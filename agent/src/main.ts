@@ -715,7 +715,7 @@ async function main(): Promise<void> {
 
   const crossCheckRunner = new CrossCheckRunner(client, git, log, {
     homeRoot: sdkHomeRoot, modelTimeoutMs: config.crossCheckModelTimeoutMs,
-    pollMs: config.pollIntervalMs, activeRuns, outbox,
+    pollMs: config.pollIntervalMs, activeRuns, outbox, rearm, batchMs: config.messageBatchMs,
     outboxTerminalMaxBytes: config.outboxTerminalMaxBytes, gapFillMax: config.gapFillMax,
     // PRD #2460: the Claude checker's path guard denies the same worker-credential set as the other
     // read-only Claude lanes. Under UZI_EXECUTOR=stub its model call is a canned APPROVE (no network).

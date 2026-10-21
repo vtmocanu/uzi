@@ -1,6 +1,6 @@
 # PRD #3166: Observable cross-check activity
 
-**Status**: Draft. Child 1 of 3 under umbrella #3165 (Deeper, observable cross-check). No blockers.
+**Status**: Done (2026-10-21). Child 1 of 3 under umbrella #3165 (Deeper, observable cross-check). No blockers.
 
 Resolved facts below were read at `main` `bf21acdc`.
 
@@ -16,14 +16,14 @@ So a checker run's feed with no tool rows proves nothing either way: it neither 
 
 ## Outcome
 
-Every Plan and Code checker run, in both families, records a bounded, sanitized account of what it read and searched, with an explicit start marker and final summary. The checker run page and `uzi run logs <checker>` show it; `uzi run get <checker>` shows only the summary. A run from an older worker shows "activity capture unavailable", never "read nothing".
+Every Plan and Code checker run, in both families, records a bounded, sanitized account of what it read and searched, with an explicit start marker and final summary. The checker run page and `uzi run logs <checker>` show it; `uzi run get <checker>` shows only the summary. A finished run with no capture marker shows "activity capture unavailable", never "read nothing".
 
 Acceptance examples:
 
 1. A Codex code checker reads three files and one read fails with the helper's oversize code. The checker run page lists the three paths with line ranges and outcome `ok`, the failed path with outcome `oversize`, and a summary "4 reads, 0 searches, 0 dropped, complete".
 2. A Claude plan checker runs a search confined to `api/internal/forge`. The feed records the scope path, match count and outcome, and never the query or pattern.
 3. A checker attempts a read outside its checkout. The feed records one `denied` event in the "outside checkout" category, without the attempted path.
-4. A worker on the previous version runs a check. New web and CLI show "activity capture unavailable (older worker)"; a marker without a summary shows "activity capture incomplete". Old web and CLI tolerate the new events without breaking (they render an unknown status event generically).
+4. A worker on the previous version runs a check. New web and CLI show "activity capture unavailable" (a missing marker does not prove an older worker); a marker without a summary shows "activity capture incomplete". Old web and CLI tolerate the new events without breaking (they render an unknown status event generically).
 
 ## Out of scope
 
@@ -55,7 +55,7 @@ Acceptance examples:
 
 ## Milestones
 
-- [ ] **M1: Every checker run records and shows its activity.** Both families, both stages: event family, delivery through redaction, caps, start marker and summary, web, `uzi run logs`, `uzi run get` summary, docs (`docs/cross-check.md`, `docs/cli.md`, then `task docs:sync`), changelog fragment. Blocked by: none. Acceptance: examples 1-4 above; health and interrupted-calls regression tests pass; gates `task gate:agent`, `task gate:api`, `task gate:web`.
+- [x] **M1: Every checker run records and shows its activity.** Both families, both stages: event family, delivery through redaction, caps, start marker and summary, web, `uzi run logs`, `uzi run get` summary, docs (`docs/cross-check.md`, `docs/cli.md`, then `task docs:sync`), changelog fragment. Blocked by: none. Acceptance: examples 1-4 above; health and interrupted-calls regression tests pass; gates `task gate:agent`, `task gate:api`, `task gate:web`.
 
 ## Decision Log
 
@@ -63,3 +63,12 @@ Acceptance examples:
 - **New status event family, not tool_use/tool_result.** Those kinds feed health loop detection and the interrupted-calls advisory; checker reads would produce false looping or interruption signals.
 - **Never record search queries or tool arguments.** They can carry repository content or secrets; scope, count and outcome are enough to judge breadth.
 - **Telemetry is best-effort.** Observability must not reduce the reliability of the check it observes.
+- **Usage and activity share one batcher on the unchanged close-then-fence terminal contract.** The runner closes the batcher once (summary first), and the terminal fence is `batcher.currentSeq()`. Usage rule: a usage frame the run never received fails the check `model_error`; a transient post failure that is later delivered does not. A frame journaled to the outbox counts as delivered, so a later outbox replay tombstone is not seen. Accepted boundary: the check can succeed with a usage frame that is tombstoned after the close.
+- **`claim_generation` is on the run DTO.** The summary binds to the current attempt: a marker or summary of the current generation is current, a lower generation is labelled "earlier attempt (generation N)", a higher one is ignored, and an API that predates the field (absent or null) shows "historical; current capture unknown".
+- **`complete` definition.** True only when the start marker was emitted, the checker reached the point of launching its model (the Claude query or the Codex provider launch, reported through the recorder's `modelStarted()` just before it) and the check then ended (normally, or by failure or timeout), and `unsettled` and `untracked` are both zero. A check that fails before its model starts (invalid claim, expired deadline, clone failure, missing credential, invalid pinned effort) reports `incomplete`. A failure after that point (a provider launch failure, or a pinned model rejected as `model_not_found`, which fails the check `checker_unavailable`) can come with a complete capture of zero reads; this supersedes the plan's earlier "pre-model failure reads complete" wording. Pending calls are capped at 256 and call ids must be 1 to 128 bytes; a call the recorder cannot track counts `untracked`. `dropped` (events past the 200-event cap) does not affect `complete`: dropped events are still counted in the totals.
+- **No Claude `oversize` mapping.** Only the Codex helper's oversize code maps to `oversize`; the Claude mapper has no oversize case, so a failed Claude call is `limit`, `denied` or `error`.
+- **`tool_output` category.** Any path under the whole checker HOME (both families; in practice the Claude SDK spill file for oversized tool output) is recorded as category `tool_output` with no path, distinct from `outside_checkout`.
+- **A Claude call refused by the code-stage budget ends the session and fails the check (`confinement_failed`).** The refused call is `limit` if its tool result arrives before the abort; otherwise it is left pending, counted `unsettled`, and the summary is `incomplete`.
+- **"In progress" shows for any non-terminal run with a current-generation marker.** Without a summary, a terminal run with a marker reads "incomplete" and a terminal started run without one reads "unavailable".
+- **Generic "activity capture unavailable" wording, no "(older worker)".** A missing marker does not prove an older worker: capture can also fail before the marker. The Outcome sentence and acceptance example 4 were reworded to match (reviewer decision at plan approval).
+- **`uzi run logs` uses the `capCell(cellText(...))` composition.** `renderer.Plain` is built from the same composition, so the activity row gets the same terminal sanitization and cell cap as other payloads; an unrecognised or invalid payload keeps the generic row.

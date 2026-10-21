@@ -338,7 +338,7 @@ describe("CodexCallbackBroker: file effects through the fileop client", () => {
       data: Buffer.from("PRIVATE_RULES_SENTINEL").toString("base64") });
     const h = makeBroker({ fileop, grants: grants({ isRoot: false, allowedTools: new Set(["Read"]) }) });
     const r = await h.broker.handleToolCall(rt(), "Read", { path: "CLAUDE.md" }, "child");
-    assert.deepEqual(r, { ok: false, code: "fileop_denied", message: "file operation denied (E_SYMLINK)" });
+    assert.deepEqual(r, { ok: false, code: "fileop_denied", message: "file operation denied (E_SYMLINK)", fileopCode: "E_SYMLINK" });
     assert.equal(fileop.calls.length, 1);
     assert.equal(fileop.calls[0]!.path, "CLAUDE.md");
     assert.equal(h.spawn.calls.length, 0);

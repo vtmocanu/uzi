@@ -213,6 +213,9 @@ var runDTOKeys = []string{
 	// until the patch edge is consumed.
 	"prd_done_path", "prd_patch_settled_at",
 	"claimed_at", "started_at", "first_started_at",
+	// PRD #3166: the run's current claim generation (always sent, 0 before the first claim; null/absent
+	// only from an older API), the attempt provenance for cross-check activity captures.
+	"claim_generation",
 	"finished_at", "created_at", "updated_at",
 	// issue #1727: when the run entered its current status; null only defensively.
 	"status_since", "repo_agents", "agent_source",

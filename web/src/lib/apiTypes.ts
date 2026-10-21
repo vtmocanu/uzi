@@ -3218,6 +3218,11 @@ export interface Run {
    *  Whole-run duration displays read this, falling back to started_at. Optional for rollout
    *  skew: an older api omits the key; null before the run first starts. */
   first_started_at?: string | null;
+  /** PRD #3166: the claim generation of the run's CURRENT attempt (runs.claim_generation); the server
+   *  sends 0 before the first claim. Cross-check activity markers and summaries carry the generation that produced
+   *  them, so this is what separates the current attempt's capture from an earlier one's. Optional
+   *  for rollout skew: null/absent only means an older api. */
+  claim_generation?: number | null;
   finished_at: string | null;
   created_at: string;
   updated_at: string;

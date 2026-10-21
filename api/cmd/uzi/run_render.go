@@ -1788,7 +1788,14 @@ func renderMessage(p *uzicli.Printer, m apitypes.MessageDTO) error {
 	// %-*s pads to a fixed RUNE width (Go's fmt measures width in runes, not bytes),
 	// and actorCell has already capped its result to that width, so the payload column
 	// starts at the same rune offset on every line.
-	p.Printf("#%-4d %-16s %-*s %s\n", m.Seq, m.Kind, actorCellWidth, actorCell(m), compactPayload(m.Payload))
+	payload := compactPayload(m.Payload)
+	// Cross-check activity events (PRD #3166) print as a human line built from validated
+	// fields, through the same capCell(cellText(...)) composition as renderer.Plain. Any
+	// other status payload, including an event this client does not know, keeps the generic row.
+	if line, ok := activityMessageLine(m.Kind, m.Payload); ok {
+		payload = capCell(cellText(line), 200)
+	}
+	p.Printf("#%-4d %-16s %-*s %s\n", m.Seq, m.Kind, actorCellWidth, actorCell(m), payload)
 	return nil
 }
 

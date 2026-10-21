@@ -311,6 +311,9 @@ export interface CandidateTransportReservation {
   cancel(): void;
 }
 
+/** Cap on the seqs {@link MessageBatcher.tombstonedSeqs} remembers. */
+const MAX_TOMBSTONE_SEQS = 1024;
+
 export class MessageBatcher {
   private reservation: TransportReservation | undefined;
   private buffer: Buffered[] = [];
@@ -344,6 +347,8 @@ export class MessageBatcher {
    *  the first durable winner). Undefined until the breaker trips; never rejects (trip guards it). */
   private permanentFailureSettled: Promise<void> | undefined;
   private seq: number;
+  private readonly tombstoned = new Set<number>();
+  private tombstoneOverflow = false;
   private timer: NodeJS.Timeout | undefined;
   private flushing = false;
   private closed = false;
@@ -474,6 +479,7 @@ export class MessageBatcher {
         max_message_bytes: MAX_MESSAGE_BYTES,
       });
       item = tombstone(item, "message_truncated", "the api cannot accept a message this large", this.redactText);
+      this.recordTombstone(out.seq);
     }
     // Every outgoing run message passes through here — the single chokepoint for
     // dumping raw frames to the operator's `docker logs` at debug level (PRD #11
@@ -700,6 +706,34 @@ export class MessageBatcher {
   /** Highest seq assigned so far (for pinning / diagnostics). */
   currentSeq(): number {
     return this.seq;
+  }
+
+  /** Lowest seq still buffered or in the pending range (neither delivered nor journaled), or
+   *  undefined when nothing is waiting. After close() returns nothing is in flight. A spilled
+   *  batcher's close journals its tail to the outbox, so those seqs read as handed off here even
+   *  though a later outbox replay may still tombstone them. Read-only. */
+  undeliveredFromSeq(): number | undefined {
+    let lowest = this.pendingRangeFirst;
+    for (const b of this.buffer) {
+      if (lowest === undefined || b.msg.seq < lowest) lowest = b.msg.seq;
+    }
+    return lowest;
+  }
+
+  /** Seqs whose content was replaced by a tombstone (emit-time oversize, a single message the api
+   *  rejected as too large (413), a permanently rejected single message, a bisected poison). Bounded: past {@link MAX_TOMBSTONE_SEQS} entries the set
+   *  stops growing and `overflow` is set. Read-only. */
+  tombstonedSeqs(): { seqs: ReadonlySet<number>; overflow: boolean } {
+    return { seqs: this.tombstoned, overflow: this.tombstoneOverflow };
+  }
+
+  private recordTombstone(seq: number): void {
+    if (this.tombstoned.has(seq)) return;
+    if (this.tombstoned.size >= MAX_TOMBSTONE_SEQS) {
+      this.tombstoneOverflow = true;
+      return;
+    }
+    this.tombstoned.add(seq);
   }
 
   /** True once the breaker has tripped and nothing more will be delivered. */
@@ -1062,6 +1096,7 @@ export class MessageBatcher {
     // contiguous, and post it alone.
     const poison = batch[lo]!;
     const marker = tombstone(poison, "message_dropped", "payload rejected by the api", this.redactText);
+    this.recordTombstone(poison.msg.seq);
     this.log.warn("isolated a permanently-rejected message; replacing it with a tombstone", {
       run_id: this.runId,
       seq: poison.msg.seq,
@@ -1199,6 +1234,7 @@ export class MessageBatcher {
         bytes: only.bytes,
         max_message_bytes: MAX_MESSAGE_BYTES,
       });
+      this.recordTombstone(only.msg.seq);
       this.buffer = [tombstone(only, "message_truncated", "the api rejected the message as too large", this.redactText), ...this.buffer];
       this.splitLimit = undefined;
       return false;
@@ -1213,6 +1249,7 @@ export class MessageBatcher {
           kind: only.msg.kind,
           error: errMessage(err),
         });
+        this.recordTombstone(only.msg.seq);
         this.buffer = [tombstone(only, "message_dropped", "payload rejected by the api", this.redactText), ...this.buffer];
         return false;
       }

@@ -656,9 +656,17 @@ type RunDTO struct {
 	// a fresh wall) no writer ever resets it, so it is the display anchor for the
 	// whole-run duration. Null until the run first starts.
 	FirstStartedAt *time.Time `json:"first_started_at"`
-	FinishedAt     *time.Time `json:"finished_at"`
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
+	// ClaimGeneration is the run's CURRENT claim generation (runs.claim_generation, migration
+	// 00223): the counter a worker claim bumps, so it names the attempt whose output is "current".
+	// Read-only. A cross-check run's activity markers and summaries carry the generation of the
+	// claim that produced them, so a client compares them against this value to tell the current
+	// attempt's capture from an earlier one. The server always sends it (0 before the first
+	// claim); the pointer exists so a client can tell a server that predates the field (null or
+	// absent) from a real 0, and report the capture provenance as unknown rather than guessing.
+	ClaimGeneration *int64     `json:"claim_generation"`
+	FinishedAt      *time.Time `json:"finished_at"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 	// StatusSince is when the run entered its CURRENT status (runs.status_since, stamped
 	// only by the statements that assign runs.status). The column is backfilled and NOT
 	// NULL (migration 00163_run_status_since.sql), so a current server always sends a
@@ -1482,9 +1490,11 @@ type RunSummaryItemDTO struct {
 	// a fresh wall) no writer ever resets it, so it is the display anchor for the
 	// whole-run duration. Null until the run first starts.
 	FirstStartedAt *time.Time `json:"first_started_at"`
-	FinishedAt     *time.Time `json:"finished_at"`
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
+	// ClaimGeneration mirrors RunDTO.ClaimGeneration (the run's current runs.claim_generation).
+	ClaimGeneration *int64     `json:"claim_generation"`
+	FinishedAt      *time.Time `json:"finished_at"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 	// StatusSince is when the run entered its CURRENT status (runs.status_since, stamped
 	// only by the statements that assign runs.status). The column is backfilled and NOT
 	// NULL (migration 00163_run_status_since.sql), so a current server always sends a
@@ -1929,6 +1939,7 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		ClaimedAt:                   item.ClaimedAt,
 		StartedAt:                   item.StartedAt,
 		FirstStartedAt:              item.FirstStartedAt,
+		ClaimGeneration:             item.ClaimGeneration,
 		FinishedAt:                  item.FinishedAt,
 		CreatedAt:                   item.CreatedAt,
 		UpdatedAt:                   item.UpdatedAt,
@@ -2093,6 +2104,7 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			ClaimedAt:                   s.ClaimedAt,
 			StartedAt:                   s.StartedAt,
 			FirstStartedAt:              s.FirstStartedAt,
+			ClaimGeneration:             s.ClaimGeneration,
 			FinishedAt:                  s.FinishedAt,
 			CreatedAt:                   s.CreatedAt,
 			UpdatedAt:                   s.UpdatedAt,
