@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -32,6 +33,9 @@ func TestPolicyHoldCLICancelLiveDB(t *testing.T) {
 	}
 	scratch, err := filepath.Abs("../../../.uzi/scratch")
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(scratch, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	dir, err := os.MkdirTemp(scratch, "policy-cancel-cli.")
@@ -82,6 +86,8 @@ func TestPolicyHoldCLICancelLiveDB(t *testing.T) {
  milestones_candidate='[{"id":"m1","title":"one"},{"id":"m2","title":"two"}]',
  milestones_completed='["m1"]',started_at=now()-interval '1 minute'
  WHERE id=$1`, e.run, uuid.New(), "pr-"+strings.Repeat("a", 32)+"-2", presentation, payload, digest[:], string(source))
+			e.exec(`INSERT INTO run_user_inputs (run_id,kind,body)
+ VALUES ($1,'follow_up','preserved cancel guidance')`, e.run)
 			if tc.pending {
 				// Same exact-generation lease shape as seedTerminalPendingLease.
 				e.exec(`INSERT INTO worker_active_runs
@@ -96,27 +102,7 @@ func TestPolicyHoldCLICancelLiveDB(t *testing.T) {
 			token := cliMintToken(t, e.pool, owner, clitoken.ScopeUser)
 			var mu sync.Mutex
 			var observations []policyCancelCLIObservation
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				body, readErr := io.ReadAll(r.Body)
-				r.Body = io.NopCloser(bytes.NewReader(body))
-				rec := httptest.NewRecorder()
-				e.router.ServeHTTP(rec, r)
-				headers := r.Header.Clone()
-				authenticated := headers.Get("Authorization") == "Bearer "+token
-				headers.Del("Authorization")
-				mu.Lock()
-				observations = append(observations, policyCancelCLIObservation{
-					method: r.Method, path: r.URL.RequestURI(), headers: headers,
-					body: string(body), authenticated: authenticated, readErr: readErr,
-					status: rec.Code, response: rec.Body.String(),
-				})
-				mu.Unlock()
-				for key, values := range rec.Header() {
-					w.Header()[key] = append([]string(nil), values...)
-				}
-				w.WriteHeader(rec.Code)
-				_, _ = w.Write(rec.Body.Bytes())
-			}))
+			server := httptest.NewServer(policyCancelCLIListener(e.router, token, &mu, &observations))
 			t.Cleanup(server.Close)
 			snapshot := func(t *testing.T) map[string]json.RawMessage {
 				t.Helper()
@@ -264,15 +250,17 @@ func TestPolicyHoldCLICancelLiveDB(t *testing.T) {
 				"pause_requested_at", "pause_mode", "pause_after_count", "credential_switch_requested_at",
 				"credential_switch_generation", "health_reason", "health_since"} {
 				if string(current[key]) != "null" {
-					t.Fatalf("terminal Cancel did not clear %s", key)
+					t.Fatalf("terminal Cancel final %s is not null", key)
 				}
 			}
 			if string(current["health"]) != `"ok"` {
-				t.Fatal("terminal Cancel retained a health flag")
+				t.Fatal("terminal Cancel final health is not ok")
 			}
 			// All other columns must survive byte-for-byte JSON comparison, including
-			// session, frozen/completed scope, policy count/source/fresh grant, approval
-			// and Stop resolution. These are the legitimate terminal Cancel writes.
+			// session, frozen/completed scope, policy count/source and approval.
+			// Fresh grant and Stop resolution stay NULL; no M2 authority is seeded.
+			// Cleanup checks above assert final values, not sensitivity of every reset.
+			// These are the legitimate terminal Cancel writes.
 			for _, key := range []string{"status", "status_since", "stop_kind", "stop_reason", "finished_at", "move_pending_since", "updated_at",
 				"plan_cross_check_gate_reason", "milestones_in_progress", "milestones_agents", "pause_requested_at", "pause_mode", "pause_after_count",
 				"credential_switch_requested_at", "credential_switch_generation", "health", "health_reason", "health_since"} {
@@ -289,6 +277,120 @@ func TestPolicyHoldCLICancelLiveDB(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Test-only listener bounds leave room for the CLI's small JSON body and three
+// requests per case. Serialize capture so concurrent callers cannot exceed the cap.
+// Rejected reads/overflows never reach the router or consume observation storage.
+const (
+	policyCancelCLIRequestLimit     = 4096
+	policyCancelCLIObservationLimit = 8
+)
+
+func policyCancelCLIListener(next http.Handler, token string, mu *sync.Mutex, observations *[]policyCancelCLIObservation) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if len(*observations) >= policyCancelCLIObservationLimit {
+			http.Error(w, "test observation limit", http.StatusServiceUnavailable)
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, policyCancelCLIRequestLimit)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			status := http.StatusBadRequest
+			var overflow *http.MaxBytesError
+			if errors.As(err, &overflow) {
+				status = http.StatusRequestEntityTooLarge
+			}
+			http.Error(w, "test request read rejected", status)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		rec := httptest.NewRecorder()
+		next.ServeHTTP(rec, r)
+		headers := r.Header.Clone()
+		authenticated := headers.Get("Authorization") == "Bearer "+token
+		headers.Del("Authorization")
+		*observations = append(*observations, policyCancelCLIObservation{
+			method: r.Method, path: r.URL.RequestURI(), headers: headers,
+			body: string(body), authenticated: authenticated,
+			status: rec.Code, response: rec.Body.String(),
+		})
+		for key, values := range rec.Header() {
+			w.Header()[key] = append([]string(nil), values...)
+		}
+		w.WriteHeader(rec.Code)
+		_, _ = w.Write(rec.Body.Bytes())
+	})
+}
+
+func TestPolicyCancelCLIListener(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		body          io.Reader
+		unknownLength bool
+		want          int
+	}{
+		{name: "at_limit", body: strings.NewReader(strings.Repeat("x", policyCancelCLIRequestLimit)), want: http.StatusAccepted},
+		{name: "overflow", body: strings.NewReader(strings.Repeat("x", policyCancelCLIRequestLimit+1)), want: http.StatusRequestEntityTooLarge},
+		{name: "chunked_overflow", body: strings.NewReader(strings.Repeat("x", policyCancelCLIRequestLimit+1)), unknownLength: true, want: http.StatusRequestEntityTooLarge},
+		{name: "read_error", body: io.MultiReader(strings.NewReader("partial"), policyCancelCLIReadError{}), want: http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var observations []policyCancelCLIObservation
+			forwarded := 0
+			listener := policyCancelCLIListener(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				forwarded++
+				w.WriteHeader(http.StatusAccepted)
+			}), "fixture", &mu, &observations)
+			req := httptest.NewRequest(http.MethodPost, "/inputs", tc.body)
+			if tc.unknownLength {
+				req.ContentLength = -1
+				req.TransferEncoding = []string{"chunked"}
+			}
+			rec := httptest.NewRecorder()
+			listener.ServeHTTP(rec, req)
+			wantForwarded := 0
+			if tc.want == http.StatusAccepted {
+				wantForwarded = 1
+			}
+			if rec.Code != tc.want || forwarded != wantForwarded || len(observations) != wantForwarded {
+				t.Fatalf("status=%d forwarded=%d observations=%d", rec.Code, forwarded, len(observations))
+			}
+		})
+	}
+	t.Run("observation_cap", func(t *testing.T) {
+		var mu sync.Mutex
+		var observations []policyCancelCLIObservation
+		forwarded := 0
+		listener := policyCancelCLIListener(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			forwarded++
+			w.WriteHeader(http.StatusAccepted)
+		}), "fixture", &mu, &observations)
+		// One extra attempt proves rejection; failures stop this bounded test loop.
+		for i := 0; i <= policyCancelCLIObservationLimit; i++ {
+			rec := httptest.NewRecorder()
+			listener.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/inputs", nil))
+			want := http.StatusAccepted
+			if i == policyCancelCLIObservationLimit {
+				want = http.StatusServiceUnavailable
+			}
+			if rec.Code != want {
+				t.Fatalf("request %d status=%d want=%d", i, rec.Code, want)
+			}
+		}
+		if len(observations) != policyCancelCLIObservationLimit || forwarded != policyCancelCLIObservationLimit {
+			t.Fatalf("observations=%d forwarded=%d", len(observations), forwarded)
+		}
+	})
+}
+
+type policyCancelCLIReadError struct{}
+
+func (policyCancelCLIReadError) Read([]byte) (int, error) {
+	return 0, errors.New("fixture read error")
 }
 
 type policyCancelCLIObservation struct {
