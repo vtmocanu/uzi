@@ -230,15 +230,15 @@ function makeHarness(opts: { mutate?: (patched: string) => string; tokenViaEnv?:
     "busybox",
     '#!/bin/sh\nsub=$1; shift\ncase "$sub" in\n' +
       "  stat)\n" +
-      // Issue #3153: the Docker-lane per-uid scratch posture probe (`stat -c '%U %a' <leaf>`). The
+      // Issue #3153: the Docker-lane per-uid scratch posture probe (`stat -c '%U %a %d:%i' <leaf>`, one stat). The
       // owner NAME is faked per leaf (STUB_OWNER_WORKER / STUB_OWNER_RUNNER) because the suite cannot
       // chown; the mode is the REAL mode of the fixture dir.
-      // Race-safe normalisation additionally probes identity: `-c '%U %a %d:%i'`, `-c '%U %d:%i'` (path or
+      // Race-safe normalisation additionally probes identity: `-c '%U %d:%i'` (path or
       // `.`) and the plain lstat `-c %d:%i`. Owner is keyed by the basename of the PHYSICAL directory
       // (so a symlink swapped in, and followed by `cd -P`, reports the standin's name); a symlink
       // operand reports a non-matching owner (lstat semantics); an inode recorded by the mkdir stub
       // reports root. Device:inode are the real ones.
-      '    if [ "$#" -eq 3 ] && [ "$1" = "-c" ] && { [ "$2" = "%U %a" ] || [ "$2" = "%U %a %d:%i" ] || [ "$2" = "%U %d:%i" ] || [ "$2" = "%d:%i" ]; }; then\n' +
+      '    if [ "$#" -eq 3 ] && [ "$1" = "-c" ] && { [ "$2" = "%U %a %d:%i" ] || [ "$2" = "%U %d:%i" ] || [ "$2" = "%d:%i" ]; }; then\n' +
       '      di=$(stat -c %d:%i "$3" 2>/dev/null || stat -f %d:%i "$3" 2>/dev/null) || exit 1\n' +
       '      [ "$2" = "%d:%i" ] && { printf "%s\\n" "$di"; exit 0; }\n' +
       '      if [ -L "$3" ]; then o=linkowner; else\n' +
@@ -253,7 +253,6 @@ function makeHarness(opts: { mutate?: (patched: string) => string; tokenViaEnv?:
       "      fi\n" +
       '      m=$(stat -c %a "$3" 2>/dev/null || stat -f %Lp "$3" 2>/dev/null) || exit 1\n' +
       '      case "$2" in\n' +
-      '        "%U %a") printf "%s %s\\n" "$o" "$m" ;;\n' +
       '        "%U %a %d:%i") printf "%s %s %s\\n" "$o" "$m" "$di" ;;\n' +
       '        *) printf "%s %s\\n" "$o" "$di" ;;\n' +
       "      esac\n" +
@@ -1857,8 +1856,8 @@ describe("issue #3153: Docker-lane per-uid scratch adopt-or-refuse (portable, re
       const w = build((x) => { leaf(x.worker); leaf(x.runner, 0o755); }, (t, lp, sd) => after(t, RUNNER_PREV, SWAP(lp, sd)));
       try {
         const r = doRun(w);
-        assertRefused(r, /changed identity before normalisation/);
         assertStandinUntouched(w, r.ops);
+        assertRefused(r, /changed identity before normalisation/);
       } finally { cleanup(w.l); }
     });
 
@@ -1878,13 +1877,15 @@ describe("issue #3153: Docker-lane per-uid scratch adopt-or-refuse (portable, re
       } finally { cleanup(w.l); }
     });
 
+    // Models a rename the runner cannot actually perform on a root-owned freshly created leaf in the
+    // sticky root; kept as defence in depth for the post-creation identity check.
     it("C: created leaf swapped right after the symlink check is refused, standin untouched", () => {
       const w = build((x) => { leaf(x.worker); }, (t, lp, sd) =>
         after(t, SYMLINK_CHECK, `      if [ "$sc_leaf" = '${lp}' ]; then ${SWAP(lp, sd).trim()}; fi\n`));
       try {
         const r = doRun(w);
-        assertRefused(r, /after creation, expected root/);
         assertStandinUntouched(w, r.ops);
+        assertRefused(r, /after creation, expected root/);
       } finally { cleanup(w.l); }
     });
 
@@ -1896,8 +1897,8 @@ describe("issue #3153: Docker-lane per-uid scratch adopt-or-refuse (portable, re
       });
       try {
         const r = doRun(w);
-        assertRefused(r, /changed identity before normalisation/);
         assertStandinUntouched(w, r.ops);
+        assertRefused(r, /changed identity before normalisation/);
       } finally { cleanup(w.l); }
     });
 
@@ -1906,8 +1907,8 @@ describe("issue #3153: Docker-lane per-uid scratch adopt-or-refuse (portable, re
         after(t, RUNNER_PREV, `/bin/ln -s '${sd}' '${lp}'\n`));
       try {
         const r = doRun(w);
-        assertRefused(r, /appeared after validation/);
         assertStandinUntouched(w, r.ops);
+        assertRefused(r, /appeared after validation/);
       } finally { cleanup(w.l); }
     });
 
@@ -1915,8 +1916,29 @@ describe("issue #3153: Docker-lane per-uid scratch adopt-or-refuse (portable, re
       const w = build((x) => { leaf(x.worker); leaf(x.runner, 0o700); }, (t, lp, sd) => after(t, RUNNER_PREV, SWAP(lp, sd)));
       try {
         const r = doRun(w);
-        assertRefused(r, /changed identity before normalisation/);
         assertStandinUntouched(w, r.ops);
+        assertRefused(r, /changed identity before normalisation/);
+      } finally { cleanup(w.l); }
+    });
+
+    it("F: leaf swapped immediately before the chmod is applied to the moved original, standin untouched", () => {
+      // Match the whole chmod line (whatever its operand) so a mutant that changes the operand still
+      // gets the swap injected right before it.
+      const CHMOD_LINE = /^ +"\$CHMOD" 00700 [^\n]*\|\| exit 4\n/m;
+      const w = build((x) => { leaf(x.worker); leaf(x.runner, 0o755); }, (t, lp, sd) => {
+        const m = CHMOD_LINE.exec(t);
+        assert.ok(m, "anchor missing");
+        return t.replace(CHMOD_LINE, SWAP(lp, sd) + m[0]);
+      });
+      try {
+        const r = doRun(w);
+        // The swap lands after the post-reclaim name check, so startup is not refused: the chmod and
+        // the hand-back act on "." (the moved original), never on the leaf name.
+        assertStandinUntouched(w, r.ops);
+        assert.equal(r.status, 0, r.stderr);
+        const moved = `${w.leafPath}.moved`;
+        assert.equal(fs.statSync(moved).mode & 0o7777, 0o700, "chmod landed on the moved original");
+        assert.ok(r.ops.includes(`chown -h runner:runner ${moved}`), r.ops.join(" | "));
       } finally { cleanup(w.l); }
     });
   });

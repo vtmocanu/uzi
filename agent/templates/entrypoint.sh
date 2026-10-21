@@ -660,23 +660,24 @@ if [ -n "$SCRATCH_DOCKER_LANE" ]; then
     if [ -L "$1" ]; then SCRATCH_REASON="is a symlink"; return 0; fi
     [ -e "$1" ] || return 0
     if [ ! -d "$1" ]; then SCRATCH_REASON="is not a directory"; return 0; fi
-    if ! sc_posture="$("$BUSYBOX" stat -c '%U %a' "$1" 2>/dev/null)"; then
+    # ONE stat yields owner, mode and identity, so the identity recorded below is the identity of the
+    # directory whose owner and mode were checked (a second stat could observe a swapped directory).
+    if ! sc_posture="$("$BUSYBOX" stat -c '%U %a %d:%i' "$1" 2>/dev/null)"; then
       SCRATCH_REASON="owner and mode could not be read"; return 0
     fi
     sc_owner="${sc_posture%% *}"
-    sc_mode="${sc_posture#* }"
+    sc_rest="${sc_posture#* }"
+    sc_mode="${sc_rest%% *}"
+    sc_devino="${sc_rest#* }"
     case "$sc_mode" in "" | *[!0-7]*) SCRATCH_REASON="mode could not be read"; return 0 ;; esac
     if [ "$sc_owner" != "$2" ]; then
       SCRATCH_REASON="owner is $sc_owner, expected $2"
     elif [ "$3" = worker ] && [ $((0$sc_mode & 022)) -ne 0 ]; then
       SCRATCH_REASON="mode is $sc_mode, group/other write set"
     else
-      # lstat identity ("owner dev:inode") for scratch_normalize; "$1" is not a symlink here.
-      if ! sc_ident="$("$BUSYBOX" stat -c '%U %d:%i' "$1" 2>/dev/null)"; then
-        SCRATCH_REASON="identity could not be read"; return 0
-      fi
+      # lstat identity ("owner dev:inode") for scratch_normalize, from the same stat as the checks above.
       SCRATCH_PREV_MODE="$sc_mode"
-      SCRATCH_PREV_ID="$sc_ident"
+      SCRATCH_PREV_ID="$sc_owner $sc_devino"
     fi
   }
   scratch_refuse() { # $1 path, $2 reason
@@ -686,7 +687,10 @@ if [ -n "$SCRATCH_DOCKER_LANE" ]; then
   # Normalise ONE leaf without ever following a path after validation. $1 leaf, $2 owner spec to hand
   # back, $3 expected "%U %d:%i" identity, $4 optional "verify" (check only, no mutation). Runs in a
   # subshell, so every command carries its own `|| exit N` (set -e is inert on the caller's `||` side).
-  # Exit 0 ok; 3 identity mismatch / swap detected; 4 an operation failed.
+  # Exit 0 ok; 3 identity mismatch / swap detected; 4 an operation failed. The identity match on "."
+  # (owner is part of it) proves the cd'd-into directory is the one validated. Verify mode proves only
+  # that: the leaf the cd resolved at check time; it does not re-check the NAME afterwards (a 0700
+  # runner leaf is never reclaimed, so the runner could re-swap after any such check anyway).
   scratch_normalize() {
     (
       cd -P -- "$1" || exit 3
@@ -700,7 +704,6 @@ if [ -n "$SCRATCH_DOCKER_LANE" ]; then
         [ "$sn_p" = "$sn_here" ]
       }
       if [ "${4:-}" = verify ]; then
-        sn_named "$1" || exit 3
         exit 0
       fi
       # Leaf only, root has no CAP_FOWNER/FSETID semantics: reclaim to root, chmod, hand back; all on ".".
@@ -730,7 +733,8 @@ if [ -n "$SCRATCH_DOCKER_LANE" ]; then
     done
     echo "$sc_n"
   }
-  # Validate BOTH leaves before touching either, so a refusal changes nothing.
+  # Validation-time refusals (either leaf) change nothing. A normalisation-time refusal of the runner
+  # leaf may follow the worker leaf's normalisation (benign: the worker leaf is then simply 0700).
   scratch_check "$WORKER_TMPDIR" worker worker
   [ -z "$SCRATCH_REASON" ] || scratch_refuse "$WORKER_TMPDIR" "$SCRATCH_REASON"
   sc_worker_prev="$SCRATCH_PREV_MODE"
