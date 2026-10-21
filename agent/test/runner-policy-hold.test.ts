@@ -15,9 +15,9 @@ import { installHarness, api, client, homeDir, git, TOKEN, gitlabClaim, fakeGitl
 
 installHarness();
 
-function refusal() {
+function refusal(policyTag: "cyberPolicy" | "misalignmentPolicyViolation" = "cyberPolicy") {
   return new ProviderPolicyRefusal({ ...admitPolicyTurn("implement"), event: "provider_policy_refusal",
-    provider: "codex", category: "policy_refusal", origin: "root", policy_tag: "cyberPolicy" });
+    provider: "codex", category: "policy_refusal", origin: "root", policy_tag: policyTag });
 }
 
 test("missing preserved session rejects without executor work even with negotiation off", async () => {
@@ -690,6 +690,275 @@ for (const variant of m1Cases) {
     assert.equal(forge.calls.length, 0, "no MR publication");
     assert.equal(api.states.some(s => s.body.status === "failed" || s.body.status === "completed"), false);
   });
+}
+
+// These are synthetic authenticated-Cancel observations, not owner HTTP/DB coverage.
+// Each latch holds one actual production boundary; execute ending early races readiness.
+// No abort is injected: policyControlGuard must observe the sticky steering cancellation.
+const m1CancelStages = [
+  "capture complete", "journal unavailable retry", "POST response before ACK decode",
+  "decoded ACK", "pending delivery retry", "lost response delivery retry",
+] as const;
+
+for (const tag of ["cyberPolicy", "misalignmentPolicyViolation"] as const) {
+  for (const stage of m1CancelStages) {
+    test(`M1 synthetic authenticated-Cancel observation: ${tag} at ${stage}`, async (t) => {
+      const { outbox, claim } = await setup();
+      claim.inventory_guarded = true;
+      if (stage === "pending delivery retry") api.policyHoldDisposition = "pending";
+      if (stage === "lost response delivery retry") api.policyHoldLoseReplies = 1;
+      const forge = fakeGitlab();
+      const sessionId = "f4d1dba8-6285-42ad-bd01-147b23590e40";
+      const bytes = Buffer.from("M1 Cancel retained source and session\n");
+      const homeMarker = path.join(homeDir, "m1-cancel-home");
+      const sessionMarker = path.join(homeDir, "sessions", `rollout-${sessionId}.jsonl`);
+      fs.mkdirSync(path.dirname(sessionMarker), { recursive: true });
+      fs.writeFileSync(homeMarker, bytes);
+      fs.writeFileSync(sessionMarker, bytes);
+      const storePath = path.join(homeDir, "codex-session-store");
+      await CodexSessionStore.persist(homeDir, storePath);
+      assert.equal(await CodexSessionStore.inspectSession(storePath, sessionId), "present");
+      const generation = fs.readFileSync(path.join(storePath, "current"), "utf8").trim();
+      const storedMarker = path.join(storePath, "generations", generation, "sessions", path.basename(sessionMarker));
+      const finalizePath = path.join(homeDir, "outbox", claim.run_id, "finalize-2.json");
+      let finalizeBytes: Buffer | undefined;
+      let flight: Parameters<PolicyHoldBoundaries["enterPolicyHold"]>[1] | undefined;
+      let clonePath = "", capturedHead: string | null = null;
+      let calls = 0, captures = 0, journalCalls = 0, sends = 0, retries = 0, arrivals = 0;
+      let policyRetirements = 0, settlements = 0;
+      let callbackError: unknown;
+      const journalAttempts: Parameters<Outbox["journalPolicy"]>[1][] = [];
+      const pinResults: Awaited<ReturnType<PolicyHoldBoundaries["pinRecoveryGeneration"]>>[] = [];
+      let journalOutcome: Parameters<Outbox["journalPolicy"]>[1] | undefined;
+      let authenticatedRequest: unknown;
+      let decodedAck: Awaited<ReturnType<typeof client.reportPolicyHold>> | undefined;
+      const cancelTerminalAcks: Array<Awaited<ReturnType<typeof client.reportState>>> = [];
+      let responseStatus: number | undefined;
+      let signalReady!: () => void, release!: () => void;
+      const ready = new Promise<void>(resolve => { signalReady = resolve; });
+      const released = new Promise<void>(resolve => { release = resolve; });
+      const pause = async () => { arrivals++; signalReady(); await released; };
+      // Callback failures can be swallowed by production catches. Preserve them for the
+      // exterior oracle and stop retries; this cancellation can never make the fixture pass.
+      const checked = async <T,>(work: () => Promise<T>): Promise<T> => {
+        try { return await work(); }
+        catch (error) { callbackError ??= error; flight?.steering.markCancelled(); throw error; }
+      };
+      const executor: Executor = { async run(ctx) {
+        await checked(async () => {
+          calls++;
+          clonePath = ctx.worktreePath;
+          ctx.onSessionId?.(sessionId);
+          fs.writeFileSync(path.join(clonePath, "m1-cancel-work.txt"), bytes);
+          const result = await outbox.journalFinalize(claim.run_id, 2);
+          assert.equal(result.written, true);
+          finalizeBytes = fs.readFileSync(finalizePath);
+        });
+        // The refusal itself must reach execute's actual catch, not checked's fixture-error arm.
+        throw refusal(tag);
+      } };
+      const subject = runnerWith(() => ({ executor, homeDir }), forge.gitlab, TOKEN,
+        nullLogger(), { outbox });
+      const observed = subject as unknown as PolicyHoldBoundaries;
+      const enter = observed.enterPolicyHold.bind(subject);
+      t.mock.method(observed, "enterPolicyHold", async (...args: Parameters<typeof enter>) => {
+        flight = args[1];
+        return enter(...args);
+      });
+      const capture = observed.captureHoldContext.bind(subject);
+      t.mock.method(observed, "captureHoldContext", (...args: Parameters<typeof capture>) => checked(async () => {
+        const result = await capture(...args);
+        captures++;
+        capturedHead = result.head;
+        assert.equal(result.verified, true, "real capture must succeed before Cancel");
+        assert.equal(result.head, execFileSync("git", ["-C", clonePath, "rev-parse", "HEAD"],
+          { encoding: "utf8" }).trim());
+        if (stage === "capture complete") await pause();
+        return result;
+      }));
+      const pin = observed.pinRecoveryGeneration.bind(subject);
+      t.mock.method(observed, "pinRecoveryGeneration", (...args: Parameters<typeof pin>) => checked(async () => {
+        const result = await pin(...args);
+        if (flight) pinResults.push(result);
+        return result; // No fabricated open backend hold / pin authority.
+      }));
+      const journal = outbox.journalPolicy.bind(outbox);
+      t.mock.method(outbox, "journalPolicy", (...args: Parameters<typeof journal>) => checked(async () => {
+        journalCalls++;
+        journalAttempts.push(args[1]);
+        if (stage === "journal unavailable retry" && journalCalls === 1)
+          return { journaled: false, reason: "not_durable" } as const;
+        // A Cancel-blind mutant can journal on the next attempt and reach the finite oracle.
+        const result = await journal(...args);
+        assert.equal(result.journaled, true);
+        journalOutcome = outbox.listPendingPolicies(claim.run_id)[0]!.outcome;
+        const authenticated = await outbox.readPolicyForRetirement(claim.run_id, 2);
+        assert.ok(authenticated?.context.expectedIdentity, "real MAC-authenticated journal");
+        authenticatedRequest = authenticated.request;
+        return result;
+      }));
+      const reportState = client.reportState.bind(client);
+      t.mock.method(client, "reportState", async (...args: Parameters<typeof reportState>) => {
+        const ack = await reportState(...args);
+        if (args[0] === claim.run_id && args[1].status === "failed" &&
+            args[1].failure_reason === "run cancelled") cancelTerminalAcks.push(ack);
+        return ack;
+      });
+      const report = client.reportPolicyHold.bind(client);
+      t.mock.method(client, "reportPolicyHold", async (...args: Parameters<typeof report>) => {
+        await checked(async () => {
+          sends++;
+          assert.deepEqual(args[1], authenticatedRequest, "durable authenticated journal precedes HTTP");
+        });
+        // A lost real HTTP reply is an expected production delivery failure, not a
+        // fixture assertion failure; let resolvePendingPolicy handle it normally.
+        const ack = await report(...args);
+        decodedAck = ack;
+        if (stage === "decoded ACK") await pause();
+        return ack;
+      });
+      // Hold the actual HTTP Response before WorkerClient reads and decodes its body.
+      // The POST has reached FakeApi, but its ACK has not yet reached policy resolution.
+      const fetchReal = globalThis.fetch;
+      if (stage === "POST response before ACK decode") {
+        t.mock.method(globalThis, "fetch", (...args: Parameters<typeof fetchReal>) => checked(async () => {
+          const response = await fetchReal(...args);
+          if (String(args[0]).endsWith(`/runs/${claim.run_id}/policy-hold`)) {
+            responseStatus = response.status;
+            await pause();
+          }
+          return response;
+        }));
+      }
+      // Only the first relevant retry is held. Subsequent mutant continuation is immediate;
+      // enterPolicyHold's delivery attempts are finite, and disk recovery is allowed above.
+      t.mock.method(observed, "waitRecoveryRetry", async () => {
+        retries++;
+        if (retries === 1 && (stage === "journal unavailable retry" ||
+            stage === "pending delivery retry" || stage === "lost response delivery retry")) await pause();
+      });
+      const retire = observed.retireFinalizeRecord.bind(subject);
+      t.mock.method(observed, "retireFinalizeRecord", async (...args: Parameters<typeof retire>) => {
+        if (args[1] === "policy_hold") { policyRetirements++; return; }
+        return retire(...args);
+      });
+      t.mock.method(observed, "settleGuardedInventory", async () => { settlements++; });
+      const execution = subject.execute(claim);
+      try {
+        await Promise.race([
+          ready,
+          execution.then(() => { throw new Error(`execute ended before ${stage}`); }),
+        ]);
+        assert.ifError(callbackError);
+        assert.ok(flight, "actual execute catch entered enterPolicyHold");
+        assert.equal(arrivals, 1);
+        assert.equal(calls, 1);
+        assert.equal(captures, 1);
+        assert.equal(flight.preserveRecoveryClone, true);
+        assert.equal(flight.preserveSession, true);
+        assert.equal(policyRetirements, 0);
+        assert.equal(settlements, 0);
+        const beforeJournal = stage === "capture complete" || stage === "journal unavailable retry";
+        assert.equal(api.policyHoldRequests.length, beforeJournal ? 0 : 1);
+        assert.equal(outbox.listPendingPolicies(claim.run_id).length, beforeJournal ? 0 : 1);
+        if (stage === "capture complete") {
+          assert.equal(flight.policyHoldOutcome, undefined, "Cancel precedes outcome admission");
+          assert.equal(journalCalls, 0);
+          assert.equal(pinResults.length, 0);
+        } else {
+          assert.deepEqual(pinResults, [undefined], "FakeApi grants no guarded generation pin");
+        }
+        if (stage === "journal unavailable retry") {
+          assert.equal(journalCalls, 1);
+          assert.equal(retries, 1);
+        }
+        if (stage === "POST response before ACK decode") {
+          assert.equal(responseStatus, 200);
+          assert.equal(decodedAck, undefined);
+        }
+        if (stage === "decoded ACK") assert.equal(decodedAck?.disposition, "applied");
+        if (stage === "pending delivery retry") assert.equal(decodedAck?.disposition, "pending");
+        if (stage === "lost response delivery retry") assert.equal(decodedAck, undefined);
+        const pins = execFileSync("git", ["-C", git.barePathFor(fx.originPath), "for-each-ref",
+          "--format=%(refname) %(objectname)", `refs/uzi-recovery-pin/${claim.run_id}/`],
+        { encoding: "utf8" });
+        const recoveryDir = path.join(git.recoveryRoot, claim.run_id);
+        const recoveryRecords = fs.existsSync(recoveryDir)
+          ? fs.readdirSync(recoveryDir).filter(name => name.endsWith(".json"))
+            .map(name => [name, fs.readFileSync(path.join(recoveryDir, name))] as const)
+          : [];
+        assert.equal(cancelTerminalAcks.length, 0, "no Cancel terminal ACK before the observation");
+        if (!beforeJournal) assert.equal(outbox.listPendingPolicies(claim.run_id)[0]!.server_settled === true,
+          false, "held or pending policy replies have not settled delivery at this boundary");
+        // Synthetic authenticated-Cancel observation only; no owner input, DB transition,
+        // cancellation custody ACK or successful owner-disposal response is fabricated.
+        flight.steering.markCancelled();
+        release();
+        await execution;
+        assert.ifError(callbackError);
+        assert.equal(calls, 1, "Cancel never retries provider/root execution");
+        assert.equal(captures, 1);
+        assert.equal(arrivals, 1);
+        assert.equal(journalCalls, beforeJournal ? (stage === "capture complete" ? 0 : 1) : 1);
+        assert.equal(sends, beforeJournal ? 0 : 1, "Cancel prevents later policy delivery");
+        assert.equal(policyRetirements, 0, "Cancel prevents policy-specific finalizer ENTRY");
+        assert.equal(settlements, 0, "Cancel prevents guarded policy settlement ENTRY");
+        assert.equal(flight.parked === true, false, "Cancel never terminalizes a policy hold");
+        assert.equal(flight.holdOrWallParkConfirmed === true, false);
+        assert.equal(flight.policyHoldIntent, undefined, "catch clears policy intent before Cancel handling");
+        assert.equal(flight.preserveRecoveryClone, true);
+        assert.equal(flight.preserveSession, true);
+        assert.equal(forge.calls.length, 0, "no MR publication");
+        assert.equal(api.states.some(s => s.body.status === "completed"), false);
+        // A failed report with the Cancel reason is legitimate. A real server may use
+        // its stop_kind=cancelled to classify that report; this synthetic test owns no DB proof.
+        for (const state of api.states.filter(s => s.body.status === "failed")) {
+          assert.equal(state.body.failure_reason, "run cancelled");
+          assert.notEqual(state.body.fail_origin, "provider_policy_refusal");
+        }
+        assert.deepEqual(fs.readFileSync(finalizePath), finalizeBytes);
+        for (const marker of [homeMarker, sessionMarker, storedMarker,
+          path.join(clonePath, "m1-cancel-work.txt")]) assert.deepEqual(fs.readFileSync(marker), bytes);
+        assert.equal(await CodexSessionStore.inspectSession(storePath, sessionId), "present");
+        assert.equal(execFileSync("git", ["-C", clonePath, "rev-parse", "HEAD"],
+          { encoding: "utf8" }).trim(), capturedHead);
+        assert.equal(execFileSync("git", ["-C", git.barePathFor(fx.originPath), "for-each-ref",
+          "--format=%(refname) %(objectname)", `refs/uzi-recovery-pin/${claim.run_id}/`],
+        { encoding: "utf8" }), pins, "Cancel supplies no pin retirement authority");
+        for (const [name, recordBytes] of recoveryRecords)
+          assert.deepEqual(fs.readFileSync(path.join(recoveryDir, name)), recordBytes);
+        const policies = outbox.listPendingPolicies(claim.run_id);
+        assert.equal(policies.length, beforeJournal ? 0 : 1);
+        if (!beforeJournal) {
+          const pending = policies[0]!;
+          assert.deepEqual(pending.outcome, journalOutcome, "immutable outcome UUID and source generation");
+          assert.equal(pending.outcome.source_generation, 2);
+          assert.equal(pending.outcome.tag, tag);
+          assert.equal(pending.outcome.session_id, sessionId);
+          assert.equal(pending.outcome.head, capturedHead);
+          assert.equal(pending.outcome.outcome_id, journalAttempts[0]!.outcome_id);
+          const cancelAcknowledged = cancelTerminalAcks.some(ack => ack.applied === true && !ack.staleClaim &&
+            !ack.staleRevisionSource && ack.status !== undefined && ["failed", "cancelled", "completed"].includes(ack.status));
+          assert.equal(pending.server_settled === true,
+            stage === "decoded ACK" || stage === "POST response before ACK decode" || cancelAcknowledged,
+            "an observed policy or Cancel terminal ACK settles delivery, not physical custody");
+          if (stage === "pending delivery retry" || stage === "lost response delivery retry")
+            assert.equal(cancelAcknowledged, true, "pending policy delivery settles through the real Cancel terminal ACK");
+          const authenticated = await outbox.readPolicyForRetirement(claim.run_id, 2);
+          assert.ok(authenticated?.context.expectedIdentity, "retained journal still authenticates");
+          assert.deepEqual(authenticated.policy.outcome, journalOutcome);
+          assert.equal(api.policyHoldRequests.length, 1);
+          assert.equal(api.policyHoldRequests[0]!.body.tag, tag);
+          assert.equal(api.policyHoldRequests[0]!.body.outcome_id, pending.outcome.outcome_id);
+          assert.equal(api.policyHoldRequests[0]!.body.source_generation, 2);
+        } else assert.equal(api.policyHoldRequests.length, 0, "no fabricated outcome or POST");
+      } finally {
+        release(); // Every owned latch is released even if a boundary assertion fails.
+        await execution;
+        assert.ifError(callbackError);
+      }
+    });
+  }
 }
 
 test("root refusal journals a flat hold and parks without terminal failure or MR", async () => {
