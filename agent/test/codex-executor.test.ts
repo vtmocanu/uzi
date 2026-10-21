@@ -16540,12 +16540,16 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
       const { ctx } = seededCtx({ gatePlan: async () => { gateCalls += 1; return approveSel; } });
       const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3272 submit_plan run");
       assert.equal(gateCalls, 0, "no plan gate is reached from an implement turn");
+      const submitPlanReply = rig.epochs[0]!.transport.responses.find(r => r.requestId === 5);
+      assert.ok(submitPlanReply, "submit_plan received a broker reply");
+      assert.equal(rec(rec(submitPlanReply.response).result).success, true,
+        "a root submit_plan is accepted without changing the seeded implementation plan");
       assert.equal(result.branch, "agent/issue-42");
       const texts = turnTexts(rig.epochs[0]!.transport);
       assert.ok(texts.length >= 2, "the run proceeded to a later turn");
       for (const text of texts.slice(1)) {
         assert.ok(text.includes("SEEDED-PLAN-BODY-3272"), "submit_plan did not replace the owner plan");
-        assert.ok(!text.includes("RE-PLAN-3272"), "the rejected replacement is absent from later prompts");
+        assert.ok(!text.includes("RE-PLAN-3272"), "the submitted replacement is absent from later prompts");
       }
     });
   });
