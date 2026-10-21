@@ -1,5 +1,5 @@
 // issue #3239 — GitCache.commitWipMarker never commits a core dump or an oversized file, and a
-// post-commit backstop rolls back (CAS on the exact pre-capture ref) or refuses when one slips in anyway.
+// post-commit backstop rolls back (CAS on the exact pre-capture branch) or refuses when one slips in anyway.
 import test, { describe } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
@@ -203,14 +203,24 @@ describe("commitWipMarker omissions (issue #3239)", () => {
     assert.deepEqual([f.calls[0]!.markerCreated, f.calls[0]!.rollbackRefused], [false, false]);
   });
 
-  test("(g1) detached HEAD: the backstop rolls the detached HEAD back with --no-deref", async (t) => {
-    const f = await fixture(t, { afterOmissionCheck: (p) => grow(p) });
+  test("(g1) detached HEAD: the backstop refuses without writing; HEAD and all refs unchanged", async (t) => {
+    let refsAtBackstop = "";
+    let wrote = false;
+    const snapshot = (p: string) => execFileSync("/usr/bin/git", ["-C", p, "for-each-ref", "--format=%(refname) %(objectname)"],
+      { env: gitEnv, encoding: "utf8" }) + "HEAD " + execFileSync("/usr/bin/git", ["-C", p, "rev-parse", "HEAD"], { env: gitEnv, encoding: "utf8" });
+    const f = await fixture(t, {
+      afterOmissionCheck: (p) => grow(p),
+      beforeBackstop: async (p) => { refsAtBackstop = snapshot(p); },
+      beforeRollbackWrite: async () => { wrote = true; },
+    });
     const pre = f.head();
     f.g("checkout", "-q", "--detach");
     await f.write("racy.txt", "tiny\n");
     assert.equal(await f.git.commitWipMarker(f.root, { onIncomplete: f.onIncomplete }), false);
-    assert.deepEqual([f.calls[0]!.markerCreated, f.calls[0]!.rollbackRefused], [false, false]);
-    assert.equal(f.head(), pre, "the detached HEAD is back at preHead");
+    assert.deepEqual([f.calls[0]!.markerCreated, f.calls[0]!.rollbackRefused], [false, true]);
+    assert.equal(wrote, false, "no rollback write was attempted");
+    assert.equal(snapshot(f.root), refsAtBackstop, "HEAD and every ref unchanged by the backstop");
+    assert.equal(f.g("rev-parse", "HEAD^"), pre);
     assert.equal(f.g("rev-parse", "refs/heads/main"), pre, "no branch ref moved");
     assert.throws(() => f.g("symbolic-ref", "-q", "HEAD"), "HEAD is still detached");
     assert.equal(await f.exists("racy.txt"), CAP + 1);

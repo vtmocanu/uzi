@@ -11094,13 +11094,14 @@ try {
    * excluded and commits the rest. Omitted files stay on disk; `onIncomplete` reports them.
    * A post-commit backstop re-reads what the marker added (a file can grow between the check
    * and the add) and, when it finds a core file or an oversized blob, rolls back by
-   * compare-and-swap on the exact ref recorded before the capture: the checked-out branch
-   * (`update-ref <ref> <preHead> <marker>`; bare HEAD is never named while attached, so only
-   * that branch can move) or, when HEAD was detached, the detached HEAD itself
-   * (`update-ref --no-deref HEAD <preHead> <marker>`, which never moves a branch ref). It runs
-   * only while HEAD still resolves to that same identity (same branch, or still detached),
-   * still sits on the marker, and the marker's parent is still preHead; any mismatch or a failed
-   * swap refuses with nothing reset. Index and worktree are never touched by the rollback.
+   * compare-and-swap on the checked-out branch recorded before the capture
+   * (`update-ref <ref> <preHead> <marker>`; bare HEAD is never named, so only that branch can
+   * move, even if HEAD switches to another branch between the recheck and the write). It runs
+   * only while HEAD still names that branch, still sits on the marker, and the marker's parent
+   * is still preHead; any mismatch or a failed swap refuses with nothing reset. A capture that
+   * started on a detached HEAD is never rolled back (the recheck and a `--no-deref HEAD` write
+   * cannot be made atomic): it refuses before any write, so the caller keeps the source. Index
+   * and worktree are never touched by the rollback.
    *
    * BEST-EFFORT: every error is caught, logged, and returns `false` rather than thrown —
    * a commit failure must NEVER propagate, because parking is the state that preserves the
@@ -11173,18 +11174,18 @@ try {
         return true;
       }
       const all = [...omitted, ...extra.filter((e) => !omitted.some((o) => o.path === e.path))];
+      // A detached HEAD is never rolled back: the identity recheck and an `update-ref --no-deref
+      // HEAD` write are separate steps, so a switch to a branch in between would be overwritten.
+      if (preRef === WIP_DETACHED) { report(all, false, true); return false; }
       const headNow = await this.wipSymbolicHead(clonePath).catch(() => undefined);
       const tipNow = (await git(["rev-parse", "--verify", "HEAD^{commit}"])).trim();
       const parentNow = (await git(["rev-parse", "--verify", `${marker}^`])).trim();
       if (headNow !== preRef || tipNow !== marker || parentNow !== preHead) { report(all, false, true); return false; }
       await this.wipCaptureSeam?.beforeRollbackWrite?.(clonePath, marker);
       try {
-        // CAS on the exact ref recorded before the capture: the branch HEAD named then, or the
-        // detached HEAD itself (--no-deref). Bare HEAD is never named while attached, so the swap
-        // cannot follow a branch HEAD moved to.
-        await git(preRef === WIP_DETACHED
-          ? ["update-ref", "--no-deref", "-m", "uzi: wip capture rollback", "HEAD", preHead, marker]
-          : ["update-ref", "-m", "uzi: wip capture rollback", preRef, preHead, marker]);
+        // CAS on the exact branch HEAD named before the capture, never bare HEAD: only that branch
+        // can move, even if HEAD switches to another branch after the recheck above.
+        await git(["update-ref", "-m", "uzi: wip capture rollback", preRef, preHead, marker]);
       } catch (err) {
         this.log.warn("WIP capture rollback refused (ref moved)", { cwd: clonePath, error: gitErrorMessage(err) });
         report(all, false, true);
