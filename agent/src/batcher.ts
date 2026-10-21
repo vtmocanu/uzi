@@ -511,6 +511,9 @@ export class MessageBatcher {
     // buffer stays unbounded exactly as today.
     if (this.spilled && this.buffer.length > 0 && this.bufferedBytes() + item.bytes > this.spillBufferBytes) {
       this.foldIntoPendingRange(out.seq);
+      // The range later leaves undeliveredFromSeq (journaled as a loss record, or replaced by
+      // network markers after rearm), so tombstone the seq now: it was never delivered.
+      this.recordTombstone(out.seq);
       this.log.warn("spill buffer cap reached; dropped a message into a pending range record", {
         run_id: this.runId,
         seq: out.seq,

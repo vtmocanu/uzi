@@ -81,6 +81,31 @@ describe("MessageBatcher.undeliveredFromSeq with a spilled pending range", () =>
       await b.close();
     } finally { await fs.rm(dir, { recursive: true, force: true }); }
   });
+
+  it("tombstones seqs dropped into the pending range, so they still read as lost after close", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "batcher-accessors-"));
+    try {
+      const outbox = new Outbox({ root: path.join(dir, "outbox"), log: nullLogger(),
+        runMaxBytes: 64 * 1024 * 1024, maxBytes: 512 * 1024 * 1024, retentionMs: 86_400_000 });
+      await outbox.init();
+      const a = api(() => 503);
+      const b = new MessageBatcher(a.client, "run", 0, 5, nullLogger(), undefined, undefined,
+        { outbox, transientTripMs: 40, spillBufferBytes: 1 });
+      b.emit(text("pre1")); b.emit(text("pre2"));
+      for (let i = 0; i < 200 && !b.isSpilled(); i++) await sleep(20);
+      assert.equal(b.isSpilled(), true, "the failing api drives the batcher into spill");
+      for (let i = 0; i < 200 && (outbox.depthFor("run")?.pendingMessages ?? 0) < 2; i++) await sleep(20);
+      await sleep(40);
+      // seq 3 is kept, seqs 4..6 are dropped by the spill-buffer cap.
+      for (const t of ["x", "y", "z", "w"]) b.emit(text(t));
+      await b.close();
+      // close journals the range as a loss record, so undeliveredFromSeq no longer names it:
+      // only the tombstone set can tell the cross-check runner those frames never arrived.
+      const t = b.tombstonedSeqs();
+      for (const seq of [4, 5, 6]) assert.equal(t.seqs.has(seq), true, `dropped seq ${seq} is tombstoned`);
+      assert.equal(t.seqs.has(3), false, "the kept seq is not tombstoned");
+    } finally { await fs.rm(dir, { recursive: true, force: true }); }
+  });
 });
 
 describe("MessageBatcher.tombstonedSeqs", () => {
