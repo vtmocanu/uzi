@@ -379,6 +379,11 @@ Tracked as GitLab issue vtmocanu/uzi#46; PRD at `prds/done/46-run-judge-self-imp
 - The judge runs on the run owner's own credential for the reviewed run's harness
   (Anthropic token for a Claude run, Codex credential for a Codex run), never a
   shared one. [user 2026-07-12] (AI-synced 2026-09-24)
+- Judge model is per harness (Claude and Codex lanes), resolved user → instance
+  → built-in for the reviewed run's harness: built-ins `opus` (Claude) and
+  `gpt-6.1-sol` (Codex, user decision 2026-10-21); Codex judge models are
+  curated ids only. Supersedes the older "cheap default" wording above.
+  (AI-synced 2026-10-21)
 - Per-user opt-in/out; admin can toggle the feature globally and force-disable
   per user (existing admin settings). [user 2026-07-12]
 - Recommendations show on the Judge page and the run page (users see their own)

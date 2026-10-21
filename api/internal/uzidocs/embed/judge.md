@@ -97,36 +97,58 @@ up waiting on a judge that can't run.
 
 ## Which model it runs on
 
-**The Judge model picker in the web UI only offers Claude aliases** — it is
-not a server-side restriction, just what the picker shows. Your Codex
-worker-model default does **not** reach a Codex judge: unless the effective
-judge model (your own override, or the instance default) happens to be a
-Codex model id itself, a Codex judge runs on the built-in Codex default
-(`gpt-6-astra`), regardless of what you've set as your Codex worker model.
-If the effective judge model is instead a Claude alias, a Codex run's judge
-drops it and falls back to that same built-in default, with a visible note
-on the run — a Claude model can never reach a Codex judge call.
+The judge has **two model settings, one per harness**: the Claude lane
+(`judge_model`) and the Codex lane (`codex_judge_model`), each settable per
+user and per instance. A judge run reads only the lane of **its own run's
+harness**, resolving in this order:
 
-The instance default is **opus** — the strongest model, since the judge's
+1. your own value for that lane,
+2. the instance value for that lane,
+3. the built-in default: **`opus`** for Claude, **`gpt-6.1-sol`** for Codex.
+
+A value that is not valid for the run's harness is skipped (one
+`harness_model_fallback` note on the run) and resolution falls through to the
+next step. Your Codex worker-model default does **not** reach a Codex judge.
+
+**Codex judge models are curated.** `codex_judge_model` accepts only
+`gpt-5.6-sol`, `gpt-6-astra`, `gpt-6-sol` or `gpt-6.1-sol`; custom Codex model
+ids are not accepted for the judge. The Claude lane rejects Codex ids
+(including `gpt-6-luna`), so a Claude judge can never be handed a Codex model
+and a Codex judge can never be handed a Claude alias. Because a Codex judge
+model is always one of the curated ids, a Codex judge never needs the custom
+Codex model exemption that other Codex runs can claim; this invariant is pinned
+by the resolver test.
+
+Setting a judge model to an empty or whitespace-only value resets it to the
+built-in default for that lane. Values are stored trimmed.
+
+The Claude built-in is **opus** — the strongest model, since the judge's
 recommendations feed the [self-improvement job](./scheduling.md#default-jobs)
-and a shallow retrospective produces shallow self-improvement work. From
-**Settings → Run judge**, the **Judge model** picker lets you override that
-default for your own judge runs; leave it on **Inherit** to use whatever the
-instance is set to. Your admin can also pin a cheaper instance-wide default (`haiku` or
-`sonnet`) from **Admin → Instance → Run judge** — either lever
-works, but your own override only changes your runs, while the admin's is
-the fallback for everyone who hasn't set one.
+and a shallow retrospective produces shallow self-improvement work. Your
+admin can pin a cheaper instance-wide Claude default (`haiku` or `sonnet`)
+from **Admin → Instance → Run judge**; your own value only changes your runs,
+while the admin's is the fallback for everyone who hasn't set one. The Codex
+lane is set through the `codex_judge_model` settings key (user and instance).
+Choosing the Codex judge model in the web UI is not part of this change.
+
+`uzi settings get` prints a **Model settings** table showing, per lane, what
+is stored, the default, what a judge run would resolve to, and where that came
+from; see [CLI](./cli.md#plan-cross-check-settings).
+
+**Migration.** A Codex id previously stored in `judge_model` (yours or the
+instance's) is copied into the Codex lane; the Claude key is left unchanged
+and is then skipped, with a note, by Claude judges.
 
 The judge uses your [reasoning effort](./worker-effort.md) preference for its
 run's harness: Claude or Codex. An unset preference inherits `medium`.
-The `judge_model` picker above is unaffected; this setting changes how hard
+The judge model settings above are unaffected; this setting changes how hard
 the judge model reasons.
 
 Opus runs roughly **5–15× the cost of haiku** per retrospective. If your
 Anthropic token is a **subscription plan** rather than a metered console key,
 an opus judge spends **plan/rate-limit quota, not dollars** — under enforced
 mode especially, a busy judge can eat into the quota your real runs need.
-Pinning your judge model to `haiku` or `sonnet` is the fix if that's a
+Pinning your Claude judge model to `haiku` or `sonnet` is the fix if that's a
 problem; short of that, deleting your token is the only way to stop the
 judge from running under enforced mode (see [Judge
 mode](#judge-mode-off-optional-enforced) above).

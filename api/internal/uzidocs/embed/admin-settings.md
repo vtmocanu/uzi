@@ -79,10 +79,10 @@ A global kill-switch for the [run judge](./judge.md), plus the model it runs
 on (**Judge model**, `opus` by default — the judge's recommendations feed
 self-improvement, so the strongest model is the default; pin a cheaper alias
 like `haiku` or `sonnet` to spend less). **Judge model** is a model picker
-for the Claude judge model. Its **Default · opus (built-in)** option resets the
+for the Claude judge model (the Claude lane). Its **Default · opus (built-in)** option resets the
 instance value to the built-in, so it follows future changes to uzi's built-in
 default; saving an empty or whitespace-only `judge_model` through the admin API
-does the same (values are stored trimmed, and a whitespace-only value stores
+does the same (the judge model keys store values trimmed, and a whitespace-only value stores
 empty and is reported as source `default`). This switch
 only arms the feature instance-wide; each user still opts in under their own
 Settings, and the judge always spends that user's own Anthropic token, never
@@ -98,6 +98,26 @@ done or file an issue from there — see
 version carrying this default — there's no migration that preserves the old
 (cheaper) value. Pin **Judge model** to `haiku` or `sonnet` before upgrading
 if you want to keep spending where it was.
+
+**Upgrade note (per-harness judge model):** if the instance `judge_model`
+held a Codex id, Claude judges now skip it with a note and run on the built-in
+`opus` instead of the SDK default; the Codex id is copied into
+`codex_judge_model`. Reset the Claude judge model to Default to clear the
+stale value.
+
+The judge has one model setting per harness; a judge run uses the lane of its
+own run's harness (user lane, then instance lane, then built-in):
+
+| Setting | Default | Controls |
+|---|---|---|
+| `judge_model` | empty (built-in `opus`) | The instance Claude judge model. Claude aliases and ids only; Codex ids are rejected. |
+| `codex_judge_model` | empty (built-in `gpt-6.1-sol`) | The instance Codex judge model. Must be one of the curated ids `gpt-5.6-sol`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6.1-sol`; no custom ids. An empty or whitespace-only value resets it to the built-in. |
+
+A value not valid for the run's harness is skipped with a
+`harness_model_fallback` note and resolution falls through. A Codex id
+previously stored in `judge_model` is copied into `codex_judge_model` on
+upgrade; the Claude key is left unchanged. Picking the Codex judge model in
+the admin UI is not part of this change; set it through the admin settings API.
 
 ### Judge mode: off, optional, enforced
 
