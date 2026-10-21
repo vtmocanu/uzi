@@ -193,11 +193,15 @@ describe("guarded maintenance WIP capture", { skip: process.platform !== "linux"
       const end = index.indexOf(0, offset + 62);
       assert.ok(end >= offset + 62);
       if (index.toString("utf8", offset + 62, end) === "tracked") {
-        // Git index modes are canonical, not filesystem permission bits; keep the forged stat cache well-formed.
+        // Issue #3222: forge every cached stat field except the mode word, which keeps the
+        // Git-valid mode `git add` wrote. A raw st.mode is 100600 under umask 077, and the
+        // capture would then refuse at its mode guard before reaching the stat-cache check.
         const fields = [st.ctimeNs / 1000000000n, st.ctimeNs % 1000000000n,
           st.mtimeNs / 1000000000n, st.mtimeNs % 1000000000n,
-          st.dev, st.ino, 0o100644n, st.uid, st.gid, st.size];
-        fields.forEach((value, field) => index.writeUInt32BE(Number(BigInt.asUintN(32, value)), offset + field * 4));
+          st.dev, st.ino, undefined, st.uid, st.gid, st.size];
+        fields.forEach((value, field) => {
+          if (value !== undefined) index.writeUInt32BE(Number(BigInt.asUintN(32, value)), offset + field * 4);
+        });
         assert.equal(index.readUInt16BE(offset + 60), 7); // Ordinary path flags, no hiding bits.
         found = true;
       }
@@ -216,6 +220,9 @@ describe("guarded maintenance WIP capture", { skip: process.platform !== "linux"
     try { result = await f.capture(); }
     catch (error) { assert.match(String(error), /refused/); }
     assert.notEqual(result?.kind, "clean", "forged index stat cache must not hide changed tracked bytes");
+    // Issue #3222: an earlier refusal (e.g. at the index-mode guard) must not pass for this check.
+    assert.ok(f.events.includes("launch:status"), "the capture reaches the stat-cache check");
+    if (visible) assert.ok(f.events.includes("launch:add"), "visible WIP is staged before the refusal");
     if (result?.kind === "committed") {
       assert.equal(f.gitIn("show", "HEAD:tracked"), "modified", "successful tree must include masked tracked bytes");
       assert.equal(f.gitIn("show", "HEAD:visible"), "new");
@@ -228,6 +235,37 @@ describe("guarded maintenance WIP capture", { skip: process.platform !== "linux"
       assert.ok(!f.events.includes("launch:commit"));
     }
     assert.equal(await fs.readFile(path.join(f.root, "tracked"), "utf8"), "modified");
+  });
+
+  test("an unsupported tracked index mode is refused before add, index and HEAD unchanged", async t => {
+    const f = await fixture(t);
+    await fs.writeFile(path.join(f.root, "tracked"), "modified");
+    await fs.writeFile(path.join(f.root, "visible"), "new");
+    const indexPath = path.join(f.root, ".git/index");
+    const index = await f.index();
+    let offset = 12;
+    let found = false;
+    for (let i = 0; i < index.readUInt32BE(8); i++) {
+      const end = index.indexOf(0, offset + 62);
+      assert.ok(end >= offset + 62);
+      if (index.toString("utf8", offset + 62, end) === "tracked") {
+        index.writeUInt32BE(0o100600, offset + 24); // The mode word; Git writes only 100644/100755.
+        found = true;
+      }
+      offset += Math.ceil((end + 1 - offset) / 8) * 8;
+    }
+    assert.ok(found);
+    createHash("sha1").update(index.subarray(0, -20)).digest().copy(index, index.length - 20);
+    await fs.writeFile(indexPath, index);
+    assert.match(f.gitIn("ls-files", "--stage", "tracked"), /^100600 /);
+    const before = await f.index();
+    await assert.rejects(f.capture(), /refused/);
+    assert.ok(!f.events.includes("launch:add"), "refused before add");
+    assert.ok(!f.events.includes("launch:commit"));
+    assert.equal(f.head(), f.old);
+    assert.deepEqual(await f.index(), before);
+    assert.equal(await fs.readFile(path.join(f.root, "tracked"), "utf8"), "modified");
+    assert.equal(await fs.readFile(path.join(f.root, "visible"), "utf8"), "new");
   });
 
   test("clean is explicit, HEAD/index unchanged and only status attempted", async t => {

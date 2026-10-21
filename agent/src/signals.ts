@@ -30,6 +30,7 @@ import { clampUtf8Bytes, DECISIONS_MEMO_TRANSPORT_MAX_BYTES } from "./decisions-
 /** The in-process MCP server name; tools surface as `mcp__uzi__<tool>`. */
 export const SIGNAL_SERVER_NAME = "uzi";
 const SUBMIT_PLAN_TOOL = "submit_plan";
+import { parseSemanticProposal, semanticProposalSchema, type SemanticSubmission, type SemanticPlanning } from "./semantic-plan.js";
 const SAVE_DRAFT_PLAN_TOOL = "save_draft_plan";
 const SIGNAL_DONE_TOOL = "signal_done";
 export const ASK_USER_TOOL = "ask_user";
@@ -75,6 +76,7 @@ function validateNonClosing(input: unknown): {
 
 /** Worker-derived admission, shared by SDK handlers and stream/callback parsing. */
 export interface SignalScanOptions {
+  semanticPlanning?: SemanticPlanning;
   ownerDecisionRequested?: boolean;
 }
 
@@ -97,6 +99,7 @@ function validateOwnerDecision(input: unknown, opts: SignalScanOptions): {
 
 /** What the worker extracts from one SDK message's tool_use blocks. */
 export interface ScannedSignals {
+  semanticSubmission?: SemanticSubmission;
   ownerDecisionRequested?: { reason: string };
   nonClosing?: { reason: string };
   /** Neutral diagnostic for a rejected done call; other blocks remain independent. */
@@ -536,6 +539,7 @@ export function buildSignalMcpServer(
           "Omit it entirely for small single-unit work.",
       );
   }
+  if (opts.semanticPlanning) planShape["semantic_proposal"] = semanticProposalSchema.optional();
   const h = makeSignalToolHandlers(opts);
   return createSdkMcpServer({
     name: SIGNAL_SERVER_NAME,
@@ -1062,6 +1066,11 @@ export function scanSignals(message: unknown, opts: SignalScanOptions = {}): Sca
       // the whole list and the candidate stays NULL (fail-closed) instead of an empty or
       // silently narrowed completion contract. The last submit_plan in a message wins, and the
       // two shapes stay mutually exclusive.
+      delete out.semanticSubmission;
+      if (opts.semanticPlanning && input && Object.hasOwn(input, "semantic_proposal")) {
+        try { out.semanticSubmission = parseSemanticProposal(input["semantic_proposal"]); }
+        catch { out.semanticSubmission = { invalid: true }; }
+      }
       const rawMilestones = input?.["milestones"];
       const rejected = rejectedMilestonesOf(rawMilestones);
       if (rejected) {

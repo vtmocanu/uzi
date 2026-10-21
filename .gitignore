@@ -18,6 +18,8 @@
 # to know the any-depth rule. Redundant, not wrong.
 web/node_modules
 agent/node_modules
+# Per-invocation agent unit-test reports (agent/test/agent-report.ts)
+agent/.test-report/
 node_modules
 web/dist/
 # Rendered Homebrew formula output (task brew:formula); the template is Formula/uzi-cli.rb

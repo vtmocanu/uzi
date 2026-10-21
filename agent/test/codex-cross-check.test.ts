@@ -8,6 +8,7 @@ import type { ClaimResponse } from "../src/protocol.js";
 import type { WorkerClient } from "../src/client.js";
 import type { Logger } from "../src/log.js";
 import { recordingLogger } from "./helpers.js";
+import { CheckActivityRecorder } from "../src/cross-check-activity.js";
 import { CrossCheckCheckerUnavailableError } from "../src/codex/model-rejection.js";
 
 const verdict = JSON.stringify({ verdict: "approve", summary: "Anchors checked", items: [] });
@@ -49,6 +50,8 @@ function rig(options: {
  holdTurn?: boolean;
  holdStat?: boolean;
  refresh?: boolean;
+ activity?: CheckActivityRecorder;
+ fileopReply?: (op: { op: string; path: string }) => Record<string, unknown> | undefined;
 } = {}) {
  const requests: Frame[] = [];
  const ops: string[] = [];
@@ -112,6 +115,8 @@ function rig(options: {
   const op = frame as unknown as { id: number; op: string; path: string };
   ops.push(op.op);
   if (op.op === "stat" && options.holdStat) return;
+  const custom = options.fileopReply?.(op);
+  if (custom) { emit({ id: op.id, ...custom }); return; }
   emit({ id: op.id, ok: op.op === "stat" || (op.op === "read" && op.path === "anchor.ts"),
    data: Buffer.from("export const anchor = true;").toString("base64"), size: Buffer.byteLength("export const anchor = true;") });
  });
@@ -141,7 +146,7 @@ function rig(options: {
    if (options.round !== undefined) c.cross_check!.round = options.round;
    return checker.run(c, "/checkout", "/owned", signal, async (payload) => {
     usage.push(payload); if (options.failUsage && payload.event === "result") throw new Error("usage failed");
-   }, cleanupConfirmed);
+   }, cleanupConfirmed, options.activity);
   } };
 }
 
@@ -808,4 +813,161 @@ it("subscription checker posts a metered API-equivalent amount for a known model
   inputTokens: 300, cacheReadInputTokens: 600, cacheCreationInputTokens: 100,
   outputTokens: 200, reasoningOutputTokens: 50, costStatus: "metered", costUSD: 0.00291,
  });
+});
+
+// PRD #3166: cross-check activity evidence through the real Read/Search broker.
+function activityRig(calls: { tool: string; arguments: Record<string, unknown> }[], fileopReply?: NonNullable<Parameters<typeof rig>[0]>["fileopReply"]) {
+ const events: Record<string, unknown>[] = [];
+ const recorder = new CheckActivityRecorder((p) => { events.push(structuredClone(p)); }, { generation: 7 });
+ recorder.attach("/checkout", "/owned");
+ let index = 0;
+ const emitCall = (emit: Emit): void => {
+  const call = calls[index]!;
+  emit({ id: 200 + index, method: "item/tool/call", params: { threadId: "thread", turnId: "turn", callId: "call-" + index++, ...call } });
+ };
+ const r = rig({ activity: recorder, fileopReply, notes: (emit) => emitCall(emit),
+  onToolReply: (_frame, emit) => { if (index < calls.length) emitCall(emit); else r.terminal(emit); } });
+ return { r, events, recorder };
+}
+const bodyOf = (lines: number): string => Buffer.from(Array.from({ length: lines }, (_, i) => "line " + (i + 1)).join("\n") + "\n").toString("base64");
+const activityReply = (op: { op: string; path: string }): Record<string, unknown> | undefined => {
+ if (op.op === "stat" && op.path === ".") return undefined;
+ if (op.path === "multi.ts" && op.op === "read") return { ok: true, data: bodyOf(50), size: Buffer.from(bodyOf(50), "base64").length };
+ if (op.path === "big.ts") return { ok: false, code: "E_OVERSIZE" };
+ if (op.path === "gone.ts") return { ok: false, code: "E_NOT_FOUND" };
+ if (op.op === "list" && op.path === "src") return { ok: true, entries: [{ name: "f.ts", type: "file" }] };
+ if (op.path === "src/f.ts") {
+  const body = Buffer.from("a\nneedle SECRET_QUERY_xyz\n");
+  return { ok: true, data: body.toString("base64"), size: body.length };
+ }
+ return undefined;
+};
+
+it("activity: a normal run marks the model started and a pre-model refusal does not", async () => {
+ const done = activityRig([]);
+ assert.equal(await done.r.run(), verdict);
+ done.recorder.start();
+ done.recorder.summary("codex", "plan", true);
+ assert.equal(done.events.find((e) => e["event"] === "check_activity_summary")!["complete"], true);
+ const events: Record<string, unknown>[] = [];
+ const recorder = new CheckActivityRecorder((p) => { events.push(structuredClone(p)); }, { generation: 7 });
+ const c = pinnedClaim(); c.config!.default_effort = "unknown" as NonNullable<ClaimResponse["config"]>["default_effort"];
+ await assert.rejects(rig({ claim: c, activity: recorder }).run(), CrossCheckCheckerUnavailableError);
+ recorder.start();
+ recorder.summary("codex", "plan", true);
+ assert.equal(events.find((e) => e["event"] === "check_activity_summary")!["complete"], false);
+});
+
+it("activity: three ok reads with line ranges and one oversize read are recorded and counted", async () => {
+ const read = (_callId: number, offset: number) => ({ tool: "Read", arguments: { path: "multi.ts", offset, limit: 20 } });
+ const { r, events, recorder } = activityRig([read(0, 1), read(1, 21), read(2, 41), { tool: "Read", arguments: { path: "big.ts" } }], activityReply);
+ assert.equal(await r.run(), verdict);
+ recorder.summary("codex", "plan", true);
+ const rows = events.filter((e) => e["event"] === "check_activity");
+ assert.deepEqual(rows, [
+  { event: "check_activity", op: "read", outcome: "ok", path: "multi.ts", lines: [1, 20] },
+  { event: "check_activity", op: "read", outcome: "ok", path: "multi.ts", lines: [21, 40] },
+  { event: "check_activity", op: "read", outcome: "ok", path: "multi.ts", lines: [41, 50] },
+  { event: "check_activity", op: "read", outcome: "oversize", path: "big.ts" },
+ ]);
+ const summary = events.find((e) => e["event"] === "check_activity_summary")!;
+ assert.deepEqual(summary["reads"], { ok: 3, denied: 0, oversize: 1, limit: 0, error: 0 });
+});
+
+it("activity: a path-jail denied read of a path outside the checkout carries no path", async () => {
+ const { r, events } = activityRig([{ tool: "Read", arguments: { path: "../../etc/passwd" } }], activityReply);
+ assert.equal(await r.run(), verdict);
+ assert.deepEqual(events, [{ event: "check_activity", op: "read", outcome: "denied", category: "outside_checkout" }]);
+ assert.doesNotMatch(JSON.stringify(events), /etc\/passwd|passwd/);
+});
+
+it("activity: a missing file is an error and a file_path argument is honoured", async () => {
+ const { r, events } = activityRig([{ tool: "Read", arguments: { path: "gone.ts" } }, { tool: "Read", arguments: { file_path: "anchor.ts" } }], activityReply);
+ assert.equal(await r.run(), verdict);
+ assert.deepEqual(events, [
+  { event: "check_activity", op: "read", outcome: "error", path: "gone.ts" },
+  { event: "check_activity", op: "read", outcome: "ok", path: "anchor.ts", lines: [1, 1] },
+ ]);
+});
+
+it("activity: a Search records its path and match count and never the query", async () => {
+ const { r, events } = activityRig([{ tool: "Search", arguments: { query: "SECRET_QUERY_xyz", path: "src" } }], activityReply);
+ assert.equal(await r.run(), verdict);
+ assert.deepEqual(events, [{ event: "check_activity", op: "search", outcome: "ok", path: "src", matches: 1 }]);
+ assert.doesNotMatch(JSON.stringify(events), /SECRET_QUERY_xyz/);
+});
+
+it("activity: a tool outside Read and Search is not recorded", async () => {
+ const { r, events } = activityRig([{ tool: "Bash", arguments: {} }, { tool: "Read", arguments: { path: "multi.ts", limit: 5 } }], activityReply);
+ assert.equal(await r.run(), verdict);
+ assert.deepEqual(events, [{ event: "check_activity", op: "read", outcome: "ok", path: "multi.ts", lines: [1, 5] }]);
+});
+
+it("activity: an empty path falls through to file_path like the broker, for Read and Search", async () => {
+ const { r, events } = activityRig([
+  { tool: "Read", arguments: { path: "", file_path: "multi.ts", limit: 2 } },
+  { tool: "Search", arguments: { query: "needle", path: "", file_path: "src" } },
+ ], activityReply);
+ assert.equal(await r.run(), verdict);
+ assert.deepEqual(events, [
+  { event: "check_activity", op: "read", outcome: "ok", path: "multi.ts", lines: [1, 2] },
+  { event: "check_activity", op: "search", outcome: "ok", path: "src", matches: 1 },
+ ]);
+});
+
+it("activity: a Search the broker denies with search_limit records outcome limit", async () => {
+ const { r, events } = activityRig([{ tool: "Search", arguments: { query: "x", path: "src" } }],
+  (op) => op.op === "list" ? { ok: true, entries: [], truncated: true } : undefined);
+ assert.equal(await r.run(), verdict);
+ assert.deepEqual(events, [{ event: "check_activity", op: "search", outcome: "limit", path: "src" }]);
+});
+
+it("activity: a fileop E_TIMEOUT records outcome limit", async () => {
+ const { r, events } = activityRig([{ tool: "Read", arguments: { path: "slow.ts" } }],
+  (op) => op.path === "slow.ts" ? { ok: false, code: "E_TIMEOUT" } : undefined);
+ assert.equal(await r.run(), verdict);
+ assert.deepEqual(events, [{ event: "check_activity", op: "read", outcome: "limit", path: "slow.ts" }]);
+});
+
+it("activity: a failure after provider launch but before a confirmed turn reports incomplete capture", async () => {
+ const events: Record<string, unknown>[] = [];
+ const recorder = new CheckActivityRecorder((p) => { events.push(structuredClone(p)); }, { generation: 7 });
+ await assert.rejects(rig({ authFailure: true, activity: recorder }).run());
+ recorder.start();
+ recorder.summary("codex", "plan", true);
+ assert.equal(events.find((e) => e["event"] === "check_activity_summary")!["complete"], false,
+  "no model session started, so the capture cannot be complete");
+});
+
+it("activity: a fileop E_DENIED records denied with category policy and no path", async () => {
+ const { r, events } = activityRig([{ tool: "Read", arguments: { path: "nope.ts" } }],
+  (op) => op.path === "nope.ts" ? { ok: false, code: "E_DENIED" } : undefined);
+ assert.equal(await r.run(), verdict);
+ assert.deepEqual(events, [{ event: "check_activity", op: "read", outcome: "denied", category: "policy" }]);
+});
+
+it("activity: a Search with more than 20 matches records matches_truncated", async () => {
+ const body = Buffer.from(Array.from({ length: 30 }, () => "needle").join("\n") + "\n");
+ const { r, events } = activityRig([{ tool: "Search", arguments: { query: "needle", path: "src" } }], (op) => {
+  if (op.op === "list" && op.path === "src") return { ok: true, entries: [{ name: "f.ts", type: "file" }] };
+  if (op.path === "src/f.ts") return { ok: true, data: body.toString("base64"), size: body.length };
+  return undefined;
+ });
+ assert.equal(await r.run(), verdict);
+ assert.deepEqual(events, [{ event: "check_activity", op: "search", outcome: "ok", path: "src", matches: 20, matches_truncated: true }]);
+});
+
+it("activity: a Read past the end of the file records ok with no lines", async () => {
+ const { r, events } = activityRig([{ tool: "Read", arguments: { path: "multi.ts", offset: 500, limit: 10 } }], activityReply);
+ assert.equal(await r.run(), verdict);
+ assert.deepEqual(events, [{ event: "check_activity", op: "read", outcome: "ok", path: "multi.ts" }]);
+});
+
+it("activity: a throwing recorder never fails the check", async () => {
+ const throwing = { begin() { throw new Error("boom"); }, settle() { throw new Error("boom"); } } as unknown as CheckActivityRecorder;
+ let sent = false;
+ const r = rig({ activity: throwing, notes: (emit) => { sent = true; emit({ id: 90, method: "item/tool/call", params: { threadId: "thread", turnId: "turn", callId: "read", tool: "Read", arguments: { path: "anchor.ts" } } }); },
+  onToolReply: (_f, emit) => r.terminal(emit) });
+ assert.equal(await r.run(), verdict);
+ assert.ok(sent);
 });

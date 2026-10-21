@@ -120,3 +120,85 @@ func TestRunCheckpointTipLiveDB(t *testing.T) {
 		t.Fatalf("checkpoint_tip = %+v after a wrong-id write, want it untouched at %q", run.CheckpointTip, tip2)
 	}
 }
+
+// TestRunCheckpointAttestedSourceSetOnlyLiveDB pins issue #3194's set-only rule on the
+// unconditional writer SetRunCheckpointTip (the path taken when checkpoint retention is not
+// wired; the retention-wired fixtures take SetRunCheckpointTipIf instead). An attested publish
+// records its source, a NULL (legacy or unattested) publish advances the tip but preserves the
+// source, and a later attested publish replaces it.
+func TestRunCheckpointAttestedSourceSetOnlyLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	userID, connID, repoID := uuid.New(), uuid.New(), uuid.New()
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("exec %q: %v", sql, err)
+		}
+	}
+	exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, userID, fmt.Sprintf("cas-%s@e2e", userID))
+	exec(`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+	      VALUES ($1, $2, 'github', 'https://forge.e2e', 'bot', 1, $3)`, connID, userID, []byte{0x1})
+	exec(`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+	      VALUES ($1, $2, 1, 'g/cas', 'https://forge.e2e/g/cas', 'main', true)`, repoID, connID)
+
+	runID := uuid.New()
+	exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status)
+	      VALUES ($1, $2, $3, 'issue', 1, 'do x', 'ctx', 'running')`, runID, userID, repoID)
+
+	text := func(s string) pgtype.Text { return pgtype.Text{String: s, Valid: true} }
+	publish := func(step, tip string, source pgtype.Text) {
+		t.Helper()
+		rows, err := q.SetRunCheckpointTip(ctx, store.SetRunCheckpointTipParams{
+			ID: runID, CheckpointTip: text(tip), AttestedSource: source,
+		})
+		if err != nil {
+			t.Fatalf("%s: SetRunCheckpointTip: %v", step, err)
+		}
+		if rows != 1 {
+			t.Fatalf("%s: SetRunCheckpointTip moved %d rows, want 1", step, rows)
+		}
+	}
+	want := func(step, tip string, source pgtype.Text) {
+		t.Helper()
+		run, err := q.GetRunByID(ctx, runID)
+		if err != nil {
+			t.Fatalf("%s: GetRunByID: %v", step, err)
+		}
+		if run.CheckpointTip != text(tip) || run.CheckpointAttestedSource != source {
+			t.Fatalf("%s: run = (tip %+v, attested %+v), want (tip %q, attested %+v)",
+				step, run.CheckpointTip, run.CheckpointAttestedSource, tip, source)
+		}
+	}
+
+	const (
+		tipA    = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		tipB    = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		tipC    = "cccccccccccccccccccccccccccccccccccccccc"
+		sourceA = "1010101010101010101010101010101010101010"
+		sourceB = "2020202020202020202020202020202020202020"
+	)
+
+	publish("attested", tipA, text(sourceA))
+	want("attested", tipA, text(sourceA))
+
+	// The NULL publish must advance the tip and leave the attestation alone.
+	publish("unattested", tipB, pgtype.Text{})
+	want("unattested", tipB, text(sourceA))
+
+	publish("re-attested", tipC, text(sourceB))
+	want("re-attested", tipC, text(sourceB))
+}

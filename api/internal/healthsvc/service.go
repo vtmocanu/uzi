@@ -141,9 +141,13 @@ type Config struct {
 	// "nothing latched" (a struct-literal test, or a deployment without a worker service),
 	// so fleet.quarantine is ok.
 	ResidueQuarantine func(workerID uuid.UUID) (workersvc.ResidueQuarantine, bool)
-	Store             Store
-	Pool              *pgxpool.Pool
-	Settings          Settings
+	// MemoryAuthorityLost reports when the api first gated a worker's run-lane claims for lost
+	// memory authority (issue #3142); workersvc.Service.MemoryAuthorityLostFor satisfies it.
+	// nil reads as "nobody gated", so fleet.memory_authority is ok.
+	MemoryAuthorityLost func(workerID uuid.UUID) (time.Time, bool)
+	Store               Store
+	Pool                *pgxpool.Pool
+	Settings            Settings
 	// DiskFull is the shared disk-full (SQLSTATE 53100) sighting signal fed by the api
 	// pool's query tracer. nil means the db check never reports disk-full.
 	DiskFull *dbdiskfull.Signal
@@ -294,6 +298,7 @@ func (s *Service) Evaluate(ctx context.Context) (Doc, error) {
 		s.checkFleetDisk(now, workers),
 		s.checkFleetRunDisk(ctx, now, workers),
 		s.checkFleetQuarantine(now, workers),
+		s.checkFleetMemoryAuthority(now, workers),
 		waiting,
 		s.checkQueueUndispatched(ctx, now),
 		controllerReport,

@@ -455,6 +455,25 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 	}
 	dto := runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)
 	if user.ID == run.UserID {
+		dto.CompletionPending, err = workersvc.CompletionPending(run)
+		if err != nil {
+			httpx.Error(w, http.StatusInternalServerError, "semantic completion authority unavailable")
+			return
+		}
+		if presentation, _ := workersvc.SemanticGateBindingFromRun(run); presentation != nil {
+			dto.SemanticGate, err = h.wsvc.SemanticGateForOwner(r.Context(), user.ID, run)
+			if err != nil {
+				httpx.Error(w, http.StatusInternalServerError, "semantic presentation unavailable")
+				return
+			}
+		}
+		// PRD #1230 D5: the drift detector is advisory; a projection failure omits it and never
+		// blocks the owner's run view.
+		if drift, driftErr := h.wsvc.SemanticDriftForOwner(r.Context(), user.ID, run); driftErr != nil {
+			slog.Error("semantic drift projection", "run_id", run.ID, "error", driftErr)
+		} else {
+			dto.SemanticDrift = drift
+		}
 		if run.Status == "awaiting_approval" {
 			if digest, err := workersvc.ResetStateDigest(run); err == nil {
 				dto.ResetStateDigest = digest
@@ -746,7 +765,7 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 			dto.BranchHasOpenMr = stats.MrCount > 0
 		}
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"run": dto})
+	writeOwnerRun(w, dto)
 }
 
 // maxRunMessagesPage caps the ?limit= page size on ListRunMessages so a single
@@ -907,7 +926,7 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req apitypes.RunInputRequest
-	if err := httpx.DecodeJSON(r, &req); err != nil {
+	if err := h.decodeOwnerRunInput(r, user.ID, id, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -931,6 +950,7 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 		ActionIfMatch:            r.Header.Get("If-Match"),
 		OverrideCapabilities:     req.OverrideCapabilities,
 		DiscardPendingOutcome:    req.DiscardPendingOutcome,
+		SemanticApproval:         req.SemanticApproval,
 		ExpectedGateRevision:     req.ExpectedGateRevision,
 		Reconciliation:           req.Reconciliation,
 		ExpectedResetStateDigest: req.ExpectedResetStateDigest,
@@ -968,6 +988,10 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 			// left the plan gate while it retried). Nothing was written; distinct from
 			// gate_revision_mismatch, which names a revision the client sent.
 			httpx.ErrorReason(w, http.StatusConflict, err.Error(), "approval_milestones_moved")
+		case errors.Is(err, workersvc.ErrSemanticResetUnsupported):
+			httpx.ErrorReason(w, http.StatusConflict, err.Error(), "semantic_reset_unsupported")
+		case errors.Is(err, workersvc.ErrSemanticGateMismatch):
+			httpx.ErrorReason(w, http.StatusConflict, "semantic gate changed; read and approve the exact presentation", "semantic_gate_mismatch")
 		case errors.Is(err, workersvc.ErrExpectedGateRevisionNotApplicable):
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, workersvc.ErrRunNotFound):
@@ -1022,7 +1046,8 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 			errors.Is(err, workersvc.ErrWallParkChanged),
 			errors.Is(err, workersvc.ErrWallParkCrossCheckIneligible),
 			errors.Is(err, workersvc.ErrWallParkStopUnavailable),
-			errors.Is(err, workersvc.ErrProviderHoldStopUnavailable):
+			errors.Is(err, workersvc.ErrProviderHoldStopUnavailable),
+			errors.Is(err, workersvc.ErrBaseAttestationHeld):
 			// PRD #1189 M1: extending is off instance-wide, the request exceeds the per-request
 			// maximum or would pass the total run-time limit, or the run's kind never times out; a
 			// wall-park extend whose park changed or whose cross-check can no longer resume (nothing

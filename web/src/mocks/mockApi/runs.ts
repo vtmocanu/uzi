@@ -17,6 +17,7 @@ import {
 import { changedMilestones } from "../../lib/milestoneReset";
 import { ApiError } from "../../lib/apiError";
 import { isCredentialSwitchRefusedLane } from "../../lib/credentialOverride";
+import { credentialSwitchHold } from "../../lib/credentialSwitchHold";
 import { isTerminalRun } from "../../lib/runStatus";
 import {
   LIVE_RUN_ID,
@@ -143,6 +144,10 @@ function custodyResponse(): RecoveryCustodyHolds {
 // (setRunCredential below) is recorded here so the live mutation wins over the seed —
 // which is what lets the "lingering-stamp" case prove no stale switch shows after apply.
 const credentialSwitched = new Set<string>();
+
+// Issue #3181: the server's ErrRunHoldSettling text, verbatim (api/internal/workersvc/credential_switch.go).
+const CREDENTIAL_SWITCH_SETTLING_REFUSAL =
+  "the worker is still finishing its own operations for this run; try Resume again shortly, or Cancel the run";
 
 // One applied epoch, so the history list renders with a token label + reason + time.
 const appliedEpochs = (): CredentialEpoch[] => [
@@ -726,11 +731,17 @@ export const runsApi = {
     // masking a stray call with a false success.
     if (run.harness === "codex")
       throw new ApiError(422, "credential override unsupported on codex harness");
+    // Issue #3181: the server refuses a switch while a settling hold's worker is live and
+    // finishing (the case this mock models; the server also lifts that fence when the worker
+    // is lost); an unsettled hold takes the override and requeues.
+    const switchHold = credentialSwitchHold(run);
+    if (switchHold === "settling") throw new ApiError(409, CREDENTIAL_SWITCH_SETTLING_REFUSAL);
     credentialSwitched.add(id);
     patchRun(id, {
       credential_override: overrideToRead(body),
       credential_switch: null,
       updated_at: new Date().toISOString(),
+      ...(switchHold === "unsettled" ? { status: "queued" as const, hold_reason: null, status_since: new Date().toISOString() } : {}),
     });
     const updated = { ...getRun(id)! };
     const pooledEligible = mockSecrets.some((s) => s.kind === "anthropic_token" && s.auto_eligible);
@@ -944,9 +955,13 @@ export const runsApi = {
     const memoryHeld = run.status === "recovery_wait" && run.recovery_wait_cause === "worker_memory_pressure";
     if (run.status !== "paused" && run.status !== "pool_wait" && !memoryHeld)
       throw new ApiError(409, `run is ${run.status}`);
+    // Issue #3181: mirrors the server's ErrRunHoldSettling refusal; an unsettled hold resumes.
+    const switchHold = credentialSwitchHold(run);
+    if (switchHold === "settling") throw new ApiError(409, CREDENTIAL_SWITCH_SETTLING_REFUSAL);
     patchRun(id, { status: "queued", updated_at: new Date().toISOString(),
       // The held-only projection disappears on Resume; the API owns the fresh episode.
       ...(memoryHeld ? { memory_hold: undefined, recovery_wait_cause: null, recovery_retry_not_before: null } : {}),
+      ...(switchHold === "unsettled" ? { hold_reason: null, status_since: new Date().toISOString() } : {}),
       ...(run.hold_reason === "provider_unavailable" ? {
         provider_park_count: 0, provider_park_streak_started_at: null, can_stop_at_provider_hold: false,
       } : {}),

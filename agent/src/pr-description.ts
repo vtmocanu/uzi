@@ -58,6 +58,8 @@
 import { createHash } from "node:crypto";
 import { SanitizedPrDescriptionFields } from "./client.js";
 import type { ClaimConfig, PrDescriptionSource } from "./protocol.js";
+import type { CompletionPending } from "./completion-pending.js";
+import { hasDriftContradiction, type SemanticObservationRecord } from "./semantic-drift.js";
 
 // ── Markers ─────────────────────────────────────────────────────────────────────────────────
 
@@ -1317,6 +1319,14 @@ export interface CompletionBlockInput {
   scopeCapped?: { completedCount: number; total?: number };
   /** Issue-only declaration; the caller redacts the reason before rendering. */
   nonClosing?: { reason: string };
+  /** PRD #1230 M4: server-sourced, human-authorized maintainer criteria that remain unverified.
+   *  The caller redacts every string field first; this renderer escapes them. Rendering never
+   *  marks anything satisfied and always suppresses `Closes`. */
+  completionPending?: CompletionPending;
+  /** PRD #1230 D5: the publication-phase drift observation the server stored. The caller redacts every
+   *  string field first; this renderer escapes them. Detection only: it renders one note when the record
+   *  reports a contradiction, never marks anything satisfied and never touches `Closes`. */
+  semanticDrift?: SemanticObservationRecord;
   /** The run used the repository's own agents (PRD #37 D3b). */
   repoAgents?: boolean;
   gatesUnverified?: readonly string[];
@@ -1361,9 +1371,63 @@ function stalenessLine(describedSha: string, headSha: string): string {
   ].join("\n");
 }
 
+/** Character budget for the fully rendered maintainer items. The decoder admits 256 criteria of about
+ *  12 KB each, far over BODY_CAP_CHARS, and capBody never trims the completion block; items past the
+ *  budget render compactly (ids only), so the block stays bounded whatever the server sent. */
+const PENDING_ITEM_CHAR_BUDGET = 24_000;
+
+/** The unchecked maintainer checklist (PRD #1230 M4), inside the issue arm's blockquote. A milestone
+ *  that is both owner-deferred and holds a maintainer criterion counts once in the outstanding line,
+ *  which is omitted under a scope cap because the inputs then cannot support a total. */
+function pendingBlock(pending: CompletionPending, deferredMilestones: readonly string[], scopeCapped: boolean): string[] {
+  const criteria = [...pending.criteria].sort((a, b) => a.criterion_id < b.criterion_id ? -1 : a.criterion_id > b.criterion_id ? 1 : 0);
+  const outstanding = new Set([...deferredMilestones, ...criteria.map((c) => c.milestone_id)]).size;
+  const full: string[] = [];
+  const brief: string[] = [];
+  let used = 0;
+  for (const c of criteria) {
+    const lines = [
+      `> - [ ] ${codeSpan(c.criterion_id)} (milestone ${codeSpan(c.milestone_id)}) — ${escapeInline(c.text)}: ${escapeInline(c.reason)}`,
+      ...c.conditions.map((x) => `>   - Condition: ${escapeInline(x)}`),
+      ...c.verification_steps.map((x) => `>   - Verify: ${escapeInline(x)}`),
+    ];
+    const size = lines.reduce((n, l) => n + l.length + 1, 0);
+    if (brief.length === 0 && used + size <= PENDING_ITEM_CHAR_BUDGET) { full.push(...lines); used += size; }
+    else brief.push(`> - [ ] ${codeSpan(c.criterion_id)} (milestone ${codeSpan(c.milestone_id)})`);
+  }
+  return [
+    "> ⚠️ **Maintainer verification pending (PRD #1230).** The criteria below were authorized by the owner as",
+    "> requiring the maintainer, not this run. They are UNVERIFIED and this pull request does NOT close the source issue:",
+    "> Checking a box grants no completion or closure authority; a body refresh restores these boxes to unchecked.",
+    ...(scopeCapped ? [] : [`> Outstanding milestones for the source issue: ${outstanding} (a deferred milestone that also holds a maintainer criterion counts once).`]),
+    ...full,
+    ...(brief.length > 0 ? [`> ${brief.length} more criteria are shown in brief; their full text is on the run page for the run owner.`, ...brief] : []),
+  ];
+}
+
+/** Display bound for one drift value: ids and paths can be long, and capBody never trims this block. */
+const DRIFT_VALUE_CHARS = 160;
+const clipDrift = (s: string): string => s.length > DRIFT_VALUE_CHARS ? s.slice(0, DRIFT_VALUE_CHARS) + "..." : s;
+
+/** The source drift note (PRD #1230 D5), or [] when the record reports no contradiction. At most nine
+ *  sources and eight links each way, each value clipped, so the block stays bounded. */
+function driftBlock(record: SemanticObservationRecord): string[] {
+  if (!hasDriftContradiction(record)) return [];
+  const sources = [record.issue, ...record.prds].filter((x) => x.outcome !== "unchanged");
+  return [
+    "> ⚠️ **Source drift detected (PRD #1230).** The issue or a linked PRD changed after approval or could not be checked.",
+    "> The approved contract is unchanged and needs owner review. This note is a detector only: it records no criterion as met.",
+    ...sources.map((x) => `> - ${codeSpan(clipDrift(x.source_id))}: ${escapeInline(x.outcome)}${x.reason ? ` (${escapeInline(x.reason)})` : ""}${x.checkbox_only ? " (checkbox state only)" : ""}`),
+    ...record.links_added.map((l) => `> - PRD link added to the issue: ${codeSpan(clipDrift(l))}`),
+    ...record.links_removed.map((l) => `> - PRD link removed from the issue: ${codeSpan(clipDrift(l))}`),
+    ...(record.links_truncated ? ["> - Some PRD links were not compared."] : []),
+  ];
+}
+
 function issueArm(input: CompletionBlockInput): string[] {
   const iid = input.issueIid;
   const deferred = input.completionScope?.deferred ?? [];
+  const pending = input.completionPending && input.completionPending.criteria.length > 0 ? input.completionPending : undefined;
   const accepted = input.completionScope?.accepted ?? [];
   const isOwnerPartial = deferred.length > 0;
   // Only the normal arm (last below) can render `Closes #N`, and a non-closing declaration
@@ -1391,13 +1455,16 @@ function issueArm(input: CompletionBlockInput): string[] {
       : [
           // #1801: NOT `Implements issue #N.` (a GitLab closing keyword).
           `Related to #${iid}.`,
-          ...(input.closes && !input.nonClosing ? ["", `Closes #${iid}`] : []),
+          ...(input.closes && !input.nonClosing && !pending ? ["", `Closes #${iid}`] : []),
         ];
   if (input.nonClosing) {
     const reason = escapeInline(input.nonClosing.reason) || Array.from(input.nonClosing.reason, (c) =>
       `U+${c.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}`).join(" ");
     lines.push("", `> **Issue remains open.** ${reason}`);
   }
+  if (pending) lines.push("", ...pendingBlock(pending, deferred.map((d) => d.milestone_id), !!input.scopeCapped));
+  const drift = input.semanticDrift ? driftBlock(input.semanticDrift) : [];
+  if (drift.length > 0) lines.push("", ...drift);
   if (accepted.length > 0) {
     lines.push(
       "",

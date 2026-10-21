@@ -53,7 +53,11 @@ func (q *Queries) RecordLiveCheckpointPublishAttempt(ctx context.Context, p Reco
 		if err != nil {
 			return uuid.Nil, err
 		}
-		if row.RunID != p.RunID || row.Branch != p.Branch || row.Ref != p.Ref || row.Tip != p.Tip {
+		// The attestation is part of the attempt's identity (issue #3194): a prepared row is never
+		// rebound to a different attested source (or to none), so the reconcilers can only ever
+		// write the value frozen with this row's tip. A mismatch refuses the push.
+		if row.RunID != p.RunID || row.Branch != p.Branch || row.Ref != p.Ref || row.Tip != p.Tip ||
+			row.AttestedSource != p.AttestedSource {
 			return uuid.Nil, errors.New("checkpoint prepared attempt does not match publish")
 		}
 	} else {

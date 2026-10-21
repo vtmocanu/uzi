@@ -4,6 +4,7 @@
 wording committed on this branch; the hosted-worker restart acceptance below is the maintainer's,
 post-merge, out of band).
 **Date**: 2026-09-30
+**Amended by**: [ADR-3153](3153-runner-shared-pvc-subpath.md) (Docker-lane clones now survive pod replacement on migrated workers)
 **Issue**: [vtmocanu/uzi#1742](https://github.com/vtmocanu/uzi/issues/1742). No PRD is linked;
 this ADR carries the decisions.
 **Builds on**: [adr/1390-outage-requeue-readoption.md](1390-outage-requeue-readoption.md) (the
@@ -245,9 +246,12 @@ exist. What happens in each case:
   settled custody.
   No recorded recovery evidence or unresolved custody instead keeps `worker_lost`;
   that decision is not proof of absence of unrecorded work.
-- **On a Docker-lane worker** the attempt clone lives on `/data/runner`, an `emptyDir`, and does
-  not survive a pod loss; there the work that existed only in the clone is gone (whatever reached
-  the worker's bare tracking ref at a checkpoint remains).
+- **On a Docker-lane worker** (as written for issue #1742; amended by
+  [ADR-3153](3153-runner-shared-pvc-subpath.md)) the attempt clone lived on `/data/runner`, an
+  `emptyDir`, and did not survive a pod loss; there the work that existed only in the clone was gone
+  (whatever reached the worker's bare tracking ref at a checkpoint remained). On a migrated worker
+  `/data/runner` is a data-PVC subPath and the clone survives pod replacement; a data-PVC recycle or
+  delete still removes it.
 
 **(c) No archive is stated only when absent.** `--json` is unchanged. Under the #2445
 amendment, attention is independent of archive availability and latest capture progress.

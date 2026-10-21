@@ -77,7 +77,12 @@ receive bounded automatic revisions. Exhaustion, blockers and check failures
 normally park for a human decision even with auto-approve on. A Codex lead on
 a worker without `cross_check_codex_lead_v1` parks for a human too.
 Irrecoverable delivery losses fail the run; see
-[Cross-check](./cross-check.md#terminal-delivery-failures). The plan is
+[Cross-check](./cross-check.md#terminal-delivery-failures). A semantic run
+(dormant until #1231; production runs are not enrolled) also needs complete
+source coverage and no maintainer criteria, or an auto-approved schedule run
+parks for a human instead; see
+[Autopilot](./autopilot.md#semantic-runs-park-instead-of-auto-approving-dormant).
+The plan is
 recorded either way, and a human still merges the resulting MR; the
 [main-branch guardrails](../ARCHITECTURE.md#guardrail-layers-the-primary-directive)
 apply independently of schedule approval.
@@ -235,22 +240,29 @@ A **sweep default** likewise offers owner guidance as an **overlay**: its baked
 guidance stays catalog-owned (shown read-only and auto-tracking catalog updates)
 and your overlay is composed onto it at fire time, under a single guidance header.
 
+Guidance affects one dormant detector. On a semantic run (not enrolled in
+production until #1231), source-drift observations compare the current forge
+issue with the frozen issue text; a scheduled run whose frozen text was composed
+with guidance is compared with the raw issue body saved at creation instead, so
+it shows **unchanged** until the issue is edited. Drift only displays and never holds the
+run; see [Completion holds](./run-completion-hold.md#source-drift-is-a-detector-only).
+
 ## Proposal output: MR or issues
 
 A prompt-target schedule that *proposes* work — a brainstorm or a survey that
-suggests something a maintainer might pick up, like feature bingo or the
-refactor scout — has an **output mode**: `mr` or `issues`. Without a
-catalog output setting, the default is `mr`; feature bingo and refactor scout
-ship with `issues`. It is **prompt-target only**: a pinned issue or a label
+suggests something a maintainer might pick up, like feature bingo, the
+refactor scout or the CI scout — has an **output mode**: `mr` or `issues`. Without a
+catalog output setting, the default is `mr`; feature bingo, refactor scout and
+CI scout ship with `issues`. It is **prompt-target only**: a pinned issue or a label
 sweep runs against an issue that already exists, so there is no proposal to
 file, and the setting is
 rejected there (HTTP 422 / a CLI usage error) rather than silently ignored.
 
 In **`mr` mode** — the existing delivery behavior — a proposal run writes an
 idea file and opens a merge request for it (feature bingo's `bingo: <feature>` MR,
-the refactor scout's proposal file). Set `--output mr` to keep this path for
-either catalog job; their prompt bodies still contain the idea-file and MR
-instructions used by this mode.
+the refactor scout's and CI scout's proposal files). Set `--output mr` to keep this
+path for any of these catalog jobs; their prompt bodies still contain the idea-file
+and MR instructions used by this mode.
 
 In **`issues` mode**, the run produces the proposal as structured content and,
 when it completes, uzi files it as a **forge issue** on the owner's connection.
@@ -273,12 +285,12 @@ appends a compact digest of them to the rendered prompt, so the run sees what
 has already been proposed (and declined) and is told not to repeat it unless
 the evidence materially changed.
 
-Feature bingo and refactor scout now ship with `issues` as their catalog
+Feature bingo, refactor scout and CI scout ship with `issues` as their catalog
 output; prompt jobs without a catalog output setting fall back to `mr`. A
 schedule with a stored `mr` or `issues` mode keeps that choice. An existing
 catalog schedule whose stored mode is NULL inherits the new catalog value on
 its next fire, with no migration of stored rows. Reset restores a catalog
-job's current baseline, so resetting either proposal job adopts `issues`.
+job's current baseline, so resetting any of these proposal jobs adopts `issues`.
 Choose `--output mr` on the CLI (`uzi schedule create`/`edit`, see [the CLI
 reference](./cli.md#commands)) or in the web schedule modal to retain
 idea-file and MR delivery.
@@ -682,19 +694,21 @@ get` prints a **Recent fires** block after **Last fire**
 
 ## Default jobs
 
-uzi ships a small **catalog of built-in default jobs** — eleven generic,
+uzi ships a small **catalog of built-in default jobs** — twelve generic,
 repo-agnostic schedules covering the standing automations most projects want
 from day one: a weekly test-improvement pass, a weekly docs-hygiene sweep, a
 deep bug-hunt audit, a feature-brainstorm prompt, a biweekly propose-only
 refactoring scout that surveys for one structural refactor and files a
-proposal issue by default (never implementing it, `refactor-scout`), daily
+proposal issue by default (never implementing it, `refactor-scout`), a
+weekly [CI scout](#ci-scout) that reads the repo's recent CI history and files
+one measured CI improvement proposal (`ci-scout`), daily
 sweeps over the `bug` and `Planned` labels and over issues **assigned to the uzi-bot
 account** (`assigned-sweep`), an On-deck backlog drain every 10 minutes
 (`ondeck-sweep`), and self-improvement — an autonomous audit of
 the enabled repo's own codebase that picks one top improvement, and a
 default-branch CI repair job (`ci-repair`, hourly, covered in
 [Default-branch CI repair](#default-branch-ci-repair)). Each has a
-baked cron cadence and, for the five prompt
+baked cron cadence and, for the six prompt
 jobs, a baked prompt; three of the four sweeps instead carry a baked label
 selector, and the fourth (`assigned-sweep`) carries the non-label "assigned"
 selector kind instead (see [Targets](#targets) above); self-improvement
@@ -745,8 +759,8 @@ the catalog — its entry is cadence and model only (see
   including assigned-sweep, still apply the [issue-input approval
   gate](#issue-input-and-the-approval-gate) per run; prompt defaults keep
   their existing approval behavior. Nothing a default job does merges on
-  its own. In their default `issues` mode, feature bingo and
-  refactor scout file proposal issues; `--output mr` retains their idea-file
+  its own. In their default `issues` mode, feature bingo, refactor scout
+  and CI scout file proposal issues; `--output mr` retains their idea-file
   and MR path. The other prompt jobs open merge requests when they produce a
   change: docs hygiene lands its mechanical fixes (broken links, stale refs,
   frontmatter only — never prose rewrites, `CLAUDE.md`, or anything under
@@ -823,6 +837,44 @@ marks the default **customized**. An API PATCH of C alone keeps the stored K. Re
 catalog values clears that divergence; the customized marker clears when
 no editable field diverges. `uzi schedule reset <id>` restores the current
 catalog baseline, including C=4, K=2 and removal on for On-deck sweep.
+
+### CI scout
+
+The **CI scout** (`ci-scout`, weekly, Monday 06:00 UTC) proposes one CI
+improvement per cycle and never implements it. When it fires, uzi reads the
+repo's recent CI history from the forge and appends a bounded snapshot to the
+run's prompt, because the run itself has no tool to read historical CI timings,
+attempts or logs:
+
+- **Window**: runs created in the last 14 days, up to 50 default-branch runs and
+  20 merge/pull request runs, each with every attempt's jobs where the forge can
+  return them (GitHub and GitLab; Forgejo returns only the latest attempt, so
+  retries within a run are reported as unknown there).
+- **What it summarizes**: per-job p50/p90 duration, the latest week against the
+  week before, time to the first failure, suspected flakes (a job that failed and
+  then passed on the same commit, within a run or across runs of one workflow)
+  with their failed and rerun execution, cancelled and overlapping runs, an
+  evidence list of the runs and jobs behind every figure, and up to four log
+  tails of failed jobs. Only timestamps the forge reported are used; a figure
+  missing some durations is shown as a lower bound with its unknown count.
+- **Bounds**: collection stops at a 15-second deadline, a cap on forge calls or
+  the shared CI read budget, and the snapshot then says what is partial. It is
+  capped at 48 KiB; anything trimmed leaves a marker. Each fire collects
+  synchronously, so one scheduler tick collects for at most two CI scouts and
+  holds any further due scout until a later tick.
+- **The proposal**: one issue (`proposal::ci-scout`) with a short summary and an
+  implementation spec ready for a run, picked from duration regressions, slow
+  feedback, slow jobs, suspected flakes, infrastructure failures and
+  cancellation waste. It never proposes removing or weakening a test or check,
+  skipping checks by changed paths without a proven dependency model, raising a
+  timeout or narrowing a matrix; every proposal requires a before/after
+  inventory showing nothing that runs was dropped, and says whether it edits CI
+  workflow files a bot token may not be allowed to push. "Nothing worth
+  proposing" is a valid outcome. Promote a proposal with the `uzi` label as
+  usual.
+
+The snapshot is tied to the catalog job: a **clone** of the CI scout keeps the
+prompt but detaches from the catalog, so it fires without CI history.
 
 ### Self-improvement
 
@@ -1242,8 +1294,8 @@ capability requirement.
 ## Automatic fixes on scheduled-run MRs
 
 The merge requests a schedule opens — **MR-mode prompt** jobs (docs
-hygiene, test improvement, bug hunt, feature bingo or refactor scout with
-`--output mr`, and custom prompt schedules in `mr` mode) and the
+hygiene, test improvement, bug hunt, feature bingo, refactor scout or CI scout
+with `--output mr`, and custom prompt schedules in `mr` mode) and the
 [self-improvement](#self-improvement) job —
 participate in uzi's two unattended autofix lanes, exactly like the MRs your
 issue runs open:

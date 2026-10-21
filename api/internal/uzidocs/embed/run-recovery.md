@@ -120,6 +120,60 @@ still proceeds to the hold; stale claim ownership stops the flight while
 retaining its source. See [Completion holds](run-completion-hold.md) for scope
 decisions, plain-resume refusal and version limits.
 
+## Credential-switch holds
+
+When you switch the token of a run that still carries retained recovery work
+([Anthropic tokens](anthropic-token.md#where-you-can-pick-it)), the worker
+first proves the run's own processes stopped before it reports the switch:
+a guarded command settle, a kill of the agent's process tree, a reap of
+processes attributed to the run's HOME, and a quiescence check, all within a
+bounded allowance. If that is proven, the switch releases as usual. If it is
+not, the run is held for you. The hold is `paused` and keeps the run's work
+and custody on that worker:
+
+- **`credential_switch_settling`**: the worker is still finishing its own
+  operations: on a Claude run the guarded-lane disposal and dependency
+  install, joined without starting or killing anything; on a Codex run its
+  normal terminal tool disposal.
+  While the holding worker is live and still the same registration, **Resume**
+  and `uzi run set-token` are refused with a 409 ("the worker is still
+  finishing its own operations for this run; try Resume again shortly, or
+  Cancel the run"); the refusal lifts on the worker's acknowledgement, a stale
+  heartbeat, the worker's removal or its re-registration. **Cancel** always
+  works. The CLI shows `credential switch settling`, the web shows
+  **settling: token switch** (Resume and Switch token stay enabled and show
+  the refusal inline).
+- **`credential_switch_unsettled`**: the worker has acknowledged that its own
+  operations joined and the run is held for you. The acknowledgement does not
+  prove the run's processes stopped. The CLI shows `credential switch unsettled`, the web shows
+  **held: token switch**. **Resume** requeues the run on the token you chose
+  (the same worker is preferred); `uzi run set-token` saves a token and
+  resumes. **Cancel** ends the run. The owner feed message names only a fixed
+  survivor class (`worker_child`, `unreadable`, `restarted`, `kill_failed`, or
+  `unverified`, `settle unconfirmed`, `deadline`), never a pid; the worker log
+  keeps the sanitized detail, which can include pids.
+
+Settling lifts only on the worker's acknowledgement (fenced on the worker,
+run, claim generation and registration nonce), the worker's heartbeat going
+stale, the worker's removal, or the worker re-registering. Elapsed time never
+lifts it. Resuming after a lift does not skip any check: the next claim still
+runs its fail-closed predecessor quiescence proof, and a survivor that stays
+unverified still ends the run `worker_residue_blocked` with custody kept.
+
+This does not cover every switch on a retained run. The worker stops non-terminal
+without requesting a hold when the API lacks the `credential_switch_hold` protocol
+feature or the retained flight's ownership reads `awaiting_*`. A refused hold report
+also stops the flight without a hold.
+
+If a hold report stays unconfirmed after one retry and an ownership read, the hold
+may already exist on the server. After its own operations join, the worker still
+sends the fenced settlement acknowledgement, with bounded heartbeat retries if
+delivery is uncertain. If the hold never applied, that acknowledgement changes
+nothing. The owner feed does not claim a confirmed hold without proof. The next
+claim's quiescence check stays fail-closed. In a narrow race, a refused `set-token`
+can still save the token you chose. Design rationale:
+[ADR-1247](../adr/1247-per-run-token-selection.md).
+
 ## When plan-revision retries expire
 
 After bounded inner retries exhaust a provider transient during a human plan
@@ -737,9 +791,12 @@ server custody, and nothing about it appears in the feed or in `uzi run recovery
 as a hold:
 
 - A restart of the same worker pod keeps the retained clone.
-- Replacing the pod loses an `emptyDir` clone on the Docker tier, even though the
-  bare repository's ledger entry or marker survive on the data volume. Inspect
-  then reports the source as missing, never as empty.
+- Replacing the pod keeps the clone on a Docker-tier worker that runs the
+  runner-shared layout (`/data/runner` is a subPath of the data volume, #3153).
+  On a worker still on the old layout, pod replacement loses the `emptyDir`
+  clone even though the bare repository's ledger entry or marker survive on the
+  data volume; inspect then reports the source as missing, never as empty. A
+  custody-held Docker worker stays on the old layout until custody releases.
 - Tearing down the PVC loses both.
 
 A successor's release of the old hold is not proof that the old clone's dirty
@@ -1502,9 +1559,10 @@ What the channel does not promise:
   uid's existing write access to `/data/runner`. Under the uid split the runner uids
   cannot connect.
 - **Durability follows the clone's storage.** A same-pod worker process restart keeps
-  the clone. Pod replacement loses an `emptyDir` clone (the Docker-tier `/data/runner`)
-  even though the bare-config ledger and marker survive; inspect reports such a source as
-  missing, never as empty work. PVC teardown loses both.
+  the clone. Pod replacement keeps the clone on a Docker-tier worker with the
+  runner-shared layout (#3153); on an old-layout worker it loses the `emptyDir` clone
+  (`/data/runner`) even though the bare-config ledger and marker survive; inspect reports
+  such a source as missing, never as empty work. PVC teardown loses both.
 - **Gitignored files are not covered.** No capture covers them; coverage is `HEAD` plus
   tracked and untracked non-ignored bytes.
 

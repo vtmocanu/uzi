@@ -4,6 +4,7 @@ package main
 // stop (PRD #1009 M4).
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -232,10 +233,36 @@ func newRunApproveCmd(env Env, gf *globalFlags) *cobra.Command {
 			// so the approve names the plan that was at the gate when the owner decided.
 			var presented apitypes.RunDTO
 			var expected *int64
+			var semantic *apitypes.SemanticGateApproval
 			if cmd.Flags().Changed("token") {
-				presented, expected, err = approvalPresentation(cmd, c, args[0])
+				// Bind the credential action and automatic semantic approval to one presentation.
+				// Explicit semantic/revision flags resolve without a second owner read.
+				if cmd.Flags().Changed("semantic-approval") || cmd.Flags().Changed(expectedGateRevisionFlag) {
+					expected, semantic, err = resolveSemanticApproval(env, cmd, c, args[0])
+					if err == nil {
+						presented, _, err = approvalPresentation(cmd, c, args[0])
+					}
+				} else {
+					presented, expected, err = approvalPresentation(cmd, c, args[0])
+					if err == nil && expected != nil && presented.SemanticGate != nil {
+						var raw []byte
+						raw, err = json.Marshal(presented.SemanticGate.Approval)
+						if err == nil {
+							semantic = new(apitypes.SemanticGateApproval)
+							err = json.Unmarshal(raw, semantic)
+						}
+						if err == nil && semantic.PresentationRevision != *expected {
+							err = uzicli.Exitf(uzicli.ExitConflict, "semantic presentation revision changed; review the gate again")
+						}
+						if err == nil {
+							for _, row := range semanticGateRows(presented) {
+								_, _ = fmt.Fprintf(env.Stderr, "%s: %s\n", row[0], row[1])
+							}
+						}
+					}
+				}
 			} else {
-				expected, err = resolveExpectedGateRevision(cmd, c, args[0])
+				expected, semantic, err = resolveSemanticApproval(env, cmd, c, args[0])
 			}
 			if err != nil {
 				return err
@@ -273,7 +300,11 @@ func newRunApproveCmd(env Env, gf *globalFlags) *cobra.Command {
 					return uzicli.Exitf(uzicli.ExitConflict, "credential switch applied; review the plan gate before approving; no plan approval was sent")
 				}
 			}
-			err = submitInput(env, gf, c, cmd, args[0], kindApprovePlan, "", sel, false, expected)
+			if semantic != nil {
+				err = submitBoundInput(env, gf, c, cmd, args[0], kindApprovePlan, "", sel, false, expected, semantic)
+			} else {
+				err = submitInput(env, gf, c, cmd, args[0], kindApprovePlan, "", sel, false, expected)
+			}
 			// PRD #1795 D5: the revision is read BEFORE the switch (above), so a gate refused as
 			// stale can arrive after the switch already landed. The switch is not rolled back;
 			// say so, so the owner re-runs the approve without repeating it.
@@ -290,6 +321,7 @@ func newRunApproveCmd(env Env, gf *globalFlags) *cobra.Command {
 			return err
 		},
 	}
+	approve.Flags().String("semantic-approval", "", "exact semantic_gate.approval JSON reviewed from run get --json")
 	approve.Flags().String("agent-source", "", "which subagent roster to run: own|repo (default: the run's own default)")
 	approve.Flags().StringSlice("exclude-agents", nil, "subagents to drop from the chosen source (requires --agent-source)")
 	// PRD #1247 M5b (D8): switch the run's Anthropic token as part of the approval. Same

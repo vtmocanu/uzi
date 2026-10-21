@@ -16,8 +16,9 @@ import { symlinkSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
+import { readFileSync } from "node:fs";
 
-import { validatePrdPath, findValidPrdCore, resolvePrdInput } from "../src/prd-link.js";
+import { validatePrdPath, findValidPrdCore, findSemanticPrdPaths, resolvePrdInput } from "../src/prd-link.js";
 
 // A warn sink that records calls so tests can assert a fallback logged a reason.
 function capturingLogger(): { warn: (m: string, f?: Record<string, unknown>) => void; calls: string[] } {
@@ -303,4 +304,27 @@ describe("resolvePrdInput", () => {
     const r = await resolvePrdInput("prds/362-x.md", "\0not-a-dir");
     assert.deepEqual(r, { prdPath: null, prdText: null });
   });
+});
+
+// PRD #1230 D5: the shared corpus the Go mirror (api/internal/workersvc FindSemanticPrdPaths and
+// prdpath.Validate) is pinned to. The expected values were recorded from this implementation, so a
+// drift in either side reddens its own test.
+describe("shared semantic PRD link corpus (fixtures/semantic-plan/prd-links.json)", () => {
+  const corpus = JSON.parse(readFileSync(path.join(import.meta.dirname, "..", "..", "fixtures", "semantic-plan", "prd-links.json"), "utf8")) as {
+    find: { name: string; text: string; paths: string[] }[];
+    validate: { path: string; valid: boolean }[];
+  };
+  it("is non-trivial", () => {
+    assert.ok(corpus.find.length >= 10 && corpus.validate.length >= 10);
+  });
+  for (const c of corpus.find) {
+    it(`find: ${c.name}`, () => {
+      assert.deepEqual(findSemanticPrdPaths(c.text), c.paths);
+    });
+  }
+  for (const c of corpus.validate) {
+    it(`validate: ${JSON.stringify(c.path).slice(0, 80)}`, () => {
+      assert.equal(validatePrdPath(c.path), c.valid);
+    });
+  }
 });
