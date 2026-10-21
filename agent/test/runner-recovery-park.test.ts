@@ -21,6 +21,12 @@ import {
   worktreeDirFor,
 } from "./runner-harness.js";
 
+// The runner's stopped-source and quiescence proofs (src/runner.ts, src/run-quiescence.ts) refuse off
+// Linux, so this scenario cannot reach its post-proof assertions on macOS (#1912). Linux runs it unchanged.
+const LINUX_ONLY = process.platform !== "linux"
+  ? "needs the Linux-only run-quiescence / stopped-source proof (src/run-quiescence.ts, src/runner.ts refuse off Linux)"
+  : false;
+
 installHarness();
 
 // #1197: verified capture must precede the promotable recovery_wait report.
@@ -215,7 +221,7 @@ describe("RunRunner — recovery_wait park (issue #1197 D-RC2c)", () => {
     }
   });
 
-  it("ack discrimination: a 200 that reports a DIFFERENT status than recovery_wait is NOT parked", async () => {
+  it("ack discrimination: a 200 that reports a DIFFERENT status than recovery_wait is NOT parked", { skip: LINUX_ONLY }, async () => {
     const { gitlab } = fakeGitlab();
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-rec-declined-"));
     try {
@@ -243,7 +249,7 @@ describe("RunRunner — recovery_wait park (issue #1197 D-RC2c)", () => {
     }
   });
 
-  it("ack error (409 refusal): the run moved on under the worker → NOT parked, cleaned up", async () => {
+  it("ack error (409 refusal): the run moved on under the worker → NOT parked, cleaned up", { skip: LINUX_ONLY }, async () => {
     const { gitlab } = fakeGitlab();
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-rec-409-"));
     try {

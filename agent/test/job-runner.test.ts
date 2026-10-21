@@ -32,6 +32,11 @@ import { stubJobQueryFn } from "../src/job-runner-stub.js";
 import { nullLogger, recordingLogger } from "./helpers.js";
 import { NATIVE_LIMIT, overflowClock } from "./overflow-clock.js";
 
+// The job workspace pins its output ancestors through procfs (src/job-workspace.ts) and refuses off Linux (#1912).
+const LINUX_ONLY = process.platform !== "linux"
+  ? "needs Linux procfs output-ancestor pinning (src/job-workspace.ts requires /proc/self/fd, procfs magic 0x9fa0)"
+  : false;
+
 const GEN = 7;
 const roots: string[] = [];
 afterEach(async () => {
@@ -338,7 +343,7 @@ describe("job terminalCancelled teardown", () => {
     }
   });
 
-  it("settles aborted output upload cleanup before returning without reports or receipts", { timeout: 5000 }, async () => {
+  it("settles aborted output upload cleanup before returning without reports or receipts", { timeout: 5000, skip: LINUX_ONLY }, async () => {
     const started = terminalBarrier();
     const aborted = terminalBarrier();
     const cleanup = terminalBarrier();

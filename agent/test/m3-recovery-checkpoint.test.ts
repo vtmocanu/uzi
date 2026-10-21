@@ -10,6 +10,11 @@ import { makeFixture } from "./fixture-repo.js";
 import { nullLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
 import { fixtureFetchTracking } from "./runner-tracking-fixture.js";
 
+// rmTreePinned (src/rmtree.ts) refuses off Linux, so the checkpoint cleanup path cannot run on macOS (#1912).
+const LINUX_ONLY = process.platform !== "linux"
+  ? "needs the Linux-only descriptor-pinned tree removal (src/rmtree.ts removePinnedTree/rmTreePinned refuse off Linux)"
+  : false;
+
 function gitIn(dir: string, args: string[]): string {
   return execFileSync("git", ["-C", dir, ...args], {
     encoding: "utf8", timeout: 30_000,
@@ -17,7 +22,7 @@ function gitIn(dir: string, args: string[]): string {
   }).trim();
 }
 
-it("M3 clean checkpoint-committed mutant remains an unvalidated snapshot without telemetry", async () => {
+it("M3 clean checkpoint-committed mutant remains an unvalidated snapshot without telemetry", { skip: LINUX_ONLY }, async () => {
   const fx = makeFixture();
   try {
     const git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());

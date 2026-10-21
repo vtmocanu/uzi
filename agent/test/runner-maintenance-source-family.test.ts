@@ -9,6 +9,13 @@ import { SteeringChannel } from "../src/steering.js";
 import { recordingLogger } from "./helpers.js";
 import { api, client, deferred, fakeGitlab, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
 
+// A fresh source is observed only through the Linux-only quiescence / stopped-source proofs
+// (src/runner.ts "non_linux_host" refusal, src/run-quiescence.ts), so it never qualifies on macOS (#1912).
+// Linux runs every assertion.
+const LINUX_ONLY = process.platform !== "linux"
+  ? "needs the Linux-only run-quiescence / stopped-source proof (src/run-quiescence.ts, src/runner.ts refuse off Linux)"
+  : false;
+
 installHarness();
 
 function command(cwd: string, ...args: string[]): string {
@@ -23,7 +30,7 @@ type Observation = {
 type Tails = { executionTails: ReadonlyMap<string, Promise<Observation | undefined>> };
 
 for (const mode of ["normal", "unknown-sibling", "unknown-ledger", "malformed-ledger", "missing-family", "stopped-marker", "reclaimed-attempt", "unadmitted-restart", "adopted", "failed-stop", "late-fence"] as const) {
-it(`#3031 actual pending fresh guarded park family: ${mode}`, async (t) => {
+it(`#3031 actual pending fresh guarded park family: ${mode}`, { skip: mode === "adopted" ? false : LINUX_ONLY }, async (t) => {
   const claim = gitlabClaim(3031, { claim_generation: 1, inventory_guarded: true });
   const feature = client.hasFeature.bind(client);
   t.mock.method(client, "hasFeature", (name: Parameters<typeof client.hasFeature>[0]) => name === "recovery_inventory_v1" || name === "claim_generation_fence" || feature(name));

@@ -10,6 +10,12 @@ import { recordingLogger } from "./helpers.js";
 import { client, fakeGitlab, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
 import { passingExclusion } from "./maintenance-exclusion-fixture.js";
 
+// The runner's stopped-source and quiescence proofs (src/runner.ts, src/run-quiescence.ts) refuse off
+// Linux, so this scenario cannot reach its post-proof assertions on macOS (#1912). Linux runs it unchanged.
+const LINUX_ONLY = process.platform !== "linux"
+  ? "needs the Linux-only run-quiescence / stopped-source proof (src/run-quiescence.ts, src/runner.ts refuse off Linux)"
+  : false;
+
 installHarness();
 
 function command(cwd: string, ...args: string[]): string {
@@ -20,7 +26,7 @@ function command(cwd: string, ...args: string[]): string {
 // its exact tail to RecoveryCoordinator.resumeTerminalSource, which replays SAVED evidence for the
 // run before any boot sweep or heartbeat-driven live pass. Here an earlier generation of the run
 // left a minted, unacknowledged settled FINAL; the terminal pass must send it through the client.
-it("#3031 runner terminal route replays a saved FINAL without a boot or live pass", async (t) => {
+it("#3031 runner terminal route replays a saved FINAL without a boot or live pass", { skip: LINUX_ONLY }, async (t) => {
   const token = "fixture-journal-key";
   const claim = gitlabClaim(3031, { claim_generation: 2, inventory_guarded: true });
   const repoId = "00000000-0000-4000-8000-000000003032";
