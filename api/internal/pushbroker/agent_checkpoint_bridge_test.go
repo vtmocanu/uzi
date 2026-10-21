@@ -215,6 +215,11 @@ func TestAgentCheckpointChainBridge(t *testing.T) {
 			runAgentStaleBaseBridge(t, root, node, c, 3242101+i)
 		})
 	}
+	for i, c := range originSeededCases {
+		t.Run("origin-seeded/"+c.name, func(t *testing.T) {
+			runAgentOriginSeededBridge(t, root, node, c, 3284101+i)
+		})
+	}
 }
 
 // staleBaseCase is one issue #3242 publication shape. The run starts on main's tip (a linear,
@@ -251,6 +256,150 @@ var staleBaseCases = []staleBaseCase{
 	// Issue #3242 / 81c950c7: a seeded run with no commit, its tracking ref set by an unconfirmed tick,
 	// pauses after main moved; the pause publish takes the non-pinned zero range and must park.
 	{name: "seeded-pause", shape: "linear", advance: "plain", seededPause: true, want: "published"},
+}
+
+// originSeededCase is the issue #3284 shape: origin already carries refs/heads/<branch> at a seed
+// commit and NO checkpoint ref; the claim is seeded with planned_base_commit = seed and
+// require_base_match = true; the run does zero new work. Origin's main advances (advance) after the
+// worker resolved its floor. mode "tick" publishes through one tick; mode "pause" first lets a tick
+// establish the tracking ref (answered superseded before the broker, as in the seeded-pause idiom),
+// so the pause is the first publish the broker sees. want is the broker's outcome for that publish.
+type originSeededCase struct {
+	name    string
+	advance string // "none" | "plain" | "workflow"
+	mode    string // "tick" | "pause"
+	guard   bool
+	want    string // "published" or the skip label
+}
+
+var originSeededCases = []originSeededCase{
+	{name: "tick-unmoved", advance: "none", mode: "tick", want: "published"},
+	{name: "tick-plain", advance: "plain", mode: "tick", want: "published"},
+	{name: "tick-workflow", advance: "workflow", mode: "tick", want: "published"},
+	{name: "pause-unmoved", advance: "none", mode: "pause", want: "published"},
+	{name: "pause-plain", advance: "plain", mode: "pause", want: "published"},
+	{name: "pause-workflow", advance: "workflow", mode: "pause", want: "published"},
+	{name: "guarded-tick-plain", advance: "plain", mode: "tick", guard: true, want: "published"},
+	{name: "guarded-pause-plain", advance: "plain", mode: "pause", guard: true, want: "published"},
+	{name: "guarded-tick-workflow", advance: "workflow", mode: "tick", guard: true, want: "ci_config_guard"},
+	{name: "guarded-pause-workflow", advance: "workflow", mode: "pause", guard: true, want: "ci_config_guard"},
+}
+
+func runAgentOriginSeededBridge(t *testing.T, root, node string, c originSeededCase, iid int) {
+	backend := requireGitHTTPBackend(t)
+	trustLoopbackTLS(t)
+	f := newGitFixture(t)
+	f.commit("README.md", "bridge\n", "initial")
+	if err := os.MkdirAll(filepath.Join(f.work, ".github", "workflows"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	f.commit(".github/workflows/ci.yml", "name: ci\non: push\njobs: {}\n# base\n", "workflow v1")
+	f.pushMain()
+	seed := f.commit("seed.txt", "seed\n", "seed")
+	branch := fmt.Sprintf("agent/issue-%d", iid)
+	ref := "refs/uzi-checkpoints/" + branch
+	f.git("push", "origin", seed+":refs/heads/"+branch)
+	if f.originRef(ref) != "" {
+		t.Fatal("precondition: origin must carry no checkpoint ref")
+	}
+	url := newGitHTTPRemote(t, f, backend).cloneURL(f)
+
+	var (
+		mu    sync.Mutex
+		first = true
+	)
+	srv := newBridgeServer(t, ref, false, func(ctx context.Context, tip string, pack []byte) error {
+		mu.Lock()
+		superseded := c.mode == "pause" && first
+		first = false
+		mu.Unlock()
+		if superseded {
+			return errBridgeSuperseded
+		}
+		opts := pushbroker.Options{
+			CloneURL: url, Username: "uzi-bot", PAT: redirectTestPAT(),
+			Branch: branch, DefaultBranch: "main", DeclaredTip: tip, Pack: pack,
+		}
+		if c.guard {
+			opts.CIConfigGuard, opts.CIConfigPaths = true, []string{".github/workflows/**"}
+		}
+		_, err := pushbroker.Publish(ctx, opts)
+		return err
+	})
+
+	var summary struct {
+		BaseTip             string `json:"baseTip"`
+		MainTip             string `json:"mainTip"`
+		ClaimPlannedBase    string `json:"claimPlannedBase"`
+		ClaimRequireBase    bool   `json:"claimRequireBase"`
+		ClaimCheckpointTip  string `json:"claimCheckpointTip"`
+		ClaimPlanSource     string `json:"claimPlanSource"`
+		CheckpointRefBefore string `json:"checkpointRefBefore"`
+		FirstTickOutcome    string `json:"firstTickOutcome"`
+		TickOutcome         string `json:"tickOutcome"`
+		Parked              bool   `json:"parked"`
+		CheckpointRefAfter  string `json:"checkpointRefAfter"`
+		BranchAfter         string `json:"branchAfter"`
+	}
+	out, runErr := runBridgeFixture(t, root, node, map[string]any{
+		"url": srv.srv.URL, "token": "tkn-bridge-123456", "origin": f.bare, "iid": iid, "boundary": "tick",
+		"originSeeded": map[string]any{"seed": seed, "advance": c.advance, "mode": c.mode},
+		"scratch":      t.TempDir(),
+	}, &summary)
+	publishes := srv.publishes()
+	describe := func() string {
+		return fmt.Sprintf("case=%+v seed=%s publishes=%+v summary=%+v\n%s", c, seed, publishes, summary, out)
+	}
+	if runErr != nil {
+		t.Fatalf("agent fixture failed: %v\n%s", runErr, describe())
+	}
+	// Preconditions: a seeded require-base claim on the seed, no inherited checkpoint, no checkpoint
+	// ref, zero new work (the worktree is still the seed).
+	if summary.ClaimPlanSource != "seeded" || summary.ClaimPlannedBase != seed || !summary.ClaimRequireBase ||
+		summary.ClaimCheckpointTip != "" || summary.CheckpointRefBefore != "" || summary.BaseTip != seed {
+		t.Fatalf("claim/origin preconditions not as intended\n%s", describe())
+	}
+	if c.advance != "none" && (summary.MainTip == "" || f.originRef("refs/heads/main") != summary.MainTip) {
+		t.Fatalf("origin main did not advance after the floor resolved\n%s", describe())
+	}
+	// The publish under test is the only one the broker sees (a tick), or the second (a pause, after
+	// the superseded first tick). Every request declares the seed.
+	wantPublishes := 1
+	if c.mode == "pause" {
+		wantPublishes = 2
+		if summary.FirstTickOutcome == "published" || len(publishes) == 0 || publishes[0].skipped != "superseded" {
+			t.Fatalf("the first tick was not answered superseded before the broker\n%s", describe())
+		}
+	}
+	if len(publishes) != wantPublishes {
+		t.Fatalf("publishes = %+v, want %d\n%s", publishes, wantPublishes, describe())
+	}
+	got := publishes[len(publishes)-1]
+	if got.tip != seed {
+		t.Fatalf("declared tip %s, want the seed %s\n%s", got.tip, seed, describe())
+	}
+	if c.want != "published" {
+		if got.skipped != c.want || summary.Parked || summary.TickOutcome == "published" || summary.CheckpointRefAfter != "" {
+			t.Fatalf("want the broker's %q refusal with no checkpoint ref and no park\n%s", c.want, describe())
+		}
+		return
+	}
+	if got.skipped != "" || got.err != "" {
+		t.Fatalf("the first publication was refused: skipped=%q err=%q\n%s", got.skipped, got.err, describe())
+	}
+	if c.mode == "tick" && summary.TickOutcome != "published" {
+		t.Fatalf("tick outcome = %q, want published\n%s", summary.TickOutcome, describe())
+	}
+	if c.mode == "pause" && !summary.Parked {
+		t.Fatalf("the pause did not park\n%s", describe())
+	}
+	if ck := summary.CheckpointRefAfter; ck != seed {
+		t.Fatalf("checkpoint ref = %s, want the seed %s\n%s", ck, seed, describe())
+	}
+	// Read inside the turn: the run's own finish may push the branch afterwards.
+	if b := summary.BranchAfter; b != seed {
+		t.Fatalf("origin branch was %s at the checkpoint, want the seed %s\n%s", b, seed, describe())
+	}
 }
 
 func runAgentCheckpointBridge(t *testing.T, root, node, boundary string, iid int, lostAck bool) {
