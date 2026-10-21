@@ -158,7 +158,16 @@ const SWAP_ON_FIRST_RECLAIM =
 // path can only reach the script through UZI_WORKER_TOKEN_FILE (run() passes it). Proves
 // the posture checks follow the env rather than a /run/secrets literal.
 function makeHarness(opts: { mutate?: (patched: string) => string; tokenViaEnv?: boolean; realChmod?: string[] } = {}): Harness {
-  const root = allocateFixture();
+  // Resolve symlinks: the worker-uid lane makes the fixture root a symlinked path, and the op-log
+  // snippet records physical paths, so assertions on logged paths need the physical root.
+  const root = fs.realpathSync(allocateFixture());
+  if (opts.realChmod) {
+    // BSD directories inherit the parent's group, and a BSD kernel may EPERM a setgid chmod (the
+    // entrypoint's `chmod 3775` on the legacy roots) on a dir whose group the caller is not in; the
+    // real-chmod stub propagates that failure. Put the root in the effective group first.
+    const rootSt = fs.statSync(root);
+    fs.chownSync(root, rootSt.uid, process.getegid!());
+  }
   const data = path.join(root, "data");
   const nix = path.join(root, "nix");
   const token = path.join(root, "token");
@@ -204,7 +213,7 @@ function makeHarness(opts: { mutate?: (patched: string) => string; tokenViaEnv?:
       'for last in "$@"; do :; done\n' +
       'case "${last##*/}" in uzi-worker|uzi-runner)\n' +
       '  case "$last" in "$(dirname "$OPLOG")"/*)\n' +
-      '    /bin/mkdir "$last" 2>/dev/null && stat -c %i "$last" >> "$(dirname "$OPLOG")/fresh-ids"\n' +
+      '    /bin/mkdir "$last" 2>/dev/null && { STUB_STAT_FROM=mkdir ${STUB_STAT:-stat} -c %i "$last" 2>/dev/null || STUB_STAT_FROM=mkdir ${STUB_STAT:-stat} -f %i "$last"; } >> "$(dirname "$OPLOG")/fresh-ids"\n' +
       "    exit 0 ;;\n" +
       "  esac ;;\n" +
       "esac\n" +
@@ -237,9 +246,10 @@ function makeHarness(opts: { mutate?: (patched: string) => string; tokenViaEnv?:
       // `.`) and the plain lstat `-c %d:%i`. Owner is keyed by the basename of the PHYSICAL directory
       // (so a symlink swapped in, and followed by `cd -P`, reports the standin's name); a symlink
       // operand reports a non-matching owner (lstat semantics); an inode recorded by the mkdir stub
-      // reports root. Device:inode are the real ones.
+      // reports root. Device:inode are the real ones. Every stat goes through ${STUB_STAT:-stat} (GNU first, BSD
+      // `-f` fallback) so UZI_TEST_STUB_STAT can substitute a BSD-stat emulation shim; STUB_STAT_FROM names the caller.
       '    if [ "$#" -eq 3 ] && [ "$1" = "-c" ] && { [ "$2" = "%U %a %d:%i" ] || [ "$2" = "%U %d:%i" ] || [ "$2" = "%d:%i" ]; }; then\n' +
-      '      di=$(stat -c %d:%i "$3" 2>/dev/null || stat -f %d:%i "$3" 2>/dev/null) || exit 1\n' +
+      '      di=$(STUB_STAT_FROM=busybox ${STUB_STAT:-stat} -c %d:%i "$3" 2>/dev/null || STUB_STAT_FROM=busybox ${STUB_STAT:-stat} -f %d:%i "$3" 2>/dev/null) || exit 1\n' +
       '      [ "$2" = "%d:%i" ] && { printf "%s\\n" "$di"; exit 0; }\n' +
       '      if [ -L "$3" ]; then o=linkowner; else\n' +
       '        if [ "$3" = . ]; then d=$(pwd -P); else d=$(cd -P -- "$3" 2>/dev/null && pwd -P) || d=$3; fi\n' +
@@ -249,10 +259,10 @@ function makeHarness(opts: { mutate?: (patched: string) => string; tokenViaEnv?:
       '          uzi-runner|uzi-runner.moved) o=${STUB_OWNER_RUNNER:-runner} ;;\n' +
       "          *) o=root ;;\n" +
       "        esac\n" +
-      '        ino=$(stat -c %i "$3" 2>/dev/null)\n' +
-      '        if [ -f "$(dirname "$OPLOG")/fresh-ids" ] && grep -qx "$ino" "$(dirname "$OPLOG")/fresh-ids"; then o=root; fi\n' +
+      '        ino=$(STUB_STAT_FROM=busybox ${STUB_STAT:-stat} -c %i "$3" 2>/dev/null || STUB_STAT_FROM=busybox ${STUB_STAT:-stat} -f %i "$3" 2>/dev/null)\n' +
+      '        if [ -n "$ino" ] && [ -f "$(dirname "$OPLOG")/fresh-ids" ] && grep -qx "$ino" "$(dirname "$OPLOG")/fresh-ids"; then o=root; fi\n' +
       "      fi\n" +
-      '      m=$(stat -c %a "$3" 2>/dev/null || stat -f %Lp "$3" 2>/dev/null) || exit 1\n' +
+      '      m=$(STUB_STAT_FROM=busybox ${STUB_STAT:-stat} -c %a "$3" 2>/dev/null || STUB_STAT_FROM=busybox ${STUB_STAT:-stat} -f %Lp "$3" 2>/dev/null) || exit 1\n' +
       '      case "$2" in\n' +
       '        "%U %a %d:%i") printf "%s %s %s\\n" "$o" "$m" "$di" ;;\n' +
       '        *) printf "%s %s\\n" "$o" "$di" ;;\n' +
@@ -569,6 +579,8 @@ function run(h: Harness, extraEnv: Record<string, string> = {}): RunResult {
       PATH: process.env.PATH ?? "/usr/bin:/bin",
       HOME: h.root,
       OPLOG: h.opLog,
+      // Test-only seam to emulate BSD stat in the stubs; absent unless set.
+      ...(process.env.UZI_TEST_STUB_STAT ? { STUB_STAT: process.env.UZI_TEST_STUB_STAT } : {}),
       ...extraEnv,
     },
   });
@@ -1804,6 +1816,10 @@ describe("issue #3153: Docker-lane per-uid scratch adopt-or-refuse (portable, re
       fs.writeFileSync(h.token, "t");
       const runnerRoot = path.join(h.data, "runner");
       fs.mkdirSync(runnerRoot);
+      const priorMode = fs.statSync(runnerRoot).mode & 0o7777;
+      fs.chmodSync(runnerRoot, 0o3775);
+      assert.equal(fs.statSync(runnerRoot).mode & 0o7777, 0o3775, "fixture precondition: the host user must be able to set 3775 (setgid+sticky) on the runner root, as the entrypoint does");
+      fs.chmodSync(runnerRoot, priorMode);
       const carve = path.join(runnerRoot, ".tmp");
       fs.mkdirSync(carve);
       const l: Lane = { h, runnerRoot, carve, worker: path.join(runnerRoot, "uzi-worker"), runner: path.join(runnerRoot, "uzi-runner") };
@@ -1824,7 +1840,6 @@ describe("issue #3153: Docker-lane per-uid scratch adopt-or-refuse (portable, re
       return patched.replace(anchor, anchor + code);
     };
     const RUNNER_PREV = '  sc_runner_prev="$SCRATCH_PREV_MODE"\n';
-    const SYMLINK_CHECK = '      if [ -L "$sc_leaf" ]; then scratch_refuse "$sc_leaf" "became a symlink while being created"; fi\n';
 
     function assertStandinUntouched(w: Swap, ops: string[]): void {
       const hits = ops.filter((o) => /^(chown|chmod) /.test(o) && o.split(/\s+/).some((t) => t === w.standinReal || t.startsWith(w.standinReal + "/")));
@@ -1880,9 +1895,25 @@ describe("issue #3153: Docker-lane per-uid scratch adopt-or-refuse (portable, re
 
     // Models a rename the runner cannot actually perform on a root-owned freshly created leaf in the
     // sticky root; kept as defence in depth for the post-creation identity check.
-    it("C: created leaf swapped right after the symlink check is refused, standin untouched", () => {
+    it("C0: created leaf replaced by a symlink right after mkdir (before the symlink check) is refused, standin untouched", () => {
+      const MKDIR_LINE = '      "$MKDIR" "$sc_leaf"\n';
       const w = build((x) => { leaf(x.worker); }, (t, lp, sd) =>
-        after(t, SYMLINK_CHECK, `      if [ "$sc_leaf" = '${lp}' ]; then ${SWAP(lp, sd).trim()}; fi\n`));
+        after(t, MKDIR_LINE, `      if [ "$sc_leaf" = '${lp}' ]; then ${SWAP(lp, sd).trim()}; fi\n`));
+      try {
+        const r = doRun(w);
+        assertStandinUntouched(w, r.ops);
+        assertRefused(r, /became a symlink while being created/);
+      } finally { cleanup(w.l); }
+    });
+
+    it("C: created leaf swapped right after the symlink check is refused, standin untouched", () => {
+      // Anchored on the line FOLLOWING the symlink check (swap inserted before it), so the anchor
+      // survives a mutant that deletes the symlink-check line itself.
+      const FRESH_READ = `      if ! sc_fresh="$("$BUSYBOX" stat -c '%U %d:%i' "$sc_leaf" 2>/dev/null)"; then\n`;
+      const w = build((x) => { leaf(x.worker); }, (t, lp, sd) => {
+        assert.equal(t.split(FRESH_READ).length, 2, "anchor missing or not unique");
+        return t.replace(FRESH_READ, `      if [ "$sc_leaf" = '${lp}' ]; then ${SWAP(lp, sd).trim()}; fi\n${FRESH_READ}`);
+      });
       try {
         const r = doRun(w);
         assertStandinUntouched(w, r.ops);
