@@ -1,6 +1,18 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { WorkerClient } from "../src/client.js";
+import type { Config } from "../src/config.js";
+import type { RunRunner } from "../src/runner.js";
+import type { ChatRunner } from "../src/chat-runner.js";
+import type { JudgeRunner } from "../src/judge-runner.js";
+import type { ReviewRunner } from "../src/review-runner.js";
+import { StatsCollector } from "../src/stats.js";
+import type { TerminalRejectionCoordinator } from "../src/terminal-rejections.js";
+import type { WorkerMemoryRuntime } from "../src/worker-memory-runtime.js";
+import { Worker } from "../src/worker.js";
 import type { ActiveSnapshot } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
 
@@ -98,11 +110,66 @@ it("an api without the advert gets a body without the member", async () => {
   assert.deepEqual(claimBodies(f)[0], {});
 });
 
-it("authority revoked after an admission wait but before the claim reports lost", async () => {
+it("the claim body reads authority at send time, not at registration", async () => {
   const f = fixture([PRESSURE, CLAIM]);
   await register(f, BOTH_CAPS);
-  await new Promise((r) => setTimeout(r, 5));
   f.client.revokeMemoryAuthority();
   await f.client.claimRun();
   assert.equal(claimBodies(f)[0]?.memory_authority, "lost");
+});
+
+it("the worker run lane reports lost when authority is revoked during a pending local admission wait", async () => {
+  const f = fixture([PRESSURE, CLAIM]);
+  let admissionCalls = 0;
+  let releaseGate!: () => void;
+  const gate = new Promise<void>((r) => { releaseGate = r; });
+  const terminalRejections = {
+    acquireAdmission: async () => {
+      if (++admissionCalls === 1) await gate;
+      return () => {};
+    },
+    loop: async () => {},
+    protectExecution: () => () => {},
+  } as unknown as TerminalRejectionCoordinator;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-3142-worker-"));
+  const config = {
+    memoryGuard: { enabled: true }, workerName: "w1", workerTemplate: "base", pollIntervalMs: 1,
+    heartbeatIntervalMs: 2, chatPollMs: 1, chatSessions: 0, maxConcurrentRuns: 1, dockerWiring: {},
+    dataDir: root, gapFillMax: 100, outboxTerminalMaxBytes: 1 << 20,
+  } as unknown as Config;
+  const runner = { shutdown: () => undefined, resumePendingRecoveries: async () => undefined,
+    settlePendingPredecessors: async () => undefined, observeSettlementTerminalAck: async () => undefined,
+    snapshotBootRecoveries: async () => [], execute: async () => undefined } as unknown as RunRunner;
+  const memory = { run: async () => {}, stop: async () => undefined } as unknown as WorkerMemoryRuntime;
+  const worker = new Worker(config, f.client, runner, { execute: async () => {} } as unknown as ChatRunner,
+    { execute: async () => {} } as unknown as JudgeRunner, { execute: async () => {} } as unknown as ReviewRunner,
+    nullLogger(), () => ({ ok: true, missing: [] as string[] }),
+    undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+    (dataDir) => new StatsCollector({ dataDir, processRss: () => 64 * 1024 * 1024 }),
+    undefined, undefined, undefined, terminalRejections, undefined, undefined, undefined, memory,
+    async () => ({ ok: true }));
+  const until = async (cond: () => boolean, what: string) => {
+    const deadline = Date.now() + 10_000;
+    while (!cond()) {
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+      await new Promise((r) => setTimeout(r, 2));
+    }
+  };
+  const ac = new AbortController();
+  const done = worker.run(ac.signal);
+  try {
+    await until(() => admissionCalls >= 1, "the run lane to block in admission");
+    assert.equal(claimBodies(f).length, 0, "no claim was sent while admission is pending");
+    // Production revocation: a heartbeat reply whose advert set lacks the pressure token.
+    f.setReply(() => json({ protocol_features: [CLAIM] }));
+    await until(() => !f.client.hasFeature(PRESSURE), "the heartbeat to drop the pressure advert");
+    releaseGate();
+    await until(() => claimBodies(f).length >= 1, "the first run-lane claim");
+    assert.equal(claimBodies(f)[0]?.memory_authority, "lost");
+  } finally {
+    releaseGate();
+    ac.abort();
+    await done.catch(() => undefined);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
