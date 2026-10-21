@@ -80,6 +80,7 @@ import { RunControls, SteerQueueCard } from "../components/SteerQueueCard";
 import { QuestionPanel, UnreadableQuestion } from "../components/QuestionPanel";
 import { deriveOpenQuestion } from "../lib/runQuestion";
 import { PlanCrossCheck } from "../components/PlanCrossCheck";
+import { CheckerActivitySummary } from "../components/CheckerActivitySummary";
 import { CodeCrossCheck } from "../components/CodeCrossCheck";
 import { Markdown } from "../components/Markdown";
 import { JobResultPanel } from "./runView/JobResultPanel";
@@ -2952,6 +2953,7 @@ export function RunView() {
       {terminal && <JudgePanel run={run} />}
 
       {run.status !== "awaiting_approval" && <PlanCrossCheck run={run} />}
+      {run.kind === "cross_check" && <CheckerActivitySummary run={run} messages={messages} />}
       {confirmedOwner === true && <CodeCrossCheck run={run} />}
 
       {/* PRD #209 M5: a SEEDED run's plan. It never enters awaiting_approval, so the

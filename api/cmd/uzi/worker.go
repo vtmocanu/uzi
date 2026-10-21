@@ -317,11 +317,11 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 // worker's reported cause.
 //
 // Every field this reads except the quarantine one (Status, DrainingSince, ActiveRuns, ActiveCrossChecks,
-// Ephemeral) is control-plane-owned (Decision 1), so those need no scrub. The quarantine
+// Ephemeral, MemoryAuthorityLostAt) is control-plane-owned (Decision 1), so those need no scrub. The quarantine
 // field is worker self-report, so this reads ONLY whether it is present, never its
 // content; the cause is never put in a table cell. The only renderer of the cause text is
 // the TUI worker view (tui_workers.go, through renderer.Plain). The raw
-// draining_since, ephemeral and residue_quarantine_* fields also ride along in `--json`
+// draining_since, ephemeral, memory_authority_lost_at and residue_quarantine_* fields also ride along in `--json`
 // untouched, so scripting keys off them rather than parsing this annotation.
 func statusCell(w apitypes.WorkerDTO) string {
 	s := w.Status
@@ -336,6 +336,7 @@ func statusCell(w apitypes.WorkerDTO) string {
 		s += " (ephemeral)"
 	}
 	s += quarantineMark(w)
+	s += memoryAuthorityMark(w)
 	// PRD #2006: an idle ephemeral worker held for a same-owner/repo/branch follow-up. The
 	// server sets the field only while the lease is live; a past value is skipped here too
 	// so a stale or skewed clock never prints a negative "left". Only the remaining time is
@@ -354,6 +355,16 @@ func statusCell(w apitypes.WorkerDTO) string {
 func quarantineMark(w apitypes.WorkerDTO) string {
 	if w.ResidueQuarantinedAt != nil {
 		return " (quarantined)"
+	}
+	return ""
+}
+
+// memoryAuthorityMark is the fixed status suffix for a worker whose guard-bound runs the api
+// is withholding because it lost memory authority (issue #3142), "" otherwise. It keys on
+// presence of the control-plane-owned timestamp only.
+func memoryAuthorityMark(w apitypes.WorkerDTO) string {
+	if w.MemoryAuthorityLostAt != nil {
+		return " (memory authority lost)"
 	}
 	return ""
 }

@@ -12,15 +12,15 @@ import (
 
 // catalogSlugs is the exact set of default scheduled jobs the product ships
 // (PRD #589 M1, extended by PRD #590 M1 with self-improve, PRD #767 M4 with
-// assigned-sweep, and issue #928 with refactor-scout). Keep it sorted — Catalog()
+// assigned-sweep, issue #928 with refactor-scout, and #3225 with ci-scout). Keep it sorted — Catalog()
 // returns its slice sorted by slug and TestCatalogSet compares
 // index-for-index.
 var catalogSlugs = []string{
-	"assigned-sweep", "bug-hunt", "bug-triage", "ci-repair", "docs-hygiene", "feature-bingo", "ondeck-sweep", "planned-sweep", "refactor-scout", "self-improve", "test-improvement",
+	"assigned-sweep", "bug-hunt", "bug-triage", "ci-repair", "ci-scout", "docs-hygiene", "feature-bingo", "ondeck-sweep", "planned-sweep", "refactor-scout", "self-improve", "test-improvement",
 }
 
 func TestProposalJobsInheritOwnerModel(t *testing.T) {
-	for _, slug := range []string{"feature-bingo", "refactor-scout"} {
+	for _, slug := range []string{"ci-scout", "feature-bingo", "refactor-scout"} {
 		t.Run(slug, func(t *testing.T) {
 			job, ok := schedtmpl.BySlug(slug)
 			if !ok {
@@ -214,6 +214,7 @@ func TestPromptCatalogOutputModes(t *testing.T) {
 		mode string
 	}{
 		{"bug-hunt", "mr"},
+		{"ci-scout", "issues"},
 		{"docs-hygiene", "mr"},
 		{"feature-bingo", "issues"},
 		{"refactor-scout", "issues"},
@@ -239,7 +240,7 @@ func TestPromptCatalogOutputModes(t *testing.T) {
 // mode with a known catalog slug resolves to that job's catalog default; a NULL mode with an
 // unknown or empty slug falls back to DefaultOutputMode ("mr").
 func TestResolveOutputMode(t *testing.T) {
-	for _, slug := range []string{"feature-bingo", "refactor-scout"} {
+	for _, slug := range []string{"ci-scout", "feature-bingo", "refactor-scout"} {
 		t.Run(slug, func(t *testing.T) {
 			for _, tc := range []struct {
 				name       string

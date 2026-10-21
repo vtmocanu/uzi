@@ -224,7 +224,9 @@ locally in step 4. The advisory still prints until the window expires.
    a plain answer cannot exempt it, then open the PR); `awaiting_approval` past `SEQ` → the run re-planned
    (usually a lost worker resumed from the default branch): before steering the new gate with
    `uzi-watcher`, check `uzi run recovery RUN` for committed work worth landing instead; `limit_wait` / `pool_wait` / `recovery_wait` → one trail line,
-   keep polling (they resume on their own). `paused` stops the poller because it never
+   keep polling (`limit_wait` and `pool_wait` resume on their own; a `recovery_wait` may need an owner action, so read its cause), except `recovery_wait` with cause
+   `worker_requeue_exhausted`: the poller stops on it (exit 0) because only the owner can
+   Resume or Cancel; back up first (`uzi-watcher` recovery). `paused` stops the poller because it never
    resumes on its own: read `hold_reason`. A run that hit its wall-clock limit is `paused`
    with `hold_reason: budget_exhausted` (PRD #1497), never `failed`: extend it (`uzi run
    extend RUN --by 2h`) and re-arm the poller; an owner pause waits for its owner.

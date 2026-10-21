@@ -2570,6 +2570,13 @@ never put in the table; read `residue_quarantined_at` and
 `residue_quarantine_cause` in `uzi admin workers --json`, or the worker view in
 `uzi tui`.
 
+A worker that lost memory authority shows `(memory authority lost)` after its
+status in the same two lists: the api withholds guard-bound runs from it until
+its container restarts, see
+[Lost memory authority](worker-setup.md#lost-memory-authority). Read
+`memory_authority_lost_at` in `uzi admin workers --json`, or the worker view in
+`uzi tui`.
+
 `uzi run get` gains four rows, each emitted only when the server has
 something to say:
 
@@ -2696,6 +2703,13 @@ presented at the gate, `0` for a run that has never gated under this
 feature). See [Run activity pane](./run-activity.md#plan-approval-gate) and
 `--expected-gate-revision` above.
 
+A run's current claim generation is readable the same way:
+`uzi run get <id> --field claim_generation` (an integer, `0` before the first
+claim, or an empty line when the API predates the field). It is how
+a checker's activity summary is bound to the current attempt; see
+[Checker activity](#checker-activity). The CLI treats an absent field as
+unknown, never as generation 0.
+
 ### Plan cross-check settings
 
 ```sh
@@ -2793,6 +2807,51 @@ structured `code_cross_check_summary`.
 stored `code_cross_check_guidance` and `cross_check_repo_instructions_enabled`.
 The CLI never writes either; use the **Code cross-check** panel on the Repos
 page.
+
+### Checker activity
+
+A Plan or Code checker run records the paths it read and searched (see
+[Checker activity](./cross-check.md#checker-activity)). The checker is a child
+run of kind `cross_check`; its id is in the `PLAN_CHECK_CHECKER_ID` or
+`CODE_CHECK_CHECKER_ID` row of the lead's `run get`.
+
+`uzi run logs <checker-id>` prints each activity event as a human row in the
+payload column, for example:
+
+```
+#7    status           cross-checker    activity capture started
+#9    status           cross-checker    read api/cmd/uzi/run_get.go L1-200 · ok
+#10   status           cross-checker    search api/internal/forge · 3 matches · ok
+#11   status           cross-checker    read denied (outside checkout)
+#14   status           cross-checker    activity summary: 4 reads, 1 search, 0 dropped, complete
+```
+
+A denied attempt outside the checkout shows the category and never the path;
+a read of the Claude SDK spill file shows as `(tool output)`. A truncated
+match count reads `N+ matches`. The row goes through the same terminal
+sanitization and 200-character cell cap as other payloads. An event this CLI
+does not recognise, or an activity payload that does not validate, keeps the
+generic payload row, and `--json` always carries the raw payload.
+
+`uzi run get <checker-id>` prints one `ACTIVITY` row for a `cross_check` run:
+
+- `4 reads, 0 searches, 0 dropped, complete` (or `incomplete`): the summary for
+  the run's current attempt.
+- `activity capture in progress`: the run is not finished and its current
+  attempt has emitted the start marker.
+- `activity capture incomplete`: the run finished with a marker and no summary.
+- `activity capture unavailable`: the run started and finished without a
+  marker. A missing marker does not prove an older worker.
+- `earlier attempt (generation N): ...`: an earlier attempt's summary, labelled
+  and appended after the current state with `; `.
+- `historical; current capture unknown: ...`: the API predates
+  `claim_generation`, so the newest summary cannot be tied to the current
+  attempt.
+
+The row is omitted when there is nothing to say, and a log read error prints no
+`ACTIVITY` row. The state is derived from the run's messages and its
+`claim_generation`; a summary or marker from a higher generation than the run
+reports is ignored.
 
 A run's PRD-completion declaration is readable the same way:
 `uzi run get <id> --field prd_done_path` (the repo-relative path the run

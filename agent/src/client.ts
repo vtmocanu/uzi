@@ -1205,6 +1205,9 @@ type CompletionReservation = { live: boolean; tickets: Set<CompletionTicket> };
 export class WorkerClient {
   private registeredWorkerId: string | undefined;
   private hasExactHoldCapability = false;
+  /** Issue #3142: this registration advertised worker_memory_authority_claim_v1. */
+  private hasMemoryAuthorityClaimCapability = false;
+  private memoryAuthorityLostLogged = false;
   // Provenance survives uncertain registration; only a successful changed identity resets it.
   private completionWorkerId: string | undefined;
   private completionInventoryUnreadable = false;
@@ -1513,6 +1516,7 @@ export class WorkerClient {
     // are fenced server-side) even when a one-shot register missed the negotiated feature.
     this.hasCredentialSwitchCapability = originalCapabilities?.includes("credential_switch_v1") ?? false;
     this.hasExactHoldCapability = originalCapabilities?.includes("recovery_held_publication_v2") ?? false;
+    this.hasMemoryAuthorityClaimCapability = originalCapabilities?.includes("worker_memory_authority_claim_v1") ?? false;
     // PRD #1390 M2a: capture the per-registration nonce the api minted, stamped onto every
     // ActiveSnapshot the worker sends. A string only (defensive); absent on an older api ⇒
     // undefined, in which case no snapshot is sent even if later heartbeat adverts grow the cache.
@@ -1731,7 +1735,12 @@ export class WorkerClient {
    *  nonce exists (nonce-stamped), so the
    *  api's pre-claim dedupe sees the runs this worker is already executing BEFORE the first
    *  post-outage heartbeat lands. If not negotiated the claim posts an empty body `{}`, which
-   *  an old api ignores (harmless — the run-lane claim was bodyless before this). */
+   *  an old api ignores (harmless — the run-lane claim was bodyless before this).
+   *
+   *  Issue #3142: when this registration advertised `worker_memory_authority_claim_v1` and the api
+   *  negotiated it, the body also carries `memory_authority` ("held" while the memory incarnation is
+   *  live, "lost" once revoked). Computed synchronously at body build time, so an admission wait
+   *  before the call cannot leave a stale value. The cross-check lane never carries it. */
   async claimRun(activeSnapshot?: ActiveSnapshot, signal?: AbortSignal, timeoutMs = this.httpTimeoutMs): Promise<ClaimResponse | null> {
     return this.claimRunLane(`${WORKER_API_PREFIX}/runs/claim`, activeSnapshot, signal, timeoutMs);
   }
@@ -1752,6 +1761,13 @@ export class WorkerClient {
       const body: ClaimRequest = {};
       if (this.hasFeature("active_run_snapshot") && activeSnapshot !== undefined && this.registerNonce !== undefined) {
         body.active_snapshot = { ...activeSnapshot, register_nonce: this.registerNonce };
+      }
+      if (!dedicated && this.hasMemoryAuthorityClaimCapability && this.hasFeature("worker_memory_authority_claim_v1")) {
+        body.memory_authority = this.memoryIncarnationValue ? "held" : "lost";
+        if (body.memory_authority === "lost" && !this.memoryAuthorityLostLogged) {
+          this.memoryAuthorityLostLogged = true;
+          this.log.warn("memory authority lost; claims report it and the api stops dispatching guard-bound runs here until the worker restarts", {});
+        }
       }
       const res = await this.fetchRaw("POST", path, body, timeoutMs, deadline);
       deadline.throwIfAborted();

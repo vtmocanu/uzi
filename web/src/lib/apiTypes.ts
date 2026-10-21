@@ -2558,6 +2558,12 @@ export interface Worker {
   // render it as plain text only (WorkerQuarantineBadge).
   residue_quarantined_at?: string | null;
   residue_quarantine_cause?: string | null;
+  // memory_authority_lost_at is when the api (api clock, RFC3339) began withholding
+  // guard-bound runs from this worker (its first gated claim, not necessarily when the
+  // worker lost memory authority) because its claims did not report it (issue #3142);
+  // null when it has not. In-process api state, so it is lost on an api restart. The
+  // operator action is to restart the worker container (WorkerMemoryAuthorityBadge).
+  memory_authority_lost_at?: string | null;
 }
 
 /** The closed set of worker bind modes (PRD #111 M3), mirroring the server's CHECK. */
@@ -3273,6 +3279,11 @@ export interface Run {
    *  Whole-run duration displays read this, falling back to started_at. Optional for rollout
    *  skew: an older api omits the key; null before the run first starts. */
   first_started_at?: string | null;
+  /** PRD #3166: the claim generation of the run's CURRENT attempt (runs.claim_generation); the server
+   *  sends 0 before the first claim. Cross-check activity markers and summaries carry the generation that produced
+   *  them, so this is what separates the current attempt's capture from an earlier one's. Optional
+   *  for rollout skew: null/absent only means an older api. */
+  claim_generation?: number | null;
   finished_at: string | null;
   created_at: string;
   updated_at: string;

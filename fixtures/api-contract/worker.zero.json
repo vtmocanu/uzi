@@ -52,5 +52,6 @@
   "outbox_blocked": null,
   "outbox_blocked_run_id": null,
   "residue_quarantined_at": null,
-  "residue_quarantine_cause": null
+  "residue_quarantine_cause": null,
+  "memory_authority_lost_at": null
 }

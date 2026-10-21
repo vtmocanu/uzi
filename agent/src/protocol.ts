@@ -700,6 +700,9 @@ export interface ResidueQuarantineWire {
  */
 export interface ClaimRequest {
   active_snapshot?: ActiveSnapshot;
+  /** Issue #3142: whether this worker still holds memory authority. Sent only on the ordinary run
+   *  lane, and only when `worker_memory_authority_claim_v1` is negotiated. */
+  memory_authority?: "held" | "lost";
 }
 
 /** Kebab-case agent name. Mirrors the API's template nameRe
