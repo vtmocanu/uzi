@@ -16448,7 +16448,7 @@ export class RunRunner {
     }
   }
 
-  private async settleForCredentialCapture(executor: Executor, deadlineMs = this.codexBoundaryDeadlineMs, purpose: "capture" | "cancel" = "capture"): Promise<CredentialFreeSettleOutcome> {
+  private async settleForCredentialCapture(executor: Executor, deadlineMs = this.codexBoundaryDeadlineMs, purpose: "capture" | "cancel" = "capture", mode: "credential-free" | "authenticated" = "credential-free"): Promise<CredentialFreeSettleOutcome> {
     const deadlineAt = Date.now() + Math.max(0, deadlineMs);
     await executor.closeAndSettlePlanSummary?.(deadlineMs);
     deadlineMs = Math.max(0, deadlineAt - Date.now());
@@ -16456,16 +16456,33 @@ export class RunRunner {
     // killAgentTree reap, so they settle (disposed and confirmed) before the capture proceeds.
     if (executor.settleWorkerCommands) {
       let confirmed = false;
-      try { confirmed = (await executor.settleWorkerCommands(deadlineMs)).confirmed; } catch { /* unconfirmed */ }
+      try { confirmed = (await executor.settleWorkerCommands(deadlineMs)).confirmed; } catch (error) {
+        if (canonicalRecoveryInterruption(error)) throw error;
+      }
       if (!confirmed) {
         return { kind: "incomplete", errors: [{ category: "protocol", message: "worker command settle unconfirmed" }] };
       }
       deadlineMs = Math.max(0, deadlineAt - Date.now());
     }
+    if (mode === "authenticated" && executor.safety) {
+      // The normal boundary verifies Codex roots and closes admission before source writes.
+      // A legacy credential-free settle would poison that authenticated boundary.
+      let entered = false;
+      try {
+        await this.reapForSink(executor, { boundary: "shutdown", deadlineMs }, async () => { entered = true; });
+      } catch (error) {
+        if (canonicalRecoveryInterruption(error)) throw error;
+        return { kind: "incomplete", errors: [{ category: "protocol", message: "authenticated capture settle threw" }] };
+      }
+      return entered
+        ? { kind: "observed_empty" }
+        : { kind: "incomplete", errors: [{ category: "protocol", message: "authenticated capture boundary not entered" }] };
+    }
     if (executor.settleForCredentialFreeCapture) {
       try {
         return await executor.settleForCredentialFreeCapture(deadlineMs, purpose);
-      } catch {
+      } catch (error) {
+        if (canonicalRecoveryInterruption(error)) throw error;
         return { kind: "incomplete", errors: [{ category: "protocol", message: "capture settle threw" }] };
       }
     }
@@ -16936,9 +16953,9 @@ export class RunRunner {
               }
               attempt = result.value;
             } else {
-              // Authenticated publication acquires its own Codex boundary. Settle strictly
-              // first without holding a credential-free callback across that boundary.
-              const settlement = await this.settleForCredentialCapture(executor);
+              // Prove the authenticated drain before source writes; publication later acquires
+              // its own boundary. Neither step acquires a credential-free capture callback.
+              const settlement = await this.settleForCredentialCapture(executor, undefined, "capture", "authenticated");
               if (settlement.kind !== "observed_empty") {
                 // Incomplete settlement retains custody until lifecycle exit; it does
                 // not consume the bounded failed-process-proof attempts below.
@@ -16969,6 +16986,8 @@ export class RunRunner {
               flight.keepGuardedInventoryOpen = true;
               feed = deferral === "vault_locked" ? VAULT_PARK_FEED : deferral === "account_unavailable" ? ACCOUNT_PARK_FEED : deferral === "credential_release_unavailable" ? RELEASE_UNAVAILABLE_PARK_FEED : REFRESH_UNKNOWN_PARK_FEED;
               confirmedRunning = false;
+            } else if (!(captureError instanceof ResidueQuarantinedError) && canonicalRecoveryInterruption(captureError)) {
+              throw captureError;
             }
             if (captureError instanceof ResidueQuarantinedError) quarantinedCapture = captureError;
             runLog.warn("recovery capture failed; retaining work for retry", {
