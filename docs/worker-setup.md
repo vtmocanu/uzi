@@ -451,7 +451,11 @@ authority; a heartbeat never does, and there is no self-restart or retry.
 - During a rolling api deploy, an old replica rejects a claim body carrying the
   member (400; the worker retries on its next poll), and an old replica's
   heartbeat advert can briefly make a still-authorized worker omit the member
-  and be withheld (it idles only).
+  and be withheld from guard-bound runs (it still claims the exempt kinds).
+- An api downgraded below the version that advertises
+  `worker_memory_pressure_v1` predates this gate too, so while it runs the
+  worker's claims fail in `bindWorkerMemory` as before; the gate applies once
+  the api is upgraded again, until the worker restarts.
 
 **Where it shows.**
 
@@ -466,7 +470,9 @@ authority; a heartbeat never does, and there is no self-restart or retry.
 - **Admin → Health** raises the `fleet.memory_authority` warning, see
   [Admin health](admin-health.md#the-checks).
 
-The api keeps this record in process memory only. It resets on an api restart
+The api keeps this record in process memory only, per api replica: with several
+replicas each surface shows only the gated claims the replica serving it handled,
+so it can be missing or flicker between replicas. It resets on an api restart
 (the gate itself does not: it reads the claim request and persisted capabilities)
 and reappears on the worker's next run-lane claim poll. An entry clears on a
 `held` claim, a re-registration, a worker delete, or 24 hours without a gated
