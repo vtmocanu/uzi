@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { Outbox } from "../src/outbox.js";
 import { sleep } from "../src/util.js";
-import { MessageBatcher, MAX_MESSAGE_BYTES } from "../src/batcher.js";
+import { MessageBatcher, MAX_MESSAGE_BYTES, replaySegment } from "../src/batcher.js";
 import { RequestError } from "../src/client.js";
 import type { WorkerClient } from "../src/client.js";
 import type { OutgoingMessage } from "../src/protocol.js";
@@ -109,7 +109,33 @@ describe("MessageBatcher.undeliveredFromSeq with a spilled pending range", () =>
 });
 
 describe("MessageBatcher.journalOnlySeqs", () => {
-  it("names seqs only journaled to the outbox until a full drain re-arms the batcher", async () => {
+  it("retains loss evidence after replay tombstones usage and the worker rearms", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "batcher-replay-proof-"));
+    try {
+      const outbox = new Outbox({ root: path.join(dir, "outbox"), log: nullLogger(),
+        runMaxBytes: 64 * 1024 * 1024, maxBytes: 512 * 1024 * 1024, retentionMs: 86_400_000 });
+      await outbox.init();
+      let outage = true;
+      const a = api((msgs) => outage ? 503 : msgs.some((m) => m.payload.event === "init") ? 400 : undefined);
+      const b = new MessageBatcher(a.client, "run", 0, 5, nullLogger(), undefined, undefined,
+        { outbox, transientTripMs: 40 });
+      b.emit({ kind: "status", payload: { event: "init" } });
+      for (let i = 0; i < 200 && !b.journalOnlySeqs().seqs.has(1); i++) await sleep(20);
+      assert.equal(b.journalOnlySeqs().seqs.has(1), true);
+      outage = false;
+      const result = await outbox.drainRun("run", (msgs, gen) =>
+        replaySegment(a.client, "run", msgs, gen, nullLogger()));
+      assert.equal(result.retired, true);
+      assert.equal(a.landed.some((m) => m.payload.event === "message_dropped"), true);
+      assert.equal(a.landed.some((m) => m.payload.event === "init"), false);
+      b.rearm();
+      await b.close();
+      assert.equal(b.journalOnlySeqs().seqs.has(1) || b.tombstonedSeqs().seqs.has(1), true,
+        "a retired tombstone is not proof that the original usage frame arrived");
+    } finally { await fs.rm(dir, { recursive: true, force: true }); }
+  });
+
+  it("names seqs only journaled to the outbox, and a re-arm does not clear them", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "batcher-accessors-"));
     try {
       const outbox = new Outbox({ root: path.join(dir, "outbox"), log: nullLogger(),
@@ -126,8 +152,7 @@ describe("MessageBatcher.journalOnlySeqs", () => {
       assert.deepEqual([...b.journalOnlySeqs().seqs].sort(), [1, 2], "journaled, not yet delivered");
       assert.equal(b.undeliveredFromSeq(), undefined, "the journal hides them from undeliveredFromSeq");
       b.rearm();
-      assert.deepEqual([...b.journalOnlySeqs().seqs], [], "a full drain (re-arm) confirms delivery");
-      assert.equal(b.journalOnlySeqs().overflow, false);
+      assert.deepEqual([...b.journalOnlySeqs().seqs].sort(), [1, 2], "a drain does not prove the original payloads arrived");
       await b.close();
     } finally { await fs.rm(dir, { recursive: true, force: true }); }
   });

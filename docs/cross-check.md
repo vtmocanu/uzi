@@ -282,9 +282,10 @@ the run's current attempt has arrived. Before then, or when it never arrives:
   rejection of any batch, or no usable outbox while the API is unreachable) or a
   tombstone-set overflow fails a would-be success with `model_error`
   whichever frame caused it. A usage post that fails transiently and is later
-  delivered does not fail the check. A usage frame that was only written to
-  the worker's outbox (the API was unreachable) and not yet delivered by a
-  full outbox drain is not delivered: a would-be success fails `model_error`.
+  delivered does not fail the check. A usage frame that was written to the
+  worker's outbox (the API was unreachable) never counts as delivered, even
+  after the outbox drains, because a replay can deliver a dropped-message
+  marker in its place: a would-be success fails `model_error`.
 - Activity lands on the checker child run, not the lead. The lead's
   stalled-health warning during a code-check wait is unchanged.
 

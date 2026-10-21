@@ -186,7 +186,7 @@ export class CrossCheckRunner {
       const tombstones = batcher.tombstonedSeqs();
       const journaled = batcher.journalOnlySeqs();
       if (tombstones.overflow || journaled.overflow) return true;
-      // Journaled to the outbox but not yet drained is not proof of delivery: fail closed.
+      // Journaled to the outbox is not proof the original payload arrived (replay may tombstone it): fail closed.
       return usageSeqs.some((s) => (from !== undefined && s >= from) || tombstones.seqs.has(s) || journaled.seqs.has(s));
     };
     let verdictDelivered = false;

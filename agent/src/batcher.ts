@@ -349,9 +349,8 @@ export class MessageBatcher {
   private seq: number;
   private readonly tombstoned = new Set<number>();
   private tombstoneOverflow = false;
-  /** Seqs written to the outbox and not yet confirmed delivered by a full drain (bounded like
-   *  {@link tombstoned}). Cleared by {@link rearm}, which runs only after the drainer retired
-   *  every spilled segment of this run. */
+  /** Seqs written to the outbox (bounded like {@link tombstoned}). Never cleared: a retired
+   *  segment does not prove the original payload arrived, since replay may tombstone it. */
   private readonly journalOnly = new Set<number>();
   private journalOnlyOverflow = false;
   private timer: NodeJS.Timeout | undefined;
@@ -735,9 +734,10 @@ export class MessageBatcher {
     return { seqs: this.tombstoned, overflow: this.tombstoneOverflow };
   }
 
-  /** Seqs whose only delivery evidence is the outbox journal: written while spilled (or by a
-   *  spilled close) and not yet confirmed by a full drain. Bounded: past {@link MAX_TOMBSTONE_SEQS}
-   *  entries the set stops growing and `overflow` is set. Read-only. */
+  /** Seqs whose only delivery evidence is the outbox journal: written while spilled or by a
+   *  spilled close. A later drain never removes them, because replay may deliver a tombstone in
+   *  place of the original. Bounded: past {@link MAX_TOMBSTONE_SEQS} entries the set stops
+   *  growing and `overflow` is set. Read-only. */
   journalOnlySeqs(): { seqs: ReadonlySet<number>; overflow: boolean } {
     return { seqs: this.journalOnly, overflow: this.journalOnlyOverflow };
   }
@@ -794,9 +794,6 @@ export class MessageBatcher {
     this.spilled = false;
     this.consecutiveFailures = 0;
     this.failingSince = undefined;
-    // The drainer retired every spilled segment, so everything journaled has been delivered.
-    this.journalOnly.clear();
-    this.journalOnlyOverflow = false;
     this.log.info("message batcher re-armed to the network after the outbox drained", { run_id: this.runId });
     if (this.buffer.length > 0 || this.pendingRangeFirst !== undefined) this.scheduleFlush();
   }

@@ -719,6 +719,31 @@ it("checker delivery: a tripped batcher alone, with every usage frame delivered,
  assert.deepEqual(r.calls.filter((x) => x !== "messages"), ["verdict:failed:model_error", "terminal:failed"]);
 });
 
+it("checker delivery: a usage frame only journaled to the outbox fails the check model_error", async () => {
+ // Seqs: 1 marker, 2 init, 3 result. The init frame's only delivery evidence is the journal.
+ const spy = mock.method(MessageBatcher.prototype, "journalOnlySeqs", () => ({ seqs: new Set<number>([2]), overflow: false }));
+ try {
+  const r = await scenario({ checker: async ({ usage }) => { await usage(initFrame); await usage(resultFrame); return verdict; } });
+  assert.deepEqual(r.calls.filter((x) => x !== "messages"), ["verdict:failed:model_error", "terminal:failed"]);
+ } finally { spy.mock.restore(); }
+});
+
+it("checker delivery: a journal-only activity row with usage delivered leaves the verdict standing", async () => {
+ const spy = mock.method(MessageBatcher.prototype, "journalOnlySeqs", () => ({ seqs: new Set<number>([1]), overflow: false }));
+ try {
+  const r = await scenario({ checker: async ({ usage }) => { await usage(initFrame); await usage(resultFrame); return verdict; } });
+  assert.equal(r.calls.filter((x) => x !== "messages")[0]?.startsWith("verdict:failed"), false);
+ } finally { spy.mock.restore(); }
+});
+
+it("checker delivery: a journal-only overflow alone fails the check model_error", async () => {
+ const spy = mock.method(MessageBatcher.prototype, "journalOnlySeqs", () => ({ seqs: new Set<number>(), overflow: true }));
+ try {
+  const r = await scenario({ checker: async ({ usage }) => { await usage(initFrame); await usage(resultFrame); return verdict; } });
+  assert.deepEqual(r.calls.filter((x) => x !== "messages"), ["verdict:failed:model_error", "terminal:failed"]);
+ } finally { spy.mock.restore(); }
+});
+
 it("checker delivery: a tombstone-set overflow alone fails the check model_error", async () => {
  const spy = mock.method(MessageBatcher.prototype, "tombstonedSeqs", () => ({ seqs: new Set<number>(), overflow: true }));
  try {
