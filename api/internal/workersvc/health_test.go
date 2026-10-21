@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -37,14 +38,17 @@ type healthFakeStore struct {
 	onlineErr error
 
 	Store
-	liveCrossCheck        map[uuid.UUID]bool
-	liveCrossCheckErr     error
-	liveCrossCheckCalls   []uuid.UUID
-	active                []store.ListActiveRunsForHealthRow
-	crossCheckRun         store.Run
-	crossCheckWorkers     []store.ListWorkersByUserRow
-	crossCheckWorkerCalls []uuid.UUID
-	window                map[uuid.UUID][]store.ListRunToolWindowRow
+	liveCrossCheck              map[uuid.UUID]bool
+	liveCrossCheckErr           error
+	liveCrossCheckCalls         []uuid.UUID
+	liveCodeCrossCheckDeadlines map[uuid.UUID]pgtype.Timestamptz
+	liveCodeCrossCheckErr       error
+	liveCodeCrossCheckCalls     []store.GetLiveCodeCrossCheckDeadlineParams
+	active                      []store.ListActiveRunsForHealthRow
+	crossCheckRun               store.Run
+	crossCheckWorkers           []store.ListWorkersByUserRow
+	crossCheckWorkerCalls       []uuid.UUID
+	window                      map[uuid.UUID][]store.ListRunToolWindowRow
 	// messages is an optional per-run run_messages log (seq ascending or not; the
 	// fake orders it). When a run has one, BOTH tool-window reads derive from it with
 	// the real queries' filter + ORDER BY seq DESC + LIMIT semantics, so a test can
@@ -149,6 +153,18 @@ type healthFakeStore struct {
 func (f *healthFakeStore) HasLivePlanCrossCheck(_ context.Context, id uuid.UUID) (bool, error) {
 	f.liveCrossCheckCalls = append(f.liveCrossCheckCalls, id)
 	return f.liveCrossCheck[id], f.liveCrossCheckErr
+}
+
+func (f *healthFakeStore) GetLiveCodeCrossCheckDeadline(_ context.Context, arg store.GetLiveCodeCrossCheckDeadlineParams) (pgtype.Timestamptz, error) {
+	f.liveCodeCrossCheckCalls = append(f.liveCodeCrossCheckCalls, arg)
+	if f.liveCodeCrossCheckErr != nil {
+		return pgtype.Timestamptz{}, f.liveCodeCrossCheckErr
+	}
+	deadline, ok := f.liveCodeCrossCheckDeadlines[arg.LeadRunID]
+	if !ok {
+		return pgtype.Timestamptz{}, pgx.ErrNoRows
+	}
+	return deadline, nil
 }
 
 func (f *healthFakeStore) GetRunByID(context.Context, uuid.UUID) (store.Run, error) {

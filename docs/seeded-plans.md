@@ -44,8 +44,33 @@ If you planned against a specific commit and want to know if `main` moved
 before the worker gets there, note that commit's SHA. `--planned-commit`
 records it; the worker compares it to the clone's own base once it checks
 out and warns in the run feed on a mismatch. Add `--require-base` to make a
-mismatch fail the run instead of warning — useful when the plan describes
-exact line ranges that a moved base would invalidate.
+mismatch reject the run before implementation instead of warning — useful when
+the plan describes exact line ranges that a moved base would invalidate. The raw
+status remains `failed`, with `fail_origin = base_diverged`; web and CLI
+show **rejected**, and the cause label is **rejected: base changed**. This
+outcome is never judged and is counted separately from execution failures in
+[usage](./run-cost.md#rejected-runs-and-failure-accounting).
+
+Review the plan against the new base, then create a new run with the updated
+`--planned-commit`. A warning without `--require-base` still lets the run proceed.
+See [rollout compatibility](./run-activity.md#when-a-required-base-has-changed)
+for mixed API/worker versions and historical runs.
+
+With `--require-base`, the check is exact. The first claim must check out the
+planned commit itself. When the run later continues its own work (after a
+budget pause and `uzi run extend`, or on another worker), it may only pick up
+content that one of its own checkpoints recorded after the check had passed.
+If it cannot prove that for work it kept itself (its own tracking or checkpoint
+copy), the agent never starts and the run is held
+(`base_attestation_missing`) with its work kept, for you to recover, export or
+start a successor: `uzi run recovery <id>` shows the kept work and `uzi run
+export <id> --output <path>` downloads it. A planned commit that is ambiguous or
+unreadable in the repository fails the run as unverifiable instead. Resume and extend are refused for
+this hold. Work picked up from the forge branch instead (for example a branch
+already pushed by an earlier attempt) is not proof of the run's own checked work,
+so unless it is exactly the content the run's checkpoint attested, a mismatch
+there is rejected as a changed base, as on a first claim.
+Without `--require-base` nothing changes: a mismatch only warns.
 
 `--planned-commit` must be a hex commit SHA, 7-64 characters — a shorter or
 non-hex value is a usage error (exit 2). The safe answer is always the full

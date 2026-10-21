@@ -453,9 +453,22 @@ export class FakeApi {
   }
 
   async listen(): Promise<string> {
-    await new Promise<void>((resolve) =>
-      this.server.listen(0, "127.0.0.1", resolve),
-    );
+    // Reject on a bind failure (EPERM in a sandbox without loopback, EADDRINUSE) so the
+    // caller's setup fails with the real error, not as an uncaught 'error' event
+    // attributed to whichever test happens to be running.
+    await new Promise<void>((resolve, reject) => {
+      const onError = (err: Error): void => {
+        this.server.off("listening", onListening);
+        reject(err);
+      };
+      const onListening = (): void => {
+        this.server.off("error", onError);
+        resolve();
+      };
+      this.server.once("error", onError);
+      this.server.once("listening", onListening);
+      this.server.listen(0, "127.0.0.1");
+    });
     // unref the listening handle so it never keeps the test PROCESS alive on its own.
     // Every test drives this server through an awaited client call, so the run's own
     // pending work holds the loop open while a test is in flight; once the tests

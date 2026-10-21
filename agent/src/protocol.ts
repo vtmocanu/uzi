@@ -1412,6 +1412,9 @@ export interface ClaimResponse extends ClaimMemoryState {
   /** Resume: the tip THIS run last published to its checkpoint ref (owner-anchor).
    *  Adoption of refs/uzi-checkpoints/<branch> requires the remote tip to equal this. */
   checkpoint_tip?: string | null;
+  /** issue #3194: the source a flight of THIS run published after its `--require-base` guard
+   *  accepted (set-only server-side). A continuation may adopt exactly this content. */
+  checkpoint_attested_source?: string | null;
   /** High-water mark of run_messages.seq; the worker continues numbering here. */
   last_seq: number;
   /** The claim generation this claim was taken at (PRD #1349 M1, D2). The server already
@@ -2014,6 +2017,18 @@ export interface CompletionPermitResponse {
     completion_scope?: ClaimConfig["completion_scope"];
   };
 }
+
+/** issue #3194: the `hold_reason` of the `--require-base` base-attestation hold (POST
+ *  /api/worker/runs/:id/base-attestation-hold). Mirrors workersvc.HoldReasonBaseAttestationMissing. */
+export const BASE_ATTESTATION_HOLD_REASON = "base_attestation_missing";
+
+/** issue #3194: what a base-attestation hold request established. `held` is the server's positive
+ *  ACK for this flight's generation; `stale` is a fence refusal (the claim moved on); `unknown`
+ *  covers every answer that proves neither (transport, 5xx, 404, 400, an unreadable body). */
+export type BaseAttestationHoldOutcome =
+  | { outcome: "held"; status: string }
+  | { outcome: "stale"; status: string }
+  | { outcome: "unknown"; detail: string };
 
 /** Request body for POST /api/worker/runs/:id/wall-park (PRD #1497 M2, D4/D15): the worker
  *  reports it dropped its turn at the run's wall-clock deadline and captured the tree, and the

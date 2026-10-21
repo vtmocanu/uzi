@@ -161,7 +161,9 @@ func newRunExtendCmd(env Env, gf *globalFlags) *cobra.Command {
 			"self-improve, mr-rework or ci-fix run), including a queued or parked one. A chat, judge " +
 			"or interactive-task run never times out, so extending one is a 409 (exit 5); a request " +
 			"over the per-extension maximum or past the total-time limit, or extending while the admin " +
-			"has turned extensions off, is also a 409, with the server's message printed verbatim.",
+			"has turned extensions off, is also a 409, with the server's message printed verbatim. " +
+			"So is a --require-base run held because its kept work is not attested against the planned " +
+			"base (base_attestation_missing): recover its kept work with the run recovery or run export commands instead.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := env.client(gf)

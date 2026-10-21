@@ -1101,6 +1101,9 @@ chmod 0755 "$RUNROOT/fake-devbox"
 # per-repo GitCache lock (agent/src/git.ts) never serializes them. It stays
 # dormant for every other phase (the seed enables only group/repo, and no phase
 # clones repo2 until M5 enables the repo).
+# The seed working copy is host-side and deleted right after its push: it must not read
+# host git config, where a global core.fsmonitor=true leaves a detached daemon behind.
+seed_git() { GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null git "$@"; }
 for r in repo repo2; do
   # --shared=0777 is LOAD-BEARING, not tidiness: this one bind-mounted bare is written
   # by MORE THAN ONE uid (forge-fake's receive-pack as root over smart-HTTP, the worker
@@ -1133,8 +1136,8 @@ for r in repo repo2; do
   # the default local-path remote.
   git -C "$RUNROOT/fakeremote/$r.git" config http.receivepack true
   seedwc="$RUNROOT/.seedwc-$r"
-  git -C "$RUNROOT" clone -q "$RUNROOT/fakeremote/$r.git" ".seedwc-$r"
-  git -C "$seedwc" checkout -q -b main
+  seed_git -C "$RUNROOT" clone -q "$RUNROOT/fakeremote/$r.git" ".seedwc-$r"
+  seed_git -C "$seedwc" checkout -q -b main
   printf '# %s\n\nSeeded by the uzi E2E harness.\n' "$r" > "$seedwc/README.md"
   if [ "$r" = repo ]; then
     # A repo-borne skill for the PRD #16 M6 opt-in path. Carries a capability key
@@ -1152,12 +1155,12 @@ for r in repo repo2; do
       > "$seedwc/.claude/agents/repo-coder.md"
     printf -- '---\nname: repo-reviewer\ndescription: Repo-defined reviewer for the M6 E2E.\ntools: Read, Grep\n---\n\nYou review changes for this repo.\n' \
       > "$seedwc/.claude/agents/repo-reviewer.md"
-    git -C "$seedwc" add README.md .claude
+    seed_git -C "$seedwc" add README.md .claude
   else
-    git -C "$seedwc" add README.md
+    seed_git -C "$seedwc" add README.md
   fi
-  git -C "$seedwc" -c user.name=seed -c user.email=seed@uzi.e2e -c commit.gpgsign=false commit -q -m "seed: initial commit ($r)"
-  git -C "$seedwc" push -q origin main
+  seed_git -C "$seedwc" -c user.name=seed -c user.email=seed@uzi.e2e -c commit.gpgsign=false commit -q -m "seed: initial commit ($r)"
+  seed_git -C "$seedwc" push -q origin main
   rm -rf "$seedwc"
 done
 

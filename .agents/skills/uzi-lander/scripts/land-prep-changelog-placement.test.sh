@@ -135,9 +135,10 @@ scenario() {
   PR_JSON=$(jq -cn --arg h "$(git -C "$d/seed" rev-parse feature)" '{state:"OPEN",headRefName:"feature",baseRefName:"main",headRefOid:$h,headRepository:{name:"uzi"},headRepositoryOwner:{login:"test"}}')
   export PR_JSON
 }
-land() {  # NAME; sets RC, OUT
+land() {  # NAME [extra land-prep args...]; sets RC, OUT
+  local n="$1"; shift
   RC=0
-  OUT=$(PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/uzi 77 --repo-root "$WORK/$1/root" --worktree "$WORK/$1/wt" --no-push --gate none 2>&1) || RC=$?
+  OUT=$(PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/uzi 77 --repo-root "$WORK/$n/root" --worktree "$WORK/$n/wt" --no-push --gate none "$@" 2>&1) || RC=$?
 }
 
 # 1. The fold: the rebase is conflict-free, the new bullets end up in [0.2.0], land-prep stops.
@@ -151,6 +152,15 @@ grep -Fq 'REBASE CONFLICT' <<<"$OUT" && fail "fold: the rebase was expected to b
 # the bullets really are under the released section (nothing was relocated)
 awk '/^## \[Unreleased\]/ {u=1; next} /^## / {u=0} u && /new added/ {bad=1} END {exit bad}' "$WORK/fold/wt/CHANGELOG.md" \
   || fail "fold: bullets unexpectedly under [Unreleased]"
+
+# 1m. The same fold under --merge: merging the folded base in is the same three-way merge, so
+#     it is conflict-free too and files the bullets under [0.2.0]; the guard stops it alike.
+scenario foldm "$FOLDED"
+land foldm --merge
+[ "$RC" -eq 11 ] || fail "foldm: expected exit 11 in merge mode, got $RC: $OUT"
+grep -Fq 'INTEGRATION=merge' <<<"$OUT" || fail "foldm: not in merge mode: $OUT"
+grep -Fq -- '- **new fixed**' <<<"$OUT" || fail "foldm: the misplaced bullet was not named: $OUT"
+grep -Fq 'MERGE CONFLICT' <<<"$OUT" && fail "foldm: the merge was expected to be conflict-free: $OUT"
 
 # 2. Control: a clean rebase that keeps the bullets under [Unreleased] is not stopped.
 scenario keep "$UNRELATED"
@@ -276,4 +286,4 @@ chain_scenario chain_ok '00003, 00004'
 chain_scenario chain_cascade '00004, 00004'
 [ "$RC" -eq 11 ] || fail "chain_cascade: a cascaded substitution must stop with exit 11, got $RC: $OUT"
 
-echo "PASS land-prep-changelog-placement: real conflict-free rebase after a release fold stops with exit 11 naming the misplaced bullets; a rebase keeping them under [Unreleased] passes; a bullet changed only by the recorded migration renumber passes (chained renames map each original once), any other edit stops"
+echo "PASS land-prep-changelog-placement: real conflict-free rebase (or --merge) after a release fold stops with exit 11 naming the misplaced bullets; a rebase keeping them under [Unreleased] passes; a bullet changed only by the recorded migration renumber passes (chained renames map each original once), any other edit stops"

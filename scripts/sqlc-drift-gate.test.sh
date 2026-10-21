@@ -2,6 +2,9 @@
 # Hermetic gate contracts; --case NAME selects an independent scenario.
 # Set UZI_SQLC_KEEP_TEST_ARTIFACTS=1 to preserve this run's artifacts for debugging.
 set -eu
+# Fixture repos must not read host git config: a global core.fsmonitor=true
+# leaves a detached fsmonitor daemon per repo on macOS.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 
 ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 SOURCE_GATE="${UZI_SQLC_DRIFT_GATE:-$ROOT/scripts/sqlc-drift-gate.sh}"

@@ -1747,12 +1747,18 @@ export interface ImplementPromptInput {
    *  approved" — nobody approved a seeded plan through the gate. FIRST TURN ONLY; an
    *  approved (non-seeded) run's prompt is byte-identical to before. */
   seeded?: boolean;
+  /** Issue #3178: the plan gate approved a stored plan while no session exists to carry it (the
+   *  run's earlier SDK session was dropped), so this first implement session is fresh. Frames
+   *  the plan block as gate-approved and adds GATE_APPROVED_FRESH_SESSION_GUIDANCE. FIRST TURN
+   *  ONLY; seeded and reviewed-resume framing take precedence. Absent/false ⇒ unchanged. */
+  gateApprovedWithoutSession?: boolean;
   /** PRD #209 (M2 validation): the seeded plan BODY to carry out, embedded on the FIRST
    *  implement turn. A session-LESS seeded run (row 2 cold start, and a requeued seeded
    *  run whose transcript was dropped) has no plan turn and no resumed session holding the
    *  plan, so without this the model never sees it and falls back to the issue. Set ONLY
-   *  on that session-less seeded path — a seeded RESUME already has the plan in its session
-   *  and every non-seeded path leaves this absent, so the resume/gated prompts are
+   *  on a session-less path with no session carrying the plan: seeded, the PRD #759 M4
+   *  reviewed resume, or the issue #3178 gate-approved session-less path. A RESUME that still
+   *  has its session already has the plan in it and leaves this absent, so those prompts are
    *  unchanged. It is AUTHORITATIVE instructions (D5), rendered in a plain <plan> block —
    *  NOT untrusted-fenced like a follow_up; the deny-hook is the backstop. */
   seededPlan?: string;
@@ -1935,6 +1941,15 @@ export const REVIEWED_RESUME_APPROVAL_GUIDANCE = [
   "an external review) happened.",
 ].join("\n");
 
+/** Issue #3178: worker-authored fact for a fresh session whose plan was approved at the plan gate
+ *  after the run's earlier session could not be resumed. */
+export const GATE_APPROVED_FRESH_SESSION_GUIDANCE = [
+  "This is a fresh session. The plan below was written in an earlier session of this run, which could not be resumed,",
+  "and was approved at the plan gate. Do not request plan approval again.",
+  "That approval is not evidence that any step the plan itself scheduled before the gate (for example",
+  "an external review) happened.",
+].join("\n");
+
 /** Issue #3149: the earlier owner follow-ups to replay on a reviewed-plan resume, as bodies in the
  *  given (id) order. An entry the lead receives live on this claim (isLive(id)) is dropped. The
  *  match is by id only, never by body text: two distinct follow-ups with the same words are both
@@ -2024,11 +2039,15 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
       "iterating between your subagents until the review passes.",
     );
   }
-  if (input.first && input.reviewedPlanResume) lines.push("", CURRENT_EXECUTION_STATE_GUIDANCE);
+  // Issue #3178: gate-approved plan, no session to carry it (seeded / reviewed resume win).
+  const gateApprovedFraming =
+    input.first && input.gateApprovedWithoutSession === true && !input.seeded && !input.reviewedPlanResume;
+  if ((input.first && input.reviewedPlanResume) || gateApprovedFraming) lines.push("", CURRENT_EXECUTION_STATE_GUIDANCE);
   // Issue #3149: a reviewed (gate-approved, not seeded) resume tells the fresh session so. Gated on
   // `first` like the plan block below, so it is first-turn scaffolding.
   const reviewedResumeFraming = input.first && input.reviewedPlanResume === true && !input.seeded;
   if (reviewedResumeFraming) lines.push("", REVIEWED_RESUME_APPROVAL_GUIDANCE);
+  if (gateApprovedFraming) lines.push("", GATE_APPROVED_FRESH_SESSION_GUIDANCE);
   // PRD #209 (D7): the amnesiac cold-start note, first turn only. Ordinary runs carry
   // this on the PLAN prompt and resume a session that saw it; a seeded run requeued
   // after its transcript was dropped had no plan turn, so it rides here. Empty (nothing
@@ -2049,7 +2068,7 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
     lines.push(
       "",
       "The plan to implement is below, between the <plan> and </plan> tags. It is the plan",
-      reviewedResumeFraming
+      reviewedResumeFraming || gateApprovedFraming
         ? "approved at the plan gate for this run — carry it out:"
         : "you supplied for this run — carry it out:",
       "<plan>",

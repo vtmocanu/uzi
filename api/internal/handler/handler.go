@@ -1235,6 +1235,10 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// window, restart the turn. Mirrors the completion/hold ack contract.
 		r.Post("/runs/{id}/wall-park", h.WorkerRunWallPark)
 		r.Post("/runs/{id}/pause", h.WorkerRunPause)
+		// issue #3194: the --require-base base-attestation HOLD. The worker's preflight guard found
+		// retained work no checkpoint attests; the service parks its own live claim (running ->
+		// paused, hold_reason='base_attestation_missing') before the agent ever runs.
+		r.Post("/runs/{id}/base-attestation-hold", h.WorkerRunBaseAttestationHold)
 
 		// Ownership/terminality probe (#559): worker-authenticated, run-scoped,
 		// READ ONLY. The interactive park-SKIP path polls it to detect a mid-turn

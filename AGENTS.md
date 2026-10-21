@@ -63,9 +63,9 @@ go install github.com/go-task/task/v3/cmd/task@v3.54.0   # pinned, sumdb-verifie
 - Not everything is a target: a single-test invocation, `sqlc generate`, the compose stack and the e2e harness stay written out as commands in `.claude/rules/go.md` and `.claude/rules/stack.md`. The single-test forms, since a rule only loads once you read a file it covers:
 
 ```sh
-cd api && go test ./internal/forge -run TestName                                  # Go (controller: cd controller)
+cd api && env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null go test ./internal/forge -run TestName   # Go (controller: cd controller)
 cd web && npx vitest run src/pages/Foo.test.tsx                                   # web
-cd agent && node --import tsx --test --test-timeout=120000 test/worker.test.ts    # agent: keep the timeout flag
+cd agent && env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null node --import tsx --test --test-timeout=120000 test/worker.test.ts   # agent: keep the timeout flag
 ```
 
 ### Lint ratchet
@@ -220,6 +220,6 @@ The map stops at the run lane. The rest, one line each, with `ARCHITECTURE.md`'s
 
 ## Run economy (agents)
 
-- **Run a gate once, to a log, then read the log.** `log=$(mktemp ./gate-log.XXXXXX); rc=0; task gate:<component> > "$log" 2>&1 || rc=$?; echo "EXIT=$rc" >> "$log"; test "$rc" -eq 0` inside the worktree, then `tail`/`grep` the file. Never rerun the same gate on the same tree to read its output differently.
+- **Run a gate once, to a log, then read the log.** `log=$(mktemp ./gate-log.XXXXXX); rc=0; task gate:<component> > "$log" 2>&1 || rc=$?; echo "EXIT=$rc" >> "$log"; test "$rc" -eq 0` inside the worktree, then `tail`/`grep` the file. Never rerun the same gate on the same tree to read its output differently. `gate:agent`'s unit stage prints a compact summary (`agent/.test-report/`, `.claude/rules/agent.md`).
 - **Rework only mandatory review findings in-run.** Mandatory: a finding the validator marks blocking, a security finding graded Medium or above, or a demonstrated violation of correctness, an acceptance criterion, data integrity or a safety invariant, whatever its label. A trust-boundary topic alone is not; when unsure, ask the validator that raised it. A rework is the smallest fix that closes the finding; a mandatory fix needing new design is reported as a material plan change, gets its own design-critique pass, then is implemented; an optional redesign is deferred. Re-review after a minimal fix covers the fix range, its affected callers and invariants, and the required gate; a full wave returns when impact is unclear or a design changes. Record every deferred note in the PR (a uzi run: grouped `deferred` scope notes); `report_incidental_issue` is for off-task bugs only.
 - **Scale the validator wave to the diff's risk class.** Presentation, copy, docs and refactor diffs get one reviewer for one round; trust-boundary, data-integrity, auth and untrusted-input diffs get reviewer + tester (+ auditor). Mechanical work (anchor verification, gate running, docs) runs on the sonnet-tier roles (`researcher`, `tester`, `documenter`); judgment work stays on opus.

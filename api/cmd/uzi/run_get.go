@@ -217,7 +217,7 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 				// is the same split cobra's deprecation notice already uses here.
 				holdKey := run.Status + "/" + strOr(run.HoldReason, "") + "/" + strOr(run.RecoveryWaitCause, "")
 				if run.Status == statusLimitWait || run.Status == statusPoolWait || run.Status == statusRecoveryWait ||
-					isCredentialDisabledHold(run) || isProviderUnavailableHold(run) {
+					isCredentialDisabledHold(run) || isProviderUnavailableHold(run) || isBaseAttestationHold(run) {
 					if parkedIn != holdKey {
 						parkedIn = holdKey
 						// pool_wait and recovery_wait are the sibling silences limit_wait is
@@ -229,7 +229,7 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 						// hold to another is announced as the new hold.
 						switch run.Status {
 						case statusPaused:
-							if isProviderUnavailableHold(run) {
+							if isProviderUnavailableHold(run) || isBaseAttestationHold(run) {
 								_, _ = fmt.Fprintf(env.Stderr, "run %s %s; still following\n", cellText(args[0]), pausedHoldNotice(run))
 								break
 							}

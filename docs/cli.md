@@ -207,7 +207,11 @@ A few worth knowing:
   in both windows, showing minutes, hours or days since the last failed run.
   A scope with lifetime finished runs but no failures shows `no failures`;
   one with no lifetime finished runs shows `-`. These are the same definitions
-  as Overview: chat, judge, and rejected plans do not count as failures.
+  as Overview: chat, judge, rejected plans and `base_diverged` required-base
+  rejections do not count as failures. Required-base rejections remain in the
+  finished-run denominator and have a separate numeric `base_diverged` count
+  in usage JSON. See [usage accounting](./run-cost.md#rejected-runs-and-failure-accounting)
+  for the partition identity and the web bar's combined **rejected** segment.
 
 - **`--harness` picks the run's execution engine; omit it to let the server
   resolve one.** `run create --harness claude|codex` and `schedule create
@@ -2023,6 +2027,7 @@ W            open the run's worker (run detail; lowercase w still reworks)
 /            filter the board or workers list
 a            toggle shared own/factory scope (board or workers; admin token required)
 h            hide finished runs — completed/failed/cancelled, keeps active + needs-you (board only; no-op on the admin board)
+p            order ON THE FLOOR highest progress first; press again for the default order (board)
 r            refresh
 v            open/close the review overlay (detail)
 f            start a follow-up (detail, owner only)
@@ -2935,6 +2940,16 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   Settings, or `uzi run set-token` where the run accepts a token switch),
   `run list` shows `paused (credential disabled)`, and the TUI draws it as
   `⊘ cred disabled` in NEEDS YOU.
+  A `paused` run created with `--require-base` can also be **held because
+  its kept work is not attested** (`hold_reason: base_attestation_missing`):
+  it continued its own work, but no checkpoint proves that work was produced
+  on the planned commit, so the agent never started. The work stays on the
+  worker, and nothing resumes or extends it (`run resume`, `run extend`,
+  `run set-token` and Stop are refused). `run get` prints a `HOLD` row
+  reading `base not attested` with the next step: inspect custody with
+  `uzi run recovery <id>`, recover the work with `uzi run export <id>
+  --output <path>`, or start a successor run. See [Seeded
+  plans](seeded-plans.md).
 
 For an ordinary pause, human `run get` makes one supplemental message read
 (`tail=100`). Its pause detail reads **paused by the run's lead** for
@@ -2981,18 +2996,24 @@ TUI board and detail header's status chip, and on `admin runs` — so you can
 tell "still proposing work" apart from "actively implementing" at a glance.
 It's still the same `running` value underneath, not an additional status.
 
-Human-facing STATUS labels also distinguish a human stop from a failure:
+Human-facing STATUS labels distinguish human stops and required-base rejections
+from execution failures:
 
-| Raw `status` | `stop_kind` | Full CLI label |
-|---|---|---|
-| `cancelled` | Any value, missing or conflicting | `stopped (cancelled)` |
-| `failed` | `cancelled` | `stopped (cancelled)` |
-| `failed` | `plan_rejected` | `stopped (plan rejected)` |
+| Raw `status` | `stop_kind` | `fail_origin` | Full CLI label |
+|---|---|---|---|
+| `cancelled` | Any value, missing or conflicting | Any | `stopped (cancelled)` |
+| `failed` | `cancelled` | Any | `stopped (cancelled)` |
+| `failed` | `plan_rejected` | Any | `stopped (plan rejected)` |
+| `failed` | No human stop | `base_diverged` | `rejected` |
 
 `run get` and `run list` use these full labels. The `admin runs` renderer
 uses the same labels, but its endpoint lists active runs only; terminal
 runs are not reachable through that listing. Human stops take precedence
-over `needs landing`, even when the run carries recoverable work. Genuine
+over `needs landing`, even when the run carries recoverable work. When no human
+stop applies, a raw `failed` run with `fail_origin: base_diverged` reads `rejected`,
+before any `needs landing` presentation. On the web, its cause label is
+`rejected: base changed`; the CLI origin field remains raw `base_diverged`. A plan rejection
+keeps its `stopped (plan rejected)` label. Genuine
 failures, including `stop_kind: auto_stopped`, keep their existing failure
 or `needs landing` presentation.
 
@@ -3003,7 +3024,9 @@ failed run with `stop_kind: plan_rejected`.
 
 These are presentation labels: raw JSON, scalar fields and status
 transitions stay unchanged. Filtering raw `status: failed` in JSON still
-includes failed-path cancellations and plan rejections. Neither `run list`
+includes failed-path cancellations, plan rejections and required-base
+rejections. See [required-base changes](./run-activity.md#when-a-required-base-has-changed)
+for rollout order and older payloads. Neither `run list`
 nor `admin runs` exposes a `--status` flag.
 
 ### Provider outage recovery and owner hold
@@ -3085,7 +3108,8 @@ built-in primitive for driving a gated run headless, replacing the hand-rolled
 `awaiting_followup`, `completed`, `failed`, `cancelled`) and waits through the
 rest (`queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/`recovery_wait`/`paused`),
 except a default wait also stops at `recovery_wait` with cause
-`worker_requeue_exhausted` for an owner decision:
+`worker_requeue_exhausted`, and at a `paused` run held on
+`base_attestation_missing`, for an owner decision:
 timed limit and recovery waits retry on a timer, pool waits need an available pooled token,
 and ordinary owner or lead pauses need `uzi run resume`. A bare `run wait` means
 "wait for the plan gate, a clarification, an interactive task's park,

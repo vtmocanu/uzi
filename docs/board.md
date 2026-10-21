@@ -242,9 +242,12 @@ clarifying question — see [Answering a question](./run-activity.md#answering-a
 both get the loudest treatment — see Attention strip), rose
 **failed** with the reason on hover, and neutral **stopped** for a
 deliberate cancel or plan rejection — even one carrying your own free-text
-reason — never styled as a failure. The stopped/failed call is made
-server-side, not guessed from the reason text, so there's no wording that
-can slip a deliberate stop into the rose "failed" treatment.
+reason — never styled as a failure. A required-base mismatch with raw
+`status = failed` and `fail_origin = base_diverged` shows neutral **rejected**,
+with cause **rejected: base changed**. Human stops take precedence. These
+labels use structured status, stop kind and origin, not the free-text reason.
+See [required-base changes](./run-activity.md#when-a-required-base-has-changed)
+for rollout compatibility and usage accounting.
 
 A completed run with a merge request becomes an **`!N`** chip linking to
 it, colored to match the MR's own state: an open MR renders exactly as

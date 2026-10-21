@@ -9,6 +9,9 @@
 # a removed field), which is enough to drive every branch; the real oasdiff semantics are
 # exercised by `task check:api-v1-compat` itself.
 set -eu
+# Fixture repos must not read host git config: a global core.fsmonitor=true
+# leaves a detached fsmonitor daemon per repo on macOS.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 
 ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 CHECK="$ROOT/scripts/check-api-v1-compat.sh"

@@ -1201,6 +1201,7 @@ for spec in 'success:stub:unset' 'success:stub:0' 'success:stub:empty' 'success:
 done
 
 node --test "$ROOT/e2e/settlement-diagnostic.test.mjs"
+node --test "$ROOT/e2e/recovery-record-projection.test.mjs"
 echo "cases=$cases passed=$passed"
 # Tally guard (the driver.test.sh idiom): a real run has at least 188 cases green; a zero-case or
 # partially-red run must exit nonzero.

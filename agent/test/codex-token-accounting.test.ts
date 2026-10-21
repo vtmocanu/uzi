@@ -96,8 +96,8 @@ function assertEntry(
 }
 
 // #2878 M2: guard counter loss reproducibly; no historical incident raw frame is available.
-// Pinned 0.160.1 resume evidence lives in e2e/codex-m4/token-resume.test.ts and
-// large-resume.test.ts: replay precedes turn/started. Neither proves compaction caused the incident.
+// Resume checks live in e2e/codex-m4/token-resume.test.ts and large-resume.test.ts:
+// replay must precede turn/started. Neither proves compaction caused the incident.
 describe("#2878 M2 accountant", () => {
   const pricing = { authMode: "api_key" as const, now: new Date("2026-10-13") };
   const note = (inputTokens: number, outputTokens: number) =>

@@ -20,7 +20,8 @@ import (
 // run's own user. Every run-insert path checks repo ownership in Go (GetRepoForUser), but
 // the schema does not tie runs.user_id to the repo owner, so the query is the last line: a
 // run row whose repo_id points at another user's repo must read as no rows (the claim path
-// then fails closed as a vanished run) rather than hand that user's token to the claimant.
+// then fails the run, as credential_unavailable for an ordinary run, #1691) rather than hand
+// that user's token to the claimant.
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; e2e/run-store-it.sh
 // provides one. A package that prints `ok` with PASS=0 is INVALID, not green.

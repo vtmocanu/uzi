@@ -7423,3 +7423,23 @@ describe("RunView side-only usage panel", () => {
     expect(rows.flat().join(" ")).not.toMatch(/\$0/);
   });
 });
+
+describe("RunView rejection presentation", () => {
+  it.each([
+    ["base_diverged", null, "rejected", "neutral"],
+    ["base_diverged", "plan_rejected", "stopped", "neutral"],
+    ["agent_failure", null, "failed", "danger"],
+  ] as const)("renders %s / %s hero and reason", async (fail_origin, stop_kind, label, tone) => {
+    mockUseRunStream.mockReturnValue({
+      run: run({ status: "failed", fail_origin, stop_kind, landing_state: "needs_landing", failure_reason: "terminal reason" }),
+      messages: [], connected: true, error: "", submit: vi.fn(), refreshRun: vi.fn(), inputs: [], canSteer: false,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    render(<MemoryRouter initialEntries={["/runs/r1"]}><RunView /></MemoryRouter>);
+    const hero = await screen.findByText(`Run ${label}`);
+    expect(hero.classList.contains(tone === "neutral" ? "text-fg" : "text-danger")).toBe(true);
+    expect(screen.getByText("terminal reason").classList.contains(tone === "neutral" ? "text-muted" : "text-danger/80")).toBe(true);
+    const pill = screen.getByText(label === "failed" ? "needs landing" : label);
+    expect(pill.classList.contains(tone === "neutral" ? "text-neutral-fg" : "text-danger")).toBe(true);
+  });
+});

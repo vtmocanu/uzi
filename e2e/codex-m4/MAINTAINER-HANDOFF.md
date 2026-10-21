@@ -55,9 +55,11 @@ just-committed digest could never match the image it named.
    `sha256:<64-hex>` values;
 2. the manifest's `provenBaseCommit` is an **ancestor** of the candidate;
 3. the `provenBaseCommit..candidate` tail is **evidence-only** — every changed path classifies as
-   evidence (`e2e/`, `prds/`, `docs/`, `adr/`, `specs/`, `.claude/`, `agent/test/`, `Taskfile.yml`,
-   or any `*.md`); a runtime path (anything under `agent/` except `agent/test/`) or an
-   unrecognized path fails closed;
+   evidence (`e2e/`, `prds/`, `docs/`, `adr/`, `specs/`, `.claude/`, `deploy/`, `scripts/`,
+   `agent/test/`, `Taskfile.yml`, any `*.md` outside `api/`, or a Go `*_test.go` outside `agent/`);
+   a runtime path (anything under `agent/` except `agent/test/`, or under `api/` except a Go
+   `*_test.go`, since the M3b proof builds its test server from `api/`) or an unrecognized path
+   fails closed;
 4. every committed O clause has **exactly one** discharging manifest record — no missing, extra,
    or duplicate;
 5. each record's `images` match the manifest's proven pair — no mismatch, no base/jvm swap;
@@ -140,7 +142,10 @@ Because these are committed `owed` clauses, the manifest must discharge each wit
    proof for a chosen `provenBaseCommit` — e.g. the base+jvm proof that already succeeded for
    commit `d054eace` (GitHub Actions run 34757302169) — or run
    `UZI_CODEX_M3B_PACKAGED=1 task test:codex-m3b:packaged` on both merge-candidate images and read
-   their digests (e.g. `docker image inspect --format '{{.Id}}'`). This is the same both-image
+   their digests (e.g. `docker image inspect --format '{{.Id}}'`). `task test:codex-proof` (and
+   its scheduled workflow, `.github/workflows/codex-packaged-proof.yml`) runs that proof plus the
+   M3a legs strictly on one image per template and writes each image ID to `receipt.json` only
+   when every leg passed. This is the same both-image
    packaged run `e2e/codex-m3b/README.md` documents; it is CI/maintainer-only because it needs
    native image builds plus a Landlock-capable kernel (in-worker image builds are storage-flaky
    and arm64 is unsupported for this proof — the worker builds no image and needs no cluster
@@ -158,9 +163,9 @@ Because these are committed `owed` clauses, the manifest must discharge each wit
      Actions run 34757302169 supplied that proof. Each record's `images` is the same proven pair
      from step 1.
 3. **Confirm the tail is evidence-only.** `provenBaseCommit` must be an ancestor of the current
-   HEAD, and the `provenBaseCommit..HEAD` diff must touch only evidence paths: `e2e/`, `prds/`,
-   `docs/`, `adr/`, `specs/`, `.claude/`, `agent/test/`, `Taskfile.yml`, or any `*.md`. A change
-   under `agent/` (except `agent/test/`) is a runtime change and requires a FRESH proof at a new
+   HEAD, and the `provenBaseCommit..HEAD` diff must touch only the evidence paths listed under
+   "The gate, redesigned around a fixed point" above. A change under `agent/` (except `agent/test/`) or `api/` (except a Go
+   `*_test.go`) is a runtime change and requires a FRESH proof at a new
    `provenBaseCommit` — it cannot ride an old proof's fixed point.
 4. **Run the gate** (mind `dir: agent` in the Taskfile, so use an absolute manifest path via
    `--show-toplevel`):

@@ -20,6 +20,9 @@ import { fakeGitHub, fakeGitlab } from "./runner-harness.js";
 import { realProcfsSkip } from "./real-procfs.js";
 
 const HAS_PROCFS = process.platform === "linux";
+// The real runner path opens the Codex session store and quiescence proofs through /proc/self/fd
+// (src/codex/session-state.ts, src/runner.ts), which macOS lacks (#1912). Linux runs every assertion.
+const NEEDS_PROCFS = !HAS_PROCFS ? "needs Linux procfs (/proc/self/fd in src/codex/session-state.ts; runner quiescence proofs refuse off Linux)" : false;
 
 import {
   CodexExecutor,
@@ -1889,7 +1892,7 @@ describe("#2493 initial credential release", () => {
   });
   }
 
-  it("real runner reclaims release-unavailable park, captures work and completes in a fresh thread", async () => {
+  it("real runner reclaims release-unavailable park, captures work and completes in a fresh thread", { skip: NEEDS_PROCFS }, async () => {
     const api = new FakeApi("resume-release-worker");
     const url = await api.listen();
     const fx = makeFixture();
@@ -2093,7 +2096,7 @@ describe("#2493 initial credential release", () => {
 
 describe("decoded Codex usage limits reach RunRunner #2360", () => {
   for (const scenario of ["window", "docker", "optout", "nonwindow", "publish-failed"] as const) {
-    it(scenario, async () => {
+    it(scenario, { skip: NEEDS_PROCFS }, async () => {
       const diagnostics = recordingLog();
       const api = new FakeApi("usage-worker");
       const url = await api.listen();

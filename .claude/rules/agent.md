@@ -15,7 +15,7 @@ task lint:agent        # lint slot alone (oxlint; NOT ratcheted)
 task deadcode:agent    # dead-code slot alone (knip)
 task test:agent        # node --test via tsx
 task typecheck:agent
-cd agent && node --import tsx --test --test-timeout=120000 test/worker.test.ts   # single file — no Task target
+cd agent && env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null node --import tsx --test --test-timeout=120000 test/worker.test.ts   # single file — no Task target
 ```
 
 - knip gates every rule at `error`, including the unused-export/type family (#597): a new unused export reddens `task deadcode:agent`. A missing knip loud-SKIPs (exit 0) locally, exits 2 in CI (`UZI_DEADCODE_AGENT_REQUIRED=1`).
@@ -46,6 +46,7 @@ cd agent && node --import tsx --test --test-timeout=120000 test/worker.test.ts  
 ## Reading `node --test` output
 
 - It prints `ℹ fail 0` while tests are failing, when they fail by TIMEOUT: the failures surface under `✖ failing tests:` and go uncounted in the tally, while `$?` is 1 throughout. Read the exit code and the named failing tests, never a bare tally. Mirror image of the `PASS=0` trap in `.claude/rules/go.md`.
+- The unit stage also writes `agent/.test-report/<id>/` (newest: `latest.json`) and prints its `summary.txt` at the end of that stage: read that, not the spec log. `progress.json` is live while tests run. It covers the unit stage only (the gate verdict is task's exit code); a missing summary or `running`/`incomplete` is never green. `HUNG` names a file whose tests ended but whose process never exited, stopped after 10 min of silence once every other file finished.
 
 ## macOS: the Codex M4 P layer runs in a Linux container
 

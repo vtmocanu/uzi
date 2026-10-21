@@ -3692,6 +3692,8 @@ WITH candidates AS MATERIALIZED (
     WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.status = 'paused'
   AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
+  -- issue #3194: a base-attestation hold is owner-resolved by recovery, never resumed.
+  AND runs.hold_reason IS DISTINCT FROM 'base_attestation_missing'
   AND (runs.hold_reason IS DISTINCT FROM 'completion_blocked' OR @allow_completion_blocked_hold::boolean)
   AND (runs.hold_reason IS DISTINCT FROM 'budget_exhausted'
        OR (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
@@ -3757,6 +3759,8 @@ UPDATE runs SET
 WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.status = 'paused'
   AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
+  -- issue #3194: a base-attestation hold is owner-resolved by recovery, never resumed.
+  AND runs.hold_reason IS DISTINCT FROM 'base_attestation_missing'
   -- D6: refuse a completion hold unless the completion decision endpoint opts in.
   AND (runs.hold_reason IS DISTINCT FROM 'completion_blocked' OR @allow_completion_blocked_hold::boolean)
   -- D7: refuse a budget_exhausted park with no remaining budget (extend is the way back).
@@ -4086,7 +4090,9 @@ WHERE id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_ge
   -- into a question/follow-up park, including ResumePausedRun's queued interval with its
   -- retained marker and old generation. ClaimRun increments the generation before fresh reports.
   -- Only provider_unavailable: every other hold reason keeps today's behaviour.
-  AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'provider_unavailable', FALSE));
+  AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'provider_unavailable', FALSE))
+  -- issue #3194: nor may one leave the base-attestation hold, which keeps this claim.
+  AND NOT (status = 'paused' AND COALESCE(hold_reason = 'base_attestation_missing', FALSE));
 
 -- name: ClearRunMilestonesCompleted :execrows
 -- PRD #628 M4: the ONLY non-union writer of milestones_completed. milestones_completed
@@ -4198,7 +4204,9 @@ WHERE id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_ge
   -- into a question/follow-up park, including ResumePausedRun's queued interval with its
   -- retained marker and old generation. ClaimRun increments the generation before fresh reports.
   -- Only provider_unavailable: every other hold reason keeps today's behaviour.
-  AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'provider_unavailable', FALSE));
+  AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'provider_unavailable', FALSE))
+  -- issue #3194: nor may one leave the base-attestation hold, which keeps this claim.
+  AND NOT (status = 'paused' AND COALESCE(hold_reason = 'base_attestation_missing', FALSE));
 
 -- name: SetRunCompleted :execrows
 -- completed is the terminal MR-opened event → Human Review. move_pending_since is
@@ -4730,7 +4738,7 @@ WITH candidates AS MATERIALIZED (
     WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
   AND runs.claim_released_at IS NULL
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
-  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
+  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked', 'base_attestation_missing'), FALSE))
   -- Protect ResumePausedRun's retained-marker queued interval; after ClaimRun, the
   -- service fence rejects reports carrying the old generation. Other holds stay paused-only.
   AND NOT (runs.status IN ('paused', 'queued') AND COALESCE(runs.hold_reason = 'provider_unavailable', FALSE))
@@ -4775,7 +4783,7 @@ UPDATE runs SET
 WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
   AND runs.claim_released_at IS NULL
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
-  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
+  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked', 'base_attestation_missing'), FALSE))
   -- Protect ResumePausedRun's retained-marker queued interval; after ClaimRun, the
   -- service fence rejects reports carrying the old generation. Other holds stay paused-only.
   AND NOT (runs.status IN ('paused', 'queued') AND COALESCE(runs.hold_reason = 'provider_unavailable', FALSE))
@@ -8087,9 +8095,11 @@ ORDER BY cost_usd DESC, output_tokens DESC, u.id;
 -- axis as the usage 7-day figures, so the two 7-day numbers on one card describe the
 -- same set of runs. plan_rejected is split out of failed (D4): rejecting a plan is the
 -- owner's decision, kept in the denominator and its own bar segment but out of the
--- numerator. Every computed column carries an explicit ::bigint cast (the file's
+-- numerator. base_diverged is likewise a separate denominator bucket: the worker
+-- refused a divergent base, rather than reporting an agent defect.
+-- Every computed column carries an explicit ::bigint cast (the file's
 -- convention). Invariants the handler/live-DB tests assert:
--- finished == completed + cancelled + plan_rejected + failed, and
+-- finished == completed + cancelled + plan_rejected + base_diverged + failed, and
 -- sum(fail_origins) == failed. The per-origin breakdown is a jsonb_object_agg scalar
 -- subquery INSIDE each outcome query (issue #1451), not a second query per scope: one
 -- statement reads one snapshot, so the breakdown and the `failed` count always describe
@@ -8106,7 +8116,7 @@ WITH last_failure AS MATERIALIZED (
     SELECT  id, user_id, COALESCE(finished_at, status_since) AS ended_at,
            COALESCE(fail_origin, 'unknown') AS origin
     FROM runs
-    WHERE user_id = @user_id AND status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected'
+    WHERE user_id = @user_id AND status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged'
       AND kind NOT IN ('chat', 'judge', 'cross_check')
     ORDER BY COALESCE(finished_at, status_since) DESC, id DESC LIMIT 1
 )
@@ -8122,12 +8132,14 @@ SELECT
     count(*) FILTER (WHERE status = 'completed')::bigint                                   AS lifetime_completed,
     count(*) FILTER (WHERE status = 'cancelled')::bigint                                   AS lifetime_cancelled,
     count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'plan_rejected')::bigint    AS lifetime_plan_rejected,
-    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected')::bigint AS lifetime_failed,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'base_diverged')::bigint    AS lifetime_base_diverged,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged')::bigint AS lifetime_failed,
     count(*) FILTER (WHERE runs.created_at >= now() - interval '7 days')::bigint           AS last7_finished,
     count(*) FILTER (WHERE status = 'completed' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_completed,
     count(*) FILTER (WHERE status = 'cancelled' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_cancelled,
     count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'plan_rejected' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_plan_rejected,
-    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_failed,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'base_diverged' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_base_diverged,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_failed,
     -- needs_landing (issue #1418): the SUB-CUT of the `failed` count whose per-run
     -- landing_state derives to needs_landing (workersvc.DeriveLandingState) — a human-landable
     -- fail_origin (@landable_origins, the Go-owned set, never spelled here) whose committed work
@@ -8158,14 +8170,14 @@ SELECT
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
               WHERE r2.user_id = @user_id
-              AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
+              AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
               AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
               GROUP BY 1) o) AS lifetime_fail_origins,
     (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
               WHERE r2.user_id = @user_id
-              AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
+              AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
               AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
               AND r2.created_at >= now() - interval '7 days'
               GROUP BY 1) o) AS last7_fail_origins
@@ -8183,7 +8195,7 @@ WITH last_failure AS MATERIALIZED (
     SELECT  id, user_id, COALESCE(finished_at, status_since) AS ended_at,
            COALESCE(fail_origin, 'unknown') AS origin
     FROM runs
-    WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected'
+    WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged'
       AND kind NOT IN ('chat', 'judge', 'cross_check')
     ORDER BY COALESCE(finished_at, status_since) DESC, id DESC LIMIT 1
 )
@@ -8200,12 +8212,14 @@ SELECT
     count(*) FILTER (WHERE status = 'completed')::bigint                                   AS lifetime_completed,
     count(*) FILTER (WHERE status = 'cancelled')::bigint                                   AS lifetime_cancelled,
     count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'plan_rejected')::bigint    AS lifetime_plan_rejected,
-    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected')::bigint AS lifetime_failed,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'base_diverged')::bigint    AS lifetime_base_diverged,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged')::bigint AS lifetime_failed,
     count(*) FILTER (WHERE runs.created_at >= now() - interval '7 days')::bigint           AS last7_finished,
     count(*) FILTER (WHERE status = 'completed' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_completed,
     count(*) FILTER (WHERE status = 'cancelled' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_cancelled,
     count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'plan_rejected' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_plan_rejected,
-    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_failed,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'base_diverged' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_base_diverged,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_failed,
     -- needs_landing (issue #1418): SUB-CUT of `failed`; see SelfRunOutcomes for the shape.
     -- @landable_origins is the Go-owned human-landable set; the correlated EXISTS resolves to
     -- the OUTER `runs` row (no JOIN, which would corrupt the sibling counts).
@@ -8228,13 +8242,13 @@ SELECT
     (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
-              WHERE r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
+              WHERE r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
               AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
               GROUP BY 1) o) AS lifetime_fail_origins,
     (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
-              WHERE r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
+              WHERE r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
               AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
               AND r2.created_at >= now() - interval '7 days'
               GROUP BY 1) o) AS last7_fail_origins
@@ -8251,7 +8265,7 @@ WITH last_failure AS MATERIALIZED (
     SELECT DISTINCT ON (user_id) id, user_id, COALESCE(finished_at, status_since) AS ended_at,
            COALESCE(fail_origin, 'unknown') AS origin
     FROM runs
-    WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected'
+    WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged'
       AND kind NOT IN ('chat', 'judge', 'cross_check')
     ORDER BY user_id, COALESCE(finished_at, status_since) DESC, id DESC
 )
@@ -8267,12 +8281,14 @@ SELECT u.id AS user_id, u.email,
     count(*) FILTER (WHERE r.status = 'completed')::bigint                                 AS completed,
     count(*) FILTER (WHERE r.status = 'cancelled')::bigint                                 AS cancelled,
     count(*) FILTER (WHERE r.status = 'failed' AND r.fail_origin = 'plan_rejected')::bigint AS plan_rejected,
-    count(*) FILTER (WHERE r.status = 'failed' AND r.fail_origin IS DISTINCT FROM 'plan_rejected')::bigint AS failed,
+    count(*) FILTER (WHERE r.status = 'failed' AND r.fail_origin = 'base_diverged')::bigint AS lifetime_base_diverged,
+    count(*) FILTER (WHERE r.status = 'failed' AND r.fail_origin IS DISTINCT FROM 'plan_rejected' AND r.fail_origin IS DISTINCT FROM 'base_diverged')::bigint AS failed,
     count(*) FILTER (WHERE r.created_at >= now() - interval '7 days')::bigint                                                                       AS last7_finished,
     count(*) FILTER (WHERE r.created_at >= now() - interval '7 days' AND r.status = 'completed')::bigint                                 AS last7_completed,
     count(*) FILTER (WHERE r.created_at >= now() - interval '7 days' AND r.status = 'cancelled')::bigint                                 AS last7_cancelled,
     count(*) FILTER (WHERE r.created_at >= now() - interval '7 days' AND r.status = 'failed' AND r.fail_origin = 'plan_rejected')::bigint AS last7_plan_rejected,
-    count(*) FILTER (WHERE r.created_at >= now() - interval '7 days' AND r.status = 'failed' AND r.fail_origin IS DISTINCT FROM 'plan_rejected')::bigint AS last7_failed,
+    count(*) FILTER (WHERE r.created_at >= now() - interval '7 days' AND r.status = 'failed' AND r.fail_origin = 'base_diverged')::bigint AS last7_base_diverged,
+    count(*) FILTER (WHERE r.created_at >= now() - interval '7 days' AND r.status = 'failed' AND r.fail_origin IS DISTINCT FROM 'plan_rejected' AND r.fail_origin IS DISTINCT FROM 'base_diverged')::bigint AS last7_failed,
     -- needs_landing (issue #1418): SUB-CUT of `failed`; see SelfRunOutcomes for the shape.
     -- The alias here is `r`,
     -- so the correlated EXISTS resolves to the OUTER `r` row (no JOIN — that would corrupt the
@@ -8298,14 +8314,14 @@ SELECT u.id AS user_id, u.email,
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
               WHERE r2.user_id = u.id
-              AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
+              AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
               AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
               GROUP BY 1) o) AS fail_origins,
     (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
               WHERE r2.user_id = u.id AND r2.created_at >= now() - interval '7 days'
-              AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
+              AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
               AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
               GROUP BY 1) o) AS last7_fail_origins
 FROM runs r
@@ -9447,7 +9463,12 @@ WHERE id = @id;
 -- PRD #1190: also stamp checkpoint_tip_at (a separate timestamp, not updated_at) so the
 -- pause UI can name the age of the last checkpoint — the "work since the last checkpoint"
 -- a `now` pause discards. It is written on every publish alongside checkpoint_tip.
-UPDATE runs SET checkpoint_tip = @checkpoint_tip, checkpoint_tip_at = now() WHERE id = @id;
+--
+-- Issue #3194: checkpoint_attested_source is set-only, inside this same write and only from the
+-- publish's own frozen non-NULL value; a NULL (legacy or unattested publish) leaves it unchanged.
+UPDATE runs SET checkpoint_tip = @checkpoint_tip, checkpoint_tip_at = now(),
+    checkpoint_attested_source = COALESCE(sqlc.narg(attested_source)::text, checkpoint_attested_source)
+WHERE id = @id;
 
 -- Run health detector (PRD #47) ----------------------------------------------
 

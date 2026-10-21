@@ -14,6 +14,10 @@ import { fileURLToPath } from "node:url";
 // an enforced invariant, cheaply (text parse, no docker), before more variants land.
 
 const templatesDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../templates");
+const codexVersion = fs.readFileSync(new URL("../codex/codex-package.lock", import.meta.url), "utf8")
+  .match(/^CODEX_VERSION=(\d+\.\d+\.\d+)$/m)?.[1];
+assert.ok(codexVersion, "the Codex lock must declare its version");
+const codexVersionPattern = new RegExp(`codex-cli ${codexVersion.replaceAll(".", "\\.")}\\b`);
 
 type ShellQuote = "'" | '"';
 
@@ -238,12 +242,55 @@ function hasRequiredSessionGroupMembership(text: string): boolean {
   );
 }
 
+// The positional operands of a BusyBox `addgroup [-g GID] [-S] [USER] GROUP` (the Alpine templates'
+// only form), so an option before them cannot hide a forbidden membership (#1236). Options may
+// appear anywhere until `--`, which is at least as permissive as the real getopt. An option this
+// parser does not know returns undefined, which the forbidden checks treat as a match (fail closed).
+function addgroupOperands(command: readonly ShellWord[]): string[] | undefined {
+  const operands: string[] = [];
+  let optionsDone = false;
+  for (let i = 1; i < command.length; i++) {
+    const value = command[i]!.value;
+    if (optionsDone || !value.startsWith("-") || value === "-") {
+      operands.push(value);
+      continue;
+    }
+    if (value === "--") {
+      optionsDone = true;
+      continue;
+    }
+    if (value.startsWith("--")) return undefined;
+    const flags = value.slice(1);
+    for (let j = 0; j < flags.length; j++) {
+      if (flags[j] === "S") continue;
+      if (flags[j] !== "g") return undefined;
+      // -g takes the rest of this word, else the next word.
+      if (j === flags.length - 1) {
+        i++;
+        if (i >= command.length) return undefined;
+      }
+      break;
+    }
+  }
+  return operands;
+}
+
+function hasAddgroupMembership(text: string, user: string, group: string): boolean {
+  return dockerfileLogicalRuns(text).some((run) =>
+    scanShellCommands(run).commands.some((command) => {
+      if (command[0]?.value !== "addgroup") return false;
+      const operands = addgroupOperands(command);
+      return operands === undefined || (operands.length === 2 && operands[0] === user && operands[1] === group);
+    }),
+  );
+}
+
 function hasForbiddenProviderWorkerMembership(text: string): boolean {
-  return hasCommand(text, ["addgroup", "runner", "worker"]) || hasUnsupportedGroupShellSyntax(text);
+  return hasAddgroupMembership(text, "runner", "worker") || hasUnsupportedGroupShellSyntax(text);
 }
 
 function hasForbiddenCommandSessionMembership(text: string): boolean {
-  return hasCommand(text, ["addgroup", "runner-cmd", "codex-session"]) || hasUnsupportedGroupShellSyntax(text);
+  return hasAddgroupMembership(text, "runner-cmd", "codex-session") || hasUnsupportedGroupShellSyntax(text);
 }
 
 function templateDockerfiles(): { name: string; text: string }[] {
@@ -577,7 +624,7 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
         `${name}/Dockerfile must RUN the Codex runner-uid build guard`,
       );
       assert.match(text, /setpriv --reuid runner\b/, `${name}/Dockerfile must document the runner-uid setpriv guard`);
-      assert.match(text, /codex-cli 0\.160\.1\b/, `${name}/Dockerfile must document the exact pinned Codex version`);
+      assert.match(text, codexVersionPattern, `${name}/Dockerfile must document the exact pinned Codex version`);
       assert.match(text, /fake-GNU-ldd\b/, `${name}/Dockerfile must document the fake-GNU-ldd PATH case`);
       // ...and the SHARED guard script must carry that substance, not merely the comment: the
       // setpriv --reuid to the runner uid, the `codex --version` exec, the expected `codex-cli`
@@ -1350,5 +1397,41 @@ describe("worker template Dockerfile group-membership parser", () => {
   it("does not treat a fully quoted addgroup argument as executable", () => {
     const dockerfile = "RUN printf '%s' 'addgroup'\n";
     assert.equal(hasForbiddenProviderWorkerMembership(dockerfile), false);
+  });
+
+  // #1236: the forbidden checks compare addgroup's operands after its options.
+  it("detects a forbidden provider membership behind addgroup options", () => {
+    for (const dockerfile of [
+      "RUN addgroup -S runner worker\n",
+      "RUN addgroup -g 10001 runner worker\n",
+      "RUN addgroup -g10001 runner worker\n",
+      "RUN addgroup -Sg 10001 runner worker\n",
+      "RUN addgroup -- runner worker\n",
+      "RUN addgroup runner -S worker\n",
+    ]) {
+      assert.equal(hasForbiddenProviderWorkerMembership(dockerfile), true, dockerfile);
+    }
+  });
+
+  it("detects a forbidden command-runner membership behind addgroup options", () => {
+    assert.equal(hasForbiddenCommandSessionMembership("RUN addgroup -S runner-cmd codex-session\n"), true);
+  });
+
+  it("fails closed on an addgroup option the parser does not know", () => {
+    assert.equal(hasForbiddenProviderWorkerMembership("RUN addgroup --system runner worker\n"), true);
+    assert.equal(hasForbiddenProviderWorkerMembership("RUN addgroup -x runner\n"), true);
+    assert.equal(hasForbiddenProviderWorkerMembership("RUN addgroup -g\n"), true);
+  });
+
+  it("does not flag group creation or other memberships that carry options", () => {
+    for (const dockerfile of [
+      "RUN addgroup -S -g 10002 runner\n",
+      "RUN addgroup -g 10004 codex-session\n",
+      "RUN addgroup -S worker runner\n",
+      "RUN addgroup -S runner codex-session\n",
+      "RUN printf '%s\\n' 'addgroup -S runner worker'\n",
+    ]) {
+      assert.equal(hasForbiddenProviderWorkerMembership(dockerfile), false, dockerfile);
+    }
   });
 });

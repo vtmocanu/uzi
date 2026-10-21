@@ -136,6 +136,9 @@ var failOrigins = []string{
 	"no_job_capable_worker",
 	"ephemeral_worker_never_registered",
 	"job_no_result",
+	// #3164: the required clone base no longer matches the seeded plan. This worker
+	// refusal stays failed, but is excluded from judging and failure accounting.
+	"base_diverged",
 	// #2321: a worker-reported provider safety refusal. Judge eligibility matches
 	// agent_failure, including resumed runs; no judge skip set includes this origin.
 	"provider_policy_refusal",
@@ -211,6 +214,7 @@ var workerReportableFailOrigins = map[string]bool{
 	// issue #1888: the worker fails a run with selected skills whose Claude SDK skills plugin
 	// failed to load at session start (never judged; see failOrigins and neverJudgeFailOrigins).
 	"skills_plugin_load_failed": true,
+	"base_diverged":             true,
 	"provider_policy_refusal":   true,
 }
 

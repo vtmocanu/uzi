@@ -8,6 +8,7 @@
   "completed": 1,
   "cancelled": 1,
   "plan_rejected": 1,
+  "base_diverged": 1,
   "failed": 1,
   "needs_landing": 1,
   "fail_origins": {

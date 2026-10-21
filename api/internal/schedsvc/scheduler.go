@@ -233,6 +233,9 @@ type Scheduler struct {
 	logger  *slog.Logger
 	// ciRepair holds the ci_watch fire's bounds (SetCIRepair); zero fields take defaults.
 	ciRepair CIRepairConfig
+	// scoutDeadline bounds one CI scout snapshot collection (#3225); zero means
+	// scoutDefaultDeadline. A test seam.
+	scoutDeadline time.Duration
 	// beat is the admin-health loop-beat callback (PRD #1484 M2): main.go injects a
 	// func(){ registry.Beat("scheduler") } ONLY when the scheduler is started
 	// (SchedulerCheckInterval > 0), so a not-started scheduler is left out of the loops
@@ -300,7 +303,7 @@ func (e *Scheduler) tick(ctx context.Context) {
 	if len(scheds) == 0 {
 		return
 	}
-	pc := &pauseCache{e: e, seen: make(map[uuid.UUID]pauseState)}
+	pc := &pauseCache{e: e, seen: make(map[uuid.UUID]pauseState), scoutSlots: scoutTickSlots}
 	for _, sched := range scheds {
 		e.process(ctx, sched, pc)
 	}
@@ -334,6 +337,10 @@ const (
 type pauseCache struct {
 	e    *Scheduler
 	seen map[uuid.UUID]pauseState
+	// scoutSlots is this tick's remaining CI scout collections (#3225): each scout fire
+	// collects CI history synchronously, so a tick runs at most scoutTickSlots of them and
+	// holds the rest for a later tick.
+	scoutSlots int
 }
 
 // paused reports the owner's pause state right now, memoizing the per-user answer for
@@ -395,6 +402,16 @@ func (e *Scheduler) process(ctx context.Context, sched store.RunSchedule, pc *pa
 			e.holdOnceCredentialDisabled(ctx, sched)
 			return
 		}
+	}
+	// #3225: a CI scout collects CI history synchronously. Beyond this tick's slots it is
+	// held like pauseUnknown (neither fired nor advanced) and re-claimed next tick, so a
+	// burst of scouts cannot stall the schedules behind them.
+	if sched.Target == "prompt" && catalogSlugOf(sched) == ciScoutSlug {
+		if pc.scoutSlots <= 0 {
+			e.logger.Debug("scheduler: ci scout slots used this tick, holding schedule", "schedule", sched.ID.String())
+			return
+		}
+		pc.scoutSlots--
 	}
 	// The tick path threads the FireOutcome into advance, which persists it into
 	// last_fire on the success/benign path (PRD #308 M2). RunNow does NOT reach here, so
@@ -922,6 +939,9 @@ func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) (Fi
 		if digest := e.proposalDigestSection(ctx, sched); digest != "" {
 			sections = append(sections, digest)
 		}
+	}
+	if catalogSlugOf(sched) == ciScoutSlug {
+		sections = append(sections, e.ciScoutSection(ctx, sched))
 	}
 	instruction := composeRunDescriptionWithSections(prompt, guidanceOf(sched), sections...)
 	// PRD #1429 M2 (D5): a null-harness schedule with a stored Anthropic override that now resolves

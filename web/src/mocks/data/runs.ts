@@ -2033,6 +2033,17 @@ export const mockRuns: Run[] = [
   },
 ];
 
+mockRuns.push({
+  ...mockRuns.find((r) => r.id === "run-failed")!,
+  id: "run-rejected", issue_iid: 10,
+  issue_title: "Refresh pool metrics after base update",
+  issue_description: "", branch: "agent/issue-10",
+  fail_origin: "base_diverged",
+  failure_reason: "The base branch changed; start a fresh run.",
+  salvage_state: null, salvage_ref: null, salvage_tip: null, salvage_expires_at: null,
+  usage_estimated_tail: null,
+});
+
 // PRD #1732 D14: runs HELD on `credential_disabled` — server-parked (status `paused`,
 // hold_reason set), resumed by the promoter on Enable, never by a plain Resume. Derived
 // from the owner-paused fixture above so every other field stays realistic.
@@ -2063,6 +2074,8 @@ mockRuns.push(
   { ...pausedBase, id: "run-provider-hold", hold_reason: "provider_unavailable",
     provider_park_count: 12, provider_park_streak_started_at: daysAgo(2),
     can_stop_at_provider_hold: true },
+  // Issue #3194: a --require-base run held because its adopted work is not attested to the base.
+  { ...pausedBase, id: "run-base-attestation-hold", hold_reason: "base_attestation_missing" },
   { ...pausedBase, id: "run-provider-recovery", status: "recovery_wait", hold_reason: null,
     recovery_wait_cause: "provider_outage", provider_park_count: 3,
     provider_park_streak_started_at: minsAgo(90), recovery_retry_not_before: minsAhead(5) },

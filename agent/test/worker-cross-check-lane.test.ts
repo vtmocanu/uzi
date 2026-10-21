@@ -23,6 +23,12 @@ import { latchResidueQuarantine } from "../src/residue-quarantine.js";
 import { resetResidueQuarantineAfterEach } from "./setup/hermetic-proc.js";
 import { recordingLogger, makeClaim, nullLogger, testGitCacheOptions } from "./helpers.js";
 
+// The runner's stopped-source and quiescence proofs (src/runner.ts, src/run-quiescence.ts) refuse off
+// Linux, so this scenario cannot reach its post-proof assertions on macOS (#1912). Linux runs it unchanged.
+const LINUX_ONLY = process.platform !== "linux"
+  ? "needs the Linux-only run-quiescence / stopped-source proof (src/run-quiescence.ts, src/runner.ts refuse off Linux)"
+  : false;
+
 resetResidueQuarantineAfterEach();
 const tick = (ms = 2) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 function deferred() {
@@ -167,7 +173,7 @@ it("cross-check cap is independent of a full run slot, snapshots see both, and s
   assert.equal(h.gate.inFlightClaims(), 0);
 });
 
-it("code child dispatch uses the dedicated pool through settlement, reader cleanup and cancellation", async (t) => {
+it("code child dispatch uses the dedicated pool through settlement, reader cleanup and cancellation", { skip: LINUX_ONLY }, async (t) => {
   const h = build(1);
   const fx = makeFixture({ "source.txt": "committed code\n" });
   const git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());

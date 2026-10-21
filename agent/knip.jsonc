@@ -51,7 +51,7 @@
   // The confinement probe and standalone editor evaluator are opt-in entries. The operator
   // retained-source client is executed by path inside the image (`node /app/src/ops/retained-source.mjs`,
   // issue #1786), never imported, so it is an entry.
-  "entry": ["test/cross-check-confinement-packaged.probe.ts", "src/pr-description-eval-cli.ts", "src/ops/retained-source.mjs"],
+  "entry": ["test/cross-check-confinement-packaged.probe.ts", "test/codex-pins-sync.cli.ts", "src/pr-description-eval-cli.ts", "src/ops/retained-source.mjs"],
 
   // The Node plugin inferred these entries when scripts.test contained --test.
   // Runtime discovery removes that trigger; retain the identical plugin entries

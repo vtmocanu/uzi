@@ -1802,6 +1802,19 @@ export interface RunnerClone {
   /** issue #1783 M2: the attempt id when the clone was seeded at an ATTEMPT path (a
    *  Docker-wired or recovery-enabled worker); absent for a canonical-path seed. */
   attemptId?: string;
+  /** issue #3194: the raw adopted source the clone was cut from — the base AFTER the structural
+   *  overlay peel and BEFORE the `wip(park)` unwrap, so a recovered marker is its own identity and
+   *  covers the staged tree the executor receives. The `--require-base` guard compares this, not
+   *  `baseCommit`. */
+  adoptedSource: string;
+  /** issue #3194: the content source a recovery-coverage wrapper verifiably stands for (the
+   *  episode journal's restoreSource), set only on a verified recovery adoption. When present the
+   *  guard compares it instead of `adoptedSource`. */
+  adoptedContentSource?: string;
+  /** issue #3194: true when the diverged-checkpoint `wip(park)` marker was cherry-picked onto a
+   *  new floor, so the materialized content is no single adopted source. `--require-base` refuses
+   *  this shape. */
+  wipCherryPicked?: boolean;
 }
 
 /**
@@ -4111,7 +4124,8 @@ export class GitCache {
       // marker's parent when a wip(park) marker was reset --soft'd back to uncommitted, and
       // baseSha (byte-identical) on every other leg. wipRecovered surfaces the recovery to
       // M4/M5.
-      return { path: clonePath, branch, publicationFloor, priorCommits, baseCommit: effectiveBase, defaultBranchCommit, seededFrom, checkpointSetAside, wipRecovered };
+      return { path: clonePath, branch, publicationFloor, priorCommits, baseCommit: effectiveBase, defaultBranchCommit, seededFrom, checkpointSetAside, wipRecovered,
+        adoptedSource: baseSha, ...(recoveredCheckpointMarkerSha !== "" ? { wipCherryPicked: true } : {}) };
     }
   }
 
@@ -6684,8 +6698,10 @@ export class GitCache {
    * Thin bundles imported with local prerequisites are valid here; publication is separate. */
   async recordRecoveryCapture(
     barePath: string, branch: string, key: string, expected: RecoverySource, iteration: number, tip: string,
+    capturedSource?: string,
   ): Promise<void> {
     if (!SHA40_RE.test(tip)) throw new Error("invalid recovery tip");
+    if (capturedSource !== undefined && !SHA40_RE.test(capturedSource)) throw new Error("invalid recovery source");
     await this.withLock(barePath, async () => {
       const journal = await this.checkedRecovery(barePath, branch, key, expected);
       const recovery = journal.recovery;
@@ -6696,8 +6712,18 @@ export class GitCache {
       if (!SHA40_RE.test(sourceHead) || !await this.isAncestor(barePath, sourceHead, tip)) throw new Error("captured history does not cover source");
       await this.runGit(barePath, ["update-ref", "--no-deref", `refs/uzi-recovery-episode/${journal.runId}/${tip}`, tip]);
       if (!await this.recoveryClockCurrent(barePath, branch, journal)) throw new Error("capture iteration is not current");
+      // issue #3194: what content the wrapper stands for. A nested capture (the captured source is
+      // itself the previous verified restoreTip) carries that episode's source forward; otherwise
+      // the source is the verified capture's own current tip. It must be covered by the wrapper;
+      // anything unprovable records no source, so --require-base refuses rather than guesses.
+      const prior = recovery.restoreTip !== undefined && recovery.restoreSource !== undefined
+        ? { tip: recovery.restoreTip, source: recovery.restoreSource } : undefined;
+      let restoreSource = capturedSource ?? tip;
+      if (prior && prior.tip === restoreSource) restoreSource = prior.source;
+      if (await this.ancestry(barePath, restoreSource, tip) !== "ancestor") restoreSource = "";
+      const { restoreSource: _stale, ...rest } = recovery;
       await this.writeRecovery(barePath, branch, { ...journal, restoreTip: tip,
-        recovery: { ...recovery, restoreTip: tip, stage: "captured" } });
+        recovery: { ...rest, restoreTip: tip, ...(restoreSource ? { restoreSource } : {}), stage: "captured" } });
     });
   }
 
@@ -6785,7 +6811,8 @@ export class GitCache {
         recovery: { ...recovery, successor, stage: "adopting" } })) throw new Error("successor iteration is not current");
       await this.writeRecovery(barePath, branch, { ...successor, retainedSources,
         recovery: { ...recovery, successor, stage: "ready-for-model" } });
-      return { ...seeded, attemptId };
+      // issue #3194: hand the guard the content source this wrapper verifiably stands for.
+      return { ...seeded, attemptId, ...(recovery.restoreSource ? { adoptedContentSource: recovery.restoreSource } : {}) };
     });
   }
 
@@ -13794,6 +13821,56 @@ try {
    *  wins the "strictly descends" branch. */
   private async isAncestor(barePath: string, ancestorRef: string, descendantRef: string): Promise<boolean> {
     return (await this.tryGit(barePath, ["merge-base", "--is-ancestor", ancestorRef, descendantRef])) === 0;
+  }
+
+  /** issue #3194: resolve a planned commit (full or abbreviated) to exactly one commit, without
+   *  replacement objects. "missing" when no commit matches, "ambiguous" when an abbreviation names
+   *  more than one, "unknown" on any git error or a malformed input — never coerced to a match. */
+  async resolveCommitUnique(barePath: string, ref: string): Promise<
+    { kind: "resolved"; sha: string } | { kind: "missing" } | { kind: "ambiguous" } | { kind: "unknown" }> {
+    const prefix = ref.trim().toLowerCase();
+    if (!/^[0-9a-f]{4,40}$/.test(prefix)) return { kind: "unknown" };
+    let listed: string;
+    try {
+      listed = await this.runGit(barePath, ["--no-replace-objects", "rev-parse", "--disambiguate=" + prefix]);
+    } catch {
+      // rev-parse --disambiguate exits non-zero only on a git error; no match prints nothing.
+      return { kind: "unknown" };
+    }
+    const commits: string[] = [];
+    for (const oid of listed.split("\n").map((l) => l.trim()).filter(Boolean)) {
+      if (!SHA40_RE.test(oid)) return { kind: "unknown" };
+      // The listed object exists, so a failed type read is an error, not absence.
+      let type: string;
+      try {
+        type = (await this.runGit(barePath, ["--no-replace-objects", "cat-file", "-t", oid])).trim();
+      } catch {
+        return { kind: "unknown" };
+      }
+      if (type === "commit") commits.push(oid);
+    }
+    if (commits.length === 0) return { kind: "missing" };
+    if (commits.length > 1) return { kind: "ambiguous" };
+    return { kind: "resolved", sha: commits[0]! };
+  }
+
+  /** issue #3194: the tree OID of `sha` in the bare (no replacement objects), or undefined on any
+   *  failure. */
+  async commitTreeOid(barePath: string, sha: string): Promise<string | undefined> {
+    if (!SHA40_RE.test(sha)) return undefined;
+    const tree = (await this.tryGitStdout(barePath, ["--no-replace-objects", "rev-parse", "--verify", `${sha}^{tree}`])).trim();
+    return SHA40_RE.test(tree) ? tree : undefined;
+  }
+
+  /** issue #3194: the tree the runner clone's INDEX holds (what the executor receives, staged WIP
+   *  included), or undefined on any failure. Run as the runner uid, like every clone read. */
+  async indexTreeOid(clonePath: string): Promise<string | undefined> {
+    try {
+      const tree = (await this.runGitAsRunner(clonePath, ["write-tree"])).trim();
+      return SHA40_RE.test(tree) ? tree : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   /** issue #1117: public delegate to {@link isAncestor} — true when `ancestorRef` is an

@@ -1,0 +1,3 @@
+# Strict proof outputs (logs, TAP streams, status/receipt JSON) from run-proof.sh.
+out-*/
+*.log

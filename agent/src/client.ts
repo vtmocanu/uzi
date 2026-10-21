@@ -109,6 +109,8 @@ import {
   type RecoveryLiveSettleRequest,
   type RecoverySettleRequest,
   type RecoverySettleResponse,
+  type BaseAttestationHoldOutcome,
+  BASE_ATTESTATION_HOLD_REASON,
 } from "./protocol.js";
 
 export type PlanCrossCheckGateReason = "revise" | "block" | "malformed" | "model_error" | "model_timeout"
@@ -2390,6 +2392,8 @@ export class WorkerClient {
     pack: Readable,
     boundarySignal?: AbortSignal,
     claimGeneration?: number,
+    /** issue #3194: the packed source this flight attests was produced on an accepted base. */
+    attestedSource?: string,
   ): Promise<PublishResult> {
     const query = claimGeneration !== undefined && claimGeneration > 0
       ? `?claim_generation=${encodeURIComponent(claimGeneration)}` : "";
@@ -2404,6 +2408,7 @@ export class WorkerClient {
         "X-Client-Version": this.version,
         "Content-Type": "application/octet-stream",
         "X-Uzi-Checkpoint-Tip": tipOid,
+        ...(attestedSource ? { "X-Uzi-Checkpoint-Attested-Source": attestedSource } : {}),
       },
       body: pack,
       // undici requires `duplex: "half"` for a streamed (Readable) request body; without it
@@ -3600,6 +3605,47 @@ export class WorkerClient {
       // ambiguous; enterCompletionHold retains artifacts while reconciling ownership.
       return { status: "" };
     });
+  }
+
+  /** issue #3194: ask the server to hold this flight's own claim on the `--require-base`
+   *  base-attestation hold (POST /worker/runs/:id/base-attestation-hold): running -> paused with
+   *  hold_reason='base_attestation_missing'. The claim generation is mandatory and never stripped:
+   *  the hold refuses resume, so it must not land on a claim this flight lost. One attempt, no retry.
+   *
+   *  Never throws. The outcome is `held` ONLY on a 200 whose body names this exact hold (a repeat
+   *  for a generation already held answers the same 200); `stale` on a 409 (the fence refused: the
+   *  claim moved on or the run left `running`); `unknown` for everything else: a transport error,
+   *  a 5xx, a 404 (an older server without the route, or a run no longer this worker's), a 400 (an
+   *  older or stricter server refusing the request) or an unreadable body. The caller keeps the
+   *  clone and custody on every outcome; the classification only decides what it may report. */
+  async requestBaseAttestationHold(
+    runId: string,
+    args: { head: string; claimGeneration: number },
+    signal?: AbortSignal,
+  ): Promise<BaseAttestationHoldOutcome> {
+    if (!Number.isSafeInteger(args.claimGeneration) || args.claimGeneration <= 0) {
+      return { outcome: "unknown", detail: "no claim generation to fence the hold" };
+    }
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/base-attestation-hold`;
+    try {
+      const res = await this.fetchRaw(
+        "POST", path, { head: args.head, claim_generation: args.claimGeneration }, this.httpTimeoutMs, signal,
+      );
+      if (res.status === 200) {
+        const fields = await readRunAck(res);
+        if (fields.status === "paused" && fields.holdReason === BASE_ATTESTATION_HOLD_REASON) {
+          return { outcome: "held", status: fields.status };
+        }
+        return { outcome: "unknown", detail: `unexpected hold acknowledgement (status ${fields.status ?? "none"})` };
+      }
+      if (res.status === 409) {
+        const fields = await readRunAck(res);
+        return { outcome: "stale", status: fields.status ?? "" };
+      }
+      return { outcome: "unknown", detail: `HTTP ${res.status}` };
+    } catch (err) {
+      return { outcome: "unknown", detail: err instanceof Error ? err.message : String(err) };
+    }
   }
 
   /** Report a WALL-CLOCK PARK to the server (POST /worker/runs/:id/wall-park, PRD #1497 M2, D4).

@@ -786,6 +786,7 @@ export interface ToolAllowlistWriteInput {
 // issue has never run. Display-only: no secrets. is_mine gates the in-app run-view
 // link (a non-owner would 403 on the run); run_count drives the "×N" retry hint.
 export interface LatestRun {
+  fail_origin?: string | null;
   /** Stored creation history; [] on a current API. Optional for older payloads. */
   auto_approve_blocked_reasons?: string[];
   id: string;
@@ -843,6 +844,7 @@ export interface LatestRun {
   // pause or a non-paused run. Non-sensitive, so the board projection sends it on every card
   // (api/internal/handler/board.go latestRunDTO.HoldReason). effectiveRunStatus overlays
   // 'credential_disabled' so the card reads "waiting: credential disabled", not "paused".
+  // 'base_attestation_missing' (issue #3194) reads "base unverified: owner hold" likewise.
   // Optional for api/web rollout skew: an absent key reads as no hold.
   hold_reason?: string | null;
   owner_name: string;
@@ -3440,7 +3442,10 @@ export interface Run {
    *  a completion hold, 'credential_disabled' for a run waiting on a disabled credential
    *  (PRD #1732 D14; resumes on Enable, never on a plain Resume), 'budget_exhausted' for a
    *  wall-clock park (PRD #1497), and 'provider_unavailable' for a provider outage bound
-   *  reached (PRD #1733; owner Resume, scoped Stop when permitted, or Cancel).
+   *  reached (PRD #1733; owner Resume, scoped Stop when permitted, or Cancel), and
+   *  'base_attestation_missing' for a --require-base run that adopted retained work no
+   *  checkpoint attests to the planned base (issue #3194; the agent was not started, nothing
+   *  automatic leaves the hold, Resume and extend are refused; recover or start a successor).
    *  Render an unrecognised value honestly.
    *  `hold_context` is the constant "unavailable(same_worker_only)" ONLY while held, else null:
    *  the UI/CLI state the hold's durability HONESTLY from it — the hold is same-worker-only and
@@ -3766,8 +3771,8 @@ export type RunSummaryItem = Omit<
 // RunOutcomes is the failed-run rate aggregate for one scope+window (PRD #1293).
 // Counted over `runs` directly, NOT the usage rollup (D1): a run that fails before
 // spending a token has no usage row but must still count. All counts are always
-// present (zeros, never null). Invariants the API guarantees (asserted server-side):
-//   - finished === completed + cancelled + plan_rejected + failed
+// present (zeros, never null); older APIs omit base_diverged. Invariants the API guarantees (asserted server-side):
+//   - finished === completed + cancelled + plan_rejected + (base_diverged ?? 0) + failed
 //   - sum(fail_origins) === failed
 // plan_rejected is split out of failed (rejecting a plan is the owner's decision, not a
 // factory failure; D4). The rate the UI shows is client-computed (failed / finished),
@@ -3791,6 +3796,8 @@ export interface RunOutcomes {
   completed: number;
   cancelled: number;
   plan_rejected: number;
+  /** Absent on older APIs; treat as zero. */
+  base_diverged?: number;
   failed: number;
   needs_landing: number;
   fail_origins: Record<string, number>;

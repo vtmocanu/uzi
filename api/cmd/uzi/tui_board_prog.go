@@ -38,6 +38,21 @@ func (m tuiModel) boardShowProg() bool {
 	return m.boardShowMile() && m.boardProgRoom() >= boardProgTitleFloor
 }
 
+// floorProgressPct is the `[p]` sort key (#3207): the percentage boardProgCell draws, or -1
+// for every run it draws none for (nil progress, a non-percent or unknown state, a percent
+// state without pct), so those sink below every measured run.
+func floorProgressPct(r apitypes.RunListItemDTO) int {
+	p := r.Progress
+	if p == nil || p.State != runprogress.StatePercent || p.Pct == nil {
+		return -1
+	}
+	return min(max(*p.Pct, 0), 100)
+}
+
+func compareFloorProgress(a, b apitypes.RunListItemDTO) int {
+	return floorProgressPct(b) - floorProgressPct(a)
+}
+
 // progParkWord is the short park reason shown after "⏸". Only the closed status enum is
 // mapped; nothing from the run is echoed.
 func progParkWord(status string) string {

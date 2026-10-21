@@ -20,6 +20,20 @@ const exec = (command: string, args: string[]) => {
 const refused = { message: "maintenance_object_snapshot_refused" };
 const exhausted = { message: "maintenance_resource_exhausted" };
 const cap = 256 * 1024 ** 2;
+// The object snapshot (src/git.ts snapshotMaintenanceObjects) refuses off Linux with
+// maintenance_object_snapshot_refused (`process.platform !== "linux"`), so scenarios that need a
+// completed snapshot cannot run on macOS (#1912). Linux runs every assertion.
+const LINUX_ONLY = process.platform !== "linux"
+  ? "needs the Linux-only descriptor-pinned object snapshot (src/git.ts snapshotMaintenanceObjects refuses off Linux)"
+  : false;
+// Fixtures build ~4070-4078-byte paths to probe Linux's 4096-byte limit; macOS PATH_MAX is 1024.
+const PATH_MAX_4096 = process.platform !== "linux"
+  ? "fixture builds ~4070-byte paths to test Linux's 4096-byte PATH_MAX; macOS PATH_MAX is 1024 (ENAMETOOLONG)"
+  : false;
+// APFS rejects non-UTF-8 file names (EILSEQ), so the raw invalid-UTF-8 name cannot be created on macOS.
+const RAW_NON_UTF8_NAMES = process.platform !== "linux"
+  ? "fixture creates a raw 0xFF file name; APFS only accepts UTF-8 names (EILSEQ)"
+  : false;
 type Handle = Awaited<ReturnType<typeof fs.open>>;
 const latch = () => {
   let release!: () => void;
@@ -158,7 +172,7 @@ async function removeLongFixtureOutput(out: string, children: ReadonlyArray<read
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
 }
 for (const allowed of [true, false]) {
-  test("derived source directory paths enforce 4096 bytes: " + allowed, async t => {
+  test("derived source directory paths enforce 4096 bytes: " + allowed, { skip: PATH_MAX_4096 }, async t => {
     const f = await fixture(t), clone = longFixturePath(path.join(f.dir, "runner"), allowed ? 4070 : 4078);
     const objects = path.join(clone, ".git", "objects");
     await fs.mkdir(objects, { recursive: true });
@@ -178,7 +192,7 @@ for (const allowed of [true, false]) {
       finally { await directory.close(); }
     }
   });
-  test("derived destination directory paths enforce 4096 bytes: " + allowed, async t => {
+  test("derived destination directory paths enforce 4096 bytes: " + allowed, { skip: PATH_MAX_4096 }, async t => {
     const f = await fixture(t);
     await fs.mkdir(path.join(f.objects, "nested-long"));
     const parent = longFixturePath(f.git.recoveryRoot, allowed ? 4066 : 4076);
@@ -198,7 +212,7 @@ for (const allowed of [true, false]) {
     }
   });
 }
-test("derived regular source file paths cannot exceed 4096 bytes", async t => {
+test("derived regular source file paths cannot exceed 4096 bytes", { skip: PATH_MAX_4096 }, async t => {
   const f = await fixture(t), clone = longFixturePath(path.join(f.dir, "runner"), 4078);
   const objects = path.join(clone, ".git", "objects");
   await fs.mkdir(objects, { recursive: true });
@@ -213,7 +227,7 @@ test("derived regular source file paths cannot exceed 4096 bytes", async t => {
     assert.equal(await fs.readFile(file, "utf8"), "abc");
   } finally { try { await fs.unlink(file); } finally { await directory.close(); } }
 });
-test("derived regular destination file paths cannot exceed 4096 bytes", async t => {
+test("derived regular destination file paths cannot exceed 4096 bytes", { skip: PATH_MAX_4096 }, async t => {
   const f = await fixture(t);
   await fs.writeFile(path.join(f.objects, "payload-long"), "abc");
   const parent = longFixturePath(f.git.recoveryRoot, 4076);
@@ -227,7 +241,7 @@ test("derived regular destination file paths cannot exceed 4096 bytes", async t 
   }
 });
 
-test("real shared clone descendants traverse offline through completed private source and base", async t => {
+test("real shared clone descendants traverse offline through completed private source and base", { skip: LINUX_ONLY }, async t => {
   const f = await fixture(t), base = await knownBaseFixture(f);
   const seed = path.join(f.dir, "seed"), verify = path.join(f.dir, "clean-view");
   await fs.rm(base.barePath, { recursive: true });
@@ -295,7 +309,7 @@ test("real shared clone descendants traverse offline through completed private s
 });
 for (const control of ["alternates", "http-alternates"]) {
   for (const kind of ["file", "symlink", "FIFO"]) {
-    test("known base omits non-authoritative source " + control + " " + kind + " without opening", async t => {
+    test("known base omits non-authoritative source " + control + " " + kind + " without opening", { skip: LINUX_ONLY }, async t => {
       const f = await fixture(t), base = await knownBaseFixture(f);
       const info = path.join(f.objects, "info"), target = path.join(f.dir, "hostile");
       await fs.mkdir(info);
@@ -365,7 +379,7 @@ for (const kind of ["bad identity", "relative", "unnormalized", "outside", "nest
 }
 for (const store of ["source", "base"]) {
   for (const kind of ["mutation", "replacement", "root replacement"]) {
-    test("both-store final revalidation: " + store + " " + kind, async t => {
+    test("both-store final revalidation: " + store + " " + kind, { skip: LINUX_ONLY }, async t => {
       const f = await fixture(t), base = await knownBaseFixture(f);
       let changed = false;
       f.hooks.open = async (_file, p) => {
@@ -388,7 +402,7 @@ for (const store of ["source", "base"]) {
   }
 }
 for (const resource of ["sourceBytes", "sourceEntries", "adminEntries", "metadataBytes", "artifactBytes"] as const) {
-  test("second store cannot renew shared " + resource + " and cleans both copies", async t => {
+  test("second store cannot renew shared " + resource + " and cleans both copies", { skip: LINUX_ONLY }, async t => {
     const f = await fixture(t), base = await knownBaseFixture(f);
     const consume = MaintenanceResources.consume.bind(MaintenanceResources);
     let used = 0, reached = false, quotaRefused = false;
@@ -419,7 +433,7 @@ for (const resource of ["sourceBytes", "sourceEntries", "adminEntries", "metadat
     await assert.rejects(fs.lstat(f.out + "-base"), { code: "ENOENT" });
   });
 }
-test("a hostile declared alternate contributes no real Git objects", async t => {
+test("a hostile declared alternate contributes no real Git objects", { skip: LINUX_ONLY }, async t => {
   const f = await fixture(t), base = await knownBaseFixture(f);
   const hostile = path.join(f.dir, "hostile"), clean = path.join(f.dir, "clean");
   await exec("/usr/bin/git", ["init", "--quiet", "--bare", "--template=", hostile]);
@@ -454,7 +468,7 @@ test("a hostile declared alternate contributes no real Git objects", async t => 
   await assert.rejects(probe);
 });
 for (const kind of ["control mutation", "control replacement", "source control directory", "late base control"]) {
-  test("both stores retain alternate metadata consistency: " + kind, async t => {
+  test("both stores retain alternate metadata consistency: " + kind, { skip: kind === "source control directory" ? false : LINUX_ONLY }, async t => {
     const f = await fixture(t), base = await knownBaseFixture(f);
     const info = path.join(f.objects, "info"), p = path.join(info, "alternates");
     await fs.mkdir(info);
@@ -479,7 +493,7 @@ for (const kind of ["control mutation", "control replacement", "source control d
   });
 }
 for (const direction of ["read", "write"]) {
-  test("second-store pending " + direction + " settles before revocation cleanup", async t => {
+  test("second-store pending " + direction + " settles before revocation cleanup", { skip: LINUX_ONLY }, async t => {
     const f = await fixture(t), base = await knownBaseFixture(f), entered = latch(), release = latch();
     let pending = false, settled = false, closesWhilePending = 0;
     f.hooks.open = (file, p) => {
@@ -517,7 +531,7 @@ for (const direction of ["read", "write"]) {
     await assert.rejects(fs.lstat(f.out + "-base"), { code: "ENOENT" });
   });
 }
-test("both stores consume the original logical source quota", async t => {
+test("both stores consume the original logical source quota", { skip: LINUX_ONLY }, async t => {
   const f = await fixture(t), base = await knownBaseFixture(f);
   f.charge("sources", 127);
   await assert.rejects(f.run(() => f.snapshot(undefined, f.source, f.out, base)), exhausted);
@@ -525,7 +539,7 @@ test("both stores consume the original logical source quota", async t => {
   await assert.rejects(fs.lstat(f.out), { code: "ENOENT" });
   await assert.rejects(fs.lstat(f.out + "-base"), { code: "ENOENT" });
 });
-test("derived base sibling is bounded before concatenation", async t => {
+test("derived base sibling is bounded before concatenation", { skip: PATH_MAX_4096 }, async t => {
   const f = await fixture(t), base = await knownBaseFixture(f);
   const parent = longFixturePath(f.git.recoveryRoot, 4076);
   await fs.mkdir(parent, { recursive: true, mode: 0o700 });
@@ -535,7 +549,7 @@ test("derived base sibling is bounded before concatenation", async t => {
   await assert.rejects(f.run(() => f.snapshot(undefined, f.source, output, base)), refused);
   await assert.rejects(fs.lstat(output), { code: "ENOENT" });
 });
-test("detaches actual loose objects, pack/index and nested encoded bytes without source writes or launches", async t => {
+test("detaches actual loose objects, pack/index and nested encoded bytes without source writes or launches", { skip: LINUX_ONLY }, async t => {
   const f = await fixture(t);
   await exec("/usr/bin/git", ["init", "--quiet", "--template=", f.clone]);
   await fs.writeFile(path.join(f.clone, "body"), "snapshot fixture\n");
@@ -573,7 +587,7 @@ test("detaches actual loose objects, pack/index and nested encoded bytes without
   assert.equal(f.launches(), 0);
   assert.ok(f.callbacks() >= before.size * 2 + 2);
 });
-test("accepts bounded caller-family paths beyond canonical two-level shape", async t => {
+test("accepts bounded caller-family paths beyond canonical two-level shape", { skip: LINUX_ONLY }, async t => {
   const f = await fixture(t), deep = path.join(f.dir, "runner", "family", "generation", "attempt");
   await fs.mkdir(path.dirname(deep), { recursive: true });
   await fs.rename(f.clone, deep);
@@ -601,7 +615,7 @@ for (const kind of ["wrong identity", "rounded identity", "relative source", "ou
   });
 }
 for (const kind of ["source ancestor", "clone", ".git", "objects", "leaf", "target parent", "hardlink", "FIFO", "raw invalid UTF8"]) {
-  test("rejects " + kind, async t => {
+  test("rejects " + kind, { skip: kind === "raw invalid UTF8" ? RAW_NON_UTF8_NAMES : false }, async t => {
     const f = await fixture(t);
     const linkPath = kind === "source ancestor" ? path.dirname(f.clone) : kind === "clone" ? f.clone :
       kind === ".git" ? path.join(f.clone, ".git") : kind === "objects" ? f.objects :
@@ -619,7 +633,7 @@ for (const kind of ["source ancestor", "clone", ".git", "objects", "leaf", "targ
 }
 for (const control of ["alternates", "http-alternates"]) {
   for (const kind of ["empty", "link", "directory", "late insertion", "handoff insertion"]) {
-    test(control + " refuses " + kind + " without reading control bytes", async t => {
+    test(control + " refuses " + kind + " without reading control bytes", { skip: kind === "late insertion" || kind === "handoff insertion" ? LINUX_ONLY : false }, async t => {
       const f = await fixture(t), info = path.join(f.objects, "info");
       await fs.mkdir(info);
       const p = path.join(info, control);
@@ -651,7 +665,7 @@ test("no producer token or discovery scope can authorize a snapshot", async t =>
   assert.equal(f.callbacks(), 0);
 });
 for (const kind of ["mutation", "replacement", "late earlier leaf", "late directory replacement", "growth"]) {
-  test("rejects changed source: " + kind, async t => {
+  test("rejects changed source: " + kind, { skip: LINUX_ONLY }, async t => {
     const f = await fixture(t);
     await fs.mkdir(path.join(f.objects, "later"));
     await fs.writeFile(path.join(f.objects, "later", "second"), "later");
@@ -683,7 +697,7 @@ for (const kind of ["mutation", "replacement", "late earlier leaf", "late direct
   });
 }
 for (const resource of ["sourceBytes", "sourceEntries", "adminEntries", "metadataBytes", "artifactBytes"] as const) {
-  test("original shared quota precharges " + resource, async t => {
+  test("original shared quota precharges " + resource, { skip: LINUX_ONLY }, async t => {
     const f = await fixture(t);
     const limit = resource === "sourceEntries" ? 65536 : resource === "adminEntries" ? 4096 : cap;
     f.charge(resource, limit - (resource === "artifactBytes" ? 2 : 0));
@@ -695,7 +709,7 @@ for (const resource of ["sourceBytes", "sourceEntries", "adminEntries", "metadat
     assert.equal(writes, 0);
   });
 }
-test("a different output path cannot renew the original artifact quota", async t => {
+test("a different output path cannot renew the original artifact quota", { skip: LINUX_ONLY }, async t => {
   const f = await fixture(t);
   f.charge("artifactBytes", cap - 5);
   await f.run(() => f.snapshot());
@@ -721,7 +735,7 @@ test("source DAC refusal never repairs permissions or launches a privileged read
   assert.equal(f.launches(), 0);
   assert.equal(await fs.readFile(path.join(f.objects, "leaf"), "utf8"), "abc");
 });
-test("source request accounting includes raw names, EOF and short read capacity", async t => {
+test("source request accounting includes raw names, EOF and short read capacity", { skip: LINUX_ONLY }, async t => {
   const f = await fixture(t);
   let requested = 0, rawReads = 0;
   f.hooks.raw = () => { rawReads++; };
@@ -738,7 +752,7 @@ test("source request accounting includes raw names, EOF and short read capacity"
   f.charge("sourceBytes", cap - requested - rawReads * 255);
   assert.throws(() => f.charge("sourceBytes", 1), exhausted);
 });
-test("partial writes retry only unwritten tail and charge the chunk once", async t => {
+test("partial writes retry only unwritten tail and charge the chunk once", { skip: LINUX_ONLY }, async t => {
   const f = await fixture(t), attempts: Array<[number, number, number]> = [];
   let admin = 0, source = 0;
   const consume = MaintenanceResources.consume.bind(MaintenanceResources);
@@ -765,7 +779,7 @@ test("partial writes retry only unwritten tail and charge the chunk once", async
   assert.throws(() => f.charge("artifactBytes", 1), exhausted);
 });
 for (const kind of ["zero write", "read fault", "write fault", "read cancel", "write cancel"]) {
-  test("settles serial filesystem I/O and cleans owned output: " + kind, async t => {
+  test("settles serial filesystem I/O and cleans owned output: " + kind, { skip: LINUX_ONLY }, async t => {
     const f = await fixture(t), entered = latch(), release = latch();
     let settled = false, reached = false, released = false, earlyCloses = 0;
     f.hooks.open = (file, p) => {
@@ -810,7 +824,7 @@ for (const kind of ["zero write", "read fault", "write fault", "read cancel", "w
     await assert.rejects(fs.lstat(f.out), { code: "ENOENT" });
   });
 }
-test("cleanup preserves a foreign replacement name", async t => {
+test("cleanup preserves a foreign replacement name", { skip: LINUX_ONLY }, async t => {
   const f = await fixture(t);
   f.hooks.open = (file, p) => {
     if (p !== path.join(f.out, "leaf")) return;
@@ -823,7 +837,7 @@ test("cleanup preserves a foreign replacement name", async t => {
   await assert.rejects(f.run(() => f.snapshot()), refused);
   assert.equal(await fs.readFile(path.join(f.out, "leaf"), "utf8"), "foreign");
 });
-test("modeled supported split-worker 2775 strict ancestor keeps private output", async t => {
+test("modeled supported split-worker 2775 strict ancestor keeps private output", { skip: LINUX_ONLY }, async t => {
   const f = await fixture(t, { split: true, mode: 0o2775, gid: 10001 });
   assert.equal((await f.run(() => f.snapshot())).fileCount, 1);
   assert.equal((await fs.lstat(f.out)).mode & 0o5777, 0o700);
@@ -836,7 +850,7 @@ for (const profile of [{ split: false, mode: 0o2775 }, { split: true, mode: 0o27
     await assert.rejects(fs.lstat(f.out), { code: "ENOENT" });
   });
 }
-test("refuses a source info change during the last control probe", async t => {
+test("refuses a source info change during the last control probe", { skip: LINUX_ONLY }, async t => {
   const f = await fixture(t);
   await fs.mkdir(path.join(f.objects, "info"));
   const lstat = fs.lstat.bind(fs);
@@ -854,7 +868,7 @@ test("refuses a source info change during the last control probe", async t => {
   assert.equal(await fs.readFile(path.join(f.objects, "info", "late"), "utf8"), "retained source");
   await assert.rejects(fs.lstat(f.out), { code: "ENOENT" });
 });
-test("new private directories retain harmless inherited setgid", async t => {
+test("new private directories retain harmless inherited setgid", { skip: LINUX_ONLY }, async t => {
   const f = await fixture(t);
   await fs.chmod(f.git.recoveryRoot, 0o2700);
   await f.run(() => f.snapshot());
@@ -880,7 +894,7 @@ test("private root never inherits the group-writable ancestor exception", async 
 });
 for (const message of ["maintenance_resource_exhausted", "maintenance_token_invalid", "maintenance_clock_invalid",
   "maintenance_resource_exhausted private", "private diagnostic"]) {
-  test("fixed refusal strips cause and properties: " + message, async t => {
+  test("fixed refusal strips cause and properties: " + message, { skip: ["maintenance_resource_exhausted", "maintenance_token_invalid", "maintenance_clock_invalid"].includes(message) ? LINUX_ONLY : false }, async t => {
     const f = await fixture(t);
     await assert.rejects(f.run(() => f.snapshot(async () => {
       throw Object.assign(new Error(message, { cause: "private" }), { stderr: "private" });
@@ -896,7 +910,7 @@ for (const message of ["maintenance_resource_exhausted", "maintenance_token_inva
 }
 
 for (const target of ["active source", "active destination", "source ancestor", "destination ancestor"]) {
-  test("short write revalidates " + target + " before retry", async t => {
+  test("short write revalidates " + target + " before retry", { skip: LINUX_ONLY }, async t => {
     const f = await fixture(t);
     let writes = 0;
     f.hooks.open = (file, p) => {

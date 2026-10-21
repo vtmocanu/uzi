@@ -139,6 +139,7 @@ function seed(): MockState {
   // DTO. Copied so the script's appends never mutate the shared fixture.
   messages.set("run-live", mockLiveMessages.map((m) => ({ ...m })));
   messages.set("run-cancelled", []);
+  messages.set("run-rejected", []);
   // The never-judged control fixture (PRD #119): a terminal run with no review AND no
   // pending judge, so the run page's unchanged "hasn't been judged yet" empty state and
   // its live Run-judge button stay demoable — run-failed used to be that fixture and now
@@ -258,6 +259,7 @@ const CARD_MIRRORED_FIELDS = [
   "mr_state",
   "failure_reason",
   "stop_kind",
+  "fail_origin",
   "stop_reason",
   "health",
   "health_reason",

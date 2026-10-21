@@ -47,6 +47,29 @@ and the measured under-count it replaced, and
 [ADR-1562](../adr/1562-run-usage-session-cumulative-basis.md) for the
 session-cumulative fold and what it does not backfill.
 
+## Rejected runs and failure accounting
+
+Usage outcomes count finished run rows, including runs with no usage. A failed
+run with `fail_origin = base_diverged` has its own count, as does
+`plan_rejected`; neither contributes to the `failed` count, `fail_origins`
+map or lifetime failure recency. These definitions apply to personal, factory
+and per-user usage in both lifetime and last-seven-day windows:
+
+```text
+finished == completed + cancelled + plan_rejected + base_diverged + failed
+sum(fail_origins) == failed
+failure rate == failed / finished
+```
+
+The API emits numeric partition counts, including zero. The usage bar's
+**rejected** segment is `plan_rejected + base_diverged`; plan rejections keep
+their **stopped** run badge, while required-base rejections show **rejected**.
+These remain raw `status = failed` rows. `provider_policy_refusal` remains an
+execution failure, counted in `failed` and eligible for judging under the
+[existing rules](./judge.md#which-runs-are-judged).
+See [required-base rollout compatibility](./run-activity.md#when-a-required-base-has-changed)
+for older APIs/workers, optional web fields and the no-backfill boundary.
+
 ## Metered, subscription, and unreported cost
 
 Not every run's cost is a real dollar figure. Each run's folded `run_usage`
@@ -153,9 +176,11 @@ embeds its byte-identical mirror at
 rates and provenance constants live in
 `api/internal/anthropicprice/anthropicprice.go`.
 
-A human must verify the affected rates and model coverage against the
-official pricing and model pages recorded in each row's `sources`, or
-Anthropic's `AnthropicPriceSourceURL`. Update the Codex table's `version`
+No human step: an agent and its review buddy each fetch the official
+pricing and model pages recorded in each row's `sources` (or Anthropic's
+`AnthropicPriceSourceURL`) independently and agree on the affected rates and
+model coverage, recording the sources and rates each checked in the change,
+before any date or rate moves. Update the Codex table's `version`
 when its pricing changes, and each checked row's `verified_at` to the actual
 verification date; review any `promo_review_date` against the official
 promotion terms. For Anthropic, update `AnthropicPriceTableVersion` when

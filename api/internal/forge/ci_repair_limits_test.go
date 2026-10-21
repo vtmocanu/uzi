@@ -22,6 +22,13 @@ var ciProviders = []Type{TypeGitHub, TypeGitLab, TypeForgejo}
 // ciWireDriver exercises the real SDK, auth, guarded transport and redaction.
 func ciWireDriver(t *testing.T, provider Type, handler http.HandlerFunc) Forge {
 	t.Helper()
+	return ciWireDriverTimeout(t, provider, 5*time.Second, handler)
+}
+
+// ciWireDriverTimeout is ciWireDriver with an explicit client timeout, for tables whose
+// multi-MiB fixtures can outlast the 5s default under -race (#3190).
+func ciWireDriverTimeout(t *testing.T, provider Type, timeout time.Duration, handler http.HandlerFunc) Forge {
+	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/repositories/7") {
 			_, _ = io.WriteString(w, `{"id":7,"name":"widgets","owner":{"login":"acme"}}`)
@@ -30,7 +37,7 @@ func ciWireDriver(t *testing.T, provider Type, handler http.HandlerFunc) Forge {
 		handler(w, r)
 	}))
 	t.Cleanup(srv.Close)
-	d, err := NewWithGitLabBackoff(provider, srv.URL, "ci-fixture-credential", 5*time.Second,
+	d, err := NewWithGitLabBackoff(provider, srv.URL, "ci-fixture-credential", timeout,
 		func(_, _ time.Duration, _ int, _ *http.Response) time.Duration { return 0 })
 	if err != nil {
 		t.Fatal(err)
@@ -205,13 +212,19 @@ func TestCIWorkflowHTTPBodyBudgets(t *testing.T) {
 	for _, provider := range ciProviders {
 		for _, mode := range []string{"exact", "plus-one", "gzip", "gzip-overflow", "unsupported", "error-overflow", "huge-item", "stream"} {
 			t.Run(string(provider)+"/"+mode, func(t *testing.T) {
-				d := ciWireDriver(t, provider, func(w http.ResponseWriter, _ *http.Request) {
-					body := ciBody(provider, ciRepairJSONBytes)
+				// Build the multi-MiB body before the timed request, not inside the handler.
+				var body string
+				switch mode {
+				case "huge-item":
+					body = ciRunsJSON(provider, `{"id":1,"name":"`+strings.Repeat("x", ciRepairJSONBytes)+`"}`)
+				case "plus-one", "gzip-overflow", "error-overflow":
+					body = ciBody(provider, ciRepairJSONBytes) + " "
+				case "stream":
+				default:
+					body = ciBody(provider, ciRepairJSONBytes)
+				}
+				d := ciWireDriverTimeout(t, provider, 30*time.Second, func(w http.ResponseWriter, _ *http.Request) {
 					switch mode {
-					case "plus-one", "gzip-overflow", "error-overflow":
-						body += " "
-					case "huge-item":
-						body = ciRunsJSON(provider, `{"id":1,"name":"`+strings.Repeat("x", ciRepairJSONBytes)+`"}`)
 					case "unsupported":
 						w.Header().Set("Content-Encoding", "br")
 					case "stream":
@@ -295,69 +308,81 @@ func ciJobsJSON(provider Type, count int) string {
 	return `{"jobs":` + string(data) + "}"
 }
 
+// TestCIJobHTTPPagination runs every mode through ListPipelineJobs and, where the
+// forge supports history (#3225), ListPipelineJobAttempts: both share one budgeted
+// pagination path, so "eleven" also pins exhaustion on a later page of history.
 func TestCIJobHTTPPagination(t *testing.T) {
 	for _, provider := range ciProviders {
-		for _, mode := range []string{"terminal-ten", "eleven", "loop", "empty", "oversized", "oversized-total", "invalid-id"} {
-			t.Run(string(provider)+"/"+mode, func(t *testing.T) {
-				var calls atomic.Int32
-				pageSize := 100
-				if provider == TypeForgejo {
-					pageSize = 50
-				}
-				d := ciWireDriver(t, provider, func(w http.ResponseWriter, r *http.Request) {
-					calls.Add(1)
-					page, _ := strconv.Atoi(r.URL.Query().Get("page"))
-					if page == 0 {
-						page = 1
+		for _, method := range []string{"jobs", "attempts"} {
+			if method == "attempts" && provider == TypeForgejo {
+				continue
+			}
+			for _, mode := range []string{"terminal-ten", "eleven", "loop", "empty", "oversized", "oversized-total", "invalid-id"} {
+				t.Run(string(provider)+"/"+method+"/"+mode, func(t *testing.T) {
+					var calls atomic.Int32
+					pageSize := 100
+					if provider == TypeForgejo {
+						pageSize = 50
 					}
-					next := page + 1
-					if mode == "terminal-ten" && page == 10 {
-						next = 0
+					d := ciWireDriver(t, provider, func(w http.ResponseWriter, r *http.Request) {
+						calls.Add(1)
+						page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+						if page == 0 {
+							page = 1
+						}
+						next := page + 1
+						if mode == "terminal-ten" && page == 10 {
+							next = 0
+						}
+						if mode == "loop" {
+							next = page
+						}
+						if mode == "oversized" || mode == "oversized-total" || mode == "invalid-id" {
+							next = 0
+						}
+						if next > 0 {
+							w.Header().Set("X-Next-Page", strconv.Itoa(next))
+							w.Header().Set("Link", fmt.Sprintf("<http://%s%s?page=%d>; rel=\"next\"", r.Host, r.URL.Path, next))
+						}
+						count := pageSize
+						switch mode {
+						case "empty":
+							count = 0
+						case "oversized":
+							count++
+						case "oversized-total":
+							count = 1001
+						}
+						body := ciJobsJSON(provider, count)
+						if mode == "invalid-id" {
+							body = strings.ReplaceAll(body, `"id":1,`, `"id":0,`)
+						}
+						_, _ = io.WriteString(w, body)
+					})
+					list := d.ListPipelineJobs
+					if method == "attempts" {
+						list = d.ListPipelineJobAttempts
 					}
-					if mode == "loop" {
-						next = page
+					jobs, err := list(WithCIRepairReadLimits(context.Background()), 7, 1)
+					if mode == "terminal-ten" {
+						if err != nil || len(jobs) != 10*pageSize || calls.Load() != 10 {
+							t.Fatalf("terminal snapshot: %d jobs, %d calls, %v", len(jobs), calls.Load(), err)
+						}
+					} else {
+						requireCIBudget(t, err)
+						if jobs != nil {
+							t.Fatal("partial jobs escaped")
+						}
+						wantCalls := int32(1)
+						if mode == "eleven" {
+							wantCalls = 10
+						}
+						if calls.Load() != wantCalls {
+							t.Fatalf("calls=%d want %d", calls.Load(), wantCalls)
+						}
 					}
-					if mode == "oversized" || mode == "oversized-total" || mode == "invalid-id" {
-						next = 0
-					}
-					if next > 0 {
-						w.Header().Set("X-Next-Page", strconv.Itoa(next))
-						w.Header().Set("Link", fmt.Sprintf("<http://%s%s?page=%d>; rel=\"next\"", r.Host, r.URL.Path, next))
-					}
-					count := pageSize
-					switch mode {
-					case "empty":
-						count = 0
-					case "oversized":
-						count++
-					case "oversized-total":
-						count = 1001
-					}
-					body := ciJobsJSON(provider, count)
-					if mode == "invalid-id" {
-						body = strings.ReplaceAll(body, `"id":1,`, `"id":0,`)
-					}
-					_, _ = io.WriteString(w, body)
 				})
-				jobs, err := d.ListPipelineJobs(WithCIRepairReadLimits(context.Background()), 7, 1)
-				if mode == "terminal-ten" {
-					if err != nil || len(jobs) != 10*pageSize || calls.Load() != 10 {
-						t.Fatalf("terminal snapshot: %d jobs, %d calls, %v", len(jobs), calls.Load(), err)
-					}
-				} else {
-					requireCIBudget(t, err)
-					if jobs != nil {
-						t.Fatal("partial jobs escaped")
-					}
-					wantCalls := int32(1)
-					if mode == "eleven" {
-						wantCalls = 10
-					}
-					if calls.Load() != wantCalls {
-						t.Fatalf("calls=%d want %d", calls.Load(), wantCalls)
-					}
-				}
-			})
+			}
 		}
 	}
 }

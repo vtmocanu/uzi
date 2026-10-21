@@ -183,6 +183,10 @@ const maxPackBytes = 64 << 20 // 64 MiB
 // tip is a 400 (a worker bug) and never reaches the broker as a would-be object id.
 var checkpointTipRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
+// checkpointAttestedSourceRe matches a full lowercase-hex object id, SHA-1 (40) or SHA-256 (64):
+// the source OID a --require-base flight attests (issue #3194). Never a prefix.
+var checkpointAttestedSourceRe = regexp.MustCompile(`^(?:[0-9a-f]{40}|[0-9a-f]{64})$`)
+
 // WorkerRegister brings the worker online (and recovers any runs it orphaned by
 // restarting). Accepts an optional {version} body.
 func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
@@ -2291,6 +2295,16 @@ func (h *Handler) WorkerRunPublish(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid checkpoint tip")
 		return
 	}
+	// Issue #3194: the optional source attestation. Absent is a legacy or unattested publish
+	// (nil); present must be a full OID, else a 400 (a worker bug) before anything is admitted.
+	var attestedSource *string
+	if raw, present := r.Header[http.CanonicalHeaderKey("X-Uzi-Checkpoint-Attested-Source")]; present {
+		if len(raw) != 1 || !checkpointAttestedSourceRe.MatchString(raw[0]) {
+			httpx.Error(w, http.StatusBadRequest, "invalid attested source")
+			return
+		}
+		attestedSource = &raw[0]
+	}
 	var claimGeneration *int64
 	if raw, present := r.URL.Query()["claim_generation"]; present {
 		if len(raw) != 1 {
@@ -2317,7 +2331,7 @@ func (h *Handler) WorkerRunPublish(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "could not read checkpoint pack")
 		return
 	}
-	res, err := h.wsvc.Publish(r.Context(), wkr, runID, tip, body, claimGeneration)
+	res, err := h.wsvc.PublishAttested(r.Context(), wkr, runID, tip, attestedSource, body, claimGeneration)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrMissingClaimGeneration) || errors.Is(err, workersvc.ErrStaleClaim) {
 			httpx.ErrorReason(w, http.StatusConflict, "checkpoint publish claim is stale", "stale_claim")

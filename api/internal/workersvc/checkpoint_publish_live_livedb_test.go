@@ -136,7 +136,7 @@ func TestLiveConfirmationRaceGuardsLiveDB(t *testing.T) {
 				case "persisted":
 					f.e.exec(t, "UPDATE runs SET checkpoint_tip=$2,checkpoint_tip_at=now() WHERE id=$1", f.newRun, lateTip)
 				case "pending attempt", "ready attempt":
-					other, err := f.svc1.recordPublishAttempt(f.e.ctx, f.newRun, f.branch, f.branchRef, lateTip)
+					other, err := f.svc1.recordPublishAttempt(f.e.ctx, f.newRun, f.branch, f.branchRef, lateTip, pgtype.Text{})
 					if err != nil {
 						t.Fatal(err)
 					}

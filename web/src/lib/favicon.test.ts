@@ -125,3 +125,11 @@ describe("failedRunIds", () => {
     expect(failedRunIds([run("running"), run("completed")])).toEqual(new Set());
   });
 });
+
+it("does not alarm on rejection, preserves raw failed bookkeeping and alarms on agent failure", () => {
+  const rejected: FaviconRun = { id: "rejected", status: "failed", stop_kind: null, fail_origin: "base_diverged" };
+  expect(deriveFaviconState([rejected], NONE)).toBe("idle");
+  expect(deriveFaviconState([rejected, run("running")], NONE)).toBe("running");
+  expect(failedRunIds([rejected])).toEqual(new Set(["rejected"]));
+  expect(deriveFaviconState([{ ...rejected, fail_origin: "agent_failure" }], NONE)).toBe("failed");
+});
