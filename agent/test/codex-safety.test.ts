@@ -25,6 +25,8 @@ import {
   type RegisteredRoot,
   type RootKind,
 } from "../src/codex/registry.js";
+import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
+import { CaptureOperationRevokedError, GitBoundaryAbortError, CheckpointUnsafeCleanupError } from "../src/checkpoint-stop.js";
 import { captureFailureOf, type BoundaryPermit, type BoundaryRequest, type BoundaryStep } from "../src/harness.js";
 
 for (const origin of ["deadline", "external", "both"] as const) {
@@ -59,6 +61,105 @@ for (const origin of ["deadline", "external", "both"] as const) {
     });
     const arbitrary = new CodexBoundaryError("action", [{ category: "timeout", message: "codex capture deadline expired" }], primary);
     assert.equal(captureFailureOf(arbitrary), undefined, "matching text cannot mint capture provenance");
+  });
+}
+
+for (const kind of ["git", "process"] as const) {
+  for (const proof of ["own", "wrong", "live"] as const) {
+    it(`R2 ${kind} revocation requires the exact already-aborted capture signal: ${proof}`, async () => {
+      const registry = new ExecutionRegistry(newLocalExecutionEpoch(2852));
+      let expire!: () => void;
+      const safety = createCodexExecutionSafety(registry, spawnCounter().seam, undefined, undefined,
+        async () => assert.fail("no child requested"),
+        (_request, _ms, fire) => { expire = fire; return () => {}; });
+      let primary: Error;
+      await assert.rejects(safety.withCredentialFreeCapture(1000, async context => {
+        const other = new AbortController(); other.abort();
+        if (proof !== "live") expire();
+        const signal = proof === "wrong" ? other.signal : context.signal;
+        primary = kind === "git" ? new GitBoundaryAbortError("original message", undefined, signal)
+          : new CaptureOperationRevokedError("original message", signal);
+        if (proof === "live") expire();
+        assert.equal(primary.message, "original message");
+        assert.equal(primary.name, kind === "git" ? "AbortError" : "TrustedExecutionRefusal");
+        assert.equal(JSON.stringify(primary), JSON.stringify(kind === "git"
+          ? new GitBoundaryAbortError("original message") : new TrustedExecutionRefusal("original message")));
+        assert.equal(Object.hasOwn(primary, "captureSignal"), false);
+        assert.equal(JSON.stringify(primary).includes("captureSignal"), false);
+        throw primary;
+      }), (error: unknown) => {
+        assert.ok(error instanceof CodexBoundaryError);
+        assert.equal(error.actionError, primary);
+        assert.equal(captureFailureOf(error)?.actionRevoked, proof === "own" ? true : undefined);
+        return true;
+      });
+    });
+  }
+}
+
+for (const origin of ["deadline", "external", "both"] as const) {
+  it("R2 raw capture abort through Git factory has exact provenance: " + origin, async t => {
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(2852));
+    const cache = new GitCache("/unused-r2", nullLogger());
+    let expire!: () => void;
+    const external = new AbortController();
+    const safety = createCodexExecutionSafety(registry, spawnCounter().seam, undefined, undefined,
+      async () => assert.fail("no child requested"),
+      (_request, _ms, fire) => { expire = fire; return () => {}; });
+    await assert.rejects(safety.withCredentialFreeCapture(1000, async context =>
+      cache.withCredentialFreeCapture(context, async () => {
+        t.mock.method(cache as any, "runGitAsRunner", async () => {
+          if (origin !== "deadline") external.abort(new Error("external authority"));
+          if (origin !== "external") expire();
+          throw context.signal.reason;
+        });
+        return cache.branchTip("/unused", "agent/issue-2852");
+      }), external.signal), (error: unknown) => {
+      assert.ok(error instanceof CodexBoundaryError);
+      assert.ok(error.actionError instanceof GitBoundaryAbortError);
+      assert.equal(captureFailureOf(error)?.actionRevoked, true);
+      assert.equal(captureFailureOf(error)?.externallyAborted, origin !== "deadline");
+      assert.equal(captureFailureOf(error)?.deadlineExpired, origin !== "external");
+      return true;
+    });
+  });
+}
+
+for (const failure of ["clean", "dispose", "reap"] as const) {
+  it("R2 in-flight capture child revocation waits for verified cleanup: " + failure, async () => {
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(2852));
+    const cache = new GitCache("/unused-r2", nullLogger());
+    const waiting = defer<void>(), disposed = defer<void>(), reap = defer<ReapOutcome>();
+    let expire!: () => void;
+    let settled = false, reaps = 0, disposals = 0;
+    const safety = createCodexExecutionSafety(registry, spawnCounter().seam, undefined, undefined,
+      async () => ({
+        stdin: null, stdout: new PassThrough(), stderr: new PassThrough(),
+        waitChild: async () => { waiting.resolve(); return new Promise(() => {}); },
+        root: { kind: "boundary_action",
+          dispose: async () => { disposals++; disposed.resolve(); if (failure === "dispose") throw new Error("dispose failed"); },
+          reap: async () => { reaps++; return reap.promise; },
+        },
+      }), (_request, _ms, fire) => { expire = fire; return () => {}; });
+    const result = safety.withCredentialFreeCapture(1000, async context =>
+      cache.withCredentialFreeCapture(context, async () => {
+        try { return await cache.branchTip("/unused", "agent/issue-2852"); }
+        finally { settled = true; }
+      }));
+    const checked = assert.rejects(result, (error: unknown) => {
+      assert.ok(error instanceof CodexBoundaryError);
+      assert.ok(error.actionError instanceof (failure === "clean" ? CaptureOperationRevokedError : CheckpointUnsafeCleanupError));
+      assert.equal(captureFailureOf(error)?.actionRevoked, failure === "clean" ? true : undefined);
+      return true;
+    });
+    await waiting.promise;
+    expire();
+    await disposed.promise;
+    assert.equal(settled, false, "revocation cannot escape before owned reap");
+    reap.resolve(failure === "reap" ? { ok: false, error: { category: "tool", message: "reap failed" } } : { ok: true });
+    await checked;
+    assert.equal(disposals, 1);
+    assert.equal(reaps, 1);
   });
 }
 

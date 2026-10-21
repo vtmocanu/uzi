@@ -17391,7 +17391,7 @@ export class RunRunner {
           throw primary;
         }
         if (capture.externallyAborted || (!capture.deadlineExpired && !capture.childCleanupFailed) ||
-            (primary !== undefined && !(primary instanceof FreeCaptureScopeExpired))) throw error;
+            (primary !== undefined && !capture.actionRevoked && !(primary instanceof FreeCaptureScopeExpired))) throw error;
       }
       if (pauseAcknowledged) return retainAcknowledgedPause();
       // Cooperative owner pause is already latched; only newer authority revocation wins here.

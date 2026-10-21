@@ -1,4 +1,4 @@
-import { checkCheckpointStop, CheckpointSoftDeadlineError, CheckpointUnsafeCleanupError, waitCheckpointAdmission } from "../checkpoint-stop.js";
+import { CaptureOperationRevokedError, GitBoundaryAbortError, checkCheckpointStop, CheckpointSoftDeadlineError, CheckpointUnsafeCleanupError, waitCheckpointAdmission } from "../checkpoint-stop.js";
 // PRD #1171 (M3, milestone 1, first unit): the `CodexExecutionSafety` facade and
 // the trusted boundary-action lane.
 //
@@ -592,7 +592,11 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
         if (errors.length) {
           this.registry.poison(errors);
           const error = new CodexBoundaryError("action", errors, outcome.ok ? undefined : outcome.error);
-          recordCaptureFailure(error, { deadlineExpired, childCleanupFailed, externallyAborted: signal?.aborted === true });
+          const actionRevoked = !outcome.ok &&
+            (outcome.error instanceof GitBoundaryAbortError || outcome.error instanceof CaptureOperationRevokedError) &&
+            outcome.error.isCaptureRevocationFor(context.signal);
+          recordCaptureFailure(error, { deadlineExpired, childCleanupFailed, externallyAborted: signal?.aborted === true,
+            ...(actionRevoked ? { actionRevoked: true as const } : {}) });
           throw error;
         }
         this.lastCaptureCompletion = completed as CompletedCredentialFreeCapture;
@@ -920,7 +924,10 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     else if (this.exclusiveReaper) throw new TrustedExecutionRefusal("reaper pipeline owns child admission");
     else if (capture) assertCaptureRequest(capture, request);
     else if (this.heldPermit !== permit) throw new TrustedExecutionRefusal("codex boundary process refused: stale permit");
-    if (permit.signal.aborted) throw new TrustedExecutionRefusal("codex boundary process refused: boundary deadline exceeded");
+    if (permit.signal.aborted) {
+      const message = "codex boundary process refused: boundary deadline exceeded";
+      throw capture ? new CaptureOperationRevokedError(message, capture.signal) : new TrustedExecutionRefusal(message);
+    }
     this.requireBoundaryProcessBudget(permit);
     if (request.timeoutMs !== undefined && (!Number.isFinite(request.timeoutMs) || request.timeoutMs <= 0)) {
       throw new TrustedExecutionRefusal("codex boundary process timeout must be positive and finite");
@@ -1050,7 +1057,10 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
         launched.stderr?.destroy();
         return { code: -1, softTimedOut: true };
       }
-      if (permit.signal.aborted) throw new TrustedExecutionRefusal("boundary process deadline exceeded");
+      if (permit.signal.aborted) {
+        const message = "boundary process deadline exceeded";
+        throw capture ? new CaptureOperationRevokedError(message, capture.signal) : new TrustedExecutionRefusal(message);
+      }
       if (cancellation.signal.aborted) {
         launched.stdout?.destroy();
         launched.stderr?.destroy();

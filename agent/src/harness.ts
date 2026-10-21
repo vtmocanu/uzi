@@ -26,11 +26,11 @@ import type {
 // Process-local capture provenance. Only safety.captureOperation records it;
 // consumers cannot reconstruct it from error text, copied fields or JSON.
 const captureFailures = new WeakMap<object, Readonly<{
-  deadlineExpired: boolean; childCleanupFailed: boolean; externallyAborted: boolean;
+  deadlineExpired: boolean; childCleanupFailed: boolean; externallyAborted: boolean; actionRevoked?: true;
 }>>();
 
 export function recordCaptureFailure(error: object, failure: {
-  deadlineExpired: boolean; childCleanupFailed: boolean; externallyAborted: boolean;
+  deadlineExpired: boolean; childCleanupFailed: boolean; externallyAborted: boolean; actionRevoked?: true;
 }): void {
   captureFailures.set(error, Object.freeze({ ...failure }));
 }

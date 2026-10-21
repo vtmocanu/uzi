@@ -3,6 +3,7 @@ import { it } from "node:test";
 import { spawn } from "node:child_process";
 import { CodexBoundaryError } from "../src/codex/safety.js";
 import { captureFailureOf, EpochCleanupUnprovenError } from "../src/harness.js";
+import { GitBoundaryAbortError } from "../src/checkpoint-stop.js";
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { StaleClaimError } from "../src/runner.js";
 import { DiskParkSignal } from "../src/cache-cap.js";
@@ -26,13 +27,15 @@ it("epoch cleanup refusal keeps facade identity out of wire fields", () => {
 // Exercise the task's handlePausePark/runFreeCapture seams with real capture ownership.
 // Only the source action is replaced, so its primary failure is independent of cleanup.
 for (const mode of ["expired-marker", "sentinel-expiry", "sentinel-cleanup", "boundary", "refusal", "boundary-expiry",
-  "unrelated-expired", "deferral", "cancel", "stale", "stale-state", "shutdown", "disk", "disk-primary", "credential", "credential-state",
+  "unrelated-expired", "git-primary-expiry", "ordinary-factory-expiry", "deferral", "cancel", "cancel-only", "branded-external", "branded-both", "stale", "stale-state", "shutdown", "disk", "disk-primary", "credential", "credential-state",
   "shutdown-primary", "disk-primary-error", "credential-primary-error", "dedup"] as const) {
   it(`R2 pause capture preserves primary and newer outcome: ${mode}`, async t => {
     const deadline = manualDeadline("checkpoint");
     const external = new AbortController();
     const authority = new AbortController();
-    const sentinel = new Error("meaningful primary sentinel", { cause: new Error("primary cause") });
+    const sentinel = mode === "git-primary-expiry"
+      ? new GitBoundaryAbortError("independent Git boundary", new Error("primary cause"))
+      : new Error("meaningful primary sentinel", { cause: new Error("primary cause") });
     const ordinary = new CodexBoundaryError("action", [{ category: "tool", message: "unrelated boundary" }], sentinel);
     const deferred = new CodexBoundaryError("reconcile", [{ category: "authorization", message: "vault locked" }], sentinel, "vault_locked");
     const refusal = new TrustedExecutionRefusal("credential-free capture scope unavailable");
@@ -83,14 +86,27 @@ for (const mode of ["expired-marker", "sentinel-expiry", "sentinel-cleanup", "bo
       }
       if (mode === "boundary") throw ordinary;
       if (mode === "refusal") throw refusal;
-      deadline.fire();
+      if (mode === "git-primary-expiry" || mode === "ordinary-factory-expiry") {
+        // Exercise branchTip's real boundaryAbortError catch after a primary
+        // failure and a later, independent capture deadline.
+        t.mock.method(git as any, "runGitAsRunner", async () => {
+          try { throw sentinel; } finally { deadline.fire(); }
+        });
+        return git.branchTip(fx.originPath, "main");
+      }
+      if (mode === "branded-external" || mode === "branded-both") {
+        external.abort(newer);
+        if (mode === "branded-both") deadline.fire();
+        throw new GitBoundaryAbortError("capture revoked externally", undefined, (held as { signal: AbortSignal }).signal);
+      }
+      if (mode !== "cancel-only") deadline.fire();
       if (mode === "expired-marker") internal.assertHeldFreeCapture(flight, held);
       if (mode === "sentinel-expiry") throw sentinel;
       if (mode === "unrelated-expired") throw refusal;
       if (mode === "boundary-expiry") throw ordinary;
       if (mode === "deferral") throw deferred;
       if (mode === "shutdown" || mode === "shutdown-primary") internal.shutdownSignal.abort(newer);
-      else if (mode === "cancel") external.abort(newer);
+      else if (mode === "cancel" || mode === "cancel-only") external.abort(newer);
       else if (mode !== "disk" && mode !== "stale" && mode !== "credential" && mode !== "disk-primary") authority.abort(newer);
       if (mode === "stale" || mode === "credential" || mode === "disk-primary") throw newer;
       if (mode === "shutdown-primary" || mode === "disk-primary-error" || mode === "credential-primary-error") throw ordinary;
@@ -123,14 +139,26 @@ for (const mode of ["expired-marker", "sentinel-expiry", "sentinel-cleanup", "bo
         else if (mode === "disk" || mode === "disk-primary-error") assert.ok(error instanceof DiskParkSignal);
         else {
           assert.ok(error instanceof CodexBoundaryError);
-          if (mode === "cancel") assert.equal(captureFailureOf(error)?.externallyAborted, true);
+          if (mode === "cancel" || mode === "cancel-only" || mode === "branded-external" || mode === "branded-both") {
+            assert.equal(captureFailureOf(error)?.externallyAborted, true);
+            if (mode === "branded-external" || mode === "branded-both") {
+              assert.equal(captureFailureOf(error)?.actionRevoked, true);
+              assert.equal(captureFailureOf(error)?.deadlineExpired, mode === "branded-both");
+            }
+          }
           else {
-            assert.equal(error.actionError, mode === "unrelated-expired" ? refusal : mode === "boundary-expiry" ? ordinary
+            assert.equal(mode === "ordinary-factory-expiry" ? (error.actionError as Error).cause : error.actionError, mode === "unrelated-expired" ? refusal : mode === "boundary-expiry" ? ordinary
               : sentinel);
             if (mode === "sentinel-cleanup") assert.deepEqual(captureFailureOf(error), {
               deadlineExpired: false, childCleanupFailed: true, externallyAborted: false,
             });
             assert.equal(error.cause, error.actionError);
+            assert.equal(captureFailureOf(error)?.actionRevoked, undefined);
+            if (mode === "git-primary-expiry") assert.equal(error.actionError, sentinel);
+            if (mode === "ordinary-factory-expiry") {
+              assert.ok(error.actionError instanceof GitBoundaryAbortError);
+              assert.equal(error.actionError.cause, sentinel);
+            }
           }
           assert.ok(error.errors.length > 0, "cleanup/expiry evidence retained separately");
         }

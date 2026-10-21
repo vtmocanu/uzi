@@ -14242,7 +14242,7 @@ try {
     this.checkRecoveryInterruption();
     MaintenanceBudget.current()?.check();
     const scope = this.boundaryProcesses.getStore();
-    if (scope?.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE);
+    if (scope?.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE, undefined, scope.capture?.signal);
     if (scope?.softSignal?.aborted || (scope?.softDeadlineAt !== undefined && (scope.now ?? Date.now)() >= scope.softDeadlineAt)) {
       throw new CheckpointSoftDeadlineError();
     }
@@ -14270,11 +14270,16 @@ try {
   /** A hard permit abort is not evidence that a candidate contains scratch files. */
   private boundaryAbortError(cause: unknown): Error | undefined {
     const scope = this.boundaryProcesses.getStore();
+    // Capture identity must not be inferred from a later abort. Outside capture,
+    // preserve the existing hard-abort precedence over cooperative stops.
+    if (scope?.capture && (cause instanceof GitBoundaryAbortError || cause instanceof CheckpointSoftDeadlineError ||
+        cause instanceof TrustedExecutionRefusal)) return cause;
     if (scope?.signal.aborted) {
       const message = cause instanceof Error && cause.message === GIT_OUTPUT_ABORT_MESSAGE
         ? GIT_OUTPUT_ABORT_MESSAGE
         : "permit-held git operation aborted";
-      return new GitBoundaryAbortError(message, cause);
+      return new GitBoundaryAbortError(message, cause,
+        scope.capture?.signal.aborted && cause === scope.capture.signal.reason ? scope.capture.signal : undefined);
     }
     if (cause instanceof CheckpointSoftDeadlineError || cause instanceof TrustedExecutionRefusal) return cause;
     if (cause instanceof CheckpointChildStartupTimeoutError) {
@@ -14531,7 +14536,7 @@ try {
     }
     const cwd = options.cwd ?? (identity === "command" ? commandCwd(args) : "/");
     const executable = resolveBoundaryExecutable(command);
-    if (boundary.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE);
+    if (boundary.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE, undefined, boundary.capture?.signal);
     if (boundary.softSignal?.aborted || (boundary.softDeadlineAt !== undefined && (boundary.now ?? Date.now)() >= boundary.softDeadlineAt)) {
       throw new CheckpointSoftDeadlineError();
     }
@@ -14646,7 +14651,7 @@ try {
       throw this.boundaryAbortError(settled[2].reason) ?? settled[2].reason;
     }
     terminal = settled[2].value;
-    if (boundary.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE);
+    if (boundary.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE, undefined, boundary.capture?.signal);
     if (terminal.softTimedOut) throw new CheckpointSoftDeadlineError();
     if (settled[0].status === "rejected") throw this.boundaryAbortError(settled[0].reason) ?? settled[0].reason;
     if (settled[1].status === "rejected") throw this.boundaryAbortError(settled[1].reason) ?? settled[1].reason;
@@ -14807,7 +14812,7 @@ try {
     const recovery = this.recoveryOperation();
     recovery?.signal.throwIfAborted();
     if (boundary) {
-      if (boundary.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE);
+      if (boundary.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE, undefined, boundary.capture?.signal);
       if (boundary.softSignal?.aborted || (boundary.softDeadlineAt !== undefined && (boundary.now ?? Date.now)() >= boundary.softDeadlineAt)) {
         throw new CheckpointSoftDeadlineError();
       }
@@ -16504,7 +16509,7 @@ try {
       settled = true;
       removeAbortListener();
       rejectResult(signal?.aborted ? new Error(GIT_LOCK_WAIT_ABORT_MESSAGE) : scope?.signal.aborted
-        ? new GitBoundaryAbortError(GIT_LOCK_WAIT_ABORT_MESSAGE)
+        ? new GitBoundaryAbortError(GIT_LOCK_WAIT_ABORT_MESSAGE, undefined, boundary?.capture?.signal)
         : new CheckpointSoftDeadlineError());
     };
     if (scope || signal) {
