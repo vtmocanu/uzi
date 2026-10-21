@@ -151,7 +151,14 @@ rc=0; out=$(run) || rc=$?
 [ "$rc" -eq 0 ] || fail "requeue exhausted after running: want exit 0, got $rc: $out"
 case "$out" in *"status=recovery_wait"*"STOP=recovery_wait:worker_requeue_exhausted"*) ;; *) fail "transition stop missing: $out";; esac
 
-# 13. any other recovery_wait cause retries on its own: keep polling to ELAPSED
+# 12c. an explicit stop set naming recovery_wait still gets the cause-specific stop and guidance
+reset recovery_wait ok "" '[]'
+echo worker_requeue_exhausted > "$WORK/cause"
+rc=0; out=$(PATH="$WORK/bin:$PATH" bash "$SCRIPT" rid completed,failed,cancelled,recovery_wait 0 6 2>/dev/null) || rc=$?
+[ "$rc" -eq 0 ] || fail "explicit recovery_wait stop set: want exit 0, got $rc: $out"
+case "$out" in *"STOP=recovery_wait:worker_requeue_exhausted"*"owner decision"*) ;; *) fail "explicit stop set lost the cause-specific stop: $out";; esac
+
+# 13. any other recovery_wait cause keeps its existing behaviour: keep polling to ELAPSED
 reset recovery_wait ok "" '[]'
 echo provider_outage > "$WORK/cause"
 rc=0; out=$(run) || rc=$?

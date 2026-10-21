@@ -51,8 +51,9 @@
 # or a stale heartbeat, which is never acked).
 # Owner-decision park: `recovery_wait` with recovery_wait_cause `worker_requeue_exhausted` never
 # resumes on its own (the owner must Resume or Cancel), so it always stops the watch, whatever the
-# stop set: STOP=recovery_wait:worker_requeue_exhausted, RESULT=stop:recovery_wait, exit 0. Any
-# other recovery_wait cause retries on a timer and keeps polling unless the stop set names it.
+# stop set (also when the stop set names recovery_wait): STOP=recovery_wait:worker_requeue_exhausted,
+# RESULT=stop:recovery_wait, exit 0. Other recovery_wait causes keep their existing behaviour: they
+# keep polling unless the stop set names recovery_wait.
 # Exit codes: 0 stop-set state (not necessarily success), 3 coverage elapsed,
 # 4 needs_attention. The final RESULT line distinguishes these outcomes.
 set -u
@@ -123,6 +124,16 @@ while [ "$i" -lt "$MAX" ]; do
     printf '%s status=%s\n' "$(date +%H:%M:%S)" "$s"
     last="$s"
   fi
+  rj=""
+  if [ "$s" = recovery_wait ]; then
+    rj="$(uzi run get "$RID" --json 2>/dev/null)" || rj=""
+    if [ "$(printf '%s' "$rj" | jq -r '.recovery_wait_cause // ""' 2>/dev/null)" = worker_requeue_exhausted ]; then
+      printf 'STOP=recovery_wait:worker_requeue_exhausted\n'
+      printf 'NOTE owner decision: automatic worker recovery stopped; back up the work, then uzi run resume or cancel\n'
+      printf 'RESULT=stop:recovery_wait\n'
+      exit 0
+    fi
+  fi
   case ",$STOP," in
     *",$s,"*)
       # A revised-plan watch (min-plan-seq set) must not stop at the OLD gate:
@@ -146,16 +157,8 @@ while [ "$i" -lt "$MAX" ]; do
   case "$s" in
     ''|completed|failed|cancelled) attn=0 ;;
     *)
-      rj=""
-      if [ "$s" = recovery_wait ] || [ "$ATTN_POLLS" -gt 0 ]; then
+      if [ -z "$rj" ] && [ "$ATTN_POLLS" -gt 0 ]; then
         rj="$(uzi run get "$RID" --json 2>/dev/null)" || rj=""
-      fi
-      if [ "$s" = recovery_wait ] \
-         && [ "$(printf '%s' "$rj" | jq -r '.recovery_wait_cause // ""' 2>/dev/null)" = worker_requeue_exhausted ]; then
-        printf 'STOP=recovery_wait:worker_requeue_exhausted\n'
-        printf 'NOTE owner decision: automatic worker recovery stopped; back up the work, then uzi run resume or cancel\n'
-        printf 'RESULT=stop:recovery_wait\n'
-        exit 0
       fi
       if [ "$ATTN_POLLS" -gt 0 ] && attention_check "$s" "$rj"; then
         attn=$((attn + 1))

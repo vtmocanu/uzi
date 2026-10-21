@@ -184,9 +184,9 @@ its iteration budget on no-op turns and fails (#2657). Leave the question unansw
 immediately `uzi run pause RUN --now`. A run at `limit_wait` is parked on an Anthropic
 usage limit and resumes itself — keep waiting. `recovery_wait` with cause
 `worker_requeue_exhausted` never resumes itself: the poller always stops on it
-(`STOP=recovery_wait:worker_requeue_exhausted`, exit 0, whatever the stop set). Back up the
+(`STOP=recovery_wait:worker_requeue_exhausted`, exit 0, whatever the stop set, even one naming `recovery_wait`). Back up the
 work (*Recovering a failed run's work*), then `uzi run resume` or cancel; other
-`recovery_wait` causes retry on a timer. `uzi-lander` uses this same poller for its
+`recovery_wait` causes keep their existing polling behaviour. `uzi-lander` uses this same poller for its
 blind watch to terminal.
 
 **Watching for a REVISED plan (after `uzi run revise`) uses the plan-seq form.** The
