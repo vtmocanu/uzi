@@ -1794,6 +1794,10 @@ export function RunView() {
   const [repoWebUrl, setRepoWebUrl] = useState<string | null>(null);
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [actionErr, setActionErr] = useState("");
+  // Issue #3181: the server's refusal of a Resume on a settling token-switch hold, bound to the
+  // run that earned it. The panel shows it only while that run is still settling.
+  const [switchRefusal, setSwitchRefusal] = useState<{ runId: string; message: string } | null>(null);
+  useEffect(() => { setSwitchRefusal(null); }, [id]);
   const [busy, setBusy] = useState(false);
   const currentAction = useRef<{ runId: string } | null>(null);
   useEffect(() => {
@@ -2162,7 +2166,7 @@ export function RunView() {
             : parkKey === "provider_unavailable"
               ? "Provider unavailable. Automatic retries have stopped; the run waits for its owner."
             : parkKey === "credential_switch_settling"
-              ? "After a token switch, the worker is stopping this run's processes. Resume becomes available when it finishes. Cancel works now."
+              ? "After a token switch, the worker is finishing its own operations for this run. Resume becomes available when the worker finishes; if it is refused, try again shortly or Cancel."
             : parkKey === "credential_switch_unsettled"
               ? "Held after a token switch. Processes could not be proven stopped; work is kept on its worker. Resume to continue on the new token, or Cancel."
             : parkKey === "paused"
@@ -2352,8 +2356,8 @@ export function RunView() {
                 // plain Resume would only park it again.
                 run.hold_reason !== "credential_disabled" &&
                 run.hold_reason !== "provider_unavailable" &&
-                // Issue #3181: the token-switch holds offer Resume in their own panel, gated
-                // on the settling fence.
+                // Issue #3181: the token-switch holds offer Resume in their own panel, which
+                // shows the server's settling refusal inline.
                 credentialSwitchHold(run) === null &&
                 (canSteer ? (
                   <Button
@@ -2694,8 +2698,22 @@ export function RunView() {
         })}
       />
       <CredentialSwitchHoldPanel run={run} ownerProof={canSteer && run.id === id} busy={busy}
+        refusal={switchRefusal?.runId === run.id ? switchRefusal.message : ""}
         onResume={() => act(async (isCurrent) => {
-          await api.resumeRun(run.id);
+          const requestRunId = run.id;
+          setSwitchRefusal(null);
+          try {
+            await api.resumeRun(requestRunId);
+          } catch (e) {
+            // Issue #3181: the server refuses Resume on a settling hold (409) while the worker
+            // is live and finishing. Word it in the panel beside Resume, not the page banner,
+            // and refetch: the hold may have moved on to unsettled meanwhile.
+            if (!(e instanceof ApiError && e.status === 409)) throw e;
+            if (!isCurrent()) return;
+            setSwitchRefusal({ runId: requestRunId, message: errorMessage(e, "Resume refused") });
+            await refreshRun();
+            return;
+          }
           if (isCurrent()) await refreshRun();
         })}
         onCancel={() => cancelRun()}

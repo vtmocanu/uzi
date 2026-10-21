@@ -157,7 +157,7 @@ const PARK_LABELS = {
   provider_unavailable: "provider unavailable: owner hold",
   provider_outage: "waiting for provider",
   completion_blocked: "Completion blocked",
-  credential_switch_settling: "stopping processes: token switch",
+  credential_switch_settling: "settling: token switch",
   credential_switch_unsettled: "held: token switch",
 } as const;
 
@@ -593,10 +593,12 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
       return { kind: "badge", label: PARK_LABELS.provider_unavailable, tone: "warning", pulse: false,
         title: "Automatic provider retries have stopped. The run waits for its owner; open the run for Resume, Stop availability and Cancel." };
     // Issue #3181: the token-switch holds. Static warn like the other holds (the worker
-    // stopping processes is not run progress, so no pulse); labels agree with StatusPill.
+    // finishing its own operations is not run progress, so no pulse); labels agree with
+    // StatusPill. The settling title promises no completion: the server may lift its fence
+    // because the worker was lost, not because it finished.
     case "credential_switch_settling":
       return { kind: "badge", label: PARK_LABELS.credential_switch_settling, tone: "warning", pulse: false,
-        title: "After a token switch, the worker is still stopping this run's processes. Resume and another token switch become available when it finishes. Cancel works now." };
+        title: "After a token switch, the worker is finishing its own operations for this run. Resume becomes available when the worker finishes; if it is refused, try again shortly or Cancel." };
     case "credential_switch_unsettled":
       return { kind: "badge", label: PARK_LABELS.credential_switch_unsettled, tone: "warning", pulse: false,
         title: "Processes could not be proven stopped; work is kept on its worker. Open the run to Resume on the new token, or Cancel." };

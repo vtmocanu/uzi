@@ -14,6 +14,7 @@ import {
   SwitchTokenAction,
 } from "./RunCredentialOverride";
 import { api, type CredentialEpoch, type Run, type SecretMeta } from "../lib/api";
+import { ApiError } from "../lib/apiError";
 
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
@@ -315,15 +316,25 @@ describe("SwitchTokenAction — seeds an EXISTING pinned override via the self-f
   });
 });
 
-// Issue #3181: the token-switch holds. A settling hold's switch is refused server-side (409)
-// until the worker finishes stopping the run's processes, so the header action says when it
-// opens instead of offering a confirm; an unsettled hold's switch requeues the held run, so
-// it must not promise an interrupt of live work.
+// Issue #3181: the token-switch holds. On a settling hold the server is the authority: it
+// refuses a switch (409) while the worker is live and finishing, and lifts that fence on a
+// lost worker with hold_reason unchanged, so the switch stays offered and the refusal shows
+// inline as an alert. An unsettled hold's switch requeues the held run, so it must not promise
+// an interrupt of live work.
 describe("SwitchTokenAction — credential-switch holds", () => {
-  it("settling: no trigger, says when Switch token opens", () => {
-    render(<SwitchTokenAction run={run({ status: "paused", hold_reason: "credential_switch_settling" })} canSteer tokens={[token()]} />);
-    expect(screen.queryByRole("button", { name: "Switch token" })).toBeNull();
-    expect(screen.getByText(/Switch token becomes available when the worker finishes stopping/)).toBeTruthy();
+  const REFUSAL = "the worker is still stopping this run's processes; Resume becomes available when it finishes, or Cancel the run";
+
+  it("settling: the switch stays offered with a note, and a 409 refusal is announced inline", async () => {
+    mockApi.setRunCredential.mockRejectedValue(new ApiError(409, REFUSAL));
+    const onSwitched = vi.fn();
+    render(<SwitchTokenAction run={run({ status: "paused", hold_reason: "credential_switch_settling" })} canSteer tokens={[token()]} onSwitched={onSwitched} />);
+    fireEvent.click(screen.getByRole("button", { name: "Switch token" }));
+    expect(screen.getByText(/Switching becomes available when the worker finishes its own operations for this run; if it is refused, try again shortly or Cancel\./)).toBeTruthy();
+    // Nothing is running to interrupt from the owner's point of view; no interrupt promise.
+    expect(screen.queryByText(/Switching now interrupts the run/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Switch to this token" }));
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toBe(REFUSAL));
+    expect(onSwitched).not.toHaveBeenCalled();
   });
 
   it("unsettled: the switch resumes the held run and promises no interrupt", () => {

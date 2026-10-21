@@ -731,8 +731,9 @@ export const runsApi = {
     // masking a stray call with a false success.
     if (run.harness === "codex")
       throw new ApiError(422, "credential override unsupported on codex harness");
-    // Issue #3181: the server refuses a switch while a settling hold's worker is still
-    // stopping the run's processes; an unsettled hold takes the override and requeues.
+    // Issue #3181: the server refuses a switch while a settling hold's worker is live and
+    // finishing (the case this mock models; the server also lifts that fence when the worker
+    // is lost); an unsettled hold takes the override and requeues.
     const switchHold = credentialSwitchHold(run);
     if (switchHold === "settling") throw new ApiError(409, CREDENTIAL_SWITCH_SETTLING_REFUSAL);
     credentialSwitched.add(id);

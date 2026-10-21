@@ -35,3 +35,16 @@ it("unsettled Resume requeues and clears the hold", async () => {
   const { run } = await settle(mockApi.resumeRun("run-cred-switch-unsettled"));
   expect(run).toMatchObject({ status: "queued", hold_reason: null });
 });
+
+it("unsettled set-token requeues on the chosen token, clears the hold and keeps the override", async () => {
+  // A fresh store: the Resume case above already requeued this fixture in the shared one.
+  vi.resetModules();
+  const { mockApi } = await import("./mockApi");
+  vi.useFakeTimers();
+  const { run: before } = await settle(mockApi.getRun("run-cred-switch-unsettled"));
+  expect(before).toMatchObject({ status: "paused", hold_reason: "credential_switch_unsettled" });
+  const { run } = await settle(mockApi.setRunCredential("run-cred-switch-unsettled", { mode: "pinned", secret_id: "sec-default" }));
+  expect(run).toMatchObject({ status: "queued", hold_reason: null, credential_override: { mode: "pinned", label: "default" } });
+  const { run: read } = await settle(mockApi.getRun("run-cred-switch-unsettled"));
+  expect(read).toMatchObject({ status: "queued", hold_reason: null, credential_override: { mode: "pinned", label: "default" } });
+});

@@ -543,7 +543,7 @@ export const RUN_STATUS_TONES: Record<
   provider_unavailable: { tone: "warning" },
   provider_outage: { tone: "warning" },
   // Issue #3181: token-switch holds (raw "paused", overlaid from hold_reason). Static warning:
-  // the owner's decision is pending (unsettled) or only Cancel is open (settling).
+  // the owner's decision is pending (unsettled) or waits on the worker finishing (settling).
   credential_switch_settling: { tone: "warning" },
   credential_switch_unsettled: { tone: "warning" },
   completed: { tone: "ok" },
@@ -601,7 +601,7 @@ const RUN_STATUS_LABELS: Record<string, string> = {
   provider_unavailable: "provider unavailable: owner hold",
   provider_outage: "waiting for provider",
   // Issue #3181: kept in step with runBadge's parked wording by the label-agreement test.
-  credential_switch_settling: "stopping processes: token switch",
+  credential_switch_settling: "settling: token switch",
   credential_switch_unsettled: "held: token switch",
 };
 

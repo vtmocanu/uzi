@@ -167,7 +167,7 @@ describe("StatusPill", () => {
     {
       name: "token switch settling",
       run: { status: "paused", hold_reason: "credential_switch_settling" },
-      label: "stopping processes: token switch", tone: "text-warn", pulse: false,
+      label: "settling: token switch", tone: "text-warn", pulse: false,
     },
     {
       name: "token switch unsettled",

@@ -177,16 +177,12 @@ export function SwitchTokenAction({
     return <span className="text-xs text-muted">Only the run&rsquo;s owner can switch its token.</span>;
   }
 
-  // Issue #3181: while the worker is still stopping a settling hold's processes the server
-  // refuses another switch (409), so say when it opens rather than offer a confirm that fails.
+  // Issue #3181: on a settling hold the server is the authority. It refuses another switch
+  // (409) while the worker is live and finishing its own operations for the run, and lifts
+  // that fence when the worker is lost, goes stale or re-registers, with hold_reason
+  // unchanged. Nothing here can tell the two apart, so the switch stays offered with a note,
+  // and a refusal shows as the inline alert below with the server's text.
   const switchHold = credentialSwitchHold(run);
-  if (switchHold === "settling") {
-    return (
-      <span className="text-xs text-muted">
-        Switch token becomes available when the worker finishes stopping this run&rsquo;s processes.
-      </span>
-    );
-  }
 
   // A held or running run has a live claim, so switching interrupts it (losing at most
   // the in-flight step); a queued run has no claim yet, so the choice just applies to
@@ -242,6 +238,11 @@ export function SwitchTokenAction({
           />
           {switchHold === "unsettled" && (
             <p className="text-[11px] text-muted">Switching resumes this held run on the chosen token.</p>
+          )}
+          {switchHold === "settling" && (
+            <p className="text-[11px] text-muted">
+              Switching becomes available when the worker finishes its own operations for this run; if it is refused, try again shortly or Cancel.
+            </p>
           )}
           {willInterrupt && (
             <p className="text-[11px] text-warn">

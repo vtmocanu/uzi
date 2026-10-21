@@ -2,9 +2,10 @@
 //
 // Issue #3181: the run view for the two token-switch holds. Each renders its own panel (not
 // the owner-pause "Paused" card), the header pill names the hold, the always-mounted park
-// region announces it, and the actions match what the server accepts: settling offers Cancel
-// with Resume disabled and explained (the server 409s Resume), unsettled offers Resume and
-// Cancel. Both are owner decisions, gated on confirmed ownership like the provider hold.
+// region announces it, and the actions match what the server accepts. Settling keeps Resume
+// enabled (the server lifts its fence on a lost worker with hold_reason unchanged) and shows
+// the server's 409 refusal inline as an alert; unsettled offers Resume and Cancel. Both are
+// owner decisions, gated on confirmed ownership like the provider hold.
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
@@ -12,6 +13,7 @@ import { RunView } from "./RunView";
 import { useRunStream } from "../lib/useRunStream";
 import { api, type Run } from "../lib/api";
 import { mockRuns } from "../mocks/data/runs";
+import { ApiError } from "../lib/apiError";
 
 vi.mock("../lib/useRunStream", () => ({ useRunStream: vi.fn() }));
 vi.mock("../lib/api", async (original) => {
@@ -61,27 +63,77 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 
-it("settling: its own panel, Cancel works, Resume disabled with the reason as its description", async () => {
+const REFUSAL = "the worker is still stopping this run's processes; Resume becomes available when it finishes, or Cancel the run";
+const WHY = "Resume becomes available when the worker finishes; if it is refused, try again shortly or Cancel.";
+
+it("settling: its own panel, Resume enabled with the server-authority note, Cancel works", async () => {
   mount(fixture("run-cred-switch-settling"));
   const p = panel();
-  expect(within(p).getByRole("heading", { name: "Stopping processes after a token switch" })).toBeTruthy();
-  expect(within(p).getByText(/the worker is stopping them now/)).toBeTruthy();
+  expect(within(p).getByRole("heading", { name: "Settling after a token switch" })).toBeTruthy();
+  expect(within(p).getByText(/The worker is finishing its own operations for this run\./)).toBeTruthy();
+  // No copy promises the processes are being stopped or that the worker will finish.
+  expect(p.textContent).not.toMatch(/stopping them now|is stopping/);
   // The fixture's override names the token Resume will continue on.
   expect(within(p).getByText(/Resume continues it on “console-key”/)).toBeTruthy();
   const resume = within(p).getByRole("button", { name: /Resume/ }) as HTMLButtonElement;
-  expect(resume.disabled).toBe(true);
+  expect(resume.disabled).toBe(false);
   const why = document.getElementById(resume.getAttribute("aria-describedby") ?? "");
-  expect(why?.textContent).toBe("Resume and Switch token become available when the worker finishes. Cancel works now.");
+  expect(why?.textContent).toBe(WHY);
   // Not the owner-pause card, and no header Resume either.
   expect(screen.queryByText("Nothing runs and nothing is spent while it waits.")).toBeNull();
   expect(screen.getAllByRole("button", { name: /Resume/ })).toEqual([resume]);
   // The header pill names the hold.
-  expect(screen.getByText("stopping processes: token switch")).toBeTruthy();
+  expect(screen.getByText("settling: token switch")).toBeTruthy();
   const cancel = within(p).getByRole("button", { name: "Cancel run" }) as HTMLButtonElement;
   expect(cancel.disabled).toBe(false);
   await act(async () => { fireEvent.click(cancel); });
   expect(submit).toHaveBeenCalledWith("cancel", "", undefined, undefined, false);
   expect(api.resumeRun).not.toHaveBeenCalled();
+});
+
+it("settling: a refused Resume shows the server's 409 inline as an alert and refetches", async () => {
+  vi.mocked(api.resumeRun).mockRejectedValue(new ApiError(409, REFUSAL));
+  mount(fixture("run-cred-switch-settling"));
+  const resume = within(panel()).getByRole("button", { name: /Resume/ });
+  await act(async () => { fireEvent.click(resume); });
+  expect(api.resumeRun).toHaveBeenCalledWith("A");
+  expect(refreshRun).toHaveBeenCalled();
+  // Announced (role=alert) inside the panel, beside the button it answers.
+  const alerts = within(panel()).getAllByRole("alert");
+  expect(alerts.map((a) => a.textContent)).toEqual([`Resume refused: ${REFUSAL}`]);
+  const ids = (resume.getAttribute("aria-describedby") ?? "").split(" ");
+  expect(ids.map((i) => document.getElementById(i)?.textContent)).toEqual([WHY, `Resume refused: ${REFUSAL}`]);
+  // Not duplicated on the page banner.
+  expect(screen.getAllByRole("alert")).toEqual(alerts);
+  // A retry clears it first, then it re-mounts so it is announced again.
+  vi.mocked(api.resumeRun).mockResolvedValueOnce({ run: mockRuns[0] });
+  await act(async () => { fireEvent.click(resume); });
+  expect(within(panel()).queryAllByRole("alert")).toHaveLength(0);
+});
+
+it("settling: a non-409 Resume failure stays on the page banner (control)", async () => {
+  vi.mocked(api.resumeRun).mockRejectedValue(new ApiError(500, "boom"));
+  mount(fixture("run-cred-switch-settling"));
+  await act(async () => { fireEvent.click(within(panel()).getByRole("button", { name: /Resume/ })); });
+  expect(within(panel()).queryAllByRole("alert")).toHaveLength(0);
+  expect(screen.getByRole("alert").textContent).toBe("boom");
+});
+
+it("unsettled never shows a settling refusal, even one left from the same run", async () => {
+  vi.mocked(api.resumeRun).mockRejectedValue(new ApiError(409, REFUSAL));
+  const view = mount(fixture("run-cred-switch-settling"));
+  await act(async () => { fireEvent.click(within(panel()).getByRole("button", { name: /Resume/ })); });
+  expect(within(panel()).getAllByRole("alert")).toHaveLength(1);
+  const unsettled = fixture("run-cred-switch-unsettled");
+  vi.mocked(useRunStream).mockImplementation(() => ({
+    run: unsettled, messages: [], connected: true, error: "", submit, refreshRun,
+    inputs: [], refreshInputs: vi.fn(), canSteer: true, confirmedOwner: owner, pauseOriginReady: true,
+  } as unknown as ReturnType<typeof useRunStream>));
+  view.rerender(<MemoryRouter initialEntries={["/runs/A"]}>
+    <Routes><Route path="/runs/:id" element={<RunView />} /></Routes>
+  </MemoryRouter>);
+  expect(within(panel()).getByRole("heading", { name: "Held: token switch" })).toBeTruthy();
+  expect(within(panel()).queryAllByRole("alert")).toHaveLength(0);
 });
 
 it("unsettled: the brief's copy, Resume requeues on the new token", async () => {
@@ -91,7 +143,9 @@ it("unsettled: the brief's copy, Resume requeues on the new token", async () => 
   expect(within(p).getByText(
     "Processes could not be proven stopped; work is kept on its worker. Resume to continue on the new token, or Cancel.",
   )).toBeTruthy();
-  expect(within(p).getByText(/Resume requeues this run on “console-key”/)).toBeTruthy();
+  expect(within(p).getByText("Resume requeues this run on “console-key”. No new work starts while it is held.")).toBeTruthy();
+  // The acknowledgement does not prove the processes stopped, so nothing claims they are idle.
+  expect(p.textContent).not.toMatch(/Nothing runs|nothing is spent/);
   expect(screen.getByText("held: token switch")).toBeTruthy();
   expect(screen.queryByText("Nothing runs and nothing is spent while it waits.")).toBeNull();
   const resumes = screen.getAllByRole("button", { name: /Resume/ });
@@ -104,7 +158,7 @@ it("unsettled: the brief's copy, Resume requeues on the new token", async () => 
 });
 
 it.each([
-  ["run-cred-switch-settling", /stopping this run's processes\. Resume becomes available when it finishes\. Cancel works now\./],
+  ["run-cred-switch-settling", /finishing its own operations for this run\. Resume becomes available when the worker finishes; if it is refused, try again shortly or Cancel\./],
   ["run-cred-switch-unsettled", /Held after a token switch\. Processes could not be proven stopped/],
 ] as const)("%s is announced by the persistent park region", (id, text) => {
   mount(fixture(id));
@@ -117,7 +171,7 @@ it.each(["run-cred-switch-settling", "run-cred-switch-unsettled"] as const)(
     mount(fixture(id));
     const p = panel();
     expect(within(p).queryAllByRole("button")).toHaveLength(0);
-    expect(within(p).getByText(/Only the run owner can/)).toBeTruthy();
+    expect(within(p).getByText("Only the run owner can resume or cancel this hold.")).toBeTruthy();
     expect(screen.queryAllByRole("button", { name: /Resume|Cancel run|Stop run/ })).toHaveLength(0);
   },
 );

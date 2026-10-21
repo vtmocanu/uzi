@@ -2069,7 +2069,8 @@ mockRuns.push(
 );
 // Issue #3181: the token-switch holds. The owner switched each run to console-key; its
 // processes could not be proven stopped. Open /runs/run-cred-switch-settling (the worker is
-// still stopping them: Resume and Switch token 409, Cancel works) or
+// still finishing its own operations for the run, the live-worker case: Resume and Switch token
+// are offered and the mock refuses both with the server's 409 text, Cancel works) or
 // /runs/run-cred-switch-unsettled (held for the owner: Resume requeues on console-key).
 for (const [id, hold] of [
   ["run-cred-switch-settling", "credential_switch_settling"],
