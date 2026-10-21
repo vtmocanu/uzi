@@ -77,7 +77,12 @@ receive bounded automatic revisions. Exhaustion, blockers and check failures
 normally park for a human decision even with auto-approve on. A Codex lead on
 a worker without `cross_check_codex_lead_v1` parks for a human too.
 Irrecoverable delivery losses fail the run; see
-[Cross-check](./cross-check.md#terminal-delivery-failures). The plan is
+[Cross-check](./cross-check.md#terminal-delivery-failures). A semantic run
+(dormant until #1231; production runs are not enrolled) also needs complete
+source coverage and no maintainer criteria, or an auto-approved schedule run
+parks for a human instead; see
+[Autopilot](./autopilot.md#semantic-runs-park-instead-of-auto-approving-dormant).
+The plan is
 recorded either way, and a human still merges the resulting MR; the
 [main-branch guardrails](../ARCHITECTURE.md#guardrail-layers-the-primary-directive)
 apply independently of schedule approval.
@@ -234,6 +239,12 @@ time, the same "generic base + owner overlay" split the issue/sweep targets use.
 A **sweep default** likewise offers owner guidance as an **overlay**: its baked
 guidance stays catalog-owned (shown read-only and auto-tracking catalog updates)
 and your overlay is composed onto it at fire time, under a single guidance header.
+
+Guidance affects one dormant detector. On a semantic run (not enrolled in
+production until #1231), source-drift observations compare the current forge
+issue with the frozen issue text; a scheduled run whose frozen text was composed
+with guidance therefore shows **changed**. Drift only displays and never holds the
+run; see [Completion holds](./run-completion-hold.md#source-drift-is-a-detector-only).
 
 ## Proposal output: MR or issues
 

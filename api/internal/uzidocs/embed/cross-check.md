@@ -211,6 +211,43 @@ link empty. Run the Down only with the new api stopped. With ephemeral workers
 off, the settings toggle warns when no online worker can run the checker,
 including when none advertises `cross_check_codex_lead_v1`.
 
+## Semantic contract profile (dormant)
+
+**Dormant.** Production enrollment is off until #1231, no production code creates a
+semantic run and only tests inject the path. A real run uses the *structural*
+profile described everywhere else on this page.
+
+| Profile | Behavior |
+|---|---|
+| Structural (legacy, today) | The frozen milestone checklist and exact-head permit. No source-coverage review: zero coverage model calls. |
+| Semantic (dormant) | Adds server-issued criterion IDs of kind `worker` or `maintainer`, and an independent coverage review that compares the issue and linked PRD with the proposed plan. |
+
+The coverage review is a bounded, tool-less model turn at the exact approval
+decision point, run once per candidate that is about to proceed: after a
+required Plan cross-check APPROVE and before auto-approval, or when the
+candidate is shown at a human gate. Automatic checker REVISE rounds consume no
+coverage review. Per verdict-bearing review there are at most two invocations
+sharing 5 minutes and 40,000 tokens, and per run at most three reviews and 15
+minutes and 120,000 tokens, independent of the checker's allowance. A changed
+candidate, source or criteria set invalidates the verdict and any checker
+approval bound to the old plan.
+
+A semantic plan is checked under a distinct candidate digest (`semantic_v1`).
+The plan-checker child needs a worker advertising `cross_check_semantic_plan_v1`
+(see [Worker versions and upgrades](./worker-upgrades.md#semantic-completion-capabilities-dormant)); with none, the check takes the existing deadline-to-human
+path and never falls back to the structural digest. A plan you revise at the gate
+triggers no new cross-family checker pass, but that revised candidate gets its
+own coverage report within the same non-resetting budgets. When coverage is
+missing, uncertain or unavailable an autopilot run parks at the gate instead of
+auto-approving; see [Autopilot](./autopilot.md#semantic-runs-park-instead-of-auto-approving-dormant).
+Design record: [ADR-2149 amendment](../adr/2149-cross-check.md#1230-coverage-park-and-semantic-digest-amendment-2026-10-20).
+
+### Coverage transport limitation
+
+Codex currently lacks an enforceable token cap. Claude's output cap alone does not prove a conservative full-call bound. Complete large sources can exceed the 40,000-token allowance. Unsupported or unbounded transports and inadmissibly large inputs yield unavailable without a model call. #1231 must establish enforceable bounds before activation.
+
+See [ADR-1225](../adr/1225-structural-completion-interlock-invariants.md#coverage-transport-limitation).
+
 ## Recovery before a human gate
 
 A reclaimed lead can start a fresh round within the same budget when

@@ -913,10 +913,11 @@ in [ADR-1225](../adr/1225-structural-completion-interlock-invariants.md#addendum
   reset can replace the frozen contract but cannot clear stored intent.
 - Excluded MR-rework/branch-adopting CI-fix lanes and Forgejo/Gitea branch-push
   closing are recorded together as finding
-  #3b56e6e5-4352-4694-ae1c-4999d5719e9c, not a forge issue. #1230 D4/#1231
-  remain open; #3068 provider-policy parking is planned. No semantic
-  activation, plan preauthorization or completed live deployment acceptance
-  is claimed.
+  #3b56e6e5-4352-4694-ae1c-4999d5719e9c, not a forge issue. #1230 D4 is
+  implemented but dormant (production off until #1231; see Feature #1226
+  below); #1231 activation and #3068 provider-policy parking are planned.
+  No semantic activation or completed live deployment acceptance is claimed.
+  (AI-synced 2026-10-20)
 
 ## Feature #1226 — Structural completion interlock
 
@@ -926,7 +927,8 @@ Tracked as GitHub issue vtmocanu/uzi#1226 (parent epic #1225); PRD at `prds/done
 - (AI-synced 2026-09-25) The structural completion interlock applies by default to new, unseeded issue runs on both Claude and Codex. A Codex interlocked run needs a worker advertising `codex_completion_interlock_v1` in addition to the shared completion protocol; unmet milestones return to the same Codex thread before a recoverable hold. [AI-synced, #1226]
 - (AI-synced 2026-09-13) That explicit later decision is delivered by #1227 as three bounded, revisioned, owner-only decisions — continue, partial (reduce scope by exact milestone ids → a `scope_reduced` delivery that never closes the issue) and accept (waive exact named criteria with a required reason, named in the closing PR); each creates a new contract revision and invalidates every prior permit, and the lead has no route to the decision authority. PRD at `prds/done/1227-completion-owner-decisions.md`. [AI-synced, #1227]
 - (AI-synced 2026-10-04) An owner `scope N` / `stop` directive authorizes a count-capped slice of the immutable frozen milestone list through an explicit capped permit: a `scope_capped` delivery never closes the issue; reaching the full frozen total remains a full delivery eligible to close the issue. [AI-synced, #2080]
-- **Planned, not shipped (#1230/#1231):** semantic completion is default-on for new eligible issue runs on both harnesses, with an instance-admin new-run kill-switch and frozen bounded model/cost controls. Exact approval-point source coverage and exact-final-head audit precede publication; missing compatible capacity queues rather than downgrades. Existing run contracts remain unchanged. Human-authorized pending maintainer acceptance stays explicitly unverified, permits non-closing delivery without a redundant later decision, and never waives failed worker checks through auto-approval or prose. (AI-synced 2026-10-17)
+- (AI-synced 2026-10-20) **Built dormant, production off until #1231 (#1230):** a semantic contract profile (server-issued criterion IDs of kind worker or maintainer, an independent plan-coverage review at the exact approval decision point) and its autopilot fallback exist but no production code enrolls a run or writes a semantic planning record, so every real run stays structural or legacy with zero coverage calls. On a semantic run, autopilot auto-approves only with complete server-reported coverage, the current checker APPROVE when Plan cross-check is required, and no maintainer criteria; otherwise the run parks in `awaiting_approval` with a `semantic_park` reason and never auto-approves later in that execution. Human-authorized maintainer criteria stay explicitly unverified, publish non-closing without a redundant later decision, and are never satisfied by auto-approval, prose or checkboxes. Source drift is displayed as a detector only. Live coverage review is unavailable: Codex lacks an enforceable token cap and Claude's output cap alone does not bound a full call, so #1231 must establish enforceable bounds before activation. [AI-synced, #1230]
+- **Planned, not shipped (#1231):** semantic completion is default-on for new eligible issue runs on both harnesses, with an instance-admin new-run kill-switch and frozen bounded model/cost controls. Enrollment freezes inside the run-creation transaction before the first claim. Exact approval-point source coverage and exact-final-head audit precede publication; missing compatible capacity queues rather than downgrades. Existing run contracts remain unchanged. (AI-synced 2026-10-20)
 - **Planned, not shipped (#1231):** if the shared completion-policy settings snapshot is unreadable and uncached, new unseeded issue creation refuses retriably instead of taking the former cold-read legacy fallback. Valid cached values cover both rollout keys; seeded/non-issue paths remain unchanged. Refusal creates no run and must not silently lose a scheduled fire. (AI-synced 2026-10-17)
 
 ## Feature #1265 — RC-first release train
