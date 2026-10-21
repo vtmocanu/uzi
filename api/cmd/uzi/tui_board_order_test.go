@@ -77,7 +77,7 @@ func TestBandOrderDoneHistory(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			before := slices.Clone(tc.runs)
-			got := bandOrder(tc.runs)
+			got := bandOrder(tc.runs, false)
 			ids := make([]string, len(got))
 			for i, r := range got {
 				ids[i] = r.ID
@@ -131,7 +131,7 @@ func TestBoardDoneAgeMatchesFinishOrder(t *testing.T) {
 					// A later metadata update must not override a recorded finish.
 					runs[0].UpdatedAt = newer.Add(time.Hour)
 				}
-				ordered := bandOrder(runs)
+				ordered := bandOrder(runs, false)
 				if ordered[0].ID != "newfinish-2" {
 					t.Fatalf("newest finish must sort first: %v", ordered)
 				}

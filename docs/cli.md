@@ -2027,6 +2027,7 @@ W            open the run's worker (run detail; lowercase w still reworks)
 /            filter the board or workers list
 a            toggle shared own/factory scope (board or workers; admin token required)
 h            hide finished runs — completed/failed/cancelled, keeps active + needs-you (board only; no-op on the admin board)
+p            order ON THE FLOOR highest progress first; press again for the default order (board)
 r            refresh
 v            open/close the review overlay (detail)
 f            start a follow-up (detail, owner only)
