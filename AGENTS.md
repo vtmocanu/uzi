@@ -68,8 +68,6 @@ cd web && npx vitest run src/pages/Foo.test.tsx                                 
 cd agent && env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null node --import tsx --test --test-timeout=120000 test/worker.test.ts   # agent: keep the timeout flag
 ```
 
-- **Repo-creating tests do not read host git config.** The Taskfile test commands that create repos, the single-test forms above and the repo-creating fixture scripts set `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null`: on macOS a global `core.fsmonitor=true` leaves a detached daemon per fixture repo. A new test command or fixture script that creates a repo carries the same pair; `task test:hermetic-git-config` checks the listed wiring, not every entrypoint.
-
 ### Lint ratchet
 
 - **The Go ratchet lives in `.golangci.yml`** (`issues: {new-from-merge-base: origin/main, whole-files: true}`), not on `lint:api`'s command line, so Task echoes only the resolved `../scripts/golangci-lint.sh <pinned-version> run ./...` command. **Read `.golangci.yml`, not the gate's output.** `GOLANGCI_LINT_VERSION` is a static, quoted Task variable so Renovate has one version field and the rendered echo still shows the pin. Dynamic or unquoted variables remain banned by `Taskfile.yml`'s header; a CI-only ratchet flag would make local and CI disagree about what a finding is.

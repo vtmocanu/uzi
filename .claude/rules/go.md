@@ -28,6 +28,8 @@ cd api && env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null go test ./
 cd api && ../scripts/sqlc.sh v1.31.1 generate
 ```
 
+- **Repo-creating tests do not read host git config.** Taskfile test commands that create repos, the single-test forms and repo-creating fixture scripts set `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null`: on macOS a global `core.fsmonitor=true` leaves a detached daemon per fixture repo. New ones carry the pair; `task test:hermetic-git-config` checks the listed wiring, not every entrypoint.
+
 ## `-count=1` and the test cache
 
 - Keep `-count=1` on both Go gates and on CI's `test:api` / `test:controller`. Without it a green `go test ./...` can mean the suite was cache-served and never ran.

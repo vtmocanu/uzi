@@ -143,6 +143,7 @@ k8s deploy is GitOps via ArgoCD — see `deploy/` (the chart plus the `deploy/RE
 
 ## Gate scope and probes
 
+- Repo-creating fixture scripts export `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null` (`.claude/rules/go.md`).
 - A new script is invisible to `lint:shell` until `git add`: shellcheck runs over tracked files only (20 tracked scripts before staging, 21 after; measured 2026-08-04). Stage first, then trust the gate.
 - A probe that returns the same answer under both hypotheses has not tested anything. The discriminating probe is a different input, not a more careful reading of the same one (`a{3}` against `aaa` *and* against the literal `a{3}`). Ask what result would have refuted you before recording a measurement as a fact.
 - **Worker egress is tier-dependent, so an egress probe that does not name the worker tier tests nothing.** Before concluding anything about egress enforcement, run `uzi admin workers` and read the worker's `docker:` flag (true = docker tier = broad egress by design), then re-measure on a standard-tier worker. A PRD's M0 must state which tier every measurement came from (#123 §1).
