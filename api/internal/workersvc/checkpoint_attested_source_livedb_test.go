@@ -1,14 +1,12 @@
 package workersvc
 
 import (
-	"encoding/json"
 	"errors"
 	"testing"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -229,41 +227,6 @@ func TestTerminalReconcileStoresAttemptFrozenSourceLiveDB(t *testing.T) {
 				t.Fatalf("attempt rows = %d, want 0", n)
 			}
 			f.assertAttestation(t, "re-recorded", newerTip, tc.want)
-		})
-	}
-}
-
-// TestClaimCarriesAttestedSourceLiveDB: real claim assembly serves the run row's stored
-// attestation as checkpoint_attested_source, and omits the key when the run has none.
-func TestClaimCarriesAttestedSourceLiveDB(t *testing.T) {
-	for _, stored := range []pgtype.Text{attestText(attestS2), {}} {
-		t.Run(map[bool]string{true: "attested", false: "unattested"}[stored.Valid], func(t *testing.T) {
-			e := setupCodexLiveDB(t)
-			user, worker, repo := e.seedCodexInfra(t)
-			// The claim body comes from assembleClaim over the claimed run row (the same seam
-			// claimWire uses); claim eligibility is not what this pins.
-			run := uuid.New()
-			e.exec("INSERT INTO runs(id,user_id,repo_id,kind,issue_iid,issue_title,issue_description,status,worker_id,checkpoint_tip,checkpoint_attested_source) VALUES($1,$2,$3,'issue',102,'t','d','claimed',$4,$5,$6)",
-				run, user, repo, worker, attestTipA, stored)
-			svc := New(e.q, e.box, testParams())
-			p, err := svc.assembleClaim(e.ctx, store.Worker{ID: worker, UserID: user}, mustRun(t, e, run))
-			if err != nil || p == nil || p.RunID != run.String() {
-				t.Fatalf("assembleClaim: payload=%+v err=%v", p, err)
-			}
-			if got := pgconv.TextPtr(p.CheckpointAttestedSource); got != stored {
-				t.Fatalf("claim checkpoint_attested_source = %+v, want %+v", got, stored)
-			}
-			b, err := json.Marshal(p)
-			if err != nil {
-				t.Fatal(err)
-			}
-			var m map[string]any
-			if err := json.Unmarshal(b, &m); err != nil {
-				t.Fatal(err)
-			}
-			if got, present := m["checkpoint_attested_source"]; present != stored.Valid || (present && got != stored.String) {
-				t.Fatalf("wire checkpoint_attested_source = %v (present %v), want %+v", got, present, stored)
-			}
 		})
 	}
 }

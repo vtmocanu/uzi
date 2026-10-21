@@ -10863,6 +10863,9 @@ export class RunRunner {
     // the unwrapped effective base) exactly against the planned commit or this run's attested
     // source, and checks the materialized tree. Warn-only runs keep the equality warning above.
     const requireBase = claim.require_base_match === true && !!claim.planned_base_commit;
+    if (requireBase && !barePath) {
+      throw new BaseProofError("this clone has no worker bare to verify the planned commit in; --require-base cannot be verified");
+    }
     if (requireBase && barePath) {
       const identity = runnerClone.adoptedContentSource ?? runnerClone.adoptedSource;
       evaluateRequiredBase({
@@ -19421,7 +19424,8 @@ export class RunRunner {
               blocker = "prerequisites_unavailable"; throw finalize;
             }
             // issue #3194: the wrapper -> source mapping comes only from this exact authenticated
-            // record of this run and generation; a mismatch records no source (fail closed).
+            // record of this run and generation. On a mismatch no captured source is passed, so the wrapper
+            // records itself as its source, which is never attested: the guard holds it (fail closed).
             capturedSource = local!.runId === claim.run_id && local!.generation === options.context.generation &&
               local!.inventoryCurrentSha === tip ? local!.inventoryCurrentSha : undefined;
             tip = local!.sourceSha;

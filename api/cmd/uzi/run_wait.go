@@ -239,7 +239,7 @@ func newRunWaitCmd(env Env, gf *globalFlags) *cobra.Command {
 			"With no `--until`, it stops on any state that needs you or ends the run: " +
 			strings.Join(defaultWaitStates, ", ") + ", or worker recovery exhausted / worker memory pressure (recovery_wait; owner Resume or Cancel), " +
 			"or a --require-base run held because its kept work is not attested against the planned base (paused, " +
-			"base_attestation_missing; recover it with `uzi run recovery` / `uzi run export`). " +
+			"base_attestation_missing; recover its kept work with the run recovery or run export commands). " +
 			"Explicit --until uses only the named statuses. Ordinary transient recovery_wait keeps polling. It does NOT stop " +
 			"on queued/claimed/running (still working), limit_wait (auto-resumes), pool_wait " +
 			"(an auto run held on an empty token pool; resumes when a token is pooled), or paused " +

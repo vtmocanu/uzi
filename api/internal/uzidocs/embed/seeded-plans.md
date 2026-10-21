@@ -60,11 +60,15 @@ With `--require-base`, the check is exact. The first claim must check out the
 planned commit itself. When the run later continues its own work (after a
 budget pause and `uzi run extend`, or on another worker), it may only pick up
 content that one of its own checkpoints recorded after the check had passed.
-If it cannot prove that, the agent never starts and the run is held
+If it cannot prove that for work it kept itself (its own tracking or checkpoint
+copy), the agent never starts and the run is held
 (`base_attestation_missing`) with its work kept, for you to recover, export or
 start a successor: `uzi run recovery <id>` shows the kept work and `uzi run
 export <id> --output <path>` downloads it. Resume and extend are refused for
-this hold. Without `--require-base` nothing changes: a mismatch only warns.
+this hold. Work picked up from the forge branch instead (for example a branch
+already pushed by an earlier attempt) is not proof of the run's own checked work,
+so a mismatch there is rejected as a changed base, as on a first claim.
+Without `--require-base` nothing changes: a mismatch only warns.
 
 `--planned-commit` must be a hex commit SHA, 7-64 characters — a shorter or
 non-hex value is a usage error (exit 2). The safe answer is always the full

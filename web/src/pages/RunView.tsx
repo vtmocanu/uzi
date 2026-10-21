@@ -1457,7 +1457,7 @@ function ProviderHoldPanel({ run, ownerProof, busy, onResume, onStop, onCancel }
 // this content was produced on the planned base, so the worker did not start the agent. The work
 // stays in custody. Nothing automatic leaves the hold and the server refuses Resume and extend,
 // so the panel offers no such action: the owner recovers via the CLI or starts a successor.
-export function BaseAttestationHoldPanel({ run, ownerProof = false, busy = false, onCancel = () => {} }: {
+function BaseAttestationHoldPanel({ run, ownerProof = false, busy = false, onCancel = () => {} }: {
   run: Run; ownerProof?: boolean; busy?: boolean; onCancel?: () => void;
 }) {
   if (run.status !== "paused" || run.hold_reason !== "base_attestation_missing") return null;
