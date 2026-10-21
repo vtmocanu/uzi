@@ -20816,18 +20816,36 @@ describe("CodexExecutor no-progress stall owner decision (issue #3139)", () => {
     else if (typeof served === "number") callbacks.reportIteration = async (n) => { fixture.iterations.push(n); return { completionAttempts: served }; };
     let calls = 0;
     const prompts: string[] = [];
+    let spawnPending = false;
+    let deferredRootDone: CodexNotification | undefined;
     const responder: Responder = (c) => {
+      if (c.method === "thread/start" && spawnPending) { spawnPending = false; return { thread: { id: "th-child" } }; }
       if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
       if (c.method !== "turn/start") return {};
+      if ((c.params as { threadId?: string }).threadId === "th-child") {
+        // A delegated child turn (not a lead provider call): its frames are subagent-origin.
+        c.transport.push(agentMessage("child is working", "th-child"));
+        c.transport.push(turnCompleted("completed", "th-child", "tn-child"));
+        // The root turn ends only after its child settled, as the app-server orders it.
+        if (deferredRootDone) { c.transport.push(deferredRootDone); deferredRootDone = undefined; }
+        return { turn: { id: "tn-child" } };
+      }
       const n = ++calls;
       const tn = `tn-stall-${n}`;
       prompts.push((c.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "");
-      for (const note of notes(n, "th-1", tn)) c.transport.push(note);
-      c.transport.push(turnCompleted("completed", "th-1", tn));
+      const turnNotes = notes(n, "th-1", tn);
+      if (turnNotes.some((note) => (note.params as { tool?: string } | undefined)?.tool === "spawn_agent")) spawnPending = true;
+      for (const note of turnNotes) c.transport.push(note);
+      if (spawnPending) deferredRootDone = turnCompleted("completed", "th-1", tn);
+      else c.transport.push(turnCompleted("completed", "th-1", tn));
       return { turn: { id: tn } };
     };
     const rig = makeMultiEpochRig(Array.from({ length: 12 }, () => responder));
-    const { ctx, emitted } = makeCtx({ ...callbacks, kind: "issue", completionInterlock: true, ...ctxOver });
+    const stallAgents: AgentTemplate[] = [
+      { name: "lead", description: "the lead", prompt_body: "lead body", tools: null, skills: [] },
+      { name: "coder", description: "a coder", prompt_body: "coder body", tools: null, skills: [] },
+    ];
+    const { ctx, emitted } = makeCtx({ ...callbacks, agents: stallAgents, kind: "issue", completionInterlock: true, ...ctxOver });
     let error: string | null = null;
     let result: Awaited<ReturnType<Executor["run"]>> | undefined;
     try { result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 20000, "#3139 stall run"); }
@@ -20955,6 +20973,74 @@ describe("CodexExecutor no-progress stall owner decision (issue #3139)", () => {
     });
   }
 
+  it("a delegating turn (spawn_agent with child frames) between stall turns resets the streak", async () => {
+    // The delegation's lead dispatch frame also counts as a lead tool call, so this pins the reset
+    // for a real delegation as a whole rather than the subagent flag alone.
+    const spawn: Notes = (c, th, tn) => [toolCall(900 + c, "spawn_agent", { role: "coder", prompt: "help" }, th, tn, `s${c}`)];
+    const r = await drive(script({ 3: spawn }));
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 6, "turn 2 counted, the delegating turn 3 reset, turns 4-6 tripped");
+    assert.equal(r.fixture.questions.length, 1);
+  });
+
+  it("a changed worktree fingerprint on one turn restarts the streak", async () => {
+    let fp = "SAME";
+    const r = await drive((c, th, tn) => { fp = c === 3 ? "CHANGED" : "SAME"; return script({})(c, th, tn); },
+      { worktreeFingerprint: async () => fp });
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 6, "the changed turn starts a new streak of one; turns 4-6 trip");
+    assert.equal(r.fixture.questions.length, 1);
+  });
+
+  it("a null worktree fingerprint on one turn restarts the streak", async () => {
+    let fp: string | null = "SAME";
+    const r = await drive((c, th, tn) => { fp = c === 3 ? null : "SAME"; return script({})(c, th, tn); },
+      { worktreeFingerprint: async () => fp });
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 6);
+    assert.equal(r.fixture.questions.length, 1);
+  });
+
+  it("a turn whose ACK serves no completionAttempts (ineligible) restarts the streak", async () => {
+    const r = await drive(script({}), {
+      reportIteration: async (n) => (n === 3 ? undefined : { completionAttempts: 0 }),
+    });
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 6, "turn 2 counted, ineligible turn 3 reset, turns 4-6 tripped");
+    assert.equal(r.fixture.questions.length, 1);
+  });
+
+  it("a cooperative checkpoint between stall turns resets the streak", async () => {
+    const ckpt: Notes = (c, th, tn) => [toolCall(200 + c, "checkpoint", {}, th, tn, `ck${c}`)];
+    const r = await drive(script({ 3: ckpt }));
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 6, "turn 2 counted, checkpoint turn 3 reset, turns 4-6 tripped");
+    assert.equal(r.fixture.questions.length, 1);
+  });
+
+  it("a park_run answer between stall turns resets the streak", async () => {
+    const park: Notes = (c, th, tn) => [toolCall(400 + c, "park_run", {}, th, tn, `pk${c}`)];
+    const r = await drive(script({ 3: park }), {
+      parkRunSupported: true,
+      requestParkRun: async () => ({ kind: "answer", answers: ["carry on"] }),
+    });
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 6, "turn 2 counted, the answered park turn 3 reset, turns 4-6 tripped");
+    assert.equal(r.fixture.questions.length, 1);
+  });
+
+  it("after a continue answer the in-process latch blocks a second stall attempt even while the served count lags at 0", async () => {
+    const r = await drive(script({}), {
+      served: 0, config: { max_iterations: 8 }, fixture: { answer: { outcome: "continue", guidance: "keep going" } },
+    });
+    assert.equal(r.error, null);
+    assert.equal(r.fixture.attempts.length, 1, "exactly one worker stall attempt");
+    assert.equal(r.fixture.questions.length, 1, "no second stall question");
+    assert.equal(r.calls(), 8, "the run drains its iteration budget instead of re-tripping");
+    assert.deepEqual(r.fixture.holds, [ITER_REASON]);
+    assert.deepEqual(r.result?.completionHeld, { reason: ITER_REASON });
+  });
+
   it("an owner follow-up resets the streak", async () => {
     let pulls = 0;
     const r = await drive(script({}), {
@@ -21024,9 +21110,13 @@ describe("CodexExecutor no-progress stall owner decision (issue #3139)", () => {
       const interactive = await drive(script({}), { interactive: true, config: { max_iterations: 6 } });
       assert.equal(interactive.fixture.attempts.length, 0);
       assert.equal(interactive.fixture.questions.length, 0);
+      assert.equal(interactive.error, ITER_REASON, "interactive run drains the iteration budget as before");
+      assert.equal(interactive.calls(), 6);
       const task = await drive(script({}), { kind: "task", config: { max_iterations: 6 } });
       assert.equal(task.fixture.attempts.length, 0);
       assert.equal(task.fixture.questions.length, 0);
+      assert.equal(task.error, ITER_REASON, "non-issue run drains the iteration budget as before");
+      assert.equal(task.calls(), 6);
     });
 
     it("real work (a tool call every turn) still ends on max_iterations", async () => {

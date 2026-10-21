@@ -199,13 +199,13 @@ describe("RunRunner — no_progress_stall question text and served attempts (iss
     assert.doesNotMatch(text, /^- /m);
   });
 
-  async function iterationBudget(served: Partial<StateAck>, issue: number): Promise<IterationBudget | undefined | void> {
+  async function iterationBudget(served: Partial<StateAck>, issue: number, exclusive = false): Promise<IterationBudget | undefined | void> {
     const { gitlab } = fakeGitlab();
     const orig = client.reportState.bind(client);
     (client as unknown as { reportState: unknown }).reportState = async (...args: unknown[]) => {
       const body = args[1] as { status?: string; iteration_count?: number } | undefined;
       const ack = (await (orig as (...a: unknown[]) => Promise<StateAck>)(...args)) as StateAck;
-      return body?.status === "running" && typeof body.iteration_count === "number" ? { ...ack, ...served } : ack;
+      return body?.status === "running" && typeof body.iteration_count === "number" ? (exclusive ? (served as StateAck) : { ...ack, ...served }) : ack;
     };
     try {
       let captured: IterationBudget | undefined | void;
@@ -227,6 +227,12 @@ describe("RunRunner — no_progress_stall question text and served attempts (iss
   it("reportIteration forwards a served completionAttempts of 0 and 2", async () => {
     assert.strictEqual((await iterationBudget({ completionAttempts: 0 }, 3141) as IterationBudget).completionAttempts, 0);
     assert.strictEqual((await iterationBudget({ completionAttempts: 2 }, 3142) as IterationBudget).completionAttempts, 2);
+  });
+
+  it("reportIteration returns a served completionAttempts even when it is the only field the ACK carries", async () => {
+    // Pins the return guard: an ACK with ONLY completionAttempts must still yield a budget object.
+    assert.deepStrictEqual(await iterationBudget({ completionAttempts: 3 }, 3144, true), { completionAttempts: 3 });
+    assert.deepStrictEqual(await iterationBudget({ completionAttempts: 0 }, 3145, true), { completionAttempts: 0 });
   });
 
   it("reportIteration leaves completionAttempts absent when the ACK serves none", async () => {

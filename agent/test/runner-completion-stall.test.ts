@@ -26,9 +26,10 @@ beforeEach(async () => {
 // (Claude: no executor.safety; Codex: executor.safety), is that no later publication, finalize or
 // code cross-check authorization consumes that stall-time state: everything published and reviewed
 // afterwards comes from the later real done checkpoint at H1, and no done permit stays held once the
-// stall attempt returns. The executors below are scripted Executors performing exactly the ctx call
-// sequence of the SdkExecutor / Codex stall path (recordAttempt([]) then
-// askCompletionQuestion(unmet, { kind: "no_progress_stall" })); the real runner behind ctx is real.
+// stall attempt returns. The executors below are scripted Executors performing the runner-facing ctx
+// call sequence of the SdkExecutor / Codex stall path (done_checkpoint, fingerprint, an empty-declaration
+// recordCompletionAttempt, then askCompletionQuestion(unmet, { kind: "no_progress_stall" })); executor-internal
+// steps (plan-summary settlement, Codex session persistence) are omitted. The runner behind ctx is real.
 
 const record = (head: string, base: string) => ({
   stage: "code" as const, round: 1 as const, candidate_generation: 1, head_commit: head, base_commit: base,
@@ -79,13 +80,14 @@ function codeSafety(provider = true) {
 
 const codexSecrets = { forge_pat: "fixture-pat", codex: { auth_mode: "api_key", capability: "fixture-cap", access_token: "fixture-access" } };
 
-/** Rejects if `action` does not settle promptly: a held done permit or sink gate would park it. */
+/** Rejects if `action` does not settle promptly: a held done permit or sink gate would park it. The bound is
+ *  generous (observed well under 2s) so a loaded CI runner does not redden it; a real hang still fails here. */
 async function promptly(label: string, action: () => Promise<unknown>): Promise<void> {
   let timer: NodeJS.Timeout | undefined;
   try {
     await Promise.race([
       action(),
-      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`${label} did not acquire promptly`)), 4000); }),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`${label} did not acquire promptly`)), 30_000); }),
     ]);
   } finally { clearTimeout(timer); }
 }
@@ -238,14 +240,17 @@ for (const lane of ["claude", "codex"] as const) {
           assert.equal(submitted.length, 0, "the hold ran no code cross-check");
           assert.ok(!api.states.some(s => s.runId === claim.run_id && s.body.status === "completed"));
           // Owner resume: a NEW flight (new runner, new claim) on the same run; its real signal_done.
-          const hold = { h0: seen.h0 };
-          const resumed: Observed = { h0: hold.h0 };
+          const resumed: Observed = { h0: seen.h0 };
           // The owner's resume: a new claim (next generation) on the same run, which finds the run running.
           api.setOwnershipStatus(claim.run_id, "running", 8);
           answered = true;
           permitRequestsBeforeRealDone = api.completionPermitRequests.length;
           submitsBeforeRealDone = submitted.length;
           realDoneStarted = true;
+          // Codex lane: the resumed claim drops secrets.codex so the runner skips the command-sandbox
+          // readiness probe this fixture cannot satisfy. The resumed flight keeps Codex safety; the claim-side
+          // branches skipped (published-start bookkeeping, session-store probe, harness label) feed neither
+          // publication nor the code cross-check, so the H1 provenance asserted below is unaffected.
           await runner(lead(lane, async ctx => {
             await realDone(ctx, resumed);
             return { branch: ctx.branch };

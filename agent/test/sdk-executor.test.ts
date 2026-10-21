@@ -8561,13 +8561,67 @@ describe("SdkExecutor no-progress stall owner decision (issue #3139)", () => {
     });
   }
 
+  it("subagent activity between stall turns resets the streak", async () => {
+    const r = await drive((c) => (c === 1 ? rp1() : c === 3 ? [subagentText("child working"), resultSuccess()] : prose(c)));
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 6, "turn 2 counted, turn 3 reset, turns 4-6 tripped");
+    assert.equal(r.fixture.questions.length, 1);
+  });
+
+  it("a changed worktree fingerprint on one turn restarts the streak", async () => {
+    let fp = "SAME";
+    const r = await drive((c) => { fp = c === 3 ? "CHANGED" : "SAME"; return c === 1 ? rp1() : prose(c); },
+      { worktreeFingerprint: async () => fp });
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 6, "the changed turn starts a new streak of one; turns 4-6 trip");
+    assert.equal(r.fixture.questions.length, 1);
+  });
+
+  it("a null worktree fingerprint on one turn restarts the streak", async () => {
+    let fp: string | null = "SAME";
+    const r = await drive((c) => { fp = c === 3 ? null : "SAME"; return c === 1 ? rp1() : prose(c); },
+      { worktreeFingerprint: async () => fp });
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 6);
+    assert.equal(r.fixture.questions.length, 1);
+  });
+
+  it("a turn whose ACK serves no completionAttempts (ineligible) restarts the streak", async () => {
+    const r = await drive((c) => (c === 1 ? rp1() : prose(c)), {
+      reportIteration: async (n) => (n === 3 ? undefined : { completionAttempts: 0 }),
+    });
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 6, "turn 2 counted, ineligible turn 3 reset, turns 4-6 tripped");
+    assert.equal(r.fixture.questions.length, 1);
+  });
+
+  it("a cooperative checkpoint between stall turns resets the streak", async () => {
+    const r = await drive((c) => (c === 1 ? rp1() : c === 3 ? [checkpointSignal(), resultSuccess()] : prose(c)));
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 6, "turn 2 counted, checkpoint turn 3 reset, turns 4-6 tripped");
+    assert.equal(r.fixture.questions.length, 1);
+  });
+
+  it("after a continue answer the in-process latch blocks a second stall attempt even while the served count lags at 0", async () => {
+    const r = await drive((c) => (c === 1 ? rp1() : prose(c)), {
+      served: 0, fixture: { answer: { outcome: "continue", guidance: "keep going" } },
+    });
+    assert.equal(r.error, null);
+    assert.equal(r.fixture.attempts.length, 1, "exactly one worker stall attempt");
+    assert.equal(r.fixture.questions.length, 1, "no second stall question");
+    assert.equal(r.calls(), 8, "the run drains its iteration budget instead of re-tripping");
+    const reason = "run reached its milestone-scaled implement/review iteration budget without completing";
+    assert.deepEqual(r.fixture.holds, [reason]);
+    assert.deepEqual(r.result?.completionHeld, { reason });
+  });
+
   it("an owner follow-up resets the streak", async () => {
     let pulls = 0;
     const r = await drive((c) => (c === 1 ? rp1() : prose(c)), {
       pullFollowUps: () => (++pulls === 4 ? pullOf(["please also check X"]) : []),
     });
     assert.equal(r.error, null);
-    assert.ok(r.calls() > 4, `the follow-up delayed the trip (calls=${r.calls()})`);
+    assert.equal(r.calls(), 6, "the follow-up turn restarts the streak at one; turns 4-6 trip");
     assert.equal(r.fixture.questions.length, 1);
   });
 
@@ -8577,7 +8631,7 @@ describe("SdkExecutor no-progress stall owner decision (issue #3139)", () => {
       pullSafetySteer: () => (++pulls === 4 ? "STEER-BODY" : undefined),
     });
     assert.equal(r.error, null);
-    assert.ok(r.calls() > 4, `the steer delayed the trip (calls=${r.calls()})`);
+    assert.equal(r.calls(), 6, "the steer turn restarts the streak at one; turns 4-6 trip");
     assert.equal(r.fixture.questions.length, 1);
   });
 
@@ -8647,9 +8701,14 @@ describe("SdkExecutor no-progress stall owner decision (issue #3139)", () => {
     it("an interactive run and a non-issue run are unchanged", async () => {
       const interactive = await drive((c) => (c === 1 ? rp1() : prose(c)), { interactive: true, config: { max_iterations: 6 } });
       assert.equal(interactive.fixture.attempts.length, 0);
+      assert.match(interactive.error ?? "", REASON_ITER, "interactive run drains the iteration budget as before");
+      assert.equal(interactive.calls(), 6);
+      assert.equal(interactive.fixture.questions.length, 0);
       const task = await drive((c) => (c === 1 ? rp1() : prose(c)), { kind: "task", config: { max_iterations: 6 } });
       assert.equal(task.fixture.attempts.length, 0);
       assert.equal(task.fixture.questions.length, 0);
+      assert.match(task.error ?? "", REASON_ITER, "non-issue run drains the iteration budget as before");
+      assert.equal(task.calls(), 6);
     });
 
     it("real work (a tool call every turn) still ends on max_iterations", async () => {
@@ -8667,8 +8726,10 @@ describe("SdkExecutor no-progress stall owner decision (issue #3139)", () => {
       }, { served: "default" });
       assert.equal(r.error, null);
       assert.equal(r.fixture.attempts.length, 1, "only the lead's own attempt; the stall path is latched off");
-      assert.ok(r.fixture.holds.length === 1);
-      assert.notEqual(r.result?.completionHeld?.reason, REASON_COMPLETION_STALL);
+      assert.equal(r.fixture.holds.length, 1);
+      assert.equal(r.calls(), 5, "the #281 identical-text streak tripped after the lead's own attempt");
+      assert.match(r.fixture.holds[0]!, REASON_410, "held via the #281 no-progress reason, not the new stall reason");
+      assert.match(r.result?.completionHeld?.reason ?? "", REASON_410);
     });
   });
 });
