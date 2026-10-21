@@ -18,6 +18,8 @@ import path from "node:path";
 import os from "node:os";
 import { credentialFreeGitFixture, latch } from "./credential-free-git-fixture.js";
 
+const linuxHelperOnly = { skip: process.platform !== "linux" && "cancellation helper requires Linux" };
+
 function scopedRequest(git: GitCache, context: CredentialFreeCaptureContext, request: BoundaryProcessRequest) {
   const internal = git as unknown as {
     execScoped(command: string, args: string[], options: { env: NodeJS.ProcessEnv; cwd: string; timeout?: number },
@@ -563,7 +565,7 @@ describe("credential-free real Git producer positives", () => {
     } finally { r.cleanup(); }
   });
 
-  it("admits the actual fixed cancellation helper as a fully registered command root", async () => {
+  it("admits the actual fixed cancellation helper as a fully registered command root", linuxHelperOnly, async () => {
     const r = await credentialFreeGitFixture();
     try {
       const result = await r.capture(() => r.git.credentialFreeCancelCleanHead(r.clone, r.bare, r.base));
@@ -629,7 +631,7 @@ describe("credential-free fixed helper deadline binding", () => {
   const produce = (r: ReturnType<typeof rig>) =>
     r.git.credentialFreeCancelCleanHead("/capture/runner", "/capture/worker.git", sha);
 
-  it("binds the allocated integer and freezes setup, joins cleanup, then revokes within the same capture", async () => {
+  it("binds the allocated integer and freezes setup, joins cleanup, then revokes within the same capture", linuxHelperOnly, async () => {
     const draining = latch(), release = latch(), resume = latch();
     let helperSpec: CodexEffectLaunchSpec | undefined;
     const r = rig({ output, drainFor: spec => {
@@ -699,7 +701,7 @@ describe("credential-free fixed helper deadline binding", () => {
   for (const cell of ["script", "executable", "argv", "environment",
     "missing helper pin", "nonempty helper pin", "missing askpass pin", "nonempty askpass pin"] as const) {
     for (const boundary of ["private issuance", "frozen setup"] as const)
-      it("refuses fixed helper " + cell + " at " + boundary, async () => {
+      it("refuses fixed helper " + cell + " at " + boundary, linuxHelperOnly, async () => {
         let attempted = false;
         let freezeFailure: unknown;
         let issuanceFailure: unknown;
@@ -774,7 +776,7 @@ describe("credential-free fixed helper deadline binding", () => {
 
   for (const value of ["different future integer", "9", "9".repeat(400), "9007199254740992",
     "Infinity", "NaN", "1.5", "01", "+9", "1e13", ""] as const)
-    it("rejects private helper deadline substitution " + (value.length > 30 ? "huge decimal" : JSON.stringify(value)), async () => {
+    it("rejects private helper deadline substitution " + (value.length > 30 ? "huge decimal" : JSON.stringify(value)), linuxHelperOnly, async () => {
       const r = rig({ output });
       const internal = r.git as any, original = internal.execScoped.bind(r.git);
       let checked = false;
@@ -804,7 +806,7 @@ describe("credential-free fixed helper deadline binding", () => {
     });
 
   for (const bound of ["maintenance", "capture", "report", "recovery"] as const)
-    it("rounds fractional maintenance DOWN and retains the original " + bound + " bound", async () => {
+    it("rounds fractional maintenance DOWN and retains the original " + bound + " bound", linuxHelperOnly, async () => {
       const clock = Date.now, wall = clock();
       let tick = 0;
       const budget = new MaintenanceBudget(9000.75, () => tick);
@@ -832,7 +834,7 @@ describe("credential-free fixed helper deadline binding", () => {
     });
 
   for (const cell of ["deadline", "maintenance", "report abort", "recovery abort"] as const)
-    it("refuses " + cell + " after asynchronous setup before helper spawn", async () => {
+    it("refuses " + cell + " after asynchronous setup before helper spawn", linuxHelperOnly, async () => {
       const clock = Date.now, wall = clock();
       let tick = 0, setups = 0;
       const budget = new MaintenanceBudget(9000.75, () => tick);
@@ -861,7 +863,7 @@ describe("credential-free fixed helper deadline binding", () => {
       } finally { Date.now = clock; budget.dispose(); }
     });
 
-  it("retains flightless legacy helper argv without capture or a new budget", async () => {
+  it("retains flightless legacy helper argv without capture or a new budget", linuxHelperOnly, async () => {
     const r = await credentialFreeGitFixture();
     const internal = r.git as any, original = internal.execScoped.bind(r.git);
     let helperArgs: string[] | undefined;
@@ -881,6 +883,40 @@ describe("credential-free fixed helper deadline binding", () => {
       assert.ok(helperArgs, "actual legacy fixed helper executed");
       assert.equal(r.requests.length, 0, "no capture queue, sink, or registry needed");
     } finally { r.cleanup(); }
+  });
+
+  it("refuses cancellation proof on non-Linux before execScoped, setup or spawn", async () => {
+    let execs = 0, setups = 0;
+    const r = rig({ output, setup: async () => { setups++; } });
+    (r.git as any).execScoped = async () => {
+      execs++;
+      throw new Error("unexpected non-Linux execScoped");
+    };
+    const descriptor = Object.getOwnPropertyDescriptor(process, "platform");
+    assert.ok(descriptor);
+    const result = await r.safety.withCredentialFreeCapture(10_000, context =>
+      r.git.withCredentialFreeCapture(context, () => {
+        let pending: Promise<string | null>;
+        if (process.platform === "linux") {
+          try {
+            Object.defineProperty(process, "platform", { ...descriptor, value: "darwin" });
+            // The producer checks the platform synchronously before its first await.
+            pending = produce(r);
+          } finally {
+            Object.defineProperty(process, "platform", descriptor);
+          }
+        } else {
+          pending = produce(r);
+        }
+        assert.deepEqual(Object.getOwnPropertyDescriptor(process, "platform"), descriptor);
+        return pending;
+      }));
+    assert.deepEqual(Object.getOwnPropertyDescriptor(process, "platform"), descriptor);
+    assert.equal(result.kind, "observed_empty");
+    if (result.kind === "observed_empty") assert.equal(result.value, null);
+    assert.equal(execs, 0, "platform refusal precedes every execScoped call");
+    assert.equal(setups, 0, "platform refusal precedes launcher setup");
+    assert.equal(r.specs.length, 0, "platform refusal precedes fake spawn");
   });
 
   it("does not launch with an already exhausted maintenance budget", async () => {
