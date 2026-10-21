@@ -75,6 +75,8 @@ export async function checkPlan(options: CheckPlanOptions): Promise<CheckedPlanD
         response.candidate.base_commit !== candidate.base_commit ||
         !Number.isFinite(deadline) || deadline > Date.now() + 2 * 60 * 60 * 1000 ||
         (identity && (response.candidate_digest !== identity.candidate_digest ||
+          response.cross_check_id !== identity.cross_check_id ||
+          ("cross_check_id" in response) !== ("cross_check_id" in identity) ||
           response.checker_run_id !== identity.checker_run_id ||
           response.deadline_at !== identity.deadline_at ||
           response.automatic_revision_limit !== identity.automatic_revision_limit ||

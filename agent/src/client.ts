@@ -177,7 +177,7 @@ export interface PlanCrossCheckFindings {
 export type PlanCrossCheckResponse = ({ reconciliation?: PlanCrossCheckReconciliation } & (
   | { result: "parked"; verdict: string; reason_class: string; lead_last_seq: number; reconciliation: PlanCrossCheckReconciliation }
   | { result: "no_row"; reason_class: "no_candidate"; lead_last_seq: number }
-  | { result: "candidate"; round: number; automatic_revision_limit: number; automatic_rounds_enabled: boolean; checker_run_id: string | null; candidate_digest: string;
+  | { result: "candidate"; round: number; automatic_revision_limit: number; automatic_rounds_enabled: boolean; cross_check_id?: string; checker_run_id: string | null; candidate_digest: string;
       candidate_generation: number; candidate: PlanCrossCheckCandidate;
       verdict: "pending" | "approve" | "revise" | "block" | "failed";
       reason_class: "" | "approve" | PlanCrossCheckGateReason;
@@ -277,7 +277,7 @@ function decodePlanCrossCheckResponse(value: unknown, generation: number, round:
     const verdict = wire.verdict === undefined ? "" : wire.verdict;
     const reason = wire.reason_class === undefined ? "" : wire.reason_class;
     if (!reconciliation || reconciliation.gateRevision < 1 ||
-        ["candidate", "candidate_digest", "candidate_generation", "checker_run_id", "findings", "round", "deadline_at"]
+        ["candidate", "candidate_digest", "candidate_generation", "cross_check_id", "checker_run_id", "findings", "round", "deadline_at"]
           .some((key) => key in wire) ||
         !(crossCheckPair(verdict, reason) ||
           (verdict === "" && (reason === "" || CROSS_CHECK_GATE_REASONS.has(reason as string))))) return invalid();
@@ -287,6 +287,8 @@ function decodePlanCrossCheckResponse(value: unknown, generation: number, round:
   const snapshot = crossCheckSnapshot(wire, true);
   if (wire.result !== "candidate" || !crossCheckRound(wire.round) || wire.round !== round || !snapshot ||
       !Number.isSafeInteger(wire.candidate_generation) || (wire.candidate_generation as number) <= 0 ||
+      ("cross_check_id" in wire && (typeof wire.cross_check_id !== "string" || wire.cross_check_id.length !== 36 ||
+        !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(wire.cross_check_id))) ||
       (wire.checker_run_id !== null && (typeof wire.checker_run_id !== "string" ||
         !/^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$/.test(wire.checker_run_id))) ||
       typeof wire.candidate_digest !== "string" || !/^[a-fA-F0-9]{64}$/.test(wire.candidate_digest) ||

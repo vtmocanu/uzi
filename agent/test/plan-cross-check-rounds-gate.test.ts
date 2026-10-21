@@ -12,7 +12,8 @@ const candidate: PlanCrossCheckCandidate = { plan_md: "plan", milestones: [], re
 type Snapshot = Extract<PlanCrossCheckResponse, { result: "candidate" }>;
 function snapshot(overrides: Partial<Snapshot> = {}): Snapshot {
   return { result: "candidate", round: 2, candidate_generation: 3, candidate_digest: "a".repeat(64),
-    candidate, checker_run_id: "00000000-0000-0000-0000-000000000001",
+    candidate, cross_check_id: "abcdef01-2345-4678-9abc-def012345678",
+    checker_run_id: "00000000-0000-0000-0000-000000000001",
     deadline_at: new Date(Date.now() + 60_000).toISOString(), lead_last_seq: 0,
     verdict: "revise", reason_class: "revise", automatic_revision_limit: 4, automatic_rounds_enabled: true,
     findings: { summary: "check scope", items: [{ file: "store.ts", severity: "warning",
@@ -73,6 +74,7 @@ test("round two polls its own identity and releases the decided proof after usag
   if (result.kind !== "revise") return;
   assert.deepEqual(result.response.findings, snapshot().findings);
   assert.equal(result.response.round, 2);
+  assert.equal(result.response.cross_check_id, pending.cross_check_id);
   assert.equal(result.response.automatic_revision_limit, 4);
   assert.deepEqual(h.proofs, [decided]);
   assert.equal(h.events.at(-1), "release");
@@ -115,6 +117,7 @@ test("ambiguous submit reads requested round and uses settled revise proof", asy
 
 for (const [name, patch] of Object.entries({
   round: { round: 3 }, digest: { candidate_digest: "c".repeat(64) },
+  crossCheck: { cross_check_id: "abcdef01-2345-4678-9abc-def012345679" },
   child: { checker_run_id: "00000000-0000-0000-0000-000000000002" },
   deadline: { deadline_at: new Date(Date.now() + 50_000).toISOString() },
   candidate: { candidate: { ...candidate, plan_md: "changed" } },
@@ -128,6 +131,37 @@ for (const [name, patch] of Object.entries({
     if (result.kind === "human") assert.equal(result.fields.plan_cross_check_gate_reason, "checker_failed");
     assert.equal(h.proofs.length, 0);
   });
+}
+
+for (const verdict of ["approve", "revise"] as const) {
+  for (const mutation of ["change", "loss", "addition"] as const) {
+    test(`cross-check identity ${mutation} never releases automatic ${verdict} proof`, async () => {
+      const pending = snapshot({ verdict: "pending", reason_class: "", findings: null });
+      const decided = { ...pending, verdict, reason_class: verdict };
+      if (mutation === "change") decided.cross_check_id = "abcdef01-2345-4678-9abc-def012345679";
+      if (mutation === "loss") delete decided.cross_check_id;
+      if (mutation === "addition") delete pending.cross_check_id;
+      const h = harness(pending, { polls: [decided] });
+      const result = await h.run();
+      assert.equal(result.kind, "human");
+      if (result.kind === "human") assert.equal(result.fields.plan_cross_check_gate_reason, "checker_failed");
+      assert.deepEqual(h.proofs, []);
+    });
+  }
+  for (const legacy of [false, true]) {
+    test(`stable ${legacy ? "legacy absent" : "canonical"} cross-check identity permits ${verdict} with null child`, async () => {
+      const pending = snapshot({ verdict: "pending", reason_class: "", findings: null, checker_run_id: null });
+      if (legacy) delete pending.cross_check_id;
+      const decided = { ...pending, verdict, reason_class: verdict };
+      const h = harness(pending, { polls: [decided] });
+      const result = await h.run();
+      assert.equal(result.kind, verdict);
+      assert.equal(result.response.cross_check_id, pending.cross_check_id);
+      assert.equal("cross_check_id" in result.response, !legacy);
+      assert.equal(result.response.checker_run_id, null);
+      assert.deepEqual(h.proofs, [decided]);
+    });
+  }
 }
 
 for (const [round, limit] of [[1, 0], [2, 1], [5, 4]]) {
