@@ -597,22 +597,52 @@ describe("RunRunner m4 — Codex durability sinks route through withBoundary", (
     );
   });
 
-  it("(1) recovery publication routes through withBoundary (boundary=shutdown)", async () => {
+  it("(1) recovery publication routes through withBoundary (boundary=shutdown)", { timeout: 15_000 }, async (t) => {
     const { gitlab } = fakeGitlab();
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-m4-rec-"));
+    // commitInTree completes synchronously; this fake starts no provider work.
+    const rig = codexRig({ providerRoot: false });
+    const events: string[] = [];
+    const withBoundary = rig.safety.withBoundary.bind(rig.safety);
+    rig.safety.withBoundary = async (request, action) => {
+      events.push(`boundary:${request.boundary}`);
+      return withBoundary(request, action);
+    };
+    const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
+      commitInTree(ctx.worktreePath, "REC.txt", "recovered work\n");
+      events.push("transient");
+      throw new TransientRecoveryError();
+    }, async () => {
+      events.push("legacy-settle");
+      assert.equal(rig.registry.rootCount(), 0);
+      assert.equal(rig.registry.pendingLaunchCount(), 0);
+      assert.equal(rig.registry.inFlightCallbackCount(), 0);
+      events.push("legacy-empty");
+      return { kind: "observed_empty" };
+    }, rig.capture);
+    const runner = runnerWith(() => ({ executor: exec }), gitlab, undefined, nullLogger(), {
+      recoveryRetryMs: 1, checkpointIntervalMs: 0,
+    });
+    const shutdown = () => runner.shutdown();
+    t.signal.addEventListener("abort", shutdown, { once: true });
+    const claim = gitlabClaim(1204);
+    const execution = runner.execute(claim);
     try {
-      const rig = codexRig();
-      const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
-        commitInTree(ctx.worktreePath, "REC.txt", "recovered work\n");
-        throw new TransientRecoveryError();
-      }, undefined, rig.capture);
-      await runnerWith(() => ({ executor: exec }), gitlab).execute(gitlabClaim(1204));
+      await execution;
+      assert.equal(events.filter(event => event === "legacy-settle").length, 1, "transient recovery invokes legacy settlement once");
+      assert.equal(events.filter(event => event === "legacy-empty").length, 1, "legacy settlement verifies the empty registry");
+      assert.ok(events.indexOf("legacy-settle") > events.indexOf("transient"));
+      assert.ok(events.indexOf("legacy-empty") > events.indexOf("legacy-settle"));
       assert.ok(rig.boundaries.includes("shutdown"), `recovery boundary recorded; got ${JSON.stringify(rig.boundaries)}`);
+      assert.ok(events.indexOf("legacy-empty") < events.indexOf("boundary:shutdown"), "strict settlement precedes the authenticated recovery boundary");
       assert.ok(
-        api.states.some((s) => s.body.status === "recovery_wait"),
+        api.states.some((s) => s.runId === claim.run_id && s.body.status === "recovery_wait"),
         "the run parked at recovery_wait",
       );
     } finally {
+      t.signal.removeEventListener("abort", shutdown);
+      runner.shutdown();
+      await execution;
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
   });
