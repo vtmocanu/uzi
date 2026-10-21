@@ -29,16 +29,18 @@ import { delay, mockScenario, oidcDemo, requireSession, users } from "./shared";
 import { agentSource, mockAllowedAgentSourceHosts } from "./agentSource";
 import { secrets } from "./secrets";
 import { checkerModelWarning, normalizeCheckerValue } from "../../lib/crossCheckSettings";
-import type { CrossCheckPinDTO, Harness, ModelSettingCell } from "../../lib/apiTypes";
+import type { CrossCheckPinDTO, Harness } from "../../lib/apiTypes";
+import { CODEX_CURATED_MODELS, CODEX_ROLE_MODELS } from "../../lib/codexModels";
+import { MOCK_JUDGE_BUILTINS, mockJudgeModelCells, resolveMockJudgeModel } from "./judgeModels";
 import { mockDefaultClaudeModel } from "./agents";
 import { workersApi } from "./workers";
 
 // PRD #1551 D3: the two closed cross-vocabulary sets, mirroring the server's lane
-// validation (and web/src/components/ModelSelect.tsx's curated lists). A curated Codex
+// validation (the curated Codex list is lib/codexModels.ts, PRD #3245). A curated Codex
 // id may not be saved into the Claude lane; a known Claude alias may not be saved into
 // the Codex lane (which otherwise accepts a custom id, D5). Kept module-local so knip
 // does not flag them.
-const CURATED_CODEX_IDS = ["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol"];
+const CURATED_CODEX_IDS = CODEX_CURATED_MODELS;
 const KNOWN_CLAUDE_ALIASES = ["opus", "sonnet", "haiku", "fable"];
 
 // ── Settings persistence (demo build) ────────────────────────────────────────
@@ -118,10 +120,6 @@ if (mockScenario() === "cross-check-dormant-claude") {
   ];
 }
 
-// The compiled-in built-in for the instance Codex judge model (PRD #3245), pinned by
-// fixtures/model-settings/judge.json.
-const CODEX_JUDGE_BUILTIN = "gpt-6.1-sol";
-
 const SEED_APP_SETTINGS: AppSettings = {
   autopilot_label: "autopilot",
   // PRD #764: the single run-eligibility label.
@@ -138,8 +136,9 @@ const SEED_APP_SETTINGS: AppSettings = {
   slack_enabled: "false",
   public_base_url: "http://127.0.0.1:8080",
   judge_enabled: "false",
-  judge_model: "opus",
-  // PRD #3245: "" = the built-in; the response reports CODEX_JUDGE_BUILTIN with source "default".
+  // PRD #3245: "" = the built-in, like a fresh install with no stored row; the response
+  // reports each judge built-in as the effective value with source "default".
+  judge_model: "",
   codex_judge_model: "",
   // PRD #69: enforced mode off, spend guards at their server defaults (cooldown 60s,
   // budget 0 = unlimited).
@@ -522,16 +521,12 @@ function mySettingsResponse(): { settings: UserSettings } {
       resolved_effort: effort ?? workerEffort ?? "medium", model_source: model === null ? "worker default" : "pin",
       effort_source: effort === null ? "worker default" : "pin", active: true };
   }));
-  // PRD #3245 interim stub: both judge cells from the stored lanes and the built-ins only
-  // (the real mock resolver, pinned by the shared fixture, lands with the web surfaces).
-  const judge_models: ModelSettingCell[] = ([
-    { harness: "claude" as const, model: userSettings.judge_model, default_model: "opus", default_source: "builtin" },
-    { harness: "codex" as const, model: userSettings.codex_judge_model ?? null, default_model: CODEX_JUDGE_BUILTIN, default_source: "builtin" },
-  ]).map(c => ({
-    ...c,
-    resolved_model: c.model ?? c.default_model,
-    source: c.model ? "user_default" : c.default_source,
-  }));
+  // PRD #3245: both judge cells through the one mock resolver (pinned to the server's by
+  // fixtures/model-settings/judge.json), from the stored user lanes and instance values.
+  const judge_models = mockJudgeModelCells(
+    { claude: userSettings.judge_model, codex: userSettings.codex_judge_model },
+    { claude: appSettings.judge_model, codex: appSettings.codex_judge_model },
+  );
   return { settings: { ...userSettings, cross_check_pins, judge_models, default_model: projected ?? null } };
 }
 
@@ -574,11 +569,11 @@ function settingsResponse(): SettingsResponse {
   // built-in as the effective value with source "default", like the server.
   const effective: AppSettings = { ...appSettings };
   if (appSettings.judge_model.trim() === "") {
-    effective.judge_model = SEED_APP_SETTINGS.judge_model;
+    effective.judge_model = MOCK_JUDGE_BUILTINS.claude;
     sources.judge_model = "default";
   }
   if (appSettings.codex_judge_model.trim() === "") {
-    effective.codex_judge_model = CODEX_JUDGE_BUILTIN;
+    effective.codex_judge_model = MOCK_JUDGE_BUILTINS.codex;
     sources.codex_judge_model = "default";
   }
   // The demo has no real socket, so Slack is always "disabled" here.
@@ -586,7 +581,7 @@ function settingsResponse(): SettingsResponse {
     settings: effective,
     secrets: { ...slackSecrets },
     sources,
-    defaults: { ...SEED_APP_SETTINGS, codex_judge_model: CODEX_JUDGE_BUILTIN },
+    defaults: { ...SEED_APP_SETTINGS, judge_model: MOCK_JUDGE_BUILTINS.claude, codex_judge_model: MOCK_JUDGE_BUILTINS.codex },
     slack_status: "disabled",
     oidc_status: oidcDemo().oidcStatus,
     oidc_provider_name: oidcDemo().providerName,
@@ -655,14 +650,9 @@ export function sessionBody() {
     has_password: !oidcDemo().passwordless,
     // Judge consent (PRD #69 M4), resolved exactly like the server: enforced only when
     // BOTH the kill-switch and enforce-all are on (Gate-2-wins), and the effective model
-    // is user-value-wins over the instance value, which falls back to opus.
+    // is the Claude lane of the shared mock judge resolver (PRD #3245), like auth.go.
     judge_enforced_by_admin: appSettings.judge_enabled === "true" && appSettings.judge_enforce_all === "true",
-    effective_judge_model:
-      (userSettings.judge_model ?? "").trim() !== ""
-        ? (userSettings.judge_model as string)
-        : appSettings.judge_model.trim() !== ""
-          ? appSettings.judge_model
-          : "opus",
+    effective_judge_model: resolveMockJudgeModel("claude", userSettings.judge_model, appSettings.judge_model).model,
   };
 }
 
@@ -918,6 +908,8 @@ export const settingsApi = {
       if (key === "judge_model") {
         const trimmed = value.trim();
         if (/\s/.test(trimmed)) throw new ApiError(400, "judge_model: must be a single token with no spaces");
+        // The Claude-lane guard (PRD #3245): no Codex role id in the Claude key.
+        if (CODEX_ROLE_MODELS.includes(trimmed)) throw new ApiError(400, "judge_model: model is a Codex model id");
         nonSecret.judge_model = trimmed;
         continue;
       }
@@ -925,6 +917,9 @@ export const settingsApi = {
       // curated Codex id, mirroring the server's validator.
       if (key === "codex_judge_model") {
         const trimmed = value.trim();
+        if (KNOWN_CLAUDE_ALIASES.includes(trimmed)) {
+          throw new ApiError(400, "codex_judge_model: must be a Codex model; this is a Claude model alias");
+        }
         if (trimmed !== "" && !CURATED_CODEX_IDS.includes(trimmed)) {
           throw new ApiError(400, "codex_judge_model: is not a Codex judge model");
         }
@@ -1343,11 +1338,19 @@ export const settingsApi = {
       if (trimmed !== "" && /\s/.test(trimmed)) {
         throw new ApiError(400, "judge_model must be a single token with no spaces");
       }
+      // The Claude-lane guard (PRD #3245), mirroring validateClaudeJudgeModel.
+      if (CODEX_ROLE_MODELS.includes(trimmed)) {
+        throw new ApiError(400, "judge_model: model is a Codex model id");
+      }
       next = { ...next, judge_model: trimmed === "" ? null : trimmed };
     }
     if (patch.codex_judge_model !== undefined) {
-      // Interim stub (PRD #3245): blank clears to inherit, a value is stored trimmed.
+      // PRD #3245: blank clears to inherit; otherwise a curated Codex id only, mirroring
+      // the server's validateCodexJudgeModel.
       const trimmed = patch.codex_judge_model?.trim() ?? "";
+      if (trimmed !== "" && !CURATED_CODEX_IDS.includes(trimmed)) {
+        throw new ApiError(400, `codex_judge_model: "${trimmed}" is not a supported Codex model`);
+      }
       next = { ...next, codex_judge_model: trimmed === "" ? null : trimmed };
     }
     if (patch.summary_model !== undefined) {
