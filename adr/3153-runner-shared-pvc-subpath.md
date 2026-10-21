@@ -38,7 +38,13 @@ On Docker-lane hosted workers, the run's working clones and `$TMPDIR` (`/data/ru
 
 ### D4. Scratch adopt-or-refuse; `.retire-*` inspection; no new cleanup authority
 
-- **Docker lane.** A per-uid scratch directory is adopted (expected-owner `0700` leaf; the entrypoint prints "writer exclusion not established") or refused, never wiped. The non-Docker wipe is unchanged.
+- **Docker lane.** A per-uid scratch directory is adopted or refused, never wiped. On adoption the entrypoint prints "writer exclusion not established". The non-Docker wipe is unchanged.
+  - **Runner leaf.** A runner-owned `uzi-runner` is adopted at any mode. The runner can chmod its own leaf, so its mode is no evidence of tampering, and refusing on it would hand the runner a durable outage it could trigger at will.
+  - **Worker leaf.** A worker-owned `uzi-worker` is adopted only without group/other write bits (`mode & 022 == 0`). A group- or other-writable worker leaf, such as one left by an fsGroup re-walk to `2770`, fails startup closed.
+  - **Refusals.** A wrong owner, a symlink or a non-directory fails startup closed with the contents untouched. An absent leaf is created fresh.
+  - **Normalisation is leaf-only.** An adopted leaf not already at `0700` is set to `0700`; nothing beneath it is re-owned or re-moded.
+  - **Race safety.** In the reverse-skew layout (an old controller with `TMPDIR=/data/runner`), `uzi-runner` sits directly in the sticky, group-writable runner root, so the runner can rename it and plant a symlink between validation and a path-following `chmod`. Validation therefore records each leaf's identity (owner, device and inode). Every normalisation enters the leaf (`cd -P`), re-checks that identity on `.`, and changes ownership and mode of `.` only, never the path. After reclaiming the leaf to root it re-checks that the leaf name still names that directory. Already-`0700` leaves get the same identity check without any change. A leaf absent at validation that exists later is refused, and a freshly created leaf must be root-owned before it is normalised.
+  - **Residuals.** A swap detected after the reclaim leaves the original leaf briefly root-owned, then hands it back with its mode unchanged before refusing. The worker leaf may already be `0700` when a later runner-leaf refusal fires, which is the state a successful boot leaves. A runner swapping its own leaf after boot is out of scope for a boot-time check.
 - **`.retire-*` leftovers** are inspected at startup and always retained, empty ones included (an old mtime and emptiness prove neither retirement nor writer exclusion: a surviving daemon container may still hold one as a bind source or cwd). One counted warning reports them. The EXDEV fallback is kept.
 - Nothing here adds a deletion path that bypasses custody or writer exclusion.
 
