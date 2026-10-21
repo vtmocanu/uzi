@@ -15,7 +15,7 @@ import type { ReviewRunner } from "../src/review-runner.js";
 import { Outbox } from "../src/outbox.js";
 import type { ClaimResponse } from "../src/protocol.js";
 import type { RunContext } from "../src/executor.js";
-import { MaintenanceBudget } from "../src/maintenance-budget.js";
+import { MaintenanceBudget, RetainedSwitchSettlement } from "../src/maintenance-budget.js";
 import type { RunProcessReap } from "../src/run-procs.js";
 import { SdkExecutor } from "../src/sdk-executor.js";
 import { LiveAttemptRegistry, type QuiesceRunOutcome, type QuiesceRunRequest } from "../src/run-quiescence.js";
@@ -113,7 +113,11 @@ interface Options {
    *  budget, and joinOwnedOperations waits on it without bound. */
   pendingOperation?: boolean;
   settlementMs?: number;
-  codexMs?: number;
+  /** The retained switch's evidence-verification allowance (RunnerOptions.retainedSwitchVerificationMs). */
+  verificationMs?: number;
+  /** Gen 2 trips the switch and drives it through ctx.attemptCredentialSwitch (the executor's
+   *  in-place path), with a taken approve that a pending switch refused. */
+  inPlace?: boolean;
   /** The turn completes (successor completed) before the switch trips. */
   completedTurn?: boolean;
   holdFeature?: boolean;
@@ -195,6 +199,13 @@ async function scenario(o: Options) {
           events.push("switch");
           switched = true;
           flight.steering.tripCredentialSwitch(2);
+          if (o.inPlace) {
+            // The state a switch tripped by a refused approve leaves: every report but the
+            // switch's own would otherwise throw the switch signal.
+            flight.steering.approveRefusedBySwitchPending = () => true;
+            await ctx.attemptCredentialSwitch!();
+            throw new Error("in-place switch expected to stop the flight");
+          }
           if (o.completedTurn) throw new CredentialSwitchSignal();
           await ctx.onModelTurnSettled!(1);
           throw new Error("switch signal expected");
@@ -213,8 +224,14 @@ async function scenario(o: Options) {
     recoveryRetryMs: 1, quiesceRun, dockerHost: "unix:///nonexistent-docker.sock", liveAttempts: new LiveAttemptRegistry(),
     activeRuns: registry,
     ...(o.settlementMs ? { retainedSwitchSettlementMs: o.settlementMs } : {}),
-    ...(o.codexMs ? { codexBoundaryDeadlineMs: o.codexMs } : {}),
+    ...(o.verificationMs ? { retainedSwitchVerificationMs: o.verificationMs } : {}),
   });
+  const enter = (r as any).enterCredentialSwitch.bind(r);
+  (r as any).enterCredentialSwitch = async (...args: any[]) => {
+    const outcome = await enter(...args);
+    events.push(`enter:${outcome}`);
+    return outcome;
+  };
   const phaseClone = (r as any).phaseClone.bind(r);
   (r as any).phaseClone = async (...args: any[]) => { flight = args[1]; return phaseClone(...args); };
   // Credentialed operations, recorded so a test can prove none ran after the switch tripped.
@@ -317,8 +334,9 @@ describe("issue #3181 m3: retained credential switch settles before it reports",
 
   it("2. a verification deadline after a proven settlement stops as today, with no hold", TIMEOUT, async () => {
     // The settlement outlasts the verification allowance (60ms) yet fits its own (30s): the
-    // verification clock starts only after settlement returns.
-    const env = await scenario({ iid: 31820, survivor: "settled-by-settle", settleDelayMs: 200, codexMs: 60, settlementMs: 30_000, blockOwnership: true });
+    // verification clock starts only after settlement returns. Only the verification allowance is
+    // shortened, so the unrelated recovery discovery never depends on wall-clock under load.
+    const env = await scenario({ iid: 31820, survivor: "settled-by-settle", settleDelayMs: 200, verificationMs: 60, settlementMs: 30_000, blockOwnership: true });
     await env.run;
     assert.equal(env.wasBlocked(), true, "the verification ownership read ran and was cut by the deadline");
     assert.deepEqual(reports(env.claim.run_id, "credential_switch", "credential_switch_failed", HOLD, SETTLED), []);
@@ -338,7 +356,7 @@ describe("issue #3181 m3: retained credential switch settles before it reports",
     assert.equal(env.flight().retainedSwitchSettlement, "held");
     for (const flag of ["preserveRecoveryClone", "preserveSession", "retainedLocalCustody", "retainedEpisodeCustody"])
       assert.equal(env.flight()[flag], true, flag);
-    assert.match(feedText(env.claim.run_id), /credential switch held: run processes could not be proven stopped \(worker command settle unconfirmed\); work and custody kept on this worker\. Resume or Cancel/);
+    assert.match(feedText(env.claim.run_id), /credential switch held: run processes could not be proven stopped \(settle unconfirmed\); work and custody kept on this worker\. Resume or Cancel/);
     assert.equal(api.holdState(env.claim.run_id), "unsettled", "the flight ended and acknowledged the hold settled");
     assert.equal(env.counts.joins, 1);
     assert.equal(api.states.some(s => s.body.status === "failed"), false, "no terminal report");
@@ -346,12 +364,39 @@ describe("issue #3181 m3: retained credential switch settles before it reports",
     assertCustodyKept(env);
   });
 
+  it("3c. the in-place path: a switch tripped by a refused approve still delivers the hold and stops held", TIMEOUT, async () => {
+    // ctx.attemptCredentialSwitch (not the safety-net arm): enterCredentialSwitch returns
+    // retained_held and the flight stops with CredentialSwitchRetainedStop(held). The pending
+    // refused approve must not abort the hold report with the switch signal.
+    const env = await scenario({ iid: 31832, survivor: "permanent", settleConfirmed: false, inPlace: true });
+    await env.run;
+    assert.ok(env.events.includes("enter:retained_held"), `in-place outcome: ${env.events.join(",")}`);
+    assert.equal(reports(env.claim.run_id, HOLD).length, 1, "the hold report reached the server");
+    assert.deepEqual(reports(env.claim.run_id, "credential_switch", "credential_switch_failed"), []);
+    assert.equal(api.holdState(env.claim.run_id), "unsettled");
+    assert.equal(env.flight().retainedSwitchSettlement, "held");
+    assert.equal(env.flight().parked, true);
+    assert.ok(env.log.lines.some(l => (l as { msg: string }).msg === "credential switch held; run processes unproven, work and custody kept for an owner Resume or Cancel"));
+    assert.equal(api.states.some(s => s.body.status === "failed"), false, "no terminal report");
+    assertNoCredentialedOps(env, false);
+    assertCustodyKept(env);
+  });
+
+  it("3d. an unconfirmed hold says so in the feed and never claims a hold", TIMEOUT, async () => {
+    const env = await scenario({ iid: 31833, survivor: "permanent", settleConfirmed: false, refuseHold: true });
+    await env.run;
+    assert.doesNotMatch(feedText(env.claim.run_id), /credential switch held/);
+    assert.match(feedText(env.claim.run_id), /hold not confirmed, work and custody kept/);
+    assert.doesNotMatch(feedText(env.claim.run_id), /777001/);
+  });
+
   it("3b. a quiescence proof that names a survivor holds and names its class in the feed", TIMEOUT, async () => {
     const env = await scenario({ iid: 31831, survivor: "permanent" });
     await env.run;
     assert.deepEqual(reports(env.claim.run_id, "credential_switch", "credential_switch_failed"), []);
     assert.equal(env.flight().retainedSwitchSettlement, "held");
-    assert.match(feedText(env.claim.run_id), /run HOME-attributed reap left 1 process\(es\): pids 777001\(worker_child\)/);
+    assert.match(feedText(env.claim.run_id), /\(survivors: worker_child\); work and custody kept/);
+    assert.doesNotMatch(feedText(env.claim.run_id), /777001|HOME-attributed/, "no pid or raw detail in the feed");
     assertCustodyKept(env);
   });
 
@@ -503,7 +548,8 @@ describe("issue #3181 m3: retained credential switch settles before it reports",
         duringSettle: flight => { flight.steering.isCancelled = () => true; } });
       await env.run;
       assert.deepEqual(reports(env.claim.run_id, HOLD, SETTLED, "credential_switch", "credential_switch_failed"), []);
-      assert.equal(env.flight().retainedSwitchSettlement, undefined);
+      assert.equal(env.flight().retainedSwitchSettlement, "unproven", "an unsettled flight is joined even though no hold was reported");
+      assert.equal(env.counts.joins, 1);
       assert.equal(api.holdState(env.claim.run_id), undefined);
       assertCustodyKept(env);
     });
@@ -513,7 +559,8 @@ describe("issue #3181 m3: retained credential switch settles before it reports",
         duringSettle: flight => { flight.steering.claimFence = () => ({ kind: "superseded" }); } });
       await env.run;
       assert.deepEqual(reports(env.claim.run_id, HOLD, SETTLED, "credential_switch", "credential_switch_failed"), []);
-      assert.equal(env.flight().retainedSwitchSettlement, undefined);
+      assert.equal(env.flight().retainedSwitchSettlement, "unproven", "an unsettled flight is joined even though no hold was reported");
+      assert.equal(env.counts.joins, 1);
       assertCustodyKept(env);
     });
 
@@ -522,7 +569,8 @@ describe("issue #3181 m3: retained credential switch settles before it reports",
         duringSettle: flight => { flight.steering.pendingCredentialSwitch = () => 3; } });
       await env.run;
       assert.deepEqual(reports(env.claim.run_id, HOLD, SETTLED, "credential_switch", "credential_switch_failed"), []);
-      assert.equal(env.flight().retainedSwitchSettlement, undefined);
+      assert.equal(env.flight().retainedSwitchSettlement, "unproven", "an unsettled flight is joined even though no hold was reported");
+      assert.equal(env.counts.joins, 1);
       assertCustodyKept(env);
     });
 
@@ -625,7 +673,7 @@ describe("issue #3181 m3: SdkExecutor bounded reap and join", () => {
       const started = Date.now();
       const budget = new MaintenanceBudget(60);
       try {
-        const reap = await MaintenanceBudget.run(budget, () => exec.reapAttributedProcesses());
+        const reap = await MaintenanceBudget.run(budget, () => RetainedSwitchSettlement.run(() => exec.reapAttributedProcesses()));
         assert.deepEqual(reap, { killed: [], left: [], complete: false });
       } finally { budget.dispose(); }
       assert.ok(Date.now() - started < 5_000, "the wait was bounded by the budget");
@@ -637,6 +685,21 @@ describe("issue #3181 m3: SdkExecutor bounded reap and join", () => {
       assert.equal(reaps, 1);
     });
   }
+
+  it("a budgeted reap outside the retained-switch settlement (cancellation maintenance) still waits unbounded", TIMEOUT, async () => {
+    const exec = executor(async () => ({ killed: [], left: [], complete: true }));
+    const op = gate();
+    withOperations(exec, { lane: op.promise });
+    const budget = new MaintenanceBudget(40);
+    try {
+      let done = false;
+      const reap = MaintenanceBudget.run(budget, () => exec.reapAttributedProcesses()).then(r => { done = true; return r; });
+      await new Promise(resolve => setTimeout(resolve, 150));
+      assert.equal(done, false, "the budget alone does not bound the join");
+      op.open();
+      assert.deepEqual(await reap, { killed: [], left: [], complete: true });
+    } finally { budget.dispose(); }
+  });
 
   it("without a budget the reap waits for the pending operation, as before", TIMEOUT, async () => {
     const exec = executor(async () => ({ killed: [], left: [], complete: true }));

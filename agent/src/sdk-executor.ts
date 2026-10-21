@@ -106,7 +106,7 @@ import {
 import { classifyLimitEvidence, LimitReachedError } from "./limit.js";
 import { PauseNowSignal, CredentialSwitchSignal, PLAN_APPROVAL_TIMEOUT_REASON, MAX_FOLLOW_UP_BATCH_RUNES, followUpRunes, type PlanVerdict } from "./steering.js";
 import { DiskParkSignal } from "./cache-cap.js";
-import { MaintenanceBudget } from "./maintenance-budget.js";
+import { MaintenanceBudget, RetainedSwitchSettlement } from "./maintenance-budget.js";
 import { type RunProcessOps, type RunProcessReap, type RunProcessScan, defaultRunProcessOps } from "./run-procs.js";
 export type { RunProcessOps } from "./run-procs.js";
 import { buildMemoryServer, MEMORY_SERVER_NAME } from "./memory-tools.js";
@@ -1175,11 +1175,12 @@ export class SdkExecutor implements Executor {
    * build survives the group kill. Never throws.
    */
   async reapAttributedProcesses(): Promise<RunProcessReap> {
-    // issue #3181: under a MaintenanceBudget (the retained credential switch's settlement) the
-    // joins below are WAITS on operations this executor already runs, so they stop waiting when
-    // the budget is spent; nothing new is started and the operations keep running. Without a
-    // budget every join is unbounded, as before.
-    const budget = MaintenanceBudget.current();
+    // issue #3181: inside the retained credential switch's settlement (the RetainedSwitchSettlement
+    // marker, not merely any MaintenanceBudget: cancellation and terminal maintenance install one
+    // too) the joins below are WAITS on operations this executor already runs, so they stop waiting
+    // when the budget is spent; nothing new is started and the operations keep running. Every other
+    // caller joins without bound, as before.
+    const budget = RetainedSwitchSettlement.active() ? MaintenanceBudget.current() : undefined;
     const joined = await this.waitWithin(this.closeAndSettlePlanSummary(), budget);
     // Issue #2471: join the lane disposal killAgentTree started, so the attributed reap sees
     // the model commands already stopped (it never rejects).
