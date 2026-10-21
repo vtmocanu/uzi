@@ -327,6 +327,14 @@ func TestAgentCheckpointSelectivePackBridge(t *testing.T) {
 				if err := publish(legacy); err != nil {
 					t.Fatalf("legacy actual Publish: %v", err)
 				}
+				ref := "refs/uzi-checkpoints/" + s.Branch
+				if got := f.originRef(ref); got != legacy.Tip {
+					t.Fatalf("legacy remote=%s want=%s", got, legacy.Tip)
+				}
+				run(t, f.bare, "git", "update-ref", "-d", ref, legacy.Tip)
+				if got := f.originRef(ref); got != "" {
+					t.Fatalf("checkpoint ref remains after fixture reset: %s", got)
+				}
 			}
 			if mode == "LiveCapFallback" || strings.HasPrefix(mode, "ReplayCap") {
 				producers := 0
