@@ -3405,6 +3405,10 @@ export class CodexExecutor implements Executor {
         const turnPrompt = safetySteer
           ? `The worker detected a problem and is steering you. This is authoritative guidance from uzi itself, not user input — follow it:\n${safetySteer}\n\n${implementBody}`
           : implementBody;
+        // #3089: the owner answer may have revised frozen scope. Keep this worker recheck
+        // neutral instead of reattaching the stale creation-time plan; use trusted loop state,
+        // never text matching, and preserve the choice through retries and fresh-thread fallback.
+        const ownerCompletionRecheck = systemFollowUp !== undefined && completionAnswered;
         completionFollowUp = undefined;
         completionAnswered = false;
         // PRD #1497 M2: drive the implement turn through the wall-park wrapper — a wall trip (the own
@@ -3426,7 +3430,7 @@ export class CodexExecutor implements Executor {
               const snapshot = interruptedSnapshotNote(ctx.interruptedSnapshot);
               interruptedOwnerDispatched = true;
               return [prompt, snapshot, calls].filter(Boolean).join("\n\n");
-            } : undefined);
+            } : undefined, ownerCompletionRecheck);
           if (implTurn.kind === "walled") return { branch: ctx.branch, agentSelection, walled: { reason: REASON_WALL } };
           if (implTurn.kind === "held") return { branch: ctx.branch, agentSelection, completionHeld: { reason: implTurn.reason } };
           // Issue #1764: an owner `now` pause dropped the turn and ctx.parkForPause parked the run.
@@ -4199,6 +4203,7 @@ export class CodexExecutor implements Executor {
     // prompt (evidencesModelProcessing), not on lifecycle events such as the claim init.
     onFirstEvent?: () => void,
     beforeDispatch?: (prompt: string) => string,
+    ownerCompletionRecheck = false,
   ): Promise<ReducedTurnResult> {
     const callbackCursor = registry.callbackAdmissionCursor();
     const turnAbort = new AbortController();
@@ -4285,7 +4290,7 @@ export class CodexExecutor implements Executor {
       if (tripReason) throw this.tripError(tripReason, tripToken!);
       armIdle();
       if (beforeDispatch) prompt = beforeDispatch(prompt);
-      const request = this.buildRunRequest(ctx, phase, prompt, resumeId, turnAbort.signal, selection);
+      const request = this.buildRunRequest(ctx, phase, prompt, resumeId, turnAbort.signal, selection, ownerCompletionRecheck);
       let turn = harness.startTurn(request);
       let events = turn.events[Symbol.asyncIterator]();
       let first = await (async () => {
@@ -4300,7 +4305,7 @@ export class CodexExecutor implements Executor {
             text: "the earlier Codex session was rejected by the provider — continuing WITHOUT its earlier context, so some work may be repeated",
             event: "resume_lineage_break",
           } });
-          turn = harness.startTurn(this.buildRunRequest(ctx, phase, prompt, undefined, turnAbort.signal, selection));
+          turn = harness.startTurn(this.buildRunRequest(ctx, phase, prompt, undefined, turnAbort.signal, selection, ownerCompletionRecheck));
           events = turn.events[Symbol.asyncIterator]();
           return events.next();
         }
@@ -4497,6 +4502,7 @@ export class CodexExecutor implements Executor {
     onFirstEvent?: () => void,
     idleOperation?: () => Promise<ReducedTurnResult>,
     beforeDispatch?: (prompt: string) => string,
+    ownerCompletionRecheck = false,
   ): Promise<
     | { kind: "turn"; result: ReducedTurnResult }
     | { kind: "walled" }
@@ -4513,7 +4519,7 @@ export class CodexExecutor implements Executor {
     for (;;) {
       try {
         const result = idleOperation ? await idleOperation() : await this.driveCodexTurn(
-          ctx, harness, registry, reducer, phase, prompt, resumeId, idleMs, wall, buildPhaseBroker, selection, scrubLeadText, onProgress, pauseNow, onFirstEvent, beforeDispatch,
+          ctx, harness, registry, reducer, phase, prompt, resumeId, idleMs, wall, buildPhaseBroker, selection, scrubLeadText, onProgress, pauseNow, onFirstEvent, beforeDispatch, ownerCompletionRecheck,
         );
         // PRD #1497 M2 (CodeRabbit !1504): honor a sticky owner cancel that RACED a REFUSED
         // wall-park re-drive in EVERY phase. The wall PauseNowSignal permanently spent the shared
@@ -4877,6 +4883,7 @@ export class CodexExecutor implements Executor {
     resumeId: string | undefined,
     signal: AbortSignal,
     selection: AgentSelection | undefined,
+    ownerCompletionRecheck = false,
   ): RunTurnRequest {
     let leadBody: string | undefined;
     const agents: Record<string, HarnessAgent> = {};
@@ -4906,9 +4913,10 @@ export class CodexExecutor implements Executor {
       // developer instructions alone are not enough. Both phases get the roster below.
       if (repoSourced) prompt += `\n\n${REPO_SUBAGENT_UNTRUSTED_APPEND}`;
       // Issue #3272: replacement prompts bypass implementPrompt, and a rejected resume starts a
-      // fresh thread with only this request. Attach the owner plan here on EVERY implement
-      // dispatch, from trusted claim fields, without duplicating it in the base prompt builder.
-      if (isSeededOwnerPlan(ctx)) {
+      // fresh thread with only this request. Attach the owner plan to implement dispatches except
+      // #3089's neutral owner-completion recheck, whose revised scope supersedes the old plan.
+      // The seeded system-prompt variant still applies to that recheck.
+      if (!ownerCompletionRecheck && isSeededOwnerPlan(ctx)) {
         prompt = [
           SEEDED_PLAN_RULES,
           "",
@@ -5006,7 +5014,8 @@ export class CodexExecutor implements Executor {
    *  out so it cannot compete. Absent ⇒ the pre-approved resume (the persisted
    *  ctx.approvedPlan, framed with REVIEWED_RESUME_APPROVAL_GUIDANCE on a reviewed-plan resume
    *  (#3149), unframed otherwise) or the issue fallback. Seeded owner plans leave their framing and
-   *  plan body to buildRunRequest, so replacement turns and resume-rejection retries carry them too.
+   *  plan body to buildRunRequest, so replacement turns and resume-rejection retries carry them too,
+   *  except the neutral owner-completion recheck whose revised scope supersedes the original plan.
    *  Every body is then followed by the shared
    *  PR_SUMMARY_GUIDANCE paragraph (PRD #1798 M2), preceded by the published-floor note when
    *  there is one and followed by the milestone tracker note when there is one.

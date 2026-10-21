@@ -12510,6 +12510,11 @@ describe("CodexExecutor milestone progress (issue #1674)", () => {
         assert.match(recheck, /Worker instruction: call `signal_done` again/);
         assert.match(recheck, /re-declare `non_closing`.*every `signal_done`/);
         assert.doesNotMatch(recheck, /Deferred integration|Approved two-milestone plan|chose to CONTINUE|Milestones:|^- m2\b/m);
+        assert.ok(!recheck.includes(SEEDED_PLAN_RULES), "the neutral owner recheck carries no seeded turn prefix");
+        const recheckThread = rig.epochs[1]!.transport.requests.find(r => r.method === "thread/start" || r.method === "thread/resume");
+        assert.ok(recheckThread);
+        assert.ok(String(rec(recheckThread.params).developerInstructions).includes(SEEDED_PLAN_RULES),
+          "the seeded system-prompt variant remains on the owner recheck");
         const tag = recheck.match(/\n<(follow_up_[a-f0-9]+)>\n/)?.[1];
         assert.ok(tag);
         const close = `</${tag}>`;
