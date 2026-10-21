@@ -91,6 +91,16 @@ function groupAlive(pid: number): boolean {
   }
 }
 
+/** Strict: only a successful probe counts (EPERM from a lingering zombie does not). */
+function groupHasLiveMember(pid: number): boolean {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function signalGroup(pid: number, signal: NodeJS.Signals): void {
   try {
     process.kill(-pid, signal);
@@ -138,7 +148,7 @@ function main(): void {
   const junit = process.env.UZI_AGENT_TEST_JUNIT;
   if (junit) args.push("--test-reporter=junit", `--test-reporter-destination=${junit}`);
   args.push("--test-timeout=120000", ...selection, ...selected);
-  const status = git(root, ["status", "--porcelain", "--untracked-files=normal"]);
+  const status = git(root, ["--no-optional-locks", "status", "--porcelain", "--untracked-files=normal"]);
   const invocation: Invocation = {
     id,
     dir,
@@ -154,6 +164,7 @@ function main(): void {
     started_at: new Date().toISOString(),
   };
   writeJsonAtomic(path.join(dir, "invocation.json"), invocation);
+  writeJsonAtomic(path.join(dir, "selected.json"), selected);
   writeJsonAtomic(path.join(base, "latest.json"), { id, dir, started_at: invocation.started_at });
   console.log(`agent-test-report: ${dir}`);
 
@@ -162,7 +173,7 @@ function main(): void {
   // while tmpdir-leak-guard deletes their TMPDIR.
   const child = spawn(process.execPath, args, {
     cwd: root,
-    env: { ...process.env, UZI_AGENT_TEST_REPORT_RUN_DIR: dir, UZI_AGENT_TEST_REPORT_TOTAL: String(selected.length) },
+    env: { ...process.env, UZI_AGENT_TEST_REPORT_RUN_DIR: dir },
     stdio: "inherit",
     detached: true,
   });
@@ -259,23 +270,28 @@ function main(): void {
           cleanup = "unverified";
         }
         if (cleanup === "unverified") console.error("agent-tests: cleanup UNVERIFIED: the test process group may still be alive");
+      } else if (child.pid !== undefined && groupHasLiveMember(child.pid)) {
+        // Diagnostic only: an uninterrupted run is not swept, so a test that leaves a process behind
+        // is named here rather than silently killed.
+        cleanup = "leftover";
+        console.error("agent-tests: processes from the test run are still alive after it exited (left behind by a test)");
       }
       finish(code, signal, cleanup, null);
       process.off("SIGINT", onInt);
       process.off("SIGTERM", onTerm);
-      // The watchdog's own SIGTERM is not a caller's signal: report a plain failure.
-      if (termination === "watchdog") {
+      // A caller's signal always wins and is re-raised; the watchdog's own SIGTERM is not one.
+      if (termination === "watchdog" && !interrupted) {
         process.exitCode = 1;
         return;
       }
-      const ended = interrupted ?? signal;
+      const ended = interrupted ?? (termination === "watchdog" ? undefined : signal);
       if (ended) {
         process.exitCode = 128 + constants.signals[ended];
         // Restore default signal handling only after the owned group has closed.
         process.kill(process.pid, ended);
         return;
       }
-      process.exitCode = cleanup === "unverified" ? 1 : (code ?? 1);
+      process.exitCode = code ?? 1;
     })().catch((error: unknown) => {
       reportError(error);
       clearInterval(watchdog);

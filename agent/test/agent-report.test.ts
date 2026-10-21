@@ -38,7 +38,7 @@ function fixture(files: Record<string, string>): string {
 function env(root: string, extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const base: NodeJS.ProcessEnv = { ...process.env, FIXTURE_ROOT: root };
   for (const key of ["NODE_TEST_CONTEXT", "UZI_AGENT_TEST_SHARD", "UZI_AGENT_TEST_CONCURRENCY", "UZI_AGENT_TEST_JUNIT",
-    "UZI_AGENT_TEST_REPORT_DIR", "UZI_AGENT_TEST_REPORT_RUN_DIR", "UZI_AGENT_TEST_REPORT_TOTAL",
+    "UZI_AGENT_TEST_REPORT_DIR", "UZI_AGENT_TEST_REPORT_RUN_DIR",
     "UZI_AGENT_TEST_STALL_MS", "UZI_AGENT_TEST_STALL_TESTONLY"]) delete base[key];
   return { ...base, ...extra };
 }
@@ -177,8 +177,12 @@ test("a later file's failure is visible in progress while an earlier file is sti
   try {
     await until(() => existsSync(path.join(root, ".test-report/latest.json")), 20_000, "latest.json");
     const progressFile = path.join(latestDir(root), "progress.json");
-    await until(() => (readJson<Progress>(progressFile)?.failures ?? []).some((failure) => failure.name === "fails early"),
-      20_000, "the early failure in progress.json");
+    // The held file is listed at its first inner event, which can trail the other file's failure.
+    await until(() => {
+      const seen = readJson<Progress>(progressFile);
+      return (seen?.failures ?? []).some((failure) => failure.name === "fails early")
+        && seen?.files["test/a-hold.test.ts"] !== undefined;
+    }, 20_000, "the early failure and the held file in progress.json");
     const live = readJson<Progress>(progressFile)!;
     assert.equal(live.state, "running");
     assert.ok(live.files["test/a-hold.test.ts"] && live.files["test/a-hold.test.ts"].done_at === undefined,
@@ -279,6 +283,77 @@ test("the watchdog does not fire while another file is still queued; SIGTERM the
   }
 });
 
+test("a test registered by a helper module never counts as a file, so a queued file still blocks the watchdog", { timeout: 60_000 }, async () => {
+  const root = fixture({
+    "a-leak.test.ts": [
+      'import test from "node:test";',
+      'import { registerHelperTest } from "./helper.js";',
+      'import { writeFileSync } from "node:fs";',
+      'registerHelperTest();',
+      'test("local, then leaks", () => {',
+      '  writeFileSync(process.env.FIXTURE_ROOT + "/leak.pid", String(process.pid));',
+      '  setInterval(() => {}, 1000);',
+      '});',
+    ].join("\n"),
+    "helper.ts": 'import test from "node:test";\nexport function registerHelperTest(): void { test("from a helper", () => {}); }\n',
+    "b-queued.test.ts": [
+      'import test from "node:test";',
+      'import { writeFileSync } from "node:fs";',
+      'test("queued", () => { writeFileSync(process.env.FIXTURE_ROOT + "/queued-ran", ""); });',
+    ].join("\n"),
+  });
+  const run = launch(root, { UZI_AGENT_TEST_STALL_MS: "500", UZI_AGENT_TEST_STALL_TESTONLY: "1", UZI_AGENT_TEST_CONCURRENCY: "1" });
+  try {
+    await until(() => existsSync(path.join(root, "leak.pid")), 20_000, "the leaking test");
+    await new Promise((resolve) => setTimeout(resolve, 2_500)); // five stall windows
+    assert.equal(run.child.exitCode, null, "a helper-located test must not stand in for the queued file\n" + run.output.join(""));
+    assert.doesNotMatch(run.output.join(""), /HUNG/);
+    const progress = readJson<Progress>(path.join(latestDir(root), "progress.json"))!;
+    assert.deepEqual(Object.keys(progress.files), ["test/a-leak.test.ts"]);
+    assert.ok(progress.unattributed_last_event_at, "the helper's events are recorded as unattributed");
+    assert.equal(progress.counts.pass, 2, "helper-defined tests still count");
+    run.child.kill("SIGTERM");
+    await run.closed;
+    assert.equal(existsSync(path.join(root, "queued-ran")), false);
+  } finally {
+    const pid = Number(readJson<number>(path.join(root, "leak.pid")));
+    if (pid > 1 && alive(pid)) process.kill(pid, "SIGKILL");
+    if (run.child.exitCode === null && run.child.signalCode === null) run.child.kill("SIGKILL");
+    await run.closed.catch(() => undefined);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an uninterrupted run that leaves a process behind is reported as leftover, not swept", { timeout: 60_000 }, () => {
+  const root = fixture({
+    "leaves.test.ts": [
+      'import test from "node:test";',
+      'import { spawn } from "node:child_process";',
+      'import { writeFileSync } from "node:fs";',
+      'test("spawns and forgets", () => {',
+      '  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], { stdio: "ignore" });',
+      '  child.unref();',
+      '  writeFileSync(process.env.FIXTURE_ROOT + "/left.pid", String(child.pid));',
+      '});',
+    ].join("\n"),
+  });
+  try {
+    const result = spawnSync(process.execPath, ["--import", "tsx", "test/run-unit-tests.ts"], {
+      cwd: root, env: env(root), encoding: "utf8", timeout: 45_000,
+    });
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    const summary = readJson<Summary>(path.join(latestDir(root), "summary.json"))!;
+    assert.equal(summary.state, "complete");
+    assert.equal(summary.cleanup, "leftover");
+    assert.match(result.stdout, /LEFTOVER processes/);
+    assert.equal(alive(Number(readFileSync(path.join(root, "left.pid"), "utf8"))), true, "diagnostic only: not killed");
+  } finally {
+    const pid = Number(readJson<number>(path.join(root, "left.pid")));
+    if (pid > 1 && alive(pid)) process.kill(pid, "SIGKILL");
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("concurrent invocations write separate report directories", { timeout: 60_000 }, async () => {
   const root = fixture({ "ok.test.ts": 'import test from "node:test";\ntest("ok", () => {});\n' });
   try {
@@ -319,7 +394,7 @@ test("hungFiles needs every pending file silent and every other file done", () =
   const at = (ms: number): string => new Date(ms).toISOString();
   const progress = (files: Progress["files"]): Progress => ({
     schema: 1, scope: "unit", state: "running", started_at: at(0), heartbeat_at: at(0), last_event_at: at(0),
-    files_total: 3, files, counts: { tests: 0, pass: 0, fail: 0, cancelled: 0, skip: 0, todo: 0, file_failures: 0, suite_failures: 0 },
+    unattributed_last_event_at: null, selection_known: true, files_total: 3, files, counts: { tests: 0, pass: 0, fail: 0, cancelled: 0, skip: 0, todo: 0, file_failures: 0, suite_failures: 0 },
     failures: [], failures_omitted: 0, node_counts: null,
   });
   const done = { started_at: at(0), last_event_at: at(0), done_at: at(0) };
@@ -333,26 +408,183 @@ test("hungFiles needs every pending file silent and every other file done", () =
 
 // Node caps each test at --test-timeout, but an explicit test or suite `timeout` option overrides that
 // cap. A test allowed to run silently for longer than the stall window could be stopped as hung, so
-// keep every literal timeout option well below the window. A non-literal value is checked by hand:
-// add it to KNOWN with its resolved value.
-test("no test timeout option can outlast the hung-file window", () => {
-  const limit = DEFAULT_STALL_MS - 120_000;
-  const KNOWN: Record<string, number> = {};
-  const option = /\b(?:test|it|describe|suite)(?:\.(?:only|skip|todo))?\(\s*(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`[^`]*`|[\w.]+)\s*,\s*\{([^{}]*)\}/g;
+// every timeout option must evaluate, with a strict grammar (numbers, same-file numeric constants,
+// + - * / and parentheses), to well below the window. Anything else is an offender to check by hand.
+
+/**
+ * Index just past the bracket, string or comment construct starting at `open`. Every step advances,
+ * so malformed input (an unterminated string or comment) ends at the end of the source, never loops.
+ */
+function skipBalanced(source: string, open: number): number {
+  const pairs: Record<string, string> = { "(": ")", "[": "]", "{": "}" };
+  const stack: string[] = [];
+  let index = open;
+  while (index < source.length) {
+    const char = source[index]!;
+    let next = index + 1;
+    if (char === '"' || char === "'" || char === "`") {
+      let scan = index + 1;
+      while (scan < source.length && source[scan] !== char) scan += source[scan] === "\\" ? 2 : 1;
+      next = Math.min(scan + 1, source.length);
+    } else if (char === "/" && source[index + 1] === "/") {
+      const newline = source.indexOf("\n", index);
+      next = newline < 0 ? source.length : newline;
+    } else if (char === "/" && source[index + 1] === "*") {
+      const close = source.indexOf("*/", index + 2);
+      next = close < 0 ? source.length : close + 2;
+    } else if (pairs[char]) {
+      stack.push(pairs[char]);
+    } else if (char === stack[stack.length - 1]) {
+      stack.pop();
+    }
+    index = next;
+    if (stack.length === 0) return index;
+  }
+  return source.length;
+}
+
+/** Top-level comma-separated pieces of `text` (an argument list or an object body). */
+function splitTopLevel(text: string): string[] {
+  const parts: string[] = [];
+  let begin = 0;
+  for (let index = 0; index < text.length;) {
+    const char = text[index]!;
+    if ("([{\"'`".includes(char) || (char === "/" && (text[index + 1] === "/" || text[index + 1] === "*"))) {
+      index = skipBalanced(text, index);
+    } else {
+      if (char === ",") {
+        parts.push(text.slice(begin, index));
+        begin = index + 1;
+      }
+      index++;
+    }
+  }
+  parts.push(text.slice(begin));
+  return parts.map((part) => part.trim()).filter(Boolean);
+}
+
+/** Strict arithmetic over numbers and same-file `const NAME = <expr>`; undefined for anything else. */
+function evaluateTimeout(expression: string, source: string, seen: Set<string> = new Set()): number | undefined {
+  const tokens = expression.match(/\d[\d_]*(?:\.\d+)?|[A-Za-z_$][\w$]*|[-+*/()]|\S/g) ?? [];
+  let position = 0;
+  const factor = (): number | undefined => {
+    const token = tokens[position++];
+    if (token === undefined) return undefined;
+    if (/^\d/.test(token)) return Number(token.replaceAll("_", ""));
+    if (token === "(") {
+      const value = sum();
+      return tokens[position++] === ")" ? value : undefined;
+    }
+    if (/^[A-Za-z_$]/.test(token) && !seen.has(token)) {
+      const declared = new RegExp(`\\bconst\\s+${token}\\s*(?::\\s*number\\s*)?=\\s*([^;\\n]+)`).exec(source)?.[1];
+      return declared === undefined ? undefined : evaluateTimeout(declared, source, new Set([...seen, token]));
+    }
+    return undefined;
+  };
+  const product = (): number | undefined => {
+    let value = factor();
+    while (value !== undefined && (tokens[position] === "*" || tokens[position] === "/")) {
+      const operator = tokens[position++];
+      const right = factor();
+      value = right === undefined ? undefined : operator === "*" ? value * right : value / right;
+    }
+    return value;
+  };
+  const sum = (): number | undefined => {
+    let value = product();
+    while (value !== undefined && (tokens[position] === "+" || tokens[position] === "-")) {
+      const operator = tokens[position++];
+      const right = product();
+      value = right === undefined ? undefined : operator === "+" ? value + right : value - right;
+    }
+    return value;
+  };
+  const value = sum();
+  return position === tokens.length && value !== undefined && Number.isFinite(value) ? value : undefined;
+}
+
+/** The source with string and comment contents blanked (same length), so code inside a fixture string is not scanned. */
+function blankLiterals(source: string): string {
+  let out = "";
+  for (let index = 0; index < source.length;) {
+    const char = source[index]!;
+    const comment = char === "/" && (source[index + 1] === "/" || source[index + 1] === "*");
+    if (char === '"' || char === "'" || char === "`" || comment) {
+      const end = skipBalanced(source, index);
+      const body = source.slice(index, end);
+      out += comment ? body.replace(/[^\n]/g, " ") : char + body.slice(1, -1).replace(/[^\n]/g, " ") + char;
+      index = end;
+    } else {
+      out += char;
+      index++;
+    }
+  }
+  return out;
+}
+
+/**
+ * Every literal-object `timeout` option passed to a test, suite or hook (incl. .only/.skip/.todo), as raw
+ * expressions. Known gap: options passed as a variable are not followed.
+ */
+function timeoutOptions(original: string): string[] {
+  const source = blankLiterals(original);
+  const found: string[] = [];
+  const call = /\b(?:test|it|describe|suite|before|after|beforeEach|afterEach)(?:\.(?:only|skip|todo))?\s*\(/g;
+  for (const match of source.matchAll(call)) {
+    const open = match.index! + match[0].length - 1;
+    const args = splitTopLevel(source.slice(open + 1, skipBalanced(source, open) - 1));
+    for (const arg of args.slice(0, 2)) {
+      if (!arg.startsWith("{")) continue;
+      for (const property of splitTopLevel(arg.slice(1, -1))) {
+        const pair = /^timeout\s*(?::\s*([\s\S]+))?$/.exec(property);
+        if (pair) found.push(pair[1]?.trim() ?? "timeout");
+      }
+    }
+  }
+  return found;
+}
+
+function timeoutOffenders(file: string, source: string, limit: number): string[] {
   const offenders: string[] = [];
+  for (const expression of timeoutOptions(source)) {
+    const value = evaluateTimeout(expression, source);
+    if (value === undefined) offenders.push(`${file}: unsupported timeout ${JSON.stringify(expression)}`);
+    else if (value > limit) offenders.push(`${file}: timeout ${expression} = ${value} > ${limit}`);
+  }
+  return offenders;
+}
+
+const TIMEOUT_LIMIT = DEFAULT_STALL_MS - 120_000;
+
+test("the timeout guard parses whole expressions and refuses what it cannot evaluate", () => {
+  const offenders = (source: string): string[] => timeoutOffenders("f.ts", source, TIMEOUT_LIMIT);
+  assert.deepEqual(offenders('test("a", { timeout: 10_000 }, () => {});'), []);
+  assert.deepEqual(offenders('const PER = 120000;\nit("a", { timeout: PER }, () => {});'), []);
+  assert.deepEqual(offenders('describe("a", { timeout: 2 * 60_000, concurrency: 1 }, () => {});'), []);
+  assert.equal(offenders('test("slow", { timeout: 100 * 60_000 }, () => {});').length, 1, "spaced arithmetic");
+  assert.equal(offenders('test("slow", { signal: { aborted: false }, timeout: 3_600_000 }, () => {});').length, 1,
+    "nested option objects");
+  assert.equal(offenders('test.only("slow", { timeout: (10 + 5) * 60_000 }, () => {});').length, 1);
+  assert.equal(offenders('test("x", { timeout: Number.MAX_SAFE_INTEGER }, () => {});').length, 1, "unsupported");
+  assert.equal(offenders('test("x", { timeout: ms() }, () => {});').length, 1, "unsupported");
+  assert.equal(offenders('const timeout = 900_000;\ntest("x", { timeout }, () => {});').length, 1, "shorthand");
+  assert.deepEqual(offenders('assert.deepEqual(calls, [{ timeout: 60_000 }]);\nconst opts = { timeout: 9e9 };'), [],
+    "data fields outside test options are not options");
+  assert.equal(offenders('before(() => {}, { timeout: 20 * 60_000 });').length, 1, "hook options");
+  assert.deepEqual(offenders('/* unterminated comment test("x", { timeout: 1 })'), [], "malformed input terminates");
+  assert.deepEqual(offenders('const s = "unterminated'), [], "malformed input terminates");
+});
+
+test("no test timeout option can outlast the hung-file window", () => {
+  const offenders: string[] = [];
+  let options = 0;
   for (const name of readdirSync(new URL("./", import.meta.url), { recursive: true })) {
     const file = String(name);
     if (!file.endsWith(".ts")) continue;
     const source = readFileSync(new URL(file, import.meta.url), "utf8");
-    for (const match of source.matchAll(option)) {
-      const value = /(?:^|[\s,])timeout\s*:\s*([^,}\s]+)/.exec(match[1]!)?.[1];
-      if (value === undefined) continue;
-      const literal = /^[\d_]+$/.test(value) ? Number(value.replaceAll("_", "")) : undefined;
-      const constant = new RegExp(`\\bconst\\s+${value.replace(/[^\w]/g, "")}\\s*=\\s*([\\d_]+)\\s*;`).exec(source)?.[1];
-      const resolved = literal ?? (constant === undefined ? KNOWN[`${file}:${value}`] : Number(constant.replaceAll("_", "")));
-      if (resolved === undefined) offenders.push(`${file}: unresolved timeout ${value}`);
-      else if (resolved > limit) offenders.push(`${file}: timeout ${resolved} > ${limit}`);
-    }
+    options += timeoutOptions(source).length;
+    offenders.push(...timeoutOffenders(file, source, TIMEOUT_LIMIT));
   }
   assert.deepEqual(offenders, []);
+  assert.ok(options >= 100, `the scan must see the suite's timeout options (saw ${options})`);
 });

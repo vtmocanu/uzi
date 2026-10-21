@@ -13,11 +13,9 @@
 // real-procfs-skip-check.sh, tmpdir-leak-guard.sh and test:codex-m4 run after it). A missing
 // summary, a progress file still `running`, or `state: incomplete` is never green, however fresh
 // its heartbeat.
-import { closeSync, fsyncSync, openSync, renameSync, writeSync } from "node:fs";
-import path from "node:path";
-import { REPORT_SCHEMA, writeJsonAtomic } from "./agent-report-reporter.js";
+import { REPORT_SCHEMA, writeJsonAtomic, writeTextAtomic } from "./agent-report-reporter.js";
 
-export { REPORT_SCHEMA, writeJsonAtomic };
+export { REPORT_SCHEMA, writeJsonAtomic, writeTextAtomic };
 /** A file with no event for this long, once every other file finished, is treated as hung. */
 export const DEFAULT_STALL_MS = 600_000;
 export type FailureKind = "fail" | "cancelled" | "file" | "suite";
@@ -61,6 +59,10 @@ export interface Progress {
   /** The reporter's own liveness, kept apart from test activity so a live reporter cannot hide a stall. */
   heartbeat_at: string;
   last_event_at: string | null;
+  /** Events located outside every selected file (a test registered by a helper module). */
+  unattributed_last_event_at: string | null;
+  /** False when the reporter could not read the selected inventory: the watchdog then never fires. */
+  selection_known: boolean;
   files_total: number | null;
   files: Record<string, FileState>;
   counts: Counts;
@@ -100,24 +102,14 @@ export interface Summary {
   invocation: Invocation;
   exit: { code: number | null; signal: string | null };
   termination: Termination;
-  cleanup: "not-needed" | "verified" | "unverified";
+  /** leftover: an uninterrupted run exited with members of its process group still alive (not swept). */
+  cleanup: "not-needed" | "verified" | "unverified" | "leftover";
   hung_files: string[];
   in_flight_files: string[];
   finished_at: string;
   progress: Progress | null;
 }
 
-export function writeTextAtomic(file: string, text: string): void {
-  const temp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.tmp`);
-  const fd = openSync(temp, "w", 0o644);
-  try {
-    writeSync(fd, text);
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-  renameSync(temp, file);
-}
 
 /** Files in flight (started, not done), oldest activity first. */
 export function inFlight(progress: Progress): string[] {
@@ -129,12 +121,18 @@ export function inFlight(progress: Progress): string[] {
 
 /**
  * The hung-file verdict: every selected file is either done or silent for at least stallMs, and at
- * least one is silent. A file still queued (no event yet) or recently active blocks it, so the
+ * least one is silent. Files are the launcher's selected inventory, matched by exact path; an event
+ * located in any other file (a helper module) only blocks the verdict while recent. A file still queued (no event yet) or recently active blocks it, so the
  * watchdog never cuts coverage short. Silence means no test started or finished in that file: every
  * test is capped by --test-timeout, but a leaked handle keeps the file's process alive forever after
  * its last test, and node's file-level completion never arrives.
  */
 export function hungFiles(progress: Progress, total: number, now: number, stallMs: number): string[] {
+  if (!progress.selection_known) return [];
+  // Activity node located outside the selected files (a helper-defined test) belongs to some
+  // selected file we cannot name: while it is recent, nothing is provably silent.
+  const unattributed = progress.unattributed_last_event_at;
+  if (unattributed !== null && now - Date.parse(unattributed) < stallMs) return [];
   const pending = inFlight(progress);
   const done = Object.keys(progress.files).length - pending.length;
   const silent = pending.filter((file) => now - Date.parse(progress.files[file]!.last_event_at) >= stallMs);
@@ -176,6 +174,7 @@ export function renderSummaryText(summary: Summary, failureLines = 20): string {
     lines.push(`in flight when stopped: ${summary.in_flight_files.join(" ")}`);
   }
   if (summary.cleanup === "unverified") lines.push("CLEANUP UNVERIFIED: the test process group may still be running");
+  if (summary.cleanup === "leftover") lines.push("LEFTOVER processes: a test left processes running after the run exited");
   lines.push(`report: ${summary.invocation.dir}`);
   return lines.join("\n") + "\n";
 }

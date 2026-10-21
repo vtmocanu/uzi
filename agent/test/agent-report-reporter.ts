@@ -12,7 +12,7 @@
 // Self-contained at runtime on purpose: node loads a reporter module without the `.js` -> `.ts`
 // mapping a relative import needs, so this file imports only node builtins and TYPES (erased).
 // The launcher imports its shared runtime helpers from here, through agent-report.ts.
-import { closeSync, fsyncSync, openSync, renameSync, writeSync } from "node:fs";
+import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type { Counts, Failure, Progress } from "./agent-report.js";
 
@@ -31,16 +31,15 @@ function boundError(text: string): string {
 }
 
 /** Write JSON atomically: a temp file in the SAME directory (never os.tmpdir(), which the leak guard deletes), then rename. */
-export function writeJsonAtomic(file: string, value: unknown): void {
+/** Atomic replace: a temp file in the SAME directory (never os.tmpdir(), which the leak guard deletes), then rename. */
+export function writeTextAtomic(file: string, text: string): void {
   const temp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.tmp`);
-  const fd = openSync(temp, "w", 0o644);
-  try {
-    writeSync(fd, JSON.stringify(value, null, 1) + "\n");
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
+  writeFileSync(temp, text, { mode: 0o644 });
   renameSync(temp, file);
+}
+
+export function writeJsonAtomic(file: string, value: unknown): void {
+  writeTextAtomic(file, JSON.stringify(value, null, 1) + "\n");
 }
 
 
@@ -85,7 +84,15 @@ export default async function* agentReport(source: AsyncIterable<TestEvent>): As
     return;
   }
   const file = path.join(dir, "progress.json");
-  const total = Number(process.env.UZI_AGENT_TEST_REPORT_TOTAL);
+  // The launcher's exact selected inventory: only these paths are files; an event located anywhere
+  // else (a test registered by a helper module) cannot be attributed and never counts as a file.
+  let selected: Set<string> | null = null;
+  try {
+    const list: unknown = JSON.parse(readFileSync(path.join(dir, "selected.json"), "utf8"));
+    if (Array.isArray(list) && list.every((entry) => typeof entry === "string")) selected = new Set(list as string[]);
+  } catch {
+    selected = null;
+  }
   const now = (): string => new Date().toISOString();
   const progress: Progress = {
     schema: REPORT_SCHEMA,
@@ -94,7 +101,9 @@ export default async function* agentReport(source: AsyncIterable<TestEvent>): As
     started_at: now(),
     heartbeat_at: now(),
     last_event_at: null,
-    files_total: Number.isSafeInteger(total) && total > 0 ? total : null,
+    unattributed_last_event_at: null,
+    selection_known: selected !== null,
+    files_total: selected?.size ?? null,
     files: {},
     counts: emptyCounts(),
     failures: [],
@@ -102,8 +111,15 @@ export default async function* agentReport(source: AsyncIterable<TestEvent>): As
     node_counts: null,
   };
   let lastWrite = 0;
+  let trailing: NodeJS.Timeout | undefined;
   const write = (force: boolean): void => {
-    if (!force && Date.now() - lastWrite < THROTTLE_MS) return;
+    if (!force && Date.now() - lastWrite < THROTTLE_MS) {
+      // A throttled change still lands within THROTTLE_MS, even if no event follows it.
+      trailing ??= setTimeout(() => write(true), THROTTLE_MS).unref();
+      return;
+    }
+    if (trailing) clearTimeout(trailing);
+    trailing = undefined;
     progress.heartbeat_at = now();
     writeJsonAtomic(file, progress);
     lastWrite = Date.now();
@@ -146,18 +162,23 @@ export default async function* agentReport(source: AsyncIterable<TestEvent>): As
       }
       const at = now();
       progress.last_event_at = at;
-      let state = progress.files[relative];
-      const started = state === undefined;
-      if (state === undefined) {
-        state = { started_at: at, last_event_at: at };
-        progress.files[relative] = state;
+      const attributable = isFileWrapper || selected?.has(relative) === true;
+      let state = attributable ? progress.files[relative] : undefined;
+      let important = false;
+      if (!attributable) {
+        progress.unattributed_last_event_at = at;
+      } else {
+        if (state === undefined) {
+          state = { started_at: at, last_event_at: at };
+          progress.files[relative] = state;
+          important = true;
+        }
+        state.last_event_at = at;
       }
-      state.last_event_at = at;
-      let important = started;
       if (event.type === "test:complete") {
         const details = data.details ?? {};
         const type = failureType(details.error);
-        if (isFileWrapper) {
+        if (isFileWrapper && state !== undefined) {
           state.done_at = at;
           state.duration_ms = details.duration_ms;
           state.passed = details.passed === true;
@@ -197,6 +218,7 @@ export default async function* agentReport(source: AsyncIterable<TestEvent>): As
     yield `agent-report: ${progress.state}, ${Object.values(progress.files).filter((state) => state.done_at).length} file(s) done\n`;
   } finally {
     clearInterval(heartbeat);
+    if (trailing) clearTimeout(trailing);
     write(true);
   }
 }
