@@ -600,8 +600,15 @@ describe("RunRunner m4 — Codex durability sinks route through withBoundary", (
   it("(1) recovery publication routes through withBoundary (boundary=shutdown)", { timeout: 15_000 }, async (t) => {
     const { gitlab } = fakeGitlab();
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-m4-rec-"));
-    // commitInTree completes synchronously; this fake starts no provider work.
-    const rig = codexRig({ providerRoot: false });
+    const rig = codexRig();
+    assert.equal(rig.registry.rootCount(), 1, "recovery starts with a tracked provider root");
+    let legacySettles = 0;
+    const sourceReadReaps: number[] = [];
+    const worktreeStatus = git.worktreeStatus.bind(git);
+    git.worktreeStatus = async (...args: Parameters<typeof worktreeStatus>) => {
+      if (events.includes("transient")) sourceReadReaps.push(rig.reaps());
+      return worktreeStatus(...args);
+    };
     const events: string[] = [];
     const withBoundary = rig.safety.withBoundary.bind(rig.safety);
     rig.safety.withBoundary = async (request, action) => {
@@ -613,12 +620,8 @@ describe("RunRunner m4 — Codex durability sinks route through withBoundary", (
       events.push("transient");
       throw new TransientRecoveryError();
     }, async () => {
-      events.push("legacy-settle");
-      assert.equal(rig.registry.rootCount(), 0);
-      assert.equal(rig.registry.pendingLaunchCount(), 0);
-      assert.equal(rig.registry.inFlightCallbackCount(), 0);
-      events.push("legacy-empty");
-      return { kind: "observed_empty" };
+      legacySettles++;
+      throw new Error("legacy credential-free settlement must not run");
     }, rig.capture);
     const runner = runnerWith(() => ({ executor: exec }), gitlab, undefined, nullLogger(), {
       recoveryRetryMs: 1, checkpointIntervalMs: 0,
@@ -629,12 +632,10 @@ describe("RunRunner m4 — Codex durability sinks route through withBoundary", (
     const execution = runner.execute(claim);
     try {
       await execution;
-      assert.equal(events.filter(event => event === "legacy-settle").length, 1, "transient recovery invokes legacy settlement once");
-      assert.equal(events.filter(event => event === "legacy-empty").length, 1, "legacy settlement verifies the empty registry");
-      assert.ok(events.indexOf("legacy-settle") > events.indexOf("transient"));
-      assert.ok(events.indexOf("legacy-empty") > events.indexOf("legacy-settle"));
+      assert.equal(legacySettles, 0, "authenticated recovery uses the normal boundary drain");
+      assert.ok(sourceReadReaps.length > 0, "recovery read the real source");
+      assert.ok(sourceReadReaps[0]! > 0, "the tracked provider root was reaped before the first recovery source read");
       assert.ok(rig.boundaries.includes("shutdown"), `recovery boundary recorded; got ${JSON.stringify(rig.boundaries)}`);
-      assert.ok(events.indexOf("legacy-empty") < events.indexOf("boundary:shutdown"), "strict settlement precedes the authenticated recovery boundary");
       assert.ok(
         api.states.some((s) => s.runId === claim.run_id && s.body.status === "recovery_wait"),
         "the run parked at recovery_wait",
@@ -643,6 +644,7 @@ describe("RunRunner m4 — Codex durability sinks route through withBoundary", (
       t.signal.removeEventListener("abort", shutdown);
       runner.shutdown();
       await execution;
+      git.worktreeStatus = worktreeStatus;
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
   });

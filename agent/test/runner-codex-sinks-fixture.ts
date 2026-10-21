@@ -232,8 +232,6 @@ export function virtualBoundaryClock() {
 export function codexRig(
   opts: {
     authMode?: "subscription" | "api_key";
-    /** Set false only for synchronous fakes that own no provider work; defaults to true. */
-    providerRoot?: boolean;
     /** Genuine runner lifecycle, joined from RunContext by lifecycle-sensitive scenarios. */
     lifecycleSignal?: AbortSignal;
     credentialClient?: Pick<WorkerClient, "releaseCodex" | "refreshCodex">;
@@ -262,7 +260,7 @@ export function codexRig(
   const authMode = opts.authMode ?? "subscription";
   const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
   const tr = trackedRoot();
-  if (opts.providerRoot !== false) registerRoot(registry, tr.root);
+  registerRoot(registry, tr.root);
   const binding = bindingOf(authMode === "subscription" ? SUBSCRIPTION : API_KEY);
 
   let refreshCalls = 0;

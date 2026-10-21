@@ -345,28 +345,26 @@ describe("M2 account park W3-W6/W9", () => {
     } finally { restore(); }
   });
 
-  it("W5/W6 capture-discovered account deferral replaces cause/feed and freshly confirms/settles before retry park", async (t) => {
+  it("W5/W6 authenticated pre-boundary account deferral replaces cause/feed and freshly confirms before held capture retries and park", async (t) => {
     client.protocolFeatures = [FEATURE, "claim_generation_fence"];
     const { gitlab, calls } = fakeGitlab();
-    // This synchronous fake finishes its filesystem mutations and owns no provider work.
-    const rig = codexRig({ accountUnavailable: () => true, providerRoot: false });
+    // The authenticated normal boundary discovers deferral before the credential-free held capture.
+    const rig = codexRig({ accountUnavailable: () => true });
+    assert.equal(rig.registry.rootCount(), 1, "deferral starts with a tracked provider root");
+    let legacySettles = 0;
     const claim = gitlabClaim(159512, { claim_generation: 3 });
     const events: string[] = [];
     let settled = 0;
     let proofs = 0;
-    const blockedProofs: Array<{ settled: number; custody: number; dirty: boolean; terminal: boolean }> = [];
+    const blockedProofs: Array<{ settled: number; reaped: boolean; custody: number; dirty: boolean; terminal: boolean }> = [];
     const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
       commitInTree(ctx.worktreePath, "COMMITTED.txt", "committed, not yet fetched back\n");
       fs.writeFileSync(path.join(ctx.worktreePath, "DIRTY.txt"), "uncommitted edit\n");
       events.push("transient");
       throw new TransientRecoveryError();
     }, async () => {
-      events.push("legacy-settle");
-      assert.equal(rig.registry.rootCount(), 0);
-      assert.equal(rig.registry.pendingLaunchCount(), 0);
-      assert.equal(rig.registry.inFlightCallbackCount(), 0);
-      events.push("legacy-empty");
-      return { kind: "observed_empty" };
+      legacySettles++;
+      throw new Error("legacy credential-free settlement must not run");
     }, async (ms, action, purpose, signal) => { settled++; events.push("settle"); return rig.capture(ms, action, purpose, signal); });
     const { logger, lines } = recordingLogger();
     const runner = runnerWith(() => ({ executor: exec }), gitlab, undefined, logger, {
@@ -374,9 +372,9 @@ describe("M2 account park W3-W6/W9", () => {
       quiesceRun: async (request) => {
         if (request.site === "recovery_capture") {
           proofs++;
-          if (proofs > 1 && proofs <= 8) {
+          if (proofs <= 7) {
             // Record here; assert after execute so quiescence error handling cannot swallow a failed assertion.
-            blockedProofs.push({ settled, custody: custody(),
+            blockedProofs.push({ settled, reaped: rig.reaps() > 0, custody: custody(),
               dirty: fs.existsSync(path.join(worktreeDirFor(159512), "DIRTY.txt")),
               terminal: statuses(claim.run_id).some((status) => ["failed", "completed", "recovery_wait"].includes(status)) });
             return {
@@ -426,15 +424,12 @@ describe("M2 account park W3-W6/W9", () => {
     const restore = spyPublishLands();
     try {
       await runner.execute(claim);
-      assert.equal(events.filter((event) => event === "legacy-settle").length, 1, "transient recovery invokes the legacy settlement facade");
-      assert.ok(events.indexOf("legacy-settle") > events.indexOf("transient"));
-      assert.equal(events.filter((event) => event === "legacy-empty").length, 1);
-      assert.ok(events.indexOf("legacy-empty") > events.indexOf("legacy-settle"));
-      assert.ok(events.indexOf("legacy-empty") < events.indexOf("settle"), "verified empty legacy settlement precedes real held capture");
-      assert.ok(proofs > 8, "capture-discovered deferral survives old blocked cap");
+      assert.equal(legacySettles, 0, "account deferral uses held capture without legacy settlement");
+      assert.equal(proofs, 8, "seven blocked held-capture proofs precede the successful eighth attempt");
+      assert.ok(rig.reaps() > 0, "the real held capture reaped the tracked provider root");
       assert.equal(settled, 8, "seven refused proofs and the final capture each acquire their own scope");
       assert.deepEqual(blockedProofs, Array.from({ length: 7 }, (_, index) => ({
-        settled: index + 1, custody: 0, dirty: true, terminal: false,
+        settled: index + 1, reaped: true, custody: 0, dirty: true, terminal: false,
       })));
       assert.ok(events.indexOf("fresh-confirm") > events.indexOf("transient"));
       assert.ok(events.indexOf("fresh-confirm") < events.indexOf("settle"));
