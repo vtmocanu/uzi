@@ -10,6 +10,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Readable } from "node:stream";
 import { type ExecutorResult, type RunContext } from "../src/executor.js";
 import { RunRunner, type ExecutorFactory } from "../src/runner.js";
@@ -295,6 +296,60 @@ describe("RunRunner — owner-requested pause park (PRD #1190 M2)", () => {
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
   });
+
+  for (const poison of ["false", "throw"] as const) {
+    it(`Claude owner pause publishes current work despite ${poison} command settlement`, { timeout: 10_000 }, async () => {
+      const { gitlab, calls: mrCalls } = fakeGitlab();
+      const scratch = new URL("../../.uzi/scratch/", import.meta.url);
+      fs.mkdirSync(scratch, { recursive: true });
+      const homeRoot = fs.mkdtempSync(fileURLToPath(new URL("r4-pause-", scratch)));
+      const { calls, restore } = spyPublish();
+      let settlements = 0;
+      let reaps = 0;
+      let parked: boolean | undefined;
+      let source = "";
+      const factory: ExecutorFactory = runId => ({
+        homeDir: path.join(homeRoot, runId),
+        executor: {
+          async settleWorkerCommands() {
+            settlements++;
+            if (poison === "throw") throw new Error("poisoned Claude command settlement");
+            return { confirmed: false };
+          },
+          killAgentTree() { reaps++; },
+          async run(ctx) {
+            source = ctx.worktreePath;
+            fs.mkdirSync(path.join(homeRoot, runId), { recursive: true });
+            // No prior checkpoint: the pause itself must commit, fetch and publish.
+            fs.writeFileSync(path.join(source, "CLAUDE_PAUSE.txt"), "current Claude work\n");
+            const at = { completedCount: 1, total: 2 };
+            parked = await ctx.parkForPause!(at);
+            return parked ? { branch: ctx.branch, pausedAt: at } : { branch: ctx.branch };
+          },
+        },
+      });
+      try {
+        const claim = gitlabClaim(1198);
+        assert.equal(claim.secrets.codex, undefined);
+        await runnerWithGit(factory, gitlab).execute(claim);
+        assert.equal(parked, true);
+        assert.ok(settlements >= 2, "warn-only entry reaches the pause's own quiescence proof");
+        assert.ok(reaps >= 2, "pause retains the process proof and post-marker reproof");
+        assert.equal(calls.length, 1, "the pause actually publishes");
+        const bare = git.barePathFor(fx.originPath);
+        assert.equal(execFileSync("git", ["-C", bare, "show", `${calls[0]!.tipOid}:CLAUDE_PAUSE.txt`],
+          { env: GIT_ENV, encoding: "utf8", stdio: "pipe" }), "current Claude work\n");
+        assert.ok(stateStatuses(claim.run_id).includes("paused"));
+        assert.equal(stateStatuses(claim.run_id).includes("pause_failed"), false);
+        assert.equal(mrCalls.length, 0);
+        assert.ok(messageKinds(claim.run_id).includes("paused"));
+        assert.equal(stateStatuses(claim.run_id).some(status => status === "failed" || status === "completed"), false);
+      } finally {
+        restore();
+        fs.rmSync(homeRoot, { recursive: true, force: true });
+      }
+    });
+  }
 
   it("reports `pause_failed` and KEEPS RUNNING (finalizes) when the publish rejects", async () => {
     const { gitlab } = fakeGitlab();

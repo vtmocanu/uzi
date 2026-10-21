@@ -6,6 +6,7 @@ import { execFileSync } from "node:child_process";
 import { ForeignCaptureBlockedError, GitCache, PendingRecoveryCaptureError, CapturePathMismatchError, type RecoveryJournalEntry } from "../src/git.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import { RunRunner, type ExecutorFactory } from "../src/runner.js";
+import type { Executor } from "../src/executor.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
 import { nullLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
@@ -53,6 +54,137 @@ function factoryFor(claim: ReturnType<typeof gitlabClaim>, committed = false) {
 }
 
 describe("recovery capture retry and restart safety (#1197)", () => {
+  for (const legacySettle of ["supported", "unsupported"] as const) {
+    it(`safety-bearing noncredential recovery keeps authenticated publication unscoped (${legacySettle})`, { timeout: 10_000 }, async (t) => {
+      const { gitlab } = fakeGitlab();
+      const claim = gitlabClaim(1399, { claim_generation: 1 });
+      const fixture = factoryFor(claim);
+      const events: string[] = [];
+      let callbackCalls = 0;
+      let captures = 0;
+      let publications = 0;
+      let retries = 0;
+      let runner!: RunRunner;
+      const marker = git.commitWipMarker.bind(git);
+      t.mock.method(git, "commitWipMarker", async (...args: Parameters<typeof marker>) => {
+        captures++;
+        assert.ok(events.includes("legacy settle"), "strict legacy settlement precedes source capture");
+        return marker(...args);
+      });
+      const publish = client.publishCheckpoint.bind(client);
+      t.mock.method(client, "publishCheckpoint", async (...args: Parameters<typeof publish>) => {
+        publications++;
+        assert.equal(callbackCalls, 0, "authenticated publication never enters the free callback");
+        assert.ok(events.includes("boundary"), "publication uses the existing authenticated boundary");
+        return publish(...args);
+      });
+      // The deterministic safety facade models admission only; fixture Git runs on
+      // the test host rather than through a production Codex process spawner.
+      t.mock.method(git, "withBoundaryProcessSpawner", async (...args: Parameters<typeof git.withBoundaryProcessSpawner>) => args[2]());
+      const factory: ExecutorFactory = (...args) => {
+        const made = fixture.factory(...args);
+        const run = made.executor.run.bind(made.executor);
+        made.executor.run = async ctx => {
+          try { return await run(ctx); }
+          finally {
+            made.executor.safety = {
+              kind: "codex",
+              withBoundary: async (_request, action) => {
+                assert.equal(callbackCalls, 0, "no free callback owns the authenticated boundary");
+                events.push("boundary");
+                return action({ signal: new AbortController().signal } as never);
+              },
+              spawnBoundaryProcess: async () => { throw new Error("fixture uses host Git"); },
+              dispose: async () => ({ kind: "disposed" }),
+            };
+            made.executor.closeAndSettlePlanSummary = async () => { events.push("summary"); };
+            made.executor.settleWorkerCommands = async () => { events.push("commands"); return { confirmed: true }; };
+            if (legacySettle === "supported") {
+              made.executor.settleForCredentialFreeCapture = async () => {
+                assert.deepEqual(events.slice(-2), ["summary", "commands"]);
+                events.push("legacy settle");
+                return { kind: "observed_empty" };
+              };
+            }
+            made.executor.withCredentialFreeCapture = (async () => {
+              callbackCalls++;
+              runner.shutdown();
+              throw new Error("noncredential recovery must not acquire free capture");
+            }) as Executor["withCredentialFreeCapture"];
+          }
+        };
+        return made;
+      };
+      runner = runnerWith(factory, gitlab, undefined, nullLogger(), { recoveryRetryMs: 1 });
+      const owner = runner as unknown as { waitRecoveryRetry(): Promise<void> };
+      t.mock.method(owner, "waitRecoveryRetry", async () => {
+        if (++retries === 6) runner.shutdown();
+      });
+      await runner.execute(claim);
+      assert.equal(callbackCalls, 0);
+      if (legacySettle === "supported") {
+        assert.ok(captures > 0);
+        assert.ok(publications > 0, "existing authenticated publication succeeds");
+        assert.equal(api.states.filter(s => s.body.status === "recovery_wait").length, 1);
+      } else {
+        assert.equal(retries, 6, "unsupported legacy settle retries without spending process-proof attempts");
+        assert.equal(captures, 0);
+        assert.equal(publications, 0);
+        assert.equal(api.states.some(s => s.body.status === "recovery_wait" || s.body.status === "failed"), false);
+        assert.ok(fs.existsSync(fixture.clone()), "unsupported settlement retains source");
+      }
+    });
+  }
+
+  for (const poison of ["false", "throw"] as const) {
+    it(`Claude noncredential recovery blocks capture and publication on ${poison} settlement`, { timeout: 10_000 }, async () => {
+      const { gitlab } = fakeGitlab();
+      const claim = gitlabClaim(1398, { claim_generation: 1 });
+      assert.equal(claim.secrets.codex, undefined);
+      const fixture = factoryFor(claim);
+      const retried = deferred();
+      let settlements = 0;
+      let captures = 0;
+      let publications = 0;
+      const marker = git.commitWipMarker.bind(git);
+      git.commitWipMarker = async (...args) => { captures++; return marker(...args); };
+      const publish = client.publishCheckpoint.bind(client);
+      client.publishCheckpoint = async (...args) => { publications++; return publish(...args); };
+      const factory: ExecutorFactory = (...args) => {
+        const made = fixture.factory(...args);
+        made.executor.settleWorkerCommands = async () => {
+          if (fixture.calls() === 0) return { confirmed: true };
+          if (++settlements >= 6) retried.resolve();
+          if (poison === "throw") throw new Error("poisoned Claude command settlement");
+          return { confirmed: false };
+        };
+        return made;
+      };
+      const runner = runnerWith(factory, gitlab, undefined, nullLogger(), { recoveryRetryMs: 1 });
+      const execution = runner.execute(claim);
+      try {
+        await Promise.race([
+          retried.promise,
+          execution.then(() => { throw new Error("recovery exited before retrying strict settlement"); }),
+        ]);
+        assert.equal(captures, 0, "unconfirmed commands prevent WIP capture");
+        assert.equal(publications, 0, "unconfirmed commands prevent checkpoint publication");
+        assert.equal(api.states.some(s => s.body.status === "recovery_wait"), false);
+        assert.equal(api.states.some(s => s.body.status === "failed"), false,
+          "incomplete settlement is retried rather than charged as a failed process proof");
+        assert.equal(fixture.calls(), 1, "settlement retries never restart the model");
+        assert.equal(fs.readFileSync(path.join(fixture.clone(), "ONLY_COPY.txt"), "utf8"), "must survive recovery\n");
+      } finally {
+        runner.shutdown();
+        await execution;
+      }
+      assert.equal(captures, 0);
+      assert.equal(publications, 0);
+      assert.ok(fs.existsSync(fixture.clone()), "shutdown retains the unsettled source");
+      assert.ok(fs.existsSync(path.join(fixture.runHome, "session")));
+    });
+  }
+
   for (const failure of ["wip", "fetch", "verify"] as const) {
     it(`${failure} failure retains active work until capture verifies`, async () => {
       const { gitlab } = fakeGitlab();

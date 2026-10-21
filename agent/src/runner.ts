@@ -39,6 +39,7 @@ import {
   renderSecretFindings,
 } from "./secret-finding-render.js";
 import type {
+  CredentialFreeSettleOutcome,
   Executor,
   ExecutorResult,
   RunContext,
@@ -14349,18 +14350,23 @@ export class RunRunner {
     claim: ClaimResponse, flight: RunFlight, deadlineAt: number,
     signal: AbortSignal | undefined, action: (held: HeldFreeCapture) => Promise<T>,
     purpose: "capture" | "cancel" = "capture",
+    claudeCommandPolicy: "strict" | "warn" = "strict",
   ): Promise<{ kind: "observed_empty"; value: T } | { kind: "incomplete" }> {
     return this.runGatedSink(flight, async () => {
       const requiresScope = this.requiresFreeCaptureScope(claim, flight);
       const remaining = () => Math.max(0, deadlineAt - Date.now());
       if (remaining() === 0 || signal?.aborted) return { kind: "incomplete" };
-      // Claude has no callback-held capture lane. Join its summary and dispose its
-      // guarded commands before allowing any source access, using the original budget.
+      // Claude has no callback-held capture lane. Join its summary and settle its
+      // guarded commands under the caller policy and original budget before source access.
       if (!flight.executor.withCredentialFreeCapture) {
         try {
           await flight.executor.closeAndSettlePlanSummary?.(remaining());
           if (remaining() === 0 || signal?.aborted) return { kind: "incomplete" };
-          if (flight.executor.settleWorkerCommands &&
+          // Owner pause and changed-plan capture retain their legacy warn/reap policy.
+          // Every other entry requires confirmed command settlement before source access.
+          if (claudeCommandPolicy === "warn") {
+            await this.settleGuardedCommands(flight.executor, remaining());
+          } else if (flight.executor.settleWorkerCommands &&
               !(await flight.executor.settleWorkerCommands(remaining())).confirmed) return { kind: "incomplete" };
         } catch { return { kind: "incomplete" }; }
         if (remaining() === 0 || signal?.aborted) return { kind: "incomplete" };
@@ -16442,6 +16448,33 @@ export class RunRunner {
     }
   }
 
+  private async settleForCredentialCapture(executor: Executor, deadlineMs = this.codexBoundaryDeadlineMs, purpose: "capture" | "cancel" = "capture"): Promise<CredentialFreeSettleOutcome> {
+    const deadlineAt = Date.now() + Math.max(0, deadlineMs);
+    await executor.closeAndSettlePlanSummary?.(deadlineMs);
+    deadlineMs = Math.max(0, deadlineAt - Date.now());
+    // Issue #2471: a guard-bound Claude flight's model commands are not covered by the
+    // killAgentTree reap, so they settle (disposed and confirmed) before the capture proceeds.
+    if (executor.settleWorkerCommands) {
+      let confirmed = false;
+      try { confirmed = (await executor.settleWorkerCommands(deadlineMs)).confirmed; } catch { /* unconfirmed */ }
+      if (!confirmed) {
+        return { kind: "incomplete", errors: [{ category: "protocol", message: "worker command settle unconfirmed" }] };
+      }
+      deadlineMs = Math.max(0, deadlineAt - Date.now());
+    }
+    if (executor.settleForCredentialFreeCapture) {
+      try {
+        return await executor.settleForCredentialFreeCapture(deadlineMs, purpose);
+      } catch {
+        return { kind: "incomplete", errors: [{ category: "protocol", message: "capture settle threw" }] };
+      }
+    }
+    if (executor.safety) {
+      return { kind: "incomplete", errors: [{ category: "protocol", message: "capture settle unsupported" }] };
+    }
+    return { kind: "observed_empty" };
+  }
+
   /**
    * #1197, verified 2026-09-08: keep the execution and steering poller active
    * while retrying local capture, and report a promotable recovery_wait ONLY
@@ -16886,26 +16919,36 @@ export class RunRunner {
           continue;
         }
         if (!capture) {
-          let settleIncomplete = false;
           let blockedDetail: string | undefined;
           let quarantinedCapture: ResidueQuarantinedError | undefined;
           try {
-            const attempt = credentialDeferred
-              ? await this.runFreeCapture(claim, flight, Date.now() + this.codexBoundaryDeadlineMs,
+            let attempt: RecoveryCaptureResult;
+            if (credentialDeferred) {
+              const result = await this.runFreeCapture(claim, flight, Date.now() + this.codexBoundaryDeadlineMs,
                 this.shutdownSignal.signal, held => this.captureRecoveryRestorePoint(claim, flight, runLog, "recovery_capture", {
                   credentialFree: true, heldCapture: held, signal: held.signal,
                   terminalDisk: opts.terminalDisk,
-                })).then(result => {
-                  if (result.kind === "observed_empty") return result.value;
-                  settleIncomplete = true;
-                  return {
-                    verified: false, published: false, residueBlocked: true,
-                    residueDetail: "credential-free capture unverified",
-                  };
-                })
-              : await this.captureRecoveryRestorePoint(claim, flight, runLog, "recovery_capture", {
+                }));
+              if (result.kind !== "observed_empty") {
+                await note(feed.settleIncomplete);
+                await retryWait();
+                continue;
+              }
+              attempt = result.value;
+            } else {
+              // Authenticated publication acquires its own Codex boundary. Settle strictly
+              // first without holding a credential-free callback across that boundary.
+              const settlement = await this.settleForCredentialCapture(executor);
+              if (settlement.kind !== "observed_empty") {
+                // Incomplete settlement retains custody until lifecycle exit; it does
+                // not consume the bounded failed-process-proof attempts below.
+                await retryWait();
+                continue;
+              }
+              attempt = await this.captureRecoveryRestorePoint(claim, flight, runLog, "recovery_capture", {
                 terminalDisk: opts.terminalDisk,
               });
+            }
             if (attempt.residueBlocked) blockedDetail = attempt.residueDetail ?? "not quiescent";
             if (attempt.verified) {
               capture = attempt;
@@ -16998,7 +17041,7 @@ export class RunRunner {
           }
           if (!capture) {
             if (credentialDeferred) {
-              await note(settleIncomplete ? feed.settleIncomplete : feed.unverified);
+              await note(feed.unverified);
             } else if (!notified) {
               batcher.emit({
                 kind: "status",
@@ -17356,7 +17399,8 @@ export class RunRunner {
       };
       try {
         const result = await this.runFreeCapture(claim, flight, deadlineAt, this.shutdownSignal.signal,
-          held => this.handlePauseParkHeld(claim, flight, held, pausedAt, options.origin, () => { pauseAcknowledged = true; }, reportRefusal));
+          held => this.handlePauseParkHeld(claim, flight, held, pausedAt, options.origin, () => { pauseAcknowledged = true; }, reportRefusal),
+          "capture", "warn");
         if (result.kind === "observed_empty") return result.value;
       } catch (error) {
         flight.sourceJoinFailed = true;
@@ -17781,7 +17825,7 @@ export class RunRunner {
       // The executor callback fences admission through the witness checks; ordinary
       // quiesceRun alone does not close executor admission.
       return { source_head: source, published_checkpoint: published };
-    });
+    }, "capture", "warn");
     if (result.kind !== "observed_empty") {
       throw new TransientRecoveryError("plan gate checkpoint could not be published and proven recoverable");
     }
