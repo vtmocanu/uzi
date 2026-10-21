@@ -1079,65 +1079,91 @@ describe("RunRunner — M2 explicit park callback", () => {
 });
 
 // issue #3239 — a pause park whose WIP marker could not be vetted (the rollback was refused) must
-// fetch and publish nothing, report pause_failed, keep the clone, and undo the marker so it does
-// not ride into later checkpoints. A core file slips past the scan, then HEAD is switched to another
-// branch at the marker so the backstop refuses its rollback while HEAD still names a marker.
+// fetch and publish nothing, report pause_failed and keep the clone. A core file slips past the scan
+// so the backstop refuses its rollback. The marker is then undone (back to the uncommitted tree) only
+// when HEAD still names the run branch; when the agent switched HEAD to another branch B at the
+// marker, nothing is rewound (neither B nor the run branch).
 describe("RunRunner — pause park with an unvetted WIP marker (issue #3239)", () => {
-  it("reports pause_failed, publishes nothing and strips the marker back to uncommitted", async () => {
-    const { gitlab } = fakeGitlab();
-    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-3239-pause-"));
-    const rd = (cwd: string, ...args: string[]) =>
-      execFileSync("git", ["-C", cwd, ...args], { env: GIT_ENV, encoding: "utf8", stdio: "pipe" }).trim();
-    const state = { armed: false, marker: "" };
-    const rGit = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({
-      gitleaksBin: defaultGitleaksShim(),
-      wipCapture: {
-        afterOmissionCheck: async (p) => { if (state.armed) fs.writeFileSync(path.join(p, "core"), "tiny\n"); },
-        beforeBackstop: async (p, marker) => {
-          if (!state.armed) return;
-          state.marker = marker;
-          rd(p, "branch", "B", marker);
-          rd(p, "symbolic-ref", "HEAD", "refs/heads/B");
+  for (const scenario of ["head-on-run-branch", "head-on-other-branch"] as const) {
+    it(`reports pause_failed and publishes nothing (${scenario})`, async () => {
+      const { gitlab } = fakeGitlab();
+      const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-3239-pause-"));
+      const rd = (cwd: string, ...args: string[]) =>
+        execFileSync("git", ["-C", cwd, ...args], { env: GIT_ENV, encoding: "utf8", stdio: "pipe" }).trim();
+      const state = { armed: false, marker: "", branch: "" };
+      const rGit = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({
+        gitleaksBin: defaultGitleaksShim(),
+        wipCapture: {
+          afterOmissionCheck: async (p) => { if (state.armed) fs.writeFileSync(path.join(p, "core"), "tiny\n"); },
+          beforeBackstop: async (p, marker) => {
+            if (!state.armed) return;
+            state.marker = marker;
+            if (scenario === "head-on-other-branch") {
+              rd(p, "branch", "B", marker);
+              rd(p, "symbolic-ref", "HEAD", "refs/heads/B");
+            }
+          },
+          beforeRollbackWrite: async (p, marker) => {
+            if (!state.armed || scenario !== "head-on-run-branch") return;
+            // Swap the run branch to a sibling marker after the final recheck: the compare-and-swap is
+            // refused while HEAD still names the run branch, at a wip(park) tip.
+            const sibling = rd(p, "commit-tree", `${marker}^{tree}`, "-p", `${marker}^`, "-m", "wip(park): sibling marker");
+            rd(p, "update-ref", `refs/heads/${state.branch}`, sibling, marker);
+          },
         },
-      },
-    }));
-    const { calls, restore } = spyPublish();
-    const seen: { subject?: string; headAfter?: string; status?: string; tracked?: string | null } = {};
-    try {
-      const iid = 3243;
-      const factory: ExecutorFactory = (runId) => ({
-        homeDir: path.join(homeRoot, runId),
-        executor: { run: async (ctx: RunContext): Promise<ExecutorResult> => {
-          fs.mkdirSync(path.join(homeRoot, runId), { recursive: true });
-          commitInTree(ctx.worktreePath, "WORK.txt", "committed\n");
-          await ctx.checkpoint?.({ reap: false });
-          fs.writeFileSync(path.join(ctx.worktreePath, "WIP.txt"), "dirty\n");
-          state.armed = true;
-          const parked = await ctx.parkForPause?.({ completedCount: 1, total: 2 });
-          state.armed = false;
-          seen.subject = rd(ctx.worktreePath, "log", "-1", "--format=%s");
-          seen.status = rd(ctx.worktreePath, "status", "--porcelain");
-          seen.tracked = (() => { try { return rd(rGit.barePathFor(fx.originPath), "rev-parse", "--verify", `refs/uzi-runner/agent/issue-${iid}`); } catch { return null; } })();
-          return parked ? { branch: ctx.branch, pausedAt: { completedCount: 1, total: 2 } } : { branch: ctx.branch };
-        } },
-      });
-      const claim = gitlabClaim(iid);
-      await new RunRunner(client, rGit, factory, nullLogger(), 20, undefined, {
-        pollMs: 5, planApprovalTimeoutMs: 0, questionTimeoutMs: 600, gitlab, checkpointIntervalMs: 0,
-        checkpointTestHooks: { retryBackoffMs: [0, 0] },
-      }).execute(claim);
+      }));
+      const { calls, restore } = spyPublish();
+      const seen: { subject?: string; head?: string; runTip?: string; runSubject?: string; bTip?: string | null; status?: string; tracked?: string | null } = {};
+      try {
+        const iid = 3243;
+        const factory: ExecutorFactory = (runId) => ({
+          homeDir: path.join(homeRoot, runId),
+          executor: { run: async (ctx: RunContext): Promise<ExecutorResult> => {
+            fs.mkdirSync(path.join(homeRoot, runId), { recursive: true });
+            state.branch = ctx.branch;
+            commitInTree(ctx.worktreePath, "WORK.txt", "committed\n");
+            await ctx.checkpoint?.({ reap: false });
+            fs.writeFileSync(path.join(ctx.worktreePath, "WIP.txt"), "dirty\n");
+            state.armed = true;
+            const parked = await ctx.parkForPause?.({ completedCount: 1, total: 2 });
+            state.armed = false;
+            seen.subject = rd(ctx.worktreePath, "log", "-1", "--format=%s");
+            seen.head = rd(ctx.worktreePath, "symbolic-ref", "HEAD");
+            seen.runTip = rd(ctx.worktreePath, "rev-parse", `refs/heads/${ctx.branch}`);
+            seen.runSubject = rd(ctx.worktreePath, "log", "-1", "--format=%s", `refs/heads/${ctx.branch}`);
+            seen.bTip = (() => { try { return rd(ctx.worktreePath, "rev-parse", "--verify", "refs/heads/B"); } catch { return null; } })();
+            seen.status = rd(ctx.worktreePath, "status", "--porcelain");
+            seen.tracked = (() => { try { return rd(rGit.barePathFor(fx.originPath), "rev-parse", "--verify", `refs/uzi-runner/agent/issue-${iid}`); } catch { return null; } })();
+            return parked ? { branch: ctx.branch, pausedAt: { completedCount: 1, total: 2 } } : { branch: ctx.branch };
+          } },
+        });
+        const claim = gitlabClaim(iid);
+        await new RunRunner(client, rGit, factory, nullLogger(), 20, undefined, {
+          pollMs: 5, planApprovalTimeoutMs: 0, questionTimeoutMs: 600, gitlab, checkpointIntervalMs: 0,
+          checkpointTestHooks: { retryBackoffMs: [0, 0] },
+        }).execute(claim);
 
-      assert.ok(state.marker, "the rollback was refused (marker unvetted)");
-      const statuses = stateStatuses(claim.run_id);
-      assert.ok(statuses.includes("pause_failed"), `pause_failed reported, got ${JSON.stringify(statuses)}`);
-      assert.ok(!statuses.includes("paused"), "the run did not park");
-      assert.deepEqual(calls, [], "nothing was published");
-      assert.notEqual(seen.tracked, state.marker, "the marker was not fetched back");
-      assert.ok(!seen.subject!.startsWith("wip(park)"), `the marker was undone, HEAD is ${seen.subject}`);
-      assert.match(seen.status!, /WIP\.txt/, "the work is on disk, uncommitted");
-    } finally {
-      restore();
-      fs.rmSync(homeRoot, { recursive: true, force: true });
-    }
-  });
+        assert.ok(state.marker, "the rollback was refused (marker unvetted)");
+        const statuses = stateStatuses(claim.run_id);
+        assert.ok(statuses.includes("pause_failed"), `pause_failed reported, got ${JSON.stringify(statuses)}`);
+        assert.ok(!statuses.includes("paused"), "the run did not park");
+        assert.deepEqual(calls, [], "nothing was published");
+        assert.notEqual(seen.tracked, state.marker, "the marker was not fetched back");
+        if (scenario === "head-on-run-branch") {
+          assert.equal(seen.head, `refs/heads/${state.branch}`);
+          assert.ok(!seen.runSubject!.startsWith("wip(park)"), `the run branch tip is not a marker, got ${seen.runSubject}`);
+          assert.notEqual(seen.runTip, state.marker);
+          assert.match(seen.status!, /WIP\.txt/, "the work is on disk, uncommitted");
+        } else {
+          assert.equal(seen.head, "refs/heads/B");
+          assert.equal(seen.bTip, state.marker, "B was not rewound");
+          assert.equal(seen.runTip, state.marker, "the run branch was not touched");
+          assert.ok(seen.subject!.startsWith("wip(park)"), "no undo ran");
+        }
+      } finally {
+        restore();
+        fs.rmSync(homeRoot, { recursive: true, force: true });
+      }
+    });
+  }
 });

@@ -240,6 +240,17 @@ describe("commitWipMarker omissions (issue #3239)", () => {
     assert.equal(f.g("rev-parse", "main^"), f.g("rev-parse", "HEAD^"));
   });
 
+  test("(o) a commit call that rejects after git wrote the ref reports an unvetted marker", async (t) => {
+    const f = await fixture(t, { commitRejectsAfterWrite: true });
+    const pre = f.head();
+    await f.write("wip.txt", "ordinary\n");
+    assert.equal(await f.git.commitWipMarker(f.root, { mode: "exclude", onIncomplete: f.onIncomplete }), false);
+    assert.equal(f.calls.length, 1);
+    assert.deepEqual([f.calls[0]!.markerCreated, f.calls[0]!.rollbackRefused], [false, true]);
+    assert.ok(f.g("log", "-1", "--format=%s").startsWith(WIP_PARK_COMMIT_PREFIX), "git did write the marker");
+    assert.equal(f.g("rev-parse", "HEAD^"), pre);
+  });
+
   test("(g3) detached, then HEAD attached to a branch at the marker: refuses, no ref moved", async (t) => {
     const f = await fixture(t, {
       afterOmissionCheck: (p) => grow(p),

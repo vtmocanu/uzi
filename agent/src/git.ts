@@ -728,6 +728,9 @@ export interface GitCacheOptions {
     afterCommit?: (clonePath: string) => Promise<void>;
     beforeBackstop?: (clonePath: string, marker: string) => Promise<void>;
     beforeRollbackWrite?: (clonePath: string, marker: string) => Promise<void>;
+    /** Make the commit invocation reject AFTER git wrote the ref (a timeout shape), so the
+     *  capture's fail-closed handling of a commit that wrote and then failed is observable. */
+    commitRejectsAfterWrite?: boolean;
   };
 }
 
@@ -11190,7 +11193,9 @@ try {
         "commit",
         "-m",
         `${WIP_PARK_COMMIT_PREFIX} interrupted work auto-saved on usage-limit park (throwaway; restored uncommitted on resume)`,
-      ]);
+      ]).then(() => {
+        if (this.wipCaptureSeam?.commitRejectsAfterWrite) throw new Error("test seam: commit call rejected after the ref was written");
+      });
       await this.wipCaptureSeam?.afterCommit?.(clonePath);
       // Post-commit backstop: the marker must be exactly one commit on preHead with no core file
       // and no blob over the cap, whatever happened to the worktree after the omission scan. The
@@ -11373,7 +11378,7 @@ try {
    */
   async undoWipMarker(clonePath: string): Promise<void> {
     try {
-      await this.runGitAsRunner(clonePath, ["reset", "--mixed", "HEAD^"]);
+      await this.runGitAsRunner(clonePath, ["reset", "--mixed", "HEAD^"], NO_REPLACE);
     } catch (err) {
       this.log.warn("WIP park marker undo failed (best-effort → marker left at HEAD)", {
         cwd: clonePath,
@@ -11401,10 +11406,31 @@ try {
    */
   async headIsWipMarker(clonePath: string): Promise<boolean> {
     try {
-      const subject = await this.runGitAsRunner(clonePath, ["log", "-1", "--format=%s"]);
+      const subject = await this.runGitAsRunner(clonePath, ["log", "-1", "--format=%s"], NO_REPLACE);
       return subject.startsWith(WIP_PARK_COMMIT_PREFIX);
     } catch (err) {
       this.log.warn("WIP park marker HEAD check failed (best-effort → not a marker)", {
+        cwd: clonePath,
+        error: gitErrorMessage(err),
+      });
+      return false;
+    }
+  }
+
+  /**
+   * True iff HEAD symbolically names `refs/heads/<branch>` and that branch's tip is a
+   * `wip(park):` marker. The pause-park undo (`reset --mixed HEAD^`) rewinds whatever HEAD
+   * names, so it must run only when that is the run branch carrying the marker. Any error
+   * answers false (best-effort, never a blind reset).
+   */
+  async headOnBranchAtWipMarker(clonePath: string, branch: string): Promise<boolean> {
+    try {
+      const ref = await this.wipSymbolicHead(clonePath);
+      if (ref !== `refs/heads/${branch}`) return false;
+      const subject = await this.runGitAsRunner(clonePath, ["log", "-1", "--format=%s", ref], NO_REPLACE);
+      return subject.startsWith(WIP_PARK_COMMIT_PREFIX);
+    } catch (err) {
+      this.log.warn("WIP park marker branch check failed (best-effort → not undone)", {
         cwd: clonePath,
         error: gitErrorMessage(err),
       });

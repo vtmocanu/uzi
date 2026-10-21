@@ -17415,8 +17415,9 @@ export class RunRunner {
     // without a runner clone to compare against, or when the quiescence proof blocked the sink.
     let holdsLatest: boolean | undefined;
     let preservationRefused = false;
+    // A flag left by an earlier capture must not steer the undo below when the proof blocked above.
+    flight.wipMarkerUnsafe = false;
     if (!residueBlocked && barePath && branch && runnerClone) {
-      flight.wipMarkerUnsafe = false;
       markerCreated = await this.git.commitWipMarker(runnerClone.path, { mode: "exclude", onIncomplete: this.wipIncompleteHandler(flight, "park") }).catch(() => { flight.sourceJoinFailed = true; return false; });
       // issue #3239: sourceJoinFailed alone does not stop the fetch-back or publish below. A marker
       // whose rollback was refused was never vetted: refuse like an ownership failure, so nothing
@@ -17516,13 +17517,18 @@ export class RunRunner {
       // at the clone HEAD: it would ride into the eventual MR and the restarted turn would build on a
       // throwaway commit. Restore its content to the uncommitted tree, the same shape the resume
       // adopt gives a marker. Best-effort; only when we actually created one this call.
-      if (markerCreated && runnerClone) {
-        await this.git.undoWipMarker(runnerClone.path).catch(() => { flight.sourceJoinFailed = true; });
-      } else if (flight.wipMarkerUnsafe && runnerClone && (await this.git.headIsWipMarker(runnerClone.path).catch(() => false))) {
-        // issue #3239: a refused rollback leaves the unvetted marker at the clone HEAD while the run
-        // continues; strip it back to the uncommitted tree so it cannot ride into a later checkpoint
-        // or the MR. headIsWipMarker guards the blind reset, as in the credential give-up path.
-        await this.git.undoWipMarker(runnerClone.path).catch(() => { flight.sourceJoinFailed = true; });
+      // The undo rewinds whatever HEAD names, so it runs only when HEAD names the run branch and
+      // that branch's tip is the marker; when the agent switched HEAD elsewhere, the marker stays
+      // where it is (the run branch is not touched) and the pause_failed below keeps the run going.
+      if ((markerCreated || flight.wipMarkerUnsafe) && runnerClone) {
+        if (branch && (await this.git.headOnBranchAtWipMarker(runnerClone.path, branch).catch(() => false))) {
+          // issue #3239: a refused rollback leaves the unvetted marker at the run branch tip while
+          // the run continues; strip it back to the uncommitted tree so it cannot ride into a later
+          // checkpoint or the MR.
+          await this.git.undoWipMarker(runnerClone.path).catch(() => { flight.sourceJoinFailed = true; });
+        } else {
+          runLog.warn("pause park: WIP marker not undone (HEAD does not name the run branch at a marker)", { run_id: flight.runId, branch });
+        }
       }
       // Decision 8: no durable checkpoint ⇒ no park. Report pause_failed (the server clears the
       // pending request and keeps the run running), tell the owner the run is still running, and
