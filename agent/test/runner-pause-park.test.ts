@@ -13,7 +13,9 @@ import path from "node:path";
 import type { Readable } from "node:stream";
 import { type ExecutorResult, type RunContext } from "../src/executor.js";
 import { RunRunner, type ExecutorFactory } from "../src/runner.js";
-import { nullLogger, noProofReseed } from "./helpers.js";
+import { GitCache } from "../src/git.js";
+import { defaultGitleaksShim } from "./gitleaks-shim.js";
+import { nullLogger, noProofReseed, testGitCacheOptions } from "./helpers.js";
 import {
   api,
   client,
@@ -1073,5 +1075,69 @@ describe("RunRunner — M2 explicit park callback", () => {
       [{ kind: "answer", answers: ["/park later"] }, false],
     ];
     for (const [verdict, expected] of verdicts) assert.equal(isParkAnswer(verdict), expected);
+  });
+});
+
+// issue #3239 — a pause park whose WIP marker could not be vetted (the rollback was refused) must
+// fetch and publish nothing, report pause_failed, keep the clone, and undo the marker so it does
+// not ride into later checkpoints. A core file slips past the scan, then HEAD is switched to another
+// branch at the marker so the backstop refuses its rollback while HEAD still names a marker.
+describe("RunRunner — pause park with an unvetted WIP marker (issue #3239)", () => {
+  it("reports pause_failed, publishes nothing and strips the marker back to uncommitted", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-3239-pause-"));
+    const rd = (cwd: string, ...args: string[]) =>
+      execFileSync("git", ["-C", cwd, ...args], { env: GIT_ENV, encoding: "utf8", stdio: "pipe" }).trim();
+    const state = { armed: false, marker: "" };
+    const rGit = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({
+      gitleaksBin: defaultGitleaksShim(),
+      wipCapture: {
+        afterOmissionCheck: async (p) => { if (state.armed) fs.writeFileSync(path.join(p, "core"), "tiny\n"); },
+        beforeBackstop: async (p, marker) => {
+          if (!state.armed) return;
+          state.marker = marker;
+          rd(p, "branch", "B", marker);
+          rd(p, "symbolic-ref", "HEAD", "refs/heads/B");
+        },
+      },
+    }));
+    const { calls, restore } = spyPublish();
+    const seen: { subject?: string; headAfter?: string; status?: string; tracked?: string | null } = {};
+    try {
+      const iid = 3243;
+      const factory: ExecutorFactory = (runId) => ({
+        homeDir: path.join(homeRoot, runId),
+        executor: { run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          fs.mkdirSync(path.join(homeRoot, runId), { recursive: true });
+          commitInTree(ctx.worktreePath, "WORK.txt", "committed\n");
+          await ctx.checkpoint?.({ reap: false });
+          fs.writeFileSync(path.join(ctx.worktreePath, "WIP.txt"), "dirty\n");
+          state.armed = true;
+          const parked = await ctx.parkForPause?.({ completedCount: 1, total: 2 });
+          state.armed = false;
+          seen.subject = rd(ctx.worktreePath, "log", "-1", "--format=%s");
+          seen.status = rd(ctx.worktreePath, "status", "--porcelain");
+          seen.tracked = (() => { try { return rd(rGit.barePathFor(fx.originPath), "rev-parse", "--verify", `refs/uzi-runner/agent/issue-${iid}`); } catch { return null; } })();
+          return parked ? { branch: ctx.branch, pausedAt: { completedCount: 1, total: 2 } } : { branch: ctx.branch };
+        } },
+      });
+      const claim = gitlabClaim(iid);
+      await new RunRunner(client, rGit, factory, nullLogger(), 20, undefined, {
+        pollMs: 5, planApprovalTimeoutMs: 0, questionTimeoutMs: 600, gitlab, checkpointIntervalMs: 0,
+        checkpointTestHooks: { retryBackoffMs: [0, 0] },
+      }).execute(claim);
+
+      assert.ok(state.marker, "the rollback was refused (marker unvetted)");
+      const statuses = stateStatuses(claim.run_id);
+      assert.ok(statuses.includes("pause_failed"), `pause_failed reported, got ${JSON.stringify(statuses)}`);
+      assert.ok(!statuses.includes("paused"), "the run did not park");
+      assert.deepEqual(calls, [], "nothing was published");
+      assert.notEqual(seen.tracked, state.marker, "the marker was not fetched back");
+      assert.ok(!seen.subject!.startsWith("wip(park)"), `the marker was undone, HEAD is ${seen.subject}`);
+      assert.match(seen.status!, /WIP\.txt/, "the work is on disk, uncommitted");
+    } finally {
+      restore();
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
   });
 });

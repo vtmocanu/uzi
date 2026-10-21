@@ -716,13 +716,16 @@ export interface GitCacheOptions {
     rename?: (from: string, to: string) => Promise<void>;
     residueUuid?: () => string;
   };
-  /** issue #3239 — test-only seams inside {@link GitCache.commitWipMarker}: `afterOmissionCheck`
-   *  runs after the omission scan and before staging (to race a file past the cap),
-   *  `beforeBackstop` after the commit and before the post-commit backstop reads HEAD, and
-   *  `beforeRollbackWrite` after the backstop's final identity recheck and before its
-   *  compare-and-swap write. Production never passes it. */
+  /** issue #3239 — test-only seams inside {@link GitCache.commitWipMarker}, in firing order:
+   *  `afterOmissionCheck` after the omission scan and before staging (to race a file past the
+   *  cap); `afterCommit` right after the commit call returns and BEFORE the backstop reads the
+   *  marker from the branch (to swap HEAD or the branch before that read); `beforeBackstop`
+   *  after the marker was read and before the backstop's identity checks; `beforeRollbackWrite`
+   *  after the final identity recheck and before the compare-and-swap write. Production never
+   *  passes it. */
   wipCapture?: {
     afterOmissionCheck?: (clonePath: string) => Promise<void>;
+    afterCommit?: (clonePath: string) => Promise<void>;
     beforeBackstop?: (clonePath: string, marker: string) => Promise<void>;
     beforeRollbackWrite?: (clonePath: string, marker: string) => Promise<void>;
   };
@@ -11128,7 +11131,9 @@ try {
     MaintenanceResources.consumeIfActive("sourceBytes", 0);
     if (MaintenanceResources.active()) throw new Error("maintenance_wip_guard_required");
     const mode = opts.mode ?? "refuse";
-    const git = (args: string[]) => this.runGitAsRunner(clonePath, args);
+    // Every object read in the capture family ignores refs/replace, so an agent-planted
+    // `git replace <big> <small>` cannot make the backstop see a different blob.
+    const git = (args: string[]) => this.runGitAsRunner(clonePath, args, NO_REPLACE);
     const report = (all: WipOmission[], markerCreated: boolean, rollbackRefused: boolean): void => {
       const omitted = all.slice(0, WIP_REPORT_MAX_OMISSIONS);
       this.log.warn("WIP park auto-save left files out", {
@@ -11178,12 +11183,15 @@ try {
         if (omitted.length > 0) report(omitted, false, false);
         return false;
       }
+      // Fail closed: set before the call, so a commit that wrote the ref and then rejected
+      // (timeout) still reports an unvetted marker.
+      committed = true;
       await git([
         "commit",
         "-m",
         `${WIP_PARK_COMMIT_PREFIX} interrupted work auto-saved on usage-limit park (throwaway; restored uncommitted on resume)`,
       ]);
-      committed = true;
+      await this.wipCaptureSeam?.afterCommit?.(clonePath);
       // Post-commit backstop: the marker must be exactly one commit on preHead with no core file
       // and no blob over the cap, whatever happened to the worktree after the omission scan. The
       // marker is the commit the capture wrote to preRef, not whatever HEAD names now.
@@ -11241,7 +11249,7 @@ try {
    *  HEAD is detached (exit 1, no output). Any other failure throws. */
   private async wipSymbolicHead(clonePath: string): Promise<string> {
     try {
-      const out = (await this.runGitAsRunner(clonePath, ["symbolic-ref", "-q", "HEAD"])).trim();
+      const out = (await this.runGitAsRunner(clonePath, ["symbolic-ref", "-q", "HEAD"], NO_REPLACE)).trim();
       if (out === "") throw new Error("git symbolic-ref -q HEAD printed nothing");
       return out;
     } catch (err) {
@@ -11256,7 +11264,7 @@ try {
    *  WIP_CAPTURE_MAX_ENTRIES rows/entries exist (nothing further is examined). Read-only; a
    *  constant number of runner-uid git processes. */
   private async wipCaptureOmissions(clonePath: string): Promise<{ omitted: WipOmission[]; overCap: boolean }> {
-    const git = (args: string[]) => this.runGitAsRunner(clonePath, args);
+    const git = (args: string[]) => this.runGitAsRunner(clonePath, args, NO_REPLACE);
     const out = await git(["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
     const rows = out.split("\0");
     if (rows[rows.length - 1] === "") rows.pop();
@@ -11307,7 +11315,7 @@ try {
     const out = await this.runGitAsRunner(
       clonePath,
       ["cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"],
-      { input: `${uniq.join("\n")}\n` },
+      { input: `${uniq.join("\n")}\n`, env: NO_REPLACE_ENV },
     );
     const lines = out.split("\n");
     if (lines[lines.length - 1] === "") lines.pop();
@@ -11338,7 +11346,7 @@ try {
   /** Core files and over-cap blobs that `preHead..marker` added (object reads, not lstat); over
    *  WIP_CAPTURE_MAX_ENTRIES entries the marker is itself a violation (one synthetic `unsized` row). */
   private async wipMarkerViolations(clonePath: string, preHead: string, marker: string): Promise<WipOmission[]> {
-    const raw = await this.runGitAsRunner(clonePath, ["diff-tree", "-r", "-z", "--no-abbrev", "--no-renames", preHead, marker]);
+    const raw = await this.runGitAsRunner(clonePath, ["diff-tree", "-r", "-z", "--no-abbrev", "--no-renames", preHead, marker], NO_REPLACE);
     const entries = this.parseRawDiffZ(raw);
     if (entries.length > WIP_CAPTURE_MAX_ENTRIES) return [{ path: "(too many paths)", reason: "unsized" }];
     const sizes = await this.wipBlobSizes(clonePath, entries.map((e) => e.oid));

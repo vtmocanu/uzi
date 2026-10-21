@@ -277,7 +277,7 @@ describe("commitWipMarker omissions (issue #3239)", () => {
   test("(j) HEAD swapped to a pre-planted clean wip branch: the commit written to the branch is vetted, not HEAD", async (t) => {
     const f = await fixture(t, {
       afterOmissionCheck: (p) => slipCore(p),
-      beforeBackstop: async (p) => {
+      afterCommit: async (p) => {
         const g = gIn(p);
         const planted = g("commit-tree", "HEAD~1^{tree}", "-p", "HEAD~1", "-m", `${WIP_PARK_COMMIT_PREFIX} planted`);
         g("branch", "B", planted);
@@ -292,6 +292,30 @@ describe("commitWipMarker omissions (issue #3239)", () => {
     assert.equal(reasons(f.calls[0]!)["core"], "core_file", "the core blob in branch A's commit is reported");
     assert.equal(f.g("rev-parse", "refs/heads/main^"), pre);
     assert.equal(f.g("symbolic-ref", "HEAD"), "refs/heads/B");
+  });
+
+  test("(n) a replace ref planted over an oversized blob cannot hide it from the backstop", async (t) => {
+    let big = "";
+    const f = await fixture(t, {
+      afterOmissionCheck: async (p) => {
+        // Slips past the scan: written after it, so the scan never saw it.
+        await fs.writeFile(path.join(p, "racy.txt"), Buffer.alloc(CAP + 1, 0x62));
+      },
+      afterCommit: async (p) => {
+        const g = gIn(p);
+        big = g("rev-parse", "HEAD:racy.txt");
+        const tiny = execFileSync("/usr/bin/git", ["-C", p, "hash-object", "-w", "--stdin"],
+          { env: gitEnv, encoding: "utf8", input: "tiny\n" }).trim();
+        g("replace", "-f", big, tiny);
+      },
+    });
+    const pre = f.head();
+    await f.write("small-wip.txt", "ordinary\n");
+    assert.equal(await f.git.commitWipMarker(f.root, { onIncomplete: f.onIncomplete }), false);
+    assert.equal(f.calls.length, 1);
+    assert.equal(reasons(f.calls[0]!)["racy.txt"], "oversized");
+    assert.equal(f.calls[0]!.markerCreated, false);
+    assert.equal(f.g("rev-parse", "refs/heads/main"), pre, "rolled back despite the replace ref");
   });
 
   test("(k) a preRef turned into a symref after the recheck never moves its target", async (t) => {

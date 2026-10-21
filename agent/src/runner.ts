@@ -17518,6 +17518,11 @@ export class RunRunner {
       // adopt gives a marker. Best-effort; only when we actually created one this call.
       if (markerCreated && runnerClone) {
         await this.git.undoWipMarker(runnerClone.path).catch(() => { flight.sourceJoinFailed = true; });
+      } else if (flight.wipMarkerUnsafe && runnerClone && (await this.git.headIsWipMarker(runnerClone.path).catch(() => false))) {
+        // issue #3239: a refused rollback leaves the unvetted marker at the clone HEAD while the run
+        // continues; strip it back to the uncommitted tree so it cannot ride into a later checkpoint
+        // or the MR. headIsWipMarker guards the blind reset, as in the credential give-up path.
+        await this.git.undoWipMarker(runnerClone.path).catch(() => { flight.sourceJoinFailed = true; });
       }
       // Decision 8: no durable checkpoint ⇒ no park. Report pause_failed (the server clears the
       // pending request and keeps the run running), tell the owner the run is still running, and
