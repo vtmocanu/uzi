@@ -308,69 +308,81 @@ func ciJobsJSON(provider Type, count int) string {
 	return `{"jobs":` + string(data) + "}"
 }
 
+// TestCIJobHTTPPagination runs every mode through ListPipelineJobs and, where the
+// forge supports history (#3225), ListPipelineJobAttempts: both share one budgeted
+// pagination path, so "eleven" also pins exhaustion on a later page of history.
 func TestCIJobHTTPPagination(t *testing.T) {
 	for _, provider := range ciProviders {
-		for _, mode := range []string{"terminal-ten", "eleven", "loop", "empty", "oversized", "oversized-total", "invalid-id"} {
-			t.Run(string(provider)+"/"+mode, func(t *testing.T) {
-				var calls atomic.Int32
-				pageSize := 100
-				if provider == TypeForgejo {
-					pageSize = 50
-				}
-				d := ciWireDriver(t, provider, func(w http.ResponseWriter, r *http.Request) {
-					calls.Add(1)
-					page, _ := strconv.Atoi(r.URL.Query().Get("page"))
-					if page == 0 {
-						page = 1
+		for _, method := range []string{"jobs", "attempts"} {
+			if method == "attempts" && provider == TypeForgejo {
+				continue
+			}
+			for _, mode := range []string{"terminal-ten", "eleven", "loop", "empty", "oversized", "oversized-total", "invalid-id"} {
+				t.Run(string(provider)+"/"+method+"/"+mode, func(t *testing.T) {
+					var calls atomic.Int32
+					pageSize := 100
+					if provider == TypeForgejo {
+						pageSize = 50
 					}
-					next := page + 1
-					if mode == "terminal-ten" && page == 10 {
-						next = 0
+					d := ciWireDriver(t, provider, func(w http.ResponseWriter, r *http.Request) {
+						calls.Add(1)
+						page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+						if page == 0 {
+							page = 1
+						}
+						next := page + 1
+						if mode == "terminal-ten" && page == 10 {
+							next = 0
+						}
+						if mode == "loop" {
+							next = page
+						}
+						if mode == "oversized" || mode == "oversized-total" || mode == "invalid-id" {
+							next = 0
+						}
+						if next > 0 {
+							w.Header().Set("X-Next-Page", strconv.Itoa(next))
+							w.Header().Set("Link", fmt.Sprintf("<http://%s%s?page=%d>; rel=\"next\"", r.Host, r.URL.Path, next))
+						}
+						count := pageSize
+						switch mode {
+						case "empty":
+							count = 0
+						case "oversized":
+							count++
+						case "oversized-total":
+							count = 1001
+						}
+						body := ciJobsJSON(provider, count)
+						if mode == "invalid-id" {
+							body = strings.ReplaceAll(body, `"id":1,`, `"id":0,`)
+						}
+						_, _ = io.WriteString(w, body)
+					})
+					list := d.ListPipelineJobs
+					if method == "attempts" {
+						list = d.ListPipelineJobAttempts
 					}
-					if mode == "loop" {
-						next = page
+					jobs, err := list(WithCIRepairReadLimits(context.Background()), 7, 1)
+					if mode == "terminal-ten" {
+						if err != nil || len(jobs) != 10*pageSize || calls.Load() != 10 {
+							t.Fatalf("terminal snapshot: %d jobs, %d calls, %v", len(jobs), calls.Load(), err)
+						}
+					} else {
+						requireCIBudget(t, err)
+						if jobs != nil {
+							t.Fatal("partial jobs escaped")
+						}
+						wantCalls := int32(1)
+						if mode == "eleven" {
+							wantCalls = 10
+						}
+						if calls.Load() != wantCalls {
+							t.Fatalf("calls=%d want %d", calls.Load(), wantCalls)
+						}
 					}
-					if mode == "oversized" || mode == "oversized-total" || mode == "invalid-id" {
-						next = 0
-					}
-					if next > 0 {
-						w.Header().Set("X-Next-Page", strconv.Itoa(next))
-						w.Header().Set("Link", fmt.Sprintf("<http://%s%s?page=%d>; rel=\"next\"", r.Host, r.URL.Path, next))
-					}
-					count := pageSize
-					switch mode {
-					case "empty":
-						count = 0
-					case "oversized":
-						count++
-					case "oversized-total":
-						count = 1001
-					}
-					body := ciJobsJSON(provider, count)
-					if mode == "invalid-id" {
-						body = strings.ReplaceAll(body, `"id":1,`, `"id":0,`)
-					}
-					_, _ = io.WriteString(w, body)
 				})
-				jobs, err := d.ListPipelineJobs(WithCIRepairReadLimits(context.Background()), 7, 1)
-				if mode == "terminal-ten" {
-					if err != nil || len(jobs) != 10*pageSize || calls.Load() != 10 {
-						t.Fatalf("terminal snapshot: %d jobs, %d calls, %v", len(jobs), calls.Load(), err)
-					}
-				} else {
-					requireCIBudget(t, err)
-					if jobs != nil {
-						t.Fatal("partial jobs escaped")
-					}
-					wantCalls := int32(1)
-					if mode == "eleven" {
-						wantCalls = 10
-					}
-					if calls.Load() != wantCalls {
-						t.Fatalf("calls=%d want %d", calls.Load(), wantCalls)
-					}
-				}
-			})
+			}
 		}
 	}
 }

@@ -179,6 +179,11 @@ func (*BaseFake) ListPipelineJobs(context.Context, int64, int64) ([]forge.Job, e
 	return nil, notStubbed("ListPipelineJobs")
 }
 
+// ListPipelineJobAttempts implements forge.Forge.
+func (*BaseFake) ListPipelineJobAttempts(context.Context, int64, int64) ([]forge.Job, error) {
+	return nil, notStubbed("ListPipelineJobAttempts")
+}
+
 // JobLogTail implements forge.Forge.
 func (*BaseFake) JobLogTail(context.Context, int64, int64, int) (string, error) {
 	return "", notStubbed("JobLogTail")
