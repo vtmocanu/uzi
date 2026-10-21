@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -235,10 +236,10 @@ func (s *Service) failCredentialSwitch(ctx context.Context, owned store.Run, wkr
 // holdReasonCredentialSwitchUnsettled, from which only the owner's resume (or set-token) moves the
 // run on.
 const (
-	holdReasonCredentialSwitchSettling  = "credential_switch_settling"
-	holdReasonCredentialSwitchUnsettled = "credential_switch_unsettled"
-	stateCredentialSwitchHeld           = "credential_switch_held"
-	stateCredentialSwitchHoldSettled    = "credential_switch_hold_settled"
+	holdReasonCredentialSwitchSettling  = "credential_switch_settling"     //nolint:gosec // G101: a run hold-reason VOCABULARY value (the server enum), not a credential.
+	holdReasonCredentialSwitchUnsettled = "credential_switch_unsettled"    //nolint:gosec // G101: a run hold-reason VOCABULARY value (the server enum), not a credential.
+	stateCredentialSwitchHeld           = "credential_switch_held"         //nolint:gosec // G101: a worker state-report VOCABULARY value (the wire enum), not a credential.
+	stateCredentialSwitchHoldSettled    = "credential_switch_hold_settled" //nolint:gosec // G101: a worker state-report VOCABULARY value (the wire enum), not a credential.
 )
 
 // ErrRunHoldSettling is the owner-facing refusal of a resume or set-token on a run whose
@@ -247,10 +248,21 @@ const (
 // 409 message.
 var ErrRunHoldSettling = errors.New("the worker is still stopping this run's processes; Resume becomes available when it finishes, or Cancel the run")
 
-// staleWorkerCutoff is the heartbeat instant before which a worker counts as stale: the same
-// WorkerHeartbeatStale window the stale-worker requeue sweep uses.
+// HeartbeatStaleCutoff is the heartbeat instant before which a worker counts as stale: now minus
+// the WorkerHeartbeatStale window the stale-worker requeue sweep uses. A non-positive window yields
+// an INVALID (NULL) cutoff, which the settling fence (ResumePausedRun, CredentialSwitchHoldSettling)
+// reads as "unknown" and keeps CLOSED rather than treating every worker as stale. The global
+// stale-sweep does not consume this value.
+func HeartbeatStaleCutoff(now time.Time, window time.Duration) pgtype.Timestamptz {
+	if window <= 0 {
+		return pgtype.Timestamptz{}
+	}
+	return pgconv.Time(now.Add(-window))
+}
+
+// staleWorkerCutoff is HeartbeatStaleCutoff over the service clock and configured window.
 func (s *Service) staleWorkerCutoff() pgtype.Timestamptz {
-	return pgconv.Time(s.now().Add(-s.p.WorkerHeartbeatStale))
+	return HeartbeatStaleCutoff(s.now(), s.p.WorkerHeartbeatStale)
 }
 
 // runHoldSettling reports whether the run's credential_switch_settling fence is up (the predicate
@@ -287,7 +299,7 @@ func (s *Service) holdCredentialSwitch(ctx context.Context, owned store.Run, wkr
 		return store.Run{}, false, err
 	}
 	if rows == 0 {
-		return cur, isCredentialSwitchHold(cur, gen, true), nil
+		return cur, isCredentialSwitchHold(cur, gen), nil
 	}
 	if s.bcast != nil {
 		s.bcast.PublishState(owned.ID, cur.Status)
@@ -326,17 +338,15 @@ func (s *Service) settleCredentialSwitchHold(ctx context.Context, owned store.Ru
 	return cur, true, nil
 }
 
-// isCredentialSwitchHold reports whether the run is paused in a credential-switch hold at gen.
-// settlingToo admits the settling reason (the hold report's replay) beside the unsettled one.
-func isCredentialSwitchHold(r store.Run, gen int64, settlingToo bool) bool {
+// isCredentialSwitchHold reports whether the run is paused in a credential-switch hold at gen
+// (either the settling or the unsettled reason, which is what the hold report's replay admits).
+func isCredentialSwitchHold(r store.Run, gen int64) bool {
 	if r.Status != "paused" || r.ClaimGeneration != gen || r.ClaimReleasedAt.Valid || !r.HoldReason.Valid {
 		return false
 	}
 	switch r.HoldReason.String {
-	case holdReasonCredentialSwitchUnsettled:
+	case holdReasonCredentialSwitchUnsettled, holdReasonCredentialSwitchSettling:
 		return true
-	case holdReasonCredentialSwitchSettling:
-		return settlingToo
 	}
 	return false
 }

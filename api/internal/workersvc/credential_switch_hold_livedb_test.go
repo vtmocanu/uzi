@@ -736,3 +736,141 @@ func TestRegisterWorkerAdvancesDindRegisterFloorLiveDB(t *testing.T) {
 		t.Fatalf("a heartbeat moved dind_register_floor %v -> %v", after.DindRegisterFloor.Time, hb.DindRegisterFloor.Time)
 	}
 }
+
+// TestCredentialSwitchHoldRegisterBeganFirstHoldLockedFirstLiveDB models the ordering that
+// transaction-start timestamps get wrong. A re-registration transaction BEGINs first, but the hold
+// transaction BEGINs second and takes the worker row lock first; the registration then waits on that
+// lock, so it is serialized AFTER the hold. With now() for the floor (the registration's start) it
+// would precede the hold's status_since and the new incarnation would be mistaken for the hold's
+// writer, leaving the fence up until the heartbeat went stale. RegisterWorker lifts the floor just
+// past a settling hold committed under the lock, so after the registration commits the settling fence
+// is lifted, the old incarnation's acknowledgement is refused, and the hold row itself (status_since
+// included) is untouched. Without a settling hold the floor still equals the registration heartbeat
+// (TestRegisterWorkerAdvancesDindRegisterFloorLiveDB and the dind maintenance tests pin that).
+func TestCredentialSwitchHoldRegisterBeganFirstHoldLockedFirstLiveDB(t *testing.T) {
+	f := newHoldFx(t)
+	id := f.run(t)
+	ctx := f.env.ctx
+
+	regTx, err := f.env.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin register tx: %v", err)
+	}
+	defer func() { _ = regTx.Rollback(ctx) }()
+	time.Sleep(50 * time.Millisecond) // the registration's transaction start is strictly earlier
+	holdTx, err := f.env.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin hold tx: %v", err)
+	}
+	defer func() { _ = holdTx.Rollback(ctx) }()
+
+	hq := store.New(holdTx)
+	if _, err := hq.GetWorkerForUpdate(ctx, f.o.workerID); err != nil {
+		t.Fatalf("hold tx lock worker: %v", err)
+	}
+	rows, err := hq.HoldCredentialSwitchUnsettled(ctx, store.HoldCredentialSwitchUnsettledParams{
+		ID: id, WorkerID: pgconv.UUID(f.o.workerID), Generation: f.gen,
+	})
+	if err != nil || rows != 1 {
+		t.Fatalf("hold in tx: rows=%d err=%v, want 1", rows, err)
+	}
+
+	regDone := make(chan error, 1)
+	go func() {
+		rq := store.New(regTx)
+		if _, err := rq.GetWorkerForUpdate(ctx, f.o.workerID); err != nil { // blocks on the hold's lock
+			regDone <- err
+			return
+		}
+		if _, err := rq.RegisterWorker(ctx, store.RegisterWorkerParams{
+			ID: f.o.workerID, ProtocolCapabilities: []string{capability.CredentialSwitchV1},
+			SnapshotRegisterNonce: pgconv.TextOrNull(uuid.NewString()),
+		}); err != nil {
+			regDone <- err
+			return
+		}
+		regDone <- regTx.Commit(ctx)
+	}()
+	select {
+	case err := <-regDone:
+		t.Fatalf("the registration finished while the hold transaction held the worker lock (err=%v)", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if err := holdTx.Commit(ctx); err != nil {
+		t.Fatalf("commit hold: %v", err)
+	}
+	if err := <-regDone; err != nil {
+		t.Fatalf("registration after the hold: %v", err)
+	}
+
+	since := statusSinceOf(t, f.env, id)
+	if floor := f.worker(t, f.o.workerID).DindRegisterFloor.Time; !floor.After(since) {
+		t.Fatalf("dind_register_floor %v is not after status_since %v although the registration was serialized after the hold", floor, since)
+	}
+	if settling, err := f.svc.runHoldSettling(ctx, id); err != nil || settling {
+		t.Fatalf("fence after the serialized re-registration = (%v, %v), want lifted", settling, err)
+	}
+	if _, applied, err := f.report(t, f.o.workerID, id, "credential_switch_hold_settled", f.gen); err != nil || applied {
+		t.Fatalf("old incarnation's acknowledgement: applied=%v err=%v, want refused", applied, err)
+	}
+	if r := mustRun(t, f.env, id); r.Status != "paused" || r.HoldReason.String != "credential_switch_settling" || !r.StatusSince.Time.Equal(since) {
+		t.Fatalf("re-registration touched the hold: %q/%q status_since=%v (was %v)", r.Status, r.HoldReason.String, r.StatusSince.Time, since)
+	}
+	if err := f.ownerResume(id); err != nil {
+		t.Fatalf("resume after the serialized re-registration: %v", err)
+	}
+}
+
+// TestCredentialSwitchHoldNullStaleCutoffKeepsFenceClosedLiveDB: the fence fails CLOSED on an
+// unknown stale cutoff. A NULL cutoff must not read as "every heartbeat is stale"; both the read
+// and ResumePausedRun keep refusing a settling hold, including a worker whose heartbeat is old, and
+// a non-positive WorkerHeartbeatStale window (which yields the NULL cutoff) behaves the same.
+func TestCredentialSwitchHoldNullStaleCutoffKeepsFenceClosedLiveDB(t *testing.T) {
+	f := newHoldFx(t)
+	id := f.run(t)
+	f.hold(t, id)
+	ctx := f.env.ctx
+	null := pgtype.Timestamptz{}
+
+	read := func(cutoff pgtype.Timestamptz) bool {
+		t.Helper()
+		settling, err := f.env.q.CredentialSwitchHoldSettling(ctx, store.CredentialSwitchHoldSettlingParams{RunID: id, StaleCutoff: cutoff})
+		if err != nil {
+			t.Fatalf("CredentialSwitchHoldSettling: %v", err)
+		}
+		return settling
+	}
+	if !read(null) {
+		t.Fatal("CredentialSwitchHoldSettling with a NULL cutoff = false, want the fence kept closed")
+	}
+	p := f.resumeParams(id)
+	p.StaleCutoff = null
+	if _, err := f.env.q.ResumePausedRun(ctx, p); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("ResumePausedRun with a NULL cutoff: err = %v, want pgx.ErrNoRows (refused)", err)
+	}
+	if got := statusOf(t, f.env, id); got != "paused" {
+		t.Fatalf("a NULL-cutoff resume left status %q, want paused", got)
+	}
+
+	// Even a long-silent holder does not open the fence under an unknown cutoff...
+	f.env.exec(`UPDATE workers SET last_heartbeat_at = now() - interval '1 day' WHERE id = $1`, f.o.workerID)
+	if !read(null) {
+		t.Fatal("a stale heartbeat opened the fence under a NULL cutoff")
+	}
+	// ...while a known cutoff still lifts it (the stale-worker lift is unchanged).
+	if read(pgconv.Time(time.Now().Add(-time.Minute))) {
+		t.Fatal("a known cutoff no longer lifts the fence for a stale holder")
+	}
+
+	// A non-positive configured window yields the NULL cutoff.
+	f.env.exec(`UPDATE workers SET last_heartbeat_at = now() WHERE id = $1`, f.o.workerID)
+	zero := testParams()
+	zero.WorkerHeartbeatStale = 0
+	zsvc := New(f.env.q, f.env.box, zero)
+	if c := zsvc.staleWorkerCutoff(); c.Valid {
+		t.Fatalf("staleWorkerCutoff with a zero window = %+v, want NULL", c)
+	}
+	if settling, err := zsvc.runHoldSettling(ctx, id); err != nil || !settling {
+		t.Fatalf("runHoldSettling with a zero window = (%v, %v), want the fence closed", settling, err)
+	}
+}

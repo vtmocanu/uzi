@@ -243,7 +243,22 @@ WITH prev AS (
         -- increment/reset CASE: this is reset-on-action, unconditional.)
         stats_disk_pressure_streak = 0,
         nix_pressure = false, data_pressure = false,
-        dind_register_floor = now(), dind_meter_epoch = 0, dind_meter_at = NULL,
+        -- Incarnation fence ordering (issue #3181): the floor is compared with runs.status_since of a
+        -- credential_switch_settling hold (HoldCredentialSwitchUnsettled stamps clock_timestamp()
+        -- under this same worker row lock). now() is this transaction's START, so a registration
+        -- that began before a hold but queued behind its lock would stamp a floor EARLIER than the
+        -- hold it was serialized after, and the new incarnation would be mistaken for the hold's
+        -- writer. A settling hold committed under the lock before this statement is visible here,
+        -- so the floor is lifted just past the latest such hold. Otherwise it stays exactly now(),
+        -- which keeps it equal to the registration heartbeat (the dind maintenance contract) and
+        -- cannot reject a legitimate meter: only a worker with a settling hold sees it move, by the
+        -- microseconds between the hold and this registration, and the new incarnation samples its
+        -- meters after the register response.
+        dind_register_floor = GREATEST(now(), COALESCE(
+            (SELECT max(r.status_since) + interval '1 microsecond' FROM runs r
+             WHERE r.worker_id = workers.id AND r.status = 'paused'
+               AND r.hold_reason = 'credential_switch_settling'), now())),
+        dind_meter_epoch = 0, dind_meter_at = NULL,
         dind_pressure_streak = 0, dind_meter_over = false, dind_below_threshold = false,
         maintenance_ready_ack = false, maintenance_ack_at = NULL,
         maintenance_phase = CASE WHEN maintenance_phase = 'ready' THEN 'requested' ELSE maintenance_phase END,
@@ -3699,7 +3714,7 @@ WITH candidates AS MATERIALIZED (
   AND (runs.hold_reason IS DISTINCT FROM 'completion_blocked' OR @allow_completion_blocked_hold::boolean)
   AND (runs.hold_reason IS DISTINCT FROM 'credential_switch_settling'
        OR NOT EXISTS (SELECT 1 FROM workers w
-                      WHERE w.id = runs.worker_id AND w.last_heartbeat_at >= @stale_cutoff::timestamptz
+                      WHERE w.id = runs.worker_id AND (@stale_cutoff::timestamptz IS NULL OR w.last_heartbeat_at >= @stale_cutoff::timestamptz)
                         AND w.dind_register_floor <= runs.status_since))
   AND (runs.hold_reason IS DISTINCT FROM 'budget_exhausted'
        OR (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
@@ -3774,7 +3789,7 @@ WHERE runs.id = @id AND runs.user_id = @user_id
   -- re-registers (dind_register_floor then moves past status_since).
   AND (runs.hold_reason IS DISTINCT FROM 'credential_switch_settling'
        OR NOT EXISTS (SELECT 1 FROM workers w
-                      WHERE w.id = runs.worker_id AND w.last_heartbeat_at >= @stale_cutoff::timestamptz
+                      WHERE w.id = runs.worker_id AND (@stale_cutoff::timestamptz IS NULL OR w.last_heartbeat_at >= @stale_cutoff::timestamptz)
                         AND w.dind_register_floor <= runs.status_since))
   -- D7: refuse a budget_exhausted park with no remaining budget (extend is the way back).
   -- Remaining = three-term total - (elapsed active run-time) = total - ((status_since - started_at) - budget_paused_seconds).
@@ -3998,7 +4013,13 @@ WHERE runs.id = @id AND runs.worker_id = @worker_id
 -- AT THAT generation. Health is reset for SetRunPaused's allowlist reason.
 UPDATE runs SET
     status                         = 'paused',
-    status_since                   = now(),
+    -- clock_timestamp(), not now(): status_since is compared with workers.dind_register_floor
+    -- (RegisterWorker), and both writers serialize on the worker row lock. now() is the transaction
+    -- START, so a hold whose transaction began before a re-registration but took the lock after it
+    -- would stamp a status_since EARLIER than the floor, reading as written by the old incarnation
+    -- and lifting the fence. clock_timestamp() is read when this UPDATE runs, which is after
+    -- beginClaimMutation's worker lock, so status_since orders with the lock.
+    status_since                   = clock_timestamp(),
     hold_reason                    = 'credential_switch_settling',
     credential_switch_requested_at = NULL,
     credential_switch_generation   = NULL,
@@ -4039,7 +4060,7 @@ FROM runs r
 JOIN workers w ON w.id = r.worker_id
 WHERE r.id = sqlc.arg('run_id')::uuid AND r.status = 'paused'
   AND r.hold_reason = 'credential_switch_settling'
-  AND w.last_heartbeat_at >= sqlc.arg('stale_cutoff')::timestamptz
+  AND (sqlc.arg('stale_cutoff')::timestamptz IS NULL OR w.last_heartbeat_at >= sqlc.arg('stale_cutoff')::timestamptz)
   AND w.dind_register_floor <= r.status_since;
 
 -- name: StampHeldCredentialSwitch :execrows
