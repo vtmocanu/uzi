@@ -244,9 +244,9 @@ const (
 
 // ErrRunHoldSettling is the owner-facing refusal of a resume or set-token on a run whose
 // credential_switch_settling hold is still fenced: its worker is alive, has not re-registered since
-// the hold and is still stopping the run's processes (issue #3181). The text is the operator-facing
+// the hold and is still finishing its own operations for the run (issue #3181). The text is the operator-facing
 // 409 message.
-var ErrRunHoldSettling = errors.New("the worker is still stopping this run's processes; Resume becomes available when it finishes, or Cancel the run")
+var ErrRunHoldSettling = errors.New("the worker is still finishing its own operations for this run; try Resume again shortly, or Cancel the run")
 
 // HeartbeatStaleCutoff is the heartbeat instant before which a worker counts as stale: now minus
 // the WorkerHeartbeatStale window the stale-worker requeue sweep uses. A non-positive window yields

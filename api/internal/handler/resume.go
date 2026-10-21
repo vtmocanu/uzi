@@ -109,8 +109,8 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 			StaleCutoff:                workersvc.HeartbeatStaleCutoff(h.clock(), h.cfg.WorkerHeartbeatStale),
 		}); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				// Issue #3181: a credential_switch_settling hold whose worker is still stopping the
-				// run's processes is its own refusal, not "no longer paused". Re-read the fence
+				// Issue #3181: a credential_switch_settling hold whose worker is still finishing its own
+				// operations for the run is its own refusal, not "no longer paused". Re-read the fence
 				// (the same predicate ResumePausedRun refuses on) rather than trusting the earlier
 				// read of the hold reason.
 				settling, serr := h.q.CredentialSwitchHoldSettling(r.Context(), store.CredentialSwitchHoldSettlingParams{

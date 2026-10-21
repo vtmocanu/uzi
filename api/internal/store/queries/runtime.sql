@@ -3786,8 +3786,8 @@ WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
   -- D6: refuse a completion hold unless the completion decision endpoint opts in.
   AND (runs.hold_reason IS DISTINCT FROM 'completion_blocked' OR @allow_completion_blocked_hold::boolean)
-  -- Issue #3181: refuse a credential_switch_settling hold while its worker is still stopping the
-  -- run's processes (a fresh heartbeat from the SAME incarnation that wrote the hold). The fence
+  -- Issue #3181: refuse a credential_switch_settling hold while its worker is still finishing its own
+  -- operations for the run (a fresh heartbeat from the SAME incarnation that wrote the hold). The fence
   -- lifts when the worker settles it (credential_switch_unsettled), goes stale or vanishes, or
   -- re-registers (dind_register_floor then moves past status_since).
   AND (runs.hold_reason IS DISTINCT FROM 'credential_switch_settling'

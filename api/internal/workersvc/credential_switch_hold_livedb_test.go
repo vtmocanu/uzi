@@ -528,6 +528,10 @@ func TestCredentialSwitchHoldSettleLiveDB(t *testing.T) {
 		f.hold(t, id)
 		since := statusSinceOf(t, f.env, id)
 		reregister(t, f.env, f.o.workerID)
+		// The real registration lifts the settling fence for the owner without moving status_since.
+		if settling, err := f.svc.runHoldSettling(f.env.ctx, id); err != nil || settling {
+			t.Fatalf("fence after re-registration = (%v, %v), want lifted", settling, err)
+		}
 		if _, applied, err := f.report(t, f.o.workerID, id, "credential_switch_hold_settled", f.gen); err != nil || applied {
 			t.Fatalf("settle by a new incarnation: applied=%v err=%v, want a clean not-applied", applied, err)
 		}
@@ -536,6 +540,12 @@ func TestCredentialSwitchHoldSettleLiveDB(t *testing.T) {
 		}
 		if !statusSinceOf(t, f.env, id).Equal(since) {
 			t.Fatal("re-registration rewrote status_since")
+		}
+		if err := f.ownerResume(id); err != nil {
+			t.Fatalf("owner resume after re-registration: %v", err)
+		}
+		if got := statusOf(t, f.env, id); got != "queued" {
+			t.Fatalf("status after owner resume = %q, want queued", got)
 		}
 		// restore the fixture worker's floor for the sub-tests that follow
 		f.env.exec(`UPDATE workers SET dind_register_floor = now() - interval '1 hour' WHERE id = $1`, f.o.workerID)

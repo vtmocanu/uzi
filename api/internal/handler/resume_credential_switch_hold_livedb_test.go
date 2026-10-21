@@ -13,8 +13,10 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/config"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -134,7 +136,15 @@ func TestResumeCredentialSwitchHoldLiveDB(t *testing.T) {
 	t.Run("re-registered worker lifts the fence", func(t *testing.T) {
 		w := newWorker()
 		id := newHold(w, "credential_switch_settling")
-		exec(`UPDATE workers SET dind_register_floor = now() WHERE id=$1`, w)
+		if call(id).Code != http.StatusConflict {
+			t.Fatal("precondition: the fence must be up before the re-registration")
+		}
+		// The REAL registration query moves dind_register_floor (its only writer), not raw SQL.
+		if _, err := h.q.RegisterWorker(ctx, store.RegisterWorkerParams{
+			ID: w, ProtocolCapabilities: []string{capability.CredentialSwitchV1}, SnapshotRegisterNonce: pgconv.TextOrNull(uuid.NewString()),
+		}); err != nil {
+			t.Fatalf("RegisterWorker: %v", err)
+		}
 		if rec := call(id); rec.Code != http.StatusOK {
 			t.Fatalf("code = %d, want 200; body=%s", rec.Code, rec.Body.String())
 		}

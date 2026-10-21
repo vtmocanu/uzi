@@ -15,7 +15,7 @@ func TestSetRunCredentialHoldSettlingIs409(t *testing.T) {
 	h := &Handler{}
 	rec := httptest.NewRecorder()
 	h.writeSetRunCredentialError(rec, workersvc.ErrRunHoldSettling)
-	const want = "the worker is still stopping this run's processes; Resume becomes available when it finishes, or Cancel the run"
+	const want = "the worker is still finishing its own operations for this run; try Resume again shortly, or Cancel the run"
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("code = %d, want 409; body=%s", rec.Code, rec.Body.String())
 	}

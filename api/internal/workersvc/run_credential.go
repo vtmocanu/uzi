@@ -137,8 +137,8 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 			}
 			break
 		}
-		// Issue #3181: a credential_switch_settling hold whose worker is still stopping the run's
-		// processes refuses the switch up front, before the override is written. This pre-check is
+		// Issue #3181: a credential_switch_settling hold whose worker is still finishing its own
+		// operations for the run refuses the switch up front, before the override is written. This pre-check is
 		// not atomic with the resume below: in a narrow race (the holder's heartbeat turns fresh
 		// between the pre-check and the resume) the owner's override is saved and the resume is
 		// then refused with ErrRunHoldSettling. The same applies to the rarer resume -> reclaim ->

@@ -70,12 +70,13 @@ func TestRunWaitStopsOnCredentialSwitchHold(t *testing.T) {
 	}
 }
 
-// TestRunWaitReturnsImmediatelyOnSettlingHold: a re-run wait against a run that is already in
-// either hold returns at once (exit 0) instead of waiting for the hold to lift.
-func TestRunWaitReturnsImmediatelyOnSettlingHold(t *testing.T) {
+// TestRunWaitReturnsImmediatelyOnCredentialSwitchHolds: a re-run wait against a run that is already in
+// either hold returns at once (exit 0) instead of waiting for the hold to lift. The --timeout makes a
+// regression fail fast (exit 7) rather than hang.
+func TestRunWaitReturnsImmediatelyOnCredentialSwitchHolds(t *testing.T) {
 	for _, reason := range []string{holdCredentialSwitchSettling, holdCredentialSwitchUnsettled} {
 		fc := &uzicli.FakeClient{GetRunHook: scriptHook(waitStep{run: pausedWithHold(reason)})}
-		_, stderr, code := runCLI(t, fakeEnv(fc), "run", "wait", "r1", "--interval", "1ms")
+		_, stderr, code := runCLI(t, fakeEnv(fc), "run", "wait", "r1", "--interval", "1ms", "--timeout", "5s")
 		if code != uzicli.ExitOK || !strings.Contains(stderr, "uzi run cancel") {
 			t.Errorf("%s: exit=%d stderr=%q, want an immediate stop naming Cancel", reason, code, stderr)
 		}
