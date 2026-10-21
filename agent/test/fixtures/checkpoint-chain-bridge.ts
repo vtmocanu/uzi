@@ -25,7 +25,9 @@ const cfg = JSON.parse(process.env.UZI_CHAIN_BRIDGE_FIXTURE ?? "") as {
    *  origin's main advances by `advance` ("none", a plain file, a workflow change, or deleting files the
    *  base has), optionally the run commits (`commit`), and a tick publishes. With `descendant` the run
    *  then commits once more and a second tick publishes the next descendant. */
-  stale?: { advance: "none" | "plain" | "workflow" | "delete"; commit: boolean; descendant: boolean };
+  stale?: { advance: "none" | "plain" | "workflow" | "delete"; commit: boolean; descendant: boolean; pause?: boolean };
+  /** A seeded claim (plan supplied at create time, approved, no planning turn). */
+  seeded?: boolean;
 };
 assert.ok(path.isAbsolute(cfg.scratch));
 assert.ok(path.isAbsolute(cfg.origin));
@@ -127,6 +129,19 @@ const runner = new RunRunner(client, gitCache, () => ({
           // Issue #3242: the run starts on main's tip; origin's main then moves past that base.
           const stale = cfg.stale;
           summary.baseTip = gitIn(ctx.worktreePath, ["rev-parse", "HEAD"]);
+          if (stale.pause) {
+            // A tick while main is still the base establishes the tracking ref (its publish is not
+            // confirmed: the Go side answers it with a skip); then main moves and the run, still
+            // without a commit, pauses through the real non-pinned pause publish.
+            fakeNow += INTERVAL_MS + 1;
+            summary.tickOutcome = await fireTick();
+            summary.mainTip = advanceOrigin("upstream.txt", `upstream ${cfg.iid}\n`);
+            const at = { completedCount: 0, total: 1 };
+            summary.parked = await ctx.parkForPause!(at);
+            summary.tips = tips;
+            summary.results = results;
+            return summary.parked ? { branch: ctx.branch, pausedAt: at } : { branch: ctx.branch };
+          }
           if (stale.advance === "workflow") {
             summary.mainTip = advanceOrigin(workflow, `name: ci\non: push\njobs: {}\n# advanced ${cfg.iid}\n`);
           } else if (stale.advance === "plain") {
@@ -181,6 +196,7 @@ const claim = makeClaim({
   issue_title: `Bridge ${cfg.iid}`,
   repo: { id: "r1", url: "https://github.com/org/repo", clone_url: cfg.origin, forge_type: "github" },
   secrets: { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "dummy-oauth-do-not-scan" },
+  ...(cfg.seeded ? { plan_source: "seeded" as const, plan_approved: true, plan_md: `# Seeded plan ${cfg.iid}\n` } : {}),
 });
 let code = 0;
 try {

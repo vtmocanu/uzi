@@ -30,6 +30,10 @@ type bridgePublish struct {
 	err     string
 }
 
+// errBridgeSuperseded stands in for the api's slot refusal (workersvc "superseded"), a 200 skip the
+// worker treats as not confirmed. Only the seeded-pause case answers it, to its first tick.
+var errBridgeSuperseded = errors.New("bridge: superseded")
+
 // bridgeSkipLabel is production's broker-refusal mapping (workersvc publishOutcome): each sentinel
 // is a 200 skip carrying this label, never a 5xx. "" means the error is not a skip sentinel.
 func bridgeSkipLabel(err error) string {
@@ -48,6 +52,8 @@ func bridgeSkipLabel(err error) string {
 		return "pack_too_large"
 	case errors.Is(err, pushbroker.ErrPackInvalid):
 		return "pack_invalid"
+	case errors.Is(err, errBridgeSuperseded):
+		return "superseded"
 	}
 	return ""
 }
@@ -221,6 +227,7 @@ type staleBaseCase struct {
 	advance                  string // "none" | "plain" | "workflow" | "delete"
 	commit, descendant, race bool
 	lostAck, guard           bool
+	seededPause              bool // a seeded claim: unconfirmed first tick, main moves, then a real pause
 	want                     string
 }
 
@@ -241,6 +248,9 @@ var staleBaseCases = []staleBaseCase{
 	{name: "guarded-plain", shape: "linear", advance: "plain", guard: true, want: "published"},
 	{name: "guarded-workflow", shape: "linear", advance: "workflow", guard: true, want: "ci_config_guard"},
 	{name: "guarded-workflow-commit", shape: "linear", advance: "workflow", commit: true, guard: true, want: "ci_config_guard"},
+	// Issue #3242 / 81c950c7: a seeded run with no commit, its tracking ref set by an unconfirmed tick,
+	// pauses after main moved; the pause publish takes the non-pinned zero range and must park.
+	{name: "seeded-pause", shape: "linear", advance: "plain", seededPause: true, want: "published"},
 }
 
 func runAgentCheckpointBridge(t *testing.T, root, node, boundary string, iid int, lostAck bool) {
@@ -408,7 +418,11 @@ func runAgentStaleBaseBridge(t *testing.T, root, node string, c staleBaseCase, i
 		missing := !shallowBaseHas(t, url, tip, branch)
 		absentMu.Lock()
 		absent = append(absent, missing)
+		first := len(absent) == 1
 		absentMu.Unlock()
+		if c.seededPause && first {
+			return errBridgeSuperseded
+		}
 		opts := pushbroker.Options{
 			CloneURL: url, Username: "uzi-bot", PAT: redirectTestPAT(),
 			Branch: branch, DefaultBranch: "main", DeclaredTip: tip, Pack: pack,
@@ -427,10 +441,12 @@ func runAgentStaleBaseBridge(t *testing.T, root, node string, c staleBaseCase, i
 		DescendantTip     string `json:"descendantTip"`
 		TickOutcome       string `json:"tickOutcome"`
 		DescendantOutcome string `json:"descendantOutcome"`
+		Parked            bool   `json:"parked"`
 	}
 	out, runErr := runBridgeFixture(t, root, node, map[string]any{
 		"url": srv.srv.URL, "token": "tkn-bridge-123456", "origin": f.bare, "iid": iid, "boundary": "tick",
-		"stale":   map[string]any{"advance": c.advance, "commit": c.commit, "descendant": c.descendant},
+		"stale":   map[string]any{"advance": c.advance, "commit": c.commit, "descendant": c.descendant, "pause": c.seededPause},
+		"seeded":  c.seededPause,
 		"scratch": t.TempDir(),
 	}, &summary)
 	publishes := srv.publishes()
@@ -445,6 +461,22 @@ func runAgentStaleBaseBridge(t *testing.T, root, node string, c staleBaseCase, i
 	}
 	if len(publishes) == 0 {
 		t.Fatalf("no checkpoint publish reached the broker\n%s", describe())
+	}
+	if c.seededPause {
+		// [unconfirmed tick of B, pause publish of B after main moved]; the pause must park on B.
+		if len(publishes) != 2 || publishes[0].skipped != "superseded" || publishes[1].tip != summary.BaseTip {
+			t.Fatalf("publishes = %+v, want [tick B skipped superseded, pause B]\n%s", publishes, describe())
+		}
+		if !absent[1] {
+			t.Fatalf("precondition: B is still a shallow base tip at the pause, so this case proves nothing\n%s", describe())
+		}
+		if publishes[1].skipped != "" || publishes[1].err != "" || !summary.Parked {
+			t.Fatalf("the seeded no-commit pause did not publish and park: %+v parked=%v\n%s", publishes[1], summary.Parked, describe())
+		}
+		if got := f.originRef(ref); got != summary.BaseTip {
+			t.Fatalf("checkpoint ref = %s, want the base %s\n%s", got, summary.BaseTip, describe())
+		}
+		return
 	}
 	moved := c.advance != "none" || c.race
 	if moved && !c.commit && !absent[0] {
