@@ -2941,8 +2941,12 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   `credential switch settling` or `credential switch unsettled` with the next
   step, `run list` shows `paused (credential switch settling)` or `paused
   (credential switch unsettled)`, the TUI draws `⊘ settling` or `⊘ unsettled`
-  in NEEDS YOU, and `run wait` with its default targets stops on either. While settling, `run resume`
-  and `run set-token` are refused with a 409 and `run cancel` works; see
+  in NEEDS YOU, and `run wait` with its default targets stops on either (a
+  re-run `run wait` on a held run returns immediately). While settling, the
+  worker is finishing its own operations; `run resume` and `run set-token` are
+  refused with a 409 only while the holding worker is live and the same
+  registration (the refusal lifts on the worker's acknowledgement, a stale
+  heartbeat, worker removal or re-registration), and `run cancel` always works; see
   [Credential-switch holds](run-recovery.md#credential-switch-holds).
 
 For an ordinary pause, human `run get` makes one supplemental message read

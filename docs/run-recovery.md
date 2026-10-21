@@ -131,16 +131,24 @@ bounded allowance. If that is proven, the switch releases as usual. If it is
 not, the run is held for you. The hold is `paused` and keeps the run's work
 and custody on that worker:
 
-- **`credential_switch_settling`**: the worker is still stopping or joining its
-  own operations. **Resume** and `uzi run set-token` are refused with a 409
-  until the hold settles; **Cancel** always works. The CLI shows `credential
-  switch settling`, the web shows **stopping processes: token switch**.
-- **`credential_switch_unsettled`**: the worker has acknowledged and the run
-  is held for you. The CLI shows `credential switch unsettled`, the web shows
+- **`credential_switch_settling`**: the worker is still finishing its own
+  operations (lane disposal, deps install); it stops and kills nothing now.
+  While the holding worker is live and still the same registration, **Resume**
+  and `uzi run set-token` are refused with a 409 ("the worker is still
+  finishing its own operations for this run; try Resume again shortly, or
+  Cancel the run"); the refusal lifts on the worker's acknowledgement, a stale
+  heartbeat, the worker's removal or its re-registration. **Cancel** always
+  works. The CLI shows `credential switch settling`, the web shows
+  **settling: token switch** (Resume and Switch token stay enabled and show
+  the refusal inline).
+- **`credential_switch_unsettled`**: the worker has acknowledged that its own
+  operations joined and the run is held for you. The acknowledgement does not
+  prove the run's processes stopped. The CLI shows `credential switch unsettled`, the web shows
   **held: token switch**. **Resume** requeues the run on the token you chose
   (the same worker is preferred); `uzi run set-token` saves a token and
   resumes. **Cancel** ends the run. The feed message and diagnostics name any
-  survivor class (`unreadable`, `worker_child`, `restarted`, `kill_failed`).
+  survivor class (`worker_child`, `unreadable`, `restarted`, `kill_failed`, or
+  `unverified`, `settle unconfirmed`, `deadline`), never a pid.
 
 Settling lifts only on the worker's acknowledgement (fenced on the worker,
 run, claim generation and registration nonce), the worker's heartbeat going

@@ -103,13 +103,16 @@ evidence-verification allowance. Two outcomes:
 - **Unproven**: the worker reports `credential_switch_held` instead. The run goes
   `paused` with `hold_reason = credential_switch_settling`; the claim is **not**
   released, the switch stamp is cleared, nothing is banked, and the override, worker and
-  session are kept. Once the worker has finished stopping or joining its own operations
+  session are kept. Once the worker has finished its own operations (lane disposal, deps install)
   it reports `credential_switch_hold_settled`, which flips the hold to
-  `credential_switch_unsettled`. Survivor classes (`unreadable`, `worker_child`,
-  `restarted`, `kill_failed`) appear in diagnostics and the hold's feed message.
+  `credential_switch_unsettled`. The acknowledgement means those operations joined; it does not
+  prove the run's processes stopped. Fixed survivor classes (`worker_child`, `unreadable`,
+  `restarted`, `kill_failed`, or `unverified` / `settle unconfirmed` / `deadline`; never pids)
+  appear in diagnostics and the hold's feed message.
 
 **The settling fence.** While the hold is `credential_switch_settling`, Resume and
-set-token are refused with a 409 (`ErrRunHoldSettling`); Cancel always works. The fence
+set-token are refused with a 409 (`ErrRunHoldSettling`) only while the holding worker is live
+and the same registration; Cancel always works. The fence
 lifts only on the worker's acknowledgement (fenced on worker, run, claim generation and
 registration nonce), the holder's heartbeat going stale, the worker row being removed, or
 the worker re-registering (`workers.dind_register_floor` moving past `runs.status_since`).
