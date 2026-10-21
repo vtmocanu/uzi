@@ -55,7 +55,8 @@ const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
   public_base_url: "http://127.0.0.1:8080",
   judge_enabled: "false",
   judge_model: "opus",
-  codex_judge_model: "",
+  // The server reports the built-in as the effective value of an unset key (source "default").
+  codex_judge_model: "gpt-6.1-sol",
   judge_enforce_all: "false",
   judge_cooldown_seconds: "60",
   judge_daily_budget: "0",
@@ -721,6 +722,11 @@ describe("AdminSettings — run judge (PRD #46)", () => {
     const select = (await screen.findByLabelText("Claude judge model")) as HTMLSelectElement;
     expect(select.value).toBe("inherit");
     expect(select.options[select.selectedIndex].textContent).toBe("Default \u00b7 opus (built-in)");
+    // The Codex lane follows its source, not its (non-empty) effective value.
+    const codex = (await screen.findByLabelText("Codex judge model")) as HTMLSelectElement;
+    expect(codex.value).toBe("inherit");
+    expect(codex.options[codex.selectedIndex].textContent).toBe("Default \u00b7 gpt-6.1-sol (built-in)");
+    expect(screen.getAllByText("Follows the built-in model.")).toHaveLength(2);
   });
 
   it("resets to the built-in by sending an empty judge model", async () => {
