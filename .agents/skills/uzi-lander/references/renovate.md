@@ -104,9 +104,8 @@ new version can break uzi or ship capabilities uzi should adopt.
   which rewrites every registered Codex version and digest pin from it; keep the Codex
   guardrail/conformance checks green.
 - Required PR CI covers the agent suite, the real-binary `test:codex-m4` on amd64 and the
-  worker-uid lane (`test-agent`). `codex-packaged-proof-gate`, required once #3212 adds it
-  to `protect-main`, covers the strict packaged proof on amd64 and the arm64 package check
-  (`e2e/codex-proof/package-exec.sh`). The amd64 image builds run but are not required.
+  worker-uid lane (`test-agent`). The required `codex-packaged-proof-gate` covers the strict
+  packaged proof on amd64 and the arm64 package check (`e2e/codex-proof/package-exec.sh`). The amd64 image builds run but are not required.
   No PR check covers an arm64 image or packaged proof, the code-mode host executing on
   arm64, `check:codex-m4-receipts` or live provider entitlement. Name in the merge note
   which of these ran.
