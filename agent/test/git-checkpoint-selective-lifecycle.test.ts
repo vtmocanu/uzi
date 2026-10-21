@@ -82,6 +82,119 @@ function controlled(target: number, cap = false) {
   };
   return { spawner, entered, cancelled, release, calls, pipes, get live() { return live; } };
 }
+/** Backpressure-sized chunks, with one event-loop turn for cancellation after each write.
+ * At most 272 chunks are offered; cancellation stops production and blocks verified disposal. */
+function flooding(target: number, output: "stdout" | "stderr", cumulative = false, chunks = 272) {
+  const cancelled = deferred(), release = deferred(), offered = deferred();
+  const calls: string[][] = [];
+  let consumed = 0, stopped = false, joined = false;
+  const chunk = output === "stderr" ? Buffer.alloc(65536, 120) : Buffer.from((TIP + "\n").repeat(1598));
+  const spawner: BoundaryProcessSpawner = async request => {
+    const args = [...request.argv], index = calls.length;
+    calls.push(args);
+    const stdout = new PassThrough(), stderr = new PassThrough(), stdin = new PassThrough();
+    stdin.resume();
+    const completed = (async () => {
+      await tick(); // Let spawnGit attach both consumers before offering bytes.
+      if (index === target || (cumulative && index < target)) {
+        for (let n = 0; n < (cumulative ? 70 : chunks) && !stopped; n++) {
+          consumed += chunk.length;
+          (output === "stderr" ? stderr : stdout).write(chunk);
+          await tick();
+        }
+        if (index === target) offered.resolve();
+      }
+      if (stopped) await release.promise;
+      else stdout.write(args.includes("pack-objects") ? "PACK" : metadata[index] ?? "");
+      stdout.end(); stderr.end(); stdin.destroy();
+      if (stopped) joined = true;
+      return { code: 0 };
+    })();
+    return { stdout, stderr, stdin, completed, cancel: async () => {
+      stopped = true;
+      cancelled.resolve();
+      stdout.destroy(); stderr.destroy(); stdin.destroy();
+      await release.promise;
+      await completed;
+    } };
+  };
+  return { spawner, cancelled, release, offered, calls,
+    get consumed() { return consumed; }, get joined() { return joined; } };
+}
+
+it("preparation counts stdout source bytes once despite raw and gated transport", async () => {
+  const git = cache(), owner = flooding(0, "stdout", false, 160);
+  const packed = await git.withBoundaryProcessSpawner(owner.spawner, new AbortController().signal,
+    () => git.checkpointPack("bare", "task", undefined, undefined, undefined, undefined,
+      undefined, undefined, { defaultBranch: "release" }));
+  assert.ok(packed);
+  try {
+    for await (const _chunk of packed.pack) { /* drain selected producer */ }
+    assert.equal(await packed.exited, 0);
+    assert.equal(owner.consumed, 160 * 65518);
+    assert.equal(owner.calls.length, 5);
+    assert.equal(owner.calls[4]!.includes("--revs"), false, "less than 16 MiB must stay selective");
+  } finally { owner.release.resolve(); packed.cancel(); packed.pack.destroy(); await packed.exited; }
+});
+
+for (const scenario of [
+  ...[0, 1, 2, 3].map(target => ({ target, output: "stderr" as const, cumulative: false })),
+  { target: 3, output: "stderr" as const, cumulative: true },
+  { target: 1, output: "stdout" as const, cumulative: false },
+]) {
+  for (const stop of ["live", "cancel", "deadline", "unsafe"] as const) {
+    it(`preparation ${scenario.output} bytes at child ${scenario.target}, cumulative=${scenario.cumulative}, join before ${stop}`, async t => {
+      let now = 1_000, returned = false;
+      t.mock.method(Date, "now", () => now);
+      const git = cache(), parent = new AbortController();
+      const owner = flooding(scenario.target, scenario.output, scenario.cumulative);
+      const unsafe = new CheckpointUnsafeCleanupError("flood disposal unverified");
+      const spawner: BoundaryProcessSpawner = async request => {
+        const child = await owner.spawner(request);
+        return { ...child, cancel: async () => {
+          await child.cancel();
+          if (stop === "unsafe") throw unsafe;
+        } };
+      };
+      const pending = git.withBoundaryProcessSpawner(spawner, new AbortController().signal,
+        () => git.checkpointPack("bare", "task", undefined, undefined, undefined, undefined,
+          undefined, undefined, { defaultBranch: "release", signal: parent.signal, deadline: 61_000 }));
+      const observed = pending.then(value => ({ value }), error => ({ error })).finally(() => { returned = true; });
+      try {
+        await Promise.race([owner.cancelled.promise, owner.offered.promise]);
+        await tick();
+        assert.ok(owner.consumed <= 16 * 1024 * 1024 + 65536, "stop within one source chunk of production ceiling");
+        assert.equal(returned, false, "no result until cancellation and completion join");
+        assert.equal(owner.calls.length, scenario.target + 1, "no fallback before verified cleanup");
+        assert.equal(owner.joined, false);
+        if (stop === "cancel") parent.abort();
+        if (stop === "deadline") now = 61_000;
+        owner.release.resolve();
+        const result = await observed;
+        assert.equal(owner.joined, true);
+        if (stop === "live") {
+          assert.ok("value" in result && result.value);
+          for await (const _chunk of result.value.pack) { /* drain the sole legacy producer */ }
+          assert.equal(await result.value.exited, 0);
+          assert.equal(owner.calls.length, scenario.target + 2);
+          assert.ok(owner.calls.at(-1)!.includes("--revs"));
+        } else {
+          assert.ok("error" in result);
+          if (stop === "unsafe") assert.equal(result.error, unsafe);
+          else assert.match(String(result.error), /abort|deadline/i);
+          assert.equal(owner.calls.length, scenario.target + 1);
+        }
+      } finally {
+        owner.release.resolve();
+        const result = await observed;
+        if ("value" in result && result.value) {
+          result.value.cancel(); result.value.pack.destroy(); await result.value.exited;
+        }
+      }
+    });
+  }
+}
+
 for (const stop of ["signal", "clock"] as const) {
   it(`soft ${stop} before entry remains cooperative without launching a producer`, async () => {
     const git = cache(), soft = new AbortController();
@@ -505,9 +618,85 @@ for (const stop of ["cancel", "deadline"] as const) {
   });
 }
 
+for (const stop of ["live", "cancel", "deadline"] as const) {
+  it(`native preparation stderr overflow joins close before ${stop}`, async t => {
+    const timers = trackTimers(t);
+    let now = 1_000;
+    t.mock.method(Date, "now", () => now);
+    const scratch = path.resolve("../.uzi/scratch");
+    fs.mkdirSync(scratch, { recursive: true });
+    const root = fs.mkdtempSync(path.join(scratch, "native-byte-cap-"));
+    execFileSync("git", ["init", "--bare", root], { stdio: "pipe" });
+    const git = cache(), parent = new AbortController(), closed = deferred(), release = deferred();
+    const spawn = git["spawnGit"].bind(git);
+    let child: Awaited<ReturnType<typeof spawn>> | undefined;
+    let consumed = 0, launches = 0, returned = false;
+    let pump: Promise<void> | undefined;
+    Object.assign(git, { spawnGit: async (...args: Parameters<typeof spawn>) => {
+      launches++;
+      if (args[1].includes("pack-objects")) {
+        assert.equal(child!.child!.exitCode !== null || child!.child!.signalCode !== null, true);
+        return { stdout: Readable.from(["PACK"]), exited: Promise.resolve(0), cancel() {} };
+      }
+      // An inert native Git reader owns the real pipes and waits for cancellation.
+      // Inject diagnostic bytes into its stderr pipe to exercise native accounting.
+      child = await spawn(root, ["cat-file", "--batch-check"], undefined,
+        { ...args[3], keepStdinOpen: true });
+      const owned = child;
+      pump = (async () => {
+        const chunk = Buffer.alloc(65536, 120);
+        for (let n = 0; n < 272 && !owned.child!.killed && !owned.child!.stderr!.destroyed; n++) {
+          consumed += chunk.length;
+          owned.child!.stderr!.push(chunk);
+          await tick();
+        }
+        // An unfixed reader reaches the finite offer limit without cancellation.
+        if (!owned.child!.killed) closed.resolve();
+      })();
+      return { ...owned, settled: async () => {
+        await owned.settled();
+        closed.resolve();
+        await release.promise;
+      } };
+    } });
+    const pending = git.checkpointPack(root, "task", undefined, undefined, undefined, undefined,
+      undefined, undefined, { defaultBranch: "release", signal: parent.signal, deadline: 61_000 });
+    const observed = pending.then(value => ({ value }), error => ({ error })).finally(() => { returned = true; });
+    try {
+      await closed.promise;
+      assert.ok(consumed <= 16 * 1024 * 1024 + 65536);
+      assert.ok(child!.child!.signalCode || child!.child!.exitCode !== null, "native close was joined");
+      assert.equal(returned, false);
+      assert.equal(launches, 1);
+      if (stop === "cancel") parent.abort();
+      if (stop === "deadline") now = 61_000;
+      release.resolve();
+      const result = await observed;
+      if (stop === "live") {
+        assert.ok("value" in result && result.value);
+        for await (const _chunk of result.value.pack) { /* drain fallback */ }
+        assert.equal(await result.value.exited, 0);
+        assert.equal(launches, 2);
+      } else {
+        assert.ok("error" in result);
+        assert.match(String(result.error), /abort|deadline/i);
+        assert.equal(launches, 1);
+      }
+      await pump;
+      assert.equal(timers.size, 0);
+      assert.equal(getEventListeners(parent.signal, "abort").length, 0);
+    } finally {
+      release.resolve(); child?.cancel(); await pump; await observed;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
+
 it("native preparation cancellation joins child close and removes its abort listener", async t => {
   const timers = trackTimers(t);
-  const root = fs.mkdtempSync(path.resolve("../.uzi/scratch/native-preparation-"));
+  const scratch = path.resolve("../.uzi/scratch");
+  fs.mkdirSync(scratch, { recursive: true });
+  const root = fs.mkdtempSync(path.join(scratch, "native-preparation-"));
   const git = cache(), parent = new AbortController(), entered = deferred(), release = deferred();
   execFileSync("git", ["init", "--bare", root], { stdio: "pipe" });
   const spawn = git["spawnGit"].bind(git);

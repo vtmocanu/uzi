@@ -961,6 +961,8 @@ interface SpawnGitOptions {
   /** Cap on the stderr kept for the failure message (both paths). Default: the boundary path keeps
    *  up to GIT_MAX_BUFFER, the plain path keeps all of it. */
   stderrMaxBytes?: number;
+  /** Private checkpoint preparation accounting, before stderr retention. Must not throw. */
+  onPreparationStderrBytes?: (bytes: number) => void;
   /** Trusted verifier traversal environment; never sourced from repository config. */
   env?: NodeJS.ProcessEnv;
   cancelOnAbandon?: boolean;
@@ -9143,6 +9145,14 @@ export class GitCache {
     const stop = new AbortController();
     const timer = setTimeout(() => stop.abort(cap), Math.max(0, Math.min(5000, limits.durationMs ?? 5000)));
     const rows = new Map<string, { row: Buffer; commit: boolean; all: boolean; blob: boolean }>();
+    let consumed = 0;
+    // Separate from retained unique rows: repeated metadata and discarded diagnostics count.
+    // This callback also runs in stderr data handlers, so cancellation must not throw.
+    const consume = (bytes: number) => {
+      if (stop.signal.aborted) return;
+      if (bytes > maxBytes - consumed) { stop.abort(cap); return; }
+      consumed += bytes;
+    };
     let charged = 0;
     const charge = (bytes: number) => {
       if (bytes > maxBytes - charged) throw cap;
@@ -9155,6 +9165,9 @@ export class GitCache {
           for await (const raw of stream) {
             this.checkCheckpointCooperation();
             const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as Uint8Array);
+            // Count each stdout byte only here, after the raw/gated transport, before parsing.
+            consume(chunk.length);
+            stop.signal.throwIfAborted();
             // Stream high-water marks bound chunks; reject a nonconforming supervisor pipe.
             if (chunk.length > 64 * 1024) throw cap;
             let offset = 0;
@@ -9176,6 +9189,7 @@ export class GitCache {
           this.checkCheckpointCooperation();
           const process = await this.spawnGit(barePath, args, undefined, {
             keepStdinOpen: !!input, stderrMaxBytes: 64 * 1024, joinStderr: true, cancelOnAbandon: true,
+            onPreparationStderrBytes: consume,
           });
           let failure: unknown;
           const read = lines(process.stdout, accept).catch(error => {
@@ -14856,6 +14870,7 @@ try {
       const stderrDone = opts.joinStderr && stderr ? finished(stderr).then(() => true, () => false) : Promise.resolve(true);
       stderr?.on("data", (c: Buffer | string) => {
         const chunk = Buffer.isBuffer(c) ? c : Buffer.from(c);
+        opts.onPreparationStderrBytes?.(chunk.length);
         if (stderrBytes >= stderrCap) return;
         const kept = chunk.subarray(0, stderrCap - stderrBytes);
         stderrChunks.push(kept);
@@ -14948,6 +14963,7 @@ try {
     const stderrDone = opts.joinStderr && stderr ? finished(stderr).then(() => true, () => false) : Promise.resolve(true);
     stderr?.on("error", error => { abortRecovery(); gated.exited(error); });
     stderr?.on("data", (c: Buffer) => {
+      opts.onPreparationStderrBytes?.(c.length);
       if (stderrCap === undefined) {
         stderrChunks.push(c);
         return;
