@@ -29,6 +29,8 @@ lock_value() {
   awk -F= -v key="$key" '$1 == key { print substr($0, index($0, "=") + 1); found=1; exit } END { if (!found) exit 1 }' "$LOCK"
 }
 
+codex_version="$(lock_value CODEX_VERSION)"
+
 for arch in "${ARCHES[@]}"; do
   case "$arch" in amd64|arm64) ;; *) echo "unsupported matrix arch: $arch" >&2; exit 2 ;; esac
   artifact="$(lock_value "CODEX_ARTIFACT_${arch}")"
@@ -44,7 +46,7 @@ run_negative() {
   local name=$1 image=$2 arch=$3 body=$4
   OWNED_CONTAINERS+=("$name")
   timeout "$TIMEOUT" docker run --rm --platform "linux/$arch" --name "$name" \
-    --entrypoint /bin/sh --mount "type=bind,src=$REPO/agent/codex,dst=/m3a,readonly" "$image" -ceu "$body"
+    --entrypoint /bin/sh --mount "type=bind,src=$REPO/agent/codex,dst=/m3a,readonly" "$image" -ceu "$body" sh "$codex_version"
   docker rm -f "$name" >/dev/null 2>&1 || true
 }
 
@@ -71,11 +73,11 @@ for template in "${TEMPLATES[@]}"; do
 
     printf '==> negative missing host %s × %s\n' "$template" "$arch"
     run_negative "codex-m3a-host-${template}-${arch}-$$" "$image" "$arch" \
-      'host=/opt/uzi-codex/0.160.1/bin/codex-code-mode-host; mv "$host" "$host.missing"; if bash /m3a/assert-codex.sh; then echo "missing host unexpectedly passed" >&2; exit 1; fi'
+      'host="/opt/uzi-codex/$1/bin/codex-code-mode-host"; mv "$host" "$host.missing"; if bash /m3a/assert-codex.sh; then echo "missing host unexpectedly passed" >&2; exit 1; fi'
 
     printf '==> negative broken binary %s × %s\n' "$template" "$arch"
     run_negative "codex-m3a-binary-${template}-${arch}-$$" "$image" "$arch" \
-      'codex=/opt/uzi-codex/0.160.1/bin/codex; printf "not-an-elf\n" > "$codex"; chmod 0755 "$codex"; if bash /m3a/assert-codex.sh; then echo "broken binary unexpectedly passed" >&2; exit 1; fi'
+      'codex="/opt/uzi-codex/$1/bin/codex"; printf "not-an-elf\n" > "$codex"; chmod 0755 "$codex"; if bash /m3a/assert-codex.sh; then echo "broken binary unexpectedly passed" >&2; exit 1; fi'
 
     printf 'PASS %s × linux/%s: positive + checksum + missing-host + broken-binary\n' "$template" "$arch"
     CELLS=$((CELLS + 1))

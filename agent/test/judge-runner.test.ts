@@ -24,6 +24,9 @@ import type {
   StateRequest,
 } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
+import { testOwnedPassHomeRoot } from "./teardown-fixtures.js";
+
+const PASS_HOME_ROOT = testOwnedPassHomeRoot();
 
 // A fake worker client recording the review, EVERY state, and the messages the judge
 // posts. `states` records all reportState calls in order (PRD #69 M6 stamps a `running`
@@ -196,7 +199,7 @@ describe("JudgeRunner", () => {
       client.postMessages = async () => { throw new RequestError("POST", "/api/worker/runs/judge-1/messages",
         failure === "stale" ? 409 : 503, failure === "stale" ? '{"disposition":"stale_claim"}' : "unavailable"); };
       const warns: string[] = [];
-      const runner = new JudgeRunner(client, { ...nullLogger(), warn: (message: string) => { warns.push(message); } }, {
+      const runner = new JudgeRunner(client, { ...nullLogger(), warn: (message: string) => { warns.push(message); } }, { homeRoot: PASS_HOME_ROOT,
         codexAdviceHarnessFactory: (async () => ({ kind: "codex", run: async (req: AdviceRequest) => {
           req.usageObserver?.({ "gpt-6-sol": { inputTokens: 100, outputTokens: 10,
             cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: 0.0003, costStatus: "metered" } });
@@ -219,7 +222,7 @@ describe("JudgeRunner", () => {
   }
   it("Claude judge usage follows the claim's existing messages", async () => {
     const { client, calls } = fakeClient(emptyTrace);
-    const runner = new JudgeRunner(client, nullLogger(), {
+    const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT,
       queryFn: replyingQueryFnWithUsage(JSON.stringify({ verdict: "ok", summary: "reviewed", recommendations: [] })),
     });
     await runner.execute(judgeClaim({ last_seq: 1 }));
@@ -239,7 +242,7 @@ describe("JudgeRunner", () => {
           inputTokens: 100, outputTokens: 10, cacheReadInputTokens: 0, cacheCreationInputTokens: 0,
           ...(scenario === "unreported" ? { costStatus: "unreported" } : { costUSD: 0.0003, costStatus: "metered" }),
         } };
-        const runner = new JudgeRunner(client, nullLogger(), {
+        const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT,
           codexAdviceHarnessFactory: (async () => ({
             kind: "codex",
             run: async (req: AdviceRequest) => {
@@ -277,7 +280,7 @@ describe("JudgeRunner", () => {
       summary: "needs a tool",
       recommendations: [{ category: "install_worker_tool", target: "jq", rationale: "missing", confidence: "high" }],
     });
-    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFn(modelJson) });
+    const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: replyingQueryFn(modelJson) });
     await runner.execute(judgeClaim());
 
     assert.equal(calls.review?.id, "target-1");
@@ -292,7 +295,7 @@ describe("JudgeRunner", () => {
   it("reports running before completed and posts the result frame's usage (PRD #69 M6)", async () => {
     const { client, calls } = fakeClient(emptyTrace);
     const modelJson = JSON.stringify({ verdict: "ok", summary: "s", recommendations: [] });
-    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFnWithUsage(modelJson) });
+    const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: replyingQueryFnWithUsage(modelJson) });
     await runner.execute(judgeClaim());
 
     // A `running` report precedes the terminal `completed` one — this is what stamps the
@@ -326,7 +329,7 @@ describe("JudgeRunner", () => {
   it("stamps the claim generation on the running, completed, and usage reports (PRD #1247 M2)", async () => {
     const { client, calls } = fakeClient(emptyTrace);
     const modelJson = JSON.stringify({ verdict: "ok", summary: "s", recommendations: [] });
-    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFnWithUsage(modelJson) });
+    const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: replyingQueryFnWithUsage(modelJson) });
     await runner.execute(judgeClaim({ claim_generation: 9 }));
 
     assert.deepEqual(
@@ -344,7 +347,7 @@ describe("JudgeRunner", () => {
   // generation, so a capability worker's judge FAILURE is fenced, not 409'd.
   it("stamps the claim generation on the failed report (PRD #1247 M2)", async () => {
     const { client, calls } = fakeClient(emptyTrace);
-    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFn("{}") });
+    const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: replyingQueryFn("{}") });
     await runner.execute(judgeClaim({ target_run_id: null, claim_generation: 4 }));
     assert.equal(calls.state?.body.status, "failed");
     assert.equal(calls.state?.body.claim_generation, 4, "the failed report carries the claim generation");
@@ -355,7 +358,7 @@ describe("JudgeRunner", () => {
   it("a capability worker's judge run is ACCEPTED (not 409) by a generation-fencing api (PRD #1247 M2)", async () => {
     const { client, calls } = fencedFakeClient(emptyTrace);
     const modelJson = JSON.stringify({ verdict: "ok", summary: "s", recommendations: [] });
-    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFnWithUsage(modelJson) });
+    const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: replyingQueryFnWithUsage(modelJson) });
     await runner.execute(judgeClaim({ claim_generation: 7 }));
 
     assert.deepEqual(calls.refused, [], "the fence refuses no mutating report — all carry the generation");
@@ -382,7 +385,7 @@ describe("JudgeRunner", () => {
       modelCalled = true;
       yield { type: "result", subtype: "success", is_error: false };
     } as unknown as SdkQueryFn;
-    const runner = new JudgeRunner(client, nullLogger(), { queryFn });
+    const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn });
     await runner.execute(judgeClaim({ claim_generation: 5 }));
 
     assert.deepEqual(
@@ -404,7 +407,7 @@ describe("JudgeRunner", () => {
   it("abandons a stale-claimed judge run at the pre-post probe with zero advice/completed posts (PRD #1247 fix round)", async () => {
     const { client, calls } = staleRunningFakeClient(emptyTrace, 2);
     const modelJson = JSON.stringify({ verdict: "ok", summary: "s", recommendations: [] });
-    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFn(modelJson) });
+    const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: replyingQueryFn(modelJson) });
     await runner.execute(judgeClaim({ claim_generation: 5 }));
 
     assert.deepEqual(
@@ -441,7 +444,7 @@ describe("JudgeRunner", () => {
       postMessages: async () => {},
     } as unknown as WorkerClient;
     const modelJson = JSON.stringify({ verdict: "ok", summary: "s", recommendations: [] });
-    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFn(modelJson) });
+    const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: replyingQueryFn(modelJson) });
     await runner.execute(judgeClaim({ claim_generation: 5 }));
 
     assert.equal(calls.review, undefined, "a probe throw posts NO advice (fail-closed: ownership unknown)");
@@ -464,7 +467,7 @@ describe("JudgeRunner", () => {
       postMessages: async () => {},
     } as unknown as WorkerClient;
     const modelJson = JSON.stringify({ verdict: "ok", summary: "s", recommendations: [] });
-    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFn(modelJson) });
+    const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: replyingQueryFn(modelJson) });
     const claim = judgeClaim({ claim_generation: 6 });
     await runner.execute(claim);
     assert.equal(gotGeneration, 6, "postReview receives the claim's generation");
@@ -490,7 +493,7 @@ describe("JudgeRunner", () => {
       postMessages: async () => {},
     } as unknown as WorkerClient;
     const modelJson = JSON.stringify({ verdict: "ok", summary: "s", recommendations: [] });
-    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFn(modelJson) });
+    const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: replyingQueryFn(modelJson) });
     await runner.execute(judgeClaim({ claim_generation: 5 }));
     assert.equal(posts, 1, "the review post was attempted once");
     assert.deepEqual(states, ["running", "running"], "no completed/failed report after a stale_claim refusal");
@@ -517,7 +520,7 @@ describe("JudgeRunner", () => {
       postMessages: async () => {},
     } as unknown as WorkerClient;
     const modelJson = JSON.stringify({ verdict: "ok", summary: "s", recommendations: [] });
-    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFn(modelJson) });
+    const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: replyingQueryFn(modelJson) });
     await runner.execute(judgeClaim({ claim_generation: 5 }));
     assert.ok(states.includes("failed"), "a non-stale refusal fails the run");
     assert.ok(!states.includes("completed"));
@@ -525,7 +528,7 @@ describe("JudgeRunner", () => {
 
   it("posts NO usage frame on the model-error path (PRD #69 M6)", async () => {
     const { client, calls } = fakeClient(emptyTrace);
-    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFn("garbage", true) });
+    const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: replyingQueryFn("garbage", true) });
     await runner.execute(judgeClaim());
 
     // The deterministic-fallback path records no real spend, so no usage frame is posted.
@@ -540,7 +543,7 @@ describe("JudgeRunner", () => {
 
   it("falls back to the deterministic command-not-found review when the model errors", async () => {
     const { client, calls } = fakeClient(emptyTrace);
-    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFn("garbage", true) });
+    const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: replyingQueryFn("garbage", true) });
     await runner.execute(judgeClaim());
 
     assert.equal(calls.review?.review.status, "failed");
@@ -567,7 +570,7 @@ describe("JudgeRunner", () => {
       };
       yield { type: "result", subtype: "error_during_execution", is_error: true };
     } as unknown as SdkQueryFn;
-    const runner = new JudgeRunner(client, nullLogger(), { queryFn, activeRuns });
+    const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn, activeRuns });
     await runner.execute(judgeClaim());
 
     assert.deepEqual(
@@ -591,7 +594,7 @@ describe("JudgeRunner", () => {
     const queryFn = async function* () {
       yield { type: "result", subtype: "error_during_execution", is_error: true, terminal_reason: "blocking_limit" };
     } as unknown as SdkQueryFn;
-    const runner = new JudgeRunner(client, nullLogger(), { queryFn, activeRuns });
+    const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn, activeRuns });
     await runner.execute(judgeClaim());
 
     assert.deepEqual(
@@ -619,7 +622,7 @@ describe("JudgeRunner", () => {
         calls.state = { id, body };
       },
     } as unknown as WorkerClient;
-    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFn("{}") });
+    const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: replyingQueryFn("{}") });
     await runner.execute(judgeClaim());
 
     assert.equal(calls.review?.review.status, "failed", "a trace-fetch failure still posts the deterministic fallback");
@@ -634,7 +637,7 @@ describe("JudgeRunner", () => {
       queried = true;
       return (async function* () {})();
     }) as unknown as SdkQueryFn;
-    const runner = new JudgeRunner(client, nullLogger(), { queryFn });
+    const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn });
     await runner.execute(judgeClaim({ secrets: { forge_pat: "", anthropic_oauth_token: "" } as never }));
 
     assert.equal(queried, false, "no token ⇒ the model must not be called");
@@ -665,7 +668,7 @@ describe("JudgeRunner", () => {
       harnessBuilt = params;
       return fakeHarness;
     }) as never;
-    const runner = new JudgeRunner(client, nullLogger(), { queryFn, codexAdviceHarnessFactory });
+    const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn, codexAdviceHarnessFactory });
     const codexSecrets = { auth_mode: "api_key", access_token: "codex-tok", capability: "cap-1" };
     await runner.execute(judgeClaim({ secrets: { forge_pat: "", codex: codexSecrets } as never }));
 
@@ -697,7 +700,7 @@ describe("JudgeRunner", () => {
       },
     };
     const codexAdviceHarnessFactory = (async () => fakeHarness) as never;
-    const runner = new JudgeRunner(client, nullLogger(), {
+    const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT,
       queryFn: (() => (async function* () {})()) as unknown as SdkQueryFn,
       codexAdviceHarnessFactory,
     });
@@ -718,7 +721,7 @@ describe("JudgeRunner", () => {
       factoryCalled = true;
       throw new Error("must not be called for a Claude claim");
     }) as never;
-    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFn(modelJson), codexAdviceHarnessFactory });
+    const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: replyingQueryFn(modelJson), codexAdviceHarnessFactory });
     await runner.execute(judgeClaim()); // default secrets: anthropic_oauth_token set, no codex block
 
     assert.equal(factoryCalled, false, "a Claude claim must never build a Codex advice harness");
@@ -739,7 +742,7 @@ describe("JudgeRunner", () => {
       },
     };
     const codexAdviceHarnessFactory = (async () => fakeHarness) as never;
-    const runner = new JudgeRunner(client, nullLogger(), {
+    const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT,
       queryFn: (() => (async function* () {})()) as unknown as SdkQueryFn,
       codexAdviceHarnessFactory,
     });
@@ -759,7 +762,7 @@ describe("JudgeRunner", () => {
 
   it("fails the run when the judge claim carries no target", async () => {
     const { client, calls } = fakeClient(emptyTrace);
-    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFn("{}") });
+    const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: replyingQueryFn("{}") });
     await runner.execute(judgeClaim({ target_run_id: null }));
     assert.equal(calls.review, undefined, "no review without a target");
     assert.equal(calls.state?.body.status, "failed");
@@ -767,7 +770,7 @@ describe("JudgeRunner", () => {
 
   it("the UZI_E2E_EXECUTOR=stub judge queryFn drives the deterministic fallback (M8/B)", async () => {
     const { client, calls } = fakeClient(emptyTrace);
-    const runner = new JudgeRunner(client, nullLogger(), { queryFn: stubJudgeQueryFn });
+    const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: stubJudgeQueryFn });
     await runner.execute(judgeClaim());
     // The stub yields an error result → JudgeRunner falls back to the claim's
     // command-not-found signal, so the e2e sees a real review naming jq, no spend.
@@ -789,7 +792,7 @@ describe("JudgeRunner", () => {
       (async function* () {
         await new Promise((r) => setTimeout(r, 60_000).unref()); // longer than the injected cap; the test itself resolves as soon as runModel's own tiny modelTimeoutMs fires, well under a second either way -- unref just keeps this abandoned timer from holding the event loop open, which is what keeps the FILE's wall time fast (measured 454ms unref'd vs 60263ms without); --test-timeout does not see this at all, since it bounds a test body, not process exit
       })()) as unknown as SdkQueryFn;
-    const runner = new JudgeRunner(client, nullLogger(), { queryFn: hung, modelTimeoutMs: 20 });
+    const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: hung, modelTimeoutMs: 20 });
     const started = Date.now();
     await runner.execute(judgeClaim());
     assert.ok(Date.now() - started < 5_000, "the wall-clock cap must abort the hung model call promptly");
@@ -886,7 +889,7 @@ describe("JudgeRunner — seeded (planless-gate) trace (PRD #209 M6)", () => {
     // and the command-not-found fallback) both contribute none — so a recommendation
     // citing a missing plan cannot appear through any deterministic path.
     const modelJson = JSON.stringify({ verdict: "ok", summary: "clean seeded run", recommendations: [] });
-    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFn(modelJson) });
+    const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: replyingQueryFn(modelJson) });
     await runner.execute(judgeClaim({ target_run_id: "seeded-target-1", judge_signal: null }));
 
     // The verdict schema parses (Success-criterion half: "the verdict schema parses").
@@ -1234,7 +1237,7 @@ describe("judge model context fences", () => {
           return { text: json, end: { kind: "terminal", terminal: { outcome: "success" } } };
         },
       })) as never;
-      const runner = new JudgeRunner(client, nullLogger(), { queryFn, codexAdviceHarnessFactory });
+      const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn, codexAdviceHarnessFactory });
       await runner.execute(judgeClaim({
         ...(provider === "Codex" ? {
           secrets: { forge_pat: "", codex: { auth_mode: "api_key", access_token: "codex-tok", capability: "cap-1" } } as never,
@@ -1721,7 +1724,7 @@ describe("judge tool confinement (PRD #89 M-allow / auditor Medium)", () => {
     const { queryFn, captured } = capturingQueryFn(
       JSON.stringify({ verdict: "ok", summary: "", recommendations: [] }),
     );
-    const runner = new JudgeRunner(client, nullLogger(), { queryFn });
+    const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn });
     await runner.execute(judgeClaim());
 
     const options = captured.options;
@@ -1746,7 +1749,7 @@ describe("judge tool confinement (PRD #89 M-allow / auditor Medium)", () => {
     const { queryFn, captured } = capturingQueryFn(
       JSON.stringify({ verdict: "ok", summary: "", recommendations: [] }),
     );
-    const runner = new JudgeRunner(client, nullLogger(), { queryFn });
+    const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn });
     await runner.execute(judgeClaim({ config: { default_effort: "high" } as ClaimConfig }));
 
     assert.ok(captured.options, "the judge must have called the model (so options were captured)");
@@ -1758,7 +1761,7 @@ describe("judge tool confinement (PRD #89 M-allow / auditor Medium)", () => {
     const { queryFn, captured } = capturingQueryFn(
       JSON.stringify({ verdict: "ok", summary: "", recommendations: [] }),
     );
-    const runner = new JudgeRunner(client, nullLogger(), { queryFn });
+    const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn });
     await runner.execute(judgeClaim());
 
     assert.ok(captured.options, "the judge must have called the model (so options were captured)");
@@ -1822,7 +1825,7 @@ describe("JudgeRunner terminal journaling (PRD #1391 Run B M3b, D6)", () => {
     const outbox = await mkJournalOutbox();
     const { client, calls } = await journalingClient(emptyTrace, /*failTerminal*/ true);
     const modelJson = JSON.stringify({ verdict: "ok", summary: "s", recommendations: [] });
-    const runner = new JudgeRunner(client, nullLogger(), {
+    const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT,
       queryFn: replyingQueryFn(modelJson),
       outbox,
       outboxTerminalMaxBytes: 1 << 20,
@@ -1845,7 +1848,7 @@ describe("JudgeRunner terminal journaling (PRD #1391 Run B M3b, D6)", () => {
     const outbox = await mkJournalOutbox();
     const { client } = await journalingClient(emptyTrace, /*failTerminal*/ false);
     const modelJson = JSON.stringify({ verdict: "ok", summary: "s", recommendations: [] });
-    const runner = new JudgeRunner(client, nullLogger(), {
+    const runner = new JudgeRunner(client, nullLogger(), { homeRoot: PASS_HOME_ROOT,
       queryFn: replyingQueryFn(modelJson),
       outbox,
       outboxTerminalMaxBytes: 1 << 20,

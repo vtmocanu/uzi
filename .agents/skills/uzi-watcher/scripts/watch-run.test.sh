@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Hermetic regression: watch-run.sh's attention stop. A dead run can read `running`, so a
+# Hermetic regression: watch-run.sh's attention stop and its owner-decision recovery_wait stop. A dead run can read `running`, so a
 # persistent non-ok health or a stale worker heartbeat must stop the poll with exit 4 and
 # the evidence, while a transient single poll, a healthy run, `slow`, and the existing stop
 # statuses keep their old behaviour (exit 0); coverage expiry is exit 3.
@@ -26,7 +26,8 @@ case "$*" in
   "run get "*" --field status") pollfile status; echo; echo $(( $(cat "$WORK/poll" 2>/dev/null || echo 0) + 1 )) > "$WORK/poll.next" ;;
   "run get "*" --json")
     jq -n --arg h "$(pollfile health)" --arg w "$(cat "$WORK/worker_id")" --arg since "$(cat "$WORK/since" 2>/dev/null || true)" \
-      '{status:"running",health:$h,health_reason:(if $h=="stalled" then "no progress 20m" else null end),health_since:(if $h=="ok" then null else ($since|if .=="" then null else . end) end),worker_id:(if $w=="" then null else $w end)}'
+      --arg c "$(cat "$WORK/cause" 2>/dev/null || true)" \
+      '{status:"running",recovery_wait_cause:(if $c=="" then null else $c end),health:$h,health_reason:(if $h=="stalled" then "no progress 20m" else null end),health_since:(if $h=="ok" then null else ($since|if .=="" then null else . end) end),worker_id:(if $w=="" then null else $w end)}'
     mv "$WORK/poll.next" "$WORK/poll" ;;
   "worker list --json") cat "$WORK/workers" ;;
   *) echo "unexpected uzi call: $*" >&2; exit 1 ;;
@@ -35,7 +36,7 @@ STUB
 chmod +x "$WORK/bin/uzi"
 
 # scenario NAME STATUSES HEALTHS WORKER_ID WORKERS_JSON
-reset() { rm -f "$WORK/since"; printf '%s\n' "$1" > "$WORK/status"; printf '%s\n' "$2" > "$WORK/health"; printf '%s' "$3" > "$WORK/worker_id"; printf '%s\n' "$4" > "$WORK/workers"; rm -f "$WORK/poll" "$WORK/poll.next"; echo 0 > "$WORK/poll"; }
+reset() { rm -f "$WORK/since" "$WORK/cause"; printf '%s\n' "$1" > "$WORK/status"; printf '%s\n' "$2" > "$WORK/health"; printf '%s' "$3" > "$WORK/worker_id"; printf '%s\n' "$4" > "$WORK/workers"; rm -f "$WORK/poll" "$WORK/poll.next"; echo 0 > "$WORK/poll"; }
 run() { PATH="$WORK/bin:$PATH" bash "$SCRIPT" rid completed,failed,cancelled 0 "${1:-6}" 2>/dev/null; }
 fresh=$(date -u +%Y-%m-%dT%H:%M:%S.123456Z)
 old=$(date -u -d '-1 hour' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-1H +%Y-%m-%dT%H:%M:%SZ)
@@ -133,5 +134,35 @@ reset "" ok "" '[]'
 rc=0; out=$(PATH="$WORK/bin:$PATH" WATCH_ATTENTION_POLLS=0 bash "$SCRIPT" rid "" 0 1) || rc=$?
 [ "$rc" -eq 3 ] || fail "unreadable status must expire, got $rc: $out"
 case "$out" in *"RESULT=elapsed") ;; *) fail "unknown status expiry missing: $out";; esac
+
+# 12. recovery_wait + worker_requeue_exhausted always stops (exit 0), even outside the stop set
+#     and with the attention check disabled: it never resumes without an owner decision.
+reset recovery_wait ok "" '[]'
+echo worker_requeue_exhausted > "$WORK/cause"
+rc=0; out=$(WATCH_ATTENTION_POLLS=0 run) || rc=$?
+[ "$rc" -eq 0 ] || fail "requeue exhausted: want exit 0, got $rc: $out"
+case "$out" in *"STOP=recovery_wait:worker_requeue_exhausted"*"owner decision"*) ;; *) fail "requeue-exhausted stop line missing: $out";; esac
+case "$out" in *"RESULT=stop:recovery_wait") ;; *) fail "requeue-exhausted result missing: $out";; esac
+
+# 12b. reached after running polls, with the attention check on
+reset "$(printf 'running\nrunning\nrecovery_wait')" ok "" '[]'
+echo worker_requeue_exhausted > "$WORK/cause"
+rc=0; out=$(run) || rc=$?
+[ "$rc" -eq 0 ] || fail "requeue exhausted after running: want exit 0, got $rc: $out"
+case "$out" in *"status=recovery_wait"*"STOP=recovery_wait:worker_requeue_exhausted"*) ;; *) fail "transition stop missing: $out";; esac
+
+# 12c. an explicit stop set naming recovery_wait still gets the cause-specific stop and guidance
+reset recovery_wait ok "" '[]'
+echo worker_requeue_exhausted > "$WORK/cause"
+rc=0; out=$(PATH="$WORK/bin:$PATH" bash "$SCRIPT" rid completed,failed,cancelled,recovery_wait 0 6 2>/dev/null) || rc=$?
+[ "$rc" -eq 0 ] || fail "explicit recovery_wait stop set: want exit 0, got $rc: $out"
+case "$out" in *"STOP=recovery_wait:worker_requeue_exhausted"*"owner decision"*) ;; *) fail "explicit stop set lost the cause-specific stop: $out";; esac
+
+# 13. any other recovery_wait cause keeps its existing behaviour: keep polling to ELAPSED
+reset recovery_wait ok "" '[]'
+echo provider_outage > "$WORK/cause"
+rc=0; out=$(run) || rc=$?
+[ "$rc" -eq 3 ] || fail "timed recovery_wait should expire: $rc: $out"
+case "$out" in *STOP=*) fail "timed recovery_wait stopped: $out";; esac
 
 echo "PASS: watch-run attention stop"

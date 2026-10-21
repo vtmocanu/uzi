@@ -14,6 +14,10 @@ import { fileURLToPath } from "node:url";
 // an enforced invariant, cheaply (text parse, no docker), before more variants land.
 
 const templatesDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../templates");
+const codexVersion = fs.readFileSync(new URL("../codex/codex-package.lock", import.meta.url), "utf8")
+  .match(/^CODEX_VERSION=(\d+\.\d+\.\d+)$/m)?.[1];
+assert.ok(codexVersion, "the Codex lock must declare its version");
+const codexVersionPattern = new RegExp(`codex-cli ${codexVersion.replaceAll(".", "\\.")}\\b`);
 
 type ShellQuote = "'" | '"';
 
@@ -238,12 +242,55 @@ function hasRequiredSessionGroupMembership(text: string): boolean {
   );
 }
 
+// The positional operands of a BusyBox `addgroup [-g GID] [-S] [USER] GROUP` (the Alpine templates'
+// only form), so an option before them cannot hide a forbidden membership (#1236). Options may
+// appear anywhere until `--`, which is at least as permissive as the real getopt. An option this
+// parser does not know returns undefined, which the forbidden checks treat as a match (fail closed).
+function addgroupOperands(command: readonly ShellWord[]): string[] | undefined {
+  const operands: string[] = [];
+  let optionsDone = false;
+  for (let i = 1; i < command.length; i++) {
+    const value = command[i]!.value;
+    if (optionsDone || !value.startsWith("-") || value === "-") {
+      operands.push(value);
+      continue;
+    }
+    if (value === "--") {
+      optionsDone = true;
+      continue;
+    }
+    if (value.startsWith("--")) return undefined;
+    const flags = value.slice(1);
+    for (let j = 0; j < flags.length; j++) {
+      if (flags[j] === "S") continue;
+      if (flags[j] !== "g") return undefined;
+      // -g takes the rest of this word, else the next word.
+      if (j === flags.length - 1) {
+        i++;
+        if (i >= command.length) return undefined;
+      }
+      break;
+    }
+  }
+  return operands;
+}
+
+function hasAddgroupMembership(text: string, user: string, group: string): boolean {
+  return dockerfileLogicalRuns(text).some((run) =>
+    scanShellCommands(run).commands.some((command) => {
+      if (command[0]?.value !== "addgroup") return false;
+      const operands = addgroupOperands(command);
+      return operands === undefined || (operands.length === 2 && operands[0] === user && operands[1] === group);
+    }),
+  );
+}
+
 function hasForbiddenProviderWorkerMembership(text: string): boolean {
-  return hasCommand(text, ["addgroup", "runner", "worker"]) || hasUnsupportedGroupShellSyntax(text);
+  return hasAddgroupMembership(text, "runner", "worker") || hasUnsupportedGroupShellSyntax(text);
 }
 
 function hasForbiddenCommandSessionMembership(text: string): boolean {
-  return hasCommand(text, ["addgroup", "runner-cmd", "codex-session"]) || hasUnsupportedGroupShellSyntax(text);
+  return hasAddgroupMembership(text, "runner-cmd", "codex-session") || hasUnsupportedGroupShellSyntax(text);
 }
 
 function templateDockerfiles(): { name: string; text: string }[] {
@@ -395,6 +442,18 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
         text,
         /readlink -f \/opt\/uzi-toolchain > \/etc\/uzi-toolchain-profile/,
         `${name}/Dockerfile must bake the /etc/uzi-toolchain-profile store-hash marker (M2 contract)`,
+      );
+      // Issue #3153: the layout marker the controller's runner-init checks before it creates
+      // the /data/runner/.tmp carve-out (fail-closed controller/image skew gate).
+      assert.match(
+        text,
+        /printf 'runner-shared-v1\\n' > \/etc\/uzi-runner-layout/,
+        `${name}/Dockerfile must bake /etc/uzi-runner-layout containing runner-shared-v1 (issue #3153)`,
+      );
+      assert.match(
+        text,
+        /chown root:root \/etc\/uzi-runner-layout[\s\S]*?chmod 0644 \/etc\/uzi-runner-layout/,
+        `${name}/Dockerfile must keep /etc/uzi-runner-layout root-owned 0644 (issue #3153)`,
       );
       // The INDIRECT nix GC root so the seed tar carries the profile and a runner
       // nix-collect-garbage (issue #91) can't reap it.
@@ -565,7 +624,7 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
         `${name}/Dockerfile must RUN the Codex runner-uid build guard`,
       );
       assert.match(text, /setpriv --reuid runner\b/, `${name}/Dockerfile must document the runner-uid setpriv guard`);
-      assert.match(text, /codex-cli 0\.160\.1\b/, `${name}/Dockerfile must document the exact pinned Codex version`);
+      assert.match(text, codexVersionPattern, `${name}/Dockerfile must document the exact pinned Codex version`);
       assert.match(text, /fake-GNU-ldd\b/, `${name}/Dockerfile must document the fake-GNU-ldd PATH case`);
       // ...and the SHARED guard script must carry that substance, not merely the comment: the
       // setpriv --reuid to the runner uid, the `codex --version` exec, the expected `codex-cli`
@@ -955,7 +1014,7 @@ describe("the shared root-entry drop wrapper", () => {
     // bind source staged under $TMPDIR resolves in the DinD-shared workdir.
     assert.match(
       entrypoint,
-      /if\s+\[\s+-n\s+"\$\{TMPDIR:-\}"\s+\];\s*then\s*\n\s*WORKER_TMPDIR="\$TMPDIR\/uzi-worker"\s*\n\s*RUNNER_TMPDIR="\$TMPDIR\/uzi-runner"/,
+      /if\s+\[\s+-n\s+"\$TMPDIR_NORM"\s+\];\s*then\s*\n\s*WORKER_TMPDIR="\$TMPDIR_NORM\/uzi-worker"\s*\n\s*RUNNER_TMPDIR="\$TMPDIR_NORM\/uzi-runner"/,
       "with an ambient TMPDIR both private tmpdirs must derive beneath it",
     );
     // Compose (no ambient TMPDIR): keep /tmp/uzi-worker + /tmp/uzi-runner EXACTLY as before.
@@ -966,6 +1025,16 @@ describe("the shared root-entry drop wrapper", () => {
     );
     // The derived worker tmp is still exported as TMPDIR across the drop.
     assert.match(entrypoint, /export TMPDIR="\$WORKER_TMPDIR"/, "the derived worker tmp is exported as TMPDIR across the drop");
+    // Issue #3153: under $DATA_DIR/runner (persistent) the per-uid scratch is adopt-or-refuse; the
+    // recursive wipe exists ONLY in the non-Docker else branch, never before the lane split.
+    const laneAt = entrypoint.indexOf('if [ -n "$SCRATCH_DOCKER_LANE" ]; then');
+    const wipeAt = entrypoint.indexOf('"$RM" -rf "$WORKER_TMPDIR" "$RUNNER_TMPDIR"');
+    const elseAt = entrypoint.indexOf("\nelse\n", laneAt);
+    assert.ok(laneAt > 0 && elseAt > laneAt && wipeAt > elseAt, "the per-uid scratch wipe must live only in the non-Docker branch");
+    assert.equal(entrypoint.split('"$RM" -rf').length - 1, 1, "exactly one recursive rm in the whole entrypoint");
+    assert.match(entrypoint, /refusing to start: per-uid scratch \$1 cannot be safely adopted \(\$2\); contents preserved; see ADR-3153 operator procedure/);
+    // The (a2b) legacy migration must skip the runner-init-owned carve-out.
+    assert.match(entrypoint, /\[ "\$tree" = runner \] && \[ "\$c" = "\$DATA_DIR\/runner\/\.tmp" \]; then continue; fi/);
   });
 
   it("PRD #1493 M2 change 3: sentinel-gated ownership-aware legacy /data migration, codex-session-store untouched", () => {
@@ -1328,5 +1397,41 @@ describe("worker template Dockerfile group-membership parser", () => {
   it("does not treat a fully quoted addgroup argument as executable", () => {
     const dockerfile = "RUN printf '%s' 'addgroup'\n";
     assert.equal(hasForbiddenProviderWorkerMembership(dockerfile), false);
+  });
+
+  // #1236: the forbidden checks compare addgroup's operands after its options.
+  it("detects a forbidden provider membership behind addgroup options", () => {
+    for (const dockerfile of [
+      "RUN addgroup -S runner worker\n",
+      "RUN addgroup -g 10001 runner worker\n",
+      "RUN addgroup -g10001 runner worker\n",
+      "RUN addgroup -Sg 10001 runner worker\n",
+      "RUN addgroup -- runner worker\n",
+      "RUN addgroup runner -S worker\n",
+    ]) {
+      assert.equal(hasForbiddenProviderWorkerMembership(dockerfile), true, dockerfile);
+    }
+  });
+
+  it("detects a forbidden command-runner membership behind addgroup options", () => {
+    assert.equal(hasForbiddenCommandSessionMembership("RUN addgroup -S runner-cmd codex-session\n"), true);
+  });
+
+  it("fails closed on an addgroup option the parser does not know", () => {
+    assert.equal(hasForbiddenProviderWorkerMembership("RUN addgroup --system runner worker\n"), true);
+    assert.equal(hasForbiddenProviderWorkerMembership("RUN addgroup -x runner\n"), true);
+    assert.equal(hasForbiddenProviderWorkerMembership("RUN addgroup -g\n"), true);
+  });
+
+  it("does not flag group creation or other memberships that carry options", () => {
+    for (const dockerfile of [
+      "RUN addgroup -S -g 10002 runner\n",
+      "RUN addgroup -g 10004 codex-session\n",
+      "RUN addgroup -S worker runner\n",
+      "RUN addgroup -S runner codex-session\n",
+      "RUN printf '%s\\n' 'addgroup -S runner worker'\n",
+    ]) {
+      assert.equal(hasForbiddenProviderWorkerMembership(dockerfile), false, dockerfile);
+    }
   });
 });

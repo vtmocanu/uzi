@@ -14,6 +14,7 @@ import {
   isPlanningRun,
   isRevisingRun,
   isStoppedRun,
+  isRejectedRun,
   milestoneBadge,
   milestoneBadgeText,
   mrChipState,
@@ -27,6 +28,7 @@ import {
   shouldShowHealthFlag,
 } from "./runBadge";
 import { RUN_STATUS_TONES } from "../components/ui";
+import { credentialSwitchHold } from "./credentialSwitchHold";
 import { isTerminalRun, TERMINAL_RUN_STATUSES } from "./runStatus";
 import type { LatestRun, Run, RunStatus, StopKind } from "./api";
 
@@ -37,6 +39,36 @@ it("provider hold badge uses projection hold reason without a retry promise", ()
   expect(needsHumanAttention("provider_unavailable")).toBe(true);
   expect(needsHumanAttention("provider_outage")).toBe(false);
   expect(badge.kind === "badge" && badge.title).toContain("waits for its owner");
+});
+it.each([
+  ["credential_switch_settling", "settling", "settling: token switch", /finishing its own operations for this run\. Resume may be refused until the worker finishes its own operations; then try again, or Cancel the run\./],
+  ["credential_switch_unsettled", "unsettled", "held: token switch", /could not be proven stopped/],
+] as const)("issue #3181 token-switch hold %s renders as its own owner-attention park", (hold, kind, label, title) => {
+  const r = run({ status: "paused", hold_reason: hold });
+  expect(credentialSwitchHold(r)).toBe(kind);
+  expect(effectiveRunStatus(r)).toBe(hold);
+  const badge = runBadge(r, 0);
+  expect(badge).toMatchObject({ kind: "badge", label, tone: "warning", pulse: false });
+  expect(badge.kind === "badge" && badge.title).toMatch(title);
+  expect(runStatusTone(hold, null)).toBe("warning");
+  expect(needsHumanAttention(hold)).toBe(true);
+});
+it("token-switch hold reasons overlay only a paused run", () => {
+  for (const status of ["queued", "running", "recovery_wait"] as const) {
+    const r = run({ status, hold_reason: "credential_switch_settling" });
+    expect(credentialSwitchHold(r)).toBeNull();
+    expect(effectiveRunStatus(r)).toBe(status);
+  }
+  expect(credentialSwitchHold(run({ status: "paused", hold_reason: null }))).toBeNull();
+  expect(effectiveRunStatus(run({ status: "paused", hold_reason: null }))).toBe("paused");
+});
+it("base attestation hold badge is a warning owner hold, not a generic pause (issue #3194)", () => {
+  const badge = runBadge(run({ status: "paused", hold_reason: "base_attestation_missing" }), 0);
+  expect(badge).toMatchObject({ label: "base unverified: owner hold", tone: "warning", pulse: false });
+  expect(effectiveRunStatus({ status: "paused", hold_reason: "base_attestation_missing" })).toBe("base_attestation_missing");
+  expect(effectiveRunStatus({ status: "queued", hold_reason: "base_attestation_missing" })).toBe("queued");
+  expect(runStatusTone("base_attestation_missing", null)).toBe("warning");
+  expect(needsHumanAttention("base_attestation_missing")).toBe(true);
 });
 it("provider recovery badge only names provider when cause is available", () => {
   expect(runBadge({ ...run({ status: "recovery_wait" }), recovery_wait_cause: "provider_outage" }, 0))
@@ -1355,5 +1387,24 @@ describe("runBadge — board card held on a disabled credential (PRD #1732)", ()
 it("usage-limit provider regression #2360: board projection stays neutral", () => {
   expect(runBadge(run({ status: "limit_wait" }), NOW)).toMatchObject({
     kind: "badge", title: "Paused on a usage limit. It resumes on its own when the window reopens.",
+  });
+});
+
+
+describe("base divergence rejection", () => {
+  it("requires failed status and the typed origin", () => {
+    expect(isRejectedRun("failed", "base_diverged")).toBe(true);
+    for (const status of ["running", "cancelled", "completed", "awaiting_approval"]) {
+      expect(isRejectedRun(status, "base_diverged")).toBe(false);
+    }
+    for (const origin of [null, undefined, "agent_failure", "plan_rejected"]) {
+      expect(isRejectedRun("failed", origin)).toBe(false);
+    }
+  });
+  it("uses neutral tone while ordinary failure remains danger", () => {
+    expect(runStatusTone("failed", null, "base_diverged")).toBe("neutral");
+    expect(runStatusTone("failed", null, "agent_failure")).toBe("danger");
+    expect(runBadge(run({ status: "failed", fail_origin: "base_diverged" }), 0)).toMatchObject({ label: "rejected", tone: "neutral" });
+    expect(runBadge(run({ status: "failed", fail_origin: "base_diverged", stop_kind: "plan_rejected" }), 0)).toMatchObject({ label: "stopped", tone: "neutral" });
   });
 });

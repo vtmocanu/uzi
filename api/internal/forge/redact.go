@@ -55,6 +55,10 @@ func (r redactor) errorStatus(err error, status int) error {
 	if errors.As(err, &budget) {
 		return &CIReadBudgetError{reason: budget.reason}
 	}
+	var tooLarge *ResponseTooLargeError
+	if errors.As(err, &tooLarge) {
+		return &ResponseTooLargeError{}
+	}
 	class := classifyError(err, status)
 	return &classifiedError{message: r.string(err.Error()), class: class}
 }

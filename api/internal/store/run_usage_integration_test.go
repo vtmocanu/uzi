@@ -771,8 +771,8 @@ func TestRunOutcomesRollupsLiveDB(t *testing.T) {
 	if selfA.LifetimeFailed != 2 {
 		t.Fatalf("A lifetime failed = %d, want 2 (plan_rejected split out)", selfA.LifetimeFailed)
 	}
-	// Invariant 1: finished == completed + cancelled + plan_rejected + failed.
-	if got := selfA.LifetimeCompleted + selfA.LifetimeCancelled + selfA.LifetimePlanRejected + selfA.LifetimeFailed; got != selfA.LifetimeFinished {
+	// Invariant 1: finished == completed + cancelled + plan_rejected + base_diverged + failed.
+	if got := selfA.LifetimeCompleted + selfA.LifetimeCancelled + selfA.LifetimePlanRejected + selfA.LifetimeBaseDiverged + selfA.LifetimeFailed; got != selfA.LifetimeFinished {
 		t.Fatalf("A lifetime invariant: finished %d != sum %d", selfA.LifetimeFinished, got)
 	}
 	// Windowing: the NULL-origin failure is 10 days old, so last7 sees 4 finished / 1 failed.
@@ -780,7 +780,7 @@ func TestRunOutcomesRollupsLiveDB(t *testing.T) {
 		t.Fatalf("A last7 finished/failed = %d/%d, want 4/1 (the 10-day-old NULL failure is out of window)",
 			selfA.Last7Finished, selfA.Last7Failed)
 	}
-	if got := selfA.Last7Completed + selfA.Last7Cancelled + selfA.Last7PlanRejected + selfA.Last7Failed; got != selfA.Last7Finished {
+	if got := selfA.Last7Completed + selfA.Last7Cancelled + selfA.Last7PlanRejected + selfA.Last7BaseDiverged + selfA.Last7Failed; got != selfA.Last7Finished {
 		t.Fatalf("A last7 invariant: finished %d != sum %d", selfA.Last7Finished, got)
 	}
 
@@ -864,7 +864,7 @@ func TestRunOutcomesRollupsLiveDB(t *testing.T) {
 			factory.LifetimeFinished, factory.LifetimeCompleted, factory.LifetimeCancelled, factory.LifetimePlanRejected, factory.LifetimeFailed)
 	}
 	// The factory invariant holds over the whole shared DB too.
-	if got := factory.LifetimeCompleted + factory.LifetimeCancelled + factory.LifetimePlanRejected + factory.LifetimeFailed; got != factory.LifetimeFinished {
+	if got := factory.LifetimeCompleted + factory.LifetimeCancelled + factory.LifetimePlanRejected + factory.LifetimeBaseDiverged + factory.LifetimeFailed; got != factory.LifetimeFinished {
 		t.Fatalf("factory lifetime invariant: finished %d != sum %d", factory.LifetimeFinished, got)
 	}
 

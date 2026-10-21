@@ -1,11 +1,13 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import * as ts from "typescript/unstable/ast";
 import { API } from "typescript/unstable/sync";
 import { fileURLToPath } from "node:url";
 import { CODEX_BIN } from "../src/codex/launcher.js";
 import { CODEX_PROBE_EXPECTATION } from "../src/codex/codex-runtime-probe.js";
+import { PIN_SCAN_PATTERN, scannedPinFiles } from "./codex-pins.js";
 
 const lock = readFileSync(new URL("../codex/codex-package.lock", import.meta.url), "utf8");
 function value(key: string): string {
@@ -14,6 +16,29 @@ function value(key: string): string {
   return entries[0]!.slice(key.length + 1);
 }
 const version = value("CODEX_VERSION");
+
+it("tracked live Codex runtime pins match the lock", (t) => {
+  // This checkout-only suite already reads repo-level M4 sources. Packaged worker-UID
+  // and M3 image lanes select other files; missing git/checkout is a failure, not a skip.
+  // The scan definition is shared with `task codex-pins:sync` (test/codex-pins.ts).
+  const pattern = PIN_SCAN_PATTERN;
+  const root = fileURLToPath(new URL("../../", import.meta.url));
+  const files = scannedPinFiles(root);
+  const stale: string[] = [];
+  let matches = 0;
+  for (const file of files) {
+    const lines = readFileSync(join(root, file), "utf8").split("\n");
+    for (const [index, line] of lines.entries()) {
+      for (const match of line.matchAll(new RegExp(pattern, "g"))) {
+        matches++;
+        if (match[2] !== version) stale.push(`${file}:${index + 1}: ${match[0]}`);
+      }
+    }
+  }
+  assert.ok(matches > 0, "the tracked-text scan must examine live Codex pins");
+  assert.equal(stale.length, 0, `live Codex pins must match CODEX_VERSION=${version}:\n${stale.join("\n")}`);
+  t.diagnostic(`checked ${matches} live Codex pins in ${files.length} tracked files`);
+});
 
 it("the imported production launcher targets the locked install root", () => {
   assert.equal(CODEX_BIN, `/opt/uzi-codex/${version}/bin/codex`);

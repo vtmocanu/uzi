@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/issueinput"
@@ -186,6 +187,10 @@ func completionNonClosingClaim(run store.Run) *CompletionNonClosing {
 // CLAIMING worker, not just the run, because since PRD #104 M3 the credential a
 // run spends can depend on which worker picked it up.
 func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store.Run) (*ClaimPayload, error) {
+	pending, pendingErr := CompletionPending(run)
+	if pendingErr != nil {
+		return nil, pendingErr
+	}
 	if run.Kind == runkind.CrossCheck {
 		if err := validateCrossCheckContext(run.IssueTitle, run.IssueDescription); err != nil {
 			return nil, err
@@ -193,7 +198,8 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	}
 	// Judge lane (PRD #46 Decision 1): a judge run has no repo and no forge
 	// connection, so it MUST fork before GetRunClaimContext (which INNER-JOINs
-	// repos → forge_connections and would treat a repo-less judge run as vanished)
+	// repos → forge_connections and returns no rows for a repo-less judge run, which
+	// the no-rows branch below would then fail as an owner mismatch, #1691)
 	// and before the bot-PAT open. Its claim carries only the Anthropic token.
 	// PRD #1906 M3: a profile-bound run (runs.egress_profile_id) is claimed only as an
 	// isolated research claim (isolateClaim, at the end). Refuse, before anything is opened,
@@ -239,7 +245,18 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	rc, err := s.q.GetRunClaimContext(ctx, run.ID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, errRunVanished
+			// No rows is two different things. A repo or connection delete cascades to the
+			// run, and every kind that reaches here has a repo, so a run row that still
+			// exists means the owner predicate (#1688) refused it: the run's repo belongs
+			// to another user. Failing that terminally (#1691) beats the silent drop,
+			// which left the run cycling claimed -> queued.
+			if _, gerr := s.q.GetRunByID(ctx, run.ID); gerr != nil {
+				if errors.Is(gerr, pgx.ErrNoRows) {
+					return nil, errRunVanished
+				}
+				return nil, fmt.Errorf("claim context: %w", gerr)
+			}
+			return nil, fmt.Errorf("%w: %w", errCredentialUnavailable, errRunRepoOwnerMismatch)
 		}
 		return nil, fmt.Errorf("claim context: %w", err)
 	}
@@ -698,6 +715,8 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		Branch:         textPtr(branch),
 		SessionID:      sessionID,
 		CheckpointTip:  textPtr(run.CheckpointTip),
+		// Issue #3194: read off the claimed run row, never derived from ownership or the tip.
+		CheckpointAttestedSource: textPtr(run.CheckpointAttestedSource),
 		// PRD #1247 M9 (task c): the last_seq recordRunCredential actually landed — bumped past any
 		// 'credential_switch' message it just inserted — NOT the stale run.LastSeq snapshot, so the
 		// worker never re-uses the server-inserted message's seq. Equals run.LastSeq when no switch
@@ -888,8 +907,9 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			// decisions (deferred milestone ids+titles+reasons, accepted id+text+reason). nil for a
 			// contract with neither a deferred nor an accepted set (legacy / non-interlocked /
 			// revision-1), so omitempty keeps such a claim byte-identical to today's.
-			CompletionScope: CompletionScopeClaim(run.CompletionContract),
-			NonClosing:      completionNonClosingClaim(run),
+			CompletionScope:   CompletionScopeClaim(run.CompletionContract, run.MilestonesFrozen),
+			CompletionPending: pending,
+			NonClosing:        completionNonClosingClaim(run),
 		},
 	}
 
@@ -975,6 +995,27 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		}
 	}
 
+	if run.Kind != runkind.CrossCheck {
+		if reader, ok := s.q.(interface {
+			GetSemanticPlanning(context.Context, uuid.UUID) (store.GetSemanticPlanningRow, error)
+		}); ok {
+			planning, err := reader.GetSemanticPlanning(ctx, run.ID)
+			if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+				return nil, err
+			}
+			if err == nil {
+				var enrollment apitypes.SemanticEnrollment
+				if err := strictSemanticJSON(planning.Enrollment, &enrollment); err != nil {
+					return nil, err
+				}
+				if enrollment.Profile != "semantic" || !validCoveragePolicy(enrollment.Policy) {
+					return nil, errCoverageUnavailable
+				}
+				payload.SemanticPlanning = &enrollment
+				payload.IssueDescription = run.IssueDescription
+			}
+		}
+	}
 	return payload, nil
 }
 

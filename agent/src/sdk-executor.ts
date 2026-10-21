@@ -74,6 +74,7 @@ import {
 import {
   buildCIFixPlanPrompt,
   buildImplementPrompt,
+  selectPriorOwnerHistory,
   interruptedCallsNote,
   buildLeadSystemPrompt,
   buildPlanPrompt,
@@ -105,6 +106,7 @@ import {
 import { classifyLimitEvidence, LimitReachedError } from "./limit.js";
 import { PauseNowSignal, CredentialSwitchSignal, PLAN_APPROVAL_TIMEOUT_REASON, MAX_FOLLOW_UP_BATCH_RUNES, followUpRunes, type PlanVerdict } from "./steering.js";
 import { DiskParkSignal } from "./cache-cap.js";
+import { MaintenanceBudget, RetainedSwitchSettlement } from "./maintenance-budget.js";
 import { type RunProcessOps, type RunProcessReap, type RunProcessScan, defaultRunProcessOps } from "./run-procs.js";
 export type { RunProcessOps } from "./run-procs.js";
 import { buildMemoryServer, MEMORY_SERVER_NAME } from "./memory-tools.js";
@@ -624,6 +626,7 @@ interface TurnResult {
    *  ScannedSignals.rejectedMilestones). Sent on the gate report in place of `milestones` so the
    *  server rejects it; never used as the worker's own breakdown. */
   rejectedMilestones?: Milestone[];
+  semanticSubmission?: import("./semantic-plan.js").SemanticSubmission;
   /** PRD #122 M2: the latest milestone progress the lead reported via report_progress
    *  during this turn (last-wins within the turn). The loop carries it into the NEXT
    *  iteration's `running` report. */
@@ -752,6 +755,13 @@ interface RunDrive {
   /** issue #1888: a no-skills run warns about plugin load errors once per worker attempt, not
    *  per turn (each claim or resume rebuilds the plugin and may warn again). */
   pluginWarned: boolean;
+  /** Issue #3174: the session the most recent driveTurn attempt ran (the same resolution rule as
+   *  the transient and signal-death resume), recorded on every exit including a trip, so an
+   *  in-place restart of an aborted turn can continue it. */
+  lastTurnSessionId?: string;
+  /** Issue #3174: sessions that showed model evidence, across the attempts of one logical turn.
+   *  Plan-phase turns add to it too; the implement loop replaces it before each implement turn. */
+  turnEvidencedSessions: Set<string>;
 }
 
 /**
@@ -818,6 +828,11 @@ interface DriveState {
   approvedPlan?: string;
   /** Checked canonical instructions replace the local plan carried by the planning session. */
   checkedPlan?: boolean;
+  /** Issue #3178: the plan gate approved (non-cross_check) while NO session exists to carry the
+   *  plan (post-gate `resumeId` undefined), e.g. a re-presented stored plan after the SDK
+   *  session was dropped. The first implement turn then opens a fresh session, so the approved
+   *  plan body must ride its prompt. Absent/false on every other path. */
+  gateApprovedWithoutSession?: boolean;
   approvedSelection?: AgentSelectionParse;
   preApproved?: boolean;
   /** Issue #2083: the decisions memo block was already placed in this execution's plan or
@@ -825,6 +840,9 @@ interface DriveState {
   decisionsMemoPlaced?: boolean;
   budget?: { asked: number };
 }
+
+/** issue #3181: a reap whose joins outlived the maintenance budget: nothing was proven, so it is incomplete. */
+const unconfirmedJoinReap = (): RunProcessReap => ({ killed: [], left: [], complete: false });
 
 export class SdkExecutor implements Executor {
   /** Issue #1604: see Executor.resumesAtGate — the plan gate reads a resumed claim's pending
@@ -1163,17 +1181,23 @@ export class SdkExecutor implements Executor {
    * build survives the group kill. Never throws.
    */
   async reapAttributedProcesses(): Promise<RunProcessReap> {
-    await this.closeAndSettlePlanSummary();
+    // issue #3181: inside the retained credential switch's settlement (the RetainedSwitchSettlement
+    // marker, not merely any MaintenanceBudget: cancellation and terminal maintenance install one
+    // too) the joins below are WAITS on operations this executor already runs, so they stop waiting
+    // when the budget is spent; nothing new is started and the operations keep running. Every other
+    // caller joins without bound, as before.
+    const budget = RetainedSwitchSettlement.active() ? MaintenanceBudget.current() : undefined;
+    const joined = await this.waitWithin(this.closeAndSettlePlanSummary(), budget);
     // Issue #2471: join the lane disposal killAgentTree started, so the attributed reap sees
     // the model commands already stopped (it never rejects).
-    await this.laneDisposal;
+    if (!joined || !await this.waitWithin(this.laneDisposal, budget)) return unconfirmedJoinReap();
     // The background deps install carries the run's HOME, so the HOME-attributed reap would count
     // it as a survivor and kill npm's children. Tear it down first. A switch that gives up and
     // continues in place loses it: best-effort by design (the agent installs the dependencies itself).
     const deps = this.activeDeps;
     if (deps && !this.depsJoined) {
       deps.abort.abort();
-      await deps.install;
+      if (!await this.waitWithin(deps.install, budget)) return unconfirmedJoinReap();
       this.depsJoined = true;
     }
     const r = await this.runProcesses.reap(this.homeDir, this.runWorktree, [...this.spawnedPids]).catch(
@@ -1184,10 +1208,39 @@ export class SdkExecutor implements Executor {
         run_home: this.homeDir,
         killed: r.killed,
         ...(r.left.length > 0 ? { left: r.left } : {}),
+        ...(r.left.length > 0 && r.leftReasons && Object.keys(r.leftReasons).length > 0 ? { left_reasons: r.leftReasons } : {}),
         ...(r.complete ? {} : { incomplete: true }),
       });
     }
     return r;
+  }
+
+  /**
+   * Wait for an executor-owned, already-running promise, giving up (false) once `budget` has no
+   * time left. A promise that already settled reads true even with no time left. The timer is
+   * always cleared and the awaited operation is never cancelled by the give-up.
+   */
+  private async waitWithin(pending: Promise<unknown> | undefined, budget: MaintenanceBudget | undefined): Promise<boolean> {
+    if (!pending) return true;
+    if (!budget) { await pending; return true; }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), Math.min(budget.remainingMs(), 2_147_483_647)); });
+    try { return await Promise.race([pending.then(() => true as const, () => true as const), expired]); }
+    finally { clearTimeout(timer); }
+  }
+
+  /**
+   * issue #3181: join, without bound, what this executor already runs: the guarded lane disposal
+   * killAgentTree started and the background deps install. Starts, aborts and kills nothing. Never
+   * rejects. Marks the deps joined, which re-enables the `.npm/_cacache` drop.
+   */
+  async joinOwnedOperations(): Promise<void> {
+    await this.laneDisposal?.catch(() => undefined);
+    const deps = this.activeDeps;
+    if (deps && !this.depsJoined) {
+      await deps.install.catch(() => undefined);
+      this.depsJoined = true;
+    }
   }
 
   /**
@@ -1725,6 +1778,7 @@ export class SdkExecutor implements Executor {
     const buildRunSignalServer = (codeCrossCheck?: NonNullable<Parameters<typeof buildSignalMcpServer>[0]>["codeCrossCheck"]): McpSdkServerConfigWithInstance =>
       buildSignalMcpServer({
         ownerDecisionRequested: ctx.completionInterlock === true && isIssueRun && !ctx.interactive,
+        semanticPlanning: ctx.semanticPlanning,
         prdDonePath: isIssueRun,
         // PRD #122 M1: milestones on submit_plan for issue runs only (Decision 13),
         // gated on the same isIssueRun discriminator as prd_done_path.
@@ -1912,6 +1966,7 @@ export class SdkExecutor implements Executor {
       } : {}),
       skillsSelected: runSkills.length > 0,
       pluginWarned: false,
+      turnEvidencedSessions: new Set<string>(),
     };
     observeState(state);
     const idleMs = seconds(
@@ -2361,6 +2416,7 @@ export class SdkExecutor implements Executor {
         // entries, so the server drops the candidate to NULL rather than reading "no milestones"
         // (or a narrowed list) as the completion contract.
         let gateMilestones: Milestone[] | undefined;
+        let semanticSubmission: import("./semantic-plan.js").SemanticSubmission | undefined;
         // Issue #1604 (D3): a resumed, unapproved claim with a persisted plan (resume_phase
         // "awaiting_approval", with or without its session, or "" with none) first reads the inputs
         // the owner sent before the claim was released, and acts on them BEFORE offering any plan:
@@ -2439,9 +2495,17 @@ export class SdkExecutor implements Executor {
           // path (the ci_fix and self_improve builders take none). Announced here, where the
           // prompt is actually sent, not when the runner fetched it.
           if (!isCIFix && !isSelfImprove && announceDecisionsMemo(ctx)) decisionsMemoPlaced = true;
-          const planStep = await this.runThroughSwitch(ctx, state, () =>
-            this.drivePlanningTurn(ctx, baseConfig, resumeId, planPrompt, state, idleMs, budget),
-          );
+          // Issue #3174: a give-up re-runs this closure; a plan turn that started session-less resumes
+          // the session the aborted attempt ran (the last planning round's, after a clarification).
+          let planResume = resumeId;
+          const planStep = await this.runThroughSwitch(ctx, state, async () => {
+            try {
+              return await this.drivePlanningTurn(ctx, baseConfig, planResume, planPrompt, state, idleMs, budget);
+            } catch (err) {
+              if (err instanceof CredentialSwitchSignal && planResume === undefined) planResume = state.lastTurnSessionId;
+              throw err;
+            }
+          });
           if ("released" in planStep) return { branch: ctx.branch, switchReleased: true };
           const plan = planStep.value;
           resumeId = plan.sessionId ?? resumeId;
@@ -2450,6 +2514,7 @@ export class SdkExecutor implements Executor {
           // approves the breakdown. It is REPLACED on each revision round (Decision 2).
           candidateMilestones = plan.milestones;
           gateMilestones = plan.rejectedMilestones ?? plan.milestones;
+          semanticSubmission = plan.semanticSubmission;
         }
 
         // --- Plan gate (+ revision loop, PRD #41) -----------------------------
@@ -2476,7 +2541,7 @@ export class SdkExecutor implements Executor {
         else {
           const onPlanPersisted = this.beginPlanSummary(ctx, prdInputP);
           const g0 = await this.runThroughSwitch(ctx, state, () =>
-            ctx.gatePlan!(approvedPlan, gateMilestones, onPlanPersisted),
+            ctx.gatePlan!(approvedPlan, gateMilestones, onPlanPersisted, undefined, semanticSubmission),
 
             ctx.continueExistingPlanGate, { reopenPlanSummary: true },
           );
@@ -2537,7 +2602,7 @@ export class SdkExecutor implements Executor {
               },
             });
             const gExhausted = await this.runThroughSwitch(ctx, state, () =>
-              ctx.gatePlan!(approvedPlan, gateMilestones, undefined, settles),
+              ctx.gatePlan!(approvedPlan, gateMilestones, undefined, settles, semanticSubmission),
               ctx.continueExistingPlanGate,
             );
             if ("released" in gExhausted) return { branch: ctx.branch, switchReleased: true };
@@ -2597,6 +2662,7 @@ export class SdkExecutor implements Executor {
           // Decision 2: the candidate is REPLACED across a revision round.
           candidateMilestones = turn.milestones;
           gateMilestones = turn.rejectedMilestones ?? turn.milestones;
+          semanticSubmission = turn.semanticSubmission;
           // PRD #362 M3c: a re-plan REGENERATES the plan summary (Decision 2), fired from
           // the gate's onPlanPersisted callback (after the re-report persists the NEW
           // plan_md) so its stale-write guard matches the new plan.
@@ -2607,6 +2673,7 @@ export class SdkExecutor implements Executor {
               gateMilestones,
               onPlanPersisted,
               settles,
+              semanticSubmission,
             ),
             ctx.continueExistingPlanGate, { reopenPlanSummary: true },
           );
@@ -2629,6 +2696,9 @@ export class SdkExecutor implements Executor {
           candidateMilestones = canonical.milestones;
           drive.checkedPlan = true;
         }
+        // Issue #3178: keyed on the post-gate resumeId (a revise turn may have produced a
+        // session), never ctx.sessionId. Cross-check approvals carry the canonical contract.
+        drive.gateApprovedWithoutSession = verdict.approval !== "cross_check" && resumeId === undefined;
         approvedSelection = verdict.selection;
         // PRD #122 M6: freeze the APPROVED milestone breakdown for the implement loop.
         // `candidateMilestones` is block-scoped and REPLACED across revision rounds
@@ -2838,6 +2908,8 @@ export class SdkExecutor implements Executor {
         // PRD #759 M4: a provably-reviewed cross-worker resume has no session carrying the
         // plan either, so the plan body must ride the implement prompt (FLAG C / R3).
         reviewedResume: ctx.reviewedPlanResume === true,
+        // Issue #3178: a plan approved at the gate with no session to carry it.
+        gateApprovedWithoutSession: drive.gateApprovedWithoutSession === true,
         hasSession: !!ctx.sessionId,
       })
         ? approvedPlan
@@ -2937,9 +3009,18 @@ export class SdkExecutor implements Executor {
       // Issue #2083: latched once the memo block rode an implement prompt (an ask_user turn
       // re-enters the first-turn branch, so the first-turn test alone would re-send it).
       let decisionsMemoImplementInjected = false;
+      // Issue #3149: one-shot latch for the earlier-owner-follow-up history of a reviewed-plan resume,
+      // spent when the carrying turn completes.
+      // Not `first`: the held-batch service path resets `iteration` to 0 without setting hasParked.
+      let priorOwnerHistoryPlaced = false;
       // Execution lifetime, independent of iteration resets and system/rework turns.
       // Consumed at harness dispatch after refreshCodeCrossCheckTools has settled.
       let interruptedOwnerDispatched = false;
+      // Issue #3174: in-place restart carry-over of an aborted implement turn (see prepareInPlaceRestart).
+      let replayFirstTurn = false;
+      let carriedSafetySteer: string | undefined;
+      // Owner follow-up ids already receipted (followUpIncluded) this execution: once per id.
+      const receiptedOwnerIds = new Set<number>();
       // PRD #634 M3: latched when the operator's scope ceiling truncates the run at the loop
       // top (the honor gate below). Hoisted like the other loop-latched locals so it survives
       // the `break` into the ExecutorResult assembly. Issue runs only.
@@ -3127,7 +3208,13 @@ export class SdkExecutor implements Executor {
         // iteration 1. Every iteration (including the first), and AHEAD of the owner follow-up
         // pull just below — it is rendered as worker guidance OUTSIDE the <follow_up> fence (see
         // buildImplementPrompt).
-        const safetySteer = ctx.pullSafetySteer?.();
+        // Issue #3174: a steer carried from an in-place restart yields to a newer one armed since.
+        const safetySteer = ctx.pullSafetySteer?.() ?? carriedSafetySteer;
+        carriedSafetySteer = undefined;
+        const replay = replayFirstTurn;
+        replayFirstTurn = false;
+        state.turnEvidencedSessions = new Set<string>();
+        const turnResume = resumeId;
         // Issue #1800: fill the owner slot (only when empty) and decide who owns this turn. A system
         // text owns it outright: the owner follow-up is neither pulled nor rendered then and waits
         // in its slot for the next ordinary turn.
@@ -3135,11 +3222,15 @@ export class SdkExecutor implements Executor {
         completionRework = undefined;
         if (followUp === undefined && !reworkForTurn) ownerBatch ??= fillOwnerBatch(queuedOwner, ctx);
         const ownerRides = followUp === undefined && !reworkForTurn ? ownerBatch : undefined;
-        const onFirstEvent = ownerRides
+        const ownerFirstEvent = ownerRides
           ? () => {
               if (ownerBatch !== ownerRides) return;
               ownerBatch = undefined;
-              for (const f of ownerRides) ctx.followUpIncluded?.(f.id);
+              for (const f of ownerRides) {
+                if (receiptedOwnerIds.has(f.id)) continue;
+                receiptedOwnerIds.add(f.id);
+                ctx.followUpIncluded?.(f.id);
+              }
             }
           : undefined;
         // PRD #1064 M1 (Decisions 1/2): a per-turn progress observer. It owns the diff base
@@ -3160,21 +3251,52 @@ export class SdkExecutor implements Executor {
         // Issue #2083: the memo rides the FIRST implement prompt only when this conversation has
         // not seen it: no session resumed (a resumed session already saw it in its plan prompt,
         // like embedSeededPlan's hasSession guard) and no plan/revise prompt of this execution
-        // carried it. The "injected" line is emitted only when the block is placed.
-        const firstImplementTurn = iteration === 1 && !hasParked;
-        const firstOrdinaryOwner = !interruptedOwnerDispatched && followUp === undefined && !reworkForTurn;
+        // carried it. The "injected" line is emitted only when the block is placed. Exception (issue
+        // #3174): an in-place replay of a turn no model processed re-sends it, status posted once.
+        const firstImplementTurn = (iteration === 1 && !hasParked) || replay;
+        const firstOrdinaryOwner = (!interruptedOwnerDispatched || replay) && followUp === undefined && !reworkForTurn;
         const priorDecisionsMemo =
           firstImplementTurn &&
           !ctx.sessionId &&
           !decisionsMemoPlaced &&
-          !decisionsMemoImplementInjected &&
+          (!decisionsMemoImplementInjected || replay) &&
           hasDecisionsMemo(ctx.decisionsMemo)
             ? ctx.decisionsMemo
             : undefined;
         if (priorDecisionsMemo !== undefined) {
+          if (!decisionsMemoImplementInjected) announceDecisionsMemo(ctx);
           decisionsMemoImplementInjected = true;
-          announceDecisionsMemo(ctx);
         }
+        // Issue #3149: history rides only a turn that renders it (not a system-text or rework turn),
+        // once. Ids the lead receives live this turn or on this claim are dropped by id. No inclusion
+        // receipt is ever issued for a history id.
+        let priorOwnerFollowUps: string[] | undefined;
+        let historyRides = false;
+        if (
+          !priorOwnerHistoryPlaced &&
+          ctx.reviewedPlanResume === true &&
+          !ctx.sessionId &&
+          followUp === undefined &&
+          !reworkForTurn
+        ) {
+          const liveIds = new Set((ownerRides ?? []).map((f) => f.id));
+          priorOwnerFollowUps = selectPriorOwnerHistory(
+            ctx.priorOwnerFollowUps,
+            (id) => liveIds.has(id) || (ctx.isLiveFollowUpId?.(id) ?? false),
+          );
+          historyRides = priorOwnerFollowUps !== undefined && priorOwnerFollowUps.length > 0;
+        }
+        // The history latch is spent only when the turn completes (below, with resumeId) AND the
+        // model processed it, and a success terminal with no model-processing evidence never saw it.
+        // An aborted turn's in-place restart (credential switch, pause-now, wall refusal) continues the
+        // aborted session (prepareInPlaceRestart): the latch is spent there when that session processed
+        // the history, and the history is re-sent only when it did not. Live-id sets only grow
+        // (isLiveFollowUpId), so history can first ride only turn 1, which has no session.
+        let historyProcessed = false;
+        const onFirstEvent = () => {
+          ownerFirstEvent?.();
+          historyProcessed = true;
+        };
         const turnPromise = this.driveTurnWithEmptyRecovery(
           ctx,
           implementConfig,
@@ -3194,6 +3316,8 @@ export class SdkExecutor implements Executor {
             // NOT treated as first. Non-interactive runs never park → identical to before.
             first: firstImplementTurn,
             reviewedPlanResume: ctx.reviewedPlanResume === true && !ctx.sessionId,
+            // Issue #3178: gate-approved plan on a session-less first implement turn.
+            gateApprovedWithoutSession: drive.gateApprovedWithoutSession === true,
             priorDecisionsMemo,
             // issue #222: warn the lead on the first implement turn that this resume's
             // reseed destroyed any local-only prior-attempt work, so a queued follow-up
@@ -3214,6 +3338,7 @@ export class SdkExecutor implements Executor {
             seededPlan: seededPlanBody,
             followUp,
             ownerFollowUps: ownerRides?.map((f) => f.body),
+            priorOwnerFollowUps,
             completionRework: reworkForTurn,
             ownerDecisionEligible: ctx.completionInterlock === true && isIssueRun && !ctx.interactive,
             // #157: the join above populated these, so the first implement turn can be told
@@ -3241,7 +3366,7 @@ export class SdkExecutor implements Executor {
             // Preserve legacy first-turn rendering without a snapshot; with a snapshot,
             // only the first ordinary owner receives this context, including when a
             // clarification reuses iteration 1.
-            priorWork: preApproved && (!ctx.interruptedSnapshot || firstOrdinaryOwner) ? ctx.priorWork : undefined,
+            priorWork: (preApproved || drive.gateApprovedWithoutSession === true) && (!ctx.interruptedSnapshot || firstOrdinaryOwner) ? ctx.priorWork : undefined,
             interruptedSnapshot: firstOrdinaryOwner ? ctx.interruptedSnapshot : undefined,
             // PRD #122 M6: name the frozen milestones and their live status so the lead
             // can see the boundaries and checkpoint at each one. A pre-approved resume
@@ -3267,7 +3392,7 @@ export class SdkExecutor implements Executor {
           onProgress,
           onFirstEvent,
           firstOrdinaryOwner ? (prompt) => {
-            if (interruptedOwnerDispatched) return prompt;
+            if (interruptedOwnerDispatched && !replay) return prompt;
             const note = interruptedCallsNote(ctx.getInterruptedCalls?.());
             interruptedOwnerDispatched = true;
             return note ? `${prompt}\n\n${note}` : prompt;
@@ -3321,10 +3446,29 @@ export class SdkExecutor implements Executor {
           if ("released" in step) { switchReleased = true; return { kind: "paused" }; }
           return step.value;
         };
+        // Issue #3174: set up an in-place restart (credential-switch give-up, declined pause-now,
+        // refused wall) of this aborted turn. A turn that started session-less continues the session
+        // the aborted attempt ran; first-turn content replays only when no model processed it in the
+        // continued session. A safety steer the continued session has not seen is carried forward.
+        const prepareInPlaceRestart = (): void => {
+          if (turnResume === undefined) resumeId = state.lastTurnSessionId;
+          const processed = resumeId !== undefined && state.turnEvidencedSessions.has(resumeId);
+          if (turnResume === undefined || firstImplementTurn) {
+            if (processed) {
+              if (historyRides && historyProcessed) priorOwnerHistoryPlaced = true;
+            } else {
+              if (firstImplementTurn) replayFirstTurn = true;
+              // An earlier attempt of this turn receipted and cleared the batch: it rides the replay.
+              if (ownerBatch === undefined && ownerRides !== undefined) ownerBatch = ownerRides;
+            }
+          }
+          if (!processed) carriedSafetySteer = safetySteer;
+        };
         let turn: TurnResult;
         try {
           turn = await turnPromise;
           resumeId = turn.sessionId ?? resumeId;
+          if (historyRides && historyProcessed) priorOwnerHistoryPlaced = true;
           if (turn.prdDonePath !== undefined) declaredPrdPath = turn.prdDonePath;
           // PRD #265 M1: latch the finished-milestone declaration the same way, so it
           // survives the terminating turn's `break` into the completed report.
@@ -3459,6 +3603,7 @@ export class SdkExecutor implements Executor {
               this.markSwitchSignalSpent(ctx);
               throwIfDiskStop(ctx);
               completionRework = reworkForTurn;
+              prepareInPlaceRestart();
               continue;
             }
             throw err;
@@ -3470,6 +3615,7 @@ export class SdkExecutor implements Executor {
             };
             if (await handlePauseNow(at)) break;
             completionRework = reworkForTurn;
+            prepareInPlaceRestart();
             continue;
           }
           // PRD #1226 M3 (D3): a POST-attempt WALL/IDLE trip routes to the completion hold (M4)
@@ -3513,6 +3659,7 @@ export class SdkExecutor implements Executor {
               this.clearTrip(state);
               throwIfDiskStop(ctx);
               completionRework = reworkForTurn;
+              prepareInPlaceRestart();
               continue;
             }
           }
@@ -4529,6 +4676,9 @@ export class SdkExecutor implements Executor {
     beforeDispatch?: (prompt: string) => string,
   ): Promise<TurnResult> {
     this.throwIfTerminal(ctx);
+    // Issue #3174: recorded on entry so a pre-dispatch trip, which skips the finally below, leaves
+    // this attempt's requested session rather than an earlier attempt's.
+    state.lastTurnSessionId = resumeId;
     // A trip may already be pending (e.g. a cancel that landed during the gate).
     if (state.tripReason) throw this.tripError(state);
 
@@ -4566,6 +4716,8 @@ export class SdkExecutor implements Executor {
     let sawTerminal = false;
     let terminal: HarnessTerminal | undefined;
     let processedEvents = 0;
+    // Issue #3174: hoisted so the finally can record per-session model evidence.
+    let sawModelEvidence = false;
     let result: TurnResult;
     // issue #1656: the session THIS turn actually runs, read off the turn's own events, and
     // whether an init reported a session other than the requested resume. Unlike the once-per-run
@@ -4617,6 +4769,7 @@ export class SdkExecutor implements Executor {
       }
       if (beforeDispatch) prompt = beforeDispatch(prompt);
       const request: RunTurnRequest = {
+        semanticPlanning: ctx.semanticPlanning,
         ownerDecisionRequested: ctx.completionInterlock === true && resolveRunKind(ctx.kind) === "issue" && !ctx.interactive,
         prompt,
         // The neutral fields below are carried as-is; the placeholders
@@ -4632,7 +4785,6 @@ export class SdkExecutor implements Executor {
         leadSkills: [],
       };
       const turn = this.harness.startTurn(request);
-      let sawModelEvidence = false;
       for await (const event of turn.events) {
         if (evidencesModelProcessing(event)) processedEvents++;
         if (!sawModelEvidence && evidencesModelProcessing(event)) {
@@ -4756,6 +4908,10 @@ export class SdkExecutor implements Executor {
       }
       throw err instanceof Error ? err : new Error(errMessage(err));
     } finally {
+      // Issue #3174: every exit, trips included, records the session this attempt ran.
+      const ranSession = resumableSessionId();
+      state.lastTurnSessionId = ranSession;
+      if (sawModelEvidence && ranSession !== undefined) state.turnEvidencedSessions.add(ranSession);
       if (idleTimer) clearTimeout(idleTimer);
       this.disarmWall(state);
       state.currentAbort = undefined;
@@ -5379,16 +5535,23 @@ export function resolveLeadModel(
  * silently falls back to the issue (the #209 M2 gap, FLAG C). The `!hasSession` guard is
  * UNCHANGED: a seeded/reviewed RESUME that still has a session already has the plan in it.
  * `reviewedResume` is optional (absent ⇒ false) so existing callers are byte-identical.
+ *
+ * Issue #3178 adds `gateApprovedWithoutSession`: the plan gate approved a (re-presented)
+ * plan while no session exists to carry it (the SDK session was dropped), so the fresh first
+ * implement session needs the body too. It is independent of `preApproved` (the gate ran) and
+ * keeps the `!hasSession` guard; absent ⇒ false, so the existing truth table is unchanged.
  */
 export function embedSeededPlan(args: {
   preApproved: boolean;
   seeded: boolean;
   hasSession: boolean;
   reviewedResume?: boolean;
+  gateApprovedWithoutSession?: boolean;
 }): boolean {
   return (
-    args.preApproved &&
-    (args.seeded || args.reviewedResume === true) &&
-    !args.hasSession
+    (args.preApproved &&
+      (args.seeded || args.reviewedResume === true) &&
+      !args.hasSession) ||
+    (args.gateApprovedWithoutSession === true && !args.hasSession)
   );
 }

@@ -46,6 +46,20 @@ it("LastRun reads only displayed started runs and preserves immutable fire snaps
   expect(screen.getByText("Snapshot title")).toBeTruthy();
   expect(JSON.stringify(snapshot)).toBe(saved);
 });
+// Issue #3181: a token-switch hold is an owner decision too, so the started-run line links to
+// the run's owner actions like the provider hold does; an owner pause does not (control).
+it.each([
+  ["credential_switch_settling", "Current: settling: token switch", true],
+  ["credential_switch_unsettled", "Current: held: token switch", true],
+  [null, "Current: paused", false],
+] as const)("LastRun links owner actions for hold %s", async (hold, current, linked) => {
+  vi.mocked(api.getRun).mockResolvedValueOnce({ run: { ...mockRuns[0], id: "A", status: "paused", hold_reason: hold } });
+  renderDetail(startedFire("A"));
+  await act(async () => {});
+  expect(screen.getByText(current)).toBeTruthy();
+  const link = screen.queryByRole("link", { name: "View owner actions" });
+  expect(link?.getAttribute("href") ?? null).toBe(linked ? "/runs/A" : null);
+});
 it.each([404, 403])("LastRun current read refusal %s stays unknown without retries", async (status) => {
   vi.mocked(api.getRun).mockRejectedValueOnce(new ApiError(status, "Refused"));
   renderDetail(startedFire("A"));

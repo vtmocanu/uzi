@@ -150,7 +150,7 @@ func TestMaybeFileProposalGates(t *testing.T) {
 // TestMaybeFileProposalCatalogOutputMode checks that NULL inherits each catalog
 // default while a stored mr mode still prevents issue filing.
 func TestMaybeFileProposalCatalogOutputMode(t *testing.T) {
-	for _, slug := range []string{"feature-bingo", "refactor-scout"} {
+	for _, slug := range []string{"ci-scout", "feature-bingo", "refactor-scout"} {
 		t.Run(slug, func(t *testing.T) {
 			t.Run("null inherits issues", func(t *testing.T) {
 				svc, fs, ff, run := proposalFixture(t, slug)

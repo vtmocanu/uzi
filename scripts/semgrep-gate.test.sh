@@ -1,6 +1,9 @@
 #!/bin/sh
 # Hermetic wrapper/capture/report tests; each fixture owns its Git index.
 set -eu
+# Fixture repos must not read host git config: a global core.fsmonitor=true
+# leaves a detached fsmonitor daemon per repo on macOS.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 mkdir -p .uzi/scratch

@@ -704,7 +704,9 @@ EOF
 promote_inflight() {
   local relbranch="release/$IB" tagB="v$IB" wt
   if [ "${UZI_RELEASE_OFFLINE_FIXTURE:-}" != "1" ]; then
-    python3 -I "$ROOT/scripts/release-ci-coverage.py" coverage "$INFLIGHT" --wait 0 || exit 3
+    # One hop, not two: the stable commit added below is itself a metadata hop, and the
+    # remote stable gate walks two hops from it, so it reaches only one past $INFLIGHT.
+    python3 -I "$ROOT/scripts/release-ci-coverage.py" coverage "$INFLIGHT" --hops 1 --wait 0 || exit 3
   fi
   if git rev-parse -q --verify "refs/heads/$relbranch" >/dev/null; then
     echo "release-cut: branch $relbranch already exists (aborted prior promotion?). Remove it deliberately and re-run." >&2; exit 3

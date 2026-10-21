@@ -295,3 +295,25 @@ it("native cancellation in beforePack cannot launch a producer or fallback", asy
       undefined, { defaultBranch: "開発/custom", signal: controller.signal }), /stop publication/);
   } finally { f.cleanup(); }
 });
+
+for (const pinned of [false, true]) {
+  it(`selective packing preserves zero-range transport commit (${pinned ? "pinned" : "unpinned"})`, async () => {
+    const f = fixture();
+    try {
+      f.git(["update-ref", "-d", `refs/remotes/origin/${f.branch}`]);
+      f.git(["update-ref", "refs/remotes/origin/main", f.candidate]);
+      const range = await f.cache.resolveCheckpointRange(f.bare, f.branch, { defaultBranch: "main" });
+      assert.ok(range);
+      assert.equal(range.tipSha, f.candidate);
+      assert.equal(range.excludeSha, f.candidate);
+      assert.equal(range.defaultBlobSha, f.candidate);
+      assert.deepEqual(range.packExcludeShas, [f.first]);
+      const packed = await f.cache.checkpointPack(f.bare, f.branch, undefined, pinned ? range : undefined,
+        undefined, undefined, undefined, undefined, { defaultBranch: "main" });
+      assert.ok(packed);
+      const expected = [`${f.candidate} commit`];
+      assert.deepEqual(await f.inventory(packed), expected, "zero range still transports its declared commit");
+      assert.deepEqual(await f.inventory(await packed.replay()), expected, "replay keeps the captured transport exclusions");
+    } finally { f.cleanup(); }
+  });
+}

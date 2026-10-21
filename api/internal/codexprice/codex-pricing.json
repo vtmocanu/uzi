@@ -3,7 +3,7 @@
   "input_tier_threshold_tokens": 272000,
   "models": {
     "gpt-6-astra": {
-      "verified_at": "2026-09-13",
+      "verified_at": "2026-10-21",
       "sources": [
         "https://developers.openai.com/api/docs/pricing",
         "https://developers.openai.com/api/docs/models/gpt-6-astra"
@@ -22,7 +22,7 @@
       }
     },
     "gpt-5.6-sol": {
-      "verified_at": "2026-09-13",
+      "verified_at": "2026-10-21",
       "promo_review_date": "2026-11-21",
       "sources": [
         "https://developers.openai.com/api/docs/pricing",

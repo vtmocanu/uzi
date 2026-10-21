@@ -6077,6 +6077,21 @@ describe("CompletionStatePanel — honest completion-interlock detail (PRD #1226
     expect(container.textContent).toBe("");
   });
 
+  // Issue #3181: a token-switch hold has its own panel; it is not a completion hold, so this
+  // panel stays empty for it. The control shows an unknown hold_reason does render here.
+  it.each([
+    ["credential_switch_settling", false],
+    ["credential_switch_unsettled", false],
+    ["some_future_hold", true],
+  ] as const)("hold_reason %s on a paused run with no completion phase renders: %s", (hold, renders) => {
+    const { container } = render(
+      <CompletionStatePanel
+        run={run({ status: "paused", completion_phase: "", hold_reason: hold, completion_unmet: [], completion_attempts: 0 })}
+      />,
+    );
+    expect(container.textContent !== "").toBe(renders);
+  });
+
   it("renders NOTHING for a run that carries none of the completion fields (rollout skew / non-interlocked)", () => {
     // The default run() builder sets no completion fields — a non-interlocked run (or an
     // old api pod omitting them) must look exactly as today.
@@ -7421,5 +7436,25 @@ describe("RunView side-only usage panel", () => {
     expect(rows[0]?.[5]).toBe("n/a");
     expect(rows[1]?.[5]).toBe("n/a");
     expect(rows.flat().join(" ")).not.toMatch(/\$0/);
+  });
+});
+
+describe("RunView rejection presentation", () => {
+  it.each([
+    ["base_diverged", null, "rejected", "neutral"],
+    ["base_diverged", "plan_rejected", "stopped", "neutral"],
+    ["agent_failure", null, "failed", "danger"],
+  ] as const)("renders %s / %s hero and reason", async (fail_origin, stop_kind, label, tone) => {
+    mockUseRunStream.mockReturnValue({
+      run: run({ status: "failed", fail_origin, stop_kind, landing_state: "needs_landing", failure_reason: "terminal reason" }),
+      messages: [], connected: true, error: "", submit: vi.fn(), refreshRun: vi.fn(), inputs: [], canSteer: false,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    render(<MemoryRouter initialEntries={["/runs/r1"]}><RunView /></MemoryRouter>);
+    const hero = await screen.findByText(`Run ${label}`);
+    expect(hero.classList.contains(tone === "neutral" ? "text-fg" : "text-danger")).toBe(true);
+    expect(screen.getByText("terminal reason").classList.contains(tone === "neutral" ? "text-muted" : "text-danger/80")).toBe(true);
+    const pill = screen.getByText(label === "failed" ? "needs landing" : label);
+    expect(pill.classList.contains(tone === "neutral" ? "text-neutral-fg" : "text-danger")).toBe(true);
   });
 });

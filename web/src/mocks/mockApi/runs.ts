@@ -17,6 +17,7 @@ import {
 import { changedMilestones } from "../../lib/milestoneReset";
 import { ApiError } from "../../lib/apiError";
 import { isCredentialSwitchRefusedLane } from "../../lib/credentialOverride";
+import { credentialSwitchHold } from "../../lib/credentialSwitchHold";
 import { isTerminalRun } from "../../lib/runStatus";
 import {
   LIVE_RUN_ID,
@@ -143,6 +144,10 @@ function custodyResponse(): RecoveryCustodyHolds {
 // (setRunCredential below) is recorded here so the live mutation wins over the seed —
 // which is what lets the "lingering-stamp" case prove no stale switch shows after apply.
 const credentialSwitched = new Set<string>();
+
+// Issue #3181: the server's ErrRunHoldSettling text, verbatim (api/internal/workersvc/credential_switch.go).
+const CREDENTIAL_SWITCH_SETTLING_REFUSAL =
+  "the worker is still finishing its own operations for this run; try Resume again shortly, or Cancel the run";
 
 // One applied epoch, so the history list renders with a token label + reason + time.
 const appliedEpochs = (): CredentialEpoch[] => [
@@ -549,18 +554,18 @@ export const runsApi = {
       last_7_days: { input_tokens: 280_000, cache_read_tokens: 2_800_000, cache_creation_tokens: 40_000, output_tokens: 120_000, cost_usd: 5.16, cost_status: "" as const },
       run_count: 23,
       // PRD #1293 failed-run outcomes. Internally consistent: finished === completed +
-      // cancelled + plan_rejected + failed, and sum(fail_origins) === failed. finished is a
+      // cancelled + plan_rejected + base_diverged + failed, and sum(fail_origins) === failed. finished is a
       // different population from run_count (D2) — infra failures spend no tokens, so it sits
       // a little above the 23 usage-bearing runs. Mirrors the u-vlad row below ("you").
       // needs_landing (issue #1418) is the sub-cut of failed whose committed work is
       // human-landable (here the workflow-scope + push-secret failures); needs_landing <= failed.
       outcomes: {
         lifetime: {
-          finished: 30, completed: 22, cancelled: 2, plan_rejected: 1, failed: 5, needs_landing: 2,
+          finished: 30, completed: 22, cancelled: 2, plan_rejected: 1, base_diverged: 0, failed: 5, needs_landing: 2,
           ...demoLinkedFailure, fail_origins: { agent_failure: 1, run_timeout: 1, workflow_scope_missing: 1, push_secret_blocked: 1, unknown: 1 },
         },
         last_7_days: {
-          finished: 8, completed: 6, cancelled: 1, plan_rejected: 0, failed: 1, needs_landing: 0,
+          finished: 8, completed: 6, cancelled: 1, plan_rejected: 0, base_diverged: 0, failed: 1, needs_landing: 0,
           last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null, fail_origins: { agent_failure: 1 },
         },
       },
@@ -582,11 +587,11 @@ export const runsApi = {
         // fail_origins likewise sum the per-user maps. last_7_days is a smaller window.
         outcomes: {
           lifetime: {
-            finished: 97, completed: 78, cancelled: 5, plan_rejected: 2, failed: 12, needs_landing: 3,
+            finished: 97, completed: 78, cancelled: 5, plan_rejected: 2, base_diverged: 0, failed: 12, needs_landing: 3,
             ...demoLinkedFailure, completed_since_last_failure: 31, last_failed_user_id: "u-vlad", fail_origins: { agent_failure: 4, run_timeout: 2, worker_lost: 1, finalize_base_align_conflict: 1, workflow_scope_missing: 1, push_secret_blocked: 1, unknown: 2 },
           },
           last_7_days: {
-            finished: 25, completed: 20, cancelled: 1, plan_rejected: 1, failed: 3, needs_landing: 0,
+            finished: 25, completed: 20, cancelled: 1, plan_rejected: 1, base_diverged: 0, failed: 3, needs_landing: 0,
             last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null, fail_origins: { agent_failure: 2, run_timeout: 1 },
           },
         },
@@ -598,36 +603,36 @@ export const runsApi = {
       },
       users: [
         {
-          user_id: "u-maria", email: "maria@example.com", usage: { input_tokens: 2_490_000, cache_read_tokens: 20_700_000, cache_creation_tokens: 400_000, output_tokens: 1_020_000, cost_usd: 37.83, cost_status: "metered" as const }, run_count: 31, outcomes: { finished: 38, completed: 30, cancelled: 2, plan_rejected: 1, failed: 5, needs_landing: 1, ...demoFailureRecency(24, "agent_failure", 8), fail_origins: { agent_failure: 2, run_timeout: 1, finalize_base_align_conflict: 1, unknown: 1 } }, subscription_run_count: 12, unreported_run_count: 0,
+          user_id: "u-maria", email: "maria@example.com", usage: { input_tokens: 2_490_000, cache_read_tokens: 20_700_000, cache_creation_tokens: 400_000, output_tokens: 1_020_000, cost_usd: 37.83, cost_status: "metered" as const }, run_count: 31, outcomes: { finished: 38, completed: 30, cancelled: 2, plan_rejected: 1, base_diverged: 0, failed: 5, needs_landing: 1, ...demoFailureRecency(24, "agent_failure", 8), fail_origins: { agent_failure: 2, run_timeout: 1, finalize_base_align_conflict: 1, unknown: 1 } }, subscription_run_count: 12, unreported_run_count: 0,
           last_7_days: { input_tokens: 300000, cache_read_tokens: 3000000, cache_creation_tokens: 40000, output_tokens: 140000, cost_usd: 5.15, cost_status: "" as const },
           last7_run_count: 7,
           last7_subscription_run_count: 3,
           last7_unreported_run_count: 0,
-          last7_outcomes: { finished: 9, completed: 7, cancelled: 0, plan_rejected: 1, failed: 1, needs_landing: 0, fail_origins: {"agent_failure": 1}, last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null },
+          last7_outcomes: { finished: 9, completed: 7, cancelled: 0, plan_rejected: 1, base_diverged: 0, failed: 1, needs_landing: 0, fail_origins: {"agent_failure": 1}, last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null },
         },
         {
-          user_id: "u-vlad", email: "vlad@example.com", usage: { input_tokens: 1_610_000, cache_read_tokens: 16_100_000, cache_creation_tokens: 240_000, output_tokens: 710_000, cost_usd: 27.01, cost_status: "metered" as const }, run_count: 23, outcomes: { finished: 30, completed: 22, cancelled: 2, plan_rejected: 1, failed: 5, needs_landing: 2, ...demoLinkedFailure, fail_origins: { agent_failure: 1, run_timeout: 1, workflow_scope_missing: 1, push_secret_blocked: 1, unknown: 1 } }, subscription_run_count: 8, unreported_run_count: 1,
+          user_id: "u-vlad", email: "vlad@example.com", usage: { input_tokens: 1_610_000, cache_read_tokens: 16_100_000, cache_creation_tokens: 240_000, output_tokens: 710_000, cost_usd: 27.01, cost_status: "metered" as const }, run_count: 23, outcomes: { finished: 30, completed: 22, cancelled: 2, plan_rejected: 1, base_diverged: 0, failed: 5, needs_landing: 2, ...demoLinkedFailure, fail_origins: { agent_failure: 1, run_timeout: 1, workflow_scope_missing: 1, push_secret_blocked: 1, unknown: 1 } }, subscription_run_count: 8, unreported_run_count: 1,
           last_7_days: { input_tokens: 280000, cache_read_tokens: 2800000, cache_creation_tokens: 40000, output_tokens: 120000, cost_usd: 5.16, cost_status: "" as const },
           last7_run_count: 6,
           last7_subscription_run_count: 2,
           last7_unreported_run_count: 1,
-          last7_outcomes: { finished: 8, completed: 6, cancelled: 1, plan_rejected: 0, failed: 1, needs_landing: 0, fail_origins: {"agent_failure": 1}, last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null },
+          last7_outcomes: { finished: 8, completed: 6, cancelled: 1, plan_rejected: 0, base_diverged: 0, failed: 1, needs_landing: 0, fail_origins: {"agent_failure": 1}, last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null },
         },
         {
-          user_id: "u-andrei", email: "andrei@example.com", usage: { input_tokens: 1_010_000, cache_read_tokens: 13_600_000, cache_creation_tokens: 210_000, output_tokens: 550_000, cost_usd: 19.71, cost_status: "metered" as const }, run_count: 19, outcomes: { finished: 21, completed: 18, cancelled: 1, plan_rejected: 0, failed: 2, needs_landing: 0, ...demoFailureRecency(72, "worker_lost", 3), fail_origins: { agent_failure: 1, worker_lost: 1 } }, subscription_run_count: 0, unreported_run_count: 0,
+          user_id: "u-andrei", email: "andrei@example.com", usage: { input_tokens: 1_010_000, cache_read_tokens: 13_600_000, cache_creation_tokens: 210_000, output_tokens: 550_000, cost_usd: 19.71, cost_status: "metered" as const }, run_count: 19, outcomes: { finished: 21, completed: 18, cancelled: 1, plan_rejected: 0, base_diverged: 0, failed: 2, needs_landing: 0, ...demoFailureRecency(72, "worker_lost", 3), fail_origins: { agent_failure: 1, worker_lost: 1 } }, subscription_run_count: 0, unreported_run_count: 0,
           last_7_days: { input_tokens: 260000, cache_read_tokens: 2800000, cache_creation_tokens: 30000, output_tokens: 120000, cost_usd: 4.7, cost_status: "" as const },
           last7_run_count: 6,
           last7_subscription_run_count: 0,
           last7_unreported_run_count: 0,
-          last7_outcomes: { finished: 7, completed: 6, cancelled: 0, plan_rejected: 0, failed: 1, needs_landing: 0, fail_origins: {"run_timeout": 1}, last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null },
+          last7_outcomes: { finished: 7, completed: 6, cancelled: 0, plan_rejected: 0, base_diverged: 0, failed: 1, needs_landing: 0, fail_origins: {"run_timeout": 1}, last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null },
         },
         {
-          user_id: "u-dana", email: "dana@example.com", usage: { input_tokens: 290_000, cache_read_tokens: 3_500_000, cache_creation_tokens: 50_000, output_tokens: 120_000, cost_usd: 4.21, cost_status: "metered" as const }, run_count: 6, outcomes: { finished: 8, completed: 8, cancelled: 0, plan_rejected: 0, failed: 0, needs_landing: 0, last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null, fail_origins: {} }, subscription_run_count: 0, unreported_run_count: 0,
+          user_id: "u-dana", email: "dana@example.com", usage: { input_tokens: 290_000, cache_read_tokens: 3_500_000, cache_creation_tokens: 50_000, output_tokens: 120_000, cost_usd: 4.21, cost_status: "metered" as const }, run_count: 6, outcomes: { finished: 8, completed: 8, cancelled: 0, plan_rejected: 0, base_diverged: 0, failed: 0, needs_landing: 0, last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null, fail_origins: {} }, subscription_run_count: 0, unreported_run_count: 0,
           last_7_days: { input_tokens: 60000, cache_read_tokens: 500000, cache_creation_tokens: 10000, output_tokens: 30000, cost_usd: 0.5, cost_status: "" as const },
           last7_run_count: 1,
           last7_subscription_run_count: 0,
           last7_unreported_run_count: 0,
-          last7_outcomes: { finished: 1, completed: 1, cancelled: 0, plan_rejected: 0, failed: 0, needs_landing: 0, fail_origins: {}, last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null },
+          last7_outcomes: { finished: 1, completed: 1, cancelled: 0, plan_rejected: 0, base_diverged: 0, failed: 0, needs_landing: 0, fail_origins: {}, last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null },
         },
       ],
       earliest_run: "2026-05-12T09:00:00Z",
@@ -726,11 +731,17 @@ export const runsApi = {
     // masking a stray call with a false success.
     if (run.harness === "codex")
       throw new ApiError(422, "credential override unsupported on codex harness");
+    // Issue #3181: the server refuses a switch while a settling hold's worker is live and
+    // finishing (the case this mock models; the server also lifts that fence when the worker
+    // is lost); an unsettled hold takes the override and requeues.
+    const switchHold = credentialSwitchHold(run);
+    if (switchHold === "settling") throw new ApiError(409, CREDENTIAL_SWITCH_SETTLING_REFUSAL);
     credentialSwitched.add(id);
     patchRun(id, {
       credential_override: overrideToRead(body),
       credential_switch: null,
       updated_at: new Date().toISOString(),
+      ...(switchHold === "unsettled" ? { status: "queued" as const, hold_reason: null, status_since: new Date().toISOString() } : {}),
     });
     const updated = { ...getRun(id)! };
     const pooledEligible = mockSecrets.some((s) => s.kind === "anthropic_token" && s.auto_eligible);
@@ -944,9 +955,13 @@ export const runsApi = {
     const memoryHeld = run.status === "recovery_wait" && run.recovery_wait_cause === "worker_memory_pressure";
     if (run.status !== "paused" && run.status !== "pool_wait" && !memoryHeld)
       throw new ApiError(409, `run is ${run.status}`);
+    // Issue #3181: mirrors the server's ErrRunHoldSettling refusal; an unsettled hold resumes.
+    const switchHold = credentialSwitchHold(run);
+    if (switchHold === "settling") throw new ApiError(409, CREDENTIAL_SWITCH_SETTLING_REFUSAL);
     patchRun(id, { status: "queued", updated_at: new Date().toISOString(),
       // The held-only projection disappears on Resume; the API owns the fresh episode.
       ...(memoryHeld ? { memory_hold: undefined, recovery_wait_cause: null, recovery_retry_not_before: null } : {}),
+      ...(switchHold === "unsettled" ? { hold_reason: null, status_since: new Date().toISOString() } : {}),
       ...(run.hold_reason === "provider_unavailable" ? {
         provider_park_count: 0, provider_park_streak_started_at: null, can_stop_at_provider_hold: false,
       } : {}),

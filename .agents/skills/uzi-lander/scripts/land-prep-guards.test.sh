@@ -12,6 +12,9 @@
 #   7. an active ci_fix on this repo/branch stops before worktree creation or push (exit 4);
 #      terminal runs and active runs on another branch or repo do not block.
 set -eu
+# Fixture repos must not read host git config: a global core.fsmonitor=true
+# leaves a detached fsmonitor daemon per repo on macOS.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 export NET_RETRY_BASE_SLEEP=0
 
 HERE="$(cd "$(dirname "$0")" && pwd)"

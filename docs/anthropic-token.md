@@ -321,6 +321,25 @@ regardless of the worker.
   confirm). Switching to a token that looks tight can warn instead of refuse
   — see [Claude rate limits](rate-limits.md).
 
+  A run that still carries [retained recovery work](run-recovery.md) takes a
+  stricter route. Before it reports the switch, the worker first proves the
+  run's own processes stopped, within a bounded allowance. If that is
+  proven, the switch releases as above. If it is not, the run is **held for
+  you** instead (`paused`, `credential_switch_settling` then
+  `credential_switch_unsettled`) and nothing is released until you choose
+  Resume or Cancel; see [Credential-switch holds](run-recovery.md#credential-switch-holds).
+  Three cases still stop the flight without
+  reporting a terminal state and the run stays non-terminal: an API without
+  the `credential_switch_hold` protocol feature (mixed-version rollout), a
+  hold report the API refuses or that stays unconfirmed after one retry and
+  an ownership read, and a retained flight whose ownership read shows the run
+  at an `awaiting_*` gate. An unconfirmed report may already have applied; the
+  worker still acknowledges it after its own operations join, as described in
+  [Credential-switch holds](run-recovery.md#credential-switch-holds).
+  In each case, the next claim's predecessor proof still
+  fails closed. In a narrow race a refused `set-token` can still save the
+  token you chose.
+
 ### Which choice wins
 
 Only one thing ever outranks a per-run choice: the [run judge](./judge.md)

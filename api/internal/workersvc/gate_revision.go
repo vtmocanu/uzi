@@ -94,15 +94,16 @@ type GatePresentedRequirements struct {
 // plan_changed_files is deliberately absent: it is advisory evidence recomputed every round,
 // not part of presentation identity (PRD #1795 A1).
 type gatePresentedPayload struct {
-	ReviseCount            *int32                          `json:"revise_count,omitempty"`
-	CheckpointWitness      *apitypes.GateCheckpointWitness `json:"checkpoint_witness,omitempty"`
-	WitnessWorkerID        *uuid.UUID                      `json:"witness_worker_id,omitempty"`
-	WitnessClaimGeneration *int64                          `json:"witness_claim_generation,omitempty"`
-	PlanMd                 *string                         `json:"plan_md"`
-	Milestones             json.RawMessage                 `json:"milestones"`
-	RequiredCapabilities   []string                        `json:"required_capabilities"`
-	RequiredTools          []string                        `json:"required_tools"`
-	SizeClass              *string                         `json:"size_class"`
+	Semantic               *apitypes.SemanticGatePresentation `json:"semantic,omitempty"`
+	ReviseCount            *int32                             `json:"revise_count,omitempty"`
+	CheckpointWitness      *apitypes.GateCheckpointWitness    `json:"checkpoint_witness,omitempty"`
+	WitnessWorkerID        *uuid.UUID                         `json:"witness_worker_id,omitempty"`
+	WitnessClaimGeneration *int64                             `json:"witness_claim_generation,omitempty"`
+	PlanMd                 *string                            `json:"plan_md"`
+	Milestones             json.RawMessage                    `json:"milestones"`
+	RequiredCapabilities   []string                           `json:"required_capabilities"`
+	RequiredTools          []string                           `json:"required_tools"`
+	SizeClass              *string                            `json:"size_class"`
 }
 
 // canonicalJSON returns the payload's canonical encoding: fixed key order, the two requirement
@@ -111,16 +112,18 @@ type gatePresentedPayload struct {
 // a stored snapshot, so a digest is only ever computed over this form, never over stored bytes.
 func (p gatePresentedPayload) canonicalJSON() ([]byte, error) {
 	out := struct {
-		ReviseCount            *int32                          `json:"revise_count,omitempty"`
-		CheckpointWitness      *apitypes.GateCheckpointWitness `json:"checkpoint_witness,omitempty"`
-		WitnessWorkerID        *uuid.UUID                      `json:"witness_worker_id,omitempty"`
-		WitnessClaimGeneration *int64                          `json:"witness_claim_generation,omitempty"`
-		PlanMd                 *string                         `json:"plan_md"`
-		Milestones             json.RawMessage                 `json:"milestones"`
-		RequiredCapabilities   []string                        `json:"required_capabilities"`
-		RequiredTools          []string                        `json:"required_tools"`
-		SizeClass              *string                         `json:"size_class"`
+		Semantic               *apitypes.SemanticGatePresentation `json:"semantic,omitempty"`
+		ReviseCount            *int32                             `json:"revise_count,omitempty"`
+		CheckpointWitness      *apitypes.GateCheckpointWitness    `json:"checkpoint_witness,omitempty"`
+		WitnessWorkerID        *uuid.UUID                         `json:"witness_worker_id,omitempty"`
+		WitnessClaimGeneration *int64                             `json:"witness_claim_generation,omitempty"`
+		PlanMd                 *string                            `json:"plan_md"`
+		Milestones             json.RawMessage                    `json:"milestones"`
+		RequiredCapabilities   []string                           `json:"required_capabilities"`
+		RequiredTools          []string                           `json:"required_tools"`
+		SizeClass              *string                            `json:"size_class"`
 	}{
+		Semantic:               p.Semantic,
 		ReviseCount:            p.ReviseCount,
 		CheckpointWitness:      p.CheckpointWitness,
 		WitnessWorkerID:        p.WitnessWorkerID,
@@ -226,6 +229,7 @@ func nonEmptyPtr(v string) *string {
 // already in the form SetRunAwaitingApproval writes (NUL-stripped plan_md, the resolved
 // milestone candidate, the vocabulary-filtered requirement set).
 type gateReportFields struct {
+	semantic               *apitypes.SemanticGatePresentation
 	reviseCount            *int32
 	checkpointWitness      *apitypes.GateCheckpointWitness
 	witnessWorkerID        *uuid.UUID
@@ -251,6 +255,7 @@ type gateReportFields struct {
 //   - required_tools / size_class are absent-safe replacements: reported when present.
 func effectiveGatePayload(base gatePresentedPayload, f gateReportFields) gatePresentedPayload {
 	out := gatePresentedPayload{
+		Semantic:               f.semantic,
 		ReviseCount:            f.reviseCount,
 		CheckpointWitness:      f.checkpointWitness,
 		WitnessWorkerID:        f.witnessWorkerID,
@@ -339,6 +344,11 @@ func classifyGateReport(ctx context.Context, q Store, locked store.Run, req Stat
 	base := rowPayload
 	if hasSnapshot {
 		base = snapshot
+	}
+	if f.semantic != nil {
+		if err := validateSemanticGateFields(effectiveGatePayload(base, f), f.semantic); err != nil {
+			return gateDecision{}, err
+		}
 	}
 	// sameAsPresented compares the report's effective payload against the stored digest (or,
 	// with no stored digest, against the base computed the same way).

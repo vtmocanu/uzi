@@ -207,10 +207,15 @@ def hotfix_exception(sha, tag):
     return f'UNVERIFIED hotfix: no CI evidence; same as pre-gate behaviour; tag {tag}, SHA {sha}, base {previous} ({base})'
 
 
-def metadata_chain(sha):
-    """At most two single-parent, strictly metadata edges, never an arbitrary walk."""
+def metadata_chain(sha, hops=2):
+    """At most `hops` (two by default) single-parent, strictly metadata edges, never an
+    arbitrary walk. The cutter's promote check passes 1: the stable commit it is about to
+    add on top of the candidate is itself one metadata hop, so the remote stable gate
+    reaches only one hop past the candidate."""
+    if hops not in (1, 2):
+        raise Refusal('hops must be 1 or 2')
     chain = [sha]
-    for _ in range(2):
+    for _ in range(hops):
         parents = git('rev-list', '--parents', '-n', '1', chain[-1]).split()
         if len(parents) != 2 or not metadata(parents[1], chain[-1]):
             break
@@ -282,9 +287,13 @@ def main():
     parser.add_argument('--tag', help='actual annotated release tag; enables the explicit hotfix exception')
     parser.add_argument('--wait', type=float, default=2700)
     parser.add_argument('--interval', type=float, default=15)
+    parser.add_argument('--hops', type=int, default=2,
+                        help='coverage: metadata hops walked from the commit (1 or 2)')
     args = parser.parse_args()
     if args.wait < 0 or args.interval <= 0:
         raise Refusal('invalid poll bounds')
+    if args.hops not in (1, 2):
+        raise Refusal('hops must be 1 or 2')
     sha = git('rev-parse', '--verify', f'{args.ref}^{{commit}}').strip()
     if args.mode == 'metadata':
         if not args.other:
@@ -306,7 +315,7 @@ def main():
             raise Refusal('smoke needs a valid release tag')
         smoke(api, sha, args.other, args.wait, args.interval)
     else:
-        chain = metadata_chain(sha) if args.mode == 'coverage' else [sha]
+        chain = metadata_chain(sha, args.hops) if args.mode == 'coverage' else [sha]
         unverified = coverage(api, sha, None, False, args.wait, args.interval, args.tag if args.mode == 'coverage' else None, chain=chain)
         if args.mode == 'coverage' and os.environ.get('GITHUB_OUTPUT'):
             with open(os.environ['GITHUB_OUTPUT'], 'a') as output:

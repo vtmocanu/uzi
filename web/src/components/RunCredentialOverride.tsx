@@ -16,6 +16,7 @@ import {
   isCredentialSwitchRefusedLane,
   setTokenBody,
 } from "../lib/credentialOverride";
+import { credentialSwitchHold } from "../lib/credentialSwitchHold";
 import { isTerminalRun } from "../lib/runStatus";
 import { sanitizeLabel } from "../lib/sanitizeLabel";
 import { useSeededCredential } from "../lib/useSeededCredential";
@@ -176,12 +177,22 @@ export function SwitchTokenAction({
     return <span className="text-xs text-muted">Only the run&rsquo;s owner can switch its token.</span>;
   }
 
+  // Issue #3181: on a settling hold the server is the authority. It refuses another switch
+  // (409) while the worker is live and finishing its own operations for the run, and lifts
+  // that fence when the worker is lost, goes stale or re-registers, with hold_reason
+  // unchanged. Nothing here can tell the two apart, so the switch stays offered with a note,
+  // and a refusal shows as the inline alert below with the server's text.
+  const switchHold = credentialSwitchHold(run);
+
   // A held or running run has a live claim, so switching interrupts it (losing at most
   // the in-flight step); a queued run has no claim yet, so the choice just applies to
   // its first claim.
   // A run held on credential_disabled (PRD #1732) holds no claim either: its claim was
   // never delivered, so switching interrupts nothing.
-  const willInterrupt = run.status !== "queued" && run.hold_reason !== "credential_disabled";
+  // A token-switch hold (issue #3181) continues no model execution, but its processes may still
+  // be alive. A permitted switch requeues it on the chosen token; the next claim must re-prove
+  // quiescence before continuing.
+  const willInterrupt = run.status !== "queued" && run.hold_reason !== "credential_disabled" && switchHold === null;
   // A pinned choice with no resolved id cannot be sent (the server 400s it), so block
   // the confirm until the user picks a real token. A pin to a DISABLED token is refused
   // server-side (PRD #1732 D5), so it blocks too.
@@ -226,6 +237,14 @@ export function SwitchTokenAction({
             tokens={pickerTokens}
             disabled={busy}
           />
+          {switchHold === "unsettled" && (
+            <p className="text-[11px] text-muted">Switching resumes this held run on the chosen token.</p>
+          )}
+          {switchHold === "settling" && (
+            <p className="text-[11px] text-muted">
+              Switching may be refused until the worker finishes its own operations; then try again, or cancel the run.
+            </p>
+          )}
           {willInterrupt && (
             <p className="text-[11px] text-warn">
               Switching now interrupts the run — it loses at most the in-flight step, then continues on the new token.

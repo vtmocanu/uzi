@@ -207,7 +207,11 @@ A few worth knowing:
   in both windows, showing minutes, hours or days since the last failed run.
   A scope with lifetime finished runs but no failures shows `no failures`;
   one with no lifetime finished runs shows `-`. These are the same definitions
-  as Overview: chat, judge, and rejected plans do not count as failures.
+  as Overview: chat, judge, rejected plans and `base_diverged` required-base
+  rejections do not count as failures. Required-base rejections remain in the
+  finished-run denominator and have a separate numeric `base_diverged` count
+  in usage JSON. See [usage accounting](./run-cost.md#rejected-runs-and-failure-accounting)
+  for the partition identity and the web bar's combined **rejected** segment.
 
 - **`--harness` picks the run's execution engine; omit it to let the server
   resolve one.** `run create --harness claude|codex` and `schedule create
@@ -2023,6 +2027,7 @@ W            open the run's worker (run detail; lowercase w still reworks)
 /            filter the board or workers list
 a            toggle shared own/factory scope (board or workers; admin token required)
 h            hide finished runs — completed/failed/cancelled, keeps active + needs-you (board only; no-op on the admin board)
+p            order ON THE FLOOR highest progress first; press again for the default order (board)
 r            refresh
 v            open/close the review overlay (detail)
 f            start a follow-up (detail, owner only)
@@ -2565,6 +2570,13 @@ never put in the table; read `residue_quarantined_at` and
 `residue_quarantine_cause` in `uzi admin workers --json`, or the worker view in
 `uzi tui`.
 
+A worker that lost memory authority shows `(memory authority lost)` after its
+status in the same two lists: the api withholds guard-bound runs from it until
+its container restarts, see
+[Lost memory authority](worker-setup.md#lost-memory-authority). Read
+`memory_authority_lost_at` in `uzi admin workers --json`, or the worker view in
+`uzi tui`.
+
 `uzi run get` gains four rows, each emitted only when the server has
 something to say:
 
@@ -2691,6 +2703,13 @@ presented at the gate, `0` for a run that has never gated under this
 feature). See [Run activity pane](./run-activity.md#plan-approval-gate) and
 `--expected-gate-revision` above.
 
+A run's current claim generation is readable the same way:
+`uzi run get <id> --field claim_generation` (an integer, `0` before the first
+claim, or an empty line when the API predates the field). It is how
+a checker's activity summary is bound to the current attempt; see
+[Checker activity](#checker-activity). The CLI treats an absent field as
+unknown, never as generation 0.
+
 ### Plan cross-check settings
 
 ```sh
@@ -2788,6 +2807,51 @@ structured `code_cross_check_summary`.
 stored `code_cross_check_guidance` and `cross_check_repo_instructions_enabled`.
 The CLI never writes either; use the **Code cross-check** panel on the Repos
 page.
+
+### Checker activity
+
+A Plan or Code checker run records the paths it read and searched (see
+[Checker activity](./cross-check.md#checker-activity)). The checker is a child
+run of kind `cross_check`; its id is in the `PLAN_CHECK_CHECKER_ID` or
+`CODE_CHECK_CHECKER_ID` row of the lead's `run get`.
+
+`uzi run logs <checker-id>` prints each activity event as a human row in the
+payload column, for example:
+
+```
+#7    status           cross-checker    activity capture started
+#9    status           cross-checker    read api/cmd/uzi/run_get.go L1-200 · ok
+#10   status           cross-checker    search api/internal/forge · 3 matches · ok
+#11   status           cross-checker    read denied (outside checkout)
+#14   status           cross-checker    activity summary: 4 reads, 1 search, 0 dropped, complete
+```
+
+A denied attempt outside the checkout shows the category and never the path;
+a read of the Claude SDK spill file shows as `(tool output)`. A truncated
+match count reads `N+ matches`. The row goes through the same terminal
+sanitization and 200-character cell cap as other payloads. An event this CLI
+does not recognise, or an activity payload that does not validate, keeps the
+generic payload row, and `--json` always carries the raw payload.
+
+`uzi run get <checker-id>` prints one `ACTIVITY` row for a `cross_check` run:
+
+- `4 reads, 0 searches, 0 dropped, complete` (or `incomplete`): the summary for
+  the run's current attempt.
+- `activity capture in progress`: the run is not finished and its current
+  attempt has emitted the start marker.
+- `activity capture incomplete`: the run finished with a marker and no summary.
+- `activity capture unavailable`: the run started and finished without a
+  marker. A missing marker does not prove an older worker.
+- `earlier attempt (generation N): ...`: an earlier attempt's summary, labelled
+  and appended after the current state with `; `.
+- `historical; current capture unknown: ...`: the API predates
+  `claim_generation`, so the newest summary cannot be tied to the current
+  attempt.
+
+The row is omitted when there is nothing to say, and a log read error prints no
+`ACTIVITY` row. The state is derived from the run's messages and its
+`claim_generation`; a summary or marker from a higher generation than the run
+reports is ignored.
 
 A run's PRD-completion declaration is readable the same way:
 `uzi run get <id> --field prd_done_path` (the repo-relative path the run
@@ -2935,6 +2999,29 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   Settings, or `uzi run set-token` where the run accepts a token switch),
   `run list` shows `paused (credential disabled)`, and the TUI draws it as
   `⊘ cred disabled` in NEEDS YOU.
+  A `paused` run can also be held after an owner token switch on a run with
+  retained recovery work (`hold_reason: credential_switch_settling`, then
+  `credential_switch_unsettled`). `run get` prints a `HOLD` row reading
+  `credential switch settling` or `credential switch unsettled` with the next
+  step, `run list` shows `paused (credential switch settling)` or `paused
+  (credential switch unsettled)`, the TUI draws `⊘ settling` or `⊘ unsettled`
+  in NEEDS YOU, and `run wait` with its default targets stops on either (a
+  re-run `run wait` on a held run returns immediately). While settling, the
+  worker is finishing its own operations; `run resume` and `run set-token` are
+  refused with a 409 only while the holding worker is live and the same
+  registration (the refusal lifts on the worker's acknowledgement, a stale
+  heartbeat, worker removal or re-registration), and `run cancel` always works; see
+  [Credential-switch holds](run-recovery.md#credential-switch-holds).
+  A `paused` run created with `--require-base` can also be **held because
+  its kept work is not attested** (`hold_reason: base_attestation_missing`):
+  it continued its own work, but no checkpoint proves that work was produced
+  on the planned commit, so the agent never started. The work stays on the
+  worker, and nothing resumes or extends it (`run resume`, `run extend`,
+  `run set-token` and Stop are refused). `run get` prints a `HOLD` row
+  reading `base not attested` with the next step: inspect custody with
+  `uzi run recovery <id>`, recover the work with `uzi run export <id>
+  --output <path>`, or start a successor run. See [Seeded
+  plans](seeded-plans.md).
 
 For an ordinary pause, human `run get` makes one supplemental message read
 (`tail=100`). Its pause detail reads **paused by the run's lead** for
@@ -2981,18 +3068,24 @@ TUI board and detail header's status chip, and on `admin runs` — so you can
 tell "still proposing work" apart from "actively implementing" at a glance.
 It's still the same `running` value underneath, not an additional status.
 
-Human-facing STATUS labels also distinguish a human stop from a failure:
+Human-facing STATUS labels distinguish human stops and required-base rejections
+from execution failures:
 
-| Raw `status` | `stop_kind` | Full CLI label |
-|---|---|---|
-| `cancelled` | Any value, missing or conflicting | `stopped (cancelled)` |
-| `failed` | `cancelled` | `stopped (cancelled)` |
-| `failed` | `plan_rejected` | `stopped (plan rejected)` |
+| Raw `status` | `stop_kind` | `fail_origin` | Full CLI label |
+|---|---|---|---|
+| `cancelled` | Any value, missing or conflicting | Any | `stopped (cancelled)` |
+| `failed` | `cancelled` | Any | `stopped (cancelled)` |
+| `failed` | `plan_rejected` | Any | `stopped (plan rejected)` |
+| `failed` | No human stop | `base_diverged` | `rejected` |
 
 `run get` and `run list` use these full labels. The `admin runs` renderer
 uses the same labels, but its endpoint lists active runs only; terminal
 runs are not reachable through that listing. Human stops take precedence
-over `needs landing`, even when the run carries recoverable work. Genuine
+over `needs landing`, even when the run carries recoverable work. When no human
+stop applies, a raw `failed` run with `fail_origin: base_diverged` reads `rejected`,
+before any `needs landing` presentation. On the web, its cause label is
+`rejected: base changed`; the CLI origin field remains raw `base_diverged`. A plan rejection
+keeps its `stopped (plan rejected)` label. Genuine
 failures, including `stop_kind: auto_stopped`, keep their existing failure
 or `needs landing` presentation.
 
@@ -3003,7 +3096,9 @@ failed run with `stop_kind: plan_rejected`.
 
 These are presentation labels: raw JSON, scalar fields and status
 transitions stay unchanged. Filtering raw `status: failed` in JSON still
-includes failed-path cancellations and plan rejections. Neither `run list`
+includes failed-path cancellations, plan rejections and required-base
+rejections. See [required-base changes](./run-activity.md#when-a-required-base-has-changed)
+for rollout order and older payloads. Neither `run list`
 nor `admin runs` exposes a `--status` flag.
 
 ### Provider outage recovery and owner hold
@@ -3085,7 +3180,8 @@ built-in primitive for driving a gated run headless, replacing the hand-rolled
 `awaiting_followup`, `completed`, `failed`, `cancelled`) and waits through the
 rest (`queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/`recovery_wait`/`paused`),
 except a default wait also stops at `recovery_wait` with cause
-`worker_requeue_exhausted` for an owner decision:
+`worker_requeue_exhausted`, and at a `paused` run held on
+`base_attestation_missing`, for an owner decision:
 timed limit and recovery waits retry on a timer, pool waits need an available pooled token,
 and ordinary owner or lead pauses need `uzi run resume`. A bare `run wait` means
 "wait for the plan gate, a clarification, an interactive task's park,

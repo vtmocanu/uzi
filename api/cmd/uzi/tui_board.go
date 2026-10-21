@@ -75,6 +75,10 @@ type boardState struct {
 	// AdminListRuns already returns non-terminal runs only.
 	hideDone bool
 
+	// sortProgress is the `[p]` toggle (#3207): order ON THE FLOOR highest progress first.
+	// Client-side and session-only like hideDone; NEEDS YOU and DONE keep their order.
+	sortProgress bool
+
 	// scroll is the index of the first visible run row: the board windows the run list to
 	// the terminal height so the header and footer stay on screen even with hundreds of runs.
 	scroll int
@@ -105,11 +109,31 @@ func (b *boardState) apply(msg boardRunsMsg) {
 	}
 	b.err = nil
 	b.errStreak = 0
+	// Under the progress sort a poll can reorder the floor, so the selection follows its
+	// run by id; the default order keeps the plain index clamp.
+	keep := ""
+	if b.sortProgress {
+		keep = b.selectedID()
+	}
 	b.runs = msg.runs
 	// Record the accepted set's provenance. This is the single site runs are accepted (the
 	// error path above leaves runs — and so runsAdmin — untouched), and msg.admin == b.admin
 	// is guaranteed by the early return, so this is exactly the admin-ness of the held runs.
 	b.runsAdmin = msg.admin
+	b.reselect(keep)
+}
+
+// reselect puts the cursor back on run id after the visible order changed, clamping
+// the previous index when id is "" or the run is gone or filtered out.
+func (b *boardState) reselect(id string) {
+	if id != "" {
+		for i, r := range b.visible() {
+			if r.ID == id {
+				b.cursor = i
+				return
+			}
+		}
+	}
 	b.clampCursor()
 }
 
@@ -160,7 +184,7 @@ func (b *boardState) visible() []apitypes.RunListItemDTO {
 		}
 		base = out
 	}
-	return bandOrder(base)
+	return bandOrder(base, b.sortProgress)
 }
 
 // The three triage bands, in fixed top-to-bottom order.
@@ -203,7 +227,7 @@ func runBand(status string, isRevising bool) int {
 // holds also require the owner to Resume, Stop or Cancel. Both are NEEDS YOU. Every band decision on the board
 // (the ordering, the eyebrow counts, the row's title ink) goes through here so they agree.
 func runBandOf(r apitypes.RunListItemDTO) int {
-	if codexReloginHold(r.RunDTO) || isCredentialDisabledHold(r.RunDTO) || isOwnerRequiredWorkerHold(r.RunDTO) || isProviderUnavailableHold(r.RunDTO) {
+	if codexReloginHold(r.RunDTO) || isCredentialDisabledHold(r.RunDTO) || isOwnerRequiredWorkerHold(r.RunDTO) || isProviderUnavailableHold(r.RunDTO) || isCredentialSwitchHold(r.RunDTO) {
 		return bandNeedsYou
 	}
 	return runBand(r.Status, r.IsRevising)
@@ -224,6 +248,12 @@ func runStateWord(r apitypes.RunListItemDTO) string {
 	if isCredentialDisabledHold(r.RunDTO) {
 		return credDisabledWord
 	}
+	if isCredentialSwitchSettlingHold(r.RunDTO) {
+		return credSwitchSettlingWord
+	}
+	if isCredentialSwitchUnsettledHold(r.RunDTO) {
+		return credSwitchUnsettledWord
+	}
 	_, word := stateGlyphWord(r.Status, r.Health, r.IsPlanning, r.IsRevising, r.LandingState, strOr(r.StopKind, ""), strOr(r.RecoveryWaitCause, ""))
 	return word
 }
@@ -241,11 +271,16 @@ func doneRunFailed(r apitypes.RunListItemDTO) bool {
 // bandOrder concatenates NEEDS YOU → ON THE FLOOR → DONE. Active bands keep the
 // server's order; DONE uses the web archive's newest-finish-first order (#2098),
 // preserving server order when both the finish instant and status rank tie.
-func bandOrder(runs []apitypes.RunListItemDTO) []apitypes.RunListItemDTO {
+// byProgress (the `[p]` toggle, #3207) orders ON THE FLOOR highest progress first,
+// server order breaking ties.
+func bandOrder(runs []apitypes.RunListItemDTO, byProgress bool) []apitypes.RunListItemDTO {
 	var buckets [numBands][]apitypes.RunListItemDTO
 	for _, r := range runs {
 		b := runBandOf(r)
 		buckets[b] = append(buckets[b], r)
+	}
+	if byProgress {
+		slices.SortStableFunc(buckets[bandFloor], compareFloorProgress)
 	}
 	slices.SortStableFunc(buckets[bandDone], compareDoneRuns)
 	out := make([]apitypes.RunListItemDTO, 0, len(runs))
@@ -291,6 +326,14 @@ func (b *boardState) selected() (apitypes.RunListItemDTO, bool) {
 		return apitypes.RunListItemDTO{}, false
 	}
 	return v[b.cursor], true
+}
+
+// selectedID is the selected run's id, or "" when nothing is selected.
+func (b *boardState) selectedID() string {
+	if r, ok := b.selected(); ok {
+		return r.ID
+	}
+	return ""
 }
 
 func (m tuiModel) boardKey(k string) (tea.Model, tea.Cmd) {
@@ -362,6 +405,14 @@ func (m tuiModel) boardKey(k string) (tea.Model, tea.Cmd) {
 		m.board.cursor = 0
 		m.board.scroll = 0
 		m.board.clampCursor()
+		return m, nil
+	case keyProgressSort:
+		// Client-side reorder of the fetched runs, so no refetch. Unlike h, the selection
+		// follows its run in both directions.
+		keep := m.board.selectedID()
+		m.board.sortProgress = !m.board.sortProgress
+		m.board.reselect(keep)
+		m.board.scroll = m.syncedScrollAt(m.boardScrollCapacity())
 		return m, nil
 	case keyEnter, keyRight:
 		// enter or → (right) opens the selected run — → is the natural "drill in" that pairs
@@ -758,6 +809,10 @@ func (m tuiModel) boardEyebrow(it boardItem) string {
 		return " " + lipgloss.NewStyle().Foreground(m.pal.amber).Bold(true).Render(name) + m.pal.faint.Render(" · "+itoa(it.count))
 	}
 	label := " " + m.pal.faint.Render(name+" · "+itoa(it.count))
+	if it.band == bandFloor && m.board.sortProgress {
+		// On the band it reorders, so the title and its live filter keep their width.
+		label += m.pal.faint.Render(" · by progress")
+	}
 	if it.band == bandDone && it.failed > 0 {
 		label += m.pal.faint.Render(" · ") + paintSeg(m.pal.alarm, nil, false, itoa(it.failed)+" failed")
 	}
@@ -1135,7 +1190,7 @@ func (m tuiModel) boardSummary() string {
 		if codexReloginHold(r.RunDTO) {
 			relogins++
 		}
-		if isCredentialDisabledHold(r.RunDTO) || isProviderUnavailableHold(r.RunDTO) {
+		if isCredentialDisabledHold(r.RunDTO) || isProviderUnavailableHold(r.RunDTO) || isCredentialSwitchHold(r.RunDTO) {
 			ownerHolds++
 		}
 		switch r.Status {

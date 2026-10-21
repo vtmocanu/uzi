@@ -441,3 +441,29 @@ func TestFilterProtocolRecoveryHeldPublication(t *testing.T) {
 		t.Fatalf("held-publication capability leaked into the scheduler vocabulary: %v", got)
 	}
 }
+
+// TestFilterProtocol_KeepsSemanticTokens pins PRD #1230: the two semantic tokens survive
+// registration (the claim clauses read them off workers.protocol_capabilities), are not scheduler
+// capabilities, keep their spelling (SQL and agent spell them identically), and neither implies
+// the other or completion_non_closing_v1 (which is an API feature, never a worker capability).
+func TestFilterProtocol_KeepsSemanticTokens(t *testing.T) {
+	got := FilterProtocol([]string{CompletionSemanticPublicationV1, CIArtifactsV1, CrossCheckSemanticPlanV1, CrossCheckCodexLeadV1, "completion_non_closing_v1"})
+	want := []string{CrossCheckCodexLeadV1, CrossCheckSemanticPlanV1, CompletionSemanticPublicationV1, CIArtifactsV1}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("FilterProtocol = %v, want %v (stable protocolOrder; completion_non_closing_v1 is not a worker capability)", got, want)
+	}
+	for _, only := range []string{CrossCheckSemanticPlanV1, CompletionSemanticPublicationV1} {
+		if got := FilterProtocol([]string{only}); !reflect.DeepEqual(got, []string{only}) {
+			t.Errorf("FilterProtocol([%q]) = %v, want only itself", only, got)
+		}
+		if got := Filter([]string{only}); len(got) != 0 {
+			t.Errorf("Filter(%q) = %v, want empty (a protocol cap must not be a scheduler cap)", only, got)
+		}
+		if got := SelfReportable([]string{only}); len(got) != 0 {
+			t.Errorf("SelfReportable(%q) = %v, want empty", only, got)
+		}
+	}
+	if CrossCheckSemanticPlanV1 != "cross_check_semantic_plan_v1" || CompletionSemanticPublicationV1 != "completion_semantic_publication_v1" {
+		t.Errorf("semantic tokens drifted: %q %q", CrossCheckSemanticPlanV1, CompletionSemanticPublicationV1)
+	}
+}

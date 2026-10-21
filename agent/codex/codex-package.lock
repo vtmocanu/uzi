@@ -18,10 +18,10 @@
 # --- Package identity (upstream release coordinates) -------------------------------
 # Renovate updates this identity block and both per-arch tag/hash pairs in one PR.
 # install-codex.sh rejects disagreement even when only one architecture is built.
-CODEX_VERSION=0.160.1
-CODEX_MANIFEST_VERSION=0.160.1
-CODEX_TAG=rust-v0.160.1
-CODEX_SOURCE_COMMIT=d27764b82f7118f674371e6d6e76271d9d606edb
+CODEX_VERSION=0.162.1
+CODEX_MANIFEST_VERSION=0.162.1
+CODEX_TAG=rust-v0.162.1
+CODEX_SOURCE_COMMIT=092d3acd6bec3e3a14bdc7e7a2810ab628ab759d
 # Artifacts live at ${CODEX_BASE_URL}/${CODEX_TAG}/${artifact}.
 CODEX_BASE_URL=https://github.com/openai/codex/releases/download
 
@@ -43,11 +43,11 @@ CODEX_MEMBERS=bin/codex bin/codex-code-mode-host codex-package.json codex-path/r
 # amd64 -> x86_64 musl
 CODEX_TARGET_amd64=x86_64-unknown-linux-musl
 CODEX_ARTIFACT_amd64=codex-package-x86_64-unknown-linux-musl.tar.gz
-CODEX_TAG_amd64=rust-v0.160.1
-CODEX_SHA256_amd64=340801565906a7028f6baaa9ab6853addaef221f0016a1417a7c1ffdd96c21f0
+CODEX_TAG_amd64=rust-v0.162.1
+CODEX_SHA256_amd64=a676f5722aae0d86cbe3764332f08eab1fdd89dc0a300b3ad4ffbf48611fa3e3
 
 # arm64 -> aarch64 musl
 CODEX_TARGET_arm64=aarch64-unknown-linux-musl
 CODEX_ARTIFACT_arm64=codex-package-aarch64-unknown-linux-musl.tar.gz
-CODEX_TAG_arm64=rust-v0.160.1
-CODEX_SHA256_arm64=dff0954438fa455c2197ddb1f421d8d68625d98de610f76bedb6e5bc837ea35b
+CODEX_TAG_arm64=rust-v0.162.1
+CODEX_SHA256_arm64=53a9ce0b94beb27a63fdeb2f7704d95199e17b3898aa33b60461a1a93ac0d88b

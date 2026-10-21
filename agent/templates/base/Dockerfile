@@ -180,6 +180,15 @@ RUN PROFILE="$(readlink -f /home/worker/.local/share/devbox/global/default/.devb
     && readlink -f /opt/uzi-toolchain > /etc/uzi-toolchain-profile \
     && chown -R worker:runner /nix/var/nix/gcroots \
     && chown -h worker:runner /nix/var/nix/gcroots/uzi-toolchain
+# issue #3153: image-baked layout marker. The controller's `runner-init` init container
+# (controller/internal/kube, before dind) creates the /data/runner/.tmp carve-out ONLY when
+# it reads `runner-shared-v1` as the first line of this file. It is the fail-closed gate
+# that proves this image's entrypoint (a2b legacy loop skips .tmp; a3 Docker-lane scratch is
+# adopt-or-refuse) matches the controller's runner-shared layout. Bump the token together
+# with the controller check. Root-owned 0644, deliberately not runner-writable.
+RUN printf 'runner-shared-v1\n' > /etc/uzi-runner-layout \
+    && chown root:root /etc/uzi-runner-layout \
+    && chmod 0644 /etc/uzi-runner-layout
 # Put the STABLE toolchain bin on the image PATH so the baked toolchain resolves for BOTH the
 # worker's provision subprocess and the agent (whose SDK PATH = runnerPath() = the image
 # PATH). Points at /opt/uzi-toolchain/bin — the immutable handle above — NOT the mutable
@@ -339,7 +348,7 @@ RUN command -v agent-browser \
 # does not hit the un-chmodable-root abort the non-root seed would.
 RUN chmod -R a+rX /nix
 
-# --- PRD #1156 M3a: package pinned Codex 0.160.1 (CLI + code-mode host) ------------------
+# --- PRD #1156 M3a: package pinned Codex 0.162.1 (CLI + code-mode host) ------------------
 # Install the COMBINED native package (not the bare CLI) into a stable, immutable,
 # root-owned root at /opt/uzi-codex/<version>/ — OUTSIDE writable /app, /data and the
 # per-run homes, and on NO PATH: the launcher resolves Codex by absolute path only, so a
@@ -353,7 +362,7 @@ RUN chmod -R a+rX /nix
 # manifest field or an unsupported arch BEFORE installing. assert-codex.sh is the
 # build-time runner-uid guard: it execs `codex --version` as the cap-less `runner` uid
 # (setpriv --reuid runner, fresh throwaway HOME, replaced env, bounded timeout), asserting EXACTLY
-# `codex-cli 0.160.1` + exit 0 AND the fake-GNU-ldd PATH case AND the code-mode host
+# `codex-cli 0.162.1` + exit 0 AND the fake-GNU-ldd PATH case AND the code-mode host
 # sibling — so a broken binary/loader or a missing host fails the BUILD, not a run. The
 # helpers + lock are removed after (no residue); NO auth/config/session state is baked.
 # MIRRORED in templates/jvm (jvm is NOT `FROM base`) — keep the two in lockstep.

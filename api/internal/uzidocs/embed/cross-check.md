@@ -193,6 +193,102 @@ permissions are the boundary. See
 [worker setup](./worker-setup.md#run-artifacts-and-the-sandbox) for the
 tool-path policy and the [architecture](../ARCHITECTURE.md#plan-cross-check).
 
+## Checker activity
+
+A Plan or Code checker run records which repository paths it read and
+searched, so a clean verdict can be judged against how much the checker
+looked at. Both families and both stages record it. The record is bounded
+telemetry: it never changes the verdict, and a failure to record it does not
+fail the check.
+
+**What an event holds**
+
+- A **read** records the checkout-relative path and the inclusive line range
+  returned, when known.
+- A **search** records the scope path (`.` for the whole checkout) and a match
+  count. A truncated count shows as `N+`.
+- Never the search query, glob or pattern, tool arguments or file contents.
+- An attempt outside the checkout is recorded as a category with no path:
+  `outside checkout`. `policy` covers a path the recorder refuses to show
+  (it carries control or bidirectional characters, or is over 512 bytes). It
+  also covers a Codex policy denial (`E_DENIED`, `denied_tool` or
+  `unknown_tool`), which can name a path inside the checkout.
+  `tool output` is any path under the checker's own HOME directory, for both
+  families (in practice the Claude SDK spill file for oversized tool output);
+  its path is not shown either.
+- Every event has an outcome: `ok`, `denied`, `oversize`, `limit` or `error`.
+  The Codex checker reports `oversize` for the helper's oversize code. The
+  Claude checker never reports `oversize`. A Claude call refused by the
+  code-stage tool budget ends the session and fails the check
+  (`confinement_failed`). The refused call is `limit` if its tool result
+  arrives before the abort; otherwise it stays **unsettled** (see below).
+
+**Caps.** A check records at most 200 events; further settled calls are
+counted in `dropped` but still counted in the summary totals. At most 256
+calls are tracked in flight, and a call id must be 1 to 128 bytes. A call the
+recorder cannot track (a non-string or out-of-range id, or one past the
+in-flight cap) is counted `untracked`; a call that never got a result by the
+end of the session is counted `unsettled`.
+
+**Marker and summary.** The runner emits a `check_activity_start` marker when
+the checker run begins and one `check_activity_summary` when the session ends.
+The summary carries the family, stage, per-outcome counts for reads and
+searches, `dropped`, `untracked`, `unsettled` and `complete`. `complete` is true
+only when the start marker was emitted, the checker's model session started
+(the Claude session's init frame arrived, or the Codex turn start was
+confirmed) and the check then ended (normally, or by failure or timeout), no
+begun call is unsettled and none was untracked. A check that ends before its
+model session starts (for example an invalid claim, an expired deadline, a
+clone failure, a missing credential, an invalid pinned effort, a provider that
+fails to start or authenticate, or a pinned model rejected at turn start)
+reports `incomplete`, never "0 reads, 0 searches, 0 dropped, complete".
+`dropped` does not affect `complete`: a
+dropped event is still counted in the totals.
+
+### Where it shows
+
+- **Checker run page.** The run page of a checker child shows a
+  **Checker activity** line, and the feed lists each event as plain text (for
+  example `read api/x.go L1-200 · ok` or `search api/internal/forge · 3 matches
+  · ok`).
+- **`uzi run logs <checker>`** prints the same rows. See
+  [CLI](./cli.md#checker-activity).
+- **`uzi run get <checker>`** prints one `ACTIVITY` row with the summary.
+
+The line reads `4 reads, 0 searches, 0 dropped, complete` (or `incomplete`, per the summary's `complete` flag) once the summary for
+the run's current attempt has arrived. Before then, or when it never arrives:
+
+| Line | Meaning |
+|------|---------|
+| `activity capture in progress` | The run is not finished and the current attempt has emitted its start marker. |
+| `activity capture incomplete` | The run finished with a marker but no summary for the current attempt. |
+| `activity capture unavailable` | The run started and finished but the current attempt emitted no marker. A missing marker does not prove an older worker; it can also mean capture failed early. |
+| `earlier attempt (generation N): ...` | A reclaimed checker's earlier attempt left a summary. It is labelled as that attempt's, and shown after the current state. A newer generation than the run reports is ignored. |
+| `historical; current capture unknown: ...` | The API predates the run's `claim_generation` field, so the newest summary cannot be bound to the current attempt. |
+
+### Rolling out activity
+
+- Web and CLI releases that predate this feature show an unknown activity
+  event as `status: <event>` (web) or as the raw payload JSON row, sanitized
+  and capped (CLI `uzi run logs`), so a worker that rolls out first is
+  harmless.
+- A checker on an older worker records nothing, so a finished check shows
+  `activity capture unavailable`, never "read nothing".
+- Activity and usage frames now share one batched channel, which is closed
+  before the terminal state is posted. A usage frame that is not delivered
+  still fails the check with `model_error`. A tombstoned or still-buffered
+  activity frame does not by itself (though a usage frame queued behind it is
+  then undelivered too), but a channel breaker trip (for example a fatal API
+  rejection of any batch, or no usable outbox while the API is unreachable) or a
+  tombstone-set overflow fails a would-be success with `model_error`
+  whichever frame caused it. A usage post that fails transiently and is later
+  delivered does not fail the check. A usage frame that was written to the
+  worker's outbox (the API was unreachable) never counts as delivered, even
+  after the outbox drains, because a replay can deliver a dropped-message
+  marker in its place: a would-be success fails `model_error`.
+- Activity lands on the checker child run, not the lead. The lead's
+  stalled-health warning during a code-check wait is unchanged.
+
 ## Rolling out Codex-lead checks
 
 Deploy the api and its migration before the workers. A new api adds
@@ -210,6 +306,43 @@ deletes Claude checker runs but keeps the check history, with the checker run
 link empty. Run the Down only with the new api stopped. With ephemeral workers
 off, the settings toggle warns when no online worker can run the checker,
 including when none advertises `cross_check_codex_lead_v1`.
+
+## Semantic contract profile (dormant)
+
+**Dormant.** Production enrollment is off until #1231, no production code creates a
+semantic run and only tests inject the path. A real run uses the *structural*
+profile described everywhere else on this page.
+
+| Profile | Behavior |
+|---|---|
+| Structural (legacy, today) | The frozen milestone checklist and exact-head permit. No source-coverage review: zero coverage model calls. |
+| Semantic (dormant) | Adds server-issued criterion IDs of kind `worker` or `maintainer`, and an independent coverage review that compares the issue and linked PRD with the proposed plan. |
+
+The coverage review is a bounded, tool-less model turn at the exact approval
+decision point, run once per candidate that is about to proceed: after a
+required Plan cross-check APPROVE and before auto-approval, or when the
+candidate is shown at a human gate. Automatic checker REVISE rounds consume no
+coverage review. Per verdict-bearing review there are at most two invocations
+sharing 5 minutes and 40,000 tokens, and per run at most three reviews and 15
+minutes and 120,000 tokens, independent of the checker's allowance. A changed
+candidate, source or criteria set invalidates the verdict and any checker
+approval bound to the old plan.
+
+A semantic plan is checked under a distinct candidate digest (`semantic_v1`).
+The plan-checker child needs a worker advertising `cross_check_semantic_plan_v1`
+(see [Worker versions and upgrades](./worker-upgrades.md#semantic-completion-capabilities-dormant)); with none, the check takes the existing deadline-to-human
+path and never falls back to the structural digest. A plan you revise at the gate
+triggers no new cross-family checker pass, but that revised candidate gets its
+own coverage report within the same non-resetting budgets. When coverage is
+missing, uncertain or unavailable an autopilot run parks at the gate instead of
+auto-approving; see [Autopilot](./autopilot.md#semantic-runs-park-instead-of-auto-approving-dormant).
+Design record: [ADR-2149 amendment](../adr/2149-cross-check.md#1230-coverage-park-and-semantic-digest-amendment-2026-10-20).
+
+### Coverage transport limitation
+
+Codex currently lacks an enforceable token cap. Claude's output cap alone does not prove a conservative full-call bound. Complete large sources can exceed the 40,000-token allowance. Unsupported or unbounded transports and inadmissibly large inputs yield unavailable without a model call. #1231 must establish enforceable bounds before activation.
+
+See [ADR-1225](../adr/1225-structural-completion-interlock-invariants.md#coverage-transport-limitation).
 
 ## Recovery before a human gate
 

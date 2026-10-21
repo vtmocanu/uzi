@@ -1,4 +1,4 @@
-import { it } from "node:test";
+import { it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { PassThrough, Writable } from "node:stream";
 import { CodexCrossCheck, CrossCheckMalformedError, type CrossCheckModelDeps } from "../src/codex/cross-check.js";
@@ -6,6 +6,8 @@ import type { CodexRootHandle, CodexLaunchSpec, CodexEffectLaunchSpec } from "..
 import type { ClaimResponse } from "../src/protocol.js";
 import { WorkerClient, RequestError } from "../src/client.js";
 import type { Logger } from "../src/log.js";
+import { MessageBatcher } from "../src/batcher.js";
+import { CrossCheckCheckerUnavailableError } from "../src/codex/model-rejection.js";
 
 const verdict = JSON.stringify({ verdict: "approve", summary: "Anchors checked", items: [] });
 const claim = (subscription = false): ClaimResponse => ({
@@ -225,7 +227,9 @@ it("outer checker uses real Read broker, actual HTTP verdict delivery and journa
      const journal = await outbox.readTerminalJournal(c.run_id, 7);
      assert.equal(journal?.body.status, expectedStatus);
      assert.equal(journal?.body.claim_generation, 7);
-     assert.equal(journal?.messagesThroughSeq, mode === "invalid-effort" ? 0 : 2);
+     // marker, init, result and summary all ride the batcher; the fence is its closed tail. The modes
+     // whose model reaches the real Read broker also record one check_activity row (PRD #3166).
+     assert.equal(journal?.messagesThroughSeq, mode === "invalid-effort" ? 2 : rejected ? 4 : 5);
     }
    }
   } catch (error) {
@@ -272,10 +276,22 @@ it("outer checker uses real Read broker, actual HTTP verdict delivery and journa
   assert.deepEqual(clones, [["/bare", c.cross_check!.base_commit, c.run_id]]);
   assert.deepEqual(r.ops, mode === "invalid-effort" ? [] : rejected ? ["stat"] : ["stat", "read"]);
   assert.deepEqual(r.disposed, mode === "invalid-effort" ? [] : ["provider", "fileop"]);
-  const delivered = posts.filter((p) => p.url.endsWith("/messages"));
-  assert.deepEqual(delivered.map((p) => p.body.messages[0].seq), mode === "invalid-effort" ? [] : [1, 2]);
-  assert.deepEqual(delivered.map((p) => p.body.messages[0].payload.event), mode === "invalid-effort" ? [] : ["init", "result"]);
-  if (mode !== "invalid-effort") assert.equal(delivered[1]!.body.messages[0].payload.is_error, !approves);
+  const delivered = posts.filter((p) => p.url.endsWith("/messages")).flatMap((p) => p.body.messages as any[]);
+  // A mode whose model reaches the real Read broker also records that read as one check_activity row.
+  const events = mode === "invalid-effort" ? ["check_activity_start", "check_activity_summary"]
+   : rejected ? ["check_activity_start", "init", "result", "check_activity_summary"]
+   : ["check_activity_start", "init", "check_activity", "result", "check_activity_summary"];
+  assert.deepEqual(delivered.map((m) => m.seq), events.map((_e, i) => i + 1));
+  assert.deepEqual(delivered.map((m) => m.payload.event), events);
+  if (mode !== "invalid-effort") assert.equal(delivered.find((m) => m.payload.event === "result")!.payload.is_error, !approves);
+  if (!rejected) {
+   const read = delivered.find((m) => m.payload.event === "check_activity")!.payload;
+   assert.equal(read.op, "read");
+   assert.equal(read.outcome, "ok");
+  }
+  // A pinned effort the checker refuses throws before the provider launches, so capture is incomplete.
+  assert.equal(delivered.at(-1)!.payload.complete, mode !== "invalid-effort");
+  assert.equal(delivered.at(-1)!.payload.generation, 7);
   if (mode !== "invalid-effort") {
    const start = r.requests.find((f) => f.method === "turn/start")!;
    const candidate = JSON.parse(/<candidate_[a-f0-9]{32}>\n([\s\S]*?)\n<\/candidate_[a-f0-9]{32}>/.exec(start.params!.input[0].text)![1]!);
@@ -297,6 +313,7 @@ it("outer checker uses real Read broker, actual HTTP verdict delivery and journa
   assert.ok(posts.every((p) => p.url.includes("/runs/check/")));
   const verdictIndex = posts.findIndex((p) => p.url.endsWith("/cross-check-verdict"));
   assert.ok(verdictIndex > 0);
+  assert.ok(posts.slice(verdictIndex).every((p) => !p.url.endsWith("/messages")), "every row is delivered before the verdict");
   assert.equal(posts.filter((p) => p.url.endsWith("/cross-check-verdict")).length, 1);
   assert.equal(posts.some((p) => p.url.includes("/cross-checks/plan")), false, "the child never submits an automatic revision");
   assert.equal(posts[verdictIndex]!.body.verdict, expectedVerdict);
@@ -343,6 +360,7 @@ for (const mode of ["stale-running", "stale-verdict", "malformed", "delivery", "
     return mode === "stale-running" || (mode === "stale-verdict" && states.length >= 3) ? { staleClaim: true } : { applied: true };
    },
    getInputs: async () => ({ inputs: [] }),
+   postMessages: async () => {},
    reportCrossCheckVerdict: async (_id: string, _generation: number, value: any) => {
     decisions.push(value);
     if (mode === "stale-verdict") throw new RequestError("POST", "/cross-check-verdict", 409,
@@ -433,4 +451,303 @@ it("exact-commit clone stays on immutable base after default and tracking refs a
   await assert.rejects(fs.stat(path.join(checkout, ".git/objects/info/alternates")), { code: "ENOENT" });
   await assert.rejects(cache.runnerCloneAtCommit(bare, "f".repeat(40), "child-id"));
  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
+// ---- Delivery contract (PRD #3166): activity and usage ride one batcher; close-then-fence ----
+
+interface Scenario {
+ checker: (ctx: { signal: AbortSignal; usage: (p: Record<string, unknown>) => Promise<void>;
+  activity: import("../src/cross-check-activity.js").CheckActivityRecorder | undefined }) => Promise<string>;
+ post?: (msgs: any[], index: number, signal?: AbortSignal) => void | Promise<void>;
+ modelTimeoutMs?: number;
+ preModelFailure?: boolean;
+ /** Put the claim's deadline_at this many ms ahead (default: the fixture's far-future deadline). */
+ deadlineInMs?: number;
+ forgePat?: string;
+ /** Override the reportState(running) ack; `n` counts the running calls (0 is the first). */
+ running?: (n: number) => Record<string, unknown>;
+}
+
+async function scenario(s: Scenario) {
+ const root = await fs.mkdtemp(path.join(path.resolve(import.meta.dirname, "../../.uzi/scratch"), "checker-delivery-"));
+ const outbox = new Outbox({ root: path.join(root, "outbox"), log: nullLogger(),
+  runMaxBytes: 64 * 1024 * 1024, maxBytes: 512 * 1024 * 1024, retentionMs: 86400000 });
+ await outbox.init();
+ const c = { ...claim(), claim_generation: 7 };
+ if (s.forgePat) c.secrets.forge_pat = s.forgePat;
+ if (s.deadlineInMs !== undefined) (c.cross_check as any).deadline_at = new Date(Date.now() + s.deadlineInMs).toISOString();
+ const calls: string[] = [];
+ const landed: any[] = [];
+ const verdicts: any[] = [];
+ const terminals: { status: string; fence: number | undefined }[] = [];
+ let postIndex = 0;
+ let runningIndex = 0;
+ const client = new WorkerClient("http://127.0.0.1:1", "join-fixture", "test", nullLogger()) as any;
+ client.reportState = async (_id: string, body: any) => {
+  if (body.status === "completed" || body.status === "failed") {
+   calls.push("terminal:" + body.status);
+   terminals.push({ status: body.status, fence: (await outbox.readTerminalJournal(c.run_id, 7))?.messagesThroughSeq });
+  }
+  if (body.status === "running" && s.running) return s.running(runningIndex++);
+  return { applied: true };
+ };
+ client.getInputs = async () => ({ inputs: [] });
+ client.postMessages = async (_run: string, msgs: any[], _gen: number, signal?: AbortSignal) => {
+  const index = postIndex++;
+  signal?.throwIfAborted();
+  await s.post?.(msgs, index, signal);
+  calls.push("messages");
+  landed.push(...msgs);
+ };
+ client.reportCrossCheckVerdict = async (_id: string, _g: number, value: any) => {
+  calls.push("verdict:" + value.verdict + (value.reason_class === "approve" ? "" : ":" + value.reason_class));
+  verdicts.push(value);
+ };
+ const git = { ensureClone: async () => "/bare", runnerCloneAtCommit: async () => "/checkout",
+  removeRunnerClone: async () => {} } as unknown as GitCache;
+ try {
+  await new CrossCheckRunner(client, git, nullLogger(), { homeRoot: root, pollMs: 1, outbox, batchMs: 5,
+   modelTimeoutMs: s.modelTimeoutMs ?? 5000,
+   model: { run: async (_c, _co, _h, signal, usage, _confirm, activity) => {
+    // The fake checker crosses into the model unless a test says it failed first.
+    if (s.preModelFailure !== true) activity?.modelStarted();
+    return s.checker({ signal, usage, activity });
+   } },
+  }).execute(c);
+ } finally { await fs.rm(root, { recursive: true, force: true }); }
+ return { calls, landed, verdicts, terminals, events: landed.map((m) => m.payload.event as string) };
+}
+
+const settleRead = (a: any, id: string, p: string) => { a.begin(id, "read", p); a.settle(id, { outcome: "ok", lines: [1, 3] }); };
+const initFrame = { event: "init", text: "init" };
+const resultFrame = { event: "result", is_error: false };
+
+function assertClosedThenFenced(r: Awaited<ReturnType<typeof scenario>>, status: string) {
+ const terminal = r.calls.indexOf("terminal:" + status);
+ assert.ok(terminal > 0, "terminal reported");
+ assert.ok(r.calls.slice(terminal).every((x) => x !== "messages"), "no row is posted after the terminal report");
+ assert.equal(r.terminals.length, 1);
+ assert.equal(r.terminals[0]!.fence, r.landed.at(-1)!.seq, "fence is the batcher's closed tail");
+ assert.deepEqual(r.landed.map((m) => m.seq), r.landed.map((_m, i) => i + 1), "stream is contiguous");
+}
+
+it("checker delivery: marker, activity, usage and summary go through the batcher with redaction before verdict and terminal", async () => {
+ const pat = "forge-pat-secret-0123456789";
+ const r = await scenario({ forgePat: pat, checker: async ({ usage, activity }) => {
+  await usage({ ...initFrame, text: "token " + pat });
+  settleRead(activity, "a", "api/x.go");
+  settleRead(activity, "b", "web/y.ts");
+  await usage(resultFrame);
+  return verdict;
+ } });
+ assert.deepEqual(r.events, ["check_activity_start", "init", "check_activity", "check_activity", "result", "check_activity_summary"]);
+ assert.equal(JSON.stringify(r.landed).includes(pat), false);
+ assert.ok(JSON.stringify(r.landed).includes("***REDACTED***"), "the secret was replaced, not dropped");
+ assert.equal(r.landed.at(-1)!.payload.complete, true);
+ assert.equal(r.landed.at(-1)!.payload.generation, 7);
+ assert.ok(r.landed.every((m) => m.agent === "cross-checker" && m.kind === "status"));
+ assert.deepEqual(r.calls.filter((x) => x !== "messages"), ["verdict:approve", "terminal:completed"]);
+ assert.ok(r.calls.lastIndexOf("messages") < r.calls.indexOf("verdict:approve"));
+ assertClosedThenFenced(r, "completed");
+});
+
+it("checker delivery: a failed check still persists the summary and the result frame", async () => {
+ const r = await scenario({ checker: async ({ usage, activity }) => {
+  await usage(initFrame);
+  settleRead(activity, "a", "api/x.go");
+  await usage({ event: "result", is_error: true });
+  throw new Error("boom");
+ } });
+ assert.deepEqual(r.events, ["check_activity_start", "init", "check_activity", "result", "check_activity_summary"]);
+ assert.deepEqual(r.calls.filter((x) => x !== "messages"), ["verdict:failed:model_error", "terminal:failed"]);
+ assert.ok(r.calls.lastIndexOf("messages") < r.calls.indexOf("verdict:failed:model_error"));
+ assertClosedThenFenced(r, "failed");
+});
+
+it("checker delivery: a model timeout closes the batcher before its terminal report", async () => {
+ const r = await scenario({ modelTimeoutMs: 30, checker: async ({ signal, usage, activity }) => {
+  await usage(initFrame);
+  activity!.begin("pending", "read", "a.ts");
+  await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+  signal.throwIfAborted();
+  return verdict;
+ } });
+ assert.deepEqual(r.calls.filter((x) => x !== "messages"), ["verdict:failed:model_timeout", "terminal:failed"]);
+ assert.equal(r.landed.at(-1)!.payload.complete, false);
+ assert.equal(r.landed.at(-1)!.payload.unsettled, 1);
+ assertClosedThenFenced(r, "failed");
+});
+
+it("checker delivery: a transient post rejection that close later delivers leaves the verdict standing", async () => {
+ const r = await scenario({ post: (_m, index) => {
+  if (index === 0) throw new RequestError("POST", "/messages", 503, "{}");
+ }, checker: async ({ usage }) => { await usage(initFrame); await usage(resultFrame); return verdict; } });
+ assert.deepEqual(r.calls.filter((x) => x !== "messages"), ["verdict:approve", "terminal:completed"]);
+ assert.deepEqual(r.events, ["check_activity_start", "init", "result", "check_activity_summary"]);
+ assertClosedThenFenced(r, "completed");
+});
+
+it("checker delivery: persistent rejection leaves usage undelivered, so the check fails model_error but the terminal is delivered", async () => {
+ const r = await scenario({ post: () => { throw new RequestError("POST", "/messages", 503, "{}"); },
+  checker: async ({ usage }) => { await usage(initFrame); return verdict; } });
+ assert.deepEqual(r.calls, ["verdict:failed:model_error", "terminal:failed"]);
+ assert.equal(r.terminals[0]!.fence, 3, "marker, init and summary were emitted; the fence is the batcher's tail");
+});
+
+it("checker delivery: a tombstoned usage frame fails the check model_error", async () => {
+ const r = await scenario({ post: (msgs) => {
+  if (msgs.some((m) => m.payload.event === "init")) throw new RequestError("POST", "/messages", 400, "{}");
+ }, checker: async ({ usage }) => { await usage(initFrame); await usage(resultFrame); return verdict; } });
+ assert.deepEqual(r.calls.filter((x) => x !== "messages"), ["verdict:failed:model_error", "terminal:failed"]);
+ assert.ok(r.landed.some((m) => m.payload.event === "message_dropped"));
+ assertClosedThenFenced(r, "failed");
+});
+
+it("checker delivery: a tombstoned activity row with usage delivered leaves the verdict standing", async () => {
+ const r = await scenario({ post: (msgs) => {
+  if (msgs.some((m) => m.payload.event === "check_activity")) throw new RequestError("POST", "/messages", 400, "{}");
+ }, checker: async ({ usage, activity }) => {
+  await usage(initFrame);
+  settleRead(activity, "a", "api/x.go");
+  await usage(resultFrame);
+  return verdict;
+ } });
+ assert.deepEqual(r.calls.filter((x) => x !== "messages"), ["verdict:approve", "terminal:completed"]);
+ assert.ok(r.landed.some((m) => m.payload.event === "message_dropped"));
+ assertClosedThenFenced(r, "completed");
+});
+
+it("checker delivery: a tripped batcher (fatal 401) turns a would-be success into model_error and still reports terminal", async () => {
+ const r = await scenario({ post: () => { throw new RequestError("POST", "/messages", 401, "{}"); },
+  checker: async ({ usage }) => {
+   await usage(initFrame);
+   await new Promise((resolve) => setTimeout(resolve, 80));
+   return verdict;
+  } });
+ assert.deepEqual(r.calls, ["verdict:failed:model_error", "terminal:failed"]);
+});
+
+it("checker delivery: 250 tool calls emit 200 activity rows plus the summary, dropped 50", async () => {
+ const r = await scenario({ checker: async ({ usage, activity }) => {
+  await usage(initFrame);
+  for (let i = 0; i < 250; i++) settleRead(activity, "id" + i, "f" + i + ".ts");
+  await usage(resultFrame);
+  return verdict;
+ } });
+ assert.equal(r.events.filter((e) => e === "check_activity").length, 200);
+ assert.equal(r.landed.at(-1)!.payload.dropped, 50);
+ assert.equal(r.landed.at(-1)!.payload.complete, true);
+ assert.deepEqual(r.calls.filter((x) => x !== "messages"), ["verdict:approve", "terminal:completed"]);
+ assertClosedThenFenced(r, "completed");
+});
+
+const summaryPost = (msgs: any[]) => msgs.some((m) => m.payload.event === "check_activity_summary");
+const sleepMs = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+it("checker delivery: a 413 on a single usage frame is a tombstone and fails the check model_error", async () => {
+ const r = await scenario({ post: (msgs) => {
+  if (msgs.some((m) => m.payload.event === "init")) throw new RequestError("POST", "/messages", 413, "{}");
+ }, checker: async ({ usage }) => { await usage(initFrame); await usage(resultFrame); return verdict; } });
+ assert.deepEqual(r.calls.filter((x) => x !== "messages"), ["verdict:failed:model_error", "terminal:failed"]);
+ assert.ok(r.landed.some((m) => m.payload.event === "message_truncated"));
+ assertClosedThenFenced(r, "failed");
+});
+
+it("checker delivery: a slow summary post cannot turn a finished verdict into a model timeout", async () => {
+ const r = await scenario({ modelTimeoutMs: 300,
+  post: async (msgs) => { if (summaryPost(msgs)) await sleepMs(400); },
+  checker: async ({ usage }) => { await usage(initFrame); await sleepMs(100); await usage(resultFrame); return verdict; } });
+ assert.deepEqual(r.calls.filter((x) => x !== "messages"), ["verdict:approve", "terminal:completed"]);
+ assertClosedThenFenced(r, "completed");
+});
+
+it("checker delivery: an expired deadline stops the runner before the checker runs and reports incomplete capture, not 0 reads complete", async () => {
+ let invoked = false;
+ const r = await scenario({ deadlineInMs: -1000, checker: async () => { invoked = true; return verdict; } });
+ assert.equal(invoked, false);
+ assert.deepEqual(r.events, ["check_activity_start", "check_activity_summary"]);
+ assert.equal(r.landed.at(-1)!.payload.complete, false);
+ assert.deepEqual(r.calls.filter((x) => x !== "messages"), ["verdict:failed:model_timeout", "terminal:failed"]);
+});
+
+it("checker delivery: a checker that throws unavailable before the model starts reports incomplete capture", async () => {
+ const r = await scenario({ preModelFailure: true, checker: async () => { throw new CrossCheckCheckerUnavailableError(); } });
+ assert.equal(r.events.at(-1), "check_activity_summary");
+ assert.equal(r.landed.at(-1)!.payload.complete, false);
+ assert.deepEqual(r.landed.at(-1)!.payload.reads, { ok: 0, denied: 0, oversize: 0, limit: 0, error: 0 });
+});
+
+it("checker delivery: the paused model timer never re-arms past deadline_at", async () => {
+ const r = await scenario({ modelTimeoutMs: 5000, deadlineInMs: 300,
+  post: async (msgs) => { if (summaryPost(msgs)) await sleepMs(400); },
+  checker: async ({ usage }) => { await usage(initFrame); await sleepMs(100); await usage(resultFrame); return verdict; } });
+ assert.deepEqual(r.calls.filter((x) => x !== "messages"), ["verdict:failed:model_timeout", "terminal:failed"]);
+ assertClosedThenFenced(r, "failed");
+});
+
+it("checker delivery: a checker_unavailable failure keeps its reason when the close is slow", async () => {
+ const r = await scenario({ modelTimeoutMs: 150,
+  post: async (msgs) => { if (summaryPost(msgs)) await sleepMs(300); },
+  checker: async ({ usage }) => { await usage(initFrame); await sleepMs(20); throw new CrossCheckCheckerUnavailableError(); } });
+ assert.deepEqual(r.calls.filter((x) => x !== "messages"), ["verdict:failed:checker_unavailable", "terminal:failed"]);
+});
+
+it("checker delivery: a stale-claim return closes the batcher, posts its rows and sends no terminal state", async () => {
+ const r = await scenario({ running: (n) => (n >= 1 ? { applied: false, staleClaim: true } : { applied: true }),
+  checker: async ({ usage }) => { await usage(initFrame); await usage(resultFrame); return verdict; } });
+ assert.deepEqual(r.events, ["check_activity_start", "init", "result", "check_activity_summary"]);
+ assert.deepEqual(r.calls.filter((x) => x !== "messages"), []);
+});
+
+it("checker delivery: a stale refusal inside the checker returns from catch, and finally still closes the batcher", async () => {
+ const r = await scenario({ checker: async ({ usage, activity }) => {
+  await usage(initFrame);
+  settleRead(activity, "r1", "a.ts");
+  await usage(resultFrame);
+  throw new RequestError("POST", "/messages", 409, JSON.stringify({ disposition: "stale_claim" }));
+ } });
+ assert.deepEqual(r.events, ["check_activity_start", "init", "check_activity", "result", "check_activity_summary"]);
+ assert.deepEqual(r.calls.filter((x) => x !== "messages"), []);
+});
+
+it("checker delivery: a tripped batcher alone, with every usage frame delivered, fails the check model_error", async () => {
+ // Only the summary post is fatal: usage seqs are delivered, so only isTripped() can reject it.
+ const r = await scenario({ post: (msgs) => {
+  if (summaryPost(msgs)) throw new RequestError("POST", "/messages", 401, "{}");
+ }, checker: async ({ usage }) => { await usage(initFrame); await usage(resultFrame); await sleepMs(80); return verdict; } });
+ assert.deepEqual(r.landed.map((m) => m.payload.event), ["check_activity_start", "init", "result"]);
+ assert.deepEqual(r.calls.filter((x) => x !== "messages"), ["verdict:failed:model_error", "terminal:failed"]);
+});
+
+it("checker delivery: a usage frame only journaled to the outbox fails the check model_error", async () => {
+ // Seqs: 1 marker, 2 init, 3 result. The init frame's only delivery evidence is the journal.
+ const spy = mock.method(MessageBatcher.prototype, "journalOnlySeqs", () => ({ seqs: new Set<number>([2]), overflow: false }));
+ try {
+  const r = await scenario({ checker: async ({ usage }) => { await usage(initFrame); await usage(resultFrame); return verdict; } });
+  assert.deepEqual(r.calls.filter((x) => x !== "messages"), ["verdict:failed:model_error", "terminal:failed"]);
+ } finally { spy.mock.restore(); }
+});
+
+it("checker delivery: a journal-only activity row with usage delivered leaves the verdict standing", async () => {
+ const spy = mock.method(MessageBatcher.prototype, "journalOnlySeqs", () => ({ seqs: new Set<number>([1]), overflow: false }));
+ try {
+  const r = await scenario({ checker: async ({ usage }) => { await usage(initFrame); await usage(resultFrame); return verdict; } });
+  assert.equal(r.calls.filter((x) => x !== "messages")[0]?.startsWith("verdict:failed"), false);
+ } finally { spy.mock.restore(); }
+});
+
+it("checker delivery: a journal-only overflow alone fails the check model_error", async () => {
+ const spy = mock.method(MessageBatcher.prototype, "journalOnlySeqs", () => ({ seqs: new Set<number>(), overflow: true }));
+ try {
+  const r = await scenario({ checker: async ({ usage }) => { await usage(initFrame); await usage(resultFrame); return verdict; } });
+  assert.deepEqual(r.calls.filter((x) => x !== "messages"), ["verdict:failed:model_error", "terminal:failed"]);
+ } finally { spy.mock.restore(); }
+});
+
+it("checker delivery: a tombstone-set overflow alone fails the check model_error", async () => {
+ const spy = mock.method(MessageBatcher.prototype, "tombstonedSeqs", () => ({ seqs: new Set<number>(), overflow: true }));
+ try {
+  const r = await scenario({ checker: async ({ usage }) => { await usage(initFrame); await usage(resultFrame); return verdict; } });
+  assert.deepEqual(r.calls.filter((x) => x !== "messages"), ["verdict:failed:model_error", "terminal:failed"]);
+ } finally { spy.mock.restore(); }
 });

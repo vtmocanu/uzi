@@ -79,6 +79,10 @@ export const mockWorkers: Worker[] = [
     upgrade_last_exit_code: null,
     last_heartbeat_at: daysAgo(2),
     online_since: null, // offline → no uptime anchor
+    // The api's in-process memory-authority gate (issue #3142) is independent of the
+    // worker's heartbeat, so the pill demo rides on this worker: not quarantined, and not
+    // one of the custody fixtures (w-laptop, w-nas).
+    memory_authority_lost_at: minsAgo(12),
     created_at: daysAgo(21),
     // Offline → its last-known cgroup sample renders dimmed, never live-looking.
     stats_cpu_pct: 12,

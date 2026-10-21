@@ -9,7 +9,9 @@ fixture() {
   RUNROOT="$SCRATCH" PROJECT=fixture COMPOSE=(fake_compose) OUTBOX_BASE_COMPOSE=(fake_compose) OUTBOX_RESTORE_NEEDED=0 RUN_B1=00000000-0000-0000-0000-000000000001
   API_AVAILABLE=1 API_PAUSED=0 ALIAS_AVAILABLE=0 REFUSE_API=0 REFUSE_ALIAS=0 REFUSE_REMOVE=0
   BARRIER_ARMED=0 BARRIER_RELEASED=0 FIXTURE_FINISHED=0 SLOW_HELPER=0
-  RESTORING=0
+  RESTORING=0 PROJECTION_FAIL=0
+  # Host limiter fixture: records the bound it was given, then runs the command.
+  timeout() { printf 'limit %s\n' "$1" >> "$SCRATCH/calls"; shift; "$@"; }
   export UZI_E2E_RECOVERY_FAST_REDRIVE=1
   storage_diagnostic_snapshot() {
     case "$1" in
@@ -41,7 +43,16 @@ fixture() {
         [ "$REFUSE_REMOVE" = 0 ] || return 1; ALIAS_AVAILABLE=0 ;;
       logs) echo fixture-evidence ;;
       restart) [ "$BARRIER_RELEASED:$FIXTURE_FINISHED" = 1:0 ] || fail 'restart preceded the guarded terminal outage' ;;
-      exec) [ "$API_AVAILABLE" = 0 ] || fail 'barrier released before API stop';
+      exec)
+        # Evidence projection: run the REAL script on the host against the scratch data root,
+        # standing in for the agent container's /data. Matched before the barrier-writer checks.
+        if [ "${2:-}:${3:-}:${4:-}:${5:-}:${6:-}:${7:-}:${8:-}" = -T:-u:0:agent:timeout:15:node ] \
+          && [ "${11:-}" = /data ]; then
+          [ "$PROJECTION_FAIL" = 0 ] || return 1
+          node --input-type=module - "$SCRATCH/data" "${@:12}"
+          return
+        fi
+        [ "$API_AVAILABLE" = 0 ] || fail 'barrier released before API stop';
         if [ "${3:-}:${4:-}" = agent:test ]; then
           [ "$BARRIER_RELEASED" = 1 ] || fail 'finalize file checked before barrier release'
           return 0
@@ -75,7 +86,7 @@ fixture() {
       .tmpfs == ["/data:size=1m","/nix:size=1m"]' "$OUTBOX_DNS_OVERRIDE" >/dev/null \
       || fail 'placeholder must be idle, phase-scoped and authority-free'
   }
-  eval "$(awk '/^(configure_outbox_api_alias|start_outbox_api_alias|remove_outbox_api_alias|recreate_outbox_api|recreate_outbox_agent|api_cut|release_outbox_cut_barrier|api_back|restore_outbox_resolution|restore_outage_state|f42_cut)\(\) \{/,/^\}/' "$PHASE")"
+  eval "$(awk '/^(configure_outbox_api_alias|start_outbox_api_alias|remove_outbox_api_alias|recreate_outbox_api|recreate_outbox_agent|api_cut|release_outbox_cut_barrier|api_back|restore_outbox_resolution|save_outbox_agent_evidence|restore_outage_state|f42_cut)\(\) \{/,/^\}/' "$PHASE")"
 }
 # Extract the real helper; the old name lets the same assertions demonstrate the
 # regression against the pre-change phase rather than failing during setup.
@@ -154,6 +165,102 @@ else [ "$?" = 7 ]; fi
 awk 'index($0,"force-recreate api") { api=1 } index($0,"force-recreate agent") { agent=1 }
   index($0,"rm -s -f -v outbox-api-placeholder") { removed=1 } END { exit(api && agent && removed ? 0 : 1) }' "$SCRATCH/calls"
 echo 'PASS: failure trap restores defaults and removes the placeholder'
+# Cleanup evidence: a failing fixture receipt wait must still leave both agent logs and both
+# allowlisted recovery-record projections, captured before the agent is recreated.
+phase_run=00000000-0000-0000-0000-000000000001
+foreign_run=00000000-0000-0000-0000-000000000099
+capture_id=22222222-2222-4222-8222-222222222222
+rm -rf "$SCRATCH/artifacts" "$SCRATCH/data"
+: > "$SCRATCH/calls"
+mkdir -p "$SCRATCH/data/recovery/$phase_run" "$SCRATCH/data/recovery/$foreign_run"
+cat > "$SCRATCH/data/recovery/$phase_run/$capture_id.json" <<JSON
+{"generation":4,"state":"uploaded","reason":"final_retry_refused","inventoryGuarded":true,
+ "finalRequest":{"body":"SECRET_FINAL_BODY"},"mac":"SECRET_MAC_VALUE","bundlePath":"/data/SECRET_BUNDLE_PATH",
+ "sourceSha":"$(printf 'e%.0s' $(seq 40))"}
+JSON
+echo '{"generation":77,"state":"pinned","reason":"foreign_reason"}' > "$SCRATCH/data/recovery/$foreign_run/$capture_id.json"
+rc=0
+(
+  fixture
+  configure_outbox_api_alias
+  eval "$(awk '/^trap .*restore_outage_state/ { print }' "$PHASE")"
+  eval "$(awk '/^resolve_fixture_source_hold\(\) \{/,/^\}/' "$ROOT/e2e/lib.sh")"
+  # shellcheck disable=SC2034  # read by the extracted real helper
+  ADMIN_EMAIL=fixture@example.com
+  hold_id=b4dec5cf-e6d4-413b-b3a8-0005a2835770
+  sleep() { SECONDS=$((SECONDS + 1)); }
+  apiget() {
+    case "$1" in
+      /api/recovery/holds) jq -nc --arg run "$RUN_B1" --arg id "$hold_id" \
+        '{holds:[{id:$id,run_id:$run,generation:1,state:"open",inventory_guarded:true,attention:"source_only",
+          has_available_capture:true,capture_state:"available"}]}' ;;
+      "/api/runs/$RUN_B1/archives") echo '{"archives":[{"id":"kept","state":"available","checksum":"stable","byte_size":12}]}' ;;
+      "/api/runs/$RUN_B1") jq -nc --arg run "$RUN_B1" '{run:{id:$run,status:"cancelled"}}' ;;
+      *) fail 'unexpected fixture receipt route' ;;
+    esac
+  }
+  db_psql() {
+    jq -nc --arg run "$RUN_B1" --arg id "$hold_id" \
+      '{run_id:$run,run_status:"cancelled",holds:[{id:$id,run_id:$run,generation:1,inventory_guarded:true,
+        state:"open",final_disposition:null,release_evidence:null,captures:[{state:"available"}]}]}'
+  }
+  api_cut
+  resolve_fixture_source_hold "$RUN_B1" 1 1
+) > "$SCRATCH/evidence.log" 2>&1 || rc=$?
+[ "$rc" != 0 ] || { echo 'FAIL: receipt timeout did not fail the subshell'; exit 1; }
+grep -F 'fixture archive custody receipt timeout' "$SCRATCH/evidence.log" >/dev/null
+art="$SCRATCH/artifacts/52-api-outage-outbox"
+for f in agent-before-api-restore.log agent-before-agent-recreate.log \
+  recovery-records-before-api-restore.jsonl recovery-records-before-agent-recreate.jsonl; do
+  [ -s "$art/$f" ] || { echo "FAIL: missing cleanup evidence $f"; exit 1; }
+done
+for label in before-api-restore before-agent-recreate; do
+  jq -se --arg run "$phase_run" --arg cap "$capture_id" \
+    'any(.[]; .run_id==$run and .capture_id==$cap and .state=="uploaded" and .reason=="final_retry_refused"
+      and .generation==4 and .final_request_present==true and .authenticated==false)' \
+    "$art/recovery-records-$label.jsonl" >/dev/null || { echo "FAIL: projection $label lacks the phase run record"; exit 1; }
+  if grep -E "$foreign_run|foreign_reason|SECRET_|eeeeeeee|/data/" "$art/recovery-records-$label.jsonl" >/dev/null; then
+    echo "FAIL: projection $label leaked foreign or secret data"; exit 1
+  fi
+done
+awk 'index($0, "exec -T -u 0 agent timeout 15 node --input-type=module - /data") { n++; if (!agent) before++; if (prev == "limit 20") bounded++ }
+  index($0, "force-recreate agent") { agent=1 } { prev=$0 }
+  END { exit(n == 2 && before == 2 && bounded == 2 && agent ? 0 : 1) }' "$SCRATCH/calls" \
+  || { echo 'FAIL: projection did not run twice before agent recreation'; exit 1; }
+echo 'PASS: failing receipt wait still saves agent logs and allowlisted recovery projections before agent recreation'
+# A failing projection exec is a warning only: cleanup must still recreate api and agent, and
+# save_outbox_agent_evidence itself must return 0 (the phase runs under errexit).
+: > "$SCRATCH/calls"
+(
+  fixture
+  configure_outbox_api_alias
+  PROJECTION_FAIL=1
+  save_outbox_agent_evidence probe || { echo 'FAIL: evidence returned nonzero on failed projection'; exit 1; }
+  OUTBOX_RESTORE_NEEDED=1
+  restore_outbox_resolution
+) > "$SCRATCH/projfail.log" 2>&1 || { echo 'FAIL: failed projection aborted cleanup'; cat "$SCRATCH/projfail.log"; exit 1; }
+grep -F 'recovery record projection failed (before-api-restore)' "$SCRATCH/projfail.log" >/dev/null \
+  || { echo 'FAIL: missing projection failure warning'; exit 1; }
+grep -F 'force-recreate api' "$SCRATCH/calls" >/dev/null && grep -F 'force-recreate agent' "$SCRATCH/calls" >/dev/null \
+  || { echo 'FAIL: cleanup did not recreate api and agent after projection failure'; exit 1; }
+echo 'PASS: failed projection warns, evidence returns 0 and cleanup still recreates api and agent'
+# No host timeout/gtimeout: the projection is skipped (never run unbounded) and evidence returns 0.
+: > "$SCRATCH/calls"
+nohost_bin="$SCRATCH/nohost-bin"
+mkdir -p "$nohost_bin" "$SCRATCH/artifacts/52-api-outage-outbox"
+ln -s "$(command -v mkdir)" "$nohost_bin/mkdir"
+(
+  fixture
+  unset -f timeout
+  PATH="$nohost_bin"
+  save_outbox_agent_evidence probe || { echo 'FAIL: evidence returned nonzero without host timeout'; exit 1; }
+) > "$SCRATCH/nohost.log" 2>&1 || { echo 'FAIL: missing host timeout aborted evidence'; cat "$SCRATCH/nohost.log"; exit 1; }
+grep -F 'recovery record projection skipped, no timeout command (probe)' "$SCRATCH/nohost.log" >/dev/null \
+  || { echo 'FAIL: missing no_host_timeout warning'; exit 1; }
+grep -F no_host_timeout "$SCRATCH/artifacts/52-api-outage-outbox/recovery-records-probe.jsonl" >/dev/null \
+  || { echo 'FAIL: missing no_host_timeout marker'; exit 1; }
+! grep -F 'exec -T -u 0 agent' "$SCRATCH/calls" >/dev/null || { echo 'FAIL: projection ran without a host limiter'; exit 1; }
+echo 'PASS: absent host timeout skips the projection with a marker and returns 0'
 fixture
 configure_outbox_api_alias
 restore_outbox_resolution
@@ -278,4 +385,4 @@ done
   jq -e '.description | contains("UZI_STUB_OUTBOX_CUT_BARRIER")' "$SCRATCH/issue.json" >/dev/null
 )
 echo 'PASS: real issue producer arms first-claim and every-execution barriers distinctly'
-echo 'cases=21 passed=21'
+echo 'cases=24 passed=24'

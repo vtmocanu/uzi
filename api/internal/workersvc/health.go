@@ -14,6 +14,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
@@ -126,10 +128,11 @@ const (
 	reasonHandoffSetup = "handoff setup has not finished"
 	// reasonStaleRequeuePinPrefix opens both expected owner-hold reasons: stale requeue
 	// (#2705) and draining or maintenance (#3000). Unlike its fixed
-	// siblings it embeds values (the deadline and the worker name), so it is matched by prefix
-	// (isStaleRequeuePinReason), and ListWaitingWorkerRuns and ListOwnersWaitingNoCapacity carry
+	// siblings they embed values (the deadline and the worker name). isStaleRequeuePinReason
+	// matches their fixed segments; ListWaitingWorkerRuns and ListOwnersWaitingNoCapacity carry
 	// the same literal in SQL (pinned in sync by a workersvc test,
-	// TestStaleRequeuePinPrefixMatchesListWaitingWorkerRunsSQL).
+	// TestStaleRequeuePinPrefixMatchesListWaitingWorkerRunsSQL). The fixed previous-worker
+	// segment and terminal suffixes distinguish both holds from the code cross-check wait.
 	reasonStaleRequeuePinPrefix = "waiting until "
 	// reasonAllWorkersBusy (PRD #216) distinguishes a saturated fleet from an idle
 	// queue: every online worker is at its advertised run-lane cap, so this run is
@@ -240,6 +243,12 @@ const (
 	// plan-checker child (it checks a Codex lead) when the only capability the owner's fleet
 	// lacks is cross_check_codex_lead_v1, which ClaimRun requires for that child.
 	reasonNoCrossCheckCodexLeadCapableWorker = "no online worker supports Codex-lead plan cross-check (cross_check_codex_lead_v1); update or provision a capable worker"
+	// PRD #1230: a semantic-enrolled run's plan-stage checker child needs cross_check_semantic_plan_v1
+	// and a semantic-enrolled lead needs completion_semantic_publication_v1; both are ClaimRun
+	// clauses outside required_capabilities. A checker with no capable worker stays unclaimable until
+	// its deadline, then takes the existing deadline-to-human path (never a structural fallback).
+	reasonNoSemanticPlanCheckerCapableWorker = "no online worker supports semantic plan cross-check (cross_check_semantic_plan_v1); update or provision a capable worker"
+	reasonNoSemanticPublicationCapableWorker = "no online worker supports semantic completion publication (completion_semantic_publication_v1); update or provision a capable worker"
 	// reasonWaitingIsolatedLane (PRD #1906 M5) is the queued reason for a PROFILE-BOUND run: only
 	// a worker the api provisions into the isolated lane can claim it (ClaimRun's two-way lane
 	// clause), so no ordinary worker reason applies. Maps to the SAME healthWaitingWorker enum.
@@ -314,10 +323,11 @@ const (
 	// pendingOutcomeFlagHeartbeats heartbeat intervals. It maps to the SAME healthStalled enum as
 	// reasonOutboxQueued, is a warning only, and never touches the lease or authorizes a reclaim,
 	// fail or discard. Same fixed-string contract as its siblings.
-	reasonOutcomeUndelivered    = "the run's outcome is journaled on its worker but has not been delivered"
-	reasonPlanCrossCheckWaiting = "waiting for plan cross-check"
-	reasonNoCrossCheckWorker    = "no eligible cross-check worker"
-	reasonCrossCheckSlotsBusy   = "waiting for a cross-check slot"
+	reasonOutcomeUndelivered          = "the run's outcome is journaled on its worker but has not been delivered"
+	reasonCodeCrossCheckWaitingSuffix = " for code cross-check"
+	reasonPlanCrossCheckWaiting       = "waiting for plan cross-check"
+	reasonNoCrossCheckWorker          = "no eligible cross-check worker"
+	reasonCrossCheckSlotsBusy         = "waiting for a cross-check slot"
 	// reasonLongToolCall (issue #2046) flags a running run whose oldest open lead tool call
 	// (delegation dispatches excluded) has been in flight longer than health_tool_call_seconds
 	// while the run itself has gone quiet. It maps to healthStalled, NOT healthSlow: slow
@@ -484,10 +494,10 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		if isStaleRequeuePinReason(reason) {
 			nudge = false
 		}
-		// A live plan cross-check is expected waiting. A worker-pickup nudge would
+		// A live plan or code cross-check is expected waiting. A worker-pickup nudge would
 		// describe its already-running lead incorrectly, even with no checker capacity.
 		// Preserve the existing notification stamp and cooldown for ordinary health episodes.
-		if reason == reasonPlanCrossCheckWaiting || reason == reasonCrossCheckSlotsBusy || reason == reasonNoCrossCheckWorker {
+		if isCodeCrossCheckWaitingReason(reason) || reason == reasonPlanCrossCheckWaiting || reason == reasonCrossCheckSlotsBusy || reason == reasonNoCrossCheckWorker {
 			nudge = false
 		}
 		since := healthSince(now, target, r)
@@ -599,8 +609,12 @@ type livePlanCrossCheckReader interface {
 	HasLivePlanCrossCheck(context.Context, uuid.UUID) (bool, error)
 }
 
+type liveCodeCrossCheckReader interface {
+	GetLiveCodeCrossCheckDeadline(context.Context, store.GetLiveCodeCrossCheckDeadlineParams) (pgtype.Timestamptz, error)
+}
+
 // runningTarget computes the flag for a running run, priority persist-looping >
-// tool-looping > live plan cross-check > stalled > long tool call > near-timeout (Decision 3, extended by
+// tool-looping > live plan cross-check > live code cross-check > stalled > long tool call > near-timeout (Decision 3, extended by
 // PRD #108 M4, #1170 D5 and issue #2046): looping is the strongest evidence of
 // pathology, and near-timeout is a budget-relative backstop that must not mask a
 // more specific signal.
@@ -673,6 +687,21 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 					}
 				}
 				return healthWaitingWorker, reasonPlanCrossCheckWaiting
+			}
+		}
+	}
+
+	if runkind.CodeCrossCheckable(r.Kind) {
+		if reader, ok := s.q.(liveCodeCrossCheckReader); ok {
+			deadline, err := reader.GetLiveCodeCrossCheckDeadline(ctx, store.GetLiveCodeCrossCheckDeadlineParams{
+				LeadRunID: r.ID, ServerNow: pgconv.Time(now),
+			})
+			if err != nil {
+				if !errors.Is(err, pgx.ErrNoRows) {
+					slog.Error("health: read live code cross-check", "run_id", r.ID, "error", err)
+				}
+			} else if deadline.Valid && deadline.InfinityModifier == pgtype.Finite && deadline.Time.After(now) {
+				return healthWaitingWorker, "waiting until " + deadline.Time.UTC().Format(time.RFC3339) + reasonCodeCrossCheckWaitingSuffix
 			}
 		}
 	}
@@ -1310,6 +1339,21 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 			return reasonNoJobCapableWorker
 		}
 	}
+	// PRD #1230: a semantic-enrolled lead or its plan-stage checker child whose owner has NO online
+	// worker with the matching semantic capability is unplaceable; the lookup is optional (fakes) and
+	// a read error falls through to the generic reasons.
+	if sq, ok := s.q.(interface {
+		GetRunSemanticHealth(context.Context, store.GetRunSemanticHealthParams) (store.GetRunSemanticHealthRow, error)
+	}); ok {
+		sem, serr := sq.GetRunSemanticHealth(ctx, store.GetRunSemanticHealthParams{RunID: r.ID, UserID: r.UserID})
+		if serr != nil {
+			slog.Error("health: read semantic enrollment", "run_id", r.ID, "error", serr)
+		} else if sem.PlanCheckerEnrolled && sem.PlanCheckerCapable == 0 {
+			return reasonNoSemanticPlanCheckerCapableWorker
+		} else if sem.LeadEnrolled && r.Kind != runkind.CrossCheck && sem.PublicationCapable == 0 {
+			return reasonNoSemanticPublicationCapableWorker
+		}
+	}
 	// All protocol requirements must be present on one worker. A separate count for each
 	// capability can falsely report a split fleet as capable.
 	if r.CompletionContractVersion.Valid && (r.Harness == harnessCodex || r.CodexMaterialRevision.Valid || r.CodexSecretID.Valid) {
@@ -1832,9 +1876,17 @@ func staleRequeuePinReason(until time.Time, workerName string) string {
 
 // isStaleRequeuePinReason matches BOTH expected owner holds: stale requeue and
 // draining/maintenance. The existing name is retained for the shared lifecycle.
-// Prefix-matched because both reasons embed the deadline and worker name.
+// Match the producers' fixed segments around their deadline and worker name, so the
+// code cross-check wait, which shares the "waiting until " prefix, is not an owner hold.
 func isStaleRequeuePinReason(reason string) bool {
-	return strings.HasPrefix(reason, reasonStaleRequeuePinPrefix)
+	return strings.HasPrefix(reason, reasonStaleRequeuePinPrefix) &&
+		strings.Contains(reason, " for its previous worker") &&
+		(strings.HasSuffix(reason, " to return; another worker may take it after that") ||
+			strings.HasSuffix(reason, " to finish draining or maintenance; another worker may take it after that"))
+}
+
+func isCodeCrossCheckWaitingReason(reason string) bool {
+	return strings.HasPrefix(reason, "waiting until ") && strings.HasSuffix(reason, reasonCodeCrossCheckWaitingSuffix)
 }
 
 // healthSince decides the health_since to write. It stamps now when a flag is raised

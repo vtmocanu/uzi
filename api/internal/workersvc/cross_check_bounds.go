@@ -71,6 +71,11 @@ func ValidateCrossCheckClaim(payload *ClaimPayload) error {
 		input.GuidanceDigest != "" || input.RepoInstructionsDigest != "" || input.RepoInstructionsText != "" {
 		return ErrCrossCheckRefused
 	}
+	if input.CandidateIdentityVersion != "" || input.SemanticCandidate != nil {
+		if input.Stage != "plan" || validateSemanticCheckerCandidate(input.PlanCrossCheckCandidate, digest) != nil {
+			return ErrCrossCheckRefused
+		}
+	}
 	_, err = crossCheckCandidateInput(store.CrossCheck{
 		Stage: input.Stage, Round: input.Round, LeadRunID: leadID,
 		HeadCommit:  pgtype.Text{String: input.HeadCommit, Valid: input.HeadCommit != ""},
@@ -84,7 +89,7 @@ func ValidateCrossCheckClaim(payload *ClaimPayload) error {
 		BaseCommit:      pgtype.Text{String: input.BaseCommit, Valid: true},
 		PlanningDiff:    pgtype.Text{String: input.PlanningDiff, Valid: true},
 		CandidateDigest: digest, DeadlineAt: pgtype.Timestamptz{Time: input.DeadlineAt, Valid: true},
-	})
+	}, input.SemanticCandidate)
 	return err
 }
 
@@ -102,8 +107,15 @@ func MarshalCrossCheckClaim(payload *ClaimPayload) ([]byte, error) {
 		}
 		return nil, err
 	}
-	if payload.Kind == runkind.CrossCheck && len(raw) >= crossCheckEnvelopeBytes {
-		return nil, ErrCrossCheckRefused
+	if payload.Kind == runkind.CrossCheck {
+		limit := crossCheckEnvelopeBytes
+		// ValidateCrossCheckClaim has verified the complete candidate and digest.
+		if payload.CrossCheck.CandidateIdentityVersion == semanticIdentityVersion && payload.CrossCheck.SemanticCandidate != nil {
+			limit = 64 << 20
+		}
+		if len(raw) >= limit {
+			return nil, ErrCrossCheckRefused
+		}
 	}
 	return append(raw, '\n'), nil
 }

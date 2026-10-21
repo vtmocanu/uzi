@@ -31,6 +31,13 @@ import {
   worktreeDirFor,
 } from "./runner-harness.js";
 
+// The stopped-source / quiescence proofs (src/runner.ts "non_linux_host" refusal, src/run-quiescence.ts)
+// refuse off Linux, so a covered-clone verdict or recovery park never completes on macOS (#1912).
+// Linux runs every assertion.
+const LINUX_ONLY = process.platform !== "linux"
+  ? "needs the Linux-only run-quiescence / stopped-source proof (src/run-quiescence.ts, src/runner.ts refuse off Linux)"
+  : false;
+
 installHarness();
 
 // issue #1786 M1 — a flight that learns its claim is stale (a /state stale_claim ack, a steering
@@ -402,7 +409,7 @@ describe("RunRunner #1786 M1 — a flight that learns its claim is stale keeps i
   });
 
   for (const flavor of ["canonical", "attempt"] as const) {
-    it(`${flavor} clone, clean and fully fetched under this run's tracking ownership: coverage is only a diagnostic, the clone is kept and recorded`, async () => {
+    it(`${flavor} clone, clean and fully fetched under this run's tracking ownership: coverage is only a diagnostic, the clone is kept and recorded`, { skip: LINUX_ONLY }, async () => {
       const rl = recordingLogger();
       const rig = stopRig(17883 + (flavor === "attempt" ? 1 : 0), flavor, "stale", {
         cleanTree: true, log: rl.logger,
@@ -431,7 +438,7 @@ describe("RunRunner #1786 M1 — a flight that learns its claim is stale keeps i
   }
 
   for (const flavor of ["canonical", "attempt"] as const) {
-    it(`${flavor} clone, clean and fully fetched, but the final proof reaps a late writer: the clone is retained with the late bytes and the record is written`, async () => {
+    it(`${flavor} clone, clean and fully fetched, but the final proof reaps a late writer: the clone is retained with the late bytes and the record is written`, { skip: LINUX_ONLY }, async () => {
       const iid = 17890 + (flavor === "attempt" ? 1 : 0);
       const LATE = "written after the byte checks\n";
       let coveredCalls = 0;
@@ -466,7 +473,7 @@ describe("RunRunner #1786 M1 — a flight that learns its claim is stale keeps i
   }
 
   for (const flavor of ["canonical", "attempt"] as const) {
-    it(`${flavor} clone, clean and fully fetched, with a writer that wrote and exited before the final proof: a covered verdict never discards the clone`, async () => {
+    it(`${flavor} clone, clean and fully fetched, with a writer that wrote and exited before the final proof: a covered verdict never discards the clone`, { skip: LINUX_ONLY }, async () => {
       const iid = 17892 + (flavor === "attempt" ? 1 : 0);
       const LATE = Buffer.from([0x4c, 0x41, 0x54, 0x45, 0x00, 0xff, 0x10, 0x20]);
       let coveredCalls = 0;
@@ -973,7 +980,7 @@ describe("RunRunner #1786 M1 — a flight that learns its claim is stale keeps i
   });
 
   for (const dockerState of ["docker_error", "docker_unconfirmed"] as const) {
-    it(`attempt clone, clean and fully fetched, Docker half ${dockerState}: ${dockerState === "docker_error" ? "the coverage check is skipped and the clone is retained" : "the coverage check runs but is diagnostic only, the clone is retained"}`, async () => {
+    it(`attempt clone, clean and fully fetched, Docker half ${dockerState}: ${dockerState === "docker_error" ? "the coverage check is skipped and the clone is retained" : "the coverage check runs but is diagnostic only, the clone is retained"}`, { skip: dockerState === "docker_unconfirmed" ? LINUX_ONLY : false }, async () => {
       const requests: QuiesceRunRequest[] = [];
       const rig = stopRig(dockerState === "docker_error" ? 17968 : 17969, "attempt", "stale", {
         cleanTree: true,

@@ -160,9 +160,24 @@ describe("StatusPill", () => {
       label: "recovery wait", tone: "text-warn", pulse: false,
     },
     {
+      name: "base attestation missing hold (issue #3194)",
+      run: { status: "paused", hold_reason: "base_attestation_missing" },
+      label: "base unverified: owner hold", tone: "text-warn", pulse: false,
+    },
+    {
       name: "disabled credential",
       run: { status: "paused", hold_reason: "credential_disabled" },
       label: "waiting: credential disabled", tone: "text-warn", pulse: false,
+    },
+    {
+      name: "token switch settling",
+      run: { status: "paused", hold_reason: "credential_switch_settling" },
+      label: "settling: token switch", tone: "text-warn", pulse: false,
+    },
+    {
+      name: "token switch unsettled",
+      run: { status: "paused", hold_reason: "credential_switch_unsettled" },
+      label: "held: token switch", tone: "text-warn", pulse: false,
     },
     {
       name: "live running",

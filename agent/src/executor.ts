@@ -118,6 +118,7 @@ export type SecretRemediationDecision =
  * compatible. The runner populates them from the claim.
  */
 export interface RunContext {
+  semanticPlanning?: import("./semantic-plan.js").SemanticPlanning;
   /** Called after harness-specific home preparation, before any model invocation. */
   prepareCIEvidence?: () => Promise<import("./ci-evidence.js").PreparedCIEvidence>;
   ciEvidence?: import("./ci-evidence.js").PreparedCIEvidence;
@@ -346,8 +347,19 @@ export interface RunContext {
    *  reseed recovered a tree). It both relaxes the preApproved session guard and, crucially,
    *  extends the embedSeededPlan gate so the plan BODY reaches the first implement turn
    *  (a bare planApproved flip leaves seededPlanBody undefined and the model falls back to
-   *  the issue — the #209 M2 gap). Absent/false ⇒ today's behaviour, byte-for-byte. */
+   *  the issue — the #209 M2 gap). Issue #3178 adds a second, independent term to that gate
+   *  (a plan approved at the gate with no session to carry it), which does not use this flag.
+   *  Absent/false ⇒ today's behaviour, byte-for-byte. */
   reviewedPlanResume?: boolean;
+  /** Issue #3149: on a reviewedPlanResume the fresh session has none of the run's earlier owner
+   *  follow-ups. These are the ones earlier claims consumed (id order, trimmed), complete or
+   *  absent: the runner leaves this undefined, and drops reviewedPlanResume, when the history
+   *  could not be restored in full. The executor renders them (selectPriorOwnerHistory +
+   *  renderPriorOwnerHistory) on the first implement turn as historical context. */
+  priorOwnerFollowUps?: readonly { id: number; body: string }[];
+  /** Issue #3149: true when follow-up `id` reaches the lead live on this claim (steering
+   *  isLiveDeliveryId), so the history replay skips it by id and it is delivered once. */
+  isLiveFollowUpId?: (id: number) => boolean;
   /** PRD #759 M2: the reseed recovered an uncommitted WIP snapshot (a wip(park): marker
    *  reset --soft back to the working tree at adopt time), so the tree carries uncommitted
    *  mid-edit changes rather than a clean checkout. Set by the RUNNER from the runner clone.
@@ -399,6 +411,7 @@ export interface RunContext {
     milestones?: Milestone[],
     onPlanPersisted?: (planMd: string) => Promise<void>,
     settles?: number,
+    semanticSubmission?: import("./semantic-plan.js").SemanticSubmission,
   ): Promise<PlanVerdict>;
   /**
    * Issue #1604 (D3): a resumed, unapproved claim with a persisted plan calls this before it
@@ -953,6 +966,14 @@ export interface Executor {
    * an executor with no guarded lane. Absent on the stub/test and Codex executors.
    */
   settleWorkerCommands?(deadlineMs: number): Promise<{ confirmed: boolean }>;
+  /**
+   * issue #3181: wait, without bound and without starting, aborting or killing anything, for the
+   * operations this executor already owns and has running (the guarded lane disposal that
+   * killAgentTree started and the background JS-deps install). The runner calls it only on a
+   * flight whose retained credential switch could not prove those operations stopped, BEFORE the
+   * flight's shared slots are released. Never rejects. Absent on the stub/test and Codex executors.
+   */
+  joinOwnedOperations?(): Promise<void>;
   /**
    * issue #1830: drop the run's rebuildable HOME caches IN PLACE (run-caches.ts dropRunCaches), for
    * a run the hard disk layer cannot park (it waits at a gate, or is finalizing). Kills no process

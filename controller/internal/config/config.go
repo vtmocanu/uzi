@@ -277,9 +277,10 @@ type Config struct {
 	// WorkerDockerEphemeralRequest overrides the WORKER container's
 	// requests.ephemeral-storage for a DOCKER worker (issue #224 M-b;
 	// UZI_WORKER_DOCKER_EPHEMERAL_REQUEST). It REPLACES the plain value rather than
-	// adding to it. Empty ⇒ the render side's built-in 4Gi, which is larger than the
-	// plain default because a docker worker's run-workdir emptyDir carries the run's
-	// entire working tree while a plain worker's lives on the /data PVC.
+	// adding to it. Empty ⇒ the render side's built-in 5Gi (unless remeasured). The run
+	// working trees (/data/runner) are on the data PVC for BOTH tiers, so they are off
+	// node ephemeral storage; the docker tier's larger default covers its writable
+	// layers, container logs and the codex-cmd-cache emptyDir.
 	WorkerDockerEphemeralRequest string
 	// WorkerDockerMaxPVCStorage is the DOCKER tier's LimitRange maxPVCStorage
 	// (UZI_WORKER_DOCKER_MAX_PVC_STORAGE, issue #224). Separate from
