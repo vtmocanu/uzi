@@ -76,6 +76,7 @@ import {
   type TickSpawnerTestHooks,
 } from "./tick-spawner.js";
 import { skillsPluginDir } from "./skills-plugin.js";
+import { captureFailureOf, EpochCleanupUnprovenError, type CodexExecutionSafety } from "./harness.js";
 import { CodexTurnFailedError } from "./codex/terminal-normalize.js";
 import { describeLimit, LimitReachedError } from "./limit.js";
 import type { Logger } from "./log.js";
@@ -572,6 +573,9 @@ type RecoveryParkCause =
   | { kind: "transient" }
   | { kind: "vault_locked" | "refresh_unknown" | "account_unavailable" | "credential_release_unavailable" }
   | { kind: "data_volume_full"; preventive: boolean };
+
+/* Exact local revocation from assertHeldFreeCapture, distinct from an arbitrary refusal. */
+class FreeCaptureScopeExpired extends TrustedExecutionRefusal {}
 
 /** Runner-local capability, valid only inside its matching flight's callback. */
 interface HeldFreeCapture {
@@ -1079,7 +1083,7 @@ const GUARDED_COMMAND_SETTLE_MS = GUARDED_LANE_JOIN_MS;
  * retained work. Local, like TerminalReportError / StaleClaimError.
  */
 class RetainedRecoveryStop extends Error {
-  constructor() { super("retained recovery stopped; custody retained"); }
+  constructor(options?: ErrorOptions) { super("retained recovery stopped; custody retained", options); }
 }
 
 class RetainedRecoveryCancelled extends RetainedRecoveryStop {}
@@ -1868,6 +1872,8 @@ type SourceGenesis = Readonly<{
 }>;
 
 interface RunFlight {
+  /** Exact facade of an incomplete owner-pause capture; never cleanup or resume authority. */
+  refusedPauseCaptureSafety?: CodexExecutionSafety;
   sourceInherited?: ClosedSourceObservation;
   sourceFamilyMatched?: boolean;
   sourceBlockingNormal?: boolean;
@@ -3809,11 +3815,21 @@ export class RunRunner {
       // later owner pause. Hand off only after its original work truly settles.
       const memoryYieldsToPause = this.canYieldMemoryToOwnerPause(flight, failure);
       if (memoryYieldsToPause) this.retainWorkerMemoryCustody(flight);
-      const err = flight.workerMemory?.hold !== undefined
+      let err = flight.workerMemory?.hold !== undefined
         ? memoryYieldsToPause ? new PauseNowSignal() : new RetainedRecoveryStop()
         : flight.owedLimitStop !== undefined && !flight.steering?.isCancelled() &&
         !flight.active?.shuttingDown && flight.steering?.claimFence() === undefined
         ? flight.owedLimitStop : failure;
+      if (err instanceof EpochCleanupUnprovenError &&
+          err.safety === flight.refusedPauseCaptureSafety &&
+          !flight.steering.isCancelled() && flight.steering.claimFence() === undefined) {
+        // Cleanup can finish after newer steering arrives. Route that exact authority
+        // first; otherwise stop nonterminal without re-capturing the poisoned epoch.
+        const authority = flight.steering.checkpointAuthoritySignal();
+        if (flight.steering.getPauseMode() === "disk") err = new DiskParkSignal(false);
+        else if (authority.aborted) err = authority.reason;
+        else err = new RetainedRecoveryStop({ cause: err });
+      }
       // PRD #35: a usage-limit death is not an ordinary failure. Handled before the
       // generic path below because that path is terminal in both senses — it reports
       // `failed` and it lets the finally erase the session this run wants to resume from.
@@ -14400,9 +14416,11 @@ export class RunRunner {
   }
 
   private assertHeldFreeCapture(flight: RunFlight, held: HeldFreeCapture): void {
-    if (this.freeCaptureFlights.get(held) !== flight ||
-        held.signal?.aborted || Date.now() >= held.deadlineAt) {
+    if (this.freeCaptureFlights.get(held) !== flight) {
       throw new TrustedExecutionRefusal("credential-free capture scope unavailable");
+    }
+    if (held.signal?.aborted || Date.now() >= held.deadlineAt) {
+      throw new FreeCaptureScopeExpired("credential-free capture scope unavailable");
     }
   }
 
@@ -17309,11 +17327,18 @@ export class RunRunner {
     pausedAt: { completedCount: number; total?: number },
     options: { origin: "lead_park" | "owner"; deadlineAt?: number },
   ): Promise<boolean> {
+    const refusedSafety = flight.executor.safety;
     const deadlineAt = options.deadlineAt ?? Date.now() + this.codexBoundaryDeadlineMs;
     return this.runGatedSink(flight, async () => {
       // Only this invocation's exact paused ACK survives a later capture refusal.
       // flight.parked may already be set by a different operation.
       let pauseAcknowledged = false;
+      let refusalReported = false;
+      const reportRefusal = (residueBlocked: boolean, residueState?: string, signal?: AbortSignal) => {
+        if (refusalReported) return Promise.resolve(false as const);
+        refusalReported = true;
+        return this.reportPauseCaptureFailed(flight, residueBlocked, residueState, signal);
+      };
       const retainAcknowledgedPause = (error?: unknown): true => {
         flight.sourceJoinFailed = true;
         flight.preserveRecoveryClone = true;
@@ -17331,22 +17356,56 @@ export class RunRunner {
       };
       try {
         const result = await this.runFreeCapture(claim, flight, deadlineAt, this.shutdownSignal.signal,
-          held => this.handlePauseParkHeld(claim, flight, held, pausedAt, options.origin, () => { pauseAcknowledged = true; }));
+          held => this.handlePauseParkHeld(claim, flight, held, pausedAt, options.origin, () => { pauseAcknowledged = true; }, reportRefusal));
         if (result.kind === "observed_empty") return result.value;
       } catch (error) {
         flight.sourceJoinFailed = true;
-        if (!pauseAcknowledged) throw error;
-        // runFreeCapture has joined scope cleanup; this preserves the pause, not capture proof.
-        return retainAcknowledgedPause(error);
+        if (pauseAcknowledged) {
+          // runFreeCapture has joined scope cleanup; this preserves the pause, not capture proof.
+          return retainAcknowledgedPause(error);
+        }
+        // Newer lifecycle authority wins even when capture cleanup also failed.
+        this.shutdownSignal.signal.throwIfAborted();
+        if (flight.steering.getPauseMode() === "disk") throw new DiskParkSignal(false);
+        flight.steering.checkpointAuthoritySignal().throwIfAborted();
+        const capture = captureFailureOf(error);
+        if (!capture || !isCodexBoundaryError(error)) throw error;
+        let primary: unknown;
+        try {
+          const action = Object.getOwnPropertyDescriptor(error, "actionError");
+          if (!action || !("value" in action)) throw error;
+          primary = action.value;
+        } catch { throw error; }
+        if (primary instanceof StaleClaimError || primary instanceof DiskParkSignal ||
+            primary instanceof CredentialSwitchSignal || codexDeferralOf(primary) !== undefined) {
+          // Preserve exact control identity for the outer runner catch, without
+          // replacing its cause or adding cleanup fields to the control.
+          try {
+            flight.runLog.warn("pause park: capture cleanup failed during lifecycle control", {
+              run_id: flight.runId,
+              diagnostic: flight.redactText
+                ? redactThenSanitize(flight.redactText, codexBoundaryDiagnosticOf(error) ?? "capture completion unverified")
+                : "capture completion unverified",
+            });
+          } catch { /* Diagnostics must not replace the lifecycle control. */ }
+          throw primary;
+        }
+        if (capture.externallyAborted || (!capture.deadlineExpired && !capture.childCleanupFailed) ||
+            (primary !== undefined && !(primary instanceof FreeCaptureScopeExpired))) throw error;
       }
       if (pauseAcknowledged) return retainAcknowledgedPause();
+      // Cooperative owner pause is already latched; only newer authority revocation wins here.
+      this.shutdownSignal.signal.throwIfAborted();
+      if (flight.steering.getPauseMode() === "disk") throw new DiskParkSignal(false);
+      flight.steering.checkpointAuthoritySignal().throwIfAborted();
       flight.sourceJoinFailed = true;
       flight.preserveRecoveryClone = true;
       flight.preserveSession = true;
       flight.runLog.warn("pause park: capture scope unavailable; the run continues", {
         run_id: flight.runId,
       });
-      return this.reportPauseCaptureFailed(flight, false);
+      flight.refusedPauseCaptureSafety = refusedSafety;
+      return reportRefusal(false);
     });
   }
 
@@ -17401,6 +17460,7 @@ export class RunRunner {
   private async handlePauseParkHeld(
     claim: ClaimResponse, flight: RunFlight, held: HeldFreeCapture,
     pausedAt: { completedCount: number; total?: number }, origin: "lead_park" | "owner", onPausedAck: () => void,
+    reportRefusal: (residueBlocked: boolean, residueState?: string, signal?: AbortSignal) => Promise<false>,
   ): Promise<boolean> {
     this.assertHeldFreeCapture(flight, held);
     const { runLog, reportState, batcher } = flight;
@@ -17417,6 +17477,7 @@ export class RunRunner {
     // The clone is not flagged preserveRecoveryClone here: the run keeps running, and its terminal
     // retire runs its own quiescence gate before removing anything.
     const pauseQuiescence = await this.quiesceRun(flight, flight.executor, { mode: "own", site: "pause_park" });
+    this.assertHeldFreeCapture(flight, held);
     let residueBlocked = pauseQuiescence.blocked;
     let residueState = pauseQuiescence.outcome.process?.state;
 
@@ -17447,6 +17508,7 @@ export class RunRunner {
     let preservationRefused = false;
     if (!residueBlocked && barePath && branch && runnerClone) {
       markerCreated = await this.git.commitWipMarker(runnerClone.path).catch(() => { flight.sourceJoinFailed = true; return false; });
+      this.assertHeldFreeCapture(flight, held);
       // issue #1783 (auditor M1): the marker's status/add/commit can start an agent-planted filter
       // AFTER the proof above. Re-prove before the fetch-back and the publish; a blocked re-proof
       // takes the same Decision-8 path as a blocked first proof (pause_failed, the marker undone).
@@ -17455,6 +17517,7 @@ export class RunRunner {
         site: "pause_park:after_runner_git",
         processOnly: true,
       });
+      this.assertHeldFreeCapture(flight, held);
       if (reproof.blocked) {
         residueBlocked = true;
         residueState = reproof.outcome.process?.state;
@@ -17464,6 +17527,7 @@ export class RunRunner {
       const preTip = await this.git
         .branchTip(runnerClone.path, branch)
         .catch(() => { flight.sourceJoinFailed = true; return null; });
+      this.assertHeldFreeCapture(flight, held);
       let fetched: FetchBackOutcome = { kind: "updated" }; // ownership is checked even without a fetch
       if (preTip !== null && (preTip !== runnerClone.baseCommit ||
           runnerClone.seededFrom === "tracking" || runnerClone.seededFrom === "checkpoint")) {
@@ -17475,6 +17539,7 @@ export class RunRunner {
           runLog,
         );
       }
+      this.assertHeldFreeCapture(flight, held);
       if (fetched.kind !== "updated") flight.sourceJoinFailed = true;
       if (fetched.kind === "refused" || !await this.trackingOwned(
         flight, barePath, branch, fetched.kind === "updated" ? preTip ?? undefined : undefined,
@@ -17482,7 +17547,9 @@ export class RunRunner {
         this.preservationRefused(flight, "ownership_unknown");
         preservationRefused = true;
       }
+      this.assertHeldFreeCapture(flight, held);
       holdsLatest = !preservationRefused && await this.trackingHoldsLatest(fetched, barePath, runnerClone.path, branch);
+      this.assertHeldFreeCapture(flight, held);
       // PRD #1416 M3 (C7): bridge a divergent tracking tip BEFORE the pause-park publish so a resume
       // adopts B (the rewritten work), not the published tip. handlePausePark is checkpoint-first and
       // does NOT route through the doCheckpointPublish/reapForSink machinery C1/C5/C6 cover, so it is
@@ -17490,6 +17557,7 @@ export class RunRunner {
       // this one placement covers both. Best-effort — a park must never throw (D4).
       if (!preservationRefused) {
         const bridge = await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "pause-park");
+        this.assertHeldFreeCapture(flight, held);
         if (bridge.kind === "preservation_refused") preservationRefused = true;
         if (bridge.kind !== "clean" && bridge.kind !== "bridged") flight.sourceJoinFailed = true;
       }
@@ -17512,6 +17580,7 @@ export class RunRunner {
             .branchTip(runnerClone.path, branch)
             .catch(() => { flight.sourceJoinFailed = true; return null; })
         : null;
+      this.assertHeldFreeCapture(flight, held);
       if (cloneTip !== null && cloneTip === flight.lastPublishedTip) {
         published = true;
         // The clone's tip is the one a prior publish confirmed landed: the checkpoint holds it.
@@ -17535,6 +17604,7 @@ export class RunRunner {
     }
 
     if (!published) {
+      this.assertHeldFreeCapture(flight, held);
       // The run CONTINUES (Decision 8), so a wip(park): marker we just made must not stay committed
       // at the clone HEAD: it would ride into the eventual MR and the restarted turn would build on a
       // throwaway commit. Restore its content to the uncommitted tree, the same shape the resume
@@ -17542,9 +17612,10 @@ export class RunRunner {
       if (markerCreated && runnerClone) {
         await this.git.undoWipMarker(runnerClone.path).catch(() => { flight.sourceJoinFailed = true; });
       }
-      return this.reportPauseCaptureFailed(flight, residueBlocked, residueState, held.signal);
+      return reportRefusal(residueBlocked, residueState, held.signal);
     }
 
+    this.assertHeldFreeCapture(flight, held);
     // PRD #1809 D8: a published pause checkpoint older than the clone's HEAD is reported as such.
     // The pause still parks: its custody handling is unchanged (the pin below; the hold settles on
     // the resume-terminal or the reconciler).

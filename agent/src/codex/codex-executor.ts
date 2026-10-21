@@ -105,6 +105,7 @@ import { installJsDeps, prepareSupervisedInstall, DEFAULT_INSTALL_TIMEOUT_MS, MA
 import { startDepsInstall, reportDepsInstall } from "../js-deps-provision.js";
 import {
   evidencesModelProcessing,
+  EpochCleanupUnprovenError,
   type BoundaryRequest,
   type BoundaryProcessRequest,
   type CodexExecutionSafety,
@@ -3580,7 +3581,7 @@ export class CodexExecutor implements Executor {
         // including completed-capture evidence at its unchanged poison revision.
         await old.dispose();
         if (this.unverifiedEpochRegistries.has(old.registry)) {
-          throw new TrustedExecutionRefusal("prior Codex epoch cleanup unproven");
+          throw new EpochCleanupUnprovenError(old.safety);
         }
         epoch = await this.startProviderEpoch(ctx, shared, lastSessionId, epochNamespace, ++epochIndex, { persistAfterLaunchOnly: true });
         this.safety = epoch.safety;

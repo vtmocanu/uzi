@@ -105,7 +105,7 @@ import { makeGitRepo, PR_SUMMARY_EXPECTED, PR_SUMMARY_INPUT } from "./pr-summary
 import type { Logger } from "../src/log.js";
 import type { DockerWiring } from "../src/docker-wiring.js";
 import type { AgentTemplate, MilestoneProgress } from "../src/protocol.js";
-import type { BoundaryRequest, BoundaryPermit } from "../src/harness.js";
+import { EpochCleanupUnprovenError, type BoundaryRequest, type BoundaryPermit } from "../src/harness.js";
 import type { CodexExecutionSafetyImpl } from "../src/codex/safety.js";
 import type {
   CacheCleanupResult,
@@ -21081,8 +21081,10 @@ describe("A capture lifecycle public run", () => {
 
   // SF1: original executor -> original RunRunner context callbacks, never a capture substitute.
   for (const route of ["seed-now", "seed-milestone", "immediate", "milestone", "pre-turn"] as const) {
-    for (const outcome of (route.startsWith("seed-") ? ["accepted"] : ["accepted", "declined", "withdrawn"]) as readonly ("accepted" | "declined" | "withdrawn")[]) {
+    for (const outcome of (route.startsWith("seed-") ? ["accepted"] : route === "immediate"
+      ? ["accepted", "declined", "withdrawn", "capture-expired", "capture-expired-foreign", "capture-expired-cancel"] : ["accepted", "declined", "withdrawn"]) as readonly ("accepted" | "declined" | "withdrawn" | "capture-expired" | "capture-expired-foreign" | "capture-expired-cancel")[]) {
       it(`SF1 real public pause ${route} ${outcome}`, async t => {
+        const captureExpired = outcome.startsWith("capture-expired");
         const diagnostics = recordingLog();
         const tmp = mock.method(os, "tmpdir", () => path.resolve("../.uzi/scratch"));
         let repo: ReturnType<typeof makeFixture>;
@@ -21099,7 +21101,11 @@ describe("A capture lifecycle public run", () => {
         const sourceEntered = installerBarrier(), sourceRelease = installerBarrier();
         let rootClean = false, savedGeneration = "", savedContent = "";
         let context: RunContext | undefined, worktree = "", region = false, parks = 0;
-        let authAtEntry = 0, launchesAtEntry = 0, regionClosed = false, accepted = false;
+        let authAtEntry = 0, launchesAtEntry = 0, regionClosed = false;
+        let accepted: boolean | undefined;
+        let expireCapture: (() => void) | undefined;
+        let pauseSafety: CodexExecutionSafetyImpl | undefined;
+        const providerRegistries: ExecutionRegistry[] = [];
         const roots = new Map<RegisteredRoot, boolean>();
         const register = ExecutionRegistry.prototype.registerRoot;
         const reap = ExecutionRegistry.prototype.reapRoot;
@@ -21107,6 +21113,7 @@ describe("A capture lifecycle public run", () => {
           this: ExecutionRegistry, ...args: Parameters<ExecutionRegistry["registerRoot"]>
         ) {
           const result = register.apply(this, args);
+          if (result.ok && args[1].kind === "provider") providerRegistries.push(this);
           if (result.ok && region && args[1].kind === "boundary_action") roots.set(args[1], false);
           return result;
         });
@@ -21172,7 +21179,7 @@ describe("A capture lifecycle public run", () => {
             generation: 3 + i, chatgpt_account_id: "verified-account", chatgpt_plan_type: null },
         })));
         api.setOwnershipStatus(claim.run_id, "running", 1);
-        if (outcome !== "accepted") api.failStateWhen(claim.run_id, b => b.status === "paused",
+        if (outcome !== "accepted" && !captureExpired) api.failStateWhen(claim.run_id, b => b.status === "paused",
           outcome === "withdrawn" ? { httpStatus: 409, runStatus: "running" } : { httpStatus: 400 });
         let milestoneAck = false;
         api.stateAckWire = (body, run) => {
@@ -21256,11 +21263,41 @@ describe("A capture lifecycle public run", () => {
               docker: { state: "not_wired", removed: [], detail: "not wired" },
             }),
           });
+        let pauseFlight: Parameters<typeof runner["handlePausePark"]>[1] | undefined;
+        if (outcome === "capture-expired-foreign" || outcome === "capture-expired-cancel") {
+          const run = fx.exec.run.bind(fx.exec);
+          t.mock.method(fx.exec, "run", async (...args: Parameters<typeof run>) => {
+            try { return await run(...args); }
+            catch (error) {
+              assert.ok(error instanceof EpochCleanupUnprovenError, "actual epoch guard rejected after disposal");
+              assert.equal(error.safety, pauseSafety, "guard names the exact failed epoch");
+              assert.ok(pauseFlight);
+              assert.equal(pauseFlight.refusedPauseCaptureSafety, pauseSafety);
+              if (outcome === "capture-expired-cancel") pauseFlight.steering.markCancelled();
+              else {
+                const foreign = createCodexExecutionSafety(new ExecutionRegistry(newLocalExecutionEpoch(285299)), async () => { throw new Error("unused foreign root"); }, async () => { throw new Error("unused foreign reconcile"); });
+                assert.notEqual(foreign, pauseSafety);
+                throw new EpochCleanupUnprovenError(foreign);
+              }
+              throw error;
+            }
+          });
+        }
         const park = runner["handlePausePark"].bind(runner);
         runner["handlePausePark"] = async (...args) => {
           assert.equal(args[1].executor, fx.exec);
           assert.ok(context);
+          pauseFlight = args[1];
           parks++; region = true;
+          pauseSafety = fx.exec.safety as CodexExecutionSafetyImpl;
+          if (captureExpired) {
+            // Drive the real safety timer while its real publication action is held.
+            // No alternate executor/capture result and no completion proof are supplied.
+            pauseSafety["seams"].armDeadline = (_request, _ms, fire) => {
+              expireCapture = fire;
+              return () => {};
+            };
+          }
           authAtEntry = api.codexRequests.length; launchesAtEntry = fx.rig.providerLaunches();
           try { accepted = await park(...args); return accepted; }
           finally {
@@ -21291,10 +21328,31 @@ describe("A capture lifecycle public run", () => {
             await beforeEnd(withdrawalApplied.promise);
             assert.equal(context!.pauseModeRequested!(), null, "actual steering consumed withdrawal after drain");
           }
-          sourceRelease.resolve(); packRelease.resolve();
+          sourceRelease.resolve();
+          if (captureExpired) {
+            await beforeEnd(packEntered.promise);
+            assert.ok(expireCapture, "production capture armed its deadline");
+            expireCapture();
+          }
+          packRelease.resolve();
           if (outcome === "accepted") {
             await execution;
             assert.equal(api.states.at(-1)?.body.status, "paused", "actual runner receives accepted paused ACK");
+          } else if (captureExpired) {
+            await execution;
+            assert.equal(regionClosed, true);
+            assert.equal(accepted, false, "real runner returns refusal after post-entry expiry");
+            assert.equal(pauseSafety!.completedCaptureForTeardown(), undefined, "expiry never mints clean completion");
+            assert.equal(fx.rig.providerLaunches(), 1, "unverified poisoned epoch cannot launch a provider");
+            assert.equal(providerRegistries.length, 1);
+            assert.equal(api.codexRequests.length, authAtEntry, "unverified old teardown cannot release a credential");
+            assert.equal(await fx.generation(), savedGeneration);
+            assert.equal(await fx.saved(), savedContent);
+            assert.equal(api.states.filter(s => s.body.status === "pause_failed").length, 1);
+            assert.equal(api.states.some(s => s.body.status === "failed"), outcome !== "capture-expired",
+              outcome === "capture-expired-foreign" ? "foreign facade guard remains an ordinary failure"
+                : outcome === "capture-expired-cancel" ? "newer cancellation retains generic cancellation dispatch"
+                  : "refused pause with unverified cleanup retains a nonterminal run");
           } else {
             await beforeEnd(successor.promise);
             assert.equal(regionClosed, true);
@@ -21302,6 +21360,9 @@ describe("A capture lifecycle public run", () => {
             assert.equal(fx.rig.providerLaunches(), 2, "decline after drain creates a fresh provider epoch");
             assert.equal(api.codexRequests.length, authAtEntry + 1, "fresh successor legitimately releases a credential after caller return");
             assert.notEqual(fx.homes[0], fx.homes[1]);
+            assert.equal(providerRegistries.length, 2);
+            assert.notEqual(providerRegistries[0], providerRegistries[1], "production constructs a new registry");
+            assert.equal(providerRegistries[0]!.state(), "disposed", "verified old teardown precedes successor work");
             assert.equal(fx.adopted[0], savedContent, "fresh epoch adopts exact persisted rollout bytes");
             const resume = fx.rig.epochs[1]!.transport.requests.find(r => r.method === "thread/resume");
             assert.equal(rec(resume!.params).threadId, thread);

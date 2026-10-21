@@ -25,7 +25,42 @@ import {
   type RegisteredRoot,
   type RootKind,
 } from "../src/codex/registry.js";
-import type { BoundaryPermit, BoundaryRequest, BoundaryStep } from "../src/harness.js";
+import { captureFailureOf, type BoundaryPermit, type BoundaryRequest, type BoundaryStep } from "../src/harness.js";
+
+for (const origin of ["deadline", "external", "both"] as const) {
+  it(`R2 capture provenance distinguishes ${origin} and retains primary/cause`, async () => {
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(2852));
+    let expire!: () => void;
+    const external = new AbortController();
+    const primary = new Error("capture primary sentinel", { cause: new Error("original cause") });
+    const safety = createCodexExecutionSafety(registry, spawnCounter().seam, undefined, undefined,
+      async () => assert.fail("no child requested"),
+      (_request, _ms, fire) => { expire = fire; return () => {}; });
+    await assert.rejects(safety.withCredentialFreeCapture(1000, async context => {
+      if (origin !== "external") expire();
+      if (origin !== "deadline") external.abort(primary);
+      assert.equal(context.signal.aborted, true);
+      if (origin === "external") assert.equal(context.signal.reason, primary);
+      throw primary;
+    }, external.signal), (error: unknown) => {
+      assert.ok(error instanceof CodexBoundaryError);
+      assert.equal(error.actionError, primary);
+      assert.equal(error.cause, primary);
+      assert.deepEqual(captureFailureOf(error), {
+        deadlineExpired: origin !== "external", childCleanupFailed: false, externallyAborted: origin !== "deadline",
+      });
+      assert.equal(Object.isFrozen(captureFailureOf(error)), true);
+      assert.equal(captureFailureOf(JSON.parse(JSON.stringify(error))), undefined, "JSON cannot mint capture provenance");
+      assert.equal(error.errors[0]?.category, origin === "deadline" ? "timeout" : "authorization");
+      assert.equal(registry.state(), "poisoned");
+      assert.equal(safety.completedCaptureForTeardown(), undefined);
+      assert.equal(Object.keys(error).includes("deadlineExpired"), false, "provenance is not an error wire field");
+      return true;
+    });
+    const arbitrary = new CodexBoundaryError("action", [{ category: "timeout", message: "codex capture deadline expired" }], primary);
+    assert.equal(captureFailureOf(arbitrary), undefined, "matching text cannot mint capture provenance");
+  });
+}
 
 // PRD #1171 (M3 m1, first unit) — the CodexExecutionSafety facade and the trusted
 // boundary-action lane. All process work is injected; nothing real is spawned.

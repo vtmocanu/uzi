@@ -18,6 +18,7 @@ for (const [window, ackMode, origin] of [
   ["healthy", "paused", "owner"], ["ACK", "paused", "owner"], ["head", "paused", "owner"],
   ["pin", "paused", "owner"], ["cleanup", "paused", "owner"],
   ["ACK", "missing", "owner"], ["ACK", "declined", "owner"], ["ACK", "uncertain", "owner"],
+  ["cleanup", "missing", "owner"], ["cleanup", "declined", "owner"], ["cleanup", "uncertain", "owner"],
   ["ACK", "previous-park", "owner"],
   ["healthy", "paused", "lead_park"], ["ACK", "paused", "lead_park"], ["ACK", "declined", "lead_park"],
 ] as const satisfies readonly (readonly [Window, Ack, "owner" | "lead_park"])[]) {
@@ -28,6 +29,7 @@ for (const [window, ackMode, origin] of [
     const releases = new Set<() => void>();
     let wake: (() => void) | undefined;
     let closed = false, done = false, returned = false, expired = false;
+    let cleanupArmed = false;
     let acked = false, requests = 0, injected = false, cleanupJoined = false;
     let clone = "", inode = 0, head = "", result: boolean | undefined, rejection: unknown;
     let snapshot: unknown, auth = { refresh: 0, release: 0 };
@@ -43,7 +45,7 @@ for (const [window, ackMode, origin] of [
     const rig = codexRig({
       armDeadline: deadline.armDeadline,
       boundaryProcess: async request => {
-        if (window !== "cleanup" || !acked || injected) return undefined;
+        if (window !== "cleanup" || (!acked && !cleanupArmed) || injected) return undefined;
         injected = true;
         // Execute only the real trusted Git request, with its original cwd/env.
         // A successful primary exit is distinct from full-root cleanup.
@@ -91,7 +93,7 @@ for (const [window, ackMode, origin] of [
       try {
         result = origin === "owner" ? await ctx.parkForPause!(at) : (await ctx.requestParkRun!(at)).kind === "paused";
       }
-      catch (error) { rejection = error; if (ackMode === "paused") throw error; }
+      catch (error) { rejection = error; throw error; }
       finally { returned = true; }
       assert.equal(rig.registry.state(), "poisoned", "accepted/refused capture keeps safety poisoned before terminal dispose");
       if (window === "healthy") {
@@ -116,8 +118,11 @@ for (const [window, ackMode, origin] of [
       snapshot = await recovery.inspect(claim.run_id);
       assert.ok(Array.isArray(snapshot) && snapshot.length > 0, "real authenticated recovery journal exists before expiry");
     };
-    if (origin === "lead_park")
+    if (origin === "lead_park") {
       t.mock.method(client, "requestWorkerPause", async () => ({ applied: true, status: "running" as const }));
+      t.mock.method(internal, "getObservedRunOwnership", async () => ({ status: "running", claim_generation: 1, claim_released: false }));
+      t.mock.method(internal, "parkQuestion", async () => ({ kind: "answer", answers: ["continue with the work"] }));
+    }
     const report = client.reportState.bind(client);
     t.mock.method(client, "reportState", async (...args: Parameters<typeof report>) => {
       if (args[1].status !== "paused") return report(...args);
@@ -131,6 +136,12 @@ for (const [window, ackMode, origin] of [
       }
       acked = ackMode === "paused";
       if (window === "ACK") await hold("ACK");
+      if (window === "cleanup" && ackMode !== "paused") {
+        cleanupArmed = true;
+        // A real capture child completes its primary exit but refuses full-root cleanup.
+        // Keep that independent cleanup evidence even though the ACK itself is declined.
+        await originalTip(clone, "agent/issue-2852").catch(() => null);
+      }
       if (ackMode === "uncertain") throw new Error("R1 accepted reply lost in transport");
       if (ackMode === "missing") return { ...ack, status: undefined } as unknown as typeof ack;
       if (ackMode === "declined" || ackMode === "previous-park") return { ...ack, status: "running", applied: false };
@@ -172,7 +183,7 @@ for (const [window, ackMode, origin] of [
           assert.equal(returned, false, "public pause stays pending behind external event");
           assert.equal(done, false, "execute tail stays pending behind external event");
           assert.ok(deadline.armed() > 0, "actual checkpoint capture deadline armed");
-          expired = true; deadline.fire();
+          if (window !== "cleanup" || ackMode === "paused") { expired = true; deadline.fire(); }
           await tick();
           assert.equal(returned, false, "expiry does not abandon held action or cleanup");
           assert.equal(done, false, "execute cannot release its tail before cleanup joins");
@@ -208,9 +219,21 @@ for (const [window, ackMode, origin] of [
           assert.ok(cleanupJoined, "refused full-root cleanup joined");
         }
       } else {
-        assert.notEqual(result, true, "missing/declined/uncertain ACK and pre-existing parked never qualify");
+        assert.equal(result, false, "missing/declined/uncertain ACK and pre-existing parked are refused");
+        assert.equal(rejection, undefined, "expected post-entry capture failure never rejects the public callback");
+        assert.equal(captureFlight.sourceJoinFailed, true);
+        assert.equal(captureFlight.preserveRecoveryClone, true);
+        assert.equal(captureFlight.preserveSession, true);
+        assert.equal(fs.statSync(clone).ino, inode);
+        assert.equal(fs.readFileSync(path.join(clone, "PUBLIC.txt"), "utf8"), bytes);
+        assert.equal(fs.readFileSync(path.join(homeDir, "owner-session"), "utf8"), "R1 exact session");
+        assert.equal(statuses(claim.run_id).includes("failed"), false);
+        assert.ok(statuses(claim.run_id).filter(s => s === "pause_failed").length <= 1);
+        assert.ok(api.messages(claim.run_id).filter(m => m.kind === "pause_failed").length <= 1);
+        assert.deepEqual(protectedAfterExpiry, [], "no source access after revocation");
+        if (window === "cleanup") assert.ok(injected && cleanupJoined);
         assert.equal(requests, ackMode === "previous-park" ? 2 : 1);
-        assert.equal(deadline.fired(), 1);
+        assert.equal(deadline.fired(), window === "cleanup" ? 0 : 1);
       }
       assert.equal(rig.registry.state(), "disposed", "execute disposes safety without reopening it");
       let called = false;

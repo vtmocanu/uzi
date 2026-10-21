@@ -3,9 +3,45 @@ import { it } from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import { api, client, git, homeDir, fakeGitlab, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
-import { FakeCodexExecutor, codexRig, statuses } from "./runner-codex-sinks-fixture.js";
+import { FakeCodexExecutor, codexRig, manualDeadline, statuses } from "./runner-codex-sinks-fixture.js";
 
 installHarness();
+
+it("R2 expiry after WIP entry does not read source, recapture, or undo the marker", async t => {
+  const deadline = manualDeadline("checkpoint");
+  const rig = codexRig({ armDeadline: deadline.armDeadline });
+  let expired = false, captures = 0;
+  const callsAfterExpiry: string[] = [];
+  const marker = git.commitWipMarker.bind(git);
+  t.mock.method(git, "commitWipMarker", async (...args: Parameters<typeof marker>) => {
+    if (expired) callsAfterExpiry.push("commitWipMarker");
+    const created = await marker(...args);
+    assert.equal(created, true);
+    expired = true;
+    deadline.fire();
+    return created;
+  });
+  for (const method of ["worktreeStatus", "worktreeHead", "branchTip", "undoWipMarker"] as const) {
+    const original = git[method].bind(git);
+    t.mock.method(git, method, async (...args: unknown[]) => {
+      if (expired) callsAfterExpiry.push(method);
+      return Reflect.apply(original, git, args);
+    });
+  }
+  const exec = new FakeCodexExecutor(rig.safety, async ctx => {
+    fs.writeFileSync(path.join(ctx.worktreePath, "R2-WIP.txt"), "exact work before expiry");
+    assert.equal(await ctx.parkForPause!({ completedCount: 1 }), false);
+    assert.deepEqual(callsAfterExpiry, []);
+    assert.equal(captures, 1, "refusal cannot recapture to replace failed completion evidence");
+    return { branch: ctx.branch, pausedAt: { completedCount: 1 } };
+  }, rig.settle, (...args) => { captures++; return rig.capture(...args); });
+  const runner = runnerWith(() => ({ executor: exec, homeDir }), fakeGitlab().gitlab,
+    undefined, undefined, { checkpointIntervalMs: 0 });
+  const claim = { ...gitlabClaim(2852), claim_generation: 1, park_run_supported: true };
+  await runner.execute(claim);
+  assert.deepEqual(statuses(claim.run_id).filter(s => s === "failed"), []);
+  assert.equal(api.states.filter(s => s.body.status === "pause_failed").length, 1);
+});
 
 it("R2 no-scope incomplete pause reports publication refusal and preserves clone/session", async t => {
   const rig = codexRig();

@@ -21,7 +21,7 @@ import type { SdkAttemptEnv } from "../sdk-env.js";
 import { MaintenanceBudget } from "../maintenance-budget.js";
 import { assertCaptureRequest, createCaptureContext } from "../git.js";
 import { TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
-import { CheckpointChildStartupTimeoutError } from "../harness.js";
+import { CheckpointChildStartupTimeoutError, recordCaptureFailure } from "../harness.js";
 import type {
   BoundaryPermit,
   CredentialFreeCaptureContext,
@@ -540,12 +540,14 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       }
       const lane = this.registry.beginCapture(proof);
       const controller = new AbortController();
-      const abort = () => controller.abort();
+      let deadlineExpired = false;
+      const abort = () => controller.abort(signal?.reason);
+      const expire = () => { deadlineExpired = true; controller.abort(); };
       signal?.addEventListener("abort", abort, { once: true });
       const captureDeadlineAt = Math.min(deadlineAt, this.now() + remaining());
       const cancelDeadline = this.seams.armDeadline
-        ? this.seams.armDeadline({ boundary: "checkpoint", deadlineMs: remaining() }, remaining(), abort)
-        : defaultArmDeadline({ boundary: "checkpoint", deadlineMs: remaining() }, remaining(), abort);
+        ? this.seams.armDeadline({ boundary: "checkpoint", deadlineMs: remaining() }, remaining(), expire)
+        : defaultArmDeadline({ boundary: "checkpoint", deadlineMs: remaining() }, remaining(), expire);
       let active = true;
       let context!: CredentialFreeCaptureContext;
       context = createCaptureContext(controller.signal, captureDeadlineAt,
@@ -578,14 +580,20 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
           try { await this.pendingActions[i]; }
           catch { errors.push({ category: "tool", message: "capture child cleanup failed" }); }
         }
-        if (controller.signal.aborted || remaining() <= 0) {
+        const childCleanupFailed = errors.length > 0;
+        deadlineExpired ||= this.now() >= captureDeadlineAt;
+        if (signal?.aborted) {
+          errors.push({ category: "authorization", message: "codex capture authority revoked" });
+        } else if (deadlineExpired) {
           errors.push({ category: "timeout", message: "codex capture deadline expired" });
         }
         const completed = errors.length === 0 ? lane.complete() : undefined;
         if (!completed && errors.length === 0) errors.push({ category: "protocol", message: "capture completion proof invalidated" });
         if (errors.length) {
           this.registry.poison(errors);
-          throw new CodexBoundaryError("action", errors, outcome.ok ? undefined : outcome.error);
+          const error = new CodexBoundaryError("action", errors, outcome.ok ? undefined : outcome.error);
+          recordCaptureFailure(error, { deadlineExpired, childCleanupFailed, externallyAborted: signal?.aborted === true });
+          throw error;
         }
         this.lastCaptureCompletion = completed as CompletedCredentialFreeCapture;
         if (!outcome.ok) throw outcome.error;
