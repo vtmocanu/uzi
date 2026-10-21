@@ -586,6 +586,9 @@ test("per-uid scratch under a live writer: a mismatched owner is refused untouch
       assertSame(snapshot(leaf, isLive), before, `${which}: contents`);
       assert.ok(await growsPast(writer.file, size) > size, `${which}: the writer was neither stopped nor starved`);
       await stopWriters();
+      // The foreign writer's live.log stays foreign-owned; the adopted-leaf writer below appends to
+      // the same path as its own uid, so remove it first.
+      reclaimAndRemove(writer.file);
       spawnSync("/bin/chown", ["-h", original, leaf]);
     }
 

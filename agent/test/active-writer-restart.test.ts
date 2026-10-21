@@ -115,16 +115,18 @@ describe("a separate process keeps writing across a simulated worker restart (#3
 
     // Real procfs: the writer in the run directory is a survivor of a capture-mode scan, so a
     // quiescence proof over that path is not given. (selfPid is a pid that cannot exist, so the
-    // writer is not skipped as the scanner's own descendant.)
-    const request: ScanRequest = {
-      mode: "capture", targetUid: process.getuid!(), targetKey: path.join(repoDir, key),
-      targetPaths: [cloneDir], liveMarkers: [], liveRoots: [], workerNonce: "n3153",
-    };
-    const scan = scanOnce(request, procfsTable, 4_194_300);
-    assert.equal(scan.tableError, undefined);
-    assert.ok(scan.survivors.some((s) => s.pid === inRun.pid && s.reason === "unattributed_in_scope"),
-      `the live writer in the run directory is a survivor: ${JSON.stringify(scan)}`);
-    assert.deepEqual(scan.kill, [], "capture mode signals nothing");
+    // writer is not skipped as the scanner's own descendant.) procfs exists only on Linux.
+    if (process.platform === "linux") {
+      const request: ScanRequest = {
+        mode: "capture", targetUid: process.getuid!(), targetKey: path.join(repoDir, key),
+        targetPaths: [cloneDir], liveMarkers: [], liveRoots: [], workerNonce: "n3153",
+      };
+      const scan = scanOnce(request, procfsTable, 4_194_300);
+      assert.equal(scan.tableError, undefined);
+      assert.ok(scan.survivors.some((s) => s.pid === inRun.pid && s.reason === "unattributed_in_scope"),
+        `the live writer in the run directory is a survivor: ${JSON.stringify(scan)}`);
+      assert.deepEqual(scan.kill, [], "capture mode signals nothing");
+    }
 
     // Everything is still there and every writer is still alive and appending.
     for (const [i, w] of active.entries()) {
