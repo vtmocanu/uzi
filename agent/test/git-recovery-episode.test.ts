@@ -8,12 +8,12 @@ import { createHash } from "node:crypto";
 import { deflateSync } from "node:zlib";
 import { loadConfig } from "../src/config.js";
 import { RecoveryClosureLimitError } from "../src/recovery-closure.js";
-import { GitCache, RetainedRecoveryBlockedError } from "../src/git.js";
+import { GitCache, RetainedRecoveryBlockedError, type PositiveOwedCandidateContext, type RunnerClone } from "../src/git.js";
 import { recoveryProgress } from "../src/recovery-progress.js";
 import { BaseAttestationMissingError, evaluateRequiredBase } from "../src/runner.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, noProofReseed, testGitCacheOptions } from "./helpers.js";
-import { fixtureFetchTracking } from "./runner-tracking-fixture.js";
+import { fixtureFetchTracking, fixtureTrackingOptions } from "./runner-tracking-fixture.js";
 
 const branch = "agent/issue-2512";
 const key = "issue-2512";
@@ -1667,4 +1667,154 @@ test("issue #3194: an unmapped coverage wrapper is held by the --require-base de
     identityTree: git(bare, ["rev-parse", `${identity}^{tree}`]),
     materializedTree: git(successor.path, ["write-tree"]),
   }), BaseAttestationMissingError);
+});
+
+// ── issue #3194 acceptance: recovery-coverage shapes through the real journal and successor ─────
+//
+// Git-level: the real recordRecoveryCapture / prepareRecoverySuccessor build the RunnerClone, and
+// the --require-base decision reads it exactly as RunRunner's guard does (the adopted content source
+// or the raw adopted source, with the bare's commit tree and the successor INDEX tree). The runner
+// path that hands recordRecoveryCapture its authenticated mapping is not driven here.
+
+const IDENT3194 = ["-c", "user.name=t", "-c", "user.email=t@example.test", "-c", "commit.gpgsign=false"];
+
+/** The --require-base decision on a recovery successor, read exactly as RunRunner's guard reads it. */
+async function guardOn(successor: RunnerClone, planned: string, attested: string | undefined): Promise<"planned" | "attested"> {
+  const identity = successor.adoptedContentSource ?? successor.adoptedSource;
+  return evaluateRequiredBase({
+    plannedBase: planned,
+    identity,
+    attestedSource: attested,
+    continuation: successor.seededFrom === "tracking" || successor.seededFrom === "checkpoint",
+    wipCherryPicked: successor.wipCherryPicked === true,
+    planned: await cache.resolveCommitUnique(bare, planned),
+    identityTree: await cache.commitTreeOid(bare, identity),
+    materializedTree: await cache.indexTreeOid(successor.path),
+  });
+}
+
+/** A commit over `parent` with `parent`'s tree, distinguished by its message. */
+function sibling(parent: string, message: string): string {
+  return git(bare, [...IDENT3194, "commit-tree", `${parent}^{tree}`, "-p", parent, "-m", message]);
+}
+
+test("issue #3194 shape 5: a multi-batch coverage aggregate (more than 32 roots) maps to its source and is accepted", async () => {
+  const reservation = await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const tip = await capture();
+  const planned = git(bare, ["rev-parse", `${tip}^`]);
+  const roots = Array.from({ length: 40 }, (_, i) => sibling(planned, `owed root ${i}`));
+  const context = (await fixtureTrackingOptions(cache, bare, branch, runId)).context as PositiveOwedCandidateContext;
+  const coverage = await cache.buildRecoveryCoverage(bare, context, roots, tip);
+  assert.match(git(bare, ["log", "-1", "--format=%s", coverage.sha]), / round 1 batch 0$/, "sanity: the aggregate took a second round");
+  assert.equal(git(bare, ["rev-list", "--parents", "-n", "1", coverage.sha]).split(" ").includes(tip), false,
+    "sanity: the source is not a direct parent of the aggregate");
+  // The runner passes the authenticated record's current tip as the wrapper's source.
+  await cache.recordRecoveryCapture(bare, branch, key, source, reservation.attempts, coverage.sha, tip);
+  assert.equal(journal().recovery.restoreSource, tip, "the multi-round aggregate records its source");
+  const successor = await cache.prepareRecoverySuccessor(bare, branch, key, source, reservation.attempts, aid(2));
+  assert.equal(successor.adoptedSource, coverage.sha, "sanity: the clone was cut from the aggregate");
+  assert.equal(await guardOn(successor, planned, tip), "attested");
+});
+
+test("issue #3194 shape 6: a second capture after a pre-guard crash carries the source through the nested wrapper", async () => {
+  const first = await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const s = await capture();
+  const planned = git(bare, ["rev-parse", `${s}^`]);
+  const w1 = wrapperOver(s, planned);
+  await cache.recordRecoveryCapture(bare, branch, key, source, first.attempts, w1, s);
+  const crashed = await cache.prepareRecoverySuccessor(bare, branch, key, source, first.attempts, aid(2));
+  // The successor flight crashed before its guard; the next claim captures that successor again and
+  // its coverage wraps the previous wrapper.
+  const expected = { runId, clonePath: crashed.path, attemptId: aid(2) };
+  const second = await recreate().reserveRecoveryIteration(bare, branch, key, expected);
+  const w2 = wrapperOver(w1, sibling(planned, "second capture root"));
+  await cache.recordRecoveryCapture(bare, branch, key, expected, second.attempts, w2, w1);
+  assert.equal(journal().recovery.restoreTip, w2);
+  assert.equal(journal().recovery.restoreSource, s, "the verified prior association carries the source forward");
+  const successor = await cache.prepareRecoverySuccessor(bare, branch, key, expected, second.attempts, aid(3));
+  assert.equal(successor.adoptedContentSource, s);
+  assert.equal(await guardOn(successor, planned, s), "attested");
+});
+
+test("issue #3194 shape 6 negative: a broken chain (new unchecked commit under the second wrapper) is held", async () => {
+  const first = await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const s = await capture();
+  const planned = git(bare, ["rev-parse", `${s}^`]);
+  const w1 = wrapperOver(s, planned);
+  await cache.recordRecoveryCapture(bare, branch, key, source, first.attempts, w1, s);
+  const crashed = await cache.prepareRecoverySuccessor(bare, branch, key, source, first.attempts, aid(2));
+  // Before the crash, unchecked content was committed over the adopted wrapper.
+  fs.writeFileSync(path.join(crashed.path, "unchecked.txt"), "never checked\n");
+  git(crashed.path, ["add", "unchecked.txt"]);
+  git(crashed.path, [...IDENT3194, "commit", "-m", "unchecked"]);
+  const x = git(crashed.path, ["rev-parse", "HEAD"]);
+  await fixtureFetchTracking(cache, bare, crashed.path, branch, runId);
+  const expected = { runId, clonePath: crashed.path, attemptId: aid(2) };
+  const second = await recreate().reserveRecoveryIteration(bare, branch, key, expected);
+  const w2 = wrapperOver(x, sibling(planned, "second capture root"));
+  await cache.recordRecoveryCapture(bare, branch, key, expected, second.attempts, w2, x);
+  assert.equal(journal().recovery.restoreSource, x, "the source is not carried past a commit the chain does not vouch for");
+  const successor = await cache.prepareRecoverySuccessor(bare, branch, key, expected, second.attempts, aid(3));
+  await assert.rejects(guardOn(successor, planned, s), BaseAttestationMissingError);
+});
+
+test("issue #3194 coverage: a swapped mapping to another attested source with a different tree is held", async () => {
+  const reservation = await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const current = await capture();
+  const planned = git(bare, ["rev-parse", `${current}^`]);
+  // An earlier attested source the wrapper also covers, but whose tree is not the restored tree.
+  const earlier = sibling(planned, "earlier attested source");
+  assert.notEqual(git(bare, ["rev-parse", `${earlier}^{tree}`]), git(bare, ["rev-parse", `${current}^{tree}`]));
+  const wrapper = wrapperOver(current, earlier);
+  await cache.recordRecoveryCapture(bare, branch, key, source, reservation.attempts, wrapper, earlier);
+  const successor = await cache.prepareRecoverySuccessor(bare, branch, key, source, reservation.attempts, aid(2));
+  assert.equal(successor.adoptedContentSource, earlier, "sanity: the swapped mapping was recorded");
+  await assert.rejects(guardOn(successor, planned, earlier), BaseAttestationMissingError);
+});
+
+test("issue #3194 coverage: a capture or successor for another iteration is refused", async () => {
+  const reservation = await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const tip = await capture();
+  const before = journal();
+  await assert.rejects(cache.recordRecoveryCapture(bare, branch, key, source, reservation.attempts + 1, tip),
+    /capture iteration is not current/);
+  assert.deepEqual(journal(), before, "a swapped iteration journals nothing");
+  await cache.recordRecoveryCapture(bare, branch, key, source, reservation.attempts, tip);
+  await assert.rejects(cache.prepareRecoverySuccessor(bare, branch, key, source, reservation.attempts + 1, aid(2)),
+    /successor iteration is not current/);
+  assert.equal(journal().recovery.stage, "captured", "no successor was adopted for the swapped iteration");
+});
+
+test("issue #3194 coverage: extra unattested WIP inside the restore is held even when the mapping names the attested source", async () => {
+  const reservation = await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const s = await capture();
+  const planned = git(bare, ["rev-parse", `${s}^`]);
+  fs.writeFileSync(path.join(source.clonePath, "extra.txt"), "unattested WIP\n");
+  assert.equal(await cache.commitWipMarker(source.clonePath), true);
+  const marker = git(source.clonePath, ["rev-parse", "HEAD"]);
+  await fixtureFetchTracking(cache, bare, source.clonePath, branch, runId);
+  const wrapper = wrapperOver(marker, planned);
+  await cache.recordRecoveryCapture(bare, branch, key, source, reservation.attempts, wrapper, s);
+  const successor = await cache.prepareRecoverySuccessor(bare, branch, key, source, reservation.attempts, aid(2));
+  assert.equal(successor.adoptedContentSource, s, "sanity: the mapping names the attested source");
+  assert.equal(fs.readFileSync(path.join(successor.path, "extra.txt"), "utf8"), "unattested WIP\n",
+    "sanity: the extra WIP is in the restored clone");
+  await assert.rejects(guardOn(successor, planned, s), BaseAttestationMissingError);
+});
+
+test("issue #3194 coverage: a legacy journal without restoreSource leaves the wrapper unvouched and is held", async () => {
+  const reservation = await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const s = await capture();
+  const planned = git(bare, ["rev-parse", `${s}^`]);
+  const wrapper = wrapperOver(s, planned);
+  await cache.recordRecoveryCapture(bare, branch, key, source, reservation.attempts, wrapper, s);
+  // An older worker journaled the capture without the source binding.
+  const legacy = journal();
+  delete legacy.recovery.restoreSource;
+  writeJournal(legacy);
+  const successor = await cache.prepareRecoverySuccessor(bare, branch, key, source, reservation.attempts, aid(2));
+  assert.equal(successor.adoptedContentSource, undefined);
+  assert.equal(git(bare, ["rev-parse", `${wrapper}^{tree}`]), git(bare, ["rev-parse", `${s}^{tree}`]),
+    "sanity: the wrapper's tree equals the attested source's, so only the missing binding holds it");
+  await assert.rejects(guardOn(successor, planned, s), BaseAttestationMissingError);
 });
