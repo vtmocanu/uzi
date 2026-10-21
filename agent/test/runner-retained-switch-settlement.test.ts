@@ -95,10 +95,21 @@ afterEach(() => {
  *  generation's reaper sees it as `left` (a worker_child, which the real reaper never kills). */
 class WorkerSurvivors {
   readonly pids = new Set<number>();
-  reap = async (): Promise<RunProcessReap> => ({
-    killed: [], left: [...this.pids], complete: true,
-    leftReasons: Object.fromEntries([...this.pids].map(pid => [pid, "worker_child"])),
-  } as RunProcessReap);
+  /** Six survivors while any is live: five worker children, then a sixth of another class. */
+  mixed = false;
+  reap = async (): Promise<RunProcessReap> => {
+    if (this.mixed && this.pids.size > 0) {
+      const left = [777001, 777002, 777003, 777004, 777005, 777006];
+      return {
+        killed: [], left, complete: true,
+        leftReasons: Object.fromEntries(left.map((pid, i) => [pid, i < 5 ? "worker_child" : "kill_failed"])),
+      } as RunProcessReap;
+    }
+    return {
+      killed: [], left: [...this.pids], complete: true,
+      leftReasons: Object.fromEntries([...this.pids].map(pid => [pid, "worker_child"])),
+    } as RunProcessReap;
+  };
 }
 
 interface Options {
@@ -127,6 +138,12 @@ interface Options {
   refuseHold?: boolean;
   /** Runs inside gen 2's settle (cancel / generation change during settlement). */
   duringSettle?: (flight: any, r: RunRunner) => void;
+  /** The reap names six survivors, the sixth of a different class than the five the detail lists. */
+  mixedSurvivors?: boolean;
+  /** Runs after gen 2's own-mode quiescence proof returned clean (cancel / fence at the last check). */
+  afterProof?: (flight: any, r: RunRunner) => void;
+  /** An injected, deliberately large codexBoundaryDeadlineMs, to tell it from the verification allowance. */
+  codexBoundaryDeadlineMs?: number;
   /** Block the first ownership read after the switch until it is aborted (verification deadline). */
   blockOwnership?: boolean;
 }
@@ -141,6 +158,8 @@ async function scenario(o: Options) {
   fs.mkdirSync(retainedHome, { recursive: true });
   fs.writeFileSync(path.join(retainedHome, "session"), "predecessor session");
   const survivors = new WorkerSurvivors();
+  survivors.mixed = o.mixedSurvivors === true;
+  const marks: { proofEnd?: number; cut?: number } = {};
   const pending = gate();
   if (!o.pendingOperation) pending.open();
   const ownOperation = gate();
@@ -217,6 +236,7 @@ async function scenario(o: Options) {
   const { gitlab } = fakeGitlab();
   const quiesceRun = async (req: QuiesceRunRequest): Promise<QuiesceRunOutcome> => {
     events.push(`quiesce:${req.site}`);
+    if (req.site === "retained_credential_switch") { marks.proofEnd = Date.now(); o.afterProof?.(flight, r); }
     return { process: { state: "quiescent", processes: [], killed: [], detail: "" }, docker: { state: "not_wired", removed: [], detail: "" } };
   };
   const log = recordingLogger();
@@ -224,6 +244,7 @@ async function scenario(o: Options) {
     recoveryRetryMs: 1, quiesceRun, dockerHost: "unix:///nonexistent-docker.sock", liveAttempts: new LiveAttemptRegistry(),
     activeRuns: registry,
     ...(o.settlementMs ? { retainedSwitchSettlementMs: o.settlementMs } : {}),
+    ...(o.codexBoundaryDeadlineMs ? { codexBoundaryDeadlineMs: o.codexBoundaryDeadlineMs } : {}),
     ...(o.verificationMs ? { retainedSwitchVerificationMs: o.verificationMs } : {}),
   });
   const enter = (r as any).enterCredentialSwitch.bind(r);
@@ -266,7 +287,7 @@ async function scenario(o: Options) {
       const signal = args[1] instanceof AbortSignal ? args[1] : args[1]?.signal;
       assert.ok(signal, "verification passes its bounded signal");
       return new Promise<Awaited<ReturnType<typeof owner>>>((_resolve, reject) => {
-        const aborted = () => reject(signal.reason);
+        const aborted = () => { marks.cut = Date.now(); reject(signal.reason); };
         if (signal.aborted) aborted(); else signal.addEventListener("abort", aborted, { once: true });
       });
     }
@@ -275,7 +296,7 @@ async function scenario(o: Options) {
   if (o.refuseHold) api.refuseHold(HOLD);
   const run = r.execute(claim);
   return {
-    claim, bare, clone, r, run, events, survivors, pending, ownOperation, counts, log, registry, retainedHome,
+    claim, bare, clone, r, run, events, marks, survivors, pending, ownOperation, counts, log, registry, retainedHome,
     flight: () => flight, before: () => before, wasBlocked: () => blocked,
     async gen3() {
       api.setOwnershipStatus(claim.run_id, "running", 3);
@@ -336,8 +357,11 @@ describe("issue #3181 m3: retained credential switch settles before it reports",
     // The settlement outlasts the verification allowance (60ms) yet fits its own (30s): the
     // verification clock starts only after settlement returns. Only the verification allowance is
     // shortened, so the unrelated recovery discovery never depends on wall-clock under load.
-    const env = await scenario({ iid: 31820, survivor: "settled-by-settle", settleDelayMs: 200, verificationMs: 60, settlementMs: 30_000, blockOwnership: true });
+    const env = await scenario({ iid: 31820, survivor: "settled-by-settle", settleDelayMs: 200, verificationMs: 60, settlementMs: 30_000, blockOwnership: true, codexBoundaryDeadlineMs: 600_000 });
     await env.run;
+    // The cut comes from retainedSwitchVerificationMs, not the (injected, 10 minute) codex boundary deadline.
+    assert.ok(env.marks.proofEnd !== undefined && env.marks.cut !== undefined, "both marks recorded");
+    assert.ok(env.marks.cut - env.marks.proofEnd < 30_000, `cut ${env.marks.cut - env.marks.proofEnd}ms after settlement`);
     assert.equal(env.wasBlocked(), true, "the verification ownership read ran and was cut by the deadline");
     assert.deepEqual(reports(env.claim.run_id, "credential_switch", "credential_switch_failed", HOLD, SETTLED), []);
     assert.equal(env.flight().retainedSwitchSettlement, undefined);
@@ -398,6 +422,14 @@ describe("issue #3181 m3: retained credential switch settles before it reports",
     assert.match(feedText(env.claim.run_id), /\(survivors: worker_child\); work and custody kept/);
     assert.doesNotMatch(feedText(env.claim.run_id), /777001|HOME-attributed/, "no pid or raw detail in the feed");
     assertCustodyKept(env);
+  });
+
+  it("3e. a sixth survivor's class still reaches the feed, without any pid", TIMEOUT, async () => {
+    const env = await scenario({ iid: 31834, survivor: "permanent", mixedSurvivors: true });
+    await env.run;
+    assert.equal(env.flight().retainedSwitchSettlement, "held");
+    assert.match(feedText(env.claim.run_id), /\(survivors: worker_child, kill_failed\); work and custody kept/);
+    assert.doesNotMatch(feedText(env.claim.run_id), /77700\d|HOME-attributed/, "no pid or raw detail in the feed");
   });
 
   it("4. a blocked owning-operation join holds, keeps the tail reserved and acknowledges only after the join", TIMEOUT, async () => {
@@ -561,6 +593,27 @@ describe("issue #3181 m3: retained credential switch settles before it reports",
       assert.deepEqual(reports(env.claim.run_id, HOLD, SETTLED, "credential_switch", "credential_switch_failed"), []);
       assert.equal(env.flight().retainedSwitchSettlement, "unproven", "an unsettled flight is joined even though no hold was reported");
       assert.equal(env.counts.joins, 1);
+      assertCustodyKept(env);
+    });
+
+    it("a cancel at the last lifecycle check after a proven settlement does not join or hold", TIMEOUT, async () => {
+      const env = await scenario({ iid: 31874, survivor: "settled-by-settle",
+        afterProof: flight => { flight.steering.isCancelled = () => true; } });
+      await env.run;
+      assert.deepEqual(reports(env.claim.run_id, HOLD, SETTLED, "credential_switch", "credential_switch_failed"), []);
+      assert.notEqual(env.flight().retainedSwitchSettlement, "unproven", "a proven settlement is never relabelled");
+      assert.equal(env.counts.joins, 0, "a settled flight joins nothing");
+      assert.doesNotMatch(JSON.stringify(env.log.lines), /settlement did not finish/);
+      assertCustodyKept(env);
+    });
+
+    it("a claim-fence change at the last check after a proven settlement does not join or hold", TIMEOUT, async () => {
+      const env = await scenario({ iid: 31875, survivor: "settled-by-settle",
+        afterProof: flight => { flight.steering.claimFence = () => ({ kind: "superseded" }); } });
+      await env.run;
+      assert.deepEqual(reports(env.claim.run_id, HOLD, SETTLED, "credential_switch", "credential_switch_failed"), []);
+      assert.notEqual(env.flight().retainedSwitchSettlement, "unproven");
+      assert.equal(env.counts.joins, 0);
       assertCustodyKept(env);
     });
 

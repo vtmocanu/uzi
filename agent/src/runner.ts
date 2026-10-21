@@ -54,7 +54,7 @@ import type { PlanCrossCheckStateRequest, PlanCrossCheckDiffRefusal } from "./cl
 import type { BoundaryPermit, BoundaryRequest, BoundarySink, BoundaryStep, GracefulShutdownCheckpoint, SafeBoundary } from "./harness.js";
 import { SinkGate } from "./sink-gate.js";
 import { cloneKeyOf } from "./attempt-path.js";
-import type { RunProcessReap } from "./run-procs.js";
+import type { LeftReason, RunProcessReap } from "./run-procs.js";
 import {
   LiveAttemptRegistry,
   describeProcesses,
@@ -1214,9 +1214,9 @@ function attributedReapCause(reap: RunProcessReap | { failure: string }): { stat
 
 /** issue #3181: the fixed owner-feed phrase for a quiescence proof that named survivors: only the
  *  m1 left-reason classes (never a pid, path or free text), or `survivors` when none is named. */
-function survivorClasses(detail: string): string {
-  const classes = ["worker_child", "unreadable", "restarted", "kill_failed"].filter((c) => detail.includes(`(${c})`));
-  return classes.length > 0 ? `survivors: ${classes.join(", ")}` : "survivors";
+function survivorClasses(classes: readonly LeftReason[] | undefined): string {
+  const named = (["worker_child", "unreadable", "restarted", "kill_failed"] as const).filter((c) => classes?.includes(c));
+  return named.length > 0 ? `survivors: ${named.join(", ")}` : "survivors";
 }
 
 /**
@@ -1248,6 +1248,13 @@ async function reapThenMayDropCaches(executor: Executor, runLog: Logger): Promis
  * processes and gains the cause in its detail. The reap's killed pids join `killed` either way.
  */
 function foldAttributedReap(outcome: QuiesceRunOutcome, reap: RunProcessReap | { failure: string }): QuiesceRunOutcome {
+  const folded = foldAttributedReapVerdict(outcome, reap);
+  if ("failure" in reap || reap.left.length === 0) return folded;
+  const classes = [...new Set(reap.left.map((pid) => reap.leftReasons?.[pid]).filter((c): c is LeftReason => c !== undefined))];
+  return classes.length > 0 ? { ...folded, leftClasses: classes } : folded;
+}
+
+function foldAttributedReapVerdict(outcome: QuiesceRunOutcome, reap: RunProcessReap | { failure: string }): QuiesceRunOutcome {
   const killed = "failure" in reap ? [] : reap.killed;
   const cause = attributedReapCause(reap);
   const prior = outcome.process;
@@ -19143,16 +19150,19 @@ export class RunRunner {
     flight: RunFlight, identity: () => void,
   ): Promise<{ settled: true } | { settled: false; detail: string; survivors: string }> {
     const budget = new MaintenanceBudget(this.retainedSwitchSettlementMs);
+    // Set once settlement is proven, BEFORE the last lifecycle check: a lifecycle throw after that
+    // point propagates as the lifecycle change it is and never relabels a proven settlement unproven.
+    let proven = false;
     const unsettled = (detail: string, survivors: string) => {
       flight.retainedSwitchSettlement = "unproven";
       return { settled: false as const, detail: sanitizeForLog(detail, 200), survivors };
     };
     try {
-      // Deliberate deviation from the rule that status transport stays under the attempt's budget:
-      // this is outside any enclosing attempt scope because MaintenanceBudget.run would otherwise
-      // attach this allowance to that attempt and leave every later await of the flight under a
-      // spent budget. It is safe here because settlement is not FINAL cleanup (no custody is
-      // released or dropped by it) and is bounded by its own allowance above.
+      // Deliberate deviation: MaintenanceBudget.withoutAttempt is reserved for status transport and
+      // must never wrap FINAL or custody cleanup. Settlement is neither (it releases and drops no
+      // custody) and is bounded by its own allowance above. It runs outside any enclosing attempt
+      // scope because MaintenanceBudget.run would otherwise attach this allowance to that attempt
+      // and leave every later await of the flight under a spent budget.
       return await MaintenanceBudget.withoutAttempt(() => MaintenanceBudget.run(budget, () => RetainedSwitchSettlement.run(async () => {
         const settle = await this.settleForCredentialCapture(flight.executor, budget.remainingMs());
         if (settle.kind !== "observed_empty") {
@@ -19167,14 +19177,16 @@ export class RunRunner {
         if (proof.blocked) {
           const process = proof.outcome.process;
           const detail = process?.detail ?? "run processes not quiescent";
-          const verdict = unsettled(detail, process?.state === "survivors" ? survivorClasses(detail) : "unverified");
+          const verdict = unsettled(detail, process?.state === "survivors" ? survivorClasses(proof.outcome.leftClasses) : "unverified");
           identity();
           return verdict;
         }
+        proven = true;
         identity();
         return { settled: true as const };
       })));
     } catch (error) {
+      if (proven) throw error;
       const verdict = unsettled(`settlement did not finish: ${errMessage(error)}`,
         budget.remainingMs() <= 0 || budget.signal.aborted ? "deadline" : "unverified");
       identity();
