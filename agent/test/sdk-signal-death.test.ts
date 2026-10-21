@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { spawn, type ChildProcess } from "node:child_process";
+import { execSync, spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -595,10 +595,14 @@ describe("SdkExecutor foreign CLI signal death (issue #1656)", () => {
 // SDK has written its first stdin line, so an SDK bump that renames or drops the tags turns
 // them red instead of silently degrading the classifier to "fail the run".
 
-/** A child that ends itself after its first stdin line, recorded so the test can await it. */
+/** A child that ends itself after its first stdin line, recorded so the test can await it.
+ *  It starts through `sh` only to drop its SOFT core limit to 0 before `exec`ing node (same
+ *  pid, same pipes): the self-SIGSEGV case below would otherwise leave a ~500 MB core file in
+ *  agent/ on a host whose core limit is unlimited. The hard limit stays as inherited. */
 function selfEndingSpawn(body: string, children: ChildProcess[]): NonNullable<SdkExecutorOptions["spawn"]> {
   return () => {
-    const child = spawn(process.execPath, ["-e", `process.stdin.once("data", () => { ${body} });`], {
+    const script = `process.stdin.once("data", () => { ${body} });`;
+    const child = spawn("/bin/sh", ["-c", 'ulimit -S -c 0 && exec "$0" "$@"', process.execPath, "-e", script], {
       stdio: ["pipe", "pipe", "pipe"],
     });
     children.push(child);
@@ -727,6 +731,26 @@ describe("dead CLI group confirmed gone before a resume (issue #1656)", () => {
 });
 
 describe("SDK process-exit error shape (issue #1656 pin)", () => {
+  it("the self-ending child runs with a soft core limit of 0 and its inherited hard limit", async (t) => {
+    const parentSoft = execSync("ulimit -S -c").toString().trim();
+    const parentHard = execSync("ulimit -H -c").toString().trim();
+    if (parentSoft === "0") t.diagnostic("the ambient soft core limit is already 0: this host cannot tell the fix from its absence");
+    const children: ChildProcess[] = [];
+    selfEndingSpawn(
+      'process.stdout.write(require("node:child_process").execSync("ulimit -S -c; ulimit -H -c").toString(), () => process.exit(0));',
+      children,
+    )({} as Parameters<NonNullable<SdkExecutorOptions["spawn"]>>[0]);
+    const child = children[0]!;
+    let out = "";
+    child.stdout!.on("data", (d: Buffer) => { out += d.toString(); });
+    const closed = new Promise<number | null>((r) => child.once("close", r));
+    child.stdin!.write("go\n");
+    assert.equal(await closed, 0);
+    const [soft, hard] = out.trim().split("\n").map((l) => l.trim());
+    assert.equal(soft, "0", "soft core limit");
+    assert.equal(hard, parentHard, "hard core limit is inherited unchanged");
+  });
+
   it("exit 143 carries own errorClass=process_exited_nonzero and exitCode=143", async () => {
     const err = await realSdkError("process.exit(143);");
     assert.ok(Object.hasOwn(err, "errorClass") && Object.hasOwn(err, "exitCode"), "own-property tags");
