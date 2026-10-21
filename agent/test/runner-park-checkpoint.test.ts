@@ -275,6 +275,7 @@ describe("RunRunner — checkpoint on the limit-park path (PRD #628 M2)", () => 
         execFileSync("git", ["-C", probe, "unpack-objects", "-q"], { env: GIT_ENV, input: call.pack });
         const objects = execFileSync("git", ["-C", probe, "cat-file", "--batch-all-objects", "--batch-check=%(objectname)"],
           { env: GIT_ENV, encoding: "utf8" }).split("\n").filter(Boolean);
+        assert.ok(objects.includes(base), "the pack carries the declared commit (#3242), so an empty pack cannot pass");
         const foreign = objects.filter((o) => !reachable.has(o));
         assert.deepEqual(foreign, [], "the pack carries nothing beyond the starting commit's history");
       }
