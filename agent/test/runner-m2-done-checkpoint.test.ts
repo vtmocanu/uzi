@@ -505,3 +505,53 @@ it("m2 real candidate acquisition mismatch is advisory without retention and gua
     assert.ok(api.states.some(s => s.body.status === "completed"));
   } finally { await Promise.allSettled([rig?.installer.settle() ?? Promise.resolve()]); }
 });
+
+it("a shutdown sink keeps its wall-clock budget when the test clock is far from wall time", async () => {
+  // Issue #3217 (CodeRabbit on PR #3219): shutdown() stamps a Date.now deadline, so reapForSink must
+  // keep Date.now for a shutdown request even when the test clock (absoluteNow) is set and far ahead.
+  const farAhead = 1_000_000_000;
+  const clock = virtualBoundaryClock();
+  let rig: ReturnType<typeof codexRig> | undefined;
+  let ready!: () => void;
+  const started = new Promise<void>(resolve => { ready = resolve; });
+  const shutdowns: Array<{ deadlineMs: number; deadlineAt: number }> = [];
+  const executor: Executor = {
+    get safety() { return rig?.safety; },
+    run: async ctx => {
+      rig = codexRig({ lifecycleSignal: AbortSignal.any([ctx.signal!, ctx.terminalLifecycleSignal!]),
+        armDeadline: clock.armDeadline, now: clock.now });
+      const boundary = rig.safety.withBoundary.bind(rig.safety);
+      rig.safety.withBoundary = async (request, action) => {
+        if (request.boundary === "shutdown" && request.gracefulShutdownCheckpoint) {
+          shutdowns.push({ deadlineMs: request.deadlineMs, deadlineAt: request.gracefulShutdownCheckpoint.deadlineAt });
+        }
+        return boundary(request, action);
+      };
+      commitInTree(ctx.worktreePath, "shutdown.txt", "work to publish\n");
+      ready();
+      await new Promise<void>(resolve => {
+        if (ctx.signal!.aborted) resolve();
+        else ctx.signal!.addEventListener("abort", () => resolve(), { once: true });
+      });
+      throw new Error("provider unwound after shutdown");
+    },
+  };
+  const worker = runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined, {
+    checkpointTestHooks: { absoluteNow: () => clock.now() + farAhead, armSoftDeadline: clock.arm },
+  });
+  const execution = worker.execute(gitlabClaim(312311));
+  try {
+    await started;
+    const shutdownAt = Date.now();
+    worker.shutdown();
+    await execution;
+    assert.ok(shutdowns.length > 0, "the shutdown durability publish reached the safety");
+    for (const s of shutdowns) {
+      assert.ok(s.deadlineMs > 0, `shutdown budget ${s.deadlineMs} must stay positive`);
+      assert.ok(s.deadlineMs <= s.deadlineAt - shutdownAt, "bounded by the wall-clock shutdown deadline");
+    }
+  } finally {
+    worker.shutdown();
+    await Promise.allSettled([execution, rig?.installer.settle() ?? Promise.resolve()]);
+  }
+});
