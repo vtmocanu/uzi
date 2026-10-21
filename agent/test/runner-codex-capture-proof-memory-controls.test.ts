@@ -77,7 +77,9 @@ function enroll(ctx: RunContext, toolId = "original-tool") {
 }
 
 for (const mode of ["retry", "uncertain", "cancel-ack"] as const) it(`public memory edge ${mode} actual monitor held lineage`,async()=>{
-  const f=await setup(1,{...settings,responseBudgetMs:5000});
+  // Real Git retries need headroom to finish the lineage proof within one original held budget.
+  const fixtureBudgetMs=30_000;
+  const f=await setup(1,{...settings,responseBudgetMs:fixtureBudgetMs});
   let releaseFeedback!:()=>void; const feedbackGate=new Promise<void>(r=>{releaseFeedback=r;});
   const o=observe();const verifications:any[]=[];
   let original:any, heldContext:any, captureSignal:AbortSignal|undefined, capturePurpose:unknown;
@@ -143,7 +145,7 @@ for (const mode of ["retry", "uncertain", "cancel-ack"] as const) it(`public mem
   const monitoring=f.memory.run();
   try{
     run=runnerWith(()=>({executor:exec,homeDir}),fakeGitlab().gitlab,undefined,undefined,
-      {memoryRuntime:f.memory,codexBoundaryDeadlineMs:5000,checkpointIntervalMs:0});
+      {memoryRuntime:f.memory,codexBoundaryDeadlineMs:fixtureBudgetMs,checkpointIntervalMs:0});
     const runner:any=run, capture=runner.captureRecoveryRestorePoint.bind(run);
     runner.captureRecoveryRestorePoint=async(...args:any[])=>{
       effectiveHeld=args[4]?.heldCapture;
