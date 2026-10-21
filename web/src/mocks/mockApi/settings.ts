@@ -115,6 +115,11 @@ if (mockScenario() === "cross-check-dormant-claude") {
       worker_default_model: null, resolved_model: null, resolved_effort: "medium", model_source: "pin", effort_source: "pin", active: true },
   ];
 }
+
+// The compiled-in built-in for the instance Codex judge model (PRD #3245), pinned by
+// fixtures/model-settings/judge.json.
+const CODEX_JUDGE_BUILTIN = "gpt-6.1-sol";
+
 const SEED_APP_SETTINGS: AppSettings = {
   autopilot_label: "autopilot",
   // PRD #764: the single run-eligibility label.
@@ -132,6 +137,8 @@ const SEED_APP_SETTINGS: AppSettings = {
   public_base_url: "http://127.0.0.1:8080",
   judge_enabled: "false",
   judge_model: "opus",
+  // PRD #3245: "" = the built-in; the response reports CODEX_JUDGE_BUILTIN with source "default".
+  codex_judge_model: "",
   // PRD #69: enforced mode off, spend guards at their server defaults (cooldown 60s,
   // budget 0 = unlimited).
   judge_enforce_all: "false",
@@ -301,6 +308,8 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     typeof a.public_base_url === "string" &&
     typeof a.judge_enabled === "string" &&
     typeof a.judge_model === "string" &&
+    // PRD #3245: tolerant, so a blob that predates the Codex lane stays valid (filled from the seed).
+    (a.codex_judge_model === undefined || typeof a.codex_judge_model === "string") &&
     typeof a.judge_enforce_all === "string" &&
     typeof a.judge_cooldown_seconds === "string" &&
     typeof a.judge_daily_budget === "string" &&
@@ -554,12 +563,16 @@ function settingsResponse(): SettingsResponse {
     effective.judge_model = SEED_APP_SETTINGS.judge_model;
     sources.judge_model = "default";
   }
+  if (appSettings.codex_judge_model.trim() === "") {
+    effective.codex_judge_model = CODEX_JUDGE_BUILTIN;
+    sources.codex_judge_model = "default";
+  }
   // The demo has no real socket, so Slack is always "disabled" here.
   return {
     settings: effective,
     secrets: { ...slackSecrets },
     sources,
-    defaults: { ...SEED_APP_SETTINGS },
+    defaults: { ...SEED_APP_SETTINGS, codex_judge_model: CODEX_JUDGE_BUILTIN },
     slack_status: "disabled",
     oidc_status: oidcDemo().oidcStatus,
     oidc_provider_name: oidcDemo().providerName,
@@ -892,6 +905,16 @@ export const settingsApi = {
         const trimmed = value.trim();
         if (/\s/.test(trimmed)) throw new ApiError(400, "judge_model: must be a single token with no spaces");
         nonSecret.judge_model = trimmed;
+        continue;
+      }
+      // codex_judge_model (PRD #3245): trimmed, "" is the reset to the built-in, otherwise a
+      // curated Codex id, mirroring the server's validator.
+      if (key === "codex_judge_model") {
+        const trimmed = value.trim();
+        if (trimmed !== "" && !CURATED_CODEX_IDS.includes(trimmed)) {
+          throw new ApiError(400, "codex_judge_model: is not a Codex judge model");
+        }
+        nonSecret.codex_judge_model = trimmed;
         continue;
       }
       // summary_model (PRD #362) is a model alias: non-empty single token, mirroring

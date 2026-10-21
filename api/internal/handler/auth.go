@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/auth"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
@@ -395,19 +396,13 @@ func (h *Handler) sessionPayload(ctx context.Context, user store.User) map[strin
 	judgeEnabled, _ := h.settings.JudgeEnabled(ctx)
 	judgeEnforceAll, _ := h.settings.JudgeEnforceAll(ctx)
 	judgeEnforced := judgeEnabled && judgeEnforceAll
-	// effective_judge_model is the model THIS user's judge actually runs on, resolved
-	// exactly the way assembleJudgeClaim resolves it (user-value-wins): the user's own
-	// non-blank judge_model, else the instance judge_model, which itself falls back to
-	// DefaultJudgeModel ("opus") inside JudgeModel. So the consent copy names the real
-	// model, not a guess.
-	effectiveJudgeModel := ""
-	if user.JudgeModel.Valid && strings.TrimSpace(user.JudgeModel.String) != "" {
-		effectiveJudgeModel = user.JudgeModel.String
-	} else if m, err := h.settings.JudgeModel(ctx); err == nil && strings.TrimSpace(m) != "" {
-		effectiveJudgeModel = m
-	} else {
-		effectiveJudgeModel = settings.DefaultJudgeModel
-	}
+	// effective_judge_model is the model THIS user's Claude-lane judge actually runs on,
+	// resolved exactly the way assembleJudgeClaim resolves it (PRD #3245): the user's
+	// Claude lane > the instance Claude value > the built-in, with values invalid for the
+	// Claude lane skipped. An instance read error is treated as unset. So the consent copy
+	// names the real model, not a guess.
+	instanceJudgeModel, _ := h.settings.InstanceModel(ctx, settings.KeyJudgeModel)
+	effectiveJudgeModel := agenttmpl.ResolveJudgeModel("claude", user.JudgeModel.String, instanceJudgeModel).Model
 	return map[string]any{
 		"user":            toDTO(user),
 		"autopilot_label": autopilotLabel,

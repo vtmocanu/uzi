@@ -87,6 +87,12 @@ func TestGetSettingsSurfacesDefaults(t *testing.T) {
 	if resp.Defaults[settings.KeyJudgeModel] != "opus" {
 		t.Errorf("defaults.judge_model = %q, want opus", resp.Defaults[settings.KeyJudgeModel])
 	}
+	if resp.Defaults[settings.KeyCodexJudgeModel] != "gpt-6.1-sol" {
+		t.Errorf("defaults.codex_judge_model = %q, want gpt-6.1-sol", resp.Defaults[settings.KeyCodexJudgeModel])
+	}
+	if resp.Settings[settings.KeyCodexJudgeModel] != "gpt-6.1-sol" || resp.Sources[settings.KeyCodexJudgeModel] != "default" {
+		t.Errorf("codex_judge_model = %q / %q, want gpt-6.1-sol / default", resp.Settings[settings.KeyCodexJudgeModel], resp.Sources[settings.KeyCodexJudgeModel])
+	}
 	// An empty stored row reads as the built-in with source default.
 	if resp.Settings[settings.KeyJudgeModel] != "opus" || resp.Sources[settings.KeyJudgeModel] != "default" {
 		t.Errorf("judge_model = %q / %q, want opus / default", resp.Settings[settings.KeyJudgeModel], resp.Sources[settings.KeyJudgeModel])

@@ -64,6 +64,7 @@ describe("mockApi settings persistence (demo survives reload)", () => {
           public_base_url: "https://uzi.example",
           judge_enabled: "false",
           judge_model: "opus",
+          codex_judge_model: "",
           judge_enforce_all: "false",
           judge_cooldown_seconds: "60",
           judge_daily_budget: "0",
@@ -138,6 +139,7 @@ describe("mockApi settings persistence (demo survives reload)", () => {
           public_base_url: "http://127.0.0.1:8080",
           judge_enabled: "false",
           judge_model: "opus",
+          codex_judge_model: "",
           judge_enforce_all: "false",
           judge_cooldown_seconds: "60",
           judge_daily_budget: "0",
@@ -1063,5 +1065,33 @@ describe("mockApi judge_model reset (PRD #3245 M1)", () => {
       message: expect.stringContaining("must not be empty"),
     });
     await expect(api.updateSettings({ judge_model: "two words" })).rejects.toMatchObject({ status: 400 });
+  });
+});
+
+describe("mockApi codex_judge_model (PRD #3245)", () => {
+  it("reports the built-in as default, trims a curated id and accepts blank as the reset", async () => {
+    installStorage();
+    const api = await reload();
+
+    const initial = await api.getSettings();
+    expect(initial.settings.codex_judge_model).toBe("gpt-6.1-sol");
+    expect(initial.sources.codex_judge_model).toBe("default");
+    expect(initial.defaults?.codex_judge_model).toBe("gpt-6.1-sol");
+
+    const pinned = await api.updateSettings({ codex_judge_model: " gpt-6-sol " });
+    expect(pinned.settings.codex_judge_model).toBe("gpt-6-sol");
+    expect(pinned.sources.codex_judge_model).toBe("db");
+
+    const reset = await api.updateSettings({ codex_judge_model: "   " });
+    expect(reset.settings.codex_judge_model).toBe("gpt-6.1-sol");
+    expect(reset.sources.codex_judge_model).toBe("default");
+  });
+
+  it("rejects a Claude alias, a non-curated id and gpt-6-luna", async () => {
+    installStorage();
+    const api = await reload();
+    for (const bad of ["opus", "gpt-7-x", "gpt-6-luna", "two words"]) {
+      await expect(api.updateSettings({ codex_judge_model: bad })).rejects.toMatchObject({ status: 400 });
+    }
   });
 });

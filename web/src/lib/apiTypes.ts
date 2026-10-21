@@ -1003,6 +1003,9 @@ export interface AppSettings {
   // default, PRD #69).
   judge_enabled: string;
   judge_model: string;
+  // codex_judge_model (PRD #3245) is the instance Codex-lane judge model: a curated Codex
+  // id, or "" for the built-in (the admin GET reports the built-in with source "default").
+  codex_judge_model: string;
   // judge_enforce_all (PRD #69) is the text "true"/"false": when on, EVERY user's
   // finished runs are judged on that user's own token, bypassing the per-user opt-in
   // — but the kill-switch (judge_enabled) still dominates. judge_cooldown_seconds and

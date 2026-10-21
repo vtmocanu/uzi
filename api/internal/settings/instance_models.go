@@ -14,7 +14,8 @@ import (
 // instanceModelKeys is the set of instance model keys whose values are trimmed
 // at storage and read through InstanceModels. Later model keys join this set.
 var instanceModelKeys = map[string]struct{}{
-	KeyJudgeModel: {},
+	KeyJudgeModel:      {},
+	KeyCodexJudgeModel: {},
 }
 
 // NormalizeForStorage returns the value to validate and store for key: the

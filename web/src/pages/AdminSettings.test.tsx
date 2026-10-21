@@ -54,6 +54,7 @@ const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
   public_base_url: "http://127.0.0.1:8080",
   judge_enabled: "false",
   judge_model: "opus",
+  codex_judge_model: "",
   judge_enforce_all: "false",
   judge_cooldown_seconds: "60",
   judge_daily_budget: "0",
@@ -115,9 +116,10 @@ const response = (
     slack_bot_token: "default",
     slack_app_token: "default",
     judge_model: "default",
+    codex_judge_model: "default",
     ...sources,
   } as Record<string, Src>,
-  defaults: { judge_model: "opus" },
+  defaults: { judge_model: "opus", codex_judge_model: "gpt-6.1-sol" },
   slack_status,
 });
 

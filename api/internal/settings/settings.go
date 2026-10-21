@@ -485,8 +485,10 @@ func Validate(key, value string) error {
 		return validateBrandCompany(value)
 	case KeyJudgeModel:
 		// Blank is the explicit reset to the built-in judge model (PRD #3245).
-		_, err := agenttmpl.ValidateModel(value)
+		_, err := agenttmpl.ValidateClaudeLaneModel(value)
 		return err
+	case KeyCodexJudgeModel:
+		return validateCodexJudgeModel(value)
 	case KeySummaryModel:
 		return validateModelAlias(value)
 	case KeyAgentSourceInterval:
