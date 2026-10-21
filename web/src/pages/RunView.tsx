@@ -34,6 +34,7 @@ import { repoAgentFolder } from "../lib/repoAgentFolder";
 import { stripUnsafeChars } from "../lib/safeText";
 import { sanitizeLabel } from "../lib/sanitizeLabel";
 import { useNow } from "../lib/useNow";
+import { credentialSwitchHold } from "../lib/credentialSwitchHold";
 import {
   effectiveRunStatus,
   parkLabel,
@@ -70,6 +71,7 @@ import {
   SwitchTokenAction,
 } from "../components/RunCredentialOverride";
 import { CredentialDisabledPanel, isCredentialDisabledHold } from "../components/CredentialDisabledPanel";
+import { CredentialSwitchHoldPanel } from "../components/CredentialSwitchHoldPanel";
 import { RunPriorityBadge } from "../components/RunPriorityBadge";
 import { formatDuration } from "../components/RunEvent";
 import { RunUsagePanel, RunUsageTailBlock } from "../components/RunUsage";
@@ -391,7 +393,9 @@ export function CompletionStatePanel({ run }: { run: Run }) {
   if (run.status === "paused" && run.hold_reason === "provider_unavailable") return null;
   const phase = run.completion_phase ?? "";
   // PRD #1732: a credential_disabled hold is not a completion state; its own panel covers it.
-  const held = run.hold_reason != null && run.hold_reason !== "credential_disabled" && run.hold_reason !== "provider_unavailable";
+  // Issue #3181: neither are the token-switch holds; CredentialSwitchHoldPanel covers them.
+  const held = run.hold_reason != null && run.hold_reason !== "credential_disabled" && run.hold_reason !== "provider_unavailable" &&
+    credentialSwitchHold(run) === null;
   if (phase === "" && !held) return null;
   const unmet = run.completion_unmet ?? [];
   const attempts = run.completion_attempts ?? 0;
@@ -846,7 +850,9 @@ export function PausedPanel({
     run.status !== "paused" ||
     run.hold_reason === "completion_blocked" ||
     run.hold_reason === "credential_disabled" ||
-    run.hold_reason === "provider_unavailable"
+    run.hold_reason === "provider_unavailable" ||
+    // Issue #3181: the token-switch holds have their own panel and Resume gating.
+    credentialSwitchHold(run) !== null
   )
     return null;
 
@@ -1715,7 +1721,9 @@ export function RunView() {
   // retain their optimistic canSteer semantics.
   const providerHeld = run?.status === "paused" && run.hold_reason === "provider_unavailable";
   const memoryHeld = run?.status === "recovery_wait" && run.recovery_wait_cause === "worker_memory_pressure";
-  const ownerDecisionHold = workerExhausted || memoryHeld || providerHeld;
+  // Issue #3181: the token-switch holds are owner decisions too (Resume / Cancel).
+  const switchHeld = run != null && credentialSwitchHold(run) !== null;
+  const ownerDecisionHold = workerExhausted || memoryHeld || providerHeld || switchHeld;
   const canSteer = optimisticCanSteer && (!ownerDecisionHold || confirmedOwner === true);
   const planCheckSeqs = useRef(new Map<string, number>());
   const planCheckRefresh = useRef<{ runId: string; busy: boolean; queued: boolean } | null>(null);
@@ -2117,6 +2125,10 @@ export function RunView() {
               ? "provider_unavailable"
             : run?.status === "paused" && run.hold_reason === "credential_disabled"
               ? "credential_disabled"
+            : run?.status === "paused" && run.hold_reason === "credential_switch_settling"
+              ? "credential_switch_settling"
+            : run?.status === "paused" && run.hold_reason === "credential_switch_unsettled"
+              ? "credential_switch_unsettled"
             : run?.status === "paused"
               ? "paused"
             : "";
@@ -2149,6 +2161,10 @@ export function RunView() {
               ? "The run is waiting because a credential it needs is disabled. Enable it and the run resumes automatically."
             : parkKey === "provider_unavailable"
               ? "Provider unavailable. Automatic retries have stopped; the run waits for its owner."
+            : parkKey === "credential_switch_settling"
+              ? "After a token switch, the worker is stopping this run's processes. Resume becomes available when it finishes. Cancel works now."
+            : parkKey === "credential_switch_unsettled"
+              ? "Held after a token switch. Processes could not be proven stopped; work is kept on its worker. Resume to continue on the new token, or Cancel."
             : parkKey === "paused"
               ? "The run is paused. Resume it from this page or with the uzi run resume command."
             : "The agent is asking you a question. The run is parked until you answer.",
@@ -2336,6 +2352,9 @@ export function RunView() {
                 // plain Resume would only park it again.
                 run.hold_reason !== "credential_disabled" &&
                 run.hold_reason !== "provider_unavailable" &&
+                // Issue #3181: the token-switch holds offer Resume in their own panel, gated
+                // on the settling fence.
+                credentialSwitchHold(run) === null &&
                 (canSteer ? (
                   <Button
                     size="sm"
@@ -2673,6 +2692,13 @@ export function RunView() {
           }
           if (isCurrent()) await refreshRun();
         })}
+      />
+      <CredentialSwitchHoldPanel run={run} ownerProof={canSteer && run.id === id} busy={busy}
+        onResume={() => act(async (isCurrent) => {
+          await api.resumeRun(run.id);
+          if (isCurrent()) await refreshRun();
+        })}
+        onCancel={() => cancelRun()}
       />
       <PausedPanel
         run={run}

@@ -165,6 +165,16 @@ describe("StatusPill", () => {
       label: "waiting: credential disabled", tone: "text-warn", pulse: false,
     },
     {
+      name: "token switch settling",
+      run: { status: "paused", hold_reason: "credential_switch_settling" },
+      label: "stopping processes: token switch", tone: "text-warn", pulse: false,
+    },
+    {
+      name: "token switch unsettled",
+      run: { status: "paused", hold_reason: "credential_switch_unsettled" },
+      label: "held: token switch", tone: "text-warn", pulse: false,
+    },
+    {
       name: "live running",
       run: { status: "running" },
       label: "running", tone: "text-info", pulse: true,

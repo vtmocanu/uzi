@@ -842,7 +842,9 @@ export interface LatestRun {
   // hold_reason (PRD #1226/#1497/#1732): why a `paused` run is server-held, null for an owner
   // pause or a non-paused run. Non-sensitive, so the board projection sends it on every card
   // (api/internal/handler/board.go latestRunDTO.HoldReason). effectiveRunStatus overlays
-  // 'credential_disabled' so the card reads "waiting: credential disabled", not "paused".
+  // 'credential_disabled' so the card reads "waiting: credential disabled", not "paused", and
+  // the issue #3181 token-switch holds ('credential_switch_settling' / 'credential_switch_unsettled')
+  // so they read "stopping processes: token switch" / "held: token switch".
   // Optional for api/web rollout skew: an absent key reads as no hold.
   hold_reason?: string | null;
   owner_name: string;
@@ -3441,6 +3443,11 @@ export interface Run {
    *  (PRD #1732 D14; resumes on Enable, never on a plain Resume), 'budget_exhausted' for a
    *  wall-clock park (PRD #1497), and 'provider_unavailable' for a provider outage bound
    *  reached (PRD #1733; owner Resume, scoped Stop when permitted, or Cancel).
+   *  Issue #3181: 'credential_switch_settling' when an owner token switch on a retained-recovery
+   *  run could not prove the run's processes stopped and the worker is still stopping them (the
+   *  server refuses Resume and another token switch with a 409 until it finishes; Cancel always
+   *  works), and 'credential_switch_unsettled' once it finished without that proof: held for the
+   *  owner, work and custody kept on that worker; Resume requeues on the newly chosen token.
    *  Render an unrecognised value honestly.
    *  `hold_context` is the constant "unavailable(same_worker_only)" ONLY while held, else null:
    *  the UI/CLI state the hold's durability HONESTLY from it — the hold is same-worker-only and

@@ -2067,6 +2067,21 @@ mockRuns.push(
     recovery_wait_cause: "provider_outage", provider_park_count: 3,
     provider_park_streak_started_at: minsAgo(90), recovery_retry_not_before: minsAhead(5) },
 );
+// Issue #3181: the token-switch holds. The owner switched each run to console-key; its
+// processes could not be proven stopped. Open /runs/run-cred-switch-settling (the worker is
+// still stopping them: Resume and Switch token 409, Cancel works) or
+// /runs/run-cred-switch-unsettled (held for the owner: Resume requeues on console-key).
+for (const [id, hold] of [
+  ["run-cred-switch-settling", "credential_switch_settling"],
+  ["run-cred-switch-unsettled", "credential_switch_unsettled"],
+] as const) {
+  mockRuns.push({
+    ...pausedBase, id, hold_reason: hold,
+    credential_override: { mode: "pinned", label: "console-key" },
+    status_since: minsAgo(hold === "credential_switch_settling" ? 2 : 14),
+    updated_at: minsAgo(hold === "credential_switch_settling" ? 2 : 14),
+  });
+}
 mockRuns.push(
   {
     // A Claude issue run pinned (per-run override) to the disabled token old-laptop: the

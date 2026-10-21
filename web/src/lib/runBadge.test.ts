@@ -27,6 +27,7 @@ import {
   shouldShowHealthFlag,
 } from "./runBadge";
 import { RUN_STATUS_TONES } from "../components/ui";
+import { credentialSwitchHold } from "./credentialSwitchHold";
 import { isTerminalRun, TERMINAL_RUN_STATUSES } from "./runStatus";
 import type { LatestRun, Run, RunStatus, StopKind } from "./api";
 
@@ -37,6 +38,28 @@ it("provider hold badge uses projection hold reason without a retry promise", ()
   expect(needsHumanAttention("provider_unavailable")).toBe(true);
   expect(needsHumanAttention("provider_outage")).toBe(false);
   expect(badge.kind === "badge" && badge.title).toContain("waits for its owner");
+});
+it.each([
+  ["credential_switch_settling", "settling", "stopping processes: token switch", /still stopping this run's processes/],
+  ["credential_switch_unsettled", "unsettled", "held: token switch", /could not be proven stopped/],
+] as const)("issue #3181 token-switch hold %s renders as its own owner-attention park", (hold, kind, label, title) => {
+  const r = run({ status: "paused", hold_reason: hold });
+  expect(credentialSwitchHold(r)).toBe(kind);
+  expect(effectiveRunStatus(r)).toBe(hold);
+  const badge = runBadge(r, 0);
+  expect(badge).toMatchObject({ kind: "badge", label, tone: "warning", pulse: false });
+  expect(badge.kind === "badge" && badge.title).toMatch(title);
+  expect(runStatusTone(hold, null)).toBe("warning");
+  expect(needsHumanAttention(hold)).toBe(true);
+});
+it("token-switch hold reasons overlay only a paused run", () => {
+  for (const status of ["queued", "running", "recovery_wait"] as const) {
+    const r = run({ status, hold_reason: "credential_switch_settling" });
+    expect(credentialSwitchHold(r)).toBeNull();
+    expect(effectiveRunStatus(r)).toBe(status);
+  }
+  expect(credentialSwitchHold(run({ status: "paused", hold_reason: null }))).toBeNull();
+  expect(effectiveRunStatus(run({ status: "paused", hold_reason: null }))).toBe("paused");
 });
 it("provider recovery badge only names provider when cause is available", () => {
   expect(runBadge({ ...run({ status: "recovery_wait" }), recovery_wait_cause: "provider_outage" }, 0))

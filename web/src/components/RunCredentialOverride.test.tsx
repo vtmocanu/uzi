@@ -314,3 +314,29 @@ describe("SwitchTokenAction — seeds an EXISTING pinned override via the self-f
     expect(confirm.disabled).toBe(true);
   });
 });
+
+// Issue #3181: the token-switch holds. A settling hold's switch is refused server-side (409)
+// until the worker finishes stopping the run's processes, so the header action says when it
+// opens instead of offering a confirm; an unsettled hold's switch requeues the held run, so
+// it must not promise an interrupt of live work.
+describe("SwitchTokenAction — credential-switch holds", () => {
+  it("settling: no trigger, says when Switch token opens", () => {
+    render(<SwitchTokenAction run={run({ status: "paused", hold_reason: "credential_switch_settling" })} canSteer tokens={[token()]} />);
+    expect(screen.queryByRole("button", { name: "Switch token" })).toBeNull();
+    expect(screen.getByText(/Switch token becomes available when the worker finishes stopping/)).toBeTruthy();
+  });
+
+  it("unsettled: the switch resumes the held run and promises no interrupt", () => {
+    render(<SwitchTokenAction run={run({ status: "paused", hold_reason: "credential_switch_unsettled" })} canSteer tokens={[token()]} />);
+    fireEvent.click(screen.getByRole("button", { name: "Switch token" }));
+    expect(screen.getByText("Switching resumes this held run on the chosen token.")).toBeTruthy();
+    expect(screen.queryByText(/Switching now interrupts the run/)).toBeNull();
+  });
+
+  it("an owner pause keeps the interrupt caveat (control)", () => {
+    render(<SwitchTokenAction run={run({ status: "paused", hold_reason: null })} canSteer tokens={[token()]} />);
+    fireEvent.click(screen.getByRole("button", { name: "Switch token" }));
+    expect(screen.getByText(/Switching now interrupts the run/)).toBeTruthy();
+    expect(screen.queryByText("Switching resumes this held run on the chosen token.")).toBeNull();
+  });
+});
