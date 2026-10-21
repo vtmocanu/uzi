@@ -10972,6 +10972,33 @@ try {
       if (await read(["rev-parse", "--verify", "HEAD^{commit}"]) !== oldHead + "\n") throw refused();
       return staged;
     };
+    // issue #3239: the marker never carries a core file or a blob over WIP_CAPTURE_MAX_FILE_BYTES.
+    // Staged entries that differ from HEAD are checked before the commit dispatches (one
+    // batched size read); any hit refuses, so the caller keeps the source. No filenames escape.
+    const omitted = async (staged: string): Promise<void> => {
+      const head = new Set(headIndex ? headIndex.slice(0, -1).split("\0") : []);
+      const oids: string[] = [];
+      for (const row of staged ? staged.slice(0, -1).split("\0") : []) {
+        if (head.has(row)) continue;
+        const match = /^(100644|100755|120000) ([0-9a-f]{40}) 0\t([^\0]+)$/.exec(row);
+        if (!match || WIP_CORE_FILE_RE.test(path.posix.basename(match[3]!))) throw refused();
+        oids.push(match[2]!);
+      }
+      const uniq = [...new Set(oids)];
+      if (uniq.length === 0) return;
+      check();
+      let out: string;
+      try {
+        out = await this.runGitAsRunner(clonePath, [...pins, "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"],
+          { env, input: uniq.join("\n") + "\n" });
+      } catch { throw refused(); }
+      const lines = rows(out.replaceAll("\n", "\0"), "sourceEntries");
+      if (lines.length !== uniq.length) throw refused();
+      for (let i = 0; i < uniq.length; i++) {
+        const match = /^([0-9a-f]{40}) blob ([0-9]+)$/.exec(lines[i]!);
+        if (!match || match[1] !== uniq[i] || Number(match[2]) > WIP_CAPTURE_MAX_FILE_BYTES) throw refused();
+      }
+    };
     let sourceDigest: string | undefined;
     let headIndex = "";
     let commitIndex = "";
@@ -10989,6 +11016,7 @@ try {
           return match[1] + " " + match[2] + " 0\t" + match[3] + "\0";
         }).join("");
       }
+      if (step === "commit") await omitted(index);
       // Compare on the same raw byte pass: HEAD for clean, staged blobs before commit.
       // No fourth enumeration, smaller blob limit, or additional source reservation.
       const input = await this.maintenanceWipInput(clonePath, { metadataBytes: 16 * 1024 ** 2 }, step === "status" ? headIndex : step === "commit" ? index : "");
