@@ -544,5 +544,7 @@ func shallowBaseHas(t *testing.T, url, sha, branch string) bool {
 	}
 	args := append([]string{"-C", dir, "-c", "http.sslVerify=false", "fetch", "-q", "--depth", "1", url}, specs...)
 	run(t, "", "git", args...)
-	return exec.Command("git", "-C", dir, "cat-file", "-e", sha+"^{commit}").Run() == nil
+	probe := exec.Command("git", "-C", dir, "cat-file", "-e", sha+"^{commit}") //nolint:gosec // G204: test helper against a test-owned temp repo; sha is the declared tip under test, not attacker input.
+	probe.Env = cleanGitEnv()
+	return probe.Run() == nil
 }
