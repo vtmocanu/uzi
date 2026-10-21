@@ -3181,12 +3181,16 @@ func (s *Service) RunBlockedOutcome(runID uuid.UUID) (reason string, workerID uu
 // CLOSED (ErrActiveSnapshotInvalid → the handler's 400). Without a snapshot (or without a tx
 // beginner: fake-store unit tests) it keeps the single auto-commit ClaimRun, which still applies
 // the persisted-snapshot exclusions and the overflow closure. Assembly always runs OUTSIDE the tx.
+//
+// Claim is the member-absent form (issue #3142): it reports no memory_authority, kept for tests
+// and internal callers. The HTTP handler calls ClaimReported.
 func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveSnapshot) (*ClaimPayload, error) {
 	return s.claimLane(ctx, wkr, snapshot, "run", MemoryAuthorityReport{})
 }
 
-// ClaimReported is Claim carrying the request's memory_authority report (issue #3142). Claim
-// itself means "member absent", so a capable worker is still gated (fail closed).
+// ClaimReported is Claim carrying the request's memory_authority report (issue #3142). The
+// handler uses it; Claim below is the member-absent form kept for tests and internal callers,
+// so a capable worker claiming through it is still gated (fail closed).
 func (s *Service) ClaimReported(ctx context.Context, wkr store.Worker, snapshot *ActiveSnapshot, report MemoryAuthorityReport) (*ClaimPayload, error) {
 	return s.claimLane(ctx, wkr, snapshot, "run", report)
 }
@@ -3323,7 +3327,7 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		if memLost {
 			s.memAuthority.recordLost(wkr.ID, claimNow)
 		} else if report.held() {
-			s.memAuthority.clear(wkr.ID)
+			s.memAuthority.evictIfSet(wkr.ID)
 		}
 	}
 	params := store.ClaimRunParams{

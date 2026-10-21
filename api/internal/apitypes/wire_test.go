@@ -930,6 +930,9 @@ var workerDTOKeys = []string{
 	// and why). Both null unless the last heartbeat reported it; overlaid from an in-process
 	// tracker, never stored. The cause is untrusted text.
 	"residue_quarantined_at", "residue_quarantine_cause",
+	// Issue #3142: when the api first gated this worker's run-lane claims for lost memory
+	// authority (api clock). Null when not gated; overlaid from an in-process tracker.
+	"memory_authority_lost_at",
 }
 
 func TestWorkerDTOTags(t *testing.T) {

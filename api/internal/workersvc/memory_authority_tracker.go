@@ -90,8 +90,6 @@ func (t *memoryAuthorityTracker) get(workerID uuid.UUID) (time.Time, bool) {
 	return st.since, ok
 }
 
-func (t *memoryAuthorityTracker) clear(workerID uuid.UUID) { t.evictIfSet(workerID) }
-
 // evictIfSet drops a worker's entry (held claim, re-register, delete). Nil-safe.
 func (t *memoryAuthorityTracker) evictIfSet(workerID uuid.UUID) {
 	if t == nil {

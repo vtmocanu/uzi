@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // memClaimStore records the ClaimRun params the handler's claim reached.
@@ -105,4 +107,67 @@ func TestWorkerClaimChatLaneIgnoresMemoryAuthority(t *testing.T) {
 			t.Errorf("body %q: chat lane reached ClaimRun: %+v", body, st.got)
 		}
 	}
+}
+
+// memAuthListStore is custodyListStore plus a ClaimRun that finds nothing, so a gated
+// claim can be recorded in the workersvc tracker through its public Claim path.
+type memAuthListStore struct{ *custodyListStore }
+
+func (memAuthListStore) ClaimRun(context.Context, store.ClaimRunParams) (store.Run, error) {
+	return store.Run{}, pgx.ErrNoRows
+}
+
+// Issue #3142: memory_authority_lost_at rides the user list and the admin list, present for
+// a gated worker and null for the other.
+func TestWorkerSurfacesOverlayMemoryAuthority(t *testing.T) {
+	id, other := uuid.New(), uuid.New()
+	gate := func(t *testing.T, h *Handler) {
+		t.Helper()
+		lost := "lost"
+		_, err := h.wsvc.ClaimReported(context.Background(), store.Worker{ID: id}, nil, workersvc.MemoryAuthorityReport{Value: &lost})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := h.wsvc.MemoryAuthorityLostFor(id); !ok {
+			t.Fatal("setup: worker not recorded as gated")
+		}
+	}
+	check := func(t *testing.T, rec *httptest.ResponseRecorder) {
+		t.Helper()
+		var body struct {
+			Workers []map[string]json.RawMessage `json:"workers"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if len(body.Workers) != 2 {
+			t.Fatalf("rows = %s", rec.Body.String())
+		}
+		gated, ok := body.Workers[0]["memory_authority_lost_at"]
+		if !ok || string(gated) == "null" || len(gated) < 3 {
+			t.Fatalf("gated row memory_authority_lost_at = %q (present=%t), want a timestamp", gated, ok)
+		}
+		if got, ok := body.Workers[1]["memory_authority_lost_at"]; !ok || string(got) != "null" {
+			t.Fatalf("clean row memory_authority_lost_at = %q (present=%t), want null", got, ok)
+		}
+	}
+	withUser := func() *http.Request {
+		return httptest.NewRequest(http.MethodGet, "/api/workers", nil).WithContext(mw.ContextWithUser(context.Background(), store.User{ID: uuid.New()}))
+	}
+	t.Run("user list", func(t *testing.T) {
+		st := memAuthListStore{&custodyListStore{ownerRows: []store.ListWorkersByUserRow{{ID: id}, {ID: other}}}}
+		h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
+		gate(t, h)
+		rec := httptest.NewRecorder()
+		h.ListWorkers(rec, withUser())
+		check(t, rec)
+	})
+	t.Run("admin list", func(t *testing.T) {
+		st := memAuthListStore{&custodyListStore{adminRows: []store.ListAllWorkersRow{{Worker: store.Worker{ID: id}}, {Worker: store.Worker{ID: other}}}}}
+		h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
+		gate(t, h)
+		rec := httptest.NewRecorder()
+		h.AdminListWorkers(rec, withUser())
+		check(t, rec)
+	})
 }

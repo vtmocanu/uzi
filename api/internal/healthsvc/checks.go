@@ -41,27 +41,28 @@ var checkMeta = map[string]struct {
 	title string
 	doc   string
 }{
-	"fleet.roll":         {"instance", groupWorkers, "Worker image roll", "worker-upgrades"},
-	"fleet.capacity":     {"owner", groupWorkers, "Worker capacity", "hosted-workers"},
-	"fleet.disk":         {"owner", groupWorkers, "Worker disk", "hosted-workers"},
-	"fleet.rundisk":      {"owner", groupWorkers, "Run disk size", "hosted-workers"},
-	"fleet.quarantine":   {"owner", groupWorkers, "Worker residue quarantine", "hosted-workers"},
-	"queue.waiting":      {"owner", groupQueue, "Runs waiting for a worker", ""},
-	"queue.undispatched": {"owner", groupQueue, "Undispatched task runs", ""},
-	"controller.report":  {"instance", groupControl, "Controller reporting", "hosted-workers"},
-	"db":                 {"instance", groupControl, "Database", ""},
-	"db.size":            {"instance", groupControl, "Database size", "admin-health"},
-	"loops":              {"instance", groupControl, "Background loops", ""},
-	"forge.sync":         {"owner", groupIntegrations, "Forge issue sync", ""},
-	"forge.ciwatch":      {"owner", groupIntegrations, "CI watch capacity", ""},
-	"slack.socket":       {"owner", groupIntegrations, "Slack socket", ""},
-	"schedules.paused":   {"owner", groupHousekeeping, "Paused schedules", ""},
-	"board.drift":        {"owner", groupHousekeeping, "Board drift", ""},
-	"custody.holds":      {"owner", groupHousekeeping, "Recovery custody holds", ""},
-	"recovery.storage":   {"owner", groupHousekeeping, "Recovery storage", ""},
-	"release.check":      {"owner", groupHousekeeping, "Upstream release", ""},
-	"agentsource.update": {"instance", groupHousekeeping, "Agent source update", "agent-source"},
-	"pricing.codex":      {"instance", groupHousekeeping, "Codex price coverage", "admin-health"},
+	"fleet.roll":             {"instance", groupWorkers, "Worker image roll", "worker-upgrades"},
+	"fleet.capacity":         {"owner", groupWorkers, "Worker capacity", "hosted-workers"},
+	"fleet.disk":             {"owner", groupWorkers, "Worker disk", "hosted-workers"},
+	"fleet.rundisk":          {"owner", groupWorkers, "Run disk size", "hosted-workers"},
+	"fleet.quarantine":       {"owner", groupWorkers, "Worker residue quarantine", "hosted-workers"},
+	"fleet.memory_authority": {"owner", groupWorkers, "Worker memory authority", "hosted-workers"},
+	"queue.waiting":          {"owner", groupQueue, "Runs waiting for a worker", ""},
+	"queue.undispatched":     {"owner", groupQueue, "Undispatched task runs", ""},
+	"controller.report":      {"instance", groupControl, "Controller reporting", "hosted-workers"},
+	"db":                     {"instance", groupControl, "Database", ""},
+	"db.size":                {"instance", groupControl, "Database size", "admin-health"},
+	"loops":                  {"instance", groupControl, "Background loops", ""},
+	"forge.sync":             {"owner", groupIntegrations, "Forge issue sync", ""},
+	"forge.ciwatch":          {"owner", groupIntegrations, "CI watch capacity", ""},
+	"slack.socket":           {"owner", groupIntegrations, "Slack socket", ""},
+	"schedules.paused":       {"owner", groupHousekeeping, "Paused schedules", ""},
+	"board.drift":            {"owner", groupHousekeeping, "Board drift", ""},
+	"custody.holds":          {"owner", groupHousekeeping, "Recovery custody holds", ""},
+	"recovery.storage":       {"owner", groupHousekeeping, "Recovery storage", ""},
+	"release.check":          {"owner", groupHousekeeping, "Upstream release", ""},
+	"agentsource.update":     {"instance", groupHousekeeping, "Agent source update", "agent-source"},
+	"pricing.codex":          {"instance", groupHousekeeping, "Codex price coverage", "admin-health"},
 }
 
 // base returns a check DTO pre-filled with the id's fixed metadata and a non-nil (empty)
@@ -620,6 +621,53 @@ func (s *Service) checkFleetQuarantine(now time.Time, workers []store.ListAllWor
 		c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Worker", Value: l})
 	}
 	c.Action = strPtr("Restart the quarantined worker's container to clear the latch; read the reported cause in `uzi admin workers --json` (residue_quarantine_cause) or the worker view in `uzi tui`.")
+	c.Since = sincePtr(oldest)
+	return c
+}
+
+// checkFleetMemoryAuthority (issue #3142) warns when the api is withholding guard-bound runs
+// from a worker with a fresh heartbeat because its run-lane claims did not report memory
+// authority. The record is the api's own in-process gate tracker (Config.MemoryAuthorityLost),
+// so a worker without a fresh heartbeat is skipped, as in checkFleetQuarantine. Worker names
+// are re-bounded through safe; nothing else worker-supplied is rendered.
+func (s *Service) checkFleetMemoryAuthority(now time.Time, workers []store.ListAllWorkersRow) apitypes.HealthCheckDTO {
+	c := s.base("fleet.memory_authority")
+	var gated []string
+	var oldest time.Time
+	if s.cfg.MemoryAuthorityLost != nil {
+		for _, row := range workers {
+			w := row.Worker
+			if !w.LastHeartbeatAt.Valid || now.Sub(w.LastHeartbeatAt.Time) > s.heartbeatStale() {
+				continue
+			}
+			since, ok := s.cfg.MemoryAuthorityLost(w.ID)
+			if !ok {
+				continue
+			}
+			age := now.Sub(since)
+			if age < 0 {
+				age = 0
+			}
+			gated = append(gated, fmt.Sprintf("%s (gated %s ago)", orDash(safe(w.Name)), humanDur(age)))
+			if oldest.IsZero() || since.Before(oldest) {
+				oldest = since
+			}
+		}
+	}
+	if len(gated) == 0 {
+		c.Severity = sevOK
+		c.Summary = "No worker has lost memory authority."
+		return c
+	}
+	c.Severity = sevWarn
+	c.Summary = fmt.Sprintf("%d worker(s) have lost memory authority; guard-bound runs are withheld from them.", len(gated))
+	for i, g := range gated {
+		if i == maxQuarantineEvidence {
+			break
+		}
+		c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Worker", Value: g})
+	}
+	c.Action = strPtr("Restart the worker's container: memory authority returns only with a fresh registration. Until then the api withholds guard-bound runs (every run-lane kind except judge, job, cross-check, review and isolated-fetch runs) from it; read memory_authority_lost_at in `uzi admin workers --json`.")
 	c.Since = sincePtr(oldest)
 	return c
 }

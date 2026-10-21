@@ -672,6 +672,9 @@ func TestStatusCell(t *testing.T) {
 		// timestamp alone; the worker's self-reported cause never reaches the status cell.
 		{"quarantined", apitypes.WorkerDTO{Status: "online", ResidueQuarantinedAt: &ts, ResidueQuarantineCause: strPtrT("pid 4242 \x1b[31mssh-agent")}, "online (quarantined)"},
 		{"quarantined and cordoned", apitypes.WorkerDTO{Status: "online", DrainingSince: &ts, ResidueQuarantinedAt: &ts}, "online (cordoned) (quarantined)"},
+		// Issue #3142: a worker the api gated for lost memory authority carries a fixed suffix.
+		{"memory authority lost", apitypes.WorkerDTO{Status: "online", MemoryAuthorityLostAt: &ts}, "online (memory authority lost)"},
+		{"quarantined and memory authority lost", apitypes.WorkerDTO{Status: "online", ResidueQuarantinedAt: &ts, MemoryAuthorityLostAt: &ts}, "online (quarantined) (memory authority lost)"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := statusCell(tc.w); got != tc.want {
@@ -920,6 +923,31 @@ func TestStatusCellLease(t *testing.T) {
 }
 
 func strPtrT(s string) *string { return &s }
+
+// TestMemoryAuthorityLostWorkerStatusInBothTables (issue #3142): `uzi worker list` and `uzi
+// admin workers` both mark a gated worker with the fixed suffix, and an ungated worker has none.
+func TestMemoryAuthorityLostWorkerStatusInBothTables(t *testing.T) {
+	now := time.Now()
+	dto := apitypes.WorkerDTO{ID: "w1", Name: "gated", Status: "online", AnthropicBindMode: "default", MemoryAuthorityLostAt: &now}
+	clean := apitypes.WorkerDTO{ID: "w2", Name: "fine", Status: "online", AnthropicBindMode: "default"}
+	for name, tc := range map[string]struct {
+		args []string
+		fc   *uzicli.FakeClient
+	}{
+		"worker list":   {[]string{"worker", "list"}, &uzicli.FakeClient{Workers: []apitypes.WorkerDTO{dto, clean}}},
+		"admin workers": {[]string{"admin", "workers"}, &uzicli.FakeClient{AdminWorkers: []apitypes.AdminWorkerDTO{{WorkerDTO: dto, OwnerEmail: "o@uzi.test"}, {WorkerDTO: clean, OwnerEmail: "o@uzi.test"}}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			out, _, code := runCLI(t, fakeEnv(tc.fc), tc.args...)
+			if code != uzicli.ExitOK {
+				t.Fatalf("exit = %d", code)
+			}
+			if got := strings.Count(out, "(memory authority lost)"); got != 1 {
+				t.Errorf("suffix count = %d, want 1 (gated worker only):\n%s", got, out)
+			}
+		})
+	}
+}
 
 // TestQuarantinedWorkerStatusInBothTables (issue #2213): `uzi worker list` and `uzi admin
 // workers` both mark a quarantined worker with the fixed " (quarantined)" suffix and never

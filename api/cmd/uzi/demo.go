@@ -264,6 +264,7 @@ func demoWorkers(now time.Time, runs []apitypes.RunListItemDTO) ([]apitypes.Work
 	all[8].TemplateDeclared, all[8].TemplateReported, all[8].Capabilities = nil, nil, []string{}
 	all[8].ResidueQuarantinedAt = at(-20 * time.Minute)
 	all[8].ResidueQuarantineCause = str("runner-uid pid 4242 \"ssh-agent\" could not be attributed (env/cwd unreadable)")
+	all[7].MemoryAuthorityLostAt = at(-12 * time.Minute)
 	all[9].DrainingSince = at(-time.Hour)
 	// The five occupied run slots and the separate chat map to demo runs.
 	// Chat is reported without adding to run-lane occupancy.
