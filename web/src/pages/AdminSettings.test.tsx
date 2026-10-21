@@ -114,8 +114,10 @@ const response = (
     public_base_url: "default",
     slack_bot_token: "default",
     slack_app_token: "default",
+    judge_model: "default",
     ...sources,
   } as Record<string, Src>,
+  defaults: { judge_model: "opus" },
   slack_status,
 });
 
@@ -660,19 +662,21 @@ describe("AdminSettings — run judge (PRD #46)", () => {
   });
 
   it("loads the current global toggle and judge model", async () => {
-    mockApi.getSettings.mockResolvedValue(response({ judge_enabled: "true", judge_model: "sonnet" }));
+    mockApi.getSettings.mockResolvedValue(
+      response({ judge_enabled: "true", judge_model: "sonnet" }, {}, { judge_model: "db" }),
+    );
     renderPage();
     const toggle = (await screen.findByLabelText(/Enable the run judge for this instance/i)) as HTMLInputElement;
     expect(toggle.checked).toBe(true);
-    expect((screen.getByLabelText("Judge model") as HTMLInputElement).value).toBe("sonnet");
+    expect((screen.getByLabelText("Judge model") as HTMLSelectElement).value).toBe("sonnet");
   });
 
   it("saves the global toggle and judge model together", async () => {
-    mockApi.updateSettings.mockResolvedValue(response({ judge_enabled: "true", judge_model: "opus" }));
+    mockApi.updateSettings.mockResolvedValue(response({ judge_enabled: "true", judge_model: "haiku" }));
     renderPage();
     await screen.findByLabelText(/Enable the run judge for this instance/i);
     fireEvent.click(screen.getByLabelText(/Enable the run judge for this instance/i));
-    fireEvent.change(screen.getByLabelText("Judge model"), { target: { value: "opus" } });
+    fireEvent.change(screen.getByLabelText("Judge model"), { target: { value: "haiku" } });
 
     const btn = screen.getByRole("button", { name: /save run judge settings/i }) as HTMLButtonElement;
     expect(btn.disabled).toBe(false);
@@ -681,7 +685,7 @@ describe("AdminSettings — run judge (PRD #46)", () => {
     await waitFor(() =>
       expect(mockApi.updateSettings).toHaveBeenCalledWith({
         judge_enabled: "true",
-        judge_model: "opus",
+        judge_model: "haiku",
         // enforce-all stays off (fixture default), the spend guards keep their loaded
         // values (PRD #69 M4/M5): the card sends the whole judge group on one save.
         judge_enforce_all: "false",
@@ -709,13 +713,40 @@ describe("AdminSettings — run judge (PRD #46)", () => {
     );
   });
 
-  it("blocks an empty judge model client-side without calling the API", async () => {
+  it("renders Default selected when the judge model follows the built-in", async () => {
+    renderPage();
+    const select = (await screen.findByLabelText("Judge model")) as HTMLSelectElement;
+    expect(select.value).toBe("inherit");
+    expect(select.options[select.selectedIndex].textContent).toBe("Default \u00b7 opus (built-in)");
+  });
+
+  it("resets to the built-in by sending an empty judge model", async () => {
+    mockApi.updateSettings.mockResolvedValue(response({}));
+    mockApi.getSettings.mockResolvedValue(response({ judge_model: "haiku" }, {}, { judge_model: "db" }));
+    renderPage();
+    const select = (await screen.findByLabelText("Judge model")) as HTMLSelectElement;
+    expect(select.value).toBe("haiku");
+    fireEvent.change(select, { target: { value: "inherit" } });
+    fireEvent.click(screen.getByRole("button", { name: /save run judge settings/i }));
+    await waitFor(() =>
+      expect(mockApi.updateSettings).toHaveBeenCalledWith(expect.objectContaining({ judge_model: "" })),
+    );
+  });
+
+  it("leaves the judge model out of the save when it did not change", async () => {
+    mockApi.updateSettings.mockResolvedValue(response({ judge_enabled: "true" }));
     renderPage();
     await screen.findByLabelText("Judge model");
-    fireEvent.change(screen.getByLabelText("Judge model"), { target: { value: "  " } });
+    fireEvent.click(screen.getByLabelText(/Enable the run judge for this instance/i));
     fireEvent.click(screen.getByRole("button", { name: /save run judge settings/i }));
-    expect(await screen.findByText(/judge model must not be empty/i)).toBeTruthy();
-    expect(mockApi.updateSettings).not.toHaveBeenCalled();
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalled());
+    expect(mockApi.updateSettings.mock.calls[0][0]).not.toHaveProperty("judge_model");
+  });
+
+  it("does not show the raw judge_model key name in the help text", async () => {
+    const { container } = renderPage();
+    await screen.findByLabelText("Judge model");
+    expect(container.textContent ?? "").not.toContain("judge_model");
   });
 });
 

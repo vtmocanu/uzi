@@ -508,12 +508,61 @@ func TestJudgeWritability(t *testing.T) {
 	// Per-value validation rejects the obvious bad inputs.
 	for _, tc := range []struct{ key, value string }{
 		{KeyJudgeEnabled, "yes"},
-		{KeyJudgeModel, ""},
+		{KeySummaryModel, ""},
 		{KeyJudgeModel, "two words"},
 	} {
 		if err := Validate(tc.key, tc.value); err == nil {
 			t.Errorf("Validate(%s, %q) = nil, want an error", tc.key, tc.value)
 		}
+	}
+
+	// A blank judge model is the explicit reset to the built-in (PRD #3245).
+	for _, v := range []string{"", "   "} {
+		if err := Validate(KeyJudgeModel, v); err != nil {
+			t.Errorf("Validate(judge_model, %q) = %v, want nil (reset)", v, err)
+		}
+	}
+}
+
+func TestNormalizeForStorage(t *testing.T) {
+	if got := NormalizeForStorage(KeyJudgeModel, "  opus \t"); got != "opus" {
+		t.Errorf("judge_model = %q, want trimmed", got)
+	}
+	if got := NormalizeForStorage(KeyJudgeModel, "   "); got != "" {
+		t.Errorf("whitespace judge_model = %q, want empty", got)
+	}
+	if got := NormalizeForStorage(KeyUziLabel, "  x "); got != "  x " {
+		t.Errorf("other keys must be verbatim, got %q", got)
+	}
+}
+
+func TestInstanceModels(t *testing.T) {
+	ctx := context.Background()
+	fs := &fakeStore{rows: []store.AppSetting{row(KeyJudgeModel, "  haiku ")}}
+	c := New(fs, time.Minute)
+
+	got, err := c.InstanceModel(ctx, KeyJudgeModel)
+	if err != nil || got != "haiku" {
+		t.Fatalf("InstanceModel = %q, %v; want trimmed haiku", got, err)
+	}
+
+	// Unset: "" and never the compiled default.
+	c2 := New(&fakeStore{}, time.Minute)
+	vals, err := c2.InstanceModels(ctx, []string{KeyJudgeModel})
+	if err != nil || vals[KeyJudgeModel] != "" {
+		t.Fatalf("unset = %v, %v; want empty string", vals, err)
+	}
+
+	// ENV wins over the stored row.
+	c.ConfigureSecrets(nil, map[string]string{KeyJudgeModel: "sonnet"})
+	if got, _ := c.InstanceModel(ctx, KeyJudgeModel); got != "sonnet" {
+		t.Errorf("env InstanceModel = %q, want sonnet", got)
+	}
+
+	// A secret key is refused with no values.
+	vals, err = c.InstanceModels(ctx, []string{KeyJudgeModel, KeySlackBotToken})
+	if err == nil || vals != nil {
+		t.Errorf("secret key: got %v, %v; want error and no values", vals, err)
 	}
 }
 

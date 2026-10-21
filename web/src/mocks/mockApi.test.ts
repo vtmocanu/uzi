@@ -1036,3 +1036,32 @@ describe("mockApi run-list summary projection (#2661)", () => {
     for (const k of heavy) for (const row of summary) expect(k in row).toBe(false);
   });
 });
+
+describe("mockApi judge_model reset (PRD #3245 M1)", () => {
+  it("accepts a blank judge_model as the reset and reports the built-in with source default", async () => {
+    installStorage();
+    const api = await reload();
+
+    const pinned = await api.updateSettings({ judge_model: " haiku " });
+    expect(pinned.settings.judge_model).toBe("haiku");
+    expect(pinned.sources.judge_model).toBe("db");
+
+    for (const blank of ["", "   "]) {
+      await api.updateSettings({ judge_model: "haiku" });
+      const res = await api.updateSettings({ judge_model: blank });
+      expect(res.settings.judge_model).toBe("opus");
+      expect(res.sources.judge_model).toBe("default");
+      expect(res.defaults?.judge_model).toBe("opus");
+    }
+  });
+
+  it("still refuses a blank summary_model and a multi-token judge_model", async () => {
+    installStorage();
+    const api = await reload();
+    await expect(api.updateSettings({ summary_model: "" })).rejects.toMatchObject({
+      status: 400,
+      message: expect.stringContaining("must not be empty"),
+    });
+    await expect(api.updateSettings({ judge_model: "two words" })).rejects.toMatchObject({ status: 400 });
+  });
+});

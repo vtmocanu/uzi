@@ -547,11 +547,19 @@ function settingsResponse(): SettingsResponse {
   const sources: Record<string, SettingSource> = {};
   for (const key of Object.keys(appSettings)) sources[key] = "db";
   for (const key of Object.keys(slackSecrets)) sources[key] = slackSecrets[key] ? "db" : "default";
+  // An empty judge_model is the explicit reset (PRD #3245): the response reports the
+  // built-in as the effective value with source "default", like the server.
+  const effective: AppSettings = { ...appSettings };
+  if (appSettings.judge_model.trim() === "") {
+    effective.judge_model = SEED_APP_SETTINGS.judge_model;
+    sources.judge_model = "default";
+  }
   // The demo has no real socket, so Slack is always "disabled" here.
   return {
-    settings: { ...appSettings },
+    settings: effective,
     secrets: { ...slackSecrets },
     sources,
+    defaults: { ...SEED_APP_SETTINGS },
     slack_status: "disabled",
     oidc_status: oidcDemo().oidcStatus,
     oidc_provider_name: oidcDemo().providerName,
@@ -878,9 +886,17 @@ export const settingsApi = {
         nonSecret.judge_daily_budget = String(n);
         continue;
       }
-      // judge_model (PRD #46) and summary_model (PRD #362) are model aliases: non-empty
-      // single token, mirroring the server's PRD #17 ValidateModel rules.
-      if (key === "judge_model" || key === "summary_model") {
+      // judge_model (PRD #46) is trimmed and may be blank: "" is the reset to the
+      // built-in (PRD #3245), mirroring the server's trim-at-storage.
+      if (key === "judge_model") {
+        const trimmed = value.trim();
+        if (/\s/.test(trimmed)) throw new ApiError(400, "judge_model: must be a single token with no spaces");
+        nonSecret.judge_model = trimmed;
+        continue;
+      }
+      // summary_model (PRD #362) is a model alias: non-empty single token, mirroring
+      // the server's PRD #17 ValidateModel rules.
+      if (key === "summary_model") {
         if (value.trim() === "") throw new ApiError(400, `${key}: must not be empty`);
         if (/\s/.test(value)) throw new ApiError(400, `${key}: must be a single token with no spaces`);
         (nonSecret as Record<string, string>)[key] = value;

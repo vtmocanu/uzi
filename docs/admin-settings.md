@@ -78,7 +78,12 @@ and how to add a theme.
 A global kill-switch for the [run judge](./judge.md), plus the model it runs
 on (**Judge model**, `opus` by default — the judge's recommendations feed
 self-improvement, so the strongest model is the default; pin a cheaper alias
-like `haiku` or `sonnet` to spend less). This switch
+like `haiku` or `sonnet` to spend less). **Judge model** is a model picker
+for the Claude judge model. Its **Default · opus (built-in)** option resets the
+instance value to the built-in, so it follows future changes to uzi's built-in
+default; saving an empty or whitespace-only `judge_model` through the admin API
+does the same (values are stored trimmed, and a whitespace-only value stores
+empty and is reported as source `default`). This switch
 only arms the feature instance-wide; each user still opts in under their own
 Settings, and the judge always spends that user's own Anthropic token, never
 the admin's.

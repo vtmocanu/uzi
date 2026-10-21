@@ -1,7 +1,15 @@
 import { useState, type FormEvent } from "react";
-import { api, type AppSettings, type SettingsResponse } from "../../lib/api";
+import { api, type AppSettings, type SettingSource, type SettingsResponse } from "../../lib/api";
 import { errorMessage } from "../../lib/apiError";
+import { ModelSelect } from "../../components/ModelSelect";
 import { Alert, Button, Card, Field, Input, SectionTitle } from "../../components/ui";
+
+// pinnedJudgeModel is the instance's own pin: "" when the judge model follows the
+// built-in (source "default"), else the stored value. The select's empty option is
+// the reset, so an unpinned instance shows Default selected, not the resolved alias.
+function pinnedJudgeModel(settings: AppSettings, sources: Record<string, SettingSource>): string {
+  return sources.judge_model === "default" ? "" : settings.judge_model;
+}
 
 // JudgeSettingsCard is the admin surface for the run judge (PRD #46): the global
 // on/off kill-switch plus the cheap model the judge runs on. It saves independently
@@ -10,13 +18,19 @@ import { Alert, Button, Card, Field, Input, SectionTitle } from "../../component
 // arms the feature instance-wide.
 export function JudgeSettingsCard({
   settings,
+  sources,
+  defaults,
   onSaved,
 }: {
   settings: AppSettings;
+  sources: Record<string, SettingSource>;
+  // The compiled-in defaults from the admin GET, for the "Default · <model> (built-in)" label.
+  defaults: Record<string, string>;
   onSaved: (resp: SettingsResponse) => void;
 }) {
   const [enabled, setEnabled] = useState(settings.judge_enabled === "true");
-  const [model, setModel] = useState(settings.judge_model);
+  const pinned = pinnedJudgeModel(settings, sources);
+  const [model, setModel] = useState(pinned);
   const [enforceAll, setEnforceAll] = useState(settings.judge_enforce_all === "true");
   const [cooldown, setCooldown] = useState(settings.judge_cooldown_seconds);
   const [budget, setBudget] = useState(settings.judge_daily_budget);
@@ -26,7 +40,7 @@ export function JudgeSettingsCard({
 
   const dirty =
     (enabled ? "true" : "false") !== settings.judge_enabled ||
-    model !== settings.judge_model ||
+    model !== pinned ||
     (enforceAll ? "true" : "false") !== settings.judge_enforce_all ||
     cooldown !== settings.judge_cooldown_seconds ||
     budget !== settings.judge_daily_budget;
@@ -35,15 +49,12 @@ export function JudgeSettingsCard({
     e.preventDefault();
     setError("");
     setNotice("");
-    if (model.trim() === "") {
-      setError("The judge model must not be empty.");
-      return;
-    }
     setBusy(true);
     try {
       const resp = await api.updateSettings({
         judge_enabled: enabled ? "true" : "false",
-        judge_model: model,
+        // Sent only when changed; "" is the reset to the built-in model.
+        ...(model !== pinned ? { judge_model: model } : {}),
         // The kill-switch dominates: enforce-all is meaningless with the judge off, so
         // never send it as on when the feature is disabled (mirrors the Gate-2-wins
         // server semantics the /me consent surface also reflects).
@@ -53,7 +64,7 @@ export function JudgeSettingsCard({
       });
       onSaved(resp);
       setEnabled(resp.settings.judge_enabled === "true");
-      setModel(resp.settings.judge_model);
+      setModel(pinnedJudgeModel(resp.settings, resp.sources));
       setEnforceAll(resp.settings.judge_enforce_all === "true");
       setCooldown(resp.settings.judge_cooldown_seconds);
       setBudget(resp.settings.judge_daily_budget);
@@ -93,20 +104,19 @@ export function JudgeSettingsCard({
         </label>
 
         <div className="space-y-1.5">
-          <Field label="Judge model">
-            <Input
+          <Field label="Judge model" htmlFor="judge-model-admin">
+            <ModelSelect
+              id="judge-model-admin"
               value={model}
-              maxLength={100}
-              autoComplete="off"
-              placeholder="opus"
-              onChange={(e) => setModel(e.target.value)}
+              onChange={setModel}
+              defaultLabel={`Default · ${defaults.judge_model ?? "opus"} (built-in)`}
+              customAriaLabel="Custom judge model ID"
             />
           </Field>
           <p className="text-xs text-faint">
-            The Claude model the judge runs on. The default is{" "}
-            <code className="rounded bg-raised px-1 py-0.5 text-fg">opus</code> — the strongest model, since
-            judge recommendations feed self-improvement. Admins and users can pin{" "}
-            <code className="rounded bg-raised px-1 py-0.5 text-fg">haiku</code> or{" "}
+            The Claude model the judge runs on. Choose Default to follow the built-in model, which is the
+            strongest one since judge recommendations feed self-improvement and changes with future
+            releases. Pin <code className="rounded bg-raised px-1 py-0.5 text-fg">haiku</code> or{" "}
             <code className="rounded bg-raised px-1 py-0.5 text-fg">sonnet</code> to spend less.
           </p>
         </div>
@@ -131,9 +141,8 @@ export function JudgeSettingsCard({
           <p className="text-xs text-faint">
             With this on, EVERY user&rsquo;s finished runs are judged — bypassing their per-user opt-in — and
             each is spent on <strong className="text-fg">that user&rsquo;s own Anthropic token without their
-            opt-in</strong>. On a subscription plan it also eats their rate-limit quota. Pin{" "}
-            <code className="rounded bg-raised px-1 py-0.5 text-fg">judge_model</code> to a cheaper model
-            (opus is the default) before enforcing. The per-user judge toggle on the Users page becomes inert
+            opt-in</strong>. On a subscription plan it also eats their rate-limit quota. Pin a
+            cheaper judge model (the built-in default is the strongest) before enforcing. The per-user judge toggle on the Users page becomes inert
             while this is on.
           </p>
         </div>

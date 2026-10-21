@@ -1009,10 +1009,12 @@ it("recorded nested checker metadata always has the nullable member", () => {
 //     but newSettingsResponse takes them from settings.AdminView, which builds all
 //     three with make(...) (handler/settings.go:49 ← settings.go:1320-1322), so the
 //     real wire is never null → secrets/sources get the ZeroOf NeverNull exemption.
+//     defaults (PRD #3245) is likewise always built with make(...) in
+//     newSettingsResponse, so it shares that exemption.
 {
   const _settingsMissing: never = null as unknown as Exclude<keyof SettingsResponse, keyof typeof settingsFull>;
   const _settingsExtra: never = null as unknown as Exclude<keyof typeof settingsFull, keyof SettingsResponse>;
-  const _settingsZero: ZeroOf<Omit<SettingsResponse, "settings">, "secrets" | "sources"> = settingsZero;
+  const _settingsZero: ZeroOf<Omit<SettingsResponse, "settings">, "secrets" | "sources" | "defaults"> = settingsZero;
   const _settingsFull: Widen<Omit<SettingsResponse, "settings">> = settingsFull;
   void _settingsMissing;
   void _settingsExtra;

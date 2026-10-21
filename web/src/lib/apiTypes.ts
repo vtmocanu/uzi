@@ -1145,6 +1145,9 @@ export interface SettingsResponse {
   settings: AppSettings;
   secrets: Record<string, boolean>;
   sources: Record<string, SettingSource>;
+  // Compiled-in default of every non-secret key (PRD #3245); secret keys are never
+  // present. Optional so an older server omits it.
+  defaults?: Record<string, string>;
   // Live Slack socket connection state (PRD #25 M2): "disabled" | "connecting" |
   // "connected" | "error:<class>". The admin Slack card renders it as a chip.
   slack_status: string;
