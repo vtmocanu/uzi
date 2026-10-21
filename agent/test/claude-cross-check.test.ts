@@ -624,7 +624,7 @@ describe("Claude cross-check activity evidence (PRD #3166)", () => {
       done("d1", undefined, { is_error: true, content: [{ type: "text", text: "PreToolUse hook: denied: a Glob or Grep pattern must be relative to the checkout and must not contain '..'" }] }),
       resultFrame(APPROVE),
     ]);
-    assert.deepEqual(events, [{ event: "check_activity", op: "search", outcome: "denied", path: ".", category: "outside_checkout" }]);
+    assert.deepEqual(events, [{ event: "check_activity", op: "search", outcome: "denied", category: "outside_checkout" }]);
   });
 
   it("a Glob with truncated:true records matches_truncated and an untruncated one does not", async () => {

@@ -289,7 +289,6 @@ export class CodexCrossCheck {
         bridge: buildAppServerRefreshBridge(claim.run_id, this.client, binding,
          { value: released.auth_mode === "subscription" ? released.generation : binding.generation }, registerToken) }
     : { mode: "api_key", apiKey: released.access_token });
-   try { activity?.modelStarted(); } catch { /* telemetry only */ }
    const provider = await (this.deps.launchProvider ?? launchCodexRoot)({
     kind: "provider", ownedDataRoot: path.join(home, "codex-data", randomUUID()),
     provider: { name: "openai", baseUrl: "https://api.openai.com/v1", envKey: "OPENAI_API_KEY" },
@@ -359,6 +358,8 @@ export class CodexCrossCheck {
    startingTurn = false;
    const turnId = turn.turn?.id;
    if (typeof turnId !== "string" || !turnId) throw new Error("cross-check missing turn");
+   // The confirmed turn start is the first evidence that the model session started.
+   try { activity?.modelStarted(); } catch { /* telemetry only */ }
    let calls = 0;
    let modelActivity = false;
    let verdictText: string | undefined;

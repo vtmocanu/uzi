@@ -108,6 +108,31 @@ describe("MessageBatcher.undeliveredFromSeq with a spilled pending range", () =>
   });
 });
 
+describe("MessageBatcher.journalOnlySeqs", () => {
+  it("names seqs only journaled to the outbox until a full drain re-arms the batcher", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "batcher-accessors-"));
+    try {
+      const outbox = new Outbox({ root: path.join(dir, "outbox"), log: nullLogger(),
+        runMaxBytes: 64 * 1024 * 1024, maxBytes: 512 * 1024 * 1024, retentionMs: 86_400_000 });
+      await outbox.init();
+      const a = api(() => 503);
+      const b = new MessageBatcher(a.client, "run", 0, 5, nullLogger(), undefined, undefined,
+        { outbox, transientTripMs: 40 });
+      assert.deepEqual([...b.journalOnlySeqs().seqs], []);
+      b.emit(text("one")); b.emit(text("two"));
+      for (let i = 0; i < 200 && !b.isSpilled(); i++) await sleep(20);
+      assert.equal(b.isSpilled(), true, "the failing api drives the batcher into spill");
+      for (let i = 0; i < 200 && b.journalOnlySeqs().seqs.size < 2; i++) await sleep(20);
+      assert.deepEqual([...b.journalOnlySeqs().seqs].sort(), [1, 2], "journaled, not yet delivered");
+      assert.equal(b.undeliveredFromSeq(), undefined, "the journal hides them from undeliveredFromSeq");
+      b.rearm();
+      assert.deepEqual([...b.journalOnlySeqs().seqs], [], "a full drain (re-arm) confirms delivery");
+      assert.equal(b.journalOnlySeqs().overflow, false);
+      await b.close();
+    } finally { await fs.rm(dir, { recursive: true, force: true }); }
+  });
+});
+
 describe("MessageBatcher.tombstonedSeqs", () => {
   it("is empty when nothing was replaced", async () => {
     const a = api(() => undefined);

@@ -444,7 +444,6 @@ export class ClaudeCrossCheck {
       // issue #2213: the last statement before the credential-bearing provider spawn.
       assertResidueQuarantineOpen("provider_turn");
       queryStarted = true;
-      try { activity?.modelStarted(); } catch { /* telemetry only */ }
       iterator = this.queryFn({ prompt: promptStream(prompt), options })[Symbol.asyncIterator]();
       while (true) {
         const next = await iterator.next();
@@ -459,6 +458,8 @@ export class ClaudeCrossCheck {
         const frame = asRecord(msg);
         budget?.observe(frame);
         if (frame?.["type"] === "system" && frame["subtype"] === "init") {
+          // The validated init frame is the first evidence that the model session started.
+          try { activity?.modelStarted(); } catch { /* telemetry only */ }
           for (const em of mapSdkMessage(msg)) {
             if (em.payload["event"] === "init") { await postUsage({ ...em.payload, harness: "claude" }); usageInit = true; }
           }

@@ -110,11 +110,11 @@ describe("CheckActivityRecorder", () => {
     assert.equal(formatActivityLine(a[2]!), "read (tool output) L1-5 · ok");
   });
 
-  it("uses an explicit policy category when the path is inside", () => {
+  it("uses an explicit policy category, without the path, when a guard denies an inside path", () => {
     const { rec, activity } = rig();
     rec.begin("p", "read", ".git/config");
     rec.settle("p", { outcome: "denied", category: "policy" });
-    assert.equal(activity()[0]!["path"], ".git/config");
+    assert.equal("path" in activity()[0]!, false, "a guard-denied attempt carries a category, never the path");
     assert.equal(activity()[0]!["category"], "policy");
   });
 

@@ -349,6 +349,11 @@ export class MessageBatcher {
   private seq: number;
   private readonly tombstoned = new Set<number>();
   private tombstoneOverflow = false;
+  /** Seqs written to the outbox and not yet confirmed delivered by a full drain (bounded like
+   *  {@link tombstoned}). Cleared by {@link rearm}, which runs only after the drainer retired
+   *  every spilled segment of this run. */
+  private readonly journalOnly = new Set<number>();
+  private journalOnlyOverflow = false;
   private timer: NodeJS.Timeout | undefined;
   private flushing = false;
   private closed = false;
@@ -730,6 +735,21 @@ export class MessageBatcher {
     return { seqs: this.tombstoned, overflow: this.tombstoneOverflow };
   }
 
+  /** Seqs whose only delivery evidence is the outbox journal: written while spilled (or by a
+   *  spilled close) and not yet confirmed by a full drain. Bounded: past {@link MAX_TOMBSTONE_SEQS}
+   *  entries the set stops growing and `overflow` is set. Read-only. */
+  journalOnlySeqs(): { seqs: ReadonlySet<number>; overflow: boolean } {
+    return { seqs: this.journalOnly, overflow: this.journalOnlyOverflow };
+  }
+
+  private recordJournalOnly(msgs: readonly OutgoingMessage[]): void {
+    for (const m of msgs) {
+      if (this.journalOnly.has(m.seq)) continue;
+      if (this.journalOnly.size >= MAX_TOMBSTONE_SEQS) { this.journalOnlyOverflow = true; return; }
+      this.journalOnly.add(m.seq);
+    }
+  }
+
   private recordTombstone(seq: number): void {
     if (this.tombstoned.has(seq)) return;
     if (this.tombstoned.size >= MAX_TOMBSTONE_SEQS) {
@@ -774,6 +794,9 @@ export class MessageBatcher {
     this.spilled = false;
     this.consecutiveFailures = 0;
     this.failingSince = undefined;
+    // The drainer retired every spilled segment, so everything journaled has been delivered.
+    this.journalOnly.clear();
+    this.journalOnlyOverflow = false;
     this.log.info("message batcher re-armed to the network after the outbox drained", { run_id: this.runId });
     if (this.buffer.length > 0 || this.pendingRangeFirst !== undefined) this.scheduleFlush();
   }
@@ -1424,6 +1447,7 @@ export class MessageBatcher {
             (identity) => { this.reservation?.outboxPending.add(identity); },
             signal,
           );
+          this.recordJournalOnly(batch.map((b) => b.msg));
         } catch (err) {
           this.buffer = batch.concat(this.buffer);
           // Advance the failure clock so nextDelayMs() backs off on a persistent
@@ -1499,6 +1523,7 @@ export class MessageBatcher {
             signal,
           );
           if (!committed) throw new Error("outbox refused tail segment");
+          this.recordJournalOnly(batch.map((b) => b.msg));
         } catch (err) {
           this.buffer = batch.concat(this.buffer);
           throw err;

@@ -184,8 +184,10 @@ export class CrossCheckRunner {
       if (batcher.isTripped()) return true;
       const from = batcher.undeliveredFromSeq();
       const tombstones = batcher.tombstonedSeqs();
-      if (tombstones.overflow) return true;
-      return usageSeqs.some((s) => (from !== undefined && s >= from) || tombstones.seqs.has(s));
+      const journaled = batcher.journalOnlySeqs();
+      if (tombstones.overflow || journaled.overflow) return true;
+      // Journaled to the outbox but not yet drained is not proof of delivery: fail closed.
+      return usageSeqs.some((s) => (from !== undefined && s >= from) || tombstones.seqs.has(s) || journaled.seqs.has(s));
     };
     let verdictDelivered = false;
     let modelInvoked = false;

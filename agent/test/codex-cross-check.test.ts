@@ -929,11 +929,21 @@ it("activity: a fileop E_TIMEOUT records outcome limit", async () => {
  assert.deepEqual(events, [{ event: "check_activity", op: "read", outcome: "limit", path: "slow.ts" }]);
 });
 
-it("activity: a fileop E_DENIED records denied with category policy", async () => {
+it("activity: a failure after provider launch but before a confirmed turn reports incomplete capture", async () => {
+ const events: Record<string, unknown>[] = [];
+ const recorder = new CheckActivityRecorder((p) => { events.push(structuredClone(p)); }, { generation: 7 });
+ await assert.rejects(rig({ authFailure: true, activity: recorder }).run());
+ recorder.start();
+ recorder.summary("codex", "plan", true);
+ assert.equal(events.find((e) => e["event"] === "check_activity_summary")!["complete"], false,
+  "no model session started, so the capture cannot be complete");
+});
+
+it("activity: a fileop E_DENIED records denied with category policy and no path", async () => {
  const { r, events } = activityRig([{ tool: "Read", arguments: { path: "nope.ts" } }],
   (op) => op.path === "nope.ts" ? { ok: false, code: "E_DENIED" } : undefined);
  assert.equal(await r.run(), verdict);
- assert.deepEqual(events, [{ event: "check_activity", op: "read", outcome: "denied", path: "nope.ts", category: "policy" }]);
+ assert.deepEqual(events, [{ event: "check_activity", op: "read", outcome: "denied", category: "policy" }]);
 });
 
 it("activity: a Search with more than 20 matches records matches_truncated", async () => {

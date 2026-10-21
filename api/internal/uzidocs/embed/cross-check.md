@@ -234,15 +234,15 @@ end of the session is counted `unsettled`.
 the checker run begins and one `check_activity_summary` when the session ends.
 The summary carries the family, stage, per-outcome counts for reads and
 searches, `dropped`, `untracked`, `unsettled` and `complete`. `complete` is true
-only when the start marker was emitted, the checker reached the point of
-launching its model (the Claude query or the Codex provider launch) and the
-check then ended (normally, or by failure or timeout), no begun call is
-unsettled and none was untracked. A check that fails before that point (for
-example an invalid claim, an expired deadline, a clone failure, a missing credential, an
-invalid pinned effort) reports `incomplete`, never "0 reads, 0 searches, 0
-dropped, complete". A failure at or after the launch (the provider fails to
-start, or a pinned model is rejected) can still show a complete capture of zero
-reads. `dropped` does not affect `complete`: a
+only when the start marker was emitted, the checker's model session started
+(the Claude session's init frame arrived, or the Codex turn start was
+confirmed) and the check then ended (normally, or by failure or timeout), no
+begun call is unsettled and none was untracked. A check that ends before its
+model session starts (for example an invalid claim, an expired deadline, a
+clone failure, a missing credential, an invalid pinned effort, a provider that
+fails to start or authenticate, or a pinned model rejected at turn start)
+reports `incomplete`, never "0 reads, 0 searches, 0 dropped, complete".
+`dropped` does not affect `complete`: a
 dropped event is still counted in the totals.
 
 ### Where it shows
@@ -282,9 +282,9 @@ the run's current attempt has arrived. Before then, or when it never arrives:
   rejection of any batch, or no usable outbox while the API is unreachable) or a
   tombstone-set overflow fails a would-be success with `model_error`
   whichever frame caused it. A usage post that fails transiently and is later
-  delivered does not fail the check. A frame written to the worker's outbox
-  counts as delivered, so a later outbox replay that is tombstoned is not seen
-  by the check.
+  delivered does not fail the check. A usage frame that was only written to
+  the worker's outbox (the API was unreachable) and not yet delivered by a
+  full outbox drain is not delivered: a would-be success fails `model_error`.
 - Activity lands on the checker child run, not the lead. The lead's
   stalled-health warning during a code-check wait is unchanged.
 

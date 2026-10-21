@@ -121,8 +121,9 @@ export class CheckActivityRecorder {
     } catch { /* telemetry only */ }
   }
 
-  /** Record that the checker session crossed into the model (the provider launch is next).
-   *  A check that throws before this point reports an incomplete capture. Never throws. */
+  /** Record that the checker's model session has started: the Claude session's validated init
+   *  frame, or a confirmed Codex turn start. A check that ends before this reports an incomplete
+   *  capture. Never throws. */
   modelStarted(): void {
     this.modelRan = true;
   }
@@ -197,7 +198,9 @@ export class CheckActivityRecorder {
 
   private build(entry: Pending, result: ActivitySettle, outcome: ActivityOutcome): Record<string, unknown> | undefined {
     const payload: Record<string, unknown> = { event: EVENT_ACTIVITY, op: entry.op, outcome };
-    if (entry.path !== undefined) payload["path"] = entry.path;
+    const category = entry.category ?? result.category;
+    // A guard-denied or out-of-checkout attempt carries a category, never the path (PRD #3166).
+    if (entry.path !== undefined && category === undefined) payload["path"] = entry.path;
     const lines = result.lines;
     if (entry.op === "read" && lines && Number.isInteger(lines[0]) && Number.isInteger(lines[1])
       && lines[0] >= 1 && lines[1] >= lines[0]) payload["lines"] = [lines[0], lines[1]];
@@ -205,7 +208,6 @@ export class CheckActivityRecorder {
       payload["matches"] = result.matches;
       if (result.matchesTruncated === true) payload["matches_truncated"] = true;
     }
-    const category = entry.category ?? result.category;
     if (category) payload["category"] = category;
     if (Buffer.byteLength(JSON.stringify(payload), "utf8") > ACTIVITY_PAYLOAD_MAX_BYTES) {
       // A path whose JSON escapes expand past the bound is omitted rather than the event dropped.
