@@ -1318,7 +1318,8 @@ func TestGitLabGetMergeRequestNon2xxSizeBoundary(t *testing.T) {
 	}
 }
 
-// Scope: only GetMergeRequest is marked; another method keeps today's behaviour.
+// Scope: only GetMergeRequest and GetMergeRequestSummary are marked; another method
+// keeps today's behaviour.
 func TestGitLabLimitDoesNotApplyToUnmarkedMethods(t *testing.T) {
 	lowerGitLabLimit(t, 4096)
 	var seenEnc atomic.Value
