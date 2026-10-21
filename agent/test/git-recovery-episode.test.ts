@@ -1795,11 +1795,12 @@ test("issue #3194 coverage: extra unattested WIP inside the restore is held even
   await fixtureFetchTracking(cache, bare, source.clonePath, branch, runId);
   const wrapper = wrapperOver(marker, planned);
   await cache.recordRecoveryCapture(bare, branch, key, source, reservation.attempts, wrapper, s);
-  const successor = await cache.prepareRecoverySuccessor(bare, branch, key, source, reservation.attempts, aid(2));
-  assert.equal(successor.adoptedContentSource, s, "sanity: the mapping names the attested source");
-  assert.equal(fs.readFileSync(path.join(successor.path, "extra.txt"), "utf8"), "unattested WIP\n",
-    "sanity: the extra WIP is in the restored clone");
-  await assert.rejects(guardOn(successor, planned, s), BaseAttestationMissingError);
+  // issue #3239: the fixture wrapper claims the coverage subject without its exact shape and buries a
+  // wip(park) marker, so the successor adopt now refuses it before any write (it used to be adopted
+  // and only held later by the --require-base guard).
+  await assert.rejects(cache.prepareRecoverySuccessor(bare, branch, key, source, reservation.attempts, aid(2)),
+    /successor recovery verification failed/);
+  assert.equal(journal().recovery.stage, "captured", "the episode keeps its captured source");
 });
 
 test("issue #3194 coverage: a legacy journal without restoreSource leaves the wrapper unvouched and is held", async () => {

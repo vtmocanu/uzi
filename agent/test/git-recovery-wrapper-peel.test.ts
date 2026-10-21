@@ -271,6 +271,17 @@ test("issue #3239 (h2): a coverage commit that cannot be read within bounds is r
   await assertRefused(r.attempts, aid(2));
 });
 
+test("issue #3239 (h4): a readable tip claiming the coverage subject without its exact shape is refused over a buried marker", async () => {
+  const r = await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const m = await wipMarker(source.clonePath, "work.txt");
+  const clean = sibling(sha(`${m}^`), "ordinary clean source");
+  const fp = "0".repeat(64);
+  const c = git(bare, [...IDENT, "commit-tree", `${clean}^{tree}`, "-p", m, "-p", clean,
+    "-m", `uzi recovery coverage ${fp} round 0 batch 0`, "-m", "extra body"]);
+  await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, c, clean);
+  await assertRefused(r.attempts, aid(2));
+});
+
 /** A lineage-listed marker leaf `mx` on `parentOf(m)`-or-elsewhere; the wrapper covers [m, mx] over source m. */
 async function leafWithParent(inside: boolean) {
   const r = await cache.reserveRecoveryIteration(bare, branch, key, source);

@@ -6843,6 +6843,8 @@ export class GitCache {
     const coverageMessage = /^uzi recovery coverage ([0-9a-f]{64}) round (0|[1-9][0-9]*) batch (0|[1-9][0-9]*)\n$/;
     const aggregates: Array<{ fp: string; tree: string; author: string | undefined; committer: string | undefined }> = [];
     const leaves = new Set<string>();
+    let lookalike = false;
+    let lookalikes = 0;
     const seen = new Set<string>();
     const queue = [tip];
     while (queue.length) {
@@ -6863,7 +6865,18 @@ export class GitCache {
         continue;
       }
       const m = coverageMessage.exec(commit.message);
-      if (!m) { leaves.add(sha); continue; }
+      if (!m) {
+        // A readable commit that claims the coverage subject without its exact shape is a look-alike:
+        // walk through it so a marker it buries is still found, and refuse below if one is.
+        if (commit.message.startsWith("uzi recovery coverage ")) {
+          lookalike = true;
+          if (++lookalikes > MAX_AGGREGATES) return fail();
+          queue.push(...commit.parents);
+          continue;
+        }
+        leaves.add(sha);
+        continue;
+      }
       aggregates.push({ fp: m[1]!, tree: commit.tree, author: commit.author, committer: commit.committer });
       if (aggregates.length > MAX_AGGREGATES) return fail();
       queue.push(...commit.parents);
@@ -6872,6 +6885,7 @@ export class GitCache {
     const markerLeaves = new Set<string>();
     for (const leaf of leaves) if ((await subjectOf(leaf)).startsWith(WIP_PARK_COMMIT_PREFIX)) markerLeaves.add(leaf);
     if (!srcMarker && markerLeaves.size === 0) return undefined;
+    if (lookalike) return fail();
 
     // From here the shape involves a marker: everything below is a hard requirement.
     if (!src || !aggregates.length) return fail();
