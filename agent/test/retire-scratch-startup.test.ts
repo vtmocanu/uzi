@@ -8,6 +8,7 @@ import fsp from "node:fs/promises";
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { GitCache, retainedUndeletableCount } from "../src/git.js";
+import { sanitizeForLog } from "../src/run-quiescence.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { noProofReseed, recordingLogger, testGitCacheOptions } from "./helpers.js";
 
@@ -87,7 +88,9 @@ describe("inspectRetireScratchAtStartup (#3153)", () => {
     assert.equal(w[0]!.count, 3);
     assert.equal(w[0]!.empty, 1);
     assert.deepEqual([...w[0]!.paths].sort(), [".retire-empty", ".retire-full", ".retire-full2"]);
-    assert.equal(w[0]!.root, path.resolve(root));
+    // The warning bounds the logged root (sanitizeForLog, 157), so a long fixture path (a long
+    // TMPDIR) is truncated there; expect the same bounded rendering, exact otherwise.
+    assert.equal(w[0]!.root, sanitizeForLog(path.resolve(root), 157));
   });
 
   it("skips a parent whose mtime is at or after process start, empty or not", async () => {
