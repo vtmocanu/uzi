@@ -95,6 +95,8 @@ func (h *Handler) writeSetRunCredentialError(w http.ResponseWriter, err error) {
 	case errors.Is(err, workersvc.ErrRunHoldSettling):
 		// Issue #3181: the run's credential-switch hold is still being settled by its worker.
 		httpx.Error(w, http.StatusConflict, workersvc.ErrRunHoldSettling.Error())
+	case errors.Is(err, workersvc.ErrBaseAttestationHeld):
+		httpx.Error(w, http.StatusConflict, err.Error())
 	case errors.Is(err, workersvc.ErrCredentialSwitchRaced):
 		httpx.Error(w, http.StatusConflict, "the run changed state while switching its token; retry")
 	default:

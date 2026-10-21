@@ -11,6 +11,10 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+# Fixture repos and the release scripts they launch must not read host git config: a
+# global core.fsmonitor=true leaves a detached fsmonitor daemon per repo on macOS.
+os.environ.update(GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_SYSTEM='/dev/null')
+
 SOURCE = Path(os.environ.get('UZI_COVERAGE_MODULE', Path(__file__).with_name('release-ci-coverage.py')))
 spec = importlib.util.spec_from_file_location('coverage_policy', SOURCE)
 policy = importlib.util.module_from_spec(spec)
@@ -307,6 +311,21 @@ class Chain(RepoFixture, unittest.TestCase):
         with self.assertRaisesRegex(policy.Refusal, 'failed CI'):
             self.prove(self.nodes[2])
 
+    def test_one_hop_stops_where_the_remote_stable_gate_stops(self):
+        # #2719: X = nodes[2] and P = nodes[1] have no evidence, P2 = the anchor is green.
+        # Two hops from X reach P2 (the old local promote check passed); the remote gate on
+        # the stable commit S (S, X, P) never does, so the local check must walk one hop.
+        self.assertIn('coverage SHA ' + self.anchor, self.prove(self.nodes[2]))
+        chain = policy.metadata_chain(self.nodes[2], 1)
+        self.assertEqual(chain, [self.nodes[2], self.nodes[1]])
+        with self.assertRaisesRegex(policy.Refusal, 'no green main-push coverage'):
+            policy.coverage(self.api, self.nodes[2], None, False, 0, 1, chain=chain)
+
+    def test_hops_bounds(self):
+        for hops in (0, 3):
+            with self.assertRaisesRegex(policy.Refusal, 'hops must be 1 or 2'):
+                policy.metadata_chain(self.nodes[2], hops)
+
     def test_stop_at_first_covered_commit(self):
         self.api.run.side_effect = lambda w, sha, b: run(w, sha) if sha == self.nodes[2] else run(w, sha, conclusion='failure')
         output = self.prove(self.nodes[2])
@@ -342,7 +361,8 @@ class Cutter(RepoFixture, unittest.TestCase):
 
     def test_promote_only_checks_candidate_without_main(self):
         calls = self.cut('0.2.0', '--promote-only')
-        self.assertEqual(calls, 'coverage v0.2.0-rc.1 --wait 0\n')
+        # One hop: the remote stable gate reaches only one hop past the candidate (#2719).
+        self.assertEqual(calls, 'coverage v0.2.0-rc.1 --hops 1 --wait 0\n')
 
     def test_cut_still_checks_exact_main(self):
         calls = self.cut('0.2.0')
@@ -371,6 +391,28 @@ class Hotfix(RepoFixture, unittest.TestCase):
             policy.coverage(api, self.sha, self.parent, False, 0, 1, tag)
         self.assertIn('UNVERIFIED hotfix: no CI evidence', output.getvalue())
         self.assertIn('base v0.1.0', output.getvalue())
+
+    def test_hotfix_decided_at_tagged_sha_before_any_parent(self):
+        # #2719: a hotfix tag whose commit has a two-hop metadata chain back to the hotfix
+        # code commit. The exception is decided at the tagged SHA, before any parent is
+        # read: a green parent must not turn the run into verified coverage.
+        for n in (1, 2):
+            self.write('deploy/chart/Chart.yaml', self.files['deploy/chart/Chart.yaml'].replace('0.1.0', f'0.1.{n}'))
+            self.commit()
+        tagged = self.git('rev-parse', 'HEAD')
+        tag = self.annotate(ref=tagged)
+        chain = policy.metadata_chain(tagged)
+        self.assertEqual(len(chain), 3)
+        self.assertEqual(chain[-1], self.sha)
+        api = unittest.mock.Mock()
+        api.run.side_effect = lambda w, sha, b: run(w, sha) if sha == self.sha else None
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            unverified = policy.coverage(api, tagged, None, False, 0, 1, tag, chain=chain)
+        self.assertTrue(unverified)
+        self.assertIn('UNVERIFIED hotfix: no CI evidence', output.getvalue())
+        self.assertNotIn('PASS ', output.getvalue())
+        self.assertEqual({call.args[1] for call in api.run.call_args_list}, {tagged})
 
     def test_hotfix_job_output(self):
         tag = self.annotate()

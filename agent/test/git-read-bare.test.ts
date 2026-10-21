@@ -11,6 +11,7 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import { GitCache, type BoundaryProcessSpawner } from "../src/git.js";
 import { resolvePrdInputFromBare } from "../src/prd-link.js";
+import { captureSemanticSources } from "../src/semantic-plan.js";
 import { readRepoInstructionsAtCommit } from "../src/repo-instructions-at-commit.js";
 import { fileURLToPath } from "node:url";
 import type { BoundaryProcessRequest } from "../src/harness.js";
@@ -40,7 +41,10 @@ function withBare(files: Record<string, string>, fn: (gc: GitCache, bare: string
   const work = path.join(root, "work");
   fs.mkdirSync(work);
   git(work, "init", "-q", "-b", "main");
-  for (const [p, content] of Object.entries(files)) fs.writeFileSync(path.join(work, p), content);
+  for (const [p, content] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(work, p)), { recursive: true });
+    fs.writeFileSync(path.join(work, p), content);
+  }
   git(work, "add", "-A");
   git(work, "commit", "-qm", "one");
   const bare = path.join(root, "bare.git");
@@ -118,6 +122,32 @@ describe("GitCache.readBare (PRD #1798 M5)", () => {
         text: "hello\n",
         truncated: false,
       });
+    });
+  });
+
+  it("opt-in semantic capture preserves exact UTF-8 and NUL bytes from the pinned bare tip", async () => {
+    const raw = "require é\u0000\r\n";
+    await withBare({ "prds-1230.md": raw }, async (gc, bare) => {
+      const result = await gc.readBare(bare, ["show", "HEAD:prds-1230.md"], { maxBytes: 1024, includeBytes: true });
+      assert.deepEqual(result.bytes, Buffer.from(raw));
+      assert.equal(result.text, raw);
+      assert.equal(result.truncated, false);
+      const cut = await gc.readBare(bare, ["show", "HEAD:prds-1230.md"], { maxBytes: 9, includeBytes: true });
+      assert.equal(cut.truncated, true);
+      assert.deepEqual(cut.bytes, Buffer.from(raw).subarray(0, 9));
+    });
+    await withBare({ "prds/1230-proof.md": raw }, async (gc, bare) => {
+      const head = git(bare, "rev-parse", "HEAD").trim();
+      const captured = await captureSemanticSources(gc, {
+        barePath: bare, repo: "example/repo", headSha: head,
+        issue: { id: "issue:1230", bytes: Buffer.from("prds/1230-proof.md") },
+        planBytes: Buffer.from("Plan"), timeoutMs: 30000,
+      });
+      assert.equal(captured.source_outcome, "complete");
+      const prd = captured.sources[1];
+      assert.ok(prd);
+      assert.deepEqual(Buffer.from(prd.bytes, "base64"), Buffer.from(raw));
+      assert.ok(prd.provenance.includes(head));
     });
   });
 

@@ -1,6 +1,7 @@
 import http from "node:http";
 import { createHash, randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
+import { decodeCrossCheckClaim } from "../src/code-cross-check-contract.js";
 import type { FakePrDescApi, PrDescOp } from "./fake-pr-desc-api.js";
 import type {
   ClaimResponse,
@@ -453,9 +454,22 @@ export class FakeApi {
   }
 
   async listen(): Promise<string> {
-    await new Promise<void>((resolve) =>
-      this.server.listen(0, "127.0.0.1", resolve),
-    );
+    // Reject on a bind failure (EPERM in a sandbox without loopback, EADDRINUSE) so the
+    // caller's setup fails with the real error, not as an uncaught 'error' event
+    // attributed to whichever test happens to be running.
+    await new Promise<void>((resolve, reject) => {
+      const onError = (err: Error): void => {
+        this.server.off("listening", onListening);
+        reject(err);
+      };
+      const onListening = (): void => {
+        this.server.off("error", onError);
+        resolve();
+      };
+      this.server.once("error", onError);
+      this.server.once("listening", onListening);
+      this.server.listen(0, "127.0.0.1");
+    });
     // unref the listening handle so it never keeps the test PROCESS alive on its own.
     // Every test drives this server through an awaited client call, so the run's own
     // pending work holds the loop open while a test is in flight; once the tests
@@ -1403,7 +1417,22 @@ export class FakeApi {
           acceptedCandidate: request.method === "POST" && status === 200 &&
             (body as { result?: string } | null)?.result === "candidate" });
         if (drop) res.destroy();
-        else send(res, status, body);
+        else {
+          const snapshot = body as { result?: string; candidate?: Record<string, unknown>;
+            candidate_digest?: string; round?: number; deadline_at?: string } | null;
+          if (status === 200 && (request.method === "POST" || request.method === "GET") &&
+              snapshot?.result === "candidate" && snapshot.candidate?.candidate_identity_version === "semantic_v1" &&
+              (snapshot.candidate.stage === undefined || snapshot.candidate.stage === "plan")) {
+            try {
+              decodeCrossCheckClaim({ ...snapshot.candidate, stage: "plan", lead_run_id: request.runId,
+                candidate_digest: snapshot.candidate_digest, round: snapshot.round, deadline_at: snapshot.deadline_at });
+              res.setHeader("X-Uzi-Candidate-Identity-Version", "semantic_v1");
+            } catch {
+              // Leave malformed fixtures unmarked so the HTTP client rejects them.
+            }
+          }
+          send(res, status, body);
+        }
       };
       if (request.method === "POST" && this.checkedFencedRuns.has(request.runId))
         return reply(409, { reason: "cross_check_refused" });
@@ -1997,7 +2026,9 @@ export class FakeApi {
               status:
                 (body.recovery_cause === "provider_outage" ? this.typedParkAck.get(runId)?.status : undefined) ??
                 this.stateStatusOverride.get(runId) ??
-                body.status,
+                // Issue #3240: as the server does, pause_failed clears the pending pause and answers
+                // with the run's own status, which stays running.
+                (body.status === "pause_failed" ? "running" : body.status),
             }),
         ...(body.recovery_cause === "provider_outage" && this.typedParkAck.get(runId)?.holdReason !== undefined
           ? { hold_reason: this.typedParkAck.get(runId)!.holdReason }

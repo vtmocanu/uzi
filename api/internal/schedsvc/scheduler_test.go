@@ -543,6 +543,9 @@ type fakeForge struct {
 	mrStateByIID map[int64]string
 	mrErr        error
 	getMRIID     []int64
+	// scout backs the CI history reads a ci-scout fire makes (#3225); nil panics like
+	// any other unstubbed call.
+	scout *scoutFake
 }
 
 func (f *fakeForge) GetIssue(_ context.Context, _ int64, iid int64) (forge.Issue, error) {

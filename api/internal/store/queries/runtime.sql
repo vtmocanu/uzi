@@ -1120,6 +1120,10 @@ WITH claimant AS MATERIALIZED (
            OR 'cross_check_v1' = ANY(@worker_protocol_caps::text[]))
       AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
            OR 'cross_check_codex_lead_v1' = ANY(@worker_protocol_caps::text[]))
+      AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.target_run_id) AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
+           OR 'cross_check_semantic_plan_v1' = ANY(@worker_protocol_caps::text[]))
+      AND (r.kind = 'cross_check' OR NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.id)
+           OR 'completion_semantic_publication_v1' = ANY(@worker_protocol_caps::text[]))
       AND (r.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = r.id
@@ -1374,6 +1378,10 @@ WITH claimant AS MATERIALIZED (
            OR 'cross_check_v1' = ANY(p.protocol_capabilities))
       AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
            OR 'cross_check_codex_lead_v1' = ANY(p.protocol_capabilities))
+      AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.target_run_id) AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
+           OR 'cross_check_semantic_plan_v1' = ANY(p.protocol_capabilities))
+      AND (r.kind = 'cross_check' OR NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.id)
+           OR 'completion_semantic_publication_v1' = ANY(p.protocol_capabilities))
       AND (r.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = r.id
@@ -1513,6 +1521,19 @@ WITH claimant AS MATERIALIZED (
            OR r.released_worker_id <> @worker_id
            OR r.released_worker_nonce IS DISTINCT FROM
                 (SELECT ow.snapshot_register_nonce FROM workers ow WHERE ow.id = @worker_id))
+      -- Issue #3142: claim-time memory-authority gate. @memory_authority_lost is true when the
+      -- claimant's request says (or, for a capable worker, omits) that it no longer holds memory
+      -- authority; it then claims only the kinds that never reach a memory runtime. This mirrors
+      -- agent/src/worker.ts dispatch, where only the final `this.runner.execute(claim)` arm
+      -- reaches RunRunner (the only runner with a memory runtime); the exempt arms are
+      -- cross_check, judge, job, review_target_run_id and an egress_profile_id (isolated_fetch)
+      -- run. A new kind defaults to guard-bound (fail closed). Deliberately NOT mirrored into the
+      -- spread-peer clause, CountOnlineWorkersClaimableForRun or the ephemeral provisioner
+      -- queries, because the state is per-request, not a property of the worker row.
+      AND (NOT @memory_authority_lost::boolean
+           OR r.kind IN ('judge', 'job', 'cross_check')
+           OR r.review_target_run_id IS NOT NULL
+           OR r.egress_profile_id IS NOT NULL)
     -- Three-level sort (PRD #320 D3): (1) resume affinity — a re-queued run
     -- prefers its prior worker, exactly as before; (2) priority rank —
     -- fn_run_priority slots BETWEEN affinity and FIFO, so an interactive run
@@ -2102,6 +2123,21 @@ UPDATE runs SET
                ELSE 0 END,
     updated_at       = now()
 WHERE runs.id = @id AND worker_id = @worker_id
+  -- Semantic freeze has no structural fallback when cross-check is disabled.
+  AND (NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = runs.id)
+       OR (COALESCE(runs.completion_contract, sqlc.narg('completion_contract')::jsonb)->>'profile' = 'semantic'
+           AND COALESCE(runs.completion_contract, sqlc.narg('completion_contract')::jsonb)
+               ->'semantic_presentation'->'candidate' =
+               (SELECT sp.candidate FROM semantic_planning sp WHERE sp.run_id = runs.id))
+       OR (runs.completion_contract IS NULL AND runs.plan_md IS NULL
+           AND runs.milestones_frozen IS NULL AND runs.milestones_candidate IS NULL
+           AND sqlc.narg('milestones_frozen')::jsonb IS NULL))
+  AND (NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = runs.id)
+       OR runs.status <> 'awaiting_approval'
+       OR EXISTS (SELECT 1 FROM run_user_inputs i WHERE i.run_id = runs.id
+           AND i.kind = 'approve_plan' AND i.gate_binding = 'bound'
+           AND i.gate_revision = runs.gate_revision AND i.applied_at IS NOT NULL
+           AND i.disposition IS DISTINCT FROM 'superseded'))
   AND status NOT IN ('completed', 'failed', 'cancelled')
   -- limit_wait is excluded EXPLICITLY, and note that the negative guard above does
   -- NOT cover it (PRD #35): a parked run is inside 'NOT IN (terminal)', so without
@@ -2347,9 +2383,12 @@ UPDATE runs SET
     -- auto_approve short-circuits the executor's preApproved path, skipping the gate
     -- with NO human in the loop, and the worker's ciFixHumanApproved initializer then
     -- reads that as approved. Clearing auto_approve here makes the resume re-gate.
-    -- Manual runs already carry auto_approve=false (no-op), and a normal autopilot run
-    -- never reaches this statement (it short-circuits in gatePlan and never parks), so
-    -- the ONLY run this newly affects is the forceGate ci_fix case — the intent.
+    -- Manual runs already carry auto_approve=false (no-op). An autopilot run parks here
+    -- only when something forces the human gate: the forceGate ci_fix case, an
+    -- auto-approved plan cross-check lead whose checker did not APPROVE (ADR-2149), and,
+    -- since PRD #1230 D3, a semantic-enrolled autopilot run whose server coverage projection is not
+    -- complete or which carries maintainer criteria: it parks here from `running` (the
+    -- semantic coverage park) and the cleared auto_approve makes any resume re-gate.
     auto_approve = false,
     -- Invalidate a published gate when any approval-bearing value changes. Compare
     -- the effective values written below, so an exact retry retains its snapshot.
@@ -2640,6 +2679,9 @@ UPDATE runs SET
     plan_source = 'agent',
     updated_at  = now()
 WHERE runs.id = @id AND runs.worker_id = @worker_id
+  AND (NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = runs.id)
+       OR EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = runs.id
+           AND sp.candidate->>'digest' = encode(sqlc.arg('candidate_digest')::bytea, 'hex')))
   AND runs.status IN ('claimed', 'running')
   AND runs.auto_approve = true
   AND runs.plan_source = 'agent'
@@ -3714,6 +3756,8 @@ WITH candidates AS MATERIALIZED (
     WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.status = 'paused'
   AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
+  -- issue #3194: a base-attestation hold is owner-resolved by recovery, never resumed.
+  AND runs.hold_reason IS DISTINCT FROM 'base_attestation_missing'
   AND (runs.hold_reason IS DISTINCT FROM 'completion_blocked' OR @allow_completion_blocked_hold::boolean)
   AND (runs.hold_reason IS DISTINCT FROM 'credential_switch_settling'
        OR NOT EXISTS (SELECT 1 FROM workers w
@@ -3784,6 +3828,8 @@ UPDATE runs SET
 WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.status = 'paused'
   AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
+  -- issue #3194: a base-attestation hold is owner-resolved by recovery, never resumed.
+  AND runs.hold_reason IS DISTINCT FROM 'base_attestation_missing'
   -- D6: refuse a completion hold unless the completion decision endpoint opts in.
   AND (runs.hold_reason IS DISTINCT FROM 'completion_blocked' OR @allow_completion_blocked_hold::boolean)
   -- Issue #3181: refuse a credential_switch_settling hold while its worker is still finishing its own
@@ -4195,11 +4241,13 @@ WHERE id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_ge
   -- PRD #1733: a late report from the parking flight must not turn an owner-facing provider hold
   -- into a question/follow-up park, including ResumePausedRun's queued interval with its
   -- retained marker and old generation. ClaimRun increments the generation before fresh reports.
-  -- Only provider_unavailable: every other hold reason keeps today's behaviour.
+  -- A provider-unavailable hold retains its claim; the specialized holds below do too.
   AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'provider_unavailable', FALSE))
   -- Issue #3181: a credential-switch hold (settling or unsettled) leaves paused only by the owner's
   -- resume/cancel, and a late park report must not rewrite its status_since (the incarnation fence).
-  AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('credential_switch_settling', 'credential_switch_unsettled'), FALSE));
+  AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('credential_switch_settling', 'credential_switch_unsettled'), FALSE))
+  -- issue #3194: nor may one leave the base-attestation hold, which keeps this claim.
+  AND NOT (status = 'paused' AND COALESCE(hold_reason = 'base_attestation_missing', FALSE));
 
 -- name: ClearRunMilestonesCompleted :execrows
 -- PRD #628 M4: the ONLY non-union writer of milestones_completed. milestones_completed
@@ -4310,11 +4358,13 @@ WHERE id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_ge
   -- PRD #1733: a late report from the parking flight must not turn an owner-facing provider hold
   -- into a question/follow-up park, including ResumePausedRun's queued interval with its
   -- retained marker and old generation. ClaimRun increments the generation before fresh reports.
-  -- Only provider_unavailable: every other hold reason keeps today's behaviour.
+  -- A provider-unavailable hold retains its claim; the specialized holds below do too.
   AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'provider_unavailable', FALSE))
   -- Issue #3181: a credential-switch hold (settling or unsettled) leaves paused only by the owner's
   -- resume/cancel, and a late park report must not rewrite its status_since (the incarnation fence).
-  AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('credential_switch_settling', 'credential_switch_unsettled'), FALSE));
+  AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('credential_switch_settling', 'credential_switch_unsettled'), FALSE))
+  -- issue #3194: nor may one leave the base-attestation hold, which keeps this claim.
+  AND NOT (status = 'paused' AND COALESCE(hold_reason = 'base_attestation_missing', FALSE));
 
 -- name: SetRunCompleted :execrows
 -- completed is the terminal MR-opened event → Human Review. move_pending_since is
@@ -4846,7 +4896,7 @@ WITH candidates AS MATERIALIZED (
     WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
   AND runs.claim_released_at IS NULL
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
-  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
+  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked', 'base_attestation_missing'), FALSE))
   -- Protect ResumePausedRun's retained-marker queued interval; after ClaimRun, the
   -- service fence rejects reports carrying the old generation. Other holds stay paused-only.
   AND NOT (runs.status IN ('paused', 'queued') AND COALESCE(runs.hold_reason = 'provider_unavailable', FALSE))
@@ -4891,7 +4941,7 @@ UPDATE runs SET
 WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
   AND runs.claim_released_at IS NULL
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
-  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
+  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked', 'base_attestation_missing'), FALSE))
   -- Protect ResumePausedRun's retained-marker queued interval; after ClaimRun, the
   -- service fence rejects reports carrying the old generation. Other holds stay paused-only.
   AND NOT (runs.status IN ('paused', 'queued') AND COALESCE(runs.hold_reason = 'provider_unavailable', FALSE))
@@ -8203,9 +8253,11 @@ ORDER BY cost_usd DESC, output_tokens DESC, u.id;
 -- axis as the usage 7-day figures, so the two 7-day numbers on one card describe the
 -- same set of runs. plan_rejected is split out of failed (D4): rejecting a plan is the
 -- owner's decision, kept in the denominator and its own bar segment but out of the
--- numerator. Every computed column carries an explicit ::bigint cast (the file's
+-- numerator. base_diverged is likewise a separate denominator bucket: the worker
+-- refused a divergent base, rather than reporting an agent defect.
+-- Every computed column carries an explicit ::bigint cast (the file's
 -- convention). Invariants the handler/live-DB tests assert:
--- finished == completed + cancelled + plan_rejected + failed, and
+-- finished == completed + cancelled + plan_rejected + base_diverged + failed, and
 -- sum(fail_origins) == failed. The per-origin breakdown is a jsonb_object_agg scalar
 -- subquery INSIDE each outcome query (issue #1451), not a second query per scope: one
 -- statement reads one snapshot, so the breakdown and the `failed` count always describe
@@ -8222,7 +8274,7 @@ WITH last_failure AS MATERIALIZED (
     SELECT  id, user_id, COALESCE(finished_at, status_since) AS ended_at,
            COALESCE(fail_origin, 'unknown') AS origin
     FROM runs
-    WHERE user_id = @user_id AND status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected'
+    WHERE user_id = @user_id AND status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged'
       AND kind NOT IN ('chat', 'judge', 'cross_check')
     ORDER BY COALESCE(finished_at, status_since) DESC, id DESC LIMIT 1
 )
@@ -8238,12 +8290,14 @@ SELECT
     count(*) FILTER (WHERE status = 'completed')::bigint                                   AS lifetime_completed,
     count(*) FILTER (WHERE status = 'cancelled')::bigint                                   AS lifetime_cancelled,
     count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'plan_rejected')::bigint    AS lifetime_plan_rejected,
-    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected')::bigint AS lifetime_failed,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'base_diverged')::bigint    AS lifetime_base_diverged,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged')::bigint AS lifetime_failed,
     count(*) FILTER (WHERE runs.created_at >= now() - interval '7 days')::bigint           AS last7_finished,
     count(*) FILTER (WHERE status = 'completed' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_completed,
     count(*) FILTER (WHERE status = 'cancelled' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_cancelled,
     count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'plan_rejected' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_plan_rejected,
-    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_failed,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'base_diverged' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_base_diverged,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_failed,
     -- needs_landing (issue #1418): the SUB-CUT of the `failed` count whose per-run
     -- landing_state derives to needs_landing (workersvc.DeriveLandingState) — a human-landable
     -- fail_origin (@landable_origins, the Go-owned set, never spelled here) whose committed work
@@ -8274,14 +8328,14 @@ SELECT
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
               WHERE r2.user_id = @user_id
-              AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
+              AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
               AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
               GROUP BY 1) o) AS lifetime_fail_origins,
     (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
               WHERE r2.user_id = @user_id
-              AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
+              AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
               AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
               AND r2.created_at >= now() - interval '7 days'
               GROUP BY 1) o) AS last7_fail_origins
@@ -8299,7 +8353,7 @@ WITH last_failure AS MATERIALIZED (
     SELECT  id, user_id, COALESCE(finished_at, status_since) AS ended_at,
            COALESCE(fail_origin, 'unknown') AS origin
     FROM runs
-    WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected'
+    WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged'
       AND kind NOT IN ('chat', 'judge', 'cross_check')
     ORDER BY COALESCE(finished_at, status_since) DESC, id DESC LIMIT 1
 )
@@ -8316,12 +8370,14 @@ SELECT
     count(*) FILTER (WHERE status = 'completed')::bigint                                   AS lifetime_completed,
     count(*) FILTER (WHERE status = 'cancelled')::bigint                                   AS lifetime_cancelled,
     count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'plan_rejected')::bigint    AS lifetime_plan_rejected,
-    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected')::bigint AS lifetime_failed,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'base_diverged')::bigint    AS lifetime_base_diverged,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged')::bigint AS lifetime_failed,
     count(*) FILTER (WHERE runs.created_at >= now() - interval '7 days')::bigint           AS last7_finished,
     count(*) FILTER (WHERE status = 'completed' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_completed,
     count(*) FILTER (WHERE status = 'cancelled' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_cancelled,
     count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'plan_rejected' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_plan_rejected,
-    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_failed,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'base_diverged' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_base_diverged,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_failed,
     -- needs_landing (issue #1418): SUB-CUT of `failed`; see SelfRunOutcomes for the shape.
     -- @landable_origins is the Go-owned human-landable set; the correlated EXISTS resolves to
     -- the OUTER `runs` row (no JOIN, which would corrupt the sibling counts).
@@ -8344,13 +8400,13 @@ SELECT
     (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
-              WHERE r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
+              WHERE r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
               AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
               GROUP BY 1) o) AS lifetime_fail_origins,
     (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
-              WHERE r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
+              WHERE r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
               AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
               AND r2.created_at >= now() - interval '7 days'
               GROUP BY 1) o) AS last7_fail_origins
@@ -8367,7 +8423,7 @@ WITH last_failure AS MATERIALIZED (
     SELECT DISTINCT ON (user_id) id, user_id, COALESCE(finished_at, status_since) AS ended_at,
            COALESCE(fail_origin, 'unknown') AS origin
     FROM runs
-    WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected'
+    WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged'
       AND kind NOT IN ('chat', 'judge', 'cross_check')
     ORDER BY user_id, COALESCE(finished_at, status_since) DESC, id DESC
 )
@@ -8383,12 +8439,14 @@ SELECT u.id AS user_id, u.email,
     count(*) FILTER (WHERE r.status = 'completed')::bigint                                 AS completed,
     count(*) FILTER (WHERE r.status = 'cancelled')::bigint                                 AS cancelled,
     count(*) FILTER (WHERE r.status = 'failed' AND r.fail_origin = 'plan_rejected')::bigint AS plan_rejected,
-    count(*) FILTER (WHERE r.status = 'failed' AND r.fail_origin IS DISTINCT FROM 'plan_rejected')::bigint AS failed,
+    count(*) FILTER (WHERE r.status = 'failed' AND r.fail_origin = 'base_diverged')::bigint AS lifetime_base_diverged,
+    count(*) FILTER (WHERE r.status = 'failed' AND r.fail_origin IS DISTINCT FROM 'plan_rejected' AND r.fail_origin IS DISTINCT FROM 'base_diverged')::bigint AS failed,
     count(*) FILTER (WHERE r.created_at >= now() - interval '7 days')::bigint                                                                       AS last7_finished,
     count(*) FILTER (WHERE r.created_at >= now() - interval '7 days' AND r.status = 'completed')::bigint                                 AS last7_completed,
     count(*) FILTER (WHERE r.created_at >= now() - interval '7 days' AND r.status = 'cancelled')::bigint                                 AS last7_cancelled,
     count(*) FILTER (WHERE r.created_at >= now() - interval '7 days' AND r.status = 'failed' AND r.fail_origin = 'plan_rejected')::bigint AS last7_plan_rejected,
-    count(*) FILTER (WHERE r.created_at >= now() - interval '7 days' AND r.status = 'failed' AND r.fail_origin IS DISTINCT FROM 'plan_rejected')::bigint AS last7_failed,
+    count(*) FILTER (WHERE r.created_at >= now() - interval '7 days' AND r.status = 'failed' AND r.fail_origin = 'base_diverged')::bigint AS last7_base_diverged,
+    count(*) FILTER (WHERE r.created_at >= now() - interval '7 days' AND r.status = 'failed' AND r.fail_origin IS DISTINCT FROM 'plan_rejected' AND r.fail_origin IS DISTINCT FROM 'base_diverged')::bigint AS last7_failed,
     -- needs_landing (issue #1418): SUB-CUT of `failed`; see SelfRunOutcomes for the shape.
     -- The alias here is `r`,
     -- so the correlated EXISTS resolves to the OUTER `r` row (no JOIN — that would corrupt the
@@ -8414,14 +8472,14 @@ SELECT u.id AS user_id, u.email,
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
               WHERE r2.user_id = u.id
-              AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
+              AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
               AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
               GROUP BY 1) o) AS fail_origins,
     (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
               WHERE r2.user_id = u.id AND r2.created_at >= now() - interval '7 days'
-              AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
+              AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
               AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
               GROUP BY 1) o) AS last7_fail_origins
 FROM runs r
@@ -8792,6 +8850,16 @@ WITH selected AS (
         updated_at       = now()
     WHERE runs.id = @run_id
       AND (runs.milestones_frozen IS NULL OR runs.milestones_candidate IS NOT DISTINCT FROM runs.milestones_frozen)
+      AND (NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = runs.id)
+           OR (runs.status = 'awaiting_approval'
+               AND sqlc.narg('expected_gate_revision')::bigint = runs.gate_revision
+               AND sqlc.narg('completion_contract')::jsonb->>'profile' = 'semantic'
+               AND sqlc.narg('completion_contract')::jsonb->'semantic_presentation' =
+                   runs.gate_presented_payload->'semantic'
+               AND sqlc.narg('completion_contract')::jsonb->'semantic_presentation'->'candidate' =
+                   (SELECT sp.candidate FROM semantic_planning sp WHERE sp.run_id = runs.id)
+               AND sqlc.narg('completion_contract')::jsonb->'semantic_approval'->>'presentation_digest' =
+                   encode(runs.gate_payload_digest, 'hex')))
       -- PRD #1795 M2 (D5): a verdict sent against a revision the run no longer shows writes
       -- NOTHING — no selection, no milestone/contract/budget freeze, no input row.
       AND (sqlc.narg('expected_gate_revision')::bigint IS NULL
@@ -9563,7 +9631,12 @@ WHERE id = @id;
 -- PRD #1190: also stamp checkpoint_tip_at (a separate timestamp, not updated_at) so the
 -- pause UI can name the age of the last checkpoint — the "work since the last checkpoint"
 -- a `now` pause discards. It is written on every publish alongside checkpoint_tip.
-UPDATE runs SET checkpoint_tip = @checkpoint_tip, checkpoint_tip_at = now() WHERE id = @id;
+--
+-- Issue #3194: checkpoint_attested_source is set-only, inside this same write and only from the
+-- publish's own frozen non-NULL value; a NULL (legacy or unattested publish) leaves it unchanged.
+UPDATE runs SET checkpoint_tip = @checkpoint_tip, checkpoint_tip_at = now(),
+    checkpoint_attested_source = COALESCE(sqlc.narg(attested_source)::text, checkpoint_attested_source)
+WHERE id = @id;
 
 -- Run health detector (PRD #47) ----------------------------------------------
 
@@ -9912,6 +9985,10 @@ WHERE run.id = @run_id
            OR 'cross_check_v1' = ANY(w.protocol_capabilities))
       AND (NOT (run.kind = 'cross_check' AND run.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = run.id AND pc.stage = 'plan'))
            OR 'cross_check_codex_lead_v1' = ANY(w.protocol_capabilities))
+      AND (NOT (run.kind = 'cross_check' AND EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = run.target_run_id) AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = run.id AND pc.stage = 'plan'))
+           OR 'cross_check_semantic_plan_v1' = ANY(w.protocol_capabilities))
+      AND (run.kind = 'cross_check' OR NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = run.id)
+           OR 'completion_semantic_publication_v1' = ANY(w.protocol_capabilities))
       AND (run.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = run.id
@@ -10374,6 +10451,10 @@ WHERE r.status = 'queued'
              OR 'cross_check_v1' = ANY(w.protocol_capabilities))
         AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
              OR 'cross_check_codex_lead_v1' = ANY(w.protocol_capabilities))
+        AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.target_run_id) AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
+             OR 'cross_check_semantic_plan_v1' = ANY(w.protocol_capabilities))
+        AND (r.kind = 'cross_check' OR NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.id)
+             OR 'completion_semantic_publication_v1' = ANY(w.protocol_capabilities))
       AND (r.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = r.id
@@ -10576,6 +10657,10 @@ WHERE r.status = 'queued'
              OR 'cross_check_v1' = ANY(w.protocol_capabilities))
         AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
              OR 'cross_check_codex_lead_v1' = ANY(w.protocol_capabilities))
+        AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.target_run_id) AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
+             OR 'cross_check_semantic_plan_v1' = ANY(w.protocol_capabilities))
+        AND (r.kind = 'cross_check' OR NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.id)
+             OR 'completion_semantic_publication_v1' = ANY(w.protocol_capabilities))
       AND (r.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = r.id
@@ -10648,6 +10733,10 @@ WHERE r.status = 'queued'
              OR 'cross_check_v1' = ANY(w.protocol_capabilities))
         AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
              OR 'cross_check_codex_lead_v1' = ANY(w.protocol_capabilities))
+        AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.target_run_id) AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
+             OR 'cross_check_semantic_plan_v1' = ANY(w.protocol_capabilities))
+        AND (r.kind = 'cross_check' OR NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.id)
+             OR 'completion_semantic_publication_v1' = ANY(w.protocol_capabilities))
       AND (r.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = r.id
@@ -11564,6 +11653,30 @@ SELECT count(*) FROM workers w WHERE w.user_id = @user_id
  AND NOT w.ephemeral AND NOT w.isolated_lane
  AND 'ci_config_guard_v1' = ANY(w.protocol_capabilities)
  AND 'ci_artifacts_v1' = ANY(w.protocol_capabilities);
+
+-- name: GetRunSemanticHealth :one
+-- PRD #1230: the queued-reason inputs for a semantic-enrolled run. lead_enrolled marks a lead
+-- run with a semantic_planning row; plan_checker_enrolled marks a plan-stage cross-check child
+-- whose target run has one. The two counts are the owner's online, non-draining, non-ephemeral
+-- workers advertising the capability each ClaimRun clause requires, so the pill and the claim
+-- gate agree. The checker count does not repeat the cross_check_v1 conjunct, which every
+-- semantic-capable checker advertises; a worker with only the semantic token never claims.
+SELECT
+  EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = @run_id) AS lead_enrolled,
+  EXISTS (SELECT 1 FROM runs c
+            JOIN semantic_planning sp ON sp.run_id = c.target_run_id
+            JOIN cross_checks pc ON pc.checker_run_id = c.id AND pc.stage = 'plan'
+           WHERE c.id = @run_id AND c.kind = 'cross_check') AS plan_checker_enrolled,
+  (SELECT count(*) FROM workers w WHERE w.user_id = @user_id
+     AND w.status = 'online'
+     AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+     AND NOT w.ephemeral AND NOT w.isolated_lane
+     AND 'completion_semantic_publication_v1' = ANY(w.protocol_capabilities))::bigint AS publication_capable,
+  (SELECT count(*) FROM workers w WHERE w.user_id = @user_id
+     AND w.status = 'online'
+     AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+     AND NOT w.ephemeral AND NOT w.isolated_lane
+     AND 'cross_check_semantic_plan_v1' = ANY(w.protocol_capabilities))::bigint AS plan_checker_capable;
 
 -- name: SaveCIArtifactAdmission :one
 UPDATE runs SET ci_artifact_manifest = @manifest::jsonb, issue_description = @description

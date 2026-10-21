@@ -177,7 +177,39 @@ else
 fi
 
 # Publish-time coverage is the release proof; the tagged SHA may inherit main CI.
-for gate in assert-ci-coverage assert-release-metadata assert-tag-smoke; do
+# A release.yml run from before #2718 has no such jobs. That is read from the workflow
+# definition the run itself used (its head_sha and path), never from a date: the run is
+# legacy only when that file's text names none of the three gates anywhere. Invariant: a
+# gate job is declared under its literal name (key or `name:`), so any declaration, in any
+# quoting or indentation, keeps the check. Unreadable run metadata, an empty definition or
+# one with no top-level `jobs:` fails. Matching is done in bash, so no tool error can read
+# as absence.
+GATES=(assert-ci-coverage assert-release-metadata assert-tag-smoke)
+legacy_gates=0
+if [ -n "${RELRUN:-}" ]; then
+  # A failed query must not be read, however valid its stdout looks.
+  run_def="$(gh api "repos/${OWNER}/${REPO}/actions/runs/${RELRUN}" --jq '"\(.head_sha) \(.path)"' 2>/dev/null)" || run_def=""
+  run_sha="${run_def%% *}"; run_path="${run_def#* }"; run_path="${run_path%%@*}"
+  definition=""
+  if [[ "$run_sha" =~ ^[0-9a-f]{40}$ ]] && [[ "$run_path" == .github/workflows/* ]]; then
+    definition="$(git show "${run_sha}:${run_path}" 2>/dev/null)" || definition=""
+  fi
+  has_jobs=0
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^jobs:[[:space:]]*(#.*)?$ ]]; then has_jobs=1; break; fi
+  done <<< "$definition"
+  if [ -z "$definition" ] || [ "$has_jobs" -eq 0 ]; then
+    fail "cannot read the workflow definition release.yml run $RELRUN used ('${run_path:-?}' at '${run_sha:-?}'; run: git fetch --tags origin)"
+  else
+    named=0
+    for gate in "${GATES[@]}"; do [[ "$definition" == *"$gate"* ]] && named=1; done
+    if [ "$named" -eq 0 ]; then
+      legacy_gates=1
+      echo "  NOTE  release.yml run $RELRUN predates the publish-time gates (#2718): its definition at ${run_sha:0:12} names none of ${GATES[*]}; gate check skipped"
+    fi
+  fi
+fi
+[ "$legacy_gates" -eq 1 ] || for gate in "${GATES[@]}"; do
   result="$(gh api "repos/${OWNER}/${REPO}/actions/runs/${RELRUN}/jobs?per_page=100" \
     --jq ".jobs[] | select(.name == \"${gate}\") | .conclusion" 2>/dev/null)"
   if [ "$result" = success ]; then

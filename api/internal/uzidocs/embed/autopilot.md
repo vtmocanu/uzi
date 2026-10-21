@@ -116,6 +116,41 @@ There is no new issue comment for these refusals; the existing
   comment points at the access-controlled run page for detail rather than
   repeating it in a member-visible GitLab comment.
 
+## Semantic runs park instead of auto-approving (dormant)
+
+**Dormant.** Production enrollment is off until [PRD #1231](https://github.com/vtmocanu/uzi/issues/1231): no production code creates a semantic run today, so every real autopilot run keeps the behavior described above (the *structural* profile, which makes zero coverage calls). This section describes the built-but-unreachable path that only tests exercise. Nothing here is live behavior.
+
+A *semantic* run (see [Cross-check](./cross-check.md#semantic-contract-profile-dormant)) compares the issue and linked PRD against the proposed plan before it proceeds. On such a run autopilot auto-approves only when all of these hold:
+
+- the server's single coverage authority reports coverage **complete**;
+- when Plan cross-check is required, the checker's **APPROVE** is for the current candidate; and
+- the candidate has **no maintainer criteria**.
+
+Otherwise the run parks in `awaiting_approval` through the same plan-approval park other gates use. Notifications use the existing post-commit notification and the Slack `awaiting_approval` hook, and wall time is banked while it waits as at other approval parks. The run does not fail, does not start a replan and receives no synthetic checker REVISE; you decide at the gate.
+
+The gate shows why autopilot stopped as a `semantic_park` reason (the web gate and a `SEMANTIC_PARK` row in `uzi run get`):
+
+| Reason | Meaning |
+|---|---|
+| `coverage_incomplete` | The review found a source requirement missing, a requirement the reviewer marks uncertain, or a criterion that is not atomic. |
+| `coverage_uncertain` | The frozen source capture was not complete, so the review cannot give a complete verdict. |
+| `coverage_unavailable` | No usable review: a transport failure, a provider safety refusal of the coverage pass (not a policy hold), or exhausted coverage budgets. |
+| `maintainer_authorization` | Coverage is complete but the candidate lists maintainer criteria that need your explicit approval. |
+
+The reason is stored only in the presented gate payload, never in the cross-check gate reason. A complete, maintainer-free candidate that is gated only by the checker keeps the existing cross-check gate reason or deadline-to-human path and carries no `semantic_park`.
+
+Three further rules:
+
+- **One-way latch.** Once a semantic run has taken the human gate in an execution, no later candidate in that execution auto-approves, including one you revise.
+- **Exhaustion is a hard stop.** When the coverage budget is spent (at most three reviews and 15 minutes and 120,000 tokens per run, independent of the checker's allowance), the gate opens without another coverage model call (the plan checker, including its automatic revise rounds, still runs before the coverage step), and shows the consumed and remaining budget.
+- **No checker coverage fallback.** With no worker advertising `cross_check_semantic_plan_v1`, the check waits for its deadline and the lead takes the human gate; it never falls back to the structural check. See [Worker versions and upgrades](./worker-upgrades.md#semantic-completion-capabilities-dormant).
+
+### Coverage transport limitation
+
+Codex currently lacks an enforceable token cap. Claude's output cap alone does not prove a conservative full-call bound. Complete large sources can exceed the 40,000-token allowance. Unsupported or unbounded transports and inadmissibly large inputs yield unavailable without a model call. #1231 must establish enforceable bounds before activation.
+
+The shipped workers supply no coverage transport at all, so even an enrolled run would park as `coverage_unavailable`. See [ADR-1225](../adr/1225-structural-completion-interlock-invariants.md#coverage-transport-limitation).
+
 ## PRD updates happen unattended
 
 An issue run is asked to update the issue's linked `prds/*.md` file before it

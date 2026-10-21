@@ -109,12 +109,18 @@ const statusPaused = "paused"
 // specific credential its owner has disabled. It resumes by itself once that credential is
 // enabled again (or, where the CLI and web offer a per-run override, once the owner points
 // the run at another token); uzi never substitutes a credential on its own (D2).
+//
+// holdBaseAttestationMissing (issue #3194) holds a `--require-base` run whose worker adopted kept
+// work no checkpoint attests was produced on the planned base. The agent never started; the work
+// stays on the worker. Resume and extend are refused: the owner recovers or exports the work, or
+// starts a successor run.
 const (
 	holdProviderUnavailable = "provider_unavailable"
 	providerOutageCause     = "provider_outage"
 	holdBudgetExhausted     = "budget_exhausted"
 	holdCompletionBlocked   = "completion_blocked"
 	holdCredentialDisabled  = "credential_disabled" //nolint:gosec // G101: a run hold-reason VOCABULARY value (the server enum), not a credential.
+	holdBaseAttestation     = "base_attestation_missing"
 )
 
 // logsPollInterval is how often `uzi run logs --follow` re-polls
@@ -473,7 +479,17 @@ func gateRevisionMismatchError(runID string, expected *int64, current int64) err
 // action took effect immediately rather than being queued. expectedGateRevision binds a
 // plan-gate verdict to a gate revision (PRD #1795 D5; nil for every other kind).
 func submitInput(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runID, kind, body string, sel *apitypes.AgentSelection, discardPendingOutcome bool, expectedGateRevision *int64) error {
-	res, err := c.SubmitRunInput(cmd.Context(), runID, kind, body, sel, discardPendingOutcome, expectedGateRevision)
+	return submitBoundInput(env, gf, c, cmd, runID, kind, body, sel, discardPendingOutcome, expectedGateRevision, nil)
+}
+
+func submitBoundInput(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runID, kind, body string, sel *apitypes.AgentSelection, discardPendingOutcome bool, expectedGateRevision *int64, approval *apitypes.SemanticGateApproval) error {
+	var res apitypes.RunInputResponse
+	var err error
+	if approval != nil {
+		res, err = c.SubmitRunInputWithOptions(cmd.Context(), runID, apitypes.RunInputRequest{Kind: kind, Body: body, Selection: sel, ExpectedGateRevision: expectedGateRevision, SemanticApproval: approval})
+	} else {
+		res, err = c.SubmitRunInput(cmd.Context(), runID, kind, body, sel, discardPendingOutcome, expectedGateRevision)
+	}
 	if err != nil {
 		// PRD #1391 Run B M3d (D13): a cancel of a run whose executor journaled a terminal
 		// outcome on its worker, sent WITHOUT --discard-pending-outcome, comes back as a typed 409

@@ -121,6 +121,10 @@ export function isStoppedRun(
   return false;
 }
 
+export function isRejectedRun(status: string, failOrigin: string | null | undefined): boolean {
+  return status === "failed" && failOrigin === "base_diverged";
+}
+
 // isPlanningRun reports whether a run is in its pre-approval PLANNING phase (issue
 // #321). It trusts the server-computed is_planning boolean and only treats it as
 // planning while the run is still `running` (is_planning is meaningful only then;
@@ -155,6 +159,7 @@ const PARK_LABELS = {
   paused: "paused",
   credential_disabled: "waiting: credential disabled",
   provider_unavailable: "provider unavailable: owner hold",
+  base_attestation_missing: "base unverified: owner hold",
   provider_outage: "waiting for provider",
   completion_blocked: "Completion blocked",
   credential_switch_settling: "settling: token switch",
@@ -192,6 +197,9 @@ export function effectiveRunStatus(
   // they are overlaid like the provider hold to name what the run is actually waiting on.
   const switchHold = credentialSwitchHold(run);
   if (switchHold) return `credential_switch_${switchHold}`;
+  // Issue #3194: a --require-base run whose adopted work no checkpoint attests to the planned
+  // base. Server-held (raw status "paused"), so overlaid like the other holds.
+  if (run.status === "paused" && run.hold_reason === "base_attestation_missing") return "base_attestation_missing";
   if (run.status === "recovery_wait" && run.recovery_wait_cause === "provider_outage") return "provider_outage";
   if (isPlanningRun(run)) return "planning";
   if (isRevisingRun(run)) return "revising";
@@ -319,6 +327,7 @@ export function priorityBadge(
 export function runStatusTone(
   status: string,
   stopKind: StopKind | null | undefined,
+  failOrigin?: string | null,
 ): BadgeTone {
   if (status === "planning") return "plan";
   // issue #750: a run re-planning after a revise. Calm INFO tone (like claimed/running
@@ -334,7 +343,7 @@ export function runStatusTone(
   if (status === "completion_checking" || status === "completion_reworking") return "info";
   if (status === "completion_blocked") return "warning";
   // PRD #1732: held on a disabled credential. Warn like the other involuntary holds.
-  if (status === "credential_disabled" || status === "provider_unavailable" || status === "provider_outage") return "warning";
+  if (status === "credential_disabled" || status === "provider_unavailable" || status === "base_attestation_missing" || status === "provider_outage") return "warning";
   // Issue #3181: both token-switch holds wait on something outside the run; warn, never danger.
   if (status === "credential_switch_settling" || status === "credential_switch_unsettled") return "warning";
   if (status === "awaiting_approval" || status === "awaiting_input")
@@ -357,7 +366,7 @@ export function runStatusTone(
   // (D11): a pause is a chosen hold, not something blocking the run. Kept in step with
   // RUN_STATUS_TONES.paused (the runBadge.test.ts tone-agreement loop asserts it).
   if (status === "paused") return "info";
-  if (isStoppedRun(status, stopKind)) return "neutral";
+  if (isStoppedRun(status, stopKind) || isRejectedRun(status, failOrigin)) return "neutral";
   if (status === "failed") return "danger";
   if (status === "completed") return "ok";
   if (status === "claimed" || status === "running") return "info";
@@ -531,6 +540,9 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
   if (isStoppedRun(run.status, run.stop_kind)) {
     return { kind: "badge", label: "stopped", tone: "neutral", pulse: false };
   }
+  if (isRejectedRun(run.status, run.fail_origin)) {
+    return { kind: "badge", label: "rejected", tone: "neutral", pulse: false };
+  }
   const eff = effectiveRunStatus(run);
   // A health flag overrides the normal status label while the run is alive but looks
   // stuck, looping, or near its timeout (PRD #47, #1170). Only fires for a flaggable status.
@@ -602,6 +614,9 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
     case "credential_switch_unsettled":
       return { kind: "badge", label: PARK_LABELS.credential_switch_unsettled, tone: "warning", pulse: false,
         title: "Processes could not be proven stopped; work is kept on its worker. Open the run to Resume on the new token, or Cancel." };
+    case "base_attestation_missing":
+      return { kind: "badge", label: PARK_LABELS.base_attestation_missing, tone: "warning", pulse: false,
+        title: "The retained work is not attested to the planned base commit, so the agent was not started. Open the run to recover the work or start a successor." };
     case "provider_outage":
       return { kind: "badge", label: PARK_LABELS.provider_outage, tone: "warning", pulse: false,
         title: "Provider outage. Open the run for park count, streak start and next retry." };
@@ -963,6 +978,7 @@ export function needsHumanAttention(status: string): boolean {
     status === "worker_memory_pressure" ||
     status === "provider_unavailable" ||
     status === "credential_switch_settling" ||
-    status === "credential_switch_unsettled"
+    status === "credential_switch_unsettled" ||
+    status === "base_attestation_missing"
   );
 }

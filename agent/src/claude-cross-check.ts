@@ -16,6 +16,8 @@
 // The SDK child runs through spawnDetached (the runner uid under the uid split, a process-group
 // kill on abort) with a full-replacement env.
 
+import path from "node:path";
+import type { ActivitySettle, CheckActivityRecorder } from "./cross-check-activity.js";
 import type { EffortLevel, HookInput, HookJSONOutput, Options as SdkOptions, SpawnOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
 
 import type { ClaimResponse } from "./protocol.js";
@@ -199,8 +201,11 @@ class CodeToolBudget {
   private readonly ids = new Set<string>();
   private readonly executed = new Set<string>();
   private readonly observed = new Set<string>();
+  private readonly denied = new Set<string>();
   private exceeded = false;
   constructor(private readonly abort: AbortController) {}
+  /** Whether the budget hook refused this tool call (read-only; activity evidence maps it to `limit`). */
+  wasDenied(id: string): boolean { return this.denied.has(id); }
   private admit(id: unknown): boolean {
     if (this.exceeded) return false;
     if (typeof id !== "string" || !id || (!this.ids.has(id) && this.ids.size >= 200)) {
@@ -216,6 +221,7 @@ class CodeToolBudget {
     const id = input.tool_use_id;
     if (!this.executed.has(id) && this.admit(id)) { this.executed.add(id); return {}; }
     this.exceeded = true;
+    if (typeof id === "string") this.denied.add(id);
     this.abort.abort(new CrossCheckConfinementError("tool_budget"));
     return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny",
       permissionDecisionReason: "cross-check tool budget exceeded" } };
@@ -236,6 +242,112 @@ class CodeToolBudget {
   }
   assertWithinBudget(): void {
     if (this.exceeded) throw new CrossCheckConfinementError("tool_budget");
+  }
+}
+
+function activityOp(tool: string): "read" | "search" | undefined {
+  if (tool === "Read") return "read";
+  return tool === "Grep" || tool === "Glob" ? "search" : undefined;
+}
+
+const ACTIVITY_PENDING_CAP = 256;
+const ACTIVITY_ID_MAX_BYTES = 128;
+
+function nonNegSafeInt(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : undefined;
+}
+
+function toolResultText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  let out = "";
+  for (const raw of content) {
+    const text = asRecord(raw)?.["text"];
+    if (typeof text === "string") out += text + "\n";
+  }
+  return out;
+}
+
+/** Maps SDK assistant tool_use and user tool_result frames onto the activity recorder (PRD #3166).
+ * Reads only ids, tool names, path fields and the structured result's counts: never a pattern,
+ * glob or file content. Every recorder call is guarded so telemetry cannot fail the check. */
+class ActivityMapper {
+  private readonly begun = new Map<string, { tool: string; rawPath?: string }>();
+  constructor(private readonly recorder: CheckActivityRecorder, private readonly checkout: string,
+    private readonly budget: CodeToolBudget | undefined) {}
+
+  observe(frame: Record<string, unknown> | undefined): void {
+    try {
+      if (frame?.["type"] === "assistant") this.onAssistant(frame);
+      else if (frame?.["type"] === "user") this.onUser(frame);
+    } catch { /* telemetry only */ }
+  }
+
+  private onAssistant(frame: Record<string, unknown>): void {
+    const content = asRecord(frame["message"])?.["content"];
+    if (!Array.isArray(content)) return;
+    for (const raw of content) {
+      const block = asRecord(raw);
+      if (block?.["type"] !== "tool_use") continue;
+      const tool = String(block["name"]);
+      const op = activityOp(tool);
+      const id = block["id"];
+      if (!op) continue;
+      // Mirror the recorder bounds: an id it would refuse, or one past the cap, is not tracked here,
+      // but it still reaches recorder.begin so the recorder counts it untracked (summary incomplete).
+      if (typeof id !== "string") { this.recorder.begin(id, op); continue; }
+      const idBytes = Buffer.byteLength(id);
+      if (idBytes < 1 || idBytes > ACTIVITY_ID_MAX_BYTES || this.begun.size >= ACTIVITY_PENDING_CAP) {
+        this.recorder.begin(id, op);
+        continue;
+      }
+      const input = asRecord(block["input"]);
+      const rawPath = tool === "Read" ? input?.["file_path"] : input?.["path"];
+      this.begun.set(id, { tool, ...(typeof rawPath === "string" ? { rawPath } : {}) });
+      this.recorder.begin(id, op, rawPath);
+    }
+  }
+
+  private onUser(frame: Record<string, unknown>): void {
+    const content = asRecord(frame["message"])?.["content"];
+    if (!Array.isArray(content)) return;
+    const blocks = content.map(asRecord).filter(b => b?.["type"] === "tool_result");
+    // The frame-level structured result belongs to a single tool_result only.
+    const structured = blocks.length === 1 ? asRecord(frame["tool_use_result"]) : undefined;
+    for (const block of blocks) {
+      const id = block?.["tool_use_id"];
+      if (typeof id !== "string") continue;
+      const info = this.begun.get(id);
+      if (!info) continue;
+      this.begun.delete(id);
+      if (block?.["is_error"] !== true) { this.recorder.settle(id, this.okResult(info.tool, structured)); continue; }
+      if (this.budget?.wasDenied(id)) { this.recorder.settle(id, { outcome: "limit" }); continue; }
+      if (toolResultText(block["content"]).includes(REASON_PATTERN)) {
+        this.recorder.settle(id, { outcome: "denied", category: "outside_checkout" });
+      } else if (this.outsideCheckout(info.rawPath)) this.recorder.settle(id, { outcome: "denied" });
+      else this.recorder.settle(id, { outcome: "error" });
+    }
+  }
+
+  private okResult(tool: string, structured: Record<string, unknown> | undefined): ActivitySettle {
+    if (tool === "Read") {
+      const file = asRecord(structured?.["file"]);
+      const start = nonNegSafeInt(file?.["startLine"]);
+      const num = nonNegSafeInt(file?.["numLines"]);
+      if (start !== undefined && num !== undefined && start >= 1 && num > 0) return { outcome: "ok", lines: [start, start + num - 1] };
+      return { outcome: "ok" };
+    }
+    const matches = tool === "Grep" ? nonNegSafeInt(structured?.["numMatches"]) ?? nonNegSafeInt(structured?.["numFiles"])
+      : nonNegSafeInt(structured?.["numFiles"]);
+    if (matches === undefined) return { outcome: "ok" };
+    return tool === "Glob" && structured?.["truncated"] === true
+      ? { outcome: "ok", matches, matchesTruncated: true } : { outcome: "ok", matches };
+  }
+
+  private outsideCheckout(rawPath: string | undefined): boolean {
+    if (!rawPath) return false;
+    const rel = path.relative(path.resolve(this.checkout), path.resolve(this.checkout, rawPath));
+    return rel === ".." || rel.startsWith(".." + path.sep) || path.isAbsolute(rel);
   }
 }
 
@@ -277,7 +389,9 @@ export class ClaudeCrossCheck {
 
   /** Same contract as CodexCrossCheck.run: returns the verdict JSON text or throws. */
   async run(claim: ClaimResponse, checkout: string, home: string, signal: AbortSignal,
-    postUsage: (payload: Record<string, unknown>) => Promise<void>, confirmNativeCleanup?: () => void): Promise<string> {
+    postUsage: (payload: Record<string, unknown>) => Promise<void>, confirmNativeCleanup?: () => void,
+    /** Activity recorder (PRD #3166): fed paths, line ranges and counts from SDK frames, never queries or content. */
+    activity?: CheckActivityRecorder): Promise<string> {
     if (claim.kind !== "cross_check") throw new Error("cross-check requires a cross_check claim");
     if (claim.secrets.codex) throw new Error("cross-check Claude path refuses a Codex credential");
     const token = claim.secrets.anthropic_oauth_token?.trim();
@@ -303,6 +417,7 @@ export class ClaudeCrossCheck {
     let readersStopped = false;
     let queryStarted = false;
     const budget = code ? new CodeToolBudget(abort) : undefined;
+    const mapper = activity ? new ActivityMapper(activity, checkout, budget) : undefined;
     let usageInit = false;
     let resultPosted = false;
     let failed = true;
@@ -335,12 +450,16 @@ export class ClaudeCrossCheck {
         if (next.done) { readersStopped = true; break; }
         const msg = next.value;
         signal.throwIfAborted();
+        // Before the budget latch can throw: a hook-denied call's tool_result must still settle as `limit`.
+        mapper?.observe(asRecord(msg));
         budget?.assertWithinBudget();
         const refusal = guardIsolatedFrameRefusal(msg, gate, CHECKER_SURFACE);
         if (refusal) throw new CrossCheckConfinementError(refusal.code);
         const frame = asRecord(msg);
         budget?.observe(frame);
         if (frame?.["type"] === "system" && frame["subtype"] === "init") {
+          // The validated init frame is the first evidence that the model session started.
+          try { activity?.modelStarted(); } catch { /* telemetry only */ }
           for (const em of mapSdkMessage(msg)) {
             if (em.payload["event"] === "init") { await postUsage({ ...em.payload, harness: "claude" }); usageInit = true; }
           }

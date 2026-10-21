@@ -14,6 +14,12 @@ import { client, fx, gitlabClaim, installHarness } from "./runner-harness.js";
 import { reportRetirementFixture } from "./report-retirement-fixture.js";
 import { nullLogger } from "./helpers.js";
 
+// The runner's stopped-source and quiescence proofs (src/runner.ts, src/run-quiescence.ts) refuse off
+// Linux, so this scenario cannot reach its post-proof assertions on macOS (#1912). Linux runs it unchanged.
+const LINUX_ONLY = process.platform !== "linux"
+  ? "needs the Linux-only run-quiescence / stopped-source proof (src/run-quiescence.ts, src/runner.ts refuse off Linux)"
+  : false;
+
 installHarness();
 
 async function restartedOutbox() {
@@ -23,7 +29,7 @@ async function restartedOutbox() {
   return outbox;
 }
 
-it("server-cancelled reply releases snapshot and overflow admission while real custody retirement refuses", async t => {
+it("server-cancelled reply releases snapshot and overflow admission while real custody retirement refuses", { skip: LINUX_ONLY }, async t => {
   const f = await reportRetirementFixture(t);
   const registry = new ActiveRunRegistry(() => f.outbox.listPendingTerminals(), () => 0);
   const journalPath = path.join(fx.dataDir, "outbox", f.claim.run_id, "terminal-2.json");

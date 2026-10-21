@@ -21,6 +21,10 @@ export interface RecoveryProgress {
   backoffMs: number;
   stage: "capturing" | "captured" | "adopting" | "ready-for-model" | "blocked";
   restoreTip?: string;
+  /** issue #3194: the content source the restoreTip wrapper verifiably stands for (a recovery
+   *  coverage commit's captured current tip). Only meaningful with restoreTip; an older reader
+   *  rejects the key and so refuses the journal (fail closed). */
+  restoreSource?: string;
   successor?: RecoverySource;
   blocker?: RecoveryBlocker;
 }
@@ -54,7 +58,7 @@ export function recoverySource(v: unknown): RecoverySource {
 
 export function recoveryProgress(v: unknown): RecoveryProgress {
   const o = object(v);
-  keys(o, ["version", "source", "attempts", "startedAt", "deadline", "claimGeneration", "backoffMs", "stage", "restoreTip", "successor", "blocker"]);
+  keys(o, ["version", "source", "attempts", "startedAt", "deadline", "claimGeneration", "backoffMs", "stage", "restoreTip", "restoreSource", "successor", "blocker"]);
   if (o.version !== 1 || !Number.isSafeInteger(o.attempts) || (o.attempts as number) < 1 || (o.attempts as number) > 3 ||
       !Number.isSafeInteger(o.startedAt) || (o.startedAt as number) < 0 ||
       !Number.isSafeInteger(o.deadline) || o.deadline !== (o.startedAt as number) + 300_000 ||
@@ -65,6 +69,8 @@ export function recoveryProgress(v: unknown): RecoveryProgress {
   if (o.successor !== undefined) recoverySource(o.successor);
   if (o.restoreTip !== undefined && (typeof o.restoreTip !== "string" || !/^[0-9a-f]{40}$/.test(o.restoreTip))) invalid();
   if (["captured", "adopting", "ready-for-model"].includes(o.stage as string) && o.restoreTip === undefined) invalid();
+  if (o.restoreSource !== undefined && (o.restoreTip === undefined || typeof o.restoreSource !== "string" ||
+      !/^[0-9a-f]{40}$/.test(o.restoreSource))) invalid();
   if (o.stage === "ready-for-model" && o.successor === undefined) invalid();
   if (o.blocker !== undefined && (!["capture_failed", "source_missing", "adoption_failed", "budget_exhausted", "clock_invalid", "oversize", "prerequisites_unavailable", "quiescence_failed", "preservation_failed", "decoded_history_limit", "readiness_cleanup_unconfirmed"].includes(o.blocker as string))) invalid();
   if (o.stage === "blocked" && o.blocker === undefined) invalid();

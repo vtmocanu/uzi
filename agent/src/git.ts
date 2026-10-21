@@ -667,6 +667,12 @@ export interface CheckpointRange {
    *  every commit the pack `tipSha ^excludeSha` carries is either scanned now, reachable from a
    *  previously confirmed checkpoint publish, or reachable from the default branch. */
   scanFloorShas?: string[];
+  /** issue #3242: TRANSPORT-only pack exclusions, replacing `^excludeSha` in the pack (never the
+   *  scan, never the floor validation). Set only for a zero range (`tipSha === excludeSha`) with no
+   *  origin branch: the pack would otherwise be empty, and the broker cannot prove it will fetch the
+   *  tip (the default branch may have moved past it). Then it is the tip's literal parent OIDs, so
+   *  the pack carries exactly the declared commit; `[]` for a root commit (distinct from absent). */
+  packExcludeShas?: readonly string[];
 }
 
 /** issue #1597 M2: optional GitCache construction knobs. */
@@ -933,6 +939,8 @@ const PREPARED_ABORT_GRACE_MS = 5_000;
 
 /** PRD #1798 M5: the bound on a {@link GitCache.readBare} read. */
 export interface BoundedReadOptions {
+  /** Preserve exact bounded stdout bytes for trusted source capture; text callers are unchanged. */
+  includeBytes?: boolean;
   /** Stop reading once more than this many stdout bytes arrived (the kept prefix is at most this).
    *  Must be finite and non-negative; readBare throws otherwise. */
   maxBytes: number;
@@ -973,6 +981,7 @@ interface SpawnGitOptions {
 export interface BoundedRead {
   text: string;
   truncated: boolean;
+  bytes?: Uint8Array;
 }
 
 // PRD #1416 M3 — cap on the EXTRA parents (beyond the first) a worker-bridge marker candidate may
@@ -1778,6 +1787,19 @@ export interface RunnerClone {
   /** issue #1783 M2: the attempt id when the clone was seeded at an ATTEMPT path (a
    *  Docker-wired or recovery-enabled worker); absent for a canonical-path seed. */
   attemptId?: string;
+  /** issue #3194: the raw adopted source the clone was cut from — the base AFTER the structural
+   *  overlay peel and BEFORE the `wip(park)` unwrap, so a recovered marker is its own identity and
+   *  covers the staged tree the executor receives. The `--require-base` guard compares this, not
+   *  `baseCommit`. */
+  adoptedSource: string;
+  /** issue #3194: the content source a recovery-coverage wrapper verifiably stands for (the
+   *  episode journal's restoreSource), set only on a verified recovery adoption. When present the
+   *  guard compares it instead of `adoptedSource`. */
+  adoptedContentSource?: string;
+  /** issue #3194: true when the diverged-checkpoint `wip(park)` marker was cherry-picked onto a
+   *  new floor, so the materialized content is no single adopted source. `--require-base` refuses
+   *  this shape. */
+  wipCherryPicked?: boolean;
 }
 
 /**
@@ -4068,7 +4090,8 @@ export class GitCache {
       // marker's parent when a wip(park) marker was reset --soft'd back to uncommitted, and
       // baseSha (byte-identical) on every other leg. wipRecovered surfaces the recovery to
       // M4/M5.
-      return { path: clonePath, branch, publicationFloor, priorCommits, baseCommit: effectiveBase, defaultBranchCommit, seededFrom, checkpointSetAside, wipRecovered };
+      return { path: clonePath, branch, publicationFloor, priorCommits, baseCommit: effectiveBase, defaultBranchCommit, seededFrom, checkpointSetAside, wipRecovered,
+        adoptedSource: baseSha, ...(recoveredCheckpointMarkerSha !== "" ? { wipCherryPicked: true } : {}) };
     }
   }
 
@@ -6641,8 +6664,10 @@ export class GitCache {
    * Thin bundles imported with local prerequisites are valid here; publication is separate. */
   async recordRecoveryCapture(
     barePath: string, branch: string, key: string, expected: RecoverySource, iteration: number, tip: string,
+    capturedSource?: string,
   ): Promise<void> {
     if (!SHA40_RE.test(tip)) throw new Error("invalid recovery tip");
+    if (capturedSource !== undefined && !SHA40_RE.test(capturedSource)) throw new Error("invalid recovery source");
     await this.withLock(barePath, async () => {
       const journal = await this.checkedRecovery(barePath, branch, key, expected);
       const recovery = journal.recovery;
@@ -6653,8 +6678,18 @@ export class GitCache {
       if (!SHA40_RE.test(sourceHead) || !await this.isAncestor(barePath, sourceHead, tip)) throw new Error("captured history does not cover source");
       await this.runGit(barePath, ["update-ref", "--no-deref", `refs/uzi-recovery-episode/${journal.runId}/${tip}`, tip]);
       if (!await this.recoveryClockCurrent(barePath, branch, journal)) throw new Error("capture iteration is not current");
+      // issue #3194: what content the wrapper stands for. A nested capture (the captured source is
+      // itself the previous verified restoreTip) carries that episode's source forward; otherwise
+      // the source is the verified capture's own current tip. It must be covered by the wrapper;
+      // anything unprovable records no source, so --require-base refuses rather than guesses.
+      const prior = recovery.restoreTip !== undefined && recovery.restoreSource !== undefined
+        ? { tip: recovery.restoreTip, source: recovery.restoreSource } : undefined;
+      let restoreSource = capturedSource ?? tip;
+      if (prior && prior.tip === restoreSource) restoreSource = prior.source;
+      if (await this.ancestry(barePath, restoreSource, tip) !== "ancestor") restoreSource = "";
+      const { restoreSource: _stale, ...rest } = recovery;
       await this.writeRecovery(barePath, branch, { ...journal, restoreTip: tip,
-        recovery: { ...recovery, restoreTip: tip, stage: "captured" } });
+        recovery: { ...rest, restoreTip: tip, ...(restoreSource ? { restoreSource } : {}), stage: "captured" } });
     });
   }
 
@@ -6742,7 +6777,8 @@ export class GitCache {
         recovery: { ...recovery, successor, stage: "adopting" } })) throw new Error("successor iteration is not current");
       await this.writeRecovery(barePath, branch, { ...successor, retainedSources,
         recovery: { ...recovery, successor, stage: "ready-for-model" } });
-      return { ...seeded, attemptId };
+      // issue #3194: hand the guard the content source this wrapper verifiably stands for.
+      return { ...seeded, attemptId, ...(recovery.restoreSource ? { adoptedContentSource: recovery.restoreSource } : {}) };
     });
   }
 
@@ -8893,15 +8929,18 @@ export class GitCache {
     replay: () => Promise<{ pack: Readable; exited: Promise<number>; cancel: () => void }>;
   } | null> {
     // Replay closes over literal OIDs and the original guard; it never rebuilds an overlay.
-    const openProducer = async (source: string, candidate: string, floor: string) => {
+    const openProducer = async (source: string, candidate: string, floor: string, packExcludes?: readonly string[]) => {
       onStep?.("scratch_preflight");
       await this.scratchPublicationPreflight(barePath, branch, source);
       if (candidate !== source) await this.scratchPublicationPreflight(barePath, branch, candidate);
       await this.validateCheckpointFloor(barePath, floor, candidate);
       await beforePack?.(candidate);
       onStep?.("checkpoint_pack");
+      // issue #3242: a zero range packs the candidate over its literal parents instead of ^floor.
+      const excludes = candidate === floor && packExcludes !== undefined ? packExcludes : [floor];
       const { stdout, exited, cancel } = await this.spawnGit(
-        barePath, ["pack-objects", "--revs", "--stdout"], `${candidate}\n^${floor}\n`, { stdoutCategory: "artifactBytes" },
+        barePath, ["pack-objects", "--revs", "--stdout"], `${candidate}\n${excludes.map((x) => `^${x}\n`).join("")}`,
+        { stdoutCategory: "artifactBytes" },
       );
       return { pack: stdout, exited, cancel };
     };
@@ -8909,8 +8948,9 @@ export class GitCache {
     // If an overlay is requested, its wrapper becomes the wanted OID while the
     // excluded floor remains pinned.
     if (pinned) {
-      const { tipSha, excludeSha } = pinned;
+      const { tipSha, excludeSha, packExcludeShas } = pinned;
       if (!SHA40_RE.test(tipSha) || !SHA40_RE.test(excludeSha) ||
+          (packExcludeShas !== undefined && (tipSha !== excludeSha || !packExcludeShas.every((x) => SHA40_RE.test(x)))) ||
           (sourceSha !== undefined && sourceSha !== tipSha)) {
         throw new ScratchPublicationError("pinned checkpoint range must be two 40-hex commit SHAs", undefined, {
           kind: "checkpoint_range", step: "checkpoint_floor", detail: "pinned range is not two 40-hex commit SHAs",
@@ -8933,7 +8973,7 @@ export class GitCache {
         }
       }
       const candidate = wanted;
-      const replay = () => openProducer(tipSha, candidate, excludeSha);
+      const replay = () => openProducer(tipSha, candidate, excludeSha, packExcludeShas);
       return { tipOid: wanted, ...await replay(), replay };
     }
     const realTip = sourceSha ?? await this.trackingTip(barePath, branch);
@@ -8991,7 +9031,17 @@ export class GitCache {
     // The initial validation establishes the floor as a literal SHA before capturing it.
     await this.validateCheckpointFloor(barePath, excludeSha, wanted);
     const floor = excludeSha!;
-    const replay = () => openProducer(realTip, wanted, floor);
+    let packExcludes: readonly string[] | undefined;
+    try {
+      packExcludes = wanted === floor ? await this.zeroRangePackExcludes(barePath, branch, wanted, floor) : undefined;
+    } catch (e) {
+      const abort = this.boundaryAbortError(e);
+      if (abort) throw abort;
+      throw new ScratchPublicationError("checkpoint parents cannot be resolved", e, {
+        kind: "checkpoint_range", step: "checkpoint_floor", ...execDetail(classifyExecFailure(e)),
+      });
+    }
+    const replay = () => openProducer(realTip, wanted, floor, packExcludes);
     return { tipOid: wanted, ...await replay(), replay };
   }
 
@@ -9016,6 +9066,23 @@ export class GitCache {
     // base keeps the pack self-contained while the overlay aligns workflow trees.
     const base = (await this.runGit(barePath, ["merge-base", defaultRef, tip])).trim();
     return SHA40_RE.test(base) ? base : defaultRef;
+  }
+
+  /**
+   * issue #3242 — the transport exclusions for a zero range (`tip === floor`) with no origin branch.
+   * The pack `tip ^tip` would be empty, and the broker's depth-1 fetch holds the tip only while it is
+   * still the default branch's tip, which the worker cannot prove for the later fetch. So the pack
+   * excludes the tip's literal parents and carries the declared commit itself: all parents of a
+   * merge, `[]` for a root. Undefined when the range is not zero or origin carries the branch (the
+   * broker fetches that branch tip). Throws when the parents cannot be resolved.
+   */
+  private async zeroRangePackExcludes(barePath: string, branch: string, tip: string, floor: string): Promise<string[] | undefined> {
+    if (tip !== floor || await this.refExists(barePath, `refs/remotes/origin/${branch}`)) return undefined;
+    const [self, ...parents] = (await this.runGit(barePath, ["rev-list", "--parents", "-n", "1", tip, "--"])).trim().split(" ");
+    if (self !== tip || !parents.every((p) => SHA40_RE.test(p))) {
+      throw new Error("checkpoint tip parents are not 40-hex commit SHAs");
+    }
+    return parents;
   }
 
   /**
@@ -9077,7 +9144,8 @@ export class GitCache {
           scanFloorShas.push(floor);
         }
       }
-      return { tipSha, excludeSha, scanFloorShas };
+      const packExcludeShas = await this.zeroRangePackExcludes(barePath, branch, tipSha, excludeSha);
+      return { tipSha, excludeSha, scanFloorShas, ...(packExcludeShas !== undefined ? { packExcludeShas } : {}) };
     } catch (err) {
       this.log.warn("checkpoint range could not be resolved", { bare: barePath, error: gitErrorMessage(err) });
       return null;
@@ -11235,8 +11303,9 @@ try {
       const text = (truncated: boolean): BoundedRead => {
         // StringDecoder.write holds back an incomplete trailing sequence: a cut through a
         // multi-byte character drops that character instead of rendering U+FFFD.
-        const decoded = new StringDecoder("utf8").write(Buffer.concat(chunks, bytes));
-        return { text: decoded, truncated };
+        const raw = Buffer.concat(chunks, bytes);
+        const decoded = new StringDecoder("utf8").write(raw);
+        return { text: decoded, truncated, ...(opts.includeBytes ? { bytes: raw } : {}) };
       };
       const onData = (chunk: Buffer | string): void => {
         const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
@@ -13647,6 +13716,56 @@ try {
    *  wins the "strictly descends" branch. */
   private async isAncestor(barePath: string, ancestorRef: string, descendantRef: string): Promise<boolean> {
     return (await this.tryGit(barePath, ["merge-base", "--is-ancestor", ancestorRef, descendantRef])) === 0;
+  }
+
+  /** issue #3194: resolve a planned commit (full or abbreviated) to exactly one commit, without
+   *  replacement objects. "missing" when no commit matches, "ambiguous" when an abbreviation names
+   *  more than one, "unknown" on any git error or a malformed input — never coerced to a match. */
+  async resolveCommitUnique(barePath: string, ref: string): Promise<
+    { kind: "resolved"; sha: string } | { kind: "missing" } | { kind: "ambiguous" } | { kind: "unknown" }> {
+    const prefix = ref.trim().toLowerCase();
+    if (!/^[0-9a-f]{4,40}$/.test(prefix)) return { kind: "unknown" };
+    let listed: string;
+    try {
+      listed = await this.runGit(barePath, ["--no-replace-objects", "rev-parse", "--disambiguate=" + prefix]);
+    } catch {
+      // rev-parse --disambiguate exits non-zero only on a git error; no match prints nothing.
+      return { kind: "unknown" };
+    }
+    const commits: string[] = [];
+    for (const oid of listed.split("\n").map((l) => l.trim()).filter(Boolean)) {
+      if (!SHA40_RE.test(oid)) return { kind: "unknown" };
+      // The listed object exists, so a failed type read is an error, not absence.
+      let type: string;
+      try {
+        type = (await this.runGit(barePath, ["--no-replace-objects", "cat-file", "-t", oid])).trim();
+      } catch {
+        return { kind: "unknown" };
+      }
+      if (type === "commit") commits.push(oid);
+    }
+    if (commits.length === 0) return { kind: "missing" };
+    if (commits.length > 1) return { kind: "ambiguous" };
+    return { kind: "resolved", sha: commits[0]! };
+  }
+
+  /** issue #3194: the tree OID of `sha` in the bare (no replacement objects), or undefined on any
+   *  failure. */
+  async commitTreeOid(barePath: string, sha: string): Promise<string | undefined> {
+    if (!SHA40_RE.test(sha)) return undefined;
+    const tree = (await this.tryGitStdout(barePath, ["--no-replace-objects", "rev-parse", "--verify", `${sha}^{tree}`])).trim();
+    return SHA40_RE.test(tree) ? tree : undefined;
+  }
+
+  /** issue #3194: the tree the runner clone's INDEX holds (what the executor receives, staged WIP
+   *  included), or undefined on any failure. Run as the runner uid, like every clone read. */
+  async indexTreeOid(clonePath: string): Promise<string | undefined> {
+    try {
+      const tree = (await this.runGitAsRunner(clonePath, ["write-tree"])).trim();
+      return SHA40_RE.test(tree) ? tree : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   /** issue #1117: public delegate to {@link isAncestor} — true when `ancestorRef` is an

@@ -118,6 +118,7 @@ export type SecretRemediationDecision =
  * compatible. The runner populates them from the claim.
  */
 export interface RunContext {
+  semanticPlanning?: import("./semantic-plan.js").SemanticPlanning;
   /** Called after harness-specific home preparation, before any model invocation. */
   prepareCIEvidence?: () => Promise<import("./ci-evidence.js").PreparedCIEvidence>;
   ciEvidence?: import("./ci-evidence.js").PreparedCIEvidence;
@@ -346,7 +347,9 @@ export interface RunContext {
    *  reseed recovered a tree). It both relaxes the preApproved session guard and, crucially,
    *  extends the embedSeededPlan gate so the plan BODY reaches the first implement turn
    *  (a bare planApproved flip leaves seededPlanBody undefined and the model falls back to
-   *  the issue — the #209 M2 gap). Absent/false ⇒ today's behaviour, byte-for-byte. */
+   *  the issue — the #209 M2 gap). Issue #3178 adds a second, independent term to that gate
+   *  (a plan approved at the gate with no session to carry it), which does not use this flag.
+   *  Absent/false ⇒ today's behaviour, byte-for-byte. */
   reviewedPlanResume?: boolean;
   /** Issue #3149: on a reviewedPlanResume the fresh session has none of the run's earlier owner
    *  follow-ups. These are the ones earlier claims consumed (id order, trimmed), complete or
@@ -408,6 +411,7 @@ export interface RunContext {
     milestones?: Milestone[],
     onPlanPersisted?: (planMd: string) => Promise<void>,
     settles?: number,
+    semanticSubmission?: import("./semantic-plan.js").SemanticSubmission,
   ): Promise<PlanVerdict>;
   /**
    * Issue #1604 (D3): a resumed, unapproved claim with a persisted plan calls this before it

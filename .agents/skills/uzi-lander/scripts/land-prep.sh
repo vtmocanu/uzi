@@ -1,21 +1,33 @@
 #!/usr/bin/env bash
 # land-prep.sh — the deterministic base-hygiene pipeline for a PR branch that cannot merge
-# as-is: sibling worktree → fetch → rebase onto the base → renumber colliding migrations
-# → the component gates when --gate asks (default none: CI is the gate) → force-with-lease push. Everything that needs no
+# as-is: sibling worktree → fetch → rebase onto the base (or merge it in, see --merge) →
+# renumber colliding migrations → the component gates when --gate asks (default none: CI is
+# the gate) → lease push. Everything that needs no
 # judgment; it STOPS (with a distinct exit code and the worktree left in place) at the
 # points that do — a rebase conflict, a renumber that touched more than the migrations
 # directory, a red gate.
 #
 # Usage: land-prep.sh OWNER/REPO PR [--worktree DIR] [--skip-rebase] [--gate auto|none|api,web,agent,controller]
-#                     [--no-push] [--no-rework-check] [--allow-changelog-removals]
+#                     [--merge|--rebase] [--no-push] [--no-rework-check] [--allow-changelog-removals]
 #                     [--allow-workflow-edit] [--repo-root DIR]
+#   --merge          merge origin/<base> into the branch instead of rebasing it: one merge
+#                    commit, no history rewrite, and a plain (fast-forward) push instead of
+#                    --force-with-lease. The default when the branch (local or remote) already
+#                    holds merge commits not on the base (an uzi rework merges main in), since
+#                    a rebase replays every commit and re-conflicts once per commit. Use it
+#                    by hand for a long linear branch; PRs are squash-merged, so the merge
+#                    commit never reaches the base. A CHANGELOG.md-only conflict is
+#                    union-resolved as for a rebase (exit 5).
+#   --rebase         force the rebase on a branch that holds merge commits (they are dropped:
+#                    git rebase linearizes).
 #   --worktree DIR   where the PR branch is checked out (default: <repo-root>-land-<PR>,
 #                    a sibling of the repo root). Reused if it already exists on the branch.
 #                    An existing checkout (at the default path or elsewhere) is reused only
 #                    if land-prep created it or --worktree names it; any other (e.g. a
 #                    buddy's own tree) is refused, exit 3.
-#   --skip-rebase    re-entry after you resolved a conflict by hand (`git rebase --continue`
-#                    done) or after a manual renumber fix: skips straight to gates + push.
+#   --skip-rebase    re-entry after you resolved a conflict by hand (`git rebase --continue`,
+#                    or in merge mode the merge `git commit`, done) or after a manual renumber
+#                    fix: skips straight to gates + push.
 #   --fresh          start the landing over: reset the (clean) worktree to origin/<branch>
 #                    and drop the recorded lease. The answer to RESULT=remote_moved.
 #                    Local commits the remote lacks are kept under
@@ -49,7 +61,8 @@
 #   4  an mr_rework run is active on this MR — defer (scripts/wait-mrrework.sh), or a ci_fix
 #      run is active on its branch — let it finish or cancel it
 #   5  rebase conflict — the worktree is left mid-rebase: resolve, `git add`, `git rebase
-#      --continue`, then re-run with --skip-rebase. A stop whose ONLY conflicted path is
+#      --continue`, then re-run with --skip-rebase. In merge mode it is left mid-merge:
+#      resolve, `git add`, `git commit`, re-run with --skip-rebase. A stop whose ONLY conflicted path is
 #      CHANGELOG.md is resolved automatically (changelog-union.sh keeps both sides) and the
 #      rebase continued, commit by commit; the CHANGELOG guard (exit 9) still runs after.
 #      The helper refuses (so this stays exit 5) when a bullet or continuation line appears
@@ -95,11 +108,13 @@
 #      after the CHANGELOG guard (exit 9), also after a pre-push base-move rebase
 set -uo pipefail
 
-REPO=""; PR=""; WT=""; WT_EXPLICIT=0; SKIP_REBASE=0; GATE="none"; PUSH=1; ROOT=""; REWORK_CHECK=1; FRESH=0; ALLOW_CL_RM=0; ALLOW_WF=0
+REPO=""; PR=""; WT=""; WT_EXPLICIT=0; SKIP_REBASE=0; GATE="none"; PUSH=1; ROOT=""; REWORK_CHECK=1; FRESH=0; ALLOW_CL_RM=0; ALLOW_WF=0; MODE_REQ=auto
 while [ $# -gt 0 ]; do
   case "$1" in
     --worktree) WT="${2:?}"; WT_EXPLICIT=1; shift 2;;
     --skip-rebase) SKIP_REBASE=1; shift;;
+    --merge) MODE_REQ=merge; shift;;
+    --rebase) MODE_REQ=rebase; shift;;
     --fresh) FRESH=1; shift;;
     --gate) GATE="${2:?}"; shift 2;;
     --no-push) PUSH=0; shift;;
@@ -107,7 +122,7 @@ while [ $# -gt 0 ]; do
     --allow-changelog-removals) ALLOW_CL_RM=1; shift;;
     --allow-workflow-edit) ALLOW_WF=1; shift;;
     --repo-root) ROOT="${2:?}"; shift 2;;
-    -h|--help) sed -n '2,83p' "$0"; exit 2;;
+    -h|--help) awk 'NR > 1 && /^set -uo pipefail/ { exit } NR > 1' "$0"; exit 2;;
     -*) echo "unknown flag: $1" >&2; exit 2;;
     *) if [ -z "$REPO" ]; then REPO="$1"; elif [ -z "$PR" ]; then PR="$1"; else echo "unexpected arg: $1" >&2; exit 2; fi; shift;;
   esac
@@ -215,6 +230,12 @@ if [ -n "$(git status --porcelain)" ]; then
   if [ "$SKIP_REBASE" -eq 1 ]; then echo "worktree is dirty; commit the manual fix first, then --skip-rebase" >&2; else echo "worktree is dirty; commit or stash first" >&2; fi
   exit 3
 fi
+# A merge whose resolution left the tree clean is still unconcluded: committing it is the
+# step that records the base as a parent. (The dirty check above catches every other
+# in-progress merge state.)
+if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+  echo "a merge is still in progress in $WT; conclude it (git commit) or abort it (git merge --abort) first" >&2; exit 5
+fi
 # The lease is the remote head this LANDING started from, persisted in the worktree's git
 # dir. Every later run of the same landing (--skip-rebase, or a plain restart after a
 # --no-push or a failed gate) pushes against THAT head, never a refreshed origin/$BRANCH:
@@ -224,6 +245,7 @@ fi
 GIT_DIR=$(git rev-parse --git-dir)
 LEASE_FILE="$GIT_DIR/uzi-lander-lease-$PR"
 BASE_FILE="$GIT_DIR/uzi-lander-base-$PR"
+MODE_FILE="$GIT_DIR/uzi-lander-mode-$PR"
 remote_now=$(git ls-remote origin "refs/heads/$BRANCH" | cut -f1)
 [ -n "$remote_now" ] || { echo "cannot read the remote head of $BRANCH" >&2; exit 3; }
 if [ "$FRESH" -eq 1 ]; then
@@ -243,10 +265,40 @@ if [ "$FRESH" -eq 1 ]; then
     while IFS= read -r c; do log "  $(git log -1 --format='%h %s' "$c")"; done <<< "$local_only"
     echo "FRESH_BACKUP=$backup"
   fi
-  git reset -q --hard "origin/$BRANCH"; rm -f "$LEASE_FILE" "$BASE_FILE"; log "--fresh: worktree reset to origin/$BRANCH (${remote_now:0:8})"
+  git reset -q --hard "origin/$BRANCH"; rm -f "$LEASE_FILE" "$BASE_FILE" "$MODE_FILE"; log "--fresh: worktree reset to origin/$BRANCH (${remote_now:0:8})"
 fi
+# Integration mode, fixed for the whole landing and recorded beside the lease: a re-entry
+# integrates a moved base the same way, and a conflicting --merge/--rebase is refused until
+# --fresh. A new landing (or one an older land-prep started, with no mode recorded) decides
+# it here: a branch that already holds merge commits (local or remote) is merged, not
+# rebased, since a rebase would replay every commit, re-conflict once per commit and drop
+# the merges.
+if [ -f "$LEASE_FILE" ] && [ -f "$MODE_FILE" ]; then
+  MODE=$(cat "$MODE_FILE")
+  case "$MODE" in merge|rebase) ;; *) echo "unreadable integration mode in $MODE_FILE; start over with --fresh" >&2; exit 3;; esac
+  if [ "$MODE_REQ" != auto ] && [ "$MODE_REQ" != "$MODE" ]; then
+    echo "refusing: this landing started in $MODE mode; --$MODE_REQ needs a new landing (--fresh)" >&2; exit 3
+  fi
+  log "integration mode: $MODE (recorded for this landing)"
+else
+  if [ "$MODE_REQ" = auto ]; then
+    merges=$(git rev-list --merges "origin/$BASE..HEAD" "origin/$BASE..origin/$BRANCH") \
+      || { echo "cannot list the branch's merge commits" >&2; exit 3; }
+    if [ -n "$merges" ]; then MODE=merge; else MODE=rebase; fi
+  else
+    MODE="$MODE_REQ"
+  fi
+  log "integration mode: $MODE ($MODE_REQ)"
+  if [ -f "$LEASE_FILE" ]; then printf '%s' "$MODE" > "$MODE_FILE" || { echo "cannot record $MODE_FILE" >&2; exit 3; }; fi
+fi
+echo "INTEGRATION=$MODE"
 rebase_in_progress() {
   [ -d "$(git rev-parse --git-path rebase-merge)" ] || [ -d "$(git rev-parse --git-path rebase-apply)" ]
+}
+merge_in_progress() { git rev-parse -q --verify MERGE_HEAD >/dev/null; }
+in_progress() { rebase_in_progress || merge_in_progress; }
+abort_integration() {
+  if rebase_in_progress; then git rebase --abort; elif merge_in_progress; then git merge --abort; fi
 }
 delta_paths() {
   printf '%s\n' "$1" | sed -e '/^$/d' -e 's|^api/internal/store/migrations/.*|api/internal/store/migrations/|' | LC_ALL=C sort -u
@@ -271,6 +323,69 @@ union_continue() {
     if GIT_EDITOR=true git -c merge.conflictStyle=diff3 rebase --continue >/dev/null 2>&1; then return 0; fi
   done
   return 1
+}
+# merge_union_continue: a merge of the base INTO the branch has stopped. While CHANGELOG.md is
+# the ONLY conflicted path, resolve it as a rebase stop is resolved. A merge has the sides the
+# other way round (stage 2 and the first marker side are the branch), so git's conflict text
+# is saved, the file is rewritten with base-side-first diff3 markers from the three index
+# stages (what changelog-union.sh reads), and --merge-stages tells its release fold that stage
+# 2 is the branch here. The index is never rewritten. On a refusal, an error or a catchable
+# interruption git's original bytes are put back. Returns 0 once the merge is committed, 1 on
+# any other stop (the merge is left in progress).
+MERGE_CL_SAVED=""
+restore_merge_changelog() {
+  [ -n "$MERGE_CL_SAVED" ] || return 0
+  trap - INT TERM HUP
+  if ! cp "$MERGE_CL_SAVED/git-conflict" CHANGELOG.md; then
+    # Keep the only copy of git's conflict text; the worktree's CHANGELOG.md is not it.
+    log "ERROR: could not restore git's CHANGELOG.md conflict text in $WT; it is kept at $MERGE_CL_SAVED/git-conflict"
+    echo "RESULT=restore_failed BACKUP=$MERGE_CL_SAVED/git-conflict WORKTREE=$WT"
+    exit 3
+  fi
+  rm -rf "$MERGE_CL_SAVED"; MERGE_CL_SAVED=""
+}
+merge_union_continue() {
+  local conflicted stages s1 s2 s3 d cu_out rc
+  merge_in_progress || return 1
+  conflicted=$(git diff --name-only --diff-filter=U | LC_ALL=C sort -u)
+  [ "$conflicted" = "CHANGELOG.md" ] || return 1
+  stages=$(git ls-files -u -- CHANGELOG.md) || return 1
+  s1=$(printf '%s\n' "$stages" | awk '$3 == 1 { print $2 }')
+  s2=$(printf '%s\n' "$stages" | awk '$3 == 2 { print $2 }')
+  s3=$(printf '%s\n' "$stages" | awk '$3 == 3 { print $2 }')
+  [ -n "$s1" ] && [ -n "$s2" ] && [ -n "$s3" ] || return 1
+  d=$(mktemp -d "${TMPDIR:-/tmp}/land-prep-${PR}-mergecl.XXXXXX") || return 1
+  if ! { cp CHANGELOG.md "$d/git-conflict" && git cat-file blob "$s1" > "$d/ancestor" \
+      && git cat-file blob "$s2" > "$d/branch" && git cat-file blob "$s3" > "$d/base"; }; then
+    rm -rf "$d"; return 1
+  fi
+  MERGE_CL_SAVED="$d"
+  trap 'restore_merge_changelog; exit 130' INT TERM HUP
+  # merge-file exits with the conflict count (capped at 127), or above that on an error.
+  rc=0
+  git merge-file -p --diff3 -L "origin/$BASE" -L ancestor -L "$BRANCH" \
+    "$d/base" "$d/ancestor" "$d/branch" > CHANGELOG.md || rc=$?
+  if [ "$rc" -ge 128 ]; then restore_merge_changelog; return 1; fi
+  if ! cu_out=$(bash "$HERE/changelog-union.sh" --merge-stages --base "$d/base" CHANGELOG.md 2>&1); then
+    printf '%s\n' "$cu_out"; restore_merge_changelog; return 1
+  fi
+  git add CHANGELOG.md || { restore_merge_changelog; return 1; }
+  rm -rf "$d"; MERGE_CL_SAVED=""; trap - INT TERM HUP
+  log "auto-resolved the CHANGELOG.md merge conflict (union of both sides, base first)"
+  GIT_EDITOR=true git commit -q --no-edit >/dev/null 2>&1
+}
+# integrate REF [quiet]: bring REF into the branch per $MODE (rebase onto it, or merge it in),
+# union-resolving a CHANGELOG.md-only stop. 0 done, 1 stopped (left in progress).
+integrate() {
+  local out rc=0
+  if [ "$MODE" = merge ]; then
+    out=$(git -c merge.conflictStyle=diff3 merge --no-ff --no-edit -q -m "Merge origin/$BASE into $BRANCH" "$1" 2>&1) || rc=$?
+  else
+    out=$(git -c merge.conflictStyle=diff3 rebase "$1" --quiet 2>&1) || rc=$?
+  fi
+  [ -n "${2:-}" ] || [ -z "$out" ] || printf '%s\n' "$out"
+  [ "$rc" -ne 0 ] || return 0
+  if [ "$MODE" = merge ]; then merge_union_continue; else union_continue; fi
 }
 # collapse_changelog BASEREF: after a completed rebase, when the branch touches CHANGELOG.md,
 # collapse only branch-added repeated `### <Section>` headings under [Unreleased] (a clean rebase keeps both
@@ -298,8 +413,8 @@ collapse_changelog() {
 # names what follows the rebase, for the log line.
 try_base_move() {
   local old="$1" new="$2" what="$3" delta mine both rest pre n shared
-  rebase_in_progress && return 1
-  [ -z "$(git status --porcelain)" ] || { log "worktree is dirty; not rebasing onto the moved base"; return 1; }
+  in_progress && return 1
+  [ -z "$(git status --porcelain)" ] || { log "worktree is dirty; not integrating the moved base"; return 1; }
   delta=$(git diff --no-renames --name-only "$old" "$new") || return 1
   mine=$(git diff --no-renames --name-only "$new...HEAD") || return 1
   both=$(LC_ALL=C comm -12 <(delta_paths "$delta") <(delta_paths "$mine"))
@@ -309,19 +424,19 @@ try_base_move() {
     return 1
   fi
   pre=$(git rev-parse HEAD)
-  if ! git -c merge.conflictStyle=diff3 rebase "$new" --quiet >/dev/null 2>&1 && ! union_continue; then
+  if ! integrate "$new" quiet; then
     # Restoring is load-bearing: exit 8 promises the worktree as it was. Any step that fails
     # to get back to $pre is an instrument failure, never a quiet "back at".
-    if rebase_in_progress && ! git rebase --abort >/dev/null 2>&1; then
-      log "ERROR: git rebase --abort failed in $WT; the worktree is mid-rebase, NOT at ${pre:0:8}"; exit 3
+    if in_progress && ! abort_integration >/dev/null 2>&1; then
+      log "ERROR: git $MODE --abort failed in $WT; the worktree is mid-$MODE, NOT at ${pre:0:8}"; exit 3
     fi
     if [ "$(git rev-parse HEAD)" != "$pre" ] && ! git reset -q --hard "$pre"; then
       log "ERROR: git reset --hard ${pre:0:8} failed in $WT; the worktree is NOT restored"; exit 3
     fi
-    if rebase_in_progress || [ "$(git rev-parse HEAD)" != "$pre" ]; then
-      log "ERROR: after the aborted rebase $WT is at $(git rev-parse --short HEAD), not ${pre:0:8}; NOT restored"; exit 3
+    if in_progress || [ "$(git rev-parse HEAD)" != "$pre" ]; then
+      log "ERROR: after the aborted $MODE $WT is at $(git rev-parse --short HEAD), not ${pre:0:8}; NOT restored"; exit 3
     fi
-    log "rebase onto the moved base ${new:0:8} conflicts; aborted, worktree back at ${pre:0:8}"
+    log "$MODE of the moved base ${new:0:8} conflicts; aborted, worktree back at ${pre:0:8}"
     return 1
   fi
   BASE_SHA="$new"
@@ -341,7 +456,7 @@ if [ -f "$LEASE_FILE" ]; then
     echo "RESULT=remote_moved"; exit 8
   fi
   if [ "$base_now" != "$BASE_SHA" ] && ! { [ "$SKIP_REBASE" -eq 1 ] \
-      && try_base_move "$BASE_SHA" "$base_now" "rebased; the gates below run on the new head"; }; then
+      && try_base_move "$BASE_SHA" "$base_now" "${MODE}d; the gates below run on the new head"; }; then
     log "remote $BASE moved ${BASE_SHA:0:8} -> ${base_now:0:8} since this landing started; start over with --fresh"
     echo "RESULT=base_moved"; exit 8
   fi
@@ -363,16 +478,21 @@ else
   BASE_SHA="$base_now"
   printf '%s' "$LEASE" > "$LEASE_FILE"
   printf '%s' "$BASE_SHA" > "$BASE_FILE"
+  printf '%s' "$MODE" > "$MODE_FILE"
 fi
 
-# ---- rebase -----------------------------------------------------------------------------
+# ---- rebase (or merge) ------------------------------------------------------------------
 if [ "$SKIP_REBASE" -eq 0 ]; then
-  # A CHANGELOG.md-only stop is resolved by union_continue; anything else stops as exit 5.
-  if git -c merge.conflictStyle=diff3 rebase "origin/$BASE" --quiet || union_continue; then
-    log "rebased onto origin/$BASE ($(git rev-list --count "origin/$BASE..HEAD") commits)"
+  # A CHANGELOG.md-only stop is union-resolved; anything else stops as exit 5.
+  if integrate "origin/$BASE"; then
+    if [ "$MODE" = merge ]; then
+      log "merged origin/$BASE into $BRANCH (HEAD $(git rev-parse --short HEAD)); no commit rewritten"
+    else
+      log "rebased onto origin/$BASE ($(git rev-list --count "origin/$BASE..HEAD") commits)"
+    fi
     collapse_changelog "origin/$BASE" || exit 3
   else
-    log "REBASE CONFLICT — worktree left mid-rebase in $WT:"
+    log "$(printf '%s' "$MODE" | tr '[:lower:]' '[:upper:]') CONFLICT — worktree left mid-$MODE in $WT:"
     git status --short | grep -E '^(UU|AA|DU|UD|DD)' || git status --short
     echo "RESULT=conflict WORKTREE=$WT"
     exit 5
@@ -622,7 +742,7 @@ base_remote_now=$(git ls-remote origin "refs/heads/$BASE" | cut -f1)
 if [ "$base_remote_now" != "$BASE_SHA" ]; then
   moved=0
   if git fetch origin "$BASE" --quiet && base_fetched=$(git rev-parse "origin/$BASE") \
-      && try_base_move "$BASE_SHA" "$base_fetched" "rebased without re-gating: CI on the pushed head is the authoritative gate"; then
+      && try_base_move "$BASE_SHA" "$base_fetched" "${MODE}d without re-gating: CI on the pushed head is the authoritative gate"; then
     moved=1
     changelog_guard
     changelog_placement_guard
@@ -634,8 +754,19 @@ if [ "$base_remote_now" != "$BASE_SHA" ]; then
     exit 8
   fi
 fi
-if git push --force-with-lease="${BRANCH}:${LEASE}" origin "HEAD:refs/heads/${BRANCH}" --quiet; then
-  rm -f "$LEASE_FILE" "$BASE_FILE"
+# Merge mode never rewrites history, so its push is a plain fast-forward: a remote that
+# advanced past the lease meanwhile is rejected (non-fast-forward) rather than overwritten.
+if [ "$MODE" = merge ]; then
+  if ! git merge-base --is-ancestor "$LEASE" HEAD; then
+    log "merge mode: HEAD does not contain the remote head ${LEASE:0:8}; not pushing (start over with --fresh)"
+    echo "RESULT=diverged"; exit 8
+  fi
+  push_cmd=(git push origin "HEAD:refs/heads/${BRANCH}" --quiet)
+else
+  push_cmd=(git push --force-with-lease="${BRANCH}:${LEASE}" origin "HEAD:refs/heads/${BRANCH}" --quiet)
+fi
+if "${push_cmd[@]}"; then
+  rm -f "$LEASE_FILE" "$BASE_FILE" "$MODE_FILE"
   log "pushed ${NEW_HEAD:0:8} (lease ${LEASE:0:8}); a re-review follows — run watch-pr.sh"
   echo "RESULT=pushed NEW_HEAD=$NEW_HEAD OLD_HEAD=$HEAD0 WORKTREE=$WT"
   exit 0

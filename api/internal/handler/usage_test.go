@@ -40,18 +40,19 @@ type outcomesBody struct {
 	Completed    int64            `json:"completed"`
 	Cancelled    int64            `json:"cancelled"`
 	PlanRejected int64            `json:"plan_rejected"`
+	BaseDiverged int64            `json:"base_diverged"`
 	Failed       int64            `json:"failed"`
 	NeedsLanding int64            `json:"needs_landing"`
 	FailOrigins  map[string]int64 `json:"fail_origins"`
 }
 
 // assertOutcomeInvariants pins the PRD #1293 / issue #1418 contract invariants on a decoded
-// window: finished == completed+cancelled+plan_rejected+failed, sum(fail_origins) == failed,
+// window: finished == completed+cancelled+plan_rejected+base_diverged+failed, sum(fail_origins) == failed,
 // and needs_landing <= failed (it is a sub-cut of failed, not a new denominator member).
 func assertOutcomeInvariants(t *testing.T, name string, o outcomesBody) {
 	t.Helper()
-	if got := o.Completed + o.Cancelled + o.PlanRejected + o.Failed; got != o.Finished {
-		t.Fatalf("%s: finished (%d) != completed+cancelled+plan_rejected+failed (%d)", name, o.Finished, got)
+	if got := o.Completed + o.Cancelled + o.PlanRejected + o.BaseDiverged + o.Failed; got != o.Finished {
+		t.Fatalf("%s: finished (%d) != completed+cancelled+plan_rejected+base_diverged+failed (%d)", name, o.Finished, got)
 	}
 	var sum int64
 	for _, c := range o.FailOrigins {

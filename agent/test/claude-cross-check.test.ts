@@ -8,6 +8,7 @@ import path from "node:path";
 import type { HookCallbackMatcher, HookInput, HookJSONOutput, Options as SdkOptions, SDKAssistantMessageError } from "@anthropic-ai/claude-agent-sdk";
 import { buildClaudeCrossCheckOptions, ClaudeCrossCheck, stubClaudeCrossCheckQueryFn } from "../src/claude-cross-check.js";
 import { CrossCheckRunner } from "../src/cross-check-runner.js";
+import { CheckActivityRecorder } from "../src/cross-check-activity.js";
 import { CrossCheckMalformedError, crossCheckBrief } from "../src/codex/cross-check.js";
 import { CrossCheckCheckerUnavailableError } from "../src/codex/model-rejection.js";
 import { buildIsolatedPreToolUse, type InitGate, type IsolationSurface } from "../src/isolated-executor.js";
@@ -512,5 +513,167 @@ describe("CrossCheckRunner dispatch on the claim's credential family (PRD #2460)
     assert.equal(codex.decisions[0].verdict, "approve");
     const leaked = await exercise(claudeClaim({ secrets: { forge_pat: "", anthropic_oauth_token: TOKEN, codex: codexSecrets } as ClaimResponse["secrets"] }));
     assert.deepEqual(leaked.calls, { codex: 0, claude: 0 });
+  });
+});
+
+describe("Claude cross-check activity evidence (PRD #3166)", () => {
+  const use = (id: string, name: string, input: Record<string, unknown>, parent: string | null = null) =>
+    ({ type: "assistant", parent_tool_use_id: parent, message: { role: "assistant", content: [{ type: "tool_use", id, name, input }] } });
+  const done = (id: string, structured?: unknown, over: Record<string, unknown> = {}) =>
+    ({ type: "user", parent_tool_use_id: null, message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: "x", ...over }] },
+      ...(structured === undefined ? {} : { tool_use_result: structured }) });
+  const secretPaths = ["/run/secrets/"];
+
+  async function capture(frames: unknown[]) {
+    const s = scratch();
+    const events: Record<string, unknown>[] = [];
+    const recorder = new CheckActivityRecorder(p => { events.push(structuredClone(p)); }, { generation: 7 });
+    recorder.attach(s.checkout, s.home);
+    const checker = new ClaudeCrossCheck(nullLogger(), { secretPaths, queryFn: queryOf(frames) });
+    try {
+      await checker.run(claudeClaim(), s.checkout, s.home, new AbortController().signal, async () => {}, undefined, recorder);
+    } finally { fs.rmSync(s.root, { recursive: true, force: true }); }
+    recorder.summary("claude", "plan", true);
+    return { events: events.filter(e => e["event"] === "check_activity"), summary: events.find(e => e["event"] === "check_activity_summary")!, all: events };
+  }
+
+  it("marks the model started on a normal run, but not when the check is refused before the query", async () => {
+    const attempt = async (claim: ReturnType<typeof claudeClaim>) => {
+      const s = scratch();
+      const events: Record<string, unknown>[] = [];
+      const recorder = new CheckActivityRecorder(p => { events.push(structuredClone(p)); }, { generation: 7 });
+      recorder.attach(s.checkout, s.home);
+      let threw = false;
+      try {
+        await new ClaudeCrossCheck(nullLogger(), { secretPaths, queryFn: queryOf([initFrame(), resultFrame(APPROVE)]) })
+          .run(claim, s.checkout, s.home, new AbortController().signal, async () => {}, undefined, recorder);
+      } catch (err) {
+        assert.ok(err instanceof CrossCheckCheckerUnavailableError);
+        threw = true;
+      } finally { fs.rmSync(s.root, { recursive: true, force: true }); }
+      recorder.start();
+      recorder.summary("claude", "plan", true);
+      return { threw, complete: events.find(e => e["event"] === "check_activity_summary")!["complete"] };
+    };
+    assert.deepEqual(await attempt(claudeClaim()), { threw: false, complete: true });
+    const bad = claudeClaim({ config: { default_model: "sonnet", default_effort: "extreme" as never } }, { effort_source: "pin" });
+    assert.deepEqual(await attempt(bad), { threw: true, complete: false });
+  });
+
+  it("records ok, outside-denied and error reads with line ranges (top-level and nested frames)", async () => {
+    const { events, summary } = await capture([
+      initFrame(),
+      use("r1", "Read", { file_path: "a.ts" }),
+      done("r1", { type: "text", file: { filePath: "a.ts", content: "FILE_BODY_SENTINEL", numLines: 30, startLine: 11, totalLines: 99 } }),
+      use("r2", "Read", { file_path: "/opt/other/data.txt" }, "sub"),
+      done("r2", undefined, { is_error: true, content: "blocked" }),
+      use("r3", "Read", { file_path: "missing.ts" }),
+      done("r3", undefined, { is_error: true, content: "ENOENT" }),
+      resultFrame(APPROVE),
+    ]);
+    assert.deepEqual(events, [
+      { event: "check_activity", op: "read", outcome: "ok", path: "a.ts", lines: [11, 40] },
+      { event: "check_activity", op: "read", outcome: "denied", category: "outside_checkout" },
+      { event: "check_activity", op: "read", outcome: "error", path: "missing.ts" },
+    ]);
+    assert.deepEqual(summary["reads"], { ok: 1, denied: 1, oversize: 0, limit: 0, error: 1 });
+    assert.doesNotMatch(JSON.stringify(events), /FILE_BODY_SENTINEL|opt\/other/);
+  });
+
+  it("records a Grep with path, match count and outcome and never carries the pattern", async () => {
+    const { all, events } = await capture([
+      initFrame(),
+      use("g1", "Grep", { pattern: "SECRET_QUERY_xyz", path: "api/internal/forge", glob: "*.go" }),
+      done("g1", { mode: "count", numFiles: 4, filenames: [], numMatches: 9 }),
+      use("g2", "Glob", { pattern: "**/*SECRET_QUERY_xyz*" }),
+      done("g2", { durationMs: 1, numFiles: 3, filenames: ["a", "b", "c"], truncated: false }),
+      use("g3", "Grep", { pattern: "SECRET_QUERY_xyz", path: "src" }),
+      done("g3", { mode: "files_with_matches", numFiles: 2, filenames: ["a", "b"] }),
+      use("g4", "Grep", { pattern: "q" }),
+      done("g4", { numFiles: -1, filenames: [] }),
+      resultFrame(APPROVE),
+    ]);
+    assert.deepEqual(events, [
+      { event: "check_activity", op: "search", outcome: "ok", path: "api/internal/forge", matches: 9 },
+      { event: "check_activity", op: "search", outcome: "ok", path: ".", matches: 3 },
+      { event: "check_activity", op: "search", outcome: "ok", path: "src", matches: 2 },
+      { event: "check_activity", op: "search", outcome: "ok", path: "." },
+    ]);
+    assert.doesNotMatch(JSON.stringify(all), /SECRET_QUERY_xyz/);
+  });
+
+  it("a read under the checker HOME is tool_output and carries no path", async () => {
+    const s = scratch();
+    const events: Record<string, unknown>[] = [];
+    const recorder = new CheckActivityRecorder(p => { events.push(structuredClone(p)); }, { generation: 1 });
+    recorder.attach(s.checkout, s.home);
+    const spill = path.join(s.home, "tool-results", "spill.txt");
+    const checker = new ClaudeCrossCheck(nullLogger(), { secretPaths, queryFn: queryOf([
+      initFrame(), use("t1", "Read", { file_path: spill }),
+      done("t1", { type: "text", file: { filePath: spill, content: "c", numLines: 2, startLine: 1, totalLines: 2 } }),
+      resultFrame(APPROVE)]) });
+    try {
+      await checker.run(claudeClaim(), s.checkout, s.home, new AbortController().signal, async () => {}, undefined, recorder);
+    } finally { fs.rmSync(s.root, { recursive: true, force: true }); }
+    assert.deepEqual(events, [{ event: "check_activity", op: "read", outcome: "ok", category: "tool_output", lines: [1, 2] }]);
+  });
+
+  it("a pattern-guard deny tool_result is denied/outside_checkout even for a Grep with no path", async () => {
+    const { events } = await capture([
+      initFrame(), use("d1", "Grep", { pattern: "x", glob: "../**" }),
+      done("d1", undefined, { is_error: true, content: [{ type: "text", text: "PreToolUse hook: denied: a Glob or Grep pattern must be relative to the checkout and must not contain '..'" }] }),
+      resultFrame(APPROVE),
+    ]);
+    assert.deepEqual(events, [{ event: "check_activity", op: "search", outcome: "denied", category: "outside_checkout" }]);
+  });
+
+  it("a Glob with truncated:true records matches_truncated and an untruncated one does not", async () => {
+    const { events } = await capture([
+      initFrame(),
+      use("g1", "Glob", { pattern: "**/*.ts" }),
+      done("g1", { durationMs: 1, numFiles: 100, filenames: [], truncated: true }),
+      use("g2", "Glob", { pattern: "*.go" }),
+      done("g2", { durationMs: 1, numFiles: 2, filenames: ["a", "b"], truncated: false }),
+      resultFrame(APPROVE),
+    ]);
+    assert.deepEqual(events, [
+      { event: "check_activity", op: "search", outcome: "ok", path: ".", matches: 100, matches_truncated: true },
+      { event: "check_activity", op: "search", outcome: "ok", path: ".", matches: 2 },
+    ]);
+  });
+
+  it("inherited-property tool names produce no activity row", async () => {
+    const { events } = await capture([
+      initFrame(),
+      use("p1", "constructor", {}), use("p2", "toString", {}), use("p3", "__proto__", {}),
+      done("p1"), done("p2"), done("p3"),
+      resultFrame(APPROVE),
+    ]);
+    assert.deepEqual(events, []);
+  });
+
+  it("more than 256 unsettled tool_use blocks stay bounded: untracked ids settle nothing and nothing throws", async () => {
+    const frames: unknown[] = [initFrame()];
+    // Before the cap fills, so the non-string id is rejected by the type check alone.
+    frames.push(use(42 as unknown as string, "Read", { file_path: "a.ts" }));
+    for (let i = 0; i < 300; i++) frames.push(use("u" + i, "Read", { file_path: "a.ts" }));
+    frames.push(use("x".repeat(129), "Read", { file_path: "a.ts" }), done("x".repeat(129)));
+    for (let i = 0; i < 300; i++) frames.push(done("u" + i, { file: { startLine: 1, numLines: 1 } }));
+    frames.push(resultFrame(APPROVE));
+    const { events, summary } = await capture(frames);
+    assert.equal(events.length, 200);
+    assert.ok(events.every(e => e["outcome"] === "ok"));
+    // 44 calls past the 256 pending cap, the 129-byte id and the non-string id are counted, never
+    // silently skipped.
+    assert.equal(summary["untracked"], 46);
+    assert.equal(summary["complete"], false);
+    assert.equal((summary["reads"] as Record<string, number>)["ok"], 256);
+  });
+
+  it("a throwing recorder never fails the check", async () => {
+    const throwing = { begin() { throw new Error("boom"); }, settle() { throw new Error("boom"); } } as unknown as CheckActivityRecorder;
+    const checker = new ClaudeCrossCheck(nullLogger(), { secretPaths, queryFn: queryOf([
+      initFrame(), use("r1", "Read", { file_path: "a.ts" }), done("r1", { file: { startLine: 1, numLines: 1 } }), resultFrame(APPROVE)]) });
+    assert.equal(await checker.run(claudeClaim(), "/checkout", "/home", new AbortController().signal, async () => {}, undefined, throwing), APPROVE);
   });
 });

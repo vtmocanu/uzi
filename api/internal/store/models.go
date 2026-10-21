@@ -127,6 +127,7 @@ type CheckpointPublishAttempt struct {
 	Checks           int32              `json:"checks"`
 	LastError        pgtype.Text        `json:"last_error"`
 	ReconcileReadyAt pgtype.Timestamptz `json:"reconcile_ready_at"`
+	AttestedSource   pgtype.Text        `json:"attested_source"`
 }
 
 type CheckpointRetention struct {
@@ -1082,6 +1083,7 @@ type Run struct {
 	MemoryPolicy                []byte             `json:"memory_policy"`
 	CompletionNonClosingReason  pgtype.Text        `json:"completion_non_closing_reason"`
 	CiArtifactManifest          []byte             `json:"ci_artifact_manifest"`
+	CheckpointAttestedSource    pgtype.Text        `json:"checkpoint_attested_source"`
 }
 
 type RunCompletionAttempt struct {
@@ -1392,6 +1394,38 @@ type RunUserInput struct {
 	GateRevision            pgtype.Int8        `json:"gate_revision"`
 	IncludedAt              pgtype.Timestamptz `json:"included_at"`
 	InclusionReported       bool               `json:"inclusion_reported"`
+}
+
+type SemanticCandidateHistory struct {
+	RunID     uuid.UUID `json:"run_id"`
+	Revision  int64     `json:"revision"`
+	Candidate []byte    `json:"candidate"`
+}
+
+type SemanticPlanning struct {
+	RunID        uuid.UUID   `json:"run_id"`
+	Enrollment   []byte      `json:"enrollment"`
+	Revision     int64       `json:"revision"`
+	Fingerprint  pgtype.Text `json:"fingerprint"`
+	Candidate    []byte      `json:"candidate"`
+	ReviewState  []byte      `json:"review_state"`
+	Observations []byte      `json:"observations"`
+}
+
+type SemanticSnapshot struct {
+	RunID uuid.UUID `json:"run_id"`
+	Hash  string    `json:"hash"`
+	Raw   []byte    `json:"raw"`
+}
+
+type SemanticSourceSnapshot struct {
+	RunID        uuid.UUID `json:"run_id"`
+	IdentityHash string    `json:"identity_hash"`
+	SourceID     string    `json:"source_id"`
+	Kind         string    `json:"kind"`
+	Hash         string    `json:"hash"`
+	Provenance   string    `json:"provenance"`
+	Completeness string    `json:"completeness"`
 }
 
 type Skill struct {

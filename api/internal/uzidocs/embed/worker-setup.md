@@ -415,6 +415,69 @@ quarantined until its next heartbeat. Any run can cause a quarantine by leaving
 such a process behind, so on a shared worker a restart is the cost of that.
 Credentials a process could read before it was detected are not revoked.
 
+## Lost memory authority
+
+A guard-enabled worker can lose memory authority mid-life: the api stops
+advertising `worker_memory_pressure_v1` (an api downgrade below the version that
+advertises it) or the worker's heartbeat is rejected so it drops its negotiated
+features (for example the api restarted with `UZI_ACTIVE_SNAPSHOT_DISABLED`).
+Registration runs once at startup, so the worker cannot regain authority on its
+own. The worker sends `memory_authority` (`held` or `lost`) on each run-lane
+claim (protocol feature `worker_memory_authority_claim_v1`, registered with the
+guard), and the api withholds guard-bound runs from a worker that reports `lost`
+or, being capable, omits the member. Withheld kinds stay `queued`; the worker
+still claims judge, job, cross-check, review and isolated-fetch runs. Chat and
+the cross-check lane are unaffected. Guard-disabled workers never register the
+capability and are unchanged; an older worker image lacks it and is never gated
+(its claims fail until restart, as before).
+
+**Releasing it.** Restart the worker's container (the pod, for a
+[hosted worker](hosted-workers.md)). Only a fresh registration restores
+authority; a heartbeat never does, and there is no self-restart or retry.
+
+**Known limits, until the restart.**
+
+- Runs the worker aborted and requeued stay pinned to it while its heartbeat is
+  fresh (up to `WORKER_AFFINITY_CEILING`, default 2h) and wait queued until the
+  worker restarts or the ceiling lapses.
+- The ephemeral provisioner and the capacity and queued-reason counts still
+  count the worker as able to take guard-bound runs. This is not time-bounded:
+  it persists until that worker restarts. The gate prevents failing admissions;
+  it does not promise automatic rerouting.
+- A busy healthy worker may defer a run to the idle lost worker for up to
+  `WORKER_SPREAD_GRACE` (3x the poll interval).
+- A claim already in flight when authority is lost still fails closed in
+  `bindWorkerMemory`.
+- During a rolling api deploy, an old replica rejects a claim body carrying the
+  member (400; the worker retries on its next poll), and an old replica's
+  heartbeat advert can briefly make a still-authorized worker omit the member
+  and be withheld from guard-bound runs (it still claims the exempt kinds).
+- An api downgraded below the version that advertises
+  `worker_memory_pressure_v1` predates this gate too, so while it runs the
+  worker's claims fail in `bindWorkerMemory` as before; the gate applies once
+  the api is upgraded again, until the worker restarts.
+
+**Where it shows.**
+
+- `uzi worker list` and `uzi admin workers` append ` (memory authority lost)` to
+  the status.
+- `uzi admin workers --json` carries `memory_authority_lost_at` (api clock: the
+  first gated claim since the worker's last registration or api start).
+- `uzi tui`'s worker view shows `memory authority lost ... ago` with the note
+  that guard-bound runs are withheld until the worker container restarts.
+- The web Workers settings page and the admin worker lists show a
+  `memory authority lost` badge.
+- **Admin → Health** raises the `fleet.memory_authority` warning, see
+  [Admin health](admin-health.md#the-checks).
+
+The api keeps this record in process memory only, per api replica: with several
+replicas each surface shows only the gated claims the replica serving it handled,
+so it can be missing or flicker between replicas. It resets on an api restart
+(the gate itself does not: it reads the claim request and persisted capabilities)
+and reappears on the worker's next run-lane claim poll. An entry clears on a
+`held` claim, a re-registration, a worker delete, or 24 hours without a gated
+claim. See [ADR-2396](../adr/2396-worker-memory-guard.md).
+
 ## Message outbox
 
 An api outage — of any length — no longer costs a run its message feed. The worker's message batcher keeps flushing to `api` as usual; once flushes have been failing transiently for `WORKER_TRANSIENT_TRIP_MS` (default 10m), it stops trying the network and starts spilling run messages to a durable, authenticated on-disk outbox under `<dataDir>/outbox` instead of tripping the run. A per-worker drainer replays the backlog, in order, once the api comes back — however long the outage lasted, as long as the retained data stays within the quotas below; past them, some message frames are dropped and replay as contiguous per-seq gap markers rather than the original messages. The outbox can't grow without bound: a per-run quota, a worker-total quota, an in-memory buffer cap while spilled, and a retention window on fully-drained runs (`WORKER_OUTBOX_RUN_MAX_BYTES`, `WORKER_OUTBOX_MAX_BYTES`, `WORKER_OUTBOX_SPILL_BUFFER_BYTES`, `WORKER_OUTBOX_RETENTION`) all keep how much disk it ever holds bounded — see [configuration.md](./configuration.md#worker-container-agent) for every knob and its default.
@@ -644,11 +707,13 @@ reason (for a supervisor profile refusal, `profile:<field>`) and does not start.
 guard-enabled worker, including Codex-only workers, and single-uid workers
 whose capability bounding set or NoNewPrivs fails the supervisor profile.
 
-**Not built.** The API does not check whether a worker can run Claude
-guard-bound work before dispatching it; that server-side eligibility gate is a
-maintainer follow-up, tracked as [#3142](https://github.com/vtmocanu/uzi/issues/3142). Until then, enable the guard fleet-wide only after
-checking that workers pass the preflight, and watch for refused startups
-after enabling it.
+**Claim gate and what is not built.** A worker that loses memory authority
+mid-life is gated at claim time, see
+[Lost memory authority](#lost-memory-authority). The API does not otherwise
+check whether a worker can run Claude guard-bound work before dispatching it:
+a worker that fails the launcher preflight still refuses to start. Enable the
+guard fleet-wide only after checking that workers pass the preflight, and watch
+for refused startups after enabling it.
 
 This is proactive mitigation, not OOM prevention: allocation bursts,
 stalled sampling and node pressure can still kill the worker. A separate

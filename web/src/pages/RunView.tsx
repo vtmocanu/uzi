@@ -41,6 +41,7 @@ import {
   formatElapsed,
   healthFlagLabel,
   isStoppedRun,
+  isRejectedRun,
   milestoneBadge,
   mrChipState,
   mrChipSuffix,
@@ -81,6 +82,7 @@ import { RunControls, SteerQueueCard } from "../components/SteerQueueCard";
 import { QuestionPanel, UnreadableQuestion } from "../components/QuestionPanel";
 import { deriveOpenQuestion } from "../lib/runQuestion";
 import { PlanCrossCheck } from "../components/PlanCrossCheck";
+import { CheckerActivitySummary } from "../components/CheckerActivitySummary";
 import { CodeCrossCheck } from "../components/CodeCrossCheck";
 import { Markdown } from "../components/Markdown";
 import { JobResultPanel } from "./runView/JobResultPanel";
@@ -90,6 +92,8 @@ import { summaryCollapse } from "../lib/prefs";
 import { ExternalLinkIcon } from "../components/icons";
 import { gateMismatchMessage, PlanPanel, SeededPlanPanel, type GateMismatch } from "./runView/PlanPanel";
 import { FullPlanPanel } from "./runView/FullPlanPanel";
+import { CompletionPending } from "./runView/CompletionPending";
+import { SemanticDrift } from "./runView/SemanticDrift";
 import { JudgePanel } from "./runView/JudgePanel";
 import { CompletionDecisionPanel } from "./runView/CompletionDecisionPanel";
 import { DeliveredCard, hasDeliveredSection } from "./runView/DeliveredCard";
@@ -393,9 +397,9 @@ export function CompletionStatePanel({ run }: { run: Run }) {
   if (run.status === "paused" && run.hold_reason === "provider_unavailable") return null;
   const phase = run.completion_phase ?? "";
   // PRD #1732: a credential_disabled hold is not a completion state; its own panel covers it.
-  // Issue #3181: neither are the token-switch holds; CredentialSwitchHoldPanel covers them.
+  // Issue #3181/#3194: token-switch and base-attestation holds have their own panels.
   const held = run.hold_reason != null && run.hold_reason !== "credential_disabled" && run.hold_reason !== "provider_unavailable" &&
-    credentialSwitchHold(run) === null;
+    run.hold_reason !== "base_attestation_missing" && credentialSwitchHold(run) === null;
   if (phase === "" && !held) return null;
   const unmet = run.completion_unmet ?? [];
   const attempts = run.completion_attempts ?? 0;
@@ -852,7 +856,8 @@ export function PausedPanel({
     run.hold_reason === "credential_disabled" ||
     run.hold_reason === "provider_unavailable" ||
     // Issue #3181: the token-switch holds have their own panel and Resume gating.
-    credentialSwitchHold(run) !== null
+    credentialSwitchHold(run) !== null ||
+    run.hold_reason === "base_attestation_missing"
   )
     return null;
 
@@ -1453,6 +1458,25 @@ function ProviderHoldPanel({ run, ownerProof, busy, onResume, onStop, onCancel }
       <Button size="sm" disabled={busy || unavailable !== null} onClick={onStop}>Stop completed work</Button>
       <Button size="sm" variant="danger" disabled={busy} onClick={onCancel}>Cancel</Button>
     </div> : <p className="mt-2 text-xs text-muted">Only the confirmed run owner can Resume, Stop or Cancel.</p>}
+  </Card>;
+}
+
+// Issue #3194: a --require-base run adopted its own retained work but no checkpoint attests that
+// this content was produced on the planned base, so the worker did not start the agent. The work
+// stays in custody. Nothing automatic leaves the hold and the server refuses Resume and extend,
+// so the panel offers no such action: the owner recovers via the CLI or starts a successor.
+function BaseAttestationHoldPanel({ run, ownerProof = false, busy = false, onCancel = () => {} }: {
+  run: Run; ownerProof?: boolean; busy?: boolean; onCancel?: () => void;
+}) {
+  if (run.status !== "paused" || run.hold_reason !== "base_attestation_missing") return null;
+  return <Card className="p-4">
+    <h2 className="text-sm font-semibold text-warn">Base unverified: waiting for owner</h2>
+    <p className="mt-1 text-xs text-muted">This run requires its planned base commit, but no checkpoint attests that the retained work was produced on it. The agent was not started. The work and its custody are kept.</p>
+    <p className="mt-1 text-xs text-muted">Nothing resumes this run automatically, and Resume and Extend are not available for this hold.</p>
+    <p className="mt-1 text-xs text-muted">Inspect custody with <code>uzi run recovery {run.id}</code>. Recover the work with <code>uzi run export {run.id} --output &lt;path&gt;</code>, or start a successor run. Discarding held custody stays a separate explicit action.</p>
+    {ownerProof ? <div className="mt-3 flex gap-2">
+      <Button size="sm" variant="danger" disabled={busy} onClick={onCancel}>Cancel</Button>
+    </div> : <p className="mt-2 text-xs text-muted">Only the run owner can cancel this hold.</p>}
   </Card>;
 }
 
@@ -2138,6 +2162,8 @@ export function RunView() {
               ? "credential_switch_settling"
             : run?.status === "paused" && run.hold_reason === "credential_switch_unsettled"
               ? "credential_switch_unsettled"
+            : run?.status === "paused" && run.hold_reason === "base_attestation_missing"
+              ? "base_attestation_missing"
             : run?.status === "paused"
               ? "paused"
             : "";
@@ -2168,6 +2194,8 @@ export function RunView() {
               ? codexHoldCopy(parkKey.slice("codex:".length) || null, "").announce
             : parkKey === "credential_disabled"
               ? "The run is waiting because a credential it needs is disabled. Enable it and the run resumes automatically."
+            : parkKey === "base_attestation_missing"
+              ? "The run is held because its retained work is not attested to the planned base commit. The agent was not started. Recover the work or start a successor run."
             : parkKey === "provider_unavailable"
               ? "Provider unavailable. Automatic retries have stopped; the run waits for its owner."
             : parkKey === "credential_switch_settling"
@@ -2194,6 +2222,7 @@ export function RunView() {
   // the header pill and the terminal banner both go neutral so they agree with
   // the board/RunsList treatment (isStoppedRun).
   const stopped = isStoppedRun(run.status, run.stop_kind);
+  const rejected = isRejectedRun(run.status, run.fail_origin);
   // issue #1418: a `failed` run whose committed work is human-landable (server-derived
   // landing_state === "needs_landing") reads "needs landing" on the header pill instead of
   // "failed" — still danger-toned, distinct label. Stopped precedence wins first (a stopped
@@ -2201,9 +2230,11 @@ export function RunView() {
   // matching the RunsList row derivation so one run reads one word on both surfaces.
   const pillStatus = stopped
     ? "stopped"
-    : run.status === "failed" && run.landing_state === "needs_landing"
-      ? "needs_landing"
-      : effectiveRunStatus(run);
+    : rejected
+      ? "rejected"
+      : run.status === "failed" && run.landing_state === "needs_landing"
+        ? "needs_landing"
+        : effectiveRunStatus(run);
   // MR state (PRD #33): a per-run frozen hint. It appends "merged"/"closed" to the
   // MR affordance and (for closed) drops the ok tone; open is unchanged.
   const mrState = mrChipState(run.mr_state);
@@ -2364,6 +2395,8 @@ export function RunView() {
                 // Issue #3181: the token-switch holds offer Resume in their own panel, which
                 // shows the server's settling refusal inline.
                 credentialSwitchHold(run) === null &&
+                // Issue #3194: Resume is refused by the server for a base-attestation hold.
+                run.hold_reason !== "base_attestation_missing" &&
                 (canSteer ? (
                   <Button
                     size="sm"
@@ -2561,6 +2594,8 @@ export function RunView() {
       />
       {error && <Alert message={error} />}
       {actionErr && <Alert message={actionErr} />}
+      <CompletionPending run={run} />
+      <SemanticDrift run={run} />
       {/* PRD #1795 D5: a refused plan verdict whose refetch shows the run has left the gate.
           The panel that would word it has unmounted, so the page says it instead. */}
       {revisionMismatch && run.status !== "awaiting_approval" && (
@@ -2578,9 +2613,11 @@ export function RunView() {
           busy={busy}
           canSteer={canSteer}
           revisionMismatch={revisionMismatch}
-          onApprove={(selection, overrideCapabilities, expectedGateRevision) =>
+          onApprove={(selection, overrideCapabilities, expectedGateRevision, semanticApproval) =>
             void gateAct(expectedGateRevision, () =>
-              submit("approve_plan", "", selection, overrideCapabilities, undefined, expectedGateRevision),
+              semanticApproval !== undefined
+                ? submit("approve_plan", "", selection, overrideCapabilities, undefined, expectedGateRevision, undefined, semanticApproval)
+                : submit("approve_plan", "", selection, overrideCapabilities, undefined, expectedGateRevision),
             )
           }
           onResetApprove={(selection, overrideCapabilities, expectedGateRevision, reset) =>
@@ -2726,6 +2763,7 @@ export function RunView() {
         })}
         onCancel={() => cancelRun()}
       />
+      <BaseAttestationHoldPanel run={run} ownerProof={canSteer && run.id === id} busy={busy} onCancel={() => cancelRun()} />
       <PausedPanel
         run={run}
         origin={pauseOrigin(run, messages, pauseOriginReady)}
@@ -2825,13 +2863,13 @@ export function RunView() {
         <div
           className={cx(
             "rounded-xl border p-4",
-            stopped ? "border-edge bg-raised/50" : "border-danger/40 bg-danger/10",
+            stopped || rejected ? "border-edge bg-raised/50" : "border-danger/40 bg-danger/10",
           )}
         >
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
-              <p className={cx("text-sm font-semibold", stopped ? "text-fg" : "text-danger")}>
-                Run {stopped ? "stopped" : "failed"}
+              <p className={cx("text-sm font-semibold", stopped || rejected ? "text-fg" : "text-danger")}>
+                Run {stopped ? "stopped" : rejected ? "rejected" : "failed"}
               </p>
               <RunFailureReason run={run} stopped={stopped} />
               <RunStopReason run={run} />
@@ -2966,6 +3004,7 @@ export function RunView() {
       {terminal && <JudgePanel run={run} />}
 
       {run.status !== "awaiting_approval" && <PlanCrossCheck run={run} />}
+      {run.kind === "cross_check" && <CheckerActivitySummary run={run} messages={messages} />}
       {confirmedOwner === true && <CodeCrossCheck run={run} />}
 
       {/* PRD #209 M5: a SEEDED run's plan. It never enters awaiting_approval, so the
@@ -3132,7 +3171,7 @@ export function RunView() {
 export function RunFailureReason({ run, stopped }: { run: Run; stopped?: boolean }) {
   if (!run.failure_reason) return null;
   return (
-    <p className={cx("mt-0.5 text-xs", stopped ? "text-muted" : "text-danger/80")}>
+    <p className={cx("mt-0.5 text-xs", stopped || isRejectedRun(run.status, run.fail_origin) ? "text-muted" : "text-danger/80")}>
       {stripUnsafeChars(run.failure_reason)}
     </p>
   );

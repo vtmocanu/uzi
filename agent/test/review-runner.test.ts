@@ -14,6 +14,9 @@ import type { GitCache } from "../src/git.js";
 import { RequestError, type WorkerClient } from "../src/client.js";
 import type { ClaimResponse, StateAck, StateRequest, TaskReviewRequest } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
+import { testOwnedPassHomeRoot } from "./teardown-fixtures.js";
+
+const PASS_HOME_ROOT = testOwnedPassHomeRoot();
 
 // A fake worker client recording the posted task-review + every state report.
 function fakeClient() {
@@ -198,7 +201,7 @@ describe("ReviewRunner", () => {
       client.postMessages = async () => { throw new RequestError("POST", "/api/worker/runs/review-1/messages",
         failure === "stale" ? 409 : 503, failure === "stale" ? '{"disposition":"stale_claim"}' : "unavailable"); };
       const warns: string[] = [];
-      const runner = new ReviewRunner(client, git, { ...nullLogger(), warn: (message: string) => { warns.push(message); } }, {
+      const runner = new ReviewRunner(client, git, { ...nullLogger(), warn: (message: string) => { warns.push(message); } }, { homeRoot: PASS_HOME_ROOT,
         codexAdviceHarnessFactory: (async () => ({ kind: "codex", run: async (req: AdviceRequest) => {
           req.usageObserver?.({ [CODEX_TASK_REVIEW_MODEL]: { inputTokens: 100, outputTokens: 10,
             cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: 0.0003, costStatus: "metered" } });
@@ -252,7 +255,7 @@ describe("ReviewRunner", () => {
             is_error: scenario === "error", ...(scenario !== "no_usage" ? { modelUsage: snapshot } : {}) };
         }) as unknown as SdkQueryFn;
         const warns: string[] = [];
-        const runner = new ReviewRunner(client, git, { ...nullLogger(), warn: (message: string) => { warns.push(message); } }, {
+        const runner = new ReviewRunner(client, git, { ...nullLogger(), warn: (message: string) => { warns.push(message); } }, { homeRoot: PASS_HOME_ROOT,
           queryFn,
           codexAdviceHarnessFactory: (async () => ({ kind: "codex", run: async (req: AdviceRequest) => {
             if (scenario !== "no_usage") {
@@ -286,7 +289,7 @@ describe("ReviewRunner", () => {
   it("clones the reviewed branch, diffs it against base, and posts parsed findings with status complete", async () => {
     const { client, calls } = fakeClient();
     const { git, calls: gitCalls } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
-    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: replyingQueryFn(goodModelJson) });
+    const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: replyingQueryFn(goodModelJson) });
     await runner.execute(reviewClaim());
 
     // (a) the bare was ensured and the diff was taken against base_branch — NO working-tree
@@ -324,7 +327,7 @@ describe("ReviewRunner", () => {
   it("stamps the claim generation on the running and completed reports (PRD #1247 M2)", async () => {
     const { client, calls } = fakeClient();
     const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
-    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: replyingQueryFn(goodModelJson) });
+    const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: replyingQueryFn(goodModelJson) });
     await runner.execute(reviewClaim({ claim_generation: 9 }));
 
     const mutating = calls.states.filter((s) => s.body.status === "running" || s.body.status === "completed");
@@ -344,7 +347,7 @@ describe("ReviewRunner", () => {
   it("stamps the claim generation on the failed report (PRD #1247 M2)", async () => {
     const { client, calls } = fakeClient();
     const { git } = fakeGit("diff\n");
-    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: forbiddenQueryFn() });
+    const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: forbiddenQueryFn() });
     await runner.execute(reviewClaim({ review_target_run_id: null, claim_generation: 4 }));
     assert.equal(calls.states.at(-1)?.body.status, "failed");
     assert.equal(calls.states.at(-1)?.body.claim_generation, 4, "the failed report carries the claim generation");
@@ -355,7 +358,7 @@ describe("ReviewRunner", () => {
   it("a capability worker's review run is ACCEPTED (not 409) by a generation-fencing api (PRD #1247 M2)", async () => {
     const { client, calls } = fencedFakeClient();
     const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
-    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: replyingQueryFn(goodModelJson) });
+    const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: replyingQueryFn(goodModelJson) });
     await runner.execute(reviewClaim({ claim_generation: 7 }));
 
     assert.deepEqual(calls.refused, [], "the fence refuses no mutating report — all carry the generation");
@@ -376,7 +379,7 @@ describe("ReviewRunner", () => {
   it("abandons a stale-claimed review run at the running report with zero clone/diff/advice work (PRD #1247 fix round)", async () => {
     const { client, calls } = staleRunningFakeClient(1);
     const { git, calls: gitCalls } = fakeGit("diff --git a/x b/x\n+one\n");
-    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: forbiddenQueryFn() });
+    const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: forbiddenQueryFn() });
     await runner.execute(reviewClaim({ claim_generation: 5 }));
 
     assert.deepEqual(
@@ -397,7 +400,7 @@ describe("ReviewRunner", () => {
   it("abandons a stale-claimed review run at the pre-post probe with zero advice/completed posts (PRD #1247 fix round)", async () => {
     const { client, calls } = staleRunningFakeClient(2);
     const { git, calls: gitCalls } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
-    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: replyingQueryFn(goodModelJson) });
+    const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: replyingQueryFn(goodModelJson) });
     await runner.execute(reviewClaim({ claim_generation: 5 }));
 
     assert.deepEqual(
@@ -433,7 +436,7 @@ describe("ReviewRunner", () => {
       },
     } as unknown as WorkerClient;
     const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
-    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: replyingQueryFn(goodModelJson) });
+    const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: replyingQueryFn(goodModelJson) });
     await runner.execute(reviewClaim({ claim_generation: 5 }));
 
     assert.equal(calls.review, undefined, "a probe throw posts NO review (fail-closed: ownership unknown)");
@@ -453,7 +456,7 @@ describe("ReviewRunner", () => {
       },
     } as unknown as WorkerClient;
     const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
-    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: replyingQueryFn(goodModelJson) });
+    const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: replyingQueryFn(goodModelJson) });
     const claim = reviewClaim({ claim_generation: 6 });
     await runner.execute(claim);
     assert.equal(gotGeneration, 6, "postTaskReview receives the claim's generation");
@@ -476,7 +479,7 @@ describe("ReviewRunner", () => {
       },
     } as unknown as WorkerClient;
     const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
-    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: replyingQueryFn(goodModelJson) });
+    const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: replyingQueryFn(goodModelJson) });
     await runner.execute(reviewClaim({ claim_generation: 5 }));
     assert.equal(posts, 1, "the task-review post was attempted once");
     assert.deepEqual(states, ["running", "running"], "no completed/failed report after a stale_claim refusal");
@@ -500,7 +503,7 @@ describe("ReviewRunner", () => {
       },
     } as unknown as WorkerClient;
     const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
-    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: replyingQueryFn(goodModelJson) });
+    const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: replyingQueryFn(goodModelJson) });
     await runner.execute(reviewClaim({ claim_generation: 5 }));
     assert.ok(states.includes("failed"), "a non-stale refusal fails the run");
     assert.ok(!states.includes("completed"));
@@ -509,7 +512,7 @@ describe("ReviewRunner", () => {
   it("posts zero findings WITHOUT calling the model on an empty diff", async () => {
     const { client, calls } = fakeClient();
     const { git, calls: gitCalls } = fakeGit("   \n  "); // whitespace-only ⇒ nothing to review
-    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: forbiddenQueryFn() });
+    const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: forbiddenQueryFn() });
     await runner.execute(reviewClaim());
 
     assert.equal(calls.review?.review.status, "complete");
@@ -523,7 +526,7 @@ describe("ReviewRunner", () => {
     const { client, calls } = fakeClient();
     const { git } = fakeGit("diff --git a/x b/x\n+one\n");
     const claim = reviewClaim({ secrets: { forge_pat: "pat" } as never });
-    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: forbiddenQueryFn() });
+    const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: forbiddenQueryFn() });
     await runner.execute(claim);
 
     assert.equal(calls.review?.review.status, "failed");
@@ -552,7 +555,7 @@ describe("ReviewRunner", () => {
       harnessBuilt = params;
       return fakeHarness;
     }) as never;
-    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: forbiddenQueryFn(), codexAdviceHarnessFactory });
+    const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: forbiddenQueryFn(), codexAdviceHarnessFactory });
     const codexSecrets = { auth_mode: "api_key", access_token: "codex-tok", capability: "cap-1" };
     await runner.execute(reviewClaim({ secrets: { forge_pat: "pat", codex: codexSecrets } as never }));
 
@@ -580,7 +583,7 @@ describe("ReviewRunner", () => {
       },
     };
     const codexAdviceHarnessFactory = (async () => fakeHarness) as never;
-    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: forbiddenQueryFn(), codexAdviceHarnessFactory });
+    const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: forbiddenQueryFn(), codexAdviceHarnessFactory });
     const codexSecrets = { auth_mode: "api_key", access_token: "codex-tok", capability: "cap-1" };
     // A custom default_model on the claim must NOT reach the reviewer — review is independent.
     await runner.execute(
@@ -604,7 +607,7 @@ describe("ReviewRunner", () => {
       factoryCalled = true;
       throw new Error("must not be called for a Claude claim");
     }) as never;
-    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: replyingQueryFn(goodModelJson), codexAdviceHarnessFactory });
+    const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: replyingQueryFn(goodModelJson), codexAdviceHarnessFactory });
     await runner.execute(reviewClaim()); // default secrets: anthropic_oauth_token set, no codex block
 
     assert.equal(factoryCalled, false, "a Claude claim must never build a Codex advice harness");
@@ -614,7 +617,7 @@ describe("ReviewRunner", () => {
   it("falls back to status failed and still completes on a malformed model response", async () => {
     const { client, calls } = fakeClient();
     const { git } = fakeGit("diff --git a/x b/x\n+one\n");
-    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: replyingQueryFn("not json at all") });
+    const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: replyingQueryFn("not json at all") });
     await runner.execute(reviewClaim());
 
     assert.equal(calls.review?.review.status, "failed");
@@ -625,7 +628,7 @@ describe("ReviewRunner", () => {
   it("falls back to status failed on a terminal model error result", async () => {
     const { client, calls } = fakeClient();
     const { git } = fakeGit("diff --git a/x b/x\n+one\n");
-    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: replyingQueryFn("", true) });
+    const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: replyingQueryFn("", true) });
     await runner.execute(reviewClaim());
 
     assert.equal(calls.review?.review.status, "failed");
@@ -635,7 +638,7 @@ describe("ReviewRunner", () => {
   it("fails the review run (no post) when the claim carries no target", async () => {
     const { client, calls } = fakeClient();
     const { git } = fakeGit("diff\n");
-    const runner = new ReviewRunner(client, git, nullLogger(), { queryFn: forbiddenQueryFn() });
+    const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn: forbiddenQueryFn() });
     await runner.execute(reviewClaim({ review_target_run_id: null }));
 
     assert.equal(calls.review, undefined, "no review is posted without a target");
@@ -746,7 +749,7 @@ describe("ReviewRunner terminal journaling (PRD #1391 Run B M3b, D6)", () => {
     const outbox = await mkReviewOutbox();
     const { client, calls } = journalingClient(/*failTerminal*/ true);
     const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
-    const runner = new ReviewRunner(client, git, nullLogger(), {
+    const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT,
       queryFn: replyingQueryFn(goodModelJson),
       outbox,
       outboxTerminalMaxBytes: 1 << 20,
@@ -764,7 +767,7 @@ describe("ReviewRunner terminal journaling (PRD #1391 Run B M3b, D6)", () => {
     const outbox = await mkReviewOutbox();
     const { client } = journalingClient(/*failTerminal*/ false);
     const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
-    const runner = new ReviewRunner(client, git, nullLogger(), {
+    const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT,
       queryFn: replyingQueryFn(goodModelJson),
       outbox,
       outboxTerminalMaxBytes: 1 << 20,

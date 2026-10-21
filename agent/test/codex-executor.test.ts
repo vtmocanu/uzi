@@ -20,6 +20,9 @@ import { fakeGitHub, fakeGitlab } from "./runner-harness.js";
 import { realProcfsSkip } from "./real-procfs.js";
 
 const HAS_PROCFS = process.platform === "linux";
+// The real runner path opens the Codex session store and quiescence proofs through /proc/self/fd
+// (src/codex/session-state.ts, src/runner.ts), which macOS lacks (#1912). Linux runs every assertion.
+const NEEDS_PROCFS = !HAS_PROCFS ? "needs Linux procfs (/proc/self/fd in src/codex/session-state.ts; runner quiescence proofs refuse off Linux)" : false;
 
 import {
   CodexExecutor,
@@ -1889,7 +1892,7 @@ describe("#2493 initial credential release", () => {
   });
   }
 
-  it("real runner reclaims release-unavailable park, captures work and completes in a fresh thread", async () => {
+  it("real runner reclaims release-unavailable park, captures work and completes in a fresh thread", { skip: NEEDS_PROCFS }, async () => {
     const api = new FakeApi("resume-release-worker");
     const url = await api.listen();
     const fx = makeFixture();
@@ -2093,7 +2096,7 @@ describe("#2493 initial credential release", () => {
 
 describe("decoded Codex usage limits reach RunRunner #2360", () => {
   for (const scenario of ["window", "docker", "optout", "nonwindow", "publish-failed"] as const) {
-    it(scenario, async () => {
+    it(scenario, { skip: NEEDS_PROCFS }, async () => {
       const diagnostics = recordingLog();
       const api = new FakeApi("usage-worker");
       const url = await api.listen();
@@ -20139,6 +20142,41 @@ it("#3101 actual CodexExecutor completed installer preserves C through shutdown 
     runner.shutdown();
     try { await withTimeout(execution, 20_000, "actual executor cleanup"); }
     finally { proof.cleanup(); await api.close(); fx.cleanup(); }
+  }
+});
+
+it("M2 Codex executor forwards semantic proposals through initial and revised gates, clearing omission", async () => {
+  const { enrollment, proposal } = await import("./semantic-coverage-fixture.js");
+  for (const semanticPlanning of [enrollment, undefined]) {
+    const submissions = [proposal(), { criteria: [] }, undefined];
+    const responder: Responder = c => {
+      if (c.method === "thread/start") return { thread: { id: "m2-plan" } };
+      if (c.method === "turn/start") {
+        const n = c.turnStartCount - 1;
+        assert.ok(n < 3, "bounded planning turns");
+        const tn = "turn-" + n;
+        if (n === 0) c.transport.push(threadStarted("m2-plan"));
+        const semantic_proposal = submissions[n];
+        c.transport.push(toolCall(c.turnStartCount, "submit_plan", { plan_md: "candidate " + n,
+          ...(semantic_proposal === undefined ? {} : { semantic_proposal }) }, "m2-plan", tn, "call-" + n))
+          .push(turnCompleted("completed", "m2-plan", tn));
+        return { turn: { id: tn } };
+      }
+      return {};
+    };
+    const rig = makeMultiEpochRig([responder, epochResponder("m2-impl", "impl", (t, th, tn) =>
+      t.push(toolCall(99, "signal_done", {}, th, tn, "done")).push(turnCompleted("completed", th, tn)))]);
+    const captured: unknown[] = [];
+    const { ctx } = makeCtx({ semanticPlanning, planApproved: false, approvedPlan: undefined,
+      gatePlan: async (_plan, _milestones, _hook, settles, semantic) => {
+        assert.equal(settles, undefined);
+        captured.push(semantic);
+        return captured.length < 3 ? { kind: "revise", automatic: true, round: captured.length, feedback: "revise" }
+          : { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never;
+      },
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 8000, "M2 semantic proposals");
+    assert.deepEqual(captured, semanticPlanning ? [proposal(), { invalid: true }, undefined] : [undefined, undefined, undefined]);
   }
 });
 

@@ -94,12 +94,14 @@ func effectiveRunStatus(status string, isPlanning, isRevising bool) string {
 // enum on the wire.
 const landingStateNeedsLanding = "needs_landing"
 
-// displayRunStatus resolves human-stop labels before planning/revising and landing.
-// After human stops are resolved, a failure with needs_landing reads "needs landing";
-// remaining statuses retain effectiveRunStatus's word. The raw status stays intact.
-func displayRunStatus(status string, isPlanning, isRevising bool, landingState, stopKind string) string {
+// displayRunStatus resolves human stops first, then failed base_diverged rejections,
+// then planning/revising and needs_landing. The raw status stays intact.
+func displayRunStatus(status string, isPlanning, isRevising bool, landingState, stopKind, failOrigin string) string {
 	if label := runpresentation.HumanStopLabel(status, stopKind); label != "" {
 		return label
+	}
+	if status == "failed" && failOrigin == "base_diverged" {
+		return "rejected"
 	}
 	s := effectiveRunStatus(status, isPlanning, isRevising)
 	if s == "failed" && landingState == landingStateNeedsLanding {

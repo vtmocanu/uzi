@@ -21,6 +21,7 @@ const (
 	keyHelp             = "?"
 	keyAdmin            = "a"
 	keyHideDone         = "h" // board: hide terminal (completed/failed/cancelled) runs, keeping active + needs-you
+	keyProgressSort     = "p" // board: order ON THE FLOOR highest progress first; again restores the default order
 	keyRefresh          = "r"
 	keyConfirmY         = "y"
 	keyConfirmN         = "n"
@@ -151,6 +152,7 @@ func helpLines(v tuiView) []string {
 		return append([]string{
 			"a          toggle the factory-wide admin board (needs a uza_ token)",
 			"h          hide finished runs; keep active and needs-you",
+			"p          floor: highest progress first; again restores the default order",
 			"cost       API-equivalent estimate",
 			"+ after 7d cost means the estimate is incomplete",
 			"           runs without estimates: tokens only",

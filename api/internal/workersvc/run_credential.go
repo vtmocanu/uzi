@@ -118,6 +118,10 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 		return SetRunCredentialResult{}, err
 	}
 
+	// issue #3194: a base-attestation hold never runs again, so no token switch can resume it.
+	if IsBaseAttestationHeld(run) {
+		return SetRunCredentialResult{}, ErrBaseAttestationHeld
+	}
 	switch run.Status {
 	case "paused":
 		if run.HoldReason.Valid && run.HoldReason.String == "credential_disabled" {

@@ -33,7 +33,9 @@ const TABLE = validatedTable.models;
  * The pinned price-table version. Recorded WITH the table (D5): the rates below were verified
  * against the official OpenAI API pricing table and model pages on 2026-09-13; the `gpt-6-sol` row was
  * added from its official model page on 2026-09-23. The GPT-6.1 Sol row was added
- * from https://developers.openai.com/api/docs/models/gpt-6.1-sol on 2026-10-01. A re-verification
+ * from https://developers.openai.com/api/docs/models/gpt-6.1-sol on 2026-10-01. The GPT-6 Astra and
+ * GPT-5.6 Sol rows were re-verified, unchanged, on 2026-10-21; each row's `verified_at` is the
+ * authority for its own date. A re-verification
  * that changes any rate MUST bump this id and, for a promotional row, its review boundary.
  */
 export const CODEX_PRICE_TABLE_VERSION = validatedTable.version;

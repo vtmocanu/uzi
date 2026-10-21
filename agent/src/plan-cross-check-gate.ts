@@ -1,4 +1,5 @@
 import { setTimeout as delay } from "node:timers/promises";
+import { isDeepStrictEqual } from "node:util";
 import {
   RequestError, type WorkerClient, type PlanCrossCheckCandidate, type PlanCrossCheckResponse,
   type PlanCrossCheckStateRequest, type PlanCrossCheckGateReason,
@@ -73,6 +74,9 @@ export async function checkPlan(options: CheckPlanOptions): Promise<CheckedPlanD
         !Number.isSafeInteger(response.candidate_generation) || generation <= 0 ||
         !/^[a-f0-9]{64}$/.test(response.candidate_digest) ||
         response.candidate.base_commit !== candidate.base_commit ||
+        (response.candidate.candidate_identity_version !== candidate.candidate_identity_version ||
+         response.candidate_digest !== (candidate.semantic_candidate?.digest ?? response.candidate_digest) ||
+         !isDeepStrictEqual(response.candidate.semantic_candidate, candidate.semantic_candidate)) ||
         !Number.isFinite(deadline) || deadline > Date.now() + 2 * 60 * 60 * 1000 ||
         (identity && (response.candidate_digest !== identity.candidate_digest ||
           response.checker_run_id !== identity.checker_run_id ||

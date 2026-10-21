@@ -2,6 +2,9 @@
 # Hermetic fetch/reuse/scan contract: fake Go metadata and scanners, no network.
 # Each case owns a throwaway git repo and excludes host-installed tools from PATH.
 set -eu
+# Fixture repos must not read host git config: a global core.fsmonitor=true
+# leaves a detached fsmonitor daemon per repo on macOS.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 
 ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 GATE="$ROOT/scripts/scan-secrets.sh"
