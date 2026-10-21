@@ -205,6 +205,7 @@ function getTimer(budget: MaintenanceBudget) { return budget["timer"]; }
 it("held own budget expires inside real selective preparation and joins disposal without a producer", async t => {
   let now = 0, finish!: () => void, entered!: () => void, returned = false, packs = 0;
   t.mock.method(performance, "now", () => now);
+  t.mock.method(Date, "now", () => now);
   const release = new Promise<void>(resolve => { finish = resolve; });
   const started = new Promise<void>(resolve => { entered = resolve; });
   const git = new GitCache("/unused", nullLogger());
