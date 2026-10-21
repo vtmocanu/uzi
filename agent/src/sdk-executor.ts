@@ -3911,7 +3911,6 @@ export class SdkExecutor implements Executor {
                 state.wallRemainingMs += wallSeconds * 1000 - maxServedWallMs;
                 maxServedWallMs = wallSeconds * 1000;
               }
-              if (history.wallSpent(fresh) && await stopAtWall()) return true;
               const at = { completedCount: fresh?.completedCount ?? latestProgress?.completed.length ?? 0, total: frozenMilestones?.length };
               // Preserve Claude's pause-before-budget precedence.
               if (fresh?.pauseRequested || ctx.pauseModeRequested?.() === "now" || ctx.pauseModeRequested?.() === "wall") {
@@ -3928,7 +3927,7 @@ export class SdkExecutor implements Executor {
               }
               const bound = fresh?.budgetExhausted ? REASON_COMPLETION_BUDGET_EXHAUSTED
                 : iteration >= maxIterations ? REASON_MAX_ITERATIONS
-                : state.wallRemainingMs <= 0 ? REASON_WALL : undefined;
+                : history.wallSpent(fresh) || state.wallRemainingMs <= 0 ? REASON_WALL : undefined;
               if (bound) {
                 if ((bound === REASON_WALL || bound === REASON_COMPLETION_BUDGET_EXHAUSTED) && await stopAtWall(bound)) return true;
                 if (await this.routeSummaryHold(ctx, bound, true)) {

@@ -2866,6 +2866,8 @@ export class CodexExecutor implements Executor {
       const idleMs = this.deps.idleMs ?? (ctx.config?.idle_timeout_seconds ? ctx.config.idle_timeout_seconds * 1000 : DEFAULT_IDLE_MS);
       const wallMs = this.deps.wallMs ?? (ctx.config?.run_timeout_seconds ? ctx.config.run_timeout_seconds * 1000 : DEFAULT_WALL_MS);
       const wall: RunWall = { remainingMs: wallMs, maxServedMs: wallMs, claimMs: wallMs };
+      let completionAttempted = false;
+      const completion = { history: new CompletionHistory(), attempted: () => completionAttempted };
 
       // Plan → approval gate, exactly like SdkExecutor (fail-closed): a pre-approved resume
       // skips the planning turn and the gate.
@@ -2954,7 +2956,7 @@ export class CodexExecutor implements Executor {
           let turn: Awaited<ReturnType<CodexExecutor["driveTurnWithWallPark"]>>;
           try {
             if (humanRevision) await ctx.beforePlanRevisionTurn?.();
-            turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, shared.selection.current, { completedCount: 0 }, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap);
+            turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, shared.selection.current, { completedCount: 0 }, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completion);
           } catch (error) {
             if (!humanRevision || !(error instanceof TransientRecoveryError) || !error.providerOrigin || !ctx.retryPlanRevisionTurn) throw error;
             // The runner hook owns backoff and control checks. Redrive without a new cap,
@@ -3014,7 +3016,8 @@ export class CodexExecutor implements Executor {
         // epoch's plan-phase broker (the implement epoch, below, re-points to implement).
         // PRD #1497 M2: drive the plan turn through the wall-park wrapper — a wall trip (the own
         // timer's REASON_WALL, or a `wall` PauseNowSignal) parks the run instead of failing it, even
-        // during planning (the completion interlock cannot have attempted completion yet).
+        // during planning. The current flight has not attempted completion yet, but a refusal
+        // can report prior server completion attempts and must then route to the completion hold.
         const planTurn = await drivePlan(this.planPrompt(ctx, environmentFacts));
         if (planTurn.kind === "walled") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
         if (planTurn.kind === "held") return { branch: ctx.branch, completionHeld: { reason: planTurn.reason } };
@@ -3163,8 +3166,6 @@ export class CodexExecutor implements Executor {
       let maxIterations = positiveOr(ctx.config?.max_iterations, DEFAULT_MAX_ITERATIONS);
       let latestProgress: ReducedTurnResult["progress"];
       let iteration = 0;
-      let completionAttempted = false;
-      const completion = { history: new CompletionHistory(), attempted: () => completionAttempted };
       let completionHeld: { reason: string } | undefined;
       let walledAtRequest = false;
       const stopAtWall = async (reason = REASON_WALL): Promise<boolean> => {

@@ -10733,13 +10733,14 @@ describe("CodexExecutor: run-wide wall and served lift (issue #1600)", () => {
     assert.equal(calls, 4, "one reportIteration per implement turn");
   });
 
-  it("(implement) a refused park after the budget is spent re-arms from the 409's budget, with no immediate re-trip", async () => {
+  it("3282 (implement) a refused park after the budget is spent re-arms from the 409's budget, with no immediate re-trip", async () => {
     const rig = makeRig({ responder: timedTurns({ turnMs: 300, turns: 2, quietFirst: true }) });
     rig.deps = { ...rig.deps, idleMs: 5000, wallMs: 100, redriveAllowanceMs: 10 };
     const { ctx, spies } = lwallCtx({
+      reportIteration: async () => ({ completionAttempts: 0 }),
       takeWallParkRefresh: () => {
         spies.refreshCalls++;
-        return spies.refreshCalls === 1 ? { totalSeconds: 5, usedSeconds: 1 } : undefined;
+        return spies.refreshCalls === 1 ? { completionAttempts: 0, totalSeconds: 5, usedSeconds: 1 } : undefined;
       },
     });
     spies.outcome = "refused";
@@ -20542,4 +20543,26 @@ describe("3282 historical boundary regressions", () => {
     assert.deepEqual(rig.epochs.map(e => e.transport.turnStartCount), [1, 1]);
     assert.deepEqual(rig.epochs[1]!.transport.requests.filter(q => q.method === "thread/resume").map(q => String(rec(q.params).threadId)), ["th-1"]);
   });
+});
+
+
+it("3282 planning wrapper holds on positive refusal history without an implementation latch", async () => {
+  const rig = makeRig();
+  rig.deps = { ...rig.deps, wallMs: 0, launchProviderRoot: async () => {
+    assert.fail("a positive refusal must not release another provider root");
+  } };
+  let parks = 0, holds = 0, takes = 0;
+  const { ctx } = makeCtx({ kind: "issue", completionInterlock: true,
+    planApproved: false, approvedPlan: undefined,
+    gatePlan: async () => { throw new Error("spent planning flight must not reach approval"); },
+    parkForWall: async () => { assert.equal(++parks, 1); return "refused"; },
+    takeWallParkRefresh: () => { takes++; return { completionAttempts: 1, totalSeconds: 60, usedSeconds: 60 }; },
+    enterCompletionHold: async (_reason, options) => { holds++; assert.equal(options?.allowDegradedCapture, true); return true; },
+  });
+  const outcome = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 2000, "planning historical refusal")
+    .then(result => ({ result, error: undefined }), error => ({ result: undefined, error }));
+  assert.equal(holds, 1, "the server-confirmed count must hold regardless of caller phase");
+  assert.equal(outcome.error, undefined);
+  assert.ok(outcome.result?.completionHeld);
+  assert.equal(parks, 1); assert.equal(takes, 1); assert.equal(rig.providerLaunches(), 0);
 });

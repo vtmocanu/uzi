@@ -32,11 +32,11 @@ function submitPlan(plan: string, sessionId = "sess-1"): SDKMessage {
     message: { content: [{ type: "tool_use", id: "t1", name: "mcp__uzi__submit_plan", input: { plan_md: plan } }] },
   } as unknown as SDKMessage;
 }
-function signalDone(sessionId = "sess-1"): SDKMessage {
+function signalDone(sessionId = "sess-1", input: Record<string, unknown> = {}): SDKMessage {
   return {
     type: "assistant",
     session_id: sessionId,
-    message: { content: [{ type: "tool_use", id: "t2", name: "mcp__uzi__signal_done", input: {} }] },
+    message: { content: [{ type: "tool_use", id: "t2", name: "mcp__uzi__signal_done", input }] },
   } as unknown as SDKMessage;
 }
 function resultSuccess(sessionId = "sess-1"): SDKMessage {
@@ -336,7 +336,7 @@ describe("SdkExecutor wall park (PRD #1497 M2)", () => {
     assert.strictEqual(spies.clearWallModeCalls, 0, "a PARKED outcome does not clear the wall mode (only a refusal does)");
   });
 
-  it("a REFUSED wall park (turn catch) clears the sticky wall mode and restarts the turn (extension after the input aborted the turn)", async () => {
+  it("3282 a REFUSED wall park (turn catch) clears the sticky wall mode and restarts the turn (extension after the input aborted the turn)", async () => {
     // Turn 2 is aborted by a `wall` PauseNowSignal; parkForWall returns "refused" (the owner extended
     // in the window). The executor clears the sticky wall mode and restarts — turn 3 signals done.
     const runSignal = new AbortController();
@@ -352,7 +352,10 @@ describe("SdkExecutor wall park (PRD #1497 M2)", () => {
       }),
       [signalDone(), resultSuccess()],
     ]);
-    const { ctx, spies } = makeCtx({ signal: runSignal.signal });
+    const { ctx, spies } = makeCtx({ signal: runSignal.signal,
+      reportIteration: async () => ({ completionAttempts: 0 }),
+      takeWallParkRefresh: () => ({ completionAttempts: 0 }),
+    });
     spies.parkForWallOutcome = "refused";
     spiesRef.s = spies;
     const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
@@ -362,7 +365,7 @@ describe("SdkExecutor wall park (PRD #1497 M2)", () => {
     assert.strictEqual(result.branch, "agent/issue-5", "the restarted turn finished the run");
   });
 
-  it("a REFUSED wall park (loop-top boundary) clears the sticky wall mode and continues (extension before the input arrived)", async () => {
+  it("3282 a REFUSED wall park (loop-top boundary) clears the sticky wall mode and continues (extension before the input arrived)", async () => {
     // The loop starts with a seeded `wall` mode (pauseModeRequested → 'wall'), so the loop-top wall
     // branch fires before the first implement turn. parkForWall returns "refused" (the owner already
     // extended), so the executor clears the wall mode and falls through to run the turn (signal_done).
@@ -370,7 +373,10 @@ describe("SdkExecutor wall park (PRD #1497 M2)", () => {
       [submitPlan("plan"), resultSuccess()],
       [signalDone(), resultSuccess()],
     ]);
-    const { ctx, spies } = makeCtx();
+    const { ctx, spies } = makeCtx({
+      reportIteration: async () => ({ completionAttempts: 0 }),
+      takeWallParkRefresh: () => ({ completionAttempts: 0 }),
+    });
     spies.mode.value = "wall"; // seeded on a re-claim; seedPauseFallback fires the loop-top branch
     spies.parkForWallOutcome = "refused";
     const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
@@ -537,5 +543,51 @@ describe("3282 Claude historical interruption regressions", () => {
     const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
     assert.ok(result.pausedAt); assert.equal(pauses, 1); assert.equal(dispatches, 0);
     assert.deepEqual(spies.enterCompletionHoldCalls, []); assert.equal(spies.parkForWallCalls, 0);
+  });
+});
+
+
+describe("3282 Claude lead-request refresh precedence", () => {
+  for (const boundary of ["owner now", "final iteration"] as const) it(`3282 lead-request spent refresh preserves ${boundary} precedence`, async () => {
+    let reports = 0, dispatches = 0, attempts = 0, pauses = 0, holds = 0;
+    const reportIterations: number[] = [];
+    const { ctx, spies } = makeCtx({
+      kind: "issue", interactive: false,
+      planApproved: true, approvedPlan: "approved", sessionId: "sess-1",
+      completionInterlock: true,
+      config: { max_iterations: boundary === "final iteration" ? 1 : 3 },
+      reportIteration: async iteration => {
+        reportIterations.push(iteration);
+        reports++;
+        assert.ok(reports <= 2, "only the loop ACK and lead-request refresh are allowed");
+        return { completionAttempts: reports === 1 ? 0 : 1, totalWallSeconds: 60,
+          usedWallSeconds: reports === 1 ? 0 : 60,
+          pauseRequested: reports === 2 && boundary === "owner now" };
+      },
+      pauseModeRequested: () => reports >= 2 && boundary === "owner now" ? "now" : null,
+      recordCompletionAttempt: async () => { attempts++; return { unmet: ["m2"], attemptCount: 1 }; },
+      parkForPause: async () => { pauses++; return true; },
+      enterCompletionHold: async (reason, options) => {
+        holds++;
+        assert.equal(boundary, "final iteration");
+        assert.equal(reason, "run reached its milestone-scaled implement/review iteration budget without completing");
+        assert.equal(options?.allowDegradedCapture, undefined);
+        return true;
+      },
+    });
+    const queryFn: SdkQueryFn = params => (async function* () {
+      assert.equal(++dispatches, 1, "the refresh must stop before another provider turn");
+      for await (const _ of params.prompt) { /* drain */ }
+      yield signalDone("sess-1", { owner_decision_requested: { reason: "Need owner input" } });
+      yield resultSuccess();
+    })();
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.equal(reports, 2); assert.deepEqual(reportIterations, [1, 1], "the second ACK must be the lead-request refresh, not a new loop iteration");
+    assert.equal(dispatches, 1); assert.equal(attempts, 1);
+    assert.equal(pauses, boundary === "owner now" ? 1 : 0);
+    assert.equal(holds, boundary === "final iteration" ? 1 : 0);
+    assert.equal(Boolean(result.pausedAt), boundary === "owner now");
+    assert.equal(Boolean(result.completionHeld), boundary === "final iteration");
+    assert.equal(result.walled, undefined); assert.equal(spies.parkForWallCalls, 0);
   });
 });

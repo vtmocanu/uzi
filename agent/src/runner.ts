@@ -6993,7 +6993,8 @@ export class RunRunner {
       // the completion hold above, the run is non-terminal and the wall seam already handled it (a
       // `paused` report on "parked", NOTHING on "undeliverable"), so there is nothing to finalize (no
       // push, no MR, no terminal report). Reap + close the batcher and return; the finally preserves
-      // clone + HOME (enterWallPark set the flags) for a resume. Issue #1784: a Codex run whose park
+      // clone + HOME when capture/delivery requires retention; a proven hold refusal permits
+      // normal cleanup instead. Issue #1784: a Codex run whose park
       // the server confirmed (`paused`) reaches here via the finalize-boundary bypass in executeClaim;
       // an undeliverable park still arrives inside the boundary. Keyed on the executor's result so no
       // non-wall path can reach this branch.
