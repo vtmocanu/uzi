@@ -3185,8 +3185,9 @@ export class CodexExecutor implements Executor {
       let completionFollowUp: string | undefined;
       let completionAnswered = false;
       // Issue #3139: the worker-initiated no-progress stall detector. It never reads the lead's text.
-      // The served attempt and completed counts are refreshed at every loop-top boundary, so an
-      // absent value stays undefined (ineligible).
+      // The served attempt and completed counts are refreshed at every loop-top boundary. An absent
+      // attempt count means ineligible; an absent completed count falls back to the milestones
+      // this flight has seen.
       const noProgress = new NoProgressStallTracker();
       let lastServedCompletionAttempts: number | undefined;
       let lastServedCompletedCount: number | undefined;

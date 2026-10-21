@@ -2967,7 +2967,8 @@ export class SdkExecutor implements Executor {
       let stallStreak = 0;
       // Issue #3139: the worker-initiated no-progress stall detector, independent of the #281 text
       // streak above. It never reads the lead's text; the served attempt count and completed count
-      // are refreshed at every loop-top boundary (absent means ineligible).
+      // are refreshed at every loop-top boundary. An absent attempt count means ineligible; an
+      // absent completed count falls back to the milestones this flight has seen.
       const noProgress = new NoProgressStallTracker();
       let lastServedCompletionAttempts: number | undefined;
       let lastServedCompletedCount: number | undefined;
@@ -3540,8 +3541,8 @@ export class SdkExecutor implements Executor {
             worktreeFingerprint,
           });
           // Latch AFTER the attempt returns — the post-attempt failure routing (step 6) only
-          // arms once at least one attempt has actually completed. A thrown attempt call leaves
-          // this false, so the run fails legacy-style (no hold), which is correct.
+          // arms once at least one attempt has actually completed. A thrown attempt call ends the
+          // flight before this line, so the latch only gates later routing within this flight.
           completionAttempted = true;
           this.throwIfTerminal(ctx);
           if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
