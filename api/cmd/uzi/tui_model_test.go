@@ -2103,6 +2103,25 @@ func TestTUIBoardFilterNoMatchEmptyState(t *testing.T) {
 	}
 }
 
+// Under [h], a filter whose only matches are folded finished runs must not claim no run
+// matches: it points at the fold instead.
+func TestTUIBoardFilterMatchesOnlyFoldedRuns(t *testing.T) {
+	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
+	next, _ := m.Update(boardRunsMsg{reqID: m.board.waitID, runs: []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1", Kind: "issue", Status: "running", IssueTitle: "live one"}},
+		{RunDTO: apitypes.RunDTO{ID: "bbbbbbbb-2", Kind: "issue", Status: "failed", IssueTitle: "vault rotation"}},
+	}})
+	m = press(t, next.(tuiModel), keyHideDone)
+	m.board.filter = "vault"
+	out := stripANSI(m.View().Content)
+	if !strings.Contains(out, "No active runs match the filter; finished matches are folded (h to show).") {
+		t.Errorf("filter matching only a folded run should point at the fold\n%s", out)
+	}
+	if strings.Contains(out, "No runs match the filter.") {
+		t.Errorf("filter matching a folded run claims nothing matches\n%s", out)
+	}
+}
+
 // The judge marker is a right-aligned column: markers of different widths end at the same
 // column, so every verdict-carrying row has the same total visual width. The pre-fix board
 // trailed the marker straight after the title, so a shorter marker produced a narrower row.
