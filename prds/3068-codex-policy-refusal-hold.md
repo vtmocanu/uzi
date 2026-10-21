@@ -569,6 +569,24 @@ Supporting security checks actually completed on d8478997: task scan:secrets use
 - Supporting scoped security: `task scan:secrets` `gate-log.gdKuRW` EXIT=0, two canaries detected, zero gating tracked-file findings (7276 indexed files); 7384 untracked scratch findings were explicitly non-gating, not a claim that all scanned bytes were clean. `task sast:semgrep` `gate-log.s6VGZc` EXIT=0, canary raw/results=1 and tree raw/results/errors=0. Auditor reported govulncheck unavailable and did not install it; no dependency-scan pass is inferred.
 - Prior canonical agent and LiveDB failures, the missing matching historical SDK/109-case execution and other CP-I obligations remain outstanding. Required actionlint/zizmor execution is not certified by PATH probes. No whole-milestone checkbox or acceptance status is promoted by this unit. Locally committed/reviewed, checkpoint acknowledgement, durable capture and forge publication remain separate observations.
 
+## Owner progression decision — 2026-10-21
+
+The owner extends CP-I item 3 for progression only: the recorded prerequisite gaps do not block continuing the serial M2, M3 and A1 work. This supersedes earlier dependency parks and CP-I progression restrictions for those gaps. No acceptance criterion is waived, no milestone is declared complete, and final acceptance remains blocked until every UNVERIFIED and UNPROVEN item passes in its closing lane. The workflow guard and the remaining v4 implementation/proof contract stay binding.
+
+The eventual PR validation section must retain these exact classifications and closing lanes:
+
+| Proof | Status and closing lane |
+|---|---|
+| Historical SDK 0.3.292 baseline proof | **UNVERIFIED — maintainer lane.** Historical cache blobs are not provisioned on this worker. Do not retry the proof here. |
+| M0 proof | **UNVERIFIED — maintainer lane.** Requires an explicit native Codex 0.153.2 binary; M0_CODEX_BIN is unset here. Do not retry the proof here. |
+| M4 (Codex 0.162.1) | **UNVERIFIED locally.** CI's `task test:codex-m4` lane provisions its pinned binary; only observed execution closes it. |
+| actionlint / zizmor | **UNVERIFIED.** Closing lane: CI `gate:repo`, with required tools actually executed. |
+| zsh-dependent proofs | **UNVERIFIED — maintainer lane**, unless CI provisioning and execution of the required proofs are verified. |
+| Failing agent-gate tests | **UNPROVEN, not ENV-BLOCKED.** Fix failures caused by this change and retain actual canonical results. |
+| Seven-package LiveDB failures | **UNPROVEN, not ENV-BLOCKED.** Before any further LiveDB rerun, identify the slow package as already decided; do not blindly repeat the full run. The recorded slow package is store; its precise cumulative timeout cause remains unresolved. |
+
+No new installs are authorized beyond the existing `npm ci --ignore-scripts` grant. Canonical `./e2e/run-store-it.sh` and `test:policy-stop-e2e` on the final head remain required. These lane assignments are outstanding validation obligations, not passes, an acceptance decision or permission to skip required gates.
+
 ## Validation limits and handoff
 
 Real provider acceptance of `thread/resume` after a policy-failed turn has not been observed; deterministic responders establish only local behavior. M1 is committed and retained, with integration still open. M2 remains in progress (partial) and M3 has not started. At `3b3d55733aadc4457f0ae8436af5885e09b0a550`, the atomic Stop confirmation and delayed-verdict repair have clean scoped reviewer/tester/auditor reviews and a passing `task gate:api`; the focused PostgreSQL run passed nine named handler LiveDB tests with no skips. These tests seed source context and do not prove its runtime writer, worker delivery, zero-root-turn finalization, or the full seven-package LiveDB/race harness. The source-authority regression reproduced three constrained claim-assembly failures with historical approvals on the unfixed code; the fix passes both named worker-service LiveDB tests, including ordinary, cross-check, current/old approval and known/unknown-source controls. Source coverage is seeded, and only claim assembly uses this new authority so far. Source writers, the composed Stop regression, timing/base uncertainty, CLI/surfaces, remaining integration gates and final acceptance are outstanding. Checkboxes must follow observed execution evidence, not these design decisions. Q1, Q2 and Q3 were confirmed as option (a) on 2026-10-16, and D15–D17 record the later approved Stop contract; no new product decision is pending. The finite-lease/other-worker and wall-grace residuals remain accepted limits, not a global no-replay guarantee.
