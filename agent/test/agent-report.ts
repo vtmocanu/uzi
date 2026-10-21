@@ -7,7 +7,8 @@
 //   summary.json   final, owned by the launcher (run-unit-tests.ts), written only after the
 //   summary.txt    node --test process group has exited; absent means the invocation never finished
 //
-// plus latest.json beside the directories, naming the newest invocation.
+// plus invocation.json and selected.json (the launcher's file inventory, the only paths the reporter
+// counts as files) in <id>/, and latest.json beside the directories, naming the newest invocation.
 //
 // Fail-closed contract: this covers the UNIT stage only (task's exit code is the gate verdict:
 // real-procfs-skip-check.sh, tmpdir-leak-guard.sh and test:codex-m4 run after it). A missing

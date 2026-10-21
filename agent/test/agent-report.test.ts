@@ -250,6 +250,32 @@ test("the watchdog stops a hung file only after every other file finished, and r
   }
 });
 
+test("a caller's signal after the watchdog fired is still re-raised", { timeout: 60_000 }, async () => {
+  const root = fixture({
+    "a-leak.test.ts": leaking,
+    "b-ok.test.ts": 'import test from "node:test";\ntest("ok", () => {});\n',
+  });
+  const run = launch(root, { UZI_AGENT_TEST_STALL_MS: "1500", UZI_AGENT_TEST_STALL_TESTONLY: "1", UZI_AGENT_TEST_CONCURRENCY: "2" });
+  try {
+    // The SIGTERM-ignoring descendant holds cleanup open for its 2 s grace: signal inside that window.
+    await until(() => /HUNG test file/.test(run.output.join("")), 30_000, "the watchdog");
+    run.child.kill("SIGINT");
+    const result = await run.closed;
+    assert.equal(result.signal, "SIGINT", run.output.join(""));
+    const summary = readJson<Summary>(path.join(latestDir(root), "summary.json"))!;
+    assert.equal(summary.termination, "watchdog");
+    assert.equal(summary.state, "incomplete");
+  } finally {
+    for (const name of ["leak.pid", "grandchild.pid"]) {
+      const pid = Number(readJson<number>(path.join(root, name)));
+      if (pid > 1 && alive(pid)) process.kill(pid, "SIGKILL");
+    }
+    if (run.child.exitCode === null && run.child.signalCode === null) run.child.kill("SIGKILL");
+    await run.closed.catch(() => undefined);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("the watchdog does not fire while another file is still queued; SIGTERM then finalizes incomplete", { timeout: 60_000 }, async () => {
   const root = fixture({
     "a-leak.test.ts": leaking,
@@ -524,7 +550,8 @@ function blankLiterals(source: string): string {
 
 /**
  * Every literal-object `timeout` option passed to a test, suite or hook (incl. .only/.skip/.todo), as raw
- * expressions. Known gap: options passed as a variable are not followed.
+ * expressions. Known gaps: options passed as a variable are not followed, and regex literals are not
+ * recognised (a quote inside one can hide later options); the 100-option floor bounds the damage.
  */
 function timeoutOptions(original: string): string[] {
   const source = blankLiterals(original);

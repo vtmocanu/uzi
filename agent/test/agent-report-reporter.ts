@@ -30,7 +30,6 @@ function boundError(text: string): string {
   return single.length > ERROR_CHARS ? single.slice(0, ERROR_CHARS) + " ...[truncated]" : single;
 }
 
-/** Write JSON atomically: a temp file in the SAME directory (never os.tmpdir(), which the leak guard deletes), then rename. */
 /** Atomic replace: a temp file in the SAME directory (never os.tmpdir(), which the leak guard deletes), then rename. */
 export function writeTextAtomic(file: string, text: string): void {
   const temp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.tmp`);
