@@ -106,6 +106,9 @@ describe("mock user settings: judge lanes (PRD #3245)", () => {
     await expect(api.putMySettings({ judge_model: "gpt-6-astra" })).rejects.toMatchObject({
       status: 400, message: "judge_model: model is a Codex model id",
     });
+    await expect(api.putMySettings({ judge_model: "gpt-6-luna" })).rejects.toMatchObject({
+      status: 400, message: "judge_model: model is a Codex model id",
+    });
     await expect(api.putMySettings({ codex_judge_model: "gpt-6-luna" })).rejects.toMatchObject({
       status: 400, message: 'codex_judge_model: "gpt-6-luna" is not a supported Codex model',
     });

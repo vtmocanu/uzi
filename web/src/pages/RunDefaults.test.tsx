@@ -529,18 +529,48 @@ describe("Run defaults — judge model per harness (PRD #3245)", () => {
     expect(save.disabled).toBe(false);
   });
 
-  it("flags a stored Codex id in the Claude lane and shows what is in effect instead", async () => {
-    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token")] });
+  // gpt-6-luna is a Codex role model but not a curated one, so it pins the warning to
+  // the role set (CODEX_ROLE_MODELS), not the curated picker list.
+  it.each(["gpt-6-astra", "gpt-6-luna"])(
+    "flags a stored Codex id (%s) in the Claude lane and shows what is in effect instead",
+    async (id) => {
+      mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token")] });
+      // The server drops the Codex id from the Claude lane, so the cell resolves to the
+      // instance default (sonnet), exactly as cells() describes it.
+      const legacy = cells();
+      legacy[0] = { ...legacy[0], model: id };
+      mockApi.getMySettings.mockResolvedValue(judgeSettings({ judge_model: id, judge_models: legacy }));
+      const { container } = renderPage();
+      const claude = (await screen.findByLabelText("Claude judge model")) as HTMLSelectElement;
+      await waitFor(() => expect(claude.value).toBe("custom"));
+      expect(document.getElementById("judge-model-effect")?.textContent).toBe("In effect: sonnet \u00b7 instance default");
+      expect(container.textContent).toContain(
+        `Not a Claude model: ${id} is a Codex model, so Claude judges skip it. Choose Default to clear it.`,
+      );
+    },
+  );
+
+  it("a stored Codex id in the Claude lane does not block saving the Codex lane", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
+    // The server resolver drops the stored gpt-6-luna, so the Claude cell resolves to
+    // the instance default.
     const legacy = cells();
-    legacy[0] = { ...legacy[0], model: "gpt-6-astra", resolved_model: "opus", source: "instance_default" };
-    mockApi.getMySettings.mockResolvedValue(judgeSettings({ judge_model: "gpt-6-astra", judge_models: legacy }));
-    const { container } = renderPage();
+    legacy[0] = { ...legacy[0], model: "gpt-6-luna" };
+    mockApi.getMySettings.mockResolvedValue(judgeSettings({ judge_model: "gpt-6-luna", judge_models: legacy }));
+    mockApi.putMySettings.mockResolvedValue(
+      judgeSettings({ judge_model: "gpt-6-luna", codex_judge_model: "gpt-6-astra", judge_models: legacy }),
+    );
+    renderPage();
     const claude = (await screen.findByLabelText("Claude judge model")) as HTMLSelectElement;
     await waitFor(() => expect(claude.value).toBe("custom"));
-    expect(document.getElementById("judge-model-effect")?.textContent).toBe("In effect: opus \u00b7 instance default");
-    expect(container.textContent).toContain(
-      "Not a Claude model: gpt-6-astra is a Codex model, so Claude judges skip it. Choose Default to clear it.",
-    );
+    const save = screen.getByRole("button", { name: "Save judge models" }) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    fireEvent.change(screen.getByLabelText("Codex judge model"), { target: { value: "gpt-6-astra" } });
+    // The Claude lane is untouched, so its warning does not gate this save.
+    expect(save.disabled).toBe(false);
+    fireEvent.click(save);
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledTimes(1));
+    expect(mockApi.putMySettings.mock.calls[0][0]).toStrictEqual({ codex_judge_model: "gpt-6-astra" });
   });
 });
 

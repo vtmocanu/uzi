@@ -793,8 +793,10 @@ describe("AdminSettings — run judge (PRD #46)", () => {
     );
   });
 
-  it("warns when the stored instance Claude judge model is a Codex id (AC5)", async () => {
-    mockApi.getSettings.mockResolvedValue(response({ judge_model: "gpt-6-sol" }, {}, { judge_model: "db" }));
+  // gpt-6-luna is a Codex role model but not a curated one, so it pins the warning to
+  // the role set (CODEX_ROLE_MODELS), not the curated picker list.
+  it.each(["gpt-6-sol", "gpt-6-luna"])("warns when the stored instance Claude judge model is a Codex id (%s, AC5)", async (id) => {
+    mockApi.getSettings.mockResolvedValue(response({ judge_model: id }, {}, { judge_model: "db" }));
     renderPage();
     const select = (await screen.findByLabelText("Claude judge model")) as HTMLSelectElement;
     expect(select.value).toBe("custom");

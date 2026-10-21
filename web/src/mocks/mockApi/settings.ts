@@ -36,11 +36,10 @@ import { mockDefaultClaudeModel } from "./agents";
 import { workersApi } from "./workers";
 
 // PRD #1551 D3: the two closed cross-vocabulary sets, mirroring the server's lane
-// validation (the curated Codex list is lib/codexModels.ts, PRD #3245). A curated Codex
-// id may not be saved into the Claude lane; a known Claude alias may not be saved into
-// the Codex lane (which otherwise accepts a custom id, D5). Kept module-local so knip
-// does not flag them.
-const CURATED_CODEX_IDS = CODEX_CURATED_MODELS;
+// validation: CODEX_CURATED_MODELS (lib/codexModels.ts, PRD #3245) and the Claude
+// aliases below. A curated Codex id may not be saved into the Claude lane; a known
+// Claude alias may not be saved into the Codex lane (which otherwise accepts a custom
+// id, D5). Kept module-local so knip does not flag it.
 const KNOWN_CLAUDE_ALIASES = ["opus", "sonnet", "haiku", "fable"];
 
 // ── Settings persistence (demo build) ────────────────────────────────────────
@@ -84,7 +83,8 @@ const SEED_USER_SETTINGS: UserSettings = {
   default_effort: null,
   default_codex_effort: null,
   judge_model: null,
-  // PRD #3245: the Codex judge lane; null = inherit. M3 builds the real UI and resolver.
+  // PRD #3245: the Codex judge lane; null = inherit. Resolved per harness into
+  // judge_models (mockJudgeModelCells) and edited on Run defaults.
   codex_judge_model: null,
   summary_model: null,
   theme: null,
@@ -374,7 +374,7 @@ function loadSettings(): { userSettings: UserSettings; appSettings: AppSettings;
           userSettings.default_codex_model == null &&
           userSettings.default_model
         ) {
-          if (CURATED_CODEX_IDS.includes(userSettings.default_model)) {
+          if (CODEX_CURATED_MODELS.includes(userSettings.default_model)) {
             userSettings.default_codex_model = userSettings.default_model;
           } else {
             userSettings.default_claude_model = userSettings.default_model;
@@ -920,7 +920,7 @@ export const settingsApi = {
         if (KNOWN_CLAUDE_ALIASES.includes(trimmed)) {
           throw new ApiError(400, "codex_judge_model: must be a Codex model; this is a Claude model alias");
         }
-        if (trimmed !== "" && !CURATED_CODEX_IDS.includes(trimmed)) {
+        if (trimmed !== "" && !CODEX_CURATED_MODELS.includes(trimmed)) {
           throw new ApiError(400, "codex_judge_model: is not a Codex judge model");
         }
         nonSecret.codex_judge_model = trimmed;
@@ -1282,7 +1282,7 @@ export const settingsApi = {
         }
         next = { ...next, default_codex_model: val };
       } else {
-        if (val !== null && CURATED_CODEX_IDS.includes(val)) {
+        if (val !== null && CODEX_CURATED_MODELS.includes(val)) {
           throw new ApiError(400, "default_claude_model: a Codex model is not valid for the Claude lane");
         }
         if (patch.default_claude_model !== undefined && (patch.default_claude_model?.trim() || null) !== val) {
@@ -1297,7 +1297,7 @@ export const settingsApi = {
       // freedom, so any other id is stored as given.
       const trimmed = patch.default_claude_model?.trim() ?? "";
       const val = trimmed === "" ? null : trimmed;
-      if (val !== null && CURATED_CODEX_IDS.includes(val)) {
+      if (val !== null && CODEX_CURATED_MODELS.includes(val)) {
         throw new ApiError(400, "default_claude_model: a Codex model is not valid for the Claude lane");
       }
       next = { ...next, default_claude_model: val };
@@ -1348,7 +1348,7 @@ export const settingsApi = {
       // PRD #3245: blank clears to inherit; otherwise a curated Codex id only, mirroring
       // the server's validateCodexJudgeModel.
       const trimmed = patch.codex_judge_model?.trim() ?? "";
-      if (trimmed !== "" && !CURATED_CODEX_IDS.includes(trimmed)) {
+      if (trimmed !== "" && !CODEX_CURATED_MODELS.includes(trimmed)) {
         throw new ApiError(400, `codex_judge_model: "${trimmed}" is not a supported Codex model`);
       }
       next = { ...next, codex_judge_model: trimmed === "" ? null : trimmed };
