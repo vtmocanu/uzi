@@ -46,6 +46,11 @@ func (h *Handler) WorkerRunBaseAttestationHold(w http.ResponseWriter, r *http.Re
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
 		case errors.Is(err, workersvc.ErrMissingClaimGeneration):
 			httpx.Error(w, http.StatusConflict, "this worker must stamp claim_generation on the base attestation hold")
+		case errors.Is(err, workersvc.ErrStaleClaim):
+			// A reconciled run's generation fence refused this claim before the setter ran (released
+			// or superseded). That is known stale ownership: the same stale_claim 409 the other
+			// worker endpoints answer, never a 500 the worker would read as unknown and retry.
+			httpx.ErrorReason(w, http.StatusConflict, "base attestation hold claim is stale", "stale_claim")
 		default:
 			slog.Error("worker run base attestation hold", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
