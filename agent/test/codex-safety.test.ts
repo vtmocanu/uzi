@@ -163,6 +163,59 @@ for (const failure of ["clean", "dispose", "reap"] as const) {
   });
 }
 
+for (const timing of ["reap", "microtask", "foreign-signal", "child-deadline"] as const) {
+  it("R2 independent child primary survives later capture expiry: " + timing, async () => {
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(2852));
+    const cache = new GitCache("/unused-r2", nullLogger());
+    let expire!: () => void;
+    let now = Date.now();
+    const foreign = new AbortController(); foreign.abort();
+    const primary = timing === "foreign-signal"
+      ? new CaptureOperationRevokedError("independent child verification failure", foreign.signal)
+      : new TrustedExecutionRefusal("independent child verification failure");
+    let sawPrimary = false, reaps = 0, disposals = 0;
+    const safety = createCodexExecutionSafety(registry, spawnCounter().seam, undefined, undefined,
+      async () => {
+        if (timing === "child-deadline") now += 1000;
+        return {
+          stdin: null, stdout: new PassThrough(), stderr: new PassThrough(),
+          waitChild: () => {
+            sawPrimary = true;
+            // The helper's rejection handler selects the independent primary first.
+            // Expiry then runs before startOwnedProcess resumes its await catch.
+            const terminal = Promise.reject(primary);
+            if (timing === "microtask") queueMicrotask(() => queueMicrotask(expire));
+            return terminal;
+          },
+          root: { kind: "boundary_action",
+            dispose: async () => { disposals++; },
+            reap: async () => {
+              reaps++;
+              assert.equal(sawPrimary, timing !== "child-deadline");
+              if (timing !== "microtask") expire();
+              return { ok: true };
+            },
+          },
+        };
+      }, (_request, _ms, fire) => { expire = fire; return () => {}; }, () => now);
+    await assert.rejects(safety.withCredentialFreeCapture(1000, async context =>
+      cache.withCredentialFreeCapture(context, () => cache.branchTip("/unused", "agent/issue-2852"))),
+      (error: unknown) => {
+        assert.ok(error instanceof CodexBoundaryError);
+        if (timing === "child-deadline") {
+          assert.ok(error.actionError instanceof TrustedExecutionRefusal);
+          assert.equal(error.actionError.message, "boundary process child deadline exceeded during launch");
+        } else assert.equal(error.actionError, primary);
+        assert.equal(captureFailureOf(error)?.deadlineExpired, true);
+        assert.equal(captureFailureOf(error)?.actionRevoked, undefined,
+          "independent terminal failures cannot authorize refusal recovery");
+        return true;
+      });
+    assert.equal(reaps, 1);
+    assert.equal(disposals, 1);
+  });
+}
+
 // PRD #1171 (M3 m1, first unit) — the CodexExecutionSafety facade and the trusted
 // boundary-action lane. All process work is injected; nothing real is spawned.
 

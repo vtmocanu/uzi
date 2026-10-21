@@ -13,6 +13,56 @@ import { codexRig, manualDeadline } from "./runner-codex-sinks-fixture.js";
 
 installHarness();
 
+for (const timing of ["reap", "microtask"] as const) {
+  it("R2 independent child error before capture expiry must reject pause: " + timing, async t => {
+    const { PassThrough } = await import("node:stream");
+    const deadline = manualDeadline("checkpoint");
+    const primary = new TrustedExecutionRefusal("independent child verification failure");
+    let sawPrimary = false;
+    const rig = codexRig({ armDeadline: deadline.armDeadline,
+      boundaryProcess: async () => ({
+        stdin: null, stdout: new PassThrough(), stderr: new PassThrough(),
+        waitChild: () => {
+          sawPrimary = true;
+          const terminal = Promise.reject(primary);
+          if (timing === "microtask") queueMicrotask(() => queueMicrotask(() => deadline.fire()));
+          return terminal;
+        },
+        root: { kind: "boundary_action", dispose: async () => {},
+          reap: async () => {
+            assert.equal(sawPrimary, true);
+            if (timing === "reap") deadline.fire();
+            return { ok: true };
+          },
+        },
+      }),
+    });
+    const runner = runnerWith(() => assert.fail("no executor needed"), fakeGitlab().gitlab);
+    const internal = runner as any;
+    t.mock.method(internal, "runGatedSink", async (_flight: unknown, action: () => Promise<unknown>) => action());
+    const reports: unknown[] = [], messages: unknown[] = [];
+    const flight: any = {
+      executor: { safety: rig.safety, withCredentialFreeCapture: rig.capture },
+      steering: { getPauseMode: () => null, checkpointAuthoritySignal: () => new AbortController().signal },
+      runId: "r2-child-primary", runLog: { warn: () => {} },
+      batcher: { emit: (message: unknown) => messages.push(message), flush: async () => {} },
+      reportState: async (body: unknown) => { reports.push(body); return { applied: true, status: "running" }; },
+    };
+    t.mock.method(internal, "handlePauseParkHeld", async () => git.branchTip(fx.originPath, "main"));
+    await assert.rejects(internal.handlePausePark(gitlabClaim(2852), flight, { completedCount: 1 }, { origin: "owner" }),
+      (error: unknown) => {
+        assert.ok(error instanceof CodexBoundaryError);
+        assert.equal(error.actionError, primary);
+        assert.equal(captureFailureOf(error)?.deadlineExpired, true);
+        assert.equal(captureFailureOf(error)?.actionRevoked, undefined);
+        return true;
+      });
+    assert.equal(flight.refusedPauseCaptureSafety, undefined);
+    assert.deepEqual(reports, []);
+    assert.deepEqual(messages, []);
+  });
+}
+
 it("epoch cleanup refusal keeps facade identity out of wire fields", () => {
   const { safety } = codexRig();
   const error = new EpochCleanupUnprovenError(safety);

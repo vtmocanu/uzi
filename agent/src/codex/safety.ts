@@ -1011,13 +1011,16 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
           if (request.recoverableTimeout && !permit.signal.aborted && this.remainingMs(this.currentDeadlineAt) > 0) {
             throw new SupervisedChildExitTimeoutError(request.timeoutMs);
           }
-          throw new TrustedExecutionRefusal("boundary process child deadline exceeded during launch");
+          const message = "boundary process child deadline exceeded during launch";
+          throw capture?.signal.aborted
+            ? new CaptureOperationRevokedError(message, capture.signal) : new TrustedExecutionRefusal(message);
         }
         terminal = await this.waitChildOrAbort(
           launched,
           permit.signal,
           cancellation.signal,
           Math.max(1, childDeadlineAt - this.now()),
+          capture?.signal,
         );
       } catch (error) {
         terminalError = error;
@@ -1056,6 +1059,12 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
         launched.stdout?.destroy();
         launched.stderr?.destroy();
         return { code: -1, softTimedOut: true };
+      }
+      // Preserve a child-selected failure even if capture expires before the await
+      // catch or during reap. Only the wait owner can identify its own abort.
+      if (capture && terminalError !== undefined &&
+          !(terminalError instanceof CaptureOperationRevokedError && terminalError.isCaptureRevocationFor(capture.signal))) {
+        throw terminalError;
       }
       if (permit.signal.aborted) {
         const message = "boundary process deadline exceeded";
@@ -1097,15 +1106,21 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     signal: AbortSignal,
     cancellation: AbortSignal,
     deadlineMs: number,
+    captureSignal?: AbortSignal,
   ): Promise<{ readonly code: number }> {
-    if (signal.aborted) return Promise.reject(new TrustedExecutionRefusal("boundary process deadline exceeded"));
+    const abortError = (): TrustedExecutionRefusal => {
+      const message = "boundary process deadline exceeded";
+      return captureSignal?.aborted
+        ? new CaptureOperationRevokedError(message, captureSignal) : new TrustedExecutionRefusal(message);
+    };
+    if (signal.aborted) return Promise.reject(abortError());
     if (cancellation.aborted) return Promise.resolve({ code: -1 });
     return new Promise((resolve, reject) => {
       const cleanup = (): void => {
         signal.removeEventListener("abort", onAbort);
         cancellation.removeEventListener("abort", onCancel);
       };
-      const onAbort = (): void => { cleanup(); reject(new TrustedExecutionRefusal("boundary process deadline exceeded")); };
+      const onAbort = (): void => { cleanup(); reject(abortError()); };
       const onCancel = (): void => { cleanup(); resolve({ code: -1 }); };
       signal.addEventListener("abort", onAbort, { once: true });
       cancellation.addEventListener("abort", onCancel, { once: true });
