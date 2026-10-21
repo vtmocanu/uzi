@@ -342,3 +342,30 @@ test("issue #3239 (h3): the non-UTF-8 fixture really is not valid UTF-8 and surv
   assert.notDeepEqual(Buffer.from(body.toString("utf8"), "utf8"), body, "the body does not round-trip through UTF-8");
   git(bare, ["fsck", "--strict", "--no-dangling"]);
 });
+
+test("issue #3239 (l): a thrown read of an inner aggregate in a multi-round wrapper refuses instead of burying its marker", async () => {
+  const r = await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const m = await wipMarker(source.clonePath, "work.txt");
+  const base = sha(`${m}^`);
+  const clean = sibling(base, "clean source");
+  // 34 distinct roots force a second coverage round (parent batches hold at most 32 roots).
+  const roots = [m, clean, ...Array.from({ length: 32 }, (_, i) => sibling(base, `filler ${i}`))];
+  const c1 = (await genuine(roots, clean)).sha;
+  const inner = git(bare, ["rev-list", "--parents", "-n", "1", c1]).split(" ").slice(1);
+  assert.ok(inner.length >= 2, "sanity: c1 is a round-1 aggregate over round-0 aggregates");
+  const holder = inner.find(a => git(bare, ["rev-list", "--parents", "-n", "1", a]).split(" ").includes(m));
+  assert.ok(holder, "sanity: one round-0 aggregate carries the marker");
+  // The tip is one level above c1, so the unreadable aggregate is two levels down: the tip's own
+  // subject read does not touch it and only the walk's bounded read can notice.
+  const tip = git(bare, ["--no-replace-objects", "-c", "commit.gpgsign=false", "commit-tree", sha(`${clean}^{tree}`), "-p", c1,
+    "-m", `uzi recovery coverage ${"0".repeat(64)} round 2 batch 0`], {
+    GIT_AUTHOR_NAME: "uzi-agent", GIT_AUTHOR_EMAIL: "uzi-agent@uzi.local", GIT_COMMITTER_NAME: "uzi-agent",
+    GIT_COMMITTER_EMAIL: "uzi-agent@uzi.local", GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z", GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z",
+  });
+  await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, tip, clean);
+  // Corrupt the loose object so cat-file throws (not a bounded-read refusal).
+  const obj = path.join(bare, "objects", holder.slice(0, 2), holder.slice(2));
+  fs.chmodSync(obj, 0o600);
+  fs.writeFileSync(obj, "garbage");
+  await assertRefused(r.attempts, aid(2));
+});

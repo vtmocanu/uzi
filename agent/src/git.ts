@@ -6802,11 +6802,14 @@ export class GitCache {
    * `successor recovery verification failed`, before a ledger entry or clone exists.
    *
    * Fail closed: once the tip is a coverage commit (or the source is a marker), any inability to verify
-   * refuses: an unreadable tip, more than 8 aggregates, or more than MAX_OWED_CANDIDATES_PER_RUN + 1
-   * leaves. A non-tip commit that {@link readBoundedCommit} cannot read (over 64 KiB, or a body that does
-   * not survive the UTF-8 round trip) is demoted to a leaf and meets the leaf rule, which classifies it
-   * by subject and never needs that read; the source and a marker leaf are read by plumbing for the same
-   * reason.
+   * refuses: an unreadable tip, more than 8 aggregates, or more than MAX_OWED_CANDIDATES_PER_RUN + 2
+   * leaves, or ANY failed read. Only a non-tip commit for which {@link readBoundedCommit} RETURNS
+   * undefined (over 64 KiB, or a body that does not survive the UTF-8 round trip) is demoted to a leaf
+   * and meets the leaf rule, which classifies it by subject and never needs that read; a demoted leaf
+   * whose subject is a coverage subject is refused (genuine aggregates are small ASCII). A read that
+   * THROWS (timeout, git failure, missing object) refuses, as does a failed subject read of the tip,
+   * the source or a leaf: a transient error never classifies a commit as a non-marker. The source and
+   * a marker leaf are compared by plumbing for the same reason.
    *
    * The caller holds the bare lock: this helper must never take it (the lock is not reentrant), which is
    * why it reads aggregates through {@link readBoundedCommit} and not {@link readRecoveryCoverageClaim}.
@@ -6814,12 +6817,25 @@ export class GitCache {
   private async resolveMarkerWrapperAdoption(
     barePath: string, journal: RecoveryJournalEntry, tip: string, src: string | undefined,
   ): Promise<{ seedTip: string; expectedHead: string; expectedTree: string; peeledMarkers: string[] } | undefined> {
-    // Leaves are the owed roots (at most MAX_OWED_CANDIDATES_PER_RUN) plus the current source.
-    const MAX_LEAVES = MAX_OWED_CANDIDATES_PER_RUN + 1, MAX_AGGREGATES = 8, MAX_OBJECT_BYTES = 64 * 1024;
+    // The producer's parent set is the owed roots (at most MAX_OWED_CANDIDATES_PER_RUN), the original
+    // source (freezeInventory appends it to the roots) and the current source (buildRecoveryCoverage
+    // adds it), and the two extras can be distinct.
+    const MAX_LEAVES = MAX_OWED_CANDIDATES_PER_RUN + 2, MAX_AGGREGATES = 8, MAX_OBJECT_BYTES = 64 * 1024;
     const fail = (): never => { throw new Error("successor recovery verification failed"); };
-    if (await this.isWipParkMarker(barePath, tip)) return undefined;
-    const srcMarker = src !== undefined && await this.isWipParkMarker(barePath, src);
-    const subject = await this.tryGitStdout(barePath, ["log", "-1", "--format=%s", `${tip}^{commit}`]);
+    // Throwing subject read (unlike isWipParkMarker/tryGitStdout, which answer "" on any non-abort
+    // error): once a decision depends on the subject, an unreadable commit refuses.
+    const subjectOf = async (rev: string): Promise<string> => {
+      try {
+        return (await this.runGit(barePath, ["--no-replace-objects", "log", "-1", "--format=%s", `${rev}^{commit}`])).trim();
+      } catch (err) {
+        const abort = this.boundaryAbortError(err);
+        if (abort) throw abort;
+        return fail();
+      }
+    };
+    const subject = await subjectOf(tip);
+    if (subject.startsWith(WIP_PARK_COMMIT_PREFIX)) return undefined;
+    const srcMarker = src !== undefined && OWED_OID.test(src) && (await subjectOf(src)).startsWith(WIP_PARK_COMMIT_PREFIX);
     // From here the tip is a coverage commit or the source is a marker. A wrapper whose walk cannot be
     // completed cannot be shown to bury no marker, so every inability to verify below refuses; only a
     // non-tip commit that cannot be read within bounds is demoted to a leaf (it then meets the leaf rule).
@@ -6838,9 +6854,11 @@ export class GitCache {
       try { commit = await this.readBoundedCommit(barePath, sha, MAX_OBJECT_BYTES); } catch (err) {
         const abort = this.boundaryAbortError(err);
         if (abort) throw abort;
+        return fail();
       }
       if (!commit) {
         if (sha === tip) return fail();
+        if ((await subjectOf(sha)).startsWith("uzi recovery coverage ")) return fail();
         leaves.add(sha);
         continue;
       }
@@ -6852,7 +6870,7 @@ export class GitCache {
     }
     if (leaves.size > MAX_LEAVES) return fail();
     const markerLeaves = new Set<string>();
-    for (const leaf of leaves) if (await this.isWipParkMarker(barePath, leaf)) markerLeaves.add(leaf);
+    for (const leaf of leaves) if ((await subjectOf(leaf)).startsWith(WIP_PARK_COMMIT_PREFIX)) markerLeaves.add(leaf);
     if (!srcMarker && markerLeaves.size === 0) return undefined;
 
     // From here the shape involves a marker: everything below is a hard requirement.
