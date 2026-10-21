@@ -792,7 +792,7 @@ jobs:
 
   # ------------------------------------------------------------- repo-wide ----
   # shellcheck (pinned, Renovate-tracked) + yamllint + ruby formula syntax +
-  # actionlint/zizmor (pinned) + gitleaks. Invokes the composed `task gate:repo`;
+  # actionlint (pinned) / zizmor (worker lock's) + gitleaks. Invokes the composed `task gate:repo`;
   # the *_REQUIRED flags
   # turn each check's fail-open SKIP into exit 2 so a missing tool in CI cannot pass
   # silently.
@@ -870,7 +870,7 @@ jobs:
         # clean), so a current yamllint is fine. Ruby (for the formula syntax lint)
         # ships preinstalled on ubuntu-latest at >= 3.1.
         run: pipx install yamllint
-      - name: Install actionlint + zizmor (pinned)
+      - name: Install actionlint (pinned) + zizmor (the worker lock's version)
         run: |
           set -euo pipefail
           # actionlint as a PINNED RELEASE BINARY (curl + sha256), not `go install
@@ -887,6 +887,9 @@ jobs:
           # renovate.json). actionlint is a linter, so a bump PR may redden lint-repo
           # with new workflow findings -- that red is the signal to fix them, by
           # design. linux/amd64 tarball; it extracts `actionlint` (+ docs/man) at root.
+          # The worker image bakes actionlint from agent/devbox-global/devbox.lock, and
+          # check:actions-tool-parity fails while the two versions differ, so a bump
+          # here also needs the lock to carry it (and a lock refresh, the reverse).
           # renovate-tarball: depName=rhysd/actionlint
           ACTIONLINT_VERSION="v1.7.12"          # v-prefixed git tag (getDigest fetches releases/tags/<value>)
           ACTIONLINT_V="${ACTIONLINT_VERSION#v}" # tarball filename is versionless
@@ -902,12 +905,14 @@ jobs:
           rm -f /tmp/actionlint.tar.gz
           echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
           "${HOME}/.local/bin/actionlint" --version
-          # zizmor: a Python-packaged (PyPI) tool, so pipx mirrors the yamllint install.
-          # Pinned exactly: a newer zizmor can add audits that would redden the gate on
-          # an unrelated PR, the drift lint:shell pins shellcheck against. No sha to
-          # maintain (pip verifies from PyPI), so Renovate bumps this fully automatically.
-          # renovate: datasource=pypi depName=zizmor versioning=pep440
-          pipx install zizmor==1.30.1
+          # zizmor: a PyPI-packaged tool, so pipx mirrors the yamllint install. CI holds
+          # no version of its own: it installs the version baked into the worker
+          # toolchain (agent/devbox-global/devbox.lock), so CI and a uzi worker run the
+          # same audits and the weekly devbox refresh moves both. A newer zizmor can add
+          # audits; that red lands on the refresh PR. check:actions-tool-parity pins
+          # this two-line shape (#2288).
+          ZIZMOR_VERSION="$(./scripts/worker-tool-version.sh zizmor)"
+          pipx install "zizmor==${ZIZMOR_VERSION}"
       - name: Install semgrep (the worker lock's version)
         # semgrep is a PyPI-packaged tool, so pipx mirrors the yamllint/zizmor
         # installs above. CI holds no version of its own: it installs the version baked
