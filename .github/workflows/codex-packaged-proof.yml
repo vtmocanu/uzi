@@ -11,7 +11,7 @@ name: Codex packaged proof
 # the arm64 artifact's SHA256, members and manifest, and `codex --version` as the runner uid. Only
 # amd64 images ship, so it guards the lock's arm64 entry, not an arm64 image (#3212).
 #
-# The `codex-packaged-proof-gate` job is the stable REQUIRED context (kind-smoke-gate precedent):
+# The `codex-packaged-proof-gate` job is the stable context to REQUIRE (kind-smoke-gate precedent):
 # every PR runs this workflow, a `changes` job decides which legs the PR needs, and the gate
 # (e2e/codex-proof/gate.sh) is red unless each leg passed or was legitimately not needed. Require
 # THAT context in the ruleset, never a leg (absent on unrelated PRs, it would wedge Pending).

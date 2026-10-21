@@ -44,6 +44,10 @@ run_case "failed filter, legs skipped" 1 \
   CI_EVENT=pull_request CHANGES_RESULT=failure NEED_AMD64=false NEED_ARM64=false AMD64_RESULT=skipped ARM64_RESULT=skipped
 run_case "cancelled filter, legs skipped" 1 \
   CI_EVENT=pull_request CHANGES_RESULT=cancelled AMD64_RESULT=skipped ARM64_RESULT=skipped
+run_case "failed filter, legs passed" 1 \
+  CI_EVENT=pull_request CHANGES_RESULT=failure NEED_AMD64=true NEED_ARM64=true AMD64_RESULT=success ARM64_RESULT=success
+run_case "cancelled filter, legs passed" 1 \
+  CI_EVENT=pull_request CHANGES_RESULT=cancelled AMD64_RESULT=success ARM64_RESULT=success
 run_case "schedule: both legs passed" 0 \
   CI_EVENT=schedule CHANGES_RESULT=skipped AMD64_RESULT=success ARM64_RESULT=success
 run_case "schedule: a skipped leg is red" 1 \
@@ -53,4 +57,4 @@ run_case "dispatch: a failed leg is red" 1 \
 run_case "no results at all is red" 1
 
 echo "cases=$cases passed=$passed"
-[ "$cases" -ge 14 ] && [ "$passed" -eq "$cases" ]
+[ "$cases" -ge 16 ] && [ "$passed" -eq "$cases" ]
