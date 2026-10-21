@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Hermetic public-CLI fixtures: no real Go executable or network is used.
 set -euo pipefail
+# Fixture repos must not read host git config: a global core.fsmonitor=true
+# leaves a detached fsmonitor daemon per repo on macOS.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SCRIPT="$HERE/attribute-failures.sh"
 ROOT=$(cd "$HERE/../../../.." && pwd)

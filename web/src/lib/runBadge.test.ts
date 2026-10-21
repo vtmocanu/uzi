@@ -39,6 +39,14 @@ it("provider hold badge uses projection hold reason without a retry promise", ()
   expect(needsHumanAttention("provider_outage")).toBe(false);
   expect(badge.kind === "badge" && badge.title).toContain("waits for its owner");
 });
+it("base attestation hold badge is a warning owner hold, not a generic pause (issue #3194)", () => {
+  const badge = runBadge(run({ status: "paused", hold_reason: "base_attestation_missing" }), 0);
+  expect(badge).toMatchObject({ label: "base unverified: owner hold", tone: "warning", pulse: false });
+  expect(effectiveRunStatus({ status: "paused", hold_reason: "base_attestation_missing" })).toBe("base_attestation_missing");
+  expect(effectiveRunStatus({ status: "queued", hold_reason: "base_attestation_missing" })).toBe("queued");
+  expect(runStatusTone("base_attestation_missing", null)).toBe("warning");
+  expect(needsHumanAttention("base_attestation_missing")).toBe(true);
+});
 it("provider recovery badge only names provider when cause is available", () => {
   expect(runBadge({ ...run({ status: "recovery_wait" }), recovery_wait_cause: "provider_outage" }, 0))
     .toMatchObject({ label: "waiting for provider", pulse: false });

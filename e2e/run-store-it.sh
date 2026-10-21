@@ -20,6 +20,9 @@
 #
 # Run standalone, or alongside ./e2e/run-e2e.sh as the full store-SQL E2E gate.
 set -euo pipefail
+# The Go suites and agent fixtures below create host-side repos: they must not read
+# host git config, where a global core.fsmonitor=true leaves a detached daemon per repo.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NAME="uzi-store-it-$$"

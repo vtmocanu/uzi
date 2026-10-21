@@ -488,6 +488,9 @@ func completionRows(r apitypes.RunDTO) [][]string {
 //   - completion_blocked (the PRD #1226 hold): "completion blocked · parked HH:MM (dur) · C/N milestones"
 //   - credential_disabled (PRD #1732 D14): "credential disabled · parked HH:MM (dur) · C/N milestones ·
 //     enable it in Settings[, or switch token: uzi run set-token <id> <label>]"
+//   - base_attestation_missing (issue #3194): "base not attested · parked HH:MM (dur) · C/N milestones ·
+//     recover the kept work: uzi run recovery <id>, uzi run export <id> --output <path>, or start a
+//     successor run"
 //
 // The milestone clause is dropped when the run carries no frozen milestones (a prompt-kind park),
 // and the extend clause rides ONLY the wall park (a completion hold resumes through its own
@@ -517,6 +520,8 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 		clauses = append(clauses, credentialDisabledAction(r))
 	case holdProviderUnavailable:
 		clauses = append(clauses, providerHoldAction(r))
+	case holdBaseAttestation:
+		clauses = append(clauses, baseAttestationAction(r))
 	}
 	return []string{"HOLD", strings.Join(clauses, " · ")}
 }
@@ -533,9 +538,25 @@ func holdReasonLabel(reason string) string {
 		return "credential disabled"
 	case holdProviderUnavailable:
 		return "provider unavailable"
+	case holdBaseAttestation:
+		return "base not attested"
 	default:
 		return cellText(reason)
 	}
+}
+
+// isBaseAttestationHold reports whether r is held because its kept work carries no
+// `--require-base` attestation (issue #3194: status paused, hold_reason base_attestation_missing).
+func isBaseAttestationHold(r apitypes.RunDTO) bool {
+	return r.Status == statusPaused && strOr(r.HoldReason, "") == holdBaseAttestation
+}
+
+// baseAttestationAction is the owner's next step for a base_attestation_missing hold (issue
+// #3194). The server refuses resume and extend, so it names only the recovery verbs.
+func baseAttestationAction(r apitypes.RunDTO) string {
+	id := cellText(r.ID)
+	return "recover the kept work: uzi run recovery " + id + ", uzi run export " + id +
+		" --output <path>, or start a successor run"
 }
 
 // isCredentialDisabledHold reports whether r is parked because a credential it needs is
@@ -590,6 +611,8 @@ func pausedHoldNotice(r apitypes.RunDTO, origin ...string) string {
 		return "held, a credential it needs is disabled; " + credentialDisabledAction(r)
 	case holdProviderUnavailable:
 		return "held, provider unavailable; " + providerHoldAction(r)
+	case holdBaseAttestation:
+		return "held, its kept work is not attested against the planned base (--require-base); " + baseAttestationAction(r)
 	default:
 		return "paused (" + holdReasonLabel(reason) + ")"
 	}

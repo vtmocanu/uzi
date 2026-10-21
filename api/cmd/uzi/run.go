@@ -109,12 +109,18 @@ const statusPaused = "paused"
 // specific credential its owner has disabled. It resumes by itself once that credential is
 // enabled again (or, where the CLI and web offer a per-run override, once the owner points
 // the run at another token); uzi never substitutes a credential on its own (D2).
+//
+// holdBaseAttestationMissing (issue #3194) holds a `--require-base` run whose worker adopted kept
+// work no checkpoint attests was produced on the planned base. The agent never started; the work
+// stays on the worker. Resume and extend are refused: the owner recovers or exports the work, or
+// starts a successor run.
 const (
 	holdProviderUnavailable = "provider_unavailable"
 	providerOutageCause     = "provider_outage"
 	holdBudgetExhausted     = "budget_exhausted"
 	holdCompletionBlocked   = "completion_blocked"
 	holdCredentialDisabled  = "credential_disabled" //nolint:gosec // G101: a run hold-reason VOCABULARY value (the server enum), not a credential.
+	holdBaseAttestation     = "base_attestation_missing"
 )
 
 // logsPollInterval is how often `uzi run logs --follow` re-polls

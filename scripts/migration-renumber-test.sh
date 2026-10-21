@@ -37,6 +37,9 @@
 #     1 = at least one assertion FAILED
 #     0 = every assertion passed
 set -u
+# Fixture repos must not read host git config: a global core.fsmonitor=true
+# leaves a detached fsmonitor daemon per repo on macOS.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 
 SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)"
 HELPER="$SCRIPTS_DIR/migration-renumber.sh"

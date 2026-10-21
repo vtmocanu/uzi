@@ -92,6 +92,8 @@ func (h *Handler) writeSetRunCredentialError(w http.ResponseWriter, err error) {
 		httpx.Error(w, http.StatusConflict, "the claim is being assembled; retry in a moment")
 	case errors.Is(err, workersvc.ErrCredentialSwitchRunTerminal):
 		httpx.Error(w, http.StatusConflict, "run has already finished")
+	case errors.Is(err, workersvc.ErrBaseAttestationHeld):
+		httpx.Error(w, http.StatusConflict, err.Error())
 	case errors.Is(err, workersvc.ErrCredentialSwitchRaced):
 		httpx.Error(w, http.StatusConflict, "the run changed state while switching its token; retry")
 	default:

@@ -455,6 +455,18 @@ func combineCheckRunStatuses(runs []*gh.CheckRun) string {
 // exactly the Pipeline.ID that LatestPipeline / LatestMRPipeline returned. Paginated
 // internally to honour the interface contract.
 func (g *github) ListPipelineJobs(ctx context.Context, projectID, pipelineID int64) ([]Job, error) {
+	return g.listWorkflowJobs(ctx, projectID, pipelineID, "", "list pipeline jobs")
+}
+
+// ListPipelineJobAttempts returns the jobs of every attempt of a workflow run
+// (filter=all); each job carries its run_attempt.
+func (g *github) ListPipelineJobAttempts(ctx context.Context, projectID, pipelineID int64) ([]Job, error) {
+	return g.listWorkflowJobs(ctx, projectID, pipelineID, "all", "list pipeline job attempts")
+}
+
+// listWorkflowJobs backs both job listings; filter "" keeps the API default
+// (latest attempt), so ListPipelineJobs sends exactly the request it always did.
+func (g *github) listWorkflowJobs(ctx context.Context, projectID, pipelineID int64, filter, op string) ([]Job, error) {
 	// ListPipelineJobs is shared: the INTERACTIVE ci-run drill-in (GetCIRun) and the
 	// poller's ci-fix snapshot both call it. Gating the reserve-shed on the interactive
 	// flag means the drill-in can shed while the poller's unmarked ci-fix read never
@@ -468,8 +480,8 @@ func (g *github) ListPipelineJobs(ctx context.Context, projectID, pipelineID int
 		return nil, err
 	}
 	ctx = markCIJSON(ctx)
-	opt := &gh.ListWorkflowJobsOptions{ListOptions: gh.ListOptions{PerPage: githubPerPage}}
-	wrap := func(e error) error { return g.wrapErr("list pipeline jobs", e) }
+	opt := &gh.ListWorkflowJobsOptions{Filter: filter, ListOptions: gh.ListOptions{PerPage: githubPerPage}}
+	wrap := func(e error) error { return g.wrapErr(op, e) }
 	return paginateCIJobs(ctx, githubPerPage, wrap, func(page int) ([]Job, int, error) {
 		opt.Page = page
 		jobs, resp, err := g.client.Actions.ListWorkflowJobs(ctx, slug.owner, slug.repo, pipelineID, opt)
@@ -687,6 +699,11 @@ func toGitHubJob(j *gh.WorkflowJob) Job {
 		WebURL:     j.GetHTMLURL(),
 		StartedAt:  j.GetStartedAt().Time,
 		FinishedAt: j.GetCompletedAt().Time,
+		CreatedAt:  j.GetCreatedAt().Time,
+	}
+	if j.RunAttempt != nil {
+		n := *j.RunAttempt
+		job.Attempt = &n
 	}
 	for _, s := range j.Steps {
 		if s == nil {

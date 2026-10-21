@@ -59,6 +59,7 @@ Tracked as GitLab issue vtmocanu/uzi#2; PRD at `prds/done/2-forge-integration-ka
 - Per-repo kanban board, columns = GitLab labels, kept in two-way sync between uzi and GitLab.
   - Reference: an internal board (label-as-column example); kan.bn (UI style).
 - Board/agents work only issues carrying the `PRD` label, sanity-checked to contain a link to the PRD file. [superseded — see Feature #22: run-eligibility is now the single `uzi` label and the PRD link is optional (PRD #764) (AI-synced 2026-08-29)]
+- GitLab `GetMergeRequest` and `GetMergeRequestSummary` bound the response body before decoding: 32 MiB for a 200, 201, 202 or 204 and 4 KiB for any other status, counted as transfer-decoded wire bytes (compressed responses are refused). An oversized response is refused with a fixed error and is unverified evidence, never a partial or merged answer (#3038, #3226). (AI-synced 2026-10-21)
 
 ## Feature #3 — Agent templates & per-user Anthropic token
 
@@ -1092,6 +1093,7 @@ Tracked as GitHub issue vtmocanu/uzi#1995; ADR at `adr/1296-durable-run-recovery
 - A credential rejection is retried only after the worker authenticates again. (AI-synced 2026-10-01)
 - A run the worker is executing is not selected for the retry. (AI-synced 2026-10-01)
 - A surviving transient recovery pin of an uploaded recovery bundle is cleaned up only with proof that the uploaded archive is self-contained (no prerequisites) and proof of the pin's repository identity with a compare-and-delete; a thin archive, an ambiguous or unsafe repository, or any failed check keeps the pin and reports the reason. A park whose bundle has forge prerequisites therefore keeps its pin. (AI-synced 2026-10-12)
+- Diagnostics only (#3152): for inventory-guarded recovery records, each boot-sweep, terminal-source or live re-drive eligibility exit before the frozen operation cycle that previously logged nothing emits one info-level `recovery: re-drive exit` line with a fixed reason code (plus the disqualifying ownership field for `inventory_not_inactive`), run id, generation and capture id, once per change of reason, from bounded state; no paths or payloads. Phase 52 saves the agent log and an allowlisted, bounded projection of its own runs' recovery records before recreating the agent. Retry timing, candidate selection and the FINAL path are unchanged. (AI-synced 2026-10-20)
 
 ## Feature #1293 — Failed-run rate on the dashboard (global and per user)
 

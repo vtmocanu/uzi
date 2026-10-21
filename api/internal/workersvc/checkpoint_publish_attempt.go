@@ -116,6 +116,9 @@ type checkpointPush struct {
 	// base is what the push observed of the run's tracking state immediately before its forge
 	// call: the compare-and-set base of its tip persist and record track (publishOutcome).
 	base publishBase
+	// attestedSource is the request's source attestation frozen at admission (issue #3194;
+	// invalid: none). Every attempt row and the tip persist of this publish carry exactly it.
+	attestedSource pgtype.Text
 }
 
 // publishBase is the run's tracking state a push observed immediately before its forge call
@@ -235,11 +238,11 @@ func pushDefinitelyRefused(err error) bool {
 // p.run is the authorization snapshot and is never refreshed to a newer claim.
 func (p *checkpointPush) recordAttempt(ctx context.Context) (uuid.UUID, error) {
 	if terminalStatuses[p.run.Status] {
-		return p.s.recordPublishAttempt(ctx, p.runID, p.branch, p.ref, p.opts.DeclaredTip)
+		return p.s.recordPublishAttempt(ctx, p.runID, p.branch, p.ref, p.opts.DeclaredTip, p.attestedSource)
 	}
 	return p.s.q.RecordLiveCheckpointPublishAttempt(ctx, store.RecordLiveCheckpointPublishAttemptParams{
 		RecordCheckpointPublishAttemptParams: store.RecordCheckpointPublishAttemptParams{
-			RunID: p.runID, Branch: p.branch, Ref: p.ref, Tip: p.opts.DeclaredTip,
+			RunID: p.runID, Branch: p.branch, Ref: p.ref, Tip: p.opts.DeclaredTip, AttestedSource: p.attestedSource,
 		},
 		ExpectedWorkerID: p.run.WorkerID, ExpectedClaimGeneration: p.run.ClaimGeneration,
 		AttemptID: p.preparedID,
@@ -269,12 +272,12 @@ func (p *checkpointPush) clearPreparedAttempt(ctx context.Context) {
 
 // recordPublishAttempt writes the attempt row a push needs before it is sent. Inert (uuid.Nil, no
 // error) when supersession is not wired: then no supersession, and no reconciliation, ever runs.
-func (s *Service) recordPublishAttempt(ctx context.Context, runID uuid.UUID, branch, ref, tip string) (uuid.UUID, error) {
+func (s *Service) recordPublishAttempt(ctx context.Context, runID uuid.UUID, branch, ref, tip string, attestedSource pgtype.Text) (uuid.UUID, error) {
 	if !s.supersessionWired() {
 		return uuid.Nil, nil
 	}
 	return s.q.RecordCheckpointPublishAttempt(ctx, store.RecordCheckpointPublishAttemptParams{
-		RunID: runID, Branch: branch, Ref: ref, Tip: tip,
+		RunID: runID, Branch: branch, Ref: ref, Tip: tip, AttestedSource: attestedSource,
 	})
 }
 
@@ -571,8 +574,9 @@ func (s *Service) reRecordPublishedTip(ctx context.Context, a store.CheckpointPu
 	if terr != nil {
 		return "", false, fmt.Errorf("track reconciled publish: %w", terr)
 	}
+	// Issue #3194: the attestation is this attempt row's own frozen value, never the run's.
 	n, perr := q.SetRunCheckpointTipIf(ctx, store.SetRunCheckpointTipIfParams{
-		CheckpointTip: a.Tip, ID: a.RunID, ExpectedTip: expectedRunTip,
+		CheckpointTip: a.Tip, ID: a.RunID, ExpectedTip: expectedRunTip, AttestedSource: a.AttestedSource,
 	})
 	if perr != nil {
 		return "", false, fmt.Errorf("persist reconciled tip: %w", perr)

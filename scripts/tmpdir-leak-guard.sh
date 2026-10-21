@@ -42,10 +42,18 @@ if [ "$#" -eq 0 ]; then
   exit 2
 fi
 
-# Normalize slash spelling without resolving symlinks (notably /var on macOS).
-# Parameter expansion cannot silently fail into an empty base as an external pipeline
-# could. The added slash makes the join root-safe; only an all-slash input becomes empty.
-temp_base="${TMPDIR:-/tmp}/"
+# Resolve the base to its physical path (macOS's /var is a symlink to /private/var):
+# the agent's recovery maintenance refuses any symlinked path component, so a symlinked
+# TMPDIR made those tests fail on macOS only (#1912). A missing or unreadable TMPDIR
+# fails closed rather than falling back somewhere else. Then normalize the slash
+# spelling; parameter expansion cannot silently fail into an empty base as an external
+# pipeline could, and the added slash makes the join root-safe (only an all-slash input
+# becomes empty).
+temp_base="$(cd "${TMPDIR:-/tmp}" 2>/dev/null && pwd -P)" || {
+  echo "tmpdir-leak-guard: cannot resolve TMPDIR '${TMPDIR:-/tmp}'" >&2
+  exit 2
+}
+temp_base="$temp_base/"
 while :; do
   case "$temp_base" in
     *//*) temp_base="${temp_base%%//*}/${temp_base#*//}" ;;

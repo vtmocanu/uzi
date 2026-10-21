@@ -89,6 +89,12 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	case "paused":
+		// issue #3194: a base-attestation hold is owner-resolved by recovery, export or a
+		// successor, never by running this run again (ResumePausedRun refuses it too).
+		if workersvc.IsBaseAttestationHeld(run) {
+			httpx.Error(w, http.StatusConflict, workersvc.ErrBaseAttestationHeld.Error())
+			return
+		}
 		// PRD #1497 M1 (D6): a completion hold resumes ONLY through its own decision endpoint, never
 		// this generic resume — 409 naming it (today this would silently resume the hold).
 		if run.HoldReason.Valid && run.HoldReason.String == "completion_blocked" {

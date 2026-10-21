@@ -156,6 +156,12 @@ func (f *forgejo) ListPipelineJobs(ctx context.Context, projectID, pipelineID in
 	})
 }
 
+// ListPipelineJobAttempts reports ErrJobAttemptsUnsupported: the Actions jobs
+// endpoint has no attempt filter, so complete attempt history is unavailable.
+func (f *forgejo) ListPipelineJobAttempts(context.Context, int64, int64) ([]Job, error) {
+	return nil, ErrJobAttemptsUnsupported
+}
+
 // JobLogTail returns at most maxBytes from the END of a job's log (a failure's
 // cause concludes its log); maxBytes <= 0 returns the whole log. The log lives at
 // /actions/jobs/{job_id}/logs (text/plain, no redirect). We bypass the gitea SDK's
@@ -228,7 +234,7 @@ func toForgejoPipeline(r *gitea.ActionWorkflowRun) Pipeline {
 // and no per-step breakdown, so Steps stays nil. StartedAt/CompletedAt come from the
 // job's timestamps (PRD #1255); a zero time (not yet started/finished) stays zero.
 func toForgejoJob(j *gitea.ActionWorkflowJob) Job {
-	return Job{
+	job := Job{
 		ID:         j.ID,
 		Name:       j.Name,
 		Stage:      "",
@@ -236,5 +242,13 @@ func toForgejoJob(j *gitea.ActionWorkflowJob) Job {
 		WebURL:     j.HTMLURL,
 		StartedAt:  j.StartedAt,
 		FinishedAt: j.CompletedAt,
+		CreatedAt:  j.CreatedAt,
 	}
+	// run_attempt is a plain int64 in the SDK, so an absent field decodes as 0;
+	// attempts are 1-based, so only a positive value is a reported attempt.
+	if j.RunAttempt > 0 {
+		n := j.RunAttempt
+		job.Attempt = &n
+	}
+	return job
 }

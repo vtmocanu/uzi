@@ -36,6 +36,9 @@
 # sub-second band: it builds a multi-commit repo). Watch it fail on the
 # unmodified scripts before M1 lands.
 set -uo pipefail
+# Fixture repos must not read host git config: a global core.fsmonitor=true
+# leaves a detached fsmonitor daemon per repo on macOS.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 
 SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)"
 TMPDIR="$(cd "$SCRIPTS_DIR/.." && pwd)/.uzi/scratch"

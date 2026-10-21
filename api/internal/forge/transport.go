@@ -21,7 +21,8 @@ func forgeTransport() http.RoundTripper {
 	return forgeHTTPTransport
 }
 
-// forgeHTTP1Transport carries budgeted CI discovery requests. Over HTTP/2,
+// forgeHTTP1Transport carries budgeted CI discovery requests and response-limited
+// requests (withResponseLimit). Over HTTP/2,
 // DATA-frame padding and empty DATA frames never reach the response body, so
 // the compressed-byte counter in ciCompressedReader would not see them. HTTP/1.1
 // delivers every transfer-decoded body byte through the body reader; its framing
@@ -47,8 +48,10 @@ func newHTTP1Transport(base *http.Transport) *http.Transport {
 }
 
 // ciRouteTransport is the bottom-most transport of timeoutClient: requests
-// marked for budgeted CI discovery (isCIJSON) use HTTP/1.1 only, everything else
-// uses the shared pool unchanged. Both package vars are read at call time; a
+// marked for budgeted CI discovery (isCIJSON) or for a response-size limit
+// (responseLimitFrom) use HTTP/1.1 only, for the same reason: over HTTP/2 empty
+// and padding DATA frames never reach the body reader, so a byte counter cannot
+// bound the wire. Everything else uses the shared pool unchanged. Both package vars are read at call time; a
 // test must swap both forgeHTTPTransport and forgeHTTP1Transport to redirect
 // budgeted traffic, because the HTTP/1.1 pool is cloned once at init.
 type ciRouteTransport struct {
@@ -56,7 +59,7 @@ type ciRouteTransport struct {
 }
 
 func (r *ciRouteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if isCIJSON(req.Context()) {
+	if isCIJSON(req.Context()) || responseLimitFrom(req.Context()) != nil {
 		return r.ciJSON().RoundTrip(req)
 	}
 	return r.general().RoundTrip(req)

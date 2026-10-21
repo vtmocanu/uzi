@@ -197,6 +197,19 @@ func rateBarParts(pct, width int) (filled, empty string) {
 // would need a knownInstructions entry (TestPrintedInstructionsAreRegistered) it cannot
 // earn, since a lipgloss Render site classifies as neither an emitter nor a cobra field.
 func (m tuiModel) boardEmptyState() string {
+	// A `/` filter that matches nothing hid the runs; it is not an empty board (#3209). The
+	// filter text is not echoed, so no untrusted text reaches this line.
+	if strings.TrimSpace(m.board.filter) != "" {
+		// Under [h] the filter may match only folded finished runs; say so rather than "no match".
+		if m.board.hideDone && !m.board.admin {
+			unfolded := m.board
+			unfolded.hideDone = false
+			if len(unfolded.visible()) > 0 {
+				return m.pal.faint.Render(" No active runs match the filter; finished matches are folded (h to show).") + "\n"
+			}
+		}
+		return m.pal.faint.Render(" No runs match the filter.") + "\n"
+	}
 	// Distinguish an empty board from one the [h] toggle has emptied by hiding finished runs,
 	// so the view does not read as "no runs" when it is really "no active runs".
 	if m.board.hideDone && strings.TrimSpace(m.board.filter) == "" {

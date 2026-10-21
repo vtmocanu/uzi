@@ -115,6 +115,11 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 				_, _ = fmt.Fprintf(env.Stderr,
 					"run %s: held, a credential it needs is disabled; %s\n", runID, credentialDisabledAction(run))
 			}
+			// issue #3194: a base-attestation hold never moves by itself; the default wait
+			// stops on it below, and the line names the recovery verbs.
+			if isBaseAttestationHold(run) {
+				_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", cellText(runID), pausedHoldNotice(run))
+			}
 		} else if run.Status == statusPaused && hold != lastHold {
 			// A move between holds keeps the status at paused, so the status line above
 			// never fires: the credential_disabled promoter settles a held run straight into
@@ -134,7 +139,7 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 				runID, cellText(run.Status))
 		}
 
-		if targets[run.Status] || (defaultUntil && isOwnerRequiredWorkerHold(run)) {
+		if targets[run.Status] || (defaultUntil && (isOwnerRequiredWorkerHold(run) || isBaseAttestationHold(run))) {
 			// PRD #603: `--min-plan-seq N` (N >= 0) gates ONLY the awaiting_approval
 			// stop so a wait after `run revise` returns on the REVISED plan, not the
 			// stale gate left by the pre-revise plan. Every other target — terminals,
@@ -232,7 +237,9 @@ func newRunWaitCmd(env Env, gf *globalFlags) *cobra.Command {
 		Short: "Block until a run reaches a chosen state",
 		Long: "Poll a run until its status enters the `--until` set, then exit 0 (PRD #264).\n\n" +
 			"With no `--until`, it stops on any state that needs you or ends the run: " +
-			strings.Join(defaultWaitStates, ", ") + ", or worker recovery exhausted / worker memory pressure (recovery_wait; owner Resume or Cancel). " +
+			strings.Join(defaultWaitStates, ", ") + ", or worker recovery exhausted / worker memory pressure (recovery_wait; owner Resume or Cancel), " +
+			"or a --require-base run held because its kept work is not attested against the planned base (paused, " +
+			"base_attestation_missing; recover its kept work with the run recovery or run export commands). " +
 			"Explicit --until uses only the named statuses. Ordinary transient recovery_wait keeps polling. It does NOT stop " +
 			"on queued/claimed/running (still working), limit_wait (auto-resumes), pool_wait " +
 			"(an auto run held on an empty token pool; resumes when a token is pooled), or paused " +

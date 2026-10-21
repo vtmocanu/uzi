@@ -34,6 +34,9 @@
 #   R3. ...including a deleted line that starts with `-- `, whose diff line `--- ...` must not
 #      be mistaken for a file header.
 set -eu
+# Fixture repos must not read host git config: a global core.fsmonitor=true
+# leaves a detached fsmonitor daemon per repo on macOS.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 export NET_RETRY_BASE_SLEEP=0
 case "${1:-}" in
   "") FRAGMENTS_ONLY=0;;

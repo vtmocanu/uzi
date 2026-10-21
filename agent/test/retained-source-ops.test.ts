@@ -20,6 +20,13 @@ import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { noProofReseed, nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
 import { fixtureFetchTracking } from "./runner-tracking-fixture.js";
 
+// Retained-source coverage and discard run behind the Linux-only quiescence proofs (src/run-quiescence.ts,
+// src/runner.ts "non_linux_host" refusal), so a source is never covered / a discard never proceeds on macOS (#1912).
+// Linux runs every assertion.
+const LINUX_ONLY = process.platform !== "linux"
+  ? "needs the Linux-only run-quiescence / stopped-source proof (src/run-quiescence.ts, src/runner.ts refuse off Linux)"
+  : false;
+
 // issue #1786 M0a — the GitCache seam of the stopped-source retention and the explicit operator
 // reclaim path: retainStoppedAttempt, markStoppedCanonical, verifyStoppedSourceCovered, inspect and
 // the plain/protected discard, all against a REAL GitCache and real Git.
@@ -596,14 +603,14 @@ describe("verifyStoppedSourceCovered", () => {
   const verify = (a: Attempt, head: string | undefined, quiesce: (p: string[], phase: "before" | "after") => Promise<boolean> = quiet, generation = 1) =>
     git.verifyStoppedSourceCovered(bare, a.branch, a.key, { runId: a.runId, clonePath: a.path, attemptId: a.attemptId }, head, { runId: a.runId, generation }, quiesce);
 
-  it("is covered for an unchanged, anchored source, and asks for quiescence before and after", async () => {
+  it("is covered for an unchanged, anchored source, and asks for quiescence before and after", { skip: LINUX_ONLY }, async () => {
     const { a, head } = await captured();
     const calls: Array<[string[], string]> = [];
     assert.equal(await verify(a, head, async (p, phase) => { calls.push([p, phase]); return true; }), "covered");
     assert.deepEqual(calls, [[[a.path], "before"], [[a.path], "after"]]);
   });
 
-  it("leaves the clone's .git/index bytes unchanged when a tracked file's mtime moved", async () => {
+  it("leaves the clone's .git/index bytes unchanged when a tracked file's mtime moved", { skip: LINUX_ONLY }, async () => {
     const { a, head } = await captured();
     const when = new Date(Date.now() + 5000);
     fs.utimesSync(path.join(a.path, "work.txt"), when, when);
@@ -662,7 +669,7 @@ describe("verifyStoppedSourceCovered", () => {
       }
     });
 
-    it("an uninitialized submodule (an empty directory at the gitlink) stays covered when the rest holds", async () => {
+    it("an uninitialized submodule (an empty directory at the gitlink) stays covered when the rest holds", { skip: LINUX_ONLY }, async () => {
       const a = await seedAttempt("run-su", 1);
       fs.writeFileSync(path.join(a.path, ".gitmodules"), '[submodule "sub"]\n\tpath = sub\n\turl = ./nowhere\n');
       gitIn(a.path, ["update-index", "--add", "--cacheinfo", `160000,${gitIn(a.path, ["rev-parse", "HEAD"])},sub`]);
@@ -677,7 +684,7 @@ describe("verifyStoppedSourceCovered", () => {
     });
   });
 
-  it("is covered through an owed pin alone when the shared tracking ref has moved on", async () => {
+  it("is covered through an owed pin alone when the shared tracking ref has moved on", { skip: LINUX_ONLY }, async () => {
     const { a, head } = await captured();
     const other = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);
     gitIn(bare, ["update-ref", `refs/uzi-runner/${a.branch}`, other]);
@@ -691,7 +698,7 @@ describe("verifyStoppedSourceCovered", () => {
     assert.equal(await verify(a, head), "not_covered");
   });
 
-  it("is not covered when tracking ownership no longer names the run and no pin anchors the head", async () => {
+  it("is not covered when tracking ownership no longer names the run and no pin anchors the head", { skip: LINUX_ONLY }, async () => {
     const { a, head } = await captured();
     assert.equal(await verify(a, head, quiet, 2), "covered", "the pin still anchors a different generation's claim");
     const ownerKey = `uzi-trackowner.${a.branch}.owner`;
@@ -700,14 +707,14 @@ describe("verifyStoppedSourceCovered", () => {
     assert.equal(await verify(a, head), "not_covered");
   });
 
-  it("is not covered once the generation differs from the committed ownership and no pin remains", async () => {
+  it("is not covered once the generation differs from the committed ownership and no pin remains", { skip: LINUX_ONLY }, async () => {
     const { a, head } = await captured();
     gitIn(bare, ["update-ref", "-d", `refs/uzi-owed/${a.runId}/${head}`]);
     assert.equal(await verify(a, head, quiet, 1), "covered");
     assert.equal(await verify(a, head, quiet, 2), "not_covered");
   });
 
-  it("is not covered when HEAD moved, a tracked file is dirty or an untracked file appeared", async () => {
+  it("is not covered when HEAD moved, a tracked file is dirty or an untracked file appeared", { skip: LINUX_ONLY }, async () => {
     const { a, head } = await captured();
     fs.writeFileSync(path.join(a.path, "untracked.txt"), "new\n");
     assert.equal(await verify(a, head), "not_covered", "new untracked file");
@@ -723,7 +730,7 @@ describe("verifyStoppedSourceCovered", () => {
     assert.equal(await verify(a, head), "not_covered", "HEAD moved past the captured head");
   });
 
-  it("is not covered while a local branch holds a commit the captured head does not, and covered again once it is reachable", async () => {
+  it("is not covered while a local branch holds a commit the captured head does not, and covered again once it is reachable", { skip: LINUX_ONLY }, async () => {
     const { a, head } = await captured();
     gitIn(a.path, ["checkout", "-q", "-b", "side"]);
     fs.writeFileSync(path.join(a.path, "side.txt"), "only on a side branch\n");
@@ -737,7 +744,7 @@ describe("verifyStoppedSourceCovered", () => {
     assert.equal(await verify(a, head), "covered", "a branch at the captured head itself loses nothing");
   });
 
-  it("is not covered while a tag or a stash entry holds worker-only source", async () => {
+  it("is not covered while a tag or a stash entry holds worker-only source", { skip: LINUX_ONLY }, async () => {
     const { a, head } = await captured();
     fs.appendFileSync(path.join(a.path, "work.txt"), "stashed bytes\n");
     gitIn(a.path, ["-c", "user.email=t@t", "-c", "user.name=t", "stash", "push"]);
@@ -768,7 +775,7 @@ describe("verifyStoppedSourceCovered", () => {
     return sha;
   }
 
-  it("is covered when the clone's local default branch sits ahead of an older resumed head and the bare holds it (seed shape)", async () => {
+  it("is covered when the clone's local default branch sits ahead of an older resumed head and the bare holds it (seed shape)", { skip: LINUX_ONLY }, async () => {
     const { a, head } = await captured();
     const ahead = commitOffBranch(a, head, "refs/heads/main", "ahead.txt");
     gitIn(bare, ["fetch", "-q", "--", a.path, "refs/heads/main:refs/remotes/origin/ahead"]);
@@ -777,7 +784,7 @@ describe("verifyStoppedSourceCovered", () => {
     assert.equal(await verify(a, head), "covered", "a local ref the bare already holds loses nothing");
   });
 
-  it("is covered when an off-branch tag exists in both the clone and the bare", async () => {
+  it("is covered when an off-branch tag exists in both the clone and the bare", { skip: LINUX_ONLY }, async () => {
     const { a, head } = await captured();
     commitOffBranch(a, head, "refs/tags/release", "release.txt");
     gitIn(bare, ["fetch", "-q", "--", a.path, "refs/tags/release:refs/tags/release"]);
@@ -829,7 +836,7 @@ describe("verifyStoppedSourceCovered", () => {
     assert.equal(await verify(a, head), "not_covered");
   });
 
-  it("is not covered for a missing or replaced path, a blocked or throwing proof, or a degraded capture", async () => {
+  it("is not covered for a missing or replaced path, a blocked or throwing proof, or a degraded capture", { skip: LINUX_ONLY }, async () => {
     const { a, head } = await captured();
     assert.equal(await verify(a, head, async () => false), "not_covered", "blocked proof before");
     let n = 0;
@@ -2006,7 +2013,7 @@ describe("rework: coverage proof does not trust the clone's git config or index 
   const verify = (a: Attempt, head: string) =>
     git.verifyStoppedSourceCovered(bare, a.branch, a.key, { runId: a.runId, clonePath: a.path, attemptId: a.attemptId }, head, { runId: a.runId, generation: 1 }, quiet);
 
-  it("an untracked file is not covered even when the clone config hides untracked files", async () => {
+  it("an untracked file is not covered even when the clone config hides untracked files", { skip: LINUX_ONLY }, async () => {
     const { a, head } = await captured();
     gitIn(a.path, ["config", "status.showUntrackedFiles", "no"]);
     assert.equal(await verify(a, head), "covered");
@@ -2015,7 +2022,7 @@ describe("rework: coverage proof does not trust the clone's git config or index 
     assert.equal(await verify(a, head), "not_covered");
   });
 
-  it("a dirty tracked file hidden by assume-unchanged or skip-worktree is not covered", async () => {
+  it("a dirty tracked file hidden by assume-unchanged or skip-worktree is not covered", { skip: LINUX_ONLY }, async () => {
     const { a, head } = await captured();
     gitIn(a.path, ["update-index", "--assume-unchanged", "work.txt"]);
     fs.appendFileSync(path.join(a.path, "work.txt"), "unpreserved\n");
@@ -2028,7 +2035,7 @@ describe("rework: coverage proof does not trust the clone's git config or index 
     assert.equal(await verify(a, head), "not_covered", "skip-worktree");
   });
 
-  it("a clone config that moves the excludes file or the worktree root is not covered", async () => {
+  it("a clone config that moves the excludes file or the worktree root is not covered", { skip: LINUX_ONLY }, async () => {
     const { a, head } = await captured();
     const ignores = path.join(a.path, "..", "evil-excludes");
     fs.writeFileSync(ignores, "hidden.txt\n");
@@ -2047,7 +2054,7 @@ describe("rework: coverage proof does not trust the clone's git config or index 
     assert.equal(await verify(a, head), "not_covered", "core.worktree");
   });
 
-  it("core.ignorecase=true in the clone config cannot hide an untracked README behind a tracked readme", async () => {
+  it("core.ignorecase=true in the clone config cannot hide an untracked README behind a tracked readme", { skip: LINUX_ONLY }, async () => {
     const a = await seedAttempt("run-ic", 1);
     fs.writeFileSync(path.join(a.path, "readme"), "captured\n");
     gitIn(a.path, ["add", "readme"]);
@@ -2061,7 +2068,7 @@ describe("rework: coverage proof does not trust the clone's git config or index 
     assert.equal(await verify(a, head), "not_covered");
   });
 
-  it("a clone claiming core.ignorecase in any form git reads as true is not covered even when clean", async () => {
+  it("a clone claiming core.ignorecase in any form git reads as true is not covered even when clean", { skip: LINUX_ONLY }, async () => {
     // A clean tree: only the refusal (not the status override) can turn these away.
     const { a, head } = await captured();
     assert.equal(await verify(a, head), "covered");
@@ -2076,7 +2083,7 @@ describe("rework: coverage proof does not trust the clone's git config or index 
     assert.equal(await verify(a, head), "covered", "false is not a claim");
   });
 
-  it("a clone with a filter driver configured or an info/attributes file is not covered", async () => {
+  it("a clone with a filter driver configured or an info/attributes file is not covered", { skip: LINUX_ONLY }, async () => {
     const { a, head } = await captured();
     gitIn(a.path, ["config", "filter.lfsish.clean", "cat"]);
     assert.equal(await verify(a, head), "not_covered", "filter config");
@@ -2087,7 +2094,7 @@ describe("rework: coverage proof does not trust the clone's git config or index 
     assert.equal(await verify(a, head), "not_covered", "info/attributes");
   });
 
-  it("a filter driver reached through include.path, config.worktree or core.attributesFile is not covered", async () => {
+  it("a filter driver reached through include.path, config.worktree or core.attributesFile is not covered", { skip: LINUX_ONLY }, async () => {
     const { a, head } = await captured();
     const orig = path.join(path.dirname(a.path), "orig-work.txt");
     fs.writeFileSync(orig, "captured\n");

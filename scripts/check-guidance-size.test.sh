@@ -3,6 +3,9 @@
 # git repo and proves the exit code (0 clean, 1 findings, 2 broken instrument) plus a key
 # substring of the output, so a gutted check cannot read green.
 set -eu
+# Fixture repos must not read host git config: a global core.fsmonitor=true
+# leaves a detached fsmonitor daemon per repo on macOS.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 
 ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 SUT="$ROOT/scripts/check-guidance-size.sh"

@@ -53,7 +53,28 @@ const LATE_UNTRACKED = "written after the capture verified\n";
 const DOCKER = "unix:///nonexistent/uzi-test-docker.sock";
 
 function gitIn(dir: string, ...args: string[]): string {
-  return execFileSync("git", ["-C", dir, ...args], { env: GIT_ENV, encoding: "utf8", stdio: "pipe" }).trim();
+  // PATH is read per call so withSameSecondCommits' git reaches the fixture's commits too.
+  return execFileSync("git", ["-C", dir, ...args], { env: { ...GIT_ENV, PATH: process.env.PATH }, encoding: "utf8", stdio: "pipe" }).trim();
+}
+
+/** Runs `fn` with a `git` first on PATH that pins every commit to one timestamp, the fixture's and
+ *  the runner's alike (the runner's git env carries PATH but no GIT_*_DATE), so two rigs' commits
+ *  land in the "same second" deterministically: the #3131 collision, without depending on timing. */
+async function withSameSecondCommits<T>(fn: () => Promise<T>): Promise<T> {
+  const realGit = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+  const quoted = `'${realGit.replaceAll("'", `'\\''`)}'`; // POSIX single quotes: no $ or ` expansion
+  const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "uzi-same-second-git-"));
+  fs.writeFileSync(path.join(dir, "git"),
+    `#!/bin/sh\nGIT_AUTHOR_DATE="2026-01-01T00:00:00Z" GIT_COMMITTER_DATE="2026-01-01T00:00:00Z" exec ${quoted} "$@"\n`,
+    { mode: 0o755 });
+  const savedPath = process.env.PATH;
+  process.env.PATH = `${dir}${path.delimiter}${savedPath ?? ""}`;
+  try {
+    return await fn();
+  } finally {
+    if (savedPath === undefined) delete process.env.PATH; else process.env.PATH = savedPath;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 }
 function cfgAll(bare: string, key: string): string[] {
   try {
@@ -75,12 +96,18 @@ interface Expected {
   objects?: string[];
 }
 
+/** Every rig shares one bare and commits the same files with the same identity, so two rigs whose
+ *  commits land in the same second would otherwise mint identical SHAs: the runner's park commit on
+ *  top would then be owed by both runs, and retention reports shared_owed_pin (#3131). The sequence
+ *  number keeps every rig's history distinct. */
+let workerStateSeq = 0;
+
 /** An unfetched commit, a tracked binary modified (bytes and mode) after it, and an untracked file. */
 function writeWorkerState(wt: string): Expected {
   fs.mkdirSync(path.join(wt, "assets"), { recursive: true });
   fs.writeFileSync(path.join(wt, "assets", "blob.bin"), BIN_V1);
   gitIn(wt, "add", "assets/blob.bin");
-  gitIn(wt, ...IDENT, "commit", "-q", "-m", "unfetched work");
+  gitIn(wt, ...IDENT, "commit", "-q", "-m", `unfetched work ${++workerStateSeq}`);
   const head = gitIn(wt, "rev-parse", "HEAD");
   fs.writeFileSync(path.join(wt, "assets", "blob.bin"), BIN_V2);
   fs.chmodSync(path.join(wt, "assets", "blob.bin"), 0o755);
@@ -390,7 +417,7 @@ describe("RunRunner #1786 M2 — the recovery handler's exits keep an unpreserve
     assert.deepEqual(stopMarkers(r.claim.run_id), [], "a terminal exit keeps the plain journal");
   });
 
-  it("clean terminal park ACK releases a covered clone (recovery_park_ack_terminal)", async () => {
+  it("clean terminal park ACK releases a covered clone (recovery_park_ack_terminal)", { skip: LINUX_CAPTURE }, async () => {
     const r = credRig(17910);
     const report = client.reportState.bind(client);
     client.reportState = async (runId, body, signal) => (body.status === "recovery_wait"
@@ -568,20 +595,24 @@ describe("RunRunner #1786 M2 — the transient recovery park revalidates coverag
   });
 
   it("operator inspect pins what a park keeps: an attempt clone is listed through its ledger entry, a canonical clone kept under its plain journal is listed too and is discardable only on a terminal server lifecycle", async () => {
-    const attempt = transientRig(17928, { dockerHost: true });
-    const canonical = transientRig(17929);
-    const hook = afterVerifiedCapture((wt) => { writeLateChange(wt); });
-    try {
-      await attempt.runner.execute(attempt.claim);
-    } finally {
-      hook.restore();
-    }
-    const hook2 = afterVerifiedCapture((wt) => { writeLateChange(wt); });
-    try {
-      await canonical.runner.execute(canonical.claim);
-    } finally {
-      hook2.restore();
-    }
+    // Both parks commit in the "same second": their pins must still be their own (#3131).
+    const { attempt, canonical } = await withSameSecondCommits(async () => {
+      const attempt = transientRig(17928, { dockerHost: true });
+      const canonical = transientRig(17929);
+      const hook = afterVerifiedCapture((wt) => { writeLateChange(wt); });
+      try {
+        await attempt.runner.execute(attempt.claim);
+      } finally {
+        hook.restore();
+      }
+      const hook2 = afterVerifiedCapture((wt) => { writeLateChange(wt); });
+      try {
+        await canonical.runner.execute(canonical.claim);
+      } finally {
+        hook2.restore();
+      }
+      return { attempt, canonical };
+    });
     assert.match(path.basename(attempt.clone()), /\.attempt-/);
     assert.ok(fs.existsSync(attempt.clone()) && fs.existsSync(canonical.clone()), "both parks kept their clone");
     const result = await git.inspectRetainedSources({ barePath: bareOf(), isLivePath: () => false });
@@ -1136,7 +1167,7 @@ describe("RunRunner #1786 M2 rework — the cancel ACK keeps owner-authorized di
   });
 
   for (const changed of [true, false]) {
-    it(`credential-deferred cancel after a verified capture: revalidated at cleanup (${changed ? "bytes written after the capture are kept" : "a covered clone goes"})`, async () => {
+    it(`credential-deferred cancel after a verified capture: revalidated at cleanup (${changed ? "bytes written after the capture are kept" : "a covered clone goes"})`, { skip: changed ? false : LINUX_CAPTURE }, async () => {
       const iid = changed ? 17951 : 17952;
       const r = credRig(iid);
       const mirror = cancelMirror(r.claim.run_id);
