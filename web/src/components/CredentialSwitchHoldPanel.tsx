@@ -89,7 +89,7 @@ export function CredentialSwitchHoldPanel({ run, ownerProof, busy, refusal, onRe
             <Button size="sm" variant="danger" disabled={busy} onClick={onCancel}>Cancel run</Button>
             {settling && (
               <p id={`${reasonId}-why`} className="text-xs text-muted">
-                Resume becomes available when the worker finishes; if it is refused, try again shortly or Cancel.
+                Resume may be refused until the worker finishes its own operations; then try again, or Cancel the run.
               </p>
             )}
           </div>

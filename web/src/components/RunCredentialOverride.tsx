@@ -241,7 +241,7 @@ export function SwitchTokenAction({
           )}
           {switchHold === "settling" && (
             <p className="text-[11px] text-muted">
-              Switching becomes available when the worker finishes its own operations for this run; if it is refused, try again shortly or Cancel.
+              Switching may be refused until the worker finishes its own operations; then try again, or cancel the run.
             </p>
           )}
           {willInterrupt && (

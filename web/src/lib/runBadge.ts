@@ -598,7 +598,7 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
     // because the worker was lost, not because it finished.
     case "credential_switch_settling":
       return { kind: "badge", label: PARK_LABELS.credential_switch_settling, tone: "warning", pulse: false,
-        title: "After a token switch, the worker is finishing its own operations for this run. Resume becomes available when the worker finishes; if it is refused, try again shortly or Cancel." };
+        title: "After a token switch, the worker is finishing its own operations for this run. Resume may be refused until the worker finishes its own operations; then try again, or Cancel the run." };
     case "credential_switch_unsettled":
       return { kind: "badge", label: PARK_LABELS.credential_switch_unsettled, tone: "warning", pulse: false,
         title: "Processes could not be proven stopped; work is kept on its worker. Open the run to Resume on the new token, or Cancel." };

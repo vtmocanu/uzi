@@ -147,7 +147,7 @@ const credentialSwitched = new Set<string>();
 
 // Issue #3181: the server's ErrRunHoldSettling text, verbatim (api/internal/workersvc/credential_switch.go).
 const CREDENTIAL_SWITCH_SETTLING_REFUSAL =
-  "the worker is still stopping this run's processes; Resume becomes available when it finishes, or Cancel the run";
+  "the worker is still finishing its own operations for this run; try Resume again shortly, or Cancel the run";
 
 // One applied epoch, so the history list renders with a token label + reason + time.
 const appliedEpochs = (): CredentialEpoch[] => [

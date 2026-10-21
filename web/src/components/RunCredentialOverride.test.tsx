@@ -322,14 +322,16 @@ describe("SwitchTokenAction — seeds an EXISTING pinned override via the self-f
 // inline as an alert. An unsettled hold's switch requeues the held run, so it must not promise
 // an interrupt of live work.
 describe("SwitchTokenAction — credential-switch holds", () => {
-  const REFUSAL = "the worker is still stopping this run's processes; Resume becomes available when it finishes, or Cancel the run";
+  const REFUSAL = "the worker is still finishing its own operations for this run; try Resume again shortly, or Cancel the run";
 
   it("settling: the switch stays offered with a note, and a 409 refusal is announced inline", async () => {
     mockApi.setRunCredential.mockRejectedValue(new ApiError(409, REFUSAL));
     const onSwitched = vi.fn();
     render(<SwitchTokenAction run={run({ status: "paused", hold_reason: "credential_switch_settling" })} canSteer tokens={[token()]} onSwitched={onSwitched} />);
     fireEvent.click(screen.getByRole("button", { name: "Switch token" }));
-    expect(screen.getByText(/Switching becomes available when the worker finishes its own operations for this run; if it is refused, try again shortly or Cancel\./)).toBeTruthy();
+    expect(screen.getByText("Switching may be refused until the worker finishes its own operations; then try again, or cancel the run.")).toBeTruthy();
+    // The switch is enabled, so nothing says it only "becomes available" later.
+    expect(document.body.textContent).not.toMatch(/becomes available/);
     // Nothing is running to interrupt from the owner's point of view; no interrupt promise.
     expect(screen.queryByText(/Switching now interrupts the run/)).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Switch to this token" }));

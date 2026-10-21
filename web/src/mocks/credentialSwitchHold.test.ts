@@ -8,7 +8,7 @@ import { ApiError } from "../lib/apiError";
 
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
 
-const REFUSAL = "the worker is still stopping this run's processes; Resume becomes available when it finishes, or Cancel the run";
+const REFUSAL = "the worker is still finishing its own operations for this run; try Resume again shortly, or Cancel the run";
 
 async function settle<T>(p: Promise<T>): Promise<T> {
   await vi.advanceTimersByTimeAsync(1000);

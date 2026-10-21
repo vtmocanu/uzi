@@ -40,7 +40,7 @@ it("provider hold badge uses projection hold reason without a retry promise", ()
   expect(badge.kind === "badge" && badge.title).toContain("waits for its owner");
 });
 it.each([
-  ["credential_switch_settling", "settling", "settling: token switch", /finishing its own operations for this run\. Resume becomes available when the worker finishes; if it is refused, try again shortly or Cancel\./],
+  ["credential_switch_settling", "settling", "settling: token switch", /finishing its own operations for this run\. Resume may be refused until the worker finishes its own operations; then try again, or Cancel the run\./],
   ["credential_switch_unsettled", "unsettled", "held: token switch", /could not be proven stopped/],
 ] as const)("issue #3181 token-switch hold %s renders as its own owner-attention park", (hold, kind, label, title) => {
   const r = run({ status: "paused", hold_reason: hold });

@@ -1798,6 +1798,11 @@ export function RunView() {
   // run that earned it. The panel shows it only while that run is still settling.
   const [switchRefusal, setSwitchRefusal] = useState<{ runId: string; message: string } | null>(null);
   useEffect(() => { setSwitchRefusal(null); }, [id]);
+  // Any move of the hold (to unsettled, a resume, a cancel, or a later fresh settling hold)
+  // retires the stored refusal: it answered one Resume on one settling hold, and must not
+  // reappear beside a later one. A refetch that leaves the run settling keeps it.
+  const switchHoldKey = run ? `${run.status}|${run.hold_reason ?? ""}` : "";
+  useEffect(() => { setSwitchRefusal(null); }, [switchHoldKey]);
   const [busy, setBusy] = useState(false);
   const currentAction = useRef<{ runId: string } | null>(null);
   useEffect(() => {
@@ -2166,7 +2171,7 @@ export function RunView() {
             : parkKey === "provider_unavailable"
               ? "Provider unavailable. Automatic retries have stopped; the run waits for its owner."
             : parkKey === "credential_switch_settling"
-              ? "After a token switch, the worker is finishing its own operations for this run. Resume becomes available when the worker finishes; if it is refused, try again shortly or Cancel."
+              ? "After a token switch, the worker is finishing its own operations for this run. Resume may be refused until the worker finishes its own operations; then try again, or Cancel the run."
             : parkKey === "credential_switch_unsettled"
               ? "Held after a token switch. Processes could not be proven stopped; work is kept on its worker. Resume to continue on the new token, or Cancel."
             : parkKey === "paused"
@@ -2701,14 +2706,17 @@ export function RunView() {
         refusal={switchRefusal?.runId === run.id ? switchRefusal.message : ""}
         onResume={() => act(async (isCurrent) => {
           const requestRunId = run.id;
+          const wasSettling = credentialSwitchHold(run) === "settling";
           setSwitchRefusal(null);
           try {
             await api.resumeRun(requestRunId);
           } catch (e) {
             // Issue #3181: the server refuses Resume on a settling hold (409) while the worker
             // is live and finishing. Word it in the panel beside Resume, not the page banner,
-            // and refetch: the hold may have moved on to unsettled meanwhile.
-            if (!(e instanceof ApiError && e.status === 409)) throw e;
+            // and refetch: the hold may have moved on to unsettled meanwhile. Only a Resume
+            // clicked on a settling hold is that refusal; any other 409 (an unsettled hold that
+            // is no longer paused, say) is ordinary feedback for the page banner.
+            if (!(wasSettling && e instanceof ApiError && e.status === 409)) throw e;
             if (!isCurrent()) return;
             setSwitchRefusal({ runId: requestRunId, message: errorMessage(e, "Resume refused") });
             await refreshRun();
