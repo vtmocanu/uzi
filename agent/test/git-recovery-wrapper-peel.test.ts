@@ -51,19 +51,29 @@ async function wipMarker(dir: string, file: string): Promise<string> {
 function sibling(parent: string, message: string): string {
   return git(bare, [...IDENT, "commit-tree", `${parent}^{tree}`, "-p", parent, "-m", message]);
 }
-function lookalike(marker: string, o: { author?: string; date?: string; fp?: string; pin: boolean }): string {
-  const tree = sha(`${marker}^{tree}`);
-  const real = createHash("sha256").update(JSON.stringify({ roots: [marker], currentSha: marker, tree })).digest("hex");
+function lookalike(marker: string, o: { author?: string; committer?: string; date?: string; fp?: string; tree?: string; pin: boolean }): string {
+  const realTree = sha(`${marker}^{tree}`);
+  const real = createHash("sha256").update(JSON.stringify({ roots: [marker], currentSha: marker, tree: realTree })).digest("hex");
   const fp = o.fp ?? real;
   const date = o.date ?? "2000-01-01T00:00:00Z";
   const author = o.author ?? "uzi-agent";
-  const wrapper = git(bare, ["--no-replace-objects", "-c", "commit.gpgsign=false", "commit-tree", tree, "-p", marker,
+  const committer = o.committer ?? "uzi-agent";
+  const wrapper = git(bare, ["--no-replace-objects", "-c", "commit.gpgsign=false", "commit-tree", o.tree ?? realTree, "-p", marker,
     "-m", `uzi recovery coverage ${fp} round 0 batch 0`], {
-    GIT_AUTHOR_NAME: author, GIT_AUTHOR_EMAIL: "uzi-agent@uzi.local", GIT_COMMITTER_NAME: author,
+    GIT_AUTHOR_NAME: author, GIT_AUTHOR_EMAIL: "uzi-agent@uzi.local", GIT_COMMITTER_NAME: committer,
     GIT_COMMITTER_EMAIL: "uzi-agent@uzi.local", GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date,
   });
   if (o.pin) git(bare, ["update-ref", `refs/uzi-coverage/${runId}/1/${fp}`, wrapper]);
   return wrapper;
+}
+/** A commit whose message is the raw bytes `msg`. It is written with `hash-object --literally` because
+ *  `commit-tree` re-encodes a non-UTF-8 message to UTF-8. */
+function rawCommit(parent: string, msg: Buffer, tree = sha(`${parent}^{tree}`)): string {
+  const who = "t <t@example.test> 946684800 +0000";
+  const body = Buffer.concat([Buffer.from(`tree ${tree}\nparent ${parent}\nauthor ${who}\ncommitter ${who}\n\n`), msg]);
+  return execFileSync("git", ["-C", bare, "hash-object", "-t", "commit", "-w", "--literally", "--stdin"], {
+    input: body, encoding: "utf8", env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
+  }).trim();
 }
 /** Assert a refused successor: nothing written, no clone, source untouched. */
 async function assertRefused(attempts: number, attempt: string): Promise<void> {
@@ -111,7 +121,8 @@ test("issue #3239 (a): a genuine wrapper over a WIP marker adopts the marker's c
 
 for (const [name, opts] of [
   ["no pin", { pin: false }],
-  ["wrong author", { pin: true, author: "mallory" }],
+  ["wrong author only", { pin: true, author: "mallory" }],
+  ["wrong committer only", { pin: true, committer: "mallory" }],
   ["wrong date", { pin: true, date: "2000-01-02T00:00:00Z" }],
   ["wrong fingerprint", { pin: true, fp: createHash("sha256").update("other").digest("hex") }],
 ] as const) {
@@ -188,9 +199,9 @@ test("issue #3239 (f): sibling markers on one parent with no lineage for the fir
   await assertRefused(r.attempts, aid(2));
 });
 
-test("issue #3239 (g): lineage that is not on the producing attempt's own journal is refused", async () => {
+test("issue #3239 (g): a marker leaf absent from the producing attempt's own journal lineage is refused", async () => {
   const { expected, attempts } = await secondEpisode();
-  // The marker is only known to a predecessor, never to the attempt that produced M2.
+  // The producing attempt's journal lost the lineage that names the superseded marker.
   const j = journal();
   delete j.peeledMarkers;
   writeJournal(j);
@@ -218,8 +229,116 @@ test("issue #3239: the journal parser validates peeledMarkers", async () => {
   };
   for (const [name, value] of Object.entries(bad)) {
     writeJournal({ ...stored, peeledMarkers: value });
-    await assert.rejects(cache.reserveRecoveryIteration(bare, branch, key, source), /./, name);
+    await assert.rejects(cache.reserveRecoveryIteration(bare, branch, key, source), /invalid peeled markers/, name);
   }
   writeJournal({ ...stored, peeledMarkers: Array.from({ length: 64 }, (_, i) => i.toString(16).padStart(40, "0")) });
   await cache.reserveRecoveryIteration(bare, branch, key, source);
+});
+
+test("issue #3239 (b2): an aggregate whose own tree differs from the source's is refused even with the matching fingerprint and a pin", async () => {
+  // The fingerprint binds the SOURCE's tree, not the aggregate's own, so only the explicit tree check
+  // can refuse this wrapper: it is pinned, has the right identity, and its fingerprint is the real one.
+  const r = await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const m = await wipMarker(source.clonePath, "work.txt");
+  const empty = git(bare, ["mktree"], {}, "");
+  assert.notEqual(empty, sha(`${m}^{tree}`));
+  const c = lookalike(m, { pin: true, tree: empty });
+  await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, c, m);
+  await assertRefused(r.attempts, aid(2));
+});
+
+for (const [name, msg] of [
+  ["a 70 KB message", Buffer.from(`oversized\n${"x".repeat(70 * 1024)}\n`)],
+  ["a non-UTF-8 byte (0xff)", Buffer.concat([Buffer.from("bad byte "), Buffer.from([0xff]), Buffer.from(" here\n")])],
+  ["an ordinary message", Buffer.from("ordinary clean source\n")],
+] as const) {
+  test(`issue #3239 (h): a clean source with ${name} over a buried non-lineage marker leaf is refused`, async () => {
+    const r = await cache.reserveRecoveryIteration(bare, branch, key, source);
+    const m = await wipMarker(source.clonePath, "work.txt");
+    const clean = rawCommit(sha(`${m}^`), msg);
+    const c = (await genuine([m, clean], clean)).sha;
+    await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, c, clean);
+    await assertRefused(r.attempts, aid(2));
+  });
+}
+
+test("issue #3239 (h2): a coverage commit that cannot be read within bounds is refused even over a clean source", async () => {
+  const r = await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const s0 = sha("HEAD", source.clonePath);
+  const fp = createHash("sha256").update(JSON.stringify({ roots: [s0], currentSha: s0, tree: sha(`${s0}^{tree}`) })).digest("hex");
+  const c = rawCommit(s0, Buffer.from(`uzi recovery coverage ${fp} round 0 batch 0\n\n${"x".repeat(70 * 1024)}\n`));
+  await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, c, s0);
+  await assertRefused(r.attempts, aid(2));
+});
+
+/** A lineage-listed marker leaf `mx` on `parentOf(m)`-or-elsewhere; the wrapper covers [m, mx] over source m. */
+async function leafWithParent(inside: boolean) {
+  const r = await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const m = await wipMarker(source.clonePath, "work.txt");
+  const outside = sibling(sha(`${m}^`), "committed work elsewhere");
+  const mx = sibling(inside ? sha(`${m}^`) : outside, "wip(park): superseded sibling marker");
+  const c = (await genuine([m, mx], m)).sha;
+  await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, c, m);
+  writeJournal({ ...journal(), peeledMarkers: [mx] });
+  return { r, m };
+}
+
+test("issue #3239 (i): a lineage-listed marker leaf whose parent is outside the source's history is refused", async () => {
+  const { r } = await leafWithParent(false);
+  await assertRefused(r.attempts, aid(2));
+});
+
+test("issue #3239 (i2): the same lineage-listed marker leaf with its parent inside the source's history is accepted", async () => {
+  const { r, m } = await leafWithParent(true);
+  const successor = await cache.prepareRecoverySuccessor(bare, branch, key, source, r.attempts, aid(2));
+  assert.equal(sha("HEAD", successor.path), sha(`${m}^`));
+});
+
+test("issue #3239 (j): a tip that is itself a WIP marker journals it as the successor's peeled lineage", async () => {
+  const r = await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const m = await wipMarker(source.clonePath, "work.txt");
+  await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, m, m);
+  const successor = await cache.prepareRecoverySuccessor(bare, branch, key, source, r.attempts, aid(2));
+  assert.equal(sha("HEAD", successor.path), sha(`${m}^`));
+  assert.equal(successor.wipRecovered, true);
+  assert.deepEqual(journal().peeledMarkers, [m]);
+  assert.equal(journal().recovery.stage, "ready-for-model");
+});
+
+test("issue #3239 (k): a plain clean tip journals no peeled markers", async () => {
+  const r = await cache.reserveRecoveryIteration(bare, branch, key, source);
+  fs.writeFileSync(path.join(source.clonePath, "work.txt"), "milestone\n");
+  git(source.clonePath, ["add", "work.txt"]);
+  git(source.clonePath, [...IDENT, "commit", "-m", "milestone"]);
+  await fixtureFetchTracking(cache, bare, source.clonePath, branch, runId);
+  const t = sha("HEAD", source.clonePath);
+  await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, t, t);
+  await cache.prepareRecoverySuccessor(bare, branch, key, source, r.attempts, aid(2));
+  assert.equal(journal().peeledMarkers, undefined);
+});
+
+test("issue #3239: markRecoveryCapture unions and dedups peeled markers, keeps them across a capture, and writes none when none is given", async () => {
+  const a = "a".repeat(40), b = "b".repeat(40);
+  assert.equal(journal().peeledMarkers, undefined, "no marker given: the field is not written");
+  await cache.markRecoveryCapture(bare, source.clonePath, branch, runId, undefined, a);
+  assert.deepEqual(journal().peeledMarkers, [a]);
+  await cache.markRecoveryCapture(bare, source.clonePath, branch, runId, undefined, b);
+  await cache.markRecoveryCapture(bare, source.clonePath, branch, runId, undefined, a);
+  assert.deepEqual([...journal().peeledMarkers].sort(), [a, b], "both markers, duplicates dedup");
+  await cache.markRecoveryCapture(bare, source.clonePath, branch, runId);
+  assert.deepEqual([...journal().peeledMarkers].sort(), [a, b], "a call without a marker leaves the lineage alone");
+  const r = await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const m = await wipMarker(source.clonePath, "work.txt");
+  await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, m, m);
+  assert.deepEqual([...journal().peeledMarkers].sort(), [a, b], "preserved across recordRecoveryCapture");
+  await assert.rejects(cache.markRecoveryCapture(bare, source.clonePath, branch, runId, undefined, "nope"), /invalid peeled marker/);
+});
+
+test("issue #3239 (h3): the non-UTF-8 fixture really is not valid UTF-8 and survives fsck", async () => {
+  const bytes = Buffer.concat([Buffer.from("bad byte "), Buffer.from([0xff]), Buffer.from(" here\n")]);
+  const c = rawCommit(sha("HEAD", source.clonePath), bytes);
+  const body = execFileSync("git", ["-C", bare, "cat-file", "commit", c]);
+  assert.ok(body.includes(0xff), "the raw 0xff byte is stored");
+  assert.notDeepEqual(Buffer.from(body.toString("utf8"), "utf8"), body, "the body does not round-trip through UTF-8");
+  git(bare, ["fsck", "--strict", "--no-dangling"]);
 });

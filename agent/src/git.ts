@@ -6801,21 +6801,29 @@ export class GitCache {
    * the seed's `reset --soft`, so neither marker nor wrapper enters history); any failed proof throws
    * `successor recovery verification failed`, before a ledger entry or clone exists.
    *
+   * Fail closed: once the tip is a coverage commit (or the source is a marker), any inability to verify
+   * refuses: an unreadable tip, more than 8 aggregates, or more than MAX_OWED_CANDIDATES_PER_RUN + 1
+   * leaves. A non-tip commit that {@link readBoundedCommit} cannot read (over 64 KiB, or a body that does
+   * not survive the UTF-8 round trip) is demoted to a leaf and meets the leaf rule, which classifies it
+   * by subject and never needs that read; the source and a marker leaf are read by plumbing for the same
+   * reason.
+   *
    * The caller holds the bare lock: this helper must never take it (the lock is not reentrant), which is
-   * why it reads commits through {@link readBoundedCommit} and not {@link readRecoveryCoverageClaim}.
+   * why it reads aggregates through {@link readBoundedCommit} and not {@link readRecoveryCoverageClaim}.
    */
   private async resolveMarkerWrapperAdoption(
     barePath: string, journal: RecoveryJournalEntry, tip: string, src: string | undefined,
   ): Promise<{ seedTip: string; expectedHead: string; expectedTree: string; peeledMarkers: string[] } | undefined> {
-    const MAX_HEADS = 64, MAX_AGGREGATES = 8, MAX_OBJECT_BYTES = 64 * 1024;
+    // Leaves are the owed roots (at most MAX_OWED_CANDIDATES_PER_RUN) plus the current source.
+    const MAX_LEAVES = MAX_OWED_CANDIDATES_PER_RUN + 1, MAX_AGGREGATES = 8, MAX_OBJECT_BYTES = 64 * 1024;
     const fail = (): never => { throw new Error("successor recovery verification failed"); };
     if (await this.isWipParkMarker(barePath, tip)) return undefined;
     const srcMarker = src !== undefined && await this.isWipParkMarker(barePath, src);
     const subject = await this.tryGitStdout(barePath, ["log", "-1", "--format=%s", `${tip}^{commit}`]);
+    // From here the tip is a coverage commit or the source is a marker. A wrapper whose walk cannot be
+    // completed cannot be shown to bury no marker, so every inability to verify below refuses; only a
+    // non-tip commit that cannot be read within bounds is demoted to a leaf (it then meets the leaf rule).
     if (!subject.startsWith("uzi recovery coverage ") && !srcMarker) return undefined;
-    // A wrapper that cannot be walked cannot be shown to bury a marker. With a clean source that keeps
-    // the pre-#3239 adoption; with a marker source it is refused.
-    const unwalkable = (): undefined => srcMarker ? fail() : undefined;
     const coverageMessage = /^uzi recovery coverage ([0-9a-f]{64}) round (0|[1-9][0-9]*) batch (0|[1-9][0-9]*)\n$/;
     const aggregates: Array<{ fp: string; tree: string; author: string | undefined; committer: string | undefined }> = [];
     const leaves = new Set<string>();
@@ -6825,17 +6833,24 @@ export class GitCache {
       const sha = queue.shift()!;
       if (seen.has(sha)) continue;
       seen.add(sha);
-      if (seen.size > MAX_AGGREGATES + MAX_HEADS) return unwalkable();
+      if (seen.size > MAX_AGGREGATES + MAX_LEAVES) return fail();
       let commit;
-      try { commit = await this.readBoundedCommit(barePath, sha, MAX_OBJECT_BYTES); } catch { return unwalkable(); }
-      if (!commit) return unwalkable();
+      try { commit = await this.readBoundedCommit(barePath, sha, MAX_OBJECT_BYTES); } catch (err) {
+        const abort = this.boundaryAbortError(err);
+        if (abort) throw abort;
+      }
+      if (!commit) {
+        if (sha === tip) return fail();
+        leaves.add(sha);
+        continue;
+      }
       const m = coverageMessage.exec(commit.message);
       if (!m) { leaves.add(sha); continue; }
       aggregates.push({ fp: m[1]!, tree: commit.tree, author: commit.author, committer: commit.committer });
-      if (aggregates.length > MAX_AGGREGATES) return unwalkable();
+      if (aggregates.length > MAX_AGGREGATES) return fail();
       queue.push(...commit.parents);
     }
-    if (leaves.size > MAX_HEADS) return unwalkable();
+    if (leaves.size > MAX_LEAVES) return fail();
     const markerLeaves = new Set<string>();
     for (const leaf of leaves) if (await this.isWipParkMarker(barePath, leaf)) markerLeaves.add(leaf);
     if (!srcMarker && markerLeaves.size === 0) return undefined;
@@ -6844,17 +6859,23 @@ export class GitCache {
     if (!src || !aggregates.length) return fail();
     const fp = aggregates[0]!.fp;
     if (aggregates.some(a => a.fp !== fp)) return fail();
-    const source = await this.readBoundedCommit(barePath, src, MAX_OBJECT_BYTES);
-    if (!source) return fail();
+    // The source (and a marker leaf) is read by plumbing, not readBoundedCommit: a clean source may be
+    // oversized or non-UTF-8 and must still be comparable.
+    if (!OWED_OID.test(src)) return fail();
+    const sha1Of = async (rev: string): Promise<string> => {
+      const out = await this.tryGitStdout(barePath, ["--no-replace-objects", "rev-parse", "--verify", rev]);
+      return OWED_OID.test(out) ? out : fail();
+    };
+    const srcTree = await sha1Of(`${src}^{tree}`);
     const identity = (kind: string) => `${kind} ${AGENT_GIT_IDENTITY.name} <${AGENT_GIT_IDENTITY.email}> 946684800 +0000`;
     for (const a of aggregates) {
-      if (a.tree !== source.tree || a.author !== identity("author") || a.committer !== identity("committer")) return fail();
+      if (a.tree !== srcTree || a.author !== identity("author") || a.committer !== identity("committer")) return fail();
     }
     const sortedLeaves = [...leaves].sort();
     if (!leaves.has(src)) return fail();
     // The roots are the leaves, with or without the current source (the producer passes both forms).
     const fingerprints = [sortedLeaves, sortedLeaves.filter(l => l !== src)].filter(r => r.length > 0)
-      .map(roots => createHash("sha256").update(JSON.stringify({ roots, currentSha: src, tree: source.tree })).digest("hex"));
+      .map(roots => createHash("sha256").update(JSON.stringify({ roots, currentSha: src, tree: srcTree })).digest("hex"));
     if (!fingerprints.includes(fp)) return fail();
     // Provenance: only the worker's own pin of this very wrapper, for this run, proves it is genuine.
     const pins = await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)",
@@ -6870,16 +6891,14 @@ export class GitCache {
     for (const leaf of sortedLeaves) {
       if (leaf === src || await this.isAncestor(barePath, leaf, src)) continue;
       if (!markerLeaves.has(leaf) || !lineage.has(leaf)) return fail();
-      const marker = await this.readBoundedCommit(barePath, leaf, MAX_OBJECT_BYTES);
-      if (!marker || marker.parents.length === 0 || !await this.isAncestor(barePath, marker.parents[0]!, src)) return fail();
+      if (!await this.isAncestor(barePath, await sha1Of(`${leaf}^`), src)) return fail();
       accepted.push(leaf);
     }
     if (srcMarker) {
-      if (source.parents.length === 0) return fail();
-      return { seedTip: src, expectedHead: source.parents[0]!, expectedTree: source.tree,
+      return { seedTip: src, expectedHead: await sha1Of(`${src}^`), expectedTree: srcTree,
         peeledMarkers: unionPeeledMarkers(accepted, [src]) };
     }
-    return { seedTip: src, expectedHead: src, expectedTree: source.tree, peeledMarkers: unionPeeledMarkers(accepted) };
+    return { seedTip: src, expectedHead: src, expectedTree: srcTree, peeledMarkers: unionPeeledMarkers(accepted) };
   }
 
   /** Fresh successor, local-only under one bare lock. Never executes in a predecessor.
@@ -6928,7 +6947,10 @@ export class GitCache {
       if (!await this.recoveryClockCurrent(barePath, branch, { ...journal, retainedSources,
         recovery: { ...recovery, successor, stage: "adopting" } })) throw new Error("successor iteration is not current");
       await this.writeRecovery(barePath, branch, { ...successor, retainedSources,
-        ...(wrapped?.peeledMarkers.length ? { peeledMarkers: wrapped.peeledMarkers } : {}),
+        // issue #3239: the lineage of what this seed peeled: the wrapper's accepted markers, or the tip
+        // itself when the tip is the marker the seed's `reset --soft` removed from history.
+        ...(wrapped ? (wrapped.peeledMarkers.length ? { peeledMarkers: wrapped.peeledMarkers } : {})
+          : marker ? { peeledMarkers: [tip] } : {}),
         recovery: { ...recovery, successor, stage: "ready-for-model" } });
       // issue #3194: hand the guard the content source this wrapper verifiably stands for.
       return { ...seeded, attemptId, ...(recovery.restoreSource ? { adoptedContentSource: recovery.restoreSource } : {}) };

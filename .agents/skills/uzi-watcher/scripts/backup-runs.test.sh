@@ -593,6 +593,31 @@ for kind in protected ordinary; do
       echo "PASS protected blocker $blocker"
     done
   fi
+  if [ "$kind" = protected ]; then
+    # issue #3239: the journal carries peeledMarkers (an optional list of at most 64 unique SHA-40).
+    for pm in '[]' '["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]' \
+        '["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]' \
+        "$(jq -cn '[range(64) | tostring | ("0" * (40 - length)) + .]')"; do
+      value="$(printf '%s' "$progress_journal" | jq --argjson pm "$pm" '.peeledMarkers=$pm | {version:1,branch:"agent/issue-4242",key:"issue-4242",journal:.}')"
+      git --git-dir="$BARE" config "uzi-retained.$rid.journal" "$value"
+      rc="$(backup_rc "$dest" "$rid")"
+      [ "$rc" -eq 0 ] || fail "peeledMarkers $pm: valid protected descriptor rejected (exit $rc); log: $(cat "$dest/latest-attempt/backup.log")"
+      tar -xOzf "$dest/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+claim-generation-dirty' \
+        || fail "peeledMarkers $pm: retained dirty bytes missing"
+      echo "PASS protected peeledMarkers accepted: ${pm:0:30}"
+    done
+    for pm in '["not-a-sha"]' '"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+        '["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"]' \
+        '["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]' \
+        "$(jq -cn '[range(65) | tostring | ("0" * (40 - length)) + .]')"; do
+      value="$(printf '%s' "$progress_journal" | jq --argjson pm "$pm" '.peeledMarkers=$pm | {version:1,branch:"agent/issue-4242",key:"issue-4242",journal:.}')"
+      git --git-dir="$BARE" config "uzi-retained.$rid.journal" "$value"
+      rc="$(backup_rc "$dest" "$rid")"
+      [ "$rc" -ne 0 ] || fail "peeledMarkers ${pm:0:30}: malformed list accepted"
+      [ ! -e "$dest/latest-attempt/issue-4242.tgz" ] || fail "peeledMarkers ${pm:0:30}: invalid descriptor attributed source"
+      echo "PASS protected peeledMarkers refused: ${pm:0:30}"
+    done
+  fi
   for generation in 0 -1 1.5 9007199254740992 '"1"' null true; do
     value="$(printf '%s' "$progress_journal" | jq --argjson gen "$generation" '.recovery.claimGeneration=$gen')"
     if [ "$kind" = protected ]; then
