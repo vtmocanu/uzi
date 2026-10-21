@@ -5,7 +5,7 @@ import { PassThrough, Readable } from "node:stream";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { GitCache, type BoundaryProcessSpawner, type GitCacheOptions } from "../src/git.js";
+import { GitCache, ScratchPublicationError, type BoundaryProcessSpawner, type GitCacheOptions } from "../src/git.js";
 import { nullLogger } from "./helpers.js";
 import { CheckpointSoftDeadlineError, CheckpointUnsafeCleanupError } from "../src/checkpoint-stop.js";
 
@@ -333,24 +333,47 @@ it("soft interruption cannot hide unverified preparation cleanup", async () => {
   } finally { owner.release.resolve(); await rejected; }
 });
 
-for (const stage of ["row", "classification"] as const) {
-  it(`a genuine ${stage} failure survives a cap expiring during deferred disposal`, async t => {
+for (const [stage, target, output, reason] of [
+  ["row", 0, "invalid row\n", "invalid checkpoint object row"],
+  ["classification", 3, "invalid classification\n", "invalid checkpoint classification"],
+  ["unterminated", 0, TIP, "unterminated checkpoint metadata"],
+  ["incomplete", 3, TIP + " commit\n", "incomplete checkpoint classification"],
+] as const) {
+  it(`a genuine ${stage} failure is typed and joins deferred disposal without fallback`, async t => {
     t.mock.timers.enable({ apis: ["setTimeout"] });
-    const git = cache(), owner = controlled(stage === "row" ? 0 : 3);
+    const git = cache(), owner = controlled(target);
+    let returned = false;
     const pending = git.withBoundaryProcessSpawner(owner.spawner, new AbortController().signal,
       () => git.checkpointPack("bare", "task"));
-    const observed = pending.then(value => ({ value }), error => ({ error }));
+    const observed = pending.then(value => ({ value }), error => ({ error })).finally(() => { returned = true; });
     try {
       await owner.entered.promise;
-      owner.pipes.at(-3)!.write(stage === "row" ? "invalid row\n" : "invalid classification\n");
-      await owner.cancelled.promise;
-      t.mock.timers.tick(5000);
+      const stdout = owner.pipes.at(-3)!;
+      stdout.write(output);
+      if (stage === "unterminated" || stage === "incomplete") stdout.end();
+      if (stage === "row" || stage === "classification") {
+        await owner.cancelled.promise;
+        t.mock.timers.tick(5000);
+      }
+      await tick();
+      assert.equal(returned, false, "refusal must wait for child settlement");
+      assert.equal(owner.live, 1);
+      assert.equal(owner.calls.length, target + 1);
+      assert.equal(owner.calls.some(args => args.includes("pack-objects")), false);
       owner.release.resolve();
       const result = await observed;
       assert.ok("error" in result, "a metadata failure must forbid legacy fallback");
-      assert.match(String(result.error), stage === "row" ? /invalid checkpoint object row/ : /invalid checkpoint classification/);
+      assert.ok(result.error instanceof ScratchPublicationError);
+      assert.equal(result.error.code, "scratch_publication_refused");
+      assert.equal(result.error.kind, "checkpoint_range");
+      assert.equal(result.error.step, "checkpoint_floor");
+      assert.equal(result.error.detail, reason);
+      assert.equal(result.error.message, `scratch_publication_refused: ${reason}`);
+      assert.equal(owner.calls.length, target + 1);
       assert.equal(owner.calls.some(args => args.includes("pack-objects")), false);
       assert.equal(owner.live, 0);
+      await tick();
+      assert.ok(owner.pipes.every(pipe => pipe.destroyed), "all child pipes are cleaned up");
     } finally { owner.release.resolve(); await observed; }
   });
 }

@@ -9183,7 +9183,9 @@ export class GitCache {
               offset = newline + 1;
             }
           }
-          if (pending.length) throw new Error("unterminated checkpoint metadata");
+          if (pending.length) throw new ScratchPublicationError("unterminated checkpoint metadata", undefined, {
+            kind: "checkpoint_range", step: "checkpoint_floor", detail: "unterminated checkpoint metadata",
+          });
         };
         const child = async (args: string[], accept: (line: Buffer) => void, input?: () => Iterable<string>) => {
           this.checkCheckpointCooperation();
@@ -9226,7 +9228,9 @@ export class GitCache {
           const oidBytes = row.subarray(0, 40);
           const oid = oidBytes.toString("latin1");
           if (!SHA40_RE.test(oid) || (row.length !== 40 && row[40] !== 32)) {
-            throw new Error("invalid checkpoint object row");
+            throw new ScratchPublicationError("invalid checkpoint object row", undefined, {
+              kind: "checkpoint_range", step: "checkpoint_floor", detail: "invalid checkpoint object row",
+            });
           }
           let entry = rows.get(oid);
           if (!entry) {
@@ -9247,14 +9251,18 @@ export class GitCache {
         await child(["cat-file", "--batch-check=%(objectname) %(objecttype)"], line => {
           const next = iterator.next();
           const match = /^([0-9a-f]{40}) (commit|tree|blob)$/.exec(line.toString("latin1"));
-          if (next.done || !match || match[1] !== next.value[0]) throw new Error("invalid checkpoint classification");
+          if (next.done || !match || match[1] !== next.value[0]) throw new ScratchPublicationError("invalid checkpoint classification", undefined, {
+            kind: "checkpoint_range", step: "checkpoint_floor", detail: "invalid checkpoint classification",
+          });
           const entry = next.value[1];
           if ((match[2] === "commit" && entry.commit) ||
               (match[2] === "tree" && entry.all) || (match[2] === "blob" && entry.blob)) {
             selected.push(entry.row, Buffer.from("\n"));
           }
         }, function* () { for (const oid of rows.keys()) yield `${oid}\n`; });
-        if (!iterator.next().done) throw new Error("incomplete checkpoint classification");
+        if (!iterator.next().done) throw new ScratchPublicationError("incomplete checkpoint classification", undefined, {
+          kind: "checkpoint_range", step: "checkpoint_floor", detail: "incomplete checkpoint classification",
+        });
         this.checkCheckpointCooperation();
         return Buffer.concat(selected);
       });
