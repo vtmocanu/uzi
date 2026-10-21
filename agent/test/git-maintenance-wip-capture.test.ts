@@ -289,7 +289,9 @@ describe("guarded maintenance WIP capture", { skip: process.platform !== "linux"
     const f = await fixture(t);
     await fs.writeFile(path.join(f.root, "tracked"), Buffer.alloc(CAP + 1, 0x62));
     await assert.rejects(f.capture(), /maintenance_wip_capture_refused/);
+    assert.ok(!f.events.includes("launch:commit"), "refused before commit");
     assert.equal(f.head(), f.old);
+    assert.equal((await fs.stat(path.join(f.root, "tracked"))).size, CAP + 1);
     const g = await fixture(t);
     await g.dirty();
     await fs.writeFile(path.join(g.root, "exact.bin"), Buffer.alloc(CAP, 0x61));
@@ -298,6 +300,19 @@ describe("guarded maintenance WIP capture", { skip: process.platform !== "linux"
     assert.equal(result.kind, "committed");
     assert.equal(g.gitIn("cat-file", "-s", "HEAD:exact.bin").trim(), String(CAP));
     assert.equal(g.gitIn("show", "HEAD:score.1"), "not a core file");
+  });
+
+  test("a core file and an oversized blob already in HEAD do not block an unrelated capture (#3239)", async t => {
+    const f = await fixture(t);
+    await fs.writeFile(path.join(f.root, "core"), "committed earlier");
+    await fs.writeFile(path.join(f.root, "huge.bin"), Buffer.alloc(CAP + 1, 0x63));
+    f.gitIn("add", "-A"); f.gitIn("commit", "-m", "history already holds them");
+    const base = f.head();
+    await f.dirty();
+    const result = await f.capture(undefined, f.root, base);
+    assert.equal(result.kind, "committed");
+    assert.equal(result.parent, base);
+    assert.equal(f.gitIn("show", "HEAD:tracked"), "changed");
   });
 
   test("clean is explicit, HEAD/index unchanged and only status attempted", async t => {
