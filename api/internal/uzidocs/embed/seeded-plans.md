@@ -64,7 +64,8 @@ If it cannot prove that for work it kept itself (its own tracking or checkpoint
 copy), the agent never starts and the run is held
 (`base_attestation_missing`) with its work kept, for you to recover, export or
 start a successor: `uzi run recovery <id>` shows the kept work and `uzi run
-export <id> --output <path>` downloads it. Resume and extend are refused for
+export <id> --output <path>` downloads it. A planned commit that is ambiguous or
+unreadable in the repository fails the run as unverifiable instead. Resume and extend are refused for
 this hold. Work picked up from the forge branch instead (for example a branch
 already pushed by an earlier attempt) is not proof of the run's own checked work,
 so unless it is exactly the content the run's checkpoint attested, a mismatch
