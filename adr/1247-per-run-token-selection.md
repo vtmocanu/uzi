@@ -106,9 +106,10 @@ evidence-verification allowance. Two outcomes:
   session are kept. Once the worker has finished its own operations (lane disposal, deps install)
   it reports `credential_switch_hold_settled`, which flips the hold to
   `credential_switch_unsettled`. The acknowledgement means those operations joined; it does not
-  prove the run's processes stopped. Fixed survivor classes (`worker_child`, `unreadable`,
-  `restarted`, `kill_failed`, or `unverified` / `settle unconfirmed` / `deadline`; never pids)
-  appear in diagnostics and the hold's feed message.
+  prove the run's processes stopped. The hold's owner feed message names only fixed survivor classes
+  (`worker_child`, `unreadable`, `restarted`, `kill_failed`, or
+  `unverified` / `settle unconfirmed` / `deadline`; never pids). The worker log keeps the
+  sanitized detail, which can include pids.
 
 **The settling fence.** While the hold is `credential_switch_settling`, Resume and
 set-token are refused with a 409 (`ErrRunHoldSettling`) only while the holding worker is live

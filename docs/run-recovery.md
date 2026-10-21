@@ -146,9 +146,10 @@ and custody on that worker:
   prove the run's processes stopped. The CLI shows `credential switch unsettled`, the web shows
   **held: token switch**. **Resume** requeues the run on the token you chose
   (the same worker is preferred); `uzi run set-token` saves a token and
-  resumes. **Cancel** ends the run. The feed message and diagnostics name any
+  resumes. **Cancel** ends the run. The owner feed message names only a fixed
   survivor class (`worker_child`, `unreadable`, `restarted`, `kill_failed`, or
-  `unverified`, `settle unconfirmed`, `deadline`), never a pid.
+  `unverified`, `settle unconfirmed`, `deadline`), never a pid; the worker log
+  keeps the sanitized detail, which can include pids.
 
 Settling lifts only on the worker's acknowledgement (fenced on the worker,
 run, claim generation and registration nonce), the worker's heartbeat going
