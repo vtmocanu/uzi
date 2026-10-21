@@ -193,9 +193,10 @@ describe("guarded maintenance WIP capture", { skip: process.platform !== "linux"
       const end = index.indexOf(0, offset + 62);
       assert.ok(end >= offset + 62);
       if (index.toString("utf8", offset + 62, end) === "tracked") {
+        // Git index modes are canonical, not filesystem permission bits; keep the forged stat cache well-formed.
         const fields = [st.ctimeNs / 1000000000n, st.ctimeNs % 1000000000n,
           st.mtimeNs / 1000000000n, st.mtimeNs % 1000000000n,
-          st.dev, st.ino, st.mode, st.uid, st.gid, st.size];
+          st.dev, st.ino, 0o100644n, st.uid, st.gid, st.size];
         fields.forEach((value, field) => index.writeUInt32BE(Number(BigInt.asUintN(32, value)), offset + field * 4));
         assert.equal(index.readUInt16BE(offset + 60), 7); // Ordinary path flags, no hiding bits.
         found = true;
