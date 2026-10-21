@@ -1696,3 +1696,27 @@ test("after a failed pause, an answered completion question still releases its h
     });
   } finally { clearTimeout(rescue); }
 });
+
+test("a delayed declined pause_failed ACK cannot retire the context a newer Running report kept", async () => {
+  const f = await setup();
+  const hold = releaseGate();
+  api.afterPersistState(f.claim.run_id, body => body.status === "pause_failed", hold.promise);
+  // A plain 409 is a declined state report (client reportStateOnce: applied only on a 200).
+  api.stateAckWire = (body, run) =>
+    body.status === "pause_failed" ? { status: 409, body: { run: { ...run, status: "running" } } } : undefined;
+  await memoryRun(f, async ctx => {
+    await ctx.reportIteration!(1);
+    const before = ctx.capturedMemory!()!;
+    const was = snapshot(before);
+    const pausing = failedPause(ctx);
+    await until(() => api.states.some(s => s.runId === f.claim.run_id && s.body.status === "pause_failed"));
+    // A newer Running report lands while the pause_failed answer is still held.
+    await ctx.reportIteration!(2);
+    assert.deepEqual(snapshot(before), was, "the newer Running ACK keeps the context");
+    hold.resolve();
+    assert.equal(await pausing, false);
+    assert.deepEqual(snapshot(before), was, "the late declined ACK must not retire the current context");
+    assert.equal(ctx.capturedMemory!()!.context, before.context);
+    assert.equal(f.reservations.length, 0, "accounting unchanged");
+  });
+});
