@@ -62,6 +62,23 @@ func TestGitLabGetMergeRequestSummaryOverLimitRefused(t *testing.T) {
 	}
 }
 
+// An oversized 404 body overflows on the lazy non-success path, where the SDK still
+// reports the status: the overflow check must win over the 404 mapping, or a refused
+// body would read as "merge request not found".
+func TestGitLabGetMergeRequestSummaryOversized404IsTooLarge(t *testing.T) {
+	w := newWireMR(t, func(rw http.ResponseWriter, _ *http.Request) {
+		rw.WriteHeader(http.StatusNotFound)
+		_, _ = rw.Write(bytes.Repeat([]byte("x"), int(gitLabMaxErrorResponseBytes)+1024))
+	}, 5*time.Second)
+	_, err := w.d.GetMergeRequestSummary(context.Background(), 7, 9)
+	if !isTooLarge(err) {
+		t.Fatalf("oversized 404 = %v, want ErrResponseTooLarge", err)
+	}
+	if errors.Is(err, ErrMergeRequestNotFound) {
+		t.Fatal("an oversized 404 body must not read as not found")
+	}
+}
+
 func TestGitLabGetMergeRequestSummaryUnderLimit(t *testing.T) {
 	lowerGitLabLimit(t, 4096)
 	w := newWireMR(t, func(rw http.ResponseWriter, r *http.Request) {
