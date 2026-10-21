@@ -165,12 +165,14 @@ func (s *Service) probeLeaseClaim(admitted, rebound bool) {
 // claim then returns an error (a 500; the agent's next claim poll retries) or provisionOne errors
 // (the next provisioning pass retries). Neither corrupts state, and there is no retry here. A lease-off service, a non-ephemeral worker or an unleased one passes the
 // no-lease params (NULL columns), where ClaimRun's lease arm admits nothing.
-func (s *Service) claimRunInTx(ctx context.Context, tx pgx.Tx, qtx *store.Queries, workerID uuid.UUID, reread store.Worker, params store.ClaimRunParams) (store.Run, bool, error) {
+func (s *Service) claimRunInTx(ctx context.Context, tx pgx.Tx, qtx *store.Queries, workerID uuid.UUID, reread store.Worker, params store.ClaimRunParams, report MemoryAuthorityReport) (store.Run, bool, error) {
 	params.ClaimantDraining = reread.DrainingSince.Valid || maintenancePending(reread)
 	if reread.MaintenanceFenced {
 		return store.Run{}, false, nil
 	}
 	params.WorkerProtocolCaps = reread.ProtocolCapabilities
+	// Issue #3142: judged against the locked re-read capabilities, run/ordinary lanes only.
+	params.MemoryAuthorityLost = params.Lane != "cross_check" && memoryAuthorityLost(reread.ProtocolCapabilities, report)
 	params.WorkerCaps = reread.Capabilities
 	params.WorkerIsolatedLane = reread.IsolatedLane
 	params.ClaimantDraining = reread.DrainingSince.Valid || maintenancePending(reread)
@@ -250,7 +252,7 @@ func (s *Service) claimRunInTx(ctx context.Context, tx pgx.Tx, qtx *store.Querie
 // re-read under that lock, the lease claim through claimRunInTx), minus the snapshot work a
 // snapshot-less claim has none of. GetWorkerForUpdate returns the row as locked, which is the
 // re-read the lease params need.
-func (s *Service) claimRunLeasedNoSnapshot(ctx context.Context, wkr store.Worker, params store.ClaimRunParams) (*ClaimPayload, error) {
+func (s *Service) claimRunLeasedNoSnapshot(ctx context.Context, wkr store.Worker, params store.ClaimRunParams, report MemoryAuthorityReport) (*ClaimPayload, error) {
 	tx, err := s.txBeginner.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -274,7 +276,7 @@ func (s *Service) claimRunLeasedNoSnapshot(ctx context.Context, wkr store.Worker
 		}
 		return nil, err
 	}
-	run, claimed, err := s.claimRunInTx(ctx, tx, qtx, wkr.ID, locked, params)
+	run, claimed, err := s.claimRunInTx(ctx, tx, qtx, wkr.ID, locked, params, report)
 	if err != nil {
 		return nil, err
 	}

@@ -46,6 +46,13 @@ var ErrNoPipeline = errors.New("forge: no pipeline for ref")
 // not one driver's implementation.
 var ErrForgeVersionUnsupported = errors.New("forge: server version is older than this driver's minimum")
 
+// ErrJobAttemptsUnsupported is returned by ListPipelineJobAttempts on a driver that
+// cannot return a run's complete attempt history (Forgejo/Gitea: the jobs endpoint
+// has no attempt filter and its rerun semantics are unverified). It means "complete
+// history unavailable", never "no prior attempts": a caller may fall back to
+// ListPipelineJobs and must then treat earlier attempts as unknown.
+var ErrJobAttemptsUnsupported = errors.New("forge: complete job attempt history unavailable")
+
 // ErrResolveUnsupported is returned by ResolveMergeRequestThread on a driver
 // whose forge has no resolvable review-thread concept (Forgejo/Gitea — PRD #700
 // Resolved facts). It is a distinct sentinel — not a redacted generic error — so
@@ -498,6 +505,17 @@ type Job struct {
 	// them (a not-yet-started or not-yet-finished job), which stores as NULL.
 	StartedAt  time.Time
 	FinishedAt time.Time
+	// CreatedAt is when the forge created the job (#3225); zero when unreported.
+	// StartedAt - CreatedAt includes dependency and manual waits, so it is not
+	// runner queue time.
+	CreatedAt time.Time
+	// Attempt is the forge-reported run attempt the job belongs to (GitHub and
+	// Forgejo run_attempt); nil when the forge reports none (GitLab). Never derived.
+	Attempt *int64
+	// QueuedDuration is the forge-measured runner queue wait (GitLab only); nil when
+	// unreported. GitLab's field cannot distinguish absent from zero, so a zero is
+	// treated as unknown.
+	QueuedDuration *time.Duration
 }
 
 // Step is one step of a job (PRD #1255). Only GitHub Actions exposes steps
@@ -858,6 +876,13 @@ type Forge interface {
 	// Called only at fix-trigger time (to snapshot failed jobs), never on the poll
 	// tick.
 	ListPipelineJobs(ctx context.Context, projectID, pipelineID int64) ([]Job, error)
+	// ListPipelineJobAttempts returns the jobs of EVERY attempt of a run, not just
+	// the latest (#3225, the CI scout's history read): GitHub filter=all, GitLab
+	// include_retried=true. Timestamps are only what the forge reported: unlike
+	// ListPipelineJobs, GitLab's FinishedAt is never derived from StartedAt plus
+	// Duration. Same budget and pagination path as ListPipelineJobs. Returns
+	// ErrJobAttemptsUnsupported where complete history is unavailable (Forgejo).
+	ListPipelineJobAttempts(ctx context.Context, projectID, pipelineID int64) ([]Job, error)
 	// JobLogTail returns at most maxBytes from the END of a job's trace (a
 	// failure's cause concludes its log); maxBytes <= 0 returns the whole trace.
 	// GitLab: GET /projects/:id/jobs/:job_id/trace — the endpoint has no range/tail

@@ -16,7 +16,8 @@ import type { WorkerClient } from "./client.js";
 import type { WorkerMemoryRuntime } from "./worker-memory-runtime.js";
 import { GUARDED_LANE_JOIN_MS } from "./claude-command/lane.js";
 import type { CapturedMemoryContext } from "./codex/broker.js";
-import type { MemoryIncarnation, WorkerMemoryPressureResult } from "./protocol.js";
+import type { BaseAttestationHoldOutcome, MemoryIncarnation, WorkerMemoryPressureResult } from "./protocol.js";
+import { BASE_ATTESTATION_HOLD_REASON } from "./protocol.js";
 import { RequestError, StateReportUnappliedError, isRunOwnershipLost, isTransient, HELD_PUBLICATION_FEATURE } from "./client.js";
 import { RecoveryClosureLimitError, recoveryClosureLimitDetail, formatRecoveryDecodedLimit } from "./recovery-closure.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
@@ -569,6 +570,9 @@ interface ExecutionRejection {
 
 /** PRD #1733: the `hold_reason` of a run held after repeated provider outages. */
 const PROVIDER_HOLD_REASON = "provider_unavailable";
+/** issue #3194: attempts (requests, each followed by an ownership read while unproven) before an
+ *  unconfirmed base-attestation hold ends the flight retained. */
+const BASE_ATTESTATION_HOLD_ATTEMPTS = 3;
 
 type RecoveryParkCause =
   | { kind: "transient" }
@@ -1681,6 +1685,84 @@ export function evaluateBaseStaleness(
 }
 
 /**
+ * issue #3194: the `--require-base` guard could not PROVE the comparison (an ambiguous planned
+ * prefix, an unreadable object or a git error). Distinct from BaseCommitDivergedError so a genuine
+ * divergence is never reported for what is really uncertainty.
+ */
+export class BaseProofError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BaseProofError";
+  }
+}
+
+/**
+ * issue #3194: a `--require-base` run adopted its own retained work, but no evidence shows that
+ * exact content was produced by a flight that accepted the planned base. The run must not execute;
+ * it is held for an owner recovery decision rather than failed.
+ */
+export class BaseAttestationMissingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BaseAttestationMissingError";
+  }
+}
+
+/** issue #3194: everything the `--require-base` decision reads, gathered by the runner. */
+export interface RequiredBaseInput {
+  plannedBase: string;
+  /** The adopted identity: the coverage content source when verified, else the raw adopted source. */
+  identity: string;
+  /** claim.checkpoint_attested_source. */
+  attestedSource: string | undefined;
+  /** The adopted source is this run's retained work (tracking/checkpoint/recovery leg). */
+  continuation: boolean;
+  /** The diverged-checkpoint WIP was cherry-picked onto a floor. */
+  wipCherryPicked: boolean;
+  planned: { kind: "resolved"; sha: string } | { kind: "missing" } | { kind: "ambiguous" } | { kind: "unknown" };
+  identityTree: string | undefined;
+  materializedTree: string | undefined;
+}
+
+/**
+ * issue #3194: the strict `--require-base` decision. Accepts (returns) only when the adopted
+ * identity is exactly the planned commit (rule A) or exactly this run's attested source (rule B),
+ * AND the materialized tree is exactly that identity's tree. Otherwise throws:
+ * BaseAttestationMissingError for retained work it cannot vouch for, BaseProofError when the proof
+ * itself failed, BaseCommitDivergedError for a genuine divergence. No ancestry, no default-branch
+ * graph.
+ */
+export function evaluateRequiredBase(input: RequiredBaseInput): "planned" | "attested" {
+  const identity = input.identity.trim().toLowerCase();
+  // The genuine-divergence wording is the stable failure_reason #3164 classifies (base_diverged).
+  const detail = `the seeded plan was written against commit ${input.plannedBase}, but this clone's base commit is ${identity}`;
+  const unvouched = () => input.continuation
+    ? new BaseAttestationMissingError(`${detail}, and no checkpoint attests that this content was produced on the planned base; --require-base is set, so the run is held for a recovery decision instead of implementing`)
+    : new BaseCommitDivergedError(`${detail}; --require-base is set, so this run will not implement against a diverged base`);
+  if (input.wipCherryPicked) throw unvouched();
+  let rule: "planned" | "attested";
+  if (input.attestedSource && input.attestedSource.trim().toLowerCase() === identity) {
+    rule = "attested";
+  } else {
+    switch (input.planned.kind) {
+      case "ambiguous":
+        throw new BaseProofError(`the planned commit ${input.plannedBase} is ambiguous in this repository; --require-base cannot be verified`);
+      case "unknown":
+        throw new BaseProofError(`the planned commit ${input.plannedBase} could not be read; --require-base cannot be verified`);
+      case "missing":
+        throw new BaseCommitDivergedError(`${detail}; --require-base is set, so this run will not implement against a diverged base`);
+    }
+    if (input.planned.sha !== identity) throw unvouched();
+    rule = "planned";
+  }
+  if (!input.identityTree || !input.materializedTree) {
+    throw new BaseProofError(`the tree of adopted commit ${identity} could not be read; --require-base cannot be verified`);
+  }
+  if (input.identityTree !== input.materializedTree) throw unvouched();
+  return rule;
+}
+
+/**
  * What the per-run executor factory yields for one execution (PRD #42 Decisions
  * 4/5): a freshly-constructed executor plus the per-run HOME to clean on terminal.
  *  - `executor`: built anew for THIS run, so `SdkExecutor.spawnedPids` and
@@ -2073,6 +2155,10 @@ interface RunFlight {
    *  claim. lastPublishedTip separately tracks clone HEAD for hasNewWork and can remain
    *  unset after a failed fetch-back even when a checkpoint landed. */
   landedCheckpoint?: boolean;
+  /** issue #3194: this flight's `--require-base` guard strictly accepted its adopted base. False at
+   *  flight start, never seeded from the claim or from ownership; while true, checkpoint publishes
+   *  attest their packed source. */
+  baseAccepted?: boolean;
   /** Issue #1832: the PRD #1809 D6 operation ("preflight", "clone/fetch") whose data-volume
    *  reclaim wait a PauseNowSignal interrupted (an owner `now` or a sweep `wall` pause; a `disk`
    *  stop sets it too, but its arm never reads it). Set only pre-clone, by awaitDataVolumeReclaim;
@@ -4512,6 +4598,12 @@ export class RunRunner {
           "e2e drop-execution seam: ending flight with no terminal report (run left running for the missing-run requeue)",
         );
         await batcher.close().catch(() => undefined);
+      } else if (err instanceof BaseAttestationMissingError) {
+        // issue #3194: the --require-base guard refused retained work no checkpoint attests, before
+        // the executor ran. Caught BEFORE the generic terminal path: this run is held for its owner,
+        // never failed, so it reports NO terminal state and keeps its clone and custody on every
+        // outcome of the hold request (enterBaseAttestationHold).
+        await this.enterBaseAttestationHold(claim, flight, err, runLog);
       } else if (codexDeferralOf(err) !== undefined) {
         // Codex credentials were deferred by a vault lock, an unknown boundary refresh,
         // or exhausted epoch-start release retries. Vault locks also arise mid-turn.
@@ -10825,7 +10917,28 @@ export class RunRunner {
     // to emit (default) or, under --require-base (claim.require_base_match), THROWS
     // BaseCommitDivergedError BEFORE any implement work — the generic catch-all then
     // fails the run, so it never implements against a diverged base (Open Question 3).
-    const staleWarning = evaluateBaseStaleness(
+    // issue #3194: under --require-base the strict decision compares the raw adopted source (not
+    // the unwrapped effective base) exactly against the planned commit or this run's attested
+    // source, and checks the materialized tree. Warn-only runs keep the equality warning above.
+    const requireBase = claim.require_base_match === true && !!claim.planned_base_commit;
+    if (requireBase && !barePath) {
+      throw new BaseProofError("this clone has no worker bare to verify the planned commit in; --require-base cannot be verified");
+    }
+    if (requireBase && barePath) {
+      const identity = runnerClone.adoptedContentSource ?? runnerClone.adoptedSource;
+      evaluateRequiredBase({
+        plannedBase: claim.planned_base_commit!,
+        identity,
+        attestedSource: claim.checkpoint_attested_source ?? undefined,
+        continuation: runnerClone.seededFrom === "tracking" || runnerClone.seededFrom === "checkpoint",
+        wipCherryPicked: runnerClone.wipCherryPicked === true,
+        planned: await this.git.resolveCommitUnique(barePath, claim.planned_base_commit!),
+        identityTree: await this.git.commitTreeOid(barePath, identity),
+        materializedTree: await this.git.indexTreeOid(runnerClone.path),
+      });
+      flight.baseAccepted = true;
+    }
+    const staleWarning = requireBase ? undefined : evaluateBaseStaleness(
       claim.planned_base_commit ?? undefined,
       runnerClone.baseCommit,
       claim.require_base_match ?? false,
@@ -13105,7 +13218,12 @@ export class RunRunner {
     // handled by the caller like a blocked Codex boundary: nothing published or settled, the park
     // stands) and keeps the clone.
     const quiesceSink = flight !== undefined;
-    const now = req.checkpointStop?.now ?? Date.now;
+    // Issue #3217: a sink without a checkpointStop (milestone) takes the test clock when one is set,
+    // so the budget it hands the safety and the deadline the safety arms share one clock. Without an
+    // explicit checkpointStop.now, a shutdown request falls back to Date.now: its
+    // gracefulShutdownCheckpoint.deadlineAt is a wall-clock instant.
+    const now = req.checkpointStop?.now
+      ?? (req.gracefulShutdownCheckpoint ? Date.now : this.checkpointTestHooks?.absoluteNow ?? Date.now);
     const deadlineAt = Math.min(now() + Math.max(0, req.deadlineMs),
       req.gracefulShutdownCheckpoint?.deadlineAt ?? Infinity);
     await executor.closeAndSettlePlanSummary?.(Math.max(0, deadlineAt - now()));
@@ -15241,7 +15359,11 @@ export class RunRunner {
     };
     try {
       signal?.throwIfAborted();
+      // issue #3194: read the acceptance bit BEFORE the owned source snapshot, and freeze the
+      // attestation with it for every retry of this logical publish.
+      const attests = flight.baseAccepted === true;
       const sourceSha = await this.requireTrackingOwned(flight, barePath, branch, pinned?.tipSha);
+      const attestedSource = attests ? sourceSha : undefined;
       signal?.throwIfAborted();
       if (await this.ciConfigGuardBlocksPublication(flight, barePath, sourceSha, "checkpoint publish")) {
         return { published: false, reason: "skipped", skipLabel: "ci_config_guard" };
@@ -15279,7 +15401,7 @@ export class RunRunner {
       for (let attempt = 1; attempt <= 3; attempt++) {
         signal?.throwIfAborted();
         onStep?.("checkpoint_upload");
-        res = await this.client.publishCheckpoint(flight.runId, packed.tipOid, producer!.pack, signal, flight.claimGeneration);
+        res = await this.client.publishCheckpoint(flight.runId, packed.tipOid, producer!.pack, signal, flight.claimGeneration, attestedSource);
         if (res.ok || typeof res.httpStatus !== "number" || res.httpStatus < 500 || res.httpStatus > 599 || attempt === 3) break;
         flight.lastAttemptedCheckpointRefTip = packed.tipOid;
         const [firstBackoffMs, secondBackoffMs] = this.checkpointTestHooks?.retryBackoffMs ?? [250, 1_000];
@@ -18209,6 +18331,111 @@ export class RunRunner {
   }
 
   /**
+   * issue #3194: hold a `--require-base` run whose preflight guard threw BaseAttestationMissingError.
+   * The executor never ran, so there is nothing to reap or capture: the adopted source is already
+   * the clone's HEAD. Retain-and-stop, like the ServerWallParkedError arm: the clone, the session
+   * HOME and the guarded inventory are kept on EVERY outcome and no terminal state is reported.
+   *
+   * An `unknown` answer (transport, 5xx, an unclassifiable body, an older server's 404/400) gets a
+   * bounded in-flight reconcile: up to BASE_ATTESTATION_HOLD_ATTEMPTS attempts within ONE deadline
+   * (completionHoldReconcileTimeoutMs, fixed at entry), each reading the run's ownership and, while
+   * that proves nothing, re-sending the identical idempotent request after a recoveryRetryMs backoff. Only the server's ACK or an ownership read showing this generation
+   * paused on base_attestation_missing is `held`; a read naming another generation, a released
+   * claim or a terminal run is `stale`. Only `held` lets the feed say the run is held. A flight
+   * still `unknown` after the attempts ends exactly like a stale one: retained, non-terminal.
+   */
+  private async enterBaseAttestationHold(
+    claim: ClaimResponse,
+    flight: RunFlight,
+    refusal: BaseAttestationMissingError,
+    runLog: Logger,
+  ): Promise<void> {
+    const { batcher } = flight;
+    flight.preserveRecoveryClone = true;
+    flight.preserveSession = true;
+    flight.keepGuardedInventoryOpen = true;
+    const runId = flight.runId;
+    // ONE request identity for every attempt (this run, this generation, this captured head) and
+    // ONE absolute deadline fixed here: requests, ownership reads and backoffs all spend it, and no
+    // step starts a fresh timer.
+    const identity = { head: flight.runnerClone?.adoptedSource ?? "", claimGeneration: flight.claimGeneration };
+    const deadline = Date.now() + this.completionHoldReconcileTimeoutMs;
+    const remaining = () => deadline - Date.now();
+    // The client classifies every answer and never throws; the catch keeps a defect there from
+    // escaping into the dispatcher, which would skip the retain-and-stop below.
+    const request = () => this.client.requestBaseAttestationHold(runId, identity, AbortSignal.timeout(Math.max(1, remaining())))
+      .catch((e: unknown): BaseAttestationHoldOutcome => ({ outcome: "unknown", detail: errMessage(e) }));
+    let ack = await request();
+    for (let attempt = 1; ack.outcome === "unknown" && attempt < BASE_ATTESTATION_HOLD_ATTEMPTS; attempt++) {
+      if (remaining() <= 0) break;
+      const proof = await this.observeBaseAttestationHold(flight, deadline, runLog);
+      if (proof) {
+        ack = proof;
+        break;
+      }
+      if (flight.active?.shuttingDown || this.shuttingDownGlobal || remaining() <= this.recoveryRetryMs) break;
+      await this.waitRecoveryRetry(flight, false);
+      ack = await request();
+    }
+    if (ack.outcome === "unknown" && remaining() > 0)
+      ack = (await this.observeBaseAttestationHold(flight, deadline, runLog)) ?? ack;
+    if (ack.outcome === "held") {
+      flight.parked = true;
+      flight.holdOrWallParkConfirmed = true;
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: `${refusal.message}. The agent did not start and this worker keeps the work. ` +
+            `Inspect it with \`uzi run recovery ${runId}\`, recover it with ` +
+            `\`uzi run export ${runId} --output <path>\`, or start a successor run.`,
+        },
+      });
+      runLog.info("run held on base_attestation_missing; clone, HOME and custody retained", { run_id: runId });
+    } else {
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: "--require-base: the adopted work is not attested against the planned base, so the agent " +
+            "did not start. The hold could not be confirmed; this worker keeps the work.",
+        },
+      });
+      runLog.warn("base attestation hold not confirmed; ending the flight non-terminal with clone and custody retained", {
+        run_id: runId,
+        claim_generation: claim.claim_generation,
+        outcome: ack.outcome,
+        refusal: refusal.message,
+        ...(ack.outcome === "unknown" ? { detail: ack.detail } : { server_status: ack.status }),
+      });
+    }
+    await batcher.close().catch(() => undefined);
+  }
+
+  /** issue #3194: what one ownership read proves about this flight's base-attestation hold:
+   *  `held` (this generation, live claim, paused on base_attestation_missing), `stale` (another
+   *  generation, a released claim, a terminal run), or undefined (no proof, including a failed read). */
+  private async observeBaseAttestationHold(
+    flight: RunFlight, deadline: number, runLog: Logger,
+  ): Promise<BaseAttestationHoldOutcome | undefined> {
+    try {
+      const own = await this.getObservedRunOwnership(flight, { deadline });
+      const generation = typeof own.claim_generation === "number" ? own.claim_generation : undefined;
+      if ((generation !== undefined && generation !== flight.claimGeneration) || own.claim_released === true ||
+          TERMINAL_RUN_STATUSES.has(own.status)) {
+        return { outcome: "stale", status: own.status };
+      }
+      if (generation === flight.claimGeneration && own.status === "paused" &&
+          own.hold_reason === BASE_ATTESTATION_HOLD_REASON) {
+        return { outcome: "held", status: own.status };
+      }
+    } catch (e) {
+      runLog.warn("base attestation hold: ownership read failed", { run_id: flight.runId, error: errMessage(e) });
+    }
+    return undefined;
+  }
+
+  /**
    * PRD #1497 M2 (D4): enter the CAPTURE-FIRST WALL PARK — the runner side of ctx.parkForWall,
    * called when the executor's turn tripped at the run's wall-clock limit (a `wall` pause aborted
    * the turn, or a pre-attempt REASON_WALL fired, or a re-claim boundary with pause_mode='wall').
@@ -19579,6 +19806,10 @@ export class RunRunner {
             let tip = resumed ? resumedTip : await this.git.revParse(bare, `refs/uzi-runner/${branch}`);
             await check();
             if (!tip) throw new Error("retained tracking tip unavailable");
+            // issue #3194: the content the restore tip stands for. Plain captures stand for themselves;
+            // a guarded coverage wrapper takes the authenticated capture record's current tip below; a
+            // resumed capture keeps its episode's recorded source (recordRecoveryCapture carries it).
+            let capturedSource: string | undefined = resumed ? undefined : tip;
 
             // Gate on the real guarded producer, including its verified thin fallback.
             // Upload ambiguity is separate from positively journaled local bundle facts.
@@ -19605,6 +19836,11 @@ export class RunRunner {
                 if (outcome.reason === "bundle_failed" || outcome.reason === "capture_error") throw new Error("local bundle capture temporarily unavailable");
                 blocker = "prerequisites_unavailable"; throw finalize;
               }
+              // issue #3194: the wrapper -> source mapping comes only from this exact authenticated
+              // record of this run and generation. On a mismatch no captured source is passed, so the wrapper
+              // records itself as its source, which is never attested: the guard holds it (fail closed).
+              capturedSource = local!.runId === claim.run_id && local!.generation === options.context.generation &&
+                local!.inventoryCurrentSha === tip ? local!.inventoryCurrentSha : undefined;
               tip = local!.sourceSha;
               for (const prerequisite of local!.prerequisiteShas!) {
                 if (!await this.git.verifyRecoveryClosure(bare, prerequisite)) {
@@ -19614,7 +19850,7 @@ export class RunRunner {
               }
             }
             await check();
-            await this.git.recordRecoveryCapture(bare, branch, key, source, iteration.attempts, tip);
+            await this.git.recordRecoveryCapture(bare, branch, key, source, iteration.attempts, tip, capturedSource);
             await check();
           });
           if (captureResult.kind !== "observed_empty") { blocker = "quiescence_failed"; throw finalize; }

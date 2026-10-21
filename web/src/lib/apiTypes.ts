@@ -844,6 +844,7 @@ export interface LatestRun {
   // pause or a non-paused run. Non-sensitive, so the board projection sends it on every card
   // (api/internal/handler/board.go latestRunDTO.HoldReason). effectiveRunStatus overlays
   // 'credential_disabled' so the card reads "waiting: credential disabled", not "paused".
+  // 'base_attestation_missing' (issue #3194) reads "base unverified: owner hold" likewise.
   // Optional for api/web rollout skew: an absent key reads as no hold.
   hold_reason?: string | null;
   owner_name: string;
@@ -2557,6 +2558,12 @@ export interface Worker {
   // render it as plain text only (WorkerQuarantineBadge).
   residue_quarantined_at?: string | null;
   residue_quarantine_cause?: string | null;
+  // memory_authority_lost_at is when the api (api clock, RFC3339) began withholding
+  // guard-bound runs from this worker (its first gated claim, not necessarily when the
+  // worker lost memory authority) because its claims did not report it (issue #3142);
+  // null when it has not. In-process api state, so it is lost on an api restart. The
+  // operator action is to restart the worker container (WorkerMemoryAuthorityBadge).
+  memory_authority_lost_at?: string | null;
 }
 
 /** The closed set of worker bind modes (PRD #111 M3), mirroring the server's CHECK. */
@@ -3217,6 +3224,11 @@ export interface Run {
    *  Whole-run duration displays read this, falling back to started_at. Optional for rollout
    *  skew: an older api omits the key; null before the run first starts. */
   first_started_at?: string | null;
+  /** PRD #3166: the claim generation of the run's CURRENT attempt (runs.claim_generation); the server
+   *  sends 0 before the first claim. Cross-check activity markers and summaries carry the generation that produced
+   *  them, so this is what separates the current attempt's capture from an earlier one's. Optional
+   *  for rollout skew: null/absent only means an older api. */
+  claim_generation?: number | null;
   finished_at: string | null;
   created_at: string;
   updated_at: string;
@@ -3441,7 +3453,10 @@ export interface Run {
    *  a completion hold, 'credential_disabled' for a run waiting on a disabled credential
    *  (PRD #1732 D14; resumes on Enable, never on a plain Resume), 'budget_exhausted' for a
    *  wall-clock park (PRD #1497), and 'provider_unavailable' for a provider outage bound
-   *  reached (PRD #1733; owner Resume, scoped Stop when permitted, or Cancel).
+   *  reached (PRD #1733; owner Resume, scoped Stop when permitted, or Cancel), and
+   *  'base_attestation_missing' for a --require-base run that adopted retained work no
+   *  checkpoint attests to the planned base (issue #3194; the agent was not started, nothing
+   *  automatic leaves the hold, Resume and extend are refused; recover or start a successor).
    *  Render an unrecognised value honestly.
    *  `hold_context` is the constant "unavailable(same_worker_only)" ONLY while held, else null:
    *  the UI/CLI state the hold's durability HONESTLY from it — the hold is same-worker-only and

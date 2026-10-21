@@ -183,6 +183,10 @@ const maxPackBytes = 64 << 20 // 64 MiB
 // tip is a 400 (a worker bug) and never reaches the broker as a would-be object id.
 var checkpointTipRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
+// checkpointAttestedSourceRe matches a full lowercase-hex object id, SHA-1 (40) or SHA-256 (64):
+// the source OID a --require-base flight attests (issue #3194). Never a prefix.
+var checkpointAttestedSourceRe = regexp.MustCompile(`^(?:[0-9a-f]{40}|[0-9a-f]{64})$`)
+
 // WorkerRegister brings the worker online (and recovers any runs it orphaned by
 // restarting). Accepts an optional {version} body.
 func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
@@ -402,6 +406,7 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool) []stri
 		{"completion_non_closing_v1"},
 		{"dind_maintenance_v1"},
 		{"worker_memory_pressure_v1"},
+		{"worker_memory_authority_claim_v1"}, // issue #3142: this api accepts the run-lane claim body's memory_authority member
 		{"recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1", "recovery_completed_publication_v1", "recovery_archive_redundancy_v1"}, // PRD #1392 M1; issue #2625 adds the redundancy route
 		{"heartbeat_outbox"},          // PRD #1391 M5, Run A
 		{"worker_residue_quarantine"}, // issue #2213: this api accepts the heartbeat's residue_quarantine member
@@ -1091,6 +1096,11 @@ func (h *Handler) WorkerClaim(w http.ResponseWriter, r *http.Request) {
 		// never 400s. Chat stays bodyless (D10).
 		var req struct {
 			ActiveSnapshot json.RawMessage `json:"active_snapshot"`
+			// MemoryAuthority is the worker's "held" | "lost" report (issue #3142), sent only when
+			// this api advertised worker_memory_authority_claim_v1. Independent of the active-snapshot
+			// kill switch below: it carries no snapshot, so a disabled api still accepts it. Any
+			// value other than "held" counts as lost; the cross_check lane ignores it.
+			MemoryAuthority *string `json:"memory_authority"`
 		}
 		if err := httpx.DecodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
 			httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -1115,7 +1125,7 @@ func (h *Handler) WorkerClaim(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("lane") == "cross_check" {
 			payload, err = h.wsvc.ClaimCrossCheck(r.Context(), wkr, snapshot)
 		} else {
-			payload, err = h.wsvc.Claim(r.Context(), wkr, snapshot)
+			payload, err = h.wsvc.ClaimReported(r.Context(), wkr, snapshot, workersvc.MemoryAuthorityReport{Value: req.MemoryAuthority})
 		}
 		if err != nil {
 			// An invalid/stale-epoch/wrong-nonce claim snapshot fails the claim CLOSED (D3): 400,
@@ -2291,6 +2301,16 @@ func (h *Handler) WorkerRunPublish(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid checkpoint tip")
 		return
 	}
+	// Issue #3194: the optional source attestation. Absent is a legacy or unattested publish
+	// (nil); present must be a full OID, else a 400 (a worker bug) before anything is admitted.
+	var attestedSource *string
+	if raw, present := r.Header[http.CanonicalHeaderKey("X-Uzi-Checkpoint-Attested-Source")]; present {
+		if len(raw) != 1 || !checkpointAttestedSourceRe.MatchString(raw[0]) {
+			httpx.Error(w, http.StatusBadRequest, "invalid attested source")
+			return
+		}
+		attestedSource = &raw[0]
+	}
 	var claimGeneration *int64
 	if raw, present := r.URL.Query()["claim_generation"]; present {
 		if len(raw) != 1 {
@@ -2317,7 +2337,7 @@ func (h *Handler) WorkerRunPublish(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "could not read checkpoint pack")
 		return
 	}
-	res, err := h.wsvc.Publish(r.Context(), wkr, runID, tip, body, claimGeneration)
+	res, err := h.wsvc.PublishAttested(r.Context(), wkr, runID, tip, attestedSource, body, claimGeneration)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrMissingClaimGeneration) || errors.Is(err, workersvc.ErrStaleClaim) {
 			httpx.ErrorReason(w, http.StatusConflict, "checkpoint publish claim is stale", "stale_claim")

@@ -927,6 +927,10 @@ type Store interface {
 	// and leaves the pending-pause columns untouched, so the owner-pause path is unaffected. 0
 	// rows (guard fail) is the non-paused ack the worker's park order must retain the run on.
 	SetRunCompletionHold(ctx context.Context, arg store.SetRunCompletionHoldParams) (store.Run, error)
+	// SetRunBaseAttestationHold (issue #3194) holds a `--require-base` run whose retained work
+	// carries no attestation: running -> paused with hold_reason='base_attestation_missing',
+	// fenced to this worker's live claim generation. An owner-only exit; nothing automatic leaves it.
+	SetRunBaseAttestationHold(ctx context.Context, arg store.SetRunBaseAttestationHoldParams) (store.Run, error)
 	ResumePausedRun(ctx context.Context, arg store.ResumePausedRunParams) (store.ResumePausedRunRow, error)
 	// PRD #1732 D14: the credential_disabled park writer (exact undelivered claim), and the
 	// promoter's two keyset worklists (one owner's held runs; owners with any held run).
@@ -1939,6 +1943,9 @@ type Service struct {
 	// restart-losing — see quarantine_tracker.go. Nil-safe at every Service accessor so
 	// a struct-literal test service reads as "nothing latched".
 	quarantine *quarantineTracker
+	// memAuthority tracks workers whose run-lane claims were gated for lost memory authority
+	// (issue #3142). In-process and restart-losing, nil-safe — see memory_authority_tracker.go.
+	memAuthority *memoryAuthorityTracker
 	// forgeBaseURLAllowed is the SSRF gate for the M8 checkpoint-publish path (PRD
 	// #122): it reports whether a run's forge base URL is on the configured
 	// allowlist before the api will fetch/push against it. Set via
@@ -2312,7 +2319,7 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 		p.RunWallCeiling = min(max(24*time.Hour, p.RunTimeout), 72*time.Hour)
 	}
 	return &Service{
-		q: q, box: box, p: p, now: time.Now, persistFail: newPersistFailTracker(), outbox: newOutboxTracker(), quarantine: newQuarantineTracker(),
+		q: q, box: box, p: p, now: time.Now, persistFail: newPersistFailTracker(), outbox: newOutboxTracker(), quarantine: newQuarantineTracker(), memAuthority: newMemoryAuthorityTracker(),
 		publishFn:            pushbroker.Publish,
 		deleteCheckpointFn:   pushbroker.Delete,
 		salvageListRefTipsFn: pushbroker.ListRefTips,
@@ -2407,6 +2414,8 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 	// (issue #2213) no longer applies; a still-latched worker re-reports it on its
 	// next heartbeat.
 	s.quarantine.evictIfSet(wkr.ID)
+	// A fresh incarnation reports its own memory authority (issue #3142).
+	s.memAuthority.evictIfSet(wkr.ID)
 	max := int32(s.p.RunMaxRequeues) //nolint:gosec // G115: RunMaxRequeues is a small bounded config int (env RUN_MAX_REQUEUES), never near int32 range
 	// template is the worker's self-reported image template (PRD #18); empty →
 	// NULL (older image sends none). Soft signal only; never rejected here.
@@ -3172,8 +3181,24 @@ func (s *Service) RunBlockedOutcome(runID uuid.UUID) (reason string, workerID uu
 // CLOSED (ErrActiveSnapshotInvalid → the handler's 400). Without a snapshot (or without a tx
 // beginner: fake-store unit tests) it keeps the single auto-commit ClaimRun, which still applies
 // the persisted-snapshot exclusions and the overflow closure. Assembly always runs OUTSIDE the tx.
+//
+// Claim is the member-absent form (issue #3142): it reports no memory_authority. Only tests call
+// it; the HTTP handler calls ClaimReported.
 func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveSnapshot) (*ClaimPayload, error) {
-	return s.claimLane(ctx, wkr, snapshot, "run")
+	return s.claimLane(ctx, wkr, snapshot, "run", MemoryAuthorityReport{})
+}
+
+// ClaimReported is Claim carrying the request's memory_authority report (issue #3142). The
+// handler uses it. Claim above is the member-absent form, under which a capable worker is still
+// gated (fail closed).
+func (s *Service) ClaimReported(ctx context.Context, wkr store.Worker, snapshot *ActiveSnapshot, report MemoryAuthorityReport) (*ClaimPayload, error) {
+	return s.claimLane(ctx, wkr, snapshot, "run", report)
+}
+
+// MemoryAuthorityLostFor returns when the api first gated this worker's run-lane claims for lost
+// memory authority, false when it is not currently gated (issue #3142). In-process only.
+func (s *Service) MemoryAuthorityLostFor(workerID uuid.UUID) (time.Time, bool) {
+	return s.memAuthority.get(workerID)
 }
 
 // ClaimCrossCheck uses the run claim assembly and exact-generation finish transaction.
@@ -3181,10 +3206,10 @@ func (s *Service) ClaimCrossCheck(ctx context.Context, wkr store.Worker, snapsho
 	if s.txBeginner == nil {
 		return nil, errors.New("cross-check claim requires a transaction")
 	}
-	return s.claimLane(ctx, wkr, snapshot, "cross_check")
+	return s.claimLane(ctx, wkr, snapshot, "cross_check", MemoryAuthorityReport{})
 }
 
-func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *ActiveSnapshot, lane string) (*ClaimPayload, error) {
+func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *ActiveSnapshot, lane string, report MemoryAuthorityReport) (*ClaimPayload, error) {
 
 	// Vault gate (PRD #32 M3): while the run owner's vault is locked (after a pod
 	// restart, or a manual lock), do not claim any of their runs — report idle so
@@ -3293,7 +3318,20 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		custodyLimit = n
 	}
 	claimNow := s.now()
+	// Issue #3142: the memory-authority gate applies to the run/ordinary lanes only (the
+	// cross_check lane never reaches a memory runtime). claimRunInTx recomputes it from the
+	// locked re-read capabilities. A held report clears the visibility entry; an absent
+	// report from a worker that is not capable (old or guard-disabled) changes nothing.
+	memLost := lane != "cross_check" && memoryAuthorityLost(wkr.ProtocolCapabilities, report)
+	if lane != "cross_check" {
+		if memLost {
+			s.memAuthority.recordLost(wkr.ID, claimNow)
+		} else if report.held() {
+			s.memAuthority.evictIfSet(wkr.ID)
+		}
+	}
 	params := store.ClaimRunParams{
+		MemoryAuthorityLost:      memLost,
 		Lane:                     lane,
 		WorkerID:                 pgconv.UUID(wkr.ID),
 		UserID:                   wkr.UserID,
@@ -3366,7 +3404,7 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 	// This serializes both lane and legacy child occupancy before ClaimRun's snapshot.
 	if snapshot == nil || s.txBeginner == nil {
 		if s.txBeginner != nil {
-			return s.claimRunLeasedNoSnapshot(ctx, wkr, params)
+			return s.claimRunLeasedNoSnapshot(ctx, wkr, params, report)
 		}
 		run, err := s.q.ClaimRun(ctx, params)
 		if err != nil {
@@ -3439,7 +3477,7 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 	// claimRunInTx). Not claimed: COMMIT (the snapshot replace must persist) and report idle. On
 	// success, COMMIT and then assemble OUTSIDE the tx (assembly opens credentials + builds
 	// snapshots and must not hold the DB tx), exactly as the no-snapshot path does.
-	run, claimed, err := s.claimRunInTx(ctx, tx, qtx, wkr.ID, reread, params)
+	run, claimed, err := s.claimRunInTx(ctx, tx, qtx, wkr.ID, reread, params, report)
 	if err != nil {
 		return nil, err
 	}
@@ -3548,6 +3586,12 @@ var errCredentialUnavailable = errors.New("credential unavailable")
 // errRunVanished marks a claim whose run disappeared before its payload could be
 // assembled (a cascading delete of the forge connection).
 var errRunVanished = errors.New("run vanished before claim assembly")
+
+// errRunRepoOwnerMismatch marks a claim whose run still exists but whose repository is not
+// owned by the run's user, so GetRunClaimContext's owner predicate (#1688) returned no rows
+// (issue #1691). Its message carries no IDs. It is wrapped in errCredentialUnavailable so
+// finishRunClaim fails the run terminally through the fenced FailClaimAssemblyExact path.
+var errRunRepoOwnerMismatch = errors.New("the run's repository is not owned by the run's user")
 
 // errCustomModelCapabilityMissing marks a Codex claim whose effective worker-root model is a
 // CUSTOM (non-curated) id that the claiming worker cannot run — it does not advertise
@@ -6386,6 +6430,20 @@ type PublishResult struct {
 // and an error only for a genuine 5xx (misconfig, decrypt failure, transport fault)
 // the worker ignores as best-effort.
 func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID, tipOid string, pack []byte, claimGeneration ...*int64) (PublishResult, error) {
+	var generation *int64
+	if len(claimGeneration) > 0 {
+		generation = claimGeneration[0]
+	}
+	return s.PublishAttested(ctx, wkr, runID, tipOid, nil, pack, generation)
+}
+
+// PublishAttested is Publish carrying the request's optional source attestation (issue #3194;
+// nil: a legacy or unattested publish). The pair (tipOid, attestedSource) is frozen here, at
+// admission: it rides every attempt row this publish writes and is persisted on the run only
+// inside the same successful checkpoint-tip write (set-only; a nil never clears a stored value).
+// An attestation is accepted only on a request stamped with the claim generation it was admitted
+// at, so a value is only ever bound to this run's current worker and generation.
+func (s *Service) PublishAttested(ctx context.Context, wkr store.Worker, runID uuid.UUID, tipOid string, attestedSource *string, pack []byte, generation *int64) (PublishResult, error) {
 	// PRD #1810 D2 (residual 2): the publish is routed on the status read below, and a
 	// live-routed push must be SENT within livePublishPrePushBudget of that routing. The clock
 	// starts BEFORE the read, so a slow read can only shorten the budget, never start it after the
@@ -6395,9 +6453,8 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 	// 1. Server-derived authorization: the run must be owned by THIS worker.
 	// ErrRunNotOwned bubbles to the handler → 404. This is the only thing the worker
 	// named (the run id), and it can only reach its own runs.
-	var generation *int64
-	if len(claimGeneration) > 0 {
-		generation = claimGeneration[0]
+	if attestedSource != nil && generation == nil {
+		return PublishResult{}, ErrMissingClaimGeneration
 	}
 	// Admission reads the reconciliation audit only after worker -> run locking,
 	// including for legacy unstamped requests. Keep this caller-authorized snapshot
@@ -6514,7 +6571,8 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 	// waits out checkpointSupersessionCooling after its terminal commit, and each push is recorded
 	// durably before it is sent (checkpoint_publish_attempts), so one whose outcome is unknown and
 	// that lands late anyway is reconciled by the sweeper (reconcilePublishAttempts).
-	push := &checkpointPush{s: s, runID: runID, run: owned, branch: branch, ref: ref, opts: opts, routedAt: routedAt}
+	push := &checkpointPush{s: s, runID: runID, run: owned, branch: branch, ref: ref, opts: opts, routedAt: routedAt,
+		attestedSource: pgconv.TextPtr(attestedSource)}
 	if terminalStatuses[owned.Status] && s.retentionWired() {
 		return s.publishTerminalLocked(ctx, push, tipOid)
 	}
@@ -6731,8 +6789,9 @@ func (s *Service) persistPublishedTip(ctx context.Context, push *checkpointPush,
 	runID := push.runID
 	if !push.base.observed {
 		if _, err := s.q.SetRunCheckpointTip(ctx, store.SetRunCheckpointTipParams{
-			CheckpointTip: pgtype.Text{String: tipOid, Valid: true},
-			ID:            runID,
+			CheckpointTip:  pgtype.Text{String: tipOid, Valid: true},
+			ID:             runID,
+			AttestedSource: push.attestedSource,
 		}); err != nil {
 			slog.Warn("checkpoint: persist tip", "run", runID, "tip", tipOid, "error", err)
 			return false
@@ -6740,7 +6799,7 @@ func (s *Service) persistPublishedTip(ctx context.Context, push *checkpointPush,
 		return true
 	}
 	n, err := s.q.SetRunCheckpointTipIf(ctx, store.SetRunCheckpointTipIfParams{
-		CheckpointTip: tipOid, ID: runID, ExpectedTip: push.base.runTip,
+		CheckpointTip: tipOid, ID: runID, ExpectedTip: push.base.runTip, AttestedSource: push.attestedSource,
 	})
 	if err != nil {
 		slog.Warn("checkpoint: persist tip", "run", runID, "tip", tipOid, "error", err)
@@ -7067,6 +7126,7 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 	// best-effort — the TTL prune is the backstop for any path that skips this.
 	s.outbox.evict(workerID)
 	s.quarantine.evictIfSet(workerID)
+	s.memAuthority.evictIfSet(workerID)
 	return nil
 }
 

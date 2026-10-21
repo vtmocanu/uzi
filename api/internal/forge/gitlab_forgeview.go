@@ -69,7 +69,13 @@ func (g *gitLab) ListMergeRequestRefs(ctx context.Context, projectID int64, opts
 // closed-and-purged) is mapped to ErrMergeRequestNotFound BEFORE wrapErr — the
 // redactor would sever the Unwrap chain, and the sentinel carries no token material.
 func (g *gitLab) GetMergeRequestSummary(ctx context.Context, projectID, iid int64) (MergeRequestSummary, error) {
-	mr, resp, err := g.client.MergeRequests.GetMergeRequest(projectID, iid, nil, gitlab.WithContext(ctx))
+	// Same response ceilings as GetMergeRequest (#3038, #3226): checked before the
+	// 404 mapping, since a refused body never reached the SDK's decoder.
+	state := &responseLimitState{}
+	mr, resp, err := g.client.MergeRequests.GetMergeRequest(projectID, iid, nil, gitlab.WithContext(withResponseLimit(ctx, state)))
+	if state.overflow.Load() {
+		return MergeRequestSummary{}, g.wrapErr("get merge request summary", &ResponseTooLargeError{})
+	}
 	if err != nil {
 		if resp != nil && resp.StatusCode == http.StatusNotFound {
 			return MergeRequestSummary{}, ErrMergeRequestNotFound

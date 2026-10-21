@@ -13,6 +13,13 @@ import type { ClaimResponse } from "../src/protocol.js";
 import { makeFixture } from "./fixture-repo.js";
 import { makeClaim, nullLogger, testGitCacheOptions } from "./helpers.js";
 
+// Snapshot retirement and the stopped-source quiescence proofs (src/git.ts snapshotMaintenanceObjects,
+// src/runner.ts quiescence proofs) fail closed off Linux, so these scenarios cannot reach their
+// post-proof assertions on macOS (#1912). Linux runs every assertion.
+const LINUX_ONLY = process.platform !== "linux"
+  ? "needs the Linux-only descriptor-pinned maintenance snapshot and quiescence proofs (src/git.ts, src/runner.ts refuse off Linux)"
+  : false;
+
 function runGit(dir: string, ...args: string[]): string {
   return execFileSync("git", ["-C", dir, ...args], { encoding: "utf8" }).trim();
 }
@@ -97,7 +104,7 @@ it("a slow local-bare identity check runs before the model timer, so the snapsho
   } finally { f.fx.cleanup(); }
 });
 
-it("code snapshot ref survives until child settlement and is deleted by exact name", async (t) => {
+it("code snapshot ref survives until child settlement and is deleted by exact name", { skip: LINUX_ONLY }, async (t) => {
   const f = await fixture();
   try {
     runGit(f.bare, "update-ref", "refs/uzi-cross-check/unrelated", f.head);
@@ -167,7 +174,7 @@ it("code snapshot ref survives until child settlement and is deleted by exact na
 });
 
 for (const control of ["moved", "unknown-settlement", "cleanup-failed", "confinement-failed", "home-cleanup-failed", "cancelled-early-return", "malformed", "oversized-diff", "server-lead-generation", "server-lead-id", "server-no-row"] as const) {
-  it(`code snapshot lifetime control: ${control}`, async (t) => {
+  it(`code snapshot lifetime control: ${control}`, { skip: control === "malformed" || control === "oversized-diff" ? LINUX_ONLY : false }, async (t) => {
     const f = await fixture();
     let called = false;
     try {
@@ -308,7 +315,7 @@ async function closeReader(f: Awaited<ReturnType<typeof fixture>>, checkout: str
     { childId, childGeneration, terminalStatus: "completed", cleanupConfirmed: true });
 }
 
-it("durable OPEN holds across restart; exact CLOSED proof retires only its own ref", async () => {
+it("durable OPEN holds across restart; exact CLOSED proof retires only its own ref", { skip: LINUX_ONLY }, async () => {
   const f = await fixture();
   const childId = randomUUID();
   try {
@@ -333,7 +340,7 @@ it("durable OPEN holds across restart; exact CLOSED proof retires only its own r
   } finally { f.fx.cleanup(); }
 });
 
-it("older OPEN and sibling reader survive newer CLOSED; latest child proof is mandatory", async () => {
+it("older OPEN and sibling reader survive newer CLOSED; latest child proof is mandatory", { skip: LINUX_ONLY }, async () => {
   const f = await fixture();
   const childId = randomUUID();
   try {
@@ -369,7 +376,7 @@ it("launch failure after durable registration leaves OPEN even without a checkou
 });
 
 for (const guard of ["stale-boot", "disposition", "unsealed", "moved", "old-child", "old-launch", "open", "generation", "child"] as const) {
-  it("independent snapshot refusal reaches guard: " + guard, async () => {
+  it("independent snapshot refusal reaches guard: " + guard, { skip: ["stale-boot", "disposition", "unsealed", "moved", "old-child", "old-launch"].includes(guard) ? LINUX_ONLY : false }, async () => {
     const f = await fixture();
     const childId = randomUUID();
     try {
@@ -484,7 +491,7 @@ it("pin=false only verifies objects; strict identities and malformed metadata re
   } finally { f.fx.cleanup(); }
 });
 
-it("CODE fence blocks other registration and retirement without losing OPEN", async (t) => {
+it("CODE fence blocks other registration and retirement without losing OPEN", { skip: LINUX_ONLY }, async (t) => {
   const f = await fixture();
   const other = new GitCache(f.fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
   const childId = randomUUID();
@@ -523,7 +530,7 @@ it("CODE fence blocks other registration and retirement without losing OPEN", as
   }
 });
 
-it("CODE snapshot retains until closed", async () => {
+it("CODE snapshot retains until closed", { skip: LINUX_ONLY }, async () => {
   const f = await fixture();
   const other = new GitCache(f.fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
   const childId = randomUUID();
@@ -590,7 +597,7 @@ it("reader count limit preserves the existing OPEN history and refuses another l
 // operation fence (see the failed-fence test above), so each mismatch gets its own fixture.
 for (const proofKind of ["fresh", "latest-child"] as const) {
   for (const mismatch of ["lead id", "head", "pin generation"] as const) {
-    it(`snapshot retirement keeps the ref when a ${proofKind} proof's sealed outcome has the wrong ${mismatch}`, async () => {
+    it(`snapshot retirement keeps the ref when a ${proofKind} proof's sealed outcome has the wrong ${mismatch}`, { skip: proofKind === "latest-child" ? LINUX_ONLY : false }, async () => {
       const f = await fixture();
       try {
         const lead = proofKind === "fresh" ? "fresh" : "lead";
@@ -634,7 +641,7 @@ for (const field of ["leadId", "head", "pinGeneration"] as const) {
 for (const kind of ["no-row", "decided-no-child"] as const) {
   for (const guard of ["valid", "not-boot", "stale-boot", "wrong-generation", "child-attached"] as const) {
     if (kind === "no-row" && guard === "wrong-generation") continue;
-    it(`boot retirement of a never-read ref: ${kind} ${guard}`, async () => {
+    it(`boot retirement of a never-read ref: ${kind} ${guard}`, { skip: guard === "stale-boot" ? LINUX_ONLY : false }, async () => {
       const f = await fixture();
       try {
         await f.git.pinCodeSnapshot(f.bare, "norow", f.head, f.base, true, 3);
@@ -671,7 +678,7 @@ for (const kind of ["no-row", "decided-no-child"] as const) {
 
 // A rowless boot retirement needs local metadata with no child or reader history (PRD #2170 U2).
 for (const leadDisposition of ["terminal", "foreign"] as const) {
-  it(`boot retirement with no server row keeps a ref a checker child read: ${leadDisposition} lead`, async () => {
+  it(`boot retirement with no server row keeps a ref a checker child read: ${leadDisposition} lead`, { skip: LINUX_ONLY }, async () => {
     const f = await fixture();
     try {
       await f.git.pinCodeSnapshot(f.bare, "norow", f.head, f.base, true, 3);

@@ -527,6 +527,9 @@ uzi version
   differ (the default branch moved since you planned) it warns into the run feed, naming
   both commits, and implements anyway. `--require-base` turns that divergence into a hard
   failure instead, so the run stops rather than implement against a base that has moved.
+  Under `--require-base` a continuation of the run's own work (after a pause and `uzi run
+  extend`, or on another worker) proceeds only from content its own checkpoint recorded after
+  the check passed; otherwise the run is held (`base_attestation_missing`) with its work kept.
   Both require `--plan-file`, and `--require-base` requires `--planned-commit` — either
   combination is a usage error.
 

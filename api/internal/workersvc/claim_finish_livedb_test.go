@@ -905,3 +905,40 @@ func TestFailClaimAssemblyExactCardlessKeepsMovePendingNullLiveDB(t *testing.T) 
 		}
 	}
 }
+
+// TestClaimOwnerMismatchFailsFencedLiveDB (issue #1691): a run whose repo_id points at another
+// user's repo makes GetRunClaimContext return no rows (the #1688 owner predicate). The claim
+// must fail the run terminally as credential_unavailable through the fenced exact-claim
+// transaction, with a reason that names neither the other repo nor the other user, rather than
+// drop it silently and let it cycle claimed -> queued.
+func TestClaimOwnerMismatchFailsFencedLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	fx := newCodexClaimFix(t, env, true)
+
+	otherUser, otherConn, otherRepo := uuid.New(), uuid.New(), uuid.New()
+	env.exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, otherUser, fmt.Sprintf("ownmm-%s@e2e", otherUser))
+	env.exec(`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+	          VALUES ($1, $2, 'github', 'https://forge.e2e', 'bot', 1, $3)`, otherConn, otherUser, []byte("sealed-other"))
+	env.exec(`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+	          VALUES ($1, $2, 1, $3, 'https://forge.e2e/g/ownmm', 'main', true)`, otherRepo, otherConn, "g/ownmm-"+otherRepo.String())
+	env.exec("UPDATE runs SET repo_id = $1 WHERE id = $2", otherRepo, fx.runID)
+
+	payload, err := fx.svc.Claim(env.ctx, fx.claimant(t, true), nil)
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	fx.assertNoClaudeFallback(t, payload)
+	r := mustRun(t, env, fx.runID)
+	if r.Status != "failed" || r.FailOrigin.String != "credential_unavailable" || !r.MovePendingSince.Valid {
+		t.Fatalf("status=%s origin=%v move_pending=%v, want failed/credential_unavailable", r.Status, r.FailOrigin, r.MovePendingSince)
+	}
+	reason := r.FailureReason.String
+	if !strings.Contains(reason, errRunRepoOwnerMismatch.Error()) {
+		t.Fatalf("failure reason %q does not carry the mismatch text", reason)
+	}
+	if strings.Contains(reason, otherRepo.String()) || strings.Contains(reason, otherUser.String()) {
+		t.Fatalf("failure reason %q leaks the other user's repo or user id", reason)
+	}
+	assertClaimRecoveryHold(t, env, fx.holdA, "open", false)
+	assertClaimRecoveryHold(t, env, fx.holdB(t), "released", true)
+}

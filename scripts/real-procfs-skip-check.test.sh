@@ -289,7 +289,8 @@ EOF
   PRELOAD_URL="$(node -e 'process.stdout.write(require("node:url").pathToFileURL(process.argv[1]).href)' -- "$PRELOAD")"
   ARGV="$TMP/node-argv"
   : > "$ARGV"
-  if (cd "$ROOT/agent" && env UZI_PACKAGE_CHILD_ARGV="$ARGV" \
+  # The launcher writes a report per invocation; keep this stub's out of the real agent/.test-report.
+  if (cd "$ROOT/agent" && env UZI_PACKAGE_CHILD_ARGV="$ARGV" UZI_AGENT_TEST_REPORT_DIR="$TMP/agent-test-report" \
     NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--import=$PRELOAD_URL" \
     UZI_AGENT_TEST_CONCURRENCY=1 sh -c "$test_script") > "$TMP/package-script-output" 2>&1 &&
     grep -qx -- '--test-concurrency=1' "$ARGV"; then
@@ -301,7 +302,7 @@ EOF
   fi
   # --test proves the actual test-child boundary was reached.
   : > "$ARGV"
-  if (cd "$ROOT/agent" && env -u UZI_AGENT_TEST_CONCURRENCY UZI_PACKAGE_CHILD_ARGV="$ARGV" \
+  if (cd "$ROOT/agent" && env -u UZI_AGENT_TEST_CONCURRENCY UZI_PACKAGE_CHILD_ARGV="$ARGV" UZI_AGENT_TEST_REPORT_DIR="$TMP/agent-test-report" \
     NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--import=$PRELOAD_URL" \
     sh -c "$test_script") > "$TMP/package-script-output" 2>&1 &&
     grep -qx -- '--test' "$ARGV" && ! grep -q -- '^--test-concurrency' "$ARGV"; then

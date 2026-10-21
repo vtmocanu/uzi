@@ -1,4 +1,5 @@
 // Dedicated one-turn checker lifecycle. It never enters CodexExecutor's lead loop.
+import type { ActivityOp, CheckActivityRecorder } from "../cross-check-activity.js";
 import path from "node:path";
 import { SCRATCH_PLACEMENT_FACT } from "../scratch-guidance.js";
 import { decodeCodeFindings } from "../code-cross-check-contract.js";
@@ -7,7 +8,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import type { WorkerClient } from "../client.js";
 import type { ClaimResponse } from "../protocol.js";
 import type { Logger } from "../log.js";
-import { CodexCallbackBroker, type RunGrants } from "./broker.js";
+import { canonicalizeCodexToolName, CodexCallbackBroker, firstStrField, type CallbackResult, type RunGrants } from "./broker.js";
 import { buildCodexDynamicTools } from "./dynamic-tools.js";
 import { wireFileopHelper } from "./fileop-client.js";
 import { ExecutionRegistry, newLocalExecutionEpoch } from "./registry.js";
@@ -113,6 +114,50 @@ const GRANTS: RunGrants = Object.freeze({
  allowedTools: immutableSet(["Read", "Search"]), allowedSkills: immutableSet([]),
 });
 
+/** Register a Read or Search call with the activity recorder. Reads only the tool name and the
+ *  `path` / `file_path` argument: never `query` or any other argument. Telemetry never throws. */
+function beginActivity(activity: CheckActivityRecorder, callId: string, tool: unknown, args: unknown): ActivityOp | undefined {
+ try {
+  const canonical = typeof tool === "string" ? canonicalizeCodexToolName(tool) : "";
+  const kind: ActivityOp | undefined = canonical === "Read" ? "read" : canonical === "Search" ? "search" : undefined;
+  if (!kind) return undefined;
+  // Same pick as the broker's Read and Search dispatch: the first non-empty string.
+  activity.begin(callId, kind, firstStrField(args, ["path", "file_path"]));
+  return kind;
+ } catch { return undefined; }
+}
+
+function positiveSafeInt(v: unknown): v is number {
+ return typeof v === "number" && Number.isSafeInteger(v) && v > 0;
+}
+
+/** Map a broker result onto an activity outcome. Outside-checkout categorisation is left to the
+ *  recorder's own path resolution at begin time; only policy denials name a category here. */
+function settleActivity(activity: CheckActivityRecorder, callId: string, kind: ActivityOp, result: CallbackResult): void {
+ try {
+  if (result.ok) {
+   const out = object(result.output);
+   if (kind === "read") {
+    const lines = positiveSafeInt(out?.offset) && positiveSafeInt(out?.linesReturned) && out?.replay !== true
+     ? [out.offset, out.offset + out.linesReturned - 1] as const : undefined;
+    activity.settle(callId, lines ? { outcome: "ok", lines } : { outcome: "ok" });
+   } else {
+    const matches = Array.isArray(out?.matches) ? out.matches.length : undefined;
+    activity.settle(callId, matches === undefined ? { outcome: "ok" }
+     : { outcome: "ok", matches, matchesTruncated: out?.truncated === true });
+   }
+   return;
+  }
+  const fileop = result.fileopCode;
+  if (fileop === "E_OVERSIZE") activity.settle(callId, { outcome: "oversize" });
+  else if (fileop === "E_TIMEOUT" || result.code === "search_limit") activity.settle(callId, { outcome: "limit" });
+  else if (fileop === "E_ESCAPE" || fileop === "E_SYMLINK" || result.code === "path_denied") activity.settle(callId, { outcome: "denied" });
+  else if (fileop === "E_DENIED" || result.code === "denied_tool" || result.code === "unknown_tool") {
+   activity.settle(callId, { outcome: "denied", category: "policy" });
+  } else activity.settle(callId, { outcome: "error" });
+ } catch { /* telemetry only */ }
+}
+
 function fence(label: string, text: string): string {
  const nonce = randomBytes(16).toString("hex");
  return `<${label}_${nonce}>\n${text}\n</${label}_${nonce}>`;
@@ -169,7 +214,9 @@ export class CodexCrossCheck {
  constructor(private readonly client: Pick<WorkerClient, "releaseCodex" | "refreshCodex">, private readonly log: Logger, private readonly deps: CrossCheckModelDeps = {}) {}
 
  async run(claim: ClaimResponse, checkout: string, home: string, signal: AbortSignal,
-  postUsage: (payload: Record<string, unknown>) => Promise<void>, confirmNativeCleanup?: () => void): Promise<string> {
+  postUsage: (payload: Record<string, unknown>) => Promise<void>, confirmNativeCleanup?: () => void,
+    /** Activity recorder (PRD #3166); fed paths, line ranges and counts only: never a query or file content. */
+    activity?: CheckActivityRecorder): Promise<string> {
   const selected = selectCodexBinding(claim.secrets);
   if (claim.kind !== "cross_check" || selected.kind !== "codex") throw new Error("cross-check requires Codex");
   const prompt = crossCheckPrompt(claim);
@@ -311,6 +358,8 @@ export class CodexCrossCheck {
    startingTurn = false;
    const turnId = turn.turn?.id;
    if (typeof turnId !== "string" || !turnId) throw new Error("cross-check missing turn");
+   // The confirmed turn start is the first evidence that the model session started.
+   try { activity?.modelStarted(); } catch { /* telemetry only */ }
    let calls = 0;
    let modelActivity = false;
    let verdictText: string | undefined;
@@ -330,8 +379,10 @@ export class CodexCrossCheck {
     } else if (note.method === "item/tool/call" && note.kind === "activity" && note.requestId !== undefined) {
      if (++calls > 200) throw new Error("cross-check cumulative tool budget exceeded");
      if (!bound || typeof params?.callId !== "string") throw new Error("cross-check foreign tool callback");
+     const activityKind = activity ? beginActivity(activity, params.callId, params.tool, params.arguments) : undefined;
      const result = await broker.handleToolCall({ threadId, turnId, callId: params.callId },
       params.tool, params.arguments, "root");
+     if (activity && activityKind) settleActivity(activity, params.callId, activityKind, result);
      transport.respond(note.requestId, { result: {
       contentItems: [{ type: "inputText", text: result.ok
        ? fence("repository_excerpt", JSON.stringify(result.output)) : result.message }],

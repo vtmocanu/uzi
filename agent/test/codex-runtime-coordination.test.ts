@@ -1,6 +1,5 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import * as ts from "typescript/unstable/ast";
@@ -8,6 +7,7 @@ import { API } from "typescript/unstable/sync";
 import { fileURLToPath } from "node:url";
 import { CODEX_BIN } from "../src/codex/launcher.js";
 import { CODEX_PROBE_EXPECTATION } from "../src/codex/codex-runtime-probe.js";
+import { PIN_SCAN_PATTERN, scannedPinFiles } from "./codex-pins.js";
 
 const lock = readFileSync(new URL("../codex/codex-package.lock", import.meta.url), "utf8");
 function value(key: string): string {
@@ -20,20 +20,10 @@ const version = value("CODEX_VERSION");
 it("tracked live Codex runtime pins match the lock", (t) => {
   // This checkout-only suite already reads repo-level M4 sources. Packaged worker-UID
   // and M3 image lanes select other files; missing git/checkout is a failure, not a skip.
-  const semver = String.raw`[0-9]+\.[0-9]+\.[0-9]+`;
-  const pattern = `(/opt/uzi-codex/|codex-cli |Codex worker uses runtime )(${semver})`;
+  // The scan definition is shared with `task codex-pins:sync` (test/codex-pins.ts).
+  const pattern = PIN_SCAN_PATTERN;
   const root = fileURLToPath(new URL("../../", import.meta.url));
-  const scan = spawnSync("git", [
-    "-c", "core.fsmonitor=false", "grep", "--no-color", "-I", "-l", "-z", "-E", pattern, "--", ".",
-    ":(exclude)adr/**", ":(exclude)prds/**", ":(exclude)CHANGELOG.md", ":(exclude)changelog.d/**",
-    // Recorded execution evidence, not the current worker contract.
-    ":(exclude)e2e/worker-uid/issue-2397-investigation.md",
-    // Synthetic version output deliberately includes mismatches to test the verifier.
-    ":(exclude)e2e/codex-m4/provision.test.ts",
-  ], { cwd: root, encoding: "utf8", maxBuffer: 1024 * 1024 });
-  assert.ifError(scan.error);
-  assert.equal(scan.status, 0, `git grep must find live Codex pins: ${scan.stderr}`);
-  const files = scan.stdout.split("\0").filter(Boolean);
+  const files = scannedPinFiles(root);
   const stale: string[] = [];
   let matches = 0;
   for (const file of files) {

@@ -15,6 +15,13 @@ import { recordingLogger, nullLogger } from "./helpers.js";
 import { api, client, fakeGitlab, git, gitlabClaim, homeDir, installHarness, deferred, runnerWith } from "./runner-harness.js";
 import { passingExclusion } from "./maintenance-exclusion-fixture.js";
 
+// A fresh source is observed only through the Linux-only quiescence / stopped-source proofs
+// (src/runner.ts "non_linux_host" refusal, src/run-quiescence.ts), so it never qualifies on macOS (#1912).
+// Linux runs every assertion.
+const LINUX_ONLY = process.platform !== "linux"
+  ? "needs the Linux-only run-quiescence / stopped-source proof (src/run-quiescence.ts, src/runner.ts refuse off Linux)"
+  : false;
+
 installHarness();
 
 function command(cwd: string, ...args: string[]): string {
@@ -27,7 +34,7 @@ for (const mode of ["normal", "origin-production-default", "origin-admission", "
   "origin-transfer-final-family", "origin-transfer-head", "origin-transfer-revoked", "origin-transfer-missing", "notification-throw", "notification-reject", "unapplied", "lost", "stale", "wrong-status", "missing-status",
   "missing-process", "missing-reproof", "unverified", "failed-reap", "late-fence",
   "failed-home", "failed-skills", "failed-owed", "record-none", "prior-record-none", "reclaimed", "nonmatching-error", "post-run-error"] as const) {
-it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, async (t) => {
+it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, { skip: ["origin-admission", "origin-pressure", "origin-transfer-final-family", "origin-transfer-head", "origin-transfer-revoked", "failed-reap"].includes(mode) ? LINUX_ONLY : false }, async (t) => {
   const originMode = mode.startsWith("origin-");
   const dirtyOrigin = mode === "origin-admission" || mode.startsWith("origin-transfer-");
   let transferCalls = 0, transferEntered = 0, transferBodyComplete = false, transferSettled = false;

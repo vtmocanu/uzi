@@ -10,6 +10,12 @@ import { recordingLogger } from "./helpers.js";
 import { client, deferred, fakeGitlab, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
 import { passingExclusion } from "./maintenance-exclusion-fixture.js";
 
+// The runner's stopped-source and quiescence proofs (src/runner.ts, src/run-quiescence.ts) refuse off
+// Linux, so this scenario cannot reach its post-proof assertions on macOS (#1912). Linux runs it unchanged.
+const LINUX_ONLY = process.platform !== "linux"
+  ? "needs the Linux-only run-quiescence / stopped-source proof (src/run-quiescence.ts, src/runner.ts refuse off Linux)"
+  : false;
+
 installHarness();
 
 function command(cwd: string, ...args: string[]): string {
@@ -19,7 +25,7 @@ function command(cwd: string, ...args: string[]): string {
 // Issue #3031: a terminal saved-evidence pass occupies the coordinator's pass set, and
 // RecoveryCoordinator.resumeLive returns early while any pass is in flight. A live re-drive is
 // therefore suppressed (not lost) while a terminal pass is blocked, and resumes after it settles.
-it("#3031 live re-drive is suppressed during a blocked terminal pass and resumes once after it", async (t) => {
+it("#3031 live re-drive is suppressed during a blocked terminal pass and resumes once after it", { skip: LINUX_ONLY }, async (t) => {
   const token = "fixture-journal-key";
   const claim = gitlabClaim(3031, { claim_generation: 2, inventory_guarded: true });
   const runA = claim.run_id, runB = "00000000-0000-4000-8000-00000000b031";

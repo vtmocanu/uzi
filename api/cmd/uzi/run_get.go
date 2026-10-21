@@ -101,6 +101,18 @@ func newRunGetCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err := renderRunDetail(p, run, origin); err != nil {
 				return err
 			}
+			// Cross-check activity evidence (PRD #3166): best-effort, human-only, one line. A
+			// log read error prints nothing extra.
+			if run.Kind == "cross_check" {
+				if messages, logErr := c.RunLogs(cmd.Context(), args[0], 0); logErr == nil {
+					terminal := terminalRunStatuses[run.Status]
+					if line := checkActivityLine(messages, run.ClaimGeneration, terminal, run.FirstStartedAt != nil); line != "" {
+						if err := p.Table(nil, [][]string{{"ACTIVITY", capCell(cellText(line), 300)}}); err != nil {
+							return err
+						}
+					}
+				}
+			}
 			// Metadata-only durable-recovery summary (PRD #1296 D7): best-effort, human-only,
 			// appended after the detail block. It NEVER widens raw access and prints nothing
 			// when the run has no recovery content, so an ordinary run's output is unchanged.
@@ -217,7 +229,7 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 				// is the same split cobra's deprecation notice already uses here.
 				holdKey := run.Status + "/" + strOr(run.HoldReason, "") + "/" + strOr(run.RecoveryWaitCause, "")
 				if run.Status == statusLimitWait || run.Status == statusPoolWait || run.Status == statusRecoveryWait ||
-					isCredentialDisabledHold(run) || isProviderUnavailableHold(run) {
+					isCredentialDisabledHold(run) || isProviderUnavailableHold(run) || isBaseAttestationHold(run) {
 					if parkedIn != holdKey {
 						parkedIn = holdKey
 						// pool_wait and recovery_wait are the sibling silences limit_wait is
@@ -229,7 +241,7 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 						// hold to another is announced as the new hold.
 						switch run.Status {
 						case statusPaused:
-							if isProviderUnavailableHold(run) {
+							if isProviderUnavailableHold(run) || isBaseAttestationHold(run) {
 								_, _ = fmt.Fprintf(env.Stderr, "run %s %s; still following\n", cellText(args[0]), pausedHoldNotice(run))
 								break
 							}

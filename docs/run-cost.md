@@ -176,9 +176,11 @@ embeds its byte-identical mirror at
 rates and provenance constants live in
 `api/internal/anthropicprice/anthropicprice.go`.
 
-A human must verify the affected rates and model coverage against the
-official pricing and model pages recorded in each row's `sources`, or
-Anthropic's `AnthropicPriceSourceURL`. Update the Codex table's `version`
+No human step: an agent and its review buddy each fetch the official
+pricing and model pages recorded in each row's `sources` (or Anthropic's
+`AnthropicPriceSourceURL`) independently and agree on the affected rates and
+model coverage, recording the sources and rates each checked in the change,
+before any date or rate moves. Update the Codex table's `version`
 when its pricing changes, and each checked row's `verified_at` to the actual
 verification date; review any `promo_review_date` against the official
 promotion terms. For Anthropic, update `AnthropicPriceTableVersion` when

@@ -1127,6 +1127,7 @@ func run() error {
 	healthSvc := healthsvc.New(healthsvc.Config{
 		WorkerEligibilityForHealth:   wsvc.WorkerEligibilityForHealth,
 		ResidueQuarantine:            wsvc.ResidueQuarantineFor,
+		MemoryAuthorityLost:          wsvc.MemoryAuthorityLostFor,
 		Store:                        q,
 		Pool:                         pool,
 		DiskFull:                     diskFull,

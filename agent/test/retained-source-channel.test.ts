@@ -26,6 +26,13 @@ import { noProofReseed, nullLogger, recordingLogger, testGitCacheOptions } from 
 import { fixtureFetchTracking } from "./runner-tracking-fixture.js";
 import { mkdtempForSocket } from "./short-sock-dir.js";
 
+// Retained-source coverage and discard run behind the Linux-only quiescence proofs (src/run-quiescence.ts,
+// src/runner.ts "non_linux_host" refusal), so a source is never covered / a discard never proceeds on macOS (#1912).
+// Linux runs every assertion.
+const LINUX_ONLY = process.platform !== "linux"
+  ? "needs the Linux-only run-quiescence / stopped-source proof (src/run-quiescence.ts, src/runner.ts refuse off Linux)"
+  : false;
+
 // issue #1786 M0b — the operator retained-source channel, against a REAL GitCache, a REAL RunRunner
 // reservation, the REAL Worker claim loops and a REAL Unix socket. The destructive sequence is
 //   gate closed -> in-flight claims drained -> idle proven -> run reservation installed ->
@@ -398,7 +405,7 @@ function claimWorker(rig: Rig, opts: { claimRun: () => Promise<ClaimResponse | n
 }
 
 describe("discard through the real socket", () => {
-  it("runs gate closed -> drained -> idle -> reservation -> holds read -> bare lock -> deletion -> release -> gate reopened", async () => {
+  it("runs gate closed -> drained -> idle -> reservation -> holds read -> bare lock -> deletion -> release -> gate reopened", { skip: LINUX_ONLY }, async () => {
     const a = await retainedAttempt("run-seq", 1);
     const rig = await rigOf();
     const ev = await inspectOne(rig, a);
@@ -429,7 +436,7 @@ describe("discard through the real socket", () => {
     assert.deepEqual(rig.holdsCalls.filter((x) => x === a.runId).length >= 1, true);
   });
 
-  it("the quiescence the boundary hands GitCache is capture-mode and scoped to the clone and its skills sibling", async () => {
+  it("the quiescence the boundary hands GitCache is capture-mode and scoped to the clone and its skills sibling", { skip: LINUX_ONLY }, async () => {
     const a = await retainedAttempt("run-q", 1);
     const skills = path.join(path.dirname(a.path), `.uzi-skills-${path.basename(a.path)}`);
     fs.mkdirSync(skills);
@@ -460,7 +467,7 @@ describe("discard through the real socket", () => {
     assert.equal(rig.gate.claimsClosed(), false);
   });
 
-  it("a Docker-wired discard is refused when the Docker teardown errored, and proceeds when it is merely unconfirmed", async () => {
+  it("a Docker-wired discard is refused when the Docker teardown errored, and proceeds when it is merely unconfirmed", { skip: LINUX_ONLY }, async () => {
     const dockerOf = (state: string) => async () => ({ process: { state: "quiescent" }, docker: { state, removed: [], detail: "" } }) as unknown as QuiesceRunOutcome;
     const a = await retainedAttempt("run-dk", 1);
     const bad = await rigOf({ quiesce: dockerOf("docker_error"), runnerOpts: { dockerHost: "unix:///nonexistent/uzi-test-docker.sock" } });
@@ -478,7 +485,7 @@ describe("discard through the real socket", () => {
     assert.equal(fs.existsSync(a.path), false);
   });
 
-  it("a held cache or maintenance blocker stays closed after retained_ops reopens", async () => {
+  it("a held cache or maintenance blocker stays closed after retained_ops reopens", { skip: LINUX_ONLY }, async () => {
     const a = await retainedAttempt("run-block", 1);
     const rig = await rigOf();
     rig.gate.close("cache");
@@ -546,7 +553,7 @@ describe("discard through the real socket", () => {
     assert.equal(rig.gate.claimsClosed(), false);
   });
 
-  it("background recovery holding the run reservation refuses the discard; it succeeds once released", async () => {
+  it("background recovery holding the run reservation refuses the discard; it succeeds once released", { skip: LINUX_ONLY }, async () => {
     const a = await retainedAttempt("run-rec", 1);
     const rig = await rigOf();
     const ev = await inspectOne(rig, a);
@@ -566,7 +573,7 @@ describe("discard through the real socket", () => {
     assert.equal(again.result.kind, "done", JSON.stringify(again));
   });
 
-  it("a second concurrent discard is busy (no queue); the first still completes", async () => {
+  it("a second concurrent discard is busy (no queue); the first still completes", { skip: LINUX_ONLY }, async () => {
     const a = await retainedAttempt("run-busy", 1);
     const rig = await rigOf();
     const ev = await inspectOne(rig, a);
@@ -728,7 +735,7 @@ describe("the claim race, through the real Worker claim loops", () => {
     }
   });
 
-  it("with no claim in flight the discard completes first under the closed gate: no claim starts between the idle proof and the deletion", async () => {
+  it("with no claim in flight the discard completes first under the closed gate: no claim starts between the idle proof and the deletion", { skip: LINUX_ONLY }, async () => {
     // Invariant under test: gate closed, claims drained, idle proven, run reservation held through
     // disposal; the claim CTE is the only production hold insertion, so the pre-lock holds read is current.
     const a = await retainedAttempt("run-race2", 1);
@@ -810,7 +817,7 @@ describe("disconnects", () => {
     assert.equal(after.sources.length, 1);
   });
 
-  it("a client that leaves once the destructive stage began does not stop it: the exact disposition is recorded for inspect", async () => {
+  it("a client that leaves once the destructive stage began does not stop it: the exact disposition is recorded for inspect", { skip: LINUX_ONLY }, async () => {
     const a = await retainedAttempt("run-dc2", 1);
     const gateOpen = deferred();
     const rig = await rigOf({
@@ -864,7 +871,7 @@ describe("inspect", () => {
     }
   });
 
-  it("logs a bounded retained count and bytes after an operation, without touching the heartbeat", async () => {
+  it("logs a bounded retained count and bytes after an operation, without touching the heartbeat", { skip: LINUX_ONLY }, async () => {
     const a = await retainedAttempt("run-diag", 1);
     const { logger, lines } = recordingLogger();
     const rig = await rigOf({ log: logger });
@@ -885,7 +892,7 @@ describe("inspect", () => {
 describe("protected-source discard through the real socket channel", () => {
   const epSel = () => ({ runId: EP_RUN, attemptId: aid(2) });
 
-  it("completes against a real episode fixture within a bounded deadline, with no deadlock on the bare lock", async () => {
+  it("completes against a real episode fixture within a bounded deadline, with no deadlock on the bare lock", { skip: LINUX_ONLY }, async () => {
     const e = await buildEpisode();
     const rig = await rigOf();
     const ev = await inspectOne(rig, epSel(), 2);
@@ -943,7 +950,7 @@ describe("a canonical source left under its plain journal, through the real sock
     return { branch, runId, path: clone.path };
   };
 
-  it("with no server hold it is listed and discarded; the plain journal goes with it", async () => {
+  it("with no server hold it is listed and discarded; the plain journal goes with it", { skip: LINUX_ONLY }, async () => {
     const c = await plainCanonical("run-plain", 2810);
     const rig = await rigOf();
     const ev = await inspectOne(rig, { runId: c.runId }, "none");

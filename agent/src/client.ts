@@ -109,6 +109,8 @@ import {
   type RecoveryLiveSettleRequest,
   type RecoverySettleRequest,
   type RecoverySettleResponse,
+  type BaseAttestationHoldOutcome,
+  BASE_ATTESTATION_HOLD_REASON,
 } from "./protocol.js";
 
 export type PlanCrossCheckGateReason = "revise" | "block" | "malformed" | "model_error" | "model_timeout"
@@ -1182,6 +1184,9 @@ type CompletionReservation = { live: boolean; tickets: Set<CompletionTicket> };
 export class WorkerClient {
   private registeredWorkerId: string | undefined;
   private hasExactHoldCapability = false;
+  /** Issue #3142: this registration advertised worker_memory_authority_claim_v1. */
+  private hasMemoryAuthorityClaimCapability = false;
+  private memoryAuthorityLostLogged = false;
   // Provenance survives uncertain registration; only a successful changed identity resets it.
   private completionWorkerId: string | undefined;
   private completionInventoryUnreadable = false;
@@ -1490,6 +1495,7 @@ export class WorkerClient {
     // are fenced server-side) even when a one-shot register missed the negotiated feature.
     this.hasCredentialSwitchCapability = originalCapabilities?.includes("credential_switch_v1") ?? false;
     this.hasExactHoldCapability = originalCapabilities?.includes("recovery_held_publication_v2") ?? false;
+    this.hasMemoryAuthorityClaimCapability = originalCapabilities?.includes("worker_memory_authority_claim_v1") ?? false;
     // PRD #1390 M2a: capture the per-registration nonce the api minted, stamped onto every
     // ActiveSnapshot the worker sends. A string only (defensive); absent on an older api ⇒
     // undefined, in which case no snapshot is sent even if later heartbeat adverts grow the cache.
@@ -1708,7 +1714,12 @@ export class WorkerClient {
    *  nonce exists (nonce-stamped), so the
    *  api's pre-claim dedupe sees the runs this worker is already executing BEFORE the first
    *  post-outage heartbeat lands. If not negotiated the claim posts an empty body `{}`, which
-   *  an old api ignores (harmless — the run-lane claim was bodyless before this). */
+   *  an old api ignores (harmless — the run-lane claim was bodyless before this).
+   *
+   *  Issue #3142: when this registration advertised `worker_memory_authority_claim_v1` and the api
+   *  negotiated it, the body also carries `memory_authority` ("held" while the memory incarnation is
+   *  live, "lost" once revoked). Computed synchronously at body build time, so an admission wait
+   *  before the call cannot leave a stale value. The cross-check lane never carries it. */
   async claimRun(activeSnapshot?: ActiveSnapshot, signal?: AbortSignal, timeoutMs = this.httpTimeoutMs): Promise<ClaimResponse | null> {
     return this.claimRunLane(`${WORKER_API_PREFIX}/runs/claim`, activeSnapshot, signal, timeoutMs);
   }
@@ -1729,6 +1740,13 @@ export class WorkerClient {
       const body: ClaimRequest = {};
       if (this.hasFeature("active_run_snapshot") && activeSnapshot !== undefined && this.registerNonce !== undefined) {
         body.active_snapshot = { ...activeSnapshot, register_nonce: this.registerNonce };
+      }
+      if (!dedicated && this.hasMemoryAuthorityClaimCapability && this.hasFeature("worker_memory_authority_claim_v1")) {
+        body.memory_authority = this.memoryIncarnationValue ? "held" : "lost";
+        if (body.memory_authority === "lost" && !this.memoryAuthorityLostLogged) {
+          this.memoryAuthorityLostLogged = true;
+          this.log.warn("memory authority lost; claims report it and the api stops dispatching guard-bound runs here until the worker restarts", {});
+        }
       }
       const res = await this.fetchRaw("POST", path, body, timeoutMs, deadline);
       deadline.throwIfAborted();
@@ -2390,6 +2408,8 @@ export class WorkerClient {
     pack: Readable,
     boundarySignal?: AbortSignal,
     claimGeneration?: number,
+    /** issue #3194: the packed source this flight attests was produced on an accepted base. */
+    attestedSource?: string,
   ): Promise<PublishResult> {
     const query = claimGeneration !== undefined && claimGeneration > 0
       ? `?claim_generation=${encodeURIComponent(claimGeneration)}` : "";
@@ -2404,6 +2424,7 @@ export class WorkerClient {
         "X-Client-Version": this.version,
         "Content-Type": "application/octet-stream",
         "X-Uzi-Checkpoint-Tip": tipOid,
+        ...(attestedSource ? { "X-Uzi-Checkpoint-Attested-Source": attestedSource } : {}),
       },
       body: pack,
       // undici requires `duplex: "half"` for a streamed (Readable) request body; without it
@@ -3600,6 +3621,47 @@ export class WorkerClient {
       // ambiguous; enterCompletionHold retains artifacts while reconciling ownership.
       return { status: "" };
     });
+  }
+
+  /** issue #3194: ask the server to hold this flight's own claim on the `--require-base`
+   *  base-attestation hold (POST /worker/runs/:id/base-attestation-hold): running -> paused with
+   *  hold_reason='base_attestation_missing'. The claim generation is mandatory and never stripped:
+   *  the hold refuses resume, so it must not land on a claim this flight lost. One attempt, no retry.
+   *
+   *  Never throws. The outcome is `held` ONLY on a 200 whose body names this exact hold (a repeat
+   *  for a generation already held answers the same 200); `stale` on a 409 (the fence refused: the
+   *  claim moved on or the run left `running`); `unknown` for everything else: a transport error,
+   *  a 5xx, a 404 (an older server without the route, or a run no longer this worker's), a 400 (an
+   *  older or stricter server refusing the request) or an unreadable body. The caller keeps the
+   *  clone and custody on every outcome; the classification only decides what it may report. */
+  async requestBaseAttestationHold(
+    runId: string,
+    args: { head: string; claimGeneration: number },
+    signal?: AbortSignal,
+  ): Promise<BaseAttestationHoldOutcome> {
+    if (!Number.isSafeInteger(args.claimGeneration) || args.claimGeneration <= 0) {
+      return { outcome: "unknown", detail: "no claim generation to fence the hold" };
+    }
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/base-attestation-hold`;
+    try {
+      const res = await this.fetchRaw(
+        "POST", path, { head: args.head, claim_generation: args.claimGeneration }, this.httpTimeoutMs, signal,
+      );
+      if (res.status === 200) {
+        const fields = await readRunAck(res);
+        if (fields.status === "paused" && fields.holdReason === BASE_ATTESTATION_HOLD_REASON) {
+          return { outcome: "held", status: fields.status };
+        }
+        return { outcome: "unknown", detail: `unexpected hold acknowledgement (status ${fields.status ?? "none"})` };
+      }
+      if (res.status === 409) {
+        const fields = await readRunAck(res);
+        return { outcome: "stale", status: fields.status ?? "" };
+      }
+      return { outcome: "unknown", detail: `HTTP ${res.status}` };
+    } catch (err) {
+      return { outcome: "unknown", detail: err instanceof Error ? err.message : String(err) };
+    }
   }
 
   /** Report a WALL-CLOCK PARK to the server (POST /worker/runs/:id/wall-park, PRD #1497 M2, D4).

@@ -243,6 +243,12 @@ func (s *Service) submitInputForRun(ctx context.Context, userID, runID uuid.UUID
 	if kind == "extend" && run.Kind == runkind.Job {
 		return SubmitInputResult{}, s.extendRefusal(run, 0, 0)
 	}
+	// issue #3194: a base-attestation hold never runs this run again. Extend (time to resume on)
+	// and Stop (a finalize that resumes) are refused; cancel and the recovery verbs stay the
+	// owner's exits.
+	if IsBaseAttestationHeld(run) && (kind == "extend" || kind == "stop") {
+		return SubmitInputResult{}, ErrBaseAttestationHeld
+	}
 	if run.Status == "paused" && run.HoldReason.Valid && run.HoldReason.String == "budget_exhausted" {
 		switch kind {
 		case "extend":

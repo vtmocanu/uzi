@@ -155,12 +155,13 @@ check "f: ledger var set" test -n "$seen_ledger"
 check "f: ledger outside scratch" test "${seen_ledger#"$seen_tmpdir"/}" = "$seen_ledger"
 
 # A macOS caller commonly ends TMPDIR with a slash. The command must see the same
-# spelling as path.join, while the scratch and ledger still live under our parent.
+# spelling as path.join, while the scratch and ledger still live under our parent's
+# physical path (the guard resolves symlinks such as macOS's /var).
 rc=0
 TMPDIR="$OUTER///" "$GUARD" "$FAKE" probe "$SEEN" > /dev/null 2> "$ERR" || rc=$?
 seen_ledger="$(sed -n 1p "$SEEN")"
 seen_tmpdir="$(sed -n 2p "$SEEN")"
-normalized_outer="$(printf '%s' "$OUTER" | tr -s '/')"
+normalized_outer="$(cd "$OUTER" && pwd -P)"
 check "trailing slash: rc=0" rc_is 0
 check "trailing slash: normalized scratch spelling" test "${seen_tmpdir#"$normalized_outer"/}" != "$seen_tmpdir"
 check "trailing slash: normalized ledger spelling" test "${seen_ledger#"$normalized_outer"/}" != "$seen_ledger"
@@ -168,6 +169,33 @@ no_double_slash() { case "$1" in *//*) return 1 ;; *) return 0 ;; esac; }
 check "trailing slash: scratch has no double slash" no_double_slash "$seen_tmpdir"
 check "trailing slash: ledger has no double slash" no_double_slash "$seen_ledger"
 check "trailing slash: scratch and ledger removed" outer_empty
+
+# A TMPDIR reached through a symlink: the command sees the physical path, with no
+# symlinked component, and the scratch and ledger still live (and are removed) there (#1912).
+LINKED="$TMP/linked"
+ln -s "$OUTER" "$LINKED"
+physical_outer="$(cd "$OUTER" && pwd -P)"
+rc=0
+TMPDIR="$LINKED" "$GUARD" "$FAKE" probe "$SEEN" > /dev/null 2> "$ERR" || rc=$?
+seen_ledger="$(sed -n 1p "$SEEN")"
+seen_tmpdir="$(sed -n 2p "$SEEN")"
+check "symlinked TMPDIR: rc=0" rc_is 0
+check "symlinked TMPDIR: scratch under the physical parent" test "${seen_tmpdir#"$physical_outer"/uzi-tmpdir-guard.}" != "$seen_tmpdir"
+check "symlinked TMPDIR: ledger under the physical parent" test "${seen_ledger#"$physical_outer"/uzi-tmpdir-guard-ledger.}" != "$seen_ledger"
+# Compare with the slash-normalized spelling ($TMPDIR may end in a slash), or the
+# prefix test is vacuous.
+linked_spelled="$(printf '%s' "$LINKED" | tr -s '/')"
+check "symlinked TMPDIR: no symlinked spelling" test "${seen_tmpdir#"$linked_spelled"/}" = "$seen_tmpdir"
+check "symlinked TMPDIR: scratch and ledger removed" outer_empty
+
+# A TMPDIR that does not exist fails closed: exit 2, the command never runs, nothing is created.
+rm -f "$SEEN"
+rc=0
+TMPDIR="$TMP/no-such-dir" "$GUARD" "$FAKE" probe "$SEEN" > /dev/null 2> "$ERR" || rc=$?
+check "missing TMPDIR: rc=2" rc_is 2
+check "missing TMPDIR: named" err_has "cannot resolve TMPDIR"
+check "missing TMPDIR: command not run" test ! -e "$SEEN"
+check "missing TMPDIR: nothing created" outer_empty
 
 # Prove the root-only spelling without creating anything at the filesystem root.
 FAKEBIN="$TMP/root-bin"

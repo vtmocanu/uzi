@@ -53,9 +53,14 @@ type ClaimPayload struct {
 	Branch         *string                 `json:"branch"`                   // resume: attach existing branch
 	SessionID      *string                 `json:"session_id"`               // resume: continue SDK session
 	CheckpointTip  *string                 `json:"checkpoint_tip,omitempty"` // resume: own-checkpoint anchor (owner-anchor guard)
-	LastSeq        int32                   `json:"last_seq"`                 // resume: continue message numbering
-	IterationCount int32                   `json:"iteration_count"`
-	RequeueCount   int32                   `json:"requeue_count"`
+	// CheckpointAttestedSource (issue #3194) is the source OID a flight of THIS run published
+	// after its --require-base guard strictly accepted (runs.checkpoint_attested_source, set-only).
+	// A continuation may adopt exactly this source. nil (omitted) for legacy, unattested and
+	// warn-only runs, so their claim stays byte-identical.
+	CheckpointAttestedSource *string `json:"checkpoint_attested_source,omitempty"`
+	LastSeq                  int32   `json:"last_seq"` // resume: continue message numbering
+	IterationCount           int32   `json:"iteration_count"`
+	RequeueCount             int32   `json:"requeue_count"`
 	// ClaimGeneration is the general claim-lane counter (PRD #1296 M1, D2), incremented
 	// atomically in the ClaimRun transaction that produced this payload and read straight
 	// off the returned run row. The worker binds its durable source-journal identity to

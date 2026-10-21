@@ -43,7 +43,7 @@ const SELF = 900;
 
 let tmp: string;
 before(() => {
-  tmp = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-quiesce-hard-"));
+  tmp = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "uzi-quiesce-hard-"));
 });
 const strays: number[] = [];
 const spawned: ChildProcess[] = [];

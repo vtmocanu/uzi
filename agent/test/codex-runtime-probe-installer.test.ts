@@ -1,7 +1,7 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, mkdir, writeFile, chmod, rm, readFile } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, chmod, rm, readFile, stat } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -94,8 +94,27 @@ interface InstalledState {
 // Populated by `before` when the real-installer path is available.
 let state: InstalledState | undefined;
 
+/** A package-contract break for the negative controls (#1565): drop a member, or override
+ *  one manifest field. The lock's contract fields (members, manifest values, targets) stay
+ *  as committed; only its checksum is pointed at the synthetic archive, as for the positive
+ *  case, so the integrity gate passes and the rejection comes from contract validation. */
+interface PackageBreak {
+  omitMember?: string;
+  manifest?: Partial<Record<"layoutVersion" | "entrypoint" | "target", string | number>>;
+}
+
 /** Build the synthetic package, run the REAL installer once, and capture what it wrote. */
 async function buildAndInstall(): Promise<InstalledState> {
+  const { installRes, state } = await buildPackageAndRunInstaller();
+  assert.equal(installRes.status, 0, `install-codex.sh failed (arch=${state.arch}):\n${installRes.stderr}`);
+  return state;
+}
+
+/** Build the synthetic package (optionally broken) and run the REAL installer on it. */
+async function buildPackageAndRunInstaller(broken: PackageBreak = {}): Promise<{
+  installRes: ReturnType<typeof spawnSync>;
+  state: InstalledState;
+}> {
   const arch = ARCH!;
   const lockText = await readFile(realLockPath, "utf8");
   const version = lockVal(lockText, "CODEX_VERSION");
@@ -112,6 +131,7 @@ async function buildAndInstall(): Promise<InstalledState> {
     resourcesDir: lockVal(lockText, "CODEX_MANIFEST_RESOURCES_DIR"),
     pathDir: lockVal(lockText, "CODEX_MANIFEST_PATH_DIR"),
     target: muslTarget,
+    ...broken.manifest,
   };
 
   // --- 1. lay out the synthetic package tree with every required member --------------
@@ -119,6 +139,7 @@ async function buildAndInstall(): Promise<InstalledState> {
   tempRoots.push(scratch);
   const pkgDir = path.join(scratch, "pkg");
   for (const member of members) {
+    if (member === broken.omitMember) continue;
     const abs = path.join(pkgDir, member);
     await mkdir(path.dirname(abs), { recursive: true });
     if (member === "codex-package.json") {
@@ -162,16 +183,17 @@ async function buildAndInstall(): Promise<InstalledState> {
       TARGETARCH: arch,
     },
   });
-  assert.equal(installRes.status, 0, `install-codex.sh failed (arch=${arch}):\n${installRes.stderr}`);
-
   return {
-    prefix,
-    version,
-    arch,
-    synthSha,
-    members,
-    receiptPath: path.join(prefix, `${version}.receipt.json`),
-    versionRoot: path.join(prefix, version),
+    installRes,
+    state: {
+      prefix,
+      version,
+      arch,
+      synthSha,
+      members,
+      receiptPath: path.join(prefix, `${version}.receipt.json`),
+      versionRoot: path.join(prefix, version),
+    },
   };
 }
 
@@ -259,4 +281,26 @@ describe("install-codex.sh ↔ probeCodexRuntime end-to-end format agreement", (
     assert.strictEqual(after.capable, false, "a tampered member must flip the probe to not-capable");
     assert.match(after.reason ?? "", /member digest mismatch/);
   });
+});
+
+// #1565: package-contract negative controls. Each breaks the package, never the lock's
+// contract fields (the checksum still matches the synthetic archive), and the real
+// installer must refuse it before anything is installed or a receipt is written.
+describe("install-codex.sh refuses a package that breaks the locked contract", () => {
+  const otherTarget = (arch: string): string => (arch === "amd64" ? "aarch64-unknown-linux-musl" : "x86_64-unknown-linux-musl");
+  const cases: Array<[string, () => PackageBreak, RegExp]> = [
+    ["a missing member", () => ({ omitMember: "bin/codex-code-mode-host" }), /expected member missing from package: bin\/codex-code-mode-host/],
+    ["a changed layoutVersion", () => ({ manifest: { layoutVersion: 2 } }), /codex-package\.json layoutVersion='2', expected '1'/],
+    ["a changed entrypoint", () => ({ manifest: { entrypoint: "bin/codex-next" } }), /codex-package\.json entrypoint='bin\/codex-next'/],
+    ["the other architecture's target", () => ({ manifest: { target: otherTarget(ARCH!) } }), /codex-package\.json target=/],
+  ];
+  for (const [name, broken, message] of cases) {
+    it(`refuses ${name}`, { skip }, async () => {
+      const { installRes, state: s } = await buildPackageAndRunInstaller(broken());
+      assert.notEqual(installRes.status, 0, `the installer accepted ${name}`);
+      assert.match(String(installRes.stderr), message);
+      await assert.rejects(stat(s.receiptPath), { code: "ENOENT" }, "no receipt for a refused package");
+      await assert.rejects(stat(s.versionRoot), { code: "ENOENT" }, "nothing installed for a refused package");
+    });
+  }
 });

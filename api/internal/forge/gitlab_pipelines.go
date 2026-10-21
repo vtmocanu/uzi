@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"time"
@@ -67,9 +68,27 @@ func (g *gitLab) LatestMRPipeline(ctx context.Context, projectID, mrIID int64) (
 }
 
 func (g *gitLab) ListPipelineJobs(ctx context.Context, projectID, pipelineID int64) ([]Job, error) {
+	return g.listPipelineJobs(ctx, projectID, pipelineID, false)
+}
+
+// ListPipelineJobAttempts returns the pipeline's jobs including retried ones
+// (include_retried=true). GitLab reports no attempt number, so Attempt stays nil,
+// and FinishedAt is only ever the reported finished_at.
+func (g *gitLab) ListPipelineJobAttempts(ctx context.Context, projectID, pipelineID int64) ([]Job, error) {
+	return g.listPipelineJobs(ctx, projectID, pipelineID, true)
+}
+
+// listPipelineJobs backs both job listings. history=false sends exactly the
+// request ListPipelineJobs always sent and keeps its derived FinishedAt.
+func (g *gitLab) listPipelineJobs(ctx context.Context, projectID, pipelineID int64, history bool) ([]Job, error) {
 	ctx = markCIJSON(ctx)
 	opt := &gitlab.ListJobsOptions{ListOptions: gitlab.ListOptions{Page: 1, PerPage: perPage}}
-	wrap := func(e error) error { return g.wrapErr("list pipeline jobs", e) }
+	op := "list pipeline jobs"
+	if history {
+		opt.IncludeRetried = new(true)
+		op = "list pipeline job attempts"
+	}
+	wrap := func(e error) error { return g.wrapErr(op, e) }
 	return paginateCIJobs(ctx, int(perPage), wrap, func(page int) ([]Job, int, error) {
 		opt.Page = int64(page)
 		jobs, resp, err := g.client.Jobs.ListPipelineJobs(projectID, pipelineID, opt, gitlab.WithContext(ctx))
@@ -84,7 +103,11 @@ func (g *gitLab) ListPipelineJobs(ctx context.Context, projectID, pipelineID int
 				}
 				continue
 			}
-			items = append(items, toGitLabJob(j))
+			if history {
+				items = append(items, toGitLabReportedJob(j))
+			} else {
+				items = append(items, toGitLabJob(j))
+			}
 		}
 		return items, int(resp.NextPage), nil
 	})
@@ -95,15 +118,31 @@ func (g *gitLab) ListPipelineJobs(ctx context.Context, projectID, pipelineID int
 // job is still settling and FinishedAt is absent, it is derived from StartedAt plus
 // Duration (seconds), which GitLab reports as the job runs (PRD #1255).
 func toGitLabJob(j *gitlab.Job) Job {
+	job := toGitLabReportedJob(j)
+	if j.FinishedAt == nil && j.StartedAt != nil && j.Duration > 0 {
+		job.FinishedAt = j.StartedAt.Add(time.Duration(j.Duration * float64(time.Second)))
+	}
+	return job
+}
+
+// toGitLabReportedJob maps only what GitLab reported: FinishedAt stays zero when
+// finished_at is absent (#3225). QueuedDuration is set only for a positive, finite
+// value that fits a time.Duration; the SDK decodes an absent field as 0, so 0 is
+// unknown, not a measured zero.
+func toGitLabReportedJob(j *gitlab.Job) Job {
 	job := Job{ID: j.ID, Name: j.Name, Stage: j.Stage, Status: j.Status, WebURL: j.WebURL}
+	if j.CreatedAt != nil {
+		job.CreatedAt = *j.CreatedAt
+	}
 	if j.StartedAt != nil {
 		job.StartedAt = *j.StartedAt
 	}
-	switch {
-	case j.FinishedAt != nil:
+	if j.FinishedAt != nil {
 		job.FinishedAt = *j.FinishedAt
-	case j.StartedAt != nil && j.Duration > 0:
-		job.FinishedAt = j.StartedAt.Add(time.Duration(j.Duration * float64(time.Second)))
+	}
+	if q := j.QueuedDuration; q > 0 && q < float64(math.MaxInt64/int64(time.Second)) {
+		d := time.Duration(q * float64(time.Second))
+		job.QueuedDuration = &d
 	}
 	return job
 }

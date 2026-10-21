@@ -202,6 +202,24 @@ describe("WorkersSettings — residue quarantine badge (issue #2213)", () => {
   });
 });
 
+describe("WorkersSettings — memory authority pill (issue #3142)", () => {
+  it("pills a gated worker and leaves an ungated worker unpilled", async () => {
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [
+        aWorker({ id: "w-g", name: "gated-one", memory_authority_lost_at: "2026-07-14T00:00:00Z" }),
+        aWorker({ id: "w-u", name: "ungated-one", memory_authority_lost_at: null }),
+      ],
+    });
+    renderPage();
+    await screen.findByText("gated-one");
+    const pills = screen.getAllByText("memory authority lost");
+    expect(pills).toHaveLength(1);
+    const row = (name: string) => screen.getByText(name).closest("li");
+    expect(row("gated-one")?.contains(pills[0])).toBe(true);
+    expect(row("ungated-one")?.textContent).not.toContain("memory authority lost");
+  });
+});
+
 describe("WorkersSettings — always-visible worker-setup guide link (PRD #57 M2)", () => {
   it("renders the worker-setup guide link in the page header", async () => {
     mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });

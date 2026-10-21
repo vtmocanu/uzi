@@ -4,6 +4,9 @@
 # command, and drives the real script. Prints `N passed, N failed`; exits 1 on any
 # failure. Needs bash, git, jq, yq and python3 (no PyYAML: the sync.py is a stub).
 set -euo pipefail
+# Fixture repos must not read host git config: a global core.fsmonitor=true
+# leaves a detached fsmonitor daemon per repo on macOS.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 
 script="$(cd "$(dirname "$0")" && pwd)/refresh-role-manifest.sh"
 pass=0

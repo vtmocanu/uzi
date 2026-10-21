@@ -32,8 +32,8 @@ sha256() { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 25
 digest=$(jq -cS . "$findings" | sha256 | cut -c1-16)
 
 render_body() {
-  printf '%s\n\n' "Pricing data needs a human re-check against the official pages."
-  printf '%s\n\n' "Found by the weekly \`task nudge:pricing\` run. Verify each row's rates, then bump the table \`version\` and the row's \`verified_at\` (or \`AnthropicPriceFetchedAt\`) and run \`task codex-pricing:sync\`; see \`docs/run-cost.md\`, \"Updating prices\"."
+  printf '%s\n\n' "Pricing data needs a re-check against the official pages, by an agent and its review buddy independently (no human step)."
+  printf '%s\n\n' "Found by the weekly \`task nudge:pricing\` run. Verify each row's rates, then bump the row's \`verified_at\` (and the table \`version\` only when a rate changes) (or \`AnthropicPriceFetchedAt\`) and run \`task codex-pricing:sync\`; see \`docs/run-cost.md\`, \"Updating prices\"."
   printf '| subject | date | reason | sources |\n|---|---|---|---|\n'
   jq -r '.[] | "| \(.subject | gsub("[|\n\r]"; " ")) | \(.date) | \(.reason) | \(.sources | join(", ")) |"' "$findings"
   printf '\n%s\n<!-- digest:%s -->\n' "$MARKER" "$digest"

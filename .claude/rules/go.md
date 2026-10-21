@@ -22,11 +22,13 @@ task deadcode:api                          # dead-code slot alone — gated at Z
 task deadcode:api:all                      # WITHOUT -test; reported, never gating, ALWAYS EXITS 0
 task test:api                              # test slot alone (-race -count=1)
 task build:api                             # or vet:api, individually
-cd api && go test ./internal/forge -run TestName   # single test — no target, not a gate recipe
+cd api && env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null go test ./internal/forge -run TestName   # single test — no target, not a gate recipe
 # after editing internal/store/migrations/ or internal/store/queries/ (CI asserts
 # the regenerate is a no-op in validate:api; no target):
 cd api && ../scripts/sqlc.sh v1.31.1 generate
 ```
+
+- **Repo-creating tests do not read host git config.** Taskfile test commands that create repos, the single-test forms and repo-creating fixture scripts set `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null`: on macOS a global `core.fsmonitor=true` leaves a detached daemon per fixture repo. New ones carry the pair; `task test:hermetic-git-config` checks the listed wiring, not every entrypoint.
 
 ## `-count=1` and the test cache
 
