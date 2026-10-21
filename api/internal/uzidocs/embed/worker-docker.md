@@ -193,15 +193,17 @@ per-pod `emptyDir`.
 - **The data volume now holds more.** Clones and daemon-owned bytes count
   against the volume's existing pressure thresholds; there is no Docker-specific
   threshold, and the volume sizes are unchanged.
-- **Rootless dind cannot write into run directories the worker made.** A
-  rootless dind container runs as host uid 1000 (100000+ for a non-root
-  container user) and, by inference, does not hold the pod's fsGroup 10001,
+- **Rootless dind cannot write into run checkouts.** A
+  rootless dind container runs as host uid 1000 (typically a 100000+ subuid
+  range for a non-root container user; the range depends on the image and is
+  not pinned in this repo) and, by inference, does not hold the pod's fsGroup 10001,
   so it is judged on the "other" permission bits. By default it cannot create
   files inside a run's checkout, in either uid mode, so
   `docker run -v <checkout>:...` bind sources that need to write back into the
   checkout fail with a permission error unless the directory is made writable
   another way. This predates the `runner-shared` layout: checkout creation is
-  unchanged, and the old `emptyDir` behaved the same. After an fsGroup
+  unchanged, and the old `emptyDir` behaved the same. Under the uid split the checkout is runner-made (`runner:runner` `2775`),
+  in the single-uid mode worker-made. After an fsGroup
   re-walk the daemon, which holds 10001, can write there; the container still
   cannot. Under the uid split nothing else changed.
 - **Single-uid only: rootless containers lost writes at the top of
@@ -213,10 +215,11 @@ per-pod `emptyDir`.
   container that bind-mounts the `/data/runner` root or the `TMPDIR` root
   (for example `-v "$TMPDIR":/x`) and writes into it now fails with a
   permission error. A bind of a `mkdtemp` subdirectory (`0700`) was never
-  writable to the container. Rootful dind containers write everywhere in the
-  bind mount before and after. The daemon itself can still create at the top
-  and in `.tmp`, so bind sources it auto-creates still work. This is not a
-  rare pattern. Evidence is auditor code analysis only (base `dea3ba68` versus
+  writable to the container. A rootful dind container running as root writes everywhere in the bind
+  mount before and after; one running a non-root `USER` is judged on mode
+  bits like the rootless case. The daemon itself can still create at the top
+  and in `.tmp`, so bind sources it auto-creates still work. This is not claimed to be
+  rare. Evidence is auditor code analysis only (base `dea3ba68` versus
   this layout); no real rootless container was run, and the rootless
   container/UID functional check remains an open validation item.
   See [ADR-3153](../adr/3153-runner-shared-pvc-subpath.md), Permissions.
