@@ -2827,6 +2827,11 @@ tasks:
   test:agent:unit:
     internal: true
     dir: agent
+    preconditions:
+      # The hung-file window (agent/test/agent-report.ts, 10 min) is shortened only by the
+      # launcher's own tests; a leaked override must not arm an early kill in a real gate.
+      - sh: '[ -z "${UZI_AGENT_TEST_STALL_MS:-}" ] && [ -z "${UZI_AGENT_TEST_STALL_TESTONLY:-}" ]'
+        msg: 'UZI_AGENT_TEST_STALL_MS / UZI_AGENT_TEST_STALL_TESTONLY are for the launcher tests only; unset them'
     cmds:
       # `npm test` and NOT a bare `node --test`: agent/package.json's test script
       # carries `--test-timeout=120000`, and node's own default is NO timeout at

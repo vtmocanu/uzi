@@ -171,7 +171,7 @@ function launcherFixture(): string {
   }
   cpSync(realpathSync(path.join(agentRoot, "node_modules/@esbuild")),
     path.join(root, "node_modules/@esbuild"), { recursive: true, dereference: true });
-  for (const file of ["run-unit-tests.ts", "agent-test-shards.ts"]) {
+  for (const file of ["run-unit-tests.ts", "agent-test-shards.ts", "agent-report.ts", "agent-report-reporter.ts"]) {
     cpSync(path.join(agentRoot, "test", file), path.join(root, "test", file));
   }
   writeFileSync(path.join(root, "test-shards.json"), JSON.stringify(emptyPins));

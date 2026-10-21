@@ -46,6 +46,7 @@ cd agent && env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null node --i
 ## Reading `node --test` output
 
 - It prints `ℹ fail 0` while tests are failing, when they fail by TIMEOUT: the failures surface under `✖ failing tests:` and go uncounted in the tally, while `$?` is 1 throughout. Read the exit code and the named failing tests, never a bare tally. Mirror image of the `PASS=0` trap in `.claude/rules/go.md`.
+- The unit stage also writes `agent/.test-report/<id>/` (newest: `latest.json`) and prints its `summary.txt` at the end of that stage: read that, not the spec log. `progress.json` is live while tests run. It covers the unit stage only (the gate verdict is task's exit code); a missing summary or `running`/`incomplete` is never green. `HUNG` names a file whose tests ended but whose process never exited, stopped after 10 min of silence once every other file finished.
 
 ## macOS: the Codex M4 P layer runs in a Linux container
 
