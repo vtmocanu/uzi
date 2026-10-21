@@ -91,22 +91,31 @@ while read -r f; do
   [[ "$f" =~ $EXEMPT ]] && continue
   creates_repo "$f" || continue
   scanned=$((scanned + 1))
-  grep -q -E "GIT_CONFIG_GLOBAL=['\"]?/dev/null" "$f" || missing="$missing $f"
+  { grep -q -E "GIT_CONFIG_GLOBAL=['\"]?/dev/null" "$f" &&
+    grep -q -E "GIT_CONFIG_(SYSTEM=['\"]?/dev/null|NOSYSTEM=['\"]?1)" "$f"; } || missing="$missing $f"
 done < <(git ls-files '*.sh' '*.py' | grep -E '(^|[/._-])test([._-]|$)')
-# 26 repo-creating test scripts when this landed; far fewer means the matcher broke.
+# 24 repo-creating test scripts when this landed; far fewer means the matcher broke.
 if [ "$scanned" -lt 20 ]; then bad "only $scanned repo-creating test scripts found; the matcher is broken"
-elif [ -z "$missing" ]; then ok "all $scanned repo-creating test scripts export GIT_CONFIG_GLOBAL=/dev/null"
-else bad "repo-creating test scripts without the export:$missing"; fi
+elif [ -z "$missing" ]; then ok "all $scanned repo-creating test scripts isolate global and system git config"
+else bad "repo-creating test scripts without global+system isolation:$missing"; fi
 
-# 4b. The prefixed Task commands keep it.
-# Capture first: `grep -q` closing the pipe early would SIGPIPE task under pipefail.
-for spec in test:api:1 test:agent:1 test:codex-m4:1 check:codex-m4-receipts:1 test:forge-fake:1 test:forge-fake-contract:1 test:checkpoint-chain-bridge:1; do
-  t="${spec%:*}" want="${spec##*:}"
-  dry="$(task --dry "$t" 2>&1 || true)"
-  n="$(printf '%s\n' "$dry" | grep -c -F 'GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null' || true)"
-  if [ "$n" -ge "$want" ]; then ok "$t carries the pair ($n)"
-  else bad "$t carries the pair $n time(s), want $want"; fi
-done
+# 4b. Each prefixed Task command keeps the pair directly in front of it. A per-target
+# count is not enough: test:agent echoes two prefixed commands, so losing one passes.
+PAIR='GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null'
+while IFS='|' read -r t cmd; do
+  if ! dry="$(task --dry "$t" 2>&1)"; then bad "task --dry $t failed: $(printf '%s\n' "$dry" | tail -2)"; continue; fi
+  # Capture first: `grep -q` closing the pipe early would SIGPIPE under pipefail.
+  if printf '%s\n' "$dry" | grep -F "$PAIR $cmd" > /dev/null; then ok "$t: $cmd"
+  else bad "$t: '$cmd' lost its $PAIR prefix"; fi
+done <<'EOF'
+test:api|go test -race -count=1
+test:agent|../scripts/real-procfs-skip-check.sh ../scripts/tmpdir-leak-guard.sh npm test
+test:codex-m4|node --import tsx --test --test-concurrency=1
+check:codex-m4-receipts|node --import tsx ../e2e/codex-m4/run-receipts.ts
+test:forge-fake|node --test e2e/forge-fake/issue-comments.test.mjs
+test:forge-fake-contract|node e2e/forge-fake/operation-contracts.test.mjs
+test:checkpoint-chain-bridge|go test -buildvcs=false -count=1 -race -v
+EOF
 
 [ "$FAILS" -eq 0 ] || { echo "hermetic-git-config: $FAILS failure(s)" >&2; exit 1; }
 echo "hermetic-git-config: all checks passed"

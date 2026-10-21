@@ -68,7 +68,7 @@ cd web && npx vitest run src/pages/Foo.test.tsx                                 
 cd agent && env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null node --import tsx --test --test-timeout=120000 test/worker.test.ts   # agent: keep the timeout flag
 ```
 
-- **Tests never read host git config.** Test targets, the single-test forms above and every fixture script set `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null`: on macOS a global `core.fsmonitor=true` leaves a detached daemon per fixture repo. A new test command or fixture script that creates a repo carries the same pair; `task test:hermetic-git-config` checks the wiring.
+- **Repo-creating tests do not read host git config.** The Taskfile test commands that create repos, the single-test forms above and the repo-creating fixture scripts set `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null`: on macOS a global `core.fsmonitor=true` leaves a detached daemon per fixture repo. A new test command or fixture script that creates a repo carries the same pair; `task test:hermetic-git-config` checks the listed wiring, not every entrypoint.
 
 ### Lint ratchet
 
