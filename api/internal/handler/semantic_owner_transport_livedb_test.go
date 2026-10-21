@@ -18,6 +18,8 @@ import (
 )
 
 // Lead runs this through the serial LiveDB wrapper, never ordinary focused checks.
+// It proves the exact DB round trip above the ordinary 1 MiB input cap;
+// TestOwnerRunNormativeTransport keeps the maximum (>64 MiB) owner GET proof.
 func TestOwnerSemanticMaxRoundTripLiveDB(t *testing.T) {
 	h, router, pool := cliLiveDB(t)
 	q := store.New(pool)
@@ -29,7 +31,7 @@ func TestOwnerSemanticMaxRoundTripLiveDB(t *testing.T) {
 	id := rmSeedRun(t, pool, owner, repo, "running")
 	worker := uuid.New()
 	cliMustExec(t, pool, `INSERT INTO workers(id,user_id,name,token_hash,status) VALUES($1,$2,'semantic-owner-max',$3,'online')`, worker, owner, worker[:])
-	body := semanticOwnerMaxRequest(t)
+	body := semanticOwnerMaxRequest(t, semanticLiveDBCriteria)
 	cliMustExec(t, pool, `UPDATE runs SET worker_id=$2,claim_generation=1,completion_contract_version=1,issue_description=$3 WHERE id=$1`, id, worker, string(body.Sources[0].Bytes))
 	cliMustExec(t, pool, `INSERT INTO semantic_planning(run_id,enrollment) VALUES($1,'{"profile":"semantic","policy":{"version":1,"model":"sonnet","max_reviews":3,"max_invocations":2,"max_tokens":120000,"max_seconds":900}}')`, id)
 	candidate, err := h.wsvc.SubmitSemanticCandidate(ctx, worker, id, 1, body.Structural, body.Proposal, body.Sources)
@@ -47,7 +49,7 @@ func TestOwnerSemanticMaxRoundTripLiveDB(t *testing.T) {
 		expected[c.Text] = c
 	}
 	counts := map[string]int{}
-	if len(candidate.Criteria) != 256 {
+	if len(candidate.Criteria) != semanticLiveDBCriteria {
 		t.Fatal("lost canonical criteria")
 	}
 	for _, c := range candidate.Criteria {
@@ -60,7 +62,7 @@ func TestOwnerSemanticMaxRoundTripLiveDB(t *testing.T) {
 		t.Fatal("lost milestones")
 	}
 	for _, n := range counts {
-		if n != 32 {
+		if n != semanticLiveDBCriteria/8 {
 			t.Fatal("lost milestone criteria")
 		}
 	}
@@ -101,7 +103,7 @@ func TestOwnerSemanticMaxRoundTripLiveDB(t *testing.T) {
 		t.Fatal("GET changed exact candidate or snapshots")
 	}
 	rec := bearerReq(router, http.MethodGet, "/api/runs/"+id.String(), token)
-	if rec.Code != http.StatusOK || rec.Body.Len() <= 64<<20 || rec.Body.Len() > apitypes.OwnerRunMaxBytes ||
+	if rec.Code != http.StatusOK || rec.Body.Len() <= 1<<20 || rec.Body.Len() > apitypes.OwnerRunMaxBytes ||
 		rec.Header().Get(apitypes.SemanticIdentityHeader) != apitypes.SemanticIdentityVersion {
 		t.Fatalf("max GET status=%d bytes=%d", rec.Code, rec.Body.Len())
 	}
@@ -144,5 +146,5 @@ func TestOwnerSemanticMaxRoundTripLiveDB(t *testing.T) {
 	if err != nil || adminRun.SemanticGate != nil {
 		t.Fatalf("admin observer semantic disclosure: %v", err)
 	}
-	t.Logf("real owner GET=%d full POST=%d criteria=256 milestones=8", rec.Body.Len(), len(raw))
+	t.Logf("real owner GET=%d full POST=%d criteria=%d milestones=8", rec.Body.Len(), len(raw), semanticLiveDBCriteria)
 }

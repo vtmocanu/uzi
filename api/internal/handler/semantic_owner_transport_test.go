@@ -21,7 +21,9 @@ import (
 
 // Keep every field and array at the compiler maxima, using printable HTML
 // identifiers so Go's encoder expands them sixfold without invalid JSONB NULs.
-func semanticOwnerMaxRequest(t *testing.T) semanticCandidateRequest {
+// An optional count keeps only that many maximum criteria, spread evenly over
+// the eight milestones (LiveDB round trips use semanticLiveDBCriteria).
+func semanticOwnerMaxRequest(t *testing.T, criterionCount ...int) semanticCandidateRequest {
 	t.Helper()
 	body := semanticEscapedRequest(t)
 	body.Sources[0].ID = strings.Repeat("<", 512)
@@ -36,9 +38,12 @@ func semanticOwnerMaxRequest(t *testing.T) semanticCandidateRequest {
 		id := fmt.Sprintf("m%d", i) + strings.Repeat("x", 62)
 		milestones = append(milestones, workersvc.Milestone{ID: id, Title: "Milestone"})
 	}
+	if len(criterionCount) == 1 {
+		proposal.Criteria = proposal.Criteria[:criterionCount[0]]
+	}
 	for i := range proposal.Criteria {
 		c := &proposal.Criteria[i]
-		c.MilestoneID = milestones[i/32].ID
+		c.MilestoneID = milestones[i*len(milestones)/len(proposal.Criteria)].ID
 		for j := range c.Citations {
 			c.Citations[j].SourceID = body.Sources[0].ID
 			c.Citations[j].Hash = hex.EncodeToString(hash[:])

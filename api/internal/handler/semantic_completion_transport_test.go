@@ -26,13 +26,10 @@ import (
 // independently bounded fields, rather than a marshal-only request fixture.
 func semanticCompletionTransportFixture(t *testing.T, criterionCount ...int) (store.Run, completionDecisionRequest) {
 	t.Helper()
-	body := semanticOwnerMaxRequest(t)
+	body := semanticOwnerMaxRequest(t, criterionCount...)
 	var proposal apitypes.SemanticProposal
 	if err := json.Unmarshal(body.Proposal, &proposal); err != nil {
 		t.Fatal(err)
-	}
-	if len(criterionCount) == 1 {
-		proposal.Criteria = proposal.Criteria[:criterionCount[0]]
 	}
 	candidate := apitypes.SemanticCandidate{CandidateIdentityVersion: apitypes.SemanticIdentityVersion, Revision: 1, Digest: "frozen"}
 	criteria := []map[string]any{}
@@ -61,7 +58,14 @@ func semanticCompletionTransportFixture(t *testing.T, criterionCount ...int) (st
 	return run, completionDecisionRequest{Decision: "authorize_maintainer", ContractRevision: 1, Maintainers: maintainers}
 }
 
-// Main executes this maximum write/read proof in the serial LiveDB sweep.
+// semanticLiveDBCriteria maximum-size criteria put every owner request in the
+// serial LiveDB sweep above the ordinary 1 MiB input cap (each test asserts it),
+// while 256 maximum criteria under -race cost minutes per test and overran the
+// CI package timeout. TestSemanticCompletionMaximumAdmission and
+// TestOwnerRunNormativeTransport keep the full 256-criterion transport proofs.
+const semanticLiveDBCriteria = 24
+
+// Main executes this write/read proof in the serial LiveDB sweep.
 func TestSemanticCompletionMaximumRenewalLiveDB(t *testing.T) {
 	h, router, pool := cliLiveDB(t)
 	h.wsvc = workersvc.New(store.New(pool), h.box, workersvc.Params{RunTimeout: 2 * time.Hour})
@@ -70,12 +74,12 @@ func TestSemanticCompletionMaximumRenewalLiveDB(t *testing.T) {
 	owner := cliSeedUser(t, pool, false)
 	repo := rmSeedRepo(t, pool, rmSeedConn(t, pool, owner), 1996, true)
 	id := rmSeedRun(t, pool, owner, repo, "paused")
-	frozen, input := semanticCompletionTransportFixture(t)
+	frozen, input := semanticCompletionTransportFixture(t, semanticLiveDBCriteria)
 	cliMustExec(t, pool, `UPDATE runs SET completion_contract_version=1,contract_revision=1,completion_contract=$2,milestones_frozen=$3,hold_reason='completion_blocked' WHERE id=$1`, id, frozen.CompletionContract, frozen.MilestonesFrozen)
 	input.Reason = "renew exact owner steps\n\u202eas frozen"
 	raw, err := json.Marshal(input)
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || len(raw) <= apitypes.RunInputLegacyMaxBytes {
+		t.Fatalf("renewal must exceed the ordinary input cap: bytes=%d err=%v", len(raw), err)
 	}
 	srv := httptest.NewUnstartedServer(router)
 	if !semanticOwnerRace {
@@ -110,7 +114,7 @@ func TestSemanticCompletionMaximumRenewalLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	pending, err := workersvc.CompletionPending(stored)
-	if err != nil || pending == nil || pending.ContractRevision != 2 || len(pending.Criteria) != 256 {
+	if err != nil || pending == nil || pending.ContractRevision != 2 || len(pending.Criteria) != semanticLiveDBCriteria {
 		t.Fatalf("pending round trip: %v", err)
 	}
 	for _, c := range pending.Criteria {
