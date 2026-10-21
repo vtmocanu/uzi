@@ -803,6 +803,10 @@ func (m tuiModel) boardEyebrow(it boardItem) string {
 		return " " + lipgloss.NewStyle().Foreground(m.pal.amber).Bold(true).Render(name) + m.pal.faint.Render(" · "+itoa(it.count))
 	}
 	label := " " + m.pal.faint.Render(name+" · "+itoa(it.count))
+	if it.band == bandFloor && m.board.sortProgress {
+		// On the band it reorders, so the title and its live filter keep their width.
+		label += m.pal.faint.Render(" · by progress")
+	}
 	if it.band == bandDone && it.failed > 0 {
 		label += m.pal.faint.Render(" · ") + paintSeg(m.pal.alarm, nil, false, itoa(it.failed)+" failed")
 	}
@@ -1239,9 +1243,6 @@ func (m tuiModel) boardTitle(full bool) string {
 	}
 	if m.board.hideDone && !m.board.admin {
 		brand += m.pal.faint.Render("   active only")
-	}
-	if m.board.sortProgress {
-		brand += m.pal.faint.Render("   by progress")
 	}
 	if m.board.filter != "" || m.board.filtering {
 		brand += m.pal.faint.Render("   /" + cellText(m.board.filter))

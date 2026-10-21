@@ -116,8 +116,12 @@ func TestTUIBoardProgressSortToggleKeepsSelection(t *testing.T) {
 	if got := runIDs(m.board.visible()); !slices.Equal(got, runIDs(bandOrder(m.board.runs, true))) {
 		t.Errorf("board not in progress order: %v", got)
 	}
-	if out := stripANSI(m.View().Content); !strings.Contains(out, "by progress") {
-		t.Errorf("title lacks the by-progress marker\n%s", out)
+	out := stripANSI(m.View().Content)
+	if !strings.Contains(out, "ON THE FLOOR · 9 · by progress") {
+		t.Errorf("floor eyebrow lacks the by-progress marker\n%s", out)
+	}
+	if title := strings.SplitN(out, "\n", 2)[0]; strings.Contains(title, "by progress") {
+		t.Errorf("by-progress marker belongs on the floor eyebrow, not the title: %q", title)
 	}
 
 	m = press(t, m, keyProgressSort)
@@ -132,6 +136,22 @@ func TestTUIBoardProgressSortToggleKeepsSelection(t *testing.T) {
 	}
 	if out := stripANSI(m.View().Content); strings.Contains(out, "by progress") {
 		t.Errorf("by-progress marker survived toggling off\n%s", out)
+	}
+}
+
+// At 80 columns the sort marker must not crowd a filter being typed off the title line.
+func TestTUIBoardProgressSortKeepsFilterCaretAt80(t *testing.T) {
+	m := progressSortModel(t, progressSortFixture())
+	m.width = 80
+	m = press(t, m, keyHideDone)
+	m = press(t, m, keyProgressSort)
+	m = press(t, m, keyFilter)
+	for _, r := range "scheduler-poll" {
+		m = press(t, m, string(r))
+	}
+	title := strings.SplitN(stripANSI(m.View().Content), "\n", 2)[0]
+	if !strings.Contains(title, "/scheduler-poll▌") {
+		t.Errorf("typed filter or caret clipped at 80 columns: %q", title)
 	}
 }
 
