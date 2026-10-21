@@ -239,7 +239,7 @@ for (const stop of ["signal", "clock"] as const) {
       prepareCheckpointObjects: async () => { preparations++; return Buffer.from(TIP + "\n"); },
       spawnGit: async () => {
         launches++;
-        return { stdout: Readable.from(["PACK"]), exited: Promise.resolve(0), cancel() {} };
+        return { stdout: Readable.from(["PACK"]), exited: Promise.resolve(0), settled: async () => {}, cancel() {} };
       },
     });
     const packed = await git.withBoundaryProcessSpawner(
@@ -599,7 +599,7 @@ it("replay retains the original absolute deadline and captured range", async t =
     prepareCheckpointObjects: async () => Buffer.from(TIP + "\n"),
     spawnGit: async (_bare: string, _args: string[], input: unknown) => {
       deadlines.push(git["recoveryOperation"]()!.deadline); inputs.push(input);
-      return { stdout: Readable.from(["PACK"]), exited: Promise.resolve(0), cancel() {} };
+      return { stdout: Readable.from(["PACK"]), exited: Promise.resolve(0), settled: async () => {}, cancel() {} };
     },
   });
   const packed = await git.checkpointPack("bare", "task", undefined, undefined, undefined, undefined,
@@ -623,7 +623,7 @@ for (const stop of ["cancel", "deadline"] as const) {
       prepareCheckpointObjects: async () => { preparations++; return Buffer.from(TIP + "\n"); },
       spawnGit: async () => {
         launches++;
-        return { stdout: Readable.from(["PACK"]), exited: Promise.resolve(0), cancel() {} };
+        return { stdout: Readable.from(["PACK"]), exited: Promise.resolve(0), settled: async () => {}, cancel() {} };
       },
     });
     const packed = await git.checkpointPack("bare", "task", undefined, undefined, undefined, undefined,
@@ -659,7 +659,7 @@ for (const stop of ["live", "cancel", "deadline"] as const) {
       launches++;
       if (args[1].includes("pack-objects")) {
         assert.equal(child!.child!.exitCode !== null || child!.child!.signalCode !== null, true);
-        return { stdout: Readable.from(["PACK"]), exited: Promise.resolve(0), cancel() {} };
+        return { stdout: Readable.from(["PACK"]), exited: Promise.resolve(0), settled: async () => {}, cancel() {} };
       }
       // An inert native Git reader owns the real pipes and waits for cancellation.
       // Inject diagnostic bytes into its stderr pipe to exercise native accounting.
@@ -748,3 +748,63 @@ it("native preparation cancellation joins child close and removes its abort list
     assert.equal(timers.size, 0, "native timeout and SIGKILL escalation timers were cleared on close");
   } finally { release.resolve(); child?.cancel(); await rejected; fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+for (const unsafeAt of [0, 1, 2]) {
+  it(`broker 5xx replay waits for verified producer cancellation: unsafeAt=${unsafeAt}`, async () => {
+    const { RunRunner } = await import("../src/runner.js");
+    const { WorkerClient } = await import("../src/client.js");
+    const git = cache();
+    Object.assign(git, { prepareCheckpointObjects: async () => Buffer.from(TIP + "\n") });
+    const cancelling = deferred(), release = deferred();
+    const failure = new CheckpointUnsafeCleanupError("producer cancellation disposal unverified");
+    let launches = 0, requests = 0;
+    const spawner: BoundaryProcessSpawner = async () => {
+      const index = ++launches;
+      const stdout = new PassThrough(), stderr = new PassThrough(), stdin = new PassThrough();
+      stdin.resume();
+      let complete!: (value: { code: number }) => void;
+      const completed = new Promise<{ code: number }>(resolve => { complete = resolve; });
+      if (index > 1 && index !== unsafeAt) { stdout.end("PACK"); stderr.end(); complete({ code: 0 }); }
+      else stdout.write("PACK");
+      return { stdin, stdout, stderr, completed, cancel: async () => {
+        if (index > 1 && index !== unsafeAt) return;
+        if (index === 1) { cancelling.resolve(); await release.promise; }
+        stdout.end(); stderr.end(); complete({ code: 1 });
+        if (index === unsafeAt) throw failure;
+      } };
+    };
+    const client = new WorkerClient("http://unused", "fixture", "test", nullLogger());
+    client.publishCheckpoint = async () => ++requests <= Math.max(1, unsafeAt)
+      ? { ok: false, httpStatus: 500 }
+      : { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/task" } };
+    const runner = new RunRunner(client, git, () => ({ executor: { run: async () => ({ branch: "task" }) } }),
+      nullLogger(), 1, undefined, { checkpointTestHooks: { retryBackoffMs: [0, 0] } });
+    Object.assign(runner, {
+      requireTrackingOwned: async () => TIP,
+      checkpointRemediationHold: async () => false,
+      ciConfigGuardBlocksPublication: async () => false,
+    });
+    const flight = { runId: "retry-cleanup", runKind: "issue", lastCheckpointRefTip: "old",
+      reportedPublishOutcomes: new Set<string>(), runLog: nullLogger(), batcher: { emit() {} } };
+    const result = git.withBoundaryProcessSpawner(spawner, new AbortController().signal, () =>
+      runner["publishCheckpointOutcome"](flight as never, "bare", "task"))
+      .then(value => ({ value, error: undefined }), error => ({ value: undefined, error }));
+    try {
+      await cancelling.promise;
+      assert.equal(launches, 1, "no successor producer before cancellation settles");
+      release.resolve();
+      const outcome = await result;
+      if (unsafeAt) {
+        assert.equal(launches, unsafeAt, "unverified cleanup never opens a successor producer");
+        assert.equal(requests, unsafeAt, "unverified cleanup never retries the upload");
+        assert.equal(outcome.error, failure, "unsafe cleanup propagates as the original hard boundary failure");
+        assert.equal(flight.lastCheckpointRefTip, "old", "the failed attempt is not confirmed");
+      } else {
+        assert.equal(outcome.error, undefined);
+        assert.deepEqual(outcome.value, { published: true });
+        assert.equal(launches, 2, "verified intentional cancellation still permits retry");
+        assert.equal(requests, 2);
+      }
+    } finally { release.resolve(); await result; }
+  });
+}

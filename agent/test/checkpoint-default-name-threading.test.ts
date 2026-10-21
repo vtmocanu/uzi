@@ -125,7 +125,7 @@ for (const expireOnRetry of [false, true]) {
         const operation = git["recoveryOperation"]()!;
         deadlines.push(operation.deadline);
         remaining.push(operation.deadline - Date.now());
-        return { stdout: Readable.from(["PACK"]), exited: Promise.resolve(0), cancel() {} };
+        return { stdout: Readable.from(["PACK"]), exited: Promise.resolve(0), settled: async () => {}, cancel() {} };
       },
     });
     client.publishCheckpoint = async (_run, _tip, stream, actualSignal) => {

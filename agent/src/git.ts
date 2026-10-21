@@ -8945,18 +8945,18 @@ export class GitCache {
   }
 
   /**
-   * PRD #122 M8 — the delta packfile of `<exclude>..refs/uzi-runner/<branch>`, for a
-   * brokered origin publish at a checkpoint. Returns `{ tipOid, pack, exited }` where
-   * `tipOid` is the tracking-ref tip (the same the checkpoint fetched back), `pack`
+   * PRD #122 M8: prepare a packfile for a brokered origin publish at a checkpoint.
+   * Returns `{ tipOid, pack, exited }` where `tipOid` is the actual candidate after
+   * any workflow overlay or checkpoint chaining, `pack`
    * STREAMS the packfile bytes, and `exited` settles with the producer's exit code;
    * null when there is no tracking ref yet (nothing to publish).
    *
    * The exclude boundary mirrors the reseed's floor: `refs/remotes/origin/<branch>` when
-   * origin carries the branch, else the default branch — so the pack carries only what the
-   * checkpoint added beyond what origin already has.
+   * origin carries the branch, else merge-base(default, tip). For a zero range without an
+   * origin branch, transport excludes the candidate's parents so the declared commit is carried.
    *
    * STREAMS, never buffers: a pack can exceed the 64 MiB `maxBuffer` cap runGit uses, so
-   * this spawns `git pack-objects` and hands back its stdout as a Readable. M1 uses a
+   * this spawns `git pack-objects` and hands back its stdout as a Readable. It uses a
    * bounded explicit object list when a server-named default tracking commit was captured:
    * every legacy commit and tree remains, and only default-reachable blobs are omitted.
    * Without that captured authority (or on preparation cap exhaustion), the legacy revision
@@ -9044,9 +9044,14 @@ export class GitCache {
     const packed = await run(() => this.checkpointPackCaptured(barePath, branch, overlay, pinned, onStep,
       sourceSha, beforePack, chainFrom, options, parent ? undefined : Infinity));
     if (!packed) return null;
+    let settlePrevious = packed.settled;
     return { tipOid: packed.tipOid, pack: packed.pack, exited: packed.exited, cancel: packed.cancel,
       replay: async () => {
+        // A numeric cancellation exit is not proof of disposal. Keep the owned
+        // settlement failure visible before any successor producer can be opened.
+        await settlePrevious();
         const producer = await run(packed.replay);
+        settlePrevious = producer.settled;
         return { pack: producer.pack, exited: producer.exited, cancel: producer.cancel };
       } };
   }

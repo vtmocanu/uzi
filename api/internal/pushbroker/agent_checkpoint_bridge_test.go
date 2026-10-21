@@ -177,7 +177,7 @@ func runBridgeFixture(t *testing.T, root, node string, cfg map[string]any, summa
 }
 
 // TestAgentCheckpointChainBridge is the issue #2733 binding bridge. It runs the REAL agent
-// (agent/test/fixtures/checkpoint-chain-bridge.ts: a real RunRunner + GitCache driving a GitHub
+// (agent/test/fixtures/checkpoint-selective-chain-bridge.ts: a real RunRunner + GitCache driving a GitHub
 // forge claim through a workflow-overlay checkpoint O and then a raw tick or iteration checkpoint
 // N) against the REAL pushbroker.Publish, over the real HTTP route and WorkerClient.publishCheckpoint.
 // The broker keeps its depth-1 fetch and pack boundaries; no commit shape is built on the Go side,
@@ -187,8 +187,9 @@ func runBridgeFixture(t *testing.T, root, node string, cfg map[string]any, summa
 // acknowledgement lost after it landed.
 //
 // The stale-base family (issue #3242) runs the same real agent through a turn whose tip never moves
-// while origin's default branch advances, then publishes. Its broker fetches over real smart HTTP
-// (git http-backend), so the depth-1 base fetch is the one every forge serves.
+// while origin's default branch advances, then publishes via checkpoint-chain-bridge.ts.
+// Its broker fetches over real smart HTTP (git http-backend), so the depth-1 base fetch is the one
+// every forge serves.
 //
 // Gated by UZI_CHECKPOINT_CHAIN_BRIDGE=1 (task test:checkpoint-chain-bridge): it needs Node and the
 // installed agent dependencies, so the default `go test ./...` skips it. Once the gate is set a
@@ -463,6 +464,11 @@ func runAgentCheckpointBridge(t *testing.T, root, node, boundary string, iid int
 	}
 }
 
+// runAgentStaleBaseBridge is issue #3242's reproduction: a run whose tip may still be the default
+// branch commit it cloned, while origin's default branch moves, publishes a checkpoint. Origin has no
+// branch and no checkpoint ref yet. Before each publish reaches the broker, a depth-1 fetch over the
+// same smart HTTP URL records whether the declared tip is absent from every base ref tip the broker
+// fetches, so a refusal can be told apart from a transport artifact.
 func runAgentStaleBaseBridge(t *testing.T, root, node string, c staleBaseCase, iid int) {
 	backend := requireGitHTTPBackend(t)
 	trustLoopbackTLS(t)
