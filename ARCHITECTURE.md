@@ -1018,7 +1018,7 @@ chain in the diagram above, with no intervening `running`.
   the checkpoint broker ([PRD #628](prds/done/628-cross-worker-resume-durability.md))
   carries off the worker and adoption peels back to uncommitted (exact recovery
   same-worker, best-effort cross-worker, bounded by `WORKER_AFFINITY_CEILING`;
-  the marker never includes core dumps or files over 8 MiB, and one under a
+  the marker never commits core dumps or files over 8 MiB, and one under a
   verified coverage wrapper is peeled at successor adopt). A
   resumed run whose plan is provably reviewed and whose work recovered continues
   without re-gating; a total loss re-gates a human-approved run, preserving
