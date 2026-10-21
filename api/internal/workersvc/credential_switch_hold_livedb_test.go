@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -88,6 +89,23 @@ func (f holdFx) reportNonce(t *testing.T, workerID, run uuid.UUID, state string,
 func (f holdFx) register(t *testing.T) string {
 	t.Helper()
 	_, nonce, err := f.svc.Register(f.env.ctx, f.worker(t, f.o.workerID), "v-test", "base", nil, nil, []string{capability.CredentialSwitchV1}, nil)
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	return nonce
+}
+
+// attest is a register snapshot that attests run as running at f.gen with a terminal outcome
+// pending, so Register leaves the run running at its generation (any other snapshot, or none,
+// requeues it as an orphan).
+func (f holdFx) attest(run uuid.UUID) *ActiveSnapshot {
+	return &ActiveSnapshot{Active: []ActiveRunEntry{entry(run, f.gen, "running", true)}}
+}
+
+// registerAttesting drives the real Service.Register with a snapshot attesting run and returns the nonce.
+func (f holdFx) registerAttesting(t *testing.T, run uuid.UUID) string {
+	t.Helper()
+	_, nonce, err := f.svc.Register(f.env.ctx, f.worker(t, f.o.workerID), "v-test", "base", nil, nil, []string{capability.CredentialSwitchV1}, f.attest(run))
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -230,6 +248,40 @@ func TestCredentialSwitchHoldEffectsAndReplayLiveDB(t *testing.T) {
 	if got := holdReasonOf(t, f.env, id); got != "credential_switch_unsettled" {
 		t.Fatalf("hold replay after settle regressed hold_reason to %q, want it to stay unsettled", got)
 	}
+}
+
+// TestCredentialSwitchHoldSupersededNonceReplayRefusedLiveDB: the idempotent-replay path converges
+// only for the CURRENT incarnation. After a genuine hold (and, separately, a genuine settle) a
+// re-registration rotates the nonce; the old incarnation's redelivery of the same report is then
+// applied=false even though the row already shows the state it would replay.
+func TestCredentialSwitchHoldSupersededNonceReplayRefusedLiveDB(t *testing.T) {
+	t.Run("hold replay", func(t *testing.T) {
+		f := newHoldFx(t)
+		id := f.run(t)
+		f.hold(t, id)
+		reregister(t, f.env, f.o.workerID)
+		if _, applied, err := f.reportNonce(t, f.o.workerID, id, "credential_switch_held", f.gen, holdFixtureNonce); err != nil || applied {
+			t.Fatalf("old-nonce hold replay: applied=%v err=%v, want refused", applied, err)
+		}
+		if got := holdReasonOf(t, f.env, id); got != "credential_switch_settling" {
+			t.Fatalf("hold_reason = %q, want the genuine hold untouched", got)
+		}
+	})
+	t.Run("settle replay", func(t *testing.T) {
+		f := newHoldFx(t)
+		id := f.run(t)
+		f.hold(t, id)
+		if _, applied, err := f.reportNonce(t, f.o.workerID, id, "credential_switch_hold_settled", f.gen, holdFixtureNonce); err != nil || !applied {
+			t.Fatalf("genuine settle: applied=%v err=%v", applied, err)
+		}
+		reregister(t, f.env, f.o.workerID)
+		if _, applied, err := f.reportNonce(t, f.o.workerID, id, "credential_switch_hold_settled", f.gen, holdFixtureNonce); err != nil || applied {
+			t.Fatalf("old-nonce settle replay: applied=%v err=%v, want refused", applied, err)
+		}
+		if got := holdReasonOf(t, f.env, id); got != "credential_switch_unsettled" {
+			t.Fatalf("hold_reason = %q, want the genuine settle untouched", got)
+		}
+	})
 }
 
 // TestCredentialSwitchHoldFencesLiveDB: every conjunct of the hold's WHERE refuses a report, each
@@ -682,8 +734,9 @@ func TestCredentialSwitchHoldNothingMovesStatusSinceLiveDB(t *testing.T) {
 	assertUntouched(t, "sweeper on the unsettled hold", "credential_switch_unsettled")
 	directPark("direct park statements on the unsettled hold", "credential_switch_unsettled")
 
-	// A real Service.Register (the only status_since-adjacent writer: it moves the worker's floor, never
-	// the run) leaves the unsettled hold untouched too.
+	// A real Service.Register (pinned here: it moves the worker's floor and may requeue or fail runs it
+	// cannot attest, but leaves this paused hold's row, status_since included, untouched) is checked
+	// on the unsettled hold too.
 	f.register(t)
 	assertUntouched(t, "Service.Register on the unsettled hold", "credential_switch_unsettled")
 }
@@ -816,29 +869,43 @@ func (f holdFx) lockWorkerAndHold(t *testing.T, id uuid.UUID) pgx.Tx {
 	return holdTx
 }
 
-// TestCredentialSwitchHoldRegisterWaitsOnHoldLockLiveDB drives the REAL Service.Register through the
-// ordering that transaction-start timestamps get wrong: the hold transaction owns the worker row
-// lock, Service.Register starts (its transaction BEGINs earlier than the hold's COMMIT) and waits on
-// it, then runs after the hold commits. The floor must land after the hold's status_since (it only
-// can if Register's floor statement sees a hold committed DURING its lock wait: a separate lock
-// statement, READ COMMITTED), so the settling fence is lifted for the owner, the old incarnation's
-// acknowledgement is refused (by nonce and by floor), and the hold row, status_since included, is
-// untouched.
-func TestCredentialSwitchHoldRegisterWaitsOnHoldLockLiveDB(t *testing.T) {
-	f := newHoldFx(t)
-	id := f.run(t)
+// registerBehindHold drives the REAL svc.Register through the ordering that transaction-start
+// timestamps get wrong: Register's transaction BEGINs (so its now() is fixed) strictly BEFORE the hold
+// transaction begins and stamps status_since, then Register waits on the worker row lock the hold
+// transaction owns, and runs only after the hold commits. The test seam registerAfterBegin pauses
+// Register between its BEGIN and its worker lock while the hold transaction is opened. A plain now()
+// floor would land BEFORE the hold's status_since here; only the floor subquery that sees the hold
+// committed during the lock wait lands after it. Returns Register's nonce.
+func (f holdFx) registerBehindHold(t *testing.T, svc *Service, id uuid.UUID) string {
+	t.Helper()
 	ctx := f.env.ctx
-	holdTx := f.lockWorkerAndHold(t, id)
-
+	begun := make(chan struct{})
+	proceed := make(chan struct{})
+	var once sync.Once
+	svc.registerAfterBegin = func() {
+		once.Do(func() {
+			close(begun)
+			<-proceed
+		})
+	}
+	t.Cleanup(func() { svc.registerAfterBegin = nil })
 	type regResult struct {
 		nonce string
 		err   error
 	}
 	regDone := make(chan regResult, 1)
 	go func() {
-		_, nonce, err := f.svc.Register(ctx, f.worker(t, f.o.workerID), "v-test", "base", nil, nil, []string{capability.CredentialSwitchV1}, nil)
+		_, nonce, err := svc.Register(ctx, f.worker(t, f.o.workerID), "v-test", "base", nil, nil, []string{capability.CredentialSwitchV1}, nil)
 		regDone <- regResult{nonce, err}
 	}()
+	select {
+	case <-begun:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Register never reached its post-BEGIN seam")
+	}
+	time.Sleep(20 * time.Millisecond) // the hold's transaction starts strictly after Register's
+	holdTx := f.lockWorkerAndHold(t, id)
+	close(proceed)
 	select {
 	case r := <-regDone:
 		t.Fatalf("Register finished while the hold transaction held the worker lock (err=%v)", r.err)
@@ -851,6 +918,19 @@ func TestCredentialSwitchHoldRegisterWaitsOnHoldLockLiveDB(t *testing.T) {
 	if reg.err != nil {
 		t.Fatalf("Register after the hold: %v", reg.err)
 	}
+	return reg.nonce
+}
+
+// TestCredentialSwitchHoldRegisterWaitsOnHoldLockLiveDB: Register BEGAN before the hold's status_since
+// was stamped and queued on the hold's worker lock (registerBehindHold). The floor must still land
+// after status_since (a plain now() floor would land before it), so the settling fence is lifted for
+// the owner, the old incarnation's acknowledgement is refused (by nonce and by floor), and the hold
+// row, status_since included, is untouched.
+func TestCredentialSwitchHoldRegisterWaitsOnHoldLockLiveDB(t *testing.T) {
+	f := newHoldFx(t)
+	id := f.run(t)
+	ctx := f.env.ctx
+	newNonce := f.registerBehindHold(t, f.svc, id)
 
 	since := statusSinceOf(t, f.env, id)
 	if floor := f.worker(t, f.o.workerID).DindRegisterFloor.Time; !floor.After(since) {
@@ -864,7 +944,7 @@ func TestCredentialSwitchHoldRegisterWaitsOnHoldLockLiveDB(t *testing.T) {
 		t.Fatalf("old-nonce acknowledgement: applied=%v err=%v, want refused", applied, err)
 	}
 	// So is the new incarnation's: it proves nothing about the old one's processes (floor > status_since).
-	if _, applied, err := f.reportNonce(t, f.o.workerID, id, "credential_switch_hold_settled", f.gen, reg.nonce); err != nil || applied {
+	if _, applied, err := f.reportNonce(t, f.o.workerID, id, "credential_switch_hold_settled", f.gen, newNonce); err != nil || applied {
 		t.Fatalf("new-nonce acknowledgement: applied=%v err=%v, want refused by the floor", applied, err)
 	}
 	if r := mustRun(t, f.env, id); r.Status != "paused" || r.HoldReason.String != "credential_switch_settling" || !r.StatusSince.Time.Equal(since) {
@@ -877,8 +957,8 @@ func TestCredentialSwitchHoldRegisterWaitsOnHoldLockLiveDB(t *testing.T) {
 
 // TestCredentialSwitchHoldRegisterIgnoresPoolIsolationLiveDB pins WHY Service.Register
 // opens its own READ COMMITTED transaction: the floor must be correct however the pool defaults the
-// isolation level. The pool is switched to REPEATABLE READ for new sessions; Register must still lift
-// the floor past a hold committed during its lock wait.
+// isolation level. The pool is switched to REPEATABLE READ for new sessions; Register (begun before the
+// hold, registerBehindHold) must still lift the floor past a hold committed during its lock wait.
 func TestCredentialSwitchHoldRegisterIgnoresPoolIsolationLiveDB(t *testing.T) {
 	f := newHoldFx(t)
 	ctx := f.env.ctx
@@ -892,7 +972,9 @@ func TestCredentialSwitchHoldRegisterIgnoresPoolIsolationLiveDB(t *testing.T) {
 		t.Skipf("cannot change the database default isolation: %v", err)
 	}
 	t.Cleanup(func() {
-		_, _ = f.env.pool.Exec(context.Background(), fmt.Sprintf(`ALTER DATABASE %s RESET default_transaction_isolation`, pgx.Identifier{db}.Sanitize()))
+		if _, err := f.env.pool.Exec(context.Background(), fmt.Sprintf(`ALTER DATABASE %s RESET default_transaction_isolation`, pgx.Identifier{db}.Sanitize())); err != nil {
+			t.Errorf("restore the database default isolation: %v", err)
+		}
 	})
 	// Fresh pool so its connections pick the new default up.
 	pool, err := store.OpenPool(ctx, os.Getenv("UZI_TEST_DATABASE_URL"))
@@ -908,23 +990,7 @@ func TestCredentialSwitchHoldRegisterIgnoresPoolIsolationLiveDB(t *testing.T) {
 	svc.SetTxBeginner(pool)
 
 	id := f.run(t)
-	holdTx := f.lockWorkerAndHold(t, id)
-	regDone := make(chan error, 1)
-	go func() {
-		_, _, err := svc.Register(ctx, f.worker(t, f.o.workerID), "v-test", "base", nil, nil, []string{capability.CredentialSwitchV1}, nil)
-		regDone <- err
-	}()
-	select {
-	case err := <-regDone:
-		t.Fatalf("Register finished while the hold transaction held the worker lock (err=%v)", err)
-	case <-time.After(400 * time.Millisecond):
-	}
-	if err := holdTx.Commit(ctx); err != nil {
-		t.Fatalf("commit hold: %v", err)
-	}
-	if err := <-regDone; err != nil {
-		t.Fatalf("Register: %v", err)
-	}
+	f.registerBehindHold(t, svc, id)
 	since := statusSinceOf(t, f.env, id)
 	if floor := f.worker(t, f.o.workerID).DindRegisterFloor.Time; !floor.After(since) {
 		t.Fatalf("dind_register_floor %v is not after status_since %v under a REPEATABLE READ pool default", floor, since)
@@ -941,11 +1007,11 @@ func TestCredentialSwitchHoldStaleIncarnationHoldRefusedLiveDB(t *testing.T) {
 	t.Run("after registration committed", func(t *testing.T) {
 		f := newHoldFx(t)
 		id := f.run(t)
-		newNonce := f.register(t)
-		// Register may have requeued/failed the unattested running run; the point of this case is a
-		// run still running at gen, so re-seed that state if so.
-		f.env.exec(`UPDATE runs SET status = 'running', claim_released_at = NULL, claim_generation = $2,
-		               credential_switch_requested_at = now(), credential_switch_generation = $2, worker_id = $3 WHERE id = $1`, id, f.gen, f.o.workerID)
+		// The registration attests the run (running, same generation), so it stays running at gen.
+		newNonce := f.registerAttesting(t, id)
+		if got := statusOf(t, f.env, id); got != "running" {
+			t.Fatalf("status after the attesting registration = %q, want running", got)
+		}
 		if _, applied, err := f.reportNonce(t, f.o.workerID, id, "credential_switch_held", f.gen, holdFixtureNonce); err != nil || applied {
 			t.Fatalf("old incarnation hold: applied=%v err=%v, want refused", applied, err)
 		}
@@ -972,7 +1038,7 @@ func TestCredentialSwitchHoldStaleIncarnationHoldRefusedLiveDB(t *testing.T) {
 		}
 		regDone := make(chan error, 1)
 		go func() {
-			_, _, err := f.svc.Register(ctx, oldWorker, "v-test", "base", nil, nil, []string{capability.CredentialSwitchV1}, nil)
+			_, _, err := f.svc.Register(ctx, oldWorker, "v-test", "base", nil, nil, []string{capability.CredentialSwitchV1}, f.attest(id))
 			regDone <- err
 		}()
 		time.Sleep(300 * time.Millisecond) // Register is queued first on the worker lock
@@ -997,8 +1063,13 @@ func TestCredentialSwitchHoldStaleIncarnationHoldRefusedLiveDB(t *testing.T) {
 		if r.err != nil || r.applied {
 			t.Fatalf("old incarnation hold queued behind the registration: applied=%v err=%v, want refused", r.applied, r.err)
 		}
-		if got := holdReasonOf(t, f.env, id); got == "credential_switch_settling" {
-			t.Fatal("a superseded incarnation's hold paused the run")
+		// The attested run stayed running through the registration, so only the nonce conjunct can
+		// have refused the hold (a status refusal would also leave it non-paused, hence the status pin).
+		if got := statusOf(t, f.env, id); got != "running" {
+			t.Fatalf("status = %q, want running (the superseded incarnation's hold must not pause it)", got)
+		}
+		if got := holdReasonOf(t, f.env, id); got != "" {
+			t.Fatalf("hold_reason = %q, want none", got)
 		}
 	})
 }

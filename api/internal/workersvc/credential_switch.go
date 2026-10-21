@@ -287,7 +287,7 @@ func (s *Service) holdCredentialSwitch(ctx context.Context, owned store.Run, wkr
 	if req.ClaimGeneration == nil {
 		return store.Run{}, false, fmt.Errorf("%w: %s requires claim_generation", ErrInvalidState, stateCredentialSwitchHeld)
 	}
-	if req.RegisterNonce == "" || len(req.RegisterNonce) > 128 {
+	if !validHoldRegisterNonce(req.RegisterNonce) {
 		return store.Run{}, false, fmt.Errorf("%w: %s requires register_nonce", ErrInvalidState, stateCredentialSwitchHeld)
 	}
 	gen := *req.ClaimGeneration
@@ -326,7 +326,7 @@ func (s *Service) settleCredentialSwitchHold(ctx context.Context, owned store.Ru
 	if req.ClaimGeneration == nil {
 		return store.Run{}, false, fmt.Errorf("%w: %s requires claim_generation", ErrInvalidState, stateCredentialSwitchHoldSettled)
 	}
-	if req.RegisterNonce == "" || len(req.RegisterNonce) > 128 {
+	if !validHoldRegisterNonce(req.RegisterNonce) {
 		return store.Run{}, false, fmt.Errorf("%w: %s requires register_nonce", ErrInvalidState, stateCredentialSwitchHoldSettled)
 	}
 	gen := *req.ClaimGeneration
@@ -353,6 +353,10 @@ func (s *Service) settleCredentialSwitchHold(ctx context.Context, owned store.Ru
 	}
 	return cur, true, nil
 }
+
+// validHoldRegisterNonce is the shape check both hold reports apply to the registration nonce they
+// carry: present and bounded. Whether it is the CURRENT nonce is currentRegisterNonce's question.
+func validHoldRegisterNonce(nonce string) bool { return nonce != "" && len(nonce) <= 128 }
 
 // currentRegisterNonce reports whether nonce is the worker's current registration nonce
 // (workers.snapshot_register_nonce), read after the claim mutation's worker lock.

@@ -2031,6 +2031,10 @@ type Service struct {
 	// non-atomically, so a deployment that never wired it can never complete an interlocked
 	// run without the permit transaction. A LEGACY completion never touches it.
 	txBeginner TxBeginner
+	// registerAfterBegin is a test seam (nil in production): Register calls it right after its
+	// transaction BEGINs and before it locks the worker row, so a test can pause a registration whose
+	// now() is already fixed while a credential-switch hold is stamped behind it.
+	registerAfterBegin func()
 	// ciRepairAfterInsert is a test seam (nil in production): CreateCIRepairRun calls it inside
 	// the create transaction after the run INSERT and before the episode write, so a test can
 	// inject a failure and prove the run and the episode roll back together.
@@ -2550,6 +2554,9 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 			_ = tx.Rollback(ctx)
 		}
 	}()
+	if s.registerAfterBegin != nil {
+		s.registerAfterBegin()
+	}
 	qtx := store.New(tx)
 	// (a) Lock the worker row FOR UPDATE (keep this a separate statement before RegisterWorker; see
 	// the READ COMMITTED note above) — the canonical order that serialises Register against
