@@ -142,6 +142,10 @@ import {
   REASON_COMPLETION_NO_PROGRESS,
   REASON_COMPLETION_LEAD_REQUESTED,
   REASON_COMPLETION_BUDGET_EXHAUSTED,
+  REASON_COMPLETION_STALL,
+  NoProgressStallTracker,
+  stallEligible,
+  progressSetsEqual,
   completionAttemptFingerprint,
   updateCompletionStreak,
   routeCompletionHold,
@@ -663,6 +667,9 @@ interface TurnResult {
   /** Issue #281: true when any subagent produced a frame this turn (work in flight),
    *  which disqualifies the turn from counting as a no-progress stall. */
   subagentActivity?: boolean;
+  /** Issue #3139: true when the lead (main origin) started a non-signal tool call this turn.
+   *  Mirrored from ReducedTurnResult like `subagentActivity`. */
+  leadToolCall?: boolean;
   /** issue #1197 (D-RC2a): the SDK terminal's positively-reported turn count, coerced
    *  by the reducer to a number ONLY when finite (missing/garbage stays undefined,
    *  never 0). Mirrored here so `driveTurn`'s returned result (reducer.finish().result)
@@ -2958,6 +2965,12 @@ export class SdkExecutor implements Executor {
       let consecutiveMisses = 0;
       // Issue #281: no-progress / terminal-refusal detection state.
       let stallStreak = 0;
+      // Issue #3139: the worker-initiated no-progress stall detector, independent of the #281 text
+      // streak above. It never reads the lead's text; the served attempt count and completed count
+      // are refreshed at every loop-top boundary (absent means ineligible).
+      const noProgress = new NoProgressStallTracker();
+      let lastServedCompletionAttempts: number | undefined;
+      let lastServedCompletedCount: number | undefined;
       let lastStallFingerprint: string | undefined;
       let lastStallText: string | undefined;
       // The detector trips only on STALL_LIMIT CONSECUTIVE qualifying refusal turns. The
@@ -2969,6 +2982,7 @@ export class SdkExecutor implements Executor {
         stallStreak = 0;
         lastStallFingerprint = undefined;
         lastStallText = undefined;
+        noProgress.reset();
       };
       // PRD #1226 M3 (D3): completion-interlock attempt-loop state, DISTINCT from the #281 prose
       // stall state above but sharing STALL_LIMIT. completionAttempted latches true once the
@@ -3103,6 +3117,8 @@ export class SdkExecutor implements Executor {
         this.throwIfTerminal(ctx);
         if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
         history.observe(served?.completionAttempts);
+        lastServedCompletionAttempts = served?.completionAttempts;
+        lastServedCompletedCount = served?.completedCount;
         const boundaryCap = isIssueRun ? scopeCapAtBoundary({
           served, frozen: frozenMilestones ?? ctx.frozenMilestones,
         }) : undefined;
@@ -3308,6 +3324,16 @@ export class SdkExecutor implements Executor {
         // the history, and the history is re-sent only when it did not. Live-id sets only grow
         // (isLiveFollowUpId), so history can first ride only turn 1, which has no session.
         let historyProcessed = false;
+        // Issue #3139: a turn whose prompt carries owner or system text is new input, so it breaks
+        // the new stall streak. Only the new tracker resets here; the #281 state is untouched.
+        if (followUp !== undefined || reworkForTurn || ownerRides || historyRides || safetySteer) {
+          noProgress.reset();
+        }
+        // Issue #3139: the progress sets before this turn, to tell whether the turn changed them.
+        const progressBefore = {
+          completed: [...(latestProgress?.completed ?? [])],
+          in_progress: [...(latestProgress?.in_progress ?? [])],
+        };
         const onFirstEvent = () => {
           ownerFirstEvent?.();
           historyProcessed = true;
@@ -3476,6 +3502,50 @@ export class SdkExecutor implements Executor {
             }
           }
           if (!processed) carriedSafetySteer = safetySteer;
+        };
+        // The worker's completion-attempt sequence, shared by the done path and the issue #3139
+        // stall path so both keep one order and one set of cancel/terminal checks.
+        const recordAttempt = async (
+          declared: string[],
+          nonClosing?: { reason: string },
+        ): Promise<{ unmet: string[]; head: string | null; worktreeFingerprint: string | null }> => {
+          // 1. Checkpoint-FIRST: capture the turn's committed work (reap + fetch-back)
+          //    BEFORE any denial/feedback, so a rework prompt or a hold never loses it.
+          //    reap:true is the same reap-before-git ordering the done/interactive-park paths
+          //    use; the session transcript survives on disk so the SAME session resumes.
+          await this.closeAndSettlePlanSummary();
+          await ctx.checkpoint?.({ reap: true, progress: latestProgress, sink: "done_checkpoint" });
+          this.throwIfTerminal(ctx);
+          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+          // 2. Read the branch tip + worktree fingerprint. The runner's worktreeFingerprint is
+          //    `${tip}\n${porcelain}`, so the FIRST line is the branch head (null when the
+          //    fingerprint is unresolvable — then head is null too, which the server accepts).
+          const worktreeFingerprint = ctx.worktreeFingerprint
+            ? await ctx.worktreeFingerprint()
+            : null;
+          const head =
+            worktreeFingerprint !== null
+              ? (worktreeFingerprint.split("\n", 1)[0] ?? null)
+              : null;
+          // 3. Record the attempt SERVER-side: it unions THIS declaration into
+          //    milestones_completed, recomputes unmet over the merged set (server authoritative)
+          //    and records a bounded attempt. Pass only this turn's declaration — the server
+          //    unions it with prior report_progress.
+          this.throwIfTerminal(ctx);
+          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+          const { unmet } = await ctx.recordCompletionAttempt!({
+            declared,
+            ...(nonClosing !== undefined ? { nonClosing } : {}),
+            head,
+            worktreeFingerprint,
+          });
+          // Latch AFTER the attempt returns — the post-attempt failure routing (step 6) only
+          // arms once at least one attempt has actually completed. A thrown attempt call leaves
+          // this false, so the run fails legacy-style (no hold), which is correct.
+          completionAttempted = true;
+          this.throwIfTerminal(ctx);
+          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+          return { unmet, head, worktreeFingerprint };
         };
         let turn: TurnResult;
         try {
@@ -3882,38 +3952,10 @@ export class SdkExecutor implements Executor {
             //    BEFORE any denial/feedback, so a rework prompt or a hold never loses it.
             //    reap:true is the same reap-before-git ordering the done/interactive-park paths
             //    use; the session transcript survives on disk so the SAME session resumes.
-            await this.closeAndSettlePlanSummary();
-            await ctx.checkpoint?.({ reap: true, progress: latestProgress, sink: "done_checkpoint" });
-            this.throwIfTerminal(ctx);
-            if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
-            // 2. Read the branch tip + worktree fingerprint. The runner's worktreeFingerprint is
-            //    `${tip}\n${porcelain}`, so the FIRST line is the branch head (null when the
-            //    fingerprint is unresolvable — then head is null too, which the server accepts).
-            const worktreeFingerprint = ctx.worktreeFingerprint
-              ? await ctx.worktreeFingerprint()
-              : null;
-            const head =
-              worktreeFingerprint !== null
-                ? (worktreeFingerprint.split("\n", 1)[0] ?? null)
-                : null;
-            // 3. Record the attempt SERVER-side: it unions THIS signal_done's declaration into
-            //    milestones_completed, recomputes unmet over the merged set (server authoritative)
-            //    and records a bounded attempt. Pass only this turn's declaration — the server
-            //    unions it with prior report_progress.
-            this.throwIfTerminal(ctx);
-            if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
-            const { unmet } = await ctx.recordCompletionAttempt({
-              declared: turn.milestonesCompleted ?? [],
-              ...(declaredNonClosing !== undefined ? { nonClosing: declaredNonClosing } : {}),
-              head,
-              worktreeFingerprint,
-            });
-            // Latch AFTER the attempt returns — the post-attempt failure routing (step 6) only
-            // arms once at least one attempt has actually completed. A thrown attempt call leaves
-            // this false, so the run fails legacy-style (no hold), which is correct.
-            completionAttempted = true;
-            this.throwIfTerminal(ctx);
-            if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+            const { unmet, head, worktreeFingerprint } = await recordAttempt(
+              turn.milestonesCompleted ?? [],
+              declaredNonClosing,
+            );
             // 4. Every frozen milestone is declared complete → break to the normal finalize path
             //    (phasePublish); M4 adds the permit + PR-head verification there.
             if (unmet.length === 0) {
@@ -4121,6 +4163,84 @@ export class SdkExecutor implements Executor {
             }
           }
           break;
+        }
+        // Issue #3139: a worker-initiated no-progress stall. An eligible run (interlocked issue run,
+        // no completion attempt yet, at least one reported completed milestone) whose lead ends
+        // STALL_LIMIT consecutive turns with no tool call, no subagent activity, no worktree change
+        // and no milestone progress, without signalling done, gets one worker-recorded empty
+        // attempt and an owner decision instead of draining the iteration budget. Evaluated before
+        // the iteration-budget check so a trip on the last iteration is not lost, and before #281
+        // (which stays unchanged below). Never reads the lead's text; never sets done or publishes.
+        const stallIsEligible = stallEligible({
+          interlocked: !!ctx.completionInterlock,
+          issueRun: isIssueRun,
+          interactive: !!ctx.interactive,
+          attemptSeamWired: !!ctx.recordCompletionAttempt && !!ctx.worktreeFingerprint,
+          servedCompletionAttempts: lastServedCompletionAttempts,
+          completionAttempted,
+          seenCompletedCount: seenCompletedIds.size,
+          servedCompletedCount: lastServedCompletedCount,
+        });
+        if (!stallIsEligible) {
+          noProgress.reset();
+        } else {
+          const stallFingerprint = await ctx.worktreeFingerprint!();
+          const stallStreakNow = noProgress.observe({
+            leadToolCall: !!turn.leadToolCall,
+            subagentActivity: !!turn.subagentActivity,
+            fingerprint: stallFingerprint,
+            progressChanged: !progressSetsEqual(progressBefore, latestProgress),
+          });
+          if (stallStreakNow >= STALL_LIMIT) {
+            ctx.emit({
+              kind: "status",
+              agent: "worker",
+              payload: {
+                text: `no progress: the lead ended ${stallStreakNow} consecutive turns with no tool call, no worktree change and no milestone progress without signalling done — running a completion check for an owner decision`,
+              },
+            });
+            // The completion-streak state (completionStallStreak, lastCompletionFingerprint) is
+            // deliberately untouched: this attempt is not a lead completion attempt.
+            const { unmet } = await recordAttempt([]);
+            if (ctx.askCompletionQuestion) {
+              this.throwIfTerminal(ctx);
+              if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+              const decision = await ctx.askCompletionQuestion(unmet, { kind: "no_progress_stall" });
+              this.throwIfTerminal(ctx);
+              if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+              if (decision.outcome === "continue") {
+                ctx.emit({
+                  kind: "status",
+                  agent: "worker",
+                  payload: {
+                    text: "owner answered — resuming for a server-authoritative completion recheck",
+                  },
+                });
+                followUp = undefined;
+                completionRework = {
+                  text: buildCompletionReworkFollowUp(unmet, frozenMilestones,
+                    { kind: "answered", guidance: decision.guidance },
+                    ctx.completionInterlock === true && isIssueRun && !ctx.interactive),
+                  answered: true,
+                };
+                resetStallState();
+                continue;
+              }
+            }
+            ctx.emit({
+              kind: "status",
+              agent: "worker",
+              payload: {
+                text: `completion blocked: the lead stopped making progress without signalling done (${unmet.length} unmet frozen milestone(s)) — holding for an owner decision`,
+              },
+            });
+            if (await this.routeSummaryHold(ctx, REASON_COMPLETION_STALL, completionAttempted)) {
+              if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+              completionHeld = { reason: REASON_COMPLETION_STALL };
+              break;
+            }
+            throw new Error(REASON_COMPLETION_STALL);
+          }
         }
         if (iteration >= maxIterations) {
           // PRD #1226 M3 (D3): a POST-attempt iteration exhaustion routes to the completion hold
