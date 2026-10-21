@@ -667,6 +667,12 @@ export interface CheckpointRange {
    *  every commit the pack `tipSha ^excludeSha` carries is either scanned now, reachable from a
    *  previously confirmed checkpoint publish, or reachable from the default branch. */
   scanFloorShas?: string[];
+  /** issue #3242: TRANSPORT-only pack exclusions, replacing `^excludeSha` in the pack (never the
+   *  scan, never the floor validation). Set only for a zero range (`tipSha === excludeSha`) with no
+   *  origin branch: the pack would otherwise be empty, and the broker cannot prove it will fetch the
+   *  tip (the default branch may have moved past it). Then it is the tip's literal parent OIDs, so
+   *  the pack carries exactly the declared commit; `[]` for a root commit (distinct from absent). */
+  packExcludeShas?: readonly string[];
 }
 
 /** issue #1597 M2: optional GitCache construction knobs. */
@@ -8920,15 +8926,18 @@ export class GitCache {
     replay: () => Promise<{ pack: Readable; exited: Promise<number>; cancel: () => void }>;
   } | null> {
     // Replay closes over literal OIDs and the original guard; it never rebuilds an overlay.
-    const openProducer = async (source: string, candidate: string, floor: string) => {
+    const openProducer = async (source: string, candidate: string, floor: string, packExcludes?: readonly string[]) => {
       onStep?.("scratch_preflight");
       await this.scratchPublicationPreflight(barePath, branch, source);
       if (candidate !== source) await this.scratchPublicationPreflight(barePath, branch, candidate);
       await this.validateCheckpointFloor(barePath, floor, candidate);
       await beforePack?.(candidate);
       onStep?.("checkpoint_pack");
+      // issue #3242: a zero range packs the candidate over its literal parents instead of ^floor.
+      const excludes = candidate === floor && packExcludes !== undefined ? packExcludes : [floor];
       const { stdout, exited, cancel } = await this.spawnGit(
-        barePath, ["pack-objects", "--revs", "--stdout"], `${candidate}\n^${floor}\n`, { stdoutCategory: "artifactBytes" },
+        barePath, ["pack-objects", "--revs", "--stdout"], `${candidate}\n${excludes.map((x) => `^${x}\n`).join("")}`,
+        { stdoutCategory: "artifactBytes" },
       );
       return { pack: stdout, exited, cancel };
     };
@@ -8936,8 +8945,9 @@ export class GitCache {
     // If an overlay is requested, its wrapper becomes the wanted OID while the
     // excluded floor remains pinned.
     if (pinned) {
-      const { tipSha, excludeSha } = pinned;
+      const { tipSha, excludeSha, packExcludeShas } = pinned;
       if (!SHA40_RE.test(tipSha) || !SHA40_RE.test(excludeSha) ||
+          (packExcludeShas !== undefined && (tipSha !== excludeSha || !packExcludeShas.every((x) => SHA40_RE.test(x)))) ||
           (sourceSha !== undefined && sourceSha !== tipSha)) {
         throw new ScratchPublicationError("pinned checkpoint range must be two 40-hex commit SHAs", undefined, {
           kind: "checkpoint_range", step: "checkpoint_floor", detail: "pinned range is not two 40-hex commit SHAs",
@@ -8960,7 +8970,7 @@ export class GitCache {
         }
       }
       const candidate = wanted;
-      const replay = () => openProducer(tipSha, candidate, excludeSha);
+      const replay = () => openProducer(tipSha, candidate, excludeSha, packExcludeShas);
       return { tipOid: wanted, ...await replay(), replay };
     }
     const realTip = sourceSha ?? await this.trackingTip(barePath, branch);
@@ -9018,7 +9028,17 @@ export class GitCache {
     // The initial validation establishes the floor as a literal SHA before capturing it.
     await this.validateCheckpointFloor(barePath, excludeSha, wanted);
     const floor = excludeSha!;
-    const replay = () => openProducer(realTip, wanted, floor);
+    let packExcludes: readonly string[] | undefined;
+    try {
+      packExcludes = wanted === floor ? await this.zeroRangePackExcludes(barePath, branch, wanted, floor) : undefined;
+    } catch (e) {
+      const abort = this.boundaryAbortError(e);
+      if (abort) throw abort;
+      throw new ScratchPublicationError("checkpoint parents cannot be resolved", e, {
+        kind: "checkpoint_range", step: "checkpoint_floor", ...execDetail(classifyExecFailure(e)),
+      });
+    }
+    const replay = () => openProducer(realTip, wanted, floor, packExcludes);
     return { tipOid: wanted, ...await replay(), replay };
   }
 
@@ -9043,6 +9063,23 @@ export class GitCache {
     // base keeps the pack self-contained while the overlay aligns workflow trees.
     const base = (await this.runGit(barePath, ["merge-base", defaultRef, tip])).trim();
     return SHA40_RE.test(base) ? base : defaultRef;
+  }
+
+  /**
+   * issue #3242 — the transport exclusions for a zero range (`tip === floor`) with no origin branch.
+   * The pack `tip ^tip` would be empty, and the broker's depth-1 fetch holds the tip only while it is
+   * still the default branch's tip, which the worker cannot prove for the later fetch. So the pack
+   * excludes the tip's literal parents and carries the declared commit itself: all parents of a
+   * merge, `[]` for a root. Undefined when the range is not zero or origin carries the branch (the
+   * broker fetches that branch tip). Throws when the parents cannot be resolved.
+   */
+  private async zeroRangePackExcludes(barePath: string, branch: string, tip: string, floor: string): Promise<string[] | undefined> {
+    if (tip !== floor || await this.refExists(barePath, `refs/remotes/origin/${branch}`)) return undefined;
+    const [self, ...parents] = (await this.runGit(barePath, ["rev-list", "--parents", "-n", "1", tip, "--"])).trim().split(" ");
+    if (self !== tip || !parents.every((p) => SHA40_RE.test(p))) {
+      throw new Error("checkpoint tip parents are not 40-hex commit SHAs");
+    }
+    return parents;
   }
 
   /**
@@ -9104,7 +9141,8 @@ export class GitCache {
           scanFloorShas.push(floor);
         }
       }
-      return { tipSha, excludeSha, scanFloorShas };
+      const packExcludeShas = await this.zeroRangePackExcludes(barePath, branch, tipSha, excludeSha);
+      return { tipSha, excludeSha, scanFloorShas, ...(packExcludeShas !== undefined ? { packExcludeShas } : {}) };
     } catch (err) {
       this.log.warn("checkpoint range could not be resolved", { bare: barePath, error: gitErrorMessage(err) });
       return null;
