@@ -139,10 +139,10 @@ Where to set each lane:
 
 - **Your Claude judge model:** **Settings → Run defaults → Run judge → Claude
   judge model**; leave it on its **Default** option to use the instance value.
-  The field shows only if you can run Claude.
+  The field is hidden only when you can run Codex but not Claude.
 - **Your Codex judge model:** **Settings → Run defaults → Run judge → Codex
   judge model**, shown only if you can run Codex. **Save judge models** saves
-  both lanes. Under each field, **In effect: <model> · <source>** names what a
+  the lanes you changed. Under each field, **In effect: <model> · <source>** names what a
   judge run would resolve to and where that came from.
 - **Instance Claude and Codex judge models:** **Admin → Instance → Run judge**
   (the same two fields; their Default option reads **Default · <model>
