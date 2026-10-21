@@ -16,7 +16,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 )
 
-// PRD #3245: 00347_codex_judge_model.sql (draft number) copies a curated judge_model into the
+// PRD #3245: 00348_codex_judge_model.sql copies a curated judge_model into the
 // new Codex lane (users and the instance key) and leaves the Claude lane untouched. The
 // SQL literal list must equal agenttmpl.CuratedCodexModels, which is itself pinned to
 // fixtures/codex-models/models.json, so this test iterates that set.
