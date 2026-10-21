@@ -46,9 +46,11 @@ judge for everyone — into three effective modes:
   themselves, exactly as in [Enable it](#1-enable-it) above. This is the mode
   once an admin turns the judge on, until they also turn on enforcement.
 - **Enforced** — both are on. Every one of your finished runs is judged
-  **whether or not you've opted in yourself**, as long as you hold an
-  Anthropic token — a token-less user is still skipped silently, since
-  there's nothing to spend. Spend still stays on your own token: an admin can
+  **whether or not you've opted in yourself**, as long as you hold a
+  usable credential for that run's harness (an Anthropic token for a Claude
+  run, a usable Codex credential for a Codex run) — a user without it is
+  skipped silently for that run, since there's nothing to spend. Spend still
+  stays on your own credential: an admin can
   force that judging *happens*, never redirect *who pays* for it. Enforcement
   also overrides a per-user force-disable an admin may have set for you on
   **Admin → Users** — one flag can't tell "an admin disabled you" from "you
@@ -135,13 +137,17 @@ while the admin's is the fallback for everyone who hasn't set one.
 
 Where to set each lane:
 
-- **Your Claude judge model:** **Settings → Run defaults → Run judge → Judge
-  model**; leave it on **Inherit** to use the instance value.
-- **Your Codex judge model:** the `codex_judge_model` field of
-  `PUT /api/me/settings` (a signed-in browser session; the CLI has no setter).
-- **Instance Claude judge model:** **Admin → Instance → Run judge**.
-- **Instance Codex judge model:** the `codex_judge_model` key of the admin
-  settings API.
+- **Your Claude judge model:** **Settings → Run defaults → Run judge → Claude
+  judge model**; leave it on its **Default** option to use the instance value.
+  The field shows only if you can run Claude.
+- **Your Codex judge model:** **Settings → Run defaults → Run judge → Codex
+  judge model**, shown only if you can run Codex. **Save judge models** saves
+  both lanes. Under each field, **In effect: <model> · <source>** names what a
+  judge run would resolve to and where that came from.
+- **Instance Claude and Codex judge models:** **Admin → Instance → Run judge**
+  (the same two fields; their Default option reads **Default · <model>
+  (built-in)**). The Claude field shows a **Not a Claude model** warning when
+  its stored value is a Codex id.
 
 `uzi settings get` prints a **Model settings** table showing, per lane, what
 is stored, the default, what a judge run would resolve to, and where that came
