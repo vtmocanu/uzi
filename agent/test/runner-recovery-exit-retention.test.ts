@@ -62,16 +62,17 @@ function gitIn(dir: string, ...args: string[]): string {
  *  land in the "same second" deterministically: the #3131 collision, without depending on timing. */
 async function withSameSecondCommits<T>(fn: () => Promise<T>): Promise<T> {
   const realGit = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+  const quoted = `'${realGit.replaceAll("'", `'\\''`)}'`; // POSIX single quotes: no $ or ` expansion
   const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "uzi-same-second-git-"));
   fs.writeFileSync(path.join(dir, "git"),
-    `#!/bin/sh\nGIT_AUTHOR_DATE="2026-01-01T00:00:00Z" GIT_COMMITTER_DATE="2026-01-01T00:00:00Z" exec ${JSON.stringify(realGit)} "$@"\n`,
+    `#!/bin/sh\nGIT_AUTHOR_DATE="2026-01-01T00:00:00Z" GIT_COMMITTER_DATE="2026-01-01T00:00:00Z" exec ${quoted} "$@"\n`,
     { mode: 0o755 });
   const savedPath = process.env.PATH;
   process.env.PATH = `${dir}${path.delimiter}${savedPath ?? ""}`;
   try {
     return await fn();
   } finally {
-    process.env.PATH = savedPath;
+    if (savedPath === undefined) delete process.env.PATH; else process.env.PATH = savedPath;
     fs.rmSync(dir, { recursive: true, force: true });
   }
 }
