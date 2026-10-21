@@ -704,7 +704,15 @@ describe("issue #3181 m3: the wire contract", () => {
 });
 
 describe("issue #3181 m3: SdkExecutor bounded reap and join", () => {
-  const scratch = () => fs.mkdtempSync(path.join(os.tmpdir(), "uzi-3181-sdk-"));
+  const scratchDirs: string[] = [];
+  const scratch = () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-3181-sdk-"));
+    scratchDirs.push(dir);
+    return dir;
+  };
+  afterEach(() => {
+    for (const dir of scratchDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+  });
   const executor = (reap: () => Promise<RunProcessReap>) => new SdkExecutor(nullLogger(), scratch(), {
     runProcesses: { scan: async () => ({ pids: [], complete: true }), reap },
   });
