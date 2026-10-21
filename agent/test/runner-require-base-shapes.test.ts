@@ -456,3 +456,91 @@ describe("--require-base never accepts unchecked content (issue #3194, negative 
     assert.equal(hold.heads.length, 1, "the successor's guard held the run");
   });
 });
+
+// ── issue #3194 M1': the guard compares the clone's INDEX tree, not the identity's tree ─────────
+//
+// One real retained-recovery adoption, run twice. A predecessor flight accepted on P, committed and
+// attested S, then its capture journaled a restore tip that stands for S (restoreSource = S, built
+// with the real capture API) and the flight ended before adopting a successor. The reclaim carries
+// attested S, so the guard's identity equals the attestation in both runs; only the content differs.
+//  (a) the restore is a wrapper over S whose tree is S's: the successor implements.
+//  (b) the restore is the wip(park) marker over S: the successor's HEAD is S and the unattested WIP
+//      is STAGED, so only the index tree differs from tree(S). It is held before the executor.
+
+async function retainedMappedRestore(iid: number, extraWip: boolean) {
+  const branch = `agent/issue-${iid}`;
+  const key = `issue-${iid}`;
+  const planned = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
+  const claim = seededClaim(iid, planned, { claim_generation: 2 });
+  const bare = await git.ensureClone(fx.originPath);
+  fs.chmodSync(path.dirname(bare), 0o700);
+  fs.chmodSync(bare, 0o700);
+  const rc = await git.createOrAttachRunnerClone(bare, iid, noProofReseed, claim.run_id);
+  const s = commitFile(rc.path, "accepted.txt");
+  await fixtureFetchTracking(git, bare, rc.path, branch, claim.run_id);
+  await git.markRecoveryCapture(bare, rc.path, branch, claim.run_id);
+  const source = { runId: claim.run_id, clonePath: rc.path };
+  const reservation = await git.reserveRecoveryIteration(bare, branch, key, source);
+  let restoreTip: string;
+  if (extraWip) {
+    fs.writeFileSync(path.join(rc.path, "unattested.txt"), "dirty WIP left after the attested publish\n");
+    assert.equal(await git.commitWipMarker(rc.path), true);
+    restoreTip = gitIn(rc.path, ["rev-parse", "HEAD"]);
+    await fixtureFetchTracking(git, bare, rc.path, branch, claim.run_id);
+  } else {
+    restoreTip = gitIn(bare, [...IDENT, "commit-tree", `${s}^{tree}`, "-p", s, "-p", planned, "-m", "uzi recovery coverage test"]);
+  }
+  await git.recordRecoveryCapture(bare, branch, key, source, reservation.attempts, restoreTip, s);
+  const journaled = JSON.parse(gitIn(bare, ["config", `uzi-recovery.${branch}.clone`])).recovery;
+  assert.equal(journaled.restoreSource, s, "sanity: the restore stands for the attested source");
+  assert.notEqual(restoreTip, s, "sanity: the source is a mapping, not the restore tip itself");
+
+  const successors: { path: string; adoptedContentSource?: string; head: string; staged: string }[] = [];
+  const realPrepare = git.prepareRecoverySuccessor.bind(git);
+  git.prepareRecoverySuccessor = (async (...args: Parameters<typeof realPrepare>) => {
+    const out = await realPrepare(...args);
+    // What the adoption materialized, read before the guard and any executor.
+    successors.push({ ...out, head: gitIn(out.path, ["rev-parse", "HEAD"]),
+      staged: gitIn(out.path, ["diff", "--cached", "--name-only"]) });
+    return out;
+  }) as typeof realPrepare;
+  const broker = brokerStub(branch);
+  const hold = holdStub();
+  const { factory, legs } = recordingFactory((ctx) => {
+    if (extraWip) return;
+    assert.equal(gitIn(ctx.worktreePath, ["write-tree"]), gitIn(ctx.worktreePath, [`rev-parse`, `${s}^{tree}`]),
+      "the executor receives exactly the attested tree");
+  });
+  try {
+    api.setOwnershipStatus(claim.run_id, "running", 2);
+    await runnerWith(factory, fakeGitlab().gitlab, undefined, nullLogger(), { recoveryRetryMs: 1 })
+      .execute({ ...claim, checkpoint_tip: s, checkpoint_attested_source: s });
+  } finally {
+    broker.restore();
+    hold.restore();
+  }
+  assert.equal(successors.length, 1, "sanity: the flight adopted the restore on a fresh successor");
+  assert.equal(successors[0]!.adoptedContentSource, s, "sanity: the guard's identity is the attested source");
+  return { claim, rc, bare, restoreTip, s, successor: successors[0]!, legs, holds: hold.heads };
+}
+
+describe("--require-base materialized-tree check on a real recovery adoption (issue #3194 M1')", () => {
+  it("(a) a mapped restore whose tree is exactly the attested source implements", async () => {
+    const r = await retainedMappedRestore(31977, false);
+    assertAccepted(r.claim.run_id, r.legs);
+    assert.deepEqual(r.holds, [], "no hold was requested");
+  });
+
+  it("(b) the same restore plus unattested STAGED WIP is held before the executor, and the work is retained", async () => {
+    const r = await retainedMappedRestore(31976, true);
+    assertNotExecuted(r.claim.run_id, r.legs);
+    assert.equal(r.successor.head, r.s, "sanity: the adopted successor's HEAD was the attested source");
+    assert.equal(r.successor.staged, "unattested.txt", "sanity: the extra WIP was staged in the successor's index");
+    assert.equal(r.holds.length, 1, "the guard held the run");
+    assert.deepEqual(outcome(r.claim.run_id).refusals, [], "held, not failed");
+    // Retained: the predecessor clone, the successor's staged WIP and the restore pin.
+    assert.equal(fs.readFileSync(path.join(r.rc.path, "unattested.txt"), "utf8"), "dirty WIP left after the attested publish\n");
+    assert.equal(fs.readFileSync(path.join(r.successor.path, "unattested.txt"), "utf8"), "dirty WIP left after the attested publish\n");
+    assert.equal(gitIn(r.bare, ["rev-parse", `refs/uzi-recovery-episode/${r.claim.run_id}/${r.restoreTip}`]), r.restoreTip);
+  });
+});
