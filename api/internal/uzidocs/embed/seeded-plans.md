@@ -67,7 +67,8 @@ start a successor: `uzi run recovery <id>` shows the kept work and `uzi run
 export <id> --output <path>` downloads it. Resume and extend are refused for
 this hold. Work picked up from the forge branch instead (for example a branch
 already pushed by an earlier attempt) is not proof of the run's own checked work,
-so a mismatch there is rejected as a changed base, as on a first claim.
+so unless it is exactly the content the run's checkpoint attested, a mismatch
+there is rejected as a changed base, as on a first claim.
 Without `--require-base` nothing changes: a mismatch only warns.
 
 `--planned-commit` must be a hex commit SHA, 7-64 characters — a shorter or
