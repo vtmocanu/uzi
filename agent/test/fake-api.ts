@@ -1924,7 +1924,9 @@ export class FakeApi {
               status:
                 (body.recovery_cause === "provider_outage" ? this.typedParkAck.get(runId)?.status : undefined) ??
                 this.stateStatusOverride.get(runId) ??
-                body.status,
+                // Issue #3240: as the server does, pause_failed clears the pending pause and answers
+                // with the run's own status, which stays running.
+                (body.status === "pause_failed" ? "running" : body.status),
             }),
         ...(body.recovery_cause === "provider_outage" && this.typedParkAck.get(runId)?.holdReason !== undefined
           ? { hold_reason: this.typedParkAck.get(runId)!.holdReason }

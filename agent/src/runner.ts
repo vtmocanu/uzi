@@ -9607,7 +9607,12 @@ export class RunRunner {
         if (steering.claimFence() !== undefined) throw new StaleClaimError();
         const memory = flight.workerMemory;
         const memorySequence = memory && body.status !== undefined ? ++memory.stateSequence : undefined;
-        if (memory && body.status !== undefined && body.status !== "running") {
+        // Issue #3240: pause_failed is a diagnostic of a flight that keeps running (Decision 8), not a
+        // lifecycle change. It leaves the memory state as it is: no retire (the Codex broker keeps
+        // the context it captured), no hold, and on a running ACK no change to `running`. Any other
+        // ACK takes the ordinary path below.
+        const continuing = body.status === "pause_failed";
+        if (memory && body.status !== undefined && body.status !== "running" && !continuing) {
           memory.running = false;
           memory.resumeReady = false;
           memory.epochReady = false;
@@ -9719,7 +9724,8 @@ export class RunRunner {
           throw new StaleClaimError();
         }
         if (ack.status === "cancelled") this.observeCancellation(flight);
-        if (memorySequence !== undefined && memory?.stateSequence === memorySequence) {
+        if (memorySequence !== undefined && memory?.stateSequence === memorySequence &&
+            !(continuing && ack.status === "running" && ack.applied !== false)) {
           memory.running = body.status === "running" && ack.status === "running" && ack.applied !== false &&
             (!memory.phaseToken || memoryPhaseToken === memory.phaseToken);
           if (memory.running && memoryPhaseToken && this.memoryRuntime!.commands.releasePhase(memoryPhaseToken)) {
