@@ -39,6 +39,7 @@ type fakeSettingsDB struct {
 	effort          pgtype.Text
 	codexEffort     pgtype.Text
 	judge           pgtype.Text
+	codexJudge      pgtype.Text
 	summary         pgtype.Text
 	theme           pgtype.Text
 	mrRework        pgtype.Bool
@@ -132,6 +133,10 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		if j, ok := args[0].(pgtype.Text); ok {
 			f.judge = j // SetUserJudgeModel: $1 = judge_model
 		}
+	case strings.Contains(sql, "UPDATE users SET codex_judge_model") && len(args) >= 1:
+		if j, ok := args[0].(pgtype.Text); ok {
+			f.codexJudge = j // SetUserCodexJudgeModel: $1 = codex_judge_model
+		}
 	case strings.Contains(sql, "UPDATE users SET summary_model") && len(args) >= 1:
 		if s, ok := args[0].(pgtype.Text); ok {
 			f.summary = s // SetUserSummaryModel: $1 = summary_model
@@ -192,6 +197,7 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		effort:          f.effort,
 		codexEffort:     f.codexEffort,
 		judge:           f.judge,
+		codexJudge:      f.codexJudge,
 		summary:         f.summary,
 		theme:           f.theme,
 		mrRework:        f.mrRework,

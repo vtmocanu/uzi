@@ -29,7 +29,7 @@ import { delay, mockScenario, oidcDemo, requireSession, users } from "./shared";
 import { agentSource, mockAllowedAgentSourceHosts } from "./agentSource";
 import { secrets } from "./secrets";
 import { checkerModelWarning, normalizeCheckerValue } from "../../lib/crossCheckSettings";
-import type { CrossCheckPinDTO, Harness } from "../../lib/apiTypes";
+import type { CrossCheckPinDTO, Harness, ModelSettingCell } from "../../lib/apiTypes";
 import { mockDefaultClaudeModel } from "./agents";
 import { workersApi } from "./workers";
 
@@ -82,6 +82,8 @@ const SEED_USER_SETTINGS: UserSettings = {
   default_effort: null,
   default_codex_effort: null,
   judge_model: null,
+  // PRD #3245: the Codex judge lane; null = inherit. M3 builds the real UI and resolver.
+  codex_judge_model: null,
   summary_model: null,
   theme: null,
   // PRD #1167 "Lights on" m2: the four raw appearance overrides, all null = inherit
@@ -261,6 +263,8 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     (u.default_codex_effort === undefined || u.default_codex_effort === null || typeof u.default_codex_effort === "string") &&
     // Optional so a pre-#69 blob stays valid; absent reads as inherit.
     (u.judge_model === undefined || u.judge_model === null || typeof u.judge_model === "string") &&
+    // Optional so a pre-#3245 blob stays valid; absent reads as inherit.
+    (u.codex_judge_model === undefined || u.codex_judge_model === null || typeof u.codex_judge_model === "string") &&
     // Optional so a pre-#362 blob stays valid; absent reads as inherit.
     (u.now_summary_enabled === undefined || u.now_summary_enabled === null || typeof u.now_summary_enabled === "boolean") &&
     (u.summary_model === undefined || u.summary_model === null || typeof u.summary_model === "string") &&
@@ -518,7 +522,17 @@ function mySettingsResponse(): { settings: UserSettings } {
       resolved_effort: effort ?? workerEffort ?? "medium", model_source: model === null ? "worker default" : "pin",
       effort_source: effort === null ? "worker default" : "pin", active: true };
   }));
-  return { settings: { ...userSettings, cross_check_pins, default_model: projected ?? null } };
+  // PRD #3245 interim stub: both judge cells from the stored lanes and the built-ins only
+  // (the real mock resolver, pinned by the shared fixture, lands with the web surfaces).
+  const judge_models: ModelSettingCell[] = ([
+    { harness: "claude" as const, model: userSettings.judge_model, default_model: "opus", default_source: "builtin" },
+    { harness: "codex" as const, model: userSettings.codex_judge_model ?? null, default_model: CODEX_JUDGE_BUILTIN, default_source: "builtin" },
+  ]).map(c => ({
+    ...c,
+    resolved_model: c.model ?? c.default_model,
+    source: c.model ? "user_default" : c.default_source,
+  }));
+  return { settings: { ...userSettings, cross_check_pins, judge_models, default_model: projected ?? null } };
 }
 
 export let appSettings: AppSettings = loadedSettings.appSettings;
@@ -1330,6 +1344,11 @@ export const settingsApi = {
         throw new ApiError(400, "judge_model must be a single token with no spaces");
       }
       next = { ...next, judge_model: trimmed === "" ? null : trimmed };
+    }
+    if (patch.codex_judge_model !== undefined) {
+      // Interim stub (PRD #3245): blank clears to inherit, a value is stored trimmed.
+      const trimmed = patch.codex_judge_model?.trim() ?? "";
+      next = { ...next, codex_judge_model: trimmed === "" ? null : trimmed };
     }
     if (patch.summary_model !== undefined) {
       // Same rules as judge_model (PRD #362 M2): blank clears to inherit, a value with

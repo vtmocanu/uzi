@@ -32,6 +32,13 @@ func newSettingsCmd(env Env, gf *globalFlags) *cobra.Command {
 				settingsCrossCheckRows(settings)); err != nil {
 				return err
 			}
+			// PRD #3245: one table for every model setting, after the cross-check table.
+			if rows := settingsModelRows(settings); len(rows) > 0 {
+				p.Println("Model settings")
+				if err := p.Table(settingsModelColumns, settingRowsTable(rows)); err != nil {
+					return err
+				}
+			}
 			// PRD #2603: nil means the per-user switch was never set, which reads as on.
 			p.Println(settingsNowSummaryLine(settings))
 			return nil

@@ -815,10 +815,10 @@ void _releaseCheckStatusFull;
 {
   const _userSettingsMissing: never = null as unknown as Exclude<keyof UserSettings, keyof typeof userSettingsFull>;
   const _userSettingsExtra: never = null as unknown as Exclude<keyof typeof userSettingsFull, keyof UserSettings>;
-  const _userSettingsZero: ZeroOf<UserSettings, "sidebar_token_ids" | "sidebar_codex_account_ids" | "cross_check_pins"> = userSettingsZero;
+  const _userSettingsZero: ZeroOf<UserSettings, "sidebar_token_ids" | "sidebar_codex_account_ids" | "cross_check_pins" | "judge_models"> = userSettingsZero;
   const _userSettingsFull: Widen<UserSettings> = userSettingsFull;
   const _settingsUserFull: Widen<UserSettings> = settingsUserSettingsFull;
-  const _settingsUserZero: ZeroOf<UserSettings, "sidebar_token_ids" | "sidebar_codex_account_ids" | "cross_check_pins"> = settingsUserSettingsZero;
+  const _settingsUserZero: ZeroOf<UserSettings, "sidebar_token_ids" | "sidebar_codex_account_ids" | "cross_check_pins" | "judge_models"> = settingsUserSettingsZero;
   void _settingsUserFull;
   void _settingsUserZero;
   void _userSettingsMissing;
