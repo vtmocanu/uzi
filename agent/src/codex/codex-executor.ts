@@ -4905,6 +4905,21 @@ export class CodexExecutor implements Executor {
       // carries the repo roster's untrusted-content passage. The resumed thread's
       // developer instructions alone are not enough. Both phases get the roster below.
       if (repoSourced) prompt += `\n\n${REPO_SUBAGENT_UNTRUSTED_APPEND}`;
+      // Issue #3272: replacement prompts bypass implementPrompt, and a rejected resume starts a
+      // fresh thread with only this request. Attach the owner plan here on EVERY implement
+      // dispatch, from trusted claim fields, without duplicating it in the base prompt builder.
+      if (isSeededOwnerPlan(ctx)) {
+        prompt = [
+          SEEDED_PLAN_RULES,
+          "",
+          "The plan to implement is below, between the <plan> and </plan> tags. It is the plan this run's owner supplied. Carry it out:",
+          "<plan>",
+          ctx.approvedPlan!.trim(),
+          "</plan>",
+          "",
+          prompt,
+        ].join("\n");
+      }
     }
     prompt = [prompt, "", delegatesLine(Object.keys(agents), codexSubagentWriteCapabilities(agents)),
       ...(phase === "plan" && Object.keys(agents).length > 0 ? ["These annotations describe implementation capabilities. All planning dispatches are read-only."] : []),
@@ -4990,7 +5005,9 @@ export class CodexExecutor implements Executor {
    *  the implementation instruction, framed as approved, and the queue-time issue text is left
    *  out so it cannot compete. Absent ⇒ the pre-approved resume (the persisted
    *  ctx.approvedPlan, framed with REVIEWED_RESUME_APPROVAL_GUIDANCE on a reviewed-plan resume
-   *  (#3149), unframed otherwise) or the issue fallback. Every body is then followed by the shared
+   *  (#3149), unframed otherwise) or the issue fallback. Seeded owner plans leave their framing and
+   *  plan body to buildRunRequest, so replacement turns and resume-rejection retries carry them too.
+   *  Every body is then followed by the shared
    *  PR_SUMMARY_GUIDANCE paragraph (PRD #1798 M2), preceded by the published-floor note when
    *  there is one and followed by the milestone tracker note when there is one.
    *
@@ -5026,19 +5043,8 @@ export class CodexExecutor implements Executor {
           "</approved_plan>",
         ].join("\n")
       : approved && isSeededOwnerPlan(ctx)
-      ? [
-          // Issue #3272: the owner supplied this plan at creation, so there was no gate to approve
-          // it. Framing first, then the raw plan in a fence; it rides every implement iteration,
-          // including a live-session resume. Deliberately no "approved" wording (PRD #209 Decision A).
-          "Implement it now on the current branch, delegating to your subagents and iterating until the review passes; do not re-plan or resubmit it.",
-          "",
-          SEEDED_PLAN_RULES,
-          "",
-          "The plan to implement is below, between the <plan> and </plan> tags. It is the plan this run's owner supplied \u2014 carry it out:",
-          "<plan>",
-          approved,
-          "</plan>",
-        ].join("\n")
+      // The common request builder carries the framing and plan on base AND replacement turns.
+      ? "Implement it now on the current branch, delegating to your subagents and iterating until the review passes; do not re-plan or resubmit it."
       : approved && ctx.reviewedPlanResume === true && !ctx.sessionId && ctx.seeded !== true
       ? [
           // Issue #3149: a reviewed-plan resume states the approval. The seeded/no-session terms are
