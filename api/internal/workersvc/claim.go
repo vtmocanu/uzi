@@ -24,11 +24,12 @@ import (
 // structured templates (PRD #3 provides several subagents that map to
 // programmatic SDK AgentDefinitions), not a single `template`.
 type ClaimPayload struct {
-	MemoryEpisode           int64                `json:"memory_episode"`
-	MemoryInterventionCount int32                `json:"memory_intervention_count"`
-	MemoryPolicy            *MemoryPolicy        `json:"memory_policy"`
-	CrossCheck              *ClaimPlanCrossCheck `json:"cross_check,omitempty"`
-	RunID                   string               `json:"run_id"`
+	SemanticPlanning        *apitypes.SemanticEnrollment `json:"semantic_planning,omitempty"`
+	MemoryEpisode           int64                        `json:"memory_episode"`
+	MemoryInterventionCount int32                        `json:"memory_intervention_count"`
+	MemoryPolicy            *MemoryPolicy                `json:"memory_policy"`
+	CrossCheck              *ClaimPlanCrossCheck         `json:"cross_check,omitempty"`
+	RunID                   string                       `json:"run_id"`
 	// Kind is the run kind (one of the runkind values; PRD #6). The worker branches on it: an
 	// issue run works IssueIID's card; a ci_fix run diagnoses + fixes Pipeline.
 	Kind string `json:"kind"`
@@ -709,10 +710,11 @@ type ClaimConfig struct {
 	// accepted set (a legacy, non-interlocked, or revision-1 run), so a non-reduced run's claim is
 	// byte-identical to today's. Unlike CompletionContractVersion/ContractRevision (scalars read
 	// straight off a column) this is derived from the completion_contract jsonb by
-	// CompletionScopeClaim; it carries milestone TITLES (looked up from the contract's criteria),
+	// CompletionScopeClaim; it carries milestone TITLES (structural criterion text or frozen semantic milestones),
 	// which the owner-facing CompletionScopeView DTO does not.
-	CompletionScope *CompletionScopeConfig `json:"completion_scope,omitempty"`
-	NonClosing      *CompletionNonClosing  `json:"non_closing,omitempty"`
+	CompletionScope   *CompletionScopeConfig         `json:"completion_scope,omitempty"`
+	CompletionPending *apitypes.CompletionPendingDTO `json:"completion_pending,omitempty"`
+	NonClosing        *CompletionNonClosing          `json:"non_closing,omitempty"`
 	// JobInputFileMaxBytes, JobInputsMaxFiles and JobInputsMaxBytes are the server's job-input
 	// limits (PRD #1909 D1: one file, files per job, total bytes per job), delivered on a JOB
 	// claim only so the worker can refuse an oversized manifest before it downloads anything. The

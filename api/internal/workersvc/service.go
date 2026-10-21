@@ -12,6 +12,7 @@ package workersvc
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -969,6 +970,15 @@ type Store interface {
 	// stale/superseded/foreign or already-cleared report affects 0 rows. failCredentialSwitch reads
 	// a 0-row result as a benign no-op (applied=false).
 	ClearCredentialSwitchByWorker(ctx context.Context, arg store.ClearCredentialSwitchByWorkerParams) (int64, error)
+	// HoldCredentialSwitchUnsettled / SettleCredentialSwitchHold / CredentialSwitchHoldSettling
+	// are the issue #3181 credential-switch hold: the worker's credential_switch_held report
+	// pauses the run (hold_reason credential_switch_settling, claim kept, stamp cleared, nothing
+	// banked); its credential_switch_hold_settled acknowledgement flips it to
+	// credential_switch_unsettled behind the incarnation fence; CredentialSwitchHoldSettling is
+	// the fence ResumePausedRun refuses on, as a read.
+	HoldCredentialSwitchUnsettled(ctx context.Context, arg store.HoldCredentialSwitchUnsettledParams) (int64, error)
+	SettleCredentialSwitchHold(ctx context.Context, arg store.SettleCredentialSwitchHoldParams) (int64, error)
+	CredentialSwitchHoldSettling(ctx context.Context, arg store.CredentialSwitchHoldSettlingParams) (bool, error)
 	// ClearCompletionBudgetExhausted clears the served budget_exhausted steer
 	// (completion_budget_exhausted_at) on the owner's CONTINUE decision (PRD #1226 M5, D3): a
 	// new owner decision is the third of D3's clears (alongside the worker acting on it /
@@ -1945,6 +1955,9 @@ type Service struct {
 	// restart-losing — see quarantine_tracker.go. Nil-safe at every Service accessor so
 	// a struct-literal test service reads as "nothing latched".
 	quarantine *quarantineTracker
+	// memAuthority tracks workers whose run-lane claims were gated for lost memory authority
+	// (issue #3142). In-process and restart-losing, nil-safe — see memory_authority_tracker.go.
+	memAuthority *memoryAuthorityTracker
 	// forgeBaseURLAllowed is the SSRF gate for the M8 checkpoint-publish path (PRD
 	// #122): it reports whether a run's forge base URL is on the configured
 	// allowlist before the api will fetch/push against it. Set via
@@ -2028,6 +2041,10 @@ type Service struct {
 	// non-atomically, so a deployment that never wired it can never complete an interlocked
 	// run without the permit transaction. A LEGACY completion never touches it.
 	txBeginner TxBeginner
+	// registerAfterBegin is a test seam (nil in production): Register calls it right after its
+	// transaction BEGINs and before it locks the worker row, so a test can pause a registration whose
+	// now() is already fixed while a credential-switch hold is stamped behind it.
+	registerAfterBegin func()
 	// ciRepairAfterInsert is a test seam (nil in production): CreateCIRepairRun calls it inside
 	// the create transaction after the run INSERT and before the episode write, so a test can
 	// inject a failure and prove the run and the episode roll back together.
@@ -2318,7 +2335,7 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 		p.RunWallCeiling = min(max(24*time.Hour, p.RunTimeout), 72*time.Hour)
 	}
 	return &Service{
-		q: q, box: box, p: p, now: time.Now, persistFail: newPersistFailTracker(), outbox: newOutboxTracker(), quarantine: newQuarantineTracker(),
+		q: q, box: box, p: p, now: time.Now, persistFail: newPersistFailTracker(), outbox: newOutboxTracker(), quarantine: newQuarantineTracker(), memAuthority: newMemoryAuthorityTracker(),
 		publishFn:            pushbroker.Publish,
 		deleteCheckpointFn:   pushbroker.Delete,
 		salvageListRefTipsFn: pushbroker.ListRefTips,
@@ -2413,6 +2430,8 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 	// (issue #2213) no longer applies; a still-latched worker re-reports it on its
 	// next heartbeat.
 	s.quarantine.evictIfSet(wkr.ID)
+	// A fresh incarnation reports its own memory authority (issue #3142).
+	s.memAuthority.evictIfSet(wkr.ID)
 	max := int32(s.p.RunMaxRequeues) //nolint:gosec // G115: RunMaxRequeues is a small bounded config int (env RUN_MAX_REQUEUES), never near int32 range
 	// template is the worker's self-reported image template (PRD #18); empty →
 	// NULL (older image sends none). Soft signal only; never rejected here.
@@ -2533,7 +2552,11 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 		return store.Worker(row), nonce, nil
 	}
 
-	tx, err := s.txBeginner.Begin(ctx)
+	// READ COMMITTED is explicit, not the pool default: RegisterWorker's dind_register_floor
+	// subquery must see a credential_switch_settling hold committed while the GetWorkerForUpdate
+	// below waited on the worker lock. That needs BOTH this isolation level (a fresh statement
+	// snapshot per statement) and the lock being taken by a statement EARLIER than RegisterWorker.
+	tx, err := s.beginReadCommitted(ctx)
 	if err != nil {
 		return store.Worker{}, "", err
 	}
@@ -2543,8 +2566,12 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 			_ = tx.Rollback(ctx)
 		}
 	}()
+	if s.registerAfterBegin != nil {
+		s.registerAfterBegin()
+	}
 	qtx := store.New(tx)
-	// (a) Lock the worker row FOR UPDATE — the canonical order that serialises Register against
+	// (a) Lock the worker row FOR UPDATE (keep this a separate statement before RegisterWorker; see
+	// the READ COMMITTED note above) — the canonical order that serialises Register against
 	// a concurrent heartbeat and the stale-worker passes (both of which lock the worker row).
 	prior, err := qtx.GetWorkerForUpdate(ctx, wkr.ID)
 	if err != nil {
@@ -3178,8 +3205,24 @@ func (s *Service) RunBlockedOutcome(runID uuid.UUID) (reason string, workerID uu
 // CLOSED (ErrActiveSnapshotInvalid → the handler's 400). Without a snapshot (or without a tx
 // beginner: fake-store unit tests) it keeps the single auto-commit ClaimRun, which still applies
 // the persisted-snapshot exclusions and the overflow closure. Assembly always runs OUTSIDE the tx.
+//
+// Claim is the member-absent form (issue #3142): it reports no memory_authority. Only tests call
+// it; the HTTP handler calls ClaimReported.
 func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveSnapshot) (*ClaimPayload, error) {
-	return s.claimLane(ctx, wkr, snapshot, "run")
+	return s.claimLane(ctx, wkr, snapshot, "run", MemoryAuthorityReport{})
+}
+
+// ClaimReported is Claim carrying the request's memory_authority report (issue #3142). The
+// handler uses it. Claim above is the member-absent form, under which a capable worker is still
+// gated (fail closed).
+func (s *Service) ClaimReported(ctx context.Context, wkr store.Worker, snapshot *ActiveSnapshot, report MemoryAuthorityReport) (*ClaimPayload, error) {
+	return s.claimLane(ctx, wkr, snapshot, "run", report)
+}
+
+// MemoryAuthorityLostFor returns when the api first gated this worker's run-lane claims for lost
+// memory authority, false when it is not currently gated (issue #3142). In-process only.
+func (s *Service) MemoryAuthorityLostFor(workerID uuid.UUID) (time.Time, bool) {
+	return s.memAuthority.get(workerID)
 }
 
 // ClaimCrossCheck uses the run claim assembly and exact-generation finish transaction.
@@ -3187,10 +3230,10 @@ func (s *Service) ClaimCrossCheck(ctx context.Context, wkr store.Worker, snapsho
 	if s.txBeginner == nil {
 		return nil, errors.New("cross-check claim requires a transaction")
 	}
-	return s.claimLane(ctx, wkr, snapshot, "cross_check")
+	return s.claimLane(ctx, wkr, snapshot, "cross_check", MemoryAuthorityReport{})
 }
 
-func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *ActiveSnapshot, lane string) (*ClaimPayload, error) {
+func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *ActiveSnapshot, lane string, report MemoryAuthorityReport) (*ClaimPayload, error) {
 
 	// Vault gate (PRD #32 M3): while the run owner's vault is locked (after a pod
 	// restart, or a manual lock), do not claim any of their runs — report idle so
@@ -3299,7 +3342,20 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		custodyLimit = n
 	}
 	claimNow := s.now()
+	// Issue #3142: the memory-authority gate applies to the run/ordinary lanes only (the
+	// cross_check lane never reaches a memory runtime). claimRunInTx recomputes it from the
+	// locked re-read capabilities. A held report clears the visibility entry; an absent
+	// report from a worker that is not capable (old or guard-disabled) changes nothing.
+	memLost := lane != "cross_check" && memoryAuthorityLost(wkr.ProtocolCapabilities, report)
+	if lane != "cross_check" {
+		if memLost {
+			s.memAuthority.recordLost(wkr.ID, claimNow)
+		} else if report.held() {
+			s.memAuthority.evictIfSet(wkr.ID)
+		}
+	}
 	params := store.ClaimRunParams{
+		MemoryAuthorityLost:      memLost,
 		Lane:                     lane,
 		WorkerID:                 pgconv.UUID(wkr.ID),
 		UserID:                   wkr.UserID,
@@ -3372,7 +3428,7 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 	// This serializes both lane and legacy child occupancy before ClaimRun's snapshot.
 	if snapshot == nil || s.txBeginner == nil {
 		if s.txBeginner != nil {
-			return s.claimRunLeasedNoSnapshot(ctx, wkr, params)
+			return s.claimRunLeasedNoSnapshot(ctx, wkr, params, report)
 		}
 		run, err := s.q.ClaimRun(ctx, params)
 		if err != nil {
@@ -3445,7 +3501,7 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 	// claimRunInTx). Not claimed: COMMIT (the snapshot replace must persist) and report idle. On
 	// success, COMMIT and then assemble OUTSIDE the tx (assembly opens credentials + builds
 	// snapshots and must not hold the DB tx), exactly as the no-snapshot path does.
-	run, claimed, err := s.claimRunInTx(ctx, tx, qtx, wkr.ID, reread, params)
+	run, claimed, err := s.claimRunInTx(ctx, tx, qtx, wkr.ID, reread, params, report)
 	if err != nil {
 		return nil, err
 	}
@@ -3873,7 +3929,7 @@ type StateRequest struct {
 	RequireRunning bool `json:"require_running,omitempty"`
 	// CompletionFinalHead is the durably delivered final SHA, negotiated separately from permits.
 	CompletionFinalHead *string `json:"completion_final_head,omitempty"`
-	State               string  `json:"status"` // running|awaiting_approval|awaiting_input|awaiting_followup|limit_wait|recovery_wait|paused|pause_failed|credential_switch|completed|failed
+	State               string  `json:"status"` // running|awaiting_approval|awaiting_input|awaiting_followup|limit_wait|recovery_wait|paused|pause_failed|credential_switch|credential_switch_failed|credential_switch_held|credential_switch_hold_settled|completed|failed
 	// ClaimGeneration is the runs.claim_generation the worker believes it holds (PRD #1247
 	// M5, D3). A CAPABILITY worker (credential_switch_v1) stamps it on EVERY mutating report;
 	// SetState then fences the transition atomically on `claim_generation = @gen AND
@@ -3901,9 +3957,14 @@ type StateRequest struct {
 	// byte-identical to before. The field MUST exist here because httpx.DecodeJSON sets
 	// DisallowUnknownFields — a fence-capable worker that sends it would 400 otherwise. A negative
 	// value is invalid (ErrInvalidState). Ignored on every non-terminal report.
-	MessagesThroughSeq        *int64  `json:"messages_through_seq"`
-	CandidateDigest           string  `json:"candidate_digest,omitempty"`
-	PlanCrossCheckGateReason  *string `json:"plan_cross_check_gate_reason"`
+	MessagesThroughSeq       *int64  `json:"messages_through_seq"`
+	CandidateDigest          string  `json:"candidate_digest,omitempty"`
+	PlanCrossCheckGateReason *string `json:"plan_cross_check_gate_reason"`
+	// SemanticPark is the PRD #1230 D3 coverage-park reason an autopilot semantic run reports with
+	// its awaiting_approval park (coverage_incomplete|coverage_uncertain|coverage_unavailable|
+	// maintainer_authorization). Optional; the server compares it with its own coverage projection
+	// (see validateSemanticPark) and stores it only in the presented payload's semantic block.
+	SemanticPark              *string `json:"semantic_park"`
 	PlanCrossCheckDiffRefusal string  `json:"plan_cross_check_diff_refusal"`
 	PlanCrossCheckRefusal     string  `json:"plan_cross_check_refusal"`
 	PlanMd                    *string `json:"plan_md"`
@@ -4256,6 +4317,11 @@ func (s *Service) SetStateReport(ctx context.Context, wkr store.Worker, runID uu
 }
 
 func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUID, req StateRequest, gateRevisionOut *int64, reconciliationOut **LeadReconciliation) (run store.Run, applied bool, err error) {
+	return s.setStateWithTx(ctx, wkr, runID, req, gateRevisionOut, reconciliationOut, nil)
+}
+
+// setStateWithTx receives the actual parent transaction only from the claim-locked facade.
+func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uuid.UUID, req StateRequest, gateRevisionOut *int64, reconciliationOut **LeadReconciliation, parentTx pgx.Tx) (run store.Run, applied bool, err error) {
 	if err := validateRevisionRetry(req); err != nil {
 		return store.Run{}, false, err
 	}
@@ -4309,9 +4375,15 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	if err := validateCappedReportOnly(owned, req); err != nil {
 		return owned, false, err
 	}
+	if s.txBeginner == nil && parentTx == nil && semanticCompletionRequiresLock(owned) &&
+		(stateUsesGenerationFence(req.State, owned) || req.State == "pause_failed" ||
+			((req.State == "credential_switch" || req.State == "credential_switch_failed") && req.ClaimGeneration != nil)) {
+		return owned, false, ErrSemanticCompletionAuthority
+	}
 	// Withdrawal/release helpers have their own short claim transaction; they must
 	// not nest beneath the generic state fence on another connection.
-	if s.txBeginner != nil && (req.State == "pause_failed" || req.State == "credential_switch" || req.State == "credential_switch_failed") {
+	if s.txBeginner != nil && (req.State == "pause_failed" || req.State == "credential_switch" || req.State == "credential_switch_failed" ||
+		req.State == stateCredentialSwitchHeld || req.State == stateCredentialSwitchHoldSettled) {
 		locked, _, tx, err := s.beginClaimMutation(ctx, wkr, runID, req.ClaimGeneration)
 		if err != nil {
 			return owned, false, err
@@ -4319,7 +4391,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		defer func() { _ = tx.Rollback(ctx) }()
 		locked.bcast = nil
 		locked.lifecycle = nil
-		current, applied, err := locked.SetState(ctx, wkr, runID, req)
+		current, applied, err := locked.setStateWithTx(ctx, wkr, runID, req, nil, nil, tx)
 		if err != nil {
 			return current, false, err
 		}
@@ -4393,6 +4465,16 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	if req.State == "credential_switch_failed" {
 		return s.failCredentialSwitch(ctx, owned, wkr, req)
 	}
+	// Issue #3181: the credential-switch HOLD report and its settlement acknowledgement. Like the
+	// release they are fenced+idempotent statements of their own, dispatched BEFORE the generic
+	// generation fence (whose stale check would reject a redelivery after the hold applied) and
+	// under the same claim mutation lock (beginClaimMutation above).
+	if req.State == stateCredentialSwitchHeld {
+		return s.holdCredentialSwitch(ctx, owned, wkr, req)
+	}
+	if req.State == stateCredentialSwitchHoldSettled {
+		return s.settleCredentialSwitchHold(ctx, owned, wkr, req)
+	}
 	// PRD #1908 D-E: a job never parks. The job runner reports only running/completed/failed, and
 	// pauseRefusalReason already refuses an owner pause, so a park report for a job is a protocol
 	// error: refuse it rather than stall a run whose cancel nothing would consume.
@@ -4441,6 +4523,16 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// adopt_gate_revision) must stamp claim_generation, because a refusal's accounting is fenced
 	// on it; a current worker always stamps it and an id-less report never refuses. Adoption
 	// always names the id it adopts with, and a revision is positive.
+	if s.txBeginner == nil && (req.State == "running" || req.State == "awaiting_approval") {
+		if txq, ok := s.q.(*store.Queries); ok {
+			if semantic, err := semanticEnrollmentPresent(ctx, txq, runID); err != nil || semantic {
+				if err != nil {
+					return owned, false, err
+				}
+				return owned, false, ErrSemanticGateMismatch
+			}
+		}
+	}
 	gateTracked := req.State == "awaiting_approval" && gateRevisionKind(owned.Kind)
 	if gateTracked && (req.PresentationID != nil || req.AdoptGateRevision != nil) {
 		if req.ClaimGeneration == nil {
@@ -4608,6 +4700,19 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// 'declined' otherwise.
 	var settleScopeDisposition string
 	// providerHeld marks a typed provider park that parkProviderOutage turned into the paused hold (PRD #1733).
+	var semanticRunningContract []byte
+	var semanticRunning bool
+	if req.State == "running" {
+		if txq, ok := q.(*store.Queries); ok {
+			semanticRunningContract, semanticRunning, err = semanticAutoContract(ctx, txq, owned, req)
+			if semanticRunning && fenceTx == nil {
+				return owned, false, ErrSemanticGateMismatch
+			}
+			if err != nil {
+				return owned, false, err
+			}
+		}
+	}
 	var providerHeld bool
 	switch req.State {
 	case "running":
@@ -4650,9 +4755,20 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			planParams := store.SetRunAutopilotPlanParams{
 				PlanMd: planBody, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 			}
+			if semanticRunning {
+				planParams.CandidateDigest, err = hex.DecodeString(req.CandidateDigest)
+				if err != nil {
+					return owned, false, ErrSemanticGateMismatch
+				}
+			}
 			if owned.PlanCrossCheckRequired {
 				if err := bindPlanCrossCheckWrite(&planParams, owned, &req); err != nil {
 					return store.Run{}, false, err
+				}
+				if txq, ok := q.(*store.Queries); ok {
+					if err := validateSemanticPlanWrite(ctx, txq, runID, planParams); err != nil {
+						return store.Run{}, false, err
+					}
 				}
 			}
 			planRows, err = q.SetRunAutopilotPlan(ctx, planParams)
@@ -4687,6 +4803,9 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		runningParams, err = s.runningStateParams(ctx, owned, req)
 		if err != nil {
 			return store.Run{}, false, err
+		}
+		if semanticRunning {
+			runningParams.CompletionContract = semanticRunningContract
 		}
 		runningParams.IterationCount = req.IterationCount
 		runningParams.SessionID = sessionID
@@ -4782,6 +4901,13 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// PRD #1795 M1: classify the report under the run-row lock BEFORE any write (see
 		// gate_revision.go). The effective presented payload is computed in Go, so a conflict
 		// needs no trial write.
+		var semanticPresentation *apitypes.SemanticGatePresentation
+		if txq, ok := q.(*store.Queries); ok {
+			semanticPresentation, err = semanticGateReport(ctx, txq, owned, req)
+			if err != nil {
+				return owned, false, err
+			}
+		}
 		decision := gateDecision{class: gateClassUntracked}
 		if gateTracked && fenceTx != nil {
 			var witnessWorker *uuid.UUID
@@ -4793,6 +4919,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				witnessWorker = &id
 			}
 			decision, err = classifyGateReport(ctx, q, owned, req, gateReportFields{
+				semantic:          semanticPresentation,
 				checkpointWitness: req.GateCheckpointWitness,
 				witnessWorkerID:   witnessWorker,
 				witnessClaimGeneration: func() *int64 {
@@ -6308,6 +6435,9 @@ type ForgeConn struct {
 	IssueIID       *int64
 	SavedTitle     string
 	SavedBody      string
+	// SavedBodyValid is true when the run captured a raw body (issue_saved_body not NULL); SavedBody
+	// otherwise falls back to the run's issue description.
+	SavedBodyValid bool
 	RawDigest      *string
 	InputReason    string
 }
@@ -6367,7 +6497,7 @@ func (s *Service) ForgeConnForRun(ctx context.Context, wkr store.Worker, runID u
 		BotForgeUserID:  row.BotForgeUserID,
 		MRIID:           mrIID,
 		ReviewComments:  run.ReviewComments,
-		IssueIID:        issueIID, SavedTitle: run.IssueTitle, SavedBody: body, RawDigest: digest, InputReason: run.IssueInputReason.String,
+		IssueIID:        issueIID, SavedTitle: run.IssueTitle, SavedBody: body, SavedBodyValid: run.IssueSavedBody.Valid, RawDigest: digest, InputReason: run.IssueInputReason.String,
 	}, nil
 }
 
@@ -7094,6 +7224,7 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 	// best-effort — the TTL prune is the backstop for any path that skips this.
 	s.outbox.evict(workerID)
 	s.quarantine.evictIfSet(workerID)
+	s.memAuthority.evictIfSet(workerID)
 	return nil
 }
 

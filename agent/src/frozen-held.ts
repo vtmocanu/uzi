@@ -33,11 +33,19 @@ export function validFrozenHeldPolicy(value: unknown): value is FrozenHeldPolicy
  * GitCache bounds each child. No retry occurs, and a failed guard blocks publication. */
 export async function prepareFrozenHeld(input: {
   git: HeldGit; barePath: string; branch: string; sourceSha: string; policy: FrozenHeldPolicy;
-  deadlineMs: number; maxBytes?: number;
+  deadlineMs: number; maxBytes?: number; defaultBranch?: string;
   onScan?: (scan: Awaited<ReturnType<HeldGit["secretScanCheckpointRange"]>>) => void;
   remediationHold?: () => Promise<boolean>;
   ciHold?: () => Promise<boolean>;
 }): Promise<{ pack: Buffer } | { reason: string }> {
+  const ownBudget = MaintenanceBudget.current() ? undefined : new MaintenanceBudget(input.deadlineMs);
+  try {
+    return await (ownBudget ? MaintenanceBudget.run(ownBudget, () => prepareFrozenHeldWithBudget(input))
+      : prepareFrozenHeldWithBudget(input));
+  } finally { ownBudget?.dispose(); }
+}
+
+async function prepareFrozenHeldWithBudget(input: Parameters<typeof prepareFrozenHeld>[0]): Promise<{ pack: Buffer } | { reason: string }> {
   const { git, barePath, branch, sourceSha, policy } = input;
   const budget = MaintenanceBudget.current();
   const check = () => budget?.check();
@@ -48,6 +56,7 @@ export async function prepareFrozenHeld(input: {
   check();
   const range = await git.resolveCheckpointRange(barePath, branch, {
     tipSha: sourceSha, confirmedTip: policy.confirmedTip, extraFloors: policy.extraFloors,
+    defaultBranch: input.defaultBranch,
   });
   check();
   if (!range) return { reason: "range_unresolved" };

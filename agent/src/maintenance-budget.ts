@@ -213,3 +213,16 @@ export class MaintenanceBudget {
     }
   }
 }
+
+const retainedSwitchSettlement = new AsyncLocalStorage<true>();
+
+/**
+ * issue #3181: marks the async chain of the retained credential switch's settlement, and only
+ * that chain. SdkExecutor.reapAttributedProcesses bounds its joins by the ambient MaintenanceBudget
+ * only while this marker is set, so every other budgeted caller (cancellation and terminal
+ * maintenance run under a budget too) keeps the unbounded join.
+ */
+export const RetainedSwitchSettlement = {
+  run<T>(action: () => T): T { return retainedSwitchSettlement.run(true, action); },
+  active(): boolean { return retainedSwitchSettlement.getStore() === true; },
+};

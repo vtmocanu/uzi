@@ -22,6 +22,7 @@ import { PauseNowSignal, CredentialSwitchSignal, type PlanVerdict } from "../src
 import type { AgentTemplate, ClaimSkill, Milestone, MilestoneAgent, MilestoneProgress } from "../src/protocol.js";
 import type { JsDepsResult } from "../src/js-deps.js";
 import { mrCompletionBlock } from "../src/runner.js";
+import { SEEDED_PLAN_RULES } from "../src/seeded-plan.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
 import { detectRepoAgents } from "../src/repoagents.js";
 import { FINDINGS_SERVER_NAME, reportIncidentalIssueToolName } from "../src/findings-tools.js";
@@ -4410,6 +4411,72 @@ describe("SdkExecutor — seeded plan body reaches the implement turn (PRD #209 
     assert.match(turns[0]!.promptText ?? "", /zqx42/, "the model must actually see the reviewed plan");
     assert.match(turns[0]!.promptText ?? "", /<plan>/, "delimited as the plan to implement");
   });
+
+  // Issue #3272: an owner-supplied plan skips the gate, so the implement-phase lead system prompt
+  // swaps the plan-first lifecycle paragraphs for the seeded one. Only the implement turn is eligible.
+  describe("seeded owner-supplied plan system prompt (issue #3272)", () => {
+    const VARIANT = "This paragraph takes precedence over any plan-first";
+    const GATED = "This run has two phases";
+    const seededBase = { planApproved: true, seeded: true, approvedPlan: PLAN };
+
+    it("a seeded run's implement turn carries the variant and not the two-phase paragraph", async () => {
+      const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+      const probe = makeCtx({ ...seededBase, sessionId: "sess-parked" });
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+      assert.strictEqual(turns.length, 1);
+      const append = appendOf(turns[0]!.options.systemPrompt);
+      assert.ok(append.length > 0);
+      assert.ok(append.includes(VARIANT));
+      assert.ok(append.includes(SEEDED_PLAN_RULES));
+      assert.ok(!append.includes(GATED));
+    });
+
+    it("a gated run's plan and implement prompts carry no variant", async () => {
+      const { queryFn, turns } = fakeTurns([
+        [submitPlan("# Plan"), resultSuccess()],
+        [signalDone(), resultSuccess()],
+      ]);
+      const probe = makeCtx({ planApproved: false, approvedPlan: undefined });
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+      assert.strictEqual(turns.length, 2);
+      for (const turn of turns) {
+        const append = appendOf(turn.options.systemPrompt);
+        assert.ok(append.length > 0);
+        assert.ok(append.includes(GATED));
+        assert.ok(!append.includes(VARIANT) && !append.includes(SEEDED_PLAN_RULES));
+      }
+    });
+
+    for (const [name, over] of [
+      ["a blank plan", { approvedPlan: "  \n " }],
+      ["a missing plan", { approvedPlan: undefined }],
+      ["planApproved false", { planApproved: false }],
+    ] as [string, Partial<RunContext>][]) {
+      it(`seeded with ${name} is gated and gets no variant`, async () => {
+        const { queryFn, turns } = fakeTurns([
+          [submitPlan("# Plan"), resultSuccess()],
+          [signalDone(), resultSuccess()],
+        ]);
+        const probe = makeCtx({ ...seededBase, sessionId: null, ...over });
+        await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+        assert.strictEqual(probe.gated.length, 1, "the gate still runs");
+        for (const turn of turns) {
+          const append = appendOf(turn.options.systemPrompt);
+          assert.ok(append.length > 0);
+          assert.ok(!append.includes(VARIANT) && !append.includes(SEEDED_PLAN_RULES));
+        }
+      });
+    }
+
+    it("the session-less seeded first turn keeps its <plan> fence alongside the variant", async () => {
+      const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+      const probe = makeCtx({ ...seededBase, sessionId: null });
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+      assert.match(turns[0]!.promptText ?? "", /<plan>/);
+      assert.match(turns[0]!.promptText ?? "", /zqx42/);
+      assert.ok(appendOf(turns[0]!.options.systemPrompt).includes(VARIANT));
+    });
+  });
 });
 
 // ── PRD #209 (M2 validation, auditor-m2 delta): pin the DEFENSE-IN-DEPTH `seeded` term ──
@@ -7584,6 +7651,32 @@ describe("M2 replacement reviewed plan fresh context", () => {
     assert.equal(result.scopeCapped, undefined);
     assert.deepEqual(result.milestonesCompleted, ["M1"]);
   });
+});
+
+it("M2 Claude executor forwards semantic proposals through initial and revised gates, clearing omission", async () => {
+  const { enrollment, proposal } = await import("./semantic-coverage-fixture.js");
+  for (const semanticPlanning of [enrollment, undefined]) {
+    const submissions = [proposal(), { criteria: [] }, undefined];
+    const scripts: Script[] = submissions.map((semantic_proposal, n) => [{
+      type: "assistant", session_id: "m2-plan", message: { content: [{
+        type: "tool_use", id: "p-" + n, name: "mcp__uzi__submit_plan",
+        input: { plan_md: "candidate " + n, ...(semantic_proposal === undefined ? {} : { semantic_proposal }) },
+      }] },
+    } as unknown as SDKMessage, resultSuccess("m2-plan")]);
+    scripts.push([signalDone(), resultSuccess()]);
+    const { queryFn } = fakeTurns(scripts);
+    const captured: unknown[] = [];
+    const probe = makeCtx({ semanticPlanning,
+      gatePlan: async (_plan, _milestones, _hook, settles, semantic) => {
+        assert.equal(settles, undefined);
+        captured.push(semantic);
+        return captured.length < 3 ? { kind: "revise", automatic: true, round: captured.length, feedback: "revise" }
+          : { kind: "approve", selection: { status: "absent" } };
+      },
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.deepEqual(captured, semanticPlanning ? [proposal(), { invalid: true }, undefined] : [undefined, undefined, undefined]);
+  }
 });
 
 describe("M3 SDK interrupted recovery delivery", () => {

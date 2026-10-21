@@ -165,6 +165,15 @@ describe("describeStatus", () => {
       "worktree ready on agent/issue-7",
     );
   });
+  it("shows the validated activity line, not worker text, for an activity payload", () => {
+    expect(
+      describeStatus({ event: "check_activity", op: "read", outcome: "ok", path: "a.go", text: "worker says hi" }),
+    ).toBe("read a.go · ok");
+    expect(describeStatus({ event: "check_activity", op: "bogus", text: "worker says hi" })).toBe(
+      "status: check_activity",
+    );
+    expect(describeStatus({ event: "init", text: "still worker text" })).toBe("still worker text");
+  });
   it("renders the SDK init frame", () => {
     expect(describeStatus({ event: "init", model: "claude-fable-5" })).toBe(
       "agent started (claude-fable-5)",

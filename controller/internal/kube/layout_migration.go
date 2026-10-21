@@ -1,0 +1,149 @@
+package kube
+
+import (
+	corev1 "k8s.io/api/core/v1"
+
+	"github.com/vtmocanu/uzi/controller/internal/protocol"
+	"github.com/vtmocanu/uzi/controller/internal/reconcile"
+)
+
+// Run-workdir layout migration guard (issue #3153).
+//
+// A Docker worker's pods used to keep /data/runner on a pod-lifetime emptyDir named
+// legacyRunWorkdirVolume; they now mount the `data` PVC subPath dindWorkdirSubPath
+// there. Replacing an old-layout pod destroys the in-pod run workdir, which for a
+// worker holding a durable-recovery custody hold (DesiredWorker.CustodyHeld) is
+// custody-held run state. migrationHeld is the ONE predicate the controller's
+// pod-replacing roll and recycle paths ask; none of them may re-derive it. (Fenced
+// DinD maintenance is guarded by CustodyHeld directly instead; teardown has no
+// custody check of its own and relies on the api keeping a custody-held worker in
+// the desired set, see the teardown doc in materializer.go.)
+//
+// This is a narrow exception to the operator's emergency DrainPolicy.ForceRoll: a
+// force-roll is consent to requeue a busy run, not to discard custody-held state.
+// It cannot guard what the controller does not do: kubelet eviction, node drain and
+// a manual pod delete replace pods without passing through this controller.
+
+// legacyRunWorkdirVolume is the removed emptyDir volume name of the old layout.
+const legacyRunWorkdirVolume = "run-workdir"
+
+// runnerLayout aliases the reconcile type so ObservedWorker carries it without a
+// mapping step. Its zero value is layoutUnknown.
+type runnerLayout = reconcile.RunnerLayout
+
+const (
+	layoutUnknown = reconcile.RunnerLayoutUnknown
+	layoutNone    = reconcile.RunnerLayoutNone
+	layoutNew     = reconcile.RunnerLayoutNew
+	layoutOld     = reconcile.RunnerLayoutOld
+)
+
+// observeRunnerLayout classifies the pods of workerID, terminating ones included. Callers
+// invoke it only after a successful pod list; a failed list leaves the observed
+// layout at its zero value, layoutUnknown. New requires EVERY pod's worker and dind containers to mount the runner-shared
+// subPath, that mount's volume to be workerID's data PVC, and NO pod to carry the legacy volume; any other non-empty set, mixed
+// ones included, is old.
+func observeRunnerLayout(workerID string, pods []corev1.Pod) runnerLayout {
+	if len(pods) == 0 {
+		return layoutNone
+	}
+	for i := range pods {
+		if !podHasNewLayout(workerID, &pods[i]) {
+			return layoutOld
+		}
+	}
+	return layoutNew
+}
+
+func podHasNewLayout(workerID string, p *corev1.Pod) bool {
+	for _, v := range p.Spec.Volumes {
+		if v.Name == legacyRunWorkdirVolume {
+			return false
+		}
+	}
+	// The mount names alone prove nothing: the volume behind the runner-shared mount must
+	// be this worker's data PVC, else the pod's /data/runner is not the persistent one
+	// (an emptyDir or another claim) and replacing it would still destroy held state.
+	if !backedByDataPVC(workerID, p) {
+		return false
+	}
+	// dind is a native sidecar (an init container with restartPolicy Always), so both
+	// lists are searched.
+	containers := append(append([]corev1.Container{}, p.Spec.Containers...), p.Spec.InitContainers...)
+	for _, name := range []string{workerContainerName, dindContainerName} {
+		found := false
+		for _, c := range containers {
+			if c.Name != name {
+				continue
+			}
+			found = true
+			if !mountsRunnerShared(c.VolumeMounts) {
+				return false
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func backedByDataPVC(workerID string, p *corev1.Pod) bool {
+	want := runnerWorkdirMount().Name
+	for _, v := range p.Spec.Volumes {
+		if v.Name == want {
+			return v.PersistentVolumeClaim != nil && v.PersistentVolumeClaim.ClaimName == dataPVCName(workerID)
+		}
+	}
+	return false
+}
+
+func mountsRunnerShared(mounts []corev1.VolumeMount) bool {
+	want := runnerWorkdirMount()
+	for _, m := range mounts {
+		if m.MountPath == want.MountPath && m.Name == want.Name && m.SubPath == want.SubPath {
+			return true
+		}
+	}
+	return false
+}
+
+// migrationHeld reports that replacing w's pods would destroy custody-held state.
+// Unknown holds too: not knowing the layout is not evidence it is safe.
+func migrationHeld(w protocol.DesiredWorker, layout runnerLayout) bool {
+	return w.Docker && w.CustodyHeld && (layout == layoutOld || layout == layoutUnknown)
+}
+
+// layoutMigrationReason is the pacing BlockingReason of a held worker.
+const layoutMigrationReason = "layout_migration_custody"
+
+// surfaceEphemeralLayoutHold records a pacing outcome for a run-bound (ephemeral)
+// worker whose drifted template replacement the layout guard is withholding. The
+// held state reaches the fleet report only when the worker also has an observed
+// roll-health row (report() attaches pacing only to rows with a phase; ephemeral
+// workers get no synthetic row). planRoll skips ephemeral workers, so without this
+// a migration-held run-bound worker has no pacing entry.
+// It writes only t.outcomes: the worker joins no pool, takes no slot and is never
+// admitted. A worker that is not held, not drifted, not observed with a Deployment,
+// or whose template cannot be resolved gets no entry (the materializer's own drift
+// arm independently refuses to patch a held worker).
+func (m *Materializer) surfaceEphemeralLayoutHold(t *rollTick, w protocol.DesiredWorker, obs reconcile.ObservedWorker) {
+	if !w.Ephemeral || !obs.HasDeployment || !migrationHeld(w, obs.RunnerLayout) {
+		return
+	}
+	spec, err := m.resolver.Resolve(w.Template, w.Size)
+	if err != nil {
+		return
+	}
+	target := RenderDeployment(m.cfg, w, spec)
+	if obs.SpecHash == target.Spec.Template.Annotations[AnnotationSpecHash] && obs.Generation == w.Generation {
+		return
+	}
+	image := workerImage(target)
+	t.outcomes[w.ID] = &protocol.Pacing{
+		State:          "held",
+		TargetImage:    image,
+		TargetVersion:  targetVersion(m.cfg, image),
+		BlockingReason: pacingText(layoutMigrationReason),
+	}
+}

@@ -77,7 +77,9 @@ const MAX_SPAWNED = 64;
  * whose linking parent was just killed stays linked): immediately before each kill it re-reads
  * `stat` and requires the same start time (a recycled pid has another), and re-reads
  * `environ`/`cwd` and requires the attribution again; it prints `K\t<pid>\t<why>` per kill, then the
- * last round's survivors as `A` lines. Both modes end with ONE `H\t<json>` summary (`scanned`,
+ * last round's survivors as `A` lines whose third field is the survivor class (`unreadable`,
+ * `worker_child`, `restarted` or `kill_failed`; see {@link LeftReason}), and the caller keeps only those four
+ * values. When a pid appears under two uid passes (two wrappers) the last wrapper's class wins. Both modes end with ONE `H\t<json>` summary (`scanned`,
  * `truncated`: the pid or time budget ran out, `unresolved`: pids whose uid could not be read,
  * `procMount`). Exit 0; 6 on bad arguments; 7 when `<procRoot>` cannot be read.
  */
@@ -284,20 +286,22 @@ if (mode === "scan") {
     let killed = 0;
     left = [];
     for (const [pid, why, pi] of found) {
-      if (why === "unreadable" || pi.ppid === workerPid) { left.push([pid, why]); continue; }
+      if (why === "unreadable") { left.push([pid, "unreadable"]); continue; }
+      if (pi.ppid === workerPid) { left.push([pid, "worker_child"]); continue; }
       // Re-verify immediately before the kill: the same process (start time), still the run's.
       const again = info(pid);
       if (again === undefined) continue;
-      if (again === "unknown" || again.start !== pi.start) { left.push([pid, "unreadable"]); continue; }
+      if (again === "unknown") { left.push([pid, "unreadable"]); continue; }
+      if (again.start !== pi.start) { left.push([pid, "restarted"]); continue; }
       const now = attribution(pid);
       if (now === "gone" || now === "none") continue;
-      if (now === "unreadable") { left.push([pid, now]); continue; }
+      if (now === "unreadable") { left.push([pid, "unreadable"]); continue; }
       try {
         process.kill(pid, "SIGKILL");
         killed++;
         w("K\\t" + pid + "\\t" + now);
       } catch (err) {
-        if (err.code !== "ESRCH") left.push([pid, "kill-failed"]);
+        if (err.code !== "ESRCH") left.push([pid, "kill_failed"]);
       }
     }
     if (killed === 0 || truncated) break;
@@ -339,8 +343,17 @@ export interface RunProcessReap {
   killed: number[];
   /** Attributed processes still there after the reap (unreadable ones are never killed). */
   left: number[];
+  /** Why each pid in `left` survived (diagnostics only; absent from fakes that do not classify).
+   *  A pid the helper did not classify is simply missing from the map. */
+  leftReasons?: Record<number, LeftReason>;
   complete: boolean;
 }
+
+/** The survivor classes the kill pass emits: `unreadable` (attribution could not be read, or the
+ *  process vanished into an unknown state), `worker_child` (a direct child of the worker, never
+ *  killed), `restarted` (the pid's start time changed between listing and kill), `kill_failed`
+ *  (SIGKILL failed other than ESRCH). */
+export type LeftReason = "unreadable" | "worker_child" | "restarted" | "kill_failed";
 
 /** The SDK executor's process attribution operations. Explicit executor options take precedence. */
 export interface RunProcessOps {
@@ -366,19 +379,24 @@ export function defaultRunProcessOps(): RunProcessOps {
 /** The `/proc` of this host; a constant so no caller spells the path. */
 const PROC_ROOT = "/proc";
 
+function isLeftReason(v: string | undefined): v is LeftReason {
+  return v === "unreadable" || v === "worker_child" || v === "restarted" || v === "kill_failed";
+}
+
 async function passes(
   mode: "scan" | "kill",
   home: string,
   worktree: string | undefined,
   spawnedPids: readonly number[],
   opts: RunProcsOptions,
-): Promise<{ attributed: number[]; killed: number[]; complete: boolean }> {
+): Promise<{ attributed: number[]; killed: number[]; complete: boolean; reasons: Record<number, LeftReason> }> {
   const budget = MaintenanceBudget.current();
   const wrappers = opts.wrappers ?? [runnerCommand];
   const budgetMs = opts.budgetMs ?? (mode === "scan" ? SCAN_BUDGET_MS : REAP_BUDGET_MS);
   const spawned = spawnedPids.filter((p) => Number.isSafeInteger(p) && p > 0).slice(0, MAX_SPAWNED);
   const attributed = new Set<number>();
   const killed = new Set<number>();
+  const reasons: Record<number, LeftReason> = {};
   let complete = true;
   for (const wrap of wrappers) {
     budget?.check();
@@ -423,12 +441,15 @@ async function passes(
         complete = false;
         continue;
       }
-      if (f[0] === "A") attributed.add(pid);
+      if (f[0] === "A") {
+        attributed.add(pid);
+        if (mode === "kill" && isLeftReason(f[2])) reasons[pid] = f[2];
+      }
       else if (f[0] === "K") killed.add(pid);
       else complete = false;
     }
   }
-  return { attributed: [...attributed], killed: [...killed], complete };
+  return { attributed: [...attributed], killed: [...killed], complete, reasons };
 }
 
 /**
@@ -467,8 +488,8 @@ export async function reapRunProcesses(
 ): Promise<RunProcessReap> {
   try {
     const r = await passes("kill", home, worktree, spawnedPids, opts);
-    return { killed: r.killed, left: r.attributed, complete: r.complete };
+    return { killed: r.killed, left: r.attributed, leftReasons: r.reasons, complete: r.complete };
   } catch {
-    return { killed: [], left: [], complete: false };
+    return { killed: [], left: [], leftReasons: {}, complete: false };
   }
 }

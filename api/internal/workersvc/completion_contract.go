@@ -23,14 +23,14 @@ import (
 // `completion_contract_version IS NOT NULL AND completion_contract IS NULL` so it freezes
 // once, idempotently, and only for an interlocked run.
 const (
-	// contractProfileStructural is the only profile M1 emits. #1230 adds semantic profiles.
+	// contractProfileStructural remains the only profile production freeze sites emit.
 	contractProfileStructural = "structural"
 	// contractRevisionInitial is the revision a freshly frozen contract carries; a permit
 	// fences on it and #1227 bumps it.
 	contractRevisionInitial = 1
 )
 
-// completionContract is the frozen structural contract's top-level shape.
+// completionContract is the single structural or dormant semantic contract shape.
 //
 // PRD #1227 M1 extends it with two OPTIONAL top-level blocks — `scope` and `accepted` — that an
 // owner decision writes at a bumped revision. Both are `omitempty`: a revision-1 contract (the
@@ -39,15 +39,23 @@ const (
 // across revisions — an owner decision never rewrites a criterion, it only defers a milestone
 // (scope.out) or accepts a criterion id (accepted).
 type completionContract struct {
-	Profile  string                `json:"profile"`
-	Revision int                   `json:"revision"`
-	Criteria []completionCriterion `json:"criteria"`
+	MaintainerAuthorizations []maintainerAuthorization          `json:"maintainer_authorizations,omitempty"`
+	SemanticApproval         *apitypes.SemanticGateApproval     `json:"semantic_approval,omitempty"`
+	SemanticPresentation     *apitypes.SemanticGatePresentation `json:"semantic_presentation,omitempty"`
+	Profile                  string                             `json:"profile"`
+	Revision                 int                                `json:"revision"`
+	Criteria                 []completionCriterion              `json:"criteria"`
 	// Scope is the owner-reduced scope on a #1227 `partial` revision: the milestone ids still
 	// in scope (`in`) and the owner-deferred ones (`out`). nil on a revision-1 contract.
 	Scope *scopeBlock `json:"scope,omitempty"`
 	// Accepted is the list of owner-accepted unmet criteria on a #1227 `accept` revision. nil on
 	// a revision-1 contract.
-	Accepted []acceptedEntry `json:"accepted,omitempty"`
+	Accepted                 []acceptedEntry                 `json:"accepted,omitempty"`
+	Sources                  []apitypes.SemanticSourceRef    `json:"sources,omitempty"`
+	PlanHash                 string                          `json:"plan_hash,omitempty"`
+	CandidateIdentityVersion string                          `json:"candidate_identity_version,omitempty"`
+	SourceOutcome            string                          `json:"source_outcome,omitempty"`
+	Coverage                 *apitypes.SemanticCoverageState `json:"coverage,omitempty"`
 }
 
 // scopeBlock is the in/out milestone split a `partial` decision records (PRD #1227 D2).
@@ -76,15 +84,21 @@ type acceptedEntry struct {
 	Revision    int    `json:"revision"`
 }
 
-// completionCriterion is one server-minted structural criterion (one per frozen milestone).
+// completionCriterion carries structural fields and optional semantic fields.
+// Structural criteria remain one per frozen milestone; omitted semantic fields preserve their JSON.
 // Audit is a nil pointer so it marshals to JSON `null` (a reserved slot, no omitempty);
 // FindingIDs is initialized to the empty slice so it marshals to `[]`, never `null`.
 type completionCriterion struct {
-	ID          string           `json:"id"`
-	MilestoneID string           `json:"milestone_id"`
-	Text        string           `json:"text"`
-	Audit       *json.RawMessage `json:"audit"`
-	FindingIDs  []string         `json:"finding_ids"`
+	ID                   string                       `json:"id"`
+	MilestoneID          string                       `json:"milestone_id"`
+	Text                 string                       `json:"text"`
+	Audit                *json.RawMessage             `json:"audit"`
+	FindingIDs           []string                     `json:"finding_ids"`
+	Kind                 string                       `json:"kind,omitempty"`
+	DoneWhen             string                       `json:"done_when,omitempty"`
+	Citations            []apitypes.SemanticCitation  `json:"citations,omitempty"`
+	EvidenceRequirements []apitypes.SemanticEvidence  `json:"evidence_requirements,omitempty"`
+	Maintainer           *apitypes.SemanticMaintainer `json:"maintainer,omitempty"`
 }
 
 // buildCompletionContract builds the frozen structural completion contract jsonb (PRD #1226
@@ -131,8 +145,22 @@ func parseCompletionContract(b []byte) (completionContract, error) {
 		return completionContract{}, fmt.Errorf("completion contract is empty")
 	}
 	var c completionContract
+	// Frozen semantic reads use one standard strict decode. The custom wire
+	// types and opaque audit values retain strictSemanticJSON's nested checks.
+	strictErr := decodeSemanticCompletionContract(b, &c)
+	if strictErr == nil && c.Profile == "semantic" {
+		if len(b) > 3*semanticProposalMaxBytes {
+			return completionContract{}, ErrSemanticCompletionAuthority
+		}
+		return c, nil
+	}
+	// Structural contracts retain encoding/json's historical read semantics.
+	c = completionContract{}
 	if err := json.Unmarshal(b, &c); err != nil {
 		return completionContract{}, fmt.Errorf("decode completion contract: %w", err)
+	}
+	if c.Profile == "semantic" {
+		return completionContract{}, ErrSemanticCompletionAuthority
 	}
 	return c, nil
 }
@@ -157,8 +185,18 @@ func buildRevisedContract(prior []byte, dec CompletionDecisionInput, frozenMs []
 	if err != nil {
 		return nil, err
 	}
-	c.Revision = newRev
+	if dec.Decision == "authorize_maintainer" {
+		if err := validateMaintainerDecision(c, dec); err != nil {
+			return nil, err
+		}
+	}
+	return buildRevisedContractFromValidated(c, dec, frozenMs, newRev)
+}
 
+// buildRevisedContractFromValidated constructs only; its caller validated the
+// decision against this same contract while holding the owner lock.
+func buildRevisedContractFromValidated(c completionContract, dec CompletionDecisionInput, frozenMs []Milestone, newRev int) ([]byte, error) {
+	c.Revision = newRev
 	switch dec.Decision {
 	case "partial":
 		keep := make(map[string]bool, len(dec.Keep))
@@ -187,7 +225,14 @@ func buildRevisedContract(prior []byte, dec CompletionDecisionInput, frozenMs []
 		sort.Strings(in)
 		sort.Slice(out, func(i, j int) bool { return out[i].MilestoneID < out[j].MilestoneID })
 		c.Scope = &scopeBlock{In: in, Out: out}
+	case "authorize_maintainer":
+		authorizeMaintainers(&c, dec, newRev)
 	case "accept":
+		if c.Profile == "semantic" {
+			// Serialization carries semantic fields without manufacturing satisfaction.
+			// validateDecision refuses semantic accept at the public decision boundary.
+			break
+		}
 		already := make(map[string]bool, len(c.Accepted))
 		for _, a := range c.Accepted {
 			already[a.ID] = true
@@ -264,8 +309,9 @@ func CompletionScopeView(contract []byte) (deferred []apitypes.CompletionDeferre
 }
 
 // CompletionScopeClaim projects a run's frozen completion_contract into the WORKER-ONLY claim seam
-// (PRD #1227 M2): the deferred (out-of-scope) milestones — each with its TITLE looked up from the
-// matching criterion's text — and the owner-accepted criteria. Unlike CompletionScopeView (which
+// (PRD #1227 M2): deferred milestones, with titles sourced from the
+// structural criterion's text or the semantic frozen milestones — and owner-accepted criteria.
+// Unlike CompletionScopeView (which
 // returns the owner-facing apitypes DTOs WITHOUT titles), this carries the milestone title the
 // worker needs to render the partial-delivery PR.
 //
@@ -274,7 +320,7 @@ func CompletionScopeView(contract []byte) (deferred []apitypes.CompletionDeferre
 // non-interlocked, or revision-1 run, keeping that run's claim byte-identical to today's. A
 // non-nil result leaves an absent half as a nil slice (omitempty), so a `partial`-only revision
 // carries only `deferred` and an `accept`-only revision only `accepted`.
-func CompletionScopeClaim(contract []byte) *CompletionScopeConfig {
+func CompletionScopeClaim(contract []byte, frozen ...[]byte) *CompletionScopeConfig {
 	c, err := parseCompletionContract(contract)
 	if err != nil {
 		return nil
@@ -294,6 +340,15 @@ func CompletionScopeClaim(contract []byte) *CompletionScopeConfig {
 		for _, cr := range c.Criteria {
 			if _, ok := titleByMilestone[cr.MilestoneID]; !ok {
 				titleByMilestone[cr.MilestoneID] = cr.Text
+			}
+		}
+		if c.Profile == "semantic" {
+			titleByMilestone = map[string]string{}
+			if len(frozen) == 1 {
+				ms, _ := DecodeMilestones(frozen[0])
+				for _, m := range ms {
+					titleByMilestone[m.ID] = m.Title
+				}
 			}
 		}
 		out.Deferred = make([]CompletionScopeDeferred, 0, len(c.Scope.Out))

@@ -990,6 +990,7 @@ describe("Worker — job dispatch and capability (PRD #1908 M4)", () => {
     assert.ok(caps?.includes("cross_check_v1"), "cross_check_v1 is advertised even when Codex is unavailable on this worker");
     assert.ok(caps?.includes("cross_check_pins_v1"), "cross-check pins are advertised independently of Codex availability");
     assert.ok(caps?.includes("cross_check_codex_lead_v1"), "the Claude checker capability is advertised independently of Codex availability");
+    assert.ok(caps?.includes("cross_check_semantic_plan_v1") && caps?.includes("completion_semantic_publication_v1"), "the dormant semantic capabilities are advertised independently of Codex availability");
     assert.ok(caps?.includes("ci_config_guard_v1"), "ci_config_guard_v1 (issue #2865) is advertised unconditionally, even when Codex is unavailable");
     assert.equal(caps?.includes("ci_artifacts_v1"), process.platform === "linux", "artifact capability requires the descriptor-backed consumer");
   });
@@ -1033,6 +1034,8 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     "cross_check_rounds_v1",
     "cross_check_pins_v1",
     "cross_check_codex_lead_v1",
+    "cross_check_semantic_plan_v1",
+    "completion_semantic_publication_v1",
     "ci_config_guard_v1",
     ...(process.platform === "linux" ? ["ci_artifacts_v1"] : []),
   ];

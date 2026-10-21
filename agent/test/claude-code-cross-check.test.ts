@@ -7,6 +7,7 @@ import type { HookInput, HookJSONOutput, Options as SdkOptions } from "@anthropi
 import { createHash } from "node:crypto";
 import { ClaudeCrossCheck, stubClaudeCrossCheckQueryFn } from "../src/claude-cross-check.js";
 import { CrossCheckRunner } from "../src/cross-check-runner.js";
+import { CheckActivityRecorder } from "../src/cross-check-activity.js";
 import { CrossCheckMalformedError, OWNER_GUIDANCE_LABEL, REPO_INSTRUCTIONS_DIFF_NOTE, codeCrossCheckBrief } from "../src/codex/cross-check.js";
 import { CrossCheckCheckerUnavailableError } from "../src/codex/model-rejection.js";
 import { processGroupPresent } from "../src/sdk-spawn.js";
@@ -515,4 +516,26 @@ it("cross-check diagnostics use fixed categories after token deregistration and 
       assert.equal(decisions.at(-1)?.reason_class, "confinement_failed", c.name);
     } finally { await fs.rm(root, { recursive: true, force: true }); }
   }
+});
+
+it("a tool call the budget hook refused settles as a limit on the code stage", async () => {
+  const root = await fs.mkdtemp(path.join(scratch, "claude-limit-"));
+  await fs.writeFile(path.join(root, "anchor.ts"), "anchor");
+  try {
+    const events: Record<string, unknown>[] = [];
+    const recorder = new CheckActivityRecorder(p => { events.push(structuredClone(p)); }, { generation: 7 });
+    recorder.attach(root, root);
+    const model = checker(p => (async function* () {
+      yield init;
+      yield { type: "assistant", parent_tool_use_id: null,
+        message: { content: [{ type: "tool_use", id: "dup", name: "Read", input: { file_path: "anchor.ts" } }] } };
+      assert.equal(await hook(p.options, "dup"), "allow");
+      assert.notEqual(await hook(p.options, "dup"), "allow", "a repeated reservation is refused");
+      yield { type: "user", parent_tool_use_id: null,
+        message: { content: [{ type: "tool_result", tool_use_id: "dup", is_error: true, content: "cross-check tool budget exceeded" }] } };
+      yield result(output());
+    })());
+    await assert.rejects(model.run(claim(), root, root, new AbortController().signal, async () => {}, undefined, recorder), /tool budget/);
+    assert.deepEqual(events, [{ event: "check_activity", op: "read", outcome: "limit", path: "anchor.ts" }]);
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
 });

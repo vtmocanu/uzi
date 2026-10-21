@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -30,13 +31,15 @@ var ErrCrossCheckUnavailable = fmt.Errorf("%w: checker unavailable", ErrCrossChe
 // PlanCrossCheckCandidate contains only the fields the checker approves. The caller
 // scrubs untrusted text before this value is stored and digested.
 type PlanCrossCheckCandidate struct {
-	PlanMd               string          `json:"plan_md"`
-	Milestones           json.RawMessage `json:"milestones"`
-	RequiredCapabilities []string        `json:"required_capabilities"`
-	RequiredTools        []string        `json:"required_tools"`
-	SizeClass            string          `json:"size_class"`
-	BaseCommit           string          `json:"base_commit"`
-	PlanningDiff         string          `json:"planning_diff"`
+	CandidateIdentityVersion string                      `json:"candidate_identity_version,omitempty"`
+	SemanticCandidate        *apitypes.SemanticCandidate `json:"semantic_candidate,omitempty"`
+	PlanMd                   string                      `json:"plan_md"`
+	Milestones               json.RawMessage             `json:"milestones"`
+	RequiredCapabilities     []string                    `json:"required_capabilities"`
+	RequiredTools            []string                    `json:"required_tools"`
+	SizeClass                string                      `json:"size_class"`
+	BaseCommit               string                      `json:"base_commit"`
+	PlanningDiff             string                      `json:"planning_diff"`
 }
 
 func (c PlanCrossCheckCandidate) Digest() ([]byte, error) {
@@ -136,10 +139,8 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 		return store.CrossCheck{}, ErrCrossCheckRefused
 	}
 	candidate.Milestones = canonical
-	digest, err := candidate.Digest()
-	if err != nil {
-		return store.CrossCheck{}, err
-	}
+	// Identity is selected under the run lock from frozen enrollment below.
+	var digest []byte
 	// Recover the immutable attempt before resolving checker credentials. A lost
 	// ACK does not authorize another round, even if the checker already decided.
 	if s.txBeginner == nil {
@@ -157,6 +158,10 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 		(locked.Status != "claimed" && locked.Status != "running") ||
 		validateCrossCheckContext(locked.IssueTitle, locked.IssueDescription) != nil {
 		return store.CrossCheck{}, ErrCrossCheckRefused
+	}
+	candidate, digest, err = bindSemanticCheckerCandidate(ctx, retryQ, leadID, candidate)
+	if err != nil {
+		return store.CrossCheck{}, err
 	}
 	prior, err := retryQ.GetExactPlanCrossCheck(ctx, store.GetExactPlanCrossCheckParams{LeadRunID: leadID, Round: round})
 	if err == nil {
@@ -215,6 +220,11 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 			validateCrossCheckContext(locked.IssueTitle, locked.IssueDescription) != nil {
 			return store.Run{}, ErrCrossCheckRefused
 		}
+		rebound, reboundDigest, e := bindSemanticCheckerCandidate(ctx, txq, leadID, candidate)
+		if e != nil || !bytes.Equal(reboundDigest, digest) {
+			return store.Run{}, ErrCrossCheckInterrupted
+		}
+		candidate = rebound
 		prior, e := txq.GetExactPlanCrossCheck(ctx, store.GetExactPlanCrossCheckParams{LeadRunID: leadID, Round: round})
 		if e == nil {
 			if prior.LeadClaimGeneration != generation || !bytes.Equal(prior.CandidateDigest, digest) {
@@ -354,6 +364,21 @@ func (s *Service) planCrossCheckStatus(ctx context.Context, worker store.Worker,
 		cc.ReasonClass = pgtype.Text{String: "interrupted", Valid: true}
 	}
 	var proof *LeadReconciliation
+	if !noRow && result != nil {
+		semantic, resolveErr := rehydrateSemanticChecker(ctx, q, cc)
+		if resolveErr != nil {
+			return store.CrossCheck{}, 0, resolveErr
+		}
+		// Legacy status rendering keeps its existing validation path. Only an
+		// enrolled semantic attempt needs immutable-history reconstruction here.
+		if semantic != nil {
+			input, resolveErr := crossCheckClaimInput(cc, semantic)
+			if resolveErr != nil {
+				return store.CrossCheck{}, 0, resolveErr
+			}
+			result.Candidate = &input.PlanCrossCheckCandidate
+		}
+	}
 	if result != nil {
 		proof, err = captureLeadReconciliation(ctx, q, worker, leadID, generation)
 		if err != nil {

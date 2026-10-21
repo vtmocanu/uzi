@@ -51,7 +51,7 @@ describe("HealthStatusProvider — the isAdmin fetch gate", () => {
     vi.mocked(useAuth).mockReturnValue({ user: { is_admin: true } } as never);
     const doc = healthySilentDoc();
     doc.checks.find((c) => c.id === "agentsource.update")!.severity = "warn";
-    doc.counts = { ok: 20, warn: 1, danger: 0, unknown: 0, na: 0 };
+    doc.counts = { ok: 21, warn: 1, danger: 0, unknown: 0, na: 0 };
     mockApi.getAdminHealth.mockResolvedValueOnce(doc).mockRejectedValueOnce(new Error("offline"));
     renderProvider();
     await act(async () => { await Promise.resolve(); });

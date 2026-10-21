@@ -287,3 +287,16 @@ Attributed attempts and paired skills may use existing guarded
 shared residue and orphaned skills have no supported generic reclaim route.
 API custody discard alone is not local writer-exclusion proof. No proxy, marker,
 ledger, API, schema, configuration flag or new infrastructure is introduced.
+
+## Amendment 2026-10-21 — #3181: the retained credential-switch settlement site
+
+A retained-recovery run's owner token switch now runs an own-mode quiescence proof with
+site `retained_credential_switch` before the worker reports the switch (see
+[ADR-1247](1247-per-run-token-selection.md#amendment-2026-10-21--3181-a-retained-switch-settles-then-releases-or-holds-for-the-owner)).
+Like the predecessor proof it is a process-scanning check, so a verdict listing an
+`unreadable_unattributed` process can latch the quarantine through the same detection,
+with the site recorded as the latch's site. The latch cause, lifetime and guards are
+unchanged. A proof that blocks without latching does not stop the run: it holds the run
+for the owner (`credential_switch_settling`, then `credential_switch_unsettled`). The
+hold is not an exoneration, because the next claim still runs the fail-closed predecessor
+proof.

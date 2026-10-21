@@ -11,6 +11,12 @@
 # writable-layer/log growth source can be named (or the absence of one reported
 # honestly) rather than guessed at.
 #
+# NOTE (#3153): this script reproduces the PRE-#3153 layout that ADR-1597
+# measured, where `run-workdir` was an emptyDir at /data/runner. On current
+# workers /data/runner is the `runner-shared` subPath of the data PVC, so the
+# "run-workdir" row below is part of the data PVC there, not a separate emptyDir.
+# The logic is unchanged and still models the old layout.
+#
 # Usage:
 #   scripts/measure-worker-ephemeral.sh [IMAGE]
 #

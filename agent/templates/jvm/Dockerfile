@@ -127,6 +127,15 @@ RUN PROFILE="$(readlink -f /home/worker/.local/share/devbox/global/default/.devb
     && readlink -f /opt/uzi-toolchain > /etc/uzi-toolchain-profile \
     && chown -R worker:runner /nix/var/nix/gcroots \
     && chown -h worker:runner /nix/var/nix/gcroots/uzi-toolchain
+# issue #3153: image-baked layout marker. The controller's `runner-init` init container
+# (controller/internal/kube, before dind) creates the /data/runner/.tmp carve-out ONLY when
+# it reads `runner-shared-v1` as the first line of this file. It is the fail-closed gate
+# that proves this image's entrypoint (a2b legacy loop skips .tmp; a3 Docker-lane scratch is
+# adopt-or-refuse) matches the controller's runner-shared layout. Bump the token together
+# with the controller check. Root-owned 0644, deliberately not runner-writable.
+RUN printf 'runner-shared-v1\n' > /etc/uzi-runner-layout \
+    && chown root:root /etc/uzi-runner-layout \
+    && chmod 0644 /etc/uzi-runner-layout
 # Put the STABLE toolchain bin on the image PATH so the baked toolchain resolves for BOTH the
 # worker's provision subprocess and the agent (whose SDK PATH = runnerPath() = the image
 # PATH). Points at /opt/uzi-toolchain/bin — the immutable handle above — NOT the mutable

@@ -13,6 +13,7 @@ import {
   type RunPriority,
   type StopKind,
 } from "./api";
+import { credentialSwitchHold } from "./credentialSwitchHold";
 import { forgeNounSentence, forgeNounLower, forgePlatform } from "./forgeNoun";
 import { formatCountdown } from "./limitWait";
 import { stripUnsafeChars } from "./safeText";
@@ -161,6 +162,8 @@ const PARK_LABELS = {
   base_attestation_missing: "base unverified: owner hold",
   provider_outage: "waiting for provider",
   completion_blocked: "Completion blocked",
+  credential_switch_settling: "settling: token switch",
+  credential_switch_unsettled: "held: token switch",
 } as const;
 
 // parkLabel names a parked run's hold in today's words (PRD #2602 rule 3: "surfaces keep
@@ -190,6 +193,10 @@ export function effectiveRunStatus(
   },
 ): string {
   if (run.status === "paused" && run.hold_reason === "provider_unavailable") return "provider_unavailable";
+  // Issue #3181: the token-switch holds sit in raw "paused" (shared with the owner pause), so
+  // they are overlaid like the provider hold to name what the run is actually waiting on.
+  const switchHold = credentialSwitchHold(run);
+  if (switchHold) return `credential_switch_${switchHold}`;
   // Issue #3194: a --require-base run whose adopted work no checkpoint attests to the planned
   // base. Server-held (raw status "paused"), so overlaid like the other holds.
   if (run.status === "paused" && run.hold_reason === "base_attestation_missing") return "base_attestation_missing";
@@ -337,6 +344,8 @@ export function runStatusTone(
   if (status === "completion_blocked") return "warning";
   // PRD #1732: held on a disabled credential. Warn like the other involuntary holds.
   if (status === "credential_disabled" || status === "provider_unavailable" || status === "base_attestation_missing" || status === "provider_outage") return "warning";
+  // Issue #3181: both token-switch holds wait on something outside the run; warn, never danger.
+  if (status === "credential_switch_settling" || status === "credential_switch_unsettled") return "warning";
   if (status === "awaiting_approval" || status === "awaiting_input")
     return "warning";
   // PRD #517: an interactive run parked awaiting the owner's next follow-up.
@@ -595,6 +604,16 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
     case "provider_unavailable":
       return { kind: "badge", label: PARK_LABELS.provider_unavailable, tone: "warning", pulse: false,
         title: "Automatic provider retries have stopped. The run waits for its owner; open the run for Resume, Stop availability and Cancel." };
+    // Issue #3181: the token-switch holds. Static warn like the other holds (the worker
+    // finishing its own operations is not run progress, so no pulse); labels agree with
+    // StatusPill. The settling title promises no completion: the server may lift its fence
+    // because the worker was lost, not because it finished.
+    case "credential_switch_settling":
+      return { kind: "badge", label: PARK_LABELS.credential_switch_settling, tone: "warning", pulse: false,
+        title: "After a token switch, the worker is finishing its own operations for this run. Resume may be refused until the worker finishes its own operations; then try again, or Cancel the run." };
+    case "credential_switch_unsettled":
+      return { kind: "badge", label: PARK_LABELS.credential_switch_unsettled, tone: "warning", pulse: false,
+        title: "Processes could not be proven stopped; work is kept on its worker. Open the run to Resume on the new token, or Cancel." };
     case "base_attestation_missing":
       return { kind: "badge", label: PARK_LABELS.base_attestation_missing, tone: "warning", pulse: false,
         title: "The retained work is not attested to the planned base commit, so the agent was not started. Open the run to recover the work or start a successor." };
@@ -958,6 +977,8 @@ export function needsHumanAttention(status: string): boolean {
     status === "worker_requeue_exhausted" ||
     status === "worker_memory_pressure" ||
     status === "provider_unavailable" ||
+    status === "credential_switch_settling" ||
+    status === "credential_switch_unsettled" ||
     status === "base_attestation_missing"
   );
 }
