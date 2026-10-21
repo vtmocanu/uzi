@@ -244,8 +244,9 @@ function makeHarness(opts: { mutate?: (patched: string) => string; tokenViaEnv?:
       '      if [ -L "$3" ]; then o=linkowner; else\n' +
       '        if [ "$3" = . ]; then d=$(pwd -P); else d=$(cd -P -- "$3" 2>/dev/null && pwd -P) || d=$3; fi\n' +
       '        case "${d##*/}" in\n' +
-      '          uzi-worker) o=${STUB_OWNER_WORKER:-worker} ;;\n' +
-      '          uzi-runner) o=${STUB_OWNER_RUNNER:-runner} ;;\n' +
+      // Owner is an inode property, so a leaf renamed to `<leaf>.moved` keeps its owner.
+      '          uzi-worker|uzi-worker.moved) o=${STUB_OWNER_WORKER:-worker} ;;\n' +
+      '          uzi-runner|uzi-runner.moved) o=${STUB_OWNER_RUNNER:-runner} ;;\n' +
       "          *) o=root ;;\n" +
       "        esac\n" +
       '        ino=$(stat -c %i "$3" 2>/dev/null)\n' +
@@ -1917,6 +1918,20 @@ describe("issue #3153: Docker-lane per-uid scratch adopt-or-refuse (portable, re
       try {
         const r = doRun(w);
         assertStandinUntouched(w, r.ops);
+        assertRefused(r, /changed identity before normalisation/);
+      } finally { cleanup(w.l); }
+    });
+
+    it("G: adopted 0700 runner leaf replaced by a symlink to its moved original is refused (verify-only name check)", () => {
+      const w = build((x) => { leaf(x.worker); leaf(x.runner, 0o700); }, (t, lp) =>
+        after(t, RUNNER_PREV, `/bin/mv '${lp}' '${lp}.moved'; /bin/ln -s '${lp}.moved' '${lp}'\n`));
+      try {
+        const r = doRun(w);
+        assertStandinUntouched(w, r.ops);
+        const moved = `${w.leafPath}.moved`;
+        assert.ok(fs.lstatSync(w.leafPath).isSymbolicLink(), "the substitution was in place when verification ran");
+        assert.deepEqual(r.ops.filter((o) => /^(chown|chmod) /.test(o) && o.includes(moved)), [], "verify mode mutates nothing");
+        assert.equal(fs.statSync(moved).mode & 0o7777, 0o700, "moved original mode unchanged");
         assertRefused(r, /changed identity before normalisation/);
       } finally { cleanup(w.l); }
     });

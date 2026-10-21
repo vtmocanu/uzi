@@ -688,9 +688,9 @@ if [ -n "$SCRATCH_DOCKER_LANE" ]; then
   # back, $3 expected "%U %d:%i" identity, $4 optional "verify" (check only, no mutation). Runs in a
   # subshell, so every command carries its own `|| exit N` (set -e is inert on the caller's `||` side).
   # Exit 0 ok; 3 identity mismatch / swap detected; 4 an operation failed. The identity match on "."
-  # (owner is part of it) proves the cd'd-into directory is the one validated. Verify mode proves only
-  # that: the leaf the cd resolved at check time; it does not re-check the NAME afterwards (a 0700
-  # runner leaf is never reclaimed, so the runner could re-swap after any such check anyway).
+  # (owner is part of it) proves the cd'd-into directory is the one validated. Verify mode also checks
+  # that the leaf NAME is that directory and not a symlink to it, at check time only (a 0700 runner leaf
+  # is never reclaimed, so the runner could re-swap after the check; a post-boot swap is out of scope).
   scratch_normalize() {
     (
       cd -P -- "$1" || exit 3
@@ -704,6 +704,8 @@ if [ -n "$SCRATCH_DOCKER_LANE" ]; then
         [ "$sn_p" = "$sn_here" ]
       }
       if [ "${4:-}" = verify ]; then
+        # The leaf NAME must still be that directory, not a symlink to it (cd -P would follow one).
+        sn_named "$1" || exit 3
         exit 0
       fi
       # Leaf only, root has no CAP_FOWNER/FSETID semantics: reclaim to root, chmod, hand back; all on ".".
