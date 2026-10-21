@@ -107,6 +107,49 @@ describe("recovery capture retry and restart safety (#1197)", () => {
     });
   }
 
+  it("a core dump in the dirty clone leaves the restore-point capture unverified and the clone intact (#3239)", async () => {
+    const { gitlab } = fakeGitlab();
+    const iid = 3239;
+    const claim = gitlabClaim(iid, { claim_generation: 1 });
+    const base = factoryFor(claim);
+    const dump = "core.1039053";
+    const factory: ExecutorFactory = (...args) => {
+      const made = base.factory(...args);
+      const run = made.executor.run.bind(made.executor);
+      made.executor.run = async (ctx) => {
+        fs.writeFileSync(path.join(ctx.worktreePath, dump), "pretend core dump\n");
+        return run(ctx);
+      };
+      return made;
+    };
+    const twice = deferred();
+    let attempts = 0;
+    const marker = git.commitWipMarker.bind(git);
+    git.commitWipMarker = async (...args) => {
+      const out = await marker(...args); // the REAL implementation: refuse mode on this path
+      if (++attempts >= 2) twice.resolve();
+      return out;
+    };
+    const runner = runnerWith(factory, gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 });
+    const execution = runner.execute(claim);
+    try {
+      await Promise.race([twice.promise, execution.then(() => { throw new Error("capture path not reached"); })]);
+      const clone = base.clone();
+      assert.equal(fs.readFileSync(path.join(clone, dump), "utf8"), "pretend core dump\n", "the dump stays on disk");
+      assert.equal(fs.readFileSync(path.join(clone, "ONLY_COPY.txt"), "utf8"), "must survive recovery\n");
+      assert.ok(!gitRead(clone, "log", "-1", "--format=%s").startsWith("wip(park):"), "no marker was made");
+      assert.equal(gitRead(clone, "diff", "--cached", "--name-only"), "", "nothing staged");
+      assert.equal(api.states.some((s) => s.body.status === "recovery_wait"), false, "an unverified capture never parks");
+      assert.equal(fs.existsSync(path.join(base.runHome, "session")), true, "no reseed or cleanup");
+      const bare = git.barePathFor(fx.originPath);
+      const journal = JSON.parse(gitRead(bare, "config", "--local", "--get", `uzi-recovery.agent/issue-${iid}.clone`)) as RecoveryJournalEntry;
+      assert.equal(journal.clonePath, clone, "the journal keeps naming the source clone");
+    } finally {
+      runner.shutdown();
+      await execution;
+    }
+  });
+
   it("shutdown retains source and journal; a new runner captures them before reseeding", async () => {
     const { gitlab } = fakeGitlab();
     const iid = 1304;

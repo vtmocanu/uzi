@@ -716,6 +716,16 @@ export interface GitCacheOptions {
     rename?: (from: string, to: string) => Promise<void>;
     residueUuid?: () => string;
   };
+  /** issue #3239 — test-only seams inside {@link GitCache.commitWipMarker}: `afterOmissionCheck`
+   *  runs after the omission scan and before staging (to race a file past the cap),
+   *  `beforeBackstop` after the commit and before the post-commit backstop reads HEAD, and
+   *  `beforeRollbackWrite` after the backstop's final identity recheck and before its
+   *  compare-and-swap write. Production never passes it. */
+  wipCapture?: {
+    afterOmissionCheck?: (clonePath: string) => Promise<void>;
+    beforeBackstop?: (clonePath: string, marker: string) => Promise<void>;
+    beforeRollbackWrite?: (clonePath: string, marker: string) => Promise<void>;
+  };
 }
 
 /** issue #1597 M2: the mid-turn checkpoint secret scan's hard deadline (all of its git + gitleaks
@@ -749,6 +759,23 @@ const CHECKPOINT_CHAIN_MAX_DIFF_BYTES = 1024 * 1024;
 //  - 100k blob oids: bounds the listing we buffer (~41 bytes per oid).
 /** Largest single blob, old or new side, a checkpoint scan accepts (bytes). */
 const CHECKPOINT_SCAN_MAX_BLOB_BYTES = 8 * 1024 * 1024;
+/** issue #3239 — the largest single file the park WIP auto-save ({@link GitCache.commitWipMarker})
+ *  will commit (bytes); a larger file, and any `core` / `core.<pid>` file, is left out. Same bound
+ *  as the checkpoint scan so a marker is never too large to scan. */
+const WIP_CAPTURE_MAX_FILE_BYTES = CHECKPOINT_SCAN_MAX_BLOB_BYTES;
+const WIP_DETACHED = "DETACHED";
+/** Most omitted paths exclude mode will pass as pathspecs to one `add`; more is treated as refuse. */
+const WIP_EXCLUDE_MAX_PATHS = 500;
+const WIP_CORE_FILE_RE = /^core(\.[0-9]+)?$/;
+/** A file the WIP auto-save refused to capture (issue #3239). `bytes` is set when sized. */
+interface WipOmission { path: string; reason: "core_file" | "oversized" | "unsized"; bytes?: number }
+/** What {@link GitCache.commitWipMarker} reports through `onIncomplete` (issue #3239). */
+export interface WipIncompleteInfo { omitted: WipOmission[]; markerCreated: boolean; rollbackRefused: boolean }
+interface WipMarkerOptions {
+  /** "refuse" (default): any omission means no marker. "exclude": commit everything else. */
+  mode?: "refuse" | "exclude";
+  onIncomplete?: (info: WipIncompleteInfo) => void;
+}
 /** Largest total of blob bytes, old and new side, a checkpoint scan accepts. */
 const CHECKPOINT_SCAN_MAX_TOTAL_BYTES = 128 * 1024 * 1024;
 /** Most distinct blob oids (old + new side) the scanned commits may touch. */
@@ -2128,6 +2155,8 @@ export class GitCache {
   private readonly terminalRecordProtection: GitCacheOptions["terminalRecordProtection"];
   /** See {@link GitCacheOptions.canonicalFree}; undefined in production. */
   private readonly canonicalFreeSeam: GitCacheOptions["canonicalFree"];
+  /** See {@link GitCacheOptions.wipCapture}; undefined in production. */
+  private readonly wipCaptureSeam: GitCacheOptions["wipCapture"];
   /** issue #1783 (N1): the targets (resolved) of every runner-uid delete that settled as a
    *  {@link RunnerDeleteUnsettledError}, each counted until its child's 'close' arrives. In-process
    *  only: the rm walks by path, so a canonical free or reseed at such a path is refused
@@ -2155,6 +2184,7 @@ export class GitCache {
     this.scratchProvisioner = opts.scratchProvisioner;
     this.retentionDeleteSeam = opts.retentionDelete;
     this.canonicalFreeSeam = opts.canonicalFree;
+    this.wipCaptureSeam = opts.wipCapture;
     this.reposRoot = path.join(dataDir, "repos");
     this.runnerRoot = path.join(dataDir, "runner");
     this.terminalRecordProtection = opts.terminalRecordProtection;
@@ -11056,27 +11086,112 @@ try {
    * reviewed work, so #218 D6's "a half-applied edit that survives is worse than one that
    * does not" no longer applies.
    *
+   * issue #3239 — the capture never commits a core dump or an oversized file. Before staging,
+   * {@link wipCaptureOmissions} lists every dirty path that is a `core` / `core.<pid>` file or a
+   * regular file (or staged blob) over WIP_CAPTURE_MAX_FILE_BYTES, or that cannot be sized.
+   * `mode: "refuse"` (default, the restore-point callers) then makes NO marker and returns
+   * `false`; `mode: "exclude"` (the park callers) unstages those paths, `add -A`s with them
+   * excluded and commits the rest. Omitted files stay on disk; `onIncomplete` reports them.
+   * A post-commit backstop re-reads what the marker added (a file can grow between the check
+   * and the add) and, when it finds a core file or an oversized blob, rolls back by
+   * compare-and-swap on the exact ref recorded before the capture: the checked-out branch
+   * (`update-ref <ref> <preHead> <marker>`; bare HEAD is never named while attached, so only
+   * that branch can move) or, when HEAD was detached, the detached HEAD itself
+   * (`update-ref --no-deref HEAD <preHead> <marker>`, which never moves a branch ref). It runs
+   * only while HEAD still resolves to that same identity (same branch, or still detached),
+   * still sits on the marker, and the marker's parent is still preHead; any mismatch or a failed
+   * swap refuses with nothing reset. Index and worktree are never touched by the rollback.
+   *
    * BEST-EFFORT: every error is caught, logged, and returns `false` rather than thrown —
    * a commit failure must NEVER propagate, because parking is the state that preserves the
    * tree and a failed park loses MORE than a missing WIP commit (D4). Returns `true` only
-   * when a marker commit was actually created (an already-clean tree returns `false` —
+   * when a marker commit was actually created and kept (an already-clean tree returns `false` —
    * nothing to commit).
    */
-  async commitWipMarker(clonePath: string): Promise<boolean> {
+  async commitWipMarker(clonePath: string, opts: WipMarkerOptions = {}): Promise<boolean> {
     MaintenanceResources.consumeIfActive("sourceBytes", 0);
     if (MaintenanceResources.active()) throw new Error("maintenance_wip_guard_required");
+    const mode = opts.mode ?? "refuse";
+    const git = (args: string[]) => this.runGitAsRunner(clonePath, args);
+    const report = (omitted: WipOmission[], markerCreated: boolean, rollbackRefused: boolean): void => {
+      this.log.warn("WIP park auto-save left files out", {
+        cwd: clonePath,
+        mode,
+        markerCreated,
+        rollbackRefused,
+        omitted: omitted.map((o) => ({ path: o.path, reason: o.reason, bytes: o.bytes })),
+      });
+      try { opts.onIncomplete?.({ omitted, markerCreated, rollbackRefused }); }
+      catch (err) { this.log.warn("WIP onIncomplete callback threw (ignored)", { cwd: clonePath, error: gitErrorMessage(err) }); }
+    };
     try {
-      const status = await this.runGitAsRunner(clonePath, ["status", "--porcelain"]);
+      const preHead = (await git(["rev-parse", "--verify", "HEAD^{commit}"])).trim();
+      const preRef = await this.wipSymbolicHead(clonePath);
+      const status = await git(["status", "--porcelain"]);
       if (status.split("\n").filter((l) => l.length > 0).length === 0) {
         return false; // clean tree — nothing to save
       }
-      await this.runGitAsRunner(clonePath, ["add", "-A"]);
-      await this.runGitAsRunner(clonePath, [
+      const omitted = await this.wipCaptureOmissions(clonePath);
+      await this.wipCaptureSeam?.afterOmissionCheck?.(clonePath);
+      if (omitted.length > 0 && (mode === "refuse" || omitted.length > WIP_EXCLUDE_MAX_PATHS)) {
+        report(omitted, false, false);
+        return false;
+      }
+      if (omitted.length > 0) {
+        for (let i = 0; i < omitted.length; i += 100) {
+          await git(["reset", "-q", "--", ...omitted.slice(i, i + 100).map((o) => `:(literal)${o.path}`)]);
+        }
+        await git(["add", "-A", "--", ".", ...omitted.map((o) => `:(exclude,literal)${o.path}`)]);
+      } else {
+        await git(["add", "-A"]);
+      }
+      let staged = false;
+      try { await git(["diff", "--cached", "--quiet"]); }
+      catch (err) { if ((err as { code?: number }).code === 1) staged = true; else throw err; }
+      if (!staged) {
+        if (omitted.length > 0) report(omitted, false, false);
+        return false;
+      }
+      await git([
         "commit",
         "-m",
         `${WIP_PARK_COMMIT_PREFIX} interrupted work auto-saved on usage-limit park (throwaway; restored uncommitted on resume)`,
       ]);
-      return true;
+      // Post-commit backstop: the marker must be exactly one commit on preHead with no core file
+      // and no blob over the cap, whatever happened to the worktree after the omission scan.
+      const marker = (await git(["rev-parse", "--verify", "HEAD^{commit}"])).trim();
+      await this.wipCaptureSeam?.beforeBackstop?.(clonePath, marker);
+      const markerParent = (await git(["rev-parse", "--verify", `${marker}^`])).trim();
+      const subject = await git(["log", "-1", "--format=%s", marker]);
+      if (markerParent !== preHead || !subject.startsWith(WIP_PARK_COMMIT_PREFIX)) {
+        report(omitted, false, true);
+        return false;
+      }
+      const extra = await this.wipMarkerViolations(clonePath, preHead, marker);
+      if (extra.length === 0) {
+        if (omitted.length > 0) report(omitted, true, false);
+        return true;
+      }
+      const all = [...omitted, ...extra.filter((e) => !omitted.some((o) => o.path === e.path))];
+      const headNow = await this.wipSymbolicHead(clonePath).catch(() => undefined);
+      const tipNow = (await git(["rev-parse", "--verify", "HEAD^{commit}"])).trim();
+      const parentNow = (await git(["rev-parse", "--verify", `${marker}^`])).trim();
+      if (headNow !== preRef || tipNow !== marker || parentNow !== preHead) { report(all, false, true); return false; }
+      await this.wipCaptureSeam?.beforeRollbackWrite?.(clonePath, marker);
+      try {
+        // CAS on the exact ref recorded before the capture: the branch HEAD named then, or the
+        // detached HEAD itself (--no-deref). Bare HEAD is never named while attached, so the swap
+        // cannot follow a branch HEAD moved to.
+        await git(preRef === WIP_DETACHED
+          ? ["update-ref", "--no-deref", "-m", "uzi: wip capture rollback", "HEAD", preHead, marker]
+          : ["update-ref", "-m", "uzi: wip capture rollback", preRef, preHead, marker]);
+      } catch (err) {
+        this.log.warn("WIP capture rollback refused (ref moved)", { cwd: clonePath, error: gitErrorMessage(err) });
+        report(all, false, true);
+        return false;
+      }
+      report(all, false, false);
+      return false;
     } catch (err) {
       this.log.warn("WIP park auto-commit failed (best-effort → not committed)", {
         cwd: clonePath,
@@ -11084,6 +11199,97 @@ try {
       });
       return false;
     }
+  }
+
+  /** `git symbolic-ref -q HEAD` as the runner uid: the checked-out ref, or WIP_DETACHED when
+   *  HEAD is detached (exit 1, no output). Any other failure throws. */
+  private async wipSymbolicHead(clonePath: string): Promise<string> {
+    try {
+      const out = (await this.runGitAsRunner(clonePath, ["symbolic-ref", "-q", "HEAD"])).trim();
+      if (out === "") throw new Error("git symbolic-ref -q HEAD printed nothing");
+      return out;
+    } catch (err) {
+      if ((err as { code?: number }).code === 1) return WIP_DETACHED;
+      throw err;
+    }
+  }
+
+  /** issue #3239 — the dirty paths {@link commitWipMarker} must not capture: `core` files,
+   *  regular files over WIP_CAPTURE_MAX_FILE_BYTES (lstat, never following a link), staged blobs
+   *  over it, and paths lstat cannot size (fail closed). Read-only; runner-uid object reads. */
+  private async wipCaptureOmissions(clonePath: string): Promise<WipOmission[]> {
+    const git = (args: string[]) => this.runGitAsRunner(clonePath, args);
+    const out = await git(["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+    const rows = out.split("\0");
+    if (rows[rows.length - 1] === "") rows.pop();
+    const candidates = new Set<string>();
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i]!;
+      const match = /^(..) (.+)$/s.exec(row);
+      if (!match) throw new Error("unparseable git status row");
+      candidates.add(match[2]!);
+      if (match[1]![0] === "R" || match[1]![0] === "C" || match[1]![1] === "R" || match[1]![1] === "C") {
+        const other = rows[++i];
+        if (other === undefined) throw new Error("git status rename row lacks its second path");
+        candidates.add(other);
+      }
+    }
+    const omitted = new Map<string, WipOmission>();
+    for (const rel of candidates) {
+      let bytes: number | undefined;
+      let present = false;
+      try {
+        const st = await fs.lstat(path.join(clonePath, rel));
+        present = true;
+        if (st.isFile()) bytes = st.size;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+          omitted.set(rel, { path: rel, reason: "unsized" });
+          continue;
+        }
+      }
+      if (WIP_CORE_FILE_RE.test(path.posix.basename(rel))) {
+        const inIndex = present || (await git(["ls-files", "-s", "-z", "--", `:(literal)${rel}`])).length > 0;
+        if (inIndex) { omitted.set(rel, { path: rel, reason: "core_file", bytes }); continue; }
+      }
+      if (bytes !== undefined && bytes > WIP_CAPTURE_MAX_FILE_BYTES) omitted.set(rel, { path: rel, reason: "oversized", bytes });
+    }
+    // Staged blobs that differ from HEAD (a worktree edit after `git add` can hide them from lstat).
+    for (const { path: rel, oid } of this.parseRawDiffZ(await git(["diff", "--cached", "--raw", "-z", "--no-renames"]))) {
+      if (omitted.has(rel)) continue;
+      const size = Number((await git(["cat-file", "-s", oid])).trim());
+      if (!Number.isFinite(size)) throw new Error("unreadable staged blob size");
+      if (size > WIP_CAPTURE_MAX_FILE_BYTES) omitted.set(rel, { path: rel, reason: "oversized", bytes: size });
+    }
+    return [...omitted.values()];
+  }
+
+  /** New-side `{path, oid}` of every non-deleted, non-gitlink entry in `diff --raw -z` output. */
+  private parseRawDiffZ(out: string): { path: string; oid: string }[] {
+    const toks = out.split("\0");
+    const res: { path: string; oid: string }[] = [];
+    for (let i = 0; i < toks.length; i++) {
+      const m = /^:(\d+) (\d+) ([0-9a-f]+) ([0-9a-f]+) (\w)/.exec(toks[i]!);
+      if (!m) continue;
+      const rel = toks[++i];
+      if (rel === undefined) throw new Error("raw diff row lacks its path");
+      if (m[5] === "D" || m[2] === "160000" || /^0+$/.test(m[4]!)) continue;
+      res.push({ path: rel, oid: m[4]! });
+    }
+    return res;
+  }
+
+  /** Core files and over-cap blobs that `preHead..marker` added (object reads, not lstat). */
+  private async wipMarkerViolations(clonePath: string, preHead: string, marker: string): Promise<WipOmission[]> {
+    const raw = await this.runGitAsRunner(clonePath, ["diff-tree", "-r", "-z", "--no-renames", preHead, marker]);
+    const res: WipOmission[] = [];
+    for (const { path: rel, oid } of this.parseRawDiffZ(raw)) {
+      const bytes = Number((await this.runGitAsRunner(clonePath, ["cat-file", "-s", oid])).trim());
+      if (!Number.isFinite(bytes)) throw new Error("unreadable marker blob size");
+      if (WIP_CORE_FILE_RE.test(path.posix.basename(rel))) res.push({ path: rel, reason: "core_file", bytes });
+      else if (bytes > WIP_CAPTURE_MAX_FILE_BYTES) res.push({ path: rel, reason: "oversized", bytes });
+    }
+    return res;
   }
 
   /**

@@ -419,3 +419,19 @@ it("new flight/reclaim loses remediation memory: a prior flagged local commit ca
   assert.equal(inspected, true, JSON.stringify(api.states));
   assert.deepEqual(tips, [flagged]);
 });
+
+it("a core dump in the dirty clone leaves captureHoldContext with NONE and no marker (#3239)", async () => {
+  const tips = spyUploads();
+  await withFlight(async (ctx, f, r) => {
+    const sha = commit(ctx.worktreePath);
+    const dump = path.join(ctx.worktreePath, "core.1039053");
+    fs.writeFileSync(dump, "pretend core dump\n");
+    const result = await r.captureHoldContext(gitlabClaim(1964), f, f.runLog);
+    assert.deepEqual(result, { verified: false, published: false, mode: "same_worker_only", head: null });
+    assert.equal(execFileSync("git", ["-C", ctx.worktreePath, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), sha,
+      "no wip marker was committed");
+    assert.equal(fs.readFileSync(dump, "utf8"), "pretend core dump\n", "the dump stays on disk");
+    assert.equal(tips.length, 0, "no hold context was published");
+    fs.rmSync(dump);
+  });
+});

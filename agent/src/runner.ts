@@ -22,7 +22,7 @@ import { RequestError, StateReportUnappliedError, isRunOwnershipLost, isTransien
 import { RecoveryClosureLimitError, recoveryClosureLimitDetail, formatRecoveryDecodedLimit } from "./recovery-closure.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
 import { MaintenanceResources } from "./recovery-maintenance.js";
-import type { CodeSnapshotFreshReceipt, GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult } from "./git.js";
+import type { WipIncompleteInfo, CodeSnapshotFreshReceipt, GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult } from "./git.js";
 import {
   CheckpointSoftDeadlineError,
   RetainedReadinessCleanupUnconfirmedError,
@@ -3922,7 +3922,7 @@ export class RunRunner {
                 // it; M2 strips it back to uncommitted at adopt time so it never reaches the MR.
                 // Best-effort — commitWipMarker swallows every error and the .catch is belt-and-
                 // braces so nothing here can undo the park (D4).
-                await this.git.commitWipMarker(worktreePath).catch(() => false);
+                await this.git.commitWipMarker(worktreePath, { mode: "exclude", onIncomplete: this.wipIncompleteHandler(flight, "park") }).catch(() => false);
                 // issue #1783 (auditor M1): the marker's status/add/commit can start an agent-planted
                 // filter AFTER the proof above; re-prove before the fetch-back, overlay and publish.
                 // Blocked → RunResidueBlockedError, handled below exactly like a blocked first proof.
@@ -4183,7 +4183,7 @@ export class RunRunner {
                   permitSignal = permit?.signal;
                   const check = () => permit?.signal.throwIfAborted();
                   check();
-                  await this.git.commitWipMarker(worktreePath).catch(() => false);
+                  await this.git.commitWipMarker(worktreePath, { mode: "exclude", onIncomplete: this.wipIncompleteHandler(flight, "park") }).catch(() => false);
                   // issue #1783 (auditor M1): re-prove after the marker's runner-clone git, before
                   // the credentialed overlay + publish (blocked → RunResidueBlockedError below).
                   check();
@@ -15905,7 +15905,7 @@ export class RunRunner {
     if (status.length > 0) {
       // DIRTY → commit the WIP marker and REQUIRE it committed; a false here is unambiguously a
       // commit FAILURE (we already know the tree is dirty), so the head is not transferable.
-      const committed = await this.git.commitWipMarker(worktreePath);
+      const committed = await this.git.commitWipMarker(worktreePath, { onIncomplete: this.wipIncompleteHandler(flight, "restore_point") });
       if (!committed) {
         runLog.warn("recovery: settle transfer — WIP commit of a dirty tree failed");
         return null;
@@ -17282,6 +17282,34 @@ export class RunRunner {
   }
 
   /**
+   * issue #3239 — the `onIncomplete` handed to {@link GitCache.commitWipMarker}: logs the omitted
+   * paths and sizes (never content) and emits ONE worker status notice. `park` (the exclude-mode
+   * park callers) also keeps the clone and its journal for the resume (preserveRecoveryClone,
+   * sourceJoinFailed), because the marker left work out and a reseed would erase it.
+   */
+  private wipIncompleteHandler(flight: RunFlight, kind: "park" | "restore_point"): (info: WipIncompleteInfo) => void {
+    return (info) => {
+      const n = info.omitted.length;
+      flight.runLog.warn("WIP capture left files out", {
+        kind,
+        markerCreated: info.markerCreated,
+        rollbackRefused: info.rollbackRefused,
+        omitted: info.omitted.map((o) => ({ path: o.path, reason: o.reason, bytes: o.bytes })),
+      });
+      if (kind === "park") {
+        flight.preserveRecoveryClone = true;
+        flight.sourceJoinFailed = true;
+      }
+      const noun = `${n} file${n === 1 ? "" : "s"} (core dumps or files over 8 MiB)`;
+      const text = kind === "park"
+        ? `WIP auto-save left out ${noun}; the clone is kept and the resume will not reseed until they are gone.`
+        : `WIP capture left out ${noun}; the recovery capture is not verified and the clone is kept.`;
+      try { flight.batcher.emit({ kind: "status", agent: "worker", payload: { text } }); }
+      catch (err) { flight.runLog.warn("WIP capture notice not emitted", { error: errMessage(err) }); }
+    };
+  }
+
+  /**
    * PRD #1190 M2: park a run on an owner pause or an explicit lead park request. Called
    * from the implement loop at the server-decided pause boundary and when a `now` pause aborted
    * the in-flight turn. Modeled on handleLimitReached, with two deliberate differences from a
@@ -17368,7 +17396,7 @@ export class RunRunner {
     let holdsLatest: boolean | undefined;
     let preservationRefused = false;
     if (!residueBlocked && barePath && branch && runnerClone) {
-      markerCreated = await this.git.commitWipMarker(runnerClone.path).catch(() => { flight.sourceJoinFailed = true; return false; });
+      markerCreated = await this.git.commitWipMarker(runnerClone.path, { mode: "exclude", onIncomplete: this.wipIncompleteHandler(flight, "park") }).catch(() => { flight.sourceJoinFailed = true; return false; });
       // issue #1783 (auditor M1): the marker's status/add/commit can start an agent-planted filter
       // AFTER the proof above. Re-prove before the fetch-back and the publish; a blocked re-proof
       // takes the same Decision-8 path as a blocked first proof (pause_failed, the marker undone).
@@ -17670,7 +17698,7 @@ export class RunRunner {
       // tree is dirty, a `false` here is unambiguously a commit FAILURE (not the clean-tree
       // no-op case), so the local restore point is not verified for this attempt.
       await opts.beforeMutation?.();
-      const committed = await this.git.commitWipMarker(worktreePath);
+      const committed = await this.git.commitWipMarker(worktreePath, { onIncomplete: this.wipIncompleteHandler(flight, "restore_point") });
       await opts.beforeMutation?.();
       if (opts.terminalDisk) this.terminalDiskInterruption(flight);
       if (!committed) {
@@ -18442,7 +18470,7 @@ export class RunRunner {
       // DIRTY → commit the WIP marker and REQUIRE it committed; a false here is unambiguously a
       // commit FAILURE (we already know the tree is dirty), so the local restore point is not
       // verified for this attempt.
-      const committed = await this.git.commitWipMarker(worktreePath);
+      const committed = await this.git.commitWipMarker(worktreePath, { onIncomplete: this.wipIncompleteHandler(flight, "restore_point") });
       if (!committed) {
         runLog.warn("completion hold capture: WIP commit of a dirty tree failed");
         return NONE;
