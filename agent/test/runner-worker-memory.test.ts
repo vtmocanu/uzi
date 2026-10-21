@@ -9,6 +9,7 @@ import type { Executor, RunContext } from "../src/executor.js";
 import type { ClaimResponse, MemoryReservationRequest, StateAck } from "../src/protocol.js";
 import { WorkerMemoryRuntime } from "../src/worker-memory-runtime.js";
 import { PauseNowSignal } from "../src/steering.js";
+import { StaleClaimError } from "../src/runner.js";
 import { MessageBatcher } from "../src/batcher.js";
 import type { WorkerClient } from "../src/client.js";
 import { nullLogger } from "./helpers.js";
@@ -1643,20 +1644,28 @@ for (const ackKind of ["declined", "stale_claim"] as const) {
     api.stateAckWire = (body, run) => {
       if (body.status !== "pause_failed") return undefined;
       return ackKind === "declined"
-        ? { status: 200, body: { run: { ...run, status: "running" }, applied: false } }
+        // A state ACK is applied only on a 200 (client reportStateOnce); a plain 409 is a declined report.
+        ? { status: 409, body: { run: { ...run, status: "running" } } }
         : { status: 409, body: { run: { ...run, status: "running" }, disposition: "stale_claim" } };
     };
     await memoryRun(f, async ctx => {
       await ctx.reportIteration!(1);
       before = ctx.capturedMemory!()!;
-      await failedPause(ctx).catch(() => false);
-      if (ackKind === "stale_claim") {
-        assert.equal(before.commands.isCurrent(before.context, before.flight, before.lifecycleRevision), false,
-          "a stale pause_failed ACK retires the context");
-      } else {
-        assert.equal(api.states.at(-1)?.body.status, "pause_failed");
-      }
-    }).catch(error => { if (ackKind !== "stale_claim") throw error; });
+      assert.equal(before.commands.admitsCommands(before.context), true);
+      let pauseError: unknown;
+      const parked = await failedPause(ctx).catch((error: unknown) => { pauseError = error; return false; });
+      assert.equal(parked, false);
+      assert.equal(api.states.at(-1)?.body.status, "pause_failed");
+      // handlePausePark keeps a park best-effort: a refused report surfaces as a declined pause, not a throw.
+      assert.equal(pauseError, undefined);
+      // Inside the still-running flight, right after the ACK: no shell authority survives.
+      assert.equal(before.commands.isCurrent(before.context, before.flight, before.lifecycleRevision), false,
+        `a ${ackKind} pause_failed ACK retires the context`);
+      assert.equal(before.commands.admitsCommands(before.context), false, "the captured context admits no command");
+    }).catch((error: unknown) => {
+      // Only the expected end of a superseded claim is tolerated; assertion failures propagate.
+      if (!(ackKind === "stale_claim" && error instanceof StaleClaimError)) throw error;
+    });
     assert.ok(before);
     assert.equal(before.commands.isCurrent(before.context, before.flight, before.lifecycleRevision), false,
       "no ACK path leaves the flight's authority alive past its end");

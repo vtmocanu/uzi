@@ -9724,8 +9724,18 @@ export class RunRunner {
           throw new StaleClaimError();
         }
         if (ack.status === "cancelled") this.observeCancellation(flight);
-        if (memorySequence !== undefined && memory?.stateSequence === memorySequence &&
-            !(continuing && ack.status === "running" && ack.applied !== false)) {
+        // Issue #3240: only an applied running ACK confirms pause_failed's continuing flight. Any other
+        // answer (declined, or a non-running status) gets the ordinary non-running handling it skipped
+        // above: the flight stops running and its context is retired, so no shell authority survives.
+        const continued = continuing && ack.status === "running" && ack.applied !== false;
+        if (continuing && !continued && memory) {
+          memory.running = false;
+          memory.resumeReady = false;
+          memory.epochReady = false;
+          memory.revisionContext = undefined;
+          this.retireWorkerMemory(flight);
+        }
+        if (memorySequence !== undefined && memory?.stateSequence === memorySequence && !continued) {
           memory.running = body.status === "running" && ack.status === "running" && ack.applied !== false &&
             (!memory.phaseToken || memoryPhaseToken === memory.phaseToken);
           if (memory.running && memoryPhaseToken && this.memoryRuntime!.commands.releasePhase(memoryPhaseToken)) {
