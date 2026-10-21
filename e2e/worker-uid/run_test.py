@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -15,11 +16,14 @@ import tool_image
 
 HARNESS = Path(__file__).resolve().parent
 SCRATCH = HARNESS.parents[1] / ".uzi/scratch"
-# Hang guard for one fake-docker run.sh invocation, not a performance budget. A lane costs about 7 s
-# of CPU-bound interpreter starts (~90 fakes) on an idle host and scales with host load; the former
-# 20 s guard was only ~2.5x that and tripped on busy CI/dev hosts. A real hang is still bounded
-# by run.sh's own phase deadlines, which the tests assert.
-RUN_SH_LIMIT = 90
+# Hang guard for one fake-docker run.sh invocation, not a performance budget. It is the ONLY bound
+# on a stuck token script, check_test.py, inventory.mjs/pattern.mjs or check.py call: those carry no
+# deadline of their own and the timeout stub does not enforce seconds. Only the docker calls are
+# bounded by run.sh's own phase deadlines, which the tests assert.
+RUN_SH_LIMIT = 20
+# Test-only: when WUID_LANE_TIMING names a file, each run.sh wall time is recorded and the max and
+# p95 are written there at the end of the module. Off by default.
+LANE_TIMES = []
 EXPECTED = [{"file": "agent/test/example.test.ts", "names": ["suite", "leaf"]}]
 COMMAND_EXPECTED = [{"file": "e2e/worker-uid/memory-command-real.test.mts", "names": ["command leaf"]}]
 SINGLE_EXPECTED = [{"file": "e2e/worker-uid/single-uid-preflight.test.mts", "names": ["single leaf"]}]
@@ -386,8 +390,12 @@ sys.exit(rc)
             "WORKER_UID_SKIP_BUILD": skip_build, "WORKER_UID_IMAGE": "fixture-image",
             "PYTHONDONTWRITEBYTECODE": "1",
         }
-        result = subprocess.run(["bash", str(self.repo / "e2e/worker-uid/run.sh")],
-                                env=env, capture_output=True, text=True, timeout=RUN_SH_LIMIT, check=False)
+        started = time.monotonic()
+        try:
+            result = subprocess.run(["bash", str(self.repo / "e2e/worker-uid/run.sh")],
+                                    env=env, capture_output=True, text=True, timeout=RUN_SH_LIMIT, check=False)
+        finally:
+            LANE_TIMES.append(time.monotonic() - started)
         calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
         runs = [call for call in calls if call[:2] == ["docker", "run"]]
         # Every Docker operation, including failures before either lane, is bounded.
@@ -801,6 +809,14 @@ sys.exit(rc)
         for detail in ("worker UID lane FAIL", "worker UID node/container exit: 124",
                        "watchdog stderr fixture"):
             self.assertIn(detail, result.stderr)
+
+
+def tearDownModule():
+    path = os.environ.get("WUID_LANE_TIMING")
+    if path and LANE_TIMES:
+        ordered = sorted(LANE_TIMES)
+        p95 = ordered[min(len(ordered) - 1, int(0.95 * len(ordered)))]
+        Path(path).write_text(f"lanes={len(ordered)} max={ordered[-1]:.2f}s p95={p95:.2f}s\n")
 
 
 if __name__ == "__main__":
