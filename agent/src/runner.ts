@@ -17991,8 +17991,8 @@ export class RunRunner {
     // emptiness and a re-reap re-invokes each RegisteredRoot.reap (idempotent). A blocked Codex
     // boundary is a best-effort recovery path: it leaves `published` false (the restore point is
     // still VERIFIED locally, so the caller's "saved on this worker" notice fires) and must NOT
-    // fail the capture. (Codex never reaches the TRANSIENT recovery — its executor throws no
-    // TransientRecoveryError — so this is defensive wiring.)
+    // fail the capture. Codex can enter transient recovery after provider retry exhaustion;
+    // publication remains best effort.
     //
     // Issue #1766: the credential recovery park captures `credentialFree`. Everything above is unchanged, but
     // the publish opens NO Codex boundary (its reconcile would retry the deferred credential operation) and
