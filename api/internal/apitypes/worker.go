@@ -253,10 +253,12 @@ type WorkerDTO struct {
 	ResidueQuarantinedAt   *time.Time `json:"residue_quarantined_at"`
 	ResidueQuarantineCause *string    `json:"residue_quarantine_cause"`
 	// MemoryAuthorityLostAt (issue #3142) is when the api first withheld guard-bound runs from
-	// this worker because its run-lane claim did not report memory authority, on the api clock
-	// (the first gated claim since this api process started). Null means not gated. It is
-	// overlaid from an in-process tracker, never stored: it resets on an api restart until the
-	// worker's next run-lane claim. Restart the worker container to regain authority.
+	// this worker because its run-lane claim did not report memory authority, on the api clock.
+	// It is the first gated claim since the worker's last registration, or since this api
+	// process started, whichever is later; a claim reporting authority held, a re-registration
+	// or 24h without a gated claim clears it. Null means not gated. It is overlaid from an
+	// in-process tracker, never stored: it resets on an api restart until the worker's next
+	// run-lane claim. Restart the worker container to regain authority.
 	MemoryAuthorityLostAt *time.Time `json:"memory_authority_lost_at"`
 }
 

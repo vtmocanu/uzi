@@ -1650,6 +1650,35 @@ func TestFleetMemoryAuthority(t *testing.T) {
 			t.Fatalf("action = %v", c.Action)
 		}
 	})
+
+	t.Run("since is the oldest gate time across workers and evidence is capped", func(t *testing.T) {
+		var rows []store.ListAllWorkersRow
+		since := map[uuid.UUID]time.Time{}
+		for i := 0; i < maxQuarantineEvidence+2; i++ {
+			id := uuid.New()
+			rows = append(rows, store.ListAllWorkersRow{Worker: store.Worker{
+				ID: id, Name: fmt.Sprintf("w%d", i),
+				LastHeartbeatAt: pgtype.Timestamptz{Time: fixedNow.Add(-time.Second), Valid: true},
+			}})
+			// The second worker carries the oldest gate time; later ones are newer.
+			since[id] = fixedNow.Add(-time.Duration(10+i) * time.Minute)
+			if i == 1 {
+				since[id] = fixedNow.Add(-5 * time.Hour)
+			}
+		}
+		lookup := func(id uuid.UUID) (time.Time, bool) { at, ok := since[id]; return at, ok }
+		svc := New(Config{Store: &fakeStore{}, Settings: &fakeSettings{}, Now: func() time.Time { return fixedNow }, HeartbeatStale: 45 * time.Second, MemoryAuthorityLost: lookup})
+		c := svc.checkFleetMemoryAuthority(fixedNow, rows)
+		if want := *sincePtr(fixedNow.Add(-5 * time.Hour)); c.Since == nil || *c.Since != want {
+			t.Fatalf("since = %v, want the oldest gate time %s", c.Since, want)
+		}
+		if len(c.Evidence) != maxQuarantineEvidence {
+			t.Fatalf("evidence rows = %d, want the cap %d", len(c.Evidence), maxQuarantineEvidence)
+		}
+		if !strings.Contains(c.Summary, fmt.Sprintf("%d worker(s)", maxQuarantineEvidence+2)) {
+			t.Fatalf("summary = %q", c.Summary)
+		}
+	})
 }
 
 // ---- fleet.quarantine ------------------------------------------------------
