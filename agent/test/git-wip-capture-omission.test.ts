@@ -258,4 +258,75 @@ describe("commitWipMarker omissions (issue #3239)", () => {
     assert.equal(f.g("rev-parse", "refs/heads/B^"), pre);
     assert.equal(f.g("symbolic-ref", "HEAD"), "refs/heads/B");
   });
+
+  const gIn = (p: string) => (...a: string[]) => execFileSync("/usr/bin/git", ["-C", p, ...a], { env: gitEnv, encoding: "utf8" }).trim();
+  const slipCore = (p: string) => fs.writeFile(path.join(p, "core"), "tiny\n");
+
+  test("(i) a small core file that appears after the scan is caught by the backstop and rolled back", async (t) => {
+    const f = await fixture(t, { afterOmissionCheck: (p) => slipCore(p) });
+    const pre = f.head();
+    await f.write("small-wip.txt", "ordinary\n");
+    assert.equal(await f.git.commitWipMarker(f.root, { mode: "exclude", onIncomplete: f.onIncomplete }), false);
+    assert.equal(f.g("rev-parse", "refs/heads/main"), pre);
+    assert.equal(f.calls.length, 1);
+    assert.equal(reasons(f.calls[0]!)["core"], "core_file");
+    assert.deepEqual([f.calls[0]!.markerCreated, f.calls[0]!.rollbackRefused], [false, false]);
+    assert.equal(await f.exists("core"), 5);
+  });
+
+  test("(j) HEAD swapped to a pre-planted clean wip branch: the commit written to the branch is vetted, not HEAD", async (t) => {
+    const f = await fixture(t, {
+      afterOmissionCheck: (p) => slipCore(p),
+      beforeBackstop: async (p) => {
+        const g = gIn(p);
+        const planted = g("commit-tree", "HEAD~1^{tree}", "-p", "HEAD~1", "-m", `${WIP_PARK_COMMIT_PREFIX} planted`);
+        g("branch", "B", planted);
+        g("symbolic-ref", "HEAD", "refs/heads/B");
+      },
+    });
+    const pre = f.head();
+    await f.write("small-wip.txt", "ordinary\n");
+    assert.equal(await f.git.commitWipMarker(f.root, { mode: "exclude", onIncomplete: f.onIncomplete }), false);
+    assert.equal(f.calls.length, 1);
+    assert.equal(f.calls[0]!.rollbackRefused, true);
+    assert.equal(reasons(f.calls[0]!)["core"], "core_file", "the core blob in branch A's commit is reported");
+    assert.equal(f.g("rev-parse", "refs/heads/main^"), pre);
+    assert.equal(f.g("symbolic-ref", "HEAD"), "refs/heads/B");
+  });
+
+  test("(k) a preRef turned into a symref after the recheck never moves its target", async (t) => {
+    let marker = "";
+    const f = await fixture(t, {
+      afterOmissionCheck: (p) => slipCore(p),
+      beforeRollbackWrite: async (p, m) => {
+        marker = m;
+        const g = gIn(p);
+        g("update-ref", "refs/remotes/origin/main", m);
+        g("symbolic-ref", "refs/heads/main", "refs/remotes/origin/main");
+      },
+    });
+    await f.write("small-wip.txt", "ordinary\n");
+    assert.equal(await f.git.commitWipMarker(f.root, { mode: "exclude", onIncomplete: f.onIncomplete }), false);
+    assert.equal(f.g("rev-parse", "refs/remotes/origin/main"), marker, "the symref target did not move");
+  });
+
+  test("(l) deleting a committed core file does not block a refuse-mode capture", async (t) => {
+    const f = await fixture(t);
+    await f.write("core", "old dump\n");
+    f.g("add", "core"); f.g("commit", "-q", "-m", "oops core");
+    await fs.rm(path.join(f.root, "core"));
+    await f.write("small-wip.txt", "ordinary\n");
+    assert.equal(await f.git.commitWipMarker(f.root, { onIncomplete: f.onIncomplete }), true);
+    assert.equal(f.calls.length, 0);
+    const tree = f.g("ls-tree", "-r", "--name-only", "HEAD").split("\n");
+    assert.ok(tree.includes("small-wip.txt") && !tree.includes("core"));
+  });
+
+  test("(m) the omission report is bounded to 100 paths plus the total", async (t) => {
+    const f = await fixture(t);
+    for (let i = 0; i < 105; i++) await f.write(`core.${i}`, "d");
+    assert.equal(await f.git.commitWipMarker(f.root, { onIncomplete: f.onIncomplete }), false);
+    assert.equal(f.calls[0]!.omitted.length, 100);
+    assert.equal(f.calls[0]!.omittedTotal, 105);
+  });
 });

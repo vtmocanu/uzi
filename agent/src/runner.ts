@@ -1944,6 +1944,12 @@ interface RunFlight {
   sourceOriginalInputs?: Readonly<{ barePath: string; branch: string; key: string;
     kind: RunKind; defaultBranch: string; cloneUrl: string; repoId: string }>;
   sourceJoinFailed?: boolean;
+  /** issue #3239 — the last park-kind WIP capture refused its own rollback (a marker nobody vetted
+   *  may be committed): the park callers reset it before the capture and skip the fetch-back and
+   *  publish when it is set. */
+  wipMarkerUnsafe?: boolean;
+  /** issue #3239 — WIP-capture notice kinds already emitted on this flight (one per kind). */
+  wipNoticed?: Set<"park" | "restore_point">;
   sourceNormalPark?: boolean;
   sourceExitDenied?: boolean;
   /** Unsupported catch selection, separate from irrevocable retainStoppedSource denial. */
@@ -3922,11 +3928,15 @@ export class RunRunner {
                 // it; M2 strips it back to uncommitted at adopt time so it never reaches the MR.
                 // Best-effort — commitWipMarker swallows every error and the .catch is belt-and-
                 // braces so nothing here can undo the park (D4).
+                flight.wipMarkerUnsafe = false;
                 await this.git.commitWipMarker(worktreePath, { mode: "exclude", onIncomplete: this.wipIncompleteHandler(flight, "park") }).catch(() => false);
                 // issue #1783 (auditor M1): the marker's status/add/commit can start an agent-planted
                 // filter AFTER the proof above; re-prove before the fetch-back, overlay and publish.
                 // Blocked → RunResidueBlockedError, handled below exactly like a blocked first proof.
                 await this.quiesceOrBlockSink(flight, executor, "park", { processOnly: true });
+                // issue #3239: a marker whose rollback was refused was never vetted; keep the clone
+                // and publish nothing from it.
+                if (flight.wipMarkerUnsafe) return;
                 const fetched = await this.fetchBackBestEffort(barePath, worktreePath, branch, flight, runLog);
                 if (fetched.kind === "refused") return;
                 // PRD #1809 D8: what the publish below packs is the tracking ref; it holds the
@@ -4183,12 +4193,15 @@ export class RunRunner {
                   permitSignal = permit?.signal;
                   const check = () => permit?.signal.throwIfAborted();
                   check();
+                  flight.wipMarkerUnsafe = false;
                   await this.git.commitWipMarker(worktreePath, { mode: "exclude", onIncomplete: this.wipIncompleteHandler(flight, "park") }).catch(() => false);
                   // issue #1783 (auditor M1): re-prove after the marker's runner-clone git, before
                   // the credentialed overlay + publish (blocked → RunResidueBlockedError below).
                   check();
                   await this.quiesceOrBlockSink(flight, executor, "shutdown", { processOnly: true });
                   check();
+                  // issue #3239: an unvetted marker (rollback refused) is never fetched back or published.
+                  if (flight.wipMarkerUnsafe) return;
                   const fetched = await this.fetchBackBestEffort(barePath, worktreePath, branch, flight, runLog);
                   check();
                   if (fetched.kind === "refused") return;
@@ -17289,18 +17302,25 @@ export class RunRunner {
    */
   private wipIncompleteHandler(flight: RunFlight, kind: "park" | "restore_point"): (info: WipIncompleteInfo) => void {
     return (info) => {
-      const n = info.omitted.length;
+      const n = info.omittedTotal;
       flight.runLog.warn("WIP capture left files out", {
         kind,
         markerCreated: info.markerCreated,
         rollbackRefused: info.rollbackRefused,
+        omittedTotal: n,
         omitted: info.omitted.map((o) => ({ path: o.path, reason: o.reason, bytes: o.bytes })),
       });
       if (kind === "park") {
         flight.preserveRecoveryClone = true;
         flight.sourceJoinFailed = true;
+        if (info.rollbackRefused) flight.wipMarkerUnsafe = true;
       }
-      const noun = `${n} file${n === 1 ? "" : "s"} (core dumps or files over 8 MiB)`;
+      // One notice per flight and kind: handleRecoveryExhausted retries restore-point captures
+      // about every second, so a core file would otherwise flood the feed.
+      const noticed = (flight.wipNoticed ??= new Set());
+      if (noticed.has(kind)) return;
+      noticed.add(kind);
+      const noun = n === 0 ? "files" : `${n} file${n === 1 ? "" : "s"} (core dumps or files over 8 MiB)`;
       const text = kind === "park"
         ? `WIP auto-save left out ${noun}; the clone is kept and the resume will not reseed until they are gone.`
         : `WIP capture left out ${noun}; the recovery capture is not verified and the clone is kept.`;
@@ -17396,7 +17416,15 @@ export class RunRunner {
     let holdsLatest: boolean | undefined;
     let preservationRefused = false;
     if (!residueBlocked && barePath && branch && runnerClone) {
+      flight.wipMarkerUnsafe = false;
       markerCreated = await this.git.commitWipMarker(runnerClone.path, { mode: "exclude", onIncomplete: this.wipIncompleteHandler(flight, "park") }).catch(() => { flight.sourceJoinFailed = true; return false; });
+      // issue #3239: sourceJoinFailed alone does not stop the fetch-back or publish below. A marker
+      // whose rollback was refused was never vetted: refuse like an ownership failure, so nothing
+      // is fetched or published and the run stays running (pause_failed) with its clone kept.
+      if (flight.wipMarkerUnsafe) {
+        this.preservationRefused(flight, "wip_marker_unsafe");
+        preservationRefused = true;
+      }
       // issue #1783 (auditor M1): the marker's status/add/commit can start an agent-planted filter
       // AFTER the proof above. Re-prove before the fetch-back and the publish; a blocked re-proof
       // takes the same Decision-8 path as a blocked first proof (pause_failed, the marker undone).
@@ -17410,7 +17438,7 @@ export class RunRunner {
         residueState = reproof.outcome.process?.state;
       }
     }
-    if (!residueBlocked && barePath && branch && runnerClone) {
+    if (!residueBlocked && !preservationRefused && barePath && branch && runnerClone) {
       const preTip = await this.git
         .branchTip(runnerClone.path, branch)
         .catch(() => { flight.sourceJoinFailed = true; return null; });

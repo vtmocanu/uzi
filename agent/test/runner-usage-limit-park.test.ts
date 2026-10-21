@@ -2104,7 +2104,7 @@ describe("RunRunner — park with an oversized untracked file (issue #3239)", ()
       const files = gitRead(bare, "ls-tree", "-r", "--name-only", ref).split("\n");
       assert.ok(files.includes("WIP.txt"), "the marker holds the ordinary WIP");
       assert.ok(!files.includes("huge.bin"), "the marker does not hold the oversized file");
-      assert.ok(feedTexts(runId).some((t) => /left out 1 file/.test(t)), "one worker notice names the omission");
+      assert.equal(feedTexts(runId).filter((t) => t.startsWith("WIP auto-save left out 1 file")).length, 1, "exactly one worker notice names the omission");
       assert.ok(fs.existsSync(path.join(clone, ".git")), "the clone was not retired");
       assert.ok(gitRead(bare, "config", "--local", "--get", `uzi-recovery.agent/issue-${iid}.clone`), "journal kept");
       assert.equal(fs.statSync(path.join(clone, "huge.bin")).size, BIG);
@@ -2130,6 +2130,11 @@ describe("RunRunner — park with an oversized untracked file (issue #3239)", ()
       try {
         await Promise.race([twice.promise, execution.then(() => { throw new Error("resume exited without retrying capture"); })]);
         assert.equal(modelRan, false, "no reseed and no model start while the file is unsaved");
+        const resumeNotices = () => feedTexts(runId).filter((t) => t.startsWith("WIP capture left out 1 file")).length;
+        for (let i = 0; i < 100 && resumeNotices() === 0; i++) await new Promise((r) => setTimeout(r, 30));
+        await new Promise((r) => setTimeout(r, 200)); // further retries would add more by now
+        assert.ok(attempts >= 2, "the capture was attempted at least twice");
+        assert.equal(resumeNotices(), 1, "exactly one restore-point notice however many capture attempts ran");
         const kept = fs.readFileSync(path.join(clone, "huge.bin"));
         assert.equal(kept.length, BIG);
         assert.ok(kept.equals(Buffer.alloc(BIG, 0x61)), "byte-identical at its original path");

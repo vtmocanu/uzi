@@ -134,6 +134,12 @@ describe("recovery capture retry and restart safety (#1197)", () => {
     const execution = runner.execute(claim);
     try {
       await Promise.race([twice.promise, execution.then(() => { throw new Error("capture path not reached"); })]);
+      const notices = () => api.messages(claim.run_id)
+        .filter((m) => m.kind === "status" && String(m.payload.text).startsWith("WIP capture left out")).length;
+      for (let i = 0; i < 100 && notices() === 0; i++) await new Promise((r) => setTimeout(r, 30));
+      await new Promise((r) => setTimeout(r, 200)); // further retries would add more by now
+      assert.ok(attempts >= 2, "the capture was attempted at least twice");
+      assert.equal(notices(), 1, "exactly one worker notice however many capture attempts ran");
       const clone = base.clone();
       assert.equal(fs.readFileSync(path.join(clone, dump), "utf8"), "pretend core dump\n", "the dump stays on disk");
       assert.equal(fs.readFileSync(path.join(clone, "ONLY_COPY.txt"), "utf8"), "must survive recovery\n");
