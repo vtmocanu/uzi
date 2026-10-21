@@ -36,6 +36,7 @@ export const mockWorkers: Worker[] = [
     upgrade_last_exit_code: null,
     last_heartbeat_at: minsAgo(0.2),
     online_since: minsAgo(192), // online ~3h 12m
+    memory_authority_lost_at: minsAgo(12), // gated ~12m ago (issue #3142)
     created_at: daysAgo(14),
     // cgroup sample with a limit → CPU bar + "used / limit · %" memory bar (ok tone).
     stats_cpu_pct: 34.2,

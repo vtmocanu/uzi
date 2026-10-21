@@ -2558,6 +2558,11 @@ export interface Worker {
   // render it as plain text only (WorkerQuarantineBadge).
   residue_quarantined_at?: string | null;
   residue_quarantine_cause?: string | null;
+  // memory_authority_lost_at is when the api (api clock, RFC3339) began withholding
+  // guard-bound runs from this worker because it lost memory authority (issue #3142);
+  // null when it has not. In-process api state, so it is lost on an api restart. The
+  // operator action is to restart the worker container (WorkerMemoryAuthorityBadge).
+  memory_authority_lost_at?: string | null;
 }
 
 /** The closed set of worker bind modes (PRD #111 M3), mirroring the server's CHECK. */

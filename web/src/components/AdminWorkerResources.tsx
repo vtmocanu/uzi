@@ -1,5 +1,6 @@
 import type { AdminWorker } from "../lib/api";
 import { Badge } from "./ui";
+import { WorkerMemoryAuthorityBadge } from "./WorkerMemoryAuthorityBadge";
 import { WorkerQuarantineBadge } from "./WorkerQuarantineBadge";
 import { hasStats, WorkerDiskLine, WorkerStatLine } from "./WorkerStats";
 
@@ -17,6 +18,7 @@ export function AdminWorkerResources({ worker, diskOnly = false }: { worker: Adm
         </Badge>
       )}
       <WorkerQuarantineBadge worker={worker} />
+      <WorkerMemoryAuthorityBadge worker={worker} />
     </span>
   );
 }
