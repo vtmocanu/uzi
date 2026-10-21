@@ -13161,7 +13161,9 @@ export class RunRunner {
     // handled by the caller like a blocked Codex boundary: nothing published or settled, the park
     // stands) and keeps the clone.
     const quiesceSink = flight !== undefined;
-    const now = req.checkpointStop?.now ?? Date.now;
+    // Issue #3217: a sink without a checkpointStop (milestone) takes the test clock when one is set,
+    // so the budget it hands the safety and the deadline the safety arms share one clock.
+    const now = req.checkpointStop?.now ?? this.checkpointTestHooks?.absoluteNow ?? Date.now;
     const deadlineAt = Math.min(now() + Math.max(0, req.deadlineMs),
       req.gracefulShutdownCheckpoint?.deadlineAt ?? Infinity);
     await executor.closeAndSettlePlanSummary?.(Math.max(0, deadlineAt - now()));

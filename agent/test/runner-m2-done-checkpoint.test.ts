@@ -69,6 +69,12 @@ it("m2 started milestone import finishes readback and ancestry bridge after its 
   let rig: ReturnType<typeof codexRig> | undefined;
   const executor: Executor = {
     get safety() { return rig?.safety; },
+    // Issue #3217: real time passes while the plan summary settles, as on a loaded runner. The
+    // milestone budget must still come from the virtual clock, so it stays exactly 30 seconds.
+    closeAndSettlePlanSummary: async () => {
+      const until = Date.now() + 2;
+      while (Date.now() < until) { /* spend real time */ }
+    },
     run: async ctx => {
       rig = codexRig({ lifecycleSignal: AbortSignal.any([ctx.signal!, ctx.terminalLifecycleSignal!]),
         armDeadline: clock.armDeadline, now: clock.now,
@@ -101,7 +107,7 @@ it("m2 started milestone import finishes readback and ancestry bridge after its 
     },
   };
   await runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, logger, {
-    checkpointTestHooks: { armSoftDeadline: clock.arm },
+    checkpointTestHooks: { absoluteNow: clock.now, armSoftDeadline: clock.arm },
   }).execute(gitlabClaim(312302, { kind: "task", branch: publishedBranch, open_mr: false }));
   assert.equal(advanced, true); assert.equal(observed, true);
   assert.equal(clock.now() - startedAt, 20_000, "started milestone settles between its 10s soft and 30s hard deadlines");
