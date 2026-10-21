@@ -2559,7 +2559,8 @@ export interface Worker {
   residue_quarantined_at?: string | null;
   residue_quarantine_cause?: string | null;
   // memory_authority_lost_at is when the api (api clock, RFC3339) began withholding
-  // guard-bound runs from this worker because it lost memory authority (issue #3142);
+  // guard-bound runs from this worker (its first gated claim, not necessarily when the
+  // worker lost memory authority) because its claims did not report it (issue #3142);
   // null when it has not. In-process api state, so it is lost on an api restart. The
   // operator action is to restart the worker container (WorkerMemoryAuthorityBadge).
   memory_authority_lost_at?: string | null;

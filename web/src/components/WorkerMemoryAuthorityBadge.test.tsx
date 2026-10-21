@@ -15,14 +15,15 @@ describe("WorkerMemoryAuthorityBadge", () => {
     render(<WorkerMemoryAuthorityBadge nowMs={NOW} worker={{ memory_authority_lost_at: LOST }} />);
     const pill = screen.getByText("memory authority lost");
     const title = pill.getAttribute("title") ?? "";
-    expect(title).toMatch(/^Lost memory authority 2h 14m ago: /);
-    expect(title).toContain("guard-bound runs");
-    expect(title).toContain("Restart the worker container to regain it.");
+    expect(title).toMatch(/^Guard-bound runs withheld for 2h 14m: /);
+    expect(title).toContain("did not report memory authority");
+    expect(title).toContain("Judge, job, cross-check, review and isolated-fetch runs still run.");
+    expect(title).toContain("Restart the worker's container to regain it.");
   });
 
   it("repeats the explanation as screen-reader text", () => {
     const { container } = render(<WorkerMemoryAuthorityBadge nowMs={NOW} worker={{ memory_authority_lost_at: LOST }} />);
-    expect(container.querySelector(".sr-only")?.textContent).toContain("Restart the worker container to regain it.");
+    expect(container.querySelector(".sr-only")?.textContent).toContain("Restart the worker's container to regain it.");
   });
 
   it.each([null, undefined])("renders nothing when memory_authority_lost_at is %s", (at) => {
@@ -49,6 +50,9 @@ describe("mock workers — memory authority", () => {
     ["owner", mockWorkers],
     ["admin", mockAdminWorkers],
   ] as const)("the %s list carries exactly one gated worker, distinct from the quarantined one", (_scope, workers) => {
-    expect(workers.filter((w) => w.memory_authority_lost_at).map((w) => w.id)).toEqual(["w-laptop"]);
+    const gated = workers.filter((w) => w.memory_authority_lost_at);
+    expect(gated.map((w) => w.id)).toEqual(["w-ci"]);
+    expect(gated[0].residue_quarantined_at).toBeFalsy();
+    expect(workers.filter((w) => w.residue_quarantined_at).map((w) => w.id)).not.toContain("w-ci");
   });
 });
