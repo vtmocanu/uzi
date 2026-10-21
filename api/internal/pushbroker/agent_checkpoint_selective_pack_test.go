@@ -275,6 +275,11 @@ func TestAgentCheckpointSelectivePackBridge(t *testing.T) {
 				}
 			}
 			opts := pushbroker.Options{CloneURL: f.cloneURL(), Branch: s.Branch, DefaultBranch: s.DefaultName, DeclaredTip: s.Tip}
+			if mode == "EqualDefault" || mode == "RevertDefault" {
+				// Protect an existing entry whose content matches the current default tree.
+				opts.CIConfigGuard = true
+				opts.CIConfigPaths = []string{"public"}
+			}
 			publish := func(a selectiveArtifact) error {
 				before := f.originRef("refs/uzi-checkpoints/" + s.Branch)
 				opts.Pack = selectiveArtifactPack(t, s, a)

@@ -109,6 +109,7 @@ func runAgentCheckpointBridge(t *testing.T, root, node, boundary string, iid int
 		// Match production's typed refusal tokens; service ownership/slot retry stays outside this bridge.
 		result, err := pushbroker.Publish(r.Context(), pushbroker.Options{
 			CloneURL: f.cloneURL(), Branch: branch, DefaultBranch: "main", DeclaredTip: tip, Pack: pack,
+			CIConfigGuard: true, CIConfigPaths: []string{".github/workflows/**"},
 		})
 		rec := bridgePublish{tip: tip, result: result}
 		resp := map[string]any{"published": true, "ref": ref}
