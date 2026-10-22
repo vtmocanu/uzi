@@ -1224,6 +1224,7 @@ tasks:
   test:uzi-watcher-backups:
     desc: hermetic tests of uzi-watcher live-clone/bare-ref backups, retention, detached loop and the label-sync create retry
     cmds:
+      - python3 -B ./.agents/skills/uzi-watcher/scripts/backup-directory.test.py
       - ./.agents/skills/uzi-watcher/scripts/backup-runs.test.sh
       - ./.agents/skills/uzi-watcher/scripts/backup-loop.test.sh
       - ./.agents/skills/uzi-watcher/scripts/create-run.test.sh
@@ -1273,6 +1274,7 @@ tasks:
       - ./.agents/skills/uzi-lander/scripts/takeover.test.sh
       - python3 -B ./.agents/skills/uzi-lander/scripts/takeover-timeout.test.py
       - ./.agents/skills/uzi-lander/scripts/takeover-mr-rework.test.sh
+      - python3 -B ./.agents/skills/uzi-lander/scripts/claims-atomic-lock.test.py
       - ./.agents/skills/uzi-lander/scripts/takeover-run-claim.test.sh
       - ./.agents/skills/uzi-lander/scripts/takeover-repo-fallback.test.sh
       - ./.agents/skills/uzi-lander/scripts/orphans.test.sh

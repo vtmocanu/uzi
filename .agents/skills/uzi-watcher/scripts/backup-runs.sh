@@ -144,10 +144,8 @@ mkdir -p "$OUTROOT"
 OUTROOT="$(cd "$OUTROOT" && pwd -P)" || exit 1
 RUNS=("$@")
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
-DEST="$OUTROOT/$TS"
-if ! mkdir "$DEST" 2>/dev/null; then
-  DEST="$(mktemp -d "$OUTROOT/${TS}.XXXXXX")" || exit 1
-fi
+# Reserve a unique snapshot directly; a CLI mkdir success can be non-exclusive.
+DEST="$(mktemp -d "$OUTROOT/${TS}.XXXXXX")" || exit 1
 LOG="$DEST/backup.log"
 log(){ printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$LOG"; }
 # UZI_CTX unset means the kubeconfig current-context, which is shared across sessions and
