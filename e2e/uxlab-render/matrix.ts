@@ -41,7 +41,7 @@ async function main() {
     return runRunner(runner.runnerCommand, command, args, { cwd,
       env: { PATH: runner.runnerPath(process.env), HOME: "/data/agent-home",
         TMPDIR: runner.runnerTmpdir(process.env) },
-      timeout, record });
+      timeout, record, killRunnerGroupOnly: runner.killRunnerGroupOnly });
   };
   assert.equal((await runAsRunner("/usr/bin/id", ["-u"])).stdout.trim(), "10002");
   const helpers: Record<string, string> = {};

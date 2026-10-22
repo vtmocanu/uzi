@@ -23,7 +23,8 @@ mount_args=()
 report_log() {
   tail -n "$1" "$log" | python3 -c 'import json, sys
 for line in sys.stdin:
-    print("FIXTURE_LOG=" + json.dumps(line.rstrip("\n"), ensure_ascii=True))'
+    text = line.rstrip("\n")
+    print("FIXTURE_LOG=" + json.dumps(text[:2048], ensure_ascii=True) + (" [truncated]" if len(text) > 2048 else ""))'
 }
 entrypoint=/usr/local/sbin/uzi-entrypoint
 bind_ro() {
