@@ -166,7 +166,7 @@ func (s *Service) probeLeaseClaim(admitted, rebound bool) {
 // (the next provisioning pass retries). Neither corrupts state, and there is no retry here. A lease-off service, a non-ephemeral worker or an unleased one passes the
 // no-lease params (NULL columns), where ClaimRun's lease arm admits nothing.
 func (s *Service) claimRunInTx(ctx context.Context, tx pgx.Tx, qtx *store.Queries, workerID uuid.UUID, reread store.Worker, params store.ClaimRunParams, report MemoryAuthorityReport) (store.Run, bool, error) {
-	params.ClaimantDraining = reread.DrainingSince.Valid || maintenancePending(reread)
+	params.ClaimantDraining = !store.WorkerAcceptsNewIntake(reread)
 	if reread.MaintenanceFenced {
 		return store.Run{}, false, nil
 	}
@@ -175,7 +175,7 @@ func (s *Service) claimRunInTx(ctx context.Context, tx pgx.Tx, qtx *store.Querie
 	params.MemoryAuthorityLost = params.Lane != "cross_check" && memoryAuthorityLost(reread.ProtocolCapabilities, report)
 	params.WorkerCaps = reread.Capabilities
 	params.WorkerIsolatedLane = reread.IsolatedLane
-	params.ClaimantDraining = reread.DrainingSince.Valid || maintenancePending(reread)
+	params.ClaimantDraining = !store.WorkerAcceptsNewIntake(reread)
 	params.IsEphemeral = reread.Ephemeral
 	params.EphemeralRunID = reread.EphemeralRunID
 	params.IsDockerWorker = reread.DockerEnabled.Valid && reread.DockerEnabled.Bool
@@ -195,7 +195,7 @@ func (s *Service) claimRunInTx(ctx context.Context, tx pgx.Tx, qtx *store.Querie
 	params.LeaseSince = reread.LeaseSince
 	params.LeaseRepoID = reread.LeaseRepoID
 	params.LeaseBranch = reread.LeaseBranch
-	params.ClaimantDraining = reread.DrainingSince.Valid || maintenancePending(reread)
+	params.ClaimantDraining = !store.WorkerAcceptsNewIntake(reread)
 	params.EphemeralRunID = reread.EphemeralRunID
 	at, err := s.claimLeaseAt(ctx, qtx)
 	if err != nil {
@@ -263,17 +263,20 @@ func (s *Service) claimRunLeasedNoSnapshot(ctx context.Context, wkr store.Worker
 			_ = tx.Rollback(ctx)
 		}
 	}()
-	if params.Lane == "cross_check" {
-		if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); err != nil {
-			return nil, err
-		}
+	if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); err != nil {
+		return nil, err
 	}
 	qtx := store.New(tx)
-	locked, err := qtx.GetWorkerForUpdate(ctx, wkr.ID)
+	_, err = qtx.GetWorkerForUpdate(ctx, wkr.ID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil // the worker row was deleted (reaper) since RequireWorker: idle
 		}
+		return nil, err
+	}
+	// A new statement sees any cordon committed while the worker lock was awaited.
+	locked, err := qtx.GetWorkerByID(ctx, wkr.ID)
+	if err != nil {
 		return nil, err
 	}
 	run, claimed, err := s.claimRunInTx(ctx, tx, qtx, wkr.ID, locked, params, report)

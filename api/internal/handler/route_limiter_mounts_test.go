@@ -618,6 +618,8 @@ var wantRouteMounts = []routeMount{
 	// Schedule edit (PRD #241 M4): owner-scoped DB update, no forge → noLimiter.
 	{"PATCH", "/api/schedules/{id}", noLimiter},
 	{"PATCH", "/api/workers/{id}", noLimiter},
+	{"POST", "/api/workers/{id}/cordon", noLimiter},
+	{"DELETE", "/api/workers/{id}/cordon", noLimiter},
 	// PRD #66 M8 (D8): admin per-repo guardrail override set — an admin-only,
 	// unscoped-by-id DB write, no forge call → noLimiter.
 	{"POST", "/api/admin/repos/{id}/guardrail-override", noLimiter},

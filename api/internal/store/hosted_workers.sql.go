@@ -109,7 +109,7 @@ func (q *Queries) CountHostedWorkersForUser(ctx context.Context, userID uuid.UUI
 const createEphemeralHostedWorker = `-- name: CreateEphemeralHostedWorker :one
 INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size, docker_enabled, ephemeral, ephemeral_run_id, anthropic_bind_mode, isolated_lane)
 VALUES ($1, $2, $3, $4, 'hosted', $5, $6, true, $7::uuid, $8, $9::boolean)
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason
 `
 
 type CreateEphemeralHostedWorkerParams struct {
@@ -230,6 +230,10 @@ func (q *Queries) CreateEphemeralHostedWorker(ctx context.Context, arg CreateEph
 		&i.RegisteredPodUid,
 		&i.RollHeartbeatAt,
 		&i.DrainingReason,
+		&i.ManualCordonedAt,
+		&i.ManualCordonedBy,
+		&i.ManualCordonedByLabel,
+		&i.ManualCordonReason,
 	)
 	return i, err
 }
@@ -237,7 +241,7 @@ func (q *Queries) CreateEphemeralHostedWorker(ctx context.Context, arg CreateEph
 const createHostedWorker = `-- name: CreateHostedWorker :one
 INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size, docker_enabled, anthropic_bind_mode)
 VALUES ($1, $2, $3, $4, 'hosted', $5, $6, $7)
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason
 `
 
 type CreateHostedWorkerParams struct {
@@ -356,6 +360,10 @@ func (q *Queries) CreateHostedWorker(ctx context.Context, arg CreateHostedWorker
 		&i.RegisteredPodUid,
 		&i.RollHeartbeatAt,
 		&i.DrainingReason,
+		&i.ManualCordonedAt,
+		&i.ManualCordonedBy,
+		&i.ManualCordonedByLabel,
+		&i.ManualCordonReason,
 	)
 	return i, err
 }
@@ -652,6 +660,8 @@ SELECT w.id,
        -- the timestamp also supports drain diagnostics and idempotent cordons.
        -- Busy drift and associated recycle wait indefinitely for idle, even on a plain drain.
        w.draining_since,
+       w.manual_cordoned_at,
+       (NOT fn_worker_accepts_new_intake(w))::boolean AS effective_cordoned,
        -- disk_pressure (PRD #837 M4): the ONE lifecycle reader of the display-only disk
        -- telemetry, allow-listed exactly like ReapEphemeralWorkers is for the uptime anchor. It
        -- is a DEBOUNCED, FRESHNESS-GATED derivation, never the raw sample:
@@ -730,6 +740,8 @@ type ListHostedWorkersForControllerRow struct {
 	DockerEnabled            pgtype.Bool        `json:"docker_enabled"`
 	Busy                     bool               `json:"busy"`
 	DrainingSince            pgtype.Timestamptz `json:"draining_since"`
+	ManualCordonedAt         pgtype.Timestamptz `json:"manual_cordoned_at"`
+	EffectiveCordoned        bool               `json:"effective_cordoned"`
 	DiskPressure             bool               `json:"disk_pressure"`
 	DiskPressureVolumes      []string           `json:"disk_pressure_volumes"`
 	MaintenanceID            pgtype.UUID        `json:"maintenance_id"`
@@ -791,6 +803,8 @@ func (q *Queries) ListHostedWorkersForController(ctx context.Context, arg ListHo
 			&i.DockerEnabled,
 			&i.Busy,
 			&i.DrainingSince,
+			&i.ManualCordonedAt,
+			&i.EffectiveCordoned,
 			&i.DiskPressure,
 			&i.DiskPressureVolumes,
 			&i.MaintenanceID,

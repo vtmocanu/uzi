@@ -29,6 +29,8 @@ func (h *Handler) mountWorkersRoutes(r chi.Router, hostedLimiter *mw.Limiter) {
 			// ownership check holding, which is why the composite FK enforces it in
 			// the schema too.
 			r.Patch("/{id}", h.PatchWorker)
+			r.Post("/{id}/cordon", h.CordonWorker)
+			r.Delete("/{id}/cordon", h.UncordonWorker)
 			// DELETE stays swapped: destroying a worker exfiltrates nothing and the
 			// loss is the owner's own. hostedLimiter runs AFTER RequireUser (B.4) and
 			// covers BOTH worker kinds (the middleware cannot see the row's kind).

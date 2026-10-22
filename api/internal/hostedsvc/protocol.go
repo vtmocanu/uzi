@@ -93,7 +93,9 @@ type DesiredWorker struct {
 	// supports independent NONDRIFTED maintenance timing and avoids repeat cordons;
 	// it cannot authorize busy drift replacement or timer-based release (#3103).
 	// It replaces M3's bool, which could say only y/n and not for-how-long.
-	DrainingSince *time.Time `json:"draining_since"`
+	DrainingSince     *time.Time `json:"draining_since"`
+	ManualCordonedAt  *time.Time `json:"manual_cordoned_at,omitempty"`
+	EffectiveCordoned bool       `json:"effective_cordoned,omitempty"`
 	// DiskPressure is true when the worker has self-reported a volume at/above the
 	// disk-pressure threshold on at least the last two consecutive fresh heartbeats
 	// (PRD #837 M4): the api derives it from a debounced streak counter

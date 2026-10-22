@@ -2356,6 +2356,12 @@ export interface WorkerRollPacing {
 }
 
 export interface Worker {
+  // Optional for compatibility with APIs predating manual owner cordons.
+  manual_cordoned_at?: string | null;
+  manual_cordoned_by?: string | null;
+  manual_cordoned_by_label?: string | null;
+  manual_cordon_reason?: string | null;
+  effective_cordoned?: boolean;
   // Omitted when absent, invalid or older than the API's independent receipt TTL.
   roll_pacing?: WorkerRollPacing;
   id: string;

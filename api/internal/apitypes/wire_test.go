@@ -873,6 +873,7 @@ func TestPipelineDTOTags(t *testing.T) {
 // workerDTOKeys is the WorkerDTO tag set (no omitempty fields). Shared by the
 // WorkerDTO pin and the AdminWorkerDTO embed pin.
 var workerDTOKeys = []string{
+	"manual_cordoned_at", "manual_cordoned_by", "manual_cordoned_by_label", "manual_cordon_reason", "effective_cordoned",
 	"id", "name", "status", "kind", "hosted_size", "docker",
 	// PRD #529: marks an auto-provisioned, run-bound throwaway hosted worker; display-only,
 	// always false for an external or a standing hosted worker.

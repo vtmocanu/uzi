@@ -3392,7 +3392,7 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		// PRD #1030 M2: a draining claimant is scoped to its own promoted run (see the
 		// drain gate above and the `NOT @claimant_draining OR r.worker_id = @worker_id`
 		// clause in ClaimRun). A non-draining worker passes false — a no-op.
-		ClaimantDraining: wkr.DrainingSince.Valid,
+		ClaimantDraining: !store.WorkerAcceptsNewIntake(wkr),
 		// PRD #1296 M1 (D2/D3/D4): the durable-recovery claim/custody contract.
 		//   - CustodyHoldLimit gates admission: a claim is blocked once the owner holds
 		//     >= the custody_hold_limit setting's admission-counted open holds (ADR-2445;
@@ -3453,10 +3453,8 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 			_ = tx.Rollback(ctx)
 		}
 	}()
-	if lane == "cross_check" {
-		if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); err != nil {
-			return nil, err
-		}
+	if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); err != nil {
+		return nil, err
 	}
 	qtx := store.New(tx)
 	// (a) Lock the worker row FIRST — the canonical order shared with Register, Heartbeat and the
