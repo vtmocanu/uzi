@@ -10,7 +10,7 @@ import type { Executor } from "../src/executor.js";
 import type { BoundaryRequest, BoundaryPermit } from "../src/harness.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
-import { nullLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
+import { nullLogger, recordingLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith, worktreeDirFor } from "./runner-harness.js";
 
 installHarness();
@@ -222,6 +222,74 @@ describe("recovery capture retry and restart safety (#1197)", () => {
       assert.equal(publications, 0);
       assert.ok(fs.existsSync(fixture.clone()), "shutdown retains the unsettled source");
       assert.ok(fs.existsSync(path.join(fixture.runHome, "session")));
+    });
+  }
+
+  for (const poison of ["false", "throw"] as const) {
+    it(`Claude recovery settlement diagnostic retries and recovers (${poison})`, { timeout: 60_000 }, async t => {
+      const mask = process.umask(0o022);
+      t.after(() => { process.umask(mask); });
+      const { gitlab } = fakeGitlab();
+      const claim = gitlabClaim(1398, { claim_generation: 1 });
+      const fixture = factoryFor(claim);
+      const log = recordingLogger();
+      let released = false, iterations = 0, settlements = 0;
+      let captures = 0, publications = 0;
+      const marker = git.commitWipMarker.bind(git);
+      t.mock.method(git, "commitWipMarker", async (...args: Parameters<typeof marker>) => {
+        captures++; return marker(...args);
+      });
+      const publish = client.publishCheckpoint.bind(client);
+      t.mock.method(client, "publishCheckpoint", async (...args: Parameters<typeof publish>) => {
+        publications++; return publish(...args);
+      });
+      const factory: ExecutorFactory = (...args) => {
+        const made = fixture.factory(...args);
+        assert.equal(made.executor.safety, undefined);
+        assert.equal(made.executor.withCredentialFreeCapture, undefined);
+        made.executor.settleWorkerCommands = async () => {
+          if (fixture.calls() === 0) return { confirmed: true };
+          settlements++;
+          if (released) return { confirmed: true };
+          if (poison === "throw") throw new Error("poisoned Claude command settlement");
+          return { confirmed: false };
+        };
+        return made;
+      };
+      const runner = runnerWith(factory, gitlab, undefined, log.logger, { recoveryRetryMs: 1, checkpointIntervalMs: 0 });
+      const owner = runner as unknown as { waitRecoveryRetry(): Promise<void> };
+      const warning = "credential recovery park: the execution did not settle; retaining work and retrying";
+      const notice = "Waiting for this run's processes to stop before saving its work; keeping the local work and session and retrying.";
+      t.mock.method(owner, "waitRecoveryRetry", async () => {
+        iterations++;
+        assert.ok(iterations <= 7, "settlement release must permit recovery on the next iteration");
+        const warnings = log.lines.filter(line => (line as { msg?: string }).msg === warning);
+        assert.equal(warnings.length, iterations, "one diagnostic for each incomplete retry, excluding preamble settles");
+        for (const line of warnings) {
+          const record = line as { level: string; run_id: string; errors: string[] };
+          assert.equal(record.level, "warn");
+          assert.equal(record.run_id, claim.run_id);
+          assert.deepEqual(record.errors, ["protocol"], "false and throw normalize in category order");
+        }
+        assert.equal(api.messages(claim.run_id).filter(m => m.kind === "status" && m.payload.text === notice).length, 1);
+        assert.deepEqual({ captures, publications }, { captures: 0, publications: 0 });
+        assert.equal(api.states.some(s => ["recovery_wait", "failed"].includes(s.body.status)), false);
+        assert.equal(fixture.calls(), 1);
+        assert.equal(fs.readFileSync(path.join(fixture.clone(), "ONLY_COPY.txt"), "utf8"), "must survive recovery\n");
+        assert.equal(fs.readFileSync(path.join(fixture.runHome, "session"), "utf8"), "transcript");
+        if (iterations === 7) released = true;
+      });
+      try {
+        assert.equal(claim.secrets.codex, undefined);
+        await runner.execute(claim);
+        assert.equal(iterations, 7, "incomplete settlement survives beyond the old five-proof threshold");
+        assert.ok(settlements >= iterations);
+        assert.equal(fixture.calls(), 1);
+        assert.ok(captures > 0 && publications > 0, "released settlement reaches real capture and publication");
+        assert.equal(api.states.filter(s => s.body.status === "recovery_wait").length, 1);
+        assert.equal(api.states.some(s => s.body.status === "failed"), false);
+        assert.equal(api.messages(claim.run_id).filter(m => m.kind === "status" && m.payload.text === notice).length, 1);
+      } finally { runner.shutdown(); process.umask(mask); }
     });
   }
 
