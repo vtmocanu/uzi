@@ -21,10 +21,10 @@ for(const variant of ["accepted","guarded","failed"] as const) it(`A public tail
  client.reportState=async(...args)=>{const r=await report(...args);if(args[1].status==="paused")ack=true;return r;};
  const publish=client.publishCheckpoint.bind(client);
  if(failed)client.publishCheckpoint=async(...args)=>{await publish(...args);return {ok:false,httpStatus:400};};
- const tip=git.branchTip.bind(git),undo=git.undoWipMarker.bind(git),pin=RecoveryCoordinator.prototype.pin;
+ const tip=git.branchTip.bind(git),undo=git.undoWipMarkerOnBranch.bind(git),pin=RecoveryCoordinator.prototype.pin;
  git.branchTip=async(...args)=>{const r=await tip(...args);if(ack&&!pauseReturned){await tick();events.push({kind:"restore-head-return",active:o.isActive(),head:r});}return r;};
  RecoveryCoordinator.prototype.pin=async function(...args){const r=await pin.apply(this,args);if(ack&&!pauseReturned){await tick();events.push({kind:"pin-return",active:o.isActive(),head:args[0].sourceSha,record:!!r});}return r;};
- git.undoWipMarker=async(...args)=>{events.push({kind:"undo-entry",active:o.isActive()});const r=await undo(...args);await tick();events.push({kind:"undo-return",active:o.isActive(),bytes:fs.readFileSync(path.join(args[0],"PUBLIC.txt"),"utf8"),status:cmd(args[0],["status","--porcelain"])});return r;};
+ git.undoWipMarkerOnBranch=async(...args)=>{events.push({kind:"undo-entry",active:o.isActive()});const r=await undo(...args);await tick();events.push({kind:"undo-return",active:o.isActive(),bytes:fs.readFileSync(path.join(args[0],"PUBLIC.txt"),"utf8"),status:cmd(args[0],["status","--porcelain"])});return r;};
  const claim={...gitlabClaim(2852),claim_generation:1,park_run_supported:true,...(variant==="guarded"?{inventory_guarded:true}:{})};
  const freeze=RecoveryCoordinator.prototype.freezeInventory,upload=RecoveryCoordinator.prototype.captureAndUpload;
  let server:ReturnType<typeof heldServer>|undefined;
@@ -57,7 +57,7 @@ for(const variant of ["accepted","guarded","failed"] as const) it(`A public tail
    assert.ok(events.every(x=>x.active),"accepted pause remains held through actual head and pin returns");
   }
   o.assertProof(true,!failed);
- }finally{git.branchTip=tip;git.undoWipMarker=undo;RecoveryCoordinator.prototype.pin=pin;RecoveryCoordinator.prototype.freezeInventory=freeze;RecoveryCoordinator.prototype.captureAndUpload=upload;o.restore();}
+ }finally{git.branchTip=tip;git.undoWipMarkerOnBranch=undo;RecoveryCoordinator.prototype.pin=pin;RecoveryCoordinator.prototype.freezeInventory=freeze;RecoveryCoordinator.prototype.captureAndUpload=upload;o.restore();}
 });
 for(const branch of ["unrelated","moved"] as const)it(`A public tail actual Git gate ${branch} postcheck refusal`,async()=>{
  const o=observe();const post:any[]=[];let refusal:unknown;let verdict:unknown;let clone="";
