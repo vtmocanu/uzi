@@ -59,16 +59,32 @@ seeds AS (
    OR (r.kind = 'ci_fix' AND s.id <> r.id AND s.user_id = r.user_id AND s.repo_id = r.repo_id
     AND s.kind IN ('issue','prompt','self_improve','mr_rework')
     AND (s.branch = r.pipeline_ref OR (s.kind = 'mr_rework' AND s.pipeline_ref = r.pipeline_ref)))
-  ORDER BY s.id LIMIT 65
  ) a ON true
 ),
 walk AS (
- SELECT s.id, s.id AS seed, 0 AS depth, ARRAY[s.id] AS path, false AS cycle FROM seeds s
- UNION ALL
- SELECT n.id, w.seed, w.depth + 1, w.path || n.id, n.id = ANY(w.path)
+ SELECT s.id, 0 AS depth FROM seeds s
+ UNION
+ SELECT n.id, w.depth + 1
  FROM walk w JOIN runs p ON p.id = w.id
  JOIN runs n ON n.id = p.target_run_id
- WHERE p.kind = 'mr_rework' AND w.depth < 16 AND NOT w.cycle
+ WHERE p.kind = 'mr_rework' AND w.depth < 16
+),
+summary AS (
+ SELECT
+ COALESCE(bool_or(w.depth >= 16 OR (a.kind = 'mr_rework' AND
+  (a.pipeline_ref IS DISTINCT FROM r.pipeline_ref OR
+   (a.branch IS NOT NULL AND a.branch IS DISTINCT FROM r.pipeline_ref) OR
+   n.id IS NULL OR w.depth = 15))), false) AS ancestry_unknown,
+ COALESCE(bool_or(a.user_id IS DISTINCT FROM r.user_id OR a.repo_id IS DISTINCT FROM r.repo_id OR
+  a.mr_iid IS NULL OR a.mr_iid <= 0 OR a.mr_iid > 9007199254740991 OR
+  (a.kind <> 'mr_rework' AND a.branch IS DISTINCT FROM r.pipeline_ref) OR
+  (a.kind = 'mr_rework' AND n.id IS NOT NULL AND a.mr_iid IS DISTINCT FROM n.mr_iid)), false) AS association_unknown
+ FROM walk w JOIN runs a ON a.id = w.id CROSS JOIN request r
+ LEFT JOIN runs n ON n.id = a.target_run_id
+),
+roots AS (
+ SELECT DISTINCT a.id FROM walk w JOIN runs a ON a.id = w.id
+ WHERE a.kind <> 'mr_rework' ORDER BY a.id LIMIT 2
 ),
 authority AS NOT MATERIALIZED (
  SELECT id, user_id, repo_id, worker_id, kind, status, claim_generation, claim_released_at,
@@ -84,8 +100,10 @@ SELECT jsonb_build_object(
  'request', (SELECT to_jsonb(a) FROM authority a WHERE a.id = r.id),
  'connection_id', c.id, 'project_id', p.forge_project_id, 'forge_type', c.forge_type,
  'base_url', c.base_url, 'token_ciphertext', encode(c.token_ciphertext, 'base64'),
- 'nodes', COALESCE((SELECT jsonb_agg(jsonb_build_object('run', to_jsonb(a), 'seed', w.seed, 'depth', w.depth, 'cycle', w.cycle)
- ORDER BY w.seed, w.depth) FROM walk w JOIN authority a ON a.id = w.id), '[]'::jsonb),
+ 'nodes', COALESCE((SELECT jsonb_agg(jsonb_build_object('run', to_jsonb(a), 'seed', a.id, 'depth', 0, 'cycle', false)
+ ORDER BY a.id) FROM roots z JOIN authority a ON a.id = z.id), '[]'::jsonb),
+ 'ancestry_unknown', (SELECT ancestry_unknown FROM summary),
+ 'association_unknown', (SELECT association_unknown FROM summary),
  'ci_mr_conflict', EXISTS (
  SELECT 1 FROM runs x WHERE r.kind = 'ci_fix' AND x.user_id = r.user_id AND x.repo_id = r.repo_id
  AND x.branch = r.pipeline_ref AND x.mr_iid IS NOT NULL
@@ -102,7 +120,8 @@ type PublicationContextSnapshotParams struct {
 }
 
 // One READ COMMITTED statement observes every root and every authority field again
-// after the forge barrier. Enumeration is at most 65 seeds times 17 ancestry rows.
+// after the forge barrier. Inspect every association; return at most two distinct roots.
+// UNION deduplicates shared ancestors at each depth; no authority JSON rides the walk.
 func (q *Queries) PublicationContextSnapshot(ctx context.Context, arg PublicationContextSnapshotParams) ([]byte, error) {
 	row := q.db.QueryRow(ctx, publicationContextSnapshot, arg.RunID, arg.UserID)
 	var snapshot []byte

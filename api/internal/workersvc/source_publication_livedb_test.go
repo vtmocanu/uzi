@@ -123,10 +123,18 @@ func TestSourcePublicationCompletionLiveDB(t *testing.T) {
 
 func TestSourcePublicationRefusalsLiveDB(t *testing.T) {
 	for _, permit := range []bool{false, true} {
-		for _, state := range []string{"zero", "stale", "released", "terminal_absent", "failed", "malformed_contract", "missing_tx"} {
+		for _, state := range []string{"zero", "missing_report_generation", "zero_report_generation", "negative_report_generation", "stale", "released", "terminal_absent", "failed", "malformed_contract", "missing_tx"} {
 			t.Run(fmt.Sprintf("permit=%t/%s", permit, state), func(t *testing.T) {
 				f := seedSourcePublication(t, permit)
 				switch state {
+				case "missing_report_generation":
+					f.req.ClaimGeneration = nil
+				case "zero_report_generation", "negative_report_generation":
+					generation := int64(0)
+					if state == "negative_report_generation" {
+						generation = -1
+					}
+					f.req.ClaimGeneration = &generation
 				case "zero":
 					f.e.exec(t, "UPDATE runs SET claim_generation=0 WHERE id=$1", f.id)
 				case "stale":
@@ -174,10 +182,8 @@ func (tx sourceCommitTx) Commit(ctx context.Context) error {
 		if err := tx.Tx.Commit(ctx); err != nil {
 			return err
 		}
-	} else {
-		if err := tx.Tx.Rollback(ctx); err != nil {
-			return err
-		}
+	} else if err := tx.Rollback(ctx); err != nil {
+		return err
 	}
 	return errors.New("injected commit acknowledgement failure")
 }

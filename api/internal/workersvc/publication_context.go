@@ -70,14 +70,16 @@ type publicationNode struct {
 	Cycle bool                 `json:"cycle"`
 }
 type publicationSnapshot struct {
-	Request         publicationAuthority `json:"request"`
-	ConnectionID    *uuid.UUID           `json:"connection_id"`
-	ProjectID       int64                `json:"project_id"`
-	ForgeType       string               `json:"forge_type"`
-	BaseURL         string               `json:"base_url"`
-	TokenCiphertext []byte               `json:"token_ciphertext"`
-	Nodes           []publicationNode    `json:"nodes"`
-	CIMRConflict    bool                 `json:"ci_mr_conflict"`
+	Request            publicationAuthority `json:"request"`
+	ConnectionID       *uuid.UUID           `json:"connection_id"`
+	ProjectID          int64                `json:"project_id"`
+	ForgeType          string               `json:"forge_type"`
+	BaseURL            string               `json:"base_url"`
+	TokenCiphertext    []byte               `json:"token_ciphertext"`
+	Nodes              []publicationNode    `json:"nodes"`
+	AncestryUnknown    bool                 `json:"ancestry_unknown"`
+	AssociationUnknown bool                 `json:"association_unknown"`
+	CIMRConflict       bool                 `json:"ci_mr_conflict"`
 }
 
 func publicationUnknown(reason string) PublicationContextResponse {
@@ -129,7 +131,10 @@ func resolvePublicationSnapshot(s publicationSnapshot, w store.Worker, id uuid.U
 	if !publicationLive(s.Request, w, id, req) {
 		return publicationUnknown("claim_changed")
 	}
-	if s.ConnectionID == nil || !publicationSafeID(s.ProjectID) || s.CIMRConflict {
+	if s.AncestryUnknown {
+		return publicationUnknown("ancestry_unknown")
+	}
+	if s.ConnectionID == nil || !publicationSafeID(s.ProjectID) || s.CIMRConflict || s.AssociationUnknown {
 		return publicationUnknown("association_unknown")
 	}
 	seeds := map[uuid.UUID]bool{}
@@ -154,7 +159,7 @@ func resolvePublicationSnapshot(s publicationSnapshot, w store.Worker, id uuid.U
 		}
 		nodes[a.ID] = a
 	}
-	if len(seeds) == 0 || len(seeds) > 64 {
+	if len(seeds) == 0 {
 		return publicationUnknown("association_unknown")
 	}
 	roots := map[uuid.UUID]publicationAuthority{}

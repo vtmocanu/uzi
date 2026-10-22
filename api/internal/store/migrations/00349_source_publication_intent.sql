@@ -18,9 +18,10 @@ ALTER TABLE runs ADD CONSTRAINT runs_source_publication_intent_check CHECK (
  AND jsonb_typeof(source_publication_intent->'published_head') = 'string'
  AND (source_publication_intent->>'published_head') ~ '^[0-9a-fA-F]{40}$'
  AND jsonb_typeof(source_publication_intent->'reported_non_closing') = 'boolean'
+ AND jsonb_typeof(source_publication_intent->'intent') = 'string'
  AND source_publication_intent->>'intent' IN ('closing','non_closing')
  AND (source_publication_intent->'reported_non_closing' = 'false'::jsonb OR source_publication_intent->>'intent' = 'non_closing')
- ));
+ ) IS TRUE) NOT VALID;
 -- +goose StatementBegin
 CREATE FUNCTION guard_source_publication_intent() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN

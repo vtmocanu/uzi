@@ -4668,6 +4668,14 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		// Locked and current: the arms below mutate through the tx, and the lock is held
 		// until the post-mutation commit, so no ClaimRun/release can interleave. Use the
 		// freshly-locked snapshot for the arm's own reads of the run row.
+		if req.SourcePublication != nil && locked.Status == "completed" {
+			if !sourcePublicationIdentity(locked, req) {
+				return locked, false, ErrInvalidState
+			}
+			// The first report already settled this run. The outer report layer
+			// verifies recovery receipts after the deferred rollback releases locks.
+			return locked, true, nil
+		}
 		if err := validateSourcePublicationLive(locked, wkr, req); err != nil {
 			return locked, false, err
 		}

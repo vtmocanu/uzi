@@ -1,16 +1,19 @@
 package workersvc
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 func TestSourcePublicationAdmissionRaceLiveDB(t *testing.T) {
@@ -95,35 +98,43 @@ func TestSourcePublicationAdmissionRaceLiveDB(t *testing.T) {
 	}
 }
 
-type sourceStampFailureBeginner struct{ TxBeginner }
-type sourceStampFailureTx struct{ pgx.Tx }
+type sourceStampFailureBeginner struct {
+	TxBeginner
+	statement string
+}
+type sourceStampFailureTx struct {
+	pgx.Tx
+	statement string
+}
 
 func (b sourceStampFailureBeginner) Begin(ctx context.Context) (pgx.Tx, error) {
 	tx, err := b.TxBeginner.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return sourceStampFailureTx{tx}, nil
+	return sourceStampFailureTx{tx, b.statement}, nil
 }
 func (tx sourceStampFailureTx) Exec(ctx context.Context, query string, args ...any) (pgconn.CommandTag, error) {
-	if strings.Contains(query, "-- name: BindSourcePublicationIntent ") {
-		return pgconn.CommandTag{}, errors.New("injected source stamp write failure")
+	if strings.Contains(query, "-- name: "+tx.statement+" ") {
+		return pgconn.CommandTag{}, fmt.Errorf("injected %s write failure", tx.statement)
 	}
 	return tx.Tx.Exec(ctx, query, args...)
 }
 
 func TestSourcePublicationStampFailureLiveDB(t *testing.T) {
 	for _, permit := range []bool{false, true} {
-		t.Run(fmt.Sprint("permit=", permit), func(t *testing.T) {
-			f := seedSourcePublication(t, permit)
-			f.svc.SetTxBeginner(sourceStampFailureBeginner{f.e.pool})
-			result, err := f.svc.SetStateReportWithReconciliation(f.e.ctx, f.w, f.id, f.req)
-			status, stamp, consumed := f.stored(t)
-			if err == nil || !strings.Contains(err.Error(), "injected source stamp write failure") || result.Applied ||
-				status != "running" || len(stamp) != 0 || consumed {
-				t.Fatalf("stamp failure unpaired completion: %+v %v status=%s stamp=%s consumed=%t", result, err, status, stamp, consumed)
-			}
-		})
+		for _, statement := range []string{"BindSourcePublicationIntent", "SetRunCompleted"} {
+			t.Run(fmt.Sprintf("permit=%t/%s", permit, statement), func(t *testing.T) {
+				f := seedSourcePublication(t, permit)
+				f.svc.SetTxBeginner(sourceStampFailureBeginner{f.e.pool, statement})
+				result, err := f.svc.SetStateReportWithReconciliation(f.e.ctx, f.w, f.id, f.req)
+				status, stamp, consumed := f.stored(t)
+				if err == nil || !strings.Contains(err.Error(), "injected "+statement+" write failure") || result.Applied ||
+					status != "running" || len(stamp) != 0 || consumed {
+					t.Fatalf("write failure unpaired completion: %+v %v status=%s stamp=%s consumed=%t", result, err, status, stamp, consumed)
+				}
+			})
+		}
 	}
 }
 
@@ -165,5 +176,140 @@ func TestSourcePublicationAbsentProofReplayLiveDB(t *testing.T) {
 				t.Fatalf("receipt manufactured proof: %+v %v stamp=%s", replay, err, stamp)
 			}
 		})
+	}
+}
+
+// Both transactions open after their unlocked reads while the source is running.
+// Each waits on an explicit release; the test completes the first before releasing
+// the second. Context cancellation bounds every wait and joins both sessions.
+type sourceOverlapBeginner struct {
+	TxBeginner
+	next    atomic.Int32
+	arrived chan int
+	release [2]chan struct{}
+	writes  atomic.Int32
+}
+type sourceOverlapTx struct {
+	pgx.Tx
+	owner *sourceOverlapBeginner
+}
+
+func (b *sourceOverlapBeginner) Begin(ctx context.Context) (pgx.Tx, error) {
+	tx, err := b.TxBeginner.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	n := int(b.next.Add(1)) - 1
+	if n >= 2 {
+		return sourceOverlapTx{tx, b}, nil
+	}
+	select {
+	case b.arrived <- n:
+	case <-ctx.Done():
+		_ = tx.Rollback(context.Background())
+		return nil, ctx.Err()
+	}
+	select {
+	case <-b.release[n]:
+		return sourceOverlapTx{tx, b}, nil
+	case <-ctx.Done():
+		_ = tx.Rollback(context.Background())
+		return nil, ctx.Err()
+	}
+}
+func (tx sourceOverlapTx) Exec(ctx context.Context, query string, args ...any) (pgconn.CommandTag, error) {
+	if !strings.HasPrefix(query, "SET TRANSACTION") {
+		tx.owner.writes.Add(1)
+	}
+	return tx.Tx.Exec(ctx, query, args...)
+}
+
+type sourceOverlapStore struct {
+	Store
+	settlements atomic.Int32
+}
+
+func (q *sourceOverlapStore) SettleScopeInputDisposition(ctx context.Context, p store.SettleScopeInputDispositionParams) (int64, error) {
+	q.settlements.Add(1)
+	return q.Store.SettleScopeInputDisposition(ctx, p)
+}
+func TestSourcePublicationOverlappingReportsLiveDB(t *testing.T) {
+	for _, permit := range []bool{false, true} {
+		for _, conflict := range []bool{false, true} {
+			t.Run(fmt.Sprintf("permit=%t/conflict=%t", permit, conflict), func(t *testing.T) {
+				f := seedSourcePublication(t, permit)
+				if !permit {
+					f.e.exec(t, "UPDATE runs SET milestones_frozen=$2,milestones_completed=$3 WHERE id=$1", f.id, frozenJSON(t, "m1"), idsJSON(t, "m1"))
+				}
+				if _, err := f.svc.SubmitInput(f.e.ctx, f.w.UserID, f.id, "scope", "100", nil); err != nil {
+					t.Fatal(err)
+				}
+				tracked := &sourceOverlapStore{Store: f.svc.q}
+				f.svc.q = tracked
+				ctx, cancel := context.WithTimeout(f.e.ctx, 20*time.Second)
+				defer cancel()
+				b := &sourceOverlapBeginner{TxBeginner: f.e.pool, arrived: make(chan int, 2), release: [2]chan struct{}{make(chan struct{}), make(chan struct{})}}
+				f.svc.SetTxBeginner(b)
+				type outcome struct {
+					r   StateReportResult
+					err error
+				}
+				first, second := make(chan outcome, 1), make(chan outcome, 1)
+				joinedFirst, joinedSecond, startedSecond := false, false, false
+				defer func() {
+					cancel()
+					if !joinedFirst {
+						<-first
+					}
+					if startedSecond && !joinedSecond {
+						<-second
+					}
+				}()
+				go func() { r, e := f.svc.SetStateReportWithReconciliation(ctx, f.w, f.id, f.req); first <- outcome{r, e} }()
+				select {
+				case <-b.arrived:
+				case <-ctx.Done():
+					t.Fatal(ctx.Err())
+				}
+				other := f.req
+				report := *other.SourcePublication
+				other.SourcePublication = &report
+				if conflict {
+					report.NonClosing = true
+				}
+				startedSecond = true
+				go func() { r, e := f.svc.SetStateReportWithReconciliation(ctx, f.w, f.id, other); second <- outcome{r, e} }()
+				select {
+				case <-b.arrived:
+				case <-ctx.Done():
+					t.Fatal(ctx.Err())
+				}
+				close(b.release[0])
+				a := <-first
+				joinedFirst = true
+				if a.err != nil || !a.r.Applied {
+					t.Fatalf("first: %+v %v", a.r, a.err)
+				}
+				_, before, spentBefore := f.stored(t)
+				writes := b.writes.Load()
+				if tracked.settlements.Load() != 1 {
+					t.Fatalf("first settlement calls=%d", tracked.settlements.Load())
+				}
+				close(b.release[1])
+				z := <-second
+				joinedSecond = true
+				_, after, spentAfter := f.stored(t)
+				if conflict {
+					if z.err == nil || z.r.Applied {
+						t.Fatalf("conflict accepted: %+v %v", z.r, z.err)
+					}
+				} else if z.err != nil || !z.r.Applied {
+					t.Fatalf("identical replay refused: %+v %v", z.r, z.err)
+				}
+				if !bytes.Equal(before, after) || spentBefore != spentAfter || b.writes.Load() != writes || tracked.settlements.Load() != 1 {
+					t.Fatalf("replay wrote stamp/settlement: writes %d->%d consumed %t->%t", writes, b.writes.Load(), spentBefore, spentAfter)
+				}
+			})
+		}
 	}
 }

@@ -158,40 +158,8 @@ func sourcePublicationRestriction(run store.Run, appliedCap bool) (bool, error) 
 		if err != nil || ms == nil {
 			return restricted, ErrSemanticCompletionAuthority
 		}
-		members := map[string]bool{}
-		for _, m := range ms {
-			if m.ID == "" || members[m.ID] {
-				return restricted, ErrSemanticCompletionAuthority
-			}
-			members[m.ID] = true
-		}
-		criteria := map[string]bool{}
-		for _, cr := range c.Criteria {
-			if !members[cr.MilestoneID] || criteria[cr.MilestoneID] || cr.ID != cr.MilestoneID+".c1" {
-				return restricted, ErrSemanticCompletionAuthority
-			}
-			criteria[cr.MilestoneID] = true
-		}
-		if len(criteria) != len(members) {
+		if _, valid := structuralAuthority(run, ms); !valid {
 			return restricted, ErrSemanticCompletionAuthority
-		}
-		if c.Scope != nil {
-			partition := map[string]bool{}
-			for _, id := range c.Scope.In {
-				if !members[id] || partition[id] {
-					return restricted, ErrSemanticCompletionAuthority
-				}
-				partition[id] = true
-			}
-			for _, d := range c.Scope.Out {
-				if !members[d.MilestoneID] || partition[d.MilestoneID] || d.Reason == "" || d.Revision < 1 || d.Revision > c.Revision {
-					return restricted, ErrSemanticCompletionAuthority
-				}
-				partition[d.MilestoneID] = true
-			}
-			if len(partition) != len(members) {
-				return restricted, ErrSemanticCompletionAuthority
-			}
 		}
 	}
 	pending, err := completionPendingFromContract(run, c)
