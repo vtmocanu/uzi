@@ -18042,9 +18042,6 @@ export class RunRunner {
       if (attempt < COMPLETION_HOLD_CAPTURE_ATTEMPTS - 1) await this.waitRecoveryRetry(flight);
     }
     checkCancellation();
-    if (flight.active?.shuttingDown) {
-      throw new DataVolumeWaitShutdown("completion hold");
-    }
     if ((!captured || captured.head === null) && options.allowDegradedCapture) {
       runLog.warn("completion hold: capture exhausted; retaining live clone and requesting an empty-head hold", { run_id: flight.runId });
       captured = { verified: false, published: false, mode: "same_worker_only", head: "" };
