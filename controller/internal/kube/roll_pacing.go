@@ -124,7 +124,7 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 	}
 	// Account for drained held workers using the newer pod snapshot before any
 	// ordinary admission can count them as serving coverage.
-	m.prepareMigrationDrains(t, desired, observed)
+	m.prepareMigrationDrains(ctx, t, desired, observed)
 	// Retire completed history only after every participant has been cleaned up.
 	// Do this before grouping so a new pin uses the current API capability set.
 	for _, e := range t.entries {

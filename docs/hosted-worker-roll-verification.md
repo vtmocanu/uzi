@@ -223,7 +223,13 @@ operational limits, not results from executing this hosted procedure.
   Re-registration clears an image-roll drain unless maintenance retains it;
   registration and poll/write failures can
   allow claims before re-drain. Failed writes retain uncertainty until evidence
-  resolves it, but this is process-local and lost on restart.
+  resolves it, but this is process-local and lost on restart. If a worker is
+  removed from the full desired inventory, its pending drain continues to fence
+  the owner/lane while cluster objects remain observed. Once its observation is
+  absent, a separate complete pod list in the original lane must also confirm
+  that no managed pod for that worker remains before the pending fence retires.
+  Failed or incomplete pod lists retain uncertainty; teardown alone is not proof
+  that every pod has disappeared.
 - A timeout does not cancel a server write. An earlier delayed cordon may commit
   **after an explicit undrained poll**, even after another selection, leaving
   multiple held workers physically drained. The accepted controller-only scope

@@ -671,3 +671,162 @@ func TestMigrationDrainOrdinaryUnconfirmed(t *testing.T) {
 		})
 	}
 }
+
+func TestMigrationDrainPendingRemovedWorkerRetirement(t *testing.T) {
+	for _, work := range []string{"migration", "ordinary"} {
+		t.Run(work, func(t *testing.T) {
+			ctx := context.Background()
+			f, ws, c := migrationFixture(t, migrationHeldOpt("a"), migrationHeldOpt("b"), migrationHeldOpt("c"))
+			p := &migrationPoller{workers: ws}
+			o := &migrationObserver{Materializer: f.m}
+			l := reconcile.New(p, o, nil, time.Second, "1.0.0", f.m.log)
+			c.fail = true
+			if err := l.Tick(ctx); err == nil {
+				t.Fatal("failed cordon did not report uncertainty")
+			}
+			if !reflect.DeepEqual(c.calls, []string{"a"}) {
+				t.Fatalf("initial cordon = %v", c.calls)
+			}
+			frozen, pending := f.m.migrationPending["a"]
+			if !pending {
+				t.Fatal("failed cordon did not retain pending entry")
+			}
+			c.fail = false
+			p.workers = ws[1:]
+			if work == "ordinary" {
+				ws[1].CustodyHeld = false
+			}
+			assertRetained := func(stage string) {
+				t.Helper()
+				if got, ok := f.m.migrationPending["a"]; !ok || !reflect.DeepEqual(got, frozen) {
+					t.Fatalf("%s: pending coverage changed: %+v, present=%v", stage, got, ok)
+				}
+				if !reflect.DeepEqual(c.calls, []string{"a"}) || lmRolled(t, f, "b") {
+					t.Fatalf("%s: same owner/lane work crossed fence: drains=%v rolled=%v",
+						stage, c.calls, lmRolled(t, f, "b"))
+				}
+			}
+			failTeardown := true
+			f.client.PrependReactor("delete", "deployments", func(a k8stesting.Action) (bool, runtime.Object, error) {
+				if failTeardown && a.(k8stesting.DeleteAction).GetName() == deploymentName("a") {
+					return true, nil, errors.New("teardown unavailable")
+				}
+				return false, nil, nil
+			})
+			if err := l.Tick(ctx); err == nil {
+				t.Fatal("failed teardown was not reported")
+			}
+			assertRetained("failed teardown")
+			failTeardown = false
+			if err := l.Tick(ctx); err != nil {
+				t.Fatal(err)
+			}
+			assertRetained("successful teardown with remaining pod")
+			// Fake deletion, like asynchronous Kubernetes GC, leaves the pod behind.
+			// Hide the observation too: the fresh verification must still find it.
+			o.hiddenID = "a"
+			for _, phase := range []corev1.PodPhase{corev1.PodRunning, corev1.PodSucceeded, corev1.PodFailed} {
+				pod, err := f.client.CoreV1().Pods(lmNS()).Get(ctx, "pod-a", metav1.GetOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				pod.Status.Phase = phase
+				if phase == corev1.PodFailed {
+					at := metav1.NewTime(m5Now)
+					pod.DeletionTimestamp = &at
+				}
+				if _, err := f.client.CoreV1().Pods(lmNS()).Update(ctx, pod, metav1.UpdateOptions{}); err != nil {
+					t.Fatal(err)
+				}
+				if err := l.Tick(ctx); err != nil {
+					t.Fatal(err)
+				}
+				assertRetained("hidden " + string(phase) + " pod")
+			}
+			if err := f.client.CoreV1().Pods(lmNS()).Delete(ctx, "pod-a", metav1.DeleteOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			o.hiddenID = ""
+			mode := ""
+			pages := 0
+			f.client.PrependReactor("list", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
+				if a.GetNamespace() != lmNS() || mode == "" {
+					return false, nil, nil
+				}
+				options := a.(k8stesting.ListActionImpl).GetListOptions()
+				if options.LabelSelector != "" || options.FieldSelector != "" {
+					t.Fatal("absence verification selected pods")
+				}
+				if mode == "error" {
+					return true, nil, errors.New("pod list unavailable")
+				}
+				if options.Limit == 0 {
+					return false, nil, nil
+				}
+				pages++
+				page := &corev1.PodList{}
+				switch mode {
+				case "oversized":
+					page.Items = make([]corev1.Pod, maintenancePageSize+1)
+				case "repeated":
+					page.Continue = "same"
+				case "page-limit":
+					page.Continue = fmt.Sprint(pages)
+				case "late-error":
+					if options.Continue != "" {
+						return true, nil, errors.New("second page unavailable")
+					}
+					page.Continue = "next"
+				case "late-match":
+					if options.Continue == "" {
+						page.Continue = "next"
+					} else {
+						page.Items = []corev1.Pod{{ObjectMeta: metav1.ObjectMeta{Labels: objectLabels("a")},
+							Status: corev1.PodStatus{Phase: corev1.PodSucceeded}}}
+					}
+				}
+				return true, page, nil
+			})
+			for _, evidence := range []string{"error", "oversized", "repeated", "page-limit", "late-error", "late-match"} {
+				mode, pages = evidence, 0
+				// Observe deliberately swallows pod-list errors. In that case a
+				// is absent without any test-only observation filtering.
+				obs, err := f.m.Observe(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, worker := range obs {
+					if worker.ID == "a" {
+						t.Fatalf("%s: pending worker unexpectedly observed", evidence)
+					}
+				}
+				if err := l.Tick(ctx); err != nil {
+					t.Fatal(err)
+				}
+				assertRetained(evidence)
+			}
+			// Non-provenance matches must not prevent a complete absence proof.
+			mode = ""
+			foreign := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foreign", Namespace: lmNS(),
+				Labels: map[string]string{LabelWorkerID: "a"}}}
+			if _, err := f.client.CoreV1().Pods(lmNS()).Create(ctx, foreign, metav1.CreateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			if err := l.Tick(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := f.m.migrationPending["a"]; ok {
+				t.Fatal("complete pod absence did not retire pending entry")
+			}
+			if work == "migration" && !reflect.DeepEqual(c.calls, []string{"a", "b"}) {
+				t.Fatalf("same owner/lane migration did not progress: %v", c.calls)
+			}
+			if work == "ordinary" && !lmRolled(t, f, "b") {
+				t.Fatalf("same owner/lane ordinary roll did not progress: %+v", f.m.PacingOutcomes()["b"])
+			}
+			if len(c.clearCalls) != 0 {
+				t.Fatalf("retirement cleared custody drains: %v", c.clearCalls)
+			}
+		})
+	}
+}

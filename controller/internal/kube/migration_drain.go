@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/vtmocanu/uzi/controller/internal/protocol"
 	"github.com/vtmocanu/uzi/controller/internal/reconcile"
@@ -27,7 +30,7 @@ func migrationLayout(t *rollTick, w protocol.DesiredWorker, observed map[string]
 	return observed[w.ID].RunnerLayout
 }
 
-func (m *Materializer) prepareMigrationDrains(t *rollTick, desired []protocol.DesiredWorker, observed map[string]reconcile.ObservedWorker) {
+func (m *Materializer) prepareMigrationDrains(ctx context.Context, t *rollTick, desired []protocol.DesiredWorker, observed map[string]reconcile.ObservedWorker) {
 	t.unavailable = map[string]bool{}
 	t.migrationFences = map[string]bool{}
 	t.pollDrained = map[string]bool{}
@@ -41,6 +44,10 @@ func (m *Materializer) prepareMigrationDrains(t *rollTick, desired []protocol.De
 	}
 	for id, frozen := range m.migrationPending {
 		w, present := byID[id]
+		if _, seen := observed[id]; !present && !seen && m.migrationPodsAbsent(ctx, id, frozen.Lane) {
+			delete(m.migrationPending, id)
+			continue
+		}
 		c, valid := coverageOf(w, frozen.Lane)
 		// Missing owner/evidence is not a resolution. A successful explicit poll
 		// can retire uncertainty, including when custody itself has cleared.
@@ -61,6 +68,33 @@ func (m *Materializer) prepareMigrationDrains(t *rollTick, desired []protocol.De
 			t.unavailable[w.ID] = true
 		}
 	}
+}
+
+// migrationPodsAbsent requires a fresh, complete, unselected scan: Observe can
+// omit a worker after swallowing a pod-list error. Any matching pod, including
+// terminal or terminating pods, retains uncertainty. maintenancePages bounds
+// each attempt to 16 pages of 256 objects; failure fences this entry and does
+// not prevent independent pending entries from being checked.
+func (m *Materializer) migrationPodsAbsent(ctx context.Context, id, lane string) bool {
+	if lane == "" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(markMaintenanceRead(ctx), 30*time.Second)
+	defer cancel()
+	found := false
+	err := maintenancePages(ctx, "migration pending pods", func(options metav1.ListOptions) (int, string, error) {
+		page, err := m.client.CoreV1().Pods(lane).List(ctx, options)
+		if err != nil {
+			return 0, "", err
+		}
+		for _, pod := range page.Items {
+			if workerID, ours := IsOurs(pod.Labels); ours && workerID == id {
+				found = true
+			}
+		}
+		return len(page.Items), page.Continue, nil
+	})
+	return err == nil && !found
 }
 
 // Fence both admission keys and the physical lane. Before the snapshot and pool
