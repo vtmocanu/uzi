@@ -14,6 +14,7 @@ case "$action" in
 esac
 mkdir -p "$scratch"
 log="$(mktemp "$scratch/uxlab-render.XXXXXX")"
+printf 'RAW_LOG=%s/%s\n' "$repo" "$log"
 name="uxlab-render-$(date +%s)-$$"
 volume="$name-nix"
 owner="$name"

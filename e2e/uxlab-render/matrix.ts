@@ -113,6 +113,7 @@ async function main() {
   async function command(label: string, script: string, cwd = checkout,
     commandSpawn = spawn, commandRoots = roots, commandMode = mode) {
     const begun = performance.now();
+    record("command-start", { label, mode: commandMode, cwd });
     const output = await commandSpawn(["/bin/bash", "-ceu", [
       'test "$(id -u)" = 10003',
       'test "$HOME" = "$TMPDIR"',
@@ -140,6 +141,16 @@ async function main() {
   };
   const goPolicy = 'export GOTOOLCHAIN=local GOFLAGS=-buildvcs=false\ncommand -v go\ngo version';
   try {
+    const versionRoots = new registry.ExecutionRegistry(registry.newLocalExecutionEpoch(4));
+    cache.watchRegistry(versionRoots);
+    const versionSpawn = codex.makeDefaultSpawnCommand(versionRoots, launcher.launchCodexEffectRoot,
+      5000, checkout, commandEnv, mode, log, cache, 15_000);
+    try {
+      await command("nix-devbox-versions",
+        'set +e\ncommand -v nix\nnix --version\nprintf "NIX_VERSION_STATUS=%s\\n" "$?"\ncommand -v devbox\ndevbox version',
+        checkout, versionSpawn, versionRoots);
+    } catch (error) { record("version-diagnostic-error", { ...runnerFailure(error) }); }
+    assert.equal(versionRoots.hasLiveCommandRoot(), false);
     const setupStarted = performance.now();
     const setup = await command("network-enabled-go-prewarm", `${goPolicy}
 go mod download
@@ -178,10 +189,26 @@ go test ./cmd/uzi/ -run '^$' -count=1`, path.join(checkout, "api"));
       const boundary = await command("nix-boundary", "/usr/local/bin/node -e " + quote(boundaryProbe) + " " + quote(sentinel) + " " + mode);
       requireCriterion("Nix open/sentinel boundary", boundary.code === 0);
     } finally { await runAsRunner("/bin/rm", ["--", sentinel]); }
-    const negative = await command("command-devbox-negative", "devbox run build", lab);
-    requireCriterion("command Devbox exits nonzero", negative.code !== 0 && negative.code !== null);
+    const controlRoots = new registry.ExecutionRegistry(registry.newLocalExecutionEpoch(3));
+    cache.watchRegistry(controlRoots);
+    const controlSpawn = codex.makeDefaultSpawnCommand(controlRoots, launcher.launchCodexEffectRoot,
+      5000, checkout, commandEnv, mode, log, cache, 60_000);
+    const controlLog = path.join(lab, ".uxlab-devbox-control-" + randomUUID());
+    let negative: { code: number | null } | undefined;
+    try {
+      negative = await command("command-devbox-negative",
+        "set +e\nset -o pipefail\ndevbox run build 2>&1 | head -c 1048576 > " + quote(controlLog) +
+        '\nexit "${PIPESTATUS[0]}"', lab, controlSpawn, controlRoots);
+    } catch (error) {
+      record("control-error", { ...runnerFailure(error) });
+    }
+    assert.equal(controlRoots.hasLiveCommandRoot(), false, "control root must drain after error");
+    const controlBytes = await readRegularFile(controlLog, 1048576).catch(() => Buffer.alloc(0));
+    const controlText = controlBytes.toString("utf8");
+    record("control-output", { bytes: controlBytes.length, prefix: controlText.slice(0, 16384) });
+    requireCriterion("command Devbox exits nonzero", negative !== undefined && negative.code !== 0 && negative.code !== null);
     requireCriterion("command Devbox specifically denies Nix big-lock",
-      /big-lock[^\n]*(?:Permission denied|permission denied)|(?:Permission denied|permission denied)[^\n]*big-lock/.test(negative.stdout + negative.stderr));
+      negative !== undefined && /big-lock[^\n]*(?:Permission denied|permission denied)|(?:Permission denied|permission denied)[^\n]*big-lock/.test(controlText));
     // Host only disconnects this exact owned container after this marker.
     await fs.writeFile("/data/uxlab-network-ready", "ready");
     const waitStarted = performance.now();
@@ -191,8 +218,9 @@ go test ./cmd/uzi/ -run '^$' -count=1`, path.join(checkout, "api"));
     }
     const offline = 'export GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local GOFLAGS=-buildvcs=false\n';
     if (cell === "base") {
+      assert.equal((await command("reset-base-outputs", "rm -rf -- frames png", lab)).code, 0);
       await runAsRunner("/bin/bash", ["-ceu",
-        'rm -rf frames png; mkdir frames png; printf "seed frame" > frames/seed-dark.ansi; printf "seed png" > png/seed-dark.png'], 30_000, lab);
+        'mkdir frames png; printf "seed frame" > frames/seed-dark.ansi; printf "seed png" > png/seed-dark.png'], 30_000, lab);
       const seedInventory = async () => {
         const entries: Awaited<ReturnType<typeof inventory>> = {};
         for (const dir of ["frames", "png"])
@@ -203,7 +231,7 @@ go test ./cmd/uzi/ -run '^$' -count=1`, path.join(checkout, "api"));
       const before = await seedInventory();
       const red = await command("offline-base-build", offline + "./build.sh", lab);
       assert(red.code !== 0 && red.code !== null, "base must reject missing freeze");
-      assert.match(red.stderr, /uxlab: freeze is missing\./);
+      assert.equal(red.stderr, "uxlab: freeze is missing. Check that devbox opt-in is enabled for this repo in uzi and that run provisioning reported no package warnings, or run devbox run build locally.\n");
       assert(!/frames written|rendered \d+ PNG/.test(red.stdout), "base generated output before preflight");
       const after = await seedInventory();
       const keys = Object.keys(before);
@@ -216,13 +244,31 @@ go test ./cmd/uzi/ -run '^$' -count=1`, path.join(checkout, "api"));
       const freeze = await command("freeze-version", "command -v freeze; freeze --version");
       assert.equal(freeze.code, 0);
       assert.match(freeze.stdout, /\b0\.2\.2\b/);
-      await runAsRunner("/bin/rm", ["-rf", "--", path.join(lab, "frames"), path.join(lab, "png")]);
-      const green = await command("offline-full-build", offline + "./build.sh", lab);
+      assert.equal((await command("reset-candidate-outputs", "rm -rf -- frames png", lab)).code, 0);
+      const buildLog = path.join(lab, ".uxlab-build-output");
+      let green;
+      try {
+        green = await command("offline-full-build",
+          offline + "set -o pipefail\n./build.sh 2>&1 | head -c 1048576 > " + quote(buildLog), lab);
+      } catch (error) {
+        for (const directory of ["frames", "png"]) {
+          let count = 0;
+          const entries = await fs.opendir(path.join(lab, directory)).catch(() => undefined);
+          if (entries) {
+            try { while (await entries.read()) { if (++count > 2048) break; } }
+            finally { await entries.close(); }
+          }
+          record("build-failure-inventory", { directory, count });
+        }
+        const bytes = await readRegularFile(buildLog, 1048576).catch(() => Buffer.alloc(0));
+        record("build-failure-output", { bytes: bytes.length, prefix: bytes.toString("utf8").slice(0, 16384) });
+        throw error;
+      }
       assert.equal(green.code, 0, "full real generation/render failed");
       record("artifacts", { phase: "full-build", pngs: await verifyPNGs(lab) });
       await runAsRunner("/bin/bash", ["-ceu", "mkdir proof; cp -a png proof/full-build"], 30_000, lab);
       await fs.writeFile("/data/uxlab-artifacts", path.join(lab, "proof"));
-      await runAsRunner("/bin/rm", ["-rf", "--", path.join(lab, "png")]);
+      assert.equal((await command("reset-render-outputs", "rm -rf -- png", lab)).code, 0);
       const render = await command("offline-render-no-home-writes", offline +
         "/usr/local/bin/node -e " + quote(homeSnapshot) + ' > .uxlab-home-before\n./render.sh\n' +
         "/usr/local/bin/node -e " + quote(homeSnapshot) + ' > .uxlab-home-after\ncmp .uxlab-home-before .uxlab-home-after\nrm .uxlab-home-before .uxlab-home-after', lab);

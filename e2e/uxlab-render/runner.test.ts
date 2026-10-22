@@ -163,3 +163,78 @@ for (const mode of ["accepts TERM", "resists TERM", "normal exit"] as const) {
     verified = true;
   });
 }
+
+for (const permissionDenied of [false, true]) {
+  test(`runner false cleanup distinguishes ${permissionDenied ? "EPERM from absence" : "an absent group"}`, async (t) => {
+    let ownedPgid: number | undefined;
+    const probes: number[] = [];
+    const realKill = process.kill.bind(process);
+    t.mock.method(process, "kill", (pid: number, signal?: NodeJS.Signals | number) => {
+      assert.equal(signal, 0, "runner may only probe through process.kill");
+      probes.push(pid);
+      if (permissionDenied) throw Object.assign(new Error("probe denied"), { code: "EPERM" });
+      return realKill(pid, signal);
+    });
+    const opts = { ...options(), killRunnerGroupOnly: (pgid: number) => {
+      ownedPgid = pgid;
+      return false;
+    } };
+    const result = runRunner(localRunner, process.execPath, ["-e", 'console.log("done")'], opts);
+    if (permissionDenied) {
+      await assert.rejects(result, { code: "ERR_RUNNER_GROUP_CLEANUP" });
+      assert(!opts.events.some((event) => event.kind === "runner-complete"));
+    } else {
+      assert.equal((await result).stdout, "done\n");
+    }
+    assert(ownedPgid !== undefined);
+    assert.deepEqual(probes, [-ownedPgid]);
+    assert.equal(opts.events.find((event) => event.kind === "runner-cleanup")?.data.groupAbsent,
+      !permissionDenied);
+  });
+}
+
+for (const cleanup of ["returns false", "throws"] as const) {
+  for (const parentExits of [true, false]) {
+    test(`runner deadline stays bounded when cleanup ${cleanup} and parent ${parentExits ? "exits" : "stays alive"}`,
+      { timeout: 5_000 }, async (t) => {
+        let ownedPgid: number | undefined;
+        const opts = { ...options(), timeout: 400,
+          killRunnerGroupOnly: (pgid: number) => {
+            ownedPgid = pgid;
+            if (cleanup === "throws") throw new Error("signal denied");
+            return false;
+          } };
+        // Teardown signals only the detached group supplied by runRunner itself.
+        // Both fixture processes also exit within two seconds if an assertion fails.
+        t.after(() => {
+          if (ownedPgid !== undefined) killRunnerGroupOnly(ownedPgid);
+        });
+        const descendant = 'setTimeout(() => process.exit(0), 1800); console.log("ready");';
+        const parent = `
+          const child = require("node:child_process").spawn(process.execPath,
+            ["-e", process.argv[1]], { stdio: ["ignore", "pipe", "inherit"] });
+          child.stdout.on("data", (chunk) => {
+            process.stdout.write(chunk);
+            if (process.argv[2] === "exit") process.exit(0);
+          });
+          setTimeout(() => process.exit(0), 2000);
+        `;
+        const begun = performance.now();
+        await assert.rejects(runRunner(localRunner, process.execPath,
+          ["-e", parent, descendant, parentExits ? "exit" : "wait"], opts));
+        const elapsed = performance.now() - begun;
+        assert(elapsed < 1200, `cleanup exceeded completion bound: ${elapsed}ms`);
+        const failure = opts.events.find((event) => event.kind === "runner-error");
+        assert(failure);
+        assert.equal(failure.data.killed, false);
+        assert(opts.events.some((event) => event.kind === "runner-cleanup" &&
+          event.data.dispatched === false && event.data.groupAbsent === false),
+        "failed signal must not be recorded as absent or dispatched");
+        assert(!opts.events.some((event) => event.kind === "runner-complete"));
+        if (parentExits) {
+          assert(opts.events.some((event) => event.kind === "runner-cleanup" &&
+            event.data.reason === "exit"), "cleanup attempted before deadline");
+        }
+      });
+  }
+}

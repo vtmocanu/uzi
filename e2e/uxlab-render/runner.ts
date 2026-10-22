@@ -38,24 +38,64 @@ export async function runRunner(
       const stdout: Buffer[] = [], stderr: Buffer[] = [];
       const sizes = { stdout: 0, stderr: 0 };
       let failure: Error | undefined;
-      let cleaned = false;
+      let cleanupAttempted = false;
+      let settled = false;
       const cleanup = (reason: string) => {
-        clearTimeout(timer);
-        if (cleaned || child.pid === undefined) return;
-        cleaned = true;
+        if (cleanupAttempted || child.pid === undefined) return;
+        cleanupAttempted = true;
+        let dispatched = false;
+        let groupAbsent = false;
+        let cleanupError: unknown;
         try {
-          const dispatched = killRunnerGroupOnly(child.pid);
-          record("runner-cleanup", { ...context, reason, pgid: child.pid, dispatched });
+          dispatched = killRunnerGroupOnly(child.pid);
         } catch (error) {
+          cleanupError = error;
           failure ??= error instanceof Error ? error : new Error(String(error));
         }
+        if (!dispatched) {
+          // Probe only our detached child's known PGID. EPERM proves existence;
+          // only ESRCH proves absence. No single-PID fallback is permitted.
+          try { process.kill(-child.pid, 0); }
+          catch (error) {
+            groupAbsent = (error as NodeJS.ErrnoException).code === "ESRCH";
+          }
+          if (!groupAbsent) {
+            failure ??= Object.assign(new Error("Runner group cleanup failed"), {
+              code: "ERR_RUNNER_GROUP_CLEANUP", killed: false,
+            });
+          }
+        }
+        record("runner-cleanup", { ...context, reason, pgid: child.pid, dispatched,
+          groupAbsent, error: bounded(cleanupError) });
+      };
+      const settle = (code: number | null, signal: NodeJS.Signals | null) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        const output = {
+          stdout: Buffer.concat(stdout, sizes.stdout).toString(),
+          stderr: Buffer.concat(stderr, sizes.stderr).toString(),
+        };
+        if (!failure && (code !== 0 || signal !== null)) {
+          failure = Object.assign(new Error("Command failed: " + wrapped.command), { code, signal, killed: false });
+        }
+        if (failure) {
+          Object.assign(failure, output);
+          reject(failure);
+        } else resolve(output);
       };
       const timer = setTimeout(() => {
-        failure ??= Object.assign(new Error("Runner deadline exceeded"), { killed: true, signal: "SIGKILL" });
+        failure ??= Object.assign(new Error("Runner deadline exceeded"), { killed: false });
         cleanup("deadline");
+        // The completion bound includes inherited pipes and failed signals.
+        // Host/container cleanup retains ownership of any surviving group.
+        child.stdout.destroy();
+        child.stderr.destroy();
+        child.unref();
+        settle(null, null);
       }, timeout);
       // Each stream keeps at most maxOutputBytes, including the final partial chunk.
-      // Overflow kills this one known group once; sibling invocations are independent.
+      // Overflow attempts cleanup once for this known group; siblings are independent.
       const capture = (name: "stdout" | "stderr", chunks: Buffer[], chunk: Buffer) => {
         const remaining = maxOutputBytes - sizes[name];
         if (remaining > 0) {
@@ -65,7 +105,7 @@ export async function runRunner(
         }
         if (chunk.length > remaining) {
           failure ??= Object.assign(new RangeError(name + " maxBuffer length exceeded"),
-            { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER", killed: true, signal: "SIGKILL" });
+            { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER", killed: false });
           cleanup("overflow");
         }
       };
@@ -79,17 +119,7 @@ export async function runRunner(
       child.on("exit", () => cleanup("exit"));
       child.on("close", (code, signal) => {
         cleanup("close");
-        const output = {
-          stdout: Buffer.concat(stdout, sizes.stdout).toString(),
-          stderr: Buffer.concat(stderr, sizes.stderr).toString(),
-        };
-        if (!failure && (code !== 0 || signal !== null)) {
-          failure = Object.assign(new Error("Command failed: " + wrapped.command), { code, signal, killed: false });
-        }
-        if (failure) {
-          Object.assign(failure, output);
-          reject(failure);
-        } else resolve(output);
+        settle(code, signal);
       });
     });
     record("runner-complete", context);
