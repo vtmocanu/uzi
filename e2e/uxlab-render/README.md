@@ -2,10 +2,11 @@
 
 ## M3 matrix (lead-owned expensive proof)
 
-The implementation has focused local checks only. Docker, the four real-image
-cells and the separate runner Devbox leg have **not** been run for M3.
-**All M3 live proof remains UNPERFORMED:** matrix cells, timing comparison,
-offline renders, Nix controls, local Devbox build and PNG visual inspection.
+M3 is **incomplete**. A real base/off attempt reached provisioning and Go
+setup, then failed the required Nix database write-access check. No rendering
+acceptance is claimed. The other matrix cells, matched timing comparison,
+local Devbox build and PNG inspection remain unperformed. See [EVIDENCE.md](EVIDENCE.md)
+for the tested revisions, safe-open failure and required scope decision.
 No production runtime, environment builder, permission or sandbox code changes.
 
 Prepare regular full repository exports under this worktree's scratch directory.
