@@ -95,6 +95,11 @@ on_exit() {
 
 case "$action" in
   build)
+    # timeout implementations differ on group-signal status (uutils can return 124
+    # for SIGINT). Preserve this wrapper's explicit signal result, as fixture does.
+    # The foreground child must still settle before bash runs either trap.
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     # CODEX_GIT_TRUST_BUILD_NETWORK (issue #1769): explicit opt-in to `docker build --network host`,
     # forwarded ONLY when it is exactly "host". On some hosts the default bridge network's egress
     # hangs, so the build's package/artifact downloads stall until the build timeout. This is
