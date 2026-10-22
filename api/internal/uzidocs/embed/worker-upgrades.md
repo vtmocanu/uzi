@@ -43,18 +43,19 @@ New issue workers send terminal `source_publication` evidence for the exact
 successful pushed SHA, including on legacy non-interlocked runs. The API stores
 an immutable `runs.source_publication_intent` stamp in the same transaction
 as successful issue completion, independently of recovery inventory or permit
-negotiation. It does not stamp before push. Rejected or rolled-back completion
-leaves no stamp; without affirmative non-closing evidence, a later refresh is
-unknown. A lost commit acknowledgement can leave completion and the stamp
+negotiation. It does not stamp before push. A rejected or rolled-back initial
+completion creates no stamp; without other affirmative evidence, a later
+refresh is unknown. A lost commit acknowledgement can leave completion and the stamp
 durable; exact terminal replay validates that paired outcome.
 
 MR rework and pipeline-branch-adopting CI fix on new workers require the
 negotiated feature and authenticated resolver; absence or unknown authority
 refuses publication. Closing needs the terminal stamp. Historical affirmative
 non-closing evidence can restrict without one, but historical publications
-receive no backfill. Old workers and old APIs retain their earlier source-issue
-behavior during rollout; neither release badges nor an API-only upgrade prove
-these refresh pushes are guarded. Pull/merge request text grants no authority.
+receive no backfill. Old workers retain their earlier publication behavior;
+new workers against old APIs refuse affected refreshes. Source-issue runs
+retain their earlier compatibility behavior until both components are upgraded.
+Neither release badges nor an API-only upgrade prove these refresh pushes are guarded. Pull/merge request text grants no authority.
 
 Deploy `00349_source_publication_intent.sql` and
 `00350_validate_source_publication_intent.sql` before the new API. Migration

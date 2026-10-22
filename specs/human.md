@@ -927,8 +927,8 @@ in [ADR-1225](../adr/1225-structural-completion-interlock-invariants.md#addendum
   source-publication evidence stored atomically with successful issue completion.
   The report carries the exact frozen successful push SHA, independently of
   recovery inventory or completion-permit negotiation, including legacy issue
-  runs. There is no pre-push writer. Rejected or rolled-back completion leaves
-  no stamp and, absent affirmative restrictions, refresh authority is unknown.
+  runs. There is no pre-push writer. A rejected or rolled-back initial completion
+  creates no stamp and, absent other affirmative evidence, refresh authority is unknown.
   A lost commit acknowledgement can leave completion and the stamp durable;
   exact terminal replay validates that paired outcome. Historical
   affirmative non-closing evidence can restrict without a stamp; historical
@@ -940,9 +940,11 @@ in [ADR-1225](../adr/1225-structural-completion-interlock-invariants.md#addendum
   commit scan, including earlier published history. Refusals fail the refresh,
   with bounded SHA evidence and no commit text; recovery retains existing
   inventory settlement rules and preserves legacy local sources unless the
-  original pinned head was verifiably archived. The worker does not rewrite
-  history. New workers without the feature refuse affected refreshes; old
-  workers/old APIs retain earlier source-issue behavior during rollout.
+  original pinned head was verifiably archived. The guard does not rewrite
+  offending messages to repair a refusal. New workers without the feature refuse
+  affected refreshes. Old workers retain their earlier publication behavior;
+  new workers against old APIs refuse affected refreshes. Source-issue runs
+  retain their earlier compatibility behavior until both components are upgraded.
   Application rollback preserves the nullable evidence column: migration 349
   Down loses proof and re-up cannot reconstruct it. (AI-synced 2026-10-22)
 - Forgejo/Gitea any-branch closure remains a boundary under #3120: no

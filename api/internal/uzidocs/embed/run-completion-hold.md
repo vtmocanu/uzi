@@ -401,8 +401,8 @@ with authoritative scope restrictions and stores `runs.source_publication_intent
 atomically with successful issue completion. This also supports legacy
 (non-interlocked) issue runs; the stamp is independent of recovery inventory
 and completion-permit negotiation. There is no pre-push stamp writer.
-A rejected or rolled-back completion leaves no stamp: absent affirmative
-non-closing evidence, a later refresh is unknown, even if the push succeeded.
+A rejected or rolled-back initial completion creates no stamp: absent
+other affirmative evidence, a later refresh is unknown, even if the push succeeded.
 A lost commit acknowledgement can leave completion and the stamp durable;
 exact terminal replay validates that paired outcome. Historical affirmative
 non-closing evidence can restrict a refresh without a stamp; missing evidence
@@ -419,12 +419,13 @@ count, without publishing commit text. These refresh refusals fail rather than
 entering the structural completion hold. Recovery keeps the existing inventory
 settlement rules; legacy refreshes retain the local source unless its original
 pinned head was verifiably archived. Preservation does not promise a remote copy.
-The worker does not rewrite history or force-push; the owner recovers and
-corrects the preserved work.
+The guard does not rewrite offending messages or force-push to repair a
+refusal; the owner recovers and corrects the preserved work.
 
 A new worker without the negotiated feature refuses affected refreshes.
-Old workers and old APIs retain their earlier source-issue behavior; upgrade
-both components for this protection. See
+Old workers retain their earlier publication behavior. New workers against
+old APIs refuse affected refreshes; source-issue runs retain their earlier
+compatibility behavior until both components are upgraded. See
 [Worker versions and upgrades](worker-upgrades.md#refresh-publication-context-3120).
 
 Forgejo/Gitea can close an issue on any branch push. #3120 guards these refresh

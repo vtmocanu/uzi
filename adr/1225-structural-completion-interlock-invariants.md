@@ -255,8 +255,8 @@ from that report and authoritative restrictions, binding generation, branch,
 request IID and published head atomically with successful issue completion.
 Legacy non-interlocked issue runs are supported. This evidence is independent
 of recovery-inventory and completion-permit negotiation, grants no custody
-release, and has no pre-push writer. Rejected or rolled-back completion leaves
-no stamp. A lost commit acknowledgement can leave completion and the stamp
+release, and has no pre-push writer. A rejected or rolled-back initial
+completion creates no stamp. A lost commit acknowledgement can leave completion and the stamp
 durable; exact terminal replay validates that paired outcome.
 Without affirmative restriction evidence, missing proof yields unknown even
 after a successful push. Historical affirmative non-closing evidence can
@@ -277,8 +277,9 @@ head was verifiably archived. This preserves work without asserting a remote
 copy or authorizing a rewrite.
 
 A new worker without the negotiated feature refuses affected refreshes.
-Old workers and old APIs retain their earlier source-issue behavior during
-rollout. Migration 349 adds nullable immutable evidence without backfill;
+Old workers retain their earlier publication behavior; new workers against
+old APIs refuse affected refreshes. Source-issue runs retain their earlier
+compatibility behavior until both components are upgraded. Migration 349 adds nullable immutable evidence without backfill;
 migration 350 validates separately. Application rollback must preserve the
 column: migration 349 Down destroys evidence, and re-up cannot reconstruct
 closing proof. See [worker rollout guidance](../docs/worker-upgrades.md#refresh-publication-context-3120).
