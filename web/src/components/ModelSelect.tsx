@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { Harness } from "../lib/api";
+import { CODEX_CURATED_MODELS } from "../lib/codexModels";
 import { Input, Select } from "./ui";
 
 // The curated model aliases offered as first-class options, one closed list PER
@@ -14,7 +15,9 @@ import { Input, Select } from "./ui";
 const CLAUDE_MODEL_ALIASES = ["opus", "sonnet", "haiku", "fable"] as const;
 // Mirror agent/src/codex/codex-executor.ts CODEX_PRODUCTION_PROVIDER.model.
 export const DEFAULT_CODEX_MODEL = "gpt-6.1-sol";
-const CODEX_MODEL_ALIASES = ["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", DEFAULT_CODEX_MODEL] as const;
+// The curated Codex list lives in lib/codexModels.ts (PRD #3245), pinned to the shared
+// fixtures/codex-models/models.json; it includes DEFAULT_CODEX_MODEL.
+const CODEX_MODEL_ALIASES = CODEX_CURATED_MODELS;
 
 // aliasesForHarness is the single place this component resolves which curated list
 // applies. Defaults to Claude for an omitted/unrecognised harness — the safe,
@@ -55,6 +58,8 @@ export function ModelSelect({
   customAriaLabel = "Custom model ID",
   harness,
   allowCustom,
+  ariaDescribedBy,
+  onCustomModeChange,
 }: {
   value: string;
   onChange: (model: string) => void;
@@ -71,6 +76,11 @@ export function ModelSelect({
   // and dedicated plan cross-check pins pass `allowCustom` to open that escape hatch
   // (PRD #1551 D5 and #2151).
   allowCustom?: boolean;
+  // Id(s) of a hint that describes the select (e.g. an "In effect" line), PRD #3245.
+  ariaDescribedBy?: string;
+  // Reports whether the picker is in "Other (custom model ID)" mode, so a caller can
+  // refuse to save an empty custom ID instead of silently sending "" (= Default).
+  onCustomModeChange?: (custom: boolean) => void;
 }) {
   const aliases = aliasesForHarness(harness);
   const customAllowed = allowCustom ?? harness !== "codex";
@@ -116,6 +126,12 @@ export function ModelSelect({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [value, harness]);
 
+  const isCustom = mode === "custom";
+  useEffect(() => {
+    onCustomModeChange?.(isCustom);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isCustom]);
+
   const emit = (v: string) => {
     lastEmitted.current = v;
     onChange(v);
@@ -135,7 +151,7 @@ export function ModelSelect({
 
   return (
     <div className="space-y-2">
-      <Select id={id} value={mode} onChange={(e) => onSelect(e.target.value as Mode)}>
+      <Select id={id} aria-describedby={ariaDescribedBy} value={mode} onChange={(e) => onSelect(e.target.value as Mode)}>
         <option value="inherit">{defaultLabel ?? "Inherit (account default)"}</option>
         {aliases.map((m) => (
           <option key={m} value={m}>

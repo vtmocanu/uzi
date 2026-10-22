@@ -26,7 +26,7 @@ import (
 // SetUserDefaultEffort/SetUserJudgeModel/SetUserSummaryModel/SetUserTheme UPDATEs QueryRow a
 // single Text RETURNING column (discarded by the handler) and SetUserSidebarTokens a uuid[]
 // one; SetUserHarnessModels (PRD #1551 M1) PATCHes the harness, both lanes and the legacy
-// default_model in one conditional UPDATE; GetUserSettings QueryRows fifteen (default_model,
+// default_model in one conditional UPDATE; GetUserSettings QueryRows eighteen (default_model,
 // default_effort, judge_model, summary_model, theme, sidebar_token_ids,
 // mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface — the four
 // appearance columns joined the read in PRD #1167 M1 — default_harness, which joined
@@ -39,6 +39,7 @@ type fakeSettingsDB struct {
 	effort          pgtype.Text
 	codexEffort     pgtype.Text
 	judge           pgtype.Text
+	codexJudge      pgtype.Text
 	summary         pgtype.Text
 	theme           pgtype.Text
 	mrRework        pgtype.Bool
@@ -132,6 +133,10 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		if j, ok := args[0].(pgtype.Text); ok {
 			f.judge = j // SetUserJudgeModel: $1 = judge_model
 		}
+	case strings.Contains(sql, "UPDATE users SET codex_judge_model") && len(args) >= 1:
+		if j, ok := args[0].(pgtype.Text); ok {
+			f.codexJudge = j // SetUserCodexJudgeModel: $1 = codex_judge_model
+		}
 	case strings.Contains(sql, "UPDATE users SET summary_model") && len(args) >= 1:
 		if s, ok := args[0].(pgtype.Text); ok {
 			f.summary = s // SetUserSummaryModel: $1 = summary_model
@@ -192,6 +197,7 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		effort:          f.effort,
 		codexEffort:     f.codexEffort,
 		judge:           f.judge,
+		codexJudge:      f.codexJudge,
 		summary:         f.summary,
 		theme:           f.theme,
 		mrRework:        f.mrRework,
@@ -213,6 +219,7 @@ type fakeSettingsRow struct {
 	effort          pgtype.Text
 	codexEffort     pgtype.Text
 	judge           pgtype.Text
+	codexJudge      pgtype.Text
 	summary         pgtype.Text
 	theme           pgtype.Text
 	mrRework        pgtype.Bool
@@ -255,7 +262,7 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		if p, ok := dest[3].(*pgtype.Text); ok {
 			*p = r.typeface
 		}
-	case 17:
+	case 18:
 		// GetUserSettings: SELECT default_model, default_effort, judge_model,
 		// summary_model, theme, sidebar_token_ids, mr_rework_enabled,
 		// appearance_mode, light_theme, dark_theme, typeface, default_harness,
@@ -272,47 +279,51 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		if p, ok := dest[2].(*pgtype.Text); ok {
 			*p = r.judge
 		}
+		// codex_judge_model (PRD #3245) rides the read right after judge_model.
 		if p, ok := dest[3].(*pgtype.Text); ok {
-			*p = r.summary
+			*p = r.codexJudge
 		}
 		if p, ok := dest[4].(*pgtype.Text); ok {
+			*p = r.summary
+		}
+		if p, ok := dest[5].(*pgtype.Text); ok {
 			*p = r.theme
 		}
-		if p, ok := dest[5].(*[]uuid.UUID); ok {
+		if p, ok := dest[6].(*[]uuid.UUID); ok {
 			*p = r.sidebarIDs
 		}
-		if p, ok := dest[6].(*pgtype.Bool); ok {
+		if p, ok := dest[7].(*pgtype.Bool); ok {
 			*p = r.mrRework
 		}
-		if p, ok := dest[7].(*pgtype.Text); ok {
+		if p, ok := dest[8].(*pgtype.Text); ok {
 			*p = r.apprMode
 		}
-		if p, ok := dest[8].(*pgtype.Text); ok {
+		if p, ok := dest[9].(*pgtype.Text); ok {
 			*p = r.lightTheme
 		}
-		if p, ok := dest[9].(*pgtype.Text); ok {
+		if p, ok := dest[10].(*pgtype.Text); ok {
 			*p = r.darkTheme
 		}
-		if p, ok := dest[10].(*pgtype.Text); ok {
+		if p, ok := dest[11].(*pgtype.Text); ok {
 			*p = r.typeface
 		}
-		if p, ok := dest[11].(*pgtype.Text); ok {
+		if p, ok := dest[12].(*pgtype.Text); ok {
 			*p = r.defaultHarness
 		}
-		if p, ok := dest[12].(*[]uuid.UUID); ok {
+		if p, ok := dest[13].(*[]uuid.UUID); ok {
 			*p = r.sidebarCodexIDs
 		}
-		if p, ok := dest[13].(*pgtype.Text); ok {
+		if p, ok := dest[14].(*pgtype.Text); ok {
 			*p = r.claudeModel
 		}
-		if p, ok := dest[14].(*pgtype.Text); ok {
+		if p, ok := dest[15].(*pgtype.Text); ok {
 			*p = r.codexModel
 		}
-		if p, ok := dest[15].(*pgtype.Text); ok {
+		if p, ok := dest[16].(*pgtype.Text); ok {
 			*p = r.codexEffort
 		}
-		// now_summary_enabled (PRD #2603) rides the read as the 17th column.
-		if p, ok := dest[16].(*pgtype.Bool); ok {
+		// now_summary_enabled (PRD #2603) rides the read as the 18th column.
+		if p, ok := dest[17].(*pgtype.Bool); ok {
 			*p = r.nowSummary
 		}
 	}

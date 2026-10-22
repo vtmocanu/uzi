@@ -89,3 +89,24 @@ describe("RunRunner reportIteration budget-total mapping (PRD #1189 M1)", () => 
     );
   });
 });
+
+describe("3282 count/time-only iteration projections", () => {
+  for (const fields of [{ completionAttempts: 1 }, { budgetUsedSeconds: 42 }]) it(`3282 preserves ${Object.keys(fields)[0]} alone`, async t => {
+    const original = client.reportState.bind(client);
+    t.mock.method(client, "reportState", async (...args: Parameters<typeof client.reportState>) => {
+      const ack = await original(...args);
+      if (args[1].iteration_count !== undefined) return { applied: true, status: "running", ...fields };
+      return ack;
+    });
+    let captured: IterationBudget | void;
+    const { gitlab } = fakeGitlab();
+    await runner({ run: async ctx => {
+      captured = await ctx.reportIteration!(1);
+      simulateCommittedWork();
+      return { branch: ctx.branch };
+    } }, gitlab).execute(gitlabClaim(328201));
+    assert.ok(captured!);
+    if ("completionAttempts" in fields) assert.equal(captured!.completionAttempts, 1);
+    else assert.equal(captured!.usedWallSeconds, 42);
+  });
+});

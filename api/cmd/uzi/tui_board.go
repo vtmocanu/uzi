@@ -236,6 +236,9 @@ func runBandOf(r apitypes.RunListItemDTO) int {
 // runStateWord is the human status word the board row draws for r (runStateToken's word),
 // which the `/` filter matches alongside the effective status.
 func runStateWord(r apitypes.RunListItemDTO) string {
+	if tuiRejectedRun(r.RunDTO) {
+		return "rejected"
+	}
 	if isProviderUnavailableHold(r.RunDTO) {
 		return providerHoldWord
 	}

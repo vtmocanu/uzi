@@ -1021,7 +1021,9 @@ chain in the diagram above, with no intervening `running`.
   captures uncommitted mid-milestone work as a throwaway `wip(park):` commit that
   the checkpoint broker ([PRD #628](prds/done/628-cross-worker-resume-durability.md))
   carries off the worker and adoption peels back to uncommitted (exact recovery
-  same-worker, best-effort cross-worker, bounded by `WORKER_AFFINITY_CEILING`). A
+  same-worker, best-effort cross-worker, bounded by `WORKER_AFFINITY_CEILING`;
+  the marker never commits core dumps or files over 8 MiB, and one under a
+  verified coverage wrapper is peeled at successor adopt). A
   resumed run whose plan is provably reviewed and whose work recovered continues
   without re-gating; a total loss re-gates a human-approved run, preserving
   [PRD #209](prds/done/209-seeded-plan-runs.md)'s loss-detection property. See

@@ -12,7 +12,8 @@
 // through a MANUAL git-receive-pack session (not remote.PushContext — see forwardPack
 // / issue #1009) whose single command carries the checkpoint tip AS FETCHED as its
 // Old. That gives the invariant two agreeing guards: locally, the declared tip is
-// verified to strictly descend origin's current tip before the wire; on the wire, the
+// verified to strictly descend origin's existing checkpoint ref (or, with none, to descend
+// or equal the published branch tip) before the wire; on the wire, the
 // remote's compare-and-swap on that fetched Old refuses any update that would move the
 // ref off it. A non-fast-forward / CAS-mismatch rejection is mapped to ErrNotDescendant
 // — a legitimate "origin moved" outcome the caller turns into a 200 skip, never a 5xx.
@@ -66,9 +67,9 @@ type Options struct {
 	BaseURL  string
 	Branch   string
 	// DefaultBranch is the repo's default branch (from the run claim context). Its
-	// objects are the exclude-boundary base a first-checkpoint delta pack was built
-	// against, so we fetch them into the storer alongside the branch's own refs — but
-	// we fetch ONLY these named refs, never every head (Rule: bounded fetch).
+	// named fetch supplies the current default snapshot for validation, alongside
+	// the branch's own refs (Rule: bounded fetch). The forge already holds historical
+	// default-reachable blobs omitted by the worker; we forward its pack verbatim.
 	DefaultBranch string
 	Username      string
 	PAT           string
@@ -110,7 +111,8 @@ type Result struct {
 
 var (
 	// ErrNotDescendant means the declared tip does not strictly descend origin's
-	// current checkpoint (or human-pushed branch) tip. The caller maps it to a 200
+	// existing checkpoint ref, or (with or without one) does not descend or equal the
+	// published refs/heads/<branch> tip. The caller maps it to a 200
 	// skip: the checkpoint ref only ever advances, so a non-descendant is a normal
 	// "origin moved" outcome, not an error.
 	ErrNotDescendant = errors.New("pushbroker: declared tip does not descend origin tip")
@@ -276,8 +278,13 @@ func validManagedRef(ref string) bool {
 }
 
 // Publish fetches origin's base objects, applies the worker's delta pack, verifies
-// the declared tip strictly descends origin's current tip, and pushes it —
-// NON-FORCED — to refs/uzi-checkpoints/<branch>.
+// the declared tip, and pushes it — NON-FORCED — to refs/uzi-checkpoints/<branch>.
+// With an existing checkpoint ref the tip must strictly descend it (equality is
+// AlreadyCurrent). With none, the tip must descend or equal the published
+// refs/heads/<branch> tip, and the push CREATES the ref (Old = zero hash), so a run
+// seeded from an origin branch publishes its seed before its first new commit
+// (issue #3284). Either way a tip that does not descend or equal the published branch is
+// ErrNotDescendant.
 //
 // NOTE: the go-git round-trip against a REAL forge is a manual/e2e validation step
 // (see the package tests, which prove the algorithm against a local bare fixture).
@@ -399,14 +406,13 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 		}
 	}
 
-	// Step 5: strict-descendant / never-backward check (the "never forced"
-	// invariant, enforced locally BEFORE the wire and again by the non-forced push).
-	base := checkpointTip
-	if base.IsZero() {
-		base = branchTip
-	}
-	if !base.IsZero() {
-		ok, err := strictDescends(ctx, repo, base, declaredCommit)
+	// Step 5: never-backward checks (the "never forced" invariant, enforced locally BEFORE
+	// the wire and again by the non-forced push).
+	//
+	// Strict descent binds only an EXISTING checkpoint ref: the declared tip must be a
+	// strict descendant of it (equality returned AlreadyCurrent above).
+	if !checkpointTip.IsZero() {
+		ok, err := strictDescends(ctx, repo, checkpointTip, declaredCommit)
 		if err != nil {
 			return Result{}, fmt.Errorf("pushbroker: ancestry (base): %w", err)
 		}
@@ -414,8 +420,11 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 			return Result{}, ErrNotDescendant
 		}
 	}
-	// If a human pushed refs/heads/<branch> ahead of (or aside from) the checkpoint,
-	// the checkpoint must not move to a tip that does not descend that branch.
+	// The published branch binds every publish: the checkpoint must not move to a tip that
+	// does not descend (or equal) a refs/heads/<branch> a human or an earlier run pushed.
+	// With NO checkpoint ref this is the only ancestry bound, so a run seeded from an
+	// origin branch may create the ref AT that branch's tip (equality) before its first new
+	// commit, while a tip behind or diverged from the branch is still refused.
 	if !branchTip.IsZero() && branchTip != checkpointTip {
 		ok, err := descendsOrEqual(ctx, repo, branchTip, declaredCommit)
 		if err != nil {
@@ -451,8 +460,11 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 	// refs/heads and so is NOT protected by the remote's denyNonFastForwards — can never
 	// be force-moved by a mismatch between the two advertisements.
 	// The already-up-to-date case (checkpointTip == tipHash) returned success far above,
-	// before the pack apply and ancestry checks, so by here the declared tip strictly
-	// descends the fetched checkpoint tip and there is a real update to forward.
+	// before the pack apply and ancestry checks, so by here there is a real write to forward:
+	// an update whose tip strictly descends the fetched checkpoint tip, or, when the ref was
+	// absent at fetch time (Old = zero hash), a create at a tip that descends or equals the
+	// published branch tip (a seeded run's first checkpoint, issue #3284). A ref created
+	// by someone else after the fetch fails the receive-pack compare-and-swap against the zero Old.
 	outcome, pushErr := forwardPack(ctx, remote, auth, checkpointRef, checkpointTip, tipHash, o.Pack)
 	disposition := PublishUnclassified
 	if outcome.invoked && !outcome.rejected && (!outcome.success || pushErr != nil) {

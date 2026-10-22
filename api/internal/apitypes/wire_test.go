@@ -1170,7 +1170,14 @@ func TestUserSettingsDTOTags(t *testing.T) {
 		// PRD #1551 M1 (D2): the retained per-harness worker-model lanes (each null ⇒ inherit).
 		"default_claude_model", "default_codex_model",
 		// PRD #2603: the per-user model-written "Now" summary switch (null ⇒ default ON).
-		"now_summary_enabled")
+		"now_summary_enabled",
+		// PRD #3245: the Codex judge lane and the read-only resolved judge cells.
+		"codex_judge_model", "judge_models")
+}
+
+func TestModelSettingCellDTOTags(t *testing.T) {
+	assertTags(t, "ModelSettingCellDTO", ModelSettingCellDTO{},
+		"harness", "model", "default_model", "default_source", "resolved_model", "source")
 }
 
 func TestCrossCheckPinDTOTags(t *testing.T) {

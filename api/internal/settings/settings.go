@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/theme"
@@ -482,7 +483,13 @@ func Validate(key, value string) error {
 		return validateEnum(value, "below", "topright")
 	case KeyBrandCompany:
 		return validateBrandCompany(value)
-	case KeyJudgeModel, KeySummaryModel:
+	case KeyJudgeModel:
+		// Blank is the explicit reset to the built-in judge model (PRD #3245).
+		_, err := agenttmpl.ValidateClaudeLaneModel(value)
+		return err
+	case KeyCodexJudgeModel:
+		return validateCodexJudgeModel(value)
+	case KeySummaryModel:
 		return validateModelAlias(value)
 	case KeyAgentSourceInterval:
 		return validateAgentSourceInterval(value)

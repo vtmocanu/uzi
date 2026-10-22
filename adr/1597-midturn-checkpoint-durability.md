@@ -81,14 +81,24 @@ no outer signal, so the first request's timeout does not bound the total operati
 `CHECKPOINT_INTERVAL` gate (default `20m`) still measures logical operations. HTTP 4xx,
 nonconfirming 2xx, skips, local errors, transport throws and aborts are not retried.
 
-The replay factory captures the original source, candidate and literal floor. It
-opens a fresh stream without resolving branch tips, rebuilding overlays, acquiring
-credentials or widening ranges. Before every producer it repeats scratch/floor and
-candidate remediation guards; the runner rechecks ownership against the original
-source before replay. Abandoned producers are explicitly cancelled, unread streams
-destroyed, and exit/reap awaited before reopening. Ordinary and retained paths settle
-the final producer too. A published ACK requires producer exit zero; an intentionally
-cancelled non-2xx producer may exit nonzero and cannot confirm publication.
+The replay factory captures the original source, candidate, literal floor and optional
+`defaultBlobSha`, including its absence. These remain immutable for the logical
+publish. It opens a fresh stream without resolving branch tips, rebuilding overlays,
+acquiring credentials or widening ranges. A captured default ref advancing, being
+rewritten or being deleted does not re-resolve the captured object on replay; loss of
+that commit object refuses with `ScratchPublicationError`. Captured absence keeps
+replay on the legacy producer even if an authoritative default later becomes available.
+
+Preparation, scratch/floor and candidate remediation guards, producer startup and
+replay share the original parent lifetime: recovery/maintenance aborts and absolute
+deadline, plus the original boundary supervisor and cooperative clock. Replay renews
+none of them. Before each producer the guards run again; the runner rechecks ownership
+against the original source before replay. Callers without an outer deadline retain
+that behavior; the preparation cap below adds no overall publish or producer deadline.
+Abandoned producers are explicitly cancelled, unread streams destroyed, and exit/reap
+awaited before reopening. Ordinary and retained paths settle the final producer too.
+A published ACK requires producer exit zero; an intentionally cancelled non-2xx
+producer may exit nonzero and cannot confirm publication.
 
 Ambiguous attempts retain the attempted tip for later logical-operation overlay
 chaining. Only ACK plus producer success advances the confirmed tip and clears the
@@ -239,12 +249,15 @@ under the approved plan's explicit residual boundaries; neither is provided by #
 - **The scan range is floored at content already public.** Three floors, each excluded
   from the scan (`tipSha ^excludeSha ^<default tip> ^<confirmed tip>`), so nothing
   reachable from any of them is re-scanned: `excludeSha` (`origin/<branch>` when
-  it exists, else the default branch), the last **confirmed** published checkpoint tip
-  (only when it is an ancestor of the pinned tip), and the origin default-branch tip. The
-  pack range stays exactly `tipSha ^excludeSha` — unchanged from the pre-tick pinned-range
-  contract, but the SCANNED range is over the pinned range being packed, minus commits
-  already reachable from the default branch or the last confirmed checkpoint (content
-  already public). Invariant: every packed commit is either scanned right now, already
+  it exists, else the common ancestor of the pinned tip and default branch), the last
+  **confirmed** published checkpoint tip (only when it is an ancestor of the pinned tip),
+  and the origin default-branch tip. The original commit/tree walk remains
+  `tipSha ^excludeSha` (or `candidate ^floor` after an overlay or chain); the
+  default-blob selection below may omit eligible blobs from that walk. The additional
+  `scanFloorShas` remain scan-only and never become pack exclusions. The SCANNED range
+  is over the pinned range being packed, minus commits already reachable from the
+  default branch or the last confirmed checkpoint (content already public).
+  Invariant: every packed commit is either scanned right now, already
   reachable from a confirmed checkpoint publish (which may itself have been an unscanned
   park/pause/shutdown publish — already public), or already on the default branch — no
   packed commit is both unscanned and not already public.
@@ -265,6 +278,47 @@ under the approved plan's explicit residual boundaries; neither is provided by #
   binary-only, empty new file, delete-only) are excluded from the expected count so the
   liveness check (expected == gitleaks' "N commits scanned") does not class a complete scan
   untrusted.
+
+### Amendment — #3171: omit default-reachable blobs without changing the commit/tree walk
+
+`captureCheckpointDefault` in `agent/src/git.ts` accepts only the exact server
+default-branch name from the run claim as name authority. The runner's
+`checkpointDefaultBranch` preserves that string, including Unicode, without trimming;
+Git validates it as a literal branch name. The captured `defaultBlobSha` must resolve
+as a commit at `refs/remotes/origin/<server name>`. An available symbolic
+`refs/remotes/origin/HEAD` may veto a conflicting name; its absence still permits
+optimization. Mirror refs, local heads and guessed names confer no omission authority.
+Held/recovery callers without a proven server name retain the legacy producer.
+
+`prepareCheckpointObjects` preserves every commit and tree from the original
+`candidate ^floor` walk. It selects blobs from
+`candidate ^floor ^defaultBlobSha`, omitting only blobs reachable from the captured
+default commit. Production does not enumerate the whole default closure. Four
+preparation children run sequentially: a commit listing, the original object listing,
+the default-excluded object listing, and a `cat-file` classifier. The classifier
+drains stdout while writing stdin concurrently, with bounded write backpressure.
+The selected object rows feed an explicit `pack-objects --stdout` producer; the
+legacy producer uses `pack-objects --revs --stdout` with the original
+`candidate ^floor` input. Neither producer uses thin packs.
+
+Preparation is capped at 65,536 retained object records, a 16 MiB charged metadata
+budget (retained rows and bookkeeping/copies, plus a separate 16 MiB ceiling on
+consumed metadata and diagnostics), 64 KiB per line, and 5 seconds within the remaining
+parent lifetime. Repeated metadata and discarded diagnostics count toward the consumed
+ceiling. Exhausting a preparation bound while the parent remains live permits the
+original revision producer only after preparation I/O and child exit/reap have joined
+with verified cleanup. Parent abort or deadline expiry never authorizes fallback;
+unverified cleanup refuses with `CheckpointUnsafeCleanupError`. Malformed or
+unterminated object rows and invalid or incomplete classification refuse with
+`ScratchPublicationError`, rather than selecting the legacy producer.
+
+The broker's named default fetch supplies its current depth-1 snapshot for validation;
+it does not reconstruct omitted historical blobs. The forge already holds those
+default-reachable blobs and receives the worker's pack verbatim. Actual protected-path
+differences still refuse as `ci_config_guard`. No trees outside the original walk
+are newly promised: missing-floor-tree strictness in the existing guard is inherited.
+The existing scan and pack budgets, HTTP protocol, broker fetch depth and inflation
+limits remain unchanged.
 
 ### Per-flight sink gate and preemption
 

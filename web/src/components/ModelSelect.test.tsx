@@ -4,6 +4,7 @@ import { useState } from "react";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { Harness as HarnessKind } from "../lib/api";
 import { ModelSelect } from "./ModelSelect";
+import { CODEX_CURATED_MODELS } from "../lib/codexModels";
 import { Field } from "./ui";
 
 afterEach(cleanup);
@@ -132,6 +133,16 @@ describe("ModelSelect — harness-scoped vocabulary (PRD #1429 D6)", () => {
     expect(screen.queryByRole("option", { name: "opus" })).toBeNull();
   });
 
+  // PRD #3245: the Codex picker's model options are exactly the shared curated list
+  // (itself pinned to fixtures/codex-models/models.json), nothing more, nothing less.
+  it("offers exactly CODEX_CURATED_MODELS as the Codex model options", () => {
+    render(<Harness initial="" pickerHarness="codex" />);
+    const models = Array.from(combo().options)
+      .map((o) => o.value)
+      .filter((v) => v !== "inherit");
+    expect(models).toEqual([...CODEX_CURATED_MODELS]);
+  });
+
   it("selects a curated Codex alias when the value is one", () => {
     render(<Harness initial="gpt-6-astra" pickerHarness="codex" />);
     expect(combo().value).toBe("gpt-6-astra");
@@ -213,5 +224,28 @@ describe("ModelSelect — provider-specific custom placeholder (PRD #1551 M3)", 
     render(<Harness initial="claude-opus-4-8" pickerHarness="claude" />);
     const custom = screen.getByLabelText("Custom model ID") as HTMLInputElement;
     expect(custom.placeholder).toBe("claude-…");
+  });
+});
+
+// PRD #3245: callers learn when the picker is in custom mode, so an empty custom ID can
+// be refused rather than silently saved as Default.
+describe("ModelSelect — custom-mode report (PRD #3245)", () => {
+  it("reports custom mode on Other… and leaves it on a curated pick", () => {
+    const seen: boolean[] = [];
+    function Reporting() {
+      const [model, setModel] = useState("opus");
+      return <ModelSelect value={model} onChange={setModel} onCustomModeChange={(c) => seen.push(c)} />;
+    }
+    render(<Reporting />);
+    expect(seen[seen.length - 1]).toBe(false);
+    fireEvent.change(combo(), { target: { value: "custom" } });
+    expect(seen[seen.length - 1]).toBe(true);
+    fireEvent.change(combo(), { target: { value: "sonnet" } });
+    expect(seen[seen.length - 1]).toBe(false);
+  });
+
+  it("wires aria-describedby onto the select", () => {
+    render(<ModelSelect value="" onChange={() => {}} ariaDescribedBy="hint" />);
+    expect(combo().getAttribute("aria-describedby")).toBe("hint");
   });
 });

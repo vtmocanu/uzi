@@ -574,10 +574,12 @@ select_clone(){
         and (if .stage == "captured" or .stage == "adopting" or .stage == "ready-for-model" then has("restoreTip") else true end)
         and (if .stage == "ready-for-model" then has("successor") else true end);
       def journal:
-        . as $j | type == "object" and fields(["runId","clonePath","attemptId","restoreTip","recovery","retainedSources"])
+        . as $j | type == "object" and fields(["runId","clonePath","attemptId","restoreTip","recovery","retainedSources","peeledMarkers"])
         and ({runId,clonePath} + (if has("attemptId") then {attemptId} else {} end)
           + (if has("restoreTip") then {restoreTip} else {} end) | src)
         and (if has("retainedSources") then (.retainedSources | type) == "array" and all(.retainedSources[]; src) else true end)
+        and (if has("peeledMarkers") then (.peeledMarkers | type) == "array" and (.peeledMarkers | length) <= 64
+             and all(.peeledMarkers[]; sha) and ((.peeledMarkers | unique | length) == (.peeledMarkers | length)) else true end)
         and (if has("recovery") then
           (.recovery | progress) and
           (same(.recovery.source) or any((.retainedSources // [])[]; same($j)) or

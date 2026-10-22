@@ -484,3 +484,26 @@ describe("RunRunner — capture-first wall park (PRD #1497 M2)", () => {
     }
   });
 });
+
+describe("3282 refused wall history delivery", () => {
+  for (const count of [0, 1, -1, 0.5]) it(`3282 refused count ${count} refresh is fenced and consumed once`, async () => {
+    const claim = { ...gitlabClaim(328202), claim_generation: 7 };
+    api.setWallParkResponse("running", 409, { total: 120, used: 60, completionAttempts: count });
+    api.parkRunOwnership = { status: "running", claim_generation: 7, hold_reason: null, claim_released: false };
+    let outcome: WallParkOutcome | undefined;
+    let refresh: ReturnType<NonNullable<RunContext["takeWallParkRefresh"]>>;
+    let second: typeof refresh;
+    const { gitlab } = fakeGitlab();
+    await runnerWithGit(() => ({ executor: { run: async ctx => {
+      outcome = await ctx.parkForWall!({ completedCount: 0 });
+      refresh = ctx.takeWallParkRefresh!();
+      second = ctx.takeWallParkRefresh!();
+      return { branch: ctx.branch, walled: { reason: "3282 stop" } };
+    } } }), gitlab).execute(claim);
+    assert.equal(outcome, "refused");
+    assert.deepEqual(refresh!, { totalSeconds: 120, usedSeconds: 60,
+      ...(Number.isSafeInteger(count) && count >= 0 ? { completionAttempts: count } : {}) });
+    assert.equal(second!, undefined);
+    assert.equal(api.wallParkRequests.length, 1);
+  });
+});

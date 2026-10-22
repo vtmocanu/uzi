@@ -9,7 +9,7 @@ import { useState } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { api, type UserSettingsPatch } from "../lib/api";
 import { CrossCheckDefaults } from "../components/CrossCheckDefaults";
-import type { UserSettings, BindMode } from "../lib/apiTypes";
+import type { UserSettings, BindMode, ModelSettingCell } from "../lib/apiTypes";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
 import { Alert, Badge, Button, Card, Field, SectionTitle, Select, Skeleton } from "../components/ui";
@@ -17,6 +17,8 @@ import { DEFAULT_CODEX_MODEL, ModelSelect } from "../components/ModelSelect";
 import { EffortSelect } from "../components/EffortSelect";
 import { HarnessPicker } from "../components/HarnessPicker";
 import { modelFieldWarning } from "../lib/agentTemplates";
+import { CODEX_ROLE_MODELS } from "../lib/codexModels";
+import { modelSettingSourceLabel } from "../lib/modelSettings";
 import { SettingsShell } from "../components/SettingsShell";
 import { hasAnthropicToken, isCodexUsable } from "../lib/hasToken";
 import {
@@ -32,6 +34,21 @@ import {
 // user-authored token label can collide with. Module scope, not inside the
 // component, so it is one stable <option> identity rather than a new string per render.
 const AUTO_OPTION = "\u0000auto";
+
+// The judge model cells' labels (PRD #3245): "Default · <model> (<source>)" for the
+// select's reset option and "In effect: <model> · <source>" beneath it. Both read the
+// server's judge_models cell; an older server without cells gets a neutral label.
+function judgeDefaultLabel(cell: ModelSettingCell | undefined): string {
+  return cell
+    ? `Default \u00b7 ${cell.default_model} (${modelSettingSourceLabel("model", cell.default_source)})`
+    : "Default";
+}
+
+function judgeInEffect(cell: ModelSettingCell): string {
+  return `In effect: ${cell.resolved_model} \u00b7 ${modelSettingSourceLabel("model", cell.source)}`;
+}
+
+const CUSTOM_EMPTY_MESSAGE = "Enter a model ID, or choose Default.";
 
 export function RunDefaults() {
   const { user, refresh, judgeEnforcedByAdmin, effectiveJudgeModel, uziLabel } = useAuth();
@@ -281,11 +298,15 @@ export function RunDefaults() {
   const [claudeUsable, setClaudeUsable] = useState(false);
   const [codexUsable, setCodexUsable] = useState(false);
 
-  // Per-user judge model (PRD #69 M2): "" = inherit the instance judge_model. Its own
-  // saved/busy pair, independent of the worker model above — they write the same
-  // /me/settings endpoint but each sends only its own field.
+  // Per-user judge models, one per harness (PRD #69 M2, PRD #3245): "" = Default (the
+  // instance value, then the built-in). Each lane keeps its own saved snapshot so one
+  // "Save judge models" sends only the lanes that changed. Busy is shared: one request.
   const [judgeModel, setJudgeModel] = useState("");
   const [savedJudgeModel, setSavedJudgeModel] = useState("");
+  const [judgeModelCustom, setJudgeModelCustom] = useState(false);
+  const [codexJudgeModel, setCodexJudgeModel] = useState("");
+  const [savedCodexJudgeModel, setSavedCodexJudgeModel] = useState("");
+  const [codexJudgeModelCustom, setCodexJudgeModelCustom] = useState(false);
   const [judgeModelBusy, setJudgeModelBusy] = useState(false);
 
   // Per-user run-summary model (PRD #362 M2): "" = inherit the instance summary_model.
@@ -329,6 +350,9 @@ export function RunDefaults() {
       const jm = settings.judge_model ?? "";
       setJudgeModel(jm);
       setSavedJudgeModel(jm);
+      const cjm = settings.codex_judge_model ?? "";
+      setCodexJudgeModel(cjm);
+      setSavedCodexJudgeModel(cjm);
       const sm = settings.summary_model ?? "";
       setSummaryModel(sm);
       setSavedSummaryModel(sm);
@@ -361,28 +385,53 @@ export function RunDefaults() {
   const pooledCount = secrets.filter((s) => s.auto_eligible && s.enabled !== false).length;
 
 
+  // The judge cells are server-resolved (user > instance > built-in, per harness), so
+  // the Default labels and In-effect lines describe the SAVED state.
+  const claudeJudgeCell = committedSettings?.judge_models?.find((c) => c.harness === "claude");
+  const codexJudgeCell = committedSettings?.judge_models?.find((c) => c.harness === "codex");
   // Same validation path as the worker model (PRD #69 M2): the shared modelFieldWarning
-  // gates Save, so a per-user judge model can't be saved to a shape the server rejects.
-  const judgeModelWarning = modelFieldWarning(judgeModel);
-  const judgeModelDirty = judgeModel.trim() !== savedJudgeModel;
+  // gates Save, so a judge model can't be saved to a shape the server rejects. The Claude
+  // lane also refuses a Codex id (the server's Claude-lane guard, PRD #3245).
+  const claudeJudgeTrimmed = judgeModel.trim();
+  const judgeModelWarning =
+    modelFieldWarning(judgeModel) ||
+    (CODEX_ROLE_MODELS.includes(claudeJudgeTrimmed)
+      ? `Not a Claude model: ${claudeJudgeTrimmed} is a Codex model, so Claude judges skip it. Choose Default to clear it.`
+      : "");
+  const codexJudgeModelWarning = modelFieldWarning(codexJudgeModel);
+  const judgeModelDirty = claudeJudgeTrimmed !== savedJudgeModel;
+  const codexJudgeModelDirty = codexJudgeModel.trim() !== savedCodexJudgeModel;
+  // "Other (custom model ID)" with an empty box would otherwise save as Default while
+  // the picker still shows Other, so it blocks Save with an inline error instead.
+  const judgeCustomEmpty = judgeModelCustom && claudeJudgeTrimmed === "";
+  const codexJudgeCustomEmpty = codexJudgeModelCustom && codexJudgeModel.trim() === "";
 
-  const saveJudgeModel = async () => {
+  // saveJudgeModels sends ONLY the dirty lanes (null = Default) in one PUT, and adopts
+  // the response's resolved cells so the In-effect lines move with the save.
+  const saveJudgeModels = async () => {
     setError("");
     setNotice("");
     setJudgeModelBusy(true);
     try {
-      const { settings } = await api.putMySettings({ judge_model: judgeModel.trim() || null });
-      setCommittedSettings(current => current && ({ ...current, judge_model: settings.judge_model }));
-      const model = settings.judge_model ?? "";
-      setJudgeModel(model);
-      setSavedJudgeModel(model);
-      setNotice(
-        model === ""
-          ? "Judge model cleared. Your runs are judged on the instance default model."
-          : `Judge model set to ${model}. It applies to your next judged run.`,
-      );
+      const patch: UserSettingsPatch = {};
+      if (judgeModelDirty) patch.judge_model = claudeJudgeTrimmed || null;
+      if (codexJudgeModelDirty) patch.codex_judge_model = codexJudgeModel.trim() || null;
+      const { settings } = await api.putMySettings(patch);
+      setCommittedSettings(current => current && ({
+        ...current,
+        judge_model: settings.judge_model,
+        codex_judge_model: settings.codex_judge_model,
+        judge_models: settings.judge_models,
+      }));
+      const claude = settings.judge_model ?? "";
+      setJudgeModel(claude);
+      setSavedJudgeModel(claude);
+      const codex = settings.codex_judge_model ?? "";
+      setCodexJudgeModel(codex);
+      setSavedCodexJudgeModel(codex);
+      setNotice("Judge models saved. They apply to your next judged run.");
     } catch (err) {
-      setError(errorMessage(err, "Failed to save judge model"));
+      setError(errorMessage(err, "Failed to save judge models"));
     } finally {
       setJudgeModelBusy(false);
     }
@@ -698,7 +747,8 @@ export function RunDefaults() {
           <SectionTitle>Run judge</SectionTitle>
           <p className="mt-2 text-sm text-muted">
             With the run judge on, each of your <strong className="text-fg">finished</strong> runs is
-            reviewed by an LLM on <strong className="text-fg">your own Anthropic tokens</strong>. It reads
+            reviewed by an LLM on the <strong className="text-fg">credential of the run&rsquo;s harness</strong>:
+            your Anthropic token for a Claude run, your Codex credential for a Codex run. It reads
             the run trace and produces a verdict plus recommendations (a missing worker tool, an agent or
             template to improve, and so on). Results appear on the Judge page and on the run&rsquo;s page,
             plus a Slack DM when your Slack account is linked. It only recommends and never changes code. Your
@@ -706,17 +756,25 @@ export function RunDefaults() {
           </p>
         </div>
 
-        {/* Enforced-mode banner (PRD #69 M4). When the admin turns on enforce-all, the
-            judge runs on EVERY finished run regardless of the opt-in below, still on the
-            user's own token — so the honest opt-out is removing the token, not this
-            toggle. effective_judge_model names the model that token will actually run. */}
+        {/* Enforced-mode banner (PRD #69 M4, PRD #3245). When the admin turns on
+            enforce-all, the judge runs on EVERY finished run regardless of the opt-in
+            below, still on the user's own credential for the run's harness — so the honest
+            opt-out is removing that credential, not this toggle. It names both resolved
+            judge models; an older server without judge_models falls back to the Claude
+            lane's effective_judge_model. */}
         {judgeEnforcedByAdmin && (
           <Alert
             tone="warning"
             message={
               `Your admin has ENFORCED the run judge: every one of your finished runs is judged on ` +
-              `your own Anthropic token${effectiveJudgeModel ? ` (model: ${effectiveJudgeModel})` : ""}, ` +
-              `whether or not the opt-in below is on. The only way to opt out is to remove your Anthropic token.`
+              `your own credential for the run's harness` +
+              (claudeJudgeCell && codexJudgeCell
+                ? ` (Claude runs on ${claudeJudgeCell.resolved_model}, Codex runs on ${codexJudgeCell.resolved_model})`
+                : effectiveJudgeModel
+                  ? ` (Claude runs on ${effectiveJudgeModel})`
+                  : "") +
+              `, whether or not the opt-in below is on. The only way to opt out is to remove your ` +
+              `credential for that harness.`
             }
           />
         )}
@@ -790,8 +848,9 @@ export function RunDefaults() {
               </optgroup>
             </Select>
             <p className="mt-1.5 text-xs text-faint">
-              Retrospectives can bill a different account from the runs they review — point them at
-              a cheaper console key while your runs stay on a subscription.
+              Used when the judge reviews a Claude run. Retrospectives can bill a different account from
+              the runs they review — point them at a cheaper console key while your runs stay on a
+              subscription.
             </p>
             {/* Empty-pool warning, D4 wording: unlike a worker (which holds), an auto
                 judge lane with an empty pool spends the default token. role=status /
@@ -805,25 +864,86 @@ export function RunDefaults() {
           </Field>
         )}
 
-        {/* Per-user judge model (PRD #69 M2). Leave on Inherit to use the instance
-            judge model the admin picked; pinning one here overrides it for YOUR judged
-            runs only, and applies in enforced mode too. Same picker + validation as the
-            worker model, so a bad model blocks Save rather than failing on the next run. */}
+        {/* Per-user judge models, one per harness (PRD #69 M2, PRD #3245). Default
+            follows the instance value, then the built-in; pinning one here overrides it
+            for YOUR judged runs only, and applies in enforced mode too. Each lane is shown
+            by the same rule as the worker-model lanes (showClaudeLane / showCodexLane);
+            the Codex lane offers only the curated models. */}
         <div className="space-y-3">
-          <Field label="Judge model" htmlFor="judge-model">
-            <ModelSelect id="judge-model" value={judgeModel} onChange={setJudgeModel} />
-          </Field>
+          <div className={`grid gap-4${showClaudeLane && showCodexLane ? " sm:grid-cols-2" : ""}`}>
+            {showClaudeLane && (
+              <div className="space-y-1.5">
+                <Field label="Claude judge model" htmlFor="judge-model">
+                  <ModelSelect
+                    id="judge-model"
+                    harness="claude"
+                    value={judgeModel}
+                    onChange={setJudgeModel}
+                    onCustomModeChange={setJudgeModelCustom}
+                    defaultLabel={judgeDefaultLabel(claudeJudgeCell)}
+                    customAriaLabel="Custom Claude judge model ID"
+                    ariaDescribedBy={claudeJudgeCell ? "judge-model-effect" : undefined}
+                  />
+                </Field>
+                {claudeJudgeCell && (
+                  <p id="judge-model-effect" className="text-xs text-faint">
+                    {judgeInEffect(claudeJudgeCell)}
+                  </p>
+                )}
+                {judgeCustomEmpty && (
+                  <p className="text-xs text-danger" role="alert">
+                    {CUSTOM_EMPTY_MESSAGE}
+                  </p>
+                )}
+                {judgeModelWarning && <Alert message={judgeModelWarning} tone="warning" />}
+              </div>
+            )}
+            {showCodexLane && (
+              <div className="space-y-1.5">
+                <Field label="Codex judge model" htmlFor="codex-judge-model">
+                  <ModelSelect
+                    id="codex-judge-model"
+                    harness="codex"
+                    allowCustom={false}
+                    value={codexJudgeModel}
+                    onChange={setCodexJudgeModel}
+                    onCustomModeChange={setCodexJudgeModelCustom}
+                    defaultLabel={judgeDefaultLabel(codexJudgeCell)}
+                    customAriaLabel="Custom Codex judge model ID"
+                    ariaDescribedBy={codexJudgeCell ? "codex-judge-model-effect" : undefined}
+                  />
+                </Field>
+                {codexJudgeCell && (
+                  <p id="codex-judge-model-effect" className="text-xs text-faint">
+                    {judgeInEffect(codexJudgeCell)}
+                  </p>
+                )}
+                {codexJudgeCustomEmpty && (
+                  <p className="text-xs text-danger" role="alert">
+                    {CUSTOM_EMPTY_MESSAGE}
+                  </p>
+                )}
+                {codexJudgeModelWarning && <Alert message={codexJudgeModelWarning} tone="warning" />}
+              </div>
+            )}
+          </div>
           <p className="text-xs text-faint">
-            The Claude model your finished runs are judged on. Leave it on <em>Inherit</em> to use the
-            instance default (opus unless your admin changed it); pin a cheaper alias to spend less.
+            The judge runs on the harness of the run it reviews, so each harness has its own judge model.
+            Leave it on Default to follow your instance&rsquo;s choice; pin a cheaper model to spend less.
           </p>
-          {judgeModelWarning && <Alert message={judgeModelWarning} tone="warning" />}
           <Button
             type="button"
-            disabled={judgeModelBusy || !judgeModelDirty || judgeModelWarning !== ""}
-            onClick={saveJudgeModel}
+            disabled={
+              judgeModelBusy ||
+              !(judgeModelDirty || codexJudgeModelDirty) ||
+              (judgeModelDirty && judgeModelWarning !== "") ||
+              (codexJudgeModelDirty && codexJudgeModelWarning !== "") ||
+              judgeCustomEmpty ||
+              codexJudgeCustomEmpty
+            }
+            onClick={saveJudgeModels}
           >
-            Save judge model
+            Save judge models
           </Button>
         </div>
       </Card>

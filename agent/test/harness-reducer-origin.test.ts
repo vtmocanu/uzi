@@ -111,3 +111,25 @@ test("M3 park signal folds only from the main assistant", async () => {
   assert.equal((await reduceRaw([frame({ parent_tool_use_id: "child" })])).result.parkRun, undefined);
   assert.equal((await reduceRaw([frame()])).result.parkRun, true);
 });
+
+// Issue #3139: the per-turn lead-tool-call stall input.
+test("leadToolCall is set only by a main-origin non-signal tool start", async () => {
+  const tool = (name: string, markers: Record<string, unknown> = {}) => ({
+    type: "assistant", ...markers,
+    message: { content: [{ type: "tool_use", id: "t1", name, input: {} }] },
+  });
+  assert.equal((await reduceRaw([tool("Read")])).result.leadToolCall, true);
+  assert.equal((await reduceRaw([tool("mcp__uzi__signal_done")])).result.leadToolCall, undefined, "signal tool");
+  assert.equal((await reduceRaw([tool("Read", { parent_tool_use_id: "child" })])).result.leadToolCall, undefined, "subagent origin");
+  assert.equal((await reduceRaw([assistant("prose only")])).result.leadToolCall, undefined);
+});
+
+test("leadToolCall folds from an activity marker and resets each turn", async () => {
+  const reducer = new RunTurnReducerImpl({ request: () => {}, get: async () => undefined });
+  reducer.beginTurn();
+  await reducer.accept({ kind: "activity", leadToolCall: true });
+  assert.equal(reducer.finish({ kind: "exhausted" }).result.leadToolCall, true);
+  reducer.beginTurn();
+  await reducer.accept({ kind: "activity", modelInitiated: true });
+  assert.equal(reducer.finish({ kind: "exhausted" }).result.leadToolCall, undefined);
+});

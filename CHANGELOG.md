@@ -33,6 +33,9 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 ### Changed
 
+- **Routine dependency updates ([#3266](https://github.com/vtmocanu/uzi/pull/3266), [#3290](https://github.com/vtmocanu/uzi/pull/3290)).**
+  Dependency manifest and image bumps that carry no entry of their own.
+
 - **Routine dependency updates ([#3019](https://github.com/vtmocanu/uzi/pull/3019), [#3134](https://github.com/vtmocanu/uzi/pull/3134), #3175).**
   Dependency manifest and image bumps that carry no entry of their own.
 
@@ -960,6 +963,27 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Codex implementation keeps `park_run` after plan approval ([#3138](https://github.com/vtmocanu/uzi/pull/3138)).**
   The Codex root registers `park_run` from planning so the resumed implementation thread can park; only implementation may execute it.
+
+- **Parked runs no longer save core dumps or files over 8 MiB into WIP auto-saves, and a retained-recovery successor no longer builds on a throwaway WIP commit hidden under a recovery coverage commit ([#3239](https://github.com/vtmocanu/uzi/pull/3239)).**
+  Such files stay on disk, the clone is kept and the capture stays unverified until they are removed; a WIP marker under a verified coverage wrapper is restored as uncommitted changes, and unproven look-alikes are refused for owner action. Checkpoints published before this fix and adopted through the tracking or checkpoint legs are not peeled.
+
+- **A run created with your own plan no longer waits for a plan approval that never comes ([#3272](https://github.com/vtmocanu/uzi/pull/3272)).**
+  On both Claude and Codex the lead is now told the plan is owner-supplied with no plan gate, so it implements instead of re-drafting the plan or parking; Codex also receives the plan in a framed block on implementation turns, including completion rework, clarification continuations and a fresh thread after resume rejection. The neutral completion recheck after an owner decision keeps the original plan out of its turn prompt so it cannot compete with revised frozen scope; the seeded system instructions still apply.
+
+- **A run seeded from an origin branch publishes its first checkpoint before its first new commit ([#3284](https://github.com/vtmocanu/uzi/pull/3284)).**
+  The push broker now creates the missing checkpoint ref at the published branch tip instead of refusing it not_descendant, so a seeded successor's tick and pause no longer skip.
+
+- **Checkpoint packs avoid resending blobs already on the default branch ([#3171](https://github.com/vtmocanu/uzi/pull/3171)).**
+  Commits and trees remain intact; bounded preparation uses a captured server-named default snapshot and falls back safely when its own limits are reached.
+
+- **An owner token switch on a run with retained recovery work no longer fails it worker_residue_blocked ([#3181](https://github.com/vtmocanu/uzi/pull/3181), #3281).**
+  The worker now proves the run's processes stopped before reporting the switch, else the run is held for its owner (credential_switch_settling, then credential_switch_unsettled; Resume or Cancel), and the next claim still runs its fail-closed predecessor proof. An API without the credential_switch_hold feature, a refused hold report, or a retained flight at an awaiting gate keeps the previous non-terminal stop. An unconfirmed hold report still retains its fenced post-join acknowledgement and bounded retry, so a missed confirmation no longer silently skips that acknowledgement.
+
+- **Live database CI retries image pulls and falls back to Docker Hub.**
+  The PostgreSQL integration job retains its exact image digest while recovering from mirror failures, with bounded pull retries and database readiness checks.
+
+- **Docker-lane hosted workers keep their run clones on the data volume across pod replacement ([#3153](https://github.com/vtmocanu/uzi/pull/3153), #3215).**
+  The worker image carrying the runner-shared layout must roll with or before the controller (a new controller refuses an older image), and a Docker worker holding recovery custody stays on the old emptyDir layout until custody releases, so its roll is held and ForceRoll does not override it.
 
 ### Security
 

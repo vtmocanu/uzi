@@ -1769,7 +1769,7 @@ describe("GitCache mid-turn primitives (issue #1597 M2)", () => {
       calls.push({ args, stdin });
       const stdout = new PassThrough();
       stdout.end();
-      return { stdout, exited: Promise.resolve(0), cancel: () => {} };
+      return { stdout, exited: Promise.resolve(0), settled: async () => {}, cancel: () => {} };
     };
     let out;
     const range = { tipSha: tip, excludeSha: base };

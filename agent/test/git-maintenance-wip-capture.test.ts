@@ -268,6 +268,53 @@ describe("guarded maintenance WIP capture", { skip: process.platform !== "linux"
     assert.equal(await fs.readFile(path.join(f.root, "visible"), "utf8"), "new");
   });
 
+  // issue #3239: the maintenance marker refuses the same files the park auto-save omits.
+  const CAP = 8 * 1024 * 1024;
+  for (const [name, file, bytes] of [["an untracked file over 8 MiB", "big.bin", CAP + 1],
+    ["a core dump", "core.4242", 16], ["a nested bare core file", "sub/core", 16]] as const) {
+    test("refuses " + name + ": no commit, HEAD unchanged, file kept (#3239)", async t => {
+      const f = await fixture(t);
+      await f.dirty();
+      await fs.mkdir(path.join(f.root, path.dirname(file)), { recursive: true });
+      await fs.writeFile(path.join(f.root, file), Buffer.alloc(bytes, 0x61));
+      await assert.rejects(f.capture(), /maintenance_wip_capture_refused/);
+      assert.ok(!f.events.includes("launch:commit"), "refused before commit");
+      assert.equal(f.head(), f.old);
+      assert.equal((await fs.stat(path.join(f.root, file))).size, bytes);
+      assert.equal(await fs.readFile(path.join(f.root, "tracked"), "utf8"), "changed");
+    });
+  }
+
+  test("an oversized TRACKED modification is refused; a file of exactly 8 MiB commits (#3239)", async t => {
+    const f = await fixture(t);
+    await fs.writeFile(path.join(f.root, "tracked"), Buffer.alloc(CAP + 1, 0x62));
+    await assert.rejects(f.capture(), /maintenance_wip_capture_refused/);
+    assert.ok(!f.events.includes("launch:commit"), "refused before commit");
+    assert.equal(f.head(), f.old);
+    assert.equal((await fs.stat(path.join(f.root, "tracked"))).size, CAP + 1);
+    const g = await fixture(t);
+    await g.dirty();
+    await fs.writeFile(path.join(g.root, "exact.bin"), Buffer.alloc(CAP, 0x61));
+    await fs.writeFile(path.join(g.root, "score.1"), "not a core file");
+    const result = await g.capture();
+    assert.equal(result.kind, "committed");
+    assert.equal(g.gitIn("cat-file", "-s", "HEAD:exact.bin").trim(), String(CAP));
+    assert.equal(g.gitIn("show", "HEAD:score.1"), "not a core file");
+  });
+
+  test("a core file and an oversized blob already in HEAD do not block an unrelated capture (#3239)", async t => {
+    const f = await fixture(t);
+    await fs.writeFile(path.join(f.root, "core"), "committed earlier");
+    await fs.writeFile(path.join(f.root, "huge.bin"), Buffer.alloc(CAP + 1, 0x63));
+    f.gitIn("add", "-A"); f.gitIn("commit", "-m", "history already holds them");
+    const base = f.head();
+    await f.dirty();
+    const result = await f.capture(undefined, f.root, base);
+    assert.equal(result.kind, "committed");
+    assert.equal(result.parent, base);
+    assert.equal(f.gitIn("show", "HEAD:tracked"), "changed");
+  });
+
   test("clean is explicit, HEAD/index unchanged and only status attempted", async t => {
     const f = await fixture(t);
     assert.deepEqual(await f.capture(), { kind: "clean", head: f.old, parent: null });

@@ -13,7 +13,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
+	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/toolprofile"
 )
@@ -1188,36 +1190,39 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, wkr store.Worker, run 
 		targetCostStatus, targetCostUSD = s.targetCostContext(ctx, uuid.UUID(run.TargetRunID.Bytes))
 	}
 
-	// Judge model resolution is user-value-wins (PRD #69 M2, Decision 5): the run
-	// owner's per-user judge_model overrides the instance judge_model for their
-	// own judge runs; NULL/blank inherits the instance value. The whole thing
-	// stays inside the s.settings != nil guard — a nil-settings deployment never
-	// enqueues judges. On a user-row read error we fall back to the instance value
-	// best-effort with a log; we NEVER send an empty model to the SDK.
+	// Judge model resolution is per harness lane (PRD #3245): the run owner's lane value
+	// for the judge run's harness > the instance value for that harness > the built-in,
+	// via agenttmpl.ResolveJudgeModel. A stored value invalid for its lane (legacy data)
+	// is skipped with ONE visible fallback note and resolution continues, so the claim
+	// always carries a concrete model valid for the harness. The whole thing stays inside
+	// the s.settings != nil guard (a nil-settings deployment never enqueues judges). A read
+	// error on either tier is logged and that tier is treated as unset: a claim never
+	// fails on it, and an empty model is never sent to the SDK.
 	var judgeModel *string
 	if s.settings != nil {
-		if um, err := s.q.GetUserJudgeModel(ctx, run.UserID); err != nil {
-			slog.Warn("judge claim: read user judge model", "user", run.UserID.String(), "error", err)
-		} else if um.Valid && strings.TrimSpace(um.String) != "" {
-			m := um.String
-			judgeModel = &m
+		harness := Harness(run.Harness)
+		instanceKey := settings.KeyJudgeModel
+		if harness == HarnessCodex {
+			instanceKey = settings.KeyCodexJudgeModel
 		}
-		if judgeModel == nil {
-			if m, err := s.settings.JudgeModel(ctx); err == nil && strings.TrimSpace(m) != "" {
-				judgeModel = &m
-			}
+		var userModel string
+		if um, err := s.q.GetUserJudgeModels(ctx, run.UserID); err != nil {
+			slog.Warn("judge claim: read user judge models", "user", run.UserID.String(), "error", err)
+		} else if harness == HarnessCodex {
+			userModel = um.CodexJudgeModel.String
+		} else {
+			userModel = um.JudgeModel.String
 		}
-	}
-
-	// PRD #1429 D6: the model vocabulary is harness-owned, same guard as the ordinary lane
-	// (claim_assembly.go). A judge model incompatible with the judge run's OWN harness (a
-	// Claude alias resolved for a Codex judge, or the reverse) is dropped so the worker uses
-	// its own harness default, and a VISIBLE nonsecret status note is recorded — a Claude
-	// alias must never reach a Codex judge claim, nor a Codex model a Claude judge claim.
-	if judgeModel != nil && !harnessModelCompatible(Harness(run.Harness), *judgeModel) {
-		dropped := *judgeModel
-		judgeModel = nil
-		recordedLastSeq = s.recordHarnessModelFallbackNote(ctx, run, recordedLastSeq, Harness(run.Harness), dropped)
+		instanceModel, err := s.settings.InstanceModel(ctx, instanceKey)
+		if err != nil {
+			slog.Warn("judge claim: read instance judge model", "key", instanceKey, "error", err)
+			instanceModel = ""
+		}
+		res := agenttmpl.ResolveJudgeModel(string(harness), userModel, instanceModel)
+		judgeModel = &res.Model
+		if len(res.Dropped) > 0 {
+			recordedLastSeq = s.recordHarnessModelFallbackNote(ctx, run, recordedLastSeq, harness, res.Dropped[0])
+		}
 	}
 
 	// The owner's existing improve_uzi target coordinates (issue #232), read best-effort:

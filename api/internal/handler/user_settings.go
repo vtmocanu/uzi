@@ -14,8 +14,10 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/theme"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
@@ -47,7 +49,10 @@ type userSettingsDTO struct {
 	DefaultEffort      *string `json:"default_effort"`
 	DefaultCodexEffort *string `json:"default_codex_effort"`
 	JudgeModel         *string `json:"judge_model"`
-	SummaryModel       *string `json:"summary_model"`
+	// CodexJudgeModel is the Codex judge lane (PRD #3245): null = inherit the instance
+	// Codex judge model; a value is a curated Codex id.
+	CodexJudgeModel *string `json:"codex_judge_model"`
+	SummaryModel    *string `json:"summary_model"`
 	// Theme is the DEPRECATED legacy single-theme override (PRD #21); kept one
 	// release. The appearance override lives in the four fields below (PRD #1167).
 	Theme *string `json:"theme"`
@@ -78,6 +83,9 @@ type userSettingsDTO struct {
 	// null = "no preference", so implicit run creation falls through D11 rather than pinning.
 	// A non-null value is one of the closed claude|codex set (validateHarness gates the write).
 	DefaultHarness *string `json:"default_harness"`
+	// JudgeModels is the read-only resolved view of both judge lanes (PRD #3245), ordered
+	// claude then codex. It is never accepted on a PUT.
+	JudgeModels []apitypes.ModelSettingCellDTO `json:"judge_models"`
 }
 
 // userSettingsResponse reads the user's settings row (one GetUserSettings query,
@@ -121,6 +129,20 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 	if effHarness == workersvc.HarnessCodex {
 		legacyModel = s.DefaultCodexModel
 	}
+	// The judge cells resolve from the stored user lanes and ONE instance read. A missing
+	// settings reader or a read error leaves the instance tier unset, so the cells fall
+	// back to the built-ins rather than failing the settings read.
+	instance := map[string]string{}
+	if h.settings != nil {
+		vals, ierr := h.settings.InstanceModels(r.Context(), []string{settings.KeyJudgeModel, settings.KeyCodexJudgeModel})
+		if ierr != nil {
+			slog.Error("read instance judge models", "error", ierr)
+		} else {
+			instance = vals
+		}
+	}
+	judgeLane := textPtrValue(s.JudgeModel.Valid, s.JudgeModel.String)
+	codexJudgeLane := textPtrValue(s.CodexJudgeModel.Valid, s.CodexJudgeModel.String)
 	// summary_model rides the GetUserSettings one-row read (it is the same users row),
 	// so the settings surface reads it from `s` — no separate query. GetUserSummaryModel
 	// stays the narrow read for issue-run claim assembly, where no other user field is
@@ -133,7 +155,8 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 			DefaultCodexModel:      textPtrValue(s.DefaultCodexModel.Valid, s.DefaultCodexModel.String),
 			DefaultEffort:          textPtrValue(s.DefaultEffort.Valid, s.DefaultEffort.String),
 			DefaultCodexEffort:     textPtrValue(s.DefaultCodexEffort.Valid, s.DefaultCodexEffort.String),
-			JudgeModel:             textPtrValue(s.JudgeModel.Valid, s.JudgeModel.String),
+			JudgeModel:             judgeLane,
+			CodexJudgeModel:        codexJudgeLane,
 			SummaryModel:           textPtrValue(s.SummaryModel.Valid, s.SummaryModel.String),
 			Theme:                  textPtrValue(s.Theme.Valid, s.Theme.String),
 			MrReworkEnabled:        boolPtrValue(s.MrReworkEnabled),
@@ -145,6 +168,7 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 			DarkTheme:              textPtrValue(s.DarkTheme.Valid, s.DarkTheme.String),
 			Typeface:               textPtrValue(s.Typeface.Valid, s.Typeface.String),
 			DefaultHarness:         textPtrValue(s.DefaultHarness.Valid, s.DefaultHarness.String),
+			JudgeModels:            judgeModelCells(judgeLane, codexJudgeLane, instance),
 		},
 	})
 }
@@ -213,6 +237,7 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		DefaultEffort      json.RawMessage `json:"default_effort"`
 		DefaultCodexEffort json.RawMessage `json:"default_codex_effort"`
 		JudgeModel         json.RawMessage `json:"judge_model"`
+		CodexJudgeModel    json.RawMessage `json:"codex_judge_model"`
 		SummaryModel       json.RawMessage `json:"summary_model"`
 		Theme              json.RawMessage `json:"theme"`
 		MrReworkEnabled    json.RawMessage `json:"mr_rework_enabled"`
@@ -345,14 +370,31 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusBadRequest, "invalid judge_model")
 			return
 		}
-		// Same validator as default_model (PRD #69 M2, Decision 4): nil/blank
-		// trims to NULL = inherit the instance judge_model; a bad model is a 400.
-		v, err := validateModel(raw)
+		// Same rules as default_model (PRD #69 M2, Decision 4) plus the Claude-lane
+		// guard (PRD #3245): nil/blank trims to NULL = inherit the instance judge_model;
+		// a bad model or a Codex role id is a 400.
+		v, err := validateClaudeJudgeModel(raw)
 		if err != nil {
-			httpx.Error(w, http.StatusBadRequest, err.Error())
+			httpx.Error(w, http.StatusBadRequest, "judge_model: "+err.Error())
 			return
 		}
 		judgeVal = v
+	}
+
+	var codexJudgeVal pgtype.Text
+	codexJudgePresent := req.CodexJudgeModel != nil
+	if codexJudgePresent {
+		var raw *string
+		if err := json.Unmarshal(req.CodexJudgeModel, &raw); err != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid codex_judge_model")
+			return
+		}
+		v, err := validateCodexJudgeModel(raw)
+		if err != nil {
+			httpx.Error(w, http.StatusBadRequest, "codex_judge_model: "+err.Error())
+			return
+		}
+		codexJudgeVal = v
 	}
 
 	var summaryVal pgtype.Text
@@ -598,6 +640,17 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			JudgeModel: judgeVal,
 		}); err != nil {
 			slog.Error("set user judge model", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	if codexJudgePresent {
+		if _, err := h.q.SetUserCodexJudgeModel(r.Context(), store.SetUserCodexJudgeModelParams{
+			ID:              user.ID,
+			CodexJudgeModel: codexJudgeVal,
+		}); err != nil {
+			slog.Error("set user codex judge model", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}

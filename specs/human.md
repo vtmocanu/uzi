@@ -380,6 +380,11 @@ Tracked as GitLab issue vtmocanu/uzi#46; PRD at `prds/done/46-run-judge-self-imp
 - The judge runs on the run owner's own credential for the reviewed run's harness
   (Anthropic token for a Claude run, Codex credential for a Codex run), never a
   shared one. [user 2026-07-12] (AI-synced 2026-09-24)
+- Judge model is per harness (Claude and Codex lanes), resolved user → instance
+  → built-in for the reviewed run's harness: built-ins `opus` (Claude) and
+  `gpt-6.1-sol` (Codex, user decision 2026-10-21); Codex judge models are
+  curated ids only. Supersedes the older "cheap default" wording above.
+  (AI-synced 2026-10-21)
 - Per-user opt-in/out; admin can toggle the feature globally and force-disable
   per user (existing admin settings). [user 2026-07-12]
 - Recommendations show on the Judge page and the run page (users see their own)
@@ -747,6 +752,7 @@ Tracked as GitLab issue vtmocanu/uzi#218; PRD at `prds/done/218-park-resume-work
   guaranteed. The separate episode failure remains unsolved; this decision changes no
   retention, deletion, drain, recovery framework or episode journal. [approved #3101]
   (AI-synced 2026-10-18)
+- The WIP auto-save never commits a core dump (`core`, `core.<pid>`) or a file over 8 MiB and never drops one silently: a park keeps the clone and its journal, notifies once per claim and kind, and stays unverified until the file is removed. A `wip(park):` marker under a verified coverage wrapper is restored uncommitted at successor adopt; unproven look-alikes refuse and need owner action. (AI-synced 2026-10-21)
 
 ## Feature #1392 — Park a run on a transient forge failure at clone or fetch
 
@@ -930,6 +936,7 @@ Tracked as GitHub issue vtmocanu/uzi#1226 (parent epic #1225); PRD at `prds/done
 - (AI-synced 2026-09-25) The structural completion interlock applies by default to new, unseeded issue runs on both Claude and Codex. A Codex interlocked run needs a worker advertising `codex_completion_interlock_v1` in addition to the shared completion protocol; unmet milestones return to the same Codex thread before a recoverable hold. [AI-synced, #1226]
 - (AI-synced 2026-09-13) That explicit later decision is delivered by #1227 as three bounded, revisioned, owner-only decisions — continue, partial (reduce scope by exact milestone ids → a `scope_reduced` delivery that never closes the issue) and accept (waive exact named criteria with a required reason, named in the closing PR); each creates a new contract revision and invalidates every prior permit, and the lead has no route to the decision authority. PRD at `prds/done/1227-completion-owner-decisions.md`. [AI-synced, #1227]
 - (AI-synced 2026-10-04) An owner `scope N` / `stop` directive authorizes a count-capped slice of the immutable frozen milestone list through an explicit capped permit: a `scope_capped` delivery never closes the issue; reaching the full frozen total remains a full delivery eligible to close the issue. [AI-synced, #2080]
+- (AI-synced 2026-10-21) An interlocked, non-interactive issue run that has reported a completed milestone and has no completion attempt, whose lead ends three consecutive turns with no tool call, subagent activity, worktree change or milestone-progress change, gets a worker-initiated empty completion attempt and the Completion blocked owner question; if the window expires it enters the completion hold instead of failing on the iteration budget. It never opens or updates a pull/merge request. [AI-synced, #3139]
 - (AI-synced 2026-10-20) **Built dormant, production off until #1231 (#1230):** a semantic contract profile (server-issued criterion IDs of kind worker or maintainer, an independent plan-coverage review at the exact approval decision point) and its autopilot fallback exist but no production code enrolls a run or writes a semantic planning record, so every real run stays structural or legacy with zero coverage calls. On a semantic run, autopilot auto-approves only with complete server-reported coverage, the current checker APPROVE when Plan cross-check is required, and no maintainer criteria; otherwise the run parks in `awaiting_approval` with a `semantic_park` reason and never auto-approves later in that execution. Human-authorized maintainer criteria stay explicitly unverified, publish non-closing without a redundant later decision, and are never satisfied by auto-approval, prose or checkboxes. Source drift is displayed as a detector only. Live coverage review is unavailable: Codex lacks an enforceable token cap and Claude's output cap alone does not bound a full call, so #1231 must establish enforceable bounds before activation. [AI-synced, #1230]
 - **Planned, not shipped (#1231):** semantic completion is default-on for new eligible issue runs on both harnesses, with an instance-admin new-run kill-switch and frozen bounded model/cost controls. Enrollment freezes inside the run-creation transaction before the first claim. Exact approval-point source coverage and exact-final-head audit precede publication; missing compatible capacity queues rather than downgrades. Existing run contracts remain unchanged. (AI-synced 2026-10-20)
 - **Planned, not shipped (#1231):** if the shared completion-policy settings snapshot is unreadable and uncached, new unseeded issue creation refuses retriably instead of taking the former cold-read legacy fallback. Valid cached values cover both rollout keys; seeded/non-issue paths remain unchanged. Refusal creates no run and must not silently lose a scheduled fire. (AI-synced 2026-10-17)

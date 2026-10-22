@@ -100,6 +100,7 @@ export type WallParkOutcome = "parked" | "undeliverable" | "refused" | "cancelle
  * `usedSeconds` the server's active time so far; either may be absent (an older server).
  */
 export interface WallParkRefresh {
+  completionAttempts?: number;
   totalSeconds?: number;
   usedSeconds?: number;
 }
@@ -744,12 +745,12 @@ export interface RunContext {
    *
    *  Returns TRUE for a confirmed hold or unresolved delivery: the runner preserves clone
    *  and HOME and the caller latches {@link ExecutorResult.completionHeld} to skip finalization.
-   *  Returns FALSE if capture was never verified or explicit proof refused the hold;
-   *  nothing was cleaned
-   *  up; the caller then falls through to the LEGACY terminal throw (never the destructive
-   *  cleanup). The implementation MUST NOT run the destructive clone/HOME cleanup on the false
-   *  path. */
-  enterCompletionHold?(reason: string): Promise<boolean>;
+   *  Returns FALSE if ordinary capture was never verified or explicit proof refused the hold.
+   *  Wall/budget callers permit degraded capture and stop nonterminally on a refusal; other
+   *  live refusals retain clone and HOME because they prove no covering handoff. Other callers
+   *  retain their legacy routing. The runner's proof and custody guards determine cleanup,
+   *  so a declined hold must not be described as a confirmed park. */
+  enterCompletionHold?(reason: string, options?: { allowDegradedCapture?: boolean }): Promise<boolean>;
   /** PRD #1226 M5 (D6): the completion-question LIVE window. Called at the completion-STALL point
    *  or on an eligible lead request with authoritative unmet milestones, instead of routing straight to the
    *  hold. Authors a completion-interlock question (reports `awaiting_input` marked
@@ -763,6 +764,10 @@ export interface RunContext {
    *  executor then routes to the verified park (routeCompletionHold, M4). It NEVER throws
    *  REASON_QUESTION_TIMEOUT: expiry is a normal outcome, not a failure, and it must not surface as a
    *  `failed` report. `unmet` is the server-authoritative unmet-milestone id set at the stall.
+   *
+   *  `trigger` names why the question opens: `lead_request`, `no_progress` (repeated identical
+   *  attempts) or `no_progress_stall` (a worker-initiated attempt after the lead stopped making
+   *  progress without signalling done, issue #3139).
    *
    *  Optional: nil in tests/legacy ⇒ the executor falls back to routeCompletionHold at the stall
    *  exactly as M4 behaved. Only reached on an interlocked run (see completionInterlock). */
@@ -882,10 +887,12 @@ export interface ExecutorResult {
    *  sets it. */
   completionHeld?: { reason: string };
   /** PRD #1497 M2: set when the run PARKED at its WALL-CLOCK limit (ctx.parkForWall returned
-   *  "parked" or "undeliverable"). The runner reads it in phasePublish to SKIP finalization (no
+   *  "parked" or "undeliverable"), or a post-attempt wall/budget hold was declined and the flight
+   *  stopped nonterminally. The runner reads it in phasePublish to SKIP finalization (no
    *  push, no PR, no terminal report), exactly like `pausedAt`/`completionHeld`: the wall seam
    *  already handled the run (a `paused` report on "parked", or NOTHING on "undeliverable", D17) and
-   *  the finally preserves clone + HOME. `reason` is the static, content-free failure-reason constant
+   *  the finally preserves clone + HOME on a live refusal; terminal refusals keep existing cleanup.
+   *  `reason` is the static, content-free failure-reason constant
    *  the trip used (REASON_WALL). NOT gated on run kind (all six timed kinds park at the wall) or on
    *  harness (both Claude and Codex). Absent on every normal completion. StubExecutor never sets it. */
   walled?: { reason: string };

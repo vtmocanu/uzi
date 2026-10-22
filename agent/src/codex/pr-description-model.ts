@@ -7,7 +7,7 @@
 // A Codex run's delivery summary runs on this curated model, selected in the advice request's
 // `model` field, never the claim's default_model: the editor pass is one short turn without worker callbacks (#1566 native async/UTC exceptions),
 // so it runs on `gpt-6-sol`, the curated model for the PR-description editor pass (one of the
-// contract models the advice renderer accepts, CONTRACT_MODELS in codex/render.ts). A
+// contract models the advice renderer accepts, CODEX_ROLE_MODELS in codex/render.ts). A
 // Claude run uses the resolved `summary_model` instead (PRD #362). No setting ships for it.
 
 export const CODEX_PR_DESCRIPTION_MODEL = "gpt-6-sol";

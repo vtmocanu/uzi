@@ -1856,10 +1856,30 @@ test("issue #3194 coverage: extra unattested WIP inside the restore is held even
   await fixtureFetchTracking(cache, bare, source.clonePath, branch, runId);
   const wrapper = wrapperOver(marker, planned);
   await cache.recordRecoveryCapture(bare, branch, key, source, reservation.attempts, wrapper, s);
+  // issue #3239: the fixture wrapper claims the coverage subject without its exact shape and buries a
+  // wip(park) marker, so the successor adopt now refuses it before any write (it used to be adopted
+  // and only held later by the --require-base guard).
+  await assert.rejects(cache.prepareRecoverySuccessor(bare, branch, key, source, reservation.attempts, aid(2)),
+    /successor recovery verification failed/);
+  assert.equal(journal().recovery.stage, "captured", "the episode keeps its captured source");
+});
+
+test("issue #3194 coverage: extra unattested committed work inside the restore is held even when the mapping names the attested source", async () => {
+  const reservation = await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const s = await capture();
+  const planned = git(bare, ["rev-parse", `${s}^`]);
+  fs.writeFileSync(path.join(source.clonePath, "extra.txt"), "unattested work\n");
+  git(source.clonePath, ["add", "extra.txt"]);
+  git(source.clonePath, ["-c", "user.name=t", "-c", "user.email=t@example.test", "-c", "commit.gpgsign=false",
+    "commit", "-q", "-m", "unattested commit"]);
+  const extra = git(source.clonePath, ["rev-parse", "HEAD"]);
+  await fixtureFetchTracking(cache, bare, source.clonePath, branch, runId);
+  const wrapper = wrapperOver(extra, planned);
+  await cache.recordRecoveryCapture(bare, branch, key, source, reservation.attempts, wrapper, s);
   const successor = await cache.prepareRecoverySuccessor(bare, branch, key, source, reservation.attempts, aid(2));
   assert.equal(successor.adoptedContentSource, s, "sanity: the mapping names the attested source");
-  assert.equal(fs.readFileSync(path.join(successor.path, "extra.txt"), "utf8"), "unattested WIP\n",
-    "sanity: the extra WIP is in the restored clone");
+  assert.equal(fs.readFileSync(path.join(successor.path, "extra.txt"), "utf8"), "unattested work\n",
+    "sanity: the extra work is in the restored clone");
   await assert.rejects(guardOn(successor, planned, s), BaseAttestationMissingError);
 });
 

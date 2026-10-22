@@ -22,6 +22,7 @@ import { PauseNowSignal, CredentialSwitchSignal, type PlanVerdict } from "../src
 import type { AgentTemplate, ClaimSkill, Milestone, MilestoneAgent, MilestoneProgress } from "../src/protocol.js";
 import type { JsDepsResult } from "../src/js-deps.js";
 import { mrCompletionBlock } from "../src/runner.js";
+import { SEEDED_PLAN_RULES } from "../src/seeded-plan.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
 import { detectRepoAgents } from "../src/repoagents.js";
 import { FINDINGS_SERVER_NAME, reportIncidentalIssueToolName } from "../src/findings-tools.js";
@@ -43,6 +44,8 @@ import type {
   PlanSummaryResult,
   Delta,
 } from "../src/summary-runner.js";
+import { RequestError } from "../src/client.js";
+import { REASON_COMPLETION_STALL } from "../src/completion-attempt.js";
 import { makeClaim, nonexistentWorktreeFactory, nullLogger, recordingLogger } from "./helpers.js";
 import { makeGitRepo, PR_SUMMARY_EXPECTED, PR_SUMMARY_INPUT } from "./pr-summary-fixture.js";
 
@@ -4410,6 +4413,72 @@ describe("SdkExecutor — seeded plan body reaches the implement turn (PRD #209 
     assert.match(turns[0]!.promptText ?? "", /zqx42/, "the model must actually see the reviewed plan");
     assert.match(turns[0]!.promptText ?? "", /<plan>/, "delimited as the plan to implement");
   });
+
+  // Issue #3272: an owner-supplied plan skips the gate, so the implement-phase lead system prompt
+  // swaps the plan-first lifecycle paragraphs for the seeded one. Only the implement turn is eligible.
+  describe("seeded owner-supplied plan system prompt (issue #3272)", () => {
+    const VARIANT = "This paragraph takes precedence over any plan-first";
+    const GATED = "This run has two phases";
+    const seededBase = { planApproved: true, seeded: true, approvedPlan: PLAN };
+
+    it("a seeded run's implement turn carries the variant and not the two-phase paragraph", async () => {
+      const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+      const probe = makeCtx({ ...seededBase, sessionId: "sess-parked" });
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+      assert.strictEqual(turns.length, 1);
+      const append = appendOf(turns[0]!.options.systemPrompt);
+      assert.ok(append.length > 0);
+      assert.ok(append.includes(VARIANT));
+      assert.ok(append.includes(SEEDED_PLAN_RULES));
+      assert.ok(!append.includes(GATED));
+    });
+
+    it("a gated run's plan and implement prompts carry no variant", async () => {
+      const { queryFn, turns } = fakeTurns([
+        [submitPlan("# Plan"), resultSuccess()],
+        [signalDone(), resultSuccess()],
+      ]);
+      const probe = makeCtx({ planApproved: false, approvedPlan: undefined });
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+      assert.strictEqual(turns.length, 2);
+      for (const turn of turns) {
+        const append = appendOf(turn.options.systemPrompt);
+        assert.ok(append.length > 0);
+        assert.ok(append.includes(GATED));
+        assert.ok(!append.includes(VARIANT) && !append.includes(SEEDED_PLAN_RULES));
+      }
+    });
+
+    for (const [name, over] of [
+      ["a blank plan", { approvedPlan: "  \n " }],
+      ["a missing plan", { approvedPlan: undefined }],
+      ["planApproved false", { planApproved: false }],
+    ] as [string, Partial<RunContext>][]) {
+      it(`seeded with ${name} is gated and gets no variant`, async () => {
+        const { queryFn, turns } = fakeTurns([
+          [submitPlan("# Plan"), resultSuccess()],
+          [signalDone(), resultSuccess()],
+        ]);
+        const probe = makeCtx({ ...seededBase, sessionId: null, ...over });
+        await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+        assert.strictEqual(probe.gated.length, 1, "the gate still runs");
+        for (const turn of turns) {
+          const append = appendOf(turn.options.systemPrompt);
+          assert.ok(append.length > 0);
+          assert.ok(!append.includes(VARIANT) && !append.includes(SEEDED_PLAN_RULES));
+        }
+      });
+    }
+
+    it("the session-less seeded first turn keeps its <plan> fence alongside the variant", async () => {
+      const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+      const probe = makeCtx({ ...seededBase, sessionId: null });
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+      assert.match(turns[0]!.promptText ?? "", /<plan>/);
+      assert.match(turns[0]!.promptText ?? "", /zqx42/);
+      assert.ok(appendOf(turns[0]!.options.systemPrompt).includes(VARIANT));
+    });
+  });
 });
 
 // ── PRD #209 (M2 validation, auditor-m2 delta): pin the DEFENSE-IN-DEPTH `seeded` term ──
@@ -8347,5 +8416,330 @@ describe("issue #3178 gate-approved plan reaches a session-less first implement 
     assert.equal(count(turns[0]!.promptText, SENTINEL), 1);
     assert.equal(count(turns[1]!.promptText, SENTINEL), 1, "the restart carries the plan once");
     assert.equal(count(turns[2]!.promptText, SENTINEL), 0);
+  });
+});
+
+// Issue #3139: a tool-free stalled lead on an eligible run (interlocked issue run, served
+// completion_attempts 0, a reported completed milestone) reaches the owner completion decision
+// instead of draining the iteration budget (or tripping #281 on identical wording).
+describe("SdkExecutor no-progress stall owner decision (issue #3139)", () => {
+  const REASON_410 = /the lead declined the task and made no progress/;
+  const REASON_ITER = /milestone-scaled implement\/review iteration budget/;
+  const readTool = (): SDKMessage => ({ type: "assistant", session_id: "sess-1",
+    message: { content: [{ type: "tool_use", id: "rd", name: "Read", input: { file_path: "a.txt" } }] } }) as unknown as SDKMessage;
+  const prose = (n: number): SDKMessage[] => [assistantText(`Dependency still unavailable (update ${n}).`), resultSuccess()];
+
+  /** Drives the Claude executor with a per-provider-call script; call 1 reports m1 complete. */
+  async function drive(
+    script: (call: number) => SDKMessage[],
+    over: Partial<RunContext> & { fixture?: Parameters<typeof dependencyWaitCallbacks>[0]; served?: "default" | "absent" | number } = {},
+  ) {
+    const { fixture: fixtureOpts, served, ...ctxOver } = over;
+    const fixture = dependencyWaitCallbacks({ eligible: true, ...fixtureOpts });
+    const callbacks = { ...fixture.callbacks };
+    if (served === "absent") callbacks.reportIteration = async (n) => { fixture.iterations.push(n); };
+    else if (typeof served === "number") callbacks.reportIteration = async (n) => { fixture.iterations.push(n); return { completionAttempts: served }; };
+    let calls = 0;
+    const prompts: string[] = [];
+    const queryFn: SdkQueryFn = (params) => (async function* () {
+      let continuation = "";
+      for await (const m of params.prompt) {
+        const c = (m as { message?: { content?: unknown } }).message?.content;
+        continuation = typeof c === "string" ? c : JSON.stringify(c);
+      }
+      prompts.push(continuation);
+      calls++;
+      for (const m of script(calls)) yield m;
+    })();
+    const probe = makeCtx({ ...callbacks, sessionId: "sess-1", kind: "issue", completionInterlock: true, ...ctxOver });
+    let error: string | null = null;
+    let result: Awaited<ReturnType<SdkExecutor["run"]>> | undefined;
+    try { result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx); }
+    catch (e) { error = (e as Error).message; }
+    return { fixture, probe, result, error, calls: () => calls, prompts };
+  }
+  const rp1 = (): SDKMessage[] => [reportProgress(["m1"], []), resultSuccess()];
+
+  it("a reworded stall reaches the no_progress_stall question and an expired window holds (regression pin: base hit max_iterations)", async () => {
+    const r = await drive((c) => (c === 1 ? rp1() : prose(c)));
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 4, "tripped on the third consecutive stall turn");
+    assert.deepEqual(r.fixture.questions, [[["m2"], { kind: "no_progress_stall" }]]);
+    assert.deepEqual(r.fixture.holds, [REASON_COMPLETION_STALL]);
+    assert.deepEqual(r.result?.completionHeld, { reason: REASON_COMPLETION_STALL });
+    assert.equal(r.fixture.attempts.length, 1);
+    assert.deepEqual(r.fixture.attempts[0]!.declared, []);
+    assert.ok(!("nonClosing" in r.fixture.attempts[0]!));
+    assert.ok(r.fixture.checkpoints.some((c) => c.reap === true && c.sink === "done_checkpoint"));
+    assert.equal(r.result?.prSummary, undefined);
+    assert.equal(r.result?.milestonesCompleted, undefined);
+  });
+
+  it("the #2657 dependency wait reaches the question and hold for both wordings on an eligible run", async () => {
+    for (const wording of ["identical", "reworded"] as const) {
+      const lead = scriptedDependencyWait(wording);
+      const r = await drive((c) => {
+        if (c === 1) return [reportProgress(["m1"], []), checkpointSignal(), resultSuccess()];
+        if (c === 2) return [askUserTurn(dependencyWaitQuestion), resultSuccess()];
+        return [assistantText((lead.next({ continuation: "", advertisedTools: {} }) as { text: string }).text), resultSuccess()];
+      });
+      assert.equal(r.error, null, wording);
+      assert.deepEqual(r.fixture.questions.map((q) => q[1]), [{ kind: "no_progress_stall" }], wording);
+      assert.deepEqual(r.fixture.holds, [REASON_COMPLETION_STALL], wording);
+      assert.equal(r.calls(), 5, wording);
+    }
+  });
+
+  it("trips on the last iteration instead of throwing max_iterations", async () => {
+    const r = await drive((c) => (c === 1 ? rp1() : prose(c)), { config: { max_iterations: 4 } });
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 4);
+    assert.deepEqual(r.result?.completionHeld, { reason: REASON_COMPLETION_STALL });
+    assert.equal(r.fixture.questions.length, 1);
+  });
+
+  it("a continue answer on the last iteration holds with max_iterations and runs no further turn", async () => {
+    const r = await drive((c) => (c === 1 ? rp1() : prose(c)), {
+      config: { max_iterations: 4 }, fixture: { answer: { outcome: "continue", guidance: "keep going" } },
+    });
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 4, "no provider turn after the answered last-iteration trip");
+    assert.deepEqual(r.result?.completionHeld, { reason: "run reached its milestone-scaled implement/review iteration budget without completing" });
+    assert.equal(r.fixture.holds.length, 1);
+  });
+
+  it("a continue answer resumes with the answered rework and a later signal_done takes the normal done path", async () => {
+    const attempts: Parameters<NonNullable<RunContext["recordCompletionAttempt"]>>[0][] = [];
+    const r = await drive((c) => {
+      if (c === 1) return rp1();
+      if (c <= 4) return prose(c);
+      return [signalDone("sess-1", { milestones_completed: ["m2"] }), resultSuccess()];
+    }, {
+      fixture: { answer: { outcome: "continue", guidance: "STALL-GUIDANCE-42" } },
+      // The stall attempt sees m2 unmet; the lead's own later attempt finds the contract satisfied.
+      recordCompletionAttempt: async (args) => { attempts.push(args); return { unmet: attempts.length === 1 ? ["m2"] : [], attemptCount: attempts.length }; },
+    });
+    assert.equal(r.error, null);
+    assert.equal(r.result?.completionHeld, undefined);
+    assert.equal(r.fixture.questions.length, 1);
+    assert.match(r.prompts[4]!, /The run owner answered the completion question/);
+    assert.match(r.prompts[4]!, /STALL-GUIDANCE-42/);
+    assert.equal(r.fixture.holds.length, 0);
+    assert.equal(attempts.length, 2, "the stall attempt plus the lead's own signal_done attempt");
+    assert.deepEqual(attempts[0]!.declared, []);
+    assert.deepEqual(attempts[1]!.declared, ["m2"]);
+  });
+
+  it("an empty unmet set still asks the question with []", async () => {
+    const asked: unknown[] = [];
+    const r2 = await drive((c) => (c === 1 ? rp1() : prose(c)), {
+      recordCompletionAttempt: async () => ({ unmet: [], attemptCount: 1 }),
+      askCompletionQuestion: async (unmet, trigger) => { asked.push([unmet, trigger]); return { outcome: "expired" }; },
+    });
+    assert.equal(r2.error, null);
+    assert.deepEqual(asked, [[[], { kind: "no_progress_stall" }]]);
+  });
+
+  it("report_progress-only turns with unchanged progress still count", async () => {
+    const r = await drive((c) => (c <= 4 ? [reportProgress(["m1"], []), resultSuccess()] : prose(c)));
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 4, "tripped on report_progress-only turns; the progress-miss escalation did not prevent it");
+    assert.equal(r.fixture.questions.length, 1);
+  });
+
+  const resetCases: Array<[string, (c: number) => SDKMessage[], Partial<RunContext>?]> = [
+    ["changed progress", (c) => (c === 1 ? rp1() : c === 4 ? [reportProgress(["m1"], ["m2"]), resultSuccess()] : prose(c))],
+    ["a read-only lead tool call", (c) => (c === 1 ? rp1() : c === 4 ? [readTool(), assistantText("reading"), resultSuccess()] : prose(c))],
+    ["an ask_user answer", (c) => (c === 1 ? rp1() : c === 4 ? [askUserTurn("anything?"), resultSuccess()] : prose(c))],
+  ];
+  for (const [name, script] of resetCases) {
+    it(`${name} resets the streak`, async () => {
+      const r = await drive(script);
+      assert.equal(r.error, null);
+      assert.equal(r.calls(), 7, "streak restarted after turn 4 and tripped on turn 7");
+      assert.equal(r.fixture.questions.length, 1);
+    });
+  }
+
+  it("subagent activity between stall turns resets the streak", async () => {
+    const r = await drive((c) => (c === 1 ? rp1() : c === 3 ? [subagentText("child working"), resultSuccess()] : prose(c)));
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 6, "turn 2 counted, turn 3 reset, turns 4-6 tripped");
+    assert.equal(r.fixture.questions.length, 1);
+  });
+
+  it("a changed worktree fingerprint on one turn restarts the streak", async () => {
+    let fp = "SAME";
+    const r = await drive((c) => { fp = c === 3 ? "CHANGED" : "SAME"; return c === 1 ? rp1() : prose(c); },
+      { worktreeFingerprint: async () => fp });
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 6, "the changed turn starts a new streak of one; turns 4-6 trip");
+    assert.equal(r.fixture.questions.length, 1);
+  });
+
+  it("a null worktree fingerprint on one turn restarts the streak", async () => {
+    let fp: string | null = "SAME";
+    const r = await drive((c) => { fp = c === 3 ? null : "SAME"; return c === 1 ? rp1() : prose(c); },
+      { worktreeFingerprint: async () => fp });
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 6);
+    assert.equal(r.fixture.questions.length, 1);
+  });
+
+  it("an unresolvable (null) worktree fingerprint on every turn is never a stall turn", async () => {
+    let fp: string | null = "SAME";
+    const r = await drive((c) => { fp = c >= 3 ? null : "SAME"; return c === 1 ? rp1() : prose(c); },
+      { config: { max_iterations: 8 }, worktreeFingerprint: async () => fp });
+    assert.equal(r.fixture.questions.length, 0, "no stall question");
+    assert.equal(r.fixture.attempts.length, 0, "no worker completion attempt");
+    assert.equal(r.calls(), 8, "every provider call up to the iteration budget ran");
+    assert.match(r.error ?? "", REASON_ITER);
+  });
+
+  it("a turn whose ACK serves no completionAttempts (ineligible) restarts the streak", async () => {
+    const r = await drive((c) => (c === 1 ? rp1() : prose(c)), {
+      reportIteration: async (n) => (n === 3 ? undefined : { completionAttempts: 0 }),
+    });
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 6, "turn 2 counted, ineligible turn 3 reset, turns 4-6 tripped");
+    assert.equal(r.fixture.questions.length, 1);
+  });
+
+  it("a cooperative checkpoint between stall turns resets the streak", async () => {
+    const r = await drive((c) => (c === 1 ? rp1() : c === 3 ? [checkpointSignal(), resultSuccess()] : prose(c)));
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 6, "turn 2 counted, checkpoint turn 3 reset, turns 4-6 tripped");
+    assert.equal(r.fixture.questions.length, 1);
+  });
+
+  it("after a continue answer the in-process latch blocks a second stall attempt even while the served count lags at 0", async () => {
+    const r = await drive((c) => (c === 1 ? rp1() : prose(c)), {
+      served: 0, fixture: { answer: { outcome: "continue", guidance: "keep going" } },
+    });
+    assert.equal(r.error, null);
+    assert.equal(r.fixture.attempts.length, 1, "exactly one worker stall attempt");
+    assert.equal(r.fixture.questions.length, 1, "no second stall question");
+    assert.equal(r.calls(), 8, "the run drains its iteration budget instead of re-tripping");
+    const reason = "run reached its milestone-scaled implement/review iteration budget without completing";
+    assert.deepEqual(r.fixture.holds, [reason]);
+    assert.deepEqual(r.result?.completionHeld, { reason });
+  });
+
+  it("an owner follow-up resets the streak", async () => {
+    let pulls = 0;
+    const r = await drive((c) => (c === 1 ? rp1() : prose(c)), {
+      pullFollowUps: () => (++pulls === 4 ? pullOf(["please also check X"]) : []),
+    });
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 6, "the follow-up turn restarts the streak at one; turns 4-6 trip");
+    assert.equal(r.fixture.questions.length, 1);
+  });
+
+  it("a safety steer resets the streak", async () => {
+    let pulls = 0;
+    const r = await drive((c) => (c === 1 ? rp1() : prose(c)), {
+      pullSafetySteer: () => (++pulls === 4 ? "STEER-BODY" : undefined),
+    });
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 6, "the steer turn restarts the streak at one; turns 4-6 trip");
+    assert.equal(r.fixture.questions.length, 1);
+  });
+
+  it("pins the accepted #281 offset: identical text with a tool call on turn A then tool-free turns still ends REASON_NO_PROGRESS", async () => {
+    // Plan residual: #281 ignores tool calls, so its streak runs ahead of the new one here.
+    const r = await drive((c) => {
+      if (c === 1) return rp1();
+      if (c === 2) return [readTool(), assistantText("Waiting."), resultSuccess()];
+      return [assistantText("Waiting."), resultSuccess()];
+    });
+    assert.match(r.error ?? "", REASON_410);
+    assert.equal(r.fixture.questions.length, 0);
+    assert.equal(r.fixture.attempts.length, 0);
+  });
+
+  it("a recordCompletionAttempt failure propagates with no question and no hold", async () => {
+    for (const err of [
+      new Error("attempt boom"),
+      new RequestError("POST", "/attempt", 409, JSON.stringify({ disposition: "stale_claim" })),
+    ]) {
+      const asked: unknown[] = [];
+      const holds: string[] = [];
+      const r = await drive((c) => (c === 1 ? rp1() : prose(c)), {
+        recordCompletionAttempt: async () => { throw err; },
+        askCompletionQuestion: async (u, t) => { asked.push([u, t]); return { outcome: "expired" }; },
+        enterCompletionHold: async (reason) => { holds.push(reason); return true; },
+      });
+      assert.equal(r.error, err.message);
+      assert.deepEqual(asked, []);
+      assert.deepEqual(holds, []);
+    }
+  });
+
+  it("an unwired question seam holds directly", async () => {
+    const r = await drive((c) => (c === 1 ? rp1() : prose(c)), { askCompletionQuestion: undefined });
+    assert.equal(r.error, null);
+    assert.deepEqual(r.fixture.holds, [REASON_COMPLETION_STALL]);
+  });
+
+  it("an unwired hold seam throws REASON_COMPLETION_STALL", async () => {
+    const r = await drive((c) => (c === 1 ? rp1() : prose(c)), { enterCompletionHold: undefined });
+    assert.equal(r.error, REASON_COMPLETION_STALL);
+  });
+
+  describe("controls", () => {
+    it("served completion_attempts 1: no stall path (reworded stays max_iterations, identical stays #281)", async () => {
+      const reworded = await drive((c) => (c === 1 ? rp1() : prose(c)), { served: 1, config: { max_iterations: 6 } });
+      assert.match(reworded.error ?? "", REASON_ITER);
+      assert.equal(reworded.fixture.questions.length, 0);
+      const identical = await drive((c) => (c === 1 ? rp1() : [assistantText("Waiting."), resultSuccess()]), { served: 1 });
+      assert.match(identical.error ?? "", REASON_410);
+      assert.equal(identical.fixture.attempts.length, 0);
+    });
+
+    it("served completion_attempts absent is ineligible", async () => {
+      const reworded = await drive((c) => (c === 1 ? rp1() : prose(c)), { served: "absent", config: { max_iterations: 6 } });
+      assert.match(reworded.error ?? "", REASON_ITER);
+      assert.equal(reworded.fixture.attempts.length, 0);
+    });
+
+    it("no reported completed milestone keeps #281 for identical text", async () => {
+      const r = await drive(() => [assistantText("Waiting."), resultSuccess()]);
+      assert.match(r.error ?? "", REASON_410);
+      assert.equal(r.fixture.attempts.length, 0);
+    });
+
+    it("an interactive run and a non-issue run are unchanged", async () => {
+      const interactive = await drive((c) => (c === 1 ? rp1() : prose(c)), { interactive: true, config: { max_iterations: 6 } });
+      assert.equal(interactive.fixture.attempts.length, 0);
+      assert.match(interactive.error ?? "", REASON_ITER, "interactive run drains the iteration budget as before");
+      assert.equal(interactive.calls(), 6);
+      assert.equal(interactive.fixture.questions.length, 0);
+      const task = await drive((c) => (c === 1 ? rp1() : prose(c)), { kind: "task", config: { max_iterations: 6 } });
+      assert.equal(task.fixture.attempts.length, 0);
+      assert.equal(task.fixture.questions.length, 0);
+      assert.match(task.error ?? "", REASON_ITER, "non-issue run drains the iteration budget as before");
+      assert.equal(task.calls(), 6);
+    });
+
+    it("real work (a tool call every turn) still ends on max_iterations", async () => {
+      const r = await drive((c) => (c === 1 ? rp1() : [readTool(), assistantText(`step ${c}`), resultSuccess()]), { config: { max_iterations: 6 } });
+      assert.match(r.error ?? "", REASON_ITER);
+      assert.equal(r.fixture.attempts.length, 0);
+    });
+
+    it("a post-attempt stall still routes to the completion hold as before", async () => {
+      // The lead signals done with m2 unmet (a real attempt), then goes silent with identical text.
+      const r = await drive((c) => {
+        if (c === 1) return rp1();
+        if (c === 2) return [signalDone(), resultSuccess()];
+        return [assistantText("Waiting."), resultSuccess()];
+      }, { served: "default" });
+      assert.equal(r.error, null);
+      assert.equal(r.fixture.attempts.length, 1, "only the lead's own attempt; the stall path is latched off");
+      assert.equal(r.fixture.holds.length, 1);
+      assert.equal(r.calls(), 5, "the #281 identical-text streak tripped after the lead's own attempt");
+      assert.match(r.fixture.holds[0]!, REASON_410, "held via the #281 no-progress reason, not the new stall reason");
+      assert.match(r.result?.completionHeld?.reason ?? "", REASON_410);
+    });
   });
 });

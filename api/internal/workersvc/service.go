@@ -1375,9 +1375,9 @@ type Store interface {
 	// next claim with no worker restart. NOT NULL column (default true) ⇒ a definite
 	// bool; false tells the worker to suppress the Co-Authored-By: Claude trailer.
 	GetUserAttributionEnabled(ctx context.Context, id uuid.UUID) (bool, error)
-	// Per-user judge model override (PRD #69 M2): read at judge-claim assembly,
-	// keyed on the run owner. NULL ⇒ inherit the instance judge_model.
-	GetUserJudgeModel(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
+	// Per-user judge model lanes (PRD #69 M2, PRD #3245): read at judge-claim assembly,
+	// keyed on the run owner. NULL ⇒ inherit the instance value for that harness.
+	GetUserJudgeModels(ctx context.Context, id uuid.UUID) (store.GetUserJudgeModelsRow, error)
 	// Per-user run-summary model override (PRD #362 M2): read at ISSUE-run claim
 	// assembly, keyed on the run owner. NULL ⇒ inherit the instance summary_model.
 	GetUserSummaryModel(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
@@ -1747,7 +1747,9 @@ type SettingsReader interface {
 	// enqueue proceeds), since these are soft cost backstops, not correctness gates.
 	JudgeCooldownSeconds(ctx context.Context) (int, error)
 	JudgeDailyBudget(ctx context.Context) (int, error)
-	JudgeModel(ctx context.Context) (string, error)
+	// InstanceModel is the trimmed instance-tier value of a non-secret model key
+	// ("" when unset). On an error the caller treats the tier as unset (PRD #3245).
+	InstanceModel(ctx context.Context, key string) (string, error)
 	// SummaryModel is the instance-default model the inline run-summary generator
 	// runs on (PRD #362 Decision 8), the fallback when the run owner has no per-user
 	// summary_model override. Falls back to the compiled-in default ("haiku").

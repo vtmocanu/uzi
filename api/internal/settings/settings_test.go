@@ -2,7 +2,9 @@ package settings
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -120,13 +122,14 @@ func TestJudgeAccessors(t *testing.T) {
 	if got, err := c.JudgeEnabled(context.Background()); err != nil || got != false {
 		t.Fatalf("JudgeEnabled default = %v, %v; want false", got, err)
 	}
-	if got, err := c.JudgeModel(context.Background()); err != nil || got != DefaultJudgeModel {
-		t.Fatalf("JudgeModel default = %q, %v; want %q", got, err, DefaultJudgeModel)
+	// The instance tier is unset on an empty table; the built-in lives in Defaults.
+	if got, err := c.InstanceModel(context.Background(), KeyJudgeModel); err != nil || got != "" {
+		t.Fatalf("InstanceModel(judge_model) default = %q, %v; want unset", got, err)
 	}
-	// Pin the literal default so an accidental flip of DefaultJudgeModel is caught
-	// (PRD #69 Decision 1: opus, not the superseded haiku/sonnet).
-	if DefaultJudgeModel != "opus" {
-		t.Fatalf("DefaultJudgeModel = %q, want \"opus\"", DefaultJudgeModel)
+	// Pin the literal default so an accidental flip is caught (PRD #69 Decision 1:
+	// opus, not the superseded haiku/sonnet).
+	if Defaults[KeyJudgeModel] != "opus" {
+		t.Fatalf("Defaults[judge_model] = %q, want \"opus\"", Defaults[KeyJudgeModel])
 	}
 
 	// "true"/"false" honored; any other value falls back to the default (false) —
@@ -150,8 +153,8 @@ func TestJudgeAccessors(t *testing.T) {
 
 	// A configured model is returned verbatim.
 	c = New(&fakeStore{rows: []store.AppSetting{row(KeyJudgeModel, "sonnet")}}, time.Minute)
-	if got, _ := c.JudgeModel(context.Background()); got != "sonnet" {
-		t.Fatalf("JudgeModel = %q, want sonnet", got)
+	if got, _ := c.InstanceModel(context.Background(), KeyJudgeModel); got != "sonnet" {
+		t.Fatalf("InstanceModel(judge_model) = %q, want sonnet", got)
 	}
 
 	// JudgeEnforceAll (PRD #69): default OFF, "true"/"false" honored, junk → false —
@@ -508,12 +511,110 @@ func TestJudgeWritability(t *testing.T) {
 	// Per-value validation rejects the obvious bad inputs.
 	for _, tc := range []struct{ key, value string }{
 		{KeyJudgeEnabled, "yes"},
-		{KeyJudgeModel, ""},
+		{KeySummaryModel, ""},
 		{KeyJudgeModel, "two words"},
 	} {
 		if err := Validate(tc.key, tc.value); err == nil {
 			t.Errorf("Validate(%s, %q) = nil, want an error", tc.key, tc.value)
 		}
+	}
+
+	// A blank judge model is the explicit reset to the built-in (PRD #3245).
+	for _, v := range []string{"", "   "} {
+		if err := Validate(KeyJudgeModel, v); err != nil {
+			t.Errorf("Validate(judge_model, %q) = %v, want nil (reset)", v, err)
+		}
+	}
+}
+
+func TestJudgeModelLaneValidation(t *testing.T) {
+	for _, ok := range []string{"", "   ", "gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", " gpt-6-sol "} {
+		if err := Validate(KeyCodexJudgeModel, ok); err != nil {
+			t.Errorf("Validate(codex_judge_model, %q) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []string{"opus", "gpt-6-luna", "gpt-7-x", "two words"} {
+		if err := Validate(KeyCodexJudgeModel, bad); err == nil {
+			t.Errorf("Validate(codex_judge_model, %q) = nil, want an error", bad)
+		}
+	}
+	// A Claude alias and a non-curated id get distinct messages.
+	a, b := Validate(KeyCodexJudgeModel, "opus"), Validate(KeyCodexJudgeModel, "gpt-7-x")
+	if a == nil || b == nil || a.Error() == b.Error() {
+		t.Errorf("messages not distinct: %v / %v", a, b)
+	}
+	for _, bad := range []string{"gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"} {
+		if err := Validate(KeyJudgeModel, bad); err == nil {
+			t.Errorf("Validate(judge_model, %q) = nil, want a Codex-id rejection", bad)
+		}
+	}
+	if !Known(KeyCodexJudgeModel) || IsSecret(KeyCodexJudgeModel) {
+		t.Errorf("codex_judge_model must be a known non-secret key")
+	}
+}
+
+// TestJudgeDefaultsMatchFixture pins both built-ins to fixtures/model-settings/judge.json.
+func TestJudgeDefaultsMatchFixture(t *testing.T) {
+	raw, err := os.ReadFile("../../../fixtures/model-settings/judge.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fx struct {
+		Builtins map[string]string `json:"builtins"`
+	}
+	if err := json.Unmarshal(raw, &fx); err != nil {
+		t.Fatal(err)
+	}
+	if Defaults[KeyJudgeModel] != fx.Builtins["claude"] {
+		t.Errorf("Defaults[judge_model] = %q, want fixtures/model-settings/judge.json builtins.claude %q", Defaults[KeyJudgeModel], fx.Builtins["claude"])
+	}
+	if Defaults[KeyCodexJudgeModel] != fx.Builtins["codex"] {
+		t.Errorf("Defaults[codex_judge_model] = %q, want fixtures/model-settings/judge.json builtins.codex %q", Defaults[KeyCodexJudgeModel], fx.Builtins["codex"])
+	}
+}
+
+func TestNormalizeForStorage(t *testing.T) {
+	if got := NormalizeForStorage(KeyJudgeModel, "  opus \t"); got != "opus" {
+		t.Errorf("judge_model = %q, want trimmed", got)
+	}
+	if got := NormalizeForStorage(KeyJudgeModel, "   "); got != "" {
+		t.Errorf("whitespace judge_model = %q, want empty", got)
+	}
+	if got := NormalizeForStorage(KeyCodexJudgeModel, " gpt-6-sol "); got != "gpt-6-sol" {
+		t.Errorf("codex_judge_model = %q, want trimmed", got)
+	}
+	if got := NormalizeForStorage(KeyUziLabel, "  x "); got != "  x " {
+		t.Errorf("other keys must be verbatim, got %q", got)
+	}
+}
+
+func TestInstanceModels(t *testing.T) {
+	ctx := context.Background()
+	fs := &fakeStore{rows: []store.AppSetting{row(KeyJudgeModel, "  haiku ")}}
+	c := New(fs, time.Minute)
+
+	got, err := c.InstanceModel(ctx, KeyJudgeModel)
+	if err != nil || got != "haiku" {
+		t.Fatalf("InstanceModel = %q, %v; want trimmed haiku", got, err)
+	}
+
+	// Unset: "" and never the compiled default.
+	c2 := New(&fakeStore{}, time.Minute)
+	vals, err := c2.InstanceModels(ctx, []string{KeyJudgeModel})
+	if err != nil || vals[KeyJudgeModel] != "" {
+		t.Fatalf("unset = %v, %v; want empty string", vals, err)
+	}
+
+	// ENV wins over the stored row.
+	c.ConfigureSecrets(nil, map[string]string{KeyJudgeModel: "sonnet"})
+	if got, _ := c.InstanceModel(ctx, KeyJudgeModel); got != "sonnet" {
+		t.Errorf("env InstanceModel = %q, want sonnet", got)
+	}
+
+	// A secret key is refused with no values.
+	vals, err = c.InstanceModels(ctx, []string{KeyJudgeModel, KeySlackBotToken})
+	if err == nil || vals != nil {
+		t.Errorf("secret key: got %v, %v; want error and no values", vals, err)
 	}
 }
 

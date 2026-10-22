@@ -11,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -97,14 +98,14 @@ func TestSessionPayloadJudgeConsentFields(t *testing.T) {
 	}
 
 	// No judge settings at all ⇒ not enforced, effective falls back to the compiled-in
-	// DefaultJudgeModel (opus) rather than an empty string.
+	// the built-in Claude judge model (opus) rather than an empty string.
 	h3 := newSettingsHandler()
 	payload3 := h3.sessionPayload(context.Background(), store.User{})
 	if enforced, _ := payload3["judge_enforced_by_admin"].(bool); enforced {
 		t.Errorf("judge_enforced_by_admin = true, want false with no settings")
 	}
-	if m := payload3["effective_judge_model"]; m != settings.DefaultJudgeModel {
-		t.Errorf("effective_judge_model = %v, want %q (default)", m, settings.DefaultJudgeModel)
+	if m := payload3["effective_judge_model"]; m != agenttmpl.DefaultClaudeJudgeModel {
+		t.Errorf("effective_judge_model = %v, want %q (default)", m, agenttmpl.DefaultClaudeJudgeModel)
 	}
 }
 

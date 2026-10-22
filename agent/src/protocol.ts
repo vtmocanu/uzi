@@ -1088,6 +1088,10 @@ export interface MilestoneAgent {
  * reference so a legitimately-scaled run does not self-trip its wall.
  */
 export interface IterationBudget {
+  /** Server-confirmed count off the same running ACK: zero permits stall eligibility;
+   * positive counts route later wall exhaustion to a hold. Absent means unknown. */
+  completionAttempts?: number;
+  usedWallSeconds?: number;
   maxIterations?: number;
   wallSeconds?: number;
   /**
@@ -2883,6 +2887,7 @@ export interface StateAck {
   /** Request-local guard projection; completion permit and frozen contract authority remain unchanged. */
   completionProjection?: { revision: number; deferredIds: string[] };
   completionAttempts?: number;
+  budgetUsedSeconds?: number;
   runId?: unknown;
   workerId?: unknown;
   workerIdentityMatches?: boolean;

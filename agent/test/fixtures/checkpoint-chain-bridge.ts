@@ -28,6 +28,12 @@ const cfg = JSON.parse(process.env.UZI_CHAIN_BRIDGE_FIXTURE ?? "") as {
   stale?: { advance: "none" | "plain" | "workflow" | "delete"; commit: boolean; descendant: boolean; pause?: boolean };
   /** A seeded claim (plan supplied at create time, approved, no planning turn). */
   seeded?: boolean;
+  /** Issue #3284: origin already carries refs/heads/<branch> = seed and no checkpoint ref; the claim is
+   *  seeded with planned_base_commit = seed and require_base_match = true. Zero new work throughout.
+   *  "tick": main advances ("none", a plain file or a workflow change), then one tick publishes.
+   *  "pause": a first tick (the Go side answers it superseded) fetches the tracking ref back, main
+   *  advances, then the run pauses through the real pause publish. */
+  originSeeded?: { seed: string; advance: "none" | "plain" | "workflow"; mode: "tick" | "pause" };
 };
 assert.ok(path.isAbsolute(cfg.scratch));
 assert.ok(path.isAbsolute(cfg.origin));
@@ -51,6 +57,10 @@ function commitIn(tree: string, file: string, content: string): string {
   gitIn(tree, ["add", "-A"]);
   gitIn(tree, [...ident, "commit", "-m", `work ${file}`]);
   return gitIn(tree, ["rev-parse", "HEAD"]);
+}
+/** A ref's OID in a repo, or "" when absent. */
+function tryRef(dir: string, ref: string): string {
+  try { return gitIn(dir, ["rev-parse", "--verify", "--quiet", ref]); } catch { return ""; }
 }
 /** Advance main's workflow in the Go-owned bare origin from a scratch clone, so the agent branch
  *  is behind on .github/workflows and the overlay path runs. */
@@ -125,6 +135,40 @@ const runner = new RunRunner(client, gitCache, () => ({
     run: async (ctx: RunContext) => {
       try {
         const progress = { completed: ["m1"], in_progress: [] };
+        if (cfg.originSeeded !== undefined) {
+          const os = cfg.originSeeded;
+          const ckpt = `refs/uzi-checkpoints/${branch}`;
+          summary.baseTip = gitIn(ctx.worktreePath, ["rev-parse", "HEAD"]);
+          summary.claimPlannedBase = claim.planned_base_commit;
+          summary.claimRequireBase = claim.require_base_match;
+          summary.claimCheckpointTip = claim.checkpoint_tip ?? null;
+          summary.claimPlanSource = claim.plan_source;
+          summary.checkpointRefBefore = tryRef(cfg.origin, ckpt);
+          if (os.mode === "pause") {
+            // The first tick establishes the tracking ref; the Go side answers its publish superseded.
+            fakeNow += INTERVAL_MS + 1;
+            summary.firstTickOutcome = await fireTick();
+          }
+          // The floor is already resolved (the runner's evaluateRequiredBase ran before executor.run).
+          if (os.advance === "workflow") {
+            summary.mainTip = advanceOrigin(workflow, `name: ci\non: push\njobs: {}\n# advanced ${cfg.iid}\n`);
+          } else if (os.advance === "plain") {
+            summary.mainTip = advanceOrigin("upstream.txt", `upstream ${cfg.iid}\n`);
+          }
+          if (os.mode === "tick") {
+            fakeNow += INTERVAL_MS + 1;
+            summary.tickOutcome = await fireTick();
+          } else {
+            const at = { completedCount: 0, total: 1 };
+            summary.parked = await ctx.parkForPause!(at);
+          }
+          summary.checkpointRefAfter = tryRef(cfg.origin, ckpt);
+          // Read inside the turn: the run's own finish may push the branch afterwards.
+          summary.branchAfter = tryRef(cfg.origin, `refs/heads/${branch}`);
+          summary.tips = tips;
+          summary.results = results;
+          return summary.parked ? { branch: ctx.branch, pausedAt: { completedCount: 0, total: 1 } } : { branch: ctx.branch };
+        }
         if (cfg.stale !== undefined) {
           // Issue #3242: the run starts on main's tip; origin's main then moves past that base.
           const stale = cfg.stale;
@@ -193,10 +237,11 @@ const runner = new RunRunner(client, gitCache, () => ({
 
 const claim = makeClaim({
   issue_iid: cfg.iid,
+  ...(cfg.originSeeded ? { planned_base_commit: cfg.originSeeded.seed, require_base_match: true } : {}),
   issue_title: `Bridge ${cfg.iid}`,
   repo: { id: "r1", url: "https://github.com/org/repo", clone_url: cfg.origin, forge_type: "github" },
   secrets: { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "dummy-oauth-do-not-scan" },
-  ...(cfg.seeded ? { plan_source: "seeded" as const, plan_approved: true, plan_md: `# Seeded plan ${cfg.iid}\n` } : {}),
+  ...(cfg.seeded || cfg.originSeeded ? { plan_source: "seeded" as const, plan_approved: true, plan_md: `# Seeded plan ${cfg.iid}\n` } : {}),
 });
 let code = 0;
 try {

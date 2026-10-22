@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/vtmocanu/uzi/api/internal/runkind"
+	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -23,8 +24,9 @@ type fakeSettings struct {
 	enforceAll      bool
 	cooldownSeconds int
 	dailyBudget     int
-	spendGuardErr   error // read error for the PRD #69 M5 spend-guard accessors (fail-open)
-	model           string
+	spendGuardErr   error  // read error for the PRD #69 M5 spend-guard accessors (fail-open)
+	model           string // instance Claude judge model (settings.KeyJudgeModel)
+	codexModel      string // instance Codex judge model (settings.KeyCodexJudgeModel)
 	// summaryModel is the instance-default run-summary model (PRD #362 M2); the zero
 	// value ("") reads as "no instance model", so an issue-run claim leaves SummaryModel
 	// nil unless a test sets it. summaryModelErr models a settings read fault.
@@ -42,7 +44,12 @@ func (f fakeSettings) JudgeCooldownSeconds(context.Context) (int, error) {
 func (f fakeSettings) JudgeDailyBudget(context.Context) (int, error) {
 	return f.dailyBudget, f.spendGuardErr
 }
-func (f fakeSettings) JudgeModel(context.Context) (string, error) { return f.model, f.err }
+func (f fakeSettings) InstanceModel(_ context.Context, key string) (string, error) {
+	if key == settings.KeyCodexJudgeModel {
+		return f.codexModel, f.err
+	}
+	return f.model, f.err
+}
 func (f fakeSettings) SummaryModel(context.Context) (string, error) {
 	return f.summaryModel, f.summaryModelErr
 }
