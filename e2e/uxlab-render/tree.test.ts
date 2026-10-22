@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,6 +11,17 @@ async function fixture(t: { after: (fn: () => Promise<void>) => void }) {
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
   return dir;
 }
+test("copy helper CLI loads outside an ESM package before validating its destination", () => {
+  const index = process.execArgv.indexOf("--import");
+  assert(index >= 0, "run fixture tests with their supported tsx loader");
+  const result = spawnSync(process.execPath, ["--import", process.execArgv[index + 1],
+    fileURLToPath(new URL("./copy.ts", import.meta.url)), "unused", "invalid"],
+  { encoding: "utf8", timeout: 10_000, maxBuffer: 65536 });
+  assert.ifError(result.error);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /invalid copy destination/);
+  assert.doesNotMatch(result.stderr, /Transform failed|Top-level await/);
+});
 test("full export copy keeps bytes, executable scripts, safe links and both manifests", async (t) => {
   const dir = await fixture(t), source = path.join(dir, "src"), dest = path.join(dir, "dest");
   await fs.mkdir(source); await fs.mkdir(dest);
