@@ -366,9 +366,13 @@ func (g *gitLab) ListIssues(ctx context.Context, projectID int64, opts ListIssue
 }
 
 func (g *gitLab) GetIssue(ctx context.Context, projectID, issueIID int64) (Issue, error) {
-	i, _, err := g.client.Issues.GetIssue(projectID, issueIID, gitlab.WithContext(ctx))
+	i, resp, err := g.client.Issues.GetIssue(projectID, issueIID, gitlab.WithContext(ctx))
 	if err != nil {
-		return Issue{}, g.wrapErr("get issue", err)
+		wrapped := g.wrapErr("get issue", err)
+		if resp != nil {
+			return Issue{}, issueReadError(resp.StatusCode, wrapped)
+		}
+		return Issue{}, wrapped
 	}
 	return toIssue(i), nil
 }

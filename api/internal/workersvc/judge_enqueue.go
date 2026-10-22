@@ -352,6 +352,10 @@ func (s *Service) maybeEnqueueTaskReview(ctx context.Context, run store.Run) {
 	// EXPLICIT selection (createRunResolved fails ErrNoCredentialForHarness rather than
 	// falling back if it is no longer usable — see CreateTaskReviewRun).
 	if _, err := s.CreateTaskReviewRun(ctx, run.UserID, repoID, run.ID, run.Branch.String, run.BaseBranch.String, Harness(run.Harness)); err != nil {
+		if errors.Is(err, ErrActiveRunExists) {
+			slog.Warn("task review enqueue: linked issue has another active run, skipping review", "run", run.ID)
+			return
+		}
 		if errors.Is(err, ErrTaskReviewAlreadyActive) {
 			return // a review run is already active for this target — expected, not an error
 		}
@@ -431,6 +435,10 @@ func (s *Service) maybeEnqueueThenFix(ctx context.Context, reviewRun store.Run) 
 	if _, err := s.CreateThenFixRun(ctx, original.UserID, uuid.UUID(original.RepoID.Bytes),
 		original.ID, original.Branch.String, original.BaseBranch.String, desc,
 		original.BudgetWallSeconds, original.BudgetMaxIterations, Harness(original.Harness)); err != nil {
+		if errors.Is(err, ErrActiveRunExists) {
+			slog.Warn("then-fix enqueue: linked issue has another active run, skipping fix", "review_run", reviewRun.ID, "target", original.ID)
+			return
+		}
 		if errors.Is(err, ErrThenFixAlreadyActive) {
 			return // a fix run is already active for this original — expected, not an error
 		}
