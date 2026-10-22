@@ -893,6 +893,7 @@ describe("PRD #1493 M2: root-branch migration ownership map (portable, record-on
   it("nix store: every boot drops group write (reclaim, chmod 1755, hand back to runner:runner)", () => {
     const h = makeHarness();
     try {
+      fs.mkdirSync(h.data);
       fs.mkdirSync(path.join(h.nix, "store"), { recursive: true });
       fs.writeFileSync(h.token, "t");
       const store = path.join(h.nix, "store");
@@ -911,6 +912,7 @@ describe("PRD #1493 M2: root-branch migration ownership map (portable, record-on
   it("nix store: a symlinked store fails closed and is never chowned or chmodded", () => {
     const h = makeHarness();
     try {
+      fs.mkdirSync(h.data);
       fs.mkdirSync(h.nix);
       const target = path.join(h.root, "elsewhere");
       fs.mkdirSync(target);
