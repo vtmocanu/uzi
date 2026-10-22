@@ -100,6 +100,14 @@ try {
     if (mode === 'partial') assert.ok(statSync(lab + '/png/a-dark.png').size > 0);
     cases++;
   }
+  // A generator that writes nothing must not pass on frames left by an earlier build.
+  rmSync(lab + '/png', { recursive: true, force: true });
+  rmSync(lab + '/order', { force: true });
+  writeFileSync(lab + '/frames/old.ansi', 'stale frame');
+  const stale = run('noframes');
+  assert.equal(stale.status, 1, 'stale frames with no new generation: ' + stale.stderr.slice(0, 300));
+  assert.match(stale.stderr, /no ANSI frames generated/);
+  cases++;
   console.log('uxlab build cases=' + cases + ' passed=' + cases);
 } finally {
   rmSync(tmp, { recursive: true, force: true });

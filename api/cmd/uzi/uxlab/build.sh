@@ -9,6 +9,8 @@ fi
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$here"
+# Drop prior frames so a generator that writes nothing cannot pass on stale ones.
+rm -f frames/*.ansi
 ./gen.sh
 ./render.sh
 

@@ -54,6 +54,7 @@ def good_members(phases=("local",)):
 
 class ExportTests(unittest.TestCase):
     def setUp(self):
+        SCRATCH.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(prefix="uxlab-export-test-", dir=SCRATCH)
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
