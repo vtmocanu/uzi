@@ -125,6 +125,8 @@ func buildSeedSet() map[string]bool {
 // gnumake→make, kubernetes-helm→helm, python3Packages.pip→pip). Everything else is
 // identity. A pinned NixOS/nixpkgs flake seed uses its fragment as the attr.
 // Case-sensitive: nix attrs are case-sensitive.
+// Only buildSeedSet calls this on the embedded manifest; Covered does not
+// normalize provisioned or user-supplied package specs.
 func normalize(attr string) string {
 	if strings.HasPrefix(attr, "github:NixOS/nixpkgs/") {
 		if i := strings.LastIndexByte(attr, '#'); i >= 0 {

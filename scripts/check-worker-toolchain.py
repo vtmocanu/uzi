@@ -39,7 +39,7 @@ def restore_go_metadata(root, previous):
     path.write_text(json.dumps(lock, indent=2) + '\n')
 
 
-def check(root, skip_modules=False, installed_go=None):
+def check(root, skip_modules=False, installed_go=None, arch=None):
     config = manifest_json((root / 'agent/devbox-global/devbox.json').read_text())
     lock = json.loads((root / 'agent/devbox-global/devbox.lock').read_text())
     packages = config['packages']
@@ -65,14 +65,18 @@ def check(root, skip_modules=False, installed_go=None):
     if len(go_keys) != 1:
         raise ValueError(f'expected one explicit Go package, got {go_keys}')
     entry = locked[go_keys[0]]
-    outputs = entry['systems']['x86_64-linux']['outputs']
-    defaults = [o['path'] for o in outputs if o.get('default') is True and o.get('name', 'out') == 'out']
-    if len(defaults) != 1:
-        raise ValueError('Go lock must have one default Linux out output')
-    match = re.fullmatch(r'/nix/store/[a-z0-9]{32}-go-(\d+\.\d+\.\d+)', defaults[0])
-    if not match:
-        raise ValueError('cannot read the resolved Go version from the lock output')
-    resolved = match[1]
+    def output_version(system):
+        outputs = entry['systems'][system]['outputs']
+        defaults = [o['path'] for o in outputs if o.get('default') is True and o.get('name', 'out') == 'out']
+        if len(defaults) != 1:
+            raise ValueError('Go lock must have one default Linux out output')
+        match = re.fullmatch(r'/nix/store/[a-z0-9]{32}-go-(\d+\.\d+\.\d+)', defaults[0])
+        if not match:
+            raise ValueError('cannot read the resolved Go version from the lock output')
+        return match[1]
+    resolved = output_version('x86_64-linux')
+    if 'aarch64-linux' in entry['systems'] and output_version('aarch64-linux') != resolved:
+        raise ValueError('Go lock Linux architecture versions disagree')
     if 'version' in entry and version(entry['version']) != version(resolved):
         raise ValueError('Go lock metadata and default output versions disagree')
     if not skip_modules:
@@ -84,9 +88,16 @@ def check(root, skip_modules=False, installed_go=None):
             if version(resolved) < version(requirements[0]):
                 raise ValueError(f'worker Go {resolved} is older than {module}/go.mod toolchain go{requirements[0]}')
     if installed_go is not None:
-        actual = re.fullmatch(r'go version go(\d+\.\d+\.\d+) \S+', installed_go)
+        actual = re.fullmatch(r'go version go(\d+\.\d+\.\d+) linux/(amd64|arm64)', installed_go)
         if not actual or actual[1] != resolved:
             raise ValueError(f'baked Go does not match lock {resolved}: {installed_go!r}')
+        if arch is not None and actual[2] != arch:
+            raise ValueError('baked Go architecture does not match TARGETARCH')
+        system = {'amd64': 'x86_64-linux', 'arm64': 'aarch64-linux'}[actual[2]]
+        if output_version(system) != actual[1]:
+            raise ValueError('baked Go does not match its architecture output')
+    elif arch is not None:
+        raise ValueError('--arch requires --installed-go')
     return resolved
 
 
@@ -95,12 +106,13 @@ def main():
     parser.add_argument('--root', type=pathlib.Path, default=pathlib.Path(__file__).resolve().parent.parent)
     parser.add_argument('--skip-modules', action='store_true', help='runtime image stage only; release stage checks modules')
     parser.add_argument('--installed-go', help='exact output of the baked go version')
+    parser.add_argument('--arch', choices=('amd64', 'arm64'), help='image TARGETARCH to check against the binary')
     parser.add_argument('--restore-go-metadata', type=pathlib.Path, help='refresh only: previous committed lock for the identical immutable Go pin')
     args = parser.parse_args()
     try:
         if args.restore_go_metadata:
             restore_go_metadata(args.root, args.restore_go_metadata)
-        resolved = check(args.root, args.skip_modules, args.installed_go)
+        resolved = check(args.root, args.skip_modules, args.installed_go, args.arch)
     except (ValueError, KeyError, TypeError, OSError) as error:
         print(f'worker-toolchain: {error}', file=sys.stderr)
         return 1

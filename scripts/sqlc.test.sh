@@ -205,6 +205,21 @@ def darwin(r):
     r.env["FIXTURE"] = str(r.other)
     r.reject("tarball checksum mismatch")
 
+@case("linux-arm64-cache", ('asset="linux-arm64"', 'asset="linux-amd64"'))
+def linux_arm64(r):
+    for arch in ("aarch64", "arm64"):
+        r.env.update(FAKE_OS="Linux", FAKE_ARCH=arch)
+        r.run()
+        assert "sqlc_1.31.1_linux_arm64.tar.gz" in (r.dir / "transport").read_text()
+        assert (r.cache / "1.31.1/linux-arm64/sqlc_1.31.1_linux_arm64.tar.gz").is_file()
+        r.env["TRANSPORT_FAIL"] = "1"
+    assert len((r.dir / "transport").read_text().splitlines()) == 1
+
+@case("linux-arm64-version", skip_failure("per-arch versions disagree"))
+def arm64_version(r):
+    r.text = r.text.replace('SQLC_LINUX_ARM64_VERSION="v1.31.1"', 'SQLC_LINUX_ARM64_VERSION="v0.0.0"')
+    r.reject("per-arch versions disagree")
+
 @case("download-checksum", ('verify_sha256 "$tar_sha256" "$CANDIDATE" \\',
                             'true \\'))
 def download_hash(r):

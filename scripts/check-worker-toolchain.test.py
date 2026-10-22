@@ -63,6 +63,16 @@ class ToolchainTests(unittest.TestCase):
             with self.subTest(output=output), self.assertRaisesRegex(ValueError, 'does not match lock'):
                 self.run_check(installed_go=output)
 
+    def test_arm64_metadata_and_binary_architecture(self):
+        systems = self.lock['packages'][self.key]['systems']
+        systems['aarch64-linux'] = {'outputs': [{'path': '/nix/store/' + 'b' * 32 + '-go-1.27.3', 'default': True}]}
+        self.assertEqual(self.run_check(installed_go='go version go1.27.3 linux/arm64', arch='arm64'), '1.27.3')
+        with self.assertRaisesRegex(ValueError, 'TARGETARCH'):
+            self.run_check(installed_go='go version go1.27.3 linux/amd64', arch='arm64')
+        systems['aarch64-linux']['outputs'][0]['path'] = '/nix/store/' + 'b' * 32 + '-go-1.27.2'
+        with self.assertRaisesRegex(ValueError, 'architecture versions disagree'):
+            self.run_check()
+
     def test_explicit_nix_attribute(self):
         old = self.key
         self.key = 'github:NixOS/nixpkgs/' + 'b' * 40 + '#go_1_27'
@@ -186,12 +196,7 @@ class ToolchainTests(unittest.TestCase):
         self.assertIn("'scripts/sqlc.sh'", filters)
         self.assertIn("'scripts/check-worker-toolchain.py'", filters)
         self.assertEqual(set(job['strategy']['matrix']['template']), {'base', 'jvm'})
-        self.assertTrue(any(s.get('with', {}).get('load') is True for s in job['steps']))
-        proof = [s for s in job['steps'] if s.get('name') == 'Prove the baked worker toolchain without network']
-        self.assertEqual(len(proof), 1)
-        self.assertNotIn('if', proof[0], 'both image variants need the offline proof')
-        self.assertIn('--network=none', proof[0]['run'])
-        self.assertIn('scripts/sqlc.sh "$SQLC_PIN" version', proof[0]['run'])
+        self.assertFalse(any(s.get('with', {}).get('load') is True for s in job['steps']))
         for template in ('base', 'jvm'):
             dockerfile = (project / 'agent/templates' / template / 'Dockerfile').read_text()
             runtime, release = dockerfile.split('FROM runtime AS release')
@@ -199,6 +204,10 @@ class ToolchainTests(unittest.TestCase):
             self.assertIn('/opt/uzi-src/scripts/check-worker-toolchain.py', release)
             self.assertNotIn('--skip-modules', release)
             self.assertIn('ENV UZI_SQLC_DIR=/usr/local/share/uzi-sqlc', runtime)
+            self.assertIn('USER runner\nRUN --network=none', release)
+            proof = release.split('USER runner\nRUN --network=none', 1)[1]
+            self.assertIn('scripts/sqlc.sh "$SQLC_PIN" version', proof)
+            self.assertIn('cd api; go version; cd ../controller; go version\nUSER root', proof)
 
 
 if __name__ == '__main__':

@@ -128,7 +128,7 @@ lags its required patch release. Updating that pin is deliberate: evaluate
 `go_1_27.version` and its Linux output at the new ref, record their exact
 version/output metadata in the lock, and verify the output is cached. The
 weekly refresh rejects manifest rewrites and reuses metadata only when the
-complete resolved Go ref is unchanged. Renovate proposes channel digest updates
+complete resolved Go ref is unchanged. Renovate proposes monthly channel digest updates
 to the manifest and guard map together; those PRs remain red until a maintainer
 regenerates the lock key and its evaluated version/output metadata.
 Devbox 0.17.5 currently rewrites the key-less gcc entry, so the weekly refresh
@@ -136,10 +136,12 @@ knowingly fails at this guard until a separate refresh redesign lands. It must
 not publish a mismatched lock while that work is pending.
 
 Both images bake the sha-verified sqlc archive at `/usr/local/share/uzi-sqlc`.
+Linux amd64 and arm64 use separate upstream archive hashes at the same version.
 The scrubbed run environments carry only its non-secret `UZI_SQLC_DIR` path;
 provisioned tools cannot override it. The wrapper verifies a private archive
-copy on every invocation. CI runs both images without networking to check Go
-and sqlc. Image size changes are measured separately when upgrading the pin.
+copy on every invocation. Both image release builds prove Go and sqlc under
+the runner uid with networking disabled. Image size changes are measured
+separately when upgrading the pin.
 
 See [ARCHITECTURE.md](../ARCHITECTURE.md#services) for the worker's egress and
 provisioning trust model, and [Worker setup](./worker-setup.md#tool-provisioning)

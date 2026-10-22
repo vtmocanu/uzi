@@ -54,6 +54,7 @@ func TestSeededAllowlistCoveredBySeed(t *testing.T) {
 
 	// NOT-covered: a package neither baked nor an exception.
 	notCovered := []string{
+		"github:NixOS/nixpkgs/0000000000000000000000000000000000000000#go_1_27", // user specs are not normalized as trusted seeds
 		"ruby",      // never baked (tier-2 only), not an exception
 		"terraform", // swapped off the allowlist by 00124, not baked (unfree)
 		"cowsay",    // arbitrary un-baked package
