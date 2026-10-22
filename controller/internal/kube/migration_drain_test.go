@@ -1,0 +1,546 @@
+package kube
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	k8stesting "k8s.io/client-go/testing"
+
+	"github.com/vtmocanu/uzi/controller/internal/protocol"
+	"github.com/vtmocanu/uzi/controller/internal/reconcile"
+)
+
+type migrationCordoner struct {
+	fakeCordoner
+	reasons []string
+	fail    bool
+}
+
+func (c *migrationCordoner) RequestDrainWithReason(ctx context.Context, id string, reasons ...string) error {
+	c.reasons = append(c.reasons, reasons...)
+	c.calls = append(c.calls, id)
+	if c.fail {
+		return errors.New("response lost")
+	}
+	return nil
+}
+
+func migrationFixture(t *testing.T, opts ...lmOpts) (*lmFixture, []protocol.DesiredWorker, *migrationCordoner) {
+	t.Helper()
+	var objects []runtime.Object
+	var workers []protocol.DesiredWorker
+	for _, opt := range opts {
+		objs, w := lmObjects(t, opt)
+		objects = append(objects, objs...)
+		workers = append(workers, w)
+	}
+	f := lmCluster(t, false, objects...)
+	c := &migrationCordoner{}
+	f.m.cordoner = c
+	return f, workers, c
+}
+func migrationHeldOpt(id string) lmOpts {
+	return lmOpts{id: id, custody: true, stale: true, layout: "old"}
+}
+func migrationProviderOpt(id string) lmOpts { return lmOpts{id: id, stale: true, layout: "new"} }
+
+func TestMigrationDrainEntry(t *testing.T) {
+	for _, mode := range []string{"busy", "idle-terminal", "singleton", "partial", "union", "foreign-owner", "foreign-lane", "unknown", "stale", "dead", "draining", "pressure", "maintenance", "ordinary-wins", "third-provider", "reverse-dependency"} {
+		t.Run(mode, func(t *testing.T) {
+			opts := []lmOpts{migrationHeldOpt("a"), migrationHeldOpt("b")}
+			if mode == "ordinary-wins" || mode == "third-provider" || mode == "reverse-dependency" {
+				opts[1] = migrationProviderOpt("b")
+			}
+			if mode == "singleton" {
+				opts = opts[:1]
+			}
+			if mode == "union" || mode == "third-provider" || mode == "reverse-dependency" {
+				opts = append(opts, migrationHeldOpt("c"))
+			}
+			if mode == "reverse-dependency" {
+				opts = append(opts, migrationProviderOpt("d"))
+			}
+			f, ws, c := migrationFixture(t, opts...)
+			ws[0].Busy = mode == "busy"
+			want := mode == "busy" || mode == "idle-terminal" || mode == "third-provider"
+			switch mode {
+			case "partial", "union":
+				ws[0].RollEvidence.SchedulingCapabilities = []string{"x", "y"}
+				ws[1].RollEvidence.SchedulingCapabilities = []string{"x"}
+				if mode == "union" {
+					ws[2].RollEvidence.SchedulingCapabilities = []string{"y"}
+				}
+			case "foreign-owner":
+				ws[1].RollEvidence.OwnerID = "other"
+			case "foreign-lane":
+				ws[1].Docker = false
+			case "unknown":
+				ws[1].RollEvidence.LivenessValidUntil = nil
+			case "stale":
+				expired := m5Now.Add(-time.Minute)
+				ws[1].RollEvidence.LivenessValidUntil = &expired
+			case "dead":
+				p, _ := f.client.CoreV1().Pods(lmNS()).Get(context.Background(), "pod-b", metav1.GetOptions{})
+				p.Status.Phase = corev1.PodSucceeded
+				_, _ = f.client.CoreV1().Pods(lmNS()).Update(context.Background(), p, metav1.UpdateOptions{})
+			case "draining":
+				ws[1].DrainingSince, ws[1].DrainingReason = &m5Now, token("image_roll")
+			case "pressure":
+				ws[1].DiskPressure = true
+			case "maintenance":
+				ws[1].DindMaintenance = &protocol.DindMaintenance{Phase: "stopping"}
+			case "ordinary-wins", "third-provider", "reverse-dependency":
+				// b drifts normally; a must remain serving when it is b's only provider.
+				if mode == "reverse-dependency" {
+					ws[0].RollEvidence.SchedulingCapabilities = []string{"x", "y", "z"}
+					ws[1].RollEvidence.SchedulingCapabilities = []string{"x", "y", "z"}
+					ws[2].RollEvidence.SchedulingCapabilities = []string{"x", "y"}
+					ws[3].RollEvidence.SchedulingCapabilities = []string{"x", "y", "z"}
+					_ = f.client.CoreV1().Pods(lmNS()).Delete(context.Background(), "pod-d", metav1.DeleteOptions{})
+					// a's existing reservation freezes the narrower drain coverage.
+					d, _ := f.client.AppsV1().Deployments(lmNS()).Get(context.Background(), deploymentName("a"), metav1.GetOptions{})
+					cov, _ := coverageOf(ws[0], lmNS())
+					cov.Scheduling = []string{"docker", "x", "y"}
+					raw, _ := json.Marshal(&rollMarker{Version: 1, Hash: d.Spec.Template.Annotations[AnnotationSpecHash], Image: workerImage(d), TargetVersion: "1.0.0", Coverage: cov})
+					d.Annotations = map[string]string{annotationRoll: string(raw)}
+					_, _ = f.client.AppsV1().Deployments(lmNS()).Update(context.Background(), d, metav1.UpdateOptions{})
+				}
+			default:
+				if len(ws) > 1 {
+					ws[1].CustodyHeld = true
+				} // another held candidate stays serving this tick
+			}
+			// All entry proofs use live old incarnations, independent of free slots.
+			if mode != "ordinary-wins" && mode != "third-provider" && mode != "reverse-dependency" && len(ws) > 1 {
+				ws[1].CustodyHeld = true
+			}
+			if mode == "third-provider" {
+				ws[2].CustodyHeld = true
+			}
+			if mode == "reverse-dependency" {
+				ws[2].CustodyHeld = true
+			}
+			if err := f.tickErr(t, ws...); err != nil && mode != "maintenance" {
+				t.Fatal(err)
+			}
+			got := false
+			for _, id := range c.calls {
+				got = got || id == "a"
+			}
+			if got != want {
+				t.Fatalf("drain calls %v; a selected=%v want %v; outcomes %+v", c.calls, got, want, f.m.PacingOutcomes())
+			}
+			if want {
+				if !reflect.DeepEqual(c.calls, []string{"a"}) || !reflect.DeepEqual(c.reasons, []string{"image_roll"}) {
+					t.Fatalf("requests %v reasons %v", c.calls, c.reasons)
+				}
+				p := f.m.PacingOutcomes()["a"]
+				if p.State != "held" || p.CanaryID != nil || p.BlockingReason == nil || !strings.Contains(*p.BlockingReason, "layout_migration_custody") {
+					t.Fatalf("held outcome %+v", p)
+				}
+				if lmRolled(t, f, "a") || lmAnnotation(t, f, "a") != "" {
+					t.Fatal("held worker replaced or reserved")
+				}
+			}
+		})
+	}
+}
+
+func TestMigrationDrainRequiresUndrainedPoll(t *testing.T) {
+	f, ws, c := migrationFixture(t, migrationHeldOpt("a"),
+		lmOpts{id: "b", layout: "new", promoted: true})
+	ws[1].DrainingSince, ws[1].DrainingReason = &m5Now, token("image_roll")
+	f.tickAll(t, ws...)
+	if !reflect.DeepEqual(c.clearCalls, []string{"b"}) {
+		t.Fatalf("provider drain not cleared: %v", c.clearCalls)
+	}
+	if len(c.calls) != 0 {
+		t.Fatalf("provider drained in original poll covered migration: %v", c.calls)
+	}
+	// Only an explicit undrained poll makes the same serving proof eligible.
+	ws[1].DrainingSince, ws[1].DrainingReason = nil, nil
+	f.tickAll(t, ws...)
+	if !reflect.DeepEqual(c.calls, []string{"a"}) {
+		t.Fatalf("undrained provider did not cover migration: %v", c.calls)
+	}
+}
+
+// Loop failures must preserve pending write uncertainty. A direct Reconcile test
+// alone cannot establish that Poll and Observe failures leave the map untouched.
+type migrationPoller struct {
+	workers []protocol.DesiredWorker
+	err     error
+}
+
+func (p *migrationPoller) Poll(context.Context) (protocol.PollResponse, error) {
+	return protocol.PollResponse{Workers: p.workers}, p.err
+}
+
+type migrationObserver struct {
+	*Materializer
+	fail bool
+}
+
+func (m *migrationObserver) Observe(ctx context.Context) ([]reconcile.ObservedWorker, error) {
+	if m.fail {
+		return nil, errors.New("observe unavailable")
+	}
+	return m.Materializer.Observe(ctx)
+}
+
+type migrationReporter struct{ report protocol.StatusReport }
+
+func (r *migrationReporter) Report(_ context.Context, s protocol.StatusReport) error {
+	r.report = s
+	return nil
+}
+
+func TestMigrationDrainPendingLoop(t *testing.T) {
+	for _, committed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "before-commit", true: "after-commit"}[committed], func(t *testing.T) {
+			f, ws, c := migrationFixture(t, migrationHeldOpt("a"), migrationHeldOpt("b"), migrationHeldOpt("c"))
+			p := &migrationPoller{workers: ws}
+			o := &migrationObserver{Materializer: f.m}
+			l := reconcile.New(p, o, nil, time.Second, "1.0.0", f.m.log)
+			c.fail = true
+			if err := l.Tick(context.Background()); err == nil {
+				t.Fatal("missing unknown-write error")
+			}
+			if !reflect.DeepEqual(c.calls, []string{"a"}) {
+				t.Fatalf("calls %v", c.calls)
+			}
+			if committed {
+				ws[0].DrainingSince, ws[0].DrainingReason = &m5Now, token("image_roll")
+			}
+			for i := 0; i < 3; i++ {
+				p.err = errors.New("poll unavailable")
+				if l.Tick(context.Background()) == nil {
+					t.Fatal("poll succeeded")
+				}
+				p.err = nil
+				o.fail = true
+				if l.Tick(context.Background()) == nil {
+					t.Fatal("observe succeeded")
+				}
+				o.fail = false
+			}
+			if len(c.calls) != 1 {
+				t.Fatalf("failed cycles retried mutation %v", c.calls)
+			}
+			// Missing owner is not positive resolution of the old attempt.
+			saved := ws[0].RollEvidence
+			ws[0].RollEvidence = nil
+			if err := l.Tick(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if len(c.calls) != 1 {
+				t.Fatalf("missing owner cleared pending: %v", c.calls)
+			}
+			ws[0].RollEvidence = saved
+			c.fail = false
+			if err := l.Tick(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			want := 2
+			if committed {
+				want = 1
+			}
+			if len(c.calls) != want {
+				t.Fatalf("fresh resolution calls %v want %d", c.calls, want)
+			}
+		})
+	}
+}
+
+func TestMigrationDrainReentryAndBudget(t *testing.T) {
+	for _, mode := range []string{"registration", "restart", "changed-coverage", "existing-budget", "image-roll-budget", "legacy-budget", "nonrenderable-budget", "missing-owner-budget", "run-bound-excluded", "coverage-loss", "later-drift"} {
+		t.Run(mode, func(t *testing.T) {
+			f, ws, c := migrationFixture(t, migrationHeldOpt("a"), migrationHeldOpt("b"), migrationHeldOpt("c"))
+			f.tickAll(t, ws...)
+			if !reflect.DeepEqual(c.calls, []string{"a"}) {
+				t.Fatalf("entry %v", c.calls)
+			}
+			ws[0].DrainingSince, ws[0].DrainingReason = &m5Now, token("pressure_recycle")
+			switch mode {
+			case "registration", "restart", "changed-coverage":
+				ws[0].DrainingSince, ws[0].DrainingReason = nil, nil
+				if mode == "changed-coverage" {
+					ws[0].RollEvidence.SchedulingCapabilities = []string{"x"}
+				}
+			case "image-roll-budget":
+				ws[0].DrainingReason = token("image_roll")
+			case "legacy-budget":
+				ws[0].DrainingReason = nil
+			case "run-bound-excluded":
+				ws[0].Ephemeral = true
+			case "nonrenderable-budget":
+				ws[0].Template = "unresolvable"
+			case "missing-owner-budget":
+				ws[0].RollEvidence = nil
+			case "coverage-loss":
+				for _, id := range []string{"b", "c"} {
+					_ = f.client.CoreV1().Pods(lmNS()).Delete(context.Background(), "pod-"+id, metav1.DeleteOptions{})
+				}
+			case "later-drift":
+				ws[1].CustodyHeld = false
+				ws[2].RollEvidence.SchedulingCapabilities = []string{"x"}
+				ws[1].RollEvidence.SchedulingCapabilities = []string{"y"}
+				ws[0].RollEvidence.SchedulingCapabilities = []string{"y"}
+				_ = f.client.CoreV1().Pods(lmNS()).Delete(context.Background(), "pod-c", metav1.DeleteOptions{})
+			}
+			if mode == "restart" {
+				f.m = New(f.client, f.m.cfg, f.m.resolver, c, f.m.drain, f.m.recycle, f.m.log)
+				f.m.now = func() time.Time { return m5Now }
+			}
+			f.tickAll(t, ws...)
+			want := 1
+			if mode == "registration" || mode == "restart" || mode == "run-bound-excluded" {
+				want = 2
+			}
+			// Changed a coverage allows a different candidate, but never a again.
+			if mode == "changed-coverage" {
+				for _, id := range c.calls[1:] {
+					if id == "a" {
+						t.Fatal("changed coverage not reevaluated")
+					}
+				}
+			} else if len(c.calls) != want {
+				t.Fatalf("calls %v want %d", c.calls, want)
+			}
+			if len(c.clearCalls) != 0 {
+				t.Fatalf("custody drain released %v", c.clearCalls)
+			}
+			if mode == "coverage-loss" {
+				p := f.m.PacingOutcomes()["a"]
+				if p.BlockingReason == nil || !strings.Contains(*p.BlockingReason, "retained drain without coverage") {
+					t.Fatalf("lost coverage outcome %+v", p)
+				}
+			}
+			if mode == "later-drift" && lmRolled(t, f, "b") {
+				t.Fatal("later drift lost availability guard")
+			}
+		})
+	}
+}
+
+func TestMigrationDrainLateCommit(t *testing.T) {
+	for _, restart := range []bool{false, true} {
+		t.Run(map[bool]string{false: "fresh-poll", true: "restart"}[restart], func(t *testing.T) {
+			f, ws, c := migrationFixture(t, migrationHeldOpt("a"), migrationHeldOpt("b"), migrationHeldOpt("c"), migrationHeldOpt("0-unrelated"))
+			ws[0].RollEvidence.SchedulingCapabilities = []string{"x", "y"}
+			ws[1].RollEvidence.SchedulingCapabilities = []string{"x"}
+			ws[2].RollEvidence.SchedulingCapabilities = []string{"x", "y"}
+			ws[3].RollEvidence.OwnerID = "unrelated"
+			c.fail = true
+			if f.tickErr(t, ws...) == nil {
+				t.Fatal("expected lost response")
+			}
+			if !reflect.DeepEqual(c.calls, []string{"a"}) {
+				t.Fatalf("entry %v", c.calls)
+			}
+			// The timed-out a POST remains delayed while a fresh poll says undrained.
+			_ = f.client.CoreV1().Pods(lmNS()).Delete(context.Background(), "pod-c", metav1.DeleteOptions{})
+			if restart {
+				f.m = New(f.client, f.m.cfg, f.m.resolver, c, f.m.drain, f.m.recycle, f.m.log)
+				f.m.now = func() time.Time { return m5Now }
+			}
+			c.fail = false
+			f.tickAll(t, ws...)
+			if !reflect.DeepEqual(c.calls, []string{"a", "b"}) {
+				t.Fatalf("accepted late-write schedule %v", c.calls)
+			}
+			// b commits, then a's old request commits late. No controller fence exists.
+			for i := 0; i < 2; i++ {
+				ws[i].DrainingSince, ws[i].DrainingReason = &m5Now, token("image_roll")
+			}
+			if !restart {
+				// This unrelated lower-ID row becomes held only during materialization.
+				ws[3].CustodyHeld = false
+				f.client.PrependReactor("patch", "deployments", func(a k8stesting.Action) (bool, runtime.Object, error) {
+					if a.(k8stesting.PatchAction).GetName() == deploymentName("0-unrelated") && strings.Contains(string(a.(k8stesting.PatchAction).GetPatch()), "\"spec\"") {
+						return true, nil, errors.New("late materialization failure")
+					}
+					return false, nil, nil
+				})
+			}
+			p := &migrationPoller{workers: ws}
+			r := &migrationReporter{}
+			l := reconcile.New(p, f.m, r, time.Second, "1.0.0", f.m.log)
+			if err := l.Tick(context.Background()); (err != nil) == restart {
+				t.Fatalf("late error=%v restart=%v", err, restart)
+			}
+			if len(c.calls) != 2 || len(c.clearCalls) != 0 {
+				t.Fatalf("multiplicity caused mutation: %v %v", c.calls, c.clearCalls)
+			}
+			for _, id := range []string{"a", "b"} {
+				if lmRolled(t, f, id) {
+					t.Fatal("late drain replaced held source")
+				}
+			}
+			pacing := f.m.PacingOutcomes()["0-unrelated"]
+			if pacing == nil || pacing.BlockingReason == nil || !strings.Contains(*pacing.BlockingReason, "fleet: multiple migration-held drains") {
+				t.Fatalf("lowest held masks notice: %+v", pacing)
+			}
+			if !restart && !strings.Contains(*pacing.BlockingReason, "mutation unconfirmed") {
+				t.Fatalf("local cause lost: %s", *pacing.BlockingReason)
+			}
+			if strings.Contains(*pacing.BlockingReason, "multiple held drains") || len(*pacing.BlockingReason) > 192 {
+				t.Fatalf("identity leak or bound: %s", *pacing.BlockingReason)
+			}
+			// Assert the actual Loop status wire, not just the pacing getter.
+			found := false
+			for _, row := range r.report.Workers {
+				if row.ID == "0-unrelated" && row.Pacing != nil && row.Pacing.BlockingReason != nil {
+					found = strings.Contains(*row.Pacing.BlockingReason, "multiple migration-held drains")
+				}
+			}
+			if !found {
+				t.Fatalf("notice missing from status wire: %+v", r.report)
+			}
+		})
+	}
+}
+
+func TestMigrationDrainUnknownFences(t *testing.T) {
+	for _, lost := range []bool{false, true} {
+		t.Run(map[bool]string{false: "confirmed", true: "lost"}[lost], func(t *testing.T) {
+			f, ws, c := migrationFixture(t, migrationHeldOpt("a"), migrationHeldOpt("b"), migrationProviderOpt("c"), migrationProviderOpt("d"))
+			ws[2].RollEvidence.SchedulingCapabilities = []string{"extra"}
+			ws[3].RollEvidence.OwnerID = "unrelated"
+			c.fail = lost
+			err := f.tickErr(t, ws...)
+			if (err != nil) != lost {
+				t.Fatalf("error %v lost %v", err, lost)
+			}
+			if !reflect.DeepEqual(c.calls, []string{"a"}) {
+				t.Fatalf("calls %v", c.calls)
+			}
+			if lmRolled(t, f, "c") == lost {
+				t.Fatalf("overlapping key crossed uncertainty fence, lost=%v", lost)
+			}
+			if !lmRolled(t, f, "d") {
+				t.Fatal("unrelated owner stalled")
+			}
+		})
+	}
+}
+
+// A migration drain has no private marker after custody settles. Ordinary
+// admission and reason-owned release must keep their existing predicates.
+func TestMigrationDrainCustodyClear(t *testing.T) {
+	for _, mode := range []string{"admitted", "released", "blocked", "unusable", "pressure", "maintenance"} {
+		t.Run(mode, func(t *testing.T) {
+			f, ws, cordon := migrationFixture(t, migrationHeldOpt("a"), migrationHeldOpt("b"), migrationHeldOpt("c"))
+			f.tickAll(t, ws...)
+			if !reflect.DeepEqual(cordon.calls, []string{"a"}) {
+				t.Fatalf("migration entry = %v", cordon.calls)
+			}
+			ws[0].CustodyHeld = false
+			ws[0].DrainingSince, ws[0].DrainingReason = &m5Now, token("image_roll")
+			if mode != "admitted" {
+				// Another ordinary canary consumes admission, so a may only be
+				// released through the existing serving-proof predicates.
+				ws[2].CustodyHeld, ws[2].Busy = false, true
+				ws[2].DrainingSince, ws[2].DrainingReason = &m5Now, token("image_roll")
+				marked := markedDeployment(t, f.m.cfg, ws[2], false)
+				marker, err := decodeRoll(marked.Annotations[annotationRoll])
+				if err != nil {
+					t.Fatal(err)
+				}
+				marker.Coverage, _ = coverageOf(ws[2], lmNS())
+				raw, err := json.Marshal(marker)
+				if err != nil {
+					t.Fatal(err)
+				}
+				dep, err := f.client.AppsV1().Deployments(lmNS()).Get(context.Background(), deploymentName("c"), metav1.GetOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				dep.Annotations = map[string]string{annotationRoll: string(raw)}
+				if _, err := f.client.AppsV1().Deployments(lmNS()).Update(context.Background(), dep, metav1.UpdateOptions{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			switch mode {
+			case "blocked":
+				dep, err := f.client.AppsV1().Deployments(lmNS()).Get(context.Background(), deploymentName("a"), metav1.GetOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				dep.Annotations = map[string]string{annotationRoll: "malformed"}
+				if _, err := f.client.AppsV1().Deployments(lmNS()).Update(context.Background(), dep, metav1.UpdateOptions{}); err != nil {
+					t.Fatal(err)
+				}
+			case "unusable":
+				expired := m5Now.Add(-time.Minute)
+				ws[0].RollEvidence.LivenessValidUntil = &expired
+			case "pressure":
+				ws[0].DiskPressure = true
+			case "maintenance":
+				ws[0].DindMaintenance = &protocol.DindMaintenance{Phase: "requested"}
+			}
+			if err := f.tickErr(t, ws...); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "admitted" {
+				if !lmRolled(t, f, "a") {
+					t.Fatalf("custody-cleared worker was not admitted: %+v", f.m.PacingOutcomes()["a"])
+				}
+			} else if lmRolled(t, f, "a") {
+				t.Fatal("unadmitted old worker was replaced")
+			}
+			aClears := 0
+			for _, id := range cordon.clearCalls {
+				if id == "a" {
+					aClears++
+				}
+				if id == "b" {
+					t.Fatal("custody-held peer drain was cleared")
+				}
+			}
+			wantClears := 0
+			if mode == "released" {
+				wantClears = 1
+			}
+			if aClears != wantClears {
+				t.Fatalf("clear calls = %v, want %d releases of a", cordon.clearCalls, wantClears)
+			}
+		})
+	}
+}
+
+func TestMigrationDrainOrdinaryUnconfirmed(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(map[bool]string{false: "confirmed", true: "unknown"}[fail], func(t *testing.T) {
+			f, ws, c := migrationFixture(t, migrationHeldOpt("a"), migrationProviderOpt("b"), migrationHeldOpt("c"))
+			ws[1].RollEvidence.SchedulingCapabilities = []string{"extra"}
+			if fail {
+				f.client.PrependReactor("patch", "deployments", func(a k8stesting.Action) (bool, runtime.Object, error) {
+					if a.(k8stesting.PatchAction).GetName() == deploymentName("b") {
+						return true, nil, errors.New("unknown reservation")
+					}
+					return false, nil, nil
+				})
+			}
+			err := f.tickErr(t, ws...)
+			if fail && err == nil {
+				t.Fatal("unknown write not reported")
+			}
+			want := []string{"a"}
+			if fail {
+				want = nil
+			}
+			if !reflect.DeepEqual(c.calls, want) {
+				t.Fatalf("calls %v want %v", c.calls, want)
+			}
+		})
+	}
+}
