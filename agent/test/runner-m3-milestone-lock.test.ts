@@ -250,6 +250,8 @@ for (const expiry of ["returned updated", "queued readback"] as const) {
       await waitForTestEvent(stopped.promise, "checkpoint settles after controlled deadline");
       active = false;
       follower = git.withBareLock(bare, async () => { overtook = !released; });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(overtook, false, "follower must not overtake the holder while its lock remains held");
       assert.equal(failure instanceof Error ? (failure as Error & { diagnostic?: string }).diagnostic ?? failure.message : failure,
         undefined, "checkpoint must soft-stop without a boundary failure");
       assert.equal(returned, true);
@@ -270,7 +272,6 @@ for (const expiry of ["returned updated", "queued readback"] as const) {
     const feed = texts.findIndex(text => text.includes("retained locally"));
     const stop = texts.findIndex(text => text.includes("soft deadline"));
     assert.ok(feed >= 0 && stop > feed, `retained-head feed precedes stop: ${JSON.stringify(texts)}`);
-    assert.equal(overtook, false);
     assert.deepEqual(tips, [head]);
     assert.equal(publications.length, 1);
     assert.equal(publications[0]!.lastPublishedTip, head);
