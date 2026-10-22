@@ -124,17 +124,16 @@ No synthetic ANSI success substitutes for real generation.
 
 The command-side `devbox run build` criterion requires a nonzero exit with a
 Nix big-lock permission denial in each mode. Boundary probes report uid/gid/mode
-and attempt O_RDWR opens of the existing database and big-lock. In off mode,
-an observed database open is closed immediately and recorded; this guidance
-correction does not approve a formal criterion change. Big-lock remains strict
-in off mode, where a successful open has been observed and fails the check.
-Required mode requires denial for both real files. These probes do not create,
-truncate, lock or write real Nix files.
+and attempt O_RDWR opens of the existing database and big-lock. Both modes
+require denial for both real files. Any successful real-file open is closed
+immediately and fails the check without writing. Earlier off-mode writable
+opens remain unaccepted; guidance does not approve a formal criterion change.
+These probes do not create, truncate, lock or write real Nix files.
 Runner creates its own disposable /nix sentinel, mode 0666. Calibration uses a
 sentinel-only off-mode probe with the same path/O_RDWR flags and a one-byte
 write, separate from the real-file probes. Required mode must deny the sentinel
-open. Unexpected big-lock or required-mode opens are closed immediately and
-fail without writing. The disposable sentinel alone receives a calibration write.
+open; a successful open is closed immediately and fails without writing.
+The disposable off-mode sentinel alone receives a calibration write.
 Runner removes that sentinel; existing Nix ownership/grants stay unchanged.
 Boundary/command-Devbox criterion failures are retained while the cell proceeds
 to its rendering checks; they still make the cell fail.
