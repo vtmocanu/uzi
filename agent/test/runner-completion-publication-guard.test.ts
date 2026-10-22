@@ -1,4 +1,5 @@
 import { beforeEach, describe, it } from "node:test";
+import type { SteeringChannel } from "../src/steering.js";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -596,6 +597,33 @@ describe("M3 publication-start completion guard", () => {
     assert.equal(api.completionHoldRequests.length, 0);
     noPublish(claim.run_id);
   });
+
+  for (const codex of [false, true]) {
+    it(`prepush hold capture cancellation keeps the owner-cancel outcome (Codex=${codex})`, async () => {
+      const claim = claimFor();
+      const rig = codexRig();
+      const probe = committing("Fixes #3090");
+      const executor = codex ? new FakeCodexExecutor(rig.safety, ctx => probe.executor.run(ctx)) : probe.executor;
+      const forge = fakeGitlab();
+      const run = runnerWith(() => ({ executor }), forge.gitlab, undefined, undefined, { recoveryRetryMs: 1 });
+      const capture = run["captureHoldContext"].bind(run);
+      let captures = 0;
+      run["captureHoldContext"] = async (...args) => {
+        captures++;
+        const result = await capture(...args);
+        const active = (run as unknown as { activeRuns: Map<string, { steering: SteeringChannel }> }).activeRuns.get(claim.run_id)!;
+        active.steering.markCancelled();
+        return result;
+      };
+      await run.execute(claim);
+      assert.equal(captures, 1, "cancel arrives during the phasePublish prepush hold capture");
+      assert.equal(api.completionHoldRequests.length, 0, "known cancel never posts a hold");
+      const reports = terminal(claim.run_id);
+      assert.equal(reports.length, 1);
+      assert.equal(reports[0]!.body.failure_reason, "run cancelled", "the API uses the owner's stored cancellation stop kind");
+      assert.equal(forge.calls.length, 0);
+    });
+  }
 
   for (const disposition of ["confirmed", "ambiguous"] as const) {
     it(`Codex prepush ${disposition} hold remains nonterminal after boundary disposal`, async () => {

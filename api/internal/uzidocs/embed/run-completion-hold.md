@@ -72,8 +72,10 @@ pre-push guard and time-limit holds after a completion attempt also have a
 bounded degraded-capture path: after capture exhaustion they can hold with
 an empty captured head, retaining the clone and session without claiming a
 verified recovery copy. Uncertain hold delivery also retains local work.
-A proven server refusal still follows the existing cleanup rules; stopping
-that flight does not claim a confirmed hold or retry a model turn. See
+A refused time-limit hold that reports a live run retains the clone and session:
+that refusal does not prove another execution holds a recovery copy. Terminal
+refusals and cancellation keep their existing cleanup rules. Stopping that
+flight does not claim a confirmed hold or retry a model turn. See
 [Recovering unpublished work](run-recovery.md#completion-publication-holds).
 
 ## Requesting an owner decision

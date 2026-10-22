@@ -6993,8 +6993,8 @@ export class RunRunner {
       // the completion hold above, the run is non-terminal and the wall seam already handled it (a
       // `paused` report on "parked", NOTHING on "undeliverable"), so there is nothing to finalize (no
       // push, no MR, no terminal report). Reap + close the batcher and return; the finally preserves
-      // clone + HOME when capture/delivery requires retention; a proven hold refusal permits
-      // normal cleanup instead. Issue #1784: a Codex run whose park
+      // clone + HOME when capture/delivery requires retention, including a live hold refusal;
+      // terminal refusals keep their existing cleanup rules. Issue #1784: a Codex run whose park
       // the server confirmed (`paused`) reaches here via the finalize-boundary bypass in executeClaim;
       // an undeliverable park still arrives inside the boundary. Keyed on the executor's result so no
       // non-wall path can reach this branch.
@@ -13114,7 +13114,10 @@ export class RunRunner {
       // above is true; a legacy or seeded run leaves it false and never reaches this seam.
       // issue #1597 M2: gated against the mid-turn tick (it reaps and captures a restore point).
       enterCompletionHold: (reason, options) =>
-        this.runGatedSink(flight, () => this.enterCompletionHold(flight, claim, reason, runLog, options)),
+        this.runGatedSink(flight, () => this.enterCompletionHold(flight, claim, reason, runLog, {
+          ...options,
+          retainOnLiveRefusal: options?.allowDegradedCapture === true,
+        })),
       // PRD #1226 M5 (D6): the completion-question LIVE window, wired as a SIBLING to
       // enterCompletionHold. The executor calls this on a completion stall or an eligible lead
       // request with authoritative unmet milestones, before parking — it authors an
@@ -17972,7 +17975,7 @@ export class RunRunner {
     claim: ClaimResponse,
     reason: string,
     runLog: Logger,
-    options: { publishCheckpoint?: boolean; allowDegradedCapture?: boolean; signal?: AbortSignal } = {},
+    options: { publishCheckpoint?: boolean; allowDegradedCapture?: boolean; retainOnLiveRefusal?: boolean; signal?: AbortSignal } = {},
   ): Promise<boolean> {
     // 1. Reap the agent tree BEFORE any credentialed capture git (REAP-BEFORE-GIT), exactly like
     //    handleRecoveryExhausted. Idempotent — phasePublish's completionHeld branch reaps again.
@@ -18080,6 +18083,13 @@ export class RunRunner {
     }
     const refuse = (): false => {
       flight.completionHoldOutcome = "refused";
+      // A wall/budget flight stops instead of re-driving. A live-status refusal does not prove
+      // another generation captured this source, especially after an empty-head capture. Keep
+      // its clone and HOME; terminal/cancellation refusals and phasePublish callers are unchanged.
+      if (options.retainOnLiveRefusal && ["queued", "claimed", "running"].includes(String(status))) {
+        runLog.info("completion hold refused while run remains live; retaining stopped source", { run_id: flight.runId });
+        return false;
+      }
       flight.preserveRecoveryClone = false;
       flight.preserveSession = false;
       runLog.info("completion hold refused by proof; normal terminal cleanup permitted", {

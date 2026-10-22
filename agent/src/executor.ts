@@ -747,7 +747,8 @@ export interface RunContext {
    *  and HOME and the caller latches {@link ExecutorResult.completionHeld} to skip finalization.
    *  Returns FALSE if ordinary capture was never verified or explicit proof refused the hold.
    *  Wall/budget callers permit degraded capture and stop nonterminally on a refusal; other
-   *  callers retain their legacy routing. The runner's proof and custody guards determine cleanup,
+   *  live refusals retain clone and HOME because they prove no covering handoff. Other callers
+   *  retain their legacy routing. The runner's proof and custody guards determine cleanup,
    *  so a declined hold must not be described as a confirmed park. */
   enterCompletionHold?(reason: string, options?: { allowDegradedCapture?: boolean }): Promise<boolean>;
   /** PRD #1226 M5 (D6): the completion-question LIVE window. Called at the completion-STALL point
@@ -886,7 +887,7 @@ export interface ExecutorResult {
    *  stopped nonterminally. The runner reads it in phasePublish to SKIP finalization (no
    *  push, no PR, no terminal report), exactly like `pausedAt`/`completionHeld`: the wall seam
    *  already handled the run (a `paused` report on "parked", or NOTHING on "undeliverable", D17) and
-   *  the finally preserves clone + HOME unless proof refused the hold and permits cleanup.
+   *  the finally preserves clone + HOME on a live refusal; terminal refusals keep existing cleanup.
    *  `reason` is the static, content-free failure-reason constant
    *  the trip used (REASON_WALL). NOT gated on run kind (all six timed kinds park at the wall) or on
    *  harness (both Claude and Codex). Absent on every normal completion. StubExecutor never sets it. */

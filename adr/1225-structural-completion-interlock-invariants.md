@@ -294,9 +294,11 @@ without fallback wall park, redrive or finalization.
 These wall/budget routes pass `allowDegradedCapture`: bounded capture
 exhaustion requests an empty-head hold, keeping clone and HOME without
 claiming a verified recovery copy. Unresolved delivery retains them too.
-Retention follows evidence; proven server refusal, cancellation and stale
-claims keep their existing cleanup rules. Cancellation observed before the
-hold POST sends no hold request.
+Retention follows evidence. A refused wall/budget hold reporting a live run
+retains clone and HOME: that refusal proves neither source coverage nor safe
+handoff to another generation. Terminal refusals, cancellation and stale
+claim fencing keep their existing handling. Cancellation observed before the
+hold POST sends no hold request. (AI-synced 2026-10-22)
 
 This is a worker-only fix. APIs supporting wall parking already serve the
 count on both running ACKs and wall-park refusals; no API, migration or chart
