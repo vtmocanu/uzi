@@ -150,11 +150,13 @@ existing="$(timeout 10s docker ps -a --filter "name=^/${name}$" --format '{{.Nam
 container_created=1
 fixture=fixture.ts
 if [ "$action" = cell ]; then fixture=matrix.ts; fi
+# Disposable /data must execute worktree and generated Devbox scripts.
+# Keep nosuid/nodev while opting into executable tmpfs, like a worktree volume.
 creation_started=$SECONDS
 timeout --kill-after=10s "${UXLAB_RENDER_CREATE_TIMEOUT:-600}" docker create --name "$name" --label "uxlab-render.owner=$owner" \
   --network "${UXLAB_RENDER_NETWORK:-bridge}" --user 0:0 \
   --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETPCAP --cap-add SETUID --cap-add SETGID \
-  --security-opt no-new-privileges --tmpfs /data \
+  --security-opt no-new-privileges --tmpfs /data:rw,exec,nosuid,nodev \
   --mount "type=volume,source=$volume,target=/nix" \
   --entrypoint "$entrypoint" \
   "${mount_args[@]}" -e "UXLAB_RENDER_IMAGE_ID=$image_id" \

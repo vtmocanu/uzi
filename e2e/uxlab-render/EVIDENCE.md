@@ -72,11 +72,42 @@ criterion decision is required before proceeding with the blocked proof.
 `git diff --exit-code 3fb1fdbf -- agent/src agent/codex agent/templates`
 passed at `96ea0864`: those production paths are unchanged.
 
-Still unperformed: missing-freeze base red in either mode; candidate rendering
+Still missing required proof: missing-freeze base red in either mode; candidate rendering
 in either mode; command-side Devbox lock control; complete database/lock denial
 and calibrated Landlock sentinel evidence; runner-owned local Devbox build;
-matched provisioning timing; PNG signatures/freshness correspondence and
+complete matrix provisioning timing; PNG signatures/freshness correspondence and
 light/dark visual inspection. The successful Go setup does not satisfy these.
+
+## Separate local attempt and mount diagnosis
+
+The separate runner-owned local leg at `573ca948` used the same image,
+production source/helper digests, bridge network, empty tier 1, repository
+opt-in, fresh named Nix volume and fresh /data as the base/off attempt.
+Provisioning runs before either proof branch: the root now installed Ruby
+4.0.6 plus charm-freeze 0.2.2 with no warnings in 30,878 ms, versus 26,990 ms
+for base Ruby alone. The single-pair difference is 3,888 ms. The timed region
+excludes creation, copying, Go setup and rendering. Both samples used default
+tmpfs settings; these are fresh image/store receipts, not a controlled CDN
+cache experiment or a completed rendering matrix. This also does not verify
+an instance opt-in setting: the fixture explicitly enables it.
+
+Local command Go setup passed in 67,770 ms. Runner-owned `devbox run build`
+then exited 126 on `.devbox/gen/scripts/build.sh`: permission denied. No frames
+or PNGs were generated. Cleanup was verified; total 208 seconds, exit 1.
+Logs: `m3-local-573ca948.log`, `uxlab-render.M9VdVr`.
+
+A small isolated execution-only A/B probe used fresh owned containers/volumes
+and a correctly owned mode-0700 shell script. Default `/data` tmpfs denied
+execution (126); `rw,exec,nosuid,nodev` permitted it (0). Both cleanup checks
+passed (`gate-log.gBfv2X`, `gate-log.NPcwGK`). An earlier diagnostic did not
+reach execution because uid 10003 could not create a directory under the
+uninitialized root-owned mount; it is not an execution result.
+
+The fixture now sets executable /data explicitly for worktree/Devbox scripts,
+retaining nosuid/nodev. The production compose mount is `agentdata:/data`
+(`docker-compose.yml:404`); no production mount, Nix permission, uid or
+sandbox grant was changed. The corrected local leg and final full gate are
+not yet recorded. The SQLite denial conflict remains independent and open.
 
 ## Focused verification and repository checks
 
@@ -105,7 +136,13 @@ base revision. An isolated full baseline gate was not claimed: Git-dependent
 gates cannot run faithfully from the permitted exports without Git metadata.
 No production trust settings or ownership were changed.
 
-A full repository gate after the fixture repairs remains to be recorded.
+A full repository gate at `573ca948` passed in 1,628 seconds (27m08s),
+including the required ShellCheck, YAML lint, parity and Task parsing. Secret
+scanning detected both canaries with zero tracked findings; Semgrep detected
+its canary with zero tree results/errors. Workflow lint used its existing
+local fail-open skip because actionlint was absent. Actual PR CI enforces that
+separate workflow tool requirement. Log: `m3-gate-573ca948.log`.
+This receipt predates the disposable-data execution correction below.
 
 Serial added-step timing on Node 24.20.0 with existing tools/caches:
 
@@ -118,7 +155,8 @@ Serial added-step timing on Node 24.20.0 with existing tools/caches:
 
 The base gate has none of these three steps, so the local serial added cost
 is about 4.9 seconds (`gate-log.sZEjjg`). This estimates lint-repo step cost;
-actual hosted CI queue and critical-path impact remain unmeasured. Manual
+actual hosted CI queue and critical-path impact remain unmeasured. Additional
+file-processing cost in existing whole-tree lint/scans was not isolated. Manual
 container creation, provisioning, Go setup, failed attempts and future render
 proof are separate costs and are not new CI jobs. The matched provisioning
 cost comparison remains incomplete.

@@ -4,8 +4,9 @@
 
 M3 is **incomplete**. A real base/off attempt reached provisioning and Go
 setup, then failed the required Nix database write-access check. No rendering
-acceptance is claimed. The other matrix cells, matched timing comparison,
-local Devbox build and PNG inspection remain unperformed. See [EVIDENCE.md](EVIDENCE.md)
+acceptance is claimed. The other matrix cells and PNG inspection remain
+unperformed. A separate local build attempt reached Devbox but failed on the
+fixture tmpfs execution setting; its correction still needs live verification. See [EVIDENCE.md](EVIDENCE.md)
 for the tested revisions, safe-open failure and required scope decision.
 No production runtime, environment builder, permission or sandbox code changes.
 
@@ -53,7 +54,13 @@ set and the same optional toolchain policy.
 
 `matrix` runs base/off, base/required, candidate/off, candidate/required
 sequentially. Each cell has a fresh named /nix volume with normal image copy-up
-and fresh /data tmpfs, real image entrypoint and worker/runner/command uid split.
+and fresh /data tmpfs with rw,exec,nosuid,nodev, real image entrypoint and
+worker/runner/command uid split. Executable /data is needed for worktree and
+generated Devbox scripts; the production compose path uses an ordinary
+agentdata volume (`docker-compose.yml`). Default Docker tmpfs denied even a
+mode-0700 script in an isolated execution probe. An otherwise identical
+exec-enabled probe succeeded. These probes are mount diagnostics, not
+production UID or rendering acceptance.
 Full exported sources and fixture/helper inputs are read-only mounts.
 A bounded copy creates the disposable checkout as runner uid 10002, with a
 120-second timeout and a separate copy-duration receipt. Only the
