@@ -18,6 +18,15 @@ func migrationLaneFenced(t *rollTick, c rollCoverage) bool {
 	return t.migrationFences[migrationLane(c)] || t.migrationFences[migrationLane(rollCoverage{Lane: c.Lane})]
 }
 
+// Entries retain the original observation if the snapshot fails, and otherwise
+// carry the newer pod LIST layout. Missing entries still use full inventory.
+func migrationLayout(t *rollTick, w protocol.DesiredWorker, observed map[string]reconcile.ObservedWorker) reconcile.RunnerLayout {
+	if e := t.entries[w.ID]; e != nil {
+		return e.o.RunnerLayout
+	}
+	return observed[w.ID].RunnerLayout
+}
+
 func (m *Materializer) prepareMigrationDrains(t *rollTick, desired []protocol.DesiredWorker, observed map[string]reconcile.ObservedWorker) {
 	t.unavailable = map[string]bool{}
 	t.migrationFences = map[string]bool{}
@@ -45,7 +54,7 @@ func (m *Materializer) prepareMigrationDrains(t *rollTick, desired []protocol.De
 	}
 	// Full desired inventory, independent of template resolution or drift proof.
 	for _, w := range desired {
-		if w.Ephemeral || !migrationHeld(w, observed[w.ID].RunnerLayout) {
+		if w.Ephemeral || !migrationHeld(w, migrationLayout(t, w, observed)) {
 			continue
 		}
 		if w.DrainingSince != nil || w.DrainingReason != nil {
@@ -92,7 +101,7 @@ func (m *Materializer) selectMigrationDrains(ctx context.Context, t *rollTick, d
 		t.unavailable[id] = true
 	}
 	for _, w := range desired {
-		if w.Ephemeral || !migrationHeld(w, observed[w.ID].RunnerLayout) {
+		if w.Ephemeral || !migrationHeld(w, migrationLayout(t, w, observed)) {
 			continue
 		}
 		ns, err := m.cfg.Placement(w)
@@ -106,8 +115,11 @@ func (m *Materializer) selectMigrationDrains(ctx context.Context, t *rollTick, d
 		if !ok || w.DrainingSince != nil || w.DrainingReason != nil {
 			budget[migrationLane(c)] = true
 		}
-		if w.DrainingSince != nil && ok {
-			drained[migrationLane(c)] = append(drained[migrationLane(c)], w.ID)
+		// Diagnostic identity needs no capability proof. Unknown owners still
+		// consume the conservative lane budget above, but cannot share samples.
+		if w.DrainingSince != nil && w.RollEvidence != nil && w.RollEvidence.Version == 1 && w.RollEvidence.OwnerID != "" {
+			identity := rollCoverage{Owner: w.RollEvidence.OwnerID, Lane: ns}
+			drained[migrationLane(identity)] = append(drained[migrationLane(identity)], w.ID)
 		}
 	}
 	// Ordinary planning has finished, including its unconfirmed metadata writes.
@@ -188,6 +200,24 @@ func (m *Materializer) selectMigrationDrains(ctx context.Context, t *rollTick, d
 			reason = strings.TrimSuffix(reason, "; operator custody decision") + "; " + migrationMultiplicity(drained[migrationLane(e.coverage)])
 		}
 		p.BlockingReason = pacingText(layoutMigrationReason + ": " + reason)
+	}
+	for _, ids := range drained {
+		if len(ids) < 2 {
+			continue
+		}
+		for _, id := range ids {
+			p := t.outcomes[id]
+			if p == nil {
+				// Display only: unresolved desired image/version stay unknown.
+				// No roll entry, pool, reservation or admission is created.
+				p = &protocol.Pacing{State: "held", BlockingReason: pacingText(layoutMigrationReason + ": retained drain; operator custody decision")}
+				t.outcomes[id] = p
+			}
+			if p.State == "held" && p.BlockingReason != nil && !strings.Contains(*p.BlockingReason, "; held drains=") {
+				cause := strings.TrimSuffix(*p.BlockingReason, "; operator custody decision")
+				p.BlockingReason = pacingText(cause + "; " + migrationMultiplicity(ids))
+			}
+		}
 	}
 }
 

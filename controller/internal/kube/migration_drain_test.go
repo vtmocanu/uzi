@@ -54,7 +54,7 @@ func migrationHeldOpt(id string) lmOpts {
 func migrationProviderOpt(id string) lmOpts { return lmOpts{id: id, stale: true, layout: "new"} }
 
 func TestMigrationDrainEntry(t *testing.T) {
-	for _, mode := range []string{"busy", "idle-terminal", "singleton", "partial", "union", "foreign-owner", "foreign-lane", "unknown", "stale", "dead", "draining", "pressure", "maintenance", "ordinary-wins", "third-provider", "reverse-dependency"} {
+	for _, mode := range []string{"busy", "busy-provider", "idle-terminal", "singleton", "partial", "union", "foreign-owner", "foreign-lane", "unknown", "stale", "dead", "draining", "pressure", "maintenance", "ordinary-wins", "third-provider", "reverse-dependency"} {
 		t.Run(mode, func(t *testing.T) {
 			opts := []lmOpts{migrationHeldOpt("a"), migrationHeldOpt("b")}
 			if mode == "ordinary-wins" || mode == "third-provider" || mode == "reverse-dependency" {
@@ -71,7 +71,10 @@ func TestMigrationDrainEntry(t *testing.T) {
 			}
 			f, ws, c := migrationFixture(t, opts...)
 			ws[0].Busy = mode == "busy"
-			want := mode == "busy" || mode == "idle-terminal" || mode == "third-provider"
+			want := mode == "busy" || mode == "busy-provider" || mode == "idle-terminal" || mode == "third-provider"
+			if mode == "busy-provider" {
+				ws[1].Busy = true
+			}
 			switch mode {
 			case "partial", "union":
 				ws[0].RollEvidence.SchedulingCapabilities = []string{"x", "y"}
@@ -141,6 +144,11 @@ func TestMigrationDrainEntry(t *testing.T) {
 			}
 			if got != want {
 				t.Fatalf("drain calls %v; a selected=%v want %v; outcomes %+v", c.calls, got, want, f.m.PacingOutcomes())
+			}
+			if mode == "ordinary-wins" || mode == "reverse-dependency" {
+				if !lmRolled(t, f, "b") || lmAnnotation(t, f, "b") == "" || lmRolled(t, f, "a") || lmAnnotation(t, f, "a") != "" {
+					t.Fatal("ordinary admission did not replace b while preserving a")
+				}
 			}
 			if want {
 				if !reflect.DeepEqual(c.calls, []string{"a"}) || !reflect.DeepEqual(c.reasons, []string{"image_roll"}) {
@@ -334,24 +342,30 @@ func TestMigrationDrainReentryAndBudget(t *testing.T) {
 				f.m.now = func() time.Time { return m5Now }
 			}
 			f.tickAll(t, ws...)
-			want := 1
-			if mode == "registration" || mode == "restart" || mode == "run-bound-excluded" {
-				want = 2
+			want := []string{"a"}
+			if mode == "registration" || mode == "restart" {
+				want = []string{"a", "a"}
 			}
-			// Changed a coverage allows a different candidate, but never a again.
-			if mode == "changed-coverage" {
-				for _, id := range c.calls[1:] {
-					if id == "a" {
-						t.Fatal("changed coverage not reevaluated")
-					}
-				}
-			} else if len(c.calls) != want {
-				t.Fatalf("calls %v want %d", c.calls, want)
+			if mode == "changed-coverage" || mode == "run-bound-excluded" {
+				want = []string{"a", "b"}
+			}
+			if !reflect.DeepEqual(c.calls, want) {
+				t.Fatalf("calls %v want %v", c.calls, want)
 			}
 			if len(c.clearCalls) != 0 {
 				t.Fatalf("custody drain released %v", c.clearCalls)
 			}
 			if mode == "coverage-loss" {
+				dep, err := f.client.AppsV1().Deployments(lmNS()).Get(context.Background(), deploymentName("a"), metav1.GetOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(dep.UID) != "uid-"+deploymentName("a") || dep.Spec.Replicas == nil || *dep.Spec.Replicas != 1 || lmRolled(t, f, "a") || lmAnnotation(t, f, "a") != "" || ws[0].DrainingReason == nil || *ws[0].DrainingReason != "pressure_recycle" {
+					t.Fatalf("coverage loss changed retained deployment/drain: %+v", dep)
+				}
+				if _, err := f.client.CoreV1().Pods(lmNS()).Get(context.Background(), "pod-a", metav1.GetOptions{}); err != nil {
+					t.Fatal("retained pod lost: ", err)
+				}
 				p := f.m.PacingOutcomes()["a"]
 				if p.BlockingReason == nil || !strings.Contains(*p.BlockingReason, "retained drain without coverage") {
 					t.Fatalf("lost coverage outcome %+v", p)
@@ -541,13 +555,18 @@ func TestMigrationDrainUnknownFences(t *testing.T) {
 // A migration drain has no private marker after custody settles. Ordinary
 // admission and reason-owned release must keep their existing predicates.
 func TestMigrationDrainCustodyClear(t *testing.T) {
-	for _, mode := range []string{"admitted", "released", "blocked", "unusable", "pressure", "maintenance"} {
+	for _, mode := range []string{"entry", "admitted", "released", "blocked", "unusable", "pressure", "maintenance"} {
 		t.Run(mode, func(t *testing.T) {
 			f, ws, cordon := migrationFixture(t, migrationHeldOpt("a"), migrationHeldOpt("b"), migrationHeldOpt("c"))
-			f.tickAll(t, ws...)
-			if !reflect.DeepEqual(cordon.calls, []string{"a"}) {
-				t.Fatalf("migration entry = %v", cordon.calls)
+			if mode == "entry" {
+				f.tickAll(t, ws...)
+				if !reflect.DeepEqual(cordon.calls, []string{"a"}) {
+					t.Fatalf("migration entry = %v", cordon.calls)
+				}
+				return
 			}
+			// Preseed the poll drain so release/admission is exercised even when
+			// migration entry itself is broken.
 			ws[0].CustodyHeld = false
 			ws[0].DrainingSince, ws[0].DrainingReason = &m5Now, token("image_roll")
 			if mode != "admitted" {
@@ -645,6 +664,9 @@ func TestMigrationDrainOrdinaryUnconfirmed(t *testing.T) {
 			}
 			if !reflect.DeepEqual(c.calls, want) {
 				t.Fatalf("calls %v want %v", c.calls, want)
+			}
+			if lmRolled(t, f, "b") == fail || (lmAnnotation(t, f, "b") == "") != fail {
+				t.Fatalf("ordinary template/reservation fail=%v pacing=%+v", fail, f.m.PacingOutcomes()["b"])
 			}
 		})
 	}

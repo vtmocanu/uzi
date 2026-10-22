@@ -115,7 +115,6 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 		namespaces[ns] = append(namespaces[ns], e)
 		t.outcomes[w.ID] = &protocol.Pacing{State: "waiting_evidence", TargetImage: workerImage(target), TargetVersion: targetVersion(m.cfg, workerImage(target))}
 	}
-	m.prepareMigrationDrains(t, desired, observed)
 	for ns, entries := range namespaces {
 		if err := m.rollSnapshot(ctx, ns, entries); err != nil {
 			for _, e := range entries {
@@ -123,6 +122,9 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 			}
 		}
 	}
+	// Account for drained held workers using the newer pod snapshot before any
+	// ordinary admission can count them as serving coverage.
+	m.prepareMigrationDrains(t, desired, observed)
 	// Retire completed history only after every participant has been cleaned up.
 	// Do this before grouping so a new pin uses the current API capability set.
 	for _, e := range t.entries {
