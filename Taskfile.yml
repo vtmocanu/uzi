@@ -1190,7 +1190,8 @@ tasks:
       # value, every bind is a read-only --mount, and that `timeout --foreground` keeps
       # docker run/build in the script's process group so a group SIGINT exits 130
       # promptly. Prints a `cases=N passed=N` tally and fails below its case floor.
-      # Linux-only: reads each process's stat file and needs GNU timeout --foreground.
+      # Linux-only: reads each process's stat file and needs timeout --foreground
+      # plus env --default-signal, supported by GNU and uutils coreutils.
       - ./e2e/codex-git-trust/run.test.sh
 
   test:e2e-driver:
