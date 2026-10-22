@@ -33,13 +33,37 @@ The controller's spec-hash is computed over the rendered pod template, where the
 
 **Policy supersession (#3103, 2026-10-18):** the original elapsed busy-image deadline is replaced by indefinite busy-drift deferral. The historical implementation/validation record below is not evidence of a current image timeout.
 
-Rather than hard-killing a busy worker on a deliberate tag bump, the controller now requests a cordon through a new authenticated control-write endpoint, `POST /api/controller/workers/{id}/drain` (`RequireController`; `api/internal/handler/controller_cordon.go`). This is deliberately a **new, narrowly-scoped** channel, distinct from the existing display-only `POST /api/controller/status` report: cordoning mutates desired state (it sets `draining_since`), which is a different trust/failure class than an observability push whose errors are deliberately swallowed. On spec-hash drift, if the API reports the worker busy, the controller cordons it and defers the roll instead of rolling immediately; it performs the `Recreate` roll only once the API reports the worker idle. Without global ForceRoll, failures reading busy-ness or writing the cordon **fail safe**: the roll is deferred rather than treating missing observation/control as permission to kill.
+Rather than hard-killing a busy worker on a deliberate tag bump, the controller now requests a cordon through a new authenticated control-write endpoint, `POST /api/controller/workers/{id}/drain` (`RequireController`; `api/internal/handler/controller_cordon.go`). This is deliberately a **new, narrowly-scoped** channel, distinct from the existing display-only `POST /api/controller/status` report: cordoning mutates desired state (it sets `draining_since`), which is a different trust/failure class than an observability push whose errors are deliberately swallowed. On spec-hash drift, if the API reports an admitted worker busy, the controller cordons it and defers the roll instead of rolling immediately; it performs the `Recreate` roll only once the API reports the worker idle. Without global ForceRoll, failures reading busy-ness or writing the cordon **fail safe**: the roll is deferred rather than treating missing observation/control as permission to kill.
 
-All actual spec-hash/generation drift — image pin, template or size — and drift-associated recycle wait indefinitely for genuine idle. This includes run-bound workers outside pacing and calls with no pacing entry or a plain drain reason. Any assigned nonterminal run blocks: queued, paused and all waits/gates count. The worker may finish its own pinned continuations/checkers, but refuses unrelated new roots, unassigned children and judge intake. An admitted busy drainer occupies pool concurrency (default one), supplies no replacement coverage, canary proof or post-promotion proof, and can hold its pool indefinitely. Unadmitted healthy peers stay uncordoned and claimable, without a legacy-recycle escape; separately fenced DinD maintenance remains independent. Idle guards and custody still apply; an empty blocker list is not custody clearance. No timer automatically uncordons a worker.
+All actual spec-hash/generation drift — image pin, template or size — and drift-associated recycle wait indefinitely for genuine idle. This includes run-bound workers outside pacing and calls with no pacing entry or a plain drain reason. Any assigned nonterminal run blocks: queued, paused and all waits/gates count. The worker may finish its own pinned continuations/checkers, but refuses unrelated new roots, unassigned children and judge intake. An admitted busy drainer occupies pool concurrency (default one), supplies no replacement coverage, canary proof or post-promotion proof, and can hold its pool indefinitely. Unadmitted healthy peers normally stay uncordoned and claimable, except for the controller-only custody-held layout migration drain described below; there is no legacy-recycle escape; separately fenced DinD maintenance remains independent. Idle guards and custody still apply; an empty blocker list is not custody clearance. No timer automatically uncordons a worker.
 
 `UZI_WORKER_DRAIN_DEADLINE` (chart `workers.drainDeadline`, default `24h`, unchanged positive-only parsing) now bounds only independent **nondrifted** pressure/nix-size maintenance, measured from API `draining_since`. That maintenance can interrupt busy runs and delete /data unless custody-held. Shortening the deadline no longer forces image upgrades; there is no new knob. Restoring an unchanged retained zero-replica Deployment while busy retains its existing guard.
 
 `UZI_WORKER_FORCE_ROLL` (chart `workers.forceRoll`, default `false`) is a **global** emergency bypass of pacing, holds, incarnation proof and busy deferral for drift, plus busy deferral for independent maintenance. It can interrupt runs and lose all capacity; it is neither targeted nor a recovery guarantee. Custody-held data and independent DinD readiness, identity and pod-absence guards remain authoritative; DinD has no deadline or ForceRoll bypass. Restore `false` after the emergency. Waiting indefinitely trades upgrade/security latency and pool progress for preservation of assigned runs.
+
+The migration exception reuses `image_roll` after ordinary admission planning;
+it grants no replacement admission, reservation, canary, roll slot or pod-template
+patch while custody holds. Run-bound workers remain outside migration drain
+selection. A distinct live eligible uncordoned same-owner/lane sibling must
+individually cover the full frozen capability set; busy is acceptable, free
+slots are not required. Full-poll observed held drains of any reason (including
+unrenderable targets), selected drains and possibly committed drains prevent
+additional selection in that owner/lane. This is not a physical one-drain guarantee.
+
+Reconciliation retries eligible undrained workers after registration, controller
+restart or an explicit undrained poll, without a fixed time bound. Failed writes
+retain uncertainty until evidence resolves it, but that uncertainty is
+process-local and lost on restart. A delayed timed-out cordon can still commit
+after an explicit undrained poll. The accepted controller-only scope adds no
+server-side fence, schema, protocol or API product change. Retained drains can
+block later ordinary rolls and remain even if the covering sibling disappears,
+potentially removing all intake coverage. Registration and poll/write failures
+can leave claim gaps; custody-clear ordinary release predicates can reopen
+claims before a later re-drain. Worker-pin rollback retains custody refusal, then ordinary
+release rules apply; deployment order is independent for this exception because
+the existing reason is reused. See
+[migration drain operational limits](../docs/hosted-worker-roll-verification.md#migration-drain-policy-and-operational-limits)
+for operator decisions, idle terminal holds and chat continuation.
 
 ### D5 — `draining_since` is an orthogonal column, never a `workers.status` value
 

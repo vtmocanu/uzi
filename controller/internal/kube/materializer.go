@@ -1058,8 +1058,10 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 	// Run-workdir layout migration guard (issue #3153), evaluated BEFORE rollDespiteBusy
 	// so it overrides ForceRoll and the paused-restore arm. Replacing an old-layout pod
 	// of a custody-held Docker worker destroys its in-pod run workdir. This direct
-	// drift arm never patches or cordons; planRoll separately selects safe migration
-	// drains without admitting replacement. layoutNone (pods known to be absent)
+	// drift arm never patches or cordons; after ordinary admission, planRoll separately
+	// selects covered image_roll migration drains without admitting replacement.
+	// Retained or uncertain drains consume that owner/lane's migration budget.
+	// layoutNone (pods known to be absent)
 	// is not held, which is what lets a paused worker be restored.
 	// Narrow exception to the emergency ForceRoll; kubelet eviction and node drain
 	// cannot be guarded here.

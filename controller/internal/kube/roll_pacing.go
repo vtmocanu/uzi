@@ -278,12 +278,14 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 }
 
 // holdForLayoutMigration reports the worker held and withdraws its own incomplete
-// roll reservation. After pool planning, selectMigrationDrains separately considers
-// a cordon using original-poll coverage and the owner/lane drain budget; this hold
-// never admits replacement. The reservation must go because the held worker is outside the
-// pool: planPool's in-flight, promotion and pending accounting never sees it, so a
-// cohort could otherwise complete without it and wedge it (and every later drift in
-// the pool) behind a stale incomplete marker once custody releases. Cancelling is
+// roll reservation. After ordinary pool planning, selectMigrationDrains separately
+// considers an image_roll cordon using frozen poll coverage, refreshed layout
+// evidence, and the owner/lane budget for observed, selected or possibly drained
+// held workers. This hold never admits replacement. The reservation must go because
+// the held worker is outside the pool: planPool's in-flight, promotion and pending
+// accounting never sees it, so a cohort could otherwise complete without it and
+// wedge it (and every later drift in the pool) behind a stale incomplete marker
+// once custody releases. Cancelling is
 // metadata-only (no template or replicas change, no pod replaced) and is the same
 // cancellation planPool already applies to an obsolete marker; the worker simply
 // re-enters admission as a fresh drifted participant after the hold lifts.

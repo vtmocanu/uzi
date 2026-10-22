@@ -116,8 +116,9 @@ not establish storage health. See [Worker versions and upgrades](worker-upgrades
 ## Draining and cordoned
 
 Persistent hosted workers roll one canary first in each owner's placement and
-capability pool. Workers waiting for their turn keep claiming runs on the old
-image. A stuck replacement holds further replacements in that pool; it does
+capability pool. Eligible uncordoned workers waiting for their turn keep claiming
+runs on the old image; custody-held migration drains are a separate exception.
+A stuck replacement holds further replacements in that pool; it does
 not trigger an automatic rollback. Size and worker type do not divide pools.
 
 When a busy worker is admitted for replacement, the cluster **cordons** (drains)
@@ -132,8 +133,9 @@ when there are no assigned blockers.
 
 An admitted busy drainer occupies pool concurrency (default one), supplies no
 replacement coverage, canary proof or post-promotion proof, and can hold the pool
-indefinitely. Healthy peers waiting for admission stay uncordoned and claimable;
-legacy recycle cannot evade that policy. Separately fenced DinD maintenance remains
+indefinitely. Healthy peers waiting for admission normally stay uncordoned and claimable,
+except for eligible custody-held migration drains; legacy recycle cannot evade
+that policy. Separately fenced DinD maintenance remains
 independent. A pool with one worker can have an outage during its roll. Waiting
 indefinitely can delay capacity turnover and security fixes indefinitely.
 
@@ -150,6 +152,27 @@ deferral for independent maintenance. It may interrupt runs and lose all capacit
 it is neither targeted nor a recovery guarantee. Custody-held data and independent
 DinD readiness/identity/pod-absence guards remain authoritative; DinD has no deadline
 or ForceRoll bypass. Restore `false` after the emergency.
+
+For a persistent drifted Docker worker held on an old or unknown layout, the controller
+may request an `image_roll` migration drain after ordinary admission planning.
+This grants no replacement admission, reservation, canary, roll slot or pod-template
+patch under custody. Run-bound workers are excluded. A distinct live eligible
+uncordoned sibling in the same owner/lane must individually cover the full frozen
+capabilities; busy is acceptable, and free run slots are not required. Observed
+held drains of any reason in the full poll, including unrenderable workers, and
+selected or possibly committed drains block additional migration selection.
+A retained drain can delay later ordinary rolls; it stays if its covering sibling
+disappears, potentially removing all intake coverage.
+
+Eligible reconciliation retries after registration/restart or an explicit
+undrained poll, without a fixed time bound. Registration and poll/write failure
+gaps can allow claims. Failed writes retain process-local uncertainty until
+evidence resolves it; restart loses it. A timed-out cordon can commit after an
+undrained poll, so more than one held worker can physically drain. Review
+`blocking_reason` and health for the operator decision. This controller-only
+change reuses `image_roll`, adds no schema/protocol/API product or server-side
+fence, and is deployment-order independent. See
+[operational limits](./hosted-worker-roll-verification.md#migration-drain-policy-and-operational-limits).
 
 A cordoned worker shows a dashed **draining** or **cordoned** pill next to its
 status in the Workers list — **draining** while it's still finishing runs,
@@ -363,6 +386,20 @@ custody migration guard (surfaced as the fleet health warning
 residual are in [Docker inside a
 worker](./worker-docker.md#run-directory-on-the-data-volume) and
 [ADR-3153](../adr/3153-runner-shared-pvc-subpath.md).
+
+The hold still refuses replacement under ForceRoll, recycle and maintenance,
+including old/unknown layouts. A persistent held worker can nevertheless receive
+the migration drain described under [Draining and cordoned](#draining-and-cordoned).
+Idle terminal holds need an operator custody decision; the #3031 automatic path
+is not added here, and nothing automatically discards held work. Chat continue
+drops a draining-worker pin and may cold-resume. Once custody clears, ordinary
+release predicates may reopen claims, allowing fresh work before a later re-drain.
+Worker-pin rollback retains custody refusal, then ordinary release rules apply. Independent
+DinD/pressure/maintenance guards stay in force. Eviction, node drain and manual
+pod deletion remain outside controller protection. Unknown-target multiple-drain
+diagnostics are display-only, keep desired image/version empty and grant no
+mutation authority; the existing rolling fallback may stamp the first
+`upgrading_since`.
 
 ## Message outbox
 
