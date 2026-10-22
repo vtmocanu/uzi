@@ -85,6 +85,10 @@ import {
   REASON_COMPLETION_NO_PROGRESS,
   REASON_COMPLETION_LEAD_REQUESTED,
   REASON_COMPLETION_BUDGET_EXHAUSTED,
+  REASON_COMPLETION_STALL,
+  NoProgressStallTracker,
+  stallEligible,
+  progressSetsEqual,
   completionAttemptFingerprint,
   updateCompletionStreak,
   routeCompletionHold,
@@ -3181,6 +3185,13 @@ export class CodexExecutor implements Executor {
       let completionStallStreak = 0;
       let completionFollowUp: string | undefined;
       let completionAnswered = false;
+      // Issue #3139: the worker-initiated no-progress stall detector. It never reads the lead's text.
+      // The served attempt and completed counts are refreshed at every loop-top boundary. An absent
+      // attempt count means ineligible; an absent completed count falls back to the milestones
+      // this flight has seen.
+      const noProgress = new NoProgressStallTracker();
+      let lastServedCompletionAttempts: number | undefined;
+      let lastServedCompletedCount: number | undefined;
       // Issue #1800: the owner's follow-up batch (never empty; an empty pull stays undefined). Pulled from steering only immediately before an ordinary
       // implement prompt is built (never while a system text owns the turn), carried across loop
       // iterations (the base prompt is rebuilt each time), and cleared only when the turn whose
@@ -3266,6 +3277,8 @@ export class CodexExecutor implements Executor {
         const served: IterationBudget | void = await ctx.reportIteration?.(iteration, latestProgress);
         if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
         completion.history.observe(served?.completionAttempts);
+        lastServedCompletionAttempts = served?.completionAttempts;
+        lastServedCompletedCount = served?.completedCount;
         const boundaryCap = isIssueRun ? scopeCapAtBoundary({ served, frozen: milestones }) : undefined;
         if (boundaryCap) {
           scopeCapped = { completedCount: boundaryCap.completedCount, total: boundaryCap.total };
@@ -3421,6 +3434,14 @@ export class CodexExecutor implements Executor {
         const ownerCompletionRecheck = systemFollowUp !== undefined && completionAnswered;
         completionFollowUp = undefined;
         completionAnswered = false;
+        // Issue #3139: a turn whose prompt carries system, owner or worker-steer text is new input, so
+        // it breaks the stall streak.
+        if (systemFollowUp !== undefined || ownerRides || historyRides || safetySteer) noProgress.reset();
+        // Issue #3139: the progress sets before this turn (latestProgress is overwritten per round).
+        const progressBefore = {
+          completed: [...(latestProgress?.completed ?? [])],
+          in_progress: [...(latestProgress?.in_progress ?? [])],
+        };
         // PRD #1497 M2: drive the implement turn through the wall-park wrapper — a wall trip (the own
         // timer's REASON_WALL, or a `wall` PauseNowSignal) parks the run (capture-first, reusing the
         // runner's captureHoldContext) instead of failing it.
@@ -3500,6 +3521,7 @@ export class CodexExecutor implements Executor {
             if (disposition.kind === "paused") { pausedAt = parkAt; return loopResult(); }
             if (disposition.kind === "cancel") throw new Error(REASON_CANCEL);
             nextPrompt = disposition.answers.join("\n") + "\n\n" + PARK_RUN_CONTINUATION;
+            noProgress.reset();
             continue;
           }
           if (!result.questions?.length) break;
@@ -3523,6 +3545,7 @@ export class CodexExecutor implements Executor {
           if (clarificationPaused) { pausedAt = parkAt; return loopResult(); }
           const continuationBody = parkRunEnabled(ctx, "implement") ? followUp : `${followUp}\n\nContinue the implementation.`;
           nextPrompt = withMilestoneNote(continuationBody, milestoneNote());
+          noProgress.reset();
           if (result.checkpoint) {
             clarificationPrompt = continuationBody;
             continue implementationLoop;
@@ -3547,8 +3570,34 @@ export class CodexExecutor implements Executor {
           latestProgress = progressAfterCheckpoint(latestProgress);
           // Issue #1764: recreate the epoch at the next loop top, after its pause/wall/hold checks.
           epochNeedsRecreate = true;
+          noProgress.reset();
           continue;
         }
+        // Issue #3139: the worker's completion-attempt sequence, shared by the interlocked done path
+        // and the no-progress stall path so both keep one order and one set of cancel checks.
+        const recordAttempt = async (
+          declared: string[],
+          nonClosing?: { reason: string },
+        ): Promise<{ unmet: string[]; head: string | null; worktreeFingerprint: string | null }> => {
+          // Preserve the live thread before reaping the provider and reading Git state.
+          await epoch!.persistSession();
+          // Issue #1764: set BEFORE the await, so a checkpoint that reaps and then throws still
+          // keeps the finally from persisting the deleted home.
+          reapedSinceLastPersist = true;
+          await this.closeAndSettlePlanSummary(boundaryDeadlineMs);
+          await ctx.checkpoint?.({ reap: true, progress: latestProgress, sink: "done_checkpoint" });
+          if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
+          const worktreeFingerprint = ctx.worktreeFingerprint ? await ctx.worktreeFingerprint() : null;
+          const head = worktreeFingerprint === null ? null : (worktreeFingerprint.split("\n", 1)[0] ?? null);
+          if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
+          const { unmet } = await ctx.recordCompletionAttempt!({
+            declared, head, worktreeFingerprint,
+            ...(nonClosing !== undefined ? { nonClosing } : {}),
+          });
+          completionAttempted = true;
+          if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
+          return { unmet, head, worktreeFingerprint };
+        };
         if (result.done) {
           if (isIssueRun && result.reportOnly) declaredReportOnly = true;
           // Issue #1932: consult the secret-remediation gate BEFORE the persist/done checkpoint
@@ -3592,23 +3641,8 @@ export class CodexExecutor implements Executor {
             }
             break;
           }
-          // Preserve the live thread before reaping the provider and reading Git state.
-          await epoch.persistSession();
-          // Issue #1764: set BEFORE the await, so a checkpoint that reaps and then throws still
-          // keeps the finally from persisting the deleted home.
-          reapedSinceLastPersist = true;
-          await this.closeAndSettlePlanSummary(boundaryDeadlineMs);
-          await ctx.checkpoint?.({ reap: true, progress: latestProgress, sink: "done_checkpoint" });
-          if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
-          const worktreeFingerprint = ctx.worktreeFingerprint ? await ctx.worktreeFingerprint() : null;
-          const head = worktreeFingerprint === null ? null : (worktreeFingerprint.split("\n", 1)[0] ?? null);
-          if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
-          const { unmet } = await ctx.recordCompletionAttempt!({
-            declared: result.milestonesCompleted ?? [], head, worktreeFingerprint,
-            ...(declaredNonClosing !== undefined ? { nonClosing: declaredNonClosing } : {}),
-          });
-          completionAttempted = true;
-          if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
+          const { unmet, head, worktreeFingerprint } = await recordAttempt(
+            result.milestonesCompleted ?? [], declaredNonClosing);
           if (unmet.length === 0) {
             const codeDecision = await ctx.codeCrossCheckGate?.({ interlocked: true, reportOnly: declaredReportOnly, repairAvailable: iteration < maxIterations });
             if (codeDecision?.action === "repair") {
@@ -3706,6 +3740,64 @@ export class CodexExecutor implements Executor {
           // Re-check the fresh ACK's cap before exhaustion or any new provider epoch.
           epochNeedsRecreate = true;
           continue;
+        }
+        // Issue #3139: a worker-initiated no-progress stall. An eligible run (interlocked issue run,
+        // no completion attempt yet, at least one reported completed milestone) whose lead ends
+        // STALL_LIMIT consecutive turns with no tool call, no subagent activity, no worktree change
+        // and no milestone progress, without signalling done, gets one worker-recorded empty attempt
+        // and an owner decision instead of draining the iteration budget. Evaluated before the
+        // iteration-budget check so a trip on the last iteration is not lost. Never reads the lead's
+        // text; never sets done or publishes.
+        const stallIsEligible = stallEligible({
+          interlocked: !!ctx.completionInterlock,
+          issueRun: isIssueRun,
+          interactive: !!ctx.interactive,
+          attemptSeamWired: !!interlockedIssue && !!ctx.worktreeFingerprint,
+          servedCompletionAttempts: lastServedCompletionAttempts,
+          completionAttempted,
+          seenCompletedCount: seenCompletedIds.size,
+          servedCompletedCount: lastServedCompletedCount,
+        });
+        if (!stallIsEligible) {
+          noProgress.reset();
+        } else {
+          const stallFingerprint = await ctx.worktreeFingerprint!();
+          const stallStreakNow = noProgress.observe({
+            leadToolCall: !!result.leadToolCall,
+            subagentActivity: !!result.subagentActivity,
+            fingerprint: stallFingerprint,
+            progressChanged: !progressSetsEqual(progressBefore, latestProgress),
+          });
+          if (stallStreakNow >= STALL_LIMIT) {
+            ctx.emit({
+              kind: "status",
+              agent: "worker",
+              payload: {
+                text: `no progress: the lead ended ${stallStreakNow} consecutive turns with no tool call, no worktree change and no milestone progress without signalling done — running a completion check for an owner decision`,
+              },
+            });
+            // completionStallStreak and lastCompletionFingerprint stay untouched: this attempt is not
+            // a lead completion attempt.
+            const { unmet } = await recordAttempt([]);
+            epochNeedsRecreate = true;
+            const decision = await ctx.askCompletionQuestion?.(unmet, { kind: "no_progress_stall" });
+            if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
+            if (decision?.outcome === "continue") {
+              completionFollowUp = buildCompletionReworkFollowUp(unmet, milestones,
+                { kind: "answered", guidance: decision.guidance },
+                ctx.completionInterlock === true && isIssueRun && !ctx.interactive);
+              completionAnswered = true;
+              if (iteration >= maxIterations) pendingIterationExhaustion = true;
+              noProgress.reset();
+              continue;
+            }
+            if (await routeHold(REASON_COMPLETION_STALL, completionAttempted)) {
+              if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+              completionHeld = { reason: REASON_COMPLETION_STALL };
+              break;
+            }
+            throw new Error(REASON_COMPLETION_STALL);
+          }
         }
         if (iteration >= maxIterations) {
           if (await routeHold(REASON_MAX_ITERATIONS, completionAttempted)) {

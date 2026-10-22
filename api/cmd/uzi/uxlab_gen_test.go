@@ -101,6 +101,12 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"board-accounts-one-each":           func(d bool) string { return boardAccountScene(d, now, 1, 140) },
 		"board-accounts-two-plus-one":       func(d bool) string { return boardAccountScene(d, now, 2, 140) },
 		"board-populated":                   func(d bool) string { return boardPopulated(d, now) },
+		"board-rejected":                    func(d bool) string { return rejectedScene(d, "board", 0, false) },
+		"board-rejected-selected":           func(d bool) string { return rejectedScene(d, "board", 0, true) },
+		"detail-rejected":                   func(d bool) string { return rejectedScene(d, "detail", 0, false) },
+		"detail-rejected-failure-control":   func(d bool) string { return rejectedScene(d, "detail", 1, false) },
+		"detail-rejected-stop-control":      func(d bool) string { return rejectedScene(d, "detail", 2, false) },
+		"worker-rejected-cached":            func(d bool) string { return rejectedScene(d, "worker", 0, false) },
 		"board-done-failures":               func(d bool) string { return boardDoneFailures(d, false) },
 		"board-done-failures-selected":      func(d bool) string { return boardDoneFailures(d, true) },
 		"board-done-age":                    func(d bool) string { return boardDoneAge(d, now) },
@@ -1650,6 +1656,33 @@ func detailPauseOrigin(dark bool, now time.Time, origin string, width int, plain
 		writer := colorprofile.NewWriter(&output, []string{"NO_COLOR=1"})
 		_, _ = writer.Write([]byte(m.View().Content))
 		return output.String()
+	}
+	return m.View().Content
+}
+
+// rejectedScene keeps base divergence beside agent failure and an explicit human stop.
+// Worker-reported phases stay running so the matching board cache supplies the stage.
+func rejectedScene(dark bool, view string, index int, selected bool) string {
+	rows := rejectedRows()
+	m := uxModel(&uzicli.FakeClient{}, "", dark)
+	switch view {
+	case "detail":
+		r := rows[index].RunDTO
+		m = uxModel(&uzicli.FakeClient{}, r.ID, dark)
+		m = applyDetail(m, r, nil)
+	case "worker":
+		m = workerRenderModel(dark)
+		m.height = 52
+		m.board.runs, m.board.runsAdmin = rows, m.board.admin
+		for _, r := range rows {
+			m.workers.rows[0].w.ReportedRuns = append(m.workers.rows[0].w.ReportedRuns, apitypes.WorkerReportedRunDTO{RunID: r.ID, Phase: "running"})
+		}
+	default:
+		rows = append([]apitypes.RunListItemDTO{{RunDTO: apitypes.RunDTO{ID: "active01", Status: "running", IssueTitle: "Active implementation"}}}, rows...)
+		m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: rows})
+		if selected {
+			m.board.cursor = 1
+		}
 	}
 	return m.View().Content
 }
