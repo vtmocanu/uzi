@@ -6,6 +6,15 @@ No final matrix/local success, rendering receipts, PNG acceptance or light/dark
 visual acceptance are recorded. The off-mode database guidance correction is
 not a formal criterion change, scope waiver or partial-delivery approval.
 
+**Boundary observations are fixture artefacts, not a property of `main`.**
+The off-mode database and lock opens recorded below happened in this
+harness's own fixture, which builds a fresh Nix store under the worker's
+umask 002. Shipped worker images and live hosted workers keep
+`/nix/var/nix/db` at 0755 with its files 0644 and runner-owned, so the
+command uid is refused there (Nix resets its umask to 022 during normal
+provisioning). A correct image is expected to make the boundary probe
+observe EACCES.
+
 ## Current recovered attempt
 
 Recovery initially restored a clean `b6bfe35d` snapshot; all previous scratch
@@ -24,7 +33,8 @@ Observed current-attempt receipts:
 - Base Ruby provisioning: 54,101 ms, no warnings.
 - Network-enabled command Go 1.27.3 prewarm: 118,956 ms, exit 0. This uses
   the uid-10003 command cache; it is not a local-runner cache or rendering proof.
-- Off-mode big-lock O_RDWR open succeeded, causing a boundary criterion failure.
+- In the fixture store (see the note above), the off-mode big-lock O_RDWR open
+  succeeded, causing a boundary criterion failure.
   The descriptor is closed without writing. This observation remains unaccepted;
   the big-lock check is strict in off mode.
 - Exact owned container and volume cleanup was verified; cell duration was
