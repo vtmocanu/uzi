@@ -53,7 +53,8 @@ test('freeze manifest parity rejects unsafe inputs and accepts JSONC strings', (
       import fs from 'node:fs';
       import { syncBuiltinESMExports } from 'node:module';
       import { pathToFileURL } from 'node:url';
-      const [checker, left, right] = process.argv.slice(1);
+      const [checker, left, right, mode] = process.argv.slice(1);
+      let grow = mode === 'grow';
       const open = fs.openSync, read = fs.readSync;
       const watched = new Set();
       let bytes = 0;
@@ -64,7 +65,13 @@ test('freeze manifest parity rejects unsafe inputs and accepts JSONC strings', (
       };
       fs.readSync = (fd, ...args) => {
         const count = read(fd, ...args);
-        if (watched.has(fd)) bytes += count;
+        if (watched.has(fd)) {
+          bytes += count;
+          if (grow && count > 0) {
+            grow = false;
+            fs.appendFileSync(left, ' ');
+          }
+        }
         return count;
       };
       syncBuiltinESMExports();
@@ -78,6 +85,17 @@ test('freeze manifest parity rejects unsafe inputs and accepts JSONC strings', (
     const bytesRead = /^MANIFEST_READ_BYTES=([0-9]+)$/m.exec(bounded.stdout);
     assert.ok(bytesRead, 'read-count observation completed');
     assert.ok(Number(bytesRead[1]) <= 1024 * 1024, 'actual manifest reads stay within 1 MiB');
+
+    // Grow only after the first read, so this covers the read loop rather than
+    // the early size rejection. A cap-plus-one buffer would read the new byte.
+    writeFileSync(a, valid + ' '.repeat(1024 * 1024 - Buffer.byteLength(valid)));
+    const growth = spawnSync(process.execPath, ['--input-type=module', '-e', observeReads, checker, a, b, 'grow'],
+      { encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024 });
+    assert.equal(growth.status, 1, 'growth past the cap must fail');
+    const growthReads = /^MANIFEST_READ_BYTES=([0-9]+)$/m.exec(growth.stdout);
+    assert.ok(growthReads, 'growth read-count observation completed');
+    assert.ok(Number(growthReads[1]) > 0, 'growth probe exercises the read loop');
+    assert.ok(Number(growthReads[1]) <= 1024 * 1024, 'growth never causes an overflow-byte read');
 
     rmSync(a);
     let result = spawnSync(process.execPath, [checker, a, b], { encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024 });
