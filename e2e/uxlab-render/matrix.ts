@@ -2,6 +2,7 @@
 // networking only after setup; it never supplies a replacement command PATH.
 import assert from "node:assert/strict";
 import { displayJSON } from "./display.js";
+import { createCriteria } from "./criteria.js";
 import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
@@ -43,11 +44,12 @@ async function main() {
         TMPDIR: runner.runnerTmpdir(process.env) },
       timeout, record, killRunnerGroupOnly: runner.killRunnerGroupOnly });
   };
-  assert.equal((await runAsRunner("/usr/bin/id", ["-u"])).stdout.trim(), "10002");
+  const runnerUid = (await runAsRunner("/usr/bin/id", ["-u"])).stdout.trim();
+  assert.equal(runnerUid, "10002");
   const helpers: Record<string, string> = {};
   for (const name of ["uzi-codex-supervisor", "uzi-codex-fileop", "uzi-codex-command-sandbox"])
     helpers[name] = sha(await readRegularFile(`/usr/local/bin/${name}`, HELPER_MAX_BYTES));
-  record("identity", { cell, mode, imageId: process.env.UXLAB_RENDER_IMAGE_ID,
+  record("identity", { cell, mode, runnerUid, imageId: process.env.UXLAB_RENDER_IMAGE_ID,
     sourceSha256: await sourceId("/app/src"), helpers, node: process.version,
     goPolicy: "GOTOOLCHAIN=local, >= go1.27.3; optional #3305 fixture symlink to readonly /usr/local/lib/uxlab-go distro" });
   if (mode === "required") {
@@ -116,6 +118,7 @@ async function main() {
     record("command-start", { label, mode: commandMode, cwd });
     const output = await commandSpawn(["/bin/bash", "-ceu", [
       'test "$(id -u)" = 10003',
+      'printf "COMMAND_UID=%s COMMAND_GID=%s COMMAND_GROUPS=%s\\n" "$(id -u)" "$(id -g)" "$(id -G)"',
       'test "$HOME" = "$TMPDIR"',
       'test "$(stat -c %u "$HOME")" = 10003',
       'test "$(stat -c %a "$HOME")" = 700',
@@ -132,25 +135,23 @@ async function main() {
     assert.equal(commandRoots.hasLiveCommandRoot(), false, "command root not drained");
     return output;
   }
-  const criterionFailures: string[] = [];
-  const requireCriterion = (label: string, passed: boolean) => {
-    if (!passed) {
-      criterionFailures.push(label);
-      record("criterion-failure", { label, cell, mode });
-    }
-  };
+  const criteria = createCriteria((label) => record("criterion-failure", { label, cell, mode }));
+  const { requireCriterion } = criteria;
   const goPolicy = 'export GOTOOLCHAIN=local GOFLAGS=-buildvcs=false\ncommand -v go\ngo version';
   try {
     const versionRoots = new registry.ExecutionRegistry(registry.newLocalExecutionEpoch(4));
     cache.watchRegistry(versionRoots);
     const versionSpawn = codex.makeDefaultSpawnCommand(versionRoots, launcher.launchCodexEffectRoot,
       5000, checkout, commandEnv, mode, log, cache, 15_000);
+    const versionLog = path.join(checkout, ".uxlab-tool-versions");
     try {
       await command("nix-devbox-versions",
-        'set +e\ncommand -v nix\nnix --version\nprintf "NIX_VERSION_STATUS=%s\\n" "$?"\ncommand -v devbox\ndevbox version',
+        "{ set +e\ncommand -v nix\nls -l \"$(command -v nix)\"\nreadlink -f \"$(command -v nix)\"\nnix --version\nprintf 'NIX_VERSION_STATUS=%s\\n' \"$?\"\ncommand -v devbox\ndevbox version\n} 2>&1 | head -c 1048576 > " + quote(versionLog),
         checkout, versionSpawn, versionRoots);
     } catch (error) { record("version-diagnostic-error", { ...runnerFailure(error) }); }
     assert.equal(versionRoots.hasLiveCommandRoot(), false);
+    const versionBytes = await readRegularFile(versionLog, 1048576).catch(() => Buffer.alloc(0));
+    record("tool-version-output", { bytes: versionBytes.length, prefix: versionBytes.toString("utf8").slice(0, 16384) });
     const setupStarted = performance.now();
     const setup = await command("network-enabled-go-prewarm", `${goPolicy}
 go mod download
@@ -279,8 +280,9 @@ go test ./cmd/uzi/ -run '^$' -count=1`, path.join(checkout, "api"));
     }
     for (const [relative, expected] of Object.entries(manifestIds))
       assert.equal(sha(await readRegularFile(path.join(checkout, relative), 1024 * 1024)), expected, `manifest mutated: ${relative}`);
-    record("result", { status: criterionFailures.length ? "FAIL" : "PASS", cell, mode, commands: homes.size, criterionFailures });
-    if (criterionFailures.length) process.exitCode = 1;
+    const { exitCode, ...criterionResult } = criteria.result();
+    record("result", { ...criterionResult, cell, mode, commands: homes.size });
+    if (exitCode) process.exitCode = exitCode;
   } finally {
     assert(cache.drained(), "cache roots did not drain");
     await cache.settle(log, (token: string, timeoutMs: number) => launcher.removeCommandCache(token, { timeoutMs }),
