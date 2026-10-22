@@ -4,8 +4,8 @@
 #   check-postgres-pin-parity.sh [<compose-file> <ci-workflow> <store-it-script>]
 #     defaults: docker-compose.yml .github/workflows/ci.yml e2e/run-store-it.sh
 #
-# 1. ci.yml's test-api-store-it postgres service pins the same tag AND digest as
-#    docker-compose.yml's db. Since #2621 that service pulls through mirror.gcr.io
+# 1. ci.yml's test-api-store-it UZI_CI_PG_IMAGE pins the same tag AND digest as
+#    docker-compose.yml's db. The CI step pulls through mirror.gcr.io
 #    (Docker Hub's anonymous rate limit), so Renovate sees two packages (`postgres`,
 #    `mirror.gcr.io/library/postgres`). renovate.json groups them into one branch
 #    (#2622); this fails the gate if they still drift (a hand edit, or a branch
@@ -26,16 +26,19 @@ compose=${1:-docker-compose.yml}
 ci=${2:-.github/workflows/ci.yml}
 storeit=${3:-e2e/run-store-it.sh}
 
-# Prints "<tag>@sha256:<hex>" for the one `image: <repo>:...` line in a file. Every
-# `image: <repo>:` line is a candidate: exactly one may exist, and it must be a full
-# tag + 64-hex digest pin.
+# Prints "<tag>@sha256:<hex>" from the compose image or dedicated CI env key.
+# Exactly one candidate may exist and it must be a full tag + 64-hex digest pin.
+# A malformed or duplicated CI key must fail even when its repository is wrong.
 pin() {
-  local file=$1 repo=$2 out
-  out=$(awk -v repo="$repo" '
+  local file=$1 repo=$2 key=${3:-image} out
+  out=$(awk -v repo="$repo" -v key="$key" '
     { line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
-    index(line, "image:") == 1 {
-      ref = substr(line, 7); sub(/^[ \t]+/, "", ref)
-      if (index(ref, repo ":") == 1) { n++; v = substr(ref, length(repo) + 2) }
+    index(line, key ":") == 1 {
+      ref = substr(line, length(key) + 2); sub(/^[ \t]+/, "", ref)
+      if (key != "image" || index(ref, repo ":") == 1) {
+        n++; if (index(ref, repo ":") != 1) exit 1
+        v = substr(ref, length(repo) + 2)
+      }
     }
     END {
       if (n != 1) exit 1
@@ -43,14 +46,14 @@ pin() {
       if (length(v) - index(v, "@sha256:") - 7 != 64) exit 1
       print v
     }' "$file") || {
-    echo "check-postgres-pin-parity: expected exactly one '$repo:<tag>@sha256:<64 hex>' image line in $file" >&2
+    echo "check-postgres-pin-parity: expected exactly one '$repo:<tag>@sha256:<64 hex>' $key line in $file" >&2
     return 1
   }
   printf '%s\n' "$out"
 }
 
 compose_pin=$(pin "$compose" 'postgres') || exit 2
-ci_pin=$(pin "$ci" 'mirror.gcr.io/library/postgres') || exit 2
+ci_pin=$(pin "$ci" 'mirror.gcr.io/library/postgres' UZI_CI_PG_IMAGE) || exit 2
 
 if [ "$compose_pin" != "$ci_pin" ]; then
   echo "check-postgres-pin-parity: postgres pins differ:" >&2

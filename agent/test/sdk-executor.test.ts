@@ -7586,6 +7586,32 @@ describe("M2 replacement reviewed plan fresh context", () => {
   });
 });
 
+it("M2 Claude executor forwards semantic proposals through initial and revised gates, clearing omission", async () => {
+  const { enrollment, proposal } = await import("./semantic-coverage-fixture.js");
+  for (const semanticPlanning of [enrollment, undefined]) {
+    const submissions = [proposal(), { criteria: [] }, undefined];
+    const scripts: Script[] = submissions.map((semantic_proposal, n) => [{
+      type: "assistant", session_id: "m2-plan", message: { content: [{
+        type: "tool_use", id: "p-" + n, name: "mcp__uzi__submit_plan",
+        input: { plan_md: "candidate " + n, ...(semantic_proposal === undefined ? {} : { semantic_proposal }) },
+      }] },
+    } as unknown as SDKMessage, resultSuccess("m2-plan")]);
+    scripts.push([signalDone(), resultSuccess()]);
+    const { queryFn } = fakeTurns(scripts);
+    const captured: unknown[] = [];
+    const probe = makeCtx({ semanticPlanning,
+      gatePlan: async (_plan, _milestones, _hook, settles, semantic) => {
+        assert.equal(settles, undefined);
+        captured.push(semantic);
+        return captured.length < 3 ? { kind: "revise", automatic: true, round: captured.length, feedback: "revise" }
+          : { kind: "approve", selection: { status: "absent" } };
+      },
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.deepEqual(captured, semanticPlanning ? [proposal(), { invalid: true }, undefined] : [undefined, undefined, undefined]);
+  }
+});
+
 describe("M3 SDK interrupted recovery delivery", () => {
   const snapshot = { base: "interrupted", interruptedEdits: false, commits: 0 } as const;
   it("M3 absent observations still consume the first-owner delivery latch", async () => {

@@ -190,7 +190,11 @@ export class RunTurnReducerImpl implements RunTurnReducer {
         label: "draft, unapproved, possibly incomplete", plan_md, truncated: false,
       } });
     }
-    if (s.plan !== undefined) this.result.plan = s.plan;
+    if (s.plan !== undefined) {
+      this.result.plan = s.plan;
+      if (s.semanticSubmission !== undefined) this.result.semanticSubmission = s.semanticSubmission;
+      else delete this.result.semanticSubmission;
+    }
     // Last-wins across the two exclusive shapes of a submit_plan milestone list (issue #1626):
     // the latest submit_plan's valid list, or its rejected (malformed or partly-malformed) one,
     // replaces the other.

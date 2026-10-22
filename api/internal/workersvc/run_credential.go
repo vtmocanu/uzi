@@ -118,6 +118,10 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 		return SetRunCredentialResult{}, err
 	}
 
+	// issue #3194: a base-attestation hold never runs again, so no token switch can resume it.
+	if IsBaseAttestationHeld(run) {
+		return SetRunCredentialResult{}, ErrBaseAttestationHeld
+	}
 	switch run.Status {
 	case "paused":
 		if s.txBeginner != nil && (PolicyOwnerConstrained(run) || run.HoldReason.String != "credential_disabled") {
@@ -149,6 +153,19 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 				}
 			}
 			break
+		}
+		// Issue #3181: a credential_switch_settling hold whose worker is still finishing its own
+		// operations for the run refuses the switch up front, before the override is written. This pre-check is
+		// not atomic with the resume below: in a narrow race (the holder's heartbeat turns fresh
+		// between the pre-check and the resume) the owner's override is saved and the resume is
+		// then refused with ErrRunHoldSettling. The same applies to the rarer resume -> reclaim ->
+		// new hold path: a resume that wins the race is reclaimed and may be held again before this
+		// pre-check's answer is used. The override is the owner's own choice and is spent at the
+		// next reclaim. A hold that settles or whose fence lifts resumes below.
+		if settling, serr := s.runHoldSettling(ctx, runID); serr != nil {
+			return SetRunCredentialResult{}, fmt.Errorf("set run credential: read hold fence: %w", serr)
+		} else if settling {
+			return SetRunCredentialResult{}, ErrRunHoldSettling
 		}
 		// Any other paused run (an owner pause, a completion or wall hold, or the provider
 		// hold): write the override FIRST (idempotent, harmless if the resume then finds 0
@@ -443,8 +460,17 @@ func (s *Service) resumePausedForCredential(ctx context.Context, userID, runID u
 		UserID:                     userID,
 		AllowCompletionBlockedHold: true,
 		GlobalTimeoutSeconds:       int32(s.p.RunTimeout.Seconds()),
+		StaleCutoff:                s.staleWorkerCutoff(),
 	}); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
+			// A hold that turned settling between the fence read and this resume is the settling
+			// refusal, not a raced state change.
+			settling, serr := s.runHoldSettling(ctx, runID)
+			if serr != nil {
+				slog.Warn("set run credential: re-read hold fence after refused resume", "run", runID, "error", serr)
+			} else if settling {
+				return ErrRunHoldSettling
+			}
 			return ErrCredentialSwitchRaced
 		}
 		return fmt.Errorf("resume paused run: %w", err)

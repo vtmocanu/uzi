@@ -12,6 +12,229 @@
     "can_resume": true,
     "can_cancel": true
   },
+  "completion_pending": {
+    "version": 1,
+    "contract_revision": 1,
+    "criteria": [
+      {
+        "criterion_id": "x",
+        "milestone_id": "x",
+        "kind": "x",
+        "text": "x",
+        "reason": "x",
+        "conditions": [
+          "x"
+        ],
+        "verification_steps": [
+          "x"
+        ],
+        "authorization_revision": 1,
+        "status": "x"
+      }
+    ]
+  },
+  "semantic_gate": {
+    "presentation": {
+      "candidate": {
+        "candidate_identity_version": "x",
+        "revision": 1,
+        "digest": "x",
+        "sources": [
+          {
+            "id": "x",
+            "kind": "x",
+            "hash": "x",
+            "provenance": "x",
+            "completeness": "x"
+          }
+        ],
+        "plan_fields_digest": "x",
+        "plan_hash": "x",
+        "source_outcome": "x",
+        "criteria": [
+          {
+            "id": "x",
+            "milestone_id": "x",
+            "kind": "x",
+            "text": "x",
+            "done_when": "x",
+            "citations": [
+              {
+                "source_id": "x",
+                "hash": "x",
+                "start": 1,
+                "end": 1
+              }
+            ],
+            "evidence_requirements": [
+              {
+                "description": "x",
+                "path": "x"
+              }
+            ],
+            "maintainer": {
+              "reason": "x",
+              "conditions": [
+                "x"
+              ],
+              "verification_steps": [
+                "x"
+              ]
+            }
+          }
+        ],
+        "coverage": {
+          "outcome": "x",
+          "candidate_digest": "x",
+          "reviews": 1,
+          "invocations": 1,
+          "tokens": 1,
+          "seconds": 1
+        }
+      },
+      "binding": {
+        "candidate_digest": "x",
+        "source_digest": "x",
+        "criteria_digest": "x"
+      },
+      "claim_generation": 1,
+      "coverage": {
+        "outcome": "x",
+        "candidate_digest": "x",
+        "source_digest": "x",
+        "criteria_digest": "x",
+        "reviews": 1,
+        "invocations": 1,
+        "charged_tokens": 1,
+        "remaining_tokens": 1,
+        "deadline": "2020-01-02T03:04:05Z",
+        "report": {
+          "candidate_digest": "x",
+          "source_digest": "x",
+          "criteria_digest": "x",
+          "requirements": [
+            {
+              "requirement_id": "x",
+              "status": "x",
+              "explanation": "x",
+              "citations": [
+                {
+                  "source_id": "x",
+                  "hash": "x",
+                  "start": 1,
+                  "end": 1
+                }
+              ],
+              "criterion_ids": [
+                "x"
+              ]
+            }
+          ],
+          "criteria": [
+            {
+              "criterion_id": "x",
+              "atomic": true,
+              "explanation": "x"
+            }
+          ]
+        }
+      },
+      "review_id": "x",
+      "invocation_id": "x",
+      "report_digest": "x",
+      "consumed_seconds": 1,
+      "remaining_seconds": 1,
+      "remaining_reviews": 1,
+      "maintainers": [
+        {
+          "id": "x",
+          "reason": "x",
+          "conditions": [
+            "x"
+          ],
+          "verification_steps": [
+            "x"
+          ]
+        }
+      ],
+      "semantic_park": "x"
+    },
+    "approval": {
+      "presentation_revision": 1,
+      "presentation_digest": "x",
+      "candidate_identity_version": "x",
+      "candidate_revision": 1,
+      "candidate_digest": "x",
+      "source_digest": "x",
+      "criteria_digest": "x",
+      "claim_generation": 1,
+      "review_id": "x",
+      "invocation_id": "x",
+      "report_digest": "x",
+      "maintainers": [
+        {
+          "id": "x",
+          "reason": "x",
+          "conditions": [
+            "x"
+          ],
+          "verification_steps": [
+            "x"
+          ]
+        }
+      ]
+    },
+    "sources": [
+      {
+        "id": "x",
+        "kind": "x",
+        "provenance": "x",
+        "completeness": "x",
+        "bytes": "AQ=="
+      }
+    ],
+    "plan": "AQ=="
+  },
+  "semantic_drift": {
+    "observations": [
+      {
+        "phase": "x",
+        "candidate_digest": "x",
+        "gate_revision": 1,
+        "pushed_sha": "x",
+        "observed_at": "2020-01-02T03:04:05Z",
+        "issue": {
+          "source_id": "x",
+          "frozen_hash": "x",
+          "observed_hash": "x",
+          "ref": "x",
+          "outcome": "x",
+          "reason": "x",
+          "checkbox_only": true
+        },
+        "prds": [
+          {
+            "source_id": "x",
+            "frozen_hash": "x",
+            "observed_hash": "x",
+            "ref": "x",
+            "outcome": "x",
+            "reason": "x",
+            "checkbox_only": true
+          }
+        ],
+        "links_added": [
+          "x"
+        ],
+        "links_removed": [
+          "x"
+        ],
+        "links_truncated": true
+      }
+    ],
+    "dropped": 1,
+    "contradiction": true
+  },
   "reset_state_digest": "x",
   "milestone_reconciliations": [
     {}
@@ -372,6 +595,7 @@
   "claimed_at": "2020-01-02T03:04:05Z",
   "started_at": "2020-01-02T03:04:05Z",
   "first_started_at": "2020-01-02T03:04:05Z",
+  "claim_generation": 1,
   "finished_at": "2020-01-02T03:04:05Z",
   "created_at": "2020-01-02T03:04:05Z",
   "updated_at": "2020-01-02T03:04:05Z",

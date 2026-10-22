@@ -207,6 +207,7 @@ func credentialSwitchState(r store.Run) *string {
 // extensionCapSeconds so this mapper stays pure — no config reaches into it. It surfaces on
 // the DTO as ForgeParkMax so the forge-park pill can render "N of MAX".
 func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, extensionCapSeconds int, forgeParkMax int, now time.Time, automaticRequeueLimit int) apitypes.RunDTO {
+	claimGeneration := r.ClaimGeneration
 	dto := apitypes.RunDTO{
 		ID:               r.ID.String(),
 		PolicyRefusal:    policyRefusalDTO(r),
@@ -287,6 +288,7 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		ClaimedAt:         timePtr(r.ClaimedAt.Valid, r.ClaimedAt.Time),
 		StartedAt:         timePtr(r.StartedAt.Valid, r.StartedAt.Time),
 		FirstStartedAt:    timePtr(r.FirstStartedAt.Valid, r.FirstStartedAt.Time),
+		ClaimGeneration:   &claimGeneration,
 		FinishedAt:        timePtr(r.FinishedAt.Valid, r.FinishedAt.Time),
 		CreatedAt:         r.CreatedAt.Time,
 		UpdatedAt:         r.UpdatedAt.Time,

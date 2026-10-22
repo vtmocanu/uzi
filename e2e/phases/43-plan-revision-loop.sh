@@ -34,7 +34,11 @@ RUN_RV="$(create_run "$REPO_ID" "$IID_RV")" || fail "revise-path run-create fail
 
 # v1 gate: the run parks at awaiting_approval carrying a plan.
 wait_status "$RUN_RV" awaiting_approval
-PLAN_V1="$(apiget "/api/runs/$RUN_RV" | jq -r '.run.plan_md // empty')"
+RV_GATE_V1_JSON="$(apiget "/api/runs/$RUN_RV")"
+PLAN_V1="$(printf '%s\n' "$RV_GATE_V1_JSON" | jq -r '.run.plan_md // empty')"
+printf '%s\n' "$RV_GATE_V1_JSON" | jq -e --arg run "$RUN_RV" \
+  '.run | .id == $run and .status == "awaiting_approval" and (has("semantic_gate") | not) and (has("completion_pending") | not)' >/dev/null \
+  || fail "production revision gate was inconsistent or exposed dormant semantic data"
 [ -n "$PLAN_V1" ] || fail "revise-path run reached the v1 gate with no plan_md"
 pass "run $RUN_RV reached the v1 plan gate (awaiting_approval) with a plan"
 
@@ -56,9 +60,10 @@ pass "revise consumed (poller-side): worker emitted plan_feedback + plan_revisin
 # awaiting_approval with the revised plan, so waiting for the marker IS waiting
 # for the v2 re-park — robust against reading the still-v1 plan_md in the window
 # between plan_revising and the re-report.
-rv_deadline=$((SECONDS + 60)); PLAN_V2=""
+rv_deadline=$((SECONDS + 60)); PLAN_V2=""; RV_GATE_V2_JSON=""
 while [ $SECONDS -lt $rv_deadline ]; do
-  PLAN_V2="$(apiget "/api/runs/$RUN_RV" | jq -r '.run.plan_md // empty')"
+  RV_GATE_V2_JSON="$(apiget "/api/runs/$RUN_RV")"
+  PLAN_V2="$(printf '%s\n' "$RV_GATE_V2_JSON" | jq -r '.run.plan_md // empty')"
   printf '%s' "$PLAN_V2" | grep -q '(revision 1: applied feedback)' && break
   sleep 0.3
 done
@@ -66,6 +71,9 @@ wait_status "$RUN_RV" awaiting_approval
 printf '%s' "$PLAN_V2" | grep -q '(revision 1: applied feedback)' \
   || fail "v2 plan_md never picked up the stub revision marker (got: ${PLAN_V2:-none})"
 [ "$PLAN_V2" != "$PLAN_V1" ] || fail "v2 plan_md is identical to v1 (the revision did not take)"
+printf '%s\n' "$RV_GATE_V2_JSON" | jq -e --arg run "$RUN_RV" \
+  '.run | .id == $run and .status == "awaiting_approval" and (has("semantic_gate") | not) and (has("completion_pending") | not)' >/dev/null \
+  || fail "production revised gate was inconsistent or exposed dormant semantic data"
 [ "$(apiget "/api/runs/$RUN_RV/messages" | jq '[.messages[] | select(.kind=="plan")] | length')" -ge 2 ] \
   || fail "expected >=2 'plan' messages after the revision round (v1 + v2)"
 pass "run re-parked at the gate with a revised plan (v2 != v1, revision marker present, >=2 plan messages)"

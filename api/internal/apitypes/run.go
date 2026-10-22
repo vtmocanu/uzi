@@ -205,12 +205,15 @@ type MemoryHoldDTO struct {
 
 // RunDTO is the web view of a run; worker-internal session_id and last_seq are omitted.
 type RunDTO struct {
-	PolicyRefusal                                  *PolicyRefusalDTO  `json:"policy_refusal,omitempty"`
-	ResetStateDigest                               string             `json:"reset_state_digest,omitempty"`
-	MilestoneReconciliations                       []json.RawMessage  `json:"milestone_reconciliations,omitempty"`
-	MilestoneReconciliationsNextBeforeGateRevision *int64             `json:"milestone_reconciliations_next_before_gate_revision,omitempty"`
-	WorkerRecovery                                 *WorkerRecoveryDTO `json:"worker_recovery,omitempty"`
-	MemoryHold                                     *MemoryHoldDTO     `json:"memory_hold,omitempty"`
+	PolicyRefusal                                  *PolicyRefusalDTO     `json:"policy_refusal,omitempty"`
+	CompletionPending                              *CompletionPendingDTO `json:"completion_pending,omitempty"`
+	SemanticGate                                   *SemanticGateDTO      `json:"semantic_gate,omitempty"`
+	SemanticDrift                                  *SemanticDriftDTO     `json:"semantic_drift,omitempty"`
+	ResetStateDigest                               string                `json:"reset_state_digest,omitempty"`
+	MilestoneReconciliations                       []json.RawMessage     `json:"milestone_reconciliations,omitempty"`
+	MilestoneReconciliationsNextBeforeGateRevision *int64                `json:"milestone_reconciliations_next_before_gate_revision,omitempty"`
+	WorkerRecovery                                 *WorkerRecoveryDTO    `json:"worker_recovery,omitempty"`
+	MemoryHold                                     *MemoryHoldDTO        `json:"memory_hold,omitempty"`
 
 	ID string `json:"id"`
 	// RepoID is null for a chat run (PRD #39): a chat has no repo. Non-null for
@@ -420,8 +423,11 @@ type RunDTO struct {
 	CompletionUnmet []string `json:"completion_unmet"`
 	// HoldReason is why a paused run is HELD (mapped from run.HoldReason): 'completion_blocked'
 	// for a completion hold (PRD #1226), 'budget_exhausted' for a wall-clock park (PRD #1497),
-	// 'credential_disabled' while a credential the run needs is disabled (PRD #1732 D14), and
-	// null otherwise (not held, or an owner pause). Read-only surfacing of the column.
+	// 'credential_disabled' while a credential the run needs is disabled (PRD #1732 D14),
+	// 'credential_switch_settling' while the worker is still finishing its own operations on a run whose
+	// token switch could not be proven settled (Resume is refused until it finishes; Cancel works),
+	// 'credential_switch_unsettled' once it finished them, processes not proven stopped (Resume is open) (issue
+	// #3181), and null otherwise (not held, or an owner pause). Read-only surfacing of the column.
 	HoldReason *string `json:"hold_reason"`
 	// HoldContext is the D8 provider-context string a completion hold states: the constant
 	// "unavailable(same_worker_only)" when the run is in a completion hold (HoldReason ==
@@ -657,9 +663,17 @@ type RunDTO struct {
 	// a fresh wall) no writer ever resets it, so it is the display anchor for the
 	// whole-run duration. Null until the run first starts.
 	FirstStartedAt *time.Time `json:"first_started_at"`
-	FinishedAt     *time.Time `json:"finished_at"`
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
+	// ClaimGeneration is the run's CURRENT claim generation (runs.claim_generation, migration
+	// 00223): the counter a worker claim bumps, so it names the attempt whose output is "current".
+	// Read-only. A cross-check run's activity markers and summaries carry the generation of the
+	// claim that produced them, so a client compares them against this value to tell the current
+	// attempt's capture from an earlier one. The server always sends it (0 before the first
+	// claim); the pointer exists so a client can tell a server that predates the field (null or
+	// absent) from a real 0, and report the capture provenance as unknown rather than guessing.
+	ClaimGeneration *int64     `json:"claim_generation"`
+	FinishedAt      *time.Time `json:"finished_at"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 	// StatusSince is when the run entered its CURRENT status (runs.status_since, stamped
 	// only by the statements that assign runs.status). The column is backfilled and NOT
 	// NULL (migration 00163_run_status_since.sql), so a current server always sends a
@@ -1258,8 +1272,11 @@ type RunSummaryItemDTO struct {
 	CompletionUnmet []string `json:"completion_unmet"`
 	// HoldReason is why a paused run is HELD (mapped from run.HoldReason): 'completion_blocked'
 	// for a completion hold (PRD #1226), 'budget_exhausted' for a wall-clock park (PRD #1497),
-	// 'credential_disabled' while a credential the run needs is disabled (PRD #1732 D14), and
-	// null otherwise (not held, or an owner pause). Read-only surfacing of the column.
+	// 'credential_disabled' while a credential the run needs is disabled (PRD #1732 D14),
+	// 'credential_switch_settling' while the worker is still finishing its own operations on a run whose
+	// token switch could not be proven settled (Resume is refused until it finishes; Cancel works),
+	// 'credential_switch_unsettled' once it finished them, processes not proven stopped (Resume is open) (issue
+	// #3181), and null otherwise (not held, or an owner pause). Read-only surfacing of the column.
 	HoldReason *string `json:"hold_reason"`
 	// HoldContext is the D8 provider-context string a completion hold states: the constant
 	// "unavailable(same_worker_only)" when the run is in a completion hold (HoldReason ==
@@ -1484,9 +1501,11 @@ type RunSummaryItemDTO struct {
 	// a fresh wall) no writer ever resets it, so it is the display anchor for the
 	// whole-run duration. Null until the run first starts.
 	FirstStartedAt *time.Time `json:"first_started_at"`
-	FinishedAt     *time.Time `json:"finished_at"`
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
+	// ClaimGeneration mirrors RunDTO.ClaimGeneration (the run's current runs.claim_generation).
+	ClaimGeneration *int64     `json:"claim_generation"`
+	FinishedAt      *time.Time `json:"finished_at"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 	// StatusSince is when the run entered its CURRENT status (runs.status_since, stamped
 	// only by the statements that assign runs.status). The column is backfilled and NOT
 	// NULL (migration 00163_run_status_since.sql), so a current server always sends a
@@ -1932,6 +1951,7 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		ClaimedAt:                   item.ClaimedAt,
 		StartedAt:                   item.StartedAt,
 		FirstStartedAt:              item.FirstStartedAt,
+		ClaimGeneration:             item.ClaimGeneration,
 		FinishedAt:                  item.FinishedAt,
 		CreatedAt:                   item.CreatedAt,
 		UpdatedAt:                   item.UpdatedAt,
@@ -2097,6 +2117,7 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			ClaimedAt:                   s.ClaimedAt,
 			StartedAt:                   s.StartedAt,
 			FirstStartedAt:              s.FirstStartedAt,
+			ClaimGeneration:             s.ClaimGeneration,
 			FinishedAt:                  s.FinishedAt,
 			CreatedAt:                   s.CreatedAt,
 			UpdatedAt:                   s.UpdatedAt,
@@ -2248,6 +2269,7 @@ type RunInputRequest struct {
 	// untyped "run has already finished" 409. A revise_plan at the revision cap whose revision
 	// still matches keeps the cap's own answer. Omitted when absent, so a newer client stays
 	// compatible with an older strict-decoding api.
+	SemanticApproval         *SemanticGateApproval    `json:"semantic_approval,omitempty"`
 	ExpectedGateRevision     *int64                   `json:"expected_gate_revision,omitempty"`
 	Reconciliation           *MilestoneReconciliation `json:"reconciliation,omitempty"`
 	ExpectedResetStateDigest string                   `json:"expected_reset_state_digest,omitempty"`

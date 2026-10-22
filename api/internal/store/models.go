@@ -127,6 +127,7 @@ type CheckpointPublishAttempt struct {
 	Checks           int32              `json:"checks"`
 	LastError        pgtype.Text        `json:"last_error"`
 	ReconcileReadyAt pgtype.Timestamptz `json:"reconcile_ready_at"`
+	AttestedSource   pgtype.Text        `json:"attested_source"`
 }
 
 type CheckpointRetention struct {
@@ -1085,6 +1086,7 @@ type Run struct {
 	MemoryPolicy                []byte             `json:"memory_policy"`
 	CompletionNonClosingReason  pgtype.Text        `json:"completion_non_closing_reason"`
 	CiArtifactManifest          []byte             `json:"ci_artifact_manifest"`
+<<<<<<< HEAD
 	PolicyRefusalCount          int32              `json:"policy_refusal_count"`
 	PolicyLastTag               pgtype.Text        `json:"policy_last_tag"`
 	PolicyLastPhase             pgtype.Text        `json:"policy_last_phase"`
@@ -1099,6 +1101,9 @@ type Run struct {
 	PolicyStopResolution        []byte             `json:"policy_stop_resolution"`
 	PolicyRevisionSource        []byte             `json:"policy_revision_source"`
 	PolicyCandidateCrossCheckID pgtype.UUID        `json:"policy_candidate_cross_check_id"`
+=======
+	CheckpointAttestedSource    pgtype.Text        `json:"checkpoint_attested_source"`
+>>>>>>> b66141d61d9550c4ca51a3c4c3c148ebf8c40d98
 }
 
 type RunCompletionAttempt struct {
@@ -1411,6 +1416,38 @@ type RunUserInput struct {
 	InclusionReported       bool               `json:"inclusion_reported"`
 	SettledAt               pgtype.Timestamptz `json:"settled_at"`
 	SupersededByStopInputID pgtype.Int8        `json:"superseded_by_stop_input_id"`
+}
+
+type SemanticCandidateHistory struct {
+	RunID     uuid.UUID `json:"run_id"`
+	Revision  int64     `json:"revision"`
+	Candidate []byte    `json:"candidate"`
+}
+
+type SemanticPlanning struct {
+	RunID        uuid.UUID   `json:"run_id"`
+	Enrollment   []byte      `json:"enrollment"`
+	Revision     int64       `json:"revision"`
+	Fingerprint  pgtype.Text `json:"fingerprint"`
+	Candidate    []byte      `json:"candidate"`
+	ReviewState  []byte      `json:"review_state"`
+	Observations []byte      `json:"observations"`
+}
+
+type SemanticSnapshot struct {
+	RunID uuid.UUID `json:"run_id"`
+	Hash  string    `json:"hash"`
+	Raw   []byte    `json:"raw"`
+}
+
+type SemanticSourceSnapshot struct {
+	RunID        uuid.UUID `json:"run_id"`
+	IdentityHash string    `json:"identity_hash"`
+	SourceID     string    `json:"source_id"`
+	Kind         string    `json:"kind"`
+	Hash         string    `json:"hash"`
+	Provenance   string    `json:"provenance"`
+	Completeness string    `json:"completeness"`
 }
 
 type Skill struct {

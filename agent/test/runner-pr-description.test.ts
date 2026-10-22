@@ -175,6 +175,39 @@ describe("M4 owner-deferred work", () => {
     assert.doesNotMatch(pr.description, /acceptance.*pending|pending.*acceptance/i);
   });
 
+  it("M4 maintainer-pending: checked boxes are reset on refresh and the verified head never adds Closes", async () => {
+    const iid = 3094;
+    const A = "00000000-0000-4000-8000-0000000000a1";
+    const pending = { version: 1, contract_revision: 1, criteria: [{
+      criterion_id: A, milestone_id: "m2", kind: "maintainer", text: "Observe the hosted rollout",
+      reason: "Only the owner can reach the cluster", conditions: ["Rolled out"], verification_steps: ["Open the dashboard"],
+      authorization_revision: 1, status: "unverified" }] } as unknown as import("../src/completion-pending.js").CompletionPending;
+    api.setRegisterProtocolFeatures(["claim_generation_fence", "completion_non_closing_v1", "completion_semantic_publication_v1"]);
+    await client.register("m4-render");
+    const checked = renderCompletionBlock({ issueIid: iid, branch: "old", closes: false, completionPending: pending })
+      .replaceAll("> - [ ]", "> - [x]");
+    assert.match(checked, /> - \[x\]/);
+    const existing = `Lead guidance.\n\n${SIZE_REGION}\n\n${checked}\n\nHuman review notes.`;
+    const { gitlab, pr } = fakeGitlab({ head: H, existing });
+    const claim = interlockedClaim(iid);
+    api.setCompletionPermitResponse(true);
+    api.stateAckWire = (body, run) => body.status === "running" && Object.keys(body).every(k => ["status", "claim_generation", "messages_through_seq"].includes(k))
+      ? { status: 200, body: { run: { ...run, completion_pending: pending } } } : undefined;
+    api.completionPermitWire = json => ({ granted: true, permit: {
+      id: "p", contract_revision: json.contract_revision, branch: json.branch, head: json.head,
+      issued_at: "2026-10-20T00:00:00Z", finding_ids: [], completion_scope: {}, completion_pending: pending } });
+    await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
+    assert.ok(statuses(claim.run_id).includes("completed"));
+    const parsed = parseOwnedBlocks(pr.description);
+    assert.ok(parsed.kind === "ok" && parsed.completion);
+    assert.equal((parsed.completion.match(/^> - \[ \] `0000/gm) ?? []).length, 1);
+    assert.ok(!parsed.completion.includes("> - [x]"), "a checked box is never authority");
+    assert.doesNotMatch(pr.description, new RegExp(`Closes #${iid}`));
+    assert.equal(closingDirectiveFor(pr.description, iid, "org/repo"), false);
+    assert.ok(pr.description.startsWith("Lead guidance.\n\n"));
+    assert.ok(pr.description.endsWith("\n\nHuman review notes."));
+  });
+
   it("prompt partial completes without an owner source-issue handoff", async () => {
     const scope = { deferred: [{ milestone_id: "m2", title: "Implement export", reason: "coding remains" }] };
     const claim = { ...interlockedClaim(3093, scope), kind: "prompt" as const, issue_iid: null };

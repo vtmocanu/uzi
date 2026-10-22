@@ -152,6 +152,12 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	case "paused":
+		// issue #3194: a base-attestation hold is owner-resolved by recovery, export or a
+		// successor, never by running this run again (ResumePausedRun refuses it too).
+		if workersvc.IsBaseAttestationHeld(run) {
+			httpx.Error(w, http.StatusConflict, workersvc.ErrBaseAttestationHeld.Error())
+			return
+		}
 		// PRD #1497 M1 (D6): a completion hold resumes ONLY through its own decision endpoint, never
 		// this generic resume — 409 naming it (today this would silently resume the hold).
 		if run.HoldReason.Valid && run.HoldReason.String == "completion_blocked" {
@@ -169,8 +175,22 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 			UserID:                     user.ID,
 			AllowCompletionBlockedHold: false,
 			GlobalTimeoutSeconds:       int32(h.cfg.RunTimeout.Seconds()),
+			StaleCutoff:                workersvc.HeartbeatStaleCutoff(h.clock(), h.cfg.WorkerHeartbeatStale),
 		}); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
+				// Issue #3181: a credential_switch_settling hold whose worker is still finishing its own
+				// operations for the run is its own refusal, not "no longer paused". Re-read the fence
+				// (the same predicate ResumePausedRun refuses on) rather than trusting the earlier
+				// read of the hold reason.
+				settling, serr := h.q.CredentialSwitchHoldSettling(r.Context(), store.CredentialSwitchHoldSettlingParams{
+					RunID: runID, StaleCutoff: workersvc.HeartbeatStaleCutoff(h.clock(), h.cfg.WorkerHeartbeatStale),
+				})
+				if serr != nil {
+					slog.Warn("resume run: re-read hold fence after refused resume", "run", runID, "error", serr)
+				} else if settling {
+					httpx.Error(w, http.StatusConflict, workersvc.ErrRunHoldSettling.Error())
+					return
+				}
 				if run.HoldReason.Valid && run.HoldReason.String == "budget_exhausted" {
 					httpx.Error(w, http.StatusConflict, fmt.Sprintf("this run is out of time; extend it to resume: uzi run extend %s --by 2h", runID))
 					return

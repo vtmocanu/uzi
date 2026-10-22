@@ -198,7 +198,10 @@ func (s *Service) mutateDindMaintenance(ctx context.Context, id uuid.UUID, op Di
 					return nil, ErrDindMaintenanceConflict
 				}
 			case "complete":
-				// RegisterWorker stamps last_heartbeat_at at dind_register_floor.
+				// RegisterWorker stamps last_heartbeat_at at now() and dind_register_floor at
+				// now(), or just past a credential_switch_settling hold's status_since when that is
+				// later, so the floor is strictly after the registration heartbeat only in that rare
+				// case (equal otherwise).
 				// Require a later, fresh heartbeat from the replacement registration
 				// before releasing the fence; keep the operation bound to the old nonce.
 				now := s.now()

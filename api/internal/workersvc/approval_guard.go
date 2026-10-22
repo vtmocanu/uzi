@@ -81,6 +81,28 @@ func (s *Service) admitApproval(ctx context.Context, owner, runID uuid.UUID, bod
 		return SubmitInputResult{}, err
 	}
 	locked := s.boundClaimControlService(q)
+	if txq, ok := q.(*store.Queries); ok {
+		presentation, coverage, loadErr := loadSemanticGate(ctx, txq, run)
+		if loadErr != nil {
+			return SubmitInputResult{}, loadErr
+		}
+		if presentation != nil {
+			if s.txBeginner == nil {
+				return SubmitInputResult{}, ErrSemanticGateMismatch
+			}
+			result, err := locked.submitSemanticApproval(ctx, tx, run, body, sel, opts, presentation, coverage)
+			if err != nil {
+				return SubmitInputResult{}, err
+			}
+			if err = tx.Commit(ctx); err != nil {
+				return SubmitInputResult{}, err
+			}
+			return result, nil
+		}
+	}
+	if opts.SemanticApproval != nil {
+		return SubmitInputResult{}, ErrSemanticGateMismatch
+	}
 	result, err := locked.submitInputForRun(ctx, owner, runID, run, "approve_plan", body, sel, opts)
 	if err != nil {
 		return SubmitInputResult{}, err

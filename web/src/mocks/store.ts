@@ -133,6 +133,9 @@ function seed(): MockState {
   // hold carries no feed rows of its own, and an empty log opens the run view.
   messages.set("run-cred-disabled", []);
   messages.set("run-cred-disabled-codex", []);
+  // Issue #3181: the token-switch holds, empty logs for the same reason.
+  messages.set("run-cred-switch-settling", []);
+  messages.set("run-cred-switch-unsettled", []);
   // PRD #1064 M3: run-live opens on an in-progress milestone (milestones_in_progress:
   // ["hb-2"]); seed ONE tool_use frame so the run view's client-side latestActivity is
   // non-null and the "now" strip renders at open, not just the board/list current_activity

@@ -13,6 +13,7 @@ import { MockRunSocket } from "../mocks/socket";
 // runtime import cycle (issue #165); imported here for api.ts's own internal
 // uses. TypeScript permits importing a name this module also re-exports below.
 import { ApiError } from "./apiError";
+import type { SemanticGateApproval } from "./semanticGate";
 
 export const MOCK_MODE = import.meta.env.VITE_UZI_MOCK === "1";
 
@@ -1303,6 +1304,7 @@ const realApi = {
     // defined, so a run with no revision (a legacy or pre-gate run) keeps today's body.
     expectedGateRevision?: number,
     reset?: MilestoneResetOptions,
+    semanticApproval?: SemanticGateApproval,
   ) =>
     request<RunInputResponse>(
       "POST",
@@ -1318,7 +1320,9 @@ const realApi = {
         ...(discardPendingOutcome ? { discard_pending_outcome: true } : {}),
         ...(expectedGateRevision !== undefined ? { expected_gate_revision: expectedGateRevision } : {}),
         ...reset,
+        ...(semanticApproval !== undefined ? { semantic_approval: semanticApproval } : {}),
       },
+      semanticApproval !== undefined ? { "X-Uzi-Candidate-Identity-Version": "semantic_v1" } : undefined,
     ),
 
   /**

@@ -1,0 +1,314 @@
+{
+  "_comment": "Shared corpus pinning agent/src/prd-link.ts findSemanticPrdPaths/validatePrdPath to api/internal/workersvc FindSemanticPrdPaths and prdpath.Validate. Expected values were recorded by running the TypeScript implementation. Non-ASCII input is \\u-escaped in the file.",
+  "find": [
+    {
+      "name": "bare path",
+      "text": "See prds/1230-semantic-completion-contract.md for details.",
+      "paths": [
+        "prds/1230-semantic-completion-contract.md"
+      ]
+    },
+    {
+      "name": "blob url github",
+      "text": "https://github.com/vtmocanu/uzi/blob/main/prds/362-x.md#L10",
+      "paths": [
+        "prds/362-x.md"
+      ]
+    },
+    {
+      "name": "blob url gitlab",
+      "text": "https://gitlab.example.com/g/p/-/blob/main/prds/362-x.md?plain=1",
+      "paths": [
+        "prds/362-x.md"
+      ]
+    },
+    {
+      "name": "trailing punctuation",
+      "text": "Read prds/1-a.md, prds/2-b.md. and prds/3-c.md!",
+      "paths": [
+        "prds/1-a.md",
+        "prds/2-b.md",
+        "prds/3-c.md"
+      ]
+    },
+    {
+      "name": "markdown link and parens",
+      "text": "[spec](prds/4-d.md) and (prds/5-e.md)",
+      "paths": [
+        "prds/4-d.md",
+        "prds/5-e.md"
+      ]
+    },
+    {
+      "name": "code span and quotes",
+      "text": "`prds/6-f.md` \"prds/7-g.md\" 'prds/8-h.md'",
+      "paths": [
+        "prds/6-f.md",
+        "prds/7-g.md",
+        "prds/8-h.md"
+      ]
+    },
+    {
+      "name": "angle brackets and square",
+      "text": "<prds/9-i.md> [prds/10-j.md]",
+      "paths": [
+        "prds/9-i.md",
+        "prds/10-j.md"
+      ]
+    },
+    {
+      "name": "duplicates keep first order",
+      "text": "prds/b.md prds/a.md prds/b.md",
+      "paths": [
+        "prds/b.md",
+        "prds/a.md"
+      ]
+    },
+    {
+      "name": "nested directory",
+      "text": "prds/done/77-finished.md",
+      "paths": [
+        "prds/done/77-finished.md"
+      ]
+    },
+    {
+      "name": "traversal stays unsafe",
+      "text": "see prds/../../etc/x.md now",
+      "paths": [
+        "prds/../../etc/x.md"
+      ]
+    },
+    {
+      "name": "absolute prefix stays whole",
+      "text": "/etc/prds/x.md",
+      "paths": [
+        "/etc/prds/x.md"
+      ]
+    },
+    {
+      "name": "backslash prefix stays whole",
+      "text": "..\\prds\\x.md and C:\\prds/y.md",
+      "paths": [
+        "C:\\prds/y.md"
+      ]
+    },
+    {
+      "name": "non blob url prefix stays whole",
+      "text": "https://example.com/prds/z.md",
+      "paths": [
+        "https://example.com/prds/z.md"
+      ]
+    },
+    {
+      "name": "dotfile segment",
+      "text": "prds/.git/config.md",
+      "paths": [
+        "prds/.git/config.md"
+      ]
+    },
+    {
+      "name": "no md",
+      "text": "prds/readme and prds/x.txt",
+      "paths": []
+    },
+    {
+      "name": "md after unrelated",
+      "text": "prds/x.mdx",
+      "paths": [
+        "prds/x.mdx"
+      ]
+    },
+    {
+      "name": "unicode whitespace separates",
+      "text": "prds/a.md\u00a0prds/b.md\u2003prds/c.md\u3000prds/d.md\ufeffprds/e.md\u2028prds/f.md",
+      "paths": [
+        "prds/a.md",
+        "prds/b.md",
+        "prds/c.md",
+        "prds/d.md",
+        "prds/e.md",
+        "prds/f.md"
+      ]
+    },
+    {
+      "name": "zero width does not separate",
+      "text": "prds/g\u200b.md",
+      "paths": [
+        "prds/g\u200b.md"
+      ]
+    },
+    {
+      "name": "newline tab separate",
+      "text": "prds/h.md\nprds/i.md\tprds/j.md\r\nprds/k.md",
+      "paths": [
+        "prds/h.md",
+        "prds/i.md",
+        "prds/j.md",
+        "prds/k.md"
+      ]
+    },
+    {
+      "name": "question and hash cut",
+      "text": "prds/l.md?x=1 prds/m.md#frag",
+      "paths": [
+        "prds/l.md",
+        "prds/m.md"
+      ]
+    },
+    {
+      "name": "trailing multi punctuation",
+      "text": "prds/n.md.,;:!",
+      "paths": [
+        "prds/n.md"
+      ]
+    },
+    {
+      "name": "md in middle then dot",
+      "text": "prds/o.md.bak",
+      "paths": [
+        "prds/o.md.bak"
+      ]
+    },
+    {
+      "name": "control byte kept whole",
+      "text": "prds/p\u0001.md",
+      "paths": [
+        "prds/p\u0001.md"
+      ]
+    },
+    {
+      "name": "non ascii segment",
+      "text": "prds/\u00e9t\u00e9.md",
+      "paths": [
+        "prds/\u00e9t\u00e9.md"
+      ]
+    },
+    {
+      "name": "empty",
+      "text": "",
+      "paths": []
+    },
+    {
+      "name": "whitespace only",
+      "text": " \t\n",
+      "paths": []
+    },
+    {
+      "name": "prefix word",
+      "text": "xprds/q.md",
+      "paths": [
+        "xprds/q.md"
+      ]
+    },
+    {
+      "name": "blob with branch slash",
+      "text": "https://github.com/o/r/blob/feature/x/prds/r.md",
+      "paths": [
+        "prds/r.md"
+      ]
+    },
+    {
+      "name": "http blob",
+      "text": "http://h/blob/m/prds/s.md",
+      "paths": [
+        "prds/s.md"
+      ]
+    },
+    {
+      "name": "double md",
+      "text": "prds/t.md.md,",
+      "paths": [
+        "prds/t.md.md"
+      ]
+    },
+    {
+      "name": "dot dot slash prefix stays whole",
+      "text": "see ../prds/x.md now",
+      "paths": [
+        "../prds/x.md"
+      ]
+    }
+  ],
+  "validate": [
+    {
+      "path": "prds/1-a.md",
+      "valid": true
+    },
+    {
+      "path": "prds/done/1-a.md",
+      "valid": true
+    },
+    {
+      "path": "",
+      "valid": false
+    },
+    {
+      "path": "prds/",
+      "valid": false
+    },
+    {
+      "path": "prds/.md",
+      "valid": false
+    },
+    {
+      "path": "prds/.git/x.md",
+      "valid": false
+    },
+    {
+      "path": "prds/../x.md",
+      "valid": false
+    },
+    {
+      "path": "prds/a//b.md",
+      "valid": false
+    },
+    {
+      "path": "prds/a/./b.md",
+      "valid": false
+    },
+    {
+      "path": "/prds/a.md",
+      "valid": false
+    },
+    {
+      "path": "prds/a.txt",
+      "valid": false
+    },
+    {
+      "path": "prds\\a.md",
+      "valid": false
+    },
+    {
+      "path": "prds/a\u0000.md",
+      "valid": false
+    },
+    {
+      "path": "prds/\u00e9.md",
+      "valid": false
+    },
+    {
+      "path": "prds/a b.md",
+      "valid": false
+    },
+    {
+      "path": "docs/a.md",
+      "valid": false
+    },
+    {
+      "path": "prds/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.md",
+      "valid": false
+    },
+    {
+      "path": "prds/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.md",
+      "valid": true
+    },
+    {
+      "path": "prds/a/",
+      "valid": false
+    },
+    {
+      "path": "prds/A_b-c.1.md",
+      "valid": true
+    }
+  ]
+}

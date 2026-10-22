@@ -171,7 +171,7 @@ function launcherFixture(): string {
   }
   cpSync(realpathSync(path.join(agentRoot, "node_modules/@esbuild")),
     path.join(root, "node_modules/@esbuild"), { recursive: true, dereference: true });
-  for (const file of ["run-unit-tests.ts", "agent-test-shards.ts"]) {
+  for (const file of ["run-unit-tests.ts", "agent-test-shards.ts", "agent-report.ts", "agent-report-reporter.ts"]) {
     cpSync(path.join(agentRoot, "test", file), path.join(root, "test", file));
   }
   writeFileSync(path.join(root, "test-shards.json"), JSON.stringify(emptyPins));
@@ -206,6 +206,8 @@ function launcherEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   delete env.UZI_AGENT_TEST_SHARD;
   delete env.UZI_AGENT_TEST_CONCURRENCY;
   delete env.UZI_AGENT_TEST_JUNIT;
+  delete env.UZI_AGENT_TEST_REPORT_DIR;
+  delete env.UZI_AGENT_TEST_REPORT_RUN_DIR;
   return { ...env, ...extra };
 }
 
@@ -325,6 +327,10 @@ test("package child-argv guard supports spaces and quotes in TMPDIR", () => {
   const root = mkdtempSync(path.join(tmpdir(), "uzi-shard-argv-"));
   const spaced = path.join(root, 'space "quoted" tmp');
   mkdirSync(spaced);
+  // It runs the real package script from agent/: its stub launcher must not touch the real report
+  // (the live gate's own latest.json, which agents follow).
+  const latest = path.join(agentRoot, ".test-report", "latest.json");
+  const before = existsSync(latest) ? readFileSync(latest, "utf8") : null;
   try {
     const script = fileURLToPath(new URL("../../scripts/real-procfs-skip-check.test.sh", import.meta.url));
     const source = readFileSync(script, "utf8");
@@ -340,6 +346,7 @@ test("package child-argv guard supports spaces and quotes in TMPDIR", () => {
     assert.equal(result.status, 0, result.stdout + result.stderr);
     assert.match(result.stdout, /package.json test script: UZI_AGENT_TEST_CONCURRENCY=1 passes/);
     assert.match(result.stdout, /unset UZI_AGENT_TEST_CONCURRENCY passes no/);
+    assert.equal(existsSync(latest) ? readFileSync(latest, "utf8") : null, before, "the real agent/.test-report/latest.json is untouched");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

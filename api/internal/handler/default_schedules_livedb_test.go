@@ -376,6 +376,7 @@ func TestCatalogProposalOutputModeLiveDB(t *testing.T) {
 	}{
 		{"feature-bingo", schedtmpl.OutputModeIssues},
 		{"refactor-scout", schedtmpl.OutputModeIssues},
+		{"ci-scout", schedtmpl.OutputModeIssues},
 		{"docs-hygiene", schedtmpl.OutputModeMR},
 	} {
 		t.Run(tc.slug, func(t *testing.T) {

@@ -4,7 +4,7 @@
 # Each budget is the size when the ratchet landed, rounded up to the next 4096-byte multiple.
 # Raising a budget is a reviewed edit to this file. The AGENTS.md budget must stay at or
 # below 65536, the REPO_INSTRUCTIONS_MAX_BYTES runtime cap in agent/src/repo-instructions.ts.
-AGENTS.md	45056
+AGENTS.md	49152
 .claude/rules/agent.md	8192
 .claude/rules/go.md	28672
 .claude/rules/prds.md	8192

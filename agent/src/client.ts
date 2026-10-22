@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { decodeCompletionPending, type CompletionPending } from "./completion-pending.js";
+import { SEMANTIC_GATE_ACK_MAX_BYTES, semanticGateAckSchema } from "./semantic-gate-wire.js";
 import { decodeInterruptedCalls, interruptedRegistration, type InterruptedRegistration, type InterruptedCalls } from "./interrupted-calls.js";
 import { Readable } from "node:stream";
 import type { ReadableStreamReadResult } from "node:stream/web";
@@ -111,6 +113,8 @@ import {
   type RecoveryLiveSettleRequest,
   type RecoverySettleRequest,
   type RecoverySettleResponse,
+  type BaseAttestationHoldOutcome,
+  BASE_ATTESTATION_HOLD_REASON,
 } from "./protocol.js";
 
 export class PolicyHoldUnsupported extends Error {
@@ -161,7 +165,14 @@ export type WorkerRunDetail = ProtocolWorkerRunDetail & { plan_cross_check_gate_
 export type WorkerRunListItem = ProtocolWorkerRunListItem & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
 export type PlanCrossCheckDiffRefusal = "base_unavailable" | "diff_failed" | "diff_too_large"
   | "too_many_untracked" | "secret_detected" | "scan_failed" | "unsupported_entry";
+import { parseSemanticEnrollment, parseSemanticCandidate, SEMANTIC_ENVELOPE_MAX_BYTES } from "./semantic-plan.js";
+import { semanticObservationRecordSchema, SEMANTIC_OBSERVATION_RESPONSE_MAX_BYTES, type SemanticObservationRequest } from "./semantic-drift.js";
+import { semanticCandidateResponseSchema, semanticCoverageStatusSchema, semanticReservationSchema,
+  type SemanticReserveRequest, type SemanticSettleRequest, type SemanticPublishRequest } from "./semantic-coverage-wire.js";
+
 export interface PlanCrossCheckCandidate {
+  candidate_identity_version?: "semantic_v1";
+  semantic_candidate?: ReturnType<typeof import("./semantic-plan.js").parseSemanticCandidate>;
   plan_md: string;
   milestones: unknown[];
   required_capabilities: string[];
@@ -304,6 +315,14 @@ function decodePlanCrossCheckResponse(value: unknown, generation: number, round:
   // Canonical stored nil capability/tool slices serialize as null, unlike milestones.
   const list = (v: unknown): string[] | undefined =>
     v === null ? [] : Array.isArray(v) && v.length <= 64 && v.every((s) => crossCheckText(s, 256)) ? v : undefined;
+  if ("semantic_identity" in c) return invalid();
+  if (c.candidate_identity_version !== undefined || c.semantic_candidate !== undefined) {
+    if (c.candidate_identity_version !== "semantic_v1" ||
+        Buffer.byteLength(JSON.stringify(c.semantic_candidate) ?? "") > SEMANTIC_ENVELOPE_MAX_BYTES) return invalid();
+    try {
+      if (parseSemanticCandidate(c.semantic_candidate).digest !== wire.candidate_digest) return invalid();
+    } catch { return invalid(); }
+  }
   const caps = list(c.required_capabilities), tools = list(c.required_tools);
   if (!caps || !tools) return invalid();
   // The normalizer preserves extra milestone prose, bounded to depth 32 and total bytes.
@@ -1070,6 +1089,10 @@ export interface CompletionPermit {
   issuedAt: string;
   findingIds: string[];
   completionScope?: ClaimConfig["completion_scope"];
+  /** PRD #1230 M4: strictly decoded; absent is legacy. */
+  completionPending?: CompletionPending;
+  /** The permit carried a completion_pending value that failed the strict decode (fail closed). */
+  completionPendingMalformed?: true;
 }
 
 /** The completion-permit endpoint's decision (PRD #1226 M4, D5), mapped from
@@ -1219,10 +1242,16 @@ const COMPLETION_OBSERVATIONS_MAX = 2048;
 type CompletionTicket = { incarnation: number; runId?: string; exclusions: Set<string> };
 type CompletionReservation = { live: boolean; tickets: Set<CompletionTicket> };
 
+/** issue #3181: the registration feature that lets a worker hold a credential switch it cannot settle. */
+export const CREDENTIAL_SWITCH_HOLD_FEATURE = "credential_switch_hold";
+
 /** Transport for the worker→API control plane (PRD §Worker protocol). */
 export class WorkerClient {
   private registeredWorkerId: string | undefined;
   private hasExactHoldCapability = false;
+  /** Issue #3142: this registration advertised worker_memory_authority_claim_v1. */
+  private hasMemoryAuthorityClaimCapability = false;
+  private memoryAuthorityLostLogged = false;
   // Provenance survives uncertain registration; only a successful changed identity resets it.
   private completionWorkerId: string | undefined;
   private completionInventoryUnreadable = false;
@@ -1534,6 +1563,7 @@ export class WorkerClient {
     this.hasCredentialSwitchCapability = originalCapabilities?.includes("credential_switch_v1") ?? false;
     this.hasPolicyHoldCapability = originalCapabilities?.includes("provider_policy_hold_v1") ?? false;
     this.hasExactHoldCapability = originalCapabilities?.includes("recovery_held_publication_v2") ?? false;
+    this.hasMemoryAuthorityClaimCapability = originalCapabilities?.includes("worker_memory_authority_claim_v1") ?? false;
     // PRD #1390 M2a: capture the per-registration nonce the api minted, stamped onto every
     // ActiveSnapshot the worker sends. A string only (defensive); absent on an older api ⇒
     // undefined, in which case no snapshot is sent even if later heartbeat adverts grow the cache.
@@ -1752,7 +1782,12 @@ export class WorkerClient {
    *  nonce exists (nonce-stamped), so the
    *  api's pre-claim dedupe sees the runs this worker is already executing BEFORE the first
    *  post-outage heartbeat lands. If not negotiated the claim posts an empty body `{}`, which
-   *  an old api ignores (harmless — the run-lane claim was bodyless before this). */
+   *  an old api ignores (harmless — the run-lane claim was bodyless before this).
+   *
+   *  Issue #3142: when this registration advertised `worker_memory_authority_claim_v1` and the api
+   *  negotiated it, the body also carries `memory_authority` ("held" while the memory incarnation is
+   *  live, "lost" once revoked). Computed synchronously at body build time, so an admission wait
+   *  before the call cannot leave a stale value. The cross-check lane never carries it. */
   async claimRun(activeSnapshot?: ActiveSnapshot, signal?: AbortSignal, timeoutMs = this.httpTimeoutMs): Promise<ClaimResponse | null> {
     return this.claimRunLane(`${WORKER_API_PREFIX}/runs/claim`, activeSnapshot, signal, timeoutMs);
   }
@@ -1774,6 +1809,13 @@ export class WorkerClient {
       if (this.hasFeature("active_run_snapshot") && activeSnapshot !== undefined && this.registerNonce !== undefined) {
         body.active_snapshot = { ...activeSnapshot, register_nonce: this.registerNonce };
       }
+      if (!dedicated && this.hasMemoryAuthorityClaimCapability && this.hasFeature("worker_memory_authority_claim_v1")) {
+        body.memory_authority = this.memoryIncarnationValue ? "held" : "lost";
+        if (body.memory_authority === "lost" && !this.memoryAuthorityLostLogged) {
+          this.memoryAuthorityLostLogged = true;
+          this.log.warn("memory authority lost; claims report it and the api stops dispatching guard-bound runs here until the worker restarts", {});
+        }
+      }
       const res = await this.fetchRaw("POST", path, body, timeoutMs, deadline);
       deadline.throwIfAborted();
       if (res.status === 204) return null;
@@ -1785,9 +1827,17 @@ export class WorkerClient {
       }
       // Dedicated requests are bounded even without a marker; unmarked ordinary
       // claims keep their existing decoder.
-      const claim = (dedicated || marker === "cross_check"
-        ? JSON.parse(await readBoundedText(res, 2 * 1024 * 1024, true))
+      const claim = (dedicated || marker === "cross_check" || res.headers.has("X-Uzi-Candidate-Identity-Version")
+        ? JSON.parse(await readCrossCheckText(res, 2 * 1024 * 1024, deadline,
+          dedicated || marker === "cross_check" ? "claim" : undefined))
         : await res.json()) as ClaimResponse;
+      if (isRecord(claim) && claim.semantic_planning !== undefined) claim.semantic_planning = parseSemanticEnrollment(claim.semantic_planning);
+      // PRD #1230 M4: a present-but-malformed maintainer-pending projection fails the claim closed.
+      if (isRecord(claim) && isRecord(claim.config) && Object.hasOwn(claim.config, "completion_pending")) {
+        const pending = decodeCompletionPending(claim.config.completion_pending);
+        if (pending.kind !== "ok") throw new Error("malformed completion_pending on claim");
+        claim.config.completion_pending = pending.pending;
+      }
       if ((marker === "cross_check") !== (isRecord(claim) && claim.kind === "cross_check")) {
         throw new Error("cross-check claim marker and kind disagree");
       }
@@ -2010,15 +2060,67 @@ export class WorkerClient {
 
   async submitPlanCrossCheck(runId: string, claimGeneration: number, candidate: PlanCrossCheckCandidate, signal?: AbortSignal, round = 1): Promise<PlanCrossCheckResponse> {
     if (!crossCheckRound(round)) throw new Error("invalid cross-check round");
+    // Frozen enrollment selects server history; do not resend the canonical criteria.
+    const { semantic_candidate: _semantic, ...request } = candidate;
     return decodePlanCrossCheckResponse(await this.postJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks`,
-      { ...candidate, stage: "plan", claim_generation: claimGeneration, round },
-      this.httpTimeoutMs, signal, CROSS_CHECK_RESPONSE_MAX_BYTES), claimGeneration, round);
+      { ...request, stage: "plan", claim_generation: claimGeneration, round },
+      this.httpTimeoutMs, signal, CROSS_CHECK_RESPONSE_MAX_BYTES, false, { generation: claimGeneration, round }), claimGeneration, round);
+  }
+
+  private semanticRequestSignal(generation: number, signal?: AbortSignal): AbortSignal {
+    if (!Number.isSafeInteger(generation) || generation <= 0) throw new Error("invalid semantic claim generation");
+    return AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(this.httpTimeoutMs)]);
+  }
+
+  async submitSemanticCandidate(runId: string, generation: number,
+    structural: PlanCrossCheckCandidate, proposal: import("./semantic-plan.js").SemanticSubmission | undefined,
+    sources: readonly unknown[], signal?: AbortSignal) {
+    const owned = this.semanticRequestSignal(generation, signal);
+    return semanticCandidateResponseSchema.parse(await this.postJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/semantic/candidate`,
+      { claim_generation: generation, structural, proposal, sources }, this.httpTimeoutMs, owned, SEMANTIC_ENVELOPE_MAX_BYTES, true));
+  }
+
+  async semanticCoverageStatus(runId: string, generation: number, signal?: AbortSignal) {
+    const owned = this.semanticRequestSignal(generation, signal);
+    return semanticCoverageStatusSchema.parse(await this.getJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/semantic/coverage?claim_generation=${generation}`,
+      undefined, 128 * 1024, owned));
+  }
+
+  async reserveSemanticCoverage(runId: string, generation: number, request: SemanticReserveRequest, signal?: AbortSignal) {
+    const owned = this.semanticRequestSignal(generation, signal);
+    return semanticReservationSchema.parse(await this.postJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/semantic/coverage/reserve`,
+      { claim_generation: generation, ...request }, this.httpTimeoutMs, owned, SEMANTIC_ENVELOPE_MAX_BYTES, true));
+  }
+
+  async settleSemanticCoverage(runId: string, generation: number, request: SemanticSettleRequest, signal?: AbortSignal) {
+    const owned = this.semanticRequestSignal(generation, signal);
+    return semanticCoverageStatusSchema.parse(await this.postJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/semantic/coverage/settle`,
+      { claim_generation: generation, ...request }, this.httpTimeoutMs, owned, 128 * 1024, true));
+  }
+
+  async publishSemanticCoverage(runId: string, generation: number, request: SemanticPublishRequest, signal?: AbortSignal) {
+    const owned = this.semanticRequestSignal(generation, signal);
+    return semanticCoverageStatusSchema.parse(await this.postJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/semantic/coverage/publish`,
+      { claim_generation: generation, ...request }, this.httpTimeoutMs, owned, 128 * 1024, true));
+  }
+
+  /** PRD #1230 D5: record one drift observation. Detection only; the caller treats any throw as "not observed". */
+  async postSemanticObservation(runId: string, generation: number, request: SemanticObservationRequest, signal?: AbortSignal) {
+    const owned = this.semanticRequestSignal(generation, signal);
+    return semanticObservationRecordSchema.parse(await this.postJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/semantic/observation`,
+      { claim_generation: generation, ...request }, this.httpTimeoutMs, owned, SEMANTIC_OBSERVATION_RESPONSE_MAX_BYTES, true));
   }
 
   async planCrossCheckStatus(runId: string, claimGeneration: number, round = 1, signal?: AbortSignal): Promise<PlanCrossCheckResponse> {
     if (!crossCheckRound(round)) throw new Error("invalid cross-check round");
     return decodePlanCrossCheckResponse(await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks/plan/${round}?claim_generation=${claimGeneration}`,
-      undefined, CROSS_CHECK_RESPONSE_MAX_BYTES, signal), claimGeneration, round);
+      undefined, CROSS_CHECK_RESPONSE_MAX_BYTES, signal, { generation: claimGeneration, round }), claimGeneration, round);
   }
 
   async planCrossCheckLatest(runId: string, generation: number, signal?: AbortSignal): Promise<PlanCrossCheckLatestMetadata> {
@@ -2042,6 +2144,31 @@ export class WorkerClient {
         !this.serverFeatures.has("gate_revision_v1"))
       throw new Error("checked plan state requires generation and gate_revision_v1");
     return this.reportStateOnce(runId, `${WORKER_API_PREFIX}/runs/${runId}/state`, body, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
+  }
+
+  /** Semantic writes require existing fences and never use compatibility stripping. */
+  async reportSemanticPlanGateState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal): Promise<StateAck> {
+    const frozen: PlanCrossCheckStateRequest = JSON.parse(JSON.stringify(body));
+    if (!Number.isSafeInteger(frozen.claim_generation) || (frozen.claim_generation ?? 0) <= 0 ||
+        !this.hasFeature("claim_generation_fence") || !this.hasFeature("gate_revision_v1") ||
+        !/^[0-9a-f]{64}$/.test(frozen.candidate_digest ?? "") ||
+        (frozen.status !== "running" && frozen.status !== "awaiting_approval") ||
+        (frozen.status === "awaiting_approval" && !frozen.presentation_id))
+      throw new Error("semantic plan state requires exact candidate, generation and gate negotiation");
+    const ack = await this.reportStateOnce(runId, `${WORKER_API_PREFIX}/runs/${runId}/state`, frozen, signal,
+      SEMANTIC_GATE_ACK_MAX_BYTES);
+    if (ack.semanticGateMalformed) throw new Error("malformed semantic presentation ACK");
+    if (ack.applied && (ack.runId !== runId || ack.status !== frozen.status || ack.staleClaim))
+      throw new Error("semantic state ACK does not confirm the requested run and status");
+    if (ack.applied && frozen.status === "awaiting_approval") {
+      const gate = ack.semanticGate;
+      if (ack.status !== "awaiting_approval" || ack.staleClaim || !gate ||
+          gate.semantic_approval.presentation_revision !== ack.gateRevision ||
+          gate.semantic_approval.claim_generation !== frozen.claim_generation ||
+          gate.semantic_approval.candidate_digest !== frozen.candidate_digest)
+        throw new Error("semantic presentation ACK does not match candidate and claim");
+    }
+    return ack;
   }
 
   /**
@@ -2088,6 +2215,16 @@ export class WorkerClient {
       // No generation send gate or strict-decode downgrade: this park requires every fence.
       return this.reportStateOnce(runId, path, outbound, signal, CROSS_CHECK_RESPONSE_MAX_BYTES,
         undefined, { incarnation, binding });
+    }
+    if (body.status === "credential_switch_held" || body.status === "credential_switch_hold_settled") {
+      // issue #3181: fenced on the current registration. The nonce is the one the most recent
+      // register response returned; no generation send gate or strict-decode downgrade applies,
+      // because an api without the feature would misread a hold as an ordinary status.
+      const nonce = this.registerNonce;
+      if (!this.hasFeature(CREDENTIAL_SWITCH_HOLD_FEATURE) || !nonce ||
+          !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0)
+        throw new Error("credential switch hold report requires the credential_switch_hold feature, a registration nonce and a positive claim_generation");
+      return this.reportStateOnce(runId, path, { ...body, register_nonce: nonce }, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
     }
     // Once a source fence is negotiated, never retry its write without that fence
     // on a rolled-back strict decoder. Initial older-API calls retain compatibility.
@@ -2285,6 +2422,10 @@ export class WorkerClient {
           }
           if (body.claim_generation !== undefined)
             ack.sentClaimGeneration = body.claim_generation;
+          if (fields.semanticGate !== undefined) ack.semanticGate = fields.semanticGate;
+          if (fields.semanticGateMalformed) ack.semanticGateMalformed = true;
+          if (fields.completionPending !== undefined) ack.completionPending = fields.completionPending;
+          if (fields.completionPendingMalformed) ack.completionPendingMalformed = true;
           if (fields.completionProjection !== undefined)
             ack.completionProjection = fields.completionProjection;
           if (fields.completionAttempts !== undefined)
@@ -2348,6 +2489,9 @@ export class WorkerClient {
             ack.staleClaim = fields.staleClaim;
           if (fields.credentialSwitchReleased !== undefined)
             ack.credentialSwitchReleased = fields.credentialSwitchReleased;
+          if (fields.credentialSwitchHeld !== undefined) ack.credentialSwitchHeld = fields.credentialSwitchHeld;
+          if (fields.credentialSwitchHoldSettled !== undefined)
+            ack.credentialSwitchHoldSettled = fields.credentialSwitchHoldSettled;
           // PRD #1795 M1 (decision 5): the revision an awaiting_approval report was answered with,
           // read like contractRevision off the same single-use body (top-level, beside `run`).
           if (fields.gateRevision !== undefined) ack.gateRevision = fields.gateRevision;
@@ -2434,6 +2578,8 @@ export class WorkerClient {
     pack: Readable,
     boundarySignal?: AbortSignal,
     claimGeneration?: number,
+    /** issue #3194: the packed source this flight attests was produced on an accepted base. */
+    attestedSource?: string,
   ): Promise<PublishResult> {
     const query = claimGeneration !== undefined && claimGeneration > 0
       ? `?claim_generation=${encodeURIComponent(claimGeneration)}` : "";
@@ -2448,6 +2594,7 @@ export class WorkerClient {
         "X-Client-Version": this.version,
         "Content-Type": "application/octet-stream",
         "X-Uzi-Checkpoint-Tip": tipOid,
+        ...(attestedSource ? { "X-Uzi-Checkpoint-Attested-Source": attestedSource } : {}),
       },
       body: pack,
       // undici requires `duplex: "half"` for a streamed (Readable) request body; without it
@@ -3597,6 +3744,9 @@ export class WorkerClient {
         ...(res.permit.completion_scope !== undefined
           ? { completionScope: res.permit.completion_scope } : {}),
       };
+      const pending = decodeCompletionPending(res.permit.completion_pending);
+      if (pending.kind === "ok") result.permit.completionPending = pending.pending;
+      else if (pending.kind === "malformed") result.permit.completionPendingMalformed = true;
     }
     return result;
   }
@@ -3644,6 +3794,47 @@ export class WorkerClient {
       // ambiguous; enterCompletionHold retains artifacts while reconciling ownership.
       return { status: "" };
     });
+  }
+
+  /** issue #3194: ask the server to hold this flight's own claim on the `--require-base`
+   *  base-attestation hold (POST /worker/runs/:id/base-attestation-hold): running -> paused with
+   *  hold_reason='base_attestation_missing'. The claim generation is mandatory and never stripped:
+   *  the hold refuses resume, so it must not land on a claim this flight lost. One attempt, no retry.
+   *
+   *  Never throws. The outcome is `held` ONLY on a 200 whose body names this exact hold (a repeat
+   *  for a generation already held answers the same 200); `stale` on a 409 (the fence refused: the
+   *  claim moved on or the run left `running`); `unknown` for everything else: a transport error,
+   *  a 5xx, a 404 (an older server without the route, or a run no longer this worker's), a 400 (an
+   *  older or stricter server refusing the request) or an unreadable body. The caller keeps the
+   *  clone and custody on every outcome; the classification only decides what it may report. */
+  async requestBaseAttestationHold(
+    runId: string,
+    args: { head: string; claimGeneration: number },
+    signal?: AbortSignal,
+  ): Promise<BaseAttestationHoldOutcome> {
+    if (!Number.isSafeInteger(args.claimGeneration) || args.claimGeneration <= 0) {
+      return { outcome: "unknown", detail: "no claim generation to fence the hold" };
+    }
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/base-attestation-hold`;
+    try {
+      const res = await this.fetchRaw(
+        "POST", path, { head: args.head, claim_generation: args.claimGeneration }, this.httpTimeoutMs, signal,
+      );
+      if (res.status === 200) {
+        const fields = await readRunAck(res);
+        if (fields.status === "paused" && fields.holdReason === BASE_ATTESTATION_HOLD_REASON) {
+          return { outcome: "held", status: fields.status };
+        }
+        return { outcome: "unknown", detail: `unexpected hold acknowledgement (status ${fields.status ?? "none"})` };
+      }
+      if (res.status === 409) {
+        const fields = await readRunAck(res);
+        return { outcome: "stale", status: fields.status ?? "" };
+      }
+      return { outcome: "unknown", detail: `HTTP ${res.status}` };
+    } catch (err) {
+      return { outcome: "unknown", detail: err instanceof Error ? err.message : String(err) };
+    }
   }
 
   /** Report a WALL-CLOCK PARK to the server (POST /worker/runs/:id/wall-park, PRD #1497 M2, D4).
@@ -4056,13 +4247,14 @@ export class WorkerClient {
     callerSignal?: AbortSignal,
     maxResponseBytes?: number,
     fenceResponseAbort = false,
+    semanticContext?: { generation: number; round: number },
   ): Promise<unknown> {
     const res = await this.fetchRaw("POST", path, body, timeoutMs, callerSignal);
     if (res.status >= 400) throw await this.toError("POST", path, res);
     MaintenanceBudget.current()?.check();
     if (res.status === 204) return undefined;
     const text = maxResponseBytes === undefined ? await readResponseText(res) :
-      await readBoundedText(res, maxResponseBytes, true, fenceResponseAbort ? callerSignal : undefined);
+      await readCrossCheckText(res, maxResponseBytes, fenceResponseAbort ? callerSignal : undefined, semanticContext);
     MaintenanceBudget.current()?.check();
     return text ? JSON.parse(text) : undefined;
   }
@@ -4322,7 +4514,8 @@ export class WorkerClient {
     return text ? JSON.parse(text) : undefined;
   }
 
-  private async getJSON(path: string, timeoutMs?: number, maxResponseBytes?: number, signal?: AbortSignal): Promise<unknown> {
+  private async getJSON(path: string, timeoutMs?: number, maxResponseBytes?: number, signal?: AbortSignal,
+    semanticContext?: { generation: number; round: number }): Promise<unknown> {
     if (signal) signal = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs ?? this.httpTimeoutMs)]);
     signal?.throwIfAborted();
     const res = await this.fetchRaw("GET", path, undefined, timeoutMs, signal);
@@ -4333,7 +4526,7 @@ export class WorkerClient {
       throw new RequestError("GET", path, res.status, text.slice(0, 4096),
         retryAfterMsOf(res.headers.get("Retry-After")), { complete: true, bytes: raw.length });
     }
-    const text = maxResponseBytes === undefined ? await readResponseText(res) : await readBoundedText(res, maxResponseBytes, true, signal);
+    const text = maxResponseBytes === undefined ? await readResponseText(res) : await readCrossCheckText(res, maxResponseBytes, signal, semanticContext);
     MaintenanceBudget.current()?.check();
     return text ? JSON.parse(text) : undefined;
   }
@@ -4452,6 +4645,12 @@ function retryAfterMsOf(h: string | null): number | undefined {
  * reserving another 64 KiB for keys/metadata stays below 6 MiB. Count actual streamed bytes,
  * never Content-Length; cross-check methods, strict gate and terminal RunDTO ACKs opt in. */
 const CROSS_CHECK_RESPONSE_MAX_BYTES = 6 * 1024 * 1024;
+/** PRD #1230 M4: a maximally escaped completion_pending projection stays below 20 MiB
+ * (api TestSemanticCompletionPendingWireBound). The server's header grants that bounded
+ * allowance on top of a state ACK's own cap; the projection must still decode strictly,
+ * and a header without a projection is malformed. Mirrors apitypes.CompletionPending*. */
+const COMPLETION_PENDING_HEADER = "X-Uzi-Completion-Pending";
+const COMPLETION_PENDING_ACK_ALLOWANCE_BYTES = 20 * 1024 * 1024;
 const RECOVERY_RELEASE_RESPONSE_MAX_BYTES = 16 * 1024;
 /** Maximum success body size for the Codex release and refresh envelopes. */
 const CODEX_SUCCESS_BODY_MAX_BYTES = 64 * 1024;
@@ -4501,6 +4700,41 @@ const ERROR_BODY_MAX_BYTES = 4096;
  *  exceeding the remaining byte budget before retaining or decoding it. */
 async function readBoundedText(res: Response, maxBytes: number, rejectOverflow = false, signal?: AbortSignal): Promise<string> {
   return new TextDecoder().decode(await readBoundedBytes(res, maxBytes, rejectOverflow, signal));
+}
+
+/** The server marker grants a bounded transport budget only. The complete
+ * semantic candidate and its enclosing digest must still validate after reading. */
+async function readCrossCheckText(res: Response, maxBytes: number, signal?: AbortSignal,
+  semanticContext?: { generation: number; round: number } | "claim"): Promise<string> {
+  const marker = res.headers.get("X-Uzi-Candidate-Identity-Version");
+  if (marker !== null && (marker !== "semantic_v1" || !semanticContext)) {
+    void res.body?.cancel().catch(() => undefined);
+    throw new Error("invalid cross-check candidate identity marker");
+  }
+  const raw = await readBoundedBytes(res, marker === "semantic_v1" ? SEMANTIC_ENVELOPE_MAX_BYTES : maxBytes, true, signal);
+  const text = new TextDecoder().decode(raw);
+  if (semanticContext) {
+    const wire: unknown = text ? JSON.parse(text) : undefined;
+    const candidate = crossCheckRecord(wire)
+      ? semanticContext === "claim" ? wire.cross_check : wire.candidate
+      : undefined;
+    const semantic = crossCheckRecord(candidate) &&
+      (candidate.candidate_identity_version !== undefined || candidate.semantic_candidate !== undefined);
+    if (marker === null && semantic) throw new Error("missing cross-check candidate identity marker");
+    if (marker !== null) {
+      let decoded: PlanCrossCheckCandidate | ReturnType<typeof decodeCrossCheckClaim> | undefined;
+      if (semanticContext === "claim") {
+        if (crossCheckRecord(wire) && wire.kind === "cross_check") decoded = decodeCrossCheckClaim(wire.cross_check);
+      } else {
+        const response = decodePlanCrossCheckResponse(wire, semanticContext.generation, semanticContext.round);
+        if (response.result === "candidate") decoded = response.candidate;
+      }
+      if (!decoded || decoded.candidate_identity_version !== "semantic_v1" || !decoded.semantic_candidate) {
+        throw new Error("cross-check candidate identity marker and body disagree");
+      }
+    }
+  }
+  return text;
 }
 
 /** The raw-byte core of {@link readBoundedText}; same bounds and failure behaviour. */
@@ -4594,6 +4828,10 @@ async function readBoundedBytes(res: Response, maxBytes: number, rejectOverflow 
  */
 export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   applied?: boolean;
+  semanticGate?: StateAck["semanticGate"];
+  semanticGateMalformed?: true;
+  completionPending?: CompletionPending;
+  completionPendingMalformed?: true;
   completedPublicationCandidate?: unknown;
   completedPublicationReason?: CompletedPublicationReason;
   runId?: unknown;
@@ -4620,13 +4858,18 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   credentialSwitch?: { generation: number };
   staleClaim?: boolean;
   credentialSwitchReleased?: boolean;
+  credentialSwitchHeld?: boolean;
+  credentialSwitchHoldSettled?: boolean;
   gateRevision?: number;
   revisionInputId?: number;
   supersededRevisionInputIds?: number[];
   staleRevisionSource?: boolean;
   reconciliation?: PlanCrossCheckReconciliation;
 }> {
-  const boundedText = maxAckBytes === undefined ? undefined : await readBoundedText(res, maxAckBytes, true);
+  const pendingMarker = res.headers.get(COMPLETION_PENDING_HEADER);
+  const ackCap = maxAckBytes === undefined ? undefined
+    : maxAckBytes + (pendingMarker === "v1" ? COMPLETION_PENDING_ACK_ALLOWANCE_BYTES : 0);
+  const boundedText = ackCap === undefined ? undefined : await readBoundedText(res, ackCap, true);
   try {
     const text = boundedText ?? await readResponseText(res);
     MaintenanceBudget.current()?.check();
@@ -4635,6 +4878,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       applied?: unknown;
       // PRD #1392 M2 (D10): `reason` is TOP-LEVEL on the {run, reason?} ack body, NOT under run.
       reason?: unknown;
+      semantic_presentation?: unknown;
+      semantic_approval?: unknown;
       completed_publication_receipt?: unknown;
       completed_publication_reason?: unknown;
       run?: {
@@ -4651,6 +4896,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
         // Issue #1626: the frozen completion-contract revision (RunDTO.completion_revision).
         completion_revision?: unknown;
         completion_deferred?: unknown;
+        completion_pending?: unknown;
         completion_attempts?: unknown;
         budget_total_seconds?: unknown;
         budget_used_seconds?: unknown;
@@ -4673,6 +4919,10 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     const run = parsed?.run;
     const out: {
       applied?: boolean;
+      semanticGate?: StateAck["semanticGate"];
+      semanticGateMalformed?: true;
+      completionPending?: CompletionPending;
+      completionPendingMalformed?: true;
       completedPublicationCandidate?: unknown;
       completedPublicationReason?: CompletedPublicationReason;
       runId?: unknown;
@@ -4699,12 +4949,30 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       credentialSwitch?: { generation: number };
       staleClaim?: boolean;
       credentialSwitchReleased?: boolean;
+      credentialSwitchHeld?: boolean;
+      credentialSwitchHoldSettled?: boolean;
       gateRevision?: number;
       revisionInputId?: number;
       supersededRevisionInputIds?: number[];
       staleRevisionSource?: boolean;
       reconciliation?: PlanCrossCheckReconciliation;
     } = {};
+    if (isRecord(parsed) && (Object.hasOwn(parsed, "semantic_presentation") || Object.hasOwn(parsed, "semantic_approval"))) {
+      try {
+        const gate = semanticGateAckSchema.safeParse({
+          semantic_presentation: parsed.semantic_presentation, semantic_approval: parsed.semantic_approval,
+        });
+        if (gate.success) out.semanticGate = gate.data;
+        else out.semanticGateMalformed = true;
+      } catch {
+        // Nested canonical decoders may throw inside a schema transform.
+        // Presence must remain malformed rather than becoming a legacy ACK.
+        out.semanticGateMalformed = true;
+      }
+    }
+    const semanticMarker = res.headers.get("X-Uzi-Candidate-Identity-Version");
+    if (semanticMarker !== null && (semanticMarker !== "semantic_v1" || !out.semanticGate))
+      out.semanticGateMalformed = true;
     if (typeof parsed?.applied === "boolean") out.applied = parsed.applied;
     if (parsed?.completed_publication_receipt !== undefined && parsed.completed_publication_reason === undefined) out.completedPublicationCandidate = parsed.completed_publication_receipt;
     const completionReason = decodeCompletedPublicationReason(parsed?.completed_publication_reason);
@@ -4743,6 +5011,14 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
         deferredIds: [...new Set(deferred.map(entry => (entry as { milestone_id: string }).milestone_id))].sort(),
       };
     }
+    // PRD #1230 M4: absence is legacy; presence (even null) that fails the strict decode is malformed.
+    if (isRecord(run) && Object.hasOwn(run, "completion_pending") && run.completion_pending !== undefined) {
+      const pending = decodeCompletionPending(run.completion_pending);
+      if (pending.kind === "ok") out.completionPending = pending.pending;
+      else out.completionPendingMalformed = true;
+    }
+    if (pendingMarker !== null && (pendingMarker !== "v1" || out.completionPending === undefined))
+      out.completionPendingMalformed = true;
     if (typeof run?.completion_attempts === "number" && Number.isSafeInteger(run.completion_attempts) && run.completion_attempts >= 0)
       out.completionAttempts = run.completion_attempts;
     // PRD #1189 M1 (D6): the served TOTAL wall (frozen budget + extension). null (a run with no
@@ -4805,6 +5081,10 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     // release after a reclaim (status 'running'), so enterCredentialSwitch accepts the release off
     // this flag rather than off status === 'queued' (which missed the idempotent case).
     if (parsed?.disposition === "released") out.credentialSwitchReleased = true;
+    // issue #3181: the credential-switch HOLD report applied (`held`), and its settling
+    // acknowledgement applied (`hold_settled`). Read only off the 200 ack, like `released`.
+    if (parsed?.disposition === "held") out.credentialSwitchHeld = true;
+    if (parsed?.disposition === "hold_settled") out.credentialSwitchHoldSettled = true;
     // PRD #1795 M1 (decision 5): the gate revision an awaiting_approval report was answered with. A
     // positive integer only; anything else (absent on an older api or another report, garbled)
     // leaves it undefined, which the gate reads as "no revision confirmed" (bound verdicts wait).

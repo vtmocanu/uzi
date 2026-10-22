@@ -4,6 +4,7 @@
 code change)
 **Date**: 2026-09-24
 **Deciders**: architect (design), team lead, Vlad (maintainer).
+**Amended by**: [ADR-3153](3153-runner-shared-pvc-subpath.md) (the evidence table below was measured under the pre-#3153 layout, where `/data/runner` was the `run-workdir` emptyDir; it is now a subPath of the data PVC)
 **Issue**: GitHub issue [vtmocanu/uzi#1597](https://github.com/vtmocanu/uzi/issues/1597) —
 there is no PRD file; the issue carries the reproduction and the milestone breakdown. This
 ADR carries the decision, its invariants, and the alternatives most likely to look
@@ -431,7 +432,7 @@ the cluster's actual kubelet version was not checked against that source read, s
 upstream contract, not a confirmed match to the exact deployed kubelet). The `run-workdir`
 `emptyDir` mount is counted **separately** from that figure by kubelet, not folded into it.
 
-Table, condensed from `scripts/measure-worker-ephemeral.sh` output (real worker image):
+Table, condensed from `scripts/measure-worker-ephemeral.sh` output (real worker image), measured under the pre-#3153 layout (the `run-workdir` emptyDir row no longer exists; `/data/runner` is now a subPath of the data PVC, ADR-3153):
 
 ```
 writable layer (SizeRw)                      55  55.0B     COUNTED (Rootfs.UsedBytes)

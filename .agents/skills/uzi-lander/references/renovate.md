@@ -104,9 +104,11 @@ new version can break uzi or ship capabilities uzi should adopt.
   which rewrites every registered Codex version and digest pin from it; keep the Codex
   guardrail/conformance checks green.
 - Required PR CI covers the agent suite, the real-binary `test:codex-m4` on amd64 and the
-  worker-uid lane. The amd64 image builds and `codex-packaged-proof.yml` run but are not
-  required; arm64, `check:codex-m4-receipts` and live provider entitlement are not covered
-  by any PR check. Name in the merge note which of these ran.
+  worker-uid lane (`test-agent`). The required `codex-packaged-proof-gate` covers the strict
+  packaged proof on amd64 and the arm64 package check (`e2e/codex-proof/package-exec.sh`). The amd64 image builds run but are not required.
+  No PR check covers an arm64 image or packaged proof, the code-mode host executing on
+  arm64, `check:codex-m4-receipts` or live provider entitlement. Name in the merge note
+  which of these ran.
 - Merging the bump implements none of it. Propose anything useful to the user and offer an
   `enhancement` issue, separate from the bump; never implement it in the bump PR. Report
   what you found, or "nothing actionable", at batch end.

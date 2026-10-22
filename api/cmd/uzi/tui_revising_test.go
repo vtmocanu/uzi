@@ -85,7 +85,7 @@ func TestBandOrderPlacesRevisingOnFloor(t *testing.T) {
 		{RunDTO: apitypes.RunDTO{ID: "revising-1", Kind: "issue", Status: "awaiting_approval", IsRevising: true}},
 		{RunDTO: apitypes.RunDTO{ID: "gate-1", Kind: "issue", Status: "awaiting_approval"}},
 	}
-	out := bandOrder(runs)
+	out := bandOrder(runs, false)
 	if len(out) != 2 {
 		t.Fatalf("bandOrder returned %d rows, want 2", len(out))
 	}

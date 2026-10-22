@@ -9,10 +9,11 @@ import { describe, expect, it } from "vitest";
 import { mockApi } from "./mockApi";
 
 describe("mock default-jobs catalog (PRD #589)", () => {
-  it("lists the five prompt jobs with their catalog output modes", async () => {
+  it("lists the six prompt jobs with their catalog output modes", async () => {
     const { entries } = await mockApi.listScheduleCatalog();
     expect(entries.filter((entry) => entry.target === "prompt").map(({ slug, output_mode }) => [slug, output_mode]).sort()).toEqual([
       ["bug-hunt", "mr"],
+      ["ci-scout", "issues"],
       ["docs-hygiene", "mr"],
       ["feature-bingo", "issues"],
       ["refactor-scout", "issues"],
@@ -20,10 +21,10 @@ describe("mock default-jobs catalog (PRD #589)", () => {
     ]);
   });
 
-  it("lists the 11 catalog entries and seeds a visible Layout-A demo state", async () => {
+  it("lists the 12 catalog entries and seeds a visible Layout-A demo state", async () => {
     const { entries, enablements } = await mockApi.listScheduleCatalog();
     expect(entries.map((e) => e.slug).sort()).toEqual(
-      ["ci-repair", "ondeck-sweep", "assigned-sweep", "bug-hunt", "bug-triage", "docs-hygiene", "feature-bingo", "planned-sweep", "refactor-scout", "self-improve", "test-improvement"].sort(),
+      ["ci-repair", "ci-scout", "ondeck-sweep", "assigned-sweep", "bug-hunt", "bug-triage", "docs-hygiene", "feature-bingo", "planned-sweep", "refactor-scout", "self-improve", "test-improvement"].sort(),
     );
     // The assigned sweep selects by assignee, not by label, so its catalog labels stay null.
     expect(entries.find((e) => e.slug === "assigned-sweep")?.labels).toBeNull();

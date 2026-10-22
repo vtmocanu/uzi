@@ -9,7 +9,8 @@ const { API } = await import(pathToFileURL(require.resolve('typescript/unstable/
 const { SyntaxKind } = await import(pathToFileURL(require.resolve('typescript/unstable/ast')));
 const files = ['codex-launcher', 'codex-executor', 'codex-shared-dir', 'entrypoint-migration', 'git-planning-diff', 'git-retained-permissions', 'claude-command-launcher', 'claude-command-real'];
 const singleFile = 'single-uid-preflight';
-const e2eFiles = new Set(['memory-command-real', 'claude-command-real', singleFile]);
+const sharedFile = 'runner-shared-real';
+const e2eFiles = new Set(['memory-command-real', 'claude-command-real', singleFile, sharedFile]);
 const captureSuite = 'Unit2 runner source capture';
 const captureLeaves = new Set([
   'cancels while the object-store snapshot streams and leaves no temp tree',
@@ -40,6 +41,20 @@ const claudeRealLeaves = new Set([
 ]);
 const singleLeaf = 'single-uid launcher preflight matches the container posture';
 
+// Issue #3153: the runner-shared layout under real uids. One root-started container, nine literal
+// top-level leaves; none may be skipped, renamed or made nonliteral.
+const sharedLeaves = [
+  'runner-init refuses a missing, wrong or symlinked layout marker before any write',
+  'runner-init as root builds worker:runner 3775 with a worker:worker 0755 .tmp and leaves old and sibling data untouched',
+  'runner-init refuses a hostile runner-shared or .tmp symlink or file without following or re-owning anything',
+  'runner-init as the worker uid requires ownership by the current uid and fails closed on anything else',
+  'the runner, runner-cmd and dind uids cannot replace .tmp or runner-shared entries, and their groups exclude 10001',
+  'a fresh .tmp is created by the entrypoint and by ensureRunnerTmpdir in both uid modes, and a planted symlink or file is refused',
+  'per-uid scratch under a live writer: a mismatched owner is refused untouched, an expected owner is adopted with writer exclusion not established',
+  "old-layout and new-layout entrypoints overlap on one data directory without re-owning, wiping or following into each other's tree",
+  'foreign-owned run-directory content is retained, counted and logged by the production retention delete in split and single-uid modes',
+];
+
 const retainedLeaves = new Set([
   "recovers retained command-owned loose objects",
   "recovers retained command-owned packed objects",
@@ -55,7 +70,7 @@ const retainedLeaves = new Set([
 // The source AST seam lets regressions share one small parser project.
 export function inventoryForSource(source, file) {
   const planning = file === 'git-planning-diff';
-  const command = file === 'memory-command-real' || file === singleFile;
+  const command = file === 'memory-command-real' || file === singleFile || file === sharedFile;
   const claudeReal = file === 'claude-command-real';
   const retained = file === 'git-retained-permissions';
   const expected = [];
@@ -118,6 +133,12 @@ export function inventoryForSource(source, file) {
     if (!expected.some(test => test.names.length === 1 && test.names[0] === singleLeaf)) {
       throw new Error(`${file}: missing required literal single-uid proof: ${singleLeaf}`);
     }
+  } else if (file === sharedFile) {
+    for (const leaf of sharedLeaves) {
+      if (!expected.some(test => test.names.length === 1 && test.names[0] === leaf)) {
+        throw new Error(`${file}: missing required literal runner-shared proof: ${leaf}`);
+      }
+    }
   } else if (command) {
     const titles = [
       'real adopted detached tree: eligibility, identity refusal, concurrent cleanup and exact pressure failure',
@@ -140,8 +161,8 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     const snapshot = api.updateSnapshot({ openProjects: [path.join(repo, 'e2e/worker-uid/tsconfig.json')] });
     const program = snapshot.getProjects()[0].program;
     const lane = process.argv[2] ?? 'worker';
-    if (!['worker', 'command', 'single'].includes(lane)) throw new Error(`unknown lane: ${lane}`);
-    const selected = lane === 'command' ? ['memory-command-real'] : lane === 'single' ? [singleFile] : files;
+    if (!['worker', 'command', 'single', 'shared'].includes(lane)) throw new Error(`unknown lane: ${lane}`);
+    const selected = lane === 'command' ? ['memory-command-real'] : lane === 'single' ? [singleFile] : lane === 'shared' ? [sharedFile] : files;
     const expected = selected.flatMap(file => {
       const filename = path.join(repo, e2eFiles.has(file)
         ? `e2e/worker-uid/${file}.test.mts` : `agent/test/${file}.test.ts`);

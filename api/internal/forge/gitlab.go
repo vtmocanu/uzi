@@ -63,7 +63,7 @@ type gitLab struct {
 // allowlist-checked by the caller.
 func newGitLab(baseURL, token string, timeout time.Duration, backoff ...retryablehttp.Backoff) (*gitLab, error) {
 	hc := timeoutClient(timeout)
-	hc.Transport = ciRepairTransport{base: hc.Transport}
+	hc.Transport = responseLimitTransport{base: ciRepairTransport{base: hc.Transport}}
 	// Stop at an off-origin redirect instead of failing it: the SDK's retry policy
 	// re-sends a GET whose redirect check errored, five times with backoff.
 	hc.CheckRedirect = createIssueRedirectGuard(redirectguard.StopOffOrigin)
@@ -526,7 +526,15 @@ func (g *gitLab) CreateIssueNote(ctx context.Context, projectID, issueIID int64,
 }
 
 func (g *gitLab) GetMergeRequest(ctx context.Context, projectID, mrIID int64) (MergeRequest, error) {
-	mr, _, err := g.client.MergeRequests.GetMergeRequest(projectID, mrIID, nil, gitlab.WithContext(ctx))
+	// Bound the response body before the SDK decodes or classifies it (#3038).
+	// The state is per call: a lazy-path overflow is recorded here because the SDK
+	// ignores the drain's read error and folds CheckResponse's into an empty
+	// ErrorResponse.
+	state := &responseLimitState{}
+	mr, _, err := g.client.MergeRequests.GetMergeRequest(projectID, mrIID, nil, gitlab.WithContext(withResponseLimit(ctx, state)))
+	if state.overflow.Load() {
+		return MergeRequest{}, g.wrapErr("get merge request", &ResponseTooLargeError{})
+	}
 	if err != nil {
 		return MergeRequest{}, g.wrapErr("get merge request", err)
 	}
