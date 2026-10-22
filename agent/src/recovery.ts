@@ -3622,11 +3622,13 @@ export class RecoveryCoordinator {
     const passSignal = this.passSignal.getStore();
     const signal = passSignal ? maintenanceSignal(passSignal) : undefined;
     signal?.throwIfAborted();
-    const value = await (budget && !passSignal ? budget.raceIO(async () => action()) : action());
-    signal?.throwIfAborted();
-    MaintenanceBudget.current()?.check();
-    this.checkSavedMetadata();
-    return value;
+    return MaintenanceBudget.runResponseRPC(async () => {
+      const value = await (budget && !passSignal ? budget.raceIO(async () => action()) : action());
+      signal?.throwIfAborted();
+      MaintenanceBudget.current()?.check();
+      this.checkSavedMetadata();
+      return value;
+    });
   }
 
   /** Issue #3031: the one async scope in which a producer-origin record may be advanced. Exactly the

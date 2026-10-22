@@ -370,3 +370,50 @@ it("pass shutdown keeps a caller budget inherited only through Git independent",
     callerBudget.dispose();
   }
 });
+
+for (const activeBudget of [false, true]) {
+  it(`late headers after pass abort join source cleanup (active budget ${activeBudget})`, linux, async t => {
+    const f = await fixture(t);
+    const entered = deferred(), headers = deferred(), cancelling = deferred(), release = deferred();
+    let cancelled = 0, shutdownReturned = false, rpcReturned = false;
+    const paths: string[] = [];
+    const body = new ReadableStream<Uint8Array>({
+      async cancel() { cancelled++; cancelling.resolve(); await release.promise; },
+    }, { highWaterMark: 0 });
+    const client = new WorkerClient("http://fixture.invalid", token, "fixture", nullLogger(), {
+      fetch: async input => {
+        paths.push(String(input));
+        entered.resolve();
+        await headers.promise;
+        return new Response(body);
+      },
+    });
+    const record = await f.bundle();
+    const before = await fs.readFile(f.file(record), "utf8");
+    const c = coordinator(f, client);
+    const budget = activeBudget ? new MaintenanceBudget() : undefined;
+    const reserve = client.reserveRecoveryCapture.bind(client);
+    t.mock.method(client, "reserveRecoveryCapture", async (...args: Parameters<typeof reserve>) => {
+      try { return await reserve(...args); } finally { rpcReturned = true; }
+    });
+    const pass = budget ? MaintenanceBudget.run(budget, () => c.resumePending()) : c.resumePending();
+    let shutdown: Promise<void> | undefined;
+    try {
+      await within(entered.promise);
+      shutdown = c.shutdown().then(() => { shutdownReturned = true; });
+      headers.resolve();
+      await within(Promise.race([cancelling.promise, shutdown]));
+      assert.equal(shutdownReturned, false, "premature shutdown settlement before source cancellation joined");
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(rpcReturned, false, "RPC must retain its caller locks while source cancellation is pending");
+      assert.equal(shutdownReturned, false, "premature shutdown settlement during source cancellation");
+    } finally {
+      headers.resolve(); release.resolve();
+      await (shutdown ?? c.shutdown()); await pass; budget?.dispose();
+    }
+    assert.equal(cancelled, 1);
+    assert.equal(body.locked, false);
+    assert.equal(await fs.readFile(f.file(record), "utf8"), before, "uncertain reservation identity stays unchanged");
+    assert.equal(paths.length, 1, "no follow-on upload or ACK");
+  });
+}

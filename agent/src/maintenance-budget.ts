@@ -9,9 +9,16 @@ interface AttemptContext {
   pendingAbort?: AbortController;
   ownedSignal?: AbortSignal;
   ownedBudgets?: Set<MaintenanceBudget>;
+  ownedResponses?: Set<OwnedResponseCleanup>;
   /** Producer clamps retain the original observation context for late cancellation. */
   producerParent?: AttemptContext;
 }
+
+interface OwnedResponseCleanup {
+  finish(): Promise<void>;
+  joinRequested(): Promise<void>;
+}
+const rpcResponses = new AsyncLocalStorage<Set<OwnedResponseCleanup>>();
 
 const scope = new AsyncLocalStorage<AttemptContext>();
 
@@ -71,6 +78,27 @@ export class MaintenanceBudget {
   /** Owned recovery passes join transport settlement rather than racing their abort. */
   static ownedSignal(): AbortSignal | undefined { return scope.getStore()?.ownedSignal; }
 
+  /** Register at headers fulfillment, before any caller can reject the handoff. */
+  static registerOwnedResponse(cleanup: OwnedResponseCleanup): () => void {
+    const responses = scope.getStore()?.ownedResponses;
+    if (!responses) return () => {};
+    responses.add(cleanup);
+    const rpc = rpcResponses.getStore();
+    rpc?.add(cleanup);
+    return () => { responses.delete(cleanup); rpc?.delete(cleanup); };
+  }
+
+  /** Keep the mutable attempt context intact; only response membership is RPC-local. */
+  static async runResponseRPC<T>(action: () => T | Promise<T>): Promise<T> {
+    if (!this.ownedSignal()) return action();
+    const responses = new Set<OwnedResponseCleanup>();
+    try { return await rpcResponses.run(responses, action); }
+    finally {
+      // One finite snapshot; only already-requested cleanup is joined here.
+      await Promise.allSettled([...responses].map(response => response.joinRequested()));
+    }
+  }
+
   static async runOwned<T>(signal: AbortSignal, action: () => Promise<T>): Promise<T> {
     const parent = scope.getStore();
     const callerSignal = this.signal();
@@ -81,11 +109,13 @@ export class MaintenanceBudget {
     const budget = parent?.budget ? new MaintenanceBudget(parent.budget.remainingMs()) : undefined;
     if (budget) budget.inheritedBudget = () => parent?.budget;
     const context: AttemptContext & { ownedBudgets: Set<MaintenanceBudget> } = {
-      budget, ownedSignal, ownedBudgets: new Set<MaintenanceBudget>(),
+      budget, ownedSignal, ownedBudgets: new Set<MaintenanceBudget>(), ownedResponses: new Set(),
     };
     if (budget) this.linkOwnedBudget(context, budget);
     try { return await scope.run(context, action); }
     finally {
+      // One finite pass-owned snapshot; cleanup failures preserve the action's result/error.
+      await Promise.allSettled([...context.ownedResponses!].map(response => response.finish()));
       // Only this pass's relay is removed; caller-owned clocks retain their original lifetime.
       for (const budget of context.ownedBudgets) {
         for (let i = budget.inherited.length - 1; i >= 0; i--) {
@@ -109,7 +139,7 @@ export class MaintenanceBudget {
       return scope.run(context, action);
     }
     if (context) this.linkOwnedBudget(context, current);
-    return scope.run({ budget: current, ownedSignal: context?.ownedSignal, ownedBudgets: context?.ownedBudgets }, action);
+    return scope.run({ budget: current, ownedSignal: context?.ownedSignal, ownedBudgets: context?.ownedBudgets, ownedResponses: context?.ownedResponses }, action);
   }
 
   /**
@@ -133,7 +163,7 @@ export class MaintenanceBudget {
     }
     try {
       child.check();
-      return await scope.run({ budget: child, identity: parent?.identity, producerParent: parent, ownedSignal: parent?.ownedSignal, ownedBudgets: parent?.ownedBudgets }, async () => {
+      return await scope.run({ budget: child, identity: parent?.identity, producerParent: parent, ownedSignal: parent?.ownedSignal, ownedBudgets: parent?.ownedBudgets, ownedResponses: parent?.ownedResponses }, async () => {
         const result = await action(child);
         child.check();
         return result;
@@ -163,7 +193,7 @@ export class MaintenanceBudget {
       parent.budget?.check();
       return action();
     }
-    return scope.run({ identity, factory, pendingAbort: new AbortController(), ownedSignal: parent?.ownedSignal, ownedBudgets: parent?.ownedBudgets }, action);
+    return scope.run({ identity, factory, pendingAbort: new AbortController(), ownedSignal: parent?.ownedSignal, ownedBudgets: parent?.ownedBudgets, ownedResponses: parent?.ownedResponses }, action);
   }
 
   /** Observation constrains time only; it grants no custody authority. */

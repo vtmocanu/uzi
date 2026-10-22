@@ -1236,7 +1236,8 @@ export class WorkerClient {
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/interrupted-calls?claim_generation=${generation}`;
     const res = await this.fetchRaw("GET", path, undefined, this.interruptedCallsTimeoutMs, deadline, { "X-Worker-Register-Nonce": identity.nonce });
     if (res.status !== 200) {
-      void res.body?.cancel().catch(() => undefined);
+      if (ownedResponses.has(res)) await discardResponse(res);
+      else void res.body?.cancel().catch(() => undefined);
       return;
     }
     const bytes = await readBoundedBytes(res, 16 * 1024, true, deadline);
@@ -1778,7 +1779,8 @@ export class WorkerClient {
       if (res.status >= 400) throw await this.toError("POST", path, res);
       const marker = res.headers.get("X-Uzi-Claim-Kind");
       if (marker !== null && marker !== "cross_check") {
-        await res.body?.cancel();
+        if (ownedResponses.has(res)) await discardResponse(res);
+        else await res.body?.cancel();
         throw new Error("unknown dedicated claim marker");
       }
       // Dedicated requests are bounded even without a marker; unmarked ordinary
@@ -2563,7 +2565,8 @@ export class WorkerClient {
     const res = await maintenanceFetch(fetch, this.baseUrl + path, init);
     if (res.status < 200 || res.status >= 300) {
       // Discard remote content without exposing it or changing the HTTP outcome.
-      if (MaintenanceBudget.current()) void res.body?.cancel().catch(() => undefined);
+      if (ownedResponses.has(res)) await discardResponse(res);
+      else if (MaintenanceBudget.current()) void res.body?.cancel().catch(() => undefined);
       else await res.body?.cancel().catch(() => undefined);
       MaintenanceBudget.current()?.check();
       return { ok: false, httpStatus: res.status };
@@ -2994,8 +2997,9 @@ export class WorkerClient {
         const res = await this.fetchRaw("GET", path, undefined, this.httpTimeoutMs, signal);
         // Do not retain or interpret error bodies (including an old API's 404).
         if (res.status !== 200) {
-          // Best effort: a stalled cancellation must not delay refusal (#2888).
-          void res.body?.cancel().catch(() => undefined);
+          // Owned refusal joins its source; other callers retain best-effort cleanup (#2888).
+          if (ownedResponses.has(res)) await discardResponse(res);
+          else void res.body?.cancel().catch(() => undefined);
           throw new Error("maintenance observation unavailable");
         }
         return JSON.parse(await readBoundedText(res, COMPLETION_HOLDS_MAX_BYTES, true, signal));
@@ -4214,7 +4218,10 @@ export class WorkerClient {
     const res = await this.fetchRaw("POST", path, body, timeoutMs, callerSignal);
     if (res.status >= 400) throw await this.toError("POST", path, res);
     MaintenanceBudget.current()?.check();
-    if (res.status === 204) return undefined;
+    if (res.status === 204) {
+      if (ownedResponses.has(res)) await discardResponse(res);
+      return undefined;
+    }
     const text = maxResponseBytes === undefined ? await readResponseText(res) :
       await readCrossCheckText(res, maxResponseBytes, fenceResponseAbort ? callerSignal : undefined, semanticContext);
     MaintenanceBudget.current()?.check();
@@ -4475,6 +4482,49 @@ export class WorkerClient {
 
 // Signals live as long as the response body, so headers do not renew an operation's cap.
 const responseSignals = new WeakMap<Response, AbortSignal>();
+// A response keeps its first cancellation promise even after its reader is adopted.
+interface OwnedResponse {
+  adopt(reader: ReadableStreamDefaultReader<Uint8Array> | ReadableStreamBYOBReader): void;
+  cancel(reason?: unknown): Promise<void>;
+  finish(): Promise<void>;
+}
+const ownedResponses = new WeakMap<Response, OwnedResponse>();
+
+function ownResponse(res: Response, signal: AbortSignal | null | undefined): void {
+  if (!MaintenanceBudget.ownedSignal()) return;
+  let target: { cancel(reason?: unknown): Promise<void> } | null = res.body;
+  let reader: ReadableStreamDefaultReader<Uint8Array> | ReadableStreamBYOBReader | undefined;
+  let cancellation: Promise<void> | undefined;
+  const cancel = (reason?: unknown): Promise<void> => {
+    // Install the promise before invoking a source that can synchronously reenter abort.
+    cancellation ??= Promise.resolve().then(() => target?.cancel(reason)).then(() => undefined, () => undefined);
+    return cancellation;
+  };
+  const abort = () => { void cancel(signal?.reason); };
+  let unregister = () => {};
+  const finish = async () => {
+    await cancel();
+    try { reader?.releaseLock(); } catch { /* cleanup cannot replace the RPC outcome */ }
+    signal?.removeEventListener("abort", abort);
+    unregister();
+  };
+  const record = {
+    adopt(value: ReadableStreamDefaultReader<Uint8Array> | ReadableStreamBYOBReader) { reader = value; target = value; },
+    cancel, finish,
+    async joinRequested() { if (cancellation) await finish(); },
+  };
+  ownedResponses.set(res, record);
+  unregister = MaintenanceBudget.registerOwnedResponse(record);
+  signal?.addEventListener("abort", abort, { once: true });
+  if (signal?.aborted) abort();
+}
+
+async function discardResponse(res: Response): Promise<void> {
+  const owned = ownedResponses.get(res);
+  if (owned) await owned.finish();
+  else void res.body?.cancel().catch(() => undefined);
+}
+
 // Bound actual bytes for default maintenance responses; individual RPCs may be stricter.
 const MAINTENANCE_RESPONSE_MAX_BYTES = 1024 * 1024;
 
@@ -4499,6 +4549,11 @@ async function maintenanceFetch(transport: typeof fetch, url: string, init: Requ
     init.signal?.throwIfAborted();
     const res = await transport(url, init);
     if (init.signal) responseSignals.set(res, init.signal);
+    ownResponse(res, init.signal);
+    if (MaintenanceBudget.ownedSignal()) {
+      try { budget?.check(); init.signal?.throwIfAborted(); }
+      catch (error) { await ownedResponses.get(res)?.finish(); throw error; }
+    }
     return res;
   }
   budget.check();
@@ -4517,13 +4572,19 @@ async function maintenanceFetch(transport: typeof fetch, url: string, init: Requ
 }
 
 async function readResponseText(res: Response): Promise<string> {
-  const budget = MaintenanceBudget.current();
-  if (!budget && !MaintenanceResources.active() && !MaintenanceBudget.ownedSignal()) return res.text();
-  budget?.check();
-  const text = await readBoundedText(res, MAINTENANCE_RESPONSE_MAX_BYTES, true);
-  budget?.check();
-  responseSignals.get(res)?.throwIfAborted();
-  return text;
+  try {
+    const budget = MaintenanceBudget.current();
+    if (!budget && !MaintenanceResources.active() && !MaintenanceBudget.ownedSignal()) return res.text();
+    budget?.check();
+    const text = await readBoundedText(res, MAINTENANCE_RESPONSE_MAX_BYTES, true);
+    budget?.check();
+    responseSignals.get(res)?.throwIfAborted();
+    return text;
+  } catch (error) {
+    const owned = ownedResponses.get(res);
+    if (owned) await owned.finish();
+    throw error;
+  }
 }
 
 /** A `Retry-After` header of whole seconds as milliseconds (capped at one hour); anything else
@@ -4603,7 +4664,8 @@ async function readCrossCheckText(res: Response, maxBytes: number, signal?: Abor
   semanticContext?: { generation: number; round: number } | "claim"): Promise<string> {
   const marker = res.headers.get("X-Uzi-Candidate-Identity-Version");
   if (marker !== null && (marker !== "semantic_v1" || !semanticContext)) {
-    void res.body?.cancel().catch(() => undefined);
+    if (ownedResponses.has(res)) await discardResponse(res);
+    else void res.body?.cancel().catch(() => undefined);
     throw new Error("invalid cross-check candidate identity marker");
   }
   const raw = await readBoundedBytes(res, marker === "semantic_v1" ? SEMANTIC_ENVELOPE_MAX_BYTES : maxBytes, true, signal);
@@ -4634,78 +4696,89 @@ async function readCrossCheckText(res: Response, maxBytes: number, signal?: Abor
 
 /** The raw-byte core of {@link readBoundedText}; same bounds and failure behaviour. */
 async function readBoundedBytes(res: Response, maxBytes: number, rejectOverflow = false, signal?: AbortSignal): Promise<Buffer> {
-  const budget = MaintenanceBudget.current();
-  budget?.check();
-  const responseSignal = responseSignals.get(res);
-  const ownedSignal = MaintenanceBudget.ownedSignal();
-  if (ownedSignal) signal = AbortSignal.any([ownedSignal, ...(signal ? [signal] : []), ...(responseSignal ? [responseSignal] : [])]);
-  const resourceSignal = MaintenanceResources.signalIfActive();
-  if (resourceSignal) signal = AbortSignal.any([resourceSignal, ...(signal ? [signal] : []), ...(responseSignal ? [responseSignal] : [])]);
-  if (budget) signal = AbortSignal.any([budget.signal, ...(signal ? [signal] : []), ...(responseSignal ? [responseSignal] : [])]);
-  const scoped = MaintenanceResources.active();
-  if (scoped) MaintenanceResources.checkIfActive();
-  if (!res.body) return Buffer.alloc(0);
-  const parts: Uint8Array[] = [];
-  let total = 0;
-  let reader: ReadableStreamDefaultReader<Uint8Array> | ReadableStreamBYOBReader;
-  let read: () => Promise<ReadableStreamReadResult<Uint8Array>>;
-  if (scoped) {
-    let boundedReader: ReadableStreamBYOBReader;
-    try {
-      boundedReader = res.body.getReader({ mode: "byob" });
-    } catch (error) {
-      // Unsupported producers cannot bypass reservation with a default reader.
-      const cancellation = res.body.cancel().catch(() => undefined);
-      if (ownedSignal) await cancellation;
-      throw error;
-    }
-    reader = boundedReader;
-    read = () => {
-      // Reserve the entire pull before allocation/read; EOF and short reads never refund.
-      // A fresh buffer is required even after EOF: BYOB transfers detach supplied buffers.
-      const size = Math.min(64 * 1024, Math.max(1, maxBytes - total));
-      MaintenanceResources.consumeIfActive("metadataBytes", size);
-      return boundedReader.read(new Uint8Array(size));
-    };
-  } else {
-    const defaultReader = res.body.getReader();
-    reader = defaultReader;
-    read = () => defaultReader.read();
-  }
-  let cancellation: Promise<void> | undefined;
-  const cancel = (reason?: unknown): Promise<void> =>
-    cancellation ??= reader.cancel(reason).catch(() => undefined);
-  const abort = () => { void cancel(signal?.reason); };
-  signal?.addEventListener("abort", abort, { once: true });
   try {
-    signal?.throwIfAborted();
-    while (total < maxBytes || rejectOverflow) {
-      signal?.throwIfAborted();
-      const { done, value } = await (budget && !MaintenanceBudget.ownedSignal() ? budget.raceIO(read, undefined, signal) : read());
-      budget?.check();
-      signal?.throwIfAborted();
-      if (scoped) MaintenanceResources.checkIfActive();
-      if (done) break;
-      if (rejectOverflow && value.byteLength > maxBytes - total) {
-        throw new ResponseBodyOverflowError(maxBytes);
+    const budget = MaintenanceBudget.current();
+    budget?.check();
+    const responseSignal = responseSignals.get(res);
+    const ownedSignal = MaintenanceBudget.ownedSignal();
+    if (ownedSignal) signal = AbortSignal.any([ownedSignal, ...(signal ? [signal] : []), ...(responseSignal ? [responseSignal] : [])]);
+    const resourceSignal = MaintenanceResources.signalIfActive();
+    if (resourceSignal) signal = AbortSignal.any([resourceSignal, ...(signal ? [signal] : []), ...(responseSignal ? [responseSignal] : [])]);
+    if (budget) signal = AbortSignal.any([budget.signal, ...(signal ? [signal] : []), ...(responseSignal ? [responseSignal] : [])]);
+    const scoped = MaintenanceResources.active();
+    if (scoped) MaintenanceResources.checkIfActive();
+    if (!res.body) return Buffer.alloc(0);
+    const parts: Uint8Array[] = [];
+    let total = 0;
+    let reader: ReadableStreamDefaultReader<Uint8Array> | ReadableStreamBYOBReader;
+    let read: () => Promise<ReadableStreamReadResult<Uint8Array>>;
+    if (scoped) {
+      let boundedReader: ReadableStreamBYOBReader;
+      try {
+        boundedReader = res.body.getReader({ mode: "byob" });
+      } catch (error) {
+        // Unsupported producers cannot bypass reservation with a default reader.
+        const cancellation = ownedResponses.get(res)?.finish() ?? res.body.cancel().catch(() => undefined);
+        if (ownedSignal) await cancellation;
+        throw error;
       }
-      parts.push(value.length > maxBytes - total ? value.subarray(0, maxBytes - total) : value);
-      total += parts[parts.length - 1]!.length;
+      reader = boundedReader;
+      read = () => {
+        // Reserve the entire pull before allocation/read; EOF and short reads never refund.
+        // A fresh buffer is required even after EOF: BYOB transfers detach supplied buffers.
+        const size = Math.min(64 * 1024, Math.max(1, maxBytes - total));
+        MaintenanceResources.consumeIfActive("metadataBytes", size);
+        return boundedReader.read(new Uint8Array(size));
+      };
+    } else {
+      const defaultReader = res.body.getReader();
+      reader = defaultReader;
+      read = () => defaultReader.read();
     }
-  } finally {
-    signal?.removeEventListener("abort", abort);
-    // Release the connection whether the body ended, hit the cap, or failed (a no-op once ended).
-    // Owned recovery passes join cancellation. Other callers keep the best-effort
-    // cancellation semantics of readBoundedBytes (#2888).
-    if (ownedSignal) await cancel();
-    else void cancel();
+    const owned = ownedResponses.get(res);
+    owned?.adopt(reader);
+    let cancellation: Promise<void> | undefined;
+    const cancel = (reason?: unknown): Promise<void> =>
+      owned?.cancel(reason) ?? (cancellation ??= reader.cancel(reason).catch(() => undefined));
+    const abort = () => { void cancel(signal?.reason); };
+    signal?.addEventListener("abort", abort, { once: true });
+    try {
+      signal?.throwIfAborted();
+      while (total < maxBytes || rejectOverflow) {
+        signal?.throwIfAborted();
+        const { done, value } = await (budget && !MaintenanceBudget.ownedSignal() ? budget.raceIO(read, undefined, signal) : read());
+        budget?.check();
+        signal?.throwIfAborted();
+        if (scoped) MaintenanceResources.checkIfActive();
+        if (done) break;
+        if (rejectOverflow && value.byteLength > maxBytes - total) {
+          throw new ResponseBodyOverflowError(maxBytes);
+        }
+        parts.push(value.length > maxBytes - total ? value.subarray(0, maxBytes - total) : value);
+        total += parts[parts.length - 1]!.length;
+      }
+    } finally {
+      signal?.removeEventListener("abort", abort);
+      // Release the connection whether the body ended, hit the cap, or failed (a no-op once ended).
+      // Owned recovery passes join cancellation. Other callers keep the best-effort
+      // cancellation semantics of readBoundedBytes (#2888).
+      if (owned) await owned.finish();
+      else if (ownedSignal) {
+        await cancel();
+        try { reader.releaseLock(); } catch { /* best effort */ }
+      } else void cancel();
+    }
+    budget?.check();
+    if (scoped) {
+      MaintenanceResources.checkIfActive();
+      signal?.throwIfAborted();
+    }
+    return Buffer.concat(parts);
+  } catch (error) {
+    const owned = ownedResponses.get(res);
+    if (owned) await owned.finish();
+    throw error;
   }
-  budget?.check();
-  if (scoped) {
-    MaintenanceResources.checkIfActive();
-    signal?.throwIfAborted();
-  }
-  return Buffer.concat(parts);
 }
 
 /**
@@ -5118,31 +5191,42 @@ function terminalObject(value: unknown): Record<string, unknown> {
  * Each read is deadline/abort bound; EOF or 128 KiB+1 observed bytes ends the loop.
  * Oversize and HTTP errors never use Response.text or retain raw error bodies. */
 async function readTerminalRejectionBody(res: Response, signal: AbortSignal): Promise<string> {
-  if (!res.body) throw terminalResponseError();
-  const reader = res.body.getReader();
-  const parts: Uint8Array[] = [];
-  let total = 0;
-  const onAbort = () => { void reader.cancel().catch(() => undefined); };
-  signal.addEventListener("abort", onAbort, { once: true });
   try {
-    while (true) {
-      signal.throwIfAborted();
-      const { done, value } = await reader.read();
-      signal.throwIfAborted();
-      if (done) break;
-      if (!value.byteLength) continue;
-      if (value.byteLength > TERMINAL_REJECTION_RESPONSE_MAX_BYTES - total) throw terminalResponseError();
-      total += value.byteLength;
-      parts.push(value);
+    if (!res.body) throw terminalResponseError();
+    const reader = res.body.getReader();
+    const parts: Uint8Array[] = [];
+    let total = 0;
+    const owned = ownedResponses.get(res);
+    owned?.adopt(reader);
+    const cancel = () => owned?.cancel() ?? reader.cancel().catch(() => undefined);
+    const onAbort = () => { void cancel(); };
+    signal.addEventListener("abort", onAbort, { once: true });
+    try {
+      while (true) {
+        signal.throwIfAborted();
+        const { done, value } = await reader.read();
+        signal.throwIfAborted();
+        if (done) break;
+        if (!value.byteLength) continue;
+        if (value.byteLength > TERMINAL_REJECTION_RESPONSE_MAX_BYTES - total) throw terminalResponseError();
+        total += value.byteLength;
+        parts.push(value);
+      }
+      return new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(parts, total));
+    } catch (err) {
+      // Owned responses join the cached cancellation; other callers keep best-effort cleanup.
+      if (owned) await owned.finish();
+      else void cancel();
+      throw err;
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+      if (owned) await owned.finish();
+      else reader.releaseLock();
     }
-    return new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(parts, total));
-  } catch (err) {
-    // One best-effort cancellation; a stalled cancellation promise cannot extend the deadline.
-    void reader.cancel().catch(() => undefined);
-    throw err;
-  } finally {
-    signal.removeEventListener("abort", onAbort);
-    reader.releaseLock();
+  } catch (error) {
+    const owned = ownedResponses.get(res);
+    if (owned) await owned.finish();
+    throw error;
   }
 }
 
