@@ -8,6 +8,9 @@
   "sources": {
     "x": "x"
   },
+  "defaults": {
+    "x": "x"
+  },
   "slack_status": "x",
   "oidc_status": "x",
   "oidc_provider_name": "x"

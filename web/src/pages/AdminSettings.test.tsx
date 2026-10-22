@@ -9,6 +9,7 @@ import { healthySilentDoc } from "../mocks/data/health";
 import { DockerAllowlistCard } from "./adminSettings/DockerAllowlistCard";
 import { api, ApiError } from "../lib/api";
 import { setDemoMode } from "../lib/demoMode";
+import { CODEX_CURATED_MODELS } from "../lib/codexModels";
 
 // Only the api object is swapped; ApiError and types stay real so the page's
 // `instanceof ApiError` checks match what the mocked methods throw.
@@ -54,6 +55,8 @@ const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
   public_base_url: "http://127.0.0.1:8080",
   judge_enabled: "false",
   judge_model: "opus",
+  // The server reports the built-in as the effective value of an unset key (source "default").
+  codex_judge_model: "gpt-6.1-sol",
   judge_enforce_all: "false",
   judge_cooldown_seconds: "60",
   judge_daily_budget: "0",
@@ -114,8 +117,11 @@ const response = (
     public_base_url: "default",
     slack_bot_token: "default",
     slack_app_token: "default",
+    judge_model: "default",
+    codex_judge_model: "default",
     ...sources,
   } as Record<string, Src>,
+  defaults: { judge_model: "opus", codex_judge_model: "gpt-6.1-sol" },
   slack_status,
 });
 
@@ -660,19 +666,21 @@ describe("AdminSettings — run judge (PRD #46)", () => {
   });
 
   it("loads the current global toggle and judge model", async () => {
-    mockApi.getSettings.mockResolvedValue(response({ judge_enabled: "true", judge_model: "sonnet" }));
+    mockApi.getSettings.mockResolvedValue(
+      response({ judge_enabled: "true", judge_model: "sonnet" }, {}, { judge_model: "db" }),
+    );
     renderPage();
     const toggle = (await screen.findByLabelText(/Enable the run judge for this instance/i)) as HTMLInputElement;
     expect(toggle.checked).toBe(true);
-    expect((screen.getByLabelText("Judge model") as HTMLInputElement).value).toBe("sonnet");
+    expect((screen.getByLabelText("Claude judge model") as HTMLSelectElement).value).toBe("sonnet");
   });
 
   it("saves the global toggle and judge model together", async () => {
-    mockApi.updateSettings.mockResolvedValue(response({ judge_enabled: "true", judge_model: "opus" }));
+    mockApi.updateSettings.mockResolvedValue(response({ judge_enabled: "true", judge_model: "haiku" }));
     renderPage();
     await screen.findByLabelText(/Enable the run judge for this instance/i);
     fireEvent.click(screen.getByLabelText(/Enable the run judge for this instance/i));
-    fireEvent.change(screen.getByLabelText("Judge model"), { target: { value: "opus" } });
+    fireEvent.change(screen.getByLabelText("Claude judge model"), { target: { value: "haiku" } });
 
     const btn = screen.getByRole("button", { name: /save run judge settings/i }) as HTMLButtonElement;
     expect(btn.disabled).toBe(false);
@@ -681,7 +689,7 @@ describe("AdminSettings — run judge (PRD #46)", () => {
     await waitFor(() =>
       expect(mockApi.updateSettings).toHaveBeenCalledWith({
         judge_enabled: "true",
-        judge_model: "opus",
+        judge_model: "haiku",
         // enforce-all stays off (fixture default), the spend guards keep their loaded
         // values (PRD #69 M4/M5): the card sends the whole judge group on one save.
         judge_enforce_all: "false",
@@ -709,13 +717,171 @@ describe("AdminSettings — run judge (PRD #46)", () => {
     );
   });
 
-  it("blocks an empty judge model client-side without calling the API", async () => {
+  it("renders Default selected when the judge model follows the built-in", async () => {
     renderPage();
-    await screen.findByLabelText("Judge model");
-    fireEvent.change(screen.getByLabelText("Judge model"), { target: { value: "  " } });
+    const select = (await screen.findByLabelText("Claude judge model")) as HTMLSelectElement;
+    expect(select.value).toBe("inherit");
+    expect(select.options[select.selectedIndex].textContent).toBe("Default \u00b7 opus (built-in)");
+    // The Codex lane follows its source, not its (non-empty) effective value.
+    const codex = (await screen.findByLabelText("Codex judge model")) as HTMLSelectElement;
+    expect(codex.value).toBe("inherit");
+    expect(codex.options[codex.selectedIndex].textContent).toBe("Default \u00b7 gpt-6.1-sol (built-in)");
+    expect(screen.getAllByText("Follows the built-in model.")).toHaveLength(2);
+  });
+
+  it("resets to the built-in by sending an empty judge model", async () => {
+    mockApi.updateSettings.mockResolvedValue(response({}));
+    mockApi.getSettings.mockResolvedValue(response({ judge_model: "haiku" }, {}, { judge_model: "db" }));
+    renderPage();
+    const select = (await screen.findByLabelText("Claude judge model")) as HTMLSelectElement;
+    expect(select.value).toBe("haiku");
+    fireEvent.change(select, { target: { value: "inherit" } });
     fireEvent.click(screen.getByRole("button", { name: /save run judge settings/i }));
-    expect(await screen.findByText(/judge model must not be empty/i)).toBeTruthy();
+    await waitFor(() =>
+      expect(mockApi.updateSettings).toHaveBeenCalledWith(expect.objectContaining({ judge_model: "" })),
+    );
+  });
+
+  it("leaves the judge model out of the save when it did not change", async () => {
+    mockApi.updateSettings.mockResolvedValue(response({ judge_enabled: "true" }));
+    renderPage();
+    await screen.findByLabelText("Claude judge model");
+    fireEvent.click(screen.getByLabelText(/Enable the run judge for this instance/i));
+    fireEvent.click(screen.getByRole("button", { name: /save run judge settings/i }));
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalled());
+    expect(mockApi.updateSettings.mock.calls[0][0]).not.toHaveProperty("judge_model");
+  });
+
+  it("does not show the raw judge key names in the help text", async () => {
+    const { container } = renderPage();
+    await screen.findByLabelText("Claude judge model");
+    // Positive control: the help text this guards is rendered.
+    expect(container.textContent ?? "").toContain("each harness has its own judge model");
+    expect(container.textContent ?? "").not.toContain("judge_model");
+  });
+
+  it("says each judge spends the credential of the run's provider", async () => {
+    const { container } = renderPage();
+    await screen.findByLabelText("Codex judge model");
+    const text = container.textContent ?? "";
+    expect(text).toContain("that user\u2019s own credential for the run\u2019s provider (Anthropic or Codex)");
+    expect(text).toContain("that user\u2019s own credential for the run\u2019s harness (Anthropic or Codex)");
+  });
+
+  // PRD #3245 D8: no hard-coded built-in when the server sends no defaults.
+  it("labels the reset neutrally when the server sends no defaults", async () => {
+    mockApi.getSettings.mockResolvedValue({ ...response({}), defaults: undefined });
+    renderPage();
+    const claude = (await screen.findByLabelText("Claude judge model")) as HTMLSelectElement;
+    const codex = screen.getByLabelText("Codex judge model") as HTMLSelectElement;
+    expect(claude.options[claude.selectedIndex].textContent).toBe("Default (built-in)");
+    expect(codex.options[codex.selectedIndex].textContent).toBe("Default (built-in)");
+  });
+
+  it("refuses to save an empty custom Claude judge model instead of resetting it", async () => {
+    mockApi.getSettings.mockResolvedValue(response({ judge_model: "haiku" }, {}, { judge_model: "db" }));
+    renderPage();
+    const select = (await screen.findByLabelText("Claude judge model")) as HTMLSelectElement;
+    expect(select.value).toBe("haiku");
+    fireEvent.change(select, { target: { value: "custom" } });
+    const btn = screen.getByRole("button", { name: /save run judge settings/i }) as HTMLButtonElement;
+    expect(screen.getByText("Enter a model ID, or choose Default.").getAttribute("role")).toBe("alert");
+    expect(btn.disabled).toBe(true);
+    fireEvent.submit(btn.closest("form")!);
     expect(mockApi.updateSettings).not.toHaveBeenCalled();
+    // A filled ID clears the refusal (the positive half above proves the query) and saves.
+    mockApi.updateSettings.mockResolvedValue(response({ judge_model: "claude-opus-4-8" }, {}, { judge_model: "db" }));
+    fireEvent.change(screen.getByLabelText("Custom Claude judge model ID"), { target: { value: "claude-opus-4-8" } });
+    expect(screen.queryByText("Enter a model ID, or choose Default.")).toBeNull();
+    fireEvent.click(btn);
+    await waitFor(() =>
+      expect(mockApi.updateSettings).toHaveBeenCalledWith(expect.objectContaining({ judge_model: "claude-opus-4-8" })),
+    );
+  });
+
+  // gpt-6-luna is a Codex role model but not a curated one, so it pins the warning to
+  // the role set (CODEX_ROLE_MODELS), not the curated picker list.
+  it.each(["gpt-6-sol", "gpt-6-luna"])("warns when the stored instance Claude judge model is a Codex id (%s, AC5)", async (id) => {
+    mockApi.getSettings.mockResolvedValue(response({ judge_model: id }, {}, { judge_model: "db" }));
+    renderPage();
+    const select = (await screen.findByLabelText("Claude judge model")) as HTMLSelectElement;
+    expect(select.value).toBe("custom");
+    const warning = screen.getByText(
+      "Not a Claude model: Claude judges use the built-in opus. Choose Default to clear it.",
+    );
+    expect(warning.getAttribute("role")).toBe("status");
+    // Choosing Default (the remedy) takes the warning away before the save.
+    fireEvent.change(select, { target: { value: "inherit" } });
+    expect(
+      screen.queryByText("Not a Claude model: Claude judges use the built-in opus. Choose Default to clear it."),
+    ).toBeNull();
+  });
+});
+
+describe("AdminSettings — Codex judge model (PRD #3245)", () => {
+  const codexSelect = () => screen.findByLabelText("Codex judge model") as Promise<HTMLSelectElement>;
+  const saveBtn = () => screen.getByRole("button", { name: /save run judge settings/i }) as HTMLButtonElement;
+
+  it("renders Default selected, labelled with the built-in, when the source is default", async () => {
+    renderPage();
+    const select = await codexSelect();
+    expect(select.value).toBe("inherit");
+    expect(select.options[select.selectedIndex].textContent).toBe("Default \u00b7 gpt-6.1-sol (built-in)");
+    // Curated only: the four curated models and no custom escape hatch.
+    expect(Array.from(select.options).map((o) => o.value)).toEqual(["inherit", ...CODEX_CURATED_MODELS]);
+  });
+
+  it("shows a stored value as selected", async () => {
+    mockApi.getSettings.mockResolvedValue(
+      response({ codex_judge_model: "gpt-6-sol" }, {}, { codex_judge_model: "db" }),
+    );
+    renderPage();
+    expect((await codexSelect()).value).toBe("gpt-6-sol");
+  });
+
+  it("sends the changed Codex value", async () => {
+    mockApi.updateSettings.mockResolvedValue(
+      response({ codex_judge_model: "gpt-6-astra" }, {}, { codex_judge_model: "db" }),
+    );
+    renderPage();
+    fireEvent.change(await codexSelect(), { target: { value: "gpt-6-astra" } });
+    fireEvent.click(saveBtn());
+    await waitFor(() =>
+      expect(mockApi.updateSettings).toHaveBeenCalledWith(expect.objectContaining({ codex_judge_model: "gpt-6-astra" })),
+    );
+    expect(mockApi.updateSettings.mock.calls[0][0]).not.toHaveProperty("judge_model");
+  });
+
+  it("choosing Default sends an empty value (the reset)", async () => {
+    mockApi.getSettings.mockResolvedValue(
+      response({ codex_judge_model: "gpt-6-sol" }, {}, { codex_judge_model: "db" }),
+    );
+    mockApi.updateSettings.mockResolvedValue(response({}));
+    renderPage();
+    const select = await codexSelect();
+    expect(select.value).toBe("gpt-6-sol");
+    fireEvent.change(select, { target: { value: "inherit" } });
+    fireEvent.click(saveBtn());
+    await waitFor(() =>
+      expect(mockApi.updateSettings).toHaveBeenCalledWith(expect.objectContaining({ codex_judge_model: "" })),
+    );
+    // After the save the response's default source selects Default again.
+    await waitFor(() => expect((screen.getByLabelText("Codex judge model") as HTMLSelectElement).value).toBe("inherit"));
+  });
+
+  it("leaves an unchanged Codex value out of the save", async () => {
+    mockApi.getSettings.mockResolvedValue(
+      response({ codex_judge_model: "gpt-6-sol" }, {}, { codex_judge_model: "db" }),
+    );
+    mockApi.updateSettings.mockResolvedValue(response({ judge_enabled: "true", codex_judge_model: "gpt-6-sol" }, {}, { codex_judge_model: "db" }));
+    renderPage();
+    await codexSelect();
+    fireEvent.click(screen.getByLabelText(/Enable the run judge for this instance/i));
+    fireEvent.click(saveBtn());
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalled());
+    // Positive half: the save did go out, carrying the toggle.
+    expect(mockApi.updateSettings.mock.calls[0][0]).toMatchObject({ judge_enabled: "true" });
+    expect(mockApi.updateSettings.mock.calls[0][0]).not.toHaveProperty("codex_judge_model");
   });
 });
 

@@ -123,6 +123,8 @@ export function AdminSettings() {
   // card for its "configured ✓" and env-greying behavior.
   const [secrets, setSecrets] = useState<Record<string, boolean>>({});
   const [sources, setSources] = useState<Record<string, SettingSource>>({});
+  // Compiled-in defaults of every non-secret key (PRD #3245), for "Default · <built-in>" labels.
+  const [defaults, setDefaults] = useState<Record<string, string>>({});
   // Live Slack socket state for the status chip (PRD #25 M2), polled separately
   // so it updates without clobbering in-progress form edits.
   const [slackStatus, setSlackStatus] = useState("disabled");
@@ -155,6 +157,7 @@ export function AdminSettings() {
     setSaved(settings);
     setSecrets(sec ?? {});
     setSources(src ?? {});
+    setDefaults(resp.defaults ?? {});
     setSlackStatus(resp.slack_status ?? "disabled");
     setOidcStatus(resp.oidc_status ?? "disabled");
     setOidcProviderName(resp.oidc_provider_name || "SSO");
@@ -452,7 +455,7 @@ export function AdminSettings() {
 
       {!loading && saved && (
         <section id="run-judge" className="scroll-mt-6">
-          <JudgeSettingsCard settings={saved} onSaved={applyResponse} />
+          <JudgeSettingsCard settings={saved} sources={sources} defaults={defaults} onSaved={applyResponse} />
         </section>
       )}
 

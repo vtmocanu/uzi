@@ -138,6 +138,7 @@ import { SummaryRunner, type PlanSummaryResult } from "./summary-runner.js";
 import { resolvePrdInput, type PrdInput } from "./prd-link.js";
 import {
   STALL_LIMIT,
+  CompletionHistory,
   REASON_COMPLETION_NO_PROGRESS,
   REASON_COMPLETION_LEAD_REQUESTED,
   REASON_COMPLETION_BUDGET_EXHAUSTED,
@@ -2978,6 +2979,7 @@ export class SdkExecutor implements Executor {
       // route to the hold. completionHeld latches the reason when the run entered the hold, so it
       // survives the `break` into the ExecutorResult (like pausedAt/scopeCapped).
       let completionAttempted = false;
+      const history = new CompletionHistory();
       let completionStallStreak = 0;
       let lastCompletionFingerprint: string | undefined;
       let completionHeld: { reason: string } | undefined;
@@ -2987,6 +2989,26 @@ export class SdkExecutor implements Executor {
       // the runner reads it in phasePublish to SKIP finalize (the wall seam already parked the run or
       // left it non-terminal, and the finally preserves clone + HOME).
       let walled: { reason: string } | undefined;
+      const stopAtWall = async (reason = REASON_WALL): Promise<boolean> => {
+        if (!ctx.completionInterlock || !(completionAttempted || history.priorAttempt)) return false;
+        if (await this.routeSummaryHold(ctx, reason, true, { allowDegradedCapture: true }))
+          completionHeld = { reason };
+        else walled = { reason };
+        return true;
+      };
+      const parkWall = async (at: { completedCount: number; total?: number }): Promise<WallParkOutcome | "stopped" | undefined> => {
+        const outcome = await this.parkForWall(ctx, at);
+        // A settled or undeliverable sink already owns the nonterminal stop, as in Codex.
+        if (outcome === "parked" || outcome === "undeliverable") return outcome;
+        if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+        if (outcome === "refused") {
+          const refresh = ctx.takeWallParkRefresh?.();
+          history.observe(refresh?.completionAttempts);
+          if (await stopAtWall()) return "stopped";
+
+        }
+        return outcome;
+      };
       // Hoisted: `turn` is declared INSIDE the loop, so the return below cannot see
       // it and the terminating turn's declaration would be discarded by `break`.
       let declaredPrdPath: string | undefined;
@@ -3080,6 +3102,7 @@ export class SdkExecutor implements Executor {
         const served = finalizing ? undefined : await ctx.reportIteration?.(iteration, latestProgress);
         this.throwIfTerminal(ctx);
         if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+        history.observe(served?.completionAttempts);
         const boundaryCap = isIssueRun ? scopeCapAtBoundary({
           served, frozen: frozenMilestones ?? ctx.frozenMilestones,
         }) : undefined;
@@ -3158,7 +3181,9 @@ export class SdkExecutor implements Executor {
           // PRD #1809 D4: a worker-local `disk` stop is never an owner pause park.
           throwIfDiskStop(ctx);
           if (ctx.pauseModeRequested?.() === "wall") {
-            const outcome = await this.parkForWall(ctx, at);
+            if (await stopAtWall()) break;
+            const outcome = await parkWall(at);
+            if (outcome === "stopped") break;
             if (outcome === "parked" || outcome === "undeliverable") {
               walled = { reason: REASON_WALL };
               break;
@@ -3174,23 +3199,10 @@ export class SdkExecutor implements Executor {
             break;
           }
         }
-        // PRD #1226 M4 (D3): the SERVER's budget-exhausted steer. A LIVE post-attempt interlocked
-        // run the server has flagged past its completion budget (served.budgetExhausted, off the
-        // SAME running-report ACK as pauseRequested) enters the completion hold PROACTIVELY here —
-        // even if the worker's own WALL/IDLE has not tripped. GATED on completionAttempted so a
-        // PRE-attempt budget flag never holds (there is no captured completion state to preserve
-        // yet, and the legacy wall/idle terminal path still owns a real pre-attempt exhaustion). A
-        // false hold verdict (capture unverified, or the server did not ACK `paused`) falls through
-        // and the run CONTINUES, exactly like a declined pause — never a destructive cleanup.
-        if (
-          served?.budgetExhausted &&
-          ctx.completionInterlock &&
-          completionAttempted &&
-          (await this.routeSummaryHold(ctx, REASON_COMPLETION_BUDGET_EXHAUSTED, completionAttempted))
-        ) {
-          completionHeld = { reason: REASON_COMPLETION_BUDGET_EXHAUSTED };
-          break;
-        }
+        // Preserve the owner-pause boundary's precedence, then stop on a server-observed
+        // historical wall or the existing completion-budget steer before dispatching again.
+        if ((history.wallSpent(served) || served?.budgetExhausted) &&
+            await stopAtWall(served?.budgetExhausted ? REASON_COMPLETION_BUDGET_EXHAUSTED : REASON_WALL)) break;
         // PRD #1809 D4 (soft layer): the per-run cache cap, at this turn boundary. The governor
         // measures the run's caches and, over the cap, trims them only at a proven quiet point (the
         // probe: no process of the run alive). A run that stays over the cap parks here, through
@@ -3414,11 +3426,9 @@ export class SdkExecutor implements Executor {
           if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
           throwIfDiskStop(ctx);
           if (ctx.pauseModeRequested?.() === "wall") {
-            if (completionAttempted && await this.routeSummaryHold(ctx, REASON_WALL, completionAttempted)) {
-              completionHeld = { reason: REASON_WALL };
-              return true;
-            }
-            const outcome = await this.parkForWall(ctx, at);
+            if (await stopAtWall()) return true;
+            const outcome = await parkWall(at);
+            if (outcome === "stopped") return true;
             if (outcome === "parked" || outcome === "undeliverable") {
               walled = { reason: REASON_WALL };
               return true;
@@ -3621,33 +3631,21 @@ export class SdkExecutor implements Executor {
             prepareInPlaceRestart();
             continue;
           }
-          // PRD #1226 M3 (D3): a POST-attempt WALL/IDLE trip routes to the completion hold (M4)
-          // instead of terminal-failing the run — its Git work is already captured by the
-          // checkpoint-first attempt above, and a live worker mid-completion must not be failed.
-          // PRE-attempt (or with the seam unwired) it rethrows exactly as before, so the wall/idle
-          // trip stays a legacy terminal failure. Only WALL/IDLE are routed here; a cancel
-          // (REASON_CANCELLED) or any other error rethrows unchanged.
-          if (
-            err instanceof Error &&
-            (err.message === REASON_WALL || err.message === REASON_IDLE) &&
-            (await this.routeSummaryHold(ctx, err.message, completionAttempted))
-          ) {
+          if (err instanceof Error && err.message === REASON_WALL && await stopAtWall()) break;
+          if (err instanceof Error && err.message === REASON_IDLE &&
+              await this.routeSummaryHold(ctx, err.message, completionAttempted)) {
             completionHeld = { reason: err.message };
             break;
           }
-          // PRD #1497 M2: a REASON_WALL trip that the completion-hold route above did NOT claim (a
-          // PRE-attempt wall — the worker's own wall timer fired before any completion attempt — or a
-          // post-attempt wall whose hold could not enter) takes the CAPTURE-FIRST wall park instead of
-          // the legacy terminal throw. This makes reportGenericFailure UNREACHABLE from a REASON_WALL
-          // trip in either case (D2/D17: no live run is failed by the wall). REASON_IDLE stays a
-          // legacy terminal failure (out of scope), so only REASON_WALL is routed here.
+          // A pre-attempt wall can still use the capture-first wall park.
           if (err instanceof Error && err.message === REASON_WALL) {
             const at = {
               completedCount:
                 served?.completedCount ?? latestProgress?.completed.length ?? 0,
               total: frozenMilestones?.length,
             };
-            const outcome = await this.parkForWall(ctx, at);
+            const outcome = await parkWall(at);
+            if (outcome === "stopped") break;
             if (outcome === "parked" || outcome === "undeliverable") {
               walled = { reason: REASON_WALL };
               break;
@@ -3950,6 +3948,7 @@ export class SdkExecutor implements Executor {
               const fresh = refresh ? await ctx.reportIteration?.(iteration, latestProgress) : undefined;
               this.throwIfTerminal(ctx);
               if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+              history.observe(fresh?.completionAttempts);
               if (fresh?.maxIterations && fresh.maxIterations > maxIterations) maxIterations = fresh.maxIterations;
               const wallSeconds = fresh?.totalWallSeconds ?? fresh?.wallSeconds;
               if (typeof wallSeconds === "number" && wallSeconds * 1000 > maxServedWallMs) {
@@ -3972,15 +3971,17 @@ export class SdkExecutor implements Executor {
               }
               const bound = fresh?.budgetExhausted ? REASON_COMPLETION_BUDGET_EXHAUSTED
                 : iteration >= maxIterations ? REASON_MAX_ITERATIONS
-                : state.wallRemainingMs <= 0 ? REASON_WALL : undefined;
+                : history.wallSpent(fresh) || state.wallRemainingMs <= 0 ? REASON_WALL : undefined;
               if (bound) {
+                if ((bound === REASON_WALL || bound === REASON_COMPLETION_BUDGET_EXHAUSTED) && await stopAtWall(bound)) return true;
                 if (await this.routeSummaryHold(ctx, bound, true)) {
                   if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
                   completionHeld = { reason: bound };
                   return true;
                 }
                 if (bound === REASON_WALL) {
-                  const outcome = await this.parkForWall(ctx, at);
+                  const outcome = await parkWall(at);
+                  if (outcome === "stopped") return true;
                   if (outcome === "parked" || outcome === "undeliverable") {
                     walled = { reason: REASON_WALL };
                     return true;
@@ -5268,9 +5269,11 @@ export class SdkExecutor implements Executor {
    * caller latches pausedAt and breaks; false ⇒ the caller CONTINUES the run (a failed publish,
    * or an executor with no parkForPause wired — the stub/tests, where a pause is inert).
    */
-  private async routeSummaryHold(ctx: RunContext, reason: string, attempted: boolean): Promise<boolean> {
+  private async routeSummaryHold(ctx: RunContext, reason: string, attempted: boolean, options?: { allowDegradedCapture?: boolean }): Promise<boolean> {
     if (attempted && ctx.enterCompletionHold) await this.closeAndSettlePlanSummary();
-    return routeCompletionHold(ctx, reason, attempted);
+    const held = await routeCompletionHold(ctx, reason, attempted, options);
+    if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+    return held;
   }
 
   private async requestPause(

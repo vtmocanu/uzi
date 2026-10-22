@@ -33,6 +33,10 @@ type settingsResponse struct {
 	Settings map[string]string `json:"settings"`
 	Secrets  map[string]bool   `json:"secrets"`
 	Sources  map[string]string `json:"sources"`
+	// Defaults carries the compiled-in default of every non-secret key (PRD #3245),
+	// so the web labels "Default · <built-in>" from the server rather than a copy.
+	// Secret keys are structurally absent: it is built from settings.Defaults only.
+	Defaults map[string]string `json:"defaults"`
 	// SlackStatus is the live Slack socket connection state (PRD #25 M2):
 	// "disabled" | "connecting" | "connected" | "error:<class>". The webui chip
 	// renders it.
@@ -46,7 +50,13 @@ type settingsResponse struct {
 }
 
 func newSettingsResponse(v settings.AdminView, slackStatus string) settingsResponse {
-	return settingsResponse{Settings: v.Values, Secrets: v.Secrets, Sources: v.Sources, SlackStatus: slackStatus}
+	defaults := make(map[string]string, len(settings.Defaults))
+	for k, d := range settings.Defaults {
+		if !settings.IsSecret(k) {
+			defaults[k] = d
+		}
+	}
+	return settingsResponse{Settings: v.Values, Secrets: v.Secrets, Sources: v.Sources, Defaults: defaults, SlackStatus: slackStatus}
 }
 
 // GetSettings returns every known setting (admin only): non-secret effective
@@ -120,6 +130,11 @@ func (h *Handler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 	if len(req.Settings) == 0 {
 		httpx.Error(w, http.StatusBadRequest, "no settings provided")
 		return
+	}
+	// Trim-at-storage (PRD #3245): normalize before validation, the merged
+	// precheck and ValueForStorage, so a whitespace-only judge model stores "".
+	for key, value := range req.Settings {
+		req.Settings[key] = settings.NormalizeForStorage(key, value)
 	}
 
 	// Per-key gate: known key, not env-fixed, and per-value valid. The env check

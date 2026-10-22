@@ -1,0 +1,450 @@
+{
+  "builtins": {
+    "claude": "opus",
+    "codex": "gpt-6.1-sol"
+  },
+  "cases": [
+    {
+      "name": "claude user set",
+      "harness": "claude",
+      "user": "haiku",
+      "instance": "",
+      "want": {
+        "model": "haiku",
+        "source": "user_default",
+        "default_model": "opus",
+        "default_source": "builtin",
+        "dropped": []
+      }
+    },
+    {
+      "name": "codex user set",
+      "harness": "codex",
+      "user": "gpt-6-astra",
+      "instance": "",
+      "want": {
+        "model": "gpt-6-astra",
+        "source": "user_default",
+        "default_model": "gpt-6.1-sol",
+        "default_source": "builtin",
+        "dropped": []
+      }
+    },
+    {
+      "name": "claude user null",
+      "harness": "claude",
+      "user": "",
+      "instance": "",
+      "want": {
+        "model": "opus",
+        "source": "builtin",
+        "default_model": "opus",
+        "default_source": "builtin",
+        "dropped": []
+      }
+    },
+    {
+      "name": "codex user null",
+      "harness": "codex",
+      "user": "",
+      "instance": "",
+      "want": {
+        "model": "gpt-6.1-sol",
+        "source": "builtin",
+        "default_model": "gpt-6.1-sol",
+        "default_source": "builtin",
+        "dropped": []
+      }
+    },
+    {
+      "name": "claude user whitespace",
+      "harness": "claude",
+      "user": " \t ",
+      "instance": "",
+      "want": {
+        "model": "opus",
+        "source": "builtin",
+        "default_model": "opus",
+        "default_source": "builtin",
+        "dropped": []
+      }
+    },
+    {
+      "name": "codex user whitespace",
+      "harness": "codex",
+      "user": " \t ",
+      "instance": "",
+      "want": {
+        "model": "gpt-6.1-sol",
+        "source": "builtin",
+        "default_model": "gpt-6.1-sol",
+        "default_source": "builtin",
+        "dropped": []
+      }
+    },
+    {
+      "name": "claude instance stored",
+      "harness": "claude",
+      "user": "",
+      "instance": "sonnet",
+      "want": {
+        "model": "sonnet",
+        "source": "instance_default",
+        "default_model": "sonnet",
+        "default_source": "instance_default",
+        "dropped": []
+      }
+    },
+    {
+      "name": "codex instance stored",
+      "harness": "codex",
+      "user": "",
+      "instance": "gpt-6-sol",
+      "want": {
+        "model": "gpt-6-sol",
+        "source": "instance_default",
+        "default_model": "gpt-6-sol",
+        "default_source": "instance_default",
+        "dropped": []
+      }
+    },
+    {
+      "name": "claude instance unset",
+      "harness": "claude",
+      "user": "",
+      "instance": "",
+      "want": {
+        "model": "opus",
+        "source": "builtin",
+        "default_model": "opus",
+        "default_source": "builtin",
+        "dropped": []
+      }
+    },
+    {
+      "name": "codex instance unset",
+      "harness": "codex",
+      "user": "",
+      "instance": "",
+      "want": {
+        "model": "gpt-6.1-sol",
+        "source": "builtin",
+        "default_model": "gpt-6.1-sol",
+        "default_source": "builtin",
+        "dropped": []
+      }
+    },
+    {
+      "name": "claude instance reset to empty falls to builtin",
+      "harness": "claude",
+      "user": "",
+      "instance": "  ",
+      "want": {
+        "model": "opus",
+        "source": "builtin",
+        "default_model": "opus",
+        "default_source": "builtin",
+        "dropped": []
+      }
+    },
+    {
+      "name": "codex instance reset to empty falls to builtin",
+      "harness": "codex",
+      "user": "",
+      "instance": "  ",
+      "want": {
+        "model": "gpt-6.1-sol",
+        "source": "builtin",
+        "default_model": "gpt-6.1-sol",
+        "default_source": "builtin",
+        "dropped": []
+      }
+    },
+    {
+      "name": "claude instance stored padded",
+      "harness": "claude",
+      "user": "",
+      "instance": "\tsonnet\n",
+      "want": {
+        "model": "sonnet",
+        "source": "instance_default",
+        "default_model": "sonnet",
+        "default_source": "instance_default",
+        "dropped": []
+      }
+    },
+    {
+      "name": "user wins over instance",
+      "harness": "claude",
+      "user": "haiku",
+      "instance": "sonnet",
+      "want": {
+        "model": "haiku",
+        "source": "user_default",
+        "default_model": "sonnet",
+        "default_source": "instance_default",
+        "dropped": []
+      }
+    },
+    {
+      "name": "codex user wins over instance",
+      "harness": "codex",
+      "user": "gpt-6-astra",
+      "instance": "gpt-6-sol",
+      "want": {
+        "model": "gpt-6-astra",
+        "source": "user_default",
+        "default_model": "gpt-6-sol",
+        "default_source": "instance_default",
+        "dropped": []
+      }
+    },
+    {
+      "name": "claude user curated codex id dropped, instance used",
+      "harness": "claude",
+      "user": "gpt-6-astra",
+      "instance": "sonnet",
+      "want": {
+        "model": "sonnet",
+        "source": "instance_default",
+        "default_model": "sonnet",
+        "default_source": "instance_default",
+        "dropped": [
+          "gpt-6-astra"
+        ]
+      }
+    },
+    {
+      "name": "claude user luna dropped, builtin used",
+      "harness": "claude",
+      "user": "gpt-6-luna",
+      "instance": "",
+      "want": {
+        "model": "opus",
+        "source": "builtin",
+        "default_model": "opus",
+        "default_source": "builtin",
+        "dropped": [
+          "gpt-6-luna"
+        ]
+      }
+    },
+    {
+      "name": "claude instance curated id dropped",
+      "harness": "claude",
+      "user": "",
+      "instance": "gpt-6-sol",
+      "want": {
+        "model": "opus",
+        "source": "builtin",
+        "default_model": "opus",
+        "default_source": "builtin",
+        "dropped": [
+          "gpt-6-sol"
+        ]
+      }
+    },
+    {
+      "name": "claude instance luna dropped",
+      "harness": "claude",
+      "user": "",
+      "instance": "gpt-6-luna",
+      "want": {
+        "model": "opus",
+        "source": "builtin",
+        "default_model": "opus",
+        "default_source": "builtin",
+        "dropped": [
+          "gpt-6-luna"
+        ]
+      }
+    },
+    {
+      "name": "codex user claude alias dropped, instance used",
+      "harness": "codex",
+      "user": "opus",
+      "instance": "gpt-6-sol",
+      "want": {
+        "model": "gpt-6-sol",
+        "source": "instance_default",
+        "default_model": "gpt-6-sol",
+        "default_source": "instance_default",
+        "dropped": [
+          "opus"
+        ]
+      }
+    },
+    {
+      "name": "codex user non-curated id dropped",
+      "harness": "codex",
+      "user": "gpt-7-x",
+      "instance": "",
+      "want": {
+        "model": "gpt-6.1-sol",
+        "source": "builtin",
+        "default_model": "gpt-6.1-sol",
+        "default_source": "builtin",
+        "dropped": [
+          "gpt-7-x"
+        ]
+      }
+    },
+    {
+      "name": "codex user luna is not curated",
+      "harness": "codex",
+      "user": "gpt-6-luna",
+      "instance": "",
+      "want": {
+        "model": "gpt-6.1-sol",
+        "source": "builtin",
+        "default_model": "gpt-6.1-sol",
+        "default_source": "builtin",
+        "dropped": [
+          "gpt-6-luna"
+        ]
+      }
+    },
+    {
+      "name": "codex instance claude alias dropped",
+      "harness": "codex",
+      "user": "",
+      "instance": "sonnet",
+      "want": {
+        "model": "gpt-6.1-sol",
+        "source": "builtin",
+        "default_model": "gpt-6.1-sol",
+        "default_source": "builtin",
+        "dropped": [
+          "sonnet"
+        ]
+      }
+    },
+    {
+      "name": "codex instance non-curated dropped",
+      "harness": "codex",
+      "user": "",
+      "instance": "gpt-7-x",
+      "want": {
+        "model": "gpt-6.1-sol",
+        "source": "builtin",
+        "default_model": "gpt-6.1-sol",
+        "default_source": "builtin",
+        "dropped": [
+          "gpt-7-x"
+        ]
+      }
+    },
+    {
+      "name": "claude both tiers invalid: two drops",
+      "harness": "claude",
+      "user": "gpt-6-astra",
+      "instance": "gpt-6-sol",
+      "want": {
+        "model": "opus",
+        "source": "builtin",
+        "default_model": "opus",
+        "default_source": "builtin",
+        "dropped": [
+          "gpt-6-astra",
+          "gpt-6-sol"
+        ]
+      }
+    },
+    {
+      "name": "codex both tiers invalid: two drops",
+      "harness": "codex",
+      "user": "opus",
+      "instance": "gpt-7-x",
+      "want": {
+        "model": "gpt-6.1-sol",
+        "source": "builtin",
+        "default_model": "gpt-6.1-sol",
+        "default_source": "builtin",
+        "dropped": [
+          "opus",
+          "gpt-7-x"
+        ]
+      }
+    },
+    {
+      "name": "claude valid alias no drop",
+      "harness": "claude",
+      "user": "",
+      "instance": "sonnet",
+      "want": {
+        "model": "sonnet",
+        "source": "instance_default",
+        "default_model": "sonnet",
+        "default_source": "instance_default",
+        "dropped": []
+      }
+    },
+    {
+      "name": "claude custom id accepted",
+      "harness": "claude",
+      "user": "claude-opus-4-8",
+      "instance": "",
+      "want": {
+        "model": "claude-opus-4-8",
+        "source": "user_default",
+        "default_model": "opus",
+        "default_source": "builtin",
+        "dropped": []
+      }
+    },
+    {
+      "name": "claude builtin accepted",
+      "harness": "claude",
+      "user": "",
+      "instance": "",
+      "want": {
+        "model": "opus",
+        "source": "builtin",
+        "default_model": "opus",
+        "default_source": "builtin",
+        "dropped": []
+      }
+    },
+    {
+      "name": "codex builtin accepted",
+      "harness": "codex",
+      "user": "",
+      "instance": "",
+      "want": {
+        "model": "gpt-6.1-sol",
+        "source": "builtin",
+        "default_model": "gpt-6.1-sol",
+        "default_source": "builtin",
+        "dropped": []
+      }
+    },
+    {
+      "name": "unknown harness uses claude rules",
+      "harness": "other",
+      "user": "gpt-6-sol",
+      "instance": "haiku",
+      "want": {
+        "model": "haiku",
+        "source": "instance_default",
+        "default_model": "haiku",
+        "default_source": "instance_default",
+        "dropped": [
+          "gpt-6-sol"
+        ]
+      }
+    },
+    {
+      "name": "unknown harness builtin is claude",
+      "harness": "",
+      "user": "",
+      "instance": "",
+      "want": {
+        "model": "opus",
+        "source": "builtin",
+        "default_model": "opus",
+        "default_source": "builtin",
+        "dropped": []
+      }
+    }
+  ]
+}

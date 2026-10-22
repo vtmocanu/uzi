@@ -2735,6 +2735,15 @@ display as `pin` or `worker default`; missing or unfamiliar values show
 [Configuration](./configuration.md#plan-cross-check-model-and-effort-pins)
 for resolution, validation and capability requirements.
 
+After the cross-check table, the human output prints a **Model settings**
+table with the columns `SETTING  HARNESS  STORED  DEFAULT  RESOLVED  SOURCE`,
+with judge rows for `claude` and `codex`. `SOURCE` is `your choice`,
+`instance default` or `built-in`. `--json` carries the same cells as
+`judge_models` (ordered claude, codex: `harness`, `model`, `default_model`,
+`default_source`, `resolved_model`, `source`; read-only) and the stored Codex
+lane as `codex_judge_model`. See
+[Run judge](./judge.md#which-model-it-runs-on).
+
 The human output ends with a `Now summary: on (default)`, `on` or `off` line:
 your own switch for the model-written [Now summary](./run-activity.md#now-summary)
 (`on (default)` means unset, which inherits on; the admin

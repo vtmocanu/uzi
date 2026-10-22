@@ -145,6 +145,19 @@ export interface CrossCheckPinDTO {
   active: boolean;
 }
 
+/** One harness's cell of a model setting (PRD #3245): the stored lane value and what
+ *  resolves for this user. A setting's cells are always ordered claude, codex. `*_source`
+ *  and `source` are the shared provenance tokens (user_default | instance_default |
+ *  builtin), labelled by fixtures/model-settings/contract.json. */
+export interface ModelSettingCell {
+  harness: Harness;
+  model: string | null;
+  default_model: string;
+  default_source: string;
+  resolved_model: string;
+  source: string;
+}
+
 export interface UserSettings {
   cross_check_pins?: CrossCheckPinDTO[];
   /** @deprecated PRD #1551 D2: superseded by the explicit per-harness lanes below.
@@ -172,6 +185,12 @@ export interface UserSettings {
    *  judge_model (which itself falls back to opus). Written through PUT /me/settings
    *  alongside default_model, validated by the same model rules. */
   judge_model: string | null;
+  /** Per-user Codex judge model (PRD #3245); null inherits the instance Codex judge
+   *  model, then the built-in. A curated Codex id when set. Optional for older servers. */
+  codex_judge_model?: string | null;
+  /** Read-only resolved view of both judge lanes (PRD #3245), claude then codex.
+   *  Never sent on a PUT. Optional for older servers. */
+  judge_models?: ModelSettingCell[];
   /** Per-user run-summary model override (PRD #362 M2); null means inherit the
    *  instance summary_model (which itself falls back to haiku). Written through
    *  PUT /me/settings alongside judge_model, validated by the same model rules. */
@@ -231,6 +250,8 @@ export interface UserSettingsPatch {
   default_codex_effort?: string | null;
   /** Per-user judge model (PRD #69 M2); present-null clears back to inherit. */
   judge_model?: string | null;
+  /** Per-user Codex judge model (PRD #3245); present-null clears back to inherit. */
+  codex_judge_model?: string | null;
   /** Per-user run-summary model (PRD #362 M2); present-null clears back to inherit. */
   summary_model?: string | null;
   theme?: string | null;
@@ -1005,6 +1026,9 @@ export interface AppSettings {
   // default, PRD #69).
   judge_enabled: string;
   judge_model: string;
+  // codex_judge_model (PRD #3245) is the instance Codex-lane judge model: a curated Codex
+  // id, or "" for the built-in (the admin GET reports the built-in with source "default").
+  codex_judge_model: string;
   // judge_enforce_all (PRD #69) is the text "true"/"false": when on, EVERY user's
   // finished runs are judged on that user's own token, bypassing the per-user opt-in
   // — but the kill-switch (judge_enabled) still dominates. judge_cooldown_seconds and
@@ -1147,6 +1171,9 @@ export interface SettingsResponse {
   settings: AppSettings;
   secrets: Record<string, boolean>;
   sources: Record<string, SettingSource>;
+  // Compiled-in default of every non-secret key (PRD #3245); secret keys are never
+  // present. Optional so an older server omits it.
+  defaults?: Record<string, string>;
   // Live Slack socket connection state (PRD #25 M2): "disabled" | "connecting" |
   // "connected" | "error:<class>". The admin Slack card renders it as a chip.
   slack_status: string;

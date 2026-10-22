@@ -162,8 +162,9 @@ type fakeStore struct {
 	// the zero value is NULL/inherit, so existing judge fixtures resolve the
 	// instance value unchanged. judgeModelErr models a user-row read fault, which
 	// must fall back to the instance value best-effort (never an empty model).
-	judgeModel    pgtype.Text
-	judgeModelErr error
+	judgeModel      pgtype.Text
+	codexJudgeModel pgtype.Text // the Codex lane (PRD #3245)
+	judgeModelErr   error
 	// summaryModel is the run owner's per-user summary_model override (PRD #362 M2);
 	// the zero value is NULL/inherit, so existing issue-run fixtures resolve the
 	// instance value unchanged. summaryModelErr models a user-row read fault, which
@@ -1033,8 +1034,8 @@ func (f *fakeStore) GetUserDefaultCodexEffort(context.Context, uuid.UUID) (pgtyp
 func (f *fakeStore) GetUserAttributionEnabled(context.Context, uuid.UUID) (bool, error) {
 	return f.attributionEnabled, f.attributionEnabledErr
 }
-func (f *fakeStore) GetUserJudgeModel(context.Context, uuid.UUID) (pgtype.Text, error) {
-	return f.judgeModel, f.judgeModelErr
+func (f *fakeStore) GetUserJudgeModels(context.Context, uuid.UUID) (store.GetUserJudgeModelsRow, error) {
+	return store.GetUserJudgeModelsRow{JudgeModel: f.judgeModel, CodexJudgeModel: f.codexJudgeModel}, f.judgeModelErr
 }
 func (f *fakeStore) GetUserSummaryModel(context.Context, uuid.UUID) (pgtype.Text, error) {
 	return f.summaryModel, f.summaryModelErr

@@ -2,6 +2,7 @@
   "settings": null,
   "secrets": null,
   "sources": null,
+  "defaults": null,
   "slack_status": "",
   "oidc_status": "",
   "oidc_provider_name": ""

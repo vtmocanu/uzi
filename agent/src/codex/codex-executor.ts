@@ -84,6 +84,7 @@ import { PauseNowSignal, MAX_FOLLOW_UP_BATCH_RUNES } from "../steering.js";
 import { isRunSummaryKind, resolveRunKind } from "../run-kind.js";
 import {
   STALL_LIMIT,
+  CompletionHistory,
   REASON_COMPLETION_NO_PROGRESS,
   REASON_COMPLETION_LEAD_REQUESTED,
   REASON_COMPLETION_BUDGET_EXHAUSTED,
@@ -2946,9 +2947,11 @@ export class CodexExecutor implements Executor {
     this.captureMayHaveDrained = () => reapedSinceLastPersist;
     // Issue #1764: route a completion hold, persisting first when the hold sink will be invoked
     // (the same condition routeCompletionHold applies).
-    const routeHold = async (reason: string, attempted: boolean): Promise<boolean> => {
+    const routeHold = async (reason: string, attempted: boolean, options?: { allowDegradedCapture?: boolean }): Promise<boolean> => {
       if (attempted && ctx.enterCompletionHold) await beforeReapingSink();
-      return routeCompletionHold(ctx, reason, attempted);
+      const held = await routeCompletionHold(ctx, reason, attempted, options);
+      if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+      return held;
     };
     // Issue #1764: the re-armable pause-now interrupt, registered ONCE for the whole run (steering's
     // onPauseNow is last-wins and fires on every `now`/`wall` pause). Each turn installs its own trip.
@@ -3547,6 +3550,8 @@ export class CodexExecutor implements Executor {
       let lastSessionId = ctx.sessionId ?? undefined;
       const wallMs = this.deps.wallMs ?? (ctx.config?.run_timeout_seconds ? ctx.config.run_timeout_seconds * 1000 : DEFAULT_WALL_MS);
       const wall: RunWall = { remainingMs: wallMs, maxServedMs: wallMs, claimMs: wallMs };
+      let completionAttempted = false;
+      const completion = { history: new CompletionHistory(), attempted: () => completionAttempted };
       this.epochAdmission = () => {
         this.assertCaptureAdmission();
         // Capture continuation adds this fence. Ordinary epoch startup retains its
@@ -3701,7 +3706,7 @@ export class CodexExecutor implements Executor {
           let turn: Awaited<ReturnType<CodexExecutor["driveTurnWithWallPark"]>>;
           try {
             if (humanRevision) await ctx.beforePlanRevisionTurn?.();
-            turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, shared.selection.current, { completedCount: 0 }, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap);
+            turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, shared.selection.current, { completedCount: 0 }, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completion);
           } catch (error) {
             if (!humanRevision || !(error instanceof TransientRecoveryError) || !error.providerOrigin || !ctx.retryPlanRevisionTurn) throw error;
             // The runner hook owns backoff and control checks. Redrive without a new cap,
@@ -3761,7 +3766,8 @@ export class CodexExecutor implements Executor {
         // epoch's plan-phase broker, recreating only after a gate capture drained it.
         // PRD #1497 M2: drive the plan turn through the wall-park wrapper — a wall trip (the own
         // timer's REASON_WALL, or a `wall` PauseNowSignal) parks the run instead of failing it, even
-        // during planning (the completion interlock cannot have attempted completion yet).
+        // during planning. The current flight has not attempted completion yet, but a refusal
+        // can report prior server completion attempts and must then route to the completion hold.
         const planTurn = await drivePlan(this.planPrompt(ctx, environmentFacts));
         if (planTurn.kind === "walled") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
         if (planTurn.kind === "held") return { branch: ctx.branch, completionHeld: { reason: planTurn.reason } };
@@ -3924,9 +3930,15 @@ export class CodexExecutor implements Executor {
       let maxIterations = positiveOr(ctx.config?.max_iterations, DEFAULT_MAX_ITERATIONS);
       let latestProgress: ReducedTurnResult["progress"];
       let iteration = 0;
-      let completionAttempted = false;
       let completionHeld: { reason: string } | undefined;
       let walledAtRequest = false;
+      const stopAtWall = async (reason = REASON_WALL): Promise<boolean> => {
+        if (!ctx.completionInterlock || !isIssueRun || !(completionAttempted || completion.history.priorAttempt)) return false;
+        if (await routeHold(reason, true, { allowDegradedCapture: true }))
+          completionHeld = { reason };
+        else walledAtRequest = true;
+        return true;
+      };
       let lastCompletionFingerprint: string | undefined;
       let completionStallStreak = 0;
       let completionFollowUp: string | undefined;
@@ -3982,6 +3994,7 @@ export class CodexExecutor implements Executor {
         branch: ctx.branch,
         agentSelection,
         ...(completionHeld ? { completionHeld } : {}),
+        ...(walledAtRequest ? { walled: { reason: REASON_WALL } } : {}),
         ...(pausedAt ? { pausedAt } : {}),
         ...(isIssueRun && scopeCapped ? { scopeCapped } : {}),
         ...(isIssueRun && declaredReportOnly ? { reportOnly: true } : {}),
@@ -4014,6 +4027,7 @@ export class CodexExecutor implements Executor {
         // budget never shortens the configured/default limit or an earlier lift.
         const served: IterationBudget | void = await ctx.reportIteration?.(iteration, latestProgress);
         if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+        completion.history.observe(served?.completionAttempts);
         const boundaryCap = isIssueRun ? scopeCapAtBoundary({ served, frozen: milestones }) : undefined;
         if (boundaryCap) {
           scopeCapped = { completedCount: boundaryCap.completedCount, total: boundaryCap.total };
@@ -4043,11 +4057,8 @@ export class CodexExecutor implements Executor {
             throw new Error(REASON_MAX_ITERATIONS);
           }
         }
-        if (served?.budgetExhausted && interlockedIssue && completionAttempted &&
-            await routeHold(REASON_COMPLETION_BUDGET_EXHAUSTED, completionAttempted)) {
-          completionHeld = { reason: REASON_COMPLETION_BUDGET_EXHAUSTED };
-          break;
-        }
+        if ((served?.budgetExhausted || completion.history.wallSpent(served)) &&
+            await stopAtWall(served?.budgetExhausted ? REASON_COMPLETION_BUDGET_EXHAUSTED : REASON_WALL)) break;
         // Issue #1764 (PRD #1190 M2 parity): the owner-requested pause boundary. Deliberate order
         // deviation from sdk-executor, which checks the pause BEFORE the budget: here the
         // post-attempt completion hold above is evaluated first, consistent with Codex's rule that
@@ -4067,17 +4078,15 @@ export class CodexExecutor implements Executor {
             // PRD #1497 M2: a pending `wall` pause (the sweep's wall-clock park, or a re-claim seeded
             // with pause_mode='wall') takes the capture-first wall park, not parkForPause. A
             // post-attempt run tries the completion hold first, as the in-turn wall trip does.
-            if (completionAttempted && await routeHold(REASON_WALL, true)) {
+            if (await stopAtWall()) break;
+            const outcome = await this.parkAtWall(ctx, at, beforeReapingSink, pauseNow, pauseToken, wall, completion);
+            if (outcome === "held") {
               completionHeld = { reason: REASON_WALL };
               break;
             }
-            const outcome = await this.parkAtWall(ctx, at, beforeReapingSink, pauseNow, pauseToken);
             if (outcome === "parked") return { branch: ctx.branch, agentSelection, walled: { reason: REASON_WALL } };
             // "refused" (the owner extended; wall mode cleared): re-arm the run-wide wall from the
             // refusal's budget and fall through to the turn. "unwired" (no seam): fall through.
-            if (outcome === "refused") {
-              refreshWallAfterRefusal(wall, ctx.takeWallParkRefresh?.(), this.deps.redriveAllowanceMs ?? REDRIVE_RACE_ALLOWANCE_MS);
-            }
             pauseNow.consume(pauseToken);
           } else if (await this.requestPause(ctx, at, beforeReapingSink)) {
             pausedAt = at;
@@ -4185,7 +4194,7 @@ export class CodexExecutor implements Executor {
           const onProgress = makeProgressObserver(ctx, latestProgress, milestones);
           // Issue #1764: an in-turn owner park reports the server's cumulative count when it served one.
           const turnAt = { completedCount: served?.completedCount ?? latestProgress?.completed?.length ?? 0, total: milestones?.length };
-          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, epoch.registry, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, shared.selection.current, turnAt, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completionAttempted, onProgress, round === 0 ? firstEventHandler : undefined, undefined,
+          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, epoch.registry, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, shared.selection.current, turnAt, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completion, onProgress, round === 0 ? firstEventHandler : undefined, undefined,
             systemFollowUp === undefined && round === 0 ? (prompt) => {
               if (interruptedOwnerDispatched) return prompt;
               const calls = interruptedCallsNote(ctx.getInterruptedCalls?.());
@@ -4235,7 +4244,7 @@ export class CodexExecutor implements Executor {
             const outcome = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer,
               "implement", nextPrompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker,
               shared.selection.current, at, shared.scrubProjected, beforeReapingSink, pauseNow,
-              recreateEpochAfterReap, completionAttempted, onProgress, undefined, async () => {
+              recreateEpochAfterReap, completion, onProgress, undefined, async () => {
                 await beforeReapingSink();
                 disposition = await ctx.requestParkRun!(at);
                 return { done: false };
@@ -4369,13 +4378,15 @@ export class CodexExecutor implements Executor {
             if (!leadRequest) return false;
             const fresh = refresh ? await ctx.reportIteration?.(iteration, latestProgress) : undefined;
             if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
+            completion.history.observe(fresh?.completionAttempts);
             if (fresh?.maxIterations && fresh.maxIterations > maxIterations) maxIterations = fresh.maxIterations;
             liftWall(wall, fresh?.totalWallSeconds ?? fresh?.wallSeconds);
             // Preserve Codex's budget-before-pause precedence.
             const bound = fresh?.budgetExhausted ? REASON_COMPLETION_BUDGET_EXHAUSTED
               : iteration >= maxIterations ? REASON_MAX_ITERATIONS
-              : wall.remainingMs <= 0 || ctx.pauseModeRequested?.() === "wall" ? REASON_WALL : undefined;
+              : completion.history.wallSpent(fresh) || wall.remainingMs <= 0 || ctx.pauseModeRequested?.() === "wall" ? REASON_WALL : undefined;
             if (bound) {
+              if ((bound === REASON_WALL || bound === REASON_COMPLETION_BUDGET_EXHAUSTED) && await stopAtWall(bound)) return true;
               if (await routeHold(bound, true)) {
                 if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
                 completionHeld = { reason: bound };
@@ -4384,13 +4395,16 @@ export class CodexExecutor implements Executor {
               if (bound === REASON_WALL) {
                 const at = { completedCount: fresh?.completedCount ?? latestProgress?.completed.length ?? 0, total: milestones?.length };
                 const pauseToken = pauseNow.capture();
-                const outcome = await this.parkAtWall(ctx, at, beforeReapingSink, pauseNow, pauseToken);
+                const outcome = await this.parkAtWall(ctx, at, beforeReapingSink, pauseNow, pauseToken, wall, completion);
+                if (outcome === "held") {
+                  completionHeld = { reason: REASON_WALL };
+                  return true;
+                }
                 if (outcome === "parked") {
                   walledAtRequest = true;
                   return true;
                 }
                 if (outcome === "refused") {
-                  refreshWallAfterRefusal(wall, ctx.takeWallParkRefresh?.(), this.deps.redriveAllowanceMs ?? REDRIVE_RACE_ALLOWANCE_MS);
                   return false;
                 }
               }
@@ -5378,7 +5392,7 @@ export class CodexExecutor implements Executor {
     beforeReapingSink: () => Promise<void>,
     pauseNow: CodexPauseNowState,
     recreateEpoch: () => Promise<ProviderEpoch>,
-    completionAttempted = false,
+    completion?: { history: CompletionHistory; attempted: () => boolean },
     onProgress: (progress: MilestoneProgress) => void = forwardProgress(ctx),
     onFirstEvent?: () => void,
     idleOperation?: () => Promise<ReducedTurnResult>,
@@ -5513,20 +5527,23 @@ export class CodexExecutor implements Executor {
           continue;
         }
         const wallTrip = msg === REASON_WALL || msg === REASON_PAUSE;
-        if (completionAttempted && (wallTrip || msg === REASON_IDLE)) {
+        if (ctx.completionInterlock && (wallTrip ? completion?.attempted() || completion?.history.priorAttempt : completion?.attempted()) && (wallTrip || msg === REASON_IDLE)) {
           const reason = wallTrip ? REASON_WALL : REASON_IDLE;
           // Issue #1764: the hold's capture reaps the live provider root; persist first.
           if (ctx.enterCompletionHold) await beforeReapingSink();
-          if (await routeCompletionHold(ctx, reason, true)) return { kind: "held", reason };
+          const held = await routeCompletionHold(ctx, reason, true, wallTrip ? { allowDegradedCapture: true } : undefined);
+          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+          if (held) return { kind: "held", reason };
+          if (wallTrip) return { kind: "walled" };
         }
         // Not a wall trip: legacy propagation.
         if (!wallTrip) throw err;
-        const outcome = await this.parkAtWall(ctx, at, beforeReapingSink, pauseNow, pauseToken);
+        const outcome = await this.parkAtWall(ctx, at, beforeReapingSink, pauseNow, pauseToken, wall, completion);
+        if (outcome === "held") return { kind: "held", reason: REASON_WALL };
         if (outcome === "parked") return { kind: "walled" };
         if (outcome === "refused") {
           // The owner extended: re-drive the turn. It skips reportIteration, so re-arm the run-wide
           // wall from the refusal's own budget first, or the re-drive would trip at once.
-          refreshWallAfterRefusal(wall, ctx.takeWallParkRefresh?.(), this.deps.redriveAllowanceMs ?? REDRIVE_RACE_ALLOWANCE_MS);
           // Issue #1789: a vault lock latched before or during the refused park defers now
           // (cancel first): recreating the epoch would release a new credential for a turn the
           // latch drops at its start anyway.
@@ -5559,7 +5576,9 @@ export class CodexExecutor implements Executor {
     beforeReapingSink: () => Promise<void>,
     pauseNow: CodexPauseNowState,
     pauseToken: PauseNowToken,
-  ): Promise<"parked" | "refused" | "unwired"> {
+    wall: RunWall,
+    completion?: { history: CompletionHistory; attempted: () => boolean },
+  ): Promise<"parked" | "held" | "refused" | "unwired"> {
     if (!ctx.parkForWall) return "unwired";
     // Issue #1764: the wall park's capture reaps the live provider root, so persist its session
     // first (the run's finally will not re-persist a possibly-deleted home).
@@ -5580,6 +5599,14 @@ export class CodexExecutor implements Executor {
       // refusal (no cancel pending ⇒ ctx.cancelRequested?.() is falsy/undefined) still continues,
       // preserving the c4c4c1f6 refused-restart fix and never over-cancelling.
       if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+      const refresh = ctx.takeWallParkRefresh?.();
+      completion?.history.observe(refresh?.completionAttempts);
+      if (ctx.completionInterlock && (completion?.attempted() || completion?.history.priorAttempt)) {
+        const held = await routeCompletionHold(ctx, REASON_WALL, true, { allowDegradedCapture: true });
+        if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+        return held ? "held" : "parked";
+      }
+      refreshWallAfterRefusal(wall, refresh, this.deps.redriveAllowanceMs ?? REDRIVE_RACE_ALLOWANCE_MS);
       // Issue #1764: clear the wall mode and consume the handled wall generation together, so it
       // can never trip the re-driven turn with a null mode. A newer owner `now` that landed during
       // the park keeps its mode (clearWallMode clears only `wall`) and its pending generation.

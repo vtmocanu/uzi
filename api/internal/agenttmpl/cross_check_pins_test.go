@@ -53,3 +53,28 @@ func TestCrossCheckFamilyValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateClaudeLaneModel(t *testing.T) {
+	for _, tc := range []struct {
+		in, want string
+		wantErr  bool
+	}{
+		{"gpt-5.6-sol", "", true},
+		{"gpt-6-astra", "", true},
+		{"gpt-6-luna", "", true},
+		{"gpt-6-sol", "", true},
+		{"gpt-6.1-sol", "", true},
+		{" gpt-6-luna ", "", true},
+		{"opus", "opus", false},
+		{"claude-opus-4-8", "claude-opus-4-8", false},
+		{" sonnet ", "sonnet", false},
+		{"", "", false},
+		{"   ", "", false},
+		{"two words", "", true},
+	} {
+		got, err := ValidateClaudeLaneModel(tc.in)
+		if (err != nil) != tc.wantErr || got != tc.want {
+			t.Errorf("ValidateClaudeLaneModel(%q) = %q, %v; want %q, err=%v", tc.in, got, err, tc.want, tc.wantErr)
+		}
+	}
+}

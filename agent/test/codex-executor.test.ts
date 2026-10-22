@@ -11003,13 +11003,14 @@ describe("CodexExecutor: run-wide wall and served lift (issue #1600)", () => {
     assert.equal(calls, 4, "one reportIteration per implement turn");
   });
 
-  it("(implement) a refused park after the budget is spent re-arms from the 409's budget, with no immediate re-trip", async () => {
+  it("3282 (implement) a refused park after the budget is spent re-arms from the 409's budget, with no immediate re-trip", async () => {
     const rig = makeRig({ responder: timedTurns({ turnMs: 300, turns: 2, quietFirst: true }) });
     rig.deps = { ...rig.deps, idleMs: 5000, wallMs: 100, redriveAllowanceMs: 10 };
     const { ctx, spies } = lwallCtx({
+      reportIteration: async () => ({ completionAttempts: 0 }),
       takeWallParkRefresh: () => {
         spies.refreshCalls++;
-        return spies.refreshCalls === 1 ? { totalSeconds: 5, usedSeconds: 1 } : undefined;
+        return spies.refreshCalls === 1 ? { completionAttempts: 0, totalSeconds: 5, usedSeconds: 1 } : undefined;
       },
     });
     spies.outcome = "refused";
@@ -12053,7 +12054,7 @@ describe("Codex completion interlock", () => {
     });
   }
   for (const outcome of ["parked", "undeliverable", "refused"] as const) {
-    it(`issue3089 landing Codex refused completion hold falls back to wall park ${outcome}`, async () => {
+    it(`3282 landing Codex declined wall hold stops without park ${outcome}`, async () => {
       const rig = makeMultiEpochRig([0, 1].map(n => epochResponder(`th-${n}`, `tn-${n}`, (t, th, tn) => {
         t.push(toolCall(1, "signal_done", n === 0 ? {
           owner_decision_requested: { reason: "Owner input" },
@@ -12072,10 +12073,10 @@ describe("Codex completion interlock", () => {
         parkForWall: async () => { parks++; return outcome; },
       });
       const result = await makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
-      assert.equal(parks, 1);
+      assert.equal(parks, 0);
       assert.equal(result.completionHeld, undefined);
-      assert.equal(Boolean(result.walled), outcome !== "refused");
-      assert.equal(attempts, outcome === "refused" ? 2 : 1);
+      assert.equal(Boolean(result.walled), true);
+      assert.equal(attempts, 1);
     });
   }
   for (const scenario of ["checkpoint cancel", "fingerprint cancel", "attempt cancel", "question cancel",
@@ -12411,7 +12412,7 @@ describe("Codex completion interlock", () => {
     });
   }
 
-  it("parks after an attempt when the wall completion hold is refused", async () => {
+  it("3282 stops without park after an attempt when the wall completion hold is declined", async () => {
     const rig = makeMultiEpochRig([firstEpoch(1), quietEpoch(2)]);
     rig.deps = { ...rig.deps, wallMs: 30, idleMs: 5000 };
     const holds: string[] = [];
@@ -12424,7 +12425,7 @@ describe("Codex completion interlock", () => {
     });
     const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "refused wall hold");
     assert.deepEqual(holds, ["codex run wall-clock timeout"]);
-    assert.equal(parks, 1);
+    assert.equal(parks, 0);
     assert.deepEqual(result.walled, { reason: "codex run wall-clock timeout" });
     assert.equal(result.completionHeld, undefined);
   });
@@ -14133,7 +14134,7 @@ describe("CodexExecutor: loop-top owner pause (issue #1764)", () => {
     assertNoPersistAfterReap(events);
   });
 
-  it("(B8 rework) a declined completion hold then a refused `wall` park that reaped recreates the epoch for the rework re-drive (issue #1782)", async () => {
+  it("3282 (B8 rework) declined wall hold stops after persisting the second epoch", async () => {
     const rig = makeMultiEpochRig([
       epochResponder("th-1", "tn-1", (t, th, tn) => {
         t.push(toolCall(1, "signal_done", { milestones_completed: ["m1"] }, th, tn, "done-1")).push(turnCompleted("completed", th, tn));
@@ -14147,6 +14148,7 @@ describe("CodexExecutor: loop-top owner pause (issue #1764)", () => {
     let mode: "wall" | null = null;
     const holds: string[] = [];
     let attempts = 0;
+    let parks = 0;
     const { ctx } = makeCtx({
       kind: "issue", completionInterlock: true, config: { max_iterations: 3 },
       signal: controller.signal,
@@ -14154,8 +14156,15 @@ describe("CodexExecutor: loop-top owner pause (issue #1764)", () => {
       clearWallMode: () => { mode = null; },
       checkpoint: async () => undefined,
       recordCompletionAttempt: async () => (++attempts === 1 ? { unmet: ["m2"], attemptCount: 1 } : { unmet: [], attemptCount: 2 }),
-      enterCompletionHold: async (reason) => { holds.push(reason); return false; }, // declined
+      enterCompletionHold: async (reason) => {
+        holds.push(reason);
+        assert.equal(events.at(-1), `persist:${homeOf(1)}`, "session persisted before hold reap");
+        await exec.safety!.withBoundary({ boundary: "checkpoint", deadlineMs: 200 }, async () => {});
+        events.push(`reap:${homeOf(1)}`);
+        return false;
+      },
       parkForWall: async () => {
+        parks++;
         await exec.safety!.withBoundary({ boundary: "checkpoint", deadlineMs: 200 }, async () => {});
         events.push(`reap:${homeOf(1)}`);
         return "refused";
@@ -14167,15 +14176,16 @@ describe("CodexExecutor: loop-top owner pause (issue #1764)", () => {
     mode = "wall";
     controller.abort(new PauseNowSignal());
     const result = await withTimeout(running, 5000, "B8 rework");
-    assert.equal(result.walled, undefined);
+    assert.deepEqual(result.walled, { reason: "codex run wall-clock timeout" });
     assert.equal(result.completionHeld, undefined);
-    assert.deepEqual(holds, ["codex run wall-clock timeout"], "the hold was offered first and declined");
-    assert.equal(rig.providerLaunches(), 3, "the refused park recreated the epoch again");
-    assert.equal(rig.epochs[1]!.transport.turnStartCount, 1, "the reaped rework epoch got no further turn/start");
-    assert.equal(rig.epochs[2]!.transport.turnStartCount, 1, "the rework re-drive ran on the fresh epoch");
-    assert.deepEqual(resumeRequests(rig, 2), ["th-1"]);
+    assert.deepEqual(holds, ["codex run wall-clock timeout"]);
+    assert.equal(parks, 0);
+    assert.equal(attempts, 1);
+    assert.equal(rig.providerLaunches(), 2, "declined hold launches no third epoch");
+    assert.equal(rig.epochs[1]!.transport.turnStartCount, 1);
+    assert.equal(rig.epochs[2]!.transport.turnStartCount, 0);
     assertNoPersistAfterReap(events);
-    assert.equal(events[events.length - 1], `persist:${homeOf(2)}`, "the terminal persist is the fresh epoch's");
+    assert.equal(events.at(-1), `reap:${homeOf(1)}`);
   });
 
   it("(B8 pause) an owner `now` that lands during the refused, reaping park parks before credential release or epoch recreation (issue #1782)", async () => {
@@ -14813,7 +14823,7 @@ describe("CodexExecutor: in-turn pause-now (issue #1764 M2)", () => {
     assert.equal(pauseParks, 0, "a pending cancel is never turned into a park");
   });
 
-  it("(S7) a post-attempt in-turn `wall` stays a wall after its refused hold even if a `now` lands during the hold; the `now` is honoured after", async () => {
+  it("3282 (S7) a declined post-attempt wall hold stops without consuming a newer owner now", async () => {
     const rig = makeMultiEpochRig([
       epochResponder("th-1", "tn-1", (t, th, tn) => {
         t.push(toolCall(1, "signal_done", { milestones_completed: ["m1"] }, th, tn, "done-1")).push(turnCompleted("completed", th, tn));
@@ -14822,7 +14832,7 @@ describe("CodexExecutor: in-turn pause-now (issue #1764 M2)", () => {
     ]);
     const hold = deferred<boolean>();
     const order: string[] = [];
-    const { ctx, pause } = pauseSteering({
+    const { ctx, pause, st } = pauseSteering({
       kind: "issue", completionInterlock: true, config: { max_iterations: 3 },
       checkpoint: async () => undefined,
       recordCompletionAttempt: async () => ({ unmet: ["m2"], attemptCount: 1 }),
@@ -14837,10 +14847,11 @@ describe("CodexExecutor: in-turn pause-now (issue #1764 M2)", () => {
     pause("now"); // the owner's `--now` replaces the mode during the hold
     hold.resolve(false);
     const result = await withTimeout(running, 3000, "S7 wall then now during hold");
-    assert.deepEqual(order, ["hold:codex run wall-clock timeout", "wall", "pause"],
-      "the refused hold falls through to the wall park it was routed as, then the pending `now` parks");
-    assert.ok(result.pausedAt, "the pending `now` parked the run");
-    assert.equal(result.walled, undefined);
+    assert.deepEqual(order, ["hold:codex run wall-clock timeout"],
+      "a declined post-attempt wall hold ends the flight without another park");
+    assert.equal(result.pausedAt, undefined);
+    assert.deepEqual(result.walled, { reason: "codex run wall-clock timeout" });
+    assert.equal(st.mode, "now", "the newer owner input was not consumed by a re-drive");
     assert.equal(result.completionHeld, undefined);
   });
 
@@ -23095,4 +23106,196 @@ describe("M3 Codex interrupted recovery delivery", () => {
     assert.match(texts[1]!, /SYSTEM-ANSWER/);
     texts.slice(1).forEach(text => assert.doesNotMatch(text, /interrupted_calls_|temporary mutations/));
   });
+});
+
+describe("3282 Codex historical completion wall routing", () => {
+  for (const route of ["spent", "pending", "budget", "trip", "refusal", "refusal-extension", "extension", "iteration"] as const) {
+    for (const accepted of (route === "extension" || route === "iteration" ? [true] : [true, false])) it(`3282 ${route} history without a flight attempt; hold ${accepted}`, async () => {
+      let dispatches = 0, parks = 0, takes = 0, holds = 0;
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method !== "turn/start") return {};
+        dispatches++;
+        assert.ok(dispatches <= 1, "no model redrive after a historical wall");
+        if (!["trip", "refusal", "refusal-extension"].includes(route)) {
+          if (route === "extension") c.transport.push(signalDone());
+          c.transport.push(turnCompleted());
+        }
+        return { turn: { id: "tn-1" } };
+      } });
+      rig.deps = { ...rig.deps, wallMs: 20, idleMs: 5000 };
+      const { ctx } = makeCtx({
+        kind: "issue", completionInterlock: true, recordCompletionAttempt: async () => ({ unmet: [], attemptCount: 2 }), config: { max_iterations: 1 },
+        reportIteration: async () => route.startsWith("refusal") ? undefined : ({
+          completionAttempts: 1, totalWallSeconds: route === "trip" ? 0.02 : 60,
+          usedWallSeconds: route === "spent" ? 60 : 0,
+          pauseRequested: route === "pending", budgetExhausted: route === "budget",
+        }),
+        pauseModeRequested: () => route === "pending" ? "wall" : null,
+        enterCompletionHold: async (_reason, options) => {
+          holds++;
+          assert.equal(options?.allowDegradedCapture, true);
+          return accepted;
+        },
+        parkForWall: async () => {
+          assert.equal(++parks, 1, "3282 historical wall must not retry wall parking");
+          return "refused";
+        },
+        takeWallParkRefresh: () => {
+          takes++;
+          return { completionAttempts: 1, totalSeconds: route === "refusal-extension" ? 120 : 60, usedSeconds: 60 };
+        },
+      });
+      const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      if (route === "iteration") {
+        await assert.rejects(running, /iteration/);
+        assert.equal(holds, 0, "history alone must not change iteration routing");
+      } else {
+        const result = await withTimeout(running, 5000, "3282 historical wall");
+        if (route === "extension") {
+          assert.equal(holds, 0); assert.equal(result.completionHeld, undefined);
+        } else {
+          assert.ok(accepted ? result.completionHeld : result.walled);
+          assert.equal(holds, 1);
+        }
+      }
+      assert.equal(dispatches, ["spent", "pending", "budget"].includes(route) ? 0 : 1);
+      assert.equal(parks, route.startsWith("refusal") ? 1 : 0);
+      assert.equal(takes, parks, "refusal evidence is consumed once");
+      assert.equal(rig.providerLaunches(), dispatches, "no provider epoch without work or after a positive refusal");
+    });
+  }
+
+  it("3282 history survives zero and missing ACKs before a pending wall", async () => {
+    let reports = 0, dispatches = 0, holds = 0;
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method !== "turn/start") return {};
+      dispatches++; c.transport.push(turnCompleted());
+      return { turn: { id: "tn-1" } };
+    } });
+    const { ctx } = makeCtx({
+      kind: "issue", completionInterlock: true, recordCompletionAttempt: async () => ({ unmet: [], attemptCount: 2 }), config: { max_iterations: 5 },
+      reportIteration: async () => {
+        reports++;
+        return reports === 1 ? { completionAttempts: 1 }
+          : reports === 2 ? { completionAttempts: 0 } : { pauseRequested: true };
+      },
+      pauseModeRequested: () => reports >= 3 ? "wall" : null,
+      enterCompletionHold: async () => { holds++; return true; },
+    });
+    assert.ok((await makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx)).completionHeld);
+    assert.equal(dispatches, 2); assert.equal(holds, 1);
+  });
+
+  it("3282 cancellation racing a resumed historical hold wins", async () => {
+    let cancelled = false, holds = 0;
+    let release!: () => void, entered!: () => void;
+    const admitted = new Promise<void>(resolve => { entered = resolve; });
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    const rig = makeRig();
+    const { ctx } = makeCtx({
+      kind: "issue", completionInterlock: true, recordCompletionAttempt: async () => ({ unmet: [], attemptCount: 2 }),
+      reportIteration: async () => ({ completionAttempts: 1, budgetExhausted: true }),
+      cancelRequested: () => cancelled,
+      enterCompletionHold: async () => { holds++; entered(); await barrier; return true; },
+    });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    try {
+      await withTimeout(Promise.race([admitted, running.then(() => {
+        throw new Error("3282 run ended before historical hold admission");
+      })]), 2000, "3282 hold admission");
+      cancelled = true;
+    } finally { release(); }
+    await assert.rejects(running, /cancel/);
+    assert.equal(holds, 1);
+    assert.equal(rig.transport.turnStartCount, 0);
+  });
+});
+
+
+describe("3282 historical boundary regressions", () => {
+  it("3282 historical-only idle remains an idle error without hold or wall park", async () => {
+    const rig = makeMultiEpochRig([epochResponder("th-1", "tn-1", () => {})]);
+    rig.deps = { ...rig.deps, idleMs: 20, wallMs: 5000 };
+    let holds = 0, parks = 0;
+    const { ctx } = makeCtx({ kind: "issue", completionInterlock: true,
+      reportIteration: async () => ({ completionAttempts: 1 }),
+      enterCompletionHold: async () => { holds++; return true; },
+      parkForWall: async () => { parks++; return "parked"; },
+    });
+    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "historical idle"), /codex run idle timeout/);
+    assert.equal(holds, 0); assert.equal(parks, 0);
+    assert.equal(rig.providerLaunches(), 1);
+    assert.equal(rig.epochs[0]!.transport.turnStartCount, 1);
+  });
+
+  for (const accepted of [true, false]) it(`3282 lost ACK and locally spent wall use refusal history without dispatch; hold ${accepted}`, async () => {
+    const rig = makeMultiEpochRig([]);
+    rig.deps = { ...rig.deps, wallMs: 0 };
+    let parks = 0, holds = 0, reports = 0, takes = 0;
+    const { ctx } = makeCtx({ kind: "issue", completionInterlock: true,
+      reportIteration: async () => { reports++; return undefined; },
+      parkForWall: async () => { parks++; return "refused"; },
+      takeWallParkRefresh: () => { takes++; return { completionAttempts: 1, totalSeconds: 60, usedSeconds: 0 }; },
+      enterCompletionHold: async (_reason, options) => {
+        holds++; assert.equal(options?.allowDegradedCapture, true); return accepted;
+      },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "lost ACK spent wall");
+    assert.ok(accepted ? result.completionHeld : result.walled);
+    assert.equal(holds, 1); assert.equal(parks, 1); assert.equal(takes, 1);
+    assert.equal(reports, 1); assert.equal(rig.providerLaunches(), 0);
+  });
+
+  it("3282 history survives checkpoint epoch recreation and zero then missing ACK", async () => {
+    const checkpoint = epochResponder("th-1", "tn-1", (t, th, tn) => {
+      t.push(toolCall(1, "checkpoint", {}, th, tn, "history-checkpoint")).push(turnCompleted("completed", th, tn));
+    });
+    const rig = makeMultiEpochRig([checkpoint, resumedEpochResponder("th-1", "tn-2", (t, th, tn) => {
+      t.push(turnCompleted("completed", th, tn));
+    })]);
+    let exec!: CodexExecutor;
+    let reports = 0, holds = 0, parks = 0;
+    const { ctx } = makeCtx({ kind: "issue", completionInterlock: true, config: { max_iterations: 5 },
+      reportIteration: async () => {
+        reports++;
+        return reports === 1 ? { completionAttempts: 1 } : reports === 2 ? { completionAttempts: 0 } : { pauseRequested: true };
+      },
+      pauseModeRequested: () => reports >= 3 ? "wall" : null,
+      checkpoint: async opts => {
+        if (opts.reap) await exec.safety!.withBoundary({ boundary: "checkpoint", deadlineMs: 200 }, async () => {});
+      },
+      enterCompletionHold: async (_reason, options) => { holds++; assert.equal(options?.allowDegradedCapture, true); return true; },
+      parkForWall: async () => { parks++; return "parked"; },
+    });
+    exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    assert.ok((await withTimeout(exec.run(ctx), 5000, "historical epoch recreation")).completionHeld);
+    assert.equal(reports, 3); assert.equal(holds, 1); assert.equal(parks, 0);
+    assert.equal(rig.providerLaunches(), 2);
+    assert.deepEqual(rig.epochs.map(e => e.transport.turnStartCount), [1, 1]);
+    assert.deepEqual(rig.epochs[1]!.transport.requests.filter(q => q.method === "thread/resume").map(q => String(rec(q.params).threadId)), ["th-1"]);
+  });
+});
+
+
+it("3282 planning wrapper holds on positive refusal history without an implementation latch", async () => {
+  const rig = makeRig();
+  rig.deps = { ...rig.deps, wallMs: 0, launchProviderRoot: async () => {
+    assert.fail("a positive refusal must not release another provider root");
+  } };
+  let parks = 0, holds = 0, takes = 0;
+  const { ctx } = makeCtx({ kind: "issue", completionInterlock: true,
+    planApproved: false, approvedPlan: undefined,
+    gatePlan: async () => { throw new Error("spent planning flight must not reach approval"); },
+    parkForWall: async () => { assert.equal(++parks, 1); return "refused"; },
+    takeWallParkRefresh: () => { takes++; return { completionAttempts: 1, totalSeconds: 60, usedSeconds: 60 }; },
+    enterCompletionHold: async (_reason, options) => { holds++; assert.equal(options?.allowDegradedCapture, true); return true; },
+  });
+  const outcome = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 2000, "planning historical refusal")
+    .then(result => ({ result, error: undefined }), error => ({ result: undefined, error }));
+  assert.equal(holds, 1, "the server-confirmed count must hold regardless of caller phase");
+  assert.equal(outcome.error, undefined);
+  assert.ok(outcome.result?.completionHeld);
+  assert.equal(parks, 1); assert.equal(takes, 1); assert.equal(rig.providerLaunches(), 0);
 });

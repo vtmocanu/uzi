@@ -7,8 +7,8 @@
 # requires: -
 # provides: J_RUN
 # handoff:  -
-# mutates:  settings:judge_enabled=true,judge_model=haiku; per-user judge opt-in PUT /api/me/judge enabled=true (both restored in-phase at the end)
-# restores: settings:judge_enabled=false + per-user opt-in OFF, in-phase at the end (explicit restores + EXIT-trap fail-safe so a mid-phase fail can't leave judge globally enabled; 39-review-row-cap re-disables idempotently as belt-and-braces)
+# mutates:  settings:judge_enabled=true,judge_model=haiku; per-user judge opt-in PUT /api/me/judge enabled=true (all restored in-phase at the end; judge_model is restored to "", i.e. Default)
+# restores: settings:judge_enabled=false, judge_model="" (Default, the built-in) + per-user opt-in OFF, in-phase at the end (explicit restores + EXIT-trap fail-safe so a mid-phase fail can't leave judge globally enabled; 39-review-row-cap re-disables idempotently as belt-and-braces)
 # =============================================================================
 # PRD #46 — run judge, end to end. UZI_E2E_EXECUTOR=stub
 # selects the STUB judge queryFn (judge-runner-stub.ts): the judge model call makes
@@ -66,7 +66,7 @@ pass "judge enabled (global kill-switch + admin opt-in); dummy token present; va
 # restore at the end; without this the fail-soft driver continues with judge
 # globally enabled and later completed runs would re-enqueue judge runs. Dropped
 # with `trap - EXIT` after the explicit restore runs.
-trap 'apiput /api/admin/settings '\''{"settings":{"judge_enabled":"false"}}'\'' >/dev/null 2>&1 || true; apiput /api/me/judge '\''{"enabled":false}'\'' >/dev/null 2>&1 || true' EXIT
+trap 'apiput /api/admin/settings '\''{"settings":{"judge_enabled":"false","judge_model":""}}'\'' >/dev/null 2>&1 || true; apiput /api/me/judge '\''{"enabled":false}'\'' >/dev/null 2>&1 || true' EXIT
 
 # --- the funnel: a finished run is auto-judged; a durable review lands ---
 J_IID="$(apipost "/api/repos/$REPO_ID/issues" \
@@ -126,7 +126,7 @@ pass "durable: review $J_REVIEW_ID re-reads through the judge API, anchored to $
 # The judged run + its review are already persisted above, and nothing downstream needs
 # judge auto-enqueue on (see the header note), so disabling now is safe and keeps the
 # concurrency capacity math clean regardless of which later phases run.
-apiput /api/admin/settings '{"settings":{"judge_enabled":"false"}}' >/dev/null
+apiput /api/admin/settings '{"settings":{"judge_enabled":"false","judge_model":""}}' >/dev/null
 apiput /api/me/judge '{"enabled":false}' >/dev/null
 trap - EXIT  # explicit restore done; drop the fail-safe
 pass "judge disabled again in-phase (global + opt-in); 39 re-disables idempotently"

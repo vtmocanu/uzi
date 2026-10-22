@@ -6,6 +6,7 @@
   "default_effort": null,
   "default_codex_effort": null,
   "judge_model": null,
+  "codex_judge_model": null,
   "summary_model": null,
   "theme": null,
   "mr_rework_enabled": null,
@@ -16,5 +17,6 @@
   "light_theme": null,
   "dark_theme": null,
   "typeface": null,
-  "default_harness": null
+  "default_harness": null,
+  "judge_models": null
 }

@@ -33,7 +33,11 @@ type UserSettingsDTO struct {
 	// DefaultCodexEffort is the independently retained Codex effort; null inherits medium.
 	DefaultCodexEffort *string `json:"default_codex_effort"`
 	JudgeModel         *string `json:"judge_model"`
-	SummaryModel       *string `json:"summary_model"`
+	// CodexJudgeModel is the Codex judge lane mirror (PRD #3245): null inherits the
+	// instance Codex judge model. JudgeModels is the read-only resolved view of both
+	// judge lanes, ordered claude then codex.
+	CodexJudgeModel *string `json:"codex_judge_model"`
+	SummaryModel    *string `json:"summary_model"`
 	// Theme is the DEPRECATED legacy single-theme override mirror (PRD #21); kept
 	// one release. The appearance override lives in the four fields below (PRD #1167).
 	Theme *string `json:"theme"`
@@ -65,4 +69,6 @@ type UserSettingsDTO struct {
 	// per-harness worker-model lanes (PRD #1551 M1 / D2); each null = inherit. Fidelity only.
 	DefaultClaudeModel *string `json:"default_claude_model"`
 	DefaultCodexModel  *string `json:"default_codex_model"`
+	// JudgeModels is read-only (never sent on a PUT): one cell per harness, claude then codex.
+	JudgeModels []ModelSettingCellDTO `json:"judge_models"`
 }

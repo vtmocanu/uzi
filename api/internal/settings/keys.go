@@ -4,6 +4,7 @@ package settings
 // SecretKeys, IsSecret and Known. Split from settings.go for PRD #1021.
 
 import (
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/theme"
 )
 
@@ -49,6 +50,9 @@ const (
 	// Both are admin-writable and carry compiled-in defaults.
 	KeyJudgeEnabled = "judge_enabled"
 	KeyJudgeModel   = "judge_model"
+	// KeyCodexJudgeModel (PRD #3245) is the instance Codex-lane judge model: a
+	// curated Codex id, or "" for the built-in. KeyJudgeModel is the Claude lane.
+	KeyCodexJudgeModel = "codex_judge_model"
 	// KeyJudgeEnforceAll (PRD #69) is an admin bool ("true"/"false"). When true it
 	// bypasses the per-user judge_enabled opt-in gate so every run is judged; the
 	// kill-switch (KeyJudgeEnabled) and token presence still govern, so a disabled
@@ -333,7 +337,6 @@ const (
 	// cost lever down to haiku/sonnet; opus is ~5–15× haiku per run, which is why
 	// M5's spend guards and the per-user override exist.
 	DefaultJudgeEnabled = "false"
-	DefaultJudgeModel   = "opus"
 	// PRD #364. The GitHub Projects v2 Status sync is OFF until an admin enables it
 	// (it writes to a user's project board), so the feature is a strict no-op on a
 	// fresh instance and on upgrade.
@@ -499,7 +502,8 @@ var Defaults = map[string]string{
 	// PRD #46 admin-writable keys. No seeded row (an absent row synthesizes to these
 	// defaults).
 	KeyJudgeEnabled:         DefaultJudgeEnabled,
-	KeyJudgeModel:           DefaultJudgeModel,
+	KeyJudgeModel:           agenttmpl.DefaultClaudeJudgeModel,
+	KeyCodexJudgeModel:      agenttmpl.DefaultCodexJudgeModel,
 	KeyJudgeEnforceAll:      DefaultJudgeEnforceAll,
 	KeyJudgeCooldownSeconds: DefaultJudgeCooldownSeconds,
 	KeyJudgeDailyBudget:     DefaultJudgeDailyBudget,

@@ -38,12 +38,6 @@ func (c *Cache) JudgeEnforceAll(ctx context.Context) (bool, error) {
 	return c.boolSetting(ctx, KeyJudgeEnforceAll)
 }
 
-// JudgeModel returns the model alias the judge runs on (PRD #46 Decision 7). Falls
-// back to the strong DefaultJudgeModel ("opus", PRD #69 Decision 1).
-func (c *Cache) JudgeModel(ctx context.Context) (string, error) {
-	return c.get(ctx, KeyJudgeModel)
-}
-
 // SummaryModel returns the model alias the inline run-summary generator runs on
 // (PRD #362 Decision 8). Falls back to DefaultSummaryModel ("haiku"). The per-user
 // override (users.summary_model) is resolved user-value-wins at issue-run claim
@@ -77,6 +71,23 @@ func validateModelAlias(value string) error {
 	}
 	_, err := agenttmpl.ValidateModel(value)
 	return err
+}
+
+// validateCodexJudgeModel is the write-time gate for the instance Codex judge
+// model (PRD #3245): blank (or whitespace-only) is the explicit reset to the
+// built-in; otherwise the trimmed value must be a curated Codex id.
+func validateCodexJudgeModel(value string) error {
+	m := strings.TrimSpace(value)
+	if m == "" {
+		return nil
+	}
+	if agenttmpl.KnownClaudeAliases[m] {
+		return errors.New("must be a Codex model; this is a Claude model alias")
+	}
+	if !agenttmpl.CuratedCodexModels[m] {
+		return errors.New("is not a Codex judge model")
+	}
+	return nil
 }
 
 // validateJudgeDailyBudget is the write-time gate for the per-user judge daily

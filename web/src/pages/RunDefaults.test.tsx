@@ -12,7 +12,8 @@ import { MemoryRouter } from "react-router-dom";
 import { RunDefaults } from "./RunDefaults";
 import { api, ApiError, type User } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
-import type { UserSettings } from "../lib/apiTypes";
+import type { ModelSettingCell, UserSettings } from "../lib/apiTypes";
+import { CODEX_CURATED_MODELS } from "../lib/codexModels";
 import { mockTemplates } from "../mocks/data";
 
 vi.mock("../lib/api", async (importActual) => {
@@ -276,7 +277,7 @@ describe("Run defaults — run judge opt-in (PRD #46, Decision 7)", () => {
   const judgeToggle = () =>
     screen.getByLabelText("Judge my finished runs") as HTMLInputElement;
 
-  it("states plainly what the judge does and that it spends the user's tokens", () => {
+  it("states plainly what the judge does and that it spends the credential of the run's harness", () => {
     const { container } = render(
       <MemoryRouter>
         <RunDefaults />
@@ -284,7 +285,10 @@ describe("Run defaults — run judge opt-in (PRD #46, Decision 7)", () => {
     );
     const text = container.textContent ?? "";
     expect(text).toMatch(/finished/i);
-    expect(text).toMatch(/your own Anthropic tokens/i);
+    // PRD #3245: the judge spends the credential of the run's harness, not always Anthropic.
+    expect(text).toContain(
+      "reviewed by an LLM on the credential of the run\u2019s harness: your Anthropic token for a Claude run, your Codex credential for a Codex run.",
+    );
     expect(text).toMatch(/recommend/i);
   });
 
@@ -350,21 +354,39 @@ describe("Run defaults — judge enforced banner + per-user model (PRD #69 M4)",
     expect(container.textContent ?? "").not.toMatch(/ENFORCED/i);
   });
 
-  it("renders the enforced banner naming the effective model and the token opt-out", async () => {
+  it("renders the enforced banner naming both resolved judge models and the credential opt-out", async () => {
     mockAuth(baseUser, { judgeEnforcedByAdmin: true, effectiveJudgeModel: "sonnet" });
-    const { container } = render(
+    mockApi.getMySettings.mockResolvedValue({ settings: {
+      default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: null,
+      appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null,
+      judge_models: [
+        { harness: "claude", model: null, default_model: "sonnet", default_source: "instance_default", resolved_model: "sonnet", source: "instance_default" },
+        { harness: "codex", model: "gpt-6-sol", default_model: "gpt-6.1-sol", default_source: "builtin", resolved_model: "gpt-6-sol", source: "user_default" },
+      ],
+    } });
+    render(
       <MemoryRouter>
         <RunDefaults />
       </MemoryRouter>,
     );
-    await screen.findByText("Run judge");
-    const text = container.textContent ?? "";
-    expect(text).toMatch(/ENFORCED/);
-    expect(text).toMatch(/model: sonnet/);
-    expect(text).toMatch(/remove your Anthropic token/i);
+    const banner = await screen.findByText(/ENFORCED/);
+    await waitFor(() => expect(banner.textContent).toContain("(Claude runs on sonnet, Codex runs on gpt-6-sol)"));
+    expect(banner.textContent).toContain("your own credential for the run's harness");
+    expect(banner.textContent).toContain("remove your credential for that harness");
   });
 
-  it("saves the per-user judge model through PUT /me/settings", async () => {
+  it("falls back to the session's effective model in the banner on a server without judge_models", async () => {
+    mockAuth(baseUser, { judgeEnforcedByAdmin: true, effectiveJudgeModel: "sonnet" });
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+    await screen.findByLabelText("Claude judge model");
+    expect(screen.getByText(/ENFORCED/).textContent).toContain("(Claude runs on sonnet)");
+  });
+
+  it("saves the per-user Claude judge model through PUT /me/settings", async () => {
     mockApi.getMySettings.mockResolvedValue({
       settings: { default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
     });
@@ -378,10 +400,177 @@ describe("Run defaults — judge enforced banner + per-user model (PRD #69 M4)",
     );
     await screen.findByText("Run judge");
     // The judge-model picker offers a "haiku" option; selecting it dirties Save.
-    const select = screen.getByLabelText("Judge model") as HTMLSelectElement;
+    const select = screen.getByLabelText("Claude judge model") as HTMLSelectElement;
     fireEvent.change(select, { target: { value: "haiku" } });
-    fireEvent.click(screen.getByText("Save judge model"));
+    fireEvent.click(screen.getByText("Save judge models"));
     await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ judge_model: "haiku" }));
+  });
+});
+
+// PRD #3245: one judge model per harness. The lanes follow the worker-model lane rules,
+// the Default labels and In-effect lines come from the server's judge_models cells, and
+// one Save sends only the lanes that changed.
+describe("Run defaults — judge model per harness (PRD #3245)", () => {
+  const key = (kind: string) => ({
+    id: kind, kind, label: kind, is_default: true, enabled: true, disabled_at: null, auto_eligible: false,
+    created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
+  });
+  const cells = (): ModelSettingCell[] => [
+    { harness: "claude", model: null, default_model: "sonnet", default_source: "instance_default", resolved_model: "sonnet", source: "instance_default" },
+    { harness: "codex", model: "gpt-6-sol", default_model: "gpt-6.1-sol", default_source: "builtin", resolved_model: "gpt-6-sol", source: "user_default" },
+  ];
+  const judgeSettings = (over: Partial<UserSettings> = {}): { settings: UserSettings } => ({
+    settings: {
+      default_harness: null, default_model: null, default_effort: null, summary_model: null,
+      appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null,
+      judge_model: null, codex_judge_model: "gpt-6-sol", judge_models: cells(),
+      ...over,
+    },
+  });
+  const optionValues = (select: HTMLSelectElement) => Array.from(select.options).map((o) => o.value);
+  const renderPage = () => render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+
+  it("Codex-only: the Codex judge select offers exactly the curated models and no Other (#1454)", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("openai_api_key")] });
+    mockApi.getMySettings.mockResolvedValue(judgeSettings());
+    renderPage();
+    const codex = (await screen.findByLabelText("Codex judge model")) as HTMLSelectElement;
+    expect(optionValues(codex)).toEqual(["inherit", ...CODEX_CURATED_MODELS]);
+    expect(optionValues(codex)).not.toContain("custom");
+    expect(codex.value).toBe("gpt-6-sol");
+    // A Codex-only user sees only the Codex judge lane (the worker-lane rule).
+    expect(screen.queryByLabelText("Claude judge model")).toBeNull();
+  });
+
+  it("Claude-only: the Claude judge select offers the Claude aliases plus Other, and no Codex lane", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token")] });
+    mockApi.getMySettings.mockResolvedValue(judgeSettings());
+    renderPage();
+    const claude = (await screen.findByLabelText("Claude judge model")) as HTMLSelectElement;
+    expect(optionValues(claude)).toEqual(["inherit", "opus", "sonnet", "haiku", "fable", "custom"]);
+    expect(screen.queryByLabelText("Codex judge model")).toBeNull();
+  });
+
+  it("both usable: both lanes show; no credential: the Claude lane alone", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
+    mockApi.getMySettings.mockResolvedValue(judgeSettings());
+    renderPage();
+    expect(await screen.findByLabelText("Claude judge model")).toBeTruthy();
+    expect(screen.getByLabelText("Codex judge model")).toBeTruthy();
+    cleanup();
+    mockApi.listSecrets.mockResolvedValue({ secrets: [] });
+    renderPage();
+    expect(await screen.findByLabelText("Claude judge model")).toBeTruthy();
+    expect(screen.queryByLabelText("Codex judge model")).toBeNull();
+  });
+
+  it("labels Default and the In-effect line from judge_models, wired by aria-describedby", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
+    mockApi.getMySettings.mockResolvedValue(judgeSettings());
+    renderPage();
+    const claude = (await screen.findByLabelText("Claude judge model")) as HTMLSelectElement;
+    const codex = screen.getByLabelText("Codex judge model") as HTMLSelectElement;
+    expect(claude.options[0].textContent).toBe("Default \u00b7 sonnet (instance default)");
+    expect(codex.options[0].textContent).toBe("Default \u00b7 gpt-6.1-sol (built-in)");
+    const claudeEffect = document.getElementById(claude.getAttribute("aria-describedby") ?? "");
+    const codexEffect = document.getElementById(codex.getAttribute("aria-describedby") ?? "");
+    expect(claudeEffect?.textContent).toBe("In effect: sonnet \u00b7 instance default");
+    expect(codexEffect?.textContent).toBe("In effect: gpt-6-sol \u00b7 your choice");
+  });
+
+  it("saves only the dirty lane, and adopts the response's In-effect cell", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
+    mockApi.getMySettings.mockResolvedValue(judgeSettings());
+    const saved = cells();
+    saved[1] = { ...saved[1], model: null, resolved_model: "gpt-6.1-sol", source: "builtin" };
+    mockApi.putMySettings.mockResolvedValue(judgeSettings({ codex_judge_model: null, judge_models: saved }));
+    renderPage();
+    const codex = (await screen.findByLabelText("Codex judge model")) as HTMLSelectElement;
+    const save = screen.getByRole("button", { name: "Save judge models" }) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    fireEvent.change(codex, { target: { value: "inherit" } });
+    fireEvent.click(save);
+    // Only the Codex lane changed, so only it is sent; null means Default.
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ codex_judge_model: null }));
+    await waitFor(() =>
+      expect(document.getElementById("codex-judge-model-effect")?.textContent).toBe("In effect: gpt-6.1-sol \u00b7 built-in"),
+    );
+    expect(save.disabled).toBe(true);
+  });
+
+  it("sends both lanes when both changed", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
+    mockApi.getMySettings.mockResolvedValue(judgeSettings());
+    mockApi.putMySettings.mockResolvedValue(judgeSettings({ judge_model: "haiku", codex_judge_model: "gpt-6-astra" }));
+    renderPage();
+    fireEvent.change(await screen.findByLabelText("Claude judge model"), { target: { value: "haiku" } });
+    fireEvent.change(screen.getByLabelText("Codex judge model"), { target: { value: "gpt-6-astra" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save judge models" }));
+    await waitFor(() =>
+      expect(mockApi.putMySettings).toHaveBeenCalledWith({ judge_model: "haiku", codex_judge_model: "gpt-6-astra" }),
+    );
+  });
+
+  it("refuses to save an empty custom Claude judge model instead of resetting to Default", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token")] });
+    mockApi.getMySettings.mockResolvedValue(judgeSettings({ judge_model: "haiku" }));
+    renderPage();
+    const claude = (await screen.findByLabelText("Claude judge model")) as HTMLSelectElement;
+    await waitFor(() => expect(claude.value).toBe("haiku"));
+    const save = screen.getByRole("button", { name: "Save judge models" }) as HTMLButtonElement;
+    fireEvent.change(claude, { target: { value: "custom" } });
+    expect(claude.value).toBe("custom");
+    expect(screen.getByText("Enter a model ID, or choose Default.").getAttribute("role")).toBe("alert");
+    expect(save.disabled).toBe(true);
+    // Filling the ID clears the refusal and enables Save (the positive half above
+    // proves this query finds the message when it is rendered).
+    fireEvent.change(screen.getByLabelText("Custom Claude judge model ID"), { target: { value: "claude-opus-4-8" } });
+    expect(screen.queryByText("Enter a model ID, or choose Default.")).toBeNull();
+    expect(save.disabled).toBe(false);
+  });
+
+  // gpt-6-luna is a Codex role model but not a curated one, so it pins the warning to
+  // the role set (CODEX_ROLE_MODELS), not the curated picker list.
+  it.each(["gpt-6-astra", "gpt-6-luna"])(
+    "flags a stored Codex id (%s) in the Claude lane and shows what is in effect instead",
+    async (id) => {
+      mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token")] });
+      // The server drops the Codex id from the Claude lane, so the cell resolves to the
+      // instance default (sonnet), exactly as cells() describes it.
+      const legacy = cells();
+      legacy[0] = { ...legacy[0], model: id };
+      mockApi.getMySettings.mockResolvedValue(judgeSettings({ judge_model: id, judge_models: legacy }));
+      const { container } = renderPage();
+      const claude = (await screen.findByLabelText("Claude judge model")) as HTMLSelectElement;
+      await waitFor(() => expect(claude.value).toBe("custom"));
+      expect(document.getElementById("judge-model-effect")?.textContent).toBe("In effect: sonnet \u00b7 instance default");
+      expect(container.textContent).toContain(
+        `Not a Claude model: ${id} is a Codex model, so Claude judges skip it. Choose Default to clear it.`,
+      );
+    },
+  );
+
+  it("a stored Codex id in the Claude lane does not block saving the Codex lane", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
+    // The server resolver drops the stored gpt-6-luna, so the Claude cell resolves to
+    // the instance default.
+    const legacy = cells();
+    legacy[0] = { ...legacy[0], model: "gpt-6-luna" };
+    mockApi.getMySettings.mockResolvedValue(judgeSettings({ judge_model: "gpt-6-luna", judge_models: legacy }));
+    mockApi.putMySettings.mockResolvedValue(
+      judgeSettings({ judge_model: "gpt-6-luna", codex_judge_model: "gpt-6-astra", judge_models: legacy }),
+    );
+    renderPage();
+    const claude = (await screen.findByLabelText("Claude judge model")) as HTMLSelectElement;
+    await waitFor(() => expect(claude.value).toBe("custom"));
+    const save = screen.getByRole("button", { name: "Save judge models" }) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    fireEvent.change(screen.getByLabelText("Codex judge model"), { target: { value: "gpt-6-astra" } });
+    // The Claude lane is untouched, so its warning does not gate this save.
+    expect(save.disabled).toBe(false);
+    fireEvent.click(save);
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledTimes(1));
+    expect(mockApi.putMySettings.mock.calls[0][0]).toStrictEqual({ codex_judge_model: "gpt-6-astra" });
   });
 });
 
@@ -1532,7 +1721,7 @@ describe("B1 independent settings responses", () => {
         await screen.findByLabelText("Claude checker model");
         expect(currentSettings()).toEqual(initial);
         if (sibling === "grid") start("Claude checker model", "sonnet", "Save cross-check defaults");
-        if (sibling === "judge") start("Judge model", "sonnet", "Save judge model");
+        if (sibling === "judge") start("Claude judge model", "sonnet", "Save judge models");
         if (sibling === "summary") start("Summary model", "sonnet", "Save summary model");
         if (sibling === "MR") fireEvent.click(screen.getByLabelText("Auto-rework MR review comments on my runs"));
         start(worker.label, worker.value, worker.button);
@@ -1542,7 +1731,7 @@ describe("B1 independent settings responses", () => {
         const finishSibling = async () => {
           replies[0]({ settings: siblingSettings });
           if (sibling === "MR") await waitFor(() => expect((screen.getByLabelText("Auto-rework MR review comments on my runs") as HTMLInputElement).disabled).toBe(false));
-          else await waitFor(() => expect((screen.getByRole("button", { name: sibling === "grid" ? "Save cross-check defaults" : sibling === "judge" ? "Save judge model" : "Save summary model" }) as HTMLButtonElement).disabled).toBe(true));
+          else await waitFor(() => expect((screen.getByRole("button", { name: sibling === "grid" ? "Save cross-check defaults" : sibling === "judge" ? "Save judge models" : "Save summary model" }) as HTMLButtonElement).disabled).toBe(true));
         };
         if (workerFirst) {
           await finish(replies[1], worker.button === "Save defaults" ? modelResponse(worker.response) : { ...initial, ...worker.response }, worker.button);
@@ -1558,7 +1747,7 @@ describe("B1 independent settings responses", () => {
         expect(mockApi.listAgentTemplates).not.toHaveBeenCalled();
         expect(mockApi.getTemplateAllocations).not.toHaveBeenCalled();
         if (sibling === "grid") expect((screen.getByLabelText("Claude checker model") as HTMLSelectElement).value).toBe("sonnet");
-        if (sibling === "judge") expect((screen.getByLabelText("Judge model") as HTMLSelectElement).value).toBe("sonnet");
+        if (sibling === "judge") expect((screen.getByLabelText("Claude judge model") as HTMLSelectElement).value).toBe("sonnet");
         if (sibling === "summary") expect((screen.getByLabelText("Summary model") as HTMLSelectElement).value).toBe("sonnet");
       });
     }
