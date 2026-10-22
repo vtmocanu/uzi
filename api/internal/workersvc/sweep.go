@@ -451,6 +451,7 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	}
 	// Same bound for the residue-quarantine tracker (issue #2213).
 	s.quarantine.prune(now)
+	s.memAuthority.prune(now) // issue #3142
 
 	// Run-health detector (PRD #47): flag/clear slow, stalled, looping, stuck-queued,
 	// and approval-idle runs from telemetry already in Postgres. Best-effort and

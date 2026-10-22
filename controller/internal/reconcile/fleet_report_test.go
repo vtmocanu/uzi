@@ -96,3 +96,57 @@ func TestTickMergesFleetReportInSinglePOST(t *testing.T) {
 		})
 	}
 }
+
+// A held pacing entry for an ephemeral (run-bound) worker rides on its observed row
+// with that row's own phase; when the worker has no health signal it gets NO synthetic
+// rolling row, because the api stamps its upgrading_since ceiling anchor on the first
+// non-terminal phase. A non-ephemeral worker in the same position still gets the
+// rolling-gap row (control).
+func TestEphemeralHeldPacingNeverGetsSyntheticRollingRow(t *testing.T) {
+	client, reports := statusWireClient(t)
+	held := func(img string) *protocol.Pacing {
+		return &protocol.Pacing{State: "held", TargetImage: img, BlockingReason: strPtr("layout_migration_custody")}
+	}
+	m := &pacingMaterializer{
+		fakeMaterializer: fakeMaterializer{observed: []ObservedWorker{
+			{ID: "eph-observed", Roll: RollHealth{Phase: protocol.PhaseSettled, PodPhase: "Running"}},
+			{ID: "eph-nosignal"},
+			{ID: "plain-nosignal"},
+		}},
+		outcomes: map[string]*protocol.Pacing{
+			"eph-observed":   held("img-a"),
+			"eph-nosignal":   held("img-b"),
+			"plain-nosignal": held("img-c"),
+		},
+	}
+	p := &fakePoller{resp: protocol.PollResponse{Workers: []protocol.DesiredWorker{
+		{ID: "eph-observed", Ephemeral: true}, {ID: "eph-nosignal", Ephemeral: true}, {ID: "plain-nosignal"},
+	}}}
+	l := New(p, m, client, 10*time.Second, "tag", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := l.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var capture capturedStatusWire
+	select {
+	case capture = <-reports:
+	default:
+		t.Fatal("no fleet status POST")
+	}
+	var got protocol.StatusReport
+	if err := json.Unmarshal(capture.body, &got); err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]protocol.WorkerStatus{}
+	for _, w := range got.Workers {
+		byID[w.ID] = w
+	}
+	if w, ok := byID["eph-observed"]; !ok || w.Phase != protocol.PhaseSettled || w.Pacing == nil || w.Pacing.State != "held" {
+		t.Errorf("observed ephemeral row = %+v, want settled phase with the held pacing attached", w)
+	}
+	if w, ok := byID["eph-nosignal"]; ok {
+		t.Errorf("ephemeral worker without health got a synthetic row: %+v", w)
+	}
+	if w, ok := byID["plain-nosignal"]; !ok || w.Phase != protocol.PhaseRolling || w.Pacing == nil {
+		t.Errorf("control: non-ephemeral gap row = %+v, want rolling with pacing", w)
+	}
+}

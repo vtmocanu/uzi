@@ -8,7 +8,7 @@ import { SdkExecutor, type SdkExecutorOptions, type SdkQueryFn } from "../src/sd
 import type { RunContext } from "../src/executor.js";
 import { CredentialSwitchSignal, PauseNowSignal, type PauseMode, type PlanVerdict } from "../src/steering.js";
 import { DiskParkSignal } from "../src/cache-cap.js";
-import { nonexistentWorktreeFactory, nullLogger } from "./helpers.js";
+import { nonexistentWorktreeFactory, nullLogger, recordingLogger } from "./helpers.js";
 
 /**
  * PRD #1809 D4 — the SdkExecutor side of the cache cap and the pressure stop:
@@ -501,6 +501,20 @@ describe("SdkExecutor — PRD #1809 D4 process attribution (BLOCKING 1)", () => 
       runProcesses: { scan: async () => ({ pids: [], complete: true }), reap: async () => outcome },
     });
     assert.deepStrictEqual(await exec.reapAttributedProcesses(), outcome);
+  });
+
+  it("reapAttributedProcesses logs the survivors' classes as left_reasons", async () => {
+    const { logger, lines } = recordingLogger();
+    const exec = new SdkExecutor(logger, homeDir, {
+      runProcesses: {
+        scan: async () => ({ pids: [], complete: true }),
+        reap: async () => ({ killed: [], left: [8, 9], leftReasons: { 8: "worker_child", 9: "kill_failed" }, complete: true }),
+      },
+    });
+    await exec.reapAttributedProcesses();
+    const warn = lines.find((l) => (l as { msg: string }).msg.startsWith("reaped the run's processes")) as Record<string, unknown>;
+    assert.deepStrictEqual(warn.left, [8, 9]);
+    assert.deepStrictEqual(warn.left_reasons, { 8: "worker_child", 9: "kill_failed" });
   });
 
   it("reapAttributedProcesses reads a rejecting attribution reap as incomplete", async () => {

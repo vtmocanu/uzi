@@ -1,6 +1,7 @@
 import http from "node:http";
 import { createHash, randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
+import { decodeCrossCheckClaim } from "../src/code-cross-check-contract.js";
 import type { FakePrDescApi, PrDescOp } from "./fake-pr-desc-api.js";
 import type {
   ClaimResponse,
@@ -599,6 +600,90 @@ export class FakeApi {
       completionRevision: opts.completionRevision,
       fired: false,
     });
+  }
+
+  // issue #3181: the server's credential-switch hold, minimally. A hold applies to a run that is
+  // running at the reported generation, pauses it with hold_reason credential_switch_settling, and
+  // an owner Resume is refused until the settled acknowledgement moves it to credential_switch_unsettled.
+  private readonly switchHolds = new Map<string, { state: "settling" | "unsettled"; generation: number }>();
+  /** Every hold / hold-settled report received, with the wire fields the server fences on. */
+  readonly holdRequests: Array<{ runId: string; status: string; claim_generation?: number; register_nonce?: string }> = [];
+  private readonly holdReplyDrops = new Map<string, number>();
+  private holdRefusals = new Set<string>();
+
+  /** Apply the next `count` reports with this status server-side, then drop the connection (a lost ACK). */
+  dropHoldReplies(status: "credential_switch_held" | "credential_switch_hold_settled", count: number): void {
+    this.holdReplyDrops.set(status, count);
+  }
+
+  /** Refuse (409, not applied) every report with this status until cleared. */
+  refuseHold(status: "credential_switch_held" | "credential_switch_hold_settled", refuse = true): void {
+    if (refuse) this.holdRefusals.add(status); else this.holdRefusals.delete(status);
+  }
+
+  /** The hold's state, or undefined when none is held. */
+  holdState(runId: string): "settling" | "unsettled" | undefined {
+    return this.switchHolds.get(runId)?.state;
+  }
+
+  /** An owner Resume: refused while the hold is settling; otherwise the run is running again at
+   *  `nextGeneration` (the reclaim the resume leads to). */
+  ownerResume(runId: string, nextGeneration: number): "resumed" | "refused" {
+    const hold = this.switchHolds.get(runId);
+    if (hold?.state === "settling") return "refused";
+    this.switchHolds.delete(runId);
+    this.setOwnershipStatus(runId, "running", nextGeneration);
+    return "resumed";
+  }
+
+  private credentialSwitchHoldState(runId: string, body: StateRequest, res: http.ServerResponse): void {
+    const send = (status: number, payload: unknown): void => {
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(payload));
+    };
+    this.holdRequests.push({
+      runId, status: body.status,
+      ...(body.claim_generation !== undefined ? { claim_generation: body.claim_generation } : {}),
+      ...(body.register_nonce !== undefined ? { register_nonce: body.register_nonce } : {}),
+    });
+    if (!body.register_nonce) return send(400, { error: "register_nonce is required" });
+    const generation = body.claim_generation as number;
+    const hold = this.switchHolds.get(runId);
+    const own = this.ownershipByRun.get(runId);
+    const held = body.status === "credential_switch_held";
+    const runDto = (status: string, reason: string | null) => ({ id: runId, status, hold_reason: reason });
+    let applied: "held" | "hold_settled" | undefined;
+    if (!this.holdRefusals.has(body.status)) {
+      if (held) {
+        if (hold?.generation === generation && hold.state === "settling") applied = "held";
+        else if (!hold && (own?.status ?? "running") === "running" && (own?.generation === undefined || own.generation === generation)) {
+          this.switchHolds.set(runId, { state: "settling", generation });
+          this.setOwnershipStatus(runId, "paused", generation, undefined, "credential_switch_settling");
+          applied = "held";
+        }
+      } else if (hold?.generation === generation) {
+        if (hold.state === "settling") {
+          hold.state = "unsettled";
+          this.setOwnershipStatus(runId, "paused", generation, undefined, "credential_switch_unsettled");
+        }
+        applied = "hold_settled";
+      }
+    }
+    if (applied) this.states.push({ runId, body });
+    const drops = this.holdReplyDrops.get(body.status) ?? 0;
+    if (applied && drops > 0) {
+      this.holdReplyDrops.set(body.status, drops - 1);
+      res.destroy();
+      return;
+    }
+    if (!applied) {
+      const state = this.switchHolds.get(runId);
+      return send(409, { error: "credential switch hold refused", run: state
+        ? runDto("paused", state.state === "settling" ? "credential_switch_settling" : "credential_switch_unsettled")
+        : runDto("running", null) });
+    }
+    const state = this.switchHolds.get(runId)!;
+    send(200, { run: runDto("paused", state.state === "settling" ? "credential_switch_settling" : "credential_switch_unsettled"), disposition: applied });
   }
 
   /** Issue #1660: answer GET /runs/{id}/follow-ups with this status and body on every read. */
@@ -1332,7 +1417,22 @@ export class FakeApi {
           acceptedCandidate: request.method === "POST" && status === 200 &&
             (body as { result?: string } | null)?.result === "candidate" });
         if (drop) res.destroy();
-        else send(res, status, body);
+        else {
+          const snapshot = body as { result?: string; candidate?: Record<string, unknown>;
+            candidate_digest?: string; round?: number; deadline_at?: string } | null;
+          if (status === 200 && (request.method === "POST" || request.method === "GET") &&
+              snapshot?.result === "candidate" && snapshot.candidate?.candidate_identity_version === "semantic_v1" &&
+              (snapshot.candidate.stage === undefined || snapshot.candidate.stage === "plan")) {
+            try {
+              decodeCrossCheckClaim({ ...snapshot.candidate, stage: "plan", lead_run_id: request.runId,
+                candidate_digest: snapshot.candidate_digest, round: snapshot.round, deadline_at: snapshot.deadline_at });
+              res.setHeader("X-Uzi-Candidate-Identity-Version", "semantic_v1");
+            } catch {
+              // Leave malformed fixtures unmarked so the HTTP client rejects them.
+            }
+          }
+          send(res, status, body);
+        }
       };
       if (request.method === "POST" && this.checkedFencedRuns.has(request.runId))
         return reply(409, { reason: "cross_check_refused" });
@@ -1713,6 +1813,8 @@ export class FakeApi {
     // Mirror worker state decoding: PostgreSQL plans persist without NUL bytes.
     // worker_messages_poison_livedb_test.go exercises this server contract.
     if (body.plan_md !== undefined) body.plan_md = body.plan_md.replaceAll("\u0000", "");
+    if (body.status === "credential_switch_held" || body.status === "credential_switch_hold_settled")
+      return this.credentialSwitchHoldState(runId, body, res);
     const typedRefusal = this.typedParkRefusal.get(runId);
     if (typedRefusal !== undefined && typedRefusal.remaining > 0 && body.recovery_cause === "provider_outage") {
       typedRefusal.remaining--;
@@ -1924,7 +2026,9 @@ export class FakeApi {
               status:
                 (body.recovery_cause === "provider_outage" ? this.typedParkAck.get(runId)?.status : undefined) ??
                 this.stateStatusOverride.get(runId) ??
-                body.status,
+                // Issue #3240: as the server does, pause_failed clears the pending pause and answers
+                // with the run's own status, which stays running.
+                (body.status === "pause_failed" ? "running" : body.status),
             }),
         ...(body.recovery_cause === "provider_outage" && this.typedParkAck.get(runId)?.holdReason !== undefined
           ? { hold_reason: this.typedParkAck.get(runId)!.holdReason }

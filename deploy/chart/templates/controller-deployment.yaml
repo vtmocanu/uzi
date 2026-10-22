@@ -341,10 +341,10 @@ spec:
               value: {{ . | quote }}
             {{- end }}
             # The DOCKER worker container's requests.ephemeral-storage (issue #224). It
-            # REPLACES UZI_WORKER_EPHEMERAL_REQUEST for this tier, and is larger because
-            # a docker worker's run-workdir emptyDir carries the run's whole working
-            # tree while a plain worker's lives on the /data PVC. Same validation and
-            # the same never-a-limit rule.
+            # REPLACES UZI_WORKER_EPHEMERAL_REQUEST for this tier. Run trees and TMPDIR
+            # are on the /data PVC for both tiers since issue #3153; the larger value
+            # is kept (not remeasured) for the docker lane's writable layers, logs and
+            # codex-cmd-cache. Same validation and the same never-a-limit rule.
             {{- with .Values.workers.docker.ephemeralRequest }}
             - name: UZI_WORKER_DOCKER_EPHEMERAL_REQUEST
               value: {{ . | quote }}

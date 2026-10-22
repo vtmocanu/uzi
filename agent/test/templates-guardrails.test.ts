@@ -443,6 +443,18 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
         /readlink -f \/opt\/uzi-toolchain > \/etc\/uzi-toolchain-profile/,
         `${name}/Dockerfile must bake the /etc/uzi-toolchain-profile store-hash marker (M2 contract)`,
       );
+      // Issue #3153: the layout marker the controller's runner-init checks before it creates
+      // the /data/runner/.tmp carve-out (fail-closed controller/image skew gate).
+      assert.match(
+        text,
+        /printf 'runner-shared-v1\\n' > \/etc\/uzi-runner-layout/,
+        `${name}/Dockerfile must bake /etc/uzi-runner-layout containing runner-shared-v1 (issue #3153)`,
+      );
+      assert.match(
+        text,
+        /chown root:root \/etc\/uzi-runner-layout[\s\S]*?chmod 0644 \/etc\/uzi-runner-layout/,
+        `${name}/Dockerfile must keep /etc/uzi-runner-layout root-owned 0644 (issue #3153)`,
+      );
       // The INDIRECT nix GC root so the seed tar carries the profile and a runner
       // nix-collect-garbage (issue #91) can't reap it.
       assert.match(
@@ -1002,7 +1014,7 @@ describe("the shared root-entry drop wrapper", () => {
     // bind source staged under $TMPDIR resolves in the DinD-shared workdir.
     assert.match(
       entrypoint,
-      /if\s+\[\s+-n\s+"\$\{TMPDIR:-\}"\s+\];\s*then\s*\n\s*WORKER_TMPDIR="\$TMPDIR\/uzi-worker"\s*\n\s*RUNNER_TMPDIR="\$TMPDIR\/uzi-runner"/,
+      /if\s+\[\s+-n\s+"\$TMPDIR_NORM"\s+\];\s*then\s*\n\s*WORKER_TMPDIR="\$TMPDIR_NORM\/uzi-worker"\s*\n\s*RUNNER_TMPDIR="\$TMPDIR_NORM\/uzi-runner"/,
       "with an ambient TMPDIR both private tmpdirs must derive beneath it",
     );
     // Compose (no ambient TMPDIR): keep /tmp/uzi-worker + /tmp/uzi-runner EXACTLY as before.
@@ -1013,6 +1025,16 @@ describe("the shared root-entry drop wrapper", () => {
     );
     // The derived worker tmp is still exported as TMPDIR across the drop.
     assert.match(entrypoint, /export TMPDIR="\$WORKER_TMPDIR"/, "the derived worker tmp is exported as TMPDIR across the drop");
+    // Issue #3153: under $DATA_DIR/runner (persistent) the per-uid scratch is adopt-or-refuse; the
+    // recursive wipe exists ONLY in the non-Docker else branch, never before the lane split.
+    const laneAt = entrypoint.indexOf('if [ -n "$SCRATCH_DOCKER_LANE" ]; then');
+    const wipeAt = entrypoint.indexOf('"$RM" -rf "$WORKER_TMPDIR" "$RUNNER_TMPDIR"');
+    const elseAt = entrypoint.indexOf("\nelse\n", laneAt);
+    assert.ok(laneAt > 0 && elseAt > laneAt && wipeAt > elseAt, "the per-uid scratch wipe must live only in the non-Docker branch");
+    assert.equal(entrypoint.split('"$RM" -rf').length - 1, 1, "exactly one recursive rm in the whole entrypoint");
+    assert.match(entrypoint, /refusing to start: per-uid scratch \$1 cannot be safely adopted \(\$2\); contents preserved; see ADR-3153 operator procedure/);
+    // The (a2b) legacy migration must skip the runner-init-owned carve-out.
+    assert.match(entrypoint, /\[ "\$tree" = runner \] && \[ "\$c" = "\$DATA_DIR\/runner\/\.tmp" \]; then continue; fi/);
   });
 
   it("PRD #1493 M2 change 3: sentinel-gated ownership-aware legacy /data migration, codex-session-store untouched", () => {

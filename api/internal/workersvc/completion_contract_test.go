@@ -8,9 +8,38 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
+
+func TestCompletionContractSemanticRevisionPreservation(t *testing.T) {
+	_, p, s := semanticFixture()
+	proposed := p.Criteria[0]
+	proposed.Kind = "maintainer"
+	proposed.Maintainer = &apitypes.SemanticMaintainer{Reason: "owner infrastructure", Conditions: []string{"deployment available"}, VerificationSteps: []string{"observe rollout"}}
+	prior := completionContract{Profile: "semantic", Revision: 1,
+		Sources:  []apitypes.SemanticSourceRef{{ID: s[0].ID, Kind: s[0].Kind, Hash: semanticHash(s[0].Bytes), Provenance: s[0].Provenance, Completeness: s[0].Completeness}},
+		PlanHash: "plan-hash", CandidateIdentityVersion: "semantic_v1", SourceOutcome: "complete", Coverage: &apitypes.SemanticCoverageState{Outcome: "unknown", CandidateDigest: "candidate-digest", Reviews: 1, Invocations: 2, Tokens: 123, Seconds: 4},
+		Criteria: []completionCriterion{{ID: uuid.NewString(), MilestoneID: "m1", Text: proposed.Text, Kind: proposed.Kind, DoneWhen: proposed.DoneWhen, Citations: proposed.Citations, EvidenceRequirements: proposed.EvidenceRequirements, Maintainer: proposed.Maintainer, FindingIDs: []string{}}},
+	}
+	for _, decision := range []string{"partial", "accept"} {
+		t.Run(decision, func(t *testing.T) {
+			raw := semanticJSON(t, prior)
+			next, err := buildRevisedContract(raw, CompletionDecisionInput{Decision: decision, Keep: []string{"m1"}, Criteria: []string{prior.Criteria[0].ID}, Reason: "owner"}, []Milestone{{ID: "m1", Title: "Behavior"}}, 2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := parseCompletionContract(next)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(semanticJSON(t, got.Criteria)) != string(semanticJSON(t, prior.Criteria)) || string(semanticJSON(t, got.Sources)) != string(semanticJSON(t, prior.Sources)) || got.PlanHash != prior.PlanHash || got.CandidateIdentityVersion != prior.CandidateIdentityVersion || got.SourceOutcome != prior.SourceOutcome || string(semanticJSON(t, got.Coverage)) != string(semanticJSON(t, prior.Coverage)) {
+				t.Fatal("owner revision dropped semantic fields")
+			}
+		})
+	}
+}
 
 // fakeCompletionInterlock is a CompletionInterlockReader whose value and error are set by
 // the test — the rollout switch createRun consults (PRD #1226 M1, D1).

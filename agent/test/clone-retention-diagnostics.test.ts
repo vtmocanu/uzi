@@ -184,6 +184,7 @@ describe("#1858 retention diagnostic observations", () => {
     }
     assert.equal(warnings().length, 129);
     await diagnose("retention-0");
+    assert.equal(typeof (warnings()[0] as unknown as { retainedUndeletable?: unknown }).retainedUndeletable, "number", "#3153: the warning carries the failed-removal-attempt counter");
     assert.equal(warnings().length, 129, "touched key remains cached");
     await diagnose("retention-1");
     assert.equal(warnings().length, 130, "evicted key may warn again");

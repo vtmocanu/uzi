@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { canonicalValue, changedMilestones } from "../../lib/milestoneReset";
 import { MilestoneResetDetails } from "./MilestoneResetDetails";
+import { SemanticPlan } from "./SemanticPlan";
+import { isSemanticGate, type SemanticGateApproval } from "../../lib/semanticGate";
 import { diffLines } from "diff";
 import { LineDiff } from "../../components/LineDiff";
 import {
@@ -256,6 +258,7 @@ export function PlanPanel({
     selection: AgentSelectionInput,
     overrideCapabilities?: boolean,
     expectedGateRevision?: number,
+    semanticApproval?: SemanticGateApproval,
   ) => void;
   onResetApprove?: (selection: AgentSelectionInput, overrideCapabilities: boolean,
     expectedGateRevision: number, reset: MilestoneResetOptions) => Promise<boolean>;
@@ -393,12 +396,18 @@ export function PlanPanel({
   // Fix 2 (M4a review): a Codex run (D5) has no Anthropic token to seed/set — gate the
   // seed-and-fetch on the run's ACTUAL harness alongside canSteer, not canSteer alone.
   const changed = changedMilestones(run);
+  // Only absence preserves the structural path; explicit null/undefined is malformed.
+  const hasSemantic = Object.prototype.hasOwnProperty.call(run, "semantic_gate");
+  const semantic = hasSemantic && isSemanticGate(run.semantic_gate) ? run.semantic_gate : null;
+  const semanticBlocked = hasSemantic && (!semantic || changed ||
+    !Number.isSafeInteger(run.gate_revision) || (run.gate_revision ?? 0) <= 0);
   const resetReady = Array.isArray(run.milestones_candidate) && typeof run.reset_state_digest === "string" && run.reset_state_digest.length > 0 &&
     Number.isSafeInteger(run.gate_revision) && (run.gate_revision ?? 0) > 0 &&
     (run.completion_revision === null || (Number.isSafeInteger(run.completion_revision) && (run.completion_revision ?? 0) > 0));
   // One snapshot binds definitions, effects, selection and authorization before any await.
   const binding = canonicalValue({
     id: run.id, status: run.status, gate: run.gate_revision, digest: run.reset_state_digest,
+    semantic: run.semantic_gate,
     revision: run.completion_revision, plan: run.plan_md, frozen: run.milestones,
     proposed: run.milestones_candidate, completed: run.milestones_completed,
     progress: run.milestones_in_progress, agents: run.milestones_agents,
@@ -442,7 +451,7 @@ export function PlanPanel({
   const [submitting, setSubmitting] = useState(false);
   const doApprove = useCallback(
     async (withOverride: boolean) => {
-      if (!canSteer || busy || submittingRef.current || run.status !== "awaiting_approval") return;
+      if (!canSteer || busy || submittingRef.current || run.status !== "awaiting_approval" || semanticBlocked) return;
       if (changed) {
         clearReset();
         setResetNotice("");
@@ -458,6 +467,7 @@ export function PlanPanel({
       // clicked, so a refetch during the credential await below cannot change it; reading it
       // here, before the await, keeps that true should this ever move to a latest-run ref.
       const expectedRevision = run.gate_revision;
+      const semanticApproval = semantic ? structuredClone(semantic.approval) : undefined;
       submittingRef.current = true;
       setSubmitting(true);
       setCredentialError("");
@@ -485,7 +495,8 @@ export function PlanPanel({
         // Preserve the exact onApprove arg-count contract (1 arg for the plain approve,
         // 2 for the capability override) so RunView's `act` wrapper and the panel tests
         // see no change.
-        if (expectedRevision !== undefined) onApprove(selection, withOverride || undefined, expectedRevision);
+        if (semanticApproval !== undefined) onApprove(selection, withOverride || undefined, expectedRevision, semanticApproval);
+        else if (expectedRevision !== undefined) onApprove(selection, withOverride || undefined, expectedRevision);
         else if (withOverride) onApprove(selection, true);
         else onApprove(selection);
       } finally {
@@ -496,12 +507,12 @@ export function PlanPanel({
         setSubmitting(false);
       }
     },
-    [credential, credentialTouched, run, onApprove, selection, canSteer, busy, changed, resetReady, onResetApprove, clearReset, binding],
+    [credential, credentialTouched, run, onApprove, selection, canSteer, busy, changed, resetReady, onResetApprove, clearReset, binding, semantic, semanticBlocked],
   );
 
   const confirmReset = async () => {
     const draft = resetDraft;
-    if (!draft || draft.binding !== latestBinding.current || !canSteer || busy || submittingRef.current ||
+    if (hasSemantic || !draft || draft.binding !== latestBinding.current || !canSteer || busy || submittingRef.current ||
       !resetAck || !resetReason.trim() || !onResetApprove) return;
     submittingRef.current = true;
     setSubmitting(true);
@@ -625,7 +636,7 @@ export function PlanPanel({
           <span className="text-[11px] text-faint">{roundsLabel}</span>
           {canSteer && !disclosing && (
             <div className="flex flex-wrap gap-2">
-              <Button disabled={busy || submitting} onClick={() => void doApprove(false)}>
+              <Button disabled={busy || submitting || semanticBlocked} onClick={() => void doApprove(false)}>
                 {approveLabel}
               </Button>
               <Button
@@ -653,10 +664,15 @@ export function PlanPanel({
         </div>
       </div>
       <div className="space-y-4 p-4">
+        {hasSemantic && (semantic
+          ? <SemanticPlan gate={semantic} />
+          : <Alert message="Semantic plan data is unavailable or malformed. Approval is blocked. Refresh and review the candidate." />)}
+        {hasSemantic && changed && <Alert message="Semantic plan reset is unsupported. Request a plan revision; ordinary reset cannot approve this candidate." />}
+        {hasSemantic && semantic && !changed && semanticBlocked && <Alert message="The semantic gate revision is unavailable. Refresh before approving." />}
         <PlanCrossCheck run={run} presentation="inset" />
         {changed && !resetDraft && <MilestoneResetDetails run={run} />}
         {resetNotice && <Alert message={resetNotice} />}
-        {canSteer && resetDraft && resetDraft.binding === binding && (
+        {canSteer && !hasSemantic && resetDraft && resetDraft.binding === binding && (
           <section role="region" aria-label="Confirm milestone reset" className="space-y-3 rounded-lg border border-warn p-3">
             <h3 className="font-semibold">Reset progress and approve plan</h3>
             <MilestoneResetDetails run={resetDraft.run} />
@@ -801,7 +817,7 @@ export function PlanPanel({
                 default path. */}
             {unmetCaps.length > 0 && canSteer && (
               <div className="mt-2.5 border-t border-edge/60 pt-2.5">
-                <Button variant="secondary" size="sm" disabled={busy || submitting || !!resetDraft} onClick={() => void doApprove(true)}>
+                <Button variant="secondary" size="sm" disabled={busy || submitting || !!resetDraft || semanticBlocked} onClick={() => void doApprove(true)}>
                   Run without {unmetCaps.map((c) => stripUnsafeChars(c)).join(", ")}
                 </Button>
                 <p className="mt-1 text-[11px] text-faint">

@@ -70,7 +70,7 @@ describe("AdminShell agent source pip", () => {
     const unknown = sourceDoc("unknown");
     const absent = sourceDoc(null);
     // A different check keeps the aggregate count/tone constant across the swap.
-    for (const doc of [warn, unknown, absent]) doc.counts = { ok: 19, warn: 1, danger: 1, unknown: 0, na: 0 };
+    for (const doc of [warn, unknown, absent]) doc.counts = { ok: 20, warn: 1, danger: 1, unknown: 0, na: 0 };
     mockApi.getAdminHealth.mockResolvedValueOnce(warn).mockResolvedValueOnce(unknown).mockResolvedValueOnce(absent);
     render(<MemoryRouter initialEntries={["/admin/settings"]}><AdminShell description={null}>body</AdminShell></MemoryRouter>);
     await act(async () => { await Promise.resolve(); });

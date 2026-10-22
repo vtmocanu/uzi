@@ -614,7 +614,7 @@ workers:
     # so the fleet rolls as its workers finish their runs. It must be concrete: the
     # controller-deployment template wraps it in `required`, so a blank tag fails the
     # render loudly rather than shipping an empty image reference.
-    tag: "0.86.0-rc.19"
+    tag: "0.86.0-rc.20"
   # The Harbor pull secret IN THE WORKER NAMESPACE. It cannot be the release
   # namespace's copy: a ServiceAccount's imagePullSecrets can only name a Secret in
   # its OWN namespace. Empty = no pull secret (the KinD smoke, where the agent image
@@ -699,8 +699,10 @@ workers:
   #
   # Why it exists: a worker pod that declares nothing is ranked as using infinitely
   # more than it requested, so it is the FIRST thing kubelet evicts under node disk
-  # pressure — and an evicted worker's in-flight run loses its entire working tree,
-  # silently. Declaring a request buys scheduler placement and eviction RANKING.
+  # pressure — and an evicted worker's in-flight run is interrupted. Run working
+  # trees live on the /data PVC for every tier (issue #3153), so the tree outlives the
+  # pod; the emptyDir scratch and the writable layer do not. Declaring a request buys
+  # scheduler placement and eviction RANKING.
   #
   # Read this before tuning it, because the two directions fail very differently:
   #   - TOO LOW is today's behaviour. Probabilistic, recoverable, and visible in a
@@ -716,8 +718,8 @@ workers:
   # lives on the /data PVC, not on an emptyDir, so it does not count against
   # this request. It is NOT the whole ephemeral picture any more: since issue
   # #1598 every worker pod, plain or docker, also carries a worker-only
-  # emptyDir (codex-cmd-cache, /var/cache/uzi-codex-cmd, in addition to any the
-  # docker lane adds) for a run's Codex command build cache, which counts
+  # emptyDir (codex-cmd-cache, /var/cache/uzi-codex-cmd) for a run's Codex
+  # command build cache, which counts
   # toward this same request/ranking. This number is deliberately NOT raised
   # for that yet — see codex-cmd-cache's own comment in
   # controller/internal/kube/render.go and adr/1598-codex-command-storage.md
@@ -746,6 +748,12 @@ workers:
   # Persistent workers keep the preset sizing. Motivation: on 2026-09-27 an ephemeral `m` worker (10Gi /data) running a
   # uzi-on-uzi issue run hit 95% during `task gate:api` (Go build cache ~6.6G + module
   # cache ~1.9G).
+  #
+  # Since issue #3153 a Docker-lane worker's run clones and $TMPDIR (/data/runner,
+  # runner-shared subPath of this same /data PVC) live here too, so this volume now
+  # also holds Docker-lane clones and .tmp, which count against the size. Retained
+  # clones persist (automatic retention deletion stays off, issue #1858). The size is
+  # unchanged pending live measurement (issue #3153 acceptance).
   #
   # CEILING: it must fit BOTH tiers' limitRange.maxPVCStorage (50Gi today), since a
   # run-bound worker lands in either tier. worker-invariants.yaml refuses to render a
@@ -814,6 +822,10 @@ workers:
   # 50Gi /data. Sizing on `m` (25Gi) would admit only 12 persistent `l` workers
   # against a tier advertising 20. If `l` should not be available here, the fix is
   # to scope it off the tier, not to under-budget.
+  #
+  # The Docker-tier presets' data sizes (5/25/50Gi) are unchanged although /data now
+  # also holds the Docker lane's run clones and .tmp (issue #3153); pending live
+  # measurement (issue #3153 acceptance), not remeasured here.
   #
   # A RUN-BOUND worker's /data is a separate term (ephemeralWorkerDataSize above, 40Gi,
   # issue #1815) that replaces the preset's DataSize for that worker. 40Gi <= l's 50Gi,
@@ -1105,15 +1117,14 @@ workers:
     # this tier rather than adding to it; read that key's comment first, all of which
     # applies here, including the never-a-limit rule.
     #
-    # Larger than the plain tier's 512Mi for one structural reason: the run-workdir
-    # emptyDir is mounted ONLY for a docker worker, and it holds the run's entire
-    # working tree — one clone per run, times maxConcurrentRuns, with $TMPDIR pointed
-    # at the same volume. A plain worker's working tree is on the /data PVC instead
-    # and never touches ephemeral storage FOR THE CHECKOUT at all — but as of issue
-    # #1598 every worker, plain or docker, also carries the worker-only codex-cmd-cache
-    # emptyDir (a run's Codex command build cache), which counts toward this request too
-    # regardless of tier. uzi's own repo is a ~170 MiB runner clone before a single
-    # dependency install.
+    # Larger than the plain tier's 512Mi, and 5Gi is kept, NOT remeasured, after issue
+    # #3153 moved the run trees and $TMPDIR (/data/runner) off the run-workdir emptyDir
+    # onto the /data PVC (runner-shared subPath); the checkout no longer touches
+    # ephemeral storage on either tier. What still counts here: the docker lane's
+    # writable layers, container logs, and the worker-only codex-cmd-cache emptyDir
+    # (issue #1598, a run's Codex command build cache, every tier). The figure was
+    # sized when the clones lived on the emptyDir, so it is likely generous now; lower
+    # it only after a hosted-worker measurement.
     #
     # Issue #1757 raised it from 4Gi to 5Gi as provisional, unmeasured headroom for the
     # codex-cmd-cache emptyDir and a lower eviction rank under node disk pressure. 5Gi,
@@ -1500,7 +1511,8 @@ web:
       # Input-file upload (PRD #1909, POST /api/v1/files): ingress-nginx defaults the request
       # body limit to 1m and would refuse any real upload before web nginx sees it. 26m = the
       # api's default per-file cap (25 MiB) plus multipart framing, matching web nginx's
-      # `location = /api/v1/files`; web nginx still limits every other /api/ path to 1m. Raise it
+      # `location = /api/v1/files`; owner run inputs allow 17m for exact semantic echoes,
+      # and other /api/ paths retain 1m. Raise the upload limit
       # together with UZI_JOB_INPUT_FILE_MAX_BYTES.
       nginx.ingress.kubernetes.io/proxy-body-size: "26m"
     # dev-cluster serves a *.example.com default wildcard cert at the

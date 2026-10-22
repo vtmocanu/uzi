@@ -18,8 +18,8 @@ func TestEvaluateScopes(t *testing.T) {
 	want := map[string]string{
 		"fleet.roll": "instance", "controller.report": "instance", "db": "instance", "db.size": "instance", "loops": "instance",
 		"fleet.capacity": "owner", "fleet.disk": "owner", "fleet.rundisk": "owner",
-		"fleet.quarantine": "owner",
-		"queue.waiting":    "owner", "queue.undispatched": "owner", "forge.sync": "owner",
+		"fleet.quarantine": "owner", "fleet.memory_authority": "owner",
+		"queue.waiting": "owner", "queue.undispatched": "owner", "forge.sync": "owner",
 		"forge.ciwatch": "owner", "slack.socket": "owner", "schedules.paused": "owner",
 		"board.drift": "owner", "custody.holds": "owner", "recovery.storage": "owner", "release.check": "owner",
 		"pricing.codex": "instance", "agentsource.update": "instance",

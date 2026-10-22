@@ -1,4 +1,5 @@
 import { isAccountingStatus, isProgressNote, isSummaryUsage } from "../lib/accountingStatus";
+import { activityStatusLine } from "../lib/checkActivity";
 import { PlanCrossCheckEvent } from "./PlanCrossCheck";
 import type { PlanCrossCheckSummary } from "../lib/apiTypes";
 import { memo, useEffect, useRef, useState, type ReactNode } from "react";
@@ -443,15 +444,24 @@ function elapsedMs(startIso: string, now: number): number {
 
 // ── status / error text ─────────────────────────────────────────────────────
 
+const ACTIVITY_EVENTS: ReadonlySet<string> = new Set(["check_activity_start", "check_activity", "check_activity_summary"]);
+
 // describeStatus maps a `status` payload to a human line. Two shapes reach here:
 // worker progress `{text}` (already human-readable) and SDK frames `{event}`
 // (init heartbeat, or the terminal result discriminated by `subtype`).
 export function describeStatus(payload: unknown): string {
   const rec = asRecord(payload);
   if (!rec) return "status";
+  const event = asString(rec["event"]);
+  // Cross-check activity evidence (PRD #3166), checked BEFORE the worker `text` shortcut so an
+  // activity payload carrying a `text` field shows the validated line, as the CLI does. A
+  // recognised, validated payload gets its human line; an unvalidated one gets the generic
+  // `status: <event>` rather than its unvetted text.
+  const activity = activityStatusLine(rec);
+  if (activity !== undefined) return activity;
+  if (event !== undefined && ACTIVITY_EVENTS.has(event)) return `status: ${event}`;
   const text = asString(rec["text"]);
   if (text !== undefined) return text;
-  const event = asString(rec["event"]);
   if (event === "init") {
     const model = asString(rec["model"]);
     return model ? `agent started (${model})` : "agent started";

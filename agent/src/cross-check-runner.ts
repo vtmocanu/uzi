@@ -20,6 +20,9 @@ import { CrossCheckConfinementError } from "./cross-check-confinement.js";
 import { errMessage } from "./util.js";
 import { rmHomeTree } from "./rmtree.js";
 import { uidSplitActive } from "./runner-uid.js";
+import { MessageBatcher } from "./batcher.js";
+import { makeRedactor, makeTextRedactor } from "./redact.js";
+import { CheckActivityRecorder } from "./cross-check-activity.js";
 
 // The verdict route uses reason-class refusals, whereas ordinary state routes use disposition.
 function checkerClaimRefused(err: unknown): boolean {
@@ -46,6 +49,10 @@ interface CrossCheckRunnerOptions {
   secretPaths?: readonly string[];
   /** Test seam for the default Claude checker's SDK query (UZI_EXECUTOR=stub injects the canned one). */
   claudeQueryFn?: SdkQueryFn;
+  /** Debounce window of the per-execute message batcher (config.messageBatchMs). Default 500. */
+  batchMs?: number;
+  /** Registry of live runs' batcher rearm() hooks, shared with the other runners. */
+  rearm?: Map<string, () => void>;
 }
 
 /** Report-only plan checker. The child owns its checkout, usage and terminal journal. */
@@ -142,10 +149,46 @@ export class CrossCheckRunner {
     if (signal?.aborted) abort();
     let timer: NodeJS.Timeout | undefined;
     let timedOut = false;
+    let timerDeadline = 0;
+    const armTimer = (ms: number): void => {
+      timerDeadline = Date.now() + ms;
+      timer = setTimeout(() => { timedOut = true; cancel.abort(new Error("cross-check timed out")); }, ms);
+    };
     let checkout: string | undefined;
     let home: string | undefined;
     let steering: ChatSteering | undefined;
-    let seq = claim.last_seq ?? 0;
+    let batcher: MessageBatcher | undefined;
+    let batcherClosed = false;
+    let rearmFn: (() => void) | undefined;
+    let recorder: CheckActivityRecorder | undefined;
+    let familyName = "unknown";
+    let stageName = "unknown";
+    const usageSeqs: number[] = [];
+    // Summary first (idempotent), then the one close: the terminal fence is batcher.currentSeq().
+    let sessionEnded = false;
+    const finishTelemetry = async (): Promise<void> => {
+      // Capture is whole only when the checker reported crossing into the model
+      // (CheckActivityRecorder.modelStarted) and its session then ended: a check that failed
+      // before the model started reports incomplete, never "0 reads, complete".
+      recorder?.summary(familyName, stageName, sessionEnded);
+      if (!batcher || batcherClosed) return;
+      batcherClosed = true;
+      await batcher.close().catch((err) => {
+        this.log.warn("cross-check message batcher close failed", { run_id: runId, error: errMessage(err) });
+      });
+    };
+    const fence = (): number => batcher?.currentSeq() ?? claim.last_seq ?? 0;
+    // A would-be success whose usage frames did not reach the run (or whose channel gave up) is a failed check.
+    const usageUndelivered = (): boolean => {
+      if (!batcher) return false;
+      if (batcher.isTripped()) return true;
+      const from = batcher.undeliveredFromSeq();
+      const tombstones = batcher.tombstonedSeqs();
+      const journaled = batcher.journalOnlySeqs();
+      if (tombstones.overflow || journaled.overflow) return true;
+      // Journaled to the outbox is not proof the original payload arrived (replay may tombstone it): fail closed.
+      return usageSeqs.some((s) => (from !== undefined && s >= from) || tombstones.seqs.has(s) || journaled.seqs.has(s));
+    };
     let verdictDelivered = false;
     let modelInvoked = false;
     let nativeCleanupConfirmed = false;
@@ -163,6 +206,19 @@ export class CrossCheckRunner {
     try {
       const ack = await this.client.reportState(runId, { status: "running", claim_generation: claim.claim_generation });
       if (ack?.staleClaim) return;
+      const secrets = [claim.secrets.forge_pat, claim.secrets.anthropic_oauth_token, claim.secrets.codex?.capability];
+      const b = new MessageBatcher(this.client, runId, claim.last_seq ?? 0, this.opts.batchMs ?? 500, this.log,
+        makeRedactor(secrets), makeTextRedactor(secrets), {
+          ...(this.opts.outbox ? { outbox: this.opts.outbox } : {}),
+          generation,
+        });
+      batcher = b;
+      rearmFn = () => b.rearm();
+      this.opts.rearm?.set(runId, rearmFn);
+      const rec = new CheckActivityRecorder((payload) => b.emit({ kind: "status", agent: "cross-checker", payload }),
+        { generation });
+      recorder = rec;
+      rec.start();
       const candidate = decodeCrossCheckClaim(claim.cross_check);
       // Single-family custody: a Codex checker holds only a Codex credential, a Claude checker only
       // the Anthropic token (PRD #2460); a claim carrying both, or neither, is invalid.
@@ -170,6 +226,8 @@ export class CrossCheckRunner {
       const hasAnthropic = Boolean(claim.secrets.anthropic_oauth_token);
       const checker = family === "codex" ? (hasAnthropic ? undefined : this.model)
         : hasAnthropic ? this.claudeModel : undefined;
+      familyName = checker === this.model ? "codex" : checker === this.claudeModel ? "claude" : "unknown";
+      if (candidate?.stage === "plan" || candidate?.stage === "code") stageName = candidate.stage;
       if (claim.kind !== "cross_check" || !checker || !candidate
         || (candidate.stage !== "plan" && candidate.stage !== "code")
         || !Number.isInteger(candidate.round) || candidate.round < 1 || candidate.round > 5
@@ -185,7 +243,7 @@ export class CrossCheckRunner {
         reason = "model_timeout";
         throw new Error("cross-check deadline expired");
       }
-      timer = setTimeout(() => { timedOut = true; cancel.abort(new Error("cross-check timed out")); }, timeout);
+      armTimer(timeout);
       cancel.signal.throwIfAborted();
       steering = new ChatSteering(this.client, runId, this.opts.pollMs ?? 1000, this.log, cancel,
         { onFollowUp: () => this.log.warn("cross-check ignores follow-up input", { run_id: runId }) }, generation);
@@ -212,10 +270,25 @@ export class CrossCheckRunner {
       reason = "model_error";
       if (!checkout) throw new Error("checker checkout unavailable");
       modelInvoked = true;
+      rec.attach(checkout, home);
       const text = await checker!.run(claim, checkout, home, cancel.signal, async (payload) => {
-        await this.client.postMessages(runId, [{ seq: ++seq, kind: "status", agent: "cross-checker", payload }], generation);
-      }, code ? () => { nativeCleanupConfirmed = true; } : undefined);
+        b.emit({ kind: "status", agent: "cross-checker", payload });
+        usageSeqs.push(b.currentSeq());
+      }, code ? () => { nativeCleanupConfirmed = true; } : undefined, rec).finally(() => { sessionEnded = true; });
       cancel.signal.throwIfAborted();
+      // Summary, then the one close: every row is delivered (or journaled) before the verdict and the
+      // fence. The model timer is paused across the close so a slow post cannot turn a finished
+      // verdict into a timeout. It resumes with the time the model had left, never past the
+      // check's deadline_at (the server refuses a verdict after it).
+      if (timer) clearTimeout(timer);
+      timer = undefined;
+      const left = timerDeadline - Date.now();
+      await finishTelemetry();
+      const remaining = Math.min(left, deadline - Date.now());
+      if (remaining > 0) armTimer(remaining);
+      else { timedOut = true; cancel.abort(new Error("cross-check timed out")); }
+      cancel.signal.throwIfAborted();
+      if (usageUndelivered()) throw new Error("cross-check usage frames were not delivered");
       reason = "malformed";
       if (code) {
         if (!nativeCleanupConfirmed) throw new CrossCheckConfinementError("cleanup_callback_missing");
@@ -226,7 +299,7 @@ export class CrossCheckRunner {
         await this.client.reportCodeCrossCheckVerdict(runId, generation, { outcome: "completed", findings }, cancel.signal);
         verdictDelivered = true;
         await postTerminalState(this.terminalDeps, this.client, {
-          runId, claimGeneration: generation, phase: "running", messagesThroughSeq: seq,
+          runId, claimGeneration: generation, phase: "running", messagesThroughSeq: fence(),
           body: { status: "completed", claim_generation: claim.claim_generation },
         });
         return;
@@ -246,16 +319,20 @@ export class CrossCheckRunner {
       await this.client.reportCrossCheckVerdict(runId, generation, { ...parsed, ...decision }, cancel.signal);
       verdictDelivered = true;
       await postTerminalState(this.terminalDeps, this.client, {
-        runId, claimGeneration: generation, phase: "running", messagesThroughSeq: seq,
+        runId, claimGeneration: generation, phase: "running", messagesThroughSeq: fence(),
         body: { status: "completed", claim_generation: claim.claim_generation },
       });
     } catch (err) {
       if (isStaleClaimRefusal(err) || steering?.claimLost()) return;
       if (checkerClaimRefused(err) && await custodyLost()) return;
+      // Classify before the close: a slow close must not relabel the failure.
       if (timedOut) reason = "model_timeout";
       else if (!cancel.signal.aborted && err instanceof CrossCheckCheckerUnavailableError) reason = "checker_unavailable";
       else if (err instanceof CrossCheckMalformedError || (err instanceof Error && /invalid code cross-check|JSON/.test(err.message))) reason = "malformed";
       else if (/confinement|cleanup unconfirmed/.test(errMessage(err))) reason = "confinement_failed";
+      if (timer) clearTimeout(timer);
+      timer = undefined;
+      await finishTelemetry();
       if (err instanceof CrossCheckConfinementError || reason === "confinement_failed") {
         // The Claude token has already left the secret registry. Do not log errMessage(err).
         this.log.warn("cross-check confinement refused", { run_id: runId, stage: code ? "code" : "plan",
@@ -279,7 +356,7 @@ export class CrossCheckRunner {
         ? "plan cross-check: checker unavailable" : "The cross-check did not complete.";
       try {
         await postTerminalState(this.terminalDeps, this.client, {
-          runId, claimGeneration: generation, phase: "running", messagesThroughSeq: seq,
+          runId, claimGeneration: generation, phase: "running", messagesThroughSeq: fence(),
           body: { status: "failed", failure_reason: failureReason, claim_generation: claim.claim_generation },
         });
       } catch (terminal) {
@@ -287,6 +364,9 @@ export class CrossCheckRunner {
       }
     } finally {
       if (timer) clearTimeout(timer);
+      // A stale-claim return reports no terminal state; its batcher is still closed exactly once.
+      await finishTelemetry();
+      if (rearmFn && this.opts.rearm?.get(runId) === rearmFn) this.opts.rearm.delete(runId);
       cancel.abort();
       signal?.removeEventListener("abort", abort);
       await steering?.stop().catch((err) => {

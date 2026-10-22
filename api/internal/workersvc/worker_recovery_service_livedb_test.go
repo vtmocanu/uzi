@@ -55,8 +55,10 @@ func (tx *recoveryHookTx) Query(ctx context.Context, sql string, args ...any) (p
 	return tx.Tx.Query(ctx, sql, args...)
 }
 func (tx *recoveryHookTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
-	// Worker liveness/nonce writes are prerequisites, not snapshot/FK writes.
-	if !strings.Contains(sql, "HeartbeatWorker") && !strings.Contains(sql, "RegisterWorker") {
+	// Worker liveness/nonce writes and the transaction's own isolation setting (Service.beginReadCommitted)
+	// are prerequisites, not snapshot/FK writes.
+	if !strings.Contains(sql, "HeartbeatWorker") && !strings.Contains(sql, "RegisterWorker") &&
+		!strings.HasPrefix(sql, "SET TRANSACTION ISOLATION LEVEL") {
 		tx.hook.after.Add(1)
 	}
 	return tx.Tx.Exec(ctx, sql, args...)

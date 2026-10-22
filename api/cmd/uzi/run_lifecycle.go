@@ -229,7 +229,7 @@ func newRunApproveCmd(env Env, gf *globalFlags) *cobra.Command {
 			}
 			// PRD #1795 D5: the revision is fixed at invocation, BEFORE the credential switch,
 			// so the approve names the plan that was at the gate when the owner decided.
-			expected, err := resolveExpectedGateRevision(cmd, c, args[0])
+			expected, semantic, err := resolveSemanticApproval(env, cmd, c, args[0])
 			if err != nil {
 				return err
 			}
@@ -256,7 +256,11 @@ func newRunApproveCmd(env Env, gf *globalFlags) *cobra.Command {
 				}
 				tokenSwitched = true
 			}
-			err = submitInput(env, gf, c, cmd, args[0], kindApprovePlan, "", sel, false, expected)
+			if semantic != nil {
+				err = submitBoundInput(env, gf, c, cmd, args[0], kindApprovePlan, "", sel, false, expected, semantic)
+			} else {
+				err = submitInput(env, gf, c, cmd, args[0], kindApprovePlan, "", sel, false, expected)
+			}
 			// PRD #1795 D5: the revision is read BEFORE the switch (above), so a gate refused as
 			// stale can arrive after the switch already landed. The switch is not rolled back;
 			// say so, so the owner re-runs the approve without repeating it.
@@ -273,6 +277,7 @@ func newRunApproveCmd(env Env, gf *globalFlags) *cobra.Command {
 			return err
 		},
 	}
+	approve.Flags().String("semantic-approval", "", "exact semantic_gate.approval JSON reviewed from run get --json")
 	approve.Flags().String("agent-source", "", "which subagent roster to run: own|repo (default: the run's own default)")
 	approve.Flags().StringSlice("exclude-agents", nil, "subagents to drop from the chosen source (requires --agent-source)")
 	// PRD #1247 M5b (D8): switch the run's Anthropic token as part of the approval. Same

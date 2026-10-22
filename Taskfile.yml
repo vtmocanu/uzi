@@ -318,6 +318,7 @@ tasks:
       # Hermetic contract for the mirror.gcr.io-then-Docker-Hub image pull CI uses
       # (scripts/docker-pull-fallback.sh): a fake `docker`, no network.
       - task: test:docker-pull-fallback
+      - task: test:ci-postgres
       - task: test:cosign-sign-retry
       # Hermetic cleanup-ownership contract for the opt-in test:web-nginx script
       # (scripts/assert-web-nginx.sh): fake docker/helm/yq, no network.
@@ -330,6 +331,7 @@ tasks:
       # golangci aliases and the outer Go-toolchain group. No registry lookup.
       - task: test:renovate-go-toolchain
       - task: test:renovate-codex-runtime
+      - task: test:renovate-postgres
       - task: test:forge-fake
       - task: test:forge-fake-contract
       # Hermetic bot-provisioning regressions (issues #2010 and #2016): fake glab,
@@ -1072,6 +1074,16 @@ tasks:
     cmds:
       - node ./scripts/renovate-go-toolchain.test.mjs
 
+  test:ci-postgres:
+    desc: hermetic workflow Postgres startup, fallback and readiness failure
+    cmds:
+      - node ./scripts/ci-postgres.test.mjs
+
+  test:renovate-postgres:
+    desc: hermetic CI Postgres pin extraction, digest updates and grouping
+    cmds:
+      - node ./scripts/renovate-postgres.test.mjs
+
   test:renovate-codex-runtime:
     desc: hermetic Codex pin extraction, grouping and partial-update rejection
     cmds:
@@ -1424,7 +1436,7 @@ tasks:
       - ./scripts/check-binary-text.sh scripts/binary-text-canary.go
 
   check:postgres-pin-parity:
-    desc: docker-compose.yml and ci.yml's mirrored postgres service pin the same tag and digest, with hermetic 0/1/2 fixtures
+    desc: docker-compose.yml and ci.yml's Postgres env pin use the same tag and digest, with hermetic 0/1/2 fixtures
     cmds:
       # ci.yml pulls postgres through mirror.gcr.io (#2621), so Renovate sees two packages;
       # renovate.json groups them (#2622) and this fails the gate if they still drift.
@@ -2667,18 +2679,14 @@ tasks:
         UZI_CODEX_REFRESH_LOSTREPLY_E2E=1 TMPDIR="{{.ROOT_DIR}}/.uzi/scratch" ./e2e/run-store-it.sh
 
   test:checkpoint-chain-bridge:
-    desc: real agent RunRunner checkpoint chain through the real pushbroker.Publish (needs Node and agent deps)
+    desc: real agent checkpoint chaining and selective packs through pushbroker.Publish (needs Node and agent deps)
     preconditions:
       - sh: command -v node && node -e 'if (Number(process.versions.node.split(".")[0]) < 24) process.exit(1)'
         msg: 'test:checkpoint-chain-bridge requires Node 24 or newer (the agent fixture runs under tsx)'
       - sh: command -v go
         msg: 'test:checkpoint-chain-bridge requires Go (the bridge is a Go test)'
     cmds:
-      - |
-        if ! task deps-check:agent; then
-          (cd agent && npm ci --ignore-scripts)
-          task deps-check:agent
-        fi
+      - task: deps-check:agent
       - |
         # The log lives under .uzi/scratch (inside the worktree, gitignored), not /tmp.
         # -buildvcs=false: a linked worktree cannot stamp VCS info. -race: the test's loopback
@@ -2687,19 +2695,26 @@ tasks:
         mkdir -p .uzi/scratch
         LOG="$(mktemp "{{.ROOT_DIR}}/.uzi/scratch/checkpoint-chain-bridge-log.XXXXXX")"
         rc=0
-        (cd api && UZI_CHECKPOINT_CHAIN_BRIDGE=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null go test -buildvcs=false -count=1 -race -v \
-          -run '^TestAgentCheckpointChainBridge$' ./internal/pushbroker/) > "$LOG" 2>&1 || rc=$?
+        printf 'revision=%s\n' "$(git rev-parse HEAD)" >> "$LOG"
+        (cd api && UZI_CHECKPOINT_CHAIN_BRIDGE=1 UZI_CHECKPOINT_SELECTIVE_PACK_BRIDGE=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null go test -buildvcs=false -count=1 -race -v \
+          -run '^TestAgentCheckpoint(Chain|SelectivePack)Bridge$' ./internal/pushbroker/) >> "$LOG" 2>&1 || rc=$?
         cat "$LOG"
         [ "$rc" -eq 0 ] || { echo "checkpoint chain bridge failed (exit $rc): $LOG" >&2; exit 1; }
         # A named RUN and PASS are mandatory and any SKIP fails: the test skips silently when its
         # gate variable is unset, which would read as green (same discipline as e2e/run-store-it.sh).
-        if ! grep -q '^=== RUN   TestAgentCheckpointChainBridge$' "$LOG" ||
-          ! grep -q '^--- PASS: TestAgentCheckpointChainBridge ' "$LOG" ||
-          grep -q -- '--- SKIP:' "$LOG"; then
-          echo "checkpoint chain bridge did not run and pass without skips: $LOG" >&2
+        for suite in TestAgentCheckpointChainBridge TestAgentCheckpointSelectivePackBridge; do
+          if ! grep -q "^=== RUN   $suite\$" "$LOG" ||
+            ! grep -q "^--- PASS: $suite " "$LOG"; then
+            echo "checkpoint bridge did not run and pass: $suite ($LOG)" >&2
+            exit 1
+          fi
+        done
+        if grep -q -- '--- SKIP:' "$LOG"; then
+          echo "checkpoint bridge unexpectedly skipped a test: $LOG" >&2
           exit 1
         fi
-        rm -f "$LOG"
+        # Retain revision-linked bridge evidence for review.
+        printf 'checkpoint bridge log: %s\n' "$LOG"
 
   deps-check:agent:
     desc: agent - is node_modules stale? (declared ranges AND resolved lockfile, offline)

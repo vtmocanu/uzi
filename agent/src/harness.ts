@@ -321,6 +321,7 @@ export interface HarnessAgent {
 }
 
 export interface RunTurnRequest {
+  semanticPlanning?: import("./semantic-plan.js").SemanticPlanning;
   /** Worker has materialized and bound the current claim evidence reader. */
   ciEvidencePrepared?: boolean;
   /** Worker-derived eligibility for owner-decision requests, never a model declaration. */
@@ -558,6 +559,7 @@ export interface CodexExecutionSafety {
 // This facade is owned by uzi, so the adapter does not gain git/workflow policy.
 
 export interface TurnSignals {
+  semanticSubmission?: import("./semantic-plan.js").SemanticSubmission;
   ownerDecisionRequested?: { reason: string };
   draftPlans?: string[];
   plan?: string;
@@ -659,7 +661,7 @@ export interface AdviceModelUsage {
 export type AdviceUsageSnapshot = Readonly<Record<string, AdviceModelUsage>>;
 
 export interface AdviceRequest {
-  label: "judge" | "review" | "summary" | "now";
+  label: "judge" | "review" | "summary" | "now" | "coverage";
   systemPrompt: string;
   prompt: string;
   model?: string;

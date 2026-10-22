@@ -88,7 +88,7 @@ Both layers can be disabled. D6's strict handling and the separate #1829 termina
 - D2 caches of runs parked with no live executor;
 - model-pass dirs (`uzi-summary-*` and siblings) whose owning process is proven stopped, never by name prefix alone.
 
-The PRD #837 recycle stays unchanged as the last resort. On the Docker lane the runner scratch dir is an emptyDir separate from the data volume; on a plain worker it is on the data volume. The reclaim covers each where it lives; cleaning the emptyDir relieves node ephemeral pressure, not the data volume.
+The PRD #837 recycle stays unchanged as the last resort. On the Docker lane the runner scratch dir is an emptyDir separate from the data volume; on a plain worker it is on the data volume. The reclaim covers each where it lives; cleaning the emptyDir relieves node ephemeral pressure, not the data volume. Since #3153 this holds only for old-layout pods: on a migrated Docker worker `/data/runner` and its scratch are on the data PVC and count against the data volume.
 
 **D8. Truthful durability reporting and per-run size.** "Checkpoint published" keeps meaning exactly that a checkpoint ref was published. The park report also says whether that checkpoint contains the run's latest committed work (it does not when the recovery pin or fetch-back failed), and custody is not released while the only copy of the latest work is on the worker (as today). The worker reports each live or parked run's HOME and cache bytes in its heartbeat; the api persists them beside the existing worker disk stats (migration, following `00191_worker_disk_stats.sql`), and `uzi worker list`, the admin health view and the run page show them.
 

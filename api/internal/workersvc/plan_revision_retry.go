@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -89,6 +91,28 @@ func validateRevisionTargets(ctx context.Context, q *store.Queries, run store.Ru
 			row.GateBinding.String != "bound" || !row.GateRevision.Valid || row.GateRevision.Int64 != *req.ExpectedGateRevision {
 			return ErrStaleRevisionSource
 		}
+	}
+	return nil
+}
+
+// requireSemanticMutation runs only after exact replay has been ruled out.
+// The pending receipt grants compilation/review, never execution or approval.
+func requireSemanticMutation(ctx context.Context, q *store.Queries, run store.Run, worker uuid.UUID) error {
+	if run.Status == "running" {
+		return nil
+	}
+	if run.Status != "awaiting_approval" {
+		return ErrInvalidState
+	}
+	pending, err := q.HasPendingSemanticRevision(ctx, store.HasPendingSemanticRevisionParams{
+		RunID: run.ID, WorkerID: pgconv.UUID(worker), ClaimGeneration: pgtype.Int8{Int64: run.ClaimGeneration, Valid: true},
+		GateRevision: pgtype.Int8{Int64: run.GateRevision, Valid: true},
+	})
+	if err != nil {
+		return err
+	}
+	if !pending {
+		return ErrStaleRevisionSource
 	}
 	return nil
 }

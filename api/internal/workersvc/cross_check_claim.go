@@ -12,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -39,17 +40,20 @@ type ClaimPlanCrossCheck struct {
 	PlanCrossCheckCandidate
 }
 
-func crossCheckClaimInput(cc store.CrossCheck) (*ClaimPlanCrossCheck, error) {
+func crossCheckClaimInput(cc store.CrossCheck, semantic ...*apitypes.SemanticCandidate) (*ClaimPlanCrossCheck, error) {
 	if cc.Round > 1 && (!cc.AutomaticRoundsEnabled || cc.Round > cc.AutomaticRevisionLimit+1) {
 		return nil, ErrCrossCheckRefused
 	}
-	return crossCheckCandidateInput(cc)
+	return crossCheckCandidateInput(cc, semantic...)
 }
 
 // crossCheckCandidateInput validates only wire shape and candidate identity.
 // Stored-attempt admission additionally requires the immutable budget snapshot.
-func crossCheckCandidateInput(cc store.CrossCheck) (*ClaimPlanCrossCheck, error) {
+func crossCheckCandidateInput(cc store.CrossCheck, semantic ...*apitypes.SemanticCandidate) (*ClaimPlanCrossCheck, error) {
 	if cc.Stage == "code" {
+		if len(semantic) > 0 && semantic[0] != nil {
+			return nil, ErrCrossCheckRefused
+		}
 		if cc.Round != 1 || !cc.HeadCommit.Valid || !cc.BaseCommit.Valid ||
 			!validCodeSHA(cc.HeadCommit.String) || !validCodeSHA(cc.BaseCommit.String) ||
 			len(cc.CandidateDigest) != 32 || !cc.DeadlineAt.Valid || len(cc.CodeContext) == 0 ||
@@ -88,6 +92,11 @@ func crossCheckCandidateInput(cc store.CrossCheck) (*ClaimPlanCrossCheck, error)
 		return nil, ErrCrossCheckRefused
 	}
 	digest, err := c.Digest()
+	if len(semantic) > 0 && semantic[0] != nil {
+		c.CandidateIdentityVersion, c.SemanticCandidate = semanticIdentityVersion, semantic[0]
+		err = validateSemanticCheckerCandidate(c, cc.CandidateDigest)
+		digest = cc.CandidateDigest
+	}
 	if err != nil || !bytes.Equal(digest, cc.CandidateDigest) {
 		return nil, ErrCrossCheckRefused
 	}
@@ -175,7 +184,14 @@ func (s *Service) assemblePlanCrossCheckInput(ctx context.Context, worker store.
 	if err != nil {
 		return err
 	}
-	input, err := crossCheckClaimInput(cc)
+	var semantic *apitypes.SemanticCandidate
+	if cc.Stage == "plan" {
+		semantic, err = rehydrateSemanticChecker(ctx, q, cc)
+		if err != nil {
+			return err
+		}
+	}
+	input, err := crossCheckClaimInput(cc, semantic)
 	if err != nil {
 		return err
 	}
