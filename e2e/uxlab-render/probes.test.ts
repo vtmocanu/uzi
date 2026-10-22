@@ -134,9 +134,12 @@ test("boundary script permits only off-mode DB observation and disposable sentin
     { mode: "required", opens: [lock], rejected: lock },
     { mode: "required", opens: [sentinel], rejected: sentinel },
     { mode: "off", opens: [db], rejected: "sentinel calibration denied" },
+    { mode: "off", scope: "sentinel", opens: [sentinel], rejected: "" },
+    { mode: "required", scope: "sentinel", opens: [], rejected: "" },
+    { mode: "off", scope: "invalid", opens: [], rejected: "invalid boundary scope" },
   ]) {
     const calls: string[] = [], errors: string[] = [], logs: string[] = [];
-    const state = { argv: ["node", sentinel, scenario.mode], exitCode: 0 };
+    const state = { argv: ["node", sentinel, scenario.mode, ...("scope" in scenario ? [scenario.scope] : [])], exitCode: 0 };
     const fakeFS = {
       lstat: async () => ({ isFile: () => true, dev: 1n, ino: 2n, uid: 10002n,
         gid: 10002n, mode: 0o664n, mtimeNs: 1n, size: 0n }),
@@ -167,7 +170,8 @@ test("boundary script permits only off-mode DB observation and disposable sentin
       ? ["Error: " + (scenario.rejected.startsWith("/") ? "unexpected writable open: " : "") + scenario.rejected]
       : [], label);
     const expectedCalls: string[] = [];
-    for (const file of [db, lock, sentinel]) {
+    const files = scenario.scope === "invalid" ? [] : scenario.scope === "sentinel" ? [sentinel] : [db, lock, sentinel];
+    for (const file of files) {
       expectedCalls.push("open:" + file);
       if (scenario.opens.includes(file)) {
         if (file === sentinel && scenario.mode === "off") expectedCalls.push("write:" + file);

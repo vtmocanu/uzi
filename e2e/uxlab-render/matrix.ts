@@ -131,6 +131,13 @@ async function main() {
     assert.equal(commandRoots.hasLiveCommandRoot(), false, "command root not drained");
     return output;
   }
+  const criterionFailures: string[] = [];
+  const requireCriterion = (label: string, passed: boolean) => {
+    if (!passed) {
+      criterionFailures.push(label);
+      record("criterion-failure", { label, cell, mode });
+    }
+  };
   const goPolicy = 'export GOTOOLCHAIN=local GOFLAGS=-buildvcs=false\ncommand -v go\ngo version';
   try {
     const setupStarted = performance.now();
@@ -165,16 +172,16 @@ go test ./cmd/uzi/ -run '^$' -count=1`, path.join(checkout, "api"));
         5000, checkout, commandEnv, "off", log, cache, 30_000);
       cache.watchRegistry(calibrationRoots);
       const calibration = await command("sentinel-calibration",
-        "/usr/local/bin/node -e " + quote(boundaryProbe) + " " + quote(sentinel) + " off",
+        "/usr/local/bin/node -e " + quote(boundaryProbe) + " " + quote(sentinel) + " off sentinel",
         checkout, calibrationSpawn, calibrationRoots, "off");
       assert.equal(calibration.code, 0, "sentinel must be writable by cmd without Landlock");
       const boundary = await command("nix-boundary", "/usr/local/bin/node -e " + quote(boundaryProbe) + " " + quote(sentinel) + " " + mode);
-      assert.equal(boundary.code, 0, "Nix open/sentinel boundary failed");
+      requireCriterion("Nix open/sentinel boundary", boundary.code === 0);
     } finally { await runAsRunner("/bin/rm", ["--", sentinel]); }
     const negative = await command("command-devbox-negative", "devbox run build", lab);
-    assert(negative.code !== 0 && negative.code !== null, "command Devbox unexpectedly succeeded");
-    assert(/big-lock[^\n]*(?:Permission denied|permission denied)|(?:Permission denied|permission denied)[^\n]*big-lock/.test(negative.stdout + negative.stderr),
-      "negative must specifically report Nix big-lock permission denial");
+    requireCriterion("command Devbox exits nonzero", negative.code !== 0 && negative.code !== null);
+    requireCriterion("command Devbox specifically denies Nix big-lock",
+      /big-lock[^\n]*(?:Permission denied|permission denied)|(?:Permission denied|permission denied)[^\n]*big-lock/.test(negative.stdout + negative.stderr));
     // Host only disconnects this exact owned container after this marker.
     await fs.writeFile("/data/uxlab-network-ready", "ready");
     const waitStarted = performance.now();
@@ -222,10 +229,12 @@ go test ./cmd/uzi/ -run '^$' -count=1`, path.join(checkout, "api"));
       assert.equal(render.code, 0, "offline render wrote HOME or failed");
       record("artifacts", { phase: "offline-render", pngs: await verifyPNGs(lab) });
       await runAsRunner("/bin/cp", ["-a", path.join(lab, "png"), path.join(lab, "proof", "offline-render")]);
+      record("rendering-complete", { cell, mode });
     }
     for (const [relative, expected] of Object.entries(manifestIds))
       assert.equal(sha(await readRegularFile(path.join(checkout, relative), 1024 * 1024)), expected, `manifest mutated: ${relative}`);
-    record("result", { status: "PASS", cell, mode, commands: homes.size });
+    record("result", { status: criterionFailures.length ? "FAIL" : "PASS", cell, mode, commands: homes.size, criterionFailures });
+    if (criterionFailures.length) process.exitCode = 1;
   } finally {
     assert(cache.drained(), "cache roots did not drain");
     await cache.settle(log, (token: string, timeoutMs: number) => launcher.removeCommandCache(token, { timeoutMs }),

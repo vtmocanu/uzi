@@ -31,10 +31,12 @@ async function readBounded(file, cap) {
 
 export const boundaryProbe = nodeFS + String.raw`
 (async () => {
-  const [sentinel, mode] = process.argv.slice(1);
+  const [sentinel, mode, scope] = process.argv.slice(1);
   check(mode === "off" || mode === "required", "invalid boundary mode");
+  check(scope === undefined || scope === "sentinel", "invalid boundary scope");
   check(/^\/nix\/uxlab-sentinel-[a-f0-9-]+$/.test(sentinel), "invalid sentinel path");
-  for (const file of ["/nix/var/nix/db/db.sqlite", "/nix/var/nix/db/big-lock", sentinel]) {
+  const files = scope === "sentinel" ? [sentinel] : ["/nix/var/nix/db/db.sqlite", "/nix/var/nix/db/big-lock", sentinel];
+  for (const file of files) {
     const stat = await fs.lstat(file, { bigint: true });
     check(stat.isFile(), "boundary requires existing regular file");
     console.log(JSON.stringify({ kind: "boundary-identity", file, ...identity(stat) }));

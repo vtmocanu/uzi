@@ -205,7 +205,10 @@ if [ "$action" = cell ]; then
   timeout 30s docker logs "$name" 2>&1 | head -c 8388608 >> "$log"
   [ "$(wc -c < "$log")" -lt 8388608 ] || { echo "ERROR: output cap" >> "$log"; exit 1; }
   rc="$(timeout 10s docker inspect "$name" --format '{{.State.ExitCode}}')"
-  if [ "$rc" = 0 ] && [ "$UXLAB_RENDER_CELL" != base ]; then
+  # Rendering evidence can be exported even when a separate boundary criterion fails.
+  # Exit status remains nonzero; only the fixture completion marker permits this arm.
+  if [ "$UXLAB_RENDER_CELL" != base ] && { [ "$rc" = 0 ] ||
+    { [ "$UXLAB_RENDER_CELL" = candidate ] && grep -q '^{"kind":"rendering-complete",' "$log"; }; }; then
     # pipefail requires BOTH the bounded decoder and docker cp producer to pass.
     if ! artifact_path="$(timeout --kill-after=5s 30s docker cp "$name:/data/uxlab-artifacts" - |
       python3 "$here/export.py" receipt 2>> "$log")"; then

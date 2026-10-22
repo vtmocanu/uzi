@@ -20,13 +20,15 @@ export UXLAB_RENDER_IMAGE
 if [ "$action" = local ]; then
   UXLAB_RENDER_CELL=local UXLAB_RENDER_MODE=off UXLAB_RENDER_REPO_DIR="$UXLAB_RENDER_CANDIDATE_DIR" bash "$here/run.sh" cell
 else
+  failed=0
   for cell in base candidate; do
     for mode in off required; do
       source_dir="$UXLAB_RENDER_CANDIDATE_DIR"
       if [ "$cell" = base ]; then source_dir="$UXLAB_RENDER_BASE_DIR"; fi
       # run.sh creates, verifies and removes its own exact container and volume
-      # before the next iteration. Failure stops the matrix.
-      UXLAB_RENDER_CELL="$cell" UXLAB_RENDER_MODE="$mode" UXLAB_RENDER_REPO_DIR="$source_dir" bash "$here/run.sh" cell
+      # before the next iteration. Collect every independent cell; any failure stays red.
+      UXLAB_RENDER_CELL="$cell" UXLAB_RENDER_MODE="$mode" UXLAB_RENDER_REPO_DIR="$source_dir" bash "$here/run.sh" cell || failed=1
     done
   done
+  exit "$failed"
 fi
