@@ -8,10 +8,35 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+import time
 
 SPEC = importlib.util.spec_from_file_location('worker_toolchain', Path(__file__).with_name('check-worker-toolchain.py'))
 CHECK = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CHECK)
+
+
+def require_public_cache(config, packages):
+    """A local realization alone cannot authorize a source-building worker image."""
+    system = subprocess.check_output(['nix', 'eval', '--impure', '--raw', '--expr',
+                                      'builtins.currentSystem'], text=True, timeout=60).strip()
+    lock = json.loads((config / 'devbox.lock').read_text())
+    paths = set()
+    for key in packages:
+        outputs = lock['packages'][key].get('systems', {}).get(system, {}).get('outputs', [])
+        selected = [output.get('path', '') for output in outputs if output.get('default') is True]
+        if not selected or any(not re.fullmatch(r'/nix/store/[a-z0-9]{32}-[^/\s]+', path) for path in selected):
+            raise ValueError(f'missing resolved worker outputs for {key} on {system}; no lock published')
+        paths.update(selected)
+    started = time.monotonic()
+    try:
+        # Query the REMOTE store, even if install already built a path locally.
+        # Recursive verification also refuses a missing dependency in its closure.
+        subprocess.run(['nix', 'path-info', '--recursive', '--store', 'https://cache.nixos.org',
+                        *sorted(paths)], check=True, stdout=subprocess.DEVNULL, timeout=300)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        raise ValueError('worker outputs not yet cached or public cache unavailable; '
+                         'retry next week; no lock published') from error
+    print(f'worker public-cache coverage: {len(paths)} output roots verified in {time.monotonic() - started:.1f}s')
 
 
 def refresh(root, devbox):
@@ -53,6 +78,7 @@ def refresh(root, devbox):
         # supported install path, then populate its store-path metadata.
         run('install', '--tidy-lockfile')
         CHECK.check(stage)
+        require_public_cache(config, packages)
         if (manifest_path.read_bytes() != original_manifest or lock_path.read_bytes() != original_lock
                 or any(path.read_bytes() != contents for path, contents in modules.items())):
             raise ValueError('worker inputs changed during refresh; no lock published')
