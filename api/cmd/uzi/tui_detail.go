@@ -1091,7 +1091,7 @@ func (m tuiModel) transportLine() string {
 // interactive modes draw their own hints, so this is only emitted when idle.
 func (m tuiModel) detailFooter() string {
 	owner := m.detail.steer.access == steerAllowed
-	parts := []string{m.keyHint("←→", "pane"), m.keyHint("↑↓", "move"), m.keyHint("W", "worker")}
+	parts := []string{m.keyHint("esc", "back"), m.keyHint("?", "keys"), m.keyHint("←→", "pane"), m.keyHint("↑↓", "move"), m.keyHint("W", "worker")}
 	if len(m.detail.lanes) > 0 {
 		parts = append(parts, m.keyHint("c", "crew"))
 	}
@@ -1114,7 +1114,6 @@ func (m tuiModel) detailFooter() string {
 		}
 		parts = append(parts, m.keyHint("f", "follow-up"), m.keyHint("x", "cancel"))
 	}
-	parts = append(parts, m.keyHint("esc", "back"), m.keyHint("?", "keys"))
 	return strings.Join(parts, m.pal.faint.Render(" · "))
 }
 
