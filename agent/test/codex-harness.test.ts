@@ -2572,6 +2572,36 @@ describe("CodexHarness: server→client tool-call routing", () => {
     assert.equal(spawnCalls.length, 1, "the replay ran no second shell effect");
   });
 
+  // Issue #3139: the shared reducer folds the projected main-origin tool start of a non-signal root
+  // callback into leadToolCall, and never folds a signal tool (report_progress) into it.
+  for (const [tool, args, expected] of [
+    ["Bash", { command: "echo hello" }, true],
+    ["report_progress", { completed: [], in_progress: [] }, false],
+  ] as const) {
+    it(`a root ${tool} item/tool/call ${expected ? "folds into" : "does not set"} leadToolCall through the reducer (issue #3139)`, async () => {
+      const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+      const request = makeRequest();
+      const broker = new CodexCallbackBroker({
+        registry,
+        spawnCommand: async () => ({ code: 0, stdout: "ok", stderr: "" }),
+        fileop: { op: async () => ({ ok: true, size: 0 }) },
+        worktreePath: WORKSPACE,
+        grants: renderCodexRun(request).leadGrants,
+        delegate: async () => ({ ok: false, code: "x", message: "no" }),
+        allowedRoles: new Set<string>(),
+      });
+      const { harness, transport } = makeHarness({ registry, broker });
+      transport.push(threadStarted()).push(toolCall(7, tool, args)).push(turnCompleted("completed")).end();
+      const events = await collect(harness.startTurn(request).events);
+      const { RunTurnReducerImpl } = await import("../src/harness-reducer.js");
+      const reducer = new RunTurnReducerImpl({ request() {}, async get() { return undefined; } });
+      reducer.beginTurn();
+      for (const event of events) await reducer.accept(event);
+      const completion = await reducer.finish({ kind: "exhausted" });
+      assert.equal(completion.result.leadToolCall === true, expected);
+    });
+  }
+
   it("a broker DENY is replied as a failed tool result (success:false), not a thrown error", async () => {
     const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
     const request = makeRequest();
@@ -3189,6 +3219,37 @@ describe("CodexHarness: modelInitiated inclusion evidence (issue #1800)", () => 
       .push(turnCompleted("completed"))
       .end();
     assert.equal(modelInitiated(await collect(harness.startTurn(makeRequest()).events)), 1);
+  });
+
+  // Issue #3139: native command/file/MCP root items count as a lead tool call; dynamic tool calls
+  // are projected as main-origin tool frames (see "routes an item/tool/call to the broker") and are
+  // counted by the reducer, so the activity marker excludes them.
+  const leadToolCalls = (events: HarnessEvent[]): number =>
+    events.filter((e) => e.kind === "activity" && e.leadToolCall === true).length;
+
+  for (const type of ["commandExecution", "fileChange", "mcpToolCall"]) {
+    it(`a root-thread ${type} item/started carries leadToolCall (issue #3139)`, async () => {
+      const { harness, transport } = makeHarness();
+      transport.push(threadStarted()).push(itemNote("item/started", type, "th-1"))
+        .push(itemNote("item/completed", type, "th-1")).push(turnCompleted("completed")).end();
+      assert.equal(leadToolCalls(await collect(harness.startTurn(makeRequest()).events)), 1);
+    });
+  }
+
+  it("a root dynamicToolCall item/started is modelInitiated but not leadToolCall (issue #3139)", async () => {
+    const { harness, transport } = makeHarness();
+    transport.push(threadStarted()).push(itemNote("item/started", "dynamicToolCall", "th-1"))
+      .push(turnCompleted("completed")).end();
+    const events = await collect(harness.startTurn(makeRequest()).events);
+    assert.equal(modelInitiated(events), 1);
+    assert.equal(leadToolCalls(events), 0);
+  });
+
+  it("a child-thread commandExecution item/started carries no leadToolCall (issue #3139)", async () => {
+    const { harness, transport } = makeHarness();
+    transport.push(threadStarted()).push(itemNote("item/started", "commandExecution", "child-thread"))
+      .push(turnCompleted("completed")).end();
+    assert.equal(leadToolCalls(await collect(harness.startTurn(makeRequest()).events)), 0);
   });
 
   it("a root-thread item/completed alone (no start this turn) is not marked modelInitiated", async () => {

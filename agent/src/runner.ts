@@ -21053,9 +21053,12 @@ export class RunRunner {
       this.openQuestionIds.set(runId, questionId);
     }
 
+    const stallSatisfied = trigger.kind === "no_progress_stall" && unmet.length === 0;
     const milestoneLines = unmet.length
       ? unmet.map((id) => `- ${escapeInline(id)}`).join("\n")
       : "- (the frozen completion contract is not yet satisfied)";
+    const stallLead =
+      "The lead stopped making progress without signalling done: it ended consecutive turns with no tool call, no worktree change and no milestone progress.";
     if (trigger.kind === "lead_request") {
       batcher.emit({
         kind: "status", agent: "worker",
@@ -21070,8 +21073,18 @@ export class RunRunner {
         questions: [
           {
             header: "Completion blocked",
-            question: [
-              ...(trigger.kind === "lead_request" ? [
+            question: (stallSatisfied ? [
+              stallLead,
+              "The frozen completion contract is satisfied, but the lead has not signalled done.",
+              "",
+              "This question persists for an owner decision; if the live window expires, the run is held.",
+              "Continue to return to the lead for a server-authoritative completion recheck:",
+              'uzi run decide <id> --continue [--guidance "<text>"]',
+            ] : [
+              ...(trigger.kind === "no_progress_stall" ? [
+                stallLead,
+                "The worker ran a completion check; the frozen completion contract still has unmet milestones:",
+              ] : trigger.kind === "lead_request" ? [
                 "The lead requested an owner decision. The authoritative frozen completion contract still has unmet milestones:",
                 "",
                 `Lead reason (untrusted display): ${escapeInline(trigger.reason)}`,
@@ -21091,7 +21104,7 @@ export class RunRunner {
               'uzi run decide <id> --accept m2.c1,m2.c3 --reason "<why>"',
               "Accept uses exact criterion IDs shown in the run view or uzi run get. It waives those criteria as met, not deferred; normal closing remains possible if otherwise eligible.",
               "Decisions do not promise publication or override the remaining checks.",
-            ].join("\n"),
+            ]).join("\n"),
           },
         ],
       },
