@@ -303,9 +303,9 @@ hold POST sends no hold request. (AI-synced 2026-10-22)
 This is a worker-only fix. APIs supporting wall parking already serve the
 count on both running ACKs and wall-park refusals; no API, migration or chart
 pin change is required. Old workers retain the old loop until rollout via
-`workers.image.tag`. The pre-existing resumed-flight gap described in held
-PR #3279's #3139 addendum must be reconciled when that PR rebases onto this
-fix; neither change depends on the other landing first.
+`workers.image.tag`. The inherited resumed-flight gap is closed by this
+amendment; the #3139 stall path below uses the same landed history routing.
+
 ## Addendum — worker-initiated stall attempt (2026-10-21, #3139)
 
 Another source of a completion attempt joins the lead's `signal_done`, the permit path's missing-milestones denial and the #3090 publication-start empty attempt (above, *Hold, attempts and capture*): a **worker-initiated stall attempt**. It exists so a lead that stops making progress without ever calling `signal_done` reaches the owner question and the hold instead of failing on the iteration budget.
@@ -319,7 +319,7 @@ Another source of a completion attempt joins the lead's `signal_done`, the permi
 **Consequences of the attempt existing.**
 
 - `completion_attempts` is never cleared. Once it is above 0, `RequestWallParks` spares a post-attempt run whose worker heartbeat is live (the #1226 carve-out starts applying), so a later wall exhaustion on a live worker goes through `StampCompletionBudgetExhausted` into a completion hold rather than a wall park. This holds only while the worker is live: `ParkRunsAtWall` can still park a post-attempt run whose worker heartbeat went stale, with `hold_reason='budget_exhausted'`, where `CanStopAtWall` can be true.
-- That wall-exhaustion routing also needs an attempt in the current flight. Both executors act on the served budget-exhausted steer only once this flight has latched an attempt. In a resumed flight with no attempt of its own, the worker's own wall trip asks `SetRunWallPark`, which refuses once `completion_attempts` is above 0. The worker then restarts the turn, so that flight gets neither a wall park nor a completion hold: it keeps re-driving with refused wall-park captures until the owner acts. Only on Codex can it end on `max_iterations`, and only if a re-driven turn completes inside the 5 s re-drive allowance. This gap predates #3139; the stall attempt puts more runs into it.
+- Wall and served completion-budget exhaustion recognize validated server history from an earlier flight through `CompletionHistory` (#3282), independently of this flight's attempt latch. A resumed run with a prior attempt enters the completion hold, using the bounded empty-head fallback if capture exhausts. A live hold refusal stops the flight nonterminally with clone and HOME retained; it never falls back to wall-park retries or model redrive. Zero-attempt owner-extension refusals keep their existing redrive behavior. (AI-synced 2026-10-22)
 - Max-iterations (both harnesses) and #281 no-progress stops (Claude only; see the residual) on that run route to the completion hold. `completionAttempted` is per flight: after a hold is resumed, routing of those stops in the resumed flight needs an attempt in that flight. The stall itself stays ineligible in the resumed flight because the server count is above 0.
 - `RunView`'s attempt count includes the worker's stall attempt.
 - The stall-time done checkpoint may capture the stall-time head. That state authorizes nothing: publication and the code cross-check use the later real done checkpoint's head, so the published head and the head the cross-check reviewed both come from it (`agent/test/runner-completion-stall.test.ts`).
