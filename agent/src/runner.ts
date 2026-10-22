@@ -2273,6 +2273,8 @@ interface RunFlight {
   publishedRealTips?: string[];
   /** Exact candidate of the successful finalize push, retained for completion bookkeeping. */
   successfulPushedSha?: string;
+  /** Registration support frozen at flight creation, before any publication. */
+  sourcePublicationNegotiated?: boolean;
   /** PRD #1230 D5: the frozen sources of the latest compiled semantic candidate and where they were
    *  captured, so a drift observation reads each PRD at the same commit. Detection input only. */
   semanticDrift?: { barePath: string; headSha: string; sources: FrozenSource[] };
@@ -6883,6 +6885,8 @@ export class RunRunner {
       logMessage: string,
       fields: Record<string, unknown>,
     ): Promise<void> => {
+      // Persist the source fence with the proof, including on boot-time replay.
+      if (body.source_publication !== undefined) body = { ...body, claim_generation: flight.claimGeneration };
       // Freeze delivered identity before journal installation and before fallback can change HEAD.
       const finalHead = body.head ?? flight.successfulPushedSha;
       if (flight.inventoryGuarded && ["issue", "mr_rework", "self_improve"].includes(flight.runKind) &&
@@ -9499,6 +9503,9 @@ export class RunRunner {
       // interlocked run; undefined for a legacy run, so JSON.stringify drops it and the legacy
       // completed report is byte-for-byte unchanged on the wire.
       head: completionHead,
+      source_publication: flight.sourcePublicationNegotiated && flight.runKind === "issue"
+        ? { version: 1, published_head: flight.successfulPushedSha!, non_closing: nonClosingDelivery }
+        : undefined,
     }, "run completed", { branch: result.branch, mr_iid: mr.iid });
   }
 
@@ -9698,6 +9705,7 @@ export class RunRunner {
       cancel,
       steering,
       claimGeneration,
+      sourcePublicationNegotiated: this.client.hasFeature("refresh_publication_context_v1"),
       planRevisionRetryNegotiated: this.client.hasFeature(PLAN_REVISION_RETRY_FEATURE) && Number.isSafeInteger(claimGeneration) && claimGeneration > 0,
       owedDefaultBranch: claim.repo.default_branch?.trim() || undefined,
       checkpointDefaultBranch: claim.repo.default_branch ?? undefined,
