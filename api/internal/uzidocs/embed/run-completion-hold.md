@@ -385,11 +385,54 @@ loss accepted between acknowledgement and push remains possible: the API
 does not fence the Git push itself. Corruption outside supported writers is
 not detected before push; the later permit fails closed.
 
-MR rework (`mr_rework`) and branch-adopting CI fix (`ci_fix`) are excluded.
-Forgejo/Gitea can close an issue on any branch push; the non-branch checkpoint
-refs `refs/uzi-checkpoints` and held refs `refs/uzi-held` are outside that
-branch-push behavior. These two residuals share the recorded finding handoff
-#3b56e6e5-4352-4694-ae1c-4999d5719e9c (a finding ID, not a forge issue).
+### Refreshing an existing publication (#3120)
+
+MR rework (`mr_rework`) and CI fix (`ci_fix`) that adopts its pipeline
+branch now resolve source publication context before publishing. With
+`refresh_publication_context_v1`, the authenticated server resolver binds
+the current worker claim generation, branch and exact candidate to the source
+run, issue and open pull/merge request. Unknown, ambiguous, changed or
+unreadable authority refuses publication; request text is never authority.
+
+A closing result requires an immutable terminal source-publication stamp.
+The issue worker reports `source_publication` with the exact frozen successful
+push SHA and its non-closing declaration. The server combines that declaration
+with authoritative scope restrictions and stores `runs.source_publication_intent`
+atomically with successful issue completion. This also supports legacy
+(non-interlocked) issue runs; the stamp is independent of recovery inventory
+and completion-permit negotiation. There is no pre-push stamp writer.
+A failed completion leaves no stamp: absent affirmative non-closing evidence,
+a later refresh is unknown, even if the push succeeded. Historical affirmative
+non-closing evidence can restrict a refresh without a stamp; missing evidence
+cannot establish closing authority. Historical publications are not backfilled.
+
+The worker resolves again for the exact candidate before each push attempt,
+including retries, alignment and bridge candidates. Source identity must
+remain stable; an observed non-closing restriction stays latched for the flight.
+For a non-closing source it scans default-branch..candidate commit messages,
+including earlier published history, for directives closing that source issue.
+Unknown context or unreadable messages stop publication. A closing hit fails
+the refresh with the refused candidate, up to five offending SHAs and a remaining
+count, without publishing commit text. These refresh refusals fail rather than
+entering the structural completion hold. Recovery keeps the existing inventory
+settlement rules; legacy refreshes retain the local source unless its original
+pinned head was verifiably archived. Preservation does not promise a remote copy.
+The worker does not rewrite history or force-push; the owner recovers and
+corrects the preserved work.
+
+A new worker without the negotiated feature refuses affected refreshes.
+Old workers and old APIs retain their earlier source-issue behavior; upgrade
+both components for this protection. See
+[Worker versions and upgrades](worker-upgrades.md#refresh-publication-context-3120).
+
+Forgejo/Gitea can close an issue on any branch push. #3120 guards these refresh
+pushes; it adds no every-branch scan and changes no forge settings. Other
+unguarded pushes, legacy scope-capped issue delivery, earlier published history
+and old workers remain boundaries. Non-branch checkpoint refs
+`refs/uzi-checkpoints` and held refs `refs/uzi-held` are outside branch-push
+closure. A resolver check grants no push lease: claim or authority changes
+between check and push, and human request edits or merges, remain races.
+Neither an earlier push nor a human edit is undone by this guard.
 
 This remains structural enforcement for every production run. #1230 D4 is
 implemented but dormant (see [Maintainer outstanding proof on semantic
