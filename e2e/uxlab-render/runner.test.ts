@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
+import { ChildProcess } from "node:child_process";
+import { once } from "node:events";
+import { Socket } from "node:net";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { runnerCommand } from "../../agent/src/runner-uid.js";
@@ -151,7 +154,7 @@ for (const mode of ["accepts TERM", "resists TERM", "normal exit"] as const) {
     await new Promise((resolve) => setTimeout(resolve, 150));
     assert.equal(await fs.readFile(heartbeat, "utf8"), before, "descendant still writes after runner returns");
     const stat = await fs.readFile(`/proc/${pid}/stat`, "utf8").catch((error) => {
-      if (error.code === "ENOENT") return null;
+      if (error.code === "ENOENT" || error.code === "ESRCH") return null;
       throw error;
     });
     assert(stat === null || /^\d+ \(.+\) Z /.test(stat), "descendant must be gone or a stopped zombie");
@@ -191,6 +194,97 @@ for (const permissionDenied of [false, true]) {
     assert.equal(opts.events.find((event) => event.kind === "runner-cleanup")?.data.groupAbsent,
       !permissionDenied);
   });
+}
+
+for (const stream of ["stdout", "stderr"] as const) {
+  for (const cleanup of ["returns false", "throws"] as const) {
+    for (const endless of [false, true]) {
+      test(`runner stops both pipes on ${stream} overflow when cleanup ${cleanup} and output is ${endless ? "endless" : "32 MiB"}`,
+        { timeout: 8_000 }, async (t) => {
+          const received = new Map<Socket, { bytes: number; largest: number }>();
+          const realEmit = Socket.prototype.emit;
+          t.mock.method(Socket.prototype, "emit", function (this: Socket, event: string | symbol, ...args: unknown[]) {
+            if (event === "data" && Buffer.isBuffer(args[0])) {
+              const stats = received.get(this) ?? { bytes: 0, largest: 0 };
+              stats.bytes += args[0].length;
+              stats.largest = Math.max(stats.largest, args[0].length);
+              received.set(this, stats);
+            }
+            return Reflect.apply(realEmit, this, [event, ...args]);
+          });
+          const unreferenced: ChildProcess[] = [];
+          const realUnref = ChildProcess.prototype.unref;
+          t.mock.method(ChildProcess.prototype, "unref", function (this: ChildProcess) {
+            unreferenced.push(this);
+            return realUnref.call(this);
+          });
+          let ownedPgid: number | undefined;
+          const opts = { ...options(), timeout: 3_000,
+            killRunnerGroupOnly: (pgid: number) => {
+              ownedPgid = pgid;
+              if (cleanup === "throws") throw new Error("signal denied");
+              return false;
+            } };
+          t.after(async () => {
+            // Only runRunner's own detached PGID is signalled. Await its parent's
+            // exit when still alive; the fixture's self deadline is a second bound.
+            const detached = unreferenced[0];
+            const exited = detached && detached.exitCode === null && detached.signalCode === null
+              ? once(detached, "exit") : undefined;
+            if (ownedPgid !== undefined) killRunnerGroupOnly(ownedPgid);
+            await exited;
+          });
+          const fixture = `
+            process.stdout.on("error", () => {});
+            process.stderr.on("error", () => {});
+            process.stdout.write("x");
+            process.stderr.write("y");
+            setTimeout(() => process.exit(0), 5000);
+            setTimeout(() => {
+              let sent = 0;
+              const chunk = Buffer.alloc(64 * 1024, "z");
+              const send = () => {
+                // One chunk per turn bounds each attempt; a self deadline bounds
+                // endless output even when the regression runs against old code.
+                process.${stream}.write(chunk);
+                sent += chunk.length;
+                if (${endless} || sent < 32 * 1024 * 1024) setImmediate(send);
+              };
+              send();
+            }, 30);
+          `;
+          const begun = performance.now();
+          await assert.rejects(runRunner(localRunner, process.execPath, ["-e", fixture], opts),
+            (error: unknown) => {
+              const failure = error as { code: string; killed: boolean; stdout: string; stderr: string };
+              assert.equal(failure.code, "ERR_CHILD_PROCESS_STDIO_MAXBUFFER");
+              assert.equal(failure.killed, false);
+              assert.equal(Buffer.byteLength(failure[stream]), 4 * 1024 * 1024);
+              return true;
+            });
+          assert(performance.now() - begun < 1_500, "overflow must settle before the runner deadline");
+          assert.equal(received.size, 2, "both child pipes were observed");
+          const total = [...received.values()].reduce((sum, stats) => sum + stats.bytes, 0);
+          assert(total < 32 * 1024 * 1024, "must stop reading before the full finite payload");
+          for (const [pipe, stats] of received) {
+            assert(pipe.destroyed, "both child pipes must be destroyed");
+            assert(stats.bytes <= 4 * 1024 * 1024 + stats.largest, "only the current overflow chunk may exceed the cap");
+          }
+          await new Promise((resolve) => setTimeout(resolve, 30));
+          assert.equal([...received.values()].reduce((sum, stats) => sum + stats.bytes, 0), total,
+            "no further data events after overflow");
+          assert.equal(unreferenced.length, 1, "surviving child must be unreferenced");
+          const cleanupEvents = opts.events.filter((event) => event.kind === "runner-cleanup");
+          assert.equal(cleanupEvents.length, 1);
+          assert.equal(cleanupEvents[0]?.data.reason, "overflow");
+          assert.equal(cleanupEvents[0]?.data.dispatched, false);
+          assert.equal(cleanupEvents[0]?.data.groupAbsent, false);
+          assert.equal(cleanupEvents[0]?.data.error, cleanup === "throws" ? "Error: signal denied" : null);
+          assert(opts.events.some((event) => event.kind === "runner-error" && event.data.killed === false));
+          assert(!opts.events.some((event) => event.kind === "runner-complete"));
+        });
+    }
+  }
 }
 
 for (const cleanup of ["returns false", "throws"] as const) {

@@ -95,8 +95,10 @@ export async function runRunner(
         settle(null, null);
       }, timeout);
       // Each stream keeps at most maxOutputBytes, including the final partial chunk.
-      // Overflow attempts cleanup once for this known group; siblings are independent.
+      // First overflow closes both pipes and settles without waiting for this group.
+      // Cleanup is attempted once; host/container cleanup owns any surviving group.
       const capture = (name: "stdout" | "stderr", chunks: Buffer[], chunk: Buffer) => {
+        if (settled) return;
         const remaining = maxOutputBytes - sizes[name];
         if (remaining > 0) {
           const kept = chunk.subarray(0, remaining);
@@ -106,7 +108,11 @@ export async function runRunner(
         if (chunk.length > remaining) {
           failure ??= Object.assign(new RangeError(name + " maxBuffer length exceeded"),
             { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER", killed: false });
+          child.stdout.destroy();
+          child.stderr.destroy();
           cleanup("overflow");
+          child.unref();
+          settle(null, null);
         }
       };
       child.stdout.on("data", (chunk: Buffer) => capture("stdout", stdout, chunk));
