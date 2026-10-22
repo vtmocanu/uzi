@@ -1,20 +1,40 @@
 -- name: PublicationContextSnapshot :one
 -- One READ COMMITTED statement observes every root and every authority field again
--- after the forge barrier. Inspect every association; return at most two distinct roots.
+-- after the forge barrier. Inspect at most 4096 unique associations; overflow is unknown.
+-- Bound each discovery arm before deduplication, and never walk a truncated inventory.
+-- Count distinct roots independently of this work budget; return at most two roots.
 -- UNION deduplicates shared ancestors at each depth; no authority JSON rides the walk.
 WITH RECURSIVE
 request AS (
  SELECT r0.* FROM runs r0 WHERE r0.id = @run_id AND r0.user_id = @user_id
 ),
-seeds AS (
- SELECT a.id FROM request r
- JOIN LATERAL (
-  SELECT s.id FROM runs s
-  WHERE (r.kind = 'mr_rework' AND s.id = r.target_run_id)
-   OR (r.kind = 'ci_fix' AND s.id <> r.id AND s.user_id = r.user_id AND s.repo_id = r.repo_id
-    AND s.kind IN ('issue','prompt','self_improve','mr_rework')
-    AND (s.branch = r.pipeline_ref OR (s.kind = 'mr_rework' AND s.pipeline_ref = r.pipeline_ref)))
+ci_branch_ids AS MATERIALIZED (
+ SELECT a.id FROM request r JOIN LATERAL (
+  SELECT s.id FROM runs s WHERE r.kind = 'ci_fix'
+   AND s.user_id = r.user_id AND s.repo_id = r.repo_id AND s.branch = r.pipeline_ref
+  LIMIT 4097
  ) a ON true
+),
+ci_rework_ids AS MATERIALIZED (
+ SELECT a.id FROM request r JOIN LATERAL (
+  SELECT s.id FROM runs s WHERE r.kind = 'ci_fix' AND s.id <> r.id
+   AND s.user_id = r.user_id AND s.repo_id = r.repo_id
+   AND s.kind = 'mr_rework' AND s.pipeline_ref = r.pipeline_ref
+  LIMIT 4097
+ ) a ON true
+),
+association_ids AS MATERIALIZED (
+ SELECT id FROM ci_branch_ids UNION SELECT id FROM ci_rework_ids LIMIT 4097
+),
+association_budget AS (
+ SELECT count(*) > 4096 AS overflow FROM association_ids
+),
+seeds AS (
+ SELECT s.id FROM request r JOIN runs s ON r.kind = 'mr_rework' AND s.id = r.target_run_id
+ UNION ALL
+ SELECT i.id FROM association_ids i JOIN runs s ON s.id = i.id
+ CROSS JOIN association_budget b CROSS JOIN request r
+ WHERE NOT b.overflow AND s.id <> r.id AND s.kind IN ('issue','prompt','self_improve','mr_rework')
 ),
 walk AS (
  SELECT s.id, 0 AS depth FROM seeds s
@@ -58,12 +78,12 @@ SELECT jsonb_build_object(
  'nodes', COALESCE((SELECT jsonb_agg(jsonb_build_object('run', to_jsonb(a), 'seed', a.id, 'depth', 0, 'cycle', false)
  ORDER BY a.id) FROM roots z JOIN authority a ON a.id = z.id), '[]'::jsonb),
  'ancestry_unknown', (SELECT ancestry_unknown FROM summary),
- 'association_unknown', (SELECT association_unknown FROM summary),
+ 'association_unknown', (SELECT overflow FROM association_budget) OR (SELECT association_unknown FROM summary),
  'ci_mr_conflict', EXISTS (
- SELECT 1 FROM runs x WHERE r.kind = 'ci_fix' AND x.user_id = r.user_id AND x.repo_id = r.repo_id
- AND x.branch = r.pipeline_ref AND x.mr_iid IS NOT NULL
- AND x.mr_iid IS DISTINCT FROM (SELECT a.mr_iid FROM seeds s JOIN runs a ON a.id = s.id ORDER BY s.id LIMIT 1)
- )
+ SELECT 1 FROM association_ids i JOIN runs x ON x.id = i.id
+ WHERE r.kind = 'ci_fix' AND x.branch = r.pipeline_ref AND x.mr_iid IS NOT NULL
+ AND x.mr_iid IS DISTINCT FROM (SELECT a.mr_iid FROM roots z JOIN runs a ON a.id = z.id ORDER BY a.id LIMIT 1)
+)
 )::jsonb AS snapshot
 FROM request r LEFT JOIN repos p ON p.id = r.repo_id
 LEFT JOIN forge_connections c ON c.id = p.connection_id AND c.user_id = r.user_id;
