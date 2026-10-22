@@ -218,6 +218,7 @@ describe("commitWipMarker omissions (issue #3239)", () => {
     await f.write("racy.txt", "tiny\n");
     assert.equal(await f.git.commitWipMarker(f.root, { onIncomplete: f.onIncomplete }), false);
     assert.deepEqual([f.calls[0]!.markerCreated, f.calls[0]!.rollbackRefused], [false, true]);
+    assert.equal(f.calls[0]!.marker, undefined, "a detached capture never reports a marker to undo");
     assert.equal(wrote, false, "no rollback write was attempted");
     assert.equal(snapshot(f.root), refsAtBackstop, "HEAD and every ref unchanged by the backstop");
     assert.equal(f.g("rev-parse", "HEAD^"), pre);
@@ -249,6 +250,7 @@ describe("commitWipMarker omissions (issue #3239)", () => {
     assert.deepEqual([f.calls[0]!.markerCreated, f.calls[0]!.rollbackRefused], [false, true]);
     assert.ok(f.g("log", "-1", "--format=%s").startsWith(WIP_PARK_COMMIT_PREFIX), "git did write the marker");
     assert.equal(f.g("rev-parse", "HEAD^"), pre);
+    assert.equal(f.calls[0]!.marker, f.head(), "the written marker is recovered as this capture's own commit");
   });
 
   test("(g3) detached, then HEAD attached to a branch at the marker: refuses, no ref moved", async (t) => {

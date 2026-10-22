@@ -11364,12 +11364,21 @@ try {
     let omitted: WipOmission[] = [];
     let scanStarted = false;
     let committed = false;
+    let preHead = "";
+    let preRef = WIP_DETACHED;
+    // The commit lands on the branch HEAD named before the capture; a detached start has only HEAD.
+    const tipOf = async (): Promise<string> =>
+      (await git(["rev-parse", "--verify", preRef === WIP_DETACHED ? "HEAD^{commit}" : `${preRef}^{commit}`])).trim();
+    // Report a marker (for the pause park's fenced undo) only when it is provably the commit this
+    // capture wrote on a branch: one commit on preHead with the marker subject. A detached capture
+    // never reports one, so no undo ever follows it.
+    const ownMarker = async (marker: string): Promise<boolean> =>
+      preRef !== WIP_DETACHED &&
+      (await git(["rev-parse", "--verify", `${marker}^`])).trim() === preHead &&
+      (await git(["log", "-1", "--format=%s", marker])).startsWith(WIP_PARK_COMMIT_PREFIX);
     try {
-      const preHead = (await git(["rev-parse", "--verify", "HEAD^{commit}"])).trim();
-      const preRef = await this.wipSymbolicHead(clonePath);
-      // The commit lands on the branch HEAD named above; a detached start has only HEAD.
-      const tipOf = async (): Promise<string> =>
-        (await git(["rev-parse", "--verify", preRef === WIP_DETACHED ? "HEAD^{commit}" : `${preRef}^{commit}`])).trim();
+      preHead = (await git(["rev-parse", "--verify", "HEAD^{commit}"])).trim();
+      preRef = await this.wipSymbolicHead(clonePath);
       const status = await git(["status", "--porcelain"]);
       if (status.split("\n").filter((l) => l.length > 0).length === 0) {
         return false; // clean tree — nothing to save
@@ -11412,7 +11421,6 @@ try {
       // and no blob over the cap, whatever happened to the worktree after the omission scan. The
       // marker is the commit the capture wrote to preRef, not whatever HEAD names now.
       const marker = await tipOf();
-      wroteMarker = marker;
       await this.wipCaptureSeam?.beforeBackstop?.(clonePath, marker);
       const markerParent = (await git(["rev-parse", "--verify", `${marker}^`])).trim();
       const subject = await git(["log", "-1", "--format=%s", marker]);
@@ -11420,13 +11428,14 @@ try {
         report(omitted, false, true);
         return false;
       }
+      if (preRef !== WIP_DETACHED) wroteMarker = marker;
       const extra = await this.wipMarkerViolations(clonePath, preHead, marker);
       if (extra.length === 0) {
         // The vetted commit must still be what the branch holds; an agent that moved it meanwhile
         // gets no publish of a commit nobody vetted.
         if ((await tipOf()) !== marker) { report(omitted, false, true); return false; }
         if (omitted.length > 0) report(omitted, true, false);
-        try { opts.onCommitted?.(marker); } catch { /* observer only */ }
+        if (preRef !== WIP_DETACHED) { try { opts.onCommitted?.(marker); } catch { /* observer only */ } }
         return true;
       }
       const all = [...omitted, ...extra.filter((e) => !omitted.some((o) => o.path === e.path))];
@@ -11457,8 +11466,14 @@ try {
       });
       // After the commit ran the marker is unvetted: report it so the park callers do not publish
       // it. Before it, an exclude-mode park still keeps its clone (the scan began, work may be left).
-      if (committed) report(omitted, false, true);
-      else if (mode === "exclude" && scanStarted) report(omitted, false, false);
+      if (committed) {
+        // A commit that wrote the ref and then rejected: recover the marker, best effort, only when
+        // it is provably this capture's commit, so the pause park can still undo it (fenced CAS).
+        if (wroteMarker === undefined) {
+          try { const tip = await tipOf(); if (await ownMarker(tip)) wroteMarker = tip; } catch { /* stays unknown */ }
+        }
+        report(omitted, false, true);
+      } else if (mode === "exclude" && scanStarted) report(omitted, false, false);
       return false;
     }
   }
@@ -11586,10 +11601,10 @@ try {
    * SAME restore the resume adopt does (#759 M2, `reset --soft` on the adopted marker), run
    * inline here because a continuing run never reseeds. BEST-EFFORT: every error is caught
    * and logged — a failed restore must never propagate, exactly as `commitWipMarker` never
-   * propagates a commit failure (D4). Callers first check that HEAD's tip is a `wip(park):`
-   * commit (the pause park also requires HEAD to name the run branch, issue #3239), so HEAD^ is
-   * that marker's parent. A detached HEAD is never undone by the pause park: the marker stays
-   * committed there, matching the detached no-rollback rule.
+   * propagates a commit failure (D4). The caller (the credential-switch give-up) first checks that
+   * HEAD's tip is a `wip(park):` commit, so HEAD^ is that marker's parent. The pause park does not
+   * use this: it undoes only the exact marker the capture reported, by compare-and-swap on the run
+   * branch ({@link undoWipMarkerOnBranch}, issue #3239).
    */
   async undoWipMarker(clonePath: string): Promise<void> {
     try {

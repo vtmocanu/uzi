@@ -1085,7 +1085,7 @@ describe("RunRunner — M2 explicit park callback", () => {
 // the agent switched HEAD to another branch B (B and HEAD are untouched); a branch that moved past the
 // marker is left alone.
 describe("RunRunner — pause park with an unvetted WIP marker (issue #3239)", () => {
-  for (const scenario of ["branch-moved", "head-on-other-branch"] as const) {
+  for (const scenario of ["branch-moved", "head-on-other-branch", "commit-rejects"] as const) {
     it(`reports pause_failed and publishes nothing (${scenario})`, async () => {
       const { gitlab } = fakeGitlab();
       const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-3239-pause-"));
@@ -1095,7 +1095,9 @@ describe("RunRunner — pause park with an unvetted WIP marker (issue #3239)", (
       const rGit = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({
         gitleaksBin: defaultGitleaksShim(),
         wipCapture: {
-          afterOmissionCheck: async (p) => { if (state.armed) fs.writeFileSync(path.join(p, "core"), "tiny\n"); },
+          // A commit that wrote the marker and then rejected (timeout): the backstop never ran on it.
+          get commitRejectsAfterWrite() { return state.armed && scenario === "commit-rejects"; },
+          afterOmissionCheck: async (p) => { if (state.armed && scenario !== "commit-rejects") fs.writeFileSync(path.join(p, "core"), "tiny\n"); },
           beforeBackstop: async (p, marker) => {
             if (!state.armed) return;
             state.marker = marker;
@@ -1144,7 +1146,7 @@ describe("RunRunner — pause park with an unvetted WIP marker (issue #3239)", (
           checkpointTestHooks: { retryBackoffMs: [0, 0] },
         }).execute(claim);
 
-        assert.ok(state.marker, "the rollback was refused (marker unvetted)");
+        if (scenario !== "commit-rejects") assert.ok(state.marker, "the rollback was refused (marker unvetted)");
         const statuses = stateStatuses(claim.run_id);
         assert.ok(statuses.includes("pause_failed"), `pause_failed reported, got ${JSON.stringify(statuses)}`);
         assert.ok(!statuses.includes("paused"), "the run did not park");
@@ -1154,6 +1156,12 @@ describe("RunRunner — pause park with an unvetted WIP marker (issue #3239)", (
           assert.equal(seen.head, `refs/heads/${state.branch}`);
           assert.ok(seen.runSubject!.startsWith("wip(park)"), "the moved branch (a sibling marker) was not rewound");
           assert.notEqual(seen.runTip, state.marker);
+        } else if (scenario === "commit-rejects") {
+          // The marker the rejected commit call wrote is recovered as this capture's own commit and
+          // undone by the fenced compare-and-swap: content back to uncommitted, nothing published.
+          assert.equal(seen.head, `refs/heads/${state.branch}`);
+          assert.ok(!seen.runSubject!.startsWith("wip(park)"), `the run branch was rewound off the marker, got ${seen.runSubject}`);
+          assert.match(seen.status!, /WIP\.txt/, "the WIP is back on disk, uncommitted");
         } else {
           assert.equal(seen.head, "refs/heads/B", "HEAD stays on B");
           assert.equal(seen.bTip, state.marker, "B was not rewound");
