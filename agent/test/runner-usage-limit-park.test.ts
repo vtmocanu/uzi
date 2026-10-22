@@ -6,6 +6,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { type ExecutorResult, type RunContext } from "../src/executor.js";
+import type { Readable } from "node:stream";
 import { RunRunner, type ExecutorFactory } from "../src/runner.js";
 import { GitCache, WIP_PARK_COMMIT_PREFIX } from "../src/git.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
@@ -2214,6 +2215,229 @@ describe("RunRunner — limit-park ancestry bridge (PRD #1416 M3, FIX 2)", () =>
         "the reseeded clone HEAD is the bridge B",
       );
     } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// issue #3239 — a park whose dirty clone holds a file the WIP auto-save must not commit (here a
+// 9 MiB non-core file) still parks, but keeps the clone and its journal; the resume then refuses
+// to reseed over the left-out file until it is gone. Real GitCache, real park and resume claims.
+describe("RunRunner — park with an oversized untracked file (issue #3239)", () => {
+  const BIG = 9 * 1024 * 1024;
+  const feedTexts = (runId: string): string[] =>
+    api.messages(runId).filter((m) => m.kind === "status").map((m) => String(m.payload.text));
+
+  async function parkWithBigFile(homeRoot: string, iid: number, runId: string) {
+    const { gitlab } = fakeGitlab();
+    let clone = "";
+    await runnerWith(
+      (rid) => ({
+        homeDir: path.join(homeRoot, rid),
+        executor: {
+          run: async (ctx: RunContext): Promise<ExecutorResult> => {
+            clone = ctx.worktreePath;
+            fs.writeFileSync(path.join(clone, "WIP.txt"), "ordinary uncommitted\n");
+            fs.writeFileSync(path.join(clone, "huge.bin"), Buffer.alloc(BIG, 0x61));
+            fs.mkdirSync(path.join(homeRoot, rid), { recursive: true });
+            throw new LimitReachedError({ resetsAtMs: Date.now() + 5 * 3600_000, rateLimitType: "five_hour" });
+          },
+        },
+      }),
+      gitlab,
+    ).execute(gitlabClaim(iid, { run_id: runId, wait_on_limit: true }));
+    return { gitlab, clone };
+  }
+
+  const bareOf = () => git.barePathFor(fx.originPath);
+  const gitRead = (cwd: string, ...args: string[]) =>
+    execFileSync("git", ["-C", cwd, ...args], { env: GIT_ENV, encoding: "utf8", stdio: "pipe" }).trim();
+  const resumeClaim = (iid: number, runId: string) => {
+    api.setOwnershipStatus(runId, "running", 2);
+    return gitlabClaim(iid, { run_id: runId, wait_on_limit: true, session_id: SID, last_seq: 1000, claim_generation: 2 });
+  };
+
+  it("parks, keeps the clone and journal, and the resume refuses to reseed over the file", async () => {
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-3239-park-"));
+    try {
+      const iid = 3239;
+      const runId = "32390000-0000-4000-8000-000000003239";
+      const { gitlab, clone } = await parkWithBigFile(homeRoot, iid, runId);
+      assert.ok(api.states.some((s) => s.body.status === "limit_wait"), "the park was accepted");
+      const bare = bareOf();
+      const ref = `refs/uzi-runner/agent/issue-${iid}`;
+      const files = gitRead(bare, "ls-tree", "-r", "--name-only", ref).split("\n");
+      assert.ok(files.includes("WIP.txt"), "the marker holds the ordinary WIP");
+      assert.ok(!files.includes("huge.bin"), "the marker does not hold the oversized file");
+      assert.equal(feedTexts(runId).filter((t) => t.startsWith("WIP auto-save left out 1 file")).length, 1, "exactly one worker notice names the omission");
+      assert.ok(fs.existsSync(path.join(clone, ".git")), "the clone was not retired");
+      assert.ok(gitRead(bare, "config", "--local", "--get", `uzi-recovery.agent/issue-${iid}.clone`), "journal kept");
+      assert.equal(fs.statSync(path.join(clone, "huge.bin")).size, BIG);
+
+      // Resume: the retained capture must stay unverified while the file exists, and nothing reseeds.
+      let modelRan = false;
+      let attempts = 0;
+      const twice = deferred();
+      const marker = git.commitWipMarker.bind(git);
+      git.commitWipMarker = async (...args) => {
+        const out = await marker(...args);
+        if (++attempts >= 2) twice.resolve();
+        return out;
+      };
+      const runner = runnerWith(
+        (rid) => ({ homeDir: path.join(homeRoot, rid), executor: { run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          modelRan = true;
+          return { branch: ctx.branch };
+        } } }),
+        gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 },
+      );
+      const execution = runner.execute(resumeClaim(iid, runId));
+      try {
+        await Promise.race([twice.promise, execution.then(() => { throw new Error("resume exited without retrying capture"); })]);
+        assert.equal(modelRan, false, "no reseed and no model start while the file is unsaved");
+        const resumeNotices = () => feedTexts(runId).filter((t) => t.startsWith("WIP capture left out 1 file")).length;
+        for (let i = 0; i < 100 && resumeNotices() === 0; i++) await new Promise((r) => setTimeout(r, 30));
+        await new Promise((r) => setTimeout(r, 200)); // further retries would add more by now
+        assert.ok(attempts >= 2, "the capture was attempted at least twice");
+        assert.equal(resumeNotices(), 1, "exactly one restore-point notice however many capture attempts ran");
+        const kept = fs.readFileSync(path.join(clone, "huge.bin"));
+        assert.equal(kept.length, BIG);
+        assert.ok(kept.equals(Buffer.alloc(BIG, 0x61)), "byte-identical at its original path");
+      } finally {
+        runner.shutdown();
+        await execution;
+      }
+      assert.ok(fs.readFileSync(path.join(clone, "huge.bin")).equals(Buffer.alloc(BIG, 0x61)), "still intact after shutdown");
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("deleting the file lets the retained capture verify and the resume proceed", async () => {
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-3239-park-del-"));
+    try {
+      const iid = 3240;
+      const runId = "32400000-0000-4000-8000-000000003240";
+      const { gitlab, clone } = await parkWithBigFile(homeRoot, iid, runId);
+      fs.rmSync(path.join(clone, "huge.bin"));
+      let seenWip: string | null = null;
+      await runnerWith(
+        (rid) => ({ homeDir: path.join(homeRoot, rid), executor: { run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          const p = path.join(ctx.worktreePath, "WIP.txt");
+          seenWip = fs.existsSync(p) ? fs.readFileSync(p, "utf8") : null;
+          return { branch: ctx.branch };
+        } } }),
+        gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 },
+      ).execute(resumeClaim(iid, runId));
+      assert.equal(seenWip, "ordinary uncommitted\n", "the resume proceeded and restored the ordinary WIP");
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// issue #3239 — the park sinks consume flight.wipMarkerUnsafe. Real GitCache whose capture is forced
+// to refuse its rollback (a core file slips past the scan, then the branch ref is locked so the
+// compare-and-swap write fails); the unvetted marker must be neither fetched back nor published.
+describe("RunRunner — unvetted WIP marker is never fetched back or published (issue #3239)", () => {
+  const readGit = (cwd: string, ...args: string[]) =>
+    execFileSync("git", ["-C", cwd, ...args], { env: GIT_ENV, encoding: "utf8", stdio: "pipe" }).trim();
+
+  function refusingGit() {
+    const state = { armed: false, marker: "", lock: "" };
+    const rGit = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({
+      gitleaksBin: defaultGitleaksShim(),
+      wipCapture: {
+        afterOmissionCheck: async (p) => { if (state.armed) fs.writeFileSync(path.join(p, "core"), "tiny\n"); },
+        beforeRollbackWrite: async (p, marker) => {
+          if (!state.armed) return;
+          state.marker = marker;
+          state.lock = readGit(p, "rev-parse", "--path-format=absolute", "--git-path", `${readGit(p, "symbolic-ref", "HEAD")}.lock`);
+          fs.writeFileSync(state.lock, "");
+        },
+      },
+    }));
+    return { rGit, state };
+  }
+
+  function spyPublish(): { calls: string[]; restore: () => void } {
+    const calls: string[] = [];
+    const orig = client.publishCheckpoint.bind(client);
+    (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = async (runId: string, tip: string, pack: Readable) => {
+      pack.resume();
+      calls.push(`${runId}:${tip}`);
+      return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/agent/issue-x" } };
+    };
+    return { calls, restore: () => { (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = orig; } };
+  }
+
+  const runnerOver = (g: GitCache, factory: ExecutorFactory, gitlab: ReturnType<typeof fakeGitlab>["gitlab"]) =>
+    new RunRunner(client, g, factory, nullLogger(), 20, undefined,
+      { pollMs: 5, planApprovalTimeoutMs: 0, questionTimeoutMs: 600, gitlab });
+
+  async function assertNothingLeft(rGit: GitCache, iid: number, clone: string, marker: string, calls: string[]) {
+    assert.ok(marker, "the rollback was refused (marker unvetted)");
+    const tracked = shaInBare(rGit.barePathFor(fx.originPath), trackingRef(iid));
+    assert.notEqual(tracked, marker, "the unvetted marker was not fetched back into the tracking ref");
+    assert.deepEqual(calls, [], "no checkpoint was published");
+    assert.ok(fs.existsSync(path.join(clone, ".git")), "the clone was kept");
+    assert.equal(fs.readFileSync(path.join(clone, "WIP.txt"), "utf8"), "dirty\n", "the work is still on disk");
+  }
+
+  it("limit-wait park: no fetch-back, no publish, clone kept", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-3239-unsafe-park-"));
+    const { rGit, state } = refusingGit();
+    const spy = spyPublish();
+    try {
+      const iid = 3241;
+      let clone = "";
+      const factory: ExecutorFactory = (rid) => ({
+        homeDir: path.join(homeRoot, rid),
+        executor: { run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          clone = ctx.worktreePath;
+          fs.writeFileSync(path.join(clone, "WIP.txt"), "dirty\n");
+          fs.mkdirSync(path.join(homeRoot, rid), { recursive: true });
+          state.armed = true;
+          throw new LimitReachedError({ resetsAtMs: Date.now() + 5 * 3600_000, rateLimitType: "five_hour" });
+        } },
+      });
+      await runnerOver(rGit, factory, gitlab).execute(gitlabClaim(iid, { wait_on_limit: true }));
+      await assertNothingLeft(rGit, iid, clone, state.marker, spy.calls);
+    } finally {
+      spy.restore();
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("graceful shutdown: no fetch-back, no publish, clone kept", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-3239-unsafe-shut-"));
+    const { rGit, state } = refusingGit();
+    const spy = spyPublish();
+    try {
+      const iid = 3242;
+      let clone = "";
+      const start = deferred();
+      const factory: ExecutorFactory = (rid) => ({
+        homeDir: path.join(homeRoot, rid),
+        executor: { run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          clone = ctx.worktreePath;
+          fs.writeFileSync(path.join(clone, "WIP.txt"), "dirty\n");
+          state.armed = true;
+          start.resolve();
+          await waitAbort(ctx.signal!);
+          throw new Error("aborted mid-run");
+        } },
+      });
+      const runner = runnerOver(rGit, factory, gitlab);
+      const p = runner.execute(gitlabClaim(iid, { wait_on_limit: true }));
+      await start.promise;
+      runner.shutdown();
+      await p;
+      await assertNothingLeft(rGit, iid, clone, state.marker, spy.calls);
+    } finally {
+      spy.restore();
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
   });

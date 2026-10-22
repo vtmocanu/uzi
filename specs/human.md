@@ -748,6 +748,7 @@ Tracked as GitLab issue vtmocanu/uzi#218; PRD at `prds/done/218-park-resume-work
   guaranteed. The separate episode failure remains unsolved; this decision changes no
   retention, deletion, drain, recovery framework or episode journal. [approved #3101]
   (AI-synced 2026-10-18)
+- The WIP auto-save never commits a core dump (`core`, `core.<pid>`) or a file over 8 MiB and never drops one silently: a park keeps the clone and its journal, notifies once per claim and kind, and stays unverified until the file is removed. A `wip(park):` marker under a verified coverage wrapper is restored uncommitted at successor adopt; unproven look-alikes refuse and need owner action. (AI-synced 2026-10-21)
 
 ## Feature #1392 — Park a run on a transient forge failure at clone or fetch
 

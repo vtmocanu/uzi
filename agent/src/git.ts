@@ -845,6 +845,22 @@ export interface GitCacheOptions {
     rename?: (from: string, to: string) => Promise<void>;
     residueUuid?: () => string;
   };
+  /** issue #3239 — test-only seams inside {@link GitCache.commitWipMarker}, in firing order:
+   *  `afterOmissionCheck` after the omission scan and before staging (to race a file past the
+   *  cap); `afterCommit` right after the commit call returns and BEFORE the backstop reads the
+   *  marker from the branch (to swap HEAD or the branch before that read); `beforeBackstop`
+   *  after the marker was read and before the backstop's identity checks; `beforeRollbackWrite`
+   *  after the final identity recheck and before the compare-and-swap write. Production never
+   *  passes it. */
+  wipCapture?: {
+    afterOmissionCheck?: (clonePath: string) => Promise<void>;
+    afterCommit?: (clonePath: string) => Promise<void>;
+    beforeBackstop?: (clonePath: string, marker: string) => Promise<void>;
+    beforeRollbackWrite?: (clonePath: string, marker: string) => Promise<void>;
+    /** Make the commit invocation reject AFTER git wrote the ref (a timeout shape), so the
+     *  capture's fail-closed handling of a commit that wrote and then failed is observable. */
+    commitRejectsAfterWrite?: boolean;
+  };
 }
 
 /** issue #1597 M2: the mid-turn checkpoint secret scan's hard deadline (all of its git + gitleaks
@@ -878,6 +894,39 @@ const CHECKPOINT_CHAIN_MAX_DIFF_BYTES = 1024 * 1024;
 //  - 100k blob oids: bounds the listing we buffer (~41 bytes per oid).
 /** Largest single blob, old or new side, a checkpoint scan accepts (bytes). */
 const CHECKPOINT_SCAN_MAX_BLOB_BYTES = 8 * 1024 * 1024;
+/** issue #3239 — the largest single file the park WIP auto-save ({@link GitCache.commitWipMarker})
+ *  will commit (bytes); a larger file, and any `core` / `core.<pid>` file, is left out. Same bound
+ *  as the checkpoint scan so a marker is never too large to scan. */
+const WIP_CAPTURE_MAX_FILE_BYTES = CHECKPOINT_SCAN_MAX_BLOB_BYTES;
+const WIP_DETACHED = "DETACHED";
+/** Most omitted paths exclude mode will pass as pathspecs to one `add`; more is treated as refuse. */
+const WIP_EXCLUDE_MAX_PATHS = 500;
+const WIP_CORE_FILE_RE = /^core(\.[0-9]+)?$/;
+/** Most status rows / staged or marker diff entries one WIP capture will examine. Past it the capture
+ *  is incomplete in BOTH modes (no marker), so a flood of paths never costs more than a constant
+ *  number of git processes plus this many lstats (issue #3239). */
+const WIP_CAPTURE_MAX_ENTRIES = 100_000;
+/** Most omitted paths logged / reported per capture; the total count rides alongside. */
+const WIP_REPORT_MAX_OMISSIONS = 100;
+/** A file the WIP auto-save refused to capture (issue #3239). `bytes` is set when sized. */
+interface WipOmission { path: string; reason: "core_file" | "oversized" | "unsized"; bytes?: number }
+/** What {@link GitCache.commitWipMarker} reports through `onIncomplete` (issue #3239). */
+export interface WipIncompleteInfo {
+  omitted: WipOmission[]; omittedTotal: number; markerCreated: boolean; rollbackRefused: boolean;
+  /** An unvetted ref tip observed after the backstop refused; null when it could not be read. */
+  unverifiedRefTip?: string | null;
+  /** The commit the capture wrote, only when it is provably that commit on a branch (one commit on
+   *  preHead with the marker subject); undefined for a detached capture. The pause park undoes exactly it. */
+  marker?: string;
+}
+interface WipMarkerOptions {
+  /** "refuse" (default): any omission means no marker. "exclude": commit everything else. */
+  mode?: "refuse" | "exclude";
+  onIncomplete?: (info: WipIncompleteInfo) => void;
+  /** Called with the vetted marker oid just before `commitWipMarker` returns true on a branch capture;
+   *  a detached capture never reports one. */
+  onCommitted?: (marker: string) => void;
+}
 /** Largest total of blob bytes, old and new side, a checkpoint scan accepts. */
 const CHECKPOINT_SCAN_MAX_TOTAL_BYTES = 128 * 1024 * 1024;
 /** Most distinct blob oids (old + new side) the scanned commits may touch. */
@@ -1397,6 +1446,20 @@ export class RetainedRecoveryBlockedError extends Error {
 export interface RecoveryJournalEntry extends RecoverySource {
   recovery?: RecoveryProgress;
   retainedSources?: RecoverySource[];
+  /** issue #3239: `wip(park):` markers whose content this attempt's clone was seeded from by an
+   *  adopt-time `reset --soft` (so they are no longer in its history). It is lineage evidence only:
+   *  a coverage wrapper may leave such a superseded marker as a leaf. Lost lineage can only cause a
+   *  refusal, never an acceptance. */
+  peeledMarkers?: string[];
+}
+
+/** issue #3239: at most this many peeled markers are journaled (SHA-40, unique). */
+const MAX_PEELED_MARKERS = 64;
+
+/** Union of marker lists, deduplicated, bounded to the newest {@link MAX_PEELED_MARKERS}. */
+function unionPeeledMarkers(...lists: Array<readonly string[] | undefined>): string[] {
+  const all = [...new Set(lists.flatMap(l => l ?? []))];
+  return all.slice(-MAX_PEELED_MARKERS);
 }
 
 // issue #1783 M2 — the per-branch ATTEMPT LEDGER, a MULTI-VALUED `config --local` key in the
@@ -1444,7 +1507,7 @@ function parseRecoveryJournal(value: string): RecoveryJournalEntry {
     throw new Error("invalid retained recovery clone journal");
   }
   const o = parsed as Record<string, unknown>;
-  if (Object.keys(o).some(k => !["runId", "clonePath", "attemptId", "restoreTip", "recovery", "retainedSources"].includes(k))) {
+  if (Object.keys(o).some(k => !["runId", "clonePath", "attemptId", "restoreTip", "recovery", "retainedSources", "peeledMarkers"].includes(k))) {
     throw new Error("invalid retained recovery clone journal");
   }
   // Legacy callers classify a mismatched attempt id as CapturePathMismatchError.
@@ -1471,7 +1534,15 @@ function parseRecoveryJournal(value: string): RecoveryJournalEntry {
   if (recovery && (recovery.source.runId !== source.runId ||
       (recovery.successor && recovery.successor.runId !== source.runId))) throw new Error("recovery run identity mismatch");
   if (retainedSources?.some(s => s.runId !== source.runId)) throw new Error("retained run identity mismatch");
-  return { ...source, ...(recovery ? { recovery } : {}), ...(retainedSources ? { retainedSources } : {}) };
+  let peeledMarkers: string[] | undefined;
+  if (o.peeledMarkers !== undefined) {
+    if (!Array.isArray(o.peeledMarkers) || o.peeledMarkers.length > MAX_PEELED_MARKERS ||
+        !o.peeledMarkers.every((m): m is string => typeof m === "string" && SHA40_RE.test(m)) ||
+        new Set(o.peeledMarkers).size !== o.peeledMarkers.length) throw new Error("invalid peeled markers");
+    peeledMarkers = [...o.peeledMarkers];
+  }
+  return { ...source, ...(recovery ? { recovery } : {}), ...(retainedSources ? { retainedSources } : {}),
+    ...(peeledMarkers?.length ? { peeledMarkers } : {}) };
 }
 
 function parseAttemptLedgerEntry(value: string): AttemptLedgerEntry | undefined {
@@ -2296,6 +2367,8 @@ export class GitCache {
   private readonly terminalRecordProtection: GitCacheOptions["terminalRecordProtection"];
   /** See {@link GitCacheOptions.canonicalFree}; undefined in production. */
   private readonly canonicalFreeSeam: GitCacheOptions["canonicalFree"];
+  /** See {@link GitCacheOptions.wipCapture}; undefined in production. */
+  private readonly wipCaptureSeam: GitCacheOptions["wipCapture"];
   /** issue #1783 (N1): the targets (resolved) of every runner-uid delete that settled as a
    *  {@link RunnerDeleteUnsettledError}, each counted until its child's 'close' arrives. In-process
    *  only: the rm walks by path, so a canonical free or reseed at such a path is refused
@@ -2324,6 +2397,7 @@ export class GitCache {
     this.scratchProvisioner = opts.scratchProvisioner;
     this.retentionDeleteSeam = opts.retentionDelete;
     this.canonicalFreeSeam = opts.canonicalFree;
+    this.wipCaptureSeam = opts.wipCapture;
     this.reposRoot = path.join(dataDir, "repos");
     this.runnerRoot = path.join(dataDir, "runner");
     this.terminalRecordProtection = opts.terminalRecordProtection;
@@ -6036,7 +6110,9 @@ export class GitCache {
    * later capture cannot prevent the restart guard from knowing whose work it is.
    * The runner clears this journal only after atomically retiring the clone
    * (retireRunnerClone), never before the rename. */
-  async markRecoveryCapture(barePath: string, clonePath: string, branch: string, runId: string, attemptId?: string): Promise<void> {
+  async markRecoveryCapture(barePath: string, clonePath: string, branch: string, runId: string, attemptId?: string,
+    peeledMarker?: string): Promise<void> {
+    if (peeledMarker !== undefined && !SHA40_RE.test(peeledMarker)) throw new Error("invalid peeled marker");
     await this.withLock(barePath, async () => {
       // issue #1783 M2: an attempt-path seed also journals the id its path and marker carry,
       // including recovery-enabled unwired workers. Canonical sources omit the attempt id.
@@ -6044,7 +6120,10 @@ export class GitCache {
       const source = recoverySource({ runId, clonePath, ...(attemptId === undefined ? {} : { attemptId }) });
       const pending = await this.readRecoveryCapture(barePath, branch);
       if (pending && !sameRecoverySource(pending, source)) throw new Error("recovery attribution cannot be overwritten");
-      const value: RecoveryJournalEntry = { ...pending, ...source };
+      // issue #3239: the seed's adopt-time `reset --soft` leg peeled this marker out of the clone's
+      // history; journal it as lineage for a later coverage wrapper over this attempt's successor marker.
+      const peeled = peeledMarker === undefined ? pending?.peeledMarkers : unionPeeledMarkers(pending?.peeledMarkers, [peeledMarker]);
+      const value: RecoveryJournalEntry = { ...pending, ...source, ...(peeled?.length ? { peeledMarkers: peeled } : {}) };
       await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), JSON.stringify(value)]);
     });
   }
@@ -7003,6 +7082,148 @@ export class GitCache {
     });
   }
 
+  /**
+   * issue #3239: decide what a retained-recovery successor may adopt when the episode restore tip is a
+   * recovery-coverage wrapper that may carry a `wip(park):` marker. Returns undefined for the
+   * unchanged shapes (the tip itself is a marker, or neither the source nor any wrapper leaf is one),
+   * which keep the plain adoption of the tip. Otherwise the wrapper must be provably the worker's own
+   * coverage of the journaled source, and the successor adopts the SOURCE (a marker is then peeled by
+   * the seed's `reset --soft`, so neither marker nor wrapper enters history); any failed proof throws
+   * `successor recovery verification failed`, before a ledger entry or clone exists.
+   *
+   * Fail closed: once the tip is a coverage commit (or the source is a marker), any inability to verify
+   * refuses: an unreadable tip, more than 8 aggregates, or more than MAX_OWED_CANDIDATES_PER_RUN + 2
+   * leaves, or ANY failed read. Only a non-tip commit for which {@link readBoundedCommit} RETURNS
+   * undefined (over 64 KiB, or a body that does not survive the UTF-8 round trip) is demoted to a leaf
+   * and meets the leaf rule, which classifies it by subject and never needs that read; a demoted leaf
+   * whose subject is a coverage subject is refused (genuine aggregates are small ASCII). A read that
+   * THROWS (timeout, git failure, missing object) refuses, as does a failed subject read of the tip,
+   * the source or a leaf: a transient error never classifies a commit as a non-marker. The source and
+   * a marker leaf are compared by plumbing for the same reason.
+   *
+   * The caller holds the bare lock: this helper must never take it (the lock is not reentrant), which is
+   * why it reads aggregates through {@link readBoundedCommit} and not {@link readRecoveryCoverageClaim}.
+   */
+  private async resolveMarkerWrapperAdoption(
+    barePath: string, journal: RecoveryJournalEntry, tip: string, src: string | undefined,
+  ): Promise<{ seedTip: string; expectedHead: string; expectedTree: string; peeledMarkers: string[] } | undefined> {
+    // The producer's parent set is the owed roots (at most MAX_OWED_CANDIDATES_PER_RUN), the original
+    // source (freezeInventory appends it to the roots) and the current source (buildRecoveryCoverage
+    // adds it), and the two extras can be distinct.
+    const MAX_LEAVES = MAX_OWED_CANDIDATES_PER_RUN + 2, MAX_AGGREGATES = 8, MAX_OBJECT_BYTES = 64 * 1024;
+    const fail = (): never => { throw new Error("successor recovery verification failed"); };
+    // Throwing subject read (unlike isWipParkMarker/tryGitStdout, which answer "" on any non-abort
+    // error): once a decision depends on the subject, an unreadable commit refuses.
+    const subjectOf = async (rev: string): Promise<string> => {
+      try {
+        return (await this.runGit(barePath, ["--no-replace-objects", "log", "-1", "--format=%s", `${rev}^{commit}`])).trim();
+      } catch (err) {
+        const abort = this.boundaryAbortError(err);
+        if (abort) throw abort;
+        return fail();
+      }
+    };
+    const subject = await subjectOf(tip);
+    if (subject.startsWith(WIP_PARK_COMMIT_PREFIX)) return undefined;
+    const srcMarker = src !== undefined && OWED_OID.test(src) && (await subjectOf(src)).startsWith(WIP_PARK_COMMIT_PREFIX);
+    // From here the tip is a coverage commit or the source is a marker. A wrapper whose walk cannot be
+    // completed cannot be shown to bury no marker, so every inability to verify below refuses; only a
+    // non-tip commit that cannot be read within bounds is demoted to a leaf (it then meets the leaf rule).
+    if (!subject.startsWith("uzi recovery coverage ") && !srcMarker) return undefined;
+    const coverageMessage = /^uzi recovery coverage ([0-9a-f]{64}) round (0|[1-9][0-9]*) batch (0|[1-9][0-9]*)\n$/;
+    const aggregates: Array<{ fp: string; tree: string; author: string | undefined; committer: string | undefined }> = [];
+    const leaves = new Set<string>();
+    let lookalike = false;
+    let lookalikes = 0;
+    const seen = new Set<string>();
+    const queue = [tip];
+    while (queue.length) {
+      const sha = queue.shift()!;
+      if (seen.has(sha)) continue;
+      seen.add(sha);
+      if (seen.size > MAX_AGGREGATES + MAX_LEAVES) return fail();
+      let commit;
+      try { commit = await this.readBoundedCommit(barePath, sha, MAX_OBJECT_BYTES); } catch (err) {
+        const abort = this.boundaryAbortError(err);
+        if (abort) throw abort;
+        return fail();
+      }
+      if (!commit) {
+        if (sha === tip) return fail();
+        if ((await subjectOf(sha)).startsWith("uzi recovery coverage ")) return fail();
+        leaves.add(sha);
+        continue;
+      }
+      const m = coverageMessage.exec(commit.message);
+      if (!m) {
+        // A readable commit that claims the coverage subject without its exact shape is a look-alike:
+        // walk through it so a marker it buries is still found. Once any look-alike was walked, any
+        // marker involvement refuses below (defence in depth: the fingerprint/pin checks would too).
+        if (commit.message.startsWith("uzi recovery coverage ")) {
+          lookalike = true;
+          if (++lookalikes > MAX_AGGREGATES) return fail();
+          queue.push(...commit.parents);
+          continue;
+        }
+        leaves.add(sha);
+        continue;
+      }
+      aggregates.push({ fp: m[1]!, tree: commit.tree, author: commit.author, committer: commit.committer });
+      if (aggregates.length > MAX_AGGREGATES) return fail();
+      queue.push(...commit.parents);
+    }
+    if (leaves.size > MAX_LEAVES) return fail();
+    const markerLeaves = new Set<string>();
+    for (const leaf of leaves) if ((await subjectOf(leaf)).startsWith(WIP_PARK_COMMIT_PREFIX)) markerLeaves.add(leaf);
+    if (!srcMarker && markerLeaves.size === 0) return undefined;
+    if (lookalike) return fail();
+
+    // From here the shape involves a marker: everything below is a hard requirement.
+    if (!src || !aggregates.length) return fail();
+    const fp = aggregates[0]!.fp;
+    if (aggregates.some(a => a.fp !== fp)) return fail();
+    // The source (and a marker leaf) is read by plumbing, not readBoundedCommit: a clean source may be
+    // oversized or non-UTF-8 and must still be comparable.
+    if (!OWED_OID.test(src)) return fail();
+    const sha1Of = async (rev: string): Promise<string> => {
+      const out = await this.tryGitStdout(barePath, ["--no-replace-objects", "rev-parse", "--verify", rev]);
+      return OWED_OID.test(out) ? out : fail();
+    };
+    const srcTree = await sha1Of(`${src}^{tree}`);
+    const identity = (kind: string) => `${kind} ${AGENT_GIT_IDENTITY.name} <${AGENT_GIT_IDENTITY.email}> 946684800 +0000`;
+    for (const a of aggregates) {
+      if (a.tree !== srcTree || a.author !== identity("author") || a.committer !== identity("committer")) return fail();
+    }
+    const sortedLeaves = [...leaves].sort();
+    if (!leaves.has(src)) return fail();
+    // The roots are the leaves, with or without the current source (the producer passes both forms).
+    const fingerprints = [sortedLeaves, sortedLeaves.filter(l => l !== src)].filter(r => r.length > 0)
+      .map(roots => createHash("sha256").update(JSON.stringify({ roots, currentSha: src, tree: srcTree })).digest("hex"));
+    if (!fingerprints.includes(fp)) return fail();
+    // Provenance: only the worker's own pin of this very wrapper, for this run, proves it is genuine.
+    const pins = await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)",
+      `refs/uzi-coverage/${journal.runId}/`]);
+    const pinned = pins.split("\n").some(line => {
+      const [ref, oid] = line.split(" ");
+      return oid === tip && ref !== undefined && new RegExp(`^refs/uzi-coverage/[^/]+/[^/]+/${fp}$`).test(ref);
+    });
+    if (!pinned) return fail();
+    // Leaves: the source, history of the source, or a marker this attempt's lineage proves superseded.
+    const lineage = new Set(journal.peeledMarkers ?? []);
+    const accepted: string[] = [];
+    for (const leaf of sortedLeaves) {
+      if (leaf === src || await this.isAncestor(barePath, leaf, src)) continue;
+      if (!markerLeaves.has(leaf) || !lineage.has(leaf)) return fail();
+      if (!await this.isAncestor(barePath, await sha1Of(`${leaf}^`), src)) return fail();
+      accepted.push(leaf);
+    }
+    if (srcMarker) {
+      return { seedTip: src, expectedHead: await sha1Of(`${src}^`), expectedTree: srcTree,
+        peeledMarkers: unionPeeledMarkers(accepted, [src]) };
+    }
+    return { seedTip: src, expectedHead: src, expectedTree: srcTree, peeledMarkers: unionPeeledMarkers(accepted) };
+  }
+
   /** Fresh successor, local-only under one bare lock. Never executes in a predecessor.
    * Adopting + successor identity land before clone creation; failure leaves that evidence.
    * Ready and attribution handoff land in ONE config write only after tip/tree/history checks.
@@ -7020,6 +7241,8 @@ export class GitCache {
       const tip = recovery.restoreTip;
       const pin = `refs/uzi-recovery-episode/${journal.runId}/${tip}`;
       if ((await this.runGit(barePath, ["rev-parse", "--verify", pin])).trim() !== tip) throw new Error("recovery pin changed");
+      // issue #3239: before any write, so a refusal leaves no ledger entry, journal change or clone.
+      const wrapped = await this.resolveMarkerWrapperAdoption(barePath, journal, tip, recovery.restoreSource);
       const clonePath = attemptClonePath(this.runnerClonePath(barePath, key), attemptId);
       if (await this.pathPresent(clonePath) || (await this.readAttemptLedger(barePath, branch)).has(attemptId)) throw new Error("successor identity already used");
       const successor: RecoverySource = { runId: journal.runId, clonePath, attemptId, restoreTip: tip };
@@ -7035,18 +7258,22 @@ export class GitCache {
       await this.writeRecovery(barePath, branch, { ...journal, retainedSources,
         recovery: { ...recovery, successor, stage: "adopting" } });
       const seeded = await this.seedRunnerClone(barePath, branch, clonePath, journal.runId, true, undefined,
-        { ...opts, recoveryTip: tip });
+        { ...opts, recoveryTip: wrapped?.seedTip ?? tip });
       const head = (await this.runGitAsRunner(clonePath, ["rev-parse", "HEAD"])).trim();
       const tree = (await this.runGitAsRunner(clonePath, ["write-tree"])).trim();
-      const expectedTree = (await this.runGit(barePath, ["rev-parse", `${tip}^{tree}`])).trim();
-      const marker = await this.isWipParkMarker(barePath, tip);
-      const expectedHead = marker ? (await this.runGit(barePath, ["rev-parse", `${tip}^`])).trim() : tip;
-      if (head !== expectedHead || tree !== expectedTree ||
+      const expectedTree = wrapped?.expectedTree ?? (await this.runGit(barePath, ["rev-parse", `${tip}^{tree}`])).trim();
+      const marker = wrapped ? wrapped.expectedHead !== wrapped.seedTip : await this.isWipParkMarker(barePath, tip);
+      const expectedHead = wrapped?.expectedHead ?? (marker ? (await this.runGit(barePath, ["rev-parse", `${tip}^`])).trim() : tip);
+      if (head !== expectedHead || tree !== expectedTree || (wrapped && marker && seeded.wipRecovered !== true) ||
           (await this.runGitAsRunner(clonePath, ["diff", "--name-only"])).trim() !== "" ||
           !await this.isAncestor(barePath, expectedHead, tip)) throw new Error("successor recovery verification failed");
       if (!await this.recoveryClockCurrent(barePath, branch, { ...journal, retainedSources,
         recovery: { ...recovery, successor, stage: "adopting" } })) throw new Error("successor iteration is not current");
       await this.writeRecovery(barePath, branch, { ...successor, retainedSources,
+        // issue #3239: the lineage of what this seed peeled: the wrapper's accepted markers, or the tip
+        // itself when the tip is the marker the seed's `reset --soft` removed from history.
+        ...(wrapped ? (wrapped.peeledMarkers.length ? { peeledMarkers: wrapped.peeledMarkers } : {})
+          : marker ? { peeledMarkers: [tip] } : {}),
         recovery: { ...recovery, successor, stage: "ready-for-model" } });
       // issue #3194: hand the guard the content source this wrapper verifiably stands for.
       return { ...seeded, attemptId, ...(recovery.restoreSource ? { adoptedContentSource: recovery.restoreSource } : {}) };
@@ -11655,6 +11882,33 @@ try {
       if (await read(["rev-parse", "--verify", "HEAD^{commit}"]) !== oldHead + "\n") throw refused();
       return staged;
     };
+    // issue #3239: the marker never carries a core file or a blob over WIP_CAPTURE_MAX_FILE_BYTES.
+    // Staged entries that differ from HEAD are checked before the commit dispatches (one
+    // batched size read); any hit refuses, so the caller keeps the source. No filenames escape.
+    const omitted = async (staged: string): Promise<void> => {
+      const head = new Set(headIndex ? headIndex.slice(0, -1).split("\0") : []);
+      const oids: string[] = [];
+      for (const row of staged ? staged.slice(0, -1).split("\0") : []) {
+        if (head.has(row)) continue;
+        const match = /^(100644|100755|120000) ([0-9a-f]{40}) 0\t([^\0]+)$/.exec(row);
+        if (!match || WIP_CORE_FILE_RE.test(path.posix.basename(match[3]!))) throw refused();
+        oids.push(match[2]!);
+      }
+      const uniq = [...new Set(oids)];
+      if (uniq.length === 0) return;
+      check();
+      let out: string;
+      try {
+        out = await this.runGitAsRunner(clonePath, [...pins, "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"],
+          { env, input: uniq.join("\n") + "\n" });
+      } catch { throw refused(); }
+      const lines = rows(out.replaceAll("\n", "\0"), "sourceEntries");
+      if (lines.length !== uniq.length) throw refused();
+      for (let i = 0; i < uniq.length; i++) {
+        const match = /^([0-9a-f]{40}) blob ([0-9]+)$/.exec(lines[i]!);
+        if (!match || match[1] !== uniq[i] || Number(match[2]) > WIP_CAPTURE_MAX_FILE_BYTES) throw refused();
+      }
+    };
     let sourceDigest: string | undefined;
     let headIndex = "";
     let commitIndex = "";
@@ -11672,6 +11926,7 @@ try {
           return match[1] + " " + match[2] + " 0\t" + match[3] + "\0";
         }).join("");
       }
+      if (step === "commit") await omitted(index);
       // Compare on the same raw byte pass: HEAD for clean, staged blobs before commit.
       // No fourth enumeration, smaller blob limit, or additional source reservation.
       const input = await this.maintenanceWipInput(clonePath, { metadataBytes: 16 * 1024 ** 2 }, step === "status" ? headIndex : step === "commit" ? index : "");
@@ -11781,34 +12036,300 @@ try {
    * reviewed work, so #218 D6's "a half-applied edit that survives is worse than one that
    * does not" no longer applies.
    *
+   * issue #3239 — the capture never commits a core dump or an oversized file. Before staging,
+   * {@link wipCaptureOmissions} lists every dirty path that is a PRESENT `core` / `core.<pid>`
+   * file (a deletion can never commit one) or a regular file (or staged blob) over
+   * WIP_CAPTURE_MAX_FILE_BYTES, or that cannot be sized, using a constant number of git processes
+   * (one batched size lookup) and at most WIP_CAPTURE_MAX_ENTRIES paths: past the cap the capture
+   * is incomplete in BOTH modes. `mode: "refuse"` (default, the restore-point callers) makes NO
+   * marker on any omission and returns `false`; `mode: "exclude"` (the park callers) unstages
+   * those paths, `add -A`s with them excluded and commits the rest. Omitted files stay on disk;
+   * `onIncomplete` reports at most WIP_REPORT_MAX_OMISSIONS of them plus the total.
+   *
+   * A post-commit backstop vets the commit the capture wrote to the branch recorded before it
+   * (`<preRef>^{commit}`, never whatever HEAD names by then; HEAD only for a detached start):
+   * it must be one commit on preHead whose added blobs hold no core file and nothing over the
+   * cap, whatever happened to the worktree after the scan. On a violation it rolls back by
+   * compare-and-swap on that exact branch (`update-ref --no-deref <preRef> <preHead> <marker>`),
+   * so only that ref can move, even if HEAD switches to another branch between the recheck and
+   * the write; `--no-deref` keeps a ref the agent turned into a symref from moving its target.
+   * It runs only while HEAD still names that branch, the branch still sits on the marker, and the
+   * marker's parent is still preHead. A capture that started on a detached HEAD is never rolled
+   * back (the recheck and a `--no-deref HEAD` write cannot be made atomic): it refuses before
+   * any write, so the caller keeps the source. Every refusal after the commit ran (identity
+   * mismatch, failed swap, detached start, or any thrown error) reports `rollbackRefused: true`;
+   * the park callers then do not publish that marker. Index and worktree are never touched by
+   * the rollback.
+   *
    * BEST-EFFORT: every error is caught, logged, and returns `false` rather than thrown —
    * a commit failure must NEVER propagate, because parking is the state that preserves the
    * tree and a failed park loses MORE than a missing WIP commit (D4). Returns `true` only
-   * when a marker commit was actually created (an already-clean tree returns `false` —
-   * nothing to commit).
+   * when a marker commit was actually created and kept (an already-clean tree returns `false` —
+   * nothing to commit). An error in exclude mode after the omission scan began still reports
+   * `onIncomplete` so a park keeps its clone.
    */
-  async commitWipMarker(clonePath: string): Promise<boolean> {
+  async commitWipMarker(clonePath: string, opts: WipMarkerOptions = {}): Promise<boolean> {
     MaintenanceResources.consumeIfActive("sourceBytes", 0);
     if (MaintenanceResources.active()) throw new Error("maintenance_wip_guard_required");
+    const mode = opts.mode ?? "refuse";
+    // Every object read in the capture family ignores refs/replace, so an agent-planted
+    // `git replace <big> <small>` cannot make the backstop see a different blob.
+    const git = (args: string[]) => this.runGitAsRunner(clonePath, args, NO_REPLACE);
+    let wroteMarker: string | undefined;
+    const report = (all: WipOmission[], markerCreated: boolean, rollbackRefused: boolean, unverifiedRefTip?: string | null): void => {
+      const marker = wroteMarker;
+      const omitted = all.slice(0, WIP_REPORT_MAX_OMISSIONS);
+      this.log.warn("WIP park auto-save left files out", {
+        cwd: clonePath,
+        mode,
+        markerCreated,
+        rollbackRefused,
+        omittedTotal: all.length,
+        omitted: omitted.map((o) => ({ path: o.path, reason: o.reason, bytes: o.bytes })),
+      });
+      try { opts.onIncomplete?.({ omitted, omittedTotal: all.length, markerCreated, rollbackRefused, marker,
+        ...(unverifiedRefTip === undefined ? {} : { unverifiedRefTip }) }); }
+      catch (err) { this.log.warn("WIP onIncomplete callback threw (ignored)", { cwd: clonePath, error: gitErrorMessage(err) }); }
+    };
+    let omitted: WipOmission[] = [];
+    let scanStarted = false;
+    let committed = false;
+    let preHead = "";
+    let preRef = WIP_DETACHED;
+    // The commit lands on the branch HEAD named before the capture; a detached start has only HEAD.
+    const tipOf = async (): Promise<string> =>
+      (await git(["rev-parse", "--verify", preRef === WIP_DETACHED ? "HEAD^{commit}" : `${preRef}^{commit}`])).trim();
+    // Report a marker (for the pause park's fenced undo) only when it is provably the commit this
+    // capture wrote on a branch: one commit on preHead with the marker subject. A detached capture
+    // never reports one, so no undo ever follows it.
+    const ownMarker = async (marker: string): Promise<boolean> =>
+      preRef !== WIP_DETACHED &&
+      (await git(["rev-parse", "--verify", `${marker}^`])).trim() === preHead &&
+      (await git(["log", "-1", "--format=%s", marker])).startsWith(WIP_PARK_COMMIT_PREFIX);
+    const reportUnsafe = async (all: WipOmission[]): Promise<void> => {
+      let unverifiedRefTip: string | null | undefined = null;
+      if (preRef !== WIP_DETACHED) {
+        try {
+          const current = await tipOf();
+          if (SHA40_RE.test(current)) unverifiedRefTip = current === wroteMarker || current === preHead ? undefined : current;
+        } catch { /* Unknown ref identity must remain quarantined. */ }
+      }
+      report(all, false, true, unverifiedRefTip);
+    };
     try {
-      const status = await this.runGitAsRunner(clonePath, ["status", "--porcelain"]);
+      preHead = (await git(["rev-parse", "--verify", "HEAD^{commit}"])).trim();
+      preRef = await this.wipSymbolicHead(clonePath);
+      const status = await git(["status", "--porcelain"]);
       if (status.split("\n").filter((l) => l.length > 0).length === 0) {
         return false; // clean tree — nothing to save
       }
-      await this.runGitAsRunner(clonePath, ["add", "-A"]);
-      await this.runGitAsRunner(clonePath, [
+      scanStarted = true;
+      const scan = await this.wipCaptureOmissions(clonePath);
+      omitted = scan.omitted;
+      await this.wipCaptureSeam?.afterOmissionCheck?.(clonePath);
+      if (scan.overCap || (omitted.length > 0 && (mode === "refuse" || omitted.length > WIP_EXCLUDE_MAX_PATHS))) {
+        report(omitted, false, false);
+        return false;
+      }
+      if (omitted.length > 0) {
+        for (let i = 0; i < omitted.length; i += 100) {
+          await git(["reset", "-q", "--", ...omitted.slice(i, i + 100).map((o) => `:(literal)${o.path}`)]);
+        }
+        await git(["add", "-A", "--", ".", ...omitted.map((o) => `:(exclude,literal)${o.path}`)]);
+      } else {
+        await git(["add", "-A"]);
+      }
+      let staged = false;
+      try { await git(["diff", "--cached", "--quiet"]); }
+      catch (err) { if ((err as { code?: number }).code === 1) staged = true; else throw err; }
+      if (!staged) {
+        if (omitted.length > 0) report(omitted, false, false);
+        return false;
+      }
+      // Fail closed: set before the call, so a commit that wrote the ref and then rejected
+      // (timeout) still reports an unvetted marker.
+      committed = true;
+      await git([
         "commit",
         "-m",
         `${WIP_PARK_COMMIT_PREFIX} interrupted work auto-saved on usage-limit park (throwaway; restored uncommitted on resume)`,
-      ]);
-      return true;
+      ]).then(() => {
+        if (this.wipCaptureSeam?.commitRejectsAfterWrite) throw new Error("test seam: commit call rejected after the ref was written");
+      });
+      await this.wipCaptureSeam?.afterCommit?.(clonePath);
+      // Post-commit backstop: the marker must be exactly one commit on preHead with no core file
+      // and no blob over the cap, whatever happened to the worktree after the omission scan. The
+      // marker is the commit the capture wrote to preRef, not whatever HEAD names now.
+      const marker = await tipOf();
+      await this.wipCaptureSeam?.beforeBackstop?.(clonePath, marker);
+      const markerParent = (await git(["rev-parse", "--verify", `${marker}^`])).trim();
+      const subject = await git(["log", "-1", "--format=%s", marker]);
+      if (markerParent !== preHead || !subject.startsWith(WIP_PARK_COMMIT_PREFIX)) {
+        await reportUnsafe(omitted);
+        return false;
+      }
+      if (preRef !== WIP_DETACHED) wroteMarker = marker;
+      const extra = await this.wipMarkerViolations(clonePath, preHead, marker);
+      if (extra.length === 0) {
+        // The vetted commit must still be what the branch holds; an agent that moved it meanwhile
+        // gets no publish of a commit nobody vetted.
+        if ((await tipOf()) !== marker) { await reportUnsafe(omitted); return false; }
+        if (omitted.length > 0) report(omitted, true, false);
+        if (preRef !== WIP_DETACHED) { try { opts.onCommitted?.(marker); } catch { /* observer only */ } }
+        return true;
+      }
+      const all = [...omitted, ...extra.filter((e) => !omitted.some((o) => o.path === e.path))];
+      // A detached HEAD is never rolled back: the identity recheck and an `update-ref --no-deref
+      // HEAD` write are separate steps, so a switch to a branch in between would be overwritten.
+      if (preRef === WIP_DETACHED) { await reportUnsafe(all); return false; }
+      const headNow = await this.wipSymbolicHead(clonePath).catch(() => undefined);
+      const tipNow = await tipOf();
+      const parentNow = (await git(["rev-parse", "--verify", `${marker}^`])).trim();
+      if (headNow !== preRef || tipNow !== marker || parentNow !== preHead) { await reportUnsafe(all); return false; }
+      await this.wipCaptureSeam?.beforeRollbackWrite?.(clonePath, marker);
+      try {
+        // CAS on the exact branch HEAD named before the capture, never bare HEAD: only that branch
+        // can move, even if HEAD switches to another branch after the recheck above. --no-deref
+        // keeps a ref turned into a symref after the recheck from moving its target.
+        await git(["update-ref", "--no-deref", "-m", "uzi: wip capture rollback", preRef, preHead, marker]);
+      } catch (err) {
+        this.log.warn("WIP capture rollback refused (ref moved)", { cwd: clonePath, error: gitErrorMessage(err) });
+        await reportUnsafe(all);
+        return false;
+      }
+      report(all, false, false);
+      return false;
     } catch (err) {
       this.log.warn("WIP park auto-commit failed (best-effort → not committed)", {
         cwd: clonePath,
         error: gitErrorMessage(err),
       });
+      // After the commit ran the marker is unvetted: report it so the park callers do not publish
+      // it. Before it, an exclude-mode park still keeps its clone (the scan began, work may be left).
+      if (committed) {
+        // A commit that wrote the ref and then rejected: recover the marker, best effort, only when
+        // it is provably this capture's commit, so the pause park can still undo it (fenced CAS).
+        if (wroteMarker === undefined) {
+          try { const tip = await tipOf(); if (await ownMarker(tip)) wroteMarker = tip; } catch { /* stays unknown */ }
+        }
+        await reportUnsafe(omitted);
+      } else if (mode === "exclude" && scanStarted) report(omitted, false, false);
       return false;
     }
+  }
+
+  /** `git symbolic-ref -q HEAD` as the runner uid: the checked-out ref, or WIP_DETACHED when
+   *  HEAD is detached (exit 1, no output). Any other failure throws. */
+  private async wipSymbolicHead(clonePath: string): Promise<string> {
+    try {
+      const out = (await this.runGitAsRunner(clonePath, ["symbolic-ref", "-q", "HEAD"], NO_REPLACE)).trim();
+      if (out === "") throw new Error("git symbolic-ref -q HEAD printed nothing");
+      return out;
+    } catch (err) {
+      if ((err as { code?: number }).code === 1) return WIP_DETACHED;
+      throw err;
+    }
+  }
+
+  /** issue #3239 — the dirty paths {@link commitWipMarker} must not capture: PRESENT `core` files,
+   *  regular files over WIP_CAPTURE_MAX_FILE_BYTES (lstat, never following a link), staged blobs
+   *  over it, and paths lstat cannot size (fail closed). `overCap` when more than
+   *  WIP_CAPTURE_MAX_ENTRIES rows/entries exist (nothing further is examined). Read-only; a
+   *  constant number of runner-uid git processes. */
+  private async wipCaptureOmissions(clonePath: string): Promise<{ omitted: WipOmission[]; overCap: boolean }> {
+    const git = (args: string[]) => this.runGitAsRunner(clonePath, args, NO_REPLACE);
+    const out = await git(["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+    const rows = out.split("\0");
+    if (rows[rows.length - 1] === "") rows.pop();
+    if (rows.length > WIP_CAPTURE_MAX_ENTRIES) return { omitted: [], overCap: true };
+    const candidates = new Set<string>();
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i]!;
+      const match = /^(..) (.+)$/s.exec(row);
+      if (!match) throw new Error("unparseable git status row");
+      candidates.add(match[2]!);
+      if (match[1]![0] === "R" || match[1]![0] === "C" || match[1]![1] === "R" || match[1]![1] === "C") {
+        const other = rows[++i];
+        if (other === undefined) throw new Error("git status rename row lacks its second path");
+        candidates.add(other);
+      }
+    }
+    const omitted = new Map<string, WipOmission>();
+    for (const rel of candidates) {
+      let bytes: number | undefined;
+      try {
+        const st = await fs.lstat(path.join(clonePath, rel));
+        if (st.isFile()) bytes = st.size;
+        // A path absent from the worktree (a deletion) can never commit its file.
+        if (WIP_CORE_FILE_RE.test(path.posix.basename(rel))) { omitted.set(rel, { path: rel, reason: "core_file", bytes }); continue; }
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") omitted.set(rel, { path: rel, reason: "unsized" });
+        continue;
+      }
+      if (bytes !== undefined && bytes > WIP_CAPTURE_MAX_FILE_BYTES) omitted.set(rel, { path: rel, reason: "oversized", bytes });
+    }
+    // Staged blobs that differ from HEAD (a worktree edit after `git add` can hide them from lstat).
+    const staged = this.parseRawDiffZ(await git(["diff", "--cached", "--raw", "-z", "--no-abbrev", "--no-renames"]))
+      .filter((e) => !omitted.has(e.path));
+    if (staged.length > WIP_CAPTURE_MAX_ENTRIES) return { omitted: [...omitted.values()], overCap: true };
+    const sizes = await this.wipBlobSizes(clonePath, staged.map((e) => e.oid));
+    for (const { path: rel, oid } of staged) {
+      const size = sizes.get(oid)!;
+      if (size > WIP_CAPTURE_MAX_FILE_BYTES) omitted.set(rel, { path: rel, reason: "oversized", bytes: size });
+    }
+    return { omitted: [...omitted.values()], overCap: false };
+  }
+
+  /** Sizes of `oids` (blobs) from ONE `cat-file --batch-check`; a missing or non-blob object throws. */
+  private async wipBlobSizes(clonePath: string, oids: string[]): Promise<Map<string, number>> {
+    const uniq = [...new Set(oids)];
+    const sizes = new Map<string, number>();
+    if (uniq.length === 0) return sizes;
+    const out = await this.runGitAsRunner(
+      clonePath,
+      ["cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"],
+      { input: `${uniq.join("\n")}\n`, env: NO_REPLACE_ENV },
+    );
+    const lines = out.split("\n");
+    if (lines[lines.length - 1] === "") lines.pop();
+    if (lines.length !== uniq.length) throw new Error("unreadable blob sizes");
+    for (let i = 0; i < uniq.length; i++) {
+      const m = /^([0-9a-f]+) blob (\d+)$/.exec(lines[i]!);
+      if (!m || m[1] !== uniq[i]) throw new Error("unreadable blob size");
+      sizes.set(uniq[i]!, Number(m[2]));
+    }
+    return sizes;
+  }
+
+  /** New-side `{path, oid}` of every non-deleted, non-gitlink entry in `diff --raw -z` output. */
+  private parseRawDiffZ(out: string): { path: string; oid: string }[] {
+    const toks = out.split("\0");
+    const res: { path: string; oid: string }[] = [];
+    for (let i = 0; i < toks.length; i++) {
+      const m = /^:(\d+) (\d+) ([0-9a-f]+) ([0-9a-f]+) (\w)/.exec(toks[i]!);
+      if (!m) continue;
+      const rel = toks[++i];
+      if (rel === undefined) throw new Error("raw diff row lacks its path");
+      if (m[5] === "D" || m[2] === "160000" || /^0+$/.test(m[4]!)) continue;
+      res.push({ path: rel, oid: m[4]! });
+    }
+    return res;
+  }
+
+  /** Core files and over-cap blobs that `preHead..marker` added (object reads, not lstat); over
+   *  WIP_CAPTURE_MAX_ENTRIES entries the marker is itself a violation (one synthetic `unsized` row). */
+  private async wipMarkerViolations(clonePath: string, preHead: string, marker: string): Promise<WipOmission[]> {
+    const raw = await this.runGitAsRunner(clonePath, ["diff-tree", "-r", "-z", "--no-abbrev", "--no-renames", preHead, marker], NO_REPLACE);
+    const entries = this.parseRawDiffZ(raw);
+    if (entries.length > WIP_CAPTURE_MAX_ENTRIES) return [{ path: "(too many paths)", reason: "unsized" }];
+    const sizes = await this.wipBlobSizes(clonePath, entries.map((e) => e.oid));
+    const res: WipOmission[] = [];
+    for (const { path: rel, oid } of entries) {
+      const bytes = sizes.get(oid)!;
+      if (WIP_CORE_FILE_RE.test(path.posix.basename(rel))) res.push({ path: rel, reason: "core_file", bytes });
+      else if (bytes > WIP_CAPTURE_MAX_FILE_BYTES) res.push({ path: rel, reason: "oversized", bytes });
+    }
+    return res;
   }
 
   /**
@@ -11820,17 +12341,66 @@ try {
    * SAME restore the resume adopt does (#759 M2, `reset --soft` on the adopted marker), run
    * inline here because a continuing run never reseeds. BEST-EFFORT: every error is caught
    * and logged — a failed restore must never propagate, exactly as `commitWipMarker` never
-   * propagates a commit failure (D4). Only ever called after `commitWipMarker` returned true,
-   * so HEAD^ is the marker's parent (the clone was checked out at a real base commit).
+   * propagates a commit failure (D4). The caller (the credential-switch give-up) first checks that
+   * HEAD's tip is a `wip(park):` commit, so HEAD^ is that marker's parent. The pause park does not
+   * use this: it undoes only the exact marker the capture reported, by compare-and-swap on the run
+   * branch ({@link undoWipMarkerOnBranch}, issue #3239).
    */
   async undoWipMarker(clonePath: string): Promise<void> {
     try {
-      await this.runGitAsRunner(clonePath, ["reset", "--mixed", "HEAD^"]);
+      await this.runGitAsRunner(clonePath, ["reset", "--mixed", "HEAD^"], NO_REPLACE);
     } catch (err) {
       this.log.warn("WIP park marker undo failed (best-effort → marker left at HEAD)", {
         cwd: clonePath,
         error: gitErrorMessage(err),
       });
+    }
+  }
+
+  /**
+   * issue #3239 — undo the exact `marker` commit on `branch`: a compare-and-swap of
+   * `refs/heads/<branch>` from `marker` to its parent. Only that branch ref can move, only while it
+   * still is exactly `marker`; HEAD is never written, so a HEAD switch or a new commit between the
+   * caller's decision and this write cannot make it rewind another ref or commit. `marker` must be
+   * a one-parent commit whose subject starts with WIP_PARK_COMMIT_PREFIX. The index and worktree
+   * are never touched: captured content remains staged and any later staged-only content survives.
+   * A separate HEAD check cannot fence an index restore against a concurrent branch switch.
+   * Any failure answers false with nothing else written.
+   */
+  async undoWipMarkerOnBranch(clonePath: string, branch: string, marker: string): Promise<boolean> {
+    const git = (args: string[]) => this.runGitAsRunner(clonePath, args, NO_REPLACE);
+    const ref = `refs/heads/${branch}`;
+    try {
+      if (!/^[0-9a-f]{40,64}$/.test(marker)) return false;
+      const subject = await git(["log", "-1", "--format=%s", marker]);
+      if (!subject.startsWith(WIP_PARK_COMMIT_PREFIX)) return false;
+      const parents = (await git(["rev-list", "--parents", "-n", "1", marker])).trim().split(/\s+/);
+      const parent = parents[1];
+      if (parents.length !== 2 || parents[0] !== marker || !parent) return false;
+      await git(["update-ref", "--no-deref", "-m", "uzi: pause wip undo", ref, parent, marker]);
+      return true;
+    } catch (err) {
+      this.log.warn("WIP park marker branch undo refused (best-effort → marker left)", { cwd: clonePath, error: gitErrorMessage(err) });
+      return false;
+    }
+  }
+
+  /** Prove a quarantined marker absent from a literal candidate's complete history.
+   * Local replace refs, grafts and shallow boundaries cannot hide its ancestry; missing
+   * objects or any unexpected failure refuse the proof. Runs as the clone's runner uid. */
+  async wipMarkerAbsentFromHistory(clonePath: string, candidate: string, marker: string): Promise<boolean> {
+    if (!SHA40_RE.test(candidate) || !SHA40_RE.test(marker)) return false;
+    try {
+      const outside = await this.runGitAsRunner(clonePath, ["rev-list", "--max-count=1", marker, "--not", candidate], {
+        env: { ...NO_REPLACE_ENV, GIT_GRAFT_FILE: "/dev/null", GIT_SHALLOW_FILE: "/dev/null" },
+      });
+      // Require positive output from successful Git execution. A launch refusal
+      // with exit 1 is not interchangeable with an ancestry command's negative result.
+      return outside.trim() === marker;
+    } catch (err) {
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
+      return false;
     }
   }
 
@@ -11853,7 +12423,7 @@ try {
    */
   async headIsWipMarker(clonePath: string): Promise<boolean> {
     try {
-      const subject = await this.runGitAsRunner(clonePath, ["log", "-1", "--format=%s"]);
+      const subject = await this.runGitAsRunner(clonePath, ["log", "-1", "--format=%s"], NO_REPLACE);
       return subject.startsWith(WIP_PARK_COMMIT_PREFIX);
     } catch (err) {
       this.log.warn("WIP park marker HEAD check failed (best-effort → not a marker)", {
@@ -15648,7 +16218,7 @@ try {
    * benign keys (e.g. GIT_NO_REPLACE_OBJECTS) and never GIT_CONFIG_* or any other
    * security-relevant key.
    */
-  private async runGitAsRunner(cwd: string | undefined, args: string[], opts: { timeoutMs?: number; env?: NodeJS.ProcessEnv } = {}): Promise<string> {
+  private async runGitAsRunner(cwd: string | undefined, args: string[], opts: { timeoutMs?: number; env?: NodeJS.ProcessEnv; input?: string } = {}): Promise<string> {
     this.assertCaptureDecoration(opts.env);
     const base = { ...gitEnv(), ...opts.env };
     // issue #1783 (R4): worker-marked ONLY when the subcommand can run no code the clone
@@ -15679,6 +16249,7 @@ try {
         env,
         timeout: opts.timeoutMs ?? GIT_TIMEOUT_MS,
         maxBuffer: GIT_MAX_BUFFER,
+        ...(opts.input !== undefined ? { input: opts.input } : {}),
       }, "command");
       return stdout;
     } catch (err) {
@@ -16955,6 +17526,34 @@ try {
   }
 
   /**
+   * Unlocked bounded commit read shared by {@link readRecoveryCoverageClaim} and the marker-wrapper
+   * check in {@link prepareRecoverySuccessor}; the caller holds the bare lock. `git cat-file` output is
+   * decoded as UTF-8 by the exec plumbing, so a body that does not survive the round trip back to its
+   * own object id (or exceeds `maxBytes`) is refused rather than trusted or sent corrupted.
+   */
+  private async readBoundedCommit(barePath: string, sha: string, maxBytes: number): Promise<{
+    body: Buffer; tree: string; parents: string[]; author: string | undefined; committer: string | undefined; message: string;
+  } | undefined> {
+    const body = Buffer.from(await this.runGit(barePath, ["--no-replace-objects", "cat-file", "commit", sha]), "utf8");
+    const id = createHash("sha1").update(Buffer.concat([Buffer.from(`commit ${body.length}\0`), body])).digest("hex");
+    if (body.length > maxBytes || id !== sha) return undefined;
+    const text = body.toString("utf8");
+    const split = text.indexOf("\n\n");
+    if (split < 0) return undefined;
+    const header = text.slice(0, split).split("\n");
+    const tree = /^tree ([0-9a-f]{40})$/.exec(header[0] ?? "")?.[1];
+    if (!tree) return undefined;
+    const parents: string[] = [];
+    for (let i = 1; i < header.length; i++) {
+      const parent = /^parent ([0-9a-f]{40})$/.exec(header[i]!)?.[1];
+      if (!parent) break;
+      parents.push(parent);
+    }
+    return { body, tree, parents, author: header[1 + parents.length], committer: header[2 + parents.length],
+      message: text.slice(split + 2) };
+  }
+
+  /**
    * Issue #2625: read, never write, the claim that a coverage aggregate built by
    * {@link buildRecoveryCoverage} is redundant with a published branch. Returns undefined (no claim)
    * for anything that does not verify locally, so a caller can only ever send a claim the api's
@@ -16975,29 +17574,9 @@ try {
         !roots.length || !roots.every(r => OWED_OID.test(r)) || !strictlySorted ||
         (witnessHead !== undefined && !OWED_OID.test(witnessHead)) || heads.length > MAX_HEADS) return undefined;
     const coverageMessage = new RegExp(`^uzi recovery coverage ${fingerprint} round (0|[1-9][0-9]*) batch (0|[1-9][0-9]*)\\n$`);
-    const gitObjectId = (body: Buffer): string =>
-      createHash("sha1").update(Buffer.concat([Buffer.from(`commit ${body.length}\0`), body])).digest("hex");
     try {
       return await this.withLock(barePath, async () => {
-        // `git cat-file` output is decoded as UTF-8 by the exec plumbing; a body that does not survive
-        // the round trip back to its own object id is refused rather than sent corrupted.
-        const readCommit = async (sha: string): Promise<{ body: Buffer; tree: string; parents: string[]; message: string } | undefined> => {
-          const body = Buffer.from(await this.runGit(barePath, ["--no-replace-objects", "cat-file", "commit", sha]), "utf8");
-          if (body.length > MAX_OBJECT_BYTES || gitObjectId(body) !== sha) return undefined;
-          const text = body.toString("utf8");
-          const split = text.indexOf("\n\n");
-          if (split < 0) return undefined;
-          const header = text.slice(0, split).split("\n");
-          const tree = /^tree ([0-9a-f]{40})$/.exec(header[0] ?? "")?.[1];
-          if (!tree) return undefined;
-          const parents: string[] = [];
-          for (let i = 1; i < header.length; i++) {
-            const parent = /^parent ([0-9a-f]{40})$/.exec(header[i]!)?.[1];
-            if (!parent) break;
-            parents.push(parent);
-          }
-          return { body, tree, parents, message: text.slice(split + 2) };
-        };
+        const readCommit = (sha: string) => this.readBoundedCommit(barePath, sha, MAX_OBJECT_BYTES);
         const tree = (await this.runGit(barePath, ["--no-replace-objects", "rev-parse", `${currentSha}^{tree}`])).trim();
         if (!OWED_OID.test(tree) ||
             createHash("sha256").update(JSON.stringify({ roots, currentSha, tree })).digest("hex") !== fingerprint) return undefined;
