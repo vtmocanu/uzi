@@ -418,14 +418,14 @@ it("3304 acquisition diagnostics distinguish queued locks from reads in each che
   await subject.execute(gitlabClaim(330403, { kind: "task", issue_iid: null, branch, open_mr: false }));
   const phases = [
     "checkpoint_import_readback", "checkpoint_post_import", "checkpoint_bridge",
-    "checkpoint_bridge", "checkpoint_bridge", "checkpoint_post_bridge",
+    "checkpoint_bridge", "checkpoint_bridge", "checkpoint_post_bridge", "checkpoint_overlay",
   ];
   assert.deepEqual(adoptionResults, ["updated"]);
-  assert.deepEqual(acquiredPhases, phases, "import readback, fetched tip, bridge observation/adoption/readback, post-bridge");
+  assert.deepEqual(acquiredPhases, phases, "import readback, fetched tip, bridge observation/adoption/readback, post-bridge, overlay context");
   assert.deepEqual(transitions, phases.flatMap(phase => ["checkpoint_lock_wait", phase]));
   assert.deepEqual(readPhases, [
     "checkpoint_import_readback", "checkpoint_post_import",
     "checkpoint_bridge", "checkpoint_bridge", "checkpoint_bridge", "checkpoint_bridge",
-    "checkpoint_post_bridge",
+    "checkpoint_post_bridge", "checkpoint_overlay",
   ], "adoption also observes tracking while checking conflicting refs under the same lock");
 });

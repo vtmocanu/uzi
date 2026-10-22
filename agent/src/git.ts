@@ -14866,8 +14866,8 @@ try {
    *   - `{ kind: "noop" }` — NOTHING was actually missing (every floor already an ancestor of H, a
    *     fast-forward): there was nothing to bridge, and no ancestry read was transiently `"unknown"`.
    *   - `{ kind: "failed" }` — malformed input, a git error, or a transient `"unknown"` ancestry read
-   *     that could not be resolved to a clean no-op (best-effort — a bridge that cannot be built never
-   *     throws here; the caller decides how to fail). A `"failed"` is NEVER conflated with a clean
+   *     that could not be resolved to a clean no-op (ordinary best-effort failure). Typed soft/hard
+   *     boundary, unsafe cleanup and authority failures propagate. A `"failed"` is NEVER conflated with a clean
    *     no-op, so a fast-forwardable run is not mistaken for a genuine synthesis failure and vice
    *     versa.
    */
@@ -17175,12 +17175,15 @@ try {
   }
 
   /** Only a server-confirmed full commit and positive ancestry proof release an owed pin. */
-  async reconcileOwedCandidates(barePath: string, runId: string, remotelyConfirmedSha: string):
+  async reconcileOwedCandidates(barePath: string, runId: string, remotelyConfirmedSha: string,
+    onStep?: (step: BoundaryStep) => void):
     Promise<{ removedShas: string[]; retainedShas: string[] }> {
     if (typeof runId !== "string" || !OWED_RUN_ID.test(runId)) throw new Error("invalid owed run ID");
     this.validateConfirmedSha(remotelyConfirmedSha);
     await this.assertOwedBare(barePath);
+    onStep?.("checkpoint_lock_wait");
     return this.withLock(barePath, async () => {
+      onStep?.("checkpoint_upload");
       const candidates = await this.enumerateOwedUnderLock(barePath, runId);
       const removedShas: string[] = [], retainedShas: string[] = [];
       for (const candidate of candidates) {

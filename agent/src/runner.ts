@@ -11546,7 +11546,8 @@ export class RunRunner {
         // PRD #1416 M3 (C1): AFTER the steer (which must see the agent's rewritten H) and BEFORE
         // the publish, non-destructively bridge a divergent tracking tip so the checkpoint pack —
         // and therefore a reseed on resume — carries B instead of the rewritten H. Best-effort:
-        // a checkpoint must never crash the run (D4), so "failed"/"unknown" only log and continue.
+        // ordinary "failed"/"unknown" outcomes only log and continue (D4). Typed soft/hard
+        // boundary, unsafe cleanup and authority failures propagate to the checkpoint boundary.
         checkpointSteps?.enter("checkpoint_bridge");
         const bridgeOutcome = await withCheckpointPostImportGit(() => this.bridgeBareTrackingRefIfDivergent(
           barePath,
@@ -11853,7 +11854,9 @@ export class RunRunner {
           const checkpointAction = async (permit?: BoundaryPermit) => {
               if (permit && softController) checkpointSoft = { signal: softController.signal, deadlineAt: softDeadlineAt, permit };
               checkpointSteps?.enter("checkpoint_overlay");
-              await doCheckpointPublish(hasNewWork ? () => this.buildCheckpointOverlay(claim, flight, barePath) : undefined, permit !== undefined);
+              await doCheckpointPublish(hasNewWork ? () => this.buildCheckpointOverlay(
+                claim, flight, barePath, step => checkpointSteps?.enter(step),
+              ) : undefined, permit !== undefined);
           };
           if (opts.doneAttempt) await checkpointAction(opts.donePermit);
           else await this.reapForSink(
@@ -13885,9 +13888,10 @@ export class RunRunner {
     }
   }
 
-  private async reconcileConfirmedOwed(flight: RunFlight, barePath: string, confirmedSha: string): Promise<void> {
+  private async reconcileConfirmedOwed(flight: RunFlight, barePath: string, confirmedSha: string,
+    onStep?: (step: BoundaryStep) => void): Promise<void> {
     try {
-      const result = await this.git.reconcileOwedCandidates(barePath, flight.runId, confirmedSha);
+      const result = await this.git.reconcileOwedCandidates(barePath, flight.runId, confirmedSha, onStep);
       // Only reconcileOwedCandidates supplies positive checkpoint coverage proof.
       // Snapshot previously announced removals before forgetting all released heads.
       const resolved = [...new Set(result.removedShas)].filter(sha => /^[0-9a-f]{40}$/.test(sha) &&
@@ -14393,7 +14397,8 @@ export class RunRunner {
    * Advances the tracking ref to B and C to B on success, so everything a caller then
    * captures / releases / aligns / pushes off the tracking ref carries B.
    *
-   * Outcomes (never thrown for control flow — a git failure inside maps to "failed"/"unknown"):
+   * Ordinary best-effort git failures map to "failed"/"unknown"; typed soft/hard boundary,
+   * unsafe cleanup and authority failures propagate. Outcomes:
    *  - "clean"   — no floor to bridge (P null, or P and C are already ancestors of H). Nothing done.
    *  - "unknown" — ancestry could not be determined (a broken read); do NOT bridge, do NOT fail.
    *  - "bridged" — B built AND validated (tree === H's tree, P and H both ancestors of B); the bare
@@ -14615,8 +14620,9 @@ export class RunRunner {
     claim: ClaimResponse,
     flight: RunFlight,
     barePath: string,
+    onStep?: (step: BoundaryStep) => void,
   ): Promise<CheckpointOverlayContext | undefined> {
-    await this.requireTrackingOwned(flight, barePath, flight.branch!);
+    await this.requireTrackingOwned(flight, barePath, flight.branch!, undefined, onStep, "checkpoint_overlay");
     if (claim.repo.forge_type !== "github") return undefined;
     const defaultBranch =
       claim.repo.default_branch?.trim() ||
@@ -15534,7 +15540,8 @@ export class RunRunner {
       // issue #3194: read the acceptance bit BEFORE the owned source snapshot, and freeze the
       // attestation with it for every retry of this logical publish.
       const attests = flight.baseAccepted === true;
-      const sourceSha = await this.requireTrackingOwned(flight, barePath, branch, pinned?.tipSha);
+      onStep?.("scratch_preflight");
+      const sourceSha = await this.requireTrackingOwned(flight, barePath, branch, pinned?.tipSha, onStep, "scratch_preflight");
       const attestedSource = attests ? sourceSha : undefined;
       signal?.throwIfAborted();
       if (await this.ciConfigGuardBlocksPublication(flight, barePath, sourceSha, "checkpoint publish")) {
@@ -15583,7 +15590,8 @@ export class RunRunner {
         await abandon(true);
         await sleep(backoffMs, signal);
         signal?.throwIfAborted();
-        await this.requireTrackingOwned(flight, barePath, branch, sourceSha);
+        onStep?.("scratch_preflight");
+        await this.requireTrackingOwned(flight, barePath, branch, sourceSha, onStep, "scratch_preflight");
         signal?.throwIfAborted();
         producer = await packed.replay();
         observeProducer();
@@ -15603,7 +15611,7 @@ export class RunRunner {
         // declared tip (the overlay `O_ov`, or realTip on the no-overlay path), so the NEXT
         // overlay carries it as parent[0] (base-first) and stays a fast-forward the broker takes.
         flight.lastCheckpointRefTip = packed.tipOid;
-        await this.reconcileConfirmedOwed(flight, barePath, packed.tipOid);
+        await this.reconcileConfirmedOwed(flight, barePath, packed.tipOid, onStep);
         // issue #1086 (F2): a confirmed publish reconciles the broker's ref, so clear any pending
         // attempted tip — the confirmed tip is now authoritative.
         flight.lastAttemptedCheckpointRefTip = undefined;

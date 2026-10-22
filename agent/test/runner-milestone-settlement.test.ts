@@ -6,12 +6,13 @@ import fs from "node:fs";
 import path from "node:path";
 import { PassThrough, Readable } from "node:stream";
 import type { Executor } from "../src/executor.js";
+import type { BoundaryStep } from "../src/harness.js";
 import type { FetchAgentBranchOptions } from "../src/git.js";
 import { RunRunner } from "../src/runner.js";
 import { CodexBoundaryError } from "../src/codex/safety.js";
 import { SupervisedChildExitTimeoutError } from "../src/codex/launcher.js";
-import { api, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
-import { codexRig, commitInTree, GIT_ENV, installRecoveryRootCleanup, virtualBoundaryClock } from "./runner-codex-sinks-fixture.js";
+import { api, client, deferred, fakeGitHub, fakeGitlab, fx, git, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
+import { codexRig, commitInTree, drain, GIT_ENV, installRecoveryRootCleanup, virtualBoundaryClock } from "./runner-codex-sinks-fixture.js";
 
 installHarness();
 installRecoveryRootCleanup();
@@ -200,3 +201,96 @@ for (const seam of cases) {
     }
   });
 }
+
+it("3304 publishing diagnostics trace overlay, initial and retry snapshots, and owed reconciliation", async t => {
+  const clock = virtualBoundaryClock();
+  const bare = git.barePathFor(fx.originPath);
+  const acquired: BoundaryStep[] = [], transitions: BoundaryStep[] = [];
+  let tracing = false, completed = false, publications = 0;
+  let active: BoundaryStep | undefined, owningPhase: BoundaryStep | undefined;
+  let rig: ReturnType<typeof codexRig> | undefined;
+  const record = (step: (name: BoundaryStep) => void) => (name: BoundaryStep) => {
+    active = name; transitions.push(name); step(name);
+  };
+  const executor: Executor = {
+    get safety() { return rig?.safety; },
+    run: async ctx => {
+      rig = codexRig({
+        lifecycleSignal: AbortSignal.any([ctx.signal!, ctx.terminalLifecycleSignal!]),
+        now: clock.now, armDeadline: clock.armDeadline,
+      });
+      commitInTree(ctx.worktreePath, "publishing-diagnostics.txt", "checkpoint work\n");
+      clock.advance(1);
+      tracing = true;
+      try {
+        await ctx.checkpoint!({ reap: true, sink: "milestone_checkpoint",
+          progress: { completed: ["publishing-diagnostics"], in_progress: [] } });
+      } finally { tracing = false; }
+      assert.equal(publications, 2, "one explicit 500 retries and confirms inside the checkpoint");
+      assert.deepEqual(acquired, ["checkpoint_overlay", "scratch_preflight", "scratch_preflight", "checkpoint_upload"]);
+      assert.deepEqual(transitions, acquired.flatMap(phase => ["checkpoint_lock_wait", phase]));
+      completed = true;
+      return { branch: ctx.branch };
+    },
+  };
+  t.mock.method(client, "publishCheckpoint", async (_id: string, _tip: string, pack: Parameters<typeof client.publishCheckpoint>[2]) => {
+    await drain(pack);
+    if (!tracing) return { ok: true, body: { published: true } };
+    publications++;
+    return publications === 1 ? { ok: false, httpStatus: 500 } : { ok: true, body: { published: true } };
+  });
+  const subject = runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined, {
+    github: fakeGitHub().github,
+    checkpointIntervalMs: 1, now: clock.now, setTickTimer: () => () => {},
+    checkpointTestHooks: { absoluteNow: clock.now, armSoftDeadline: clock.arm, retryBackoffMs: [0, 0] },
+  });
+  const internal = subject as unknown as {
+    checkedTrackingSnapshot(flight: never, barePath: string, branch: string, sha?: string,
+      step?: (name: BoundaryStep) => void, phase?: BoundaryStep): Promise<string | null>;
+  };
+  const snapshot = internal.checkedTrackingSnapshot.bind(subject);
+  t.mock.method(internal, "checkedTrackingSnapshot", async (...args: Parameters<typeof snapshot>) => {
+    const phase = args[5];
+    if (!tracing || (phase !== "checkpoint_overlay" && phase !== "scratch_preflight")) return snapshot(...args);
+    assert.ok(args[4], "publishing snapshot receives tracing");
+    owningPhase = active = phase;
+    try { return await snapshot(args[0], args[1], args[2], args[3], record(args[4]), phase); }
+    finally { owningPhase = undefined; }
+  });
+  const reconcile = git.reconcileOwedCandidates.bind(git);
+  t.mock.method(git, "reconcileOwedCandidates", async (...args: Parameters<typeof reconcile>) => {
+    if (!tracing) return reconcile(...args);
+    const onStep = args[3];
+    assert.ok(onStep, "confirmed publication supplies owed reconciliation tracing");
+    owningPhase = active = "checkpoint_upload";
+    try { return await reconcile(args[0], args[1], args[2], record(onStep)); }
+    finally { owningPhase = undefined; }
+  });
+  const gitInternal = git as unknown as {
+    withLock<T>(key: string, action: () => Promise<T>, signal?: AbortSignal): Promise<T>;
+  };
+  const withLock = gitInternal.withLock.bind(git);
+  t.mock.method(gitInternal, "withLock", async <T>(key: string, action: () => Promise<T>, signal?: AbortSignal): Promise<T> => {
+    if (!tracing || !owningPhase || key !== bare) return withLock(key, action, signal);
+    const phase = owningPhase;
+    assert.equal(active, "checkpoint_lock_wait", "label changes immediately before queueing");
+    const release = deferred();
+    // One predecessor per targeted acquisition, released in this hook even if an assertion fails.
+    const holder = withLock(key, async () => { await release.promise; });
+    const waiter = withLock(key, async () => {
+      const result = action();
+      assert.equal(active, phase, "owning phase resumes at acquisition before work settles");
+      acquired.push(phase);
+      return result;
+    }, signal);
+    try { assert.equal(active, "checkpoint_lock_wait", "queued acquisition reports waiting"); }
+    finally { release.resolve(); }
+    const [, result] = await Promise.all([holder, waiter]);
+    return result;
+  });
+  client.protocolFeatures = ["run_checkpoint_durability"];
+  await subject.execute(gitlabClaim(330411, { kind: "task", branch: "feature/publishing-diagnostics", issue_iid: null, open_mr: false,
+    repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath,
+      forge_type: "github", default_branch: "main" } }));
+  assert.equal(completed, true, "runner must not swallow an executor assertion: " + JSON.stringify({ publications, acquired, transitions, states: api.states }));
+});
