@@ -1246,6 +1246,7 @@ tasks:
     desc: hermetic devbox workflow token isolation, validated lock transfer and proposal behavior
     cmds:
       - ./scripts/devbox-update.test.sh
+      - python3 -B scripts/refresh-worker-lock.test.py
 
   check:worker-toolchain:
     desc: worker package lock keys and resolved Go satisfy module go and toolchain requirements (offline)

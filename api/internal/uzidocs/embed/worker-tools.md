@@ -128,13 +128,26 @@ Go currently uses an immutable nixpkgs channel ref because the Devbox index
 lags its required patch release. Updating that pin is deliberate: evaluate
 `go_1_27.version` and its Linux output at the new ref, record their exact
 version/output metadata in the lock, and verify the output is cached. The
-weekly refresh rejects manifest rewrites and reuses metadata only when the
-complete resolved Go ref is unchanged. Renovate proposes monthly channel digest updates
+weekly refresh preserves this explicit pin and its evaluated metadata. Renovate proposes monthly channel digest updates
 to the manifest and guard map together; those PRs remain red until a maintainer
 regenerates the lock key and its evaluated version/output metadata.
-Devbox 0.17.5 currently rewrites the key-less gcc entry, so the weekly refresh
-knowingly fails at this guard until a separate refresh redesign lands. It must
-not publish a mismatched lock while that work is pending.
+
+Weekly maintenance runs `scripts/refresh-worker-lock.py` with the pinned Devbox
+version. It copies the manifest and lock to an isolated project, updates only
+Devbox's stdenv input (`devbox update nixpkgs --no-install`), removes the raw
+attribute entries from that staged lock, then runs `devbox install --tidy-lockfile`.
+The install realizes packages and can require substantial cache downloads; this
+is not a metadata-only or offline refresh. A normal full `devbox update` migrates
+raw keys to devbox-search `@latest` entries and is intentionally avoided.
+
+The helper requires the manifest to remain byte-identical and validates the
+complete lock and module Go requirements before atomically replacing the original
+lock. A failed or partial attempt leaves both original inputs intact. The read-only
+workflow then builds the image; only its hash-bound, validated lock artifact can
+reach the separate write-capable proposal job. Review all package version changes
+before landing. The monthly Go revision and weekly stdenv revision can differ,
+adding a second nixpkgs closure; compare closure counts and both image sizes when
+upgrading, rather than assuming a size reduction will persist.
 
 Both images bake the sha-verified sqlc archive at `/usr/local/share/uzi-sqlc`.
 Linux amd64 and arm64 use separate upstream archive hashes at the same version.
