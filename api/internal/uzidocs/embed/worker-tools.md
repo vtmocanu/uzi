@@ -118,7 +118,8 @@ the admin's own responsibility to match what the image actually bakes.
 
 ## Worker Go and sqlc pins
 
-The worker Go pin must satisfy both repository `toolchain` declarations.
+The worker Go pin must satisfy the highest `go` or optional `toolchain`
+requirement in either repository module.
 `task check:worker-toolchain` checks the package/lock keys and resolved version
 offline. Both image builds additionally check the actual Go binary against the
 lock, then check module requirements in the release stage.

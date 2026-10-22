@@ -1246,7 +1246,7 @@ tasks:
       - ./scripts/devbox-update.test.sh
 
   check:worker-toolchain:
-    desc: worker package lock keys and resolved Go satisfy both module toolchains (offline)
+    desc: worker package lock keys and resolved Go satisfy module go and toolchain requirements (offline)
     cmds:
       - python3 -B scripts/check-worker-toolchain.py
 

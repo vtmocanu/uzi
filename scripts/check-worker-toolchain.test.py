@@ -51,6 +51,36 @@ class ToolchainTests(unittest.TestCase):
                     self.run_check()
                 mod.write_text(original)
 
+    def test_go_only_modules(self):
+        for module in ('api', 'controller'):
+            for required in ('1.27.3', '1.27'):
+                with self.subTest(module=module, required=required):
+                    mod = self.root / module / 'go.mod'
+                    original = mod.read_text()
+                    mod.write_text(f'module example.test/{module}\ngo {required}\n')
+                    self.assertEqual(self.run_check(), '1.27.3')
+                    mod.write_text(original)
+
+    def test_go_directive_cannot_exceed_worker(self):
+        for module in ('api', 'controller'):
+            for toolchain in ('', 'toolchain go1.27.3\n'):
+                with self.subTest(module=module, toolchain=toolchain):
+                    mod = self.root / module / 'go.mod'
+                    original = mod.read_text()
+                    mod.write_text(f'module example.test/{module}\ngo 1.27.4\n{toolchain}')
+                    with self.assertRaisesRegex(ValueError, f'older than {module}/go.mod requirement go1.27.4'):
+                        self.run_check()
+                    mod.write_text(original)
+
+    def test_module_directive_cardinality(self):
+        mod = self.root / 'api/go.mod'
+        for directives in ('toolchain go1.27.3\n', 'go 1.27.3\ngo 1.27.3\n',
+                           'go 1.27.3\ntoolchain go1.27.3\ntoolchain go1.27.3\n'):
+            with self.subTest(directives=directives):
+                mod.write_text('module example.test/api\n' + directives)
+                with self.assertRaisesRegex(ValueError, 'exactly one go and at most one toolchain'):
+                    self.run_check()
+
     def test_orphaned_and_missing_keys(self):
         for packages in (['go', 'jq.bin'], [self.key], [self.key, 'jq.bin', 'new-package']):
             with self.subTest(packages=packages):

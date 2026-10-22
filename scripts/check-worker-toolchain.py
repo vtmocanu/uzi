@@ -82,11 +82,16 @@ def check(root, skip_modules=False, installed_go=None, arch=None):
     if not skip_modules:
         for module in ('api', 'controller'):
             text = (root / module / 'go.mod').read_text()
-            requirements = re.findall(r'^toolchain go(\S+)\s*$', text, re.M)
-            if len(requirements) != 1:
-                raise ValueError(f'{module}/go.mod must declare exactly one toolchain')
-            if version(resolved) < version(requirements[0]):
-                raise ValueError(f'worker Go {resolved} is older than {module}/go.mod toolchain go{requirements[0]}')
+            go_lines = re.findall(r'^[ \t]*go[ \t]+([^\s]+)[ \t]*(?://[^\n]*)?$', text, re.M)
+            toolchain_lines = re.findall(r'^[ \t]*toolchain[ \t]+([^\s]+)[ \t]*(?://[^\n]*)?$', text, re.M)
+            if len(go_lines) != 1 or len(toolchain_lines) > 1:
+                raise ValueError(f'{module}/go.mod must declare exactly one go and at most one toolchain directive')
+            requirements = go_lines + [t.removeprefix('go') for t in toolchain_lines]
+            # A language-only go directive such as 1.27 requires that release family.
+            requirements = [r + '.0' if re.fullmatch(r'\d+\.\d+', r) else r for r in requirements]
+            required = max(requirements, key=version)
+            if version(resolved) < version(required):
+                raise ValueError(f'worker Go {resolved} is older than {module}/go.mod requirement go{required}')
     if installed_go is not None:
         actual = re.fullmatch(r'go version go(\d+\.\d+\.\d+) linux/(amd64|arm64)', installed_go)
         if not actual or actual[1] != resolved:
