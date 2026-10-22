@@ -3,6 +3,7 @@
 // harness client, an executor that leaves a realistic failed workspace, and the custody-retention
 // assertions every fault test makes.
 import assert from "node:assert/strict";
+import type { TestContext } from "node:test";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -257,6 +258,36 @@ export function watchFreezes(server: HeldServer): { failedAckedAtFreeze: boolean
     return coverage;
   };
   return seen;
+}
+
+/**
+ * These legacy cases own a LIVE/foreground/restart interleaving after execute.
+ * Hold the automatic notification BEFORE trackPass registers it, preserving that
+ * boundary. Dedicated notification tests exercise automatic replay without this barrier.
+ * Test cleanup closes the runner first, then releases and joins deferred notifications
+ * through the production shutdown guard, including when an assertion fails.
+ */
+export function deferTerminalEvidence(r: RunRunner, t: Pick<TestContext, "after" | "mock">): void {
+  const recovery = recoveryOf(r);
+  const resume = recovery.resumeTerminalEvidence.bind(recovery);
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const pending: Promise<void>[] = [];
+  t.mock.method(recovery, "resumeTerminalEvidence", (...args: Parameters<typeof resume>) => {
+    const notification = gate.then(() => resume(...args));
+    pending.push(notification);
+    return notification;
+  });
+  t.after(async () => {
+    // TestContext.after follows the harness's afterEach cleanup. Close admission
+    // before releasing the artificial barrier, so no notification can use retired
+    // fixture storage or a closed fake API. Already-owned passes still settle.
+    r.shutdown();
+    release();
+    const results = await Promise.allSettled([...pending, r.shutdownRecoveries()]);
+    const failed = results.find(result => result.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
+  });
 }
 
 /** Run the live re-drive the worker performs after execute(); each pass may send one journaled FINAL. */
