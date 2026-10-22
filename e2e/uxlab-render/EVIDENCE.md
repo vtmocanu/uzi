@@ -106,8 +106,24 @@ uninitialized root-owned mount; it is not an execution result.
 The fixture now sets executable /data explicitly for worktree/Devbox scripts,
 retaining nosuid/nodev. The production compose mount is `agentdata:/data`
 (`docker-compose.yml:404`); no production mount, Nix permission, uid or
-sandbox grant was changed. The corrected local leg and final full gate are
-not yet recorded. The SQLite denial conflict remains independent and open.
+sandbox grant was changed.
+
+The corrected local retry at `50b8da9a` reached the one-hour cell deadline and
+exited 1 after 3,655 seconds including creation and cleanup. The exact owned
+container and Nix volume were removed and absence verified. No artifact
+receipts were exported. The current wrapper collects Docker child output on
+normal container exit; its wall-deadline exit occurs before that collection,
+so this attempt does not identify the stalled child stage. It cannot establish
+frame generation, rendering or PNG inspection. Logs: `m3-local-50b8da9a.log`
+and `uxlab-render.qrtn5f`. Further fixture diagnosis and a successful local
+proof remain required. The final full gate after the mount correction is
+also not recorded; ShellCheck and all three scoped reviews of that literal
+flag change passed. The SQLite denial conflict remains independent and open.
+
+No partial-delivery or criterion waiver has been approved. M3 remains required
+and incomplete. The owner decision being requested concerns the exact off-mode
+SQLite-open denial requirement and the prohibition on production runtime
+changes; it does not mark any other outstanding check as complete.
 
 ## Focused verification and repository checks
 

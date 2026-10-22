@@ -5,8 +5,10 @@
 M3 is **incomplete**. A real base/off attempt reached provisioning and Go
 setup, then failed the required Nix database write-access check. No rendering
 acceptance is claimed. The other matrix cells and PNG inspection remain
-unperformed. A separate local build attempt reached Devbox but failed on the
-fixture tmpfs execution setting; its correction still needs live verification. See [EVIDENCE.md](EVIDENCE.md)
+unperformed. A separate local build attempt failed on the fixture tmpfs
+execution setting. After that correction, the local retry hit its one-hour
+cell deadline without artifact receipts; detailed child output was not retained
+on that timeout path. Local rendering and final acceptance remain incomplete. See [EVIDENCE.md](EVIDENCE.md)
 for the tested revisions, safe-open failure and required scope decision.
 No production runtime, environment builder, permission or sandbox code changes.
 
