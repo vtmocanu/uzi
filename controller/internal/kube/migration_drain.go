@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/vtmocanu/uzi/controller/internal/protocol"
 	"github.com/vtmocanu/uzi/controller/internal/reconcile"
@@ -117,15 +118,10 @@ func (m *Materializer) selectMigrationDrains(ctx context.Context, t *rollTick, d
 			ordinaryUncertain[migrationLane(e.coverage)] = true
 		}
 	}
-	for lane, ids := range drained {
+	for _, ids := range drained {
 		if len(ids) > 1 {
 			t.migrationMultiple = true
 			sort.Strings(ids)
-			for _, e := range t.entries {
-				if migrationLane(e.coverage) == lane && t.outcomes[e.w.ID].State == "held" {
-					t.outcomes[e.w.ID].BlockingReason = pacingText(layoutMigrationReason + ": " + migrationMultiplicity(ids) + "; operator custody decision")
-				}
-			}
 		}
 	}
 	ids := []string{}
@@ -187,16 +183,18 @@ func (m *Materializer) selectMigrationDrains(ctx context.Context, t *rollTick, d
 			}
 		}
 		if len(drained[migrationLane(e.coverage)]) > 1 {
-			reason = migrationMultiplicity(drained[migrationLane(e.coverage)]) + "; " + reason
+			// The final fleet notice supplies the operator action. Keep the
+			// local cause before one complete sampled identity within 192 bytes.
+			reason = strings.TrimSuffix(reason, "; operator custody decision") + "; " + migrationMultiplicity(drained[migrationLane(e.coverage)])
 		}
 		p.BlockingReason = pacingText(layoutMigrationReason + ": " + reason)
 	}
 }
 
-// The caller sorts identities; include a count and a bounded sample, not an
-// unbounded list that would crowd the cause out of the pacing text.
+// The caller sorts at least two UUIDs. One complete identity leaves room for
+// the local cause and final fleet notice within the pacing byte budget.
 func migrationMultiplicity(ids []string) string {
-	return fmt.Sprintf("multiple held drains=%d; sample=%v", len(ids), ids[:min(2, len(ids))])
+	return fmt.Sprintf("held drains=%d; sample=%s", len(ids), ids[0])
 }
 
 // Display-only fleet notice must run after materialization can create late held
@@ -213,6 +211,6 @@ func (m *Materializer) finalizeMigrationNotice(t *rollTick) {
 		if p.BlockingReason != nil {
 			cause = *p.BlockingReason
 		}
-		p.BlockingReason = pacingText("fleet: multiple migration-held drains; operator custody decision; " + layoutMigrationReason + "; " + cause)
+		p.BlockingReason = pacingText("fleet: multiple migration-held drains; intake risk; operator decision; " + cause)
 	}
 }

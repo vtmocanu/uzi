@@ -109,7 +109,10 @@ func TestMigrationDrainEntry(t *testing.T) {
 					d, _ := f.client.AppsV1().Deployments(lmNS()).Get(context.Background(), deploymentName("a"), metav1.GetOptions{})
 					cov, _ := coverageOf(ws[0], lmNS())
 					cov.Scheduling = []string{"docker", "x", "y"}
-					raw, _ := json.Marshal(&rollMarker{Version: 1, Hash: d.Spec.Template.Annotations[AnnotationSpecHash], Image: workerImage(d), TargetVersion: "1.0.0", Coverage: cov})
+					raw, _ := json.Marshal(&rollMarker{Version: 1, Hash: strings.Repeat("a", 64), Image: workerImage(d), TargetVersion: "1.0.0", Coverage: cov})
+					if _, err := decodeRoll(string(raw)); err != nil {
+						t.Fatalf("reverse-dependency marker must decode: %v", err)
+					}
 					d.Annotations = map[string]string{annotationRoll: string(raw)}
 					_, _ = f.client.AppsV1().Deployments(lmNS()).Update(context.Background(), d, metav1.UpdateOptions{})
 				}
@@ -186,14 +189,28 @@ func (p *migrationPoller) Poll(context.Context) (protocol.PollResponse, error) {
 
 type migrationObserver struct {
 	*Materializer
-	fail bool
+	fail     bool
+	hiddenID string
 }
 
 func (m *migrationObserver) Observe(ctx context.Context) ([]reconcile.ObservedWorker, error) {
 	if m.fail {
 		return nil, errors.New("observe unavailable")
 	}
-	return m.Materializer.Observe(ctx)
+	observed, err := m.Materializer.Observe(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if m.hiddenID == "" {
+		return observed, nil
+	}
+	filtered := make([]reconcile.ObservedWorker, 0, len(observed))
+	for _, worker := range observed {
+		if worker.ID != m.hiddenID {
+			filtered = append(filtered, worker)
+		}
+	}
+	return filtered, nil
 }
 
 type migrationReporter struct{ report protocol.StatusReport }
@@ -245,6 +262,21 @@ func TestMigrationDrainPendingLoop(t *testing.T) {
 				t.Fatalf("missing owner cleared pending: %v", c.calls)
 			}
 			ws[0].RollEvidence = saved
+			// A missing pending worker must still consume the frozen budget,
+			// without the missing-owner row independently blocking the lane.
+			// Omit its observation too: this models missing evidence, rather
+			// than authorizing the existing undesired-worker teardown path.
+			p.workers, o.hiddenID = ws[1:], "a"
+			if err := l.Tick(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if len(c.calls) != 1 {
+				t.Fatalf("absent worker lost pending budget: %v", c.calls)
+			}
+			if len(deletedSet(f.client)) != 0 {
+				t.Fatal("missing evidence deleted worker objects")
+			}
+			p.workers, o.hiddenID = ws, ""
 			c.fail = false
 			if err := l.Tick(context.Background()); err != nil {
 				t.Fatal(err)
@@ -392,7 +424,7 @@ func TestMigrationDrainLateCommit(t *testing.T) {
 			if !restart && !strings.Contains(*pacing.BlockingReason, "mutation unconfirmed") {
 				t.Fatalf("local cause lost: %s", *pacing.BlockingReason)
 			}
-			if strings.Contains(*pacing.BlockingReason, "multiple held drains") || len(*pacing.BlockingReason) > 192 {
+			if strings.Contains(*pacing.BlockingReason, "held drains=") || len(*pacing.BlockingReason) > 192 {
 				t.Fatalf("identity leak or bound: %s", *pacing.BlockingReason)
 			}
 			// Assert the actual Loop status wire, not just the pacing getter.
@@ -406,6 +438,54 @@ func TestMigrationDrainLateCommit(t *testing.T) {
 				t.Fatalf("notice missing from status wire: %+v", r.report)
 			}
 		})
+	}
+}
+
+func TestMigrationDrainNoticeBudget(t *testing.T) {
+	const first = "11111111-1111-4111-8111-111111111111"
+	const second = "22222222-2222-4222-8222-222222222222"
+	const ordinary = "00000000-0000-4000-8000-000000000000"
+	f, ws, cordon := migrationFixture(t, migrationHeldOpt(first), migrationHeldOpt(second),
+		lmOpts{id: ordinary, layout: "new", stale: true, marker: "canary"})
+	for i := 0; i < 2; i++ {
+		ws[i].DrainingSince, ws[i].DrainingReason = &m5Now, token("image_roll")
+	}
+	if err := f.client.CoreV1().Pods(lmNS()).Delete(context.Background(), "pod-"+ordinary, metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	observed, err := f.m.Observe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const originalCause = "confirmed admission suspended for usable coverage"
+	if err := f.m.Reconcile(context.Background(), ws, observed); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{first, second} {
+		p := f.m.PacingOutcomes()[id]
+		if p == nil || p.BlockingReason == nil {
+			t.Fatalf("missing local notice for %s", id)
+		}
+		reason := *p.BlockingReason
+		if len(reason) > 192 || !strings.Contains(reason, "held drains=2; sample="+first) ||
+			!strings.Contains(reason, "retained drain without coverage") ||
+			!strings.Contains(reason, "layout_migration_custody") {
+			t.Fatalf("local notice lost complete sample or cause: %q", reason)
+		}
+		if strings.Contains(reason, second[:8]) {
+			t.Fatalf("partial second UUID: %q", reason)
+		}
+	}
+	p := f.m.PacingOutcomes()[ordinary]
+	if p == nil || p.BlockingReason == nil || !strings.Contains(*p.BlockingReason, originalCause) ||
+		!strings.Contains(*p.BlockingReason, "fleet: multiple migration-held drains") {
+		t.Fatalf("ordinary cause erased by multiplicity: %+v", p)
+	}
+	if strings.Contains(*p.BlockingReason, first) || strings.Contains(*p.BlockingReason, second) {
+		t.Fatalf("sample escaped migration diagnostics: %q", *p.BlockingReason)
+	}
+	if len(cordon.calls) != 0 || len(cordon.clearCalls) != 0 {
+		t.Fatalf("multiplicity caused drain mutations: %v %v", cordon.calls, cordon.clearCalls)
 	}
 }
 
