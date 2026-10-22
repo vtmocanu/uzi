@@ -36,7 +36,25 @@ func (*ResponseTooLargeError) Unwrap() error { return ErrResponseTooLarge }
 // (streaming) path, where the SDK ignores the read error (the deferred drain) or
 // folds it into an empty ErrorResponse. One state is created per marked call and
 // never shared between calls.
-type responseLimitState struct{ overflow atomic.Bool }
+type responseLimitState struct {
+	overflow atomic.Bool
+	ceiling  int64
+}
+
+// issueResponseBytes is eight times 256 KiB: sixfold JSON expansion plus
+// metadata headroom. It is also twice the 1 MiB API cap.
+const issueResponseBytes int64 = 2 << 20
+
+// objectResponseBytes follows ancestryBodyLimit and artifactPageBytes (1 MiB).
+const objectResponseBytes int64 = 1 << 20
+
+// commentPageResponseBytes is a per-page policy: 100 comments of 64 KiB plus
+// metadata. It does not promise that every escaped page fits.
+const commentPageResponseBytes int64 = 8 << 20
+
+func newResponseLimitState(ceiling int64) *responseLimitState {
+	return &responseLimitState{ceiling: ceiling}
+}
 
 type responseLimitKey struct{}
 
@@ -175,9 +193,9 @@ func declaresContentEncoding(h http.Header) bool {
 // responseLimitTransport bounds response bodies of requests marked with
 // withResponseLimit, before the SDK decodes or classifies them:
 //   - bodies of SDK success statuses and of statuses the SDK retries on status
-//     alone are read eagerly (32 MiB / 4 KiB). An overflow is a transport error
-//     with no response, which the SDK does not retry.
-//   - every other body is streamed through a lazy 4 KiB+1 window so the SDK and
+//     alone are read eagerly (the call ceiling / at most 4 KiB). An overflow is
+//     a transport error with no response, which the SDK does not retry.
+//   - every other body is streamed through a lazy min(ceiling, 4 KiB)+1 window so the SDK and
 //     net/http read it exactly when they would without a limit.
 //
 // Every counted byte is a transfer-decoded wire body byte: the request carries
@@ -208,9 +226,13 @@ func (t responseLimitTransport) RoundTrip(req *http.Request) (*http.Response, er
 		setBuffered(resp, nil)
 		return resp, nil
 	}
+	limit := state.ceiling
+	if limit == 0 {
+		limit = gitLabMaxResponseBytes
+	}
 	switch code := resp.StatusCode; {
 	case statusSDKSuccess(code):
-		data, err := readBoundedBody(resp.Body, gitLabMaxResponseBytes)
+		data, err := readBoundedBody(resp.Body, limit)
 		if err != nil {
 			var tooLarge *ResponseTooLargeError
 			if errors.As(err, &tooLarge) {
@@ -221,7 +243,7 @@ func (t responseLimitTransport) RoundTrip(req *http.Request) (*http.Response, er
 		}
 		setBuffered(resp, data)
 	case statusRetriedBySDK(code):
-		data, err := readBoundedBody(resp.Body, min(gitLabMaxResponseBytes, gitLabMaxErrorResponseBytes))
+		data, err := readBoundedBody(resp.Body, min(limit, gitLabMaxErrorResponseBytes))
 		if err != nil {
 			var tooLarge *ResponseTooLargeError
 			if errors.As(err, &tooLarge) {
@@ -231,7 +253,7 @@ func (t responseLimitTransport) RoundTrip(req *http.Request) (*http.Response, er
 		}
 		setBuffered(resp, data)
 	default:
-		resp.Body = &lazyCappedBody{rc: resp.Body, remaining: min(gitLabMaxResponseBytes, gitLabMaxErrorResponseBytes), state: state}
+		resp.Body = &lazyCappedBody{rc: resp.Body, remaining: min(limit, gitLabMaxErrorResponseBytes), state: state}
 	}
 	return resp, nil
 }
