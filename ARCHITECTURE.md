@@ -1166,7 +1166,8 @@ chain in the diagram above, with no intervening `running`.
   that worker's old flight out. The owner extends (resumes with the granted time),
   stops (milestone issue runs only — finalizes the completed milestones into a
   merge request), or cancels; the park has no expiry and the behavior is not
-  configurable. Both harnesses park; none fails at the wall. See
+  configurable. Both harnesses enforce the wall through capture-first parking or,
+  after a completion attempt, the completion hold. See
   [docs/run-pause.md](docs/run-pause.md) and [docs/run-health.md](docs/run-health.md).
 
 - **Eligible Codex root refusal → owner policy hold**
