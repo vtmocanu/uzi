@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import { displayJSON } from "./display.js";
 import { createCriteria } from "./criteria.js";
+import { captureOutput } from "./capture.js";
 import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
@@ -146,7 +147,7 @@ async function main() {
     const versionLog = path.join(checkout, ".uxlab-tool-versions");
     try {
       await command("nix-devbox-versions",
-        "{ set +e\ncommand -v nix\nls -l \"$(command -v nix)\"\nreadlink -f \"$(command -v nix)\"\nnix --version\nprintf 'NIX_VERSION_STATUS=%s\\n' \"$?\"\ncommand -v devbox\ndevbox version\n} 2>&1 | /bin/dd bs=1 count=1048576 2>/dev/null > " + quote(versionLog),
+        "{ set +e\ncommand -v nix\nls -l \"$(command -v nix)\"\nreadlink -f \"$(command -v nix)\"\nnix --version\nprintf 'NIX_VERSION_STATUS=%s\\n' \"$?\"\ncommand -v devbox\ndevbox version\n} 2>&1 | " + captureOutput + " > " + quote(versionLog),
         checkout, versionSpawn, versionRoots);
     } catch (error) { record("version-diagnostic-error", { ...runnerFailure(error) }); }
     assert.equal(versionRoots.hasLiveCommandRoot(), false);
@@ -198,7 +199,7 @@ go test ./cmd/uzi/ -run '^$' -count=1`, path.join(checkout, "api"));
     let negative: { code: number | null } | undefined;
     try {
       negative = await command("command-devbox-negative",
-        "set +e\nset -o pipefail\ndevbox run build 2>&1 | /bin/dd bs=1 count=1048576 2>/dev/null > " + quote(controlLog) +
+        "set +e\nset -o pipefail\ndevbox run build 2>&1 | " + captureOutput + " > " + quote(controlLog) +
         '\nexit "${PIPESTATUS[0]}"', lab, controlSpawn, controlRoots);
     } catch (error) {
       record("control-error", { ...runnerFailure(error) });
@@ -250,7 +251,7 @@ go test ./cmd/uzi/ -run '^$' -count=1`, path.join(checkout, "api"));
       let green;
       try {
         green = await command("offline-full-build",
-          offline + "set -o pipefail\n./build.sh 2>&1 | /bin/dd bs=1 count=1048576 2>/dev/null > " + quote(buildLog), lab);
+          offline + "set -o pipefail\n./build.sh 2>&1 | " + captureOutput + " > " + quote(buildLog), lab);
       } catch (error) {
         for (const directory of ["frames", "png"]) {
           let count = 0;
