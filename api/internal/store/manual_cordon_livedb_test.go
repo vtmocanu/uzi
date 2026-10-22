@@ -85,47 +85,21 @@ func TestManualCordonPersistenceAndIntakeLiveDB(t *testing.T) {
 
 func TestManualCordonAutomaticFenceCompositionLiveDB(t *testing.T) {
 	for _, reason := range []string{"image_roll", "pressure_recycle", "maintenance"} {
-		for _, manualFirst := range []bool{false, true} {
-			t.Run(fmt.Sprintf("%s/manual-release-first=%v", reason, manualFirst), func(t *testing.T) {
-				f := newRollAffinityFixture(t)
-				w := f.worker("combined", 0, false)
-				mustExec(f.ctx, t, f.pool, "UPDATE workers SET kind='hosted',hosted_size='m',template_declared='base' WHERE id=$1", w)
-				manualChange(t, f, w, true)
-				var err error
-				switch reason {
-				case "image_roll":
-					_, err = f.q.CordonHostedWorkerImageRoll(f.ctx, w)
-				case "pressure_recycle":
-					_, err = f.q.CordonHostedWorkerPressureRecycle(f.ctx, w)
-				default:
-					tx, e := f.pool.Begin(f.ctx)
-					if e != nil {
-						t.Fatal(e)
+		for _, establishManualFirst := range []bool{false, true} {
+			for _, manualFirst := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/manual-establish-first=%v/manual-release-first=%v", reason, establishManualFirst, manualFirst), func(t *testing.T) {
+					f := newRollAffinityFixture(t)
+					w := f.worker("combined", 0, false)
+					mustExec(f.ctx, t, f.pool, "UPDATE workers SET kind='hosted',hosted_size='m',template_declared='base' WHERE id=$1", w)
+					if establishManualFirst {
+						manualChange(t, f, w, true)
 					}
-					q := store.New(tx)
-					_, err = q.GetWorkerForUpdate(f.ctx, w)
-					if err == nil {
-						_, err = q.SetDindMaintenance(f.ctx, store.SetDindMaintenanceParams{ID: w, MaintenancePhase: "requested"})
-					}
-					if err == nil {
-						err = tx.Commit(f.ctx)
-					} else {
-						_ = tx.Rollback(f.ctx)
-					}
-				}
-				if err != nil {
-					t.Fatal(err)
-				}
-				if store.WorkerAcceptsNewIntake(manualRead(t, f, w)) {
-					t.Fatal("combined fence accepts intake")
-				}
-				releaseAuto := func() {
-					t.Helper()
+					var err error
 					switch reason {
 					case "image_roll":
-						_, err = f.q.UncordonHostedWorkerImageRoll(f.ctx, w)
+						_, err = f.q.CordonHostedWorkerImageRoll(f.ctx, w)
 					case "pressure_recycle":
-						_, err = f.q.UncordonHostedWorkerPressureRecycle(f.ctx, w)
+						_, err = f.q.CordonHostedWorkerPressureRecycle(f.ctx, w)
 					default:
 						tx, e := f.pool.Begin(f.ctx)
 						if e != nil {
@@ -134,7 +108,7 @@ func TestManualCordonAutomaticFenceCompositionLiveDB(t *testing.T) {
 						q := store.New(tx)
 						_, err = q.GetWorkerForUpdate(f.ctx, w)
 						if err == nil {
-							_, err = q.SetDindMaintenance(f.ctx, store.SetDindMaintenanceParams{ID: w, MaintenancePhase: "cancelled"})
+							_, err = q.SetDindMaintenance(f.ctx, store.SetDindMaintenanceParams{ID: w, MaintenancePhase: "requested"})
 						}
 						if err == nil {
 							err = tx.Commit(f.ctx)
@@ -145,27 +119,61 @@ func TestManualCordonAutomaticFenceCompositionLiveDB(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-				}
-				if manualFirst {
-					cleared := manualChange(t, f, w, false)
-					if cleared.ManualCordonedAt.Valid || store.WorkerAcceptsNewIntake(cleared) {
-						t.Fatal("uncordon released automatic fence")
+					if !establishManualFirst {
+						manualChange(t, f, w, true)
 					}
-					releaseAuto()
-				} else {
-					releaseAuto()
-					kept := manualRead(t, f, w)
-					if !kept.ManualCordonedAt.Valid || store.WorkerAcceptsNewIntake(kept) {
-						t.Fatal("automatic release erased manual intent")
+					if store.WorkerAcceptsNewIntake(manualRead(t, f, w)) {
+						t.Fatal("combined fence accepts intake")
 					}
-					manualChange(t, f, w, false)
-				}
-				if !store.WorkerAcceptsNewIntake(manualRead(t, f, w)) {
-					t.Fatal("both releases did not reopen intake")
-				}
-			})
+					releaseAuto := func() {
+						t.Helper()
+						switch reason {
+						case "image_roll":
+							_, err = f.q.UncordonHostedWorkerImageRoll(f.ctx, w)
+						case "pressure_recycle":
+							_, err = f.q.UncordonHostedWorkerPressureRecycle(f.ctx, w)
+						default:
+							tx, e := f.pool.Begin(f.ctx)
+							if e != nil {
+								t.Fatal(e)
+							}
+							q := store.New(tx)
+							_, err = q.GetWorkerForUpdate(f.ctx, w)
+							if err == nil {
+								_, err = q.SetDindMaintenance(f.ctx, store.SetDindMaintenanceParams{ID: w, MaintenancePhase: "cancelled"})
+							}
+							if err == nil {
+								err = tx.Commit(f.ctx)
+							} else {
+								_ = tx.Rollback(f.ctx)
+							}
+						}
+						if err != nil {
+							t.Fatal(err)
+						}
+					}
+					if manualFirst {
+						cleared := manualChange(t, f, w, false)
+						if cleared.ManualCordonedAt.Valid || store.WorkerAcceptsNewIntake(cleared) {
+							t.Fatal("uncordon released automatic fence")
+						}
+						releaseAuto()
+					} else {
+						releaseAuto()
+						kept := manualRead(t, f, w)
+						if !kept.ManualCordonedAt.Valid || store.WorkerAcceptsNewIntake(kept) {
+							t.Fatal("automatic release erased manual intent")
+						}
+						manualChange(t, f, w, false)
+					}
+					if !store.WorkerAcceptsNewIntake(manualRead(t, f, w)) {
+						t.Fatal("both releases did not reopen intake")
+					}
+				})
+			}
 		}
 	}
+
 }
 
 var errCordonFault = errors.New("injected cordon transaction failure")
