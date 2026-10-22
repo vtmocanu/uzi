@@ -18,7 +18,8 @@ import (
 // in SetRunCompletionHold: the run update and its wall-input settlement CTE.
 func TestCompletionHoldHistoricalAttemptAfterReclaimLiveDB(t *testing.T) {
 	fx := newWPFixture(t)
-	w := fx.worker("completion-reclaim", wpWorker{nonce: "completion-reclaim"})
+	protocolCaps := []string{"completion_interlock_v1"}
+	w := fx.worker("completion-reclaim", wpWorker{nonce: "completion-reclaim", protocolCaps: protocolCaps})
 	wid := pgtype.UUID{Bytes: w, Valid: true}
 	const oldGeneration int64 = 7
 	oldGen := pgtype.Int8{Int64: oldGeneration, Valid: true}
@@ -82,7 +83,7 @@ func TestCompletionHoldHistoricalAttemptAfterReclaimLiveDB(t *testing.T) {
 	reclaimed, err := fx.q.ClaimRun(fx.ctx, store.ClaimRunParams{
 		UserID: fx.userID, WorkerID: wid, Lane: "run",
 		AffinityCutoff: wpAgo(30 * time.Minute), SpreadCutoff: wpAgo(9 * time.Second),
-		HeartbeatCutoff: wpAgo(45 * time.Second),
+		HeartbeatCutoff: wpAgo(45 * time.Second), WorkerProtocolCaps: protocolCaps,
 	})
 	if err != nil {
 		t.Fatalf("ClaimRun after resume: %v", err)
