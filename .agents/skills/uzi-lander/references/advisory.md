@@ -36,15 +36,17 @@ explicitly authorizes public disclosure before the release.
 
 ## Publish (after the release)
 
-- Cite the first **stable** release carrying the fix. An RC-only patched version points
-  stable-channel users at a build they do not install, so ask `uzi-release` to promote.
-- Verify the tag contains every fix commit (`git merge-base --is-ancestor`) and is a
-  published non-prerelease.
+- Cite the first published release carrying the fix; an RC (`X.Y.Z-rc.N`) is allowed
+  without waiting for the stable. Stable-channel users do not install an RC, so say in
+  Patches that the fix reaches stable with the next promotion.
+- Verify the tag contains every fix commit (`git merge-base --is-ancestor`) and its
+  release is published (an RC's is a pre-release).
 - Update the advisory with a JSON payload file:
   `gh api -X PATCH repos/<owner>/<repo>/security-advisories/<GHSA> --input <file>`, carrying
   `summary`, the public `description` (Impact, Patches, Workarounds), `cwe_ids`, and full
   `vulnerabilities[]` entries: keep each existing `package` (`ecosystem`, `name`) and set
-  `vulnerable_version_range: "< X.Y.Z"` and `patched_versions: "X.Y.Z"`.
+  `vulnerable_version_range: "< <version>"` and `patched_versions: "<version>"`, where
+  `<version>` is the cited tag without `v` (RC suffix included).
 - Close every fork PR first; publishing refuses (422, "a workspace with no open pull
   requests") while one is open. Use
   `gh api -X PATCH repos/<owner>/<fork>/pulls/<n> -f state=closed`; `gh pr close --comment`

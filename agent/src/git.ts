@@ -1,5 +1,5 @@
 import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
-import { CheckpointSoftDeadlineError, CheckpointUnsafeCleanupError, GitBoundaryAbortError } from "./checkpoint-stop.js";
+import { isCheckpointBoundaryFailure, CheckpointSoftDeadlineError, CheckpointUnsafeCleanupError, GitBoundaryAbortError } from "./checkpoint-stop.js";
 import { MaintenanceResources } from "./recovery-maintenance.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
 import { CodexLaunchError, launchCodexEffectRoot, SUPERVISOR_BIN, type CodexRootHandle } from "./codex/launcher.js";
@@ -4604,10 +4604,9 @@ export class GitCache {
           // A refusal can leave stage as the sole anchor if metadata/pinning failed.
           // Delete it only after an independently verified durable anchor exists.
           try {
-            if (await this.hasOwedAnchorUnderLock(barePath, opts.context.runId, incoming)) {
+            if (result.kind === "updated" && await this.checkedTrackingSha(barePath, branch) === incoming) {
               await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
-            } else if (result.kind === "updated" &&
-                await this.checkedTrackingSha(barePath, branch) === incoming) {
+            } else if (await this.hasOwedAnchorUnderLock(barePath, opts.context.runId, incoming)) {
               await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
             } else if (result.kind === "not_updated" && result.reason === "owed_limit") {
               // At the cap the incoming head is deliberately unpreserved (the run is stopped and its
@@ -4756,11 +4755,14 @@ export class GitCache {
     await this.validateOwedContext(barePath, branch, opts.context);
     this.validateConfirmedSha(opts.remotelyConfirmedSha);
     await this.requireOwedCommit(barePath, sha);
+    opts.checkpointStep?.("checkpoint_lock_wait");
     return this.withLock(barePath, async () => {
+      opts.checkpointStep?.("checkpoint_bridge");
       const observed = await this.observeTrackingUnderLock(barePath, branch);
       if (!observed) return { kind: "not_updated", reason: "ownership_unknown" };
       this.checkCheckpointCooperation();
-      const result = await this.promoteTrackingUnderLock(barePath, branch, sha, observed, opts);
+      // Adoption stays in checkpoint_bridge; promotion's import substeps belong to fetchAgentBranch.
+      const result = await this.promoteTrackingUnderLock(barePath, branch, sha, observed, { ...opts, checkpointStep: undefined });
       if (result.kind === "not_updated") {
         await this.maskCheckpointCooperation(async () => this.checkCheckpointCooperation());
         return result;
@@ -14864,8 +14866,8 @@ try {
    *   - `{ kind: "noop" }` — NOTHING was actually missing (every floor already an ancestor of H, a
    *     fast-forward): there was nothing to bridge, and no ancestry read was transiently `"unknown"`.
    *   - `{ kind: "failed" }` — malformed input, a git error, or a transient `"unknown"` ancestry read
-   *     that could not be resolved to a clean no-op (best-effort — a bridge that cannot be built never
-   *     throws here; the caller decides how to fail). A `"failed"` is NEVER conflated with a clean
+   *     that could not be resolved to a clean no-op (ordinary best-effort failure). Typed soft/hard
+   *     boundary, unsafe cleanup and authority failures propagate. A `"failed"` is NEVER conflated with a clean
    *     no-op, so a fast-forwardable run is not mistaken for a genuine synthesis failure and vice
    *     versa.
    */
@@ -14969,6 +14971,7 @@ try {
       });
       return { kind: "built", sha };
     } catch (e) {
+      if (isCheckpointBoundaryFailure(e)) throw e;
       this.log.warn("PRD #1416 M3: ancestry bridge synthesis failed", {
         tip,
         error: gitErrorMessage(e),
@@ -16606,7 +16609,8 @@ try {
 
   /** Local committed ownership only; this is never confirmation of remote containment. */
   async committedTrackingOwnership(barePath: string, branch: string, runId: string,
-    expectedSha?: string, generation?: number): Promise<CommittedTrackingOwnership> {
+    expectedSha?: string, generation?: number,
+    trace?: { waiting: () => void; acquired: () => void }): Promise<CommittedTrackingOwnership> {
     if (typeof runId !== "string" || !OWED_RUN_ID.test(runId) ||
         typeof branch !== "string" || typeof barePath !== "string" ||
         (expectedSha !== undefined && (typeof expectedSha !== "string" || !OWED_OID.test(expectedSha))) ||
@@ -16619,7 +16623,11 @@ try {
       if (abort) throw abort;
       return { kind: "not_owned" };
     }
-    return this.withLock(barePath, () => this.committedTrackingOwnershipUnderLock(barePath, branch, runId, expectedSha, generation));
+    trace?.waiting();
+    return this.withLock(barePath, () => {
+      trace?.acquired();
+      return this.committedTrackingOwnershipUnderLock(barePath, branch, runId, expectedSha, generation);
+    });
   }
 
   /** {@link committedTrackingOwnership} for a caller that already holds the bare lock. The
@@ -17167,12 +17175,15 @@ try {
   }
 
   /** Only a server-confirmed full commit and positive ancestry proof release an owed pin. */
-  async reconcileOwedCandidates(barePath: string, runId: string, remotelyConfirmedSha: string):
+  async reconcileOwedCandidates(barePath: string, runId: string, remotelyConfirmedSha: string,
+    onStep?: (step: BoundaryStep) => void):
     Promise<{ removedShas: string[]; retainedShas: string[] }> {
     if (typeof runId !== "string" || !OWED_RUN_ID.test(runId)) throw new Error("invalid owed run ID");
     this.validateConfirmedSha(remotelyConfirmedSha);
     await this.assertOwedBare(barePath);
+    onStep?.("checkpoint_lock_wait");
     return this.withLock(barePath, async () => {
+      onStep?.("checkpoint_upload");
       const candidates = await this.enumerateOwedUnderLock(barePath, runId);
       const removedShas: string[] = [], retainedShas: string[] = [];
       for (const candidate of candidates) {

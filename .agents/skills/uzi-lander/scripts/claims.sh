@@ -85,12 +85,13 @@ owner_live() {
   if [ -n "$ls" ] && [ "$(( $(date +%s) - $(iso2epoch "$ls") ))" -gt "$(( STALE_HOURS * 3600 ))" ]; then echo dead; else echo unknown; fi
 }
 
-# key_lock <key>: take the per-key mkdir lock (atomic on POSIX); released on exit. A lock
-# older than 60 s belongs to a crashed holder and is broken. Exit 3 when it stays busy.
+# key_lock <key>: take the per-key directory lock via mkdir(2); released on exit. A lock
+# older than 60 s is treated as stale and broken. Exit 3 when it stays busy.
 key_lock() {
+  command -v python3 >/dev/null 2>&1 || { echo "python3 is required for atomic claim locks" >&2; exit 3; }
   lock="$CL/.lock.$1"; local got=0 lage
   for _ in 1 2 3 4 5 6 7 8 9 10; do
-    if mkdir "$lock" 2>/dev/null; then got=1; break; fi
+    if atomic_mkdir "$lock" 2>/dev/null; then got=1; break; fi
     lage=$(( $(date +%s) - $(stat -c %Y "$lock" 2>/dev/null || stat -f %m "$lock" 2>/dev/null || date +%s) ))
     [ "$lage" -gt 60 ] && rm -rf "$lock"
     sleep 0.3

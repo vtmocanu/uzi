@@ -375,7 +375,7 @@ if [ -n "$SD" ]; then
   LOCK="$SD/locks/merge"
   me=$(self_identity) || { echo "cannot verify merge-lock owner" >&2; exit 3; }
   my_uuid=$(printf '%s' "$me" | cut -f2); my_name=$(printf '%s' "$me" | cut -f1)
-  if ! mkdir "$LOCK" 2>/dev/null; then
+  if ! atomic_mkdir "$LOCK" 2>/dev/null; then
     o_uuid=$(cat "$LOCK/uuid" 2>/dev/null || echo ""); o_name=$(cat "$LOCK/name" 2>/dev/null || echo "?")
     age=$(( $(date +%s) - $(stat -c %Y "$LOCK" 2>/dev/null || stat -f %m "$LOCK" 2>/dev/null || date +%s) ))
     # Break the lock when it is ours, older than the TTL, or its owner is provably dead
@@ -383,7 +383,7 @@ if [ -n "$SD" ]; then
     dead=0
     if [ -n "$o_uuid" ]; then is_live "$o_uuid"; [ $? -eq 1 ] && dead=1; fi
     if [ "$o_uuid" = "$my_uuid" ] || [ "$age" -gt 600 ] || [ "$dead" -eq 1 ]; then
-      rm -rf "$LOCK"; mkdir "$LOCK" 2>/dev/null || { echo "cannot take the merge lock" >&2; exit 3; }
+      rm -rf "$LOCK"; atomic_mkdir "$LOCK" 2>/dev/null || { echo "cannot take the merge lock" >&2; exit 3; }
     else
       echo "MERGE_LOCK_HELD_BY=$o_name ($o_uuid, ${age}s) — another lander is merging; wait for its main CI run to appear, then re-run"; exit 7
     fi

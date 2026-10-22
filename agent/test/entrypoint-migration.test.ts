@@ -890,6 +890,43 @@ describe("PRD #1493 M2: root-branch migration ownership map (portable, record-on
     }
   });
 
+  it("nix store: every boot drops group write (reclaim, chmod 1755, hand back to runner:runner)", () => {
+    const h = makeHarness();
+    try {
+      fs.mkdirSync(h.data);
+      fs.mkdirSync(path.join(h.nix, "store"), { recursive: true });
+      fs.writeFileSync(h.token, "t");
+      const store = path.join(h.nix, "store");
+      for (const boot of [1, 2]) {
+        fs.writeFileSync(h.opLog, "");
+        const r = run(h, { STUB_NOOP: "1" });
+        assert.equal(r.status, 0, `boot ${boot} must succeed (stderr: ${r.stderr})`);
+        const ops = r.ops.filter((o) => opPathArg(o) === store);
+        assert.deepEqual(ops, [`chown 0:0 ${store}`, `chmod 1755 ${store}`, `chown runner:runner ${store}`], `boot ${boot}: store repair ops`);
+      }
+    } finally {
+      fs.rmSync(h.root, { recursive: true, force: true });
+    }
+  });
+
+  it("nix store: a symlinked store fails closed and is never chowned or chmodded", () => {
+    const h = makeHarness();
+    try {
+      fs.mkdirSync(h.data);
+      fs.mkdirSync(h.nix);
+      const target = path.join(h.root, "elsewhere");
+      fs.mkdirSync(target);
+      fs.symlinkSync(target, path.join(h.nix, "store"));
+      fs.writeFileSync(h.token, "t");
+      const r = run(h, { STUB_NOOP: "1" });
+      assert.notEqual(r.status, 0, "a symlinked /nix/store must refuse to start");
+      assert.match(r.stderr, /refusing to start: .*\/store is a symlink/);
+      assert.ok(!r.ops.some((o) => opPathArg(o) === path.join(h.nix, "store") || opPathArg(o) === target), "no op may touch the store link or its target");
+    } finally {
+      fs.rmSync(h.root, { recursive: true, force: true });
+    }
+  });
+
   it("sticky carve-out: the three parents get 3775 (setgid+group-write+STICKY), never 2775", () => {
     const h = makeHarness();
     try {

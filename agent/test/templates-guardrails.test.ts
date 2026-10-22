@@ -594,6 +594,12 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
         text.indexOf("chmod -R a+rX /nix") > text.search(/timeout \d+ "\$AGENT_BROWSER_EXECUTABLE_PATH"/),
         `${name}/Dockerfile must run the /nix store-perm chmod AFTER the build-guard chromium launch (the guard, running as root, is what creates the root:root 0700 dir — normalizing before it is a no-op)`,
       );
+      // The store root must leave the image owner-writable only (group `runner` includes
+      // runner-cmd); it must follow the a+rX normalization, which never removes bits.
+      assert.ok(
+        text.indexOf("chmod g-w /nix/store") > text.indexOf("chmod -R a+rX /nix"),
+        `${name}/Dockerfile must drop group write on /nix/store after the a+rX normalization`,
+      );
     });
 
     it(`${name}: packages the pinned Codex native bundle + runner-uid guard in lockstep (PRD #1156 M3a)`, () => {

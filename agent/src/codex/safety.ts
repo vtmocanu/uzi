@@ -168,6 +168,9 @@ const STEP_LABELS: Record<BoundaryStep, string> = {
   checkpoint_import_readback: "checkpoint-import-readback",
   checkpoint_code_head: "checkpoint-code-head",
   checkpoint_bridge: "checkpoint-bridge",
+  checkpoint_post_import: "checkpoint-post-import",
+  checkpoint_steer: "checkpoint-steer",
+  checkpoint_post_bridge: "checkpoint-post-bridge",
 };
 
 function isBoundaryStep(value: unknown): value is BoundaryStep {
