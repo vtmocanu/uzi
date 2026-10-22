@@ -674,6 +674,9 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 				}); ok {
 					if childID, err := reader.GetPlanCrossCheckChildForHealth(ctx, r.ID); err == nil {
 						if counts, err := s.workerEligibilityForHealth(ctx, now, childID, s.capabilityAwareOn(ctx)); err == nil {
+							if reason := manualCordonWaitReason(counts); reason != "" {
+								return healthWaitingWorker, reason
+							}
 							if reason := rollWaitReason(now, counts); reason != "" {
 								return healthWaitingWorker, reason
 							}
@@ -1188,6 +1191,9 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 			slog.Error("health: read child eligibility", "run_id", r.ID, "error", err)
 			return reasonPlanCrossCheckWaiting
 		}
+		if reason := manualCordonWaitReason(counts); reason != "" {
+			return reason
+		}
 		if reason := rollWaitReason(now, counts); reason != "" {
 			return reason
 		}
@@ -1204,6 +1210,8 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	eligibility, eligibilityErr := s.workerEligibilityForHealth(ctx, now, r.ID, capAware)
 	if eligibilityErr != nil {
 		slog.Error("health: read current worker eligibility", "run_id", r.ID, "error", eligibilityErr)
+	} else if reason := manualCordonWaitReason(eligibility); reason != "" {
+		return reason
 	} else if reason := rollWaitReason(now, eligibility); reason != "" {
 		return reason
 	} else if DrainOnlyEligibleForHealth(eligibility) {
@@ -1404,13 +1412,17 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 				capableIgnoringCodexLead := false
 				claudeChecker := run.Kind == "cross_check" && run.Harness == harnessClaude
 				for _, worker := range workers {
-					if worker.Status == "online" && !worker.DrainingSince.Valid && !worker.Ephemeral && !worker.IsolatedLane &&
+					if worker.Status == "online" && store.WorkerAcceptsNewIntake(store.Worker{
+						ManualCordonedAt:  worker.ManualCordonedAt,
+						DrainingSince:     worker.DrainingSince,
+						MaintenanceFenced: worker.MaintenanceFenced,
+						MaintenancePhase:  worker.MaintenancePhase,
+					}) && !worker.Ephemeral && !worker.IsolatedLane &&
 						slices.Contains(worker.ProtocolCapabilities, capability.CrossCheckV1) &&
 						slices.Contains(worker.ProtocolCapabilities, requiredProtocol) &&
 						(!r.CrossCheckPinRequired || slices.Contains(worker.ProtocolCapabilities, capability.CrossCheckPinsV1)) &&
 						(!r.CodexCustomRoot || slices.Contains(worker.ProtocolCapabilities, capability.CodexCustomModelV1)) &&
-						(run.Harness != harnessCodex || (slices.Contains(worker.ProtocolCapabilities, capability.CodexHarnessV1) && slices.Contains(worker.ProtocolCapabilities, capability.CodexRuntimeV2))) &&
-						!worker.MaintenanceFenced && worker.MaintenancePhase != "requested" && worker.MaintenancePhase != "ready" && worker.MaintenancePhase != "stopping" && worker.MaintenancePhase != "recycling" {
+						(run.Harness != harnessCodex || (slices.Contains(worker.ProtocolCapabilities, capability.CodexHarnessV1) && slices.Contains(worker.ProtocolCapabilities, capability.CodexRuntimeV2))) {
 						capableIgnoringCodexLead = true
 						if !claudeChecker || slices.Contains(worker.ProtocolCapabilities, capability.CrossCheckCodexLeadV1) {
 							capable = true

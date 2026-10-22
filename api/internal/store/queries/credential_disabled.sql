@@ -297,7 +297,7 @@ FOR UPDATE;
 -- not hold affinity will not be the next claimant, so its binding is not the requirement.
 -- name: LockWorkerBindingForShare :one
 SELECT anthropic_bind_mode, anthropic_secret_id,
-       (draining_since IS NOT NULL
+       (NOT fn_worker_accepts_new_intake(workers)
         OR (last_heartbeat_at IS NOT NULL AND last_heartbeat_at >= @heartbeat_cutoff::timestamptz))::boolean
            AS holds_affinity
 FROM workers

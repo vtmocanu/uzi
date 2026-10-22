@@ -959,7 +959,7 @@ WITH claimant AS MATERIALIZED (
     SELECT r.id, r.user_id, r.repo_id, r.kind, r.claim_generation, r.egress_profile_id FROM runs r
     WHERE r.user_id = @user_id
       AND EXISTS (SELECT 1 FROM claimant c WHERE NOT c.maintenance_fenced
-        AND (c.draining_since IS NULL AND c.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+        AND (fn_worker_accepts_new_intake(c)
              OR r.worker_id = c.id))
       AND r.kind <> 'chat' AND NOT r.cross_check_lane
       AND ((COALESCE(@lane::text, '') IN ('', 'run', 'ordinary') AND r.kind <> 'cross_check')
@@ -1015,7 +1015,7 @@ WITH claimant AS MATERIALIZED (
            OR NOT EXISTS (
                SELECT 1 FROM workers ow
                WHERE ow.id = r.worker_id
-                 AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced
+                 AND (NOT fn_worker_accepts_new_intake(ow) OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced
                       OR (ow.last_heartbeat_at IS NOT NULL
                           AND ow.last_heartbeat_at >= @heartbeat_cutoff)
                       -- #2705 pin P: a run the stale sweeper requeued (stale_requeue_generation
@@ -1338,7 +1338,7 @@ WITH claimant AS MATERIALIZED (
                 AND p.last_heartbeat_at >= @heartbeat_cutoff
                 -- A draining peer claims nothing (PRD #422 Decision 7), so never DEFER a
                 -- run to it — it would never pick the run up.
-                AND p.draining_since IS NULL AND NOT p.maintenance_fenced AND p.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+                AND fn_worker_accepts_new_intake(p)
                 -- PRD #529 Decision 4: an ephemeral peer claims ONLY its own bound run
                 -- (ClaimRun's claimant clause above), so it would never pick up a
                 -- FOREIGN run — same failure mode as the draining-peer guard. Deferring
@@ -1350,7 +1350,7 @@ WITH claimant AS MATERIALIZED (
                 -- (the claimant clause's lease arm), advisory like this whole mirror, so now().
                 AND (NOT p.ephemeral OR p.ephemeral_run_id = r.id
                      OR (fn_ephemeral_lease_admits(
-                            p.lease_since, p.lease_repo_id, p.lease_branch, p.draining_since IS NOT NULL,
+                            p.lease_since, p.lease_repo_id, p.lease_branch, NOT fn_worker_accepts_new_intake(p),
                             @ephemeral_lease::interval, now(),
                             r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
                    AND (NOT fn_ephemeral_docker_preference_applies((SELECT owner.ephemeral_docker_enabled FROM users owner WHERE owner.id = r.user_id), @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]) OR COALESCE(p.docker_enabled, false))))
@@ -9749,7 +9749,7 @@ SELECT id, user_id, status, auto_approve,
        COALESCE(runs.status = 'queued' AND runs.kind <> 'cross_check'
                 AND runs.worker_id IS NOT NULL
                 AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = runs.worker_id
-                            AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced)), false)::boolean AS owner_hold_pinnable,
+                            AND (NOT fn_worker_accepts_new_intake(ow) OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced)), false)::boolean AS owner_hold_pinnable,
        COALESCE((SELECT ow.name FROM workers ow WHERE ow.id = runs.worker_id), '')::text AS stale_requeue_worker_name,
        (runs.kind = 'cross_check' AND EXISTS (SELECT 1 FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = runs.id WHERE pin.user_id = runs.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness AND (pin.model IS NOT NULL OR pin.effort IS NOT NULL)))::boolean AS cross_check_pin_required,
        (SELECT MIN(evidence.since) FROM (
@@ -9931,7 +9931,12 @@ WHERE w.user_id = @user_id
 -- Issue #2184: preserve the advisory availability projection separately from strict health
 -- eligibility. Static requirements compose on ONE candidate; strict counts ignore slots.
 WITH candidates AS (
-SELECT w.id, rh.pacing, rh.pacing_observed_at, rh.blocking_reason, rh.phase,
+SELECT w.id,
+       (run.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, run, false, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = run.id), @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))::boolean AS strict_candidate,
+       fn_worker_accepts_new_intake(w)::boolean AS accepts_intake,
+       w.maintenance_fenced AS hard_fenced,
+       w.manual_cordoned_at, w.manual_cordoned_by, w.manual_cordoned_by_label, w.manual_cordon_reason,
+       rh.pacing, rh.pacing_observed_at, rh.blocking_reason, rh.phase,
        (w.last_heartbeat_at IS NOT NULL AND w.last_heartbeat_at >= @heartbeat_cutoff)::boolean AS heartbeat_recent,
        (run.egress_profile_id IS NULL)::boolean AS diagnostic_lane,
        (run.kind <> 'cross_check' OR run.worker_id IS NULL OR run.worker_id = w.id
@@ -9951,13 +9956,13 @@ SELECT w.id, rh.pacing, rh.pacing_observed_at, rh.blocking_reason, rh.phase,
        (CASE WHEN run.kind = 'cross_check' THEN fn_cross_check_child_eligible(w, run, true, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = run.id), @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz)
              ELSE w.max_concurrent_runs IS NULL OR wa.active < w.max_concurrent_runs END) AS free_slot,
        (run.kind = 'cross_check' OR NOT w.ephemeral OR w.ephemeral_run_id = run.id OR (fn_ephemeral_lease_admits(
-              w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
+              w.lease_since, w.lease_repo_id, w.lease_branch, false,
               @ephemeral_lease::interval, now(),
               run.repo_id, run.kind, run.branch, run.pipeline_ref, run.issue_iid, run.failure_snapshot, run.egress_profile_id)
                    AND (NOT fn_ephemeral_docker_preference_applies(owner.ephemeral_docker_enabled, @worker_docker_enabled::boolean, run.repo_id, run.kind, run.egress_profile_id, @docker_repo_allowlist::uuid[]) OR COALESCE(w.docker_enabled, false)))) AS advisory_binding,
        (run.kind = 'cross_check' OR NOT w.ephemeral OR w.ephemeral_run_id = run.id OR (
            (fn_ephemeral_lease_admits(
-              w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
+              w.lease_since, w.lease_repo_id, w.lease_branch, false,
               @ephemeral_lease::interval, now(),
               run.repo_id, run.kind, run.branch, run.pipeline_ref, run.issue_iid, run.failure_snapshot, run.egress_profile_id)
                    AND (NOT fn_ephemeral_docker_preference_applies(owner.ephemeral_docker_enabled, @worker_docker_enabled::boolean, run.repo_id, run.kind, run.egress_profile_id, @docker_repo_allowlist::uuid[]) OR COALESCE(w.docker_enabled, false)))
@@ -9968,7 +9973,7 @@ SELECT w.id, rh.pacing, rh.pacing_observed_at, rh.blocking_reason, rh.phase,
        (NOT w.ephemeral) AS persistent,
        (run.kind = 'cross_check' OR run.worker_id IS NULL OR run.worker_id = w.id
         OR NOT EXISTS (SELECT 1 FROM workers ow WHERE ow.id = run.worker_id
-                       AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced OR
+                       AND (NOT fn_worker_accepts_new_intake(ow) OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced OR
                             (ow.last_heartbeat_at IS NOT NULL AND ow.last_heartbeat_at >= @heartbeat_cutoff)
                             -- #2705 pin P, mirroring ClaimRun's stale-requeue grace arm.
                             OR (run.kind <> 'cross_check'
@@ -9986,7 +9991,9 @@ CROSS JOIN LATERAL (
       AND pr.kind <> 'chat' AND NOT pr.cross_check_lane
 ) wa
 WHERE run.id = @run_id
-  AND (run.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, run, false, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = run.id), @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))
+  -- Manual diagnostics include statically suitable hard-fenced peers in their denominator.
+  -- strict_candidate retains fn_cross_check_child_eligible's actual fence for existing counts.
+  AND (run.kind <> 'cross_check' OR fn_cross_check_child_eligible(jsonb_populate_record(w, '{"maintenance_fenced":false}'::jsonb), run, false, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = run.id), @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))
   AND fn_worker_can_claim(
         COALESCE(w.docker_enabled, false),
         @docker_repo_allowlist::uuid[],
@@ -10065,20 +10072,26 @@ WHERE run.id = @run_id
        OR run.released_worker_id <> w.id
        OR run.released_worker_nonce IS DISTINCT FROM w.snapshot_register_nonce)
 )
-SELECT count(*) FILTER (WHERE heartbeat_recent AND online AND affinity AND strict_binding)::bigint AS strict_eligible,
-       count(*) FILTER (WHERE heartbeat_recent AND (draining_since IS NULL OR own_worker) AND free_slot AND advisory_binding)::bigint AS claimable,
-       count(*) FILTER (WHERE heartbeat_recent AND online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::bigint AS draining_eligible,
-       count(*) FILTER (WHERE heartbeat_recent AND online AND draining_since IS NULL AND affinity AND strict_binding)::bigint AS non_draining_eligible,
-       count(*) FILTER (WHERE heartbeat_recent AND online AND draining_since IS NOT NULL AND own_worker AND affinity AND strict_binding)::bigint AS suitable_own_draining,
-       max(draining_since) FILTER (WHERE heartbeat_recent AND online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::timestamptz AS latest_suitable_draining_since
-       , count(*) FILTER (WHERE diagnostic_lane AND diagnostic_affinity AND affinity AND strict_binding)::bigint AS diagnostic_suitable
-       , count(*) FILTER (WHERE diagnostic_lane AND diagnostic_affinity AND affinity AND strict_binding AND through_roll)::bigint AS diagnostic_rolling
-       , count(*) FILTER (WHERE diagnostic_lane AND diagnostic_affinity AND affinity AND strict_binding AND through_roll
+SELECT count(*) FILTER (WHERE strict_candidate AND heartbeat_recent AND online AND NOT hard_fenced AND affinity AND strict_binding)::bigint AS strict_eligible,
+       count(*) FILTER (WHERE strict_candidate AND heartbeat_recent AND online AND NOT hard_fenced AND (accepts_intake OR own_worker) AND affinity AND free_slot AND advisory_binding)::bigint AS claimable,
+       count(*) FILTER (WHERE strict_candidate AND heartbeat_recent AND online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::bigint AS draining_eligible,
+       count(*) FILTER (WHERE strict_candidate AND heartbeat_recent AND online AND accepts_intake AND affinity AND strict_binding)::bigint AS non_draining_eligible,
+       count(*) FILTER (WHERE strict_candidate AND heartbeat_recent AND online AND draining_since IS NOT NULL AND own_worker AND affinity AND strict_binding)::bigint AS suitable_own_draining,
+       max(draining_since) FILTER (WHERE strict_candidate AND heartbeat_recent AND online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::timestamptz AS latest_suitable_draining_since
+       , count(*) FILTER (WHERE strict_candidate AND diagnostic_lane AND diagnostic_affinity AND affinity AND strict_binding)::bigint AS diagnostic_suitable
+       , count(*) FILTER (WHERE strict_candidate AND diagnostic_lane AND diagnostic_affinity AND affinity AND strict_binding AND through_roll)::bigint AS diagnostic_rolling
+       , count(*) FILTER (WHERE strict_candidate AND diagnostic_lane AND diagnostic_affinity AND affinity AND strict_binding AND through_roll
                              AND heartbeat_recent AND online AND draining_since IS NOT NULL
                              AND pacing->>'state' = 'active' AND phase = 'settled')::bigint AS diagnostic_draining_only
        , (SELECT jsonb_build_object('pacing', c.pacing, 'observed_at', c.pacing_observed_at, 'blocking_reason', c.blocking_reason)
-          FROM candidates c WHERE c.diagnostic_lane AND c.diagnostic_affinity AND c.affinity AND c.strict_binding AND c.through_roll
+          FROM candidates c WHERE c.strict_candidate AND c.diagnostic_lane AND c.diagnostic_affinity AND c.affinity AND c.strict_binding AND c.through_roll
           ORDER BY (c.pacing->>'state' = 'held') DESC, c.id LIMIT 1)::jsonb AS diagnostic_roll_context
+       , count(*) FILTER (WHERE heartbeat_recent AND online AND diagnostic_affinity AND affinity AND strict_binding)::bigint AS manual_suitable
+       , count(*) FILTER (WHERE heartbeat_recent AND online AND diagnostic_affinity AND affinity AND strict_binding AND manual_cordoned_at IS NOT NULL)::bigint AS manual_cordoned
+       , (SELECT jsonb_build_object('worker_id', c.id, 'actor_id', c.manual_cordoned_by,
+                 'actor_label', c.manual_cordoned_by_label, 'at', c.manual_cordoned_at, 'reason', c.manual_cordon_reason)
+          FROM candidates c WHERE c.heartbeat_recent AND c.online AND c.diagnostic_affinity AND c.affinity AND c.strict_binding AND c.manual_cordoned_at IS NOT NULL
+          ORDER BY c.id LIMIT 1)::jsonb AS manual_context
 FROM candidates;
 
 -- name: ListDockerBlockedReposForUser :many
@@ -10131,7 +10144,7 @@ WHERE w.user_id = @user_id
   AND w.status = 'online'
   -- A draining worker has no free slot for NEW work (it claims nothing), so the
   -- queued-run reason resolver must not count it as an idle worker (PRD #422 Decision 7).
-  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+  AND fn_worker_accepts_new_intake(w)
   -- AND NOT w.ephemeral (PRD #529 M2, Correction B; issue #1624): an ephemeral worker is
   -- bound to ONE run (it can claim only its ephemeral_run_id), so it never has a free
   -- slot for ANOTHER run, even when idle, with a NULL cap, or below an advertised cap.
@@ -10171,7 +10184,7 @@ WHERE w.user_id = @user_id
 SELECT count(*) FROM workers w
 WHERE w.user_id = @user_id
   AND w.status = 'online'
-  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+  AND fn_worker_accepts_new_intake(w)
   AND NOT w.ephemeral
   -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
   -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
@@ -10201,7 +10214,7 @@ WHERE w.user_id = @user_id
 SELECT count(*) FROM workers w
 WHERE w.user_id = @user_id
   AND w.status = 'online'
-  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+  AND fn_worker_accepts_new_intake(w)
   AND NOT w.ephemeral
   -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
   -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
@@ -10218,7 +10231,7 @@ WHERE w.user_id = @user_id
 SELECT count(*) FROM workers w
 WHERE w.user_id = @user_id
   AND w.status = 'online'
-  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+  AND fn_worker_accepts_new_intake(w)
   AND NOT w.ephemeral
   AND NOT w.isolated_lane
   AND 'ci_config_guard_v1' = ANY(w.protocol_capabilities);
@@ -10245,7 +10258,7 @@ WHERE w.user_id = @user_id
 SELECT count(*) FROM workers w
 WHERE w.user_id = @user_id
   AND w.status = 'online'
-  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+  AND fn_worker_accepts_new_intake(w)
   AND NOT w.ephemeral
   -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
   -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
@@ -10258,7 +10271,7 @@ WHERE w.user_id = @user_id
 SELECT count(*) FROM workers w
 WHERE w.user_id = @user_id
   AND w.status = 'online'
-  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+  AND fn_worker_accepts_new_intake(w)
   AND NOT w.ephemeral
   -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
   -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
@@ -10273,7 +10286,7 @@ WHERE w.user_id = @user_id
 SELECT count(*) FROM workers w
 WHERE w.user_id = @user_id
   AND w.status = 'online'
-  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+  AND fn_worker_accepts_new_intake(w)
   AND NOT w.ephemeral
   -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
   -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
@@ -10307,7 +10320,7 @@ WHERE w.user_id = @user_id
 SELECT count(*) FROM workers w
 WHERE w.user_id = @user_id
   AND w.status = 'online'
-  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+  AND fn_worker_accepts_new_intake(w)
   AND NOT w.ephemeral
   -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
   -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
@@ -10327,7 +10340,7 @@ WHERE w.user_id = @user_id
 SELECT count(*) FROM workers w
 WHERE w.user_id = @user_id
   AND w.status = 'online'
-  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+  AND fn_worker_accepts_new_intake(w)
   AND NOT w.ephemeral
   AND NOT COALESCE(w.docker_enabled, false)
   AND 'job_runner_v1' = ANY(w.protocol_capabilities)
@@ -10396,7 +10409,7 @@ WHERE r.status = 'queued'
         r.worker_id IS NOT NULL AND r.kind <> 'cross_check'
     AND r.updated_at >= @affinity_cutoff::timestamptz
     AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = r.worker_id
-                AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced)), false)
+                AND (NOT fn_worker_accepts_new_intake(ow) OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced)), false)
   -- #2705: a run that ClaimRun is holding for its returning worker is not demand yet. This is
   -- the "effective pin" E, the claim pin plus the affinity ceiling, so it is true only while
   -- ClaimRun really blocks every peer:
@@ -10434,7 +10447,7 @@ WHERE r.status = 'queued'
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
         AND NOT w.maintenance_fenced
-        AND ((w.draining_since IS NULL AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling'))
+        AND ((fn_worker_accepts_new_intake(w))
              OR (r.kind = 'cross_check' AND r.worker_id = w.id))
         AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, false, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = r.id), @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))
         AND (r.kind = 'cross_check' OR NOT w.ephemeral
@@ -10442,7 +10455,7 @@ WHERE r.status = 'queued'
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
              -- provisioned for.
              OR (fn_ephemeral_lease_admits(
-                    w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
+                    w.lease_since, w.lease_repo_id, w.lease_branch, NOT fn_worker_accepts_new_intake(w),
                     @ephemeral_lease::interval, now(),
                     r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
                    AND (NOT fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]) OR COALESCE(w.docker_enabled, false))
@@ -10508,7 +10521,7 @@ WHERE r.status = 'queued'
       SELECT 1 FROM workers wj
       WHERE wj.user_id = r.user_id
         AND wj.status = 'online'
-        AND wj.draining_since IS NULL AND NOT wj.maintenance_fenced AND wj.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+        AND fn_worker_accepts_new_intake(wj)
         AND NOT wj.ephemeral
         AND NOT COALESCE(wj.docker_enabled, false)
         AND 'job_runner_v1' = ANY(wj.protocol_capabilities)
@@ -10615,7 +10628,7 @@ WHERE r.status = 'queued'
         r.worker_id IS NOT NULL AND r.kind <> 'cross_check'
     AND r.updated_at >= @affinity_cutoff::timestamptz
     AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = r.worker_id
-                AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced)), false)
+                AND (NOT fn_worker_accepts_new_intake(ow) OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced)), false)
   -- #2705: a run that ClaimRun is holding for its returning worker is not demand yet. This is
   -- the "effective pin" E, the claim pin plus the affinity ceiling, so it is true only while
   -- ClaimRun really blocks every peer:
@@ -10641,7 +10654,7 @@ WHERE r.status = 'queued'
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
         AND NOT w.maintenance_fenced
-        AND ((w.draining_since IS NULL AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling'))
+        AND ((fn_worker_accepts_new_intake(w))
              OR (r.kind = 'cross_check' AND r.worker_id = w.id))
         AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, false, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = r.id), @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))
         AND (r.kind = 'cross_check' OR NOT w.ephemeral
@@ -10649,7 +10662,7 @@ WHERE r.status = 'queued'
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
              -- provisioned for.
              OR (fn_ephemeral_lease_admits(
-                    w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
+                    w.lease_since, w.lease_repo_id, w.lease_branch, NOT fn_worker_accepts_new_intake(w),
                     @ephemeral_lease::interval, now(),
                     r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
                    AND (NOT fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]) OR COALESCE(w.docker_enabled, false))
@@ -10718,7 +10731,7 @@ WHERE r.status = 'queued'
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
         AND NOT w.maintenance_fenced
-        AND ((w.draining_since IS NULL AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling'))
+        AND ((fn_worker_accepts_new_intake(w))
              OR (r.kind = 'cross_check' AND r.worker_id = w.id))
         AND (r.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, r, true, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = r.id), @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))
         AND (r.kind = 'cross_check' OR NOT w.ephemeral
@@ -10726,7 +10739,7 @@ WHERE r.status = 'queued'
              -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
              -- provisioned for.
              OR (fn_ephemeral_lease_admits(
-                    w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
+                    w.lease_since, w.lease_repo_id, w.lease_branch, NOT fn_worker_accepts_new_intake(w),
                     @ephemeral_lease::interval, now(),
                     r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
                    AND (NOT fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]) OR COALESCE(w.docker_enabled, false))
@@ -11355,7 +11368,7 @@ WHERE r.health = 'waiting_worker'
   AND NOT EXISTS (
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
-        AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+        AND fn_worker_accepts_new_intake(w)
         AND w.last_heartbeat_at IS NOT NULL
         AND w.last_heartbeat_at >= @heartbeat_cutoff
   )
@@ -11685,7 +11698,7 @@ LIMIT 1;
 -- name: CountOnlineWorkersSatisfyingCIArtifacts :one
 SELECT count(*) FROM workers w WHERE w.user_id = @user_id
  AND w.status = 'online'
- AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+ AND fn_worker_accepts_new_intake(w)
  AND NOT w.ephemeral AND NOT w.isolated_lane
  AND 'ci_config_guard_v1' = ANY(w.protocol_capabilities)
  AND 'ci_artifacts_v1' = ANY(w.protocol_capabilities);
@@ -11705,12 +11718,12 @@ SELECT
            WHERE c.id = @run_id AND c.kind = 'cross_check') AS plan_checker_enrolled,
   (SELECT count(*) FROM workers w WHERE w.user_id = @user_id
      AND w.status = 'online'
-     AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+     AND fn_worker_accepts_new_intake(w)
      AND NOT w.ephemeral AND NOT w.isolated_lane
      AND 'completion_semantic_publication_v1' = ANY(w.protocol_capabilities))::bigint AS publication_capable,
   (SELECT count(*) FROM workers w WHERE w.user_id = @user_id
      AND w.status = 'online'
-     AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+     AND fn_worker_accepts_new_intake(w)
      AND NOT w.ephemeral AND NOT w.isolated_lane
      AND 'cross_check_semantic_plan_v1' = ANY(w.protocol_capabilities))::bigint AS plan_checker_capable;
 
