@@ -38,6 +38,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/ciartifacts"
 	"github.com/vtmocanu/uzi/api/internal/config"
+	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/issueinput"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -7539,6 +7540,9 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		}
 		capture, err = issueinput.Fetch(ctx, f, row.ForgeProjectID, issueIID, row.BotForgeUserID)
 		if err != nil {
+			if errors.Is(err, forge.ErrResponseTooLarge) {
+				return store.Run{}, fmt.Errorf("%w: %w", ErrDescriptionTooLarge, err)
+			}
 			return store.Run{}, ErrForgeIssueRead
 		}
 	}
