@@ -86,6 +86,11 @@ def refresh(root, devbox):
             if key != anchor:
                 del lock['packages'][key]
         (config / 'devbox.lock').write_text(json.dumps(lock, indent=2) + '\n')
+        # Devbox 0.17.5, commit be5b810af31dcfb4d397ced6aa4159b55a0a73b3:
+        # package.go IsLegacy = unversioned + empty source; update.go's
+        # updatePendingPackages skips unversioned non-legacy entries; packages.go's
+        # noInstall mode skips installation/recomputation in a fresh project.
+        # A Devbox bump MUST rerun the real Linux probe for these assumptions.
         # A raw entry already marked nixpkg is not migrated by update. Keep one
         # such anchor while Devbox resolves all other missing raw entries, then
         # use one newly resolved entry while refreshing the original anchor.
