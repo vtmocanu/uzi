@@ -421,7 +421,10 @@ export type BoundaryStep =
   | "checkpoint_import_mutation"
   | "checkpoint_import_readback"
   | "checkpoint_code_head"
-  | "checkpoint_bridge";
+  | "checkpoint_bridge"
+  | "checkpoint_post_import"
+  | "checkpoint_steer"
+  | "checkpoint_post_bridge";
 
 /** Runner-supplied cause for the actual shutdown checkpoint; credential reauthorization is still required. */
 export interface GracefulShutdownCheckpoint {
