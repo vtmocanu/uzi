@@ -70,19 +70,16 @@ func (h *Handler) changeManualCordon(w http.ResponseWriter, r *http.Request, cor
 	case err != nil:
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 	default:
-		rows, err := h.wsvc.ListWorkers(r.Context(), user.ID)
+		row, err := h.wsvc.WorkerProjectionForOwner(r.Context(), user.ID, id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			httpx.Error(w, http.StatusNotFound, "no such worker")
+			return
+		}
 		if err != nil {
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
-		for _, row := range rows {
-			if row.ID != id {
-				continue
-			}
-			dto := h.workerDTOWithOverlays(r.Context(), row)
-			httpx.JSON(w, http.StatusOK, map[string]any{"worker": dto})
-			return
-		}
-		httpx.Error(w, http.StatusNotFound, "no such worker")
+		dto := h.workerDTOWithOverlays(r.Context(), row)
+		httpx.JSON(w, http.StatusOK, map[string]any{"worker": dto})
 	}
 }
