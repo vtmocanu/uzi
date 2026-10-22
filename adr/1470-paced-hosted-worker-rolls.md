@@ -171,7 +171,8 @@ names the commit that contains the chart. A per-cluster override still wins; cus
 matching override. ADR-1720's published bare SemVer tag cannot identify
 that complete stamp. Do not infer the target from the replacement, substitute
 the independently advancing API version, or strip build metadata. A missing
-mapping holds before cordoning. The controller's fully specified SemVer-tag
+mapping holds before ordinary admission cordoning; the separate custody-held
+migration drain grants no replacement authority. The controller's fully specified SemVer-tag
 mapping is not a way to recover metadata absent from a bare published tag.
 
 Registration retains its existing 64-byte display sanitization. Exact versions
