@@ -761,11 +761,21 @@ worker, including abandoned attempts and crash-window live orphans, shared
 own-key residue from canonical and attempt entries, and orphaned skills.
 There is no automatic reclaim escape from that accumulation.
 
-**Slice A contract (Refs #2852) (AI-synced 2026-10-18):** credential-free capture, including owner pause,
-keeps execution closed without changing these retention rules. If a failed or withdrawn
-pause may have drained Codex execution, the saved session is loaded into a recreated
-provider epoch before work continues. Human or automatic gate revision after changed
-milestones follows the same rule. Newer cancellation, pause and vault-lock state are
+**Slice A contract (Refs #2852) (AI-synced 2026-10-22):** credential-free capture, including owner pause,
+keeps execution closed without changing these retention rules. With proven cleanup,
+a possibly drained provider epoch is recreated from the saved session before continuing
+after failed/withdrawn pause or human/automatic changed-milestone gate revision.
+The prior session generation stays until provider adoption. Under accepted B1, unproven
+cleanup still throws `EpochCleanupUnprovenError`; the runner converts it to a nonterminal
+`RetainedRecoveryStop` only when its safety facade matches the exact refused or
+unacknowledged owner-pause capture, subject to newer steering authority. That matching
+stop retains clone, session, journal and custody without forcing recreation or another
+in-run epoch, and does not report a failed terminal state. This conversion does not
+cover every changed-milestone gate revision failure. Subsequent execution may recover
+through existing in-budget requeue or owner Resume/hold policy, conditional on budget
+and hold state; automatic recovery or Resume is not guaranteed. Retained-source recovery
+uses a fresh attempt path and model session (`thread/start`), not the old model thread.
+Newer cancellation, pause and vault-lock state are
 checked before credentials or another model turn; a locked vault can defer recreation
 into credential recovery. This does not make an open approval gate parkable. Healthy
 credentialed capture gaps (B) and the terminal snapshot/late-writer limitation (C)

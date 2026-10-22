@@ -295,8 +295,8 @@ class FakeTransport implements CodexTransport {
   private closedFlag = false;
   private interceptor?: (note: CodexNotification, frameBytes: number) => boolean;
 
-  /** Issue #1782: a refused wall park recreates the provider epoch, so a single-transport rig
-   *  hands the recreated epoch a SUCCESSOR transport whose request log and start counters feed
+  /** Issue #1782: when proven cleanup permits epoch recreation after a refused wall park,
+   *  a single-transport rig hands that epoch a SUCCESSOR transport whose request log and counters feed
    *  this (primary) transport, keeping cumulative assertions on `rig.transport` meaningful.
    *  Only `requests` and the thread/turn start counters are mirrored: responses, notifies, closes,
    *  requestOverride and the server-request interceptor stay per-transport and are NOT copied to a

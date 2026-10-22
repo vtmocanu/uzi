@@ -2018,7 +2018,7 @@ interface EpochSharedContext {
   readonly accountant: CodexUsageAccountant;
   /** Issue #1764: the run's lifecycle signal for epoch startup (the fresh credential release).
    *  It follows ctx.signal for a genuine cancel/shutdown only: a PauseNowSignal abort spends the
-   *  shared signal permanently, and a declined or refused pause must still mint fresh epochs. */
+   *  shared signal permanently; after proven cleanup, a declined/refused pause can need a fresh epoch. */
   readonly lifecycleSignal: AbortSignal;
   /** The run's RESOLVED agent selection (issue #1718), set once by run() before the implement
    *  loop and read per request by buildRunRequest. A run-local cell (not an executor field) so it
@@ -2912,8 +2912,9 @@ export class CodexExecutor implements Executor {
     // already set, because the home may be gone. The store then holds the generation persisted
     // before the first such sink. A refused or declined sink cannot be told apart from one that
     // reaped, so the flag stays set until a fresh epoch is installed: an in-turn refused wall park
-    // recreates it at once (recreateEpochAfterReap), a loop-top refused park or declined hold
-    // recreates it at the implement loop top (epochNeedsRecreate). The fresh epoch's newer session
+    // attempts recreation at once (recreateEpochAfterReap), a loop-top refused park or declined hold
+    // attempts it at the implement loop top (epochNeedsRecreate). Both require proven cleanup;
+    // unverified teardown throws before another epoch starts. The fresh epoch's newer session
     // state is captured by its own persists; until then the store keeps the pre-sink generation.
     let beforeReapPersist: Promise<void> | undefined;
     const beforeReapingSink = async (): Promise<void> => {
@@ -3567,8 +3568,14 @@ export class CodexExecutor implements Executor {
 
       // Issue #1782: a refused in-turn wall park may already have reaped the provider root (the
       // runner's capture runs the Codex boundary before the owner's extension is known), which
-      // permanently closes the epoch's registry. The executor cannot tell, so a refused park always
-      // recreates the epoch. The session was persisted by beforeReapingSink before the park and the
+      // permanently closes the epoch's registry. Recreation requires proven cleanup: an old
+      // registry still in unverifiedEpochRegistries throws EpochCleanupUnprovenError before any
+      // new in-run epoch. The runner converts only the exact refused/unacknowledged owner-pause
+      // safety facade to RetainedRecoveryStop, subject to newer steering authority; it keeps
+      // clone/session/journal/custody without a failed terminal report. Later execution depends
+      // on existing budget/hold policy; retained-source recovery starts a fresh path/model session.
+      // This is not a blanket changed-milestone gate revision error conversion.
+      // The session was persisted by beforeReapingSink before the park and the
       // reaped home is gone, so the old epoch is NOT persisted again. If startProviderEpoch throws,
       // `epoch` and `reapedSinceLastPersist` stay as they were, so the finally skips the persist.
       // The fresh epoch's home stays empty until its provider launches, so it persists nothing
@@ -5334,16 +5341,18 @@ export class CodexExecutor implements Executor {
    * getPauseMode()==='wall') route post-attempt to a completion hold first. Before an attempt,
    * or when that hold is refused, they route to ctx.parkForWall through the runner's
    * captureHoldContext path. Returns the turn's result, a completion hold, a `walled` sentinel so
-   * phasePublish skips finalize, or `paused`. A REFUSED wall park (owner extended) re-drives the
-   * turn on a freshly recreated provider epoch (issue #1782: the refused capture may have reaped
-   * the root). Idle trips hold after an attempt and otherwise rethrow; other errors propagate
-   * unchanged.
+   * phasePublish skips finalize, or `paused`. With proven cleanup, a REFUSED wall park (owner
+   * extended) re-drives the turn on a recreated provider epoch (issue #1782: capture may have
+   * reaped the root). Unproven cleanup throws before recreation. Idle trips hold after an attempt
+   * and otherwise rethrow; other errors propagate unchanged.
    *
    * Issue #1764: an owner now/milestone pause that dropped the turn (REASON_PAUSE, mode not `wall`)
    * is honoured, never cancelled. In the implement phase it parks through ctx.parkForPause
-   * (`paused` with `at`); a declined park re-drives the same turn. In the plan phase it returns
+   * (`paused` with `at`); a declined park re-drives after any required cleanup is proven.
+   * In the plan phase it returns
    * `paused` at once and the plan loop throws a PauseNowSignal for the runner to park. A pause whose
-   * mode was withdrawn (null) re-drives the turn. A pending cancel wins over every pause. Each
+   * mode was withdrawn (null) re-drives subject to the same cleanup guard. A pending cancel wins
+   * over every pause. Each
    * handling path consumes only the interrupt generation it captured before its first await.
    */
   private async driveTurnWithWallPark(
@@ -5376,7 +5385,7 @@ export class CodexExecutor implements Executor {
   > {
     // Issue #2099: transient-provider retries spent by THIS call; a wall-park re-drive does not reset it.
     let transientAttempts = 0;
-    // Issue #1782: reassigned after a refused wall park recreates the provider epoch.
+    // Issue #1782: reassigned if proven cleanup permits recreation after a refused wall park.
     let harness = harnessIn;
     let registry = registryIn;
     let resumeId = resumeIdIn;
@@ -5491,7 +5500,7 @@ export class CodexExecutor implements Executor {
           }
           // The runner can capture before deciding the pause; requestPause persists first.
           if (await this.requestPause(ctx, at, beforeReapingSink)) return { kind: "paused", at };
-          // A declined pause re-enters the loop, which recreates any captured epoch.
+          // A declined pause re-enters the loop; captured-epoch recreation requires proven cleanup.
           pauseNow.consume(pauseToken);
           if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
           continue;
@@ -5519,7 +5528,7 @@ export class CodexExecutor implements Executor {
           // A newer pause is handled before releasing credentials for the replacement epoch.
           if (this.pendingInterruption(ctx, pauseNow, wall) === REASON_PAUSE) continue;
           // Issue #1782: the refused capture may have reaped the provider root (closing the
-          // registry for good), so the re-drive runs on a freshly recreated epoch.
+          // registry for good); the re-drive requires recreation after proven cleanup.
           if (!idleOperation) await adoptFresh();
           if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
           continue;
@@ -5613,7 +5622,7 @@ export class CodexExecutor implements Executor {
    * (a during-run refresh may have advanced it past the binding's initial generation), falling back
    * to the binding's generation when the cell is unset. `signal` is the run's lifecycle signal
    * (issue #1764), not ctx.signal: a PauseNowSignal spends ctx.signal for the rest of the run, and a
-   * declined/refused pause still needs fresh epochs.
+   * declined/refused pause can need a fresh epoch after proven cleanup.
    */
   private async releaseInitialCredential(
     ctx: RunContext,

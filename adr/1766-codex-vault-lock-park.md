@@ -272,11 +272,18 @@ semantics (`handleRecoveryExhausted`, `agent/src/runner.ts`), subject to the nar
 graceful-shutdown durability exception below.
 
 Owner pause uses this held credential-free capture discipline. Save the credential-free
-session before capture can drain the provider epoch. After a failed or withdrawn pause
-that may have drained it, continuing execution recreates a provider through the existing
-epoch path from the saved session. Changed-milestone gate revision, human or automatic,
-likewise recreates before another provider turn. Newer cancellation, pause and vault-lock
-state are checked before credentials or model execution; a vault lock on recreation takes
+session before capture can drain the provider epoch. With proven cleanup, continuing
+after a failed or withdrawn pause or human/automatic changed-milestone gate revision
+recreates a possibly drained provider through the existing saved-session epoch path.
+Unproven cleanup still throws `EpochCleanupUnprovenError`. Only the exact matching
+refused/unacknowledged owner-pause safety facade receives accepted B1's
+`RetainedRecoveryStop`, retaining clone/session/journal/custody without a failed terminal
+report or new in-run epoch. This is not a blanket gate-revision error conversion.
+Subsequent execution remains conditional on existing budget/hold recovery policy;
+retained-source recovery starts a fresh attempt path and model session. See ADR-1783's
+B1 boundary below (AI-synced 2026-10-22).
+Newer cancellation, pause and vault-lock state are checked before credentials or model
+execution; a vault lock on recreation takes
 this ADR's credential-deferral park. An accepted owner-pause continuation uses
 fresh held capture authority for source
 HEAD/pin and guarded inventory; refused proof leaves the exact parked source,
