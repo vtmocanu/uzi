@@ -10,8 +10,29 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
+
+type m2OverflowLiveStore struct {
+	*store.Queries
+	scheduleID uuid.UUID
+}
+
+// Isolate this scheduler's fixture from other due schedules in the shared test database.
+func (s *m2OverflowLiveStore) ClaimDueSchedules(ctx context.Context) ([]store.RunSchedule, error) {
+	rows, err := s.Queries.ClaimDueSchedules(ctx)
+	if err != nil {
+		return nil, err
+	}
+	owned := make([]store.RunSchedule, 0, 1)
+	for _, row := range rows {
+		if row.ID == s.scheduleID {
+			owned = append(owned, row)
+		}
+	}
+	return owned, nil
+}
 
 func TestM2ScheduleCaptureOverflowLiveDB(t *testing.T) {
 	for _, target := range []string{"issue", "sweep"} {
@@ -36,8 +57,8 @@ func TestM2ScheduleCaptureOverflowLiveDB(t *testing.T) {
 					builder := m2OverflowBuilder{&fakeBuilder{}, f}
 					runs := workersvc.New(q, box, workersvc.Params{})
 					runs.SetTxBeginner(pool)
-					sched := New(q, runs, builder, nil, nil, nil, time.Minute, nil)
 					id := uuid.New()
+					sched := New(&m2OverflowLiveStore{Queries: q, scheduleID: id}, runs, builder, nil, nil, nil, time.Minute, nil)
 					due := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
 					t.Cleanup(func() {
 						if _, err := pool.Exec(ctx, "UPDATE run_schedules SET enabled=false WHERE id=$1", id); err != nil {
