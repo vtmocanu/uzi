@@ -29,9 +29,12 @@ remains separate. No plan revision or producer enablement is included.
   rediscovery map, continuation or boot/live ordering change is delivered.
   The ledger remains v1. Existing capture and transfer helpers remain.
 
-The published seed is retained. Default branch revision
-`a077e42b9b08cc3e4a24ff59d456d13342ee897f` was integrated with merge
-`3e7fdced754f75395dc3ee365dc776144a258a77`; no published commit was rewritten.
+The published seed and history are retained. The recovered record names
+default branch revision `a077e42b9b08cc3e4a24ff59d456d13342ee897f` and merge
+`3e7fdced754f75395dc3ee365dc776144a258a77`. In the current continuation,
+the required default `e707e0b223328c734f1c6cc0bcc419e1b64adc4d` merged
+without conflicts as `9c2b0ccb10baf725cbead7f2670ed28e795b99fc`;
+no published commit was rewritten.
 
 ## Material change needed
 
@@ -222,7 +225,7 @@ downgrade residuals remain as recorded in ADR-1197. No ledger export or
 restore artifact is added. Related issues #2852, #3101/#3132, #2969, #2884,
 #2494, #2506-A, #2544 and #3105 remain separately owned.
 
-The initial reviewer report at `3e7fdced` leaves one performance note:
+The recovered historical reviewer report at `3e7fdced` leaves one performance note:
 CI before/after and critical-path timing remains unmeasured (M4).
 Infrastructure suggestions from the tester reports are deferred: two
 coverage/pre-commit suggestions at `3e7fdced`, two formatter/coverage
@@ -256,13 +259,24 @@ The run cannot perform these; the responsible actor is the maintainer or landing
 6. `run-store-it.sh` with named LiveDB zero-skip, if the run recorded it unrun.
 7. The U4b representative measurement, if the run recorded it unrun.
 
-All MO items remain maintainer-owned and unperformed. The local Git fixture
-has sufficient history (2,110 commits at merge, non-shallow), but the composed
-measurement cannot be built under the conflicting W0 contract. MO7 is not
-a substitute for resolving that conflict. Local environment limits and MO
-do not waive worker obligations.
+MO remains incomplete and maintainer-owned. MO1–5 and the composed
+measurement are unperformed. At the validation capture below, store-it had
+not yet run; the final PR records its actual outcome and retains MO6 if it remains
+unrun, as the conditional item above requires. MO7 remains unperformed.
+The current source is non-shallow with 2,123 commits; history availability
+is not a measurement blocker. The composed measurement cannot be built under
+the conflicting W0 contract. MO7 is not a substitute for resolving that
+conflict. Local environment limits and MO do not waive worker obligations.
 
 ## Validation record
+
+### Recovered historical evidence
+
+The table and reports in this subsection are recovered records of earlier
+revisions, not checks rerun or signoffs renewed in this continuation.
+Their mutation results are historical reports, not declarations about current
+mutation artifacts. Current-continuation evidence supplied by the lead is
+recorded separately below.
 
 Agent test commands use the repository's 120,000 ms timeout. Scoped
 proofs ran on Linux, Node 24.20.0, with isolated Git configuration and the
@@ -280,7 +294,7 @@ result is inferred.
 | S response-handoff regression control | Seven selected tests on the repaired candidate with the original client failed through intended cleanup-order assertions; zero timeouts/cancellations. |
 | S response-handoff focused proof | 120/120 passed, zero skips/cancellations at the `7ec239bc` source; typecheck, lint and knip passed. |
 | E2E library, fake forge, watcher selected-source backups | `task test:e2e-lib`, `task test:forge-fake` and `task test:uzi-watcher-backups` passed. No new ledger backup artifact is added. |
-| Documentation mirror | `task docs:sync` ran; the final document update is mirrored again before commit. |
+| Documentation mirror | The recovered record reports that `task docs:sync` ran and planned another mirror before commit; that plan is not evidence of a current mirror. The lead owns integration and mirror synchronization. |
 
 S's five acceptance cases are in
 `recovery-pass-shutdown-join.test.ts`: real silent reserve/upload, real
@@ -320,10 +334,63 @@ in `e2e/phases/`, `e2e/lib.sh`, `e2e/lib.test.sh` or
 `e2e/phases/72-custody-lifecycle.sh`; that compose phase is **unrun** on
 all three forges. Hosted and process-image checks remain MO-owned.
 
-The final frozen serial gates are recorded with exact revisions and results
-in the PR. The first failed
-gate above is never represented as green. Exact-candidate CI, three-forge
-compose phases and hosted acceptance are not established by focused tests.
+### Current-continuation observed evidence
+
+These observations were captured for clean source `9c2b0ccb`, after
+integration of required default `e707e0b2` and before the final documentation
+commit. The PR records subsequent frozen-gate and final-review outcomes.
+
+| Observed check | Result and revision |
+|---|---|
+| Full `task gate:agent` | **Failed**, exit 201 at clean `9c2b0ccb`, Linux, Node 24.20.0, umask 0022. All 637 files ran: 19,550 tests, 19,532 passed, 3 failed, 15 skipped, zero cancelled; unit duration 4,775 seconds. The launcher also reported LEFTOVER processes. Log: `.uzi/scratch/gate-log.65NQS6`. |
+| Whole S/N-related files in that invocation | `recovery-pass-shutdown-join.test.ts`, `recovery-terminal-origin-admission.test.ts` and `runner-terminal-saved-final-replay.test.ts` passed; respective file durations 1.998552 s, 10.200042 s and 71.711223 s. All 22 named seed-regression cases have passing entries in this same invocation. These passes do not make the full gate green. |
+| Immutable export comparison, three selected cases | Candidate `9c2b0ccb` and base `e707e0b2` each had 2 passes and 1 failure, using the same dependencies and lock SHA256 `91291c93d858cfc43abc435dfb24e9563e4bee1190341ca3d08d61f008017cf4`. Logs: `.uzi/scratch/gate-log.bCOWMi` and `.uzi/scratch/gate-log.f8Acov`. |
+| Immutable export comparison, broader lifecycle/proc groups | Each revision had 25 passes and zero skips. Logs: `.uzi/scratch/gate-log.EB91NK` and `.uzi/scratch/gate-log.U1QXV7`. These comparisons remain inconclusive for the full-gate Codex/proc failures. |
+| Continuation prerequisites | `task test:e2e-lib`, `task test:forge-fake` and `task test:uzi-watcher-backups` passed. |
+
+Fresh mutation controls also used isolated exports of `9c2b0ccb`. The
+lead-owned scope-unlink control typechecked and made both required reserve
+and bundle tests fail through assertions, with zero cancellations or skips.
+The reserve exceeded the 5,000 ms settlement bound; the bundle changed the
+journal from `pinned` to `needs_action`. The latter detects journal retention,
+not independent sensitivity of the child-order assertion. Logs:
+`.uzi/scratch/gate-log.90BBkv` and `.uzi/scratch/gate-log.OcXmov`.
+
+The lead checked the tester-owned mutation scripts and logs: foreground
+budget sharing, owned-budget signal omission, late-header ownership,
+first-cancellation replacement, disabled archive notification, bypassed
+settlement receipts, and routing replay through source admission all
+typechecked and failed through their intended assertions (10 selected cases,
+zero cancellations or skips). The wrong-route control reached the real
+`ledger.admit` zero-call assertion with `1 !== 0`; the notification control
+failed its FINAL/ACK assertion. The initial foreground mutation that failed
+typechecking is excluded. These mutants stayed in scratch exports; production
+source remained unchanged. Their logs use the `.uzi/scratch/tester-1-` prefix.
+
+The three full-gate failures were:
+
+- `codex-executor`: “wall-during-dispose settles eligible Bash and retires roots before park/report”.
+- `entrypoint-migration`: “nix store: every boot drops group write (reclaim, chmod 1755, hand back to runner:runner)”.
+- `run-procs`: “this host's real proc tree: an unrelated NON-DUMPABLE process does not make the run busy”.
+
+The Nix fixture fails identically on candidate and base because `STUB_NOOP`
+leaves the data directory absent before the migration-marker write. This
+off-task issue was recorded for triage. The selected Codex/proc cases both
+pass in isolation; their comparisons, including the broader groups, are
+**inconclusive** for the full-gate failures and do not establish that those
+failures are unrelated to this change.
+
+The reviewer at `9c2b0ccb` reported no mandatory S/N defect; optional CI
+before/after and critical-path timing remains unmeasured. Final tester,
+auditor and candidate-review outcomes belong to the PR verification record.
+Recovered historical signoffs above do not supply current approval.
+
+At this capture, `gate:api`, store-it and `gate:repo` had not yet run.
+The final PR records the actual frozen serial gate revisions and results,
+including store-it's outcome for conditional MO6. Both failed agent gates
+remain failed records. The latest branch pipeline query returned `null`;
+exact-candidate CI is unvalidated. Three-forge compose phases and hosted
+acceptance remain unperformed; focused tests do not establish them.
 
 ## MEASURE lines
 
