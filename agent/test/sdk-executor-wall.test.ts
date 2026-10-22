@@ -231,6 +231,25 @@ describe("SDK overflow wall expiry M1", () => {
 });
 
 describe("SdkExecutor wall park (PRD #1497 M2)", () => {
+  for (const outcome of ["parked", "undeliverable", "refused", "cancelled"] as const) {
+    it(`wall park ${outcome} racing cancellation preserves its sink outcome`, async () => {
+      let cancelled = false, parks = 0, dispatches = 0;
+      const { ctx } = makeCtx({
+        planApproved: true, approvedPlan: "approved", sessionId: "sess-1",
+        pauseModeRequested: () => "wall",
+        cancelRequested: () => cancelled,
+        parkForWall: async () => { parks++; cancelled = true; return outcome; },
+      });
+      const queryFn: SdkQueryFn = () => { dispatches++; throw new Error("unexpected provider dispatch"); };
+      const running = new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+      if (outcome === "parked" || outcome === "undeliverable")
+        assert.deepEqual((await running).walled, { reason: "run exceeded its wall-clock timeout" });
+      else await assert.rejects(running, { message: "run cancelled" });
+      assert.equal(parks, 1);
+      assert.equal(dispatches, 0);
+    });
+  }
+
   it("a PRE-attempt REASON_WALL takes the capture-first wall park, not a terminal failure", async () => {
     // Plan turn instant; the implement turn hangs until the wall timer aborts it (a 0.05s wall). No
     // signal_done, so completionAttempted is false — the pre-attempt path. parkForWall returns

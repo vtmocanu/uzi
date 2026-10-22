@@ -18022,8 +18022,9 @@ export class RunRunner {
     };
     if (holdQuiescence.blocked) captured = residueHold(holdQuiescence.outcome.process?.state);
     for (let attempt = 0; !holdQuiescence.blocked && attempt < COMPLETION_HOLD_CAPTURE_ATTEMPTS; attempt++) {
-      options.signal?.throwIfAborted();
+      // Restore provisional retention before a shared cancellation signal can throw.
       checkCancellation();
+      options.signal?.throwIfAborted();
       if (flight.active?.shuttingDown) break;
       try {
         const result = await this.captureHoldContext(claim, flight, runLog, options);
@@ -18060,8 +18061,8 @@ export class RunRunner {
       );
       return false;
     }
-    options.signal?.throwIfAborted();
     checkCancellation();
+    options.signal?.throwIfAborted();
     const head = captured.head;
     flight.completionHoldOutcome = "unresolved";
     flight.parked = false;

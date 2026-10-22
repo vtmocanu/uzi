@@ -625,6 +625,42 @@ describe("M3 publication-start completion guard", () => {
     });
   }
 
+  for (const codex of [false, true]) for (const abortWait of [false, true]) {
+    it(`prepush hold retry cancellation releases provisional clone and HOME retention (Codex=${codex}, abortWait=${abortWait})`, async () => {
+      const claim = claimFor();
+      const runHome = path.join(homeDir, claim.run_id);
+      fs.mkdirSync(runHome, { recursive: true });
+      const sentinel = path.join(runHome, "SESSION_TRANSCRIPT");
+      fs.writeFileSync(sentinel, "session bytes\n");
+      const rig = codexRig();
+      const probe = committing("Fixes #3090");
+      const executor = codex ? new FakeCodexExecutor(rig.safety, ctx => probe.executor.run(ctx)) : probe.executor;
+      const forge = fakeGitlab();
+      const run = runnerWith(() => ({ executor, homeDir: runHome }), forge.gitlab);
+      let captures = 0, retries = 0;
+      run["captureHoldContext"] = async () => {
+        captures++;
+        return { verified: false, published: false, mode: "same_worker_only", head: null };
+      };
+      const wait = run["waitRecoveryRetry"].bind(run);
+      run["waitRecoveryRetry"] = async flight => {
+        retries++;
+        const waiting = abortWait ? wait(flight, true, 10_000) : undefined;
+        run["observeCancellation"](flight);
+        assert.equal(flight.cancel.signal.aborted, true, "the hold's shared signal is aborted between capture attempts");
+        await waiting;
+      };
+      await run.execute(claim);
+      assert.equal(captures, 1);
+      assert.equal(retries, 1);
+      assert.equal(api.completionHoldRequests.length, 0);
+      assert.equal(fs.existsSync(worktreeDirFor(IID)), false, "cancel releases this hold's provisional clone retention");
+      assert.equal(fs.existsSync(sentinel), false, "cancel releases this hold's provisional HOME retention");
+      assert.equal(terminal(claim.run_id).at(-1)!.body.failure_reason, "run cancelled");
+      assert.equal(forge.calls.length, 0);
+    });
+  }
+
   for (const disposition of ["confirmed", "ambiguous"] as const) {
     it(`Codex prepush ${disposition} hold remains nonterminal after boundary disposal`, async () => {
       const claim = claimFor();

@@ -2956,6 +2956,8 @@ export class SdkExecutor implements Executor {
       };
       const parkWall = async (at: { completedCount: number; total?: number }): Promise<WallParkOutcome | "stopped" | undefined> => {
         const outcome = await this.parkForWall(ctx, at);
+        // A settled or undeliverable sink already owns the nonterminal stop, as in Codex.
+        if (outcome === "parked" || outcome === "undeliverable") return outcome;
         if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
         if (outcome === "refused") {
           const refresh = ctx.takeWallParkRefresh?.();
