@@ -141,8 +141,15 @@ is not a metadata-only or offline refresh. A normal full `devbox update` migrate
 raw keys to devbox-search `@latest` entries and is intentionally avoided.
 
 The helper requires the manifest to remain byte-identical and validates the
-complete lock and module Go requirements before atomically replacing the original
-lock. A failed or partial attempt leaves both original inputs intact. The read-only
+complete lock and module Go requirements. It then checks every selected output
+and its dependency closure against the remote `https://cache.nixos.org` store,
+even when installation already built that output locally. Uncached outputs or
+an unavailable cache fail closed with a retry-next-week result. Installation can
+still incur source-build cost before this check; a successful local build alone
+never authorizes a source-building image.
+
+Only then does it atomically replace the original lock. A failed or partial
+attempt leaves both original inputs intact. The read-only
 workflow then builds the image; only its hash-bound, validated lock artifact can
 reach the separate write-capable proposal job. Review all package version changes
 before landing. The monthly Go revision and weekly stdenv revision can differ,

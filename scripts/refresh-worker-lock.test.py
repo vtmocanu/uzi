@@ -50,7 +50,8 @@ mode = os.environ['REFRESH_CASE']
 if mode == 'rewrite':
     manifest.write_text(manifest.read_text() + '\\n// migrated to search\\n')
     data = json.loads(pathlib.Path(os.environ['FAKE_LOCK']).read_text())
-    data['packages']['jq.bin'] = {'resolved': 'github:NixOS/nixpkgs/' + 'b' * 40 + '#jq.bin'}
+    data['packages']['jq.bin'] = {'resolved': 'github:NixOS/nixpkgs/' + 'b' * 40 + '#jq.bin',
+        'systems': {'x86_64-linux': {'outputs': [{'path': '/nix/store/' + 'c' * 32 + '-jq-1.8.2-bin', 'default': True}]}}}
     lock.write_text(json.dumps(data))
     sys.exit(0)
 if args[0] == 'update' and 'nixpkgs' in args:
@@ -61,7 +62,8 @@ elif args[0] == 'install':
     data = json.loads(lock.read_text())
     assert 'jq.bin' not in data['packages'], 'raw entry must be invalidated'
     assert os.environ['PIN_KEY'] in data['packages'], 'explicit pin must survive'
-    data['packages']['jq.bin'] = {'resolved': 'github:NixOS/nixpkgs/' + 'b' * 40 + '#jq.bin'}
+    data['packages']['jq.bin'] = {'resolved': 'github:NixOS/nixpkgs/' + 'b' * 40 + '#jq.bin',
+        'systems': {'x86_64-linux': {'outputs': [{'path': '/nix/store/' + 'c' * 32 + '-jq-1.8.2-bin', 'default': True}]}}}
     if mode == 'orphan':
         data['packages']['jq.bin@latest'] = {}
     if mode == 'input-change':
@@ -74,6 +76,23 @@ else:
     sys.exit(7)
 ''')
         fake.chmod(0o755)
+        nix = binary / 'nix'
+        nix.write_text('''#!/usr/bin/env python3
+import os, sys
+args = sys.argv[1:]
+if args[0] == 'eval':
+    print('x86_64-linux')
+elif args[0] == 'path-info':
+    assert '--recursive' in args
+    assert args[args.index('--store') + 1] == 'https://cache.nixos.org'
+    assert '/nix/store/' + 'a' * 32 + '-go-1.27.3' in args
+    assert '/nix/store/' + 'c' * 32 + '-jq-1.8.2-bin' in args
+    if os.environ['REFRESH_CASE'] == 'cache-miss':
+        sys.exit(1)
+else:
+    sys.exit(2)
+''')
+        nix.chmod(0o755)
         sleep = binary / 'sleep'
         sleep.write_text('#!/bin/sh\nexit 0\n')
         sleep.chmod(0o755)
@@ -119,6 +138,12 @@ else:
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual((self.root / 'agent/devbox-global/devbox.lock').read_bytes(), self.before_lock)
         self.assertIn('go 1.99.0', (self.root / 'api/go.mod').read_text())
+
+    def test_locally_realized_but_uncached_output_cannot_publish(self):
+        result = self.invoke('cache-miss')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('not yet cached', result.stderr)
+        self.assert_originals()
 
 
 if __name__ == '__main__':
