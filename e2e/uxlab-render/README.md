@@ -78,5 +78,4 @@ establish a provisioning-time comparison. Full render, Nix-denial controls,
 matching-Go proof and local Devbox build remain M3 obligations.
 
 Focused checks passed: Bash syntax, ShellCheck 0.11.0 at warning severity,
-Node 24.20.0 TypeScript syntax, and `git diff --check HEAD`.
-
+and Node 24.20.0 TypeScript syntax.
