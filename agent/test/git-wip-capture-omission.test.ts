@@ -379,13 +379,13 @@ describe("undoWipMarkerOnBranch (issue #3239)", () => {
     return { f, parent, marker };
   }
 
-  test("(a) CAS succeeds: branch at parent, index == parent tree, worktree file kept uncommitted", async (t) => {
+  test("(a) CAS succeeds: branch at parent, index kept, worktree file remains staged", async (t) => {
     const { f, parent, marker } = await withMarker(t);
     assert.equal(await f.git.undoWipMarkerOnBranch(f.root, "main", marker), true);
     assert.equal(f.g("rev-parse", "refs/heads/main"), parent);
-    assert.equal(f.g("diff", "--cached", "--name-only"), "", "index equals the parent tree");
+    assert.equal(f.g("diff", "--cached", "--name-only"), "wip.txt", "the capture remains staged");
     assert.equal(await f.exists("wip.txt"), 6);
-    assert.match(f.g("status", "--porcelain"), /\?\? wip\.txt/);
+    assert.match(f.g("status", "--porcelain"), /^A  wip\.txt$/m);
   });
 
   test("(b) branch moved past the marker: refused, branch untouched", async (t) => {
@@ -413,5 +413,35 @@ describe("undoWipMarkerOnBranch (issue #3239)", () => {
     const tip = f.head();
     assert.equal(await f.git.undoWipMarkerOnBranch(f.root, "main", tip), false);
     assert.equal(f.head(), tip);
+  });
+
+  test("(e) staged-only content survives the HEAD-switch index-restore window", async (t) => {
+    const { f, parent, marker } = await withMarker(t);
+    f.g("branch", "B", marker);
+    await f.write("index-only.txt", "only staged version\n");
+    f.g("add", "index-only.txt");
+    await f.write("index-only.txt", "different working version\n");
+    const staged = f.g("ls-files", "--stage", "--", "index-only.txt");
+    const index = await fs.readFile(path.join(f.root, ".git", "index"));
+    const runGit = f.git["runGitAsRunner"].bind(f.git);
+    let indexWrites = 0;
+    f.git["runGitAsRunner"] = async (cwd, args, opts) => {
+      // Reproduce the old race after its HEAD check and immediately before its
+      // read-tree. A branch-only undo never opens this index-write window.
+      if (args[0] === "read-tree") {
+        indexWrites++;
+        f.g("symbolic-ref", "HEAD", "refs/heads/B");
+      }
+      return runGit(cwd, args, opts);
+    };
+
+    assert.equal(await f.git.undoWipMarkerOnBranch(f.root, "main", marker), true);
+    assert.equal(f.g("rev-parse", "refs/heads/main"), parent);
+    assert.equal(f.g("rev-parse", "refs/heads/B"), marker, "B is not rewound");
+    assert.equal(f.g("ls-files", "--stage", "--", "index-only.txt"), staged, "staged-only entry survives");
+    assert.equal(f.g("show", ":index-only.txt"), "only staged version", "staged-only bytes survive");
+    assert.deepEqual(await fs.readFile(path.join(f.root, ".git", "index")), index, "index is byte-identical");
+    assert.equal(await fs.readFile(path.join(f.root, "index-only.txt"), "utf8"), "different working version\n");
+    assert.equal(indexWrites, 0, "undo never writes the shared index");
   });
 });

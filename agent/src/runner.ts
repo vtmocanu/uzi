@@ -17530,7 +17530,7 @@ export class RunRunner {
       // is a compare-and-swap of the run branch ref from that marker to its parent, so it moves only
       // that branch and only while it still is that commit, and never writes HEAD. When the oid is
       // unknown, or the CAS refuses (branch moved), the marker stays and the pause_failed below
-      // keeps the run going.
+      // keeps the run going. The index stays intact, preserving captured and later staged-only work.
       if ((markerCreated || flight.wipMarkerUnsafe) && runnerClone) {
         const markerOid = createdMarker ?? flight.wipUnsafeMarker;
         if (branch && markerOid) {

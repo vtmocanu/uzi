@@ -11624,10 +11624,10 @@ try {
    * `refs/heads/<branch>` from `marker` to its parent. Only that branch ref can move, only while it
    * still is exactly `marker`; HEAD is never written, so a HEAD switch or a new commit between the
    * caller's decision and this write cannot make it rewind another ref or commit. `marker` must be
-   * a one-parent commit whose subject starts with WIP_PARK_COMMIT_PREFIX. The mixed-reset index is
-   * restored (`read-tree <parent>`) only when the CAS succeeded and HEAD still names the branch; the
-   * worktree is never touched, so the captured content stays on disk as uncommitted changes. Any
-   * failure answers false with nothing else written.
+   * a one-parent commit whose subject starts with WIP_PARK_COMMIT_PREFIX. The index and worktree
+   * are never touched: captured content remains staged and any later staged-only content survives.
+   * A separate HEAD check cannot fence an index restore against a concurrent branch switch.
+   * Any failure answers false with nothing else written.
    */
   async undoWipMarkerOnBranch(clonePath: string, branch: string, marker: string): Promise<boolean> {
     const git = (args: string[]) => this.runGitAsRunner(clonePath, args, NO_REPLACE);
@@ -11640,12 +11640,6 @@ try {
       const parent = parents[1];
       if (parents.length !== 2 || parents[0] !== marker || !parent) return false;
       await git(["update-ref", "--no-deref", "-m", "uzi: pause wip undo", ref, parent, marker]);
-      try {
-        if ((await this.wipSymbolicHead(clonePath)) === ref) await git(["read-tree", parent]);
-        else this.log.warn("WIP park marker undone on the branch; HEAD moved, index left", { cwd: clonePath, branch });
-      } catch (err) {
-        this.log.warn("WIP park marker undone on the branch; index restore failed", { cwd: clonePath, error: gitErrorMessage(err) });
-      }
       return true;
     } catch (err) {
       this.log.warn("WIP park marker branch undo refused (best-effort → marker left)", { cwd: clonePath, error: gitErrorMessage(err) });
