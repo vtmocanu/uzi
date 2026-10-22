@@ -234,6 +234,52 @@ adds no ledger backup/restore artifact or historical-reader format change,
 and does not expand ADR-1786 authority. Production-image/PVC and three-forge
 compose/k8s acceptance remain maintainer-owned and unperformed.
 
+### Terminal-producer hold validation (issue #3031, 2026-10-22)
+
+The current approved W0 P1 still pins the post-`add -A` index's device,
+inode, size, mtime, ctime and trailing checksum before and after commit and
+through P5. A fresh isolated reproduction on Git 2.54.0 with
+`--no-optional-locks` and `GIT_OPTIONAL_LOCKS=0`: ordinary add then commit
+changed index size from 174 to 193 bytes, replaced its inode, and changed
+the trailing checksum from `88f9ac4900f5211559744ad9f7bcfdc3493c11d1` to
+`2d4d8e449815a6fcd5b4e9fa951d903164e746ed`. The `ls-files --stage`
+entries were identical and status was clean. This independently reproduces
+the existing index conflict above on the merged candidate.
+
+There is also a content-policy conflict. W0 P3 replaces the old 64 MiB /
+16,384-entry envelope with frozen slot caps "with no hidden lower cap";
+W0 P4 requires `add -A` to commit the final worktree for all of T union U
+(tracked and non-ignored untracked paths). The current
+[requirements record](../specs/human.md) at line 755 prohibits WIP auto-save
+of core dumps and files over 8 MiB. The
+[WIP policy amendment](0759-protect-run-work-usage-limit-park.md#amendment-2026-10-21-issue-3239-the-wip-auto-save-refuses-core-dumps-and-oversized-files-and-vets-its-own-marker)
+explicitly includes `captureMaintenanceWip`.
+The [maintenance capture tests](../agent/test/git-maintenance-wip-capture.test.ts)
+at lines 271–317 preserve refusal before commit for new/changed oversized
+content and core files, success at exactly 8 MiB, and exemption for unchanged
+core/oversized content already in HEAD. The literal all-content/no-hidden-lower-cap
+contract conflicts with that policy.
+
+Under R3, disagreement with a higher source or an impossible required
+acceptance means finish independent work, introduce no workaround, and
+leave dependent milestones incomplete. Re-pinning after commit, weakening
+the identity proof, omitting protected content or hiding the 8 MiB refusal
+inside slot accounting would each change the contract. A material revision
+must explicitly reconcile P1/P5 with legitimate index replacement and
+P3/P4 with the core/8 MiB policy, then specify the revised acceptance and
+repeat the required reviews and gates. No such revision is approved here.
+
+The seed's reachable changes are S (owned recovery-pass shutdown) and N
+(saved-evidence replay notification); both remain pending independent
+reviews and the lead's exact validation results. New-origin production
+remains disabled. W0, U4b, U4c, U4d, U5, F, M3 and M4 remain incomplete;
+MO is unperformed. No delta transfer, provenance P, boot/live ordering
+change or U5 delivery is claimed. The existing helpers, test ports and
+accounting stay unchanged. The named accepted provenance shortfall and
+existing dormant limits above remain the boundary, not new guarantees.
+See the [delivery report](../docs/issue-3031-delivery.md) for the requirement
+map and outstanding evidence.
+
 ### Server-owned backoff
 
 `SetRunRecoveryWait` admits only the owning worker's running, non-judge run.
