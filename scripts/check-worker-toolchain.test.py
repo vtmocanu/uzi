@@ -10,6 +10,8 @@ import subprocess
 import tempfile
 import unittest
 
+os.environ.update(GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null")
+
 SPEC = importlib.util.spec_from_file_location('worker_toolchain', pathlib.Path(__file__).with_name('check-worker-toolchain.py'))
 CHECK = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CHECK)
