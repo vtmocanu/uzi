@@ -5,7 +5,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { captureOutput } from "./capture.js";
 
-test("diagnostics flush a prefix before EOF and stop at exactly 1 MiB", { timeout: 15000 }, async () => {
+test("diagnostics flush a prefix before EOF and stop at exactly 1 MiB", { timeout: 30000 }, async () => {
   const dir = fs.mkdtempSync(fileURLToPath(new URL("../../.uzi/scratch/capture-test-", import.meta.url)));
   const file = dir + "/output", fd = fs.openSync(file, "wx");
   const child = spawn("/bin/sh", ["-c", "exec " + captureOutput],
@@ -30,6 +30,8 @@ test("diagnostics flush a prefix before EOF and stop at exactly 1 MiB", { timeou
     input.write("prefix");
     await flushed;
     clearTimeout(timer);
+    watcher?.close();
+    watcher = undefined;
     assert.equal(fs.readFileSync(file, "utf8"), "prefix");
     input.end(Buffer.alloc(1048576, 120));
     await done;

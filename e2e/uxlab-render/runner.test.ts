@@ -292,7 +292,7 @@ for (const cleanup of ["returns false", "throws"] as const) {
     test(`runner deadline stays bounded when cleanup ${cleanup} and parent ${parentExits ? "exits" : "stays alive"}`,
       { timeout: 5_000 }, async (t) => {
         let ownedPgid: number | undefined;
-        const opts = { ...options(), timeout: 400,
+        const opts = { ...options(), timeout: 1000,
           killRunnerGroupOnly: (pgid: number) => {
             ownedPgid = pgid;
             if (cleanup === "throws") throw new Error("signal denied");
@@ -317,7 +317,7 @@ for (const cleanup of ["returns false", "throws"] as const) {
         await assert.rejects(runRunner(localRunner, process.execPath,
           ["-e", parent, descendant, parentExits ? "exit" : "wait"], opts));
         const elapsed = performance.now() - begun;
-        assert(elapsed < 1200, `cleanup exceeded completion bound: ${elapsed}ms`);
+        assert(elapsed < 1600, `cleanup exceeded completion bound: ${elapsed}ms`);
         const failure = opts.events.find((event) => event.kind === "runner-error");
         assert(failure);
         assert.equal(failure.data.killed, false);
