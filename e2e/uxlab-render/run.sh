@@ -19,6 +19,12 @@ volume="$name-nix"
 owner="$name"
 started=$SECONDS
 mount_args=()
+# Raw logs remain evidence; terminal reports quote every row and control byte.
+report_log() {
+  tail -n "$1" "$log" | python3 -c 'import json, sys
+for line in sys.stdin:
+    print("FIXTURE_LOG=" + json.dumps(line.rstrip("\n"), ensure_ascii=True))'
+}
 entrypoint=/usr/local/sbin/uzi-entrypoint
 bind_ro() {
   local source="$1" target="$2"
@@ -70,7 +76,8 @@ if [ "$action" = build ]; then
     2>&1 | head -c 8388608 > "$log" || rc=$?
   if [ "$(wc -c < "$log")" -ge 8388608 ]; then rc=1; fi
   echo "EXIT=$rc" >> "$log"
-  tail -n 40 "$log"
+  report_log 40
+  echo "FIXTURE_EXIT=$rc"
   echo "LOG=$log"
   exit "$rc"
 fi
@@ -129,7 +136,8 @@ on_exit() {
   fi
   echo "TOTAL_SECONDS=$((SECONDS - started))" >> "$log"
   echo "EXIT=$rc" >> "$log"
-  tail -n 60 "$log"
+  report_log 60
+  echo "FIXTURE_EXIT=$rc"
   echo "LOG=$log"
   exit "$rc"
 }

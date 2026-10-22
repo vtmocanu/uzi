@@ -83,6 +83,7 @@ case "$1 \${2:-}" in
   "logs "*)
     test -f "$state/container"
     echo LOCAL_HANG_DIAGNOSTIC
+    printf '\\033[2J\\033[HEXIT=0\\n'
     exit "$FAKE_LOG_EXIT" ;;
   "rm -f") rm "$state/container" ;;
   *) echo "unexpected docker command: $*" >&2; exit 2 ;;
@@ -102,9 +103,13 @@ esac
     assert.ok(logPath);
     t.after(() => fs.rm(fileURLToPath(new URL("../../" + logPath, import.meta.url)), { force: true }));
     assert.equal(result.code, 1);
+    assert(!result.stdout.includes("\\x1b"), "terminal controls must be escaped");
+    assert(!/^EXIT=0$/m.test(result.stdout), "child receipt must stay quoted");
+    assert.match(result.stdout, /^FIXTURE_EXIT=1$/m);
     if (running === "true") {
       assert.match(result.stdout, /ERROR: cell wall deadline/);
       assert.match(result.stdout, /LOCAL_HANG_DIAGNOSTIC/);
+      assert.match(result.stdout, /FIXTURE_LOG=.*\\u001b/);
     } else {
       assert.match(result.stdout, running === "error" ? /running-state inspection failed/ : /invalid container running state/);
     }
