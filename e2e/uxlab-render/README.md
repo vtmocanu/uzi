@@ -73,8 +73,8 @@ runtime modifications are included in M1.
 
 ## M1 validation receipt — 2026-10-22
 
-Historical receipt for the fixture before the bounded-input repair. The lead
-must rerun the canary and record fresh proof for the changed fixture.
+Historical receipt for the fixture before the bounded-input repair. Fresh
+post-repair proof is recorded below.
 
 Executed `bash e2e/uxlab-render/run.sh canary` against base root manifest
 SHA256 `d3b4242b28ce03f6fafa548aff5edc8c67ce28d5c0b708f259676f78a578e33b`.
@@ -101,3 +101,21 @@ matching-Go proof and local Devbox build remain M3 obligations.
 
 Focused checks passed: Bash syntax, ShellCheck 0.11.0 at warning severity,
 and Node 24.20.0 TypeScript syntax.
+
+### Post-repair verification
+
+The lead reran `bash e2e/uxlab-render/run.sh canary` at commit
+`076a2a011508f2ca1e6ed99012edcb644d3146be`, using a new fixture-owned Nix
+volume. Image, agent source, base manifest and helper hashes matched the
+earlier receipt. Real provisioning completed in 27,684 ms. Both `off` and
+`required` again passed twice with uid 10003, the provisioned Ruby 4.0.6
+profile path, and four distinct empty mode-0700 HOME/TMPDIR directories.
+The fixture and wrapper exited 0, with verified container/volume cleanup.
+Total wrapper time was 110 seconds; this is a fresh canary receipt, not the
+M3 before/after provisioning comparison.
+
+All eight bounded-input regressions passed. Reviewer and auditor independently
+reviewed the repair at the same commit and found no remaining findings; the
+auditor confirmed resolution of the original unbounded-read finding.
+The unchanged runner also passed `task lint:shell` at the earlier fixture
+commit. Full rendering and the other M3 checks remain unperformed.
