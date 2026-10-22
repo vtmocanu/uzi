@@ -120,8 +120,9 @@ detail page and by `uzi run get`.
   recorded. API-equivalent cost compares work, not a bill; subscription
   users may consume purchased credits. See [run cost](./run-cost.md#metered-subscription-and-unreported-cost).
 - **Separate from the judge model.** The [run judge](./judge.md) runs on
-  its own model, set instance-wide by an admin (`opus` by default). Your
-  worker-model settings here have no effect on it.
+  its own per-harness judge models (Claude `opus` and Codex `gpt-6.1-sol` by
+  default), set per user or instance-wide by an admin. Your worker-model
+  settings here have no effect on them.
 - **Separate from reasoning effort.** Your [reasoning
   effort](./worker-effort.md), which controls how hard the model thinks,
   is shared across both harnesses; see that page.

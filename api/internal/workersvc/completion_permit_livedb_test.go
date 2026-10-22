@@ -556,6 +556,68 @@ func TestAttemptUnionMergesDeclarationLiveDB(t *testing.T) {
 	}
 }
 
+// TestEmptyDeclarationAttemptThenHoldLiveDB (issue #3139): a worker-initiated completion attempt
+// with an EMPTY (non-nil) declaration, as the no-progress stall path sends, records exactly one
+// attempt, unions nothing into milestones_completed, reports the still-unmet milestones, and leaves
+// the run holdable (completion_blocked pause) by the follow-up hold report.
+func TestEmptyDeclarationAttemptThenHoldLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	// Frozen m1,m2,m3; only m1 declared complete at seed; completion_attempts starts at 0.
+	runID := e.seedFrozenRun(t, wid, []string{"m1", "m2", "m3"}, []string{"m1"}, false)
+	wkr := store.Worker{ID: wid}
+
+	res, err := svc.RecordCompletionAttempt(e.ctx, wkr, runID, CompletionAttemptRequest{
+		MilestonesCompleted: []string{},
+		Head:                "stallhead-" + uuid.New().String(),
+		WorktreeFingerprint: "stallwf-" + uuid.New().String(),
+	})
+	if err != nil {
+		t.Fatalf("empty-declaration attempt: %v", err)
+	}
+	if res.AttemptCount != 1 {
+		t.Fatalf("attempt_count = %d, want 1", res.AttemptCount)
+	}
+	if len(res.Unmet) != 2 || res.Unmet[0] != "m2" || res.Unmet[1] != "m3" {
+		t.Fatalf("unmet = %v, want [m2 m3]", res.Unmet)
+	}
+	if n, _ := e.runCompletionAttempts(t, runID); n != 1 {
+		t.Fatalf("runs.completion_attempts = %d, want 1", n)
+	}
+	if n := e.attemptRowCount(t, runID); n != 1 {
+		t.Fatalf("run_completion_attempts rows = %d, want exactly 1", n)
+	}
+	var storedUnmet []string
+	if err := e.pool.QueryRow(e.ctx,
+		`SELECT ARRAY(SELECT jsonb_array_elements_text(latest_completion_attempt->'unmet')) FROM runs WHERE id = $1`, runID).
+		Scan(&storedUnmet); err != nil {
+		t.Fatalf("read latest_completion_attempt unmet: %v", err)
+	}
+	if len(storedUnmet) != 2 || storedUnmet[0] != "m2" || storedUnmet[1] != "m3" {
+		t.Fatalf("stored latest_completion_attempt unmet = %v, want [m2 m3]", storedUnmet)
+	}
+	// milestonesCompletedIDs sorts, so this compares as a set: an empty declaration adds nothing.
+	got := e.milestonesCompletedIDs(t, runID)
+	if len(got) != 1 || got[0] != "m1" {
+		t.Fatalf("milestones_completed after empty declaration = %v, want the same set [m1]", got)
+	}
+
+	run, applied, err := svc.SetRunCompletionHold(e.ctx, wkr, runID, "", nil)
+	if err != nil {
+		t.Fatalf("SetRunCompletionHold: %v", err)
+	}
+	if !applied {
+		t.Fatal("the hold must apply after the empty-declaration attempt")
+	}
+	if run.Status != "paused" {
+		t.Fatalf("held run status = %q, want paused", run.Status)
+	}
+	if !run.HoldReason.Valid || run.HoldReason.String != "completion_blocked" {
+		t.Fatalf("hold_reason = %+v, want 'completion_blocked'", run.HoldReason)
+	}
+}
+
 // attemptHeadFingerprint reads the single stored run_completion_attempts row's head and
 // worktree_fingerprint TEXT columns.
 func (e interlockLiveDB) attemptHeadFingerprint(t *testing.T, runID uuid.UUID) (head, fingerprint string) {

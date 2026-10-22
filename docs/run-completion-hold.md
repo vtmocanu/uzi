@@ -57,15 +57,34 @@ a pull/merge request:
    **in the same session** — no re-planning, no new run. Three identical
    consecutive completion attempts (same unmet IDs, branch head and worktree
    fingerprint) open the same question.
-3. If that window passes with no answer, the run parks in a **completion
+3. A run that has already reported at least one completed milestone and has
+   never made a completion attempt can also be caught when its lead stops
+   without calling `signal_done`: three consecutive turns with no tool
+   call, no subagent activity, no worktree change and no milestone progress
+   (the lead's wording is ignored; your input resets the count). The worker
+   then records an empty completion attempt that marks nothing complete and
+   opens the same question. This never opens or updates a pull/merge request
+   (like any completion check, it may push the branch tip to the run's
+   checkpoint ref as a durability checkpoint).
+4. If that window passes with no answer, the run parks in a **completion
    hold** — a `paused` run, but held for this structural reason rather than
    because you asked it to pause.
 
-A completion hold does not authorize publication. It preserves work for a
+An interlocked run that has already attempted completion can also enter a
+completion hold when its time limit is reached, including after Continue or
+when another worker picks it up. Earlier attempts with time still remaining
+do not by themselves stop work.
+
+A completion hold does not authorize finalization. It preserves work for a
 later decision. Normal capture verifies the Git work before parking. The
-pre-push guard also has a bounded degraded-capture path: after capture
-exhaustion it can hold with an empty captured head, retaining the clone and
-session without claiming a verified recovery copy. See
+pre-push guard and time-limit holds after a completion attempt also have a
+bounded degraded-capture path: after capture exhaustion they can hold with
+an empty captured head, retaining the clone and session without claiming a
+verified recovery copy. Uncertain hold delivery also retains local work.
+A refused time-limit hold that reports a live run retains the clone and session:
+that refusal does not prove another execution holds a recovery copy. Terminal
+refusals and cancellation keep their existing cleanup rules. Stopping that
+flight does not claim a confirmed hold or retry a model turn. See
 [Recovering unpublished work](run-recovery.md#completion-publication-holds).
 
 ## Requesting an owner decision
@@ -128,6 +147,24 @@ disagree about which one applies:
   question live, or has parked in the completion hold. Same label either way,
   since both mean the same thing: the run needs a decision.
 
+A stalled lead produces its own wording: the question says the lead stopped
+making progress without signalling done. If every milestone is already met, it
+says the contract is satisfied but the lead has not signalled done, and offers
+only **Continue**. If the window passes, the run is held and shows as **Completion blocked**,
+like any other completion hold; the hold does not carry stall-specific wording
+in the UI. On both Claude and Codex the activity feed shows a worker status
+line when the stall is caught: "no progress: the lead ended 3 consecutive
+turns with no tool call, no worktree change and no milestone progress without
+signalling done — running a completion check for an owner decision". When the
+window passes, Claude also shows "completion blocked: the lead stopped making
+progress without signalling done (N unmet frozen milestone(s)) — holding for
+an owner decision" as it enters the hold. The run is held for an
+owner decision rather than failing on the iteration budget. The attempt count
+includes the worker's stall attempt, so a run can show one attempt that the
+lead never made. If the stall is caught on the run's last iteration,
+**Continue** holds the run (Completion blocked) without a further turn,
+because no iteration is left.
+
 The completion panels show the bounded server-provided unmet-milestone list,
 the attempt count and the hold reason. The durable question feed also shows
 an explicit lead request's reason, escaped and labelled **Lead reason
@@ -169,7 +206,12 @@ uzi run decide <id> --continue [--guidance "<text>"]
   your guidance to the run's next session as a follow-up.
 
 Guidance is optional: `uzi run decide <id> --continue` with no `--guidance`
-simply tells the run to carry on with the required work.
+simply tells the run to carry on with the required work. It grants no extra
+time: after a time-limit completion hold, Continue immediately re-holds
+unless you extend the budget first (`uzi run extend <id> --by 2h`). Time
+spent paused adds no working budget. Extension alone does not resume a
+completion hold; then choose a completion decision. An extension accepted
+while the worker is already stopping for time may still leave the run held.
 
 **Partial** — reduce scope by naming the exact milestone ids to keep, with a
 required reason:
@@ -208,6 +250,13 @@ does not require the old unmet list or infer a formal decision from prose.
 
 ## Mixed-version limits
 
+The #3282 time-limit fix is worker-only. APIs supporting wall parking already
+return completion-attempt counts in running acknowledgements and wall-park
+refusals; no API upgrade, migration or chart pin change is needed for this
+fix. Old workers retain the previous loop until the worker image is rolled
+out (`workers.image.tag` for hosted workers). This is separate from the
+permit-scope version requirements below.
+
 A new API includes `completion_scope` in each granted worker permit, derived
 from the same locked run revision that authorized the permit. It is `{}`
 when there is no scope decision. A new worker uses this permit scope for
@@ -227,9 +276,10 @@ intent has separate version requirements below.
 
 **Be aware that a completion hold's conversation continuity is not durable
 across workers.** Verified captures can recover Git work on another worker.
-A degraded pre-push hold retains local work without verifying a recovery copy, so losing
-that worker can lose the latest work. The run's provider session (the live
-conversation state a same-worker resume continues without re-planning) survives only as
+A degraded pre-push or post-attempt time-limit hold retains local work without
+verifying a recovery copy, so losing that worker can lose the latest work.
+The run's provider session (the live conversation state a same-worker resume
+continues without re-planning) survives only as
 long as the same worker that held it is still around to reclaim it, bounded
 by the same worker-affinity ceiling that already governs every other parked
 run (2 hours by default; see

@@ -11068,7 +11068,11 @@ FOR UPDATE OF runs;
 -- PRD #1226 M2 (D4) + M3: record ONE gated completion attempt and return the run's new attempt
 -- count, ATOMICALLY and BOUNDED. Fired on the permit path's missing-milestones denial (with a
 -- head, no worktree fingerprint, no declaration) and by the same-lead nudge endpoint (with head,
--- worktree fingerprint AND the lead's declared milestones_completed). In one statement it:
+-- worktree fingerprint AND the lead's declared milestones_completed). The worker-initiated
+-- attempts reach the same endpoint with `milestones_completed: []` (the publication-start attempt,
+-- #3090, agent/src/runner.ts, and the no-progress stall attempt, #3139, both agent executors); an
+-- empty declaration adds no id, but unlike a NULL declaration it still rewrites the column (a
+-- NULL column becomes '[]' and the ids are deduplicated, possibly re-ordered). In one statement it:
 --   1. inserts the attempt row (`ins`) GUARDED to an INTERLOCKED run OWNED by the worker
 --      (completion_contract_version IS NOT NULL); the INSERT ... SELECT ... FROM runs yields no
 --      row and inserts nothing when the guard fails. Data-modifying CTEs always run to

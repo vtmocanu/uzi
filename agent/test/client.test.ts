@@ -1646,3 +1646,32 @@ describe("M2 API refresh wire classification", () => {
     });
   }
 });
+
+describe("3282 state and wall refusal historical projections", () => {
+  for (const count of [0, 1, -1, 0.5, Number.MAX_SAFE_INTEGER + 1]) it(`3282 validated count ${count} and used wall roundtrip`, async () => {
+    api.sendRawState("run-1", 200, JSON.stringify({ run: {
+      status: "running", completion_attempts: count, budget_used_seconds: 23.5,
+    } }));
+    const c = newClient();
+    const ack = await c.reportState("run-1", { status: "running" });
+    const expected = Number.isSafeInteger(count) && count >= 0 ? count : undefined;
+    assert.equal(ack.completionAttempts, expected);
+    assert.equal(ack.budgetUsedSeconds, 23.5);
+    api.setWallParkResponse("running", 409, { total: 100, used: 23.5, completionAttempts: count });
+    const refusal = await c.reportWallPark("run-1", { head: "", published: false });
+    assert.equal(refusal.completionAttempts, expected);
+    assert.equal(refusal.budgetUsedSeconds, 23.5);
+  });
+
+  for (const used of [-1, null, "1"]) it(`3282 rejects invalid used time ${used}`, async () => {
+    api.sendRawState("run-1", 200, JSON.stringify({ run: { status: "running", budget_used_seconds: used } }));
+    assert.equal((await newClient().reportState("run-1", { status: "running" })).budgetUsedSeconds, undefined);
+  });
+});
+
+
+it("3282 raw wall refusal preserves negative numeric used time", async () => {
+  api.setWallParkResponse("running", 409, { total: 100, used: -1 });
+  const refusal = await newClient().reportWallPark("run-1", { head: "", published: false });
+  assert.equal(refusal.budgetUsedSeconds, -1);
+});

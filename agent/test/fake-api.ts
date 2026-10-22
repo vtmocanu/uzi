@@ -405,7 +405,7 @@ export class FakeApi {
   private wallParkCommitted = false;
   readonly ownershipRequests: string[] = [];
   // Issue #1600: the budget_total_seconds / budget_used_seconds the wall-park RunDTO carries.
-  private wallParkBudget: { total?: number; used?: number } | undefined;
+  private wallParkBudget: { total?: number; used?: number; completionAttempts?: number } | undefined;
   // PRD #1226 M4 (D5): the completion-permit endpoint. Records each request (run + body) and answers
   // a configurable decision — a revision-bound grant by default, or {granted:false, deny_reason} — at a
   // configurable HTTP status (a non-200 models a transport/HTTP error the client THROWS on, distinct
@@ -1070,7 +1070,7 @@ export class FakeApi {
    *  answers with (default 200/"paused" = a landed park; 409 with a non-"paused" status models a
    *  REFUSED park the client must NOT throw on; a 404/5xx models an UNDELIVERABLE report the client
    *  THROWS on, D17). */
-  setWallParkResponse(status: string, httpStatus = 200, budget?: { total?: number; used?: number }): void {
+  setWallParkResponse(status: string, httpStatus = 200, budget?: { total?: number; used?: number; completionAttempts?: number }): void {
     this.wallParkStatus = status;
     this.wallParkHttpStatus = httpStatus;
     this.wallParkBudget = budget;
@@ -1724,6 +1724,7 @@ export class FakeApi {
       const run: Record<string, unknown> = { id: runId, status: this.wallParkStatus };
       if (this.wallParkBudget?.total !== undefined) run.budget_total_seconds = this.wallParkBudget.total;
       if (this.wallParkBudget?.used !== undefined) run.budget_used_seconds = this.wallParkBudget.used;
+      if (this.wallParkBudget?.completionAttempts !== undefined) run.completion_attempts = this.wallParkBudget.completionAttempts;
       return send(res, this.wallParkHttpStatus, { run });
     }
 

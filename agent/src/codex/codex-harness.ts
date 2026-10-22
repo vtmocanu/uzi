@@ -1722,7 +1722,14 @@ export class CodexHarness implements RunHarness {
         if (frame !== undefined) return frame;
         // A model-issued tool item on the root thread (issue #1800 inclusion evidence); any other
         // item update / unknown method is liveness only.
-        if (this.isModelIssuedItem(note)) return { kind: "activity", sessionId: this.threadId, modelInitiated: true };
+        if (this.isModelIssuedItem(note)) {
+          // issue #3139: native command/file/MCP items count as a lead tool call; a dynamic tool
+          // call is projected as a main-origin tool frame (non-signal only) and counted by the reducer.
+          if (this.isNativeLeadToolItem(note)) {
+            return { kind: "activity", sessionId: this.threadId, modelInitiated: true, leadToolCall: true };
+          }
+          return { kind: "activity", sessionId: this.threadId, modelInitiated: true };
+        }
         return { kind: "activity", sessionId: this.threadId };
       }
     }
@@ -2131,6 +2138,11 @@ export class CodexHarness implements RunHarness {
     if (params === undefined || params.threadId !== this.threadId) return false;
     const type = asString(asObject(params.item)?.type);
     return type === "commandExecution" || type === "fileChange" || type === "mcpToolCall" || type === "dynamicToolCall";
+  }
+
+  private isNativeLeadToolItem(note: Extract<CodexNotification, { kind: "activity" }>): boolean {
+    const type = asString(asObject(asObject(note.params)?.item)?.type);
+    return type === "commandExecution" || type === "fileChange" || type === "mcpToolCall";
   }
 
   // VERIFIED 2026-09-10: the native both-image packaged proof drove pinned Codex

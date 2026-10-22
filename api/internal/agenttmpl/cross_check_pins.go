@@ -11,6 +11,15 @@ const DefaultCodexModel = "gpt-6.1-sol"
 var CuratedCodexModels = map[string]bool{
 	"gpt-6-astra": true, "gpt-5.6-sol": true, "gpt-6-sol": true, "gpt-6.1-sol": true,
 }
+
+// CodexRoleModels is CuratedCodexModels plus gpt-6-luna: the model contract of
+// agent advice and role pins. It is not a picker vocabulary; the Claude-lane
+// guard uses it to refuse every id that only a Codex run can serve.
+var CodexRoleModels = map[string]bool{
+	"gpt-6-astra": true, "gpt-5.6-sol": true, "gpt-6-luna": true, "gpt-6-sol": true, "gpt-6.1-sol": true,
+}
+
+// Both sets above are pinned to fixtures/codex-models/models.json by tests.
 var KnownClaudeAliases = map[string]bool{"opus": true, "sonnet": true, "haiku": true, "fable": true}
 
 func ValidateFamilyModel(harness, raw string) (string, error) {
@@ -29,6 +38,19 @@ func ValidateFamilyModel(harness, raw string) (string, error) {
 		}
 	default:
 		return "", fmt.Errorf("unknown harness")
+	}
+	return model, nil
+}
+
+// ValidateClaudeLaneModel is ValidateModel for a Claude lane: "" (after trim)
+// stays "" (inherit or reset), and any CodexRoleModels member is refused.
+func ValidateClaudeLaneModel(raw string) (string, error) {
+	model, err := ValidateModel(raw)
+	if err != nil {
+		return "", err
+	}
+	if CodexRoleModels[model] {
+		return "", fmt.Errorf("model is a Codex model id")
 	}
 	return model, nil
 }

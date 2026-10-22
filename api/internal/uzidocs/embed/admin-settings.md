@@ -76,12 +76,22 @@ and how to add a theme.
 ## Run judge
 
 A global kill-switch for the [run judge](./judge.md), plus the model it runs
-on (**Judge model**, `opus` by default — the judge's recommendations feed
+on (**Claude judge model**, `opus` by default — the judge's recommendations feed
 self-improvement, so the strongest model is the default; pin a cheaper alias
-like `haiku` or `sonnet` to spend less). This switch
+like `haiku` or `sonnet` to spend less, and **Codex judge model**, `gpt-6.1-sol`
+by default, for judges of Codex runs). Each field is a model picker. The
+**Default · opus (built-in)** option of the Claude field and the
+**Default · gpt-6.1-sol (built-in)** option of the Codex field reset the
+instance value to the built-in, so it follows future changes to uzi's built-in
+default; saving an empty or whitespace-only `judge_model` through the admin API
+does the same (a blank instance value falls through to the built-in; a user's
+blank personal value instead inherits the instance value). The judge model keys
+store values trimmed, and a whitespace-only value stores empty and is reported
+as source `default`. This switch
 only arms the feature instance-wide; each user still opts in under their own
-Settings, and the judge always spends that user's own Anthropic token, never
-the admin's.
+Settings, and the judge always spends that user's own credential for the run's harness, never
+the admin's. A **Not a Claude model** warning appears under the Claude field
+when its stored value is a Codex id, which Claude judges skip.
 
 As an admin, you can also review every user's judge recommendations at once,
 in an attribution-hidden **All users** view on the Judge page, and mark them
@@ -91,8 +101,30 @@ done or file an issue from there — see
 **Upgrade note:** an instance that already had the judge enabled, with no
 `judge_model` pinned, starts spending `opus` the moment it upgrades to a
 version carrying this default — there's no migration that preserves the old
-(cheaper) value. Pin **Judge model** to `haiku` or `sonnet` before upgrading
+(cheaper) value. Pin **Claude judge model** to `haiku` or `sonnet` before upgrading
 if you want to keep spending where it was.
+
+**Upgrade note (per-harness judge model):** if the instance `judge_model`
+held a Codex id, Claude judges now skip it with a note and run on the built-in
+`opus` instead of the SDK default; a curated Codex id is also copied into
+`codex_judge_model`. **Admin → Instance → Run judge** shows the **Not a Claude
+model** warning on the Claude field while such a value is stored; choose
+**Default** there to clear it.
+
+The judge has one model setting per harness; a judge run uses the lane of its
+own run's harness (user lane, then instance lane, then built-in):
+
+| Setting | Default | Controls |
+|---|---|---|
+| `judge_model` | empty (built-in `opus`) | The instance Claude judge model. Claude aliases and ids only; Codex ids are rejected. |
+| `codex_judge_model` | empty (built-in `gpt-6.1-sol`) | The instance Codex judge model. Must be one of the curated Codex models (the ones the Codex worker model picker offers); no custom ids. An empty or whitespace-only value resets it to the built-in. Users set their own value under **Settings → Run defaults → Run judge → Codex judge model**; a blank personal value inherits this one. |
+
+A value not valid for the run's harness is skipped with a
+`harness_model_fallback` note and resolution falls through. A Codex id
+previously stored in `judge_model` is copied into `codex_judge_model` on
+upgrade; the Claude key is left unchanged. The instance Codex judge
+model is set in **Admin → Instance → Run judge → Codex judge model** or through
+the admin settings API (`codex_judge_model`).
 
 ### Judge mode: off, optional, enforced
 
@@ -104,10 +136,10 @@ above is off), combines with the kill-switch into three effective modes:
 |---|---|---|
 | `judge_enabled=false` | **Off** | Nobody — the kill-switch always wins, even with `judge_enforce_all=true`. |
 | `judge_enabled=true`, `judge_enforce_all=false` | **Optional** | Only users who've opted in themselves. |
-| `judge_enabled=true`, `judge_enforce_all=true` | **Enforced** | Every user who holds an Anthropic token, whether or not they've opted in; a token-less user is still skipped, since there's nothing to spend. |
+| `judge_enabled=true`, `judge_enforce_all=true` | **Enforced** | Every user who holds a usable credential for the run's harness (an Anthropic token for a Claude run, a usable Codex credential for a Codex run), whether or not they've opted in; a user without it is skipped for that run, since there's nothing to spend. |
 
 Enforcing the judge never redirects *who pays*: spend always stays on each
-run owner's own Anthropic token — an admin can force that judging happens,
+run owner's own credential for the run's harness — an admin can force that judging happens,
 never send the bill to a different account. It also overrides a per-user
 force-disable set on **Admin → Users**: the per-user toggle there is shown
 greyed and labelled "Inert: enforced mode judges every run regardless of
@@ -120,9 +152,9 @@ judge doc.
 If your users hold Anthropic **subscription** plans rather than metered
 console keys, remember that an enforced `opus` judge spends their
 plan/rate-limit **quota**, not dollars — a busy judge can eat into the quota
-their real runs need. Pin **Judge model** to `haiku`/`sonnet` before
+their real runs need. Pin **Claude judge model** to `haiku`/`sonnet` before
 enforcing, or leave enforcement off and let users opt in with their own
-per-user model choice (**Settings → Run judge → Judge model**).
+per-user model choice (**Settings → Run defaults → Run judge → Claude judge model** and **Codex judge model**).
 
 ### Spend guards
 

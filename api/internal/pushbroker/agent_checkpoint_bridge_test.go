@@ -28,6 +28,7 @@ type bridgePublish struct {
 	tip     string
 	skipped string
 	err     string
+	result  pushbroker.Result
 }
 
 // errBridgeSuperseded stands in for the api's slot refusal (workersvc "superseded"), a 200 skip the
@@ -176,7 +177,7 @@ func runBridgeFixture(t *testing.T, root, node string, cfg map[string]any, summa
 }
 
 // TestAgentCheckpointChainBridge is the issue #2733 binding bridge. It runs the REAL agent
-// (agent/test/fixtures/checkpoint-chain-bridge.ts: a real RunRunner + GitCache driving a GitHub
+// (agent/test/fixtures/checkpoint-selective-chain-bridge.ts: a real RunRunner + GitCache driving a GitHub
 // forge claim through a workflow-overlay checkpoint O and then a raw tick or iteration checkpoint
 // N) against the REAL pushbroker.Publish, over the real HTTP route and WorkerClient.publishCheckpoint.
 // The broker keeps its depth-1 fetch and pack boundaries; no commit shape is built on the Go side,
@@ -186,8 +187,9 @@ func runBridgeFixture(t *testing.T, root, node string, cfg map[string]any, summa
 // acknowledgement lost after it landed.
 //
 // The stale-base family (issue #3242) runs the same real agent through a turn whose tip never moves
-// while origin's default branch advances, then publishes. Its broker fetches over real smart HTTP
-// (git http-backend), so the depth-1 base fetch is the one every forge serves.
+// while origin's default branch advances, then publishes via checkpoint-chain-bridge.ts.
+// Its broker fetches over real smart HTTP (git http-backend), so the depth-1 base fetch is the one
+// every forge serves.
 //
 // Gated by UZI_CHECKPOINT_CHAIN_BRIDGE=1 (task test:checkpoint-chain-bridge): it needs Node and the
 // installed agent dependencies, so the default `go test ./...` skips it. Once the gate is set a
@@ -213,6 +215,11 @@ func TestAgentCheckpointChainBridge(t *testing.T) {
 	for i, c := range staleBaseCases {
 		t.Run("stale-base/"+c.name, func(t *testing.T) {
 			runAgentStaleBaseBridge(t, root, node, c, 3242101+i)
+		})
+	}
+	for i, c := range originSeededCases {
+		t.Run("origin-seeded/"+c.name, func(t *testing.T) {
+			runAgentOriginSeededBridge(t, root, node, c, 3284101+i)
 		})
 	}
 }
@@ -253,6 +260,150 @@ var staleBaseCases = []staleBaseCase{
 	{name: "seeded-pause", shape: "linear", advance: "plain", seededPause: true, want: "published"},
 }
 
+// originSeededCase is the issue #3284 shape: origin already carries refs/heads/<branch> at a seed
+// commit and NO checkpoint ref; the claim is seeded with planned_base_commit = seed and
+// require_base_match = true; the run does zero new work. Origin's main advances (advance) after the
+// worker resolved its floor. mode "tick" publishes through one tick; mode "pause" first lets a tick
+// establish the tracking ref (answered superseded before the broker, as in the seeded-pause idiom),
+// so the pause is the first publish the broker sees. want is the broker's outcome for that publish.
+type originSeededCase struct {
+	name    string
+	advance string // "none" | "plain" | "workflow"
+	mode    string // "tick" | "pause"
+	guard   bool
+	want    string // "published" or the skip label
+}
+
+var originSeededCases = []originSeededCase{
+	{name: "tick-unmoved", advance: "none", mode: "tick", want: "published"},
+	{name: "tick-plain", advance: "plain", mode: "tick", want: "published"},
+	{name: "tick-workflow", advance: "workflow", mode: "tick", want: "published"},
+	{name: "pause-unmoved", advance: "none", mode: "pause", want: "published"},
+	{name: "pause-plain", advance: "plain", mode: "pause", want: "published"},
+	{name: "pause-workflow", advance: "workflow", mode: "pause", want: "published"},
+	{name: "guarded-tick-plain", advance: "plain", mode: "tick", guard: true, want: "published"},
+	{name: "guarded-pause-plain", advance: "plain", mode: "pause", guard: true, want: "published"},
+	{name: "guarded-tick-workflow", advance: "workflow", mode: "tick", guard: true, want: "ci_config_guard"},
+	{name: "guarded-pause-workflow", advance: "workflow", mode: "pause", guard: true, want: "ci_config_guard"},
+}
+
+func runAgentOriginSeededBridge(t *testing.T, root, node string, c originSeededCase, iid int) {
+	backend := requireGitHTTPBackend(t)
+	trustLoopbackTLS(t)
+	f := newGitFixture(t)
+	f.commit("README.md", "bridge\n", "initial")
+	if err := os.MkdirAll(filepath.Join(f.work, ".github", "workflows"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	f.commit(".github/workflows/ci.yml", "name: ci\non: push\njobs: {}\n# base\n", "workflow v1")
+	f.pushMain()
+	seed := f.commit("seed.txt", "seed\n", "seed")
+	branch := fmt.Sprintf("agent/issue-%d", iid)
+	ref := "refs/uzi-checkpoints/" + branch
+	f.git("push", "origin", seed+":refs/heads/"+branch)
+	if f.originRef(ref) != "" {
+		t.Fatal("precondition: origin must carry no checkpoint ref")
+	}
+	url := newGitHTTPRemote(t, f, backend).cloneURL(f)
+
+	var (
+		mu    sync.Mutex
+		first = true
+	)
+	srv := newBridgeServer(t, ref, false, func(ctx context.Context, tip string, pack []byte) error {
+		mu.Lock()
+		superseded := c.mode == "pause" && first
+		first = false
+		mu.Unlock()
+		if superseded {
+			return errBridgeSuperseded
+		}
+		opts := pushbroker.Options{
+			CloneURL: url, Username: "uzi-bot", PAT: redirectTestPAT(),
+			Branch: branch, DefaultBranch: "main", DeclaredTip: tip, Pack: pack,
+		}
+		if c.guard {
+			opts.CIConfigGuard, opts.CIConfigPaths = true, []string{".github/workflows/**"}
+		}
+		_, err := pushbroker.Publish(ctx, opts)
+		return err
+	})
+
+	var summary struct {
+		BaseTip             string `json:"baseTip"`
+		MainTip             string `json:"mainTip"`
+		ClaimPlannedBase    string `json:"claimPlannedBase"`
+		ClaimRequireBase    bool   `json:"claimRequireBase"`
+		ClaimCheckpointTip  string `json:"claimCheckpointTip"`
+		ClaimPlanSource     string `json:"claimPlanSource"`
+		CheckpointRefBefore string `json:"checkpointRefBefore"`
+		FirstTickOutcome    string `json:"firstTickOutcome"`
+		TickOutcome         string `json:"tickOutcome"`
+		Parked              bool   `json:"parked"`
+		CheckpointRefAfter  string `json:"checkpointRefAfter"`
+		BranchAfter         string `json:"branchAfter"`
+	}
+	out, runErr := runBridgeFixture(t, root, node, map[string]any{
+		"url": srv.srv.URL, "token": "tkn-bridge-123456", "origin": f.bare, "iid": iid, "boundary": "tick",
+		"originSeeded": map[string]any{"seed": seed, "advance": c.advance, "mode": c.mode},
+		"scratch":      t.TempDir(),
+	}, &summary)
+	publishes := srv.publishes()
+	describe := func() string {
+		return fmt.Sprintf("case=%+v seed=%s publishes=%+v summary=%+v\n%s", c, seed, publishes, summary, out)
+	}
+	if runErr != nil {
+		t.Fatalf("agent fixture failed: %v\n%s", runErr, describe())
+	}
+	// Preconditions: a seeded require-base claim on the seed, no inherited checkpoint, no checkpoint
+	// ref, zero new work (the worktree is still the seed).
+	if summary.ClaimPlanSource != "seeded" || summary.ClaimPlannedBase != seed || !summary.ClaimRequireBase ||
+		summary.ClaimCheckpointTip != "" || summary.CheckpointRefBefore != "" || summary.BaseTip != seed {
+		t.Fatalf("claim/origin preconditions not as intended\n%s", describe())
+	}
+	if c.advance != "none" && (summary.MainTip == "" || f.originRef("refs/heads/main") != summary.MainTip) {
+		t.Fatalf("origin main did not advance after the floor resolved\n%s", describe())
+	}
+	// The publish under test is the only one the broker sees (a tick), or the second (a pause, after
+	// the superseded first tick). Every request declares the seed.
+	wantPublishes := 1
+	if c.mode == "pause" {
+		wantPublishes = 2
+		if summary.FirstTickOutcome == "published" || len(publishes) == 0 || publishes[0].skipped != "superseded" {
+			t.Fatalf("the first tick was not answered superseded before the broker\n%s", describe())
+		}
+	}
+	if len(publishes) != wantPublishes {
+		t.Fatalf("publishes = %+v, want %d\n%s", publishes, wantPublishes, describe())
+	}
+	got := publishes[len(publishes)-1]
+	if got.tip != seed {
+		t.Fatalf("declared tip %s, want the seed %s\n%s", got.tip, seed, describe())
+	}
+	if c.want != "published" {
+		if got.skipped != c.want || summary.Parked || summary.TickOutcome == "published" || summary.CheckpointRefAfter != "" {
+			t.Fatalf("want the broker's %q refusal with no checkpoint ref and no park\n%s", c.want, describe())
+		}
+		return
+	}
+	if got.skipped != "" || got.err != "" {
+		t.Fatalf("the first publication was refused: skipped=%q err=%q\n%s", got.skipped, got.err, describe())
+	}
+	if c.mode == "tick" && summary.TickOutcome != "published" {
+		t.Fatalf("tick outcome = %q, want published\n%s", summary.TickOutcome, describe())
+	}
+	if c.mode == "pause" && !summary.Parked {
+		t.Fatalf("the pause did not park\n%s", describe())
+	}
+	if ck := summary.CheckpointRefAfter; ck != seed {
+		t.Fatalf("checkpoint ref = %s, want the seed %s\n%s", ck, seed, describe())
+	}
+	// Read inside the turn: the run's own finish may push the branch afterwards.
+	if b := summary.BranchAfter; b != seed {
+		t.Fatalf("origin branch was %s at the checkpoint, want the seed %s\n%s", b, seed, describe())
+	}
+}
+
 func runAgentCheckpointBridge(t *testing.T, root, node, boundary string, iid int, lostAck bool) {
 	f := newGitFixture(t)
 	f.commit("README.md", "bridge\n", "initial")
@@ -263,14 +414,104 @@ func runAgentCheckpointBridge(t *testing.T, root, node, boundary string, iid int
 	f.pushMain()
 	branch := fmt.Sprintf("agent/issue-%d", iid)
 	ref := "refs/uzi-checkpoints/" + branch
+	// The origin branch pins the old floor; default gains then deletes a bounded historical blob.
+	run(t, "", "git", "-C", f.work, "push", "origin", "HEAD:refs/heads/"+branch)
+	f.commit("historical.txt", "historical default content\n", "historical default blob")
+	historicalBlob := strings.TrimSpace(run(t, "", "git", "-C", f.work, "rev-parse", "HEAD:historical.txt"))
+	run(t, "", "git", "-C", f.work, "rm", "historical.txt")
+	run(t, "", "git", "-C", f.work, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "remove historical default blob")
+	f.pushMain()
 
-	srv := newBridgeServer(t, ref, lostAck, func(ctx context.Context, tip string, pack []byte) error {
-		_, err := pushbroker.Publish(ctx, pushbroker.Options{
+	ctx, cancel := context.WithTimeout(context.Background(), 110*time.Second)
+	defer cancel()
+	var mu sync.Mutex
+	var seen []bridgePublish
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasPrefix(r.URL.Path, "/api/worker/runs/") || !strings.HasSuffix(r.URL.Path, "/publish") {
+			http.NotFound(w, r)
+			return
+		}
+		tip := r.Header.Get("X-Uzi-Checkpoint-Tip")
+		pack, err := checkpointBridgePack(r.Body)
+		if err != nil {
+			cancel() // Join the child through cmd.Run before reporting the bounded-read failure.
+			http.Error(w, "read pack", http.StatusBadRequest)
+			return
+		}
+		// Match production's typed refusal tokens; service ownership/slot retry stays outside this bridge.
+		result, err := pushbroker.Publish(r.Context(), pushbroker.Options{
 			CloneURL: f.cloneURL(), Branch: branch, DefaultBranch: "main", DeclaredTip: tip, Pack: pack,
+			CIConfigGuard: true, CIConfigPaths: []string{".github/workflows/**"},
 		})
-		return err
-	})
+		rec := bridgePublish{tip: tip, result: result}
+		resp := map[string]any{"published": true, "ref": ref}
+		switch {
+		case err == nil:
+		case checkpointBridgeRefusal(err) != "":
+			rec.skipped = checkpointBridgeRefusal(err)
+		default:
+			rec.err = err.Error()
+			http.Error(w, "publish failed", http.StatusInternalServerError)
+			mu.Lock()
+			seen = append(seen, rec)
+			mu.Unlock()
+			return
+		}
+		if rec.skipped != "" {
+			resp = map[string]any{"published": false, "ref": ref, "skipped": rec.skipped}
+		}
+		mu.Lock()
+		seen = append(seen, rec)
+		first := len(seen) == 1
+		mu.Unlock()
+		if lostAck && first {
+			// The overlay landed in origin; the agent never sees the acknowledgement.
+			http.Error(w, "ack lost", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
 
+	scratch, err := os.MkdirTemp(filepath.Join(root, ".uzi/scratch"), "chain-bridge-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("chain evidence=%s", scratch)
+	cfg, err := json.Marshal(map[string]any{
+		"url": srv.URL, "token": "tkn-bridge-123456", "origin": f.bare, "iid": iid,
+		"boundary": boundary, "scratch": scratch, "defaultBranch": "main", "historicalBlob": historicalBlob,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.CommandContext(ctx, node, "--import", "tsx", "test/fixtures/checkpoint-selective-chain-bridge.ts")
+	cmd.Dir = filepath.Join(root, "agent")
+	cmd.WaitDelay = 10 * time.Second
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "NODE_TEST_CONTEXT=") {
+			cmd.Env = append(cmd.Env, kv)
+		}
+	}
+	cmd.Env = append(cmd.Env, "UZI_CHAIN_BRIDGE_FIXTURE="+string(cfg))
+	stdout := &checkpointBridgeOutput{cancel: cancel}
+	stderr := &checkpointBridgeOutput{cancel: cancel}
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	runErr := cmd.Run()
+	if stdout.overflow || stderr.overflow {
+		t.Fatal("fixture output exceeded one MiB; child cancelled and joined")
+	}
+
+	mu.Lock()
+	publishes := append([]bridgePublish(nil), seen...)
+	mu.Unlock()
+	describe := func() string {
+		return fmt.Sprintf("publishes=%+v\nstdout:\n%s\nstderr:\n%s", publishes, stdout.String(), stderr.String())
+	}
+	if runErr != nil {
+		t.Fatalf("agent fixture failed: %v\n%s", runErr, describe())
+	}
 	var summary struct {
 		Overlay     string   `json:"overlay"`
 		OverlayRef  string   `json:"overlayRef"`
@@ -282,16 +523,16 @@ func runAgentCheckpointBridge(t *testing.T, root, node, boundary string, iid int
 			HTTPStatus int  `json:"httpStatus"`
 		} `json:"results"`
 	}
-	out, runErr := runBridgeFixture(t, root, node, map[string]any{
-		"url": srv.srv.URL, "token": "tkn-bridge-123456", "origin": f.bare, "iid": iid,
-		"boundary": boundary, "scratch": t.TempDir(),
-	}, &summary)
-	publishes := srv.publishes()
-	describe := func() string { return fmt.Sprintf("publishes=%+v\n%s", publishes, out) }
-	if runErr != nil {
-		t.Fatalf("agent fixture failed: %v\n%s", runErr, describe())
+	found := false
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		if rest, ok := strings.CutPrefix(line, "BRIDGE_SUMMARY "); ok {
+			if err := json.Unmarshal([]byte(rest), &summary); err != nil {
+				t.Fatalf("bad summary %q: %v", rest, err)
+			}
+			found = true
+		}
 	}
-	if summary.Overlay == "" || summary.RawTip == "" {
+	if !found || summary.Overlay == "" || summary.RawTip == "" {
 		t.Fatalf("fixture summary incomplete: %+v\n%s", summary, describe())
 	}
 
@@ -302,6 +543,13 @@ func runAgentCheckpointBridge(t *testing.T, root, node, boundary string, iid int
 	subject := strings.TrimSpace(run(t, "", "git", "-C", f.bare, "log", "-1", "--format=%s", summary.Overlay))
 	if !strings.HasPrefix(subject, "ckpt(overlay):") {
 		t.Fatalf("overlay subject = %q, want a ckpt(overlay): commit", subject)
+	}
+	// The fixture advances default with the same run file before changing workflows:
+	// the real overlay wrapper must therefore have exactly default's complete tree.
+	overlayTree := strings.TrimSpace(run(t, "", "git", "-C", f.bare, "rev-parse", summary.Overlay+"^{tree}"))
+	defaultTree := strings.TrimSpace(run(t, "", "git", "-C", f.bare, "rev-parse", "refs/heads/main^{tree}"))
+	if overlayTree != defaultTree {
+		t.Fatalf("overlay tree %s differs from default tree %s", overlayTree, defaultTree)
 	}
 
 	// A lost acknowledgement is an HTTP 500 the agent retries once with the SAME overlay tip, so
@@ -338,7 +586,15 @@ func runAgentCheckpointBridge(t *testing.T, root, node, boundary string, iid int
 		}
 	}
 
-	for _, p := range publishes {
+	for i, p := range publishes {
+		want := pushbroker.PublishAdvanced
+		already := lostAck && i == 1
+		if already {
+			want = pushbroker.PublishUnclassified
+		}
+		if p.result.Disposition != want || p.result.AlreadyCurrent != already {
+			t.Fatalf("publish %d result=%+v want disposition=%v alreadyCurrent=%t", i, p.result, want, already)
+		}
 		if p.skipped != "" || p.err != "" {
 			t.Fatalf("a publish was not accepted (tip %s skipped=%q err=%q)\n%s", p.tip, p.skipped, p.err, describe())
 		}

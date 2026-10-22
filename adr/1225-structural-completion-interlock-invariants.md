@@ -63,7 +63,7 @@ On a gated `signal_done`, the executor checkpoints the current work **before** a
 
 Additive routing (#3089): on an interlocked, noninteractive issue run on either harness, `signal_done({owner_decision_requested:{reason:string}})` can open that same question at the first authoritative unmet result without waiting for the stall threshold. The request object admits only `reason`, trimmed to 1–500 Unicode code points by validation (invalid or extra keys are refused, never truncated). It supplies no scope authority and does not block finalization when the authoritative unmet set is empty. The fingerprint, iteration/wall budgets, deadline, cancellation/pause/completion-budget bounds and I6 capture-before-park ordering remain unchanged; requesting the window resets none of them. The durable question labels and escapes the lead reason as untrusted display text and uses server-provided unmet IDs. Only the existing decision endpoints apply continue/partial/accept, within their existing live completion-question or paused completion-blocked windows; ordinary clarification and plain pause remain ineligible. Ordinary answers, repository docs and `non_closing` carry no scope authority. After any answer the worker asks for a fresh authoritative `signal_done` recheck, without enforcing the old unmet list or inferring a formal decision from prose.
 
-Before any completion attempt exists on a run, legacy stall/wall/budget outcomes are byte-for-byte unchanged — this whole apparatus only engages once a run has entered the completion protocol at least once.
+Before any completion attempt exists on a run, legacy stall/wall/budget outcomes remain unchanged except for the eligible worker-initiated first attempt in the [#3139 stall addendum](#addendum--worker-initiated-stall-attempt-2026-10-21-3139). Wall and served completion-budget routing also recognize validated server history from an earlier flight (#3282); idle, iteration and stall routing still require this flight's completion attempt.
 
 ### I6 — `SetRunCompletionHold` is a dedicated sibling of `SetRunPaused`, not a widening of it, with a fixed capture-then-park order (D6)
 
@@ -71,8 +71,9 @@ Exactly like [ADR-1190](1190-run-pause-invariants.md) rejected widening `SetRunP
 
 The normal park order is fixed and must not be reordered by a later child.
 The #3090 pre-push exception skips remote checkpoint publication and permits
-bounded degraded capture with local retention, as recorded in the dated
-addendum below; it does not relax the prior-attempt guard above:
+bounded degraded capture with local retention. #3282 also permits degraded
+capture for post-attempt wall/budget holds. The dated addenda below qualify
+the sequence without relaxing the prior-attempt guard above:
 
 1. reap the agent tree (before any credentialed capture git — REAP-BEFORE-GIT);
 2. WIP-commit dirty work;
@@ -82,7 +83,7 @@ addendum below; it does not relax the prior-attempt guard above:
 6. call `SetRunCompletionHold` and require the **returned status literally `paused`** — the same positive-ACK contract the pause park uses, never `applied` alone;
 7. only then mark the flight parked so normal cleanup runs.
 
-**The preserve flags (`preserveRecoveryClone`, `preserveSession`) are set before capture.** Ordinary capture exhaustion clears them; a definitive hold refusal permits terminal cleanup. An ambiguous hold delivery retains the clone and session and ends non-terminal, without claiming a confirmed park. A literal `paused` ACK or the existing fenced ownership probe confirms the hold. `captureHoldContext` retains [ADR-1197](1197-transient-recovery-park.md)'s verified-capture sequence (dirty check → WIP commit → fetch → positive tracking-ref verification → best-effort remote publish); a prior checkpoint is not proof of the latest capture. The #3090 addendum qualifies that template only for new pre-push holds: exhausted capture can request the existing empty-head degraded hold, preserving live work without claiming a verified recovery copy.
+**The preserve flags (`preserveRecoveryClone`, `preserveSession`) are set before capture.** Ordinary capture exhaustion clears them; the pre-push and post-attempt wall/budget exceptions instead request an empty-head hold and retain local work. A definitive hold refusal permits existing cleanup. An ambiguous hold delivery retains the clone and session and ends non-terminal, without claiming a confirmed park. A literal `paused` ACK or the existing fenced ownership probe confirms the hold. `captureHoldContext` retains [ADR-1197](1197-transient-recovery-park.md)'s verified-capture sequence (dirty check → WIP commit → fetch → positive tracking-ref verification → best-effort remote publish); a prior checkpoint is not proof of the latest capture. The #3090 and #3282 addenda qualify that template for pre-push and post-attempt wall/budget holds: exhausted capture can request the existing empty-head degraded hold, preserving live work without claiming a verified recovery copy.
 
 ### I7 — the served `budget_exhausted` steer is one-shot and survives an ordinary running report (D3)
 
@@ -92,9 +93,13 @@ addendum below; it does not relax the prior-attempt guard above:
 
 **`SetRunRunning` must clear only `hold_reason`/`hold_captured_head` on the resume→running transition — it must never clear `completion_budget_exhausted_at`.** A regression here (fixed in `a32d3264`, caught by review before ship) had `SetRunRunning` unconditionally clearing the served flag; because `SetState`'s running arm calls `SetRunRunning` and *then* re-reads the row for the same ACK, the flag was disarmed before the worker could ever observe it — a live lead past its wall could never be steered into the hold at all. The flag's only legitimate clears are `SetRunCompletionHold` (the worker acted on it) and `ContinueCompletionDecision` (a new owner decision, D3's third clear) — never an ordinary heartbeat. `TestSetRunRunningPreservesCompletionBudgetExhaustedLiveDB` pins this by arming the flag through the real stamp query and asserting a subsequent running report leaves it set.
 
+The #3282 worker routing below carries this live-worker wall carve-out across flights using validated server attempt history. It also checks the same running ACK's spent wall time before another implementation dispatch, without waiting for the sweep's `budget_exhausted` steer. Prior history with wall time remaining does not itself block work.
+
 ### I8 — one owner decision, one endpoint, and honest `same_worker_only` durability (D6/D7/D8)
 
 `ContinueCompletionDecision` was the only decision this child (#1226) shipped (`{decision: continue, guidance?}`); #1227 has since added `partial` and `accept` on the same endpoint (see the Consequences section below), so the handler now 400s only a value outside that three-way domain. It dispatches on exactly two windows: the **live** `awaiting_input` completion-question window (identified by the dedicated `completion_question_at` marker — never the old, imprecise "interlocked AND `completion_attempts > 0`" proxy, which could match an ordinary PRD #88 clarification on an interlocked post-attempt run and let a continue-decision resolve the *wrong* question), and the **paused** `hold_reason='completion_blocked'` window. The live window resumes in place (delivered as an `answer` the worker's `steering.awaitAnswer` can resolve, never a `follow_up`); the paused window resumes through `queued` via `ResumePausedRun`, deliberately leaving `hold_reason`/`hold_captured_head` **set** until the first accepted running report clears them (D7) — not prematurely in the resume itself, so a resumed-but-not-yet-running row still visibly carries why it was held.
+
+Continue grants no extra wall budget. After a time-limit completion hold, Continue re-holds at once unless the owner extends the budget first; paused-time banking does not add active time. Extension alone does not resume `completion_blocked`: a completion decision is still required.
 
 The live window itself is time-boxed by `completion_hold_window_seconds` (claim-delivered, default 900s, `agent/src/runner.ts`'s `askCompletionQuestion`) — **deliberately separate** from `question_timeout_seconds` and from the `#88` `questionDeadlines`/`questionCounts` bookkeeping, and its expiry **resolves** `{outcome: "expired"}` rather than rejecting — this window has no fail-closed path and must never throw `REASON_QUESTION_TIMEOUT`; expiry always routes to the verified hold (I6), never to `failed`.
 
@@ -262,6 +267,66 @@ remains: there is no API fence around the Git push itself.
 preauthorization or semantic activation. Live deployment acceptance has not
 been performed; mocked tests and PR existence establish neither that
 acceptance nor full end-to-end coverage.
+
+## Addendum — wall/budget history across flights (2026-10-22, #3282)
+
+Both harnesses keep `completionAttempted` initially false for each flight,
+separate from monotonic `CompletionHistory.priorAttempt`. The latter latches
+on a positive safe-integer count from the validated existing iteration ACK
+or the full `RunDTO` in a wall-park 409 refusal. Zero, missing or invalid
+counts do not erase confirmed history. Wall and served `budgetExhausted`
+routing use either latch; idle, iteration and stall routing are unchanged.
+
+Once historical state is confirmed, finite nonnegative `usedWallSeconds`
+and `totalWallSeconds` from the same ACK with used >= total stop a post-attempt
+run before another implementation dispatch, even if `budgetExhausted` is
+false. The served total includes extensions and finalize allowance. Missing
+timing fields leave existing wall trips and budget steers in charge; prior
+history alone with time remaining permits work.
+
+A positive-count wall refusal routes immediately to a completion hold,
+without lifecycle rearm or model redrive. A genuine zero-attempt owner
+extension keeps the existing redrive. D14's accepted race remains: an
+extension accepted between the wall trip and hold may still leave the run
+held. A declined wall/budget completion hold stops the flight non-terminal,
+without fallback wall park, redrive or finalization.
+
+These wall/budget routes pass `allowDegradedCapture`: bounded capture
+exhaustion requests an empty-head hold, keeping clone and HOME without
+claiming a verified recovery copy. Unresolved delivery retains them too.
+Retention follows evidence. A refused wall/budget hold reporting a live run
+retains clone and HOME: that refusal proves neither source coverage nor safe
+handoff to another generation. Terminal refusals, cancellation and stale
+claim fencing keep their existing handling. Cancellation observed before the
+hold POST sends no hold request. (AI-synced 2026-10-22)
+
+This is a worker-only fix. APIs supporting wall parking already serve the
+count on both running ACKs and wall-park refusals; no API, migration or chart
+pin change is required. Old workers retain the old loop until rollout via
+`workers.image.tag`. The inherited resumed-flight gap is closed by this
+amendment; the #3139 stall path below uses the same landed history routing.
+
+## Addendum — worker-initiated stall attempt (2026-10-21, #3139)
+
+Another source of a completion attempt joins the lead's `signal_done`, the permit path's missing-milestones denial and the #3090 publication-start empty attempt (above, *Hold, attempts and capture*): a **worker-initiated stall attempt**. It exists so a lead that stops making progress without ever calling `signal_done` reaches the owner question and the hold instead of failing on the iteration budget.
+
+**Eligibility** (agent-only; both Claude and Codex): an interlocked, non-interactive issue run that has previously reported at least one completed milestone and whose server-reported `completion_attempts` is exactly 0. The trip is `STALL_LIMIT` (3) consecutive lead turns with no lead tool call, no subagent activity, an unchanged worktree and unchanged milestone progress sets. A `report_progress` with no change still counts as no progress; owner or system input resets the count; the lead's wording is ignored. Runs with no reported completed milestone, interactive and non-issue runs, and resumed runs with `completion_attempts` > 0 are unchanged.
+
+**What it records.** One worker-initiated attempt with an empty declaration (`declared: []`, not report-only, not non-closing), so it marks nothing complete. The worker then asks the existing **Completion blocked** owner question with stall-specific text (worker-authored question text); when no milestone is unmet, the text says the contract is satisfied but the lead has not signalled done, and offers only continue. If the live window expires, the run enters the completion hold (I6) instead of failing on `max_iterations`. The worker's hold request carries only the head and claim generation, so the server stores the generic `completion_blocked` reason and the UI shows Completion blocked; the stall-specific reason string is worker-internal (worker log, and the failure reason only when the hold cannot be entered). The stall path never opens or updates a pull/merge request; like any done checkpoint it may push the branch tip to the run's checkpoint ref (`refs/uzi-checkpoints/<branch>`) as a durability checkpoint. A continue answer returns to the lead for a server-authoritative recheck. If the trip happened on the last iteration, a continue holds the run without a further turn because none remains.
+
+**Qualification of the pre-attempt invariant.** I5's statement that legacy stall/wall/budget outcomes are unchanged before any attempt exists is true only for runs that are not eligible above. For an eligible stalled run the worker creates that attempt itself, so the run is on the completion path from then on, subject to the per-flight note below.
+
+**Consequences of the attempt existing.**
+
+- `completion_attempts` is never cleared. Once it is above 0, `RequestWallParks` spares a post-attempt run whose worker heartbeat is live (the #1226 carve-out starts applying), so a later wall exhaustion on a live worker goes through `StampCompletionBudgetExhausted` into a completion hold rather than a wall park. This holds only while the worker is live: `ParkRunsAtWall` can still park a post-attempt run whose worker heartbeat went stale, with `hold_reason='budget_exhausted'`, where `CanStopAtWall` can be true.
+- Wall and served completion-budget exhaustion recognize validated server history from an earlier flight through `CompletionHistory` (#3282), independently of this flight's attempt latch. A resumed run with a prior attempt enters the completion hold, using the bounded empty-head fallback if capture exhausts. A live hold refusal stops the flight nonterminally with clone and HOME retained; it never falls back to wall-park retries or model redrive. Zero-attempt owner-extension refusals keep their existing redrive behavior. (AI-synced 2026-10-22)
+- Max-iterations (both harnesses) and #281 no-progress stops (Claude only; see the residual) on that run route to the completion hold. `completionAttempted` is per flight: after a hold is resumed, routing of those stops in the resumed flight needs an attempt in that flight. The stall itself stays ineligible in the resumed flight because the server count is above 0.
+- `RunView`'s attempt count includes the worker's stall attempt.
+- The stall-time done checkpoint may capture the stall-time head. That state authorizes nothing: publication and the code cross-check use the later real done checkpoint's head, so the published head and the head the cross-check reviewed both come from it (`agent/test/runner-completion-stall.test.ts`).
+
+**Accepted residuals.** The #281 identical-text detector exists only in the Claude executor; the residual and the "#281 stops route to the hold" bullet apply to Claude only. On an eligible Claude run the older #281 detector (identical-text based; it ignores tool calls) can still reach its streak first and fail the run before any attempt exists when its streak runs ahead of the stall counter, for example a tool-calling turn with identical text followed by two tool-free turns. This addendum does not close that gap. Separately, an in-place restarted (aborted) turn (credential give-up, declined pause, refused wall park) neither counts as a stall turn nor resets the streak; fingerprint equality still bounds it.
+
+User-facing behavior is described in [Completion holds](../docs/run-completion-hold.md).
 
 ## Semantic default-on amendment (2026-10-17, #1230/#1231; status updated 2026-10-20)
 

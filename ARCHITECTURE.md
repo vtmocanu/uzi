@@ -1021,7 +1021,9 @@ chain in the diagram above, with no intervening `running`.
   captures uncommitted mid-milestone work as a throwaway `wip(park):` commit that
   the checkpoint broker ([PRD #628](prds/done/628-cross-worker-resume-durability.md))
   carries off the worker and adoption peels back to uncommitted (exact recovery
-  same-worker, best-effort cross-worker, bounded by `WORKER_AFFINITY_CEILING`). A
+  same-worker, best-effort cross-worker, bounded by `WORKER_AFFINITY_CEILING`;
+  the marker never commits core dumps or files over 8 MiB, and one under a
+  verified coverage wrapper is peeled at successor adopt). A
   resumed run whose plan is provably reviewed and whose work recovered continues
   without re-gating; a total loss re-gates a human-approved run, preserving
   [PRD #209](prds/done/209-seeded-plan-runs.md)'s loss-detection property. See
@@ -1182,9 +1184,10 @@ chain in the diagram above, with no intervening `running`.
   rejected provider resume re-park unless the exact claim has explicit fresh
   consent. Attempt isolation stays; a one-generation grant is not refreshed on
   reclaim. Owner mutations bind the presented outcome UUID and generation via
-  `If-Match`; retry cannot silently refresh consent. Stop atomically queues normal
-  completed-scope finalization without a lead turn, retaining publication guards.
-  API/CLI are the M2 control surface; web/TUI/Slack controls remain pending M3.
+  `If-Match`; retry cannot silently refresh consent. Stop review and settlement
+  groundwork is present, but stopped execution authority and CLI confirmation
+  remain pending M2. Production Stop stays disabled until that composition and
+  the M3 web/TUI/Slack controls and replay proofs are complete.
 
   The typed local hold journal advertises `terminal_pending` and reconciles
   immutable outcome identities before same-worker execution. Already-applied

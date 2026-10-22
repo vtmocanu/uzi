@@ -81,6 +81,7 @@ export class RunTurnReducerImpl implements RunTurnReducer {
 
     switch (event.kind) {
       case "activity":
+        if (event.leadToolCall === true) this.result.leadToolCall = true;
         break;
       case "initialized":
         // issue #1562: thread the adapter's fresh-session verdict so the persisted
@@ -136,6 +137,15 @@ export class RunTurnReducerImpl implements RunTurnReducer {
     // item that survives the signal filter (co-gated — model only where usage is).
     let usageAttached = false;
     for (const item of event.items) {
+      // issue #3139: a root non-signal tool start is the lead acting (stall-signal input).
+      if (
+        event.origin.kind === "main" &&
+        item.kind === "tool" &&
+        item.phase === "started" &&
+        item.signal === undefined
+      ) {
+        this.result.leadToolCall = true;
+      }
       // Group-before-filter: drop every recognized signal tool_use from persisted
       // output (the adapter marked them). Tool RESULTS are never dropped.
       if (item.kind === "tool" && item.phase === "started" && item.signal !== undefined) {

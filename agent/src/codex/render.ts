@@ -86,7 +86,12 @@ const FORGE_TOOL_NAMES = forgeToolNames();
 /** The initial product model picker (ADR :266). Deliberately narrower than the
  *  server catalog; an out-of-picker model is dropped with a diagnostic — EXCEPT the
  *  run root sourced from the server worker default (PRD #1551), see {@link resolveModel}. */
-const CONTRACT_MODELS: ReadonlySet<string> = new Set(["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"]);
+export const CODEX_ROLE_MODELS: ReadonlySet<string> = new Set(["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"]);
+
+/** True when `model` is one of the {@link CODEX_ROLE_MODELS} ids the advice renderer accepts. */
+export function isCodexRoleModel(model: string): boolean {
+  return CODEX_ROLE_MODELS.has(model);
+}
 
 /** The byte ceiling on a custom worker-root model ID. MIRRORS the API validator's
  *  `MaxModelLen` (api/internal/agenttmpl/model.go) so a value the API accepted on the
@@ -330,7 +335,7 @@ function resolveModel(
   modelSource?: RunTurnRequest["modelSource"],
 ): string | undefined {
   if (candidate === undefined) return undefined;
-  if (CONTRACT_MODELS.has(candidate)) return candidate;
+  if (isCodexRoleModel(candidate)) return candidate;
   if (modelSource === "worker_default") {
     if (isValidCustomModelId(candidate)) return candidate;
     throw new CustomWorkerModelError(candidate);
@@ -363,7 +368,7 @@ function resolveRoleModel(
   diagnostics: MutableDiagnostics,
 ): string | undefined {
   if (agentModel === undefined) return requestModel;
-  if (CONTRACT_MODELS.has(agentModel)) return agentModel;
+  if (isCodexRoleModel(agentModel)) return agentModel;
   diagnostics.push({ kind: "unknown_model", role, name: sanitizeName(agentModel) });
   return requestModel;
 }

@@ -133,13 +133,19 @@ import { PlanRejectedError, PlanRevisionReplacedError, stampPrSummaryHead } from
 import { emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "./plan-missing.js";
 import { errMessage } from "./util.js";
 import { assertResidueQuarantineOpen } from "./residue-quarantine.js";
+import { isSeededOwnerPlan } from "./seeded-plan.js";
 import { SummaryRunner, type PlanSummaryResult } from "./summary-runner.js";
 import { resolvePrdInput, type PrdInput } from "./prd-link.js";
 import {
   STALL_LIMIT,
+  CompletionHistory,
   REASON_COMPLETION_NO_PROGRESS,
   REASON_COMPLETION_LEAD_REQUESTED,
   REASON_COMPLETION_BUDGET_EXHAUSTED,
+  REASON_COMPLETION_STALL,
+  NoProgressStallTracker,
+  stallEligible,
+  progressSetsEqual,
   completionAttemptFingerprint,
   updateCompletionStreak,
   routeCompletionHold,
@@ -661,6 +667,9 @@ interface TurnResult {
   /** Issue #281: true when any subagent produced a frame this turn (work in flight),
    *  which disqualifies the turn from counting as a no-progress stall. */
   subagentActivity?: boolean;
+  /** Issue #3139: true when the lead (main origin) started a non-signal tool call this turn.
+   *  Mirrored from ReducedTurnResult like `subagentActivity`. */
+  leadToolCall?: boolean;
   /** issue #1197 (D-RC2a): the SDK terminal's positively-reported turn count, coerced
    *  by the reducer to a number ONLY when finite (missing/garbage stays undefined,
    *  never 0). Mirrored here so `driveTurn`'s returned result (reducer.finish().result)
@@ -2872,6 +2881,8 @@ export class SdkExecutor implements Executor {
           kind: ctx.kind,
           repoInstructions: repoInstructionsBlock,
           harness: "claude",
+          // Issue #3272: an owner-supplied plan skips the gate; the implement prompt says so.
+          seeded: isSeededOwnerPlan(ctx),
           ...(drive.lane ? { guardedCommand: { unavailable: implementUnavailable } } : {}),
         }),
         preToolUse: preToolUse(selectedNames, true, implementUnavailable),
@@ -2954,6 +2965,13 @@ export class SdkExecutor implements Executor {
       let consecutiveMisses = 0;
       // Issue #281: no-progress / terminal-refusal detection state.
       let stallStreak = 0;
+      // Issue #3139: the worker-initiated no-progress stall detector, independent of the #281 text
+      // streak above. It never reads the lead's text; the served attempt count and completed count
+      // are refreshed at every loop-top boundary. An absent attempt count means ineligible; an
+      // absent completed count falls back to the milestones this flight has seen.
+      const noProgress = new NoProgressStallTracker();
+      let lastServedCompletionAttempts: number | undefined;
+      let lastServedCompletedCount: number | undefined;
       let lastStallFingerprint: string | undefined;
       let lastStallText: string | undefined;
       // The detector trips only on STALL_LIMIT CONSECUTIVE qualifying refusal turns. The
@@ -2965,6 +2983,7 @@ export class SdkExecutor implements Executor {
         stallStreak = 0;
         lastStallFingerprint = undefined;
         lastStallText = undefined;
+        noProgress.reset();
       };
       // PRD #1226 M3 (D3): completion-interlock attempt-loop state, DISTINCT from the #281 prose
       // stall state above but sharing STALL_LIMIT. completionAttempted latches true once the
@@ -2975,6 +2994,7 @@ export class SdkExecutor implements Executor {
       // route to the hold. completionHeld latches the reason when the run entered the hold, so it
       // survives the `break` into the ExecutorResult (like pausedAt/scopeCapped).
       let completionAttempted = false;
+      const history = new CompletionHistory();
       let completionStallStreak = 0;
       let lastCompletionFingerprint: string | undefined;
       let completionHeld: { reason: string } | undefined;
@@ -2984,6 +3004,26 @@ export class SdkExecutor implements Executor {
       // the runner reads it in phasePublish to SKIP finalize (the wall seam already parked the run or
       // left it non-terminal, and the finally preserves clone + HOME).
       let walled: { reason: string } | undefined;
+      const stopAtWall = async (reason = REASON_WALL): Promise<boolean> => {
+        if (!ctx.completionInterlock || !(completionAttempted || history.priorAttempt)) return false;
+        if (await this.routeSummaryHold(ctx, reason, true, { allowDegradedCapture: true }))
+          completionHeld = { reason };
+        else walled = { reason };
+        return true;
+      };
+      const parkWall = async (at: { completedCount: number; total?: number }): Promise<WallParkOutcome | "stopped" | undefined> => {
+        const outcome = await this.parkForWall(ctx, at);
+        // A settled or undeliverable sink already owns the nonterminal stop, as in Codex.
+        if (outcome === "parked" || outcome === "undeliverable") return outcome;
+        if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+        if (outcome === "refused") {
+          const refresh = ctx.takeWallParkRefresh?.();
+          history.observe(refresh?.completionAttempts);
+          if (await stopAtWall()) return "stopped";
+
+        }
+        return outcome;
+      };
       // Hoisted: `turn` is declared INSIDE the loop, so the return below cannot see
       // it and the terminating turn's declaration would be discarded by `break`.
       let declaredPrdPath: string | undefined;
@@ -3077,6 +3117,9 @@ export class SdkExecutor implements Executor {
         const served = finalizing ? undefined : await ctx.reportIteration?.(iteration, latestProgress);
         this.throwIfTerminal(ctx);
         if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+        history.observe(served?.completionAttempts);
+        lastServedCompletionAttempts = served?.completionAttempts;
+        lastServedCompletedCount = served?.completedCount;
         const boundaryCap = isIssueRun ? scopeCapAtBoundary({
           served, frozen: frozenMilestones ?? ctx.frozenMilestones,
         }) : undefined;
@@ -3155,7 +3198,9 @@ export class SdkExecutor implements Executor {
           // PRD #1809 D4: a worker-local `disk` stop is never an owner pause park.
           throwIfDiskStop(ctx);
           if (ctx.pauseModeRequested?.() === "wall") {
-            const outcome = await this.parkForWall(ctx, at);
+            if (await stopAtWall()) break;
+            const outcome = await parkWall(at);
+            if (outcome === "stopped") break;
             if (outcome === "parked" || outcome === "undeliverable") {
               walled = { reason: REASON_WALL };
               break;
@@ -3171,23 +3216,10 @@ export class SdkExecutor implements Executor {
             break;
           }
         }
-        // PRD #1226 M4 (D3): the SERVER's budget-exhausted steer. A LIVE post-attempt interlocked
-        // run the server has flagged past its completion budget (served.budgetExhausted, off the
-        // SAME running-report ACK as pauseRequested) enters the completion hold PROACTIVELY here —
-        // even if the worker's own WALL/IDLE has not tripped. GATED on completionAttempted so a
-        // PRE-attempt budget flag never holds (there is no captured completion state to preserve
-        // yet, and the legacy wall/idle terminal path still owns a real pre-attempt exhaustion). A
-        // false hold verdict (capture unverified, or the server did not ACK `paused`) falls through
-        // and the run CONTINUES, exactly like a declined pause — never a destructive cleanup.
-        if (
-          served?.budgetExhausted &&
-          ctx.completionInterlock &&
-          completionAttempted &&
-          (await this.routeSummaryHold(ctx, REASON_COMPLETION_BUDGET_EXHAUSTED, completionAttempted))
-        ) {
-          completionHeld = { reason: REASON_COMPLETION_BUDGET_EXHAUSTED };
-          break;
-        }
+        // Preserve the owner-pause boundary's precedence, then stop on a server-observed
+        // historical wall or the existing completion-budget steer before dispatching again.
+        if ((history.wallSpent(served) || served?.budgetExhausted) &&
+            await stopAtWall(served?.budgetExhausted ? REASON_COMPLETION_BUDGET_EXHAUSTED : REASON_WALL)) break;
         // PRD #1809 D4 (soft layer): the per-run cache cap, at this turn boundary. The governor
         // measures the run's caches and, over the cap, trims them only at a proven quiet point (the
         // probe: no process of the run alive). A run that stays over the cap parks here, through
@@ -3293,6 +3325,16 @@ export class SdkExecutor implements Executor {
         // the history, and the history is re-sent only when it did not. Live-id sets only grow
         // (isLiveFollowUpId), so history can first ride only turn 1, which has no session.
         let historyProcessed = false;
+        // Issue #3139: a turn whose prompt carries owner or system text is new input, so it breaks
+        // the new stall streak. Only the new tracker resets here; the #281 state is untouched.
+        if (followUp !== undefined || reworkForTurn || ownerRides || historyRides || safetySteer) {
+          noProgress.reset();
+        }
+        // Issue #3139: the progress sets before this turn, to tell whether the turn changed them.
+        const progressBefore = {
+          completed: [...(latestProgress?.completed ?? [])],
+          in_progress: [...(latestProgress?.in_progress ?? [])],
+        };
         const onFirstEvent = () => {
           ownerFirstEvent?.();
           historyProcessed = true;
@@ -3411,11 +3453,9 @@ export class SdkExecutor implements Executor {
           if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
           throwIfDiskStop(ctx);
           if (ctx.pauseModeRequested?.() === "wall") {
-            if (completionAttempted && await this.routeSummaryHold(ctx, REASON_WALL, completionAttempted)) {
-              completionHeld = { reason: REASON_WALL };
-              return true;
-            }
-            const outcome = await this.parkForWall(ctx, at);
+            if (await stopAtWall()) return true;
+            const outcome = await parkWall(at);
+            if (outcome === "stopped") return true;
             if (outcome === "parked" || outcome === "undeliverable") {
               walled = { reason: REASON_WALL };
               return true;
@@ -3463,6 +3503,50 @@ export class SdkExecutor implements Executor {
             }
           }
           if (!processed) carriedSafetySteer = safetySteer;
+        };
+        // The worker's completion-attempt sequence, shared by the done path and the issue #3139
+        // stall path so both keep one order and one set of cancel/terminal checks.
+        const recordAttempt = async (
+          declared: string[],
+          nonClosing?: { reason: string },
+        ): Promise<{ unmet: string[]; head: string | null; worktreeFingerprint: string | null }> => {
+          // 1. Checkpoint-FIRST: capture the turn's committed work (reap + fetch-back)
+          //    BEFORE any denial/feedback, so a rework prompt or a hold never loses it.
+          //    reap:true is the same reap-before-git ordering the done/interactive-park paths
+          //    use; the session transcript survives on disk so the SAME session resumes.
+          await this.closeAndSettlePlanSummary();
+          await ctx.checkpoint?.({ reap: true, progress: latestProgress, sink: "done_checkpoint" });
+          this.throwIfTerminal(ctx);
+          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+          // 2. Read the branch tip + worktree fingerprint. The runner's worktreeFingerprint is
+          //    `${tip}\n${porcelain}`, so the FIRST line is the branch head (null when the
+          //    fingerprint is unresolvable — then head is null too, which the server accepts).
+          const worktreeFingerprint = ctx.worktreeFingerprint
+            ? await ctx.worktreeFingerprint()
+            : null;
+          const head =
+            worktreeFingerprint !== null
+              ? (worktreeFingerprint.split("\n", 1)[0] ?? null)
+              : null;
+          // 3. Record the attempt SERVER-side: it unions THIS declaration into
+          //    milestones_completed, recomputes unmet over the merged set (server authoritative)
+          //    and records a bounded attempt. Pass only this turn's declaration — the server
+          //    unions it with prior report_progress.
+          this.throwIfTerminal(ctx);
+          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+          const { unmet } = await ctx.recordCompletionAttempt!({
+            declared,
+            ...(nonClosing !== undefined ? { nonClosing } : {}),
+            head,
+            worktreeFingerprint,
+          });
+          // Latch AFTER the attempt returns — the post-attempt failure routing (step 6) only
+          // arms once at least one attempt has actually completed. A thrown attempt call ends the
+          // flight before this line, so the latch only gates later routing within this flight.
+          completionAttempted = true;
+          this.throwIfTerminal(ctx);
+          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+          return { unmet, head, worktreeFingerprint };
         };
         let turn: TurnResult;
         try {
@@ -3618,33 +3702,21 @@ export class SdkExecutor implements Executor {
             prepareInPlaceRestart();
             continue;
           }
-          // PRD #1226 M3 (D3): a POST-attempt WALL/IDLE trip routes to the completion hold (M4)
-          // instead of terminal-failing the run — its Git work is already captured by the
-          // checkpoint-first attempt above, and a live worker mid-completion must not be failed.
-          // PRE-attempt (or with the seam unwired) it rethrows exactly as before, so the wall/idle
-          // trip stays a legacy terminal failure. Only WALL/IDLE are routed here; a cancel
-          // (REASON_CANCELLED) or any other error rethrows unchanged.
-          if (
-            err instanceof Error &&
-            (err.message === REASON_WALL || err.message === REASON_IDLE) &&
-            (await this.routeSummaryHold(ctx, err.message, completionAttempted))
-          ) {
+          if (err instanceof Error && err.message === REASON_WALL && await stopAtWall()) break;
+          if (err instanceof Error && err.message === REASON_IDLE &&
+              await this.routeSummaryHold(ctx, err.message, completionAttempted)) {
             completionHeld = { reason: err.message };
             break;
           }
-          // PRD #1497 M2: a REASON_WALL trip that the completion-hold route above did NOT claim (a
-          // PRE-attempt wall — the worker's own wall timer fired before any completion attempt — or a
-          // post-attempt wall whose hold could not enter) takes the CAPTURE-FIRST wall park instead of
-          // the legacy terminal throw. This makes reportGenericFailure UNREACHABLE from a REASON_WALL
-          // trip in either case (D2/D17: no live run is failed by the wall). REASON_IDLE stays a
-          // legacy terminal failure (out of scope), so only REASON_WALL is routed here.
+          // A pre-attempt wall can still use the capture-first wall park.
           if (err instanceof Error && err.message === REASON_WALL) {
             const at = {
               completedCount:
                 served?.completedCount ?? latestProgress?.completed.length ?? 0,
               total: frozenMilestones?.length,
             };
-            const outcome = await this.parkForWall(ctx, at);
+            const outcome = await parkWall(at);
+            if (outcome === "stopped") break;
             if (outcome === "parked" || outcome === "undeliverable") {
               walled = { reason: REASON_WALL };
               break;
@@ -3881,38 +3953,10 @@ export class SdkExecutor implements Executor {
             //    BEFORE any denial/feedback, so a rework prompt or a hold never loses it.
             //    reap:true is the same reap-before-git ordering the done/interactive-park paths
             //    use; the session transcript survives on disk so the SAME session resumes.
-            await this.closeAndSettlePlanSummary();
-            await ctx.checkpoint?.({ reap: true, progress: latestProgress, sink: "done_checkpoint" });
-            this.throwIfTerminal(ctx);
-            if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
-            // 2. Read the branch tip + worktree fingerprint. The runner's worktreeFingerprint is
-            //    `${tip}\n${porcelain}`, so the FIRST line is the branch head (null when the
-            //    fingerprint is unresolvable — then head is null too, which the server accepts).
-            const worktreeFingerprint = ctx.worktreeFingerprint
-              ? await ctx.worktreeFingerprint()
-              : null;
-            const head =
-              worktreeFingerprint !== null
-                ? (worktreeFingerprint.split("\n", 1)[0] ?? null)
-                : null;
-            // 3. Record the attempt SERVER-side: it unions THIS signal_done's declaration into
-            //    milestones_completed, recomputes unmet over the merged set (server authoritative)
-            //    and records a bounded attempt. Pass only this turn's declaration — the server
-            //    unions it with prior report_progress.
-            this.throwIfTerminal(ctx);
-            if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
-            const { unmet } = await ctx.recordCompletionAttempt({
-              declared: turn.milestonesCompleted ?? [],
-              ...(declaredNonClosing !== undefined ? { nonClosing: declaredNonClosing } : {}),
-              head,
-              worktreeFingerprint,
-            });
-            // Latch AFTER the attempt returns — the post-attempt failure routing (step 6) only
-            // arms once at least one attempt has actually completed. A thrown attempt call leaves
-            // this false, so the run fails legacy-style (no hold), which is correct.
-            completionAttempted = true;
-            this.throwIfTerminal(ctx);
-            if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+            const { unmet, head, worktreeFingerprint } = await recordAttempt(
+              turn.milestonesCompleted ?? [],
+              declaredNonClosing,
+            );
             // 4. Every frozen milestone is declared complete → break to the normal finalize path
             //    (phasePublish); M4 adds the permit + PR-head verification there.
             if (unmet.length === 0) {
@@ -3947,6 +3991,7 @@ export class SdkExecutor implements Executor {
               const fresh = refresh ? await ctx.reportIteration?.(iteration, latestProgress) : undefined;
               this.throwIfTerminal(ctx);
               if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+              history.observe(fresh?.completionAttempts);
               if (fresh?.maxIterations && fresh.maxIterations > maxIterations) maxIterations = fresh.maxIterations;
               const wallSeconds = fresh?.totalWallSeconds ?? fresh?.wallSeconds;
               if (typeof wallSeconds === "number" && wallSeconds * 1000 > maxServedWallMs) {
@@ -3969,15 +4014,17 @@ export class SdkExecutor implements Executor {
               }
               const bound = fresh?.budgetExhausted ? REASON_COMPLETION_BUDGET_EXHAUSTED
                 : iteration >= maxIterations ? REASON_MAX_ITERATIONS
-                : state.wallRemainingMs <= 0 ? REASON_WALL : undefined;
+                : history.wallSpent(fresh) || state.wallRemainingMs <= 0 ? REASON_WALL : undefined;
               if (bound) {
+                if ((bound === REASON_WALL || bound === REASON_COMPLETION_BUDGET_EXHAUSTED) && await stopAtWall(bound)) return true;
                 if (await this.routeSummaryHold(ctx, bound, true)) {
                   if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
                   completionHeld = { reason: bound };
                   return true;
                 }
                 if (bound === REASON_WALL) {
-                  const outcome = await this.parkForWall(ctx, at);
+                  const outcome = await parkWall(at);
+                  if (outcome === "stopped") return true;
                   if (outcome === "parked" || outcome === "undeliverable") {
                     walled = { reason: REASON_WALL };
                     return true;
@@ -4117,6 +4164,84 @@ export class SdkExecutor implements Executor {
             }
           }
           break;
+        }
+        // Issue #3139: a worker-initiated no-progress stall. An eligible run (interlocked issue run,
+        // no completion attempt yet, at least one reported completed milestone) whose lead ends
+        // STALL_LIMIT consecutive turns with no tool call, no subagent activity, no worktree change
+        // and no milestone progress, without signalling done, gets one worker-recorded empty
+        // attempt and an owner decision instead of draining the iteration budget. Evaluated before
+        // the iteration-budget check so a trip on the last iteration is not lost, and before #281
+        // (which stays unchanged below). Never reads the lead's text; never sets done or publishes.
+        const stallIsEligible = stallEligible({
+          interlocked: !!ctx.completionInterlock,
+          issueRun: isIssueRun,
+          interactive: !!ctx.interactive,
+          attemptSeamWired: !!ctx.recordCompletionAttempt && !!ctx.worktreeFingerprint,
+          servedCompletionAttempts: lastServedCompletionAttempts,
+          completionAttempted,
+          seenCompletedCount: seenCompletedIds.size,
+          servedCompletedCount: lastServedCompletedCount,
+        });
+        if (!stallIsEligible) {
+          noProgress.reset();
+        } else {
+          const stallFingerprint = await ctx.worktreeFingerprint!();
+          const stallStreakNow = noProgress.observe({
+            leadToolCall: !!turn.leadToolCall,
+            subagentActivity: !!turn.subagentActivity,
+            fingerprint: stallFingerprint,
+            progressChanged: !progressSetsEqual(progressBefore, latestProgress),
+          });
+          if (stallStreakNow >= STALL_LIMIT) {
+            ctx.emit({
+              kind: "status",
+              agent: "worker",
+              payload: {
+                text: `no progress: the lead ended ${stallStreakNow} consecutive turns with no tool call, no worktree change and no milestone progress without signalling done — running a completion check for an owner decision`,
+              },
+            });
+            // The completion-streak state (completionStallStreak, lastCompletionFingerprint) is
+            // deliberately untouched: this attempt is not a lead completion attempt.
+            const { unmet } = await recordAttempt([]);
+            if (ctx.askCompletionQuestion) {
+              this.throwIfTerminal(ctx);
+              if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+              const decision = await ctx.askCompletionQuestion(unmet, { kind: "no_progress_stall" });
+              this.throwIfTerminal(ctx);
+              if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+              if (decision.outcome === "continue") {
+                ctx.emit({
+                  kind: "status",
+                  agent: "worker",
+                  payload: {
+                    text: "owner answered — resuming for a server-authoritative completion recheck",
+                  },
+                });
+                followUp = undefined;
+                completionRework = {
+                  text: buildCompletionReworkFollowUp(unmet, frozenMilestones,
+                    { kind: "answered", guidance: decision.guidance },
+                    ctx.completionInterlock === true && isIssueRun && !ctx.interactive),
+                  answered: true,
+                };
+                resetStallState();
+                continue;
+              }
+            }
+            ctx.emit({
+              kind: "status",
+              agent: "worker",
+              payload: {
+                text: `completion blocked: the lead stopped making progress without signalling done (${unmet.length} unmet frozen milestone(s)) — holding for an owner decision`,
+              },
+            });
+            if (await this.routeSummaryHold(ctx, REASON_COMPLETION_STALL, completionAttempted)) {
+              if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+              completionHeld = { reason: REASON_COMPLETION_STALL };
+              break;
+            }
+            throw new Error(REASON_COMPLETION_STALL);
+          }
         }
         if (iteration >= maxIterations) {
           // PRD #1226 M3 (D3): a POST-attempt iteration exhaustion routes to the completion hold
@@ -5265,9 +5390,11 @@ export class SdkExecutor implements Executor {
    * caller latches pausedAt and breaks; false ⇒ the caller CONTINUES the run (a failed publish,
    * or an executor with no parkForPause wired — the stub/tests, where a pause is inert).
    */
-  private async routeSummaryHold(ctx: RunContext, reason: string, attempted: boolean): Promise<boolean> {
+  private async routeSummaryHold(ctx: RunContext, reason: string, attempted: boolean, options?: { allowDegradedCapture?: boolean }): Promise<boolean> {
     if (attempted && ctx.enterCompletionHold) await this.closeAndSettlePlanSummary();
-    return routeCompletionHold(ctx, reason, attempted);
+    const held = await routeCompletionHold(ctx, reason, attempted, options);
+    if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+    return held;
   }
 
   private async requestPause(

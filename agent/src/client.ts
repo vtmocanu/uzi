@@ -2430,6 +2430,8 @@ export class WorkerClient {
             ack.completionProjection = fields.completionProjection;
           if (fields.completionAttempts !== undefined)
             ack.completionAttempts = fields.completionAttempts;
+          if (typeof fields.budgetUsedSeconds === "number" && Number.isFinite(fields.budgetUsedSeconds) && fields.budgetUsedSeconds >= 0)
+            ack.budgetUsedSeconds = fields.budgetUsedSeconds;
           if (body.completion_final_head !== undefined) {
             if (!this.hasFeature("recovery_completed_publication_v1")) {
               ack.completedPublicationReason = "unsupported_feature";
@@ -3851,7 +3853,7 @@ export class WorkerClient {
   async reportWallPark(
     runId: string,
     args: { head: string; published: boolean; claimGeneration?: number; checkpointContainsLatest?: boolean },
-  ): Promise<{ applied: boolean; status: string; budgetTotalSeconds?: number; budgetUsedSeconds?: number }> {
+  ): Promise<{ applied: boolean; status: string; budgetTotalSeconds?: number; budgetUsedSeconds?: number; completionAttempts?: number }> {
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/wall-park`;
     // Stamp the claim-lane generation through the shared send-gate + skew-safe fallback, exactly as
     // requestCompletionHold does: a wall_park_v1 worker also advertises credential_switch_v1, so it
@@ -3868,12 +3870,13 @@ export class WorkerClient {
         const fields = await readRunAck(res);
         // Issue #1600: a refused park's 409 carries the run's fresh budget; pass it through so the
         // executor re-arms from the server's remaining time instead of its exhausted local wall.
-        const out: { applied: boolean; status: string; budgetTotalSeconds?: number; budgetUsedSeconds?: number } = {
+        const out: { applied: boolean; status: string; budgetTotalSeconds?: number; budgetUsedSeconds?: number; completionAttempts?: number } = {
           applied: res.status === 200,
           status: fields.status ?? "",
         };
         if (fields.budgetTotalSeconds !== undefined) out.budgetTotalSeconds = fields.budgetTotalSeconds;
         if (fields.budgetUsedSeconds !== undefined) out.budgetUsedSeconds = fields.budgetUsedSeconds;
+        if (fields.completionAttempts !== undefined) out.completionAttempts = fields.completionAttempts;
         return out;
       }
       if (res.status >= 400) throw await this.toError("POST", path, res);

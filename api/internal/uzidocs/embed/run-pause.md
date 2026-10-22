@@ -236,15 +236,22 @@ twice.
 
 ## Not the same as running out of time
 
-A run that reaches its wall-clock time limit also parks — `hold_reason:
-budget_exhausted` — instead of failing; it is never failed for the clock
-alone, and this park has no expiry either. It isn't the pause on this page
-(nobody asked for it) and it isn't the completion hold above (nothing is
-unfinished by the plan's own criteria — the run simply ran out of budget).
-From the CLI: **extend** it (`uzi run extend <id> --by 2h`, which adds time
-and resumes it in one step), **stop** it (`uzi run stop <id>`, milestone
-issue runs only — finalizes the milestones already done into a merge
-request), or **cancel** it (`uzi run cancel <id>`).
+A run that reaches its wall-clock time limit also parks instead of failing
+for the clock alone, with no expiry. Before a completion attempt, the wall
+park uses `hold_reason: budget_exhausted`. From the CLI: **extend** it
+(`uzi run extend <id> --by 2h`, which adds time and resumes that wall park in
+one step), **stop** it (`uzi run stop <id>`, milestone issue runs only —
+finalizes the milestones already done into a merge request), or **cancel**
+it (`uzi run cancel <id>`).
+
+On an interlocked run with a confirmed earlier completion attempt, a live
+worker instead routes the time limit to `completion_blocked`, including
+across worker flights. This is a [completion hold](run-completion-hold.md#deciding-on-a-held-run)
+and needs a completion decision; ordinary resume or extension alone does
+not resume it. Extend the budget before choosing Continue, or the run
+immediately re-holds. Paused time grants no extra working budget. See the
+[mixed-version limits](run-completion-hold.md#mixed-version-limits)
+for rollout details.
 
 ## The CLI
 

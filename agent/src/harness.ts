@@ -215,7 +215,9 @@ export type HarnessEvent = HarnessEventMeta &
   (
     // `modelInitiated` (Codex only): the model itself issued a tool or item on the active root
     // thread (command, file change, MCP/dynamic tool call). Absent on pure lifecycle liveness.
-    | { kind: "activity"; modelInitiated?: true }
+    // `leadToolCall` (Codex only): a root native command/file/MCP item started this turn (issue
+    // #3139 stall signal); dynamic tool calls reach the reducer as main-origin tool frames instead.
+    | { kind: "activity"; modelInitiated?: true; leadToolCall?: true }
     // issue #1562 (ADR-1562): `freshSession` marks that this SDK process did NOT
     // continue the requested session (no resume requested, or the init session_id
     // differed). Threaded to projectInit so the persisted init frame gains
@@ -593,6 +595,9 @@ export interface ReducedTurnResult extends TurnSignals {
   sessionId?: string;
   finalText?: string;
   subagentActivity?: boolean;
+  /** issue #3139: true when this turn had a root (lead, main-origin) non-signal tool start.
+   *  Per-turn; subagent tool starts and signal tools never set it. */
+  leadToolCall?: boolean;
   /** issue #1197 (D-RC2a): the SDK terminal's POSITIVELY-reported turn count
    *  (`terminal.metrics.wire.num_turns`), coerced to a number ONLY when it is a
    *  finite number (mirrors limit.ts normalizeResetsAt's shape). Missing or garbage

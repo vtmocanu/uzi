@@ -1086,7 +1086,7 @@ type Run struct {
 	MemoryPolicy                []byte             `json:"memory_policy"`
 	CompletionNonClosingReason  pgtype.Text        `json:"completion_non_closing_reason"`
 	CiArtifactManifest          []byte             `json:"ci_artifact_manifest"`
-<<<<<<< HEAD
+	CheckpointAttestedSource    pgtype.Text        `json:"checkpoint_attested_source"`
 	PolicyRefusalCount          int32              `json:"policy_refusal_count"`
 	PolicyLastTag               pgtype.Text        `json:"policy_last_tag"`
 	PolicyLastPhase             pgtype.Text        `json:"policy_last_phase"`
@@ -1101,9 +1101,6 @@ type Run struct {
 	PolicyStopResolution        []byte             `json:"policy_stop_resolution"`
 	PolicyRevisionSource        []byte             `json:"policy_revision_source"`
 	PolicyCandidateCrossCheckID pgtype.UUID        `json:"policy_candidate_cross_check_id"`
-=======
-	CheckpointAttestedSource    pgtype.Text        `json:"checkpoint_attested_source"`
->>>>>>> b66141d61d9550c4ca51a3c4c3c148ebf8c40d98
 }
 
 type RunCompletionAttempt struct {
@@ -1560,6 +1557,7 @@ type User struct {
 	PlanCrossCheckEnabled   bool               `json:"plan_cross_check_enabled"`
 	NowSummaryEnabled       pgtype.Bool        `json:"now_summary_enabled"`
 	CodeCrossCheckEnabled   bool               `json:"code_cross_check_enabled"`
+	CodexJudgeModel         pgtype.Text        `json:"codex_judge_model"`
 }
 
 type UserCrossCheckPin struct {

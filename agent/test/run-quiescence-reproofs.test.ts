@@ -189,13 +189,13 @@ describe("issue #1783: the pause park re-proves after its wip marker", () => {
     const pub = spyPublish();
     const fetch = spyFetchBack(q.lastBlocked);
     let undos = 0;
-    const origUndo = git.undoWipMarker.bind(git);
-    git.undoWipMarker = (async (...a: Parameters<typeof git.undoWipMarker>) => {
+    const origUndo = git.undoWipMarkerOnBranch.bind(git);
+    git.undoWipMarkerOnBranch = (async (...a: Parameters<typeof git.undoWipMarkerOnBranch>) => {
       undos += 1;
       return origUndo(...a);
-    }) as typeof git.undoWipMarker;
+    }) as typeof git.undoWipMarkerOnBranch;
     const parked: Array<boolean | undefined> = [];
-    const after: { head?: string; status?: string; fetches?: number; publishes?: number; tracking?: string | null } = {};
+    const after: { head?: string; status?: string; stagedBytes?: string; worktreeBytes?: string; fetches?: number; publishes?: number; tracking?: string | null } = {};
     let trackingBefore: string | null | undefined;
     const factory: ExecutorFactory = (runId) => ({
       homeDir: path.join(homeDir, runId),
@@ -209,6 +209,8 @@ describe("issue #1783: the pause park re-proves after its wip marker", () => {
           // Observed right after the declined park, before the run goes on to finalize.
           after.head = gitIn(ctx.worktreePath, ["log", "-1", "--format=%s"]);
           after.status = gitIn(ctx.worktreePath, ["status", "--porcelain"]);
+          after.stagedBytes = execFileSync("git", ["-C", ctx.worktreePath, "show", ":UNCOMMITTED.txt"], { env: GIT_ENV, encoding: "utf8", stdio: "pipe" });
+          after.worktreeBytes = fs.readFileSync(path.join(ctx.worktreePath, "UNCOMMITTED.txt"), "utf8");
           after.fetches = fetch.total();
           after.publishes = pub.calls();
           after.tracking = trackingSha(iid);
@@ -226,7 +228,9 @@ describe("issue #1783: the pause park re-proves after its wip marker", () => {
     assert.ok(!st.includes("paused"), "never paused");
     assert.equal(undos, 1, "the wip marker was undone");
     assert.equal(after.head, "work", "HEAD is the agent's own commit, not a wip(park): marker");
-    assert.match(after.status ?? "", /^\?\? UNCOMMITTED\.txt$/m, "the marker's content is back in the uncommitted tree");
+    assert.match(after.status ?? "", /^A  UNCOMMITTED\.txt$/m, "the undone marker's content stays staged");
+    assert.equal(after.stagedBytes, "in progress\n", "the staged content is intact");
+    assert.equal(after.worktreeBytes, "in progress\n", "the worktree content is intact");
     assert.equal(after.fetches, 0, "no fetch-back");
     assert.equal(fetch.early(), 0, "no fetch-back right after the blocked re-proof");
     assert.equal(after.publishes, 0, "no checkpoint published");

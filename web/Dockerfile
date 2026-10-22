@@ -64,6 +64,9 @@ COPY fixtures/run-question-answer.json /app/fixtures/run-question-answer.json
 COPY fixtures/plan-revision/ /app/fixtures/plan-revision/
 # runProgressParity.test.ts and mocks/runProgress.test.ts import the run-progress parity fixture (#2602).
 COPY fixtures/run-progress/ /app/fixtures/run-progress/
+# codexModels/modelSettings tests and the judge-model mock parity test import these (#3245).
+COPY fixtures/codex-models/ /app/fixtures/codex-models/
+COPY fixtures/model-settings/ /app/fixtures/model-settings/
 RUN npm run build
 
 # --- runtime stage ---

@@ -46,7 +46,20 @@ export function scriptedDependencyWait(
   };
 }
 
-export function dependencyWaitCallbacks() {
+type CompletionQuestionArgs = [string[], Parameters<NonNullable<RunContext["askCompletionQuestion"]>>[1]];
+
+/**
+ * `eligible: true` (issue #3139) serves the stall-attempt preconditions: the recorded attempt
+ * count rides `reportIteration`, attempts/questions/holds are recorded instead of failing, and
+ * the question outcome is scriptable via `answer` (default: the window expires).
+ */
+export function dependencyWaitCallbacks(
+  opts: { eligible?: boolean; answer?: { outcome: "continue"; guidance?: string } | { outcome: "expired" } } = {},
+) {
+  const eligible = opts.eligible === true;
+  const attempts: Parameters<NonNullable<RunContext["recordCompletionAttempt"]>>[0][] = [];
+  const questions: CompletionQuestionArgs[] = [];
+  const holds: string[] = [];
   const asked: string[][] = [];
   const checkpoints: Parameters<NonNullable<RunContext["checkpoint"]>>[0][] = [];
   const iterations: number[] = [];
@@ -65,16 +78,27 @@ export function dependencyWaitCallbacks() {
     reportIteration: async (iteration, value) => {
       iterations.push(iteration);
       progress.push(value);
+      if (eligible) return { completionAttempts: attempts.length };
     },
-    recordCompletionAttempt: async () => {
-      assert.fail("waiting must never attempt completion");
+    recordCompletionAttempt: async (args) => {
+      if (!eligible) assert.fail("waiting must never attempt completion");
+      attempts.push(args);
+      return { unmet: ["m2"], attemptCount: attempts.length };
     },
-    enterCompletionHold: async () => {
-      assert.fail("pre-completion waiting must never enter a completion hold");
+    enterCompletionHold: async (reason) => {
+      if (!eligible) assert.fail("pre-completion waiting must never enter a completion hold");
+      holds.push(reason);
+      return true;
     },
   };
+  if (eligible) {
+    callbacks.askCompletionQuestion = async (unmet, trigger) => {
+      questions.push([unmet, trigger]);
+      return opts.answer ?? { outcome: "expired" };
+    };
+  }
   return {
-    callbacks, asked, checkpoints, iterations,
+    callbacks, asked, checkpoints, iterations, attempts, questions, holds,
     assertPreserved() {
       assert.deepEqual(asked, [[dependencyWaitQuestion]]);
       assert.ok(checkpoints.some((c) => c.reap && JSON.stringify(c.progress) === JSON.stringify(dependencyWaitProgress)));

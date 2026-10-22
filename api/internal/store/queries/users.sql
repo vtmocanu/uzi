@@ -216,12 +216,13 @@ RETURNING default_effort;
 -- no worker restart. NOT NULL column (default true) → always a definite bool.
 SELECT attribution_enabled FROM users WHERE id = $1;
 
--- name: GetUserJudgeModel :one
--- The current user's per-user judge model override (PRD #69 M2); NULL = inherit
--- the instance judge_model. Read at judge-claim assembly, keyed on the run owner.
--- Selects only the column: the judge claim needs no other user field, and a
+-- name: GetUserJudgeModels :one
+-- The current user's per-user judge model lanes (PRD #69 M2, PRD #3245): the Claude
+-- lane judge_model and the Codex lane codex_judge_model; NULL = inherit the instance
+-- value for that harness. Read at judge-claim assembly, keyed on the run owner.
+-- Selects only the two columns: the judge claim needs no other user field, and a
 -- narrow read keeps resolution self-contained and cheap (Decision 5).
-SELECT judge_model FROM users WHERE id = $1;
+SELECT judge_model, codex_judge_model FROM users WHERE id = $1;
 
 -- name: SetUserJudgeModel :one
 -- Sets (or clears, when @judge_model is NULL) the current user's per-user judge
@@ -230,12 +231,19 @@ SELECT judge_model FROM users WHERE id = $1;
 UPDATE users SET judge_model = @judge_model WHERE id = @id
 RETURNING judge_model;
 
+-- name: SetUserCodexJudgeModel :one
+-- Sets (or clears, when @codex_judge_model is NULL) the current user's per-user Codex
+-- judge model (PRD #3245). NULL inherits the instance codex_judge_model. Own-user
+-- only; caller passes the session user's id.
+UPDATE users SET codex_judge_model = @codex_judge_model WHERE id = @id
+RETURNING codex_judge_model;
+
 -- name: GetUserSummaryModel :one
 -- The current user's per-user run-summary model override (PRD #362 M2); NULL =
 -- inherit the instance summary_model. Read at ISSUE-run claim assembly, keyed on
 -- the run owner. Selects only the column: the claim needs no other user field, and
 -- a narrow read keeps resolution self-contained and cheap (Decision 8). Mirrors
--- GetUserJudgeModel but rides the issue-run claim rather than the judge claim.
+-- GetUserJudgeModels but rides the issue-run claim rather than the judge claim.
 SELECT summary_model FROM users WHERE id = $1;
 
 -- name: SetUserSummaryModel :one
@@ -248,7 +256,7 @@ RETURNING summary_model;
 -- name: GetUserSettings :one
 -- The current user's own (non-secret) settings surface: default worker model
 -- (PRD #17), per-user default reasoning effort (PRD #617), per-user judge model
--- override (PRD #69), per-user run-summary model override (PRD #362 M2), UI theme
+-- override (PRD #69, plus the Codex lane codex_judge_model, PRD #3245), per-user run-summary model override (PRD #362 M2), UI theme
 -- override (PRD #21), and the sidebar token-meter choice (00123). NULL = inherit /
 -- use the instance default / default-token-only. Own-user only; the caller passes
 -- the session user's id. summary_model rides this one-row read for the settings
@@ -265,7 +273,7 @@ RETURNING summary_model;
 -- default_claude_model and default_codex_model (PRD #1551 M1 / D2) ride it too — the retained
 -- per-harness worker-model lanes; each NULL means "inherit". The settings surface exposes both
 -- lanes, and projects the deprecated default_model from the effective harness's lane.
-SELECT default_model, default_effort, judge_model, summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, now_summary_enabled FROM users WHERE id = $1;
+SELECT default_model, default_effort, judge_model, codex_judge_model, summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, now_summary_enabled FROM users WHERE id = $1;
 
 -- name: GetUserSchedulePause :one
 -- The current user's pause-all-schedules state (PRD #1093), returned RAW: the switch

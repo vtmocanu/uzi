@@ -13,7 +13,7 @@ func newSettingsCmd(env Env, gf *globalFlags) *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error { return cmd.Help() },
 	}
 	cmd.AddCommand(&cobra.Command{
-		Use: "get", Short: "Show account settings and cross-check pins", Args: cobra.NoArgs,
+		Use: "get", Short: "Show account settings, cross-check pins and model settings", Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			c, err := env.client(gf)
 			if err != nil {
@@ -31,6 +31,13 @@ func newSettingsCmd(env Env, gf *globalFlags) *cobra.Command {
 				"RESOLVED MODEL", "MODEL SOURCE", "STORED EFFORT", "RESOLVED EFFORT", "EFFORT SOURCE"},
 				settingsCrossCheckRows(settings)); err != nil {
 				return err
+			}
+			// PRD #3245: one table for every model setting, after the cross-check table.
+			if rows := settingsModelRows(settings); len(rows) > 0 {
+				p.Println("Model settings")
+				if err := p.Table(settingsModelColumns, settingRowsTable(rows)); err != nil {
+					return err
+				}
 			}
 			// PRD #2603: nil means the per-user switch was never set, which reads as on.
 			p.Println(settingsNowSummaryLine(settings))

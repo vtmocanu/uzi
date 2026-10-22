@@ -19,6 +19,7 @@
   "default_effort": "x",
   "default_codex_effort": "x",
   "judge_model": "x",
+  "codex_judge_model": "x",
   "summary_model": "x",
   "theme": "x",
   "mr_rework_enabled": true,
@@ -33,5 +34,15 @@
   "light_theme": "x",
   "dark_theme": "x",
   "typeface": "x",
-  "default_harness": "x"
+  "default_harness": "x",
+  "judge_models": [
+    {
+      "harness": "x",
+      "model": "x",
+      "default_model": "x",
+      "default_source": "x",
+      "resolved_model": "x",
+      "source": "x"
+    }
+  ]
 }
