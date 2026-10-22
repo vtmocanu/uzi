@@ -410,6 +410,8 @@ for (const evidence of ["status", "generation", "inventory", "ACK", "report"] as
     r.setPredicate(async () => false);
     let changed = false;
     let reads = 0;
+    let evidenceReads = 0;
+    let acknowledged = false;
     t.mock.method(r.client, "getRunOwnership", async () => {
       reads++;
       return {
@@ -420,28 +422,42 @@ for (const evidence of ["status", "generation", "inventory", "ACK", "report"] as
     if (evidence === "inventory") r.setPredicate(async () => { reads++; return !changed; });
     if (evidence === "ACK") t.mock.method(r.runner, "recoveryFinalAcknowledged", async () => {
       reads++;
-      return changed;
+      evidenceReads++;
+      acknowledged = changed;
+      return acknowledged;
     });
     if (evidence === "report") t.mock.method(r.runner, "retireRecoveryReport", async () => {
       reads++;
+      evidenceReads++;
+      if (changed) r.records.delete(`${A}:1`);
       return { retired: changed };
     });
-    // Hold deletion for ACK/report so their later positive evidence is what retires it.
+    // ACK must be observed before unlink; report retirement cannot fall back to unlink.
     if (evidence === "ACK" || evidence === "report") {
-      t.mock.method(r.outbox, "retireFinalizeIfEligible", async () => changed);
+      t.mock.method(r.outbox, "retireFinalizeIfEligible", async () => {
+        if (evidence !== "ACK" || !acknowledged) return false;
+        r.records.delete(`${A}:1`);
+        return true;
+      });
     }
     await r.w.sweepPendingFinalizes();
     assert.equal(r.failures().length, 1);
     changed = true;
     const before = reads;
+    const evidenceBefore = evidenceReads;
     const queries = [...r.queries];
     r.advance(14999);
     await r.w.sweepPendingFinalizes();
     assert.equal(reads, before);
+    assert.equal(evidenceReads, evidenceBefore);
     assert.deepEqual(r.queries, queries, "all queries are skipped while cooling");
     r.advance(1);
     await r.w.sweepPendingFinalizes();
     assert.ok(reads > before);
+    if (evidence === "ACK" || evidence === "report") {
+      assert.equal(evidenceReads, evidenceBefore + 1, "the named evidence is queried at eligibility");
+    }
+    assert.equal(r.records.size, 0, "the observed evidence permits actual record retirement");
     assert.equal(r.logger.info.at(-1)!.fields.transition, "retired");
   });
 }
