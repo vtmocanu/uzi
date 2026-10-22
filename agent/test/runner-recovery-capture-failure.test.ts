@@ -271,7 +271,8 @@ describe("recovery capture retry and restart safety (#1197)", () => {
           assert.equal(record.run_id, claim.run_id);
           assert.deepEqual(record.errors, ["protocol"], "false and throw normalize in category order");
         }
-        assert.equal(api.messages(claim.run_id).filter(m => m.kind === "status" && m.payload.text === notice).length, 1);
+        // note() can share an active batch send; API visibility is checked after
+        // handleRecoveryExhausted closes the batcher and joins that owned send.
         assert.deepEqual({ captures, publications }, { captures: 0, publications: 0 });
         assert.equal(api.states.some(s => ["recovery_wait", "failed"].includes(s.body.status)), false);
         assert.equal(fixture.calls(), 1);
