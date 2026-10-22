@@ -784,14 +784,16 @@ interface WipOmission { path: string; reason: "core_file" | "oversized" | "unsiz
 /** What {@link GitCache.commitWipMarker} reports through `onIncomplete` (issue #3239). */
 export interface WipIncompleteInfo {
   omitted: WipOmission[]; omittedTotal: number; markerCreated: boolean; rollbackRefused: boolean;
-  /** The commit the capture wrote, when one was written and read back; the pause park undoes exactly it. */
+  /** The commit the capture wrote, only when it is provably that commit on a branch (one commit on
+   *  preHead with the marker subject); undefined for a detached capture. The pause park undoes exactly it. */
   marker?: string;
 }
 interface WipMarkerOptions {
   /** "refuse" (default): any omission means no marker. "exclude": commit everything else. */
   mode?: "refuse" | "exclude";
   onIncomplete?: (info: WipIncompleteInfo) => void;
-  /** Called with the vetted marker oid just before `commitWipMarker` returns true. */
+  /** Called with the vetted marker oid just before `commitWipMarker` returns true on a branch capture;
+   *  a detached capture never reports one. */
   onCommitted?: (marker: string) => void;
 }
 /** Largest total of blob bytes, old and new side, a checkpoint scan accepts. */
