@@ -1117,7 +1117,7 @@ describe("RunRunner — pause park with an unvetted WIP marker (issue #3239)", (
         },
       }));
       const { calls, restore } = spyPublish();
-      const seen: { subject?: string; head?: string; runTip?: string; runSubject?: string; bTip?: string | null; status?: string; tracked?: string | null } = {};
+      const seen: { subject?: string; head?: string; runTip?: string; runSubject?: string; bTip?: string | null; status?: string; trackedBefore?: string; tracked?: string | null } = {};
       try {
         const iid = 3243;
         const factory: ExecutorFactory = (runId) => ({
@@ -1127,6 +1127,7 @@ describe("RunRunner — pause park with an unvetted WIP marker (issue #3239)", (
             state.branch = ctx.branch;
             commitInTree(ctx.worktreePath, "WORK.txt", "committed\n");
             await ctx.checkpoint?.({ reap: false });
+            seen.trackedBefore = rd(rGit.barePathFor(fx.originPath), "rev-parse", "--verify", `refs/uzi-runner/agent/issue-${iid}`);
             fs.writeFileSync(path.join(ctx.worktreePath, "WIP.txt"), "dirty\n");
             state.armed = true;
             const parked = await ctx.parkForPause?.({ completedCount: 1, total: 2 });
@@ -1152,7 +1153,8 @@ describe("RunRunner — pause park with an unvetted WIP marker (issue #3239)", (
         assert.ok(statuses.includes("pause_failed"), `pause_failed reported, got ${JSON.stringify(statuses)}`);
         assert.ok(!statuses.includes("paused"), "the run did not park");
         assert.deepEqual(calls, [], "nothing was published");
-        assert.notEqual(seen.tracked, state.marker, "the marker was not fetched back");
+        assert.ok(seen.trackedBefore, "the checkpoint established a tracking tip before the pause");
+        assert.equal(seen.tracked, seen.trackedBefore, "the pause fetched nothing back, including a sibling marker");
         if (scenario === "branch-moved") {
           assert.equal(seen.head, `refs/heads/${state.branch}`);
           assert.ok(seen.runSubject!.startsWith("wip(park)"), "the moved branch (a sibling marker) was not rewound");
