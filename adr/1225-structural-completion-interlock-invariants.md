@@ -293,7 +293,8 @@ scope waiver, and makes no claim of completed live deployment acceptance.
 
 For an unpublished declared/owner-partial history refusal without Stop,
 owner continue guidance can name the SHAs and ask the lead to reword its own
-unpublished commits. The worker never rewrites history or force-pushes.
+unpublished commits. The guard does not rewrite offending messages or
+force-push to repair a refusal.
 For published history or Stop, cancel and manually deliver preserved work
 through existing recovery. Stop resumes directly into finalization with no
 lead turn; partial/accept cannot repair history. Plain resume is refused for

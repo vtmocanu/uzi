@@ -333,8 +333,8 @@ publication fails or a human has touched the request in between:
 For a declared or owner-partial run whose offending commits are still
 unpublished, choose **Continue** and give guidance naming the logged SHAs:
 ask the lead to reword its own unpublished commits in the next turn. The
-worker does not rewrite history or force-push. Partial and accept decisions
-cannot fix commit history.
+guard does not rewrite offending messages or force-push to repair a refusal.
+Partial and accept decisions cannot fix commit history.
 
 If the history was already published, or the run has a Stop directive,
 cancel and manually deliver the preserved work through
