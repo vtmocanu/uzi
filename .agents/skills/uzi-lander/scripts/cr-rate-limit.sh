@@ -180,9 +180,9 @@ trigger_review_once() (
   sd=$(state_dir) || exit 3
   lock="$sd/locks/cr-review-${REPO//\//_}-$PR"
   marker="$sd/locks/cr-review-last-${REPO//\//_}-$PR"
-  if ! mkdir "$lock" 2>/dev/null; then
+  if ! atomic_mkdir "$lock" 2>/dev/null; then
     age=$(( $(date +%s) - $(stat -c %Y "$lock" 2>/dev/null || stat -f %m "$lock" 2>/dev/null || date +%s) ))
-    if [ "$age" -gt 600 ]; then rm -rf "$lock"; mkdir "$lock" 2>/dev/null || { echo "review-trigger lock busy" >&2; exit 3; }
+    if [ "$age" -gt 600 ]; then rm -rf "$lock"; atomic_mkdir "$lock" 2>/dev/null || { echo "review-trigger lock busy" >&2; exit 3; }
     else echo "REVIEW_TRIGGER_LOCK_HELD=1 (another invocation is posting the review trigger)"; exit 3; fi
   fi
   trap 'rm -rf "$lock"' EXIT
@@ -279,9 +279,9 @@ if { [ "$QUERY" -eq 1 ] || [ -z "$reset_ts" ]; } && [ "$ASK" -eq 1 ]; then
   # limit` from the last 10 minutes exists (an unreadable listing means do not post).
   SD=$(state_dir) || exit 3
   ask_lock="$SD/locks/cr-ask-${REPO//\//_}-$PR"
-  if ! mkdir "$ask_lock" 2>/dev/null; then
+  if ! atomic_mkdir "$ask_lock" 2>/dev/null; then
     lage=$(( $(date +%s) - $(stat -c %Y "$ask_lock" 2>/dev/null || stat -f %m "$ask_lock" 2>/dev/null || date +%s) ))
-    if [ "$lage" -gt 600 ]; then rm -rf "$ask_lock"; mkdir "$ask_lock" 2>/dev/null || { echo "ask lock busy" >&2; exit 3; }
+    if [ "$lage" -gt 600 ]; then rm -rf "$ask_lock"; atomic_mkdir "$ask_lock" 2>/dev/null || { echo "ask lock busy" >&2; exit 3; }
     else echo "ASK_LOCK_HELD=1 (another invocation is asking; re-run without --ask in a minute)"; exit 2; fi
   fi
   trap 'rm -rf "$ask_lock"' EXIT
