@@ -143,7 +143,7 @@ The unfinished rendering, local Devbox and visual work remains worker-owned.
 | Complete base/candidate provisioning comparison by mode | Matched ab970306 observations above; repair changes setup, so updated comparison remains pending |
 | Host PNG export, signatures, dimensions, hashes and strict freshness | No final artifact receipt |
 | Light/dark visual inspection | Unperformed; no acceptance claimed |
-| Current full repository gate | Pending after the strict-probe repair; prior `687d7df1` pass took 1,797 seconds with actionlint skipped (absent) |
+| Current full repository gate | Post-repair local pass at `4e70ae10`: exit 0, 1,812 seconds with disposable HOME and required shell/YAML tools; actionlint explicitly skipped (absent); no plain-environment or hosted-CI proof |
 
 The lead owns collecting matrix/local receipts and the remaining verification.
 This documentation-only update runs no gates/tests and performs no rendering or
@@ -249,6 +249,38 @@ off-mode boundary observations above remain unresolved M3 requirements.
 The earlier full repository gate predates this code repair; it is not a
 current-code validation receipt. No plain-environment or hosted-CI pass is
 claimed for the recorded disposable-HOME gate invocation.
+
+Post-repair receipt supplied by the lead, who directly read
+`.uzi/scratch/gate-log.0FpOMH`:
+
+- `TESTED_REVISION=4e70ae1054141c1a9b9e5e3fe4af2b4949036742`;
+  `HOME=<disposable fixture-home> UZI_LINT_SHELL_REQUIRED=1 UZI_LINT_YAML_REQUIRED=1 task gate:repo`
+  exited 0 in 1,812 seconds (30m12s).
+- ShellCheck 0.11.0 ran at warning severity over 300 scripts; strict yamllint
+  ran over 40 YAML files. Parity pins matched; 40 parity cases plus
+  missing/nonregular coverage (2 Node tests), 10 build cases, and supervisor
+  Go vet/tests passed.
+- Secret scan: 0 tracked findings across 7,429 index entries, 2 canaries
+  detected; 147 untracked findings, including downloaded Go test fixtures,
+  were not gating. The full scan covered 996.14 MB in 6m36s. Semgrep canary
+  raw/results/errors/verdict: 1/1/0/0; tree: 0/0/0/0.
+- Actionlint was absent: the existing local workflow-lint **SKIP** was
+  explicit. The required-tool flags enforced shell/YAML tool availability.
+  The lead verified disposable-HOME configuration limited to the exact
+  worktree's `safe.directory`; production runtime uid, environment and grants
+  were unchanged.
+- The prior full gate took 1,797 seconds; the 15-second aggregate increase
+  is not an isolated repair-cost or CI-impact measurement.
+  The separate 6,520 ms added-target measurement remains unchanged. No
+  controlled cache/queue comparison or hosted measurements are available.
+- The prior reviewer at `594ccd8f` found stale README procedures at lines 128/136,
+  corrected by `4e70ae10`. The new reviewer and scoped auditor were clean at
+  `4e70ae10`; the audit boundary included 1 focused test pass, with no other
+  notes. The earlier cancelled auditor is not claimed as passed.
+
+This local gate pass does not complete M3, change any failed or unperformed
+real-image criterion, or constitute partial-delivery approval. The earlier
+3-test strict-probe and 50-test fixture receipts above remain valid and separate.
 
 ## Historical receipts (prior scratch logs lost)
 
