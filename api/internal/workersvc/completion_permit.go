@@ -952,7 +952,7 @@ func (s *Service) completeRunWithPermitLease(ctx context.Context, wkr store.Work
 	// Completed publication and ephemeral leasing serialize on the worker before the run.
 	// A persistent worker or nil-generation report never enters a lease.
 	leaseTx := s.ephemeralLease > 0 && wkr.Ephemeral && req.ClaimGeneration != nil
-	if leaseTx || completedPublicationCapable(wkr, req) {
+	if leaseTx || completedPublicationCapable(wkr, req) || req.SourcePublication != nil {
 		if _, werr := qtx.GetWorkerForUpdate(ctx, wkr.ID); werr != nil {
 			if errors.Is(werr, pgx.ErrNoRows) {
 				return 0, false, lease, nil // the worker row is gone: no longer this worker's run
@@ -969,6 +969,15 @@ func (s *Service) completeRunWithPermitLease(ctx context.Context, wkr store.Work
 		return 0, false, lease, err
 	}
 
+	if req.SourcePublication != nil {
+		if run.Status == "completed" {
+			if !sourcePublicationIdentity(run, req) {
+				return 0, false, lease, ErrInvalidState
+			}
+		} else if err := validateSourcePublicationLive(run, wkr, req); err != nil {
+			return 0, false, lease, err
+		}
+	}
 	reconciled, rerr := reconciliationExists(ctx, tx, owned.ID)
 	if rerr != nil {
 		return 0, false, lease, rerr
@@ -1134,6 +1143,10 @@ func (s *Service) completeRunWithPermitLease(ctx context.Context, wkr store.Work
 		// The run left the completable state under the lock (e.g. a superseding terminal). Roll
 		// back so the permit is NOT consumed and the report stays non-terminal.
 		return 0, false, lease, nil
+	}
+
+	if err := bindSourcePublication(ctx, tx, wkr, run, req, completedParams.StopKind.String == "scope_capped"); err != nil {
+		return 0, false, lease, err
 	}
 
 	// Generation-activation hook seam (PRD #1226 M2, D4). This is a DELIBERATE no-op today:

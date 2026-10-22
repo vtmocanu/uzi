@@ -2528,6 +2528,13 @@ export interface StateRequest {
   require_running?: boolean;
   /** Immutable delivered final SHA; sent only with recovery_completed_publication_v1. */
   completion_final_head?: string;
+  /** Issue #3120: successful issue publication, negotiated independently of recovery/permits.
+   *  This exact terminal identity requires its positive claim_generation on every retry. */
+  source_publication?: {
+    version: 1;
+    published_head: string;
+    non_closing: boolean;
+  };
   /** Required for an opted-in autopilot plan write; server-computed at submission. */
   candidate_digest?: string;
   /** PRD #1230 M4 (dormant): the autopilot coverage-park reason on a semantic awaiting_approval
