@@ -86,6 +86,7 @@ func TestNormalize(t *testing.T) {
 		"go-task":             "task",       // aliased to binary name
 		"gnumake":             "make",       // aliased to binary name
 		"kubernetes-helm":     "helm",       // aliased to binary name
+		"github:NixOS/nixpkgs/5adc50831c259f87faeb09ddf930d43597197473#go_1_27": "go", // pinned seed still supplies go
 	}
 	for in, want := range cases {
 		if got := normalize(in); got != want {

@@ -1072,7 +1072,7 @@ tasks:
       - ./scripts/sqlc-drift-gate.test.sh
 
   test:renovate-go-toolchain:
-    desc: hermetic extraction and grouping contract for Go-toolchain Renovate updates
+    desc: hermetic Go-toolchain grouping and worker Go flake extraction contract
     cmds:
       - node ./scripts/renovate-go-toolchain.test.mjs
 

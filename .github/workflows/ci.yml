@@ -1259,19 +1259,9 @@ jobs:
           build-args: |
             UZI_SRC_SHA=${{ github.sha }}
           tags: uzi-agent-${{ matrix.template }}:pr
-      - name: Measure the previous published base image
-        if: matrix.template == 'base'
-        id: worker-baseline
-        run: |
-          tag="$(awk -F '"' '/^PINNED_TAG=/{print $2}' scripts/assert-worker-tag-decoupled.sh)"
-          test -n "$tag"
-          docker pull "ghcr.io/vtmocanu/uzi/agent-base:${tag}"
-          bytes="$(docker image inspect "ghcr.io/vtmocanu/uzi/agent-base:${tag}" --format='{{.Size}}')"
-          printf 'bytes=%s\n' "$bytes" >> "$GITHUB_OUTPUT"
       - name: Prove the baked worker toolchain without network
         env:
           TEMPLATE: ${{ matrix.template }}
-          BASELINE_BYTES: ${{ steps.worker-baseline.outputs.bytes }}
         run: |
           SQLC_PIN="$(awk -F '"' '/^SQLC_LINUX_AMD64_VERSION=/{print $2}' scripts/sqlc.sh)"
           docker run --rm --network=none --user runner --cap-drop=ALL \
@@ -1288,7 +1278,3 @@ jobs:
             '
           bytes="$(docker image inspect "uzi-agent-${TEMPLATE}:pr" --format='{{.Size}}')"
           printf 'image=%s size_bytes=%s\n' "$TEMPLATE" "$bytes"
-          if [ "$TEMPLATE" = base ]; then
-            printf 'base_before_bytes=%s base_after_bytes=%s delta_bytes=%s\n' \
-              "$BASELINE_BYTES" "$bytes" "$((bytes - BASELINE_BYTES))"
-          fi
