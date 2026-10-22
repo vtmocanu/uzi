@@ -230,6 +230,56 @@ it("hidden records and frozen subsets preserve cooldown and fairness", async t =
     "unattempted generations retain priority after hidden and frozen passes");
 });
 
+for (const change of ["removed", "replaced"] as const) {
+  it(`registration wave skips a frozen identity ${change} while the first sixteen await inventory`, async t => {
+    const r = rig(t, Array.from({ length: 17 }, (_, n) => entry(A, n + 1)));
+    const frozen = [...r.records.values()];
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const held = deferred<boolean>();
+    let calls = 0;
+    r.setPredicate(async () => ++calls <= 16 ? held.promise : true);
+    const key = `${A}:17`;
+    const state = r.w as unknown as {
+      readonly finalizeRetries: ReadonlyMap<string, unknown>;
+      readonly finalizeAttempts: ReadonlyMap<string, unknown>;
+    };
+    const pass = r.w.sweepPendingFinalizes(undefined, frozen, new Set<Readonly<object>>());
+    try {
+      await flush();
+      assert.equal(calls, 16, "the first wave holds sixteen inventory calls");
+      assert.equal(r.queries.filter(q => q === "capture").length, 16);
+      if (change === "removed") r.records.delete(key);
+      else r.add(entry(A, 17));
+    } finally {
+      held.resolve(true);
+      await pass;
+    }
+    assert.deepEqual({
+      retry: state.finalizeRetries.has(key),
+      fairness: state.finalizeAttempts.has(key),
+      created: r.logger.info.filter(log =>
+        log.fields.claim_generation === 17 && log.fields.transition === "created").length,
+      captures: r.queries.filter(q => q === "capture").length,
+      inventory: r.queries.filter(q => q === key).length,
+    }, { retry: false, fairness: false, created: 0, captures: 16, inventory: 0 },
+    "the stale frozen candidate creates no state or completion-capture query");
+    assert.equal(r.failures().length, 16);
+    if (change === "removed") r.add(entry(A, 17));
+    const fresh = r.records.get(key)!;
+    assert.notEqual(fresh.identity, frozen[16]!.identity);
+    await r.w.sweepPendingFinalizes();
+    assert.equal(calls, 17, "only the fresh identity attempts while the first sixteen cool");
+    assert.equal(r.queries.filter(q => q === "capture").length, 17);
+    assert.equal(r.queries.filter(q => q === key).length, 1);
+    assert.equal(r.failures().length, 17);
+    const failures = r.failures().filter(log => log.fields.claim_generation === 17);
+    assert.equal(failures.length, 1);
+    assert.equal(failures[0]!.fields.attempt_count, 1, "the fresh identity inherits no failure history");
+    assert.equal(r.logger.info.filter(log =>
+      log.fields.claim_generation === 17 && log.fields.transition === "created").length, 1);
+  });
+}
+
 it("eligible siblings beyond sixteen cooling records proceed; runs, generations and restart are independent", async t => {
   const r = rig(t, Array.from({ length: 16 }, (_, n) => entry(A, n + 1)));
   await r.w.sweepPendingFinalizes();

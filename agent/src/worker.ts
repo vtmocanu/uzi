@@ -272,6 +272,8 @@ export class Worker {
         if (finalizeAuthorities.has(key)) continue;
         try {
           if (this.isFinalizeRunLive(entry.run_id)) continue;
+          // A registration wave may outlive this identity; stale candidates own no retry or fairness state.
+          if (outbox.finalizeRecordIdentity(entry.run_id, entry.claim_generation) !== identity) continue;
           this.finalizeAttempts.set(key, { identity, sequence: ++this.finalizeAttemptSequence });
           const state = retry ?? { entry, identity, logId: ++this.finalizeRecordSequence, failures: 0, nextEligible: 0 };
           if (!retry) {
