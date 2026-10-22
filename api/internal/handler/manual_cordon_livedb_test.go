@@ -86,7 +86,7 @@ func TestManualCordonTransitionsLiveDB(t *testing.T) {
 				first.ManualCordonedAt.After(time.Now().Add(time.Minute)) || first.ManualCordonedBy == nil ||
 				*first.ManualCordonedBy != owner.String() || first.ManualCordonedByLabel == nil ||
 				*first.ManualCordonedByLabel != "Op er ator" || first.ManualCordonReason == nil ||
-				*first.ManualCordonReason != "Fix this [31m now" || !first.EffectiveCordoned {
+				*first.ManualCordonReason != "Fix this  now" || !first.EffectiveCordoned {
 				t.Fatalf("cordoned metadata: %+v", first)
 			}
 			manualCordonEventCounts(t, pool, id, 1, 0)
@@ -121,7 +121,7 @@ func TestManualCordonTransitionsLiveDB(t *testing.T) {
 				FROM worker_cordon_events WHERE worker_id = $1 AND action = 'cordon'`, id).Scan(&actor, &label, &reason); err != nil {
 				t.Fatal(err)
 			}
-			if actor != owner.String() || label != "Op er ator" || reason != "Fix this [31m now" {
+			if actor != owner.String() || label != "Op er ator" || reason != "Fix this  now" {
 				t.Fatalf("stored audit snapshot = %q %q %q", actor, label, reason)
 			}
 		})

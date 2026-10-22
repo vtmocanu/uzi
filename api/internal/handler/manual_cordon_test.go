@@ -34,6 +34,7 @@ func TestManualCordonReason(t *testing.T) {
 		{name: "trailing junk", body: "{} x", errText: "invalid cordon request"},
 		{name: "oversize", body: jsonReason(strings.Repeat("x", 8192)), errText: "invalid cordon request"},
 		{name: "501 emoji", body: jsonReason(strings.Repeat("😀", 501)), errText: "reason must be at most 500 codepoints"},
+		{name: "ANSI before sanitization", body: jsonReason(strings.Repeat("\x1b[31m", 101)), errText: "reason must be at most 500 codepoints"},
 		{name: "501 before sanitization", body: jsonReason("a" + strings.Repeat("\n", 500)), errText: "reason must be at most 500 codepoints"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

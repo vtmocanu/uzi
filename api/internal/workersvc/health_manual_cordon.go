@@ -8,7 +8,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/vtmocanu/uzi/api/internal/store"
-	"github.com/vtmocanu/uzi/api/internal/termsafe"
 )
 
 func manualCordonWaitReason(counts store.CountOnlineWorkersClaimableForRunRow) string {
@@ -26,11 +25,11 @@ func manualCordonWaitReason(counts store.CountOnlineWorkersClaimableForRunRow) s
 		evidence.ActorID == uuid.Nil || evidence.WorkerID == uuid.Nil || evidence.At.IsZero() {
 		return ""
 	}
-	label := termsafe.SanitizeBounded(termsafe.CellText(evidence.ActorLabel), 200)
+	label := store.ManualCordonText(evidence.ActorLabel, 200)
 	if strings.TrimSpace(label) == "" {
 		label = evidence.ActorID.String()
 	}
-	reason := termsafe.SanitizeBounded(termsafe.CellText(evidence.Reason), 500)
+	reason := store.ManualCordonText(evidence.Reason, 500)
 	text := fmt.Sprintf("waiting for workers cordoned (manual): %s (%s) at %s", label, evidence.ActorID, evidence.At.UTC().Format(time.RFC3339))
 	if strings.TrimSpace(reason) != "" {
 		text += ": " + reason

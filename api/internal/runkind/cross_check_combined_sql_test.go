@@ -15,12 +15,24 @@ func TestCrossCheckCombinedSQLMirrorParity(t *testing.T) {
 		t.Fatal(err)
 	}
 	blocks := namedQueryBlocks(string(raw))
+	diagnostic := blocks["CountOnlineWorkersClaimableForRun"]
+	if strings.Count(diagnostic, "fn_cross_check_child_eligible(jsonb_populate_record(w, '{\"maintenance_fenced\":false}'::jsonb), run, false,") != 1 {
+		t.Fatal("manual diagnostic must clear only the hard fence for static suitability")
+	}
+	for _, predicate := range []string{
+		"fn_cross_check_child_eligible(w, run, false,",
+		"fn_cross_check_child_eligible(w, run, true,",
+	} {
+		if strings.Count(diagnostic, predicate) != 1 {
+			t.Fatalf("actual eligibility lost its canonical fence: %s", predicate)
+		}
+	}
 	for _, site := range []struct {
 		name               string
 		helpers, protocols int
 	}{
 		{"ClaimRun", 2, 2},                          // claimant and legacy spread peer
-		{"CountOnlineWorkersClaimableForRun", 2, 1}, // availability and strict health
+		{"CountOnlineWorkersClaimableForRun", 3, 1}, // availability, strict health and fence-independent manual diagnostics
 		{"ListUnplaceableQueuedRunsForEphemeral", 1, 1},
 		{"ListSaturationQueuedRunsForEphemeral", 2, 2}, // eligible and available workers
 	} {

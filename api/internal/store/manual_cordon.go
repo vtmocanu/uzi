@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 
+	"github.com/charmbracelet/x/ansi"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -57,14 +58,11 @@ func ChangeWorkerManualCordon(ctx context.Context, db cordonTxBeginner, ownerID,
 		}
 		return current, nil
 	}
-	label := strings.TrimSpace(termsafe.CellText(displayName))
-	label = string([]rune(label)[:min(len([]rune(label)), 200)])
+	label := ManualCordonText(displayName, 200)
 	if label == "" {
 		label = ownerID.String()
 	}
-	reason.String = strings.TrimSpace(termsafe.CellText(reason.String))
-	reasonRunes := []rune(reason.String)
-	reason.String = strings.TrimSpace(string(reasonRunes[:min(len(reasonRunes), 500)]))
+	reason.String = ManualCordonText(reason.String, 500)
 	reason.Valid = reason.Valid && reason.String != ""
 	action := "uncordon"
 	if cordon {
@@ -88,4 +86,12 @@ func ChangeWorkerManualCordon(ctx context.Context, db cordonTxBeginner, ownerID,
 		return Worker{}, err
 	}
 	return current, nil
+}
+
+// ManualCordonText strips terminal sequences before flattening metadata and caps codepoints.
+// This is specific to manual metadata; general terminal cell semantics stay unchanged.
+func ManualCordonText(value string, limit int) string {
+	value = strings.TrimSpace(termsafe.CellText(ansi.Strip(value)))
+	runes := []rune(value)
+	return strings.TrimSpace(string(runes[:min(len(runes), limit)]))
 }

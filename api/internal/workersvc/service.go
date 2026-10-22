@@ -459,6 +459,7 @@ const (
 // Store is the narrow set of generated queries workersvc uses. *store.Queries
 // satisfies it; tests embed it and override only the methods they exercise.
 type Store interface {
+	GetWorkerProjectionForOwner(context.Context, store.GetWorkerProjectionForOwnerParams) (store.GetWorkerProjectionForOwnerRow, error)
 	GetRunByIDForUpdate(context.Context, uuid.UUID) (store.Run, error)
 	PruneExpiredPendingOutcomeIdentities(context.Context, store.PruneExpiredPendingOutcomeIdentitiesParams) (int64, error)
 	GetCrossCheckChildProtocol(context.Context, uuid.UUID) (int32, error)
@@ -7168,6 +7169,12 @@ func (s *Service) ResolveTokenLabel(ctx context.Context, userID uuid.UUID, label
 // ListWorkers returns the user's workers with derived busy status.
 func (s *Service) ListWorkers(ctx context.Context, userID uuid.UUID) ([]store.ListWorkersByUserRow, error) {
 	return s.q.ListWorkersByUser(ctx, userID)
+}
+
+// WorkerProjectionForOwner returns one full owner-scoped worker list projection.
+func (s *Service) WorkerProjectionForOwner(ctx context.Context, userID, workerID uuid.UUID) (store.ListWorkersByUserRow, error) {
+	row, err := s.q.GetWorkerProjectionForOwner(ctx, store.GetWorkerProjectionForOwnerParams{UserID: userID, WorkerID: workerID})
+	return store.ListWorkersByUserRow(row), err
 }
 
 // DeleteWorker revokes a worker (its token stops authenticating). A worker that

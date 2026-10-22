@@ -557,15 +557,23 @@ func (s *Service) healthTargetFor(ctx context.Context, now time.Time, r store.Li
 		}
 		// Issue #2705: a run held for its returning worker is explained from the first tick of the
 		// hold, not after the queued threshold. Issue #2501: the unambiguous, persistent
-		// docker-allowlist block is also surfaced early. Both owner holds and that block bypass
+		// docker-allowlist block is also surfaced early. Manual cordon, owner holds and that block bypass
 		// the age gate: any other reason queuedReason resolves (vault, custody, codex, egress)
 		// stays quiet until th.queued, exactly as for an unpinned run. th.queued == 0 above still
 		// switches every queued flag off.
 		if !olderThan(now, r.StatusSince, th.queued) {
 			_, stalePinned := s.staleRequeuePin(now, r)
 			_, ownerHeld := s.ownerHold(now, r)
-			if stalePinned || ownerHeld {
-				if reason := s.queuedReason(ctx, now, r, th); isStaleRequeuePinReason(reason) {
+			manualBlocked := false
+			if !stalePinned && !ownerHeld {
+				counts, err := s.workerEligibilityForHealth(ctx, now, r.ID, s.capabilityAwareOn(ctx))
+				manualBlocked = err == nil && manualCordonWaitReason(counts) != ""
+			}
+			if stalePinned || ownerHeld || manualBlocked {
+				// Only a persistent hold warrants the prerequisite ladder before
+				// the age threshold; unrelated young runs retain the cheap path.
+				reason := s.queuedReasonBeforeAge(ctx, now, r, th, true)
+				if strings.HasPrefix(reason, "waiting for workers cordoned (manual):") || isStaleRequeuePinReason(reason) {
 					return healthWaitingWorker, reason
 				}
 			}
@@ -1112,6 +1120,12 @@ func stallBaseline(r store.ListActiveRunsForHealthRow) time.Time {
 // re-label, so a demoted-but-unplaceable run still reports the actionable capability block
 // rather than a yield message.
 func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds) string {
+	return s.queuedReasonBeforeAge(ctx, now, r, th, false)
+}
+
+// queuedReasonBeforeAge shares prerequisite and manual evidence ordering with the
+// ordinary ladder. early stops before transient fleet diagnostics for young runs.
+func (s *Service) queuedReasonBeforeAge(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds, early bool) string {
 	// PRD #400 Decision 6 / issue #1367: an undispatched task run (its uzi/task/<id> branch
 	// push or dispatch never landed) is NOT waiting for a worker — ClaimRun never offers it
 	// (kind<>'task' OR dispatched_at IS NOT NULL), so none of the fleet reasons below is the
@@ -1172,46 +1186,46 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	if r.EgressProfileID.Valid {
 		return s.isolatedLaneReason(ctx, r)
 	}
-	// Draining or maintenance holds take precedence when both owner holds overlap.
-	if until, held := s.ownerHold(now, r); held {
+	// Availability and manual diagnostics share one projection. Manual intent must
+	// remain visible alongside an automatic owner hold, but a claimable continuation
+	// is not blocked by either soft intent.
+	capAware := s.capabilityAwareOn(ctx)
+	eligibility, eligibilityErr := s.workerEligibilityForHealth(ctx, now, r.ID, capAware)
+	until, held := s.ownerHold(now, r)
+	if eligibilityErr == nil {
+		if reason := manualCordonWaitReason(eligibility); reason != "" {
+			if held && eligibility.AutomaticOwnerHold {
+				reason += "; " + ownerHoldReason(until, r.StaleRequeueWorkerName)
+			}
+			return reason
+		}
+	}
+	if held && (eligibilityErr != nil || eligibility.ManualCordoned == 0 || eligibility.AutomaticOwnerHold) {
 		return ownerHoldReason(until, r.StaleRequeueWorkerName)
 	}
-	// Issue #2705: ClaimRun is holding this stale-requeued run for its returning worker, so no
-	// fleet reason below is the cause. After every fundamental block above (none of which a
-	// returning worker clears) and before the cross_check and fleet rungs.
 	if until, pinned := s.staleRequeuePin(now, r); pinned {
 		return staleRequeuePinReason(until, r.StaleRequeueWorkerName)
 	}
-	// Read the capability-aware kill-switch ONCE and thread the same value into both the
-	// capability-gap rung (below) and the claim-time eligibility rung (rung 5), so the two
-	// counts and the claim path can never disagree on whether capabilities are enforced.
+	if early {
+		return ""
+	}
 	if r.Kind == "cross_check" {
-		counts, err := s.workerEligibilityForHealth(ctx, now, r.ID, s.capabilityAwareOn(ctx))
-		if err != nil {
-			slog.Error("health: read child eligibility", "run_id", r.ID, "error", err)
+		if eligibilityErr != nil {
+			slog.Error("health: read child eligibility", "run_id", r.ID, "error", eligibilityErr)
 			return reasonPlanCrossCheckWaiting
 		}
-		if reason := manualCordonWaitReason(counts); reason != "" {
+		if reason := rollWaitReason(now, eligibility); reason != "" {
 			return reason
 		}
-		if reason := rollWaitReason(now, counts); reason != "" {
-			return reason
-		}
-		if counts.StrictEligible > 0 {
-			if counts.Claimable == 0 {
+		if eligibility.StrictEligible > 0 {
+			if eligibility.Claimable == 0 {
 				return reasonCrossCheckSlotsBusy
 			}
 			return reasonPlanCrossCheckWaiting
 		}
-		// Diagnose missing rounds/pins below when no worker meets the combined
-		// child contract. StrictEligible includes bound ephemeral checker workers.
 	}
-	capAware := s.capabilityAwareOn(ctx)
-	eligibility, eligibilityErr := s.workerEligibilityForHealth(ctx, now, r.ID, capAware)
 	if eligibilityErr != nil {
 		slog.Error("health: read current worker eligibility", "run_id", r.ID, "error", eligibilityErr)
-	} else if reason := manualCordonWaitReason(eligibility); reason != "" {
-		return reason
 	} else if reason := rollWaitReason(now, eligibility); reason != "" {
 		return reason
 	} else if DrainOnlyEligibleForHealth(eligibility) {
