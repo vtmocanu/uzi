@@ -176,9 +176,10 @@ class ExportTests(unittest.TestCase):
         self.rejects(archive(member("local/", kind=tarfile.DIRTYPE, size=1)), "directory/size")
         want = expected()
         want["local"]["scene-dark.png"] = (export.FILE_MAX + 1, "0" * 64)
-        self.rejects(archive(member("local", kind=tarfile.DIRTYPE),
-                             member("local/scene-dark.png", size=export.FILE_MAX + 1)),
-                     "file byte limit", want)
+        with patch.object(export.os, "open", side_effect=AssertionError("file opened before size rejection")):
+            self.rejects(archive(member("local", kind=tarfile.DIRTYPE),
+                                 member("local/scene-dark.png", size=export.FILE_MAX + 1)),
+                         "file byte limit", want)
 
     def test_missing_file_phase_and_hash_mismatch(self):
         self.rejects(archive(*good_members()[:2]), "incomplete")
