@@ -178,7 +178,11 @@ if [ "$action" = cell ]; then
       handed_off=1
     fi
     if [ "$((SECONDS - cell_started))" -ge "${UXLAB_RENDER_TIMEOUT:-3600}" ]; then
-      echo "ERROR: cell wall deadline" >> "$log"; exit 1
+      echo "ERROR: cell wall deadline" >> "$log"
+      # One best-effort snapshot before cleanup: 30s plus 5s kill grace, <=8MiB.
+      timeout --kill-after=5s 30s docker logs "$name" 2>&1 | head -c 8388608 >> "$log" ||
+        echo "ERROR: timeout log collection failed or output capped" >> "$log"
+      exit 1
     fi
     sleep 1
   done

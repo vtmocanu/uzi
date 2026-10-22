@@ -56,19 +56,79 @@ test("standalone HOME snapshot enforces per-file, total, depth and enumeration b
       fs.writeFile(path.join(home, String(i + n)), "")));
   await assert.rejects(snapshot(home), /HOME entry limit/);
 });
-test("boundary script calibrates only disposable writes and closes unexpected real-file opens", async () => {
+test("cell deadline collects container logs before cleanup and retains failure", async (t) => {
+  const dir = await fixture(t);
+  await fs.writeFile(path.join(dir, "docker"), `#!/usr/bin/env bash
+set -eu
+state="$FAKE_DOCKER_DIR"
+case "$1 \${2:-}" in
+  "info ") ;;
+  "image inspect") echo fixture-image ;;
+  "volume ls") ;;
+  "volume create") printf '%s' "\${4#uxlab-render.owner=}" > "$state/owner" ;;
+  "volume inspect") cat "$state/owner" ;;
+  "volume rm") ;;
+  "ps -a") if [ -f "$state/container" ]; then cat "$state/owner"; fi ;;
+  "inspect "*)
+    case "$*" in
+      *State.Running*) echo true ;;
+      *uxlab-render.owner*) cat "$state/owner" ;;
+      *) exit 2 ;;
+    esac ;;
+  "create "*) touch "$state/container" ;;
+  "start "*) ;;
+  "logs "*)
+    test -f "$state/container"
+    echo LOCAL_HANG_DIAGNOSTIC
+    exit "$FAKE_LOG_EXIT" ;;
+  "rm -f") rm "$state/container" ;;
+  *) echo "unexpected docker command: $*" >&2; exit 2 ;;
+esac
+`, { mode: 0o755 });
+  for (const logExit of ["0", "2"]) {
+    const result = await exec("bash", [fileURLToPath(new URL("./run.sh", import.meta.url)), "cell"], {
+      env: { ...process.env, PATH: dir + path.delimiter + process.env.PATH,
+        FAKE_DOCKER_DIR: dir, FAKE_LOG_EXIT: logExit,
+        UXLAB_RENDER_CELL: "local", UXLAB_RENDER_MODE: "off", UXLAB_RENDER_TIMEOUT: "0",
+        UXLAB_RENDER_REPO_DIR: dir, UXLAB_RENDER_SRC_DIR: dir,
+        UXLAB_RENDER_MANIFEST: fileURLToPath(new URL("../../devbox.json", import.meta.url)),
+        UXLAB_RENDER_GO_DIR: "", UXLAB_RENDER_BIN_DIR: "" },
+      timeout: 10_000, maxBuffer: 64 * 1024,
+    }).then(() => { throw new Error("deadline must fail"); }, error => error);
+    const logPath = result.stdout.match(/^LOG=(.+)$/m)?.[1];
+    assert.ok(logPath);
+    t.after(() => fs.rm(fileURLToPath(new URL("../../" + logPath, import.meta.url)), { force: true }));
+    assert.equal(result.code, 1);
+    assert.match(result.stdout, /ERROR: cell wall deadline/);
+    assert.match(result.stdout, /LOCAL_HANG_DIAGNOSTIC/);
+    assert.match(result.stdout, /CLEANUP=verified/);
+    assert.match(result.stdout, /EXIT=1/);
+    assert.equal(result.stdout.includes("ERROR: timeout log collection failed"), logExit !== "0");
+  }
+});
+test("boundary script permits only off-mode DB observation and disposable sentinel writes", async () => {
   const sentinel = "/nix/uxlab-sentinel-abc";
-  for (const scenario of ["off", "required", "unexpected-db", "unexpected-sentinel"]) {
-    const calls: string[] = [], errors: string[] = [];
-    const state = { argv: ["node", sentinel, scenario === "off" ? "off" : "required"], exitCode: 0 };
+  const db = "/nix/var/nix/db/db.sqlite", lock = "/nix/var/nix/db/big-lock";
+  for (const scenario of [
+    { mode: "off", opens: [sentinel], rejected: "" },
+    { mode: "off", opens: [db, sentinel], rejected: "" },
+    { mode: "required", opens: [], rejected: "" },
+    { mode: "required", opens: [db], rejected: db },
+    { mode: "off", opens: [lock, sentinel], rejected: lock },
+    { mode: "off", opens: [db, lock, sentinel], rejected: lock },
+    { mode: "required", opens: [lock], rejected: lock },
+    { mode: "required", opens: [sentinel], rejected: sentinel },
+    { mode: "off", opens: [db], rejected: "sentinel calibration denied" },
+  ]) {
+    const calls: string[] = [], errors: string[] = [], logs: string[] = [];
+    const state = { argv: ["node", sentinel, scenario.mode], exitCode: 0 };
     const fakeFS = {
       lstat: async () => ({ isFile: () => true, dev: 1n, ino: 2n, uid: 10002n,
-        gid: 10002n, mode: 0o666n, mtimeNs: 1n, size: 0n }),
+        gid: 10002n, mode: 0o664n, mtimeNs: 1n, size: 0n }),
       open: async (file: string, flags: number) => {
         assert.equal(flags, constants.O_RDWR);
         calls.push("open:" + file);
-        if ((file === sentinel && scenario !== "required") ||
-            (file.endsWith("db.sqlite") && scenario === "unexpected-db")) return {
+        if (scenario.opens.includes(file)) return {
           close: async () => { calls.push("close:" + file); },
           write: async () => { calls.push("write:" + file); return { bytesWritten: 1 }; },
         };
@@ -84,14 +144,32 @@ test("boundary script calibrates only disposable writes and closes unexpected re
         throw new Error("unexpected dependency");
       },
       process: state, Buffer,
-      console: { log: () => {}, error: (error: string) => { errors.push(error); } },
+      console: { log: (message: string) => { logs.push(message); }, error: (error: string) => { errors.push(error); } },
     }, { timeout: 1000 });
-    assert.equal(state.exitCode, scenario.startsWith("unexpected") ? 1 : 0, scenario);
-    assert.equal(calls.filter(call => call.startsWith("write:")).join(), scenario === "off" ? "write:" + sentinel : "");
-    if (scenario === "unexpected-db") {
-      assert.equal(calls.at(-1), "close:/nix/var/nix/db/db.sqlite");
-      assert.equal(errors.length, 1);
+    const label = JSON.stringify(scenario);
+    assert.equal(state.exitCode, scenario.rejected ? 1 : 0, label);
+    assert.deepEqual(errors, scenario.rejected
+      ? ["Error: " + (scenario.rejected.startsWith("/") ? "unexpected writable open: " : "") + scenario.rejected]
+      : [], label);
+    const expectedCalls: string[] = [];
+    for (const file of [db, lock, sentinel]) {
+      expectedCalls.push("open:" + file);
+      if (scenario.opens.includes(file)) {
+        if (file === sentinel && scenario.mode === "off") expectedCalls.push("write:" + file);
+        expectedCalls.push("close:" + file);
+      }
+      if (file === scenario.rejected) break;
     }
-    if (scenario === "unexpected-sentinel") assert.equal(calls.at(-1), "close:" + sentinel);
+    assert.deepEqual(calls, expectedCalls, label);
+    assert.deepEqual(logs.filter(line => line.startsWith("OFF_MODE_DB_OPEN_OBSERVED=")),
+      scenario.mode === "off" && scenario.opens.includes(db) ? ["OFF_MODE_DB_OPEN_OBSERVED=" + db] : [], label);
+    assert.deepEqual(logs.filter(line => line.startsWith("SENTINEL_WRITE_CALIBRATED=")),
+      !scenario.rejected && scenario.mode === "off" ? ["SENTINEL_WRITE_CALIBRATED=" + sentinel] : [], label);
+    for (const file of [db, lock, sentinel]) {
+      if (calls.includes("open:" + file) && !scenario.opens.includes(file) &&
+          !(file === sentinel && scenario.mode === "off")) {
+        assert.ok(logs.includes("OPEN_DENIED=" + file), label);
+      }
+    }
   }
 });
