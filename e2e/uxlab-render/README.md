@@ -42,6 +42,25 @@ Configuration:
 - `bash e2e/uxlab-render/run.sh build`: optional image build using the existing,
   unchanged base Dockerfile. `UXLAB_RENDER_BUILD_TIMEOUT` defaults to 1800.
 
+Fixture input reads accept regular files only (no symlinks, FIFOs, or devices).
+The root manifest is limited to 1 MiB, each source file to 4 MiB, all source
+content to 64 MiB, and each helper binary to 64 MiB. Sizes are checked before
+allocation; reads use chunks of at most 64 KiB and at most one extra byte to
+detect growth past a cap. Source enumeration counts at most 8192 file/directory
+entries across the tree before collecting names for sorting, with at most 64
+directory levels below the root. Exceeding any limit fails the fixture.
+Successful inputs retain the same byte hashes and source path/content delimiters.
+
+Focused input regressions (installed agent dependencies required):
+
+```sh
+cd agent
+node --import tsx --test --test-timeout=120000 ../e2e/uxlab-render/inputs.test.ts
+```
+
+Tests create and remove only their own directories under this worktree's
+`.uzi/scratch/`.
+
 Logs live only in this worktree's `.uzi/scratch/`; the runner prints the path.
 They include image ID/labels, source content SHA256, helper binary SHA256s,
 image/Node/devbox/Nix versions, provisioning events, command output, elapsed
@@ -53,6 +72,9 @@ pass/skip into exit 3. Other failures are nonzero. No full render matrix or
 runtime modifications are included in M1.
 
 ## M1 validation receipt — 2026-10-22
+
+Historical receipt for the fixture before the bounded-input repair. The lead
+must rerun the canary and record fresh proof for the changed fixture.
 
 Executed `bash e2e/uxlab-render/run.sh canary` against base root manifest
 SHA256 `d3b4242b28ce03f6fafa548aff5edc8c67ce28d5c0b708f259676f78a578e33b`.

@@ -7,6 +7,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
 import type { RunContext } from "../../agent/src/executor.js";
+import { readRegularFile, sourceId, MANIFEST_MAX_BYTES, HELPER_MAX_BYTES } from "./inputs.js";
 
 const exec = promisify(execFile);
 const src = "/app/src";
@@ -14,27 +15,6 @@ const load = (name: string) => import(pathToFileURL(path.join(src, name)).href);
 const started = performance.now();
 const record = (kind: string, fields: Record<string, unknown>) =>
   console.log(JSON.stringify({ kind, elapsedMs: Math.round(performance.now() - started), ...fields }));
-
-async function sourceId(): Promise<string> {
-  const hash = createHash("sha256");
-  async function walk(dir: string): Promise<void> {
-    for (const name of (await fs.readdir(dir)).sort()) {
-      const file = path.join(dir, name);
-      const stat = await fs.lstat(file);
-      assert(!stat.isSymbolicLink(), `source export must contain regular files/directories: ${file}`);
-      if (stat.isDirectory()) await walk(file);
-      else {
-        assert(stat.isFile(), `unsupported source entry: ${file}`);
-        hash.update(path.relative(src, file));
-        hash.update("\0");
-        hash.update(await fs.readFile(file));
-        hash.update("\0");
-      }
-    }
-  }
-  await walk(src);
-  return hash.digest("hex");
-}
 
 async function main(): Promise<void> {
   if (process.env.UZI_UID_SPLIT !== "1" || process.getuid?.() !== 10001) {
@@ -67,12 +47,12 @@ async function main(): Promise<void> {
   assert.equal((await runAsRunner("/usr/bin/id", ["-u"])).stdout.trim(), "10002");
   const helperIds: Record<string, string> = {};
   for (const name of ["uzi-codex-supervisor", "uzi-codex-fileop", "uzi-codex-command-sandbox"]) {
-    helperIds[name] = createHash("sha256").update(await fs.readFile(`/usr/local/bin/${name}`)).digest("hex");
+    helperIds[name] = createHash("sha256").update(await readRegularFile(`/usr/local/bin/${name}`, HELPER_MAX_BYTES)).digest("hex");
   }
   record("identity", {
     imageId: process.env.UXLAB_RENDER_IMAGE_ID,
     imageVersion: process.env.UZI_AGENT_VERSION,
-    sourceSha256: await sourceId(), helpers: helperIds, node: process.version,
+    sourceSha256: await sourceId(src), helpers: helperIds, node: process.version,
     devbox: (await runAsRunner("devbox", ["version"])).stdout.trim(),
     nix: (await runAsRunner("nix", ["--version"])).stdout.trim(),
     workerUid: process.getuid?.(), runnerUid: 10002,
@@ -90,8 +70,7 @@ async function main(): Promise<void> {
     'mkdir "$1"; chmod 2770 "$1"; git init -q "$1"', "sh", checkout]);
   await exec(wrapped.command, wrapped.args, { timeout: 10_000, maxBuffer: 1024 * 1024 });
   assert.equal((await fs.stat(checkout)).uid, 10002);
-  const manifest = await fs.readFile("/work/root-devbox.json");
-  assert(manifest.length <= 1024 * 1024, "root manifest exceeds 1 MiB");
+  const manifest = await readRegularFile("/work/root-devbox.json", MANIFEST_MAX_BYTES);
   await fs.writeFile(path.join(checkout, "devbox.json"), manifest);
   record("manifest", { sha256: createHash("sha256").update(manifest).digest("hex") });
   const events: string[] = [];
