@@ -1,5 +1,5 @@
 import { prepareCIEvidence, validateCIRepairClaim, type PreparedCIEvidence } from "./ci-evidence.js";
-import { isCheckpointBoundaryFailure, type CheckpointStop } from "./checkpoint-stop.js";
+import { GitBoundaryAbortError, isCheckpointBoundaryFailure, type CheckpointStop } from "./checkpoint-stop.js";
 import { prepareFrozenHeld, type FrozenHeldPolicy } from "./frozen-held.js";
 import { interruptedSnapshot, prepareInterruptedCalls } from "./interrupted-calls.js";
 import { CodeCrossCheckGate, persistedCodeCrossCheckSummary } from "./code-cross-check-gate.js";
@@ -375,6 +375,7 @@ const CODEX_BOUNDARY_STEPS: ReadonlySet<BoundaryStep> = new Set<BoundaryStep>([
   "checkpoint_import_readback",
   "checkpoint_code_head",
   "checkpoint_bridge",
+  "checkpoint_post_import", "checkpoint_steer", "checkpoint_post_bridge",
 ]);
 
 /** Issue #1900: the finite deadline (ms) of the Codex FINALIZE boundary. The finalize publish
@@ -11428,15 +11429,31 @@ export class RunRunner {
         opts.doneAttempt && opts.donePermit ? { signal: opts.doneAttempt.stop.signal, deadlineAt: opts.doneAttempt.softDeadlineAt, permit: opts.donePermit } : undefined;
       const withCheckpointSoftGit = <T>(action: () => Promise<T>): Promise<T> => {
         const soft = checkpointSoft;
+        if (soft && opts.reap && !opts.doneAttempt) {
+          if (soft.permit.signal.aborted) throw new GitBoundaryAbortError("checkpoint authority revoked");
+          if (soft.signal.aborted || (soft.deadlineAt ?? Infinity) <= (this.checkpointTestHooks?.absoluteNow ?? Date.now)()) {
+            throw new CheckpointSoftDeadlineError();
+          }
+        }
         return soft
           ? this.git.withBoundaryProcessSpawner(
               (request) => executor.safety!.spawnBoundaryProcess(soft.permit, request),
               soft.permit.signal,
               action,
-              { softSignal: soft.signal, softDeadlineAt: soft.deadlineAt, now: opts.doneAttempt?.now },
+              { softSignal: soft.signal, softDeadlineAt: soft.deadlineAt, now: opts.doneAttempt?.now ?? this.checkpointTestHooks?.absoluteNow },
             )
           : action();
       };
+      const withCheckpointPostImportGit = <T>(action: () => Promise<T>): Promise<T> =>
+        opts.reap && !opts.doneAttempt ? withCheckpointSoftGit(action) : action();
+      const adoptCheckpointBridge = <T>(action: () => Promise<T>): Promise<T> => withCheckpointPostImportGit(() => {
+        const soft = checkpointSoft;
+        return soft && opts.reap && !opts.doneAttempt
+          ? this.git.withBoundaryProcessSpawner(
+              request => executor.safety!.spawnBoundaryProcess(soft.permit, request), soft.permit.signal, action,
+            )
+          : action();
+      });
       // `inPermit`: this publish runs inside a Codex permit (the reap:true milestone on a Codex run),
       // whose deadline the scan must not push it past (issue #1597 M2 review item 7).
       // `noReport`: skip the running report (the post-permit deferred publish; the milestone's own
@@ -11488,6 +11505,7 @@ export class RunRunner {
           });
         }
 
+        checkpointSteps?.enter("checkpoint_post_import");
         if (codeDoneSnapshot && fetchedBack.kind !== "updated") { codeSnapshot = undefined; codeFreshReceipt = undefined; codeEmptyPrompt = false; }
         if (fetchedBack.kind === "refused") {
           if (opts.doneAttempt) throw new PreservationRefusedError();
@@ -11511,7 +11529,9 @@ export class RunRunner {
             runLog.warn("code snapshot unavailable", { error: errMessage(err) });
           }
         }
-        const fetchedTip = await this.requireTrackingOwned(flight, barePath, runnerClone.branch);
+        const fetchedTip = await withCheckpointPostImportGit(() => this.requireTrackingOwned(
+          flight, barePath, runnerClone.branch, undefined, step => checkpointSteps?.enter(step), "checkpoint_post_import",
+        ));
 
         // PRD #1416 M2: on the tip that was just fetched into the bare, detect a history
         // rewrite at/below the published floor P (and floor C) and steer the agent to restore
@@ -11520,19 +11540,23 @@ export class RunRunner {
         // Never read the runner clone here (that crosses
         // the worker-uid/runner-uid ownership seam branchTip exists to avoid). MID-RUN
         // checkpoint tick only — the finalize/park/capture fetch-backs are M3's territory.
-        await this.maybeSteerOnDivergence(barePath, flight, fetchedTip, batcher, steering, runLog);
+        checkpointSteps?.enter("checkpoint_steer");
+        await withCheckpointPostImportGit(() => this.maybeSteerOnDivergence(barePath, flight, fetchedTip, batcher, steering, runLog));
 
         // PRD #1416 M3 (C1): AFTER the steer (which must see the agent's rewritten H) and BEFORE
         // the publish, non-destructively bridge a divergent tracking tip so the checkpoint pack —
         // and therefore a reseed on resume — carries B instead of the rewritten H. Best-effort:
-        // a checkpoint must never crash the run (D4), so "failed"/"unknown" only log and continue.
-        if (opts.doneAttempt) checkpointSteps?.enter("checkpoint_bridge");
-        const bridgeOutcome = await this.bridgeBareTrackingRefIfDivergent(
+        // ordinary "failed"/"unknown" outcomes only log and continue (D4). Typed soft/hard
+        // boundary, unsafe cleanup and authority failures propagate to the checkpoint boundary.
+        checkpointSteps?.enter("checkpoint_bridge");
+        const bridgeOutcome = await withCheckpointPostImportGit(() => this.bridgeBareTrackingRefIfDivergent(
           barePath,
           runnerClone.branch,
           flight,
           runLog,
-        );
+          adoptCheckpointBridge,
+          step => checkpointSteps?.enter(step),
+        ));
         if (bridgeOutcome.kind === "preservation_refused") {
           if (codeDoneSnapshot) clearCodeSnapshot();
           if (opts.doneAttempt) throw new PreservationRefusedError();
@@ -11547,21 +11571,22 @@ export class RunRunner {
             outcome: bridgeOutcome.kind,
           });
         }
-        // The local fetch-back and ancestry bridge above must finish even when
-        // remote publication runs out of budget. The soft stop begins to govern
-        // only the overlay/pack/upload path below.
-        if (hasNewWork && checkpointSoft?.signal.aborted) throw new CheckpointSoftDeadlineError();
-        // Local fetch-back/bridge stays intact. All sinks hold findings remembered in this flight;
-        // reap publishes also require the last clean-scanned source. Sinks remain unscanned and
-        // do not contain never-flagged content (including overlay trees) or a new flight's history.
-        const postBridgeTip = await this.requireTrackingOwned(flight, barePath, runnerClone.branch);
+        // Started import/adoption settles ownership under the hard allowance. Later
+        // milestone phases remain cooperative, including checkpoints without new work.
+        // Keep the done checkpoint's existing publication-stop position.
+        if (opts.doneAttempt && hasNewWork && checkpointSoft?.signal.aborted) throw new CheckpointSoftDeadlineError();
+        checkpointSteps?.enter("checkpoint_post_bridge");
+        const postBridgeTip = await withCheckpointPostImportGit(() => this.requireTrackingOwned(
+          flight, barePath, runnerClone.branch, undefined, step => checkpointSteps?.enter(step), "checkpoint_post_bridge",
+        ));
         const timeGateOpen =
           this.checkpointIntervalMs > 0 &&
           this.now() - flight.lastPublish >= this.checkpointIntervalMs;
         // Keep a closed time gate's own outcome; judge the post-bridge candidate before any overlay.
         const remediationHold =
           hasNewWork && (opts.reap || timeGateOpen || flight.pendingPublish) &&
-          await this.checkpointRemediationHold(flight, barePath, postBridgeTip, opts.reap);
+          await withCheckpointPostImportGit(() => this.checkpointRemediationHold(flight, barePath, postBridgeTip, opts.reap));
+        checkpointSteps?.enter("checkpoint_overlay");
         // Resolve the GitHub overlay context after the candidate is in the
         // worker bare. Even a slow local default-branch lookup now runs under
         // the same checkpoint-only child budget as the remote default fetch.
@@ -11570,7 +11595,7 @@ export class RunRunner {
           : typeof overlay === "function"
             ? await withCheckpointSoftGit(overlay)
             : overlay;
-        if (hasNewWork && checkpointSoft?.signal.aborted) throw new CheckpointSoftDeadlineError();
+        if ((hasNewWork || !opts.doneAttempt) && checkpointSoft?.signal.aborted) throw new CheckpointSoftDeadlineError();
 
         // PRD #267: origin-publish gate. The publish is CREDENTIAL-FREE (a pack brokered to the
         // api via publishCheckpoint, no PAT — checkpointPack local objects → client join token)
@@ -11829,7 +11854,9 @@ export class RunRunner {
           const checkpointAction = async (permit?: BoundaryPermit) => {
               if (permit && softController) checkpointSoft = { signal: softController.signal, deadlineAt: softDeadlineAt, permit };
               checkpointSteps?.enter("checkpoint_overlay");
-              await doCheckpointPublish(hasNewWork ? () => this.buildCheckpointOverlay(claim, flight, barePath) : undefined, permit !== undefined);
+              await doCheckpointPublish(hasNewWork ? () => this.buildCheckpointOverlay(
+                claim, flight, barePath, step => checkpointSteps?.enter(step),
+              ) : undefined, permit !== undefined);
           };
           if (opts.doneAttempt) await checkpointAction(opts.donePermit);
           else await this.reapForSink(
@@ -13861,9 +13888,10 @@ export class RunRunner {
     }
   }
 
-  private async reconcileConfirmedOwed(flight: RunFlight, barePath: string, confirmedSha: string): Promise<void> {
+  private async reconcileConfirmedOwed(flight: RunFlight, barePath: string, confirmedSha: string,
+    onStep?: (step: BoundaryStep) => void): Promise<void> {
     try {
-      const result = await this.git.reconcileOwedCandidates(barePath, flight.runId, confirmedSha);
+      const result = await this.git.reconcileOwedCandidates(barePath, flight.runId, confirmedSha, onStep);
       // Only reconcileOwedCandidates supplies positive checkpoint coverage proof.
       // Snapshot previously announced removals before forgetting all released heads.
       const resolved = [...new Set(result.removedShas)].filter(sha => /^[0-9a-f]{40}$/.test(sha) &&
@@ -14179,10 +14207,12 @@ export class RunRunner {
     flight.steering?.abortLifecycle();
   }
 
-  private async checkedTrackingSnapshot(flight: RunFlight, barePath: string, branch: string, expectedSha?: string): Promise<string | null> {
+  private async checkedTrackingSnapshot(flight: RunFlight, barePath: string, branch: string, expectedSha?: string,
+    step?: (step: BoundaryStep) => void, phase: BoundaryStep = "checkpoint_post_import"): Promise<string | null> {
     const { context } = await this.owedOptions(flight, barePath, branch);
     const owned = await this.git.committedTrackingOwnership(
       barePath, branch, flight.runId, expectedSha, context.generation ?? undefined,
+      step ? { waiting: () => step("checkpoint_lock_wait"), acquired: () => step(phase) } : undefined,
     );
     return owned.kind === "owned" && owned.context.generation === context.generation &&
       owned.context.runId === context.runId && owned.context.branch === context.branch &&
@@ -14195,8 +14225,9 @@ export class RunRunner {
     return await this.checkedTrackingSnapshot(flight, barePath, branch, expectedSha) !== null;
   }
 
-  private async requireTrackingOwned(flight: RunFlight, barePath: string, branch: string, expectedSha?: string): Promise<string> {
-    const sha = await this.checkedTrackingSnapshot(flight, barePath, branch, expectedSha);
+  private async requireTrackingOwned(flight: RunFlight, barePath: string, branch: string, expectedSha?: string,
+    step?: (step: BoundaryStep) => void, phase: BoundaryStep = "checkpoint_post_import"): Promise<string> {
+    const sha = await this.checkedTrackingSnapshot(flight, barePath, branch, expectedSha, step, phase);
     if (sha === null) throw this.preservationRefused(flight, "ownership_unknown");
     return sha;
   }
@@ -14211,22 +14242,26 @@ export class RunRunner {
     }
     options.checkpointStep?.("checkpoint_import_context");
     const owed = await this.owedOptions(flight, barePath, branch);
-    const result = await importScope(() => this.git.fetchAgentBranch(
-      barePath, worktreePath, branch, flight.runId, { ...owed, ...options },
-    ));
-    if (result.kind === "not_updated") throw this.preservationRefused(flight, result.reason);
-    options.checkpointStep?.("checkpoint_import_readback");
-    await this.requireTrackingOwned(flight, barePath, branch, result.candidateSha);
-    if (result.divergence === "divergent") {
-      const heads = result.displacedSha && result.retainedShas.includes(result.displacedSha) ? [result.displacedSha] : [];
-      for (const sha of heads) if (/^[0-9a-f]{40}$/.test(sha) && !flight.owedFeedClosed) {
-        flight.batcher.emit({ kind: "status", agent: "worker", payload: { text:
-          `Rewrite/divergence preserved head ${sha.slice(0, 12)} before ${result.candidateSha.slice(0, 12)}; worker-local, not checkpoint durable. Use uzi run recovery or uzi run export.`,
-        } });
+    return importScope(async () => {
+      const result = await this.git.fetchAgentBranch(
+        barePath, worktreePath, branch, flight.runId, { ...owed, ...options },
+      );
+      if (result.kind === "not_updated") throw this.preservationRefused(flight, result.reason);
+      if (result.divergence === "divergent") {
+        const heads = result.displacedSha && result.retainedShas.includes(result.displacedSha) ? [result.displacedSha] : [];
+        for (const sha of heads) if (/^[0-9a-f]{40}$/.test(sha) && !flight.owedFeedClosed) {
+          flight.batcher.emit({ kind: "status", agent: "worker", payload: { text:
+            `Rewrite/divergence preserved head ${sha.slice(0, 12)} before ${result.candidateSha.slice(0, 12)}; worker-local, not checkpoint durable. Use uzi run recovery or uzi run export.`,
+          } });
+        }
       }
-    }
-    this.announceOwedHeads(flight, result.retainedShas);
-    return result;
+      this.announceOwedHeads(flight, result.retainedShas);
+      options.checkpointStep?.("checkpoint_import_readback");
+      await importScope(() => this.requireTrackingOwned(
+        flight, barePath, branch, result.candidateSha, options.checkpointStep, "checkpoint_import_readback",
+      ));
+      return result;
+    });
   }
 
   private async fetchBackBestEffort(
@@ -14362,7 +14397,8 @@ export class RunRunner {
    * Advances the tracking ref to B and C to B on success, so everything a caller then
    * captures / releases / aligns / pushes off the tracking ref carries B.
    *
-   * Outcomes (never thrown for control flow — a git failure inside maps to "failed"/"unknown"):
+   * Ordinary best-effort git failures map to "failed"/"unknown"; typed soft/hard boundary,
+   * unsafe cleanup and authority failures propagate. Outcomes:
    *  - "clean"   — no floor to bridge (P null, or P and C are already ancestors of H). Nothing done.
    *  - "unknown" — ancestry could not be determined (a broken read); do NOT bridge, do NOT fail.
    *  - "bridged" — B built AND validated (tree === H's tree, P and H both ancestors of B); the bare
@@ -14374,8 +14410,10 @@ export class RunRunner {
     branch: string,
     flight: RunFlight,
     runLog: Logger,
+    adopt: <T>(action: () => Promise<T>) => Promise<T> = action => action(),
+    step?: (step: BoundaryStep) => void,
   ): Promise<BridgeOutcome> {
-    const H = await this.checkedTrackingSnapshot(flight, barePath, branch);
+    const H = await this.checkedTrackingSnapshot(flight, barePath, branch, undefined, step, "checkpoint_bridge");
     if (H === null) {
       this.preservationRefused(flight, "ownership_unknown");
       return { kind: "preservation_refused" };
@@ -14464,32 +14502,35 @@ export class RunRunner {
     // B includes H and the floors, so this also covers every bridge parent.
     await this.git.scratchPublicationPreflight(barePath, branch, H);
     await this.git.scratchPublicationPreflight(barePath, branch, bridge);
-    // Adopt B: advance the bare tracking ref (worker-uid) and the checkpoint floor C.
-    try {
-      const update = await this.git.updateTrackingRef(barePath, branch, bridge, await this.owedOptions(flight, barePath, branch));
-      if (update.kind === "not_updated") {
-        this.preservationRefused(flight, update.reason);
-        return { kind: "preservation_refused" };
+    // Once adoption starts, context, custody and the local floor settle together.
+    return adopt(async () => {
+      try {
+        const context = await this.owedOptions(flight, barePath, branch);
+        const update = await this.git.updateTrackingRef(barePath, branch, bridge, { ...context, checkpointStep: step });
+        if (update.kind === "not_updated") {
+          this.preservationRefused(flight, update.reason);
+          return { kind: "preservation_refused" };
+        }
+        await this.requireTrackingOwned(flight, barePath, branch, update.candidateSha, step, "checkpoint_bridge");
+      } catch (e) {
+        if (isCheckpointBoundaryFailure(e)) throw e;
+        if (e instanceof PreservationRefusedError) return { kind: "preservation_refused" };
+        runLog.warn("PRD #1416 M3: could not advance the tracking ref to the bridge", {
+          run_id: flight.runId,
+          bridge,
+          error: errMessage(e),
+        });
+        return { kind: "failed" };
       }
-      await this.requireTrackingOwned(flight, barePath, branch, update.candidateSha);
-    } catch (e) {
-      if (isCheckpointBoundaryFailure(e)) throw e;
-      if (e instanceof PreservationRefusedError) return { kind: "preservation_refused" };
-      runLog.warn("PRD #1416 M3: could not advance the tracking ref to the bridge", {
+      flight.checkpointFloor = bridge;
+      runLog.info("PRD #1416 M3: history rewritten below the published floor; bridged and advanced the tracking ref", {
         run_id: flight.runId,
+        published_tip: publishedTip,
+        tip: H,
         bridge,
-        error: errMessage(e),
       });
-      return { kind: "failed" };
-    }
-    flight.checkpointFloor = bridge;
-    runLog.info("PRD #1416 M3: history rewritten below the published floor; bridged and advanced the tracking ref", {
-      run_id: flight.runId,
-      published_tip: publishedTip,
-      tip: H,
-      bridge,
+      return { kind: "bridged", bridge };
     });
-    return { kind: "bridged", bridge };
   }
 
   /**
@@ -14579,8 +14620,9 @@ export class RunRunner {
     claim: ClaimResponse,
     flight: RunFlight,
     barePath: string,
+    onStep?: (step: BoundaryStep) => void,
   ): Promise<CheckpointOverlayContext | undefined> {
-    await this.requireTrackingOwned(flight, barePath, flight.branch!);
+    await this.requireTrackingOwned(flight, barePath, flight.branch!, undefined, onStep, "checkpoint_overlay");
     if (claim.repo.forge_type !== "github") return undefined;
     const defaultBranch =
       claim.repo.default_branch?.trim() ||
@@ -15409,7 +15451,8 @@ export class RunRunner {
       for (const sha of state.flaggedCommits!) {
         if (await this.git.ancestry(barePath, sha, candidate) !== "divergent") return true;
       }
-    } catch {
+    } catch (error) {
+      if (isCheckpointBoundaryFailure(error)) throw error;
       return true;
     }
     return false;
@@ -15497,7 +15540,8 @@ export class RunRunner {
       // issue #3194: read the acceptance bit BEFORE the owned source snapshot, and freeze the
       // attestation with it for every retry of this logical publish.
       const attests = flight.baseAccepted === true;
-      const sourceSha = await this.requireTrackingOwned(flight, barePath, branch, pinned?.tipSha);
+      onStep?.("scratch_preflight");
+      const sourceSha = await this.requireTrackingOwned(flight, barePath, branch, pinned?.tipSha, onStep, "scratch_preflight");
       const attestedSource = attests ? sourceSha : undefined;
       signal?.throwIfAborted();
       if (await this.ciConfigGuardBlocksPublication(flight, barePath, sourceSha, "checkpoint publish")) {
@@ -15546,7 +15590,8 @@ export class RunRunner {
         await abandon(true);
         await sleep(backoffMs, signal);
         signal?.throwIfAborted();
-        await this.requireTrackingOwned(flight, barePath, branch, sourceSha);
+        onStep?.("scratch_preflight");
+        await this.requireTrackingOwned(flight, barePath, branch, sourceSha, onStep, "scratch_preflight");
         signal?.throwIfAborted();
         producer = await packed.replay();
         observeProducer();
@@ -15566,7 +15611,7 @@ export class RunRunner {
         // declared tip (the overlay `O_ov`, or realTip on the no-overlay path), so the NEXT
         // overlay carries it as parent[0] (base-first) and stays a fast-forward the broker takes.
         flight.lastCheckpointRefTip = packed.tipOid;
-        await this.reconcileConfirmedOwed(flight, barePath, packed.tipOid);
+        await this.reconcileConfirmedOwed(flight, barePath, packed.tipOid, onStep);
         // issue #1086 (F2): a confirmed publish reconciles the broker's ref, so clear any pending
         // attempted tip — the confirmed tip is now authoritative.
         flight.lastAttemptedCheckpointRefTip = undefined;

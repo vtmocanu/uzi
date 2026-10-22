@@ -344,9 +344,32 @@ finalize retains its separate 50-minute boundary.
 
 Milestones retain 10 s soft / 30 s hard budgets. Before import, the bare-lock
 wait can forfeit its queued callback on a soft stop while retaining its
-predecessor in the queue. Once milestone import starts, transport, preservation,
-readback and bridging are hard-only; a soft stop cannot abandon that transition.
-This does not extend the milestone allowance to the done-checkpoint values.
+predecessor in the queue. Once milestone import starts, transport, preservation
+and in-import stage cleanup stay hard-only. Amendment #3304 makes readback,
+steering and bridge reads after a settled milestone import cooperatively
+stoppable. The worker emits retained-head/divergence notices before honoring the
+soft stop, even when there is no new work to publish. A started bridge adoption
+stays hard-only through tracking update, ownership readback and checkpoint-floor
+advancement; a soft stop cannot split that transition. Other fetch-back callers
+retain their ownership readback and existing policy. This does not extend the
+milestone allowance to the done-checkpoint values.
+
+For a successful import, cleanup first checks that the tracking ref still holds
+the incoming head and deletes its private stage on a match, without scanning
+unrelated runs' owed inventory. A mismatch falls back to the existing owed-anchor
+check; refusals retain that check. Cleanup failures remain fatal for successful
+imports. This checked ref read and stage deletion can still exhaust the hard
+boundary after ownership settles; making cleanup recoverable would require a
+stage-retention/reclamation policy outside #3304.
+
+A clean post-import soft stop reports `soft_deadline` and milestone progress,
+without claiming publication or origin durability. The next checkpoint, park
+or finalize re-evaluates skipped readback, steering, bridging and publication.
+Post-import phases and their bare-lock waits have separate diagnostic spans.
+Repeated skips can leave work local and protected but unpublished; replacement
+of a Docker pod can still lose that work (#3153). Transport, ownership mutation
+and started adoption may still exhaust the hard boundary. Reconcile, quiesce and
+reap before the action also consume the same 30 s allowance.
 
 For done imports, Git's private `AsyncLocalStorage` scope masks the cooperative
 soft signal before the first displaced-head pin, producing-context persistence
