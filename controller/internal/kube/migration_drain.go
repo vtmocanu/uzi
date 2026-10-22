@@ -120,6 +120,12 @@ func (m *Materializer) migrationCover(t *rollTick, candidate *rollEntry) bool {
 			!covers(peer.w, candidate.coverage) || (peer.admitted && peer.drift) {
 			continue
 		}
+		// Independent /nix maintenance runs after planning and may recycle or
+		// cordon this otherwise usable provider in the same reconciliation.
+		spec, err := m.resolver.Resolve(peer.w.Template, peer.w.Size)
+		if err != nil || m.legacyRecycleDue(peer.w, peer.o, spec) {
+			continue
+		}
 		if m.oldUsable(t, peer) || m.currentUsable(t, peer) || m.promoted(t, peer) {
 			return true
 		}

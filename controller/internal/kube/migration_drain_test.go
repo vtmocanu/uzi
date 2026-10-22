@@ -54,9 +54,15 @@ func migrationHeldOpt(id string) lmOpts {
 func migrationProviderOpt(id string) lmOpts { return lmOpts{id: id, stale: true, layout: "new"} }
 
 func TestMigrationDrainEntry(t *testing.T) {
-	for _, mode := range []string{"busy", "busy-provider", "idle-terminal", "singleton", "partial", "union", "foreign-owner", "foreign-lane", "unknown", "stale", "dead", "draining", "pressure", "maintenance", "ordinary-wins", "third-provider", "reverse-dependency"} {
+	for _, mode := range []string{"busy", "busy-provider", "idle-terminal", "singleton", "partial", "union", "foreign-owner", "foreign-lane", "unknown", "stale", "dead", "draining", "pressure", "maintenance", "undersized-nix", "undersized-nix-busy", "undersized-nix-disabled", "full-size-nix", "ordinary-wins", "third-provider", "reverse-dependency"} {
 		t.Run(mode, func(t *testing.T) {
+			nixProvider := strings.HasPrefix(mode, "undersized-nix") || mode == "full-size-nix"
 			opts := []lmOpts{migrationHeldOpt("a"), migrationHeldOpt("b")}
+			if nixProvider {
+				// Current, non-held coverage can still disappear to independent
+				// /nix maintenance later in this same reconciliation.
+				opts[1] = lmOpts{id: "b", layout: "new", promoted: true}
+			}
 			if mode == "ordinary-wins" || mode == "third-provider" || mode == "reverse-dependency" {
 				opts[1] = migrationProviderOpt("b")
 			}
@@ -71,7 +77,24 @@ func TestMigrationDrainEntry(t *testing.T) {
 			}
 			f, ws, c := migrationFixture(t, opts...)
 			ws[0].Busy = mode == "busy"
-			want := mode == "busy" || mode == "busy-provider" || mode == "idle-terminal" || mode == "third-provider"
+			want := mode == "busy" || mode == "busy-provider" || mode == "idle-terminal" || mode == "third-provider" || mode == "undersized-nix-disabled" || mode == "full-size-nix"
+			if nixProvider {
+				pvc, err := f.client.CoreV1().PersistentVolumeClaims(lmNS()).Get(context.Background(), nixPVCName("b"), metav1.GetOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				size := "4Gi"
+				if mode == "full-size-nix" {
+					spec := testSpec(t, "base", "m")
+					size = spec.NixSize.String()
+				}
+				pvc.Spec.Resources.Requests[corev1.ResourceStorage] = *ptrQuantity(size)
+				if _, err := f.client.CoreV1().PersistentVolumeClaims(lmNS()).Update(context.Background(), pvc, metav1.UpdateOptions{}); err != nil {
+					t.Fatal(err)
+				}
+				f.m.recycle.Enabled = mode != "undersized-nix-disabled"
+				ws[1].Busy = mode == "undersized-nix-busy"
+			}
 			if mode == "busy-provider" {
 				ws[1].Busy = true
 			}
@@ -121,12 +144,12 @@ func TestMigrationDrainEntry(t *testing.T) {
 					_, _ = f.client.AppsV1().Deployments(lmNS()).Update(context.Background(), d, metav1.UpdateOptions{})
 				}
 			default:
-				if len(ws) > 1 {
+				if len(ws) > 1 && !nixProvider {
 					ws[1].CustodyHeld = true
 				} // another held candidate stays serving this tick
 			}
-			// All entry proofs use live old incarnations, independent of free slots.
-			if mode != "ordinary-wins" && mode != "third-provider" && mode != "reverse-dependency" && len(ws) > 1 {
+			// Entry proofs use live incarnations, independent of free slots.
+			if mode != "ordinary-wins" && mode != "third-provider" && mode != "reverse-dependency" && len(ws) > 1 && !nixProvider {
 				ws[1].CustodyHeld = true
 			}
 			if mode == "third-provider" {
