@@ -19,6 +19,7 @@ volume="$name-nix"
 owner="$name"
 started=$SECONDS
 mount_args=()
+entrypoint=/usr/local/sbin/uzi-entrypoint
 bind_ro() {
   local source="$1" target="$2"
   case "$source" in /*) ;; *) echo "ERROR: bind source must be absolute: $source" >&2; exit 2 ;; esac
@@ -40,7 +41,8 @@ if [ "$action" != build ]; then
     fi
     if [ -n "${UXLAB_RENDER_GO_DIR:-}" ]; then
       [ -x "$UXLAB_RENDER_GO_DIR/bin/go" ] && [ -d "$UXLAB_RENDER_GO_DIR/src" ] || { echo "ERROR: Go distro needs bin/go and src" >&2; exit 2; }
-      bind_ro "$UXLAB_RENDER_GO_DIR" /opt/uzi-toolchain
+      bind_ro "$UXLAB_RENDER_GO_DIR" /usr/local/lib/uxlab-go
+      entrypoint=/work/uxlab-render/go-entrypoint.sh
     fi
   fi
   # A regular exported source directory is accepted; no Git metadata is needed.
@@ -154,7 +156,7 @@ timeout --kill-after=10s "${UXLAB_RENDER_CREATE_TIMEOUT:-600}" docker create --n
   --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETPCAP --cap-add SETUID --cap-add SETGID \
   --security-opt no-new-privileges --tmpfs /data \
   --mount "type=volume,source=$volume,target=/nix" \
-  --entrypoint /usr/local/sbin/uzi-entrypoint \
+  --entrypoint "$entrypoint" \
   "${mount_args[@]}" -e "UXLAB_RENDER_IMAGE_ID=$image_id" \
   -e "UXLAB_RENDER_CELL=${UXLAB_RENDER_CELL:-}" -e "UXLAB_RENDER_MODE=${UXLAB_RENDER_MODE:-}" \
   "$image_id" /bin/sh -c 'cd /app && exec /usr/local/bin/node --import tsx "$1"' sh "/work/uxlab-render/$fixture" >> "$log"
@@ -181,22 +183,19 @@ if [ "$action" = cell ]; then
   timeout 30s docker logs "$name" 2>&1 | head -c 8388608 >> "$log"
   [ "$(wc -c < "$log")" -lt 8388608 ] || { echo "ERROR: output cap" >> "$log"; exit 1; }
   rc="$(timeout 10s docker inspect "$name" --format '{{.State.ExitCode}}')"
-  artifact_available=0
-  if { [ "$UXLAB_RENDER_CELL" = candidate ] || [ "$UXLAB_RENDER_CELL" = local ]; } &&
-    timeout 10s docker cp "$name:/data/uxlab-artifacts" - > /dev/null 2>&1; then
-    # Read the fixed receipt then copy only this owned container's verified PNG dir.
-    artifact_receipt="$(mktemp "$scratch/uxlab-artifact-path.XXXXXX")"
-    timeout 30s docker cp "$name:/data/uxlab-artifacts" "$artifact_receipt"
-    [ "$(wc -c < "$artifact_receipt")" -lt 256 ] || exit 1
-    artifact_path="$(cat "$artifact_receipt")"
-    [[ "$artifact_path" =~ ^/data/runner/uxlab-[a-f0-9-]+/api/cmd/uzi/uxlab/proof$ ]] || exit 1
+  if [ "$rc" = 0 ] && [ "$UXLAB_RENDER_CELL" != base ]; then
+    # pipefail requires BOTH the bounded decoder and docker cp producer to pass.
+    if ! artifact_path="$(timeout --kill-after=5s 30s docker cp "$name:/data/uxlab-artifacts" - |
+      python3 "$here/export.py" receipt 2>> "$log")"; then
+      echo "ERROR: receipt export failed" >> "$log"; exit 1
+    fi
     artifacts="$(mktemp -d "$scratch/uxlab-png-${UXLAB_RENDER_CELL}-${UXLAB_RENDER_MODE}.XXXXXX")"
-    timeout --kill-after=5s 120s docker cp "$name:$artifact_path/." "$artifacts"
+    if ! timeout --kill-after=5s 120s docker cp "$name:$artifact_path/." - |
+      python3 "$here/export.py" "$UXLAB_RENDER_CELL" "$log" "$artifacts" fresh-owned-dir 2>> "$log"; then
+      rm -rf -- "$artifacts"
+      echo "ERROR: PNG export failed" >> "$log"; exit 1
+    fi
     echo "PNG_EXPORT=$repo/$artifacts" >> "$log"
-    artifact_available=1
-  fi
-  if [ "$rc" = 0 ] && [ "$UXLAB_RENDER_CELL" != base ] && [ "$artifact_available" = 0 ]; then
-    echo "ERROR: successful cell missing required PNG export" >> "$log"; exit 1
   fi
   exit "$rc"
 fi

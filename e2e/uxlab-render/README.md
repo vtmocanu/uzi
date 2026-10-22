@@ -18,12 +18,15 @@ set -euo pipefail
 mkdir -p .uzi/scratch
 base_export="$(mktemp -d .uzi/scratch/uxlab-base.XXXXXX)"
 candidate_export="$(mktemp -d .uzi/scratch/uxlab-candidate.XXXXXX)"
+# mktemp creates 0700; the container runner needs traversal of export roots.
+chmod 755 "$base_export" "$candidate_export"
 git archive 3fb1fdbf | tar -x -C "$base_export"
 git archive cb2cc627 | tar -x -C "$candidate_export"
 export UXLAB_RENDER_BASE_DIR="$PWD/$base_export"
 export UXLAB_RENDER_CANDIDATE_DIR="$PWD/$candidate_export"
-# Optional: a real compatible Go distribution, mounted read-only at the
-# production /opt/uzi-toolchain handle. No command PATH override is applied.
+# Optional: a real compatible Go distribution, mounted read-only at
+# /usr/local/lib/uxlab-go; fixture #3305 wrapper repoints /opt/uzi-toolchain.
+# No command PATH override is applied.
 export UXLAB_RENDER_GO_DIR="$PWD/.uzi/scratch/go-prereq/mod/golang.org/toolchain@v0.0.1-go1.27.3.linux-amd64"
 bash e2e/uxlab-render/run.sh matrix
 bash e2e/uxlab-render/run.sh local
@@ -33,10 +36,16 @@ The lead must first supply an image/toolchain with Go >= 1.27.3, matching
 `api/go.mod`'s patched toolchain. Every setup command uses
 `GOTOOLCHAIN=local`, prints its actual Go path/version and fails if too old.
 The current worker Go 1.26.8 cannot provide this proof (#3305).
-The optional full distribution mount covers the existing /opt/uzi-toolchain
-directory. Both boundary and HOME probes use standalone inline JavaScript via
-absolute /usr/local/bin/node, which remains outside that mount; no Python is
-needed by these probes. Diagnose compiler/font/image availability before running.
+The explicit #3305 fixture workaround mounts the optional full distribution
+read-only at /usr/local/lib/uxlab-go. A trusted root preparation wrapper requires
+/opt/uzi-toolchain to be an existing symlink, replaces only that symlink to point
+to /usr/local/lib/uxlab-go, then execs the actual unchanged
+/usr/local/sbin/uzi-entrypoint with the same arguments and capabilities. This
+avoids placing the readonly bind inside /nix, where entrypoint recursive chown
+would encounter it. There are no production code, environment, PATH or grant
+changes. Both boundary and HOME probes use standalone inline JavaScript via
+absolute /usr/local/bin/node. Host export decoding requires Python 3 stdlib;
+no Python is needed by the container probes. Diagnose compiler/font/image availability before running.
 The fixture never appends resolved Nix store binaries to command PATH.
 All four cells use one resolved image ID, one mounted production source/helper
 set and the same optional toolchain policy.
@@ -103,37 +112,77 @@ requiring the same Go version and verifying the full PNG set. It retains network
 for the real nested Devbox install; it is not the offline command proof.
 
 Verified candidate PNGs are copied inside the container into a proof directory
-after full build and again after offline rendering. Before exact-name cleanup,
-the host uses `docker cp` from its own container into this worktree's
-`.uzi/scratch/uxlab-png-*` and prints `PNG_EXPORT=`. A later command assertion
-failure still exports an already verified full-build set. Inspect these PNGs
-before recording visual acceptance. Local PNGs are exported the same way.
+after full build and again after offline rendering. Only a successful cell
+(exit 0) attempts host export, before exact-name container cleanup.
+The host pipes `docker cp container:path -` into fixture-only `export.py`.
+The receipt tar permits only one regular uxlab-artifacts file, at most 255 ASCII
+bytes matching the fixed proof path pattern; its entire stream is capped at
+16 KiB and eight headers. It is validated in memory before any host file write.
+PNG exports use a fresh owned mktemp directory under this worktree's
+.uzi/scratch. The decoder caps payload at 512 MiB, files at 16 MiB, all headers
+(including PAX) at 8192, metadata including padding at 16 MiB, and the full
+uncompressed stream at 528 MiB. Every read is at most 64 KiB; declared sizes are
+checked before file creation or payload reads. Manual 512-byte framing uses
+TarInfo.frombuf only for header checksum/numeric decoding.
+Only full-build/offline-render candidate phase directories or the local phase
+are permitted, with flat ASCII light/dark scene PNGs. Exact names, sizes and
+SHA256 hashes must match the bounded matrix log artifact records; phase sets
+must match and every scene must have both themes. Missing/duplicate/unexpected
+entries, links, special files, sparse/GNU/global headers and path escapes fail.
+Small per-file PAX records (4096 bytes, 16 records, 1024-byte values) permit only
+path/mtime/atime/ctime, with strict lengths and no duplicate keys or repeated/
+dangling extensions. Effective paths are validated after PAX.
+Files are created exclusively with O_NOFOLLOW in fresh phase directories;
+archive permissions and ownership are never applied. Two zero terminators are
+required, followed only by bounded all-zero padding through EOF.
+Both producer and decoder must pass under pipefail. Either failure removes the
+owned partial directory. Decoder success sets the export directory to 755;
+only after both succeed is `PNG_EXPORT=` recorded. Inspect these PNGs before recording visual acceptance.
+Local PNGs are exported the same way.
 Logs print per-file hashes, dimensions, mtimes, command output, identities,
 cache settlement and verified cleanup. All cells must finish and all receipts
 must be reviewed by the lead before claiming M3 live proof.
 
 Copy/artifact traversal is serial and stops at the first failure: at most
 32768 entries, depth 64, 16 MiB per file and 256 MiB total. Internal relative
-symlinks are copied without following them; absolute/escaping links and links
-into omitted .git/.uzi/node_modules are rejected. These directories are omitted
-at every level. Artifact frames additionally cap at 2048 with strict flat
-light/dark names. Special files are rejected by the regular-file reader.
-The source exports must be stable for the invocation.
+symlinks are copied without following them after lexical and realpath checks.
+Targets must remain inside the source export. Invalid links include absolute
+paths, dangling targets, cycles, and targets in `.git`, `.uzi`, or `node_modules`.
+These names are omitted only during source traversal. Artifact
+traversal validates every entry, including these names, and rejects all links.
+Artifact frames additionally cap at 2048 with strict flat light/dark names.
+Special files are rejected by the regular-file reader. Source exports must
+remain stable and readonly throughout validation/copy: canonical checks are
+not a defense against concurrent source mutation.
+Display JSON receipts escape bidi controls U+061C, U+200E/U+200F, U+202A–U+202E
+and U+2066–U+2069 as literal backslash-u digits. Raw output and predicates retain
+their original bytes.
 
 Focused local checks (no Docker, dependency installation or repository gate):
 
 ```sh
-bash -n e2e/uxlab-render/run.sh e2e/uxlab-render/matrix-run.sh
+python3 -B -m unittest discover -s e2e/uxlab-render -p export_test.py -v
+bash -n e2e/uxlab-render/run.sh e2e/uxlab-render/matrix-run.sh e2e/uxlab-render/go-entrypoint.sh
 for file in e2e/uxlab-render/*.ts; do node --check "$file"; done
-shellcheck -S warning e2e/uxlab-render/run.sh e2e/uxlab-render/matrix-run.sh
+shellcheck -S warning e2e/uxlab-render/run.sh e2e/uxlab-render/matrix-run.sh e2e/uxlab-render/go-entrypoint.sh
 cd agent
-node --import tsx --test --test-timeout=120000 ../e2e/uxlab-render/inputs.test.ts ../e2e/uxlab-render/tree.test.ts ../e2e/uxlab-render/probes.test.ts
+node --import tsx --test --test-timeout=120000 ../e2e/uxlab-render/inputs.test.ts ../e2e/uxlab-render/tree.test.ts ../e2e/uxlab-render/probes.test.ts ../e2e/uxlab-render/display.test.ts
 ```
 
 Focused receipt (2026-10-22): 17 tests passed, including all eight original M1
 input tests, six copy/inventory/PNG tests and three standalone Node probe tests.
 Node 24.20.0 syntax, Bash syntax and ShellCheck 0.11.0 at warning severity passed.
 These checks do not establish M3 live proof.
+
+Mandatory-fix focused receipt (2026-10-22): 20 TypeScript tests and 18 Python
+export tests passed, including bounded reads, receipt size before payload reads,
+PAX/framing rejection, exact export sets/hashes and partial-directory cleanup on
+decoder or producer failure. Restoring the original tree checks and unescaped
+formatter in a disposable scratch export produced the three expected regression
+failures. No Docker, scanner, repository gate or dependency installation ran.
+The #3305 wrapper and actual Docker tar compatibility still require a real-image
+matrix/local run by the lead; synthetic USTAR/PAX streams exercise the decoder
+locally but do not establish live acceptance.
 
 ## M1 production provisioning canary
 

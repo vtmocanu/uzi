@@ -1,5 +1,6 @@
 // M1: real repo opt-in provisioning through the production Codex command boundary.
 import assert from "node:assert/strict";
+import { displayJSON } from "./display.js";
 import { execFile, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
@@ -14,7 +15,7 @@ const src = "/app/src";
 const load = (name: string) => import(pathToFileURL(path.join(src, name)).href);
 const started = performance.now();
 const record = (kind: string, fields: Record<string, unknown>) =>
-  console.log(JSON.stringify({ kind, elapsedMs: Math.round(performance.now() - started), ...fields }));
+  console.log(displayJSON({ kind, elapsedMs: Math.round(performance.now() - started), ...fields }));
 
 async function main(): Promise<void> {
   if (process.env.UZI_UID_SPLIT !== "1" || process.getuid?.() !== 10001) {

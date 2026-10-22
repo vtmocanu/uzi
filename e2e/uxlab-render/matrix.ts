@@ -1,6 +1,7 @@
 // M3: real production provisioning/command seams. The host wrapper removes
 // networking only after setup; it never supplies a replacement command PATH.
 import assert from "node:assert/strict";
+import { displayJSON } from "./display.js";
 import { execFile, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
@@ -15,7 +16,7 @@ const exec = promisify(execFile);
 const load = (name: string) => import(pathToFileURL(path.join("/app/src", name)).href);
 const start = performance.now();
 const record = (kind: string, data: Record<string, unknown>) =>
-  console.log(JSON.stringify({ kind, elapsedMs: Math.round(performance.now() - start), ...data }));
+  console.log(displayJSON({ kind, elapsedMs: Math.round(performance.now() - start), ...data }));
 const labRelative = "api/cmd/uzi/uxlab";
 const sha = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
 
@@ -50,7 +51,7 @@ async function main() {
     helpers[name] = sha(await readRegularFile(`/usr/local/bin/${name}`, HELPER_MAX_BYTES));
   record("identity", { cell, mode, imageId: process.env.UXLAB_RENDER_IMAGE_ID,
     sourceSha256: await sourceId("/app/src"), helpers, node: process.version,
-    goPolicy: "GOTOOLCHAIN=local, >= go1.27.3; optional readonly /opt/uzi-toolchain distro" });
+    goPolicy: "GOTOOLCHAIN=local, >= go1.27.3; optional #3305 fixture symlink to readonly /usr/local/lib/uxlab-go distro" });
   if (mode === "required") {
     const probe = spawnSync("/usr/local/bin/uzi-codex-command-sandbox", ["--probe"],
       { encoding: "utf8", timeout: 10_000, maxBuffer: 1024 * 1024 });
@@ -150,7 +151,7 @@ go test ./cmd/uzi/ -run '^$' -count=1`, path.join(checkout, "api"));
         `${goPolicy}\ndevbox run build`], 900_000, lab);
       record("local-devbox", positive);
       assert(positive.stdout.includes(version[0]), "local Devbox leg must use exactly the command setup Go version");
-      record("artifacts", { pngs: await verifyPNGs(lab) });
+      record("artifacts", { phase: "local", pngs: await verifyPNGs(lab) });
       await runAsRunner("/bin/bash", ["-ceu", "mkdir proof; cp -a png proof/local"], 30_000, lab);
       await fs.writeFile("/data/uxlab-artifacts", path.join(lab, "proof"));
       record("result", { status: "PASS", cell, mode });
@@ -187,14 +188,21 @@ go test ./cmd/uzi/ -run '^$' -count=1`, path.join(checkout, "api"));
     if (cell === "base") {
       await runAsRunner("/bin/bash", ["-ceu",
         'rm -rf frames png; mkdir frames png; printf "seed frame" > frames/seed-dark.ansi; printf "seed png" > png/seed-dark.png'], 30_000, lab);
-      const before = await inventory(lab);
+      const seedInventory = async () => {
+        const entries: Awaited<ReturnType<typeof inventory>> = {};
+        for (const dir of ["frames", "png"])
+          for (const [name, receipt] of Object.entries(await inventory(path.join(lab, dir), undefined, undefined, false)))
+            Object.assign(entries, { [`${dir}/${name}`]: receipt });
+        return entries;
+      };
+      const before = await seedInventory();
       const red = await command("offline-base-build", offline + "./build.sh", lab);
       assert(red.code !== 0 && red.code !== null, "base must reject missing freeze");
       assert.match(red.stderr, /uxlab: freeze is missing\./);
       assert(!/frames written|rendered \d+ PNG/.test(red.stdout), "base generated output before preflight");
-      const after = await inventory(lab);
-      const keys = Object.keys(before).filter((name) => name.startsWith("frames/") || name.startsWith("png/"));
-      const afterKeys = Object.keys(after).filter((name) => name.startsWith("frames/") || name.startsWith("png/"));
+      const after = await seedInventory();
+      const keys = Object.keys(before);
+      const afterKeys = Object.keys(after);
       assert.equal(keys.length, afterKeys.length, "seed inventory count changed");
       for (let i = 0; i < keys.length; i++) assert(keys[i] === afterKeys[i], `seed inventory first mismatch at index ${i}`);
       for (const key of keys) assert(JSON.stringify(before[key]) === JSON.stringify(after[key]), `seed bytes/mtime changed: ${key}`);

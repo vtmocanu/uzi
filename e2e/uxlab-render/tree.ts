@@ -1,4 +1,4 @@
-// Bounded exported-repository copy and artifact receipts; never follow input links.
+// Bounded repository copy and artifact receipts; validate source links before copying.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
@@ -13,6 +13,8 @@ export async function inventory(root: string, copyTo?: string, limits = { entrie
   for (const [value, max] of [[limits.entries, MAX_ENTRIES], [limits.totalBytes, MAX_TOTAL], [limits.fileBytes, MAX_FILE], [limits.depth, 64]])
     assert(Number.isSafeInteger(value) && value >= 0 && value <= max, "invalid tree limit");
   const result: Record<string, { sha256: string; bytes: number; mtimeNs: string }> = {};
+  // Source is a stable readonly export throughout validation and copy.
+  const canonicalRoot = await fs.realpath(root);
   let entries = 0, total = 0;
   async function walk(dir: string, depth: number): Promise<void> {
     assert(depth <= limits.depth, "tree depth limit");
@@ -28,7 +30,7 @@ export async function inventory(root: string, copyTo?: string, limits = { entrie
       }
     } finally { await handle.close(); }
     for (const name of names.sort()) {
-      if (OMIT.has(name)) continue;
+      if (allowLinks && OMIT.has(name)) continue;
       const file = path.join(dir, name), relative = path.relative(root, file);
       const stat = await fs.lstat(file, { bigint: true });
       const target = copyTo && path.join(copyTo, relative);
@@ -42,6 +44,11 @@ export async function inventory(root: string, copyTo?: string, limits = { entrie
         const resolved = path.relative(root, path.resolve(path.dirname(file), link));
         assert(resolved !== ".." && !resolved.startsWith("../"), "escaping source link");
         assert(!resolved.split(path.sep).some((part) => OMIT.has(part)), "link into omitted source");
+        let canonical: string;
+        try { canonical = path.relative(canonicalRoot, await fs.realpath(file)); }
+        catch { throw new Error("unresolvable source link"); }
+        assert(canonical !== ".." && !canonical.startsWith("../"), "escaping source link");
+        assert(!canonical.split(path.sep).some((part) => OMIT.has(part)), "link into omitted source");
         total += Buffer.byteLength(link);
         assert(total <= limits.totalBytes, "tree total byte limit");
         if (target) await fs.symlink(link, target);
@@ -78,7 +85,7 @@ export async function verifyPNGs(lab: string) {
     assert.equal(bytes.toString("ascii", 12, 16), "IHDR", `IHDR: ${png}`);
     const width = bytes.readUInt32BE(16), height = bytes.readUInt32BE(20);
     assert(width > 0 && height > 0 && width <= 16384 && height <= 16384, `PNG dimensions: ${png}`);
-    receipts.push({ name: png, width, height, ...pngs[png] });
+    receipts.push({ name: png, width, height, ...pngs[png], frame: { name, ...frames[name] } });
   }
   return receipts;
 }

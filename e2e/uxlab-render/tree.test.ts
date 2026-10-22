@@ -36,6 +36,39 @@ test("export rejects escaping, absolute and omitted-directory links", async (t) 
     await fs.unlink(path.join(dir, "link"));
   }
 });
+test("source canonical containment rejects composed escapes, dangling links, cycles and omitted targets", async (t) => {
+  const dir = await fixture(t), source = path.join(dir, "src");
+  await fs.mkdir(source);
+  await fs.writeFile(path.join(dir, "outside"), "outside");
+  await fs.symlink(".", path.join(source, "d"));
+  await fs.symlink("d/../outside", path.join(source, "link"));
+  await assert.rejects(inventory(source), /escaping source link/);
+  await fs.unlink(path.join(source, "link"));
+  for (const target of ["missing", "link"]) {
+    await fs.symlink(target, path.join(source, "link"));
+    await assert.rejects(inventory(source), /unresolvable source link/);
+    await fs.unlink(path.join(source, "link"));
+  }
+  await fs.mkdir(path.join(source, ".uzi"));
+  await fs.writeFile(path.join(source, ".uzi", "hidden"), "hidden");
+  await fs.symlink(".uzi", path.join(source, "alias"));
+  await fs.symlink("alias/hidden", path.join(source, "link"));
+  await assert.rejects(inventory(source), /omitted source/);
+});
+test("artifact traversal validates omitted names and rejects their links", async (t) => {
+  const dir = await fixture(t);
+  for (const name of [".git", ".uzi", "node_modules"]) {
+    await fs.mkdir(path.join(dir, name));
+    await fs.writeFile(path.join(dir, name, "file"), "visible");
+    assert((await inventory(dir, undefined, undefined, false))[name + "/file"]);
+    await fs.symlink("file", path.join(dir, name, "link"));
+    await assert.rejects(inventory(dir, undefined, undefined, false), /artifact symlink/);
+    await fs.rm(path.join(dir, name), { recursive: true });
+    await fs.symlink(".", path.join(dir, name));
+    await assert.rejects(inventory(dir, undefined, undefined, false), /artifact symlink/);
+    await fs.unlink(path.join(dir, name));
+  }
+});
 test("export entry, depth, per-file and total budgets fail closed", async (t) => {
   const dir = await fixture(t);
   await fs.writeFile(path.join(dir, "a"), "123");
@@ -66,6 +99,8 @@ test("artifact seam requires both themes, exact inventory, PNG header/dimensions
   const dir = await fixture(t); await makePNGs(dir);
   const receipts = await verifyPNGs(dir);
   assert.equal(receipts.length, 2); assert.equal(receipts[0].width, 1200); assert.equal(receipts[0].height, 900);
+  assert.equal(receipts[0].frame.name, receipts[0].name.replace(/\.png$/, ".ansi"));
+  assert(BigInt(receipts[0].mtimeNs) > BigInt(receipts[0].frame.mtimeNs));
   const png = path.join(dir, "png", "real-scene-dark.png");
   await fs.utimes(png, 1000, 1000);
   await assert.rejects(verifyPNGs(dir), /stale PNG/);
