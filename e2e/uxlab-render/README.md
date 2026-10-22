@@ -205,7 +205,7 @@ bash -n e2e/uxlab-render/run.sh e2e/uxlab-render/matrix-run.sh e2e/uxlab-render/
 for file in e2e/uxlab-render/*.ts; do node --check "$file"; done
 shellcheck -S warning e2e/uxlab-render/run.sh e2e/uxlab-render/matrix-run.sh e2e/uxlab-render/go-entrypoint.sh
 cd agent
-node --import tsx --test --test-timeout=120000 ../e2e/uxlab-render/inputs.test.ts ../e2e/uxlab-render/tree.test.ts ../e2e/uxlab-render/probes.test.ts ../e2e/uxlab-render/display.test.ts
+node --import tsx --test --test-timeout=120000 ../e2e/uxlab-render/*.test.ts
 ```
 
 Historical focused receipt (2026-10-22; prior scratch logs lost): 17 tests

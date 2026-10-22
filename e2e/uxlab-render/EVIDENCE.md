@@ -140,7 +140,7 @@ The unfinished rendering, local Devbox and visual work remains worker-owned.
 | Complete base/candidate provisioning comparison by mode | Matched ab970306 observations above; repair changes setup, so updated comparison remains pending |
 | Host PNG export, signatures, dimensions, hashes and strict freshness | No final artifact receipt |
 | Light/dark visual inspection | Unperformed; no acceptance claimed |
-| Current full repository gate | Not yet rerun; historical pass below is not current verification |
+| Current full repository gate | Passed at `687d7df1407a49f821ab7aef45656da44f6ad2ff`, exit 0 in 1,797 seconds; actionlint skipped (absent); does not complete M3 |
 
 The lead owns collecting matrix/local receipts and the remaining verification.
 This documentation-only update runs no gates/tests and performs no rendering or
@@ -150,6 +150,41 @@ and pkg/tool/ binaries and readable/traversable mount directories; see the
 [fixture instructions](README.md) and [UX lab prerequisites](../../api/cmd/uzi/uxlab/README.md).
 
 ## Current supplied repository receipts
+
+The full gate and final 50-test fixture run below validate code revision
+`687d7df1407a49f821ab7aef45656da44f6ad2ff`. Other receipts are identified
+separately. The documenter used lead-supplied results; the lead read the logs.
+
+- Full `gate:repo`: exit 0, wall 1,797 seconds (29m57s),
+  `.uzi/scratch/gate-log.NOFhIT`, using
+  `HOME=<disposable fixture-home> UZI_LINT_SHELL_REQUIRED=1 UZI_LINT_YAML_REQUIRED=1 task gate:repo`.
+  ShellCheck 0.11.0 ran at warning severity over 300 tracked scripts;
+  strict yamllint ran over 40 YAML files. Pin match, 40 parity fixture cases
+  plus missing/nonregular coverage (2 Node tests), and 10 build cases passed.
+  `lint:actions` explicitly **SKIPPED** because actionlint was absent;
+  workflow linting did not execute.
+- `scan:secrets`: exit 0, tracked files clean, canaries detected.
+  The 147 untracked findings, including downloaded Go test fixtures, were
+  not gating. Semgrep canary raw/results/errors/verdict: 1/1/0/0;
+  tree: 0/0/0/0. These scanner receipts belong to the full gate above.
+- Final fixture tests: 50 passed, 0 failed, 0 cancelled, 0 skipped;
+  strict types and diff check passed (`.uzi/scratch/gate-log.axye1Q`).
+  Python: 18 passed (`.uzi/scratch/gate-log.N1Od5Z`); that earlier combined
+  invocation exited 1 due to capture cancellation, since fixed. The Python
+  result does not make that whole invocation a pass.
+  `task deadcode:agent` passed again on the current code after adding the
+  capture module (`.uzi/scratch/gate-log.8pdqj0`).
+- Web `npm audit --package-lock-only --audit-level=high --json` exited 1
+  on both candidate and isolated base with the same 1 critical DOMPurify
+  and 5 moderate Vitest advisories (`.uzi/scratch/gate-log.4Ei2tQ` and
+  `.uzi/scratch/gate-log.jVYVvJ`, respectively). Dependency files were
+  unchanged; this remains separate off-task triage.
+- Final reviewer/auditor scope `906d216f..687d7df1`: no introduced defects
+  found. Additional auditor scanner orchestration returned no result and was
+  terminated; it did not pass. The lead's full-gate scanner evidence above
+  is separate.
+
+These receipts do not complete M3 or replace any pending real-image proof.
 
 `task --list` and `task --dry gate:repo` passed: `gate-log.3kJ3k8` and
 `gate-log.aMZWjk`. The base parity check failed as expected on the missing root
@@ -167,8 +202,10 @@ Serial added-step timing on Node 24.20.0 (`gate-log.r3myAF`):
 
 The base gate lacks these steps. This local serial measurement is not a hosted
 CI job measurement; queue, cache and critical-path effects remain unmeasured.
-Whole-tree scan overhead was not isolated. Provisioning, Go setup and manual
-render attempts are separate costs.
+The 6,520 ms added-step timing is distinct from the full gate's 29m57s.
+The full scan covered 995.63 MB in 6m21s, including scratch; neither isolated
+scan overhead nor a hosted CI comparison was measured. Provisioning, Go setup
+and manual render attempts are separate costs.
 
 ## Historical receipts (prior scratch logs lost)
 
