@@ -445,3 +445,29 @@ describe("undoWipMarkerOnBranch (issue #3239)", () => {
     assert.equal(indexWrites, 0, "undo never writes the shared index");
   });
 });
+
+describe("unsafe WIP history absence proof", () => {
+  test("requires successful positive evidence and ignores shallow, graft and replace hiding", async t => {
+    const f = await fixture(t);
+    const parent = f.head();
+    await f.write("wip.txt", "dirty\n");
+    assert.equal(await f.git.commitWipMarker(f.root), true);
+    const marker = f.head();
+    f.g("commit", "-q", "--allow-empty", "-m", "later");
+    const tip = f.head();
+    assert.equal(await f.git.wipMarkerAbsentFromHistory(f.root, parent, marker), true);
+    assert.equal(await f.git.wipMarkerAbsentFromHistory(f.root, tip, marker), false);
+    assert.equal(await f.git.wipMarkerAbsentFromHistory(f.root, marker, marker), false);
+    assert.equal(await f.git.wipMarkerAbsentFromHistory(f.root, tip, "f".repeat(40)), false, "missing object is unknown");
+    await fs.writeFile(path.join(f.root, ".git", "shallow"), tip + "\n");
+    assert.equal(await f.git.wipMarkerAbsentFromHistory(f.root, tip, marker), false, "shallow metadata cannot hide the marker");
+    await fs.unlink(path.join(f.root, ".git", "shallow"));
+    await fs.writeFile(path.join(f.root, ".git", "info", "grafts"), tip + "\n");
+    assert.equal(await f.git.wipMarkerAbsentFromHistory(f.root, tip, marker), false, "grafts cannot hide the marker");
+    await fs.unlink(path.join(f.root, ".git", "info", "grafts"));
+    f.g("replace", tip, parent);
+    assert.equal(await f.git.wipMarkerAbsentFromHistory(f.root, tip, marker), false, "replace refs cannot hide the marker");
+    f.git["runGitAsRunner"] = async () => { throw Object.assign(new Error("launch refused"), { code: 1 }); };
+    assert.equal(await f.git.wipMarkerAbsentFromHistory(f.root, parent, marker), false, "exit 1 is not proof of absence");
+  });
+});

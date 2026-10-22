@@ -794,6 +794,8 @@ interface WipOmission { path: string; reason: "core_file" | "oversized" | "unsiz
 /** What {@link GitCache.commitWipMarker} reports through `onIncomplete` (issue #3239). */
 export interface WipIncompleteInfo {
   omitted: WipOmission[]; omittedTotal: number; markerCreated: boolean; rollbackRefused: boolean;
+  /** An unvetted ref tip observed after the backstop refused; null when it could not be read. */
+  unverifiedRefTip?: string | null;
   /** The commit the capture wrote, only when it is provably that commit on a branch (one commit on
    *  preHead with the marker subject); undefined for a detached capture. The pause park undoes exactly it. */
   marker?: string;
@@ -11829,7 +11831,7 @@ try {
     // `git replace <big> <small>` cannot make the backstop see a different blob.
     const git = (args: string[]) => this.runGitAsRunner(clonePath, args, NO_REPLACE);
     let wroteMarker: string | undefined;
-    const report = (all: WipOmission[], markerCreated: boolean, rollbackRefused: boolean): void => {
+    const report = (all: WipOmission[], markerCreated: boolean, rollbackRefused: boolean, unverifiedRefTip?: string | null): void => {
       const marker = wroteMarker;
       const omitted = all.slice(0, WIP_REPORT_MAX_OMISSIONS);
       this.log.warn("WIP park auto-save left files out", {
@@ -11840,7 +11842,8 @@ try {
         omittedTotal: all.length,
         omitted: omitted.map((o) => ({ path: o.path, reason: o.reason, bytes: o.bytes })),
       });
-      try { opts.onIncomplete?.({ omitted, omittedTotal: all.length, markerCreated, rollbackRefused, marker }); }
+      try { opts.onIncomplete?.({ omitted, omittedTotal: all.length, markerCreated, rollbackRefused, marker,
+        ...(unverifiedRefTip === undefined ? {} : { unverifiedRefTip }) }); }
       catch (err) { this.log.warn("WIP onIncomplete callback threw (ignored)", { cwd: clonePath, error: gitErrorMessage(err) }); }
     };
     let omitted: WipOmission[] = [];
@@ -11858,6 +11861,16 @@ try {
       preRef !== WIP_DETACHED &&
       (await git(["rev-parse", "--verify", `${marker}^`])).trim() === preHead &&
       (await git(["log", "-1", "--format=%s", marker])).startsWith(WIP_PARK_COMMIT_PREFIX);
+    const reportUnsafe = async (all: WipOmission[]): Promise<void> => {
+      let unverifiedRefTip: string | null | undefined = null;
+      if (preRef !== WIP_DETACHED) {
+        try {
+          const current = await tipOf();
+          if (SHA40_RE.test(current)) unverifiedRefTip = current === wroteMarker || current === preHead ? undefined : current;
+        } catch { /* Unknown ref identity must remain quarantined. */ }
+      }
+      report(all, false, true, unverifiedRefTip);
+    };
     try {
       preHead = (await git(["rev-parse", "--verify", "HEAD^{commit}"])).trim();
       preRef = await this.wipSymbolicHead(clonePath);
@@ -11907,7 +11920,7 @@ try {
       const markerParent = (await git(["rev-parse", "--verify", `${marker}^`])).trim();
       const subject = await git(["log", "-1", "--format=%s", marker]);
       if (markerParent !== preHead || !subject.startsWith(WIP_PARK_COMMIT_PREFIX)) {
-        report(omitted, false, true);
+        await reportUnsafe(omitted);
         return false;
       }
       if (preRef !== WIP_DETACHED) wroteMarker = marker;
@@ -11915,7 +11928,7 @@ try {
       if (extra.length === 0) {
         // The vetted commit must still be what the branch holds; an agent that moved it meanwhile
         // gets no publish of a commit nobody vetted.
-        if ((await tipOf()) !== marker) { report(omitted, false, true); return false; }
+        if ((await tipOf()) !== marker) { await reportUnsafe(omitted); return false; }
         if (omitted.length > 0) report(omitted, true, false);
         if (preRef !== WIP_DETACHED) { try { opts.onCommitted?.(marker); } catch { /* observer only */ } }
         return true;
@@ -11923,11 +11936,11 @@ try {
       const all = [...omitted, ...extra.filter((e) => !omitted.some((o) => o.path === e.path))];
       // A detached HEAD is never rolled back: the identity recheck and an `update-ref --no-deref
       // HEAD` write are separate steps, so a switch to a branch in between would be overwritten.
-      if (preRef === WIP_DETACHED) { report(all, false, true); return false; }
+      if (preRef === WIP_DETACHED) { await reportUnsafe(all); return false; }
       const headNow = await this.wipSymbolicHead(clonePath).catch(() => undefined);
       const tipNow = await tipOf();
       const parentNow = (await git(["rev-parse", "--verify", `${marker}^`])).trim();
-      if (headNow !== preRef || tipNow !== marker || parentNow !== preHead) { report(all, false, true); return false; }
+      if (headNow !== preRef || tipNow !== marker || parentNow !== preHead) { await reportUnsafe(all); return false; }
       await this.wipCaptureSeam?.beforeRollbackWrite?.(clonePath, marker);
       try {
         // CAS on the exact branch HEAD named before the capture, never bare HEAD: only that branch
@@ -11936,7 +11949,7 @@ try {
         await git(["update-ref", "--no-deref", "-m", "uzi: wip capture rollback", preRef, preHead, marker]);
       } catch (err) {
         this.log.warn("WIP capture rollback refused (ref moved)", { cwd: clonePath, error: gitErrorMessage(err) });
-        report(all, false, true);
+        await reportUnsafe(all);
         return false;
       }
       report(all, false, false);
@@ -11954,7 +11967,7 @@ try {
         if (wroteMarker === undefined) {
           try { const tip = await tipOf(); if (await ownMarker(tip)) wroteMarker = tip; } catch { /* stays unknown */ }
         }
-        report(omitted, false, true);
+        await reportUnsafe(omitted);
       } else if (mode === "exclude" && scanStarted) report(omitted, false, false);
       return false;
     }
@@ -12123,6 +12136,25 @@ try {
       return true;
     } catch (err) {
       this.log.warn("WIP park marker branch undo refused (best-effort → marker left)", { cwd: clonePath, error: gitErrorMessage(err) });
+      return false;
+    }
+  }
+
+  /** Prove a quarantined marker absent from a literal candidate's complete history.
+   * Local replace refs, grafts and shallow boundaries cannot hide its ancestry; missing
+   * objects or any unexpected failure refuse the proof. Runs as the clone's runner uid. */
+  async wipMarkerAbsentFromHistory(clonePath: string, candidate: string, marker: string): Promise<boolean> {
+    if (!SHA40_RE.test(candidate) || !SHA40_RE.test(marker)) return false;
+    try {
+      const outside = await this.runGitAsRunner(clonePath, ["rev-list", "--max-count=1", marker, "--not", candidate], {
+        env: { ...NO_REPLACE_ENV, GIT_GRAFT_FILE: "/dev/null", GIT_SHALLOW_FILE: "/dev/null" },
+      });
+      // Require positive output from successful Git execution. A launch refusal
+      // with exit 1 is not interchangeable with an ancestry command's negative result.
+      return outside.trim() === marker;
+    } catch (err) {
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
       return false;
     }
   }

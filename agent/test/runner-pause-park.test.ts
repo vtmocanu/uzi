@@ -13,6 +13,7 @@ import path from "node:path";
 import type { Readable } from "node:stream";
 import { type ExecutorResult, type RunContext } from "../src/executor.js";
 import { RunRunner, type ExecutorFactory } from "../src/runner.js";
+import { LimitReachedError } from "../src/limit.js";
 import { GitCache } from "../src/git.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import { nullLogger, noProofReseed, testGitCacheOptions } from "./helpers.js";
@@ -1172,6 +1173,132 @@ describe("RunRunner — pause park with an unvetted WIP marker (issue #3239)", (
         restore();
         fs.rmSync(homeRoot, { recursive: true, force: true });
       }
+    });
+  }
+});
+
+// A clean tree is not evidence that an earlier failed rollback became safe.
+for (const removed of [false, true]) for (const followup of ["pause", "limit"] as const) {
+  it(`unsafe WIP refusal survives a second pause until history is clean: removed=${removed} followup=${followup}`, async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-3239-repeat-pause-"));
+    const rd = (cwd: string, ...args: string[]) => execFileSync("git", ["-C", cwd, ...args],
+      { env: GIT_ENV, encoding: "utf8", stdio: "pipe" }).trim();
+    let armed = false, marker = "";
+    const rGit = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({
+      gitleaksBin: defaultGitleaksShim(),
+      wipCapture: {
+        afterOmissionCheck: async p => { if (armed) fs.writeFileSync(path.join(p, "core"), "dump\n"); },
+        beforeRollbackWrite: async (_p, sha) => {
+          if (!armed) return;
+          marker = sha;
+          throw new Error("fixture: rollback write refused");
+        },
+      },
+    }));
+    // Model the pause's second CAS refusing too, so the actual unsafe marker remains.
+    rGit.undoWipMarkerOnBranch = async () => false;
+    const { calls, restore } = spyPublish();
+    const seen: { second?: boolean; clean?: string; marker?: string } = {};
+    try {
+      const factory: ExecutorFactory = runId => ({ homeDir: path.join(homeRoot, runId), executor: {
+        run: async ctx => {
+          fs.mkdirSync(path.join(homeRoot, runId), { recursive: true });
+          commitInTree(ctx.worktreePath, "WORK.txt", "committed\n");
+          await ctx.checkpoint?.({ reap: false });
+          fs.writeFileSync(path.join(ctx.worktreePath, "WIP.txt"), "dirty\n");
+          armed = true;
+          await ctx.parkForPause?.({ completedCount: 1, total: 2 });
+          armed = false;
+          seen.marker = marker;
+          seen.clean = rd(ctx.worktreePath, "status", "--porcelain");
+          if (removed) rd(ctx.worktreePath, "update-ref", `refs/heads/${ctx.branch}`, rd(ctx.worktreePath, "rev-parse", `${marker}^`), marker);
+          if (followup === "limit") throw new LimitReachedError({ resetsAtMs: Date.now() + 5 * 3600_000, rateLimitType: "five_hour" });
+          seen.second = await ctx.parkForPause?.({ completedCount: 1, total: 2 });
+          // Stop this scripted executor at the observation boundary; finalization is not under test.
+          return { branch: ctx.branch, pausedAt: { completedCount: 1, total: 2 } };
+        },
+      } });
+      await new RunRunner(client, rGit, factory, nullLogger(), 20, undefined, {
+        pollMs: 5, planApprovalTimeoutMs: 0, questionTimeoutMs: 600, gitlab, checkpointIntervalMs: 0,
+        checkpointTestHooks: { retryBackoffMs: [0, 0] },
+      }).execute(gitlabClaim(3244, { wait_on_limit: true }));
+      assert.match(seen.marker ?? "", /^[0-9a-f]{40}$/, "a real unsafe marker was written");
+      assert.equal(seen.clean, "", "the second capture starts from a clean worktree");
+      if (followup === "pause") assert.equal(seen.second, removed, "only verified removal from history permits the next pause");
+      assert.equal(calls.length, removed ? 1 : 0, "a clean tree cannot authorize publishing the unsafe marker");
+    } finally { restore(); fs.rmSync(homeRoot, { recursive: true, force: true }); }
+  });
+}
+
+describe("unsafe WIP flight quarantine", () => {
+  function fixture() {
+    const cache = new GitCache("unused", nullLogger());
+    const runner = new RunRunner(client, cache, () => ({ executor: { run: async () => ({ branch: "branch" }) } }), nullLogger(), 20);
+    const flight = { runId: "quarantine", runLog: nullLogger(), batcher: { emit() {} },
+      preserveRecoveryClone: false, sourceJoinFailed: false } as unknown as Parameters<RunRunner["wipSafeTip"]>[0];
+    const record = (marker?: string, unverifiedRefTip?: string | null) => runner["wipIncompleteHandler"](flight, "park")({
+      omitted: [], omittedTotal: 0, markerCreated: false, rollbackRefused: true, marker, unverifiedRefTip,
+    });
+    return { cache, runner, flight, record };
+  }
+
+  it("checks all known markers and still blocks their later reintroduction without releasing retention", async () => {
+    const f = fixture(), a = "a".repeat(40), b = "b".repeat(40), tip = "c".repeat(40);
+    f.record(a); f.record(b);
+    let present = b;
+    f.cache.branchTip = async () => tip;
+    f.cache.wipMarkerAbsentFromHistory = async (_path, _tip, marker) => marker !== present;
+    assert.equal(await f.runner["wipSafeTip"](f.flight, "clone", "branch"), null);
+    present = "";
+    assert.equal(await f.runner["wipSafeTip"](f.flight, "clone", "branch"), tip);
+    assert.equal(f.flight.wipMarkerUnsafe, false);
+    assert.equal(f.flight.preserveRecoveryClone, true);
+    assert.equal(f.flight.sourceJoinFailed, true);
+    present = a;
+    assert.equal(await f.runner["wipSafeTip"](f.flight, "clone", "branch"), null, "clearance is not permission to reintroduce a marker");
+    assert.equal(f.flight.wipUnsafeMarker, undefined, "publication quarantine does not grant marker-undo identity");
+  });
+
+  it("quarantines a conflicting ref tip without authorizing its undo", async () => {
+    const f = fixture(), written = "a".repeat(40), conflict = "b".repeat(40);
+    f.record(written, conflict);
+    f.cache.branchTip = async () => conflict;
+    f.cache.wipMarkerAbsentFromHistory = async (_path, _tip, marker) => marker !== conflict;
+    assert.equal(await f.runner["wipSafeTip"](f.flight, "clone", "branch"), null);
+    assert.equal(f.flight.wipUnsafeMarker, written, "only the capture's own marker may be undone");
+  });
+
+  it("pins the proved candidate through the existing import fence", async () => {
+    const f = fixture(), marker = "a".repeat(40), tip = "b".repeat(40);
+    f.record(marker);
+    f.cache.branchTip = async () => tip;
+    f.cache.wipMarkerAbsentFromHistory = async () => true;
+    Object.assign(f.runner, { owedOptions: async () => ({}) });
+    let imports = 0;
+    f.cache.fetchAgentBranch = async (_bare, _clone, _branch, _run, options) => {
+      imports++;
+      assert.equal(options.expectedCandidateSha, tip, "the proof's literal SHA reaches acquisition");
+      throw new Error("checkpoint candidate changed during acquisition");
+    };
+    await assert.rejects(f.runner["fetchTracking"](f.flight, "bare", "clone", "branch"), /candidate changed/);
+    assert.equal(imports, 1);
+    imports = 0;
+    await assert.rejects(f.runner["fetchTracking"](f.flight, "bare", "clone", "branch", {
+      expectedCandidateSha: "c".repeat(40),
+    }), /tracking preservation refused/);
+    assert.equal(imports, 0, "an existing incompatible candidate fence is never replaced");
+  });
+
+  for (const unknown of ["missing", "overflow"] as const) {
+    it(`fails closed on ${unknown} marker identity`, async () => {
+      const f = fixture();
+      if (unknown === "missing") f.record();
+      else for (let i = 0; i < 70; i++) f.record(i.toString(16).padStart(40, "0"));
+      f.cache.branchTip = async () => { throw new Error("unknown identity must not attempt clearance"); };
+      assert.equal(await f.runner["wipSafeTip"](f.flight, "clone", "branch"), null);
+      assert.ok(f.flight.wipUnsafeMarkers!.size <= 65, "bounded known identities plus the unknown sentinel");
+      assert.equal(f.flight.wipMarkerUnsafe, true);
     });
   }
 });

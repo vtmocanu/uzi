@@ -243,6 +243,8 @@ import {
 /** Cap on a reported failure_reason, matching the forge error-body cap
  *  (forge.ts) so a runaway SDK error can't bloat the run row or the stream. */
 const MAX_FAILURE_REASON_LEN = 512;
+/** Bound remembered unsafe markers per flight; unknown identity or overflow stays blocked. */
+const WIP_UNSAFE_MARKER_LIMIT = 64;
 
 /** issue #1932: how many times the pre-exit secret remediation gate returns a done to the lead for a
  *  history rewrite before the run fails `push_secret_blocked`. */
@@ -1973,12 +1975,14 @@ interface RunFlight {
   sourceOriginalInputs?: Readonly<{ barePath: string; branch: string; key: string;
     kind: RunKind; defaultBranch: string; cloneUrl: string; repoId: string }>;
   sourceJoinFailed?: boolean;
-  /** issue #3239 — the last park-kind WIP capture refused its own rollback (a marker nobody vetted
-   *  may be committed): the park callers reset it before the capture and skip the fetch-back and
-   *  publish when it is set. */
+  /** issue #3239: an unvetted marker may remain in history. Captures never reset this refusal;
+   * only a complete-history absence proof permits publication of an exact candidate. */
   wipMarkerUnsafe?: boolean;
   /** issue #3239 — the commit a refused park capture wrote (when read back); the pause park undoes exactly it. */
   wipUnsafeMarker?: string;
+  /** Unsafe markers remain quarantined for this flight, even after an absence proof.
+   * Undefined records an unknown marker or bounded-set overflow and cannot be cleared by a read. */
+  wipUnsafeMarkers?: Set<string | undefined>;
   /** issue #3239 — WIP-capture notice kinds already emitted on this flight (one per kind). */
   wipNoticed?: Set<"park" | "restore_point">;
   sourceNormalPark?: boolean;
@@ -3993,7 +3997,6 @@ export class RunRunner {
                 // it; M2 strips it back to uncommitted at adopt time so it never reaches the MR.
                 // Best-effort — commitWipMarker swallows every error and the .catch is belt-and-
                 // braces so nothing here can undo the park (D4).
-                flight.wipMarkerUnsafe = false;
                 await this.git.commitWipMarker(worktreePath, { mode: "exclude", onIncomplete: this.wipIncompleteHandler(flight, "park") }).catch(() => false);
                 // issue #1783 (auditor M1): the marker's status/add/commit can start an agent-planted
                 // filter AFTER the proof above; re-prove before the fetch-back, overlay and publish.
@@ -4001,7 +4004,7 @@ export class RunRunner {
                 await this.quiesceOrBlockSink(flight, executor, "park", { processOnly: true });
                 // issue #3239: a marker whose rollback was refused was never vetted; keep the clone
                 // and publish nothing from it.
-                if (flight.wipMarkerUnsafe) return;
+                if (flight.wipMarkerUnsafe && await this.wipSafeTip(flight, worktreePath, branch) === null) return;
                 const fetched = await this.fetchBackBestEffort(barePath, worktreePath, branch, flight, runLog);
                 if (fetched.kind === "refused") return;
                 // PRD #1809 D8: what the publish below packs is the tracking ref; it holds the
@@ -4258,7 +4261,6 @@ export class RunRunner {
                   permitSignal = permit?.signal;
                   const check = () => permit?.signal.throwIfAborted();
                   check();
-                  flight.wipMarkerUnsafe = false;
                   await this.git.commitWipMarker(worktreePath, { mode: "exclude", onIncomplete: this.wipIncompleteHandler(flight, "park") }).catch(() => false);
                   // issue #1783 (auditor M1): re-prove after the marker's runner-clone git, before
                   // the credentialed overlay + publish (blocked → RunResidueBlockedError below).
@@ -4266,7 +4268,7 @@ export class RunRunner {
                   await this.quiesceOrBlockSink(flight, executor, "shutdown", { processOnly: true });
                   check();
                   // issue #3239: an unvetted marker (rollback refused) is never fetched back or published.
-                  if (flight.wipMarkerUnsafe) return;
+                  if (flight.wipMarkerUnsafe && await this.wipSafeTip(flight, worktreePath, branch) === null) return;
                   const fetched = await this.fetchBackBestEffort(barePath, worktreePath, branch, flight, runLog);
                   check();
                   if (fetched.kind === "refused") return;
@@ -14191,6 +14193,13 @@ export class RunRunner {
   }
 
   private async fetchTracking(flight: RunFlight, barePath: string, worktreePath: string, branch: string, options: Pick<FetchAgentBranchOptions, "expectedCandidateSha" | "checkpointImportMode" | "checkpointStep"> = {}, importScope: <T>(action: () => Promise<T>) => Promise<T> = action => action()): Promise<Extract<TrackingUpdateResult, { kind: "updated" }>> {
+    if (flight.wipMarkerUnsafe || flight.wipUnsafeMarkers?.size) {
+      const safeTip = await this.wipSafeTip(flight, worktreePath, branch);
+      if (safeTip === null || (options.expectedCandidateSha !== undefined && options.expectedCandidateSha !== safeTip))
+        throw this.preservationRefused(flight, "wip_marker_unsafe");
+      // The existing import fence must fetch exactly the candidate whose history was proved.
+      if (safeTip !== undefined) options = { ...options, expectedCandidateSha: safeTip };
+    }
     options.checkpointStep?.("checkpoint_import_context");
     const owed = await this.owedOptions(flight, barePath, branch);
     const result = await importScope(() => this.git.fetchAgentBranch(
@@ -17568,7 +17577,15 @@ export class RunRunner {
       if (kind === "park") {
         flight.preserveRecoveryClone = true;
         flight.sourceJoinFailed = true;
-        if (info.rollbackRefused) { flight.wipMarkerUnsafe = true; flight.wipUnsafeMarker = info.marker; }
+      }
+      if (info.rollbackRefused) {
+        flight.wipMarkerUnsafe = true;
+        flight.wipUnsafeMarker = info.marker;
+        const markers = (flight.wipUnsafeMarkers ??= new Set());
+        for (const marker of [info.marker, ...(info.unverifiedRefTip === undefined ? [] : [info.unverifiedRefTip ?? undefined])]) {
+          if (!markers.has(undefined) && !markers.has(marker))
+            markers.add(markers.size < WIP_UNSAFE_MARKER_LIMIT ? marker : undefined);
+        }
       }
       // One notice per flight and kind: handleRecoveryExhausted retries restore-point captures
       // about every second, so a core file would otherwise flood the feed.
@@ -17582,6 +17599,26 @@ export class RunRunner {
       try { flight.batcher.emit({ kind: "status", agent: "worker", payload: { text } }); }
       catch (err) { flight.runLog.warn("WIP capture notice not emitted", { error: errMessage(err) }); }
     };
+  }
+
+  /** Undefined: no refusal; null: blocked; otherwise the exact candidate proved safe.
+   * Retain the bounded quarantine so reintroducing a marker later in this flight is blocked too.
+   * Publication clearance never grants clone retirement or custody release. */
+  private async wipSafeTip(flight: RunFlight, clonePath: string, branch: string): Promise<string | null | undefined> {
+    const markers = flight.wipUnsafeMarkers;
+    if (!markers?.size) return flight.wipMarkerUnsafe ? null : undefined;
+    flight.wipMarkerUnsafe = true;
+    if (markers.has(undefined)) return null;
+    const tip = await this.git.branchTip(clonePath, branch);
+    if (!tip) return null;
+    for (const marker of markers) {
+      if (!await this.git.wipMarkerAbsentFromHistory(clonePath, tip, marker!)) {
+        return null;
+      }
+    }
+    flight.wipMarkerUnsafe = false;
+    flight.wipUnsafeMarker = undefined;
+    return tip;
   }
 
   /**
@@ -17670,19 +17707,12 @@ export class RunRunner {
     // without a runner clone to compare against, or when the quiescence proof blocked the sink.
     let holdsLatest: boolean | undefined;
     let preservationRefused = false;
-    // A flag left by an earlier capture must not steer the undo below when the proof blocked above.
-    flight.wipMarkerUnsafe = false;
-    flight.wipUnsafeMarker = undefined;
     let createdMarker: string | undefined;
     if (!residueBlocked && barePath && branch && runnerClone) {
       markerCreated = await this.git.commitWipMarker(runnerClone.path, { mode: "exclude", onIncomplete: this.wipIncompleteHandler(flight, "park"), onCommitted: (m) => { createdMarker = m; } }).catch(() => { flight.sourceJoinFailed = true; return false; });
       // issue #3239: sourceJoinFailed alone does not stop the fetch-back or publish below. A marker
       // whose rollback was refused was never vetted: refuse like an ownership failure, so nothing
       // is fetched or published and the run stays running (pause_failed) with its clone kept.
-      if (flight.wipMarkerUnsafe) {
-        this.preservationRefused(flight, "wip_marker_unsafe");
-        preservationRefused = true;
-      }
       // issue #1783 (auditor M1): the marker's status/add/commit can start an agent-planted filter
       // AFTER the proof above. Re-prove before the fetch-back and the publish; a blocked re-proof
       // takes the same Decision-8 path as a blocked first proof (pause_failed, the marker undone).
@@ -17694,6 +17724,10 @@ export class RunRunner {
       if (reproof.blocked) {
         residueBlocked = true;
         residueState = reproof.outcome.process?.state;
+      }
+      if (!residueBlocked && flight.wipMarkerUnsafe && await this.wipSafeTip(flight, runnerClone.path, branch) === null) {
+        this.preservationRefused(flight, "wip_marker_unsafe");
+        preservationRefused = true;
       }
     }
     if (!residueBlocked && !preservationRefused && barePath && branch && runnerClone) {
