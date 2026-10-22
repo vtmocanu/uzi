@@ -85,6 +85,7 @@ import { MessageBatcher } from "../src/batcher.js";
 import { MAX_PROJECTED_BYTES } from "../src/codex/projection.js";
 import type { OutgoingMessage } from "../src/protocol.js";
 import { createCodexTransport, CodexTransportError, type CodexNotification, type CodexTransport } from "../src/codex/transport.js";
+import { REASON_COMPLETION_STALL } from "../src/completion-attempt.js";
 import { PlanRejectedError, PlanRevisionReplacedError, type RunContext, type EmittedMessage, type Executor, type WallParkOutcome, type SecretRemediationDecision } from "../src/executor.js";
 import { PauseNowSignal, SteeringChannel, followUpRunes, MAX_FOLLOW_UP_BATCH_RUNES } from "../src/steering.js";
 import { makeRecoveryCoordinator, FakeRecoveryClient, FakeRecoveryGit, commitInTree } from "./codex-reap-fixture.js";
@@ -23298,4 +23299,355 @@ it("3282 planning wrapper holds on positive refusal history without an implement
   assert.equal(outcome.error, undefined);
   assert.ok(outcome.result?.completionHeld);
   assert.equal(parks, 1); assert.equal(takes, 1); assert.equal(rig.providerLaunches(), 0);
+});
+// ================================================================================
+// Issue #3139: the Codex executor routes a tool-free no-progress stall (an eligible interlocked issue
+// run with reported completed milestones and no recorded completion attempt) to the owner completion
+// decision instead of draining the iteration budget. Mirrors the Claude describe in sdk-executor.test.ts.
+describe("CodexExecutor no-progress stall owner decision (issue #3139)", () => {
+  const ITER_REASON = "codex run reached its implement/review iteration budget without completing";
+  type Notes = (c: number, th: string, tn: string) => CodexNotification[];
+  const rp1: Notes = (c, th, tn) => [toolCall(100 + c, "report_progress", dependencyWaitProgress, th, tn, `p${c}`)];
+  const prose: Notes = (c) => [agentMessage(`Dependency still unavailable (update ${c}).`)];
+
+  /** Drives the Codex executor with a per-provider-call script; call 1 reports m1 complete. */
+  async function drive(
+    notes: Notes,
+    over: Partial<RunContext> & { fixture?: Parameters<typeof dependencyWaitCallbacks>[0]; served?: "default" | "absent" | number } = {},
+  ) {
+    const { fixture: fixtureOpts, served, ...ctxOver } = over;
+    const fixture = dependencyWaitCallbacks({ eligible: true, ...fixtureOpts });
+    const callbacks = { ...fixture.callbacks };
+    if (served === "absent") callbacks.reportIteration = async (n) => { fixture.iterations.push(n); };
+    else if (typeof served === "number") callbacks.reportIteration = async (n) => { fixture.iterations.push(n); return { completionAttempts: served }; };
+    let calls = 0;
+    const prompts: string[] = [];
+    let spawnPending = false;
+    let deferredRootDone: CodexNotification | undefined;
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start" && spawnPending) { spawnPending = false; return { thread: { id: "th-child" } }; }
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method !== "turn/start") return {};
+      if ((c.params as { threadId?: string }).threadId === "th-child") {
+        // A delegated child turn (not a lead provider call): its frames are subagent-origin.
+        c.transport.push(agentMessage("child is working", "th-child"));
+        c.transport.push(turnCompleted("completed", "th-child", "tn-child"));
+        // The root turn ends only after its child settled, as the app-server orders it.
+        if (deferredRootDone) { c.transport.push(deferredRootDone); deferredRootDone = undefined; }
+        return { turn: { id: "tn-child" } };
+      }
+      const n = ++calls;
+      const tn = `tn-stall-${n}`;
+      prompts.push((c.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "");
+      const turnNotes = notes(n, "th-1", tn);
+      if (turnNotes.some((note) => (note.params as { tool?: string } | undefined)?.tool === "spawn_agent")) spawnPending = true;
+      for (const note of turnNotes) c.transport.push(note);
+      if (spawnPending) deferredRootDone = turnCompleted("completed", "th-1", tn);
+      else c.transport.push(turnCompleted("completed", "th-1", tn));
+      return { turn: { id: tn } };
+    };
+    const rig = makeMultiEpochRig(Array.from({ length: 12 }, () => responder));
+    const stallAgents: AgentTemplate[] = [
+      { name: "lead", description: "the lead", prompt_body: "lead body", tools: null, skills: [] },
+      { name: "coder", description: "a coder", prompt_body: "coder body", tools: null, skills: [] },
+    ];
+    const { ctx, emitted } = makeCtx({ ...callbacks, agents: stallAgents, kind: "issue", completionInterlock: true, ...ctxOver });
+    let error: string | null = null;
+    let result: Awaited<ReturnType<Executor["run"]>> | undefined;
+    try { result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 20000, "#3139 stall run"); }
+    catch (e) { error = (e as Error).message; }
+    return { fixture, emitted, result, error, calls: () => calls, prompts, rig };
+  }
+  const bashTool: Notes = (c, th, tn) => [toolCall(500 + c, "Bash", { command: "ls" }, th, tn, `b${c}`), agentMessage("reading")];
+  const nativeCommand: Notes = (c, th) => [
+    { kind: "activity", method: "item/started", params: { threadId: th, item: { type: "commandExecution" } } },
+    agentMessage(`running ${c}`),
+  ];
+  const script = (special: Record<number, Notes>): Notes => (c, th, tn) => (special[c] ?? (c === 1 ? rp1 : prose))(c, th, tn);
+
+  it("a reworded stall reaches the no_progress_stall question and an expired window holds (regression pin: base failed on max_iterations)", async () => {
+    const r = await drive(script({}), { config: { max_iterations: 8 } });
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 4, "tripped on the third consecutive stall turn");
+    assert.deepEqual(r.fixture.questions, [[["m2"], { kind: "no_progress_stall" }]]);
+    assert.deepEqual(r.fixture.holds, [REASON_COMPLETION_STALL]);
+    assert.deepEqual(r.result?.completionHeld, { reason: REASON_COMPLETION_STALL });
+    assert.equal(r.fixture.attempts.length, 1);
+    assert.deepEqual(r.fixture.attempts[0]!.declared, []);
+    assert.ok(!("nonClosing" in r.fixture.attempts[0]!));
+    assert.ok(r.fixture.checkpoints.some((c) => c.reap === true && c.sink === "done_checkpoint"));
+    assert.equal(r.result?.prSummary, undefined);
+    assert.equal(r.result?.milestonesCompleted, undefined);
+  });
+
+  it("the #2657 dependency wait reaches the question and hold on an eligible run", async () => {
+    const lead = scriptedDependencyWait("reworded");
+    const fixture = dependencyWaitCallbacks({ eligible: true });
+    let turns = 0;
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method !== "turn/start") return {};
+      const n = ++turns;
+      const tn = `tn-wait-${n}`;
+      if (n === 1) {
+        c.transport.push(toolCall(100 + n, "report_progress", dependencyWaitProgress, "th-1", tn, "progress"));
+        c.transport.push(toolCall(200 + n, "checkpoint", {}, "th-1", tn, "checkpoint"));
+      } else if (n === 2) {
+        c.transport.push(toolCall(300 + n, "ask_user", { questions: [{ question: dependencyWaitQuestion }] }, "th-1", tn, "ask"));
+      } else {
+        c.transport.push(agentMessage((lead.next({ continuation: "", advertisedTools: {} }) as { text: string }).text));
+      }
+      c.transport.push(turnCompleted("completed", "th-1", tn));
+      return { turn: { id: tn } };
+    };
+    const rig = makeMultiEpochRig(Array.from({ length: 12 }, () => responder));
+    const { ctx } = makeCtx({ ...fixture.callbacks, kind: "issue", completionInterlock: true });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 20000, "#3139 dependency wait run");
+    assert.deepEqual(fixture.questions.map((q) => q[1]), [{ kind: "no_progress_stall" }]);
+    assert.deepEqual(fixture.holds, [REASON_COMPLETION_STALL]);
+    assert.deepEqual(result.completionHeld, { reason: REASON_COMPLETION_STALL });
+    assert.equal(fixture.attempts.length, 1);
+  });
+
+  it("trips on the last iteration instead of throwing max_iterations", async () => {
+    const r = await drive(script({}), { config: { max_iterations: 4 } });
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 4);
+    assert.deepEqual(r.result?.completionHeld, { reason: REASON_COMPLETION_STALL });
+    assert.equal(r.fixture.questions.length, 1);
+  });
+
+  it("a continue answer on the last iteration holds with max_iterations and runs no further turn", async () => {
+    const r = await drive(script({}), {
+      config: { max_iterations: 4 }, fixture: { answer: { outcome: "continue", guidance: "keep going" } },
+    });
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 4, "no provider turn after the answered last-iteration trip");
+    assert.deepEqual(r.result?.completionHeld, { reason: ITER_REASON });
+    assert.deepEqual(r.fixture.holds, [ITER_REASON]);
+  });
+
+  it("a continue answer resumes with the answered rework and a later signal_done takes the normal done path", async () => {
+    const attempts: Parameters<NonNullable<RunContext["recordCompletionAttempt"]>>[0][] = [];
+    const r = await drive(script({
+      5: (_c, th, tn) => [toolCall(700, "signal_done", { milestones_completed: ["m2"] }, th, tn, "c-done")],
+    }), {
+      fixture: { answer: { outcome: "continue", guidance: "STALL-GUIDANCE-42" } },
+      recordCompletionAttempt: async (args) => { attempts.push(args); return { unmet: attempts.length === 1 ? ["m2"] : [], attemptCount: attempts.length }; },
+    });
+    assert.equal(r.error, null);
+    assert.equal(r.result?.completionHeld, undefined);
+    assert.equal(r.fixture.questions.length, 1);
+    assert.match(r.prompts[4]!, /The run owner answered the completion question/);
+    assert.match(r.prompts[4]!, /STALL-GUIDANCE-42/);
+    assert.equal(r.fixture.holds.length, 0);
+    assert.equal(attempts.length, 2, "the stall attempt plus the lead's own signal_done attempt");
+    assert.deepEqual(attempts[0]!.declared, []);
+    assert.deepEqual(attempts[1]!.declared, ["m2"]);
+    assert.equal(r.calls(), 5);
+  });
+
+  it("an empty unmet set still asks the question with []", async () => {
+    const asked: unknown[] = [];
+    const r = await drive(script({}), {
+      recordCompletionAttempt: async () => ({ unmet: [], attemptCount: 1 }),
+      askCompletionQuestion: async (unmet, trigger) => { asked.push([unmet, trigger]); return { outcome: "expired" }; },
+    });
+    assert.equal(r.error, null);
+    assert.deepEqual(asked, [[[], { kind: "no_progress_stall" }]]);
+  });
+
+  it("report_progress-only turns with unchanged progress still count", async () => {
+    const r = await drive((c, th, tn) => (c <= 4 ? rp1(c, th, tn) : prose(c, th, tn)));
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 4, "tripped on report_progress-only turns; the progress-miss escalation did not prevent it");
+    assert.equal(r.fixture.questions.length, 1);
+  });
+
+  const resetCases: Array<[string, Notes]> = [
+    ["changed progress", (c, th, tn) => [toolCall(100 + c, "report_progress", { completed: ["m1"], in_progress: ["m2"] }, th, tn, `p${c}`)]],
+    ["a non-signal root tool call (projected tool start)", bashTool],
+    ["a root commandExecution item", nativeCommand],
+    ["an ask_user answer", (c, th, tn) => [toolCall(300 + c, "ask_user", { questions: [{ question: "anything?" }] }, th, tn, `q${c}`)]],
+  ];
+  for (const [name, at4] of resetCases) {
+    it(`${name} resets the streak`, async () => {
+      const r = await drive(script({ 4: at4 }));
+      assert.equal(r.error, null);
+      assert.equal(r.calls(), 7, "streak restarted after turn 4 and tripped on turn 7");
+      assert.equal(r.fixture.questions.length, 1);
+    });
+  }
+
+  it("a delegating turn (spawn_agent with child frames) between stall turns resets the streak", async () => {
+    // The delegation's lead dispatch frame also counts as a lead tool call, so this pins the reset
+    // for a real delegation as a whole rather than the subagent flag alone.
+    const spawn: Notes = (c, th, tn) => [toolCall(900 + c, "spawn_agent", { role: "coder", prompt: "help" }, th, tn, `s${c}`)];
+    const r = await drive(script({ 3: spawn }));
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 6, "turn 2 counted, the delegating turn 3 reset, turns 4-6 tripped");
+    assert.equal(r.fixture.questions.length, 1);
+  });
+
+  it("a changed worktree fingerprint on one turn restarts the streak", async () => {
+    let fp = "SAME";
+    const r = await drive((c, th, tn) => { fp = c === 3 ? "CHANGED" : "SAME"; return script({})(c, th, tn); },
+      { worktreeFingerprint: async () => fp });
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 6, "the changed turn starts a new streak of one; turns 4-6 trip");
+    assert.equal(r.fixture.questions.length, 1);
+  });
+
+  it("a null worktree fingerprint on one turn restarts the streak", async () => {
+    let fp: string | null = "SAME";
+    const r = await drive((c, th, tn) => { fp = c === 3 ? null : "SAME"; return script({})(c, th, tn); },
+      { worktreeFingerprint: async () => fp });
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 6);
+    assert.equal(r.fixture.questions.length, 1);
+  });
+
+  it("an unresolvable (null) worktree fingerprint on every turn is never a stall turn", async () => {
+    let fp: string | null = "SAME";
+    const r = await drive((c, th, tn) => { fp = c >= 3 ? null : "SAME"; return script({})(c, th, tn); },
+      { config: { max_iterations: 8 }, worktreeFingerprint: async () => fp });
+    assert.equal(r.fixture.questions.length, 0, "no stall question");
+    assert.equal(r.fixture.attempts.length, 0, "no worker completion attempt");
+    assert.equal(r.calls(), 8, "every provider call up to the iteration budget ran");
+    assert.equal(r.error, ITER_REASON);
+  });
+
+  it("a turn whose ACK serves no completionAttempts (ineligible) restarts the streak", async () => {
+    const r = await drive(script({}), {
+      reportIteration: async (n) => (n === 3 ? undefined : { completionAttempts: 0 }),
+    });
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 6, "turn 2 counted, ineligible turn 3 reset, turns 4-6 tripped");
+    assert.equal(r.fixture.questions.length, 1);
+  });
+
+  it("a cooperative checkpoint between stall turns resets the streak", async () => {
+    const ckpt: Notes = (c, th, tn) => [toolCall(200 + c, "checkpoint", {}, th, tn, `ck${c}`)];
+    const r = await drive(script({ 3: ckpt }));
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 6, "turn 2 counted, checkpoint turn 3 reset, turns 4-6 tripped");
+    assert.equal(r.fixture.questions.length, 1);
+  });
+
+  it("a park_run answer between stall turns resets the streak", async () => {
+    const park: Notes = (c, th, tn) => [toolCall(400 + c, "park_run", {}, th, tn, `pk${c}`)];
+    const r = await drive(script({ 3: park }), {
+      parkRunSupported: true,
+      requestParkRun: async () => ({ kind: "answer", answers: ["carry on"] }),
+    });
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 6, "turn 2 counted, the answered park turn 3 reset, turns 4-6 tripped");
+    assert.equal(r.fixture.questions.length, 1);
+  });
+
+  it("after a continue answer the in-process latch blocks a second stall attempt even while the served count lags at 0", async () => {
+    const r = await drive(script({}), {
+      served: 0, config: { max_iterations: 8 }, fixture: { answer: { outcome: "continue", guidance: "keep going" } },
+    });
+    assert.equal(r.error, null);
+    assert.equal(r.fixture.attempts.length, 1, "exactly one worker stall attempt");
+    assert.equal(r.fixture.questions.length, 1, "no second stall question");
+    assert.equal(r.calls(), 8, "the run drains its iteration budget instead of re-tripping");
+    assert.deepEqual(r.fixture.holds, [ITER_REASON]);
+    assert.deepEqual(r.result?.completionHeld, { reason: ITER_REASON });
+  });
+
+  it("an owner follow-up resets the streak", async () => {
+    let pulls = 0;
+    const r = await drive(script({}), {
+      pullFollowUps: () => (++pulls === 3 ? [{ id: 1, body: "please also check X" }] : []),
+    });
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 5, "the follow-up delayed the trip by one turn");
+    assert.equal(r.fixture.questions.length, 1);
+  });
+
+  it("a safety steer resets the streak", async () => {
+    let pulls = 0;
+    const r = await drive(script({}), {
+      pullSafetySteer: () => (++pulls === 3 ? "STEER-BODY" : undefined),
+    });
+    assert.equal(r.error, null);
+    assert.equal(r.calls(), 5, "the steer delayed the trip by one turn");
+    assert.equal(r.fixture.questions.length, 1);
+  });
+
+  it("a recordCompletionAttempt failure propagates with no question and no hold", async () => {
+    for (const err of [
+      new Error("attempt boom"),
+      new RequestError("POST", "/attempt", 409, JSON.stringify({ disposition: "stale_claim" })),
+    ]) {
+      const asked: unknown[] = [];
+      const holds: string[] = [];
+      const r = await drive(script({}), {
+        recordCompletionAttempt: async () => { throw err; },
+        askCompletionQuestion: async (u, t) => { asked.push([u, t]); return { outcome: "expired" }; },
+        enterCompletionHold: async (reason) => { holds.push(reason); return true; },
+      });
+      assert.equal(r.error, err.message);
+      assert.deepEqual(asked, []);
+      assert.deepEqual(holds, []);
+    }
+  });
+
+  it("an unwired question seam holds directly", async () => {
+    const r = await drive(script({}), { askCompletionQuestion: undefined });
+    assert.equal(r.error, null);
+    assert.deepEqual(r.fixture.holds, [REASON_COMPLETION_STALL]);
+  });
+
+  it("an unwired hold seam throws REASON_COMPLETION_STALL", async () => {
+    const r = await drive(script({}), { enterCompletionHold: undefined });
+    assert.equal(r.error, REASON_COMPLETION_STALL);
+  });
+
+  describe("controls", () => {
+    it("served completion_attempts 1 or absent: no stall path, stays max_iterations", async () => {
+      for (const served of [1, "absent"] as const) {
+        const r = await drive(script({}), { served, config: { max_iterations: 6 } });
+        assert.equal(r.error, ITER_REASON, String(served));
+        assert.equal(r.fixture.questions.length, 0, String(served));
+        assert.equal(r.fixture.attempts.length, 0, String(served));
+      }
+    });
+
+    it("no reported completed milestone stays max_iterations", async () => {
+      const r = await drive(prose, { config: { max_iterations: 6 } });
+      assert.equal(r.error, ITER_REASON);
+      assert.equal(r.fixture.attempts.length, 0);
+    });
+
+    it("an interactive run and a non-issue run are unchanged", async () => {
+      const interactive = await drive(script({}), { interactive: true, config: { max_iterations: 6 } });
+      assert.equal(interactive.fixture.attempts.length, 0);
+      assert.equal(interactive.fixture.questions.length, 0);
+      assert.equal(interactive.error, ITER_REASON, "interactive run drains the iteration budget as before");
+      assert.equal(interactive.calls(), 6);
+      const task = await drive(script({}), { kind: "task", config: { max_iterations: 6 } });
+      assert.equal(task.fixture.attempts.length, 0);
+      assert.equal(task.fixture.questions.length, 0);
+      assert.equal(task.error, ITER_REASON, "non-issue run drains the iteration budget as before");
+      assert.equal(task.calls(), 6);
+    });
+
+    it("real work (a tool call every turn) still ends on max_iterations", async () => {
+      const r = await drive((c, th, tn) => (c === 1 ? rp1(c, th, tn) : bashTool(c, th, tn)), { config: { max_iterations: 6 } });
+      assert.equal(r.error, ITER_REASON);
+      assert.equal(r.fixture.attempts.length, 0);
+    });
+
+    it("a post-attempt stall still routes to the max_iterations hold as before", async () => {
+      const r = await drive(script({ 2: (_c, th, tn) => [toolCall(700, "signal_done", {}, th, tn, "c-done")] }), { config: { max_iterations: 6 } });
+      assert.equal(r.error, null);
+      assert.equal(r.fixture.attempts.length, 1, "only the lead's own attempt; the stall path is latched off");
+      assert.equal(r.fixture.questions.length, 0);
+      assert.notEqual(r.result?.completionHeld?.reason, REASON_COMPLETION_STALL);
+      assert.deepEqual(r.fixture.holds, [ITER_REASON]);
+    });
+  });
 });

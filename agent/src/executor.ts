@@ -765,6 +765,10 @@ export interface RunContext {
    *  REASON_QUESTION_TIMEOUT: expiry is a normal outcome, not a failure, and it must not surface as a
    *  `failed` report. `unmet` is the server-authoritative unmet-milestone id set at the stall.
    *
+   *  `trigger` names why the question opens: `lead_request`, `no_progress` (repeated identical
+   *  attempts) or `no_progress_stall` (a worker-initiated attempt after the lead stopped making
+   *  progress without signalling done, issue #3139).
+   *
    *  Optional: nil in tests/legacy ⇒ the executor falls back to routeCompletionHold at the stall
    *  exactly as M4 behaved. Only reached on an interlocked run (see completionInterlock). */
   askCompletionQuestion?(

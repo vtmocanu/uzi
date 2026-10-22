@@ -1,9 +1,12 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import type { Executor, RunContext } from "../src/executor.js";
-import type { StateRequest, UserInput } from "../src/protocol.js";
+import type { IterationBudget, StateAck, StateRequest, UserInput } from "../src/protocol.js";
 import {
   api,
+  client,
+  runner,
+  simulateCommittedWork,
   fakeGitlab,
   gitlabClaim,
   input,
@@ -154,5 +157,86 @@ describe("RunRunner — completion-question live window (PRD #1226 M5 D6)", () =
     await runnerWith(() => ({ executor }), gitlab).execute(claim);
 
     assert.deepStrictEqual(decision.value, { outcome: "continue", guidance: undefined });
+  });
+});
+
+describe("RunRunner — no_progress_stall question text and served attempts (issue #3139)", () => {
+  async function askStall(unmet: string[], issue: number): Promise<string> {
+    const { gitlab } = fakeGitlab();
+    const executor: Executor = { run: async (ctx) => {
+      await ctx.askCompletionQuestion!(unmet, { kind: "no_progress_stall" });
+      return { branch: ctx.branch, completionHeld: { reason: "test" } };
+    } };
+    const claim = gitlabClaim(issue, { config: { completion_hold_window_seconds: 900 } });
+    await runnerWith(() => ({ executor }), gitlab, undefined, undefined, {
+      setTimer: (cb) => { queueMicrotask(cb); return () => {}; },
+    }).execute(claim);
+    const message = api.messages(claim.run_id).find((m) => m.kind === "question")!;
+    const q = (message.payload as { questions: { question: string }[] }).questions[0]!;
+    return q.question;
+  }
+
+  it("non-empty unmet lists the milestones and offers continue, partial and accept", async () => {
+    const text = await askStall(["m1", "m2"], 3139);
+    assert.match(text, /The lead stopped making progress without signalling done: it ended consecutive turns with no tool call, no worktree change and no milestone progress\./);
+    assert.match(text, /The worker ran a completion check; the frozen completion contract still has unmet milestones:/);
+    assert.match(text, /- m1\n- m2/);
+    assert.match(text, /--continue/);
+    assert.match(text, /--partial m1,m2/);
+    assert.match(text, /--accept m2\.c1,m2\.c3/);
+    assert.doesNotMatch(text, /signalled done, but|Repeated completion attempts|completion attempts/);
+  });
+
+  it("empty unmet offers only continue and renders no milestone fallback", async () => {
+    const text = await askStall([], 3140);
+    assert.match(text, /The lead stopped making progress without signalling done/);
+    assert.match(text, /The frozen completion contract is satisfied, but the lead has not signalled done\./);
+    assert.match(text, /This question persists for an owner decision; if the live window expires, the run is held\./);
+    assert.match(text, /server-authoritative completion recheck/);
+    assert.match(text, /--continue \[--guidance/);
+    assert.doesNotMatch(text, /not yet satisfied/);
+    assert.doesNotMatch(text, /--partial|--accept/);
+    assert.doesNotMatch(text, /^- /m);
+  });
+
+  async function iterationBudget(served: Partial<StateAck>, issue: number, exclusive = false): Promise<IterationBudget | undefined | void> {
+    const { gitlab } = fakeGitlab();
+    const orig = client.reportState.bind(client);
+    (client as unknown as { reportState: unknown }).reportState = async (...args: unknown[]) => {
+      const body = args[1] as { status?: string; iteration_count?: number } | undefined;
+      const ack = (await (orig as (...a: unknown[]) => Promise<StateAck>)(...args)) as StateAck;
+      return body?.status === "running" && typeof body.iteration_count === "number" ? (exclusive ? (served as StateAck) : { ...ack, ...served }) : ack;
+    };
+    try {
+      let captured: IterationBudget | undefined | void;
+      const exec: Executor = {
+        run: async (ctx) => {
+          captured = await ctx.reportIteration!(1, undefined);
+          simulateCommittedWork();
+          return { branch: ctx.branch };
+        },
+        killAgentTree: () => {},
+      };
+      await runner(exec, gitlab).execute(gitlabClaim(issue));
+      return captured;
+    } finally {
+      (client as unknown as { reportState: unknown }).reportState = orig;
+    }
+  }
+
+  it("reportIteration forwards a served completionAttempts of 0 and 2", async () => {
+    assert.strictEqual((await iterationBudget({ completionAttempts: 0 }, 3141) as IterationBudget).completionAttempts, 0);
+    assert.strictEqual((await iterationBudget({ completionAttempts: 2 }, 3142) as IterationBudget).completionAttempts, 2);
+  });
+
+  it("reportIteration returns a served completionAttempts even when it is the only field the ACK carries", async () => {
+    // Pins the return guard: an ACK with ONLY completionAttempts must still yield a budget object.
+    assert.deepStrictEqual(await iterationBudget({ completionAttempts: 3 }, 3144, true), { completionAttempts: 3 });
+    assert.deepStrictEqual(await iterationBudget({ completionAttempts: 0 }, 3145, true), { completionAttempts: 0 });
+  });
+
+  it("reportIteration leaves completionAttempts absent when the ACK serves none", async () => {
+    const b = await iterationBudget({}, 3143);
+    assert.strictEqual((b as IterationBudget | undefined)?.completionAttempts, undefined);
   });
 });

@@ -1,7 +1,7 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import { legacyTrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
-import { REASON_COMPLETION_LEAD_REQUESTED } from "../src/completion-attempt.js";
+import { REASON_COMPLETION_LEAD_REQUESTED, REASON_COMPLETION_STALL } from "../src/completion-attempt.js";
 
 it("issue3089 repair: legacy refusal trusts only the exact lead-requested completion hold reason", () => {
   for (const reason of [
@@ -82,4 +82,18 @@ it("trusted refusal: legacy helper honors the caller's existing control predicat
   assert.equal(legacyTrustedExecutionRefusal(reason), false);
   assert.equal(legacyTrustedExecutionRefusal("startup: " + reason, existing), true);
   assert.equal(legacyTrustedExecutionRefusal('I/O says "' + reason + '"', existing), false);
+});
+
+it("issue3139: legacy refusal trusts only the exact no-progress stall completion hold reason", () => {
+  for (const reason of [
+    REASON_COMPLETION_STALL,
+    String(new Error(REASON_COMPLETION_STALL)),
+    "completion hold: " + String(new Error(REASON_COMPLETION_STALL)),
+  ]) assert.equal(legacyTrustedExecutionRefusal(reason), true, reason);
+
+  for (const reason of [
+    REASON_COMPLETION_STALL + " model supplied suffix",
+    "completion hold: Error: " + REASON_COMPLETION_STALL + " model supplied suffix",
+    'filesystem says: "' + REASON_COMPLETION_STALL + '"',
+  ]) assert.equal(legacyTrustedExecutionRefusal(reason), false, reason);
 });
