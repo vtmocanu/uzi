@@ -309,9 +309,11 @@ locally in step 4. The advisory still prints until the window expires.
      “Already reviewed the last commit.” Decide whether the existing coverage plus a local
      review is sufficient for this risk class. If a bot review is still warranted, post
      `@coderabbitai full review` once and return to step 2; never auto-post it.
-   - **Skipped (exit 6, reason printed).** `N files exceed the limit of 100` (also CodeRabbit's
-     answer to `@coderabbitai full review`) means switch to Greptile: post `@greptileai review`,
-     then `--reviewer greptile --reviewer-grace 2`. A disabled base branch means Greptile or
+   - **File-limit refusal (status or command reply).** `N files exceed the limit of 100`,
+     including CodeRabbit's answer to `@coderabbitai full review`, means switch to Greptile: post
+     `@greptileai review`, then `--reviewer greptile --reviewer-grace 2`. A command reply need
+     not change the commit status, so do not wait for a particular watcher exit.
+   - **Other skipped status (exit 6, reason printed).** A disabled base branch means Greptile or
      local review. An ignored title keyword gets an explicit bot trigger only
      when the PR was already classified large/high-risk; Renovate-class PRs still require
      the user's prior approval. Absent after the grace means local review, noted at merge.
