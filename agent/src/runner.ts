@@ -1963,6 +1963,9 @@ type MemoryFlight = {
   hold?: Readonly<{ context: MemoryContext; deadline: number; humanRevision: boolean }>;
   operation?: Promise<void>;
   settled?: boolean;
+  /** Original Codex run/finally stays owned after a bounded memory observation. */
+  executorRun?: Promise<void>;
+  executorSettled?: boolean;
   /** A rejected ownership probe cannot be revived by a later pause input. */
   ownershipRejected?: boolean;
   closing?: Promise<void>;
@@ -1987,7 +1990,9 @@ type SourceGenesis = Readonly<{
 }>;
 
 interface RunFlight {
-  /** Exact facade of an incomplete owner-pause capture; never cleanup or resume authority. */
+  /** Local observer only; preservation keeps its own operation and authority. */
+  memoryHoldObserver?: () => void;
+  /** Exact facade of a refused/unacknowledged owner-pause capture; never cleanup or resume authority. */
   refusedPauseCaptureSafety?: CodexExecutionSafety;
   sourceInherited?: ClosedSourceObservation;
   sourceFamilyMatched?: boolean;
@@ -4855,9 +4860,13 @@ export class RunRunner {
       if (flight.workerMemory) {
         flight.workerMemory.ended = true;
         flight.workerMemory.unsubscribe?.();
-        if (this.requiresFreeCaptureScope(claim, flight) && flight.workerMemory.operation && !flight.workerMemory.settled) {
+        const pending = [
+          ...(!flight.workerMemory.settled && flight.workerMemory.operation ? [flight.workerMemory.operation] : []),
+          ...(!flight.workerMemory.executorSettled && flight.workerMemory.executorRun ? [flight.workerMemory.executorRun] : []),
+        ];
+        if (this.requiresFreeCaptureScope(claim, flight) && pending.length) {
           flight.runLog.warn("codex capture operation pending; source reservation retained");
-          ownMemory(flight.workerMemory.operation);
+          ownMemory(Promise.allSettled(pending).then(() => {}));
         }
       }
       // PRD #1171 m4 (F1): the FINAL Codex registry disposal, after EVERY durability sink has
@@ -4875,6 +4884,7 @@ export class RunRunner {
       let terminalDisposeUnproven = false;
       if (executor.safety && !(flight.workerMemory?.closing && !flight.workerMemory.closingSettled) &&
           !(flight.workerMemory?.operation && !flight.workerMemory.settled) &&
+          !(flight.workerMemory?.executorRun && !flight.workerMemory.executorSettled) &&
           !this.memoryRuntime?.sinkReceipts.some(receipt => receipt.context.flight === flight)) {
         try {
           await executor.closeAndSettlePlanSummary?.(this.codexBoundaryDeadlineMs);
@@ -13384,11 +13394,17 @@ export class RunRunner {
         if (m4ResumeReviewedPlan && priorOwnerHistory.status === "complete" && priorOwnerHistory.entries.length > 0) {
           await this.awaitResumedDelivery(runId, steering, batcher, runLog, cancel.signal);
         }
-        try { result = await executor.run(ctx); }
+        let execution: Promise<ExecutorResult>;
+        try { execution = executor.run(ctx); }
         catch (value) {
           executionRejection.executorRejected = true;
           throw value;
         }
+        // Observer expiry is not an executor rejection. Only the original run
+        // supplies that private provenance, including a synchronously thrown error.
+        void execution.catch(() => { executionRejection.executorRejected = true; });
+        result = this.memoryRuntime && this.requiresFreeCaptureScope(claim, flight)
+          ? await this.awaitExecutorWithMemoryDeadline(flight, execution) : await execution;
         if (flight.workerMemory?.hold) {
           await this.reconcileWorkerMemory(flight);
           throw new RetainedRecoveryStop();
@@ -17946,7 +17962,12 @@ export class RunRunner {
         const result = await this.runFreeCapture(claim, flight, deadlineAt, this.shutdownSignal.signal,
           held => this.handlePauseParkHeld(claim, flight, held, pausedAt, options.origin, () => { pauseAcknowledged = true; }, reportRefusal),
           "capture", "warn");
-        if (result.kind === "observed_empty") return result.value;
+        if (result.kind === "observed_empty") {
+          // A completed capture may still have no paused ACK. If this exact
+          // epoch later fails teardown, it needs the same B1 retained stop.
+          if (!result.value) flight.refusedPauseCaptureSafety = refusedSafety;
+          return result.value;
+        }
       } catch (error) {
         flight.sourceJoinFailed = true;
         if (pauseAcknowledged) {
@@ -19590,11 +19611,38 @@ export class RunRunner {
     }
   }
 
+  /** Bound only the memory-hold observer; the original executor still owns its finally. */
+  private async awaitExecutorWithMemoryDeadline(flight: RunFlight, execution: Promise<ExecutorResult>): Promise<ExecutorResult> {
+    let onHold!: () => void;
+    let observing = false;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      onHold = () => {
+        const memory = flight.workerMemory;
+        if (!memory?.hold || observing) return;
+        observing = true;
+        memory.executorSettled = false;
+        memory.executorRun = execution.then(
+          () => { memory.executorSettled = true; },
+          () => { memory.executorSettled = true; },
+        );
+        // Same absolute hold deadline, no capture/disposal or new authority.
+        void this.joinWorkerMemory(memory.executorRun, memory.hold.deadline).catch(reject);
+      };
+      flight.memoryHoldObserver = onHold;
+      onHold();
+    });
+    try { return await Promise.race([execution, deadline]); }
+    finally { if (flight.memoryHoldObserver === onHold) flight.memoryHoldObserver = undefined; }
+  }
+
   private startWorkerMemoryPreservation(flight: RunFlight): Promise<void> {
     const memory = flight.workerMemory!;
     if (memory.operation) return memory.operation;
     if (memory.ended) return Promise.resolve();
     const hold = memory.hold!;
+    // A prior refused pause may already have aborted cancel; observe the hold
+    // directly instead of depending on a second AbortController notification.
+    flight.memoryHoldObserver?.();
     // Preparation left tool outcome delivery open. This owner operation now stops
     // only the original model execution; its capture signal is independent.
     flight.cancel.abort(new RetainedRecoveryStop());
@@ -19685,7 +19733,8 @@ export class RunRunner {
     const memory = flight.workerMemory;
     const pause = flight.steering.getPauseMode();
     if (!memory?.hold || (pause !== "now" && pause !== "milestone") ||
-        Date.now() >= memory.hold.deadline || !memory.operation || memory.settled !== true || memory.ownershipRejected ||
+        Date.now() >= memory.hold.deadline || !memory.operation || memory.settled !== true ||
+        (memory.executorRun && !memory.executorSettled) || memory.ownershipRejected ||
         flight.parked || flight.holdOrWallParkConfirmed || flight.stoppedSourceKept ||
         flight.active?.shuttingDown || this.shuttingDownGlobal ||
         flight.steering.isCancelled() || flight.steering.claimFence() !== undefined ||
@@ -19715,6 +19764,7 @@ export class RunRunner {
       deadline).catch(() => {});
     if (memory.closing) await this.joinWorkerMemory(memory.closing, deadline).catch(() => {});
     if (memory.feedback.size || receipts.length || (memory.operation && !memory.settled) ||
+        (memory.executorRun && !memory.executorSettled) ||
         (memory.closing && !memory.closingSettled))
       this.retainWorkerMemoryCustody(flight);
   }

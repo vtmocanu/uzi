@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { it } from "node:test";
 import { spawn } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
 import { CodexBoundaryError } from "../src/codex/safety.js";
 import { captureFailureOf, EpochCleanupUnprovenError } from "../src/harness.js";
 import { GitBoundaryAbortError } from "../src/checkpoint-stop.js";
@@ -8,10 +10,56 @@ import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { StaleClaimError } from "../src/runner.js";
 import { DiskParkSignal } from "../src/cache-cap.js";
 import { CredentialSwitchSignal } from "../src/steering.js";
-import { fx, git, fakeGitlab, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
-import { codexRig, manualDeadline } from "./runner-codex-sinks-fixture.js";
+import { api, client, fx, git, fakeGitlab, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
+import { codexRig, FakeCodexExecutor, manualDeadline, statuses } from "./runner-codex-sinks-fixture.js";
+import { JOIN_TOKEN } from "./runner-held-publication-fixture.js";
 
 installHarness();
+
+for (const route of ["publish-refused", "pause-rejected", "pause-ack-lost", "different-facade"] as const) {
+  it(`completed false pause retains only its matching unproven epoch: ${route}`, async t => {
+    const rig = codexRig();
+    const claim = { ...gitlabClaim(2852), claim_generation: 1, park_run_supported: true };
+    let clone = "", pauses = 0, publications = 0, packedBytes = 0;
+    const publish = client.publishCheckpoint.bind(client);
+    t.mock.method(client, "publishCheckpoint", async (...args: Parameters<typeof publish>) => {
+      publications++;
+      for await (const chunk of args[2]) packedBytes += chunk.length;
+      return route === "publish-refused" || route === "different-facade"
+        ? { ok: false, httpStatus: 400 }
+        : { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/agent/issue-2852" } };
+    });
+    const report = client.reportState.bind(client);
+    t.mock.method(client, "reportState", async (...args: Parameters<typeof report>) => {
+      if (args[1].status !== "paused") return report(...args);
+      pauses++;
+      if (route === "pause-rejected") return { applied: false, status: "running" };
+      const response = await report(...args);
+      if (route === "pause-ack-lost") throw new Error("fixture lost pause acknowledgement");
+      return response;
+    });
+    const executor = new FakeCodexExecutor(rig.safety, async ctx => {
+      clone = ctx.worktreePath;
+      fs.writeFileSync(path.join(clone, "PAUSE.txt"), "retained pause bytes\n");
+      fs.writeFileSync(path.join(homeDir, "pause-session"), "retained session\n");
+      assert.equal(await ctx.parkForPause!({ completedCount: 1 }), false, "real pause sink declined after capture");
+      throw new EpochCleanupUnprovenError(route === "different-facade" ? codexRig().safety : rig.safety);
+    }, rig.settle, rig.capture);
+    const runner = runnerWith(() => ({ executor, homeDir }), fakeGitlab().gitlab, JOIN_TOKEN,
+      undefined, { checkpointIntervalMs: 0 });
+    await runner.execute(claim);
+    assert.ok(publications > 0, "actual checkpoint publication reached");
+    assert.ok(packedBytes > 0, "the broker consumed the real Git pack");
+    assert.equal(pauses > 0, route === "pause-rejected" || route === "pause-ack-lost");
+    assert.equal(statuses(claim.run_id).includes("failed"), route === "different-facade",
+      "only the same refused pause facade selects B1 instead of terminal failure");
+    if (route !== "different-facade") {
+      assert.equal(api.states.some(row => row.body.status === "completed"), false);
+      assert.equal(fs.readFileSync(path.join(clone, "PAUSE.txt"), "utf8"), "retained pause bytes\n");
+      assert.equal(fs.readFileSync(path.join(homeDir, "pause-session"), "utf8"), "retained session\n");
+    }
+  });
+}
 
 for (const timing of ["reap", "microtask"] as const) {
   it("R2 independent child error before capture expiry must reject pause: " + timing, async t => {
@@ -171,7 +219,7 @@ for (const mode of ["expired-marker", "sentinel-expiry", "sentinel-cleanup", "bo
       assert.equal(flight.sourceJoinFailed, true);
       assert.equal(flight.preserveRecoveryClone, true);
       assert.equal(flight.preserveSession, true);
-      assert.equal(flight.refusedPauseCaptureSafety, rig.safety, "only incomplete refusal records its exact facade");
+      assert.equal(flight.refusedPauseCaptureSafety, rig.safety, "this incomplete refusal records its exact facade");
       assert.equal(reports.length, 1, "body plus cleanup emits one refusal");
       assert.equal(messages.length, 1);
       assert.doesNotMatch(JSON.stringify(messages), /residue|process/i);

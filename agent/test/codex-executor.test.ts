@@ -813,10 +813,22 @@ describe("M3 actual runner memory Codex delivery", () => {
       pressure: (bytes: number) => { usage = bytes; }, samples: () => sampleId };
   }
 
-  for (const exhausted of [false, true]) {
-    it(exhausted ? "exhausted bound parks owner with matching callback and retained clone/home"
-      : "pressure joins callback/feed, blocks retry and rearms after sustained low Q", async () => {
+  for (const mode of ["retry", "exhausted", "late capture", "late cleanup"] as const) {
+    const exhausted = mode !== "retry";
+    const lateCapture = mode === "late capture";
+    const late = lateCapture || mode === "late cleanup";
+    it(late ? `memory deadline returns publicly while real Codex capture and finally stay owned: ${mode}`
+      : exhausted ? "exhausted bound parks owner with matching callback and retained clone/home"
+      : "pressure joins callback/feed, blocks retry and rearms after sustained low Q", { skip: late && NEEDS_PROCFS }, async t => {
       const f = await fixture(exhausted ? 1 : 0);
+      let releaseCapture!: () => void, releaseCleanup!: () => void, releaseSibling!: () => void;
+      const captureGate = new Promise<void>(resolve => { releaseCapture = resolve; });
+      const cleanupGate = new Promise<void>(resolve => { releaseCleanup = resolve; });
+      const siblingGate = new Promise<void>(resolve => { releaseSibling = resolve; });
+      const siblingHome = path.join(path.dirname(m2Runner.homeDir), "isolated-sibling");
+      let siblingClone = "", siblingReady = false;
+      let siblingWork: Promise<void> | undefined;
+      let captureEntered = false, cleanupEntered = false;
       let captureStatusReads = 0;
       if (exhausted) {
         // Empty source-only capture: fake effect handles cannot execute Git commands.
@@ -871,6 +883,17 @@ describe("M3 actual runner memory Codex delivery", () => {
         },
       };
       const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider, m2Runner.homeDir);
+      if (late) {
+        const teardown = (executor as any).tearDownEpoch.bind(executor);
+        t.mock.method(executor as any, "tearDownEpoch", async (...args: unknown[]) => {
+          if (captureEntered) {
+            cleanupEntered = true;
+            await cleanupGate;
+            await fs.writeFile(path.join(m2Runner.homeDir, "late-cleanup-proof"), "owned late cleanup");
+          }
+          return teardown(...args);
+        });
+      }
       let captured: CapturedMemoryContext | undefined;
       const settlements: unknown[] = [];
       const delivery: Executor = {
@@ -886,7 +909,12 @@ describe("M3 actual runner memory Codex delivery", () => {
           assert.ok(ms > 0 && ms <= 5000, "settlement stays inside the finite owner budget");
           captureActive = true;
           try {
-            const result = await Reflect.apply(executor.withCredentialFreeCapture, executor, [ms, action, purpose, signal, attempt]);
+            const scopedAction: typeof action = late ? async held => {
+              captureEntered = true;
+              if (lateCapture) await captureGate;
+              return action(held);
+            } : action;
+            const result = await Reflect.apply(executor.withCredentialFreeCapture, executor, [ms, scopedAction, purpose, signal, attempt]);
             settlements.push(result.kind === "observed_empty" ? { kind: result.kind } : result);
             return result;
           } finally { captureActive = false; }
@@ -902,9 +930,20 @@ describe("M3 actual runner memory Codex delivery", () => {
       const monitoring = f.memory.run();
       const transport = rig.epochs[0]!.transport;
       const ownerLog = recordingLogger();
-      const running = m2Runner.runnerWith(() => ({ executor: delivery, homeDir: m2Runner.homeDir }),
+      const runner = m2Runner.runnerWith(runId => runId === f.claim.run_id
+        ? { executor: delivery, homeDir: m2Runner.homeDir }
+        : { homeDir: siblingHome, executor: { run: async ctx => {
+          siblingClone = ctx.worktreePath;
+          await fs.writeFile(path.join(siblingClone, "SIBLING.txt"), "isolated sibling source");
+          await fs.writeFile(path.join(siblingHome, "session-proof"), "isolated sibling home");
+          siblingReady = true;
+          await siblingGate;
+          return { branch: ctx.branch, pausedAt: { completedCount: 0 } };
+        } } },
         m2Runner.fakeGitlab().gitlab, undefined, ownerLog.logger,
-        { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000 }).execute(f.claim);
+        { memoryRuntime: f.memory, codexBoundaryDeadlineMs: lateCapture ? 500 : late ? 1500 : 5000 });
+      const running = runner.execute(f.claim);
+      let duplicate: Promise<void> | undefined;
       // Rescue only our fake roots/transport, never host processes. Owner waits allow 6s;
       // the 10s rescue settles execution even when an assertion fails before normal cleanup.
       const rescue = setTimeout(() => { finishes.forEach(finish => finish()); transport.end(); }, 10000);
@@ -938,7 +977,61 @@ describe("M3 actual runner memory Codex delivery", () => {
         assert.equal(f.reservations[0]!.claim_generation, 7);
         assert.equal(f.reservations[0]!.memory_episode, 3);
         assert.equal(f.reservations[0]!.register_nonce, "m3-original-registration");
-        if (!exhausted) {
+        if (late) {
+          await waitFor(() => captureEntered, "real Codex capture callback entered");
+          const memory = (captured!.flight as any).workerMemory;
+          let terminalDisposals = 0, duplicateGateCalls = 0;
+          const safety = executor.safety!;
+          const dispose = safety.dispose.bind(safety);
+          t.mock.method(safety, "dispose", async (...args: Parameters<typeof dispose>) => {
+            terminalDisposals++;
+            return dispose(...args);
+          });
+          await withTimeout(running, lateCapture ? 1500 : 3000, "memory deadline must not await Codex captureTail");
+          assert.equal(memory.settled === true, !lateCapture,
+            "cover both pending capture and capture already settled beneath pending executor cleanup");
+          assert.equal(runner.isExecuting(f.claim.run_id), true);
+          assert.equal(terminalDisposals, 0, "runner cannot dispose beneath the live capture");
+          assert.equal(await fs.readFile(path.join(m2Runner.homeDir, "m3-session-proof"), "utf8"), "original home");
+          assert.ok(await fs.stat(m2Runner.worktreeDirFor(2396)), "exact source retained");
+          assert.deepEqual(await runner.withRetainedSourceBoundary(f.claim.run_id, [], async () => "unsafe"), { entered: false });
+          const sibling: ClaimResponse = { ...m2Runner.gitlabClaim(2397, {
+            plan_md: "Approved isolated sibling", plan_approved: true, plan_source: "seeded" as const,
+          }), run_id: randomUUID(), claim_generation: 1, memory_episode: 0,
+            memory_policy: { version: 1, max_interventions: 2 }, memory_intervention_count: 0 };
+          await fs.mkdir(siblingHome, { recursive: true });
+          m2Runner.api.setOwnershipStatus(sibling.run_id, "running", 1);
+          f.pressure(100);
+          siblingWork = runner.execute(sibling);
+          await waitFor(() => siblingReady, "independent sibling executes in its own source")
+            .catch(error => { throw new Error(`${String(error)}; sibling states=${JSON.stringify(m2Runner.api.states.filter(s => s.runId === sibling.run_id))}; owner=${JSON.stringify(ownerLog.lines)}`); });
+          assert.notEqual(siblingClone, m2Runner.worktreeDirFor(2396));
+          assert.notEqual(siblingHome, m2Runner.homeDir);
+          t.mock.method(runner as any, "gateQueuedDuplicate", async () => { duplicateGateCalls++; return false; });
+          duplicate = runner.execute(f.claim);
+          await new Promise<void>(resolve => setImmediate(resolve));
+          assert.equal(duplicateGateCalls, 0, "same-run successor remains behind original capture");
+          releaseCapture();
+          await waitFor(() => cleanupEntered, "original Codex finally entered after capture");
+          await memory.operation;
+          assert.equal(memory.settled, true);
+          assert.notEqual(memory.executorSettled, true);
+          await new Promise<void>(resolve => setImmediate(resolve));
+          assert.equal(runner.isExecuting(f.claim.run_id), true, "tail still owns original executor cleanup");
+          assert.equal(duplicateGateCalls, 0, "capture completion alone cannot admit successor");
+          assert.equal(terminalDisposals, 0);
+          assert.deepEqual(await runner.withRetainedSourceBoundary(f.claim.run_id, [], async () => "unsafe"), { entered: false });
+          assert.equal(m2Runner.api.states.some(s => s.runId === f.claim.run_id &&
+            (s.body.status === "failed" || s.body.status === "completed" || (lateCapture && s.body.checkpoint_contains_latest === true))), false);
+          releaseCleanup();
+          await duplicate;
+          assert.equal(memory.executorSettled, true);
+          assert.equal(duplicateGateCalls, 1);
+          assert.equal(runner.isExecuting(f.claim.run_id), false);
+          assert.equal(await fs.readFile(path.join(m2Runner.homeDir, "late-cleanup-proof"), "utf8"), "owned late cleanup");
+          assert.equal(await fs.readFile(path.join(siblingClone, "SIBLING.txt"), "utf8"), "isolated sibling source");
+          assert.equal(await fs.readFile(path.join(siblingHome, "session-proof"), "utf8"), "isolated sibling home");
+        } else if (!exhausted) {
           assert.equal(captured!.commands.admitsCommands(captured!.context), false);
           transport.push(toolCall(23962, "Bash", { command: "echo m3-retry" },
             "m3-thread", "m3-turn", "m3-retry-call"));
@@ -973,7 +1066,7 @@ describe("M3 actual runner memory Codex delivery", () => {
           transport.end();
         }
         await withTimeout(running, 12000, "M3 runner completion");
-        if (exhausted) {
+        if (exhausted && !late) {
           const parks = m2Runner.api.states.filter(s => s.body.recovery_cause === "worker_memory_pressure");
           assert.equal(parks.length, 1);
           assert.deepEqual(parks[0]!.body, { status: "recovery_wait", recovery_cause: "worker_memory_pressure",
@@ -990,6 +1083,9 @@ describe("M3 actual runner memory Codex delivery", () => {
           assert.equal(captured!.commands.remaining(captured!.context), 0);
         }
       } finally {
+        releaseCapture();
+        releaseCleanup();
+        releaseSibling();
         finishes.forEach(finish => finish());
         transport.end();
         try { await withTimeout(running, 12000, "M3 runner cleanup"); }
@@ -997,6 +1093,10 @@ describe("M3 actual runner memory Codex delivery", () => {
           clearTimeout(rescue);
           await f.memory.stop();
           await monitoring;
+          await duplicate;
+          await siblingWork;
+          await (captured?.flight as any)?.workerMemory?.operation;
+          await (captured?.flight as any)?.workerMemory?.executorRun;
         }
       }
     });

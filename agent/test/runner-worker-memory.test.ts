@@ -698,6 +698,63 @@ for (const primaryError of [new Error("exact owner failure"), undefined]) {
   });
 }
 
+for (const rejects of [false, true]) {
+  test(`non-memory executor observation preserves settlement and exact error rejected=${rejects}`, async () => {
+    const runner = runnerWith(() => ({ executor: { run: async () => assert.fail("unused executor") } }), fakeGitlab().gitlab);
+    const owner = runner as unknown as {
+      awaitExecutorWithMemoryDeadline(flight: unknown, execution: Promise<unknown>): Promise<unknown>;
+    };
+    const gate = releaseGate(), cancel = new AbortController();
+    const memory: { executorRun?: Promise<void> } = {};
+    const result = {}, primary = new Error("exact non-memory executor failure");
+    const execution = gate.promise.then(() => { if (rejects) throw primary; return result; });
+    const observing = owner.awaitExecutorWithMemoryDeadline({ cancel, workerMemory: memory }, execution);
+    let settled = false;
+    void observing.then(() => { settled = true; }, () => { settled = true; });
+    try {
+      cancel.abort(new Error("ordinary cancellation"));
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(settled, false, "non-memory cancellation cannot detach executor cleanup");
+      assert.equal(memory.executorRun, undefined, "no memory ownership is invented without a hold");
+      gate.resolve();
+      if (rejects) await assert.rejects(observing, error => error === primary);
+      else assert.equal(await observing, result);
+    } finally {
+      gate.resolve();
+      await observing.catch(() => {});
+    }
+  });
+}
+
+test("memory hold after an earlier pause abort still bounds the executor observer", async t => {
+  const runner = runnerWith(() => ({ executor: { run: async () => assert.fail("unused executor") } }), fakeGitlab().gitlab);
+  const owner = runner as any;
+  const execution = releaseGate(), cleanup = releaseGate();
+  const cancel = new AbortController();
+  const priorPause = new PauseNowSignal();
+  cancel.abort(priorPause);
+  const memory: any = { ended: false };
+  const flight = { cancel, workerMemory: memory };
+  t.mock.method(owner, "preserveWorkerMemory", async () => cleanup.promise);
+  let returned = false, failure: unknown;
+  const observation = owner.awaitExecutorWithMemoryDeadline(flight, execution.promise).catch((error: unknown) => {
+    returned = true; failure = error;
+  });
+  memory.hold = { deadline: Date.now() - 1 };
+  const operation = owner.startWorkerMemoryPreservation(flight);
+  try {
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(returned, true, "the original spent hold deadline stops observation despite an already-aborted signal");
+    assert.equal((failure as Error).constructor.name, "RetainedRecoveryStop");
+    assert.equal(cancel.signal.reason, priorPause);
+    assert.notEqual(memory.executorSettled, true, "the original executor remains owned");
+    assert.notEqual(memory.settled, true, "the original capture remains owned");
+  } finally {
+    execution.resolve(); cleanup.resolve();
+    await observation; await operation;
+  }
+});
+
 test("execution owner ordinary observation follows tail deletion", async () => {
   const claim = gitlabClaim(2396);
   const runner = runnerWith(() => ({ executor: { run: async () => {

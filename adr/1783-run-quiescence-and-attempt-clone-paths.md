@@ -384,12 +384,17 @@ authority. See [ADR-1597's residual boundaries](1597-midturn-checkpoint-durabili
   roots retain existing accounting, with no new decorated-environment exception.
 
   For pending Codex memory capture, the same `executionTails` promise is installed
-  synchronously before factory work and owns the original preservation operation
-  through capture callback completion and cleanup. The public observer can return
-  after its configured bounded wait while that tail still reserves the run. Only after actual settlement may identity-checked deletion release it;
+  synchronously before factory work and owns both the original preservation operation
+  and the original executor run, including its serialized finally. The runner's wait
+  is bounded only by that memory hold's original deadline; Codex cleanup stays owned
+  and unchanged. The public observer can return while that tail still reserves the
+  run. Terminal disposal cannot run beneath either pending operation. Only after
+  actual settlement may identity-checked deletion release it;
   an old owner cannot delete a queued successor's replacement tail. Same-run local
   duplicates and maintenance respect this ordinary execution reservation, with no
-  `inventoryReservations` exemption. An indefinitely pending callback or cleanup
+  `inventoryReservations` exemption. Unrelated runs keep their existing admission
+  behavior and separate executor registry, clone and HOME; the original run's
+  capture context and source reservation remain exclusive. An indefinitely pending callback or cleanup
   can retain the reservation indefinitely; capacity cost and occurrence rates are
   unknown. The original deadline still expires command authority. ACK uncertainty
   grants neither recapture nor success; original receipt, custody and late-ACK
@@ -405,7 +410,10 @@ authority. See [ADR-1597's residual boundaries](1597-midturn-checkpoint-durabili
   `unverifiedEpochRegistries`; no forced recreation or new in-run epoch passes that
   guard. The runner converts the error to `RetainedRecoveryStop` only when its safety
   facade matches the exact refused or unacknowledged owner-pause capture and newer
-  steering authority does not take precedence. This matching case stops nonterminally,
+  steering authority does not take precedence. A completed capture returning false
+  (including publication refusal or a rejected/lost pause ACK) records that same
+  facade identity; capture completion alone does not establish an acknowledged pause.
+  This matching case stops nonterminally,
   without reporting `failed`, and retains clone, session, journal and custody. The
   conversion is not a rule for every changed-milestone gate revision failure.
   Subsequent execution may recover through existing in-budget requeue or owner
