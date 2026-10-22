@@ -61,11 +61,19 @@ a pull/merge request:
    hold** — a `paused` run, but held for this structural reason rather than
    because you asked it to pause.
 
-A completion hold does not authorize publication. It preserves work for a
+An interlocked run that has already attempted completion can also enter a
+completion hold when its time limit is reached, including after Continue or
+when another worker picks it up. Earlier attempts with time still remaining
+do not by themselves stop work.
+
+A completion hold does not authorize finalization. It preserves work for a
 later decision. Normal capture verifies the Git work before parking. The
-pre-push guard also has a bounded degraded-capture path: after capture
-exhaustion it can hold with an empty captured head, retaining the clone and
-session without claiming a verified recovery copy. See
+pre-push guard and time-limit holds after a completion attempt also have a
+bounded degraded-capture path: after capture exhaustion they can hold with
+an empty captured head, retaining the clone and session without claiming a
+verified recovery copy. Uncertain hold delivery also retains local work.
+A proven server refusal still follows the existing cleanup rules; stopping
+that flight does not claim a confirmed hold or retry a model turn. See
 [Recovering unpublished work](run-recovery.md#completion-publication-holds).
 
 ## Requesting an owner decision
@@ -169,7 +177,12 @@ uzi run decide <id> --continue [--guidance "<text>"]
   your guidance to the run's next session as a follow-up.
 
 Guidance is optional: `uzi run decide <id> --continue` with no `--guidance`
-simply tells the run to carry on with the required work.
+simply tells the run to carry on with the required work. It grants no extra
+time: after a time-limit completion hold, Continue immediately re-holds
+unless you extend the budget first (`uzi run extend <id> --by 2h`). Time
+spent paused adds no working budget. Extension alone does not resume a
+completion hold; then choose a completion decision. An extension accepted
+while the worker is already stopping for time may still leave the run held.
 
 **Partial** — reduce scope by naming the exact milestone ids to keep, with a
 required reason:
@@ -208,6 +221,13 @@ does not require the old unmet list or infer a formal decision from prose.
 
 ## Mixed-version limits
 
+The #3282 time-limit fix is worker-only. APIs supporting wall parking already
+return completion-attempt counts in running acknowledgements and wall-park
+refusals; no API upgrade, migration or chart pin change is needed for this
+fix. Old workers retain the previous loop until the worker image is rolled
+out (`workers.image.tag` for hosted workers). This is separate from the
+permit-scope version requirements below.
+
 A new API includes `completion_scope` in each granted worker permit, derived
 from the same locked run revision that authorized the permit. It is `{}`
 when there is no scope decision. A new worker uses this permit scope for
@@ -227,9 +247,10 @@ intent has separate version requirements below.
 
 **Be aware that a completion hold's conversation continuity is not durable
 across workers.** Verified captures can recover Git work on another worker.
-A degraded pre-push hold retains local work without verifying a recovery copy, so losing
-that worker can lose the latest work. The run's provider session (the live
-conversation state a same-worker resume continues without re-planning) survives only as
+A degraded pre-push or post-attempt time-limit hold retains local work without
+verifying a recovery copy, so losing that worker can lose the latest work.
+The run's provider session (the live conversation state a same-worker resume
+continues without re-planning) survives only as
 long as the same worker that held it is still around to reclaim it, bounded
 by the same worker-affinity ceiling that already governs every other parked
 run (2 hours by default; see
