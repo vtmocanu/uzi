@@ -1,6 +1,7 @@
 # shellcheck shell=bash
 # state.sh — the shared state directory and the session identity for the uzi-lander
-# scripts. Sourced (never executed); defines state_dir, peers_json, self_identity, is_live.
+# scripts. Sourced (never executed); defines state_dir, atomic_mkdir, peers_json,
+# self_identity and is_live.
 #
 # STATE DIR: $UZI_LANDER_STATE_DIR, else <git common dir>/uzi-lander — the main checkout's
 # .git/, which every worktree of the repo shares, is never tracked, and needs no .gitignore
@@ -32,6 +33,12 @@ state_dir() {
   else d="/tmp/uzi-lander"; fi
   mkdir -p "$d/trail" "$d/claims" "$d/locks" 2>/dev/null || { echo "cannot create state dir $d" >&2; return 1; }
   printf '%s' "$d"
+}
+
+# A successful acquisition must mean this process created the directory. Some
+# CLI mkdir implementations swallow EEXIST after a concurrent creation.
+atomic_mkdir() {
+  python3 -I -c 'import os, sys; os.mkdir(sys.argv[1])' "$1"
 }
 
 # The registry, fetched at most once per process. Empty when peers.py is absent or fails.

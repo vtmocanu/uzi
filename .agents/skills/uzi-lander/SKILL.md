@@ -139,7 +139,8 @@ the `session-peers` skill (`buddy: @NAME`), or else a **local buddy**, a subagen
 | Small/mechanical non-Renovate PR | the buddy (the initial local reviewer) |
 | After a small local fix | the buddy's `APPROVE` of the fixed head, plus green CI; a fix too big for that goes to `uzi run rework` (step 4) |
 | CodeRabbit rate-limited | live reset ≤ 20 min: normally wait for CodeRabbit; switch earlier only for an ASAP merge or the user's request. Longer/unknown resets use Greptile for large or trust-boundary PRs (plus buddy review), the buddy alone for small PRs (step 3) |
-| Bot skipped or absent | the buddy |
+| CodeRabbit skipped over its file limit | Greptile (step 3) |
+| Bot skipped or absent otherwise | the buddy |
 | Skill or script maintenance (`[skip-cr]`) | the buddy; the lander and the buddy land it, no user review |
 | Rebase, merge of `main`, or renumber only | the buddy's `APPROVE` of the range-diff (for a merge, the conflict resolution) on the new head, plus green CI (`watch-pr.sh --reviewer none`, which still checks current-head CI and live findings); a prior review of the old head carries over only when the range-diff changes no reviewed semantics. This is the one exception to the exact-SHA review rules below |
 | Bot approved this head, no local fix since | none extra, except large or trust-boundary PRs: the buddy too, as a skim (a brief naming the diff range and the risky seams; a verdict pinned to the SHA). The bot does the full read |
@@ -308,8 +309,12 @@ locally in step 4. The advisory still prints until the window expires.
      “Already reviewed the last commit.” Decide whether the existing coverage plus a local
      review is sufficient for this risk class. If a bot review is still warranted, post
      `@coderabbitai full review` once and return to step 2; never auto-post it.
-   - **Skipped (exit 6, reason printed).** `>100 files` or a disabled base branch means
-     Greptile or local review. An ignored title keyword gets an explicit bot trigger only
+   - **File-limit refusal (status or command reply).** `N files exceed the limit of 100`,
+     including CodeRabbit's answer to `@coderabbitai full review`, means switch to Greptile: post
+     `@greptileai review`, then `--reviewer greptile --reviewer-grace 2`. A command reply need
+     not change the commit status, so do not wait for a particular watcher exit.
+   - **Other skipped status (exit 6, reason printed).** A disabled base branch means Greptile or
+     local review. An ignored title keyword gets an explicit bot trigger only
      when the PR was already classified large/high-risk; Renovate-class PRs still require
      the user's prior approval. Absent after the grace means local review, noted at merge.
 4. **Findings.** Gather: `S/pr-findings.sh OWNER/REPO PR [PR ...]` (both bots plus every

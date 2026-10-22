@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { GitCache, CheckpointSoftDeadlineError, type BoundaryProcessSpawner } from "../src/git.js";
-import { GitBoundaryAbortError } from "../src/checkpoint-stop.js";
+import { CheckpointUnsafeCleanupError, GitBoundaryAbortError } from "../src/checkpoint-stop.js";
 import { RunRunner } from "../src/runner.js";
 import { WorkerClient } from "../src/client.js";
 import { makeFixture } from "./fixture-repo.js";
@@ -732,3 +732,90 @@ it("m1 pending ownership remains refused after a stopped unknown-owner preservat
     assert.ok((await f.cache.enumerateOwedCandidates(f.bare, run)).some(c => c.sha === next));
   } finally { f.fx.cleanup(); }
 });
+
+it("3304 updated cleanup proves tracking first and ignores malformed unrelated inventory", async () => {
+  const f = await fixture();
+  try {
+    const incoming = f.commit("cleanup without inventory");
+    const internal = f.cache as unknown as {
+      hasOwedAnchorUnderLock(bare: string, run: string, sha: string): Promise<boolean>;
+    };
+    let inventoryReads = 0;
+    const anchor = internal.hasOwedAnchorUnderLock.bind(f.cache);
+    internal.hasOwedAnchorUnderLock = async (...args) => { inventoryReads++; return anchor(...args); };
+    fs.mkdirSync(path.join(f.bare, "uzi-owed"), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(f.bare, "uzi-owed", "context-" + "f".repeat(64) + ".json"),
+      JSON.stringify({ runId: "unrelated-run" }), { mode: 0o600 });
+    assert.equal((await f.fetch()).kind, "updated");
+    assert.equal(inventoryReads, 0);
+    assert.equal(git(f.bare, "for-each-ref", "--format=%(objectname)", "refs/uzi-incoming/"), "");
+    assert.equal(git(f.bare, "rev-parse", "refs/uzi-runner/" + branch), incoming);
+    await assert.rejects(f.cache.enumerateOwedCandidates(f.bare, run),
+      "the unrelated malformed context really would fail an inventory scan");
+  } finally { f.fx.cleanup(); }
+});
+
+it("3304 updated cleanup tracking mismatch falls back to owed anchor", async () => {
+  const f = await fixture();
+  try {
+    const incoming = f.commit("cleanup mismatch fallback");
+    const internal = f.cache as unknown as {
+      checkedTrackingSha(bare: string, branch: string): Promise<string | undefined>;
+      hasOwedAnchorUnderLock(bare: string, run: string, sha: string): Promise<boolean>;
+    };
+    const checked = internal.checkedTrackingSha.bind(f.cache), owed = internal.hasOwedAnchorUnderLock.bind(f.cache);
+    const events: string[] = [];
+    internal.checkedTrackingSha = async (...args) => {
+      const sha = await checked(...args);
+      if (sha === incoming && fs.existsSync(f.receipt) && JSON.parse(fs.readFileSync(f.receipt, "utf8")).phase === "committed") {
+        events.push("tracking"); return f.base;
+      }
+      return sha;
+    };
+    internal.hasOwedAnchorUnderLock = async (...args) => { events.push("owed"); return owed(...args); };
+    assert.equal((await f.fetch()).kind, "updated");
+    assert.deepEqual(events, ["tracking", "owed"]);
+    assert.equal(git(f.bare, "for-each-ref", "--format=%(objectname)", "refs/uzi-incoming/"), "");
+  } finally { f.fx.cleanup(); }
+});
+
+for (const boundary of ["soft", "hard", "unsafe"] as const) {
+  it(`3304 bridge synthesis propagates ${boundary} boundary failure`, async () => {
+    const f = await fixture();
+    try {
+      const failure = boundary === "soft" ? new CheckpointSoftDeadlineError()
+        : boundary === "hard" ? new GitBoundaryAbortError("hard synthesis")
+        : new CheckpointUnsafeCleanupError("unsafe synthesis");
+      // Ancestry is the public Git seam used by synthesis and by ordinary callers.
+      f.cache.ancestry = async () => { throw failure; };
+      await assert.rejects(f.cache.bridgeToFloors(f.bare, f.base, [f.commit("floor")]), error => error === failure);
+    } finally { f.fx.cleanup(); }
+  });
+}
+
+for (const boundary of ["soft", "hard", "unsafe", "ordinary"] as const) {
+  it(`3304 remediation ancestry catch preserves ${boundary} failure semantics`, async () => {
+    const f = await fixture();
+    let observed = false;
+    try {
+      const failure = boundary === "soft" ? new CheckpointSoftDeadlineError()
+        : boundary === "hard" ? new GitBoundaryAbortError("hard remediation")
+        : boundary === "unsafe" ? new CheckpointUnsafeCleanupError("unsafe remediation")
+        : new Error("ordinary ancestry unavailable");
+      let calls = 0;
+      f.cache.ancestry = async () => { calls++; throw failure; };
+      const runner = new RunRunner(new WorkerClient("http://unused", "test", "test", nullLogger()), f.cache,
+        () => ({ executor: { run: async () => ({ branch }) } }), nullLogger(), 1);
+      const subject = runner as unknown as {
+        checkpointRemediationHold(flight: unknown, bare: string, candidate: string, reap: boolean): Promise<boolean>;
+      };
+      const flight = { secretRemediation: { attempts: 0, flaggedCommits: [f.base] } };
+      const hold = () => subject.checkpointRemediationHold(flight, f.bare, f.commit("remediation candidate"), true);
+      if (boundary === "ordinary") assert.equal(await hold(), true, "ordinary read errors retain the publication hold");
+      else await assert.rejects(hold(), error => error === failure);
+      assert.equal(calls, 1, "remediation ancestry catch was exercised");
+      observed = true;
+    } finally { f.fx.cleanup(); }
+    assert.equal(observed, true);
+  });
+}
