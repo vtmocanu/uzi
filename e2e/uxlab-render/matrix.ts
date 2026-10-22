@@ -1,0 +1,234 @@
+// M3: real production provisioning/command seams. The host wrapper removes
+// networking only after setup; it never supplies a replacement command PATH.
+import assert from "node:assert/strict";
+import { execFile, spawnSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { promisify } from "node:util";
+import { pathToFileURL } from "node:url";
+import { inventory, verifyPNGs } from "./tree.js";
+import { boundaryProbe, homeSnapshot } from "./probes.js";
+import { readRegularFile, sourceId, HELPER_MAX_BYTES } from "./inputs.js";
+
+const exec = promisify(execFile);
+const load = (name: string) => import(pathToFileURL(path.join("/app/src", name)).href);
+const start = performance.now();
+const record = (kind: string, data: Record<string, unknown>) =>
+  console.log(JSON.stringify({ kind, elapsedMs: Math.round(performance.now() - start), ...data }));
+const labRelative = "api/cmd/uzi/uxlab";
+const sha = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+
+async function main() {
+  assert(process.env.UZI_UID_SPLIT === "1" && process.getuid?.() === 10001,
+    "real entrypoint uid split is required (harness absence is not base-red)");
+  process.umask(0o002);
+  const cell = process.env.UXLAB_RENDER_CELL;
+  const mode = process.env.UXLAB_RENDER_MODE;
+  assert(cell === "base" || cell === "candidate" || cell === "local");
+  assert(mode === "off" || mode === "required");
+  const provision = await load("provision-run.js");
+  const codex = await load("codex/codex-executor.js");
+  const launcher = await load("codex/launcher.js");
+  const registry = await load("codex/registry.js");
+  const runner = await load("runner-uid.js");
+  const { createLogger } = await load("log.js");
+  const warnings: string[] = [];
+  const log = createLogger("info");
+  const warn = log.warn.bind(log);
+  log.warn = (message: string, fields?: Record<string, unknown>) => { warnings.push(message); warn(message, fields); };
+  const runAsRunner = async (command: string, args: string[], timeout = 30_000, cwd = "/app") => {
+    const wrapped = runner.runnerCommand(command, args);
+    return exec(wrapped.command, wrapped.args, { cwd,
+      env: { PATH: runner.runnerPath(process.env), HOME: "/data/agent-home",
+        TMPDIR: runner.runnerTmpdir(process.env) },
+      timeout, maxBuffer: 4 * 1024 * 1024 });
+  };
+  assert.equal((await runAsRunner("/usr/bin/id", ["-u"])).stdout.trim(), "10002");
+  const helpers: Record<string, string> = {};
+  for (const name of ["uzi-codex-supervisor", "uzi-codex-fileop", "uzi-codex-command-sandbox"])
+    helpers[name] = sha(await readRegularFile(`/usr/local/bin/${name}`, HELPER_MAX_BYTES));
+  record("identity", { cell, mode, imageId: process.env.UXLAB_RENDER_IMAGE_ID,
+    sourceSha256: await sourceId("/app/src"), helpers, node: process.version,
+    goPolicy: "GOTOOLCHAIN=local, >= go1.27.3; optional readonly /opt/uzi-toolchain distro" });
+  if (mode === "required") {
+    const probe = spawnSync("/usr/local/bin/uzi-codex-command-sandbox", ["--probe"],
+      { encoding: "utf8", timeout: 10_000, maxBuffer: 1024 * 1024 });
+    assert.ifError(probe.error);
+    assert.equal(probe.status, 0, "required Landlock unavailable");
+  }
+  const runId = randomUUID(), checkout = `/data/runner/uxlab-${runId}`;
+  const lab = path.join(checkout, labRelative);
+  const copyStarted = performance.now();
+  record("copy-output", { ...(await runAsRunner("/usr/local/bin/node",
+    ["--import", "tsx", "/work/uxlab-render/copy.ts", "/work/repository", checkout,
+      ...(cell === "base" ? ["/work/candidate-build.sh"] : [])], 120_000)) });
+  const copyMs = Math.round(performance.now() - copyStarted);
+  record("copy", { durationMs: copyMs, timeoutMs: 120_000 });
+  assert.equal((await fs.stat(checkout)).uid, 10002);
+  await runAsRunner("git", ["init", "-q", checkout]);
+  if (cell === "base") {
+    // copy.ts adds ONLY candidate build.sh, as runner; base manifests stay intact.
+    record("build-overlay", { sha256: sha(await readRegularFile(path.join(lab, "build.sh"), 1024 * 1024)) });
+    assert.equal((await fs.stat(path.join(lab, "build.sh"))).uid, 10002);
+  }
+  const manifestIds = {};
+  for (const relative of ["devbox.json", `${labRelative}/devbox.json`]) {
+    Object.assign(manifestIds, { [relative]: sha(await readRegularFile(path.join(checkout, relative), 1024 * 1024)) });
+  }
+  if (cell === "base") {
+    assert.equal((manifestIds as Record<string, string>)["devbox.json"], "d3b4242b28ce03f6fafa548aff5edc8c67ce28d5c0b708f259676f78a578e33b", "frozen 3fb1fdbf root manifest differs");
+    assert.equal((manifestIds as Record<string, string>)[`${labRelative}/devbox.json`], "c3fdf4d3e91ce9fe73acde30b51e2042e827c3f33dbf5485407579952be1182c", "frozen nested manifest differs");
+  }
+  record("checkout", { checkout, copyMs, manifests: manifestIds });
+  const { extractRepoDevboxPackages } = await load("repo-tools.js");
+  const packages: string[] = await extractRepoDevboxPackages(checkout);
+  assert(packages.includes("ruby@4.0.6"), "expected root Ruby package");
+  assert.equal(packages.includes("charm-freeze@0.2.2"), cell !== "base", "root freeze policy differs");
+  const events: string[] = [];
+  const provisionStarted = performance.now();
+  const result = await provision.provisionRunTools({
+    runId, worktreePath: checkout, config: { tool_packages: [], repo_devbox_opt_in: true },
+    emit: (message: { payload: Record<string, unknown> }) => {
+      events.push(String(message.payload.text));
+      record("provision-event", { text: message.payload.text });
+    },
+  }, { provisionRoot: "/data/provision", homeDir: "/data/agent-home", log });
+  record("provision", { cell, mode, durationMs: Math.round(performance.now() - provisionStarted), ...result });
+  assert.equal(warnings.length, 0, "provisioning warning/degradation");
+  const expectedEvents = [`merged ${packages.length} package(s) from this repo\'s devbox.json`,
+    `provisioning ${packages.length} tool(s): ${packages.join(", ")}`, "tools provisioned"];
+  assert.equal(events.length, expectedEvents.length, "provisioning degraded or emitted unexpected events");
+  for (let i = 0; i < events.length; i++) assert(events[i] === expectedEvents[i], `provision event ${i} differs; see event receipt`);
+  assert.equal(result.provisionDir, `/data/provision/${runId}`);
+  assert(result.toolEnv.PATH?.includes(`/data/provision/${runId}/.devbox`));
+  const commandEnv = codex.withCommandGitTrust(codex.buildCommandEnv("/tmp", result.toolEnv),
+    await codex.canonicalCheckoutPath(checkout));
+  const roots = new registry.ExecutionRegistry(registry.newLocalExecutionEpoch(1));
+  const holder = await launcher.startCommandCacheHolder(randomUUID());
+  const cache = new codex.HeldRunCommandCache(holder);
+  cache.watchRegistry(roots);
+  const spawn = codex.makeDefaultSpawnCommand(roots, launcher.launchCodexEffectRoot,
+    5000, checkout, commandEnv, mode, log, cache, 900_000);
+  const homes = new Set<string>();
+  async function command(label: string, script: string, cwd = checkout,
+    commandSpawn = spawn, commandRoots = roots, commandMode = mode) {
+    const begun = performance.now();
+    const output = await commandSpawn(["/bin/bash", "-ceu", [
+      'test "$(id -u)" = 10003',
+      'test "$HOME" = "$TMPDIR"',
+      'test "$(stat -c %u "$HOME")" = 10003',
+      'test "$(stat -c %a "$HOME")" = 700',
+      'entries="$(ls -A "$HOME")"; test -z "$entries"',
+      'printf "COMMAND_HOME=%s\\n" "$HOME"',
+      'printf "COMMAND_HOME_OWNER=%s COMMAND_HOME_MODE=%s COMMAND_HOME_EMPTY=yes\\n" "$(stat -c %u "$HOME")" "$(stat -c %a "$HOME")"',
+      script,
+    ].join("\n")], { cwd });
+    record("command", { label, mode: commandMode, durationMs: Math.round(performance.now() - begun), ...output });
+    const home = /^COMMAND_HOME=(.+)$/m.exec(output.stdout)?.[1];
+    assert(home?.startsWith("/tmp/uzi-codex-command-"), "missing fresh command HOME receipt");
+    assert(!homes.has(home), "command HOME reused");
+    homes.add(home);
+    assert.equal(commandRoots.hasLiveCommandRoot(), false, "command root not drained");
+    return output;
+  }
+  const goPolicy = 'export GOTOOLCHAIN=local GOFLAGS=-buildvcs=false\ncommand -v go\ngo version';
+  try {
+    const setupStarted = performance.now();
+    const setup = await command("network-enabled-go-prewarm", `${goPolicy}
+go mod download
+go test ./cmd/uzi/ -run '^$' -count=1`, path.join(checkout, "api"));
+    assert.equal(setup.code, 0, "Go setup failed; never count harness/toolchain failure as base-red");
+    const version = /go version go(\d+)\.(\d+)\.(\d+)/.exec(setup.stdout);
+    assert(version && (Number(version[1]) > 1 || Number(version[1]) === 1 &&
+      (Number(version[2]) > 27 || Number(version[2]) === 27 && Number(version[3]) >= 3)), "Go >= 1.27.3 required");
+    record("setup", { durationMs: Math.round(performance.now() - setupStarted), cache: cache.current() });
+    if (cell === "local") {
+      // Separate runner-owned nested Devbox store leg; never a model command.
+      await runAsRunner("/bin/rm", ["-rf", "--", path.join(lab, "frames"), path.join(lab, "png")]);
+      const positive = await runAsRunner("/bin/bash", ["-ceu",
+        `${goPolicy}\ndevbox run build`], 900_000, lab);
+      record("local-devbox", positive);
+      assert(positive.stdout.includes(version[0]), "local Devbox leg must use exactly the command setup Go version");
+      record("artifacts", { pngs: await verifyPNGs(lab) });
+      await runAsRunner("/bin/bash", ["-ceu", "mkdir proof; cp -a png proof/local"], 30_000, lab);
+      await fs.writeFile("/data/uxlab-artifacts", path.join(lab, "proof"));
+      record("result", { status: "PASS", cell, mode });
+      return;
+    }
+    const sentinel = `/nix/uxlab-sentinel-${runId}`;
+    await runAsRunner("/usr/local/bin/node", ["-e",
+      'process.umask(0); require("node:fs").writeFileSync(process.argv[1], "", { flag: "wx", mode: 0o666 });', sentinel]);
+    try {
+      // Calibration uses exactly the same path/flags, off-mode command identity.
+      const calibrationRoots = new registry.ExecutionRegistry(registry.newLocalExecutionEpoch(2));
+      const calibrationSpawn = codex.makeDefaultSpawnCommand(calibrationRoots, launcher.launchCodexEffectRoot,
+        5000, checkout, commandEnv, "off", log, cache, 30_000);
+      cache.watchRegistry(calibrationRoots);
+      const calibration = await command("sentinel-calibration",
+        "/usr/local/bin/node -e " + quote(boundaryProbe) + " " + quote(sentinel) + " off",
+        checkout, calibrationSpawn, calibrationRoots, "off");
+      assert.equal(calibration.code, 0, "sentinel must be writable by cmd without Landlock");
+      const boundary = await command("nix-boundary", "/usr/local/bin/node -e " + quote(boundaryProbe) + " " + quote(sentinel) + " " + mode);
+      assert.equal(boundary.code, 0, "Nix open/sentinel boundary failed");
+    } finally { await runAsRunner("/bin/rm", ["--", sentinel]); }
+    const negative = await command("command-devbox-negative", "devbox run build", lab);
+    assert(negative.code !== 0 && negative.code !== null, "command Devbox unexpectedly succeeded");
+    assert(/big-lock[^\n]*(?:Permission denied|permission denied)|(?:Permission denied|permission denied)[^\n]*big-lock/.test(negative.stdout + negative.stderr),
+      "negative must specifically report Nix big-lock permission denial");
+    // Host only disconnects this exact owned container after this marker.
+    await fs.writeFile("/data/uxlab-network-ready", "ready");
+    const waitStarted = performance.now();
+    while (!(await fs.stat("/data/uxlab-offline").then(() => true, () => false))) {
+      assert(performance.now() - waitStarted < 120_000, "host offline handoff timed out");
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    const offline = 'export GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local GOFLAGS=-buildvcs=false\n';
+    if (cell === "base") {
+      await runAsRunner("/bin/bash", ["-ceu",
+        'rm -rf frames png; mkdir frames png; printf "seed frame" > frames/seed-dark.ansi; printf "seed png" > png/seed-dark.png'], 30_000, lab);
+      const before = await inventory(lab);
+      const red = await command("offline-base-build", offline + "./build.sh", lab);
+      assert(red.code !== 0 && red.code !== null, "base must reject missing freeze");
+      assert.match(red.stderr, /uxlab: freeze is missing\./);
+      assert(!/frames written|rendered \d+ PNG/.test(red.stdout), "base generated output before preflight");
+      const after = await inventory(lab);
+      const keys = Object.keys(before).filter((name) => name.startsWith("frames/") || name.startsWith("png/"));
+      const afterKeys = Object.keys(after).filter((name) => name.startsWith("frames/") || name.startsWith("png/"));
+      assert.equal(keys.length, afterKeys.length, "seed inventory count changed");
+      for (let i = 0; i < keys.length; i++) assert(keys[i] === afterKeys[i], `seed inventory first mismatch at index ${i}`);
+      for (const key of keys) assert(JSON.stringify(before[key]) === JSON.stringify(after[key]), `seed bytes/mtime changed: ${key}`);
+      record("base-red", { seeds: keys.map((name) => ({ name, ...after[name] })) });
+    } else {
+      const freeze = await command("freeze-version", "command -v freeze; freeze --version");
+      assert.equal(freeze.code, 0);
+      assert.match(freeze.stdout, /\b0\.2\.2\b/);
+      await runAsRunner("/bin/rm", ["-rf", "--", path.join(lab, "frames"), path.join(lab, "png")]);
+      const green = await command("offline-full-build", offline + "./build.sh", lab);
+      assert.equal(green.code, 0, "full real generation/render failed");
+      record("artifacts", { phase: "full-build", pngs: await verifyPNGs(lab) });
+      await runAsRunner("/bin/bash", ["-ceu", "mkdir proof; cp -a png proof/full-build"], 30_000, lab);
+      await fs.writeFile("/data/uxlab-artifacts", path.join(lab, "proof"));
+      await runAsRunner("/bin/rm", ["-rf", "--", path.join(lab, "png")]);
+      const render = await command("offline-render-no-home-writes", offline +
+        "/usr/local/bin/node -e " + quote(homeSnapshot) + ' > .uxlab-home-before\n./render.sh\n' +
+        "/usr/local/bin/node -e " + quote(homeSnapshot) + ' > .uxlab-home-after\ncmp .uxlab-home-before .uxlab-home-after\nrm .uxlab-home-before .uxlab-home-after', lab);
+      assert.equal(render.code, 0, "offline render wrote HOME or failed");
+      record("artifacts", { phase: "offline-render", pngs: await verifyPNGs(lab) });
+      await runAsRunner("/bin/cp", ["-a", path.join(lab, "png"), path.join(lab, "proof", "offline-render")]);
+    }
+    for (const [relative, expected] of Object.entries(manifestIds))
+      assert.equal(sha(await readRegularFile(path.join(checkout, relative), 1024 * 1024)), expected, `manifest mutated: ${relative}`);
+    record("result", { status: "PASS", cell, mode, commands: homes.size });
+  } finally {
+    assert(cache.drained(), "cache roots did not drain");
+    await cache.settle(log, (token: string, timeoutMs: number) => launcher.removeCommandCache(token, { timeoutMs }),
+      { releaseMs: 10_000, removeMs: 10_000 });
+    const settled = await holder.release(cache.drained(), 10_000);
+    record("cache-settled", settled);
+    assert(settled.state === "removed" || settled.state === "absent", "cache cleanup must be complete, not pending");
+    assert.equal(warnings.length, 0, "cache/provision warning");
+  }
+}
+function quote(value: string) { return "'" + value.replaceAll("'", "'\\''") + "'"; }
+main().catch((error) => { record("result", { status: "FAIL", error: String(error), stack: error?.stack }); process.exitCode = 1; });

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Opt-in M1 production provisioning canary. No provider/model credential is used.
+# Opt-in production provisioning/render proof. No provider/model credential is used.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
@@ -7,7 +7,11 @@ cd "$repo"
 scratch=.uzi/scratch
 image="${UXLAB_RENDER_IMAGE:-ghcr.io/vtmocanu/uzi/agent-base:0.86.0-rc.18}"
 action="${1:-canary}"
-case "$action" in canary|build) ;; *) echo "usage: $0 {canary|build}" >&2; exit 2 ;; esac
+case "$action" in
+  matrix|local) exec bash "$here/matrix-run.sh" "$action" ;;
+  canary|build|cell) ;;
+  *) echo "usage: $0 {canary|matrix|local|build}" >&2; exit 2 ;;
+esac
 mkdir -p "$scratch"
 log="$(mktemp "$scratch/uxlab-render.XXXXXX")"
 name="uxlab-render-$(date +%s)-$$"
@@ -22,11 +26,23 @@ bind_ro() {
   [ -e "$source" ] || { echo "ERROR: missing bind source: $source" >&2; exit 2; }
   mount_args+=(--mount "type=bind,source=$source,target=$target,readonly")
 }
-if [ "$action" = canary ]; then
+if [ "$action" != build ]; then
   bind_ro "$here" /work/uxlab-render
   manifest="${UXLAB_RENDER_MANIFEST:-$repo/devbox.json}"
   [ -f "$manifest" ] || { echo "ERROR: root manifest must be a regular file" >&2; exit 2; }
   bind_ro "$manifest" /work/root-devbox.json
+  if [ "$action" = cell ]; then
+    case "${UXLAB_RENDER_CELL:-}/${UXLAB_RENDER_MODE:-}" in base/off|base/required|candidate/off|candidate/required|local/off) ;; *) echo "ERROR: invalid matrix cell" >&2; exit 2 ;; esac
+    [ -d "${UXLAB_RENDER_REPO_DIR:-}" ] || { echo "ERROR: exported full repository required" >&2; exit 2; }
+    bind_ro "$UXLAB_RENDER_REPO_DIR" /work/repository
+    if [ "$UXLAB_RENDER_CELL" = base ]; then
+      bind_ro "${UXLAB_RENDER_CANDIDATE_DIR:?}/api/cmd/uzi/uxlab/build.sh" /work/candidate-build.sh
+    fi
+    if [ -n "${UXLAB_RENDER_GO_DIR:-}" ]; then
+      [ -x "$UXLAB_RENDER_GO_DIR/bin/go" ] && [ -d "$UXLAB_RENDER_GO_DIR/src" ] || { echo "ERROR: Go distro needs bin/go and src" >&2; exit 2; }
+      bind_ro "$UXLAB_RENDER_GO_DIR" /opt/uzi-toolchain
+    fi
+  fi
   # A regular exported source directory is accepted; no Git metadata is needed.
   source_dir="${UXLAB_RENDER_SRC_DIR:-$repo/agent/src}"
   [ -d "$source_dir" ] || { echo "ERROR: source must be an exported agent/src directory" >&2; exit 2; }
@@ -41,6 +57,7 @@ if [ "$action" = canary ]; then
 fi
 if ! command -v docker >/dev/null 2>&1 || ! timeout 10s docker info >/dev/null 2>&1; then
   echo "SKIP: Docker CLI or daemon unavailable; LOG=$log"
+  if [ "$action" = cell ]; then exit 1; fi
   exit 77
 fi
 if [ "$action" = build ]; then
@@ -57,6 +74,7 @@ if [ "$action" = build ]; then
 fi
 if ! image_id="$(timeout 10s docker image inspect "$image" --format '{{.Id}}')"; then
   echo "SKIP: image absent: $image; LOG=$log"
+  if [ "$action" = cell ]; then exit 1; fi
   exit 77
 fi
 timeout 10s docker image inspect "$image_id" \
@@ -128,6 +146,9 @@ timeout 10s docker volume create --label "uxlab-render.owner=$owner" "$volume" >
 existing="$(timeout 10s docker ps -a --filter "name=^/${name}$" --format '{{.Names}}')"
 [ -z "$existing" ] || { echo "ERROR: container name collision" >&2; exit 2; }
 container_created=1
+fixture=fixture.ts
+if [ "$action" = cell ]; then fixture=matrix.ts; fi
+creation_started=$SECONDS
 timeout --kill-after=10s "${UXLAB_RENDER_CREATE_TIMEOUT:-600}" docker create --name "$name" --label "uxlab-render.owner=$owner" \
   --network "${UXLAB_RENDER_NETWORK:-bridge}" --user 0:0 \
   --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETPCAP --cap-add SETUID --cap-add SETGID \
@@ -135,7 +156,50 @@ timeout --kill-after=10s "${UXLAB_RENDER_CREATE_TIMEOUT:-600}" docker create --n
   --mount "type=volume,source=$volume,target=/nix" \
   --entrypoint /usr/local/sbin/uzi-entrypoint \
   "${mount_args[@]}" -e "UXLAB_RENDER_IMAGE_ID=$image_id" \
-  "$image_id" /bin/sh -c 'cd /app && exec /usr/local/bin/node --import tsx /work/uxlab-render/fixture.ts' >> "$log"
+  -e "UXLAB_RENDER_CELL=${UXLAB_RENDER_CELL:-}" -e "UXLAB_RENDER_MODE=${UXLAB_RENDER_MODE:-}" \
+  "$image_id" /bin/sh -c 'cd /app && exec /usr/local/bin/node --import tsx "$1"' sh "/work/uxlab-render/$fixture" >> "$log"
+echo "CREATION_SECONDS=$((SECONDS - creation_started))" >> "$log"
+if [ "$action" = cell ]; then
+  timeout 30s docker start "$name" >> "$log"
+  handed_off=0
+  cell_started=$SECONDS
+  while [ "$(timeout 10s docker inspect "$name" --format '{{.State.Running}}')" = true ]; do
+    if [ "$handed_off" = 0 ] && [ "$UXLAB_RENDER_CELL" != local ] &&
+      timeout 10s docker exec --user 10001:10002 "$name" test -f /data/uxlab-network-ready; then
+      # No host-network mode: disconnect is the proof boundary, not GOPROXY alone.
+      timeout 30s docker network disconnect "${UXLAB_RENDER_NETWORK:-bridge}" "$name" >> "$log" 2>&1
+      test "$(timeout 10s docker inspect "$name" --format '{{len .NetworkSettings.Networks}}')" = 0
+      timeout 10s docker exec --user 10001:10002 "$name" touch /data/uxlab-offline
+      echo "NETWORK=disconnected" >> "$log"
+      handed_off=1
+    fi
+    if [ "$((SECONDS - cell_started))" -ge "${UXLAB_RENDER_TIMEOUT:-3600}" ]; then
+      echo "ERROR: cell wall deadline" >> "$log"; exit 1
+    fi
+    sleep 1
+  done
+  timeout 30s docker logs "$name" 2>&1 | head -c 8388608 >> "$log"
+  [ "$(wc -c < "$log")" -lt 8388608 ] || { echo "ERROR: output cap" >> "$log"; exit 1; }
+  rc="$(timeout 10s docker inspect "$name" --format '{{.State.ExitCode}}')"
+  artifact_available=0
+  if { [ "$UXLAB_RENDER_CELL" = candidate ] || [ "$UXLAB_RENDER_CELL" = local ]; } &&
+    timeout 10s docker cp "$name:/data/uxlab-artifacts" - > /dev/null 2>&1; then
+    # Read the fixed receipt then copy only this owned container's verified PNG dir.
+    artifact_receipt="$(mktemp "$scratch/uxlab-artifact-path.XXXXXX")"
+    timeout 30s docker cp "$name:/data/uxlab-artifacts" "$artifact_receipt"
+    [ "$(wc -c < "$artifact_receipt")" -lt 256 ] || exit 1
+    artifact_path="$(cat "$artifact_receipt")"
+    [[ "$artifact_path" =~ ^/data/runner/uxlab-[a-f0-9-]+/api/cmd/uzi/uxlab/proof$ ]] || exit 1
+    artifacts="$(mktemp -d "$scratch/uxlab-png-${UXLAB_RENDER_CELL}-${UXLAB_RENDER_MODE}.XXXXXX")"
+    timeout --kill-after=5s 120s docker cp "$name:$artifact_path/." "$artifacts"
+    echo "PNG_EXPORT=$repo/$artifacts" >> "$log"
+    artifact_available=1
+  fi
+  if [ "$rc" = 0 ] && [ "$UXLAB_RENDER_CELL" != base ] && [ "$artifact_available" = 0 ]; then
+    echo "ERROR: successful cell missing required PNG export" >> "$log"; exit 1
+  fi
+  exit "$rc"
+fi
 rc=0
 # Foreground timeout bounds the whole fixture; production install retries remain
 # bounded by provision.ts. head caps combined output; reaching the cap is failure.

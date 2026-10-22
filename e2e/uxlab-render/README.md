@@ -1,4 +1,141 @@
-# M1 production provisioning canary
+# Production provisioning and uxlab rendering fixtures
+
+## M3 matrix (lead-owned expensive proof)
+
+The implementation has focused local checks only. Docker, the four real-image
+cells and the separate runner Devbox leg have **not** been run for M3.
+**All M3 live proof remains UNPERFORMED:** matrix cells, timing comparison,
+offline renders, Nix controls, local Devbox build and PNG visual inspection.
+No production runtime, environment builder, permission or sandbox code changes.
+
+Prepare regular full repository exports under this worktree's scratch directory.
+The base is frozen at `3fb1fdbf`; the candidate below is M2 at `cb2cc627`.
+Use the actual final candidate ref when it changes. Exporting only agent/src is
+insufficient for M3: real Go generation needs the full repository.
+
+```bash
+set -euo pipefail
+mkdir -p .uzi/scratch
+base_export="$(mktemp -d .uzi/scratch/uxlab-base.XXXXXX)"
+candidate_export="$(mktemp -d .uzi/scratch/uxlab-candidate.XXXXXX)"
+git archive 3fb1fdbf | tar -x -C "$base_export"
+git archive cb2cc627 | tar -x -C "$candidate_export"
+export UXLAB_RENDER_BASE_DIR="$PWD/$base_export"
+export UXLAB_RENDER_CANDIDATE_DIR="$PWD/$candidate_export"
+# Optional: a real compatible Go distribution, mounted read-only at the
+# production /opt/uzi-toolchain handle. No command PATH override is applied.
+export UXLAB_RENDER_GO_DIR="$PWD/.uzi/scratch/go-prereq/mod/golang.org/toolchain@v0.0.1-go1.27.3.linux-amd64"
+bash e2e/uxlab-render/run.sh matrix
+bash e2e/uxlab-render/run.sh local
+```
+
+The lead must first supply an image/toolchain with Go >= 1.27.3, matching
+`api/go.mod`'s patched toolchain. Every setup command uses
+`GOTOOLCHAIN=local`, prints its actual Go path/version and fails if too old.
+The current worker Go 1.26.8 cannot provide this proof (#3305).
+The optional full distribution mount covers the existing /opt/uzi-toolchain
+directory. Both boundary and HOME probes use standalone inline JavaScript via
+absolute /usr/local/bin/node, which remains outside that mount; no Python is
+needed by these probes. Diagnose compiler/font/image availability before running.
+The fixture never appends resolved Nix store binaries to command PATH.
+All four cells use one resolved image ID, one mounted production source/helper
+set and the same optional toolchain policy.
+
+`matrix` runs base/off, base/required, candidate/off, candidate/required
+sequentially. Each cell has a fresh named /nix volume with normal image copy-up
+and fresh /data tmpfs, real image entrypoint and worker/runner/command uid split.
+Full exported sources and fixture/helper inputs are read-only mounts.
+A bounded copy creates the disposable checkout as runner uid 10002, with a
+120-second timeout and a separate copy-duration receipt. Only the
+candidate `build.sh` is added to the base checkout; frozen base root and nested
+manifest hashes are checked, and both manifests must stay byte-identical.
+There are no writable host binds.
+
+Each root provisions with empty tier 1, repository opt-in and the default real
+installer through `provisionRunTools`. Exact provisioning events and absence
+of warnings reject fallback. Provision duration is measured around that call
+alone; copy, container creation and Go setup durations are separate receipts.
+The before/after comparison is the base and candidate provision receipt for
+each mode; timings remain unmeasured until the lead runs them.
+
+Commands use `buildCommandEnv`, `withCommandGitTrust` and
+`makeDefaultSpawnCommand`, with a real `HeldRunCommandCache` created by
+`startCommandCacheHolder`. Each command checks its fresh empty 0700
+HOME/TMPDIR and uid 10003. Setup downloads Go modules and compiles the real
+CLI test package through that same command seam while networking is available.
+The host then disconnects this exact owned container from its Docker network,
+verifies zero attached networks and releases the offline handoff. Render
+commands additionally disable Go proxy/sumdb/toolchain downloads. Use a
+disconnectable bridge/custom Docker network; host/none/container modes are
+rejected. `UXLAB_RENDER_TIMEOUT` defaults to 3600 seconds per matrix cell;
+each command has a 900-second wall limit. Setup failure or missing Docker/
+image/uid split is a harness failure, never a successful base-red result.
+
+Base cells seed frame/PNG bytes, run the full candidate build entrypoint and
+require its named missing-freeze error before generation. Frame inventory,
+SHA256 bytes and nanosecond mtimes must remain identical. Candidate cells
+require freeze 0.2.2, delete outputs and execute the real `./build.sh`:
+full Go generation plus real freeze rendering. Every generated ANSI needs its
+light/dark peer and exactly one PNG with PNG signature, IHDR dimensions and a
+strictly newer nanosecond mtime. A second render runs without network and
+compares bounded HOME snapshots before/after freeze; production cache paths
+are outside HOME and are not followed. HOME enumeration uses opendir iteration,
+counts before collecting names, and caps at 8192 entries, depth 64, 4 MiB per
+file and 16 MiB total (plus one overflow-detection byte). Snapshots retain uid/gid/mode, inode/device,
+size, nanosecond mtime, file hashes and symlink text without following links.
+No synthetic ANSI success substitutes for real generation.
+
+Both modes require command-side `devbox run build` to fail specifically on
+the Nix big-lock permission denial. Bounded standalone Node probes report
+uid/gid/mode and try only O_RDWR opens on the existing database and big-lock,
+close descriptors and fail if either
+open succeeds. They do not create, truncate, lock or write real Nix files.
+Runner creates only its own disposable /nix sentinel, mode 0666; an off-mode
+command first calibrates an actual one-byte write using the exact same sentinel
+path/O_RDWR flags. Required mode must deny that open, preventing writes.
+Unexpected real-file or required-mode sentinel opens are immediately closed and
+fail without writing. Only the disposable sentinel receives a calibration write.
+Runner removes only that sentinel; existing Nix ownership/grants stay unchanged.
+
+`local` is a separate fresh runner-owned store leg: after the same command
+Go prewarm it runs actual nested-manifest `devbox run build` as runner,
+requiring the same Go version and verifying the full PNG set. It retains network
+for the real nested Devbox install; it is not the offline command proof.
+
+Verified candidate PNGs are copied inside the container into a proof directory
+after full build and again after offline rendering. Before exact-name cleanup,
+the host uses `docker cp` from its own container into this worktree's
+`.uzi/scratch/uxlab-png-*` and prints `PNG_EXPORT=`. A later command assertion
+failure still exports an already verified full-build set. Inspect these PNGs
+before recording visual acceptance. Local PNGs are exported the same way.
+Logs print per-file hashes, dimensions, mtimes, command output, identities,
+cache settlement and verified cleanup. All cells must finish and all receipts
+must be reviewed by the lead before claiming M3 live proof.
+
+Copy/artifact traversal is serial and stops at the first failure: at most
+32768 entries, depth 64, 16 MiB per file and 256 MiB total. Internal relative
+symlinks are copied without following them; absolute/escaping links and links
+into omitted .git/.uzi/node_modules are rejected. These directories are omitted
+at every level. Artifact frames additionally cap at 2048 with strict flat
+light/dark names. Special files are rejected by the regular-file reader.
+The source exports must be stable for the invocation.
+
+Focused local checks (no Docker, dependency installation or repository gate):
+
+```sh
+bash -n e2e/uxlab-render/run.sh e2e/uxlab-render/matrix-run.sh
+for file in e2e/uxlab-render/*.ts; do node --check "$file"; done
+shellcheck -S warning e2e/uxlab-render/run.sh e2e/uxlab-render/matrix-run.sh
+cd agent
+node --import tsx --test --test-timeout=120000 ../e2e/uxlab-render/inputs.test.ts ../e2e/uxlab-render/tree.test.ts ../e2e/uxlab-render/probes.test.ts
+```
+
+Focused receipt (2026-10-22): 17 tests passed, including all eight original M1
+input tests, six copy/inventory/PNG tests and three standalone Node probe tests.
+Node 24.20.0 syntax, Bash syntax and ShellCheck 0.11.0 at warning severity passed.
+These checks do not establish M3 live proof.
+
+## M1 production provisioning canary
 
 Run from the worktree root:
 
@@ -8,11 +145,11 @@ bash e2e/uxlab-render/run.sh canary
 
 This opt-in fixture uses the real root entrypoint, worker 10001, runner 10002,
 and production command identity 10003. It provisions a checkout-root
-`devbox.json` copied byte-for-byte from the base root manifest (currently only
-`ruby@4.0.6`), with repository opt-in enabled and
+`devbox.json` copied byte-for-byte from the selected root manifest (current
+candidate: Ruby 4.0.6 and freeze 0.2.2), with repository opt-in enabled and
 empty tier 1. There are no install, shellenv, or PATH-probe stubs. Warnings or
 fallback to empty tier 1 fail. Two commands in each of `off` and `required`
-assert the provisioned Ruby path and version, uid, and fresh empty private
+assert the provisioned Ruby path/version, freeze version when declared, uid, and fresh empty private
 HOME/TMPDIR with mode 0700. Required Landlock absence fails.
 
 Docker needs network access to the real devbox/Nix download endpoints. The
@@ -68,8 +205,16 @@ times, filesystem free-space observations, cleanup verification, and final exit 
 is capped at 8 MiB; reaching the cap fails. Cleanup attempts each owned object
 once, with bounded commands, and verifies exact-name absence. Docker/image or
 uid-split absence exits 77 (unperformed, never PASS); cleanup failure turns a
-pass/skip into exit 3. Other failures are nonzero. No full render matrix or
-runtime modifications are included in M1.
+pass/skip into exit 3. Other failures are nonzero. M1 remains separate from the M3 matrix above; neither changes production runtime code.
+To reproduce the historical Ruby-only canary, first create the full base export
+above and run:
+
+```sh
+UXLAB_RENDER_MANIFEST="$UXLAB_RENDER_BASE_DIR/devbox.json" bash e2e/uxlab-render/run.sh canary
+```
+
+The manifest option is still accepted; the canary derives its exact expected
+package events from the selected manifest rather than assuming one package.
 
 ## M1 validation receipt — 2026-10-22
 

@@ -94,9 +94,12 @@ async function main(): Promise<void> {
     provisionRoot: "/data/provision", homeDir: "/data/agent-home", log,
   });
   record("provision", { durationMs: Math.round(performance.now() - provisionStarted), ...result });
+  const { extractRepoDevboxPackages } = await load("repo-tools.js");
+  const packages: string[] = await extractRepoDevboxPackages(checkout);
+  assert(packages.includes("ruby@4.0.6"), "canary requires the real root Ruby package");
   const expectedEvents = [
-    "merged 1 package(s) from this repo's devbox.json",
-    "provisioning 1 tool(s): ruby@4.0.6",
+    `merged ${packages.length} package(s) from this repo's devbox.json`,
+    `provisioning ${packages.length} tool(s): ${packages.join(", ")}`,
     "tools provisioned",
   ];
   assert.equal(events.length, expectedEvents.length, "unexpected provisioning event count");
@@ -130,6 +133,7 @@ async function main(): Promise<void> {
         'test "$(stat -c %a "$TMPDIR")" = 700',
         'printf "UID=%s\\nHOME=%s\\nTMPDIR=%s\\nHOME_MODE=%s\\nTMPDIR_MODE=%s\\n" "$(id -u)" "$HOME" "$TMPDIR" "$(stat -c %a "$HOME")" "$(stat -c %a "$TMPDIR")"',
         "command -v ruby && ruby --version",
+        ...(packages.includes("charm-freeze@0.2.2") ? ["command -v freeze && freeze --version"] : []),
         'touch "$HOME/uxlab-marker"',
       ].join("\n")], { cwd: checkout });
       record("canary", { mode, invocation, durationMs: Math.round(performance.now() - commandStarted), ...output });
@@ -147,6 +151,7 @@ async function main(): Promise<void> {
       assert(ruby?.startsWith(`/data/provision/${runId}/.devbox/`) && ruby.endsWith("/ruby"),
         "command -v must resolve Ruby through this run's provisioned devbox");
       assert.match(output.stdout, /^ruby 4\.0\.6(?:\s|$)/m);
+      if (packages.includes("charm-freeze@0.2.2")) assert.match(output.stdout, /\b0\.2\.2\b/);
       assert.equal(roots.hasLiveCommandRoot(), false);
     }
   }
