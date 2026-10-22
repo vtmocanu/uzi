@@ -207,6 +207,24 @@ The full scan covered 995.63 MB in 6m21s, including scratch; neither isolated
 scan overhead nor a hosted CI comparison was measured. Provisioning, Go setup
 and manual render attempts are separate costs.
 
+## Unpublished history correction
+
+The pre-publication scanner flagged README prose in an unpublished commit.
+A fixup was autosquashed into its introducing commit, now `237547db`, without
+rewriting the published base `3fb1fdbf`. At rewritten HEAD `41a468a7`, the tree
+differed from pre-rewrite `fc9757ae` only in that README paragraph; code and
+tests were identical. The previous code revision `687d7df1` corresponds to
+rewritten `2c4cbfed`. Earlier receipt hashes identify execution revisions,
+not a fresh run after the history rewrite.
+
+A default-rules history scan of the entire unpublished range through `41a468a7`
+passed with no findings across 28 commits, with allow directives ignored
+(`.uzi/scratch/gate-log.x9rEuy`). The explicit configuration extended only the
+built-in defaults and used an empty ignore directory. Repeated parity and
+hermetic build checks passed (`.uzi/scratch/gate-log.XGtXiu`). The unchanged
+code retains its earlier full-gate evidence; no full gate rerun is claimed.
+This documentation correction does not complete M3.
+
 ## Historical receipts (prior scratch logs lost)
 
 These receipts predate recovery and do not verify `ab970306`.
