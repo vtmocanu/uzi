@@ -2,20 +2,23 @@
 
 ## M3 matrix (lead-owned expensive proof)
 
-M3 is **incomplete**. A real base/off attempt reached provisioning and Go
-setup, then failed the required Nix database write-access check. No rendering
-acceptance is claimed. The other matrix cells and PNG inspection remain
-unperformed. A separate local build attempt failed on the fixture tmpfs
-execution setting. After that correction, the local retry hit its one-hour
-cell deadline without artifact receipts; detailed child output was not retained
-on that timeout path. Local rendering and final acceptance remain incomplete. See [EVIDENCE.md](EVIDENCE.md)
-for the tested revisions, safe-open failure and required scope decision.
+M3 is **INCOMPLETE**. The matrix at `ab970306` completed with exit 1 and verified
+cleanup of all four containers and volumes. The enforced base preflight red passed;
+no completed candidate PNG set or visual acceptance is recorded. The repaired
+off base preflight also passed; a repaired required build generated 260 frames
+but reached its deadline with 63 PNG paths. Native Nix fails version detection
+on denied /proc reads, so the lock-specific control is unmet. A formal owner
+decision is needed; see the evidence for failed and unfinished criteria. An observed off-mode boundary failure
+remains unaccepted. The off-mode database observation has a guidance correction,
+not a formal criterion change or scope waiver. See [EVIDENCE.md](EVIDENCE.md)
+for current observations, historical receipts and pending proof.
 No production runtime, environment builder, permission or sandbox code changes.
 
 Prepare regular full repository exports under this worktree's scratch directory.
-The base is frozen at `3fb1fdbf`; the candidate below is M2 at `cb2cc627`.
-Use the actual final candidate ref when it changes. Exporting only agent/src is
-insufficient for M3: real Go generation needs the full repository.
+The base is frozen at `3fb1fdbf`; resolve the actual candidate HEAD below.
+An export includes committed files; record its full revision before running.
+Exporting only agent/src is insufficient for M3: real Go generation needs the
+full repository.
 
 ```bash
 set -euo pipefail
@@ -25,12 +28,15 @@ candidate_export="$(mktemp -d .uzi/scratch/uxlab-candidate.XXXXXX)"
 # mktemp creates 0700; the container runner needs traversal of export roots.
 chmod 755 "$base_export" "$candidate_export"
 git archive 3fb1fdbf | tar -x -C "$base_export"
-git archive cb2cc627 | tar -x -C "$candidate_export"
+candidate_ref="$(git rev-parse HEAD)"
+printf 'CANDIDATE_REF=%s\n' "$candidate_ref"
+git archive "$candidate_ref" | tar -x -C "$candidate_export"
 export UXLAB_RENDER_BASE_DIR="$PWD/$base_export"
 export UXLAB_RENDER_CANDIDATE_DIR="$PWD/$candidate_export"
 # Optional: a real compatible Go distribution, mounted read-only at
 # /usr/local/lib/uxlab-go; fixture #3305 wrapper repoints /opt/uzi-toolchain.
-# No command PATH override is applied.
+# No command PATH override is applied. Downloaded distributions may need
+# executable bits on bin/ and pkg/tool/ binaries and readable/traversable mount dirs.
 export UXLAB_RENDER_GO_DIR="$PWD/.uzi/scratch/go-prereq/mod/golang.org/toolchain@v0.0.1-go1.27.3.linux-amd64"
 bash e2e/uxlab-render/run.sh matrix
 bash e2e/uxlab-render/run.sh local
@@ -42,8 +48,9 @@ The lead must first supply an image/toolchain with Go >= 1.27.3, matching
 The current worker Go 1.26.8 cannot provide this proof (#3305).
 The explicit #3305 fixture workaround mounts the optional full distribution
 read-only at /usr/local/lib/uxlab-go. A trusted root preparation wrapper requires
-/opt/uzi-toolchain to be an existing symlink, replaces only that symlink to point
-to /usr/local/lib/uxlab-go, then execs the actual unchanged
+/opt/uzi-toolchain to be an existing symlink. It creates a fixture-owned profile
+view retaining the image tools and font data, overrides only go/gofmt with links
+to the supplied distribution, repoints the stable handle, then execs the actual unchanged
 /usr/local/sbin/uzi-entrypoint with the same arguments and capabilities. This
 avoids placing the readonly bind inside /nix, where entrypoint recursive chown
 would encounter it. There are no production code, environment, PATH or grant
@@ -55,8 +62,9 @@ All four cells use one resolved image ID, one mounted production source/helper
 set and the same optional toolchain policy.
 
 `matrix` runs base/off, base/required, candidate/off, candidate/required
-sequentially. Each cell has a fresh named /nix volume with normal image copy-up
-and fresh /data tmpfs with rw,exec,nosuid,nodev, real image entrypoint and
+sequentially, continuing through all four cells and retaining an aggregate
+nonzero status if a cell fails. Each cell has a fresh named /nix volume with
+normal image copy-up and fresh /data tmpfs with rw,exec,nosuid,nodev, real image entrypoint and
 worker/runner/command uid split. Executable /data is needed for worktree and
 generated Devbox scripts; the production compose path uses an ordinary
 agentdata volume (`docker-compose.yml`). Default Docker tmpfs denied even a
@@ -74,21 +82,30 @@ Each root provisions with empty tier 1, repository opt-in and the default real
 installer through `provisionRunTools`. Exact provisioning events and absence
 of warnings reject fallback. Provision duration is measured around that call
 alone; copy, container creation and Go setup durations are separate receipts.
-The before/after comparison is the base and candidate provision receipt for
-each mode; timings remain unmeasured until the lead runs them.
+The before/after comparison needs base and candidate provision receipts for
+each mode; isolated historical samples do not complete that comparison.
 
 Commands use `buildCommandEnv`, `withCommandGitTrust` and
 `makeDefaultSpawnCommand`, with a real `HeldRunCommandCache` created by
 `startCommandCacheHolder`. Each command checks its fresh empty 0700
 HOME/TMPDIR and uid 10003. Setup downloads Go modules and compiles the real
 CLI test package through that same command seam while networking is available.
+This prewarm populates the uid-10003 command cache, not the separate local
+runner's cache.
 The host then disconnects this exact owned container from its Docker network,
 verifies zero attached networks and releases the offline handoff. Render
 commands additionally disable Go proxy/sumdb/toolchain downloads. Use a
 disconnectable bridge/custom Docker network; host/none/container modes are
 rejected. `UXLAB_RENDER_TIMEOUT` defaults to 3600 seconds per matrix cell;
-each command has a 900-second wall limit. Setup failure or missing Docker/
-image/uid split is a harness failure, never a successful base-red result.
+build/setup commands have a 900-second wall limit. Nix-version diagnostics have
+15 seconds; the Devbox negative control has 60 seconds and byte-caps captured
+output at 1 MiB. A control timeout remains a failed criterion while independent
+build checks continue. Build failures record bounded output plus frame/PNG counts. Runner helpers use detached spawn,
+retain at most 4 MiB of bytes each for stdout and stderr, and invoke production
+`killRunnerGroupOnly` on their known group at exit or deadline (also on overflow
+or launch error). This helper does not depend on GNU timeout inside the image;
+the host shell wrapper still uses timeout for Docker operations.
+Setup failure or missing Docker/image/uid split is a harness failure, never a successful base-red result.
 
 Base cells seed frame/PNG bytes, run the full candidate build entrypoint and
 require its named missing-freeze error before generation. Frame inventory,
@@ -104,26 +121,35 @@ file and 16 MiB total (plus one overflow-detection byte). Snapshots retain uid/g
 size, nanosecond mtime, file hashes and symlink text without following links.
 No synthetic ANSI success substitutes for real generation.
 
-Both modes require command-side `devbox run build` to fail specifically on
-the Nix big-lock permission denial. Bounded standalone Node probes report
-uid/gid/mode and try only O_RDWR opens on the existing database and big-lock,
-close descriptors and fail if either
-open succeeds. They do not create, truncate, lock or write real Nix files.
-Runner creates only its own disposable /nix sentinel, mode 0666; an off-mode
-command first calibrates an actual one-byte write using the exact same sentinel
-path/O_RDWR flags. Required mode must deny that open, preventing writes.
-Unexpected real-file or required-mode sentinel opens are immediately closed and
-fail without writing. Only the disposable sentinel receives a calibration write.
-Runner removes only that sentinel; existing Nix ownership/grants stay unchanged.
+The command-side `devbox run build` criterion requires a nonzero exit with a
+Nix big-lock permission denial in each mode. Boundary probes report uid/gid/mode
+and attempt O_RDWR opens of the existing database and big-lock. In off mode,
+an observed database open is closed immediately and recorded; this guidance
+correction does not approve a formal criterion change. Big-lock remains strict
+in off mode, where a successful open has been observed and fails the check.
+Required mode requires denial for both real files. These probes do not create,
+truncate, lock or write real Nix files.
+Runner creates its own disposable /nix sentinel, mode 0666. Calibration uses a
+sentinel-only off-mode probe with the same path/O_RDWR flags and a one-byte
+write, separate from the real-file probes. Required mode must deny the sentinel
+open. Unexpected big-lock or required-mode opens are closed immediately and
+fail without writing. The disposable sentinel alone receives a calibration write.
+Runner removes that sentinel; existing Nix ownership/grants stay unchanged.
+Boundary/command-Devbox criterion failures are retained while the cell proceeds
+to its rendering checks; they still make the cell fail.
 
-`local` is a separate fresh runner-owned store leg: after the same command
-Go prewarm it runs actual nested-manifest `devbox run build` as runner,
-requiring the same Go version and verifying the full PNG set. It retains network
+`local` is a separate fresh runner-owned store leg: after uid-10003 command
+Go prewarm it runs actual nested-manifest `devbox run build` as runner, using
+a separate runner cache, requiring the same Go version and verifying the full
+PNG set. It retains network
 for the real nested Devbox install; it is not the offline command proof.
 
 Verified candidate PNGs are copied inside the container into a proof directory
-after full build and again after offline rendering. Only a successful cell
-(exit 0) attempts host export, before exact-name container cleanup.
+after full build and again after offline rendering. Host export runs before
+exact-name container cleanup on cell success, or for a candidate with the explicit
+`rendering-complete` marker despite a separate boundary failure. That export
+retains the nonzero cell status and does not establish matrix or visual acceptance.
+Local export requires cell success; base cells do not export PNGs.
 The host pipes `docker cp container:path -` into fixture-only `export.py`.
 The receipt tar permits only one regular uxlab-artifacts file, at most 255 ASCII
 bytes matching the fixed proof path pattern; its entire stream is capped at
@@ -166,7 +192,10 @@ remain stable and readonly throughout validation/copy: canonical checks are
 not a defense against concurrent source mutation.
 Display JSON receipts escape bidi controls U+061C, U+200E/U+200F, U+202A–U+202E
 and U+2066–U+2069 as literal backslash-u digits. Raw output and predicates retain
-their original bytes.
+their original bytes. Terminal `report_log` output prefixes each row with
+`FIXTURE_LOG=` and ASCII JSON-quotes at most 2048 source characters, adding a
+truncation marker when needed. The genuine `FIXTURE_EXIT=` is emitted separately;
+raw logs remain unchanged.
 
 Focused local checks (no Docker, dependency installation or repository gate):
 
@@ -179,20 +208,21 @@ cd agent
 node --import tsx --test --test-timeout=120000 ../e2e/uxlab-render/inputs.test.ts ../e2e/uxlab-render/tree.test.ts ../e2e/uxlab-render/probes.test.ts ../e2e/uxlab-render/display.test.ts
 ```
 
-Focused receipt (2026-10-22): 17 tests passed, including all eight original M1
-input tests, six copy/inventory/PNG tests and three standalone Node probe tests.
+Historical focused receipt (2026-10-22; prior scratch logs lost): 17 tests
+passed, including all eight original M1 input tests, six copy/inventory/PNG tests and three standalone Node probe tests.
 Node 24.20.0 syntax, Bash syntax and ShellCheck 0.11.0 at warning severity passed.
 These checks do not establish M3 live proof.
 
-Mandatory-fix focused receipt (2026-10-22): 20 TypeScript tests and 18 Python
-export tests passed, including bounded reads, receipt size before payload reads,
+Historical mandatory-fix focused receipt (2026-10-22; prior scratch logs lost):
+20 TypeScript tests and 18 Python export tests passed, including bounded reads, receipt size before payload reads,
 PAX/framing rejection, exact export sets/hashes and partial-directory cleanup on
 decoder or producer failure. Restoring the original tree checks and unescaped
 formatter in a disposable scratch export produced the three expected regression
 failures. No Docker, scanner, repository gate or dependency installation ran.
-The #3305 wrapper and actual Docker tar compatibility still require a real-image
-matrix/local run by the lead; synthetic USTAR/PAX streams exercise the decoder
-locally but do not establish live acceptance.
+The #3305 workaround has reached real-image Go prewarm; full matrix/local
+rendering and actual Docker artifact tar compatibility remain unverified.
+Synthetic USTAR/PAX streams exercise the decoder locally but do not establish
+live acceptance.
 
 ## M1 production provisioning canary
 
@@ -277,8 +307,9 @@ package events from the selected manifest rather than assuming one package.
 
 ## M1 validation receipt — 2026-10-22
 
-Historical receipt for the fixture before the bounded-input repair. Fresh
-post-repair proof is recorded below.
+Historical receipt for the fixture before the bounded-input repair. Historical
+post-repair proof is recorded below. Earlier scratch logs were lost on recovery;
+these tracked M1 receipts do not verify the current M3 candidate.
 
 Executed `bash e2e/uxlab-render/run.sh canary` against base root manifest
 SHA256 `d3b4242b28ce03f6fafa548aff5edc8c67ce28d5c0b708f259676f78a578e33b`.
