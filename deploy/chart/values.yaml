@@ -527,9 +527,12 @@ workers:
   # --- the drain policy (PRD #422 M5) ---------------------------------------------
   #
   # Busy spec-hash/generation drift (image pin, template or size) waits indefinitely
-  # for genuine idle (#3103), including run-bound workers outside pacing. Only an
-  # admitted paced worker is cordoned; waiting peers keep claiming. An admitted busy
-  # drainer consumes a slot without replacement coverage, canary proof or post-promotion proof.
+  # for genuine idle (#3103), including run-bound workers outside pacing. Ordinary
+  # paced workers are cordoned only when admitted; eligible uncordoned waiting peers
+  # keep claiming, except for separate covered custody-held migration drains (#3307).
+  # Migration drains grant no replacement admission or template patch (ADR-3153 D7).
+  # An admitted busy drainer consumes a slot without replacement coverage, canary
+  # proof or post-promotion proof.
   #
   # drainDeadline: busy deferral for independent NONDRIFTED pressure/nix-size
   #   maintenance only; it may interrupt runs and delete /data unless custody-held.
@@ -550,7 +553,8 @@ workers:
   # tags do not identify the +g<commit> stamp. Release packaging fills this empty
   # default from signature-verified pinned image configs (#2906); tracked values
   # stay empty. Per-cluster overrides win: custom pins/source charts need a matching
-  # verified target. Missing mapping holds rolls before cordoning.
+  # verified target. Missing mapping holds ordinary admission cordoning; a separate
+  # custody-held migration drain grants no replacement authority.
   # Example: "0.86.0-rc.9+g37e46a3". Never use the independently advancing API version.
   rollTargetVersion: ""
 

@@ -114,7 +114,7 @@ supports an old provider and drain confirmation, not replacement promotion.
    image-roll drain. A migration drain is separate from replacement admission
    and still must not patch the held template.
 3. Submit eligible real runs after the configured deadline has elapsed and record
-   that retained workers actually claim and execute them. An online flag or an
+   that eligible uncordoned retained workers actually claim and execute them. An online flag or an
    unmodified Deployment alone is not sufficient evidence. Record run IDs,
    claiming worker IDs and times without logs/source. The bad canary must not
    cause admission of siblings even when a drain deadline would have expired.
@@ -133,8 +133,8 @@ across overlapping pools. An admitted old incarnation must not count as future
 replacement capacity before its writes complete.
 
 After promoting a healthy canary, make a later admitted replacement fail. Record
-that this unresolved participant holds further admissions and healthy retained
-old workers continue claiming. A successful canary is not immunity to later
+that this unresolved participant holds further admissions and eligible uncordoned
+retained old workers continue claiming. A successful canary is not immunity to later
 failure. Confirm release clears only roll-owned drains on healthy old or proven
 healthy current workers, preserving independent pressure, maintenance and
 custody fences. Confirm there is no automatic rollback.
