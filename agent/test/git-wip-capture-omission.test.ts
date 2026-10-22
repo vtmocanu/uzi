@@ -365,3 +365,51 @@ describe("commitWipMarker omissions (issue #3239)", () => {
     assert.equal(f.calls[0]!.omittedTotal, 105);
   });
 });
+
+describe("undoWipMarkerOnBranch (issue #3239)", () => {
+  async function withMarker(t: test.TestContext) {
+    const f = await fixture(t);
+    const parent = f.head();
+    await f.write("wip.txt", "dirty\n");
+    let marker = "";
+    assert.equal(await f.git.commitWipMarker(f.root, { mode: "exclude", onCommitted: (m) => { marker = m; } }), true);
+    assert.equal(marker, f.head(), "onCommitted reported the commit the capture wrote");
+    return { f, parent, marker };
+  }
+
+  test("(a) CAS succeeds: branch at parent, index == parent tree, worktree file kept uncommitted", async (t) => {
+    const { f, parent, marker } = await withMarker(t);
+    assert.equal(await f.git.undoWipMarkerOnBranch(f.root, "main", marker), true);
+    assert.equal(f.g("rev-parse", "refs/heads/main"), parent);
+    assert.equal(f.g("diff", "--cached", "--name-only"), "", "index equals the parent tree");
+    assert.equal(await f.exists("wip.txt"), 6);
+    assert.match(f.g("status", "--porcelain"), /\?\? wip\.txt/);
+  });
+
+  test("(b) branch moved past the marker: refused, branch untouched", async (t) => {
+    const { f, marker } = await withMarker(t);
+    f.g("commit", "-q", "--allow-empty", "-m", "later");
+    const tip = f.head();
+    assert.equal(await f.git.undoWipMarkerOnBranch(f.root, "main", marker), false);
+    assert.equal(f.g("rev-parse", "refs/heads/main"), tip);
+  });
+
+  test("(c) HEAD switched to B at the marker: only the named branch is rewound, HEAD stays on B", async (t) => {
+    const { f, parent, marker } = await withMarker(t);
+    f.g("branch", "B", marker);
+    f.g("symbolic-ref", "HEAD", "refs/heads/B");
+    assert.equal(await f.git.undoWipMarkerOnBranch(f.root, "main", marker), true);
+    assert.equal(f.g("rev-parse", "refs/heads/main"), parent);
+    assert.equal(f.g("rev-parse", "refs/heads/B"), marker, "B untouched");
+    assert.equal(f.g("symbolic-ref", "HEAD"), "refs/heads/B");
+    assert.equal(f.g("diff", "--cached", "--name-only"), "", "index not reset (still B's tree)");
+  });
+
+  test("(d) a commit that is not a wip(park) marker is refused", async (t) => {
+    const f = await fixture(t);
+    f.g("commit", "-q", "--allow-empty", "-m", "plain");
+    const tip = f.head();
+    assert.equal(await f.git.undoWipMarkerOnBranch(f.root, "main", tip), false);
+    assert.equal(f.head(), tip);
+  });
+});

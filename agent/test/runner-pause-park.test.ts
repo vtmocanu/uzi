@@ -1080,11 +1080,12 @@ describe("RunRunner — M2 explicit park callback", () => {
 
 // issue #3239 — a pause park whose WIP marker could not be vetted (the rollback was refused) must
 // fetch and publish nothing, report pause_failed and keep the clone. A core file slips past the scan
-// so the backstop refuses its rollback. The marker is then undone (back to the uncommitted tree) only
-// when HEAD still names the run branch; when the agent switched HEAD to another branch B at the
-// marker, nothing is rewound (neither B nor the run branch).
+// so the backstop refuses its rollback. The park then undoes the exact marker the capture wrote with a
+// compare-and-swap on the named run branch only: a branch still at the marker is rewound even when
+// the agent switched HEAD to another branch B (B and HEAD are untouched); a branch that moved past the
+// marker is left alone.
 describe("RunRunner — pause park with an unvetted WIP marker (issue #3239)", () => {
-  for (const scenario of ["head-on-run-branch", "head-on-other-branch"] as const) {
+  for (const scenario of ["branch-moved", "head-on-other-branch"] as const) {
     it(`reports pause_failed and publishes nothing (${scenario})`, async () => {
       const { gitlab } = fakeGitlab();
       const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-3239-pause-"));
@@ -1104,7 +1105,7 @@ describe("RunRunner — pause park with an unvetted WIP marker (issue #3239)", (
             }
           },
           beforeRollbackWrite: async (p, marker) => {
-            if (!state.armed || scenario !== "head-on-run-branch") return;
+            if (!state.armed || scenario !== "branch-moved") return;
             // Swap the run branch to a sibling marker after the final recheck: the compare-and-swap is
             // refused while HEAD still names the run branch, at a wip(park) tip.
             const sibling = rd(p, "commit-tree", `${marker}^{tree}`, "-p", `${marker}^`, "-m", "wip(park): sibling marker");
@@ -1149,16 +1150,15 @@ describe("RunRunner — pause park with an unvetted WIP marker (issue #3239)", (
         assert.ok(!statuses.includes("paused"), "the run did not park");
         assert.deepEqual(calls, [], "nothing was published");
         assert.notEqual(seen.tracked, state.marker, "the marker was not fetched back");
-        if (scenario === "head-on-run-branch") {
+        if (scenario === "branch-moved") {
           assert.equal(seen.head, `refs/heads/${state.branch}`);
-          assert.ok(!seen.runSubject!.startsWith("wip(park)"), `the run branch tip is not a marker, got ${seen.runSubject}`);
+          assert.ok(seen.runSubject!.startsWith("wip(park)"), "the moved branch (a sibling marker) was not rewound");
           assert.notEqual(seen.runTip, state.marker);
-          assert.match(seen.status!, /WIP\.txt/, "the work is on disk, uncommitted");
         } else {
-          assert.equal(seen.head, "refs/heads/B");
+          assert.equal(seen.head, "refs/heads/B", "HEAD stays on B");
           assert.equal(seen.bTip, state.marker, "B was not rewound");
-          assert.equal(seen.runTip, state.marker, "the run branch was not touched");
-          assert.ok(seen.subject!.startsWith("wip(park)"), "no undo ran");
+          assert.ok(!seen.runSubject!.startsWith("wip(park)"), `the run branch was rewound off the marker, got ${seen.runSubject}`);
+          assert.notEqual(seen.runTip, state.marker);
         }
       } finally {
         restore();

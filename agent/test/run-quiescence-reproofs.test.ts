@@ -189,11 +189,11 @@ describe("issue #1783: the pause park re-proves after its wip marker", () => {
     const pub = spyPublish();
     const fetch = spyFetchBack(q.lastBlocked);
     let undos = 0;
-    const origUndo = git.undoWipMarker.bind(git);
-    git.undoWipMarker = (async (...a: Parameters<typeof git.undoWipMarker>) => {
+    const origUndo = git.undoWipMarkerOnBranch.bind(git);
+    git.undoWipMarkerOnBranch = (async (...a: Parameters<typeof git.undoWipMarkerOnBranch>) => {
       undos += 1;
       return origUndo(...a);
-    }) as typeof git.undoWipMarker;
+    }) as typeof git.undoWipMarkerOnBranch;
     const parked: Array<boolean | undefined> = [];
     const after: { head?: string; status?: string; fetches?: number; publishes?: number; tracking?: string | null } = {};
     let trackingBefore: string | null | undefined;

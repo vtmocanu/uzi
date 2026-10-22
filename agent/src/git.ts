@@ -782,11 +782,17 @@ const WIP_REPORT_MAX_OMISSIONS = 100;
 /** A file the WIP auto-save refused to capture (issue #3239). `bytes` is set when sized. */
 interface WipOmission { path: string; reason: "core_file" | "oversized" | "unsized"; bytes?: number }
 /** What {@link GitCache.commitWipMarker} reports through `onIncomplete` (issue #3239). */
-export interface WipIncompleteInfo { omitted: WipOmission[]; omittedTotal: number; markerCreated: boolean; rollbackRefused: boolean }
+export interface WipIncompleteInfo {
+  omitted: WipOmission[]; omittedTotal: number; markerCreated: boolean; rollbackRefused: boolean;
+  /** The commit the capture wrote, when one was written and read back; the pause park undoes exactly it. */
+  marker?: string;
+}
 interface WipMarkerOptions {
   /** "refuse" (default): any omission means no marker. "exclude": commit everything else. */
   mode?: "refuse" | "exclude";
   onIncomplete?: (info: WipIncompleteInfo) => void;
+  /** Called with the vetted marker oid just before `commitWipMarker` returns true. */
+  onCommitted?: (marker: string) => void;
 }
 /** Largest total of blob bytes, old and new side, a checkpoint scan accepts. */
 const CHECKPOINT_SCAN_MAX_TOTAL_BYTES = 128 * 1024 * 1024;
@@ -11340,7 +11346,9 @@ try {
     // Every object read in the capture family ignores refs/replace, so an agent-planted
     // `git replace <big> <small>` cannot make the backstop see a different blob.
     const git = (args: string[]) => this.runGitAsRunner(clonePath, args, NO_REPLACE);
+    let wroteMarker: string | undefined;
     const report = (all: WipOmission[], markerCreated: boolean, rollbackRefused: boolean): void => {
+      const marker = wroteMarker;
       const omitted = all.slice(0, WIP_REPORT_MAX_OMISSIONS);
       this.log.warn("WIP park auto-save left files out", {
         cwd: clonePath,
@@ -11350,7 +11358,7 @@ try {
         omittedTotal: all.length,
         omitted: omitted.map((o) => ({ path: o.path, reason: o.reason, bytes: o.bytes })),
       });
-      try { opts.onIncomplete?.({ omitted, omittedTotal: all.length, markerCreated, rollbackRefused }); }
+      try { opts.onIncomplete?.({ omitted, omittedTotal: all.length, markerCreated, rollbackRefused, marker }); }
       catch (err) { this.log.warn("WIP onIncomplete callback threw (ignored)", { cwd: clonePath, error: gitErrorMessage(err) }); }
     };
     let omitted: WipOmission[] = [];
@@ -11404,6 +11412,7 @@ try {
       // and no blob over the cap, whatever happened to the worktree after the omission scan. The
       // marker is the commit the capture wrote to preRef, not whatever HEAD names now.
       const marker = await tipOf();
+      wroteMarker = marker;
       await this.wipCaptureSeam?.beforeBackstop?.(clonePath, marker);
       const markerParent = (await git(["rev-parse", "--verify", `${marker}^`])).trim();
       const subject = await git(["log", "-1", "--format=%s", marker]);
@@ -11417,6 +11426,7 @@ try {
         // gets no publish of a commit nobody vetted.
         if ((await tipOf()) !== marker) { report(omitted, false, true); return false; }
         if (omitted.length > 0) report(omitted, true, false);
+        try { opts.onCommitted?.(marker); } catch { /* observer only */ }
         return true;
       }
       const all = [...omitted, ...extra.filter((e) => !omitted.some((o) => o.path === e.path))];
@@ -11593,6 +11603,40 @@ try {
   }
 
   /**
+   * issue #3239 — undo the exact `marker` commit on `branch`: a compare-and-swap of
+   * `refs/heads/<branch>` from `marker` to its parent. Only that branch ref can move, only while it
+   * still is exactly `marker`; HEAD is never written, so a HEAD switch or a new commit between the
+   * caller's decision and this write cannot make it rewind another ref or commit. `marker` must be
+   * a one-parent commit whose subject starts with WIP_PARK_COMMIT_PREFIX. The mixed-reset index is
+   * restored (`read-tree <parent>`) only when the CAS succeeded and HEAD still names the branch; the
+   * worktree is never touched, so the captured content stays on disk as uncommitted changes. Any
+   * failure answers false with nothing else written.
+   */
+  async undoWipMarkerOnBranch(clonePath: string, branch: string, marker: string): Promise<boolean> {
+    const git = (args: string[]) => this.runGitAsRunner(clonePath, args, NO_REPLACE);
+    const ref = `refs/heads/${branch}`;
+    try {
+      if (!/^[0-9a-f]{40,64}$/.test(marker)) return false;
+      const subject = await git(["log", "-1", "--format=%s", marker]);
+      if (!subject.startsWith(WIP_PARK_COMMIT_PREFIX)) return false;
+      const parents = (await git(["rev-list", "--parents", "-n", "1", marker])).trim().split(/\s+/);
+      const parent = parents[1];
+      if (parents.length !== 2 || parents[0] !== marker || !parent) return false;
+      await git(["update-ref", "--no-deref", "-m", "uzi: pause wip undo", ref, parent, marker]);
+      try {
+        if ((await this.wipSymbolicHead(clonePath)) === ref) await git(["read-tree", parent]);
+        else this.log.warn("WIP park marker undone on the branch; HEAD moved, index left", { cwd: clonePath, branch });
+      } catch (err) {
+        this.log.warn("WIP park marker undone on the branch; index restore failed", { cwd: clonePath, error: gitErrorMessage(err) });
+      }
+      return true;
+    } catch (err) {
+      this.log.warn("WIP park marker branch undo refused (best-effort → marker left)", { cwd: clonePath, error: gitErrorMessage(err) });
+      return false;
+    }
+  }
+
+  /**
    * PRD #1247 M5b (data-integrity fix) — true iff the runner clone's HEAD commit is a
    * `wip(park):` marker (its subject starts with WIP_PARK_COMMIT_PREFIX, the same prefix
    * `commitWipMarker` plants). Read as the RUNNER uid (`runGitAsRunner`, `log -1
@@ -11615,27 +11659,6 @@ try {
       return subject.startsWith(WIP_PARK_COMMIT_PREFIX);
     } catch (err) {
       this.log.warn("WIP park marker HEAD check failed (best-effort → not a marker)", {
-        cwd: clonePath,
-        error: gitErrorMessage(err),
-      });
-      return false;
-    }
-  }
-
-  /**
-   * True iff HEAD symbolically names `refs/heads/<branch>` and that branch's tip is a
-   * `wip(park):` marker. The pause-park undo (`reset --mixed HEAD^`) rewinds whatever HEAD
-   * names, so it must run only when that is the run branch carrying the marker. Any error
-   * answers false (best-effort, never a blind reset).
-   */
-  async headOnBranchAtWipMarker(clonePath: string, branch: string): Promise<boolean> {
-    try {
-      const ref = await this.wipSymbolicHead(clonePath);
-      if (ref !== `refs/heads/${branch}`) return false;
-      const subject = await this.runGitAsRunner(clonePath, ["log", "-1", "--format=%s", ref], NO_REPLACE);
-      return subject.startsWith(WIP_PARK_COMMIT_PREFIX);
-    } catch (err) {
-      this.log.warn("WIP park marker branch check failed (best-effort → not undone)", {
         cwd: clonePath,
         error: gitErrorMessage(err),
       });

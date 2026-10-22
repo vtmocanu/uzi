@@ -1948,6 +1948,8 @@ interface RunFlight {
    *  may be committed): the park callers reset it before the capture and skip the fetch-back and
    *  publish when it is set. */
   wipMarkerUnsafe?: boolean;
+  /** issue #3239 — the commit a refused park capture wrote (when read back); the pause park undoes exactly it. */
+  wipUnsafeMarker?: string;
   /** issue #3239 — WIP-capture notice kinds already emitted on this flight (one per kind). */
   wipNoticed?: Set<"park" | "restore_point">;
   sourceNormalPark?: boolean;
@@ -17318,7 +17320,7 @@ export class RunRunner {
       if (kind === "park") {
         flight.preserveRecoveryClone = true;
         flight.sourceJoinFailed = true;
-        if (info.rollbackRefused) flight.wipMarkerUnsafe = true;
+        if (info.rollbackRefused) { flight.wipMarkerUnsafe = true; flight.wipUnsafeMarker = info.marker; }
       }
       // One notice per flight and kind: handleRecoveryExhausted retries restore-point captures
       // about every second, so a core file would otherwise flood the feed.
@@ -17422,8 +17424,10 @@ export class RunRunner {
     let preservationRefused = false;
     // A flag left by an earlier capture must not steer the undo below when the proof blocked above.
     flight.wipMarkerUnsafe = false;
+    flight.wipUnsafeMarker = undefined;
+    let createdMarker: string | undefined;
     if (!residueBlocked && barePath && branch && runnerClone) {
-      markerCreated = await this.git.commitWipMarker(runnerClone.path, { mode: "exclude", onIncomplete: this.wipIncompleteHandler(flight, "park") }).catch(() => { flight.sourceJoinFailed = true; return false; });
+      markerCreated = await this.git.commitWipMarker(runnerClone.path, { mode: "exclude", onIncomplete: this.wipIncompleteHandler(flight, "park"), onCommitted: (m) => { createdMarker = m; } }).catch(() => { flight.sourceJoinFailed = true; return false; });
       // issue #3239: sourceJoinFailed alone does not stop the fetch-back or publish below. A marker
       // whose rollback was refused was never vetted: refuse like an ownership failure, so nothing
       // is fetched or published and the run stays running (pause_failed) with its clone kept.
@@ -17522,18 +17526,21 @@ export class RunRunner {
       // at the clone HEAD: it would ride into the eventual MR and the restarted turn would build on a
       // throwaway commit. Restore its content to the uncommitted tree, the same shape the resume
       // adopt gives a marker. Best-effort; only when this call created a marker or refused to vet
-      // one (issue #3239). The undo rewinds whatever HEAD names, so it runs only when HEAD names the
-      // run branch and that branch's tip is a wip(park): commit; when the agent switched HEAD
-      // elsewhere or detached it, the marker stays where it is (the run branch is not touched) and
-      // the pause_failed below keeps the run going.
+      // one (issue #3239), and only for the exact marker oid the capture reported: undoWipMarkerOnBranch
+      // is a compare-and-swap of the run branch ref from that marker to its parent, so it moves only
+      // that branch and only while it still is that commit, and never writes HEAD. When the oid is
+      // unknown, or the CAS refuses (branch moved), the marker stays and the pause_failed below
+      // keeps the run going.
       if ((markerCreated || flight.wipMarkerUnsafe) && runnerClone) {
-        if (branch && (await this.git.headOnBranchAtWipMarker(runnerClone.path, branch).catch(() => false))) {
-          // issue #3239: a refused rollback leaves the unvetted marker at the run branch tip while
-          // the run continues; strip it back to the uncommitted tree so it cannot ride into a later
-          // checkpoint or the MR.
-          await this.git.undoWipMarker(runnerClone.path).catch(() => { flight.sourceJoinFailed = true; });
+        const markerOid = createdMarker ?? flight.wipUnsafeMarker;
+        if (branch && markerOid) {
+          const undone = await this.git.undoWipMarkerOnBranch(runnerClone.path, branch, markerOid).catch(() => false);
+          if (!undone) {
+            flight.sourceJoinFailed = true;
+            runLog.warn("pause park: WIP marker not undone (branch no longer at the marker)", { run_id: flight.runId, branch });
+          }
         } else {
-          runLog.warn("pause park: WIP marker not undone (HEAD does not name the run branch at a marker)", { run_id: flight.runId, branch });
+          runLog.warn("pause park: WIP marker not undone (marker oid unknown)", { run_id: flight.runId, branch });
         }
       }
       // Decision 8: no durable checkpoint ⇒ no park. Report pause_failed (the server clears the
