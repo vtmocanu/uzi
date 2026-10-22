@@ -1,14 +1,15 @@
 # uzi devbox worker and uxlab lock refresh: bump the nixpkgs pin Renovate does not cover.
 #
 # WHY THIS EXISTS (issue #912). agent/devbox-global/devbox.json lists the worker
-# toolchain UNVERSIONED (go, gcc, python3, chromium, openssl, semgrep, helm,
-# opentofu, ...); each resolves against the nixpkgs revision pinned in
+# toolchain mostly as raw nixpkgs attributes (gcc, python3, chromium, openssl,
+# semgrep, helm, opentofu, ...); each resolves against the stdenv revision pinned in
 # agent/devbox-global/devbox.lock, and the worker image bakes exactly that lock
 # (agent/templates/base/Dockerfile COPYs it before `devbox global install`). Renovate
-# tracks the npm/Go/CI-tool pins but not this lock, so it silently rots (the pin sat
-# ~6.5 weeks stale when #912 was filed). This weekly job removes the lock and re-resolves
-# every package against the newest nixpkgs-unstable commit (a plain `devbox update` keeps
-# packages pinned to their current commit -- a no-op for versions), so a bump CAN carry
+# tracks explicit pins, including Go's separate immutable flake revision, but cannot
+# regenerate this lock. This weekly job refreshes the stdenv input, invalidates only raw
+# attributes, and resolves them through Devbox install in an isolated staging directory.
+# A full `devbox update` migrates raw keys to devbox-search @latest entries, so it is not
+# used here. Explicit pins and their metadata stay intact. A bump CAN carry
 # major tool versions, which is intended (workers should get current, patched tools) and is
 # exactly why it is VALIDATED and human-reviewed rather than applied blind.
 #
@@ -110,30 +111,15 @@ jobs:
           sudo install -m 0755 "$(find "${tmp}" -type f -name devbox | head -n1)" /usr/local/bin/devbox
           devbox version
 
-      # Force a FULL re-resolve. `devbox update` on its own keeps every package "resolved to
-      # its current version" (the old pinned commit) -- a no-op for tool versions (verified:
-      # it only advanced the nixpkgs-unstable alias while all 23 packages stayed on the old
-      # commit, so chromium etc. did not move). Removing the lock first makes devbox
-      # re-resolve every unversioned package against the CURRENT nixpkgs-unstable commit,
-      # which is what actually advances the versions (chromium 150 -> 152 in a local resolve).
-      # Request --no-install, but devbox may still initialize packages before relocking
-      # (observed semgrep failure in #2618). The image build remains the final worker guard. A transient nix binary-cache
-      # fetch can truncate (as it did on the first run), so retry; rm runs each attempt so a
-      # partial lock from a failed try never leaks into the next.
+      # Refresh through supported Devbox operations without changing package resolution
+      # models (#3311). Each attempt starts from the original coherent inputs; manifest
+      # rewrites, partial installs and mismatched keys leave both originals untouched.
+      # This realizes the refreshed packages; the image build remains the final guard.
       - name: devbox update (full re-resolve to the latest nixpkgs)
-        working-directory: agent/devbox-global
         run: |
           set -euo pipefail
-          cp devbox.lock "${RUNNER_TEMP}/worker-go-lock-before.json"
           for attempt in 1 2 3; do
-            rm -f devbox.lock
-            if devbox update --no-install; then
-              # Never publish a lock whose keys disagree with the committed manifest.
-              git diff --exit-code -- devbox.json
-              # An immutable flake has the same outputs after a full relock. Devbox omits
-              # their metadata; reuse it only if the complete resolved ref is unchanged.
-              python3 ../../scripts/check-worker-toolchain.py \
-                --restore-go-metadata "${RUNNER_TEMP}/worker-go-lock-before.json"
+            if python3 scripts/refresh-worker-lock.py; then
               exit 0
             fi
             if [ "${attempt}" -lt 3 ]; then
