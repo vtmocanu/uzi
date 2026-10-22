@@ -337,6 +337,10 @@ try {
   assert.equal(registries[0]!.state(), "disposed");
   assert.equal(transports[0]!.turnStartCount, 1);
   assert.equal(transports[1]!.turnStartCount, 1);
+  assert.deepEqual(transports[1]!.requests
+    .filter(({ method }) => method === "thread/start" || method === "thread/resume")
+    .map(({ method }) => method), ["thread/start"],
+  "retained-source recovery starts a fresh model session on the new attempt");
   assert.ok(lines.some(l => l.includes("retained work verified on a fresh local attempt")) ||
     git(successor, ["merge-base", "--is-ancestor", committed, "HEAD"]) === "");
   console.log("M1 retained stop -> nonce heartbeat in-budget requeue -> reclaim -> independent recovery -> fresh Codex model turn");

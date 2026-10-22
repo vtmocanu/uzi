@@ -163,4 +163,3 @@ export class FakeTransport implements CodexTransport {
     return Promise.resolve();
   }
 }
-
