@@ -94,7 +94,7 @@ func newGitHub(baseURL, token string, timeout time.Duration) (*github, error) {
 	// base/upload origin, however go-github built it.
 	httpClient := timeoutClient(timeout)
 	pin := redirectguard.NewOriginPin(newETagTransport(httpClient.Transport, token))
-	httpClient.Transport = ciRepairTransport{base: pin}
+	httpClient.Transport = responseLimitTransport{base: ciRepairTransport{base: pin}}
 	opts := []gh.ClientOptionsFunc{
 		gh.WithHTTPClient(httpClient),
 		gh.WithAuthToken(token),

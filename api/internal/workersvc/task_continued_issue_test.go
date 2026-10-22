@@ -3,7 +3,11 @@ package workersvc
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -83,6 +87,38 @@ func TestLinkedTaskValidation(t *testing.T) {
 			}
 			if wantCalls > 0 && (f.project != 621 || f.iid != tc.iid) {
 				t.Fatalf("wrong forge scope %d/%d", f.project, f.iid)
+			}
+		})
+	}
+}
+
+// The real SDK's oversized 404 must be a failed validation, never an absent
+// issue or a successful insertion. Flushing headers makes the body unknown-length.
+func TestLinkedTaskBoundedValidation(t *testing.T) {
+	for _, driver := range []forge.Type{forge.TypeGitHub, forge.TypeGitLab, forge.TypeForgejo} {
+		t.Run(string(driver), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if strings.HasSuffix(r.URL.Path, "/issues/17") {
+					w.WriteHeader(http.StatusNotFound)
+					w.(http.Flusher).Flush()
+					_, _ = w.Write([]byte("{\"message\":\"" + strings.Repeat("x", 5<<10) + "\"}"))
+					return
+				}
+				_, _ = w.Write([]byte(`{"id":621,"name":"widgets","owner":{"login":"acme"}}`))
+			}))
+			defer srv.Close()
+			f, err := forge.New(driver, srv.URL, "fixture", time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fs := &fakeStore{repoRow: aValidRepoRow()}
+			svc := New(fs, newBox(t), testParams())
+			svc.SetForges(m2Builder{f})
+			iid := int64(17)
+			_, err = svc.CreateTaskRun(context.Background(), uuid.New(), uuid.New(), "task", "", false, false, false, false, &iid)
+			if !errors.Is(err, ErrForgeIssueRead) || fs.taskRunParams != nil {
+				t.Fatalf("oversized validation err=%v inserted=%v", err, fs.taskRunParams != nil)
 			}
 		})
 	}

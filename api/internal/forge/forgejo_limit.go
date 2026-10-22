@@ -29,6 +29,9 @@ type cappedTransport struct {
 }
 
 func (t cappedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if responseLimitFrom(req.Context()) != nil && !isCIJSON(req.Context()) {
+		return responseLimitTransport(t).RoundTrip(req)
+	}
 	if isCIJSON(req.Context()) {
 		return t.base.RoundTrip(req)
 	}

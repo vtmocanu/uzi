@@ -36,7 +36,31 @@ func (*ResponseTooLargeError) Unwrap() error { return ErrResponseTooLarge }
 // (streaming) path, where the SDK ignores the read error (the deferred drain) or
 // folds it into an empty ErrorResponse. One state is created per marked call and
 // never shared between calls.
-type responseLimitState struct{ overflow atomic.Bool }
+type responseLimitState struct {
+	overflow            atomic.Bool
+	unsupportedEncoding atomic.Bool
+}
+
+// GetIssueBounded validates a continuation issue using the marked-response limits
+// (32 MiB success, 4 KiB error). Ordinary Forge.GetIssue calls are unchanged.
+// A fresh state prevents an SDK's ignored read error from accepting partial data
+// or classifying an oversized response as an absent issue.
+func GetIssueBounded(ctx context.Context, f Forge, projectID, iid int64) (Issue, error) {
+	state := &responseLimitState{}
+	// Continuation validation has its own limit, even under a CI discovery context.
+	ctx = context.WithValue(ctx, ciRepairJSONKey{}, false)
+	issue, err := f.GetIssue(withResponseLimit(ctx, state), projectID, iid)
+	if state.overflow.Load() {
+		return Issue{}, &ResponseTooLargeError{}
+	}
+	if state.unsupportedEncoding.Load() {
+		return Issue{}, &bodyReadError{category: "unsupported content encoding"}
+	}
+	if err != nil {
+		return Issue{}, err
+	}
+	return issue, nil
+}
 
 type responseLimitKey struct{}
 
@@ -199,6 +223,7 @@ func (t responseLimitTransport) RoundTrip(req *http.Request) (*http.Response, er
 		return resp, err
 	}
 	if declaresContentEncoding(resp.Header) {
+		state.unsupportedEncoding.Store(true)
 		// Forced compression: the wire bytes are not the content. Read nothing; keep
 		// the status so classification survives, but never hand a body on.
 		_ = resp.Body.Close()
