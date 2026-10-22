@@ -2,17 +2,16 @@
 // networking only after setup; it never supplies a replacement command PATH.
 import assert from "node:assert/strict";
 import { displayJSON } from "./display.js";
-import { execFile, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { promisify } from "node:util";
+import { runRunner, runnerFailure } from "./runner.js";
 import { pathToFileURL } from "node:url";
 import { inventory, verifyPNGs } from "./tree.js";
 import { boundaryProbe, homeSnapshot } from "./probes.js";
 import { readRegularFile, sourceId, HELPER_MAX_BYTES } from "./inputs.js";
 
-const exec = promisify(execFile);
 const load = (name: string) => import(pathToFileURL(path.join("/app/src", name)).href);
 const start = performance.now();
 const record = (kind: string, data: Record<string, unknown>) =>
@@ -39,11 +38,10 @@ async function main() {
   const warn = log.warn.bind(log);
   log.warn = (message: string, fields?: Record<string, unknown>) => { warnings.push(message); warn(message, fields); };
   const runAsRunner = async (command: string, args: string[], timeout = 30_000, cwd = "/app") => {
-    const wrapped = runner.runnerCommand(command, args);
-    return exec(wrapped.command, wrapped.args, { cwd,
+    return runRunner(runner.runnerCommand, command, args, { cwd,
       env: { PATH: runner.runnerPath(process.env), HOME: "/data/agent-home",
         TMPDIR: runner.runnerTmpdir(process.env) },
-      timeout, maxBuffer: 4 * 1024 * 1024 });
+      timeout, record });
   };
   assert.equal((await runAsRunner("/usr/bin/id", ["-u"])).stdout.trim(), "10002");
   const helpers: Record<string, string> = {};
@@ -97,7 +95,7 @@ async function main() {
   }, { provisionRoot: "/data/provision", homeDir: "/data/agent-home", log });
   record("provision", { cell, mode, durationMs: Math.round(performance.now() - provisionStarted), ...result });
   assert.equal(warnings.length, 0, "provisioning warning/degradation");
-  const expectedEvents = [`merged ${packages.length} package(s) from this repo\'s devbox.json`,
+  const expectedEvents = [`merged ${packages.length} package(s) from this repo's devbox.json`,
     `provisioning ${packages.length} tool(s): ${packages.join(", ")}`, "tools provisioned"];
   assert.equal(events.length, expectedEvents.length, "provisioning degraded or emitted unexpected events");
   for (let i = 0; i < events.length; i++) assert(events[i] === expectedEvents[i], `provision event ${i} differs; see event receipt`);
@@ -127,7 +125,7 @@ async function main() {
     ].join("\n")], { cwd });
     record("command", { label, mode: commandMode, durationMs: Math.round(performance.now() - begun), ...output });
     const home = /^COMMAND_HOME=(.+)$/m.exec(output.stdout)?.[1];
-    assert(home?.startsWith("/tmp/uzi-codex-command-"), "missing fresh command HOME receipt");
+    assert(home && home.startsWith("/tmp/uzi-codex-command-"), "missing fresh command HOME receipt");
     assert(!homes.has(home), "command HOME reused");
     homes.add(home);
     assert.equal(commandRoots.hasLiveCommandRoot(), false, "command root not drained");
@@ -148,7 +146,7 @@ go test ./cmd/uzi/ -run '^$' -count=1`, path.join(checkout, "api"));
       // Separate runner-owned nested Devbox store leg; never a model command.
       await runAsRunner("/bin/rm", ["-rf", "--", path.join(lab, "frames"), path.join(lab, "png")]);
       const positive = await runAsRunner("/bin/bash", ["-ceu",
-        `${goPolicy}\ndevbox run build`], 900_000, lab);
+        `export GOTOOLCHAIN=local GOFLAGS=-buildvcs=false\ndevbox run -- go version\ndevbox run build`], 900_000, lab);
       record("local-devbox", positive);
       assert(positive.stdout.includes(version[0]), "local Devbox leg must use exactly the command setup Go version");
       record("artifacts", { phase: "local", pngs: await verifyPNGs(lab) });
@@ -239,4 +237,5 @@ go test ./cmd/uzi/ -run '^$' -count=1`, path.join(checkout, "api"));
   }
 }
 function quote(value: string) { return "'" + value.replaceAll("'", "'\\''") + "'"; }
-main().catch((error) => { record("result", { status: "FAIL", error: String(error), stack: error?.stack }); process.exitCode = 1; });
+main().catch((error) => { record("result", { status: "FAIL", ...runnerFailure(error),
+  stack: String(error?.stack ?? "").slice(0, 4096) }); process.exitCode = 1; });

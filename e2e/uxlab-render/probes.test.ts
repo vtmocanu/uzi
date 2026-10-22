@@ -56,7 +56,7 @@ test("standalone HOME snapshot enforces per-file, total, depth and enumeration b
       fs.writeFile(path.join(home, String(i + n)), "")));
   await assert.rejects(snapshot(home), /HOME entry limit/);
 });
-test("cell deadline collects container logs before cleanup and retains failure", async (t) => {
+test("cell deadline and failed or invalid polling retain failure with verified cleanup", async (t) => {
   const dir = await fixture(t);
   await fs.writeFile(path.join(dir, "docker"), `#!/usr/bin/env bash
 set -eu
@@ -71,7 +71,10 @@ case "$1 \${2:-}" in
   "ps -a") if [ -f "$state/container" ]; then cat "$state/owner"; fi ;;
   "inspect "*)
     case "$*" in
-      *State.Running*) echo true ;;
+      *State.Running*)
+        if [ "$FAKE_RUNNING" = error ]; then echo INSPECT_FAILED >&2; exit 2; fi
+        echo "$FAKE_RUNNING" ;;
+      *State.ExitCode*) echo 0 ;;
       *uxlab-render.owner*) cat "$state/owner" ;;
       *) exit 2 ;;
     esac ;;
@@ -85,10 +88,10 @@ case "$1 \${2:-}" in
   *) echo "unexpected docker command: $*" >&2; exit 2 ;;
 esac
 `, { mode: 0o755 });
-  for (const logExit of ["0", "2"]) {
+  for (const [running, logExit] of [["true", "0"], ["true", "2"], ["error", "0"], ["invalid", "0"]]) {
     const result = await exec("bash", [fileURLToPath(new URL("./run.sh", import.meta.url)), "cell"], {
       env: { ...process.env, PATH: dir + path.delimiter + process.env.PATH,
-        FAKE_DOCKER_DIR: dir, FAKE_LOG_EXIT: logExit,
+        FAKE_DOCKER_DIR: dir, FAKE_LOG_EXIT: logExit, FAKE_RUNNING: running,
         UXLAB_RENDER_CELL: "local", UXLAB_RENDER_MODE: "off", UXLAB_RENDER_TIMEOUT: "0",
         UXLAB_RENDER_REPO_DIR: dir, UXLAB_RENDER_SRC_DIR: dir,
         UXLAB_RENDER_MANIFEST: fileURLToPath(new URL("../../devbox.json", import.meta.url)),
@@ -99,8 +102,12 @@ esac
     assert.ok(logPath);
     t.after(() => fs.rm(fileURLToPath(new URL("../../" + logPath, import.meta.url)), { force: true }));
     assert.equal(result.code, 1);
-    assert.match(result.stdout, /ERROR: cell wall deadline/);
-    assert.match(result.stdout, /LOCAL_HANG_DIAGNOSTIC/);
+    if (running === "true") {
+      assert.match(result.stdout, /ERROR: cell wall deadline/);
+      assert.match(result.stdout, /LOCAL_HANG_DIAGNOSTIC/);
+    } else {
+      assert.match(result.stdout, running === "error" ? /running-state inspection failed/ : /invalid container running state/);
+    }
     assert.match(result.stdout, /CLEANUP=verified/);
     assert.match(result.stdout, /EXIT=1/);
     assert.equal(result.stdout.includes("ERROR: timeout log collection failed"), logExit !== "0");

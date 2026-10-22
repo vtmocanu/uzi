@@ -167,7 +167,14 @@ if [ "$action" = cell ]; then
   timeout 30s docker start "$name" >> "$log"
   handed_off=0
   cell_started=$SECONDS
-  while [ "$(timeout 10s docker inspect "$name" --format '{{.State.Running}}')" = true ]; do
+  while :; do
+    running="$(timeout 10s docker inspect "$name" --format '{{.State.Running}}')" ||
+      { echo "ERROR: container running-state inspection failed" >> "$log"; exit 1; }
+    case "$running" in
+      true) ;;
+      false) break ;;
+      *) echo "ERROR: invalid container running state" >> "$log"; exit 1 ;;
+    esac
     if [ "$handed_off" = 0 ] && [ "$UXLAB_RENDER_CELL" != local ] &&
       timeout 10s docker exec --user 10001:10002 "$name" test -f /data/uxlab-network-ready; then
       # No host-network mode: disconnect is the proof boundary, not GOPROXY alone.
