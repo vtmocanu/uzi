@@ -423,11 +423,20 @@ const (
 	providerRetryWord = "provider wait"
 )
 
+// tuiRejectedRun identifies a base-divergence rejection while preserving human stops.
+func tuiRejectedRun(r apitypes.RunDTO) bool {
+	return r.Status == "failed" && strOr(r.FailOrigin, "") == "base_diverged" &&
+		runpresentation.HumanStopReason(r.Status, strOr(r.StopKind, "")) == ""
+}
+
 // runStateToken gives typed provider, Codex relogin and credential holds their
 // own tokens; other runs use stateToken. Provider markers require matching status.
 func (p palette) runStateToken(r apitypes.RunDTO, isRevising bool) runToken {
 	if runpresentation.HumanStopReason(r.Status, strOr(r.StopKind, "")) != "" {
 		return p.stateToken(r.Status, r.Health, r.IsPlanning, isRevising, r.LandingState, strOr(r.StopKind, ""))
+	}
+	if tuiRejectedRun(r) {
+		return runToken{glyph: "·", word: "rejected", color: p.faintC}
 	}
 	if isProviderUnavailableHold(r) {
 		return runToken{glyph: "⊘", word: providerHoldWord, color: p.amber}

@@ -86,6 +86,15 @@ func TestGenerateUXLabFrames(t *testing.T) {
 
 	// scenes maps a base name to a builder that returns the rendered frame for a theme.
 	scenes := map[string]func(dark bool) string{
+		"board-base-diverged":          func(d bool) string { return baseDivergedBoardModel(d, false).View().Content },
+		"board-base-diverged-selected": func(d bool) string { return baseDivergedBoardModel(d, true).View().Content },
+		"detail-base-diverged": func(d bool) string {
+			r := baseDivergedRows()[0].RunDTO
+			m := uxModel(&uzicli.FakeClient{}, r.ID, d)
+			m = applyDetail(m, r, nil)
+			return m.View().Content
+		},
+		"worker-base-diverged":              func(d bool) string { return baseDivergedWorkerModel(d).View().Content },
 		"board-human-stop-own-unselected":   func(d bool) string { return humanStopBoardScene(d, false, false) },
 		"board-human-stop-own-selected":     func(d bool) string { return humanStopBoardScene(d, false, true) },
 		"board-human-stop-admin-unselected": func(d bool) string { return humanStopBoardScene(d, true, false) },
