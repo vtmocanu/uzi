@@ -346,7 +346,9 @@ RUN command -v agent-browser \
 # readable (0555/0444) by nix default, so in practice this only reopens the guard-created
 # 0700 dirs. Safe: the toolchain store holds no secrets. As root here, busybox `chmod -R`
 # does not hit the un-chmodable-root abort the non-root seed would.
-RUN chmod -R a+rX /nix
+# Then drop group write on the store root (only its owner writes it): entrypoint (a1).
+RUN chmod -R a+rX /nix \
+    && chmod g-w /nix/store
 
 # --- PRD #1156 M3a: package pinned Codex 0.162.1 (CLI + code-mode host) ------------------
 # Install the COMBINED native package (not the bare CLI) into a stable, immutable,

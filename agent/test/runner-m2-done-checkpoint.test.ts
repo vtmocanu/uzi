@@ -57,7 +57,7 @@ it("m2 done shares 60/90 seconds across preliminary reads and import children", 
   assert.ok(childBudgets.every(ms => ms <= 60_000));
 });
 
-it("m2 started milestone import finishes readback and ancestry bridge after its 10 second publication stop", async () => {
+it("m2 started milestone import settles ownership but defers ancestry bridge after its soft stop", async () => {
   const publishedBranch = "feature/m2-milestone";
   execFileSync("git", ["-C", fx.originPath, "checkout", "-b", publishedBranch], { stdio: "pipe" });
   commitInTree(fx.originPath, "floor.txt", "published floor\n");
@@ -96,12 +96,17 @@ it("m2 started milestone import finishes readback and ancestry bridge after its 
       const bare = git.barePathFor(fx.originPath);
       const bridged = await git.trackingTip(bare, ctx.branch);
       assert.ok(bridged);
-      assert.notEqual(bridged, head, "the started milestone completes its ancestry bridge after soft expiry");
+      assert.equal(bridged, head, "the started import settles but later bridge is deferred");
       assert.equal(await git.ancestry(bare, head, bridged), "ancestor");
       assert.equal(await git.revParse(bare, `${bridged}^{tree}`), await git.revParse(bare, `${head}^{tree}`));
       const owned = await git.committedTrackingOwnership(bare, ctx.branch, ctx.runId, bridged);
       assert.equal(owned.kind, "owned");
       assert.ok((await git.enumerateOwedCandidates(bare, ctx.runId)).some(c => c.sha === head), "original imported head remains owed");
+      await ctx.checkpoint!({ reap: false });
+      const retried = await git.trackingTip(bare, ctx.branch);
+      assert.ok(retried);
+      assert.notEqual(retried, head, "retry completes the deferred bridge");
+      assert.equal(await git.ancestry(bare, head, retried), "ancestor");
       observed = true;
       return { branch: ctx.branch };
     },
