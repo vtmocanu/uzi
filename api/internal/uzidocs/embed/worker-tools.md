@@ -133,20 +133,23 @@ to the manifest and guard map together; those PRs remain red until a maintainer
 regenerates the lock key and its evaluated version/output metadata.
 
 Weekly maintenance runs `scripts/refresh-worker-lock.py` with the pinned Devbox
-version. It copies the manifest and lock to an isolated project, updates only
-Devbox's stdenv input (`devbox update nixpkgs --no-install`), removes the raw
-attribute entries from that staged lock, then runs `devbox install --tidy-lockfile`.
-The install realizes packages and can require substantial cache downloads; this
-is not a metadata-only or offline refresh. A normal full `devbox update` migrates
-raw keys to devbox-search `@latest` entries and is intentionally avoided.
+version. It copies the manifest and lock to an isolated project and updates only
+Devbox's stdenv input (`devbox update nixpkgs --no-install`). Two selected-raw-package
+updates with `--no-install` resolve the refreshed output paths. Each pass preserves
+one existing `source: nixpkg` entry while invalidating the other raw entries; the
+second pass refreshes the original preserved entry. This avoids the legacy-key
+migration without updating explicit pins or implementing a separate Nix resolver.
+A normal full `devbox update` migrates raw keys to devbox-search `@latest` entries
+and is intentionally avoided.
 
 The helper requires the manifest to remain byte-identical and validates the
 complete lock and module Go requirements. It then checks every selected output
 and its dependency closure against the remote `https://cache.nixos.org` store,
-even when installation already built that output locally. Uncached outputs or
-an unavailable cache fail closed with a retry-next-week result. Installation can
-still incur source-build cost before this check; a successful local build alone
-never authorizes a source-building image.
+even if an output already exists locally. Uncached outputs or an unavailable cache
+fail closed with a retry-next-week result before package installation. Only a
+cache-covered closure proceeds to `devbox install --tidy-lockfile`; the output
+paths must remain unchanged afterward. Realization can require substantial cache
+downloads, so the complete refresh is not offline.
 
 Only then does it atomically replace the original lock. A failed or partial
 attempt leaves both original inputs intact. The read-only

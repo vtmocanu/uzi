@@ -26,6 +26,9 @@ class RefreshTests(unittest.TestCase):
         self.packages[0] = self.key
         self.lock['packages'][self.key] = self.lock['packages'].pop(original_key)
         self.lock['packages'][self.key]['resolved'] = self.key
+        self.packages.append('gcc')
+        for key in ('jq.bin', 'gcc'):
+            self.lock['packages'][key] = {'source': 'nixpkg', 'resolved': 'github:NixOS/nixpkgs/' + 'a' * 40 + '#' + key}
         self.write()
         scripts = self.root / 'scripts'
         scripts.mkdir()
@@ -44,6 +47,8 @@ class RefreshTests(unittest.TestCase):
         fake.write_text('''#!/usr/bin/env python3
 import json, os, pathlib, sys
 args = sys.argv[1:]
+with open(os.environ['DEVBOX_TRACE'], 'a') as trace:
+    trace.write(json.dumps(args) + '\\n')
 config = pathlib.Path(args[args.index('--config') + 1]) if '--config' in args else pathlib.Path.cwd()
 manifest, lock = config / 'devbox.json', config / 'devbox.lock'
 mode = os.environ['REFRESH_CASE']
@@ -58,18 +63,29 @@ if args[0] == 'update' and 'nixpkgs' in args:
     data = json.loads(lock.read_text())
     data['packages']['github:NixOS/nixpkgs/nixpkgs-unstable'] = {'resolved': 'github:NixOS/nixpkgs/' + 'b' * 40}
     lock.write_text(json.dumps(data))
-elif args[0] == 'install':
+elif args[0] in ('install', 'update'):
     data = json.loads(lock.read_text())
-    assert 'jq.bin' not in data['packages'], 'raw entry must be invalidated'
+    if args[0] == 'update':
+        assert '--no-install' in args
+        assert data['packages'][args[1]]['source'] == 'nixpkg', 'raw anchor must survive'
+        assert any(key not in data['packages'] for key in ('jq.bin', 'gcc')), 'other raw entries must be invalidated'
     assert os.environ['PIN_KEY'] in data['packages'], 'explicit pin must survive'
-    data['packages']['jq.bin'] = {'resolved': 'github:NixOS/nixpkgs/' + 'b' * 40 + '#jq.bin',
-        'systems': {'x86_64-linux': {'outputs': [{'path': '/nix/store/' + 'c' * 32 + '-jq-1.8.2-bin', 'default': True}]}}}
-    if mode == 'orphan':
+    for key, suffix in (('jq.bin', 'c' * 32 + '-jq-1.8.2-bin'), ('gcc', 'f' * 32 + '-gcc-16.2.0')):
+        if key not in data['packages']:
+            data['packages'][key] = {'source': 'nixpkg', 'resolved': 'github:NixOS/nixpkgs/' + 'b' * 40 + '#' + key,
+                'systems': {'x86_64-linux': {'outputs': [{'path': '/nix/store/' + suffix, 'default': True}]}}}
+    if mode == 'go-change':
+        data['packages'][os.environ['PIN_KEY']]['resolved'] += '?changed=true'
+    if mode == 'orphan' and args[0] == 'install':
         data['packages']['jq.bin@latest'] = {}
-    if mode == 'input-change':
+    if mode == 'output-change' and args[0] == 'install':
+        data['packages']['jq.bin']['systems']['x86_64-linux']['outputs'][0]['path'] = '/nix/store/' + 'd' * 32 + '-jq-1.8.2-bin'
+    if mode == 'input-change' and args[0] == 'install':
         (pathlib.Path(os.environ['SOURCE_ROOT']) / 'api/go.mod').write_text('module changed\\ngo 1.99.0\\n')
+    if mode == 'partial' and args[0] == 'install':
+        del data['packages']['jq.bin']
     lock.write_text(json.dumps(data))
-    if mode == 'partial':
+    if mode == 'partial' and args[0] == 'install':
         sys.exit(7)
 else:
     lock.write_text('{"packages": {}}')
@@ -87,6 +103,7 @@ elif args[0] == 'path-info':
     assert args[args.index('--store') + 1] == 'https://cache.nixos.org'
     assert '/nix/store/' + 'a' * 32 + '-go-1.27.3' in args
     assert '/nix/store/' + 'c' * 32 + '-jq-1.8.2-bin' in args
+    assert '/nix/store/' + 'f' * 32 + '-gcc-16.2.0' in args
     if os.environ['REFRESH_CASE'] == 'cache-miss':
         sys.exit(1)
 else:
@@ -98,7 +115,8 @@ else:
         sleep.chmod(0o755)
         self.env = {**os.environ, 'PATH': str(binary) + os.pathsep + os.environ['PATH'],
                     'RUNNER_TEMP': str(self.root), 'PIN_KEY': self.key,
-                    'FAKE_LOCK': str(self.root / 'fake-lock.json'), 'SOURCE_ROOT': str(self.root)}
+                    'FAKE_LOCK': str(self.root / 'fake-lock.json'), 'SOURCE_ROOT': str(self.root),
+                    'DEVBOX_TRACE': str(self.root / 'devbox-trace.jsonl')}
         subprocess.run(['git', 'init', '-q', str(self.root)], check=True)
         subprocess.run(['git', '-C', str(self.root), 'add', 'agent'], check=True)
 
@@ -143,6 +161,25 @@ else:
         result = self.invoke('cache-miss')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('not yet cached', result.stderr)
+        self.assert_originals()
+
+    def test_uncached_output_is_refused_before_install(self):
+        result = self.invoke('cache-miss')
+        self.assertNotEqual(result.returncode, 0)
+        calls = [json.loads(line) for line in (self.root / 'devbox-trace.jsonl').read_text().splitlines()]
+        self.assertFalse(any(call[0] == 'install' for call in calls), calls)
+        self.assert_originals()
+
+    def test_install_cannot_change_cache_verified_outputs(self):
+        result = self.invoke('output-change')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('outputs changed', result.stderr)
+        self.assert_originals()
+
+    def test_metadata_refresh_cannot_change_the_immutable_go_pin(self):
+        result = self.invoke('go-change')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('pin metadata changed', result.stderr)
         self.assert_originals()
 
 

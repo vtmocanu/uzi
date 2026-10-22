@@ -15,10 +15,7 @@ CHECK = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CHECK)
 
 
-def require_public_cache(config, packages):
-    """A local realization alone cannot authorize a source-building worker image."""
-    system = subprocess.check_output(['nix', 'eval', '--impure', '--raw', '--expr',
-                                      'builtins.currentSystem'], text=True, timeout=60).strip()
+def selected_output_paths(config, packages, system):
     lock = json.loads((config / 'devbox.lock').read_text())
     paths = set()
     for key in packages:
@@ -27,9 +24,17 @@ def require_public_cache(config, packages):
         if not selected or any(not re.fullmatch(r'/nix/store/[a-z0-9]{32}-[^/\s]+', path) for path in selected):
             raise ValueError(f'missing resolved worker outputs for {key} on {system}; no lock published')
         paths.update(selected)
+    return paths
+
+
+def require_public_cache(config, packages):
+    """Verify the selected closure before any package realization."""
+    system = subprocess.check_output(['nix', 'eval', '--impure', '--raw', '--expr',
+                                      'builtins.currentSystem'], text=True, timeout=60).strip()
+    paths = selected_output_paths(config, packages, system)
     started = time.monotonic()
     try:
-        # Query the REMOTE store, even if install already built a path locally.
+        # Query the REMOTE store, even if a path already exists locally.
         # Recursive verification also refuses a missing dependency in its closure.
         subprocess.run(['nix', 'path-info', '--recursive', '--store', 'https://cache.nixos.org',
                         *sorted(paths)], check=True, stdout=subprocess.DEVNULL, timeout=300)
@@ -37,6 +42,7 @@ def require_public_cache(config, packages):
         raise ValueError('worker outputs not yet cached or public cache unavailable; '
                          'retry next week; no lock published') from error
     print(f'worker public-cache coverage: {len(paths)} output roots verified in {time.monotonic() - started:.1f}s')
+    return system, paths
 
 
 def refresh(root, devbox):
@@ -71,14 +77,36 @@ def refresh(root, devbox):
         # selectors to devbox-search @latest packages. A normal full update does not.
         run('update', 'nixpkgs', '--no-install')
         lock = json.loads((config / 'devbox.lock').read_text())
+        anchors = [key for key in raw if lock['packages'][key].get('source') == 'nixpkg']
+        if len(raw) < 2 or not anchors:
+            raise ValueError('metadata-only refresh requires two raw attributes and a nixpkg anchor')
+        anchor = anchors[0]
+        pinned = {key: lock['packages'][key] for key in packages if key not in raw}
         for key in raw:
-            del lock['packages'][key]
+            if key != anchor:
+                del lock['packages'][key]
         (config / 'devbox.lock').write_text(json.dumps(lock, indent=2) + '\n')
-        # Resolve missing raw attributes against the refreshed stdenv through Devbox's
-        # supported install path, then populate its store-path metadata.
+        # A raw entry already marked nixpkg is not migrated by update. Keep one
+        # such anchor while Devbox resolves all other missing raw entries, then
+        # use one newly resolved entry while refreshing the original anchor.
+        # No explicit pin is updated, and no package install is requested.
+        run('update', anchor, '--no-install')
+        lock = json.loads((config / 'devbox.lock').read_text())
+        other = next(key for key in raw if key != anchor)
+        if lock['packages'][other].get('source') != 'nixpkg':
+            raise ValueError('raw resolution changed source; no lock published')
+        del lock['packages'][anchor]
+        (config / 'devbox.lock').write_text(json.dumps(lock, indent=2) + '\n')
+        run('update', other, '--no-install')
+        CHECK.check(stage)
+        final = json.loads((config / 'devbox.lock').read_text())
+        if any(final['packages'][key] != entry for key, entry in pinned.items()):
+            raise ValueError('explicit pin metadata changed; no lock published')
+        system, cached_paths = require_public_cache(config, packages)
         run('install', '--tidy-lockfile')
         CHECK.check(stage)
-        require_public_cache(config, packages)
+        if selected_output_paths(config, packages, system) != cached_paths:
+            raise ValueError('worker outputs changed after cache verification; no lock published')
         if (manifest_path.read_bytes() != original_manifest or lock_path.read_bytes() != original_lock
                 or any(path.read_bytes() != contents for path, contents in modules.items())):
             raise ValueError('worker inputs changed during refresh; no lock published')
