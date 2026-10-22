@@ -9,6 +9,7 @@ import type { ChatRunner } from "../src/chat-runner.js";
 import type { JudgeRunner } from "../src/judge-runner.js";
 import type { ReviewRunner } from "../src/review-runner.js";
 import { recordingLogger } from "./worker-sweep-rig.js";
+import { reportProofTiming } from "../src/report-proof-timing.js";
 
 const A = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 const B = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
@@ -35,6 +36,8 @@ function rig(t: TestContext, entries = [entry()]) {
   const queries: string[] = [];
   const deleted: PendingFinalize[] = [];
   const logger = recordingLogger();
+  const warnings: Array<{ msg: string; fields: Record<string, unknown> }> = [];
+  logger.log.warn = (msg, fields) => { warnings.push({ msg, fields: fields ?? {} }); };
   let predicate: (id: string, gen: number) => Promise<boolean> = async () => true;
   const outbox = {
     listPendingFinalizeGenerations: (includeTerminal = false) => [...records.values()]
@@ -53,23 +56,66 @@ function rig(t: TestContext, entries = [entry()]) {
     capturePublicationCompletionRetirement: (): Readonly<object> | undefined => { queries.push("capture"); return undefined; },
     getRunOwnership: async () => { queries.push("ownership"); return { status: "completed", claim_generation: 999 }; },
   };
-  const newWorker = () => new Worker({} as Config, client as unknown as WorkerClient, {
+  const runner = {
     isExecuting: () => { queries.push("live"); return false; },
     recoveryFinalAcknowledged: async () => { queries.push("ack"); return false; },
     retireRecoveryReport: async () => { queries.push("report"); return { retired: false }; },
     recoveryInventoryPending: async (id: string, gen: number) => {
       queries.push(`${id}:${gen}`); return predicate(id, gen);
     },
-  } as unknown as RunRunner, {} as ChatRunner, {} as JudgeRunner, {} as ReviewRunner,
-  logger.log, () => ({ ok: true, missing: [] }), outbox) as unknown as Sweep;
+  };
+  const newWorker = () => new Worker({} as Config, client as unknown as WorkerClient,
+    runner as unknown as RunRunner, {} as ChatRunner, {} as JudgeRunner, {} as ReviewRunner,
+    logger.log, () => ({ ok: true, missing: [] }), outbox) as unknown as Sweep;
   const w = newWorker();
-  return { w, newWorker, client, records, hidden, queries, deleted, add, logger,
+  return { w, newWorker, client, runner, outbox, records, hidden, queries, deleted, add, logger, warnings,
     setPredicate: (fn: typeof predicate) => { predicate = fn; },
     advance: (ms: number) => { now += ms; },
     now: () => now,
     failures: () => logger.info.filter(log => log.fields.transition === "failed"),
   };
 }
+
+// Copy this file unchanged and select this name on ee190c042: only existing Worker/outbox
+// interfaces and call counts are used, so baseline fails on a premature retry.
+it("baseline-compatible primary: timed-out false authority respects consecutive cooldowns through saturation", async t => {
+  const r = rig(t);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let calls = 0;
+  let held = deferred<boolean>();
+  r.setPredicate(async () => { calls++; return held.promise; });
+  try {
+    for (const random of [0, 1]) {
+      t.mock.method(Math, "random", () => random);
+      const w = r.newWorker();
+      const delays = random === 0
+        ? [12000, 24000, 48000, 96000, 192000, 384000, 480000, 480000]
+        : [15000, 30000, 60000, 120000, 240000, 480000, 600000, 600000];
+      for (const delay of delays) {
+        held = deferred<boolean>();
+        const before = calls;
+        const pass = w.sweepPendingFinalizes();
+        await flush();
+        assert.equal(calls, before + 1, "exact expiry starts one bounded attempt");
+        r.advance(1000);
+        t.mock.timers.tick(1000);
+        await pass;
+        held.resolve(false);
+        await flush();
+        assert.equal(calls, before + 1, "late false settlement starts no extra attempt");
+        const queries = r.queries.length;
+        r.advance(delay - 1);
+        await w.sweepPendingFinalizes();
+        assert.equal(calls, before + 1, "timed-out authority must not retry before cooldown expiry");
+        assert.equal(r.queries.length, queries, "cooldown precedes every predicate");
+        r.advance(1);
+      }
+    }
+  } finally {
+    held.resolve(false);
+    await flush();
+  }
+});
 
 for (const random of [0, 1]) {
   it(`retained outcomes back off through the cap with jitter endpoint ${random}`, async t => {
@@ -242,6 +288,163 @@ it("late settlement cannot restore removed state or overwrite a new identity", a
   assert.notEqual(r.failures()[0]!.fields.record_identity, r.failures()[1]!.fields.record_identity);
   assert.equal(r.deleted.length, 0);
 });
+
+for (const operation of [
+  "recovery-inventory pending", "ownership lookup", "final-ACK check",
+  "recovery-report retirement", "queued conditional deletion",
+  "completion notification via queued deletion", "completion notification via report",
+] as const) {
+  it(`authority expiry snapshots the active ${operation} before late settlement`, async t => {
+    const r = rig(t);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const held = deferred<void>();
+    r.setPredicate(async () => false);
+    const notification = operation.startsWith("completion notification");
+    t.mock.method(r.client, "capturePublicationCompletionRetirement", () => {
+      // Give the initial capture its own elapsed time; none belongs to the next operation.
+      r.advance(125);
+      t.mock.timers.tick(125);
+      return notification ? {} : undefined;
+    });
+    if (operation === "final-ACK check") {
+      t.mock.method(r.runner, "recoveryFinalAcknowledged", async () => {
+        await held.promise;
+        return false;
+      });
+    } else if (operation === "recovery-report retirement") {
+      t.mock.method(r.runner, "retireRecoveryReport", async () => {
+        await held.promise;
+        return { retired: false };
+      });
+    } else if (operation === "recovery-inventory pending") {
+      r.setPredicate(async () => { await held.promise; return false; });
+    } else if (operation === "ownership lookup") {
+      t.mock.method(r.client, "getRunOwnership", async () => {
+        await held.promise;
+        return { status: "completed", claim_generation: 999 };
+      });
+    } else if (operation === "queued conditional deletion") {
+      t.mock.method(r.outbox, "retireFinalizeIfEligible", async () => {
+        await held.promise;
+        return false;
+      });
+    } else {
+      // Exercise both notification call sites independently.
+      if (operation.endsWith("via report")) {
+        t.mock.method(r.runner, "retireRecoveryReport", async () =>
+          ({ retired: true, authority: "archive" }));
+      } else {
+        t.mock.method(r.runner, "recoveryFinalAcknowledged", async () => true);
+      }
+      Object.assign(r.runner, {
+        notifyPublicationCompletionRetired: async () => { await held.promise; },
+      });
+    }
+    try {
+      const pass = r.w.sweepPendingFinalizes();
+      await flush();
+      assert.equal(r.warnings.length, 0, "no diagnostic before expiry");
+      r.advance(875);
+      t.mock.timers.tick(875);
+      // Move time again before catch processing; the diagnostic must retain timer-time values.
+      r.advance(77);
+      await pass;
+      assert.equal(r.warnings.length, 1);
+      const warning = r.warnings[0]!;
+      assert.equal(warning.msg, "outbox: finalize retry retained a generation");
+      const snapshot = {
+        authority_step: notification ? "completion notification" : operation,
+        authority_step_elapsed_ms: 875,
+        authority_attempt_elapsed_ms: 1000,
+      };
+      for (const [key, value] of Object.entries(snapshot)) assert.equal(warning.fields[key], value);
+      const saved = { ...warning.fields };
+      const logs = r.logger.info.length;
+      await r.w.sweepPendingFinalizes();
+      assert.equal(r.warnings.length, 1, "skipped heartbeats emit no deadline warning");
+      if (r.records.size) assert.equal(r.logger.info.length, logs, "cooling emits no heartbeat log");
+      else assert.equal(r.logger.info.at(-1)!.fields.transition, "removed", "completed unlink is reconciled");
+      held.resolve();
+      await flush();
+      assert.deepEqual(warning.fields, saved, "late progress cannot alter the expiry snapshot");
+      assert.equal(r.warnings.length, 1);
+    } finally {
+      held.resolve();
+      await flush();
+    }
+  });
+}
+
+for (const cancellation of ["shutdown", "pass"] as const) {
+  it(`${cancellation} cancellation has no authority deadline diagnostic`, async t => {
+    const r = rig(t);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    t.mock.method(reportProofTiming, "finalizePassMs", () => 500);
+    const held = deferred<boolean>();
+    r.setPredicate(async () => held.promise);
+    const controller = new AbortController();
+    try {
+      const pass = r.w.sweepPendingFinalizes(controller.signal);
+      await flush();
+      if (cancellation === "shutdown") controller.abort();
+      else {
+        r.advance(500);
+        t.mock.timers.tick(500);
+      }
+      await pass;
+      assert.equal(r.warnings.length, 1);
+      assert.equal(r.warnings[0]!.fields.authority_step, undefined);
+      assert.equal(r.warnings[0]!.fields.authority_step_elapsed_ms, undefined);
+      assert.equal(r.warnings[0]!.fields.authority_attempt_elapsed_ms, undefined);
+      assert.equal(r.failures().length, cancellation === "shutdown" ? 0 : 1);
+    } finally {
+      held.resolve(false);
+      await flush();
+    }
+  });
+}
+
+for (const evidence of ["status", "generation", "inventory", "ACK", "report"] as const) {
+  it(`changed ${evidence} evidence is first queried at cooldown expiry`, async t => {
+    const r = rig(t);
+    r.setPredicate(async () => false);
+    let changed = false;
+    let reads = 0;
+    t.mock.method(r.client, "getRunOwnership", async () => {
+      reads++;
+      return {
+        status: evidence === "status" && !changed ? "running" : "completed",
+        claim_generation: evidence === "generation" && !changed ? 0 : 999,
+      };
+    });
+    if (evidence === "inventory") r.setPredicate(async () => { reads++; return !changed; });
+    if (evidence === "ACK") t.mock.method(r.runner, "recoveryFinalAcknowledged", async () => {
+      reads++;
+      return changed;
+    });
+    if (evidence === "report") t.mock.method(r.runner, "retireRecoveryReport", async () => {
+      reads++;
+      return { retired: changed };
+    });
+    // Hold deletion for ACK/report so their later positive evidence is what retires it.
+    if (evidence === "ACK" || evidence === "report") {
+      t.mock.method(r.outbox, "retireFinalizeIfEligible", async () => changed);
+    }
+    await r.w.sweepPendingFinalizes();
+    assert.equal(r.failures().length, 1);
+    changed = true;
+    const before = reads;
+    const queries = [...r.queries];
+    r.advance(14999);
+    await r.w.sweepPendingFinalizes();
+    assert.equal(reads, before);
+    assert.deepEqual(r.queries, queries, "all queries are skipped while cooling");
+    r.advance(1);
+    await r.w.sweepPendingFinalizes();
+    assert.ok(reads > before);
+    assert.equal(r.logger.info.at(-1)!.fields.transition, "retired");
+  });
+}
 
 it("shutdown cancels the waiter without scheduling retry work", async t => {
   const r = rig(t);

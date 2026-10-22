@@ -310,9 +310,12 @@ export class Worker {
       });
   }
 
-  private async hasFinalizeAuthority(entry: PendingFinalize, identity: Readonly<object>, registrationLower: boolean): Promise<boolean> {
+  private async hasFinalizeAuthority(entry: PendingFinalize, identity: Readonly<object>, registrationLower: boolean,
+    step: (operation: string) => void): Promise<boolean> {
+    step("recovery-inventory pending");
     if (await this.runner.recoveryInventoryPending(entry.run_id, entry.claim_generation) !== false) return false;
     if (registrationLower || this.acceptedFinalizes.get(finalizeKey(entry)) === identity) return true;
+    step("ownership lookup");
     const ownership: unknown = await this.client.getRunOwnership(entry.run_id);
     if (!ownership || typeof ownership !== "object") return false;
     const proof = ownership as { status?: unknown; claim_generation?: unknown; inventory_guarded?: unknown };
@@ -329,8 +332,23 @@ export class Worker {
     const authorityWait = new AbortController();
     const abort = () => authorityWait.abort(signal.reason);
     signal.addEventListener("abort", abort, { once: true });
-    const timer = setTimeout(() => authorityWait.abort(new Error("finalize authority deadline")),
-      reportProofTiming.finalizeAuthorityMs());
+    const attemptStarted = Date.now();
+    let operation = "completion-retirement capture";
+    let stepStarted = attemptStarted;
+    const step = (next: string) => { operation = next; stepStarted = Date.now(); };
+    let authorityDeadline: Readonly<{
+      authority_step: string; authority_step_elapsed_ms: number; authority_attempt_elapsed_ms: number;
+    }> | undefined;
+    const timer = setTimeout(() => {
+      if (authorityWait.signal.aborted) return;
+      // Snapshot before abort: late progress in the quarantined authority cannot rewrite expiry.
+      const expired = Date.now();
+      authorityDeadline = Object.freeze({
+        authority_step: operation, authority_step_elapsed_ms: expired - stepStarted,
+        authority_attempt_elapsed_ms: expired - attemptStarted,
+      });
+      authorityWait.abort(new Error("finalize authority deadline"));
+    }, reportProofTiming.finalizeAuthorityMs());
     try {
       const incarnation = this.client.capturePublicationCompletionRetirement?.();
       // Install quarantine before invoking the predicate, including synchronously throwing doubles.
@@ -340,28 +358,34 @@ export class Worker {
         const retireWithExistingAuthority = async (): Promise<boolean> => {
           if (outbox.finalizeRecordIdentity(entry.run_id, entry.claim_generation) !== identity ||
               !reportEligible()) return false;
-          if (await this.hasFinalizeAuthority(entry, identity, registrationLower) !== true) return false;
+          if (await this.hasFinalizeAuthority(entry, identity, registrationLower, step) !== true) return false;
           const eligible = () => reportEligible() && !this.isFinalizeRunLive(entry.run_id);
           if (!eligible()) return false;
+          step("queued conditional deletion");
           const retired = await outbox.retireFinalizeIfEligible(
             entry.run_id, entry.claim_generation, eligible, authorityWait.signal, identity);
-          if (retired === true && incarnation && eligible())
+          if (retired === true && incarnation && eligible()) {
+            step("completion notification");
             await this.runner.notifyPublicationCompletionRetired(entry.run_id, entry.claim_generation, incarnation);
+          }
           return retired;
         };
         // Prefer the existing exact covering ACK clause before spending its deadline
         // on an archive-only proof. Ownership, identity and live fences still apply.
         if (typeof this.runner.recoveryFinalAcknowledged === "function" && reportEligible() &&
-            await this.runner.recoveryFinalAcknowledged(entry.run_id, entry.claim_generation) === true &&
+            (step("final-ACK check"), await this.runner.recoveryFinalAcknowledged(entry.run_id, entry.claim_generation)) === true &&
             await retireWithExistingAuthority()) return true;
         if (typeof this.runner.retireRecoveryReport === "function" && reportEligible()) {
+          step("recovery-report retirement");
           const retired = await this.runner.retireRecoveryReport(entry.run_id, entry.claim_generation, {
             expectedIdentity: identity, signal: authorityWait.signal, deadline, eligible: reportEligible,
           }, "finalize", outbox);
           if (retired.retired) {
             if (retired.authority === "acknowledged_final_report_only") return true;
-            if (incarnation && reportEligible() && !this.isFinalizeRunLive(entry.run_id)) await this.runner.notifyPublicationCompletionRetired(
-              entry.run_id, entry.claim_generation, incarnation);
+            if (incarnation && reportEligible() && !this.isFinalizeRunLive(entry.run_id)) {
+              step("completion notification");
+              await this.runner.notifyPublicationCompletionRetired(entry.run_id, entry.claim_generation, incarnation);
+            }
             return true;
           }
         }
@@ -384,6 +408,7 @@ export class Worker {
     } catch (err) {
       this.log.warn("outbox: finalize retry retained a generation", {
         run_id: entry.run_id, claim_generation: entry.claim_generation, error: errMessage(err),
+        ...authorityDeadline,
       });
     } finally {
       clearTimeout(timer);
