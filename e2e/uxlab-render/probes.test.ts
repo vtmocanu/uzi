@@ -121,19 +121,20 @@ esac
     assert.equal(result.stdout.includes("ERROR: timeout log collection failed"), logExit !== "0");
   }
 });
-test("boundary script permits only off-mode DB observation and disposable sentinel writes", async () => {
+test("boundary script rejects real DB/lock writable opens and permits only off-mode disposable sentinel writes", async () => {
   const sentinel = "/nix/uxlab-sentinel-abc";
   const db = "/nix/var/nix/db/db.sqlite", lock = "/nix/var/nix/db/big-lock";
   for (const scenario of [
     { mode: "off", opens: [sentinel], rejected: "" },
-    { mode: "off", opens: [db, sentinel], rejected: "" },
+    { mode: "off", opens: [db, sentinel], rejected: db },
     { mode: "required", opens: [], rejected: "" },
     { mode: "required", opens: [db], rejected: db },
     { mode: "off", opens: [lock, sentinel], rejected: lock },
-    { mode: "off", opens: [db, lock, sentinel], rejected: lock },
+    { mode: "off", opens: [db, lock, sentinel], rejected: db },
     { mode: "required", opens: [lock], rejected: lock },
     { mode: "required", opens: [sentinel], rejected: sentinel },
-    { mode: "off", opens: [db], rejected: "sentinel calibration denied" },
+    { mode: "off", opens: [db], rejected: db },
+    { mode: "off", opens: [], rejected: "sentinel calibration denied" },
     { mode: "off", scope: "sentinel", opens: [sentinel], rejected: "" },
     { mode: "required", scope: "sentinel", opens: [], rejected: "" },
     { mode: "off", scope: "invalid", opens: [], rejected: "invalid boundary scope" },
@@ -162,7 +163,7 @@ test("boundary script permits only off-mode DB observation and disposable sentin
         throw new Error("unexpected dependency");
       },
       process: state, Buffer,
-      console: { log: (message: string) => { logs.push(message); }, error: (error: string) => { errors.push(error); } },
+      console: { log: (message: string) => { logs.push(message); }, error: (error: string) => { calls.push("error"); errors.push(error); } },
     }, { timeout: 1000 });
     const label = JSON.stringify(scenario);
     assert.equal(state.exitCode, scenario.rejected ? 1 : 0, label);
@@ -179,9 +180,8 @@ test("boundary script permits only off-mode DB observation and disposable sentin
       }
       if (file === scenario.rejected) break;
     }
+    if (scenario.rejected) expectedCalls.push("error");
     assert.deepEqual(calls, expectedCalls, label);
-    assert.deepEqual(logs.filter(line => line.startsWith("OFF_MODE_DB_OPEN_OBSERVED=")),
-      scenario.mode === "off" && scenario.opens.includes(db) ? ["OFF_MODE_DB_OPEN_OBSERVED=" + db] : [], label);
     assert.deepEqual(logs.filter(line => line.startsWith("SENTINEL_WRITE_CALIBRATED=")),
       !scenario.rejected && scenario.mode === "off" ? ["SENTINEL_WRITE_CALIBRATED=" + sentinel] : [], label);
     for (const file of [db, lock, sentinel]) {

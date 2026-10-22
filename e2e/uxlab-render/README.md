@@ -9,8 +9,9 @@ off base preflight also passed; a repaired required build generated 260 frames
 but reached its deadline with 63 PNG paths. Native Nix fails version detection
 on denied /proc reads, so the lock-specific control is unmet. A formal owner
 decision is needed; see the evidence for failed and unfinished criteria. An observed off-mode boundary failure
-remains unaccepted. The off-mode database observation has a guidance correction,
-not a formal criterion change or scope waiver. See [EVIDENCE.md](EVIDENCE.md)
+remains unaccepted. The current probe closes and fails any writable database or
+lock open in either mode. The earlier observation-only database exception was
+removed; the guidance correction is not a formal criterion change or scope waiver. See [EVIDENCE.md](EVIDENCE.md)
 for current observations, historical receipts and pending proof.
 No production runtime, environment builder, permission or sandbox code changes.
 

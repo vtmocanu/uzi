@@ -48,12 +48,6 @@ export const boundaryProbe = nodeFS + String.raw`
       console.log("OPEN_DENIED=" + file);
       continue;
     }
-    // Observe the separate off-mode DB permission gap without writing the DB.
-    if (file === "/nix/var/nix/db/db.sqlite" && mode === "off") {
-      await handle.close();
-      console.log("OFF_MODE_DB_OPEN_OBSERVED=" + file);
-      continue;
-    }
     // Immediately close every unexpected open. Real DB/lock never receive writes.
     if (file !== sentinel || mode !== "off") {
       await handle.close();

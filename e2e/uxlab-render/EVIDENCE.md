@@ -30,11 +30,14 @@ Observed current-attempt receipts:
 - Exact owned container and volume cleanup was verified; cell duration was
   310 seconds. This is not a completed four-cell matrix result.
 
-The probe now records and immediately closes an observed off-mode database
-open, separately from sentinel-only off-mode calibration. Required-mode real-file
-denials and off-mode big-lock denial remain strict. Formal criteria for the
-off-mode database observation are pending; the guidance correction does not
-satisfy the original denial criterion or approve a scope change.
+Earlier cells recorded and closed an off-mode database open without failing
+that database step; their overall results still failed on other criteria.
+The cross-check repair removed this unapproved exception: the current probe
+closes and fails any successful database or lock O_RDWR open in either mode.
+Only the disposable off-mode sentinel may be written during calibration.
+Historical real-image cells have not been rerun with this stricter probe.
+Formal criteria for the off-mode observation remain pending; guidance alone
+does not satisfy the original denial criterion or approve a scope change.
 
 The matrix continues through base/off, base/required, candidate/off and
 candidate/required, retaining an aggregate nonzero status for any failed cell.
@@ -140,7 +143,7 @@ The unfinished rendering, local Devbox and visual work remains worker-owned.
 | Complete base/candidate provisioning comparison by mode | Matched ab970306 observations above; repair changes setup, so updated comparison remains pending |
 | Host PNG export, signatures, dimensions, hashes and strict freshness | No final artifact receipt |
 | Light/dark visual inspection | Unperformed; no acceptance claimed |
-| Current full repository gate | Passed at `687d7df1407a49f821ab7aef45656da44f6ad2ff`, exit 0 in 1,797 seconds; actionlint skipped (absent); does not complete M3 |
+| Current full repository gate | Pending after the strict-probe repair; prior `687d7df1` pass took 1,797 seconds with actionlint skipped (absent) |
 
 The lead owns collecting matrix/local receipts and the remaining verification.
 This documentation-only update runs no gates/tests and performs no rendering or
@@ -224,6 +227,28 @@ built-in defaults and used an empty ignore directory. Repeated parity and
 hermetic build checks passed (`.uzi/scratch/gate-log.XGtXiu`). The unchanged
 code retains its earlier full-gate evidence; no full gate rerun is claimed.
 This documentation correction does not complete M3.
+
+## Cross-check repair
+
+The boundary-probe regression now rejects a successful database or lock open
+in either sandbox mode, checking exactly-once closure before failure and no
+real-file writes. The updated test failed against the pre-repair probe in an
+isolated `73a50c14` export: old off-mode database handling returned 0 where 1
+was required (`gate-log.mnqotM`, exit 1). The repaired probe and standalone
+HOME tests passed (3 tests, `gate-log.cQgJaA`, exit 0). Syntax and explicit
+ESNext/Bundler type checks passed; an initial NodeNext check failed on existing
+ESM `import.meta` usage rather than the repair. All 50 fixture tests then
+passed (`gate-log.7MCMwF`); that combined invocation exited 1 because selected-file
+TypeScript checks need `--ignoreConfig` on this tool version. The corrected
+strict typecheck, syntax, changelog validation and diff checks passed
+(`gate-log.M2HB7n`, exit 0), without repeating the test suite.
+
+The changelog now describes verified build guards and explicitly states the
+unfinished real-worker acceptance. The failed rendering, Devbox control and
+off-mode boundary observations above remain unresolved M3 requirements.
+The earlier full repository gate predates this code repair; it is not a
+current-code validation receipt. No plain-environment or hosted-CI pass is
+claimed for the recorded disposable-HOME gate invocation.
 
 ## Historical receipts (prior scratch logs lost)
 
