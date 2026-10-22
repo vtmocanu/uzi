@@ -244,6 +244,12 @@ const (
 	// plan-checker child (it checks a Codex lead) when the only capability the owner's fleet
 	// lacks is cross_check_codex_lead_v1, which ClaimRun requires for that child.
 	reasonNoCrossCheckCodexLeadCapableWorker = "no online worker supports Codex-lead plan cross-check (cross_check_codex_lead_v1); update or provision a capable worker"
+	// PRD #1230: a semantic-enrolled run's plan-stage checker child needs cross_check_semantic_plan_v1
+	// and a semantic-enrolled lead needs completion_semantic_publication_v1; both are ClaimRun
+	// clauses outside required_capabilities. A checker with no capable worker stays unclaimable until
+	// its deadline, then takes the existing deadline-to-human path (never a structural fallback).
+	reasonNoSemanticPlanCheckerCapableWorker = "no online worker supports semantic plan cross-check (cross_check_semantic_plan_v1); update or provision a capable worker"
+	reasonNoSemanticPublicationCapableWorker = "no online worker supports semantic completion publication (completion_semantic_publication_v1); update or provision a capable worker"
 	// reasonWaitingIsolatedLane (PRD #1906 M5) is the queued reason for a PROFILE-BOUND run: only
 	// a worker the api provisions into the isolated lane can claim it (ClaimRun's two-way lane
 	// clause), so no ordinary worker reason applies. Maps to the SAME healthWaitingWorker enum.
@@ -1361,6 +1367,21 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 			slog.Error("health: count online workers satisfying job runner", "run_id", r.ID, "error", cerr)
 		} else if c == 0 {
 			return reasonNoJobCapableWorker
+		}
+	}
+	// PRD #1230: a semantic-enrolled lead or its plan-stage checker child whose owner has NO online
+	// worker with the matching semantic capability is unplaceable; the lookup is optional (fakes) and
+	// a read error falls through to the generic reasons.
+	if sq, ok := s.q.(interface {
+		GetRunSemanticHealth(context.Context, store.GetRunSemanticHealthParams) (store.GetRunSemanticHealthRow, error)
+	}); ok {
+		sem, serr := sq.GetRunSemanticHealth(ctx, store.GetRunSemanticHealthParams{RunID: r.ID, UserID: r.UserID})
+		if serr != nil {
+			slog.Error("health: read semantic enrollment", "run_id", r.ID, "error", serr)
+		} else if sem.PlanCheckerEnrolled && sem.PlanCheckerCapable == 0 {
+			return reasonNoSemanticPlanCheckerCapableWorker
+		} else if sem.LeadEnrolled && r.Kind != runkind.CrossCheck && sem.PublicationCapable == 0 {
+			return reasonNoSemanticPublicationCapableWorker
 		}
 	}
 	// All protocol requirements must be present on one worker. A separate count for each

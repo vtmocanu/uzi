@@ -6,6 +6,8 @@ import path from "node:path";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
 import { GitCache } from "../src/git.js";
+import { prepareFrozenHeld, type FrozenHeldPolicy } from "../src/frozen-held.js";
+import { defaultGitleaksShim } from "./gitleaks-shim.js";
 
 // Issue #2545: the held publication's range. resolveCheckpointRange takes an explicit tip (the frozen
 // record's aggregate, which no tracking ref names) and rangeTouchesWorkflows judges the scanned range
@@ -142,5 +144,56 @@ describe("rangeTouchesWorkflows", () => {
     const range = await rangeOf(tip);
     assert.equal(await cache.rangeTouchesWorkflows(bare, { ...range, tipSha: "1".repeat(40) }), "unknown");
     assert.equal(await cache.rangeTouchesWorkflows(bare, { ...range, excludeSha: "bad" }), "unknown");
+  });
+});
+
+// Issue #3242: a zero range (the held tip is still a default-branch commit the default has moved
+// past, with no origin branch) packs the tip over its literal parents, so the pack carries the commit
+// the broker must find. The scan floor, the policy checks and the pack cap are unchanged.
+describe("a zero-range held publication", () => {
+  const policy: FrozenHeldPolicy = { version: 1, blocked: false, everKnown: false, flaggedCommits: [], ciGlobs: null, extraFloors: [] };
+  let scanCache: GitCache;
+  let parent: string, tip: string, moved: string;
+  beforeEach(() => {
+    scanCache = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
+    parent = commitFile(work, "a.txt", "a\n");
+    tip = commitFile(work, "b.txt", "b\n");
+    commitFile(work, "c.txt", "c\n");
+    git(work, "rm", "-q", "a.txt");
+    git(work, "-c", "commit.gpgsign=false", "commit", "-q", "-m", "drop a.txt");
+    moved = git(work, "rev-parse", "HEAD");
+    sync();
+  });
+
+  it("keeps the scan floors and excludes only the tip's parents from the pack", async () => {
+    const range = await scanCache.resolveCheckpointRange(bare, BRANCH, { tipSha: tip });
+    assert.ok(range);
+    assert.equal(range.excludeSha, tip, "the floor is the merge base, which is the tip itself");
+    assert.deepEqual(range.scanFloorShas, [moved], "the scan floor is still the default tip");
+    assert.deepEqual(range.packExcludeShas, [parent], "the transport excludes the literal parent");
+    assert.notEqual(moved, tip);
+  });
+
+  it("prepares a bounded pack that carries the tip commit, after a trusted scan", async () => {
+    let scanned: { trusted: boolean; findings: unknown[] } | undefined;
+    const out = await prepareFrozenHeld({
+      git: scanCache, barePath: bare, branch: BRANCH, sourceSha: tip, policy, deadlineMs: 60_000,
+      onScan: (s) => { scanned = s; },
+    });
+    assert.ok("pack" in out, `prepared: ${JSON.stringify("reason" in out ? out.reason : "")}`);
+    assert.equal(scanned?.trusted, true);
+    assert.deepEqual(scanned?.findings, []);
+    const probe = fs.mkdtempSync(path.join(fx.dataDir, "probe-"));
+    git(probe, "init", "-q", "--bare");
+    execFileSync("git", ["-C", probe, "unpack-objects", "-q"], { env: GIT_ENV, input: out.pack });
+    assert.equal(git(probe, "cat-file", "-t", tip), "commit", "the pack carries the declared commit");
+    assert.throws(() => git(probe, "cat-file", "-e", parent), "the parent is excluded");
+  });
+
+  it("still refuses a pack over the byte cap", async () => {
+    const out = await prepareFrozenHeld({
+      git: scanCache, barePath: bare, branch: BRANCH, sourceSha: tip, policy, deadlineMs: 60_000, maxBytes: 16,
+    });
+    assert.deepEqual(out, { reason: "pack_too_large" });
   });
 });

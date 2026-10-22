@@ -318,6 +318,7 @@ tasks:
       # Hermetic contract for the mirror.gcr.io-then-Docker-Hub image pull CI uses
       # (scripts/docker-pull-fallback.sh): a fake `docker`, no network.
       - task: test:docker-pull-fallback
+      - task: test:ci-postgres
       - task: test:cosign-sign-retry
       # Hermetic cleanup-ownership contract for the opt-in test:web-nginx script
       # (scripts/assert-web-nginx.sh): fake docker/helm/yq, no network.
@@ -330,6 +331,7 @@ tasks:
       # golangci aliases and the outer Go-toolchain group. No registry lookup.
       - task: test:renovate-go-toolchain
       - task: test:renovate-codex-runtime
+      - task: test:renovate-postgres
       - task: test:forge-fake
       - task: test:forge-fake-contract
       # Hermetic bot-provisioning regressions (issues #2010 and #2016): fake glab,
@@ -438,6 +440,9 @@ tasks:
       - task: check:changelog-entry
       - task: test:changelog-rc-bullets
       - task: check:changelog-rc-bullets
+      # Tests never read host git config (macOS fsmonitor daemon leak); ~9s locally: it runs
+      # `task` itself to prove a Task command beats an exported GIT_CONFIG_GLOBAL.
+      - task: test:hermetic-git-config
       - task: test:livedb-skip-guard
       # CI and the baked worker share one SAST engine (#2093): CI installs the
       # worker lock's semgrep, and this fails if CI grows a pin of its own.
@@ -1069,18 +1074,37 @@ tasks:
     cmds:
       - node ./scripts/renovate-go-toolchain.test.mjs
 
+  test:ci-postgres:
+    desc: hermetic workflow Postgres startup, fallback and readiness failure
+    cmds:
+      - node ./scripts/ci-postgres.test.mjs
+
+  test:renovate-postgres:
+    desc: hermetic CI Postgres pin extraction, digest updates and grouping
+    cmds:
+      - node ./scripts/renovate-postgres.test.mjs
+
   test:renovate-codex-runtime:
     desc: hermetic Codex pin extraction, grouping and partial-update rejection
     cmds:
       - node ./scripts/renovate-codex-runtime.test.mjs
 
   test:codex-proof-harness:
-    desc: hermetic regressions for the strict Codex packaged-proof verdict (TAP checker + run-proof.sh, no docker)
+    desc: hermetic regressions for the strict Codex packaged-proof verdict (TAP checker, run-proof.sh and the gate, no docker)
     cmds:
       # Real `node --test --test-reporter=tap` fixtures, so a reporter format change fails here.
       - node --test e2e/codex-proof/check-node-tap.test.mjs
       # Fake docker/timeout and fake legs; prints a mandatory `cases=N passed=N` tally.
       - bash e2e/codex-proof/run-proof.test.sh
+      # The required codex-packaged-proof-gate verdict per leg (#3212); same tally contract.
+      - bash e2e/codex-proof/gate.test.sh
+
+  test:codex-package-exec:
+    desc: Native arm64 Codex package check (install-codex.sh + assert-codex.sh in the runtime base), as CI runs it
+    # The codex-packaged-proof.yml arm64-package-exec leg (#3212). Needs a native linux/arm64
+    # docker daemon (e.g. Apple silicon) and egress; refuses an emulated run. NOT wired into gate.
+    cmds:
+      - ./e2e/codex-proof/package-exec.sh arm64
 
   test:codex-proof:
     desc: Opt-in strict packaged Codex O proof (M3b lifecycle, M3a profile + confinement suites) on base and jvm
@@ -1099,7 +1123,7 @@ tasks:
   test:forge-fake:
     desc: offline HTTPS issue-comment and bot-author contracts for the shared forge fake
     cmds:
-      - node --test e2e/forge-fake/issue-comments.test.mjs
+      - env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null node --test e2e/forge-fake/issue-comments.test.mjs
 
   test:forge-fake-contract:
     desc: offline production Go and worker forge operation contracts over real HTTPS
@@ -1114,7 +1138,7 @@ tasks:
       # test caching; v proves the named test ran with zero skips; timeout bounds
       # execution at 60s (the launcher separately allows 240s including compile).
       # Anchored run selects only this external-package contract, not the suite.
-      - node e2e/forge-fake/operation-contracts.test.mjs -- go test -buildvcs=false -count=1 -v -timeout=60s -run='^TestForgeFakeOperationContracts$' ./internal/forge
+      - env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null node e2e/forge-fake/operation-contracts.test.mjs -- go test -buildvcs=false -count=1 -v -timeout=60s -run='^TestForgeFakeOperationContracts$' ./internal/forge
 
   test:create-gitlab-bot:
     desc: hermetic bot-provisioning contract for create-gitlab-bot.sh (fake glab, no network), tally-guarded
@@ -1260,6 +1284,11 @@ tasks:
     desc: shipped RC changelog bullets remain byte-identical
     cmds:
       - bash scripts/changelog-section.sh check-rc-bullets HEAD
+
+  test:hermetic-git-config:
+    desc: tests never read host git config (hostile global core.fsmonitor recorder; Task precedence; wiring)
+    cmds:
+      - bash scripts/hermetic-git-config.test.sh
 
   test:changelog-rc-bullets:
     desc: hermetic frozen RC bullet guard regressions
@@ -1407,7 +1436,7 @@ tasks:
       - ./scripts/check-binary-text.sh scripts/binary-text-canary.go
 
   check:postgres-pin-parity:
-    desc: docker-compose.yml and ci.yml's mirrored postgres service pin the same tag and digest, with hermetic 0/1/2 fixtures
+    desc: docker-compose.yml and ci.yml's Postgres env pin use the same tag and digest, with hermetic 0/1/2 fixtures
     cmds:
       # ci.yml pulls postgres through mirror.gcr.io (#2621), so Renovate sees two packages;
       # renovate.json groups them (#2622) and this fails the gate if they still drift.
@@ -2192,7 +2221,7 @@ tasks:
       # counted as 0%. The total is therefore an over-estimate of module-wide
       # coverage. -coverpkg=./... would fix that and re-instruments every package on
       # every run; that trade is a threshold-time decision, not a measurement-time one.
-      - go test -race -count=1 -covermode=atomic -coverprofile=coverage.out ./...
+      - env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null go test -race -count=1 -covermode=atomic -coverprofile=coverage.out ./...
       # A script, not `go tool cover ... | tail -1`: the pipe would put the verdict on
       # `tail`, and it guards against summarising a profile that measured nothing.
       - sh ../scripts/coverage-total.sh coverage.out
@@ -2670,7 +2699,7 @@ tasks:
         mkdir -p .uzi/scratch
         LOG="$(mktemp "{{.ROOT_DIR}}/.uzi/scratch/checkpoint-chain-bridge-log.XXXXXX")"
         rc=0
-        (cd api && UZI_CHECKPOINT_CHAIN_BRIDGE=1 go test -buildvcs=false -count=1 -race -v \
+        (cd api && UZI_CHECKPOINT_CHAIN_BRIDGE=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null go test -buildvcs=false -count=1 -race -v \
           -run '^TestAgentCheckpointChainBridge$' ./internal/pushbroker/) > "$LOG" 2>&1 || rc=$?
         cat "$LOG"
         [ "$rc" -eq 0 ] || { echo "checkpoint chain bridge failed (exit $rc): $LOG" >&2; exit 1; }
@@ -2810,6 +2839,11 @@ tasks:
   test:agent:unit:
     internal: true
     dir: agent
+    preconditions:
+      # The hung-file window (agent/test/agent-report.ts, 10 min) is shortened only by the
+      # launcher's own tests; a leaked override must not arm an early kill in a real gate.
+      - sh: '[ -z "${UZI_AGENT_TEST_STALL_MS:-}" ] && [ -z "${UZI_AGENT_TEST_STALL_TESTONLY:-}" ]'
+        msg: 'UZI_AGENT_TEST_STALL_MS / UZI_AGENT_TEST_STALL_TESTONLY are for the launcher tests only; unset them'
     cmds:
       # `npm test` and NOT a bare `node --test`: agent/package.json's test script
       # carries `--test-timeout=120000`, and node's own default is NO timeout at
@@ -2887,7 +2921,7 @@ tasks:
           ../scripts/real-procfs-skip-check.test.sh
           ../scripts/tmpdir-leak-guard.test.sh
         fi
-      - ../scripts/real-procfs-skip-check.sh ../scripts/tmpdir-leak-guard.sh npm test
+      - env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null ../scripts/real-procfs-skip-check.sh ../scripts/tmpdir-leak-guard.sh npm test
 
   test:codex-m0:
     desc: Opt-in credential-free Codex 0.153.2 app-server characterization
@@ -3324,7 +3358,7 @@ tasks:
       - ./node_modules/.bin/tsc --noEmit -p ../e2e/codex-m4/tsconfig.json
       - mkdir -p "$(dirname "$CODEX_M4_EVIDENCE")"
       - rm -f "$CODEX_M4_EVIDENCE"                       # only THIS invocation's file
-      - node --import tsx --test --test-concurrency=1 --test-timeout=120000 test/claude-conformance-advice-ceiling.test.ts test/claude-conformance-invariant-mappings.test.ts test/claude-conformance-reducer.test.ts test/codex-home-screening.test.ts ../e2e/codex-m4/*.test.ts
+      - env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null node --import tsx --test --test-concurrency=1 --test-timeout=120000 test/claude-conformance-advice-ceiling.test.ts test/claude-conformance-invariant-mappings.test.ts test/claude-conformance-reducer.test.ts test/codex-home-screening.test.ts ../e2e/codex-m4/*.test.ts
       # macOS/non-Linux: the Linux-only P leg cannot run a Linux-musl codex binary natively (the P
       # files self-route to a skip there via p-platform.ts). Route it through the pinned Linux
       # container, which reads CODEX_M4_EVIDENCE from the env and appends the codex/P evidence to the
@@ -3361,7 +3395,7 @@ tasks:
     #     task check:codex-m4-receipts
     dir: agent
     cmds:
-      - node --import tsx ../e2e/codex-m4/run-receipts.ts
+      - env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null node --import tsx ../e2e/codex-m4/run-receipts.ts
 
   test:codex-m4:macos:
     desc: PRD 1287 D7 point 3 - run the strict Codex M4 P suite inside the pinned Linux container (macOS/maintainer path)

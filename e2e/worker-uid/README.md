@@ -137,6 +137,58 @@ Each container gets a 65-second watchdog plus five-second kill grace (70 seconds
 its own `single-<n>-results.xml` checked against `single-expected.json`; any container or checker failure
 fails the run. Worst case is 210 seconds on top of the other phases.
 
+After the single-uid phase, a runner-shared phase (issue #3153) starts one more container, as root with
+exactly the entrypoint's startup capability set (`CHOWN`, `DAC_OVERRIDE`, `SETPCAP`, `SETUID`, `SETGID`; no
+`FOWNER`, no `FSETID`), no network and `no-new-privileges`, on tmpfs `/data` and `/nix`, from the
+base image. It runs `e2e/worker-uid/runner-shared-real.test.mts`: nine required literal top-level
+leaves (inventory lane `node e2e/worker-uid/inventory.mjs shared`) that exercise the runner-shared
+subPath layout under real uids. Nothing is stubbed: the controller's golden runner-init script
+(`controller/internal/kube/testdata/runner-shared-init.sh`, mounted read-only; only its
+`/data-seed` and marker paths are substituted) and the working-tree
+`agent/templates/entrypoint.sh` (its real root window, real `setpriv` drop and `tini`) run unmodified,
+and every other identity is made with `setpriv` using the argv `agent/src/runner-uid.ts` builds (`setprivArgsForUid`
+for runner 10002 and runner-cmd 10003 with `--init-groups`, the entrypoint's own final drop for the
+split worker, a capless 10001 for the single-uid worker, uid 1000 with supplementary gid 10001 for the
+dind uid, uids 0 and 101000 for daemon-written content). The argv is production's, but it is spawned from root (which holds SETPCAP), so the capability bounding set differs from production; no DAC outcome depends on it. The leaves are:
+
+- the image layout marker gate: a missing, empty, wrong or symlinked marker, or a directory in its
+  place, makes runner-init refuse before any write (the seed volume is byte-for-byte unchanged);
+- runner-init as root on a fresh volume: `runner-shared` is worker:runner `3775`, `.tmp` is
+  worker:worker `0755`, an old root-owned `0755` `runner` directory and sibling data are untouched, and a
+  second run changes nothing;
+- hostile `runner-shared` or `.tmp` symlinks (to `.`, to a sibling, to the parent) and files are refused
+  without following or re-owning anything;
+- runner-init as the capless worker uid: success only on a volume that uid owns, fail closed on a
+  root-owned one, refusal of a symlink;
+- the runner, runner-cmd and dind uids cannot rename, remove, symlink over or write inside `.tmp`, cannot
+  move a worker-owned run directory, and (runner, runner-cmd) cannot replace `runner-shared` in its
+  `worker:10001 2775` parent; their effective groups exclude 10001 when spawned the production way. The
+  same leaf pins that a process holding only the fsGroup (the dind uid) cannot create entries at the top of
+  `runner-shared` or inside a worker-made run directory (both group `runner`, other `r-x`), while the runner
+  and runner-cmd uids can;
+- a fresh `.tmp`: created by the real entrypoint (split) and by `ensureRunnerTmpdir` as the capless and the
+  split worker on an empty `runner-shared`; a symlink or file planted at `.tmp` is refused each time;
+- per-uid scratch under a live writer: a leaf owned by a foreign uid (dind, a subuid) with a live writer
+  of that uid is refused with contents, owner and mode untouched; expected-owner `0700` leaves with live
+  writers are adopted, preserved and announced with "writer exclusion not established";
+- old-layout (`TMPDIR=/data/runner`) and new-layout (`TMPDIR=/data/runner/.tmp`) entrypoint boots in
+  sequence and overlapping, one workload live while the other layout boots: neither re-owns, wipes or
+  follows into the other's tree, and a hostile link between the layouts is refused;
+- foreign-owned run-directory content (uid 0, 1000 and 101000: directories holding files, a non-writable
+  directory, a sticky directory, loose files in the non-sticky 0777 `out` directory, and a live foreign writer) under the production retention delete
+  (`GitCache.deleteRetainedArtifact`) in split mode (the real `setpriv`-to-runner `rm -rf`) and single-uid
+  mode (in-process `fs.rm`): with a vetoing writer guard nothing is touched and nothing is counted; with the
+  guards open the artifact is retained, the undeletable counter rises by exactly one, the "could not delete
+  (not permitted)" diagnostic names the path and errno, and the foreign content that cannot be removed (directories holding files, the non-writable and sticky directories) keeps its owner, mode and inode, and the live foreign writer keeps appending. The loose files in the non-sticky 0777 `out` directory are not asserted either way.
+
+The container gets a 415-second watchdog plus five-second kill grace; each leaf has its own
+timeout of at most 115 seconds. Its results are checked against `shared-expected.json` like the
+other lanes. These leaves need the root-started capability set, so they cannot run in the worker proof
+container (which has dropped to uid 10001) and are not skippable: the container asserts its own uid,
+capability set, `no-new-privileges` and tmpfs `/data` first. Not reproduced, because they need
+`CAP_SYS_ADMIN`: the dind container's subPath-only mount view (a process cannot replace or traverse above a
+bind-mount root) and the kubelet's fsGroup application.
+
 `task test:worker-uid-harness` runs the Docker-free checker, shell wrapper and
 required-check regression tests. The wrapper tests stub Node inventory/pattern,
 Docker and timeout, use the real checker, and verify status reporting, stderr,

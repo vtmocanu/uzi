@@ -452,12 +452,27 @@ func (h *Handler) overlayResidueQuarantine(dto *apitypes.WorkerDTO, workerID uui
 	dto.ResidueQuarantineCause = &cause
 }
 
+// overlayMemoryAuthority folds the api's in-process memory-authority gate record (issue #3142)
+// onto the DTO. Left NIL (marshals null) when the worker is not currently gated. A nil wsvc is
+// a no-op.
+func (h *Handler) overlayMemoryAuthority(dto *apitypes.WorkerDTO, workerID uuid.UUID) {
+	if h.wsvc == nil {
+		return
+	}
+	at, ok := h.wsvc.MemoryAuthorityLostFor(workerID)
+	if !ok {
+		return
+	}
+	dto.MemoryAuthorityLostAt = &at
+}
+
 // overlayWorkerReports applies every in-process, heartbeat-reported overlay (outbox
-// depth, residue quarantine) to a worker DTO. Each response site that shows a worker
-// calls this one helper so the two stay in lockstep.
+// depth, residue quarantine, memory authority) to a worker DTO. Each response site that shows
+// a worker calls this one helper so they stay in lockstep.
 func (h *Handler) overlayWorkerReports(dto *apitypes.WorkerDTO, workerID uuid.UUID) {
 	h.overlayOutbox(dto, workerID)
 	h.overlayResidueQuarantine(dto, workerID)
+	h.overlayMemoryAuthority(dto, workerID)
 }
 
 type workerReportedRuns struct {

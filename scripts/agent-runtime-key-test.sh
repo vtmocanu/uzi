@@ -11,6 +11,9 @@
 #     from HEAD (staged, unstaged, untracked, ignored), exits 2 instead of printing a key.
 # Watch it fail on a broken script: drop a class from the key material and its row reddens.
 set -euo pipefail
+# Fixture repos must not read host git config: a global core.fsmonitor=true
+# leaves a detached fsmonitor daemon per repo on macOS.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 
 SCRIPT="$(cd "$(dirname "$0")" && pwd)/agent-runtime-key.sh"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/agent-runtime-key-test.XXXXXX")"

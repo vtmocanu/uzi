@@ -49,7 +49,14 @@ func (c *HTTPClient) GetRunWithOptions(ctx context.Context, id string, opts RunR
 	var env struct {
 		Run apitypes.RunDTO `json:"run"`
 	}
-	if err := c.get(ctx, path, &env); err != nil {
+	resp, body, err := c.doJSONReadOwner(ctx, "GET", path, nil, true)
+	if err != nil {
+		return apitypes.RunDTO{}, err
+	}
+	if err := decode2xx(resp, body, path, &env); err != nil {
+		return apitypes.RunDTO{}, err
+	}
+	if err := validateOwnerRunTransport(resp, body, env.Run); err != nil {
 		return apitypes.RunDTO{}, err
 	}
 	return env.Run, nil

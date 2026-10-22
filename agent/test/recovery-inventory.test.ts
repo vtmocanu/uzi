@@ -909,28 +909,43 @@ it("late cancellation releases queued journal pin without late mutation or FIFO 
   });
   let observed!: () => void, observations = 0;
   const queued = new Promise<void>(resolve => { observed = resolve; });
+  // The holder observes first (1). The waiter's and the sibling's journal reads finish in
+  // either order, so the sibling waits for the waiter: expiry must find the waiter past its
+  // read and queued on the lock, not still reading (#3220).
+  let waiterObserved!: () => void;
+  const waiterRead = new Promise<void>(resolve => { waiterObserved = resolve; });
   const writer = f.make(false, undefined, undefined, { maintenanceBudget: () => new MaintenanceBudget(),
-    afterPinObserve: async () => { if (++observations === 2) observed(); } });
+    afterPinObserve: async () => {
+      if (MaintenanceBudget.isAttempt("journal")) waiterObserved();
+      else if (observations >= 1) await waiterRead;
+      if (++observations === 3) observed();
+    } });
   const pin = (sha: string) => writer.pin({ runId: "run-1", kind: "issue", branch: "task", sourceSha: sha });
   const holder = pin(H);
   await held;
-  let mono = 0, settled = false, expire!: () => void;
+  let mono = 0, outcome: "pending" | "fulfilled" | "rejected" = "pending", expire!: () => void;
   let budget: MaintenanceBudget | undefined;
   const waiter = MaintenanceBudget.runAttempt("journal", () => budget = new MaintenanceBudget(100, () => mono), () => {
     expire = AsyncLocalStorage.bind(() => { MaintenanceBudget.observeCancellation(); mono = 100; assert.throws(() => budget!.check()); });
     return pin(H2);
   });
-  const result = waiter.then(() => { settled = true; }, () => { settled = true; });
+  const result = waiter.then(() => { outcome = "fulfilled"; }, () => { outcome = "rejected"; });
   const sibling = pin("c".repeat(40));
+  let drained: PromiseSettledResult<unknown>[] = [];
   try {
-    await queued;
-    await new Promise<void>(resolve => setImmediate(resolve));
-    expire();
-    await new Promise<void>(resolve => setImmediate(resolve));
-    assert.equal(settled, true, "late journal waiter rejects while holder remains held");
-    assert.equal(renames, 1);
-  } finally { release(); await Promise.all([holder, result, sibling]); budget?.dispose(); }
-  try {
+    try {
+      await queued;
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expire();
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(outcome, "rejected", "late journal waiter rejects while holder remains held");
+      assert.equal(renames, 1);
+    } finally {
+      // Drain every pin before the fixture closes, even when one rejects.
+      release();
+      try { drained = await Promise.allSettled([holder, result, sibling]); } finally { budget?.dispose(); }
+    }
+    for (const settled of drained) if (settled.status === "rejected") throw settled.reason;
     assert.equal(renames, 2, "expired pin never writes");
     assert.deepEqual((await f.coordinator.inspect("run-1")).map(r => r.sourceSha).sort(), [H, "c".repeat(40)].sort());
   } finally { await f.close(); }

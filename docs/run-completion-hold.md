@@ -95,7 +95,10 @@ without progress, or an announcement of publication.
 Put owner or deployment acceptance in a separate final milestone when it
 must happen outside the worker. Implementation, documentation, tests,
 mandatory gates, security checks and review remain worker work. Approval
-or auto-approval of that plan does not waive them.
+or auto-approval of that plan does not waive them. This separate-final-milestone
+convention is the structural-run rule; a dormant semantic run instead uses
+`maintainer` criteria (see [Maintainer outstanding proof on semantic
+runs](#maintainer-outstanding-proof-on-semantic-runs-dormant)).
 
 Formal owner partial is the scope-reduction authority: it records the exact
 kept and deferred milestone IDs and a reason. This applies to ordinary
@@ -365,10 +368,91 @@ refs `refs/uzi-checkpoints` and held refs `refs/uzi-held` are outside that
 branch-push behavior. These two residuals share the recorded finding handoff
 #3b56e6e5-4352-4694-ae1c-4999d5719e9c (a finding ID, not a forge issue).
 
-This remains structural enforcement. #1230 D4 and #1231 remain open; there
-is no plan-time preauthorization or active semantic completion audit.
+This remains structural enforcement for every production run. #1230 D4 is
+implemented but dormant (see [Maintainer outstanding proof on semantic
+runs](#maintainer-outstanding-proof-on-semantic-runs-dormant)); #1231, which
+activates semantic enrollment and the completion audit, is still open.
 Live deployment acceptance has not been performed; mocked tests or an
 existing PR do not establish it.
+
+## Maintainer outstanding proof on semantic runs (dormant)
+
+**Dormant.** Production enrollment is off until #1231, no production code
+writes a semantic planning record, and only tests inject the path; a real run
+is structural or legacy and shows none of this. The rules below describe what
+the built code does once a run is enrolled, and nothing in this section is live
+behavior or deployment evidence.
+
+A semantic run's criteria are either worker criteria (code, doc, test) or
+**maintainer** criteria: owner-only acceptance the worker lacks the authority or
+infrastructure to perform, such as observing a hosted rollout. The kind alone
+grants nothing. Only maintainer criteria that you approved, by exact criterion
+ID and condition, at the plan gate or in an owner contract revision are
+excluded from the worker's requirements; approval authorizes only the IDs and
+conditions shown. An ordinary answer, a checkbox, the lead's own assertion or
+auto-approval never reclassifies a failed worker requirement, and a newly
+proposed maintainer criterion forces the human gate even on
+[autopilot](autopilot.md#semantic-runs-park-instead-of-auto-approving-dormant).
+
+What the run carries for them is `completion_pending`: a `version`, the
+`contract_revision` and a list of `criteria`, each with its
+`authorization_revision` and a fixed status of `unverified`. It appears on the
+claim, the state acknowledgement and the completion permit. It is publication
+data, never evidence that anything was verified.
+
+- **Publication is non-closing.** With pending criteria the title, body and
+  commit guards treat the delivery like an owner-partial one: the source issue
+  stays open and the closing-commit scans widen to cover it. The pending
+  criteria are tracked apart from deferred milestones, so one piece of work is
+  never counted twice.
+- **Mismatch holds.** The projection in the publication acknowledgement must
+  equal the permit's, including each `authorization_revision`, or publication
+  holds. A worker without the negotiated `completion_semantic_publication_v1`
+  API feature holds, and so does the capped-empty path; none of them publishes
+  as closing.
+- **Where you see it.** The pull request body lists each pending item as an
+  unchecked box with its ID, milestone, reason, conditions and verification
+  steps, redacted and escaped. Items are rendered in full up to a 24,000
+  character budget and by ID only after that. The run page (visible to the run
+  owner only) and the `SEMANTIC_PENDING` rows of `uzi run get` show the same
+  criteria, plus a `SEMANTIC_PARK` row when autopilot stopped at the gate.
+  Checking a box grants no completion or closure authority, and a body refresh
+  restores it to unchecked.
+
+### Source drift is a detector only
+
+The frozen issue and PRD sources can change after approval. On a semantic run the
+server records drift observations when a gate is presented and again after
+the branch is pushed:
+
+- The server re-reads the current issue through the authorized forge
+  connection and hashes it the way the frozen issue source was hashed. When
+  the run saved the raw issue body at creation and it differs from the frozen
+  text (a scheduled run whose issue text was composed with guidance), the
+  current raw body is compared with that saved body instead. The
+  worker hashes each frozen PRD source at the exact commit through trusted bare
+  git. Issue links to PRD paths that were added or removed are reported as
+  paths (for such a run, between the saved raw body and the current raw body);
+  an added or removed link counts as a contradiction, like a changed or unknown
+  source. A run resumed after a worker restart or reclaim still records the
+  publication observation: the worker fetches the frozen PRD source refs
+  (source identities and hashes, no source text) from the server's coverage status.
+- Each source comes out **unchanged**, **changed** or **unknown** with a reason
+  (for example the forge was unreadable or timed out). Unknown counts as a
+  contradiction, and a flip of only a task-list checkbox is recorded as
+  changed, never as a criterion satisfied.
+- At most 32 observations are kept; the number dropped is counted.
+- It is shown as the owner-only `semantic_drift` field on the run, a
+  `SEMANTIC_DRIFT` row in `uzi run get`, and a short note in the pull request
+  body when the publication-time observation recorded a contradiction. If
+  the drift observations cannot be loaded, the run page (and `uzi run get`)
+  omits the drift section rather than failing.
+
+Drift never holds, refuses, revises or satisfies anything, and it never
+replaces the approved contract; it asks you to look. A scheduled run whose
+frozen issue text was composed (for example with schedule guidance added to the
+issue body) is compared against the raw body saved at creation, so it shows
+**unchanged** until the issue itself is edited.
 
 ## Not the same as an owner pause
 

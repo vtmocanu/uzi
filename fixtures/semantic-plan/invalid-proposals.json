@@ -1,0 +1,82 @@
+{
+  "cases": [
+    {
+      "name": "null evidence path",
+      "from": "\"path\":\"agent/test/semantic-plan.test.ts\"",
+      "to": "\"path\":null",
+      "valid": false
+    },
+    {
+      "name": "null start",
+      "from": "\"start\":0",
+      "to": "\"start\":null",
+      "valid": false
+    },
+    {
+      "name": "missing start",
+      "from": "\"start\":0,",
+      "to": "",
+      "valid": false
+    },
+    {
+      "name": "null end",
+      "from": "\"end\":13",
+      "to": "\"end\":null",
+      "valid": false
+    },
+    {
+      "name": "missing end",
+      "from": ",\"end\":13",
+      "to": "",
+      "valid": false
+    },
+    {
+      "name": "unpaired surrogate 0",
+      "from": "\"Preserve source bytes\"",
+      "to": "\"\\ud800\"",
+      "valid": false
+    },
+    {
+      "name": "unpaired surrogate 1",
+      "from": "\"Preserve source bytes\"",
+      "to": "\"\\udc00\"",
+      "valid": false
+    },
+    {
+      "name": "unpaired surrogate 2",
+      "from": "\"Preserve source bytes\"",
+      "to": "\"\\ud800\\u0061\"",
+      "valid": false
+    },
+    {
+      "name": "unpaired surrogate 3",
+      "from": "\"Preserve source bytes\"",
+      "to": "\"\\ud800\\ud800\"",
+      "valid": false
+    },
+    {
+      "name": "valid Unicode 0",
+      "from": "\"Preserve source bytes\"",
+      "to": "\"\\ud83d\\ude00\"",
+      "valid": true
+    },
+    {
+      "name": "valid Unicode 1",
+      "from": "\"Preserve source bytes\"",
+      "to": "\"\\\\ud800\"",
+      "valid": true
+    },
+    {
+      "name": "valid Unicode 2",
+      "from": "\"Preserve source bytes\"",
+      "to": "\"\\ufffd\"",
+      "valid": true
+    },
+    {
+      "name": "valid Unicode 3",
+      "from": "\"Preserve source bytes\"",
+      "to": "\"�\"",
+      "valid": true
+    }
+  ]
+}

@@ -51,6 +51,7 @@ type stateRequestMinusGateRevision struct {
 	MessagesThroughSeq         *int64                          `json:"messages_through_seq"`
 	CandidateDigest            string                          `json:"candidate_digest,omitempty"`
 	PlanCrossCheckGateReason   *string                         `json:"plan_cross_check_gate_reason"`
+	SemanticPark               *string                         `json:"semantic_park"`
 	PlanCrossCheckDiffRefusal  string                          `json:"plan_cross_check_diff_refusal"`
 	PlanCrossCheckRefusal      string                          `json:"plan_cross_check_refusal"`
 	PlanMd                     *string                         `json:"plan_md"`

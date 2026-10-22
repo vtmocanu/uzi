@@ -133,11 +133,16 @@ func TestMergedPredecessorFairnessAndRestart(t *testing.T) {
 }
 
 func TestMergedPredecessorRefusals(t *testing.T) {
-	for _, kind := range []string{"", "unknown", "opened", "closed", "locked", "wrong_iid", "unreadable", "bad_token", "discard_error", "merged"} {
+	for _, kind := range []string{"", "unknown", "opened", "closed", "locked", "wrong_iid", "unreadable", "bad_token", "discard_error", "too_large", "merged"} {
 		t.Run(kind, func(t *testing.T) {
 			f := &mergeForge{read: func(_ context.Context, _, iid int64) (forge.MergeRequest, error) {
 				if kind == "unreadable" {
 					return forge.MergeRequest{}, errors.New("secret must not be logged")
+				}
+				if kind == "too_large" {
+					// A refused oversized response is unverified evidence even when
+					// the fake also hands back a merged-looking value.
+					return forge.MergeRequest{IID: iid, State: forge.MRStateMerged}, &forge.ResponseTooLargeError{}
 				}
 				if kind == "wrong_iid" {
 					return forge.MergeRequest{IID: iid + 1, State: forge.MRStateMerged}, nil

@@ -21,6 +21,13 @@ import { fakeGitHub } from "../runner-harness.js";
 
 const cfg = JSON.parse(process.env.UZI_CHAIN_BRIDGE_FIXTURE ?? "") as {
   url: string; token: string; origin: string; iid: number; boundary: "tick" | "iteration"; scratch: string;
+  /** Absent: the #2733 overlay-then-chain turn. Present (issue #3242): the turn starts on main's tip,
+   *  origin's main advances by `advance` ("none", a plain file, a workflow change, or deleting files the
+   *  base has), optionally the run commits (`commit`), and a tick publishes. With `descendant` the run
+   *  then commits once more and a second tick publishes the next descendant. */
+  stale?: { advance: "none" | "plain" | "workflow" | "delete"; commit: boolean; descendant: boolean; pause?: boolean };
+  /** A seeded claim (plan supplied at create time, approved, no planning turn). */
+  seeded?: boolean;
 };
 assert.ok(path.isAbsolute(cfg.scratch));
 assert.ok(path.isAbsolute(cfg.origin));
@@ -48,10 +55,24 @@ function commitIn(tree: string, file: string, content: string): string {
 /** Advance main's workflow in the Go-owned bare origin from a scratch clone, so the agent branch
  *  is behind on .github/workflows and the overlay path runs. */
 function advanceOriginWorkflow(): void {
+  advanceOrigin(workflow, `name: ci\non: push\njobs: {}\n# advanced ${cfg.iid}\n`);
+}
+/** Advance main in the Go-owned bare origin by one commit removing paths (files or directories). */
+function removeOnOrigin(paths: string[]): string {
   const work = path.join(local, "origin-work");
-  execFileSync("git", ["clone", "-q", cfg.origin, work], { env: gitEnv });
-  commitIn(work, workflow, `name: ci\non: push\njobs: {}\n# advanced ${cfg.iid}\n`);
+  if (!fs.existsSync(work)) execFileSync("git", ["clone", "-q", cfg.origin, work], { env: gitEnv });
+  gitIn(work, ["rm", "-r", "-q", "--", ...paths]);
+  gitIn(work, [...ident, "commit", "-m", "remove " + paths.join(" ")]);
   gitIn(work, ["push", "-q", "origin", "HEAD:refs/heads/main"]);
+  return gitIn(work, ["rev-parse", "HEAD"]);
+}
+/** Advance main in the Go-owned bare origin by one commit to file, from a scratch clone. */
+function advanceOrigin(file: string, content: string): string {
+  const work = path.join(local, "origin-work");
+  if (!fs.existsSync(work)) execFileSync("git", ["clone", "-q", cfg.origin, work], { env: gitEnv });
+  const tip = commitIn(work, file, content);
+  gitIn(work, ["push", "-q", "origin", "HEAD:refs/heads/main"]);
+  return tip;
 }
 
 // The runner's worker client talks to the in-process FakeApi; only publishCheckpoint is delegated to
@@ -67,10 +88,12 @@ const goClient = new WorkerClient(cfg.url, cfg.token, "0.1.0-test", nullLogger()
 const tips: string[] = [];
 const results: unknown[] = [];
 (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = async (
-  runId: string, tipOid: string, pack: Parameters<WorkerClient["publishCheckpoint"]>[2], signal?: AbortSignal,
+  ...args: Parameters<WorkerClient["publishCheckpoint"]>
 ) => {
+  const [, tipOid] = args;
   tips.push(tipOid);
-  const res = await goClient.publishCheckpoint(runId, tipOid, pack, signal);
+  // Every argument is forwarded (claim generation, attested source); only this RPC reaches Go.
+  const res = await goClient.publishCheckpoint(...args);
   results.push(res);
   return res;
 };
@@ -102,6 +125,42 @@ const runner = new RunRunner(client, gitCache, () => ({
     run: async (ctx: RunContext) => {
       try {
         const progress = { completed: ["m1"], in_progress: [] };
+        if (cfg.stale !== undefined) {
+          // Issue #3242: the run starts on main's tip; origin's main then moves past that base.
+          const stale = cfg.stale;
+          summary.baseTip = gitIn(ctx.worktreePath, ["rev-parse", "HEAD"]);
+          if (stale.pause) {
+            // A tick while main is still the base establishes the tracking ref (its publish is not
+            // confirmed: the Go side answers it with a skip); then main moves and the run, still
+            // without a commit, pauses through the real non-pinned pause publish.
+            fakeNow += INTERVAL_MS + 1;
+            summary.tickOutcome = await fireTick();
+            summary.mainTip = advanceOrigin("upstream.txt", `upstream ${cfg.iid}\n`);
+            const at = { completedCount: 0, total: 1 };
+            summary.parked = await ctx.parkForPause!(at);
+            summary.tips = tips;
+            summary.results = results;
+            return summary.parked ? { branch: ctx.branch, pausedAt: at } : { branch: ctx.branch };
+          }
+          if (stale.advance === "workflow") {
+            summary.mainTip = advanceOrigin(workflow, `name: ci\non: push\njobs: {}\n# advanced ${cfg.iid}\n`);
+          } else if (stale.advance === "plain") {
+            summary.mainTip = advanceOrigin("upstream.txt", `upstream ${cfg.iid}\n`);
+          } else if (stale.advance === "delete") {
+            summary.mainTip = removeOnOrigin(["README.md", "docs"]);
+          }
+          if (stale.commit) summary.workTip = commitIn(ctx.worktreePath, "w.txt", "W\n");
+          fakeNow += INTERVAL_MS + 1;
+          summary.tickOutcome = await fireTick();
+          if (stale.descendant) {
+            summary.descendantTip = commitIn(ctx.worktreePath, "d.txt", "D\n");
+            fakeNow += INTERVAL_MS + 1;
+            summary.descendantOutcome = await fireTick();
+          }
+          summary.tips = tips;
+          summary.results = results;
+          return { branch: ctx.branch };
+        }
         summary.realTip = commitIn(ctx.worktreePath, "r.txt", "R\n");
         advanceOriginWorkflow();
         await ctx.checkpoint!({ reap: true, progress });
@@ -137,6 +196,7 @@ const claim = makeClaim({
   issue_title: `Bridge ${cfg.iid}`,
   repo: { id: "r1", url: "https://github.com/org/repo", clone_url: cfg.origin, forge_type: "github" },
   secrets: { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "dummy-oauth-do-not-scan" },
+  ...(cfg.seeded ? { plan_source: "seeded" as const, plan_approved: true, plan_md: `# Seeded plan ${cfg.iid}\n` } : {}),
 });
 let code = 0;
 try {

@@ -157,6 +157,29 @@ describe("issue #1828: the finalize gate", { skip: process.platform !== "linux" 
     assert.equal(fs.existsSync(worktreeDirFor(iid)), true, "the clone is kept");
   });
 
+  it("survivor classes ride in the detail (capped), and the verdict is the same blocked finalize", TIMEOUT, async () => {
+    const { gitlab, calls: mrCalls } = fakeGitlab();
+    const iid = 18283;
+    simulateCommittedWork();
+    const { quiesceRun } = quiescentProof();
+    const classed: RunProcessReap = {
+      killed: [],
+      left: [41, 42, 43, 44, 45, 46, 47],
+      leftReasons: { 41: "worker_child", 42: "unreadable", 43: "restarted", 44: "kill_failed" },
+      complete: true,
+    };
+    const claim = gitlabClaim(iid);
+    await runnerWith(withReap(finalizeFactory, reapScript([COMPLETE, classed])), gitlab, undefined, undefined, { quiesceRun }).execute(claim);
+    const failed = lastFailed(claim.run_id);
+    assert.equal(failed?.fail_origin, "worker_residue_blocked");
+    assert.match(
+      String(failed?.failure_reason),
+      /HOME-attributed reap left 7 process\(es\): pids 41\(worker_child\),42\(unreadable\),43\(restarted\),44\(kill_failed\),45,\+2 more/,
+    );
+    assert.equal(mrCalls.length, 0, "nothing was published");
+    assert.equal(fs.existsSync(worktreeDirFor(iid)), true, "the clone is kept");
+  });
+
   it("control: a complete reap finalizes and retires the clone as before", TIMEOUT, async () => {
     const { gitlab, calls: mrCalls } = fakeGitlab();
     const iid = 18283;

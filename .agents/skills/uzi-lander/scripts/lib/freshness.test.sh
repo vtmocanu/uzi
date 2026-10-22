@@ -2,6 +2,9 @@
 # freshness.test.sh — skill_scripts_stale reads 0 on a match, 1 behind or edited, unknown
 # outside git or without origin/main. Hermetic: a throwaway repo and a bare "origin".
 set -euo pipefail
+# Fixture repos must not read host git config: a global core.fsmonitor=true
+# leaves a detached fsmonitor daemon per repo on macOS.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/freshness.sh
 . "$HERE/freshness.sh"

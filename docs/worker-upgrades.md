@@ -36,6 +36,27 @@ fall back only at exactly the claim revision (default 1). A different
 revision without scope holds closed. Upgrade both components for current
 scope rendering; see [Completion holds](run-completion-hold.md).
 
+## Semantic completion capabilities (dormant)
+
+**Dormant.** Production enrollment is off until #1231, so no real run needs these
+capabilities yet. They are built so the fleet can be upgraded ahead of
+activation; new workers advertise both unconditionally.
+
+| Capability | Who needs it | If missing |
+|---|---|---|
+| `cross_check_semantic_plan_v1` | The plan-checker child of a semantic lead: a hard claim clause, outside override paths | No worker can claim the check. It waits to its deadline and the lead takes the existing deadline-to-human gate; there is no fallback to the structural check. |
+| `completion_semantic_publication_v1` | A semantic lead worker: a hard claim clause, and also a negotiated API feature the worker consults before publishing | A semantic run stays queued with a health reason naming the protocol. A worker without the API feature holds instead of publishing pending maintainer proof. |
+
+`completion_non_closing_v1` alone is not enough for either. The two semantic
+capabilities do not imply each other, and neither implies readiness for the
+#1231 completion audit. Workers without them keep claiming structural and legacy
+runs as before. Roll the API first, then the workers, as for
+[`completion_non_closing_v1`](#completion-publication-compatibility); see
+[Autopilot](autopilot.md#semantic-runs-park-instead-of-auto-approving-dormant) for
+what the park looks like and
+[Completion holds](run-completion-hold.md#maintainer-outstanding-proof-on-semantic-runs-dormant)
+for the publication side.
+
 ## Display states
 
 | Badge | Meaning | Action |

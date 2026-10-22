@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/issueinput"
@@ -186,6 +187,10 @@ func completionNonClosingClaim(run store.Run) *CompletionNonClosing {
 // CLAIMING worker, not just the run, because since PRD #104 M3 the credential a
 // run spends can depend on which worker picked it up.
 func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store.Run) (*ClaimPayload, error) {
+	pending, pendingErr := CompletionPending(run)
+	if pendingErr != nil {
+		return nil, pendingErr
+	}
 	if run.Kind == runkind.CrossCheck {
 		if err := validateCrossCheckContext(run.IssueTitle, run.IssueDescription); err != nil {
 			return nil, err
@@ -713,6 +718,8 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		Branch:         textPtr(branch),
 		SessionID:      sessionID,
 		CheckpointTip:  textPtr(run.CheckpointTip),
+		// Issue #3194: read off the claimed run row, never derived from ownership or the tip.
+		CheckpointAttestedSource: textPtr(run.CheckpointAttestedSource),
 		// PRD #1247 M9 (task c): the last_seq recordRunCredential actually landed — bumped past any
 		// 'credential_switch' message it just inserted — NOT the stale run.LastSeq snapshot, so the
 		// worker never re-uses the server-inserted message's seq. Equals run.LastSeq when no switch
@@ -903,8 +910,9 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			// decisions (deferred milestone ids+titles+reasons, accepted id+text+reason). nil for a
 			// contract with neither a deferred nor an accepted set (legacy / non-interlocked /
 			// revision-1), so omitempty keeps such a claim byte-identical to today's.
-			CompletionScope: CompletionScopeClaim(run.CompletionContract),
-			NonClosing:      completionNonClosingClaim(run),
+			CompletionScope:   CompletionScopeClaim(run.CompletionContract, run.MilestonesFrozen),
+			CompletionPending: pending,
+			NonClosing:        completionNonClosingClaim(run),
 		},
 	}
 
@@ -990,6 +998,27 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		}
 	}
 
+	if run.Kind != runkind.CrossCheck {
+		if reader, ok := s.q.(interface {
+			GetSemanticPlanning(context.Context, uuid.UUID) (store.GetSemanticPlanningRow, error)
+		}); ok {
+			planning, err := reader.GetSemanticPlanning(ctx, run.ID)
+			if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+				return nil, err
+			}
+			if err == nil {
+				var enrollment apitypes.SemanticEnrollment
+				if err := strictSemanticJSON(planning.Enrollment, &enrollment); err != nil {
+					return nil, err
+				}
+				if enrollment.Profile != "semantic" || !validCoveragePolicy(enrollment.Policy) {
+					return nil, errCoverageUnavailable
+				}
+				payload.SemanticPlanning = &enrollment
+				payload.IssueDescription = run.IssueDescription
+			}
+		}
+	}
 	return payload, nil
 }
 

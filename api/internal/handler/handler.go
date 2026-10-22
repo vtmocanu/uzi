@@ -1200,6 +1200,16 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.Post("/runs/{id}/state", h.WorkerRunState)
 		r.Post("/runs/{id}/memory/reserve", h.WorkerMemoryReserve)
 		r.Post("/runs/{id}/memory/outcome", h.WorkerMemoryOutcome)
+		// Bound semantic body-decoding work per worker, including while production enrollment is off.
+		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/semantic/candidate", h.WorkerSemanticCandidate)
+		// PRD #1230 D5: each call reads the run's issue from the forge (best effort), so it rides
+		// the per-worker limiter like the other forge-touching worker writes. The service
+		// pre-checks ownership, generation and enrolment before that read.
+		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/semantic/observation", h.WorkerSemanticObservation)
+		r.Get("/runs/{id}/semantic/coverage", h.WorkerSemanticCoverageStatus)
+		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/semantic/coverage/reserve", h.WorkerSemanticCoverageReserve)
+		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/semantic/coverage/settle", h.WorkerSemanticCoverageSettle)
+		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/semantic/coverage/publish", h.WorkerSemanticCoveragePublish)
 		r.Post("/runs/{id}/cross-checks", h.WorkerSubmitPlanCrossCheck)
 		r.Get("/runs/{id}/cross-checks/code/latest", h.WorkerCodeCrossCheckStatus)
 		r.Post("/runs/{id}/cross-checks/code/dispositions", h.WorkerCodeCrossCheckDispositions)
@@ -1237,6 +1247,10 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.Post("/runs/{id}/wall-park", h.WorkerRunWallPark)
 		r.Post("/runs/{id}/policy-hold", h.WorkerRunPolicyHold)
 		r.Post("/runs/{id}/pause", h.WorkerRunPause)
+		// issue #3194: the --require-base base-attestation HOLD. The worker's preflight guard found
+		// retained work no checkpoint attests; the service parks its own live claim (running ->
+		// paused, hold_reason='base_attestation_missing') before the agent ever runs.
+		r.Post("/runs/{id}/base-attestation-hold", h.WorkerRunBaseAttestationHold)
 
 		// Ownership/terminality probe (#559): worker-authenticated, run-scoped,
 		// READ ONLY. The interactive park-SKIP path polls it to detect a mid-turn

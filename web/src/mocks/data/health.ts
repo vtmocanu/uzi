@@ -3,7 +3,7 @@ import { minsAgo } from "./time";
 
 // Admin-health fixtures (PRD #1484 M4). These stand in for GET /api/admin/health in mock
 // mode and back the Health-tab component tests. They mirror the real registry
-// (api/internal/healthsvc): all 21 of its check ids, in the SAME stable order the
+// (api/internal/healthsvc): all 22 of its check ids, in the SAME stable order the
 // server emits (service.go Evaluate), so the demo and the tests exercise a well-formed document.
 //
 // Summaries here are illustrative demo copy, not byte-for-byte the server's templates — the
@@ -17,6 +17,7 @@ const CHECK_META: { id: string; scope: string; group: string; title: string; doc
   { id: "fleet.disk", scope: "owner", group: "workers", title: "Worker disk", doc: "hosted-workers" },
   { id: "fleet.rundisk", scope: "owner", group: "workers", title: "Run disk size", doc: "hosted-workers" },
   { id: "fleet.quarantine", scope: "owner", group: "workers", title: "Worker residue quarantine", doc: "hosted-workers" },
+  { id: "fleet.memory_authority", scope: "owner", group: "workers", title: "Worker memory authority", doc: "hosted-workers" },
   { id: "queue.waiting", scope: "owner", group: "queue", title: "Runs waiting for a worker", doc: null },
   { id: "queue.undispatched", scope: "owner", group: "queue", title: "Undispatched task runs", doc: null },
   { id: "controller.report", scope: "instance", group: "control", title: "Controller reporting", doc: "hosted-workers" },
@@ -42,6 +43,7 @@ const OK_SUMMARY: Record<string, string> = {
   "fleet.disk": "No worker is under sustained disk pressure.",
   "fleet.rundisk": "No run is close to filling its worker's data volume.",
   "fleet.quarantine": "No worker reports a residue quarantine.",
+  "fleet.memory_authority": "No worker has lost memory authority.",
   "queue.waiting": "No run is waiting for a worker.",
   "queue.undispatched": "No task run is stuck undispatched.",
   "controller.report": "The controller is reporting.",

@@ -22,7 +22,7 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
@@ -123,11 +123,49 @@ describe("entrypoint fixture scratch selection", () => {
   });
 });
 
+/**
+ * Issue #3153 (race-safe scratch normalisation): sh snippet for the chown/chmod stubs that appends
+ * "<verb> <operands>" to $OPLOG with every directory operand resolved to its PHYSICAL path ("." is
+ * the physical cwd), so an op that follows a swapped-in symlink is logged under the symlink's TARGET.
+ * A chown -h operand that is a symlink stays unresolved (it acts on the link itself).
+ */
+function logOpsSnippet(verb: "chown" | "chmod"): string {
+  return (
+    'ops=\nfor a in "$@"; do\n' +
+    '  case "$a" in\n' +
+    '    .) a=$(pwd -P) ;;\n' +
+    "    -*) ;;\n" +
+    `    *) if [ -d "$a" ] && { [ ! -L "$a" ] || [ ${verb === "chmod" ? "1 = 1" : "1 = 0"} ]; }; then a=$(cd -P -- "$a" && pwd -P); fi ;;\n` +
+    "  esac\n" +
+    '  ops="$ops $a"\n' +
+    "done\n" +
+    `printf "${verb}%s\\n" "$ops" >> "$OPLOG"\n`
+  );
+}
+
+/**
+ * Test seam: STUB_SWAP_LEAF/STUB_SWAP_STANDIN make the FIRST `chown -h 0:0 .` (the normaliser's
+ * reclaim, after its cd) rename the leaf aside and plant a symlink to the standin at its name.
+ */
+const SWAP_ON_FIRST_RECLAIM =
+  'if [ -n "${STUB_SWAP_LEAF:-}" ] && [ "${1:-}" = "-h" ] && [ "${2:-}" = "0:0" ] && [ "${3:-}" = "." ] && [ ! -e "$OPLOG.swapped" ]; then\n' +
+  '  : > "$OPLOG.swapped"\n' +
+  '  /bin/mv "$STUB_SWAP_LEAF" "$STUB_SWAP_LEAF.moved"\n' +
+  '  /bin/ln -s "$STUB_SWAP_STANDIN" "$STUB_SWAP_LEAF"\n' +
+  "fi\n";
+
 // tokenViaEnv (issue #1761): leave the entrypoint's TOKEN line as shipped, so the token
 // path can only reach the script through UZI_WORKER_TOKEN_FILE (run() passes it). Proves
 // the posture checks follow the env rather than a /run/secrets literal.
 function makeHarness(opts: { mutate?: (patched: string) => string; tokenViaEnv?: boolean; realChmod?: string[] } = {}): Harness {
-  const root = allocateFixture();
+  // Resolve symlinks: the worker-uid lane makes the fixture root a symlinked path, and the op-log
+  // snippet records physical paths, so assertions on logged paths need the physical root.
+  const root = fs.realpathSync(allocateFixture());
+  // BSD directories inherit the parent's group, and a BSD kernel may EPERM a setgid chmod (the
+  // entrypoint's `chmod 3775` on the legacy roots, or a test's own setgid fixture) on a dir whose
+  // group the caller is not in. Put the root in the effective group first, for every fixture.
+  const rootSt = fs.statSync(root);
+  fs.chownSync(root, rootSt.uid, process.getegid!());
   const data = path.join(root, "data");
   const nix = path.join(root, "nix");
   const token = path.join(root, "token");
@@ -153,20 +191,30 @@ function makeHarness(opts: { mutate?: (patched: string) => string; tokenViaEnv?:
   writeStub(
     stubDir,
     "chown",
-    '#!/bin/sh\nprintf "chown %s\\n" "$*" >> "$OPLOG"\n' +
+    "#!/bin/sh\n" + SWAP_ON_FIRST_RECLAIM + logOpsSnippet("chown") +
       'if [ -n "${STUB_ROFS_TOKEN:-}" ] && [ "$1" = "0:0" ] && [ "$2" = "$STUB_ROFS_TOKEN" ]; then exit 1; fi\n' +
       '[ -n "${STUB_NOOP:-}" ] && exit 0\n/bin/chown "$@" 2>/dev/null || true\nexit 0\n',
   );
   writeStub(
     stubDir,
     "chmod",
-    '#!/bin/sh\nprintf "chmod %s\\n" "$*" >> "$OPLOG"\n' +
+    "#!/bin/sh\n" + logOpsSnippet("chmod") +
       '[ -n "${STUB_NOOP:-}" ] && exit 0\n/bin/chmod "$@" 2>/dev/null || true\nexit 0\n',
   );
   writeStub(
     stubDir,
     "mkdir",
     '#!/bin/sh\nprintf "mkdir %s\\n" "$*" >> "$OPLOG"\n' +
+      // Issue #3153: a Docker-lane per-uid scratch leaf under the sandbox is created for real even
+      // under STUB_NOOP (the normaliser must cd into it), and its inode is recorded in fresh-ids so
+      // the busybox stat stub can report it as root-owned (what a real fresh mkdir yields).
+      'for last in "$@"; do :; done\n' +
+      'case "${last##*/}" in uzi-worker|uzi-runner)\n' +
+      '  case "$last" in "$(dirname "$OPLOG")"/*)\n' +
+      '    /bin/mkdir "$last" 2>/dev/null && { STUB_STAT_FROM=mkdir ${STUB_STAT:-stat} -c %i "$last" 2>/dev/null || STUB_STAT_FROM=mkdir ${STUB_STAT:-stat} -f %i "$last"; } >> "$(dirname "$OPLOG")/fresh-ids"\n' +
+      "    exit 0 ;;\n" +
+      "  esac ;;\n" +
+      "esac\n" +
       '[ -n "${STUB_NOOP:-}" ] && exit 0\n/bin/mkdir "$@" 2>/dev/null || true\nexit 0\n',
   );
   writeStub(
@@ -189,6 +237,39 @@ function makeHarness(opts: { mutate?: (patched: string) => string; tokenViaEnv?:
     "busybox",
     '#!/bin/sh\nsub=$1; shift\ncase "$sub" in\n' +
       "  stat)\n" +
+      // Issue #3153: the Docker-lane per-uid scratch posture probe (`stat -c '%U %a %d:%i' <leaf>`, one stat). The
+      // owner NAME is faked per leaf (STUB_OWNER_WORKER / STUB_OWNER_RUNNER) because the suite cannot
+      // chown; the mode is the REAL mode of the fixture dir.
+      // Race-safe normalisation additionally probes identity: `-c '%U %d:%i'` (path or
+      // `.`) and the plain lstat `-c %d:%i`. Owner is keyed by the basename of the PHYSICAL directory
+      // (so a symlink swapped in, and followed by `cd -P`, reports the standin's name); a symlink
+      // operand reports a non-matching owner (lstat semantics); an inode recorded by the mkdir stub
+      // reports root. Device:inode are the real ones. Every stat goes through ${STUB_STAT:-stat} (GNU first, BSD
+      // `-f` fallback) so UZI_TEST_STUB_STAT can substitute a BSD-stat emulation shim; STUB_STAT_FROM names the caller.
+      '    if [ "$#" -eq 3 ] && [ "$1" = "-c" ] && { [ "$2" = "%U %a %d:%i" ] || [ "$2" = "%U %d:%i" ] || [ "$2" = "%d:%i" ]; }; then\n' +
+      '      di=$(STUB_STAT_FROM=busybox ${STUB_STAT:-stat} -c %d:%i "$3" 2>/dev/null || STUB_STAT_FROM=busybox ${STUB_STAT:-stat} -f %d:%i "$3" 2>/dev/null) || exit 1\n' +
+      '      [ "$2" = "%d:%i" ] && { printf "%s\\n" "$di"; exit 0; }\n' +
+      '      if [ -L "$3" ]; then o=linkowner; else\n' +
+      '        if [ "$3" = . ]; then d=$(pwd -P); else d=$(cd -P -- "$3" 2>/dev/null && pwd -P) || d=$3; fi\n' +
+      '        case "${d##*/}" in\n' +
+      // Owner is an inode property, so a leaf renamed to `<leaf>.moved` keeps its owner.
+      '          uzi-worker|uzi-worker.moved) o=${STUB_OWNER_WORKER:-worker} ;;\n' +
+      '          uzi-runner|uzi-runner.moved) o=${STUB_OWNER_RUNNER:-runner} ;;\n' +
+      "          *) o=root ;;\n" +
+      "        esac\n" +
+      '        ino=$(STUB_STAT_FROM=busybox ${STUB_STAT:-stat} -c %i "$3" 2>/dev/null || STUB_STAT_FROM=busybox ${STUB_STAT:-stat} -f %i "$3" 2>/dev/null)\n' +
+      '        if [ -n "$ino" ] && [ -f "$(dirname "$OPLOG")/fresh-ids" ] && grep -qx "$ino" "$(dirname "$OPLOG")/fresh-ids"; then o=root; fi\n' +
+      "      fi\n" +
+      // BSD `%Lp` drops the special bits; `%Mp%Lp` keeps them (`2770`, `0755`), so strip the leading
+      // zero to match GNU `%a`.
+      '      m=$(STUB_STAT_FROM=busybox ${STUB_STAT:-stat} -c %a "$3" 2>/dev/null || STUB_STAT_FROM=busybox ${STUB_STAT:-stat} -f %Mp%Lp "$3" 2>/dev/null) || exit 1\n' +
+      '      case "$m" in 0?*) m=${m#0} ;; esac\n' +
+      '      case "$2" in\n' +
+      '        "%U %a %d:%i") printf "%s %s %s\\n" "$o" "$m" "$di" ;;\n' +
+      '        *) printf "%s %s\\n" "$o" "$di" ;;\n' +
+      "      esac\n" +
+      "      exit 0\n" +
+      "    fi\n" +
       '    if [ "$#" -eq 3 ] && [ "$1" = "-c" ] && [ "$2" = "%h" ]; then\n' +
       '      n=$(ls -ld -- "$3" 2>/dev/null | awk \'{print $2}\')\n' +
       '      case "$n" in ""|*[!0-9]*) exit 1 ;; esac\n' +
@@ -216,7 +297,7 @@ function makeHarness(opts: { mutate?: (patched: string) => string; tokenViaEnv?:
   if (opts.realChmod) {
     // Opt-in filesystem proof: chown stays best-effort and setpriv stays stubbed.
     // Suppressing chown here also prevents a real ownership change from hiding chmod drift.
-    writeStub(stubDir, "chown", '#!/bin/sh\nprintf "chown %s\\n" "$*" >> "$OPLOG"\n');
+    writeStub(stubDir, "chown", "#!/bin/sh\n" + SWAP_ON_FIRST_RECLAIM + logOpsSnippet("chown"));
     for (const verb of ["chmod", "mkdir", "rm"]) {
       writeStub(stubDir, verb, `#!${process.execPath}
 const fs = require("node:fs");
@@ -240,7 +321,9 @@ for (const target of targets) {
   while (!fs.existsSync(existing)) existing = path.dirname(existing);
   inside(fs.realpathSync(existing));
 }
-fs.appendFileSync(process.env.OPLOG, verb + " " + args.join(" ") + "\\n");
+// chmod operands are logged by PHYSICAL path, so a followed symlink shows up as its target.
+const logged = verb === "chmod" ? args.map((a, i) => (i > 0 && fs.existsSync(a) ? fs.realpathSync(a) : a)) : args;
+fs.appendFileSync(process.env.OPLOG, verb + " " + logged.join(" ") + "\\n");
 function snapshot(p) {
   const st = fs.lstatSync(p);
   if (!st.isDirectory() || st.isSymbolicLink()) return;
@@ -255,6 +338,7 @@ if (result.error) throw result.error;
 if (result.status !== 0) process.exit(result.status ?? 1);
 if (verb === "mkdir") {
   for (const p of targets) fs.appendFileSync(path.join(root, "mkdir.jsonl"), JSON.stringify({ path: p, mode: fs.statSync(p).mode & 0o7777 }) + "\\n");
+  for (const p of targets) fs.appendFileSync(path.join(root, "fresh-ids"), String(fs.statSync(p, { bigint: true }).ino) + "\\n");
 }
 `);
     }
@@ -496,6 +580,8 @@ function run(h: Harness, extraEnv: Record<string, string> = {}): RunResult {
       PATH: process.env.PATH ?? "/usr/bin:/bin",
       HOME: h.root,
       OPLOG: h.opLog,
+      // Test-only seam to emulate BSD stat in the stubs; absent unless set.
+      ...(process.env.UZI_TEST_STUB_STAT ? { STUB_STAT: process.env.UZI_TEST_STUB_STAT } : {}),
       ...extraEnv,
     },
   });
@@ -772,11 +858,13 @@ describe("PRD #1493 M2: root-branch migration ownership map (portable, record-on
       fs.mkdirSync(h.nix);
       fs.writeFileSync(h.token, "t");
       const workdir = path.join(h.data, "runner"); // the DinD-shared workdir the pod pre-sets
+      fs.mkdirSync(workdir); // the leaves are really created (and then stat'ed) beneath it
       const r = run(h, { STUB_NOOP: "1", TMPDIR: workdir });
       assert.equal(r.status, 0, `ambient-TMPDIR run must succeed (stderr: ${r.stderr})`);
       // Both private tmpdirs are created BENEATH the ambient TMPDIR (bind sources resolve in
       // the DinD-shared workdir), and the worker's is exported as TMPDIR across the drop.
-      assert.ok(opMatches(r.ops, "mkdir", `${workdir}/uzi-worker`, `${workdir}/uzi-runner`), "tmpdirs must derive beneath the ambient TMPDIR");
+      // Issue #3153: the Docker lane creates each ABSENT leaf with its own plain (non -p) mkdir.
+      assert.ok(opMatches(r.ops, "mkdir", `${workdir}/uzi-worker`) && opMatches(r.ops, "mkdir", `${workdir}/uzi-runner`), "tmpdirs must derive beneath the ambient TMPDIR");
       assert.equal(r.env.get("TMPDIR"), `${workdir}/uzi-worker`, "TMPDIR must be the derived worker tmp");
       assert.equal(r.env.get("UZI_RUNNER_TMPDIR"), `${workdir}/uzi-runner`, "UZI_RUNNER_TMPDIR must be the derived runner tmp");
     } finally {
@@ -1388,5 +1476,527 @@ describe("PRD #1493 M2: legacy run HOME survives migration and still validates (
     } finally {
       fs.rmSync(h.root, { recursive: true, force: true });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Issue #3153: the Docker-lane TMPDIR carve-out (`/data/runner/.tmp`) and the per-uid scratch
+// under it. `/data/runner` is a subPath of the PERSISTENT data volume, so nothing there is ever
+// recursively wiped or re-owned: an existing leaf is adopted only when it is a real directory
+// owned by its expected user (runner leaf: any mode; worker leaf: no group/other write), then
+// normalised leaf-only to 0700; anything else fails startup closed.
+// ---------------------------------------------------------------------------------------------
+describe("issue #3153: Docker-lane per-uid scratch adopt-or-refuse (portable, record-only)", () => {
+  interface Lane { h: Harness; runnerRoot: string; carve: string; worker: string; runner: string }
+  function lane(setup?: (l: Lane) => void, carveExists = true): Lane {
+    const h = makeHarness();
+    fs.mkdirSync(h.data);
+    fs.mkdirSync(h.nix);
+    fs.writeFileSync(h.token, "t");
+    const runnerRoot = path.join(h.data, "runner");
+    const carve = path.join(runnerRoot, ".tmp");
+    fs.mkdirSync(runnerRoot);
+    if (carveExists) fs.mkdirSync(carve);
+    const l: Lane = { h, runnerRoot, carve, worker: path.join(carve, "uzi-worker"), runner: path.join(carve, "uzi-runner") };
+    setup?.(l);
+    return l;
+  }
+  function leaf(dir: string, mode = 0o700): void {
+    fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(dir, "PRECIOUS"), "x");
+    fs.mkdirSync(path.join(dir, "nested"));
+    fs.chmodSync(dir, mode);
+  }
+  /** Any op that names a per-uid leaf (or something under it). */
+  const touching = (ops: string[], ...dirs: string[]): string[] => ops.filter((o) => dirs.some((d) => o.includes(d)));
+  const cleanup = (l: Lane): void => { fs.rmSync(l.h.root, { recursive: true, force: true }); };
+
+  it("adopts matching 0700 leaves: contents preserved, no rm / chown / chmod / mkdir on them, diagnostic printed", () => {
+    const l = lane((x) => { leaf(x.worker); leaf(x.runner); });
+    try {
+      const r = run(l.h, { STUB_NOOP: "1", TMPDIR: l.carve });
+      assert.equal(r.status, 0, r.stderr);
+      assert.deepEqual(touching(r.ops, l.worker, l.runner), [], "no op may touch an adopted leaf");
+      assert.equal(r.ops.filter((o) => o.startsWith("rm ")).length, 0, "no rm on the Docker lane");
+      assert.ok(!r.ops.some((o) => o.startsWith("chown -R") && o.includes(".tmp")), "no recursive chown of the carve-out");
+      assert.ok(r.stderr.includes(`uzi-entrypoint: per-uid scratch adopted (contents preserved, writer exclusion not established): ${l.worker} entries=2 previous_mode=700\n`), r.stderr);
+      assert.ok(r.stderr.includes(`uzi-entrypoint: per-uid scratch adopted (contents preserved, writer exclusion not established): ${l.runner} entries=2 previous_mode=700\n`), r.stderr);
+      assert.equal(fs.readFileSync(path.join(l.worker, "PRECIOUS"), "utf8"), "x");
+      assert.equal(fs.readFileSync(path.join(l.runner, "PRECIOUS"), "utf8"), "x");
+      assert.equal(r.env.get("TMPDIR"), l.worker);
+      assert.equal(r.env.get("UZI_RUNNER_TMPDIR"), l.runner);
+    } finally { cleanup(l); }
+  });
+
+  it("re-asserts the carve-out root every boot: reclaim, chmod 00755, hand-over to worker:worker (no recursion)", () => {
+    const l = lane();
+    try {
+      const r = run(l.h, { STUB_NOOP: "1", TMPDIR: l.carve });
+      assert.equal(r.status, 0, r.stderr);
+      const reclaim = r.ops.indexOf(`chown -h 0:0 ${l.carve}`);
+      const chmod = r.ops.indexOf(`chmod 00755 ${l.carve}`);
+      const handover = r.ops.indexOf(`chown -h worker:worker ${l.carve}`);
+      assert.ok(reclaim >= 0 && chmod > reclaim && handover > chmod, `ops: ${r.ops.join(" | ")}`);
+    } finally { cleanup(l); }
+  });
+
+  it("creates ABSENT leaves fresh (mkdir, chmod 00700, chown -h) without any rm", () => {
+    const l = lane();
+    try {
+      const r = run(l.h, { STUB_NOOP: "1", TMPDIR: l.carve });
+      assert.equal(r.status, 0, r.stderr);
+      for (const [dir, owner] of [[l.worker, "worker:worker"], [l.runner, "runner:runner"]] as const) {
+        const mk = r.ops.findIndex((o) => o === `mkdir ${dir}`);
+        const mode = r.ops.findIndex((o, i) => i > mk && o === `chmod 00700 ${dir}`);
+        const own = r.ops.findIndex((o, i) => i > mode && o === `chown -h ${owner} ${dir}`);
+        assert.ok(mk >= 0 && mode > mk && own > mode, `${dir}: ${r.ops.join(" | ")}`);
+        // Leaf only: mkdir, then reclaim -> chmod -> hand-back of the leaf itself (operands are the
+        // physical path the stubs resolved "." / the leaf to), nothing else under the carve-out.
+        assert.deepEqual(
+          touching(r.ops, dir),
+          [`mkdir ${dir}`, `chown -h 0:0 ${dir}`, `chmod 00700 ${dir}`, `chown -h ${owner} ${dir}`],
+          "leaf-only creation ops",
+        );
+      }
+      assert.equal(r.ops.filter((o) => o.startsWith("rm ")).length, 0);
+    } finally { cleanup(l); }
+  });
+
+  // Adoption of a wider-mode leaf normalises THE LEAF ONLY (reclaim -> chmod 00700 -> hand-back),
+  // never recursively, never with rm.
+  for (const [name, setup, mode, which] of [
+    ["a runner leaf at 755", (x: Lane) => { leaf(x.worker); leaf(x.runner, 0o755); }, "755", "runner"],
+    ["a runner leaf at 2777", (x: Lane) => { leaf(x.worker); leaf(x.runner, 0o2777); }, "2777", "runner"],
+    ["a worker leaf at 750", (x: Lane) => { leaf(x.worker, 0o750); leaf(x.runner); }, "750", "worker"],
+  ] as const) {
+    it(`adopts ${name} and normalises the leaf only`, () => {
+      const l = lane(setup);
+      try {
+        const r = run(l.h, { STUB_NOOP: "1", TMPDIR: l.carve });
+        assert.equal(r.status, 0, r.stderr);
+        const dir = which === "runner" ? l.runner : l.worker;
+        const owner = which === "runner" ? "runner:runner" : "worker:worker";
+        const reclaim = r.ops.indexOf(`chown -h 0:0 ${dir}`);
+        const chmod = r.ops.indexOf(`chmod 00700 ${dir}`);
+        const handback = r.ops.indexOf(`chown -h ${owner} ${dir}`);
+        assert.ok(reclaim >= 0 && chmod > reclaim && handback > chmod, `ops: ${r.ops.join(" | ")}`);
+        assert.deepEqual(touching(r.ops, dir).sort(), [`chmod 00700 ${dir}`, `chown -h 0:0 ${dir}`, `chown -h ${owner} ${dir}`].sort(), "leaf-only ops");
+        assert.ok(!touching(r.ops, l.carve).some((o) => /^(chown|chmod) (-R|.* -R)/.test(o)), "no recursive op under the carve-out");
+        assert.equal(r.ops.filter((o) => o.startsWith("rm ")).length, 0, "no rm");
+        assert.ok(r.stderr.includes(`${dir} entries=2 previous_mode=${mode}\n`), r.stderr);
+        assert.equal(fs.readFileSync(path.join(dir, "PRECIOUS"), "utf8"), "x");
+      } finally { cleanup(l); }
+    });
+  }
+
+  for (const [name, setup, env, reason] of [
+    ["a leaf owned by someone else", (x: Lane) => { leaf(x.worker); leaf(x.runner); }, { STUB_OWNER_RUNNER: "worker" }, /owner is worker, expected runner/],
+    ["a worker leaf owned by someone else", (x: Lane) => { leaf(x.worker); leaf(x.runner); }, { STUB_OWNER_WORKER: "runner" }, /owner is runner, expected worker/],
+    ["a worker leaf at 770", (x: Lane) => { leaf(x.worker, 0o770); leaf(x.runner); }, {}, /mode is 770, group\/other write set/],
+    ["a worker leaf at 2770 (fsGroup re-walk)", (x: Lane) => { leaf(x.worker, 0o2770); leaf(x.runner); }, {}, /mode is 2770, group\/other write set/],
+  ] as const) {
+    it(`fails closed on ${name}: non-zero exit, specific message, nothing removed, re-owned or re-moded`, () => {
+      const l = lane(setup);
+      try {
+        const r = run(l.h, { STUB_NOOP: "1", TMPDIR: l.carve, ...env });
+        assert.notEqual(r.status, 0);
+        assert.match(r.stderr, /refusing to start: per-uid scratch .* cannot be safely adopted \(/);
+        assert.match(r.stderr, reason);
+        assert.match(r.stderr, /contents preserved; see ADR-3153 operator procedure/);
+        assert.deepEqual(touching(r.ops, l.worker, l.runner), [], "no op may touch either leaf");
+        assert.equal(r.ops.filter((o) => o.startsWith("rm ")).length, 0);
+        assert.equal(fs.readFileSync(path.join(l.worker, "PRECIOUS"), "utf8"), "x");
+        assert.equal(r.env.size, 0, "must not reach the privilege drop");
+      } finally { cleanup(l); }
+    });
+  }
+
+  it("fails closed on a symlink leaf and leaves its target untouched", () => {
+    const l = lane((x) => {
+      const target = path.join(x.h.root, "elsewhere");
+      fs.mkdirSync(target);
+      fs.writeFileSync(path.join(target, "keep"), "k");
+      fs.symlinkSync(target, x.worker);
+    });
+    try {
+      const r = run(l.h, { STUB_NOOP: "1", TMPDIR: l.carve });
+      assert.notEqual(r.status, 0);
+      assert.match(r.stderr, /per-uid scratch .*uzi-worker cannot be safely adopted \(is a symlink\)/);
+      assert.deepEqual(touching(r.ops, l.worker, l.runner), []);
+      assert.ok(fs.lstatSync(l.worker).isSymbolicLink());
+      assert.equal(fs.readFileSync(path.join(l.h.root, "elsewhere", "keep"), "utf8"), "k");
+    } finally { cleanup(l); }
+  });
+
+  it("fails closed on a non-directory leaf", () => {
+    const l = lane((x) => { fs.writeFileSync(x.runner, "file"); });
+    try {
+      const r = run(l.h, { STUB_NOOP: "1", TMPDIR: l.carve });
+      assert.notEqual(r.status, 0);
+      assert.match(r.stderr, /uzi-runner cannot be safely adopted \(is not a directory\)/);
+      assert.equal(fs.readFileSync(l.runner, "utf8"), "file");
+      assert.deepEqual(touching(r.ops, l.worker, l.runner), []);
+    } finally { cleanup(l); }
+  });
+
+  it("refuses a symlinked carve-out root and a non-directory one, touching nothing", () => {
+    for (const kind of ["symlink", "file"] as const) {
+      const l = lane((x) => {
+        fs.rmdirSync(x.carve);
+        if (kind === "symlink") {
+          fs.mkdirSync(path.join(x.h.root, "elsewhere"));
+          fs.symlinkSync(path.join(x.h.root, "elsewhere"), x.carve);
+        } else fs.writeFileSync(x.carve, "f");
+      });
+      try {
+        const r = run(l.h, { STUB_NOOP: "1", TMPDIR: l.carve });
+        assert.notEqual(r.status, 0, kind);
+        assert.match(r.stderr, kind === "symlink" ? /\.tmp is a symlink/ : /\.tmp exists and is not a directory/);
+        assert.deepEqual(touching(r.ops, l.carve).filter((o) => !o.startsWith("chown -R") && !o.startsWith("mkdir -p")), [], kind);
+        assert.equal(r.env.size, 0);
+      } finally { fs.rmSync(l.h.root, { recursive: true, force: true }); }
+    }
+  });
+
+  it("refuses to start when the carve-out cannot be created (no mkdir -p of missing parents)", () => {
+    const l = lane(undefined, false); // .tmp absent; the NOOP mkdir stub creates nothing
+    try {
+      const r = run(l.h, { STUB_NOOP: "1", TMPDIR: l.carve });
+      assert.notEqual(r.status, 0);
+      assert.match(r.stderr, /could not create .*\.tmp/);
+      assert.ok(r.ops.includes(`mkdir ${l.carve}`), "plain mkdir of the final component");
+      assert.ok(!r.ops.some((o) => o.startsWith("mkdir -p") && o.includes(l.carve)));
+    } finally { cleanup(l); }
+  });
+
+  it("refuses a TMPDIR nested more than one level below the runner root", () => {
+    const l = lane();
+    try {
+      const r = run(l.h, { STUB_NOOP: "1", TMPDIR: path.join(l.carve, "deeper") });
+      assert.notEqual(r.status, 0);
+      assert.match(r.stderr, /must be a direct child of/);
+    } finally { cleanup(l); }
+  });
+
+  it("refuses a non-canonical TMPDIR spelling and deletes/re-owns/re-modes nothing", () => {
+    const l = lane((x) => {
+      leaf(path.join(x.carve, "uzi-worker"));
+      leaf(path.join(x.carve, "uzi-runner"));
+      // A non-.tmp child with the legacy sentinel absent: the one-time migration would
+      // `chown -R` it, so a refusal that ran after the migration would record that op.
+      fs.mkdirSync(path.join(x.runnerRoot, "fake-clone"));
+      fs.symlinkSync(x.h.data, path.join(x.h.root, "rootalias"));
+      // A symlinked LEAF (the parent is canonical): only a whole-path resolve catches it.
+      fs.symlinkSync(x.carve, path.join(x.h.root, "leafalias"));
+    });
+    try {
+      const rr = l.runnerRoot;
+      const d = l.h.data;
+      const variants: Array<[string, RegExp]> = [
+        [`${d}//runner/.tmp`, /not a canonical path/],
+        [`${rr}//.tmp`, /not a canonical path/],
+        [`${rr}/./.tmp`, /not a canonical path/],
+        [`${rr}/x/../.tmp`, /not a canonical path/],
+        [`${rr}/.tmp/.`, /not a canonical path/],
+        [`${rr}/.tmp/..`, /not a canonical path/],
+        ["../data/runner/.tmp", /not an absolute path/],
+        [path.join(l.h.root, "rootalias", "runner", ".tmp"), /resolves to .* inside/],
+        [path.join(l.h.root, "leafalias"), /resolves to .* inside/],
+      ];
+      for (const [tmp, msg] of variants) {
+        const r = run(l.h, { STUB_NOOP: "1", TMPDIR: tmp });
+        assert.notEqual(r.status, 0, `must refuse ${tmp}`);
+        assert.match(r.stderr, new RegExp(`uzi-entrypoint: refusing to start: TMPDIR .*${msg.source}`));
+        // Earlier, unrelated boot steps still record ops on the data roots themselves; nothing may
+        // rm anything or touch an entry BELOW the runner root.
+        const bad = r.ops.filter((o) => o.startsWith("rm ") || o.includes(`${rr}/`));
+        assert.deepEqual(bad, [], `no scratch ops for ${tmp}: ${bad.join(" | ")}`);
+        for (const u of ["uzi-worker", "uzi-runner"]) {
+          assert.ok(fs.existsSync(path.join(l.carve, u, "PRECIOUS")), `${u} survives ${tmp}`);
+        }
+      }
+    } finally { cleanup(l); }
+  });
+
+  it("refuses a carve-out name other than .tmp (the legacy-loop skip hard-codes it) with no writes", () => {
+    const l = lane((x) => { fs.mkdirSync(path.join(x.runnerRoot, "scratch")); });
+    try {
+      const r = run(l.h, { STUB_NOOP: "1", TMPDIR: path.join(l.runnerRoot, "scratch") });
+      assert.notEqual(r.status, 0);
+      assert.match(r.stderr, /uzi-entrypoint: refusing to start: TMPDIR carve-out .* must be .*\/\.tmp/);
+      const bad = r.ops.filter((o) => o.startsWith("rm ") || o.includes(`${l.runnerRoot}/`));
+      assert.deepEqual(bad, [], bad.join(" | "));
+    } finally { cleanup(l); }
+  });
+
+  it("reverse skew: TMPDIR == /data/runner keeps the old root handling (no carve-out ops) and still never wipes leaves", () => {
+    const l = lane((x) => { leaf(path.join(x.runnerRoot, "uzi-worker")); });
+    try {
+      const r = run(l.h, { STUB_NOOP: "1", TMPDIR: l.runnerRoot });
+      assert.equal(r.status, 0, r.stderr);
+      assert.ok(!r.ops.some((o) => o.startsWith("chmod 00755")), "no carve-out re-assertion of the runner root");
+      assert.ok(!r.ops.includes(`chown -h 0:0 ${l.runnerRoot}`), "the runner root itself is not reclaimed");
+      assert.equal(r.ops.filter((o) => o.startsWith("rm ")).length, 0);
+      assert.ok(r.stderr.includes(`${path.join(l.runnerRoot, "uzi-worker")} entries=2`), r.stderr);
+      assert.equal(r.env.get("TMPDIR"), path.join(l.runnerRoot, "uzi-worker"));
+    } finally { cleanup(l); }
+  });
+
+  it("non-Docker (TMPDIR unset): the long-standing wipe is unchanged", () => {
+    const h = makeHarness();
+    try {
+      fs.mkdirSync(h.data);
+      fs.mkdirSync(h.nix);
+      fs.writeFileSync(h.token, "t");
+      const r = run(h, { STUB_NOOP: "1" });
+      assert.equal(r.status, 0, r.stderr);
+      assert.ok(r.ops.includes("rm -rf /tmp/uzi-worker /tmp/uzi-runner"), r.ops.join(" | "));
+      assert.ok(r.ops.includes("chown 0:0 /tmp/uzi-worker"));
+      assert.doesNotMatch(r.stderr, /per-uid scratch adopted/);
+    } finally { fs.rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  // Section 3b: a SEPARATE process keeps appending to a file inside a scratch leaf while the
+  // entrypoint runs (a lingering old pod, or a rootful daemon, shares the volume). An
+  // expected-owner 0700 leaf is adopted and preserved with the documented "writer exclusion not
+  // established" diagnostic: that is correct, not a defect. A leaf with a mismatched owner is
+  // refused with the contents untouched. Neither case may remove, re-own or re-mode anything.
+  for (const [name, env, expectStart] of [
+    ["adopts an expected-owner 0700 leaf under a live writer and preserves it", {}, true],
+    ["refuses a mismatched-owner leaf under a live writer and touches nothing", { STUB_OWNER_WORKER: "runner" }, false],
+  ] as const) {
+    it(name, async () => {
+      const l = lane((x) => { leaf(x.worker); leaf(x.runner); });
+      const writer = spawn(process.execPath, ["-e",
+        'setInterval(() => require("node:fs").appendFileSync("live.log", "tick\\n"), 10);'],
+        { cwd: l.worker, stdio: "ignore", env: { PATH: process.env.PATH ?? "/usr/bin:/bin" } });
+      const size = (): number => { try { return fs.statSync(path.join(l.worker, "live.log")).size; } catch { return 0; } };
+      const growsPast = async (n: number): Promise<number> => {
+        for (let i = 0; i < 250 && size() <= n; i++) await new Promise((r) => setTimeout(r, 20));
+        assert.ok(size() > n, "the live writer is appending");
+        return size();
+      };
+      try {
+        const first = await growsPast(0);
+        const r = run(l.h, { STUB_NOOP: "1", TMPDIR: l.carve, ...env }); // blocks this process, not the writer
+        if (expectStart) {
+          assert.equal(r.status, 0, r.stderr);
+          assert.ok(r.stderr.includes(`uzi-entrypoint: per-uid scratch adopted (contents preserved, writer exclusion not established): ${l.worker} entries=`), r.stderr);
+          assert.equal(r.env.get("TMPDIR"), l.worker);
+        } else {
+          assert.notEqual(r.status, 0);
+          assert.match(r.stderr, /owner is runner, expected worker/);
+        }
+        assert.deepEqual(touching(r.ops, l.worker, l.runner), [], "no op may touch either leaf");
+        assert.equal(r.ops.filter((o) => o.startsWith("rm ")).length, 0, "no rm");
+        assert.equal(fs.readFileSync(path.join(l.worker, "PRECIOUS"), "utf8"), "x");
+        assert.equal(fs.readFileSync(path.join(l.runner, "PRECIOUS"), "utf8"), "x");
+        assert.ok(fs.existsSync(path.join(l.worker, "nested")));
+        await growsPast(first); // still alive, still appending into the same leaf afterwards
+      } finally { writer.kill("SIGKILL"); cleanup(l); }
+    });
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Race safety (security finding): /data/runner is sticky and, in the reverse-skew layout
+  // (TMPDIR == $DATA_DIR/runner), the runner owns uzi-runner and can rename it and plant a symlink
+  // between validation and the mutation. Each case swaps the runner leaf for a symlink to a sibling
+  // STANDIN directory (distinct mode 0751) at a different instant and requires: startup refuses, no
+  // chown/chmod operand ever resolves to the standin, and the standin's mode / uid / gid are intact.
+  // ---------------------------------------------------------------------------------------------
+  describe("race-safe normalisation (leaf swapped for a symlink)", () => {
+    const STANDIN_MODE = 0o751;
+    interface Swap { l: Lane; leafPath: string; standin: string; standinReal: string; uid: number; gid: number }
+    /** Reverse-skew lane (no carve-out ops): leaves directly under the runner root; real chmod/mkdir. */
+    function swapLane(setup: (x: Lane, leafPath: string) => void): Swap {
+      let leafPath = "";
+      let standin = "";
+      const h = makeHarness({ realChmod: ["/bin/chmod"] });
+      fs.mkdirSync(h.data);
+      fs.mkdirSync(h.nix);
+      fs.writeFileSync(h.token, "t");
+      const runnerRoot = path.join(h.data, "runner");
+      fs.mkdirSync(runnerRoot);
+      const priorMode = fs.statSync(runnerRoot).mode & 0o7777;
+      fs.chmodSync(runnerRoot, 0o3775);
+      assert.equal(fs.statSync(runnerRoot).mode & 0o7777, 0o3775, "fixture precondition: the host user must be able to set 3775 (setgid+sticky) on the runner root, as the entrypoint does");
+      fs.chmodSync(runnerRoot, priorMode);
+      const carve = path.join(runnerRoot, ".tmp");
+      fs.mkdirSync(carve);
+      const l: Lane = { h, runnerRoot, carve, worker: path.join(runnerRoot, "uzi-worker"), runner: path.join(runnerRoot, "uzi-runner") };
+      leafPath = l.runner;
+      standin = path.join(h.root, "standin");
+      fs.mkdirSync(standin);
+      fs.writeFileSync(path.join(standin, "keep"), "k");
+      fs.chmodSync(standin, STANDIN_MODE);
+      setup(l, leafPath);
+      const st = fs.statSync(standin);
+      return { l, leafPath, standin, standinReal: fs.realpathSync(standin), uid: st.uid, gid: st.gid };
+    }
+    const SWAP = (leafPath: string, standin: string): string =>
+      `/bin/mv '${leafPath}' '${leafPath}.moved'; /bin/ln -s '${standin}' '${leafPath}'\n`;
+    /** Insert `code` on the line after `anchor` (which must occur in the patched script exactly as given). */
+    const after = (patched: string, anchor: string, code: string): string => {
+      assert.ok(patched.includes(anchor), `anchor missing: ${anchor}`);
+      return patched.replace(anchor, anchor + code);
+    };
+    const RUNNER_PREV = '  sc_runner_prev="$SCRATCH_PREV_MODE"\n';
+
+    function assertStandinUntouched(w: Swap, ops: string[]): void {
+      const hits = ops.filter((o) => /^(chown|chmod) /.test(o) && o.split(/\s+/).some((t) => t === w.standinReal || t.startsWith(w.standinReal + "/")));
+      assert.deepEqual(hits, [], `no chown/chmod operand may resolve to the standin: ${ops.join(" | ")}`);
+      const st = fs.statSync(w.standin);
+      assert.equal(st.mode & 0o7777, STANDIN_MODE, "standin mode unchanged");
+      assert.equal(st.uid, w.uid);
+      assert.equal(st.gid, w.gid);
+      assert.equal(fs.readFileSync(path.join(w.standin, "keep"), "utf8"), "k");
+    }
+    function assertRefused(r: RunResult, reason: RegExp): void {
+      assert.notEqual(r.status, 0, r.stderr);
+      assert.match(r.stderr, /refusing to start: per-uid scratch .*uzi-runner cannot be safely adopted \(/);
+      assert.match(r.stderr, reason);
+      assert.equal(r.env.size, 0, "must not reach the privilege drop");
+    }
+    /** Build a lane whose mutate closure sees the final leaf/standin paths (they are fixed by the harness root). */
+    function build(setup: (x: Lane) => void, inject: (patched: string, leafPath: string, standin: string) => string): Swap {
+      // The harness root (and so both paths) is only known after makeHarness: allocate, then patch the script.
+      const w = swapLane(setup);
+      const original = fs.readFileSync(w.l.h.script, "utf8");
+      const patched = inject(original, w.leafPath, w.standin);
+      assert.notEqual(patched, original, "the mutation must change the script text");
+      fs.writeFileSync(w.l.h.script, patched, { mode: 0o755 });
+      return w;
+    }
+    const doRun = (w: Swap, env: Record<string, string> = {}): RunResult => run(w.l.h, { TMPDIR: w.l.runnerRoot, ...env });
+
+    it("A: adopted runner leaf at 755 swapped after validation is refused, standin untouched", () => {
+      const w = build((x) => { leaf(x.worker); leaf(x.runner, 0o755); }, (t, lp, sd) => after(t, RUNNER_PREV, SWAP(lp, sd)));
+      try {
+        const r = doRun(w);
+        assertStandinUntouched(w, r.ops);
+        assertRefused(r, /changed identity before normalisation/);
+      } finally { cleanup(w.l); }
+    });
+
+    it("B: leaf swapped at the first reclaim chown (after the cd) is detected, original handed back, mode unchanged", () => {
+      const w = swapLane((x) => { leaf(x.worker); leaf(x.runner, 0o755); });
+      try {
+        const r = doRun(w, { STUB_SWAP_LEAF: w.leafPath, STUB_SWAP_STANDIN: w.standin });
+        assert.ok(fs.existsSync(`${w.l.h.opLog}.swapped`), "the swap seam must have fired");
+        assertRefused(r, /changed identity before normalisation/);
+        assertStandinUntouched(w, r.ops);
+        // The cd'd-into (moved) original: reclaimed, then handed straight back, never chmod'ed.
+        const moved = `${w.leafPath}.moved`;
+        assert.ok(r.ops.includes(`chown -h 0:0 ${moved}`), r.ops.join(" | "));
+        assert.ok(r.ops.includes(`chown -h runner:runner ${moved}`), `hand-back: ${r.ops.join(" | ")}`);
+        assert.ok(!r.ops.some((o) => o.startsWith("chmod ") && o.includes(w.leafPath)), "no chmod after the swap was detected");
+        assert.equal(fs.statSync(moved).mode & 0o7777, 0o755, "original leaf mode unchanged");
+      } finally { cleanup(w.l); }
+    });
+
+    // Models a rename the runner cannot actually perform on a root-owned freshly created leaf in the
+    // sticky root; kept as defence in depth for the post-creation identity check.
+    it("C0: created leaf replaced by a symlink right after mkdir (before the symlink check) is refused, standin untouched", () => {
+      const MKDIR_LINE = '      "$MKDIR" "$sc_leaf"\n';
+      const w = build((x) => { leaf(x.worker); }, (t, lp, sd) =>
+        after(t, MKDIR_LINE, `      if [ "$sc_leaf" = '${lp}' ]; then ${SWAP(lp, sd).trim()}; fi\n`));
+      try {
+        const r = doRun(w);
+        assertStandinUntouched(w, r.ops);
+        assertRefused(r, /became a symlink while being created/);
+      } finally { cleanup(w.l); }
+    });
+
+    it("C: created leaf swapped right after the symlink check is refused, standin untouched", () => {
+      // Anchored on the line FOLLOWING the symlink check (swap inserted before it), so the anchor
+      // survives a mutant that deletes the symlink-check line itself.
+      const FRESH_READ = `      if ! sc_fresh="$("$BUSYBOX" stat -c '%U %d:%i' "$sc_leaf" 2>/dev/null)"; then\n`;
+      const w = build((x) => { leaf(x.worker); }, (t, lp, sd) => {
+        assert.equal(t.split(FRESH_READ).length, 2, "anchor missing or not unique");
+        return t.replace(FRESH_READ, `      if [ "$sc_leaf" = '${lp}' ]; then ${SWAP(lp, sd).trim()}; fi\n${FRESH_READ}`);
+      });
+      try {
+        const r = doRun(w);
+        assertStandinUntouched(w, r.ops);
+        assertRefused(r, /after creation, expected root/);
+      } finally { cleanup(w.l); }
+    });
+
+    it("C2: created leaf swapped after the owner/identity read (before normalise) is refused, standin untouched", () => {
+      const APPLY = '      scratch_apply "$sc_leaf" "$sc_owner" "$sc_fresh"\n';
+      const w = build((x) => { leaf(x.worker); }, (t, lp, sd) => {
+        assert.ok(t.includes(APPLY), "anchor missing");
+        return t.replace(APPLY, `      if [ "$sc_leaf" = '${lp}' ]; then ${SWAP(lp, sd).trim()}; fi\n${APPLY}`);
+      });
+      try {
+        const r = doRun(w);
+        assertStandinUntouched(w, r.ops);
+        assertRefused(r, /changed identity before normalisation/);
+      } finally { cleanup(w.l); }
+    });
+
+    it("D: leaf absent at validation but a symlink planted before the loop is refused, standin untouched", () => {
+      const w = build((x) => { leaf(x.worker); }, (t, lp, sd) =>
+        after(t, RUNNER_PREV, `/bin/ln -s '${sd}' '${lp}'\n`));
+      try {
+        const r = doRun(w);
+        assertStandinUntouched(w, r.ops);
+        assertRefused(r, /appeared after validation/);
+      } finally { cleanup(w.l); }
+    });
+
+    it("E: adopted 0700 runner leaf swapped after validation is refused (verify-only path), standin untouched", () => {
+      const w = build((x) => { leaf(x.worker); leaf(x.runner, 0o700); }, (t, lp, sd) => after(t, RUNNER_PREV, SWAP(lp, sd)));
+      try {
+        const r = doRun(w);
+        assertStandinUntouched(w, r.ops);
+        assertRefused(r, /changed identity before normalisation/);
+      } finally { cleanup(w.l); }
+    });
+
+    it("G: adopted 0700 runner leaf replaced by a symlink to its moved original is refused (verify-only name check)", () => {
+      const w = build((x) => { leaf(x.worker); leaf(x.runner, 0o700); }, (t, lp) =>
+        after(t, RUNNER_PREV, `/bin/mv '${lp}' '${lp}.moved'; /bin/ln -s '${lp}.moved' '${lp}'\n`));
+      try {
+        const r = doRun(w);
+        assertStandinUntouched(w, r.ops);
+        const moved = `${w.leafPath}.moved`;
+        assert.ok(fs.lstatSync(w.leafPath).isSymbolicLink(), "the substitution was in place when verification ran");
+        assert.deepEqual(r.ops.filter((o) => /^(chown|chmod) /.test(o) && o.includes(moved)), [], "verify mode mutates nothing");
+        assert.equal(fs.statSync(moved).mode & 0o7777, 0o700, "moved original mode unchanged");
+        assertRefused(r, /changed identity before normalisation/);
+      } finally { cleanup(w.l); }
+    });
+
+    it("F: leaf swapped immediately before the chmod is applied to the moved original, standin untouched", () => {
+      // Match the whole chmod line (whatever its operand) so a mutant that changes the operand still
+      // gets the swap injected right before it.
+      const CHMOD_LINE = /^ +"\$CHMOD" 00700 [^\n]*\|\| exit 4\n/m;
+      const w = build((x) => { leaf(x.worker); leaf(x.runner, 0o755); }, (t, lp, sd) => {
+        const m = CHMOD_LINE.exec(t);
+        assert.ok(m, "anchor missing");
+        return t.replace(CHMOD_LINE, SWAP(lp, sd) + m[0]);
+      });
+      try {
+        const r = doRun(w);
+        // The swap lands after the post-reclaim name check, so startup is not refused: the chmod and
+        // the hand-back act on "." (the moved original), never on the leaf name.
+        assertStandinUntouched(w, r.ops);
+        assert.equal(r.status, 0, r.stderr);
+        const moved = `${w.leafPath}.moved`;
+        assert.equal(fs.statSync(moved).mode & 0o7777, 0o700, "chmod landed on the moved original");
+        assert.ok(r.ops.includes(`chown -h runner:runner ${moved}`), r.ops.join(" | "));
+      } finally { cleanup(w.l); }
+    });
+  });
+
+  it("(a2b) legacy migration re-owns runner children but skips the .tmp carve-out", () => {
+    const l = lane((x) => { fs.mkdirSync(path.join(x.runnerRoot, "legacy-repo")); });
+    try {
+      const r = run(l.h, { STUB_NOOP: "1", TMPDIR: l.carve });
+      assert.equal(r.status, 0, r.stderr);
+      assert.ok(r.ops.includes(`chown -R runner:runner ${path.join(l.runnerRoot, "legacy-repo")}`), r.ops.join(" | "));
+      assert.ok(!r.ops.some((o) => o.startsWith("chown -R") && o.includes(l.carve)), "the carve-out is never re-owned runner:runner");
+    } finally { cleanup(l); }
   });
 });

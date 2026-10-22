@@ -239,7 +239,7 @@ export type CallbackOrigin = "root" | "child" | "unknown";
  *  or transport frame. */
 export type CallbackResult =
   | { readonly ok: true; readonly output: unknown }
-  | { readonly ok: false; readonly code: string; readonly message: string; readonly policyRefusal?: PolicyRefusalPayload; readonly memoryPressure?: WorkerMemoryPressureResult };
+  | { readonly ok: false; readonly code: string; readonly message: string; readonly fileopCode?: string; readonly policyRefusal?: PolicyRefusalPayload; readonly memoryPressure?: WorkerMemoryPressureResult };
 
 /** One fileop request, mapped to the NDJSON op protocol
  *  (agent/codex/supervisor/fileop). `path`/`newPath` are worktree-RELATIVE (the
@@ -394,6 +394,7 @@ export interface ScreenPolicy {
  *  for the life of the turn; the broker consults THESE, never the callback args, to
  *  decide authority. */
 export interface RunGrants {
+  readonly semanticPlanning?: import("../semantic-plan.js").SemanticPlanning;
   readonly ownerDecisionRequested?: boolean;
   readonly role: string;
   readonly phase: "plan" | "implement";
@@ -443,7 +444,7 @@ function strField(args: unknown, key: string): string | undefined {
 }
 
 /** The first present non-empty string among `keys`, else undefined. */
-function firstStrField(args: unknown, keys: readonly string[]): string | undefined {
+export function firstStrField(args: unknown, keys: readonly string[]): string | undefined {
   for (const k of keys) {
     const v = strField(args, k);
     if (v !== undefined) return v;
@@ -1080,7 +1081,9 @@ export class CodexCallbackBroker {
     // `appliedBeforeFailure` is bounded by a JavaScript array length, so its decimal
     // representation is at most ten digits. No path, edit body, or raw helper error
     // crosses this neutral model-visible result.
-    return deny("fileop_denied", `file operation denied (${code})${partial}`);
+    // `fileopCode` is the same closed-vocabulary value already echoed in the message, exposed typed
+    // so cross-check activity evidence can classify the denial without parsing text.
+    return { ok: false, code: "fileop_denied", message: `file operation denied (${code})${partial}`, fileopCode: code };
   }
 
   // --- signals (ROOT-ONLY) ----------------------------------------------------
@@ -1111,7 +1114,7 @@ export class CodexCallbackBroker {
           },
         ],
       },
-    }, { ownerDecisionRequested: this.grants.ownerDecisionRequested });
+    }, { ownerDecisionRequested: this.grants.ownerDecisionRequested, semanticPlanning: this.grants.semanticPlanning });
     if (scanned.signalDiagnostic !== undefined) {
       return deny("invalid_signal", scanned.signalDiagnostic);
     }
