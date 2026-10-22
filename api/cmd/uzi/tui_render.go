@@ -148,11 +148,11 @@ type palette struct {
 	// The ANDON semantic colours, held as raw color.Color so a caller can compose a
 	// foreground word, a spine glyph or (for the amber band alone) a fill on the fly.
 	// stateColor/stateToken resolve a run's semantic colour from these. The board
-	// dims finished failure tokens with doneAlarm while retaining the failure signal.
+	// dims DONE-row failure and judge issues ink with doneAlarm, retaining their signals.
 	tungsten  color.Color // chrome / selection accent / eyebrows
 	amber     color.Color // andon attention: needs-you, the gate band, ⚑ ✎
-	alarm     color.Color // failed, judge "issues", high severity
-	doneAlarm color.Color // dimmed failure ink for DONE row state tokens
+	alarm     color.Color // active failures, judge severity, high severity, DONE failure count
+	doneAlarm color.Color // DONE failure state/issue ink and judge "issues" badges
 	stall     color.Color // stalled / looping / near-timeout health
 	sage      color.Color // running (deliberately dimmer — running is normal)
 	indigo    color.Color // planning
