@@ -116,6 +116,26 @@ the admin's own responsibility to match what the image actually bakes.
   a `docker compose down -v` would also delete the database volume); the next
   run re-downloads what it needs.
 
+## Worker Go and sqlc pins
+
+The worker Go pin must satisfy both repository `toolchain` declarations.
+`task check:worker-toolchain` checks the package/lock keys and resolved version
+offline. Both image builds additionally check the actual Go binary against the
+lock, then check module requirements in the release stage.
+
+Go currently uses an immutable nixpkgs channel ref because the Devbox index
+lags its required patch release. Updating that pin is deliberate: evaluate
+`go_1_27.version` and its Linux output at the new ref, record their exact
+version/output metadata in the lock, and verify the output is cached. The
+weekly refresh rejects manifest rewrites and reuses metadata only when the
+complete resolved Go ref is unchanged.
+
+Both images bake the sha-verified sqlc archive at `/usr/local/share/uzi-sqlc`.
+The scrubbed run environments carry only its non-secret `UZI_SQLC_DIR` path;
+provisioned tools cannot override it. The wrapper verifies a private archive
+copy on every invocation. CI runs both images without networking to check Go
+and sqlc, and reports the base image size change against the published pin.
+
 See [ARCHITECTURE.md](../ARCHITECTURE.md#services) for the worker's egress and
 provisioning trust model, and [Worker setup](./worker-setup.md#tool-provisioning)
 for the operator view.

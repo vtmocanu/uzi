@@ -280,6 +280,7 @@ const COMMAND_ENV_PROTECTED_KEYS: ReadonlySet<string> = new Set([
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
   "AGENT_BROWSER_ARGS",
+  "UZI_SQLC_DIR",
   // issue #1783: the run-attempt marker and worker spawn mark sdk-env.ts protects too.
   "UZI_RUN_ATTEMPT",
   "UZI_RUN_CLONE",
@@ -5492,6 +5493,8 @@ export function buildCommandEnv(tmpdir: string, toolEnv: Record<string, string>,
     TMPDIR: tmpdir,
     LANG: "C",
   };
+  // A non-secret image path under /usr, already readable by the command sandbox.
+  if (process.env.UZI_SQLC_DIR) env.UZI_SQLC_DIR = process.env.UZI_SQLC_DIR;
   for (const [k, v] of Object.entries(toolEnv)) {
     if (COMMAND_ENV_PROTECTED_KEYS.has(k)) continue; // never breach the boundary / reintroduce a credential key
     // Issue #1716: inline git config is worker-owned (withCommandGitTrust); a provisioned

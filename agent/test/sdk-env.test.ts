@@ -58,6 +58,7 @@ describe("buildSdkEnv", () => {
     // env has one) — no other WORKER env is spread in. TMPDIR is not a secret.
     const expected = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AGENT_BROWSER_ARGS"]);
     if (process.env.UZI_RUNNER_TMPDIR || process.env.TMPDIR) expected.add("TMPDIR");
+    if (process.env.UZI_SQLC_DIR) expected.add("UZI_SQLC_DIR");
     assert.deepStrictEqual(new Set(Object.keys(env)), expected);
   });
 

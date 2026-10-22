@@ -1039,6 +1039,9 @@ jobs:
               - 'controller/**'
             agent:
               - 'agent/**'
+              # Runtime-stage COPY inputs outside agent/ also need image validation.
+              - 'scripts/sqlc.sh'
+              - 'scripts/check-worker-toolchain.py'
               - '.dockerignore'
               - '.github/workflows/ci.yml'
             worker_uid:
@@ -1246,6 +1249,7 @@ jobs:
           context: .
           file: agent/templates/${{ matrix.template }}/Dockerfile
           push: false
+          load: true
           platforms: linux/amd64
           # :buildcache holds the runtime-stage layers, :buildcache-release the release
           # stage's (release.yml writes both since #1720); read-only here, as above.
@@ -1255,3 +1259,36 @@ jobs:
           build-args: |
             UZI_SRC_SHA=${{ github.sha }}
           tags: uzi-agent-${{ matrix.template }}:pr
+      - name: Measure the previous published base image
+        if: matrix.template == 'base'
+        id: worker-baseline
+        run: |
+          tag="$(awk -F '"' '/^PINNED_TAG=/{print $2}' scripts/assert-worker-tag-decoupled.sh)"
+          test -n "$tag"
+          docker pull "ghcr.io/vtmocanu/uzi/agent-base:${tag}"
+          bytes="$(docker image inspect "ghcr.io/vtmocanu/uzi/agent-base:${tag}" --format='{{.Size}}')"
+          printf 'bytes=%s\n' "$bytes" >> "$GITHUB_OUTPUT"
+      - name: Prove the baked worker toolchain without network
+        env:
+          TEMPLATE: ${{ matrix.template }}
+          BASELINE_BYTES: ${{ steps.worker-baseline.outputs.bytes }}
+        run: |
+          SQLC_PIN="$(awk -F '"' '/^SQLC_LINUX_AMD64_VERSION=/{print $2}' scripts/sqlc.sh)"
+          docker run --rm --network=none --user runner --cap-drop=ALL \
+            --security-opt=no-new-privileges --entrypoint /bin/sh \
+            --env "SQLC_PIN=$SQLC_PIN" \
+            "uzi-agent-${TEMPLATE}:pr" -ec '
+              cd /opt/uzi-src
+              which -a go
+              test "$(which -a go | wc -l)" -eq 1
+              go version
+              scripts/sqlc.sh "$SQLC_PIN" version
+              cd api && go version
+              cd ../controller && go version
+            '
+          bytes="$(docker image inspect "uzi-agent-${TEMPLATE}:pr" --format='{{.Size}}')"
+          printf 'image=%s size_bytes=%s\n' "$TEMPLATE" "$bytes"
+          if [ "$TEMPLATE" = base ]; then
+            printf 'base_before_bytes=%s base_after_bytes=%s delta_bytes=%s\n' \
+              "$BASELINE_BYTES" "$bytes" "$((bytes - BASELINE_BYTES))"
+          fi
