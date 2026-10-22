@@ -211,6 +211,21 @@ func (m *Materializer) finalizeMigrationNotice(t *rollTick) {
 		if p.BlockingReason != nil {
 			cause = *p.BlockingReason
 		}
-		p.BlockingReason = pacingText("fleet: multiple migration-held drains; intake risk; operator decision; " + cause)
+		const prefix = "fleet: multiple migration-held drains; intake risk; operator decision; "
+		if detailAt := strings.LastIndex(cause, "; held drains="); detailAt >= 0 {
+			local, detail := cause[:detailAt], cause[detailAt:]
+			// Count width varies. Reserve the complete metadata suffix before
+			// shortening the local cause at a word boundary, never inside a UUID.
+			// A UUID and any int-sized count leave room for the custody token.
+			budget := 192 - len(prefix) - len(detail)
+			if len(local) > budget && budget > len(layoutMigrationReason) {
+				cut := strings.LastIndexByte(local[:budget+1], ' ')
+				if cut > len(layoutMigrationReason) {
+					local = local[:cut]
+				}
+			}
+			cause = local + detail
+		}
+		p.BlockingReason = pacingText(prefix + cause)
 	}
 }

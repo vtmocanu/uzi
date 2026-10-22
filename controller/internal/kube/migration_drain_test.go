@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -445,47 +446,71 @@ func TestMigrationDrainNoticeBudget(t *testing.T) {
 	const first = "11111111-1111-4111-8111-111111111111"
 	const second = "22222222-2222-4222-8222-222222222222"
 	const ordinary = "00000000-0000-4000-8000-000000000000"
-	f, ws, cordon := migrationFixture(t, migrationHeldOpt(first), migrationHeldOpt(second),
-		lmOpts{id: ordinary, layout: "new", stale: true, marker: "canary"})
-	for i := 0; i < 2; i++ {
-		ws[i].DrainingSince, ws[i].DrainingReason = &m5Now, token("image_roll")
-	}
-	if err := f.client.CoreV1().Pods(lmNS()).Delete(context.Background(), "pod-"+ordinary, metav1.DeleteOptions{}); err != nil {
-		t.Fatal(err)
-	}
-	observed, err := f.m.Observe(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	const originalCause = "confirmed admission suspended for usable coverage"
-	if err := f.m.Reconcile(context.Background(), ws, observed); err != nil {
-		t.Fatal(err)
-	}
-	for _, id := range []string{first, second} {
-		p := f.m.PacingOutcomes()[id]
-		if p == nil || p.BlockingReason == nil {
-			t.Fatalf("missing local notice for %s", id)
-		}
-		reason := *p.BlockingReason
-		if len(reason) > 192 || !strings.Contains(reason, "held drains=2; sample="+first) ||
-			!strings.Contains(reason, "retained drain without coverage") ||
-			!strings.Contains(reason, "layout_migration_custody") {
-			t.Fatalf("local notice lost complete sample or cause: %q", reason)
-		}
-		if strings.Contains(reason, second[:8]) {
-			t.Fatalf("partial second UUID: %q", reason)
-		}
-	}
-	p := f.m.PacingOutcomes()[ordinary]
-	if p == nil || p.BlockingReason == nil || !strings.Contains(*p.BlockingReason, originalCause) ||
-		!strings.Contains(*p.BlockingReason, "fleet: multiple migration-held drains") {
-		t.Fatalf("ordinary cause erased by multiplicity: %+v", p)
-	}
-	if strings.Contains(*p.BlockingReason, first) || strings.Contains(*p.BlockingReason, second) {
-		t.Fatalf("sample escaped migration diagnostics: %q", *p.BlockingReason)
-	}
-	if len(cordon.calls) != 0 || len(cordon.clearCalls) != 0 {
-		t.Fatalf("multiplicity caused drain mutations: %v %v", cordon.calls, cordon.clearCalls)
+	const uncertain = "44444444-4444-4444-8444-444444444444"
+	for _, count := range []int{2, 10} {
+		t.Run(fmt.Sprint(count), func(t *testing.T) {
+			opts := []lmOpts{migrationHeldOpt(first), migrationHeldOpt(second)}
+			for i := 2; i < count; i++ {
+				opts = append(opts, migrationHeldOpt(fmt.Sprintf("33333333-3333-4333-8333-%012d", i)))
+			}
+			opts = append(opts, migrationHeldOpt(uncertain),
+				lmOpts{id: ordinary, layout: "new", stale: true, marker: "canary"})
+			f, ws, cordon := migrationFixture(t, opts...)
+			for i := 0; i < count; i++ {
+				ws[i].DrainingSince, ws[i].DrainingReason = &m5Now, token("image_roll")
+			}
+			// The undrained held worker takes the uncertain-evidence branch
+			// before the occupied-budget branch. Two-digit counts must not
+			// push its sampled UUID beyond the pacing byte budget.
+			dep, err := f.client.AppsV1().Deployments(lmNS()).Get(context.Background(), deploymentName(uncertain), metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			dep.Annotations = map[string]string{annotationRoll: "malformed"}
+			if _, err := f.client.AppsV1().Deployments(lmNS()).Update(context.Background(), dep, metav1.UpdateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.client.CoreV1().Pods(lmNS()).Delete(context.Background(), "pod-"+ordinary, metav1.DeleteOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			observed, err := f.m.Observe(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			const originalCause = "confirmed admission suspended for usable coverage"
+			if err := f.m.Reconcile(context.Background(), ws, observed); err != nil {
+				t.Fatal(err)
+			}
+			for _, id := range []string{first, second, uncertain} {
+				p := f.m.PacingOutcomes()[id]
+				if p == nil || p.BlockingReason == nil {
+					t.Fatalf("missing local notice for %s", id)
+				}
+				reason := *p.BlockingReason
+				wantCause := "retained drain without coverage"
+				if id == uncertain {
+					wantCause = "uncertain"
+				}
+				if len(reason) > 192 || !strings.Contains(reason, fmt.Sprintf("held drains=%d; sample=%s", count, first)) ||
+					!strings.Contains(reason, wantCause) || !strings.Contains(reason, "layout_migration_custody") {
+					t.Fatalf("local notice lost complete sample or cause: %q", reason)
+				}
+				if strings.Contains(reason, second[:8]) {
+					t.Fatalf("partial second UUID: %q", reason)
+				}
+			}
+			p := f.m.PacingOutcomes()[ordinary]
+			if p == nil || p.BlockingReason == nil || !strings.Contains(*p.BlockingReason, originalCause) ||
+				!strings.Contains(*p.BlockingReason, "fleet: multiple migration-held drains") {
+				t.Fatalf("ordinary cause erased by multiplicity: %+v", p)
+			}
+			if strings.Contains(*p.BlockingReason, first) || strings.Contains(*p.BlockingReason, second) {
+				t.Fatalf("sample escaped migration diagnostics: %q", *p.BlockingReason)
+			}
+			if len(cordon.calls) != 0 || len(cordon.clearCalls) != 0 {
+				t.Fatalf("multiplicity caused drain mutations: %v %v", cordon.calls, cordon.clearCalls)
+			}
+		})
 	}
 }
 
