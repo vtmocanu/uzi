@@ -443,6 +443,42 @@ func TestCredentialSwitchHoldPreHoldSnapshotLiveDB(t *testing.T) {
 	f.mustRefuseSetToken(t, id, "pre-hold snapshot applied after the hold")
 }
 
+func TestCredentialSwitchHoldSetTokenStaleCutoffLiveDB(t *testing.T) {
+	for _, unknown := range []bool{false, true} {
+		name := "known_cutoff_lifts_stale_holder"
+		if unknown {
+			name = "zero_window_keeps_fence_closed"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newHoldFx(t)
+			if unknown {
+				params := testParams()
+				params.WorkerHeartbeatStale = 0
+				f.svc = New(f.env.q, f.env.box, params)
+				f.svc.SetTxBeginner(f.env.pool)
+			}
+			id := f.run(t)
+			f.hold(t, id)
+			f.env.exec(`UPDATE workers SET last_heartbeat_at = now() - interval '1 day' WHERE id = $1`, f.o.workerID)
+			if unknown {
+				f.mustRefuseSetToken(t, id, "a NULL cutoff cannot lift the settling fence")
+				return
+			}
+			result, err := f.svc.SetRunCredential(f.env.ctx, f.o.userID, id, CredentialOverrideModePinned, &f.o.altTok)
+			if err != nil {
+				t.Fatalf("set-token with a known stale holder: %v", err)
+			}
+			r := mustRun(t, f.env, id)
+			if result.Run.Status != "queued" || r.Status != "queued" || r.HoldReason.Valid {
+				t.Fatalf("set-token result=%q status=%q hold=%v, want queued with hold cleared", result.Run.Status, r.Status, r.HoldReason)
+			}
+			if !r.CredentialOverrideSecretID.Valid || uuid.UUID(r.CredentialOverrideSecretID.Bytes) != f.o.altTok {
+				t.Fatal("resumed set-token did not atomically save the selected override")
+			}
+		})
+	}
+}
+
 // TestCredentialSwitchHoldAffinityClaimLiveDB: with updated_at backdated past the affinity ceiling and
 // the holding worker's heartbeat fresh, a second live worker's ClaimRun does not admit the held run -
 // before a refused Resume and after it. Once the worker settles and the owner resumes, only the

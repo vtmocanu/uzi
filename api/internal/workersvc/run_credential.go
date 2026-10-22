@@ -75,10 +75,10 @@ type SetRunCredentialResult struct {
 // validates the requested override through the ONE validator (typed 404/409/422/400), then
 // dispatches on the run's CURRENT status:
 //
-//   - queued / limit_wait / pool_wait / recovery_wait / paused: write the override columns
-//     FIRST (idempotent), then the state-specific transition (an early promote for a parked
-//     run; nothing more for queued). A 0-row promote (a raced claim/cancel) is
-//     ErrCredentialSwitchRaced → 409.
+//   - queued / limit_wait / pool_wait / recovery_wait / paused: save the override and perform
+//     the state-specific transition (an early promote for a parked run; nothing more for queued).
+//     Paused override/resume changes commit together when transactional. A settling hold returns
+//     ErrRunHoldSettling; other 0-row promotions return ErrCredentialSwitchRaced → 409.
 //   - awaiting_approval / awaiting_input / awaiting_followup / running: a worker holds the
 //     session, so this is the HELD-STATE switch (PRD #1247 M5, D4/D14). If the holding worker
 //     advertises the credential_switch capability, the override columns AND the switch stamp are
@@ -394,11 +394,6 @@ func (s *Service) setCredentialAndPromote(ctx context.Context, observed store.Ru
 	return nil
 }
 
-// resumePausedForCredential is the paused arm of `uzi run set-token`: it resumes any paused run
-// the way the owner's resume does (PRD #1497 M1), with AllowCompletionBlockedHold so a completion
-// hold still resumes here as before. A budget_exhausted wall park with no remaining budget is
-// refused by the budget guard (0 rows -> ErrCredentialSwitchRaced); the owner extends such a run
-// rather than set-token-ing it. A provider hold's streak is cleared by ResumePausedRun itself.
 // setPausedCredential holds the existing secret mutation lock before the run lock.
 // The override and resume commit together; an observed hold change refuses both.
 func (s *Service) setPausedCredential(ctx context.Context, observed store.Run, resolved *CredentialOverride, token string) error {
@@ -428,11 +423,22 @@ func (s *Service) setPausedCredential(ctx context.Context, observed store.Run, r
 				return err
 			}
 		} else {
+			staleCutoff := s.staleWorkerCutoff()
 			if _, err := q.ResumePausedRun(ctx, store.ResumePausedRunParams{
 				ID: current.ID, UserID: current.UserID, AllowCompletionBlockedHold: true,
 				GlobalTimeoutSeconds: int32(s.p.RunTimeout.Seconds()),
+				StaleCutoff:          staleCutoff,
 			}); err != nil {
 				if errors.Is(err, pgx.ErrNoRows) {
+					settling, fenceErr := q.CredentialSwitchHoldSettling(ctx, store.CredentialSwitchHoldSettlingParams{
+						RunID: current.ID, StaleCutoff: staleCutoff,
+					})
+					if fenceErr != nil {
+						return fmt.Errorf("set run credential: read hold fence: %w", fenceErr)
+					}
+					if settling {
+						return ErrRunHoldSettling
+					}
 					return ErrCredentialSwitchRaced
 				}
 				return err
@@ -454,6 +460,10 @@ func (s *Service) setPausedCredential(ctx context.Context, observed store.Run, r
 	})
 }
 
+// resumePausedForCredential is the ordinary paused arm of `uzi run set-token`. It uses the
+// owner's ResumePausedRun bookkeeping with AllowCompletionBlockedHold. A spent wall budget
+// refuses the resume; the owner extends it rather than set-token-ing it. ResumePausedRun
+// clears a provider hold's streak itself.
 func (s *Service) resumePausedForCredential(ctx context.Context, userID, runID uuid.UUID) error {
 	if _, err := s.q.ResumePausedRun(ctx, store.ResumePausedRunParams{
 		ID:                         runID,
