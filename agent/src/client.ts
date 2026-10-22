@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { decodePublicationContext, validatePublicationContextRequest } from "./publication-context.js";
+import type { PublicationContextRequest, PublicationContextResponse } from "./protocol.js";
 import { decodeCompletionPending, type CompletionPending } from "./completion-pending.js";
 import { SEMANTIC_GATE_ACK_MAX_BYTES, semanticGateAckSchema } from "./semantic-gate-wire.js";
 import { decodeInterruptedCalls, interruptedRegistration, type InterruptedRegistration, type InterruptedCalls } from "./interrupted-calls.js";
@@ -2021,6 +2023,22 @@ export class WorkerClient {
     return decodePlanCrossCheckResponse(await this.postJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks`,
       { ...request, stage: "plan", claim_generation: claimGeneration, round },
       this.httpTimeoutMs, signal, CROSS_CHECK_RESPONSE_MAX_BYTES, false, { generation: claimGeneration, round }), claimGeneration, round);
+  }
+
+  /** One observation per candidate/attempt; no retry or generation/proof downgrade. */
+  async publicationContext(runId: string, request: PublicationContextRequest, signal?: AbortSignal): Promise<PublicationContextResponse> {
+    const body = { ...request };
+    validatePublicationContextRequest(runId, body);
+    if (!this.hasFeature("refresh_publication_context_v1")) throw new Error("publication context feature unavailable");
+    const owned = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(this.httpTimeoutMs)]);
+    try {
+      return decodePublicationContext(await this.postJSON(
+        `${WORKER_API_PREFIX}/runs/${runId}/publication-context`,
+        body, this.httpTimeoutMs, owned, 16 * 1024, true), runId, body);
+    } catch {
+      owned.throwIfAborted();
+      throw new Error("publication context unavailable");
+    }
   }
 
   private semanticRequestSignal(generation: number, signal?: AbortSignal): AbortSignal {

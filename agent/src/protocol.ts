@@ -16,6 +16,33 @@ import type { SemanticGateAck } from "./semantic-gate-wire.js";
 /** All worker endpoints live under this prefix and take a Bearer join token. */
 export const WORKER_API_PREFIX = "/api/worker";
 
+/** Fresh, worker-only authority for one refresh candidate. */
+export interface PublicationContextRequest {
+  claim_generation: number;
+  branch: string;
+  candidate_head: string;
+}
+export interface SourcePublicationIdentity {
+  version: 1;
+  claim_generation: number;
+  branch: string;
+  mr_iid: number;
+  published_head: string;
+  intent: "closing" | "non_closing";
+  reported_non_closing: boolean;
+}
+export interface PublicationContextBinding extends PublicationContextRequest {
+  run_id: string;
+  mr_iid: number;
+  source_run_id: string;
+  source_publication: SourcePublicationIdentity | null;
+  issue_iid: number | null;
+  intent: "closing" | "non_closing" | "not_applicable";
+}
+export type PublicationContextResponse =
+  | { version: 1; status: "unknown"; reason: string }
+  | { version: 1; status: "resolved" | "not_applicable"; binding: PublicationContextBinding };
+
 /** Non-terminal + terminal run states the worker reports via /state. */
 export type RunState =
   | "running"
