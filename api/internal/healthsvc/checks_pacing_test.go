@@ -62,11 +62,14 @@ func TestFleetHeldPacingMigrationMultiplicity(t *testing.T) {
 		name     string
 		multiple bool
 		allStuck bool
+		unknown  bool
 	}{
 		{name: "single"},
 		{name: "multiple", multiple: true},
 		{name: "single all stuck", allStuck: true},
 		{name: "multiple all stuck", multiple: true, allStuck: true},
+		{name: "unknown multiple", multiple: true, unknown: true},
+		{name: "unknown multiple all stuck", multiple: true, allStuck: true, unknown: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			report := func(id, target, reason string) store.ListAllWorkersRow {
@@ -89,9 +92,14 @@ func TestFleetHeldPacingMigrationMultiplicity(t *testing.T) {
 				localCause = prefix + localCause + "; held drains=2; sample=" + firstID
 				selectedCause = prefix + ownCause
 			}
-			workers := []store.ListAllWorkersRow{report(firstID, "repo:affected", localCause)}
+			target := "repo:affected"
+			if tc.unknown {
+				target = ""
+				localCause = prefix + "layout_migration_custody: retained drain; held drains=2; sample=" + firstID
+			}
+			workers := []store.ListAllWorkersRow{report(firstID, target, localCause)}
 			if tc.multiple {
-				workers = append(workers, report(secondID, "repo:affected", localCause))
+				workers = append(workers, report(secondID, target, localCause))
 			}
 			// checkFleetRoll must select the lowest ID at equal held rank,
 			// even though the unrelated report arrives last.
@@ -111,8 +119,12 @@ func TestFleetHeldPacingMigrationMultiplicity(t *testing.T) {
 			if strings.Contains(check.Summary, "multiple migration-held drains") != tc.multiple {
 				t.Fatalf("incorrect fleet multiplicity notice: %q", check.Summary)
 			}
+			displayed, err := json.Marshal(check)
+			if err != nil {
+				t.Fatal(err)
+			}
 			for _, forbidden := range []string{firstID, secondID, "layout_migration_custody", "held drains=", "sample=", "repo:affected"} {
-				if strings.Contains(check.Summary, forbidden) {
+				if strings.Contains(string(displayed), forbidden) {
 					t.Fatalf("affected detail %q escaped into selected summary: %q", forbidden, check.Summary)
 				}
 			}
@@ -123,6 +135,48 @@ func TestFleetHeldPacingMigrationMultiplicity(t *testing.T) {
 				t.Fatalf("all-stuck diagnostics suppressed: %+v", check)
 			}
 		})
+	}
+}
+
+// These are representative controller JSON/SQL rows at the API health seam.
+// They do not execute migration selection or Loop's synthetic status fallback.
+func TestFleetHeldPacingUnknownTarget(t *testing.T) {
+	const firstID = "22222222-2222-4222-8222-222222222222"
+	const secondID = "33333333-3333-4333-8333-333333333333"
+	const reason = "fleet: multiple migration-held drains; intake risk; operator decision; layout_migration_custody: retained drain; held drains=2; sample=" + firstID
+	// Health evidence has its own 96-byte display cap; persistence retains the
+	// complete 192-byte-bounded controller diagnostic (handler LiveDB test).
+	const visibleReason = "fleet: multiple migration-held drains; intake risk; operator decision; layout_migration_custody:"
+	const raw = `{"state":"held","target_image":"","target_version":"","blocking_reason":"fleet: multiple migration-held drains; intake risk; operator decision; layout_migration_custody: retained drain; held drains=2; sample=22222222-2222-4222-8222-222222222222"}`
+	if len(reason) > 192 {
+		t.Fatal("fixture exceeds controller reason budget")
+	}
+	report := func(id string) store.ListAllWorkersRow {
+		row := hostedRow("unresolvable", workersvc.PhaseRolling, 0, "", "", "2.0.0")
+		row.Worker.ID = uuid.MustParse(id)
+		row.RollPacing = []byte(raw)
+		row.RollPacingObservedAt = pgtype.Timestamptz{Time: fixedNow, Valid: true}
+		return row
+	}
+	first, second := report(firstID), report(secondID)
+	unrelated := hostedRow("unrelated", workersvc.PhaseSettled, 0, "", "", "2.0.0")
+	unrelated.Worker.ID = uuid.MustParse("11111111-1111-4111-8111-111111111111")
+	unrelated.RollPacing = []byte(`{"state":"active","target_image":"repo:observed","target_version":"2.0.0","retained_image":"repo:foreign","retained_version":"1.0.0"}`)
+	unrelated.RollPacingObservedAt = first.RollPacingObservedAt
+	for _, rows := range [][]store.ListAllWorkersRow{
+		{unrelated, second, first},
+		{first, second, unrelated},
+	} {
+		check := New(Config{HostedWorkerVersion: "2.0.0"}).checkFleetRoll(fixedNow, rows, true)
+		if check.Severity != sevWarn || check.Summary != "Worker roll held at : "+visibleReason+"." {
+			t.Fatalf("unknown-target hold lost selection or exact reason: %+v", check)
+		}
+		if len(check.Evidence) != 3 ||
+			check.Evidence[0].Value != "" ||
+			check.Evidence[1].Value != visibleReason ||
+			check.Evidence[2].Value != "none confirmed" {
+			t.Fatalf("unknown target inferred observed image or replacement coverage: %+v", check.Evidence)
+		}
 	}
 }
 
