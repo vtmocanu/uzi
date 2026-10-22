@@ -153,7 +153,14 @@ first adopts any inherited caller budget; pass ownership then isolates it
 in a child with the same remaining clock. Scope ordering prevents late
 adoption from attaching pass shutdown to the caller's controller. That
 signal reaches its Git operations and lock waits, its cancellation budget
-(including a budget activated later), and every recovery HTTP attempt. Shutdown closes pass
+(including a budget activated later), and every recovery HTTP attempt. Each
+owned response registers cleanup at transport fulfillment, before caller
+postchecks. Body and reader cleanup share the first cancellation promise;
+requested cleanup joins at the RPC boundary before caller locks unwind, and
+pass teardown joins any remaining response. Reader ownership lasts through
+source settlement. RPC membership uses a separate async-local set, preserving
+the original mutable attempt context and clock. This adds no timer or authority.
+Shutdown closes pass
 admission, aborts those owned operations and joins actual settlement; a Git
 child is reaped before its lock is released. An HTTP request interrupted
 after send retains the existing uncertain outcome and request identity;
@@ -269,13 +276,15 @@ must explicitly reconcile P1/P5 with legitimate index replacement and
 P3/P4 with the core/8 MiB policy, then specify the revised acceptance and
 repeat the required reviews and gates. No such revision is approved here.
 
-The seed's reachable changes are S (owned recovery-pass shutdown) and N
-(saved-evidence replay notification); both remain pending independent
-reviews and the lead's exact validation results. New-origin production
-remains disabled. W0, U4b, U4c, U4d, U5, F, M3 and M4 remain incomplete;
-MO is unperformed. No delta transfer, provenance P, boot/live ordering
-change or U5 delivery is claimed. The existing helpers, test ports and
-accounting stay unchanged. The named accepted provenance shortfall and
+The reachable changes are S (owned recovery-pass shutdown, including the
+response-handoff cleanup join) and N (saved-evidence replay notification).
+Scoped acceptance, regression and mutation results are recorded in the
+report below; frozen-gate and live acceptance remain separate. New-origin
+production remains disabled. W0, U4b, U4c, U4d, U5, F, M3 and M4 remain
+incomplete; MO is unperformed. No delta transfer, provenance P, boot/live
+ordering change or U5 delivery is claimed. Existing capture/transfer helpers
+and resource accounting stay unchanged. Ordinary LIVE/foreground test cases
+are retained case-for-case with controlled automatic-notification timing. The named accepted provenance shortfall and
 existing dormant limits above remain the boundary, not new guarantees.
 See the [delivery report](../docs/issue-3031-delivery.md) for the requirement
 map and outstanding evidence.
