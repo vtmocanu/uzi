@@ -1,6 +1,7 @@
 package healthsvc
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -49,6 +50,79 @@ func TestFleetHeldPacingCoverage(t *testing.T) {
 	check = s.checkFleetRoll(now, []store.ListAllWorkersRow{one}, true)
 	if check.Severity != sevWarn || !strings.Contains(check.Summary, "at risk") {
 		t.Fatalf("override %+v", check)
+	}
+}
+
+func TestFleetHeldPacingMigrationMultiplicity(t *testing.T) {
+	const prefix = "fleet: multiple migration-held drains; intake risk; operator decision; "
+	const ownCause = "ImagePullBackOff"
+	const firstID = "22222222-2222-4222-8222-222222222222"
+	const secondID = "33333333-3333-4333-8333-333333333333"
+	for _, tc := range []struct {
+		name     string
+		multiple bool
+		allStuck bool
+	}{
+		{name: "single"},
+		{name: "multiple", multiple: true},
+		{name: "single all stuck", allStuck: true},
+		{name: "multiple all stuck", multiple: true, allStuck: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			report := func(id, target, reason string) store.ListAllWorkersRow {
+				t.Helper()
+				row := hostedRow("held", workersvc.PhaseStuck, 0, "ImagePullBackOff", "agent", "bad")
+				row.Worker.ID = uuid.MustParse(id)
+				raw, err := json.Marshal(map[string]string{
+					"state": "held", "target_image": target, "blocking_reason": reason,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				row.RollPacing = raw
+				row.RollPacingObservedAt = pgtype.Timestamptz{Time: fixedNow, Valid: true}
+				return row
+			}
+			localCause := "layout_migration_custody: retained drain without coverage"
+			selectedCause := ownCause
+			if tc.multiple {
+				localCause = prefix + localCause + "; held drains=2; sample=" + firstID
+				selectedCause = prefix + ownCause
+			}
+			workers := []store.ListAllWorkersRow{report(firstID, "repo:affected", localCause)}
+			if tc.multiple {
+				workers = append(workers, report(secondID, "repo:affected", localCause))
+			}
+			// checkFleetRoll must select the lowest ID at equal held rank,
+			// even though the unrelated report arrives last.
+			unrelated := report("11111111-1111-4111-8111-111111111111", "repo:unrelated", selectedCause)
+			if !tc.allStuck {
+				unrelated.RollPhase.String = workersvc.PhaseSettled
+			}
+			workers = append(workers, unrelated)
+			check := New(Config{HostedWorkerVersion: "bad"}).checkFleetRoll(fixedNow, workers, true)
+			wantSeverity := sevWarn
+			if tc.allStuck {
+				wantSeverity = sevDanger
+			}
+			if check.Severity != wantSeverity || !strings.Contains(check.Summary, "repo:unrelated: "+selectedCause+".") {
+				t.Fatalf("selected report lost cause or severity: %+v", check)
+			}
+			if strings.Contains(check.Summary, "multiple migration-held drains") != tc.multiple {
+				t.Fatalf("incorrect fleet multiplicity notice: %q", check.Summary)
+			}
+			for _, forbidden := range []string{firstID, secondID, "layout_migration_custody", "held drains=", "sample=", "repo:affected"} {
+				if strings.Contains(check.Summary, forbidden) {
+					t.Fatalf("affected detail %q escaped into selected summary: %q", forbidden, check.Summary)
+				}
+			}
+			if len(check.Evidence) < 2 || check.Evidence[0].Value != "repo:unrelated" || check.Evidence[1].Value != selectedCause {
+				t.Fatalf("unrelated selected report did not retain its own diagnostics: %+v", check.Evidence)
+			}
+			if tc.allStuck && (!strings.Contains(check.Summary, "All ") || !strings.Contains(check.Summary, "ImagePullBackOff")) {
+				t.Fatalf("all-stuck diagnostics suppressed: %+v", check)
+			}
+		})
 	}
 }
 
