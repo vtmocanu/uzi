@@ -202,6 +202,25 @@ migrate_tree() {
 migrate_tree "$NIX_DIR" "$NIX_OWNER"
 migrate_tree "$DATA_DIR" "$WORKER_OWNER"
 
+# --- (a1) /nix/store is writable by its owner only -----------------------------------------
+# The nix installer leaves the store 1775 and the image chowns it to group `runner`, which
+# `runner-cmd` joins for the run worktree, so a command root could create top-level store
+# entries the runner-owned single-user nix can then neither replace nor remove. Only the
+# owner (`runner`, which provisions) ever writes the store, so drop group write. Every boot,
+# non-recursive, so a volume seeded by an older image is repaired too: reclaim to root, chmod
+# (the root window has no CAP_FOWNER), hand back. A symlinked store would make the chown
+# re-own its target, so refuse to start instead.
+NIX_STORE="$NIX_DIR/store"
+if [ -L "$NIX_STORE" ]; then
+  echo "uzi-entrypoint: refusing to start: $NIX_STORE is a symlink" >&2
+  exit 1
+fi
+if [ -d "$NIX_STORE" ]; then
+  "$CHOWN" 0:0 "$NIX_STORE"
+  "$CHMOD" 1755 "$NIX_STORE"
+  "$CHOWN" "$NIX_OWNER" "$NIX_STORE"
+fi
+
 # --- (a2) PRD #51 M4: runner-owned /data subtree carve-out ((b) ownership model) --
 # Under (b) separate-runner-clone the RUNNER clone store + the SDK/provision HOMEs are
 # runner-owned trees (the agent checks out + commits there as uid `runner`), while the
