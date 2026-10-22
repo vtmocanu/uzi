@@ -43,8 +43,10 @@ New issue workers send terminal `source_publication` evidence for the exact
 successful pushed SHA, including on legacy non-interlocked runs. The API stores
 an immutable `runs.source_publication_intent` stamp in the same transaction
 as successful issue completion, independently of recovery inventory or permit
-negotiation. It does not stamp before push. Failed completion leaves no stamp;
-without affirmative non-closing evidence, a later refresh is unknown.
+negotiation. It does not stamp before push. Rejected or rolled-back completion
+leaves no stamp; without affirmative non-closing evidence, a later refresh is
+unknown. A lost commit acknowledgement can leave completion and the stamp
+durable; exact terminal replay validates that paired outcome.
 
 MR rework and pipeline-branch-adopting CI fix on new workers require the
 negotiated feature and authenticated resolver; absence or unknown authority

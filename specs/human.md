@@ -927,8 +927,10 @@ in [ADR-1225](../adr/1225-structural-completion-interlock-invariants.md#addendum
   source-publication evidence stored atomically with successful issue completion.
   The report carries the exact frozen successful push SHA, independently of
   recovery inventory or completion-permit negotiation, including legacy issue
-  runs. There is no pre-push writer. Failed completion leaves no stamp and,
-  absent affirmative restrictions, refresh authority is unknown. Historical
+  runs. There is no pre-push writer. Rejected or rolled-back completion leaves
+  no stamp and, absent affirmative restrictions, refresh authority is unknown.
+  A lost commit acknowledgement can leave completion and the stamp durable;
+  exact terminal replay validates that paired outcome. Historical
   affirmative non-closing evidence can restrict without a stamp; historical
   publications receive no backfill. Pull/merge request text grants no authority.
   (AI-synced 2026-10-22)

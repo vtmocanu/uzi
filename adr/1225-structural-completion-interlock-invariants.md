@@ -255,7 +255,9 @@ from that report and authoritative restrictions, binding generation, branch,
 request IID and published head atomically with successful issue completion.
 Legacy non-interlocked issue runs are supported. This evidence is independent
 of recovery-inventory and completion-permit negotiation, grants no custody
-release, and has no pre-push writer. A failed completion leaves no stamp.
+release, and has no pre-push writer. Rejected or rolled-back completion leaves
+no stamp. A lost commit acknowledgement can leave completion and the stamp
+durable; exact terminal replay validates that paired outcome.
 Without affirmative restriction evidence, missing proof yields unknown even
 after a successful push. Historical affirmative non-closing evidence can
 restrict without a stamp; absence cannot authorize closing. No historical

@@ -401,8 +401,10 @@ with authoritative scope restrictions and stores `runs.source_publication_intent
 atomically with successful issue completion. This also supports legacy
 (non-interlocked) issue runs; the stamp is independent of recovery inventory
 and completion-permit negotiation. There is no pre-push stamp writer.
-A failed completion leaves no stamp: absent affirmative non-closing evidence,
-a later refresh is unknown, even if the push succeeded. Historical affirmative
+A rejected or rolled-back completion leaves no stamp: absent affirmative
+non-closing evidence, a later refresh is unknown, even if the push succeeded.
+A lost commit acknowledgement can leave completion and the stamp durable;
+exact terminal replay validates that paired outcome. Historical affirmative
 non-closing evidence can restrict a refresh without a stamp; missing evidence
 cannot establish closing authority. Historical publications are not backfilled.
 
