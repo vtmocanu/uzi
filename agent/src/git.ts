@@ -786,6 +786,8 @@ export interface CheckpointRange {
    *  every commit the pack `tipSha ^excludeSha` carries is either scanned now, reachable from a
    *  previously confirmed checkpoint publish, or reachable from the default branch. */
   scanFloorShas?: string[];
+  /** Captured server-named origin tracking commit; only its reachable blobs may be omitted. */
+  defaultBlobSha?: string;
   /** issue #3242: TRANSPORT-only pack exclusions, replacing `^excludeSha` in the pack (never the
    *  scan, never the floor validation). Set only for a zero range (`tipSha === excludeSha`) with no
    *  origin branch: the pack would otherwise be empty, and the broker cannot prove it will fetch the
@@ -796,6 +798,8 @@ export interface CheckpointRange {
 
 /** issue #1597 M2: optional GitCache construction knobs. */
 export interface GitCacheOptions {
+  /** Test-only tightening of selective checkpoint preparation limits. */
+  checkpointPackBounds?: { records?: number; bytes?: number; lineBytes?: number; durationMs?: number };
   /** Test-only supervised readiness root. Production always uses the immutable launcher. */
   retainedReadinessLaunchForTest?: typeof launchCodexEffectRoot;
   /** Cumulative decoded object bytes per recovery operation. */
@@ -1084,6 +1088,8 @@ interface SpawnGitOptions {
   /** Cap on the stderr kept for the failure message (both paths). Default: the boundary path keeps
    *  up to GIT_MAX_BUFFER, the plain path keeps all of it. */
   stderrMaxBytes?: number;
+  /** Private checkpoint preparation accounting, before stderr retention. Must not throw. */
+  onPreparationStderrBytes?: (bytes: number) => void;
   /** Trusted verifier traversal environment; never sourced from repository config. */
   env?: NodeJS.ProcessEnv;
   cancelOnAbandon?: boolean;
@@ -2279,6 +2285,7 @@ export class GitCache {
   /** issue #1597 M2: the gitleaks executable (see {@link GitCacheOptions.gitleaksBin}). */
   private readonly gitleaksBin: string;
   private readonly maxOwedCandidates: number;
+  private readonly checkpointPackBounds: NonNullable<GitCacheOptions["checkpointPackBounds"]>;
   /** issue #2733: the checkpoint-chain verifier bounds (see {@link GitCacheOptions.checkpointChainBounds}). */
   private readonly chainMaxWrappers: number;
   private readonly chainMaxDiffBytes: number;
@@ -2310,6 +2317,7 @@ export class GitCache {
     this.recoveryDecodedLimitBytes = validateRecoveryDecodedLimitBytes(opts.recoveryDecodedLimitBytes === undefined ? RECOVERY_DECODED_LIMIT : opts.recoveryDecodedLimitBytes);
     this.retainedReadinessLaunch = opts.retainedReadinessLaunchForTest ?? launchCodexEffectRoot;
     this.gitleaksBin = opts.gitleaksBin ?? "gitleaks";
+    this.checkpointPackBounds = opts.checkpointPackBounds ?? {};
     this.maxOwedCandidates = opts.maxOwedCandidates ?? MAX_OWED_CANDIDATES_PER_RUN;
     this.chainMaxWrappers = opts.checkpointChainBounds?.maxWrappers ?? CHECKPOINT_CHAIN_MAX_WRAPPERS;
     this.chainMaxDiffBytes = opts.checkpointChainBounds?.maxDiffBytes ?? CHECKPOINT_CHAIN_MAX_DIFF_BYTES;
@@ -9157,18 +9165,22 @@ export class GitCache {
   }
 
   /**
-   * PRD #122 M8 — the delta packfile of `<exclude>..refs/uzi-runner/<branch>`, for a
-   * brokered origin publish at a checkpoint. Returns `{ tipOid, pack, exited }` where
-   * `tipOid` is the tracking-ref tip (the same the checkpoint fetched back), `pack`
+   * PRD #122 M8: prepare a packfile for a brokered origin publish at a checkpoint.
+   * Returns `{ tipOid, pack, exited }` where `tipOid` is the actual candidate after
+   * any workflow overlay or checkpoint chaining, `pack`
    * STREAMS the packfile bytes, and `exited` settles with the producer's exit code;
    * null when there is no tracking ref yet (nothing to publish).
    *
    * The exclude boundary mirrors the reseed's floor: `refs/remotes/origin/<branch>` when
-   * origin carries the branch, else the default branch — so the pack carries only what the
-   * checkpoint added beyond what origin already has.
+   * origin carries the branch, else merge-base(default, tip). For a zero range without an
+   * origin branch, transport excludes the candidate's parents so the declared commit is carried.
    *
    * STREAMS, never buffers: a pack can exceed the 64 MiB `maxBuffer` cap runGit uses, so
-   * this spawns `git pack-objects --revs --stdout` and hands back its stdout as a Readable
+   * this spawns `git pack-objects` and hands back its stdout as a Readable. It uses a
+   * bounded explicit object list when a server-named default tracking commit was captured:
+   * every legacy commit and tree remains, and only default-reachable blobs are omitted.
+   * Without that captured authority (or on preparation cap exhaustion), the legacy revision
+   * input is used. Both producers are non-thin. The stdout is returned
    * for the client to upload directly. Credential-free: this is a LOCAL read of the
    * WORKER-OWNED bare by the worker uid (base gitEnv, no PAT, no runner-uid switch — the
    * runner does not own the bare). A shared lock is not taken: pack-objects reads a
@@ -9189,31 +9201,138 @@ export class GitCache {
      *  that is not already contained in it (see {@link buildCheckpointChain}), so the broker sees a
      *  strict descendant of the ref. Optional: absent ⇒ today's raw behaviour. */
     chainFrom?: readonly (string | undefined)[],
+    options: { defaultBranch?: string; signal?: AbortSignal; deadline?: number } = {},
   ): Promise<{
     tipOid: string; pack: Readable; exited: Promise<number>; cancel: () => void;
     replay: () => Promise<{ pack: Readable; exited: Promise<number>; cancel: () => void }>;
   } | null> {
+    const parent = this.recoveryOperation();
+    const boundary = this.boundaryProcesses.getStore();
+    const budget = MaintenanceBudget.current();
+    const signal = AbortSignal.any([parent?.signal, MaintenanceBudget.signal(),
+      budget?.signal, boundary?.signal]
+      .filter((s): s is AbortSignal => !!s));
+    const deadline = Math.min(options.deadline ?? Infinity, parent?.deadline ?? Infinity,
+      budget ? Date.now() + budget.remainingMs() : Infinity);
+    // Cooperative stops stay in the boundary scope: recovery signals and deadlines are hard.
+    // Replay retains the original soft clock and supervisor without renewing either lifetime.
+    const run = <T extends { pack: Readable; exited: Promise<number>; cancel: () => void; settled: () => Promise<void> } | null>(action: () => Promise<T>): Promise<T> => {
+      const scoped = async (): Promise<T> => {
+        // The runner's upload signal can combine the hard permit and cooperative signal.
+        // Relay only independent aborts into recovery; the boundary owns cooperative stopping.
+        const caller = new AbortController();
+        const cooperativeCallerAbort = () => !!boundary?.softSignal?.aborted &&
+          options.signal?.aborted && options.signal.reason === boundary.softSignal.reason;
+        const abort = () => {
+          if (!cooperativeCallerAbort()) caller.abort(options.signal?.reason);
+        };
+        const remove = () => options.signal?.removeEventListener("abort", abort);
+        options.signal?.addEventListener("abort", abort, { once: true });
+        if (options.signal?.aborted) abort();
+        let owner: NonNullable<T> | undefined;
+        try {
+          const result = await this.withRecoveryOperation(AbortSignal.any([signal, caller.signal]), deadline, async () => {
+            this.checkCheckpointCooperation();
+            const created = await action();
+            if (created) owner = created as NonNullable<T>;
+            return created;
+          });
+          if (result) void result.exited.then(remove, remove);
+          else remove();
+          return result;
+        } catch (error) {
+          remove();
+          if (owner) {
+            owner.cancel();
+            owner.pack.destroy();
+            // The caller has no handle yet: retain custody through cancellation and reap.
+            const cleanup = await Promise.allSettled([owner.settled(), owner.exited]);
+            const failure = cleanup.find(result => result.status === "rejected");
+            if (failure?.status === "rejected") {
+              throw failure.reason instanceof CheckpointUnsafeCleanupError ? failure.reason
+                : new CheckpointUnsafeCleanupError("checkpoint producer handoff cleanup unverified", failure.reason);
+            }
+          }
+          if (!signal.aborted && !caller.signal.aborted && cooperativeCallerAbort() && error === options.signal?.reason) {
+            throw new CheckpointSoftDeadlineError();
+          }
+          throw error;
+        }
+      };
+      return boundary ? this.boundaryProcesses.run(boundary, scoped) : scoped();
+    };
+    const packed = await run(() => this.checkpointPackCaptured(barePath, branch, overlay, pinned, onStep,
+      sourceSha, beforePack, chainFrom, options, parent ? undefined : Infinity));
+    if (!packed) return null;
+    let settlePrevious = packed.settled;
+    return { tipOid: packed.tipOid, pack: packed.pack, exited: packed.exited, cancel: packed.cancel,
+      replay: async () => {
+        // A numeric cancellation exit is not proof of disposal. Keep the owned
+        // settlement failure visible before any successor producer can be opened.
+        await settlePrevious();
+        const producer = await run(packed.replay);
+        settlePrevious = producer.settled;
+        return { pack: producer.pack, exited: producer.exited, cancel: producer.cancel };
+      } };
+  }
+
+  private async checkpointPackCaptured(
+    barePath: string,
+    branch: string,
+    overlay?: CheckpointOverlayContext,
+    pinned?: CheckpointRange,
+    onStep?: (step: BoundaryStep) => void,
+    /** Exact committed ownership snapshot supplied by the runner; never a source ref name. */
+    sourceSha?: string,
+    /** Judge the actual candidate after overlay/floor validation, before starting a producer. */
+    beforePack?: (wantedSha: string) => Promise<void>,
+    /** issue #2733: the checkpoint ref tips this run knows, in preference order (attempted, then
+     *  confirmed). When no overlay wrapper was built, the raw tip is chained over the first one
+     *  that is not already contained in it (see {@link buildCheckpointChain}), so the broker sees a
+     *  strict descendant of the ref. Optional: absent ⇒ today's raw behaviour. */
+    chainFrom?: readonly (string | undefined)[],
+    options: { defaultBranch?: string; signal?: AbortSignal; deadline?: number } = {},
+    producerTimeoutMs?: number,
+  ): Promise<{
+    tipOid: string; pack: Readable; exited: Promise<number>; cancel: () => void; settled: () => Promise<void>;
+    replay: () => Promise<{ pack: Readable; exited: Promise<number>; cancel: () => void; settled: () => Promise<void> }>;
+  } | null> {
     // Replay closes over literal OIDs and the original guard; it never rebuilds an overlay.
-    const openProducer = async (source: string, candidate: string, floor: string, packExcludes?: readonly string[]) => {
+    const openProducer = async (source: string, candidate: string, floor: string, defaultBlobSha?: string, packExcludes?: readonly string[]) => {
+      this.checkCheckpointCooperation();
       onStep?.("scratch_preflight");
       await this.scratchPublicationPreflight(barePath, branch, source);
       if (candidate !== source) await this.scratchPublicationPreflight(barePath, branch, candidate);
       await this.validateCheckpointFloor(barePath, floor, candidate);
       await beforePack?.(candidate);
+      this.checkCheckpointCooperation();
+      if (defaultBlobSha && (!SHA40_RE.test(defaultBlobSha) ||
+          await this.revParse(barePath, `${defaultBlobSha}^{commit}`) !== defaultBlobSha)) {
+        throw new ScratchPublicationError("captured checkpoint default is unavailable");
+      }
+      const selected = defaultBlobSha && !(candidate === floor && packExcludes !== undefined)
+        ? await this.prepareCheckpointObjects(barePath, candidate, floor, defaultBlobSha) : undefined;
+      this.checkCheckpointCooperation();
       onStep?.("checkpoint_pack");
-      // issue #3242: a zero range packs the candidate over its literal parents instead of ^floor.
+      // Preserve #3242's zero-range transport envelope. It is deliberately packed by
+      // the legacy producer: blob selection over candidate ^floor would be empty.
       const excludes = candidate === floor && packExcludes !== undefined ? packExcludes : [floor];
-      const { stdout, exited, cancel } = await this.spawnGit(
-        barePath, ["pack-objects", "--revs", "--stdout"], `${candidate}\n${excludes.map((x) => `^${x}\n`).join("")}`,
-        { stdoutCategory: "artifactBytes" },
+      this.checkCheckpointCooperation();
+      const { stdout, exited, cancel, settled } = await this.spawnGit(
+        barePath, selected === undefined ? ["pack-objects", "--revs", "--stdout"] : ["pack-objects", "--stdout"],
+        selected ?? `${candidate}\n${excludes.map((x) => `^${x}\n`).join("")}`, {
+          stdoutCategory: "artifactBytes", stderrMaxBytes: 64 * 1024,
+          // checkpointPack's synthetic recovery scope must not add a producer timeout default.
+          timeoutMs: producerTimeoutMs,
+        },
       );
-      return { pack: stdout, exited, cancel };
+      return { pack: stdout, exited, cancel, settled };
     };
     // A pinned range uses literal commit OIDs for the pack floor and candidate.
     // If an overlay is requested, its wrapper becomes the wanted OID while the
     // excluded floor remains pinned.
     if (pinned) {
-      const { tipSha, excludeSha, packExcludeShas } = pinned;
+      const { tipSha, excludeSha, defaultBlobSha, packExcludeShas } = pinned;
       if (!SHA40_RE.test(tipSha) || !SHA40_RE.test(excludeSha) ||
           (packExcludeShas !== undefined && (tipSha !== excludeSha || !packExcludeShas.every((x) => SHA40_RE.test(x)))) ||
           (sourceSha !== undefined && sourceSha !== tipSha)) {
@@ -9238,9 +9357,10 @@ export class GitCache {
         }
       }
       const candidate = wanted;
-      const replay = () => openProducer(tipSha, candidate, excludeSha, packExcludeShas);
+      const replay = () => openProducer(tipSha, candidate, excludeSha, defaultBlobSha, packExcludeShas);
       return { tipOid: wanted, ...await replay(), replay };
     }
+    const defaultBlobSha = await this.captureCheckpointDefault(barePath, options.defaultBranch);
     const realTip = sourceSha ?? await this.trackingTip(barePath, branch);
     if (!realTip) return null;
     onStep?.("scratch_preflight");
@@ -9306,8 +9426,173 @@ export class GitCache {
         kind: "checkpoint_range", step: "checkpoint_floor", ...execDetail(classifyExecFailure(e)),
       });
     }
-    const replay = () => openProducer(realTip, wanted, floor, packExcludes);
+    const replay = () => openProducer(realTip, wanted, floor, defaultBlobSha, packExcludes);
     return { tipOid: wanted, ...await replay(), replay };
+  }
+
+  /** Server context is the sole name authority. origin/HEAD only vetoes a conflict. */
+  private async captureCheckpointDefault(barePath: string, name?: string): Promise<string | undefined> {
+    this.checkCheckpointCooperation();
+    if (!name || !(await this.isRemoteBranchName(barePath, name))) {
+      this.checkCheckpointCooperation();
+      return undefined;
+    }
+    let head = "";
+    try {
+      // Remove Git's terminator only; Unicode whitespace is valid ref spelling.
+      head = (await this.runGit(barePath, ["symbolic-ref", "-q", "refs/remotes/origin/HEAD"])).replace(/\n$/, "");
+    } catch (err) {
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
+    }
+    this.checkCheckpointCooperation();
+    const ref = `refs/remotes/origin/${name}`;
+    if (head && head !== ref) return undefined;
+    const sha = await this.revParse(barePath, `${ref}^{commit}`);
+    this.checkCheckpointCooperation();
+    return sha && SHA40_RE.test(sha) ? sha : undefined;
+  }
+
+  /** Four sequential owned children; only the classifier has concurrent bounded input/output.
+   * One failed child stops the pass. All cancellation and exit promises settle before fallback.
+   * Rows retain Git's path spelling; classification never requests object contents. */
+  private async prepareCheckpointObjects(barePath: string, candidate: string, floor: string, defaultSha: string): Promise<Buffer | undefined> {
+    const limits = this.checkpointPackBounds;
+    const maxRecords = Math.max(0, Math.min(65536, limits.records ?? 65536));
+    const maxBytes = Math.max(0, Math.min(16 * 1024 * 1024, limits.bytes ?? 16 * 1024 * 1024));
+    const maxLine = Math.max(0, Math.min(64 * 1024, limits.lineBytes ?? 64 * 1024));
+    const cap = new Error("checkpoint object preparation bound exhausted");
+    const stop = new AbortController();
+    const timer = setTimeout(() => stop.abort(cap), Math.max(0, Math.min(5000, limits.durationMs ?? 5000)));
+    const rows = new Map<string, { row: Buffer; commit: boolean; all: boolean; blob: boolean }>();
+    let consumed = 0;
+    // Separate from retained unique rows: repeated metadata and discarded diagnostics count.
+    // This callback also runs in stderr data handlers, so cancellation must not throw.
+    const consume = (bytes: number) => {
+      if (stop.signal.aborted) return;
+      if (bytes > maxBytes - consumed) { stop.abort(cap); return; }
+      consumed += bytes;
+    };
+    let charged = 0;
+    const charge = (bytes: number) => {
+      if (bytes > maxBytes - charged) throw cap;
+      charged += bytes;
+    };
+    try {
+      return await this.withRecoveryOperation(stop.signal, Infinity, async () => {
+        const lines = async (stream: Readable, accept: (line: Buffer) => void) => {
+          let pending = Buffer.alloc(0);
+          for await (const raw of stream) {
+            this.checkCheckpointCooperation();
+            const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as Uint8Array);
+            // Count each stdout byte only here, after the raw/gated transport, before parsing.
+            consume(chunk.length);
+            stop.signal.throwIfAborted();
+            // Stream high-water marks bound chunks; reject a nonconforming supervisor pipe.
+            if (chunk.length > 64 * 1024) throw cap;
+            let offset = 0;
+            while (offset < chunk.length) {
+              const newline = chunk.indexOf(10, offset);
+              const end = newline < 0 ? chunk.length : newline;
+              if (pending.length + end - offset > maxLine) throw cap;
+              const part = chunk.subarray(offset, end);
+              pending = pending.length ? Buffer.concat([pending, part]) : Buffer.from(part);
+              if (newline < 0) break;
+              accept(pending);
+              pending = Buffer.alloc(0);
+              offset = newline + 1;
+            }
+          }
+          if (pending.length) throw new ScratchPublicationError("unterminated checkpoint metadata", undefined, {
+            kind: "checkpoint_range", step: "checkpoint_floor", detail: "unterminated checkpoint metadata",
+          });
+        };
+        const child = async (args: string[], accept: (line: Buffer) => void, input?: () => Iterable<string>) => {
+          this.checkCheckpointCooperation();
+          const process = await this.spawnGit(barePath, args, undefined, {
+            keepStdinOpen: !!input, stderrMaxBytes: 64 * 1024, joinStderr: true, cancelOnAbandon: true,
+            onPreparationStderrBytes: consume,
+          });
+          let failure: unknown;
+          const read = lines(process.stdout, accept).catch(error => {
+            failure ??= error; process.cancel(); process.stdin?.destroy(); process.stdout.destroy();
+            throw error;
+          });
+          const write = (async () => {
+            if (!input) return;
+            if (!process.stdin) throw new Error("checkpoint classifier has no stdin");
+            for (const row of input()) {
+              this.checkCheckpointCooperation();
+              // One callback outstanding: bounded backpressure while stdout drains independently.
+              await new Promise<void>((resolve, reject) => {
+                process.stdin!.write(row, error => error ? reject(error) : resolve());
+              });
+            }
+            process.stdin.end();
+          })().catch(error => {
+            failure ??= error; process.cancel(); process.stdin?.destroy(); process.stdout.destroy();
+            throw error;
+          });
+          const settled = await Promise.allSettled([read, write]);
+          if (settled.some(result => result.status === "rejected")) {
+            process.cancel(); process.stdin?.destroy(); process.stdout.destroy();
+          }
+          // Cleanup proof precedes cap/abort classification: an unverified child forbids fallback.
+          await process.settled();
+          const code = await process.exited;
+          if (failure) throw failure;
+          this.checkCheckpointCooperation();
+          if (code !== 0) throw new Error("checkpoint metadata child failed");
+        };
+        const retain = (kind: "commit" | "all" | "blob") => (row: Buffer) => {
+          const oidBytes = row.subarray(0, 40);
+          const oid = oidBytes.toString("latin1");
+          if (!SHA40_RE.test(oid) || (row.length !== 40 && row[40] !== 32)) {
+            throw new ScratchPublicationError("invalid checkpoint object row", undefined, {
+              kind: "checkpoint_range", step: "checkpoint_floor", detail: "invalid checkpoint object row",
+            });
+          }
+          let entry = rows.get(oid);
+          if (!entry) {
+            if (rows.size >= maxRecords) throw cap;
+            // Charge row storage, map/object overhead, classifier and selected-row copies
+            // before retaining. Pipe/pending buffers are separately bounded above.
+            charge(512 + row.length * 8);
+            entry = { row, commit: false, all: false, blob: false };
+            rows.set(oid, entry);
+          }
+          entry[kind] = true;
+        };
+        await child(["rev-list", candidate, `^${floor}`], retain("commit"));
+        await child(["rev-list", "--objects", candidate, `^${floor}`], retain("all"));
+        await child(["rev-list", "--objects", candidate, `^${floor}`, `^${defaultSha}`], retain("blob"));
+        const iterator = rows.entries();
+        const selected: Buffer[] = [];
+        await child(["cat-file", "--batch-check=%(objectname) %(objecttype)"], line => {
+          const next = iterator.next();
+          const match = /^([0-9a-f]{40}) (commit|tree|blob)$/.exec(line.toString("latin1"));
+          if (next.done || !match || match[1] !== next.value[0]) throw new ScratchPublicationError("invalid checkpoint classification", undefined, {
+            kind: "checkpoint_range", step: "checkpoint_floor", detail: "invalid checkpoint classification",
+          });
+          const entry = next.value[1];
+          if ((match[2] === "commit" && entry.commit) ||
+              (match[2] === "tree" && entry.all) || (match[2] === "blob" && entry.blob)) {
+            selected.push(entry.row, Buffer.from("\n"));
+          }
+        }, function* () { for (const oid of rows.keys()) yield `${oid}\n`; });
+        if (!iterator.next().done) throw new ScratchPublicationError("incomplete checkpoint classification", undefined, {
+          kind: "checkpoint_range", step: "checkpoint_floor", detail: "incomplete checkpoint classification",
+        });
+        this.checkCheckpointCooperation();
+        return Buffer.concat(selected);
+      });
+    } catch (error) {
+      if (error instanceof CheckpointUnsafeCleanupError) throw error;
+      // Parent lifetime always wins over the optimization cap after verified disposal.
+      this.checkCheckpointCooperation();
+      if (error === cap || (stop.signal.aborted && error === stop.signal.reason)) return undefined;
+      throw error;
+    } finally { clearTimeout(timer); }
   }
 
   private async validateCheckpointFloor(barePath: string, floor: string | null, candidate: string): Promise<void> {
@@ -9356,12 +9641,12 @@ export class GitCache {
    * via `rev-parse --verify <ref>^{commit}` and validated as 40-hex; plus the SCAN-only floors
    * ({@link CheckpointRange.scanFloorShas}): the default-branch tip, and `confirmedTip` (the last
    * checkpoint tip a publish CONFIRMED) when it is an ancestor of `tipSha`. Null when the tip or the
-   * pack floor does not resolve. Never throws.
+   * pack floor does not resolve. Ordinary resolution failures return null; interruption propagates.
    */
   async resolveCheckpointRange(
     barePath: string,
     branch: string,
-    opts: { confirmedTip?: string; extraFloors?: string[]; tipSha?: string } = {},
+    opts: { confirmedTip?: string; extraFloors?: string[]; tipSha?: string; defaultBranch?: string } = {},
   ): Promise<CheckpointRange | null> {
     try {
       // Issue #2545: a held publication names its tip explicitly (the frozen record's aggregate
@@ -9409,9 +9694,16 @@ export class GitCache {
           scanFloorShas.push(floor);
         }
       }
+      const defaultBlobSha = await this.captureCheckpointDefault(barePath, opts.defaultBranch);
+      this.checkCheckpointCooperation();
       const packExcludeShas = await this.zeroRangePackExcludes(barePath, branch, tipSha, excludeSha);
-      return { tipSha, excludeSha, scanFloorShas, ...(packExcludeShas !== undefined ? { packExcludeShas } : {}) };
+      return { tipSha, excludeSha, scanFloorShas,
+        ...(defaultBlobSha === undefined ? {} : { defaultBlobSha }),
+        ...(packExcludeShas === undefined ? {} : { packExcludeShas }) };
     } catch (err) {
+      this.checkCheckpointCooperation();
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
       this.log.warn("checkpoint range could not be resolved", { bare: barePath, error: gitErrorMessage(err) });
       return null;
     }
@@ -15057,9 +15349,9 @@ try {
   private async spawnGit(
     cwd: string,
     args: string[],
-    stdin?: string,
+    stdin?: string | Buffer,
     opts: SpawnGitOptions = {},
-  ): Promise<{ child?: ChildProcess; stdin?: Writable; stdout: Readable; exited: Promise<number>; cancel: () => void }> {
+  ): Promise<{ child?: ChildProcess; stdin?: Writable; stdout: Readable; exited: Promise<number>; settled: () => Promise<void>; cancel: () => void }> {
     if (this.boundaryProcesses.getStore()?.capture && opts.trustedExecutable) {
       throw new Error("capture trusted executable refused");
     }
@@ -15068,7 +15360,6 @@ try {
     const metered = MaintenanceResources.active();
     const producerScope = AsyncLocalStorage.snapshot();
     const completionError = (): Error | undefined => producerScope(() => {
-      if (!metered) return;
       try { this.checkRecoveryInterruption(); MaintenanceResources.checkIfActive(); }
       catch (error) { return error instanceof Error ? error : new Error(String(error)); }
     });
@@ -15096,23 +15387,34 @@ try {
           cwd,
           env,
           identity: "worker_pat",
-          ...(childTimeout === undefined ? {} : { timeoutMs: childTimeout }),
+          ...(childTimeout === undefined || !Number.isFinite(childTimeout) ? {} : { timeoutMs: childTimeout }),
           ...(remainingSoft === undefined ? {} : { recoverableTimeout: true }),
         });
       } catch (cause) {
         throw this.boundaryAbortError(cause) ?? cause;
       }
-      const expired = this.checkRecoverySpawn(process);
-      if (expired) await expired;
-      if (!process.stdout) {
-        await Promise.allSettled([process.cancel(), process.completed]);
-        throw new Error("supervised git process has no stdout");
-      }
+      const refuseAfterCleanup = async (cause: unknown): Promise<never> => {
+        const cleanup = await Promise.allSettled([Promise.resolve().then(() => process.cancel()), process.completed]);
+        for (const result of cleanup) {
+          if (result.status !== "rejected") continue;
+          const reason = result.reason;
+          if (reason instanceof CheckpointUnsafeCleanupError || reason instanceof TrustedExecutionRefusal ||
+              reason instanceof GitBoundaryAbortError || reason instanceof CheckpointSoftDeadlineError) throw reason;
+          throw new CheckpointUnsafeCleanupError("checkpoint child startup settlement unverified", reason);
+        }
+        throw cause;
+      };
+      try { this.checkRecoveryInterruption(); }
+      catch (error) { await refuseAfterCleanup(error); }
+      if (!process.stdout) return refuseAfterCleanup(new Error("supervised git process has no stdout"));
       const stderrCap = opts.stderrMaxBytes ?? GIT_MAX_BUFFER;
       const stderrChunks: Buffer[] = [];
       let stderrBytes = 0;
       let cancellation: Promise<unknown> | undefined;
-      const abortRecovery = () => { cancellation ??= process.cancel().catch(() => undefined); };
+      const abortRecovery = () => {
+        cancellation ??= Promise.resolve().then(() => process.cancel());
+        void cancellation.catch(() => undefined);
+      };
       // Wrapper refusal can precede the source's asynchronous disposal. Private
       // transport keeps both raw pipes owned until EOF or actual close, including
       // cancellation; an error event alone does not settle their descriptors.
@@ -15124,6 +15426,7 @@ try {
       const stderrDone = opts.joinStderr && stderr ? finished(stderr).then(() => true, () => false) : Promise.resolve(true);
       stderr?.on("data", (c: Buffer | string) => {
         const chunk = Buffer.isBuffer(c) ? c : Buffer.from(c);
+        opts.onPreparationStderrBytes?.(chunk.length);
         if (stderrBytes >= stderrCap) return;
         const kept = chunk.subarray(0, stderrCap - stderrBytes);
         stderrChunks.push(kept);
@@ -15152,15 +15455,27 @@ try {
       else if (opts.keepStdinOpen) process.stdin?.write(stdin ?? "");
       else process.stdin?.end(stdin ?? "");
       const completion = process.completed.then(({ code }) => completionError() ? -1 : code, () => -1);
+      const settled = async () => {
+        const terminal = await Promise.allSettled([process.completed]);
+        const cancelled = await Promise.allSettled(cancellation ? [cancellation] : []);
+        recovery?.signal.removeEventListener("abort", abortRecovery);
+        const failed = cancelled.find(result => result.status === "rejected");
+        const rejected = failed?.status === "rejected" ? failed
+          : terminal[0]!.status === "rejected" ? terminal[0]! : undefined;
+        if (rejected) {
+          const reason = rejected.reason;
+          if (reason instanceof CheckpointUnsafeCleanupError || reason instanceof TrustedExecutionRefusal ||
+              reason instanceof GitBoundaryAbortError || reason instanceof CheckpointSoftDeadlineError) throw reason;
+          throw new CheckpointUnsafeCleanupError("checkpoint metadata child settlement unverified", reason);
+        }
+      };
       const exited = (opts.joinStderr ? completion.then(async code => {
         const [stderrSettled, rawSettled] = await Promise.all([stderrDone, rawOutputsDone]);
         return stderrSettled && rawSettled.every(Boolean) && !completionError() ? code : -1;
-      }) : completion).finally(async () => {
-        recovery?.signal.removeEventListener("abort", abortRecovery);
-        await cancellation;
-      });
-      void exited.catch(() => undefined);
-      return { stdin: opts.keepStdinOpen ? process.stdin ?? undefined : undefined, stdout: gated.out, exited, cancel: abortRecovery };
+      }) : completion).then(async code => {
+        try { await settled(); return code; } catch { return -1; }
+      }, () => -1);
+      return { stdin: opts.keepStdinOpen ? process.stdin ?? undefined : undefined, stdout: gated.out, exited, settled, cancel: abortRecovery };
     }
     const timeoutMs = recovery ? Math.min(opts.timeoutMs ?? Infinity, this.recoveryRemaining(recovery)) : opts.timeoutMs;
     if (MaintenanceResources.active()) assertNoCredentialedGitWhileQuarantined(env);
@@ -15175,7 +15490,7 @@ try {
     };
     recovery?.signal.addEventListener("abort", abortRecovery, { once: true });
     let timeoutError: Error | undefined;
-    const timeout = timeoutMs === undefined ? undefined : setTimeout(() => {
+    const timeout = timeoutMs === undefined || !Number.isFinite(timeoutMs) ? undefined : setTimeout(() => {
       if (timeoutMs === opts.timeoutMs && !killTimer && child.exitCode === null && child.signalCode === null) {
         timeoutError = opts.nativeTimeoutError;
       }
@@ -15187,6 +15502,7 @@ try {
       if (killTimer) clearTimeout(killTimer);
     });
     if (recovery?.signal.aborted) abortRecovery();
+    const closed = new Promise<void>(resolve => child.once("close", () => resolve()));
     const exited = new Promise<number>((resolve) => {
       let failed = false;
       child.once("error", () => { failed = true; if (!recovery?.budget && !metered) resolve(-1); });
@@ -15203,6 +15519,7 @@ try {
     const stderrDone = opts.joinStderr && stderr ? finished(stderr).then(() => true, () => false) : Promise.resolve(true);
     stderr?.on("error", error => { abortRecovery(); gated.exited(error); });
     stderr?.on("data", (c: Buffer) => {
+      opts.onPreparationStderrBytes?.(c.length);
       if (stderrCap === undefined) {
         stderrChunks.push(c);
         return;
@@ -15231,7 +15548,7 @@ try {
     const joined = opts.joinStderr ? completion.then(async code =>
       await stderrDone && !completionError() ? code : -1) : completion;
     void joined.catch(() => undefined);
-    return { child, stdin: opts.keepStdinOpen ? child.stdin ?? undefined : undefined, stdout: gated.out, exited: joined, cancel: abortRecovery };
+    return { child, stdin: opts.keepStdinOpen ? child.stdin ?? undefined : undefined, stdout: gated.out, exited: joined, settled: () => closed, cancel: abortRecovery };
   }
 
   /**
