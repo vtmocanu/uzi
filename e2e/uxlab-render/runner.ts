@@ -23,14 +23,15 @@ export async function runRunner(
 ) {
   const { cwd, env, timeout, record } = options;
   const outerTimeoutMs = timeout + killAfterMs + fallbackGraceMs;
-  const context = { command: bounded(command), cwd: bounded(cwd), timeoutMs: timeout,
+  const timeoutBinary = process.env.UXLAB_RENDER_RUNNER_TIMEOUT ?? "/opt/uzi-toolchain/bin/timeout";
+  const context = { command: bounded(command), timeoutBinary: bounded(timeoutBinary), cwd: bounded(cwd), timeoutMs: timeout,
     killAfterMs, outerTimeoutMs };
   let stage = "wrap";
   try {
     record("runner-launch", context);
     // timeout runs after runnerCommand's uid drop and manages its own process group.
     // TERM at the deadline, KILL after the grace; execFile is only a later fallback.
-    const wrapped = runnerCommand("/usr/bin/timeout",
+    const wrapped = runnerCommand(timeoutBinary,
       ["--kill-after=5s", `${timeout / 1000}s`, command, ...args]);
     stage = "exec";
     const result = await exec(wrapped.command, wrapped.args,

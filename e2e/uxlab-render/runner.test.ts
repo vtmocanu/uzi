@@ -8,9 +8,9 @@ import { runRunner } from "./runner.js";
 
 // The Alpine test host's /usr/bin/timeout may be BusyBox. An explicit test-only
 // override exercises installed GNU timeout without modifying the host or command env.
-const timeoutBinary = process.env.UXLAB_TEST_TIMEOUT_BINARY ?? "/usr/bin/timeout";
+const timeoutBinary = process.env.UXLAB_TEST_TIMEOUT_BINARY ?? "/opt/uzi-toolchain/bin/timeout";
 const localRunner = (command: string, args: string[]) => {
-  assert.equal(command, "/usr/bin/timeout");
+  assert.equal(command, process.env.UXLAB_RENDER_RUNNER_TIMEOUT ?? "/opt/uzi-toolchain/bin/timeout");
   assert.equal(args[0], "--kill-after=5s");
   assert(!args.includes("--foreground"));
   return runnerCommand(timeoutBinary, args, false);
