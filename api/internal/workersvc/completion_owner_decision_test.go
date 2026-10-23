@@ -310,6 +310,21 @@ func TestValidateDecision(t *testing.T) {
 		}
 	})
 
+	t.Run("authorize_maintainer on a structural contract is invalid", func(t *testing.T) {
+		// The structural fixture reaches the profile guard (completionPendingFromContract returns
+		// nil, nil for a structural profile, so the revision-conflict arm is not taken). The guard
+		// refuses with the bare ErrCompletionDecisionInvalid, even for a well-formed decision.
+		err := validateDecision(lockedRev1, CompletionDecisionInput{
+			Decision: "authorize_maintainer", Reason: "r", ContractRevision: 1,
+		}, frozenMs)
+		if !errors.Is(err, ErrCompletionDecisionInvalid) {
+			t.Fatalf("authorize_maintainer on a structural contract: want ErrCompletionDecisionInvalid, got %v", err)
+		}
+		if errors.Is(err, ErrCompletionRevisionConflict) {
+			t.Fatalf("authorize_maintainer must be refused by the profile guard, not the revision-conflict arm: %v", err)
+		}
+	})
+
 	t.Run("restoration and out-of-scope on a revised contract", func(t *testing.T) {
 		// Revise to rev2 deferring m2,m3 (keep m1). Then a keep of a deferred id, and an accept of a
 		// deferred criterion, are both invalid.

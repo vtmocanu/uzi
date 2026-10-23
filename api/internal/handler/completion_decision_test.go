@@ -31,7 +31,9 @@ import (
 //     including a read-only admin_ro uza_ Bearer that keeps IsAdmin=true — is hidden, never writes);
 //   - a missing/empty reason → 400 (handler shape validation, before the service);
 //   - an unknown milestone/criterion id → 400 (ErrCompletionDecisionInvalid);
-//   - a stale fenced contract_revision → 409 (ErrCompletionRevisionConflict).
+//   - a stale fenced contract_revision → 409 (ErrCompletionRevisionConflict);
+//   - authorize_maintainer on this structural run → 400 whose body is exactly the service sentinel
+//     (the profile guard in validateDecisionFromContract), not a decode or shape 400 (PRD #1232 M1 (f)).
 //
 // Every case is an error path (none commits), so the seeded run stays at revision 1 and is reused;
 // the foreign cases additionally assert the run is unchanged (no owner-bypass write).
@@ -102,25 +104,35 @@ func TestCompletionDecisionHandlerStatusMappingLiveDB(t *testing.T) {
 		user uuid.UUID
 		req  completionDecisionRequest
 		want int
+		// wantErr, when set, is the exact {"error": ...} message the response must carry, so a
+		// 400 from the guard under test cannot be satisfied by an unrelated 400 (a decode failure,
+		// a missing reason, an unknown decision).
+		wantErr string
 	}{
 		// partial
 		{"partial foreign caller is 404", stranger,
-			completionDecisionRequest{Decision: "partial", Keep: []string{"m1"}, Reason: "r", ContractRevision: 1}, http.StatusNotFound},
+			completionDecisionRequest{Decision: "partial", Keep: []string{"m1"}, Reason: "r", ContractRevision: 1}, http.StatusNotFound, ""},
 		{"partial empty reason is 400", owner,
-			completionDecisionRequest{Decision: "partial", Keep: []string{"m1"}, Reason: "   ", ContractRevision: 1}, http.StatusBadRequest},
+			completionDecisionRequest{Decision: "partial", Keep: []string{"m1"}, Reason: "   ", ContractRevision: 1}, http.StatusBadRequest, ""},
 		{"partial unknown milestone is 400", owner,
-			completionDecisionRequest{Decision: "partial", Keep: []string{"zzz"}, Reason: "r", ContractRevision: 1}, http.StatusBadRequest},
+			completionDecisionRequest{Decision: "partial", Keep: []string{"zzz"}, Reason: "r", ContractRevision: 1}, http.StatusBadRequest, ""},
 		{"partial stale revision is 409", owner,
-			completionDecisionRequest{Decision: "partial", Keep: []string{"m1"}, Reason: "r", ContractRevision: 7}, http.StatusConflict},
+			completionDecisionRequest{Decision: "partial", Keep: []string{"m1"}, Reason: "r", ContractRevision: 7}, http.StatusConflict, ""},
 		// accept
 		{"accept foreign caller is 404", stranger,
-			completionDecisionRequest{Decision: "accept", Criteria: []string{"m1.c1"}, Reason: "r", ContractRevision: 1}, http.StatusNotFound},
+			completionDecisionRequest{Decision: "accept", Criteria: []string{"m1.c1"}, Reason: "r", ContractRevision: 1}, http.StatusNotFound, ""},
 		{"accept empty reason is 400", owner,
-			completionDecisionRequest{Decision: "accept", Criteria: []string{"m1.c1"}, Reason: "", ContractRevision: 1}, http.StatusBadRequest},
+			completionDecisionRequest{Decision: "accept", Criteria: []string{"m1.c1"}, Reason: "", ContractRevision: 1}, http.StatusBadRequest, ""},
 		{"accept unknown criterion is 400", owner,
-			completionDecisionRequest{Decision: "accept", Criteria: []string{"zzz.c1"}, Reason: "r", ContractRevision: 1}, http.StatusBadRequest},
+			completionDecisionRequest{Decision: "accept", Criteria: []string{"zzz.c1"}, Reason: "r", ContractRevision: 1}, http.StatusBadRequest, ""},
 		{"accept stale revision is 409", owner,
-			completionDecisionRequest{Decision: "accept", Criteria: []string{"m1.c1"}, Reason: "r", ContractRevision: 7}, http.StatusConflict},
+			completionDecisionRequest{Decision: "accept", Criteria: []string{"m1.c1"}, Reason: "r", ContractRevision: 7}, http.StatusConflict, ""},
+		// authorize_maintainer on this structural-profile run: a well-formed request (decodes, has a
+		// reason, fences on the live revision) that only the service's profile guard refuses. The
+		// exact bare sentinel text distinguishes it from every other 400 this handler can produce.
+		{"authorize_maintainer on a structural run is 400 from the profile guard", owner,
+			completionDecisionRequest{Decision: "authorize_maintainer", Reason: "r", ContractRevision: 1},
+			http.StatusBadRequest, workersvc.ErrCompletionDecisionInvalid.Error()},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -131,6 +143,17 @@ func TestCompletionDecisionHandlerStatusMappingLiveDB(t *testing.T) {
 			rec := postCompletionDecision(t, h, tc.user, tc.user == stranger, runID, tc.req)
 			if rec.Code != tc.want {
 				t.Fatalf("status = %d, want %d; body=%s", rec.Code, tc.want, rec.Body.String())
+			}
+			if tc.wantErr != "" {
+				var body struct {
+					Error string `json:"error"`
+				}
+				if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+					t.Fatalf("decode error body %q: %v", rec.Body.String(), err)
+				}
+				if body.Error != tc.wantErr {
+					t.Fatalf("error = %q, want exactly %q (a different 400 would mask the guard)", body.Error, tc.wantErr)
+				}
 			}
 			// A foreign caller must have written nothing: the revision stays at 1.
 			if tc.user == stranger {
