@@ -16,6 +16,7 @@ import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { AGENT_GIT_IDENTITY, GitCache, WIP_PARK_COMMIT_PREFIX } from "../src/git.js";
@@ -48,6 +49,7 @@ const EXHAUSTED = /maintenance_resource_exhausted/;
 const REFUSED_OR_HELPER = /maintenance_wip_capture_refused|subprocess exited 1/;
 const MUTATING = ["write-tree", "commit-tree", "update-ref"] as const;
 const CAP = 8 * 1024 * 1024;
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const BASE = "a1eba31831f9799a29857471514369d854ec8e72";
 const BRANCH = "refs/heads/main";
 const cleanEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
@@ -315,6 +317,34 @@ describe("hash-attested maintenance WIP capture (W0-H)", { skip: process.platfor
     assert.equal(await fs.readFile(path.join(f.root, "tracked"), "utf8"), "changed");
   });
 
+  test("a tracked file replaced by a directory is refused before add", async t => {
+    const f = await fixture(t);
+    await fs.rm(path.join(f.root, "tracked"));
+    await fs.mkdir(path.join(f.root, "tracked"));
+    await fs.writeFile(path.join(f.root, "tracked/inner"), "inner");
+    const refsBefore = f.refs(), indexBefore = await f.index();
+    await assert.rejects(f.capture(), REFUSED);
+    assert.ok(!f.launched("add"));
+    assert.deepEqual(f.mutations(), []);
+    assertUnmoved(f, refsBefore);
+    assert.deepEqual(await f.index(), indexBefore);
+    assert.equal(await fs.readFile(path.join(f.root, "tracked/inner"), "utf8"), "inner", "bytes kept");
+  });
+
+  test("an intent-to-add entry (git add -N) is refused before add", async t => {
+    const f = await fixture(t);
+    await f.dirty();
+    await fs.writeFile(path.join(f.root, "intent"), "planned");
+    f.gitIn("add", "-N", "intent");
+    const refsBefore = f.refs(), indexBefore = await f.index();
+    await assert.rejects(f.capture(), REFUSED);
+    assert.ok(!f.launched("add"));
+    assert.deepEqual(f.mutations(), []);
+    assertUnmoved(f, refsBefore);
+    assert.deepEqual(await f.index(), indexBefore);
+    assert.equal(await fs.readFile(path.join(f.root, "intent"), "utf8"), "planned");
+  });
+
   test("a conversion attribute refuses at the pre-commit tree proof: no commit-tree, no update-ref", async t => {
     const f = await fixture(t);
     await fs.writeFile(path.join(f.root, ".gitattributes"), "conv text eol=crlf\n");
@@ -475,7 +505,7 @@ describe("hash-attested maintenance WIP capture (W0-H)", { skip: process.platfor
       if (step !== "commit" || phase !== "dispatch" || visit !== 3) return;
       competing = f.gitIn("commit-tree", f.gitIn("rev-parse", "HEAD^{tree}").trim(), "-p", f.old, "-m", "competing writer").trim();
       f.gitIn("update-ref", BRANCH, competing, f.old);
-    } })));
+    } })), /update-ref --no-deref refs\/heads\/main .* failed: .*cannot lock ref 'refs\/heads\/main': is at .* but expected/);
     assert.deepEqual(f.mutations(), ["write-tree", "commit-tree", "update-ref"], "the CAS was attempted");
     assert.match(competing, /^[0-9a-f]{40}$/);
     assert.equal(f.head(), competing, "the competing tip is kept");
@@ -513,6 +543,7 @@ describe("hash-attested maintenance WIP capture (W0-H)", { skip: process.platfor
   // refused in P0, before any commit-group launch. Git itself accepts these hand-made commits.
   for (const [name, mutate] of [
     ["timezone -0060", (c: string) => c.replace(/^(committer .*> \d+) [+-]\d{4}$/m, "$1 -0060")],
+    ["timezone -0000", (c: string) => c.replace(/^(committer .*> \d+) [+-]\d{4}$/m, "$1 -0000")],
     ["timezone +9999", (c: string) => c.replace(/^(committer .*> \d+) [+-]\d{4}$/m, "$1 +9999")],
     ["leading-zero timestamp", (c: string) => c.replace(/^(committer .*> )(\d+)( [+-]\d{4})$/m, "$100$2$3")],
   ] as const) test("source commit with a non-canonical committer date (" + name + ") is refused before any commit-group launch", async t => {
@@ -732,16 +763,18 @@ describe("hash-attested maintenance WIP capture (W0-H)", { skip: process.platfor
     await fs.writeFile(path.join(f.root, "fresh"), "new");
     const copy = path.join(f.dir, "copy");
     await fs.cp(f.root, copy, { recursive: true, preserveTimestamps: true });
+    // One capture per admitted slot (one pass per slot): each extra capture gets its own harness and ledger.
+    const another = async (root: string) => harness(t, await tmpDir(t), root, f.old,
+      (...args) => execFileSync("/usr/bin/git", ["-C", root, ...args], { env: gitEnv, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }));
     const first = await f.capture();
     assert.equal(first.kind, "committed");
-    f.resetVisits();
-    const second = await f.capture(f.hooks(), copy, f.old);
+    const second = await (await another(copy)).capture();
     assert.equal(second.kind, "committed");
     assert.equal(second.head, first.head, "same source SHA + same content => same W");
     // Re-capture in place: move the branch back (index reset to the source), the worktree stays dirty.
     f.gitIn("reset", "--mixed", "-q", f.old);
     assert.equal(f.head(), f.old);
-    const third = await f.capture(f.hooks(), f.root, f.old);
+    const third = await (await another(f.root)).capture();
     assert.equal(third.head, first.head);
     const sourceDate = f.gitIn("show", "-s", "--format=%cd", "--date=raw", f.old).trim();
     assert.equal(f.gitIn("show", "-s", "--format=%an|%ae|%ad|%cn|%ce|%cd", "--date=raw", first.head).trim(),
@@ -787,12 +820,12 @@ describe("hash-attested maintenance WIP capture (W0-H)", { skip: process.platfor
   // boundary tests and the hosted deploy; the harness would strip a setpriv prefix if one were present.
   for (const mode of ["single-uid", "uid-split"] as const) {
     test("both uid modes: " + mode + " (dirty commits; clean stays explicit)", async t => {
-      const saved = { split: process.env.UZI_UID_SPLIT, path: process.env.UZI_RUNNER_PATH };
+      const saved = { split: process.env.UZI_UID_SPLIT, path: process.env.UZI_RUNNER_PATH, ambient: process.env.PATH ?? "" };
       t.after(() => {
         if (saved.split === undefined) delete process.env.UZI_UID_SPLIT; else process.env.UZI_UID_SPLIT = saved.split;
         if (saved.path === undefined) delete process.env.UZI_RUNNER_PATH; else process.env.UZI_RUNNER_PATH = saved.path;
       });
-      if (mode === "uid-split") { process.env.UZI_UID_SPLIT = "1"; process.env.UZI_RUNNER_PATH = process.env.PATH; }
+      if (mode === "uid-split") { process.env.UZI_UID_SPLIT = "1"; process.env.UZI_RUNNER_PATH = "/nonexistent-uzi-runner-extra:" + saved.ambient; }
       else { delete process.env.UZI_UID_SPLIT; delete process.env.UZI_RUNNER_PATH; }
       const f = await fixture(t);
       // Clean: explicit, HEAD/index unchanged and only status attempted.
@@ -812,7 +845,8 @@ describe("hash-attested maintenance WIP capture (W0-H)", { skip: process.platfor
       assert.equal(f.gitIn("status", "--porcelain=v1"), "");
       const helperPaths = f.argvs.filter(a => ["pin", "census", "payload", "metadata"].includes(a.label)).map(a => a.env.PATH);
       assert.ok(helperPaths.length > 0);
-      assert.ok(helperPaths.every(p => p === process.env.PATH), "helpers resolve through the runner PATH in both modes");
+      const expectedPath = mode === "uid-split" ? "/nonexistent-uzi-runner-extra:" + saved.ambient : saved.ambient;
+      assert.ok(helperPaths.every(p => p === expectedPath), "helpers resolve through runnerPath(): UZI_RUNNER_PATH under the split, ambient PATH otherwise");
     });
   }
 
@@ -945,7 +979,7 @@ describe("hash-attested maintenance WIP capture (W0-H)", { skip: process.platfor
   // -------------------------------------------- acceptance 10: representative measurement
 
   const baseMissing = (() => {
-    try { execFileSync("git", ["cat-file", "-e", BASE + "^{commit}"], { cwd: path.resolve(".."), env: gitEnv, stdio: "pipe" }); return false; }
+    try { execFileSync("git", ["cat-file", "-e", BASE + "^{commit}"], { cwd: REPO_ROOT, env: gitEnv, stdio: "pipe" }); return false; }
     catch { return true; }
   })();
   test("representative measurement: a realistic WIP on a clone of this repository at the base SHA, real slot, no allowances",
@@ -992,7 +1026,7 @@ async function measureRepresentative(t: test.TestContext) {
   const dir = await tmpDir(t);
   const clone = path.join(dir, "clone");
   const sh = (cwd: string, ...args: string[]) => execFileSync("/usr/bin/git", args, { cwd, env: gitEnv, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 1024 ** 3 });
-  sh(dir, "clone", "--no-local", "--no-hardlinks", "-q", "--no-checkout", path.resolve(".."), clone);
+  sh(dir, "clone", "--no-local", "--no-hardlinks", "-q", "--no-checkout", REPO_ROOT, clone);
   sh(clone, "checkout", "-q", "-b", "wip-measure", BASE);
   for (const [key, value] of [["user.name", "fixture"], ["user.email", "fixture@example.com"], ["maintenance.auto", "false"], ["gc.auto", "0"]] as const)
     sh(clone, "config", key, value);

@@ -339,10 +339,11 @@ protected and no ref update.
 - A detached HEAD, or a branch ref that is itself symbolic, refuses.
 - `eol`, `ident` and `working-tree-encoding` conversions make the hashed and
   staged oids disagree and refuse, at the latest at the tree proof.
-- A source commit whose committer date is not in Git's canonical form
-  refuses before any commit-group launch, and W's exact text is proved
-  before the branch CAS, so a header Git would normalize never moves the
-  branch.
+- A source commit whose committer date is outside the accepted canonical
+  form (leading-zero timestamp, `-0000`, or a zone outside ±14:59) refuses
+  in P0, before any commit-group launch. Independently, W's exact text is
+  proved before the branch CAS, so any header Git normalizes refuses with
+  the branch unmoved.
 - Two states the previous capture committed now refuse with the source
   retained: a tracked file replaced by a directory (a census type change),
   and an intent-to-add index entry (`git add -N`), which the strict index

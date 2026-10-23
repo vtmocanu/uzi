@@ -11942,7 +11942,7 @@ try {
     if (await read(["rev-parse", "--verify", "HEAD^{commit}"]) !== oldHead + "\n") throw refused();
     const oldCommit = await read(["cat-file", "-p", oldHead]);
     const oldHeaders = oldCommit.slice(0, Math.max(0, oldCommit.indexOf("\n\n"))).split("\n").filter(row => row.startsWith("committer "));
-    const dateMatch = oldHeaders.length === 1 ? /^committer .*> (0|[1-9]\d{0,11}) ([+-](?:0\d|1[0-4])[0-5]\d)$/.exec(oldHeaders[0]!) : null;
+    const dateMatch = oldHeaders.length === 1 ? /^committer .*> (0|[1-9]\d{0,11}) ((?!-0000)[+-](?:0\d|1[0-4])[0-5]\d)$/.exec(oldHeaders[0]!) : null;
     if (!dateMatch) throw refused();
     const commitDate = `@${dateMatch[1]} ${dateMatch[2]}`;
     const identityEnv: NodeJS.ProcessEnv = {

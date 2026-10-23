@@ -317,9 +317,9 @@ measurement are unperformed. At the validation capture below, store-it had
 not yet run; the final PR records its actual outcome and retains MO6 if it remains
 unrun, as the conditional item above requires. MO7 remains unperformed.
 The current source is non-shallow with 2,123 commits; history availability
-is not a measurement blocker. The composed measurement cannot be built under
-the conflicting W0 contract. MO7 is not a substitute for resolving that
-conflict. Local environment limits and MO do not waive worker obligations.
+is not a measurement blocker. The W0 contract conflicts are resolved (#3349),
+but the composed measurement still cannot be built until U4b and the archive
+stage are delivered. MO7 is not a substitute for that delivery. Local environment limits and MO do not waive worker obligations.
 
 ## Validation record
 
