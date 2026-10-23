@@ -128,7 +128,7 @@ func TestPolicySemanticSourceApplicability(t *testing.T) {
 }
 
 func TestPolicySemanticSourceAcceptedEmptyInventory(t *testing.T) {
-	r, _, reader, _ := semanticPolicyGateFixture(t)
+	r, _, reader, cc := semanticPolicyGateFixture(t)
 	payload, _, _ := decodeGatePresentedPayload(r.GatePresentedPayload)
 	r.GateRevision = 0
 	r.GatePresentationID = pgtype.UUID{}
@@ -148,6 +148,29 @@ func TestPolicySemanticSourceAcceptedEmptyInventory(t *testing.T) {
 	if !policyRevisionPlanApproved(context.Background(), q, r, true) {
 		t.Fatal("valid accepted empty inventory refused")
 	}
+	t.Run("frozen_A_current_planning_B", func(t *testing.T) {
+		b := payload.Semantic.Candidate
+		b.Revision++
+		digest, err := semanticCheckerDigest(PlanCrossCheckCandidate{PlanMd: cc.PlanMd.String, Milestones: cc.Milestones, RequiredCapabilities: cc.RequiredCapabilities, RequiredTools: cc.RequiredTools, SizeClass: cc.SizeClass.String, BaseCommit: cc.BaseCommit.String, PlanningDiff: cc.PlanningDiff.String}, b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b.Digest = hex.EncodeToString(digest)
+		changedReader := *reader
+		changedReader.planning.Candidate = semanticJSON(t, b)
+		changedReader.history = map[string][]byte{
+			payload.Semantic.Candidate.Digest: semanticJSON(t, payload.Semantic.Candidate),
+			b.Digest:                          semanticJSON(t, b),
+		}
+		target, valid, err := policyRevisionAcceptedTarget(context.Background(), &changedReader, r)
+		if err != nil || !valid || target == nil || target.Digest != payload.Semantic.Candidate.Digest {
+			t.Fatalf("accepted target replaced by mutable planning: valid=%v err=%v", valid, err)
+		}
+		changedQ := &policyIdentitySemanticApprovalReader{&policyIdentityApprovalReader{}, &changedReader}
+		if !policyRevisionPlanApproved(context.Background(), changedQ, r, true) {
+			t.Fatal("accepted A refused after current planning changed to B")
+		}
+	})
 	for _, tc := range []struct {
 		name   string
 		change func(*store.Run)

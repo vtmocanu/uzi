@@ -18,7 +18,7 @@ import (
 // worker runtime composition or activation.
 func semanticPolicySourceLive(t *testing.T, auto bool) (codexTestEnv, *gateFix, *coverageLiveFixture) {
 	t.Helper()
-	e, f, old, _ := acceptanceUnpublishedFixture(t)
+	e, f, old, checked := acceptanceUnpublishedFixture(t)
 	resetInterlockSetting(t, e)
 	f.svc.SetCompletionInterlockSettings(settings.New(e.q, time.Minute))
 	f.svc.p.PlanMaxRevisions = 10
@@ -29,6 +29,11 @@ func semanticPolicySourceLive(t *testing.T, auto bool) (codexTestEnv, *gateFix, 
 		t.Fatal(err)
 	}
 	structural, proposal, sources := semanticFixture()
+	// Checker admission requires these fields, and they must participate in
+	// semantic compilation rather than being patched into its result.
+	structural.BaseCommit = checked.BaseCommit
+	structural.PlanningDiff = checked.PlanningDiff
+	structural.SizeClass = checked.SizeClass
 	sources[0].Bytes = []byte(run.IssueDescription)
 	proposal.Criteria[0].Citations[0].Hash = semanticHash(sources[0].Bytes)
 	// The cached eligible issue supplies the immutable description.
