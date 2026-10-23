@@ -1586,11 +1586,13 @@ repackCp.spawn = function(...args) {
     const hook = `
 const refusedCp = require("node:child_process"), refusedSpawn = refusedCp.spawn;
 refusedCp.spawn = function(...args) {
-  const p = refusedSpawn.apply(this, args);
-  if (args[1].includes("cat-file") && args[1].includes("tree")) {
-    p.kill("SIGKILL");
-    p.once("close", () => require("node:fs").writeFileSync(__DATA__ + "/interrupted-child", ""));
-  }
+  if (!args[1].includes("cat-file") || !args[1].includes("tree")) return refusedSpawn.apply(this, args);
+  // A stand-in object child that writes partial output and never finishes, killed only once
+  // that output proves it is running: the interruption cannot race a fast real child.
+  const p = refusedSpawn.call(this, process.execPath,
+    ["-e", "process.stdout.write('partial'); setInterval(() => {}, 1000);"], args[2]);
+  p.stdout.once("data", () => p.kill("SIGKILL"));
+  p.once("close", () => require("node:fs").writeFileSync(__DATA__ + "/interrupted-child", ""));
   return p;
 };
 `;
