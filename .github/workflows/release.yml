@@ -115,7 +115,7 @@ jobs:
           cache: false
       - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5
         with:
-          version: v4.3.0
+          version: v4.3.1
       - uses: ./.github/actions/setup-task
       - name: Install the locked web test dependencies
         working-directory: web
@@ -739,7 +739,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5
         with:
-          version: v4.3.0
+          version: v4.3.1
       # Retrying, checksum-pinned cosign install (issue #945; rationale in the action
       # header). Needs the repo checked out first (actions/checkout runs above).
       - uses: ./.github/actions/install-cosign
