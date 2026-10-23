@@ -5,7 +5,7 @@ import { setImmediate as tick } from "node:timers/promises";
 import { codexRig, drain } from "./runner-codex-sinks-fixture.js";
 import { git, client } from "./runner-harness.js";
 
-export function observe(opts: { vault?: boolean; refusal?: boolean; sourcePath?: string } = {}) {
+export function observe(opts: { vault?: boolean; refusal?: boolean; sourcePath?: string; authenticated?: boolean; lifecycleSignal?: AbortSignal } = {}) {
   let armed = false, start = 0, active = false, entries = 0, returns = 0;
   let fullReap = false, done = false, injected = false;
   const authDeltas: unknown[] = [];
@@ -27,6 +27,7 @@ export function observe(opts: { vault?: boolean; refusal?: boolean; sourcePath?:
   };
   const rig = codexRig({
     vaultLocked: () => !!opts.vault,
+    lifecycleSignal: opts.lifecycleSignal,
     boundaryProcess: async request => {
       if (!armed || injected) return undefined;
       injected = true;
@@ -98,8 +99,18 @@ export function observe(opts: { vault?: boolean; refusal?: boolean; sourcePath?:
   const arm = () => { if (!armed) { armed = true; start = rig.processSpawns(); entries = 0; returns = 0; authDeltas.length = 0; } };
   const boundary = rig.safety.withBoundary.bind(rig.safety);
   rig.safety.withBoundary = async (req, action) => {
-    try { return await boundary(req, action); }
-    catch (error) { if (opts.vault) arm(); throw error; }
+    let observing = false;
+    try {
+      return await boundary(req, async permit => {
+        if (!(armed && opts.authenticated)) return action(permit);
+        observing = true;
+        entries++; active = true;
+        const refresh = rig.refreshCalls(), release = rig.releaseCalls();
+        try { return await action(permit); }
+        finally { authDeltas.push({ refresh: rig.refreshCalls() - refresh, release: rig.releaseCalls() - release }); }
+      });
+    } catch (error) { if (opts.vault) arm(); throw error; }
+    finally { if (observing) { active = false; returns++; } }
   };
   const recordSource = (sourcePath?: string) => {
     if (armed && (!opts.sourcePath || sourcePath === opts.sourcePath)) source.push({
@@ -130,6 +141,16 @@ export function observe(opts: { vault?: boolean; refusal?: boolean; sourcePath?:
     }
     return report(id, body, signal);
   };
+  const holdReport = client.requestCompletionHold.bind(client);
+  client.requestCompletionHold = async (...args) => {
+    if (armed && opts.authenticated) { await hold("ACK"); acks.push({active, pending:!done}); }
+    return holdReport(...args);
+  };
+  const wallReport = client.reportWallPark.bind(client);
+  client.reportWallPark = async (...args) => {
+    if (armed && opts.authenticated) { await hold("ACK"); acks.push({active, pending:!done}); }
+    return wallReport(...args);
+  };
   const capture: typeof rig.capture = async (ms, action, purpose, signal, attempt) => {
     try {
       return await rig.capture(ms, async held => {
@@ -159,7 +180,7 @@ export function observe(opts: { vault?: boolean; refusal?: boolean; sourcePath?:
             // assertProof's ack argument checks the latter caller contract.
             if (event.phase !== "ACK" || active) {
               assert.equal(active, true, event.phase + " retains capture custody");
-              assert.equal(rig.registry.state(), "poisoned", event.phase + " keeps successor admission closed");
+              assert.equal(rig.registry.state(), opts.authenticated ? "closed" : "poisoned", event.phase + " keeps successor admission closed");
             }
             // Sequential completed scopes contribute equally to both counters;
             // the current entered scope must still have no matching return.
@@ -179,12 +200,13 @@ export function observe(opts: { vault?: boolean; refusal?: boolean; sourcePath?:
       closed = true;
       for (const release of releases) release();
       git.commitWipMarker=wip; git.worktreeStatus=status; client.publishCheckpoint=publish; client.reportState=report;
+      client.requestCompletionHold=holdReport; client.reportWallPark=wallReport;
     },
     assertProof: (publication: boolean, ack = false) => {
       const o = observations();
       console.log("PUBLIC_PROOF", JSON.stringify(o));
       assert.ok(source.length > 0, "protected source was actually read");
-      assert.deepEqual(source[0], {state:"poisoned",pending:0,callbacks:0,fullReap:true,active:true},
+      assert.deepEqual(source[0], {state:opts.authenticated ? "closed" : "poisoned",pending:0,callbacks:0,fullReap:true,active:true},
         "first protected source requires closed admission, drained launches/callbacks and completed root proof inside capture");
       assert.ok(authDeltas.length > 0, "actual capture auth activity observed");
       assert.ok(authDeltas.every((d:any)=>d.refresh===0 && d.release===0), "zero refresh/release inside actual capture");
