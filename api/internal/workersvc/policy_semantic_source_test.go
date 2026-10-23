@@ -158,9 +158,14 @@ func TestPolicySemanticSourceAcceptedEmptyInventory(t *testing.T) {
 		b.Digest = hex.EncodeToString(digest)
 		changedReader := *reader
 		changedReader.planning.Candidate = semanticJSON(t, b)
+		changedReader.planning.Revision = b.Revision
 		changedReader.history = map[string][]byte{
 			payload.Semantic.Candidate.Digest: semanticJSON(t, payload.Semantic.Candidate),
 			b.Digest:                          semanticJSON(t, b),
+		}
+		current, valid, err := policyRevisionCurrentTarget(context.Background(), &changedReader, r)
+		if err != nil || !valid || current == nil || current.Digest != b.Digest {
+			t.Fatalf("current planning B is not valid: valid=%v err=%v", valid, err)
 		}
 		target, valid, err := policyRevisionAcceptedTarget(context.Background(), &changedReader, r)
 		if err != nil || !valid || target == nil || target.Digest != payload.Semantic.Candidate.Digest {

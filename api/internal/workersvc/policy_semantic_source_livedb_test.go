@@ -46,10 +46,19 @@ func semanticPolicySourceLive(t *testing.T, auto bool) (codexTestEnv, *gateFix, 
 	return e, f, c
 }
 
+// Match the compiled display fields on both gate and automatic reports.
+func semanticPolicySourceReport(t *testing.T, c *coverageLiveFixture) StateRequest {
+	req := gateReportRequest(t, c)
+	req.RequiredCapabilities = &c.structural.RequiredCapabilities
+	req.RequiredTools = &c.structural.RequiredTools
+	req.SizeClass = &c.structural.SizeClass
+	return req
+}
+
 func TestPolicySemanticSourcePublicationReceiptLiveDB(t *testing.T) {
 	e, f, c := semanticPolicySourceLive(t, false)
 	publishGateCoverage(t, c)
-	req := gateReportRequest(t, c)
+	req := semanticPolicySourceReport(t, c)
 	firstGate := presentSemanticGate(t, c, req)
 	first := mustRun(t, e, c.run)
 	source := assertRevisionGateBound(t, e, c.run, first.GateRevision)
@@ -67,7 +76,7 @@ func TestPolicySemanticSourcePublicationReceiptLiveDB(t *testing.T) {
 		t.Fatal("fixture did not separate semantic and structural identity")
 	}
 	publishGateCoverage(t, c)
-	req = gateReportRequest(t, c)
+	req = semanticPolicySourceReport(t, c)
 	req.ExpectedGateRevision = &firstGate.Approval.PresentationRevision
 	req.RevisionInputID = &revisionID
 	gate := presentSemanticGate(t, c, req)
@@ -98,7 +107,7 @@ func TestPolicySemanticSourceNoCheckerAutoStopLiveDB(t *testing.T) {
 	e, f, c := semanticPolicySourceLive(t, true)
 	f.svc.p.PolicyStopNegotiated = true
 	publishGateCoverage(t, c)
-	req := gateReportRequest(t, c)
+	req := semanticPolicySourceReport(t, c)
 	req.State, req.PresentationID = "running", nil
 	autopilotRevisionReport(t, f, c.run, req)
 	accepted := mustRun(t, e, c.run)
@@ -176,7 +185,7 @@ func TestPolicySemanticSourceCheckedAcceptanceLiveDB(t *testing.T) {
 			history := acceptanceHistory(t, e, c.run)
 			e.exec("UPDATE runs SET policy_refusal_count=1 WHERE id=$1", c.run)
 			assertAutopilotApproval(t, e, c.run, false)
-			req := gateReportRequest(t, c)
+			req := semanticPolicySourceReport(t, c)
 			if human {
 				req.SemanticPark = strPtr(semanticParkMaintainerAuth)
 				gate := presentSemanticGate(t, c, req)
