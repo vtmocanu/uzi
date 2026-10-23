@@ -717,7 +717,7 @@ describe("Unit2 runner source capture", { skip: process.platform !== "linux" && 
       await fs.writeFile(path.join(f.clone, "tracked"), "shared change\n");
       assert.match((await f.capture()).toString(), /-base\n\+shared change/);
       await nativeFs.rm(f.bare, { recursive: true });
-      await assertRefused(f.capture(), "base_unavailable", "errno:ENOENT");
+      await assertRefused(f.capture(), "base_unavailable", "base_object_type_mismatch");
     } finally { await f.dispose(); }
   });
 
@@ -1526,6 +1526,44 @@ repackCp.spawn = function(...args) {
     });
   }
 
+
+  for (const kind of ["regular file", "symlink"] as const) {
+    it("refuses inflated bare blob credit for a clean " + kind + " with authentic OID identity", async () => {
+      const f = await fixture({ seed: async seed => {
+        if (kind === "symlink") await fs.symlink("tracked", path.join(seed, "link"));
+      } });
+      try {
+        f.cache.setPlanningLimitsForTest({ ...defaultLimits, sourceAllowance: 1 });
+        assert.deepEqual(await f.capture(), Buffer.alloc(0));
+        await fs.writeFile(path.join(f.clone, "new-binary"), Buffer.alloc(2));
+        await assertRefused(f.capture(), "diff_too_large", "total_source_cap");
+        await fs.unlink(path.join(f.clone, "new-binary"));
+
+        // Corrupt worker-owned bare metadata under the authentic blob identity;
+        // the unchanged worktree still hashes to that identity.
+        await nativeFs.rm(path.join(f.bare, "objects"), { recursive: true });
+        await fs.chmod(f.data, 0o755);
+        await nativeFs.cp(path.join(f.data, "seed/.git/objects"), path.join(f.bare, "objects"), { recursive: true });
+        await fs.chmod(f.data, 0o700);
+        const name = kind === "symlink" ? "link" : "tracked";
+        const oid = (await f.bareGit("rev-parse", "HEAD:" + name)).trim();
+        const loose = path.join(f.bare, "objects", oid.slice(0, 2), oid.slice(2));
+        const original = inflateSync(await nativeFs.readFile(loose));
+        const bytes = original.subarray(original.indexOf(0) + 1);
+        assert.equal(createHash("sha1").update("blob " + bytes.length + "\0").update(bytes).digest("hex"), oid);
+        const body = Buffer.concat([bytes, Buffer.alloc(32768, 120)]);
+        const damaged = deflateSync(Buffer.concat([Buffer.from("blob " + body.length + "\0"), body]));
+        damaged.writeUInt8(damaged.readUInt8(damaged.length - 1) ^ 0xff, damaged.length - 1);
+        await nativeFs.unlink(loose);
+        await nativeFs.writeFile(loose, damaged);
+        assert.equal((await f.bareGit("cat-file", "-s", oid)).trim(), String(body.length));
+
+        await assertRefused(f.capture(), "base_unavailable", "base_object_integrity");
+        await fs.writeFile(path.join(f.clone, "new-binary"), Buffer.alloc(2));
+        await assertRefused(f.capture(), "base_unavailable", "base_object_integrity");
+      } finally { await f.dispose(); }
+    });
+  }
 
   it("primary proof: interrupted object child preserves fixed git_refused without partial output", async () => {
     const hook = `
