@@ -102,9 +102,10 @@ and the focused `TestEmbeddedDocsMatchSource` Go test also passed.
 
 The initial agent gate at `89df35b0` failed in the private Git verification
 file. Its first failure reproduced on base `7501b6b6` and candidate exports.
-The fixture creates default-mode directories beneath setgid scratch; with
-umask `0002`, their inherited group-write permission conflicts with the
-snapshot's worker-directory safety predicate. The unchanged first test passed
+The fixture creates default-mode directories beneath setgid scratch. The
+failures are consistent with inherited group-write permissions under umask
+`0002` conflicting with the snapshot's worker-directory safety predicate;
+the original exception was not preserved, so the exact first throw is unproven. The unchanged first test passed
 in both exports under `0022`, and the full private-verification file passed
 all 30 tests before the full gate rerun. The correction restricts newly
 created permissions; no safety check, test or required gate was weakened.
