@@ -14,7 +14,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/capability"
-	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -102,13 +101,17 @@ func (s *Service) writePolicyRevisionSource(ctx context.Context, tx pgx.Tx, w st
 
 // Capture coverage from the locked pre-publication row. Publication must not
 // make an old mismatched source appear valid by replacing the gate first.
-func policyRevisionSourceBeforePublication(r store.Run) *apitypes.PolicyRevisionSourceV1 {
+func policyRevisionSourceBeforePublication(ctx context.Context, reader any, r store.Run) (*apitypes.PolicyRevisionSourceV1, error) {
 	source, err := apitypes.ParsePolicyRevisionSourceV1(r.PolicyRevisionSource)
-	if err != nil || !policyRevisionSourceGateMatches(r, source) ||
-		!policyStopSelectionValid(source, stopUUID(r.PolicyCandidateCrossCheckID)) {
-		return nil
+	matched, matchErr := policyRevisionSourceGateMatches(ctx, reader, r, source)
+	if matchErr != nil {
+		return nil, matchErr
 	}
-	return &source
+	if err != nil || !matched ||
+		!policyStopSelectionValid(source, stopUUID(r.PolicyCandidateCrossCheckID)) {
+		return nil, nil
+	}
+	return &source, nil
 }
 
 // The caller has applied a publish decision in the same claim transaction.
@@ -126,11 +129,15 @@ func rebindPolicyRevisionSource(ctx context.Context, q *store.Queries, owned sto
 			PresentationID: uuid.UUID(published.GatePresentationID.Bytes).String(),
 			PayloadDigest:  hex.EncodeToString(published.GatePayloadDigest),
 		}
+		matched, err := policyRevisionGateMatches(ctx, q, published, *source)
+		if err != nil {
+			return err
+		}
 		// ID-less publications cannot represent a V1 gate. Authenticate the
 		// persisted snapshot as well as the revision actually allocated.
 		if published.GateRevision == revision && published.GatePresentationID.Valid &&
 			uuid.UUID(published.GatePresentationID.Bytes) != uuid.Nil &&
-			policyRevisionGateMatches(published, *source) {
+			matched {
 			raw, err = json.Marshal(source)
 			if err != nil {
 				return err
@@ -152,12 +159,12 @@ func rebindPolicyRevisionSource(ctx context.Context, q *store.Queries, owned sto
 	return nil
 }
 
-func policyRevisionSourceGateMatches(r store.Run, source apitypes.PolicyRevisionSourceV1) bool {
+func policyRevisionSourceGateMatches(ctx context.Context, reader any, r store.Run, source apitypes.PolicyRevisionSourceV1) (bool, error) {
 	if source.Gate != nil {
-		return policyRevisionGateMatches(r, source)
+		return policyRevisionGateMatches(ctx, reader, r, source)
 	}
 	return r.GateRevision == 0 && !r.GatePresentationID.Valid && len(r.GatePayloadDigest) == 0 &&
-		(len(r.GatePresentedPayload) == 0 || bytes.Equal(bytes.TrimSpace(r.GatePresentedPayload), []byte("null")))
+		(len(r.GatePresentedPayload) == 0 || bytes.Equal(bytes.TrimSpace(r.GatePresentedPayload), []byte("null"))), nil
 }
 
 // The locked row is the pre-selection snapshot; created is the row returned by
@@ -165,7 +172,11 @@ func policyRevisionSourceGateMatches(r store.Run, source apitypes.PolicyRevision
 // takes a revision. Historical candidates need not project to the current gate.
 func policyRevisionSourceWithCreatedCrossCheck(ctx context.Context, q *store.Queries, r store.Run, created store.CrossCheck) ([]byte, error) {
 	source, err := apitypes.ParsePolicyRevisionSourceV1(r.PolicyRevisionSource)
-	if err != nil || !policyRevisionSourceGateMatches(r, source) ||
+	matched, matchErr := policyRevisionSourceGateMatches(ctx, q, r, source)
+	if matchErr != nil {
+		return nil, matchErr
+	}
+	if err != nil || !matched ||
 		!policyStopSelectionValid(source, stopUUID(r.PolicyCandidateCrossCheckID)) {
 		return nil, nil
 	}
@@ -212,13 +223,22 @@ func policyRevisionSourceWithCreatedCrossCheck(ctx context.Context, q *store.Que
 
 func policyRevisionUpdatedSource(ctx context.Context, tx pgx.Tx, r store.Run, w store.Worker, wire policyRevisionWire) ([]byte, error) {
 	source, err := apitypes.ParsePolicyRevisionSourceV1(r.PolicyRevisionSource)
-	if err != nil || !wire.valid || !policyRevisionSourceGateMatches(r, source) ||
+	q := store.New(tx)
+	matched, matchErr := policyRevisionSourceGateMatches(ctx, q, r, source)
+	if matchErr != nil {
+		return nil, matchErr
+	}
+	if err != nil || !wire.valid || !matched ||
 		!policyStopSelectionValid(source, stopUUID(r.PolicyCandidateCrossCheckID)) {
 		return nil, nil
 	}
 	carrierSource := source
 	carrierSource.Gate = wire.carrier.Gate
-	if !policyRevisionSourceGateMatches(r, carrierSource) {
+	matched, matchErr = policyRevisionSourceGateMatches(ctx, q, r, carrierSource)
+	if matchErr != nil {
+		return nil, matchErr
+	}
+	if !matched {
 		return nil, nil
 	}
 	// Traverse only the stored finite inventory, once per reference, without
@@ -322,14 +342,35 @@ func policyRevisionWitness(ctx context.Context, tx pgx.Tx, r store.Run, w store.
 	if err != nil || !valid {
 		return false, err
 	}
-	if !primary || r.GateRevision == 0 {
+	if !primary {
 		return true, nil
 	}
-	projection := gatePresentedPayload{PlanMd: textPtr(cc.PlanMd), Milestones: cc.Milestones, RequiredCapabilities: capability.Filter(cc.RequiredCapabilities), RequiredTools: capability.FilterTools(cc.RequiredTools), SizeClass: nonEmptyPtr(cc.SizeClass.String)}
-	if r.Kind != runkind.Issue {
-		projection.Milestones = nil
+	q := store.New(tx)
+	var target *apitypes.SemanticCandidate
+	if r.GateRevision == 0 {
+		var valid bool
+		target, valid, err = policyRevisionCurrentTarget(ctx, q, r)
+		if err != nil || !valid {
+			return false, err
+		}
+		// Structural gate-zero sources retain their existing admission rules.
+		if target == nil {
+			return true, nil
+		}
+		return target.Digest == hex.EncodeToString(cc.CandidateDigest), nil
+	} else {
+		source, parseErr := apitypes.ParsePolicyRevisionSourceV1(r.PolicyRevisionSource)
+		if parseErr != nil {
+			return false, nil
+		}
+		matched, err := policyRevisionGateMatches(ctx, q, r, source)
+		if err != nil || !matched {
+			return false, err
+		}
+		payload, _, _ := decodeGatePresentedPayload(r.GatePresentedPayload)
+		if payload.Semantic != nil {
+			target = &payload.Semantic.Candidate
+		}
 	}
-	projected, err := projection.canonicalJSON()
-	current, currentErr := gatePayloadFromRow(r).canonicalJSON()
-	return err == nil && currentErr == nil && bytes.Equal(projected, current), nil
+	return policyRevisionIdentityApplicable(ctx, q, r, cc, target, r.GateRevision == 0)
 }

@@ -19,7 +19,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
-	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -96,14 +95,25 @@ func policyStopManifestLocked(ctx context.Context, qtx *store.Queries, r store.R
 	noGate := source.Gate == nil
 	var gateSnapshot *apitypes.PolicyStopGateSnapshot
 	var payload gatePresentedPayload
-	var a []byte
+	matched, matchErr := policyRevisionSourceGateMatches(ctx, qtx, r, source)
+	if matchErr != nil {
+		return m, matchErr
+	}
+	if !matched {
+		return bad()
+	}
+	var target *apitypes.SemanticCandidate
 	if noGate {
-		if !policyRevisionSourceGateMatches(r, source) || source.PrimaryRevision != nil || !policyRevisionNoGatePlanApproved(r) {
+		if source.PrimaryRevision != nil || !policyRevisionNoGatePlanApproved(r) {
 			return bad()
 		}
 		payload = policyAutopilotPayloadFromRow(r)
-		a, err = payload.canonicalJSON()
+		var valid bool
+		target, valid, err = policyRevisionAcceptedTarget(ctx, qtx, r)
 		if err != nil {
+			return m, err
+		}
+		if !valid {
 			return bad()
 		}
 	} else {
@@ -119,24 +129,8 @@ func policyStopManifestLocked(ctx context.Context, qtx *store.Queries, r store.R
 		if err != nil || !ok {
 			return bad()
 		}
-		_, sum, err := payload.digest()
-		if err != nil || !bytes.Equal(sum, r.GatePayloadDigest) {
-			return bad()
-		}
-		// Compare the persisted visible candidate, without witness-only presentation metadata.
-		current := gatePayloadFromRow(r)
-		visible := payload
-		visible.ReviseCount = nil
-		visible.CheckpointWitness = nil
-		visible.WitnessWorkerID = nil
-		visible.WitnessClaimGeneration = nil
-		a, err = visible.canonicalJSON()
-		if err != nil {
-			return bad()
-		}
-		b, err := current.canonicalJSON()
-		if err != nil || !bytes.Equal(a, b) {
-			return bad()
+		if payload.Semantic != nil {
+			target = &payload.Semantic.Candidate
 		}
 		gateSnapshot = &apitypes.PolicyStopGateSnapshot{PolicyStopGateContext: gate}
 	}
@@ -333,9 +327,11 @@ func policyStopManifestLocked(ctx context.Context, qtx *store.Queries, r store.R
 			return bad()
 		}
 		if selected != nil && *selected == id.String() {
-			projection := gatePresentedPayload{PlanMd: textPtr(cc.PlanMd), Milestones: cc.Milestones, RequiredCapabilities: capability.Filter(cc.RequiredCapabilities), RequiredTools: capability.FilterTools(cc.RequiredTools), SizeClass: nonEmptyPtr(cc.SizeClass.String)}
-			projected, err := projection.canonicalJSON()
-			if err != nil || !bytes.Equal(a, projected) {
+			applicable, err := policyRevisionIdentityApplicable(ctx, qtx, r, cc, target, noGate)
+			if err != nil {
+				return m, err
+			}
+			if !applicable {
 				return bad()
 			}
 		}

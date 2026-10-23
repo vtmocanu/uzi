@@ -9,6 +9,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/capability"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -60,4 +62,130 @@ func policyRevisionIdentityValid(ctx context.Context, reader any, cc store.Cross
 	// a semantic_v1 digest cannot pass this comparison.
 	digest, err := candidate.Digest()
 	return err == nil && bytes.Equal(digest, cc.CandidateDigest), nil
+}
+
+// policyRevisionPlanning detects enrollment without selecting a witness from the
+// mutable candidate. Missing enrollment retains the structural profile.
+func policyRevisionPlanning(ctx context.Context, reader any, r store.Run) (store.GetSemanticPlanningRow, bool, error) {
+	q, ok := reader.(policyRevisionIdentityReader)
+	if !ok {
+		return store.GetSemanticPlanningRow{}, false, nil
+	}
+	planning, err := q.GetSemanticPlanning(ctx, r.ID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return planning, false, nil
+	}
+	if err != nil {
+		return planning, false, err
+	}
+	var e apitypes.SemanticEnrollment
+	if strictSemanticJSON(planning.Enrollment, &e) != nil || e.Profile != "semantic" {
+		return planning, true, ErrSemanticGateMismatch
+	}
+	return planning, true, nil
+}
+
+// Exact immutable lookup; no latest-row or text recovery is permitted.
+func policyRevisionSemanticTarget(ctx context.Context, reader any, r store.Run, c *apitypes.SemanticCandidate) (bool, error) {
+	q, ok := reader.(policyRevisionIdentityReader)
+	if !ok || c == nil || c.CandidateIdentityVersion != semanticIdentityVersion || c.Revision < 1 {
+		return false, nil
+	}
+	digest, err := hex.DecodeString(c.Digest)
+	if err != nil || len(digest) != 32 || hex.EncodeToString(digest) != c.Digest {
+		return false, nil
+	}
+	if _, err := buildSemanticCompletionContract(*c); err != nil {
+		return false, nil
+	}
+	raw, err := q.GetSemanticCandidateByDigest(ctx, store.GetSemanticCandidateByDigestParams{RunID: r.ID, Column2: c.Digest})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var immutable apitypes.SemanticCandidate
+	return strictSemanticJSON(raw, &immutable) == nil && sameSemanticJSON(immutable, *c), nil
+}
+
+func policyRevisionCurrentTarget(ctx context.Context, reader any, r store.Run) (*apitypes.SemanticCandidate, bool, error) {
+	planning, semantic, err := policyRevisionPlanning(ctx, reader, r)
+	if errors.Is(err, ErrSemanticGateMismatch) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if !semantic {
+		return nil, true, nil
+	}
+	var c apitypes.SemanticCandidate
+	if strictSemanticJSON(planning.Candidate, &c) != nil || c.Revision != planning.Revision {
+		return nil, false, nil
+	}
+	valid, err := policyRevisionSemanticTarget(ctx, reader, r, &c)
+	return &c, valid, err
+}
+
+// Accepted execution is validated even with an empty checker inventory. Mutable
+// planning is used only to detect enrollment, never to replace frozen identity.
+func policyRevisionAcceptedTarget(ctx context.Context, reader any, r store.Run) (*apitypes.SemanticCandidate, bool, error) {
+	_, semantic, err := policyRevisionPlanning(ctx, reader, r)
+	if errors.Is(err, ErrSemanticGateMismatch) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if !semantic && !semanticCompletionRequiresLock(r) {
+		return nil, true, nil
+	}
+	c, err := parseCompletionContract(r.CompletionContract)
+	if err != nil || c.Profile != "semantic" {
+		return nil, false, nil
+	}
+	if _, err := completionPendingFromContract(r, c); err != nil {
+		return nil, false, nil
+	}
+	// These callers authorize gate-zero accepted execution, including plans
+	// with no checker. The frozen candidate must describe this stored plan and
+	// execution definitions; matching criterion membership alone is insufficient.
+	if validateSemanticGateFields(policyAutopilotPayloadFromRow(r), c.SemanticPresentation) != nil {
+		return nil, false, nil
+	}
+	target := c.SemanticPresentation.Candidate
+	valid, err := policyRevisionSemanticTarget(ctx, reader, r, &target)
+	return &target, valid, err
+}
+
+// The caller authenticates the historical witness first and supplies an already
+// authenticated operation-specific target. This helper never chooses latest.
+func policyRevisionIdentityApplicable(ctx context.Context, reader any, r store.Run, cc store.CrossCheck, target *apitypes.SemanticCandidate, noGate bool) (bool, error) {
+	_, semantic, err := policyRevisionPlanning(ctx, reader, r)
+	if errors.Is(err, ErrSemanticGateMismatch) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if semantic {
+		if target == nil || target.CandidateIdentityVersion != semanticIdentityVersion || target.Revision < 1 || target.Digest != hex.EncodeToString(cc.CandidateDigest) {
+			return false, nil
+		}
+	}
+	if !semantic && target != nil {
+		return false, nil
+	}
+	projection := gatePresentedPayload{PlanMd: textPtr(cc.PlanMd), Milestones: cc.Milestones, RequiredCapabilities: capability.Filter(cc.RequiredCapabilities), RequiredTools: capability.FilterTools(cc.RequiredTools), SizeClass: nonEmptyPtr(cc.SizeClass.String)}
+	if r.Kind != runkind.Issue {
+		projection.Milestones = nil
+	}
+	current := gatePayloadFromRow(r)
+	if noGate {
+		current = policyAutopilotPayloadFromRow(r)
+	}
+	a, ae := projection.canonicalJSON()
+	b, be := current.canonicalJSON()
+	return ae == nil && be == nil && bytes.Equal(a, b), nil
 }

@@ -4,12 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"strings"
 
 	"github.com/google/uuid"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
-	"github.com/vtmocanu/uzi/api/internal/capability"
-	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -71,12 +70,27 @@ func policyRevisionPlanApproved(ctx context.Context, reader any, r store.Run, le
 			return false
 		}
 		hasRevision, err := q.HasPolicyRevisionHistory(ctx, r.ID)
-		return err == nil && !hasRevision
+		_, valid, targetErr := policyRevisionAcceptedTarget(ctx, reader, r)
+		return err == nil && !hasRevision && targetErr == nil && valid
 	}
 	source, err := apitypes.ParsePolicyRevisionSourceV1(r.PolicyRevisionSource)
-	if err != nil || !policyRevisionSourceGateMatches(r, source) ||
+	matched, matchErr := policyRevisionSourceGateMatches(ctx, reader, r, source)
+	if err != nil || matchErr != nil || !matched ||
 		!policyStopSelectionValid(source, stopUUID(r.PolicyCandidateCrossCheckID)) {
 		return false
+	}
+	var target *apitypes.SemanticCandidate
+	if source.Gate == nil {
+		var valid bool
+		target, valid, err = policyRevisionAcceptedTarget(ctx, reader, r)
+		if err != nil || !valid {
+			return false
+		}
+	} else {
+		payload, _, _ := decodeGatePresentedPayload(r.GatePresentedPayload)
+		if payload.Semantic != nil {
+			target = &payload.Semantic.Candidate
+		}
 	}
 	// A primary revision remains unapproved even after its row was Stop-settled.
 	// Gate authentication above binds the original persisted source to this candidate.
@@ -118,21 +132,8 @@ func policyRevisionPlanApproved(ctx context.Context, reader any, r store.Run, le
 		if err != nil || !valid {
 			return false
 		}
-		projection := gatePresentedPayload{
-			PlanMd: textPtr(cc.PlanMd), Milestones: cc.Milestones,
-			RequiredCapabilities: capability.Filter(cc.RequiredCapabilities),
-			RequiredTools:        capability.FilterTools(cc.RequiredTools), SizeClass: nonEmptyPtr(cc.SizeClass.String),
-		}
-		if r.Kind != runkind.Issue {
-			projection.Milestones = nil
-		}
-		projected, err := projection.canonicalJSON()
-		currentPayload := gatePayloadFromRow(r)
-		if source.Gate == nil {
-			currentPayload = policyAutopilotPayloadFromRow(r)
-		}
-		current, currentErr := currentPayload.canonicalJSON()
-		if err != nil || currentErr != nil || !bytes.Equal(projected, current) {
+		applicable, err := policyRevisionIdentityApplicable(ctx, reader, r, cc, target, source.Gate == nil)
+		if err != nil || !applicable {
 			return false
 		}
 	}
@@ -158,9 +159,9 @@ func policyRevisionNoGatePlanApproved(r store.Run) bool {
 
 // policyRevisionGateMatches uses the same canonical gate helpers as
 // policyStopManifestLocked without requiring a paused row or completed scope.
-func policyRevisionGateMatches(r store.Run, source apitypes.PolicyRevisionSourceV1) bool {
+func policyRevisionGateMatches(ctx context.Context, reader any, r store.Run, source apitypes.PolicyRevisionSourceV1) (bool, error) {
 	if source.Gate == nil || r.GateRevision <= 0 || !r.GatePresentationID.Valid {
-		return false
+		return false, nil
 	}
 	gate := apitypes.PolicyStopGateContext{
 		Revision:       stopDecimal(r.GateRevision),
@@ -168,21 +169,42 @@ func policyRevisionGateMatches(r store.Run, source apitypes.PolicyRevisionSource
 		PayloadDigest:  hex.EncodeToString(r.GatePayloadDigest),
 	}
 	if *source.Gate != gate {
-		return false
+		return false, nil
 	}
 	payload, ok, err := decodeGatePresentedPayload(r.GatePresentedPayload)
 	if err != nil || !ok {
-		return false
+		return false, nil
 	}
 	_, digest, err := payload.digest()
 	if err != nil || !bytes.Equal(digest, r.GatePayloadDigest) {
-		return false
+		return false, nil
 	}
+	_, semantic, enrollmentErr := policyRevisionPlanning(ctx, reader, r)
+	if enrollmentErr != nil {
+		if errors.Is(enrollmentErr, ErrSemanticGateMismatch) {
+			return false, nil
+		}
+		return false, enrollmentErr
+	}
+	if semantic || payload.Semantic != nil {
+		if !semantic || payload.Semantic == nil {
+			return false, nil
+		}
+		p := payload.Semantic
+		if p.Binding != SemanticCoverageBinding(p.Candidate) || validateSemanticGateFields(payload, p) != nil {
+			return false, nil
+		}
+		valid, err := policyRevisionSemanticTarget(ctx, reader, r, &p.Candidate)
+		if err != nil || !valid {
+			return false, err
+		}
+	}
+	payload.Semantic = nil
 	payload.ReviseCount = nil
 	payload.CheckpointWitness = nil
 	payload.WitnessWorkerID = nil
 	payload.WitnessClaimGeneration = nil
 	visible, err := payload.canonicalJSON()
 	current, currentErr := gatePayloadFromRow(r).canonicalJSON()
-	return err == nil && currentErr == nil && bytes.Equal(visible, current)
+	return err == nil && currentErr == nil && bytes.Equal(visible, current), nil
 }

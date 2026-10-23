@@ -256,7 +256,7 @@ type policyIdentitySemanticApprovalReader struct {
 func TestPolicyRevisionIdentityApproval(t *testing.T) {
 	for _, name := range []string{"legacy_structural", "legacy_semantic_refused", "semantic_history", "missing_history", "database_error"} {
 		t.Run(name, func(t *testing.T) {
-			cc, _, identity := policyIdentityFixture(t)
+			cc, candidate, identity := policyIdentityFixture(t)
 			want := name == "legacy_structural" || name == "semantic_history"
 			if name == "legacy_structural" {
 				c, _, _ := semanticFixture()
@@ -281,6 +281,16 @@ func TestPolicyRevisionIdentityApproval(t *testing.T) {
 				PolicyRevisionSource: semanticJSON(t, apitypes.PolicyRevisionSourceV1{
 					Version: 1, AssociatedCrossChecks: []apitypes.PolicyRevisionRef{{Source: "plan_cross_check", CrossCheckID: &id}},
 				}),
+			}
+			if name != "legacy_structural" {
+				presentation := semanticGateProjection(&semanticCoverageTx{candidate: candidate}, r)
+				var err error
+				r.CompletionContract, err = semanticGateContract(&presentation, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				r.CompletionContractVersion = pgtype.Int4{Int32: 1, Valid: true}
+				r.ContractRevision = pgtype.Int4{Int32: 1, Valid: true}
 			}
 			if got := policyRevisionPlanApproved(context.Background(), reader, r, true); got != want {
 				t.Fatalf("approved=%v; want %v", got, want)

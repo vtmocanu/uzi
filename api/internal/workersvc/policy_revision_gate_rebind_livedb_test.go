@@ -33,7 +33,8 @@ func assertRevisionGateBound(t *testing.T, e codexTestEnv, run uuid.UUID, revisi
 	t.Helper()
 	r := mustRun(t, e, run)
 	source := inventorySource(t, e, run)
-	if r.GateRevision != revision || !policyRevisionGateMatches(r, source) {
+	matched, matchErr := policyRevisionGateMatches(context.Background(), e.q, r, source)
+	if r.GateRevision != revision || matchErr != nil || !matched {
 		t.Fatalf("source does not authenticate published revision %d: %s", revision, r.PolicyRevisionSource)
 	}
 	return source

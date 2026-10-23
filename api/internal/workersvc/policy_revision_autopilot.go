@@ -1,7 +1,6 @@
 package workersvc
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,7 +10,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
-	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -33,7 +31,11 @@ func preparePolicyAutopilotAcceptance(ctx context.Context, tx pgx.Tx, w store.Wo
 		return nil, nil
 	}
 	source, err := apitypes.ParsePolicyRevisionSourceV1(r.PolicyRevisionSource)
-	if err != nil || source.Gate != nil || !policyRevisionSourceGateMatches(r, source) ||
+	matched, matchErr := policyRevisionSourceGateMatches(ctx, store.New(tx), r, source)
+	if matchErr != nil {
+		return nil, matchErr
+	}
+	if err != nil || source.Gate != nil || !matched ||
 		!policyStopSelectionValid(source, stopUUID(r.PolicyCandidateCrossCheckID)) {
 		return nil, nil
 	}
@@ -116,7 +118,7 @@ func policyAutopilotPayloadFromRow(r store.Run) gatePresentedPayload {
 
 // Both guarded plan and running writes must already have affected exactly one
 // row. This uses their persisted candidate, never a latest-cross-check search.
-func acceptPolicyAutopilotRevision(ctx context.Context, tx pgx.Tx, proof *policyAutopilotAcceptance, plan pgtype.Text) error {
+func acceptPolicyAutopilotRevision(ctx context.Context, tx pgx.Tx, proof *policyAutopilotAcceptance, plan pgtype.Text, writeDigest string) error {
 	q := store.New(tx)
 	current, err := q.GetRunByID(ctx, proof.previous.ID)
 	if err != nil {
@@ -125,26 +127,29 @@ func acceptPolicyAutopilotRevision(ctx context.Context, tx pgx.Tx, proof *policy
 	if current.Status != "running" || !current.PlanMd.Valid || current.PlanMd != plan {
 		return fmt.Errorf("policy autopilot persisted plan mismatch")
 	}
+	target, valid, err := policyRevisionAcceptedTarget(ctx, q, current)
+	if err != nil {
+		return err
+	}
+	if !valid || (target != nil && target.Digest != writeDigest) {
+		return fmt.Errorf("%w: policy autopilot semantic contract invalid", ErrInvalidState)
+	}
 	kept := []apitypes.PolicyRevisionRef{}
 	selected := pgtype.UUID{}
 	for _, cc := range proof.checks {
 		if cc.Verdict != "approve" || cc.LeadClaimGeneration != current.ClaimGeneration {
 			continue
 		}
-		projection := gatePresentedPayload{PlanMd: textPtr(cc.PlanMd), Milestones: cc.Milestones,
-			RequiredCapabilities: capability.Filter(cc.RequiredCapabilities), RequiredTools: capability.FilterTools(cc.RequiredTools),
-			SizeClass: nonEmptyPtr(cc.SizeClass.String)}
-		if current.Kind != runkind.Issue {
-			projection.Milestones = nil
+		applicable, err := policyRevisionIdentityApplicable(ctx, q, current, cc, target, true)
+		if err != nil {
+			return err
 		}
-		projected, err := projection.canonicalJSON()
-		actual, actualErr := policyAutopilotPayloadFromRow(current).canonicalJSON()
-		if err != nil || actualErr != nil {
-			return nil
-		}
-		if !bytes.Equal(projected, actual) {
+		if !applicable {
 			// A current selected APPROVE must be the candidate the normal writer stored.
 			if current.PolicyCandidateCrossCheckID.Valid && uuid.UUID(current.PolicyCandidateCrossCheckID.Bytes) == cc.ID {
+				if current.PlanCrossCheckRequired {
+					return fmt.Errorf("%w: policy autopilot selected candidate mismatch", ErrInvalidState)
+				}
 				return nil
 			}
 			continue

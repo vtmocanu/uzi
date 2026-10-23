@@ -4908,7 +4908,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 			if rows != 1 {
 				return store.Run{}, false, fmt.Errorf("policy autopilot running fence: affected %d rows", rows)
 			}
-			if err := acceptPolicyAutopilotRevision(ctx, fenceTx, autopilotAcceptance, stripNULParam(req.PlanMd)); err != nil {
+			if err := acceptPolicyAutopilotRevision(ctx, fenceTx, autopilotAcceptance, stripNULParam(req.PlanMd), req.CandidateDigest); err != nil {
 				return store.Run{}, false, err
 			}
 		}
@@ -5067,7 +5067,10 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 			!owned.ClaimReleasedAt.Valid
 		var publicationSource *apitypes.PolicyRevisionSourceV1
 		if rebindSource {
-			publicationSource = policyRevisionSourceBeforePublication(owned)
+			publicationSource, err = policyRevisionSourceBeforePublication(ctx, q, owned)
+			if err != nil {
+				return store.Run{}, false, err
+			}
 		}
 		rows, err = q.SetRunAwaitingApproval(ctx, approvalParams)
 		if err == nil && rows > 0 {
