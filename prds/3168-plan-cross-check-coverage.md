@@ -1,6 +1,6 @@
 # PRD #3168: Plan cross-check coverage account
 
-**Status**: M1 code implemented and focused-tested/reviewed; documentation updated, required gates pending (2026-10-23). M1 remains unchecked until P3 validation evidence is complete. Redesigned 2026-10-23 as advisory (see Decision Log). Child 3 of 3 under umbrella #3165 (Deeper, observable cross-check). PRD #3166 is done (2026-10-21). M1 has no implementation dependency and lands before PRD #3167 M2 and M3a (same file; see Coordination). M1 is delivered through child #3334, whose PR closes only the child; this issue stays open for M2. M2 is blocked by PRD #3167 M1 (replay harness).
+**Status**: Partially delivered: M1 delivered through child #3334 (2026-10-23); M2 replay pending. Redesigned 2026-10-23 as advisory (see Decision Log). Child 3 of 3 under umbrella #3165 (Deeper, observable cross-check). PRD #3166 is done (2026-10-21). M1 has no implementation dependency and lands before PRD #3167 M2 and M3a (same file; see Coordination). M1 is delivered through child #3334, whose PR closes only the child; this issue stays open for M2. M2 is blocked by PRD #3167 M1 (replay harness).
 
 Resolved facts below were re-read at `main` `72c97fc7`.
 
@@ -80,26 +80,39 @@ Acceptance examples:
 
 ## Milestones
 
-- [ ] **M1: Advisory coverage in plan checks, delivered on approve.** Brief, revision prompt, approve delivery, tests, docs and `task docs:sync`, dated ADR-2149 amendment, changelog fragment, and the `specs/human.md` lines on plan cross-check (dispositions and fenced advice, ~211-213) updated with an `(AI-synced YYYY-MM-DD)` entry: coverage notes are advisory, a missing coverage disposition alone is not REVISE, an approval's findings reach the lead as fenced advice, and the safety carve-out. Delivered through a child issue whose PR closes only that child. Blocked by: none (rebase onto #3097 if it lands first). Acceptance: examples 1-4 at instruction and delivery level; the tests above; gates `task gate:agent`, `task gate:api` (docs mirror, `TestEmbeddedDocsMatchSource`), `task check-docs:web`, `task gate:repo`.
+- [x] **M1: Advisory coverage in plan checks, delivered on approve.** Brief, revision prompt, approve delivery, tests, docs and `task docs:sync`, dated ADR-2149 amendment, changelog fragment, and the `specs/human.md` lines on plan cross-check (dispositions and fenced advice, ~211-213) updated with an `(AI-synced YYYY-MM-DD)` entry: coverage notes are advisory, a missing coverage disposition alone is not REVISE, an approval's findings reach the lead as fenced advice, and the safety carve-out. Delivered through a child issue whose PR closes only that child. Blocked by: none (rebase onto #3097 if it lands first). Acceptance: examples 1-4 at instruction and delivery level; the tests above; gates `task gate:agent`, `task gate:api` (docs mirror, `TestEmbeddedDocsMatchSource`), `task check-docs:web`, `task gate:repo`.
 - [ ] **M2: Measure coverage advice.** Maintainer replay of the pre-M1 and M1 briefs on the plan corpus, per family. Blocked by: M1, PRD #3167 M1. Extends the PRD #3167 harness to build plan-stage claims (candidate, planning diff, round) if its M1 does not. Acceptance: aggregate posted on this issue, coverage warnings judged true or false, unmeasured items named; this issue closes with M2.
 
 ### M1 progress (2026-10-23, child #3334)
 
-Code is implemented and focused-tested/reviewed; the P2 documentation update
-records the instruction and delivery contract. Required validation is incomplete,
-so M1 remains unchecked and is fully delivered only after P3 evidence. The
-reported `task gate:agent` at `89df35b0` completed 664 unit files but failed
-with 18 failures and one cancellation in
-`agent/test/git-maintenance-private-verification.test.ts` (log
-`.uzi/scratch/gate-log.rvBJqS`). The first failure was reproduced on base
-`7501b6b6` and candidate isolated exports (logs ending `RW8zzL` and `RTGqeD`);
-the remaining failures have not individually been proven to occur on base.
-This is not a passing gate. P2's `task check-docs:web` passed: 77 docs,
-48 length warnings. `task docs:sync`, source/mirror byte comparison, fragment
-validation and `git diff --check HEAD` passed. The focused
-`go test ./internal/uzidocs -run '^TestEmbeddedDocsMatchSource$' -count=1`
-from `api/` passed. Required full API and repository gates have not run yet;
-P3 validation remains pending. No maintainer replay is required for child #3334.
+M1's guidance, shared advice fence, worker-local handoff and both-executor
+delivery are implemented in `89df35b0`, with regression-test refinements in
+`a73f1976` and `0773927b`. Reviewer, auditor and tester reviewed those fixed
+ranges; identified test gaps were repaired and scoped reviews were clean.
+Documentation, the dated ADR amendment, human decisions, changelog and synced
+CLI mirror landed in `9d33a91f`, with a clean documentation review.
+
+Required gates at `9d33a91f` passed: `task gate:api`, `task gate:repo`, and
+`umask 0022; task gate:agent`. The agent gate completed 664 unit files
+(20,929 passes, 15 skips, zero failures/cancellations) and Codex M4
+(189 passes, no skips); its completeness check satisfied the required matrix.
+`task check-docs:web` passed (77 docs, 48 length warnings). `task docs:sync`,
+source/mirror byte comparison, fragment validation, `git diff --check HEAD`
+and the focused `TestEmbeddedDocsMatchSource` Go test also passed.
+
+The initial agent gate at `89df35b0` failed in the private Git verification
+file. Its first failure reproduced on base `7501b6b6` and candidate exports.
+The fixture creates default-mode directories beneath setgid scratch; with
+umask `0002`, their inherited group-write permission conflicts with the
+snapshot's worker-directory safety predicate. The unchanged first test passed
+in both exports under `0022`, and the full private-verification file passed
+all 30 tests before the full gate rerun. The correction restricts newly
+created permissions; no safety check, test or required gate was weakened.
+Run-local logs: agent `ZKHGWV` (initial failure `rvBJqS`), API `gbAnJz`,
+repository `YtrKGl`, docs `AxGyN0`, under `.uzi/scratch/gate-log.*`.
+
+These are instruction-contract and delivery tests, not live model convergence
+or cost/latency measurements. No maintainer replay is required for child #3334.
 M2 remains unchecked and unmeasured, parent #3168 stays open, and this PRD
 remains in place.
 
