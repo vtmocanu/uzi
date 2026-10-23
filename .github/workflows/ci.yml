@@ -339,8 +339,8 @@ jobs:
 
   # The combined recovery proof crosses API, agent, fixtures and the DB harness.
   # Run on every PR/main push except audited component-independent PRs. The Task
-  # target owns the serial LiveDB sweep and all three worker
-  # variants; ubuntu-latest supplies Docker for its throwaway database.
+  # target owns the serial LiveDB sweep, all four lost-reply worker variants,
+  # and the retained-stop proof; ubuntu-latest supplies its throwaway database.
   test-codex-refresh-lostreply-e2e:
     needs: changes
     if: >-
@@ -348,7 +348,10 @@ jobs:
       (github.event_name != 'pull_request' || needs.changes.result != 'success' ||
       needs.changes.outputs.skip_components != '1')
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The job runs the bridge plus the whole store-IT sweep: 25m on main (2026-10-22),
+    # 31-33m once #3120 added its LiveDB matrices (cut off at 30m twice, last package
+    # still passing). 45 leaves room for runner variance.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
