@@ -17814,6 +17814,14 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     const diagnostics = recordingLog();
     const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, "rateLimitExceeded") });
     tinyBackoff(rig, { deferRegistryTeardown: true });
+    const launchCapture = rig.deps.launchEffectRoot!;
+    const captureGitLaunches: CodexEffectLaunchSpec[] = [];
+    rig.deps = { ...rig.deps, launchEffectRoot: async (spec, deadline) => {
+      const handle = await launchCapture(spec, deadline);
+      const forwarded = forwardCredentialFreeGitRoot(spec, deadline, handle);
+      if (forwarded !== handle) captureGitLaunches.push(spec);
+      return forwarded;
+    } };
     const client = new WorkerClient(url, "rate-limit-worker", "test", diagnostics.log, {
       sleep: async () => {}, terminalRetrySchedule: [1, 1],
     });
@@ -17825,15 +17833,40 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
       plan_approved: true, plan_source: "agent", plan_md: "approved plan",
       secrets: { forge_pat: "fixture-forge-pat-000000", codex: SUBSCRIPTION as never },
     });
+    const git = new GitCache(fx.dataDir, diagnostics.log, undefined, testGitCacheOptions());
+    const barePath = git.barePathFor(claim.repo.clone_url);
     const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
     const homeDir = path.join(fx.dataDir, "rate-limit-home");
     let produced: unknown;
+    let clonePath: string | undefined;
     const run = executor.run.bind(executor);
     executor.run = async ctx => {
-      try { return await run(ctx); } catch (error) { produced = error; throw error; }
+      clonePath = ctx.worktreePath;
+      // Read the fixture's actual refs without launching an extra unsupervised Git child.
+      const readFixtureHead = async (gitdir: string): Promise<string> => {
+        const head = (await fs.readFile(path.join(gitdir, "HEAD"), "utf8")).trim();
+        if (!head.startsWith("ref: ")) return head;
+        const ref = head.slice(5);
+        try { return (await fs.readFile(path.join(gitdir, ref), "utf8")).trim(); }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          const packed = await fs.readFile(path.join(gitdir, "packed-refs"), "utf8");
+          const entry = packed.split("\n").find(line => line.slice(41) === ref);
+          assert.ok(entry, `fixture HEAD ref ${ref} must exist`);
+          return entry.slice(0, 40);
+        }
+      };
+      const cloneHead = await readFixtureHead(path.join(ctx.worktreePath, ".git"));
+      assert.match(cloneHead, /^[0-9a-f]{40}$/);
+      assert.equal(await readFixtureHead(barePath), cloneHead, "worker bare and runner clone start at the same real HEAD");
+      try { return await run(ctx); } catch (error) {
+        produced = error;
+        assert.equal(rig.client.refreshCalls.length, 0, "provider retries do not refresh credentials");
+        throw error;
+      }
     };
     try {
-      await new RunRunner(client, new GitCache(fx.dataDir, diagnostics.log, undefined, testGitCacheOptions()),
+      await new RunRunner(client, git,
         () => ({ executor, homeDir }), diagnostics.log, 20, undefined, {
           pollMs: 5, recoveryRetryMs: 5, codexBoundaryDeadlineMs: 200,
           quiesceRun: async () => ({
@@ -17843,12 +17876,17 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
         }).execute(claim);
       assert.ok(produced instanceof TransientRecoveryError, diagnostics.lines.join("\n"));
       assert.equal(produced.providerOrigin, true);
+      assert.ok(captureGitLaunches.some(spec => spec.identity === "worker_pat" && spec.cwd === barePath),
+        "capture uses real supervised Git in the trusted worker bare");
+      assert.ok(captureGitLaunches.some(spec => spec.identity === "command" && spec.cwd === clonePath),
+        "capture uses real supervised Git in the runner clone");
       assert.equal(rig.transport.turnStartCount, 3, "the real producer spent exactly two retries");
       const reports = api.states.filter(s => s.runId === claim.run_id && s.body.status === "recovery_wait");
       assert.equal(reports.length, 1, diagnostics.lines.join("\n"));
       assert.equal(reports[0]!.body.recovery_cause, "provider_outage");
       assert.equal(reports[0]!.body.productive_turns, 0, "failed rate-limit attempts are not productive");
       assert.equal(reports[0]!.body.claim_generation, 3);
+      assert.equal(rig.client.refreshCalls.length, 1, "only the held recovery boundary reconciles credentials");
       assert.ok(!api.states.some(s => s.body.status === "failed" || s.body.status === "limit_wait"));
     } finally { await api.close(); fx.cleanup(); }
   });
