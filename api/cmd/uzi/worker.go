@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/x/ansi"
 	"github.com/spf13/cobra"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -52,13 +53,52 @@ func printWorkerDrainDetail(p *uzicli.Printer, w apitypes.WorkerDTO) {
 	}
 }
 
-// newWorkerCmd — `uzi worker`. list and rm are both wired. There is no
-// `create`: minting a join token is a webui action (it returns a credential
+// manualWorkerField bounds a sanitized single-line field by Unicode code points.
+func manualWorkerField(s string) string {
+	r := []rune(strings.Join(strings.Fields(uzicli.CellText(ansi.Strip(s))), " "))
+	if len(r) > 200 {
+		return string(r[:199]) + "…"
+	}
+	return string(r)
+}
+
+func printWorkerManualDetail(p *uzicli.Printer, w apitypes.WorkerDTO) {
+	if w.ManualCordonedAt == nil {
+		return
+	}
+	actor := manualWorkerField(strOr(w.ManualCordonedByLabel, ""))
+	if actor == "" {
+		actor = manualWorkerField(strOr(w.ManualCordonedBy, "-"))
+	}
+	p.Printf("Manual cordon worker %s: actor=%s at=%s\n",
+		manualWorkerField(w.ID), manualWorkerField(actor), w.ManualCordonedAt.UTC().Format(time.RFC3339))
+	p.Printf("  Manual reason: %s\n", manualWorkerField(strOr(w.ManualCordonReason, "-")))
+}
+
+func printWorkerManualResult(env Env, gf *globalFlags, w apitypes.WorkerDTO) error {
+	p := env.printer(gf)
+	if p.Format == uzicli.FormatJSON {
+		return p.JSON(w)
+	}
+	if !gf.quiet {
+		p.Printf("worker %s: %s\n", manualWorkerField(w.ID), manualWorkerField(statusCell(w)))
+		if w.ManualCordonedAt == nil {
+			p.Printf("Manual cordon cleared.\n")
+		}
+		printWorkerManualDetail(p, w)
+		printWorkerDrainDetail(p, w)
+		p.Printf("Held work continues; automatic drains and other fences can remain.\n")
+	}
+	return nil
+}
+
+// newWorkerCmd — `uzi worker`. Lists, removes and manually cordons workers.
+// There is no `create`: minting a join token is a webui action (it returns a credential
 // that reads decrypted secrets), so it stays cookie-only (Decision 18).
 func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "worker",
-		Short: "List and remove workers",
+		Short: "List and manage workers",
 	}
 
 	list := &cobra.Command{
@@ -142,6 +182,7 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 				return err
 			}
 			for _, w := range workers {
+				printWorkerManualDetail(p, w)
 				printWorkerDrainDetail(p, w)
 			}
 			return nil
@@ -291,7 +332,43 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 	setToken.Flags().BoolVar(&toAuto, "auto", false, "auto-select per claim from your opted-in token pool")
 	setToken.Flags().BoolVar(&toDefault, "default", false, "clear the binding; use the account default token")
 
-	cmd.AddCommand(list, rm, setToken)
+	var reason string
+	cordon := &cobra.Command{
+		Use:   "cordon <id>",
+		Short: "Suspend new intake on a persistent worker",
+		Long:  "Suspend new intake on a persistent worker. Held work continues; automatic drains and other fences remain independent.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			w, err := c.CordonWorker(cmd.Context(), args[0], reason)
+			if err != nil {
+				return err
+			}
+			return printWorkerManualResult(env, gf, w)
+		},
+	}
+	cordon.Flags().StringVarP(&reason, "reason", "m", "", "optional manual cordon reason (at most 500 Unicode code points)")
+	uncordon := &cobra.Command{
+		Use:   "uncordon <id>",
+		Short: "Clear a worker's manual cordon",
+		Long:  "Clear only the manual cordon. Held work continues; other fences remain and can still prevent new intake.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			w, err := c.UncordonWorker(cmd.Context(), args[0])
+			if err != nil {
+				return err
+			}
+			return printWorkerManualResult(env, gf, w)
+		},
+	}
+	cmd.AddCommand(list, rm, setToken, cordon, uncordon)
 	return cmd
 }
 
@@ -325,6 +402,9 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 // untouched, so scripting keys off them rather than parsing this annotation.
 func statusCell(w apitypes.WorkerDTO) string {
 	s := w.Status
+	if w.ManualCordonedAt != nil {
+		s += " · cordoned (manual)"
+	}
 	if w.DrainingSince != nil {
 		if w.ActiveRuns > 0 || w.ActiveCrossChecks > 0 {
 			s += " (draining)"

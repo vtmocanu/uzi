@@ -44,6 +44,39 @@ func (c *HTTPClient) ListWorkers(ctx context.Context) ([]apitypes.WorkerDTO, err
 	return env.Workers, nil
 }
 
+func (c *HTTPClient) CordonWorker(ctx context.Context, id, reason string) (apitypes.WorkerDTO, error) {
+	path := "/api/workers/" + url.PathEscape(id) + "/cordon"
+	resp, body, err := c.doJSONRead(ctx, http.MethodPost, path, struct {
+		Reason string `json:"reason,omitempty"`
+	}{reason})
+	if err != nil {
+		return apitypes.WorkerDTO{}, err
+	}
+	return decodeManualWorkerResponse(resp, body, path)
+}
+
+func (c *HTTPClient) UncordonWorker(ctx context.Context, id string) (apitypes.WorkerDTO, error) {
+	path := "/api/workers/" + url.PathEscape(id) + "/cordon"
+	resp, body, err := c.doJSONRead(ctx, http.MethodDelete, path, nil)
+	if err != nil {
+		return apitypes.WorkerDTO{}, err
+	}
+	return decodeManualWorkerResponse(resp, body, path)
+}
+
+func decodeManualWorkerResponse(resp *http.Response, body []byte, path string) (apitypes.WorkerDTO, error) {
+	var out struct {
+		Worker *apitypes.WorkerDTO `json:"worker"`
+	}
+	if err := decode2xx(resp, body, path, &out); err != nil {
+		return apitypes.WorkerDTO{}, err
+	}
+	if out.Worker == nil || out.Worker.ID == "" {
+		return apitypes.WorkerDTO{}, Exitf(ExitGeneric, "worker cordon response is missing the updated worker")
+	}
+	return *out.Worker, nil
+}
+
 func (c *HTTPClient) DeleteWorker(ctx context.Context, id string) error {
 	path := "/api/workers/" + url.PathEscape(id)
 	resp, body, err := c.doJSONRead(ctx, http.MethodDelete, path, nil)
