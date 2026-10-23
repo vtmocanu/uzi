@@ -140,9 +140,9 @@ for (const site of ["wall", "hold", "recovery"] as const) {
 for (const refuseCleanup of [false, true]) {
   it(`primary Git completion waits for full-root cleanup (${refuseCleanup ? "refused" : "settled"})`, async t => {
     let armed = false, injected = false, sourceSteps = 0, acks = 0, fallbacks = 0;
-    let rootSettled = false, done = false, clone = "";
+    let rootSettled = false, done = false, clone = "", primaryJoined = false;
     const phases: string[] = [];
-    const events: Array<{ phase: string; release: () => void }> = [];
+    const events: Array<{ phase: string; fallback: boolean; release: () => void }> = [];
     const releases: Array<() => void> = [];
     let wake: (() => void) | undefined;
     let closed = false;
@@ -150,7 +150,7 @@ for (const refuseCleanup of [false, true]) {
       if (closed) return;
       await new Promise<void>(resolve => {
         releases.push(resolve);
-        events.push({ phase, release: resolve });
+        events.push({ phase, fallback: fallbacks > 0, release: resolve });
         wake?.();
       });
     };
@@ -195,6 +195,10 @@ for (const refuseCleanup of [false, true]) {
         };
       },
     });
+    const boundary = rig.safety.withBoundary.bind(rig.safety);
+    t.mock.method(rig.safety, "withBoundary", async (...args: Parameters<typeof boundary>) => {
+      try { return await boundary(...args); } finally { primaryJoined = true; }
+    });
     for (const name of ["worktreeStatus", "commitWipMarker", "worktreeHead", "fetchAgentBranch"] as const) {
       const original = git[name].bind(git);
       t.mock.method(git, name, async (...args: unknown[]) => {
@@ -219,6 +223,7 @@ for (const refuseCleanup of [false, true]) {
       return { branch: ctx.branch, completionHeld: { reason: "cleanup barrier" } };
     }, undefined, (ms, action, purpose, signal, attempt) => {
       fallbacks++;
+      assert.equal(primaryJoined, true, "fallback starts only after the primary scope has joined");
       return rig.capture(ms, action, purpose, signal, attempt);
     });
     const { gitlab } = fakeGitlab();
@@ -238,7 +243,8 @@ for (const refuseCleanup of [false, true]) {
           assert.equal(done, false, "public callback remains pending at " + event.phase);
           assert.equal(sourceSteps, firstSteps, "no next source step before full-root settlement");
           assert.equal(acks, 0, "no ACK before full-root settlement");
-          assert.equal(fallbacks, 0, "no fallback overlaps primary cleanup");
+          if (event.fallback) assert.equal(primaryJoined, true, "a fresh drain owns its own cleanup");
+          else assert.equal(fallbacks, 0, "no fallback overlaps primary cleanup");
         } finally { event.release(); }
       }
       await operation;

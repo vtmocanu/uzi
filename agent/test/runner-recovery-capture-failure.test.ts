@@ -7,7 +7,9 @@ import { ForeignCaptureBlockedError, GitCache, PendingRecoveryCaptureError, Capt
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import { RunRunner, type ExecutorFactory } from "../src/runner.js";
 import type { Executor } from "../src/executor.js";
-import type { BoundaryRequest, BoundaryPermit } from "../src/harness.js";
+import type { BoundaryPermit, BoundaryRequest } from "../src/harness.js";
+import { codexRig } from "./runner-codex-sinks-fixture.js";
+import { acceptsHeldCaptureCleanup } from "../src/codex/safety.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
 import { nullLogger, recordingLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
@@ -68,82 +70,82 @@ describe("recovery capture retry and restart safety (#1197)", () => {
       let publications = 0;
       let retries = 0;
       let runner!: RunRunner;
-      const assertDrained = () => {
-        const summary = events.indexOf("summary");
-        const commands = events.indexOf("commands");
-        const drain = events.indexOf("drained");
-        assert.ok(summary >= 0 && commands > summary && drain > commands,
-          "summary and confirmed commands precede successful normal boundary return");
+      const rig = codexRig();
+      let held: BoundaryPermit | undefined;
+      const assertHeld = () => {
+        assert.ok(held, "source operations execute inside the original callback");
+        assert.equal(rig.registry.state(), "closed");
+        assert.ok(events.indexOf("commands") > events.indexOf("summary"));
+        assert.equal(events.includes("released"), false, "source work precedes boundary release");
       };
       const marker = git.commitWipMarker.bind(git);
       t.mock.method(git, "commitWipMarker", async (...args: Parameters<typeof marker>) => {
         captures++;
-        assertDrained();
+        assertHeld();
         events.push("marker");
         return marker(...args);
       });
       const fetch = git.fetchAgentBranch.bind(git);
       t.mock.method(git, "fetchAgentBranch", async (...args: Parameters<typeof fetch>) => {
         fetches++;
-        assertDrained();
+        assertHeld();
         events.push("fetch");
         return fetch(...args);
       });
       const publish = client.publishCheckpoint.bind(client);
       t.mock.method(client, "publishCheckpoint", async (...args: Parameters<typeof publish>) => {
         publications++;
+        assertHeld();
         assert.equal(callbackCalls, 0);
         assert.equal(legacyCalls, 0);
-        assert.ok(events.indexOf("marker") > events.indexOf("drained"));
-        assert.ok(events.indexOf("fetch") > events.indexOf("drained"));
-        assert.ok(events.filter(event => event === "boundary").length >= 2,
-          "publication acquires its own authenticated boundary after the drain");
+        assert.ok(events.indexOf("marker") >= 0 && events.indexOf("fetch") > events.indexOf("marker"));
+        assert.equal(rig.boundaries.length, 1, "capture and publication share the original boundary");
         return publish(...args);
       });
-      // This facade tests admission and ordering only; fixture Git runs on the host.
-      // Production Codex root verification remains the normal boundary's responsibility.
-      t.mock.method(git, "withBoundaryProcessSpawner", async (...args: Parameters<typeof git.withBoundaryProcessSpawner>) => args[2]());
+      const state = client.reportState.bind(client);
+      t.mock.method(client, "reportState", async (...args: Parameters<typeof state>) => {
+        if (args[1].status === "recovery_wait") {
+          assertHeld();
+          assert.equal(acceptsHeldCaptureCleanup(rig.safety, held!), true,
+            "the actual facade has settled pending children before the park POST");
+          events.push("ack");
+        }
+        return state(...args);
+      });
+      const withBoundary = rig.safety.withBoundary.bind(rig.safety);
+      t.mock.method(rig.safety, "withBoundary", async <T>(request: BoundaryRequest, action: (permit: BoundaryPermit) => Promise<T>): Promise<T> => {
+        if (request.boundary !== "shutdown") return withBoundary(request, action);
+        events.push("boundary");
+        if (boundary === "throw") throw new Error("injected boundary failure");
+        if (boundary === "not-entered") return undefined as never;
+        return withBoundary(request, async permit => {
+          held = permit;
+          const result = await action(permit).finally(() => {
+            held = undefined;
+            events.push("released");
+          });
+          if (boundary === "throw-after-action") throw new Error("injected boundary return failure");
+          return result;
+        });
+      });
       const factory: ExecutorFactory = (...args) => {
         const made = fixture.factory(...args);
-        const run = made.executor.run.bind(made.executor);
-        made.executor.run = async ctx => {
-          try { return await run(ctx); }
-          finally {
-            made.executor.safety = {
-              kind: "codex",
-              withBoundary: async <T>(request: BoundaryRequest, action: (permit: BoundaryPermit) => Promise<T>): Promise<T> => {
-                assert.equal(callbackCalls, 0);
-                assert.equal(legacyCalls, 0);
-                events.push("boundary");
-                if (captures === 0) {
-                  assert.equal(request.boundary, "shutdown");
-                  assert.ok(events.indexOf("commands") >= 0, "commands confirmed before drain");
-                  if (boundary === "throw") throw new Error("injected boundary failure");
-                  // Deliberately broken admission facade: a resolved return alone is no proof.
-                  if (boundary === "not-entered") return undefined as T;
-                  const result = await action({ signal: new AbortController().signal } as never);
-                  if (boundary === "throw-after-action") throw new Error("injected boundary return failure");
-                  events.push("drained");
-                  return result;
-                }
-                return action({ signal: new AbortController().signal } as never);
-              },
-              spawnBoundaryProcess: async () => { throw new Error("fixture uses host Git"); },
-              dispose: async () => ({ kind: "disposed" }),
-            };
-            made.executor.closeAndSettlePlanSummary = async () => { events.push("summary"); };
-            made.executor.settleWorkerCommands = async () => { events.push("commands"); return { confirmed: true }; };
-            made.executor.settleForCredentialFreeCapture = async () => {
-              legacyCalls++;
-              throw new Error("authenticated recovery must not use legacy free settle");
-            };
-            made.executor.withCredentialFreeCapture = (async () => {
-              callbackCalls++;
-              runner.shutdown();
-              throw new Error("authenticated recovery must not acquire free capture");
-            }) as Executor["withCredentialFreeCapture"];
-          }
+        // Broken wrapper identity must fail before source work even if it invokes action.
+        made.executor.safety = boundary === "throw-after-action" ? {
+          kind: "codex", withBoundary: (request, action) => rig.safety.withBoundary(request, action),
+          spawnBoundaryProcess: (permit, request) => rig.safety.spawnBoundaryProcess(permit, request),
+          dispose: request => rig.safety.dispose(request),
+        } : rig.safety;
+        made.executor.closeAndSettlePlanSummary = async () => { events.push("summary"); };
+        made.executor.settleWorkerCommands = async () => { events.push("commands"); return { confirmed: true }; };
+        made.executor.settleForCredentialFreeCapture = async () => {
+          legacyCalls++;
+          throw new Error("authenticated recovery must not use legacy free settle");
         };
+        made.executor.withCredentialFreeCapture = (async () => {
+          callbackCalls++;
+          return { kind: "incomplete", errors: [] };
+        }) as Executor["withCredentialFreeCapture"];
         return made;
       };
       runner = runnerWith(factory, gitlab, undefined, nullLogger(), { recoveryRetryMs: 1 });
@@ -163,9 +165,11 @@ describe("recovery capture retry and restart safety (#1197)", () => {
         assert.ok(captures > 0);
         assert.ok(fetches > 0);
         assert.ok(publications > 0, "authenticated publication succeeds");
+        assert.ok(rig.processSpawns() > 0, "Git used the real facade's owned process seam");
+        assert.ok(events.indexOf("ack") < events.indexOf("released"), "ACK remains inside the original callback");
         assert.equal(api.states.filter(s => s.body.status === "recovery_wait").length, 1);
       } else {
-        assert.equal(retries, 6, "incomplete boundary retries without spending process-proof attempts");
+        assert.equal(retries, 0, "broken admission cannot start a source retry loop");
         assert.equal(captures, 0);
         assert.equal(fetches, 0);
         assert.equal(publications, 0);

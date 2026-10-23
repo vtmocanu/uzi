@@ -342,17 +342,16 @@ export function codexRig(
   );
   const boundaries: string[] = [];
   const disposeBoundaries: string[] = [];
-  const safety: CodexExecutionSafety = {
-    kind: "codex",
-    withBoundary: (req, action) => {
-      boundaries.push(req.boundary);
-      return inner.withBoundary(req, action);
-    },
-    spawnBoundaryProcess: (permit, request) => inner.spawnBoundaryProcess(permit, request),
-    dispose: (req) => {
-      disposeBoundaries.push(req.boundary);
-      return inner.dispose(req);
-    },
+  const safety = inner;
+  const withBoundary = inner.withBoundary.bind(inner);
+  safety.withBoundary = (req, action) => {
+    boundaries.push(req.boundary);
+    return withBoundary(req, action);
+  };
+  const dispose = inner.dispose.bind(inner);
+  safety.dispose = req => {
+    disposeBoundaries.push(req.boundary);
+    return dispose(req);
   };
   return {
     installer,

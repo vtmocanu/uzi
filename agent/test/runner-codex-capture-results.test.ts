@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync, spawn } from "node:child_process";
-import { CodexBoundaryError } from "../src/codex/safety.js";
+import { CodexBoundaryError, acceptsHeldCaptureCleanup } from "../src/codex/safety.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
 import { codexRig, commitInTree, FakeCodexExecutor, GIT_ENV, manualDeadline } from "./runner-codex-sinks-fixture.js";
@@ -395,6 +395,7 @@ for (const reply of ["park", "provider-hold", "untyped-provider-hold", "wrong-ho
     const iid = 285940 + ["park", "provider-hold", "untyped-provider-hold", "wrong-hold", "running", "statusless", "stale-generation", "cancelled", "shutdown"].indexOf(reply);
     const execution = runner.execute(gitlabClaim(iid, { claim_generation: 7 }));
     if (reply === "shutdown") await assert.rejects(execution, { name: "AbortError" });
+    else if (reply === "stale-generation") await assert.rejects(execution, { name: "StaleClaimError" });
     else await execution;
     assert.equal(reports, 1, "received or refused replies never cause a second POST after join");
     assert.equal(deadline.fired(), 1);
@@ -406,4 +407,155 @@ for (const reply of ["park", "provider-hold", "untyped-provider-hold", "wrong-ho
     assert.equal(fs.readFileSync(path.join(clone, "RESULT.txt"), "utf8"), bytes);
     assert.equal(readGit(git.barePathFor(fx.originPath), "show", `refs/uzi-runner/agent/issue-${iid}:RESULT.txt`), bytes);
   });
+}
+
+for (const site of ["wall", "hold", "recovery", "permit", "prepush"] as const) {
+  for (const fault of ["raw-tool", "raw-tool-expiry", "raw-tool-late-expiry", "clean-child-deadline"] as const) {
+    const unsafe = fault !== "clean-child-deadline";
+    it(`${site}: facade cleanup witness rejects unknown poison and preserves ${fault}`, async t => {
+      const finalize = site === "permit" || site === "prepush";
+      let publication = false, injected = 0, verifies = 0, freeCalls = 0, joined = false, sourceRemovals = 0;
+      let clone = "", verifiedHead = "";
+      const iid = 286100 + ["wall", "hold", "recovery", "permit", "prepush"].indexOf(site) * 4 + ["raw-tool", "raw-tool-expiry", "raw-tool-late-expiry", "clean-child-deadline"].indexOf(fault);
+      const deadline = manualDeadline(finalize ? "finalize" : "shutdown");
+      let heldPermit: Parameters<typeof acceptsHeldCaptureCleanup>[1] | undefined;
+      const rig = codexRig({ armDeadline: deadline.armDeadline, boundaryProcess: async request => {
+        if (unsafe || !publication || injected) return undefined;
+        injected++;
+        const [bin, ...args] = request.argv;
+        const child = spawn(bin!, args, { cwd: request.cwd, env: request.env, stdio: ["pipe", "pipe", "pipe"] });
+        const terminal = new Promise<{ code: number }>((resolve, reject) => {
+          child.once("error", reject);
+          child.once("close", code => resolve({ code: code ?? 1 }));
+        });
+        void terminal.catch(() => undefined);
+        return {
+          stdin: child.stdin, stdout: child.stdout, stderr: child.stderr,
+          waitChild: () => { deadline.fire(); return terminal; },
+          root: {
+            kind: "boundary_action",
+            reap: async () => {
+              await terminal;
+              return { ok: true }; // Fixture root observation, not kernel reaper evidence.
+            },
+            dispose: async () => {
+              if (child.exitCode === null) child.kill("SIGKILL");
+              await terminal.catch(() => undefined);
+            },
+          },
+        };
+      }});
+      const remove = git.removeRunnerClone.bind(git);
+      t.mock.method(git, "removeRunnerClone", async (...args: Parameters<typeof remove>) => {
+        if (args[0] === clone) sourceRemovals++;
+        return remove(...args);
+      });
+      const boundary = rig.safety.withBoundary.bind(rig.safety);
+      t.mock.method(rig.safety, "withBoundary", async (...args: Parameters<typeof boundary>) => {
+        const [request, action] = args;
+        try { return await boundary(request, async permit => {
+          heldPermit = permit;
+          return action(permit);
+        }); } finally { heldPermit = undefined; joined = true; }
+      });
+      const verify = git.verifyRunnerTrackingCovers.bind(git);
+      t.mock.method(git, "verifyRunnerTrackingCovers", async (...args: Parameters<typeof verify>) => {
+        const result = await verify(...args);
+        if (result) {
+          verifies++;
+          verifiedHead = readGit(git.barePathFor(fx.originPath), "rev-parse", `refs/uzi-runner/agent/issue-${iid}`).trim();
+        }
+        return result;
+      });
+      const executor = new FakeCodexExecutor(rig.safety, async ctx => {
+        clone = ctx.worktreePath;
+        if (finalize) commitInTree(clone, "RESULT.txt", bytes);
+        else fs.writeFileSync(path.join(clone, "RESULT.txt"), bytes);
+        if (site === "recovery") throw new TransientRecoveryError("publication cleanup fixture");
+        if (site === "hold") {
+          await ctx.enterCompletionHold!("publication cleanup");
+          return { branch: ctx.branch, completionHeld: { reason: "publication cleanup" } };
+        }
+        if (site === "wall") {
+          await ctx.parkForWall!({ completedCount: 0 });
+          return { branch: ctx.branch, walled: { reason: "publication cleanup" } };
+        }
+        return { branch: ctx.branch, ...(site === "prepush" ? { nonClosing: { reason: "remaining work" } } : {}) };
+      }, undefined, async () => {
+        freeCalls++;
+        assert.equal(joined, true, "fresh fallback must wait for primary settlement");
+        return { kind: "incomplete", errors: [{ category: "tool", message: "no fresh empty proof" }] };
+      });
+      const runner = runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined, { recoveryRetryMs: 1 });
+      const internal = runner as unknown as {
+        buildCheckpointOverlay: (...args: unknown[]) => Promise<unknown>;
+        captureHoldContext: (...args: unknown[]) => Promise<unknown>;
+      };
+      const publicationChild = async () => {
+        publication = true;
+        await git.trackingTip(git.barePathFor(fx.originPath), `agent/issue-${iid}`);
+        if (unsafe) {
+          injected++;
+          if (fault === "raw-tool-late-expiry") fs.writeFileSync(path.join(clone, "RESULT.txt"), "later unverified bytes\n");
+          rig.registry.poison({ category: "tool", message: "independent cleanup unconfirmed" });
+          if (fault !== "raw-tool") deadline.fire();
+        }
+      };
+      if (finalize) {
+        // Both finalize callers disable publication. Exercise their held continuation after
+        // local proof with the same real child cleanup refusal, without enabling publication.
+        const capture = internal.captureHoldContext.bind(runner);
+        t.mock.method(internal, "captureHoldContext", async (...args: unknown[]) => {
+          const result = await capture(...args);
+          await publicationChild();
+          return result;
+        });
+        if (site === "prepush") t.mock.method(git, "publishedCommitMessages", async () => null);
+        api.setRegisterProtocolFeatures(["claim_generation_fence", "completion_non_closing_v1"]);
+        await client.register("cleanup-finalize");
+      } else {
+        t.mock.method(internal, "buildCheckpointOverlay", async () => {
+          await publicationChild();
+          throw new Error("ordinary optional publication failure after safe cleanup");
+        });
+      }
+      const holdRequest = client.requestCompletionHold.bind(client);
+      t.mock.method(client, "requestCompletionHold", async (...args: Parameters<typeof holdRequest>) => {
+        // These deadline continuations are joined; ordinary healthy controls above remain held.
+        assert.equal(joined, true);
+        assert.equal(heldPermit, undefined);
+        return holdRequest(...args);
+      });
+      api.setCompletionHoldResponse("paused");
+      api.setWallParkResponse("paused", 200);
+      const claim = gitlabClaim(iid, finalize ? {
+        claim_generation: 7, config: { completion_contract_version: 1, contract_revision: 1 },
+      } : {});
+      if (finalize) {
+        api.setPublicationState(claim.run_id, [], 1);
+        api.setCompletionPermitResponse(false, { denyReason: "incomplete" });
+      }
+      await runner.execute(claim);
+      assert.equal(injected, 1, "a real Git child completed in the tested scope");
+      assert.equal(verifies, 1, "no reuse or recapture of invalidated provisional evidence");
+      assert.equal(rig.refreshCalls(), 1, "no second credential refresh");
+      assert.ok(verifiedHead);
+      assert.equal(readGit(git.barePathFor(fx.originPath), "show", verifiedHead + ":RESULT.txt"), bytes);
+      assert.equal(readGit(clone, "rev-parse", "HEAD").trim(), verifiedHead);
+      assert.equal(fs.readFileSync(path.join(clone, "RESULT.txt"), "utf8"),
+        fault === "raw-tool-late-expiry" ? "later unverified bytes\n" : bytes,
+        "the exact original source survives invalidated local evidence");
+      if (site === "wall") {
+        assert.equal(api.wallParkRequests.length, unsafe ? 0 : 1);
+        if (!unsafe) assert.equal(api.wallParkRequests[0]!.body.head, verifiedHead);
+      } else if (site === "recovery") {
+        assert.equal(api.states.filter(state => state.runId === claim.run_id && state.body.status === "recovery_wait").length, unsafe ? 0 : 1);
+      } else {
+        assert.equal(api.completionHoldRequests.length, unsafe ? 0 : 1, "unsafe cleanup cannot authorize a hold ACK, even with degraded capture allowed");
+        if (!unsafe) assert.equal(api.completionHoldRequests[0]!.body.head, verifiedHead);
+      }
+      assert.equal(freeCalls, unsafe ? 1 : 0, "only a fresh proof can replace invalidated evidence");
+      assert.equal(sourceRemovals, 0, "capture refusal never deletes the original source");
+    });
+  }
 }

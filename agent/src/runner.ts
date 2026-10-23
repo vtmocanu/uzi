@@ -1,4 +1,5 @@
 import { prepareCIEvidence, validateCIRepairClaim, type PreparedCIEvidence } from "./ci-evidence.js";
+import { acceptsHeldCaptureCleanup, acceptsJoinedCaptureCleanup, settleHeldCaptureCleanup } from "./codex/safety.js";
 import { CheckpointUnsafeCleanupError, GitBoundaryAbortError, isCheckpointBoundaryFailure, type CheckpointStop } from "./checkpoint-stop.js";
 import { prepareFrozenHeld, type FrozenHeldPolicy } from "./frozen-held.js";
 import { interruptedSnapshot, prepareInterruptedCalls } from "./interrupted-calls.js";
@@ -620,6 +621,7 @@ interface HoldCaptureResult {
 interface CaptureProgress {
   readonly flight: RunFlight;
   local?: { kind: "hold"; result: HoldCaptureResult } | { kind: "recovery"; result: RecoveryCaptureResult };
+  localBinding?: { safety: CodexExecutionSafety; permit: BoundaryPermit };
   failure?: { issued: object; error: unknown; options: { keepCustody?: boolean } };
   control?: { issued: object; error: unknown };
   dispositionStarted: boolean;
@@ -7111,10 +7113,11 @@ export class RunRunner {
         if (canonicalRecoveryInterruption(error) && !isCodexBoundaryError(error) &&
             !(error instanceof TrustedExecutionRefusal) && codexDeferralOf(error) === undefined &&
             !(error instanceof RunResidueBlockedError) &&
-            !(captureSignal?.aborted && error === captureSignal.reason)) throw error;
+            !(captureSignal?.aborted && (error === captureSignal.reason || error instanceof GitBoundaryAbortError))) throw error;
         if (captureContinuation.pending) throw error;
         captureContinuation.pending = async () => {
           this.captureAuthority(flight, Infinity);
+          this.validateJoinedCapture(flight, episode);
           await this.runGatedSink(flight, async () => {
             if (progress.local || progress.dispositionStarted || Date.now() >= episode.deadlineAt) {
               await finish(await this.resumeHoldDisposition(claim, flight, runLog, holdReason, options, episode));
@@ -15012,6 +15015,27 @@ export class RunRunner {
     return episode;
   }
 
+  private validateJoinedCapture(flight: RunFlight, episode: CaptureEpisode): void {
+    const progress = this.captureProgressFor(flight, episode);
+    const binding = progress.localBinding;
+    if (progress.local && (!binding || binding.safety !== flight.executor.safety ||
+        !acceptsJoinedCaptureCleanup(binding.safety, binding.permit))) {
+      progress.local = undefined;
+      this.retainCaptureSource(flight);
+    }
+  }
+
+  private async settleCaptureRequest(flight: RunFlight, held?: HeldAuthenticatedCapture): Promise<void> {
+    if (!held) return;
+    this.assertHeldAuthenticatedCapture(flight, held);
+    if (!await settleHeldCaptureCleanup(held.safety, held.permit) ||
+        !acceptsHeldCaptureCleanup(held.safety, held.permit)) {
+      this.retainCaptureSource(flight);
+      throw new CheckpointUnsafeCleanupError("authenticated capture cleanup unconfirmed");
+    }
+    this.assertHeldAuthenticatedCapture(flight, held);
+  }
+
   private captureProgressFor(flight: RunFlight, episode: CaptureEpisode): CaptureProgress {
     const progress = this.captureProgress.get(episode);
     if (!progress || progress.flight !== flight) throw new TrustedExecutionRefusal("capture episode unavailable");
@@ -15030,6 +15054,7 @@ export class RunRunner {
 
   private async resumeHoldDisposition(claim: ClaimResponse, flight: RunFlight, runLog: Logger,
     reason: string, options: HoldCaptureOptions, episode: CaptureEpisode): Promise<boolean> {
+    this.validateJoinedCapture(flight, episode);
     const progress = this.captureProgressFor(flight, episode);
     this.captureAuthority(flight, Infinity);
     if (progress.holdOutcome !== undefined) return progress.holdOutcome;
@@ -15044,6 +15069,7 @@ export class RunRunner {
 
   private async resumeWallDisposition(claim: ClaimResponse, flight: RunFlight, runLog: Logger,
     options: HoldCaptureOptions, episode: CaptureEpisode): Promise<WallParkOutcome> {
+    this.validateJoinedCapture(flight, episode);
     const progress = this.captureProgressFor(flight, episode);
     this.captureAuthority(flight, Infinity);
     if (progress.wallOutcome !== undefined) return progress.wallOutcome;
@@ -15104,6 +15130,9 @@ export class RunRunner {
       this.authenticatedCaptureFlights.set(held, flight);
       try {
         this.assertHeldAuthenticatedCapture(flight, held);
+        // The outer finalize wrapper also serves sinks outside B. Narrow cleanup
+        // acceptance begins when a capture scope or capture helper actually enters.
+        if (boundOperations) await this.settleCaptureRequest(flight, held);
         const result = await action(held);
         this.assertHeldAuthenticatedCapture(flight, held);
         return result;
@@ -15150,15 +15179,17 @@ export class RunRunner {
                 interrupted = canonicalRecoveryInterruption(error) && !isCodexBoundaryError(error) &&
                   !(error instanceof TrustedExecutionRefusal) && codexDeferralOf(error) === undefined &&
                   !(error instanceof RunResidueBlockedError) &&
-                  !(held.signal.aborted && error === held.signal.reason);
+                  !(held.signal.aborted && (error === held.signal.reason || error instanceof GitBoundaryAbortError));
                 interruption = error;
                 throw error;
               }
             });
           actionCompleted = true;
         });
+        if (!actionCompleted) throw new TrustedExecutionRefusal("capture boundary callback did not complete");
         return value;
       } catch (error) {
+        this.validateJoinedCapture(flight, episode);
         this.retainCaptureSource(flight);
         if (progress.control) throw progress.control.error;
         if (progress.failure && resume) return resume(progress.failure.issued);
@@ -17446,6 +17477,7 @@ export class RunRunner {
       episode?: CaptureEpisode; freeFallback?: boolean; dispositionOnly?: boolean; dispositionSignal?: AbortSignal } = {},
   ): Promise<boolean> {
     const episode = opts.episode;
+    if (opts.dispositionOnly && episode) this.validateJoinedCapture(flight, episode);
     const progress = episode ? this.captureProgressFor(flight, episode) : undefined;
     const captureSignal = opts.heldAuthenticated?.signal ?? opts.heldCapture?.signal ?? opts.dispositionSignal;
     const failCapture = async (error: unknown, options: { keepCustody?: boolean } = {}): Promise<void> => {
@@ -17468,6 +17500,7 @@ export class RunRunner {
             deferral ? { kind: deferral } : cause,
             { ...opts, episode: captureEpisode, heldCapture: held, freeFallback: true });
         }, async error => {
+          this.validateJoinedCapture(flight, captureEpisode);
           const settled = this.captureProgressFor(flight, captureEpisode);
           // Private callback provenance survives safety wrapping; reporting starts only after join.
           if (settled.control) throw settled.control.error;
@@ -18137,6 +18170,7 @@ export class RunRunner {
           // Issue #2014: the usage tail lands before the park report (flush drains the usage recorder
           // first, bounded by USAGE_DRAIN_DEADLINE_MS); the batcher stays open for the park's feed lines.
           await batcher.flush(captureSignal).catch(() => undefined);
+          await this.settleCaptureRequest(flight, opts.heldAuthenticated);
           if (providerTyped) providerTypedSent = true;
           if (progress) progress.dispositionStarted = true;
           captureSignal?.throwIfAborted();
@@ -18265,6 +18299,11 @@ export class RunRunner {
           // ownership: returning while it is still running would strand the row
           // because this healthy worker's heartbeats prevent stale-worker requeue.
         } catch (reportError) {
+          // A refused held cleanup checkpoint cannot be retried inside its own poisoned
+          // callback. Join the parent before any free proof or retained disposition.
+          if (opts.heldAuthenticated && (reportError instanceof CheckpointUnsafeCleanupError ||
+              isCodexBoundaryError(reportError) || opts.heldAuthenticated.signal.aborted ||
+              Date.now() >= opts.heldAuthenticated.deadlineAt)) throw reportError;
           if ((credentialDeferred || opts.terminalDisk) && reportError instanceof StaleClaimError) {
             // #1247: the run moved on under this worker. Stop silently; issue #1786: the clone is kept
             // even when covered (no write through the stale claim).
@@ -18976,6 +19015,7 @@ export class RunRunner {
   ): Promise<RecoveryCaptureResult> {
     if (opts.heldAuthenticated) {
       this.assertHeldAuthenticatedCapture(flight, opts.heldAuthenticated);
+      await this.settleCaptureRequest(flight, opts.heldAuthenticated);
       return this.captureRecoveryRestorePointBody(claim, flight, runLog, site, {
         ...opts, signal: opts.heldAuthenticated.signal,
       });
@@ -19133,6 +19173,9 @@ export class RunRunner {
     }
     if (opts.episode && opts.heldAuthenticated) {
       this.assertHeldAuthenticatedCapture(flight, opts.heldAuthenticated);
+      this.captureProgressFor(flight, opts.episode).localBinding = {
+        safety: opts.heldAuthenticated.safety, permit: opts.heldAuthenticated.permit,
+      };
       this.captureProgressFor(flight, opts.episode).local = {
         kind: "recovery", result: { verified: true, published: false, capturedHead },
       };
@@ -19244,6 +19287,7 @@ export class RunRunner {
       await this.settleGuardedCommands(flight.executor);
       flight.executor.killAgentTree?.();
     }
+    if (options.dispositionOnly && options.episode) this.validateJoinedCapture(flight, options.episode);
     const progress = options.episode ? this.captureProgressFor(flight, options.episode) : undefined;
     if (options.dispositionOnly && !progress) throw new TrustedExecutionRefusal("capture disposition unavailable");
     // Cancellation only releases this hold's provisional retention. Existing custody and stale
@@ -19344,7 +19388,9 @@ export class RunRunner {
     flight.parked = false;
     flight.holdOrWallParkConfirmed = false;
     let status: unknown;
+    await this.settleCaptureRequest(flight, options.heldAuthenticated);
     try {
+      options.signal?.throwIfAborted();
       if (progress) progress.dispositionStarted = true;
       const ack = await this.client.requestCompletionHold(flight.runId, {
         head,
@@ -19576,6 +19622,7 @@ export class RunRunner {
       await this.settleGuardedCommands(flight.executor);
       flight.executor.killAgentTree?.();
     }
+    if (options.dispositionOnly && options.episode) this.validateJoinedCapture(flight, options.episode);
     const progress = options.episode ? this.captureProgressFor(flight, options.episode) : undefined;
     if (options.dispositionOnly && !progress) throw new TrustedExecutionRefusal("capture disposition unavailable");
     // 2. Retain EVERYTHING up front (D4/D17): the wall park NEVER fails, so — unlike the completion
@@ -19663,6 +19710,7 @@ export class RunRunner {
     };
     let ack: Awaited<ReturnType<WorkerClient["reportWallPark"]>> | undefined;
     for (let attempt = 0; attempt < 2; attempt++) {
+      await this.settleCaptureRequest(flight, options.heldAuthenticated);
       try {
         options.signal?.throwIfAborted();
         if (progress) progress.dispositionStarted = true;
@@ -19935,6 +19983,7 @@ export class RunRunner {
   ): Promise<{ verified: boolean; published: boolean; mode: "same_worker_only"; head: string | null; residueBlocked?: boolean }> {
     if (options.heldAuthenticated) {
       this.assertHeldAuthenticatedCapture(flight, options.heldAuthenticated);
+      await this.settleCaptureRequest(flight, options.heldAuthenticated);
       options = { ...options, signal: options.heldAuthenticated.signal };
     }
     else if (options.heldCapture) this.assertHeldFreeCapture(flight, options.heldCapture);
@@ -20018,6 +20067,9 @@ export class RunRunner {
     }
     if (options.episode && options.heldAuthenticated) {
       this.assertHeldAuthenticatedCapture(flight, options.heldAuthenticated);
+      this.captureProgressFor(flight, options.episode).localBinding = {
+        safety: options.heldAuthenticated.safety, permit: options.heldAuthenticated.permit,
+      };
       this.captureProgressFor(flight, options.episode).local = {
         kind: "hold", result: { verified: true, published: false, mode: "same_worker_only", head },
       };

@@ -448,7 +448,16 @@ authority. See [ADR-1597's residual boundaries](1597-midturn-checkpoint-durabili
   Git spawners join full child cleanup. New acquisitions order sink gate, safety,
   then bare lock; already-held finalize preserves its original order and deadline.
   The private authenticated capability is bound to the exact flight, executor and
-  safety facade and expires with its callback. Both finalize hold branches use a
+  safety facade and expires with its callback. Before capture-dependent requests,
+  the existing safety facade settles owned children while keeping the permit held;
+  recovery's ACK-conditioned source settlement stays inside that same callback.
+  Saved local verification reused after unwind requires a matching joined-cleanup
+  witness for the actual facade and permit. An independent poison invalidates it,
+  including empty or capped diagnostic writes; later expiry cannot erase that fact.
+  Only the facade's known deadline paths with affirmative full-root cleanup preserve
+  local evidence through expiry. These observations grant no launch, credential or
+  terminal-retirement authority and never reopen admission.
+  Both finalize hold branches use a
   private one-shot continuation after the parent boundary joins; error names,
   causes and actionError fields cannot issue it. Continuation replays neither
   publication nor an ACK.
