@@ -624,6 +624,7 @@ interface CaptureProgress {
   localBinding?: { safety: CodexExecutionSafety; permit: BoundaryPermit };
   failure?: { issued: object; error: unknown; options: { keepCustody?: boolean } };
   control?: { issued: object; error: unknown };
+  provisionalCancel?: { held: HeldAuthenticatedCapture; error: Error };
   dispositionStarted: boolean;
   parkAcknowledged: boolean;
   holdOutcome?: boolean;
@@ -7098,8 +7099,10 @@ export class RunRunner {
       const episode = this.newCaptureEpisode(flight, heldCapture?.deadlineAt);
       let finishing = false;
       let captureSignal: AbortSignal | undefined;
+      let entered: HeldAuthenticatedCapture | undefined;
       try {
         const capture = (scoped?: HeldAuthenticatedCapture) => {
+          entered = scoped;
           captureSignal = scoped?.signal;
           return this.enterCompletionHold(flight, claim, holdReason, runLog, {
             ...options, signal: scoped?.signal ?? options.signal, episode, heldAuthenticated: scoped,
@@ -7115,6 +7118,16 @@ export class RunRunner {
         // The failed private capture invocation, not an error's name/fields,
         // authorizes this handoff. Other phasePublish/finish failures cannot issue it.
         if (!heldCapture || !captureContinuation || finishing) throw error;
+        if (entered && progress.provisionalCancel?.held === entered &&
+            progress.provisionalCancel.error === error && !captureContinuation.pending) {
+          const actual = entered;
+          // The finalize owner invokes this only after its entire boundary joins.
+          captureContinuation.pending = async () => {
+            if (!this.cleanJoinedProvisionalCancel(flight, episode, actual, error)) this.retainCaptureSource(flight);
+            throw error;
+          };
+          throw captureContinuation.unwind;
+        }
         if (error instanceof CheckpointUnsafeCleanupError) progress.local = undefined;
         this.retainCaptureSource(flight);
         this.captureAuthority(flight, Infinity);
@@ -15097,6 +15110,19 @@ export class RunRunner {
       }));
   }
 
+  /** Avoid adding B retention only; existing artifact owners keep their guards. */
+  private cleanJoinedProvisionalCancel(flight: RunFlight, episode: CaptureEpisode,
+    held: HeldAuthenticatedCapture, error: unknown): boolean {
+    const progress = this.captureProgressFor(flight, episode);
+    return progress.provisionalCancel?.held === held && progress.provisionalCancel.error === error &&
+      !progress.dispositionStarted && held.executor === flight.executor && held.safety === flight.executor.safety &&
+      flight.steering.isCancelled() && flight.steering.claimFence() === undefined &&
+      !flight.active?.shuttingDown && !this.shutdownSignal.signal.aborted &&
+      !held.permit.signal.aborted && Date.now() < episode.healthyDeadlineAt &&
+      Date.now() < episode.deadlineAt && !this.captureRetentions.has(flight) &&
+      acceptsJoinedCaptureCleanup(held.safety, held.permit);
+  }
+
   private retainCaptureSource(flight: RunFlight): void {
     this.captureRetentions.add(flight);
     flight.preserveRecoveryClone = true;
@@ -15163,6 +15189,9 @@ export class RunRunner {
     handoffDeferral?: (error: unknown) => Promise<T>,
   ): Promise<T> {
     const progress = this.captureProgressFor(flight, episode);
+    let entered: HeldAuthenticatedCapture | undefined;
+    const cleanProvisionalCancel = (error: unknown): boolean =>
+      !!entered && this.cleanJoinedProvisionalCancel(flight, episode, entered, error);
     return this.runGatedSink(flight, async () => {
       let actionCompleted = false;
       let interrupted = false;
@@ -15185,6 +15214,7 @@ export class RunRunner {
           if (!permit) throw new TrustedExecutionRefusal("capture boundary permit missing");
           value = await this.withAuthenticatedCaptureProof(flight, permit,
             Math.min(deadlineAt!, episode.healthyDeadlineAt), async held => {
+              entered = held;
               try { return await primary(held); }
               catch (error) {
                 interrupted = canonicalRecoveryInterruption(error) && !isCodexBoundaryError(error) &&
@@ -15201,6 +15231,7 @@ export class RunRunner {
         return value;
       } catch (error) {
         this.validateJoinedCapture(flight, episode);
+        if (cleanProvisionalCancel(error)) throw error;
         // A recorded wall cancellation hands off to its independent producer after
         // join. Do not add B's inventory prohibition to that producer's existing guards.
         if (progress.wallOutcome === "cancelled" && flight.steering.isCancelled() &&
@@ -15233,6 +15264,7 @@ export class RunRunner {
         throw new TrustedExecutionRefusal("capture fallback did not observe an empty scope");
       }
     }).catch(async error => {
+      if (cleanProvisionalCancel(error)) throw error;
       if (progress.wallOutcome === "cancelled" && flight.steering.isCancelled() &&
           flight.steering.claimFence() === undefined) throw error;
       this.retainCaptureSource(flight);
@@ -19323,9 +19355,14 @@ export class RunRunner {
     const previousSession = flight.preserveSession;
     const checkCancellation = (): void => {
       if (!flight.steering.isCancelled()) return;
-      flight.preserveRecoveryClone = previousClone;
-      flight.preserveSession = previousSession;
-      throw new Error("run cancelled");
+      flight.preserveRecoveryClone = previousClone || this.captureRetentions.has(flight);
+      flight.preserveSession = previousSession || this.captureRetentions.has(flight);
+      const error = new Error("run cancelled");
+      if (progress && !progress.dispositionStarted && options.heldAuthenticated &&
+          this.authenticatedCaptureFlights.get(options.heldAuthenticated) === flight) {
+        progress.provisionalCancel = { held: options.heldAuthenticated, error };
+      }
+      throw error;
     };
     checkCancellation();
     // Retain clone and session throughout capture and ambiguous delivery.
@@ -19348,6 +19385,8 @@ export class RunRunner {
     // `residueBlocked`) takes the same path.
     const holdQuiescence = options.dispositionOnly ? undefined :
       await this.quiesceRun(flight, flight.executor, { mode: "own", site: "completion_hold" });
+    if (holdQuiescence?.blocked && (options.heldAuthenticated || options.heldCapture))
+      this.retainCaptureSource(flight);
     checkCancellation();
     if (holdQuiescence?.blocked && (options.heldAuthenticated || options.heldCapture))
       throw new RunResidueBlockedError("completion capture process proof unavailable");
@@ -19371,6 +19410,8 @@ export class RunRunner {
           ? await this.git.withRecoveryOperation(options.heldAuthenticated.signal, options.episode.healthyDeadlineAt,
             () => this.captureHoldContext(claim, flight, runLog, options))
           : await this.captureHoldContext(claim, flight, runLog, options);
+        if (result.residueBlocked && (options.heldAuthenticated || options.heldCapture))
+          this.retainCaptureSource(flight);
         checkCancellation();
         if (result.residueBlocked) {
           captured = residueHold("after_runner_git");
@@ -19381,6 +19422,9 @@ export class RunRunner {
           break;
         }
       } catch (captureError) {
+        if ((options.heldAuthenticated || options.heldCapture) &&
+            (captureError instanceof RunResidueBlockedError || captureError instanceof CheckpointUnsafeCleanupError ||
+              isCodexBoundaryError(captureError))) this.retainCaptureSource(flight);
         checkCancellation();
         if (options.heldAuthenticated || options.heldCapture) {
           this.retainCaptureSource(flight);
@@ -20084,6 +20128,7 @@ export class RunRunner {
     // fetch and the publish; blocked → `residueBlocked`, which the caller maps onto its own
     // blocked semantics (the hold stands with an empty head; the wall park goes degraded).
     if (await this.reproveAfterRunnerGit(flight, "hold_capture")) {
+      if (options.heldAuthenticated || options.heldCapture) this.retainCaptureSource(flight);
       runLog.warn("completion hold capture: clone not provably quiescent after the WIP marker; nothing captured or published");
       return { ...NONE, residueBlocked: true };
     }
