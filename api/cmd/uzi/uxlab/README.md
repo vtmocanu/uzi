@@ -174,6 +174,12 @@ keeps the harness from becoming a second maintained TUI, the fate of the retired
 
 ## Fixture-only interactive PTY check
 
+From the primary checkout root, run the terminal interpreter unit controls:
+
+```sh
+python3 -B -m unittest discover -s api/cmd/uzi/uxlab -p demo_pty_test.py -v
+```
+
 Drive an **already compiled candidate** without a server or credentials.
 From the primary checkout root, run one bounded
 command (replace the binary path with the executable from the exact candidate

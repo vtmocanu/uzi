@@ -28,6 +28,7 @@ class Screen:
         self.cells = [[" "] * cols for _ in range(rows)]
         self.x = self.y = 0
         self.saved = (0, 0)
+        self.margin_top, self.margin_bottom = 0, rows - 1
         self.pending = ""
         self.last = " "
 
@@ -37,16 +38,17 @@ class Screen:
         self.cells += [[" "] * cols for _ in range(rows - len(self.cells))]
         self.cols, self.rows = cols, rows
         self.x, self.y = min(self.x, cols - 1), min(self.y, rows - 1)
+        self.margin_top, self.margin_bottom = 0, rows - 1
 
     def text(self):
         return "\n".join("".join(row).rstrip() for row in self.cells)
 
     def linefeed(self):
-        self.y += 1
-        if self.y >= self.rows:
-            self.cells.pop(0)
-            self.cells.append([" "] * self.cols)
-            self.y = self.rows - 1
+        if self.y == self.margin_bottom:
+            self.cells.pop(self.margin_top)
+            self.cells.insert(self.margin_bottom, [" "] * self.cols)
+        else:
+            self.y = min(self.y + 1, self.rows - 1)
 
     def put(self, ch):
         if unicodedata.combining(ch) or ch in ("\ufe0e", "\ufe0f", "\u200d"):
@@ -94,7 +96,14 @@ class Screen:
             return
         if private:
             raise AssertionError(f"unsupported private CSI {body!r}{op}")
-        if op in ("H", "f"):
+        if op == "r":  # DECSTBM; origin mode is off, so home is screen (0, 0).
+            top = nums[0] or 1
+            bottom = (nums[1] or self.rows) if len(nums) > 1 else self.rows
+            if len(nums) > 2 or not 1 <= top < bottom <= self.rows:
+                raise AssertionError(f"unsupported scroll region {body!r}")
+            self.margin_top, self.margin_bottom = top - 1, bottom - 1
+            self.x = self.y = 0
+        elif op in ("H", "f"):
             self.y = min(self.rows - 1, max(0, n - 1))
             self.x = min(self.cols - 1, max(0, (nums[1] or 1) - 1)) if len(nums) > 1 else 0
         elif op in ("A", "B", "C", "D", "E", "F", "G", "d", "\x60"):
@@ -129,6 +138,32 @@ class Screen:
                 0: (x, self.cols), 1: (0, x + 1), 2: (0, self.cols)
             }[nums[0]]
             self.cells[self.y][start:end] = [" "] * (end - start)
+        elif op == "P":  # DCH: close the gap on this row and blank its right edge.
+            col = min(self.x, self.cols - 1)
+            count = min(n, self.cols - col)
+            self.cells[self.y][col:] = self.cells[self.y][col + count:] + [" "] * count
+        elif op == "S":  # SU: scroll the entire region without moving the cursor.
+            count = min(n, self.margin_bottom - self.margin_top + 1)
+            self.cells[self.margin_top:self.margin_bottom + 1] = (
+                self.cells[self.margin_top + count:self.margin_bottom + 1] +
+                [[" "] * self.cols for _ in range(count)])
+        elif op == "T":  # SD: scroll down without moving the cursor.
+            count = min(n, self.margin_bottom - self.margin_top + 1)
+            self.cells[self.margin_top:self.margin_bottom + 1] = (
+                [[" "] * self.cols for _ in range(count)] +
+                self.cells[self.margin_top:self.margin_bottom + 1 - count])
+        elif op == "L":  # IL: insert only within the configured scroll region.
+            if self.margin_top <= self.y <= self.margin_bottom:
+                count = min(n, self.margin_bottom - self.y + 1)
+                self.cells[self.y:self.margin_bottom + 1] = (
+                    [[" "] * self.cols for _ in range(count)] +
+                    self.cells[self.y:self.margin_bottom + 1 - count])
+        elif op == "M":  # DL: pull following region rows up and blank the bottom.
+            if self.margin_top <= self.y <= self.margin_bottom:
+                count = min(n, self.margin_bottom - self.y + 1)
+                self.cells[self.y:self.margin_bottom + 1] = (
+                    self.cells[self.y + count:self.margin_bottom + 1] +
+                    [[" "] * self.cols for _ in range(count)])
         elif op in ("s", "u"):
             if op == "s":
                 self.saved = (self.x, self.y)
@@ -174,6 +209,12 @@ class Screen:
                     self.saved = (self.x, self.y)
                 elif op == "8":
                     self.x, self.y = self.saved
+                elif op == "M":  # RI: scroll down only at the top margin.
+                    if self.y == self.margin_top:
+                        self.cells.pop(self.margin_bottom)
+                        self.cells.insert(self.margin_top, [" "] * self.cols)
+                    else:
+                        self.y = max(0, self.y - 1)
                 elif op == "D":
                     self.linefeed()
                 elif op == "E":
@@ -352,13 +393,16 @@ def scenario(d):
         d.resize(cols, rows)
         footer = "ctrl+w focus" if rows == 60 else "enter/→ worker"
         d.check(f"resize-{cols}x{rows}", lambda s: selected("recovery")(s) and footer in s.splitlines()[-1])
-    d.check("bottom-focus", contains("[pulls]", "ctrl+w focus"), b"\x17")
-    d.check("top-focus", lambda s: "[workers]" in s and "[pulls]" not in s, b"\x17")
+    # The shipped default bottom pane is CI (workers navigation contract).
+    d.check("bottom-focus", contains("[ci]", "tab pane", "R repo"), b"\x17")
+    d.check("top-focus", lambda s: "[workers]" in s and "[ci]" not in s and
+            "ctrl+w focus" in s, b"\x17")
     d.check("split-collapsed", lambda s: "ctrl+w focus" not in s and selected("recovery")(s), b"s")
     d.check("split-restored", contains("ctrl+w focus", "selected recovery"), b"s")
     d.resize(120, 34)
     d.check("return-small", contains("enter/→ worker", "selected recovery"))
-    d.check("floor", contains("floor", "scheduler"), b"1")
+    # The board truncates the title; use the visible issue coordinate.
+    d.check("floor", contains("floor", "#418", "? keys"), b"1")
     d.check("scheduler-filter", contains("scheduler"), b"/scheduler")
     # Enter accepts the filter, then opens the selected live run.
     d.check("scheduler-filter-accepted", contains("scheduler", "418"), b"\r")
@@ -367,6 +411,11 @@ def scenario(d):
     d.check("tab-transcript", contains("▎TRANSCRIPT"), b"\t")
     d.check("left-crew", contains("▎CREW"), b"\x1b[D")
     d.check("right-transcript", contains("▎TRANSCRIPT"), b"\x1b[C")
+    # Page Up only pauses a scrollable transcript; establish overflow first.
+    d.check("live-history-before-resize", contains("Planning the change", "⇣ following"))
+    d.resize(120, 12)
+    d.check("compact-live-viewport", lambda s: "▎TRANSCRIPT" in s and
+            "⇣ following" in s and "Planning the change" not in s)
     paused = d.check("paused", contains("⏸", "g", "new"), b"\x1b[5~")
     before = int(re.search(r"(\d+) new", paused)[1])
     d.check("live-ticks-while-paused",
