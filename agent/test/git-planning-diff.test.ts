@@ -91,7 +91,10 @@ async function fixture(options: {
   dispose: () => Promise<void>;
 }> {
   const data = await fixtureIO.temporaryDirectory("planning-fixture-");
-  const protectedRoot = await nativeFs.mkdtemp(path.join(await nativeFs.realpath(os.tmpdir()), "planning-protected-"));
+  // Under the UID split each identity's TMPDIR is a private 0700 directory, so the worker-owned
+  // protected root goes in their shared parent, which the runner can traverse but not write.
+  const protectedParent = uidSplitActive() ? path.dirname(os.tmpdir()) : os.tmpdir();
+  const protectedRoot = await nativeFs.mkdtemp(path.join(await nativeFs.realpath(protectedParent), "planning-protected-"));
   await nativeFs.chmod(protectedRoot, 0o755);
   let clone = "";
   try {
