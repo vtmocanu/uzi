@@ -156,9 +156,31 @@ func TestCheckpointCoordinatesContractLiveDB(t *testing.T) {
 			if storedPair.WorkBranch != *c.WorkBranch || storedPair.CheckpointKey != *c.CheckpointKey {
 				t.Fatalf("stored pair disagrees: %s", stored)
 			}
-			model := store.Run{ID: pair.RunID, UserID: owner, RepoID: pgconv.UUID(repo), Kind: pair.Kind, CheckpointCoordinates: raw}
-			if pair.IssueIID != nil {
-				model.IssueIid = pgconv.Int8Ptr(pair.IssueIID)
+			// Identity is a fixture oracle too: do not construct the Go model
+			// from SQL-produced identity fields and thereby validate SQL against itself.
+			rootID := uuid.MustParse(root["id"].(string))
+			var expectedIID *int64
+			if value, ok := root["issue_iid"].(float64); ok {
+				iid := int64(value)
+				expectedIID = &iid
+			}
+			if pair.Version != 1 || pair.RunID != rootID || pair.UserID != owner ||
+				pair.RepoID != repo || pair.Kind != root["kind"] ||
+				(pair.IssueIID == nil) != (expectedIID == nil) ||
+				(expectedIID != nil && *pair.IssueIID != *expectedIID) {
+				t.Fatalf("SQL fixture identity mismatch: %s", raw)
+			}
+			if len(pair.Provenance) != len(c.Nodes) {
+				t.Fatalf("provenance length=%d want=%d", len(pair.Provenance), len(c.Nodes))
+			}
+			for i, node := range c.Nodes {
+				if pair.Provenance[i] != uuid.MustParse(node["id"].(string)) {
+					t.Fatalf("provenance[%d]=%s want fixture node %s", i, pair.Provenance[i], node["id"])
+				}
+			}
+			model := store.Run{ID: rootID, UserID: owner, RepoID: pgconv.UUID(repo), Kind: root["kind"].(string), CheckpointCoordinates: raw}
+			if expectedIID != nil {
+				model.IssueIid = pgconv.Int8Ptr(expectedIID)
 			}
 			decoded, err := frozenCheckpointCoordinates(model)
 			if err != nil || (decoded != nil) != *c.Eligible || decoded.WorkBranch != *c.WorkBranch || decoded.CheckpointKey != *c.CheckpointKey {

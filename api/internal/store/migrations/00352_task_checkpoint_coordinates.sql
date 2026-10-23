@@ -187,11 +187,18 @@ $$ LANGUAGE plpgsql;
 
 ALTER TABLE run_salvage DROP CONSTRAINT run_salvage_branch_format_check;
 ALTER TABLE run_salvage ADD CONSTRAINT run_salvage_branch_format_check
-    CHECK (branch ~ '^(agent/issue-[0-9]+|uzi/(self-improve|task)/[0-9a-f-]{36})$');
+    CHECK (branch ~ '^(agent/issue-[0-9]+|uzi/(self-improve|task)/[0-9a-f-]{36})$') NOT VALID;
 
 -- +goose Down
+-- Exclude concurrent enrollment before checking the sticky descriptor. The next
+-- statement takes a fresh READ COMMITTED snapshot after this lock is acquired.
+LOCK TABLE runs IN ACCESS EXCLUSIVE MODE;
 -- +goose StatementBegin
 DO $$ BEGIN
+    -- A stricter isolation level could retain a snapshot from before the lock.
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'checkpoint schema downgrade requires READ COMMITTED';
+    END IF;
     IF EXISTS (SELECT 1 FROM runs WHERE checkpoint_coordinates IS NOT NULL) THEN
         RAISE EXCEPTION 'cannot downgrade with enrolled checkpoint coordinates';
     END IF;

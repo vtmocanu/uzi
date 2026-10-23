@@ -25,6 +25,15 @@ func TestCheckpointCoordinatesHeldMetadataLiveDB(t *testing.T) {
 				if err != nil || n != 1 {
 					t.Fatalf("approval metadata: rows=%d err=%v", n, err)
 				}
+				input, err := env.q.CreateApprovePlanInput(env.ctx, store.CreateApprovePlanInputParams{
+					RunID: run.ID, Body: pgconv.Text("{}"), AgentSource: pgconv.Text("own"),
+					AgentExclusions: []byte("[]"), RunMaxIterations: 5,
+					SizeBudgetFactorL: 2, MilestoneBudgetCap: 10,
+					RunTimeoutSeconds: 7200, BudgetWallCeilingSeconds: 28800,
+				})
+				if err != nil || input.RunID != run.ID || input.Kind != "approve_plan" {
+					t.Fatalf("held approval input=%+v err=%v", input, err)
+				}
 			}
 			n, err := env.q.UpdateRunLastSeq(env.ctx, store.UpdateRunLastSeqParams{
 				ID: run.ID, Seq: 7, ClaimGeneration: pgconv.Int8Ptr(&run.ClaimGeneration),
