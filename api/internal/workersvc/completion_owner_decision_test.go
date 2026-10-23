@@ -8,6 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -311,9 +312,11 @@ func TestValidateDecision(t *testing.T) {
 	})
 
 	t.Run("authorize_maintainer on a structural contract is invalid", func(t *testing.T) {
-		// The structural fixture reaches the profile guard (completionPendingFromContract returns
-		// nil, nil for a structural profile, so the revision-conflict arm is not taken). The guard
-		// refuses with the bare ErrCompletionDecisionInvalid, even for a well-formed decision.
+		// The plain structural fixture passes completionPendingFromContract (nil, nil), so the
+		// revision-conflict arm is not taken, and authorize_maintainer is refused with the bare
+		// ErrCompletionDecisionInvalid. This subtest alone does NOT isolate the profile guard:
+		// validateMaintainerSelection also returns that sentinel for an empty Maintainers list.
+		// See the "maintainer-bearing structural contract" subtest for the guard's reachability.
 		err := validateDecision(lockedRev1, CompletionDecisionInput{
 			Decision: "authorize_maintainer", Reason: "r", ContractRevision: 1,
 		}, frozenMs)
@@ -321,7 +324,46 @@ func TestValidateDecision(t *testing.T) {
 			t.Fatalf("authorize_maintainer on a structural contract: want ErrCompletionDecisionInvalid, got %v", err)
 		}
 		if errors.Is(err, ErrCompletionRevisionConflict) {
-			t.Fatalf("authorize_maintainer must be refused by the profile guard, not the revision-conflict arm: %v", err)
+			t.Fatalf("authorize_maintainer on a plain structural contract must not be a revision conflict: %v", err)
+		}
+	})
+
+	t.Run("authorize_maintainer on a maintainer-bearing structural contract", func(t *testing.T) {
+		// Give a structural-profile contract a maintainer criterion and a decision that matches it
+		// exactly, so validateMaintainerSelection alone would accept the decision.
+		var c completionContract
+		if err := json.Unmarshal(lockedRev1.CompletionContract, &c); err != nil {
+			t.Fatalf("unmarshal fixture: %v", err)
+		}
+		if c.Profile == "semantic" {
+			t.Fatalf("fixture must be a non-semantic profile, got %q", c.Profile)
+		}
+		c.Criteria[0].Kind = "maintainer"
+		c.Criteria[0].Maintainer = &apitypes.SemanticMaintainer{
+			Reason: "owner infrastructure", Conditions: []string{"deployment available"}, VerificationSteps: []string{"observe rollout"},
+		}
+		raw, err := json.Marshal(c)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		run := lockedRev1
+		run.CompletionContract = raw
+		dec := CompletionDecisionInput{
+			Decision: "authorize_maintainer", Reason: "r", ContractRevision: 1,
+			Maintainers: semanticMaintainers(c),
+		}
+		// Control: the selection check by itself accepts this decision, so only an earlier arm of
+		// validateDecisionFromContract can be refusing it.
+		if err := validateMaintainerSelection(c, dec); err != nil {
+			t.Fatalf("control: validateMaintainerSelection must accept the matching selection: %v", err)
+		}
+		// Observed behaviour: semantic fields on a non-semantic contract are rejected by
+		// completionPendingFromContract first, so validateDecision returns a revision conflict and
+		// never reaches the profile guard. The guard is therefore shadowed for this input and no
+		// validateDecision input isolates it from the earlier arm.
+		err = validateDecision(run, dec, frozenMs)
+		if !errors.Is(err, ErrCompletionRevisionConflict) {
+			t.Fatalf("maintainer-bearing structural contract: want ErrCompletionRevisionConflict, got %v", err)
 		}
 	})
 

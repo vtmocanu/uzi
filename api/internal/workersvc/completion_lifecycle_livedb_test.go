@@ -675,7 +675,8 @@ func TestCompletionLifecycleKillSwitchAfterCreateLiveDB(t *testing.T) {
 	})
 
 	t.Run("legacy run stays legacy after the switch goes true", func(t *testing.T) {
-		// The switch is still false from the previous subtest; the run is created under it.
+		// Set the switch false here so this subtest passes when run alone.
+		setInterlockSetting(t, f.env, "false")
 		f.freshSettings()
 		r := f.createRun(t)
 		assertContractVersion(t, f.env, r.id, false)
@@ -704,8 +705,9 @@ func TestCompletionLifecycleKillSwitchAfterCreateLiveDB(t *testing.T) {
 }
 
 // TestCompletionLifecycleAuthorizeMaintainerRefusedLiveDB (PRD #1232 M1 (f)): authorize_maintainer
-// is a semantic-profile decision. On a structural held run DecideCompletion refuses it with
-// ErrCompletionDecisionInvalid and writes nothing.
+// is a semantic-profile decision. On a structural held run DecideCompletion refuses it with the
+// bare ErrCompletionDecisionInvalid and writes nothing. The sentinel alone does not show which
+// check refused it (an empty Maintainers list yields the same one).
 func TestCompletionLifecycleAuthorizeMaintainerRefusedLiveDB(t *testing.T) {
 	f := newLifecycleFixture(t, HarnessClaude)
 	r := f.reachFrozenRunning(t, []string{}, []string{capability.CompletionInterlockV1}, 5)
@@ -719,7 +721,7 @@ func TestCompletionLifecycleAuthorizeMaintainerRefusedLiveDB(t *testing.T) {
 		t.Fatalf("authorize_maintainer on a structural held run: err=%v, want ErrCompletionDecisionInvalid", err)
 	}
 	if errors.Is(err, ErrCompletionRevisionConflict) {
-		t.Fatalf("the refusal must come from the profile guard, not the revision fence: %v", err)
+		t.Fatalf("the refusal must be the bare decision-invalid sentinel, not the revision fence: %v", err)
 	}
 	if got := r.row(t).ContractRevision; !got.Valid || got.Int32 != 1 {
 		t.Fatalf("contract_revision = %+v after the refused decision, want 1", got)

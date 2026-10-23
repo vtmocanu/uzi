@@ -32,8 +32,9 @@ import (
 //   - a missing/empty reason → 400 (handler shape validation, before the service);
 //   - an unknown milestone/criterion id → 400 (ErrCompletionDecisionInvalid);
 //   - a stale fenced contract_revision → 409 (ErrCompletionRevisionConflict);
-//   - authorize_maintainer on this structural run → 400 whose body is exactly the service sentinel
-//     (the profile guard in validateDecisionFromContract), not a decode or shape 400 (PRD #1232 M1 (f)).
+//   - authorize_maintainer on this structural run → 400 whose body is exactly the bare service sentinel
+//     (ErrCompletionDecisionInvalid), not a decode or shape 400 (PRD #1232 M1 (f)). The sentinel is
+//     also what an empty Maintainers selection yields, so this does not isolate the profile guard.
 //
 // Every case is an error path (none commits), so the seeded run stays at revision 1 and is reused;
 // the foreign cases additionally assert the run is unchanged (no owner-bypass write).
@@ -128,9 +129,10 @@ func TestCompletionDecisionHandlerStatusMappingLiveDB(t *testing.T) {
 		{"accept stale revision is 409", owner,
 			completionDecisionRequest{Decision: "accept", Criteria: []string{"m1.c1"}, Reason: "r", ContractRevision: 7}, http.StatusConflict, ""},
 		// authorize_maintainer on this structural-profile run: a well-formed request (decodes, has a
-		// reason, fences on the live revision) that only the service's profile guard refuses. The
-		// exact bare sentinel text distinguishes it from every other 400 this handler can produce.
-		{"authorize_maintainer on a structural run is 400 from the profile guard", owner,
+		// reason, fences on the live revision) that the service refuses with the bare sentinel. The
+		// exact text distinguishes it from the handler's own decode and shape 400s, not from
+		// validateMaintainerSelection's identical sentinel (the empty Maintainers list).
+		{"authorize_maintainer on a structural run is 400 with the bare sentinel", owner,
 			completionDecisionRequest{Decision: "authorize_maintainer", Reason: "r", ContractRevision: 1},
 			http.StatusBadRequest, workersvc.ErrCompletionDecisionInvalid.Error()},
 	}
