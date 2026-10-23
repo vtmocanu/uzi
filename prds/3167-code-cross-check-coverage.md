@@ -1,6 +1,6 @@
 # PRD #3167: Code cross-check coverage account and measured depth
 
-**Status**: Draft. Child 2 of 3 under umbrella #3165 (Deeper, observable cross-check). PRD #3166 is done (2026-10-21). M1 has no blocker; M2 waits for M1; M3a waits for M1 and M2; M3b waits for M3a. M2 and M3a rebase onto PRD #3168 M1, which lands first (same file). Amended 2026-10-23 with acceptance-criteria findings (see Decision Log).
+**Status**: Draft. Child 2 of 3 under umbrella #3165 (Deeper, observable cross-check). PRD #3166 is done (2026-10-21). M1 has no blocker; M2 waits for M1; M3a waits for M1 and M2; M3b waits for M3a. M2 and M3a rebase onto PRD #3168 M1, which lands first (same file). Amended 2026-10-23 with acceptance-criteria findings (see Decision Log). 2026-10-23: the M1 harness, disclosed synthetic corpus and scorer landed via #3357 (see [Code cross-check replay](../docs/code-cross-check-replay.md)); M1 stays open until the maintainer posts the separately authorized baseline aggregate on this issue.
 
 Resolved facts below were read at `main` `bf21acdc`; facts added 2026-10-23 were read at `72c97fc7`.
 
@@ -86,3 +86,4 @@ Acceptance examples:
 - **Baseline rerun on new cases** (2026-10-23). Criterion cases added for M3b are scored against the pinned old brief before comparing, with separately authorized maintainer model calls.
 - **Milestones excerpt worker-only.** The claim already carries the frozen milestones under the candidate digest, so only the prompt changes.
 - **Order with PRD #3168.** Both edit `agent/src/codex/cross-check.ts` in different functions; PRD #3168 M1 lands first and M2/M3a here rebase onto it. M1's baseline is unaffected, since PRD #3168 does not touch the code brief.
+- **M1 corpus is disclosed synthetic** (owner decision 2026-10-23, #3357). Pre-fix states reconstructed from squash merges with pinned base/squash/tree/commit/removed hunks/checksums; synthetic issues and plans, milestones always []; #2887's macOS calibration defect not reconstructed (execution-only, excluded); scoring reports expected-defect matches as a proxy and unadjudicated findings, false positives only after maintainer adjudication; Codex replay is API-key only.

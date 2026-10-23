@@ -93,4 +93,4 @@ old baseline for those cases.
 ## Maintainer follow-up
 
 Outside issue #3357 (unnumbered): run the authorized real-model baseline and post the sanitized
-aggregate on #3167. See docs/code-cross-check-replay.md (written in a later unit) for the commands.
+aggregate on #3167. See [the replay docs](../../docs/code-cross-check-replay.md) for the commands.
