@@ -1947,6 +1947,21 @@ describe("U2 real runner checked gate", () => {
     assert.equal(gate.plan_cross_check_diff_refusal, "scan_failed");
   });
 
+  it("logs the refusal when the trusted bare authority is absent", async () => {
+    const { log, warnings } = diagnosticLogger();
+    let spawned = false;
+    git.capturePlanningDiff = async () => { spawned = true; return Buffer.alloc(0); };
+    const run = runnerWith(() => ({ executor: checkedExec().exec, homeDir }), fakeGitlab().gitlab, undefined, log) as unknown as {
+      captureCheckedPlanningDiff(clone: string, base: string, bare: string | undefined, signal: AbortSignal,
+        log: Logger): Promise<unknown> };
+    const got = await run.captureCheckedPlanningDiff("/nonexistent/clone", "a".repeat(40), undefined,
+      new AbortController().signal, log);
+    assert.deepEqual(got, { refusal: "base_unavailable", diagnostic: "bare_unavailable" });
+    assert.equal(spawned, false);
+    assert.deepEqual(warnings.filter((w) => w.message === "plan cross-check: planning diff refused").map((w) => w.fields),
+      [{ refusal: "base_unavailable", diagnostic: "bare_unavailable" }]);
+  });
+
   it("logs only the fixed refusal vocabulary and reports the sub-code in the gate reason", async () => {
     const c = claim();
     const hostile = "bounded runner process failed: UZI-PLANNING-REFUSAL unsupported_symlink\n"
@@ -1986,7 +2001,12 @@ describe("U2 real runner checked gate", () => {
     let scanned = "";
     const capture = git.capturePlanningDiff.bind(git);
     const scan = git.scanPatchForSecrets.bind(git);
-    git.capturePlanningDiff = async (clone, base) => { capturedBase = base; return capture(clone, base); };
+    git.capturePlanningDiff = async (clone, base, bare) => {
+      capturedBase = base;
+      assert.ok(bare);
+      assert.equal(path.basename(bare), path.basename(path.dirname(clone)) + ".git");
+      return capture(clone, base, bare);
+    };
     git.scanPatchForSecrets = async (diff) => { scanned = diff; return scan(diff); };
     api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body) });
     await start(checkedExec(async (ctx) => {

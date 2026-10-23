@@ -327,18 +327,19 @@ describe("runBadge taxonomy", () => {
   });
 });
 
-// PRD #1190: a run its owner paused. It falls to its own case (not the default arm, which
+// PRD #1190: an ordinary paused run. It falls to its own case (not the default arm, which
 // would draw a neutral "paused" indistinguishable from cancelled) — an INFO-toned
 // "‖ paused" badge carrying the same glyph StatusPill uses.
 describe("paused (PRD #1190)", () => {
   it("paused → info '‖ paused' badge, static (no elapsed)", () => {
     const b = runBadge(run({ status: "paused" }), NOW);
     expect(b.kind).toBe("badge");
-    if (b.kind === "badge") {
-      expect(b.label).toBe("‖ paused");
-      expect(b.tone).toBe("info");
-      expect(b.pulse).toBe(false);
-    }
+    if (b.kind !== "badge") throw new Error("paused must render a badge");
+    expect(b.label).toBe("‖ paused");
+    expect(b.tone).toBe("info");
+    expect(b.pulse).toBe(false);
+    expect(b.title).toBe("Paused. Resume it from the run page or with `uzi run resume`.");
+    expect(b.title).not.toContain("owner");
   });
 
   it("its badge is STATIC — identical on any nowMs, like the other holds", () => {
