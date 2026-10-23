@@ -204,6 +204,48 @@ func TestManualCordonHealthReadFailureRecovery(t *testing.T) {
 	}
 }
 
+func TestManualCordonOwnerPinnedReadFailureRecovery(t *testing.T) {
+	for _, age := range []time.Duration{time.Minute, time.Hour} {
+		t.Run(age.String(), func(t *testing.T) {
+			r := ownerHeldRun()
+			r.StatusSince = ago(age)
+			r.Health = healthWaitingWorker
+			r.HealthReason = pgtype.Text{
+				String: fmt.Sprintf("%s prior operator (%s) at %s: investigating capacity", manualCordonWaitPrefix, uuid.New(), t0.Add(-time.Hour).Format(time.RFC3339)),
+				Valid:  true,
+			}
+			r.HealthSince, r.HealthNotifiedAt = ago(30*time.Minute), ago(20*time.Minute)
+			fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}, eligibilityErr: errors.New("projection unavailable")}
+			svc, b := pinSvc(fs, defaultHealthSettings())
+			if n := svc.detectRunHealth(context.Background(), t0); n != 0 || len(fs.writes) != 0 || len(b.healthNudges) != 0 {
+				t.Fatalf("failed read changed manual episode: changes=%d writes=%+v nudges=%v", n, fs.writes, b.healthNudges)
+			}
+			got := fs.active[0]
+			if got.Health != r.Health || got.HealthReason != r.HealthReason || got.HealthSince != r.HealthSince || got.HealthNotifiedAt != r.HealthNotifiedAt || len(fs.eligibilityCalls) != 1 {
+				t.Fatalf("failed read lost manual evidence or episode: got=%+v calls=%d", got, len(fs.eligibilityCalls))
+			}
+			// A successful projection proves the assigned continuation can claim.
+			fs.eligibilityErr = nil
+			fs.eligibility = store.CountOnlineWorkersClaimableForRunRow{Claimable: 1, AssignedClaimable: 1}
+			fs.onlineWorkers, fs.freeSlotWorkers = 1, 1
+			if n := svc.detectRunHealth(context.Background(), t0.Add(time.Second)); n != 1 {
+				t.Fatalf("recovery changes=%d want 1", n)
+			}
+			w := lastWrite(t, fs, r.ID)
+			if age < 10*time.Minute {
+				if w.Health != healthOK || w.HealthReason.Valid || w.HealthSince.Valid {
+					t.Fatalf("young recovery did not clear: %+v", w)
+				}
+			} else if w.Health != healthWaitingWorker || w.HealthReason.String != reasonWaitingWorker || w.HealthSince != r.HealthSince {
+				t.Fatalf("aged recovery lost ordinary wait/episode: %+v", w)
+			}
+			if w.HealthNotifiedAt.Valid || len(b.healthNudges) != 1 || b.healthNudges[0] || len(fs.eligibilityCalls) != 2 {
+				t.Fatalf("recovery renotified or reread: write=%+v nudges=%v calls=%d", w, b.healthNudges, len(fs.eligibilityCalls))
+			}
+		})
+	}
+}
+
 func TestManualCordonYoungProjectionReadOnce(t *testing.T) {
 	evidence := mustJSON(t, map[string]any{"worker_id": uuid.New(), "actor_id": uuid.New(), "at": t0})
 	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{runRow("queued")}, eligibility: store.CountOnlineWorkersClaimableForRunRow{ManualSuitable: 1, ManualCordoned: 1, ManualContext: evidence}}
@@ -215,13 +257,16 @@ func TestManualCordonYoungProjectionReadOnce(t *testing.T) {
 }
 
 func TestManualCordonReadFailurePrerequisitePriority(t *testing.T) {
-	for _, mode := range []string{"vault", "custody", "account", "owner hold"} {
+	for _, mode := range []string{"vault", "custody", "account", "stale pin"} {
 		t.Run(mode, func(t *testing.T) {
 			r := ownerHeldRun()
 			r.StatusSince = ago(time.Hour)
 			r.Health = healthWaitingWorker
 			r.HealthReason = pgtype.Text{String: manualCordonWaitPrefix + " prior evidence", Valid: true}
-			r.OwnerHoldPinnable = mode == "owner hold"
+			r.StaleRequeuePinnable = mode == "stale pin"
+			if r.StaleRequeuePinnable {
+				r.StatusSince = ago(15 * time.Minute)
+			}
 			fs := &healthFakeStore{eligibilityErr: errors.New("projection unavailable")}
 			svc, _ := pinSvc(fs, defaultHealthSettings())
 			want := ""
@@ -235,8 +280,8 @@ func TestManualCordonReadFailurePrerequisitePriority(t *testing.T) {
 			case "account":
 				r.CodexAccountGated = true
 				want = reasonCodexAccountUnavailable
-			case "owner hold":
-				want = ownerHoldReason(r.UpdatedAt.Time.Add(svc.p.WorkerAffinityCeiling), r.StaleRequeueWorkerName)
+			case "stale pin":
+				want = staleRequeuePinReason(r.StatusSince.Time.Add(svc.p.WorkerStaleRequeueGrace), r.StaleRequeueWorkerName)
 			}
 			fs.active = []store.ListActiveRunsForHealthRow{r}
 			if n := svc.detectRunHealth(context.Background(), t0); n != 1 || lastWrite(t, fs, r.ID).HealthReason.String != want {
