@@ -1039,6 +1039,9 @@ jobs:
               - 'controller/**'
             agent:
               - 'agent/**'
+              # Runtime-stage COPY inputs outside agent/ also need image validation.
+              - 'scripts/sqlc.sh'
+              - 'scripts/check-worker-toolchain.py'
               - '.dockerignore'
               - '.github/workflows/ci.yml'
             worker_uid:
