@@ -359,8 +359,10 @@ func TestValidateDecision(t *testing.T) {
 		}
 		// Observed behaviour: semantic fields on a non-semantic contract are rejected by
 		// completionPendingFromContract first, so validateDecision returns a revision conflict and
-		// never reaches the profile guard. The guard is therefore shadowed for this input and no
-		// validateDecision input isolates it from the earlier arm.
+		// never reaches the profile guard. Deleting the guard is therefore behaviour-equivalent: this
+		// earlier contract check covers maintainer-bearing structural contracts, and
+		// validateMaintainerSelection covers plain ones. A permissive guard (returning nil) is
+		// caught by the "authorize_maintainer on a structural contract is invalid" subtest.
 		err = validateDecision(run, dec, frozenMs)
 		if !errors.Is(err, ErrCompletionRevisionConflict) {
 			t.Fatalf("maintainer-bearing structural contract: want ErrCompletionRevisionConflict, got %v", err)
