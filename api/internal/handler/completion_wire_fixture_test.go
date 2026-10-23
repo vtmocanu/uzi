@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"regexp"
 	"testing"
 	"time"
@@ -118,17 +117,19 @@ func TestCompletionWireFixtures(t *testing.T) {
 				t.Fatalf("status=%d body=%s", rec.Code, rec.Body)
 			}
 			got := normalizeWire(t, rec.Body.Bytes())
-			path := filepath.Join(wireFixtureDir, tc.file)
+			// os.Root confines reads and writes to the fixture directory: a name cannot climb out.
+			root, err := os.OpenRoot(wireFixtureDir)
+			if err != nil {
+				t.Fatalf("open fixture dir %s: %v", wireFixtureDir, err)
+			}
+			defer func() { _ = root.Close() }()
 			if os.Getenv(wireRecordEnv) == "1" {
-				if err := os.MkdirAll(wireFixtureDir, 0o755); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.WriteFile(path, got, 0o644); err != nil {
+				if err := root.WriteFile(tc.file, got, 0o600); err != nil {
 					t.Fatal(err)
 				}
 				return
 			}
-			want, err := os.ReadFile(path)
+			want, err := root.ReadFile(tc.file)
 			if err != nil {
 				t.Fatalf("read fixture (record with %s=1): %v", wireRecordEnv, err)
 			}
