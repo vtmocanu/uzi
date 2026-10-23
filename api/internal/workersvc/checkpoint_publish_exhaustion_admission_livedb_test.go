@@ -116,7 +116,7 @@ func TestCheckpointPublishAdmissionPoolOwnershipLiveDB(t *testing.T) {
 		calls++
 		return pushbroker.Result{}, nil
 	})
-	p := &checkpointPush{s: f.svc1, runID: f.oldRun, run: r, branch: f.branch, ref: f.branchRef}
+	p := &checkpointPush{s: f.svc1, runID: f.oldRun, run: r, checkpointKey: f.branch, ref: f.branchRef}
 	p.opts.DeclaredTip = lateTip
 	if err := p.pushOnce(f.e.ctx); !errors.Is(err, errPushRefused) || calls != 0 {
 		t.Fatalf("Tx-backed push: err=%v broker=%d", err, calls)

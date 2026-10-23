@@ -111,7 +111,7 @@ func TestLiveRunTrackAdvanceIsCompareAndSetLiveDB(t *testing.T) {
 			// One active run per issue: retire the new run, then read the old one as live again.
 			f.e.exec(t, `UPDATE runs SET status = 'completed', finished_at = now() WHERE id = $1`, f.newRun)
 			f.e.exec(t, `UPDATE runs SET status = 'running' WHERE id = $1`, f.oldRun)
-			push := &checkpointPush{s: f.svc1, runID: f.oldRun, branch: f.branch, ref: f.branchRef}
+			push := &checkpointPush{s: f.svc1, runID: f.oldRun, checkpointKey: f.branch, ref: f.branchRef}
 			if err := push.observePublishBase(f.e.ctx); err != nil {
 				t.Fatalf("observePublishBase: %v", err)
 			}
@@ -183,7 +183,7 @@ func TestLivePublishCreateAfterSettleReopensRecordLiveDB(t *testing.T) {
 // backwards).
 func TestPersistPublishedTipIsIdempotentLiveDB(t *testing.T) {
 	f := newSupersedeFix(t)
-	push := &checkpointPush{s: f.svc1, runID: f.oldRun, branch: f.branch, ref: f.branchRef}
+	push := &checkpointPush{s: f.svc1, runID: f.oldRun, checkpointKey: f.branch, ref: f.branchRef}
 	if err := push.observePublishBase(f.e.ctx); err != nil {
 		t.Fatalf("observePublishBase: %v", err)
 	}

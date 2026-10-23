@@ -145,8 +145,8 @@ func (f *retentionFix) assertDeleted(t *testing.T, runID uuid.UUID, branch strin
 		t.Fatalf("delete calls = %d, want 1", len(calls))
 	}
 	c := calls[0]
-	if c.Branch != branch || c.ExpectedOldTip != retentionTestTip {
-		t.Fatalf("delete = {branch %q tip %q}, want {%q %q}", c.Branch, c.ExpectedOldTip, branch, retentionTestTip)
+	if c.CheckpointKey != branch || c.ExpectedOldTip != retentionTestTip {
+		t.Fatalf("delete = {branch %q tip %q}, want {%q %q}", c.CheckpointKey, c.ExpectedOldTip, branch, retentionTestTip)
 	}
 	if c.CloneURL != "https://forge.e2e/g/interlock.git" || c.Username != "bot" || c.PAT != f.pat {
 		t.Fatalf("delete coordinates = {clone %q user %q pat-matches %v}, want the server-derived repo, bot user and decrypted PAT",

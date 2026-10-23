@@ -231,7 +231,8 @@ JOIN forge_connections c ON c.id = p.connection_id
 WHERE r.status = 'failed'
   AND r.fail_origin IS DISTINCT FROM 'plan_rejected'
   AND r.checkpoint_tip IS NOT NULL
-  AND ((r.kind = 'issue' AND r.issue_iid IS NOT NULL) OR r.kind = 'self_improve')
+  AND fn_checkpoint_coordinates(r) IS NOT NULL
+  AND (r.kind <> 'task' OR r.checkpoint_coordinates IS NOT NULL)
   AND c.forge_type = ANY($1::text[])
   AND r.finished_at >= $2::timestamptz
   AND NOT EXISTS (SELECT 1 FROM run_salvage s WHERE s.run_id = r.id)

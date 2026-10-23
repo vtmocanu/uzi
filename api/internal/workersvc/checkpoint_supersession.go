@@ -251,7 +251,7 @@ func (s *Service) driveSupersession(ctx context.Context, row store.CheckpointRet
 		return false, err
 	}
 	if derr := s.deleteCheckpointFn(ctx, pushbroker.DeleteOptions{
-		CloneURL: f.cloneURL, Branch: row.Branch, Ref: branchRef, Username: f.username, PAT: f.pat, ExpectedOldTip: row.Tip,
+		CloneURL: f.cloneURL, CheckpointKey: row.Branch, Ref: branchRef, Username: f.username, PAT: f.pat, ExpectedOldTip: row.Tip,
 	}); derr != nil {
 		return false, s.recordRetentionFailure(ctx, row, retentionSuperseding,
 			"delete branch ref: "+scrubForgeError(derr.Error(), f.pat))

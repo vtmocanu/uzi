@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -95,4 +96,35 @@ func checkpointCoordinatesForWorker(worker store.Worker, run store.Run) (*Checkp
 		return nil, fmt.Errorf("worker cannot consume enrolled checkpoint coordinates")
 	}
 	return pair, nil
+}
+
+// publicationCoordinates consumes only enrolled task descriptors. Legacy issue
+// and self-improvement runs retain their server-derived, single-branch contract.
+func publicationCoordinates(run store.Run) (*CheckpointCoordinates, error) {
+	pair, err := frozenCheckpointCoordinates(run)
+	if err != nil || pair != nil {
+		return pair, err
+	}
+	if run.Kind == "task" {
+		return nil, nil
+	}
+	branch, ok := checkpointBranch(run.Kind, run.ID, run.IssueIid)
+	if !ok {
+		return nil, nil
+	}
+	return &CheckpointCoordinates{WorkBranch: branch, CheckpointKey: branch}, nil
+}
+
+// retentionCoordinates adapts the historical retention API, whose branch field
+// names a checkpoint key. Tasks must be read in full to validate enrollment.
+func (s *Service) retentionCoordinates(ctx context.Context, runID uuid.UUID, kind string, iid pgtype.Int8) (*CheckpointCoordinates, error) {
+	run := store.Run{ID: runID, Kind: kind, IssueIid: iid}
+	if kind == "task" {
+		var err error
+		run, err = s.q.GetRunByID(ctx, runID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return publicationCoordinates(run)
 }

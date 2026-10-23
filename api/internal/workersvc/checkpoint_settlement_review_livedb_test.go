@@ -387,7 +387,7 @@ func TestSupersessionLatePublishInWindowLiveDB(t *testing.T) {
 			return
 		}
 		once.Do(func() {
-			push := &checkpointPush{s: f.svc2, runID: f.oldRun, branch: f.branch, ref: f.branchRef}
+			push := &checkpointPush{s: f.svc2, runID: f.oldRun, checkpointKey: f.branch, ref: f.branchRef}
 			if err := push.observePublishBase(f.e.ctx); err != nil {
 				t.Errorf("observePublishBase: %v", err)
 			}
@@ -497,7 +497,7 @@ func TestLiveRoutedLatePublishSupersededLogsWarnLiveDB(t *testing.T) {
 			f := newSupersedeFix(t)
 			const t2 = "7777777777777777777777777777777777777777"
 			// The late publish's compare-and-set base, read before its push (the record retained).
-			push := &checkpointPush{s: f.svc2, runID: f.oldRun, branch: f.branch, ref: f.branchRef}
+			push := &checkpointPush{s: f.svc2, runID: f.oldRun, checkpointKey: f.branch, ref: f.branchRef}
 			if err := push.observePublishBase(f.e.ctx); err != nil {
 				t.Fatalf("observePublishBase: %v", err)
 			}

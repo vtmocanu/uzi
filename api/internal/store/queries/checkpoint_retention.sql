@@ -300,7 +300,7 @@ SELECT now()::timestamptz AS listed_at;
 -- steady-state pass reads only recent candidates. The overlap covers commit-order skew: both
 -- columns are the writer's transaction time, so a run committed after a pass advanced the
 -- watermark past its key is still inside the window on the next pass. The caller derives the
--- branch in Go (checkpointBranch), records the run through the terminal-time inserts, and
+-- authorized checkpoint key in Go, records the run through the terminal-time inserts, and
 -- advances the watermark (AdvanceCheckpointRetentionBackfillWatermark) from what the page proved.
 SELECT r.id, r.kind, r.issue_iid,
        GREATEST(r.status_since, r.checkpoint_tip_at)::timestamptz AS backfill_key
@@ -308,7 +308,8 @@ FROM runs r
 WHERE r.status IN ('completed', 'failed', 'cancelled')
   AND r.checkpoint_tip IS NOT NULL
   AND r.repo_id IS NOT NULL
-  AND ((r.kind = 'issue' AND r.issue_iid IS NOT NULL) OR r.kind = 'self_improve')
+  AND fn_checkpoint_coordinates(r) IS NOT NULL
+  AND (r.kind <> 'task' OR r.checkpoint_coordinates IS NOT NULL)
   AND r.status_since >= (SELECT m.enabled_at FROM checkpoint_retention_meta m)
   -- The scan's lower bound, as a scalar subquery (an InitPlan) so the planner uses it as the
   -- index condition on idx_runs_checkpoint_backfill: a join filter against the meta row would
@@ -552,6 +553,9 @@ SET checkpoint_tip = @tip::text,
     -- Issue #3194: set-only, from the confirmed attempt row's own frozen value (bound below).
     checkpoint_attested_source = COALESCE(sqlc.narg(attested_source)::text, r.checkpoint_attested_source)
 WHERE r.id = @run_id
+  AND (r.kind <> 'task' OR (r.checkpoint_coordinates IS NOT NULL
+       AND fn_checkpoint_coordinates(r) = r.checkpoint_coordinates
+       AND @ref::text = 'refs/uzi-checkpoints/' || (fn_checkpoint_coordinates(r)->>'checkpoint_key')))
   AND r.status NOT IN ('completed', 'failed', 'cancelled')
   AND (r.checkpoint_tip IS NOT DISTINCT FROM sqlc.narg(expected_tip)::text
        OR r.checkpoint_tip = @tip::text)
@@ -559,6 +563,7 @@ WHERE r.id = @run_id
       SELECT 1 FROM checkpoint_publish_attempts a
       WHERE a.id = @attempt_id AND a.run_id = r.id
         AND a.ref = @ref::text AND a.tip = @tip::text
+        AND (r.kind <> 'task' OR a.branch = fn_checkpoint_coordinates(r)->>'checkpoint_key')
         AND a.attested_source IS NOT DISTINCT FROM sqlc.narg(attested_source)::text
         AND a.reconcile_ready_at IS NOT NULL
         AND (r.checkpoint_tip IS NULL OR r.checkpoint_tip = a.tip
@@ -581,14 +586,17 @@ WHERE r.id = @run_id
   AND NOT EXISTS (
       SELECT 1 FROM runs other
       WHERE other.repo_id = r.repo_id AND other.id <> r.id AND other.checkpoint_tip = @tip::text
+        AND (r.kind <> 'task' OR fn_checkpoint_coordinates(other)->>'checkpoint_key' = fn_checkpoint_coordinates(r)->>'checkpoint_key')
   )
   AND NOT EXISTS (
       SELECT 1 FROM checkpoint_publish_attempts a JOIN runs other ON other.id = a.run_id
       WHERE other.repo_id = r.repo_id AND a.run_id <> r.id AND a.tip = @tip::text
+        AND (r.kind <> 'task' OR a.ref = 'refs/uzi-checkpoints/' || (fn_checkpoint_coordinates(r)->>'checkpoint_key'))
   )
   AND NOT EXISTS (
       SELECT 1 FROM checkpoint_retentions c
       WHERE c.repo_id = r.repo_id AND c.run_id <> r.id AND c.tip = @tip::text
+        AND (r.kind <> 'task' OR c.branch = fn_checkpoint_coordinates(r)->>'checkpoint_key')
         AND c.state IN ('retained', 'superseding', 'superseded', 'settling')
   );
 
@@ -668,20 +676,29 @@ WHERE id = @id
 -- name: CheckpointTipClaimedByOtherRun :one
 -- Whether any OTHER run of the repo claims this tip (its persisted checkpoint tip, an outstanding
 -- publish attempt, or a live retention record): a branch ref at such a tip is never deleted as
--- this run's late publish.
+-- this run's late publish. Enrolled tasks scope each arm to their authorized
+-- destination; legacy issue/self ownership remains repository-wide.
+WITH subject AS (
+    SELECT r.kind, fn_checkpoint_coordinates(r)->>'checkpoint_key' AS checkpoint_key
+    FROM runs r WHERE r.id = @run_id
+      AND (r.kind <> 'task' OR r.checkpoint_coordinates IS NOT NULL)
+)
 SELECT (
     EXISTS (
         SELECT 1 FROM runs r
         WHERE r.repo_id = @repo_id AND r.id <> @run_id AND r.checkpoint_tip = @tip::text
+          AND (subject.kind <> 'task' OR fn_checkpoint_coordinates(r)->>'checkpoint_key' = subject.checkpoint_key)
     )
     OR EXISTS (
         SELECT 1 FROM checkpoint_publish_attempts a
         JOIN runs r ON r.id = a.run_id
         WHERE r.repo_id = @repo_id AND a.run_id <> @run_id AND a.tip = @tip::text
+          AND (subject.kind <> 'task' OR a.ref = 'refs/uzi-checkpoints/' || subject.checkpoint_key)
     )
     OR EXISTS (
         SELECT 1 FROM checkpoint_retentions c
         WHERE c.repo_id = @repo_id AND c.run_id <> @run_id AND c.tip = @tip::text
+          AND (subject.kind <> 'task' OR c.branch = subject.checkpoint_key)
           AND c.state IN ('retained', 'superseding', 'superseded', 'settling')
     )
-)::bool AS claimed;
+)::bool AS claimed FROM subject;

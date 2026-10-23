@@ -56,7 +56,9 @@ type HeldPackOptions struct {
 	// Branch and DefaultBranch are fetched (shallow) as pack bases, with the branch's checkpoint
 	// ref, exactly as Publish does: the pack was built against the last published checkpoint or
 	// the merge base with the default branch.
-	Branch        string
+	Branch        string // Legacy fallback for the named coordinates.
+	WorkBranch    string
+	CheckpointKey string
 	DefaultBranch string
 	// BaseRefs are further full refs to fetch as bases. Each must be a well-formed ref under
 	// refs/heads/ or a managed namespace, else ErrInvalidRef.
@@ -163,10 +165,11 @@ func PrepareHeldPack(ctx context.Context, o HeldPackOptions) (*PreparedHeldPack,
 			want["refs/heads/"+b] = "refs/remotes/origin/" + b
 		}
 	}
-	addHead(o.Branch)
+	workBranch, checkpointKey := checkpointNames(o.Branch, o.WorkBranch, o.CheckpointKey)
+	addHead(workBranch)
 	addHead(o.DefaultBranch)
-	if o.Branch != "" {
-		want[checkpointRefPrefix+o.Branch] = checkpointRefPrefix + o.Branch
+	if checkpointKey != "" {
+		want[checkpointRefPrefix+checkpointKey] = checkpointRefPrefix + checkpointKey
 	}
 	for _, b := range o.BaseRefs {
 		if strings.HasPrefix(b, "refs/heads/") {

@@ -6617,6 +6617,21 @@ func (s *Service) PublishAttested(ctx context.Context, wkr store.Worker, runID u
 			return PublishResult{}, ErrStaleClaim
 		}
 	}
+	// Task destinations require the currently registered consumer, not just a
+	// descriptor left by an earlier compatible generation. Re-read under the
+	// worker lock already held by beginClaimMutation before admitting any write.
+	if owned.Kind == runkind.Task && len(owned.CheckpointCoordinates) != 0 {
+		registered := wkr
+		if tx != nil {
+			registered, err = store.New(tx).GetWorkerForUpdate(ctx, wkr.ID)
+			if err != nil {
+				return PublishResult{}, err
+			}
+		}
+		if registered.UserID != owned.UserID || !slices.Contains(registered.ProtocolCapabilities, capability.TaskCheckpointCoordinatesV1) {
+			return PublishResult{Skipped: "unsupported"}, nil
+		}
+	}
 	// Release admission locks before retention locking or forge I/O. Publish needs
 	// the full service dependencies, rather than the claim-control facade.
 	if tx != nil {
@@ -6625,21 +6640,16 @@ func (s *Service) PublishAttested(ctx context.Context, wkr store.Worker, runID u
 		}
 	}
 
-	// 2. Branch is derived SERVER-SIDE from validated run-row fields (kind, the run's
-	// uuid, the issue iid) — never from the worker, and never from owned.Branch.
-	// runs.branch is written ONLY at completion (SetRunCompleted), so it is NULL/empty
-	// for a `running` run; a checkpoint publish fires MID-RUN, so reading it would make
-	// the whole feature inert. Checkpoints fire for the checkpoint-eligible set — an
-	// issue run (agent/issue-<iid>) and a self_improve run (uzi/self-improve/<runID>,
-	// PRD #1062 M3) — so any other kind, or an issue run missing its iid, is an
-	// unsupported publish we skip (best-effort) rather than fault. checkpointBranch
-	// dispatches on kind FIRST (a self_improve run also carries a valid issue_iid, its
-	// stable tracking issue), and derives the branch only from run-row fields, so no
-	// worker-controlled string ever flows into the refspec.
-	branch, ok := checkpointBranch(owned.Kind, runID, owned.IssueIid)
-	if !ok {
+	// 2. Use server-authorized coordinates; tasks require frozen enrollment.
+	coordinates, err := publicationCoordinates(owned)
+	if err != nil {
+		return PublishResult{}, err
+	}
+	if coordinates == nil {
 		return PublishResult{Published: false, Ref: "", Skipped: "unsupported"}, nil
 	}
+	// Retention and slot ownership use the checkpoint key, not the work head.
+	branch := coordinates.CheckpointKey
 	ref := checkpointRefPrefix + branch
 
 	// 3. Repo + connection facts (clone URL, base URL, default branch, bot username,
@@ -6692,7 +6702,8 @@ func (s *Service) PublishAttested(ctx context.Context, wkr store.Worker, runID u
 	opts := pushbroker.Options{
 		CloneURL:      cloneURL,
 		BaseURL:       rc.BaseUrl,
-		Branch:        branch,
+		WorkBranch:    coordinates.WorkBranch,
+		CheckpointKey: coordinates.CheckpointKey,
 		DefaultBranch: rc.DefaultBranch.String,
 		Username:      rc.BotUsername,
 		PAT:           string(botPAT),
@@ -6714,7 +6725,7 @@ func (s *Service) PublishAttested(ctx context.Context, wkr store.Worker, runID u
 	// waits out checkpointSupersessionCooling after its terminal commit, and each push is recorded
 	// durably before it is sent (checkpoint_publish_attempts), so one whose outcome is unknown and
 	// that lands late anyway is reconciled by the sweeper (reconcilePublishAttempts).
-	push := &checkpointPush{s: s, runID: runID, run: owned, branch: branch, ref: ref, opts: opts, routedAt: routedAt,
+	push := &checkpointPush{s: s, runID: runID, run: owned, checkpointKey: branch, ref: ref, opts: opts, routedAt: routedAt,
 		attestedSource: pgconv.TextPtr(attestedSource)}
 	if terminalStatuses[owned.Status] && s.retentionWired() {
 		return s.publishTerminalLocked(ctx, push, tipOid)
@@ -6761,7 +6772,7 @@ func (s *Service) PublishAttested(ctx context.Context, wkr store.Worker, runID u
 // one whose outcome is unknown and that the forge applies after the lock is released is reconciled
 // by the sweeper.
 func (s *Service) publishTerminalLocked(ctx context.Context, push *checkpointPush, tipOid string) (PublishResult, error) {
-	owned, branch, ref := push.run, push.branch, push.ref
+	owned, branch, ref := push.run, push.checkpointKey, push.ref
 	runID := owned.ID
 	var (
 		res    PublishResult
@@ -6836,7 +6847,7 @@ func (s *Service) pushCheckpoint(ctx context.Context, push *checkpointPush) erro
 		if admissionErr := push.prepareLiveAttempt(ctx); admissionErr != nil {
 			return admissionErr
 		}
-		if s.freeCheckpointSlot(ctx, push.run, push.branch) {
+		if s.freeCheckpointSlot(ctx, push.run, push.checkpointKey) {
 			err = push.pushOnce(ctx)
 		}
 	}

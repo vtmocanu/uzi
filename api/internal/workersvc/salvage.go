@@ -217,10 +217,9 @@ func (s *Service) enqueueSalvage(ctx context.Context, now time.Time) (int64, err
 	}
 	var touched int64
 	for _, c := range cands {
-		// The query already restricts to checkpoint-eligible kinds; derive the branch the
-		// same way Publish does (never from a worker string).
-		branch, ok := checkpointBranch(c.Kind, c.ID, c.IssueIid)
-		if !ok {
+		// Retention branch columns carry checkpoint keys, including enrolled tasks.
+		coordinates, err := s.retentionCoordinates(ctx, c.ID, c.Kind, c.IssueIid)
+		if err != nil || coordinates == nil {
 			continue
 		}
 		state, live := salvageStatePending, pgtype.UUID{Bytes: c.ID, Valid: true}
@@ -232,7 +231,7 @@ func (s *Service) enqueueSalvage(ctx context.Context, now time.Time) (int64, err
 			UserID:    c.UserID,
 			RepoID:    c.RepoID,
 			ForgeType: c.ForgeType,
-			Branch:    branch,
+			Branch:    coordinates.CheckpointKey,
 			Tip:       c.CheckpointTip,
 			LiveRunID: live,
 			State:     state,

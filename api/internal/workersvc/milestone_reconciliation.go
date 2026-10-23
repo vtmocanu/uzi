@@ -448,11 +448,11 @@ func (s *Service) reconcileMilestoneApproval(ctx context.Context, owner uuid.UUI
 	if problem != "" || gone {
 		return SubmitInputResult{}, ErrReconciliationNotReady
 	}
-	branch, branchOK := checkpointBranch(run.Kind, run.ID, run.IssueIid)
-	if !branchOK {
+	coordinates, coordinateErr := publicationCoordinates(run)
+	if coordinateErr != nil || coordinates == nil {
 		return SubmitInputResult{}, ErrReconciliationNotReady
 	}
-	ref := checkpointRefPrefix + branch
+	ref := checkpointRefPrefix + coordinates.CheckpointKey
 	tips, err := s.listRefTipsFn(ctx, pushbroker.ListRefsOptions{CloneURL: forge.cloneURL, Username: forge.username, PAT: forge.pat}, ref)
 	if err != nil || tips[ref] != witness.PublishedCheckpoint {
 		return SubmitInputResult{}, ErrReconciliationNotReady
@@ -533,7 +533,7 @@ func (s *Service) reconcileMilestoneApproval(ctx context.Context, owner uuid.UUI
  VALUES($1,$2,$3,$4,$5,$6,'retained')
  ON CONFLICT(run_id) DO UPDATE SET state='retained',updated_at=now()
  WHERE checkpoint_retentions.ref=EXCLUDED.ref AND checkpoint_retentions.tip=EXCLUDED.tip
- AND checkpoint_retentions.state='retained'`, run.ID, owner, run.RepoID, branch, witness.PublishedCheckpoint, ref)
+ AND checkpoint_retentions.state='retained'`, run.ID, owner, run.RepoID, coordinates.CheckpointKey, witness.PublishedCheckpoint, ref)
 	if err != nil {
 		return SubmitInputResult{}, err
 	}

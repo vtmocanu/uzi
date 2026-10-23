@@ -59,9 +59,8 @@ func validateLiveSettleRequest(req apitypes.RecoveryLiveSettleRequest) error {
 //	   successor_generation, held by the caller with its claim unreleased; the hold is open, at
 //	   predecessor_generation < successor_generation, originally taken by the caller.
 //	e. captures the target coordinates BEFORE the forge: runs.branch as read, and for a
-//	   checkpoint target the branch derived from the run row (checkpointBranch over kind, run
-//	   id, issue iid); for a branch target runs.branch itself, which must be a valid branch
-//	   name. An underivable or invalid branch is retained/not_eligible.
+//	   checkpoint target the authorized checkpoint key; for a branch target runs.branch itself,
+//	   which must be a valid branch name. An underivable or invalid branch is retained/not_eligible.
 //	f. binds source_sha to the server's captures exactly as the completed path does
 //	   (retained/candidate_mismatch).
 //	g. proves: reads the target head H ONCE (RefHead of refs/uzi-checkpoints/<branch>, or
@@ -133,6 +132,9 @@ func (s *Service) SettlePredecessorHoldLive(ctx context.Context, wkr store.Worke
 	}
 
 	// e. The target coordinates, captured before the forge is asked.
+	if _, err := frozenCheckpointCoordinates(run); err != nil {
+		return retained(apitypes.RecoverySettleNotEligible), nil
+	}
 	capturedBranch := run.Branch
 	kind, issueIid := run.Kind, run.IssueIid
 	var provenBranch string
@@ -143,11 +145,11 @@ func (s *Service) SettlePredecessorHoldLive(ctx context.Context, wkr store.Worke
 		}
 		provenBranch = capturedBranch.String
 	default: // apitypes.RecoverySettleTargetCheckpoint (validated above)
-		cp, ok := checkpointBranch(kind, runID, issueIid)
-		if !ok || !isSettleBranchName(cp) {
+		coordinates, err := publicationCoordinates(run)
+		if err != nil || coordinates == nil || !isSettleBranchName(coordinates.CheckpointKey) {
 			return retained(apitypes.RecoverySettleNotEligible), nil
 		}
-		provenBranch = cp
+		provenBranch = coordinates.CheckpointKey
 	}
 
 	// f. The server-held source binding.
@@ -198,6 +200,7 @@ func (s *Service) SettlePredecessorHoldLive(ctx context.Context, wkr store.Worke
 		PredecessorGeneration: req.PredecessorGeneration,
 		WorkerID:              wkr.ID,
 		CapturedBranch:        capturedBranch,
+		CapturedCoordinates:   run.CheckpointCoordinates,
 		Kind:                  kind,
 		IssueIid:              issueIid,
 	})

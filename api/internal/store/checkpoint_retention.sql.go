@@ -150,22 +150,30 @@ func (q *Queries) CheckLiveCheckpointPublishAdmission(ctx context.Context, arg C
 }
 
 const checkpointTipClaimedByOtherRun = `-- name: CheckpointTipClaimedByOtherRun :one
+WITH subject AS (
+    SELECT r.kind, fn_checkpoint_coordinates(r)->>'checkpoint_key' AS checkpoint_key
+    FROM runs r WHERE r.id = $2
+      AND (r.kind <> 'task' OR r.checkpoint_coordinates IS NOT NULL)
+)
 SELECT (
     EXISTS (
         SELECT 1 FROM runs r
         WHERE r.repo_id = $1 AND r.id <> $2 AND r.checkpoint_tip = $3::text
+          AND (subject.kind <> 'task' OR fn_checkpoint_coordinates(r)->>'checkpoint_key' = subject.checkpoint_key)
     )
     OR EXISTS (
         SELECT 1 FROM checkpoint_publish_attempts a
         JOIN runs r ON r.id = a.run_id
         WHERE r.repo_id = $1 AND a.run_id <> $2 AND a.tip = $3::text
+          AND (subject.kind <> 'task' OR a.ref = 'refs/uzi-checkpoints/' || subject.checkpoint_key)
     )
     OR EXISTS (
         SELECT 1 FROM checkpoint_retentions c
         WHERE c.repo_id = $1 AND c.run_id <> $2 AND c.tip = $3::text
+          AND (subject.kind <> 'task' OR c.branch = subject.checkpoint_key)
           AND c.state IN ('retained', 'superseding', 'superseded', 'settling')
     )
-)::bool AS claimed
+)::bool AS claimed FROM subject
 `
 
 type CheckpointTipClaimedByOtherRunParams struct {
@@ -176,7 +184,8 @@ type CheckpointTipClaimedByOtherRunParams struct {
 
 // Whether any OTHER run of the repo claims this tip (its persisted checkpoint tip, an outstanding
 // publish attempt, or a live retention record): a branch ref at such a tip is never deleted as
-// this run's late publish.
+// this run's late publish. Enrolled tasks scope each arm to their authorized
+// destination; legacy issue/self ownership remains repository-wide.
 func (q *Queries) CheckpointTipClaimedByOtherRun(ctx context.Context, arg CheckpointTipClaimedByOtherRunParams) (bool, error) {
 	row := q.db.QueryRow(ctx, checkpointTipClaimedByOtherRun, arg.RepoID, arg.RunID, arg.Tip)
 	var claimed bool
@@ -191,13 +200,17 @@ SET checkpoint_tip = $1::text,
     -- Issue #3194: set-only, from the confirmed attempt row's own frozen value (bound below).
     checkpoint_attested_source = COALESCE($2::text, r.checkpoint_attested_source)
 WHERE r.id = $3
+  AND (r.kind <> 'task' OR (r.checkpoint_coordinates IS NOT NULL
+       AND fn_checkpoint_coordinates(r) = r.checkpoint_coordinates
+       AND $4::text = 'refs/uzi-checkpoints/' || (fn_checkpoint_coordinates(r)->>'checkpoint_key')))
   AND r.status NOT IN ('completed', 'failed', 'cancelled')
-  AND (r.checkpoint_tip IS NOT DISTINCT FROM $4::text
+  AND (r.checkpoint_tip IS NOT DISTINCT FROM $5::text
        OR r.checkpoint_tip = $1::text)
   AND EXISTS (
       SELECT 1 FROM checkpoint_publish_attempts a
-      WHERE a.id = $5 AND a.run_id = r.id
-        AND a.ref = $6::text AND a.tip = $1::text
+      WHERE a.id = $6 AND a.run_id = r.id
+        AND a.ref = $4::text AND a.tip = $1::text
+        AND (r.kind <> 'task' OR a.branch = fn_checkpoint_coordinates(r)->>'checkpoint_key')
         AND a.attested_source IS NOT DISTINCT FROM $2::text
         AND a.reconcile_ready_at IS NOT NULL
         AND (r.checkpoint_tip IS NULL OR r.checkpoint_tip = a.tip
@@ -213,21 +226,24 @@ WHERE r.id = $3
             AND c.ref = $8::text
             AND c.recovery_ref IS NOT DISTINCT FROM $9::text
             AND c.state = $10::text AND c.tip = $11::text
-            AND c.ref = $6::text AND c.recovery_ref IS NULL
+            AND c.ref = $4::text AND c.recovery_ref IS NULL
             AND c.state IN ('retained', 'settling', 'deleted', 'abandoned')
       ))
   )
   AND NOT EXISTS (
       SELECT 1 FROM runs other
       WHERE other.repo_id = r.repo_id AND other.id <> r.id AND other.checkpoint_tip = $1::text
+        AND (r.kind <> 'task' OR fn_checkpoint_coordinates(other)->>'checkpoint_key' = fn_checkpoint_coordinates(r)->>'checkpoint_key')
   )
   AND NOT EXISTS (
       SELECT 1 FROM checkpoint_publish_attempts a JOIN runs other ON other.id = a.run_id
       WHERE other.repo_id = r.repo_id AND a.run_id <> r.id AND a.tip = $1::text
+        AND (r.kind <> 'task' OR a.ref = 'refs/uzi-checkpoints/' || (fn_checkpoint_coordinates(r)->>'checkpoint_key'))
   )
   AND NOT EXISTS (
       SELECT 1 FROM checkpoint_retentions c
       WHERE c.repo_id = r.repo_id AND c.run_id <> r.id AND c.tip = $1::text
+        AND (r.kind <> 'task' OR c.branch = fn_checkpoint_coordinates(r)->>'checkpoint_key')
         AND c.state IN ('retained', 'superseding', 'superseded', 'settling')
   )
 `
@@ -236,9 +252,9 @@ type ConfirmLiveCheckpointPublishAttemptParams struct {
 	Tip                 string      `json:"tip"`
 	AttestedSource      pgtype.Text `json:"attested_source"`
 	RunID               uuid.UUID   `json:"run_id"`
+	Ref                 string      `json:"ref"`
 	ExpectedTip         pgtype.Text `json:"expected_tip"`
 	AttemptID           uuid.UUID   `json:"attempt_id"`
-	Ref                 string      `json:"ref"`
 	HadRetention        bool        `json:"had_retention"`
 	ObservedRef         string      `json:"observed_ref"`
 	ObservedRecoveryRef pgtype.Text `json:"observed_recovery_ref"`
@@ -254,9 +270,9 @@ func (q *Queries) ConfirmLiveCheckpointPublishAttempt(ctx context.Context, arg C
 		arg.Tip,
 		arg.AttestedSource,
 		arg.RunID,
+		arg.Ref,
 		arg.ExpectedTip,
 		arg.AttemptID,
-		arg.Ref,
 		arg.HadRetention,
 		arg.ObservedRef,
 		arg.ObservedRecoveryRef,
@@ -646,7 +662,8 @@ FROM runs r
 WHERE r.status IN ('completed', 'failed', 'cancelled')
   AND r.checkpoint_tip IS NOT NULL
   AND r.repo_id IS NOT NULL
-  AND ((r.kind = 'issue' AND r.issue_iid IS NOT NULL) OR r.kind = 'self_improve')
+  AND fn_checkpoint_coordinates(r) IS NOT NULL
+  AND (r.kind <> 'task' OR r.checkpoint_coordinates IS NOT NULL)
   AND r.status_since >= (SELECT m.enabled_at FROM checkpoint_retention_meta m)
   -- The scan's lower bound, as a scalar subquery (an InitPlan) so the planner uses it as the
   -- index condition on idx_runs_checkpoint_backfill: a join filter against the meta row would
@@ -694,7 +711,7 @@ type ListCheckpointRetentionBackfillRow struct {
 // steady-state pass reads only recent candidates. The overlap covers commit-order skew: both
 // columns are the writer's transaction time, so a run committed after a pass advanced the
 // watermark past its key is still inside the window on the next pass. The caller derives the
-// branch in Go (checkpointBranch), records the run through the terminal-time inserts, and
+// authorized checkpoint key in Go, records the run through the terminal-time inserts, and
 // advances the watermark (AdvanceCheckpointRetentionBackfillWatermark) from what the page proved.
 func (q *Queries) ListCheckpointRetentionBackfill(ctx context.Context, arg ListCheckpointRetentionBackfillParams) ([]ListCheckpointRetentionBackfillRow, error) {
 	rows, err := q.db.Query(ctx, listCheckpointRetentionBackfill, arg.OnlyRunID, arg.MaxRows)

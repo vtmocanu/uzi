@@ -327,6 +327,14 @@ func (s *Service) PublishHeld(ctx context.Context, wkr store.Worker, runID uuid.
 	if err != nil {
 		return HeldPublishResult{}, err
 	}
+	coordinates, err := publicationCoordinates(adm.run)
+	if err != nil {
+		return HeldPublishResult{}, &HeldRefusal{Reason: HeldReasonIdentityChanged}
+	}
+	var workBranch, checkpointKey string
+	if coordinates != nil {
+		workBranch, checkpointKey = coordinates.WorkBranch, coordinates.CheckpointKey
+	}
 	if adm.pub != nil {
 		if !heldIdentityMatches(*adm.pub, adm.hold, wkr, runID, req) {
 			return HeldPublishResult{}, &HeldRefusal{Reason: HeldReasonIdentityChanged}
@@ -349,9 +357,8 @@ func (s *Service) PublishHeld(ctx context.Context, wkr store.Worker, runID uuid.
 		slog.Warn("held publication: forge connection unavailable", "run", runID, "error", secretscrub.Scrub(err.Error()))
 		return HeldPublishResult{}, &HeldRefusal{Reason: HeldReasonForgeUnavailable}
 	}
-	branch, _ := checkpointBranch(adm.run.Kind, runID, adm.run.IssueIid)
 	opts := pushbroker.HeldPackOptions{
-		RunID: runID, Generation: req.Generation, Branch: branch, DefaultBranch: rc.DefaultBranch.String,
+		RunID: runID, Generation: req.Generation, WorkBranch: workBranch, CheckpointKey: checkpointKey, DefaultBranch: rc.DefaultBranch.String,
 		Tip: req.Tip, Pack: pack,
 		CIConfigGuard: adm.run.CiConfigGuard, CIConfigPaths: adm.run.CiConfigPaths,
 	}

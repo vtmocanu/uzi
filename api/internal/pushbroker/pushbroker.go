@@ -63,9 +63,11 @@ import (
 // and the declared tip. CloneURL/BaseURL/Branch/DefaultBranch/Username/PAT are
 // server-derived.
 type Options struct {
-	CloneURL string
-	BaseURL  string
-	Branch   string
+	CloneURL      string
+	BaseURL       string
+	Branch        string // Legacy fallback when named coordinates are absent.
+	WorkBranch    string
+	CheckpointKey string
 	// DefaultBranch is the repo's default branch (from the run claim context). Its
 	// named fetch supplies the current default snapshot for validation, alongside
 	// the branch's own refs (Rule: bounded fetch). The forge already holds historical
@@ -296,7 +298,8 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 	ctx, cancel := context.WithTimeout(ctx, maxPublishDuration)
 	defer cancel()
 
-	ref := checkpointRefPrefix + o.Branch
+	workBranch, checkpointKey := checkpointNames(o.Branch, o.WorkBranch, o.CheckpointKey)
+	ref := checkpointRefPrefix + checkpointKey
 	result := Result{Ref: ref}
 
 	tipHash := plumbing.NewHash(o.DeclaredTip)
@@ -340,7 +343,7 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 
 	auth := authFor(o)
 	checkpointRef := plumbing.ReferenceName(ref)
-	branchRef := plumbing.ReferenceName("refs/remotes/origin/" + o.Branch)
+	branchRef := plumbing.ReferenceName("refs/remotes/origin/" + workBranch)
 
 	// Step 2: fetch ONLY the base refs this publish needs into the storer — the
 	// branch itself, the repo default branch (the delta pack's exclude-boundary base
@@ -354,7 +357,7 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 	// ("couldn't find remote ref"), and the PRIMARY M8 case is a branch never pushed
 	// to heads — so we first LIST the advertised refs and fetch only the subset that
 	// exists. Missing refs, an empty remote, and up-to-date are all tolerated.
-	if err := fetchBaseRefs(ctx, remote, auth, o.Branch, o.DefaultBranch); err != nil {
+	if err := fetchBaseRefs(ctx, remote, auth, workBranch, o.DefaultBranch, checkpointKey); err != nil {
 		return Result{}, err
 	}
 
@@ -504,15 +507,16 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 // Options: a delete ships no pack and declares no tip, so it needs only enough to
 // reach the remote and name the checkpoint ref.
 type DeleteOptions struct {
-	CloneURL string
-	Branch   string
-	Username string
-	PAT      string
+	CloneURL      string
+	Branch        string // Legacy fallback for CheckpointKey.
+	CheckpointKey string
+	Username      string
+	PAT           string
 	// Ref, when set, is the FULL name of the ref to delete and replaces
-	// refs/uzi-checkpoints/<Branch>. It must lie under refs/uzi-checkpoints/,
+	// refs/uzi-checkpoints/<CheckpointKey> (Branch for legacy callers). It must lie under refs/uzi-checkpoints/,
 	// refs/uzi-recovery/, refs/uzi-salvage/ (PRD #1867) or refs/uzi-held/ (issue #2545) and
 	// be a well-formed ref name, else Delete returns ErrInvalidRef before any network I/O.
-	// Empty keeps the branch-derived name. A recovery, salvage or held ref is only ever
+	// Empty keeps the key-derived name. A recovery, salvage or held ref is only ever
 	// CAS-deleted: Ref under any of those prefixes with an empty ExpectedOldTip is ErrInvalidRef.
 	Ref string
 	// ExpectedOldTip is the tip this run last published to its checkpoint ref (the
@@ -572,7 +576,8 @@ func Delete(ctx context.Context, o DeleteOptions) error {
 	ctx, cancel := context.WithTimeout(ctx, maxDeleteDuration)
 	defer cancel()
 
-	ref := checkpointRefPrefix + o.Branch
+	_, checkpointKey := checkpointNames(o.Branch, "", o.CheckpointKey)
+	ref := checkpointRefPrefix + checkpointKey
 	if o.Ref != "" {
 		if !validManagedRef(o.Ref) {
 			return ErrInvalidRef
@@ -1178,7 +1183,7 @@ func scanPackBudget(ctx context.Context, pack []byte) error {
 // unadvertised ref fails the whole fetch, it first lists the remote's advertised
 // refs and fetches only the subset that exists. Missing refs, an empty remote and
 // up-to-date are all tolerated (the primary M8 case is a branch never pushed).
-func fetchBaseRefs(ctx context.Context, remote *git.Remote, auth transport.AuthMethod, branch, defaultBranch string) error {
+func fetchBaseRefs(ctx context.Context, remote *git.Remote, auth transport.AuthMethod, branch, defaultBranch, checkpointKey string) error {
 	// Deduplicate: branch and defaultBranch can coincide, and defaultBranch may be
 	// empty (a repo-less/unknown default). Each head lands under refs/remotes/origin/*;
 	// the checkpoint namespace is mirrored 1:1.
@@ -1191,8 +1196,8 @@ func fetchBaseRefs(ctx context.Context, remote *git.Remote, auth transport.AuthM
 	}
 	addHead(branch)
 	addHead(defaultBranch)
-	if branch != "" {
-		want[checkpointRefPrefix+branch] = checkpointRefPrefix + branch
+	if checkpointKey != "" {
+		want[checkpointRefPrefix+checkpointKey] = checkpointRefPrefix + checkpointKey
 	}
 	return fetchWantedRefs(ctx, remote, auth, want)
 }
@@ -1473,4 +1478,16 @@ func isWorkflowScopeRejection(err error) bool {
 	return strings.Contains(msg, "workflow scope") ||
 		strings.Contains(msg, "without workflow scope") ||
 		strings.Contains(msg, "refusing to allow a personal access token to create or update workflow")
+}
+
+// checkpointNames preserves the single-branch API for legacy callers. Named
+// coordinates independently select the work head and checkpoint destination.
+func checkpointNames(legacy, workBranch, checkpointKey string) (string, string) {
+	if workBranch == "" {
+		workBranch = legacy
+	}
+	if checkpointKey == "" {
+		checkpointKey = legacy
+	}
+	return workBranch, checkpointKey
 }

@@ -250,7 +250,7 @@ func TestHeldPublishHappyPathLiveDB(t *testing.T) {
 	}
 	o := f.fake.opts[0]
 	if o.PAT != f.pat || o.Username != "bot" || o.CloneURL != "https://forge.e2e/g/interlock.git" || o.RunID != f.run ||
-		o.Generation != 1 || o.Tip != heldTestTip || o.Branch != fmt.Sprintf("agent/issue-%d", f.iid) || o.DefaultBranch != "main" {
+		o.Generation != 1 || o.Tip != heldTestTip || o.WorkBranch != fmt.Sprintf("agent/issue-%d", f.iid) || o.CheckpointKey != fmt.Sprintf("agent/issue-%d", f.iid) || o.DefaultBranch != "main" {
 		t.Fatalf("broker options = %+v (PAT redacted in the comparison)", o)
 	}
 }
