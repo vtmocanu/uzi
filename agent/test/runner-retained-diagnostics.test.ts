@@ -5,6 +5,7 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { formatRetainedRecoveryDiagnostic, RetainedReadinessCleanupUnconfirmedError } from "../src/git.js";
 import { noProofReseed, recordingLogger } from "./helpers.js";
+import { codexRig } from "./runner-codex-sinks-fixture.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
 
 installHarness();
@@ -129,10 +130,16 @@ it("an asynchronous readiness refusal stops retained recovery before successor a
     refusals++;
     throw new Error("retained_readiness_access");
   };
-  await runnerWith(() => ({ executor: {
-    sandboxesCommands: true,
-    run: async () => { models++; throw new Error("must not enter model"); },
-  } }), fakeGitlab().gitlab, undefined, log.logger, { recoveryRetryMs: 1 }).execute(claim);
+  await runnerWith(() => {
+    const rig = codexRig();
+    return { executor: {
+      sandboxesCommands: true,
+      settleForCredentialFreeCapture: rig.settle,
+      withCredentialFreeCapture: rig.capture,
+      safety: rig.safety,
+      run: async () => { models++; throw new Error("must not enter model"); },
+    } };
+  }, fakeGitlab().gitlab, undefined, log.logger, { recoveryRetryMs: 1 }).execute(claim);
   assert.ok(refusals > 0, "the readiness refusal was reached");
   assert.equal(models, 0, "no successor is admitted after a readiness refusal");
   const diagnostics = log.lines.filter((line: any) => line.msg === warning) as Array<Record<string, any>>;

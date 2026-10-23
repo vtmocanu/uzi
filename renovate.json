@@ -32,6 +32,16 @@
   "customManagers": [
     {
       "customType": "regex",
+      "description": "Worker Go flake: propose monthly nixpkgs-unstable channel digest updates to the manifest, embedded seed and guard together. PRs intentionally arrive red until a maintainer regenerates the matching lock key and Nix-evaluated Go version/output metadata; postUpgrade lock generation is not allowed here.",
+      "managerFilePatterns": ["/^agent/devbox-global/(devbox\\.json|toolchain-guard\\.tsv)$/", "/^api/internal/toolseed/devbox\\.json$/"],
+      "matchStrings": ["github:NixOS/nixpkgs/(?<currentDigest>[a-f0-9]{40})#go_[0-9]+_[0-9]+"],
+      "currentValueTemplate": "nixpkgs-unstable",
+      "depNameTemplate": "worker-go-nixpkgs",
+      "packageNameTemplate": "https://github.com/NixOS/nixpkgs",
+      "datasourceTemplate": "git-refs"
+    },
+    {
+      "customType": "regex",
       "description": "Pinned CI Postgres env reference: the step-managed database keeps its tag and digest grouped with docker-compose.yml.",
       "managerFilePatterns": [
         "/^\\.github/workflows/ci\\.yml$/"
@@ -104,6 +114,14 @@
   ],
   "packageRules": [
     {
+      "description": "Worker Go channel digests need matching lock metadata and image validation before merge; keep them independent of major/minor Go toolchain grouping.",
+      "matchDepNames": ["worker-go-nixpkgs"],
+      "schedule": ["* 0-5 1 * *"],
+      "automerge": false,
+      "minimumReleaseAgeBehaviour": "timestamp-optional",
+      "prBodyNotes": ["This channel digest update requires maintainer lock repair: regenerate the Go package key, evaluate the pinned go_1_27 version and Linux store output with Nix, and update the lock metadata. The worker-toolchain repository guard and baked image version assertion deliberately keep this PR red until that work is complete."]
+    },
+    {
       "description": "Patch updates automerge on green CI. Repo auto-merge is off, so Renovate merges them itself: it rebases a behind branch first (strict required checks), then merges once every check is green. Later rules override this one (Codex runtime, the agent SDK).",
       "matchUpdateTypes": ["patch"],
       "automerge": true,
@@ -137,7 +155,7 @@
       "separateMajorMinor": false
     },
     {
-      "description": "sqlc: group the CI pin and both platform release archives so local generation stays in lockstep with CI.",
+      "description": "sqlc: group the CI pin and all platform release archives so local generation stays in lockstep with CI.",
       "matchPackageNames": ["sqlc-dev/sqlc"],
       "groupName": "sqlc",
       "separateMajorMinor": false

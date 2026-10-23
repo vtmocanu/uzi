@@ -1,4 +1,5 @@
 import { describe, it } from "node:test";
+import { ownedSummaryHarnesses } from "../src/codex/summary-ownership.js";
 import assert from "node:assert/strict";
 
 import {
@@ -830,6 +831,43 @@ describe("CodexAdviceHarness: timeout + grace + fail-closed setup", () => {
       return true;
     });
     assert.equal(bits.disposeCalls(), 1, "the isolated HOME is disposed after settlement/grace");
+  });
+
+  it("owned summary preserves the primary failure while joining every failing cleanup", async () => {
+    const primary = new Error("original model failure");
+    const steps: string[] = [];
+    let drains = 0;
+    let disposing!: () => void, release!: () => void;
+    const entered = new Promise<void>(resolve => { disposing = resolve; });
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const bits = makeHarness({
+      appServerAuth: {
+        mode: "subscription",
+        authenticate: async () => {},
+        handleServerRequest: async () => false,
+        closeAdmissionAndCancel() { steps.push("cancel"); throw new Error("cancel failed"); },
+        drainInterceptedRequests: async () => {
+          if (++drains === 1) return;
+          steps.push("drain"); throw new Error("drain failed");
+        },
+      },
+      dispose: async () => { steps.push("dispose"); disposing(); await held; throw new Error("dispose failed"); },
+    });
+    let poisoned = false, returned = false;
+    ownedSummaryHarnesses.set(bits.harness, () => { poisoned = true; });
+    bits.transport.push(turnCompleted());
+    const running = bits.harness.run(makeAdviceRequest({ label: "summary" }), { onTerminal: () => { throw primary; } });
+    const outcome = running.then(() => { returned = true; return undefined; }, error => { returned = true; return error; });
+    try {
+      await entered;
+      assert.equal(returned, false, "full disposal remains joined after other cleanup failures");
+      assert.equal(poisoned, true, "cleanup failure records independent ownership evidence");
+      assert.deepEqual(steps, ["cancel", "drain", "dispose"]);
+      assert.equal(bits.transport.closes, 2, "both transport cleanup attempts run");
+      release();
+      assert.equal(await outcome, primary, "cleanup must preserve the exact primary error object");
+      assert.equal(bits.disposeCalls(), 1);
+    } finally { release(); await outcome; }
   });
 
   it("disposes the advice root when authentication draining fails", async () => {

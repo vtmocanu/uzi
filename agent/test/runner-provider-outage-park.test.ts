@@ -70,17 +70,33 @@ function rigFor(harness: Harness, scenario: Scenario, homeRoot: string): Rig {
   };
   let factory: ExecutorFactory;
   if (harness === "codex") {
-    const rig = codexRig();
-    if (scenario.failReap) {
-      const real = rig.safety.withBoundary.bind(rig.safety);
-      rig.safety.withBoundary = async (req, action) => {
-        if (thrown && req.boundary === "shutdown") throw new CodexBoundaryError("quiesce", [{ category: "protocol", message: "provider not reaped" }]);
-        return real(req, action);
-      };
-    }
     factory = (runId) => {
       runHome = path.join(homeRoot, runId);
-      return { homeDir: runHome, executor: new FakeCodexExecutor(rig.safety, behavior, rig.settle) };
+      // Replacement executors own fresh provider roots, safety and capture authority.
+      const rig = codexRig();
+      let modelThrown = false;
+      let drainedAfterThrow = false;
+      const instanceBehavior = async (ctx: RunContext): Promise<ExecutorResult> => {
+        try {
+          return await behavior(ctx);
+        } catch (err) {
+          modelThrown = true;
+          throw err;
+        }
+      };
+      if (scenario.failReap) {
+        const real = rig.safety.withBoundary.bind(rig.safety);
+        rig.safety.withBoundary = async (req, action) => {
+          const postThrowShutdown = modelThrown && req.boundary === "shutdown";
+          // Let the real strict drain finish before verified local capture. Inject the
+          // late publication/pre-report reap fault only after that successful return.
+          if (postThrowShutdown && drainedAfterThrow) throw new CodexBoundaryError("quiesce", [{ category: "protocol", message: "provider not reaped" }]);
+          const result = await real(req, action);
+          if (postThrowShutdown) drainedAfterThrow = true;
+          return result;
+        };
+      }
+      return { homeDir: runHome, executor: new FakeCodexExecutor(rig.safety, instanceBehavior, undefined, rig.capture) };
     };
   } else {
     factory = (runId) => {

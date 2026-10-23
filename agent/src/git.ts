@@ -21,6 +21,9 @@ import type { Logger } from "./log.js";
 import type { PlanCrossCheckDiffRefusal } from "./client.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest, BoundaryStep } from "./harness.js";
 import { CheckpointChildStartupTimeoutError } from "./harness.js";
+import type { CredentialFreeCaptureContext } from "./harness.js";
+import type { CommandSandboxMode } from "./config.js";
+import { validateCaptureGitRequest } from "./credential-free-capture.js";
 import { RUNNER_UID, WORKER_UID, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import { unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
 import { rmRunnerTeardownTree } from "./rmtree.js";
@@ -53,6 +56,121 @@ import {
   type SecretFinding,
 } from "./secret-scan-guard.js";
 import { lookupAttributes, type PathAttributes } from "./pr-size.js";
+
+// Capture acquisition and request issuance share GitCache canonical policy ownership.
+type Spawner = (request: BoundaryProcessRequest) => Promise<BoundaryProcessHandle>;
+interface Acquisition {
+  readonly spawn: Spawner;
+  readonly live: () => boolean;
+}
+const acquisitions = new WeakMap<CredentialFreeCaptureContext, Acquisition>();
+const requests = new WeakMap<BoundaryProcessRequest, { context: CredentialFreeCaptureContext; validate: () => void }>();
+interface Launch {
+  readonly command: string;
+  readonly args: readonly string[];
+  readonly cwd: string;
+  readonly env: NodeJS.ProcessEnv;
+  readonly identity: string;
+}
+const launches = new WeakMap<object, () => void>();
+
+function refuseCapture(): never {
+  throw new TrustedExecutionRefusal("credential-free capture launch refused");
+}
+
+/** Safety alone creates an acquisition, after the registry observed_empty check. */
+export function createCaptureContext(
+  signal: AbortSignal, deadlineAt: number, spawn: Spawner, live: () => boolean,
+): CredentialFreeCaptureContext {
+  const context = Object.freeze({ signal, deadlineAt }) as CredentialFreeCaptureContext;
+  acquisitions.set(context, { spawn, live });
+  return context;
+}
+
+function acquisition(context: CredentialFreeCaptureContext): Acquisition {
+  const held = acquisitions.get(context);
+  if (!held || !held.live() || context.signal.aborted || Date.now() >= context.deadlineAt) refuseCapture();
+  return held;
+}
+
+/** Bind privately inside GitCache; callers receive no spawner on the context. */
+function captureGitSpawner(
+  context: CredentialFreeCaptureContext,
+  bindValidation: (request: BoundaryProcessRequest) => () => void,
+): Spawner {
+  acquisition(context);
+  return (raw) => {
+    acquisition(context);
+    // Copy before the first await: no retained caller-owned array or env survives.
+    const request = Object.freeze({ ...raw, argv: Object.freeze([...raw.argv]), env: Object.freeze({ ...raw.env }) });
+    const validate = bindValidation(request);
+    const check = () => { acquisition(context); validate(); };
+    check();
+    requests.set(request, { context, validate: check });
+    return acquisition(context).spawn(request);
+  };
+}
+
+export function assertCaptureRequest(context: CredentialFreeCaptureContext, request: BoundaryProcessRequest): void {
+  const held = requests.get(request);
+  if (!held || held.context !== context) refuseCapture();
+  held.validate();
+}
+
+export function isCaptureRequest(request: BoundaryProcessRequest): boolean {
+  return requests.has(request);
+}
+
+/** The executor binds its trusted identity/sandbox transformation before launch. */
+export function bindCaptureLaunch(request: BoundaryProcessRequest, spec: Launch, mode: CommandSandboxMode): void {
+  const held = requests.get(request);
+  if (!held) return;
+  held.validate();
+  const checkTransformation = () => {
+    if (spec.identity !== request.identity || spec.cwd !== request.cwd) refuseCapture();
+    let argv: readonly string[];
+    if (request.identity === "command") {
+      const tmp = spec.env.HOME;
+      if (!tmp || !/^\/tmp\/uzi-codex-command-[0-9a-f-]{36}$/.test(tmp) ||
+          spec.env.TMPDIR !== tmp || spec.command !== "/usr/local/bin/uzi-codex-command-sandbox" ||
+          spec.args[0] !== "--root" || spec.args[1] !== request.cwd ||
+          spec.args[2] !== "--tmp" || spec.args[3] !== tmp ||
+          spec.args[4] !== "--cwd" || spec.args[5] !== request.cwd ||
+          spec.args[6] !== "--mode" || spec.args[7] !== mode ||
+          (mode !== "required" && mode !== "best-effort" && mode !== "off") ||
+          spec.args[8] !== "--") refuseCapture();
+      argv = spec.args.slice(9);
+    } else argv = [spec.command, ...spec.args];
+    if (argv.length !== request.argv.length || argv.some((arg, i) => arg !== request.argv[i])) refuseCapture();
+    const keys = new Set([...Object.keys(spec.env), ...Object.keys(request.env)]);
+    for (const key of keys) {
+      if (request.identity === "command" && (key === "HOME" || key === "TMPDIR")) continue;
+      if (spec.env[key] !== request.env[key] || Object.hasOwn(spec.env, key) !== Object.hasOwn(request.env, key)) refuseCapture();
+    }
+  };
+  checkTransformation();
+  const command = spec.command;
+  const args = Object.freeze([...spec.args]);
+  const cwd = spec.cwd;
+  const identity = spec.identity;
+  const env = Object.freeze({ ...spec.env });
+  Object.freeze(spec.args);
+  Object.freeze(spec.env);
+  Object.freeze(spec);
+  launches.set(spec, () => {
+    held.validate();
+    checkTransformation();
+    if (spec.command !== command || spec.cwd !== cwd || spec.identity !== identity ||
+        spec.args.length !== args.length || spec.args.some((arg, i) => arg !== args[i]) ||
+        Object.keys(spec.env).length !== Object.keys(env).length ||
+        Object.entries(spec.env).some(([key, value]) => env[key] !== value)) refuseCapture();
+  });
+}
+
+/** Synchronous final check at the real supervisor spawn, after all wrapper awaits. */
+export function assertCaptureLaunch(spec: Launch): void {
+  launches.get(spec)?.();
+}
 
 const execFileAsync = promisify(execFile);
 
@@ -634,6 +752,7 @@ const PATCH_SCAN_TIMEOUT_MS = 2 * 60_000;
 export type BoundaryProcessSpawner = (request: BoundaryProcessRequest) => Promise<BoundaryProcessHandle>;
 
 interface BoundaryProcessScope {
+  capture?: CredentialFreeCaptureContext;
   spawn: BoundaryProcessSpawner;
   signal: AbortSignal;
   /** Checkpoint-only budget. The soft signal may forfeit a queued lock or abort
@@ -2132,6 +2251,13 @@ export class GitCache {
   // At capacity, pinning still works but returns no retirement receipt (retention).
   private readonly codeSnapshotFreshReceipts = new Set<string>();
   private readonly boundaryProcesses = new AsyncLocalStorage<BoundaryProcessScope>();
+  private readonly captureSynthesis = new AsyncLocalStorage<{
+    argv: readonly string[]; env: NodeJS.ProcessEnv; live: () => boolean;
+  }>();
+  private readonly captureCancelContent = new AsyncLocalStorage<{
+    context: CredentialFreeCaptureContext; argv: readonly string[]; env: NodeJS.ProcessEnv;
+    cwd: string; deadline: number; live: () => boolean; checkBudget: () => void;
+  }>();
   private readonly reportProofs = new AsyncLocalStorage<{ signal: AbortSignal; deadline: number; owedBytes: number; configBytes: number }>();
 
   /** Optional observational budget, isolated from concurrent capture/cleanup operations. */
@@ -2291,10 +2417,101 @@ export class GitCache {
     action: () => Promise<T>,
     hooks: { beforeLockRelease?: (key: string) => Promise<void>; softSignal?: AbortSignal; softDeadlineAt?: number; now?: () => number } = {},
   ): Promise<T> {
+    if (this.boundaryProcesses.getStore()?.capture) throw new Error("capture spawner cannot be replaced");
     return this.boundaryProcesses.run(
       { spawn: spawner, signal, ...hooks },
       action,
     );
+  }
+
+  /** Bind the opaque safety context privately. The runner supplies no command spawner. */
+  withCredentialFreeCapture<T>(context: CredentialFreeCaptureContext, action: () => Promise<T>): Promise<T> {
+    if (this.boundaryProcesses.getStore()) throw new Error("capture scope cannot overlay a process scope");
+    const base = gitEnv();
+    // Enumerate only worker-owned, fixed decorations used by the capture readers.
+    // No caller credential/config overlay enters. The canonical worker-owned global
+    // config path (used by isolated forge fixtures) stays exactly as gitEnv built it.
+    const environments: NodeJS.ProcessEnv[] = [];
+    const fixedDecorations = [
+      { GIT_OPTIONAL_LOCKS: "0" },
+      { GIT_NO_REPLACE_OBJECTS: "1" },
+      { GIT_SHALLOW_FILE: "/dev/null" },
+      { GIT_GRAFT_FILE: "/dev/null" },
+      { GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL },
+    ];
+    let bases: NodeJS.ProcessEnv[] = [base];
+    // Five fixed flags produce at most thirty-two bases; no I/O or retry.
+    for (const decoration of fixedDecorations) bases = [...bases, ...bases.map(env => ({ ...env, ...decoration }))];
+    for (const env of bases) {
+      environments.push(env, workerSpawnEnv(env));
+      const runner = { ...env, PATH: runnerPath() };
+      const tmp = runnerTmpdir();
+      for (const decorated of [runner, ...(tmp ? [{ ...runner, TMPDIR: tmp }] : [])]) {
+        environments.push(unmarkedSpawnEnv(decorated), workerSpawnEnv(decorated),
+          { ...workerSpawnEnv(decorated), GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL });
+      }
+    }
+    for (const env of environments) Object.freeze(env);
+    const spawn = captureGitSpawner(context, request => {
+      // Capture the private invocation at issuance, then retain it through the final
+      // launcher check. Shape-valid paths/dates alone grant no synthesis authority.
+      const synthesis = this.captureSynthesis.getStore();
+      const helper = this.captureCancelContent.getStore();
+      const dynamic = this.captureSynthesisEnvironment(request.env);
+      const hasDynamic = Object.keys(dynamic).length > 0;
+      const candidates = hasDynamic && synthesis ? environments.map(env => ({ ...env, ...synthesis.env })) : environments;
+      return () => {
+        if (request.argv[0] === process.execPath) {
+          if (!helper || helper.context !== context || !helper.live() || request.identity !== "command" ||
+              request.cwd !== helper.cwd || request.argv.length !== helper.argv.length ||
+              request.argv.some((arg, i) => arg !== helper.argv[i]) ||
+              Object.keys(request.env).length !== Object.keys(helper.env).length ||
+              Object.entries(request.env).some(([key, value]) => !Object.hasOwn(helper.env, key) || helper.env[key] !== value) ||
+              !Number.isSafeInteger(helper.deadline) || Date.now() >= helper.deadline) refuseCapture();
+          helper.checkBudget();
+        }
+        if (hasDynamic && (!synthesis || !synthesis.live() || request.identity !== "worker_pat" || request.cwd !== "/" ||
+            request.argv.length !== synthesis.argv.length || request.argv.some((arg, i) => arg !== synthesis.argv[i]))) refuseCapture();
+        validateCaptureGitRequest(request, candidates, GIT_BIN, process.execPath, CANCEL_CONTENT_HELPER);
+      };
+    });
+    return this.boundaryProcesses.run({ capture: context, spawn, signal: context.signal }, action);
+  }
+
+  /** Credentialed overlays are refused at their entry, before any source work. */
+  assertCredentialedCaptureAllowed(): void {
+    if (this.boundaryProcesses.getStore()?.capture) throw new Error("credentialed overlay unavailable during capture");
+  }
+
+  private captureSynthesisEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    const result: NodeJS.ProcessEnv = {};
+    for (const [key, value] of Object.entries(env)) {
+      if (key === "GIT_AUTHOR_NAME" || key === "GIT_COMMITTER_NAME") {
+        if (value !== AGENT_GIT_IDENTITY.name) throw new Error("capture author identity refused");
+      } else if (key === "GIT_AUTHOR_EMAIL" || key === "GIT_COMMITTER_EMAIL") {
+        if (value !== AGENT_GIT_IDENTITY.email) throw new Error("capture author identity refused");
+      } else if (key === "GIT_AUTHOR_DATE" || key === "GIT_COMMITTER_DATE") {
+        if (!value || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})$/.test(value) || !Number.isFinite(Date.parse(value)))
+          throw new Error("capture commit date refused");
+      } else if (key === "GIT_INDEX_FILE" || key === "GIT_WORK_TREE") {
+        const prefix = key === "GIT_INDEX_FILE" ? "uzi-ckpt-idx-" : "uzi-ckpt-work-";
+        if (!value || path.dirname(value) !== os.tmpdir() || !path.basename(value).startsWith(prefix) ||
+            !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(path.basename(value).slice(prefix.length)))
+          throw new Error("capture synthesis path refused");
+      } else continue;
+      result[key] = value;
+    }
+    return result;
+  }
+
+  private assertCaptureDecoration(extra: NodeJS.ProcessEnv | undefined): void {
+    if (!this.boundaryProcesses.getStore()?.capture || !extra) return;
+    const allowed: NodeJS.ProcessEnv = { GIT_OPTIONAL_LOCKS: "0", GIT_NO_REPLACE_OBJECTS: "1",
+      GIT_SHALLOW_FILE: "/dev/null", GIT_GRAFT_FILE: "/dev/null", GIT_NO_LAZY_FETCH: "1",
+      GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL, ...this.captureSynthesisEnvironment(extra) };
+    if (Object.entries(extra).some(([key, value]) => !Object.hasOwn(allowed, key) || allowed[key] !== value)) {
+      throw new Error("capture environment overlay refused");
+    }
   }
 
   /** issue #1597 M2: run `fn` holding the per-bare serialization lock (the same one every bare
@@ -3533,6 +3750,7 @@ export class GitCache {
   /** The recursive delete itself (see {@link deleteRetainedArtifact}, and M3's
    *  {@link freeCanonicalClonePath}): runner-uid under the split, in-process single-uid. */
   private async runRunnerUidDelete(target: string): Promise<void> {
+    if (this.boundaryProcesses.getStore()?.capture) throw new Error("capture cannot run an unsupervised delete");
     const split = this.retentionDeleteSeam?.split ?? uidSplitActive();
     if (!split) {
       await fs.rm(target, { recursive: true, force: true });
@@ -6269,6 +6487,7 @@ export class GitCache {
   async normalizeRetainedSourceObjects(
     barePath: string, branch: string, key: string, expectedSource: RecoverySource,
   ): Promise<void> {
+    if (this.boundaryProcesses.getStore()?.capture) refuseCapture();
     const operation = this.recoveryOperations.getStore();
     if (!operation) throw new Error("retained_readiness_operation_required");
     // The lock may report an expired operation after its callback settles. Keep
@@ -6719,8 +6938,9 @@ export class GitCache {
     // or added alternates within this operation can escape re-hashing when directory
     // identities and cached type/size metadata match.
     // Ignore replacement, shallow and graft views, and forbid promisor lazy fetch.
-    const env = { ...gitEnv(), GIT_NO_REPLACE_OBJECTS: "1", GIT_SHALLOW_FILE: "/dev/null",
-      GIT_GRAFT_FILE: "/dev/null", GIT_NO_LAZY_FETCH: "1", GIT_ALLOW_PROTOCOL: "none" };
+    const decoration = { GIT_NO_REPLACE_OBJECTS: "1", GIT_SHALLOW_FILE: "/dev/null",
+      GIT_GRAFT_FILE: "/dev/null", GIT_NO_LAZY_FETCH: "1", GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL };
+    const env = { ...gitEnv(), ...decoration };
     const read = binding?.read ?? (async (args: string[], input?: string): Promise<string> =>
       (await this.execScoped("git", withDir(barePath, ["--no-replace-objects", ...args]),
         { env, timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER, ...(input === undefined ? {} : { input }) })).stdout);
@@ -6764,7 +6984,7 @@ export class GitCache {
         const input = objects.map(object => object.oid).join("\n") + "\n";
         producer = binding ? await binding.spawn(["cat-file", "--batch"], input) :
           await this.spawnGit(barePath, ["--no-replace-objects", "cat-file", "--batch"], input,
-            { env, timeoutMs: GIT_TIMEOUT_MS, stderrMaxBytes: 4096, cancelOnAbandon: true, stdoutCategory: "closure" });
+            { env: decoration, timeoutMs: GIT_TIMEOUT_MS, stderrMaxBytes: 4096, cancelOnAbandon: true, stdoutCategory: "closure" });
         await verifyClosureFrames(producer.stdout, objects, budget, operation?.signal);
         if (await producer.exited !== 0) return false;
       }
@@ -10255,11 +10475,11 @@ export class GitCache {
     try {
       await fs.mkdir(tmpWork, { recursive: true });
       const idxEnv: NodeJS.ProcessEnv = { GIT_INDEX_FILE: tmpIdx };
-      await this.runGitWithEnv(barePath, ["read-tree", realTip], idxEnv);
+      await this.runSynthesisGit(barePath, ["read-tree", realTip], idxEnv);
       // `--ignore-unmatch` is load-bearing: against a temp index a `git rm --cached` with no
       // match exits non-zero, so this flag makes the no-`.github`/already-deleted edges no-ops
       // (the same flag `alignBranchWithDefault` carries).
-      await this.runGitWithEnv(
+      await this.runSynthesisGit(
         barePath,
         ["rm", "--cached", "-r", "--ignore-unmatch", ".github/workflows"],
         idxEnv,
@@ -10271,13 +10491,13 @@ export class GitCache {
         await this.runGit(barePath, ["ls-tree", workflowSource, "--", ".github/workflows"])
       ).trim();
       if (sourceWfTree.length > 0) {
-        await this.runGitWithEnv(
+        await this.runSynthesisGit(
           barePath,
           ["read-tree", "--prefix=.github/workflows", `${workflowSource}:.github/workflows`],
           { ...idxEnv, GIT_WORK_TREE: tmpWork },
         );
       }
-      const newRoot = (await this.runGitWithEnv(barePath, ["write-tree"], idxEnv)).trim();
+      const newRoot = (await this.runSynthesisGit(barePath, ["write-tree"], idxEnv)).trim();
       if (!/^[0-9a-f]{40}$/.test(newRoot)) return null;
       const realTipTree = (await this.runGit(barePath, ["rev-parse", `${realTip}^{tree}`])).trim();
       if (!keepTreeEqual && newRoot === realTipTree) return null;
@@ -10289,7 +10509,7 @@ export class GitCache {
       for (const p of parents) commitArgs.push("-p", p);
       commitArgs.push("-m", message);
       const sha = (
-        await this.runGitWithEnv(barePath, commitArgs, {
+        await this.runSynthesisGit(barePath, commitArgs, {
           ...idxEnv,
           GIT_AUTHOR_NAME: AGENT_GIT_IDENTITY.name,
           GIT_AUTHOR_EMAIL: AGENT_GIT_IDENTITY.email,
@@ -11434,16 +11654,41 @@ export class GitCache {
       const ignored = await read(["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--", ":(glob)**/.gitignore", ":(exclude).uzi/scratch/**"]);
       if (ignored.split("\0").some(entry => entry && !entry.startsWith(".uzi/scratch/"))) return null;
       const report = this.reportProofs.getStore();
-      const args = ["-e", CANCEL_CONTENT_HELPER, cwd, ...(report ? [String(report.deadline)] : [])];
+      const capture = this.boundaryProcesses.getStore()?.capture;
+      const recovery = capture ? this.recoveryOperation() : undefined;
+      const now = Date.now();
+      // Allocate once: fractional monotonic maintenance time is rounded down;
+      // later launch checks consume the same deadline rather than renewing it.
+      const deadline = capture ? Math.floor(Math.min(now + 28000, capture.deadlineAt,
+        report?.deadline ?? Infinity, recovery?.deadline ?? Infinity,
+        recovery?.budget ? now + Math.floor(recovery.budget.remainingMs()) : Infinity)) : undefined;
+      if (capture && (!Number.isSafeInteger(deadline) || deadline! <= now)) refuseCapture();
+      const args = ["-e", CANCEL_CONTENT_HELPER, cwd,
+        ...(capture ? [String(deadline)] : report ? [String(report.deadline)] : [])];
       const wrapped = this.boundaryProcesses.getStore()
         ? { command: process.execPath, args }
         : runnerCommand(process.execPath, args);
       const input = JSON.stringify(manifest);
       if (Buffer.byteLength(input) > 2 * 1024 * 1024) return exhausted("manifest_bytes");
-      const proof = await this.execScoped(wrapped.command, wrapped.args, {
-        env: unmarkedSpawnEnv({ ...gitEnv(), PATH: runnerPath() }),
-        cwd, input, timeout: 30000, maxBuffer: 1024,
+      const env = Object.freeze(unmarkedSpawnEnv({ ...gitEnv(), PATH: runnerPath() }));
+      const execute = () => this.execScoped(wrapped.command, wrapped.args, {
+        env, cwd, input, timeout: 30000, maxBuffer: 1024,
       }, "command");
+      let proof: { stdout: string; stderr: string };
+      if (capture) {
+        let live = true;
+        Object.freeze(wrapped.args);
+        const argv = Object.freeze([wrapped.command, ...wrapped.args]);
+        const checkBudget = () => {
+          report?.signal.throwIfAborted();
+          recovery?.signal.throwIfAborted();
+          recovery?.budget?.check();
+        };
+        try {
+          proof = await this.captureCancelContent.run({ context: capture, argv, env, cwd,
+            deadline: deadline!, live: () => live, checkBudget }, execute);
+        } finally { live = false; }
+      } else proof = await execute();
       if (proof.stdout !== "clean\n") return null;
       const after = (await read(["rev-parse", "--verify", "HEAD^{commit}"])).trim();
       return status.length === 0 && before === after ? after : null;
@@ -12953,6 +13198,7 @@ try {
       index: { path: string; byteSize: number; objectCount: number }; sourceSha: string }) => Promise<void>,
     knownBase?: { barePath: string; identity: string },
   ): Promise<void> {
+    if (this.boundaryProcesses.getStore()?.capture) throw new Error("capture private verification refused");
     MaintenanceResources.check();
     if (!this.boundaryProcesses.getStore() || !this.recoveryOperations.getStore() ||
         !SHA40_RE.test(tip) || typeof beforeEffect !== "function" || typeof consume !== "function") {
@@ -14953,7 +15199,7 @@ try {
         `bridge: restore published tip ${floors[0]} as an ancestor of ${tip} (tree unchanged)`,
       );
       const sha = (
-        await this.runGitWithEnv(barePath, args, {
+        await this.runSynthesisGit(barePath, args, {
           GIT_AUTHOR_NAME: AGENT_GIT_IDENTITY.name,
           GIT_AUTHOR_EMAIL: AGENT_GIT_IDENTITY.email,
           GIT_COMMITTER_NAME: AGENT_GIT_IDENTITY.name,
@@ -15127,7 +15373,7 @@ try {
     this.checkRecoveryInterruption();
     MaintenanceBudget.current()?.check();
     const scope = this.boundaryProcesses.getStore();
-    if (scope?.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE);
+    if (scope?.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE, undefined, scope.capture?.signal);
     if (scope?.softSignal?.aborted || (scope?.softDeadlineAt !== undefined && (scope.now ?? Date.now)() >= scope.softDeadlineAt)) {
       throw new CheckpointSoftDeadlineError();
     }
@@ -15155,11 +15401,16 @@ try {
   /** A hard permit abort is not evidence that a candidate contains scratch files. */
   private boundaryAbortError(cause: unknown): Error | undefined {
     const scope = this.boundaryProcesses.getStore();
+    // Capture identity must not be inferred from a later abort. Outside capture,
+    // preserve the existing hard-abort precedence over cooperative stops.
+    if (scope?.capture && (cause instanceof GitBoundaryAbortError || cause instanceof CheckpointSoftDeadlineError ||
+        cause instanceof TrustedExecutionRefusal)) return cause;
     if (scope?.signal.aborted) {
       const message = cause instanceof Error && cause.message === GIT_OUTPUT_ABORT_MESSAGE
         ? GIT_OUTPUT_ABORT_MESSAGE
         : "permit-held git operation aborted";
-      return new GitBoundaryAbortError(message, cause);
+      return new GitBoundaryAbortError(message, cause,
+        scope.capture?.signal.aborted && cause === scope.capture.signal.reason ? scope.capture.signal : undefined);
     }
     if (cause instanceof CheckpointSoftDeadlineError || cause instanceof TrustedExecutionRefusal) return cause;
     if (cause instanceof CheckpointChildStartupTimeoutError) {
@@ -15416,7 +15667,7 @@ try {
     }
     const cwd = options.cwd ?? (identity === "command" ? commandCwd(args) : "/");
     const executable = resolveBoundaryExecutable(command);
-    if (boundary.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE);
+    if (boundary.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE, undefined, boundary.capture?.signal);
     if (boundary.softSignal?.aborted || (boundary.softDeadlineAt !== undefined && (boundary.now ?? Date.now)() >= boundary.softDeadlineAt)) {
       throw new CheckpointSoftDeadlineError();
     }
@@ -15531,7 +15782,7 @@ try {
       throw this.boundaryAbortError(settled[2].reason) ?? settled[2].reason;
     }
     terminal = settled[2].value;
-    if (boundary.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE);
+    if (boundary.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE, undefined, boundary.capture?.signal);
     if (terminal.softTimedOut) throw new CheckpointSoftDeadlineError();
     if (settled[0].status === "rejected") throw this.boundaryAbortError(settled[0].reason) ?? settled[0].reason;
     if (settled[1].status === "rejected") throw this.boundaryAbortError(settled[1].reason) ?? settled[1].reason;
@@ -15559,6 +15810,9 @@ try {
   }
 
   private async runGit(cwd: string | undefined, args: string[], pat?: string, scope?: string, username?: string): Promise<string> {
+    if (this.boundaryProcesses.getStore()?.capture && (pat !== undefined || scope !== undefined || username !== undefined)) {
+      throw new Error("capture credentials refused");
+    }
     const env = gitEnv(pat, scope, username);
     // Log args only; the PAT lives in env (GIT_CONFIG_VALUE_n), never in args.
     this.log.debug("git", { cwd, args });
@@ -15590,6 +15844,22 @@ try {
     }
   }
 
+  /** Bind values allocated/read by the private object-DB producers to this exact
+   * invocation. Revocation follows the awaited child; no sibling inherits authority. */
+  private async runSynthesisGit(cwd: string, args: string[], extraEnv: NodeJS.ProcessEnv): Promise<string> {
+    if (!this.boundaryProcesses.getStore()?.capture) return this.runGitWithEnv(cwd, args, extraEnv);
+    let live = true;
+    const env = Object.freeze({ ...extraEnv });
+    const invocationArgs = Object.freeze([...args]);
+    const argv = Object.freeze([GIT_BIN, ...withDir(cwd, [...invocationArgs])]);
+    try {
+      return await this.captureSynthesis.run({ argv, env, live: () => live },
+        () => this.runGitWithEnv(cwd, invocationArgs, env));
+    } finally {
+      live = false;
+    }
+  }
+
   /**
    * PRD #1062 M2 (#1036) — a worker-uid git that carries EXTRA environment on top of the base
    * `gitEnv()` (no PAT): `GIT_INDEX_FILE` for a temp-index synthesis, `GIT_WORK_TREE` for the
@@ -15600,13 +15870,14 @@ try {
    */
   private async runGitWithEnv(
     cwd: string | undefined,
-    args: string[],
+    args: readonly string[],
     extraEnv: NodeJS.ProcessEnv,
   ): Promise<string> {
+    this.assertCaptureDecoration(extraEnv);
     const env = { ...gitEnv(), ...extraEnv };
     this.log.debug("git (env)", { cwd, args });
     try {
-      const { stdout } = await this.execScoped("git", withDir(cwd, args), {
+      const { stdout } = await this.execScoped("git", withDir(cwd, [...args]), {
         env,
         timeout: GIT_TIMEOUT_MS,
         maxBuffer: GIT_MAX_BUFFER,
@@ -15654,6 +15925,10 @@ try {
     stdin?: string | Buffer,
     opts: SpawnGitOptions = {},
   ): Promise<{ child?: ChildProcess; stdin?: Writable; stdout: Readable; exited: Promise<number>; settled: () => Promise<void>; cancel: () => void }> {
+    if (this.boundaryProcesses.getStore()?.capture && opts.trustedExecutable) {
+      throw new Error("capture trusted executable refused");
+    }
+    this.assertCaptureDecoration(opts.env);
     const env = opts.trustedExecutable ? { ...opts.env } : { ...gitEnv(), ...opts.env };
     const metered = MaintenanceResources.active();
     const producerScope = AsyncLocalStorage.snapshot();
@@ -15667,7 +15942,7 @@ try {
     const recovery = this.recoveryOperation();
     recovery?.signal.throwIfAborted();
     if (boundary) {
-      if (boundary.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE);
+      if (boundary.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE, undefined, boundary.capture?.signal);
       if (boundary.softSignal?.aborted || (boundary.softDeadlineAt !== undefined && (boundary.now ?? Date.now)() >= boundary.softDeadlineAt)) {
         throw new CheckpointSoftDeadlineError();
       }
@@ -15884,6 +16159,7 @@ try {
   ): Promise<Buffer> {
     const boundary = this.boundaryProcesses.getStore();
     if (!boundary) throw new Error("bounded runner stdout requires a trusted boundary spawner");
+    if (boundary.capture) throw new Error("arbitrary bounded stdout helpers are unavailable during capture");
     if (!path.isAbsolute(cwd) || !argv[0] || !path.isAbsolute(argv[0])) {
       throw new Error("bounded runner stdout requires trusted absolute executable and clone cwd");
     }
@@ -15946,6 +16222,7 @@ try {
    * security-relevant key.
    */
   private async runGitAsRunner(cwd: string | undefined, args: string[], opts: { timeoutMs?: number; env?: NodeJS.ProcessEnv; input?: string } = {}): Promise<string> {
+    this.assertCaptureDecoration(opts.env);
     const base = { ...gitEnv(), ...opts.env };
     // issue #1783 (R4): worker-marked ONLY when the subcommand can run no code the clone
     // configures (runnerGitCarriesWorkerMark), so a concurrent reap never kills that op. Every
@@ -16182,6 +16459,7 @@ try {
   /** Run git, returning the exit code (0 on success) instead of throwing. */
   private async tryGit(cwd: string | undefined, args: string[], pat?: string): Promise<number> {
     // issue #2213: built outside the try so a quarantine refusal is never read as an exit code.
+    if (this.boundaryProcesses.getStore()?.capture && pat !== undefined) throw new Error("capture credentials refused");
     const env = gitEnv(pat);
     try {
       await this.execScoped("git", withDir(cwd, args), { env, timeout: GIT_TIMEOUT_MS });
@@ -16202,6 +16480,7 @@ try {
    *  keeps its historical coerce-to-1 for callers that only care whether the op succeeded; this
    *  sibling exists for callers (ancestry) that MUST NOT treat a broken read as a data answer. */
   private async tryGitExit(cwd: string | undefined, args: string[], pat?: string): Promise<number | null> {
+    if (this.boundaryProcesses.getStore()?.capture && pat !== undefined) throw new Error("capture credentials refused");
     const env = gitEnv(pat);
     try {
       await this.execScoped("git", withDir(cwd, args), { env, timeout: GIT_TIMEOUT_MS });
@@ -17231,7 +17510,7 @@ try {
           const args = ["--no-replace-objects", "-c", "commit.gpgsign=false", "commit-tree", tree];
           for (const parent of parents.slice(start, start + 32)) args.push("-p", parent);
           args.push("-m", `uzi recovery coverage ${fingerprint} round ${round} batch ${start / 32}`);
-          const sha = (await this.runGitWithEnv(barePath, args, {
+          const sha = (await this.runSynthesisGit(barePath, args, {
             GIT_AUTHOR_NAME: AGENT_GIT_IDENTITY.name, GIT_AUTHOR_EMAIL: AGENT_GIT_IDENTITY.email,
             GIT_COMMITTER_NAME: AGENT_GIT_IDENTITY.name, GIT_COMMITTER_EMAIL: AGENT_GIT_IDENTITY.email,
             GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z", GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z",
@@ -17403,7 +17682,7 @@ try {
       settled = true;
       removeAbortListener();
       rejectResult(signal?.aborted ? new Error(GIT_LOCK_WAIT_ABORT_MESSAGE) : scope?.signal.aborted
-        ? new GitBoundaryAbortError(GIT_LOCK_WAIT_ABORT_MESSAGE)
+        ? new GitBoundaryAbortError(GIT_LOCK_WAIT_ABORT_MESSAGE, undefined, boundary?.capture?.signal)
         : new CheckpointSoftDeadlineError());
     };
     if (scope || signal) {

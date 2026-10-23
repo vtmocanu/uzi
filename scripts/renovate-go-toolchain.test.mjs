@@ -147,10 +147,10 @@ const sqlcWrapperDeps = extract(
   read("scripts/sqlc.sh"),
   "scripts/sqlc.sh",
 );
-assertEqual(sqlcWrapperDeps.length, 2, "sqlc platform dependency count");
+assertEqual(sqlcWrapperDeps.length, 3, "sqlc platform dependency count");
 assertEqual(
   sqlcWrapperDeps.map((dep) => dep.depName).sort().join(","),
-  "sqlc-darwin-arm64,sqlc-linux-amd64",
+  "sqlc-darwin-arm64,sqlc-linux-amd64,sqlc-linux-arm64",
   "sqlc dependency aliases",
 );
 const sqlcCIDeps = extract(
@@ -162,7 +162,7 @@ assertEqual(sqlcCIDeps.length, 1, "sqlc CI dependency count");
 const sqlcDeps = [...sqlcCIDeps, ...sqlcWrapperDeps];
 assertEqual(new Set(sqlcDeps.map((dep) => dep.currentValue)).size, 1, "sqlc versions must agree");
 assertEqual(
-  new Set(sqlcWrapperDeps.map((dep) => dep.currentDigest)).size, 2,
+  new Set(sqlcWrapperDeps.map((dep) => dep.currentDigest)).size, 3,
   "sqlc platform archives need distinct digests",
 );
 assertEqual(
@@ -178,5 +178,25 @@ for (const dep of sqlcDeps) {
     assertEqual(resolved(dep, updateType).separateMajorMinor, false, `${dep.depName} separation`);
   }
 }
+
+const flake = config.customManagers.find(manager => manager.depNameTemplate === "worker-go-nixpkgs");
+assert(flake, "worker Go flake manager is missing");
+assertEqual(flake.datasourceTemplate, "git-refs", "worker Go datasource");
+assertEqual(flake.currentValueTemplate, "nixpkgs-unstable", "worker Go channel");
+assertEqual(flake.packageNameTemplate, "https://github.com/NixOS/nixpkgs", "worker Go repository");
+const digests = [];
+for (const file of ["agent/devbox-global/devbox.json", "agent/devbox-global/toolchain-guard.tsv", "api/internal/toolseed/devbox.json"]) {
+  assert(flake.managerFilePatterns.some(pattern => matchesPattern(file, pattern)), `${file} must be refreshed together`);
+  const deps = extract(flake, read(file), file);
+  assertEqual(deps.length, 1, `${file} worker Go dependency count`);
+  assert(/^[a-f0-9]{40}$/.test(deps[0].currentDigest), `${file} immutable digest`);
+  digests.push(deps[0].currentDigest);
+}
+assertEqual(new Set(digests).size, 1, "manifest, seed and guard Go revisions agree");
+const manual = config.packageRules.find(rule => rule.matchDepNames?.includes("worker-go-nixpkgs"));
+assertEqual(manual.automerge, false, "worker Go digest needs maintainer lock/image review");
+assertEqual(JSON.stringify(manual.schedule), JSON.stringify(["* 0-5 1 * *"]), "worker Go digest updates are monthly");
+assertEqual(manual.minimumReleaseAgeBehaviour, "timestamp-optional", "git-refs has no release timestamp");
+assert(manual.prBodyNotes.some(note => note.includes("lock")), "worker Go PR must explain lock work");
 
 console.log("Renovate Go-toolchain contract: PASS");

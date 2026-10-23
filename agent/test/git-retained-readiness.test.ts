@@ -10,6 +10,7 @@ import { GitCache, type RecoveryJournalEntry } from "../src/git.js";
 import { CodexLaunchError, SUPERVISOR_BIN, type CodexRootHandle, type CodexEffectLaunchSpec } from "../src/codex/launcher.js";
 import { recoveryProgress, type RecoverySource } from "../src/recovery-progress.js";
 import type { Logger } from "../src/log.js";
+import { codexRig } from "./runner-codex-sinks-fixture.js";
 
 const worktree = fileURLToPath(new URL("../../", import.meta.url));
 const scratch = path.join(worktree, ".uzi/scratch");
@@ -431,15 +432,16 @@ describe("runner retained readiness ordering and custody", async () => {
       };
       h.client.releaseRecoveryCustody = async () => { releases++; throw Error("custody release forbidden"); };
       const log = recordingLogger();
+      const capture = codexRig().capture;
       const r = h.runnerWith(runId => ({
         homeDir: path.join(h.homeDir, runId),
         executor: {
           sandboxesCommands: true,
-          run: async () => { models++; throw Error("model admission forbidden"); },
-          settleForCredentialFreeCapture: async () => {
+          withCredentialFreeCapture: (ms, action, purpose, signal) => {
             events.push("settle");
-            return { kind: "observed_empty" };
+            return capture(ms, action, purpose, signal);
           },
+          run: async () => { models++; throw Error("model admission forbidden"); },
         },
       }), h.fakeGitlab().gitlab, undefined, log.logger, { recoveryRetryMs: 1 });
       await r.execute(claim);
@@ -547,12 +549,16 @@ describe("runner retained readiness ordering and custody", async () => {
     h.git.prepareRecoverySuccessor = async () => { adoptions++; throw Error("fixture stops at adoption"); };
     h.client.releaseRecoveryCustody = async () => { releases++; throw Error("custody release forbidden"); };
     const log = recordingLogger();
+    const capture = codexRig().capture;
     const r = h.runnerWith(runId => ({
       homeDir: path.join(h.homeDir, runId),
       executor: {
         sandboxesCommands: fault === "legacy" ? false : fault === "profile" ? "unknown" as unknown as boolean : true,
+        withCredentialFreeCapture: (ms, action, purpose, signal) => {
+          events.push("settle");
+          return capture(ms, action, purpose, signal);
+        },
         run: async () => { models++; throw Error("model forbidden"); },
-        settleForCredentialFreeCapture: async () => { events.push("settle"); return { kind: "observed_empty" }; },
       },
     }), h.fakeGitlab().gitlab, undefined, log.logger, { recoveryRetryMs: 1 });
     await r.execute(claim);

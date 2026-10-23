@@ -32,9 +32,28 @@ export class CheckpointSoftDeadlineError extends Error {
 /** Shared hard Git boundary discriminator; independent of the Codex implementation. */
 export class GitBoundaryAbortError extends Error {
   readonly checkpointBoundary = "hard";
-  constructor(message: string, cause?: unknown) {
+  readonly #captureSignal?: AbortSignal;
+  constructor(message: string, cause?: unknown, captureSignal?: AbortSignal) {
     super(message, { cause });
     this.name = "AbortError";
+    this.#captureSignal = captureSignal?.aborted ? captureSignal : undefined;
+  }
+
+  isCaptureRevocationFor(signal: AbortSignal): boolean {
+    return this.#captureSignal !== undefined && this.#captureSignal === signal;
+  }
+}
+
+/** Capture cancellation observed by the process owner, after any owned cleanup. */
+export class CaptureOperationRevokedError extends TrustedExecutionRefusal {
+  readonly #captureSignal?: AbortSignal;
+  constructor(message: string, captureSignal?: AbortSignal) {
+    super(message);
+    this.#captureSignal = captureSignal?.aborted ? captureSignal : undefined;
+  }
+
+  isCaptureRevocationFor(signal: AbortSignal): boolean {
+    return this.#captureSignal !== undefined && this.#captureSignal === signal;
   }
 }
 

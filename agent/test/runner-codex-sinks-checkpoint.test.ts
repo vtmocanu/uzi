@@ -125,7 +125,7 @@ describe("RunRunner #1900 — the Codex finalize boundary deadline and its named
     const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
       commitInTree(ctx.worktreePath, "SLOW-PASS.txt", "a slow editor pass\n");
       return { branch: ctx.branch };
-    });
+    }, undefined, rig.capture);
     const claim = gitlabClaim(1900);
     // Default deadlines: neither codexBoundaryDeadlineMs nor the finalize override is passed.
     await runnerWith(() => ({ executor: exec }), gitlab, undefined, undefined, {
@@ -149,7 +149,7 @@ describe("RunRunner #1900 — the Codex finalize boundary deadline and its named
     const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
       commitInTree(ctx.worktreePath, "NAMED-STEP.txt", "deadline during prepare\n");
       return { branch: ctx.branch };
-    });
+    }, undefined, rig.capture);
     const { logger, lines } = recordingLogger();
     const claim = gitlabClaim(1901);
     await runnerWith(() => ({ executor: exec }), gitlab, undefined, logger, {
@@ -188,7 +188,7 @@ describe("RunRunner #1900 — the Codex finalize boundary deadline and its named
         commitInTree(ctx.worktreePath, "ROUTE.txt", "milestone 1\n");
         await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
         return { branch: ctx.branch };
-      });
+      }, undefined, rig.capture);
       const claim = gitlabClaim(override === undefined ? 1902 : 1903);
       await runnerWith(() => ({ executor: exec }), gitlab, undefined, undefined,
         override === undefined ? {} : { codexFinalizeBoundaryDeadlineMs: override }).execute(claim);
@@ -215,7 +215,7 @@ describe("RunRunner #1900 — the Codex finalize boundary deadline and its named
     const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
       commitInTree(ctx.worktreePath, "STEPS.txt", "step logging\n");
       return { branch: ctx.branch };
-    });
+    }, undefined, rig.capture);
     const { logger, lines } = recordingLogger();
     const claim = gitlabClaim(1904);
     await runnerWith(() => ({ executor: exec }), gitlab, undefined, logger).execute(claim);
@@ -267,7 +267,7 @@ describe("RunRunner #1914 — Codex milestone checkpoint diagnostics", () => {
       commitInTree(ctx.worktreePath, "M1.txt", "deadline step\n");
       await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] }, sink: "milestone_checkpoint" });
       return { branch: ctx.branch };
-    });
+    }, undefined, rig.capture);
     const claim = gitlabClaim(1916, {
       repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, forge_type: "github" },
     });
@@ -347,7 +347,7 @@ describe("RunRunner #1914 — Codex milestone checkpoint diagnostics", () => {
       commitInTree(ctx.worktreePath, "M1.txt", "checkpoint diagnostics\n");
       await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] }, sink: "milestone_checkpoint" });
       return { branch: ctx.branch };
-    });
+    }, undefined, rig.capture);
     const claim = gitlabClaim(1914, {
       repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, forge_type: "github" },
     });
@@ -377,7 +377,7 @@ describe("RunRunner #1914 — Codex milestone checkpoint diagnostics", () => {
       commitInTree(ctx.worktreePath, "M1.txt", "checkpoint step timings\n");
       await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] }, sink: "milestone_checkpoint" });
       return { branch: ctx.branch };
-    });
+    }, undefined, rig.capture);
     const { logger, lines } = recordingLogger();
     const claim = gitlabClaim(1915);
     await runnerWith(() => ({ executor: exec }), gitlab, undefined, logger).execute(claim);
@@ -468,7 +468,7 @@ describe("RunRunner #1914 — a slow checkpoint overlay remains owed", () => {
       assert.equal(uploadedTips.length, 1, "the owed milestone was retried once without a new commit");
       assert.notEqual(uploadedTips[0], committedTip, "retry rebuilt the workflow overlay, rather than sending the raw tip");
       return { branch: ctx.branch };
-    });
+    }, undefined, rig.capture);
     const claim = gitlabClaim(1918, {
       repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, forge_type: "github" },
     });
@@ -569,7 +569,7 @@ describe("RunRunner #1914 — a slow checkpoint overlay remains owed", () => {
       assert.equal(tickResult, "published", "the ordinary tick settled the owed candidate");
       assert.deepEqual(tips, [milestoneTip], "the overlay-less, scratch-scanned tick packed the committed tip");
       return { branch: ctx.branch };
-    });
+    }, undefined, rig.capture);
     const claim = gitlabClaim(1922, {
       repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, forge_type: "github" },
     });
@@ -673,7 +673,7 @@ describe("RunRunner #1914 — a slow checkpoint overlay remains owed", () => {
       assert.deepEqual(confirmedTips, [], "the first flight reported no remote success");
       vaultLocked = true; // finalize parks for recovery without a credentialed push
       return { branch: ctx.branch };
-    }, rig1.settle);
+    }, undefined, rig1.capture);
     let reclaimedTip = "";
     let secondCheckpointReturned = false;
     try {
@@ -714,7 +714,7 @@ describe("RunRunner #1914 — a slow checkpoint overlay remains owed", () => {
           assert.equal(confirmedTips[0], committedTip, "credential-free predecessor recapture published the saved candidate");
           assert.notEqual(confirmedTips[1], committedTip, "the fresh attempt checkpoint was wrapped for the advanced workflow");
           return { branch: ctx.branch };
-        }, rig2.settle);
+        }, undefined, rig2.capture);
         return { executor: exec2 };
       };
       await runnerWith(factory2, gitlab, undefined, undefined, {
@@ -789,7 +789,7 @@ describe("RunRunner #1914 — a slow checkpoint overlay remains owed", () => {
       assert.equal(confirmed, 1, "the retry received the only published ACK");
       assert.equal(publishedStates.length, 1, "only the confirmed retry advanced published state");
       return { branch: ctx.branch };
-    });
+    }, undefined, rig.capture);
     const claim = gitlabClaim(1919, {
       repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, forge_type: "github" },
     });
@@ -895,7 +895,7 @@ describe("RunRunner #1914 — a slow checkpoint overlay remains owed", () => {
       secondReturned = true;
       assert.equal(published, 1, "a later guarded checkpoint retries and lands the committed tip once");
       return { branch: ctx.branch };
-    });
+    }, undefined, rig.capture);
     const claim = gitlabClaim(1920, {
       repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, forge_type: "github" },
     });
@@ -989,7 +989,7 @@ describe("RunRunner #1914 — a slow checkpoint overlay remains owed", () => {
       assert.equal(confirmed, 1, "the retried pack was the only confirmed publication");
       assert.equal(publishedStates.length, 1, "only the ACK advanced published state");
       return { branch: ctx.branch };
-    });
+    }, undefined, rig.capture);
     const originalRun = exec.run.bind(exec);
     exec.run = async (ctx) => {
       try { return await originalRun(ctx); }

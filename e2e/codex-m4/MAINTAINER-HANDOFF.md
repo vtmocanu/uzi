@@ -56,7 +56,9 @@ just-committed digest could never match the image it named.
 2. the manifest's `provenBaseCommit` is an **ancestor** of the candidate;
 3. the `provenBaseCommit..candidate` tail is **evidence-only** — every changed path classifies as
    evidence (`e2e/`, `prds/`, `docs/`, `adr/`, `specs/`, `.claude/`, `deploy/`, `scripts/`,
-   `agent/test/`, `Taskfile.yml`, any `*.md` outside `api/`, or a Go `*_test.go` outside `agent/`);
+   `agent/test/`, `Taskfile.yml`, any `*.md` outside `api/`, or a Go `*_test.go` outside `agent/`),
+   except `scripts/check-worker-toolchain.py` and `scripts/sqlc.sh`, which are worker image build
+   inputs and classify as runtime;
    a runtime path (anything under `agent/` except `agent/test/`, or under `api/` except a Go
    `*_test.go`, since the M3b proof builds its test server from `api/`) or an unrecognized path
    fails closed;
@@ -165,7 +167,7 @@ Because these are committed `owed` clauses, the manifest must discharge each wit
 3. **Confirm the tail is evidence-only.** `provenBaseCommit` must be an ancestor of the current
    HEAD, and the `provenBaseCommit..HEAD` diff must touch only the evidence paths listed under
    "The gate, redesigned around a fixed point" above. A change under `agent/` (except `agent/test/`) or `api/` (except a Go
-   `*_test.go`) is a runtime change and requires a FRESH proof at a new
+   `*_test.go`), or either image-build script named above, is a runtime change and requires a FRESH proof at a new
    `provenBaseCommit` — it cannot ride an old proof's fixed point.
 4. **Run the gate** (mind `dir: agent` in the Taskfile, so use an absolute manifest path via
    `--show-toplevel`):

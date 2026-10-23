@@ -1687,10 +1687,13 @@ func rejectedScene(dark bool, view string, index int, selected bool) string {
 	return m.View().Content
 }
 
-// boardDoneFailures shows both failure outcomes beside human stops and successful work.
+// boardDoneFailures shows shared DONE alarm ink beside an active judge issues badge.
 func boardDoneFailures(dark, selected bool) string {
 	m := uxModel(&uzicli.FakeClient{}, "", dark)
 	rows := append([]apitypes.RunListItemDTO{{RunDTO: apitypes.RunDTO{ID: "active01", Status: "running", IssueTitle: "Active implementation"}}}, doneFailureRows()...)
+	for i := range rows {
+		rows[i].JudgeVerdict, rows[i].JudgeTodoCount = sp("issues"), 2
+	}
 	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: rows})
 	if selected {
 		m.board.cursor = 1

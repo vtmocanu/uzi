@@ -4,7 +4,7 @@
 #
 # AGENT_PATHS is the space-separated runtime surface used by autobump's raw Git
 # pathspec diffs: source, dependency manifests, TypeScript config, binaries,
-# templates, global devbox toolchain and Codex packaging/supervisor.
+# templates, global devbox toolchain, baked sqlc archive and Codex packaging/supervisor.
 # is_shipping <path> returns 0 for that set (exact entries or slash descendants),
 # api, controller, web app, chart and docs; 1 for tests, e2e, fixtures and everything
 # else (including skill/PRD-only changes). Tests are excluded before runtime matching.
@@ -16,7 +16,7 @@
 #     next candidate; skill/PRD-only work with empty [Unreleased] is nonshipping.
 #   - scripts/worker-tag-autobump.sh: which runtime paths warrant rolling workers.
 #   - scripts/check-changelog-entry.sh: which branch changes need a changelog entry.
-AGENT_PATHS="agent/src agent/package.json agent/package-lock.json agent/tsconfig.json agent/bin agent/templates agent/devbox-global agent/codex"
+AGENT_PATHS="agent/src agent/package.json agent/package-lock.json agent/tsconfig.json agent/bin agent/templates agent/devbox-global agent/codex scripts/sqlc.sh"
 
 is_shipping() {
   case "$1" in

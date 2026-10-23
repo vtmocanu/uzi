@@ -121,8 +121,9 @@ It clears when the pod recovers, not on a timer.
 
 Persistent hosted workers use one canary per owner, placement lane and effective
 registered capability pool before admitting more replacements. The default is
-one concurrent replacement per pool after promotion. Healthy peers waiting for
-admission keep claiming on the old image. For routine upgrades, an admitted busy
+one concurrent replacement per pool after promotion. Eligible uncordoned peers
+waiting for admission keep claiming on the old image; custody-held migration
+drains are an exception that does not authorize replacement. For routine upgrades, an admitted busy
 worker with image, template or generation drift waits indefinitely until genuinely
 idle. It occupies a concurrency slot and supplies no replacement coverage, canary
 proof or post-promotion proof, and can hold its pool indefinitely. The drain deadline

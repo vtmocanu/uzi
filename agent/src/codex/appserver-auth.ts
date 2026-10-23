@@ -63,6 +63,8 @@ export type CodexAppServerAuthConfig =
       readonly mode: "subscription";
       readonly initial: ServerVerifiedCodexAuthTokens;
       readonly bridge: CodexSubscriptionRefreshBridge;
+      /** Worker-owned delivery fence; never supplied by the app-server. */
+      readonly assertRefreshAdmission?: () => void;
     };
 
 /** Minimal composition seam consumed by run and advice harnesses. */
@@ -153,6 +155,7 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
           mode: "subscription",
           initial: { accessToken: config.initial.accessToken, accountId: config.initial.accountId },
           bridge: config.bridge,
+          assertRefreshAdmission: config.assertRefreshAdmission,
         };
     this.mode = config.mode;
   }
@@ -195,6 +198,9 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
   ): Promise<boolean> {
     if (note.kind !== "activity" || note.method !== REFRESH_METHOD || note.requestId === undefined) return false;
 
+    if (this.interceptedClosed) {
+      this.poisonAndRespond(transport, note.requestId, "codex authentication request admission is closed");
+    }
     if (this.state !== "ready" || this.transport !== transport) {
       this.poisonAndRespond(transport, note.requestId, "codex authentication refresh arrived outside the active session");
     }
@@ -202,8 +208,13 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
       this.poisonAndRespond(transport, note.requestId, "codex api-key session received a subscription refresh request");
     }
     this.validateRefreshParams(transport, note.requestId, note.params);
-    await this.handleRefresh(transport, note.requestId, signal);
-    return true;
+    const task = this.handleRefresh(transport, note.requestId, signal);
+    const owned = task.catch((error: unknown) => {
+      if (error instanceof CodexAppServerAuthError && error.poisoned) this.recordInterceptedFailure(error);
+    });
+    this.interceptedTasks.add(owned);
+    try { await task; return true; }
+    finally { this.interceptedTasks.delete(owned); }
   }
 
   async drainInterceptedRequests(): Promise<void> {
@@ -257,7 +268,7 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
           this.safeErrorResponse(transport, requestId, PROTOCOL_POISON_CODE, "codex authentication protocol violation");
           throw error;
         }
-        delivered = this.safeErrorResponse(
+        this.safeErrorResponse(
           transport,
           requestId,
           REFRESH_FAILED_CODE,
@@ -266,6 +277,12 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
         return;
       }
 
+      try {
+        if (this.config.mode === "subscription") this.config.assertRefreshAdmission?.();
+      } catch {
+        this.safeErrorResponse(transport, requestId, REFRESH_FAILED_CODE, "codex authentication refresh unavailable");
+        return;
+      }
       try {
         transport.respond(requestId, {
           result: {
@@ -468,6 +485,13 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
         throw transportError("codex authentication refresh aborted");
       }
       bridgeWork = bridge.refresh({ operationId, signal: controller.signal });
+      // Retain raw request ownership after cancellation grace expires. runRefresh
+      // classifies failure; this owner joins both outcomes through actual settlement.
+      let owned!: Promise<void>;
+      owned = bridgeWork.then(() => {}, () => {}).finally(() => {
+        this.interceptedTasks.delete(owned);
+      });
+      this.interceptedTasks.add(owned);
       const value = await Promise.race([
         bridgeWork,
         deadline,
@@ -485,8 +509,9 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
         && bridgeWork !== undefined
         && !(await this.awaitBridgeSettlement(bridgeWork, BRIDGE_CANCEL_SETTLEMENT_MS))
       ) {
-        this.poison();
-        throw protocolError("codex authentication bridge did not settle after cancellation");
+        const failure = protocolError("codex authentication bridge did not settle after cancellation");
+        this.recordInterceptedFailure(failure);
+        throw failure;
       }
       if (error instanceof CodexAppServerAuthError) throw error;
       throw transportError("codex authentication refresh failed");
