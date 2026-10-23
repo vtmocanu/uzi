@@ -117,6 +117,8 @@ describe("committed replay corpus (hermetic)", () => {
       ], [
         "Consider removing the unused import; it fails lint",
         "cleanup could be simplified",
+        // Word boundaries matter: without them "no" matches inside "Annotate".
+        "Annotate the test: removeDir helper fails lint",
       ]],
       ["d-3063", "D4", [
         "ids is optional, so a grouped file request can omit ids",
