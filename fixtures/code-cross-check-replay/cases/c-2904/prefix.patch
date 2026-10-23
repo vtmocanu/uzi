@@ -1,0 +1,605 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 6a5df174..dc18e7b4 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -30,6 +30,11 @@ through `[0.52.0]`.)
+ - **Automatic issue starts can select Claude or Codex with forge labels ([#2853](https://github.com/vtmocanu/uzi/issues/2853)).**
+   Issue schedules (including every sweep selector and run-now) and autopilot read fresh `harness::claude` or `harness::codex` labels without falling back to the other harness. Invalid labels or a conflicting schedule pin skip the issue; unpinned sweeps continue past label-selected credential refusals, while one-time single issues hold on disabled selected credentials. A labelled Codex autopilot issue can start for a consenting Codex-only owner; unlabelled autopilot keeps its legacy Anthropic-token gate. Manual starts and prompt/self-improve schedules keep their existing behavior. Maintainer landing step: create both labels on this repository's forge.
+ 
++### Fixed
++
++- **Repos with a very long origin path no longer fail to clone with `ENAMETOOLONG` ([#2886](https://github.com/vtmocanu/uzi/issues/2886)).**
++  A bare repo cache name over 255 bytes is now a bounded `uzi-sha256-<digest>.git` directory. New clones record their origin, and a hashed-name directory is reused only for that exact origin; a mismatched, missing or unreadable stored origin is refused without a fetch or delete. Takes effect after a release and worker rollout.
++
+ ## [0.86.0] - 2026-10-06
+ 
+ ### Changed
+diff --git a/agent/src/cross-check-runner.ts b/agent/src/cross-check-runner.ts
+index fac64eb2..de16ba23 100644
+--- a/agent/src/cross-check-runner.ts
++++ b/agent/src/cross-check-runner.ts
+@@ -176,6 +176,9 @@ export class CrossCheckRunner {
+         || !/^[a-f0-9]{40}$/.test(candidate.base_commit)
+         || (code && (candidate.round !== 1 || !/^[a-f0-9]{40}$/.test(code.head_commit))))
+         throw new Error("invalid checker claim");
++      // issue #2886: resolve (and identity-check) the code child's existing bare before the model
++      // timer starts, so this await cannot race the timeout ahead of the snapshot reader.
++      const codeBare = code ? await this.git.existingBarePathFor(claim.repo.clone_url) : undefined;
+       const deadline = Date.parse(candidate.deadline_at);
+       const timeout = Math.min(this.opts.modelTimeoutMs ?? 15 * 60_000, deadline - Date.now());
+       if (!Number.isFinite(timeout) || timeout <= 0) {
+@@ -187,7 +190,7 @@ export class CrossCheckRunner {
+       steering = new ChatSteering(this.client, runId, this.opts.pollMs ?? 1000, this.log, cancel,
+         { onFollowUp: () => this.log.warn("cross-check ignores follow-up input", { run_id: runId }) }, generation);
+       steering.start();
+-      const bare = code ? this.git.barePathFor(claim.repo.clone_url)
++      const bare = code ? codeBare!
+         : await this.git.ensureClone(claim.repo.clone_url, claim.secrets.forge_pat, claim.secrets.forge_username);
+       cancel.signal.throwIfAborted();
+       if (code) {
+diff --git a/agent/src/git.ts b/agent/src/git.ts
+index 0d5867e6..fa9ae544 100644
+--- a/agent/src/git.ts
++++ b/agent/src/git.ts
+@@ -1169,6 +1169,18 @@ export class ForeignRetainedRecoveryError extends Error {
+   constructor() { super("foreign retained recovery"); }
+ }
+ 
++/**
++ * issue #2886: a bare cache directory named by the bounded `uzi-sha256-<hex>.git` form does not
++ * provably belong to the origin being asked for (stored origin missing, duplicated, unreadable or
++ * different, or the path is not a bare). Fail closed: nothing is fetched, deleted or rewritten.
++ */
++export class BareCacheIdentityError extends Error {
++  constructor(readonly bareName: string) {
++    super(`bare cache identity check failed: ${bareName}`);
++    this.name = "BareCacheIdentityError";
++  }
++}
++
+ export class RetainedRecoveryBlockedError extends Error {
+   readonly reason = "source_missing";
+   constructor(readonly barePath: string, readonly branch: string, readonly key: string,
+@@ -2074,6 +2086,43 @@ export class GitCache {
+     return path.join(this.reposRoot, bareDirName(repoUrl));
+   }
+ 
++  /**
++   * The bare cache path for an origin that must already exist locally: no fetch, no creation.
++   * A hashed-name bare must carry this exact origin (see {@link BareCacheIdentityError}); a path
++   * that does not exist is returned as-is, like {@link barePathFor}.
++   */
++  async existingBarePathFor(repoUrl: string): Promise<string> {
++    const barePath = this.barePathFor(repoUrl);
++    if (await lstatPresent(barePath)) await this.assertBareOriginIdentity(barePath, repoUrl);
++    return barePath;
++  }
++
++  /** Read the stored `uzi.cacheOrigin` of a bare. Only `ok` admits reuse of a hashed-name bare. */
++  private async readBareCacheOrigin(barePath: string): Promise<BareCacheOrigin> {
++    let out: string;
++    try {
++      out = await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"]);
++    } catch (err) {
++      if (err instanceof RunResidueBlockedError) throw err;
++      const abort = this.boundaryAbortError(err);
++      if (abort) throw abort;
++      return { kind: "unreadable" };
++    }
++    // `--null` entries are `key\nvalue`, or a bare `key` when the entry has no value.
++    const entries = out.split("\0").filter(item => item === BARE_CACHE_ORIGIN_KEY || item.startsWith(BARE_CACHE_ORIGIN_KEY + "\n"));
++    if (entries.length === 0) return { kind: "absent" };
++    if (entries.length !== 1 || !entries[0]!.includes("\n")) return { kind: "invalid" };
++    return { kind: "ok", value: entries[0]!.slice(BARE_CACHE_ORIGIN_KEY.length + 1) };
++  }
++
++  /** issue #2886: a hashed-name bare is reusable only for the origin stored in it at clone time. */
++  private async assertBareOriginIdentity(barePath: string, repoUrl: string): Promise<void> {
++    const name = path.basename(barePath);
++    if (!HASHED_BARE_NAME.test(name)) return;
++    const stored = await this.readBareCacheOrigin(barePath);
++    if (stored.kind !== "ok" || stored.value !== repoUrl) throw new BareCacheIdentityError(name);
++  }
++
+   /** Resolve a recovery journal basename to a real bare directly under the private repos root. */
+   async resolveRecoveryBareDir(bareDir: string): Promise<string | undefined> {
+     if (
+@@ -2100,6 +2149,11 @@ export class GitCache {
+       try { if ((await this.runGit(barePath, ["rev-parse", "--is-bare-repository"])).trim() !== "true") return undefined; }
+       catch { return undefined; }
+     } else if (!(await isBareRepo(barePath))) return undefined;
++    // issue #2886: a hashed name is trusted only when the origin stored in the bare hashes to it.
++    if (HASHED_BARE_NAME.test(bareDir)) {
++      const stored = await this.readBareCacheOrigin(barePath);
++      if (stored.kind !== "ok" || bareDirName(stored.value) !== bareDir) return undefined;
++    }
+     return barePath;
+   }
+ 
+@@ -2173,6 +2227,7 @@ export class GitCache {
+     return this.withLock(barePath, async () => {
+       await fs.mkdir(this.reposRoot, { recursive: true });
+       if (await isBareRepo(barePath)) {
++        await this.assertBareOriginIdentity(barePath, repoUrl);
+         this.log.info("repo cache: fetching", { bare: barePath });
+         // Issue #134: reassert IDEMPOTENTLY on the warm path, BEFORE the fetch (the first
+         // object-writing command, hence the first spawner). cloneBare only runs on the very
+@@ -2188,6 +2243,10 @@ export class GitCache {
+           label: "clone/fetch",
+         });
+       } else {
++        // issue #2886: never clone over (or beside) something occupying a hashed name.
++        if (HASHED_BARE_NAME.test(path.basename(barePath)) && await lstatPresent(barePath)) {
++          throw new BareCacheIdentityError(path.basename(barePath));
++        }
+         this.log.info("repo cache: cloning bare", { url: repoUrl, bare: barePath });
+         await withForgeRetry(() => this.cloneBare(repoUrl, barePath, pat, scope, username), {
+           schedule: this.retry?.schedule,
+@@ -5750,7 +5809,10 @@ export class GitCache {
+ 
+   /** Credential-free effective path mode, independent of recovery journal disposition. */
+   async recoveryAttemptMode(repoUrl: string, key: string): Promise<boolean> {
+-    return this.readRecoveryAttemptMode(this.barePathFor(repoUrl), key);
++    const barePath = this.barePathFor(repoUrl);
++    await this.assertRecoveryBare(barePath);
++    await this.assertBareOriginIdentity(barePath, repoUrl);
++    return this.readRecoveryAttemptMode(barePath, key);
+   }
+ 
+   private async readRecoveryAttemptMode(barePath: string, key: string): Promise<boolean> {
+@@ -5775,6 +5837,7 @@ export class GitCache {
+     if (!await this.pathPresent(barePath)) return undefined;
+     await this.assertRecoveryBare(barePath);
+     return this.withLock(barePath, async () => {
++      await this.assertBareOriginIdentity(barePath, repoUrl);
+       const stored = await this.readRecoveryCaptureWithRaw(barePath, branch);
+       if (!stored) return undefined;
+       const journal = stored.journal;
+@@ -11079,7 +11142,7 @@ export class GitCache {
+     // non-empty dir → a deterministic "already exists" failure (permanent), converting a
+     // transient into a permanent one. This guarantees each retry starts from a clean bare.
+     try {
+-      await this.runGit(undefined, ["clone", "--bare", "--", repoUrl, dest], pat, scope, username);
++      await this.runGit(undefined, ["clone", "--bare", "-c", `${BARE_CACHE_ORIGIN_KEY_CONFIG}=${repoUrl}`, "--", repoUrl, dest], pat, scope, username);
+       // Convert the mirror refspec to remote-tracking so future fetches write to
+       // refs/remotes/origin/*. Under (b) the bare's refs/heads/* stay the
+       // stale mirror; the agent branch is resolved via refs/remotes/origin/* (resume)
+@@ -14525,10 +14588,21 @@ async function isBareRepo(p: string): Promise<boolean> {
+   return pathExists(path.join(p, "HEAD"));
+ }
+ 
++/** issue #2886: the bounded bare name {@link bareDirName} falls back to; detected by format. */
++const HASHED_BARE_NAME = /^uzi-sha256-[0-9a-f]{64}\.git$/;
++/** Config key (as `git config --list` prints it, lowercased) holding the origin a bare was cloned from. */
++const BARE_CACHE_ORIGIN_KEY = "uzi.cacheorigin";
++/** The same key in the spelling `git clone -c` takes. */
++const BARE_CACHE_ORIGIN_KEY_CONFIG = "uzi.cacheOrigin";
++type BareCacheOrigin = { kind: "ok"; value: string } | { kind: "absent" } | { kind: "invalid" } | { kind: "unreadable" };
++
+ /**
+  * Filesystem-safe, collision-free bare-clone dir name for a repo URL: host plus
+  * each path segment joined by '+'. '+' is illegal in GitHub/GitLab path
+  * segments, so two names collide only for the same repo on the same host.
++ * A name over 255 UTF-8 bytes (one path component's limit) is replaced by
++ * `uzi-sha256-<sha256 hex of the raw input>.git`; such a bare records its origin in
++ * `uzi.cacheOrigin` and is reused only when that matches (issue #2886).
+  * Examples:
+  *   https://gitlab.com/org/repo.git  -> gitlab.com+org+repo.git
+  *   git@gitlab.com:org/repo          -> gitlab.com+org+repo.git
+@@ -14548,6 +14622,7 @@ export function bareDirName(rawUrl: string): string {
+   let name = parts.join("+");
+   if (!name.endsWith(".git")) name += ".git";
+   if (name === ".git") name = "repo.git";
++  if (Buffer.byteLength(name, "utf8") > 255) return `uzi-sha256-${sha256Hex(rawUrl)}.git`;
+   return name;
+ }
+ 
+diff --git a/agent/test/claude-code-cross-check.test.ts b/agent/test/claude-code-cross-check.test.ts
+index df7e0e98..8f3f82b4 100644
+--- a/agent/test/claude-code-cross-check.test.ts
++++ b/agent/test/claude-code-cross-check.test.ts
+@@ -419,9 +419,11 @@ for (const truncated of [false, true]) for (const clean of [true, false]) it("ru
+       row_present: true, lead_claim_generation: 1, child_present: true, checker_run_id: "child", checker_claim_generation: 7, checker_status: clean ? "completed" : "failed",
+       outcome: clean ? "completed" : "failed" }),
+   } as unknown as WorkerClient;
++  let existingBareCalls = 0;
+   const git = {
+     ensureClone: async () => { assert.fail("code must not prepare origin"); },
+     barePathFor: () => "/local-bare",
++    existingBarePathFor: async () => { existingBareCalls++; return "/local-bare"; },
+     runnerCloneAtCommit: async (...args: unknown[]) => { calls.push(args); return root; },
+     readBare: async (bare: string, args: unknown[], opts: any) => {
+       assert.equal(bare, "/local-bare");
+@@ -440,6 +442,7 @@ for (const truncated of [false, true]) for (const clean of [true, false]) it("ru
+     assert.equal(c.cross_check?.stage === "code" && c.cross_check.code_diff, expectedDiff, "Claude committed diff uses its selected family tool names");
+     assert.ok(prompt.includes(expectedDiff), "production Claude prompt carries the committed diff notice");
+     assert.deepEqual(calls, [["/local-bare", "b".repeat(40), "child", "lead", 7]]);
++    assert.equal(existingBareCalls, 1, "the code branch resolves the local bare through existingBarePathFor");
+     assert.equal(decisions.at(-1).outcome, clean ? "completed" : "failed");
+     if (clean) assert.deepEqual(decisions.at(-1).findings, [finding]);
+     else assert.equal(decisions.at(-1).reason_class, "confinement_failed");
+@@ -497,7 +500,7 @@ it("cross-check diagnostics use fixed categories after token deregistration and
+     const client = { reportState: async () => ({ applied: true }), getInputs: async () => ({ inputs: [] }), postMessages: async () => {},
+       reportCodeCrossCheckVerdict: async (_id: string, _gen: number, v: Record<string, unknown>) => { decisions.push(v); },
+     } as unknown as WorkerClient;
+-    const git = { barePathFor: () => "/bare", runnerCloneAtCommit: async () => root,
++    const git = { barePathFor: () => "/bare", existingBarePathFor: async () => "/bare", runnerCloneAtCommit: async () => root,
+       readBare: async () => ({ text: "diff", truncated: false }), removeRunnerClone: async () => {},
+     } as unknown as GitCache;
+     const claimed = claim(); claimed.secrets.anthropic_oauth_token = sentinel;
+diff --git a/agent/test/code-cross-check-snapshot.test.ts b/agent/test/code-cross-check-snapshot.test.ts
+index 2b8230c8..9448f1b4 100644
+--- a/agent/test/code-cross-check-snapshot.test.ts
++++ b/agent/test/code-cross-check-snapshot.test.ts
+@@ -71,6 +71,32 @@ it("timeout with unconfirmed native cleanup retains the snapshot reader", async
+   } finally { f.fx.cleanup(); }
+ });
+ 
++it("a slow local-bare identity check runs before the model timer, so the snapshot reader still opens (#2886)", async (t) => {
++  const f = await fixture();
++  try {
++    // The lookup outlasts modelTimeoutMs: had it run after the timer started, the abort would land
++    // before runnerCloneAtCommit and no reader would ever open.
++    const realExisting = f.git.existingBarePathFor.bind(f.git);
++    t.mock.method(f.git, "existingBarePathFor", async (url: string) => {
++      await new Promise((resolve) => setTimeout(resolve, 50));
++      return realExisting(url);
++    });
++    const clone = t.mock.method(f.git, "runnerCloneAtCommit");
++    t.mock.method(f.git, "closeCodeSnapshotReader", async () => assert.fail("unconfirmed reader cannot close"));
++    await new CrossCheckRunner(f.client, f.git, nullLogger(), {
++      homeRoot: f.fx.dataDir, modelTimeoutMs: 5, model: { run: async (_claim, _checkout, _home, signal) => {
++        await new Promise<void>((resolve) => {
++          if (signal.aborted) resolve();
++          else signal.addEventListener("abort", () => resolve(), { once: true });
++        });
++        throw new Error("cross-check cleanup unconfirmed");
++      } },
++    }).execute(f.claim);
++    assert.equal(clone.mock.callCount(), 1, "the timer must not abort ahead of the snapshot reader");
++    assert.equal(JSON.parse(fs.readFileSync(metadataPath(f.bare), "utf8")).readers[0].state, "OPEN");
++  } finally { f.fx.cleanup(); }
++});
++
+ it("code snapshot ref survives until child settlement and is deleted by exact name", async (t) => {
+   const f = await fixture();
+   try {
+diff --git a/agent/test/git-clone-argv.test.ts b/agent/test/git-clone-argv.test.ts
+index 36d21318..dee96d82 100644
+--- a/agent/test/git-clone-argv.test.ts
++++ b/agent/test/git-clone-argv.test.ts
+@@ -51,7 +51,8 @@ it("cloneBare terminates options before the repository and destination", async (
+     const repoUrl = "-repository";
+     const dest = path.join(fx.dataDir, "captured.git");
+     const args = await captureBareClone(cache, repoUrl, dest);
+-    assert.deepEqual(args, ["clone", "--bare", "--", repoUrl, dest]);
++    // issue #2886: the stored origin identity rides as one `-c key=value` operand, still before `--`.
++    assert.deepEqual(args, ["clone", "--bare", "-c", `uzi.cacheOrigin=${repoUrl}`, "--", repoUrl, dest]);
+   } finally {
+     fx.cleanup();
+   }
+diff --git a/agent/test/git.test.ts b/agent/test/git.test.ts
+index 324217aa..8903c5da 100644
+--- a/agent/test/git.test.ts
++++ b/agent/test/git.test.ts
+@@ -7,10 +7,11 @@ import fs from "node:fs";
+ import net from "node:net";
+ import os from "node:os";
+ import path from "node:path";
++import { createHash } from "node:crypto";
+ import { PassThrough, Readable } from "node:stream";
+ import { makeFixture, type Fixture } from "./fixture-repo.js";
+ import { nullLogger, recordingLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
+-import { GitCache, ScratchProvisionError, ScratchPublicationError, bareDirName, gitEnv } from "../src/git.js";
++import { BareCacheIdentityError, GitCache, ScratchProvisionError, ScratchPublicationError, bareDirName, gitEnv } from "../src/git.js";
+ import { TickSpawner } from "../src/tick-spawner.js";
+ 
+ let fx: Fixture;
+@@ -1965,3 +1966,222 @@ describe("issue #909 — the owner-stamp reader falls back to the pre-#887 flatt
+     assert.strictEqual(refInBare(bare, "refs/uzi-runner/uzi-self-improve"), true);
+   });
+ });
++
++// issue #2886: a very long origin must not produce an over-long bare directory component.
++describe("bounded bare cache names (issue #2886)", () => {
++  const HASHED = /^uzi-sha256-[0-9a-f]{64}\.git$/;
++  const longRoots: string[] = [];
++  afterEach(() => {
++    for (const root of longRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
++  });
++
++  /** The pre-#2886 naming for a local absolute path: segments joined by '+' plus '.git'. */
++  function legacyName(p: string): string {
++    return p.split("/").filter(Boolean).join("+") + ".git";
++  }
++
++  /** A valid nested local origin (one commit) whose legacy flattened name exceeds 255 UTF-8 bytes. */
++  function makeLongOrigin(): { origin: string; sha: string } {
++    const root = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-longorigin-"));
++    longRoots.push(root);
++    const segs = Array.from({ length: 6 }, (_, i) => `${i}` + "s".repeat(58));
++    const origin = path.join(root, ...segs, "origin");
++    fs.mkdirSync(origin, { recursive: true });
++    gitIn(origin, ["init", "-q", "-b", "main"]);
++    fs.writeFileSync(path.join(origin, "LONG.txt"), "long origin\n");
++    gitIn(origin, ["add", "LONG.txt"]);
++    gitIn(origin, ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false",
++      "-c", "maintenance.auto=false", "-c", "gc.auto=0", "commit", "-q", "-m", "long"]);
++    return { origin, sha: gitIn(origin, ["rev-parse", "HEAD"]) };
++  }
++
++  /** A hashed-name bare for a fresh long origin, plus the facts the refusal cases compare. */
++  async function hashedBare(): Promise<{ origin: string; sha: string; bare: string; cfg: string }> {
++    const { origin, sha } = makeLongOrigin();
++    const bare = await git.ensureClone(origin);
++    return { origin, sha, bare, cfg: path.join(bare, "config") };
++  }
++
++  const refs = (bare: string): string => gitIn(bare, ["for-each-ref", "--format=%(refname) %(objectname)"]);
++
++  it("clones an origin whose legacy name exceeds 255 bytes (regression)", async () => {
++    const { origin, sha } = makeLongOrigin();
++    assert.ok(fs.statSync(origin).isDirectory());
++    assert.ok(Buffer.byteLength(legacyName(origin), "utf8") > 255, "precondition: legacy name is over-long");
++    const bare = await git.ensureClone(origin);
++    assert.ok(Buffer.byteLength(path.basename(bare), "utf8") <= 255);
++    assert.match(path.basename(bare), HASHED);
++    assert.equal(gitIn(bare, ["cat-file", "-t", sha]), "commit");
++    assert.equal(gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]), sha);
++    assert.equal(gitIn(bare, ["config", "--local", "--get", "uzi.cacheOrigin"]), origin);
++    // A second call reuses the same bare.
++    assert.equal(await git.ensureClone(origin), bare);
++    for (const part of path.relative(fx.dataDir, git.runnerClonePath(bare, "k")).split(path.sep)) {
++      assert.ok(Buffer.byteLength(part, "utf8") <= 255);
++    }
++  });
++
++  it("keeps a 255-byte name and hashes a 256-byte one", () => {
++    const keep = "a".repeat(255 - ".git".length) + ".git";
++    assert.equal(Buffer.byteLength(keep, "utf8"), 255);
++    assert.equal(bareDirName("/" + keep), keep);
++    const longIn = "/" + "a".repeat(256 - ".git".length);
++    const hashed = bareDirName(longIn);
++    assert.match(hashed, HASHED);
++    assert.equal(hashed, `uzi-sha256-${createHash("sha256").update(longIn).digest("hex")}.git`);
++  });
++
++  it("measures bytes, not characters, and is deterministic and injective on long inputs", () => {
++    const multibyte = "/" + "é".repeat(130);
++    assert.ok(multibyte.length < 255 && Buffer.byteLength(multibyte + ".git") > 255);
++    assert.match(bareDirName(multibyte), HASHED);
++    assert.equal(bareDirName(multibyte), bareDirName(multibyte));
++    const x = "/" + "x".repeat(300);
++    const y = "/" + "x".repeat(301);
++    assert.notEqual(bareDirName(x), bareDirName(y));
++  });
++
++  it("refuses a short origin that flattens to another origin's hashed name", async () => {
++    const { origin, bare, cfg } = await hashedBare();
++    const other = "/" + path.basename(bare);
++    assert.equal(bareDirName(other), path.basename(bare));
++    const refsBefore = refs(bare);
++    const cfgBefore = fs.readFileSync(cfg, "utf8");
++    await assert.rejects(git.ensureClone(other), BareCacheIdentityError);
++    await assert.rejects(git.existingBarePathFor(other), BareCacheIdentityError);
++    assert.equal(refs(bare), refsBefore);
++    assert.equal(fs.readFileSync(cfg, "utf8"), cfgBefore);
++    assert.equal(gitIn(bare, ["config", "--local", "--get", "uzi.cacheOrigin"]), origin);
++    assert.equal(await git.existingBarePathFor(origin), bare);
++  });
++
++  it("refuses a hashed bare whose stored origin is removed", async () => {
++    const { origin, bare, cfg } = await hashedBare();
++    const refsBefore = refs(bare);
++    gitIn(bare, ["config", "--local", "--unset", "uzi.cacheOrigin"]);
++    const cfgBefore = fs.readFileSync(cfg, "utf8");
++    await assert.rejects(git.ensureClone(origin), BareCacheIdentityError);
++    assert.equal(await git.resolveRecoveryBareDir(path.basename(bare)), undefined);
++    assert.equal(refs(bare), refsBefore);
++    assert.equal(fs.readFileSync(cfg, "utf8"), cfgBefore);
++  });
++
++  it("refuses a hashed bare with two stored origins", async () => {
++    const { origin, bare, cfg } = await hashedBare();
++    const refsBefore = refs(bare);
++    gitIn(bare, ["config", "--local", "--add", "uzi.cacheOrigin", origin]);
++    const cfgBefore = fs.readFileSync(cfg, "utf8");
++    await assert.rejects(git.ensureClone(origin), BareCacheIdentityError);
++    assert.equal(await git.resolveRecoveryBareDir(path.basename(bare)), undefined);
++    assert.equal(fs.readFileSync(cfg, "utf8"), cfgBefore);
++    assert.equal(refs(bare), refsBefore);
++  });
++
++  it("refuses a hashed bare whose config cannot be listed", async () => {
++    const { origin, bare, cfg } = await hashedBare();
++    const refsBefore = refs(bare);
++    const good = fs.readFileSync(cfg, "utf8");
++    fs.writeFileSync(cfg, good + "\n[broken\n");
++    try {
++      await assert.rejects(git.ensureClone(origin), BareCacheIdentityError);
++      assert.equal(await git.resolveRecoveryBareDir(path.basename(bare)), undefined);
++      assert.equal(fs.readFileSync(cfg, "utf8"), good + "\n[broken\n");
++    } finally {
++      fs.writeFileSync(cfg, good);
++    }
++    assert.equal(refs(bare), refsBefore);
++  });
++
++  it("refuses to clone over a non-bare entry at a hashed name", async () => {
++    const { origin } = makeLongOrigin();
++    const bare = git.barePathFor(origin);
++    fs.mkdirSync(bare, { recursive: true });
++    fs.writeFileSync(path.join(bare, "keep.txt"), "x");
++    await assert.rejects(git.ensureClone(origin), BareCacheIdentityError);
++    assert.equal(fs.readFileSync(path.join(bare, "keep.txt"), "utf8"), "x");
++  });
++
++  it("resolves restart sources: legacy names without the key, hashed names with it, never a symlink", async () => {
++    const sha = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
++    // A pre-#2886 bare: short, non-hashed name and no stored origin. Built directly so the name
++    // stays legacy under any TMPDIR length (ensureClone(fx.originPath) hashes under a long one).
++    const legacyName = "legacy-short+origin.git";
++    assert.doesNotMatch(legacyName, HASHED);
++    fs.mkdirSync(path.join(fx.dataDir, "repos"), { recursive: true });
++    const legacy = path.join(fx.dataDir, "repos", legacyName);
++    gitIn(fx.originPath, ["clone", "-q", "--bare", fx.originPath, legacy]);
++    assert.equal(await git.resolveRecoveryBareDir(legacyName), legacy);
++    const legacyRes = await git.resolveRestartSource(legacyName, sha, "main");
++    assert.equal(legacyRes.status, "on_default");
++
++    const long = await hashedBare();
++    const hashedRes = await git.resolveRestartSource(path.basename(long.bare), long.sha, "main");
++    assert.equal(hashedRes.status, "on_default");
++
++    const reposRoot = path.dirname(long.bare);
++    const outside = path.join(path.dirname(fx.dataDir), "outside.git");
++    gitIn(fx.originPath, ["clone", "-q", "--bare", fx.originPath, outside]);
++    const inside = `uzi-sha256-${"a".repeat(64)}.git`;
++    const out = `uzi-sha256-${"b".repeat(64)}.git`;
++    fs.symlinkSync(long.bare, path.join(reposRoot, inside));
++    fs.symlinkSync(outside, path.join(reposRoot, out));
++    assert.equal((await git.resolveRestartSource(inside, long.sha, "main")).status, "missing_bare");
++    assert.equal((await git.resolveRestartSource(out, sha, "main")).status, "missing_bare");
++
++    gitIn(long.bare, ["config", "--local", "--unset", "uzi.cacheOrigin"]);
++    assert.equal((await git.resolveRestartSource(path.basename(long.bare), long.sha, "main")).status, "missing_bare");
++  });
++
++  it("refuses a copied hashed bare under a different hashed name", async () => {
++    const { bare, sha } = await hashedBare();
++    const otherName = `uzi-sha256-${"c".repeat(64)}.git`;
++    const copy = path.join(path.dirname(bare), otherName);
++    await fs.promises.cp(bare, copy, { recursive: true, preserveTimestamps: true });
++    assert.equal(fs.lstatSync(copy).isSymbolicLink(), false);
++    assert.equal(await git.resolveRecoveryBareDir(otherName), undefined);
++    assert.equal((await git.resolveRestartSource(otherName, sha, "main")).status, "missing_bare");
++    assert.equal((await git.resolveRestartSource(path.basename(bare), sha, "main")).status, "on_default");
++  });
++
++  it("refuses a hashed bare whose stored origin is a short string flattening to its own name", async () => {
++    const { origin, bare } = await hashedBare();
++    const name = path.basename(bare);
++    const short = "/" + name;
++    assert.equal(bareDirName(short), name);
++    gitIn(bare, ["config", "--local", "--replace-all", "uzi.cacheOrigin", short]);
++    const refsBefore = refs(bare);
++    // The resolver's self-consistency check passes here; only the identity check guards the long origin.
++    assert.equal(await git.resolveRecoveryBareDir(name), bare);
++    await assert.rejects(git.recoveryAttemptMode(origin, "k"), BareCacheIdentityError);
++    await assert.rejects(git.discoverRetainedRecovery(origin, "agent/issue-1", "k", "run-1"), BareCacheIdentityError);
++    await assert.rejects(git.ensureClone(origin), BareCacheIdentityError);
++    assert.equal(refs(bare), refsBefore);
++  });
++
++  it("refuses a hashed bare whose stored origin key has no value", async () => {
++    const { origin, bare, cfg } = await hashedBare();
++    gitIn(bare, ["config", "--local", "--unset", "uzi.cacheOrigin"]);
++    fs.appendFileSync(cfg, "[uzi]\n\tcacheOrigin\n");
++    const refsBefore = refs(bare);
++    const cfgBefore = fs.readFileSync(cfg, "utf8");
++    await assert.rejects(git.ensureClone(origin), BareCacheIdentityError);
++    assert.equal(await git.resolveRecoveryBareDir(path.basename(bare)), undefined);
++    assert.equal(refs(bare), refsBefore);
++    assert.equal(fs.readFileSync(cfg, "utf8"), cfgBefore);
++  });
++
++  it("keeps the recovery ownership check for hashed bares", async () => {
++    const { origin, bare, cfg } = await hashedBare();
++    assert.equal(await git.recoveryAttemptMode(origin, "k"), false);
++    assert.equal(await git.discoverRetainedRecovery(origin, "agent/issue-1", "k", "run-1"), undefined);
++    const mode = fs.statSync(cfg).mode & 0o7777;
++    fs.chmodSync(cfg, mode | 0o002);
++    try {
++      await assert.rejects(git.recoveryAttemptMode(origin, "k"), /unsafe recovery bare config/);
++      await assert.rejects(git.discoverRetainedRecovery(origin, "agent/issue-1", "k", "run-1"), /unsafe recovery bare config/);
++    } finally {
++      fs.chmodSync(cfg, mode);
++    }
++    assert.ok(fs.existsSync(bare));
++  });
++});
+diff --git a/agent/test/issue-1742-recovery.test.ts b/agent/test/issue-1742-recovery.test.ts
+index c2a7cd21..86c52ee6 100644
+--- a/agent/test/issue-1742-recovery.test.ts
++++ b/agent/test/issue-1742-recovery.test.ts
+@@ -1,5 +1,6 @@
+ import { afterEach, describe, it } from "node:test";
+ import assert from "node:assert/strict";
++import { execFileSync } from "node:child_process";
+ import fs from "node:fs";
+ import fsp from "node:fs/promises";
+ import os from "node:os";
+@@ -10,7 +11,7 @@ import { Outbox } from "../src/outbox.js";
+ import { RecoveryCoordinator, type RecoveryArchiveClient } from "../src/recovery.js";
+ import { nullLogger } from "./helpers.js";
+ import { FakeRecoveryClient } from "./codex-reap-fixture.js";
+-import { TOKEN, fakeGitlab, git, gitlabClaim, installHarness, runner, simulateCommittedWork } from "./runner-harness.js";
++import { TOKEN, fakeGitlab, fx, git, gitlabClaim, installHarness, runner, simulateCommittedWork } from "./runner-harness.js";
+ 
+ // Issue #1742 M3 D4(b) — the EARLY CUT: a crash at finalize fetch-back, before the finalization
+ // pin, with committed work only in the owner's runner clone. G's record is still the early base
+@@ -148,6 +149,64 @@ describe("issue #1742 D4(a): the runner's finalization pin", () => {
+   });
+ });
+ 
++describe("issue #2886: the finalization pin for a long origin", () => {
++  it("records the bounded hashed bareDir and captures it at exact G", async () => {
++    const GEN = 4;
++    // A nested local origin whose legacy flattened name is over 255 bytes, holding the fixture's content.
++    const root = fs.mkdtempSync(path.join(os.tmpdir(), "issue-2886-longorigin-"));
++    roots.push(root);
++    const longOrigin = path.join(root, ...Array.from({ length: 6 }, (_, i) => `${i}` + "s".repeat(58)), "origin");
++    fs.mkdirSync(path.dirname(longOrigin), { recursive: true });
++    execFileSync("git", ["clone", "-q", fx.originPath, longOrigin], {
++      env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
++    });
++    assert.ok(Buffer.byteLength(longOrigin.split("/").filter(Boolean).join("+") + ".git", "utf8") > 255);
++    const base = gitlabClaim(1886);
++    const claim = gitlabClaim(1886, { claim_generation: GEN, repo: { ...base.repo, clone_url: longOrigin } });
++    simulateCommittedWork();
++    let fetched = false;
++    const realFetch = git.fetchAgentBranch.bind(git);
++    git.fetchAgentBranch = (async (...args: Parameters<typeof git.fetchAgentBranch>) => {
++      const out = await realFetch(...args);
++      fetched = true;
++      return out;
++    }) as typeof git.fetchAgentBranch;
++    let reached!: () => void;
++    const at = new Promise<void>((resolve) => { reached = resolve; });
++    let release!: () => void;
++    const gate = new Promise<void>((resolve) => { release = resolve; });
++    git.changedFiles = (async () => {
++      if (fetched) {
++        reached();
++        await gate;
++        throw new Error("cut: process died after the finalization pin");
++      }
++      return ["src/impl.ts"];
++    }) as typeof git.changedFiles;
++    const { gitlab } = fakeGitlab();
++    const execution = runner(new StubExecutor(nullLogger()), gitlab, TOKEN).execute(claim);
++    try {
++      await Promise.race([at, new Promise<void>((_, rej) => setTimeout(() => rej(new Error("post-pin cut not reached")), 10_000))]);
++      const client = new FakeRecoveryClient();
++      const coord = new RecoveryCoordinator({ client, git, log: nullLogger(), recoveryRoot: git.recoveryRoot, workerToken: TOKEN });
++      const records = await coord.inspect(claim.run_id);
++      assert.equal(records.length, 1);
++      const rec = records[0]!;
++      assert.equal(rec.generation, GEN);
++      assert.equal(rec.finalizationPin, true);
++      assert.match(rec.bareDir!, /^uzi-sha256-[0-9a-f]{64}\.git$/);
++      assert.equal(rec.bareDir, path.basename(git.barePathFor(claim.repo.clone_url)));
++      const snapshot = await coord.snapshotBootRecords();
++      await coord.resumePending(undefined, snapshot);
++      assert.equal(client.reserveCalls.length, 1, "reserved once");
++      assert.equal(client.reserveCalls[0]!.generation, GEN);
++    } finally {
++      release();
++      await execution;
++    }
++  });
++});
++
+ // NOT COVERED HERE: the re-claim leg (the same run re-claimed at G+1 on the same worker entering
+ // the PendingRecoveryCaptureError path, parking recovery_wait with the work in the tracking ref,
+ // and reserving at G+1 only). That path runs only inside phaseClone of a docker-lane attempt-path

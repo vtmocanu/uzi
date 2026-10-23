@@ -1,0 +1,390 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 2b12663b..a8a7ed92 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -24,6 +24,9 @@ through `[0.52.0]`.)
+ 
+ ### Fixed
+ 
++- **Checkpoint publication acknowledgments are capped at 64 KiB ([#2888](https://github.com/vtmocanu/uzi/issues/2888)).**
++  The worker now reads the checkpoint publish response through a streamed-byte cap instead of buffering it whole, so an oversized or endless acknowledgment is cancelled and treated as an ambiguous publish failure (the attempted tip is kept, nothing is confirmed) without echoing any of the body.
++
+ - **Published charts carry the verified worker roll target ([#2906](https://github.com/vtmocanu/uzi/issues/2906)).**
+   Release packaging derives the exact baked version from signature-verified pinned worker images, including older worker pins, so persistent hosted-worker rolls no longer wait for a manual target-version mapping. Per-cluster overrides remain available; remove a hand-set `workers.rollTargetVersion` when using the published chart's pin so a stale override cannot hold the next roll. Missing or conflicting image identity blocks chart publication.
+ 
+diff --git a/agent/src/client.ts b/agent/src/client.ts
+index ba1bc4b4..7713e99f 100644
+--- a/agent/src/client.ts
++++ b/agent/src/client.ts
+@@ -2018,7 +2018,10 @@ export class WorkerClient {
+    * rather than throwing, and a 2xx with an empty body returns `{ ok: false, httpStatus }`
+    * too (the publish could not be confirmed). A 2xx with a parseable body returns
+    * `{ ok: true, body }` — which the caller further inspects for a best-effort skip
+-   * (`published: false`). The bearer/version header assembly mirrors fetchRaw; the same
++   * (`published: false`). The acknowledgment is read through {@link readBoundedText} under
++   * {@link CHECKPOINT_PUBLISH_ACK_MAX_BYTES}: an oversized body, a read failure or an abort
++   * THROWS (a `ResponseBodyOverflowError` for overflow), which leaves the publish outcome
++   * ambiguous for the caller. The bearer/version header assembly mirrors fetchRaw; the same
+    * per-request timeout is used — generous enough for a real pack, and an abort is just
+    * another best-effort miss (it throws, caught by the caller's warn-and-swallow).
+    */
+@@ -2029,6 +2032,9 @@ export class WorkerClient {
+     boundarySignal?: AbortSignal,
+   ): Promise<PublishResult> {
+     const path = `${WORKER_API_PREFIX}/runs/${runId}/publish`;
++    const signal = boundarySignal
++      ? AbortSignal.any([boundarySignal, AbortSignal.timeout(this.httpTimeoutMs)])
++      : AbortSignal.timeout(this.httpTimeoutMs);
+     const init: RequestInit = {
+       method: "POST",
+       headers: {
+@@ -2041,9 +2047,7 @@ export class WorkerClient {
+       // undici requires `duplex: "half"` for a streamed (Readable) request body; without it
+       // the fetch throws before sending. (oxlint no-invalid-fetch-options accepts this shape.)
+       duplex: "half",
+-      signal: boundarySignal
+-        ? AbortSignal.any([boundarySignal, AbortSignal.timeout(this.httpTimeoutMs)])
+-        : AbortSignal.timeout(this.httpTimeoutMs),
++      signal,
+     };
+     const res = await fetch(this.baseUrl + path, init);
+     if (res.status < 200 || res.status >= 300) {
+@@ -2051,7 +2055,9 @@ export class WorkerClient {
+       await res.body?.cancel().catch(() => undefined);
+       return { ok: false, httpStatus: res.status };
+     }
+-    const text = await res.text();
++    // Bounded by streamed bytes: an overflow, a read failure or an abort throws, so the caller
++    // records the publish as ambiguous instead of reading an unbounded acknowledgment.
++    const text = await readBoundedText(res, CHECKPOINT_PUBLISH_ACK_MAX_BYTES, true, signal);
+     // A 2xx with no body cannot confirm the publish landed; treat it as a non-confirming
+     // outcome carrying the 2xx code rather than fabricating a body.
+     if (!text) return { ok: false, httpStatus: res.status };
+@@ -3664,6 +3670,8 @@ const CROSS_CHECK_RESPONSE_MAX_BYTES = 6 * 1024 * 1024;
+ const RECOVERY_RELEASE_RESPONSE_MAX_BYTES = 16 * 1024;
+ /** Maximum success body size for the Codex release and refresh envelopes. */
+ const CODEX_SUCCESS_BODY_MAX_BYTES = 64 * 1024;
++/** Operational cap on the checkpoint publication acknowledgment; counts streamed bytes, not Content-Length. */
++const CHECKPOINT_PUBLISH_ACK_MAX_BYTES = 64 * 1024;
+ 
+ /** Read through EOF, including at the exact cap; never retain or decode an overflowing chunk. */
+ async function readCodexSuccessText(res: Response): Promise<string> {
+diff --git a/agent/test/client-checkpoint-publication.test.ts b/agent/test/client-checkpoint-publication.test.ts
+new file mode 100644
+index 00000000..11a5af08
+--- /dev/null
++++ b/agent/test/client-checkpoint-publication.test.ts
+@@ -0,0 +1,167 @@
++import assert from "node:assert/strict";
++import { createServer, type Server } from "node:http";
++import type { AddressInfo } from "node:net";
++import { Readable } from "node:stream";
++import { afterEach, describe, it } from "node:test";
++import { WorkerClient } from "../src/client.js";
++import { nullLogger } from "./helpers.js";
++
++// Issue #2888: the checkpoint publication acknowledgment is read under a streamed-byte cap.
++const CAP = 64 * 1024;
++const MARKER = "SECRET-BODY-MARKER";
++const TIP = "a".repeat(40);
++const enc = new TextEncoder();
++
++const realFetch = globalThis.fetch;
++afterEach(() => { globalThis.fetch = realFetch; });
++
++interface Source { stream: ReadableStream<Uint8Array>; cancelled: () => boolean; }
++
++/** A stream of the given chunks that records whether its source cancel hook ran. */
++function chunked(chunks: Uint8Array[]): Source {
++  let i = 0, cancelled = false;
++  const stream = new ReadableStream<Uint8Array>({
++    pull(c) { if (i < chunks.length) c.enqueue(chunks[i++]!); else c.close(); },
++    cancel() { cancelled = true; },
++  }, { highWaterMark: 0 });
++  return { stream, cancelled: () => cancelled };
++}
++
++/** Valid JSON `{"published":true,"pad":"..."}` padded with whitespace to exactly `bytes` bytes. */
++function padded(bytes: number, extra = ""): Uint8Array {
++  const head = `{"published":true${extra}}`;
++  const body = head + " ".repeat(bytes - enc.encode(head).length);
++  const out = enc.encode(body);
++  assert.equal(out.length, bytes);
++  return out;
++}
++
++function stub(make: (init: RequestInit) => Response): void {
++  globalThis.fetch = (async (_input: unknown, init?: RequestInit) => make(init ?? {})) as typeof fetch;
++}
++
++function publish(boundary?: AbortSignal) {
++  const client = new WorkerClient("http://ckpt.test", "tok", "test", nullLogger());
++  return client.publishCheckpoint("run-1", TIP, Readable.from(["pack"]), boundary);
++}
++
++const overflow = { name: "ResponseBodyOverflowError" };
++
++describe("checkpoint publication acknowledgment", () => {
++  it("returns a small valid ack, a skipped ack and an empty 2xx as before", async () => {
++    stub(() => Response.json({ published: true }));
++    assert.deepEqual(await publish(), { ok: true, body: { published: true } });
++    stub(() => Response.json({ published: false, skipped: "not_descendant" }));
++    assert.deepEqual(await publish(), { ok: true, body: { published: false, skipped: "not_descendant" } });
++    stub(() => new Response("", { status: 202 }));
++    assert.deepEqual(await publish(), { ok: false, httpStatus: 202 });
++  });
++
++  it("accepts exactly the cap", async () => {
++    const src = chunked([padded(CAP)]);
++    stub(() => new Response(src.stream, { status: 200 }));
++    assert.deepEqual(await publish(), { ok: true, body: { published: true } });
++  });
++
++  it("rejects one byte over the cap without echoing the body, and cancels the source", async () => {
++    const src = chunked([padded(CAP + 1, `,"m":"${MARKER}"`)]);
++    stub(() => new Response(src.stream, { status: 200 }));
++    await assert.rejects(publish(), (err: Error) => {
++      assert.equal(err.name, overflow.name);
++      assert.ok(!err.message.includes(MARKER));
++      return true;
++    });
++    assert.equal(src.cancelled(), true);
++  });
++
++  it("stops pulling an endless stream near the cap", async () => {
++    let pulled = 0, cancelled = false;
++    const chunk = new Uint8Array(16 * 1024).fill(0x20);
++    const stream = new ReadableStream<Uint8Array>({
++      pull(c) {
++        if (pulled >= 4 * 1024 * 1024) { c.error(new Error("sentinel limit reached")); return; }
++        pulled += chunk.length;
++        c.enqueue(chunk);
++      },
++      cancel() { cancelled = true; },
++    }, { highWaterMark: 0 });
++    stub(() => new Response(stream, { status: 200 }));
++    await assert.rejects(publish(), overflow);
++    assert.equal(cancelled, true);
++    assert.ok(pulled <= CAP + 16 * 1024, `pulled ${pulled}`);
++  });
++
++  it("rejects an over-cap chunked body from a real server with no Content-Length", async () => {
++    const server: Server = createServer((_req, res) => {
++      res.writeHead(200, { "Content-Type": "application/json" });
++      res.write(Buffer.alloc(CAP, 0x20));
++      res.write(Buffer.alloc(1024, 0x20));
++      res.end();
++    });
++    await new Promise<void>(r => server.listen(0, "127.0.0.1", r));
++    try {
++      const { port } = server.address() as AddressInfo;
++      const client = new WorkerClient(`http://127.0.0.1:${port}`, "tok", "test", nullLogger());
++      await assert.rejects(client.publishCheckpoint("run-1", TIP, Readable.from(["pack"])), overflow);
++    } finally {
++      server.closeAllConnections();
++      await new Promise<void>(r => server.close(() => r()));
++    }
++  });
++
++  it("counts streamed bytes, not Content-Length", async () => {
++    const big = chunked([padded(CAP + 1)]);
++    stub(() => new Response(big.stream, { status: 200, headers: { "Content-Length": "10" } }));
++    await assert.rejects(publish(), overflow);
++    const small = chunked([padded(100)]);
++    stub(() => new Response(small.stream, { status: 200, headers: { "Content-Length": "999999999" } }));
++    assert.deepEqual(await publish(), { ok: true, body: { published: true } });
++  });
++
++  describe("multibyte UTF-8", () => {
++    const withText = (bytes: number, text: string) => padded(bytes, `,"t":"${text}"`);
++    it("accepts exactly the cap and decodes the characters", async () => {
++      const text = "ü\u{1F600}x";
++      stub(() => new Response(chunked([withText(CAP, text)]).stream, { status: 200 }));
++      assert.deepEqual(await publish(), { ok: true, body: { published: true, t: text } } as never);
++    });
++    it("rejects one byte over even when the character count is under the cap", async () => {
++      const text = "ü".repeat(1000);
++      const body = withText(CAP + 1, text);
++      assert.ok(new TextDecoder().decode(body).length < CAP);
++      stub(() => new Response(chunked([body]).stream, { status: 200 }));
++      await assert.rejects(publish(), overflow);
++    });
++    it("decodes a code point split across two chunks", async () => {
++      const text = "\u{1F600}";
++      const bytes = withText(200, text);
++      const at = bytes.indexOf(0xf0) + 2;
++      stub(() => new Response(chunked([bytes.subarray(0, at), bytes.subarray(at)]).stream, { status: 200 }));
++      assert.deepEqual(await publish(), { ok: true, body: { published: true, t: text } } as never);
++    });
++  });
++
++  it("propagates a mid-read stream error unchanged", async () => {
++    const err = new Error("stream broke");
++    let sent = false;
++    const stream = new ReadableStream<Uint8Array>({
++      pull(c) { if (!sent) { sent = true; c.enqueue(enc.encode("{")); } else c.error(err); },
++    }, { highWaterMark: 0 });
++    stub(() => new Response(stream, { status: 200 }));
++    await assert.rejects(publish(), (e: unknown) => e === err);
++  });
++
++  it("aborts a stalled read when the boundary signal fires and cancels the source", async () => {
++    let cancelled = false;
++    const stream = new ReadableStream<Uint8Array>({
++      pull: () => new Promise<void>(() => undefined),
++      cancel() { cancelled = true; },
++    }, { highWaterMark: 0 });
++    const boundary = new AbortController();
++    stub(() => new Response(stream, { status: 200 }));
++    const pending = publish(boundary.signal);
++    setTimeout(() => boundary.abort(), 20);
++    await assert.rejects(pending, { name: "AbortError" });
++    assert.equal(cancelled, true);
++  });
++});
+diff --git a/agent/test/runner-checkpoint-retry.test.ts b/agent/test/runner-checkpoint-retry.test.ts
+index 786ff3f6..1e1b1511 100644
+--- a/agent/test/runner-checkpoint-retry.test.ts
++++ b/agent/test/runner-checkpoint-retry.test.ts
+@@ -10,11 +10,26 @@ const TIP = "a".repeat(40);
+ const ACK = { ok: true, body: { published: true } };
+ const FAIL = { ok: false, httpStatus: 500 };
+ 
+-async function exercise(opts: {
++/** Hand-driven response body for the real-client path: pulls on demand and records the source cancel hook. */
++interface RealAck { stream: ReadableStream<Uint8Array>; cancelled: () => boolean }
++function ackStream(bytes: Uint8Array): RealAck {
++  let sent = false, cancelled = false;
++  const stream = new ReadableStream<Uint8Array>({
++    pull(c) { if (!sent) { sent = true; c.enqueue(bytes); } else c.close(); },
++    cancel() { cancelled = true; },
++  }, { highWaterMark: 0 });
++  return { stream, cancelled: () => cancelled };
++}
++
++function start(opts: {
+   responses?: unknown[]; abort?: "backoff" | "ownership" | "guard";
+   refusal?: "ownership" | "scratch" | "remediation"; exit?: number; throws?: boolean; packThrows?: boolean;
+   /** Omit for the production 250 ms then 1000 ms backoff; the default skips real waiting. */
+   backoffMs?: readonly [number, number] | "production";
++  /** Opt in: keep the real WorkerClient.publishCheckpoint and stub only globalThis.fetch with this ack body. */
++  realClient?: { body: Uint8Array };
++  /** Opt in: `exited` stays pending until the returned `resolveExit` is called. */
++  deferredExit?: boolean;
+ } = {}) {
+   const abort = new AbortController();
+   const git = new GitCache("/unused", nullLogger());
+@@ -30,6 +45,11 @@ async function exercise(opts: {
+   };
+   let ownership = 0, guards = 0, requests = 0, producers = 0, cancels = 0;
+   const streams: Readable[] = [];
++  let resolveExit: (code: number) => void = () => undefined;
++  const exited = opts.deferredExit
++    ? new Promise<number>(resolve => { resolveExit = resolve; })
++    : Promise.resolve(opts.exit ?? 0);
++  let ack: RealAck | undefined;
+   const bytes: string[] = [];
+   const events: string[] = [];
+   seam.requireTrackingOwned = async () => {
+@@ -50,12 +70,25 @@ async function exercise(opts: {
+       await guard?.(TIP);
+       producers++;
+       events.push("open");
+-      return { pack: Readable.from(["exact-pack"]), exited: Promise.resolve(opts.exit ?? 0),
++      return { pack: Readable.from(["exact-pack"]), exited,
+         cancel: () => { cancels++; events.push("settled"); } };
+     };
+     return { tipOid: TIP, ...await replay(), replay };
+   };
+-  client.publishCheckpoint = async (_run, tip, pack, signal) => {
++  const realFetch = globalThis.fetch;
++  if (opts.realClient) {
++    const real = opts.realClient;
++    globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
++      requests++;
++      const pack = init?.body as Readable;
++      streams.push(pack);
++      let body = "";
++      for await (const chunk of pack) body += chunk;
++      bytes.push(body);
++      ack = ackStream(real.body);
++      return new Response(ack.stream, { status: 200 });
++    }) as typeof fetch;
++  } else client.publishCheckpoint = async (_run, tip, pack, signal) => {
+     assert.equal(tip, TIP);
+     assert.equal(signal, abort.signal);
+     requests++;
+@@ -76,8 +109,23 @@ async function exercise(opts: {
+     lastAttemptedCheckpointRefTip: undefined as string | undefined,
+     reportedPublishOutcomes: new Set<string>(), runLog,
+     batcher: { emit: (value: unknown) => feed.push(value) } };
+-  const outcome = await seam.publishCheckpointOutcome(flight, "bare", "branch", undefined, abort.signal);
+-  return { outcome, flight, feed, requests, producers, cancels, streams, bytes, events, retryLogs };
++  let settled = false;
++  const done = seam.publishCheckpointOutcome(flight, "bare", "branch", undefined, abort.signal)
++    .finally(() => { settled = true; globalThis.fetch = realFetch; });
++  return { done, flight, feed, streams, bytes, events, retryLogs, resolveExit,
++    get settled() { return settled; }, get ackCancelled() { return ack?.cancelled() ?? false; },
++    get requests() { return requests; }, get producers() { return producers; }, get cancels() { return cancels; } };
++}
++
++async function exercise(opts: Parameters<typeof start>[0] = {}) {
++  const h = start(opts);
++  const outcome = await h.done;
++  return Object.assign(h, { outcome });
++}
++
++async function until(cond: () => boolean): Promise<void> {
++  for (let i = 0; i < 200 && !cond(); i++) await new Promise(r => setImmediate(r));
++  assert.ok(cond(), "condition was not reached");
+ }
+ 
+ it("500 then ACK uses fresh exact streams, settles the old producer, and recovers an empty ledger", async () => {
+@@ -158,3 +206,47 @@ it("transport throw is ambiguous and never retried", async () => {
+   assert.equal(r.requests, 1);
+   assert.equal(r.flight.lastAttemptedCheckpointRefTip, TIP);
+ });
++
++const ACK_CAP = 64 * 1024;
++const enc = new TextEncoder();
++const ackBytes = (n: number, extra = "") => {
++  const head = `{"published":true${extra}}`;
++  return enc.encode(head + " ".repeat(n - enc.encode(head).length));
++};
++
++it("over-cap ack with the real client stays unsettled until the producer exits, then is an ambiguous error", async () => {
++  const marker = "ACK-BODY-MARKER";
++  const h = start({ realClient: { body: ackBytes(ACK_CAP + 1, `,"m":"${marker}"`) }, deferredExit: true });
++  await until(() => h.ackCancelled);
++  await new Promise(r => setImmediate(r));
++  assert.equal(h.settled, false);
++  h.resolveExit(0);
++  const outcome = await h.done;
++  assert.deepEqual(outcome, { published: false, reason: "error" });
++  assert.equal(h.flight.lastCheckpointRefTip, "OLD");
++  assert.equal(h.flight.lastAttemptedCheckpointRefTip, TIP);
++  assert.equal(h.requests, 1);
++  const feed = JSON.stringify(h.feed);
++  assert.doesNotMatch(feed, new RegExp(marker));
++  assert.match(feed, /checkpoint publish failed: error/);
++});
++
++it("normal ack with the real client confirms only after the producer exits 0", async () => {
++  const h = start({ realClient: { body: ackBytes(100) }, deferredExit: true });
++  await until(() => h.requests === 1);
++  await new Promise(r => setTimeout(r, 20));
++  assert.equal(h.settled, false);
++  assert.equal(h.flight.lastCheckpointRefTip, "OLD");
++  h.resolveExit(0);
++  assert.deepEqual(await h.done, { published: true });
++  assert.equal(h.flight.lastCheckpointRefTip, TIP);
++});
++
++it("normal ack with the real client but a failing producer is not confirmed", async () => {
++  const h = start({ realClient: { body: ackBytes(100) }, deferredExit: true });
++  await until(() => h.requests === 1);
++  h.resolveExit(1);
++  assert.deepEqual(await h.done, { published: false, reason: "error" });
++  assert.equal(h.flight.lastCheckpointRefTip, "OLD");
++  assert.equal(h.flight.lastAttemptedCheckpointRefTip, TIP);
++});

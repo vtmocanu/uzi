@@ -1,0 +1,30 @@
+{
+  "corpus_version": "2026-10-23.1",
+  "pins_sha256": "0bab67b6af5512d049e96636a9f6690766d98bd1b5c563dd54271a57a4c478e6",
+  "cases": [
+    {
+      "id": "d-2888",
+      "case_sha256": "4af556318f72e4cd7f4f5700b30d8929883be5005cea1c2398694ac546e5c308"
+    },
+    {
+      "id": "d-3063",
+      "case_sha256": "17ac33f21041b03c89d9a4739dc17d54a261f2eac23918573a8b4bc70038b19d"
+    },
+    {
+      "id": "d-2887",
+      "case_sha256": "272a91643f85daf9a2d7c2aae53dd3bd92c45cbae0453f73b8ac9d84ab123e45"
+    },
+    {
+      "id": "c-2904",
+      "case_sha256": "449e00504e74e17135a3a02c8f65b64f8dc9a6c82a4ce0aa37eb4493574bddc3"
+    },
+    {
+      "id": "c-2926",
+      "case_sha256": "4dcd3a2ebed64d34c902021b12a1234a43358d89896c82152a9b1358c4265752"
+    },
+    {
+      "id": "c-3063",
+      "case_sha256": "d4378a1540c7cd989347f84125f39650fecb049efb8e6c8096fe1660a287b548"
+    }
+  ]
+}

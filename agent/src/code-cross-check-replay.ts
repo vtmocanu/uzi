@@ -24,8 +24,8 @@ const replayLog: Logger = {
 };
 
 export const CORPUS_DIR = "fixtures/code-cross-check-replay";
-/** Source-pinned sha256 of manifest.json. The corpus unit sets the real value. */
-const CORPUS_MANIFEST_SHA256 = "0".repeat(64);
+/** Source-pinned sha256 of fixtures/code-cross-check-replay/manifest.json. Re-pin when the corpus changes. */
+export const CORPUS_MANIFEST_SHA256 = "cbad197cb84480adde02dd34ee1d0349d3479bb3f21be0448fa3bbc404760266";
 export const REPLAY_DIFF_ARGS = ["--no-ext-diff", "--no-textconv", "--no-color", "--abbrev=8"] as const;
 const REPLAY_IDENTITY = { name: "uzi replay", email: "replay@uzi.invalid", date: "2026-01-01T00:00:00Z" } as const;
 export const READER_IMPLEMENTATION = { codex: "codex fileop Read+Search", claude: "claude sdk Read+Grep+Glob" } as const;
