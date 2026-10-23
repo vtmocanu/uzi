@@ -8,6 +8,7 @@
   "scripts": {
     "start": "tsx src/main.ts",
     "eval:pr-description": "tsx src/pr-description-eval-cli.ts",
+    "eval:code-cross-check": "tsx src/code-cross-check-replay-cli.ts",
     "lint": "oxlint --config .oxlintrc.json -D correctness --report-unused-disable-directives-severity=error src test",
     "knip": "knip",
     "typecheck": "tsc --noEmit",
