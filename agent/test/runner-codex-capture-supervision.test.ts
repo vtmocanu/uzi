@@ -2,9 +2,10 @@ import { it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
-import { api, fakeGitlab, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
-import { FakeCodexExecutor } from "./runner-codex-sinks-fixture.js";
+import { api, fakeGitlab, fx, git, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
+import { FakeCodexExecutor, GIT_ENV } from "./runner-codex-sinks-fixture.js";
 import { observe } from "./runner-codex-capture-proof-fixture.js";
 
 installHarness();
@@ -94,7 +95,14 @@ for (const site of ["wall", "hold", "recovery"] as const) for (const fallback of
       depth++;
       try { return await original(...args); } finally { depth--; }
     });
-    await runner.execute(gitlabClaim(285530 + ["wall", "hold", "recovery"].indexOf(site) * 2 + Number(fallback)));
+    const iid = 285530 + ["wall", "hold", "recovery"].indexOf(site) * 2 + Number(fallback);
+    const claim = gitlabClaim(iid);
+    await runner.execute(claim);
+    if (site === "hold") assert.ok(api.completionHoldRequests[0]?.body.head, "real verified hold completed");
+    else if (site === "wall") assert.ok(api.wallParkRequests[0]?.body.head, "real verified wall park completed");
+    else assert.ok(api.states.some(state => state.runId === claim.run_id && state.body.status === "recovery_wait"));
+    assert.equal(execFileSync("git", ["-C", git.barePathFor(fx.originPath), "show", `refs/uzi-runner/agent/issue-${iid}:ALL-CHILDREN.txt`],
+      { env: GIT_ENV, encoding: "utf8" }), "all capture launches supervised\n", "the independently observed children produced the actual local capture");
     assert.ok(launches > 0, "native child creation was observed independently of facade calls");
     assert.equal(unowned.length, 0, `first child bypassing its scoped spawner: ${unowned[0] ?? "none"}`);
     assert.equal(tickets.size, 0, "each scoped Git launch reached exactly one native child");
