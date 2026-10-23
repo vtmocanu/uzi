@@ -162,12 +162,31 @@ func TestLinkedTaskPoolPromotionConflictLiveDB(t *testing.T) {
 	env.exec("UPDATE runs SET continued_issue_iid=71 WHERE id=$1", held)
 	winner := uuid.New()
 	env.exec("INSERT INTO runs (id,user_id,repo_id,kind,issue_iid,issue_title,issue_description) VALUES ($1,$2,$3,'issue',71,'winner','')", winner, o.userID, o.repoID)
+	// The sweep spans all owners; an independent eligible run must still resume.
+	other := seedReevalOwner(t, env, BindModeAuto, true)
+	control := seedTaskRun(t, env, other.userID, other.repoID, "uzi/task/"+uuid.NewString(), "claude", "pool_wait", false, false)
 	before := mustRun(t, env, held)
 	bc := &parkBroadcaster{}
 	svc.SetBroadcaster(bc)
 	n, err := svc.resumePoolWaitRuns(env.ctx)
-	if err != nil || n != 0 || statusOf(t, env, held) != "pool_wait" || bc.sawState(held, "queued") {
+	if err != nil || statusOf(t, env, held) != "pool_wait" || bc.sawState(held, "queued") {
 		t.Fatalf("sweep conflict n=%d err=%v", n, err)
+	}
+	if statusOf(t, env, control) != "queued" || !bc.sawState(control, "queued") {
+		t.Fatal("independent owner did not resume and broadcast queued")
+	}
+	queued := make(map[uuid.UUID]bool)
+	for _, state := range bc.states {
+		if state.status != "queued" {
+			continue
+		}
+		if state.id == held || queued[state.id] || statusOf(t, env, state.id) != "queued" {
+			t.Fatalf("invalid queued broadcast for run %s", state.id)
+		}
+		queued[state.id] = true
+	}
+	if n != int64(len(queued)) {
+		t.Fatalf("sweep resumed %d runs but broadcast %d distinct queued runs", n, len(queued))
 	}
 	_, err = svc.SetRunCredential(env.ctx, o.userID, held, CredentialOverrideModePinned, &o.altTok)
 	var pgErr *pgconn.PgError
