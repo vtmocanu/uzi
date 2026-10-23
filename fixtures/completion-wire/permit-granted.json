@@ -1,0 +1,12 @@
+{
+  "granted": true,
+  "permit": {
+    "id": "00000000-0000-4000-8000-000000000000",
+    "contract_revision": 1,
+    "branch": "agent/issue-1",
+    "head": "H",
+    "issued_at": "2026-01-01T00:00:00Z",
+    "finding_ids": [],
+    "completion_scope": {}
+  }
+}
