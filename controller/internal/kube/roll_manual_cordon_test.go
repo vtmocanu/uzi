@@ -12,6 +12,49 @@ import (
 	"github.com/vtmocanu/uzi/controller/internal/protocol"
 )
 
+// This fake models only automatic reason ownership, not API storage. Legacy
+// unscoped operations fail immediately; owner manual holds arrive only in polls.
+type manualReasonCordoner struct {
+	t                *testing.T
+	automatic        map[string]string
+	requests, clears []string
+	clearErr         error
+}
+
+func (f *manualReasonCordoner) RequestDrain(context.Context, string) error {
+	f.t.Fatal("controller used unscoped drain request")
+	return nil
+}
+
+func (f *manualReasonCordoner) ClearDrain(context.Context, string) error {
+	f.t.Fatal("controller used unscoped drain clear")
+	return nil
+}
+
+func (f *manualReasonCordoner) RequestDrainWithReason(_ context.Context, id string, reasons ...string) error {
+	if len(reasons) != 1 || reasons[0] != "image_roll" {
+		f.t.Fatalf("unexpected automatic drain request for %s: %v", id, reasons)
+	}
+	f.requests = append(f.requests, id+":"+reasons[0])
+	f.automatic[id] = reasons[0]
+	return nil
+}
+
+func (f *manualReasonCordoner) ClearDrainWithReason(_ context.Context, id string, reasons ...string) error {
+	if len(reasons) != 1 || reasons[0] != "image_roll" {
+		f.t.Fatalf("unexpected automatic drain clear for %s: %v", id, reasons)
+	}
+	f.clears = append(f.clears, id+":"+reasons[0])
+	if f.clearErr != nil {
+		return f.clearErr
+	}
+	if f.automatic[id] != reasons[0] {
+		f.t.Fatalf("cleared unowned automatic reason for %s: %q", id, f.automatic[id])
+	}
+	delete(f.automatic, id)
+	return nil
+}
+
 func manualWorker(w *protocol.DesiredWorker) {
 	w.ManualCordonedAt = &m5Now
 	value := true
@@ -25,7 +68,9 @@ func TestManualRollAdmission(t *testing.T) {
 			if mode == "singleton" || mode == "busy" {
 				n = 1
 			}
-			m, c, ws, cordon := matrixFixture(t, n)
+			m, c, ws, _ := matrixFixture(t, n)
+			cordon := &manualReasonCordoner{t: t, automatic: map[string]string{}}
+			m.cordoner = cordon
 			manualWorker(&ws[0])
 			want := true
 			wantID := "w1"
@@ -71,8 +116,15 @@ func TestManualRollAdmission(t *testing.T) {
 			} else if len(patches) != 0 {
 				t.Fatalf("unsafe template replacement: %v", patches)
 			}
-			if mode == "busy" && (len(cordon.calls) != 1 || cordon.calls[0] != "w1") {
-				t.Fatalf("manual busy worker must drain and wait: %v", cordon.calls)
+			if mode == "busy" {
+				if len(cordon.requests) != 1 || cordon.requests[0] != "w1:image_roll" || cordon.automatic["w1"] != "image_roll" {
+					t.Fatalf("manual busy worker must request image_roll and wait: %+v", cordon)
+				}
+			} else if len(cordon.requests) != 0 {
+				t.Fatalf("idle admission requested an automatic drain: %v", cordon.requests)
+			}
+			if len(cordon.clears) != 0 {
+				t.Fatalf("admission cleared an unowned drain: %v", cordon.clears)
 			}
 			if !want {
 				for _, w := range ws {
@@ -98,9 +150,6 @@ func TestManualRollAdmission(t *testing.T) {
 					t.Fatalf("roll admission deleted object: %v", action)
 				}
 			}
-			if mode != "omitted" && ws[0].ManualCordonedAt != nil && !ws[0].ManualCordonedAt.Equal(m5Now) {
-				t.Fatal("manual cordon changed")
-			}
 		})
 	}
 }
@@ -113,7 +162,7 @@ func TestManualCanaryCompletionAndRelease(t *testing.T) {
 				n = 1
 			}
 			m, c, ws, _ := matrixFixture(t, n)
-			f := &mandatoryReasonCordoner{}
+			f := &manualReasonCordoner{t: t, automatic: map[string]string{}}
 			m.cordoner = f
 			if mode == "singleton" {
 				manualWorker(&ws[0])
@@ -126,6 +175,7 @@ func TestManualCanaryCompletionAndRelease(t *testing.T) {
 			}
 			if mode == "manual_release" || mode == "release" || mode == "failed_release" {
 				ws[0].DrainingSince, ws[0].DrainingReason = recentDrain(), token("image_roll")
+				f.automatic["w1"] = "image_roll"
 				v := true
 				ws[0].EffectiveCordoned = &v
 			}
@@ -143,8 +193,35 @@ func TestManualCanaryCompletionAndRelease(t *testing.T) {
 				t.Fatalf("coverage after completion: %v, want %d; %+v", got, wantPatches, m.PacingOutcomes())
 			}
 			if mode == "release" || mode == "manual_release" || mode == "failed_release" {
-				if len(f.clearCalls) != 1 || f.clearCalls[0] != "w1" || len(f.reasons) != 1 || f.reasons[0] != "image_roll" {
+				if len(f.clears) != 1 || f.clears[0] != "w1:image_roll" {
 					t.Fatalf("reason-owned release not attempted first: %+v", f)
+				}
+				wantReason := ""
+				if mode == "failed_release" {
+					wantReason = "image_roll"
+				}
+				if f.automatic["w1"] != wantReason {
+					t.Fatalf("automatic release state=%q want %q", f.automatic["w1"], wantReason)
+				}
+			} else if len(f.clears) != 0 {
+				t.Fatalf("manual-only completion attempted a release: %v", f.clears)
+			}
+			if len(f.requests) != 0 {
+				t.Fatalf("completion requested another drain: %v", f.requests)
+			}
+			if mode == "manual" || mode == "manual_release" {
+				// Poll again with the owner hold still present, after any successful
+				// automatic release. No controller operation can remove that hold.
+				ws[0].DrainingSince, ws[0].DrainingReason = nil, nil
+				released := false
+				ws[0].EffectiveCordoned = &released // Isolate the manual hold from the aggregate guard.
+				clearCount := len(f.clears)
+				rollTickTest(t, matrixRestart(m), ws)
+				if len(f.clears) != clearCount || len(f.requests) != 0 {
+					t.Fatalf("manual-only poll changed automatic reasons: %+v", f)
+				}
+				if got := templatePatches(c); len(got) != 1 {
+					t.Fatalf("manual canary supplied coverage after automatic release: %v", got)
 				}
 			}
 			if mode == "singleton" {
