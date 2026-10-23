@@ -20,6 +20,7 @@ test("capture inventory requires the cancellation, trusted bare and sandbox proo
     "reads packed trusted bare objects as the real runner uid without write authority",
     "captures under the enforced required command sandbox",
   ];
+  mkdirSync(path.join(repo, ".uzi/scratch"), { recursive: true });
   const scratch = mkdtempSync(path.join(repo, ".uzi/scratch/capture-inventory."));
   const api = new API({ cwd: scratch });
   try {
