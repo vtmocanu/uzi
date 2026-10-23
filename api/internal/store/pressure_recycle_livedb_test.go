@@ -8,7 +8,6 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
-	"os"
 	"testing"
 )
 
@@ -148,8 +147,50 @@ func TestPressureRecycleMigrationLockLiveDB(t *testing.T) {
 }
 
 func TestPressureRecycleMigrationRoundtripLiveDB(t *testing.T) {
-	ctx, pool, q := openHealthLiveDB(t)
-	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	ctx, parent, _ := openHealthLiveDB(t)
+	var marked bool
+	if err := parent.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM uzi_test_harness.database_marker WHERE marker='recovery-reset-v1')").Scan(&marked); err != nil || !marked {
+		t.Fatalf("test database marker required: marked=%v err=%v", marked, err)
+	}
+	// Earlier tests can leave manual intent and durable audit history in the
+	// shared database. Neither may be removed to make a schema rollback pass.
+	sharedSnapshot := func() string {
+		t.Helper()
+		var got string
+		if err := parent.QueryRow(ctx, `SELECT jsonb_build_object(
+			'events', (SELECT jsonb_agg(to_jsonb(e) ORDER BY id) FROM worker_cordon_events e),
+			'intent', (SELECT jsonb_agg(jsonb_build_array(id,manual_cordoned_at,manual_cordoned_by,manual_cordoned_by_label,manual_cordon_reason) ORDER BY id)
+				FROM workers WHERE manual_cordoned_at IS NOT NULL))::text`).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	sharedBefore := sharedSnapshot()
+	defer func() {
+		if sharedSnapshot() != sharedBefore {
+			t.Error("pressure migration roundtrip changed shared manual intent or audit history")
+		}
+	}()
+
+	ctx, dsn := standIsolatedDB(t, "pressure_migration_")
+	if err := store.MigrateTo(ctx, dsn, 332); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	// Read only columns present on both sides of migration 00332, rather
+	// than the generated current-schema worker projection.
+	read := func(id uuid.UUID) store.Worker {
+		t.Helper()
+		var got store.Worker
+		if err := pool.QueryRow(ctx, "SELECT draining_since,draining_reason FROM workers WHERE id=$1", id).Scan(&got.DrainingSince, &got.DrainingReason); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
 	user := uuid.New()
 	mustExec(ctx, t, pool, "INSERT INTO users(id,email,password_hash) VALUES($1,$2,'x')", user, user.String()+"@migration.test")
 	ids := []uuid.UUID{uuid.New(), uuid.New(), uuid.New()}
@@ -158,11 +199,7 @@ func TestPressureRecycleMigrationRoundtripLiveDB(t *testing.T) {
 	}
 	before := make([]store.Worker, 3)
 	for i, id := range ids {
-		var err error
-		before[i], err = q.GetWorkerByID(ctx, id)
-		if err != nil {
-			t.Fatal(err)
-		}
+		before[i] = read(id)
 	}
 	defer func() {
 		if err := store.Migrate(ctx, dsn); err != nil {
@@ -173,11 +210,8 @@ func TestPressureRecycleMigrationRoundtripLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i, id := range ids {
-		got, err := q.GetWorkerByID(ctx, id)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !got.DrainingSince.Time.Equal(before[i].DrainingSince.Time) {
+		got := read(id)
+		if got.DrainingSince.Valid != before[i].DrainingSince.Valid || !got.DrainingSince.Time.Equal(before[i].DrainingSince.Time) {
 			t.Fatal("Down removed drain")
 		}
 		if i == 0 {
