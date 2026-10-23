@@ -18885,6 +18885,8 @@ async function indexEntries(bytes) {
         const unchanged = previous?.mode === 0o120000 && (!staged || staged.mode === 0o120000)
           && createHash("sha1").update("blob " + leaf.link.length + "\0").update(leaf.link).digest("hex") === previous.oid;
         if (!unchanged) refuse("unsupported_symlink");
+        // Batch credit must match the authenticated bytes observed in the worktree.
+        if (leaf.link.length !== sizes.get(previous.oid)) refuse("base_object_integrity");
         continue;
       }
       // A base or index symlink whose worktree path is no longer that symlink.
@@ -18899,10 +18901,16 @@ async function indexEntries(bytes) {
     } finally { if (fd !== undefined) close(fd); }
     if (!previous && content === null) continue;
     if (previous && content !== null && previous.mode === mode
-        && createHash("sha1").update("blob " + content.length + "\0").update(content).digest("hex") === previous.oid) continue;
+        && createHash("sha1").update("blob " + content.length + "\0").update(content).digest("hex") === previous.oid) {
+      // An authentic OID alone does not validate the batch size credited to this path.
+      if (content.length !== sizes.get(previous.oid)) refuse("base_object_integrity");
+      continue;
+    }
     let before = null;
     if (previous) {
       before = await object("blob", previous.oid, FILE_LIMIT);
+      // Fetched before-images must agree with the same initial batch credit.
+      if (before.length !== sizes.get(previous.oid)) refuse("base_object_integrity");
     }
     // Git's binary sample convention, before creating any diff inputs.
     if ((before && before.subarray(0, 8000).includes(0)) || (content && content.subarray(0, 8000).includes(0))) continue;
