@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -276,19 +277,30 @@ func taskCheckpointTransfer(t *testing.T, env codexTestEnv, root, agent, mode st
 		t.Fatal(err)
 	}
 	if mode == "first-write-refused" {
-		// Real receive-pack explicit ng, before any ref update.
-		hook := filepath.Join(origin, "hooks/pre-receive")
-		if err := os.WriteFile(hook, []byte("#!/bin/sh\necho 'non-fast-forward: fixture refusal' >&2\nexit 1\n"), 0700); err != nil {
-			t.Fatal(err)
-		}
+		// A known ancestry refusal happens before receive-pack. Generic hook
+		// rejection text is deliberately NOT proof that an attempted write is absent.
+		tree := taskCheckpointGit(t, origin, "rev-parse", state.Base+"^{tree}")
+		continuation := taskCheckpointGit(t, origin, "-c", "user.name=fixture", "-c", "user.email=fixture@example.test",
+			"commit-tree", tree, "-p", state.Base, "-m", "competing branch before first checkpoint")
+		taskCheckpointGit(t, origin, "update-ref", "refs/heads/"+first.CheckpointCoordinates.WorkBranch, continuation)
+		cfg["continuation_tip"] = continuation
 	}
 	f.svc.SetPublishFn(func(ctx context.Context, o pushbroker.Options) (pushbroker.Result, error) {
 		o.CloneURL = remote.URL + "/origin.git" // Only the destination changes; auth and policy stay production.
 		return pushbroker.Publish(ctx, o)
 	})
 	result, publishErr := f.svc.Publish(env.ctx, f.wkr, run.ID, state.Tip, pack, &first.ClaimGeneration)
-	if receive.Load() != 1 {
-		t.Fatalf("owned HTTP receive-pack requests=%d want=1; publish=%+v err=%v", receive.Load(), result, publishErr)
+	wantReceive := int32(1)
+	if mode == "first-write-refused" {
+		wantReceive = 0
+		var attempts int
+		if err := env.pool.QueryRow(env.ctx, "SELECT count(*) FROM checkpoint_publish_attempts WHERE run_id=$1", run.ID).Scan(&attempts); err != nil || attempts != 0 ||
+			publishErr != nil || result.Published || result.Skipped != "not_descendant" {
+			t.Fatalf("definite ancestry refusal: result=%+v attempts=%d query=%v publish=%v", result, attempts, err, publishErr)
+		}
+	}
+	if receive.Load() != wantReceive {
+		t.Fatalf("owned HTTP receive-pack requests=%d want=%d; publish=%+v err=%v", receive.Load(), wantReceive, result, publishErr)
 	}
 	persisted := mustRun(t, env, run.ID)
 	if len(persisted.CheckpointCoordinates) == 0 {
@@ -351,7 +363,6 @@ func taskCheckpointTransfer(t *testing.T, env codexTestEnv, root, agent, mode st
 		if *second.CheckpointWriteUnresolved || second.CheckpointTip != nil {
 			t.Fatal("definite refusal not projected as explicit false / NULL anchor")
 		}
-		taskCheckpointGit(t, origin, "update-ref", "refs/heads/"+second.CheckpointCoordinates.WorkBranch, state.Base)
 		cfg["mode"] = "refused"
 		node(t, "recover")
 	case "lost-ack-after-requeue":
@@ -513,14 +524,25 @@ func taskCheckpointSmartHTTP(origin string) http.Handler {
 			args = append(args, "--advertise-refs")
 		}
 		args = append(args, origin)
-		cmd := exec.CommandContext(r.Context(), "git", args...) //nolint:gosec // Fixed Git executable, literal allowlisted operation, and owned fixture path; no shell.
-		cmd.Env = taskCheckpointEnv()
+		var input []byte
 		if !advertise {
-			cmd.Stdin = r.Body
+			var err error
+			input, err = io.ReadAll(io.LimitReader(r.Body, (1<<20)+1))
+			if err != nil || len(input) > 1<<20 {
+				http.Error(w, "fixture request exceeds its byte budget", http.StatusRequestEntityTooLarge)
+				return
+			}
 		}
-		var stderr bytes.Buffer
-		cmd.Stderr = &stderr
-		output, err := cmd.Output()
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "git", args...) //nolint:gosec // Fixed Git executable, literal allowlisted operation, and owned fixture path; no shell.
+		cmd.Env = taskCheckpointEnv()
+		cmd.Stdin = bytes.NewReader(input)
+		stdout := taskCheckpointHTTPBuffer{limit: 1 << 20}
+		stderr := taskCheckpointHTTPBuffer{limit: 64 << 10}
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		err := cmd.Run()
+		output := stdout.Bytes()
 		if err != nil {
 			http.Error(w, "fixture Git: "+stderr.String(), http.StatusInternalServerError)
 			return
@@ -535,4 +557,18 @@ func taskCheckpointSmartHTTP(origin string) http.Handler {
 		}
 		_, _ = w.Write(output)
 	})
+}
+
+type taskCheckpointHTTPBuffer struct {
+	buffer bytes.Buffer
+	limit  int
+}
+
+func (b *taskCheckpointHTTPBuffer) Bytes() []byte  { return b.buffer.Bytes() }
+func (b *taskCheckpointHTTPBuffer) String() string { return b.buffer.String() }
+func (b *taskCheckpointHTTPBuffer) Write(p []byte) (int, error) {
+	if len(p) > b.limit-b.buffer.Len() {
+		return 0, fmt.Errorf("fixture Git output exceeds its byte budget")
+	}
+	return b.buffer.Write(p)
 }

@@ -24,7 +24,7 @@ type Claim = {
 const [action, configPath] = process.argv.slice(2);
 assert.ok(configPath);
 const cfg = JSON.parse(fs.readFileSync(configPath, "utf8")) as {
-  scratch: string; origin: string; url: string; claim: Claim; mode: string;
+  scratch: string; origin: string; url: string; claim: Claim; mode: string; continuation_tip?: string;
 };
 const env = { ...process.env };
 for (const key of Object.keys(env)) if (key.startsWith("GIT_")) delete env[key];
@@ -69,7 +69,10 @@ if (action === "init") {
   fs.mkdirSync(data, { mode: 0o700 });
   const { logger, lines } = recordingLogger();
   const cache = new GitCache(data, logger, undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
-  const bare = await cache.ensureClone(cfg.url, undefined, undefined, key);
+  // Publication reaches this same origin through real HTTP receive-pack. Worker
+  // clones use its file transport, avoiding the unrelated raw-file-URI escaping
+  // bug for cache directories derived from HTTP URLs with explicit ports.
+  const bare = await cache.ensureClone(cfg.origin, undefined, undefined, key);
   const seed = () => cache.runnerCloneForBranch(bare, branch, "task-e2e", noProofReseed,
     claim.run_id, true, claim.checkpoint_tip, undefined,
     { checkpointKey: key, checkpointWriteUnresolved: claim.checkpoint_write_unresolved });
@@ -119,7 +122,8 @@ if (action === "init") {
       assert.equal(claim.checkpoint_write_unresolved, false, "definite refusal carries explicit false");
       assert.equal(claim.checkpoint_tip, undefined);
       const clone = await seed();
-      assert.equal(git(clone.path, "rev-parse", "HEAD"), state.base);
+      assert.ok(cfg.continuation_tip, "known refusal retains a validated inherited branch");
+      assert.equal(git(clone.path, "rev-parse", "HEAD"), cfg.continuation_tip);
       assert.equal(clone.branch, branch);
       assert.equal(fs.existsSync(path.join(clone.path, "committed.txt")), false);
       console.log("safe-branch-continuation");
@@ -145,7 +149,7 @@ if (action === "init") {
       } } }), logger, 20, undefined, { gitlab, pollMs: 5, teardownTestDeps: portableTeardownTestDeps });
       try {
         const payload = structuredClone(cfg.claim) as unknown as ClaimResponse;
-        payload.repo.clone_url = cfg.url;
+        payload.repo.clone_url = cfg.origin;
         await runner.execute(payload);
         assert.equal(entered, true, "production runner enters executor only after recovery");
         assert.ok(api.messages(claim.run_id).some(message =>
