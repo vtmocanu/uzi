@@ -15,6 +15,18 @@ func (f *FakeClient) ListWorkers(context.Context) ([]apitypes.WorkerDTO, error) 
 	return f.Workers, nil
 }
 
+func (f *FakeClient) CordonWorker(_ context.Context, id, reason string) (apitypes.WorkerDTO, error) {
+	f.CordonWorkerCalls++
+	f.LastCordonWorkerID, f.LastCordonReason = id, reason
+	return f.CordonWorkerResult, f.Err
+}
+
+func (f *FakeClient) UncordonWorker(_ context.Context, id string) (apitypes.WorkerDTO, error) {
+	f.UncordonWorkerCalls++
+	f.LastUncordonWorkerID = id
+	return f.UncordonWorkerResult, f.Err
+}
+
 func (f *FakeClient) DeleteWorker(_ context.Context, id string) error {
 	f.DeleteWorkerCalls++
 	f.LastDeletedWorkerID = id

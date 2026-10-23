@@ -82,6 +82,8 @@ type Client interface {
 	// Client and still be testable: FakeClient implements it too.
 	StreamRun(ctx context.Context, runID string) (*RunStream, error)
 	ListWorkers(ctx context.Context) ([]apitypes.WorkerDTO, error)
+	CordonWorker(ctx context.Context, id, reason string) (apitypes.WorkerDTO, error)
+	UncordonWorker(ctx context.Context, id string) (apitypes.WorkerDTO, error)
 	// ListSecrets returns the caller's Anthropic tokens as metadata (labels, ids,
 	// default flags — never values): GET /api/me/secrets, RequireUser (PRD #104 D8,
 	// a list is safe from a CLI token; creating/rotating/deleting is web-only). Each
