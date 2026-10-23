@@ -20,7 +20,7 @@ remains separate. No plan revision or producer enablement is included.
   share the first body/reader cancellation promise, and join requested cleanup
   before an RPC failure unwinds caller locks. Pass teardown joins remaining
   responses without renewing the attempt clock. An uncertain remote request
-  retains its original identity.
+  retains its original identity. A pass aborted after the transient bundle ref is created may leave it, potentially indefinitely until a later successful bundle on that bare replaces and deletes it; it is excluded from coverage proofs and only retains objects.
 - N: an accepted ordinary guarded archive upload schedules saved-evidence replay
   after confirmed process, command, steering, auxiliary and execution-tail
   settlement. Unconfirmed settlement and shutdown suppress notification.
