@@ -7812,6 +7812,9 @@ describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
   });
 
   it("M1 approval advice reaches actual Codex requests across epoch recreation; empty variants preserve bytes", async () => {
+    const issueDescription = "Implement criteria A, B, C and D (fourth criterion).";
+    const approvedPlan = "server canonical contract: implement criteria A, B and C.";
+    assert.doesNotMatch(approvedPlan, /\bD\b/);
     const findings = { summary: "Coverage uncertainty: unreadable source; 3 coverage notes omitted", items: [
       { file: "plan.md", severity: "warning" as const, summary: "Requirement gap: fourth criterion", rationale: "issue states four" },
       { file: "live", severity: "info" as const, summary: "Coverage uncertainty: hosted proof", rationale: "maintainer only" },
@@ -7821,14 +7824,15 @@ describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
     async function capture(notes?: typeof findings | null) {
       const rig = planThenImplementRig();
       const { ctx } = makeCtx({
-        planApproved: false, approvedPlan: undefined, claimGeneration: 7,
+        planApproved: false, approvedPlan: undefined, claimGeneration: 7, issueDescription,
         gatePlan: async () => ({ kind: "approve", approval: "cross_check", selection: { status: "absent" },
           ...(notes === undefined ? {} : { findings: notes }),
-          canonical: { plan: "server canonical contract", milestones: [], candidate_digest: "a".repeat(64), claimGeneration: 7 },
+          canonical: { plan: approvedPlan, milestones: [], candidate_digest: "a".repeat(64), claimGeneration: 7 },
         }),
       });
       await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 8000, "M1 advice delivery");
       assert.equal(turnTexts(rig, 0).length, 1, "advice starts no revision round");
+      assert.ok(turnTexts(rig, 0)[0]!.includes(issueDescription), "planning received all four issue criteria");
       assert.equal(rig.providerLaunches(), 2, "normal approval epoch recreation retained");
       const request = rig.epochs[1]!.transport.requests.find(r => r.method === "turn/start")!;
       return (request.params as { input: { text: string }[] }).input[0]!.text;

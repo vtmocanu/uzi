@@ -12,6 +12,7 @@ const rules = {
   gaps: /omitted or partly covered requirement as warning with mandatory summary prefix Requirement gap:/,
   live: /hosted, live or maintainer-only surfaces as info with mandatory summary prefix Coverage uncertainty:/,
   markers: /Every coverage item must use one of these prefixes; defect items must never use either prefix/,
+  regressionTests: /Flag regression tests that cannot fail on the unfixed code/,
   safety: /stated by the issue as a safety, security or data-integrity constraint is a defect: error, no coverage prefix, REVISE/,
   unreadable: /Missing, external, unreadable or oversize requirement sources get a Coverage uncertainty: note in summary, never treated as covered/,
   noDefectCoverage: /No defect found does not mean requirement covered/,

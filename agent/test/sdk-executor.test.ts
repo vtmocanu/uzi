@@ -1588,6 +1588,9 @@ describe("SdkExecutor checked canonical approval", () => {
   }
 
   it("M1 approval advice reaches actual SDK prompts completely; empty variants preserve bytes", async () => {
+    const issueDescription = "Implement criteria A, B, C and D (fourth criterion).";
+    const approved = { ...canonical, plan: "Implement criteria A, B and C." };
+    assert.doesNotMatch(approved.plan, /\bD\b/);
     const findings = { summary: "Coverage uncertainty: unreadable source; 3 coverage notes omitted", items: [
       { file: "plan.md", severity: "warning" as const, summary: "Requirement gap: fourth criterion", rationale: "issue states four" },
       { file: "live", severity: "info" as const, summary: "Coverage uncertainty: hosted proof", rationale: "maintainer only" },
@@ -1599,12 +1602,13 @@ describe("SdkExecutor checked canonical approval", () => {
         [submitPlanWithMilestones([], "LOCAL plan"), resultSuccess()],
         [signalDone(), resultSuccess()],
       ]);
-      const verdict = checked();
+      const verdict = checked(approved);
       assert.ok(verdict.kind === "approve" && verdict.approval === "cross_check");
       if (notes !== undefined) verdict.findings = notes;
-      const probe = makeCtx({ claimGeneration: 7 }, verdict);
+      const probe = makeCtx({ claimGeneration: 7, issueDescription }, verdict);
       await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
       assert.equal(turns.length, 2, "advice starts no revision round");
+      assert.ok(turns[0]!.promptText!.includes(issueDescription), "planning received all four issue criteria");
       return turns[1]!.promptText!;
     }
     const baseline = await capture();
@@ -1616,7 +1620,7 @@ describe("SdkExecutor checked canonical approval", () => {
       const fence = prompt.match(/^<advice_([a-f0-9]{16})>\n([^\n]+)\n<\/advice_\1>$/m);
       assert.ok(fence);
       assert.deepEqual(JSON.parse(fence[2]!), notes);
-      assert.ok(prompt.includes(canonical.plan));
+      assert.ok(prompt.includes(approved.plan));
       assert.match(prompt, /canonical plan remains authoritative/);
       assert.match(prompt, /omitted requirement ONLY within the issue's stated scope; name that addition in the PR description/);
       assert.match(prompt, /Keep existing permissions and constraints/);

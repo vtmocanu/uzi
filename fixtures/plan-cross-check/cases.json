@@ -125,7 +125,8 @@
     "plan": "Test passes before the fix.",
     "expected": "REVISE for a defect, without a coverage prefix",
     "rules": [
-      "markers"
+      "markers",
+      "regressionTests"
     ]
   },
   {
