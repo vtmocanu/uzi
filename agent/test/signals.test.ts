@@ -1240,3 +1240,23 @@ describe("M3 park_run scanning", () => {
     assert.equal(isSignalToolName("mcp__uzi__park_run"), true);
   });
 });
+
+describe("signal_done report_only texts scope the #3360 fallback to issue runs", () => {
+  const pinned = (text: string) => {
+    assert.match(text, /opens no merge request when nothing was committed/);
+    assert.match(text, /On issue runs, committed work already published to a checkpoint is instead delivered as a non-closing merge request if its checks pass/);
+    assert.match(text, /unpublished commits are not delivered/);
+  };
+  it("pins the tool description", async () => {
+    const res = await callToolOverJsonRpc(buildSignalMcpServer({ reportOnly: true }), "signal_done", {}, "tools/list");
+    const tools = ((res["result"] as { tools?: { name: string; description?: string }[] } | undefined)?.tools) ?? [];
+    const done = tools.find((t) => t.name === "signal_done");
+    assert.ok(done, `signal_done listed; got ${JSON.stringify(res)}`);
+    pinned(done.description ?? "");
+  });
+  it("pins the completion acknowledgement", async () => {
+    const res = await callToolOverJsonRpc(buildSignalMcpServer({ reportOnly: true }), "signal_done", { summary: "s" });
+    const content = ((res["result"] as { content?: { type: string; text?: string }[] } | undefined)?.content) ?? [];
+    pinned(content.map((c) => c.text ?? "").join("\n"));
+  });
+});

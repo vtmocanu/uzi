@@ -71,6 +71,7 @@ describe("#3360 report_only dynamic schema", () => {
     assert.equal(declaration.type, "boolean");
     assert.match(String(declaration.description), /no code change/i);
     assert.match(String(declaration.description), /non_closing/);
+    assert.match(String(declaration.description), /^Issue runs only:/);
   });
 });
 

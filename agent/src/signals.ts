@@ -330,7 +330,7 @@ function makeSignalToolHandlers(opts: SignalScanOptions): {
         content: [
           {
             type: "text",
-            text: "Completion attempt received. The worker will check the completion contract before delivery or an owner decision handoff. A request does not defer or waive any work. With report_only it records your summary and transcript and opens no merge request when nothing was committed; work already published is delivered as a non-closing merge request. On issue runs only, non_closing declares that this delivery leaves the issue open; omit it on other run kinds. End your turn.",
+            text: "Completion attempt received. The worker will check the completion contract before delivery or an owner decision handoff. A request does not defer or waive any work. With report_only it records your summary and transcript and opens no merge request when nothing was committed. On issue runs, committed work already published to a checkpoint is instead delivered as a non-closing merge request if its checks pass; unpublished commits are not delivered. On issue runs only, non_closing declares that this delivery leaves the issue open; omit it on other run kinds. End your turn.",
           },
         ],
       };
@@ -619,7 +619,7 @@ export function buildSignalMcpServer(
       ),
       tool(
         SIGNAL_DONE_TOOL,
-        "Submit a completion attempt after committing locally and passing review. The worker checks the completion contract before delivery or an owner decision handoff; you never push. An owner decision request does not defer or waive work. With report_only the worker records your summary and transcript and opens no merge request when nothing was committed; work already published is delivered as a non-closing merge request.",
+        "Submit a completion attempt after committing locally and passing review. The worker checks the completion contract before delivery or an owner decision handoff; you never push. An owner decision request does not defer or waive work. With report_only the worker records your summary and transcript and opens no merge request when nothing was committed. On issue runs, committed work already published to a checkpoint is instead delivered as a non-closing merge request if its checks pass; unpublished commits are not delivered.",
         doneShape,
         (input) => h.signalDone(input),
       ),
