@@ -188,7 +188,7 @@ describe("report_only fallback to non-closing delivery (#3360)", () => {
     await negotiate();
     const { forge } = setup();
     const completed: import("../src/code-cross-check-contract.js").CodeCrossCheckRecord = {
-      stage: "code", round: 1, candidate_generation: 1, head_commit: "b".repeat(40), base_commit: "a".repeat(40),
+      stage: "code", round: 1, candidate_generation: 7, head_commit: "b".repeat(40), base_commit: "a".repeat(40),
       candidate_digest: "c".repeat(64), checker_run_id: "child", checker_harness: "codex", checker_model: "test-checker",
       checker_effort: "high", outcome: "completed", reason_class: null, findings: [], dispositions: null,
       finalized_at: new Date().toISOString(), interrupted_at: null, deadline_at: new Date().toISOString(),

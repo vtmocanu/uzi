@@ -141,12 +141,13 @@ diff is confirmed empty, the run fails with the existing #299 reason, scope-capp
 included; a diff read failure keeps the fail-open into the normal checks. The prompt-kind
 (#341) zero-diff orphan guard and other run kinds are unchanged.
 
-Known limits: the advisory code cross-check that `report_only` skips is not replayed. The
-fallback's summary is not replaced by the persisted cross-check status; when the run requires
-a cross-check, the MR renders "Code cross-check incomplete: skipped: report_only was
-declared". Against an API
-without `completion_non_closing_v1` the declaration is not persisted (the documented
-rollout limitation in `docs/worker-upgrades.md`, "Completion publication compatibility").
+Known limits: the advisory code cross-check that `report_only` skips is not replayed. When
+the run requires a cross-check and the session produced no cross-check summary, the MR renders
+"Code cross-check incomplete: skipped: report_only was declared"; a summary from an earlier
+completion attempt in the same session is kept as-is. Either way the persisted cross-check
+status does not replace the fallback's summary at publication. Against an API without
+`completion_non_closing_v1` the declaration is not persisted (the documented rollout
+limitation in `docs/worker-upgrades.md`, "Completion publication compatibility").
 
 **`report_md` rides the shared `RunDTO` embed.** `RunListItemDTO` embeds `RunDTO`
 (`api/internal/apitypes/run.go`), so `report_only`/`report_md` appear on the runs LIST as
