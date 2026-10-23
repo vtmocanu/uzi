@@ -13,11 +13,21 @@ import (
 
 func TestM2RunOriginsResponseOverflow(t *testing.T) {
 	for _, origin := range []string{"composite", "fallback"} {
-		for _, overflow := range []bool{false, true} {
-			t.Run(fmt.Sprintf("%s/overflow=%t", origin, overflow), func(t *testing.T) {
-				concrete := &forge.ResponseTooLargeError{}
+		for _, mode := range []string{"ordinary", "issue", "unknown", "bare", "error", "prerequisite"} {
+			overflow := mode == "issue"
+			t.Run(fmt.Sprintf("%s/%s", origin, mode), func(t *testing.T) {
+				concrete := &forge.ResponseTooLargeError{Provenance: forge.ResponseIssueSuccess}
 				source := errors.New("temporary forge failure")
-				if overflow {
+				switch mode {
+				case "unknown":
+					source = &forge.ResponseTooLargeError{}
+				case "bare":
+					source = forge.ErrResponseTooLarge
+				case "error":
+					source = &forge.ResponseTooLargeError{Provenance: forge.ResponseError, Outcome: forge.ErrorClassServerError}
+				case "prerequisite":
+					source = &forge.ResponseTooLargeError{Provenance: forge.ResponseSuccess}
+				case "issue":
 					source = fmt.Errorf("outer: %w", fmt.Errorf("inner: %w", concrete))
 				}
 				fs := &fakeStore{repoRow: store.GetRepoForUserRow{ID: uuid.New()}, issueByID: store.Issue{Labels: uziLabels()}}

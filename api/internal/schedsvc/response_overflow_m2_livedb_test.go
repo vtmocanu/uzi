@@ -50,7 +50,7 @@ func TestM2ScheduleCaptureOverflowLiveDB(t *testing.T) {
 					source := error(context.DeadlineExceeded)
 					want := SkipFetchFailed
 					if overflow {
-						source = fmt.Errorf("wrapped: %w", &forge.ResponseTooLargeError{})
+						source = fmt.Errorf("wrapped: %w", &forge.ResponseTooLargeError{Provenance: forge.ResponseIssueSuccess})
 						want = SkipDescriptionTooLarge
 					}
 					f := &m2OverflowForge{fakeForge: &fakeForge{issue: forge.Issue{Title: "fresh", Description: "body", Labels: []string{"uzi"}}}, firstErr: source}

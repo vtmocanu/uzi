@@ -212,7 +212,7 @@ func (g *github) repoSlugFor(ctx context.Context, projectID int64) (repoSlug, er
 	state := newResponseLimitState(objectResponseBytes)
 	r, _, err := g.client.Repositories.GetByID(withResponseLimit(ctx, state), projectID)
 	if state.overflow.Load() {
-		return repoSlug{}, g.wrapErr(fmt.Sprintf("resolve repo %d", projectID), &ResponseTooLargeError{})
+		return repoSlug{}, g.wrapErr(fmt.Sprintf("resolve repo %d", projectID), state.err())
 	}
 	if err != nil {
 		return repoSlug{}, g.wrapErr(fmt.Sprintf("resolve repo %d", projectID), err)

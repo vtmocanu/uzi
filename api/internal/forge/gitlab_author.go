@@ -16,7 +16,7 @@ func (g *gitLab) RepositoryAuthorEligibility(ctx context.Context, projectID, aut
 	state := newResponseLimitState(objectResponseBytes)
 	u, userResp, err := g.client.Users.GetUser(authorID, nil, gitlab.WithContext(withResponseLimit(ctx, state)))
 	if state.overflow.Load() {
-		return AuthorUnknown, g.wrapErr("resolve repository author", &ResponseTooLargeError{})
+		return AuthorUnknown, g.wrapErr("resolve repository author", state.err())
 	}
 	if err != nil {
 		return AuthorUnknown, g.wrapErr("resolve repository author", err)
@@ -43,7 +43,7 @@ func (g *gitLab) RepositoryAuthorEligibility(ctx context.Context, projectID, aut
 	}
 	resp, err := g.client.Do(req, &m)
 	if state.overflow.Load() {
-		return AuthorUnknown, g.wrapErr("repository author membership", &ResponseTooLargeError{})
+		return AuthorUnknown, g.wrapErr("repository author membership", state.err())
 	}
 	if err != nil {
 		// The stable identity was independently resolved above; members/all's 404
@@ -53,7 +53,7 @@ func (g *gitLab) RepositoryAuthorEligibility(ctx context.Context, projectID, aut
 			state := newResponseLimitState(objectResponseBytes)
 			repo, repoResp, readErr := g.client.Projects.GetProject(projectID, nil, gitlab.WithContext(withResponseLimit(ctx, state)))
 			if state.overflow.Load() {
-				return AuthorUnknown, g.wrapErr("author repository", &ResponseTooLargeError{})
+				return AuthorUnknown, g.wrapErr("author repository", state.err())
 			}
 			if readErr != nil {
 				return AuthorUnknown, g.wrapErr("author repository", readErr)

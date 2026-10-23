@@ -272,7 +272,7 @@ func (tempErr) Temporary() bool { return true }
 func isTooLarge(err error) bool { return errors.Is(err, ErrResponseTooLarge) }
 
 // wantRefusal asserts the typed, fixed, content-free refusal and a zero MR.
-func wantRefusal(t *testing.T, mr MergeRequest, err error) {
+func wantRefusal(t *testing.T, mr MergeRequest, err error, classes ...ErrorClass) {
 	t.Helper()
 	if err == nil {
 		t.Fatalf("want the size refusal, got success %+v", mr)
@@ -287,8 +287,12 @@ func wantRefusal(t *testing.T, mr MergeRequest, err error) {
 	if !errors.As(err, &typed) {
 		t.Fatalf("error %T is not *ResponseTooLargeError", err)
 	}
-	if Class(err) != ErrorClassOther {
-		t.Fatalf("class = %q, want other", Class(err))
+	wantClass := ErrorClassOther
+	if len(classes) > 0 {
+		wantClass = classes[0]
+	}
+	if Class(err) != wantClass || IsIssueResponseTooLarge(err) {
+		t.Fatalf("class = %q, want %q; MR must not be an issue refusal", Class(err), wantClass)
 	}
 	if mr != (MergeRequest{}) {
 		t.Fatalf("a refused response must return the zero MergeRequest, got %+v", mr)
@@ -1075,20 +1079,21 @@ func oversizedHandler(code int, location string) http.HandlerFunc {
 
 func TestGitLabGetMergeRequestLazyPathOverflow(t *testing.T) {
 	cases := []struct {
-		name string
-		h    http.HandlerFunc
+		name  string
+		h     http.HandlerFunc
+		class ErrorClass
 	}{
-		{"401", oversizedHandler(401, "")},
-		{"404", oversizedHandler(404, "")},
-		{"501", oversizedHandler(501, "")},
-		{"302_without_location", oversizedHandler(302, "")},
-		{"302_off_origin", oversizedHandler(302, "http://other.invalid/x")},
+		{"401", oversizedHandler(401, ""), ErrorClassAuth},
+		{"404", oversizedHandler(404, ""), ErrorClassOther},
+		{"501", oversizedHandler(501, ""), ErrorClassServerError},
+		{"302_without_location", oversizedHandler(302, ""), ErrorClassOther},
+		{"302_off_origin", oversizedHandler(302, "http://other.invalid/x"), ErrorClassOther},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			w := newWireMR(t, c.h, 5*time.Second)
 			mr, err := w.get(context.Background())
-			wantRefusal(t, mr, err)
+			wantRefusal(t, mr, err, c.class)
 			if w.rt.reqs.Load() != 1 {
 				t.Fatalf("requests = %d, want 1 (these statuses are never status-retried)", w.rt.reqs.Load())
 			}
@@ -1147,21 +1152,22 @@ func TestGitLabGetMergeRequestEagerStatusSet(t *testing.T) {
 func TestGitLabGetMergeRequestOverflowIsNotRetried(t *testing.T) {
 	lowerGitLabLimit(t, 8192)
 	cases := []struct {
-		name string
-		h    http.HandlerFunc
+		name  string
+		h     http.HandlerFunc
+		class ErrorClass
 	}{
-		{"200", func(rw http.ResponseWriter, _ *http.Request) { _, _ = rw.Write(mrJSON(9, 10000)) }},
-		{"500", oversizedHandler(500, "")},
-		{"429", oversizedHandler(429, "")},
-		{"999", oversizedHandler(999, "")},
-		{"501", oversizedHandler(501, "")},
-		{"404", oversizedHandler(404, "")},
+		{"200", func(rw http.ResponseWriter, _ *http.Request) { _, _ = rw.Write(mrJSON(9, 10000)) }, ErrorClassOther},
+		{"500", oversizedHandler(500, ""), ErrorClassServerError},
+		{"429", oversizedHandler(429, ""), ErrorClassRateLimited},
+		{"999", oversizedHandler(999, ""), ErrorClassOther},
+		{"501", oversizedHandler(501, ""), ErrorClassServerError},
+		{"404", oversizedHandler(404, ""), ErrorClassOther},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			w := newWireMR(t, c.h, 5*time.Second)
 			mr, err := w.get(context.Background())
-			wantRefusal(t, mr, err)
+			wantRefusal(t, mr, err, c.class)
 			if w.rt.reqs.Load() != 1 {
 				t.Fatalf("requests = %d, want exactly 1", w.rt.reqs.Load())
 			}
@@ -1307,7 +1313,11 @@ func TestGitLabGetMergeRequestNon2xxSizeBoundary(t *testing.T) {
 			// The token starts 6 bytes before the 4096 cut.
 			w := newWireMR(t, serve(code, body(4097, 4090)), 5*time.Second)
 			mr, err := w.get(context.Background())
-			wantRefusal(t, mr, err)
+			wantClass := ErrorClassAuth
+			if code == 500 {
+				wantClass = ErrorClassServerError
+			}
+			wantRefusal(t, mr, err, wantClass)
 			if strings.Contains(err.Error(), tok) || strings.Contains(err.Error(), tok[:6]) || strings.Contains(err.Error(), "xxxx") {
 				t.Fatalf("token or body text in the refusal: %q", err.Error())
 			}

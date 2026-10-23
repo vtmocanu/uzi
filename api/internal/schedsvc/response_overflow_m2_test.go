@@ -32,14 +32,26 @@ func (b m2OverflowBuilder) ForgeForConnection(string, string, []byte) (forge.For
 	return b.driver, nil
 }
 
+var m2OverflowCases = []struct {
+	name      string
+	err       error
+	permanent bool
+}{
+	{"ordinary", context.DeadlineExceeded, false},
+	{"issue", fmt.Errorf("wrapped: %w", &forge.ResponseTooLargeError{Provenance: forge.ResponseIssueSuccess}), true},
+	{"unknown", &forge.ResponseTooLargeError{}, false},
+	{"bare", forge.ErrResponseTooLarge, false},
+	{"error", &forge.ResponseTooLargeError{Provenance: forge.ResponseError, Outcome: forge.ErrorClassServerError}, false},
+	{"prerequisite", &forge.ResponseTooLargeError{Provenance: forge.ResponseSuccess}, false},
+}
+
 func TestM2SweepOverflowBackfills(t *testing.T) {
-	for _, overflow := range []bool{false, true} {
-		t.Run(fmt.Sprint(overflow), func(t *testing.T) {
+	for _, tc := range m2OverflowCases {
+		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness()
-			source := error(context.DeadlineExceeded)
+			source := tc.err
 			want := SkipFetchFailed
-			if overflow {
-				source = fmt.Errorf("wrapped: %w", &forge.ResponseTooLargeError{})
+			if tc.permanent {
 				want = SkipDescriptionTooLarge
 			}
 			f := &m2OverflowForge{fakeForge: h.fb.f, firstErr: source}
@@ -59,16 +71,13 @@ func TestM2SweepOverflowBackfills(t *testing.T) {
 }
 
 func TestM2IssueOverflowAdvances(t *testing.T) {
-	for _, overflow := range []bool{false, true} {
-		t.Run(fmt.Sprint(overflow), func(t *testing.T) {
+	for _, tc := range m2OverflowCases {
+		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness()
-			h.fb.f.err = context.DeadlineExceeded
-			if overflow {
-				h.fb.f.err = fmt.Errorf("wrapped: %w", &forge.ResponseTooLargeError{})
-			}
+			h.fb.f.err = tc.err
 			h.st.due = []store.RunSchedule{h.issueSchedule()}
 			h.sched.Boot(context.Background())
-			if !overflow {
+			if !tc.permanent {
 				if len(h.st.advanceCalls) != 0 {
 					t.Fatal("transient failure advanced")
 				}

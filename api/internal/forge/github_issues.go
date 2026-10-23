@@ -75,9 +75,10 @@ func (g *github) GetIssue(ctx context.Context, projectID, issueIID int64) (Issue
 		return Issue{}, g.wrapErr("get issue", err)
 	}
 	state := newResponseLimitState(issueResponseBytes)
+	state.issueTarget = true
 	i, _, err := g.client.Issues.Get(withResponseLimit(ctx, state), slug.owner, slug.repo, num)
 	if state.overflow.Load() {
-		return Issue{}, g.wrapErr("get issue", &ResponseTooLargeError{})
+		return Issue{}, g.wrapErr("get issue", state.err())
 	}
 	if err != nil {
 		return Issue{}, g.wrapErr("get issue", err)
@@ -186,7 +187,7 @@ func (g *github) ListIssueComments(ctx context.Context, projectID, issueIID int6
 		state := newResponseLimitState(commentPageResponseBytes)
 		comments, resp, err := g.client.Issues.ListComments(withResponseLimit(ctx, state), slug.owner, slug.repo, num, opt)
 		if state.overflow.Load() {
-			return nil, 0, &ResponseTooLargeError{}
+			return nil, 0, state.err()
 		}
 		if err != nil {
 			return nil, 0, err

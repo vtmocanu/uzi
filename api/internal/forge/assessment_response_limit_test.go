@@ -221,6 +221,9 @@ func TestAssessmentResponseLimits(t *testing.T) {
 						}
 					} else {
 						assessmentRefusal(t, err)
+						if IsIssueResponseTooLarge(err) != (c.name == "issue") {
+							t.Fatalf("successful response provenance: issue=%v err=%v", IsIssueResponseTooLarge(err), err)
+						}
 					}
 					if calls != 1 || observed != 1 {
 						t.Fatalf("attempts=%d observed=%d", calls, observed)
@@ -285,7 +288,7 @@ func TestAssessmentProductionConstructorWiring(t *testing.T) {
 
 func TestAssessmentOversizedErrors(t *testing.T) {
 	for _, c := range assessmentLimitCases {
-		for _, status := range []int{404, 429, 500, 503} {
+		for _, status := range []int{401, 403, 404, 429, 500, 501, 503} {
 			t.Run(fmt.Sprintf("%s/%s/%d", c.driver, c.name, status), func(t *testing.T) {
 				attempts, projectReads := 0, 0
 				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -320,7 +323,7 @@ func TestAssessmentOversizedErrors(t *testing.T) {
 						state.ceiling = 8192
 					}
 					resp, err := next.RoundTrip(r)
-					if strings.HasSuffix(r.URL.Path, c.path) && status != 404 {
+					if strings.HasSuffix(r.URL.Path, c.path) && statusRetriedBySDK(status) {
 						if resp != nil {
 							t.Fatal("retriable overflow exposed a response")
 						}
@@ -330,6 +333,18 @@ func TestAssessmentOversizedErrors(t *testing.T) {
 				})
 				_, err := assessmentCall(t, d, c.name)
 				assessmentRefusal(t, err)
+				wantClass := ErrorClassOther
+				switch status {
+				case 401, 403:
+					wantClass = ErrorClassAuth
+				case 429:
+					wantClass = ErrorClassRateLimited
+				case 500, 501, 503:
+					wantClass = ErrorClassServerError
+				}
+				if IsIssueResponseTooLarge(err) || Class(err) != wantClass {
+					t.Fatalf("error-status provenance: permanent=%v class=%q want=%q", IsIssueResponseTooLarge(err), Class(err), wantClass)
+				}
 				if strings.Contains(err.Error(), "REMOTE") {
 					t.Fatalf("remote error text: %v", err)
 				}

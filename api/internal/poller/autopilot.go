@@ -208,7 +208,7 @@ func (a *Autopilot) handle(ctx context.Context, r store.ListEnabledReposWithConn
 	// the run exactly as the manual start path snapshots the description it is given.
 	capture, err := issueinput.Fetch(ctx, f, r.ForgeProjectID, iid, cc.BotForgeUserID)
 	if err != nil {
-		if errors.Is(err, forge.ErrResponseTooLarge) {
+		if forge.IsIssueResponseTooLarge(err) {
 			a.recordThenComment(ctx, r, f, iid, eventID, tooLargeComment())
 			return
 		}
