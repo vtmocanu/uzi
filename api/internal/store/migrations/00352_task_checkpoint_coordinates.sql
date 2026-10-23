@@ -149,7 +149,7 @@ BEGIN
         OR (NEW.worker_id IS NOT NULL AND NEW.worker_id IS DISTINCT FROM OLD.worker_id)
         OR NEW.claim_generation IS DISTINCT FROM OLD.claim_generation
         OR (OLD.claim_released_at IS NOT NULL AND NEW.claim_released_at IS NULL)
-        OR (OLD.status NOT IN ('claimed','running') AND NEW.status IN ('claimed','running','awaiting_approval','awaiting_input','awaiting_followup'))
+        OR (NEW.status IS DISTINCT FROM OLD.status AND OLD.status NOT IN ('claimed','running') AND NEW.status IN ('claimed','running','awaiting_approval','awaiting_input','awaiting_followup'))
     );
     IF authority AND (
         current_setting('uzi.task_checkpoint_coordinates_api', true) IS DISTINCT FROM 'v1'

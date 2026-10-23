@@ -1,10 +1,12 @@
 package workersvc
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -12,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -24,7 +27,7 @@ import (
 // Lock order, shared by every writer that can change a parked run's requirement:
 //
 //  1. the per-user secret mutation advisory lock (store.LockSecretMutation), always first;
-//  2. the run row FOR UPDATE;
+//  2. for enrolled runs, the recorded worker FOR UPDATE, then the run FOR UPDATE;
 //  3. the requirement source row FOR SHARE: the recorded worker (worker binding) or the users
 //     row (Judge / self-improve binding);
 //  4. the credential row FOR SHARE.
@@ -232,8 +235,8 @@ func (s *Service) promoteCredentialDisabledRun(ctx context.Context, userID, runI
 		return "", err
 	}
 	q := store.New(tx)
-	// (2) The run row, re-read under its lock.
-	run, err := q.LockCredentialDisabledRunForPromotion(ctx, store.LockCredentialDisabledRunForPromotionParams{ID: runID, UserID: userID})
+	// (2) Lock the enrolled worker before re-reading the run under its lock.
+	run, err := lockCredentialDisabledCheckpointRun(ctx, q, userID, runID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", nil
 	}
@@ -262,6 +265,59 @@ func (s *Service) promoteCredentialDisabledRun(ctx context.Context, userID, runI
 		return "", err
 	}
 	return status, nil
+}
+
+type credentialCheckpointAdmission interface {
+	GetWorkerForUpdate(context.Context, uuid.UUID) (store.Worker, error)
+	OptInCheckpointCoordinates(context.Context) error
+}
+
+// lockCredentialDisabledCheckpointRun runs after the secret advisory lock. Only an
+// enrolled snapshot needs the worker lock; a changed binding or enrollment under
+// the run lock refuses the operation without attempting a reverse worker lock.
+func lockCredentialDisabledCheckpointRun(ctx context.Context, q interface {
+	GetRunByID(context.Context, uuid.UUID) (store.Run, error)
+	LockCredentialDisabledRunForPromotion(context.Context, store.LockCredentialDisabledRunForPromotionParams) (store.LockCredentialDisabledRunForPromotionRow, error)
+}, userID, runID uuid.UUID) (store.LockCredentialDisabledRunForPromotionRow, error) {
+	empty := store.LockCredentialDisabledRunForPromotionRow{}
+	prior, err := q.GetRunByID(ctx, runID)
+	if err != nil {
+		return empty, err
+	}
+	if prior.UserID != userID {
+		return empty, pgx.ErrNoRows
+	}
+	var admission credentialCheckpointAdmission
+	if len(prior.CheckpointCoordinates) > 0 {
+		if !prior.WorkerID.Valid {
+			return empty, pgx.ErrNoRows
+		}
+		var ok bool
+		admission, ok = q.(credentialCheckpointAdmission)
+		if !ok {
+			return empty, pgx.ErrNoRows
+		}
+		worker, err := admission.GetWorkerForUpdate(ctx, uuid.UUID(prior.WorkerID.Bytes))
+		if err != nil {
+			return empty, err
+		}
+		if worker.UserID != userID || !slices.Contains(worker.ProtocolCapabilities, capability.TaskCheckpointCoordinatesV1) {
+			return empty, pgx.ErrNoRows
+		}
+	}
+	run, err := q.LockCredentialDisabledRunForPromotion(ctx, store.LockCredentialDisabledRunForPromotionParams{ID: runID, UserID: userID})
+	if err != nil {
+		return empty, err
+	}
+	if !bytes.Equal(prior.CheckpointCoordinates, run.CheckpointCoordinates) || (len(run.CheckpointCoordinates) > 0 && prior.WorkerID != run.WorkerID) {
+		return empty, pgx.ErrNoRows
+	}
+	if admission != nil {
+		if err := admission.OptInCheckpointCoordinates(ctx); err != nil {
+			return empty, err
+		}
+	}
+	return run, nil
 }
 
 // credentialHoldReleaser is the statement surface that moves a locked, requirement-met held run
@@ -332,8 +388,9 @@ func releaseCredentialDisabledHold(ctx context.Context, q credentialHoldReleaser
 
 // reassignCredentialDisabledRun is `uzi run set-token` on a run held on credential_disabled
 // (PRD #1732 D2/D14): it writes the owner's new override and moves the run out of the hold in
-// one transaction, in the promoter's lock order (the user's secret mutation lock, then the run
-// row), so it and a concurrent promotion serialize and exactly one moves the run. A run with
+// one transaction, in the promoter's lock order (the user's secret mutation lock, then the
+// enrolled worker and run rows), so it and a concurrent promotion serialize and exactly one
+// moves the run. A run with
 // budget left and no pending pause is queued; one with a pending pause lands in that pause, and
 // one whose budget is spent in budget_exhausted, as the promoter would settle it, with the new
 // override written either way. It returns the status the run left the hold in, or
@@ -346,7 +403,7 @@ func releaseCredentialDisabledHold(ctx context.Context, q credentialHoldReleaser
 func (s *Service) reassignCredentialDisabledRun(ctx context.Context, userID, runID uuid.UUID, resolved *CredentialOverride) (string, error) {
 	var status string
 	err := s.withSecretMutation(ctx, userID, func(q secretMutationQueries) error {
-		run, err := q.LockCredentialDisabledRunForPromotion(ctx, store.LockCredentialDisabledRunForPromotionParams{ID: runID, UserID: userID})
+		run, err := lockCredentialDisabledCheckpointRun(ctx, q, userID, runID)
 		if err != nil {
 			return err // pgx.ErrNoRows: gone
 		}
@@ -548,6 +605,7 @@ func noAnthropicTokenAtAll(ctx context.Context, q *store.Queries, userID uuid.UU
 // reassignment of a held run, and the set-token override-plus-promote of a queued or parked run.
 // Both the Store and a transaction-bound *store.Queries satisfy it.
 type secretMutationQueries interface {
+	GetRunByID(ctx context.Context, id uuid.UUID) (store.Run, error)
 	GetUserSecretCiphertextByID(ctx context.Context, arg store.GetUserSecretCiphertextByIDParams) (store.GetUserSecretCiphertextByIDRow, error)
 	SetWorkerAnthropicSecret(ctx context.Context, arg store.SetWorkerAnthropicSecretParams) (store.Worker, error)
 	SetUserJudgeAnthropicBinding(ctx context.Context, arg store.SetUserJudgeAnthropicBindingParams) (store.User, error)

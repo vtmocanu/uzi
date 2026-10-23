@@ -20,6 +20,7 @@ import (
 )
 
 type coordinateCase struct {
+	Eligible      *bool            `json:"eligible"`
 	Name          string           `json:"name"`
 	Nodes         []map[string]any `json:"nodes"`
 	WorkBranch    *string          `json:"work_branch"`
@@ -39,7 +40,16 @@ func readCoordinateCases(t *testing.T) []coordinateCase {
 	if len(cases) == 0 {
 		t.Fatal("empty coordinate fixture")
 	}
+	for _, c := range cases {
+		if c.Eligible == nil || *c.Eligible != (c.WorkBranch != nil && c.CheckpointKey != nil) {
+			t.Fatalf("%s: eligible must be explicit and agree with the coordinate pair", c.Name)
+		}
+	}
 	return cases
+}
+
+func TestCheckpointCoordinatesFixtureEligibility(t *testing.T) {
+	readCoordinateCases(t)
 }
 
 // Uses the literal shared oracle for SQL derivation and Go named-pair decoding.
@@ -110,9 +120,16 @@ func TestCheckpointCoordinatesContractLiveDB(t *testing.T) {
 			if err := tx.QueryRow(env.ctx, `SELECT fn_checkpoint_coordinates(jsonb_populate_record(NULL::runs,$1::jsonb))`, encoded).Scan(&raw); err != nil {
 				t.Fatal(err)
 			}
-			if c.WorkBranch == nil {
+			if (len(raw) > 0) != *c.Eligible {
+				t.Fatalf("SQL eligibility=%v want=%v", len(raw) > 0, *c.Eligible)
+			}
+			if !*c.Eligible {
 				if len(raw) != 0 {
 					t.Fatalf("want no coordinates; got %s", raw)
+				}
+				decoded, err := checkpointCoordinatesForWorker(store.Worker{}, store.Run{CheckpointCoordinates: raw})
+				if err != nil || decoded != nil {
+					t.Fatalf("ineligible Go pair=%+v err=%v", decoded, err)
 				}
 				return
 			}
@@ -144,7 +161,7 @@ func TestCheckpointCoordinatesContractLiveDB(t *testing.T) {
 				model.IssueIid = pgconv.Int8Ptr(pair.IssueIID)
 			}
 			decoded, err := frozenCheckpointCoordinates(model)
-			if err != nil || decoded.WorkBranch != *c.WorkBranch || decoded.CheckpointKey != *c.CheckpointKey {
+			if err != nil || (decoded != nil) != *c.Eligible || decoded.WorkBranch != *c.WorkBranch || decoded.CheckpointKey != *c.CheckpointKey {
 				t.Fatalf("Go pair=%+v err=%v", decoded, err)
 			}
 		})

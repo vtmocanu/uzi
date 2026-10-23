@@ -267,7 +267,7 @@ LIMIT @page_size::int;
 -- advisory lock and BEFORE any requirement source or credential row.
 -- name: LockCredentialDisabledRunForPromotion :one
 SELECT id, user_id, kind, harness, status, hold_reason, pause_requested_at, pause_mode,
-       credential_override_mode, credential_override_secret_id, codex_secret_id, worker_id
+       credential_override_mode, credential_override_secret_id, codex_secret_id, worker_id, checkpoint_coordinates
 FROM runs
 WHERE id = @id AND user_id = @user_id
 FOR UPDATE;

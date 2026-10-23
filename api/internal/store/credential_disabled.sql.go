@@ -117,7 +117,7 @@ func (q *Queries) ListCredentialDisabledUsers(ctx context.Context, arg ListCrede
 
 const lockCredentialDisabledRunForPromotion = `-- name: LockCredentialDisabledRunForPromotion :one
 SELECT id, user_id, kind, harness, status, hold_reason, pause_requested_at, pause_mode,
-       credential_override_mode, credential_override_secret_id, codex_secret_id, worker_id
+       credential_override_mode, credential_override_secret_id, codex_secret_id, worker_id, checkpoint_coordinates
 FROM runs
 WHERE id = $1 AND user_id = $2
 FOR UPDATE
@@ -141,6 +141,7 @@ type LockCredentialDisabledRunForPromotionRow struct {
 	CredentialOverrideSecretID pgtype.UUID        `json:"credential_override_secret_id"`
 	CodexSecretID              pgtype.UUID        `json:"codex_secret_id"`
 	WorkerID                   pgtype.UUID        `json:"worker_id"`
+	CheckpointCoordinates      []byte             `json:"checkpoint_coordinates"`
 }
 
 // Promoter step (2): the candidate run row, locked AFTER the user's secret mutation
@@ -161,6 +162,7 @@ func (q *Queries) LockCredentialDisabledRunForPromotion(ctx context.Context, arg
 		&i.CredentialOverrideSecretID,
 		&i.CodexSecretID,
 		&i.WorkerID,
+		&i.CheckpointCoordinates,
 	)
 	return i, err
 }

@@ -10,7 +10,8 @@
       }
     ],
     "work_branch": "agent/issue-42",
-    "checkpoint_key": "agent/issue-42"
+    "checkpoint_key": "agent/issue-42",
+    "eligible": true
   },
   {
     "name": "legacy self improve",
@@ -22,7 +23,8 @@
       }
     ],
     "work_branch": "uzi/self-improve/11111111-1111-4111-8111-111111111111",
-    "checkpoint_key": "uzi/self-improve/11111111-1111-4111-8111-111111111111"
+    "checkpoint_key": "uzi/self-improve/11111111-1111-4111-8111-111111111111",
+    "eligible": true
   },
   {
     "name": "task root",
@@ -34,7 +36,8 @@
       }
     ],
     "work_branch": "uzi/task/11111111-1111-4111-8111-111111111111",
-    "checkpoint_key": "uzi/task/11111111-1111-4111-8111-111111111111"
+    "checkpoint_key": "uzi/task/11111111-1111-4111-8111-111111111111",
+    "eligible": true
   },
   {
     "name": "task review",
@@ -52,7 +55,8 @@
       }
     ],
     "work_branch": "uzi/task/11111111-1111-4111-8111-111111111111",
-    "checkpoint_key": "uzi/task/22222222-2222-4222-8222-222222222222"
+    "checkpoint_key": "uzi/task/22222222-2222-4222-8222-222222222222",
+    "eligible": true
   },
   {
     "name": "task fix",
@@ -70,7 +74,8 @@
       }
     ],
     "work_branch": "uzi/task/11111111-1111-4111-8111-111111111111",
-    "checkpoint_key": "uzi/task/22222222-2222-4222-8222-222222222222"
+    "checkpoint_key": "uzi/task/22222222-2222-4222-8222-222222222222",
+    "eligible": true
   },
   {
     "name": "task multihop",
@@ -94,7 +99,8 @@
       }
     ],
     "work_branch": "uzi/task/11111111-1111-4111-8111-111111111111",
-    "checkpoint_key": "uzi/task/33333333-3333-4333-8333-333333333333"
+    "checkpoint_key": "uzi/task/33333333-3333-4333-8333-333333333333",
+    "eligible": true
   },
   {
     "name": "bad branch",
@@ -106,7 +112,8 @@
       }
     ],
     "work_branch": null,
-    "checkpoint_key": null
+    "checkpoint_key": null,
+    "eligible": false
   },
   {
     "name": "missing branch",
@@ -118,7 +125,8 @@
       }
     ],
     "work_branch": null,
-    "checkpoint_key": null
+    "checkpoint_key": null,
+    "eligible": false
   },
   {
     "name": "missing ancestor",
@@ -131,7 +139,8 @@
       }
     ],
     "work_branch": null,
-    "checkpoint_key": null
+    "checkpoint_key": null,
+    "eligible": false
   },
   {
     "name": "foreign owner",
@@ -150,7 +159,8 @@
       }
     ],
     "work_branch": null,
-    "checkpoint_key": null
+    "checkpoint_key": null,
+    "eligible": false
   },
   {
     "name": "foreign repo",
@@ -169,7 +179,8 @@
       }
     ],
     "work_branch": null,
-    "checkpoint_key": null
+    "checkpoint_key": null,
+    "eligible": false
   },
   {
     "name": "ambiguous",
@@ -193,7 +204,8 @@
       }
     ],
     "work_branch": null,
-    "checkpoint_key": null
+    "checkpoint_key": null,
+    "eligible": false
   },
   {
     "name": "cycle",
@@ -212,7 +224,8 @@
       }
     ],
     "work_branch": null,
-    "checkpoint_key": null
+    "checkpoint_key": null,
+    "eligible": false
   },
   {
     "name": "unsupported",
@@ -224,7 +237,8 @@
       }
     ],
     "work_branch": null,
-    "checkpoint_key": null
+    "checkpoint_key": null,
+    "eligible": false
   },
   {
     "name": "mismatched issue branch",
@@ -237,7 +251,8 @@
       }
     ],
     "work_branch": "agent/issue-42",
-    "checkpoint_key": "agent/issue-42"
+    "checkpoint_key": "agent/issue-42",
+    "eligible": true
   },
   {
     "name": "issue missing iid",
@@ -249,7 +264,8 @@
       }
     ],
     "work_branch": null,
-    "checkpoint_key": null
+    "checkpoint_key": null,
+    "eligible": false
   },
   {
     "name": "bound 64",
@@ -639,7 +655,8 @@
       }
     ],
     "work_branch": "uzi/task/44444444-4444-4444-8444-000000000063",
-    "checkpoint_key": "uzi/task/44444444-4444-4444-8444-000000000000"
+    "checkpoint_key": "uzi/task/44444444-4444-4444-8444-000000000000",
+    "eligible": true
   },
   {
     "name": "bound 65",
@@ -1035,7 +1052,8 @@
       }
     ],
     "work_branch": null,
-    "checkpoint_key": null
+    "checkpoint_key": null,
+    "eligible": false
   },
   {
     "name": "persisted self improve branch ignored",
@@ -1047,7 +1065,8 @@
       }
     ],
     "work_branch": "uzi/self-improve/11111111-1111-4111-8111-111111111111",
-    "checkpoint_key": "uzi/self-improve/11111111-1111-4111-8111-111111111111"
+    "checkpoint_key": "uzi/self-improve/11111111-1111-4111-8111-111111111111",
+    "eligible": true
   },
   {
     "name": "unsupported ancestor kind",
@@ -1065,6 +1084,7 @@
       }
     ],
     "work_branch": null,
-    "checkpoint_key": null
+    "checkpoint_key": null,
+    "eligible": false
   }
 ]

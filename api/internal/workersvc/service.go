@@ -4607,8 +4607,10 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 				return store.Run{}, false, werr
 			}
 		}
-		if err := qtx.OptInCheckpointCoordinates(ctx); err != nil {
-			return store.Run{}, false, err
+		if len(owned.CheckpointCoordinates) > 0 {
+			if err := qtx.OptInCheckpointCoordinates(ctx); err != nil {
+				return store.Run{}, false, err
+			}
 		}
 		locked, lerr := qtx.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)})
 		if lerr != nil {
@@ -4706,8 +4708,10 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 				return store.Run{}, false, err
 			}
 		}
-		if err := qtx.OptInCheckpointCoordinates(ctx); err != nil {
-			return store.Run{}, false, err
+		if len(owned.CheckpointCoordinates) > 0 {
+			if err := qtx.OptInCheckpointCoordinates(ctx); err != nil {
+				return store.Run{}, false, err
+			}
 		}
 		locked, lerr := qtx.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)})
 		if lerr != nil {
