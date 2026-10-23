@@ -652,7 +652,7 @@ func (m tuiModel) workersSummary(width int, hideIdleCrossChecks bool) string {
 	if m.board.admin {
 		scope = "factory workers"
 	}
-	build := func(showUnknown, showAdmission, showOnline, showCount bool) string {
+	build := func(showUnknown, showAdmission, showOnline, showCount bool, compact int) string {
 		parts := []string{paintSeg(nil, nil, true, scope)}
 		if showCount {
 			parts = append(parts, itoa(n))
@@ -667,7 +667,9 @@ func (m tuiModel) workersSummary(width int, hideIdleCrossChecks bool) string {
 		if !showCount {
 			slots = fmt.Sprintf("%d/%d runs", used, cap)
 		}
-		parts = append(parts, slots)
+		if compact < 2 {
+			parts = append(parts, slots)
+		}
 		crossDenom := itoa(crossCap)
 		if crossUnknown > 0 {
 			crossDenom = "?"
@@ -680,7 +682,11 @@ func (m tuiModel) workersSummary(width int, hideIdleCrossChecks bool) string {
 			parts = append(parts, cross)
 		}
 		if manualIntake > 0 {
-			parts = append(parts, paintSeg(m.pal.wait, nil, false, fmt.Sprintf("%d cordoned (manual)", manualIntake)))
+			label := fmt.Sprintf("%d cordoned (manual)", manualIntake)
+			if compact > 0 {
+				label = fmt.Sprintf("%d manual", manualIntake)
+			}
+			parts = append(parts, paintSeg(m.pal.wait, nil, false, label))
 		}
 		if showAdmission {
 			if holding > 0 {
@@ -699,12 +705,21 @@ func (m tuiModel) workersSummary(width int, hideIdleCrossChecks bool) string {
 		return strings.Join(parts, " · ")
 	}
 	for _, options := range [][4]bool{{true, true, true, true}, {false, true, true, true}, {false, false, true, true}, {false, false, false, false}} {
-		text := build(options[0], options[1], options[2], options[3])
+		text := build(options[0], options[1], options[2], options[3], 0)
 		if visualWidth(text) <= width {
 			return text
 		}
 	}
-	return build(false, false, false, false)
+	if manualIntake > 0 {
+		// Keep manual intent and attention in narrow titles; retain runs when they fit.
+		for compact := 1; compact <= 2; compact++ {
+			text := build(false, false, false, false, compact)
+			if visualWidth(text) <= width {
+				return text
+			}
+		}
+	}
+	return build(false, false, false, false, 0)
 }
 
 func (m tuiModel) workerKind(r workerRow) string {

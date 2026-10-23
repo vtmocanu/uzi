@@ -136,6 +136,58 @@ func TestTUIWorkerManualSummary(t *testing.T) {
 	}
 }
 
+func TestTUIWorkerManualCompactSummary(t *testing.T) {
+	for _, dark := range []bool{false, true} {
+		m := workersScene(dark, "workers-manual-160")
+		for _, tc := range []struct {
+			width int
+			hide  bool
+			want  string
+		}{
+			{60, true, "workers · 5/12 runs · 4 cordoned (manual) · 7 need attention"},
+			{49, true, "workers · 5/12 runs · 4 manual · 7 need attention"},
+			{43, true, "workers · 4 manual · 7 need attention"},
+			{62, false, "workers · 5/12 runs · 0/? checks · 4 manual · 7 need attention"},
+		} {
+			got := stripANSI(m.workersSummary(tc.width, tc.hide))
+			if got != tc.want || visualWidth(got) > tc.width {
+				t.Errorf("width=%d hide=%t: summary %q, want %q", tc.width, tc.hide, got, tc.want)
+			}
+		}
+		for _, split := range []bool{false, true} {
+			for _, view := range []tuiView{viewBoard, viewWorkers} {
+				m := workersScene(dark, "workers-manual-80")
+				m.splitMode = "off"
+				if split {
+					m.splitMode = "auto"
+				}
+				m = resizeSplit(m, 80, 60)
+				m.setListView(view)
+				lines := strings.Split(stripANSI(m.View().Content), "\n")
+				at := 0
+				if !split && view == viewWorkers {
+					at = 1
+				}
+				requireWorkerText(t, lines[at], "4", "manual", "7 need attention")
+				if split || at == 1 {
+					requireWorkerText(t, lines[at], "5/12")
+				}
+				if at == 0 {
+					requireWorkerText(t, lines[0], "4 manual")
+				} else if strings.Contains(lines[0], "need attention") {
+					t.Fatal("owner workers fallback moved inline")
+				}
+				t.Logf("dark=%t split=%t view=%d: title width=%d summary line=%q", dark, split, view, visualWidth(lines[0]), lines[at])
+				for _, line := range lines {
+					if visualWidth(line) > 80 {
+						t.Fatalf("ship View overflow: %q", line)
+					}
+				}
+			}
+		}
+	}
+}
+
 func TestTUIWorkerManualHostileMetadata(t *testing.T) {
 	for _, width := range []int{80, 120} {
 		m := workerRenderModel(false)
