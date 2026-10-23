@@ -396,15 +396,37 @@ support is deferred: equal base and index gitlink ids do not prove that
 directory is staged. Supporting it needs a proof that the worktree preserves
 the base gitlink under publication.
 
-Capture runs under two independent 128 MiB budgets: one for source reads
-(worktree compare reads and verified object reads) and one for the
-object-store snapshot copy, which is streamed in small chunks so cleanup can
-run on SIGTERM. The snapshot is a temporary tree on the worker's disk,
-removed when capture ends. Measured once on a clone of the uzi repository
-(October 2026), capture used about a 74 MiB snapshot (the temporary tree
-peaks near that size) and about 100 MiB of source reads, in under 7 s
-against a 28 s deadline; a repository whose tracked text approaches
-128 MiB will refuse with `diff_too_large`.
+Capture derives its budgets from the immutable base in the worker-held bare
+repository. The helper reads base objects only from that bare's object
+directory, with type, size and hash verification; it rejects bare alternates
+and uses neutral Git scratch instead of the clone's object store or
+configuration. Missing or detectably corrupt required objects refuse with
+`base_unavailable`; a concurrent repack may instead produce `diff_failed`
+(diagnostic `git_refused`). Capture holds no long-lived bare lock.
+
+Source reads have a limit of per-path base blob bytes (duplicates included),
+plus verified commit/tree bytes, plus 128 MiB. Clean or deleted paths fit
+within base credit; changed files charge roughly their new size against the
+allowance. Clone inputs grant no credit, and current regular files are read completely
+through pinned descriptors without trusting clean index stats. Independent
+index, path, walk and ignore budgets also scale from the verified base;
+see the [counter definitions and bounds](../adr/2149-cross-check.md#planning-diff-capture-symlinks-gitlinks-and-budgets-2026-10-07-2410).
+
+There is no object-store snapshot copy or snapshot budget. Base discovery
+has per-object, depth and deadline bounds, with no aggregate base cap or
+cache. No additional absolute ceiling applies to the relative totals. Limits remain: 4 MiB per file, 2 MiB per commit/tree object, depth 64,
+64 KiB per ignore/exclude read, 512 KiB patch/output and 200 non-ignored
+untracked files. The helper has 28 s and the outer capture 30 s; yielding
+during discovery and reads allows cancellation cleanup within the production
+2 s SIGTERM kill grace. Large clean repositories no longer meet a fixed
+128 MiB source ceiling, but other bounds and deadlines can still refuse.
+
+Hosted post-merge acceptance remains pending: a maintainer must measure
+clean HEAD capture including base sizing with a reported sample count,
+verify bare read/write posture on Docker and kube-native workers, and
+observe an auto-approved scheduled run proceeding without a gate.
+Single-UID operation still lacks OS write isolation; split-UID helpers can
+read the bare but cannot write it. Capture refusals keep the human fallback.
 
 ### Rollout
 
