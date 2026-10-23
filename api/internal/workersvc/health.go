@@ -1218,6 +1218,7 @@ func (s *Service) queuedReasonWithEligibility(ctx context.Context, now time.Time
 	}
 	eligibility, eligibilityErr := projection.counts, projection.err
 	until, held := s.ownerHold(now, r)
+	preserveManual := eligibilityErr != nil && r.HealthReason.Valid && isManualCordonWaitReason(r.HealthReason.String)
 	if eligibilityErr == nil {
 		if reason := manualCordonWaitReason(eligibility); reason != "" {
 			if held && eligibility.AutomaticOwnerHold {
@@ -1226,15 +1227,15 @@ func (s *Service) queuedReasonWithEligibility(ctx context.Context, now time.Time
 			return reason
 		}
 	}
-	if held && (eligibilityErr != nil || (eligibility.AssignedClaimable == 0 && (eligibility.ManualCordoned == 0 || eligibility.AutomaticOwnerHold))) {
+	if held && !preserveManual && (eligibilityErr != nil || (eligibility.AssignedClaimable == 0 && (eligibility.ManualCordoned == 0 || eligibility.AutomaticOwnerHold))) {
 		return ownerHoldReason(until, r.StaleRequeueWorkerName)
 	}
 	if until, pinned := s.staleRequeuePin(now, r); pinned {
 		return staleRequeuePinReason(until, r.StaleRequeueWorkerName)
 	}
-	if eligibilityErr != nil && r.HealthReason.Valid && isManualCordonWaitReason(r.HealthReason.String) {
+	if preserveManual {
 		// A failed projection cannot prove that the prior manual block ended.
-		// Account prerequisites and genuine owner holds above retain priority.
+		// Account prerequisites and independent stale requeue pins retain priority.
 		return r.HealthReason.String
 	}
 	if early {
