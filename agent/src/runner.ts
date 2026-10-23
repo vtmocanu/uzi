@@ -3629,9 +3629,8 @@ export class RunRunner {
           if (!(await this.gateQueuedDuplicate(claim))) return;
           claim = await this.refreshQueuedClaimCursor(claim);
         }
-        const result = await this.executeClaim(claim, inherited || undefined, operation => { ownedMemory = operation; });
-        observation = result.observation;
-        evidenceReady = result.evidenceReady;
+        observation = await this.executeClaim(claim, inherited || undefined, operation => { ownedMemory = operation; },
+          ready => { evidenceReady = ready; });
       } catch (error) {
         failed = true;
         primaryError = error;
@@ -3837,7 +3836,7 @@ export class RunRunner {
   }
 
   private async executeClaim(claim: ClaimResponse, inherited: ClosedSourceObservation | undefined,
-    ownMemory: (operation: Promise<void>) => void): Promise<{ observation: ClosedSourceObservation | void; evidenceReady: boolean }> {
+    ownMemory: (operation: Promise<void>) => void, evidenceSettled?: (ready: boolean) => void): Promise<ClosedSourceObservation | void> {
     let observedFlight: RunFlight | undefined;
     await MaintenanceBudget.runAttempt(`${claim.run_id}:${claim.claim_generation ?? 0}`, () => {
       if (!observedFlight) throw new Error("cancellation observed before flight initialization");
@@ -3855,7 +3854,8 @@ export class RunRunner {
       !flight.sourceJoinFailed && !flight.evidenceJoinFailed &&
       flight.terminalResolved === true && !flight.parked && !flight.active?.shuttingDown &&
       !this.shuttingDownGlobal && residueQuarantine() === undefined;
-    return { evidenceReady, observation };
+    evidenceSettled?.(evidenceReady);
+    return observation;
   }
 
   private async closedSourceObservation(claim: ClaimResponse, flight?: RunFlight): Promise<ClosedSourceObservation | void> {
@@ -5313,11 +5313,20 @@ export class RunRunner {
       const commands = flight.evidenceCommands;
       // A retained-recovery successor can replace the executor. The old runtime's
       // terminal receipt never proves settlement of that new owner.
+      // Normal teardown marks the memory flight ended and retires its context but keeps the object,
+      // so settlement is explicit evidence (the same pending checks the terminal disposal guard uses),
+      // never the object's absence.
+      const memory = flight.workerMemory;
+      const memorySettled = !memory || (memory.ended &&
+        !(memory.operation && !memory.settled) &&
+        !(memory.executorRun && !memory.executorSettled) &&
+        !(memory.closing && !memory.closingSettled) &&
+        memory.feedback.size === 0 && !memory.hold);
       flight.evidenceJoinsConfirmed = flight.executor === executor && steeringJoined && flight.evidenceProcessJoined === executor &&
         !flight.evidenceJoinFailed && !flight.sourceJoinFailed &&
         (flight.evidenceAuxiliaries === undefined || flight.evidenceAuxiliaries === "joined") &&
         (!executor.settleWorkerCommands || (commands === this.commandSettlements.get(executor) && commands?.confirmed === true && !commands.failed)) &&
-        !flight.workerMemory && !this.memoryRuntime?.sinkReceipts.some(receipt => receipt.context.flight === flight) &&
+        memorySettled && !this.memoryRuntime?.sinkReceipts.some(receipt => receipt.context.flight === flight) &&
         !batcher.isTripped() && !batcher.isSpilled() && batcher.bufferedCount() === 0;
     }
   }

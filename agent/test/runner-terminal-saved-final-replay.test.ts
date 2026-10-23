@@ -4,15 +4,17 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import { RecoveryCoordinator } from "../src/recovery.js";
 import { RequestError } from "../src/client.js";
 import { SteeringChannel } from "../src/steering.js";
 import type { CodexExecutionSafety, BoundaryPermit } from "../src/harness.js";
 import type { Executor } from "../src/executor.js";
 import type { RecoveryExactHold, RecoveryFinalDisposition } from "../src/protocol.js";
-import { recordingLogger } from "./helpers.js";
-import { client, fakeGitlab, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
+import { nullLogger, recordingLogger } from "./helpers.js";
+import { api, client, fakeGitlab, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
 import { passingExclusion } from "./maintenance-exclusion-fixture.js";
+import { WorkerMemoryRuntime } from "../src/worker-memory-runtime.js";
 
 // The runner's stopped-source and quiescence proofs (src/runner.ts, src/run-quiescence.ts) refuse off
 // Linux, so this scenario cannot reach its post-proof assertions on macOS (#1912). Linux runs it unchanged.
@@ -150,15 +152,38 @@ function deferred() {
 }
 
 type ReplayMode = "ordinary" | "upload-rejected" | "upload-failed" | "commands-unconfirmed" | "commands-rejected" |
-  "disposed" | "incomplete" | "legacy_in_process" | "dispose-rejected" | "steering-rejected" | "executor-replaced" | "shutdown";
+  "disposed" | "incomplete" | "legacy_in_process" | "dispose-rejected" | "steering-rejected" | "executor-replaced" | "shutdown" |
+  "memory-enrolled" | "memory-operation-pending" | "memory-executor-pending" | "memory-closing-pending" | "memory-sink-receipt";
 
 for (const mode of ["ordinary", "upload-rejected", "upload-failed", "commands-unconfirmed", "commands-rejected",
-  "disposed", "incomplete", "legacy_in_process", "dispose-rejected", "steering-rejected", "executor-replaced", "shutdown"] as ReplayMode[]) {
+  "disposed", "incomplete", "legacy_in_process", "dispose-rejected", "steering-rejected", "executor-replaced", "shutdown",
+  "memory-enrolled", "memory-operation-pending", "memory-executor-pending", "memory-closing-pending",
+  "memory-sink-receipt"] as ReplayMode[]) {
   it("N current accepted archive replay: " + mode, {
     skip: process.platform !== "linux",
   }, async t => {
     const token = "current-archive-fixture";
     const claim = gitlabClaim(3037, { claim_generation: 1, inventory_guarded: true });
+    // A real enrolled worker-memory flight (issue #3031 N): the runner binds it from the claim's memory
+    // fields and the registered memory incarnation, and teardown ends it without removing the object.
+    const memoryMode = mode.startsWith("memory-");
+    let memoryRuntime: WorkerMemoryRuntime | undefined;
+    if (memoryMode) {
+      api.memoryRegisterNonce = "terminal-replay-memory-registration";
+      api.setRegisterProtocolFeatures(["worker_memory_pressure_v1", "claim_generation_fence", "recovery_inventory_v1"]);
+      await client.register("memory-replay-fixture", "base");
+      Object.assign(claim, { memory_episode: 3, memory_policy: { version: 1, max_interventions: 2 }, memory_intervention_count: 0 });
+      memoryRuntime = new WorkerMemoryRuntime({ enabled: true, reserveBytes: 100, hysteresisBytes: 100, sampleMs: 2,
+        responseBudgetMs: 200, rearmMs: 10, maxInterventions: 2 }, client, nullLogger(), {
+        reader: { sample: () => {
+          const time = performance.now();
+          return { available: true, sampleId: 1, startedAtMs: time, completedAtMs: time, currentBytes: 0, limitBytes: 1000,
+            stat: { anon: 1, shmem: 0, slab_unreclaimable: 0, unevictable: 0 },
+            pressure: { some: { avg10: 0, avg60: 0, avg300: 0, total: 0 }, full: { avg10: 0, avg60: 0, avg300: 0, total: 0 } } };
+        } },
+      });
+      t.after(async () => { await memoryRuntime!.stop(); });
+    }
     const repoId = "00000000-0000-4000-8000-000000003037";
     claim.repo.id = repoId;
     let status = "running";
@@ -213,6 +238,9 @@ for (const mode of ["ordinary", "upload-rejected", "upload-failed", "commands-un
     };
     const resume = proto.resumeTerminalEvidence;
     let capturedTail: unknown;
+    type PendingMemory = { operation?: Promise<void>; settled?: boolean; executorRun?: Promise<void>;
+      executorSettled?: boolean; closing?: Promise<void>; closingSettled?: boolean; ended: boolean };
+    let memoryFlight: { workerMemory?: PendingMemory } | undefined;
     const tails = () => (runner as unknown as { executionTails: Map<string, unknown> }).executionTails;
     if (resume) t.mock.method(proto as { resumeTerminalEvidence: NonNullable<typeof resume> }, "resumeTerminalEvidence", function (this: RecoveryCoordinator,
       ...args: Parameters<typeof resume>) {
@@ -275,8 +303,26 @@ for (const mode of ["ordinary", "upload-rejected", "upload-failed", "commands-un
       maintenanceExclusion: passingExclusion(), dockerHost: "http://unused.invalid", recoveryRetryMs: 1,
       quiesceRun: async () => ({ process: { state: "quiescent", processes: [], killed: [], detail: "" },
         docker: { state: "not_wired", removed: [], detail: "" } }),
+      ...(memoryRuntime ? { memoryRuntime, codexBoundaryDeadlineMs: 200 } : {}),
     });
     let replaced = false;
+    if (memoryMode) {
+      const owner = runner as unknown as { archiveAccepted: (flight: { workerMemory?: PendingMemory }, record: unknown) => void };
+      const accepted = owner.archiveAccepted;
+      t.mock.method(owner, "archiveAccepted", (flight: Parameters<typeof accepted>[0], record: unknown) => {
+        accepted.call(runner, flight, record);
+        memoryFlight = flight;
+        const never = new Promise<void>(() => {});
+        const memory = flight.workerMemory;
+        assert.ok(memory, "the claim enrolled a real worker memory flight");
+        if (mode === "memory-operation-pending") { memory.operation = never; memory.settled = false; }
+        if (mode === "memory-executor-pending") { memory.executorRun = never; memory.executorSettled = false; }
+        if (mode === "memory-closing-pending") { memory.closing = never; memory.closingSettled = false; }
+        if (mode === "memory-sink-receipt") {
+          t.mock.getter(memoryRuntime!, "sinkReceipts", () => [{ context: { flight }, completion: never }] as never);
+        }
+      });
+    }
     if (mode === "executor-replaced") {
       const owner = runner as unknown as {
         archiveAccepted: (flight: { executor: Executor }, record: unknown) => void;
@@ -321,7 +367,11 @@ for (const mode of ["ordinary", "upload-rejected", "upload-failed", "commands-un
         assert.ok(disposals > 0, "the original runtime has a real disposal result");
         assert.equal(replacementDisposals, 0, "no disposal result confirms the replacement runtime");
       }
-      const expected = mode === "ordinary" || mode === "disposed";
+      if (memoryMode) {
+        assert.ok(memoryFlight?.workerMemory, "the memory flight object survives teardown");
+        assert.equal(memoryFlight.workerMemory.ended, true, "normal teardown ended the memory flight");
+      }
+      const expected = mode === "ordinary" || mode === "disposed" || mode === "memory-enrolled";
       if (expected) assert.equal(sourceNotifications, 0, "ordinary upload has no source-family notification");
       assert.equal(releases.length, expected ? 1 : 0, (expected ? "CURRENT archive gets a newly minted FINAL and ACK: " : "unconfirmed or rejected work cannot mint FINAL: ") + JSON.stringify({ records: (await inspect.inspect(claim.run_id)).map(r => ({ state: r.state, reason: r.reason, final: !!r.finalRequest, ack: r.finalAcknowledged })), logs: log.lines.slice(-5) }));
       assert.equal(notifications, expected ? 1 : 0, "accepted archive notification requires confirmed joins: " + JSON.stringify(log.lines.slice(-8)));
