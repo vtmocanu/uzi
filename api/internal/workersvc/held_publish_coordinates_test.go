@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
+	"slices"
 	"testing"
 
 	"github.com/google/uuid"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/capability"
+	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/pushbroker"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -102,6 +105,77 @@ type liveCoordinateStore struct {
 func (s *liveCoordinateStore) ReleasePredecessorCustodyHoldByLiveAncestry(_ context.Context, p store.ReleasePredecessorCustodyHoldByLiveAncestryParams) (int64, error) {
 	s.releasedLive = &p
 	return 1, nil
+}
+
+type liveCoordinateForge struct {
+	*settleUnitForge
+	refs  []string
+	heads []string
+}
+
+func (f *liveCoordinateForge) RefHead(_ context.Context, _ int64, ref string) (string, error) {
+	f.refs = append(f.refs, ref)
+	return uHead, nil
+}
+
+func (f *liveCoordinateForge) CompareAncestry(ctx context.Context, projectID int64, head, candidate string) (forge.Ancestry, error) {
+	f.heads = append(f.heads, head)
+	return f.settleUnitForge.CompareAncestry(ctx, projectID, head, candidate)
+}
+
+func TestLiveSettleTaskCoordinateCheckpointDescendant(t *testing.T) {
+	u := newSettleUnit()
+	q := &liveCoordinateStore{settleUnitStore: u.st}
+	ancestorID := uuid.New()
+	workBranch := "uzi/task/" + ancestorID.String()
+	checkpointKey := "uzi/task/" + u.run.String()
+	q.run.Kind, q.run.Status = "task", "running"
+	q.run.RepoID = pgconv.UUID(uuid.New())
+	q.run.Branch = pgconv.Text(workBranch)
+	q.hold.UserID = u.wkr.UserID
+	q.sources = []string{uB}
+	descriptor, err := json.Marshal(CheckpointCoordinates{
+		Version: 1, RunID: q.run.ID, UserID: q.run.UserID, RepoID: uuid.UUID(q.run.RepoID.Bytes),
+		Kind: "task", WorkBranch: workBranch, CheckpointKey: checkpointKey,
+		Provenance: []uuid.UUID{u.run, ancestorID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q.run.CheckpointCoordinates = descriptor
+	f := &liveCoordinateForge{settleUnitForge: u.fk}
+	svc := New(q, nil, Params{})
+	svc.SetForges(settleUnitBuilder{f: f})
+	req := apitypes.RecoveryLiveSettleRequest{
+		PredecessorGeneration: 1, SuccessorGeneration: 2, Target: "checkpoint",
+		PublishedSha: uA, SourceSha: uB, AdoptedSha: uC,
+	}
+	res, err := svc.SettlePredecessorHoldLive(context.Background(), u.wkr, u.run, u.hold, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Outcome != "released" || res.FinalHeadSha != uHead || q.releasedLive == nil {
+		t.Fatalf("result=%+v release=%+v", res, q.releasedLive)
+	}
+	// The descendant's checkpoint key differs from its inherited work branch.
+	if !slices.Equal(f.refs, []string{"refs/uzi-checkpoints/" + checkpointKey}) || len(f.branches) != 0 {
+		t.Fatalf("checkpoint refs=%v branch reads=%v", f.refs, f.branches)
+	}
+	if !slices.Equal(f.candidates, []string{uA, uB, uC}) ||
+		!slices.Equal(f.heads, []string{uHead, uHead, uHead}) {
+		t.Fatalf("ancestry candidates=%v heads=%v", f.candidates, f.heads)
+	}
+	want := store.ReleasePredecessorCustodyHoldByLiveAncestryParams{
+		PublishedSha: uA, SourceSha: uB, AdoptedSha: uC, FinalHeadSha: uHead,
+		SuccessorGeneration: 2, PredecessorGeneration: 1,
+		ProvenBranch: checkpointKey, Target: "checkpoint",
+		HoldID: u.hold, RunID: u.run, UserID: u.wkr.UserID, WorkerID: u.wkr.ID,
+		CapturedBranch: pgconv.Text(workBranch), CapturedCoordinates: descriptor,
+		Kind: "task", IssueIid: q.run.IssueIid,
+	}
+	if !reflect.DeepEqual(*q.releasedLive, want) {
+		t.Fatalf("release=%+v; want %+v", *q.releasedLive, want)
+	}
 }
 
 func TestLiveSettleTaskCoordinateAdmission(t *testing.T) {
