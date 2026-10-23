@@ -236,7 +236,7 @@ func (s *Service) promoteCredentialDisabledRun(ctx context.Context, userID, runI
 	}
 	q := store.New(tx)
 	// (2) Lock the enrolled worker before re-reading the run under its lock.
-	run, err := lockCredentialDisabledCheckpointRun(ctx, q, userID, runID)
+	run, err := lockCredentialDisabledCheckpointRun(ctx, q, userID, runID, int32(s.p.RunTimeout.Seconds()))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", nil
 	}
@@ -278,7 +278,7 @@ type credentialCheckpointAdmission interface {
 func lockCredentialDisabledCheckpointRun(ctx context.Context, q interface {
 	GetRunByID(context.Context, uuid.UUID) (store.Run, error)
 	LockCredentialDisabledRunForPromotion(context.Context, store.LockCredentialDisabledRunForPromotionParams) (store.LockCredentialDisabledRunForPromotionRow, error)
-}, userID, runID uuid.UUID) (store.LockCredentialDisabledRunForPromotionRow, error) {
+}, userID, runID uuid.UUID, globalTimeoutSeconds int32) (store.LockCredentialDisabledRunForPromotionRow, error) {
 	empty := store.LockCredentialDisabledRunForPromotionRow{}
 	prior, err := q.GetRunByID(ctx, runID)
 	if err != nil {
@@ -288,10 +288,8 @@ func lockCredentialDisabledCheckpointRun(ctx context.Context, q interface {
 		return empty, pgx.ErrNoRows
 	}
 	var admission credentialCheckpointAdmission
-	if len(prior.CheckpointCoordinates) > 0 {
-		if !prior.WorkerID.Valid {
-			return empty, pgx.ErrNoRows
-		}
+	var capable bool
+	if len(prior.CheckpointCoordinates) > 0 && prior.WorkerID.Valid {
 		var ok bool
 		admission, ok = q.(credentialCheckpointAdmission)
 		if !ok {
@@ -301,18 +299,26 @@ func lockCredentialDisabledCheckpointRun(ctx context.Context, q interface {
 		if err != nil {
 			return empty, err
 		}
-		if worker.UserID != userID || !slices.Contains(worker.ProtocolCapabilities, capability.TaskCheckpointCoordinatesV1) {
+		if worker.UserID != userID {
 			return empty, pgx.ErrNoRows
 		}
+		capable = slices.Contains(worker.ProtocolCapabilities, capability.TaskCheckpointCoordinatesV1)
 	}
-	run, err := q.LockCredentialDisabledRunForPromotion(ctx, store.LockCredentialDisabledRunForPromotionParams{ID: runID, UserID: userID})
+	run, err := q.LockCredentialDisabledRunForPromotion(ctx, store.LockCredentialDisabledRunForPromotionParams{
+		ID: runID, UserID: userID, GlobalTimeoutSeconds: globalTimeoutSeconds,
+	})
 	if err != nil {
 		return empty, err
 	}
 	if !bytes.Equal(prior.CheckpointCoordinates, run.CheckpointCoordinates) || (len(run.CheckpointCoordinates) > 0 && prior.WorkerID != run.WorkerID) {
 		return empty, pgx.ErrNoRows
 	}
-	if admission != nil {
+	// Queue-only writes preserve the released claim. Settlement reopens authority
+	// and still requires the bound worker's capability and API opt-in.
+	if len(run.CheckpointCoordinates) > 0 && !capable && !run.CanQueue {
+		return empty, pgx.ErrNoRows
+	}
+	if capable {
 		if err := admission.OptInCheckpointCoordinates(ctx); err != nil {
 			return empty, err
 		}
@@ -403,7 +409,7 @@ func releaseCredentialDisabledHold(ctx context.Context, q credentialHoldReleaser
 func (s *Service) reassignCredentialDisabledRun(ctx context.Context, userID, runID uuid.UUID, resolved *CredentialOverride) (string, error) {
 	var status string
 	err := s.withSecretMutation(ctx, userID, func(q secretMutationQueries) error {
-		run, err := lockCredentialDisabledCheckpointRun(ctx, q, userID, runID)
+		run, err := lockCredentialDisabledCheckpointRun(ctx, q, userID, runID, int32(s.p.RunTimeout.Seconds()))
 		if err != nil {
 			return err // pgx.ErrNoRows: gone
 		}

@@ -14,11 +14,12 @@ import (
 
 type credentialCheckpointLockFake struct {
 	Store
-	prior     store.Run
-	locked    store.LockCredentialDisabledRunForPromotionRow
-	worker    store.Worker
-	workerErr error
-	calls     []string
+	prior      store.Run
+	locked     store.LockCredentialDisabledRunForPromotionRow
+	worker     store.Worker
+	workerErr  error
+	lockParams store.LockCredentialDisabledRunForPromotionParams
+	calls      []string
 }
 
 func (f *credentialCheckpointLockFake) GetRunByID(context.Context, uuid.UUID) (store.Run, error) {
@@ -29,8 +30,9 @@ func (f *credentialCheckpointLockFake) GetWorkerForUpdate(context.Context, uuid.
 	f.calls = append(f.calls, "worker")
 	return f.worker, f.workerErr
 }
-func (f *credentialCheckpointLockFake) LockCredentialDisabledRunForPromotion(context.Context, store.LockCredentialDisabledRunForPromotionParams) (store.LockCredentialDisabledRunForPromotionRow, error) {
+func (f *credentialCheckpointLockFake) LockCredentialDisabledRunForPromotion(_ context.Context, params store.LockCredentialDisabledRunForPromotionParams) (store.LockCredentialDisabledRunForPromotionRow, error) {
 	f.calls = append(f.calls, "run")
+	f.lockParams = params
 	return f.locked, nil
 }
 func (f *credentialCheckpointLockFake) OptInCheckpointCoordinates(context.Context) error {
@@ -47,8 +49,13 @@ func (f *credentialCheckpointLockFake) SettleCredentialDisabledPause(context.Con
 	return store.SettleCredentialDisabledPauseRow{ID: f.locked.ID, Status: "paused"}, nil
 }
 
+func (f *credentialCheckpointLockFake) ReassignCredentialDisabledRun(context.Context, store.ReassignCredentialDisabledRunParams) (store.ReassignCredentialDisabledRunRow, error) {
+	f.calls = append(f.calls, "queue")
+	return store.ReassignCredentialDisabledRunRow{ID: f.locked.ID, Status: "queued"}, nil
+}
+
 func TestCheckpointCoordinatesCredentialLockAdmission(t *testing.T) {
-	for _, mode := range []string{"compatible", "incompatible", "foreign worker", "missing worker", "raced worker", "raced enrollment", "legacy"} {
+	for _, mode := range []string{"compatible", "incompatible", "foreign worker", "missing worker", "raced worker", "raced enrollment", "legacy", "unsupported queue", "unbound queue", "unbound settlement", "foreign queue", "raced queue"} {
 		t.Run(mode, func(t *testing.T) {
 			owner, worker, runID := uuid.New(), uuid.New(), uuid.New()
 			marker := []byte(`{"version":1}`)
@@ -63,7 +70,6 @@ func TestCheckpointCoordinatesCredentialLockAdmission(t *testing.T) {
 				wantCalls += ",opt-in,override,settle"
 			case "incompatible":
 				f.worker.ProtocolCapabilities = nil
-				wantCalls = "pre-read,worker"
 			case "foreign worker":
 				f.worker.UserID = uuid.New()
 				wantCalls = "pre-read,worker"
@@ -75,6 +81,26 @@ func TestCheckpointCoordinatesCredentialLockAdmission(t *testing.T) {
 			case "raced enrollment":
 				f.prior.CheckpointCoordinates = nil
 				wantCalls = "pre-read,run"
+			case "unsupported queue", "foreign queue", "raced queue":
+				f.worker.ProtocolCapabilities = nil
+				f.locked.CanQueue = true
+				wantCalls += ",queue"
+				if mode == "foreign queue" {
+					f.worker.UserID = uuid.New()
+					wantCalls = "pre-read,worker"
+				}
+				if mode == "raced queue" {
+					f.locked.WorkerID = pgconv.UUID(uuid.New())
+					wantCalls = "pre-read,worker,run"
+				}
+			case "unbound queue", "unbound settlement":
+				f.prior.WorkerID.Valid = false
+				f.locked.WorkerID = f.prior.WorkerID
+				wantCalls = "pre-read,run"
+				if mode == "unbound queue" {
+					f.locked.CanQueue = true
+					wantCalls += ",queue"
+				}
 			case "legacy":
 				f.prior.CheckpointCoordinates = nil
 				f.locked.CheckpointCoordinates = nil
@@ -82,15 +108,22 @@ func TestCheckpointCoordinatesCredentialLockAdmission(t *testing.T) {
 			}
 			f.locked.Status = "paused"
 			f.locked.HoldReason = pgconv.Text("credential_disabled")
-			f.locked.PauseRequestedAt.Valid = true
+			f.locked.PauseRequestedAt.Valid = !f.locked.CanQueue
 			svc := &Service{q: f, p: testParams()}
 			status, err := svc.reassignCredentialDisabledRun(context.Background(), owner, runID, &CredentialOverride{Mode: CredentialOverrideModeAuto})
-			success := mode == "compatible" || mode == "legacy"
-			if success && (err != nil || status != "paused") {
+			success := mode == "compatible" || mode == "legacy" || mode == "unsupported queue" || mode == "unbound queue"
+			wantStatus := "paused"
+			if f.locked.CanQueue {
+				wantStatus = "queued"
+			}
+			if success && (err != nil || status != wantStatus) {
 				t.Fatalf("status=%s err=%v", status, err)
 			}
 			if !success && err != ErrCredentialSwitchRaced {
 				t.Fatalf("want fail closed, got %v", err)
+			}
+			if strings.Contains(strings.Join(f.calls, ","), ",run") && f.lockParams.GlobalTimeoutSeconds != int32(svc.p.RunTimeout.Seconds()) {
+				t.Fatal("lock projection used a different timeout")
 			}
 			if calls := strings.Join(f.calls, ","); calls != wantCalls {
 				t.Fatalf("calls=%s want=%s", calls, wantCalls)

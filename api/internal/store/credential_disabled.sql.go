@@ -117,15 +117,22 @@ func (q *Queries) ListCredentialDisabledUsers(ctx context.Context, arg ListCrede
 
 const lockCredentialDisabledRunForPromotion = `-- name: LockCredentialDisabledRunForPromotion :one
 SELECT id, user_id, kind, harness, status, hold_reason, pause_requested_at, pause_mode,
-       credential_override_mode, credential_override_secret_id, codex_secret_id, worker_id, checkpoint_coordinates
+       credential_override_mode, credential_override_secret_id, codex_secret_id, worker_id, checkpoint_coordinates,
+       (runs.pause_requested_at IS NULL
+        AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL OR
+             (COALESCE(runs.budget_wall_seconds, $1::int)
+                + runs.budget_extension_seconds + runs.budget_finalize_seconds)
+             - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int)
+                - runs.budget_paused_seconds) > 0))::boolean AS can_queue
 FROM runs
-WHERE id = $1 AND user_id = $2
+WHERE id = $2 AND user_id = $3
 FOR UPDATE
 `
 
 type LockCredentialDisabledRunForPromotionParams struct {
-	ID     uuid.UUID `json:"id"`
-	UserID uuid.UUID `json:"user_id"`
+	GlobalTimeoutSeconds int32     `json:"global_timeout_seconds"`
+	ID                   uuid.UUID `json:"id"`
+	UserID               uuid.UUID `json:"user_id"`
 }
 
 type LockCredentialDisabledRunForPromotionRow struct {
@@ -142,12 +149,13 @@ type LockCredentialDisabledRunForPromotionRow struct {
 	CodexSecretID              pgtype.UUID        `json:"codex_secret_id"`
 	WorkerID                   pgtype.UUID        `json:"worker_id"`
 	CheckpointCoordinates      []byte             `json:"checkpoint_coordinates"`
+	CanQueue                   bool               `json:"can_queue"`
 }
 
 // Promoter step (2): the candidate run row, locked AFTER the user's secret mutation
 // advisory lock and BEFORE any requirement source or credential row.
 func (q *Queries) LockCredentialDisabledRunForPromotion(ctx context.Context, arg LockCredentialDisabledRunForPromotionParams) (LockCredentialDisabledRunForPromotionRow, error) {
-	row := q.db.QueryRow(ctx, lockCredentialDisabledRunForPromotion, arg.ID, arg.UserID)
+	row := q.db.QueryRow(ctx, lockCredentialDisabledRunForPromotion, arg.GlobalTimeoutSeconds, arg.ID, arg.UserID)
 	var i LockCredentialDisabledRunForPromotionRow
 	err := row.Scan(
 		&i.ID,
@@ -163,6 +171,7 @@ func (q *Queries) LockCredentialDisabledRunForPromotion(ctx context.Context, arg
 		&i.CodexSecretID,
 		&i.WorkerID,
 		&i.CheckpointCoordinates,
+		&i.CanQueue,
 	)
 	return i, err
 }

@@ -267,7 +267,13 @@ LIMIT @page_size::int;
 -- advisory lock and BEFORE any requirement source or credential row.
 -- name: LockCredentialDisabledRunForPromotion :one
 SELECT id, user_id, kind, harness, status, hold_reason, pause_requested_at, pause_mode,
-       credential_override_mode, credential_override_secret_id, codex_secret_id, worker_id, checkpoint_coordinates
+       credential_override_mode, credential_override_secret_id, codex_secret_id, worker_id, checkpoint_coordinates,
+       (runs.pause_requested_at IS NULL
+        AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL OR
+             (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int)
+                + runs.budget_extension_seconds + runs.budget_finalize_seconds)
+             - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int)
+                - runs.budget_paused_seconds) > 0))::boolean AS can_queue
 FROM runs
 WHERE id = @id AND user_id = @user_id
 FOR UPDATE;
