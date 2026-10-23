@@ -2277,32 +2277,59 @@ describe("RunRunner checked gate for a Codex lead (PRD #2460)", () => {
     assert.ok(statuses(c.run_id).includes("completed"));
   });
 
-  // The Codex executor wires neither attemptCredentialSwitch nor deferCredentialSwitch, so a held-state
-  // switch signal that reached a Codex lead mid-gate would take the runner's safety-net release. The
-  // server never stamps one for a Codex run (ErrCredentialOverrideHarnessUnsupported); this proves the
-  // worker side stays safe if one arrived anyway: the run is released NON-terminal and nothing
-  // implements the checked approval.
-  it("a credential switch signal at a Codex lead's checked gate releases the claim; it never fails or implements the run", { skip: LINUX_CAPTURE }, async () => {
+  // Codex switch signals stop retained before capture, credential reconciliation or claim release.
+  // A checked approval cannot authorize implementation after that stop.
+  it("a credential switch signal at a Codex lead's checked gate retains the claim and exact source/session without capture or implementation", { skip: LINUX_CAPTURE }, async () => {
     const c = codexClaim();
+    let switched = false;
+    let captures = 0;
+    let clone = "";
+    const session = path.join(homeDir, "codex-switch-session");
+    const marker = git.commitWipMarker.bind(git);
+    const planning = git.capturePlanningDiff.bind(git);
+    git.commitWipMarker = async (...args) => { if (switched) captures++; return marker(...args); };
+    git.capturePlanningDiff = async (...args) => { if (switched) captures++; return planning(...args); };
     api.crossCheckHandler = ({ runId, body }) => {
+      switched = true;
       api.requestCredentialSwitch(runId, 1);
       api.armStateAckCredentialSwitch(runId, 1);
       return { status: 200, body: answer(runId, body, "approve", "approve", canonicalOf(body)) };
     };
     let implemented = false;
-    const exec: Executor = { run: async (ctx) => {
-      const verdict = await ctx.gatePlan!(PLAN);
-      // Both transports are armed (the inputs poll and the canonical running report's state ack), so
-      // the test does not depend on which wins; gatePlan normally rejects with CredentialSwitchSignal.
-      // This check is defensive only.
-      ctx.signal?.throwIfAborted();
-      if (verdict.kind === "approve") implemented = true;
-      return { branch: ctx.branch };
-    } };
-    await start(exec, c);
+    const exec: Executor = {
+      withCredentialFreeCapture: async () => { captures++; throw new Error("switch must not capture"); },
+      run: async (ctx) => {
+        clone = ctx.worktreePath;
+        fs.mkdirSync(session, { recursive: true });
+        fs.writeFileSync(path.join(session, "transcript"), "held Codex session\n");
+        fs.writeFileSync(path.join(clone, "switch-sentinel.txt"), "held local work\n");
+        const verdict = await ctx.gatePlan!(PLAN);
+        // Both transports are armed (the inputs poll and the canonical running report's state ack), so
+        // the test does not depend on which wins; gatePlan normally rejects with CredentialSwitchSignal.
+        ctx.signal?.throwIfAborted();
+        if (verdict.kind === "approve") implemented = true;
+        return { branch: ctx.branch };
+      },
+    };
+    const forge = fakeGitlab();
+    try {
+      await runnerWith(() => ({ executor: exec, homeDir: session }), forge.gitlab, undefined, undefined,
+        { planCrossCheckTiming: timing, planApprovalTimeoutMs: 4000 }).execute(c);
+    } finally {
+      git.commitWipMarker = marker;
+      git.capturePlanningDiff = planning;
+    }
     const states = api.states.filter((s) => s.runId === c.run_id).map((s) => s.body);
     assert.ok(!states.some((s) => s.status === "failed"), `a switch never fails the run: ${JSON.stringify(states.map((s) => s.status))}`);
-    assert.ok(states.some((s) => s.status === "credential_switch"), `the safety-net release ran: ${JSON.stringify(states.map((s) => s.status))}`);
+    assert.ok(!states.some((s) => s.status.startsWith("credential_switch")), "no switch release or hold report");
+    assert.equal(switched, true, "the bound checked response delivered the switch");
+    assert.equal(api.crossCheckRequests.length, 1, "the original checked candidate remains bound");
+    assert.equal(captures, 0, "no capture after the switch");
+    assert.equal(api.codexRequests.length, 0, "no credential refresh or release");
+    assert.equal(forge.calls.length, 0, "no forge publication");
+    assert.equal(api.completionPermitRequests.length, 0);
+    assert.equal(fs.readFileSync(path.join(clone, "switch-sentinel.txt"), "utf8"), "held local work\n");
+    assert.equal(fs.readFileSync(path.join(session, "transcript"), "utf8"), "held Codex session\n");
     assert.ok(!states.some((s) => s.status === "completed"), "the run does not complete on the old claim");
     assert.equal(implemented, false, "no implementation follows the interrupted gate");
   });

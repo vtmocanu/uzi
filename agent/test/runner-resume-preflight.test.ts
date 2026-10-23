@@ -12,6 +12,7 @@ import type { CodexRootHandle } from "../src/codex/launcher.js";
 import { type RunContext, type ExecutorResult } from "../src/executor.js";
 import { CodexSessionStore } from "../src/codex/session-state.js";
 import { assertCaptureLaunch } from "../src/git.js";
+import { codexRig } from "./runner-codex-sinks-fixture.js";
 import {
   type ExecutorFactory,
   RESUME_CONTINUED_EVENT,
@@ -394,9 +395,6 @@ it("a retained Codex runner turn adopts the session artifact but starts a fresh 
   };
   const originalReadiness = git.normalizeRetainedSourceObjects;
   let readiness = 0;
-  const originalStatus = git.worktreeStatus;
-  const originalVerify = git.verifyRunnerTrackingCovers;
-  const originalPack = git.checkpointPack;
   const transport: CodexTransport = {
     async request<T>(method: string, params?: unknown): Promise<T> {
       requests.push({ method, params });
@@ -441,22 +439,19 @@ it("a retained Codex runner turn adopts the session artifact but starts a fresh 
 
     // Seed the real clone, then park this run with its per-run HOME and session intact.
     api.setCompletionHoldResponse("paused", 200);
+    const seedRig = codexRig();
     await runnerWith(() => ({
       homeDir: runHome,
       executor: {
+        safety: seedRig.safety,
+        withCredentialFreeCapture: seedRig.capture,
         run: async (ctx: RunContext): Promise<ExecutorResult> => {
-          git.worktreeStatus = (async () => []) as typeof git.worktreeStatus;
-          git.verifyRunnerTrackingCovers = (async () => true) as typeof git.verifyRunnerTrackingCovers;
-          git.checkpointPack = (async () => null) as typeof git.checkpointPack;
           enteredHold = await ctx.enterCompletionHold!("test completion hold reason");
           if (!enteredHold) throw new Error("completion hold was refused");
           return { branch: ctx.branch, completionHeld: { reason: "test completion hold reason" } };
         },
       },
     }), gitlab, undefined, undefined, { recoveryRetryMs: 1 }).execute(firstClaim);
-    git.worktreeStatus = originalStatus;
-    git.verifyRunnerTrackingCovers = originalVerify;
-    git.checkpointPack = originalPack;
     assert.equal(enteredHold, true, "the server acknowledged a real completion hold");
     assert.equal(api.completionHoldRequests.length, 1);
     assert.equal(api.completionHoldRequests[0]?.runId, claim.run_id);
@@ -489,6 +484,8 @@ it("a retained Codex runner turn adopts the session artifact but starts a fresh 
       executor: (() => {
         const codexExecutor = new CodexExecutor({ debug() {}, info() {}, warn() {}, error() {}, addSecret() {}, removeSecret() {}, child() { return this; } },
         path.join(homeRoot, runId), { binding: selected.binding, client, provider }, {
+          // The runner owns post-model capture and the final registry disposal.
+          deferRegistryTeardown: true,
           sessionStore: {
             ...CodexSessionStore,
             adopt: async (storeDir, codexHome, opts) => {
@@ -522,6 +519,11 @@ it("a retained Codex runner turn adopts the session artifact but starts a fresh 
             const argv = spec.identity === "command"
               ? spec.args.slice(separator + 1) : [spec.command, ...spec.args];
             assert.equal(argv[0], "/usr/bin/git", "only trusted Git boundary invocations are forwarded");
+            const bare = git.barePathFor(fx.originPath);
+            const directoryArg = argv.indexOf("-C");
+            const target = directoryArg >= 0 ? argv[directoryArg + 1] : spec.cwd;
+            assert.equal(spec.identity, target === bare ? "worker_pat" : "command",
+              "bare Git keeps the trusted worker identity; clone Git keeps the command identity");
             assertCaptureLaunch(spec);
             assert.ok(deadline !== undefined && Number.isFinite(deadline) && deadline > 0,
               "Git launch keeps its original finite deadline");
@@ -564,9 +566,6 @@ it("a retained Codex runner turn adopts the session artifact but starts a fresh 
             assert.equal(journal.recovery.source.clonePath, canonical);
             assert.equal(journal.recovery.successor.clonePath, ctx.worktreePath);
             const result = await codexExecutor.run(ctx);
-            git.worktreeStatus = (async () => []) as typeof git.worktreeStatus;
-            git.verifyRunnerTrackingCovers = (async () => true) as typeof git.verifyRunnerTrackingCovers;
-            git.checkpointPack = (async () => null) as typeof git.checkpointPack;
             const held = await ctx.enterCompletionHold!("resumed turn verified");
             assert.equal(held, true, "the resumed turn entered a second completion hold");
             return { ...result, completionHeld: { reason: "resumed turn verified" } };
@@ -599,9 +598,6 @@ it("a retained Codex runner turn adopts the session artifact but starts a fresh 
     assert.equal(api.completionHoldRequests.length, 2, "both completion holds were acknowledged");
   } finally {
     git.normalizeRetainedSourceObjects = originalReadiness;
-    git.worktreeStatus = originalStatus;
-    git.verifyRunnerTrackingCovers = originalVerify;
-    git.checkpointPack = originalPack;
     fs.rmSync(homeRoot, { recursive: true, force: true });
   }
 });

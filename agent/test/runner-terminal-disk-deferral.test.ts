@@ -164,24 +164,38 @@ describe("terminal execution disk deferral", () => {
     it(`Codex supervisor ${mode} must affirmatively enter a successful boundary`, async () => {
       let markers = 0;
       git.commitWipMarker = async () => { markers++; return false; };
+      let captures = 0;
+      let publications = 0;
+      const publish = client.publishCheckpoint.bind(client);
+      client.publishCheckpoint = async (...args) => { publications++; return publish(...args); };
       let boundaries = 0;
+      let callbacks = 0;
       const safety = supervisedSafety(mode);
       const boundary = safety.withBoundary.bind(safety);
       safety.withBoundary = async (request, action) => {
         boundaries++;
-        return boundary(request, action);
+        return boundary(request, permit => { callbacks++; return action(permit); });
       };
+      let sourceHead = "";
       const f = fixture({ safety,
+        afterWork: async ctx => { sourceHead = readGit(ctx.worktreePath, "rev-parse", "HEAD"); },
         runner: { quiesceRun: async () => ({ ...QUIESCENT, process: undefined }) } });
-      await f.runner.execute(f.claim);
+      const capture = git.worktreeStatus.bind(git);
+      git.worktreeStatus = async (...args) => { captures++; return capture(...args); };
+      try { await f.runner.execute(f.claim); }
+      finally { client.publishCheckpoint = publish; git.worktreeStatus = capture; }
       assert.equal(parks().length, mode === "empty" ? 1 : 0);
       assert.equal(markers, mode === "empty" ? 3 : 0);
       assert.equal(fs.existsSync(f.clone()), true);
+      if (mode === "empty") assert.ok(callbacks > 0, "the real safety owner entered protected work");
       if (mode !== "empty") {
-        assert.equal(boundaries, 5, "incomplete settlement consumes the bounded unsafe-proof budget");
-        const failed = api.states.filter(s => s.body.status === "failed");
-        assert.equal(failed.length, 1);
-        assert.equal(failed[0]!.body.fail_origin, "worker_residue_blocked");
+        assert.equal(boundaries, 1, "one unproven boundary stops without renewing admission");
+        assert.equal(callbacks, 0, "missing cleanup authority never enters protected work");
+        assert.equal(readGit(f.clone(), "rev-parse", "HEAD"), sourceHead, "the exact source head is retained");
+        assert.equal(api.codexRequests.length, 0, "no credential refresh or release");
+        assert.equal(captures, 0, "unproven cleanup admits no source capture");
+        assert.equal(publications, 0, "unproven cleanup publishes nothing");
+        assert.equal(api.states.some(s => s.body.status === "failed"), false, "the uncertain source stops retained");
         assert.equal(api.states.some(s => s.body.status === "completed"), false);
         assert.equal(f.forge.calls.length, 0, "no finalize/MR");
         assert.equal(api.completionPermitRequests.length, 0);
@@ -307,8 +321,8 @@ describe("terminal execution disk deferral", () => {
         assert.equal(f.reclaims(), 1, "canonical redispatch never re-enters disk admission");
         assert.equal(settles, 5, "each verification attempt has its own capture scope");
         assert.equal(unverified, 5, "credential deferrals outlive the three-attempt disk capture budget");
-        // Post-WIP deferral follows both the strict drain prerequisite and the source proof.
-        assert.deepEqual(boundaries, location === "post-WIP proof" ? ["shutdown", "shutdown"] : ["shutdown"]);
+        // The post-WIP proof stays inside the original authenticated boundary until deferral.
+        assert.deepEqual(boundaries, ["shutdown"]);
         assert.equal(custodySettles, 0, "custody is retained");
         assert.equal(parks().length, 1);
         assert.equal(parks()[0]!.body.recovery_cause, deferral === "vault_locked" ? "vault_locked" : undefined);

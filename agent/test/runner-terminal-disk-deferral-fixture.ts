@@ -5,7 +5,8 @@ import { execFileSync } from "node:child_process";
 import { DataVolumeGuard } from "../src/disk-full.js";
 import { DiskGovernor } from "../src/cache-cap.js";
 import { type CredentialFreeSettleOutcome, type ExecutorResult, type RunContext } from "../src/executor.js";
-import type { BoundaryPermit, CodexExecutionSafety } from "../src/harness.js";
+import type { CodexExecutionSafety } from "../src/harness.js";
+import { codexRig } from "./runner-codex-sinks-fixture.js";
 import { type ExecutorFactory, type RunnerOptions } from "../src/runner.js";
 import type { QuiesceRunOutcome } from "../src/run-quiescence.js";
 import type { StatfsSample } from "../src/stats.js";
@@ -104,12 +105,13 @@ export async function waitForAbort(signal: AbortSignal): Promise<void> {
   assert.equal(signal.aborted, true, "control reached the running flight");
 }
 export function supervisedSafety(mode: "empty" | "absent" | "incomplete"): CodexExecutionSafety {
+  if (mode === "empty") return codexRig().safety;
+  // Deliberately unregistered facades cannot issue safety-owned cleanup evidence.
   return {
     kind: "codex",
-    withBoundary: async (request, action) => {
+    withBoundary: async () => {
       if (mode === "incomplete") throw new Error("supervisor settlement incomplete");
-      if (mode === "absent") return undefined as never;
-      return await action({ epoch: 1, boundary: request.boundary, signal: new AbortController().signal } as BoundaryPermit);
+      return undefined as never;
     },
     spawnBoundaryProcess: async () => { throw new Error("fixture has no subprocess admission"); },
     dispose: async () => ({ kind: "disposed" }),
