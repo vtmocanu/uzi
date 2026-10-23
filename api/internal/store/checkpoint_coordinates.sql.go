@@ -9,6 +9,7 @@ import (
 	"context"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const enrollCheckpointCoordinates = `-- name: EnrollCheckpointCoordinates :one
@@ -26,6 +27,25 @@ func (q *Queries) EnrollCheckpointCoordinates(ctx context.Context, arg EnrollChe
 	var coordinates []byte
 	err := row.Scan(&coordinates)
 	return coordinates, err
+}
+
+const getClaimCheckpointRecovery = `-- name: GetClaimCheckpointRecovery :one
+SELECT r.checkpoint_tip, r.checkpoint_attested_source,
+       EXISTS (SELECT 1 FROM checkpoint_publish_attempts a WHERE a.run_id = r.id)::boolean AS checkpoint_write_unresolved
+FROM runs r WHERE r.id = $1
+`
+
+type GetClaimCheckpointRecoveryRow struct {
+	CheckpointTip             pgtype.Text `json:"checkpoint_tip"`
+	CheckpointAttestedSource  pgtype.Text `json:"checkpoint_attested_source"`
+	CheckpointWriteUnresolved bool        `json:"checkpoint_write_unresolved"`
+}
+
+func (q *Queries) GetClaimCheckpointRecovery(ctx context.Context, runID uuid.UUID) (GetClaimCheckpointRecoveryRow, error) {
+	row := q.db.QueryRow(ctx, getClaimCheckpointRecovery, runID)
+	var i GetClaimCheckpointRecoveryRow
+	err := row.Scan(&i.CheckpointTip, &i.CheckpointAttestedSource, &i.CheckpointWriteUnresolved)
+	return i, err
 }
 
 const optInCheckpointCoordinates = `-- name: OptInCheckpointCoordinates :exec

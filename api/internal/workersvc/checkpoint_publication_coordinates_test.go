@@ -3,6 +3,7 @@ package workersvc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/google/uuid"
@@ -23,7 +24,7 @@ func TestPublishEnrolledCoordinateFixture(t *testing.T) {
 			run := store.Run{
 				ID: uuid.MustParse(root["id"].(string)), UserID: uuid.New(),
 				RepoID: pgtype.UUID{Bytes: uuid.New(), Valid: true}, Kind: root["kind"].(string),
-				Status: "running",
+				Status: "running", ClaimGeneration: 1,
 			}
 			if branch, ok := root["branch"].(string); ok {
 				run.Branch = pgtype.Text{String: branch, Valid: true}
@@ -74,7 +75,23 @@ func TestPublishEnrolledCoordinateFixture(t *testing.T) {
 			registered := worker()
 			registered.UserID = run.UserID
 			registered.ProtocolCapabilities = []string{capability.TaskCheckpointCoordinatesV1}
-			result, err := svc.Publish(context.Background(), registered, run.ID, testCheckpointTip, []byte("pack"))
+			var generation *int64 // Legacy issue/self_improve publishing remains unstamped.
+			if run.Kind == "task" {
+				generation = &run.ClaimGeneration
+				stale := run.ClaimGeneration + 1
+				for _, refusal := range []struct {
+					generation *int64
+					want       error
+				}{
+					{nil, ErrMissingClaimGeneration}, {&stale, ErrStaleClaim},
+				} {
+					_, err := svc.Publish(context.Background(), registered, run.ID, testCheckpointTip, []byte("pack"), refusal.generation)
+					if !errors.Is(err, refusal.want) || calls != 0 || fs.livePublishAttemptID != uuid.Nil {
+						t.Fatalf("generation refusal: err=%v calls=%d attempt=%s", err, calls, fs.livePublishAttemptID)
+					}
+				}
+			}
+			result, err := svc.Publish(context.Background(), registered, run.ID, testCheckpointTip, []byte("pack"), generation)
 			if err != nil || !result.Published || calls != 1 || result.Ref != "refs/uzi-checkpoints/"+*fixture.CheckpointKey {
 				t.Fatalf("result=%+v calls=%d err=%v", result, calls, err)
 			}
@@ -92,7 +109,7 @@ func TestPublishEnrolledCoordinateFixture(t *testing.T) {
 				}
 				fs.runOwned.CheckpointCoordinates = run.CheckpointCoordinates
 				fs.runOwned.Branch = pgtype.Text{String: "wrong/branch", Valid: true}
-				_, err = svc.Publish(context.Background(), registered, run.ID, testCheckpointTip, []byte("pack"))
+				_, err = svc.Publish(context.Background(), registered, run.ID, testCheckpointTip, []byte("pack"), generation)
 				if err == nil || calls != 1 {
 					t.Fatalf("drift accepted: calls=%d err=%v", calls, err)
 				}

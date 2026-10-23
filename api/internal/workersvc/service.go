@@ -6631,6 +6631,9 @@ func (s *Service) PublishAttested(ctx context.Context, wkr store.Worker, runID u
 		if registered.UserID != owned.UserID || !slices.Contains(registered.ProtocolCapabilities, capability.TaskCheckpointCoordinatesV1) {
 			return PublishResult{Skipped: "unsupported"}, nil
 		}
+		if generation == nil {
+			return PublishResult{}, ErrMissingClaimGeneration
+		}
 	}
 	// Release admission locks before retention locking or forge I/O. Publish needs
 	// the full service dependencies, rather than the claim-control facade.
