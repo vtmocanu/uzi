@@ -11942,7 +11942,7 @@ try {
     if (await read(["rev-parse", "--verify", "HEAD^{commit}"]) !== oldHead + "\n") throw refused();
     const oldCommit = await read(["cat-file", "-p", oldHead]);
     const oldHeaders = oldCommit.slice(0, Math.max(0, oldCommit.indexOf("\n\n"))).split("\n").filter(row => row.startsWith("committer "));
-    const dateMatch = oldHeaders.length === 1 ? /^committer .*> (\d{1,12}) ([+-]\d{4})$/.exec(oldHeaders[0]!) : null;
+    const dateMatch = oldHeaders.length === 1 ? /^committer .*> (0|[1-9]\d{0,11}) ([+-](?:0\d|1[0-4])[0-5]\d)$/.exec(oldHeaders[0]!) : null;
     if (!dateMatch) throw refused();
     const commitDate = `@${dateMatch[1]} ${dateMatch[2]}`;
     const identityEnv: NodeJS.ProcessEnv = {
@@ -11951,6 +11951,8 @@ try {
       GIT_AUTHOR_DATE: commitDate, GIT_COMMITTER_DATE: commitDate,
     };
     const identityLine = `${AGENT_GIT_IDENTITY.name} <${AGENT_GIT_IDENTITY.email}> ${dateMatch[1]} ${dateMatch[2]}`;
+    // W's exact text (treeId is set by write-tree); checked before the CAS and again in P5.
+    const expectedCommit = () => `tree ${treeId}\nparent ${oldHead}\nauthor ${identityLine}\ncommitter ${identityLine}\n\n${subject}\n`;
 
     // P1: initial index proof on the clone's own index; the tracked set T is never re-listed.
     const pin0 = await readPin();
@@ -12135,6 +12137,8 @@ try {
         { env: { ...env, ...identityEnv } });
       if (!/^[0-9a-f]{40}\n$/.test(commitOut)) throw refused();
       newHead = commitOut.slice(0, -1);
+      // Prove W's exact text before the CAS: a header Git normalized must never move the branch.
+      if (await read(["cat-file", "-p", newHead]) !== expectedCommit()) throw refused();
       await repin(pin);
 
       await callbacks.beforeStep("commit", "dispatch");
@@ -12152,7 +12156,7 @@ try {
     // P5: post-capture proof. A failure here refuses with the source retained; no ref is rewound.
     await repin(postTreePin);
     const commit = await read(["cat-file", "-p", newHead]);
-    if (commit !== `tree ${treeId}\nparent ${oldHead}\nauthor ${identityLine}\ncommitter ${identityLine}\n\n${subject}\n`) throw refused();
+    if (commit !== expectedCommit()) throw refused();
     if (await read(["symbolic-ref", "--no-recurse", "HEAD"]) !== branchRef + "\n") throw refused();
     if (await read(["rev-parse", "--verify", "HEAD^{commit}"]) !== newHead + "\n") throw refused();
     if (rows(await read(["status", "--porcelain=v2", "-z", "--untracked-files=all", "--ignore-submodules=none", "--no-renames"]),

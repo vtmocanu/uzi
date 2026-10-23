@@ -96,7 +96,7 @@ describe("guarded maintenance WIP capture", { skip: process.platform !== "linux"
   // W0: the three fixed raw metadata envelopes are replaced by one two-stage hashing pass
   // charged for what it actually reads, so a dirty capture still succeeds with the same
   // 196 MiB of metadataBytes already spent and never launches the old raw envelope helper.
-  test("dirty capture uses three matched 16 MiB raw metadata envelopes without reducing source caps", async t => {
+  test("dirty capture needs no fixed raw metadata envelope and does not reduce source caps", async t => {
     const f = await fixture(t);
     await f.dirty();
     f.run(() => MaintenanceResources.consume("metadataBytes", 196 * 1024 ** 2));
