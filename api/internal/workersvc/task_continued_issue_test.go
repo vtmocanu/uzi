@@ -97,9 +97,14 @@ func TestLinkedTaskValidation(t *testing.T) {
 func TestLinkedTaskBoundedValidation(t *testing.T) {
 	for _, driver := range []forge.Type{forge.TypeGitHub, forge.TypeGitLab, forge.TypeForgejo} {
 		t.Run(string(driver), func(t *testing.T) {
+			issueReceived := make(chan struct{}, 1)
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				if strings.HasSuffix(r.URL.Path, "/issues/17") {
+					select {
+					case issueReceived <- struct{}{}:
+					default:
+					}
 					w.WriteHeader(http.StatusNotFound)
 					w.(http.Flusher).Flush()
 					_, _ = w.Write([]byte("{\"message\":\"" + strings.Repeat("x", 5<<10) + "\"}"))
@@ -119,6 +124,11 @@ func TestLinkedTaskBoundedValidation(t *testing.T) {
 			_, err = svc.CreateTaskRun(context.Background(), uuid.New(), uuid.New(), "task", "", false, false, false, false, &iid)
 			if !errors.Is(err, ErrForgeIssueRead) || fs.taskRunParams != nil {
 				t.Fatalf("oversized validation err=%v inserted=%v", err, fs.taskRunParams != nil)
+			}
+			select {
+			case <-issueReceived:
+			default:
+				t.Fatal("validation failed before the issue endpoint received /issues/17")
 			}
 		})
 	}

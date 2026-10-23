@@ -58,6 +58,46 @@ func TestHandoffIssueForwardAndConflict(t *testing.T) {
 	}
 }
 
+func TestHandoffOmittedIssueKeepsBranch(t *testing.T) {
+	fc := &uzicli.FakeClient{CreatedTaskRun: taskRun("r", "uzi/task/server"), DispatchedRun: taskRun("r", "uzi/task/server")}
+	rec := &handoffRecorder{}
+	env, _ := handoffEnv(fc, rec)
+	_, stderr, code := runCLI(t, env, "handoff", "-m", "ordinary task")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	if fc.LastCreateTaskContinuedIssueIID != nil {
+		t.Fatal("omitted issue became a continuation link")
+	}
+	pushed := false
+	for _, call := range rec.gitCalls {
+		if len(call) > 0 && call[0] == "push" {
+			pushed = true
+			if !strings.Contains(strings.Join(call, " "), "HEAD:refs/heads/uzi/task/server") {
+				t.Fatalf("push changed server branch: %v", call)
+			}
+		}
+	}
+	if !pushed || fc.LastDispatchRunID != "r" {
+		t.Fatalf("push=%v dispatch=%q", pushed, fc.LastDispatchRunID)
+	}
+}
+
+func TestHandoffRunGetJSONUnlinked(t *testing.T) {
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r": {ID: "r", Kind: "task"}}}
+	out, stderr, code := runCLI(t, fakeEnv(fc), "run", "get", "r", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(out), &body); err != nil {
+		t.Fatal(err)
+	}
+	if string(body["continued_issue_iid"]) != "null" || string(body["issue_iid"]) != "null" {
+		t.Fatalf("wrong JSON: %s", out)
+	}
+}
+
 func TestHandoffRunGetJSONContinuedIssue(t *testing.T) {
 	iid := int64(42)
 	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r": {ID: "r", Kind: "task", ContinuedIssueIID: &iid}}}
