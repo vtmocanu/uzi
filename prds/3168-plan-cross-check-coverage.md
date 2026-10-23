@@ -1,10 +1,10 @@
 # PRD #3168: Plan cross-check coverage account
 
-**Status**: Draft, redesigned 2026-10-23 as advisory (see Decision Log). Child 3 of 3 under umbrella #3165 (Deeper, observable cross-check). PRD #3166 is done (2026-10-21). M1 has no blocker and lands before PRD #3167 M2 and M3a (same file; see Coordination). M1 is delivered through a child issue whose PR closes only the child; this issue stays open for M2. M2 is blocked by PRD #3167 M1 (replay harness).
+**Status**: M1 code implemented and focused-tested/reviewed; documentation updated, required gates pending (2026-10-23). M1 remains unchecked until P3 validation evidence is complete. Redesigned 2026-10-23 as advisory (see Decision Log). Child 3 of 3 under umbrella #3165 (Deeper, observable cross-check). PRD #3166 is done (2026-10-21). M1 has no implementation dependency and lands before PRD #3167 M2 and M3a (same file; see Coordination). M1 is delivered through child #3334, whose PR closes only the child; this issue stays open for M2. M2 is blocked by PRD #3167 M1 (replay harness).
 
 Resolved facts below were re-read at `main` `72c97fc7`.
 
-## Problem
+## Problem (pre-M1 baseline)
 
 A Plan cross-check APPROVE gates implementation of an auto-approved plan, but nothing says which of the issue's requirements the plan covers:
 
@@ -58,7 +58,7 @@ Acceptance examples:
   - This deliberately widens delivery to every item of an approving verdict, defect `info` and `warning` items included, not only coverage.
   - No item category field and no wire, API, schema or capability change: `validateVerdict` (`agent/src/codex/cross-check.ts`), the client findings decoder and `NormalizeCrossCheckFindings` (`api/internal/workersvc/cross_check_findings.go`) stay unchanged.
   - Best-effort: held in worker memory, not re-delivered after a reclaim. When the dormant semantic human gate drops `checkedApproval`, nothing new reaches the lead; this is a documented limitation.
-- **Trust and scope.** Notes are nonce-fenced untrusted advice with `buildAutomaticRevisionPrompt`'s fencing (nonce retry, entity-escape fallback) and wording: verify against the code and issue, decline conflicting suggestions, keep existing permissions. One fence implementation shared by both prompts, not a copy. The lead may implement an omitted requirement only within the issue's stated scope and must name it in the PR description; code cross-check reviews it. `buildAutomaticRevisionPrompt("code", ...)` output stays byte-identical.
+- **Trust and scope.** Notes are nonce-fenced untrusted advice with `buildAutomaticRevisionPrompt`'s fencing (nonce retry, entity-escape fallback) and wording: verify against the code and issue, decline conflicting suggestions, keep existing permissions. One fence implementation shared by both prompts, not a copy. The lead may implement an omitted requirement only within the issue's stated scope and must name it in the PR description; code cross-check reviews it when enabled. Scope, permissions and canonical-plan authority apply independently of that opt-in. `buildAutomaticRevisionPrompt("code", ...)` output stays byte-identical.
 - **Docs.** `docs/cross-check.md` ("implements exactly the approved checked plan") and the matching `ARCHITECTURE.md` sentence state that an approval may carry advisory notes, that coverage never revises or blocks, and the in-scope implementation rule; then `task docs:sync`. A dated amendment to `adr/2149-cross-check.md`.
 - **Evaluation (M2).** Reuses PRD #3167's replay harness with a plan corpus (including #2888 at its pre-fix snapshot), the pre-M1 brief pinned by commit, N repeats per family: approve/revise/block rates, coverage warnings judged true or false, cost, latency and timeout rate.
 
@@ -83,10 +83,30 @@ Acceptance examples:
 - [ ] **M1: Advisory coverage in plan checks, delivered on approve.** Brief, revision prompt, approve delivery, tests, docs and `task docs:sync`, dated ADR-2149 amendment, changelog fragment, and the `specs/human.md` lines on plan cross-check (dispositions and fenced advice, ~211-213) updated with an `(AI-synced YYYY-MM-DD)` entry: coverage notes are advisory, a missing coverage disposition alone is not REVISE, an approval's findings reach the lead as fenced advice, and the safety carve-out. Delivered through a child issue whose PR closes only that child. Blocked by: none (rebase onto #3097 if it lands first). Acceptance: examples 1-4 at instruction and delivery level; the tests above; gates `task gate:agent`, `task gate:api` (docs mirror, `TestEmbeddedDocsMatchSource`), `task check-docs:web`, `task gate:repo`.
 - [ ] **M2: Measure coverage advice.** Maintainer replay of the pre-M1 and M1 briefs on the plan corpus, per family. Blocked by: M1, PRD #3167 M1. Extends the PRD #3167 harness to build plan-stage claims (candidate, planning diff, round) if its M1 does not. Acceptance: aggregate posted on this issue, coverage warnings judged true or false, unmeasured items named; this issue closes with M2.
 
+### M1 progress (2026-10-23, child #3334)
+
+Code is implemented and focused-tested/reviewed; the P2 documentation update
+records the instruction and delivery contract. Required validation is incomplete,
+so M1 remains unchecked and is fully delivered only after P3 evidence. The
+reported `task gate:agent` at `89df35b0` completed 664 unit files but failed
+with 18 failures and one cancellation in
+`agent/test/git-maintenance-private-verification.test.ts` (log
+`.uzi/scratch/gate-log.rvBJqS`). The first failure was reproduced on base
+`7501b6b6` and candidate isolated exports (logs ending `RW8zzL` and `RTGqeD`);
+the remaining failures have not individually been proven to occur on base.
+This is not a passing gate. P2's `task check-docs:web` passed: 77 docs,
+48 length warnings. `task docs:sync`, source/mirror byte comparison, fragment
+validation and `git diff --check HEAD` passed. The focused
+`go test ./internal/uzidocs -run '^TestEmbeddedDocsMatchSource$' -count=1`
+from `api/` passed. Required full API and repository gates have not run yet;
+P3 validation remains pending. No maintainer replay is required for child #3334.
+M2 remains unchecked and unmeasured, parent #3168 stays open, and this PRD
+remains in place.
+
 ## Risks
 
 - Noise: every approval may now carry notes. Mitigated by the advisory wording, the 20-item cap with defects first, and the scope rule.
-- Widened delivery: approve-verdict defect notes now reach the lead, which may over-act on them. The scope rule and the code cross-check bound it.
+- Widened delivery: approve-verdict defect notes now reach the lead, which may over-act on them. The scope rule, existing permissions and canonical-plan authority bound it independently; code cross-check reviews the implementation when enabled.
 - The checker may omit the marker, mark a defect, or call for REVISE on coverage anyway. The marker is an instruction convention, never parsed to rewrite a verdict; fixtures pin instructions only, and M2 reports misclassifications.
 - Rollout, worker-only: an old lead worker discards approve items as today; an old checker sends no coverage items and the new lead renders whatever items arrive. Both orders are safe; no API change.
 

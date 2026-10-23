@@ -647,7 +647,10 @@ permitted scratch relocation alone is not a validation bypass or proof of
 harmlessness. Complete automatic revisions include `Cross-check dispositions`
 for every immediately preceding delivered item, with addressed location/method
 or declined rationale and inspectable evidence. The checker considers supported
-declines; round 2+ omissions mean REVISE, never BLOCK solely for omission.
+declines; round 2+ missing/incomplete defect dispositions mean REVISE, never
+BLOCK solely for omission. Missing or declined prior coverage dispositions
+alone never justify REVISE or BLOCK; a supported decline cannot waive a
+mandatory defect requirement.
 Uninspectable instruction claims remain explicitly unverified and cannot alone
 establish an exception to inspectable requirements; precedence is unchanged.
 This prompt contract adds no parser, fields, transport, history or authority:
@@ -656,11 +659,47 @@ dispositions are untrusted content within the exact candidate digest. See
 [#3091 amendment](adr/2149-cross-check.md#default-and-plan-prompt-amendment-2026-10-17-3091).
 Exhaustion, BLOCK, timeout
 and other failures keep their fallbacks. A Codex lead consumes automatic
-rounds without spending its human revision budget and implements exactly the
-acknowledged checked plan; its submit requires its worker to advertise
+rounds without spending its human revision budget and implements from the
+acknowledged canonical checked plan, which remains authoritative. Both lead
+families also receive approving findings as described below. Its submit
+requires its worker to advertise
 `cross_check_codex_lead_v1` and the api must send the claim field
 `plan_cross_check_codex_lead`, otherwise it keeps the older
 `codex_lead_unsupported` park to a human gate.
+
+The shared checker brief asks both families to enumerate requirements from the
+issue snapshot and linked repository PRDs with existing tools, deadlines and
+read/search limits; comments are not supplied and URLs are not fetched.
+Omitted/partly covered requirements use warning `Requirement gap:`; hosted,
+live or maintainer-only verification uses info `Coverage uncertainty:`.
+Every coverage item uses one of these prefixes; defects never use either.
+Missing/external/unreadable/oversized sources get a summary uncertainty note,
+never a covered claim. No defect found does not establish coverage. Omitted
+stated safety, security or data-integrity constraints remain error defects,
+without coverage prefixes, requiring REVISE under existing defect rules.
+Coverage alone never justifies REVISE or BLOCK. Defects take priority within
+the 20-item cap; spare slots hold coverage, with overflow summarized literally
+as `N coverage notes omitted`. Coverage and its count do not displace defects.
+
+The worker passes every approving item (including noncoverage warning/info)
+and the complete bounded summary, including summary-only findings, to both
+executors' implementation prompts through the shared nonce fence. Absent/null
+findings or empty summary plus empty items preserve prompt bytes. This is
+untrusted, non-gating advice: verify against code, issue and uzi rules, decline
+conflicts with reasons, and retain permissions and constraints. The canonical
+plan remains authoritative; omitted requirements may be implemented only
+within issue scope and must be disclosed in the PR description. Code
+cross-check reviews the implementation when enabled; scope, permissions and
+canonical authority apply independently. No extra gate, re-plan or round is
+introduced. Advice is worker-local and lost on reclaim; the dormant semantic
+human-gate path drops it when it drops the checker approval. Old lead workers
+discard approving findings; old checkers supply no new coverage account, and
+new leads render the findings received. These instruction contracts do not
+prove model convergence. No wire/API/schema, capability or persistence change
+is introduced; code-stage revision prompt bytes remain unchanged. See
+[PRD #3168](prds/3168-plan-cross-check-coverage.md) and the
+[2026-10-23 amendment](adr/2149-cross-check.md#advisory-plan-coverage-amendment-2026-10-23-3334--3168-m1)
+for rationale and validation boundaries.
 
 Recovery follows the 2026-10-07 preserve-decided-fallback decision in
 [PRD #2150 D8](prds/done/2150-plan-cross-check-auto-revise.md#decision-log).
