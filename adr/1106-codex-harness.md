@@ -947,10 +947,10 @@ and the stable-to-stable source diff for the consumed paths:
   acts only when a turn requests an explicit access program, and uzi requests
   none. `instant_interrupt` was already on in 0.162.1.
 - A resumed thread restores its saved permission profile and network grants
-  before validation, and explicit overrides keep precedence. Uzi re-asserts
-  `approvalPolicy: "never"`, explicit `untrusted` project trust and
-  `environments: []` on every turn, and the cold-resume native-denial proof
-  stays required.
+  before validation, and explicit overrides keep precedence. Uzi sets
+  `approvalPolicy: "never"` and explicit `untrusted` project trust on every
+  thread start and resume, and sends `environments: []` on every turn. The
+  cold-resume native-denial proof stays required.
 - Incomplete responses (for example `max_output_tokens`) are now terminal and
   non-retryable. They reach the app-server as `codexErrorInfo: "other"`, which
   uzi's closed map already classifies as `unknown`. The app-server
