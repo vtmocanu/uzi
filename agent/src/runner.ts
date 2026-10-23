@@ -7087,10 +7087,14 @@ export class RunRunner {
     ): Promise<void> => {
       const episode = this.newCaptureEpisode(flight, heldCapture?.deadlineAt);
       let finishing = false;
+      let captureSignal: AbortSignal | undefined;
       try {
-        const capture = (scoped?: HeldAuthenticatedCapture) => this.enterCompletionHold(flight, claim, holdReason, runLog, {
-          ...options, signal: scoped?.signal ?? options.signal, episode, heldAuthenticated: scoped,
-        });
+        const capture = (scoped?: HeldAuthenticatedCapture) => {
+          captureSignal = scoped?.signal;
+          return this.enterCompletionHold(flight, claim, holdReason, runLog, {
+            ...options, signal: scoped?.signal ?? options.signal, episode, heldAuthenticated: scoped,
+          });
+        };
         const held = heldCapture
           ? await this.withAuthenticatedCaptureProof(flight, heldCapture.permit, episode.healthyDeadlineAt, capture)
           : await capture();
@@ -7105,7 +7109,8 @@ export class RunRunner {
         this.captureAuthority(flight, Infinity);
         if (canonicalRecoveryInterruption(error) && !isCodexBoundaryError(error) &&
             !(error instanceof TrustedExecutionRefusal) && codexDeferralOf(error) === undefined &&
-            !(error instanceof RunResidueBlockedError)) throw error;
+            !(error instanceof RunResidueBlockedError) &&
+            !(captureSignal?.aborted && error === captureSignal.reason)) throw error;
         if (captureContinuation.pending) throw error;
         captureContinuation.pending = async () => {
           this.captureAuthority(flight, Infinity);
@@ -15133,7 +15138,8 @@ export class RunRunner {
               catch (error) {
                 interrupted = canonicalRecoveryInterruption(error) && !isCodexBoundaryError(error) &&
                   !(error instanceof TrustedExecutionRefusal) && codexDeferralOf(error) === undefined &&
-                  !(error instanceof RunResidueBlockedError);
+                  !(error instanceof RunResidueBlockedError) &&
+                  !(held.signal.aborted && error === held.signal.reason);
                 interruption = error;
                 throw error;
               }
