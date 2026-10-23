@@ -11710,7 +11710,8 @@ export class GitCache {
    * quiescence, output and permit checks; this grants no producer authority and
    * does not bound Git/filter input. No discovery or unsupervised fallback.
    */
-  private async maintenanceWipInput(
+  // The maintenance capture no longer calls this (W0-H, #3349); it is retained with its direct tests.
+  async maintenanceWipInput(
     cwd: string,
     limits: { sourceBytes?: number; sourceEntries?: number; metadataBytes?: number } = {},
     expectedIndex = "",
@@ -11826,7 +11827,7 @@ export class GitCache {
       ["maintenance.auto", "false"], ["gc.auto", "0"], ["commit.gpgsign", "false"],
       ...GIT_CODE_EXEC_KEY_PINS.map(([key, value]) => [key.toLowerCase(), value] as [string, string]),
     ]);
-    const safety = async (): Promise<string> => {
+    const configCheck = async (): Promise<void> => {
       check();
       // The fixed helper has five realpath calls and at most fifteen lstat
       // calls. Charge every call for the entire canonical path: cloneDepth
@@ -11851,6 +11852,7 @@ try {
     const st = fs.lstatSync(path.join(git, name));
     if (!st.isFile() || st.isSymbolicLink()) throw Error();
   }
+  try { fs.lstatSync(path.join(git, "index.lock")); throw Error(); } catch (e) { if (e.code !== "ENOENT") throw e; }
   for (const name of ["info", "objects", "refs"]) {
     const p = path.join(git, name);
     if (!fs.lstatSync(p).isDirectory() || fs.realpathSync(p) !== p) throw Error();
@@ -11876,118 +11878,290 @@ try {
         if (fixed.has(key)) { if (fixed.get(key) !== value) throw refused(); }
         else if (!/^(user\.(name|email)|remote\.[^.]+\.(url|fetch)|branch\.[^.]+\.(remote|merge))$/.test(key)) throw refused();
       }
-      if (await read(["rev-parse", "--shared-index-path"]) !== "") throw refused();
-      const staged = await read(["ls-files", "--stage", "-z"]);
-      for (const row of rows(staged, "sourceEntries")) {
-        if (!/^(100644|100755|120000) [0-9a-f]{40} 0\t[^\0]+$/.test(row)) throw refused();
-      }
-      for (const row of rows(await read(["ls-files", "-v", "-z"]), "sourceEntries")) {
-        if (!/^H [^\0]+$/.test(row)) throw refused();
-      }
-      if (await read(["rev-parse", "--verify", "HEAD^{commit}"]) !== oldHead + "\n") throw refused();
-      return staged;
     };
-    // issue #3239: the marker never carries a core file or a blob over WIP_CAPTURE_MAX_FILE_BYTES.
-    // Staged entries that differ from HEAD are checked before the commit dispatches (one
-    // batched size read); any hit refuses, so the caller keeps the source. No filenames escape.
-    const omitted = async (staged: string): Promise<void> => {
-      const head = new Set(headIndex ? headIndex.slice(0, -1).split("\0") : []);
-      const oids: string[] = [];
-      for (const row of staged ? staged.slice(0, -1).split("\0") : []) {
-        if (head.has(row)) continue;
-        const match = /^(100644|100755|120000) ([0-9a-f]{40}) 0\t([^\0]+)$/.exec(row);
-        if (!match || WIP_CORE_FILE_RE.test(path.posix.basename(match[3]!))) throw refused();
-        oids.push(match[2]!);
-      }
-      const uniq = [...new Set(oids)];
-      if (uniq.length === 0) return;
+    const helper = async (script: string, args: string[], input: string | undefined, maxBuffer: number): Promise<string> => {
       check();
-      let out: string;
+      let result: { stdout: string; stderr: string };
       try {
-        out = await this.runGitAsRunner(clonePath, [...pins, "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"],
-          { env, input: uniq.join("\n") + "\n" });
+        result = await this.execScoped(process.execPath, ["-e", script, ...args], {
+          cwd: "/", env: unmarkedSpawnEnv({ ...gitEnv(), PATH: runnerPath() }), timeout: 30000, maxBuffer,
+          ...(input === undefined ? {} : { input }),
+        }, "command");
       } catch { throw refused(); }
-      const lines = rows(out.replaceAll("\n", "\0"), "sourceEntries");
-      if (lines.length !== uniq.length) throw refused();
-      for (let i = 0; i < uniq.length; i++) {
-        const match = /^([0-9a-f]{40}) blob ([0-9]+)$/.exec(lines[i]!);
-        if (!match || match[1] !== uniq[i] || Number(match[2]) > WIP_CAPTURE_MAX_FILE_BYTES) throw refused();
-      }
+      check();
+      if (result.stderr) throw refused();
+      return result.stdout;
     };
-    let sourceDigest: string | undefined;
-    let headIndex = "";
-    let commitIndex = "";
-    // Three attempts maximum, sharing the original scope/counters/deadline.
-    // Any refusal stops the sequence; no reset, fence clearing or retry.
-    for (const step of ["status", "add", "commit"] as const) {
-      await callbacks.beforeStep(step, "prepare");
-      check();
-      const index = await safety();
-      if (step === "status") {
-        headIndex = rows(await read(["ls-tree", "-r", "-z", oldHead]), "sourceEntries").map(row => {
-          const match = /^(100644|100755|120000) blob ([0-9a-f]{40})\t([^\0]+)$/.exec(row);
-          if (!match) throw refused();
-          MaintenanceResources.consume("metadataBytes", 4 * row.length + 32);
-          return match[1] + " " + match[2] + " 0\t" + match[3] + "\0";
-        }).join("");
-      }
-      if (step === "commit") await omitted(index);
-      // Compare on the same raw byte pass: HEAD for clean, staged blobs before commit.
-      // No fourth enumeration, smaller blob limit, or additional source reservation.
-      const input = await this.maintenanceWipInput(clonePath, { metadataBytes: 16 * 1024 ** 2 }, step === "status" ? headIndex : step === "commit" ? index : "");
-      if (step === "commit" && !input.agrees) throw refused();
-      if (sourceDigest !== undefined && sourceDigest !== input.digest) throw refused();
-      sourceDigest = input.digest;
-      await callbacks.beforeStep(step, "dispatch");
-      check(); // Fresh eligibility/slot/signal check immediately before dispatch.
-      let output: string;
-      try {
-        output = await this.runGitAsRunner(clonePath, [...pins, ...(step === "status"
-          ? ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"]
-          : step === "add" ? ["add", "-A"] : ["commit", "-m", subject])], { env });
-      } finally {
-        await callbacks.afterRunnerGit(step);
-      }
-      check();
-      if (step === "status") {
-        if (output === "") {
-          if (!input.agrees || index !== headIndex) throw refused();
-          if (await read(["rev-parse", "--verify", "HEAD^{commit}"]) !== oldHead + "\n") throw refused();
-          return { kind: "clean", head: oldHead, parent: null };
-        }
-        const statusRows = rows(output, "sourceEntries");
-        for (let i = 0; i < statusRows.length; i++) {
-          const row = statusRows[i]!;
-          if (!/^(?:\?\?|[ MTADRC]{2}) [^\0]+$/.test(row) || row.startsWith("  ")) throw refused();
-          if (row[0] === "R" || row[0] === "C" || row[1] === "R" || row[1] === "C") {
-            if (!statusRows[++i]) throw refused();
-          }
-        }
-      }
-      if (step === "commit") commitIndex = index;
-    }
-    const headOutput = await read(["rev-parse", "--verify", "HEAD^{commit}"]);
-    if (headOutput.length !== 41 || !/^[0-9a-f]{40}\n$/.test(headOutput)) throw refused();
-    const head = headOutput.slice(0, -1);
-    if (head === oldHead) throw refused();
-    const commit = await read(["cat-file", "commit", head]);
-    const separator = commit.indexOf("\n\n");
-    if (separator < 0) throw refused();
-    const headers = commit.slice(0, separator).split("\n");
-    const parents = headers.filter(row => row.startsWith("parent "));
-    if (parents.length !== 1 || parents[0] !== "parent " + oldHead ||
-        commit.slice(separator + 2) !== subject + "\n") throw refused();
-    const index = await read(["ls-files", "--stage", "-z"]);
-    rows(index, "sourceEntries");
-    if (index !== commitIndex) throw refused();
-    const tree = rows(await read(["ls-tree", "-r", "-z", head]), "sourceEntries");
-    const expected = tree.map(row => {
-      const match = /^(100644|100755|120000) blob ([0-9a-f]{40})\t([^\0]+)$/.exec(row);
+    // Index identity pin: dev/ino/size/mtime/ctime plus the trailing checksum. No index parsing.
+    // Every identity/checksum read is charged at the index size it just read.
+    const readPin = async (): Promise<string> => {
+      const match = /^(\d+ \d+ (\d+) \d+ \d+ [0-9a-f]{40})\n$/.exec(
+        await helper(MAINTENANCE_WIP_PIN_HELPER, [clonePath], undefined, 160));
       if (!match) throw refused();
-      return match[1] + " " + match[2] + " 0\t" + match[3] + "\0";
-    }).join("");
-    if (expected !== index) throw refused();
-    return { kind: "committed", head, parent: oldHead };
+      MaintenanceResources.consume("metadataBytes", Number(match[2]));
+      return match[1]!;
+    };
+    const repin = async (reference: string): Promise<void> => {
+      if (await readPin() !== reference) throw refused();
+    };
+    // A helper stage is charged BEFORE it launches and never refunded: sourceEntries per
+    // lstat/open/read step, sourceBytes for the payload, adminEntries once per distinct
+    // directory (root included) and metadataBytes per path (+1 KiB bookkeeping).
+    const charge = (paths: readonly string[], entriesPer: number, payloadBytes: number) => {
+      MaintenanceResources.consume("sourceEntries", entriesPer * paths.length);
+      MaintenanceResources.consume("sourceBytes", payloadBytes);
+      // The helper also walks the clone path's own ancestors (and "/") to reach the root.
+      MaintenanceResources.consume("adminEntries", wipDirectoryCount(paths) + cloneDepth + 1);
+      let metadata = 0;
+      for (const p of paths) metadata += Buffer.byteLength(p, "utf8") + 1024;
+      MaintenanceResources.consume("metadataBytes", metadata);
+    };
+    // Stage 1 (and the race rechecks): no-follow lstat of every path through O_PATH ancestors.
+    const census = async (paths: readonly string[], allow: readonly boolean[]): Promise<string[]> => {
+      charge(paths, 1, 0);
+      const out = await helper(MAINTENANCE_WIP_CENSUS_HELPER, [clonePath],
+        JSON.stringify(paths.map((p, i) => [p, allow[i] ? 1 : 0])), 160 * paths.length + 64);
+      const lines = out.split("\n");
+      if (lines.pop() !== "" || lines.length !== paths.length) throw refused();
+      return lines;
+    };
+    const wipPolicy = (p: string, size: number): boolean =>
+      WIP_CORE_FILE_RE.test(path.posix.basename(p)) || size > WIP_CAPTURE_MAX_FILE_BYTES;
+
+    // P0: O(1) checks.
+    await callbacks.beforeStep("status", "prepare");
+    check();
+    await configCheck();
+    if (await read(["rev-parse", "--shared-index-path"]) !== "") throw refused();
+    const branchMatch = /^refs\/heads\/([^\n]+)\n$/.exec(await read(["symbolic-ref", "--no-recurse", "HEAD"]));
+    if (!branchMatch || !wipBranchValid(branchMatch[1]!)) throw refused();
+    const branchRef = "refs/heads/" + branchMatch[1]!;
+    const branchRow = await read(["for-each-ref", "--format=%(refname)%00%(symref)%00%(objectname)", branchRef]);
+    MaintenanceResources.consume("sourceEntries", 1);
+    if (branchRow !== branchRef + "\0\0" + oldHead + "\n") throw refused();
+    if (await read(["rev-parse", "--verify", "HEAD^{commit}"]) !== oldHead + "\n") throw refused();
+    const oldCommit = await read(["cat-file", "-p", oldHead]);
+    const oldHeaders = oldCommit.slice(0, Math.max(0, oldCommit.indexOf("\n\n"))).split("\n").filter(row => row.startsWith("committer "));
+    const dateMatch = oldHeaders.length === 1 ? /^committer .*> (\d{1,12}) ([+-]\d{4})$/.exec(oldHeaders[0]!) : null;
+    if (!dateMatch) throw refused();
+    const commitDate = `@${dateMatch[1]} ${dateMatch[2]}`;
+    const identityEnv: NodeJS.ProcessEnv = {
+      GIT_AUTHOR_NAME: AGENT_GIT_IDENTITY.name, GIT_AUTHOR_EMAIL: AGENT_GIT_IDENTITY.email,
+      GIT_COMMITTER_NAME: AGENT_GIT_IDENTITY.name, GIT_COMMITTER_EMAIL: AGENT_GIT_IDENTITY.email,
+      GIT_AUTHOR_DATE: commitDate, GIT_COMMITTER_DATE: commitDate,
+    };
+    const identityLine = `${AGENT_GIT_IDENTITY.name} <${AGENT_GIT_IDENTITY.email}> ${dateMatch[1]} ${dateMatch[2]}`;
+
+    // P1: initial index proof on the clone's own index; the tracked set T is never re-listed.
+    const pin0 = await readPin();
+    const T = new Map<string, string>();
+    for (const row of rows(await read(["ls-files", "--stage", "-z"]), "sourceEntries")) {
+      const match = /^(100644|100755|120000) ([0-9a-f]{40}) 0\t([^\0]+)$/.exec(row);
+      if (!match || !wipPathValid(match[3]!) || T.has(match[3]!)) throw refused();
+      T.set(match[3]!, match[1] + " " + match[2]);
+    }
+    const flagRows = rows(await read(["ls-files", "-v", "-z"]), "sourceEntries");
+    if (flagRows.length !== T.size) throw refused();
+    let flagged = 0;
+    for (const p of T.keys()) if (flagRows[flagged++] !== "H " + p) throw refused();
+    await repin(pin0);
+
+    // P2 + P3: change manifest, then hash every path of T and U before the status step is joined.
+    await callbacks.beforeStep("status", "dispatch");
+    await repin(pin0);
+    await configCheck();
+    let statusAttempted = false, clean = false;
+    const delta = new Map<string, [string, string]>();
+    const race: { paths: string[]; allow: boolean[]; lines: string[] } = { paths: [], allow: [], lines: [] };
+    try {
+      statusAttempted = true;
+      check();
+      const statusOut = await this.runGitAsRunner(clonePath, [...pins, "status", "--porcelain=v2", "-z",
+        "--untracked-files=all", "--ignore-submodules=none", "--no-renames"], { env });
+      await repin(pin0);
+      const diffOut = await read(["diff-index", "--cached", "-z", "--raw", "--no-renames", oldHead]);
+      await repin(pin0);
+      const manifest = new Map<string, { staged: boolean; worktreeMode: string; head: string }>();
+      const untracked = new Set<string>();
+      for (const row of rows(statusOut, "sourceEntries")) {
+        if (row.startsWith("? ")) {
+          const p = row.slice(2);
+          if (p.endsWith("/") || !wipPathValid(p) || untracked.has(p) || T.has(p)) throw refused();
+          untracked.add(p);
+          continue;
+        }
+        const match = /^1 ([.MTAD]{2}) N\.\.\. (000000|100644|100755|120000) (000000|100644|100755|120000) (000000|100644|100755|120000) ([0-9a-f]{40}) ([0-9a-f]{40}) ([^\0]+)$/.exec(row);
+        if (!match || match[1] === ".." || !wipPathValid(match[7]!) || manifest.has(match[7]!)) throw refused();
+        const p = match[7]!, tracked = T.get(p);
+        // The status view of the index must agree with the single P1 listing.
+        if (tracked === undefined ? match[3] !== "000000" || match[6] !== WIP_ZERO_OID : tracked !== match[3] + " " + match[6])
+          throw refused();
+        manifest.set(p, { staged: match[1]![0] !== ".", worktreeMode: match[4]!, head: match[2] + " " + match[5] });
+      }
+      const staged = wipParseRawDiff(rows(diffOut, "sourceEntries"));
+      if (!staged) throw refused();
+      for (const p of staged.keys()) if (manifest.get(p)?.staged !== true) throw refused();
+      const headTuple = (p: string): string => staged.get(p)?.[0] ?? T.get(p) ?? WIP_ABSENT;
+      for (const [p, row] of manifest) if (row.staged !== staged.has(p) || row.head !== headTuple(p)) throw refused();
+
+      const universe = [...T.keys(), ...untracked];
+      const allow = universe.map(p => manifest.get(p)?.worktreeMode === "000000");
+      const lines = universe.length ? await census(universe, allow) : [];
+      if (universe.length) await repin(pin0);
+      const sizes: number[] = [];
+      const present: number[] = [];
+      let total = 0;
+      lines.forEach((line, i) => {
+        if (line === "a") { if (!allow[i]) throw refused(); sizes.push(0); return; }
+        const match = /^([fl]) ([01]) (\d+) \d+ \d+ \d+ \d+$/.exec(line);
+        if (!match) throw refused();
+        const size = Number(match[3]);
+        if (!Number.isSafeInteger(size)) throw refused();
+        sizes.push(size); present.push(i); total += size;
+      });
+      const worktree = new Map<string, string>();
+      if (present.length) {
+        const readPaths = present.map(i => universe[i]!);
+        charge(readPaths, 4, total);
+        const hashed = await helper(MAINTENANCE_WIP_PAYLOAD_HELPER, [clonePath, String(total)],
+          JSON.stringify(present.map(i => [universe[i], lines[i]])), 96 * present.length + 64);
+        const out = hashed.split("\n");
+        if (out.pop() !== "" || out.length !== present.length) throw refused();
+        out.forEach((row, n) => {
+          const match = /^(100644|100755|120000) [0-9a-f]{40}$/.exec(row);
+          const line = lines[present[n]!]!;
+          if (!match || match[1] !== (line[0] === "l" ? "120000" : line[2] === "1" ? "100755" : "100644")) throw refused();
+          worktree.set(universe[present[n]!]!, row);
+        });
+        await repin(pin0);
+      }
+      // The stat cache is never trusted: an undeclared tracked difference refuses.
+      for (const p of T.keys()) {
+        if (!manifest.has(p) && worktree.get(p) !== T.get(p)) throw refused();
+      }
+      for (const [p, row] of manifest) {
+        const tuple = worktree.get(p);
+        // A path removed from the index but kept on disk is also a `?` row; its hash is the worktree side.
+        if (row.worktreeMode === "000000" ? tuple !== undefined && !untracked.has(p)
+            : tuple === undefined || !tuple.startsWith(row.worktreeMode + " "))
+          throw refused();
+      }
+      for (const p of new Set([...universe, ...staged.keys()])) {
+        const current = worktree.get(p) ?? WIP_ABSENT, base = headTuple(p);
+        if (current !== base) delta.set(p, [base, current]);
+      }
+      if (manifest.size === 0 && untracked.size === 0 && staged.size === 0) {
+        if (await read(["rev-parse", "--verify", "HEAD^{commit}"]) !== oldHead + "\n") throw refused();
+        await repin(pin0);
+        clean = true;
+      } else {
+        if (delta.size === 0) throw refused(); // staged and unstaged changes cancel out: nothing to commit
+        const sizeOf = new Map(universe.map((p, i) => [p, sizes[i]!] as [string, number]));
+        for (const [p, [, current]] of delta) {
+          if (current !== WIP_ABSENT && wipPolicy(p, sizeOf.get(p) ?? 0)) throw refused();
+        }
+        universe.forEach((p, i) => {
+          if (!manifest.has(p) && !untracked.has(p)) return;
+          race.paths.push(p); race.allow.push(allow[i]!); race.lines.push(lines[i]!);
+        });
+      }
+    } finally {
+      if (statusAttempted) await callbacks.afterRunnerGit("status");
+    }
+    if (clean) return { kind: "clean", head: oldHead, parent: null };
+    await repin(pin0);
+    const raceRecheck = async (): Promise<void> => {
+      if (race.paths.length === 0) return;
+      const current = await census(race.paths, race.allow);
+      for (let i = 0; i < current.length; i++) if (current[i] !== race.lines[i]) throw refused();
+    };
+    const sameDelta = (actual: Map<string, [string, string]> | null): boolean => {
+      if (!actual || actual.size !== delta.size) return false;
+      for (const [p, [base, current]] of delta) {
+        const row = actual.get(p);
+        if (!row || row[0] !== base || row[1] !== current) return false;
+      }
+      return true;
+    };
+
+    // P4a: add -A (takes index.lock). The original pin is rechecked immediately before the launch.
+    await callbacks.beforeStep("add", "prepare");
+    check();
+    await callbacks.beforeStep("add", "dispatch");
+    await repin(pin0);
+    await configCheck();
+    await raceRecheck();
+    await repin(pin0);
+    let pinAdd: string;
+    try {
+      check();
+      await this.runGitAsRunner(clonePath, [...pins, "add", "-A"], { env });
+      pinAdd = await readPin(); // first sanctioned index transition, captured in add's scope
+    } finally {
+      await callbacks.afterRunnerGit("add");
+    }
+    await repin(pinAdd);
+
+    // P4b: plumbing commit. Each mutating launch has its own (commit, dispatch) callback.
+    await callbacks.beforeStep("commit", "prepare");
+    check();
+    const hookPins = ["-c", `core.hooksPath=${EMPTY_GIT_HOOKS_DIR}`];
+    let attempted = false;
+    let newHead = "", treeId = "", postTreePin = "";
+    try {
+      let pin = pinAdd;
+      await repin(pin);
+      await callbacks.beforeStep("commit", "dispatch");
+      await repin(pin);
+      await configCheck();
+      await raceRecheck();
+      await repin(pin);
+      attempted = true;
+      check();
+      const treeOut = await this.runGitAsRunner(clonePath, [...pins, "write-tree"], { env });
+      if (!/^[0-9a-f]{40}\n$/.test(treeOut)) throw refused();
+      const tree = treeId = treeOut.slice(0, -1);
+      pin = postTreePin = await readPin(); // second sanctioned index transition (stale cache-tree rewrite)
+      if (!sameDelta(wipParseRawDiff(rows(await read(["diff-tree", "-r", "--raw", "-z", "--no-renames", oldHead, tree]), "sourceEntries"))))
+        throw refused();
+      await repin(pin);
+
+      await callbacks.beforeStep("commit", "dispatch");
+      await repin(pin);
+      await configCheck();
+      await repin(pin);
+      check();
+      const commitOut = await this.runGitAsRunner(clonePath, [...pins, ...hookPins, "commit-tree", tree, "-p", oldHead, "-m", subject],
+        { env: { ...env, ...identityEnv } });
+      if (!/^[0-9a-f]{40}\n$/.test(commitOut)) throw refused();
+      newHead = commitOut.slice(0, -1);
+      await repin(pin);
+
+      await callbacks.beforeStep("commit", "dispatch");
+      await repin(pin);
+      await configCheck();
+      await repin(pin);
+      check();
+      await this.runGitAsRunner(clonePath, [...pins, ...hookPins, "update-ref", "--no-deref", branchRef, newHead, oldHead],
+        { env: { ...env, ...identityEnv } });
+      await repin(pin);
+    } finally {
+      if (attempted) await callbacks.afterRunnerGit("commit");
+    }
+
+    // P5: post-capture proof. A failure here refuses with the source retained; no ref is rewound.
+    await repin(postTreePin);
+    const commit = await read(["cat-file", "-p", newHead]);
+    if (commit !== `tree ${treeId}\nparent ${oldHead}\nauthor ${identityLine}\ncommitter ${identityLine}\n\n${subject}\n`) throw refused();
+    if (await read(["symbolic-ref", "--no-recurse", "HEAD"]) !== branchRef + "\n") throw refused();
+    if (await read(["rev-parse", "--verify", "HEAD^{commit}"]) !== newHead + "\n") throw refused();
+    if (rows(await read(["status", "--porcelain=v2", "-z", "--untracked-files=all", "--ignore-submodules=none", "--no-renames"]),
+        "sourceEntries").length !== 0) throw refused();
+    if (!sameDelta(wipParseRawDiff(rows(await read(["diff-tree", "-r", "--raw", "-z", "--no-renames", oldHead, newHead]), "sourceEntries"))))
+      throw refused();
+    await raceRecheck();
+    await repin(postTreePin);
+    return { kind: "committed", head: newHead, parent: oldHead };
   }
 
   /**
@@ -17753,6 +17927,212 @@ try {
     return result;
   }
 }
+
+// Hash-attested maintenance WIP capture (captureMaintenanceWip): pure parsers and the
+// runner-owned helper scripts. Helpers print a fixed diagnostic-free failure (exit 1,
+// no stderr, no paths) and obey a 28s deadline inside the owner's 30s timeout.
+const WIP_ZERO_OID = "0".repeat(40);
+const WIP_ABSENT = "000000 " + WIP_ZERO_OID;
+
+/** A conservative branch name (the part after refs/heads/); anything unusual refuses. */
+function wipBranchValid(name: string): boolean {
+  if (name.length === 0 || name.length > 200) return false;
+  return name.split("/").every(part => /^[A-Za-z0-9_][A-Za-z0-9._-]*$/.test(part) && !part.endsWith(".lock") && !part.includes(".."));
+}
+
+/** Path rules for every path from any Git listing. */
+function wipPathValid(value: string): boolean {
+  if (value.length === 0 || value.includes("�") || Buffer.byteLength(value, "utf8") > 4096) return false;
+  const parts = value.split("/");
+  if (parts.length > 64) return false;
+  for (const part of parts) {
+    if (part.length === 0 || part === "." || part === ".." || Buffer.byteLength(part, "utf8") > 255 ||
+        part.includes("\\") || part.toLowerCase() === ".git") return false;
+    for (let i = 0; i < part.length; i++) {
+      const code = part.charCodeAt(i);
+      if (code < 0x20 || code === 0x7f) return false;
+    }
+  }
+  return true;
+}
+
+/** Distinct directories (the root included) touched by resolving every path's ancestors. */
+function wipDirectoryCount(paths: readonly string[]): number {
+  const dirs = new Set<string>([""]);
+  for (const value of paths) {
+    for (let at = value.indexOf("/"); at >= 0; at = value.indexOf("/", at + 1)) dirs.add(value.slice(0, at));
+  }
+  return dirs.size;
+}
+
+/**
+ * `diff-index`/`diff-tree --raw -z --no-renames` rows (already split on NUL) as
+ * path -> [old "mode oid" | absent, new "mode oid" | absent]; null when malformed.
+ */
+function wipParseRawDiff(rows: readonly string[]): Map<string, [string, string]> | null {
+  if (rows.length % 2 !== 0) return null;
+  const result = new Map<string, [string, string]>();
+  for (let i = 0; i < rows.length; i += 2) {
+    const match = /^:(000000|100644|100755|120000) (000000|100644|100755|120000) ([0-9a-f]{40}) ([0-9a-f]{40}) [ADMT]$/.exec(rows[i]!);
+    const target = rows[i + 1]!;
+    if (!match || result.has(target) || !wipPathValid(target)) return null;
+    if ((match[1] === "000000") !== (match[3] === WIP_ZERO_OID) || (match[2] === "000000") !== (match[4] === WIP_ZERO_OID)) return null;
+    result.set(target, [match[1] === "000000" ? WIP_ABSENT : match[1] + " " + match[3],
+      match[2] === "000000" ? WIP_ABSENT : match[2] + " " + match[4]]);
+  }
+  return result;
+}
+
+// Index identity pin: dev ino size mtimeNs ctimeNs trailing-checksum. Reads ONLY the
+// trailing 20 bytes; never parses the index.
+const MAINTENANCE_WIP_PIN_HELPER = String.raw`// uzi-wip-pin
+const fs = require("node:fs");
+const C = fs.constants;
+const root = process.argv[1];
+function refuse() { throw Error("refused"); }
+function same(a, b) {
+  if (["dev", "ino", "size", "mtimeNs", "ctimeNs", "nlink"].some(k => a[k] !== b[k])) refuse();
+}
+try {
+  if (process.platform !== "linux" || typeof root !== "string" || !root.startsWith("/") || fs.realpathSync(root) !== root) refuse();
+  const git = root + "/.git";
+  if (!fs.lstatSync(git).isDirectory() || fs.realpathSync(git) !== git) refuse();
+  const file = git + "/index";
+  const named = fs.lstatSync(file, { bigint: true });
+  if (!named.isFile() || named.nlink !== 1n || named.size < 32n || named.size > 33554432n) refuse();
+  const fd = fs.openSync(file, C.O_RDONLY | C.O_NOFOLLOW | C.O_NONBLOCK);
+  try {
+    const opened = fs.fstatSync(fd, { bigint: true });
+    if (!opened.isFile()) refuse();
+    same(named, opened);
+    const size = Number(opened.size), tail = Buffer.alloc(20);
+    let got = 0;
+    while (got < 20) {
+      const n = fs.readSync(fd, tail, got, 20 - got, size - 20 + got);
+      if (!n) refuse();
+      got += n;
+    }
+    same(opened, fs.fstatSync(fd, { bigint: true }));
+    same(named, fs.lstatSync(file, { bigint: true }));
+    process.stdout.write([opened.dev, opened.ino, opened.size, opened.mtimeNs, opened.ctimeNs, tail.toString("hex")].join(" ") + "\n");
+  } finally { fs.closeSync(fd); }
+} catch { process.exitCode = 1; }
+`;
+
+// Shared by the census and payload helpers: the clone root and every directory are opened
+// through an O_PATH|O_NOFOLLOW chain addressed via /proc/<pid>/fd/<fd>/<leaf>, so a symlinked
+// or non-directory ancestor refuses and the source namespace is never followed.
+const MAINTENANCE_WIP_TREE_PRELUDE = String.raw`
+const fs = require("node:fs");
+const { createHash } = require("node:crypto");
+const C = fs.constants, O_PATH = 0x200000;
+const root = process.argv[1];
+const deadline = Date.now() + 28000, fds = new Set(), dirs = new Map();
+function refuse() { throw Error("refused"); }
+function check() { if (Date.now() >= deadline) refuse(); }
+function open(p, flags) { const fd = fs.openSync(p, flags); fds.add(fd); return fd; }
+function close(fd) { fs.closeSync(fd); fds.delete(fd); }
+function at(fd, leaf) { return "/proc/" + process.pid + "/fd/" + fd + "/" + leaf; }
+function dirAt(parent, leaf) {
+  const fd = open(at(parent, leaf), O_PATH | C.O_NOFOLLOW);
+  if (!fs.fstatSync(fd).isDirectory()) refuse();
+  return fd;
+}
+function openRoot() {
+  if (process.platform !== "linux" || typeof root !== "string" || !root.startsWith("/") || root.length < 2) refuse();
+  let fd = open("/", O_PATH | C.O_NOFOLLOW);
+  for (const part of root.slice(1).split("/")) {
+    if (!part || part === "." || part === "..") refuse();
+    fd = dirAt(fd, part);
+  }
+  return fd;
+}
+function identity(st) {
+  const kind = st.isFile() ? "f" : st.isSymbolicLink() ? "l" : "";
+  if (!kind) refuse();
+  return [kind, st.mode & 64n ? 1 : 0, st.size, st.dev, st.ino, st.mtimeNs, st.ctimeNs].join(" ");
+}
+dirs.set("", openRoot());
+function dirFor(parts) {
+  let key = "", fd = dirs.get("");
+  for (const part of parts) {
+    key = key ? key + "/" + part : part;
+    let next = dirs.get(key);
+    if (next === undefined) { next = dirAt(fd, part); dirs.set(key, next); }
+    fd = next;
+  }
+  return fd;
+}
+function absent(e) { return e && e.code === "ENOENT"; }
+`;
+
+// Stage 1 (and race rechecks): lstat no-follow each path, print one identity line each.
+// Input: JSON [[path, allowAbsent]]. ENOENT is accepted only where the parent declared a deletion.
+const MAINTENANCE_WIP_CENSUS_HELPER = "// uzi-wip-census\n" + MAINTENANCE_WIP_TREE_PRELUDE + String.raw`
+try {
+  const input = JSON.parse(fs.readFileSync(0, "utf8"));
+  const out = [];
+  for (const [rel, allow] of input) {
+    check();
+    const parts = rel.split("/"), leaf = parts.pop();
+    let st;
+    try { st = fs.lstatSync(at(dirFor(parts), leaf), { bigint: true }); }
+    catch (e) { if (allow === 1 && absent(e)) { out.push("a"); continue; } refuse(); }
+    out.push(identity(st));
+  }
+  process.stdout.write(out.join("\n") + "\n");
+} catch { process.exitCode = 1; }
+finally { for (const fd of fds) { try { fs.closeSync(fd); } catch { process.exitCode = 1; } } }
+`;
+
+// Stage 2: hash every present path. Input: JSON [[path, censusLine]]; argv[2] bounds the
+// total bytes. Regular files open O_NOFOLLOW|O_NONBLOCK, must still match the census
+// identity, are read in <= 64 KiB chunks plus a 1-byte EOF probe (growth refuses) and are
+// re-checked after the read. Symlinks use readlink with the same before/after identity.
+const MAINTENANCE_WIP_PAYLOAD_HELPER = "// uzi-wip-payload\n" + MAINTENANCE_WIP_TREE_PRELUDE + String.raw`
+try {
+  const limit = Number(process.argv[2]);
+  if (!Number.isSafeInteger(limit) || limit < 0) refuse();
+  const input = JSON.parse(fs.readFileSync(0, "utf8"));
+  const chunk = Buffer.alloc(65536), out = [];
+  let total = 0;
+  for (const [rel, expected] of input) {
+    check();
+    const parts = rel.split("/"), leaf = parts.pop(), p = at(dirFor(parts), leaf);
+    const size = Number(expected.split(" ")[2]);
+    total += size;
+    if (!Number.isSafeInteger(size) || total > limit) refuse();
+    if (identity(fs.lstatSync(p, { bigint: true })) !== expected) refuse();
+    if (expected[0] === "l") {
+      if (size > 4096) refuse();
+      const target = fs.readlinkSync(p, { encoding: "buffer" });
+      if (target.length !== size || identity(fs.lstatSync(p, { bigint: true })) !== expected) refuse();
+      out.push("120000 " + createHash("sha1").update("blob " + size + "\0").update(target).digest("hex"));
+      continue;
+    }
+    const fd = open(p, C.O_RDONLY | C.O_NOFOLLOW | C.O_NONBLOCK);
+    try {
+      const opened = fs.fstatSync(fd, { bigint: true });
+      if (!opened.isFile() || identity(opened) !== expected) refuse();
+      const blob = createHash("sha1").update("blob " + size + "\0");
+      let n = 0;
+      while (true) {
+        const got = fs.readSync(fd, chunk, 0, Math.min(65536, size + 1 - n), null);
+        if (!got) break;
+        n += got;
+        if (n > size) refuse();
+        blob.update(chunk.subarray(0, got));
+        check();
+      }
+      if (n !== size || identity(fs.fstatSync(fd, { bigint: true })) !== expected ||
+          identity(fs.lstatSync(p, { bigint: true })) !== expected) refuse();
+      out.push((expected[2] === "1" ? "100755 " : "100644 ") + blob.digest("hex"));
+    } finally { close(fd); }
+  }
+  process.stdout.write(out.join("\n") + "\n");
+} catch { process.exitCode = 1; }
+finally { for (const fd of fds) { try { fs.closeSync(fd); } catch { process.exitCode = 1; } } }
+`;
 
 // A single read-only Linux child. Attempts, raw directory rows (including EOF),
 // names, link capacity and file read requests debit the reserved envelope BEFORE
