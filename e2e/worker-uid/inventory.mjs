@@ -13,8 +13,8 @@ const sharedFile = 'runner-shared-real';
 const e2eFiles = new Set(['memory-command-real', 'claude-command-real', singleFile, sharedFile]);
 const captureSuite = 'Unit2 runner source capture';
 const captureLeaves = new Set([
-  'cancels while the object-store snapshot streams and leaves no temp tree',
-  'cancels while many tiny object files are copied and leaves no temp tree',
+  'cancels during worktree comparisons and leaves no temp tree',
+  'cancels while many tiny worktree entries are walked and leaves no temp tree',
   "never reads a symlink target's content",
   'reads each symlink only through its still-open pinned parent descriptor',
   'refuses a leaf swapped to a regular file before readlink without resolving the pathname',
@@ -22,6 +22,9 @@ const captureLeaves = new Set([
   'captures an unchanged tracked symlink tree as an empty patch',
   'captures edits elsewhere next to unchanged tracked symlinks',
   'treats a symlinked .gitignore as absent while the path stays a candidate',
+  'reads loose trusted bare objects as the real runner uid without write authority',
+  'reads packed trusted bare objects as the real runner uid without write authority',
+  'captures under the enforced required command sandbox',
 ]);
 
 const claudeRealSuite = 'real Claude guarded command lane';
