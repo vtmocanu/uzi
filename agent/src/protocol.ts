@@ -1463,6 +1463,10 @@ export interface ClaimResponse extends ClaimMemoryState {
   /** Resume: the tip THIS run last published to its checkpoint ref (owner-anchor).
    *  Adoption of refs/uzi-checkpoints/<branch> requires the remote tip to equal this. */
   checkpoint_tip?: string | null;
+  /** Server-authorized immutable v1 coordinates; validated before any checkpoint use. */
+  checkpoint_coordinates?: unknown;
+  /** Explicit false proves no outstanding task write; omitted or malformed is unknown. */
+  checkpoint_write_unresolved?: boolean;
   /** issue #3194: the source a flight of THIS run published after its `--require-base` guard
    *  accepted (set-only server-side). A continuation may adopt exactly this content. */
   checkpoint_attested_source?: string | null;

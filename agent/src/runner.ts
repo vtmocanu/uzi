@@ -1,3 +1,4 @@
+import { checkpointCoordinatesForClaim, type CheckpointCoordinates } from "./checkpoint-coordinates.js";
 import { prepareCIEvidence, validateCIRepairClaim, type PreparedCIEvidence } from "./ci-evidence.js";
 import { GitBoundaryAbortError, isCheckpointBoundaryFailure, type CheckpointStop } from "./checkpoint-stop.js";
 import { prepareFrozenHeld, type FrozenHeldPolicy } from "./frozen-held.js";
@@ -1998,7 +1999,11 @@ type SourceGenesis = Readonly<{
   attemptId: string;
 }>;
 
+type ClaimCheckpointEvidence = Readonly<{ tip?: string; attestedSource?: string; writeUnresolved?: boolean }>;
+
 interface RunFlight {
+  readonly checkpointCoordinates?: CheckpointCoordinates;
+  readonly checkpointClaimEvidence: ClaimCheckpointEvidence;
   /** Local observer only; preservation keeps its own operation and authority. */
   memoryHoldObserver?: () => void;
   /** Exact facade of a refused/unacknowledged owner-pause capture; never cleanup or resume authority. */
@@ -7257,7 +7262,8 @@ export class RunRunner {
       // marker-only park exception remains in hasCommittedCheckpoint.
       const publishedCheckpoint =
         await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch,
-          landedCheckpoint ? { tip: flight.lastCheckpointRefTip } : undefined);
+          landedCheckpoint ? { tip: flight.lastCheckpointRefTip } : undefined,
+          flight.checkpointCoordinates?.checkpoint_key ?? (flight.runKind === "task" ? null : runnerClone.branch));
       if (publishedCheckpoint) {
         batcher.emit({
           kind: "status",
@@ -7273,7 +7279,7 @@ export class RunRunner {
           status: "failed",
           failure_reason:
             "signal_done was called with report_only, but this run published committed work to a checkpoint ref (refs/uzi-checkpoints/" +
-            runnerClone.branch +
+            (flight.checkpointCoordinates?.checkpoint_key ?? runnerClone.branch) +
             ") on origin. A report-only completion opens no branch or merge request and would orphan that checkpoint. If this run has code to land, call signal_done WITHOUT report_only so the work lands as a merge request; report_only is only valid for a run that committed nothing.",
         });
         runLog.info("run failed: report_only declared after a checkpoint was published", {
@@ -7515,7 +7521,8 @@ export class RunRunner {
         if (result.scopeCapped) {
           const publishedCheckpoint =
             await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch,
-              landedCheckpoint ? { tip: flight.lastCheckpointRefTip } : undefined);
+              landedCheckpoint ? { tip: flight.lastCheckpointRefTip } : undefined,
+              flight.checkpointCoordinates?.checkpoint_key ?? (flight.runKind === "task" ? null : runnerClone.branch));
           if (!publishedCheckpoint) {
             // Bind a zero slice to its committed base in the runner-owned clone, without pushing.
             let cappedHead: string | undefined;
@@ -7596,7 +7603,8 @@ export class RunRunner {
         // carries no committed content; unknown confirmed publication still blocks.
         const publishedCheckpoint =
           await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch,
-            landedCheckpoint ? { tip: flight.lastCheckpointRefTip } : undefined);
+            landedCheckpoint ? { tip: flight.lastCheckpointRefTip } : undefined,
+            flight.checkpointCoordinates?.checkpoint_key ?? (flight.runKind === "task" ? null : runnerClone.branch));
         if (publishedCheckpoint) {
           batcher.emit({
             kind: "status",
@@ -7612,7 +7620,7 @@ export class RunRunner {
             status: "failed",
             failure_reason:
               "signal_done was called with report_only, but this run published committed work to a checkpoint ref (refs/uzi-checkpoints/" +
-              runnerClone.branch +
+              (flight.checkpointCoordinates?.checkpoint_key ?? runnerClone.branch) +
               ") on origin. A report-only completion opens no branch or merge request and would orphan that checkpoint. If this run has code to land, call signal_done WITHOUT report_only so the work lands as a merge request; report_only is only valid for a run that committed nothing.",
           });
           runLog.info("prompt run failed: report_only after a checkpoint was published", {
@@ -9812,6 +9820,13 @@ export class RunRunner {
     // ignores. Widened from Promise<void> so the park branch can read it without
     // re-plumbing this closure; the annotation is the only change, and awaiting a
     // value nobody binds behaves exactly as before.
+    const checkpointCoordinates = checkpointCoordinatesForClaim(claim);
+    const checkpointClaimEvidence = Object.freeze({
+      tip: claim.checkpoint_tip ?? undefined,
+      attestedSource: claim.checkpoint_attested_source ?? undefined,
+      writeUnresolved: typeof claim.checkpoint_write_unresolved === "boolean"
+        ? claim.checkpoint_write_unresolved : undefined,
+    });
     const flight: RunFlight = {
       runId,
       executor,
@@ -9887,6 +9902,8 @@ export class RunRunner {
           if (flight.completionSendAttempted) await this.bindCompletionSource(flight);
         }
       },
+      checkpointCoordinates,
+      checkpointClaimEvidence,
       runKind: resolveRunKind(claim.kind),
       observedSessionId: undefined,
       latestContractRevision: undefined,
@@ -10069,7 +10086,8 @@ export class RunRunner {
       // PRD #1062 M2 (#1036): the checkpoint ref tip this run last knows, for the overlay's
       // prevCheckpointTip. Seeded from the persisted tip on the claim (a resume already has an
       // overlay on the ref), advanced on every confirmed publish.
-      lastCheckpointRefTip: claim.checkpoint_tip ?? undefined,
+      lastCheckpointRefTip: resolveRunKind(claim.kind) !== "task" || checkpointCoordinates
+        ? checkpointClaimEvidence.tip : undefined,
       lastAttemptedCheckpointRefTip: undefined,
       checkpointChainForge: claim.repo.forge_type === "github",
       ...(claim.config?.ci_config_guard === true
@@ -10756,6 +10774,7 @@ export class RunRunner {
             claim.repo.clone_url,
             claim.secrets.forge_pat,
             claim.secrets.forge_username,
+            flight.runKind === "task" ? flight.checkpointCoordinates?.checkpoint_key : undefined,
           ),
       );
     } catch (err) {
@@ -10787,7 +10806,7 @@ export class RunRunner {
     // so: the mode can land between the read above and the seed under the bare lock.
     for (let freshRetry = false; ; ) {
       try {
-        const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, reseed, flight.executor, attemptSeed));
+        const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, reseed, flight.executor, attemptSeed, flight.checkpointCoordinates ?? null, flight.checkpointClaimEvidence));
         flight.worktreePath = runnerClone.path;
         flight.branch = runnerClone.branch;
       } catch (err) {
@@ -10823,7 +10842,7 @@ export class RunRunner {
           // 404'd on a worker move (Gap 2).
           await this.reclaimTerminalOrphan(barePath, claim, flight, err.clonePath, err.branch, err.ownerRunId, err);
           await refreshAttemptSeed();
-          const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, reseed, flight.executor, attemptSeed));
+          const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, reseed, flight.executor, attemptSeed, flight.checkpointCoordinates ?? null, flight.checkpointClaimEvidence));
           flight.worktreePath = runnerClone.path;
           flight.branch = runnerClone.branch;
         } else if (err instanceof CapturePathMismatchError) {
@@ -10832,7 +10851,7 @@ export class RunRunner {
           // The SAME owner-derived validation decides; any unmet predicate fails closed.
           await this.reclaimTerminalOrphan(barePath, claim, flight, err.journaledPath, err.branch, err.ownerRunId, err);
           await refreshAttemptSeed();
-          const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, reseed, flight.executor, attemptSeed));
+          const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, reseed, flight.executor, attemptSeed, flight.checkpointCoordinates ?? null, flight.checkpointClaimEvidence));
           flight.worktreePath = runnerClone.path;
           flight.branch = runnerClone.branch;
         } else {
@@ -11183,7 +11202,7 @@ export class RunRunner {
       evaluateRequiredBase({
         plannedBase: claim.planned_base_commit!,
         identity,
-        attestedSource: claim.checkpoint_attested_source ?? undefined,
+        attestedSource: flight.checkpointClaimEvidence.attestedSource,
         continuation: runnerClone.seededFrom === "tracking" || runnerClone.seededFrom === "checkpoint",
         wipCherryPicked: runnerClone.wipCherryPicked === true,
         planned: await this.git.resolveCommitUnique(barePath, claim.planned_base_commit!),
@@ -14289,7 +14308,8 @@ export class RunRunner {
       ...(state?.cleanTip ? { cleanTip: state.cleanTip } : {}),
       flaggedCommits: [...(state?.flaggedCommits ?? [])],
       ciGlobs: flight.ciConfigGuardGlobs ? [...flight.ciConfigGuardGlobs] : null,
-      ...(flight.lastCheckpointRefTip ? { confirmedTip: flight.lastCheckpointRefTip } : {}),
+      ...(flight.lastCheckpointRefTip ? { confirmedTip: flight.lastCheckpointRefTip,
+        ...(flight.runKind === "task" ? { checkpointKey: flight.checkpointCoordinates!.checkpoint_key } : {}) } : {}),
       extraFloors: [...(flight.publishedRealTips ?? []), flight.publishedTip]
         .filter((f): f is string => typeof f === "string" && /^[0-9a-f]{40}$/.test(f)),
     };
@@ -15734,6 +15754,10 @@ export class RunRunner {
     onStep?: (step: BoundaryStep) => void,
     reap = true,
   ): Promise<PublishOutcome> {
+    if (flight.runKind === "task" && !flight.checkpointCoordinates)
+      return { published: false, reason: "skipped", skipLabel: "unsupported" };
+    if (flight.checkpointCoordinates && flight.checkpointCoordinates.work_branch !== branch)
+      return { published: false, reason: "error" };
     // issue #1086 (F2): two-tip reconciliation. The CONFIRMED tip advances only on a real ACK; an
     // ambiguous result (non-2xx, or a throw after the pack tip is known) records the ATTEMPTED tip
     // so the next overlay chains from it. Caveat: under PERSISTENT consecutive ACK loss the
@@ -15823,6 +15847,8 @@ export class RunRunner {
       }
       if (!res) throw new Error("checkpoint publish produced no response");
       if (res.ok && res.body.published === true) {
+        if (flight.runKind === "task" && res.body.ref !== `refs/uzi-checkpoints/${flight.checkpointCoordinates!.checkpoint_key}`)
+          throw new Error("checkpoint publication returned a different authorized ref");
         // An early HTTP success does not prove the streamed git pack completed. spawnGit's
         // exit promise never rejects and, inside a boundary, settles only after root reap.
         // Abandon an unread tail so the producer cannot stay blocked on pipe backpressure.
@@ -16145,7 +16171,8 @@ export class RunRunner {
       await this.settler.supersedeOlderGenerations(claim.run_id, claim.claim_generation);
     }
     try {
-      if (flight.barePath && claim.checkpoint_tip) await this.reconcileConfirmedOwed(flight, flight.barePath, claim.checkpoint_tip);
+      if (flight.barePath && flight.lastCheckpointRefTip)
+        await this.reconcileConfirmedOwed(flight, flight.barePath, flight.lastCheckpointRefTip);
       if (flight.barePath) {
         const pins = await this.git.enumerateOwedCandidates(flight.barePath, claim.run_id);
         this.announceOwedHeads(flight, pins.map(p => p.sha));
@@ -16261,8 +16288,8 @@ export class RunRunner {
    * on the execution path, errors caught, and bounded by the flight's cancel signal (the worker
    * sweep retries whatever is left). Kind-gated by what the api can prove against while the run is
    * live:
-   *   - `checkpoint`: issue / self_improve runs (the checkpoint-publishing kinds; their runs.branch
-   *     is NULL while live, so `branch` would only answer not_eligible);
+   *   - `checkpoint`: issue / self_improve and descriptor-authorized task runs;
+   *     task checkpoint destinations come from the server-authorized run key;
    *   - `branch`: task runs ONLY — the one kind whose runs.branch is set at creation (task.sql).
    *     prompt (CreatePromptRun), ci_fix and mr_rework runs leave runs.branch NULL, so the api
    *     answers not_eligible for them while live; they fire nothing and settle on completion.
@@ -16271,7 +16298,7 @@ export class RunRunner {
     if (flight.retainedLocalCustody || !this.settlement.enabled) return;
     const kind = flight.runKind;
     if (kind === undefined) return;
-    const eligible = target === "checkpoint" ? kind === "issue" || kind === "self_improve" : kind === "task";
+    const eligible = target === "checkpoint" ? kind === "issue" || kind === "self_improve" || (kind === "task" && !!flight.checkpointCoordinates) : kind === "task";
     if (!eligible) return;
     const generation = flight.claimGeneration;
     if (!Number.isSafeInteger(generation) || generation <= 0) return;
@@ -20558,7 +20585,8 @@ export class RunRunner {
           await check();
           await this.checkWorkerResidueBeforeFetch(claim.run_id, "retained_recovery", flight.runLog);
           await check();
-          await this.git.ensureClone(claim.repo.clone_url, claim.secrets.forge_pat, claim.secrets.forge_username);
+          await this.git.ensureClone(claim.repo.clone_url, claim.secrets.forge_pat, claim.secrets.forge_username,
+            flight.runKind === "task" ? flight.checkpointCoordinates?.checkpoint_key : undefined);
           await check();
           const captureResult = await this.runFreeCapture(claim, flight, iteration.deadline, signal, async held => {
             const check = async () => {
@@ -20637,7 +20665,8 @@ export class RunRunner {
           blocker = "adoption_failed";
           const attemptId = mintAttemptId(claim.claim_generation, new Date(this.now()));
           const successor = await this.git.prepareRecoverySuccessor(bare, branch, key, source,
-            iteration.attempts, attemptId, { selfContained: flight.executor.sandboxesCommands === true || claim.plan_cross_check_required === true });
+            iteration.attempts, attemptId, { checkpointWriteUnresolved: flight.checkpointClaimEvidence.writeUnresolved, checkpointKey: flight.checkpointCoordinates?.checkpoint_key ??
+              (flight.runKind === "task" ? null : undefined), selfContained: flight.executor.sandboxesCommands === true || claim.plan_cross_check_required === true });
           expectedSource = { ...source, clonePath: successor.path, attemptId: successor.attemptId };
           flight.runnerClone = successor;
           flight.worktreePath = successor.path;
@@ -20707,6 +20736,12 @@ export class RunRunner {
     reseed: CanonicalReseedOptions,
     executor: Executor,
     attempt?: AttemptSeedOptions,
+    frozenCoordinates: CheckpointCoordinates | null | undefined = checkpointCoordinatesForClaim(claim),
+    frozenEvidence: ClaimCheckpointEvidence = {
+      tip: claim.checkpoint_tip ?? undefined,
+      attestedSource: claim.checkpoint_attested_source ?? undefined,
+      writeUnresolved: typeof claim.checkpoint_write_unresolved === "boolean" ? claim.checkpoint_write_unresolved : undefined,
+    },
   ) {
     // PRD #218 M2: thread the run id as the tracking-ref OWNERSHIP anchor. The git layer
     // stays claim-agnostic — it consults the tracking ref only when its stamp matches
@@ -20724,7 +20759,7 @@ export class RunRunner {
     // A reconciled lead starts a fresh transcript while retaining its approved
     // checkpoint lineage. GitCache still requires the exact checkpoint tip.
     const resume = claim.session_id != null || (claim.resume_phase === "implementing" &&
-      claim.plan_approved === true && !!claim.plan_md?.trim() && claim.checkpoint_tip != null);
+      claim.plan_approved === true && !!claim.plan_md?.trim() && frozenEvidence.tip != null);
     // issue #1042 M4: the OWNER ANCHOR for the cross-worker checkpoint adopt guard — the tip
     // THIS run last published to its own refs/uzi-checkpoints/<branch> ref, persisted
     // server-side on every publish (M2) and delivered on the claim. runnerCloneForBranch
@@ -20732,12 +20767,14 @@ export class RunRunner {
     // checkpoint's current SHA, so a resumed run that never published its own checkpoint
     // cannot seed off a PRIOR (possibly plan-rejected) run's work. `?? undefined` maps the
     // wire's null (a never-published run) to the "do not adopt" sentinel the git layer reads.
-    const expectedCheckpointTip = claim.checkpoint_tip ?? undefined;
+    const checkpointCoordinates = frozenCoordinates;
+    const expectedCheckpointTip = resolveRunKind(claim.kind) !== "task" || checkpointCoordinates
+      ? frozenEvidence.tip : undefined;
     // Sandboxed commands cannot read the worker bare; required planning cross-check capture
     // also refuses object alternates, including for Claude. Dissociate either clone at seed.
     // `executor.sandboxesCommands` is set at construction; `executor.safety` is populated
     // only inside run(), so it is still unset here. Ordinary Claude/stub clones pass false.
-    const cloneOpts = { selfContained: executor.sandboxesCommands === true || claim.plan_cross_check_required === true || claim.code_cross_check_required === true };
+    const cloneOpts = { checkpointWriteUnresolved: frozenEvidence.writeUnresolved, checkpointKey: checkpointCoordinates?.checkpoint_key ?? (claim.kind === "task" ? null : undefined), selfContained: executor.sandboxesCommands === true || claim.plan_cross_check_required === true || claim.code_cross_check_required === true };
     // PRD #983 M4b: the per-kind branch derivations (ci_fix's default-branch vs run-branch
     // choice, self_improve/prompt's fresh-per-cycle run-id branch, task/mr_rework's
     // pre-seeded branch with its loud missing-branch guard) live in RUN_KIND_PROFILES. A
