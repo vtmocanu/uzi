@@ -15,9 +15,16 @@ const CHILD = "22222222-2222-4222-8222-222222222222";
 const BRANCH = "uzi/task/11111111-1111-4111-8111-111111111111";
 const CHILD_KEY = "uzi/task/22222222-2222-4222-8222-222222222222";
 const REF = "refs/uzi-checkpoints/uzi/task/22222222-2222-4222-8222-222222222222";
+function fixtureGitEnv(inherited: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env = { ...inherited };
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("GIT_")) delete env[key];
+  }
+  return { ...env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0" };
+}
 function cmd(cwd: string, ...args: string[]): string {
   return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", stdio: "pipe",
-    env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" } }).trim();
+    env: fixtureGitEnv() }).trim();
 }
 function commit(cwd: string, file: string, message = file, content = file): string {
   fs.mkdirSync(path.dirname(path.join(cwd, file)), { recursive: true });
@@ -144,7 +151,7 @@ it("overlay chains and cross-worker peeling belong to the child's key, independe
       for await (const chunk of packed.pack) chunks.push(Buffer.from(chunk));
       assert.equal(await packed.exited, 0);
       execFileSync("git", ["-C", r.fx.originPath, "index-pack", "--stdin", "--fix-thin"], {
-        input: Buffer.concat(chunks), stdio: "pipe" });
+        input: Buffer.concat(chunks), stdio: "pipe", env: fixtureGitEnv() });
       cmd(r.fx.originPath, "update-ref", REF, packed.tipOid);
       return packed.tipOid;
     }
@@ -205,7 +212,7 @@ it("frozen held packs and secret scan floors use the work branch, with task conf
     assert.equal(ranges[0]!.excludeSha, publishedBranch);
     assert.ok(ranges[0]!.scanFloorShas?.includes(confirmed));
     execFileSync("git", ["-C", r.fx.originPath, "index-pack", "--stdin", "--fix-thin"], {
-      input: result.pack, stdio: "pipe" });
+      input: result.pack, stdio: "pipe", env: fixtureGitEnv() });
     assert.equal(cmd(r.fx.originPath, "rev-parse", source + "^{commit}"), source);
   } finally { r.fx.cleanup(); }
 });
@@ -362,4 +369,43 @@ it("held task publication scans new secrets beyond the branch and confirmed key 
     assert.deepEqual(await prepareFrozenHeld({ git: cache, barePath: bare, branch: BRANCH, sourceSha: ci,
       policy: { ...policy, ciGlobs: [".gitlab-ci.yml"] }, deadlineMs: 30_000 }), { reason: "ci_config_guard" });
   } finally { fx.cleanup(); }
+});
+
+it("fixture Git ignores inherited repository, index, object and config overrides", () => {
+  const r = rig();
+  try {
+    const inherited: NodeJS.ProcessEnv = { ...process.env, GIT_DIR: path.join(r.fx.dataDir, "foreign.git"),
+      GIT_WORK_TREE: r.fx.dataDir, GIT_INDEX_FILE: path.join(r.fx.dataDir, "foreign-index"),
+      GIT_OBJECT_DIRECTORY: path.join(r.fx.dataDir, "foreign-objects"), GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "core.bare", GIT_CONFIG_VALUE_0: "true" };
+    const env = fixtureGitEnv(inherited);
+    assert.equal(env.PATH, inherited.PATH);
+    assert.equal(env.TMPDIR, inherited.TMPDIR);
+    assert.deepEqual(Object.keys(env).filter(key => key.startsWith("GIT_")).sort(),
+      ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_TERMINAL_PROMPT"]);
+    // Read-only: prove repository selection before any Git write with this environment.
+    const selected = execFileSync("git", ["-C", r.fx.originPath, "rev-parse", "--show-toplevel"],
+      { env, encoding: "utf8", stdio: "pipe" }).trim();
+    assert.equal(fs.realpathSync(selected), fs.realpathSync(r.fx.originPath));
+    assert.equal(inherited.GIT_DIR, path.join(r.fx.dataDir, "foreign.git"));
+  } finally { r.fx.cleanup(); }
+});
+
+it("evicting an old task freshness proof refuses cold recovery despite a mirrored exact ref", async () => {
+  const r = rig();
+  try {
+    const base = cmd(r.fx.originPath, "rev-parse", "HEAD");
+    cmd(r.fx.originPath, "update-ref", REF, base);
+    const bare = await r.cache.ensureClone(r.fx.originPath, undefined, undefined, CHILD_KEY);
+    // Populate intervening preparations without 255 network/Git preparations. Exercise
+    // eviction through ensureClone and recovery through the public clone boundary.
+    const proofs = (r.cache as unknown as { taskCheckpointFreshness: Map<string, string | null> }).taskCheckpointFreshness;
+    for (let i = 0; i < 255; i++) proofs.set("intervening-" + i, null);
+    await r.cache.ensureClone(r.fx.originPath, undefined, undefined, BRANCH);
+    assert.equal(proofs.size, 256);
+    assert.equal(cmd(bare, "rev-parse", REF), base, "the mirrored ref still exists");
+    await assert.rejects(r.seed(bare, CHILD, base), /freshness unavailable/);
+    const root = await r.seed(bare, ROOT);
+    assert.equal(cmd(root.path, "rev-parse", "HEAD"), base, "the newest absence proof remains usable");
+  } finally { r.fx.cleanup(); }
 });

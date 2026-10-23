@@ -2,10 +2,11 @@ import { it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import { Readable } from "node:stream";
 import path from "node:path";
 import type { ClaimResponse } from "../src/protocol.js";
 import type { Executor } from "../src/executor.js";
-import type { RunRunner } from "../src/runner.js";
+import { RunRunner } from "../src/runner.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runner } from "./runner-harness.js";
 
 installHarness();
@@ -16,9 +17,16 @@ const BRANCH = "uzi/task/11111111-1111-4111-8111-111111111111";
 const KEY = "uzi/task/22222222-2222-4222-8222-222222222222";
 const REF = "refs/uzi-checkpoints/uzi/task/22222222-2222-4222-8222-222222222222";
 
+function fixtureGitEnv(inherited: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env = { ...inherited };
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("GIT_")) delete env[key];
+  }
+  return { ...env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0" };
+}
 function cmd(cwd: string, ...args: string[]): string {
   return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", stdio: "pipe",
-    env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" } }).trim();
+    env: fixtureGitEnv() }).trim();
 }
 function commit(cwd: string, file: string): string {
   fs.writeFileSync(path.join(cwd, file), file);
@@ -160,4 +168,79 @@ for (const mode of ["declared-task", "capped-issue", "empty-prompt"] as const) i
     await runner(executor, gitlab).execute(c);
     assert.ok(api.states.some(s => s.runId === CHILD && s.body.status === "completed" && s.body.report_only));
     assert.deepEqual(checks, [{ branch: expectedBranch, key: expectedKey }]);
+  });
+
+it("fixture Git ignores inherited repository, index, object and config overrides", () => {
+    const inherited: NodeJS.ProcessEnv = { ...process.env, GIT_DIR: path.join(fx.dataDir, "foreign.git"),
+      GIT_WORK_TREE: fx.dataDir, GIT_INDEX_FILE: path.join(fx.dataDir, "foreign-index"),
+      GIT_OBJECT_DIRECTORY: path.join(fx.dataDir, "foreign-objects"), GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "core.bare", GIT_CONFIG_VALUE_0: "true" };
+    const env = fixtureGitEnv(inherited);
+    assert.equal(env.PATH, inherited.PATH);
+    assert.equal(env.TMPDIR, inherited.TMPDIR);
+    assert.deepEqual(Object.keys(env).filter(key => key.startsWith("GIT_")).sort(),
+      ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_TERMINAL_PROMPT"]);
+    // Read-only: prove repository selection before any Git write with this environment.
+    const selected = execFileSync("git", ["-C", fx.originPath, "rev-parse", "--show-toplevel"],
+      { env, encoding: "utf8", stdio: "pipe" }).trim();
+    assert.equal(fs.realpathSync(selected), fs.realpathSync(fx.originPath));
+    assert.equal(inherited.GIT_DIR, path.join(fx.dataDir, "foreign.git"));
+});
+
+for (const evidence of ["published anchor", "unresolved write"] as const) it(
+  "missing task coordinates refuse execution with " + evidence,
+  async () => {
+    const c = claim();
+    delete c.checkpoint_coordinates;
+    if (evidence === "published anchor") c.checkpoint_tip = "a".repeat(40);
+    else c.checkpoint_write_unresolved = true;
+    const { gitlab } = fakeGitlab();
+    let executions = 0;
+    let preparations = 0;
+    let packs = 0;
+    let uploads = 0;
+    const ensure = git.ensureClone.bind(git);
+    git.ensureClone = async (...args) => { preparations++; return ensure(...args); };
+    git.checkpointPack = async () => { packs++; return null; };
+    client.publishCheckpoint = async () => { uploads++; return { ok: true, body: { published: true, ref: REF } }; };
+    const executor: Executor = { run: async ctx => { executions++; return { branch: ctx.branch, reportOnly: true }; } };
+    await assert.rejects(runner(executor, gitlab).execute(c), /requires authorized coordinates/);
+    assert.deepEqual([preparations, executions, packs, uploads], [0, 0, 0, 0]);
+  });
+
+for (const generation of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, undefined]) it(
+  "enrolled task refuses checkpoint I/O for generation " + generation,
+  async () => {
+    let preparations = 0;
+    let packs = 0;
+    let uploads = 0;
+    const receiver = {
+      requireTrackingOwned: async () => { preparations++; return "a".repeat(40); },
+      ciConfigGuardBlocksPublication: async () => false,
+      checkpointRemediationHold: async () => false,
+      reconcileConfirmedOwed: async () => {}, triggerLiveSettle: () => {},
+      git: { checkpointPack: async () => {
+        packs++;
+        return { pack: Readable.from([Buffer.from("fixture")]), exited: Promise.resolve(0),
+          tipOid: "a".repeat(40), cancel() {} };
+      } },
+      client: { publishCheckpoint: async (_run: string, _tip: string, stream: Readable) => {
+        uploads++;
+        for await (const _chunk of stream) { /* matching ACK must not bypass the guard */ }
+        return { ok: true, body: { published: true, ref: REF } };
+      } },
+    };
+    const flight = { runKind: "task", runId: CHILD, claimGeneration: generation,
+      checkpointCoordinates: claim().checkpoint_coordinates,
+      lastCheckpointRefTip: "confirmed", lastAttemptedCheckpointRefTip: "attempted",
+      reportedPublishOutcomes: new Set(), runLog: { info() {}, warn() {} } };
+    const outcome = await RunRunner.prototype["publishCheckpointOutcome"].call(
+      receiver as unknown as RunRunner,
+      flight as unknown as Parameters<RunRunner["publishCheckpointOutcome"]>[0], "bare", BRANCH);
+    assert.deepEqual(outcome, { published: false, reason: "error" });
+    assert.equal(preparations, 0);
+    assert.equal(packs, 0);
+    assert.equal(uploads, 0);
+    assert.equal(flight.lastCheckpointRefTip, "confirmed");
+    assert.equal(flight.lastAttemptedCheckpointRefTip, "attempted");
   });

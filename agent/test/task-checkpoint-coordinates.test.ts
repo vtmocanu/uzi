@@ -49,6 +49,22 @@ it("absence preserves legacy equal pairs and never authorizes a task from its br
     "uzi/self-improve/11111111-1111-4111-8111-111111111111");
 });
 
+it("a missing descriptor cannot discard a task checkpoint anchor or unresolved write", () => {
+  for (const evidence of [
+    { checkpoint_tip: "a".repeat(40) },
+    { checkpoint_attested_source: "b".repeat(40) },
+    { checkpoint_write_unresolved: true },
+  ]) {
+    const claim = { ...task(), ...evidence };
+    delete claim.checkpoint_coordinates;
+    assert.throws(() => checkpointCoordinatesForClaim(claim), /requires authorized coordinates/);
+  }
+  const legacy = task();
+  delete legacy.checkpoint_coordinates;
+  legacy.checkpoint_write_unresolved = false;
+  assert.equal(checkpointCoordinatesForClaim(legacy), undefined, "absence of a checkpoint does not authorize a key");
+});
+
 it("present malformed or unsupported descriptors fail closed", () => {
   const edits: unknown[] = [null, [], "v1", { version: 2 }, { run_id: ROOT }, { repo_id: USER },
     { user_id: "not-a-uuid" }, { kind: "issue" }, { issue_iid: 42 }, { work_branch: "feature/foreign" },

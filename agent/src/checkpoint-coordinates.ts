@@ -24,6 +24,11 @@ export function checkpointCoordinatesForClaim(claim: ClaimResponse): CheckpointC
   const value = claim.checkpoint_coordinates;
   const kind = claim.kind ?? "issue";
   if (value === undefined) {
+    // Legacy tasks never published checkpoints. A named anchor or unresolved
+    // write cannot be downgraded to branch-only execution by an older API.
+    if (kind === "task" && (claim.checkpoint_tip != null ||
+        claim.checkpoint_attested_source != null || claim.checkpoint_write_unresolved === true))
+      throw new Error("task checkpoint recovery requires authorized coordinates");
     if (kind === "issue" && Number.isSafeInteger(claim.issue_iid) && claim.issue_iid! > 0)
       return legacy("agent/issue-" + claim.issue_iid);
     if (kind === "self_improve") return legacy("uzi/self-improve/" + claim.run_id);

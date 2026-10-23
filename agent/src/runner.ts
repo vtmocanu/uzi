@@ -15756,6 +15756,8 @@ export class RunRunner {
   ): Promise<PublishOutcome> {
     if (flight.runKind === "task" && !flight.checkpointCoordinates)
       return { published: false, reason: "skipped", skipLabel: "unsupported" };
+    if (flight.runKind === "task" && (!Number.isSafeInteger(flight.claimGeneration) || flight.claimGeneration <= 0))
+      return { published: false, reason: "error" };
     if (flight.checkpointCoordinates && flight.checkpointCoordinates.work_branch !== branch)
       return { published: false, reason: "error" };
     // issue #1086 (F2): two-tip reconciliation. The CONFIRMED tip advances only on a real ACK; an

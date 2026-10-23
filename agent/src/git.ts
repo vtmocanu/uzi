@@ -2776,6 +2776,11 @@ export class GitCache {
           if (isCheckpointBoundaryFailure(err)) throw err;
           this.log.warn("task checkpoint freshness unavailable", { checkpointKey });
         }
+        // Keep at most 256 preparations, oldest first. An evicted proof reads as
+        // unavailable in runnerCloneForBranch, so cold recovery fails closed.
+        if (this.taskCheckpointFreshness.size > 256) {
+          this.taskCheckpointFreshness.delete(this.taskCheckpointFreshness.keys().next().value!);
+        }
       }
       return barePath;
     });
