@@ -17,6 +17,7 @@ func TestCrossCheckLaneSQLExclusionParity(t *testing.T) {
 	}
 	inventory := []disposition{
 		{"runtime", "ListWorkersByUser", 1, ""},
+		{"runtime", "GetWorkerProjectionForOwner", 1, ""},
 		{"runtime", "CountInProgressRunsForUser", 1, ""},
 		{"runtime", "ListRunsForUser", 1, ""},
 		{"runtime", "ListActiveRunsAll", 1, ""},
@@ -57,6 +58,7 @@ func TestCrossCheckLaneSQLExclusionParity(t *testing.T) {
 	comments := regexp.MustCompile(`--[^\n]*`)
 	loadSites := map[string]map[int]bool{
 		"ListWorkersByUser": {0: true}, "ListAllWorkers": {0: true},
+		"GetWorkerProjectionForOwner":           {0: true},
 		"ClaimRun":                              {0: true, 2: true, 4: true},
 		"CountOnlineWorkersClaimableForRun":     {0: true},
 		"CountOnlineWorkersWithFreeSlotForUser": {0: true},
