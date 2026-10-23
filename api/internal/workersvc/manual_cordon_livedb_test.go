@@ -71,6 +71,13 @@ func TestManualCordonCodeCheckerOwnAssignedLiveDB(t *testing.T) {
 	}
 	f.runID = uuid.UUID(cc.CheckerRunID.Bytes)
 	setManualCordonForTest(t, f.env, f.userID, f.workerID, true)
+	before := mustRun(t, f.env, f.runID)
+	f.env.exec("UPDATE workers SET maintenance_fenced=true WHERE id=$1", f.workerID)
+	if laneClaim(t, f, "cross_check", nil) != nil {
+		t.Fatal("hard-fenced assigned code checker delivered executable payload")
+	}
+	f.unchanged(t, before)
+	f.env.exec("UPDATE workers SET maintenance_fenced=false WHERE id=$1", f.workerID)
 	p := laneClaim(t, f, "cross_check", nil)
 	r := mustRun(t, f.env, f.runID)
 	if p == nil || p.RunID != f.runID.String() || p.CrossCheck == nil || p.CrossCheck.Stage != "code" ||
@@ -122,6 +129,16 @@ func TestManualCordonChatIntakeAndContinuationLiveDB(t *testing.T) {
 				VALUES($1,$2,'chat','manual chat','hello','queued',$3)`, id, f.userID, worker)
 			stale := wkrRow(t, env, f.workerID)
 			setManualCordonForTest(t, env, f.userID, f.workerID, true)
+			if assigned {
+				before := mustRun(t, env, id)
+				env.exec("UPDATE workers SET maintenance_fenced=true WHERE id=$1", f.workerID)
+				p, err := f.svc.ClaimChat(env.ctx, stale)
+				after := mustRun(t, env, id)
+				if err != nil || p != nil || after.Status != before.Status || after.WorkerID != before.WorkerID || after.ClaimGeneration != before.ClaimGeneration {
+					t.Fatalf("hard-fenced assigned chat changed admission: payload=%v err=%v before=%+v after=%+v", p != nil, err, before, after)
+				}
+				env.exec("UPDATE workers SET maintenance_fenced=false WHERE id=$1", f.workerID)
+			}
 			p, err := f.svc.ClaimChat(env.ctx, stale)
 			if err != nil {
 				t.Fatal(err)
@@ -138,6 +155,47 @@ func TestManualCordonChatIntakeAndContinuationLiveDB(t *testing.T) {
 			if err != nil || p == nil || p.RunID != id.String() || r.Status != "claimed" ||
 				!r.WorkerID.Valid || uuid.UUID(r.WorkerID.Bytes) != f.workerID || r.ClaimGeneration != 1 {
 				t.Fatalf("chat continuation/uncordon did not deliver persisted claim: err=%v", err)
+			}
+		})
+	}
+}
+
+func TestManualCordonEndedChatContinueLiveDB(t *testing.T) {
+	for _, cordoned := range []bool{false, true} {
+		t.Run(fmt.Sprint("cordoned=", cordoned), func(t *testing.T) {
+			env := setupCodexLiveDB(t)
+			f := newCustodyContinuationFixture(t, env)
+			src := uuid.New()
+			env.exec(`INSERT INTO runs(id,user_id,kind,issue_title,issue_description,status,worker_id)
+				VALUES($1,$2,'chat','ended chat','hello','completed',$3)`, src, f.userID, f.workerID)
+			if cordoned {
+				setManualCordonForTest(t, env, f.userID, f.workerID, true)
+			}
+			next, err := f.svc.ContinueChat(env.ctx, f.userID, src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if next.ID == src || next.Status != "queued" || !next.ResumeOfRunID.Valid || uuid.UUID(next.ResumeOfRunID.Bytes) != src ||
+				next.WorkerID.Valid != !cordoned || next.ClaimGeneration != 0 {
+				t.Fatalf("ended ContinueChat did not create correctly assigned new run: %+v", next)
+			}
+			if !cordoned && uuid.UUID(next.WorkerID.Bytes) != f.workerID {
+				t.Fatal("uncordoned ContinueChat lost source-worker affinity")
+			}
+			stale := wkrRow(t, env, f.workerID)
+			p, err := f.svc.ClaimChat(env.ctx, stale)
+			if cordoned {
+				r := mustRun(t, env, next.ID)
+				if err != nil || p != nil || r.Status != "queued" || r.WorkerID.Valid || r.ClaimGeneration != 0 {
+					t.Fatalf("ended chat broadened affinity under manual cordon: payload=%v err=%v run=%+v", p != nil, err, r)
+				}
+				setManualCordonForTest(t, env, f.userID, f.workerID, false)
+				p, err = f.svc.ClaimChat(env.ctx, stale)
+			}
+			r := mustRun(t, env, next.ID)
+			if err != nil || p == nil || p.RunID != next.ID.String() || r.Status != "claimed" ||
+				!r.WorkerID.Valid || uuid.UUID(r.WorkerID.Bytes) != f.workerID || r.ClaimGeneration != 1 {
+				t.Fatalf("ended chat positive claim control failed: payload=%v err=%v run=%+v", p != nil, err, r)
 			}
 		})
 	}

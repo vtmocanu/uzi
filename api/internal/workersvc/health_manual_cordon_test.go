@@ -15,13 +15,27 @@ import (
 // and maintenance-fenced peers are still suitable; unavailable and incompatible
 // peers cannot enlarge the manual-cordon denominator.
 func TestManualCordonHealthSuitableSetLiveDB(t *testing.T) {
-	for _, peerState := range []string{"none", "busy", "hard-fenced", "wrong-owner", "incompatible", "stale", "offline", "placement-disallowed"} {
+	for _, peerState := range []string{"none", "busy", "hard-fenced", "automatically-draining", "wrong-owner", "incompatible", "stale", "offline", "placement-disallowed", "protocol", "bound-elsewhere", "isolated-lane", "artifact", "semantic"} {
 		t.Run(peerState, func(t *testing.T) {
 			e := setupInterlockLiveDB(t)
 			svc := e.permitService(t)
 			run := e.seedQueuedRun(t, nil, []string{"gpu"})
 			e.exec(t, "UPDATE runs SET status_since=now()-interval '1 hour' WHERE id=$1", run)
-			manual := e.seedHeartbeatWorker(t, nil)
+			var protocols []string
+			switch peerState {
+			case "protocol":
+				e.exec(t, "UPDATE runs SET completion_contract_version=1 WHERE id=$1", run)
+				protocols = []string{"completion_interlock_v1"}
+			case "artifact":
+				e.exec(t, "UPDATE runs SET kind='prompt',issue_iid=NULL,ci_config_guard=true WHERE id=$1", run)
+				e.exec(t, `INSERT INTO job_files(user_id,run_id,direction,display_name,byte_size,sha256,storage_name,content_type,state)
+					VALUES($1,$2,'input','fixture.txt',0,repeat('a',64),repeat('a',64)||'.txt','text/plain','attached')`, e.userID, run)
+				protocols = []string{"ci_config_guard_v1", "ci_artifacts_v1"}
+			case "semantic":
+				e.exec(t, `INSERT INTO semantic_planning(run_id,enrollment) VALUES($1,'{"profile":"semantic","policy":{"version":1,"model":"sonnet","max_reviews":3,"max_invocations":2,"max_tokens":120000,"max_seconds":900}}')`, run)
+				protocols = []string{"completion_semantic_publication_v1"}
+			}
+			manual := e.seedHeartbeatWorker(t, protocols)
 			e.exec(t, "UPDATE workers SET capabilities='{gpu}' WHERE id=$1", manual)
 			cordoned, err := store.ChangeWorkerManualCordon(e.ctx, e.pool, e.userID, manual, "health operator",
 				pgtype.Text{String: "investigating capacity", Valid: true}, true)
@@ -40,6 +54,9 @@ func TestManualCordonHealthSuitableSetLiveDB(t *testing.T) {
 				case "hard-fenced":
 					e.exec(t, "UPDATE workers SET maintenance_fenced=true WHERE id=$1", peer)
 					wantSuitable = 2
+				case "automatically-draining":
+					e.exec(t, "UPDATE workers SET draining_since=now(),draining_reason='image_roll' WHERE id=$1", peer)
+					wantSuitable = 2
 				case "wrong-owner":
 					owner := uuid.New()
 					e.exec(t, "INSERT INTO users(id,email,password_hash) VALUES($1,$2,'x')", owner, owner.String()+"@e2e")
@@ -50,6 +67,15 @@ func TestManualCordonHealthSuitableSetLiveDB(t *testing.T) {
 					e.exec(t, "UPDATE workers SET last_heartbeat_at=now()-interval '1 hour' WHERE id=$1", peer)
 				case "offline":
 					e.exec(t, "UPDATE workers SET status='offline' WHERE id=$1", peer)
+				case "protocol", "semantic":
+					// The cordoned worker has the required protocol; the peer does not.
+				case "artifact":
+					e.exec(t, "UPDATE workers SET protocol_capabilities='{ci_config_guard_v1}' WHERE id=$1", peer)
+				case "bound-elsewhere":
+					bound := e.seedQueuedRun(t, nil, nil)
+					e.exec(t, "UPDATE workers SET ephemeral=true,ephemeral_run_id=$2 WHERE id=$1", peer, bound)
+				case "isolated-lane":
+					e.exec(t, "UPDATE workers SET kind='hosted',hosted_size='m',template_declared='base',isolated_lane=true,ephemeral=true WHERE id=$1", peer)
 				case "placement-disallowed":
 					// A Docker worker may not serve this repo: the service
 					// passes an empty Docker repository allowlist.
@@ -69,18 +95,32 @@ func TestManualCordonHealthSuitableSetLiveDB(t *testing.T) {
 				if reason != "" {
 					t.Fatalf("uncordoned suitable peer misdiagnosed: %q", reason)
 				}
-				return
 			}
 			wantReason := fmt.Sprintf("waiting for workers cordoned (manual): health operator (%s) at %s: investigating capacity",
 				e.userID, cordoned.ManualCordonedAt.Time.UTC().Format(time.RFC3339))
+			if wantSuitable == 2 {
+				wantReason = ""
+			}
 			if reason != wantReason {
 				t.Fatalf("metadata reason=%q want=%q", reason, wantReason)
 			}
 			// queuedReason consumes the same real projection and must surface
 			// its metadata rather than a generic lack-of-capacity explanation.
 			svc.SetCapabilitySettings(fakeCapabilitySettings{on: true})
-			if got := svc.queuedReason(e.ctx, now, e.healthRowFor(t, run), thWithLimit(testCustodyLimit)); got != wantReason {
+			row := e.healthRowFor(t, run)
+			got := svc.queuedReason(e.ctx, now, row, thWithLimit(testCustodyLimit))
+			if wantSuitable == 2 {
+				if strings.Contains(got, "cordoned (manual)") {
+					t.Fatalf("suitable peer falsely diagnosed manual by resolver: %q", got)
+				}
+			} else if got != wantReason {
 				t.Fatalf("queued reason=%q want=%q", got, wantReason)
+			}
+			th := thWithLimit(testCustodyLimit)
+			th.queued = 10 * time.Minute
+			target, targetReason := svc.healthTargetFor(e.ctx, now, row, th)
+			if target != healthWaitingWorker || targetReason != got {
+				t.Fatalf("health target=%q/%q want waiting_worker/%q", target, targetReason, got)
 			}
 			if _, err := store.ChangeWorkerManualCordon(e.ctx, e.pool, e.userID, manual, "health operator", pgtype.Text{}, false); err != nil {
 				t.Fatal(err)

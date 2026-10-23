@@ -86,10 +86,22 @@ func TestManualCordonMigrationLifecycleLiveDB(t *testing.T) {
 	}
 	// Boundary values are accepted and validation preserves them.
 	mustExec(ctx, t, pool, "UPDATE workers SET manual_cordoned_at=now(),manual_cordoned_by=$2,manual_cordoned_by_label=repeat('x',200),manual_cordon_reason=repeat('r',500) WHERE id=$1", worker, owner)
+	manualFields := func() string {
+		t.Helper()
+		var got string
+		if err := pool.QueryRow(ctx, "SELECT jsonb_build_array(manual_cordoned_at,manual_cordoned_by,manual_cordoned_by_label,manual_cordon_reason)::text FROM workers WHERE id=$1", worker).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	beforeValidation := manualFields()
 	if err := store.MigrateTo(ctx, dsn, 350); err != nil {
 		t.Fatal(err)
 	}
 	validated(true)
+	if after := manualFields(); after != beforeValidation {
+		t.Fatalf("constraint validation changed manual fields: before=%s after=%s", beforeValidation, after)
+	}
 	if err := store.MigrateTo(ctx, dsn, 351); err != nil {
 		t.Fatal(err)
 	}
