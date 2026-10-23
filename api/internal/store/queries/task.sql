@@ -31,8 +31,8 @@
 -- create seam (workersvc.createRunAtomic), not the SQL literal 'claude'. A handoff task uses
 -- D11; M2/M3 wire the real resolved value. Every current caller passes string(HarnessClaude)
 -- as a mechanical stopgap.
-INSERT INTO runs (id, user_id, repo_id, kind, branch, base_branch, open_mr, interactive, review_requested, then_fix_requested, issue_title, issue_description, auto_approve, wait_on_limit, required_capabilities, budget_wall_seconds, budget_max_iterations, trigger_source, harness, code_cross_check_required)
-VALUES (@run_id, @user_id, @repo_id::uuid, 'task', @branch, sqlc.narg('base_branch'), @open_mr, @interactive, @review_requested, @then_fix_requested, @issue_title, @issue_description, true, @wait_on_limit, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), sqlc.narg('budget_wall_seconds'), sqlc.narg('budget_max_iterations'), 'task', @harness, (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = @user_id))
+INSERT INTO runs (id, user_id, repo_id, continued_issue_iid, kind, branch, base_branch, open_mr, interactive, review_requested, then_fix_requested, issue_title, issue_description, auto_approve, wait_on_limit, required_capabilities, budget_wall_seconds, budget_max_iterations, trigger_source, harness, code_cross_check_required)
+VALUES (@run_id, @user_id, @repo_id::uuid, sqlc.narg('continued_issue_iid'), 'task', @branch, sqlc.narg('base_branch'), @open_mr, @interactive, @review_requested, @then_fix_requested, @issue_title, @issue_description, true, @wait_on_limit, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), sqlc.narg('budget_wall_seconds'), sqlc.narg('budget_max_iterations'), 'task', @harness, (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = @user_id))
 RETURNING *;
 
 -- name: CreateThenFixRun :one
@@ -63,14 +63,14 @@ RETURNING *;
 -- an explicit selection (D4); M3 wires that real value. Every current caller passes
 -- string(HarnessClaude) as a mechanical stopgap.
 INSERT INTO runs (
-    id, user_id, repo_id, kind, branch, base_branch,
+    id, user_id, repo_id, continued_issue_iid, kind, branch, base_branch,
     then_fix_of_run_id, review_target_run_id, dispatched_at,
     auto_approve, open_mr, review_requested, then_fix_requested, wait_on_limit,
     issue_title, issue_description, required_capabilities,
     budget_wall_seconds, budget_max_iterations, trigger_source, harness
 , code_cross_check_required)
 VALUES (
-    @run_id, @user_id, @repo_id::uuid, 'task', @branch, sqlc.narg('base_branch'),
+    @run_id, @user_id, @repo_id::uuid, (SELECT source.continued_issue_iid FROM runs source WHERE source.id = @then_fix_of_run_id AND source.user_id = @user_id AND source.repo_id = @repo_id::uuid), 'task', @branch, sqlc.narg('base_branch'),
     @then_fix_of_run_id, NULL, now(),
     true, false, false, false, @wait_on_limit,
     @issue_title, @issue_description,
@@ -96,12 +96,12 @@ RETURNING *;
 -- as an explicit selection (D4); M3 wires that real value. Every current caller passes
 -- string(HarnessClaude) as a mechanical stopgap.
 INSERT INTO runs (
-    id, user_id, repo_id, kind, branch, base_branch,
+    id, user_id, repo_id, continued_issue_iid, kind, branch, base_branch,
     review_target_run_id, dispatched_at, auto_approve, open_mr, review_requested,
     issue_title, issue_description, required_capabilities, trigger_source, harness
 , code_cross_check_required)
 VALUES (
-    @run_id, @user_id, @repo_id::uuid, 'task', @branch, sqlc.narg('base_branch'),
+    @run_id, @user_id, @repo_id::uuid, (SELECT source.continued_issue_iid FROM runs source WHERE source.id = @target_run_id AND source.user_id = @user_id AND source.repo_id = @repo_id::uuid), 'task', @branch, sqlc.narg('base_branch'),
     @target_run_id, now(), true, false, false,
     @issue_title, '',
     COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), 'task_review', @harness

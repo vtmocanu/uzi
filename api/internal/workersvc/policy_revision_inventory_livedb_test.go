@@ -27,7 +27,7 @@ func revisionInventoryFixture(t *testing.T) (codexTestEnv, *Service, store.Worke
 	e.ctx = ctx
 	repo := uuid.UUID(mustRun(t, e, old).RepoID.Bytes)
 	setDefaultHarness(t, e, w.UserID, "codex")
-	r, err := svc.CreateTaskRun(ctx, w.UserID, repo, "inventory writer", "", false, false, false, false)
+	r, err := svc.CreateTaskRun(ctx, w.UserID, repo, "inventory writer", "", false, false, false, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

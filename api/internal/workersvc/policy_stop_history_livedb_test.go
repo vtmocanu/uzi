@@ -292,7 +292,7 @@ func TestPolicyStopHistoryRefusesCorruptionLiveDB(t *testing.T) {
 			case "missing_predecessor":
 				e.exec("DELETE FROM run_user_inputs WHERE id=$1", predecessor)
 			case "foreign_predecessor":
-				other, err := f.svc.CreateTaskRun(e.ctx, f.userID, uuid.UUID(mustRun(t, e, run).RepoID.Bytes), "foreign", "", false, false, false, false)
+				other, err := f.svc.CreateTaskRun(e.ctx, f.userID, uuid.UUID(mustRun(t, e, run).RepoID.Bytes), "foreign", "", false, false, false, false, nil)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -395,7 +395,7 @@ func TestPolicyStopHistoryDistinctCandidatesLiveDB(t *testing.T) {
 					case "historical_future":
 						e.exec("UPDATE cross_checks SET lead_claim_generation=2 WHERE id=$1", first.ID)
 					case "foreign":
-						foreign, err := f.svc.CreateTaskRun(e.ctx, f.userID, uuid.UUID(mustRun(t, e, run).RepoID.Bytes), "foreign checker evidence", "", false, false, false, false)
+						foreign, err := f.svc.CreateTaskRun(e.ctx, f.userID, uuid.UUID(mustRun(t, e, run).RepoID.Bytes), "foreign checker evidence", "", false, false, false, false, nil)
 						if err != nil {
 							t.Fatal(err)
 						}

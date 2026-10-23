@@ -39,7 +39,7 @@ func newHandoffCmd(env Env, gf *globalFlags) *cobra.Command {
 		Long: "Hand off a long-running, throwaway task to a uzi worker, agent-style. This command\n" +
 			"creates a task run, pushes your current HEAD to a server-named uzi/task/<id> branch\n" +
 			"with your own git credentials, and dispatches it; the worker commits onto that same\n" +
-			"branch, which you pull. No forge issue, no merge request (pass --mr to open one).\n\n" +
+			"branch, which you pull. Pass --issue to link an existing issue, --mr to open a merge request.\n\n" +
 			"Context comes from -m, or -f <file> ('-' for stdin), or piped stdin. The repo is\n" +
 			"auto-detected from the origin remote; pass --repo to override.\n\n" +
 			"The dispatch confirmation prints how to pull, watch, continue, and clean up the run.",
@@ -55,6 +55,7 @@ func newHandoffCmd(env Env, gf *globalFlags) *cobra.Command {
 	handoff.Flags().Bool("review", false, "after the task completes, run a diff-review and produce findings (fetch with 'uzi handoff review <id>')")
 	handoff.Flags().Bool("then-fix", false, "after the review, auto-apply a fix run for its findings to the same branch (turns on --review)")
 	handoff.Flags().Bool("interactive", false, "Keep the task alive after signal_done to iterate conversationally; wind down with 'uzi run stop'")
+	handoff.Flags().Int64("issue", 0, "link this handoff to an existing issue IID")
 	handoff.Flags().String("repo", "", "repo id to run against (overrides origin auto-detection; see 'uzi repo list')")
 
 	handoff.AddCommand(newHandoffRmCmd(env, gf))
@@ -63,6 +64,14 @@ func newHandoffCmd(env Env, gf *globalFlags) *cobra.Command {
 }
 
 func runHandoffCreate(env Env, gf *globalFlags, cmd *cobra.Command) error {
+	var continuedIssueIID *int64
+	if cmd.Flags().Changed("issue") {
+		iid, err := cmd.Flags().GetInt64("issue")
+		if err != nil || iid <= 0 {
+			return uzicli.Exitf(uzicli.ExitUsage, "--issue must be a positive issue IID")
+		}
+		continuedIssueIID = &iid
+	}
 	msg, _ := cmd.Flags().GetString("message")
 	file, _ := cmd.Flags().GetString("file")
 	base, _ := cmd.Flags().GetString("base")
@@ -128,7 +137,7 @@ func runHandoffCreate(env Env, gf *globalFlags, cmd *cobra.Command) error {
 	}
 
 	// (1) Create — receive the id and the server-named uzi/task/<id> branch.
-	run, err := c.CreateTaskRun(cmd.Context(), repoID, context, baseBranch, mr, reviewRequested, thenFix, interactive)
+	run, err := c.CreateTaskRun(cmd.Context(), repoID, context, baseBranch, mr, reviewRequested, thenFix, interactive, continuedIssueIID)
 	if err != nil {
 		return err
 	}

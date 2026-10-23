@@ -1,3 +1,4 @@
+import { enableRefreshPublication } from "./publication-fixture.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -576,6 +577,8 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     gitIn(fx.originPath, ["checkout", "main"]);
     const { github, calls } = fakeGitHub();
     const claim = githubClaim(158, { kind: "mr_rework", branch: "agent/issue-158", issue_iid: null });
+    claim.claim_generation ??= 7;
+    await enableRefreshPublication(api, client, claim, fx.originPath, 158, "closing");
     const checked: Array<string[] | null> = [];
     const original = git.branchWorkflowFiles.bind(git);
     git.branchWorkflowFiles = (async (...args: Parameters<typeof git.branchWorkflowFiles>) => {

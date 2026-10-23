@@ -1098,9 +1098,11 @@ type Run struct {
 	PolicyLastOutcomeID         pgtype.UUID        `json:"policy_last_outcome_id"`
 	PolicyLastSourceGeneration  pgtype.Int8        `json:"policy_last_source_generation"`
 	PolicyFreshClaimGeneration  pgtype.Int8        `json:"policy_fresh_claim_generation"`
+	SourcePublicationIntent     []byte             `json:"source_publication_intent"`
 	PolicyStopResolution        []byte             `json:"policy_stop_resolution"`
 	PolicyRevisionSource        []byte             `json:"policy_revision_source"`
 	PolicyCandidateCrossCheckID pgtype.UUID        `json:"policy_candidate_cross_check_id"`
+	ContinuedIssueIid           pgtype.Int8        `json:"continued_issue_iid"`
 }
 
 type RunCompletionAttempt struct {

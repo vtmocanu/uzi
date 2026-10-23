@@ -38,6 +38,7 @@
   "forge_type": "x",
   "kind": "x",
   "issue_iid": 1,
+  "continued_issue_iid": 1,
   "issue_title": "x",
   "harness": "x",
   "has_prd_link": true,

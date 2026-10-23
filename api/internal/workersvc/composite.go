@@ -211,6 +211,9 @@ func (s *Service) StartRunForUser(ctx context.Context, userID, repoID uuid.UUID,
 	}
 	capture, err := issueinput.FetchWithTimeout(ctx, f, repo.ForgeProjectID, issueIID, repo.BotForgeUserID, issueinput.InteractiveAssessmentTimeout)
 	if err != nil {
+		if forge.IsIssueResponseTooLarge(err) {
+			return store.Run{}, fmt.Errorf("%w: %w", ErrDescriptionTooLarge, err)
+		}
 		// err is already PAT-redacted by the driver.
 		return store.Run{}, fmt.Errorf("%w: %v", ErrForgeIssueRead, err)
 	}

@@ -27,9 +27,9 @@ import (
 // recovery_archive_redundancy_v1 right after it (the api accepts the archive redundancy claim).
 func TestRegisterAdvertisesProtocolFeatures(t *testing.T) {
 	got := protocolFeatures(true, true, time.Hour)
-	want := []string{"heartbeat_protocol_refresh_v1", "completion_non_closing_v1", "completion_semantic_publication_v1", "dind_maintenance_v1", "worker_memory_pressure_v1", "worker_memory_authority_claim_v1", "recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1", "recovery_completed_publication_v1", "recovery_archive_redundancy_v1", "heartbeat_outbox", "worker_residue_quarantine", "claim_generation_fence", "terminal_fence", "recovery_cause_vault_locked", "recovery_cause_codex_account_unavailable", "gate_revision_v1", "milestone_reconciliation_v1", "plan_revision_retry_v1", "recovery_cause_data_volume_full", "recovery_cause_provider_outage", "provider_progress_on_recovery_park_v1", "run_checkpoint_durability", "repo_agent_folder", "terminal_rejection_report", "credential_switch_hold", "active_run_snapshot", "provider_policy_hold", "recovery_held_publication_v1", "recovery_held_publication_v2"}
+	want := []string{"heartbeat_protocol_refresh_v1", "completion_non_closing_v1", "refresh_publication_context_v1", "completion_semantic_publication_v1", "dind_maintenance_v1", "worker_memory_pressure_v1", "worker_memory_authority_claim_v1", "recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1", "recovery_completed_publication_v1", "recovery_archive_redundancy_v1", "heartbeat_outbox", "worker_residue_quarantine", "claim_generation_fence", "terminal_fence", "recovery_cause_vault_locked", "recovery_cause_codex_account_unavailable", "gate_revision_v1", "milestone_reconciliation_v1", "plan_revision_retry_v1", "recovery_cause_data_volume_full", "recovery_cause_provider_outage", "provider_progress_on_recovery_park_v1", "run_checkpoint_durability", "repo_agent_folder", "terminal_rejection_report", "credential_switch_hold", "active_run_snapshot", "provider_policy_hold", "recovery_held_publication_v1", "recovery_held_publication_v2"}
 	if !slices.Equal(got, want) {
-		t.Fatalf("protocolFeatures(true, true) = %v, want exactly %v", got, want)
+		t.Fatalf("protocolFeatures(true, true, time.Hour) = %v, want exactly %v", got, want)
 	}
 	// Fresh slice: a caller mutating the result must not corrupt the advertised set.
 	got[0] = "clobbered"
@@ -43,12 +43,12 @@ func TestRegisterAdvertisesProtocolFeatures(t *testing.T) {
 // feature while the other landed tokens stay exactly as they were.
 func TestProtocolFeaturesOmitsSnapshotWhenDisabled(t *testing.T) {
 	got := protocolFeatures(false, true, time.Hour)
-	want := []string{"heartbeat_protocol_refresh_v1", "completion_non_closing_v1", "completion_semantic_publication_v1", "dind_maintenance_v1", "worker_memory_pressure_v1", "worker_memory_authority_claim_v1", "recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1", "recovery_completed_publication_v1", "recovery_archive_redundancy_v1", "heartbeat_outbox", "worker_residue_quarantine", "claim_generation_fence", "terminal_fence", "recovery_cause_vault_locked", "recovery_cause_codex_account_unavailable", "gate_revision_v1", "milestone_reconciliation_v1", "plan_revision_retry_v1", "recovery_cause_data_volume_full", "recovery_cause_provider_outage", "provider_progress_on_recovery_park_v1", "run_checkpoint_durability", "repo_agent_folder", "terminal_rejection_report", "credential_switch_hold", "recovery_held_publication_v1", "recovery_held_publication_v2"}
+	want := []string{"heartbeat_protocol_refresh_v1", "completion_non_closing_v1", "refresh_publication_context_v1", "completion_semantic_publication_v1", "dind_maintenance_v1", "worker_memory_pressure_v1", "worker_memory_authority_claim_v1", "recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1", "recovery_completed_publication_v1", "recovery_archive_redundancy_v1", "heartbeat_outbox", "worker_residue_quarantine", "claim_generation_fence", "terminal_fence", "recovery_cause_vault_locked", "recovery_cause_codex_account_unavailable", "gate_revision_v1", "milestone_reconciliation_v1", "plan_revision_retry_v1", "recovery_cause_data_volume_full", "recovery_cause_provider_outage", "provider_progress_on_recovery_park_v1", "run_checkpoint_durability", "repo_agent_folder", "terminal_rejection_report", "credential_switch_hold", "recovery_held_publication_v1", "recovery_held_publication_v2"}
 	if !slices.Equal(got, want) {
-		t.Fatalf("protocolFeatures(false, true) = %v, want exactly %v", got, want)
+		t.Fatalf("protocolFeatures(false, true, time.Hour) = %v, want exactly %v", got, want)
 	}
 	if slices.Contains(got, "active_run_snapshot") {
-		t.Fatal("protocolFeatures(false, true) advertises active_run_snapshot; the feature is disabled and it must be omitted")
+		t.Fatal("protocolFeatures(false, true, time.Hour) advertises active_run_snapshot; the feature is disabled and it must be omitted")
 	}
 }
 

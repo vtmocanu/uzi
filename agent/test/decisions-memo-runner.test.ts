@@ -1,5 +1,7 @@
+import { enableRefreshPublication } from "./publication-fixture.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { recordingLogger, nullLogger } from "./helpers.js";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
@@ -8,6 +10,8 @@ import { DECISIONS_MEMO_MAX_BYTES, DECISIONS_MEMO_TRANSPORT_MAX_BYTES } from "..
 import type { ClaimResponse } from "../src/protocol.js";
 import {
   api,
+  client,
+  fx,
   assistant,
   fakeGitlab,
   git,
@@ -74,10 +78,26 @@ const enabledMemo = (body: unknown = { format: 1, body: "earlier-run-notes", sou
 });
 
 async function drive(claim: ClaimResponse, lead: Driven, exec?: Executor) {
+  const refresh = claim.kind === "mr_rework" || (claim.kind === "ci_fix" && claim.pipeline?.ref === "agent/issue-7");
+  if (refresh) {
+    claim.claim_generation ??= 7;
+    await enableRefreshPublication(api, client, claim, fx.originPath, claim.kind === "mr_rework" ? 42 : 7, "closing");
+  }
   const { gitlab, calls } = fakeGitlab();
   const { logger, lines } = recordingLogger();
   api.setInputs(claim.run_id, [input("approve_plan")]);
   const executor = exec ?? new SdkExecutor(nullLogger(), homeDir, { queryFn: lead.queryFn });
+  // These scripted leads model committed work via changedFiles; refresh authority also
+  // needs a real candidate distinct from the historical main commit.
+  if (refresh) {
+    const run = executor.run.bind(executor);
+    executor.run = async ctx => {
+      const result = await run(ctx);
+      execFileSync("git", ["-C", ctx.worktreePath, "-c", "user.name=Test", "-c", "user.email=test@example.test",
+        "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "memo refresh fixture work"]);
+      return result;
+    };
+  }
   await runnerWith(() => ({ executor }), gitlab, undefined, logger).execute(claim);
   const completed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "completed");
   return { calls, lines, completed };
@@ -217,7 +237,8 @@ describe("decisions memo: no save", () => {
     simulateCommittedWork();
     api.decisionsMemo.get = enabledMemo(null);
     const exec: Executor = { run: async (ctx) => ({ branch: ctx.branch, decisionsMemo: CANARY }) };
-    await drive(gitlabClaim(7, { kind: "ci_fix", pipeline: { id: 1, ref: "agent/issue-7", web_url: "https://x/1", failed_jobs: [] } as never }), scriptedLead(undefined), exec);
+    const { completed } = await drive(gitlabClaim(7, { kind: "ci_fix", pipeline: { id: 1, ref: "agent/issue-7", web_url: "https://x/1", failed_jobs: [] } as never }), scriptedLead(undefined), exec);
+    assert.ok(completed, "the CI adoption reaches completion before checking memo exclusion");
     assert.strictEqual(api.decisionsMemoGets.length, 0);
     assert.strictEqual(api.decisionsMemoPosts.length, 0);
   });
@@ -267,7 +288,8 @@ describe("decisions memo: claim-time read", () => {
     api.decisionsMemo.get = enabledMemo({ format: 1, body: "REMEMBER-THE-FIX", source_run_id: "r0" });
     const claim = rework();
     const lead = scriptedLead("next-memo");
-    await drive(claim, lead);
+    const { completed } = await drive(claim, lead);
+    assert.ok(completed, "memo injection survives refresh publication");
     assert.ok(lead.prompts[0]!.includes("REMEMBER-THE-FIX"));
     assert.match(lead.prompts[0]!, /<untrusted_decisions_memo_[0-9a-f]+>/);
     const statuses = api.messages(claim.run_id).filter((m) => m.kind === "status").map((m) => JSON.stringify(m.payload));
@@ -282,7 +304,8 @@ describe("decisions memo: claim-time read", () => {
     simulateCommittedWork();
     api.decisionsMemo.get = enabledMemo({ format: 1, body: "REMEMBER-THE-FIX" });
     const claim = rework();
-    await drive(claim, scriptedLead("next-memo"));
+    const { completed } = await drive(claim, scriptedLead("next-memo"));
+    assert.ok(completed, "the normal rework reaches completion");
     assert.strictEqual(injected(claim).length, 1);
   });
 

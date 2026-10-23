@@ -36,6 +36,42 @@ fall back only at exactly the claim revision (default 1). A different
 revision without scope holds closed. Upgrade both components for current
 scope rendering; see [Completion holds](run-completion-hold.md).
 
+## Refresh publication context (#3120)
+
+Roll the API and workers together for `refresh_publication_context_v1`.
+New issue workers send terminal `source_publication` evidence for the exact
+successful pushed SHA, including on legacy non-interlocked runs. The API stores
+an immutable `runs.source_publication_intent` stamp in the same transaction
+as successful issue completion, independently of recovery inventory or permit
+negotiation. It does not stamp before push. A rejected or rolled-back initial
+completion creates no stamp; without other affirmative evidence, a later
+refresh is unknown. A lost commit acknowledgement can leave completion and the stamp
+durable; exact terminal replay validates that paired outcome.
+
+MR rework and pipeline-branch-adopting CI fix on new workers require the
+negotiated feature and authenticated resolver; absence or unknown authority
+refuses publication. Closing needs the terminal stamp. Historical affirmative
+non-closing evidence can restrict without one, but historical publications
+receive no backfill. Old workers retain their earlier publication behavior;
+new workers against old APIs refuse affected refreshes. Source-issue runs
+retain their earlier compatibility behavior until both components are upgraded.
+Neither release badges nor an API-only upgrade prove these refresh pushes are guarded. Pull/merge request text grants no authority.
+
+Deploy `00349_source_publication_intent.sql` and
+`00350_validate_source_publication_intent.sql` before the new API. Migration
+349 adds a nullable evidence column and an immutability trigger, with no
+backfill, default or index; migration 350 validates the constraint in a separate
+transaction after the ALTER TABLE lock is released. Both set a two-second
+local lock timeout.
+
+On application rollback, preserve the nullable evidence column and its
+recorded values. Migration 349 Down drops the column and loses the evidence;
+re-applying Up cannot reconstruct closing proof. Migration 350 Down retains
+the validated constraint. Old binaries can leave the column unused.
+See [Completion holds](run-completion-hold.md#refreshing-an-existing-publication-3120)
+for refusal, recovery and Forgejo/Gitea boundaries. This rollout does not
+activate semantic completion or establish live deployment acceptance.
+
 ## Semantic completion capabilities (dormant)
 
 **Dormant.** Production enrollment is off until #1231, so no real run needs these

@@ -16,7 +16,7 @@ import (
 func (g *github) GetMergeRequest(ctx context.Context, projectID, mrIID int64) (MergeRequest, error) {
 	slug, err := g.repoSlugFor(ctx, projectID)
 	if err != nil {
-		return MergeRequest{}, err
+		return MergeRequest{}, mrOverflowError(err)
 	}
 	num, err := ghNum(mrIID)
 	if err != nil {

@@ -266,6 +266,7 @@
   "forge_type": "x",
   "kind": "x",
   "issue_iid": 1,
+  "continued_issue_iid": 1,
   "issue_title": "x",
   "issue_description": "x",
   "harness": "x",

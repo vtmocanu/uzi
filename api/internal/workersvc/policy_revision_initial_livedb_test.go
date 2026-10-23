@@ -38,7 +38,7 @@ func TestPolicyRevisionInitialCreationLiveDB(t *testing.T) {
 					seedEligibleIssue(t, e, repo, 1)
 					r, err = svc.CreateRun(e.ctx, user, repo, 1, "description", nil, nil, false, nil, nil, nil)
 				case "task", "interactive":
-					r, err = svc.CreateTaskRun(e.ctx, user, repo, "context", "", false, false, false, kind == "interactive")
+					r, err = svc.CreateTaskRun(e.ctx, user, repo, "context", "", false, false, false, kind == "interactive", nil)
 				case "prompt":
 					schedule := seedPromptScheduleRow(t, e, user, repo)
 					r, err = svc.CreatePromptRun(e.ctx, user, repo, schedule, "title", "prompt", false, false, nil, nil, false, nil, nil)
@@ -50,7 +50,7 @@ func TestPolicyRevisionInitialCreationLiveDB(t *testing.T) {
 					// Bridge: execute each child's real SQL INSERT through the atomic
 					// seam; public follow-on dispatch needs unrelated terminal events.
 					// The original is created publicly so its repo and branch are real.
-					target, createErr := svc.CreateTaskRun(e.ctx, user, repo, "context", "", false, false, false, false)
+					target, createErr := svc.CreateTaskRun(e.ctx, user, repo, "context", "", false, false, false, false, nil)
 					if createErr != nil {
 						t.Fatal(createErr)
 					}
@@ -209,7 +209,7 @@ func TestPolicyRevisionUnsupportedInvalidationLiveDB(t *testing.T) {
 				// seeded; no source UPDATE simulates initialization or acceptance.
 				alias := e.seedStaticAPIKey(t, e.userID, "initial-batch-"+uuid.NewString(), codexToken("sk"))
 				makeCodexDefault(t, e.codexTestEnv, alias)
-				r, err := e.svc.CreateTaskRun(e.ctx, e.userID, e.repoID, "context", "", false, false, false, false)
+				r, err := e.svc.CreateTaskRun(e.ctx, e.userID, e.repoID, "context", "", false, false, false, false, nil)
 				if err != nil {
 					t.Fatal(err)
 				}

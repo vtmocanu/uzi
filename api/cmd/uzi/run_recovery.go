@@ -23,11 +23,20 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
+
+func parseRecoveryRunID(raw string) (string, error) {
+	id, err := uuid.Parse(raw)
+	if err != nil {
+		return "", uzicli.Exitf(uzicli.ExitUsage, "invalid run id %q: the full run UUID is required", cellText(raw))
+	}
+	return id.String(), nil
+}
 
 // newRunRecoveryCmd builds `uzi run recovery [run-id] [--json]`.
 func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
@@ -67,8 +76,25 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 			"names where it lives: `refs/uzi-checkpoints/<branch>`, or `refs/uzi-recovery/<run-id>` " +
 			"once a newer run on the same branch superseded it, with its tip and retention state " +
 			"(--json: checkpoint_ref, checkpoint_tip, checkpoint_state).",
-		Args: cobra.MaximumNArgs(1),
+		Args: func(cmd *cobra.Command, args []string) error {
+			if err := cobra.MaximumNArgs(1)(cmd, args); err != nil {
+				return err
+			}
+			if len(args) == 1 {
+				_, err := parseRecoveryRunID(args[0])
+				return err
+			}
+			return nil
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			var runID string
+			if len(args) == 1 {
+				var err error
+				runID, err = parseRecoveryRunID(args[0])
+				if err != nil {
+					return err
+				}
+			}
 			c, err := env.client(gf)
 			if err != nil {
 				return err
@@ -84,7 +110,6 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 				}
 				return renderOwnerRecovery(env, gf, holds, reasons)
 			}
-			runID := args[0]
 			// The endpoint is owner-wide; narrow to this run client-side.
 			var forRun []apitypes.RecoveryCustodyHoldDTO
 			for _, h := range holds.Holds {

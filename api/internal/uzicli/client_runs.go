@@ -563,7 +563,7 @@ func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int6
 	return env.Run, nil
 }
 
-func (c *HTTPClient) CreateTaskRun(ctx context.Context, repoID, taskContext, baseBranch string, openMR, reviewRequested, thenFixRequested, interactive bool) (apitypes.RunDTO, error) {
+func (c *HTTPClient) CreateTaskRun(ctx context.Context, repoID, taskContext, baseBranch string, openMR, reviewRequested, thenFixRequested, interactive bool, continuedIssueIID *int64) (apitypes.RunDTO, error) {
 	var env struct {
 		Run apitypes.RunDTO `json:"run"`
 	}
@@ -573,13 +573,14 @@ func (c *HTTPClient) CreateTaskRun(ctx context.Context, repoID, taskContext, bas
 	// review_requested and then_fix_requested are plain bools (a task defaults to no MR,
 	// no review, no fix; false is the common, correct value to send).
 	reqBody := struct {
-		Context          string `json:"context"`
-		BaseBranch       string `json:"base_branch,omitempty"`
-		OpenMr           bool   `json:"open_mr"`
-		Interactive      bool   `json:"interactive"`
-		ReviewRequested  bool   `json:"review_requested"`
-		ThenFixRequested bool   `json:"then_fix_requested"`
-	}{Context: taskContext, BaseBranch: baseBranch, OpenMr: openMR, Interactive: interactive, ReviewRequested: reviewRequested, ThenFixRequested: thenFixRequested}
+		ContinuedIssueIID *int64 `json:"continued_issue_iid,omitempty"`
+		Context           string `json:"context"`
+		BaseBranch        string `json:"base_branch,omitempty"`
+		OpenMr            bool   `json:"open_mr"`
+		Interactive       bool   `json:"interactive"`
+		ReviewRequested   bool   `json:"review_requested"`
+		ThenFixRequested  bool   `json:"then_fix_requested"`
+	}{ContinuedIssueIID: continuedIssueIID, Context: taskContext, BaseBranch: baseBranch, OpenMr: openMR, Interactive: interactive, ReviewRequested: reviewRequested, ThenFixRequested: thenFixRequested}
 	if err := c.postJSON(ctx, "/api/repos/"+url.PathEscape(repoID)+"/task-runs", reqBody, &env); err != nil {
 		return apitypes.RunDTO{}, err
 	}

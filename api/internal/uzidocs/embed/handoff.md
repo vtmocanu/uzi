@@ -10,8 +10,9 @@ audience: user
 uzi. Where the normal flow is durable and forge-tracked — an issue, a plan
 gate, a merge request someone reviews — a handoff is a **rented remote
 worktree**: you push it some work, watch it, pull the result, and throw the
-branch away. No issue to file, no PRD to write, no MR to review, nothing to
-clean up on the forge afterward (unless you ask for one).
+branch away. No issue to file, no PRD to write, and no MR to review by default.
+For recovery that continues an existing issue, `--issue <iid>` records the
+link without turning the task into an issue run or adding a plan gate.
 
 For the full flag reference and exact behavior, see [uzi
 CLI](./cli.md#uzi-handoff-ephemeral-branch-scoped-task-runs).
@@ -23,7 +24,7 @@ first one — it's a genuinely different shape of run:
 
 | | PRD flow (`uzi run create`) | Handoff flow (`uzi handoff`) |
 |---|---|---|
-| Trigger | A forge issue, usually `uzi`-labelled | A local checkout + inline context |
+| Trigger | A forge issue, usually `uzi`-labelled | A local checkout + inline context; optional existing-issue link |
 | Gate | Plan approval before implementation | None — the worker starts immediately |
 | Deliverable | A merge request you review | Commits on a branch you pull |
 | Record | The issue + MR are the durable history | The run transcript in uzi; no forge artifact by default |
@@ -44,8 +45,8 @@ result" — is what handoff productizes.
    credentials — the same push you'd type by hand.
 3. The CLI dispatches the run. Only now can a worker claim it.
 4. The worker clones `uzi/task/<run-id>`, works your inline context, commits,
-   and pushes its commits back to the same branch — no forge issue, no merge
-   request, unless you passed `--mr`.
+   and pushes its commits back to the same branch — no forge issue is created,
+   and no merge request unless you passed `--mr`.
 5. You `git fetch origin uzi/task/<run-id> && git switch uzi/task/<run-id>`
    to pick up the result. Send more context with the existing `uzi run
    follow-up <run-id>`; watch with `uzi run get`/`uzi run logs --follow` or
@@ -58,6 +59,30 @@ writer. If you push more local commits to a *live* task branch mid-run,
 that push is rejected non-fast-forward rather than clobbering the worker's
 history — a mid-run user push is out of scope for v1. Use `uzi run
 follow-up` to steer a running task instead of pushing over it.
+
+## Continuing an existing issue
+
+After the previous run is terminal, seed a recovery task from your saved ref:
+
+```sh
+uzi handoff --base recover/issue-N --issue N --mr --file <spec>
+```
+
+Replace `N` with the issue IID. The server verifies that it is an existing
+forge issue in a repo you own; open or closed is fine, with no eligibility
+label or PRD required. The task keeps its `uzi/task/<run-id>` branch and has
+no board association. `continued_issue_iid` records the link in run get/list
+JSON; `issue_iid` stays null. The flag itself adds no MR reference or closing
+keyword. Task MRs retain their existing non-closing behavior.
+
+A nonterminal run for that issue, including `pool_wait`, blocks creation
+(HTTP 409, CLI exit 5). Terminal tasks release the guard; review and then-fix
+children inherit the link, but best-effort child creation leaves a gap after
+a parent finishes. There is no continuous reservation when the chain is
+entirely terminal. A completed linked task with an open or unknown-state MR
+blocks fresh issue runs unless `uzi run create --force` is used; force cannot
+bypass the active guard. Handoff creation checks active runs, not completed
+open MRs, and has no `--force`. Omit `--issue` for an unrelated recovery task.
 
 ## The review / then-fix loop
 
@@ -155,7 +180,7 @@ other way (there is no `uzi run create --interactive`) is always one-shot.
 - **There's no server-side auto-prune yet.** A finished no-MR task's branch
   sits on the forge until you delete it with `rm` — that's the v1 cleanup
   story, not an automatic sweep. Run `rm` once you've pulled what you need.
-- **A raw handoff has no forge record.** With no issue and no MR, there's
+- **An unlinked, no-MR handoff has no forge record.** Without `--issue` or `--mr`, there's
   nothing durable on the forge naming what happened — the run transcript and
   your inline context are still persisted in uzi (`uzi run get`/`uzi run
   logs`), but there's no issue thread or MR description to point someone

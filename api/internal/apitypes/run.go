@@ -229,10 +229,11 @@ type RunDTO struct {
 	// set for the issue-shaped kinds (issue, self_improve); the ci_fix fields below carry
 	// pipeline context, chat carries Title, and a task (uzi handoff) carries
 	// Branch/BaseBranch/OpenMr set at create.
-	Kind             string `json:"kind"`
-	IssueIID         *int64 `json:"issue_iid"`
-	IssueTitle       string `json:"issue_title"`
-	IssueDescription string `json:"issue_description"`
+	Kind              string `json:"kind"`
+	IssueIID          *int64 `json:"issue_iid"`
+	ContinuedIssueIID *int64 `json:"continued_issue_iid"`
+	IssueTitle        string `json:"issue_title"`
+	IssueDescription  string `json:"issue_description"`
 	// Harness is the run's ACTUAL execution harness (PRD #1429 M1 / D2), the stored
 	// runs.harness — a closed enum, "claude" | "codex". Always on the wire (the column is NOT
 	// NULL DEFAULT 'claude', so store.Run.Harness is a plain string): a pre-feature run and
@@ -1085,9 +1086,10 @@ type RunSummaryItemDTO struct {
 	// set for the issue-shaped kinds (issue, self_improve); the ci_fix fields below carry
 	// pipeline context, chat carries Title, and a task (uzi handoff) carries
 	// Branch/BaseBranch/OpenMr set at create.
-	Kind       string `json:"kind"`
-	IssueIID   *int64 `json:"issue_iid"`
-	IssueTitle string `json:"issue_title"`
+	Kind              string `json:"kind"`
+	IssueIID          *int64 `json:"issue_iid"`
+	ContinuedIssueIID *int64 `json:"continued_issue_iid"`
+	IssueTitle        string `json:"issue_title"`
 	// Harness is the run's ACTUAL execution harness (PRD #1429 M1 / D2), the stored
 	// runs.harness — a closed enum, "claude" | "codex". Always on the wire (the column is NOT
 	// NULL DEFAULT 'claude', so store.Run.Harness is a plain string): a pre-feature run and
@@ -1858,6 +1860,7 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		ForgeType:                   item.ForgeType,
 		Kind:                        item.Kind,
 		IssueIID:                    item.IssueIID,
+		ContinuedIssueIID:           item.ContinuedIssueIID,
 		IssueTitle:                  item.IssueTitle,
 		Harness:                     item.Harness,
 		HasPRDLink:                  item.HasPRDLink,
@@ -2024,6 +2027,7 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			ForgeType:                   s.ForgeType,
 			Kind:                        s.Kind,
 			IssueIID:                    s.IssueIID,
+			ContinuedIssueIID:           s.ContinuedIssueIID,
 			IssueTitle:                  s.IssueTitle,
 			Harness:                     s.Harness,
 			HasPRDLink:                  s.HasPRDLink,

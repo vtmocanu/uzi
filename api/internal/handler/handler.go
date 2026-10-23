@@ -1294,6 +1294,7 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// extends its own read/write deadlines (worker_held_publication.go); the body is capped
 		// at maxPackBytes. Eligibility is checked before the body is read.
 		r.With(h.refuseJobRuns).Post("/runs/{id}/held-publication", h.WorkerRunHeldPublication)
+		r.With(h.refuseJobRuns).Post("/runs/{id}/publication-context", h.WorkerRunPublicationContext)
 
 		// Agent memory (PRD #90): the worker's save_memory tool POSTs one bounded
 		// entry; the read half lists the run's (user, repo) memory the worker fences

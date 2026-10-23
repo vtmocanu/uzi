@@ -404,6 +404,7 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool, pendin
 	groups := [][]string{
 		{"heartbeat_protocol_refresh_v1"},
 		{"completion_non_closing_v1"},
+		{"refresh_publication_context_v1"},
 		{"completion_semantic_publication_v1"}, // PRD #1230 D4: independent of completion_non_closing_v1; advertises the semantic coverage park report
 		{"dind_maintenance_v1"},
 		{"worker_memory_pressure_v1"},

@@ -341,7 +341,8 @@ type Client interface {
 	// resolves the effective harness itself, D11), "claude"/"codex" (validated CLIENT-SIDE
 	// before this call) rides as an explicit pin.
 	CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, credOverride *CreateRunCredentialOverride, harness string) (apitypes.RunDTO, error)
-	// CreateTaskRun queues an issue-less handoff/task run on a repo (PRD #400 M3):
+	// CreateTaskRun queues a handoff/task run on a repo (PRD #400 M3). A nil
+	// continuedIssueIID omits the optional existing-issue link:
 	// POST /api/repos/{id}/task-runs {context, base_branch?, open_mr}. The server
 	// names the branch (uzi/task/<run-id>) and the created-run response carries it in
 	// Branch — which is what the CLI then pushes local HEAD to. context is the inline
@@ -355,7 +356,7 @@ type Client interface {
 	// findings to the same branch (--then-fix implies --review); interactive
 	// (--interactive) asks the worker to keep the run alive after signal_done (parking in
 	// awaiting_followup to iterate) rather than terminating.
-	CreateTaskRun(ctx context.Context, repoID, context, baseBranch string, openMR, reviewRequested, thenFixRequested, interactive bool) (apitypes.RunDTO, error)
+	CreateTaskRun(ctx context.Context, repoID, context, baseBranch string, openMR, reviewRequested, thenFixRequested, interactive bool, continuedIssueIID *int64) (apitypes.RunDTO, error)
 	// GetTaskReview fetches a handoff task's diff-review (PRD #400 M4a): GET
 	// /api/runs/{id}/task-review, whose envelope is {"task_review": <dto>|null}. A visible
 	// task with no review yet returns a nil DTO (the CLI prints "no review available yet");

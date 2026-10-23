@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { decodePublicationContext, validatePublicationContextRequest } from "./publication-context.js";
+import type { PublicationContextRequest, PublicationContextResponse } from "./protocol.js";
 import { decodeCompletionPending, type CompletionPending } from "./completion-pending.js";
 import { SEMANTIC_GATE_ACK_MAX_BYTES, semanticGateAckSchema } from "./semantic-gate-wire.js";
 import { decodeInterruptedCalls, interruptedRegistration, type InterruptedRegistration, type InterruptedCalls } from "./interrupted-calls.js";
@@ -2067,6 +2069,22 @@ export class WorkerClient {
       this.httpTimeoutMs, signal, CROSS_CHECK_RESPONSE_MAX_BYTES, false, { generation: claimGeneration, round }), claimGeneration, round);
   }
 
+  /** One observation per candidate/attempt; no retry or generation/proof downgrade. */
+  async publicationContext(runId: string, request: PublicationContextRequest, signal?: AbortSignal): Promise<PublicationContextResponse> {
+    const body = { ...request };
+    validatePublicationContextRequest(runId, body);
+    if (!this.hasFeature("refresh_publication_context_v1")) throw new Error("publication context feature unavailable");
+    const owned = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(this.httpTimeoutMs)]);
+    try {
+      return decodePublicationContext(await this.postJSON(
+        `${WORKER_API_PREFIX}/runs/${runId}/publication-context`,
+        body, this.httpTimeoutMs, owned, 16 * 1024, true), runId, body);
+    } catch {
+      owned.throwIfAborted();
+      throw new Error("publication context unavailable");
+    }
+  }
+
   private semanticRequestSignal(generation: number, signal?: AbortSignal): AbortSignal {
     if (!Number.isSafeInteger(generation) || generation <= 0) throw new Error("invalid semantic claim generation");
     return AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(this.httpTimeoutMs)]);
@@ -2199,6 +2217,18 @@ export class WorkerClient {
    */
   async reportState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal): Promise<StateAck> {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/state`;
+    if (body.source_publication !== undefined) {
+      // Snapshot nested proof once, before either transport retries or caller mutation.
+      const outbound: PlanCrossCheckStateRequest = Object.freeze(structuredClone(body));
+      const evidence: StateAttemptEvidence = { ambiguous: false, refusals: 0 };
+      try {
+        return await this.reportStateOnce(runId, path, outbound, signal, CROSS_CHECK_RESPONSE_MAX_BYTES, evidence);
+      } catch (err) {
+        if (!evidence.ambiguous && evidence.refusals > 0 && err instanceof StateDecodeRefusalError)
+          throw new StateReportUnappliedError(runId, err);
+        throw err;
+      }
+    }
     if (body.recovery_cause === "worker_memory_pressure") {
       // Snapshot once: caller mutation and transport retries cannot rebind this request.
       const outbound: PlanCrossCheckStateRequest = Object.freeze(JSON.parse(JSON.stringify(body)));
@@ -2385,6 +2415,21 @@ export class WorkerClient {
     if (MaintenanceBudget.current()) signal = AbortSignal.any([MaintenanceBudget.current()!.signal, ...(signal ? [signal] : [])]);
     for (let attempt = 0; ; attempt++) {
       signal?.throwIfAborted();
+      // Revalidate on every actual attempt: registration may shrink while retry sleep yields.
+      if (body.source_publication !== undefined) {
+        const proof = body.source_publication;
+        if (!this.hasFeature("refresh_publication_context_v1") ||
+            !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0 ||
+            body.status !== "completed" || body.report_only === true ||
+            typeof body.branch !== "string" || body.branch.length === 0 || body.branch.length > 1024 ||
+            /[\p{Cc}\p{Cf}]/u.test(body.branch) ||
+            !Number.isSafeInteger(body.mr_iid) || (body.mr_iid ?? 0) <= 0 ||
+            !proof || proof.version !== 1 ||
+            !/^[0-9a-f]{40}$/.test(proof.published_head) || typeof proof.non_closing !== "boolean" ||
+            (body.head !== undefined && body.head !== proof.published_head) ||
+            (body.completion_final_head !== undefined && body.completion_final_head !== proof.published_head))
+          throw new Error("source publication requires negotiated support, positive claim_generation and matching terminal proof");
+      }
       try {
         const res = await this.fetchRaw("POST", path, body, this.httpTimeoutMs, signal);
         // 409 = the server declined the transition and is telling us the run's real

@@ -924,13 +924,43 @@ in [ADR-1225](../adr/1225-structural-completion-interlock-invariants.md#addendum
   guidance. Published history or Stop requires cancel/manual delivery.
   Partial/accept cannot fix history; a separately approved reconciliation
   reset can replace the frozen contract but cannot clear stored intent.
-- Excluded MR-rework/branch-adopting CI-fix lanes and Forgejo/Gitea branch-push
-  closing are recorded together as finding
-  #3b56e6e5-4352-4694-ae1c-4999d5719e9c, not a forge issue. #1230 D4 is
-  implemented but dormant (production off until #1231; see Feature #1226
-  below); #1231 activation and #3068 provider-policy parking are planned.
-  No semantic activation or completed live deployment acceptance is claimed.
-  (AI-synced 2026-10-20)
+- #3120 implements `refresh_publication_context_v1` for MR rework and
+  pipeline-branch-adopting CI fix: an authenticated resolver binds the live
+  claim, exact candidate, branch, source issue and open request; unknown or
+  ambiguous authority refuses. Positive closing requires immutable terminal
+  source-publication evidence stored atomically with successful issue completion.
+  The report carries the exact frozen successful push SHA, independently of
+  recovery inventory or completion-permit negotiation, including legacy issue
+  runs. There is no pre-push writer. A rejected or rolled-back initial completion
+  creates no stamp and, absent other affirmative evidence, refresh authority is unknown.
+  A lost commit acknowledgement can leave completion and the stamp durable;
+  exact terminal replay validates that paired outcome. Historical
+  affirmative non-closing evidence can restrict without a stamp; historical
+  publications receive no backfill. Pull/merge request text grants no authority.
+  (AI-synced 2026-10-22)
+- Refreshes re-resolve before each exact-candidate push attempt, including
+  retries and transformed candidates, keep source identity stable and latch
+  observed restrictions. Non-closing sources require a default-branch..candidate
+  commit scan, including earlier published history. Refusals fail the refresh,
+  with bounded SHA evidence and no commit text; recovery retains existing
+  inventory settlement rules and preserves legacy local sources unless the
+  original pinned head was verifiably archived. The guard does not rewrite
+  offending messages to repair a refusal. New workers without the feature refuse
+  affected refreshes. Old workers retain their earlier publication behavior;
+  new workers against old APIs refuse affected refreshes. Source-issue runs
+  retain their earlier compatibility behavior until both components are upgraded.
+  Application rollback preserves the nullable evidence column: migration 349
+  Down loses proof and re-up cannot reconstruct it. (AI-synced 2026-10-22)
+- Forgejo/Gitea any-branch closure remains a boundary under #3120: no
+  every-branch scan or settings change covers other unguarded pushes, legacy
+  scope-capped issue delivery, earlier published history or old workers.
+  Non-branch checkpoint/held refs are outside branch-push closure. Check-to-push
+  claim/authority changes and human request edits/merges remain races; the guard
+  cannot undo publication or human edits. Semantic, owner and frozen-scope rules
+  remain unchanged. #1230 D4 is implemented but dormant (production off until
+  #1231; see Feature #1226 below); #1231 activation and #3068 provider-policy
+  parking are planned. No semantic activation or completed live deployment
+  acceptance is claimed. (AI-synced 2026-10-22)
 
 ## Feature #1226 — Structural completion interlock
 

@@ -186,7 +186,7 @@ func runOriginDriftOrigins(t *testing.T, env codexTestEnv, svc *Service, userID,
 	})
 
 	t.Run("task handoff (Service.CreateTaskRun)", func(t *testing.T) {
-		run, err := svc.CreateTaskRun(env.ctx, userID, repoID, "inline context", "", false, false, false, false)
+		run, err := svc.CreateTaskRun(env.ctx, userID, repoID, "inline context", "", false, false, false, false, nil)
 		if err != nil {
 			t.Fatalf("CreateTaskRun: %v", err)
 		}

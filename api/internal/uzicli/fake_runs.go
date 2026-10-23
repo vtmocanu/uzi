@@ -345,7 +345,8 @@ func (f *FakeClient) CreateRun(_ context.Context, repoID string, issueIID int64,
 // refusal still proves the write was reached; CreateTaskRunErr wins over Err so a
 // 422 can be modelled on this verb alone. It appends "create" to TaskCalls so the
 // create → push → dispatch ordering is observable.
-func (f *FakeClient) CreateTaskRun(_ context.Context, repoID, taskContext, baseBranch string, openMR, reviewRequested, thenFixRequested, interactive bool) (apitypes.RunDTO, error) {
+func (f *FakeClient) CreateTaskRun(_ context.Context, repoID, taskContext, baseBranch string, openMR, reviewRequested, thenFixRequested, interactive bool, continuedIssueIID *int64) (apitypes.RunDTO, error) {
+	f.LastCreateTaskContinuedIssueIID = continuedIssueIID
 	f.LastCreateTaskRepoID = repoID
 	f.LastCreateTaskContext = taskContext
 	f.LastCreateTaskBaseBranch = baseBranch

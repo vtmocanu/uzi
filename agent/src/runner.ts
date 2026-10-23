@@ -20,6 +20,7 @@ import { GUARDED_LANE_JOIN_MS } from "./claude-command/lane.js";
 import type { CapturedMemoryContext } from "./codex/broker.js";
 import type { BaseAttestationHoldOutcome, MemoryIncarnation, WorkerMemoryPressureResult } from "./protocol.js";
 import { BASE_ATTESTATION_HOLD_REASON } from "./protocol.js";
+import { PublicationContextLatch } from "./publication-context.js";
 import { RequestError, StateReportUnappliedError, isRunOwnershipLost, isTransient, HELD_PUBLICATION_FEATURE, CREDENTIAL_SWITCH_HOLD_FEATURE } from "./client.js";
 import { RecoveryClosureLimitError, recoveryClosureLimitDetail, formatRecoveryDecodedLimit } from "./recovery-closure.js";
 import { MaintenanceBudget, RetainedSwitchSettlement } from "./maintenance-budget.js";
@@ -935,6 +936,14 @@ class ClosingCommitRefusedSignal extends PublicationRefusedSignal {
   constructor(readonly head: string, readonly shas: string[] | null) {
     super("closing commit message refused");
     this.name = "ClosingCommitRefusedSignal";
+  }
+}
+
+/** A refresh has no affirmative, stable source authority for this exact candidate. */
+class PublicationContextRefusedSignal extends PublicationRefusedSignal {
+  constructor(readonly head: string | null) {
+    super("refresh publication context refused");
+    this.name = "PublicationContextRefusedSignal";
   }
 }
 
@@ -2314,6 +2323,8 @@ interface RunFlight {
   publishedRealTips?: string[];
   /** Exact candidate of the successful finalize push, retained for completion bookkeeping. */
   successfulPushedSha?: string;
+  /** Registration support frozen at flight creation, before any publication. */
+  sourcePublicationNegotiated?: boolean;
   /** PRD #1230 D5: the frozen sources of the latest compiled semantic candidate and where they were
    *  captured, so a drift observation reads each PRD at the same commit. Detection input only. */
   semanticDrift?: { barePath: string; headSha: string; sources: FrozenSource[] };
@@ -6981,6 +6992,7 @@ export class RunRunner {
     // fetch-back). Undefined until then and for non-code-publishing / early-return kinds, so
     // the terminal drive is a no-op for report-only / not_code / pause / empty-diff exits.
     let recoveryRecord: RecoveryRecord | undefined;
+    let terminalCaptureVerified = false;
     // Drive the durable-recovery terminal action off the reported status, once H is pinned:
     // a `completed` full publication releases custody; a `failed` finalization captures +
     // uploads the verified bundle (model-free). Best-effort — it MUST NOT disturb the run's
@@ -7045,6 +7057,7 @@ export class RunRunner {
               forgeUsername: claim.secrets.forge_username,
               signal: boundarySignal,
             });
+            terminalCaptureVerified = outcome.state === "uploaded";
             runLog.info("recovery: finalization-failure capture outcome", {
               run_id: claim.run_id,
               capture_id: outcome.captureId,
@@ -7094,6 +7107,8 @@ export class RunRunner {
       logMessage: string,
       fields: Record<string, unknown>,
     ): Promise<void> => {
+      // Persist the source fence with the proof, including on boot-time replay.
+      if (body.source_publication !== undefined) body = { ...body, claim_generation: flight.claimGeneration };
       // Freeze delivered identity before journal installation and before fallback can change HEAD.
       const finalHead = body.head ?? flight.successfulPushedSha;
       if (flight.inventoryGuarded && ["issue", "mr_rework", "self_improve"].includes(flight.runKind) &&
@@ -7888,7 +7903,23 @@ export class RunRunner {
 
     const effectiveDeclared = result.nonClosing ?? claim.config?.non_closing;
     const issuePublication = resolveRunKind(claim.kind) === "issue" && typeof claim.issue_iid === "number";
+    const refreshPublication = resolveRunKind(claim.kind) === "mr_rework" ||
+      (resolveRunKind(claim.kind) === "ci_fix" && !!claim.pipeline && result.branch === claim.pipeline.ref);
+    const publicationContextLatch = new PublicationContextLatch();
     let closingGateIid = issuePublication && effectiveDeclared ? claim.issue_iid! : undefined;
+    const refreshPublicationContext = async (head: string | null): Promise<void> => {
+      if (!refreshPublication) return;
+      try {
+        if (!head) throw new PublicationContextRefusedSignal(head);
+        const context = await this.client.publicationContext(runId, {
+          claim_generation: flight.claimGeneration!, branch: result.branch, candidate_head: head,
+        }, boundarySignal);
+        closingGateIid = publicationContextLatch.observe(context);
+      } catch (error) {
+        rethrowWorkflowAbort(error);
+        throw new PublicationContextRefusedSignal(head);
+      }
+    };
     // PRD #1230 M4: set only from the publication-start ACK's non-empty maintainer-pending
     // projection. It widens the closing guard and the non-closing delivery decision; it is neither a
     // lead declaration (effectiveDeclared) nor a member of the legacy deferred-milestone set.
@@ -7903,19 +7934,24 @@ export class RunRunner {
       return commits.filter(c => closingDirectiveFor(c.message, closingGateIid!, closingRepoPath)).map(c => c.sha);
     };
     let prepushReported = false;
-    const refusePrepush = async (kind: "closing" | "unknown", head: string | null, evidence: string[] | null = null): Promise<void> => {
+    const refusePrepush = async (kind: "closing" | "unknown" | "context", head: string | null, evidence: string[] | null = null): Promise<void> => {
       if (prepushReported) return;
       prepushReported = true;
       // Never place unvalidated evidence or commit text in the feed or terminal journal.
       const shas = evidence !== null && evidence.every(sha => /^[a-fA-F0-9]{40}$/.test(sha)) ? evidence : null;
       const shown = (shas ?? []).slice(0, 5).join(", ");
       const more = (shas?.length ?? 0) > 5 ? ` and ${shas!.length - 5} more` : "";
-      const failureReason = kind === "unknown" ? COMPLETION_INTERLOCK_UNHELD_REASON : shas === null
+      const refusedCandidate = head && /^[a-fA-F0-9]{40}$/.test(head) ? head : "unavailable";
+      const refusalReason = kind === "context"
+        ? `refresh publication refused: source context could not be confirmed for candidate ${refusedCandidate}; publication stopped`
+        : kind === "unknown" ? COMPLETION_INTERLOCK_UNHELD_REASON : shas === null
         ? "non-closing delivery refused: could not read the commit messages to publish; publication stopped"
         : `non-closing delivery refused: commit message(s) close issue #${closingGateIid} (${shown}${more}); publication stopped; correcting them needs a history rewrite, left to the owner`;
-      const holdEligible = interlocked && !(effectiveDeclared && !this.client.hasFeature("completion_non_closing_v1"));
+      const failureReason = refreshPublication && kind === "closing"
+        ? `${refusalReason}; refused candidate ${refusedCandidate}` : refusalReason;
+      const holdEligible = !refreshPublication && interlocked && !(effectiveDeclared && !this.client.hasFeature("completion_non_closing_v1"));
       batcher.emit({ kind: "status", agent: "worker", payload: {
-        text: kind === "unknown"
+        text: kind === "context" ? failureReason : kind === "unknown"
           ? holdEligible
             ? "Completion state could not be confirmed before push; the run is held for the owner."
             : "Completion state could not be confirmed before push; publication stopped."
@@ -7923,8 +7959,15 @@ export class RunRunner {
       } });
       // An old API cannot retain declared intent on a new hold. Preserve the existing terminal path.
       if (!holdEligible) {
-        await closeBatcher();
-        await journalTerminalReport({ status: "failed", failure_reason: failureReason.slice(0, MAX_FAILURE_REASON_LEN) });
+        try {
+          await closeBatcher();
+          await journalTerminalReport({ status: "failed", failure_reason: failureReason.slice(0, MAX_FAILURE_REASON_LEN) });
+        } finally {
+          // Guarded inventory settlement owns its existing verified-cleanup policy. Legacy
+          // refresh refusals retain the local source unless the original pinned H was archived.
+          if (refreshPublication && claim.inventory_guarded !== true && !terminalCaptureVerified)
+            flight.preserveRecoveryClone = true;
+        }
         return;
       }
       const holdReason = kind === "unknown" ? "completion identity unresolvable" : "closing commit message refused";
@@ -8159,6 +8202,14 @@ export class RunRunner {
         closingGateIid = claim.issue_iid!;
     }
 
+    try {
+      await refreshPublicationContext(publicationOriginalHead);
+    } catch (error) {
+      if (!(error instanceof PublicationContextRefusedSignal)) throw error;
+      await refusePrepush("context", error.head);
+      return;
+    }
+
     // Early closing-commit refusal, placed AFTER the GitHub workflow precheck so a workflow-scope
     // refusal keeps precedence when a run trips both.
     if (closingGateIid !== undefined) {
@@ -8271,6 +8322,9 @@ export class RunRunner {
               throw new WorkflowScopeBlockedSignal();
             }
           }
+          // Every actual attempt re-resolves, including network retries and transformed candidates.
+          // This stays after ownership and workflow checks even when no closing scan was needed.
+          await refreshPublicationContext(sourceSha);
           // Issue #2779: the authoritative commit-message check on the owned candidate about to be
           // pushed. The finalize bridge can re-parent published checkpoint floors into this
           // candidate, so a closing commit reworded away from H can come back after the early check.
@@ -8965,6 +9019,7 @@ export class RunRunner {
       rethrowWorkflowAbort(e);
       if (e instanceof PublicationRefusedSignal) {
         if (e instanceof ClosingCommitRefusedSignal) await refusePrepush("closing", e.head, e.shas);
+        if (e instanceof PublicationContextRefusedSignal) await refusePrepush("context", e.head);
         return;
       }
       if (e instanceof ScratchPublicationError) throw e;
@@ -9047,6 +9102,7 @@ export class RunRunner {
         rethrowWorkflowAbort(e);
         if (e instanceof PublicationRefusedSignal) {
           if (e instanceof ClosingCommitRefusedSignal) await refusePrepush("closing", e.head, e.shas);
+          if (e instanceof PublicationContextRefusedSignal) await refusePrepush("context", e.head);
           return;
         }
         if (e instanceof RunResidueBlockedError) throw e;
@@ -9267,9 +9323,7 @@ export class RunRunner {
       );
     // D17: a refresh run (mr_rework, or a ci_fix adopting an existing branch rather than opening a
     // fresh ci-fix/pipeline-N one) refreshes only the region and never authors closing semantics.
-    const refreshRun =
-      runKind === "mr_rework" ||
-      (runKind === "ci_fix" && !!claim.pipeline && result.branch === claim.pipeline.ref);
+    const refreshRun = refreshPublication;
     const repoPath = repoPathFromUrl(claim.repo.url);
     // Amended D10: an issue run whose completion block is non-closing (an interlocked run until its
     // head is verified, an owner partial, a scope-capped run, an explicit declaration) has its whole body scanned for a
@@ -9710,6 +9764,9 @@ export class RunRunner {
       // interlocked run; undefined for a legacy run, so JSON.stringify drops it and the legacy
       // completed report is byte-for-byte unchanged on the wire.
       head: completionHead,
+      source_publication: flight.sourcePublicationNegotiated && flight.runKind === "issue"
+        ? { version: 1, published_head: flight.successfulPushedSha!, non_closing: nonClosingDelivery }
+        : undefined,
     }, "run completed", { branch: result.branch, mr_iid: mr.iid });
   }
 
@@ -9915,6 +9972,7 @@ export class RunRunner {
       cancel,
       steering,
       claimGeneration,
+      sourcePublicationNegotiated: this.client.hasFeature("refresh_publication_context_v1"),
       planRevisionRetryNegotiated: this.client.hasFeature(PLAN_REVISION_RETRY_FEATURE) && Number.isSafeInteger(claimGeneration) && claimGeneration > 0,
       owedDefaultBranch: claim.repo.default_branch?.trim() || undefined,
       checkpointDefaultBranch: claim.repo.default_branch ?? undefined,

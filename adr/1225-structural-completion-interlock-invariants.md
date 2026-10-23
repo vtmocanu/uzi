@@ -238,11 +238,63 @@ coordinated API/worker rollout is necessary. Retain the nullable column on
 application rollback. The additive ALTER TABLE takes a table lock but has
 no backfill, default or index.
 
+### Source-publication refresh authority (#3120, 2026-10-22)
+
+`refresh_publication_context_v1` provides a worker-authenticated resolver for
+MR rework and pipeline-branch-adopting CI fix. It checks the live owned claim
+generation, branch, candidate, bounded source ancestry and unique source
+association, verifies the open forge request's identity and branch, and
+rechecks the authority snapshot under worker/run locks. Unknown or ambiguous
+authority refuses; pull/merge request text never supplies closing authority.
+
+Positive closing authority requires an immutable terminal
+`runs.source_publication_intent` stamp on the source issue run. The terminal
+`source_publication` report carries version 1, the exact frozen successful
+push SHA and reported non-closing intent. The server derives effective intent
+from that report and authoritative restrictions, binding generation, branch,
+request IID and published head atomically with successful issue completion.
+Legacy non-interlocked issue runs are supported. This evidence is independent
+of recovery-inventory and completion-permit negotiation, grants no custody
+release, and has no pre-push writer. A rejected or rolled-back initial
+completion creates no stamp. A lost commit acknowledgement can leave completion and the stamp
+durable; exact terminal replay validates that paired outcome.
+Without affirmative restriction evidence, missing proof yields unknown even
+after a successful push. Historical affirmative non-closing evidence can
+restrict without a stamp; absence cannot authorize closing. No historical
+backfill is performed.
+
+The worker resolves initially and again at each exact-candidate push attempt,
+including network retries and alignment/bridge candidates. Immutable source
+identity must stay stable; an observed non-closing restriction is latched.
+For a restricted source, default-branch..candidate messages, including earlier
+published history, are checked for closure of the server-resolved source issue.
+Unknown context or unreadable messages refuse. Closing hits fail the refresh
+with the refused candidate, at most five offending SHAs and a remaining count,
+without commit text. Refresh refusals use terminal failure rather than the
+structural hold. Inventory settlement keeps its existing cleanup authority;
+legacy refresh refusal retains the local source unless the original pinned
+head was verifiably archived. This preserves work without asserting a remote
+copy or authorizing a rewrite.
+
+A new worker without the negotiated feature refuses affected refreshes.
+Old workers retain their earlier publication behavior; new workers against
+old APIs refuse affected refreshes. Source-issue runs retain their earlier
+compatibility behavior until both components are upgraded. Migration 349 adds nullable immutable evidence without backfill;
+migration 350 validates separately. Application rollback must preserve the
+column: migration 349 Down destroys evidence, and re-up cannot reconstruct
+closing proof. See [worker rollout guidance](../docs/worker-upgrades.md#refresh-publication-context-3120).
+
+The resolver grants no lease across check-to-push: claim/authority changes,
+human request edits and merges remain races. It cannot undo earlier publication
+or human edits. This adds no semantic activation, owner decision authority or
+scope waiver, and makes no claim of completed live deployment acceptance.
+
 ### Owner recovery and explicit residuals
 
 For an unpublished declared/owner-partial history refusal without Stop,
 owner continue guidance can name the SHAs and ask the lead to reword its own
-unpublished commits. The worker never rewrites history or force-pushes.
+unpublished commits. The guard does not rewrite offending messages or
+force-push to repair a refusal.
 For published history or Stop, cancel and manually deliver preserved work
 through existing recovery. Stop resumes directly into finalization with no
 lead turn; partial/accept cannot repair history. Plain resume is refused for
@@ -251,13 +303,15 @@ resume. Stop is a running owner directive, wall parking follows #1497, and
 provider-policy parking under #3068 remains planned.
 
 Legacy declared refusal remains terminal. Legacy scope caps retain title/body
-protection but can still close through commit messages. `mr_rework` and
-branch-adopting `ci_fix` are excluded from this issue-publication guard.
-Forgejo/Gitea any-branch closing concerns branch pushes; checkpoint refs
-`refs/uzi-checkpoints` and held refs `refs/uzi-held` are not branches.
-The excluded lanes and this Forgejo/Gitea branch-push residual are recorded
-together via finding handoff #3b56e6e5-4352-4694-ae1c-4999d5719e9c.
-That identifier is a finding ID, not a forge issue number.
+protection but can still close through commit messages. #3120 adds the
+source-publication refresh guard above for `mr_rework` and pipeline-branch-adopting
+`ci_fix`; it does not enroll those runs in structural completion.
+
+Forgejo/Gitea any-branch closure remains a boundary: #3120 does not scan every
+branch or change forge settings. Other unguarded pushes, legacy scope-capped
+issue delivery, earlier published history and old workers remain outside its
+guarantee. Checkpoint refs `refs/uzi-checkpoints` and held refs `refs/uzi-held`
+are non-branch refs, outside branch-push closure.
 
 Already-published history cannot be unpushed; an already-open PR may merge
 before a resumed guard runs. Claim loss accepted between ACK and push also
