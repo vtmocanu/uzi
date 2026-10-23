@@ -52,7 +52,9 @@ would launder a real "committed nothing" bug into a green run. So the undeclared
 a reason that names the remedy ("call signal_done with report_only: true"). The
 discrimination is precise: `git.changedFiles` returning `null` means the diff could not be
 computed — that keeps the normal push path (fail-open); only a CONFIRMED `[]` fails. A
-declared `report_only` has already returned before this guard is reached.
+declared `report_only` returns before this guard is reached, except the issue-run fallback
+(#3360, below): it does reach the guard, and a confirmed-empty fetched candidate fails with
+the same #299 reason.
 
 ### 3. A dedicated `report_md` column, not the transcript
 
@@ -93,8 +95,9 @@ instead of opening an empty MR.
 `fetchAgentBranch`, so if a lead declares `report_only` on a run that DID commit code and
 published no checkpoint, that commit is not pushed — it is discarded when the runner clone is
 torn down. There is no inverse guard for that case; when a committed checkpoint WAS published,
-the issue-run fallback below (#3360) applies instead. This mirrors the `not_code` precedent, and the lead prompt frames report_only
-as "no code change to land"; documented here, not guarded.
+the issue-run fallback below (#3360) applies instead. This mirrors the `not_code` precedent,
+and the lead prompt frames report_only as "no code change to land"; documented here, not
+guarded.
 
 **Checkpoint/resume: orphan guard (#299, refined by #759 and #2967).** A
 report-only completion opens no branch or MR to supersede a published checkpoint.
@@ -138,8 +141,10 @@ diff is confirmed empty, the run fails with the existing #299 reason, scope-capp
 included; a diff read failure keeps the fail-open into the normal checks. The prompt-kind
 (#341) zero-diff orphan guard and other run kinds are unchanged.
 
-Known limits: the advisory code cross-check that `report_only` skips is not replayed, so
-when the run requires a cross-check the MR discloses it as incomplete. Against an API
+Known limits: the advisory code cross-check that `report_only` skips is not replayed. The
+fallback's summary is not replaced by the persisted cross-check status; when the run requires
+a cross-check, the MR renders "Code cross-check incomplete: skipped: report_only was
+declared". Against an API
 without `completion_non_closing_v1` the declaration is not persisted (the documented
 rollout limitation in `docs/worker-upgrades.md`, "Completion publication compatibility").
 
