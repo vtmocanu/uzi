@@ -13,9 +13,9 @@ import (
 
 func TestTUIWorkerManualCordon(t *testing.T) {
 	at := time.Date(2026, 10, 23, 1, 2, 3, 0, time.UTC)
-	for _, width := range []int{80, 120} {
+	for _, width := range []int{80, 120, 160} {
 		for _, admin := range []bool{false, true} {
-			for _, kind := range []string{"offline", "holding", "draining", "idle", "effective", "legacy"} {
+			for _, kind := range []string{"offline", "holding", "draining", "idle", "busy", "combined", "effective", "legacy"} {
 				t.Run(fmt.Sprintf("%d/%t/%s", width, admin, kind), func(t *testing.T) {
 					m := workerRenderModel(true)
 					m.board.admin, m.workers.admin, m.workerDetail.admin = admin, admin, admin
@@ -33,11 +33,21 @@ func TestTUIWorkerManualCordon(t *testing.T) {
 					case "draining":
 						w.DrainingSince = &at
 						w.ActiveRuns = 1
+					case "busy":
+						w.Busy, w.ActiveRuns = true, 1
+					case "combined":
+						n := 1
+						w.CustodyDecisionsNeeded, w.DrainingSince = &n, &at
+						w.Busy, w.ActiveRuns = true, 1
 					case "effective":
 						w.ManualCordonedAt = nil
 					case "legacy":
 						w.ManualCordonedAt = nil
 						w.EffectiveCordoned = false
+					}
+					expectedState := map[string]string{"offline": "offline", "holding": "holding", "draining": "draining", "busy": "busy", "combined": "holding", "idle": "idle", "legacy": "idle", "effective": "idle"}[kind]
+					if got := workerState(m.workers.rows[0]); got != expectedState {
+						t.Fatalf("state = %q, want %q", got, expectedState)
 					}
 					for _, view := range []tuiView{viewWorkers, viewWorker} {
 						m.view = view
@@ -61,9 +71,7 @@ func TestTUIWorkerManualCordon(t *testing.T) {
 						default:
 							requireWorkerText(t, out, "cordoned (manual)", "operator", "2026-10-23T01:02:03Z", "maintenance 維😀")
 						}
-						if kind == "offline" || kind == "holding" || kind == "draining" {
-							requireWorkerText(t, out, kind)
-						}
+						requireWorkerText(t, out, expectedState)
 						for _, line := range strings.Split(out, "\n") {
 							if visualWidth(line) > width {
 								t.Fatalf("overflow %q", line)
@@ -78,6 +86,53 @@ func TestTUIWorkerManualCordon(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+// Exercise the writer downgrade independently of the explicit Ascii model above.
+func TestTUIWorkerManualNoColorWriter(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	for _, dark := range []bool{false, true} {
+		for _, view := range []tuiView{viewWorkers, viewWorker} {
+			m := workersScene(dark, "workers-manual-120")
+			m.view = view
+			m.workerDetail.workerID = m.workers.selectedID
+			m = step(m, tea.ColorProfileMsg{Profile: colorprofile.TrueColor})
+			raw := m.View().Content
+			if !strings.Contains(raw, "\u001b[") {
+				t.Fatal("TrueColor input has no ANSI: downgrade control is vacuous")
+			}
+			var buf bytes.Buffer
+			writer := colorprofile.NewWriter(&buf, []string{"NO_COLOR=1", "TERM=xterm-256color", "COLORTERM=truecolor"})
+			if _, err := writer.Write([]byte(raw)); err != nil {
+				t.Fatal(err)
+			}
+			out := buf.String()
+			if strings.Contains(out, "\u001b") {
+				t.Fatalf("NO_COLOR retained ANSI: %q", out)
+			}
+			requireWorkerText(t, out, "cordoned (manual)", "fleet operator", "Maintenance window", "holding")
+		}
+	}
+}
+
+func TestTUIWorkerManualSummary(t *testing.T) {
+	for _, dark := range []bool{false, true} {
+		m := workersScene(dark, "workers-manual-160")
+		// Demo manual intent spans offline, holding, automatic drain and busy.
+		// Pin the totals independently so counting manual intent cannot reclassify liveness.
+		requireWorkerText(t, stripANSI(m.workersSummary(300, false)), "4 cordoned (manual)", "8 online", "5/12 run slots in use", "1 holding", "1 draining", "7 need attention")
+		requireWorkerText(t, stripANSI(m.View().Content), "4 cordoned (manual)", "7 need attention")
+		m = step(m, tea.WindowSizeMsg{Width: 240, Height: 34})
+		requireWorkerText(t, stripANSI(m.View().Content), "4 cordoned (manual)", "8 online", "5/12 run slots in use", "1 holding", "1 draining", "7 need attention")
+		for i := range m.workers.rows {
+			m.workers.rows[i].w.ManualCordonedAt = nil
+		}
+		out := stripANSI(m.workersSummary(300, false))
+		if strings.Contains(out, "cordoned (manual)") {
+			t.Fatal("manual intake inferred from automatic state")
+		}
+		requireWorkerText(t, out, "8 online", "5/12 run slots in use", "1 holding", "1 draining")
 	}
 }
 
@@ -253,13 +308,18 @@ func TestTUIWorkerManualResizeAndSmallRows(t *testing.T) {
 	if selected == "" {
 		t.Fatal("missing selected worker")
 	}
-	for _, size := range []struct{ width, height int }{{80, 12}, {120, 34}, {80, 34}} {
+	for _, size := range []struct{ width, height int }{{80, 12}, {120, 34}, {80, 34}, {160, 60}} {
 		m = step(m, tea.WindowSizeMsg{Width: size.width, Height: size.height})
 		if m.workers.selectedID != selected {
 			t.Fatal("resize lost worker selection")
 		}
 		out := stripANSI(m.View().Content)
-		requireWorkerText(t, out, "recovery", "cordoned (manual)", "enter/→ worker")
+		requireWorkerText(t, out, "recovery", "cordoned (manual)")
+		if size.height >= 60 {
+			requireWorkerText(t, out, "enter/→ open", "ctrl+w focus")
+		} else {
+			requireWorkerText(t, out, "enter/→ worker")
+		}
 		if len(strings.Split(out, "\n")) > size.height {
 			t.Fatal("resize hid footer beyond terminal height")
 		}
@@ -282,12 +342,22 @@ func TestTUIWorkerManualResizeAndSmallRows(t *testing.T) {
 }
 
 func TestTUIManualScenes(t *testing.T) {
-	for _, name := range []string{"workers-manual-80", "workers-manual-120", "worker-manual", "worker-manual-combined"} {
-		m := workersScene(true, name)
-		out := stripANSI(m.View().Content)
-		requireWorkerText(t, out, "cordoned (manual)", "fleet operator", "Maintenance window")
-		if name == "worker-manual-combined" {
-			requireWorkerText(t, out, "offline", "unpublished work needs an owner decision", "only pinned work may claim")
+	for _, name := range []string{"workers-manual-80", "workers-manual-120", "workers-manual-160", "worker-manual-80", "worker-manual-combined-80", "worker-manual", "worker-manual-combined"} {
+		for _, dark := range []bool{true, false} {
+			m := workersScene(dark, name)
+			out := stripANSI(m.View().Content)
+			requireWorkerText(t, out, "cordoned (manual)", "fleet operator", "Maintenance window")
+			for _, line := range strings.Split(out, "\n") {
+				if visualWidth(line) > m.width {
+					t.Fatalf("%s overflow: %q", name, line)
+				}
+			}
+			if name == "workers-manual-160" {
+				requireWorkerText(t, out, "CPU", "MEM", "DISK (worst)", "VERSION", "HB", "INTAKE")
+			}
+			if strings.HasPrefix(name, "worker-manual-combined") {
+				requireWorkerText(t, out, "offline", "unpublished work needs an owner decision", "only pinned work may claim")
+			}
 		}
 	}
 }

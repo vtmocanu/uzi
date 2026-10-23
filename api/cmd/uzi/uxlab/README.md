@@ -172,6 +172,46 @@ exactly one permanent entry, `template`, as the copyable example. This disciplin
 keeps the harness from becoming a second maintained TUI, the fate of the retired
 `factoryui` prototype.
 
+## Fixture-only interactive PTY check
+
+Drive an **already compiled candidate** without a server or credentials.
+From the primary checkout root, run one bounded
+command (replace the binary path with the executable from the exact candidate
+export; choose a fresh output directory):
+
+```sh
+python3 api/cmd/uzi/uxlab/demo-pty.py --binary /absolute/path/to/candidate/uzi --out "$PWD/.uzi/scratch/demo-pty-m3"
+```
+
+The driver launches only `<binary> tui --demo`, using Python's standard library
+PTY support. It does not build, install tools, read other processes, run Git in
+the export, change HOME, or repair a runtime. It limits the full drive to 150
+seconds, each assertion to six seconds (live tick assertions to five), output
+to 8 MiB, and cleanup to its own child PID with bounded waits. A failed step
+stops dependent steps and still cleans up that child.
+
+Artifacts stay in the primary checkout's `.uzi/scratch/demo-pty-m3/`:
+`terminal.ansi` is diagnostic raw output; named `*.txt` files capture
+the **current interpreted screen** at each checkpoint; `checks.jsonl` records
+assertions and dimensions; `result.txt` records pass/failure. Assertions never
+search accumulated terminal output.
+
+Coverage includes worker filtering/selection and manual metadata, detail/help/back,
+offline/automatic-drain/busy combinations, 80×12 / 80×34 / 160×60 resize and footer
+retention, split focus/collapse/restore, and scheduler #418 transcript focus,
+PgUp pause, new-message growth and `g` follow. Worker polls read static demo
+fixtures every five seconds: they do **not** mutate cordon state. The live-update
+check instead observes the demo's existing 1.2-second stream messages.
+
+The interpreter implements cursor positioning, line/screen erasure, SGR, terminal
+queries, alternate-screen modes and basic UTF-8 cell widths for this drive.
+Unknown cursor/erase instructions fail the drive and leave artifacts for review;
+this is not a general terminal emulator. Changes to terminal sequences, focus markers
+or fixture text may require updating the driver. The child disables the CLI's
+skill auto-upgrade and version check, so their pre-run hooks cannot write a skill
+or contact an API before the demo starts. This command does not generate or
+inspect PNGs; light/dark render inspection remains a separate verification step.
+
 ## Adding a state
 
 Add a builder to the `scenes` map in `../uxlab_gen_test.go` (drive the real model with the
