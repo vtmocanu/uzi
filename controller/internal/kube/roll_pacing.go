@@ -363,7 +363,7 @@ func pacingText(s string) *string {
 }
 func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEntry) {
 	for _, e := range pool {
-		if e.blocked == "" && m.promoted(t, e) {
+		if e.blocked == "" && m.incarnationComplete(t, e) {
 			m.releaseRollHold(ctx, t, e)
 		}
 	}
@@ -383,12 +383,12 @@ func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEn
 		for _, peer := range pool {
 			// Current-incarnation proof retires completed pacing metadata only;
 			// this does not release source custody or mutate protected storage.
-			if peer.blocked == "" && peer.marker != nil && !peer.marker.Canary && m.promoted(t, peer) {
+			if peer.blocked == "" && peer.marker != nil && !peer.marker.Canary && m.incarnationComplete(t, peer) {
 				if err := m.reserveRoll(ctx, peer, nil); err != nil {
 					peer.blocked = "completion cleanup unconfirmed"
 				}
 			}
-			if peer.blocked != "" || (peer.marker != nil && !peer.marker.Completed && !m.promoted(t, peer)) || peer.drift {
+			if peer.blocked != "" || (peer.marker != nil && !peer.marker.Completed && !m.incarnationComplete(t, peer)) || peer.drift {
 				t.outcomes[peer.w.ID].State = "held"
 				t.outcomes[peer.w.ID].BlockingReason = pacingText("completed cohort cleanup pending; explicit recovery required if proof is unavailable")
 			} else {
@@ -413,7 +413,7 @@ func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEn
 			proof := e.w.RollEvidence
 			if e.w.CustodyHeld || e.blocked != "" || !e.drift || e.dep == nil || e.dep.Spec.Replicas == nil || *e.dep.Spec.Replicas != 1 ||
 				e.dep.Spec.Template.Annotations[AnnotationSpecHash] == e.marker.Hash || e.w.DrainingSince != nil ||
-				(e.claim != nil && e.claim.Annotations[annotationRoll] != "") || len(e.pods) != 1 || !m.oldUsable(t, e) ||
+				(e.claim != nil && e.claim.Annotations[annotationRoll] != "") || len(e.pods) != 1 || !m.oldIncarnation(t, e) ||
 				proof == nil || proof.RegisterNonce == nil || *proof.RegisterNonce == "" || *proof.RegisterNonce != e.marker.Nonce ||
 				proof.RegisteredVersion == nil || *proof.RegisteredVersion != e.marker.PreviousVersion ||
 				proof.PodUID == nil || *proof.PodUID == "" || *proof.PodUID != string(e.pods[0].UID) ||
@@ -521,7 +521,7 @@ func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEn
 			}
 			if !e.marker.Completed {
 				active = true
-				if !m.promoted(t, e) {
+				if !m.incarnationComplete(t, e) {
 					inFlight++
 				}
 			}
@@ -541,7 +541,7 @@ func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEn
 	}
 	allPromoted := canary != ""
 	for _, e := range pool {
-		if e.drift || (e.marker != nil && !m.promoted(t, e)) {
+		if e.drift || (e.marker != nil && !m.incarnationComplete(t, e)) {
 			allPromoted = false
 		}
 	}
@@ -590,7 +590,7 @@ func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEn
 				e.blocked = "participant roll health stuck"
 			}
 		}
-		if active && !e.drift && e.marker == nil && e.dep != nil && !maintenanceActive(e.w) && !m.currentUsable(t, e) {
+		if active && !e.drift && e.marker == nil && e.dep != nil && !maintenanceActive(e.w) && !m.currentIncarnation(t, e) {
 			blocker = e.w.ID
 			e.blocked = "target template has no reservation proof"
 		}
@@ -689,13 +689,13 @@ func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEn
 			continue
 		}
 		if e.marker != nil {
-			if !e.drift && !m.promoted(t, e) {
+			if !e.drift && !m.incarnationComplete(t, e) {
 				p.State = "waiting_evidence"
 				p.BlockingReason = pacingText("waiting for current-pod registration and nonce heartbeat proof")
 				e.admitted = true
 				continue
 			}
-			if m.promoted(t, e) {
+			if m.incarnationComplete(t, e) {
 				p.State = "active"
 			} else {
 				if !m.remainingCoverage(t, pool, e) || (!promotedCanary && e.w.ID != canary) {
@@ -725,7 +725,7 @@ func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEn
 						id, predicate = peer.w.ID, "replacement_admitted"
 						break
 					}
-					if peer.marker != nil && !peer.marker.Completed && !m.promoted(t, peer) {
+					if peer.marker != nil && !peer.marker.Completed && !m.incarnationComplete(t, peer) {
 						id, predicate = peer.w.ID, "replacement_in_flight"
 						break
 					}
@@ -828,6 +828,10 @@ func (m *Materializer) coverageBlocker(t *rollTick, candidate *rollEntry) (strin
 		predicate = "disk_pressure"
 	case maintenanceActive(peer.w):
 		predicate = "maintenance_active"
+	case peer.w.ManualCordonedAt != nil:
+		predicate = "manual_cordon"
+	case peer.w.EffectiveCordoned != nil && *peer.w.EffectiveCordoned:
+		predicate = "effective_cordon"
 	case !covers(peer.w, candidate.coverage):
 		predicate = "capability_mismatch"
 	case !liveWorkerPod(peer):
@@ -845,13 +849,13 @@ func (m *Materializer) coverageBlocker(t *rollTick, candidate *rollEntry) (strin
 func (m *Materializer) releaseRollHold(ctx context.Context, t *rollTick, e *rollEntry) {
 	// Serving proof is independent of custody. Releasing a drain can refill a
 	// source-protected worker, so retain this mutation's custody fence explicitly.
-	if e.w.CustodyHeld || !imageRollDrain(e.w) || e.blocked != "" {
+	if e.w.CustodyHeld || e.w.DiskPressure || maintenanceActive(e.w) || !imageRollDrain(e.w) || e.blocked != "" {
 		return
 	}
 	copy := *e
 	copy.w.DrainingSince = nil
 	copy.w.DrainingReason = nil
-	if !m.promoted(t, e) && ((e.marker != nil && !e.drift) || e.admitted || !m.oldUsable(t, &copy)) {
+	if !m.incarnationComplete(t, e) && ((e.marker != nil && !e.drift) || e.admitted || !m.oldIncarnation(t, &copy)) {
 		return
 	}
 	if c, ok := m.cordoner.(rollCordoner); ok {
@@ -861,6 +865,9 @@ func (m *Materializer) releaseRollHold(ctx context.Context, t *rollTick, e *roll
 			t.outcomes[e.w.ID].BlockingReason = pacingText(e.blocked)
 		} else {
 			e.w.DrainingSince, e.w.DrainingReason = nil, nil
+			// The aggregate also includes API-only maintenance fences. Preserve
+			// explicit true until a fresh poll confirms release; nil keeps the
+			// historical drain-only behavior for older APIs.
 		}
 	}
 }
@@ -1191,8 +1198,14 @@ func freshUntil(now, start time.Time, evaluated, expiry time.Time) bool {
 // hold protects storage but cannot negate independent positive serving proof.
 // Mutation callers keep their own custody fences.
 func (m *Materializer) oldUsable(t *rollTick, e *rollEntry) bool {
+	return servingEligible(e.w) && m.oldIncarnation(t, e)
+}
+
+// oldIncarnation also supports safe metadata cancellation and reason-owned release;
+// those operations must not require lifting the owner's manual cordon.
+func (m *Materializer) oldIncarnation(t *rollTick, e *rollEntry) bool {
 	proof := e.w.RollEvidence
-	return !t.unavailable[e.w.ID] && !migrationLaneFenced(t, e.coverage) && e.blocked == "" && liveWorkerPod(e) && proof != nil && (workerImage(e.dep) != workerImage(e.target) || e.dep.Spec.Template.Annotations[AnnotationSpecHash] != e.target.Spec.Template.Annotations[AnnotationSpecHash] || m.currentUsable(t, e)) && proof.LivenessValidUntil != nil &&
+	return !t.unavailable[e.w.ID] && !migrationLaneFenced(t, e.coverage) && e.blocked == "" && liveWorkerPod(e) && proof != nil && (workerImage(e.dep) != workerImage(e.target) || e.dep.Spec.Template.Annotations[AnnotationSpecHash] != e.target.Spec.Template.Annotations[AnnotationSpecHash] || m.currentIncarnation(t, e)) && proof.LivenessValidUntil != nil &&
 		freshUntil(m.now(), t.start, proof.EvaluatedAt, *proof.LivenessValidUntil) &&
 		!e.w.DiskPressure && !maintenanceActive(e.w) &&
 		e.w.DrainingSince == nil && covers(e.w, e.coverage)
@@ -1203,6 +1216,11 @@ func (m *Materializer) oldUsable(t *rollTick, e *rollEntry) bool {
 // still be nonempty and proven by the heartbeat for the single non-terminating,
 // non-terminal pod.
 func (m *Materializer) currentUsable(t *rollTick, e *rollEntry) bool {
+	return servingEligible(e.w) && m.currentIncarnation(t, e)
+}
+
+// currentIncarnation proves the target template without requiring serving eligibility.
+func (m *Materializer) currentIncarnation(t *rollTick, e *rollEntry) bool {
 	if t.unavailable[e.w.ID] || migrationLaneFenced(t, e.coverage) || e.dep == nil || workerImage(e.dep) != workerImage(e.target) {
 		return false
 	}
@@ -1218,7 +1236,7 @@ func (m *Materializer) currentUsable(t *rollTick, e *rollEntry) bool {
 		}
 		copy.marker.Nonce = e.marker.Nonce
 	}
-	return m.promoted(t, &copy)
+	return m.incarnationComplete(t, &copy)
 }
 func liveWorkerPod(e *rollEntry) bool {
 	if e.dep == nil || e.dep.DeletionTimestamp != nil || e.dep.UID == "" {
@@ -1246,10 +1264,24 @@ func maintenanceActive(w protocol.DesiredWorker) bool {
 	return op != nil && op.Phase != "complete" && op.Phase != "completed" && op.Phase != "cancelled"
 }
 
-// promoted proves the current serving incarnation. It grants no authority to
-// discard protected sources or clear a custody-held drain. A protected provider
-// still under a cordon cannot supply claimable coverage.
+// servingEligible requires confirmed automatic release before counting coverage.
+// An omitted effective field preserves the older API's drain-only behavior.
+func servingEligible(w protocol.DesiredWorker) bool {
+	return w.ManualCordonedAt == nil && (w.EffectiveCordoned == nil || !*w.EffectiveCordoned) &&
+		w.DrainingSince == nil && !w.DiskPressure && !maintenanceActive(w)
+}
+
+// promoted adds serving eligibility to fresh replacement proof. Custody alone
+// does not negate serving evidence; mutation callers retain their custody guards.
 func (m *Materializer) promoted(t *rollTick, e *rollEntry) bool {
+	return servingEligible(e.w) && m.incarnationComplete(t, e)
+}
+
+// incarnationComplete proves replacement identity for reservation completion and
+// cleanup, independently of manual intake suspension. Existing pressure,
+// maintenance, custody and automatic-drain fences still apply. This proof never
+// authorizes destruction.
+func (m *Materializer) incarnationComplete(t *rollTick, e *rollEntry) bool {
 	r, p := e.marker, e.w.RollEvidence
 	if t.unavailable[e.w.ID] || migrationLaneFenced(t, e.coverage) || e.blocked != "" || e.o.Roll.Phase == protocol.PhaseStuck || r == nil || p == nil || !p.Registered || p.Version != 1 || e.dep == nil || e.dep.UID == "" || e.dep.DeletionTimestamp != nil ||
 		e.dep.Spec.Template.Annotations[AnnotationSpecHash] != r.Hash || workerImage(e.dep) != r.Image ||

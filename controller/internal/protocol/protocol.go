@@ -79,6 +79,10 @@ type DesiredWorker struct {
 	// hostedsvc.DesiredWorker.DrainingSince, and the shared golden pins the two in lockstep.
 	DrainingSince *time.Time `json:"draining_since"`
 	Generation    int64      `json:"generation"`
+	// Manual cordon persists across replacement and is independent of automatic drain.
+	// Omission of EffectiveCordoned preserves historical availability checks.
+	ManualCordonedAt  *time.Time `json:"manual_cordoned_at,omitempty"`
+	EffectiveCordoned *bool      `json:"effective_cordoned,omitempty"`
 	// DiskPressure is true when the worker's own disk-space metric crossed the api's
 	// pressure threshold (PRD #837 M4). This side reacts by recycling the worker's /nix
 	// and /data volumes (teardown + reprovision), unless the worker is Ephemeral or a
