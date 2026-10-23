@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -122,6 +123,126 @@ func TestPolicySemanticSourceApplicability(t *testing.T) {
 			got, err := policyRevisionIdentityApplicable(context.Background(), reader, r, cc, test.target, false)
 			if err != nil || got != test.want {
 				t.Fatalf("applicable=%v err=%v", got, err)
+			}
+		})
+	}
+}
+
+type policySemanticLegacyApprovalReader struct {
+	*policyIdentityReader
+	hasRevision    bool
+	revisionErr    error
+	revisionRunIDs []uuid.UUID
+}
+
+func (r *policySemanticLegacyApprovalReader) HasPolicyRevisionHistory(_ context.Context, id uuid.UUID) (bool, error) {
+	r.revisionRunIDs = append(r.revisionRunIDs, id)
+	return r.hasRevision, r.revisionErr
+}
+
+func TestPolicySemanticSourceLegacyApproval(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		want bool
+	}{
+		{"accepted_A", true},
+		{"frozen_A_current_planning_B", true},
+		{"missing_contract", false},
+		{"corrupt_contract", false},
+		{"changed_plan", false},
+		{"changed_frozen_definition", false},
+		{"changed_contract_revision", false},
+		{"missing_immutable_history", false},
+		{"corrupt_immutable_history", false},
+		{"immutable_history_read_error", false},
+		{"planning_read_error", false},
+		{"recorded_revision", false},
+		{"revision_history_query_error", false},
+		{"legacy_unapproved", false},
+		{"ordinary_approved", true},
+		{"ordinary_unapproved", false},
+		{"structural_no_revision", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, _, identity, cc := semanticPolicyGateFixture(t)
+			payload, _, _ := decodeGatePresentedPayload(r.GatePresentedPayload)
+			r.GateRevision = 0
+			r.GatePresentationID = pgtype.UUID{}
+			r.GatePayloadDigest, r.GatePresentedPayload = nil, nil
+			r.MilestonesFrozen = r.MilestonesCandidate
+			r.PlanSource = planSourceSeeded
+			r.PolicyRefusalCount = 1
+			r.CompletionContractVersion = pgtype.Int4{Int32: 1, Valid: true}
+			r.ContractRevision = pgtype.Int4{Int32: 1, Valid: true}
+			var err error
+			r.CompletionContract, err = semanticGateContract(payload.Semantic, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r.PolicyRevisionSource = nil
+			q := &policySemanticLegacyApprovalReader{policyIdentityReader: identity}
+			legacyApproved := true
+			switch tc.name {
+			case "frozen_A_current_planning_B":
+				b := payload.Semantic.Candidate
+				b.Revision++
+				digest, err := semanticCheckerDigest(PlanCrossCheckCandidate{PlanMd: cc.PlanMd.String, Milestones: cc.Milestones, RequiredCapabilities: cc.RequiredCapabilities, RequiredTools: cc.RequiredTools, SizeClass: cc.SizeClass.String, BaseCommit: cc.BaseCommit.String, PlanningDiff: cc.PlanningDiff.String}, b)
+				if err != nil {
+					t.Fatal(err)
+				}
+				b.Digest = hex.EncodeToString(digest)
+				identity.planning.Candidate = semanticJSON(t, b)
+				identity.planning.Revision = b.Revision
+				identity.history[b.Digest] = semanticJSON(t, b)
+				current, valid, err := policyRevisionCurrentTarget(context.Background(), q, r)
+				if err != nil || !valid || current == nil || current.Digest != b.Digest {
+					t.Fatalf("current planning B is not valid: valid=%v err=%v", valid, err)
+				}
+			case "missing_contract":
+				r.CompletionContract = nil
+			case "corrupt_contract":
+				r.CompletionContract = []byte("{")
+			case "changed_plan":
+				r.PlanMd.String += " different accepted plan"
+			case "changed_frozen_definition":
+				r.MilestonesFrozen = []byte(`[{"id":"m1","title":"Different execution"}]`)
+			case "changed_contract_revision":
+				r.ContractRevision.Int32++
+			case "missing_immutable_history":
+				identity.history = nil
+			case "corrupt_immutable_history":
+				identity.history[payload.Semantic.Candidate.Digest] = []byte("{")
+			case "immutable_history_read_error":
+				identity.historyErr = errors.New("immutable history unavailable")
+			case "planning_read_error":
+				identity.planningErr = errors.New("planning unavailable")
+			case "recorded_revision":
+				q.hasRevision = true
+			case "revision_history_query_error":
+				q.revisionErr = errors.New("revision history unavailable")
+			case "legacy_unapproved":
+				legacyApproved = false
+			case "ordinary_approved", "ordinary_unapproved":
+				r.PolicyRefusalCount = 0
+				r.CompletionContract = nil
+				legacyApproved = tc.name == "ordinary_approved"
+			case "structural_no_revision":
+				identity.planningErr = pgx.ErrNoRows
+				r.CompletionContract = nil
+				r.CompletionContractVersion, r.ContractRevision = pgtype.Int4{}, pgtype.Int4{}
+			}
+			if len(r.PolicyRevisionSource) != 0 || r.GateRevision != 0 || r.GatePresentationID.Valid {
+				t.Fatal("fixture must retain SQL-NULL source and no published gate")
+			}
+			if got := policyRevisionPlanApproved(context.Background(), q, r, legacyApproved); got != tc.want {
+				t.Fatalf("approved=%v; want %v", got, tc.want)
+			}
+			if r.PolicyRefusalCount > 0 && legacyApproved {
+				if len(q.revisionRunIDs) != 1 || q.revisionRunIDs[0] != r.ID {
+					t.Fatal("NULL-source fallback must query revision history for this run once")
+				}
+			} else if len(q.revisionRunIDs) != 0 {
+				t.Fatal("ordinary or unapproved run queried revision history")
 			}
 		})
 	}
