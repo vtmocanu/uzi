@@ -1,11 +1,12 @@
 package workersvc
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
-	"net/http/cgi" //nolint:gosec // Test-only local git HTTP backend on the supported Go toolchain.
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -45,19 +46,15 @@ func TestTaskCheckpointCrossWorkerRecoveryE2E(t *testing.T) {
 	if out, err := deps.CombinedOutput(); err != nil || string(out) != "tsx-ready" {
 		t.Fatalf("required node/tsx: %s %v", out, err)
 	}
-	backend := filepath.Join(strings.TrimSpace(taskCheckpointGit(t, root, "--exec-path")), "git-http-backend")
-	if info, err := os.Stat(backend); err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
-		t.Fatalf("required executable git-http-backend: %s (%v)", backend, err)
-	}
 	env := setupCodexLiveDB(t)
-	t.Run("creation-hooks", func(t *testing.T) { taskCheckpointCreation(t, env, root, backend) })
+	t.Run("creation-hooks", func(t *testing.T) { taskCheckpointCreation(t, env, root) })
 	for _, mode := range []string{"successful-write", "first-write-refused", "lost-ack-after-requeue"} {
-		t.Run(mode, func(t *testing.T) { taskCheckpointTransfer(t, env, root, agent, backend, mode) })
+		t.Run(mode, func(t *testing.T) { taskCheckpointTransfer(t, env, root, agent, mode) })
 	}
 }
 
 // Each child is created by the production terminal hooks, not reconstructed SQL.
-func taskCheckpointCreation(t *testing.T, env codexTestEnv, repoRoot, backend string) {
+func taskCheckpointCreation(t *testing.T, env codexTestEnv, repoRoot string) {
 	f := newCustodyContinuationFixture(t, env)
 	root, err := f.svc.CreateTaskRun(env.ctx, f.userID, f.repoID, "checkpoint proof", "main", false, true, true, false, nil)
 	if err != nil {
@@ -90,9 +87,7 @@ func taskCheckpointCreation(t *testing.T, env codexTestEnv, repoRoot, backend st
 	if err != nil {
 		t.Fatal(err)
 	}
-	remote := httptest.NewServer(&cgi.Handler{Path: backend, Env: []string{
-		"GIT_PROJECT_ROOT=" + scratch, "GIT_HTTP_EXPORT_ALL=1",
-		"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null"}})
+	remote := httptest.NewServer(taskCheckpointSmartHTTP(origin))
 	defer remote.Close()
 	var publishingID string
 	f.svc.SetPublishFn(func(ctx context.Context, o pushbroker.Options) (pushbroker.Result, error) {
@@ -150,7 +145,7 @@ func taskCheckpointClaim(t *testing.T, f *custodyContinuationFixture, worker sto
 	return p
 }
 
-func taskCheckpointTransfer(t *testing.T, env codexTestEnv, root, agent, backend, mode string) {
+func taskCheckpointTransfer(t *testing.T, env codexTestEnv, root, agent, mode string) {
 	f := newCustodyContinuationFixture(t, env)
 	f.svc.SetForgeBaseURLAllowed(func(s string) bool { return s == "https://forge.e2e" })
 	run, err := f.svc.CreateTaskRun(env.ctx, f.userID, f.repoID, "recover committed and dirty bytes", "main", false, mode == "successful-write", mode == "successful-write", false, nil)
@@ -197,8 +192,28 @@ func taskCheckpointTransfer(t *testing.T, env codexTestEnv, root, agent, backend
 	}
 	origin := filepath.Join(scratch, "origin.git")
 	cfg := map[string]any{"scratch": scratch, "origin": origin, "claim": first, "mode": mode}
-	node := func(action string) string {
+	node := func(t *testing.T, action string) string {
 		t.Helper()
+		preserve := action == "recover" && (cfg["mode"] == "unknown" || cfg["mode"] == "absent" || cfg["mode"] == "mismatch" || cfg["mode"] == "unrelated")
+		var authority, attempts, refs string
+		attemptSnapshot := func() string {
+			t.Helper()
+			var value string
+			if err := env.pool.QueryRow(env.ctx, `SELECT COALESCE(jsonb_agg(to_jsonb(a) ORDER BY id),'[]'::jsonb)::text
+ FROM checkpoint_publish_attempts a WHERE run_id=$1`, run.ID).Scan(&value); err != nil {
+				t.Fatal(err)
+			}
+			return value
+		}
+		if preserve {
+			var open int
+			if err := env.pool.QueryRow(env.ctx, "SELECT count(*) FROM recovery_custody_holds WHERE run_id=$1 AND state='open'", run.ID).Scan(&open); err != nil || open == 0 {
+				t.Fatalf("refusal fixture must protect open custody: %d %v", open, err)
+			}
+			authority = coordinateAuthoritySnapshot(t, env, run.ID)
+			attempts = attemptSnapshot()
+			refs = taskCheckpointGit(t, origin, "for-each-ref", "--format=%(refname) %(objectname)")
+		}
 		data, err := json.Marshal(cfg)
 		if err != nil {
 			t.Fatal(err)
@@ -216,14 +231,17 @@ func taskCheckpointTransfer(t *testing.T, env codexTestEnv, root, agent, backend
 		if err != nil {
 			t.Fatalf("node %s mode=%v: %v\n%s", action, cfg["mode"], err, out)
 		}
+		if preserve && (coordinateAuthoritySnapshot(t, env, run.ID) != authority || attemptSnapshot() != attempts ||
+			taskCheckpointGit(t, origin, "for-each-ref", "--format=%(refname) %(objectname)") != refs) {
+			t.Fatal("recovery refusal changed custody, frozen authority, pending evidence or remote refs")
+		}
 		t.Logf("node %s: %s", action, out)
 		return string(out)
 	}
-	node("init")
+	node(t, "init")
 	var receive atomic.Int32
 	var requeued atomic.Bool
-	cgiBackend := &cgi.Handler{Path: backend, Env: []string{"GIT_PROJECT_ROOT=" + scratch, "GIT_HTTP_EXPORT_ALL=1",
-		"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null"}}
+	backend := taskCheckpointSmartHTTP(origin)
 	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/git-receive-pack") {
 			receive.Add(1)
@@ -235,16 +253,16 @@ func taskCheckpointTransfer(t *testing.T, env codexTestEnv, root, agent, backend
 					return
 				}
 				recorder := httptest.NewRecorder()
-				cgiBackend.ServeHTTP(recorder, r)
+				backend.ServeHTTP(recorder, r)
 				http.Error(w, "lost receive-pack acknowledgement", http.StatusBadGateway)
 				return
 			}
 		}
-		cgiBackend.ServeHTTP(w, r)
+		backend.ServeHTTP(w, r)
 	}))
 	defer remote.Close()
 	cfg["url"] = remote.URL + "/origin.git"
-	node("prepare")
+	node(t, "prepare")
 	var state struct{ Tip, Base, Committed, Marker string }
 	data, err := os.ReadFile(filepath.Join(scratch, "state.json"))
 	if err != nil {
@@ -300,7 +318,7 @@ func taskCheckpointTransfer(t *testing.T, env codexTestEnv, root, agent, backend
 			t.Fatalf("unresolved attempt=%d err=%v", attempts, err)
 		}
 	}
-	node("delete-A")
+	node(t, "delete-A")
 	env.exec("UPDATE runs SET status='queued' WHERE id=$1", run.ID)
 	// Run all three UNCHANGED archived SQL entry points against this same task,
 	// including the landed remote / NULL database-tip window.
@@ -335,31 +353,31 @@ func taskCheckpointTransfer(t *testing.T, env codexTestEnv, root, agent, backend
 		}
 		taskCheckpointGit(t, origin, "update-ref", "refs/heads/"+second.CheckpointCoordinates.WorkBranch, state.Base)
 		cfg["mode"] = "refused"
-		node("recover")
+		node(t, "recover")
 	case "lost-ack-after-requeue":
 		if !*second.CheckpointWriteUnresolved || second.CheckpointTip != nil {
 			t.Fatal("lost ACK handoff hid unresolved write / fabricated anchor")
 		}
 		cfg["mode"] = "unknown"
-		node("recover")
+		node(t, "recover")
 	case "successful-write":
 		if second.CheckpointTip == nil || *second.CheckpointTip != state.Tip {
 			t.Fatal("B missing own anchor")
 		}
 		// Move only the default branch, keeping the authorized historical bytes.
-		node("advance-default")
+		node(t, "advance-default")
 		cfg["mode"] = "success"
-		node("recover")
-		t.Run("runner-feed", func(t *testing.T) { cfg["mode"] = "runner-feed"; node("recover") })
+		node(t, "recover")
+		t.Run("runner-feed", func(t *testing.T) { cfg["mode"] = "runner-feed"; node(t, "recover") })
 		t.Run("absent-exact-ref", func(t *testing.T) {
 			taskCheckpointGit(t, origin, "update-ref", "-d", ref)
 			cfg["mode"] = "absent"
-			node("recover")
+			node(t, "recover")
 		})
 		t.Run("mismatched-exact-ref", func(t *testing.T) {
 			taskCheckpointGit(t, origin, "update-ref", ref, state.Base)
 			cfg["mode"] = "mismatch"
-			node("recover")
+			node(t, "recover")
 		})
 		t.Run("unrelated-workbranch", func(t *testing.T) {
 			taskCheckpointGit(t, origin, "update-ref", ref, state.Tip)
@@ -386,7 +404,7 @@ func taskCheckpointTransfer(t *testing.T, env codexTestEnv, root, agent, backend
 			}
 			taskCheckpointGit(t, origin, "update-ref", ref, state.Tip)
 			cfg["mode"] = "unrelated"
-			node("recover")
+			node(t, "recover")
 		})
 	}
 }
@@ -428,9 +446,18 @@ func taskCheckpointHistoricalRefusal(t *testing.T, f *custodyContinuationFixture
 				params = store.FrozenReadoptRunsFromSnapshotParams{WorkerID: f.workerID, FrozenTargets: ledger, LockedParentIds: parents}
 			}
 			sql, args := historicalCoordinateQuery(t, name, params)
-			_, err = tx.Exec(env.ctx, sql, args...)
+			sp, err := tx.Begin(env.ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = sp.Exec(env.ctx, sql, args...)
 			requireCoordinateSQLState(t, err, "23514")
-			if err := tx.Rollback(env.ctx); err != nil {
+			if err := sp.Rollback(env.ctx); err != nil {
+				t.Fatal(err)
+			}
+			// Commit the surrounding transaction so its earlier work cannot be
+			// hidden by a blanket rollback of the entire admission boundary.
+			if err := tx.Commit(env.ctx); err != nil {
 				t.Fatal(err)
 			}
 			if after := coordinateAuthoritySnapshot(t, env, id); after != before {
@@ -458,4 +485,54 @@ func taskCheckpointGit(t *testing.T, dir string, args ...string) string {
 		t.Fatalf("git %v: %v\n%s", args, err, out)
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// taskCheckpointSmartHTTP supplies only the HTTP framing; the installed Git
+// implements advertisement, pack negotiation, hooks and ref updates. Some worker
+// images omit the optional CGI git-http-backend executable.
+func taskCheckpointSmartHTTP(origin string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var operation, service string
+		advertise := r.Method == http.MethodGet && r.URL.Path == "/origin.git/info/refs"
+		if advertise {
+			service = r.URL.Query().Get("service")
+		} else if r.Method == http.MethodPost {
+			service = strings.TrimPrefix(r.URL.Path, "/origin.git/")
+		}
+		switch service {
+		case "git-upload-pack":
+			operation = "upload-pack"
+		case "git-receive-pack":
+			operation = "receive-pack"
+		default:
+			http.NotFound(w, r)
+			return
+		}
+		args := []string{operation, "--stateless-rpc"}
+		if advertise {
+			args = append(args, "--advertise-refs")
+		}
+		args = append(args, origin)
+		cmd := exec.CommandContext(r.Context(), "git", args...) //nolint:gosec // Fixed Git executable, literal allowlisted operation, and owned fixture path; no shell.
+		cmd.Env = taskCheckpointEnv()
+		if !advertise {
+			cmd.Stdin = r.Body
+		}
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		output, err := cmd.Output()
+		if err != nil {
+			http.Error(w, "fixture Git: "+stderr.String(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-cache")
+		if advertise {
+			w.Header().Set("Content-Type", "application/x-"+service+"-advertisement")
+			prefix := "# service=" + service + "\n"
+			_, _ = fmt.Fprintf(w, "%04x%s0000", len(prefix)+4, prefix)
+		} else {
+			w.Header().Set("Content-Type", "application/x-"+service+"-result")
+		}
+		_, _ = w.Write(output)
+	})
 }
