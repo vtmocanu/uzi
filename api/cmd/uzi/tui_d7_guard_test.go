@@ -231,6 +231,8 @@ var d7UntrustedFields = []string{
 	"upgradeDetail", "upgradeTarget", "blockingContainer", "blockingReason",
 	"outboxBlockedText", "outboxBlockedRunText", "quarantineText", "tokenLabel", "hostedSize", "capabilityText",
 	"workerOwner", "pressureText", "attnShort", "attnDetail",
+	"ManualCordonedByLabel", "ManualCordonReason", "ManualCordonedBy",
+	"manualActorLabel", "manualActorID", "manualReason",
 	"runWorkerName",
 	// Issue #2705: the run's health_reason on the crew rail's waiting line (railWaitingLine),
 	// drawn through renderer.Plain; the hostile-value case is in TestTUIViewsStripControlBytesFromUntrustedText.

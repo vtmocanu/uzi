@@ -402,6 +402,9 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 // untouched, so scripting keys off them rather than parsing this annotation.
 func statusCell(w apitypes.WorkerDTO) string {
 	s := w.Status
+	if w.EffectiveCordoned && w.ManualCordonedAt == nil && w.DrainingSince == nil {
+		s += " · intake fenced"
+	}
 	if w.ManualCordonedAt != nil {
 		s += " · cordoned (manual)"
 	}

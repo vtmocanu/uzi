@@ -373,9 +373,9 @@ func crossCheckFleetScene(dark bool, split bool, width, active int) tuiModel {
 	return m
 }
 
-var workerSceneNames = []string{"workers-list-120", "workers-list-80", "workers-factory", "workers-cordoned", "split-workers-top", "floor-fleet", "workers-stale-stats"}
+var workerSceneNames = []string{"workers-manual-120", "workers-manual-80", "workers-list-120", "workers-list-80", "workers-factory", "workers-cordoned", "split-workers-top", "floor-fleet", "workers-stale-stats"}
 
-var workerDetailSceneNames = []string{"worker-upgrade-failed", "worker-outcome-outbox", "worker-holding", "worker-capacity-blocked", "worker-provisioning", "worker-provisioning-failed"}
+var workerDetailSceneNames = []string{"worker-manual", "worker-manual-combined", "worker-upgrade-failed", "worker-outcome-outbox", "worker-holding", "worker-capacity-blocked", "worker-provisioning", "worker-provisioning-failed"}
 
 // workersScene uses the shipped model and the interactive demo's client.
 func workersScene(dark bool, name string) tuiModel {
@@ -392,7 +392,7 @@ func workersScene(dark bool, name string) tuiModel {
 			}
 		}
 	}
-	target := map[string]string{"worker-capacity-blocked": "forge-small", "worker-provisioning": "forge-small", "worker-provisioning-failed": "forge-small", "worker-upgrade-failed": "forge-small", "worker-outcome-outbox": "forge-docker", "worker-holding": "recovery"}[name]
+	target := map[string]string{"worker-manual": "forge-m-2", "worker-manual-combined": "forge-small", "worker-capacity-blocked": "forge-small", "worker-provisioning": "forge-small", "worker-provisioning-failed": "forge-small", "worker-upgrade-failed": "forge-small", "worker-outcome-outbox": "forge-docker", "worker-holding": "recovery"}[name]
 	if target != "" {
 		// Scene-local samples keep the demo fleet's state and attention counts intact.
 		for i := range fake.Workers {
@@ -401,6 +401,10 @@ func workersScene(dark bool, name string) tuiModel {
 				continue
 			}
 			switch name {
+			case "worker-manual-combined":
+				holds := 1
+				w.CustodyDecisionsNeeded = &holds
+				w.RetainingUnpublishedWork = true
 			case "worker-capacity-blocked":
 				w.UpgradeStatus = "capacity_blocked"
 				w.UpgradeBlockingKind = strPtrT("scheduler_capacity")
@@ -441,7 +445,7 @@ func workersScene(dark bool, name string) tuiModel {
 	if target != "" {
 		height = 52
 	}
-	if name == "workers-list-80" {
+	if name == "workers-list-80" || name == "workers-manual-80" {
 		width = 80
 	}
 	if name == "split-workers-top" {
@@ -457,6 +461,13 @@ func workersScene(dark bool, name string) tuiModel {
 	}
 	msg := m.fetchWorkersCmd(m.board.admin, m.workers.waitID)()
 	m = step(m, msg)
+	if strings.HasPrefix(name, "workers-manual-") {
+		for i, r := range m.workers.visible(time.Now()) {
+			if r.w.Name == "recovery" {
+				m.workers.cursor, m.workers.selectedID = i, r.w.ID
+			}
+		}
+	}
 	if name == "workers-cordoned" {
 		for i, r := range m.workers.visible(time.Now()) {
 			if r.w.Name == "b-runner" {

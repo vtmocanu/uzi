@@ -24,6 +24,7 @@ type workerRowText struct {
 	upgradeDetail, upgradeTarget, blockingContainer, blockingReason        string
 	outboxBlockedText, tokenLabel, hostedSize, capabilityText, workerOwner string
 	quarantineText, outboxBlockedRunText                                   string
+	manualActorLabel, manualActorID, manualReason                          string
 	pressureText                                                           []string
 }
 
@@ -37,8 +38,46 @@ func workerTextOf(r workerRow) workerRowText {
 		outboxBlockedText: workerString(w.OutboxBlocked), outboxBlockedRunText: workerString(w.OutboxBlockedRunID), quarantineText: workerString(w.ResidueQuarantineCause), tokenLabel: workerString(w.AnthropicSecretLabel),
 		hostedSize: workerString(w.HostedSize), capabilityText: strings.Join(w.Capabilities, " "),
 		workerOwner: r.workerOwner, pressureText: r.pressureText,
+		manualActorLabel: strOr(w.ManualCordonedByLabel, ""), manualActorID: strOr(w.ManualCordonedBy, ""), manualReason: strOr(w.ManualCordonReason, ""),
 	}
 }
+
+// workerIntakeLabel is orthogonal to workerState's liveness and custody priority.
+func workerIntakeLabel(w apitypes.WorkerDTO) string {
+	if w.ManualCordonedAt != nil {
+		return "cordoned (manual)"
+	}
+	if w.EffectiveCordoned && w.DrainingSince == nil {
+		return "intake fenced"
+	}
+	return ""
+}
+
+// manualCordonLines strips whole terminal sequences before Plain and clamps by
+// display cells after sanitizing. Metadata occupies at most three single lines.
+func (m tuiModel) manualCordonLines(r workerRow, width int) []string {
+	if r.w.ManualCordonedAt == nil {
+		if label := workerIntakeLabel(r.w); label != "" {
+			return []string{m.renderer.Plain(label, width)}
+		}
+		return nil
+	}
+	t := workerTextOf(r)
+	actor := strings.TrimSpace(m.renderer.Plain(ansi.Strip(t.manualActorLabel), 200))
+	if actor == "" {
+		actor = strings.TrimSpace(m.renderer.Plain(ansi.Strip(t.manualActorID), 200))
+	}
+	if actor == "" {
+		actor = "unknown"
+	}
+	reason := m.renderer.Plain(ansi.Strip(t.manualReason), 200)
+	return []string{
+		clampVisual("cordoned (manual) · by "+actor, width),
+		clampVisual("at "+r.w.ManualCordonedAt.UTC().Format(time.RFC3339), width),
+		clampVisual("reason: "+reason, width),
+	}
+}
+
 func workerString(s *string) string {
 	if s == nil {
 		return "?"
@@ -856,6 +895,9 @@ func (m tuiModel) workerRowLine(r workerRow, selected bool, width int, columns w
 	}
 	fields = append(fields, att)
 	line := clampVisual(strings.Join(fields, paintSeg(nil, bg, false, " ")), width)
+	if label := workerIntakeLabel(r.w); label != "" {
+		line = clampVisual(clampVisual(line, max(0, width-visualWidth(label)-1))+" "+m.renderer.Plain(label, width), width)
+	}
 	return line + paintSeg(nil, bg, false, strings.Repeat(" ", max(0, width-visualWidth(line))))
 }
 func (m tuiModel) workerReadout(r workerRow, width int) []string {
@@ -865,13 +907,14 @@ func (m tuiModel) workerReadout(r workerRow, width int) []string {
 		selected += m.pal.faint.Render(" · owner ") + m.renderer.Plain(t.workerOwner, width)
 	}
 	items := workerAttention(r, time.Now())
-	if width >= 120 {
+	if width >= 120 && workerIntakeLabel(r.w) == "" {
 		for _, item := range items {
 			selected += m.pal.faint.Render(" · ") + paintSeg(m.workerAttentionColor(item), nil, false, m.renderer.Plain(item.attnShort, width))
 		}
 		return []string{clampVisual(selected, width)}
 	}
 	lines := []string{clampVisual(selected, width)}
+	lines = append(lines, m.manualCordonLines(r, width)...)
 	for _, item := range items {
 		lines = append(lines, clampVisual("  "+paintSeg(m.workerAttentionColor(item), nil, false, m.renderer.Plain(item.attnShort, max(0, width-2))), width))
 	}

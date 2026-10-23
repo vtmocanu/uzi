@@ -266,6 +266,13 @@ func demoWorkers(now time.Time, runs []apitypes.RunListItemDTO) ([]apitypes.Work
 	all[8].ResidueQuarantineCause = str("runner-uid pid 4242 \"ssh-agent\" could not be attributed (env/cwd unreadable)")
 	all[7].MemoryAuthorityLostAt = at(-12 * time.Minute)
 	all[9].DrainingSince = at(-time.Hour)
+	for _, i := range []int{4, 5, 6, 7} {
+		all[i].ManualCordonedAt = at(-30 * time.Minute)
+		all[i].ManualCordonedBy = str("0d493162-41a1-4d82-9437-c9f1acde6512")
+		all[i].ManualCordonedByLabel = str("fleet operator")
+		all[i].ManualCordonReason = str("Maintenance window; held work continues")
+		all[i].EffectiveCordoned = true
+	}
 	// The five occupied run slots and the separate chat map to demo runs.
 	// Chat is reported without adding to run-lane occupancy.
 	for _, binding := range []struct {

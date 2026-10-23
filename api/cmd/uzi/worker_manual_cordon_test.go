@@ -11,6 +11,26 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
+func TestWorkerManualCordonAdminReadOnly(t *testing.T) {
+	at := time.Date(2026, 10, 23, 1, 2, 3, 0, time.UTC)
+	actor, reason := "operator", "Owner maintenance"
+	w := apitypes.WorkerDTO{ID: "worker", Status: "online", ManualCordonedAt: &at,
+		ManualCordonedByLabel: &actor, ManualCordonReason: &reason}
+	fc := &uzicli.FakeClient{AdminWorkers: []apitypes.AdminWorkerDTO{{WorkerDTO: w, OwnerEmail: "owner@example.test"}}}
+	out, stderr, code := runCLI(t, fakeEnv(fc), "admin", "workers")
+	if code != 0 {
+		t.Fatalf("admin read failed: %d %s", code, stderr)
+	}
+	for _, want := range []string{"cordoned (manual)", "actor=operator", "2026-10-23T01:02:03Z", "Manual reason: Owner maintenance"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("admin metadata missing %q: %s", want, out)
+		}
+	}
+	if fc.CordonWorkerCalls+fc.UncordonWorkerCalls != 0 {
+		t.Fatal("read-only admin view attempted a cordon write")
+	}
+}
+
 func TestWorkerManualCordonRepeatQuietHelp(t *testing.T) {
 	at := time.Date(2026, 10, 23, 1, 2, 3, 0, time.UTC)
 	label, actor, reason := "\u202e", "owner-uuid", "first reason"
@@ -110,6 +130,14 @@ func TestWorkerManualCordonFailureAndUsage(t *testing.T) {
 				t.Fatal("invalid args called client")
 			}
 		}
+	}
+}
+
+func TestWorkerEffectiveOnlyFence(t *testing.T) {
+	fc := &uzicli.FakeClient{Workers: []apitypes.WorkerDTO{{ID: "fenced", Status: "online", EffectiveCordoned: true}, {ID: "legacy", Status: "online"}}}
+	out, stderr, code := runCLI(t, fakeEnv(fc), "worker", "list")
+	if code != 0 || !strings.Contains(out, "online · intake fenced") || !strings.Contains(out, "legacy") {
+		t.Fatalf("%d %q %q", code, out, stderr)
 	}
 }
 
