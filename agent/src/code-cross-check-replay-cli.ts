@@ -150,7 +150,7 @@ async function runScore(deps: ReplayCliDeps, args: string[]): Promise<number> {
   if (adjudicationsFile !== undefined) {
     adjudications = parseAdjudications((await readInput(adjudicationsFile, ADJUDICATIONS_MAX_BYTES, "adjudication_invalid")).toString("utf8"));
   }
-  deps.write(sanitizedAggregate(scoreReplays(corpus, parseReplayRecords(bytes.toString("utf8")), adjudications)));
+  deps.write(sanitizedAggregate(scoreReplays(corpus, parseReplayRecords(bytes.toString("utf8"), deps.env), adjudications)));
   return 0;
 }
 

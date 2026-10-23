@@ -259,6 +259,13 @@ test("raw records go to an owner-only file; stdout carries ids, counts and pins 
   assert.deepEqual(bad.lines, ['{"error":"adjudication_invalid"}']);
   const noRecords = await cli(["score", path.join(tc.root, "missing.jsonl")]);
   assert.deepEqual(noRecords.lines, ['{"error":"records_invalid"}']);
+  // A recorded model that embeds an env credential value is refused at score time, with the CLI's env.
+  const leakedFile = path.join(tc.root, "leaked-model.jsonl");
+  await fs.writeFile(leakedFile, raw.replaceAll('"model":"haiku"', '"model":"m-zzsecretvalue9-x"'));
+  assert.equal((await cli(["score", leakedFile])).code, 0);
+  const leaked = await cli(["score", leakedFile], { env: { ...env, OPENAI_API_KEY: "zzsecretvalue9" } });
+  assert.equal(leaked.code, 1);
+  assert.deepEqual(leaked.lines, ['{"error":"records_invalid"}']);
 });
 
 test("a mid-run failure still reports the partial records file", async () => {

@@ -36,9 +36,9 @@
       "line_range": null,
       "use_line_range": false,
       "match": [
-        "cleanup",
-        "rmSync|remov",
-        "normaliz.*error|original error|precedence"
+        "cleanup[\\s\\S]*(fail|error|throw)",
+        "(rmSync|remov)[\\s\\S]*(fail|error|throw|precedence)",
+        "(original|normali[sz]ation) error"
       ],
       "detectability": "read_only",
       "rationale": "Test gap: nothing pins that the original normalization error survives when removing the failed scratch root also fails.",

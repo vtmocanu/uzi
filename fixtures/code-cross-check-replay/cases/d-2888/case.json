@@ -38,9 +38,10 @@
       ],
       "use_line_range": true,
       "match": [
-        "readBoundedText",
-        "reader\\.cancel",
-        "cancel(lation)?.*(never|hang|settl)"
+        "reader\\.cancel[\\s\\S]*(never|hang|settl|await|block)",
+        "(await|awaited)[\\s\\S]*cancel[\\s\\S]*(never|hang|settl|block)",
+        "cancel(lation)?\\b[\\s\\S]*(never|hang|settl)",
+        "(never|hang|settl)[\\s\\S]*cancel"
       ],
       "detectability": "read_only",
       "rationale": "readBoundedText awaits reader.cancel() in its finally block, so a response source whose cancellation never settles keeps an overflow or abort error from reaching the caller.",

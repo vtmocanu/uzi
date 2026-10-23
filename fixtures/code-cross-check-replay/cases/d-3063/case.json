@@ -5,7 +5,7 @@
   "plan_source": "synthetic",
   "source": {
     "pr": 3063,
-    "issue": 3063
+    "issue": 2991
   },
   "squash_sha": "391b2478e092e40f2790202437d9e3c38cb48453",
   "base_sha": "976724a58221d50da40569a439288a49fac0db0e",
@@ -36,9 +36,8 @@
       "line_range": null,
       "use_line_range": false,
       "match": [
-        "\\bids\\b.*optional",
-        "FindingGroupFileRequest",
-        "group.*ids"
+        "\\bids\\b[\\s\\S]*(optional|required|missing|omit|undefined)",
+        "(optional|required)[\\s\\S]*\\bids\\b"
       ],
       "detectability": "read_only",
       "rationale": "FindingGroupFileRequest declares ids as optional although the grouped file endpoint requires it, so a request can be built without any finding ids.",

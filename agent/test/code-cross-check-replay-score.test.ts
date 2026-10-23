@@ -54,6 +54,22 @@ test("a path-set defect without a line range matches by keyword on any listed pa
   assert.equal(defectScore(g, "d-a", "D2").matched, 1);
 });
 
+test("a single generic word does not match a tightened defect pattern; a defect-specific finding does", () => {
+  const tight: ScoreCorpus = {
+    ...corpus,
+    cases: [{ id: "d-t", kind: "defect", input_provenance: "reconstructed", expected: [expected({
+      id: "D3", paths: ["src/client.ts"], line_range: [100, 110], use_line_range: false,
+      match: ["reader\\.cancel[\\s\\S]*(never|hang|settl|await|block)", "(await|awaited)[\\s\\S]*cancel[\\s\\S]*(never|hang|settl|block)", "cancel(lation)?\\b[\\s\\S]*(never|hang|settl)", "(never|hang|settl)[\\s\\S]*cancel"],
+    })] }],
+  };
+  const score = (f: CodeFinding) => scoreReplays(tight, [rec({ case_id: "d-t", findings: [f] })]).groups[0]!.defects[0]!.matched;
+  const base = { path: "src/client.ts", line: 500 };
+  assert.equal(score(finding("F1", { ...base, title: "readBoundedText could use a comment", detail: "naming" })), 0);
+  assert.equal(score(finding("F1", { ...base, title: "reader.cancel is fine", detail: "cleanup" })), 0);
+  assert.equal(score(finding("F1", { ...base, title: "Awaited reader.cancel() can hang", detail: "x" })), 1);
+  assert.equal(score(finding("F1", { ...base, title: "Overflow error lost", detail: "a source whose cancellation never settles" })), 1);
+});
+
 test("unmatched defect-case findings and every control finding are unadjudicated, never false positives", () => {
   const agg = scoreReplays(corpus, [
     rec({ case_id: "d-a", findings: [finding("F1", { line: 15 }), finding("F2", { path: "src/other.ts" })] }),
@@ -163,6 +179,10 @@ test("record parsing is strict", () => {
   }));
   const line = good();
   assert.equal(parseReplayRecords(line + "\n" + good({ repeat: 2 }) + "\n").length, 2);
+  const credentialEnv = { UZI_API_TOKEN: "zzsecretvalue9", SHORT_KEY: "abc" };
+  assert.throws(() => parseReplayRecords(good({ model: "m-zzsecretvalue9-x" }), credentialEnv), { message: "records_invalid" });
+  assert.equal(parseReplayRecords(good({ model: "m-zzsecretvalue9-x" })).length, 1);
+  assert.equal(parseReplayRecords(good({ model: "m-abc-x" }), credentialEnv).length, 1);
   assert.throws(() => parseReplayRecords(line + "\n" + line + "\n"), { message: "records_invalid" });
   assert.throws(() => parseReplayRecords(good({ model: "safe\u202eevil" })), { message: "records_invalid" });
   assert.throws(() => parseReplayRecords(good({ model: "sk-abcdefghijklmnop" })), { message: "records_invalid" });

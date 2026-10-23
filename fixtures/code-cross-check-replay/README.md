@@ -11,7 +11,7 @@ reconstructed inputs. They do not replay the original runs exactly.
 - Issue texts and plans are synthetic paraphrases written from the squash commit messages and diff
   scope (`plan_source` is `synthetic`; a plan is never a historically approved plan). Milestones are
   always `[]`: requirements stated in an issue stay in the issue input and are not evidence of
-  approved milestones. #3063 has no known issue number, so its case uses the PR number as the issue id.
+  approved milestones. #3063's squash CHANGELOG bullet cites #2991, so its cases use 2991 as the issue id.
 - Sanitization (no usernames, emails, hosts, quotes, co-author lines) applies to `issue.md` and
   `plan.md`. Patches and witness blobs are byte-exact public repository content.
 - Every case is `input_provenance: reconstructed`. Reports separate reconstructed-input from
@@ -67,14 +67,18 @@ identity), that the removed patch restores the squash tree, and that the prefix 
 `git diff --no-ext-diff --no-textconv --no-color --abbrev=8 <base> <prefix_commit>`. There is no
 upstream-SHA override and no second source-selection mechanism.
 
-Snapshots carry no original history (one parentless commit). The corpus test's materialization layer
-is skipped only in a shallow checkout where every pinned object is absent; it fails on partial
-presence, and `UZI_REPLAY_CORPUS_REQUIRE_OBJECTS=1` makes it fail instead of skip.
+Snapshots carry no original history (one parentless commit). The corpus test's object-dependent layer
+verifies the pins and reads prefix-tree blobs through `verifyCasePins`; full snapshots are exercised by
+`verify`/`replay` and the fixture tests. That layer is skipped only in a shallow checkout where every
+pinned object is absent; it fails on partial presence, and `UZI_REPLAY_CORPUS_REQUIRE_OBJECTS=1` makes
+it fail instead of skip. CI's agent test job checks out shallow, so in CI only the hermetic layer runs;
+the pin layer runs in full clones (and fails instead of skipping with that variable set). Enabling it in
+CI needs a maintainer workflow change outside this corpus.
 
 ## Scoring limits
 
 Expected-defect matching (path, line, keyword) is a scoring proxy, not proof that a finding correctly
-diagnosed the defect. The expected list is not exhaustive. Unmatched and control findings are
+diagnosed the defect. The match patterns were tightened to require a defect-specific combination of terms rather than one generic word (still a proxy). The expected list is not exhaustive. Unmatched and control findings are
 unadjudicated, never confirmed false positives. The maintainer reviews the private findings and may
 supply an adjudication file before verified false-positive counts are published.
 

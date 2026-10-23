@@ -25,7 +25,7 @@ const replayLog: Logger = {
 
 export const CORPUS_DIR = "fixtures/code-cross-check-replay";
 /** Source-pinned sha256 of fixtures/code-cross-check-replay/manifest.json. Re-pin when the corpus changes. */
-export const CORPUS_MANIFEST_SHA256 = "cbad197cb84480adde02dd34ee1d0349d3479bb3f21be0448fa3bbc404760266";
+export const CORPUS_MANIFEST_SHA256 = "6a17a098884ad0942eb1c0f1a820a6ccbba01fa02a0d8584183134b516123f4e";
 export const REPLAY_DIFF_ARGS = ["--no-ext-diff", "--no-textconv", "--no-color", "--abbrev=8"] as const;
 const REPLAY_IDENTITY = { name: "uzi replay", email: "replay@uzi.invalid", date: "2026-01-01T00:00:00Z" } as const;
 export const READER_IMPLEMENTATION = { codex: "codex fileop Read+Search", claude: "claude sdk Read+Grep+Glob" } as const;
@@ -874,7 +874,7 @@ export function sanitizedAggregate(agg: Aggregate): string {
 // ---------------------------------------------------------------------------------------------
 // Operator-supplied inputs to `score`
 
-function parseRecord(v: unknown): ReplayRecord {
+function parseRecord(v: unknown, env: NodeJS.ProcessEnv): ReplayRecord {
   try {
     const r = strict(v, [
       "case_id", "kind", "input_provenance", "family", "repeat", "corpus_version", "checker_version", "brief_sha256",
@@ -890,7 +890,7 @@ function parseRecord(v: unknown): ReplayRecord {
     const findings = decodeCodeFindings(r.findings);
     const family = oneOf(r.family, ["claude", "codex"] as const);
     const model = str(r.model, 100);
-    if (!isSafeReplayModel(model)) return invalidRecords();
+    if (!isSafeReplayModel(model, env)) return invalidRecords();
     return {
       case_id: caseId, kind: oneOf(r.kind, ["defect", "control"] as const),
       input_provenance: oneOf(r.input_provenance, ["reconstructed", "recorded"] as const),
@@ -906,14 +906,14 @@ function parseRecord(v: unknown): ReplayRecord {
   } catch { return invalidRecords(); }
 }
 
-export function parseReplayRecords(text: string): ReplayRecord[] {
+export function parseReplayRecords(text: string, env: NodeJS.ProcessEnv = {}): ReplayRecord[] {
   const out: ReplayRecord[] = [];
   const seen = new Set<string>();
   for (const line of text.split("\n")) {
     if (line.trim() === "") continue;
     let value: unknown;
     try { value = JSON.parse(line); } catch { return invalidRecords(); }
-    const rec = parseRecord(value);
+    const rec = parseRecord(value, env);
     if (seen.has(recordKey(rec))) return invalidRecords();
     seen.add(recordKey(rec));
     out.push(rec);
