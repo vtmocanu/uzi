@@ -229,7 +229,8 @@ func (m tuiModel) boardEmptyState() string {
 // the owner on the admin board, the status WORD (state colour, not a filled chip), AGE, the
 // milestone micro-bar, and the title, with an own-board-only judge marker flushed right. A
 // selected row rides the full-width warm selection bar with a ▸ cursor. DONE rows keep
-// faint titles; failures retain dimmed alarm state tokens and full alarm issue links.
+// faint titles; failures retain dimmed alarm state tokens and issue links. DONE judge
+// issues badges share that same dimmed alarm.
 func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCols, cols boardAccountCols) string {
 	unfocused := sel && m.splitDrawn() && m.view != viewBoard
 	if unfocused {
@@ -245,9 +246,9 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 		bg = m.pal.selBg
 	}
 
-	// Finished failures, including needs landing, retain a quiet alarm on the state token.
-	// Human stops stay faint, as do other terminal outcomes. The judge marker keeps its
-	// own severity colour regardless.
+	// Finished failures, including needs landing, retain a quiet alarm on state tokens
+	// and issue links. Human stops stay faint, as do other terminal outcomes. Judge
+	// issues badges share the quiet alarm on every DONE row.
 	failedDone := doneRunFailed(r)
 	stateC := tok.color
 	if terminal {
@@ -343,7 +344,7 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 	if r.IssueIID != nil {
 		issueC := idC
 		if failedDone {
-			issueC = m.pal.alarm // also on the selected row; run ids keep their selection ink
+			issueC = m.pal.doneAlarm // also on the selected row; run ids keep their selection ink
 		}
 		styledIID := paintSeg(issueC, bg, sel, "#"+itoa(int(*r.IssueIID)))
 		titlePrefix = m.issueLink(r.RunDTO, styledIID) + paintSeg(nil, bg, false, " ")
@@ -355,7 +356,7 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 	// Judge marker (own board only; AdminListRuns carries no JudgeVerdict), flushed to the right
 	// edge so the ⚖ icon and count align down the board.
 	if mc.fullW > 0 && !m.board.admin && r.JudgeVerdict != nil {
-		row = padSeg(clampVisual(row, contentWidth-mc.fullW), contentWidth-mc.fullW, bg) + m.verdictMarker(*r.JudgeVerdict, r.JudgeTodoCount, mc.verdictW, mc.countW, bg)
+		row = padSeg(clampVisual(row, contentWidth-mc.fullW), contentWidth-mc.fullW, bg) + m.verdictMarker(*r.JudgeVerdict, r.JudgeTodoCount, mc.verdictW, mc.countW, terminal, bg)
 	} else if sel {
 		// Keep the warm selection bar spanning the full width even with no trailing marker.
 		row = padSeg(clampVisual(row, contentWidth), contentWidth, bg)
@@ -488,18 +489,18 @@ func (m tuiModel) boardMarkerCols(rows []apitypes.RunListItemDTO) boardMarkerCol
 	if mc.verdictW > 0 {
 		// The empty-verdict/zero-count marker has the full fixed width, and visualWidth accounts
 		// for the ⚖ glyph's own cell count.
-		mc.fullW = visualWidth(m.verdictMarker("", 0, mc.verdictW, mc.countW, nil))
+		mc.fullW = visualWidth(m.verdictMarker("", 0, mc.verdictW, mc.countW, false, nil))
 	}
 	return mc
 }
 
-// verdictMarker is the own-board ⚖ judge badge, coloured by severity (issues → alarm red,
-// everything else → faint) via the shared verdictColor. It lays the verdict WORD out in a fixed
+// verdictMarker is the own-board ⚖ judge badge: issues use alarm red on active rows,
+// dimmed alarm on DONE rows; everything else stays faint. It lays the verdict WORD out in a fixed
 // verdictW slot and the "· N" count in a fixed countW slot after it, so down the board the ⚖
 // icon and the count align and only the verdict word shifts. The verdict is a closed enum but
 // rendered through Plain so an unrecognised value from a newer server cannot inject control
 // bytes. bg carries the selection bar behind the marker on a selected row.
-func (m tuiModel) verdictMarker(verdict string, todo, verdictW, countW int, bg color.Color) string {
+func (m tuiModel) verdictMarker(verdict string, todo, verdictW, countW int, dim bool, bg color.Color) string {
 	label := "⚖ " + padVisual(m.renderer.Plain(verdict, 8), verdictW)
 	if countW > 0 {
 		count := ""
@@ -508,7 +509,11 @@ func (m tuiModel) verdictMarker(verdict string, todo, verdictW, countW int, bg c
 		}
 		label += " " + padVisual(count, countW)
 	}
-	return paintSeg(m.pal.verdictColor(verdict), bg, false, label)
+	ink := m.pal.verdictColor(verdict)
+	if dim && verdict == "issues" {
+		ink = m.pal.doneAlarm
+	}
+	return paintSeg(ink, bg, false, label)
 }
 
 // milestoneMarker is the board's compact milestone micro-bar — one cell per frozen milestone,

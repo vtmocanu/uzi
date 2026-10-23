@@ -7,7 +7,7 @@ import { CodexSessionStore } from "../src/codex/session-state.js";
 import { RequestError } from "../src/client.js";
 import { ResidueQuarantinedError, latchResidueQuarantine } from "../src/residue-quarantine.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
-import type { CredentialFreeSettleOutcome } from "../src/executor.js";
+import type { Executor } from "../src/executor.js";
 import { nullLogger, recordingLogger } from "./helpers.js";
 import {
   api, client, fakeGitlab, git, gitlabClaim, homeDir, installHarness, runnerWith, worktreeDirFor,
@@ -51,7 +51,7 @@ describe("M2 account park W3-W6/W9", () => {
             sink: sink === "checkpoint" ? "milestone_checkpoint" : "done_checkpoint",
           });
           return { branch: ctx.branch };
-        }, async (ms) => { events.push("settle"); return rig.settle(ms); });
+        }, undefined, async (ms, action, purpose, signal) => { events.push("settle"); return rig.capture(ms, action, purpose, signal); });
         const iid = 159500 + ["finalize", "checkpoint", "done_checkpoint"].indexOf(sink) * 2 + Number(advertised);
         const claim = gitlabClaim(iid, { claim_generation: 3 });
         const report = client.reportState.bind(client);
@@ -134,12 +134,12 @@ describe("M2 account park W3-W6/W9", () => {
     let ready!: () => void;
     const entered = new Promise<void>((resolve) => { ready = resolve; });
     let attempts = 0;
-    w = workThenDefer(rig, async (ms) => {
+    w = workThenDefer(rig, undefined, async (ms, action, purpose, signal) => {
       if (!w.ctx()?.cancelRequested?.()) {
         if (++attempts === 2) ready();
         return { kind: "incomplete", errors: [{ category: "timeout", message: "writer alive" }] };
       }
-      return rig.settle(ms);
+      return rig.capture(ms, action, purpose, signal);
     });
     const claim = gitlabClaim(159523);
     const runner = runnerWith(() => ({ executor: w.exec }), gitlab, undefined, nullLogger(), {
@@ -179,7 +179,7 @@ describe("M2 account park W3-W6/W9", () => {
     const { logger, lines } = recordingLogger();
     let ready!: () => void;
     const entered = new Promise<void>((resolve) => { ready = resolve; });
-    const w = workThenDefer(rig, async () => {
+    const w = workThenDefer(rig, undefined, async () => {
       ready();
       return { kind: "incomplete", errors: [{ category: "timeout", message: "writer alive" }] };
     });
@@ -199,6 +199,44 @@ describe("M2 account park W3-W6/W9", () => {
       assert.equal(archive.releaseCalls.length, 0);
       assert.equal(rig.refreshCalls(), 1);
     } finally { runner.shutdown(); await execution; }
+  });
+
+  it("W6: missing capture capability fails closed and retains source before bounded shutdown", async () => {
+    client.protocolFeatures = [FEATURE];
+    const { gitlab, calls } = fakeGitlab();
+    const rig = codexRig({ accountUnavailable: () => true });
+    let legacySettles = 0;
+    const w = workThenDefer(rig, async (ms) => {
+      legacySettles++;
+      return rig.settle(ms);
+    });
+    assert.equal(w.exec.withCredentialFreeCapture, undefined, "explicitly missing callback capability");
+    const claim = gitlabClaim(159526);
+    const { logger, lines } = recordingLogger();
+    const runner = runnerWith(() => ({ executor: w.exec }), gitlab, undefined, logger, { recoveryRetryMs: 1 });
+    const custody = spyCustodySettle(runner);
+    const retry = runner as unknown as { waitRecoveryRetry: (...args: unknown[]) => Promise<void> };
+    const wait = retry.waitRecoveryRetry.bind(runner);
+    let waits = 0;
+    retry.waitRecoveryRetry = async (...args) => {
+      if (++waits === 2) runner.shutdown();
+      return wait(...args);
+    };
+    let publishes = 0;
+    const publish = client.publishCheckpoint.bind(client);
+    client.publishCheckpoint = async (...args) => { publishes++; return publish(...args); };
+    await runner.execute(claim);
+    assert.equal(waits, 2, "missing capability is observed across bounded retries");
+    assert.equal(legacySettles, 0, "legacy settlement cannot authorize capture");
+    assert.equal(publishes, 0);
+    assert.equal(parkReports(claim.run_id).length, 0);
+    assert.equal(custody(), 0);
+    assert.equal(calls.length, 0);
+    assert.equal(api.completionPermitRequests.length, 0);
+    assert.ok(!statuses(claim.run_id).some((s) => s === "failed" || s === "completed"));
+    assert.equal(fs.readFileSync(path.join(worktreeDirFor(159526), "DIRTY.txt"), "utf8"), "uncommitted edit\n");
+    assert.equal(fs.readFileSync(path.join(worktreeDirFor(159526), "COMMITTED.txt"), "utf8"), "committed, not yet fetched back\n");
+    assert.ok(sessionKept(lines));
   });
 
   it("W6: residue refusal during capture fails worker_residue_blocked with custody kept", async () => {
@@ -307,31 +345,38 @@ describe("M2 account park W3-W6/W9", () => {
     } finally { restore(); }
   });
 
-  it("W5/W6 capture-discovered account deferral replaces cause/feed and freshly confirms/settles before retry park", async () => {
+  it("W5/W6 authenticated pre-boundary account deferral replaces cause/feed and freshly confirms before held capture retries and park", async (t) => {
     client.protocolFeatures = [FEATURE, "claim_generation_fence"];
     const { gitlab, calls } = fakeGitlab();
+    // The authenticated normal boundary discovers deferral before the credential-free held capture.
     const rig = codexRig({ accountUnavailable: () => true });
+    assert.equal(rig.registry.rootCount(), 1, "deferral starts with a tracked provider root");
+    let legacySettles = 0;
     const claim = gitlabClaim(159512, { claim_generation: 3 });
     const events: string[] = [];
     let settled = 0;
     let proofs = 0;
+    const blockedProofs: Array<{ settled: number; reaped: boolean; custody: number; dirty: boolean; terminal: boolean }> = [];
     const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
       commitInTree(ctx.worktreePath, "COMMITTED.txt", "committed, not yet fetched back\n");
       fs.writeFileSync(path.join(ctx.worktreePath, "DIRTY.txt"), "uncommitted edit\n");
       events.push("transient");
       throw new TransientRecoveryError();
-    }, async (ms) => { settled++; events.push("settle"); return rig.settle(ms); });
+    }, async () => {
+      legacySettles++;
+      throw new Error("legacy credential-free settlement must not run");
+    }, async (ms, action, purpose, signal) => { settled++; events.push("settle"); return rig.capture(ms, action, purpose, signal); });
     const { logger, lines } = recordingLogger();
     const runner = runnerWith(() => ({ executor: exec }), gitlab, undefined, logger, {
       recoveryRetryMs: 1, checkpointIntervalMs: 0,
       quiesceRun: async (request) => {
         if (request.site === "recovery_capture") {
           proofs++;
-          if (proofs > 1 && proofs <= 8) {
-            assert.equal(settled, 1, "fresh credential-free settlement after discovered deferral");
-            assert.equal(custody(), 0);
-            assert.ok(fs.existsSync(path.join(worktreeDirFor(159512), "DIRTY.txt")));
-            assert.ok(!statuses(claim.run_id).some((s) => ["failed", "completed", "recovery_wait"].includes(s)));
+          if (proofs <= 7) {
+            // Record here; assert after execute so quiescence error handling cannot swallow a failed assertion.
+            blockedProofs.push({ settled, reaped: rig.reaps() > 0, custody: custody(),
+              dirty: fs.existsSync(path.join(worktreeDirFor(159512), "DIRTY.txt")),
+              terminal: statuses(claim.run_id).some((status) => ["failed", "completed", "recovery_wait"].includes(status)) });
             return {
               process: { state: "unverified", processes: [], killed: [], detail: "capture proof blocked" },
               docker: { state: "not_wired", removed: [], detail: "" },
@@ -344,6 +389,8 @@ describe("M2 account park W3-W6/W9", () => {
         };
       },
     });
+    const shutdown = () => runner.shutdown();
+    t.signal.addEventListener("abort", shutdown, { once: true });
     const custody = spyCustodySettle(runner);
     const waits = observeWaits(runner);
     const report = client.reportState.bind(client);
@@ -377,8 +424,13 @@ describe("M2 account park W3-W6/W9", () => {
     const restore = spyPublishLands();
     try {
       await runner.execute(claim);
-      assert.ok(proofs > 8, "capture-discovered deferral survives old blocked cap");
-      assert.equal(settled, 1);
+      assert.equal(legacySettles, 0, "account deferral uses held capture without legacy settlement");
+      assert.equal(proofs, 8, "seven blocked held-capture proofs precede the successful eighth attempt");
+      assert.ok(rig.reaps() > 0, "the real held capture reaped the tracked provider root");
+      assert.equal(settled, 8, "seven refused proofs and the final capture each acquire their own scope");
+      assert.deepEqual(blockedProofs, Array.from({ length: 7 }, (_, index) => ({
+        settled: index + 1, reaped: true, custody: 0, dirty: true, terminal: false,
+      })));
       assert.ok(events.indexOf("fresh-confirm") > events.indexOf("transient"));
       assert.ok(events.indexOf("fresh-confirm") < events.indexOf("settle"));
       assert.ok(events.indexOf("settle") < events.indexOf("park"));
@@ -393,7 +445,11 @@ describe("M2 account park W3-W6/W9", () => {
       assert.equal(rig.refreshCalls(), 1);
       assert.equal(rig.releaseCalls(), 0);
       assert.doesNotMatch(JSON.stringify(lines), new RegExp(VAULT_BODY_SENTINEL));
-    } finally { restore(); }
+    } finally {
+      t.signal.removeEventListener("abort", shutdown);
+      runner.shutdown();
+      restore();
+    }
   });
 
   it("W5: incomplete settle and failed fetch-back retain running work and heartbeat before verified park", async () => {
@@ -402,11 +458,11 @@ describe("M2 account park W3-W6/W9", () => {
     const rig = codexRig({ accountUnavailable: () => true });
     const claim = gitlabClaim(159513);
     let settles = 0;
-    const settle = async (ms: number): Promise<CredentialFreeSettleOutcome> => {
+    const capture: NonNullable<Executor["withCredentialFreeCapture"]> = async (ms, action, purpose, signal) => {
       if (++settles <= 6) return { kind: "incomplete", errors: [{ category: "timeout", message: "writer alive" }] };
-      return rig.settle(ms);
+      return rig.capture(ms, action, purpose, signal);
     };
-    const w = workThenDefer(rig, settle);
+    const w = workThenDefer(rig, undefined, capture);
     const runner = runnerWith(() => ({ executor: w.exec }), gitlab, undefined, nullLogger(), { recoveryRetryMs: 1 });
     const custody = spyCustodySettle(runner);
     const waits = observeWaits(runner);
@@ -424,7 +480,7 @@ describe("M2 account park W3-W6/W9", () => {
     const restore = spyPublishLands();
     try {
       await runner.execute(claim);
-      assert.equal(settles, 7);
+      assert.equal(settles, 13, "six refusals plus seven separately scoped fetch-back attempts");
       assert.ok(waits.every((ms) => ms <= 16));
       assert.ok(waits.includes(16));
       assertCaptured(159513);

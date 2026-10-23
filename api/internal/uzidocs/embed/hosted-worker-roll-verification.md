@@ -108,10 +108,13 @@ supports an old provider and drain confirmation, not replacement promotion.
    chart's worker pin is global, so owner-specific fault injection must be
    prepared in the disposable test environment, not represented as a chart knob.
 2. Observe exactly one admitted canary in that pool fail with `ErrImagePull` or
-   `ImagePullBackOff`. Waiting siblings must be **neither cordoned nor patched**:
-   retain their old template/image and no image-roll drain.
+   `ImagePullBackOff`. Waiting siblings without an eligible custody-held migration
+   drain must be
+   **neither cordoned nor patched**: retain their old template/image and no
+   image-roll drain. A migration drain is separate from replacement admission
+   and still must not patch the held template.
 3. Submit eligible real runs after the configured deadline has elapsed and record
-   that retained workers actually claim and execute them. An online flag or an
+   that eligible uncordoned retained workers actually claim and execute them. An online flag or an
    unmodified Deployment alone is not sufficient evidence. Record run IDs,
    claiming worker IDs and times without logs/source. The bad canary must not
    cause admission of siblings even when a drain deadline would have expired.
@@ -130,8 +133,8 @@ across overlapping pools. An admitted old incarnation must not count as future
 replacement capacity before its writes complete.
 
 After promoting a healthy canary, make a later admitted replacement fail. Record
-that this unresolved participant holds further admissions and healthy retained
-old workers continue claiming. A successful canary is not immunity to later
+that this unresolved participant holds further admissions and eligible uncordoned
+retained old workers continue claiming. A successful canary is not immunity to later
 failure. Confirm release clears only roll-owned drains on healthy old or proven
 healthy current workers, preserving independent pressure, maintenance and
 custody fences. Confirm there is no automatic rollback.
@@ -178,12 +181,79 @@ reservation state or optimistic preconditions.
   runs genuinely finish and verify the guarded automatic roll proceeds.
 - Record the busy drainer consuming pool concurrency (default one), supplying no
   replacement coverage, canary proof or post-promotion proof, and holding further admission
-  indefinitely. Unadmitted peers stay uncordoned/claimable; legacy recycle cannot
-  evade that policy. Test separately fenced DinD maintenance independently.
+  indefinitely. Unadmitted peers normally stay uncordoned/claimable, except for eligible
+  custody-held migration drains; legacy recycle cannot evade that policy.
+  Test separately fenced DinD maintenance independently.
 - Exercise independent nondrifted pressure/nix-size maintenance past its shortened
   deadline: busy deferral may expire and unheld /data may be deleted. Repeat with
   custody-held data preserved, including with no assigned blockers. Preserve idle
   guards and the guarded busy restore of an unchanged retained zero-replica Deployment.
+
+## Migration drain policy and operational limits
+
+This controller-only policy reuses `image_roll`; it adds no schema, worker
+protocol or API product change, and requires no deployment order for the drain
+exception. The API-first order above still applies to introducing paced rolls.
+No server-side settlement fence is added. These are policy and accepted
+operational limits, not results from executing this hosted procedure.
+
+- Ordinary admission is planned first. A persistent drifted Docker worker held
+  on an old or unknown layout may then be selected for a migration drain,
+  without replacement admission, new reservation, canary, roll slot or
+  pod-template patch. Incomplete own reservations are withdrawn; unconfirmed
+  cancellation retains its cohort fence. Run-bound workers are excluded from
+  drain selection while keeping replacement custody protection.
+- A distinct live eligible uncordoned sibling in the same owner/lane must
+  **individually** cover the full frozen scheduling, protocol and ordinary/checker
+  eligibility set. Two partial siblings cannot cover by union. Busy is okay:
+  this is serving eligibility, not a free-slot requirement. Uncertain evidence,
+  pressure, maintenance or admitted drift disqualifies coverage.
+- A held worker observed drained for **any reason** in the full poll occupies
+  the migration budget, including one whose target cannot render. Selected and
+  possibly committed drains also occupy it. No additional migration selection
+  proceeds in that owner/lane. Unknown owner evidence conservatively fences
+  the lane. This is not an absolute physical one-drain guarantee.
+- Drained held workers supply no intake coverage. Later ordinary rolls may wait
+  behind a retained migration drain. If the covering sibling disappears after
+  entry, all intake coverage can be lost; the retained drain stays. Review
+  `blocking_reason` and health, preserve held sources and decide how to restore
+  eligible capacity or resolve custody through the supported recovery paths.
+- Eligible reconciliation is level-triggered after registration, controller
+  restart and explicit undrained polls, without a fixed time bound.
+  Re-registration clears an image-roll drain unless maintenance retains it;
+  registration and poll/write failures can
+  allow claims before re-drain. Failed writes retain uncertainty until evidence
+  resolves it, but this is process-local and lost on restart. If a worker is
+  removed from the full desired inventory, its pending drain continues to fence
+  the owner/lane while cluster objects remain observed. Once its observation is
+  absent, a separate complete pod list in the original lane must also confirm
+  that no managed pod for that worker remains before the pending fence retires.
+  Failed or incomplete pod lists retain uncertainty; teardown alone is not proof
+  that every pod has disappeared.
+- A timeout does not cancel a server write. An earlier delayed cordon may commit
+  **after an explicit undrained poll**, even after another selection, leaving
+  multiple held workers physically drained. The accepted controller-only scope
+  supplies no server-side fence. Treat the multiple-drain intake-risk notice,
+  local cause and sampled worker identity as an operator decision, not authority
+  to delete pods, discard sources or bypass custody.
+- Unknown-target multiple-drain outcomes are display-only: desired image and
+  version stay empty, with no roll entry, admission or reservation created.
+  The existing synthetic rolling fallback may stamp the first
+  `upgrading_since`; that timestamp grants no mutation authority.
+- Custody-clear ordinary release predicates can release `image_roll` before a
+  later re-drain, allowing fresh work. Idle terminal custody holds still need
+  an operator custody decision; the #3031 automatic path is not added here.
+  **No automatic discard.** Follow
+  [Reviewing and resolving held work](./run-recovery.md#reviewing-and-resolving-held-work)
+  and preserve first.
+- Chat continue drops the draining-worker pin and may cold-resume elsewhere.
+  Returning to a previous pin retains custody refusal; after custody clearance,
+  ordinary release rules apply. Reusing `image_roll` makes this exception
+  independent of API/worker rollout order.
+- Replacement custody guards remain on ForceRoll, recycle, maintenance and
+  old/unknown layouts, with independent DinD, pressure and maintenance fences.
+  Kubelet eviction, node drain and manual pod deletion remain outside controller
+  protection and can lose old-layout clones.
 
 ## Missing evidence and explicit recovery
 

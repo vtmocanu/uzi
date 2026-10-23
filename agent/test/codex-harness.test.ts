@@ -334,6 +334,13 @@ function completedItem(item: Record<string, unknown>, threadId = "th-1"): CodexN
 }
 
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
+}
+
 describe("m1 response usage", () => {
   const records = (events: HarnessEvent[]) => events.filter((e): e is Extract<HarnessEvent, { kind: "usage_record" }> => e.kind === "usage_record");
   const last = { inputTokens: 100, cachedInputTokens: 30, cacheWriteInputTokens: 20, outputTokens: 40, totalTokens: 140 };
@@ -5681,24 +5688,45 @@ describe("CodexHarness: error precedence + lifecycle", () => {
     });
   });
 
-  it("a launch failure cancels the reservation (no poison) and re-throws the setup error", async () => {
+  it("unknown failed startup retains uncertainty after reservation cancellation and terminal disposal", async () => {
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    let reject!: (error: Error) => void;
+    const pending = new Promise<never>((_, fail) => { reject = fail; });
+    const boom = new Error("unknown native startup");
+    const { harness } = makeHarness({ registry, launchRoot: () => pending });
+    const turn = collect(harness.startTurn(makeRequest()).events);
+    await tick();
+    assert.equal(registry.pendingLaunchCount(), 1);
+    reject(boom);
+    await assert.rejects(turn, error => error === boom);
+    assert.equal(registry.pendingLaunchCount(), 0);
+    assert.equal((await registry.settleForCapture(1000)).kind, "incomplete");
+    assert.equal((await registry.disposeTools(1000)).kind, "incomplete");
+    assert.equal((await registry.settleForCapture(1000)).kind, "incomplete");
+  });
+
+  it("an unknown launch failure settles its reservation but retains uncertainty and the setup error", async () => {
     const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
     const boom = new Error("launch failed");
     const { harness } = makeHarness({ registry, launchRoot: async () => { throw boom; } });
 
     await assert.rejects(collect(harness.startTurn(makeRequest()).events), (err: unknown) => err === boom);
     assert.equal(registry.pendingLaunchCount(), 0, "the reservation was settled (cancelled)");
-    assert.equal(registry.isPoisoned(), false, "a launch abort cancels, it does not poison");
+    assert.equal(registry.isPoisoned(), true, "canceling a reservation cannot prove failed-start cleanup");
+    assert.equal((await registry.settleForCapture(1_000)).kind, "incomplete");
   });
 
   it("aborts the launch and tears the root down when registry admission fails (finding 6)", async () => {
     const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
     let disposed = 0;
+    let reaps = 0;
+    let releaseReap!: (value: { ok: true }) => void;
+    const reaping = new Promise<{ ok: true }>(resolve => { releaseReap = resolve; });
     // A root whose declared kind MISMATCHES the reserved "provider" kind: the REAL registry
     // poisons and registerRoot returns { ok: false }, so ensureRoot must not proceed on it.
     const mismatchedRoot: RegisteredRoot = {
       kind: "command",
-      reap: async () => ({ ok: true }),
+      reap: () => { reaps++; return reaping; },
       dispose: async () => {
         disposed += 1;
       },
@@ -5714,12 +5742,26 @@ describe("CodexHarness: error precedence + lifecycle", () => {
       launchRoot: async () => ({ root: mismatchedRoot, transport, supervisorPid: 1 }),
     });
 
-    await assert.rejects(collect(harness.startTurn(makeRequest()).events), (err: unknown) => {
+    let finished = false;
+    const turn = collect(harness.startTurn(makeRequest()).events);
+    const rejection = assert.rejects(turn, (err: unknown) => {
       assert.ok(err instanceof CodexHarnessError);
       assert.equal(err.failure.category, "protocol");
       assert.match(err.message, /failed registry admission/);
       return true;
     });
+    void turn.then(() => { finished = true; }, () => { finished = true; });
+    try {
+      await tick();
+      assert.equal(registry.rootCount(), 1, "rejected registration retains the launched root");
+      assert.equal(registry.pendingLaunchCount(), 0, "retained root settles its reservation");
+      assert.equal(reaps, 1, "startup joins the launched root's reap");
+      assert.equal(finished, false, "startup cannot reject before owned reaping settles");
+    } finally {
+      releaseReap({ ok: true });
+      await rejection;
+    }
+    assert.equal((await registry.settleForCapture(1000)).kind, "incomplete");
     // The registry poisoned on the kind mismatch, and the just-launched root was torn down:
     // its transport was closed and it was disposed rather than left to a (dead) reap.
     assert.equal(registry.isPoisoned(), true, "the admission failure poisoned the epoch");
@@ -5753,6 +5795,61 @@ describe("CodexHarness: error precedence + lifecycle", () => {
     turn.requestStop("cancel");
     assert.deepEqual(await collect(turn.events), []);
     assert.equal(transport.requests.length, 0, "the stopped lazy turn launches no model work");
+  });
+
+  it("reentrant transport close observes the shared pending completion and sticky rejection", async () => {
+    const { harness, transport } = makeHarness();
+    transport.push(threadStarted()).push(turnCompleted("completed")).end();
+    await collect(harness.startTurn(makeRequest()).events);
+    const cleanup = deferred<void>();
+    const failure = new Error("reentrant transport close failed");
+    let reentered: Promise<void> | undefined;
+    let closes = 0;
+    transport.close = () => {
+      closes++;
+      reentered = harness.close();
+      return cleanup.promise;
+    };
+    const first = harness.close();
+    assert.ok(reentered);
+    const settled: unknown[] = [];
+    const observe = (work: Promise<void>) => work.then(
+      () => { settled.push("fulfilled"); }, error => { settled.push(error); });
+    const joined = Promise.all([observe(first), observe(reentered)]);
+    try {
+      await tick();
+      assert.deepEqual(settled, [], "a reentrant close cannot finish before owned cleanup");
+      cleanup.reject(failure);
+      await joined;
+      assert.deepEqual(settled, [failure, failure]);
+      await assert.rejects(harness.close(), error => error === failure);
+      assert.equal(closes, 1);
+    } finally { cleanup.reject(failure); await joined; }
+  });
+
+  it("concurrent and repeated close callers share pending completion and rejection", async () => {
+    const { harness, transport } = makeHarness();
+    transport.push(threadStarted()).push(turnCompleted("completed")).end();
+    await collect(harness.startTurn(makeRequest()).events);
+    const cleanup = deferred<void>();
+    const failure = new Error("transport close failed");
+    let closes = 0;
+    transport.close = () => { closes++; return cleanup.promise; };
+    const first = harness.close();
+    const second = harness.close();
+    const settled: unknown[] = [];
+    const observe = (work: Promise<void>) => work.then(
+      () => { settled.push("fulfilled"); }, error => { settled.push(error); });
+    const joined = Promise.all([observe(first), observe(second)]);
+    try {
+      await tick();
+      assert.deepEqual(settled, [], "every close caller waits for owned cleanup");
+      cleanup.reject(failure);
+      await joined;
+      assert.deepEqual(settled, [failure, failure]);
+      await assert.rejects(harness.close(), error => error === failure);
+      assert.equal(closes, 1);
+    } finally { cleanup.reject(failure); await joined; }
   });
 
   it("close() is idempotent and does NOT reap / dispose / quiesce the registry", async () => {

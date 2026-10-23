@@ -43,22 +43,23 @@ type rollMarker struct {
 	Completed       bool         `json:"completed"`
 }
 type rollEntry struct {
-	w              protocol.DesiredWorker
-	o              reconcile.ObservedWorker
-	target         *appsv1.Deployment
-	dep            *appsv1.Deployment
-	marker         *rollMarker
-	pods           []corev1.Pod
-	volumeRefs     map[string]bool
-	sets           map[string]appsv1.ReplicaSet
-	coverage       rollCoverage
-	ns             string
-	drift          bool
-	admitted       bool
-	blocked        string
-	recovery       bool
-	claim          *corev1.PersistentVolumeClaim
-	rawReservation bool
+	w                  protocol.DesiredWorker
+	o                  reconcile.ObservedWorker
+	target             *appsv1.Deployment
+	dep                *appsv1.Deployment
+	marker             *rollMarker
+	pods               []corev1.Pod
+	volumeRefs         map[string]bool
+	sets               map[string]appsv1.ReplicaSet
+	coverage           rollCoverage
+	ns                 string
+	drift              bool
+	admitted           bool
+	blocked            string
+	recovery           bool
+	claim              *corev1.PersistentVolumeClaim
+	rawReservation     bool
+	migrationHeldDrift bool
 }
 type rollTick struct {
 	entries   map[string]*rollEntry
@@ -67,8 +68,12 @@ type rollTick struct {
 	uncertain map[string]bool
 	// layoutUncertain names, per coverage key, the held worker whose own reservation
 	// could not be shown withdrawn (see holdForLayoutMigration).
-	layoutUncertain map[string]string
-	errors          []error
+	layoutUncertain   map[string]string
+	errors            []error
+	unavailable       map[string]bool
+	migrationFences   map[string]bool
+	migrationMultiple bool
+	pollDrained       map[string]bool
 }
 type rollTickKey struct{}
 
@@ -117,6 +122,9 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 			}
 		}
 	}
+	// Account for drained held workers using the newer pod snapshot before any
+	// ordinary admission can count them as serving coverage.
+	m.prepareMigrationDrains(ctx, t, desired, observed)
 	// Retire completed history only after every participant has been cleaned up.
 	// Do this before grouping so a new pin uses the current API capability set.
 	for _, e := range t.entries {
@@ -176,6 +184,9 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 			}
 		}
 		e.coverage = coverage
+		if migrationLaneFenced(t, coverage) {
+			t.uncertain[coverageKey(coverage)] = true
+		}
 		// Layout migration guard (issue #3153), BEFORE the ForceRoll override below: a
 		// held worker's template replacement would destroy custody-held run state, so
 		// it is never admitted, never a canary and never takes a roll slot. Not
@@ -184,6 +195,7 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 		drifted := e.drift || (e.dep == nil && e.o.HasDeployment &&
 			(e.o.SpecHash != e.target.Spec.Template.Annotations[AnnotationSpecHash] || e.o.Generation != e.w.Generation))
 		if drifted && migrationHeld(e.w, e.o.RunnerLayout) {
+			e.migrationHeldDrift = true
 			m.holdForLayoutMigration(ctx, t, e)
 			continue
 		}
@@ -244,15 +256,36 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 			t.errors = append(t.errors, fmt.Errorf("worker %s: %s; re-observe and re-poll required", e.w.ID, e.blocked))
 		}
 	}
+	// Settle ordinary reservation writes before selecting a migration drain.
+	// Pass 2 still confirms admission, but a reservation already written here is
+	// an idempotent no-op there.
+	for _, w := range order {
+		e := t.entries[w.ID]
+		if e == nil || !e.admitted || t.uncertain[coverageKey(e.coverage)] || migrationLaneFenced(t, e.coverage) {
+			continue
+		}
+		if err := m.confirmAdmission(ctx, t, e); err != nil {
+			e.blocked = "reservation mutation unconfirmed"
+			t.uncertain[coverageKey(e.coverage)] = true
+			t.outcomes[w.ID].State = "waiting_evidence"
+			t.outcomes[w.ID].BlockingReason = pacingText(e.blocked)
+			t.errors = append(t.errors, fmt.Errorf("worker %s: %w", w.ID, err))
+		}
+	}
+	m.selectMigrationDrains(ctx, t, desired, observed, pools)
 	m.pacing = t.outcomes
 	return t, order
 }
 
 // holdForLayoutMigration reports the worker held and withdraws its own incomplete
-// roll reservation. The reservation must go because the held worker is outside the
-// pool: planPool's in-flight, promotion and pending accounting never sees it, so a
-// cohort could otherwise complete without it and wedge it (and every later drift in
-// the pool) behind a stale incomplete marker once custody releases. Cancelling is
+// roll reservation. After ordinary pool planning, selectMigrationDrains separately
+// considers an image_roll cordon using frozen poll coverage, refreshed layout
+// evidence, and the owner/lane budget for observed, selected or possibly drained
+// held workers. This hold never admits replacement. The reservation must go because
+// the held worker is outside the pool: planPool's in-flight, promotion and pending
+// accounting never sees it, so a cohort could otherwise complete without it and
+// wedge it (and every later drift in the pool) behind a stale incomplete marker
+// once custody releases. Cancelling is
 // metadata-only (no template or replicas change, no pod replaced) and is the same
 // cancellation planPool already applies to an obsolete marker; the worker simply
 // re-enters admission as a fresh drifted participant after the hold lifts.
@@ -731,7 +764,7 @@ func (m *Materializer) remainingCoverage(t *rollTick, pool []*rollEntry, candida
 			continue
 		}
 		population++
-		if e == candidate || e.blocked != "" {
+		if e == candidate || e.blocked != "" || t.unavailable[e.w.ID] {
 			continue
 		}
 		if e.marker != nil {
@@ -749,7 +782,7 @@ func (m *Materializer) remainingCoverage(t *rollTick, pool []*rollEntry, candida
 		return true
 	}
 	for _, e := range t.entries {
-		if e.ns != candidate.ns || !covers(e.w, candidate.coverage) || e.blocked != "" {
+		if e.ns != candidate.ns || !covers(e.w, candidate.coverage) || e.blocked != "" || t.unavailable[e.w.ID] {
 			continue
 		}
 		if e == candidate || (e.admitted && (e.drift || (!m.currentUsable(t, e) && !m.promoted(t, e)))) {
@@ -785,6 +818,8 @@ func (m *Materializer) coverageBlocker(t *rollTick, candidate *rollEntry) (strin
 	proof := peer.w.RollEvidence
 	predicate := "incarnation_proof_unconfirmed"
 	switch {
+	case t.unavailable[peer.w.ID] || migrationLaneFenced(t, peer.coverage):
+		predicate = "migration_drain_unavailable"
 	case peer.blocked != "":
 		predicate = peer.blocked
 	case peer.admitted && peer.drift:
@@ -1157,7 +1192,7 @@ func freshUntil(now, start time.Time, evaluated, expiry time.Time) bool {
 // Mutation callers keep their own custody fences.
 func (m *Materializer) oldUsable(t *rollTick, e *rollEntry) bool {
 	proof := e.w.RollEvidence
-	return e.blocked == "" && liveWorkerPod(e) && proof != nil && (workerImage(e.dep) != workerImage(e.target) || e.dep.Spec.Template.Annotations[AnnotationSpecHash] != e.target.Spec.Template.Annotations[AnnotationSpecHash] || m.currentUsable(t, e)) && proof.LivenessValidUntil != nil &&
+	return !t.unavailable[e.w.ID] && !migrationLaneFenced(t, e.coverage) && e.blocked == "" && liveWorkerPod(e) && proof != nil && (workerImage(e.dep) != workerImage(e.target) || e.dep.Spec.Template.Annotations[AnnotationSpecHash] != e.target.Spec.Template.Annotations[AnnotationSpecHash] || m.currentUsable(t, e)) && proof.LivenessValidUntil != nil &&
 		freshUntil(m.now(), t.start, proof.EvaluatedAt, *proof.LivenessValidUntil) &&
 		!e.w.DiskPressure && !maintenanceActive(e.w) &&
 		e.w.DrainingSince == nil && covers(e.w, e.coverage)
@@ -1168,7 +1203,7 @@ func (m *Materializer) oldUsable(t *rollTick, e *rollEntry) bool {
 // still be nonempty and proven by the heartbeat for the single non-terminating,
 // non-terminal pod.
 func (m *Materializer) currentUsable(t *rollTick, e *rollEntry) bool {
-	if e.dep == nil || workerImage(e.dep) != workerImage(e.target) {
+	if t.unavailable[e.w.ID] || migrationLaneFenced(t, e.coverage) || e.dep == nil || workerImage(e.dep) != workerImage(e.target) {
 		return false
 	}
 	c, ok := coverageOf(e.w, e.ns)
@@ -1216,7 +1251,7 @@ func maintenanceActive(w protocol.DesiredWorker) bool {
 // still under a cordon cannot supply claimable coverage.
 func (m *Materializer) promoted(t *rollTick, e *rollEntry) bool {
 	r, p := e.marker, e.w.RollEvidence
-	if e.o.Roll.Phase == protocol.PhaseStuck || r == nil || p == nil || !p.Registered || p.Version != 1 || e.dep == nil || e.dep.UID == "" || e.dep.DeletionTimestamp != nil ||
+	if t.unavailable[e.w.ID] || migrationLaneFenced(t, e.coverage) || e.blocked != "" || e.o.Roll.Phase == protocol.PhaseStuck || r == nil || p == nil || !p.Registered || p.Version != 1 || e.dep == nil || e.dep.UID == "" || e.dep.DeletionTimestamp != nil ||
 		e.dep.Spec.Template.Annotations[AnnotationSpecHash] != r.Hash || workerImage(e.dep) != r.Image ||
 		p.RegisteredVersion == nil || *p.RegisteredVersion != r.TargetVersion || p.RegisterNonce == nil || *p.RegisterNonce == "" || *p.RegisterNonce == r.Nonce ||
 		p.PodUID == nil || *p.PodUID == "" || p.HeartbeatAt == nil || p.HeartbeatAt.IsZero() || p.HeartbeatAt.After(p.EvaluatedAt) ||

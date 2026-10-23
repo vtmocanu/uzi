@@ -54,6 +54,7 @@ func TestSeededAllowlistCoveredBySeed(t *testing.T) {
 
 	// NOT-covered: a package neither baked nor an exception.
 	notCovered := []string{
+		"github:NixOS/nixpkgs/0000000000000000000000000000000000000000#go_1_27", // user specs are not normalized as trusted seeds
 		"ruby",      // never baked (tier-2 only), not an exception
 		"terraform", // swapped off the allowlist by 00124, not baked (unfree)
 		"cowsay",    // arbitrary un-baked package
@@ -86,6 +87,7 @@ func TestNormalize(t *testing.T) {
 		"go-task":             "task",       // aliased to binary name
 		"gnumake":             "make",       // aliased to binary name
 		"kubernetes-helm":     "helm",       // aliased to binary name
+		"github:NixOS/nixpkgs/5adc50831c259f87faeb09ddf930d43597197473#go_1_27": "go", // pinned seed still supplies go
 	}
 	for in, want := range cases {
 		if got := normalize(in); got != want {

@@ -31,15 +31,49 @@ gate, `esc` back, `?` help.
 
 ## Screenshots — one command
 
+In a provisioned uzi run, for **both Claude and Codex**:
+
 ```sh
-cd api/cmd/uzi/uxlab
-devbox run build          # generate ANSI frames + render them to png/
+cd api/cmd/uzi/uxlab && ./build.sh
 ```
 
-`build` runs two steps you can also run alone:
+The repo owner must enable repo Devbox opt-in (`repo_devbox_opt_in`) in uzi. Check the
+run feed for successful provisioning with **no package warnings** before rendering.
+The runner installs tools before launching the harness; do not invoke Devbox or Nix
+from run commands. Provisioning reads the root `devbox.json` packages, not the nested
+uxlab scripts or lockfile. A warning can mean repo extras were skipped, so a started
+run alone does not establish that `freeze` is available.
 
-- `devbox run gen` — drives the real `tuiModel` offline and writes `frames/*.ansi`
-- `devbox run render` — turns `frames/*.ansi` into `png/*.png` with `freeze`
+Generation runs `go test`, so Go must match or exceed the `api/go.mod` toolchain
+(currently **1.27.3**), with that toolchain available in the run environment. Provisioning
+`freeze` does not fix the separate Go toolchain issue **#3305**.
+
+Local contributors keep the Devbox entry point:
+
+```sh
+cd api/cmd/uzi/uxlab && devbox run build
+```
+
+Both entry points use `build.sh`: missing `freeze` fails before frames change, then
+`gen.sh` drives the real `tuiModel` offline to `frames/*.ansi` and `render.sh` converts
+them to `png/*.png`. The build rejects an empty frame inventory and requires a nonempty
+PNG **strictly newer than its corresponding ANSI frame** for each generated frame.
+After a code change, run the full build and inspect BOTH `png/<scene>-dark.png` and
+`png/<scene>-light.png`. A timed-out render can leave stale PNGs; freshness checks do
+not replace visual review.
+
+For partial operations with the required tools already on PATH:
+
+- `./gen.sh` — generate frames; needs the Go toolchain above.
+- `./render.sh` — render existing frames; needs `freeze`.
+
+Local contributors can use `devbox run gen` / `devbox run render` for those halves.
+Partial operations do not perform the full build's preflight and freshness checks.
+
+Keep the `charm-freeze@0.2.2` pins in root `devbox.json` and uxlab `devbox.json` manually
+in sync when upgrading. `gate:repo` includes `check:uxlab-freeze` to enforce version
+parity. Worker provisioning uses a packages-only resolver: the package version is
+pinned, but the nested Devbox lockfile's exact Nix store path is not guaranteed.
 
 Outputs land in `png/`. Both `frames/` and `png/` are gitignored: they are large binaries
 derived deterministically from the committed harness, so they are regenerated, not stored.
@@ -72,7 +106,7 @@ Every scene is rendered from the SHIPPED model, `-dark` and `-light`.
 | Frame | State it captures |
 |---|---|
 | `board-populated` / `board-empty` / `board-admin` / `board-filter` | the run board: mixed statuses/health, empty state, factory-wide admin (OWNER), and the `/` filter |
-| `board-done-failures` / `board-done-failures-selected` | failed and needs-landing state ink, red issue links, quiet human stops, and the failure count, with and without selection |
+| `board-done-failures` / `board-done-failures-selected` | one dimmed red for DONE failure state tokens, their issue links and every DONE issues judge badge; full-red active issues badges and failure count; quiet human stops, with and without selection |
 | `board-done-age` | recent finishes from older runs, legacy finish fallback, and unchanged active age |
 | `detail-running` | detail, live, crew rail focused, ⇣ following |
 | `detail-milestones-attributed` | two in-progress milestones each attributed to its subagent; the D3 unique-match lane also shows live age (PRD #1224) |
@@ -92,7 +126,8 @@ Every scene is rendered from the SHIPPED model, `-dark` and `-light`.
 | `../uxlab_gen_test.go` | the screenshot generator: drives the shipped `tuiModel` into every scene (and, per sketch, `sketches`) |
 | `../demo.go` | the `uzi tui --demo` showcase (shipped model + fake client + live ticker) |
 | `../sketch.go` | the sketch harness: the `sketches` registry, its lipgloss primitives, and the Tier-A frame host |
-| `gen.sh` / `render.sh` | regenerate ANSI frames / render them to PNG |
+| `build.sh` | provisioned-run entry point; preflight, generate, render and verify PNG freshness |
+| `gen.sh` / `render.sh` | partial operations: regenerate ANSI frames / render them to PNG |
 | `devbox.json` | pins `freeze`; scripts `demo`, `gen`, `render`, `build` |
 
 ## Prototyping a new TUI feature (sketches)
@@ -123,7 +158,8 @@ cd api && go run ./cmd/uzi tui --sketch <name>   # live preview, no server
 ```
 
 A bare `uzi tui --sketch` (or `--sketch list`, or an unknown name) prints the registered
-sketch names. `devbox run build` picks up any Tier-A sketch automatically — no generator
+sketch names. `cd api/cmd/uzi/uxlab && ./build.sh` in provisioned Claude/Codex runs
+(local contributors: `devbox run build`) picks up any Tier-A sketch automatically — no generator
 edit needed — and produces its `sketch-<name>-<frameIndex>-<theme>.png` alongside the shipped
 scenes; a Tier-B-only sketch (no `frames`) is live-preview-only and isn't screenshotted.
 
@@ -139,5 +175,6 @@ keeps the harness from becoming a second maintained TUI, the fate of the retired
 ## Adding a state
 
 Add a builder to the `scenes` map in `../uxlab_gen_test.go` (drive the real model with the
-same message/key helpers the other builders use), then `devbox run build`. Name frames
-`<screen>-<state>-<theme>.png`.
+same message/key helpers the other builders use), then run
+`cd api/cmd/uzi/uxlab && ./build.sh` in provisioned Claude/Codex runs (local contributors:
+`devbox run build`). Inspect both themes as above. Name frames `<screen>-<state>-<theme>.png`.

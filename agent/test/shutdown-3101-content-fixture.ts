@@ -70,7 +70,8 @@ export function shutdownContentProof(fx: Fixture, client: WorkerClient, iid: num
           assert.ok(signal, "shutdown broker publication carries its bounded boundary signal");
           assert.equal(signal.aborted, false, "spent execution signals do not abort the publication permit");
         } else {
-          assert.equal(signal, undefined, "existing credential-free owner pause does not mint a Codex boundary permit");
+          assert.ok(signal, "owner pause publication carries its bounded capture signal");
+          assert.equal(signal.aborted, false, "pause capture signal remains live through the receiver ACK");
         }
         beforeAck?.(signal, generation);
       }

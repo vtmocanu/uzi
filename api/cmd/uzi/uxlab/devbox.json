@@ -15,8 +15,7 @@
         "./render.sh"
       ],
       "build": [
-        "./gen.sh",
-        "./render.sh"
+        "./build.sh"
       ]
     }
   }

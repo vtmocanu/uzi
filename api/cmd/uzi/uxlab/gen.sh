@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Regenerate the raw-ANSI TUI frames under frames/ by driving the real tuiModel offline
-# (no server, no PTY). See uxlab_gen_test.go. Called by `devbox run build`.
+# (no server, no PTY). See uxlab_gen_test.go and README.md for Go requirements.
+# Full build: ./build.sh in provisioned Claude/Codex runs; devbox run build locally.
+# Partial operation: ./gen.sh with the matching Go toolchain already on PATH.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

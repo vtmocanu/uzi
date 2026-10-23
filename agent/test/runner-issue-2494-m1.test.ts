@@ -1,3 +1,4 @@
+import { codexRig } from "./runner-codex-sinks-fixture.js";
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -212,7 +213,9 @@ for (const cancellation of ["archive", "held", "unknown"] as const) {
     const events: unknown[] = [], log = nullLogger();
     log.warn = (message, fields) => events.push({ message, fields });
     log.info = (message, fields) => events.push({ message, fields });
+    const rig = codexRig();
     const r = runnerWith(() => ({ executor: {
+      withCredentialFreeCapture: rig.capture,
       run: async ctx => { if (ctx.cancelRequested?.()) throw new Error("run cancelled"); models++; throw new Error("cancelled model must not run"); },
       killAgentTree() {},
       settleForCredentialFreeCapture: async () => ({ kind: "observed_empty" as const }),

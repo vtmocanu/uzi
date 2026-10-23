@@ -1,3 +1,4 @@
+import { codexRig } from "./runner-codex-sinks-fixture.js";
 import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -5,9 +6,8 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import type { ExecutorResult, RunContext } from "../src/executor.js";
-import type { BoundaryPermit, CodexExecutionSafety } from "../src/harness.js";
 import { CapturePathMismatchError, GitCache, type AttemptSeedOptions, type RecoveryJournalEntry } from "../src/git.js";
 import { LimitReachedError } from "../src/limit.js";
 import { RunRunner, failOriginForReason, type ExecutorFactory } from "../src/runner.js";
@@ -752,10 +752,17 @@ describe("issue #1856 / #2512: unproven settlement retains a charged predecessor
       const { factory: baseFactory, started } = codexFactory();
       const factory: ExecutorFactory = (id) => {
         const built = baseFactory(id);
-        if (unsupported) delete built.executor.settleForCredentialFreeCapture;
-        else built.executor.settleForCredentialFreeCapture = async () => ({
-          kind: "incomplete", errors: [{ category: "timeout", message: "predecessor drain unverified" }],
-        });
+        if (unsupported) {
+          delete built.executor.settleForCredentialFreeCapture;
+          delete built.executor.withCredentialFreeCapture;
+        } else {
+          built.executor.settleForCredentialFreeCapture = async () => ({
+            kind: "incomplete", errors: [{ category: "timeout", message: "predecessor drain unverified" }],
+          });
+          built.executor.withCredentialFreeCapture = async () => ({
+            kind: "incomplete", errors: [{ category: "timeout", message: "predecessor drain unverified" }],
+          });
+        }
         return built;
       };
       const { logger } = recordingLogger();
@@ -1303,32 +1310,22 @@ describe("issue #1783 M2: the seed-time sweep over the key's NON-LIVE paths", { 
 /** A Codex-shaped executor (it carries `safety`) that stops after the seed. */
 function codexFactory(onRun: (ctx: RunContext) => void = () => {}): { factory: ExecutorFactory; started: () => number } {
   let started = 0;
-  const safety: CodexExecutionSafety = {
-    kind: "codex",
-    withBoundary: async (req, action) => action({ epoch: 1, boundary: req.boundary, signal: new AbortController().signal } as unknown as BoundaryPermit),
-    spawnBoundaryProcess: async (_permit, request) => {
-      const [command, ...args] = request.argv;
-      const child = spawn(command!, args, { cwd: request.cwd, env: request.env, stdio: ["pipe", "pipe", "pipe"] });
-      const completed = new Promise<{ code: number }>((resolve, reject) => {
-        child.once("error", reject);
-        child.once("exit", (code, sig) => resolve({ code: code ?? (sig ? 128 : 1) }));
-      });
-      return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, cancel: async () => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); await completed; }, completed };
-    },
-    dispose: async () => ({ kind: "disposed" }),
-  };
-  const factory: ExecutorFactory = (runId) => ({
-    homeDir: path.join(homeDir, runId),
-    executor: {
-      safety,
-      settleForCredentialFreeCapture: async () => ({ kind: "observed_empty" as const }),
-      run: async (ctx: RunContext): Promise<ExecutorResult> => {
-        started++;
-        onRun(ctx);
-        throw new Error("stop after the seed");
+  const factory: ExecutorFactory = (runId) => {
+    const rig = codexRig();
+    return {
+      homeDir: path.join(homeDir, runId),
+      executor: {
+        safety: rig.safety,
+        withCredentialFreeCapture: rig.capture,
+        settleForCredentialFreeCapture: rig.settle,
+        run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          started++;
+          onRun(ctx);
+          throw new Error("stop after the seed");
+        },
       },
-    },
-  });
+    };
+  };
   return { factory, started: () => started };
 }
 

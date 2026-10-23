@@ -99,12 +99,15 @@ glamour for markdown. The board, detail, review, lanes and steer views are `tui_
 `tui_detail.go` / `tui_review.go` / `tui_lanes.go` / `tui_steer.go`; the shared palette +
 render primitives are `tui_render.go`.
 
-**Render harness (this is how you SEE it):** `cd api/cmd/uzi/uxlab && devbox run build`
-regenerates the ANSI frames (an env-gated `uxlab_gen_test.go` drives the REAL shipped
-`tuiModel` offline, no server/PTY) AND the PNGs (charmbracelet/freeze, light + dark, ~19
-scenes) under `uxlab/png/`. Read `png/<scene>-dark.png` and `png/<scene>-light.png`. `devbox
-run gen` / `render` are the two halves; after a code change run the FULL `devbox run build`
-and confirm the PNG mtimes are newer than the frames (a timed-out render leaves stale PNGs).
+**Render harness (this is how you SEE it):** in provisioned Claude AND Codex runs,
+`cd api/cmd/uzi/uxlab && ./build.sh`; local contributors use `devbox run build`.
+This drives the REAL shipped `tuiModel` offline (env-gated `uxlab_gen_test.go`, no
+server/PTY) to ANSI frames AND light + dark PNGs under `uxlab/png/`. After a code
+change run the FULL build: missing `freeze` fails before frames change; success
+requires nonempty PNGs strictly newer than their corresponding frames. Read BOTH
+`png/<scene>-dark.png` and `png/<scene>-light.png`. See `api/cmd/uzi/uxlab/README.md`
+for opt-in, provisioning warnings, Go prerequisites and partial operations. The runner
+provisions before launch; do not invoke Devbox/Nix in run commands.
 Interactive drive-testing: `cd api && go run ./cmd/uzi tui --demo` (a hidden flag that runs
 the real model over seeded fixtures + a fake stream, no server).
 

@@ -53,7 +53,7 @@ func TestBoardDoneFailureInk(t *testing.T) {
 						if dark {
 							stateInk = lipgloss.Color("#cf8585")
 						}
-						issueInk = m.pal.alarm
+						issueInk = stateInk
 						word, glyph = "failed", "✗"
 						if i == 1 {
 							word = "needs landing"
@@ -77,6 +77,52 @@ func TestBoardDoneFailureInk(t *testing.T) {
 						t.Error("failed row lost its OSC-8 issue link")
 					}
 				})
+			}
+		}
+	}
+}
+
+func TestBoardDoneVerdictInk(t *testing.T) {
+	rows := append([]apitypes.RunListItemDTO{{RunDTO: apitypes.RunDTO{ID: "judgerun", Status: "running"}}}, doneFailureRows()...)
+	for _, dark := range []bool{false, true} {
+		for _, selected := range []bool{false, true} {
+			for _, r := range rows {
+				for _, verdict := range []string{"issues", "ideal", "ok"} {
+					t.Run(fmt.Sprintf("dark=%t/selected=%t/%s/%s", dark, selected, r.ID, verdict), func(t *testing.T) {
+						r.JudgeVerdict, r.JudgeTodoCount = sp(verdict), 2
+						m := tuiTestModel(t, &uzicli.FakeClient{}, "")
+						m.dark, m.pal = dark, newPalette(dark)
+						m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: []apitypes.RunListItemDTO{
+							{RunDTO: apitypes.RunDTO{ID: "active01", Status: "running"}}, r,
+						}})
+						visible := m.board.visible()
+						for i, row := range visible {
+							if row.ID == r.ID {
+								m.board.cursor = i
+								if !selected {
+									m.board.cursor = (i + 1) % len(visible)
+								}
+								break
+							}
+						}
+						var bg color.Color
+						if selected {
+							bg = m.pal.selBg
+						}
+						ink := m.pal.faintC
+						if verdict == "issues" {
+							ink = m.pal.alarm
+							if r.Status != "running" {
+								ink = m.pal.doneAlarm
+							}
+						}
+						line := boardAgeTestRow(t, m.View().Content, r.ID)
+						span := paintSeg(ink, bg, false, "⚖ "+verdict+" · 2")
+						if !strings.Contains(line, span) {
+							t.Errorf("judge badge missing expected SGR span %q in %q", span, line)
+						}
+					})
+				}
 			}
 		}
 	}
@@ -122,7 +168,9 @@ func TestBoardDoneFailureEyebrow(t *testing.T) {
 
 func TestBoardDoneFailureAscii(t *testing.T) {
 	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
-	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: doneFailureRows()})
+	rows := doneFailureRows()
+	rows[0].JudgeVerdict, rows[0].JudgeTodoCount = sp("issues"), 2
+	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: rows})
 	truecolor := m.View().Content
 	m = step(m, tea.ColorProfileMsg{Profile: colorprofile.Ascii})
 	var buf bytes.Buffer
@@ -139,7 +187,7 @@ func TestBoardDoneFailureAscii(t *testing.T) {
 		t.Error("Ascii changed the board's text or glyphs")
 	}
 	out = stripANSI(out)
-	for _, want := range []string{"DONE · 5 · 2 failed", "✗", "needs landing", "stopped", "✓"} {
+	for _, want := range []string{"DONE · 5 · 2 failed", "✗", "needs landing", "stopped", "✓", "⚖ issues · 2"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("Ascii lost %q", want)
 		}

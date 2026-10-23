@@ -20,17 +20,22 @@ SQLC_DARWIN_ARM64_SHA256="21602158c99eb1f2bae197a66abfb1941d1e9e50b23125bb193349
 # renovate-tarball: depName=sqlc-linux-amd64 packageName=sqlc-dev/sqlc
 SQLC_LINUX_AMD64_VERSION="v1.31.1"
 SQLC_LINUX_AMD64_SHA256="497ae4fcdfa64c5b0c311ffe4c2bd991e43991e82e5367792ed78bc2dca27354"
+# renovate-tarball: depName=sqlc-linux-arm64 packageName=sqlc-dev/sqlc
+SQLC_LINUX_ARM64_VERSION="v1.31.1"
+SQLC_LINUX_ARM64_SHA256="b7cae247740d0c51a1e657479e5b2d21e6fef428f596682a01bc55bf4ab8a23d"
 
 # One sha across two arches is a guaranteed mismatch whose tempting "fix" is to
-# delete the check. Only darwin/arm64 (the dev host) and linux/amd64 (both shared
-# runners) are pinned; any other host fails loudly. The versions are duplicated
+# delete the check. Darwin/arm64 and both Linux worker architectures are pinned;
+# any other host fails loudly. The versions are duplicated
 # so Renovate can update each asset and digest atomically, then checked here so a
 # partial update cannot pass on whichever architecture happens to run first.
-if [ "$SQLC_DARWIN_ARM64_VERSION" != "$SQLC_LINUX_AMD64_VERSION" ]; then
+if [ "$SQLC_DARWIN_ARM64_VERSION" != "$SQLC_LINUX_AMD64_VERSION" ] \
+  || [ "$SQLC_DARWIN_ARM64_VERSION" != "$SQLC_LINUX_ARM64_VERSION" ]; then
   echo "sqlc.sh: per-arch versions disagree:" >&2
   echo "  darwin/arm64=$SQLC_DARWIN_ARM64_VERSION" >&2
   echo "  linux/amd64=$SQLC_LINUX_AMD64_VERSION" >&2
-  echo "  Renovate must update both version+sha256 pairs in one change." >&2
+  echo "  linux/arm64=$SQLC_LINUX_ARM64_VERSION" >&2
+  echo "  Renovate must update all version+sha256 pairs in one change." >&2
   exit 2
 fi
 
@@ -45,9 +50,13 @@ case "$os/$arch" in
     asset="linux-amd64"
     tar_sha256="$SQLC_LINUX_AMD64_SHA256"
     ;;
+  Linux/aarch64 | Linux/arm64)
+    asset="linux-arm64"
+    tar_sha256="$SQLC_LINUX_ARM64_SHA256"
+    ;;
   *)
     echo "sqlc.sh: unsupported host $os/$arch" >&2
-    echo "  Only darwin/arm64 and linux/amd64 are pinned. Adding one needs its" >&2
+    echo "  Only darwin/arm64, linux/amd64 and linux/arm64 are pinned. Adding one needs its" >&2
     echo "  own version+tarball-sha256 pair derived from that arch's artifact." >&2
     exit 2
     ;;
@@ -56,7 +65,7 @@ esac
 pinned_version="$SQLC_DARWIN_ARM64_VERSION"
 if [ "$VERSION" != "$pinned_version" ]; then
   echo "sqlc.sh: pinned archives are for $pinned_version, got '$VERSION'." >&2
-  echo "  Update ci.yml's SQLC_VERSION and both per-arch version+sha256 pairs together." >&2
+  echo "  Update ci.yml's SQLC_VERSION and all per-arch version+sha256 pairs together." >&2
   exit 2
 fi
 VER_NO_V="${VERSION#v}"
@@ -159,7 +168,7 @@ tar_bytes="$(wc -c < "$UNPACKED" | tr -d ' ')"
 [ "$tar_bytes" -le "$MAX_TAR_BYTES" ] \
   || { echo "sqlc.sh: decompressed tar exceeds $MAX_TAR_BYTES bytes" >&2; exit 2; }
 
-# Both inspected release archives contain exactly one regular file named sqlc.
+# The pinned release archives contain exactly one regular file named sqlc.
 EXPECTED_MEMBERS="$TMP/expected-members"
 MEMBERS="$TMP/members"
 MEMBERS_SORTED="$TMP/members-sorted"

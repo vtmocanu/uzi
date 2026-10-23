@@ -368,6 +368,20 @@ describe("committed O registry (finding [11]: no candidate digests in the tracke
 });
 
 describe("classifyPath is pinned to the Dockerfile COPY surface (anti-drift)", () => {
+  for (const p of ["scripts/check-worker-toolchain.py", "scripts/sqlc.sh"]) {
+    it(`${p} invalidates an older packaged receipt`, () => {
+      assert.equal(classifyPath(p), "runtime", p);
+      const result = checkReceipts(committed(), baseManifest(), { paths: [p], baseIsAncestor: true });
+      assert.equal(result.ok, false, p);
+      assert.deepEqual(result.drift, [{ path: p, kind: "runtime" }]);
+    });
+  }
+  it("similarly named repo tooling remains evidence", () => {
+    for (const p of ["scripts/check-worker-toolchain.test.py", "scripts/sqlc.sh.md"]) {
+      assert.equal(classifyPath(p), "evidence", p);
+    }
+  });
+
   /** Parse every real repo-path COPY source out of a Dockerfile: drop flags (`--...`), SKIP a
    *  build-stage copy (`--from=`), take all-but-last (dest) as sources, SKIP the chat-only `.`. */
   function copySources(dockerfile: string): string[] {

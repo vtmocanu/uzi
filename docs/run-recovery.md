@@ -77,8 +77,60 @@ hold's retained custody. After discarded/released precedence, an OPEN hold at
 otherwise `source_only`, before available unguarded archives or capture progress.
 Other custody attention decisions retain their existing ordering.
 
-The worker attempts preservation using its existing recovery path. Failed
-or uncertain capture keeps local source custody; there is no archive or
+The worker attempts preservation using its existing recovery path. Under the
+**slice A contract (Refs #2852) (AI-synced 2026-10-18)**, Codex credential-free capture keeps
+execution closed through capture and settlement of the supervised capture processes,
+including credential-free recovery and retained-source capture. Clean cooperative
+normal checkpoint stops (#3132) do not replace capture's intentional poison.
+A normal checkpoint refuses an already poisoned or disposed registry before queue
+side effects; a previously queued checkpoint that later expires preserves that
+state's capture revision and active or completed evidence. Capture still waits for
+full supervised-child settlement; healthy queue expiry still fails closed, without
+extending the deadline. (AI-synced 2026-10-18)
+Setup, auth and
+executor-owned summary cleanup stay joined even after authority or summary delivery
+expires; unconfirmed cleanup blocks capture and credential continuation. If a
+healthy checkpoint fully stopped and cleaned up the prior Codex execution, then
+initial credential release for its replacement exhausts, credential-free preservation
+can still proceed after fresh settlement within the original deadline. This grants
+no model or credential authority and does not change source retention. Local capture
+moves capturable work from the ephemeral clone into the durable worker bare;
+blanket refusal would regress verified park/pause preservation. It does not
+prove that latest work is archived or authorize source deletion. After an accepted
+owner pause, later source checks require fresh capture authority. If that proof
+refuses, the exact parked source, session, journal and custody remain retained;
+an uncertain acknowledgment starts neither recapture nor another pause attempt.
+A bounded observation can return while memory capture or its cleanup remains
+unfinished. The worker keeps that run reserved and its local source held until
+the original capture and cleanup actually settle. A same-run duplicate on that
+runner waits, and local maintenance refuses entry while the reservation remains.
+If cleanup never settles, the reservation can remain indefinitely, reducing
+available capacity; occurrence rates and capacity cost are unknown. Command
+authority still expires at the original deadline. An uncertain acknowledgment
+does not start another capture, establish success or release custody; late
+acknowledgments retain the existing isolation from a successor attempt.
+An eligible retained source can be checked before the new model session starts,
+using a temporary worker-internal binding to that exact source. Existing live-owner
+conflicts and clone proof/reproof still apply; missing or invalid binding refuses
+the scoped proof and retains custody. This grants no source deletion authority.
+See [pre-start binding](../adr/1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect)
+(Refs #2852) (AI-synced 2026-10-18).
+Retained recovery first holds a separate scope for predecessor quiescence, then
+releases it before #3059's independently supervised retained-object permission
+normalization. That normalization and credentialed clone refresh (`ensureClone`)
+remain outside A's Git-only capture scope. A later held scope covers resumed-tip
+verification, direct publication or capture through `recordRecoveryCapture`.
+This integration adds no capture allowlist exception. (AI-synced 2026-10-18)
+Retained-source capture ends at its durable capture record; creating a fresh
+successor from that bare pin follows outside the held capture, without reading
+old clone bytes. Healthy credentialed whole-capture closure (B) and strengthened
+terminal proof (C) remain unshipped; existing terminal executor disposal still
+applies, with snapshot coverage still preceding strengthened writer-exclusion proof.
+Registered-root capture exclusion does not exclude daemon or sibling writers,
+accepted-but-invisible creates (#1860), or Claude terminal residuals; per-attempt
+cgroup proof (#1862) remains unshipped. Automatic reclaim remains disabled (#1858),
+and custody SETTLE and physical CLEANUP remain separate (#2746).
+Failed or uncertain capture keeps local source custody; there is no archive or
 latest-work guarantee, and loss of that worker's retained storage can lose
 uncaptured work. Confirmed drain, a resolved outcome and fresh usage below
 the quiet threshold for the configured dwell are required before another
@@ -708,6 +760,37 @@ non-closing #1858 change disables unsafe automatic retention reclaim on every
 worker, including abandoned attempts and crash-window live orphans, shared
 own-key residue from canonical and attempt entries, and orphaned skills.
 There is no automatic reclaim escape from that accumulation.
+
+**Slice A contract (Refs #2852) (AI-synced 2026-10-22):** credential-free capture, including owner pause,
+keeps execution closed without changing these retention rules. With proven cleanup,
+a possibly drained provider epoch is recreated from the saved session before continuing
+after failed/withdrawn pause or human/automatic changed-milestone gate revision.
+The prior session generation stays until provider adoption. Under accepted B1, unproven
+cleanup still throws `EpochCleanupUnprovenError`; the runner converts it to a nonterminal
+`RetainedRecoveryStop` only when its safety facade matches the exact refused or
+unacknowledged owner-pause capture, subject to newer steering authority. That matching
+stop retains clone, session, journal and custody without forcing recreation or another
+in-run epoch, and does not report a failed terminal state. This conversion does not
+cover every changed-milestone gate revision failure. Subsequent execution may recover
+through existing in-budget requeue or owner Resume/hold policy, conditional on budget
+and hold state; automatic recovery or Resume is not guaranteed. Retained-source recovery
+uses a fresh attempt path and model session (`thread/start`), not the old model thread.
+Newer cancellation, pause and vault-lock state are
+checked before credentials or another model turn; a locked vault can defer recreation
+into credential recovery. This does not make an open approval gate parkable. Healthy
+credentialed capture gaps (B) and the terminal snapshot/late-writer limitation (C)
+remain open; existing terminal disposal does not remove that snapshot limitation.
+After terminal settlement, verified capture evidence can attest that the disposed
+Codex registry drained for command-cache release. Later poison, changed registry
+facts, unclean cache roots or open roots retain that cache. This avoids retaining
+large caches after verified pause/gate capture, without granting source deletion,
+credential release or a general clean status. Scoped reaper helpers retain ordinary
+kill behavior; no-kill observation requires a genuine report budget. Existing
+absolute deadlines expire without detaching owned cleanup or renewing authority.
+The detailed boundary is in [ADR-1783](../adr/1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect).
+Refs #2852 (AI-synced 2026-10-18).
+A does not complete #2852. Independent #3031 work is not a prerequisite and gains no
+model-free capture coverage or changes to producers, ledger, custody or settlement.
 
 Retained bytes, identity metadata and the safety inventory have no retention
 bound. Existing per-seed process/teardown scope over non-live paths and ledger

@@ -381,11 +381,35 @@ for (const mode of ["now", "wall", "withdrawn-now"] as const) {
     let rig: ReturnType<typeof codexRig> | undefined;
     let injected = false, checkpointReturned = false, cleanAfterDone: boolean | undefined;
     let parkResult: unknown;
+    let capturedRig: ReturnType<typeof codexRig> | undefined;
+    let captureProof: object | undefined;
+    let captureDeadlineAt = 0, captureCallbacks = 0, capturesSettled = 0;
     const claim = gitlabClaim(312308);
     if (mode === "withdrawn-now") api.stateAckWire = (body, run) => body.status === "paused"
       ? { status: 200, body: { applied: false, run: { ...run, status: "running" } } } : undefined;
     const executor: Executor = {
       get safety() { return rig?.safety; },
+      withCredentialFreeCapture: async (ms, action, purpose, signal, attempt) => {
+        const current = rig!;
+        capturedRig = current;
+        captureDeadlineAt = Date.now() + ms;
+        const credentials = current.refreshCalls() + current.releaseCalls();
+        const result = await current.capture(ms, context => {
+          captureCallbacks++;
+          return action(context);
+        }, purpose, signal, attempt);
+        assert.equal(result.kind, "observed_empty");
+        if (result.kind === "observed_empty") {
+          assert.ok("proof" in result && result.proof !== null && typeof result.proof === "object");
+          captureProof = result.proof;
+          assert.equal(current.registry.acceptsCompletedCapture(captureProof), true,
+            "capture callback and supervised children settled at the same poison revision");
+        }
+        assert.equal(current.refreshCalls() + current.releaseCalls(), credentials,
+          "credential-free capture performs no refresh or release");
+        capturesSettled++;
+        return result;
+      },
       run: async ctx => {
         const execution = new AbortController();
         const forward = () => { if (!(ctx.signal?.reason instanceof PauseNowSignal)) execution.abort(ctx.signal?.reason); };
@@ -416,6 +440,20 @@ for (const mode of ["now", "wall", "withdrawn-now"] as const) {
         }
         // A withdrawn turn remains dropped. The owner ACK decides the pending park.
         parkResult = await ctx.parkForPause!(at);
+        if (mode === "withdrawn-now") {
+          const oldRig = rig;
+          assert.equal(parkResult, false);
+          assert.ok(captureProof);
+          assert.equal(oldRig.registry.acceptsCompletedCapture(captureProof), true);
+          const disposal = await oldRig.safety.dispose({ boundary: "terminal",
+            deadlineMs: Math.max(0, captureDeadlineAt - Date.now()) });
+          assert.equal(disposal.kind, "disposed", "fresh epoch requires completed old-rig cleanup");
+          assert.equal(oldRig.registry.acceptsCompletedCapture(captureProof), true);
+          await oldRig.installer.settle();
+          // Model recreateEpochAfterReap in CodexExecutor.run before normal activity resumes.
+          rig = codexRig({ lifecycleSignal: AbortSignal.any([execution.signal, ctx.terminalLifecycleSignal!]) });
+          assert.notEqual(rig.registry, oldRig.registry, "continuation never reuses the captured epoch");
+        }
         return parkResult ? { branch: ctx.branch, pausedAt: at } : { branch: ctx.branch };
       },
     };
@@ -429,7 +467,19 @@ for (const mode of ["now", "wall", "withdrawn-now"] as const) {
       if (mode === "wall") {
         const park = api.wallParkRequests.find(s => s.runId === claim.run_id);
         assert.match(String(park?.body.head), /^[0-9a-f]{40}$/, "the clean source permits a verified local wall capture");
-      } else assert.equal(rig!.registry.isPoisoned(), false);
+      } else {
+        assert.equal(captureCallbacks, 1, "pause enters the real credential-free capture callback");
+        assert.equal(capturesSettled, 1, "pause awaits supervised capture settlement");
+        assert.equal(capturedRig!.registry.isPoisoned(), true, "capture permanently closes old epoch admission");
+        assert.deepEqual(capturedRig!.registry.reserveLaunch("provider"), { kind: "denied", reason: "admission_closed" });
+        assert.equal(capturedRig!.registry.state(), "disposed");
+        if (mode === "withdrawn-now") {
+          assert.equal(capturedRig!.boundaries.includes("finalize"), false, "old epoch is never finalized");
+          assert.ok(rig!.boundaries.includes("finalize"), "continuation finalizes on the fresh epoch");
+          assert.equal(rig!.registry.isPoisoned(), false);
+          assert.equal(rig!.registry.state(), "disposed");
+        }
+      }
       assert.ok(api.states.some(s => s.runId === claim.run_id && s.body.status === "paused") ||
         api.wallParkRequests.some(s => s.runId === claim.run_id));
       assert.equal(api.states.some(s => s.runId === claim.run_id && s.body.status === "completed"), mode === "withdrawn-now");

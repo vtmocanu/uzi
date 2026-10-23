@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -11,6 +11,7 @@ import type { CodexNotification, CodexTransport } from "../src/codex/transport.j
 import type { CodexRootHandle } from "../src/codex/launcher.js";
 import { type RunContext, type ExecutorResult } from "../src/executor.js";
 import { CodexSessionStore } from "../src/codex/session-state.js";
+import { assertCaptureLaunch } from "../src/git.js";
 import {
   type ExecutorFactory,
   RESUME_CONTINUED_EVENT,
@@ -502,44 +503,75 @@ it("a retained Codex runner turn adopts the session artifact but starts a fresh 
             artifactAtLaunch = fs.existsSync(artifact) && fs.readFileSync(artifact, "utf8") === sessionBytes;
             return { root: { kind: "provider", reap: async () => ({ ok: true }), dispose: async () => {} }, transport, supervisorPid: 1234 };
           },
-          launchEffectRoot: async (): Promise<CodexRootHandle> => ({
-            started: { event: "started", supervisorPid: 200, childPid: 201, subreaper: true,
-              nondumpable: true, uid: 10003, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
-            supervisorPid: 200,
-            transport: { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() },
-            snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
-            observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
-            waitChild: async () => ({ event: "child_exit", code: 0 }),
-            dispose: async () => ({ clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } }),
-            failed: undefined, whenFailed: new Promise<Error>(() => undefined),
-          }),
+          launchEffectRoot: async (spec, deadline): Promise<CodexRootHandle> => {
+            const handle: CodexRootHandle = {
+              started: { event: "started", supervisorPid: 200, childPid: 201, subreaper: true,
+                nondumpable: true, uid: 10003, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+              supervisorPid: 200,
+              transport: { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() },
+              snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+              observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
+              waitChild: async () => ({ event: "child_exit", code: 0 }),
+              dispose: async () => ({ clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } }),
+              failed: undefined, whenFailed: new Promise<Error>(() => undefined),
+            };
+            // Fileop protocol and supervisor drainage stay modeled in this fixture.
+            if (spec.args.includes("/usr/local/bin/uzi-codex-fileop")) return handle;
+            const separator = spec.args.indexOf("--");
+            if (spec.identity === "command") assert.ok(separator >= 0, "command wrapper requires its argv separator");
+            const argv = spec.identity === "command"
+              ? spec.args.slice(separator + 1) : [spec.command, ...spec.args];
+            assert.equal(argv[0], "/usr/bin/git", "only trusted Git boundary invocations are forwarded");
+            assertCaptureLaunch(spec);
+            assert.ok(deadline !== undefined && Number.isFinite(deadline) && deadline > 0,
+              "Git launch keeps its original finite deadline");
+            const child = spawn(argv[0]!, argv.slice(1), { cwd: spec.cwd, env: spec.env, stdio: "pipe" });
+            // One attempt and one deadline signal to this owned child; no sibling work is changed.
+            const timer = setTimeout(() => child.kill(), deadline);
+            const exited = new Promise<{ event: "child_exit"; code: number }>((resolve, reject) => {
+              child.once("error", error => { clearTimeout(timer); reject(error); });
+              child.once("close", code => { clearTimeout(timer); resolve({ event: "child_exit", code: code ?? 1 }); });
+            });
+            return { ...handle,
+              transport: { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr },
+              waitChild: async () => exited,
+              // Real stream closure is not kernel drainage proof: retain the modeled dispose event.
+              dispose: async ms => { await exited; return handle.dispose(ms); },
+            };
+          },
           wireFileop: () => ({ client: { op: async () => ({ ok: true }) }, dispose: async () => {} }),
           spawnCommand: async () => ({ code: 0, stdout: "", stderr: "" }),
           provisionRunTools: async () => ({ toolEnv: {} }),
           idleMs: 5000, wallMs: 5000, childTurnDeadlineMs: 5000,
         });
-        return { sandboxesCommands: codexExecutor.sandboxesCommands, run: async (ctx: RunContext): Promise<ExecutorResult> => {
-          assert.equal(readiness, 1, "retained readiness completed before session adoption");
-          assert.equal(seenContext, undefined, "one successor claim reaches the actual executor once");
-          seenContext = ctx;
-          assert.equal(ctx.sessionId, undefined, "retained recovery drops claimed session lineage");
-          assert.notEqual(ctx.worktreePath, canonical);
-          assert.match(ctx.worktreePath, /\.attempt-.*-g2-/);
-          assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "retained.txt"), "utf8"), "held local work\n");
-          const journal = readJournal();
-          assert.equal(journal.clonePath, ctx.worktreePath);
-          assert.equal(journal.recovery.stage, "ready-for-model");
-          assert.equal(journal.recovery.attempts, 1);
-          assert.equal(journal.recovery.source.clonePath, canonical);
-          assert.equal(journal.recovery.successor.clonePath, ctx.worktreePath);
-          const result = await codexExecutor.run(ctx);
-          git.worktreeStatus = (async () => []) as typeof git.worktreeStatus;
-          git.verifyRunnerTrackingCovers = (async () => true) as typeof git.verifyRunnerTrackingCovers;
-          git.checkpointPack = (async () => null) as typeof git.checkpointPack;
-          const held = await ctx.enterCompletionHold!("resumed turn verified");
-          assert.equal(held, true, "the resumed turn entered a second completion hold");
-          return { ...result, completionHeld: { reason: "resumed turn verified" } };
-        } };
+        return {
+          get safety() { return codexExecutor.safety; },
+          sandboxesCommands: codexExecutor.sandboxesCommands,
+          withCredentialFreeCapture: codexExecutor.withCredentialFreeCapture.bind(codexExecutor),
+          settleForCredentialFreeCapture: codexExecutor.settleForCredentialFreeCapture.bind(codexExecutor),
+          run: async (ctx: RunContext): Promise<ExecutorResult> => {
+            assert.equal(readiness, 1, "retained readiness completed before session adoption");
+            assert.equal(seenContext, undefined, "one successor claim reaches the actual executor once");
+            seenContext = ctx;
+            assert.equal(ctx.sessionId, undefined, "retained recovery drops claimed session lineage");
+            assert.notEqual(ctx.worktreePath, canonical);
+            assert.match(ctx.worktreePath, /\.attempt-.*-g2-/);
+            assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "retained.txt"), "utf8"), "held local work\n");
+            const journal = readJournal();
+            assert.equal(journal.clonePath, ctx.worktreePath);
+            assert.equal(journal.recovery.stage, "ready-for-model");
+            assert.equal(journal.recovery.attempts, 1);
+            assert.equal(journal.recovery.source.clonePath, canonical);
+            assert.equal(journal.recovery.successor.clonePath, ctx.worktreePath);
+            const result = await codexExecutor.run(ctx);
+            git.worktreeStatus = (async () => []) as typeof git.worktreeStatus;
+            git.verifyRunnerTrackingCovers = (async () => true) as typeof git.verifyRunnerTrackingCovers;
+            git.checkpointPack = (async () => null) as typeof git.checkpointPack;
+            const held = await ctx.enterCompletionHold!("resumed turn verified");
+            assert.equal(held, true, "the resumed turn entered a second completion hold");
+            return { ...result, completionHeld: { reason: "resumed turn verified" } };
+          },
+        };
       })(),
     }), gitlab).execute(claim);
     const events = api.messages(claim.run_id).filter((m) => m.kind === "status").map((m) => m.payload.event);

@@ -42,6 +42,7 @@ for (const mode of ["shutdown", "park"] as const) {
     const credentialAtDone: number[] = [];
     const credentialAtTerminal: number[] = [];
     const typedShutdownExchanges = [0, 0];
+    const captureCallbacks = [0, 0], capturesSettled = [0, 0];
 
     const fetch = git.fetchAgentBranch.bind(git);
     t.mock.method(git, "fetchAgentBranch", (...args: Parameters<typeof git.fetchAgentBranch>) => {
@@ -76,6 +77,18 @@ for (const mode of ["shutdown", "park"] as const) {
 
     const executors: Executor[] = ids.map((_, index) => ({
       get safety() { return rigs[index]?.safety; },
+      withCredentialFreeCapture: async (ms, action, purpose, signal, attempt) => {
+        const rig = rigs[index]!;
+        const credentials = rig.refreshCalls() + rig.releaseCalls();
+        const result = await rig.capture(ms, context => {
+          captureCallbacks[index]!++;
+          return action(context);
+        }, purpose, signal, attempt);
+        assert.equal(result.kind, "observed_empty");
+        assert.equal(rig.refreshCalls() + rig.releaseCalls(), credentials, "capture adds no credential exchange");
+        capturesSettled[index]!++;
+        return result;
+      },
       run: async ctx => {
         executorCalls[index]!++;
         const rig = codexRig({
@@ -241,7 +254,11 @@ for (const mode of ["shutdown", "park"] as const) {
       }
       for (const index of [0, 1]) {
         const rig = rigs[index]!;
-        assert.equal(rig.registry.isPoisoned(), false);
+        const captured = mode === "park" && index === 1;
+        assert.equal(captureCallbacks[index], captured ? 1 : 0, "only the pause participant uses capture");
+        assert.equal(capturesSettled[index], captured ? 1 : 0, "capture owner settles before execution returns");
+        assert.equal(rig.registry.isPoisoned(), captured, "only capture permanently closes epoch admission");
+        if (captured) assert.deepEqual(rig.registry.reserveLaunch("provider"), { kind: "denied", reason: "admission_closed" });
         assert.equal(rig.registry.state(), "disposed", "each run disposes only its own registry");
         assert.equal(rig.refreshCalls() + rig.releaseCalls(), credentialAtStop[index]! + typedShutdownExchanges[index]!,
           "no ordinary credential authority after shutdown: run=" + index +

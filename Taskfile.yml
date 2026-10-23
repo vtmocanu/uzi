@@ -287,6 +287,9 @@ tasks:
     cmds:
       - task: lint:shell
       - task: lint:yaml
+      - task: check:uxlab-freeze
+      - task: test:uxlab-freeze
+      - task: test:uxlab-build
       - task: check:skill-triage-render
       # A web test importing an uncopied fixture passes gate:web but breaks the web image build (#2602).
       - task: test:web-docker-fixtures
@@ -300,6 +303,8 @@ tasks:
       # blocks of .github/actions/**/action.yml, the one class lint:shell and
       # lint:actions both miss. Same fail-open/REQUIRED contract, same UZI_LINT_ACTIONS_REQUIRED.
       - task: lint:actions:embedded
+      - task: test:worker-toolchain
+      - task: check:worker-toolchain
       # Hermetic fake-tool regression suite for the golangci-lint downloader and
       # build-Go guard: no network and no real release binary. It protects the
       # archive-cache trust boundary and the go/toolchain compatibility seam.
@@ -1069,8 +1074,23 @@ tasks:
       - ./scripts/sqlc.test.sh
       - ./scripts/sqlc-drift-gate.test.sh
 
+  check:uxlab-freeze:
+    desc: check root and uxlab charm-freeze pin parity
+    cmds:
+      - node ./scripts/check-uxlab-freeze.mjs
+
+  test:uxlab-freeze:
+    desc: hermetic uxlab freeze manifest parity regressions
+    cmds:
+      - node --test ./scripts/check-uxlab-freeze.test.mjs
+
+  test:uxlab-build:
+    desc: hermetic uxlab build preflight and PNG freshness contract
+    cmds:
+      - bash ./scripts/uxlab-build.test.sh
+
   test:renovate-go-toolchain:
-    desc: hermetic extraction and grouping contract for Go-toolchain Renovate updates
+    desc: hermetic Go-toolchain grouping and worker Go flake extraction contract
     cmds:
       - node ./scripts/renovate-go-toolchain.test.mjs
 
@@ -1244,6 +1264,16 @@ tasks:
     desc: hermetic devbox workflow token isolation, validated lock transfer and proposal behavior
     cmds:
       - ./scripts/devbox-update.test.sh
+
+  check:worker-toolchain:
+    desc: worker package lock keys and resolved Go satisfy module go and toolchain requirements (offline)
+    cmds:
+      - python3 -B scripts/check-worker-toolchain.py
+
+  test:worker-toolchain:
+    desc: offline regression tests for worker lock drift and baked Go assertions
+    cmds:
+      - python3 -B scripts/check-worker-toolchain.test.py
 
   test:govulncheck-toolchain:
     desc: hermetic govulncheck module toolchain, host-native install, analysis environment and exit contract (fake go)
