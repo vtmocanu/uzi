@@ -366,9 +366,17 @@ func (g *gitLab) ListIssues(ctx context.Context, projectID int64, opts ListIssue
 }
 
 func (g *gitLab) GetIssue(ctx context.Context, projectID, issueIID int64) (Issue, error) {
-	i, _, err := g.client.Issues.GetIssue(projectID, issueIID, gitlab.WithContext(ctx))
+	state := issueResponseState(ctx)
+	i, resp, err := g.client.Issues.GetIssue(projectID, issueIID, gitlab.WithContext(withResponseLimit(ctx, state)))
+	if state.overflow.Load() {
+		return Issue{}, g.wrapErr("get issue", state.err())
+	}
 	if err != nil {
-		return Issue{}, g.wrapErr("get issue", err)
+		wrapped := g.wrapErr("get issue", err)
+		if resp != nil {
+			return Issue{}, issueReadError(resp.StatusCode, wrapped)
+		}
+		return Issue{}, wrapped
 	}
 	return toIssue(i), nil
 }
@@ -491,7 +499,11 @@ func (g *gitLab) ListIssueComments(ctx context.Context, projectID, issueIID int6
 	wrap := func(e error) error { return g.wrapErr("list issue comments", e) }
 	return paginate(wrap, func(page int) ([]IssueComment, int, error) {
 		opt.Page = int64(page)
-		notes, resp, err := g.client.Notes.ListIssueNotes(projectID, issueIID, opt, gitlab.WithContext(ctx))
+		state := newResponseLimitState(commentPageResponseBytes)
+		notes, resp, err := g.client.Notes.ListIssueNotes(projectID, issueIID, opt, gitlab.WithContext(withResponseLimit(ctx, state)))
+		if state.overflow.Load() {
+			return nil, 0, state.err()
+		}
 		if err != nil {
 			return nil, 0, err
 		}
@@ -533,7 +545,7 @@ func (g *gitLab) GetMergeRequest(ctx context.Context, projectID, mrIID int64) (M
 	state := &responseLimitState{}
 	mr, _, err := g.client.MergeRequests.GetMergeRequest(projectID, mrIID, nil, gitlab.WithContext(withResponseLimit(ctx, state)))
 	if state.overflow.Load() {
-		return MergeRequest{}, g.wrapErr("get merge request", &ResponseTooLargeError{})
+		return MergeRequest{}, g.wrapErr("get merge request", mrOverflowError(state.err()))
 	}
 	if err != nil {
 		return MergeRequest{}, g.wrapErr("get merge request", err)

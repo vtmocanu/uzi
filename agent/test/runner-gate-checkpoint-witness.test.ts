@@ -16,7 +16,7 @@ const P = "b".repeat(40);
 const ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
 describe("M1 gate checkpoint witness", () => {
-  for (const mode of ["published", "failed", "unrelated", "moved", "legacy", "initial", "unchanged",
+  for (const mode of ["published", "claude-false", "claude-throw", "failed", "unrelated", "moved", "legacy", "initial", "unchanged",
     "unchanged-empty", "absent-candidate", "removed", "frozen-empty", "reordered", "resumed", "resumed-empty", "held-approve", "revise", "revise-unconfirmed"] as const) {
     it(`${mode}: only a confirmed recoverable publish presents a witness`, async () => {
       const order: string[] = [];
@@ -53,6 +53,12 @@ describe("M1 gate checkpoint witness", () => {
       const executor: Executor = {
         resumesAtGate: resumed,
         killAgentTree() { order.push("quiesce"); },
+        async settleWorkerCommands() {
+          if (!sourcePath || !mode.startsWith("claude-")) return { confirmed: true };
+          order.push("settle");
+          if (mode === "claude-throw") throw new Error("poisoned Claude command settlement");
+          return { confirmed: false };
+        },
         async run(ctx) {
           sourcePath = ctx.worktreePath;
           git.worktreeStatus = async () => [];
@@ -119,6 +125,13 @@ describe("M1 gate checkpoint witness", () => {
       const gates = api.states.filter((s) => s.runId === claim.run_id && s.body.status === "awaiting_approval");
       if (!ordinary && mode !== "failed" && mode !== "unrelated" && mode !== "moved") {
         assert.equal(gates.length, 1);
+        if (mode.startsWith("claude-")) {
+          const beforePack = order.slice(0, order.indexOf("pack"));
+          assert.ok(beforePack.filter(step => step === "settle").length >= 2,
+            "poisoned settlement reaches the outer entry and nested restore capture");
+          assert.ok(beforePack.filter(step => step === "quiesce").length >= 2,
+            "nested restore capture still proves quiescence and re-proves after runner git");
+        }
         assert.deepEqual(gates[0]!.body.gate_checkpoint_witness, { source_head: H, published_checkpoint: P });
         assert.equal(gates[0]!.body.claim_generation, 7, "presentation retains the frame generation");
         assert.equal(order.slice(0, order.indexOf("gate")).filter((step) => step === "pack").length, 1, "capture packs once");

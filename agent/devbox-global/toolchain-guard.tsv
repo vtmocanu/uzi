@@ -25,7 +25,7 @@
 # `-` when there is no cheap non-interactive smoke, or when a later, better guard
 # already covers it -- chromium is smoke-tested properly by the `--dump-dom` guard
 # further down each Dockerfile, so duplicating a weaker check here would buy nothing.
-go	go	go version
+github:NixOS/nixpkgs/5adc50831c259f87faeb09ddf930d43597197473#go_1_27	go	go version
 gcc	gcc	gcc --version
 python3	python3	python3 --version
 python3Packages.pip	pip	pip --version

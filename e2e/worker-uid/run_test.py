@@ -484,6 +484,7 @@ sys.exit(rc)
             "/app/uzi-worker-uid-proof/agent/test/codex-launcher.test.ts", "/app/uzi-worker-uid-proof/agent/test/codex-executor.test.ts",
             "/app/uzi-worker-uid-proof/agent/test/codex-shared-dir.test.ts", "/app/uzi-worker-uid-proof/agent/test/entrypoint-migration.test.ts",
             "/app/uzi-worker-uid-proof/agent/test/git-planning-diff.test.ts",
+            "/app/uzi-worker-uid-proof/agent/test/codex-capture-reaper-real.test.ts",
             "/app/uzi-worker-uid-proof/agent/test/git-retained-permissions.test.ts",
             "/app/uzi-worker-uid-proof/agent/test/claude-command-launcher.test.ts",
         ])

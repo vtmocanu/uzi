@@ -77,7 +77,7 @@ func TestAgentSelectionTags(t *testing.T) {
 // runDTOKeys is the RunDTO tag set with Usage nil (usage is omitempty). Shared by
 // the RunDTO pin and the RunListItemDTO embed pin.
 var runDTOKeys = []string{
-	"id", "repo_id", "forge_type", "kind", "issue_iid", "issue_title", "issue_description",
+	"id", "repo_id", "forge_type", "kind", "issue_iid", "continued_issue_iid", "issue_title", "issue_description",
 	// PRD #1429 M1 (D2): the run's actual stored harness (closed enum claude|codex), NOT NULL
 	// DEFAULT 'claude' so always on the wire ("claude" for every current run).
 	"harness",

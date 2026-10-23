@@ -6,6 +6,7 @@ package main
 // without --yes, and --yes mapping straight to the discard call.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"reflect"
@@ -23,6 +24,9 @@ type countingRecoveryClient struct {
 	uzicli.Client
 	holdsCalls    int
 	archivesCalls int
+	getRunCalls   int
+	archivesArgs  []string
+	getRunArgs    []string
 }
 
 func (c *countingRecoveryClient) RecoveryHolds(ctx context.Context) (apitypes.RecoveryCustodyHoldsDTO, error) {
@@ -32,7 +36,267 @@ func (c *countingRecoveryClient) RecoveryHolds(ctx context.Context) (apitypes.Re
 
 func (c *countingRecoveryClient) RecoveryArchives(ctx context.Context, runID string) (apitypes.RecoveryArchiveSummaryDTO, error) {
 	c.archivesCalls++
+	c.archivesArgs = append(c.archivesArgs, runID)
 	return c.Client.RecoveryArchives(ctx, runID)
+}
+
+func (c *countingRecoveryClient) GetRun(ctx context.Context, runID string) (apitypes.RunDTO, error) {
+	c.getRunCalls++
+	c.getRunArgs = append(c.getRunArgs, runID)
+	return c.Client.GetRun(ctx, runID)
+}
+
+const (
+	recoveryHeldRunID   = "abcdefab-cdef-4abc-abcd-abcdefabcdef"
+	recoveryOtherRunID  = "fedcbafe-dcba-4fed-bcde-fedcbafedcba"
+	recoveryAbsentRunID = "12345678-1234-4123-8123-123456789abc"
+)
+
+func TestRunRecoveryInvalidRunID(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		arg  string
+		safe string
+	}{
+		{"prefix", recoveryHeldRunID[:8], "abcdefab"},
+		{"malformed", "not-a-run-uuid", "not-a-run-uuid"},
+		{"controls", "bad\nrun\t\x1b[31m\r", "bad run [31m"},
+	} {
+		for _, mode := range []string{"human", "json"} {
+			for _, config := range []string{"configured", "missing-config"} {
+				t.Run(tc.name+"/"+mode+"/"+config, func(t *testing.T) {
+					fc := &uzicli.FakeClient{
+						RecoveryHoldsResult: apitypes.RecoveryCustodyHoldsDTO{Holds: []apitypes.RecoveryCustodyHoldDTO{
+							{ID: "held-invalid-control", RunID: recoveryHeldRunID, State: "open", Attention: "needs_action"},
+						}},
+					}
+					client := &countingRecoveryClient{Client: fc}
+					env := fakeEnv(client)
+					newClientCalls := 0
+					env.NewClient = func(uzicli.Settings) uzicli.Client {
+						newClientCalls++
+						return client
+					}
+					args := []string{"run", "recovery", tc.arg}
+					if config == "configured" {
+						args = append(args, "--url", skewURL)
+					} else {
+						env.Store = uzicli.NewStore(t.TempDir())
+					}
+					if mode == "json" {
+						args = append(args, "--json")
+					}
+					out, errb, code := runCLI(t, env, args...)
+					if code != uzicli.ExitUsage || out != "" {
+						t.Errorf("exit=%d stdout=%q stderr=%q; want usage and empty stdout", code, out, errb)
+					}
+					if !strings.Contains(errb, tc.safe) || !strings.Contains(errb, "the full run UUID is required") {
+						t.Errorf("stderr=%q; want sanitized argument %q and full UUID guidance", errb, tc.safe)
+					}
+					if strings.ContainsAny(errb, "\x1b\r\t") || (tc.name == "controls" && strings.Contains(errb, tc.arg)) {
+						t.Errorf("stderr contains unsanitized argument: %q", errb)
+					}
+					if newClientCalls != 0 || client.holdsCalls != 0 || client.archivesCalls != 0 || client.getRunCalls != 0 {
+						t.Errorf("calls: NewClient=%d holds=%d archives=%d GetRun=%d; want all zero",
+							newClientCalls, client.holdsCalls, client.archivesCalls, client.getRunCalls)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestRunRecoveryInvalidRunIDBeforeVersionProbe(t *testing.T) {
+	withVersion(t, "v0.11.8")
+	for _, tc := range []struct {
+		name  string
+		arg   string
+		valid bool
+	}{
+		{"prefix", recoveryHeldRunID[:8], false},
+		{"malformed", "not-a-run-uuid", false},
+		{"valid-control", recoveryHeldRunID, true},
+	} {
+		for _, mode := range []string{"human", "json"} {
+			t.Run(tc.name+"/"+mode, func(t *testing.T) {
+				fc := behindServer()
+				client := &countingRecoveryClient{Client: fc}
+				// A fresh skewEnv gives every case a cold version cache.
+				env := skewEnv(t, client)
+				newClientCalls := 0
+				env.NewClient = func(uzicli.Settings) uzicli.Client {
+					newClientCalls++
+					return client
+				}
+				args := []string{"run", "recovery", tc.arg, "--url", skewURL}
+				if mode == "json" {
+					args = append(args, "--json")
+				}
+				out, errb, code := runCLI(t, env, args...)
+				if tc.valid {
+					if code != uzicli.ExitOK || fc.BuildInfoCalls != 1 || newClientCalls == 0 {
+						t.Errorf("positive control: exit=%d NewClient=%d BuildInfo=%d stdout=%q stderr=%q",
+							code, newClientCalls, fc.BuildInfoCalls, out, errb)
+					}
+					return
+				}
+				if code != uzicli.ExitUsage || out != "" || !strings.Contains(errb, "the full run UUID is required") {
+					t.Errorf("exit=%d stdout=%q stderr=%q; want usage before version probe", code, out, errb)
+				}
+				if newClientCalls != 0 || fc.BuildInfoCalls != 0 || client.holdsCalls != 0 ||
+					client.archivesCalls != 0 || client.getRunCalls != 0 {
+					t.Errorf("calls: NewClient=%d BuildInfo=%d holds=%d archives=%d GetRun=%d; want all zero",
+						newClientCalls, fc.BuildInfoCalls, client.holdsCalls, client.archivesCalls, client.getRunCalls)
+				}
+			})
+		}
+	}
+}
+
+func TestRunRecoveryValidEmptyControls(t *testing.T) {
+	for _, mode := range []string{"human", "json"} {
+		t.Run(mode, func(t *testing.T) {
+			client := &countingRecoveryClient{Client: &uzicli.FakeClient{}}
+			args := []string{"run", "recovery", recoveryHeldRunID}
+			want := "run " + recoveryHeldRunID + " has no retained custody holds\n"
+			if mode == "json" {
+				args = append(args, "--json")
+				want = "[]\n"
+			}
+			out, errb, code := runCLI(t, fakeEnv(client), args...)
+			if code != uzicli.ExitOK || out != want || errb != "" {
+				t.Errorf("exit=%d stdout=%q stderr=%q; want success and stdout=%q", code, out, errb, want)
+			}
+			if client.holdsCalls != 1 || client.archivesCalls != 0 || client.getRunCalls != 0 {
+				t.Errorf("calls: holds=%d archives=%d GetRun=%d; want 1, 0, 0",
+					client.holdsCalls, client.archivesCalls, client.getRunCalls)
+			}
+		})
+	}
+}
+
+func TestRunRecoveryCanonicalRunID(t *testing.T) {
+	for _, input := range []struct {
+		name string
+		arg  string
+	}{
+		{"uppercase", strings.ToUpper(recoveryHeldRunID)},
+		{"braced", "{" + recoveryHeldRunID + "}"},
+	} {
+		for _, mode := range []string{"human", "json"} {
+			for _, state := range []string{"held", "empty"} {
+				t.Run(input.name+"/"+mode+"/"+state, func(t *testing.T) {
+					reason := "recovery canonical failure"
+					fc := &uzicli.FakeClient{
+						RecoveryHoldsResult: apitypes.RecoveryCustodyHoldsDTO{Holds: []apitypes.RecoveryCustodyHoldDTO{
+							{ID: "canonical-source", RunID: recoveryHeldRunID, Generation: 7, State: "open",
+								Attention: "source_only", WorkerName: "alpha", TerminalRecordRejection: "mac_failure"},
+							{ID: "canonical-archive", RunID: recoveryHeldRunID, Generation: 8, State: "open",
+								Attention: "needs_action", HasAvailableCapture: true},
+							{ID: "other-run-hold", RunID: recoveryOtherRunID, Generation: 9, State: "open", Attention: "active"},
+						}},
+						RunByID: map[string]apitypes.RunDTO{
+							recoveryHeldRunID:  {ID: recoveryHeldRunID, Status: "failed", FailureReason: &reason},
+							recoveryOtherRunID: {ID: recoveryOtherRunID, Status: "completed"},
+						},
+						RecoverySummaries: map[string]apitypes.RecoveryArchiveSummaryDTO{
+							recoveryHeldRunID: {Supported: true, Archives: []apitypes.RecoveryArchiveDTO{
+								{ID: "canonical-capture", HoldID: "canonical-archive", State: "available"},
+								{ID: "other-capture", HoldID: "other-run-hold", State: "available"},
+								{ID: "legacy-capture", State: "available"},
+							}},
+						},
+					}
+					if state == "empty" {
+						// Keep a distinct held run to prove the requested run is filtered.
+						fc.RecoveryHoldsResult.Holds = fc.RecoveryHoldsResult.Holds[2:]
+					}
+					client := &countingRecoveryClient{Client: fc}
+					args := []string{"run", "recovery", input.arg}
+					if mode == "json" {
+						args = append(args, "--json")
+					}
+					out, errb, code := runCLI(t, fakeEnv(client), args...)
+					if code != uzicli.ExitOK {
+						t.Fatalf("exit=%d stdout=%q stderr=%q", code, out, errb)
+					}
+					if client.holdsCalls != 1 {
+						t.Errorf("RecoveryHolds calls=%d; want 1", client.holdsCalls)
+					}
+					if strings.Contains(out, input.arg) || strings.Contains(errb, input.arg) ||
+						strings.Contains(out, recoveryOtherRunID) || strings.Contains(out, "other-run-hold") || strings.Contains(out, "other-capture") {
+						t.Errorf("noncanonical or unrelated identity: stdout=%q stderr=%q", out, errb)
+					}
+					if state == "empty" {
+						want := "run " + recoveryHeldRunID + " has no retained custody holds\n"
+						if mode == "json" {
+							want = "[]\n"
+						}
+						if out != want || errb != "" || client.getRunCalls != 0 || client.archivesCalls != 0 {
+							t.Errorf("empty: stdout=%q stderr=%q GetRun=%d archives=%d; want %q and no lookups",
+								out, errb, client.getRunCalls, client.archivesCalls, want)
+						}
+						return
+					}
+					if client.getRunCalls != 1 || !reflect.DeepEqual(client.getRunArgs, []string{recoveryHeldRunID}) {
+						t.Errorf("GetRun calls=%d args=%q; want one canonical lookup", client.getRunCalls, client.getRunArgs)
+					}
+					const terminalCopy = "terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody"
+					if mode == "human" {
+						if errb != "" || client.archivesCalls != 0 {
+							t.Errorf("human stderr=%q archives=%d; want empty stderr and no archives", errb, client.archivesCalls)
+						}
+						for _, want := range []string{
+							"canonical-source", "canonical-archive",
+							"run " + recoveryHeldRunID + " hold canonical-source gen 7: " + terminalCopy + "\n",
+							"run " + recoveryHeldRunID + ": " + reason + "\n",
+							"2 hold(s) await a decision: discard with `uzi run discard " + recoveryHeldRunID + " --hold <hold-id> --yes`\n",
+							"1 hold(s) have a recovery archive: recover with `uzi run export`\n",
+						} {
+							if !strings.Contains(out, want) {
+								t.Errorf("missing %q in stdout=%q", want, out)
+							}
+						}
+						return
+					}
+					if client.archivesCalls != 1 || !reflect.DeepEqual(client.archivesArgs, []string{recoveryHeldRunID}) {
+						t.Errorf("RecoveryArchives calls=%d args=%q; want one canonical lookup", client.archivesCalls, client.archivesArgs)
+					}
+					wantWarning := "uzi: 1 capture(s) carry no hold id (server predates it) and are not listed; 'uzi run get " + recoveryHeldRunID + "' lists the available ones\n"
+					if errb != wantWarning {
+						t.Errorf("stderr=%q; want canonical legacy warning %q", errb, wantWarning)
+					}
+					var rows []struct {
+						ID                string `json:"id"`
+						RunID             string `json:"run_id"`
+						TerminalRejection string `json:"terminal_rejection"`
+						FailureReason     string `json:"failure_reason"`
+						Captures          []struct {
+							ID string `json:"id"`
+						} `json:"captures"`
+					}
+					if err := json.Unmarshal([]byte(out), &rows); err != nil {
+						t.Fatalf("invalid hold JSON: %v; stdout=%q", err, out)
+					}
+					if len(rows) != 2 {
+						t.Fatalf("JSON holds=%d; want exactly the two canonical holds: %s", len(rows), out)
+					}
+					if rows[0].ID != "canonical-source" || rows[1].ID != "canonical-archive" {
+						t.Errorf("wrong holds: %s", out)
+					}
+					for _, row := range rows {
+						if row.RunID != recoveryHeldRunID || row.FailureReason != reason {
+							t.Errorf("noncanonical run or missing failure diagnostic: %s", out)
+						}
+					}
+					if rows[0].TerminalRejection != terminalCopy || rows[0].Captures == nil || len(rows[0].Captures) != 0 ||
+						len(rows[1].Captures) != 1 || rows[1].Captures[0].ID != "canonical-capture" {
+						t.Errorf("terminal diagnostic or capture attachment changed: %s", out)
+					}
+				})
+			}
+		}
+	}
 }
 
 func ownerRecoveryFixture() apitypes.RecoveryCustodyHoldsDTO {
@@ -61,24 +325,24 @@ func TestRecoveryTerminalRejection(t *testing.T) {
 		for _, archive := range []bool{false, true} {
 			dto := ownerRecoveryFixture()
 			dto.Holds = []apitypes.RecoveryCustodyHoldDTO{
-				{ID: "hold-g7", RunID: "run-one", Generation: 7, State: "open", Attention: "source_only", WorkerName: "alpha", TerminalRecordRejection: "mac_failure"},
-				{ID: "hold-g8", RunID: "run-one", Generation: 8, State: "open", Attention: "active", TerminalRecordRejection: "untrusted flag"},
+				{ID: "hold-g7", RunID: recoveryHeldRunID, Generation: 7, State: "open", Attention: "source_only", WorkerName: "alpha", TerminalRecordRejection: "mac_failure"},
+				{ID: "hold-g8", RunID: recoveryHeldRunID, Generation: 8, State: "open", Attention: "active", TerminalRecordRejection: "untrusted flag"},
 			}
 			if archive {
-				dto.Holds = append(dto.Holds, apitypes.RecoveryCustodyHoldDTO{ID: "hold-g9", RunID: "run-one", Generation: 9, State: "open", Attention: "archive_ready", HasAvailableCapture: true, TerminalRecordRejection: "mac_failure"})
+				dto.Holds = append(dto.Holds, apitypes.RecoveryCustodyHoldDTO{ID: "hold-g9", RunID: recoveryHeldRunID, Generation: 9, State: "open", Attention: "archive_ready", HasAvailableCapture: true, TerminalRecordRejection: "mac_failure"})
 			}
 			fc := &uzicli.FakeClient{RecoveryHoldsResult: dto, RecoverySummaries: map[string]apitypes.RecoveryArchiveSummaryDTO{
-				"run-one": {Archives: []apitypes.RecoveryArchiveDTO{{ID: "cap-g9", HoldID: "hold-g9", State: "available"}}},
+				recoveryHeldRunID: {Archives: []apitypes.RecoveryArchiveDTO{{ID: "cap-g9", HoldID: "hold-g9", State: "available"}}},
 			}}
 			args := []string{"run", "recovery"}
 			if runSpecific {
-				args = append(args, "run-one")
+				args = append(args, recoveryHeldRunID)
 			}
 			out, errb, code := runCLI(t, fakeEnv(fc), args...)
 			if code != uzicli.ExitOK {
 				t.Fatalf("exit=%d stderr=%s", code, errb)
 			}
-			if !strings.Contains(out, "run run-one hold hold-g7 gen 7: "+copy) ||
+			if !strings.Contains(out, "run "+recoveryHeldRunID+" hold hold-g7 gen 7: "+copy) ||
 				!strings.Contains(out, "hold hold-g7: no recovery archive; custody of worker alpha's local source is retained (export unavailable; it may be the only copy)") {
 				t.Fatalf("missing identity or copy: %s", out)
 			}
@@ -103,7 +367,7 @@ func TestRecoveryTerminalRejection(t *testing.T) {
 				}
 				rows = owner.Holds
 			}
-			if len(rows) != len(dto.Holds) || rows[0]["id"] != "hold-g7" || rows[0]["run_id"] != "run-one" ||
+			if len(rows) != len(dto.Holds) || rows[0]["id"] != "hold-g7" || rows[0]["run_id"] != recoveryHeldRunID ||
 				rows[0]["generation"] != float64(7) || rows[0]["attention"] != "source_only" ||
 				rows[0]["terminal_record_rejection"] != "mac_failure" || rows[0]["terminal_rejection"] != copy {
 				t.Fatalf("JSON identity/copy changed: %s", jsonOut)
@@ -256,9 +520,9 @@ func recoveryHoldsFixture() apitypes.RecoveryCustodyHoldsDTO {
 	return apitypes.RecoveryCustodyHoldsDTO{
 		Aggregate: apitypes.RecoveryCustodyAggregateDTO{OpenHolds: 2, AdmissionCountedHolds: 1, CustodyHoldLimit: 8, DecisionNeeded: 1, BlockedRuns: 0},
 		Holds: []apitypes.RecoveryCustodyHoldDTO{
-			{ID: "hold-run1-gen1", RunID: "run1", Generation: 1, State: "open", Attention: "source_only",
+			{ID: "hold-run1-gen1", RunID: recoveryHeldRunID, Generation: 1, State: "open", Attention: "source_only",
 				WorkerID: "w1", WorkerName: "alpha", CaptureState: ""},
-			{ID: "hold-run2-gen1", RunID: "run2", Generation: 1, State: "open", Attention: "active",
+			{ID: "hold-run2-gen1", RunID: recoveryOtherRunID, Generation: 1, State: "open", Attention: "active",
 				WorkerID: "w2", WorkerName: "beta"},
 		},
 	}
@@ -268,7 +532,7 @@ func recoveryHoldsFixture() apitypes.RecoveryCustodyHoldsDTO {
 // hold id, generation and disposition — and filters OUT holds belonging to other runs.
 func TestRunRecoveryRenders(t *testing.T) {
 	fc := &uzicli.FakeClient{RecoveryHoldsResult: recoveryHoldsFixture()}
-	out, _, code := runCLI(t, fakeEnv(fc), "run", "recovery", "run1")
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "recovery", recoveryHeldRunID)
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0", code)
 	}
@@ -285,7 +549,7 @@ func TestRunRecoveryRenders(t *testing.T) {
 // the requested run's holds.
 func TestRunRecoveryJSON(t *testing.T) {
 	fc := &uzicli.FakeClient{RecoveryHoldsResult: recoveryHoldsFixture()}
-	out, _, code := runCLI(t, fakeEnv(fc), "run", "recovery", "run1", "--json")
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "recovery", recoveryHeldRunID, "--json")
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0", code)
 	}
@@ -305,11 +569,11 @@ func TestRunRecoveryJSON(t *testing.T) {
 func TestRunRecoveryJSONCheckpointRef(t *testing.T) {
 	const serverJSON = `{"aggregate":{"open_holds":2,"custody_hold_limit":8,"decision_needed":1,"blocked_runs":0},
 	  "holds":[
-	    {"id":"hold-run1-gen1","run_id":"run1","generation":1,"state":"open","attention":"source_only",
+	    {"id":"hold-run1-gen1","run_id":"` + recoveryHeldRunID + `","generation":1,"state":"open","attention":"source_only",
 	     "worker_id":"w1","has_available_capture":false,"created_at":"2026-09-27T10:00:00Z","updated_at":"2026-09-27T10:00:00Z",
 	     "checkpoint_ref":"refs/uzi-recovery/run1","checkpoint_tip":"2222222222222222222222222222222222222222",
 	     "checkpoint_state":"superseded"},
-	    {"id":"hold-run1-gen2","run_id":"run1","generation":2,"state":"open","attention":"active",
+	    {"id":"hold-run1-gen2","run_id":"` + recoveryHeldRunID + `","generation":2,"state":"open","attention":"active",
 	     "worker_id":"w1","has_available_capture":false,"created_at":"2026-09-27T10:00:00Z","updated_at":"2026-09-27T10:00:00Z"}
 	  ]}`
 	var dto apitypes.RecoveryCustodyHoldsDTO
@@ -317,7 +581,7 @@ func TestRunRecoveryJSONCheckpointRef(t *testing.T) {
 		t.Fatalf("decode server JSON: %v", err)
 	}
 	fc := &uzicli.FakeClient{RecoveryHoldsResult: dto}
-	out, _, code := runCLI(t, fakeEnv(fc), "run", "recovery", "run1", "--json")
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "recovery", recoveryHeldRunID, "--json")
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0", code)
 	}
@@ -347,14 +611,14 @@ func TestRunRecoveryJSONCheckpointRef(t *testing.T) {
 func TestRunRecoveryRendersCheckpointRef(t *testing.T) {
 	dto := recoveryHoldsFixture()
 	dto.Holds = append(dto.Holds, apitypes.RecoveryCustodyHoldDTO{
-		ID: "hold-run1-gen2", RunID: "run1", Generation: 2, State: "open", Attention: "active",
+		ID: "hold-run1-gen2", RunID: recoveryHeldRunID, Generation: 2, State: "open", Attention: "active",
 		WorkerID: "w1", WorkerName: "alpha",
 		CheckpointRef:   "refs/uzi-recovery/run1",
 		CheckpointTip:   "2222222222222222222222222222222222222222",
 		CheckpointState: "superseded",
 	})
 	fc := &uzicli.FakeClient{RecoveryHoldsResult: dto}
-	out, _, code := runCLI(t, fakeEnv(fc), "run", "recovery", "run1")
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "recovery", recoveryHeldRunID)
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0", code)
 	}
@@ -389,15 +653,16 @@ func TestRunRecoveryCheckpointLineSanitizes(t *testing.T) {
 
 func TestRunRecoveryHintFoldsRunID(t *testing.T) {
 	runID := "run\nwith\ttabs"
-	fc := &uzicli.FakeClient{
-		RecoveryHoldsResult: apitypes.RecoveryCustodyHoldsDTO{Holds: []apitypes.RecoveryCustodyHoldDTO{
-			{ID: "hold-n", RunID: runID, Generation: 1, State: "open", Attention: "needs_action", WorkerID: "w1"},
-		}},
+	holds := []apitypes.RecoveryCustodyHoldDTO{
+		{ID: "hold-n", RunID: runID, Generation: 1, State: "open", Attention: "needs_action", WorkerID: "w1"},
 	}
-	out, errb, code := runCLI(t, fakeEnv(fc), "run", "recovery", runID)
-	if code != uzicli.ExitOK {
-		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, errb)
+	var stdout, stderr bytes.Buffer
+	env := fakeEnv(&uzicli.FakeClient{})
+	env.Stdout, env.Stderr = &stdout, &stderr
+	if err := renderRunRecovery(env, &globalFlags{}, runID, holds, nil, nil); err != nil {
+		t.Fatal(err)
 	}
+	out := stdout.String()
 	want := "1 hold(s) await a decision: discard with `uzi run discard run with tabs --hold <hold-id> --yes`"
 	for _, line := range strings.Split(out, "\n") {
 		if line == want {
@@ -409,36 +674,31 @@ func TestRunRecoveryHintFoldsRunID(t *testing.T) {
 
 func TestRunRecoveryEmptyFoldsRunID(t *testing.T) {
 	runID := "run\nwith\ttabs"
-	fc := &uzicli.FakeClient{RecoveryHoldsResult: apitypes.RecoveryCustodyHoldsDTO{}}
-	out, errb, code := runCLI(t, fakeEnv(fc), "run", "recovery", runID)
-	if code != uzicli.ExitOK {
-		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, errb)
+	var stdout, stderr bytes.Buffer
+	env := fakeEnv(&uzicli.FakeClient{})
+	env.Stdout, env.Stderr = &stdout, &stderr
+	if err := renderRunRecovery(env, &globalFlags{}, runID, nil, nil, nil); err != nil {
+		t.Fatal(err)
 	}
 	want := "run run with tabs has no retained custody holds\n"
-	if out != want {
+	if out := stdout.String(); out != want {
 		t.Errorf("empty-holds stdout = %q, want %q", out, want)
 	}
 }
 
 func TestRunRecoveryJSONWarningFoldsRunID(t *testing.T) {
 	runID := "run\nwith\ttabs"
-	fc := &uzicli.FakeClient{
-		RecoveryHoldsResult: apitypes.RecoveryCustodyHoldsDTO{Holds: []apitypes.RecoveryCustodyHoldDTO{
-			{ID: "hold-n", RunID: runID, Generation: 1, State: "open", Attention: "needs_action", WorkerID: "w1"},
-		}},
-		RecoverySummaries: map[string]apitypes.RecoveryArchiveSummaryDTO{
-			runID: {Supported: true, Archives: []apitypes.RecoveryArchiveDTO{
-				{ID: "cap-legacy", HoldID: "", State: "available"},
-			}},
-		},
-		RunByID: map[string]apitypes.RunDTO{
-			runID: {ID: runID, Status: "completed"},
-		},
+	holds := []apitypes.RecoveryCustodyHoldDTO{
+		{ID: "hold-n", RunID: runID, Generation: 1, State: "open", Attention: "needs_action", WorkerID: "w1"},
 	}
-	out, errb, code := runCLI(t, fakeEnv(fc), "run", "recovery", runID, "--json")
-	if code != uzicli.ExitOK {
-		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, errb)
+	archives := []apitypes.RecoveryArchiveDTO{{ID: "cap-legacy", HoldID: "", State: "available"}}
+	var stdout, stderr bytes.Buffer
+	env := fakeEnv(&uzicli.FakeClient{})
+	env.Stdout, env.Stderr = &stdout, &stderr
+	if err := renderRunRecovery(env, &globalFlags{json: true}, runID, holds, archives, nil); err != nil {
+		t.Fatal(err)
 	}
+	out, errb := stdout.String(), stderr.String()
 	want := "uzi: 1 capture(s) carry no hold id (server predates it) and are not listed; 'uzi run get run with tabs' lists the available ones\n"
 	if errb != want {
 		t.Errorf("complete capture warning = %q, want %q", errb, want)
@@ -446,18 +706,18 @@ func TestRunRecoveryJSONWarningFoldsRunID(t *testing.T) {
 	if strings.Contains(errb, "\t") || strings.Count(errb, "\n") != 1 || !strings.HasSuffix(errb, "\n") {
 		t.Errorf("capture warning must have no tabs and only a final newline: %q", errb)
 	}
-	var holds []struct {
+	var rows []struct {
 		ID       string            `json:"id"`
 		RunID    string            `json:"run_id"`
 		Captures []json.RawMessage `json:"captures"`
 	}
-	if err := json.Unmarshal([]byte(out), &holds); err != nil {
+	if err := json.Unmarshal([]byte(out), &rows); err != nil {
 		t.Fatalf("run recovery --json is not a hold array: %v\n%s", err, out)
 	}
-	if len(holds) != 1 || holds[0].ID != "hold-n" || holds[0].RunID != runID {
-		t.Fatalf("JSON holds = %+v, want the matching hold with raw run ID %q", holds, runID)
+	if len(rows) != 1 || rows[0].ID != "hold-n" || rows[0].RunID != runID {
+		t.Fatalf("JSON holds = %+v, want the matching hold with raw run ID %q", rows, runID)
 	}
-	if holds[0].Captures == nil || len(holds[0].Captures) != 0 {
+	if rows[0].Captures == nil || len(rows[0].Captures) != 0 {
 		t.Errorf("JSON captures = %s, want [] with the unattributed capture omitted", out)
 	}
 }
@@ -465,7 +725,7 @@ func TestRunRecoveryJSONWarningFoldsRunID(t *testing.T) {
 // TestRunRecoveryEmptyJSON proves --json emits [] (never null) for a run with no holds.
 func TestRunRecoveryEmptyJSON(t *testing.T) {
 	fc := &uzicli.FakeClient{RecoveryHoldsResult: recoveryHoldsFixture()}
-	out, _, code := runCLI(t, fakeEnv(fc), "run", "recovery", "run-none", "--json")
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "recovery", recoveryAbsentRunID, "--json")
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0", code)
 	}
@@ -481,7 +741,7 @@ func TestRunRecoveryJSONCaptures(t *testing.T) {
 	fc := &uzicli.FakeClient{
 		RecoveryHoldsResult: recoveryHoldsFixture(),
 		RecoverySummaries: map[string]apitypes.RecoveryArchiveSummaryDTO{
-			"run1": {Supported: true, Archives: []apitypes.RecoveryArchiveDTO{
+			recoveryHeldRunID: {Supported: true, Archives: []apitypes.RecoveryArchiveDTO{
 				{ID: "cap-1", HoldID: "hold-run1-gen1", State: "available", SourceSha: "aaaa", ByteSize: i64(8),
 					CreatedAt: time.Date(2026, 9, 1, 12, 30, 0, 0, time.UTC)},
 				{ID: "cap-other", HoldID: "hold-run1-gen0", State: "expired", SourceSha: "bbbb"},
@@ -490,7 +750,7 @@ func TestRunRecoveryJSONCaptures(t *testing.T) {
 			}},
 		},
 	}
-	out, errb, code := runCLI(t, fakeEnv(fc), "run", "recovery", "run1", "--json")
+	out, errb, code := runCLI(t, fakeEnv(fc), "run", "recovery", recoveryHeldRunID, "--json")
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, errb)
 	}
@@ -526,7 +786,7 @@ func TestRunRecoveryJSONCaptures(t *testing.T) {
 	}
 	// cap-legacy (no hold_id) is attached nowhere, so the omission must be said on stderr,
 	// never silent; cap-other names a real (other) hold and is not counted.
-	if !strings.Contains(errb, "1 capture(s) carry no hold id") || !strings.Contains(errb, "uzi run get run1") {
+	if !strings.Contains(errb, "1 capture(s) carry no hold id") || !strings.Contains(errb, "uzi run get "+recoveryHeldRunID) {
 		t.Errorf("stderr = %q, want the unattributed-capture warning naming 1 capture and the run get listing", errb)
 	}
 }
@@ -535,7 +795,7 @@ func TestRunRecoveryJSONCaptures(t *testing.T) {
 // null), so a consuming agent iterates it unconditionally.
 func TestRunRecoveryJSONNoCaptures(t *testing.T) {
 	fc := &uzicli.FakeClient{RecoveryHoldsResult: recoveryHoldsFixture()}
-	out, _, code := runCLI(t, fakeEnv(fc), "run", "recovery", "run1", "--json")
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "recovery", recoveryHeldRunID, "--json")
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0", code)
 	}
@@ -551,7 +811,7 @@ func TestRunRecoveryJSONArchivesError(t *testing.T) {
 		RecoveryHoldsResult: recoveryHoldsFixture(),
 		RecoveryArchivesErr: uzicli.Exitf(uzicli.ExitGeneric, "archives read failed"),
 	}
-	out, _, code := runCLI(t, fakeEnv(fc), "run", "recovery", "run1", "--json")
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "recovery", recoveryHeldRunID, "--json")
 	if code == uzicli.ExitOK {
 		t.Fatalf("exit = 0 on an archives read error, want non-zero; stdout=%q", out)
 	}
@@ -568,7 +828,7 @@ func TestRunRecoveryJSONDeletedRunDegrades(t *testing.T) {
 		RecoveryHoldsResult: recoveryHoldsFixture(),
 		RecoveryArchivesErr: uzicli.Exitf(uzicli.ExitNotFound, "run not found"),
 	}
-	out, errb, code := runCLI(t, fakeEnv(fc), "run", "recovery", "run1", "--json")
+	out, errb, code := runCLI(t, fakeEnv(fc), "run", "recovery", recoveryHeldRunID, "--json")
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0 on a 404 archives read (stderr: %s)", code, errb)
 	}
@@ -591,8 +851,8 @@ func TestRunRecoveryJSONDeletedRunDegrades(t *testing.T) {
 // joined: the human table and a --json run with no holds both succeed with the read failing.
 func TestRunRecoveryNoArchivesReadWithoutNeed(t *testing.T) {
 	for _, args := range [][]string{
-		{"run", "recovery", "run1"},
-		{"run", "recovery", "run-none", "--json"},
+		{"run", "recovery", recoveryHeldRunID},
+		{"run", "recovery", recoveryAbsentRunID, "--json"},
 	} {
 		fc := &uzicli.FakeClient{
 			RecoveryHoldsResult: recoveryHoldsFixture(),
@@ -843,13 +1103,13 @@ func TestOwnerRecoveryQuietSuppressesGuidance(t *testing.T) {
 }
 
 func TestRunRecoverySourceOnlyNoExportSuggestion(t *testing.T) {
-	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{RecoveryHoldsResult: recoveryHoldsFixture()}), "run", "recovery", "run1")
+	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{RecoveryHoldsResult: recoveryHoldsFixture()}), "run", "recovery", recoveryHeldRunID)
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d", code)
 	}
 	for _, want := range []string{
 		"hold hold-run1-gen1: no recovery archive; custody of worker alpha's local source is retained (export unavailable; it may be the only copy)",
-		"1 hold(s) await a decision: discard with `uzi run discard run1 --hold <hold-id> --yes`",
+		"1 hold(s) await a decision: discard with `uzi run discard " + recoveryHeldRunID + " --hold <hold-id> --yes`",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q in:\n%s", want, out)
@@ -863,10 +1123,10 @@ func TestRunRecoverySourceOnlyNoExportSuggestion(t *testing.T) {
 func TestRunRecoveryArchiveReadyGetsExportHint(t *testing.T) {
 	dto := recoveryHoldsFixture()
 	dto.Holds = []apitypes.RecoveryCustodyHoldDTO{
-		{ID: "hold-r", RunID: "run1", Generation: 1, State: "open", Attention: "archive_ready",
+		{ID: "hold-r", RunID: recoveryHeldRunID, Generation: 1, State: "open", Attention: "archive_ready",
 			WorkerID: "w1", WorkerName: "alpha", HasAvailableCapture: true, CaptureState: "available"},
 	}
-	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{RecoveryHoldsResult: dto}), "run", "recovery", "run1")
+	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{RecoveryHoldsResult: dto}), "run", "recovery", recoveryHeldRunID)
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d", code)
 	}
@@ -881,10 +1141,10 @@ func TestRunRecoveryArchiveReadyGetsExportHint(t *testing.T) {
 func TestRunRecoveryReleasedHoldGetsNoExportHint(t *testing.T) {
 	dto := recoveryHoldsFixture()
 	dto.Holds = []apitypes.RecoveryCustodyHoldDTO{
-		{ID: "hold-rel", RunID: "run1", Generation: 1, State: "released", Attention: "settled",
+		{ID: "hold-rel", RunID: recoveryHeldRunID, Generation: 1, State: "released", Attention: "settled",
 			WorkerID: "w1", HasAvailableCapture: true, CaptureState: "available"},
 	}
-	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{RecoveryHoldsResult: dto}), "run", "recovery", "run1")
+	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{RecoveryHoldsResult: dto}), "run", "recovery", recoveryHeldRunID)
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d", code)
 	}
@@ -896,20 +1156,20 @@ func TestRunRecoveryReleasedHoldGetsNoExportHint(t *testing.T) {
 func TestRunRecoveryNeedsActionGetsDiscard(t *testing.T) {
 	dto := recoveryHoldsFixture()
 	dto.Holds = []apitypes.RecoveryCustodyHoldDTO{
-		{ID: "hold-n", RunID: "run1", Generation: 1, State: "open", Attention: "needs_action", WorkerID: "w1"},
+		{ID: "hold-n", RunID: recoveryHeldRunID, Generation: 1, State: "open", Attention: "needs_action", WorkerID: "w1"},
 	}
-	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{RecoveryHoldsResult: dto}), "run", "recovery", "run1")
+	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{RecoveryHoldsResult: dto}), "run", "recovery", recoveryHeldRunID)
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d", code)
 	}
-	if !strings.Contains(out, "1 hold(s) await a decision: discard with `uzi run discard run1 --hold <hold-id> --yes`") ||
+	if !strings.Contains(out, "1 hold(s) await a decision: discard with `uzi run discard "+recoveryHeldRunID+" --hold <hold-id> --yes`") ||
 		strings.Contains(out, "uzi run export") || strings.Contains(out, "custody of worker") {
 		t.Errorf("needs_action guidance wrong:\n%s", out)
 	}
 }
 
 func TestRunRecoveryQuietSuppressesGuidance(t *testing.T) {
-	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{RecoveryHoldsResult: recoveryHoldsFixture()}), "--quiet", "run", "recovery", "run1")
+	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{RecoveryHoldsResult: recoveryHoldsFixture()}), "--quiet", "run", "recovery", recoveryHeldRunID)
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d", code)
 	}
@@ -936,9 +1196,9 @@ func TestSourceOnlyLineSanitizes(t *testing.T) {
 	if strings.ContainsAny(out, "\x1b\r\x07") || strings.Contains(out, "\nforged") {
 		t.Errorf("owner listing leaked hostile bytes: %q", out)
 	}
-	h.RunID = "run1"
+	h.RunID = recoveryHeldRunID
 	out, _, code = runCLI(t, fakeEnv(&uzicli.FakeClient{RecoveryHoldsResult: apitypes.RecoveryCustodyHoldsDTO{
-		Holds: []apitypes.RecoveryCustodyHoldDTO{h}}}), "run", "recovery", "run1")
+		Holds: []apitypes.RecoveryCustodyHoldDTO{h}}}), "run", "recovery", recoveryHeldRunID)
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d", code)
 	}
@@ -984,10 +1244,10 @@ func TestSourceOnlyArchiveAndCaptureIndependent(t *testing.T) {
 func TestRunRecoveryHumanAdmissionColumn(t *testing.T) {
 	dto := ownerRecoveryFixture()
 	for i := range dto.Holds {
-		dto.Holds[i].RunID = "run1"
+		dto.Holds[i].RunID = recoveryHeldRunID
 	}
 	fc := &uzicli.FakeClient{RecoveryHoldsResult: dto}
-	out, errb, code := runCLI(t, fakeEnv(fc), "run", "recovery", "run1")
+	out, errb, code := runCLI(t, fakeEnv(fc), "run", "recovery", recoveryHeldRunID)
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, stderr=%q", code, errb)
 	}

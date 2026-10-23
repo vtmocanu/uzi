@@ -5,12 +5,14 @@ import (
 	"errors"
 	"math"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -38,9 +40,15 @@ const maxTaskBaseBranchBytes = 512
 // maxTaskBaseBranchBytes (PRD #400) → 400. Mapped in writeStartRunError.
 var ErrTaskBaseBranchTooLong = errors.New("base branch is too long")
 
+// ErrContinuedIssueInvalid rejects non-positive links and PRs from shared issue endpoints.
+var ErrContinuedIssueInvalid = errors.New("continued_issue_iid must identify a positive issue IID, not a pull request")
+
+// ErrContinuedIssueNotFound rejects missing or mismatched forge issues.
+var ErrContinuedIssueNotFound = errors.New("continued issue not found on this repository's forge")
+
 // CreateTaskRun queues a kind='task' run for a uzi handoff (PRD #400). It is shaped
 // like CreatePromptRun, deliberately NOT createRun: a task run is repo-ful but
-// ISSUE-LESS (no forge issue, no PRD link), so the normal path's cached-PRD-issue and
+// ISSUE-LESS for execution (issue_iid stays NULL, no PRD gate), so the normal path's cached-PRD-issue and
 // PRD-link gates do not apply. The inline context is snapshotted directly as the run's
 // issue_description (inheriting the 256 KiB cap + NUL sanitization), and a derived
 // first-line title as its issue_title, so the run view is self-contained.
@@ -57,7 +65,7 @@ var ErrTaskBaseBranchTooLong = errors.New("base branch is too long")
 // cheap branch-safety assertion (Decision 8) confirms the resolved branch is namespaced
 // and is not the repo's default branch — belt-and-suspenders behind the server-named
 // branch being safe by construction.
-func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, inlineContext, baseBranch string, openMR, reviewRequested, thenFixRequested, interactive bool) (store.Run, error) {
+func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, inlineContext, baseBranch string, openMR, reviewRequested, thenFixRequested, interactive bool, continuedIssueIID *int64) (store.Run, error) {
 	id := uuid.New()
 	branch := taskBranchPrefix + id.String()
 
@@ -72,6 +80,46 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, i
 			return store.Run{}, ErrRepoNotFound
 		}
 		return store.Run{}, err
+	}
+
+	// Linked handoffs validate directly against the owner's forge project. They do not
+	// depend on cached board membership, labels, issue state, or a PRD link.
+	var continued pgtype.Int8
+	if continuedIssueIID != nil {
+		if *continuedIssueIID <= 0 {
+			return store.Run{}, ErrContinuedIssueInvalid
+		}
+		if s.forges == nil {
+			return store.Run{}, ErrForgesUnavailable
+		}
+		f, err := s.forges.ForgeForConnection(row.ForgeType, row.BaseUrl, row.TokenCiphertext)
+		if err != nil {
+			return store.Run{}, ErrForgeBuild
+		}
+		fetchCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		issue, err := forge.GetIssueBounded(fetchCtx, f, row.ForgeProjectID, *continuedIssueIID)
+		cancel()
+		if err != nil {
+			var notFound *forge.IssueNotFoundError
+			if errors.As(err, &notFound) {
+				return store.Run{}, ErrContinuedIssueNotFound
+			}
+			return store.Run{}, ErrForgeIssueRead
+		}
+		if issue.IID != *continuedIssueIID {
+			return store.Run{}, ErrContinuedIssueNotFound
+		}
+		if issue.IsPullRequest {
+			return store.Run{}, ErrContinuedIssueInvalid
+		}
+		continued = pgtype.Int8{Int64: *continuedIssueIID, Valid: true}
+		active, err := s.q.HasActiveRunForIssue(ctx, store.HasActiveRunForIssueParams{RepoID: repoID, IssueIid: continued})
+		if err != nil {
+			return store.Run{}, err
+		}
+		if active {
+			return store.Run{}, ErrActiveRunExists
+		}
 	}
 
 	// Cap the inline context the same way the seeded/prompt paths cap issue_description,
@@ -118,6 +166,7 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, i
 	run, err := s.createRunResolved(ctx, userID, nil /*explicit: implicit D11*/, func(q Store, resolved resolvedHarness) (store.Run, error) {
 		return q.CreateTaskRun(ctx, store.CreateTaskRunParams{
 			RunID:               id,
+			ContinuedIssueIid:   continued,
 			UserID:              userID,
 			RepoID:              repoID,
 			Branch:              pgconv.TextOrNull(branch),
@@ -139,7 +188,7 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, i
 		})
 	})
 	if err != nil {
-		return store.Run{}, err
+		return store.Run{}, taskCreateError(err)
 	}
 	// A task run is created NOT-yet-claimable (dispatched_at NULL); the live status
 	// broadcast stays consistent with other kinds, but the worker cannot claim it until
@@ -235,11 +284,7 @@ func (s *Service) CreateTaskReviewRun(ctx context.Context, userID, repoID, targe
 		})
 	})
 	if err != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-			return store.Run{}, ErrTaskReviewAlreadyActive
-		}
-		return store.Run{}, err
+		return store.Run{}, taskCreateError(err)
 	}
 	// The review run is already claimable (dispatched_at stamped in SQL); broadcast queued
 	// so any live view re-reads it, exactly like DispatchTaskRun does for a plain handoff.
@@ -312,11 +357,7 @@ func (s *Service) CreateThenFixRun(ctx context.Context, userID, repoID, original
 		})
 	})
 	if err != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-			return store.Run{}, ErrThenFixAlreadyActive
-		}
-		return store.Run{}, err
+		return store.Run{}, taskCreateError(err)
 	}
 	// The fix run is already claimable (dispatched_at stamped in SQL); broadcast queued so
 	// any live view re-reads it, exactly like CreateTaskReviewRun / DispatchTaskRun.
@@ -375,4 +416,21 @@ func pgTextTrimNarg(s string) pgtype.Text {
 		return pgtype.Text{}
 	}
 	return pgconv.TextOrNull(s)
+}
+
+// taskCreateError preserves unrelated uniqueness failures; only these constraints
+// describe an active issue, review target, or fix target conflict.
+func taskCreateError(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+		switch pgErr.ConstraintName {
+		case "uq_runs_one_active_per_issue":
+			return ErrActiveRunExists
+		case "uq_one_active_task_review_per_target":
+			return ErrTaskReviewAlreadyActive
+		case "uq_one_active_then_fix_per_target":
+			return ErrThenFixAlreadyActive
+		}
+	}
+	return err
 }

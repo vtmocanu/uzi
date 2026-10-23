@@ -946,11 +946,44 @@ and `prds/done/636-multi-repo-custom-schedules.md`.
 CLI (not the worker) pushes the user's own HEAD to a server-named
 `uzi/task/<run-id>` branch with the user's own git credentials, then dispatches
 the run so the worker clones that branch, works the inline context, and pushes
-commits back, with no forge issue and no MR unless `--mr` is passed. See
+commits back, creating no forge issue and no MR unless `--mr` is passed.
+`--issue <iid>` optionally links an existing issue for continuation. See
 [prds/done/400-uzi-handoff.md](prds/done/400-uzi-handoff.md),
 [docs/handoff.md](docs/handoff.md), and
-[docs/cli.md](docs/cli.md#uzi-handoff-ephemeral-branch-scoped-task-runs). Status
-is a linear state machine:
+[docs/cli.md](docs/cli.md#uzi-handoff-ephemeral-branch-scoped-task-runs).
+
+Issue continuation (#3326) stores a nullable `runs.continued_issue_iid`.
+Migration 351's CHECK permits a populated value only on a `task`, with a
+positive IID, non-null repo and null `issue_iid`; this adds no board
+association. `CreateTaskRun` verifies repo ownership and the real forge issue
+(open or closed, not a PR), without eligibility-label or PRD gates.
+`HasActiveRunForIssue` retains its existing `issue_iid` matches (including
+self-improvement) and also matches linked tasks, counting nonterminal states
+including `pool_wait`. The partial unique expression index on
+`(repo_id, coalesce(issue_iid, continued_issue_iid))` covers `issue`/`task`
+runs, excluding terminal states and `pool_wait`; the creation precheck
+still counts `pool_wait` as active. Terminal tasks release the active guard.
+A separate nonunique partial index, `idx_runs_continued_issue_lookup` on
+`(repo_id, continued_issue_iid)` for tasks with a non-null link, supports
+linked-task lookups alongside `idx_runs_issue_history` for `issue_iid`
+lookups. These lookup indexes do not bound the history scanned for one issue.
+Review and then-fix children inherit the link, with best-effort post-terminal
+creation and no continuous reservation while the chain is entirely terminal.
+`GetOpenMRRunForIssue` also finds completed linked tasks with an MR whose
+state is neither merged nor closed, including unknown state. That blocks a
+fresh issue run unless `run create --force` is used; force does not bypass
+the active guard. Task creation checks active runs, not completed open MRs.
+The link does not change task branches or the Refs-only MR profile, and does
+not itself generate a reference or closing keyword.
+
+**Deployment / rollback (migration 351).** The transactional `ALTER TABLE`
+holds `ACCESS EXCLUSIVE` through CHECK validation and index scans. A nullable
+column without a default avoids a table rewrite, but CHECK/index scans and
+their I/O/WAL costs remain; production-volume cost and lock duration are
+unknown. Down restores the old issue-only index, drops the linked-task lookup
+index and drops the link column, irreversibly losing continuation provenance.
+
+Status is a linear state machine:
 
 ```
 queued → claimed → running ⇄ awaiting_input (ask_user, PRD #88) → awaiting_approval ⟲ (revise, PRD #41) → running → completed
@@ -2425,7 +2458,8 @@ promoted. Registration keeps its 64-byte display limit; altered/truncated
 versions withhold the incarnation binding. Missing mapping or evidence holds
 rather than falling back to unpaced replacement.
 
-Only admitted image turns receive a roll-owned cordon over the authenticated
+Admitted image turns and eligible custody-held layout migrations receive an
+`image_roll` cordon over the authenticated
 `POST /api/controller/workers/{id}/drain` control-write channel. The API's
 `draining_since` and reason remain separate from heartbeat-derived status.
 Under #3103, actual spec-hash/generation drift (image pin, template or size) and
@@ -2436,8 +2470,10 @@ API assignments are authoritative, not worker `reported_runs`. Own pinned
 continuations/checkers may finish; unrelated new roots, unassigned children and
 judge intake are refused. An admitted busy drainer consumes concurrency (default
 one), supplies no replacement coverage, canary proof or post-promotion proof, and can
-hold its pool indefinitely. Unadmitted healthy peers stay uncordoned and claimable,
-without a legacy-recycle escape; separately fenced DinD remains independent.
+hold its pool indefinitely. Unadmitted healthy peers normally stay uncordoned
+and claimable; eligible custody-held layout migration drains are the exception,
+without replacement admission or a legacy-recycle escape. Separately fenced
+DinD remains independent.
 Idle guards and custody still apply, even with no assigned blockers. Restoring
 an unchanged retained zero-replica Deployment while busy keeps its existing guard.
 
@@ -2514,7 +2550,23 @@ plain lane. DinD never uses ForceRoll or the drain deadline. Simultaneous pressu
 runs legacy first, DinD on a later tick; legacy busy deadlines now apply only to
 independent nondrifted maintenance, while global ForceRoll retains custody guards.
 A custody-held Docker worker whose pod still has the old layout (an emptyDir at
-`/data/runner`) is held on it, ForceRoll included, until custody releases; a
+`/data/runner`) is held on it, ForceRoll included, until custody releases. Persistent drifted workers
+may receive a migration drain after ordinary admission planning, using the
+existing `image_roll` reason, with a distinct live eligible uncordoned sibling
+in the same owner/lane individually covering the frozen full capability set
+(busy is allowed; free slots are not required). Run-bound workers are excluded
+from this drain selection. Observed drains of any reason in the full held
+inventory, selected drains and possibly committed drains occupy its budget,
+including unrenderable workers. A retained drain supplies no intake coverage
+and can delay later ordinary rolls; it remains if its covering sibling is lost.
+Selection is level-triggered after registration/restart or an explicit undrained
+poll, with no fixed time bound. Failed writes retain process-local uncertainty
+until poll evidence resolves it; restart loses that uncertainty. This is a
+controller selection limit, not a physical one-drain guarantee: a timed-out POST
+can commit after an undrained poll. No server-side fence, schema, protocol or
+API product change is added. Held outcomes and health expose the operator
+decision; no automatic discard is authorized. See the
+[migration drain operational limits](docs/hosted-worker-roll-verification.md#migration-drain-policy-and-operational-limits). A
 `runner-init` init container refuses a worker image without the
 `runner-shared-v1` layout marker. Kubelet eviction, node drain and manual pod
 deletion are not guarded. See

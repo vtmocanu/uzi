@@ -78,7 +78,7 @@ func (g *github) GetMergeRequestSummary(ctx context.Context, projectID, iid int6
 	}
 	slug, err := g.repoSlugFor(ctx, projectID)
 	if err != nil {
-		return MergeRequestSummary{}, err
+		return MergeRequestSummary{}, mrOverflowError(err)
 	}
 	num, err := ghNum(iid)
 	if err != nil {

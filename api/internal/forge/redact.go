@@ -57,6 +57,9 @@ func (r redactor) errorStatus(err error, status int) error {
 	}
 	var tooLarge *ResponseTooLargeError
 	if errors.As(err, &tooLarge) {
+		return tooLarge.safeCopy()
+	}
+	if errors.Is(err, ErrResponseTooLarge) {
 		return &ResponseTooLargeError{}
 	}
 	class := classifyError(err, status)

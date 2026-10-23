@@ -154,7 +154,7 @@ uzi findings dismiss <finding-id> --reason wont-do|not-an-issue
 uzi findings resolve <finding-id>
 uzi findings undo <disposition-id>
 uzi findings stats [--repo <id>] [--json]
-uzi handoff -m <text> | -f <path> [--base <ref>] [--mr] [--review] [--then-fix] [--interactive] [--repo <id>]
+uzi handoff -m <text> | -f <path> [--base <ref>] [--issue <iid>] [--mr] [--review] [--then-fix] [--interactive] [--repo <id>]
 uzi handoff rm <run-id> | review <run-id>
 uzi token list
 uzi rate-limits [--provider claude|codex]
@@ -1470,14 +1470,14 @@ expires, or into a state that saved nothing); retry the removal after that.
 ## uzi handoff: ephemeral branch-scoped task runs
 
 ```sh
-uzi handoff -m "<context>" [--file <path>] [--base <ref>] [--mr]
+uzi handoff -m "<context>" [--file <path>] [--base <ref>] [--issue <iid>] [--mr]
             [--review] [--then-fix] [--repo <repo-id>]
 uzi handoff rm <run-id>
 uzi handoff review <run-id>
 ```
 
 `uzi handoff` (alias `uzi task`) hands a throwaway task to a worker without a
-forge issue and without a PRD: no plan gate, no issue to file, no MR to
+forge issue by default and without a PRD: no plan gate, no issue to file, no MR to
 review, unless you ask for one. Think of it as renting a remote worktree —
 you push it some work, watch it, pull the result, and throw the branch away.
 See [Handoff: renting a remote worktree](./handoff.md) for the full mental
@@ -1510,7 +1510,7 @@ first two fails:
 
 The worker clones `uzi/task/<id>`, works your inline context (from `-m`, or
 `-f <file>`/`-f -` for stdin, or piped bare stdin), commits, and pushes back
-to the same branch. There's no forge issue and no MR by default — pull the
+to the same branch. No forge issue is created, and there's no MR by default — pull the
 result yourself:
 
 ```sh
@@ -1534,11 +1534,33 @@ A few things worth knowing before you rely on this:
   "rebase onto main" — uzi can't force-push a rewrite of a branch it already
   published, so a rebase there gets bridged (or, if that's impossible, fails
   the run) at finalize instead of landing as asked.
-- **A raw handoff has no forge record.** With no issue and no MR (no `--mr`),
+- **An unlinked, no-MR handoff has no forge record.** Without `--issue` or `--mr`,
   there's nothing durable on the forge — the run transcript and your inline
   context are still persisted in uzi (`uzi run get`/`uzi run logs`), but if
   you want a forge-visible artifact, pass `--mr` or escalate later by opening
   one yourself from the pulled branch.
+- **`--issue <iid>`** links an existing issue for recovery or continuation. It
+  requires a positive signed 64-bit integer; zero, negative and overflowing
+  values are usage errors (exit 2). The server verifies a real forge issue
+  (not a pull request) in a repo you own; open and closed issues are allowed,
+  with no eligibility-label or PRD requirement. Without this flag, ordinary
+  task behavior is unchanged.
+
+  The run stays `kind: task`: `continued_issue_iid` carries the link,
+  `issue_iid` stays null, and there is no board association or branch change.
+  Run get/list JSON includes `continued_issue_iid` as null or the linked IID.
+  Passing the flag generates neither an MR reference nor a closing keyword.
+  Task MRs retain their existing non-closing behavior.
+
+  A nonterminal run for the issue, including `pool_wait`, blocks creation
+  (HTTP 409, CLI exit 5). Terminal tasks release this active guard. Review
+  and `--then-fix` runs inherit the link, but their creation is best effort:
+  there is a gap after a parent goes terminal, with no continuous reservation
+  when the chain is entirely terminal. A completed linked task whose MR is
+  still open or has unknown state blocks a fresh **issue run**, unless you
+  use `uzi run create --force`; that flag cannot bypass the active guard.
+  Handoff creation checks active runs, not completed open MRs, and has no
+  `--force` flag.
 - **`--mr`** has the worker open an MR for the branch once it finishes, the
   escalation path for a throwaway task that turns out to be keeper work. An
   MR-opened branch is exempt from `uzi handoff rm` — delete it via the MR
@@ -1749,10 +1771,11 @@ A newer release is available.
   never squeezed. `[h]` hides finished runs (completed/failed/cancelled),
   leaving the active and needs-you runs. The rows are grouped into three
   triage bands (NEEDS YOU, then ON THE FLOOR, then DONE) rather than one
-  flat table. DONE keeps failed and `needs landing` state tokens in dimmed red,
-  their issue links in full red, and their titles faint. Human-stopped runs
-  stay faint. When failures are present, the DONE heading adds a red
-  `K failed` count over the filtered rows. Each row reads left to right as a
+  flat table. Failed and `needs landing` DONE rows use one dimmed red for
+  their state tokens and issue links. On every DONE row, an `issues` judge
+  badge uses that same dimmed red. Human-stopped state tokens and all DONE
+  titles stay faint. When failures are present, the DONE heading adds a
+  full-red `K failed` count over the filtered rows. Each row reads left to right as a
   `▌` andon strip and
   status glyph, the run id, the status WORD in its own colour (a stalled run
   reads `▲ stalled`, because health folds into the status token rather than

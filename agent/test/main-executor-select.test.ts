@@ -7,7 +7,9 @@ import { nullLogger } from "./helpers.js";
 import { WorkerClient } from "../src/client.js";
 import { StubExecutor } from "../src/executor.js";
 import { SdkExecutor } from "../src/sdk-executor.js";
-import { CodexExecutor, FailClosedExecutor } from "../src/codex/codex-executor.js";
+import { CodexExecutor, FailClosedExecutor, type CodexAdviceHarnessFactory, type CodexAdviceHarnessBuildParams } from "../src/codex/codex-executor.js";
+import { ownedSummaryFactories, summaryOwnership } from "../src/codex/summary-ownership.js";
+import type { SummaryRunner } from "../src/summary-runner.js";
 import { buildChatExecutor, buildRunExecutor, type BuildRunExecutorDeps } from "../src/main.js";
 import { ChatExecutor } from "../src/chat-executor.js";
 import type { ClaimCodexSecrets } from "../src/protocol.js";
@@ -56,23 +58,42 @@ function baseDeps(overrides: Partial<BuildRunExecutorDeps> = {}): BuildRunExecut
   };
 }
 
-it("2833 forwards shared advice factory to Codex summary runner while stub stays inert", () => {
-  const factory = (async () => { throw new Error("should not construct during selection"); }) as
-    import("../src/codex/codex-executor.js").CodexAdviceHarnessFactory;
+it("2833 forwards shared advice factory to Codex summary runner while stub stays inert", async () => {
+  const builds: CodexAdviceHarnessBuildParams[] = [];
+  const factory: CodexAdviceHarnessFactory = async params => {
+    builds.push(params);
+    throw new Error("fixture advice construction refused");
+  };
   const deps = baseDeps({ codexAdviceHarnessFactory: factory });
   const rawCodex = { ...VALID_SUBSCRIPTION_CODEX, claim_metadata: "original subscription claim" };
   const result = buildRunExecutor("run-summary", rawCodex, deps);
   assert.ok(result.executor instanceof CodexExecutor);
   const executor = result.executor as unknown as {
     opts: { codexAdviceHarnessFactory?: unknown; summaryClaimCodex?: unknown };
-    summaryRunner: { homeRoot: string; codexAdviceHarnessFactory?: unknown };
+    summaryRunner: Pick<SummaryRunner, "generateIntentSummary"> & {
+      homeRoot: string; codexAdviceHarnessFactory?: CodexAdviceHarnessFactory;
+    };
   };
   assert.equal(executor.opts.codexAdviceHarnessFactory, factory);
   assert.equal(executor.opts.summaryClaimCodex, rawCodex);
   assert.equal(executor.summaryRunner.homeRoot, SDK_HOME_ROOT);
-  assert.equal(executor.summaryRunner.codexAdviceHarnessFactory, factory);
+  const ownedFactory = executor.summaryRunner.codexAdviceHarnessFactory;
+  assert.equal(typeof ownedFactory, "function");
+  assert.notEqual(ownedFactory, factory);
+  assert.ok(ownedSummaryFactories.has(ownedFactory!));
+  assert.equal(builds.length, 0, "selection does not construct an advice harness");
   const stub = buildRunExecutor("run-summary", VALID_SUBSCRIPTION_CODEX, { ...deps, executorKind: "stub" });
   assert.ok(stub.executor instanceof StubExecutor);
+  assert.equal(builds.length, 0, "stub selection leaves the advice factory inert");
+  assert.equal(await executor.summaryRunner.generateIntentSummary({
+    claim: { run_id: "run-summary", secrets: { codex: rawCodex } },
+    token: "", model: "unused", issueTitle: "Forwarding", issueBody: "Owned summary build",
+  }), null, "the forwarded factory refusal stays advisory");
+  assert.equal(builds.length, 1, "the owned wrapper forwards the public summary call once");
+  assert.ok(summaryOwnership.get(builds[0]!), "the forwarded build has executor-owned summary custody");
+  assert.equal(builds[0]!.runId, "run-summary");
+  assert.equal(builds[0]!.binding.authMode, "subscription");
+  assert.equal(builds[0]!.refresh, "deny");
 });
 
 describe("buildRunExecutor — the stub-before-codex reorder (PRD #1429 M6)", () => {

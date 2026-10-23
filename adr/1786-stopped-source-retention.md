@@ -1,4 +1,4 @@
-# ADR-1786: A stopped generation's source is kept until preservation is proven or an operator disposes it
+# ADR-1786: A stopped generation's source is kept until explicit operator disposal
 
 **Status**: Accepted
 **Date**: 2026-10-12
@@ -23,7 +23,37 @@ A stopped generation's exact local source is kept until an operator explicitly d
 stopped-source exits the coverage check is diagnostic only and never authorizes release. Park
 release paths also keep the exact clone and existing journal even when covered. Terminal exits
 retain the existing snapshot-based covered release, subject to the remaining writer-exclusion
-limitation tracked in [#2852](https://github.com/vtmocanu/uzi/issues/2852).
+limitation tracked in [#2852](https://github.com/vtmocanu/uzi/issues/2852) (AI-synced 2026-10-18).
+
+**Slice A contract, Refs #2852 (AI-synced 2026-10-18):** A holds
+credential-free GitCache capture and its supervised children, including retained-source
+capture, under closed admission and an epoch fence. This preservation boundary grants
+no disposal authority: stopped and parked sources remain retained under this ADR.
+Initial predecessor quiescence acquires and releases `runFreeCapture` before
+#3059's independently supervised `normalizeRetainedSourceObjects`, outside A's
+Git-only scope; `ensureClone` also remains outside free capture. A later held scope
+covers resumed-tip verification, direct publication or capture through
+`recordRecoveryCapture`. (AI-synced 2026-10-18)
+That held scope ends after `recordRecoveryCapture`; fresh successor creation from the
+durable bare pin is outside capture and reads only predecessor lstat metadata, not
+old clone bytes. Ordinary seeding trust is unchanged. Refusing every credential-free
+capture would strand capturable work in the ephemeral clone rather than the durable
+worker bare and regress verified park/pause preservation; successful local capture
+still proves neither archive availability nor permission to delete the predecessor.
+Pre-start retained-source proof uses a fresh unregistered process marker bound to
+the exact source, as specified in [ADR-1783](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect).
+It is not the source attempt identity or a recovery-record capture ID; it changes
+no journal, ledger, live registry, successor or deletion authority. Live-owner
+conflicts and inside clone proof/reproof still apply. Refs #2852 (AI-synced 2026-10-18).
+Exact completed-capture evidence also has a narrow disposed-registry cache
+attestation reader under [ADR-1783](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect);
+this grants no source cleanup or general clean status. Refs #2852 (AI-synced 2026-10-18).
+Existing terminal executor disposal does not close the gap between snapshot coverage
+and writer-exclusion proof; strengthened terminal proof (C) and healthy credentialed pre-publish closure (B)
+remain unshipped. A does not establish Docker writer exclusion:
+accepted-but-invisible creates (#1860), daemon/sibling writers and Claude terminal
+residuals remain. Per-attempt cgroups (#1862) are not supplied by A. #1858 grants
+no automatic reclaim, and #2746 custody SETTLE remains separate from physical CLEANUP.
 
 None of the following is proof: a successor's claim, a released hold (including a successor's
 release of a predecessor hold), a terminal run status, or a capture result remembered from

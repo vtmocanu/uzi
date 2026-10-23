@@ -1,3 +1,4 @@
+import { enableRefreshPublication } from "./publication-fixture.js";
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -267,6 +268,7 @@ for (const kind of ["mr_rework", "ci_fix", "issue"] as const) {
     cmd(writer, "push", "origin", branch);
     const claim = gitlabClaim(2404, { kind, branch, claim_generation: 7, base_branch: "main",
       repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: remote } });
+    if (kind === "mr_rework") await enableRefreshPublication(api, client, claim, remote, 2404, "closing");
     const original = git.pushBranch.bind(git);
     let R = "";
     let C = "";

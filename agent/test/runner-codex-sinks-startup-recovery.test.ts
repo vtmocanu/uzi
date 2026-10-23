@@ -12,6 +12,7 @@ import {
   type SupervisorProcess,
 } from "../src/codex/launcher.js";
 import { boundaryProcessSpawnerForTest } from "../src/codex/codex-executor.js";
+import { carriesForgeCredential } from "../src/residue-quarantine.js";
 import { COMMAND_UID, WORKER_UID } from "../src/runner-uid.js";
 import { RejectedStartupTransport } from "./codex-rejected-startup-fixture.js";
 import type { Logger } from "../src/log.js";
@@ -83,14 +84,18 @@ describe("RunRunner M2 — lost refresh replies reconcile before credential reco
         try {
           client.protocolFeatures = [VAULT_FEATURE];
           const { gitlab, calls: mrCalls } = fakeGitlab();
-          const rig = codexRig({ credentialClient });
+          const processCredentials: boolean[] = [];
+          const rig = codexRig({ credentialClient, boundaryProcess: (request) => {
+            processCredentials.push(carriesForgeCredential(request.env));
+            return undefined;
+          } });
           const { logger, lines } = recordingLogger();
           const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
             commitInTree(ctx.worktreePath, "COMMITTED.txt", "committed, not yet fetched back\n");
             fs.writeFileSync(path.join(ctx.worktreePath, "DIRTY.txt"), "uncommitted edit\n");
             if (sink === "checkpoint") await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
             return { branch: ctx.branch };
-          }, rig.settle);
+          }, undefined, rig.capture);
           const iid = 177000 + ["finalize", "checkpoint"].indexOf(sink) * 10 + ["vault_locked", "unavailable", "contended", "legacy_typed_first"].indexOf(reply);
           const claim = gitlabClaim(iid, { claim_generation: 3 });
           const runner = runnerWith(() => ({ executor: exec }), gitlab, undefined, logger, { recoveryRetryMs: 1 });
@@ -103,7 +108,9 @@ describe("RunRunner M2 — lost refresh replies reconcile before credential reco
           assert.equal(parks[0]!.recovery_cause, reply === "vault_locked" || reply === "legacy_typed_first" ? "vault_locked" : undefined);
           assertCaptured(iid);
           assert.deepEqual(rig.boundaries, [sink], "no new boundary after reconciliation deferred");
-          assert.equal(rig.processSpawns(), 0, "no permit-held process action");
+          assert.ok(processCredentials.length > 0, "supervised credential-free Git captures the actual work");
+          assert.equal(processCredentials.length, rig.processSpawns(), "every actual process seam is observed");
+          assert.ok(processCredentials.every((credentialed) => !credentialed), "no spawned process carries forge credentials");
           assert.equal(api.completionPermitRequests.length, 0, "no completion authority requested");
           assert.equal(mrCalls.length, 0);
           assert.equal(custody(), 0);
@@ -219,7 +226,7 @@ describe("RunRunner M2 — unknown refresh sink retries and local recovery", () 
           await ctx.checkpoint!({ reap: false });
           checkpointRetried = true;
           return { branch: ctx.branch };
-        }, ready.settle);
+        }, undefined, ready.capture);
         return { executor: exec };
       };
       await runnerWith(factory, gitlab, undefined, nullLogger(), { recoveryRetryMs: 1 }).execute({ ...claim, claim_generation: 4 });
@@ -247,7 +254,7 @@ describe("M2 existing completion hold deferral control", () => {
       fs.writeFileSync(path.join(ctx.worktreePath, "DIRTY.txt"), "dirty work\n");
       entered = await ctx.enterCompletionHold!("existing pending owner decision");
       return entered ? { branch: ctx.branch, completionHeld: { reason: "existing pending owner decision" } } : { branch: ctx.branch };
-    }, rig.settle);
+    }, undefined, rig.capture);
     const claim = gitlabClaim(177090, { claim_generation: 3 });
     await runnerWith(() => ({ executor: exec }), gitlab, undefined, nullLogger(), { recoveryRetryMs: 1 }).execute(claim);
     assert.ok(!statuses(claim.run_id).includes("failed"), "an unknown refresh must not fail this hold");
@@ -385,7 +392,7 @@ describe("RunRunner M2 fatal rejected startup", () => {
         await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] }, sink: scenario.sink });
         checkpointReturned = true;
         return { branch: ctx.branch };
-      });
+      }, undefined, rig.capture);
       const claim = gitlabClaim(247560 + index, {
         repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, forge_type: "github" },
       });
@@ -701,7 +708,7 @@ describe("RunRunner M2 positive rejected startup acceptance", () => {
           }), "worker Git logger records the fixed recovery classification");
           return { branch: ctx.branch };
         } catch (error) { softSkipPost?.dispose(); turnFailure = error; throw error; }
-      });
+      }, undefined, rig.capture);
       const claim = gitlabClaim(247500 + index, {
         repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, forge_type: "github" },
       });

@@ -308,6 +308,8 @@ type Label struct {
 // Issue is a forge issue as uzi caches it. Description is carried so the caller
 // can compute the PRD-link check at fetch time; it is never persisted.
 type Issue struct {
+	// IsPullRequest distinguishes PRs returned by shared issue endpoints; internal only.
+	IsPullRequest     bool `json:"-"`
 	IID               int64
 	Title             string
 	State             string // "opened" | "closed"

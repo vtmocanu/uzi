@@ -18,15 +18,17 @@ import (
 // (issue #856) against a REAL Postgres. createRun must refuse a fresh issue run when the
 // SAME issue already has a COMPLETED (terminal) run owning an OPEN merge request — the
 // active-run gate cannot see a terminal run, so this guard is the only thing that stops a
-// fresh run re-planning and re-reviewing onto an already-open MR. Five arms, each on its
-// own repo+issue so they cannot cross-contaminate:
+// fresh run re-planning and re-reviewing onto an already-open MR. Each case uses its own
+// repo+issue so they cannot cross-contaminate. The linked-task matrices cover completed
+// MR states with/without force and active states (including pool_wait), which force
+// never bypasses. The original issue-run controls cover:
 //
 //  1. blocked   — a completed issue run with mr_iid + mr_state='opened' ⇒ a second
 //     CreateRun returns ErrOpenMRExists and the message names the MR number.
 //  2. merged    — the same prior run with mr_state='merged' (no open MR) ⇒ allowed.
 //  3. forced    — an open MR present but force=true ⇒ allowed (the guard is bypassed).
 //  4. kind scope — a completed SELF_IMPROVE run (kind != 'issue') owning an open MR for the
-//     same issue ⇒ allowed, because the guard is scoped to kind='issue'.
+//     same issue ⇒ allowed, because the guard covers issue runs and linked tasks.
 //  5. watcher lag — a completed issue run with mr_iid set but mr_state STILL NULL (the
 //     watcher has not ticked yet) ⇒ a second CreateRun is still REFUSED with ErrOpenMRExists
 //     naming the MR. This proves the guard keys on the authoritative mr_iid and no longer
@@ -102,6 +104,71 @@ func TestOpenMRGuardLiveDB(t *testing.T) {
 		}
 	}
 
+	// A completed linked task participates in the same open-MR policy as an
+	// issue run. Force releases only that policy, never the active-run guard.
+	for _, state := range []string{"NULL", "opened", "locked", "merged", "closed"} {
+		for _, force := range []bool{false, true} {
+			t.Run(fmt.Sprintf("linked_task/%s/force_%v", state, force), func(t *testing.T) {
+				userID, repoID := seedRepoAndIssue(t, "linked")
+				var mrState any = state
+				if state == "NULL" {
+					mrState = nil
+				}
+				priorID := uuid.New()
+				if _, err := pool.Exec(ctx, `INSERT INTO runs
+     (id,user_id,repo_id,kind,continued_issue_iid,issue_title,issue_description,branch,mr_iid,mr_state,status)
+     VALUES($1,$2,$3,'task',$4,'prior','body',$5,4260,$6,'completed')`,
+					priorID, userID, repoID, issueIID, "uzi/task/"+uuid.NewString(), mrState); err != nil {
+					t.Fatal(err)
+				}
+				run, err := svc.CreateRun(ctx, userID, repoID, issueIID, "description", nil, nil, force, nil, nil, nil)
+				blocked := !force && state != "merged" && state != "closed"
+				if blocked {
+					if !errors.Is(err, ErrOpenMRExists) || !strings.Contains(err.Error(), "!4260") {
+						t.Fatalf("CreateRun error=%v, want named ErrOpenMRExists", err)
+					}
+				} else if err != nil || run.Kind != runkind.Issue {
+					t.Fatalf("CreateRun run=%+v error=%v, want issue run", run, err)
+				}
+				var count int
+				if err := pool.QueryRow(ctx, "SELECT count(*) FROM runs WHERE repo_id=$1", repoID).Scan(&count); err != nil {
+					t.Fatal(err)
+				}
+				want := 2
+				if blocked {
+					want = 1
+				}
+				if count != want {
+					t.Fatalf("persisted runs=%d want=%d", count, want)
+				}
+			})
+		}
+	}
+	for _, status := range []string{"queued", "running", "pool_wait"} {
+		for _, force := range []bool{false, true} {
+			t.Run(fmt.Sprintf("active_linked_task/%s/force_%v", status, force), func(t *testing.T) {
+				userID, repoID := seedRepoAndIssue(t, "active-linked")
+				if _, err := pool.Exec(ctx, `INSERT INTO runs
+     (id,user_id,repo_id,kind,continued_issue_iid,issue_title,issue_description,branch,status)
+     VALUES($1,$2,$3,'task',$4,'prior','body',$5,$6)`,
+					uuid.New(), userID, repoID, issueIID, "uzi/task/"+uuid.NewString(), status); err != nil {
+					t.Fatal(err)
+				}
+				_, err := svc.CreateRun(ctx, userID, repoID, issueIID, "description", nil, nil, force, nil, nil, nil)
+				if !errors.Is(err, ErrActiveRunExists) {
+					t.Fatalf("CreateRun error=%v want ErrActiveRunExists", err)
+				}
+				var count int
+				if err := pool.QueryRow(ctx, "SELECT count(*) FROM runs WHERE repo_id=$1", repoID).Scan(&count); err != nil {
+					t.Fatal(err)
+				}
+				if count != 1 {
+					t.Fatalf("refusal persisted %d runs, want original only", count)
+				}
+			})
+		}
+	}
+
 	t.Run("blocks a fresh issue run when a prior issue run owns an open MR", func(t *testing.T) {
 		userID, repoID := seedRepoAndIssue(t, "block")
 		const mrIID int64 = 4210
@@ -143,10 +210,10 @@ func TestOpenMRGuardLiveDB(t *testing.T) {
 		}
 	})
 
-	t.Run("guard is scoped to issue kind: a non-issue prior run's open MR does not block", func(t *testing.T) {
+	t.Run("a self-improve prior run's open MR does not block", func(t *testing.T) {
 		userID, repoID := seedRepoAndIssue(t, "scope")
 		// A completed self_improve run (kind != 'issue') owning an open MR for the SAME
-		// issue. GetOpenMRRunForIssue filters kind='issue', so it must not match.
+		// issue. GetOpenMRRunForIssue excludes self_improve, so it must not match.
 		seedPriorRun(t, userID, repoID, "self_improve", "opened", 4240)
 
 		run, err := svc.CreateRun(ctx, userID, repoID, issueIID, "the description", nil, nil, false /*force*/, nil, nil, nil)

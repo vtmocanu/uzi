@@ -464,12 +464,153 @@ descendants, including daemons that change process groups. A command is not an
 app-server descendant merely because a callback requested it.
 
 Provider roots receive only their own provider credential; command roots receive
-a sparse credential-free environment. At a boundary, close admission, settle
-accepted launches and callbacks, then drain and verify **every** root for that
-frozen epoch. Lost supervision or an unconfirmed result poisons the run. The
+a sparse credential-free environment. At a credentialed boundary, close admission,
+settle accepted launches and callbacks, then drain and verify the registered roots
+for that frozen epoch. The
 [outer safety gate](../e2e/codex-m0/harness-contract.md#lifecycle-operation-order-and-evidence)
-owns the matching-epoch permit and holds it through every runner sink; it also
-preserves primary-error independence and the unchanged Claude branch.
+holds the matching-epoch permit through the runner action and its owned work,
+preserving primary-error independence and the unchanged Claude branch.
+
+**Slice A contract, Refs #2852 (AI-synced 2026-10-18):**
+A separate credential-free GitCache capture callback holds safety serialization,
+the epoch fence and closed admission through source reads, WIP commit, fetch-back,
+verification, authorized publication and full supervised-child settlement. An
+intentionally poisoned registry admits this narrow lane after confirmed settlement;
+it admits no provider turn or normal callback, admission reopen, credential
+reconciliation, refresh or release, PAT, credential-bearing environment or overlay.
+Lost supervision or incomplete settlement grants no capture authority. This context
+mints neither a credentialed nor a completion permit. See the
+[remaining sink gaps](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect).
+
+Pre-start capture uses the existing capture-only facade. A later owned capture can
+also select a fresh production capture-only facade for the exact retired public
+facade after verified full teardown. Ordinary evidence is created only by
+`ProviderEpoch.dispose` replacing an abandoned epoch, with observed quiescence
+and matching-epoch reaping, successful disposal, harness close and fileop cleanup
+for that exact public facade; it remains valid only while that registry is disposed
+and unpoisoned.
+The exact registry's pre-reap epoch, root count and existing launch/callback
+cursors, with initially zero pending launches and callbacks, must remain unchanged
+through aggregate reaping, registry/harness/fileop cleanup and later eligibility
+checks; a newly admitted root or pending reservation invalidates the clean result
+and retains the old registry as unverified, even if disposal clears its tables.
+Terminal run cleanup and partial-build cleanup do not create this
+ordinary fact from cleared tracking tables. Intentional capture instead retains
+the exact completed scope/epoch/registry proof and unchanged poison revision. The public safety marker
+stays present, so normal boundaries still refuse rather than taking the legacy
+branch. After setup, summary and installer joins, session save, attempt binding
+and outstanding-registry drain checks, this evidence permits facade selection,
+not capture authority. The fresh acquisition still calls `settleForCapture`,
+intentionally poisons its new registry and uses its own settlement within the
+original deadline. Arbitrary disposal, cleared tracking tables, failed cleanup,
+new poison or roots, and foreign facades cannot substitute for either evidence
+origin. This adds no model/provider, reconciliation, credential-release or PAT
+authority and changes no command-cache eligibility or retention rule.
+Refs #2852 (AI-synced 2026-10-18).
+
+The optional fifth
+`Executor.withCredentialFreeCapture` argument is worker-internal immutable
+`marker`/`cloneKey`/`clonePath` metadata, not a wire field. The executor snapshots
+it before yielding, selects `captureReaperAttempt` under `captureTail` after prior
+ownership, setup/summary joins and session save, before safety acquisition, and
+restores it after owned callback/child settlement. Both facade getters select
+`captureReaperAttempt ?? reaperAttempt`; `run(ctx)` remains the normal binding
+writer. Invalid metadata or a tuple foreign to that normal binding refuses before
+the action. Omission retains normal fallback and pre-start scoped-reaper refusal;
+it does not impose a blanket capture ban. No helper JSON, flags, bootstrap,
+protocol, budget, component, model or credential authority changes.
+Refs #2852 (AI-synced 2026-10-18).
+
+In retained recovery, the initial predecessor quiescence proof acquires and releases
+`runFreeCapture` before #3059's independently supervised
+`normalizeRetainedSourceObjects`, outside A's Git-only scope. `ensureClone` also
+runs outside free capture. A later held callback covers resumed-tip verification,
+direct publication or capture through `recordRecoveryCapture`; successor creation
+follows outside that callback. This integration adds no capture allowlist exception.
+Refs #2852 (AI-synced 2026-10-18).
+
+The scoped reaper uses registered supervisor roots for fixed `mktemp`, the existing
+Node/tsx run-quiescence helper flag, and removal of the exact private temporary
+directory. Ordinary scans send legacy JSON without `reportDeadline` and retain
+unbounded kill-mode procfs reads. A genuine `reportBudget` adds the floored deadline
+and selects no-kill report observation; no new procfs read bounds, bootstrap,
+helper flag, request schema or supervisor protocol are introduced. The parent caps
+operations at the minimum absolute scope, report (when present), helper and ambient
+deadlines. Late completion, nonzero exit, output overflow or cancellation-cleanup
+failure is unverified. Safety's exclusive guard refuses reaping with pending launches,
+callbacks or unreaped capture children, and refuses ordinary child admission while
+the pipeline is active. Started children join through full root completion before
+pipeline guard and safety queue release. Raw scoped fallback is refused; exact
+attempt, clone key and target binding remain required. Outside executing-flight
+scope, maintenance and Claude retain the legacy route without added flight waits
+or budgets. Refs #2852 (AI-synced 2026-10-18).
+
+Free-capture roots and the closed-reaper branch bypass `cacheForLaunch` / `track`;
+ordinary cached command roots keep their existing accounting. This adds no decorated
+environment exception. The exact completed-capture cache attestation reader is
+specified in [ADR-1783](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect).
+Refs #2852 (AI-synced 2026-10-18).
+
+GitCache binds the restricted launch policy: the canonical environment includes
+exactly one empty `credential.helper` and one empty `core.askpass`, with no
+credential-bearing override. The strict GitCache builder policy matches the complete
+canonical environment's own keys and values, including exact indexed config order
+(reordering is refused). The command-identity launch binds the sandbox mode to the
+executor-selected `required`, `best-effort` or `off` mode, alongside the fixed
+wrapper, cwd, argv and environment transformation. The immutable original request
+and its sandbox-transformed request are both checked synchronously at launch.
+Only the builder supplies the empty helper/askpass pins; duplicate entries and caller
+helper/askpass argv overrides, even empty ones, are refused. The synchronous launch-request check
+scans credential/askpass, includes, config-env, `GIT_CONFIG_PARAMETERS`, Authorization
+and URL-userinfo channels. The fixed embedded cancellation-content helper is
+allowed only through its supervised binding, not as generic helper execution.
+Trusted-worker bare Git keeps its worker identity;
+`worker_pat` is the historical identity name, not evidence of credential presence.
+Credential presence is checked separately; free capture does not downgrade bare
+Git to the isolated clone identity. Blanket refusal of free capture was rejected:
+it leaves uncaptured work in an ephemeral clone instead of moving capturable work
+into the persistent worker bare and regresses verified park/pause preservation.
+Local capture alone proves neither origin publication nor permission to dispose
+of the source. Worker-provided global Git
+config may configure drivers; ordinary seeding trust is unchanged. These
+configuration pins alone prove neither driver inertness nor process exclusion.
+
+Private `captureSynthesis` async-local state and `runSynthesisGit` bind dynamic
+worker author/committer identity, dates and private temporary index/worktree paths
+to the exact live Git invocation. The producers are `synthesizeWorkflowWrapper`
+(called by `buildWorkflowOverlay` and `buildCheckpointChain`), `bridgeToFloors`
+and `buildRecoveryCoverage`; `sizeAttrGit` receives no synthesis authority.
+Shape-valid paths, dates or a generic code/path exception cannot authorize synthesis.
+Canonical config order, the two empty helper/askpass pins and credential/config/env/URL
+refusals still apply; no PAT or username overlay is admitted. Outside executing-flight
+capture scopes, GitCache and maintenance keep their existing behavior.
+Refs #2852 (AI-synced 2026-10-18).
+
+Codex background JS dependency installation and Devbox `install` / `shellenv`
+use registered supervisor roots for fixed normal setup, with the existing runner
+identity, manager commands, replacement environment, HOME and caches. The private
+setup binding grants no model or credential authority
+and is unavailable inside the Git capture lane. A primary child exit or fulfilled
+best-effort install result is insufficient: confirmed root cleanup is required
+before capture or boundary credential reconciliation. Unconfirmed cleanup remains
+separate from the dependency-install outcome. The PATH probe is a read-only
+exception: an isolated trusted fixed filesystem-access script checks path entries
+as data, without executing them. Claude's installer path is unchanged.
+
+Executor-owned intent/plan summaries use private factory/parameter/harness bindings
+in [summary-ownership.ts](../agent/src/codex/summary-ownership.ts), not labels or
+structural lookalikes. Their factory, launch, auth, consume, full root disposal and
+result POST stay joined after the delivery-abandonment bound. Registry cleanup
+failure independently refuses free capture, healthy credential reconciliation and
+epoch recreation; retain primary errors separately. Other judge, review, Now and
+delivery advice outside this factory keep their existing behavior.
+
+Auth close joins raw refresh and direct-handler work. Check the synchronous epoch
+fence before token delivery and before/after release; closing admission prevents a
+late reply from restoring authority. The original absolute authority deadline still
+expires: owned cleanup stays joined under the fence without a renewed budget or
+detached tail. These private bindings add no generic spawner, identities, privileges,
+protocol or infrastructure.
 
 The same supervisor mechanism has been measured with actual provider roots and
 separate process controls. M0 needs no different process primitive for command

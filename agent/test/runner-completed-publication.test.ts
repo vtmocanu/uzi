@@ -1,3 +1,4 @@
+import { installSourcePublicationContext } from "./publication-fixture.js";
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -45,7 +46,10 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
           });
           const branch = kind === "self_improve" ? `uzi/self-improve/${claim.run_id}`
             : kind === "mr_rework" ? "agent/issue-42" : "agent/issue-2507";
-          api.setRegisterProtocolFeatures(["claim_generation_fence", "recovery_inventory_v1", feature, "terminal_rejection_report"]);
+          if (kind === "mr_rework") installSourcePublicationContext(api, claim,
+            command(fx.originPath, ["rev-parse", "main"]), null, "not_applicable");
+          api.setRegisterProtocolFeatures(["claim_generation_fence", "recovery_inventory_v1", feature, "terminal_rejection_report",
+            ...(kind === "mr_rework" ? ["refresh_publication_context_v1"] : [])]);
           const registration = await client.register("completion-full-execute", undefined, undefined, undefined, ["claim_generation_fence", "recovery_inventory_v1", feature]);
           assert.ok(registration.worker_id);
           if (capacity) {

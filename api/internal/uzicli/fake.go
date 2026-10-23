@@ -194,19 +194,20 @@ type FakeClient struct {
 	// DispatchTaskRunErr win over the blanket Err so a test can model a create 422 or
 	// a dispatch 404 on the specific verb while the capture still proves it was
 	// reached.
-	CreatedTaskRun            apitypes.RunDTO
-	LastCreateTaskRepoID      string
-	LastCreateTaskContext     string
-	LastCreateTaskBaseBranch  string
-	LastCreateTaskOpenMr      bool
-	LastCreateTaskInteractive bool
-	LastCreateTaskReview      bool
-	LastCreateTaskThenFix     bool
-	CreateTaskRunErr          error
-	DispatchedRun             apitypes.RunDTO
-	LastDispatchRunID         string
-	DispatchTaskRunErr        error
-	TaskCalls                 []string
+	CreatedTaskRun                  apitypes.RunDTO
+	LastCreateTaskContinuedIssueIID *int64
+	LastCreateTaskRepoID            string
+	LastCreateTaskContext           string
+	LastCreateTaskBaseBranch        string
+	LastCreateTaskOpenMr            bool
+	LastCreateTaskInteractive       bool
+	LastCreateTaskReview            bool
+	LastCreateTaskThenFix           bool
+	CreateTaskRunErr                error
+	DispatchedRun                   apitypes.RunDTO
+	LastDispatchRunID               string
+	DispatchTaskRunErr              error
+	TaskCalls                       []string
 
 	// GetTaskReview capture (PRD #400 M4a). TaskReview is the canned reply (nil ⇒ the
 	// task has no review yet); GetTaskReviewErr wins over Err so a 404 can be modelled on

@@ -78,7 +78,8 @@ it("worker UID inventory requires exactly nine literal capture leaves and preser
     assert.deepEqual([...new Set(inventory.map(test => test.file))], [
       "agent/test/codex-launcher.test.ts", "agent/test/codex-executor.test.ts",
       "agent/test/codex-shared-dir.test.ts", "agent/test/entrypoint-migration.test.ts", file,
-      "agent/test/git-retained-permissions.test.ts", "agent/test/claude-command-launcher.test.ts",
+      "agent/test/codex-capture-reaper-real.test.ts", "agent/test/git-retained-permissions.test.ts",
+      "agent/test/claude-command-launcher.test.ts",
       "e2e/worker-uid/claude-command-real.test.mts",
     ]);
     assert.deepEqual(inventory.filter(test => test.file === file).map(test => test.names[1]).sort(), [...leaves].sort());

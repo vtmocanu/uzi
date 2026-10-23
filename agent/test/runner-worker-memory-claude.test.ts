@@ -1,20 +1,99 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 import { test } from "node:test";
 import { performance } from "node:perf_hooks";
 import type { Executor } from "../src/executor.js";
 import type { ClaimResponse } from "../src/protocol.js";
 import { WorkerMemoryRuntime } from "../src/worker-memory-runtime.js";
 import { nullLogger } from "./helpers.js";
-import { api, client, fakeGitlab, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
+import { api, client, fakeGitlab, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
 
 installHarness();
 
 // Issue #2471 M3: a guard-bound runner enrols Claude claims (no Codex secret) too.
 
+for (const outcome of ["false", "throw", "confirmed"] as const) {
+  test(`capture policy: persisted Claude memory exhaustion / ${outcome}`, { timeout: 60_000 }, async t => {
+    const mask = process.umask(0o022);
+    t.after(() => { process.umask(mask); });
+    const f = await setup(30_000);
+    f.claim.memory_intervention_count = 2;
+    let entries = 0, settlements = 0, preservationSettlements = 0, captures = 0, publications = 0;
+    let flight: { sinkGate: { isHeld(): boolean };
+      workerMemory?: { operation?: Promise<void>; settled?: boolean } } | undefined;
+    const begin = f.memory.begin.bind(f.memory);
+    t.mock.method(f.memory, "begin", (...args: Parameters<typeof begin>) => {
+      const context = begin(...args);
+      flight = context.flight as typeof flight;
+      return context;
+    });
+    let clone = "", accessorReached = false;
+    let callbackFailure: unknown;
+    const session = path.join(homeDir, f.claim.run_id);
+    const marker = git.commitWipMarker.bind(git);
+    t.mock.method(git, "commitWipMarker", async (...args: Parameters<typeof marker>) => {
+      captures++; return marker(...args);
+    });
+    const publish = client.publishCheckpoint.bind(client);
+    t.mock.method(client, "publishCheckpoint", async (...args: Parameters<typeof publish>) => {
+      publications++; return publish(...args);
+    });
+    const executor: Executor = {
+      run: async ctx => {
+        entries++;
+        clone = ctx.worktreePath;
+        fs.mkdirSync(session, { recursive: true, mode: 0o700 });
+        fs.writeFileSync(path.join(session, "session"), "original session", { mode: 0o600 });
+        fs.writeFileSync(path.join(clone, "ONLY_COPY.txt"), "memory work");
+        api.setOwnershipStatus(f.claim.run_id, "running", 7);
+        try {
+          assert.equal(typeof ctx.capturedMemory, "function");
+          assert.throws(() => ctx.capturedMemory!(), /retained recovery/i);
+          accessorReached = true;
+        } catch (error) { callbackFailure = error; throw error; }
+        throw new Error("original execution stopped after exhausted accessor");
+      },
+      settleWorkerCommands: async () => {
+        if (!accessorReached) return { confirmed: true };
+        settlements++;
+        if (flight?.workerMemory?.operation && !flight.workerMemory.settled && flight.sinkGate.isHeld()) {
+          preservationSettlements++;
+        }
+        if (outcome === "throw") throw new Error("memory command protocol failure");
+        return { confirmed: outcome === "confirmed" };
+      },
+    };
+    const runner = runnerWith(() => ({ executor, homeDir: session }), fakeGitlab().gitlab,
+      undefined, nullLogger(), { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 30_000, checkpointIntervalMs: 0 });
+    try {
+      assert.equal(f.claim.secrets.codex, undefined);
+      await runner.execute(f.claim);
+      if (callbackFailure) throw callbackFailure;
+      assert.equal(entries, 1);
+      assert.equal(accessorReached, true, "real persisted-exhaustion accessor created the preservation hold");
+      assert.ok(settlements > 0);
+      assert.ok(preservationSettlements > 0, "the pending preservation operation reached settlement inside the real sink gate");
+      assert.equal(api.states.some(s => ["failed", "completed"].includes(s.body.status)), false);
+      const parks = api.states.filter(s => s.body.recovery_cause === "worker_memory_pressure");
+      if (outcome === "confirmed") {
+        assert.ok(captures > 0 && publications > 0, "confirmed control reaches preservation capture/publication");
+        assert.equal(parks.length, 1);
+      } else {
+        assert.deepEqual({ captures, publications }, { captures: 0, publications: 0 });
+        assert.equal(parks.length, 0);
+        assert.equal(api.states.some(s => s.body.status === "recovery_wait"), false);
+        assert.equal(fs.readFileSync(path.join(clone, "ONLY_COPY.txt"), "utf8"), "memory work");
+        assert.equal(fs.readFileSync(path.join(session, "session"), "utf8"), "original session");
+      }
+    } finally { runner.shutdown(); await f.memory.stop(); process.umask(mask); }
+  });
+}
+
 const settings = { enabled: true as const, reserveBytes: 100, hysteresisBytes: 100,
   sampleMs: 2, responseBudgetMs: 200, rearmMs: 10, maxInterventions: 2 };
 
-async function setup() {
+async function setup(responseBudgetMs = settings.responseBudgetMs) {
   api.memoryRegisterNonce = "claude-memory-registration";
   api.setRegisterProtocolFeatures(["worker_memory_pressure_v1", "claim_generation_fence"]);
   await client.register("memory-claude-fixture", "base");
@@ -22,7 +101,7 @@ async function setup() {
   const claim: ClaimResponse = { ...gitlabClaim(2471), claim_generation: 7,
     memory_episode: 3, memory_policy: { version: 1, max_interventions: 2 }, memory_intervention_count: 0 };
   api.setOwnershipStatus(claim.run_id, "running", 7);
-  const memory = new WorkerMemoryRuntime(settings, client, nullLogger(), {
+  const memory = new WorkerMemoryRuntime({ ...settings, responseBudgetMs }, client, nullLogger(), {
     reader: { sample: () => {
       const time = performance.now();
       return { available: true, sampleId: 1, startedAtMs: time, completedAtMs: time,
@@ -114,34 +193,60 @@ test("only the memory invalidation tells the executor; cancellation retires memo
   } finally { await f.memory.stop(); await monitoring.catch(() => undefined); }
 });
 
-test("credential capture settles guarded commands first and goes incomplete while they are unconfirmed", async () => {
+test("credential capture joins summary and confirms guarded commands before source access with the remaining budget", async () => {
   const f = await setup();
   const r = runnerWith(() => ({ executor: {} as Executor }), fakeGitlab().gitlab, undefined, undefined, { memoryRuntime: f.memory });
-  const settle = (executor: Executor) => (r as unknown as {
-    settleForCredentialCapture(executor: Executor, deadlineMs: number): Promise<{ kind: string }>;
-  }).settleForCredentialCapture(executor, 500);
+  const owner = r as unknown as {
+    runFreeCapture(claim: ClaimResponse, flight: unknown, deadlineAt: number, signal: undefined,
+      action: () => Promise<string>): Promise<{ kind: string; value?: string }>;
+  };
+  let sourceCalls = 0;
+  const settle = (executor: Executor, deadlineAt = Date.now() + 500) => owner.runFreeCapture(f.claim, {
+    executor, survivingTickGroups: [], sinkGate: { run: (action: () => Promise<unknown>) => action() },
+  }, deadlineAt, undefined, async () => { sourceCalls++; return "source"; });
   try {
     let deadlines: number[] = [];
-    let freeCalls = 0;
-    const free = async () => { freeCalls++; return { kind: "observed_empty" as const }; };
     const unconfirmed: Executor = { run: async () => { throw new Error("unused"); },
-      settleWorkerCommands: async (deadline) => { deadlines.push(deadline); return { confirmed: false }; },
-      settleForCredentialFreeCapture: free };
+      settleWorkerCommands: async deadline => { deadlines.push(deadline); return { confirmed: false }; } };
     assert.equal((await settle(unconfirmed)).kind, "incomplete");
-    assert.equal(freeCalls, 0, "an unconfirmed lane stops the capture before any other settle");
+    assert.equal(sourceCalls, 0);
     assert.equal(deadlines.length, 1);
     assert.ok(deadlines[0]! > 0 && deadlines[0]! <= 500);
     const throwing: Executor = { run: async () => { throw new Error("unused"); },
       settleWorkerCommands: async () => { throw new Error("boom"); } };
     assert.equal((await settle(throwing)).kind, "incomplete");
-    deadlines = [];
+    assert.equal(sourceCalls, 0);
+
+    let releaseSummary!: () => void, releaseCommands!: () => void;
+    let commandsEntered!: () => void;
+    const summary = new Promise<void>(resolve => { releaseSummary = resolve; });
+    const commands = new Promise<void>(resolve => { releaseCommands = resolve; });
+    const entered = new Promise<void>(resolve => { commandsEntered = resolve; });
+    const clock = Date.now;
+    const original = clock();
+    let now = original;
+    let summaryBudget = 0;
     const confirmed: Executor = { run: async () => { throw new Error("unused"); },
-      settleWorkerCommands: async (deadline) => { deadlines.push(deadline); return { confirmed: true }; },
-      settleForCredentialFreeCapture: free };
-    assert.equal((await settle(confirmed)).kind, "observed_empty");
-    assert.equal(freeCalls, 1);
-    // A guard-disabled executor (no settleWorkerCommands) keeps the existing order untouched.
+      closeAndSettlePlanSummary: async budget => { summaryBudget = budget!; await summary; },
+      settleWorkerCommands: async deadline => { deadlines.push(deadline); commandsEntered(); await commands; return { confirmed: true }; } };
+    deadlines = [];
+    Date.now = () => now;
+    try {
+      const pending = settle(confirmed, original + 500);
+      await Promise.resolve();
+      assert.equal(sourceCalls, 0, "pending summary prevents source work");
+      now += 125;
+      releaseSummary();
+      await entered;
+      assert.equal(summaryBudget, 500);
+      assert.deepEqual(deadlines, [375], "command settle consumes the original remaining budget");
+      assert.equal(sourceCalls, 0, "pending commands prevent source work");
+      releaseCommands();
+      assert.deepEqual(await pending, { kind: "observed_empty", value: "source" });
+    } finally { Date.now = clock; releaseSummary(); releaseCommands(); }
+    assert.equal(sourceCalls, 1);
     assert.equal((await settle({ run: async () => { throw new Error("unused"); } })).kind, "observed_empty");
+    assert.equal(sourceCalls, 2);
   } finally { await f.memory.stop(); }
 });
 

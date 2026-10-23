@@ -97,12 +97,13 @@ SELECT EXISTS (
     SELECT 1 FROM runs
     -- ::uuid keeps this a non-null uuid.UUID param after runs.repo_id went nullable
     -- (PRD #39 chat runs); an autopilot issue run always targets a repo.
-    WHERE repo_id = @repo_id::uuid AND issue_iid = @issue_iid
+    WHERE repo_id = @repo_id::uuid
+      AND (issue_iid = @issue_iid OR (kind = 'task' AND continued_issue_iid = @issue_iid))
       AND status NOT IN ('completed', 'failed', 'cancelled')
 ) AS active;
 
 -- name: GetOpenMRRunForIssue :one
--- The MR iid of a completed issue run that still owns an OPEN merge request for this
+-- The MR iid of a completed issue or linked task run that still owns an OPEN merge request for this
 -- issue (issue #856). Backs createRun's create-time open-MR refusal: a fresh issue run
 -- is blocked while a prior run's MR is still open, so we do not re-plan + re-review onto
 -- an MR that is already open. The guard keys on the authoritative mr_iid, written
@@ -117,8 +118,8 @@ SELECT EXISTS (
 SELECT r.mr_iid
 FROM runs r
 WHERE r.repo_id = @repo_id::uuid
-  AND r.issue_iid = @issue_iid
-  AND r.kind = 'issue'
+  AND ((r.kind = 'issue' AND r.issue_iid = @issue_iid)
+       OR (r.kind = 'task' AND r.continued_issue_iid = @issue_iid))
   AND r.status = 'completed'
   AND r.mr_iid IS NOT NULL
   AND r.mr_state IS DISTINCT FROM 'merged'

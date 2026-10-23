@@ -1,4 +1,4 @@
-import { followSuccessfulPush } from "./publication-fixture.js";
+import { enableRefreshPublication, followSuccessfulPush } from "./publication-fixture.js";
 import fs from "node:fs";
 import path from "node:path";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
@@ -416,7 +416,10 @@ describe("RunRunner — refresh runs (PRD #1798 D17)", () => {
     const legacy = "A human-written PR body.\n\nCloses #42";
     const { gitlab, calls, pr } = fakeGitlab({ head: H, existing: legacy });
 
-    await runner(new StubExecutor(nullLogger()), gitlab).execute(mrReworkClaim());
+    const claim = mrReworkClaim();
+    claim.claim_generation ??= 7;
+    await enableRefreshPublication(api, client, claim, fx.originPath, 42, "closing");
+    await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
     assert.ok(!calls.some((c) => c.method === "PUT"), "no body write");
     assert.equal(pr.description, legacy);
   });
@@ -426,7 +429,10 @@ describe("RunRunner — refresh runs (PRD #1798 D17)", () => {
     const existing = `Intro.\n\n${SIZE_REGION}\n\n${completion}\n\nBot text.`;
     const { gitlab, pr } = fakeGitlab({ head: H, existing });
 
-    await runner(new StubExecutor(nullLogger()), gitlab).execute(mrReworkClaim());
+    const claim = mrReworkClaim();
+    claim.claim_generation ??= 7;
+    await enableRefreshPublication(api, client, claim, fx.originPath, 42, "closing");
+    await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
     const parsed = parseOwnedBlocks(pr.description);
     assert.ok(parsed.kind === "ok");
     assert.equal(parsed.kind === "ok" && parsed.completion, completion, "the completion block is untouched");
@@ -928,6 +934,8 @@ describe("m2 non-closing delivery", () => {
     const completion = [COMPLETION_START, "Related to #2172.", "", "Closes #2172", "", "---", "Opened by uzi.", COMPLETION_END].join("\n");
     const { gitlab, pr } = fakeGitlab({ existing: `Intro.\n\n${SIZE_REGION}\n\n${completion}\n\nBot text.` });
     const claim = gitlabClaim(2172, { kind: "mr_rework", branch: "agent/issue-2172", base_branch: "main" });
+    claim.claim_generation ??= 7;
+    await enableRefreshPublication(api, client, claim, fx.originPath, 2172, "closing");
     await runner(declaring("must be ignored"), gitlab).execute(claim);
     assert.ok(statuses(claim.run_id).includes("completed"));
     const parsed = parseOwnedBlocks(pr.description);

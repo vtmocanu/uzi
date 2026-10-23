@@ -167,6 +167,7 @@ const runner = new RunRunner(client, cache, (_runId, codex) => {
     // Production Codex executors always declare command sandboxing; retained recovery requires it.
     sandboxesCommands: true,
     safety,
+    withCredentialFreeCapture: (ms, action, _purpose, signal) => inner.withCredentialFreeCapture(ms, action, signal),
     settleForCredentialFreeCapture: (ms) => inner.settleForCredentialFreeCapture(ms),
     run: async (ctx: RunContext): Promise<ExecutorResult> => {
       if (flight === 1) {
