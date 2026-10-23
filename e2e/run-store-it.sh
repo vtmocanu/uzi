@@ -152,17 +152,16 @@ LOG="$(mktemp "${TMPDIR:-/tmp}/uzi-store-it-log.XXXXXX")" || {
   echo "run-store-it: mktemp failed" >&2
   exit 1
 }
-# Keep local LiveDB deadlines bounded per package. With artifact admission coverage,
-# workersvc takes nearly 18m in isolation and integrated sweeps exceeded 20m (#2866),
-# so give it 30m of headroom; handler retains 20m. This changes no test selection or
-# race/skip checks and is not a speedup. Reset other packages to 10m each iteration.
+# Bound aggregate LiveDB time per package, matching ci.yml: store exhausted 10m
+# and workersvc exhausted 30m in measured sweeps. Allow store/handler 20m,
+# workersvc 60m, and others 10m; outer limits still apply. Tests, -race, -p 1 and
+# the skip guard are unchanged; longer budgets are not passing or performance proof.
 for p in "${PKGS[@]}"; do
-  timeout=10m
-  if [ "$p" = "./internal/handler/..." ]; then
-    timeout=20m
-  elif [ "$p" = "./internal/workersvc/..." ]; then
-    timeout=30m
-  fi
+  case "$p" in
+    ./internal/store/...|./internal/handler/...) timeout=20m ;;
+    ./internal/workersvc/...) timeout=60m ;;
+    *) timeout=10m ;;
+  esac
   UZI_TEST_DATABASE_URL="$DSN" go test -buildvcs=false -count=1 -v -race -p 1 \
     -timeout "$timeout" -run 'LiveDB$' "$p" 2>&1 | tee -a "$LOG"
 done

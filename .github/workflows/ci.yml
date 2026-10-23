@@ -306,14 +306,18 @@ jobs:
             ./internal/recovery/...
             ./internal/poller/...
           )
-          # Match the local runner's bounded per-package timeouts. The workersvc
-          # race-enabled sweep exceeded 15 minutes after reconciliation coverage.
+          # Bound aggregate LiveDB time per package, matching run-store-it.sh: store
+          # exhausted 10m and workersvc exhausted 30m in measured sweeps. Allow
+          # store/handler 20m, workersvc 60m, and others 10m; outer limits still apply.
+          # Tests, -race, -p 1 and the skip guard are unchanged; longer budgets are
+          # not passing or performance proof.
           : > livedb.log
           for p in "${PKGS[@]}"; do
-            timeout=10m
-            if [ "$p" = ./internal/workersvc/... ]; then
-              timeout=20m
-            fi
+            case "$p" in
+              ./internal/store/...|./internal/handler/...) timeout=20m ;;
+              ./internal/workersvc/...) timeout=60m ;;
+              *) timeout=10m ;;
+            esac
             go test -count=1 -v -race -p 1 -timeout "$timeout" -run 'LiveDB$' "$p" 2>&1 | tee -a livedb.log
           done
           # Aggregate check shared with e2e/run-store-it.sh: something ran, and nothing
