@@ -1,5 +1,5 @@
 import { prepareCIEvidence, validateCIRepairClaim, type PreparedCIEvidence } from "./ci-evidence.js";
-import { GitBoundaryAbortError, isCheckpointBoundaryFailure, type CheckpointStop } from "./checkpoint-stop.js";
+import { CheckpointUnsafeCleanupError, GitBoundaryAbortError, isCheckpointBoundaryFailure, type CheckpointStop } from "./checkpoint-stop.js";
 import { prepareFrozenHeld, type FrozenHeldPolicy } from "./frozen-held.js";
 import { interruptedSnapshot, prepareInterruptedCalls } from "./interrupted-calls.js";
 import { CodeCrossCheckGate, persistedCodeCrossCheckSummary } from "./code-cross-check-gate.js";
@@ -7105,6 +7105,7 @@ export class RunRunner {
         // The failed private capture invocation, not an error's name/fields,
         // authorizes this handoff. Other phasePublish/finish failures cannot issue it.
         if (!heldCapture || !captureContinuation || finishing) throw error;
+        if (error instanceof CheckpointUnsafeCleanupError) progress.local = undefined;
         this.retainCaptureSource(flight);
         this.captureAuthority(flight, Infinity);
         if (canonicalRecoveryInterruption(error) && !isCodexBoundaryError(error) &&
@@ -15033,7 +15034,7 @@ export class RunRunner {
     this.captureAuthority(flight, Infinity);
     if (progress.holdOutcome !== undefined) return progress.holdOutcome;
     if (progress.dispositionStarted) return flight.completionHoldOutcome !== "refused";
-    if (Date.now() >= episode.deadlineAt) return false;
+    if (progress.local?.kind !== "hold" || Date.now() >= episode.deadlineAt) return false;
     return this.withCaptureDisposition(flight, episode, signal =>
       this.enterCompletionHold(flight, claim, reason, runLog, {
         ...options, episode, signal, heldAuthenticated: undefined, heldCapture: undefined,
@@ -15051,7 +15052,7 @@ export class RunRunner {
       flight.uncertainWallPark = true;
       return "undeliverable";
     }
-    if (Date.now() >= episode.deadlineAt) {
+    if (progress.local?.kind !== "hold" || Date.now() >= episode.deadlineAt) {
       flight.uncertainWallPark = true;
       return "undeliverable";
     }
@@ -17933,6 +17934,7 @@ export class RunRunner {
             }
           } catch (captureError) {
             if (opts.heldAuthenticated && (isCodexBoundaryError(captureError) ||
+                captureError instanceof CheckpointUnsafeCleanupError ||
                 codexDeferralOf(captureError) !== undefined ||
                 Date.now() >= opts.heldAuthenticated.deadlineAt || opts.heldAuthenticated.signal.aborted)) throw captureError;
             if (opts.terminalDisk) {
@@ -18112,6 +18114,7 @@ export class RunRunner {
           // first, bounded by USAGE_DRAIN_DEADLINE_MS); the batcher stays open for the park's feed lines.
           await batcher.flush(captureSignal).catch(() => undefined);
           if (providerTyped) providerTypedSent = true;
+          if (progress) progress.dispositionStarted = true;
           const ack = await reportState(parkBody, captureSignal);
           if (progress && (ack.status === "recovery_wait" ||
               (providerTyped && ack.status === "paused" && ack.holdReason === PROVIDER_HOLD_REASON)))
@@ -19147,8 +19150,10 @@ export class RunRunner {
       }
     } catch (err) {
       if (opts.heldAuthenticated) {
-        // Local verification and optional publication are independent. The enclosing
-        // scope still has to complete child cleanup before this result is usable.
+        if (err instanceof CheckpointUnsafeCleanupError) {
+          if (opts.episode) this.captureProgressFor(flight, opts.episode).local = undefined;
+          throw err;
+        }
         this.assertHeldAuthenticatedCapture(flight, opts.heldAuthenticated);
         if (canonicalRecoveryInterruption(err)) throw err;
         runLog.warn("recovery publication failed; local capture retained", { error: errMessage(err) });
@@ -20012,6 +20017,10 @@ export class RunRunner {
       }
     } catch (err) {
       if (options.heldAuthenticated) {
+        if (err instanceof CheckpointUnsafeCleanupError) {
+          if (options.episode) this.captureProgressFor(flight, options.episode).local = undefined;
+          throw err;
+        }
         this.assertHeldAuthenticatedCapture(flight, options.heldAuthenticated);
         if (canonicalRecoveryInterruption(err)) throw err;
         runLog.warn("hold publication failed; local capture retained", { error: errMessage(err) });
