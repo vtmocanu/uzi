@@ -13450,7 +13450,8 @@ export class RunRunner {
       // wall boundary.
       // issue #1597 M2: gated against the mid-turn tick (it reaps and captures a restore point).
       parkForWall: async () => {
-        const outcome = await this.runGatedSink(flight, () => this.enterWallPark(flight, claim, runLog));
+        const episode = this.isCodexCapture(claim, flight) ? this.newCaptureEpisode(flight) : undefined;
+        const outcome = await this.runGatedSink(flight, () => this.enterWallPark(flight, claim, runLog, { episode }));
         if (outcome === "refused" && !(flight.wallParkRefresh?.completionAttempts && flight.wallParkRefresh.completionAttempts > 0)) steering.rearmLifecycle();
         return outcome;
       },
@@ -13500,11 +13501,13 @@ export class RunRunner {
       // Claude or Codex issue run carries completion_contract_version and completionInterlock
       // above is true; a legacy or seeded run leaves it false and never reaches this seam.
       // issue #1597 M2: gated against the mid-turn tick (it reaps and captures a restore point).
-      enterCompletionHold: (reason, options) =>
-        this.runGatedSink(flight, () => this.enterCompletionHold(flight, claim, reason, runLog, {
-          ...options,
+      enterCompletionHold: (reason, options) => {
+        const episode = this.isCodexCapture(claim, flight) ? this.newCaptureEpisode(flight) : undefined;
+        return this.runGatedSink(flight, () => this.enterCompletionHold(flight, claim, reason, runLog, {
+          ...options, episode,
           retainOnLiveRefusal: options?.allowDegradedCapture === true,
-        })),
+        }));
+      },
       // PRD #1226 M5 (D6): the completion-question LIVE window, wired as a SIBLING to
       // enterCompletionHold. The executor calls this on a completion stall or an eligible lead
       // request with authoritative unmet milestones, before parking — it authors an
@@ -15043,8 +15046,15 @@ export class RunRunner {
     const progress = this.captureProgressFor(flight, episode);
     this.captureAuthority(flight, Infinity);
     if (progress.wallOutcome !== undefined) return progress.wallOutcome;
-    if (progress.dispositionStarted) return flight.parked ? "parked" : "undeliverable";
-    if (Date.now() >= episode.deadlineAt) return "undeliverable";
+    if (progress.dispositionStarted) {
+      if (flight.parked) return "parked";
+      flight.uncertainWallPark = true;
+      return "undeliverable";
+    }
+    if (Date.now() >= episode.deadlineAt) {
+      flight.uncertainWallPark = true;
+      return "undeliverable";
+    }
     return this.withCaptureDisposition(flight, episode, signal =>
       this.enterWallPark(flight, claim, runLog, {
         ...options, episode, signal, heldAuthenticated: undefined, heldCapture: undefined,

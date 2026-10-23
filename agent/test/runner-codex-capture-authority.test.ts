@@ -61,7 +61,9 @@ for (const site of ["wall", "hold", "recovery"] as const) for (const authority o
     const claim = gitlabClaim(285510 + ["wall", "hold", "recovery"].indexOf(site) * 2 + Number(authority === "fence"));
     api.setCompletionHoldResponse("paused");
     api.setWallParkResponse("paused", 200);
-    await run.execute(claim);
+    let executionError: unknown;
+    await run.execute(claim).catch(error => { executionError = error; });
+    assert.equal(executionError, undefined, "revoked capture unwinds into the canonical control disposition");
     assert.equal(revoked, true, "real registered root settlement crossed the authority boundary");
     assert.equal(source, 0, "revocation precedes source inspection and WIP/import");
     assert.equal(fallbacks, 0, "revocation never authorizes A fallback");

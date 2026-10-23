@@ -76,7 +76,10 @@ for (const site of ["wall", "hold", "recovery"] as const) {
       return rig.capture(ms, action, purpose, signal, attempt);
     });
     const { gitlab } = fakeGitlab();
-    await runnerWith(() => ({ executor }), gitlab, undefined, undefined, { recoveryRetryMs: 1 }).execute(gitlabClaim(285310 + ["wall", "hold", "recovery"].indexOf(site)));
+    let executionError: unknown;
+    await runnerWith(() => ({ executor }), gitlab, undefined, undefined, { recoveryRetryMs: 1 }).execute(gitlabClaim(285310 + ["wall", "hold", "recovery"].indexOf(site)))
+      .catch(error => { executionError = error; });
+    assert.equal(executionError, undefined, "budget exhaustion completes a retained stop without leaking boundary errors");
     assert.equal(expired, true, "expiration was injected into an already-created episode");
     assert.equal(deadline.fired(), 1);
     console.log("EXHAUSTION_RESULT", site, JSON.stringify({ reads, fallbacks, uploads, acknowledgments, headUnchanged: readGit(clone, "rev-parse", "HEAD") === originalHead, status: readGit(clone, "status", "--porcelain"), bytesUnchanged: fs.readFileSync(path.join(clone, "LIFETIME.txt"), "utf8") === bytes }));
@@ -253,5 +256,63 @@ for (const refuseCleanup of [false, true]) {
       assert.ok(sourceSteps > firstSteps!, "capture continues only after cleanup");
       assert.equal(fallbacks, 0);
     }
+  });
+}
+
+for (const site of ["wall", "hold"] as const) {
+  it(`${site}: sink-gate contention consumes the original episode deadline`, async t => {
+    const rig = codexRig();
+    let armed = false, waited = false, source = 0, fallbacks = 0, clone = "";
+    const executor = new FakeCodexExecutor(rig.safety, async ctx => {
+      clone = ctx.worktreePath;
+      fs.writeFileSync(path.join(clone, "QUEUED.txt"), bytes);
+      armed = true;
+      if (site === "hold") {
+        assert.equal(await ctx.enterCompletionHold!("queued capture"), false);
+        return { branch: ctx.branch, completionHeld: { reason: "queued capture" } };
+      }
+      assert.equal(await ctx.parkForWall!({ completedCount: 0 }), "undeliverable");
+      return { branch: ctx.branch, walled: { reason: "queued capture" } };
+    }, undefined, (ms, action, purpose, signal, attempt) => {
+      fallbacks++;
+      return rig.capture(ms, action, purpose, signal, attempt);
+    });
+    const runner = runnerWith(() => ({ executor }), fakeGitlab().gitlab);
+    const seam = runner as unknown as {
+      runGatedSink: (flight: { sinkGate: { run<T>(action: () => Promise<T>): Promise<T> } }, action: () => Promise<unknown>) => Promise<unknown>;
+    };
+    const gated = seam.runGatedSink.bind(runner);
+    t.mock.method(seam, "runGatedSink", async (flight: { sinkGate: { run<T>(action: () => Promise<T>): Promise<T> } }, action: () => Promise<unknown>) => {
+      if (!armed || waited) return gated(flight, action);
+      waited = true;
+      let enter!: () => void, release!: () => void;
+      const entered = new Promise<void>(resolve => { enter = resolve; });
+      const held = new Promise<void>(resolve => { release = resolve; });
+      const blocker = flight.sinkGate.run(async () => { enter(); await held; });
+      await entered;
+      const queued = gated(flight, action);
+      await tick();
+      const expired = Date.now() + 180_001;
+      t.mock.method(Date, "now", () => expired);
+      release();
+      await blocker;
+      return queued;
+    });
+    for (const name of ["worktreeStatus", "commitWipMarker", "fetchAgentBranch"] as const) {
+      const original = git[name].bind(git);
+      t.mock.method(git, name, async (...args: unknown[]) => {
+        if (armed) source++;
+        return Reflect.apply(original, git, args);
+      });
+    }
+    const claim = gitlabClaim(site === "wall" ? 285335 : 285336);
+    await runner.execute(claim);
+    assert.equal(waited, true, "a different live sink owner held the real gate");
+    assert.equal(source, 0, "waiting cannot renew the budget before source work");
+    assert.equal(fallbacks, 0);
+    assert.equal(rig.refreshCalls(), 0, "expired queue admission cannot reconcile");
+    assert.equal(api.wallParkRequests.length + api.completionHoldRequests.length, 0);
+    assert.equal(fs.readFileSync(path.join(clone, "QUEUED.txt"), "utf8"), bytes);
+    assert.equal(readGit(clone, "status", "--porcelain"), "?? QUEUED.txt\n");
   });
 }

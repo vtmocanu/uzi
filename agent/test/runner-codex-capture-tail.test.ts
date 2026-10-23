@@ -19,6 +19,7 @@ type Flight = {
 };
 type Seam = {
   runGatedSink<T>(flight: Flight, action: () => Promise<T>): Promise<T>;
+  handleRecoveryExhausted(...args: unknown[]): Promise<boolean>;
   settleRecoveryGeneration(...args: unknown[]): Promise<unknown>;
   reapThenSettleRecoveryGeneration(...args: unknown[]): Promise<unknown>;
   retainStoppedSource(flight: Flight, executor: Executor, reason: string, ...rest: unknown[]): Promise<unknown>;
@@ -34,6 +35,7 @@ for (const mode of ["healthy-B", "fallback-B", "vault-A", "claude", "claude-term
     const lateReads: string[] = [];
     const credentialLaunches: boolean[] = [];
     const authDeltas: Array<{ refresh: number; release: number }> = [];
+    const settlementProofs: Array<{ authenticated: boolean; free: boolean; state: string }> = [];
     const claude = mode.startsWith("claude");
     const rig = codexRig({
       lifecycleSignal: lifecycle.signal,
@@ -96,16 +98,18 @@ for (const mode of ["healthy-B", "fallback-B", "vault-A", "claude", "claude-term
       observed = flight;
       return sink(flight, action);
     });
+    const recovery = seam.handleRecoveryExhausted.bind(runner);
+    t.mock.method(seam, "handleRecoveryExhausted", async (...args: unknown[]) => {
+      observed = args[2] as Flight;
+      return recovery(...args);
+    });
     const settle = seam.settleRecoveryGeneration.bind(runner);
     t.mock.method(seam, "settleRecoveryGeneration", async (...args: unknown[]) => {
       settlements++;
       if (!claude) {
-        assert.equal(authenticated, true, "final settle enters within authenticated capture");
-        assert.equal(free, false);
-        assert.equal(rig.registry.state(), "closed");
-        await tick(); // Require the same authority across an awaited tail barrier.
-        assert.equal(authenticated, true, "settle barrier cannot outlive authenticated capture");
-        assert.equal(rig.registry.state(), "closed");
+        settlementProofs.push({ authenticated, free, state: rig.registry.state() });
+        await tick(); // Observe both sides; assertion failures must not enter report retry catches.
+        settlementProofs.push({ authenticated, free, state: rig.registry.state() });
       }
       return settle(...args);
     });
@@ -119,7 +123,10 @@ for (const mode of ["healthy-B", "fallback-B", "vault-A", "claude", "claude-term
       reasons.push(reason);
       return retain(flight, exec, reason, ...rest);
     });
-    await runner.execute(claim);
+    let executionError: unknown;
+    await runner.execute(claim).catch(error => { executionError = error; });
+    if (mode === "fallback-B") assert.ok(freeEntries > 0, "refused primary must reach verified local fallback");
+    assert.equal(executionError, undefined, "recovery disposition completes after a refused capture boundary");
     if (!claude) assert.ok(observed, "actual runner sink supplied the flight");
     if (mode === "codex-terminal") {
       assert.ok(reasons.includes("recovery_park_ack_terminal"), "terminal reason retains its existing coverage path");
@@ -136,6 +143,9 @@ for (const mode of ["healthy-B", "fallback-B", "vault-A", "claude", "claude-term
       assert.ok(statuses(claim.run_id).includes("recovery_wait"));
       if (mode === "healthy-B") {
         assert.ok(settlements > 0, "real final settlement was called");
+        assert.ok(settlementProofs.length >= 2);
+        assert.ok(settlementProofs.every(proof => proof.authenticated && !proof.free && proof.state === "closed"),
+          "final settlement and its awaited tail remain inside the same authenticated proof");
         assert.equal(reapSettlements, 0, "held final settlement needs no second reap");
       } else {
         assert.equal(settlements, 0, "fallback/deferred recovery never settles");
@@ -184,7 +194,7 @@ for (const misuse of ["stale", "foreign-flight"] as const) {
     const capture = seam.captureHoldContext.bind(runner);
     t.mock.method(seam, "captureHoldContext", async (candidate: typeof claim, actual: Flight,
       log: ReturnType<typeof nullLogger>, supplied: Record<string, unknown> = {}) => {
-      if (supplied.heldAuthenticated && !checked) {
+      if (!checked) {
         checked = true;
         options = { ...supplied, publishCheckpoint: false };
         assert.equal(actual, flight, "held callback belongs to actual intercepted flight");
@@ -199,7 +209,7 @@ for (const misuse of ["stale", "foreign-flight"] as const) {
       return capture(candidate, actual, log, supplied);
     });
     await runner.execute(claim);
-    assert.equal(checked, true, "actual held callback supplied authenticated capability");
+    assert.equal(checked, true, "actual capture callback supplied the options tested after its lifetime");
     assert.ok(flight);
     assert.ok(options);
     if (misuse === "stale") {

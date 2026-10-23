@@ -250,9 +250,12 @@ for (const site of ["hold", "wall", "recovery"] as const) {
         callbackReached = outcome === "parked";
         return { branch: ctx.branch, walled: { reason: "fixture wall" } };
       }, undefined, capture);
-      await runnerWith(() => ({ executor }), gitlab, undefined, undefined, { recoveryRetryMs: 1 }).execute(claim);
+      let executionError: unknown;
+      await runnerWith(() => ({ executor }), gitlab, undefined, undefined, { recoveryRetryMs: 1 }).execute(claim)
+        .catch(error => { executionError = error; });
       assert.ok(site === "recovery" || callbackReached, "public runner callback completed the park");
-      assert.ok(source.length > 3, "both first source read and final readback were observed");
+      assert.ok(source.length > 3, "healthy capture or refused-primary fallback must actually capture and verify local bytes");
+      assert.equal(executionError, undefined, "refusal completes its local-preservation disposition");
       assert.ok(source.every(event => event.reaped && (refusal === "healthy"
         ? event.authenticated && !event.free && event.state === "closed"
         : event.free && !event.authenticated)), JSON.stringify(source));

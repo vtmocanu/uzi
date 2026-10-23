@@ -17,7 +17,7 @@ const readGit = (tree: string, ...args: string[]) =>
 
 it("no-held capture with publication disabled acquires before its first source read", async t => {
   const rig = codexRig();
-  let direct = false, admitted = false, checked = false, reads = 0;
+  let direct = false, admitted = false, checked = false, completed = false, reads = 0;
   const boundary = rig.safety.withBoundary.bind(rig.safety);
   t.mock.method(rig.safety, "withBoundary", async (request: Parameters<typeof boundary>[0], action: Parameters<typeof boundary>[1]) =>
     boundary(request, async permit => {
@@ -58,6 +58,7 @@ it("no-held capture with publication disabled acquires before its first source r
         const bare = git.barePathFor(fx.originPath);
         assert.equal(result.head, readGit(bare, "rev-parse", "refs/uzi-runner/agent/issue-285370").trim());
         assert.equal(readGit(bare, "show", result.head + ":RESULT.txt"), bytes);
+        completed = true;
       } finally { direct = false; }
     }
     return gated(flight, action);
@@ -65,6 +66,7 @@ it("no-held capture with publication disabled acquires before its first source r
   api.setCompletionHoldResponse("paused");
   await runner.execute(claim);
   assert.equal(checked, true, "the real flight reached the intercepted sink");
+  assert.equal(completed, true, "the direct capture assertions completed, rather than being swallowed by runner failure dispatch");
   assert.equal(reads, 1, "the direct capture read actual source");
 });
 
