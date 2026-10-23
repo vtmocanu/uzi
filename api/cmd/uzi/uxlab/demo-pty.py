@@ -64,13 +64,18 @@ class Screen:
     def csi(self, body, op):
         if op in ("m", "q"):  # SGR / cursor shape / version query
             return
-        if op == "u" and body == "?":  # no enhanced keyboard protocol
-            self.reply(b"\x1b[?0u")
+        if op == "u" and body in ("?", ">1"):
+            # Legacy-keyboard terminal: ignore the enhancement push and do not
+            # advertise Kitty support in response to its query. Neither command
+            # changes the displayed cells; the driver sends legacy key bytes.
             return
         if op == "p" and body in ("?2026$", "?2027$"):
             # Synchronized output supported but reset; grapheme mode unavailable.
             mode, state = (2026, 2) if body == "?2026$" else (2027, 0)
             self.reply(f"\x1b[?{mode};{state}$y".encode())
+            return
+        if op == "W" and body == "?5":  # DECST8C: tab stops every 8 columns
+            # Screen.feed already models HT with this fixed tab-stop layout.
             return
         private = body.startswith(("?", ">"))
         raw = body.lstrip("?>")

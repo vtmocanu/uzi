@@ -24,9 +24,13 @@ func TestWorkersDemoFleet(t *testing.T) {
 		t.Fatal("demo healthy busy worker needs retained source and no owner decisions")
 	}
 	m := workersScene(true, "workers-list-120")
-	want := "workers · 9 · 8 online · 5/12 run slots in use +1 ?cap · 0/? cross-checks · 1 holding · 1 draining · 7 need attention"
-	if got := stripANSI(m.workersSummary(120, false)); got != want {
+	want := "workers · 9 · 8 online · 5/12 run slots in use +1 ?cap · 0/? cross-checks · 4 cordoned (manual) · 1 holding · 1 draining · 7 need attention"
+	if got := stripANSI(m.workersSummary(300, false)); got != want {
 		t.Fatalf("summary %q", got)
+	}
+	compact := "workers · 9 · 8 online · 5/12 run slots in use · 0/? cross-checks · 4 cordoned (manual) · 7 need attention"
+	if got := stripANSI(m.workersSummary(120, false)); got != compact {
+		t.Fatalf("120-column summary %q", got)
 	}
 	if title := m.workerFleetTitleLines("▚▚ uzi · floor", false); !strings.Contains(stripANSI(title[0]), "need attention") {
 		t.Fatal("compact floor title omitted attention", title)
