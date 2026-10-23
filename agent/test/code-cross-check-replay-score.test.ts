@@ -54,7 +54,7 @@ test("a path-set defect without a line range matches by keyword on any listed pa
   assert.equal(defectScore(g, "d-a", "D2").matched, 1);
 });
 
-test("a single generic word does not match a tightened defect pattern; a defect-specific finding does", () => {
+test("scoring applies inline keyword patterns with word-level context (not the committed corpus patterns)", () => {
   const tight: ScoreCorpus = {
     ...corpus,
     cases: [{ id: "d-t", kind: "defect", input_provenance: "reconstructed", expected: [expected({

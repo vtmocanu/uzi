@@ -78,9 +78,11 @@ CI needs a maintainer workflow change outside this corpus.
 ## Scoring limits
 
 Expected-defect matching (path, line, keyword) is a scoring proxy, not proof that a finding correctly
-diagnosed the defect. The match patterns were tightened to require a defect-specific combination of terms rather than one generic word (still a proxy). The expected list is not exhaustive. Unmatched and control findings are
-unadjudicated, never confirmed false positives. The maintainer reviews the private findings and may
-supply an adjudication file before verified false-positive counts are published.
+diagnosed the defect. The match patterns require a defect-specific combination of terms with word
+boundaries rather than one generic word; they are still a proxy, and a correct finding phrased
+differently can still be missed. The expected list is not exhaustive. Unmatched and control findings
+are unadjudicated, never confirmed false positives. The maintainer reviews the private findings and
+may supply an adjudication file before verified false-positive counts are published.
 
 ## Replacing a case
 

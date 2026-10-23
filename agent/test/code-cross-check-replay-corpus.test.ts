@@ -9,9 +9,10 @@ import path from "node:path";
 import { after, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
-  CORPUS_DIR, CORPUS_MANIFEST_SHA256, loadReplayCorpus, replayGit, verifyCasePins,
+  CORPUS_DIR, CORPUS_MANIFEST_SHA256, findingMatches, loadReplayCorpus, replayGit, verifyCasePins,
   type ReplayCase, type ReplayCorpus,
 } from "../src/code-cross-check-replay.js";
+import type { CodeFinding } from "../src/code-cross-check-contract.js";
 
 const CHECKOUT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const CASE_IDS = ["d-2888", "d-3063", "d-2887", "c-2904", "c-2926", "c-3063"];
@@ -95,6 +96,42 @@ describe("committed replay corpus (hermetic)", () => {
     assert.equal(c.expected[0]!.in_diff, true);
     assert.ok(removedLines(c.removedPatch).some((l) => l.includes(literal)));
     assert.ok(added(c.prefixPatch).some((l) => l.includes(literal)));
+  });
+
+  it("committed match patterns accept defect-specific phrasings and reject generic ones", () => {
+    const CASES: Array<[string, string, string[], string[]]> = [
+      ["d-2888", "D3", [
+        "Awaited reader.cancel() can hang when the source never settles",
+        "cancellation never settles, so the overflow error never reaches the caller",
+        "Overflow error can be masked: cancel() promise may not resolve",
+      ], [
+        "AbortController cancel path is missing a test for this change",
+        "This change drops the retry; cancel requests are not logged",
+        "Request cancellation is not propagated to the unchanged poller",
+        "reader.cancel() in the finally block is correct cleanup",
+        "readBoundedText could use a comment",
+      ]],
+      ["d-2887", "D1", [
+        "No test covers cleanup failure when removing the failed scratch root; the original normalization error could be replaced",
+        "rmSync failure during cleanup would mask the original chown error",
+      ], [
+        "Consider removing the unused import; it fails lint",
+        "cleanup could be simplified",
+      ]],
+      ["d-3063", "D4", [
+        "ids is optional, so a grouped file request can omit ids",
+      ], [
+        "FindingGroupFileRequest could use a doc comment",
+        "send_to_uzi flag on the group request is undocumented",
+      ]],
+    ];
+    for (const [caseId, defectId, positives, negatives] of CASES) {
+      const d = byId(caseId).expected.find((e) => e.id === defectId)!;
+      // Off the line range, so only the keyword patterns decide.
+      const of = (title: string): CodeFinding => ({ id: "F1", severity: "major", path: d.paths[0]!, line: 1, title, detail: "" });
+      for (const p of positives) assert.equal(findingMatches(d, of(p)), true, `${defectId} should match: ${p}`);
+      for (const n of negatives) assert.equal(findingMatches(d, of(n)), false, `${defectId} should not match: ${n}`);
+    }
   });
 
   it("D1: the cleanup-failure test exists only in the removed hunks", () => {

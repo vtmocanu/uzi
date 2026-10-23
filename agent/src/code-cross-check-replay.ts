@@ -25,7 +25,7 @@ const replayLog: Logger = {
 
 export const CORPUS_DIR = "fixtures/code-cross-check-replay";
 /** Source-pinned sha256 of fixtures/code-cross-check-replay/manifest.json. Re-pin when the corpus changes. */
-export const CORPUS_MANIFEST_SHA256 = "6a17a098884ad0942eb1c0f1a820a6ccbba01fa02a0d8584183134b516123f4e";
+export const CORPUS_MANIFEST_SHA256 = "940db1d7ffba8515370bc581af4224644545dfd60d21c6449a2f5d0e94156f3a";
 export const REPLAY_DIFF_ARGS = ["--no-ext-diff", "--no-textconv", "--no-color", "--abbrev=8"] as const;
 const REPLAY_IDENTITY = { name: "uzi replay", email: "replay@uzi.invalid", date: "2026-01-01T00:00:00Z" } as const;
 export const READER_IMPLEMENTATION = { codex: "codex fileop Read+Search", claude: "claude sdk Read+Grep+Glob" } as const;
@@ -741,7 +741,7 @@ const invalidRecords = (): never => { throw new ReplayError("records_invalid"); 
 
 const SCORING_NOTE = "expected-defect matching is a proxy; unadjudicated findings are not confirmed false positives";
 
-function findingMatches(d: ExpectedDefect, f: CodeFinding): boolean {
+export function findingMatches(d: ExpectedDefect, f: CodeFinding): boolean {
   if (!d.paths.includes(f.path)) return false;
   if (d.use_line_range && d.line_range && f.line >= d.line_range[0] && f.line <= d.line_range[1]) return true;
   const text = `${f.title}\n${f.detail}`;

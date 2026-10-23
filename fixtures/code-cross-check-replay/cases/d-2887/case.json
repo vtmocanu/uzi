@@ -36,9 +36,9 @@
       "line_range": null,
       "use_line_range": false,
       "match": [
-        "cleanup[\\s\\S]*(fail|error|throw)",
-        "(rmSync|remov)[\\s\\S]*(fail|error|throw|precedence)",
-        "(original|normali[sz]ation) error"
+        "\\b(?:cleanup|rmSync|remov\\w*)\\b[\\s\\S]*\\b(?:fail\\w*|throw\\w*|error)\\b[\\s\\S]*\\b(?:original|normali[sz]\\w*|mask\\w*|replac\\w*|precedence|swallow\\w*)",
+        "\\b(?:original|normali[sz]ation)\\s+error\\b[\\s\\S]*\\b(?:cleanup|remov\\w*|rmSync)",
+        "\\b(?:no|missing|lacks?|untested)\\b[\\s\\S]*\\btest[\\s\\S]*\\b(?:cleanup|remov\\w*|rmSync)\\b[\\s\\S]*\\bfail"
       ],
       "detectability": "read_only",
       "rationale": "Test gap: nothing pins that the original normalization error survives when removing the failed scratch root also fails.",
