@@ -381,3 +381,24 @@ describe("produceRecoveryBundle — leakage & size bounds (PRD #1296 D5/D6)", ()
     );
   });
 });
+
+describe("produceRecoveryBundle — transient ref cleanup after recovery abort (#3031 S)", () => {
+  it("deletes the transient recovered-source ref even when the recovery signal aborts after it is created", async t => {
+    const outPath = path.join(topo.base, "aborted.bundle");
+    const controller = new AbortController();
+    let sawRef = false;
+    const owner = cache as unknown as { streamBundleWithCap: (...args: unknown[]) => Promise<void> };
+    t.mock.method(owner, "streamBundleWithCap", async () => {
+      // The ref exists in the persistent bare at bundle-create time; abort the recovery signal here.
+      sawRef = git(topo.workerBare, ["for-each-ref", "--format=%(refname)", RECOVERY_BUNDLE_REF]) === RECOVERY_BUNDLE_REF;
+      controller.abort(new Error("recovery shutdown"));
+      throw new Error("bundle create interrupted");
+    });
+    await assert.rejects(() => cache.produceRecoveryBundle(topo.workerBare, {
+      sourceSha: topo.headSha, outPath, forgeTip: topo.baseSha,
+    }, controller.signal));
+    assert.equal(sawRef, true, "the transient ref was created before the abort");
+    assert.equal(git(topo.workerBare, ["for-each-ref", "--format=%(refname)", RECOVERY_BUNDLE_REF]), "",
+      "the transient ref does not outlive the aborted operation");
+  });
+});

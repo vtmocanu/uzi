@@ -13156,7 +13156,14 @@ try {
         await fs.rm(opts.outPath, { force: true });
         throw err;
       } finally {
-        await this.tryGit(barePath, ["update-ref", "-d", RECOVERY_BUNDLE_REF]);
+        // Still under the bare lock. An aborted recovery signal would make execScoped refuse every
+        // Git child, leaving the transient ref (and the objects it keeps reachable) in the
+        // persistent bare, so the one delete leaves that scope and runs under its own bounded one.
+        try {
+          await this.recoveryOperations.exit(() => this.withRecoveryOperation(
+            new AbortController().signal, Date.now() + RETAINED_OP_DEADLINE_MS,
+            () => this.tryGit(barePath, ["update-ref", "-d", RECOVERY_BUNDLE_REF])));
+        } catch { /* a failed delete keeps the previous best-effort behaviour */ }
       }
       // Stream the produced file to compute size + SHA-256 without buffering the whole
       // (up to 64 MiB) bundle in memory.
