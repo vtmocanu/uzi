@@ -64,6 +64,13 @@ func TestManualCordonMountedActualBodyBoundLiveDB(t *testing.T) {
 				name := fmt.Sprintf("%s/length=%d/bytes=%d/%s", method, length, len(body), body[:min(len(body), 12)])
 				t.Run(name, func(t *testing.T) {
 					id, _ := manualCordonSeedWorker(t, pool, owner, "external", false)
+					path := "/api/workers/" + id.String() + "/cordon"
+					initialEvents := 0
+					if method == http.MethodDelete {
+						manualCordonWorkerResponse(t, bearerReqBody(router, http.MethodPost, path, token, `{"reason":"retain malformed DELETE evidence"}`), id)
+						initialEvents = 1
+					}
+					before := manualCordonStateSnapshot(t, pool, id)
 					req := httptest.NewRequest(method, "/api/workers/"+id.String()+"/cordon", strings.NewReader(body))
 					req.ContentLength = length
 					req.Header.Set("Authorization", "Bearer "+token)
@@ -77,14 +84,16 @@ func TestManualCordonMountedActualBodyBoundLiveDB(t *testing.T) {
 						t.Fatalf("actual body bound/shape response=%d %s want=%d", rec.Code, rec.Body.String(), want)
 					}
 					if want == 400 {
-						manualCordonEventCounts(t, pool, id, 0, 0)
-						var cordoned bool
-						if err := pool.QueryRow(context.Background(), "SELECT manual_cordoned_at IS NOT NULL FROM workers WHERE id=$1", id).Scan(&cordoned); err != nil {
-							t.Fatal(err)
+						manualCordonEventCounts(t, pool, id, initialEvents, 0)
+						if after := manualCordonStateSnapshot(t, pool, id); after != before {
+							t.Fatal("invalid body changed manual tuple or audit rows")
 						}
-						if cordoned {
-							t.Fatal("invalid body changed worker")
+					} else if method == http.MethodDelete {
+						w := manualCordonWorkerResponse(t, rec, id)
+						if w.ManualCordonedAt != nil || w.ManualCordonedBy != nil || w.ManualCordonedByLabel != nil || w.ManualCordonReason != nil {
+							t.Fatal("valid DELETE retained manual tuple")
 						}
+						manualCordonEventCounts(t, pool, id, 1, 1)
 					}
 				})
 			}

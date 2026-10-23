@@ -2442,7 +2442,9 @@ WHERE run.id = $9
 )
 SELECT COALESCE(bool_or(own_worker AND automatic_hold), false)::boolean AS automatic_owner_hold,
        count(*) FILTER (WHERE strict_candidate AND heartbeat_recent AND online AND NOT hard_fenced AND affinity AND strict_binding)::bigint AS strict_eligible,
-       count(*) FILTER (WHERE strict_candidate AND heartbeat_recent AND online AND NOT hard_fenced AND (accepts_intake OR own_worker) AND affinity AND free_slot AND advisory_binding)::bigint AS claimable,
+       -- Legacy advisory availability deliberately ignores status and affinity.
+       count(*) FILTER (WHERE strict_candidate AND heartbeat_recent AND NOT hard_fenced AND (accepts_intake OR own_worker) AND free_slot AND advisory_binding)::bigint AS claimable,
+       count(*) FILTER (WHERE strict_candidate AND heartbeat_recent AND online AND NOT hard_fenced AND own_worker AND affinity AND free_slot AND advisory_binding)::bigint AS assigned_claimable,
        count(*) FILTER (WHERE strict_candidate AND heartbeat_recent AND online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::bigint AS draining_eligible,
        count(*) FILTER (WHERE strict_candidate AND heartbeat_recent AND online AND accepts_intake AND affinity AND strict_binding)::bigint AS non_draining_eligible,
        count(*) FILTER (WHERE strict_candidate AND heartbeat_recent AND online AND draining_since IS NOT NULL AND own_worker AND affinity AND strict_binding)::bigint AS suitable_own_draining,
@@ -2482,6 +2484,7 @@ type CountOnlineWorkersClaimableForRunRow struct {
 	AutomaticOwnerHold          bool               `json:"automatic_owner_hold"`
 	StrictEligible              int64              `json:"strict_eligible"`
 	Claimable                   int64              `json:"claimable"`
+	AssignedClaimable           int64              `json:"assigned_claimable"`
 	DrainingEligible            int64              `json:"draining_eligible"`
 	NonDrainingEligible         int64              `json:"non_draining_eligible"`
 	SuitableOwnDraining         int64              `json:"suitable_own_draining"`
@@ -2537,6 +2540,7 @@ func (q *Queries) CountOnlineWorkersClaimableForRun(ctx context.Context, arg Cou
 		&i.AutomaticOwnerHold,
 		&i.StrictEligible,
 		&i.Claimable,
+		&i.AssignedClaimable,
 		&i.DrainingEligible,
 		&i.NonDrainingEligible,
 		&i.SuitableOwnDraining,

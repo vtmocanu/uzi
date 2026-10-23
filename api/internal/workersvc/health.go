@@ -566,19 +566,22 @@ func (s *Service) healthTargetFor(ctx context.Context, now time.Time, r store.Li
 			_, stalePinned := s.staleRequeuePin(now, r)
 			_, ownerHeld := s.ownerHold(now, r)
 			manualBlocked := false
+			var projection *healthEligibilityResult
 			if !stalePinned && !ownerHeld {
 				counts, err := s.workerEligibilityForHealth(ctx, now, r.ID, s.capabilityAwareOn(ctx))
-				manualBlocked = err == nil && manualCordonWaitReason(counts) != ""
+				projection = &healthEligibilityResult{counts: counts, err: err}
+				manualBlocked = (err == nil && manualCordonWaitReason(counts) != "") ||
+					(err != nil && r.HealthReason.Valid && isManualCordonWaitReason(r.HealthReason.String))
 			}
 			if stalePinned || ownerHeld || manualBlocked {
 				// Only a persistent hold warrants the prerequisite ladder before
 				// the age threshold; unrelated young runs retain the cheap path.
-				reason := s.queuedReasonBeforeAge(ctx, now, r, th, true)
+				reason := s.queuedReasonWithEligibility(ctx, now, r, th, true, projection)
 				if isManualCordonWaitReason(reason) || isStaleRequeuePinReason(reason) {
 					return healthWaitingWorker, reason
 				}
 			}
-			return s.earlyDockerAllowlistTarget(ctx, now, r, th)
+			return s.earlyDockerAllowlistTarget(ctx, now, r, th, projection)
 		}
 		// Every queued-past-threshold reason is resolved in queuedReason, most-fundamental
 		// first (vault-lock, no online worker, no capability-eligible worker, priority-class
@@ -1127,6 +1130,16 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 // queuedReasonBeforeAge shares prerequisite and manual evidence ordering with the
 // ordinary ladder. early stops before transient fleet diagnostics for young runs.
 func (s *Service) queuedReasonBeforeAge(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds, early bool) string {
+	return s.queuedReasonWithEligibility(ctx, now, r, th, early, nil)
+}
+
+// healthEligibilityResult belongs to one evaluation, including a failed read.
+type healthEligibilityResult struct {
+	counts store.CountOnlineWorkersClaimableForRunRow
+	err    error
+}
+
+func (s *Service) queuedReasonWithEligibility(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds, early bool, projection *healthEligibilityResult) string {
 	// PRD #400 Decision 6 / issue #1367: an undispatched task run (its uzi/task/<id> branch
 	// push or dispatch never landed) is NOT waiting for a worker — ClaimRun never offers it
 	// (kind<>'task' OR dispatched_at IS NOT NULL), so none of the fleet reasons below is the
@@ -1191,7 +1204,11 @@ func (s *Service) queuedReasonBeforeAge(ctx context.Context, now time.Time, r st
 	// remain visible alongside an automatic owner hold, but a claimable continuation
 	// is not blocked by either soft intent.
 	capAware := s.capabilityAwareOn(ctx)
-	eligibility, eligibilityErr := s.workerEligibilityForHealth(ctx, now, r.ID, capAware)
+	if projection == nil {
+		counts, err := s.workerEligibilityForHealth(ctx, now, r.ID, capAware)
+		projection = &healthEligibilityResult{counts: counts, err: err}
+	}
+	eligibility, eligibilityErr := projection.counts, projection.err
 	until, held := s.ownerHold(now, r)
 	if eligibilityErr == nil {
 		if reason := manualCordonWaitReason(eligibility); reason != "" {
@@ -1201,11 +1218,16 @@ func (s *Service) queuedReasonBeforeAge(ctx context.Context, now time.Time, r st
 			return reason
 		}
 	}
-	if held && (eligibilityErr != nil || eligibility.ManualCordoned == 0 || eligibility.AutomaticOwnerHold) {
+	if held && (eligibilityErr != nil || (eligibility.AssignedClaimable == 0 && (eligibility.ManualCordoned == 0 || eligibility.AutomaticOwnerHold))) {
 		return ownerHoldReason(until, r.StaleRequeueWorkerName)
 	}
 	if until, pinned := s.staleRequeuePin(now, r); pinned {
 		return staleRequeuePinReason(until, r.StaleRequeueWorkerName)
+	}
+	if eligibilityErr != nil && r.HealthReason.Valid && isManualCordonWaitReason(r.HealthReason.String) {
+		// A failed projection cannot prove that the prior manual block ended.
+		// Account prerequisites and genuine owner holds above retain priority.
+		return r.HealthReason.String
 	}
 	if early {
 		return ""
@@ -1683,7 +1705,7 @@ func (s *Service) repoNotDockerAllowedReason(ctx context.Context, ownerID uuid.U
 // is eligible for the repo, and queuedReason resolves to the docker-allowlist reason (so
 // every more-fundamental rung still wins); every other path, including any probe read error (an owner-lookup failure still shows the Member wording),
 // returns (healthOK, "").
-func (s *Service) earlyDockerAllowlistTarget(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds) (string, string) {
+func (s *Service) earlyDockerAllowlistTarget(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds, projection *healthEligibilityResult) (string, string) {
 	if !r.RepoID.Valid || r.EgressProfileID.Valid || s.dockerAllowlist == nil {
 		return healthOK, ""
 	}
@@ -1715,7 +1737,7 @@ func (s *Service) earlyDockerAllowlistTarget(ctx context.Context, now time.Time,
 	if elig != 0 {
 		return healthOK, ""
 	}
-	if reason := s.queuedReason(ctx, now, r, th); isRepoNotDockerAllowedReason(reason) {
+	if reason := s.queuedReasonWithEligibility(ctx, now, r, th, false, projection); isRepoNotDockerAllowedReason(reason) {
 		return healthWaitingWorker, reason
 	}
 	return healthOK, ""

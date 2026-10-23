@@ -17,7 +17,7 @@ func isManualCordonWaitReason(reason string) bool {
 }
 
 func manualCordonWaitReason(counts store.CountOnlineWorkersClaimableForRunRow) string {
-	if counts.ManualSuitable == 0 || counts.ManualSuitable != counts.ManualCordoned || counts.Claimable > 0 {
+	if counts.ManualSuitable == 0 || counts.ManualSuitable != counts.ManualCordoned || counts.AssignedClaimable > 0 {
 		return ""
 	}
 	var evidence struct {
