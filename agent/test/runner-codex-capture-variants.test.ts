@@ -58,6 +58,20 @@ for (const free of [false, true]) {
         return QUIESCENT;
       } },
     });
+    if (free) {
+      const runner = f.runner as unknown as {
+        captureRecoveryRestorePoint: (...args: any[]) => Promise<unknown>;
+      };
+      const capture = runner.captureRecoveryRestorePoint.bind(f.runner);
+      t.mock.method(runner, "captureRecoveryRestorePoint", async (...args: any[]) => {
+        const [claim, flight, log, site, options] = args;
+        if (!options.credentialFree) return capture(...args);
+        assert.ok(options.heldCapture, "existing A owner supplies the real held-free capability");
+        // Exercise the held-free terminalDisk helper directly. The typed B-to-A
+        // handoff deliberately does not carry terminalDisk into the A episode.
+        return capture(claim, flight, log, site, { ...options, terminalDisk: true });
+      });
+    }
     await f.runner.execute(f.claim);
     assert.equal(f.calls(), 1);
     assert.equal(parks().length, 1);

@@ -1648,6 +1648,9 @@ for (const wip of [false, true]) {
         fs.writeFileSync(path.join(source.clonePath, ".git", "info", "attributes"),
           "README.md filter=successorproof\n");
         // Real Git reachability control in the owned predecessor fixture, then clear.
+        // Force materialization: --force can skip filters when index stat data matches.
+        fs.unlinkSync(path.join(source.clonePath, "work.txt"));
+        fs.unlinkSync(path.join(source.clonePath, "README.md"));
         git(source.clonePath, ["checkout", "--force", "HEAD", "--", "work.txt", "README.md"]);
         assert.ok(fs.readFileSync(filter.marker, "utf8").includes(source.clonePath), "local filter control executed");
         assert.ok(fs.readFileSync(hook.marker, "utf8").includes(source.clonePath), "local hook control executed");
