@@ -671,42 +671,52 @@ func TestCheckpointCoordinatesClaimCompatibilityLiveDB(t *testing.T) {
 
 func TestCheckpointCoordinatesTerminalNewLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
-	for _, mode := range []string{"new branch and tip", "unsupported lineage", "unknown write"} {
+	for _, mode := range []string{"new issue iid and tip", "enrolled task", "unenrolled task", "unsupported lineage", "unknown write"} {
 		t.Run(mode, func(t *testing.T) {
 			f := newCustodyContinuationFixture(t, env)
-			id := seedCoordinateTask(f)
-			env.exec("UPDATE runs SET branch='feature/before' WHERE id=$1", id)
-			branch := "uzi/task/" + id.String()
+			var id uuid.UUID
+			var wantBranch, wantState string
 			var tip any = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-			if mode == "unsupported lineage" {
-				branch = "feature/unsupported"
+			switch mode {
+			case "new issue iid and tip":
+				id = f.seedRun("running", 0)
+				env.exec("UPDATE runs SET issue_iid=41 WHERE id=$1", id)
+				// A stale own-row lookup sees IID 41; NEW must yield this literal.
+				wantBranch, wantState = "agent/issue-42", "settling"
+				env.exec("UPDATE runs SET status='failed',issue_iid=42,checkpoint_tip=$2 WHERE id=$1", id, tip)
+			case "enrolled task":
+				run := claimCoordinateTask(t, f)
+				id = run.ID
+				wantBranch, wantState = "uzi/task/"+id.String(), "retained"
+				// Keep the frozen branch intact and publish only the terminal tip.
+				env.exec("UPDATE runs SET status='failed',checkpoint_tip=$2 WHERE id=$1", id, tip)
+			default:
+				id = seedCoordinateTask(f)
+				env.exec("UPDATE runs SET branch='feature/before' WHERE id=$1", id)
+				branch := "uzi/task/" + id.String()
+				if mode == "unsupported lineage" {
+					branch = "feature/unsupported"
+				}
+				if mode == "unknown write" {
+					tip = nil
+				}
+				env.exec("UPDATE runs SET status='failed',branch=$2,checkpoint_tip=$3 WHERE id=$1", id, branch, tip)
 			}
-			if mode == "unknown write" {
-				tip = nil
+			var branch, gotTip, ref, state string
+			err := env.pool.QueryRow(env.ctx, "SELECT branch,tip,ref,state FROM checkpoint_retentions WHERE run_id=$1", id).
+				Scan(&branch, &gotTip, &ref, &state)
+			if wantBranch == "" {
+				if !errors.Is(err, pgx.ErrNoRows) {
+					t.Fatalf("unenrolled/unsupported/unknown retention: branch=%q err=%v", branch, err)
+				}
+				return
 			}
-			env.exec("UPDATE runs SET status='failed',branch=$2,checkpoint_tip=$3 WHERE id=$1", id, branch, tip)
-			var keys []string
-			rows, err := env.pool.Query(env.ctx, "SELECT branch FROM checkpoint_retentions WHERE run_id=$1", id)
 			if err != nil {
 				t.Fatal(err)
 			}
-			for rows.Next() {
-				var key string
-				if err := rows.Scan(&key); err != nil {
-					t.Fatal(err)
-				}
-				keys = append(keys, key)
-			}
-			rows.Close()
-			if err := rows.Err(); err != nil {
-				t.Fatal(err)
-			}
-			if mode == "new branch and tip" {
-				if len(keys) != 1 || keys[0] != branch {
-					t.Fatalf("NEW retention keys=%v", keys)
-				}
-			} else if len(keys) != 0 {
-				t.Fatalf("unsupported/unknown became durable: %v", keys)
+			if branch != wantBranch || gotTip != tip || ref != "refs/uzi-checkpoints/"+wantBranch || state != wantState {
+				t.Fatalf("NEW retention=(%q,%q,%q,%q) want=(%q,%q,%q,%q)",
+					branch, gotTip, ref, state, wantBranch, tip, "refs/uzi-checkpoints/"+wantBranch, wantState)
 			}
 		})
 	}
@@ -722,9 +732,11 @@ func TestCheckpointCoordinatesGuardedDownLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = provider.ApplyVersion(env.ctx, 352, false)
-	if err == nil || !strings.Contains(err.Error(), "cannot downgrade with enrolled checkpoint coordinates") {
-		t.Fatalf("guarded Down: %v", err)
+	for _, version := range []int64{354, 352} {
+		_, err = provider.ApplyVersion(env.ctx, version, false)
+		if err == nil || !strings.Contains(err.Error(), "cannot downgrade with enrolled checkpoint coordinates") {
+			t.Fatalf("guarded Down %d: %v", version, err)
+		}
 	}
 	persisted := mustRun(t, env, run.ID)
 	if string(persisted.CheckpointCoordinates) != string(run.CheckpointCoordinates) {
