@@ -34,3 +34,70 @@ for (const site of ["wall", "hold", "recovery"] as const) {
     proof.assertProof(true, true);
   });
 }
+
+// The native ChildProcess seam sees both spawn and execFile (including the
+// promisified execFile captured by GitCache at module initialization). Counting
+// only facade requests would miss a new child that silently uses the legacy path.
+for (const site of ["wall", "hold", "recovery"] as const) for (const fallback of [false, true]) {
+  it(`${site} ${fallback ? "fallback" : "healthy"}: every native capture child consumes a scoped launch`, async t => {
+    const { ChildProcess } = await import("node:child_process");
+    const { codexRig } = await import("./runner-codex-sinks-fixture.js");
+    type NativeOptions = { file: string; args: string[]; cwd?: string };
+    const prototype = ChildProcess.prototype as unknown as { spawn(options: NativeOptions): number };
+    const native = prototype.spawn;
+    const tickets = new Map<string, number>();
+    const unowned: string[] = [];
+    let armed = false, depth = 0, launches = 0, clone = "";
+    const key = (file: string, args: readonly string[], cwd?: string) => JSON.stringify([file, args, String(cwd ?? "")]);
+    const rig = codexRig({ blockReconcile: fallback, boundaryProcess: request => {
+      if (armed && depth > 0) {
+        const requestKey = key(request.argv[0]!, request.argv.slice(1), request.cwd);
+        tickets.set(requestKey, (tickets.get(requestKey) ?? 0) + 1);
+      }
+      return undefined;
+    } });
+    t.mock.method(prototype, "spawn", function(this: InstanceType<typeof ChildProcess>, options: NativeOptions) {
+      if (armed && depth > 0) {
+        launches++;
+        const requestKey = key(options.file, options.args.slice(1), options.cwd);
+        const remaining = tickets.get(requestKey) ?? 0;
+        if (remaining === 0) {
+          unowned.push(path.basename(options.file));
+        }
+        else if (remaining === 1) tickets.delete(requestKey);
+        else tickets.set(requestKey, remaining - 1);
+      }
+      return Reflect.apply(native, this, [options]);
+    });
+    const executor = new FakeCodexExecutor(rig.safety, async ctx => {
+      clone = ctx.worktreePath;
+      fs.writeFileSync(path.join(clone, "ALL-CHILDREN.txt"), "all capture launches supervised\n");
+      armed = true;
+      if (site === "recovery") throw new TransientRecoveryError("native seam capture");
+      if (site === "hold") {
+        await ctx.enterCompletionHold!("native seam hold");
+        return { branch: ctx.branch, completionHeld: { reason: "native seam hold" } };
+      }
+      await ctx.parkForWall!({ completedCount: 0 });
+      return { branch: ctx.branch, walled: { reason: "native seam wall" } };
+    }, undefined, rig.capture);
+    api.setCompletionHoldResponse("paused");
+    api.setWallParkResponse("paused", 200);
+    const runner = runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined, { recoveryRetryMs: 1 });
+    const helper = site === "wall" ? "enterWallPark" : site === "hold" ? "enterCompletionHold" : "handleRecoveryExhausted";
+    const internal = runner as unknown as Record<typeof helper, (...args: unknown[]) => Promise<unknown>>;
+    const original = internal[helper].bind(runner);
+    // Scope the independent native observation to the actual B capture/disposition
+    // helper, including its admission, records and tail. Unrelated execute-result
+    // owed-candidate bookkeeping has its own policy and is outside this interval.
+    t.mock.method(internal, helper, async (...args: unknown[]) => {
+      depth++;
+      try { return await original(...args); } finally { depth--; }
+    });
+    await runner.execute(gitlabClaim(285530 + ["wall", "hold", "recovery"].indexOf(site) * 2 + Number(fallback)));
+    assert.ok(launches > 0, "native child creation was observed independently of facade calls");
+    assert.equal(unowned.length, 0, `first child bypassing its scoped spawner: ${unowned[0] ?? "none"}`);
+    assert.equal(tickets.size, 0, "each scoped Git launch reached exactly one native child");
+    assert.equal(fs.readFileSync(path.join(clone, "ALL-CHILDREN.txt"), "utf8"), "all capture launches supervised\n");
+  });
+}
