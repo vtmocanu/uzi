@@ -152,16 +152,17 @@ LOG="$(mktemp "${TMPDIR:-/tmp}/uzi-store-it-log.XXXXXX")" || {
   echo "run-store-it: mktemp failed" >&2
   exit 1
 }
-# Keep local LiveDB deadlines bounded per package. With artifact admission coverage,
-# workersvc takes nearly 18m in isolation and integrated sweeps exceeded 20m (#2866),
-# so give it 30m of headroom; handler retains 20m. This changes no test selection or
-# race/skip checks and is not a speedup. Reset other packages to 10m each iteration.
+# Keep local LiveDB deadlines bounded per package. The integrated #3120 sweep
+# exhausted workersvc's cumulative 30m budget before completion (the last test
+# passes in isolation); allow 45m for the complete inventory. Handler retains 20m.
+# Test selection, assertions, race/skip checks and package serialization stay the
+# same. This is not a speedup. Reset other packages to 10m each iteration.
 for p in "${PKGS[@]}"; do
   timeout=10m
   if [ "$p" = "./internal/handler/..." ]; then
     timeout=20m
   elif [ "$p" = "./internal/workersvc/..." ]; then
-    timeout=30m
+    timeout=45m
   fi
   UZI_TEST_DATABASE_URL="$DSN" go test -buildvcs=false -count=1 -v -race -p 1 \
     -timeout "$timeout" -run 'LiveDB$' "$p" 2>&1 | tee -a "$LOG"
@@ -190,16 +191,21 @@ rm -f "$LOG"
 # This opt-in leg shares the live throwaway DSN but is outside the LiveDB name
 # filter. Existing Go-only CI lanes neither require Node nor prove this composition.
 if [ -n "${UZI_CODEX_REFRESH_LOSTREPLY_E2E:-}" ]; then
-  E2E_LOG="$(mktemp "${TMPDIR:-/tmp}/codex-refresh-lostreply-log.XXXXXX")"
+  E2E_LOG="$(mktemp "${TMPDIR:-/tmp}/codex-recovery-log.XXXXXX")"
   UZI_TEST_DATABASE_URL="$DSN" go test -buildvcs=false -count=1 -v -race -p 1 \
-    -run '^TestCodexRefreshLostReplyE2E$' ./internal/handler/... 2>&1 | tee "$E2E_LOG"
+    -run '^TestCodex(RefreshLostReply|RetainedStop)E2E$' ./internal/handler/... 2>&1 | tee "$E2E_LOG"
   # A named RUN and PASS are mandatory; inspect all indentation levels for skips.
-  if ! grep -q '^=== RUN   TestCodexRefreshLostReplyE2E$' "$E2E_LOG" ||
-    ! grep -q '^--- PASS: TestCodexRefreshLostReplyE2E ' "$E2E_LOG" ||
-    grep -q -- '--- SKIP:' "$E2E_LOG"; then
-    echo "combined Codex proof did not run and pass without skips: $E2E_LOG" >&2
+  if grep -q -- '--- SKIP:' "$E2E_LOG"; then
+    echo "combined Codex proof skipped: $E2E_LOG" >&2
     exit 1
   fi
+  for proof in TestCodexRefreshLostReplyE2E TestCodexRetainedStopE2E; do
+    if ! grep -Fxq "=== RUN   $proof" "$E2E_LOG" ||
+      ! grep -q "^--- PASS: $proof " "$E2E_LOG"; then
+      echo "combined Codex proof did not run and pass: $proof ($E2E_LOG)" >&2
+      exit 1
+    fi
+  done
   rm -f "$E2E_LOG"
 fi
 

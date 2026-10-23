@@ -59,6 +59,7 @@ var nixOutputSuffixes = map[string]bool{
 //   - gnumake → make : mainProgram `make`.
 //   - kubernetes-helm → helm : mainProgram `helm`.
 //   - python3Packages.pip → pip : the `pip` CLI.
+//   - go_1_27 → go : the pinned Go flake's binary.
 //
 // CAVEAT, documented rather than hidden: `yq` names two DIFFERENT nixpkgs packages
 // — the baked Go `yq-go` and the python-wrapper `yq` — that share the `yq` binary.
@@ -73,6 +74,7 @@ var seedAliases = map[string]string{
 	"gnumake":             "make",
 	"kubernetes-helm":     "helm",
 	"python3Packages.pip": "pip",
+	"go_1_27":             "go",
 }
 
 // seedExceptions are packages that are allowlisted but deliberately NOT baked into
@@ -84,7 +86,7 @@ var seedAliases = map[string]string{
 //     so baking it buys nothing and it stays off the toolchain but on the
 //     allowlist.
 //   - nodejs: nodejs is in the 00046 seed but is NOT baked as a devbox package;
-//     the base image's node (node:22-alpine) is not a devbox-provisioned nodejs,
+//     the base image's node (node:24-alpine) is not a devbox-provisioned nodejs,
 //     so the gate would otherwise reject the seeded row on every deployment.
 //
 // These are the only two entries the gate treats as covered without a
@@ -121,8 +123,16 @@ func buildSeedSet() map[string]bool {
 // shellcheck.bin→shellcheck) but leaves python3Packages.pip intact at this step
 // (pip is not an output name), then applies the alias map (yq-go→yq, go-task→task,
 // gnumake→make, kubernetes-helm→helm, python3Packages.pip→pip). Everything else is
-// identity. Case-sensitive: nix attrs are case-sensitive.
+// identity. A pinned NixOS/nixpkgs flake seed uses its fragment as the attr.
+// Case-sensitive: nix attrs are case-sensitive.
+// Only buildSeedSet calls this on the embedded manifest; Covered does not
+// normalize provisioned or user-supplied package specs.
 func normalize(attr string) string {
+	if strings.HasPrefix(attr, "github:NixOS/nixpkgs/") {
+		if i := strings.LastIndexByte(attr, '#'); i >= 0 {
+			attr = attr[i+1:]
+		}
+	}
 	if i := strings.LastIndexByte(attr, '.'); i >= 0 {
 		if nixOutputSuffixes[attr[i+1:]] {
 			attr = attr[:i]

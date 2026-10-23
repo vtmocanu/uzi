@@ -33,6 +33,8 @@
   // worker toolchain (agent/devbox-global/devbox.json) instead — it is a broadly-useful
   // base crypto/TLS CLI, not a repo-specific extra like ruby, so every worker gets it.
   "packages": [
-    "ruby@4.0.6"
+    "ruby@4.0.6",
+    // charm-freeze: uxlab renders this repo's TUI ANSI frames to reviewable PNGs.
+    "charm-freeze@0.2.2"
   ]
 }

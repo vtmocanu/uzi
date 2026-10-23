@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Turn the raw-ANSI TUI frames under frames/ into PNGs under png/, using
-# charmbracelet/freeze. Run it inside the devbox env so `freeze` is on PATH:
+# charmbracelet/freeze. See README.md for provisioning and tool prerequisites.
 #
-#   cd api/cmd/uzi/uxlab && devbox run build     # generate frames + render (one command)
-#   cd api/cmd/uzi/uxlab && devbox run render    # render only (frames already exist)
+#   cd api/cmd/uzi/uxlab && ./build.sh          # provisioned Claude/Codex full build
+#   cd api/cmd/uzi/uxlab && devbox run build    # local contributor full build
+#   cd api/cmd/uzi/uxlab && ./render.sh         # partial: frames + freeze on PATH
+# Local partial operation: devbox run render. Runs must not invoke Devbox/Nix.
 #
 # Theme handling, and why it is not just a background swap: freeze's default text
 # colour is light, which is correct for a dark terminal but washes out un-styled text

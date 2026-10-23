@@ -87,13 +87,15 @@ EXEMPT='^(\.agents/skills/uzi-lander/scripts/test-linux\.sh|scripts/devbox-updat
 creates_repo() { perl -ne '$m = 1 if /^\s*[^#]*\bgit\w*\b.*\b(init|clone)\b/; END { exit($m ? 0 : 1) }' "$1"; }
 missing=""
 scanned=0
+# The exact trusted root can have a different owner under the worker UID split;
+# command-scoped trust here does not relax fixture isolation.
 while read -r f; do
   [[ "$f" =~ $EXEMPT ]] && continue
   creates_repo "$f" || continue
   scanned=$((scanned + 1))
   { grep -q -E "GIT_CONFIG_GLOBAL=['\"]?/dev/null" "$f" &&
     grep -q -E "GIT_CONFIG_(SYSTEM=['\"]?/dev/null|NOSYSTEM=['\"]?1)" "$f"; } || missing="$missing $f"
-done < <(git ls-files '*.sh' '*.py' | grep -E '(^|[/._-])test([._-]|$)')
+done < <(GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null git -c safe.directory="$ROOT" ls-files '*.sh' '*.py' | grep -E '(^|[/._-])test([._-]|$)')
 # 24 repo-creating test scripts when this landed; far fewer means the matcher broke.
 if [ "$scanned" -lt 20 ]; then bad "only $scanned repo-creating test scripts found; the matcher is broken"
 elif [ -z "$missing" ]; then ok "all $scanned repo-creating test scripts isolate global and system git config"

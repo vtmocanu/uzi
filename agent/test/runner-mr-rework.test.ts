@@ -5,7 +5,8 @@ import { randomUUID } from "node:crypto";
 import { makeClaim, nullLogger } from "./helpers.js";
 import { StubExecutor } from "../src/executor.js";
 import type { ClaimResponse } from "../src/protocol.js";
-import { api, fx, git, fakeGitlab, installHarness, runner } from "./runner-harness.js";
+import { enableRefreshPublication } from "./publication-fixture.js";
+import { api, client, fx, git, fakeGitlab, installHarness, runner } from "./runner-harness.js";
 
 installHarness();
 
@@ -42,6 +43,8 @@ describe("RunRunner — mr_rework kind (PRD #700 / issue #778)", () => {
   it("resolves the MR branch and does NOT throw the issue_iid error", async () => {
     const { gitlab } = fakeGitlab();
     const claim = mrReworkClaim();
+    claim.claim_generation ??= 7;
+    await enableRefreshPublication(api, client, claim, fx.originPath, null, "not_applicable");
     await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
 
     // The run reached completion, NOT failure — the mr_rework arm cloned claim.branch
@@ -71,6 +74,8 @@ describe("RunRunner — mr_rework kind (PRD #700 / issue #778)", () => {
   it("pushes the rework onto the MR branch on origin", async () => {
     const { gitlab } = fakeGitlab();
     const claim = mrReworkClaim();
+    claim.claim_generation ??= 7;
+    await enableRefreshPublication(api, client, claim, fx.originPath, null, "not_applicable");
     await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
 
     // The push landed on the MR branch — a real git push to the fixture bare origin.
@@ -109,6 +114,8 @@ describe("RunRunner — mr_rework kind (PRD #700 / issue #778)", () => {
     // fallback, so the "#null" title assertion below actually exercises the mr_rework arm
     // rather than returning the fixture's non-empty title (which made it vacuous).
     const claim = mrReworkClaim({ issue_title: "" });
+    claim.claim_generation ??= 7;
+    await enableRefreshPublication(api, client, claim, fx.originPath, null, "not_applicable");
     await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
 
     assert.equal(calls.length, 1, "the mr_rework finalize opened exactly one MR");
@@ -169,6 +176,8 @@ describe("RunRunner — mr_rework kind (PRD #700 / issue #778)", () => {
 
     const { gitlab, calls } = fakeGitlab();
     const claim = mrReworkClaim();
+    claim.claim_generation ??= 7;
+    await enableRefreshPublication(api, client, claim, fx.originPath, null, "not_applicable");
     try {
       await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
     } finally {
@@ -230,6 +239,8 @@ describe("RunRunner — mr_rework kind (PRD #700 / issue #778)", () => {
 
     const { gitlab } = fakeGitlab();
     const claim = mrReworkClaim();
+    claim.claim_generation ??= 7;
+    await enableRefreshPublication(api, client, claim, fx.originPath, null, "not_applicable");
     try {
       await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
     } finally {

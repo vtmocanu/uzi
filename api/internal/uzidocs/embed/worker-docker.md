@@ -242,7 +242,31 @@ per-pod `emptyDir`.
 - **Custody-held workers migrate later.** A Docker worker that holds
   recovery custody for a run stays on its old pod layout (the `emptyDir`)
   until custody releases, so its unpublished clone is not lost by the
-  migration. While held, the worker is not rolled, and a forced roll
+  migration. Persistent drifted held workers may receive a controller-only
+  `image_roll` drain after ordinary admission planning, with a distinct live
+  eligible uncordoned same-owner/lane sibling individually covering the full
+  frozen capabilities (busy is okay; free slots are not required). This creates
+  no replacement admission, reservation, canary, roll slot or pod-template patch;
+  run-bound workers are excluded. Full-poll held drains of any reason, including
+  unrenderable targets, and selected/possibly committed drains block further
+  selection. Retained drains can delay ordinary rolls and stay after covering
+  sibling loss, potentially removing all intake coverage.
+  Reconciliation is level-triggered after registration/restart or an explicit
+  undrained poll, with no fixed time bound; registration and poll/write failures
+  can allow claims in the gap. Failed writes retain process-local uncertainty
+  until evidence resolves it; restart loses it. Timed-out cordons can commit
+  after an undrained poll, so multiple held workers may physically drain.
+  No server-side fence or schema/protocol/API product change is added; the reused
+  reason makes this exception deployment-order independent. See
+  [operational limits](./hosted-worker-roll-verification.md#migration-drain-policy-and-operational-limits).
+  Idle terminal holds need an operator custody decision (#3031 automatic path
+  is not added); there is no automatic discard. Chat continue drops the
+  draining-worker pin and may cold-resume. Custody-clear ordinary release can
+  admit fresh work before later re-drain; worker-pin rollback retains custody refusal before
+  ordinary release. Unknown-target multiple-drain diagnostics keep image/version
+  empty and grant no mutation authority; existing rolling fallback may stamp
+  the first `upgrading_since`. Independent DinD/pressure/maintenance guards stay
+  in force. While held, the worker is not rolled, and a forced roll
   (ForceRoll) does not override the hold; the controller logs
   `layout-migration-held-custody count=N workers=...` each tick and the
   fleet shows a health warning `Worker roll held at <image>:

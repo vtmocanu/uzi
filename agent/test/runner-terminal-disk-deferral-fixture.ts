@@ -35,6 +35,7 @@ export function fixture(opts: {
   reclaim?: () => Promise<void>; runner?: Partial<RunnerOptions>;
   result?: ExecutorResult; safety?: CodexExecutionSafety; observe?: (ctx: RunContext) => void;
   afterWork?: (ctx: RunContext) => Promise<void>;
+  withCredentialFreeCapture?: import("../src/executor.js").Executor["withCredentialFreeCapture"];
   settleForCredentialFreeCapture?: () => Promise<CredentialFreeSettleOutcome>;
 } = {}) {
   const claim = gitlabClaim(2201, { claim_generation: 4, ...(opts.kind ? { kind: opts.kind } : {}) });
@@ -48,7 +49,7 @@ export function fixture(opts: {
   const error = Object.hasOwn(opts, "error") ? opts.error : new Error("opaque executor failure");
   const factory: ExecutorFactory = () => ({
     homeDir: home,
-    executor: { safety: opts.safety, settleForCredentialFreeCapture: opts.settleForCredentialFreeCapture, run: async (ctx) => {
+    executor: { withCredentialFreeCapture: opts.withCredentialFreeCapture, safety: opts.safety, settleForCredentialFreeCapture: opts.settleForCredentialFreeCapture, run: async (ctx) => {
       opts.observe?.(ctx);
       calls++;
       clone = ctx.worktreePath;

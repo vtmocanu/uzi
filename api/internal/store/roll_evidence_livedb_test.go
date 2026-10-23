@@ -96,6 +96,18 @@ func TestRollEvidenceDrainWritersLiveDB(t *testing.T) {
 	if _, err := q.CordonHostedWorkerImageRoll(ctx, w.ID); err != nil {
 		t.Fatal(err)
 	}
+	if got := read(); !got.DrainingSince.Valid || !got.DrainingReason.Valid || got.DrainingReason.String != "image_roll" {
+		t.Fatalf("image cordon missing before register: %+v", got)
+	}
+	if _, err := q.RegisterWorker(ctx, store.RegisterWorkerParams{ID: w.ID, SnapshotRegisterNonce: pgconv.TextOrNull("without-maintenance"), Capabilities: []string{}, ProtocolCapabilities: []string{}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(); got.DrainingSince.Valid || got.DrainingReason.Valid || got.MaintenanceOwnsDrain {
+		t.Fatalf("register without maintenance left persisted drain provenance: %+v", got)
+	}
+	if _, err := q.CordonHostedWorkerImageRoll(ctx, w.ID); err != nil {
+		t.Fatal(err)
+	}
 	maintenance("requested")
 	updated, err := q.RegisterWorker(ctx, store.RegisterWorkerParams{ID: w.ID, SnapshotRegisterNonce: pgconv.TextOrNull("new"), Capabilities: []string{}, ProtocolCapabilities: []string{}})
 	if err != nil {

@@ -89,12 +89,25 @@ describe("production code never installs a quiescence test view", () => {
       matches(bare, /=\s*(?:globalThis\s*(?:\?\.|\.)\s*)?process\b(?!\s*(?:\?\.|\.|\[))/g),
       [],
     );
-    // No `env` member read on anything, whatever the receiver (an alias, `globalThis.process`, a
-    // call result), by dot, optional chain or a computed "env" key. The one `.env` in code today is
-    // the helper spawner handing its own `opts.env` (built by the caller from `workerSpawnEnv(...)`)
-    // to `spawn`; a spawn option `env:` object key is not a member access and is not matched.
-    assert.deepEqual(matches(bare, /[\w$)\]]*\s*(?:\?\.|\.)\s*env\b/g), ["opts.env"]);
-    assert.match(bare, /const defaultHelperSpawn: HelperSpawn = \(command, args, opts\) =>\s*spawn\([^;]*\benv: opts\.env\b/);
+    // Only the named closed-request validator may inspect request.env, and only for
+    // the frozen canonical envelope and its worker-owned temporary directory.
+    const validators = matches(src, /export function assertClosedReaperRequest\(request: BoundaryProcessRequest, signal\?: AbortSignal, owner\?: object\): string \{[\s\S]*?\n\}/g);
+    assert.equal(validators.length, 1, "found exactly one closed-request validator");
+    const validator = validators[0]!;
+    assert.match(validator, /const env = workerSpawnEnv\(bound\.kind === "scan"\s*\? \{ PATH: bound\.owner\.scanPath, TMPDIR: bound\.owner\.created!, TSX_DISABLE_CACHE: "1" \}\s*: \{ PATH: HELPER_PATH \}\);/);
+    assert.match(validator, /!Object\.isFrozen\(request\.env\)/);
+    assert.match(validator, /JSON\.stringify\(request\.env\) !== JSON\.stringify\(env\)/);
+    assert.match(validator, /bound\.kind === "scan" && request\.env\.TMPDIR !== bound\.owner\.created/);
+    assert.match(validator, /throw new TrustedExecutionRefusal\("noncanonical reaper operation"\)/);
+    const validatedReads = validator
+      .replace("Object.isFrozen(request.env)", "Object.isFrozen(envelope)")
+      .replace("JSON.stringify(request.env) !== JSON.stringify(env)", "JSON.stringify(envelope) !== JSON.stringify(env)")
+      .replace("request.env.TMPDIR !== bound.owner.created", "envelope.TMPDIR !== bound.owner.created");
+    // All other reads, including extra request.env reads inside the validator, retain
+    // the receiver-independent scan. The helper spawner may pass its canonical opts.env.
+    const remainder = withoutStrings(src.replace(validator, validatedReads));
+    assert.deepEqual(matches(remainder, /[\w$)\]]*\s*(?:\?\.|\.)\s*env\b/g), ["opts.env"]);
+    assert.match(bare, /const defaultHelperSpawn: HelperSpawn = \(command, args, opts\) =>\s*\{\s*if \(uidSplitActive\(\) && hasReaperCaptureScope\(\)\) throw new Error\([^;]*\);\s*return spawn\([^;]*\benv: opts\.env\b/);
     assert.deepEqual(matches(src, /\[\s*["'`]env["'`]\s*\]/g), []);
     // And, stated for the view path itself: the setter and the view validation mention no `process`.
     const setter = /export function setQuiescenceViewForTests\([^)]*\): void \{[\s\S]*?\n\}/.exec(src)?.[0] ?? "";

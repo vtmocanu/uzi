@@ -1,4 +1,5 @@
 import { it, mock } from "node:test";
+import { codexRig } from "./runner-codex-sinks-fixture.js";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -70,7 +71,10 @@ for (const scenario of ["wallpark", "clarification", "old-generation-foreground"
     let clone = "", identicalTree = "";
     let dirtyBlob: string | undefined;
     let oldRoot: string | undefined;
+    const rig = codexRig();
     const executor: Executor = {
+      withCredentialFreeCapture: scenario === "registry"
+        ? async () => ({ kind: "incomplete", errors: [] }) : rig.capture,
       async run(ctx) {
         if (ctx.cancelRequested?.()) throw new Error("run cancelled");
         models++;

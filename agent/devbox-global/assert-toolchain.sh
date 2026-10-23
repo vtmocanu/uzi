@@ -31,7 +31,8 @@ trap 'rm -rf "$tmp"' EXIT
 # regex over a file full of prose comments is its own bug factory. The list output is
 # `* <package>@<version>` plus an unrelated "not activated" warning block, so match
 # the starred lines strictly and ignore everything else.
-devbox global list 2>/dev/null | sed -n 's/^\* \([^@]*\)@.*/\1/p' | sort > "$tmp/installed"
+# Flake package names have no @version suffix; retain their complete manifest key.
+devbox global list 2>/dev/null | awk '/^\* / { sub(/^\* /, ""); sub(/@.*/, ""); print }' | sort > "$tmp/installed"
 grep -v '^[[:space:]]*#' "$GUARD" | grep -v '^[[:space:]]*$' | awk -F'\t' '{print $1}' | sort > "$tmp/guarded"
 
 if ! cmp -s "$tmp/installed" "$tmp/guarded"; then

@@ -157,6 +157,24 @@ COPY agent/devbox-global/assert-toolchain.sh /tmp/assert-toolchain.sh
 RUN bash /tmp/assert-toolchain.sh /tmp/toolchain-guard.tsv \
     && rm -f /tmp/assert-toolchain.sh /tmp/toolchain-guard.tsv
 
+# #3305: validate the committed lock against the actual baked Go. Module requirements
+# belong to the release stage below, so go.mod edits do not invalidate the runtime cache.
+COPY agent/devbox-global/devbox.json /tmp/worker-toolchain/agent/devbox-global/devbox.json
+COPY agent/devbox-global/devbox.lock /tmp/worker-toolchain/agent/devbox-global/devbox.lock
+COPY scripts/check-worker-toolchain.py /tmp/worker-toolchain/scripts/check-worker-toolchain.py
+RUN python3 /tmp/worker-toolchain/scripts/check-worker-toolchain.py --skip-modules \
+      --installed-go "$(/opt/uzi-toolchain/bin/go version)" --arch "$TARGETARCH" \
+    && rm -rf /tmp/worker-toolchain
+
+# The wrapper trusts only its pinned archive hash and re-verifies a private copy on
+# every invocation. Keep the baked archive under /usr, an existing command read root.
+ENV UZI_SQLC_DIR=/usr/local/share/uzi-sqlc
+COPY scripts/sqlc.sh /tmp/worker-sqlc.sh
+RUN SQLC_PIN="$(awk -F '"' '/^SQLC_LINUX_AMD64_VERSION=/{print $2}' /tmp/worker-sqlc.sh)" \
+    && sh /tmp/worker-sqlc.sh "$SQLC_PIN" version \
+    && chmod -R a+rX "$UZI_SQLC_DIR" \
+    && rm -f /tmp/worker-sqlc.sh
+
 # PRD #974 M2: bake the pinned gitleaks so the finalize pre-push secret scan needs NO run-time
 # module fetch (the restricted worker tier blocks proxy.golang.org). `go` resolves via the
 # toolchain ENV above; GOBIN=/usr/local/bin puts the binary on the image PATH (agent-browser is
@@ -358,6 +376,7 @@ RUN mkdir -p /var/cache/uzi-codex-cmd && chmod 0755 /var/cache/uzi-codex-cmd
 # The release stage is ALWAYS built, so a release image never aliases another release
 # (ADR-1720).
 FROM runtime AS release
+ARG TARGETARCH
 
 COPY agent/tsconfig.json ./
 COPY agent/src ./src
@@ -371,6 +390,8 @@ COPY agent/src ./src
 # templates/base — keep in lockstep. See templates/base/Dockerfile for the rationale.
 ARG UZI_SRC_SHA=
 COPY . /opt/uzi-src
+RUN python3 /opt/uzi-src/scripts/check-worker-toolchain.py \
+      --installed-go "$(/opt/uzi-toolchain/bin/go version)" --arch "$TARGETARCH"
 RUN printf 'uzi source baked into the worker image (PRD #39 chat)\ncommit: %s\nbuilt:  %s\n' \
       "${UZI_SRC_SHA:-unknown}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /opt/uzi-src/BUILD_INFO
 
@@ -411,9 +432,20 @@ RUN mkdir -p /data && chown -R worker:worker /app /data
 # nor the runner uid can plant a git hook. MUST be as root; the entrypoint drops later.
 RUN mkdir -p /usr/share/uzi-git-nohooks && chmod 0555 /usr/share/uzi-git-nohooks
 
+# Prove the final toolchain as the command uid, without network. Keeping this in
+# the release build avoids exporting/loading the multi-GB image just for a probe.
+USER runner
+RUN --network=none set -eu; cd /opt/uzi-src; \
+    which -a go; test "$(which -a go | wc -l)" -eq 1; \
+    go version; \
+    SQLC_PIN="$(awk -F '"' '/^SQLC_LINUX_AMD64_VERSION=/{print $2}' scripts/sqlc.sh)"; \
+    scripts/sqlc.sh "$SQLC_PIN" version; \
+    cd api; go version; cd ../controller; go version
+USER root
+
 # PRD #51 A1 root-entry setpriv drop — the SAME explicit stanza as templates/base (jvm
 # is NOT `FROM base`). Image baseline stays ROOT and the entrypoint drops to `worker`
-# keeping only CAP_SETUID/SETGID ambient (M4 spawns `runner` children). No `USER` line.
+# keeping only CAP_SETUID/SETGID ambient (M4 spawns `runner` children). Final USER is root.
 COPY --chmod=0755 agent/templates/entrypoint.sh /usr/local/sbin/uzi-entrypoint
 VOLUME ["/data", "/nix"]
 

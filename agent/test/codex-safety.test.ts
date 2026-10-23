@@ -25,7 +25,196 @@ import {
   type RegisteredRoot,
   type RootKind,
 } from "../src/codex/registry.js";
-import type { BoundaryPermit, BoundaryRequest, BoundaryStep } from "../src/harness.js";
+import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
+import { CaptureOperationRevokedError, GitBoundaryAbortError, CheckpointUnsafeCleanupError } from "../src/checkpoint-stop.js";
+import { captureFailureOf, type BoundaryPermit, type BoundaryRequest, type BoundaryStep } from "../src/harness.js";
+
+for (const origin of ["deadline", "external", "both"] as const) {
+  it(`R2 capture provenance distinguishes ${origin} and retains primary/cause`, async () => {
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(2852));
+    let expire!: () => void;
+    const external = new AbortController();
+    const primary = new Error("capture primary sentinel", { cause: new Error("original cause") });
+    const safety = createCodexExecutionSafety(registry, spawnCounter().seam, undefined, undefined,
+      async () => assert.fail("no child requested"),
+      (_request, _ms, fire) => { expire = fire; return () => {}; });
+    await assert.rejects(safety.withCredentialFreeCapture(1000, async context => {
+      if (origin !== "external") expire();
+      if (origin !== "deadline") external.abort(primary);
+      assert.equal(context.signal.aborted, true);
+      if (origin === "external") assert.equal(context.signal.reason, primary);
+      throw primary;
+    }, external.signal), (error: unknown) => {
+      assert.ok(error instanceof CodexBoundaryError);
+      assert.equal(error.actionError, primary);
+      assert.equal(error.cause, primary);
+      assert.deepEqual(captureFailureOf(error), {
+        deadlineExpired: origin !== "external", childCleanupFailed: false, externallyAborted: origin !== "deadline",
+      });
+      assert.equal(Object.isFrozen(captureFailureOf(error)), true);
+      assert.equal(captureFailureOf(JSON.parse(JSON.stringify(error))), undefined, "JSON cannot mint capture provenance");
+      assert.deepEqual(error.errors, [{ category: "timeout", message: "codex capture deadline expired" }]);
+      assert.equal(registry.state(), "poisoned");
+      assert.equal(safety.completedCaptureForTeardown(), undefined);
+      assert.equal(Object.keys(error).includes("deadlineExpired"), false, "provenance is not an error wire field");
+      return true;
+    });
+    const arbitrary = new CodexBoundaryError("action", [{ category: "timeout", message: "codex capture deadline expired" }], primary);
+    assert.equal(captureFailureOf(arbitrary), undefined, "matching text cannot mint capture provenance");
+  });
+}
+
+for (const kind of ["git", "process"] as const) {
+  for (const proof of ["own", "wrong", "live"] as const) {
+    it(`R2 ${kind} revocation requires the exact already-aborted capture signal: ${proof}`, async () => {
+      const registry = new ExecutionRegistry(newLocalExecutionEpoch(2852));
+      let expire!: () => void;
+      const safety = createCodexExecutionSafety(registry, spawnCounter().seam, undefined, undefined,
+        async () => assert.fail("no child requested"),
+        (_request, _ms, fire) => { expire = fire; return () => {}; });
+      let primary: Error;
+      await assert.rejects(safety.withCredentialFreeCapture(1000, async context => {
+        const other = new AbortController(); other.abort();
+        if (proof !== "live") expire();
+        const signal = proof === "wrong" ? other.signal : context.signal;
+        primary = kind === "git" ? new GitBoundaryAbortError("original message", undefined, signal)
+          : new CaptureOperationRevokedError("original message", signal);
+        if (proof === "live") expire();
+        assert.equal(primary.message, "original message");
+        assert.equal(primary.name, kind === "git" ? "AbortError" : "TrustedExecutionRefusal");
+        assert.equal(JSON.stringify(primary), JSON.stringify(kind === "git"
+          ? new GitBoundaryAbortError("original message") : new TrustedExecutionRefusal("original message")));
+        assert.equal(Object.hasOwn(primary, "captureSignal"), false);
+        assert.equal(JSON.stringify(primary).includes("captureSignal"), false);
+        throw primary;
+      }), (error: unknown) => {
+        assert.ok(error instanceof CodexBoundaryError);
+        assert.equal(error.actionError, primary);
+        assert.equal(captureFailureOf(error)?.actionRevoked, proof === "own" ? true : undefined);
+        return true;
+      });
+    });
+  }
+}
+
+for (const origin of ["deadline", "external", "both"] as const) {
+  it("R2 raw capture abort through Git factory has exact provenance: " + origin, async t => {
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(2852));
+    const cache = new GitCache("/unused-r2", nullLogger());
+    let expire!: () => void;
+    const external = new AbortController();
+    const safety = createCodexExecutionSafety(registry, spawnCounter().seam, undefined, undefined,
+      async () => assert.fail("no child requested"),
+      (_request, _ms, fire) => { expire = fire; return () => {}; });
+    await assert.rejects(safety.withCredentialFreeCapture(1000, async context =>
+      cache.withCredentialFreeCapture(context, async () => {
+        t.mock.method(cache as any, "runGitAsRunner", async () => {
+          if (origin !== "deadline") external.abort(new Error("external authority"));
+          if (origin !== "external") expire();
+          throw context.signal.reason;
+        });
+        return cache.branchTip("/unused", "agent/issue-2852");
+      }), external.signal), (error: unknown) => {
+      assert.ok(error instanceof CodexBoundaryError);
+      assert.ok(error.actionError instanceof GitBoundaryAbortError);
+      assert.equal(captureFailureOf(error)?.actionRevoked, true);
+      assert.equal(captureFailureOf(error)?.externallyAborted, origin !== "deadline");
+      assert.equal(captureFailureOf(error)?.deadlineExpired, origin !== "external");
+      return true;
+    });
+  });
+}
+
+for (const failure of ["clean", "dispose", "reap"] as const) {
+  it("R2 in-flight capture child revocation waits for verified cleanup: " + failure, async () => {
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(2852));
+    const cache = new GitCache("/unused-r2", nullLogger());
+    const waiting = defer<void>(), disposed = defer<void>(), reap = defer<ReapOutcome>();
+    let expire!: () => void;
+    let settled = false, reaps = 0, disposals = 0;
+    const safety = createCodexExecutionSafety(registry, spawnCounter().seam, undefined, undefined,
+      async () => ({
+        stdin: null, stdout: new PassThrough(), stderr: new PassThrough(),
+        waitChild: async () => { waiting.resolve(); return new Promise(() => {}); },
+        root: { kind: "boundary_action",
+          dispose: async () => { disposals++; disposed.resolve(); if (failure === "dispose") throw new Error("dispose failed"); },
+          reap: async () => { reaps++; return reap.promise; },
+        },
+      }), (_request, _ms, fire) => { expire = fire; return () => {}; });
+    const result = safety.withCredentialFreeCapture(1000, async context =>
+      cache.withCredentialFreeCapture(context, async () => {
+        try { return await cache.branchTip("/unused", "agent/issue-2852"); }
+        finally { settled = true; }
+      }));
+    const checked = assert.rejects(result, (error: unknown) => {
+      assert.ok(error instanceof CodexBoundaryError);
+      assert.ok(error.actionError instanceof (failure === "clean" ? CaptureOperationRevokedError : CheckpointUnsafeCleanupError));
+      assert.equal(captureFailureOf(error)?.actionRevoked, failure === "clean" ? true : undefined);
+      return true;
+    });
+    await waiting.promise;
+    expire();
+    await disposed.promise;
+    assert.equal(settled, false, "revocation cannot escape before owned reap");
+    reap.resolve(failure === "reap" ? { ok: false, error: { category: "tool", message: "reap failed" } } : { ok: true });
+    await checked;
+    assert.equal(disposals, 1);
+    assert.equal(reaps, 1);
+  });
+}
+
+for (const timing of ["reap", "microtask", "foreign-signal", "child-deadline"] as const) {
+  it("R2 independent child primary survives later capture expiry: " + timing, async () => {
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(2852));
+    const cache = new GitCache("/unused-r2", nullLogger());
+    let expire!: () => void;
+    let now = Date.now();
+    const foreign = new AbortController(); foreign.abort();
+    const primary = timing === "foreign-signal"
+      ? new CaptureOperationRevokedError("independent child verification failure", foreign.signal)
+      : new TrustedExecutionRefusal("independent child verification failure");
+    let sawPrimary = false, reaps = 0, disposals = 0;
+    const safety = createCodexExecutionSafety(registry, spawnCounter().seam, undefined, undefined,
+      async () => {
+        if (timing === "child-deadline") now += 1000;
+        return {
+          stdin: null, stdout: new PassThrough(), stderr: new PassThrough(),
+          waitChild: () => {
+            sawPrimary = true;
+            // The helper's rejection handler selects the independent primary first.
+            // Expiry then runs before startOwnedProcess resumes its await catch.
+            const terminal = Promise.reject(primary);
+            if (timing === "microtask") queueMicrotask(() => queueMicrotask(expire));
+            return terminal;
+          },
+          root: { kind: "boundary_action",
+            dispose: async () => { disposals++; },
+            reap: async () => {
+              reaps++;
+              assert.equal(sawPrimary, timing !== "child-deadline");
+              if (timing !== "microtask") expire();
+              return { ok: true };
+            },
+          },
+        };
+      }, (_request, _ms, fire) => { expire = fire; return () => {}; }, () => now);
+    await assert.rejects(safety.withCredentialFreeCapture(1000, async context =>
+      cache.withCredentialFreeCapture(context, () => cache.branchTip("/unused", "agent/issue-2852"))),
+      (error: unknown) => {
+        assert.ok(error instanceof CodexBoundaryError);
+        if (timing === "child-deadline") {
+          assert.ok(error.actionError instanceof TrustedExecutionRefusal);
+          assert.equal(error.actionError.message, "boundary process child deadline exceeded during launch");
+        } else assert.equal(error.actionError, primary);
+        assert.equal(captureFailureOf(error)?.deadlineExpired, true);
+        assert.equal(captureFailureOf(error)?.actionRevoked, undefined,
+          "independent terminal failures cannot authorize refusal recovery");
+        return true;
+      });
+    assert.equal(reaps, 1);
+    assert.equal(disposals, 1);
+  });
+}
 
 // PRD #1171 (M3 m1, first unit) — the CodexExecutionSafety facade and the trusted
 // boundary-action lane. All process work is injected; nothing real is spawned.
@@ -1017,6 +1206,46 @@ describe("CodexExecutionSafety.withBoundary: per-sink reconcile (m4)", () => {
     assert.equal(result, 6);
   });
 
+  it("#2852 terminal hook refusal remains incomplete after a later successful hook", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(3));
+    let calls = 0;
+    const safety = createCodexExecutionSafety(reg, spawnCounter().seam, undefined, () => {
+      if (++calls === 1) throw new Error("private cleanup detail");
+    });
+    const first = await safety.dispose(req("terminal"));
+    assert.equal(first.kind, "incomplete");
+    assert.equal(JSON.stringify(first).includes("private cleanup detail"), false);
+    const second = await safety.dispose(req("terminal"));
+    assert.equal(second.kind, "incomplete", "cleared tables cannot erase hook failure");
+    assert.equal(calls, 2, "independent cleanup is still attempted");
+    assert.equal(reg.isPoisoned(), true);
+  });
+
+  for (const hookFails of [false, true]) {
+    it(`#2852 registry disposal preserves primary failure with hook failure ${hookFails}`, async () => {
+      const reg = new ExecutionRegistry(newLocalExecutionEpoch(3));
+      const primary = new Error("primary disposal failure");
+      const secondary = new Error("secondary cleanup failure");
+      reg.disposeTools = async () => { throw primary; };
+      let hooks = 0;
+      const safety = createCodexExecutionSafety(reg, spawnCounter().seam, undefined, () => {
+        hooks++;
+        if (hookFails) throw secondary;
+      });
+      await assert.rejects(safety.dispose(req("terminal")), error => {
+        if (hookFails) {
+          assert.ok(error instanceof AggregateError);
+          assert.equal(error.cause, primary);
+          assert.deepEqual(error.errors, [primary, secondary]);
+          assert.equal(error.message.includes(primary.message), false);
+          assert.equal(error.message.includes(secondary.message), false);
+        } else assert.equal(error, primary);
+        return true;
+      });
+      assert.equal(hooks, 1);
+    });
+  }
+
   it("dispose runs the onDispose terminal hook AFTER a post-run sink registered a token (F1: sink tokens are evicted)", async () => {
     // Models the executor's F1 wiring: a post-run sink reconcile registers a fresh token
     // into a set (via addSecret), and the terminal dispose the runner calls evicts it via
@@ -1682,6 +1911,58 @@ describe("M2 first-send deadline safety propagation", () => {
   });
 });
 
+describe("A normal boundaries refuse unusable registries before credentials", () => {
+  for (const state of ["poisoned", "disposed"] as const) {
+    it(`refuses ${state} before reconcile or action`, async () => {
+      const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+      let reconciles = 0, actions = 0, quiesces = 0, reaps = 0;
+      const quiesce = registry.quiesceChildren.bind(registry);
+      const reap = registry.reapProcesses.bind(registry);
+      registry.quiesceChildren = (...args) => { quiesces++; return quiesce(...args); };
+      registry.reapProcesses = (...args) => { reaps++; return reap(...args); };
+      const spawn = spawnCounter();
+      const safety = createCodexExecutionSafety(registry, spawn.seam, async () => {
+        reconciles++;
+        return { kind: "ready" };
+      });
+      if (state === "poisoned") registry.poison({ category: "protocol", message: "prior proof refused" });
+      else assert.equal((await safety.dispose(req("terminal"))).kind, "disposed");
+      const priorErrors = registry.poisonErrors();
+      const priorQuiesces = quiesces, priorReaps = reaps;
+      await assert.rejects(safety.withBoundary(req("finalize"), async () => { actions++; }), CodexBoundaryError);
+      assert.equal(reconciles, 0, "an unusable epoch cannot release or refresh credentials");
+      assert.equal(actions, 0);
+      assert.equal(spawn.state.calls, 0);
+      assert.equal(quiesces, priorQuiesces);
+      assert.equal(reaps, priorReaps);
+      assert.equal(registry.state(), state);
+      assert.deepEqual(registry.poisonErrors(), priorErrors, "refusal does not mint fresh cleanup evidence");
+    });
+  }
+
+  it("rechecks registry state after waiting for the safety queue", async () => {
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    let reconciles = 0, secondActions = 0;
+    const entered = defer<void>(), release = defer<void>();
+    const safety = createCodexExecutionSafety(registry, spawnCounter().seam, async () => {
+      reconciles++;
+      return { kind: "ready" };
+    });
+    const first = safety.withBoundary(req("checkpoint"), async () => {
+      entered.resolve(undefined);
+      await release.promise;
+    });
+    await entered.promise;
+    const second = safety.withBoundary(req("finalize"), async () => { secondActions++; });
+    const outcomes = Promise.allSettled([first, second]);
+    registry.poison({ category: "protocol", message: "proof changed while queued" });
+    release.resolve(undefined);
+    const results = await outcomes;
+    assert.equal(results[1]!.status, "rejected");
+    assert.equal(reconciles, 1, "only the first usable acquisition reconciled");
+    assert.equal(secondActions, 0);
+  });
+});
 
 describe("m1 cooperative safety admission", () => {
   it("attributes an already hard-expired admission instead of reporting a soft stop", async () => {
@@ -2154,3 +2435,155 @@ for (const reason of ["owner_cancel", "claim_loss", "untyped_lifecycle", "shutdo
     assert.equal(reg.isPoisoned(), reason !== "worker_shutdown");
   });
 }
+
+describe("R2 terminal disposal acquisition", () => {
+  function fixture(dispose: BoundarySeams["dispose"]) {
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(3200));
+    let now = 100;
+    let expire: (() => void) | undefined;
+    let cancels = 0;
+    const safety = new CodexExecutionSafetyImpl(registry, {
+      quiesce: r => registry.quiesceChildren(r.deadlineMs),
+      reap: (r, epoch) => registry.reapProcesses(r.deadlineMs, epoch),
+      dispose, spawnRoot: spawnCounter().seam,
+      now: () => now,
+      armDeadline: (request, _ms, fire) => {
+        if (request.boundary !== "terminal") return () => {};
+        expire = fire;
+        return () => { cancels++; expire = undefined; };
+      },
+    });
+    return { registry, safety, advance: (ms: number) => { now += ms; },
+      expire: () => { assert.ok(expire); expire(); }, cancels: () => cancels };
+  }
+
+  for (const failure of [false, true]) {
+    it(`enters idle zero-budget disposal and joins cleanup (throws=${failure})`, async () => {
+      const disposing = defer<void>(), cleanup = defer<void>();
+      const primary = new Error("idle cleanup failed");
+      const budgets: number[] = [];
+      const f = fixture(async request => {
+        budgets.push(request.deadlineMs);
+        disposing.resolve();
+        await cleanup.promise;
+        if (failure) throw primary;
+        return { kind: "disposed" };
+      });
+      const disposal = f.safety.dispose({ boundary: "terminal", deadlineMs: 0 });
+      let settled = false;
+      const checked = disposal.then(
+        result => { settled = true; return { result }; },
+        error => { settled = true; return { error }; },
+      );
+      // A turn of the event loop also lets a refused disposal report its result.
+      await new Promise<void>(resolve => setImmediate(resolve));
+      try {
+        assert.deepEqual(budgets, [0], "idle disposal must enter the cleanup owner without inflating its budget");
+        await disposing.promise;
+        let laterRan = false;
+        const later = f.safety.withBoundary(req("checkpoint"), async () => { laterRan = true; });
+        f.advance(100);
+        await new Promise<void>(resolve => setImmediate(resolve));
+        assert.equal(settled, false);
+        assert.equal(laterRan, false, "later acquisition must join entered zero-budget cleanup");
+        cleanup.resolve();
+        assert.deepEqual(await checked, failure ? { error: primary } : { result: { kind: "disposed" } });
+        await later;
+        assert.equal(laterRan, true);
+      } finally {
+        cleanup.resolve();
+        await checked;
+      }
+    });
+  }
+
+  for (const order of ["predecessor-first", "deadline-first", "ready-after-deadline"] as const) {
+    it(`refuses queued disposal in the same-tick ${order} race`, async () => {
+      let disposals = 0;
+      const f = fixture(async () => { disposals++; return { kind: "disposed" }; });
+      const entered = defer<void>(), release = defer<void>();
+      const active = f.safety.withBoundary(req("checkpoint"), async () => {
+        entered.resolve(); await release.promise;
+      });
+      await entered.promise;
+      const disposal = f.safety.dispose({ boundary: "terminal", deadlineMs: 50 });
+      try {
+        if (order === "predecessor-first") release.resolve();
+        f.advance(50);
+        if (order !== "ready-after-deadline") f.expire();
+        if (order !== "predecessor-first") release.resolve();
+        await active;
+        assert.deepEqual(await disposal, { kind: "incomplete", errors: [{
+          category: "timeout", message: "codex disposal expired in the boundary queue",
+        }] });
+        assert.equal(disposals, 0);
+      } finally { release.resolve(); await active; }
+    });
+  }
+
+  for (const mode of ["hook", "zero", "expired"] as const) {
+    it(`returns incomplete on ${mode} acquisition expiry without releasing the real predecessor`, async () => {
+      let disposals = 0;
+      const f = fixture(async () => { disposals++; return { kind: "disposed" }; });
+      const entered = defer<void>(), release = defer<void>();
+      const active = f.safety.withBoundary(req("checkpoint"), async () => {
+        entered.resolve(); await release.promise;
+      });
+      await entered.promise;
+      const disposal = f.safety.dispose({ boundary: "terminal", deadlineMs: mode === "zero" ? 0 : 50 });
+      if (mode === "hook") { f.advance(50); f.expire(); }
+      if (mode === "expired") { f.advance(50); release.resolve(); }
+      try {
+        assert.deepEqual(await disposal, { kind: "incomplete", errors: [{
+          category: "timeout", message: "codex disposal expired in the boundary queue",
+        }] });
+        const events: string[] = [];
+        const successor = f.safety.withBoundary(req("checkpoint"), async () => { events.push("boundary"); });
+        const capture = f.safety.settleForCredentialFreeCapture(1000).then(result => {
+          events.push("capture"); return result;
+        });
+        if (mode !== "expired") {
+          await new Promise<void>(resolve => setImmediate(resolve));
+          assert.deepEqual(events, [], "neither successor can overtake the real predecessor");
+          assert.equal(f.registry.state(), "closed", "expiry leaves the registry untouched");
+        }
+        release.resolve();
+        await active;
+        await successor;
+        assert.equal((await capture).kind, "observed_empty");
+        assert.deepEqual(events, ["boundary", "capture"], "retained slot eventually drains in order");
+        assert.equal(disposals, 0, "late predecessor settlement never starts terminal disposal");
+      } finally { release.resolve(); await active; }
+    });
+  }
+
+  for (const failure of [false, true]) {
+    it(`passes the original remaining budget and joins owned cleanup (throws=${failure})`, async () => {
+      const entered = defer<void>(), release = defer<void>(), disposing = defer<void>(), cleanup = defer<void>();
+      const primary = new Error("disposal failed");
+      const budgets: number[] = [];
+      const f = fixture(async request => {
+        budgets.push(request.deadlineMs); disposing.resolve(); await cleanup.promise;
+        if (failure) throw primary;
+        return { kind: "disposed" };
+      });
+      const active = f.safety.withBoundary(req("checkpoint"), async () => {
+        entered.resolve(); await release.promise;
+      });
+      await entered.promise;
+      const disposal = f.safety.dispose({ boundary: "terminal", deadlineMs: 50 });
+      const checked = failure ? assert.rejects(disposal, error => error === primary) : disposal;
+      f.advance(20); release.resolve(); await active; await disposing.promise;
+      assert.deepEqual(budgets, [30]);
+      assert.equal(f.cancels(), 1, "acquisition timer is cancelled once before owned cleanup");
+      let laterRan = false;
+      const later = f.safety.withBoundary(req("checkpoint"), async () => { laterRan = true; });
+      f.advance(50);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(laterRan, false, "owned cleanup is joined even past the acquisition deadline");
+      cleanup.resolve(); await checked; await later;
+      assert.equal(laterRan, true, "success or throw releases the queue");
+      assert.equal(budgets.length, 1);
+    });
+  }
+});

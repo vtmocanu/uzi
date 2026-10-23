@@ -1,4 +1,5 @@
 import { after } from "node:test";
+import { AsyncLocalStorage } from "node:async_hooks";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
@@ -118,6 +119,8 @@ function registerRoot(reg: ExecutionRegistry, root: RegisteredRoot): void {
   if (reserved.kind === "reserved") reg.registerRoot(reserved.reservation, root);
 }
 
+type Capture = NonNullable<Executor["withCredentialFreeCapture"]>;
+
 export interface CodexRig {
   installer: ReturnType<typeof createRunLaneInstallerReconcile>;
   registry: ExecutionRegistry;
@@ -133,7 +136,8 @@ export interface CodexRig {
   disposes: () => number;
   processSpawns: () => number;
   processArgv: readonly (readonly string[])[];
-  /** Issue #1766: the real facade's credential-free capture settle (for a vault-lock park). */
+  /** The real facade's credential-free callback scope (for all capture sinks). */
+  capture: Capture;
   settle: (deadlineMs: number) => Promise<CredentialFreeSettleOutcome>;
 }
 
@@ -297,6 +301,7 @@ export function codexRig(
   );
   const reconcile: ReconcileBeforeBoundary = installer.reconcile;
 
+  const captureAttempt = new AsyncLocalStorage<Parameters<Capture>[4]>();
   const inner = createCodexExecutionSafety(
     registry,
     async () => {
@@ -333,6 +338,7 @@ export function codexRig(
     },
     opts.armDeadline,
     opts.now,
+    { reaperAttempt: () => captureAttempt.getStore() },
   );
   const boundaries: string[] = [];
   const disposeBoundaries: string[] = [];
@@ -362,21 +368,30 @@ export function codexRig(
     processSpawns: () => processSpawns,
     processArgv,
     settle: (deadlineMs) => inner.settleForCredentialFreeCapture(deadlineMs),
+    capture: (deadlineMs, action, _purpose, signal, attempt) => {
+      const snapshot = attempt === undefined ? undefined : Object.freeze({
+        marker: attempt.marker, cloneKey: attempt.cloneKey, clonePath: attempt.clonePath,
+      });
+      return captureAttempt.run(snapshot, () => inner.withCredentialFreeCapture(deadlineMs, action, signal));
+    },
   };
 }
 
 /** A fake Codex executor: carries a `.safety`, NO killAgentTree, and runs `behavior`. Issue
- *  #1766: an optional `settle` is exposed as the harness-agnostic credential-free capture settle. */
+ *  An optional callback capability forwards purpose/signal and awaits owned cleanup. */
 export class FakeCodexExecutor implements Executor {
   safety: CodexExecutionSafety;
+  withCredentialFreeCapture?: Capture;
   settleForCredentialFreeCapture?: (deadlineMs: number) => Promise<CredentialFreeSettleOutcome>;
   constructor(
     safety: CodexExecutionSafety,
     private readonly behavior: (ctx: RunContext) => Promise<ExecutorResult>,
     settle?: (deadlineMs: number) => Promise<CredentialFreeSettleOutcome>,
+    capture?: Capture,
   ) {
     this.safety = safety;
     if (settle) this.settleForCredentialFreeCapture = settle;
+    if (capture) this.withCredentialFreeCapture = (ms, action, purpose, signal, attempt) => Reflect.apply(capture, undefined, [ms, action, purpose, signal, attempt]);
   }
   run(ctx: RunContext): Promise<ExecutorResult> {
     return this.behavior(ctx);
@@ -452,7 +467,7 @@ export async function finalizeDeadlineScenario(
   const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
     commitInTree(ctx.worktreePath, "STUCK-FORGE.txt", "finalize must cancel\n");
     return { branch: ctx.branch };
-  });
+  }, undefined, rig.capture);
   await runnerWith(() => ({ executor: exec }), stuckForge, undefined, undefined, {
     codexBoundaryDeadlineMs: 60_000,
   }).execute(gitlabClaim(issue));
@@ -529,7 +544,7 @@ export async function shutdownDeadlineScenario(
       started();
       await new Promise<void>((_, reject) => ctx.signal!.addEventListener("abort", () => reject(new Error("aborted")), { once: true }));
       return { branch: ctx.branch };
-    }) }), gitlab, undefined, undefined, {
+    }, undefined, rig.capture) }), gitlab, undefined, undefined, {
       codexBoundaryDeadlineMs: 60_000,
       shutdownPublishTimeoutMs: 60_000,
     });
@@ -645,7 +660,7 @@ export function enabledRecovery(): { coord: ReturnType<typeof makeRecoveryCoordi
 
 /** An executor that commits COMMITTED.txt (never fetched back) and leaves DIRTY.txt uncommitted,
  *  then returns so the finalize reconcile hits the locked vault. `deferred()` flips once it ran. */
-export function workThenDefer(rig: CodexRig, settle?: (ms: number) => Promise<CredentialFreeSettleOutcome>): {
+export function workThenDefer(rig: CodexRig, settle?: (ms: number) => Promise<CredentialFreeSettleOutcome>, capture?: Capture): {
   exec: FakeCodexExecutor;
   deferred: () => boolean;
   ctx: () => RunContext | undefined;
@@ -658,7 +673,7 @@ export function workThenDefer(rig: CodexRig, settle?: (ms: number) => Promise<Cr
     fs.writeFileSync(path.join(ctx.worktreePath, "DIRTY.txt"), "uncommitted edit\n");
     ran = true;
     return { branch: ctx.branch };
-  }, settle ?? rig.settle);
+  }, settle, capture ?? (settle ? undefined : rig.capture));
   return { exec, deferred: () => ran, ctx: () => seen };
 }
 
@@ -704,15 +719,15 @@ export function countPublishes(when: () => boolean): { count: () => number; rest
   };
 }
 
-/** A settle that reports incomplete ONCE (running `onFirst` then), and settles for real after. */
-export function settleOnceIncomplete(rig: CodexRig, onFirst: () => void): (ms: number) => Promise<CredentialFreeSettleOutcome> {
+/** Refuse acquisition ONCE (running `onFirst` then), then enter the real capture scope. */
+export function captureOnceIncomplete(rig: CodexRig, onFirst: () => void): Capture {
   let calls = 0;
-  return async (ms) => {
+  return async (ms, action, purpose, signal) => {
     if (++calls === 1) {
       onFirst();
       return { kind: "incomplete", errors: [{ category: "timeout", message: "a writer survived" }] };
     }
-    return rig.settle(ms);
+    return rig.capture(ms, action, purpose, signal);
   };
 }
 

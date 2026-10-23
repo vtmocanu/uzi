@@ -1,3 +1,4 @@
+import { enableRefreshPublication } from "./publication-fixture.js";
 import { fixtureFetchTracking, fixtureUpdateTracking, fixtureTrackingOptions } from "./runner-tracking-fixture.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -826,6 +827,8 @@ describe("RunRunner — a concurrent remote advance is not a rewrite (PRD #1416 
     };
     const remoteTip = () => gitIn(fx.originPath, ["rev-parse", branch]);
     const claim = githubTaskClaim(branch, { kind: "mr_rework", open_mr: true });
+    claim.claim_generation ??= 7;
+    await enableRefreshPublication(api, client, claim, fx.originPath, 779, "closing");
     try {
       await githubRunner(github, executor).execute(claim);
     } finally {
@@ -864,6 +867,8 @@ describe("RunRunner — a concurrent remote advance is not a rewrite (PRD #1416 
       kind: "mr_rework",
       open_mr: true,
     });
+    claim.claim_generation ??= 7;
+    await enableRefreshPublication(api, client, claim, fx.originPath, 777, "closing");
     await runner(exec, gitlab).execute(claim).catch(() => undefined);
 
     const branchMoved = api.states.some(
@@ -892,6 +897,8 @@ describe("RunRunner — a concurrent remote advance is not a rewrite (PRD #1416 
       },
     };
     const claim = taskClaim(branch, { kind: "mr_rework", open_mr: true });
+    claim.claim_generation ??= 7;
+    await enableRefreshPublication(api, client, claim, fx.originPath, 778, "closing");
     await runner(exec, gitlab).execute(claim);
     const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed")?.body;
     assert.match(failed?.failure_reason ?? "", /^scratch_publication_refused:/);
