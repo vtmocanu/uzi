@@ -2210,7 +2210,9 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
       "If this run's deliverable is a report, command output, or a verification result",
       "with NO code change to land (an evidence run), call `signal_done` with",
       "`report_only: true` instead of committing an empty change — the worker records your",
-      "summary and transcript and opens no merge request.",
+      "summary and transcript and opens no merge request. `report_only` is not how to leave the",
+      "issue open: if you committed code, omit `report_only` and declare `non_closing` with a",
+      "reason instead.",
     );
   }
   return lines.join("\n");

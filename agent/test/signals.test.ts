@@ -474,6 +474,9 @@ describe("buildSignalMcpServer prd_done_path schema gate (PRD #72 M4)", () => {
     const enabled = doneToolShape(buildSignalMcpServer({ reportOnly: true }));
     assert.ok("report_only" in enabled, `expected report_only; got ${Object.keys(enabled).join(", ")}`);
     assert.ok("summary" in enabled);
+    const description = (enabled["report_only"] as { description?: string }).description ?? "";
+    assert.match(description, /NO code change/);
+    assert.match(description, /non_closing/, "report_only points to non_closing for leaving the issue open (#3360)");
   });
 
   it("exposes signal_done proposal UNGATED on run kind, and it is optional (PRD #929 M2)", () => {

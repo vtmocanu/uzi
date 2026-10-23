@@ -330,7 +330,7 @@ function makeSignalToolHandlers(opts: SignalScanOptions): {
         content: [
           {
             type: "text",
-            text: "Completion attempt received. The worker will check the completion contract before delivery or an owner decision handoff. A request does not defer or waive any work. With report_only it records your summary and transcript and opens no merge request. On issue runs only, non_closing declares that this delivery leaves the issue open; omit it on other run kinds. End your turn.",
+            text: "Completion attempt received. The worker will check the completion contract before delivery or an owner decision handoff. A request does not defer or waive any work. With report_only it records your summary and transcript and opens no merge request when nothing was committed; work already published is delivered as a non-closing merge request. On issue runs only, non_closing declares that this delivery leaves the issue open; omit it on other run kinds. End your turn.",
           },
         ],
       };
@@ -501,7 +501,8 @@ export function buildSignalMcpServer(
       .describe(
         "Set true ONLY when the run's deliverable is a report, command output, or a " +
           "verification result with NO code change to land, so the worker records the findings " +
-          "and opens no merge request. Omit it (or set false) when a code change was committed.",
+          "and opens no merge request. Omit it (or set false) when a code change was committed. " +
+          "It does not leave the issue open; to leave the issue open use `non_closing`.",
       );
   }
   // Issue #2083: the private decisions memo for the next rework run. Same conditional-shape
@@ -618,7 +619,7 @@ export function buildSignalMcpServer(
       ),
       tool(
         SIGNAL_DONE_TOOL,
-        "Submit a completion attempt after committing locally and passing review. The worker checks the completion contract before delivery or an owner decision handoff; you never push. An owner decision request does not defer or waive work. With report_only the worker records your summary and transcript and opens no merge request.",
+        "Submit a completion attempt after committing locally and passing review. The worker checks the completion contract before delivery or an owner decision handoff; you never push. An owner decision request does not defer or waive work. With report_only the worker records your summary and transcript and opens no merge request when nothing was committed; work already published is delivered as a non-closing merge request.",
         doneShape,
         (input) => h.signalDone(input),
       ),
