@@ -3,11 +3,13 @@ package workersvc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/vault"
@@ -15,11 +17,83 @@ import (
 
 type healthCrossCheckPlacementStore struct {
 	*healthFakeStore
-	childID uuid.UUID
+	childID  uuid.UUID
+	childErr error
 }
 
 func (f *healthCrossCheckPlacementStore) GetPlanCrossCheckChildForHealth(context.Context, uuid.UUID) (uuid.UUID, error) {
-	return f.childID, nil
+	return f.childID, f.childErr
+}
+
+func TestHealthCrossCheckManualReadFailurePreservesEpisode(t *testing.T) {
+	for _, failedRead := range []string{"live", "child", "eligibility"} {
+		t.Run(failedRead, func(t *testing.T) {
+			r := stalledRunRow()
+			r.Kind = runkind.Issue
+			r.Health = healthWaitingWorker
+			r.HealthReason = pgconv.TextOrNull("waiting for workers cordoned (manual): checker operator at " + t0.Add(-20*time.Minute).Format(time.RFC3339) + ": maintenance")
+			r.HealthSince = ago(20 * time.Minute)
+			r.HealthNotifiedAt = ago(15 * time.Minute)
+			fs, svc, b := nudgeSvc(t, r, defaultHealthSettings())
+			fs.liveCrossCheck = map[uuid.UUID]bool{r.ID: true}
+			fs.eligibility = store.CountOnlineWorkersClaimableForRunRow{StrictEligible: 1, Claimable: 1}
+			placement := &healthCrossCheckPlacementStore{healthFakeStore: fs, childID: uuid.New()}
+			svc.q = placement
+			readErr := errors.New("placement read unavailable")
+			switch failedRead {
+			case "live":
+				fs.liveCrossCheckErr = readErr
+			case "child":
+				placement.childErr = readErr
+			case "eligibility":
+				fs.eligibilityErr = readErr
+			}
+
+			if changed := svc.detectRunHealth(context.Background(), t0); changed != 0 {
+				t.Fatalf("failed read changed=%d writes=%+v", changed, fs.writes)
+			}
+			if len(fs.writes) != 0 || len(b.healthNudges) != 0 {
+				t.Fatalf("failed read wrote or broadcast: writes=%+v nudges=%v", fs.writes, b.healthNudges)
+			}
+			if got := fs.active[0]; got.Health != r.Health || got.HealthReason != r.HealthReason ||
+				got.HealthSince != r.HealthSince || got.HealthNotifiedAt != r.HealthNotifiedAt {
+				t.Fatalf("failed read changed manual episode: %+v", got)
+			}
+
+			fs.liveCrossCheckErr, placement.childErr, fs.eligibilityErr = nil, nil, nil
+			if changed := svc.detectRunHealth(context.Background(), t0.Add(time.Minute)); changed != 1 {
+				t.Fatalf("recovered read changed=%d want 1", changed)
+			}
+			w := lastWrite(t, fs, r.ID)
+			if len(fs.writes) != 1 || w.Health != healthWaitingWorker || w.HealthReason.String != reasonPlanCrossCheckWaiting {
+				t.Fatalf("recovered placement write=%+v", w)
+			}
+			if w.HealthSince != r.HealthSince || w.HealthNotifiedAt.Valid {
+				t.Fatalf("recovered read reset episode stamps: %+v", w)
+			}
+			// SetRunHealth preserves the existing notification stamp when its parameter is NULL.
+			if len(b.healthNudges) != 1 || b.healthNudges[0] {
+				t.Fatalf("recovered read nudged: %v", b.healthNudges)
+			}
+		})
+	}
+}
+
+func TestHealthCrossCheckManualConfirmedNoLiveRecovers(t *testing.T) {
+	r := stalledRunRow()
+	r.Kind = runkind.Issue
+	r.Health = healthWaitingWorker
+	r.HealthReason = pgconv.TextOrNull("waiting for workers cordoned (manual): checker maintenance")
+	r.HealthSince = ago(20 * time.Minute)
+	r.HealthNotifiedAt = ago(15 * time.Minute)
+	fs, svc, _ := nudgeSvc(t, r, defaultHealthSettings())
+	svc.q = &healthCrossCheckPlacementStore{healthFakeStore: fs, childID: uuid.New()}
+	if changed := svc.detectRunHealth(context.Background(), t0); changed != 1 {
+		t.Fatalf("confirmed no live checker changed=%d want 1", changed)
+	}
+	if w := lastWrite(t, fs, r.ID); w.Health != healthStalled || w.HealthReason.String != reasonStalled {
+		t.Fatalf("confirmed no live checker did not resume diagnosis: %+v", w)
+	}
 }
 
 func TestHealthQueuedCheckerCustodyExemption(t *testing.T) {
