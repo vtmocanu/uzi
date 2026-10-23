@@ -45,7 +45,7 @@ func TestClaimCheckpointRecoveryEncoding(t *testing.T) {
 // Claim's real assembly seam lets confirmation commit before the final handoff.
 func TestClaimCheckpointRecoveryProjectionLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
-	for _, mode := range []string{"none", "nonready", "ready", "confirmed", "null anchors"} {
+	for _, mode := range []string{"none", "nonready", "ready", "matching tip", "confirmed", "null anchors"} {
 		t.Run(mode, func(t *testing.T) {
 			f := newCustodyContinuationFixture(t, env)
 			id := seedCoordinateTask(f)
@@ -80,6 +80,10 @@ func TestClaimCheckpointRecoveryProjectionLiveDB(t *testing.T) {
 				}
 				// Neither due scheduling, nor matching the current tip, may hide an attempt.
 				env.exec("UPDATE checkpoint_publish_attempts SET next_check_at=now()+interval '1 day' WHERE id=$1", attemptID)
+				if mode == "matching tip" {
+					env.exec("UPDATE runs SET checkpoint_tip=$2 WHERE id=$1", id, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+					return
+				}
 				if mode == "nonready" {
 					return
 				}
@@ -106,7 +110,7 @@ func TestClaimCheckpointRecoveryProjectionLiveDB(t *testing.T) {
 			if err != nil || payload == nil || !hookRan || payload.CheckpointCoordinates == nil || payload.CheckpointWriteUnresolved == nil {
 				t.Fatalf("claim projection missing: payload=%v hook=%v err=%v", payload != nil, hookRan, err)
 			}
-			want := mode == "nonready" || mode == "ready"
+			want := mode == "nonready" || mode == "ready" || mode == "matching tip"
 			if *payload.CheckpointWriteUnresolved != want {
 				t.Fatalf("unresolved=%v want=%v", *payload.CheckpointWriteUnresolved, want)
 			}
@@ -114,6 +118,10 @@ func TestClaimCheckpointRecoveryProjectionLiveDB(t *testing.T) {
 				if payload.CheckpointTip == nil || *payload.CheckpointTip != "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" ||
 					payload.CheckpointAttestedSource == nil || *payload.CheckpointAttestedSource != "cccccccccccccccccccccccccccccccccccccccc" {
 					t.Fatal("handoff retained pre-confirmation anchors")
+				}
+			} else if mode == "matching tip" {
+				if payload.CheckpointTip == nil || *payload.CheckpointTip != "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" || payload.CheckpointAttestedSource != nil {
+					t.Fatal("matching-tip unresolved evidence or nullable attestation was not refreshed")
 				}
 			} else if payload.CheckpointTip != nil || payload.CheckpointAttestedSource != nil {
 				t.Fatal("NULL anchors were not refreshed")
