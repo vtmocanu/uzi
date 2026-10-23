@@ -122,6 +122,9 @@ func TestPublicationContextResolverLiveDB(t *testing.T) {
 				if result.Status != want {
 					t.Fatalf("status want %s: %+v", want, result)
 				}
+				if want == "not_applicable" && (result.Binding == nil || result.Binding.IssueIID != nil) {
+					t.Fatalf("not_applicable must carry no source issue: %+v", result.Binding)
+				}
 				if want == "resolved" {
 					intent := "closing"
 					if scenario == "non_closing" || scenario == "failed_restricted" {

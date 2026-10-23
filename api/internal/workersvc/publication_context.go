@@ -197,6 +197,9 @@ func resolvePublicationSnapshot(s publicationSnapshot, w store.Worker, id uuid.U
 		CandidateHead: req.CandidateHead, MRIID: *source.MRIID, SourceRunID: source.ID, IssueIID: source.IssueIID}
 	if source.Kind == "prompt" || source.Kind == "self_improve" {
 		binding.Intent = "not_applicable"
+		// A self-improvement run carries its tracking issue, which it never closes; the wire
+		// contract sends no source issue for a not-applicable source.
+		binding.IssueIID = nil
 		return PublicationContextResponse{Version: 1, Status: "not_applicable", Binding: binding}
 	}
 	if source.Kind != "issue" || source.IssueIID == nil || !publicationSafeID(*source.IssueIID) || source.ReportOnly {
