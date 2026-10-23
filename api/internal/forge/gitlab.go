@@ -542,7 +542,7 @@ func (g *gitLab) GetMergeRequest(ctx context.Context, projectID, mrIID int64) (M
 	state := &responseLimitState{}
 	mr, _, err := g.client.MergeRequests.GetMergeRequest(projectID, mrIID, nil, gitlab.WithContext(withResponseLimit(ctx, state)))
 	if state.overflow.Load() {
-		return MergeRequest{}, g.wrapErr("get merge request", state.err())
+		return MergeRequest{}, g.wrapErr("get merge request", mrOverflowError(state.err()))
 	}
 	if err != nil {
 		return MergeRequest{}, g.wrapErr("get merge request", err)

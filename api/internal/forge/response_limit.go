@@ -65,6 +65,18 @@ func (e *ResponseTooLargeError) safeCopy() *ResponseTooLargeError {
 	return out
 }
 
+// mrOverflowError preserves the MR methods' overflow class while retaining only
+// safe response provenance. Ordinary errors keep their existing classification.
+func mrOverflowError(err error) error {
+	var large *ResponseTooLargeError
+	if !errors.As(err, &large) {
+		return err
+	}
+	out := large.safeCopy()
+	out.Outcome = ErrorClassOther
+	return out
+}
+
 // IsIssueResponseTooLarge requires affirmative provenance from a successful
 // direct issue response. Bare sentinels and unknown responses are not permanent.
 func IsIssueResponseTooLarge(err error) bool {
