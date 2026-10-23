@@ -95,12 +95,9 @@ func preparePolicyRevisionAcceptance(ctx context.Context, tx pgx.Tx, w store.Wor
 			cc.RevisionDisposition.Valid || cc.RevisionSettledAt.Valid || cc.RevisionSupersededByStopInputID.Valid {
 			return nil, nil
 		}
-		candidate := PlanCrossCheckCandidate{PlanMd: cc.PlanMd.String, Milestones: cc.Milestones,
-			RequiredCapabilities: cc.RequiredCapabilities, RequiredTools: cc.RequiredTools,
-			SizeClass: cc.SizeClass.String, BaseCommit: cc.BaseCommit.String, PlanningDiff: cc.PlanningDiff.String}
-		digest, err := candidate.Digest()
-		if err != nil || !bytes.Equal(digest, cc.CandidateDigest) {
-			return nil, nil
+		valid, err := policyRevisionIdentityValid(ctx, q, cc)
+		if err != nil || !valid {
+			return nil, err
 		}
 		primary := source.PrimaryRevision != nil && source.PrimaryRevision.CrossCheckID != nil && *source.PrimaryRevision.CrossCheckID == *ref.CrossCheckID
 		if primary && (cc.Verdict != "revise" || !cc.DecidedAt.Valid) {

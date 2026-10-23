@@ -325,9 +325,11 @@ func policyStopManifestLocked(ctx context.Context, qtx *store.Queries, r store.R
 		if noGate && (cc.Verdict != "approve" || cc.LeadClaimGeneration > r.ClaimGeneration || cc.RevisionSupersededByStopInputID.Valid) {
 			return bad()
 		}
-		candidate := PlanCrossCheckCandidate{PlanMd: cc.PlanMd.String, Milestones: cc.Milestones, RequiredCapabilities: cc.RequiredCapabilities, RequiredTools: cc.RequiredTools, SizeClass: cc.SizeClass.String, BaseCommit: cc.BaseCommit.String, PlanningDiff: cc.PlanningDiff.String}
-		digest, err := candidate.Digest()
-		if err != nil || !bytes.Equal(digest, cc.CandidateDigest) {
+		valid, err := policyRevisionIdentityValid(ctx, qtx, cc)
+		if err != nil {
+			return m, err
+		}
+		if !valid {
 			return bad()
 		}
 		if selected != nil && *selected == id.String() {

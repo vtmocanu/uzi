@@ -190,10 +190,9 @@ func policyRevisionSourceWithCreatedCrossCheck(ctx context.Context, q *store.Que
 		if cc.LeadRunID != r.ID || cc.Stage != "plan" || cc.Round < 1 || cc.LeadClaimGeneration <= 0 {
 			return nil, nil
 		}
-		candidate := PlanCrossCheckCandidate{PlanMd: cc.PlanMd.String, Milestones: cc.Milestones, RequiredCapabilities: cc.RequiredCapabilities, RequiredTools: cc.RequiredTools, SizeClass: cc.SizeClass.String, BaseCommit: cc.BaseCommit.String, PlanningDiff: cc.PlanningDiff.String}
-		digest, err := candidate.Digest()
-		if err != nil || !bytes.Equal(digest, cc.CandidateDigest) {
-			return nil, nil
+		valid, err := policyRevisionIdentityValid(ctx, q, cc)
+		if err != nil || !valid {
+			return nil, err
 		}
 		if id == created.ID {
 			return nil, fmt.Errorf("new cross-check already in pre-creation inventory")
@@ -319,10 +318,9 @@ func policyRevisionWitness(ctx context.Context, tx pgx.Tx, r store.Run, w store.
 		!r.PolicyCandidateCrossCheckID.Valid || uuid.UUID(r.PolicyCandidateCrossCheckID.Bytes) != id) {
 		return false, nil
 	}
-	candidate := PlanCrossCheckCandidate{PlanMd: cc.PlanMd.String, Milestones: cc.Milestones, RequiredCapabilities: cc.RequiredCapabilities, RequiredTools: cc.RequiredTools, SizeClass: cc.SizeClass.String, BaseCommit: cc.BaseCommit.String, PlanningDiff: cc.PlanningDiff.String}
-	digest, err := candidate.Digest()
-	if err != nil || !bytes.Equal(digest, cc.CandidateDigest) {
-		return false, nil
+	valid, err := policyRevisionIdentityValid(ctx, store.New(tx), cc)
+	if err != nil || !valid {
+		return false, err
 	}
 	if !primary || r.GateRevision == 0 {
 		return true, nil

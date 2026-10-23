@@ -114,13 +114,8 @@ func policyRevisionPlanApproved(ctx context.Context, reader any, r store.Run, le
 			!cc.DecidedAt.Valid || cc.RevisionSettledAt.Valid || cc.RevisionDisposition.Valid || cc.RevisionSupersededByStopInputID.Valid {
 			return false
 		}
-		candidate := PlanCrossCheckCandidate{
-			PlanMd: cc.PlanMd.String, Milestones: cc.Milestones,
-			RequiredCapabilities: cc.RequiredCapabilities, RequiredTools: cc.RequiredTools,
-			SizeClass: cc.SizeClass.String, BaseCommit: cc.BaseCommit.String, PlanningDiff: cc.PlanningDiff.String,
-		}
-		digest, err := candidate.Digest()
-		if err != nil || !bytes.Equal(digest, cc.CandidateDigest) {
+		valid, err := policyRevisionIdentityValid(ctx, reader, cc)
+		if err != nil || !valid {
 			return false
 		}
 		projection := gatePresentedPayload{
