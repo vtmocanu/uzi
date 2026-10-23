@@ -768,8 +768,8 @@ an unproven **process** is treated as a run still running.
 What happens next depends on where in the run this check comes up, because
 most of the places that check are not the end of the run:
 
-- At a wall-clock, usage-limit, or completion-hold park, the check being
-  unproven means the worker skips the capture for that park entirely — no
+- At a wall-clock, usage-limit, or completion-hold park, if the required proof
+  remains unproven, the worker skips capture for that park — no
   checkpoint publish, so the latest local work stays on this worker only
   for now (a checkpoint publish targets a separate checkpoint ref, never
   the run's branch directly) — but the park itself still stands: a
@@ -778,21 +778,28 @@ most of the places that check are not the end of the run:
   Docker-wired worker, that later capture can still fail the run with
   worker residue blocked), while a resume on another worker recovers only
   from whatever checkpoint was last durably published.
-- At a pause the owner requested, it means the pause itself fails: the run
-  reports **pause failed** and keeps running rather than stopping on
-  unproven ground.
+- At a pause the owner requested, the pause cannot capture without proof.
+  Claude reports **pause failed** and continues when its existing checks allow it.
+  Codex continues only through a fresh provider epoch after proven cleanup; an
+  unacknowledged or refused pause with unproven cleanup retains a nonterminal stop
+  instead (ADR-1783's accepted B1 behavior).
 - At a milestone checkpoint, it means that one checkpoint's publish is
   skipped and the run continues to its next milestone.
-- During a credential switch, the worker retries capturing a verified
+- During a Claude credential switch, the worker retries capturing a verified
   restore point a bounded number of times. If it never succeeds, it reports
   **credential switch failed**; when the server confirms the failure stamp
   cleared, the run normally continues on the old credential in place (its
   clone and session are kept); otherwise it is stopped and left to be
   requeued rather than continuing on uncertain ground.
-- A recovery capture that cannot prove the clone stopped is retried, up to a
-  bounded number of times; if the clone still can't be proven stopped after
-  that, the run fails the same way finalize does (see below), with the clone
-  kept.
+- A Claude recovery capture that cannot prove the clone stopped is retried a
+  bounded number of times; if proof still fails, the run fails the same way
+  finalize does (see below), with the clone kept. Codex ordinary recovery can
+  first use the credential-free fallback described below; refused or exhausted
+  proof retains a nonterminal stop without claiming a verified capture.
+- Codex direct and retained credential switches retain/refuse before capture or
+  credential work. Codex per-run overrides remain unsupported (D9); only Claude
+  invokes the switch callback, including its existing retained-switch hold flow
+  ([credential-switch holds](run-recovery.md#credential-switch-holds)).
 - On graceful shutdown, an unproven clone means nothing is published to the
   run's checkpoint; the pending requeue stands, and a later resume recovers
   from whatever was last durably saved.
@@ -827,16 +834,28 @@ stub run's own checks at those sites, and blocks the canonical clone reseed
 and, on a Docker-wired worker, every capture of another attempt's clone,
 regardless of which harness the run belongs to (seeding a fresh attempt clone is the one
 exception described above), by design:
-the worker would rather refuse to proceed than guess. **A Codex run's own
-checks are a disclosed exception**: they don't scan the process table at
-all, relying instead on Codex's own proof that its processes have drained,
-so an unaccountable process elsewhere on the worker does not block a Codex
-run's own park, finalize, shutdown, retire, or recovery and credential-switch
-capture the way it blocks a Claude or stub run's. The exception is a run
-capturing a predecessor attempt's clone: its recovery capture always scans.
-See [ADR-1783](../adr/1783-run-quiescence-and-attempt-clone-paths.md)
-for exactly which of those checks still has no process proof at all. A
-process the worker *can* positively tie, by ancestry, to another live run's
+the worker would rather refuse to proceed than guess. **Codex own-mode checks
+are a disclosed exception**: they skip this process-table scan. Slice B keeps
+registered-root process exclusion across Codex wall/hold and ordinary recovery
+capture, from before source access through verification, optional publication and
+source-dependent settlement; predecessor capture still uses capture-mode scanning.
+After its primary scope joins, a refused healthy capture can use A's credential-free
+`observed_empty` fallback within the original deadline. Wall/hold fallback stays
+local; recovery may use its existing join-token publication. Optional publication
+failure keeps already verified local work without recapture. Exhausted or refused
+proof retains the source, session and inventory without inventing success or an ACK.
+Cancellation, fencing and shutdown revocation grant no fallback; ordinary Codex
+capture stops after shutdown revokes authority. The typed #3109 graceful checkpoint
+path stays separate. Codex recovery parks skip the later post-scope clone diagnostic;
+Claude and terminal/stale paths keep their prior behavior. Terminal disposal does
+not close C's snapshot/late-writer gap: strengthened terminal proof remains unshipped.
+Docker writer exclusion, accepted-but-invisible creates (#1860) and Claude terminal
+residuals also remain open. See
+[ADR-1783's A/B contract](../adr/1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect)
+for the original 180-second episode, 120-second healthy phase and 60-second fallback
+reserve, shared with parent deadlines, retries and joined cleanup. (AI-synced 2026-10-23)
+
+A process the worker *can* positively tie, by ancestry, to another live run's
 own recorded root, or to a long-lived process the worker itself launched
 (not the agent), is not this case: it is attributed and does not block.
 When the check is unproven

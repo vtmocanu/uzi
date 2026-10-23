@@ -94,10 +94,12 @@ healthy checkpoint fully stopped and cleaned up the prior Codex execution, then
 initial credential release for its replacement exhausts, credential-free preservation
 can still proceed after fresh settlement within the original deadline. This grants
 no model or credential authority and does not change source retention. Local capture
-moves capturable work from the ephemeral clone into the durable worker bare;
-blanket refusal would regress verified park/pause preservation. It does not
-prove that latest work is archived or authorize source deletion. After an accepted
-owner pause, later source checks require fresh capture authority. If that proof
+moves capturable work from the source clone into a verified capture in the durable
+worker bare; blanket refusal would strand that work in the source.
+Older Docker layouts could lose source work on pod replacement; migrated hosted
+workers keep the source on a PVC ([ADR-3153](../adr/3153-runner-shared-pvc-subpath.md)).
+Neither layout nor capture authorizes source deletion or guarantees a latest-work
+archive. After an accepted owner pause, later source checks require fresh capture authority. If that proof
 refuses, the exact parked source, session, journal and custody remain retained;
 an uncertain acknowledgment starts neither recapture nor another pause attempt.
 A bounded observation can return while memory capture or its cleanup remains
@@ -123,9 +125,30 @@ verification, direct publication or capture through `recordRecoveryCapture`.
 This integration adds no capture allowlist exception. (AI-synced 2026-10-18)
 Retained-source capture ends at its durable capture record; creating a fresh
 successor from that bare pin follows outside the held capture, without reading
-old clone bytes. Healthy credentialed whole-capture closure (B) and strengthened
-terminal proof (C) remain unshipped; existing terminal executor disposal still
-applies, with snapshot coverage still preceding strengthened writer-exclusion proof.
+old clone bytes. **Slice B (Refs #2852) (AI-synced 2026-10-23)** now keeps
+registered-root process exclusion across Codex wall park, completion hold and
+ordinary recovery: from before the first source operation through local verification,
+optional publication and source-dependent settlement. Recovery with `terminalDisk`
+reuses its held proof rather than acquiring another scope.
+
+The original episode allows 180 seconds total, with 120 seconds for healthy capture
+and 60 seconds reserved for fallback. Public wall/hold waiting starts that clock
+before the sink gate; parent deadlines can shorten it. Retry, deferral and cleanup
+do not renew authority. Owned cleanup stays joined even if it finishes later, but
+expiry permits no new sensitive work. After the primary scope joins, A's
+`observed_empty` fallback can preserve locally without refresh, PAT or overlay.
+Wall/hold fallback is local-only; recovery can use its existing join-token publish.
+Verified local work survives optional publication failure without recapture.
+Refused or exhausted proof keeps the exact source, session and inventory; it
+establishes neither a verified head nor an acknowledgment. Cancellation, claim
+fencing and shutdown revocation grant no fallback. Ordinary Codex capture stops
+when shutdown revokes authority; the typed #3109 graceful checkpoint stays separate.
+See [the canonical A/B contract](../adr/1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect)
+for scope and deadline internals. This adds no fresh park secret scan; remembered
+findings and the pack guard keep their existing rules.
+
+Strengthened terminal proof (C) remains unshipped; existing terminal executor disposal
+still applies, with snapshot coverage still preceding strengthened writer-exclusion proof.
 Registered-root capture exclusion does not exclude daemon or sibling writers,
 accepted-but-invisible creates (#1860), or Claude terminal residuals; per-attempt
 cgroup proof (#1862) remains unshipped. Automatic reclaim remains disabled (#1858),
@@ -174,7 +197,12 @@ decisions, plain-resume refusal and version limits.
 
 ## Credential-switch holds
 
-When you switch the token of a run that still carries retained recovery work
+This flow applies to Claude. Codex per-run credential overrides remain unsupported
+(D9); its direct and retained switch entries retain/refuse before capture or
+credential work. Only Claude invokes the switch callback; see
+[ADR-1247](../adr/1247-per-run-token-selection.md).
+
+When you switch the token of a Claude run that still carries retained recovery work
 ([Anthropic tokens](anthropic-token.md#where-you-can-pick-it)), the worker
 first proves the run's own processes stopped before it reports the switch:
 a guarded command settle, a kill of the agent's process tree, a reap of
@@ -184,9 +212,8 @@ not, the run is held for you. The hold is `paused` and keeps the run's work
 and custody on that worker:
 
 - **`credential_switch_settling`**: the worker is still finishing its own
-  operations: on a Claude run the guarded-lane disposal and dependency
-  install, joined without starting or killing anything; on a Codex run its
-  normal terminal tool disposal.
+  operations: the Claude guarded-lane disposal and dependency
+  install, joined without starting or killing anything.
   While the holding worker is live and still the same registration, **Resume**
   and `uzi run set-token` are refused with a 409 ("the worker is still
   finishing its own operations for this run; try Resume again shortly, or
@@ -732,8 +759,11 @@ leaves, and whether coverage can release it, depends on the exit:
 - **Park release paths** (recovery, provider outage, credential-switch, disk and
   live non-terminal final parks) keep the exact clone and its existing recovery
   journal even when covered, with no `uzi-stopped` marker or `reclaimed` entry.
-  Coverage is diagnostic when checked; shutdown still skips the check. A
-  successful direct credential switch also keeps the clone for recapture.
+  Coverage is diagnostic when checked; shutdown still skips the check. Codex
+  recovery parks skip the post-scope clone diagnostic at the original cleanup
+  site, preserving `sourceExitDenied` and retention latches. Claude and terminal/stale
+  paths keep their existing checks. A successful direct Claude credential switch
+  also keeps the clone for recapture.
 - **Terminal exits** (`completed`, `failed`, `cancelled`) retain their existing
   covered release at the handler's exit. Otherwise the clone and plain journal
   stay; a kept terminal clone still follows existing terminal-orphan handling.
@@ -777,9 +807,11 @@ and hold state; automatic recovery or Resume is not guaranteed. Retained-source 
 uses a fresh attempt path and model session (`thread/start`), not the old model thread.
 Newer cancellation, pause and vault-lock state are
 checked before credentials or another model turn; a locked vault can defer recreation
-into credential recovery. This does not make an open approval gate parkable. Healthy
-credentialed capture gaps (B) and the terminal snapshot/late-writer limitation (C)
-remain open; existing terminal disposal does not remove that snapshot limitation.
+into credential recovery. This does not make an open approval gate parkable.
+Slice B now covers Codex wall/hold/ordinary recovery through source-dependent
+settlement; see [ADR-1783](../adr/1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect).
+Strengthened terminal proof (C) remains unshipped; existing terminal disposal does not remove the
+snapshot/late-writer limitation. (AI-synced 2026-10-23)
 After terminal settlement, verified capture evidence can attest that the disposed
 Codex registry drained for command-cache release. Later poison, changed registry
 facts, unclean cache roots or open roots retain that cache. This avoids retaining
@@ -789,7 +821,7 @@ kill behavior; no-kill observation requires a genuine report budget. Existing
 absolute deadlines expire without detaching owned cleanup or renewing authority.
 The detailed boundary is in [ADR-1783](../adr/1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect).
 Refs #2852 (AI-synced 2026-10-18).
-A does not complete #2852. Independent #3031 work is not a prerequisite and gains no
+A plus B does not complete #2852. Independent #3031 work is not a prerequisite and gains no
 model-free capture coverage or changes to producers, ledger, custody or settlement.
 
 Retained bytes, identity metadata and the safety inventory have no retention

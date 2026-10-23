@@ -480,7 +480,18 @@ it admits no provider turn or normal callback, admission reopen, credential
 reconciliation, refresh or release, PAT, credential-bearing environment or overlay.
 Lost supervision or incomplete settlement grants no capture authority. This context
 mints neither a credentialed nor a completion permit. See the
-[remaining sink gaps](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect).
+[sink contracts and remaining terminal gap](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect).
+
+**Slice B contract, Refs #2852 (AI-synced 2026-10-23):** healthy Codex wall
+park, completion hold and ordinary recovery hold the existing process permit from
+before source inspection through capture and source-dependent settlement. The
+private authenticated capability is bound to its exact flight/executor and callback
+lifetime; Git children use the existing supervisor and await full cleanup. A's
+credential-free fallback starts only after the primary scope joins, within the
+same deadline. Unexpected Codex credential-switch entries retain without capture.
+Claude behavior and terminal disposal remain unchanged. The linked
+[sink contract](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect)
+records the budget, held-finalize continuation, publication and remaining C/Docker limits.
 
 Pre-start capture uses the existing capture-only facade. A later owned capture can
 also select a fresh production capture-only facade for the exact retired public
@@ -568,8 +579,12 @@ Trusted-worker bare Git keeps its worker identity;
 `worker_pat` is the historical identity name, not evidence of credential presence.
 Credential presence is checked separately; free capture does not downgrade bare
 Git to the isolated clone identity. Blanket refusal of free capture was rejected:
-it leaves uncaptured work in an ephemeral clone instead of moving capturable work
-into the persistent worker bare and regresses verified park/pause preservation.
+it strands capturable work, including work awaiting verified capture, in the source
+clone instead of moving verified bytes into the persistent worker bare and regresses
+verified park/pause preservation. Older Docker emptyDir layouts could lose that source
+on pod replacement; [ADR-3153](3153-runner-shared-pvc-subpath.md) migrated workers
+keep it on the data PVC. Neither layout nor successful capture grants deletion authority
+(AI-synced 2026-10-23).
 Local capture alone proves neither origin publication nor permission to dispose
 of the source. Worker-provided global Git
 config may configure drivers; ordinary seeding trust is unchanged. These

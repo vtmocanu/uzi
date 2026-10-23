@@ -311,9 +311,12 @@ authority. See [ADR-1597's residual boundaries](1597-midturn-checkpoint-durabili
   active capture retains its revision and full supervised-child settlement, and
   exact completed evidence survives disposal. Healthy queue expiry still fails
   closed; no deadline is extended. (AI-synced 2026-10-18)
-  The capture context mints neither a credentialed nor a
+  A's credential-free capture context mints neither a credentialed nor a
   completion permit; absence of that permit does not mean absence of a held
-  capture boundary. [ADR-1106](1106-codex-harness.md#process-root-ownership)
+  capture boundary. B's authenticated context instead carries the existing permit
+  under private exact-flight/executor/safety identity and callback lifetime checks;
+  a structural lookalike or an error field grants no authority (AI-synced 2026-10-23).
+  [ADR-1106](1106-codex-harness.md#process-root-ownership)
   records the canonical empty helper/askpass launch policy and separate
   credential-presence check for the trusted worker identity `worker_pat`.
   Codex JS dependency installation and Devbox install/shellenv retain their normal
@@ -437,18 +440,53 @@ authority. See [ADR-1597's residual boundaries](1597-midturn-checkpoint-durabili
   fresh successor creation from the durable bare pin is outside capture. It reads
   predecessor lstat metadata, not old clone bytes; ordinary seeding trust is unchanged.
 
-  The healthy credentialed wall park, completion hold and recovery/credential-switch
-  captures still have the pre-publish status/WIP/fetch-back gap; wrapping publish
-  alone does not close it. That is slice B, **unshipped** in A. Terminal paths
-  already have executor disposal; the remaining gap is snapshot coverage before
-  writer-exclusion proof, not a blanket absence of disposal. Strengthened terminal
-  process proof is slice C, **unshipped**. `CodexExecutor` has no `killAgentTree`
-  implementation, so the direct optional call is not Codex process proof.
-  Neither the held capture nor a process scan proves Docker writer exclusion;
-  accepted-but-invisible daemon creates (#1860) and Claude residuals remain.
+  **Slice B contract, Refs #2852 (AI-synced 2026-10-23):** B is implemented in
+  this delivery. Healthy Codex wall park, completion hold and ordinary recovery,
+  including recovery with `terminalDisk`, keep registered-root process exclusion from before
+  the first source operation through WIP commit, import/fetch-back, readback,
+  bridge, ownership checks, publication and source-dependent settlement. Scoped
+  Git spawners join full child cleanup. New acquisitions order sink gate, safety,
+  then bare lock; already-held finalize preserves its original order and deadline.
+  The private authenticated capability is bound to the exact flight, executor and
+  safety facade and expires with its callback. Both finalize hold branches use a
+  private one-shot continuation after the parent boundary joins; error names,
+  causes and actionError fields cannot issue it. Continuation replays neither
+  publication nor an ACK.
+
+  One episode starts before public wall/hold sink-gate waiting: 180 s total,
+  with 120 s for healthy capture reserving 60 s for fallback. Parent deadlines cap
+  both phases; retries and disposition use remaining time, never a renewed deadline.
+  Owned cleanup may finish later but stays joined; expiry authorizes no further
+  sensitive work and abandons no owned work. Before verified local capture, primary
+  poison, boundary refusal or expiry can take A's observed_empty fallback only
+  after the primary scope joins, with no refresh, PAT or overlay. Wall/hold fallback
+  is local-only; recovery may use its existing join-token publication. An already
+  verified local result survives optional publication failure without recapture.
+  Cancellation, claim fencing and shutdown revocation grant no fallback. Ordinary
+  Codex completion capture therefore stops and retains after runner.shutdown;
+  the typed #3109 graceful-shutdown checkpoint path remains separate and unchanged.
+
+  Both direct and retained Codex credential-switch entries retain/refuse before
+  capture or credential work. Codex per-run overrides remain unsupported under D9
+  ([override refusal](../api/internal/workersvc/credential_override.go) and
+  [run creation](../api/internal/workersvc/service.go)); only the
+  [Claude executor](../agent/src/sdk-executor.ts) invokes the switch callback.
+  Claude behavior is unchanged. Codex recovery-park
+  cleanup skips its post-scope clone diagnostic at the original cleanup site, after
+  the original guards, preserving sourceExitDenied and retention latches. Claude
+  and terminal reasons retain their prior paths.
+
+  Terminal paths already have executor disposal; B changes neither disposeTools
+  nor slice C's still-unshipped strengthened terminal proof. Snapshot coverage
+  before writer-exclusion proof remains a gap. `CodexExecutor` has no killAgentTree
+  implementation, so the direct optional call is not Codex process proof. Neither
+  A nor B proves Docker writer exclusion: accepted-but-invisible daemon creates
+  (#1860), daemon/sibling writers and Claude residuals remain.
 
   A accounts for **R1857-01 and the credential-free half of R1857-05**, using
-  shared R1857-07/08 controls. It does not complete #2852 or claim B/C coverage.
+  shared R1857-07/08 controls. B covers R1857-03/-04, the credentialed half of
+  R1857-05, R1857-06 by Codex unreachability plus worker refusal, and its R1857-07/08
+  controls. A plus B does not complete #2852 or claim C's R1857-02 coverage.
   Per-attempt cgroups (#1862) remain unshipped, not an available proof. #1858
   still forbids automatic retention reclaim. Preservation authority is not
   deletion authority: #2746's custody SETTLE and physical CLEANUP stay separate.
@@ -493,10 +531,11 @@ authority. See [ADR-1597's residual boundaries](1597-midturn-checkpoint-durabili
 
 Process proof remains limited to the boundary that actually runs: the Linux
 reaper where enabled, the existing credentialed Codex supervisor boundary, or
-A's callback-held credential-free GitCache capture (contract above).
-The held capture covers its action and supervised children; it does not close
-B's healthy credentialed pre-publish gaps or strengthen C's terminal release
-proof. Claude/stub process handling is unchanged. This says nothing about a Docker
+A's callback-held credential-free GitCache capture or B's whole-region healthy
+Codex capture (contracts above). B closes the healthy pre-publish process gap
+through source-dependent settlement; C's terminal release proof remains unchanged
+and unshipped (AI-synced 2026-10-23). Claude/stub process handling is unchanged.
+This says nothing about a Docker
 container — the Docker teardown that runs alongside it is best-effort cleanup,
 not proof, so a container that still binds the clone path can, in principle,
 outlive the checks that gate on process quiescence alone. Attempt-unique clone
@@ -571,8 +610,8 @@ ssh-agent an unrelated tool started, not necessarily this run's own — is a
 covers. Canonical reseed and predecessor/orphan capture run `seed`/`capture`
 mode, which scans regardless of executor. Claude and stub `own` mode sites
 also scan. Codex `own` mode sites skip the process scan and use their own
-supervisor boundary at credentialed sinks; the separate Codex gap remains as
-described in the Invariants section. Under the revised decision below, only
+supervisor boundary at credentialed sinks; the remaining Codex terminal gap is
+described in the Invariants section (AI-synced 2026-10-23). Under the revised decision below, only
 concurrent-claim and single-uid cases can still lock out these scanning sites
 solely because of an unattributed unreadable process. The fresh-attempt seed
 exception remains because seeding a fresh path moves or frees nothing.
@@ -769,7 +808,7 @@ The original follow-ups are recorded below with their later disposition where kn
   complete after the process proof and clean listings. #2852's terminal/Docker
   writer-exclusion remainder is not fixed. Currently unwired status is not durable
   proof that a path was never exposed to a daemon.
-- **Follow-up 4 — #2852 remains partial under the slice A contract (AI-synced 2026-10-18).** A holds owner
+- **Follow-up 4 — #2852 remains partial after slices A and B (AI-synced 2026-10-23).** A holds owner
   pause and credential-free recovery, memory-pressure and retained-source capture
   through supervised-child settlement, including the narrow lane of an intentionally
   poisoned, successfully settled registry. It restores neither normal admission
@@ -780,14 +819,19 @@ The original follow-ups are recorded below with their later disposition where kn
   later execution depends on existing budget/hold policy and uses a fresh attempt
   path/model session for retained-source recovery. This is not a blanket gate-revision
   error conversion. Vault lock on recreation takes credential deferral (AI-synced 2026-10-22).
-  Slice B's healthy wall/hold/recovery/switch pre-publish closure and slice C's strengthened terminal
-  proof remain unshipped. Existing credentialed permits remain required at their
-  sinks; A's capture context is separate and supplies no structural completion permit.
+  B now holds healthy Codex wall/hold/ordinary-recovery capture through source-dependent
+  settlement, with joined A fallback under the original episode deadline; Codex switch
+  entries retain/refuse early. Slice C's strengthened terminal proof remains unshipped.
+  Existing credentialed permits remain required at their sinks; B carries the permit
+  under private callback identity/lifetime checks, while A supplies no structural
+  completion permit. The invariant above records fallback and finalize-continuation limits.
   Owned summary/setup/auth cleanup remains joined after authority or delivery expiry,
   with independent cleanup faults refusing capture and credential continuation.
   Existing terminal executor disposal does
   not close the gap between snapshot coverage and writer-exclusion proof. A provides no daemon mediation,
-  per-attempt cgroup proof or safe automatic retention reclaim. Refs #2852.
+  per-attempt cgroup proof or safe automatic retention reclaim; neither does B.
+  Refusal/capacity rates remain unknown and retained bytes can grow. Retention and
+  capacity pressure confer no deletion authority. Refs #2852.
 - **Follow-up 5 — a per-attempt cgroup v2 boundary.** Proper per-run process
   ownership would resolve the remaining concurrent-claim and single-uid
   lockout. This direction is parked in #1862.
