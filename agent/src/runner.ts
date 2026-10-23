@@ -21091,7 +21091,7 @@ export class RunRunner {
         // branch below (a human sees the plan + the nudge and can revise/reject). The verdict is
         // UNCHANGED — this arms guidance beside the approve, it does not alter it.
         if (proposesRewrite) steering.pushSafetySteer(composePlanGateNudge(publishedTip!));
-        if (checkedApproval) return { kind: "approve", approval: "cross_check", selection: { status: "ok", selection },
+        if (checkedApproval) return { kind: "approve", approval: "cross_check", findings: checkedApproval.findings, selection: { status: "ok", selection },
           canonical: { plan: checkedApproval.candidate.plan_md,
             milestones: checkedApproval.candidate.milestones as Milestone[],
             candidate_digest: checkedApproval.candidate_digest, claimGeneration: checkedApproval.candidate_generation } };
