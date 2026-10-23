@@ -89,21 +89,159 @@ func TestTUIWorkerManualHostileMetadata(t *testing.T) {
 		at := time.Date(2026, 10, 23, 1, 2, 3, 0, time.UTC)
 		w.ManualCordonedAt = &at
 		w.ManualCordonedByLabel = sp("\u001b]0;hidden-title\a\u001b[31m\u202e\u200b\u0085\n")
-		w.ManualCordonedBy = sp("actor-uuid")
+		w.ManualCordonedBy = sp("\u001b]0;hidden-actor\a\u001b[2Jactor-uuid\u0001\u0085\u200b\u202e\n")
 		w.ManualCordonReason = sp("\u001b]8;;https://hidden.test\u001b\\\u001b[31m維😀 safe\u001b]8;;\u001b\\\n\t\u0001\u009f\u202e" + strings.Repeat("界", 200) + "TAIL")
-		for _, view := range []tuiView{viewWorkers, viewWorker} {
-			m.view = view
-			out := stripANSI(m.View().Content)
-			requireWorkerText(t, out, "cordoned (manual)", "actor-uuid", "維😀 safe", "reason:")
-			for _, bad := range []string{"hidden-title", "hidden.test", "[31m", "TAIL", "\u202e", "\u200b", "\u009f"} {
-				if strings.Contains(out, bad) {
-					t.Fatalf("unsafe %q in %q", bad, out)
+		for _, actualAscii := range []bool{false, true} {
+			if actualAscii {
+				m = step(m, tea.ColorProfileMsg{Profile: colorprofile.Ascii})
+			}
+			for _, view := range []tuiView{viewWorkers, viewWorker} {
+				m.view = view
+				raw := m.View().Content
+				assertNoRawControls(t, "manual metadata", raw)
+				// Metadata lines are plain text even when surrounding UI chrome is styled.
+				for _, line := range m.manualCordonLines(m.workers.rows[0], width) {
+					assertNoRawControls(t, "plain manual metadata", line)
+					if strings.ContainsAny(line, "\u001b\t\r\n") {
+						t.Fatalf("terminal instruction or extra line in metadata: %q", line)
+					}
+				}
+				for _, bad := range []string{"\u001b]", "\u001b[2J", "\a", "\t", "\u0001", "\u0085", "\u009f", "\u200b", "\u202e", "hidden-title", "hidden-actor", "hidden.test"} {
+					if strings.Contains(raw, bad) {
+						t.Errorf("unsafe %q in raw frame: %q", bad, raw)
+					}
+				}
+				if actualAscii {
+					var buf bytes.Buffer
+					writer := colorprofile.NewWriter(&buf, nil)
+					writer.Profile = colorprofile.Ascii
+					if _, err := writer.Write([]byte(raw)); err != nil {
+						t.Fatal(err)
+					}
+					raw = buf.String()
+					assertNoRawControls(t, "Ascii manual metadata", raw)
+					// Ascii drops colours, retaining legitimate bold/reset UI styling.
+					// Only these exact chrome sequences may remain; metadata above allows none.
+					plain := strings.NewReplacer("\u001b[1m", "", "\u001b[m", "", "\u001b[0m", "", "\u001b[22m", "").Replace(raw)
+					if strings.Contains(plain, "\u001b") {
+						t.Errorf("Ascii frame retained a colour or terminal instruction: %q", raw)
+					}
+				}
+				out := stripANSI(raw)
+				requireWorkerText(t, out, "cordoned (manual)", "actor-uuid", "維😀 safe", "reason:")
+				for _, bad := range []string{"hidden-title", "hidden.test", "[31m", "TAIL", "\u202e", "\u200b", "\u009f"} {
+					if strings.Contains(out, bad) {
+						t.Fatalf("unsafe %q in %q", bad, out)
+					}
+				}
+				for _, line := range strings.Split(out, "\n") {
+					if visualWidth(line) > width {
+						t.Fatalf("overflow %q", line)
+					}
 				}
 			}
-			for _, line := range strings.Split(out, "\n") {
-				if visualWidth(line) > width {
-					t.Fatalf("overflow %q", line)
-				}
+		}
+	}
+}
+
+func TestTUIWorkerManualIntakeColumns(t *testing.T) {
+	at := time.Date(2026, 10, 23, 1, 2, 3, 0, time.UTC)
+	for _, width := range []int{80, 120, 160, 200} {
+		for _, admin := range []bool{false, true} {
+			for _, intake := range []string{"manual", "effective", "none"} {
+				t.Run(fmt.Sprintf("%d/%t/%s", width, admin, intake), func(t *testing.T) {
+					m := workerRenderModel(true)
+					m.width, m.height, m.view = width, 34, viewWorkers
+					m.board.admin, m.workers.admin = admin, admin
+					r := m.workers.rows[0]
+					r.w.ID, r.w.Name, r.workerOwner = "warning", "warning-row", "owner@example.test"
+					if intake != "none" || width >= 160 {
+						r.w.Version = sp("0.85.1+gba846d7")
+					}
+					r.w.OutboxBlocked = sp("automatic warning")
+					r.w.LastHeartbeatAt = &at
+					switch intake {
+					case "manual":
+						r.w.ManualCordonedAt = &at
+					case "effective":
+						r.w.EffectiveCordoned = true
+					}
+					plain := m.workers.rows[0]
+					plain.w.ID, plain.w.Name = "plain", "plain-row"
+					m.workers.rows = []workerRow{r, plain}
+					m.workers.selectedID = plain.w.ID
+					out := stripANSI(m.renderWorkersBody(34, false))
+					var header, warning, ordinary string
+					for _, line := range strings.Split(out, "\n") {
+						if visualWidth(line) > width {
+							t.Fatalf("overflow: %q", line)
+						}
+						switch {
+						case strings.Contains(line, "NAME"):
+							header = line
+						case strings.Contains(line, "warning-row"):
+							warning = line
+						case strings.Contains(line, "plain-row") && !strings.Contains(line, "selected"):
+							ordinary = line
+						}
+					}
+					requireWorkerText(t, header, "STATE", "KIND", "RUNS", "CHECKS", "ATTENTION")
+					requireWorkerText(t, warning, "idle", "host·?", "✕ outbox")
+					if strings.Contains(warning, "▌") {
+						t.Fatal("warning regression must exercise an unselected row")
+					}
+					if ordinary == "" {
+						t.Fatal("missing ordinary row")
+					}
+					column := func(line, label string) int {
+						t.Helper()
+						i := strings.Index(line, label)
+						if i < 0 {
+							t.Fatalf("missing %q in %q", label, line)
+						}
+						return visualWidth(line[:i])
+					}
+					if column(header, "ATTENTION") != column(warning, "✕ outbox") ||
+						column(header, "ATTENTION") != column(ordinary, "—") {
+						t.Fatalf("attention columns differ:\n%s\n%s\n%s", header, warning, ordinary)
+					}
+					dense := width >= 120 && (intake == "none" || width >= 160)
+					for _, label := range []string{"CPU", "MEM", "DISK (worst)", "VERSION", "HB"} {
+						if strings.Contains(header, label) != dense {
+							t.Errorf("dense column %s at width %d: %q", label, width, header)
+						}
+					}
+					if admin && width >= 120 {
+						requireWorkerText(t, header, "OWNER")
+						if column(header, "OWNER") != column(warning, "owner") {
+							t.Fatal("owner column moved")
+						}
+					}
+					if intake == "none" {
+						if strings.Contains(header, "INTAKE") || strings.Contains(warning, "cordoned") {
+							t.Fatal("optional intake changed the legacy layout")
+						}
+					} else {
+						label := "cordoned (manual)"
+						if intake == "effective" {
+							label = "intake fenced"
+						}
+						if column(header, "INTAKE") != column(warning, label) {
+							t.Fatalf("intake columns differ:\n%s\n%s", header, warning)
+						}
+						if width >= 120 {
+							requireWorkerText(t, warning, "✕ outbox blocked")
+						}
+						m.workers.filter = "plain-row"
+						filtered := stripANSI(m.renderWorkersBody(34, false))
+						if strings.Contains(filtered, "INTAKE") {
+							t.Fatal("filtered-out intake worker changed the table")
+						}
+						if width >= 120 {
+							requireWorkerText(t, filtered, "CPU", "HB")
+						}
+					}
+				})
 			}
 		}
 	}
