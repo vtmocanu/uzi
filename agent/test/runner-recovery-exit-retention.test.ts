@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import { describe, it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -235,6 +235,8 @@ function stopMarkers(runId: string): string[] {
 // --- the vault-locked (credential-deferred) rig --------------------------------------------------
 
 interface CredRig {
+  rig: ReturnType<typeof codexRig>;
+  executor: FakeCodexExecutor;
   claim: ReturnType<typeof gitlabClaim>;
   runner: RunRunner;
   lines: unknown[];
@@ -245,7 +247,7 @@ interface CredRig {
   seedHead: () => string;
 }
 
-function credRig(iid: number, o: { generation?: number; extra?: Record<string, unknown>; claim?: Record<string, unknown> } = {}): CredRig {
+function credRig(iid: number, o: { generation?: number; extra?: Record<string, unknown>; claim?: Record<string, unknown>; session?: boolean } = {}): CredRig {
   const { gitlab } = fakeGitlab();
   client.protocolFeatures = [VAULT_FEATURE];
   const rig = codexRig({ vaultLocked: () => true });
@@ -256,13 +258,99 @@ function credRig(iid: number, o: { generation?: number; extra?: Record<string, u
   const exec = new FakeCodexExecutor(rig.safety, async (ctx: RunContext): Promise<ExecutorResult> => {
     clone = ctx.worktreePath;
     seedHead = gitIn(clone, "rev-parse", "HEAD");
+    if (o.session) {
+      fs.mkdirSync(path.join(homeDir, claim.run_id), { recursive: true });
+      fs.writeFileSync(path.join(homeDir, claim.run_id, "session"), "park transcript\n");
+    }
     facts = writeWorkerState(ctx.worktreePath);
     api.setOwnershipStatus(claim.run_id, "running", claim.claim_generation as number);
     return { branch: ctx.branch };
   }, undefined, rig.capture);
   const { logger, lines } = recordingLogger();
-  const runner = runnerWith(() => ({ executor: exec }), gitlab, undefined, logger, { recoveryRetryMs: 5, ...o.extra });
-  return { claim, runner, lines, worked: () => facts!, clone: () => clone, ran: () => facts !== undefined, seedHead: () => seedHead };
+  const runner = runnerWith(() => ({ executor: exec, ...(o.session ? { homeDir: path.join(homeDir, claim.run_id) } : {}) }), gitlab, undefined, logger, { recoveryRetryMs: 5, ...o.extra });
+  return { claim, runner, lines, rig, executor: exec, worked: () => facts!, clone: () => clone, ran: () => facts !== undefined, seedHead: () => seedHead };
+}
+
+
+/** Observe the actual flight and joined A callback; never supply capture authority. */
+function observeCodexPark(t: TestContext, r: CredRig): () => void {
+  type Flight = { sourceExitDenied?: boolean; preserveRecoveryClone?: boolean;
+    stoppedSourceKept?: boolean; preserveSession: boolean; runHome?: string };
+  const seam = r.runner as unknown as {
+    buildFlight(...args: unknown[]): Flight;
+    handleRecoveryExhausted(...args: unknown[]): Promise<boolean>;
+    retainStoppedSource(...args: unknown[]): Promise<unknown>;
+    executeClaim(...args: unknown[]): Promise<unknown>;
+  };
+  let flight: Flight | undefined;
+  let handlerFlight: Flight | undefined;
+  let joined = 0;
+  const reads: string[] = [], reasons: string[] = [], admissions: unknown[] = [];
+  const build = seam.buildFlight.bind(r.runner);
+  t.mock.method(seam, "buildFlight", (...args: unknown[]) => flight = build(...args));
+  const handler = seam.handleRecoveryExhausted.bind(r.runner);
+  t.mock.method(seam, "handleRecoveryExhausted", async (...args: unknown[]) => {
+    handlerFlight = args[2] as Flight;
+    return handler(...args);
+  });
+  const capture = r.executor.withCredentialFreeCapture;
+  assert.ok(capture, "the Codex fixture has a real capture callback");
+  const observeCapture: typeof capture = async (...args) => {
+    const result = await capture(...args);
+    if (result.kind === "observed_empty") joined++;
+    return result;
+  };
+  r.executor.withCredentialFreeCapture = observeCapture;
+  t.after(() => { r.executor.withCredentialFreeCapture = capture; });
+  const retain = seam.retainStoppedSource.bind(r.runner);
+  t.mock.method(seam, "retainStoppedSource", (...args: unknown[]) => {
+    reasons.push(String(args[2]));
+    return retain(...args);
+  });
+  const execute = seam.executeClaim.bind(r.runner);
+  t.mock.method(seam, "executeClaim", async (...args: unknown[]) => {
+    const result = await execute(...args);
+    admissions.push(result);
+    return result;
+  });
+  const methods = git as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
+  for (const name of ["worktreeStatus", "worktreeHead", "worktreeCleanHardened",
+    "localRefsReachableFrom", "commitWipMarker", "verifyRunnerTrackingCovers", "trackingTip"]) {
+    const method = methods[name];
+    assert.ok(method, `fixture Git method ${name} exists`);
+    const original = method.bind(git);
+    t.mock.method(methods, name, (...args: unknown[]) => {
+      if (joined) reads.push(name);
+      return original(...args);
+    });
+  }
+  const report = client.reportState.bind(client);
+  let beforeCleanup = false;
+  t.mock.method(client, "reportState", async (...args: Parameters<typeof report>) => {
+    if (args[1].status === "recovery_wait") {
+      assert.equal(flight?.sourceExitDenied, undefined, "exit latch is not set before park ACK");
+      beforeCleanup = true;
+    }
+    return report(...args);
+  });
+  return () => {
+    assert.ok(beforeCleanup && joined > 0, "park ACK and fully joined capture observed");
+    assert.ok(flight && flight === handlerFlight, "buildFlight and recovery observe the same flight");
+    assert.equal(flight.sourceExitDenied, true, "cleanup denies source exit at its original point");
+    assert.equal(flight.preserveRecoveryClone, true);
+    assert.equal(flight.stoppedSourceKept, true);
+    assert.deepEqual(reasons, [], "Codex park skips source-reading retention diagnostic");
+    assert.deepEqual(reads, [], "no product source diagnostics after A proof release");
+    assert.deepEqual(admissions, [undefined], "park exports no closed-source observation");
+    assert.equal(r.rig.registry.reserveLaunch("command").kind, "denied", "normal command admission stays closed");
+    assert.equal(r.rig.registry.reserveLaunch("provider").kind, "denied", "normal model admission stays closed");
+    assert.equal(fs.existsSync(r.clone()), true);
+    assert.equal(fs.existsSync(flight.runHome!), flight.preserveSession, "original session policy holds");
+    if (flight.preserveSession) assert.equal(fs.readFileSync(path.join(flight.runHome!, "session"), "utf8"), "park transcript\n");
+    assert.deepEqual(cfgAll(bareOf(), `uzi-recovery.${branchOf(r.claim.issue_iid!)}.clone`).map(raw => JSON.parse(raw)),
+      [{ runId: r.claim.run_id, clonePath: r.clone() }]);
+    assert.deepEqual(stopMarkers(r.claim.run_id), []);
+  };
 }
 
 const noTrackingWrite = (iid: number): void => {
@@ -335,9 +423,10 @@ describe("RunRunner #1786 M2 — the recovery handler's exits keep an unpreserve
     assert.deepEqual(retainedReasons(r.lines), ["recovery_other_generation"]);
   });
 
-  it("row 7: the credential-deferred park ACK keeps a source that changed after its verified capture (commit, tracked edit and untracked file)", async () => {
+  it("row 7: the credential-deferred park ACK keeps a source that changed after its verified capture (commit, tracked edit and untracked file)", async (t) => {
     const iid = 17904;
-    const r = credRig(iid);
+    const r = credRig(iid, { session: true });
+    const checkPark = observeCodexPark(t, r);
     let late: Expected | undefined;
     const parked = spyHandlerResults(r.runner);
     const hook = afterVerifiedCapture((wt) => { late = writeLateChange(wt); });
@@ -351,14 +440,15 @@ describe("RunRunner #1786 M2 — the recovery handler's exits keep an unpreserve
     assertRecoverable(r.clone(), late!, "row 7");
     assert.deepEqual(parked, [true], "the handler still reports the run parked");
     // A park exit keeps the plain journal: no stopped-source marker, so the resume recaptures the bytes.
-    assert.deepEqual(keptReasons(r.lines), ["recovery_park_keep"]);
+    checkPark();
     assert.deepEqual(retainedReasons(r.lines), []);
     assert.deepEqual(stopMarkers(r.claim.run_id), []);
   });
 
-  it("row 7 control: a capture still current and anchored at the exit keeps the clone; the park is unchanged", async () => {
+  it("row 7 control: a capture still current and anchored at the exit keeps the clone; the park is unchanged", async (t) => {
     const iid = 17905;
-    const r = credRig(iid);
+    const r = credRig(iid, { session: true });
+    const checkPark = observeCodexPark(t, r);
     let waits = 0;
     const waitRetry = (r.runner as unknown as { waitRecoveryRetry: (...a: unknown[]) => Promise<void> }).waitRecoveryRetry.bind(r.runner);
     (r.runner as unknown as { waitRecoveryRetry: unknown }).waitRecoveryRetry = (...a: unknown[]) => { waits++; return waitRetry(...a); };
@@ -370,14 +460,15 @@ describe("RunRunner #1786 M2 — the recovery handler's exits keep an unpreserve
       ["running", "running", "running", "recovery_wait"], "the same park reports in the same order");
     assert.equal(waits, 0, "no new waits");
     assert.deepEqual(coveredReasons(r.lines), []);
-    assert.deepEqual(keptReasons(r.lines), ["recovery_park_keep"]);
+    checkPark();
     assert.deepEqual(retainedReasons(r.lines), []);
     assert.deepEqual(stopMarkers(r.claim.run_id), []);
   });
 
-  it("shared tracking moves after the verified capture (another run's fetch-back, no owed pin for the captured head): the source is kept", async () => {
+  it("shared tracking moves after the verified capture (another run's fetch-back, no owed pin for the captured head): the source is kept", async (t) => {
     const iid = 17906;
-    const r = credRig(iid);
+    const r = credRig(iid, { session: true });
+    const checkPark = observeCodexPark(t, r);
     const report = client.reportState.bind(client);
     client.reportState = async (runId, body, signal) => {
       if (body.status === "recovery_wait") {
@@ -393,7 +484,7 @@ describe("RunRunner #1786 M2 — the recovery handler's exits keep an unpreserve
     }
     assertRecoverable(r.clone(), writeExpectedAfterWip(r.worked(), r.clone()), "shared tracking move");
     assert.equal(parkReports(r.claim.run_id).length, 1);
-    assert.deepEqual(keptReasons(r.lines), ["recovery_park_keep"]);
+    checkPark();
     assert.deepEqual(stopMarkers(r.claim.run_id), []);
   });
 
