@@ -7636,8 +7636,9 @@ export class RunRunner {
       }
       // changedFiles returns null on diff-FAILURE (keep pushing — fail open) and [] on a
       // CONFIRMED-empty diff. report_only is the sanctioned zero-diff success — a declared
-      // report_only already returned above, so reaching here undeclared+empty is the
-      // ambiguous case; fail with an actionable reason instead of opening an empty MR.
+      // report_only either returned above or (with a published checkpoint) took the #3360
+      // fallback handled just above, so reaching here undeclared+empty is the ambiguous
+      // case; fail with an actionable reason instead of opening an empty MR.
       if (changedForGuard !== null && changedForGuard.length === 0) {
         // PRD #634 M3: an operator scope directive can truncate a run at its very first
         // milestone boundary, before any milestone produced committed work — a legitimate
@@ -9254,7 +9255,9 @@ export class RunRunner {
     // preserved text around it.
     // Rebuild persisted evidence at publication as well as session completion: a superseded
     // completed row must not carry the earlier attempt's counts into a reconciled MR.
-    if (claim.code_cross_check_required === true && result.codeCrossCheckSummary) {
+    // #3360: the report_only fallback's own "skipped" disclosure must not be replaced by a
+    // persisted status row (which can be absent or an earlier same-generation completed check).
+    if (claim.code_cross_check_required === true && result.codeCrossCheckSummary && !reportOnlyFallback) {
       try {
         result.codeCrossCheckSummary = persistedCodeCrossCheckSummary(
           await this.client.codeCrossCheckStatus(claim.run_id, flight.claimGeneration,

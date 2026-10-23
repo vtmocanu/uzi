@@ -91,9 +91,9 @@ describe("report_only fallback to non-closing delivery (#3360)", () => {
     assert.match(forge.pr.description, /Issue remains open/);
   });
 
-  for (const [label, configure, expectOrigin] of [
-    ["non-stale 4xx", () => { api.completionAttemptHttpStatus = 400; }, false],
-    ["transient 5xx exhausting the retries", () => { api.completionAttemptHttpStatus = 503; }, false],
+  for (const [label, configure, expectOrigin, expectedAttempts] of [
+    ["non-stale 4xx", () => { api.completionAttemptHttpStatus = 400; }, false, 1],
+    ["transient 5xx exhausting the retries", () => { api.completionAttemptHttpStatus = 503; }, false, 3],
   ] as const) {
     it(`fails closed with the #299 reason when the forced attempt hits a ${label}: no push, no MR`, async () => {
       await negotiate();
@@ -103,7 +103,7 @@ describe("report_only fallback to non-closing delivery (#3360)", () => {
       api.setCompletionPermitResponse(true);
       await runner(reportOnlyExecutor(), forge.gitlab).execute(claim);
 
-      assert.ok(api.completionAttemptRequests.length >= 1);
+      assert.equal(api.completionAttemptRequests.length, expectedAttempts);
       const failed = terminal(claim.run_id, "failed");
       assert.ok(failed, JSON.stringify(api.states.map((s) => s.body)));
       assert.match(failed.failure_reason ?? "", /report_only/);
@@ -176,20 +176,77 @@ describe("report_only fallback to non-closing delivery (#3360)", () => {
     const claim = gitlabClaim(3365, { claim_generation: 7 });
     await runner(reportOnlyExecutor({ message: "Closes #3365" }), forge.gitlab).execute(claim);
 
-    assert.ok(terminal(claim.run_id, "failed"), JSON.stringify(api.states.map((s) => s.body)));
+    const failed = terminal(claim.run_id, "failed");
+    assert.ok(failed, JSON.stringify(api.states.map((s) => s.body)));
+    assert.match(failed.failure_reason ?? "", /non-closing delivery refused: commit message\(s\) close issue #3365/);
     assert.equal(pushed(), "", "refused before push");
     assert.equal(originHasBranch(3365), false);
     assert.equal(forge.all.length, 0, "no MR");
   });
 
-  it("code_cross_check_required: the MR body discloses the cross-check as incomplete", async () => {
+  it("code_cross_check_required: the MR body discloses the cross-check as skipped, even when a completed row exists", async (t) => {
     await negotiate();
     const { forge } = setup();
+    const completed: import("../src/code-cross-check-contract.js").CodeCrossCheckRecord = {
+      stage: "code", round: 1, candidate_generation: 1, head_commit: "b".repeat(40), base_commit: "a".repeat(40),
+      candidate_digest: "c".repeat(64), checker_run_id: "child", checker_harness: "codex", checker_model: "test-checker",
+      checker_effort: "high", outcome: "completed", reason_class: null, findings: [], dispositions: null,
+      finalized_at: new Date().toISOString(), interrupted_at: null, deadline_at: new Date().toISOString(),
+    };
+    t.mock.method(client, "codeCrossCheckStatus", async () => completed);
     const claim = gitlabClaim(3366, { claim_generation: 7, code_cross_check_required: true });
     await runner(reportOnlyExecutor(), forge.gitlab).execute(claim);
 
     assert.ok(terminal(claim.run_id, "completed"), JSON.stringify(api.states.map((s) => s.body)));
-    assert.match(forge.pr.description, /Code cross-check incomplete/);
+    assert.match(forge.pr.description, /Code cross-check incomplete: skipped: report\\?_only was declared/);
+    assert.doesNotMatch(forge.pr.description, /checked `/);
     assert.doesNotMatch(forge.pr.description, /Closes #3366/);
+  });
+
+  it("a config.non_closing declaration keeps its own reason in the attempt and the MR body", async () => {
+    await negotiate();
+    const { forge } = setup();
+    const reason = "Config declared reason A: maintainer owns the remaining milestones.";
+    const claim = interlockedClaim(3367, { non_closing: { reason } });
+    api.setCompletionPermitResponse(true);
+    await runner(reportOnlyExecutor(), forge.gitlab).execute(claim);
+
+    assert.equal(api.completionAttemptRequests.length, 1);
+    assert.deepEqual(api.completionAttemptRequests[0]!.non_closing, { reason });
+    assert.ok(terminal(claim.run_id, "completed"), JSON.stringify(api.states.map((s) => s.body)));
+    assert.ok(forge.pr.description.includes(reason), forge.pr.description);
+    assert.equal(forge.pr.description.includes(STATIC_REASON), false);
+  });
+
+  it("an executor-returned nonClosing reason is not overwritten by the static fallback reason", async () => {
+    await negotiate();
+    const { forge } = setup();
+    const reason = "Executor declared reason B: follow-up work remains.";
+    const claim = interlockedClaim(3368);
+    api.setCompletionPermitResponse(true);
+    await runner(reportOnlyExecutor({ extra: { nonClosing: { reason } } }), forge.gitlab).execute(claim);
+
+    assert.equal(api.completionAttemptRequests.length, 1);
+    assert.deepEqual(api.completionAttemptRequests[0]!.non_closing, { reason });
+    assert.ok(terminal(claim.run_id, "completed"), JSON.stringify(api.states.map((s) => s.body)));
+    assert.ok(forge.pr.description.includes(reason), forge.pr.description);
+    assert.equal(forge.pr.description.includes(STATIC_REASON), false);
+  });
+
+  it("a non-issue run declaring report_only after a published checkpoint keeps the #299 failure (no fallback)", async () => {
+    await negotiate();
+    const { forge, pushed } = setup();
+    const claim = gitlabClaim(3369, { kind: "prompt", claim_generation: 7 });
+    await runner(reportOnlyExecutor(), forge.gitlab).execute(claim);
+
+    const failed = terminal(claim.run_id, "failed");
+    assert.ok(failed, JSON.stringify(api.states.map((s) => s.body)));
+    assert.match(failed.failure_reason ?? "", /report_only/);
+    assert.match(failed.failure_reason ?? "", /checkpoint/);
+    assert.equal(pushed(), "", "nothing was pushed");
+    assert.equal(forge.all.length, 0, "no MR opened");
+    assert.equal(api.completionAttemptRequests.length, 0);
+    assert.equal(api.states.some((s) => s.runId === claim.run_id && s.body.source_publication?.non_closing === true), false);
+    assert.equal(api.states.some((s) => /will attempt non-closing delivery/.test(JSON.stringify(s.body))), false);
   });
 });
