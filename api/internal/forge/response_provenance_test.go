@@ -45,7 +45,7 @@ func TestResponseOverflowProvenanceRedaction(t *testing.T) {
 				if !errors.Is(clean, ErrResponseTooLarge) || strings.Contains(fmt.Sprintf("%+v", *large), "REMOTE") {
 					t.Fatal("unsafe metadata or lost sentinel")
 				}
-			} else if tc.name != "bare" {
+			} else {
 				t.Fatal("lost typed overflow")
 			}
 		})
