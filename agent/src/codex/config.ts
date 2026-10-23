@@ -177,10 +177,10 @@ function validateProductionConfigOptions(opts: CodexProductionConfigOptions): vo
 /**
  * Build the fixed production config used with `account/login/start` authentication.
  *
- * The 0.162.1 built-in `openai` provider has `requires_openai_auth = true` and no
+ * The 0.163.0 built-in `openai` provider has `requires_openai_auth = true` and no
  * configured base URL. That absence is load-bearing: API-key auth selects
  * `https://api.openai.com/v1`, while `chatgptAuthTokens` selects the ChatGPT Codex
- * backend. Version 0.162.1 merges configured providers with `or_insert`, so a caller cannot
+ * backend. Version 0.163.0 merges configured providers with `or_insert`, so a caller cannot
  * override the built-in `openai` provider with a partial table. Its production request and
  * stream retry defaults therefore remain active by design; the zero-retry custom-provider
  * settings belong only to deterministic fake-provider tests.
@@ -200,7 +200,7 @@ export function buildCodexProductionConfigToml(opts: CodexProductionConfigOption
  * is deliberately separate from {@link buildCodexProductionConfigToml}: production
  * keeps the built-in `openai` provider and emits no endpoint override.
  *
- * Codex 0.162.1's built-in provider has WebSockets enabled and cannot be
+ * Codex 0.163.0's built-in provider has WebSockets enabled and cannot be
  * overridden by a same-name provider table (`merge_configured_model_providers` uses
  * `or_insert`). Its app-server tests instead use a distinct custom provider with
  * `requires_openai_auth = true` and `supports_websockets = false`; this reproduces
