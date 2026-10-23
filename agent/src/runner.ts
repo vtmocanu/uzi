@@ -20983,7 +20983,10 @@ export class RunRunner {
       runLog.warn("plan cross-check: planning diff refused", { refusal: "base_unavailable", diagnostic: "base_invalid" });
       return { refusal: "base_unavailable", diagnostic: "base_invalid" };
     }
-    if (!barePath) return { refusal: "base_unavailable", diagnostic: "bare_unavailable" };
+    if (!barePath) {
+      runLog.warn("plan cross-check: planning diff refused", { refusal: "base_unavailable", diagnostic: "bare_unavailable" });
+      return { refusal: "base_unavailable", diagnostic: "bare_unavailable" };
+    }
     const scope = new AbortController();
     const ownerSignal = AbortSignal.any([signal, scope.signal]);
     const timer = setTimeout(() => scope.abort(), 60_000);
