@@ -24,7 +24,7 @@ This is a **web-only** change. No API, DTO, store, migration or CLI change: `GET
 
 | Item | Relationship |
 |---|---|
-| PRD #1484 (`prds/1484-admin-health-tab.md`) | Shipped the Health tab, the Overview card, the danger banner and the pips. This PRD reworks their presentation; the health document, its checks, severity rules, polling, snooze and notification behaviour are unchanged. |
+| PRD #1484 (`prds/done/1484-admin-health-tab.md`) | Shipped the Health tab, the Overview card, the danger banner and the pips. This PRD reworks their presentation; the health document, its checks, severity rules, polling, snooze and notification behaviour are unchanged. |
 | PRD #1167 | Light themes (Dawn, Hall, Shadow) and the Plex typeface; every new surface must read correctly on all five themes. |
 | PRD #113 | The sidebar count-badge tones (`count`, `alert`); this PRD adds `warn`. |
 

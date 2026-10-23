@@ -3,7 +3,7 @@
 **Status**: Accepted (PRD #1810 M1-M4 implemented, including rework rounds 1 and 2; M5 in progress)
 **Date**: 2026-09-27 (amended 2026-09-28, rework rounds 1 and 2)
 **Deciders**: agent team, per PRD #1810
-**PRD**: [PRD #1810](../prds/1810-retain-failed-run-checkpoint-ref.md)
+**PRD**: [PRD #1810](../prds/done/1810-retain-failed-run-checkpoint-ref.md)
 
 ## Decision (summary)
 
@@ -430,7 +430,7 @@ above.
 
 ## References
 
-- [PRD #1810](../prds/1810-retain-failed-run-checkpoint-ref.md)
+- [PRD #1810](../prds/done/1810-retain-failed-run-checkpoint-ref.md)
 - [ADR-0122](0122-checkpoint-push-broker.md) — the push broker's CAS,
   never-forced invariant this ADR extends to a second ref namespace.
 - [ADR-1867](1867-failed-run-salvage-ref.md) — reuses `CreateRef` for a third,

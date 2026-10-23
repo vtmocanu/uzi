@@ -145,7 +145,7 @@ Every Claude `cross_check` claim takes the lead lock before the child lock, incl
 
 ### Not shipped
 
-Code cross-check was out of scope here and is now implemented by #2170 (see [PRD #2170](../prds/2170-code-cross-check.md) and [Cross-check](../docs/cross-check.md#code-cross-check)). A Claude child claims through the dedicated cross-check lane of #2169 like a Codex child (a legacy plan-stage run slot only during a mixed-image roll), and additionally needs `cross_check_codex_lead_v1`. Hosted authenticated Claude model acceptance is not proven by local tests.
+Code cross-check was out of scope here and is now implemented by #2170 (see [PRD #2170](../prds/done/2170-code-cross-check.md) and [Cross-check](../docs/cross-check.md#code-cross-check)). A Claude child claims through the dedicated cross-check lane of #2169 like a Codex child (a legacy plan-stage run slot only during a mixed-image roll), and additionally needs `cross_check_codex_lead_v1`. Hosted authenticated Claude model acceptance is not proven by local tests.
 
 ## Default and plan prompt amendment (2026-10-17, #3091)
 

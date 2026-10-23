@@ -249,9 +249,9 @@ drivers (no new API call), `main`.
 - **Explicitly out of scope.** `mr_rework`/`ci_fix` and other issue-less runs
   (`poller.go:393-395`); chat / judge / self_improve; reacting to issue edits or new
   comments; auto-cancel; closing the MR or deleting the branch; reopen handling; webhooks.
-- **Adjacency.** Open PRDs `prds/1190-run-pause-resume.md` (owner pause, whose path M2
-  reuses), `prds/1497-park-at-wall.md`, `prds/1229-durable-run-holds.md`,
-  `prds/1202-on-demand-mr-rework.md`/`prds/1233-structured-blockers-mr-rework.md`; forge
+- **Adjacency.** Open PRDs `prds/done/1190-run-pause-resume.md` (owner pause, whose path M2
+  reuses), `prds/1497-park-at-wall.md`, `prds/done/1229-durable-run-holds.md`,
+  `prds/done/1202-on-demand-mr-rework.md`/`prds/1233-structured-blockers-mr-rework.md`; forge
   issues #1461 (mr_rework re-arms after owner cancel), #1324 (park on forge outage at
   finalize), #813 (harden mr_rework) — adjacent lanes, different mechanism. The six prior
   bingo files: run-queue-priority shipped (`prds/done/320-run-queue-priority.md`);
@@ -270,7 +270,7 @@ Commands re-run at `a10da71b`:
 |---|---|---|
 | Marker name is unused | `git grep -n -i -F 'issue_withdrawn' -- .` | Empty (rc 1) |
 | No issue-close→cancel already | `git grep -n -i -E 'CancelRunForIssue\|cancel.*issue.*closed\|issue.*closed.*cancel' -- api/ agent/src` | Empty (rc 1) |
-| Prior withdrawal/de-label prose | `git grep -n -i -E 'withdrawn\|eligibility revoked\|de-?label' -- prds/ ideas/ adr/ docs/ specs/human.md` | 85 `de-node-label` HTML hits in `docs/diagrams/` (noise) plus 31 hits in 16 files, all incidental: the two latency docs (`docs/board.md:307`, `docs/configuration.md:134`); cache-eviction/reconcile prose (`prds/done/2-forge-integration-kanban.md:130,133,170,179,185,196`, `prds/done/4-agent-runtime-workers.md:96`, `prds/done/527-mr-merged-state-recording.md:53,118,149`, `prds/done/98-judge-menu.md:729`); "withdrawn" meaning a retracted bullet or a withdrawn pause request (`prds/done/224-worker-ephemeral-storage.md:96,249,260,1153,2945`, `prds/done/65-forgejo-support.md:502,1194`, `prds/done/98-judge-menu.md:512`, `adr/0216-fleet-aware-claim.md:45`, `adr/1190-run-pause-invariants.md:69,71`, `prds/1190-run-pause-resume.md:58`, `prds/1296-durable-run-recovery.md:207`, `prds/mockups/run-budget-extend-pause-mock.html:472`); label-word coincidences such as `decodeLabels` (`prds/done/22-prdless-label.md:98`, `prds/done/982-api-contract-fixtures.md:221,371`, `prds/done/1208-web-ux-polish.md:32`). None proposes a live run reacting to its issue's withdrawal |
+| Prior withdrawal/de-label prose | `git grep -n -i -E 'withdrawn\|eligibility revoked\|de-?label' -- prds/ ideas/ adr/ docs/ specs/human.md` | 85 `de-node-label` HTML hits in `docs/diagrams/` (noise) plus 31 hits in 16 files, all incidental: the two latency docs (`docs/board.md:307`, `docs/configuration.md:134`); cache-eviction/reconcile prose (`prds/done/2-forge-integration-kanban.md:130,133,170,179,185,196`, `prds/done/4-agent-runtime-workers.md:96`, `prds/done/527-mr-merged-state-recording.md:53,118,149`, `prds/done/98-judge-menu.md:729`); "withdrawn" meaning a retracted bullet or a withdrawn pause request (`prds/done/224-worker-ephemeral-storage.md:96,249,260,1153,2945`, `prds/done/65-forgejo-support.md:502,1194`, `prds/done/98-judge-menu.md:512`, `adr/0216-fleet-aware-claim.md:45`, `adr/1190-run-pause-invariants.md:69,71`, `prds/done/1190-run-pause-resume.md:58`, `prds/done/1296-durable-run-recovery.md:207`, `prds/mockups/run-budget-extend-pause-mock.html:472`); label-word coincidences such as `decodeLabels` (`prds/done/22-prdless-label.md:98`, `prds/done/982-api-contract-fixtures.md:221,371`, `prds/done/1208-web-ux-polish.md:32`). None proposes a live run reacting to its issue's withdrawal |
 | A forge-observation stop function | `git grep -n -E '^func .*\) (Cancel\|Supersede\|Abort\|Halt)[A-Za-z]*\(' -- api/ \| grep -v _test` | Only `CancelReworkForMR` keys on a forge observation, and on an MR — not an issue |
 | Close-edge query passes | `grep -rn '^-- name:' api/internal/store/queries/ \| grep -i -E 'close\|reopen\|withdraw\|label'` | The two close-edge passes (`ListFindingIssueCloseEdges`, judge twin) settle dispositions, never a run |
 | Any withdrawal/completion notification kind | `git grep -n -P 'Kind:\s+"' -- api/internal \| grep -v _test` | Kinds are `ci_autofix_*`, `mr_rework_halted`, `run_failed`, `schedule_error` (+ const-declared siblings); the `completion_decision`/`follow_up` hits are run-input kinds, not notifications — no withdrawal or completion kind |
@@ -292,6 +292,6 @@ Commands re-run at `a10da71b`:
   the watcher's workflow-scope plan-trap (`.agents/skills/uzi-watcher/SKILL.md:141-146`),
   the finalize `fail_origin: "workflow_scope_missing"` (`agent/src/runner.ts:3170`), and
   the deterministic plan screen `internal/planpolicy` (`api/internal/planpolicy/planpolicy.go:1-2`).
-  Overlaps open PRDs `prds/1416-published-branch-rewrite.md:28` (M5 plan-gate nudge) and
-  `prds/1297-prevent-and-salvage-finalization-blockers.md:33` (salvaging finalization
+  Overlaps open PRDs `prds/done/1416-published-branch-rewrite.md:28` (M5 plan-gate nudge) and
+  `prds/done/1297-prevent-and-salvage-finalization-blockers.md:33` (salvaging finalization
   blockers), so it is theirs to extend, not a fresh idea.

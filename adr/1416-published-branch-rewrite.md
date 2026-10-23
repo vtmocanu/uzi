@@ -4,7 +4,7 @@
 pass; M7, lead-owned hosted acceptance, is post-merge and not shipped in this work).
 **Date**: 2026-09-17
 **Issue**: [vtmocanu/uzi#1416](https://github.com/vtmocanu/uzi/issues/1416)
-**PRD**: [prds/1416-published-branch-rewrite.md](../prds/1416-published-branch-rewrite.md) —
+**PRD**: [prds/done/1416-published-branch-rewrite.md](../prds/done/1416-published-branch-rewrite.md) —
 carries the full Decision Log (D1-D10), the milestone breakdown, the resolved facts and the
 verified code anchors; this ADR restates the seams a future change must not silently break.
 

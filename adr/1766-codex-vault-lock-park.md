@@ -52,7 +52,7 @@ no working credential, ready result, boundary permit or merge-request authority.
 
 ## Account-unavailable boundary amendment (issue #1595, 2026-10-10)
 
-[PRD #1595](../prds/1595-codex-boundary-account-park.md) extends this typed-409,
+[PRD #1595](../prds/done/1595-codex-boundary-account-park.md) extends this typed-409,
 credential-free park mechanism to a running Codex **subscription** run's durability-boundary
 reconcile. M1/M2 are implemented and reviewed on the issue branch; maintainer-hosted
 acceptance is pending. The hold classifier and same-identity re-admission remain owned by
@@ -307,7 +307,7 @@ owner `stop` that requests normal finish does not abort execution or revoke shut
 revocation, ownership, unreleased claim, generation, credential authorization and deadlines
 remain enforced. Only a late **remote** owner cancellation after successful reconciliation may
 still allow bounded broker publication for the still-bound same claim generation through
-[PRD #1810's terminal route](../prds/1810-retain-failed-run-checkpoint-ref.md), consistent with
+[PRD #1810's terminal route](../prds/done/1810-retain-failed-run-checkpoint-ref.md), consistent with
 #3030. Terminal cancellation still refuses credential release/refresh on the server; a pending
 queued cancellation is not itself that terminal credential refusal. No local stop, effective
 revocation, claim loss, switch or expired deadline gains a publication waiver.

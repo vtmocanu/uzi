@@ -189,7 +189,7 @@ cleanup serialization and message-cursor refresh.
 
 **Status**: Accepted (PRD #1392 M1-M4 committed on this branch).
 **Issue**: [vtmocanu/uzi#1392](https://github.com/vtmocanu/uzi/issues/1392)
-**PRD**: [prds/1392-forge-unreachable-preclone-park.md](../prds/1392-forge-unreachable-preclone-park.md)
+**PRD**: [prds/done/1392-forge-unreachable-preclone-park.md](../prds/done/1392-forge-unreachable-preclone-park.md)
 
 "Verified capture before a promotable park" above assumes a clone already
 exists to inspect, WIP-commit and fetch. That assumption does not hold for

@@ -9,7 +9,7 @@ audience: operator
 The isolated research lane is a worker namespace with no internet, plus
 `uzi-fetcher`, the one service through which a run in that lane reads web
 content. It exists so an official-sources research run ([PRD
-#1906](../prds/1906-official-sources-web-research.md)) can read a vendor's
+#1906](../prds/done/1906-official-sources-web-research.md)) can read a vendor's
 documentation and datasheets from hosts on an admin-approved [site
 list](egress-profiles.md) and nowhere else, with every attempt logged. The
 design rationale is in [ADR-1906](../adr/1906-isolated-fetch-lane.md).

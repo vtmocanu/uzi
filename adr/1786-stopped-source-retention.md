@@ -4,7 +4,7 @@
 **Date**: 2026-10-12
 **Issue**: [vtmocanu/uzi#1786](https://github.com/vtmocanu/uzi/issues/1786)
 **Amended by**: [ADR-3153](3153-runner-shared-pvc-subpath.md) (Docker-lane `/data/runner` is a data-PVC subPath; pod replacement no longer loses a kept clone on migrated workers)
-**Related**: ADR-1197 (`adr/1197-transient-recovery-park.md`), ADR-1783 (`adr/1783-run-quiescence-and-attempt-clone-paths.md`); spec `prds/1786-preserve-worker-only-work.md`
+**Related**: ADR-1197 (`adr/1197-transient-recovery-park.md`), ADR-1783 (`adr/1783-run-quiescence-and-attempt-clone-paths.md`); spec `prds/done/1786-preserve-worker-only-work.md`
 
 ## Context
 
@@ -443,7 +443,7 @@ Every case keeps the source. What a later run sees depends on where the failure 
   cancelled terminal release (#2852), pending real writer exclusion and safe reclaim in the
   Docker lane. Persisting the coverage verdict into inspect
   output is also not done; today it is in the worker log only. Decision: PRD
-  `prds/1786-preserve-worker-only-work.md`, Decision 6 (lander and reviewer).
+  `prds/done/1786-preserve-worker-only-work.md`, Decision 6 (lander and reviewer).
 - **Not shipped:** teardown of attributed containers is not proven by tests or hosted
   acceptance (tracked in #2747). The teardown code ships (`teardownDocker` force-removes
   containers mounting the clone and answers `docker_unconfirmed` only after two clean

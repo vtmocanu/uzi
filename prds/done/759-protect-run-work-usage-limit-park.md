@@ -87,7 +87,7 @@ harder best-effort fallback.
   `plan_approved` can be true while `plan_md` is worker-authored and unreviewed, and row-3
   re-planning is the defense against implementing a plan no human ever gated. D8 introduced
   `plan_source`/provenance as the discriminator. M4 must consult provenance, not just presence.
-- `prds/556-session-preserving-worker-resume.md` — session resume; cross-worker session durability
+- `prds/done/556-session-preserving-worker-resume.md` — session resume; cross-worker session durability
   out of scope (Axis 2's deeper fix).
 - `prds/done/267-time-based-checkpoints.md` / `prds/done/218-park-resume-work-loss.md` — the
   committed-only checkpoint model; **#218 D6 = no auto-commit on park** (the decision this PRD
