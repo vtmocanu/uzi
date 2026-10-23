@@ -230,6 +230,8 @@ uzi findings resolve <finding-id>
 uzi findings stats [--repo <repo-id>]
 uzi findings undo <disposition-id>
 uzi worker list
+uzi worker cordon <id> [-m <reason>] [--json]
+uzi worker uncordon <id> [--json]
 uzi worker rm <worker-id>
 uzi worker set-token <worker-id> <label>
 uzi worker set-token <worker-id> --default
@@ -1609,6 +1611,11 @@ into `file`/`dismiss`/`resolve`. `undo` keys on the `disposition_id` field (read
   these requeues: its runs are re-adopted to their exact phase on its next
   heartbeat instead. `uzi worker list` / `uzi admin workers` show the runs
   each worker reports executing and in which phase.
+- `uzi worker cordon <id> [-m <reason>]` pauses new intake on your persistent
+  worker; held work continues. `uzi worker uncordon <id>` clears only manual
+  intent; automatic drains and other fences can remain. Both return the updated
+  worker with `--json`. Run-bound/ephemeral workers return HTTP 409:
+  `manual cordon is only supported for persistent workers`.
 - `uzi worker set-token <worker-id> <label>|--default|--auto` — choose which
   Anthropic credential a worker's runs spend. A **label** pins it to that token;
   **`--default`** uses your default one; **`--auto`** lets uzi pick per claim from
