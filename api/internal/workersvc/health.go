@@ -676,10 +676,14 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 	// The live query owns the current-generation, deadline and required-check predicate;
 	// the strict pending/settlement helper is deliberately not a health signal.
 	if runkind.PlanCrossCheckable(r.Kind) {
+		preserveManual := r.Health == healthWaitingWorker && r.HealthReason.Valid && isManualCordonWaitReason(r.HealthReason.String)
 		if reader, ok := s.q.(livePlanCrossCheckReader); ok {
 			live, err := reader.HasLivePlanCrossCheck(ctx, r.ID)
 			if err != nil {
 				slog.Error("health: read live plan cross-check", "run_id", r.ID, "error", err)
+				if preserveManual {
+					return healthWaitingWorker, r.HealthReason.String
+				}
 			} else if live {
 				if reader, ok := s.q.(interface {
 					GetPlanCrossCheckChildForHealth(context.Context, uuid.UUID) (uuid.UUID, error)
@@ -698,7 +702,11 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 							if counts.Claimable == 0 {
 								return healthWaitingWorker, reasonCrossCheckSlotsBusy
 							}
+						} else if preserveManual {
+							return healthWaitingWorker, r.HealthReason.String
 						}
+					} else if preserveManual {
+						return healthWaitingWorker, r.HealthReason.String
 					}
 				}
 				return healthWaitingWorker, reasonPlanCrossCheckWaiting
