@@ -332,3 +332,78 @@ for (const expired of [false, true]) {
     assert.equal(readGit(git.barePathFor(fx.originPath), "show", `refs/uzi-runner/agent/issue-${iid}:RESULT.txt`), bytes);
   });
 }
+
+for (const reply of ["park", "provider-hold", "untyped-provider-hold", "wrong-hold", "running", "statusless", "stale-generation", "cancelled", "shutdown"] as const) {
+  it(`recovery: confirmed reply at healthy expiry preserves ${reply} disposition`, async t => {
+    let now = Date.now(), reports = 0, verifies = 0, settlementsAfterReply = 0;
+    let replied = false, clone = "", parked = 0;
+    const deadline = manualDeadline("shutdown");
+    const rig = codexRig({ now: () => now, armDeadline: deadline.armDeadline });
+    const verify = git.verifyRunnerTrackingCovers.bind(git);
+    t.mock.method(git, "verifyRunnerTrackingCovers", async (...args: Parameters<typeof verify>) => {
+      const result = await verify(...args);
+      if (result) verifies++;
+      return result;
+    });
+    const provider = reply === "provider-hold" || reply === "wrong-hold";
+    const executor = new FakeCodexExecutor(rig.safety, async ctx => {
+      clone = ctx.worktreePath;
+      fs.writeFileSync(path.join(clone, "RESULT.txt"), bytes);
+      throw new TransientRecoveryError("received park reply fixture", { providerOrigin: provider });
+    }, undefined, rig.capture);
+    const runner = runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined, { recoveryRetryMs: 1 });
+    const internal = runner as unknown as {
+      handleRecoveryExhausted: (...args: unknown[]) => Promise<boolean>;
+      settleRecoveryGeneration: (...args: unknown[]) => Promise<unknown>;
+      reapThenSettleRecoveryGeneration: (...args: unknown[]) => Promise<unknown>;
+    };
+    const recover = internal.handleRecoveryExhausted.bind(runner);
+    t.mock.method(internal, "handleRecoveryExhausted", async (...args: unknown[]) => {
+      const result = await recover(...args);
+      if (result) parked++;
+      return result;
+    });
+    for (const method of ["settleRecoveryGeneration", "reapThenSettleRecoveryGeneration"] as const) {
+      const settle = internal[method].bind(runner);
+      t.mock.method(internal, method, async (...args: unknown[]) => {
+        if (replied) settlementsAfterReply++;
+        return settle(...args);
+      });
+    }
+    api.setRegisterProtocolFeatures(["claim_generation_fence", "recovery_cause_provider_outage"]);
+    await client.register("received-park-reply");
+    const report = client.reportState.bind(client);
+    t.mock.method(client, "reportState", async (...args: Parameters<typeof report>) => {
+      if (args[1].status !== "recovery_wait") return report(...args);
+      reports++;
+      assert.equal(args[1].claim_generation, 7, "the flight reporter binds the request generation");
+      assert.equal(args[1].recovery_cause === "provider_outage", provider);
+      const ack = await report(...args);
+      replied = true;
+      now += 120_001;
+      t.mock.method(Date, "now", () => now);
+      deadline.fire();
+      if (reply === "shutdown") runner.shutdown();
+      if (reply === "stale-generation") return { ...ack, status: "recovery_wait", staleClaim: true, applied: false };
+      if (reply === "cancelled") return { ...ack, status: "cancelled" };
+      if (reply === "running") return { ...ack, status: "running" };
+      if (reply === "statusless") return { applied: false };
+      if (reply === "provider-hold" || reply === "untyped-provider-hold" || reply === "wrong-hold")
+        return { ...ack, status: "paused", holdReason: reply === "wrong-hold" ? "budget_exhausted" : "provider_unavailable" };
+      return ack;
+    });
+    const iid = 285940 + ["park", "provider-hold", "untyped-provider-hold", "wrong-hold", "running", "statusless", "stale-generation", "cancelled", "shutdown"].indexOf(reply);
+    const execution = runner.execute(gitlabClaim(iid, { claim_generation: 7 }));
+    if (reply === "shutdown") await assert.rejects(execution, { name: "AbortError" });
+    else await execution;
+    assert.equal(reports, 1, "received or refused replies never cause a second POST after join");
+    assert.equal(deadline.fired(), 1);
+    assert.equal(parked, reply === "park" || reply === "provider-hold" ? 1 : 0,
+      "only an accepted park or typed provider hold survives expiry; lifecycle authority still wins");
+    assert.equal(settlementsAfterReply, 0, "no source settlement runs after scoped expiry");
+    assert.equal(verifies, 1);
+    assert.equal(rig.refreshCalls(), 1);
+    assert.equal(fs.readFileSync(path.join(clone, "RESULT.txt"), "utf8"), bytes);
+    assert.equal(readGit(git.barePathFor(fx.originPath), "show", `refs/uzi-runner/agent/issue-${iid}:RESULT.txt`), bytes);
+  });
+}

@@ -17456,13 +17456,6 @@ export class RunRunner {
       }
       await this.reportGenericFailure(claim, flight, error, options);
     };
-    const report = reportState;
-    reportState = async (body, signal = captureSignal) => {
-      signal?.throwIfAborted();
-      const ack = await report(body, signal);
-      signal?.throwIfAborted();
-      return ack;
-    };
     if (this.isCodexCapture(claim, flight) && !opts.dispositionOnly && !opts.heldAuthenticated && !opts.heldCapture &&
         (cause.kind === "transient" || cause.kind === "data_volume_full")) {
       const captureEpisode = episode ?? this.newCaptureEpisode(flight);
@@ -17502,6 +17495,13 @@ export class RunRunner {
               { ...opts, episode: captureEpisode, freeFallback: true, dispositionOnly: true, dispositionSignal: signal }));
         });
     }
+    const report = reportState;
+    reportState = async (body, signal = captureSignal) => {
+      signal?.throwIfAborted();
+      const ack = await report(body, signal);
+      signal?.throwIfAborted();
+      return ack;
+    };
     // Credential deferrals share the credential-free proof/custody posture.
     // Unknown outcomes never imply a locked vault or send an API recovery cause.
     let credentialDeferred = cause.kind === "vault_locked" || cause.kind === "refresh_unknown" || cause.kind === "account_unavailable" || cause.kind === "credential_release_unavailable";
@@ -17919,10 +17919,34 @@ export class RunRunner {
                 continue;
               }
               attempt = result.value;
-            } else {
+            } else if (opts.heldAuthenticated) {
+              this.assertHeldAuthenticatedCapture(flight, opts.heldAuthenticated);
               attempt = await this.captureRecoveryRestorePoint(claim, flight, runLog, "recovery_capture", {
                 terminalDisk: opts.terminalDisk, heldAuthenticated: opts.heldAuthenticated, episode,
               });
+            } else {
+              // Prove the authenticated drain before source writes; publication later acquires
+              // its own boundary. Neither step acquires a credential-free capture callback.
+              const settlement = await this.settleForCredentialCapture(executor, undefined, "capture", "authenticated");
+              if (settlement.kind !== "observed_empty") {
+                if (!opts.terminalDisk) {
+                  runLog.warn("credential recovery park: the execution did not settle; retaining work and retrying", {
+                    run_id: flight.runId,
+                    errors: settlement.errors.map((e) => e.category),
+                  });
+                  await note(feed.settleIncomplete);
+                  await retryWait();
+                  continue;
+                }
+                // Incomplete settlement grants no source permission; use the existing
+                // bounded unsafe-proof refusal while retaining clone, session and custody.
+                attempt = { verified: false, published: false, residueBlocked: true,
+                  residueDetail: "terminal disk capture: authenticated settlement incomplete" };
+              } else {
+                attempt = await this.captureRecoveryRestorePoint(claim, flight, runLog, "recovery_capture", {
+                  terminalDisk: opts.terminalDisk,
+                });
+              }
             }
             if (attempt.residueBlocked) blockedDetail = attempt.residueDetail ?? "not quiescent";
             if (attempt.verified) {
@@ -18115,10 +18139,15 @@ export class RunRunner {
           await batcher.flush(captureSignal).catch(() => undefined);
           if (providerTyped) providerTypedSent = true;
           if (progress) progress.dispositionStarted = true;
-          const ack = await reportState(parkBody, captureSignal);
+          captureSignal?.throwIfAborted();
+          // The flight reporter validates stale claims before returning. Preserve its received
+          // ACK before a scoped expiry can interrupt disposition; the joined continuation
+          // consumes this evidence without another POST or source settlement.
+          const ack = await report(parkBody, captureSignal);
           if (progress && (ack.status === "recovery_wait" ||
               (providerTyped && ack.status === "paused" && ack.holdReason === PROVIDER_HOLD_REASON)))
             progress.parkAcknowledged = true;
+          captureSignal?.throwIfAborted();
           if (providerTyped && (ack.status === "recovery_wait" || (ack.status === "paused" && ack.holdReason === PROVIDER_HOLD_REASON))) {
             const held = ack.status === "paused";
             runLog.info(held ? "run held after repeated provider outages" : "run parked for a provider outage", {
