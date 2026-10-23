@@ -13054,7 +13054,7 @@ try {
    *
    * The bundle is `git bundle verify`d against the bare (a producer self-check that its
    * prerequisites resolve) before the size/checksum are recorded. The transient named ref
-   * is created and deleted under the SAME bare lock, so a concurrent op never observes it.
+   * is created, and its best-effort deletion attempted, under the SAME bare lock; an aborted cleanup may leave it afterwards.
    */
   async produceRecoveryBundle(
     barePath: string,
@@ -13115,7 +13115,7 @@ try {
         }
       }
       // Create the transient named ref at H, build the bundle from EXACTLY that ref, verify
-      // it, then delete the ref in a finally so the bare's namespace is left untouched.
+      // it, then attempt a best-effort delete of the ref in a finally (an aborted cleanup may leave it).
       await this.runGit(barePath, ["update-ref", RECOVERY_BUNDLE_REF, h]);
       try {
         // `-` writes the bundle to stdout so the bytes actually written are counted and capped.
