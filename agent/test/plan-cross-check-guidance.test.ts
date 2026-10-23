@@ -7,6 +7,18 @@ import type { ClaimResponse } from "../src/protocol.js";
 
 // These are instruction-contract checks, not a mock model or a prediction of its verdict.
 const rules = {
+  requirements: /Enumerate requirements and acceptance criteria from issue_title and issue_body and repository PRDs linked by the issue/,
+  readLimits: /existing [^\n]+within the current deadline and read\/search limits; comments are not supplied\. Do not fetch URLs or add tools/,
+  gaps: /omitted or partly covered requirement as warning with mandatory summary prefix Requirement gap:/,
+  live: /hosted, live or maintainer-only surfaces as info with mandatory summary prefix Coverage uncertainty:/,
+  markers: /Every coverage item must use one of these prefixes; defect items must never use either prefix/,
+  regressionTests: /Flag regression tests that cannot fail on the unfixed code/,
+  safety: /stated by the issue as a safety, security or data-integrity constraint is a defect: error, no coverage prefix, REVISE/,
+  unreadable: /Missing, external, unreadable or oversize requirement sources get a Coverage uncertainty: note in summary, never treated as covered/,
+  noDefectCoverage: /No defect found does not mean requirement covered/,
+  advisory: /Coverage alone NEVER justifies REVISE or BLOCK/,
+  cap: /20-item cap, place defects first; coverage uses only remaining space[\s\S]*"N coverage notes omitted"[\s\S]*never displace a defect/,
+  coverageDisposition: /missing or declined (?:prior coverage disposition|coverage dispositions)[\s\S]{0,130}alone never justif(?:ies|y) REVISE or BLOCK/i,
   effects: /(?:environment|env)[\s\S]{0,250}effects?/i,
   rejectBypass: /(?:reject|flag|must not|do not|forbid)[\s\S]{0,160}skip[\s\S]{0,100}select[\s\S]{0,100}narrow[\s\S]{0,100}weaken[\s\S]{0,180}(?:restriction|prohibit)/i,
   scratch: /(?:(?:temporary|scratch)[\s\S]{0,220}(?:relocat|placement)|relocat[\s\S]{0,220}(?:temporary|scratch))[\s\S]{0,220}(?:not|isn't|alone)[\s\S]{0,120}(?:bypass|skip)/i,
@@ -43,6 +55,9 @@ test("guidance fixture loader has the exact nonempty case set", () => {
     "tmpdir-internal-logs-go-children", "tmpdir-narrows-tests", "scratch-destination-changes-config",
     "initial-no-heading", "later-no-heading", "later-incomplete", "earlier-items-only",
     "supported-decline", "unsupported-authority", "addressed-where-how",
+    "four-criteria-three-covered", "regression-cannot-fail", "unreadable-linked-sources",
+    "missing-coverage-disposition", "declined-coverage", "partial-requirement", "live-only",
+    "omitted-issue-safety", "defects-fill-cap", "no-defect-is-not-covered",
   ].sort());
   for (const c of fixtures) {
     assert.ok(c.plan.trim() && c.expected.trim() && c.rules.length);
@@ -61,7 +76,7 @@ for (const c of fixtures) test(`plan checker instructions decide ${c.name}: ${c.
 
 const revisionRules: (keyof typeof rules)[] = [
   "effects", "rejectBypass", "scratch", "goChildren", "reliedEffects", "noNameProof", "sensitiveEffects",
-  "latestItems", "olderOptional", "declines", "unverified", "noPrecedence", "completePlan", "addressed", "heading",
+  "coverageDisposition", "latestItems", "olderOptional", "declines", "unverified", "noPrecedence", "completePlan", "addressed", "heading",
 ];
 test("plan revision puts dispositions and effect guidance outside both DATA fences", () => {
   const advice = { summary: "CURRENT-SUMMARY", items: [

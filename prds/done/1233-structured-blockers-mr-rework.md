@@ -2,9 +2,9 @@
 
 **Issue:** [#1233](https://github.com/vtmocanu/uzi/issues/1233)
 **Parent epic:** [#1225](https://github.com/vtmocanu/uzi/issues/1225)
-**Status:** Planned, blocked on #1227, #1230 and #1231.
+**Status:** Closed not planned (2026-10-23): depends on the cancelled #1231 auditor; see #1225. The body below is the historical design.
 **Priority:** High.
-**Execution:** Keep `Planned` without `uzi`. Add `uzi` only after #1231 merges and main CI is green.
+**Execution:** None. Not planned; never dispatch.
 
 This child gives completion-relevant review findings server-owned identities and applies them to both issue completion and MR rework. It consumes #1231's auditor/semantic permit and does not change provider-context storage. No implementation or validation may modify `.github/workflows/**`.
 

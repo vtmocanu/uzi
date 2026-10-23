@@ -7811,6 +7811,9 @@ export class GitCache {
    * means "not covered". The `refs/stash` refusal is a belt: stash commits are never reachable
    * from the bare. Any failed read is `false`.
    *
+   * The transient {@link RECOVERY_BUNDLE_REF} is excluded from `--all`: an aborted bundle pass may
+   * leave it behind, and it only retains objects, never proves a side ref held.
+   *
    * `--objects` makes a ref naming a blob, tree or tag object count as held only when the bare
    * reaches that object from one of its refs, not when it merely has it as unreachable loose data.
    *
@@ -7843,7 +7846,7 @@ export class GitCache {
       const all = [...shas];
       for (let i = 0; i < all.length; i += LOCAL_REF_REVLIST_CHUNK) {
         const chunk = all.slice(i, i + LOCAL_REF_REVLIST_CHUNK);
-        const extra = await this.runGitWithEnv(barePath, ["rev-list", "--objects", "-n", "1", ...chunk, "--not", head, "--all"], NO_REPLACE_ENV);
+        const extra = await this.runGitWithEnv(barePath, ["rev-list", "--objects", "-n", "1", ...chunk, "--not", head, `--exclude=${RECOVERY_BUNDLE_REF}`, "--all"], NO_REPLACE_ENV);
         if (extra.trim() !== "") return false;
       }
       return true;
@@ -13047,13 +13050,24 @@ try {
    * limit is enforced WHILE writing ({@link streamBundleWithCap}): the git child is killed and the
    * partial file removed as soon as the bytes written pass the limit.
    *
+   * A pass aborted after the transient ref is created may leave it, potentially indefinitely until a later successful bundle on that bare replaces and deletes it; it is excluded from coverage proofs and only retains objects.
+   *
    * The bundle is `git bundle verify`d against the bare (a producer self-check that its
    * prerequisites resolve) before the size/checksum are recorded. The transient named ref
-   * is created and deleted under the SAME bare lock, so a concurrent op never observes it.
+   * is created, and its best-effort deletion attempted, under the SAME bare lock; an aborted cleanup may leave it afterwards.
    */
   async produceRecoveryBundle(
     barePath: string,
     opts: { sourceSha: string; outPath: string; forgeTip?: string; guardedDefaultBranch?: string; maxBytes?: number },
+    signal?: AbortSignal,
+  ): Promise<RecoveryBundleResult> {
+    const produce = () => this.produceRecoveryBundleWithinOperation(barePath, opts);
+    return signal ? this.withRecoveryOperation(signal, Infinity, produce) : produce();
+  }
+
+  private async produceRecoveryBundleWithinOperation(
+    barePath: string,
+    opts: Parameters<GitCache["produceRecoveryBundle"]>[1],
   ): Promise<RecoveryBundleResult> {
     MaintenanceResources.consumeIfActive("artifactBytes", 0);
     if (opts.guardedDefaultBranch !== undefined && opts.forgeTip !== undefined) {
@@ -13101,7 +13115,7 @@ try {
         }
       }
       // Create the transient named ref at H, build the bundle from EXACTLY that ref, verify
-      // it, then delete the ref in a finally so the bare's namespace is left untouched.
+      // it, then attempt a best-effort delete of the ref in a finally (an aborted cleanup may leave it).
       await this.runGit(barePath, ["update-ref", RECOVERY_BUNDLE_REF, h]);
       try {
         // `-` writes the bundle to stdout so the bytes actually written are counted and capped.

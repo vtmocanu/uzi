@@ -200,7 +200,7 @@ and acceptance limits above remain historical records.
 
 ## #1230 coverage-park and semantic digest amendment (2026-10-20)
 
-This amendment records the dormant [PRD #1230](../prds/1230-semantic-completion-contract.md) M4 additions to the plan gate. Everything in it is reachable only through a run with a `semantic_planning` enrollment; production enrollment is off until #1231, no production code writes one, and only tests inject the path. The structural and legacy meanings of the sections above are unchanged. Nothing here is hosted-acceptance proof.
+This amendment records the dormant [PRD #1230](../prds/done/1230-semantic-completion-contract.md) M4 additions to the plan gate. Everything in it is reachable only through a run with a `semantic_planning` enrollment; production enrollment is off until #1231, no production code writes one, and only tests inject the path. The structural and legacy meanings of the sections above are unchanged. Nothing here is hosted-acceptance proof.
 
 ### The `semantic_v1` candidate digest
 
@@ -225,3 +225,63 @@ Consistent with D16, a human revision of the plan triggers no new cross-family c
 ### Coverage transport limitation
 
 Production coverage review reaches no model today: see the [coverage transport limitation](1225-structural-completion-interlock-invariants.md#coverage-transport-limitation) in ADR-1225. Until #1231 establishes enforceable bounds, a production call would settle as coverage-unavailable (`semantic_park: coverage_unavailable`) rather than reach a model.
+
+## Advisory plan coverage amendment (2026-10-23, #3334 / #3168 M1)
+
+This amendment records [PRD #3168](../prds/3168-plan-cross-check-coverage.md)
+M1's advisory coverage contract, implemented through child #3334. It narrows
+the universal missing-disposition REVISE rule in the 2026-10-17 amendment for
+coverage notes; defect disposition rules remain. It does not activate the
+dormant semantic coverage profile above.
+
+The shared `crossCheckBrief` asks both checker families to enumerate
+requirements and acceptance criteria from the supplied issue snapshot and
+repository PRDs linked by the issue. Existing read/search tools, deadlines
+and limits apply; issue comments are not supplied, and no URL fetching or new
+tool access is added. Omitted or partly covered requirements use warning with
+the mandatory summary prefix `Requirement gap:`. Requirements verifiable only
+on hosted, live or maintainer-only surfaces use info with `Coverage uncertainty:`.
+Every coverage item uses one of these prefixes; defects never use either.
+Missing, external, unreadable or oversized sources receive a summary
+`Coverage uncertainty:` note and are never reported as covered. No defect
+found does not mean requirement covered.
+
+Coverage alone never justifies REVISE or BLOCK, including a missing or declined
+prior coverage disposition. An omitted requirement stated by the issue as a
+safety, security or data-integrity constraint remains an error defect, with no
+coverage prefix, requiring REVISE under existing defect rules. Missing or
+incomplete defect dispositions still call for REVISE, never BLOCK solely for
+that omission; a supported decline cannot waive a mandatory defect requirement.
+Defects come first within the existing 20-item cap. Coverage fills spare space;
+overflow is counted in the summary as `N coverage notes omitted`. Coverage
+items and the omitted count never displace a defect.
+
+The runner passes approving findings to both lead executors.
+`renderPlanApprovalAdvice` in `agent/src/prompt.ts` delivers every item,
+including noncoverage warning/info, plus the complete bounded summary,
+including summary-only findings. Absent/null findings or an empty summary
+with no items leave implementation-prompt bytes unchanged. Approval and
+automatic revision advice share nonce fencing, with eight nonce attempts and
+entity escaping on exhaustion. The fenced text is untrusted, non-gating advice:
+verify against issue, code and uzi rules, decline conflicts with reasons, and
+retain existing permissions and constraints. The approved canonical plan
+remains authoritative. An omitted requirement may be implemented only within
+the issue's stated scope and must be named in the PR description. Code
+cross-check reviews the implementation when enabled; scope, permissions and
+canonical authority apply independently.
+
+No additional gate, re-plan or revision round is required. There is no new
+wire/API/schema field, capability or persistence. Advice is worker-local and
+lost on reclaim; the dormant semantic human-gate path drops it when it drops
+`checkedApproval`. Mixed workers retain that boundary: old leads discard
+approving findings, old checkers supply no new coverage account, and new leads
+render received findings. These are instruction and delivery contracts, not
+behavioral convergence guarantees. Code-stage revision prompt bytes stay
+unchanged.
+
+Instruction-contract tests and captured provider requests verify guidance and
+both-executor delivery; they do not prove model behavior. Fixed-nonce goldens
+pin unchanged code-stage revision prompts. Required validation and its observed
+results are tracked in PRD #3168's M1 progress section. Child #3334 requires no
+maintainer replay; parent #3168 remains open for M2. No live model convergence,
+cost or latency measurement is claimed.

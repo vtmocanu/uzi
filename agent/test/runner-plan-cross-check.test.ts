@@ -2000,7 +2000,11 @@ describe("U2 real runner checked gate", () => {
 
   it("real runner APPROVE reaches SDK implementation with server normalization and []", { skip: LINUX_CAPTURE }, async () => {
     const c = claim();
+    const findings = { summary: "Coverage uncertainty: unreadable PRD; 2 coverage notes omitted", items: [
+      { file: "plan.md", severity: "warning", summary: "Requirement gap: fourth acceptance criterion", rationale: "only three planned" },
+    ] };
     api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, "approve", "approve", {
+      findings,
       candidate: { ...body, plan_md: NORMALIZED, milestones: [], required_capabilities: [], required_tools: [], size_class: "s" },
     }) });
     const base = planWithMilestonesThenDoneQuery([{ id: "local", title: "local milestone" }]);
@@ -2024,6 +2028,10 @@ describe("U2 real runner checked gate", () => {
     };
     await start(new SdkExecutor(nullLogger(), homeDir, { queryFn: wrapped }), c);
     assert.equal(api.crossCheckRequests.length, 1);
+    assert.equal(gates(c.run_id).length, 0, "coverage APPROVE needs no human gate");
+    for (const text of [findings.summary, ...findings.items.map(item => item.summary)]) {
+      assert.ok(prompts.slice(1).some(p => p.includes(text)), "actual implementation carries all advice");
+    }
     assert.ok(prompts.slice(1).some((p) => p.includes("server normalized proposal")), "SDK adopts server prose");
     assert.ok(!prompts.slice(1).some((p) => p.includes("local milestone")), "SDK clears local milestone list");
     assert.ok(statuses(c.run_id).includes("completed"));
@@ -2034,6 +2042,7 @@ for (const committed of [false, true])
 it(`checked canonical storage resumes after real switch give-up with ${committed ? "committed held ACK" : "write not committed"}`, { timeout: 10_000, skip: LINUX_CAPTURE }, async () => {
   const c = claim();
   api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, "approve", "approve", {
+    findings: { summary: "Coverage uncertainty: retained ACK handoff", items: [] },
     candidate: { ...body, plan_md: NORMALIZED, milestones: [], required_capabilities: [], required_tools: [], size_class: "s" },
   }) });
   let requested = false;
@@ -2178,6 +2187,7 @@ it(`checked canonical storage resumes after real switch give-up with ${committed
     assert.equal(gates(c.run_id).length, 0, "no human publication");
     assert.ok(!statuses(c.run_id).includes("recovery_wait"));
     assert.ok(statuses(c.run_id).includes("completed"));
+    assert.ok(prompts.slice(1).some(p => p.includes("Coverage uncertainty: retained ACK handoff")), "same-execution storage closure retains advice after ACK retry");
     assert.ok(prompts.slice(1).some((p) => p.includes("server normalized proposal")));
     assert.ok(!prompts.slice(1).some((p) => p.includes("local milestone")));
     assert.equal(api.messages(c.run_id).filter((m) => m.kind === "plan").length, 1, "no second initial plan emission");
@@ -2263,13 +2273,15 @@ describe("RunRunner checked gate for a Codex lead (PRD #2460)", () => {
 
   it("submits a candidate and takes the approved canonical plan (acceptance 1)", { skip: LINUX_CAPTURE }, async () => {
     const c = codexClaim();
-    api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, "approve", "approve", canonicalOf(body)) });
+    const findings = { summary: "Coverage uncertainty: missing source", items: [] };
+    api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, "approve", "approve", { ...canonicalOf(body), findings }) });
     const { exec, verdicts } = checkedExec();
     await start(exec, c);
     assert.equal(api.crossCheckRequests.length, 1, "the Codex lead's candidate is submitted for a cross-check");
     assert.equal(verdicts.length, 1);
     const v = verdicts[0]!;
     assert.ok(v.kind === "approve" && v.approval === "cross_check");
+    assert.deepEqual(v.findings, findings);
     assert.equal(v.kind === "approve" && v.approval === "cross_check" ? v.canonical.plan : "", NORMALIZED);
     const states = api.states.filter((s) => s.runId === c.run_id).map((s) => s.body);
     assert.ok(!states.some((s) => (s as { plan_cross_check_gate_reason?: string }).plan_cross_check_gate_reason === "codex_lead_unsupported"), "no unsupported park");

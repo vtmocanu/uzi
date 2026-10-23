@@ -9,7 +9,7 @@ import { Outbox } from "../src/outbox.js";
 import { resolvePendingTerminal, makeTerminalOutboxDeps } from "../src/terminal-resolve.js";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
 import { api, baseUrl, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
-import { HELD_LINUX_ONLY, JOIN_TOKEN, commit, frozenRecords, heldServer, recoveryOf, skipCheckpoints } from "./runner-held-publication-fixture.js";
+import { HELD_LINUX_ONLY, JOIN_TOKEN, commit, deferTerminalEvidence, frozenRecords, heldServer, recoveryOf, skipCheckpoints } from "./runner-held-publication-fixture.js";
 
 installHarness();
 
@@ -94,6 +94,7 @@ for (const entry of ["boot", "live"] as const) for (const ack of ["receipt", "re
       if (args[1].status === "completed" && !terminal) down = true;
       return report(...args);
     });
+    deferTerminalEvidence(r, t);
     await r.execute(claim);
     const saved = await outbox.readTerminalJournal(claim.run_id, 71);
     t.diagnostic(JSON.stringify({ stage: "outage", head, saved: saved?.body, bodies, events }));
@@ -234,6 +235,7 @@ for (const cancellation of ["archive", "held", "unknown"] as const) {
       r["observeCancellation"](flight);
       return result;
     };
+    deferTerminalEvidence(r, t);
     await r.execute(claim);
     assert.equal(models, 0);
     const original = await frozenRecords(claim);
@@ -308,6 +310,7 @@ for (const overlap of ["after-exit", "during-exit", "report-before-reservation"]
         reservation: r["inventoryReservations"].has(claim.run_id) });
       return boundary(...args);
     };
+    deferTerminalEvidence(r, t);
     await r.execute(claim);
     const original = await frozenRecords(claim);
     assert.equal(original[0]?.reason, "inventory_source_not_quiescent:execution_tail_present");

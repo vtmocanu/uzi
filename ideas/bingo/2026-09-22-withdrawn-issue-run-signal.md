@@ -251,7 +251,7 @@ drivers (no new API call), `main`.
   comments; auto-cancel; closing the MR or deleting the branch; reopen handling; webhooks.
 - **Adjacency.** Open PRDs `prds/done/1190-run-pause-resume.md` (owner pause, whose path M2
   reuses), `prds/1497-park-at-wall.md`, `prds/done/1229-durable-run-holds.md`,
-  `prds/done/1202-on-demand-mr-rework.md`/`prds/1233-structured-blockers-mr-rework.md`; forge
+  `prds/done/1202-on-demand-mr-rework.md`/`prds/done/1233-structured-blockers-mr-rework.md`; forge
   issues #1461 (mr_rework re-arms after owner cancel), #1324 (park on forge outage at
   finalize), #813 (harden mr_rework) — adjacent lanes, different mechanism. The six prior
   bingo files: run-queue-priority shipped (`prds/done/320-run-queue-priority.md`);
