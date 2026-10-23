@@ -339,8 +339,8 @@ jobs:
 
   # The combined recovery proof crosses API, agent, fixtures and the DB harness.
   # Run on every PR/main push except audited component-independent PRs. The Task
-  # target owns the serial LiveDB sweep and all three worker
-  # variants; ubuntu-latest supplies Docker for its throwaway database.
+  # target owns the serial LiveDB sweep, all four lost-reply worker variants,
+  # and the retained-stop proof; ubuntu-latest supplies its throwaway database.
   test-codex-refresh-lostreply-e2e:
     needs: changes
     if: >-
