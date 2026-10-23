@@ -580,7 +580,21 @@ test("N replay-only entry never admits or consumes producer resources with an el
     resumeTerminalEvidence?: RecoveryCoordinator["resumeTerminalSource"];
   }).resumeTerminalEvidence;
   assert.ok(method, "the replay-only entry is installed");
+  // A sealed saved record (an uncertain held create) is the kind of evidence the replay-only entry may redrive.
+  await f.seal({ version: 1, runId, generation: 1, captureId: "00000000-0000-4000-8000-000000000041",
+    kind: "issue", branch: "task", sourceSha: sha, createdAt: Date.now(), state: "pinned", inventoryGuarded: true,
+    bareDir: "repo.git", heldCreateUncertain: true });
+  // The direct observable of replay processing: the coordinator redrives exactly the sealed record.
+  const redriven: Array<{ captureId: string; path: unknown }> = [];
+  const owner = f.coordinator as unknown as { pendingStep: (snap: RecoveryRecord, signal?: AbortSignal, path?: string) => Promise<void> };
+  const pendingStep = owner.pendingStep;
+  t.mock.method(owner, "pendingStep", function (this: unknown, snap: RecoveryRecord, signal?: AbortSignal, path?: string) {
+    redriven.push({ captureId: snap.captureId, path });
+    return pendingStep.call(this, snap, signal, path);
+  });
   await method.call(f.coordinator, runId, Promise.resolve(f.observation), 1, f.signal.signal);
+  assert.deepEqual(redriven, [{ captureId: "00000000-0000-4000-8000-000000000041", path: "terminal_source" }],
+    "the sealed saved record was actually redriven (not a vacuous empty pass)");
   assert.equal(admissions, 0, "saved replay must never enter real RecoveryMaintenance.admit");
   assert.equal(consumption, 0, "saved replay consumes no producer resource budget");
   assert.equal(await f.chargeCount(), 0);
