@@ -2896,6 +2896,9 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 			return store.Worker{}, err
 		}
 		maxRequeues := int32(s.p.RunMaxRequeues) //nolint:gosec // G115: RunMaxRequeues is a small bounded config int (env RUN_MAX_REQUEUES), never near int32 range
+		if err := qtx.OptInCheckpointCoordinates(ctx); err != nil {
+			return store.Worker{}, err
+		}
 		readopted, err = qtx.FrozenReadoptRunsFromSnapshot(ctx, store.FrozenReadoptRunsFromSnapshotParams{WorkerID: updated.ID, FrozenTargets: frozen, LockedParentIds: parents})
 		if err != nil {
 			return store.Worker{}, err
@@ -3444,7 +3447,7 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 	// Snapshot carried + tx beginner: ONE transaction in the canonical lock order (D8), so a
 	// sibling's concurrent FOR UPDATE SKIP LOCKED claim cannot see this claimant's pre-locked runs
 	// or replaced snapshot until it commits.
-	tx, err := s.txBeginner.Begin(ctx)
+	tx, err := s.beginReadCommitted(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -3517,7 +3520,7 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		return nil, err
 	}
 	committed = true
-	return s.assembleAndFinishRunClaim(ctx, wkr, run, params.RecoveryCapable)
+	return s.assembleAndFinishRunClaim(ctx, reread, run, params.RecoveryCapable)
 }
 
 // requestActivePairs extracts the index-aligned (run_id, claim_generation) pairs a claim's request
@@ -4596,13 +4599,16 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		// Completed publication and ephemeral leasing serialize on the worker before the run.
 		// Keep leasing conditional on an ephemeral terminal report with the lease enabled.
 		leaseFence = req.ClaimGeneration != nil && s.ephemeralLease > 0 && wkr.Ephemeral && (req.State == "completed" || req.State == "failed")
-		if leaseFence || completedPublicationCapable(wkr, req) || req.SourcePublication != nil {
+		if len(owned.CheckpointCoordinates) > 0 || leaseFence || completedPublicationCapable(wkr, req) || req.SourcePublication != nil {
 			if _, werr := qtx.GetWorkerForUpdate(ctx, wkr.ID); werr != nil {
 				if errors.Is(werr, pgx.ErrNoRows) {
 					return store.Run{}, false, ErrRunNotOwned // the worker row is gone: the run left it
 				}
 				return store.Run{}, false, werr
 			}
+		}
+		if err := qtx.OptInCheckpointCoordinates(ctx); err != nil {
+			return store.Run{}, false, err
 		}
 		locked, lerr := qtx.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)})
 		if lerr != nil {
@@ -4695,6 +4701,14 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		}
 		fenceTx = tx
 		qtx := store.New(tx)
+		if len(owned.CheckpointCoordinates) > 0 {
+			if _, err := qtx.GetWorkerForUpdate(ctx, wkr.ID); err != nil {
+				return store.Run{}, false, err
+			}
+		}
+		if err := qtx.OptInCheckpointCoordinates(ctx); err != nil {
+			return store.Run{}, false, err
+		}
 		locked, lerr := qtx.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)})
 		if lerr != nil {
 			if errors.Is(lerr, pgx.ErrNoRows) {

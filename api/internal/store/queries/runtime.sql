@@ -1088,6 +1088,7 @@ WITH claimant AS MATERIALIZED (
       -- even when capability scheduling is disabled or the owner clears required_capabilities.
       AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = r.id)
            OR 'milestone_reconciliation_claim_v1' = ANY(@worker_protocol_caps::text[]))
+      AND (r.checkpoint_coordinates IS NULL OR 'task_checkpoint_coordinates_v1' = ANY(@worker_protocol_caps::text[]))
       AND (r.completion_contract_version IS NULL
            OR 'completion_interlock_v1' = ANY(@worker_protocol_caps::text[]))
       -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
@@ -1356,6 +1357,7 @@ WITH claimant AS MATERIALIZED (
                 -- the claimant's @worker_protocol_caps above).
                 AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = r.id)
                      OR 'milestone_reconciliation_claim_v1' = ANY(p.protocol_capabilities))
+      AND (r.checkpoint_coordinates IS NULL OR 'task_checkpoint_coordinates_v1' = ANY(p.protocol_capabilities))
                 AND (r.completion_contract_version IS NULL
                      OR 'completion_interlock_v1' = ANY(p.protocol_capabilities))
                 -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
@@ -7213,6 +7215,10 @@ WITH candidates AS MATERIALIZED (
     WHERE a.worker_id = @worker_id AND a.run_id = r.id AND a.terminal_pending = false
   AND r.worker_id = @worker_id
   AND r.status = 'queued'
+  AND (r.checkpoint_coordinates IS NULL OR EXISTS (
+      SELECT 1 FROM workers coordinate_worker
+      WHERE coordinate_worker.id = @worker_id AND coordinate_worker.user_id = r.user_id
+        AND 'task_checkpoint_coordinates_v1' = ANY(coordinate_worker.protocol_capabilities)))
   AND (r.kind <> 'cross_check' OR r.claim_generation > 0)
   AND r.kind <> 'chat'
   AND r.claim_generation = a.claim_generation
@@ -7271,6 +7277,10 @@ FROM worker_active_runs a
 WHERE a.worker_id = @worker_id AND a.run_id = r.id AND a.terminal_pending = false
   AND r.worker_id = @worker_id
   AND r.status = 'queued'
+  AND (r.checkpoint_coordinates IS NULL OR EXISTS (
+      SELECT 1 FROM workers coordinate_worker
+      WHERE coordinate_worker.id = @worker_id AND coordinate_worker.user_id = r.user_id
+        AND 'task_checkpoint_coordinates_v1' = ANY(coordinate_worker.protocol_capabilities)))
   AND (r.kind <> 'cross_check' OR r.claim_generation > 0)
   AND r.kind <> 'chat'
   AND r.claim_generation = a.claim_generation
@@ -9969,6 +9979,7 @@ WHERE run.id = @run_id
         @capability_aware::boolean)
   AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = run.id)
        OR 'milestone_reconciliation_claim_v1' = ANY(w.protocol_capabilities))
+      AND (run.checkpoint_coordinates IS NULL OR 'task_checkpoint_coordinates_v1' = ANY(w.protocol_capabilities))
   AND (run.completion_contract_version IS NULL
        OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
   -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
@@ -10398,7 +10409,7 @@ WHERE r.status = 'queued'
   -- the CODE exclusion above keeps known CODE children on their own worker.
   -- PRD #2865: a GUARDED run (ci_config_guard) is demand too: with no worker reporting
   -- ci_config_guard_v1 online, only a freshly provisioned worker can claim it.
-  AND (cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR r.kind = 'cross_check' OR r.ci_config_guard OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]))
+  AND (r.checkpoint_coordinates IS NOT NULL OR cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR r.kind = 'cross_check' OR r.ci_config_guard OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]))
 
   AND NOT EXISTS (
       SELECT 1 FROM workers w
@@ -10422,6 +10433,7 @@ WHERE r.status = 'queued'
         -- Protocol requirements apply to persistent and leased workers alike.
         AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = r.id)
                       OR 'milestone_reconciliation_claim_v1' = ANY(w.protocol_capabilities))
+      AND (r.checkpoint_coordinates IS NULL OR 'task_checkpoint_coordinates_v1' = ANY(w.protocol_capabilities))
         AND (r.completion_contract_version IS NULL
                       OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
         -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
@@ -10628,6 +10640,7 @@ WHERE r.status = 'queued'
         -- Protocol requirements apply to persistent and leased workers alike.
         AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = r.id)
                       OR 'milestone_reconciliation_claim_v1' = ANY(w.protocol_capabilities))
+      AND (r.checkpoint_coordinates IS NULL OR 'task_checkpoint_coordinates_v1' = ANY(w.protocol_capabilities))
         AND (r.completion_contract_version IS NULL
                       OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
         -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
@@ -10704,6 +10717,7 @@ WHERE r.status = 'queued'
         -- Protocol requirements apply to persistent and leased workers alike.
         AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = r.id)
                       OR 'milestone_reconciliation_claim_v1' = ANY(w.protocol_capabilities))
+      AND (r.checkpoint_coordinates IS NULL OR 'task_checkpoint_coordinates_v1' = ANY(w.protocol_capabilities))
         AND (r.completion_contract_version IS NULL
                       OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
         -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside

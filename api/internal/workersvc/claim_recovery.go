@@ -235,6 +235,18 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		return nil, "", err
 	}
 	defer func() { _ = q.Rollback(ctx) }()
+	if len(run.CheckpointCoordinates) > 0 {
+		live, ok := q.(pgxClaimFinishTx)
+		if !ok {
+			return nil, "", errClaimRecoveryNoTx
+		}
+		if _, err := live.GetWorkerForUpdate(ctx, identity.workerID); err != nil {
+			return nil, "", err
+		}
+		if err := live.OptInCheckpointCoordinates(ctx); err != nil {
+			return nil, "", err
+		}
+	}
 	// Intrinsic pin failures and every Claude checker claim enter lead-first: the
 	// locked credential re-check may decide the check. The persisted stage selects
 	// the verdict lock and settlement before the child row is locked.
