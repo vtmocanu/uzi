@@ -953,7 +953,7 @@ commits back, creating no forge issue and no MR unless `--mr` is passed.
 [docs/cli.md](docs/cli.md#uzi-handoff-ephemeral-branch-scoped-task-runs).
 
 Issue continuation (#3326) stores a nullable `runs.continued_issue_iid`.
-Migration 349's CHECK permits a populated value only on a `task`, with a
+Migration 351's CHECK permits a populated value only on a `task`, with a
 positive IID, non-null repo and null `issue_iid`; this adds no board
 association. `CreateTaskRun` verifies repo ownership and the real forge issue
 (open or closed, not a PR), without eligibility-label or PRD gates.
@@ -976,7 +976,7 @@ the active guard. Task creation checks active runs, not completed open MRs.
 The link does not change task branches or the Refs-only MR profile, and does
 not itself generate a reference or closing keyword.
 
-**Deployment / rollback (migration 349).** The transactional `ALTER TABLE`
+**Deployment / rollback (migration 351).** The transactional `ALTER TABLE`
 holds `ACCESS EXCLUSIVE` through CHECK validation and index scans. A nullable
 column without a default avoids a table rewrite, but CHECK/index scans and
 their I/O/WAL costs remain; production-volume cost and lock duration are
