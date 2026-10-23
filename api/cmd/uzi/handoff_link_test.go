@@ -69,15 +69,7 @@ func TestHandoffOmittedIssueKeepsBranch(t *testing.T) {
 	if fc.LastCreateTaskContinuedIssueIID != nil {
 		t.Fatal("omitted issue became a continuation link")
 	}
-	pushed := false
-	for _, call := range rec.gitCalls {
-		if len(call) > 0 && call[0] == "push" {
-			pushed = true
-			if !strings.Contains(strings.Join(call, " "), "HEAD:refs/heads/uzi/task/server") {
-				t.Fatalf("push changed server branch: %v", call)
-			}
-		}
-	}
+	pushed := hasGitCall(rec, []string{"push", "origin", "HEAD:refs/heads/uzi/task/server"})
 	if !pushed || fc.LastDispatchRunID != "r" {
 		t.Fatalf("push=%v dispatch=%q", pushed, fc.LastDispatchRunID)
 	}

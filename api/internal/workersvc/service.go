@@ -1048,7 +1048,7 @@ type Store interface {
 	// gave the manual/board/Slack path is restored here (this SELECT still counts
 	// pool_wait as active).
 	HasActiveRunForIssue(ctx context.Context, arg store.HasActiveRunForIssueParams) (bool, error)
-	// GetOpenMRRunForIssue returns the MR iid of a completed issue run that still owns an
+	// GetOpenMRRunForIssue returns the MR iid of a completed issue or linked task run owning an
 	// OPEN merge request for the issue (issue #856), or pgx.ErrNoRows when none does. It
 	// backs createRun's create-time open-MR refusal (the open-MR dedup that --force bypasses).
 	GetOpenMRRunForIssue(ctx context.Context, arg store.GetOpenMRRunForIssueParams) (pgtype.Int8, error)

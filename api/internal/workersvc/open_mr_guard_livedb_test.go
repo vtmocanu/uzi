@@ -18,15 +18,17 @@ import (
 // (issue #856) against a REAL Postgres. createRun must refuse a fresh issue run when the
 // SAME issue already has a COMPLETED (terminal) run owning an OPEN merge request — the
 // active-run gate cannot see a terminal run, so this guard is the only thing that stops a
-// fresh run re-planning and re-reviewing onto an already-open MR. Five arms, each on its
-// own repo+issue so they cannot cross-contaminate:
+// fresh run re-planning and re-reviewing onto an already-open MR. Each case uses its own
+// repo+issue so they cannot cross-contaminate. The linked-task matrices cover completed
+// MR states with/without force and active states (including pool_wait), which force
+// never bypasses. The original issue-run controls cover:
 //
 //  1. blocked   — a completed issue run with mr_iid + mr_state='opened' ⇒ a second
 //     CreateRun returns ErrOpenMRExists and the message names the MR number.
 //  2. merged    — the same prior run with mr_state='merged' (no open MR) ⇒ allowed.
 //  3. forced    — an open MR present but force=true ⇒ allowed (the guard is bypassed).
 //  4. kind scope — a completed SELF_IMPROVE run (kind != 'issue') owning an open MR for the
-//     same issue ⇒ allowed, because the guard is scoped to kind='issue'.
+//     same issue ⇒ allowed, because the guard covers issue runs and linked tasks.
 //  5. watcher lag — a completed issue run with mr_iid set but mr_state STILL NULL (the
 //     watcher has not ticked yet) ⇒ a second CreateRun is still REFUSED with ErrOpenMRExists
 //     naming the MR. This proves the guard keys on the authoritative mr_iid and no longer
