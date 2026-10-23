@@ -963,6 +963,10 @@ including `pool_wait`. The partial unique expression index on
 `(repo_id, coalesce(issue_iid, continued_issue_iid))` covers `issue`/`task`
 runs, excluding terminal states and `pool_wait`; the creation precheck
 still counts `pool_wait` as active. Terminal tasks release the active guard.
+A separate nonunique partial index, `idx_runs_continued_issue_lookup` on
+`(repo_id, continued_issue_iid)` for tasks with a non-null link, supports
+linked-task lookups alongside `idx_runs_issue_history` for `issue_iid`
+lookups. These lookup indexes do not bound the history scanned for one issue.
 Review and then-fix children inherit the link, with best-effort post-terminal
 creation and no continuous reservation while the chain is entirely terminal.
 `GetOpenMRRunForIssue` also finds completed linked tasks with an MR whose
@@ -976,8 +980,8 @@ not itself generate a reference or closing keyword.
 holds `ACCESS EXCLUSIVE` through CHECK validation and index scans. A nullable
 column without a default avoids a table rewrite, but CHECK/index scans and
 their I/O/WAL costs remain; production-volume cost and lock duration are
-unknown. Down restores the old issue-only index and drops the link column,
-irreversibly losing continuation provenance.
+unknown. Down restores the old issue-only index, drops the linked-task lookup
+index and drops the link column, irreversibly losing continuation provenance.
 
 Status is a linear state machine:
 
