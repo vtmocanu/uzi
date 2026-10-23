@@ -615,9 +615,12 @@ func (m tuiModel) workersSummary(width int, hideIdleCrossChecks bool) string {
 		return ""
 	}
 	n, online, used, cap, unknown, attention, holding, draining, cordoned := len(m.workers.rows), 0, 0, 0, 0, 0, 0, 0, 0
-	crossUsed, crossCap, crossUnknown := 0, 0, 0
+	crossUsed, crossCap, crossUnknown, manualIntake := 0, 0, 0, 0
 	now := time.Now()
 	for _, r := range m.workers.rows {
+		if r.w.ManualCordonedAt != nil {
+			manualIntake++
+		}
 		if r.w.Status == "online" {
 			online++
 			used += r.w.ActiveRuns
@@ -675,6 +678,9 @@ func (m tuiModel) workersSummary(width int, hideIdleCrossChecks bool) string {
 		}
 		if !hideIdleCrossChecks || crossUsed != 0 {
 			parts = append(parts, cross)
+		}
+		if manualIntake > 0 {
+			parts = append(parts, paintSeg(m.pal.wait, nil, false, fmt.Sprintf("%d cordoned (manual)", manualIntake)))
 		}
 		if showAdmission {
 			if holding > 0 {
