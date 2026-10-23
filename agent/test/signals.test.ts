@@ -1243,9 +1243,8 @@ describe("M3 park_run scanning", () => {
 
 describe("signal_done report_only texts scope the #3360 fallback to issue runs", () => {
   const pinned = (text: string) => {
-    assert.match(text, /opens no merge request when nothing was committed/);
-    assert.match(text, /On issue runs, committed work already published to a checkpoint is instead delivered as a non-closing merge request if its checks pass/);
-    assert.match(text, /unpublished commits are not delivered/);
+    assert.match(text, /opens no merge request when no committed work was published to a checkpoint \(local commits are then not delivered\)/);
+    assert.match(text, /On issue runs, once committed work was published to a checkpoint, the committed branch is instead delivered as a non-closing merge request if its checks pass/);
   };
   it("pins the tool description", async () => {
     const res = await callToolOverJsonRpc(buildSignalMcpServer({ reportOnly: true }), "signal_done", {}, "tools/list");

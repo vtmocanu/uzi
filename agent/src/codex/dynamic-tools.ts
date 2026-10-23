@@ -138,7 +138,7 @@ function definition(name: string, grants: RunGrants): Omit<CodexDynamicToolSpec,
           summary: STRING,
           report_only: {
             type: "boolean",
-            description: "Issue runs only: set true ONLY when the run's deliverable is a report, command output, or a verification result with NO code change to land, so the worker records the findings and opens no merge request. Omit it (or set false) when a code change was committed. It does not leave the issue open; to leave the issue open use `non_closing`. Omit on other run kinds.",
+            description: "Issue runs only: set true ONLY when the run's deliverable is a report, command output, or a verification result with NO code change to land, so the worker records the findings and opens no merge request. Omit it (or set false) when a code change was committed. It does not leave the issue open; to leave the issue open use `non_closing`. If committed work was already published to a checkpoint, the committed branch is delivered as a non-closing merge request instead. Omit on other run kinds.",
           },
           non_closing: {
             ...objectSchema({ reason: STRING }, ["reason"], false),

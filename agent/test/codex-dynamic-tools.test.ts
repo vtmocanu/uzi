@@ -72,6 +72,7 @@ describe("#3360 report_only dynamic schema", () => {
     assert.match(String(declaration.description), /no code change/i);
     assert.match(String(declaration.description), /non_closing/);
     assert.match(String(declaration.description), /^Issue runs only:/);
+    assert.match(String(declaration.description), /already published to a checkpoint, the committed branch is delivered as a non-closing merge request/);
   });
 });
 
