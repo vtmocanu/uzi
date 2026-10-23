@@ -3854,6 +3854,7 @@ export class WorkerClient {
   async reportWallPark(
     runId: string,
     args: { head: string; published: boolean; claimGeneration?: number; checkpointContainsLatest?: boolean },
+    signal?: AbortSignal,
   ): Promise<{ applied: boolean; status: string; budgetTotalSeconds?: number; budgetUsedSeconds?: number; completionAttempts?: number }> {
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/wall-park`;
     // Stamp the claim-lane generation through the shared send-gate + skew-safe fallback, exactly as
@@ -3866,7 +3867,7 @@ export class WorkerClient {
       if (includeField) body.claim_generation = args.claimGeneration;
       // PRD #1809 D8: the caller passes it only when the api advertised run_checkpoint_durability.
       if (args.checkpointContainsLatest !== undefined) body.checkpoint_contains_latest = args.checkpointContainsLatest;
-      const res = await this.fetchRaw("POST", path, body);
+      const res = await this.fetchRaw("POST", path, body, this.httpTimeoutMs, signal);
       if (res.status === 200 || res.status === 409) {
         const fields = await readRunAck(res);
         // Issue #1600: a refused park's 409 carries the run's fresh budget; pass it through so the
