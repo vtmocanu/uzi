@@ -12,7 +12,7 @@ A maintainer-run, offline replay of today's unchanged Code cross-check checkers 
 Run everything from the `agent/` directory with the repository's installed dependencies. Supply credentials through the process environment, never as arguments.
 
 - **Codex:** a uid-split worker container. The replay launches the pinned Codex binary (`/opt/uzi-codex/0.163.0/bin/codex`) through `/usr/local/bin/uzi-codex-supervisor` and the cross-check helpers `/usr/local/bin/uzi-codex-command-sandbox` and `/usr/local/bin/uzi-codex-fileop`. The launcher refuses without `UZI_UID_SPLIT=1`: the worker identity is uid 10001 and the command identity is uid 10003. Codex replay supports API-key auth only (`OPENAI_API_KEY`); subscription auth is not supported.
-- **Claude:** Linux, preferably the worker image, with `CLAUDE_CODE_OAUTH_TOKEN`.
+- **Claude:** `CLAUDE_CODE_OAUTH_TOKEN`. Running inside the worker image is recommended: the checker's native cleanup certifies its SDK process group with POSIX process-group signals, and its path guard denies the worker's credential paths.
 
 ## Authorization
 
@@ -26,7 +26,7 @@ Real-model calls cost money. They need the maintainer's own authorization for pa
    npm run eval:code-cross-check -- verify
    ```
 
-2. Replay each family. `--family` (`claude` or `codex`), `--model`, `--effort` (`low`, `medium`, `high`, `xhigh`, `max`) and `--repeats` (1 to 20) are required; `--timeout-ms` is optional (at most 15 minutes). Five repeats is the recommended baseline. Record the model and effort you used; the sanitized aggregate carries both.
+2. Replay each family. `--family` (`claude` or `codex`), `--model`, `--effort` (`low`, `medium`, `high`, `xhigh`, `max`) and `--repeats` (1 to 20) are required; `--timeout-ms` is optional (default and maximum 15 minutes). The approved plan suggests five repeats, which is 30 paid checker calls per family for the six cases. A missing credential does not stop the run up front: every record is `missing_auth` and the command exits 1. Record the model and effort you used; the sanitized aggregate carries both.
 
    ```sh
    npm run eval:code-cross-check -- replay --family claude --model <model> --effort <effort> --repeats 5 --authorize-real-model-calls
@@ -62,7 +62,7 @@ To publish false-positive counts, the maintainer reads the private records file 
 ]
 ```
 
-Any adjudicated finding leaves `unadjudicated_findings`; only `false_positive` verdicts count in `verified_false_positives`. A malformed file gives `adjudication_invalid`, a repeated pair `adjudication_duplicate` and an unknown record or finding `adjudication_unknown_finding`. A stale or foreign records file gives `records_invalid`.
+Any adjudicated unmatched or control finding leaves `unadjudicated_findings` (an adjudication of a finding that matched an expected defect is accepted but has no effect); only `false_positive` verdicts count in `verified_false_positives`. A malformed file gives `adjudication_invalid`, a repeated pair `adjudication_duplicate` and an unknown record or finding `adjudication_unknown_finding`. A stale or foreign records file gives `records_invalid`, or `score_unknown_case` when a record names a case id that is not in this corpus.
 
 ## Publish
 
