@@ -12678,6 +12678,84 @@ describe("Codex completion interlock", () => {
     assert.match(JSON.stringify(rig.epochs[1]!.transport.requests.find((r) => r.method === "turn/start")?.params), /m2: Remaining/);
   });
 
+  // PRD #1232 M2: the Codex arm of the #1220 (b0ffd0ea) regression, mirroring the Claude arm in
+  // runner-completion-1220-regression.test.ts. Five milestones frozen, the lead declares four.
+  const FROZEN_FIVE = ["m1", "m2", "m3", "m4", "m5"].map((id) => ({ id, title: `title of ${id}` }));
+  const declareEpoch = (n: number, declared: string[], first: boolean): Responder => {
+    const frames = (t: FakeTransport, th: string, tn: string): void => {
+      t.push(toolCall(n, "signal_done", { milestones_completed: declared }, th, tn, `done-${n}`))
+        .push(turnCompleted("completed", th, tn));
+    };
+    return first ? epochResponder("th-1", `tn-${n}`, frames) : resumedEpochResponder("th-1", `tn-${n}`, frames);
+  };
+  const turnPrompts = (rig: MultiRig): string[] =>
+    rig.epochs.map((e) => JSON.stringify(e.transport.requests.find((r) => r.method === "turn/start")?.params));
+
+  it("b0ffd0ea shape: 5 frozen / 4 declared checkpoints first, names m5 on the SAME thread, never finalizes", async () => {
+    const four = ["m1", "m2", "m3", "m4"];
+    const rig = makeMultiEpochRig([declareEpoch(1, four, true), declareEpoch(2, four, false), declareEpoch(3, four, false)]);
+    const order: string[] = [];
+    const attempts: unknown[] = [];
+    const holds: string[] = [];
+    const { ctx } = makeCtx({
+      kind: "issue", completionInterlock: true, config: { max_iterations: 10 },
+      frozenMilestones: FROZEN_FIVE,
+      checkpoint: async () => { order.push("checkpoint"); },
+      worktreeFingerprint: async () => "TIP\n M docs/adr.md",
+      recordCompletionAttempt: async (args) => {
+        order.push("attempt");
+        attempts.push(args);
+        return { unmet: ["m5"], attemptCount: attempts.length };
+      },
+      askCompletionQuestion: async (unmet) => {
+        assert.deepEqual(unmet, ["m5"]);
+        order.push("ask");
+        return { outcome: "expired" };
+      },
+      enterCompletionHold: async (reason) => { order.push("hold"); holds.push(reason); return true; },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "codex b0ffd0ea");
+
+    assert.deepEqual(order.slice(0, 2), ["checkpoint", "attempt"], "checkpoint precedes the first server attempt");
+    assert.deepEqual(attempts, Array.from({ length: 3 }, () => ({
+      declared: four, head: "TIP", worktreeFingerprint: "TIP\n M docs/adr.md",
+    })), "three identical no-progress attempts, each declaring only m1..m4");
+    // Same thread: every re-prompt is a thread/resume of th-1 whose turn names m5 and its title.
+    const prompts = turnPrompts(rig);
+    assert.equal(rig.providerLaunches(), 3);
+    for (const [i, epoch] of rig.epochs.slice(1).entries()) {
+      const resumes = epoch.transport.requests.filter((r) => r.method === "thread/resume");
+      assert.deepEqual(resumes.map((r) => rec(r.params).threadId), ["th-1"], `epoch ${i + 1} resumed th-1`);
+      assert.match(prompts[i + 1]!, /m5: title of m5/);
+      assert.doesNotMatch(prompts[i + 1]!, /m4: title of m4/, "only the unmet milestone is named");
+    }
+    // Never finalized: parked in the hold, no publishable (non-held) result.
+    assert.equal(holds.length, 1);
+    assert.deepEqual(order.slice(-2), ["ask", "hold"]);
+    assert.deepEqual(result.completionHeld, { reason: holds[0] });
+    assert.deepEqual(result.milestonesCompleted, four);
+  });
+
+  it("mutation control (positive): all 5 declared (unmet empties) finalizes", async () => {
+    const rig = makeMultiEpochRig([declareEpoch(1, ["m1", "m2", "m3", "m4", "m5"], true)]);
+    const attempts: unknown[] = [];
+    const holds: string[] = [];
+    const { ctx } = makeCtx({
+      kind: "issue", completionInterlock: true, config: { max_iterations: 10 },
+      frozenMilestones: FROZEN_FIVE,
+      checkpoint: async () => {},
+      worktreeFingerprint: async () => "TIP\n M docs/adr.md",
+      recordCompletionAttempt: async (args) => { attempts.push(args); return { unmet: [], attemptCount: attempts.length }; },
+      enterCompletionHold: async (reason) => { holds.push(reason); return true; },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "codex 5 declared");
+    assert.equal(attempts.length, 1, "one attempt, then finalize");
+    assert.deepEqual(holds, []);
+    assert.equal(result.completionHeld, undefined);
+    assert.equal(rig.providerLaunches(), 1, "no rework turn");
+    assert.deepEqual(result.milestonesCompleted, ["m1", "m2", "m3", "m4", "m5"]);
+  });
+
   it("asks at three identical attempts, continues with guidance, then holds on expiry", async () => {
     const rig = makeMultiEpochRig([firstEpoch(1), doneEpoch(2), doneEpoch(3), doneEpoch(4), doneEpoch(5), doneEpoch(6)]);
     let attempts = 0;

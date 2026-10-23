@@ -3,9 +3,9 @@
 The completion-interlock responses the api returns on the worker permit/attempt wire, for a structural
 run frozen with five milestones `m1`..`m5` (one criterion `mN.c1` each):
 
-- `attempt-unmet.json`: `POST /api/worker/runs/{id}/completion-attempt` with `m1`..`m4` declared; the
+- `attempt-unmet.json`: `POST /api/worker/runs/{id}/completion/attempt` with `m1`..`m4` declared; the
   server-authoritative unmet set is `["m5"]`.
-- `permit-denied.json`: `POST /api/worker/runs/{id}/completion-permit` at contract revision 1 with
+- `permit-denied.json`: `POST /api/worker/runs/{id}/completion/permit` at contract revision 1 with
   `m1`..`m4` complete; a non-terminal denial, `deny_reason` `missing_milestones`, `unmet` `["m5"]`.
 - `permit-granted.json`: the same request with all five complete; the granted permit (id, contract
   revision, branch, head, issue time, finding ids, `completion_scope`).
