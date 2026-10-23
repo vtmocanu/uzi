@@ -87,8 +87,13 @@ func TestManualCordonHealthSuitableSetLiveDB(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if counts.ManualSuitable != wantSuitable || counts.ManualCordoned != 1 || counts.Claimable != 0 {
-				t.Fatalf("suitable set: %+v, want suitable=%d manual=1 claimable=0", counts, wantSuitable)
+			wantAdvisory := int64(0)
+			if peerState == "offline" {
+				// A fresh offline heartbeat remains a legacy advisory hint only.
+				wantAdvisory = 1
+			}
+			if counts.ManualSuitable != wantSuitable || counts.ManualCordoned != 1 || counts.Claimable != wantAdvisory || counts.AssignedClaimable != 0 {
+				t.Fatalf("suitable set: %+v, want suitable=%d manual=1 claimable=%d assigned=0", counts, wantSuitable, wantAdvisory)
 			}
 			reason := manualCordonWaitReason(counts)
 			if wantSuitable == 2 {
@@ -126,7 +131,7 @@ func TestManualCordonHealthSuitableSetLiveDB(t *testing.T) {
 				t.Fatal(err)
 			}
 			counts, err = svc.workerEligibilityForHealth(e.ctx, time.Now(), run, true)
-			if err != nil || counts.Claimable != 1 || counts.ManualCordoned != 0 || manualCordonWaitReason(counts) != "" {
+			if err != nil || counts.Claimable != 1+wantAdvisory || counts.ManualCordoned != 0 || manualCordonWaitReason(counts) != "" {
 				t.Fatalf("uncordon projection=%+v err=%v", counts, err)
 			}
 		})
@@ -155,7 +160,7 @@ func TestManualCordonHealthOwnContinuationAndImageRollLiveDB(t *testing.T) {
 				t.Fatal("manual plus image roll granted upgrade health exemption")
 			}
 			if assigned {
-				if counts.Claimable != 1 || manualCordonWaitReason(counts) != "" {
+				if counts.Claimable != 1 || counts.AssignedClaimable != 1 || manualCordonWaitReason(counts) != "" {
 					t.Fatalf("own continuation marked manually blocked: %+v", counts)
 				}
 			} else if counts.Claimable != 0 || !strings.Contains(manualCordonWaitReason(counts), "cordoned (manual)") {
@@ -186,5 +191,62 @@ func TestManualCordonCheckerHealthIncludesHardFencedPeerLiveDB(t *testing.T) {
 	counts, err = f.svc.workerEligibilityForHealth(f.env.ctx, time.Now(), f.runID, true)
 	if err != nil || counts.ManualSuitable != 1 || !strings.Contains(manualCordonWaitReason(counts), "cordoned (manual)") {
 		t.Fatalf("checker compatibility control=%+v err=%v", counts, err)
+	}
+}
+
+func TestManualCordonAssignedImageRollResolverLiveDB(t *testing.T) {
+	for _, age := range []time.Duration{time.Minute, time.Hour} {
+		for _, fenced := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/fenced=%v", age, fenced), func(t *testing.T) {
+				e := setupInterlockLiveDB(t)
+				svc := e.permitService(t)
+				svc.p.WorkerAffinityCeiling = 2 * time.Hour
+				run, worker := e.seedQueuedRun(t, nil, nil), e.seedHeartbeatWorker(t, nil)
+				now := time.Now()
+				e.exec(t, "UPDATE runs SET worker_id=$2,status_since=$3,updated_at=$4 WHERE id=$1", run, worker, now.Add(-age), now)
+				e.exec(t, "UPDATE workers SET draining_since=now(),draining_reason='image_roll',maintenance_fenced=$2 WHERE id=$1", worker, fenced)
+				if _, err := store.ChangeWorkerManualCordon(e.ctx, e.pool, e.userID, worker, "operator", pgtype.Text{}, true); err != nil {
+					t.Fatal(err)
+				}
+				counts, err := svc.workerEligibilityForHealth(e.ctx, now, run, true)
+				wantAssigned := int64(1)
+				if fenced {
+					wantAssigned = 0
+				}
+				if err != nil || counts.AssignedClaimable != wantAssigned {
+					t.Fatalf("counts=%+v err=%v", counts, err)
+				}
+				flag, reason := svc.healthTargetFor(e.ctx, now, e.healthRowFor(t, run), healthThresholds{queued: 10 * time.Minute, custodyLimit: testCustodyLimit, custodyLimitOK: true})
+				if fenced {
+					if flag != healthWaitingWorker || !isManualCordonWaitReason(reason) || !strings.Contains(reason, "finish draining or maintenance") {
+						t.Fatalf("lost hard fence: %q %q", flag, reason)
+					}
+				} else if isManualCordonWaitReason(reason) || strings.Contains(reason, "finish draining or maintenance") || reason == ReasonWorkersUpgrading || strings.Contains(reason, "worker roll") || (age < 10*time.Minute && flag != healthOK) {
+					t.Fatalf("assigned continuation falsely blocked: %q %q", flag, reason)
+				}
+			})
+		}
+	}
+}
+
+func TestManualCordonOfflineFreshAdvisoryPeerLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	run, worker := e.seedQueuedRun(t, nil, nil), e.seedHeartbeatWorker(t, nil)
+	if _, err := store.ChangeWorkerManualCordon(e.ctx, e.pool, e.userID, worker, "operator", pgtype.Text{}, true); err != nil {
+		t.Fatal(err)
+	}
+	peer := e.seedHeartbeatWorker(t, nil)
+	e.exec(t, "UPDATE workers SET status='offline' WHERE id=$1", peer)
+	counts, err := svc.workerEligibilityForHealth(e.ctx, time.Now(), run, true)
+	if err != nil || counts.Claimable != 1 || counts.AssignedClaimable != 0 || counts.ManualSuitable != 1 || counts.ManualCordoned != 1 {
+		t.Fatalf("offline advisory peer counts=%+v err=%v", counts, err)
+	}
+	for _, age := range []time.Duration{time.Minute, time.Hour} {
+		e.exec(t, "UPDATE runs SET status_since=$2 WHERE id=$1", run, time.Now().Add(-age))
+		flag, reason := svc.healthTargetFor(e.ctx, time.Now(), e.healthRowFor(t, run), healthThresholds{queued: 10 * time.Minute, custodyLimit: testCustodyLimit, custodyLimitOK: true})
+		if flag != healthWaitingWorker || !isManualCordonWaitReason(reason) {
+			t.Fatalf("age=%s offline peer vetoed manual reason: %q %q", age, flag, reason)
+		}
 	}
 }

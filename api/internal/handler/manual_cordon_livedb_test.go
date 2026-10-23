@@ -69,6 +69,19 @@ func manualCordonEventCounts(t *testing.T, pool *pgxpool.Pool, worker uuid.UUID,
 	}
 }
 
+// manualCordonStateSnapshot compares the complete persisted tuple and every audit row.
+func manualCordonStateSnapshot(t *testing.T, pool *pgxpool.Pool, worker uuid.UUID) string {
+	t.Helper()
+	var state string
+	if err := pool.QueryRow(context.Background(), `SELECT jsonb_build_object(
+ 'tuple', jsonb_build_array(manual_cordoned_at,manual_cordoned_by,manual_cordoned_by_label,manual_cordon_reason),
+ 'events', (SELECT COALESCE(jsonb_agg(to_jsonb(e) ORDER BY e.occurred_at,e.id),'[]'::jsonb) FROM worker_cordon_events e WHERE e.worker_id=w.id))::text
+ FROM workers w WHERE id=$1`, worker).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	return state
+}
+
 func TestManualCordonTransitionsLiveDB(t *testing.T) {
 	_, router, pool := cliLiveDB(t)
 	owner := cliSeedUser(t, pool, false)
@@ -178,6 +191,9 @@ func TestManualCordonMountedAuthLiveDB(t *testing.T) {
 	product := v1MintProductToken(t, h.q, owner, v1SeedProduct(t, h.q, admin), producttoken.Scopes, nil).token
 	for _, method := range []string{http.MethodPost, http.MethodDelete} {
 		t.Run(method, func(t *testing.T) {
+			if method == http.MethodDelete {
+				manualCordonWorkerResponse(t, bearerReqBody(router, http.MethodPost, "/api/workers/"+id.String()+"/cordon", cliMintToken(t, pool, owner, clitoken.ScopeUser), `{"reason":"retain rejected DELETE evidence"}`), id)
+			}
 			for _, tc := range []struct {
 				name, jwt, bearer, csrf string
 				worker                  uuid.UUID
@@ -199,6 +215,7 @@ func TestManualCordonMountedAuthLiveDB(t *testing.T) {
 				{name: "foreign ephemeral", jwt: cliMintJWT(t, pool, other), csrf: "valid", worker: ephemeral, want: 404},
 			} {
 				t.Run(tc.name, func(t *testing.T) {
+					before := manualCordonStateSnapshot(t, pool, tc.worker)
 					req := httptest.NewRequest(method, "/api/workers/"+tc.worker.String()+"/cordon", nil)
 					if tc.jwt != "" {
 						req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: tc.jwt}) //nolint:gosec // Test client cookie; response cookie attributes do not apply.
@@ -227,12 +244,24 @@ func TestManualCordonMountedAuthLiveDB(t *testing.T) {
 							t.Fatalf("error = %q, want %q", body.Error, tc.errText)
 						}
 					}
-					manualCordonEventCounts(t, pool, tc.worker, 0, 0)
+					if after := manualCordonStateSnapshot(t, pool, tc.worker); after != before {
+						t.Fatal("rejected request changed manual tuple or audit rows")
+					}
+					wantCordon := 0
+					if method == http.MethodDelete && tc.worker == id {
+						wantCordon = 1
+					}
+					manualCordonEventCounts(t, pool, tc.worker, wantCordon, 0)
 				})
 			}
 		})
 	}
-	// No rejected request may leave state behind, even if its response was masked.
+	// The valid owner DELETE clears the pre-existing cordon exactly once.
+	cleared := manualCordonWorkerResponse(t, bearerReq(router, http.MethodDelete, "/api/workers/"+id.String()+"/cordon", cliMintToken(t, pool, owner, clitoken.ScopeUser)), id)
+	if cleared.ManualCordonedAt != nil || cleared.ManualCordonedBy != nil || cleared.ManualCordonedByLabel != nil || cleared.ManualCordonReason != nil {
+		t.Fatal("valid DELETE retained manual tuple")
+	}
+	manualCordonEventCounts(t, pool, id, 1, 1)
 	for _, worker := range []uuid.UUID{id, ephemeral} {
 		var cordoned bool
 		if err := pool.QueryRow(context.Background(), `SELECT manual_cordoned_at IS NOT NULL FROM workers WHERE id=$1`, worker).Scan(&cordoned); err != nil {

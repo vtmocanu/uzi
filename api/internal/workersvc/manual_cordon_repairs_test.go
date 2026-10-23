@@ -3,6 +3,7 @@ package workersvc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -27,7 +28,7 @@ func TestManualCordonHealthEntryMetadataAndPrerequisites(t *testing.T) {
 	}
 	manual := fmt.Sprintf("waiting for workers cordoned (manual): %s (%s) at %s: %s", label, actor, t0.Format(time.RFC3339), reason)
 	for _, age := range []time.Duration{time.Minute, time.Hour} {
-		for _, mode := range []string{"manual", "hard fence", "claimable continuation", "disabled", "custody", "vault", "account", "generic"} {
+		for _, mode := range []string{"manual", "advisory peer", "hard fence", "claimable continuation", "disabled", "custody", "vault", "account", "generic"} {
 			t.Run(age.String()+"/"+mode, func(t *testing.T) {
 				r := ownerHeldRun()
 				r.StatusSince = ago(age)
@@ -38,11 +39,15 @@ func TestManualCordonHealthEntryMetadataAndPrerequisites(t *testing.T) {
 				th := healthThresholds{queued: 10 * time.Minute, custodyLimit: testCustodyLimit, custodyLimitOK: true}
 				want := manual
 				switch mode {
+				case "advisory peer":
+					fs.eligibility.Claimable = 1
 				case "hard fence":
 					fs.eligibility.AutomaticOwnerHold = true
 					want += "; " + ownerHoldReason(r.UpdatedAt.Time.Add(svc.p.WorkerAffinityCeiling), r.StaleRequeueWorkerName)
 				case "claimable continuation":
 					fs.eligibility.Claimable = 1
+					fs.eligibility.AssignedClaimable = 1
+					fs.eligibility.AutomaticOwnerHold = true
 					// Generic lack-of-capacity text is outside this assertion; it must
 					// never become an owner hold or manual block.
 					want = ""
@@ -159,5 +164,84 @@ func TestManualCordonHealthYoungUnicodeLiveDB(t *testing.T) {
 	want := fmt.Sprintf("waiting for workers cordoned (manual): %s (%s) at %s: %s", label, e.userID, cordoned.ManualCordonedAt.Time.UTC().Format(time.RFC3339), reason)
 	if flag != healthWaitingWorker || got != want {
 		t.Fatalf("young health=(%q,%q), want %q", flag, got, want)
+	}
+}
+
+func TestManualCordonHealthReadFailureRecovery(t *testing.T) {
+	for _, age := range []time.Duration{time.Minute, time.Hour} {
+		t.Run(age.String(), func(t *testing.T) {
+			r := runRow("queued")
+			r.StatusSince = ago(age)
+			r.Health = healthWaitingWorker
+			r.HealthReason = pgtype.Text{String: manualCordonWaitPrefix + " prior operator evidence", Valid: true}
+			r.HealthSince, r.HealthNotifiedAt = ago(30*time.Minute), ago(20*time.Minute)
+			fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}, eligibilityErr: errors.New("projection unavailable")}
+			svc, b := pinSvc(fs, defaultHealthSettings())
+			if n := svc.detectRunHealth(context.Background(), t0); n != 0 || len(fs.writes) != 0 || len(b.healthNudges) != 0 {
+				t.Fatalf("failed read changed episode: changes=%d writes=%+v nudges=%v", n, fs.writes, b.healthNudges)
+			}
+			if len(fs.eligibilityCalls) != 1 || fs.active[0].HealthSince != r.HealthSince || fs.active[0].HealthNotifiedAt != r.HealthNotifiedAt {
+				t.Fatal("failed evaluation lost episode stamps or reread projection")
+			}
+			// A later successful projection proves the manual block ended.
+			fs.eligibilityErr = nil
+			fs.onlineWorkers, fs.freeSlotWorkers = 1, 1
+			if n := svc.detectRunHealth(context.Background(), t0.Add(time.Second)); n != 1 {
+				t.Fatalf("recovery changes=%d want 1", n)
+			}
+			w := lastWrite(t, fs, r.ID)
+			if age < 10*time.Minute {
+				if w.Health != healthOK || w.HealthReason.Valid || w.HealthSince.Valid {
+					t.Fatalf("young recovery did not clear: %+v", w)
+				}
+			} else if w.Health != healthWaitingWorker || w.HealthReason.String != reasonWaitingWorker || w.HealthSince != r.HealthSince {
+				t.Fatalf("aged recovery lost ordinary wait/episode: %+v", w)
+			}
+			if w.HealthNotifiedAt.Valid || len(b.healthNudges) != 1 || b.healthNudges[0] || len(fs.eligibilityCalls) != 2 {
+				t.Fatalf("recovery renotified or reread: write=%+v nudges=%v calls=%d", w, b.healthNudges, len(fs.eligibilityCalls))
+			}
+		})
+	}
+}
+
+func TestManualCordonYoungProjectionReadOnce(t *testing.T) {
+	evidence := mustJSON(t, map[string]any{"worker_id": uuid.New(), "actor_id": uuid.New(), "at": t0})
+	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{runRow("queued")}, eligibility: store.CountOnlineWorkersClaimableForRunRow{ManualSuitable: 1, ManualCordoned: 1, ManualContext: evidence}}
+	fs.active[0].StatusSince = ago(time.Minute)
+	svc, _ := pinSvc(fs, defaultHealthSettings())
+	if n := svc.detectRunHealth(context.Background(), t0); n != 1 || len(fs.eligibilityCalls) != 1 || !isManualCordonWaitReason(lastWrite(t, fs, fs.active[0].ID).HealthReason.String) {
+		t.Fatalf("manual evaluation changes=%d projection reads=%d", n, len(fs.eligibilityCalls))
+	}
+}
+
+func TestManualCordonReadFailurePrerequisitePriority(t *testing.T) {
+	for _, mode := range []string{"vault", "custody", "account", "owner hold"} {
+		t.Run(mode, func(t *testing.T) {
+			r := ownerHeldRun()
+			r.StatusSince = ago(time.Hour)
+			r.Health = healthWaitingWorker
+			r.HealthReason = pgtype.Text{String: manualCordonWaitPrefix + " prior evidence", Valid: true}
+			r.OwnerHoldPinnable = mode == "owner hold"
+			fs := &healthFakeStore{eligibilityErr: errors.New("projection unavailable")}
+			svc, _ := pinSvc(fs, defaultHealthSettings())
+			want := ""
+			switch mode {
+			case "vault":
+				svc.SetVault(vault.New(newBox(t), newMemVaultStore()))
+				want = reasonVaultLocked
+			case "custody":
+				fs.custodyHolds = int64(testCustodyLimit)
+				want = reasonCustodyLimit
+			case "account":
+				r.CodexAccountGated = true
+				want = reasonCodexAccountUnavailable
+			case "owner hold":
+				want = ownerHoldReason(r.UpdatedAt.Time.Add(svc.p.WorkerAffinityCeiling), r.StaleRequeueWorkerName)
+			}
+			fs.active = []store.ListActiveRunsForHealthRow{r}
+			if n := svc.detectRunHealth(context.Background(), t0); n != 1 || lastWrite(t, fs, r.ID).HealthReason.String != want {
+				t.Fatalf("prerequisite priority: changes=%d writes=%+v want=%q", n, fs.writes, want)
+			}
+		})
 	}
 }

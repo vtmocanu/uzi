@@ -111,7 +111,7 @@ func TestHealthCrossCheckPlacementDoesNotNudgeRunningLead(t *testing.T) {
 		{"manual before no eligible checker", store.CountOnlineWorkersClaimableForRunRow{ManualSuitable: 1, ManualCordoned: 1}, "manual"},
 		{"manual before busy slots", store.CountOnlineWorkersClaimableForRunRow{ManualSuitable: 1, ManualCordoned: 1, StrictEligible: 1}, "manual"},
 		{"manual with suitable peer", store.CountOnlineWorkersClaimableForRunRow{ManualSuitable: 2, ManualCordoned: 1, StrictEligible: 1}, reasonCrossCheckSlotsBusy},
-		{"manual own continuation", store.CountOnlineWorkersClaimableForRunRow{ManualSuitable: 1, ManualCordoned: 1, StrictEligible: 1, Claimable: 1}, reasonPlanCrossCheckWaiting},
+		{"manual own continuation", store.CountOnlineWorkersClaimableForRunRow{ManualSuitable: 1, ManualCordoned: 1, StrictEligible: 1, Claimable: 1, AssignedClaimable: 1}, reasonPlanCrossCheckWaiting},
 		{"slot busy", store.CountOnlineWorkersClaimableForRunRow{StrictEligible: 1}, reasonCrossCheckSlotsBusy},
 		{"no eligible checker", store.CountOnlineWorkersClaimableForRunRow{}, reasonNoCrossCheckWorker},
 		{"checker available", store.CountOnlineWorkersClaimableForRunRow{StrictEligible: 1, Claimable: 1}, reasonPlanCrossCheckWaiting},

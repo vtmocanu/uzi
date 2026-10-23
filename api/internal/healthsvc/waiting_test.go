@@ -96,6 +96,7 @@ func TestWaitingManualCordonEvaluation(t *testing.T) {
 					counts.DrainingEligible = 1
 					counts.SuitableOwnDraining = 1
 					counts.Claimable = 1
+					counts.AssignedClaimable = 1
 				case "upgrade only":
 					counts.ManualCordoned = 0
 					counts.DrainingEligible = 1
