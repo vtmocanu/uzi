@@ -5,8 +5,9 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
-  BRIEF_TOOLS, buildReplayClaim, codexReleaseSeam, loadReplayCorpus, materializeCase, replayGit, runReplays,
-  type ReplayCase, type ReplayCorpus, type ReplayRecord, type RunReplaysDeps,
+  BRIEF_TOOLS, buildReplayClaim, codexReleaseSeam, loadReplayCorpus, materializeCase, REPLAY_DIFF_ARGS, replayGit, replayIdentityEnv, runReplays,
+  verifyCasePins,
+  type MaterializedCase, type ReplayCase, type ReplayCorpus, type ReplayRecord, type RunReplaysDeps,
 } from "../src/code-cross-check-replay.js";
 import type { ClaudeCrossCheck } from "../src/claude-cross-check.js";
 import { runReplayCli } from "../src/code-cross-check-replay-cli.js";
@@ -171,6 +172,22 @@ test("cost is a number only when the family reports one", async () => {
   assert.equal(await cost("codex", { event: "result", modelUsage: { a: entry("metered", 0.25), b: entry("metered", 0.5) } }), 0.75);
   assert.equal(await cost("codex", { event: "result", modelUsage: { a: entry("metered", 0.25), b: entry("unreported") } }), null);
   assert.equal(await cost("codex", { event: "result", modelUsage: {} }), null);
+  assert.equal(await cost("codex", { event: "result" }), null);
+  assert.equal(await cost("codex", { event: "result", modelUsage: null }), null);
+});
+
+test("latency times only the checker call and is null when no checker ran", async () => {
+  const slow = async (): Promise<MaterializedCase> => {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    return { snapshot: scratch, cleanup: async () => { await new Promise((resolve) => setTimeout(resolve, 200)); } };
+  };
+  const rec = (await replay({ materialize: slow, checkers: { claude: checker(completes()) } }))[0]!;
+  assert.equal(rec.outcome, "completed");
+  assert.ok(rec.latency_ms !== null && rec.latency_ms < 150, String(rec.latency_ms));
+  assert.equal((await replay({ env: {} }))[0]!.latency_ms, null);
+  const outer = new AbortController();
+  outer.abort();
+  assert.equal((await replay({ signal: outer.signal }))[0]!.latency_ms, null);
 });
 
 const quietSignals = new EventEmitter();
@@ -217,7 +234,8 @@ test("raw records go to an owner-only file; stdout carries ids, counts and pins 
   const r = await cli(replayArgs(["--authorize-real-model-calls"]), { checkers: { claude: checker(completes()) } });
   assert.equal(r.code, 0);
   const { records_file } = JSON.parse(r.lines[0]!) as { records_file: string };
-  const file = path.join(tc.checkout, records_file);
+  assert.ok(path.isAbsolute(records_file));
+  const file = records_file;
   assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
   const raw = await fs.readFile(file, "utf8");
   assert.ok(raw.includes("UNIQUE-TITLE-XYZ"));
@@ -232,8 +250,26 @@ test("raw records go to an owner-only file; stdout carries ids, counts and pins 
   const scored = await cli(["score", file]);
   assert.equal(scored.code, 0);
   assert.equal(scored.lines[0], r.lines[1]);
+  // A path relative to the checkout root also works, whatever the cwd is.
+  const relative = await cli(["score", path.relative(tc.checkout, file)]);
+  assert.equal(relative.code, 0);
+  assert.equal(relative.lines[0], r.lines[1]);
   const bad = await cli(["score", file, "--adjudications", path.join(tc.root, "missing.json")]);
   assert.equal(bad.code, 1);
+  assert.deepEqual(bad.lines, ['{"error":"adjudication_invalid"}']);
+  const noRecords = await cli(["score", path.join(tc.root, "missing.jsonl")]);
+  assert.deepEqual(noRecords.lines, ['{"error":"records_invalid"}']);
+});
+
+test("a mid-run failure still reports the partial records file", async () => {
+  const r = await cli(replayArgs(["--authorize-real-model-calls"]), {
+    materialize: async () => { throw new Error("disk exploded"); },
+    checkers: { claude: checker(completes()) },
+  });
+  assert.equal(r.code, 1);
+  assert.equal(r.lines.length, 2);
+  assert.ok(path.isAbsolute((JSON.parse(r.lines[0]!) as { records_file: string }).records_file));
+  assert.deepEqual(r.lines[1], '{"error":"startup_failed"}');
 });
 
 test("verify materializes every case; a wrong manifest pin fails with a fixed code", async () => {
@@ -309,7 +345,8 @@ test("a consistently re-pinned corpus still fails on brief drift, oversize diff,
   await load();
 });
 
-const git = async (cwd: string, args: string[]): Promise<string> => (await replayGit(args, { cwd })).toString("utf8").trim();
+const git = async (cwd: string, args: string[], env?: Record<string, string>): Promise<string> =>
+  (await replayGit(args, { cwd, env })).toString("utf8").trim();
 
 test("materialize exports the pre-fix tree as a single parentless commit and cleans up", async () => {
   const m = await materializeCase(tc.checkout, defect, scratch);
@@ -324,6 +361,65 @@ test("materialize exports the pre-fix tree as a single parentless commit and cle
   assert.deepEqual(await fs.readdir(scratch), []);
   const control = await materializeCase(tc.checkout, corpus.cases.find((c) => c.id === tc.controlId)!, scratch);
   try { assert.equal(await fs.readFile(path.join(control.snapshot, "src/other.ts"), "utf8"), "export const other = 2;\n"); } finally { await control.cleanup(); }
+});
+
+test("materialize writes exact blobs: tracked-but-ignored and export-subst files, tree equals prefix_tree", async () => {
+  const m = await materializeCase(tc.checkout, defect, scratch);
+  try {
+    assert.equal(await fs.readFile(path.join(m.snapshot, "notes/ignored.log"), "utf8"), "tracked but ignored\n");
+    assert.equal(await git(m.snapshot, ["ls-files", "notes/ignored.log"]), "notes/ignored.log");
+    assert.equal(await fs.readFile(path.join(m.snapshot, "src/stamp.txt"), "utf8"), "$Format:%H$\n");
+    assert.equal(await git(m.snapshot, ["rev-parse", "HEAD^{tree}"]), defect.prefix_tree);
+    assert.equal(await git(m.snapshot, ["status", "--porcelain", "--ignored"]), "");
+  } finally { await m.cleanup(); }
+});
+
+test("verifyCasePins reads exact prefix-tree blobs without a snapshot", async () => {
+  const v = await verifyCasePins(tc.checkout, defect, scratch);
+  try {
+    assert.equal((await v.readFile("src/stamp.txt")).toString("utf8"), "$Format:%H$\n");
+    assert.ok((await v.readFile("src/client.ts")).toString("utf8").includes("const limit = 10;"));
+    assert.deepEqual((await fs.readdir(scratch)).filter((n) => n.startsWith("replay-snap-")), []);
+    await assert.rejects(v.readFile("src/missing.ts"));
+  } finally { await v.cleanup(); }
+  assert.deepEqual(await fs.readdir(scratch), []);
+});
+
+test("each pin check fails on its own", async () => {
+  const control = corpus.cases.find((c) => c.id === tc.controlId)!;
+  // removed.patch must reach the squash tree: pin the defect to another commit's squash.
+  await assert.rejects(verifyCasePins(tc.checkout, { ...defect, squash_sha: control.squash_sha }, scratch), { message: "corpus_integrity" });
+  // The commit id must reproduce: an absent id and an existing commit with the same tree and parent but another identity.
+  await assert.rejects(verifyCasePins(tc.checkout, { ...defect, prefix_commit: "4".repeat(40) }, scratch), { message: "corpus_integrity" });
+  const lookalike = await git(tc.checkout, ["commit-tree", defect.prefix_tree, "-p", defect.base_sha, "-m", "another message"], { ...replayIdentityEnv(), GIT_COMMITTER_DATE: "2026-02-02T00:00:00Z" });
+  await assert.rejects(verifyCasePins(tc.checkout, { ...defect, prefix_commit: lookalike }, scratch), { message: "corpus_integrity" });
+  // Same tree, different patch bytes (longer abbreviations): only the byte comparison catches it.
+  const longer = await replayGit(["diff", ...REPLAY_DIFF_ARGS.filter((a) => !a.startsWith("--abbrev")), "--abbrev=12", defect.base_sha, defect.prefix_commit],
+    { cwd: tc.checkout });
+  assert.ok(!longer.equals(defect.prefixPatch));
+  await assert.rejects(verifyCasePins(tc.checkout, { ...defect, prefixPatch: longer }, scratch), { message: "corpus_integrity" });
+  await (await verifyCasePins(tc.checkout, defect, scratch)).cleanup();
+  assert.deepEqual(await fs.readdir(scratch), []);
+});
+
+test("materialize refuses a snapshot whose tree differs from prefix_tree (a gitlink cannot be exported)", async () => {
+  const index = path.join(tc.root, "gitlink-index");
+  const env = { GIT_INDEX_FILE: index };
+  await replayGit(["read-tree", defect.base_sha], { cwd: tc.checkout, env });
+  await replayGit(["update-index", "--add", "--cacheinfo", `160000,${"5".repeat(40)},vendor/sub`], { cwd: tc.checkout, env });
+  const tree = await git(tc.checkout, ["write-tree"], env);
+  const ident = replayIdentityEnv();
+  const prefixCommit = await git(tc.checkout, ["commit-tree", tree, "-p", defect.base_sha, "-m", "code cross-check replay prefix c-gitlink"], ident);
+  const squash = await git(tc.checkout, ["commit-tree", tree, "-p", defect.base_sha, "-m", "gitlink squash"], ident);
+  const prefixPatch = await replayGit(["diff", ...REPLAY_DIFF_ARGS, defect.base_sha, prefixCommit], { cwd: tc.checkout });
+  const gitlink: ReplayCase = {
+    ...corpus.cases.find((c) => c.id === tc.controlId)!, id: "c-gitlink", squash_sha: squash, base_sha: defect.base_sha,
+    prefix_tree: tree, prefix_commit: prefixCommit, prefixPatch, removedPatch: Buffer.alloc(0),
+  };
+  // Every pin holds, so verification passes and only the snapshot tree check can refuse.
+  await (await verifyCasePins(tc.checkout, gitlink, scratch)).cleanup();
+  await assert.rejects(materializeCase(tc.checkout, gitlink, scratch), { message: "corpus_integrity" });
+  assert.deepEqual(await fs.readdir(scratch), []);
 });
 
 test("materialize reports a missing base object and an unpinned tree, leaving no scratch behind", async () => {

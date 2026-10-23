@@ -1,12 +1,15 @@
 // Maintainer-run entry for the offline code cross-check replay harness (PRD 3167 M1).
 // Subcommands: verify, replay (real model calls, explicitly authorized), score (offline).
-// Output is fixed-code JSON lines; raw records go to a 0600 file and never to stdout.
+// Stdout is JSON lines of fixed codes, ids, counts, pins and the absolute records-file path; raw records
+// go to a 0600 file and never to stdout. `score` resolves a relative records or adjudications path
+// against the checkout root (not the cwd, which is agent/ under `npm run`).
 import path from "node:path";
 import fs from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
-  loadReplayCorpus, materializeCase, parseAdjudications, parseReplayRecords, readReplayFile, ReplayError,
+  isSafeReplayModel, loadReplayCorpus, materializeCase, parseAdjudications, parseReplayRecords, readReplayFile, REPLAY_EFFORTS,
+  ReplayError,
   runReplays, sanitizedAggregate, scoreReplays,
   type ReplayEffort, type ReplayFamily, type ReplayRecord, type RunReplaysDeps,
 } from "./code-cross-check-replay.js";
@@ -36,7 +39,7 @@ interface ReplayArgs {
   authorized: boolean;
 }
 
-const EFFORTS: readonly string[] = ["low", "medium", "high", "xhigh", "max"];
+const EFFORTS: readonly string[] = REPLAY_EFFORTS;
 const RECORDS_MAX_BYTES = 64 * 1024 * 1024;
 const ADJUDICATIONS_MAX_BYTES = 4 * 1024 * 1024;
 
@@ -71,12 +74,7 @@ function parseReplayArgs(args: string[], env: NodeJS.ProcessEnv): ReplayArgs | n
     timeoutMs = Number(timeoutText);
     if (timeoutMs > 15 * 60_000) return null;
   }
-  if (Buffer.byteLength(model) > 100 || /[\s\p{Cc}\p{Cf}�]/u.test(model) ||
-      !/^[\p{L}\p{N}][\p{L}\p{N}._:/-]*$/u.test(model) ||
-      /(?:sk-|gh[pousr]_|github_pat_|glpat-|xox[baprs]-)/i.test(model)) return null;
-  for (const key of Object.keys(env)) {
-    if (/(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)/i.test(key) && env[key] && model.includes(env[key]!)) return null;
-  }
+  if (!isSafeReplayModel(model, env)) return null;
   return { family, model, effort: effort as ReplayEffort, repeats, timeoutMs, authorized };
 }
 
@@ -117,6 +115,7 @@ async function runReplayCommand(deps: ReplayCliDeps, a: ReplayArgs, signal: Abor
   // Raw findings are model output about repository code: owner-only, created exclusively.
   const handle = await fs.open(file, "wx", 0o600);
   let records: ReplayRecord[];
+  const absFile = path.resolve(file);
   try {
     records = await runReplays({
       checkout: deps.checkout, corpus, families: [a.family], model: a.model, effort: a.effort, repeats: a.repeats,
@@ -124,8 +123,11 @@ async function runReplayCommand(deps: ReplayCliDeps, a: ReplayArgs, signal: Abor
       materialize: deps.materialize, signal, now: deps.now, checkerVersion,
       writeRecord: async (rec) => { await handle.appendFile(JSON.stringify(rec) + "\n"); },
     });
+  } catch (error) {
+    deps.write(JSON.stringify({ records_file: absFile }));
+    throw error;
   } finally { await handle.close(); }
-  deps.write(JSON.stringify({ records_file: path.relative(deps.checkout, file) }));
+  deps.write(JSON.stringify({ records_file: absFile }));
   deps.write(sanitizedAggregate(scoreReplays(corpus, records)));
   return records.every((r) => r.outcome === "completed") ? 0 : 1;
 }
@@ -137,13 +139,16 @@ async function runScore(deps: ReplayCliDeps, args: string[]): Promise<number> {
   if (args.length === 3 && args[1] === "--adjudications") adjudicationsFile = args[2];
   else if (args.length !== 1) { deps.write(JSON.stringify({ error: "invalid_cli" })); return 1; }
   const corpus = await loadReplayCorpus(deps.checkout, { manifestSha256: deps.manifestSha256 });
-  const bytes = await readReplayFile(recordsFile, RECORDS_MAX_BYTES);
-  if (!bytes) throw new ReplayError("records_invalid");
+  const readInput = async (file: string, max: number, code: "records_invalid" | "adjudication_invalid"): Promise<Buffer> => {
+    let bytes: Buffer | null = null;
+    try { bytes = await readReplayFile(path.resolve(deps.checkout, file), max); } catch { /* mapped below */ }
+    if (!bytes) throw new ReplayError(code);
+    return bytes;
+  };
+  const bytes = await readInput(recordsFile, RECORDS_MAX_BYTES, "records_invalid");
   let adjudications;
   if (adjudicationsFile !== undefined) {
-    const adj = await readReplayFile(adjudicationsFile, ADJUDICATIONS_MAX_BYTES);
-    if (!adj) throw new ReplayError("adjudication_invalid");
-    adjudications = parseAdjudications(adj.toString("utf8"));
+    adjudications = parseAdjudications((await readInput(adjudicationsFile, ADJUDICATIONS_MAX_BYTES, "adjudication_invalid")).toString("utf8"));
   }
   deps.write(sanitizedAggregate(scoreReplays(corpus, parseReplayRecords(bytes.toString("utf8")), adjudications)));
   return 0;

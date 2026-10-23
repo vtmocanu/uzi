@@ -1,5 +1,5 @@
 // Pins the committed replay corpus (fixtures/code-cross-check-replay). The hermetic layer needs no git
-// objects. The materialization layer rebuilds every pre-fix snapshot from the checkout's own objects and
+// objects. The pin layer rebuilds every pre-fix tree from the checkout's own objects and
 // is skipped only in a shallow checkout where every pinned object is absent.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
@@ -9,7 +9,7 @@ import path from "node:path";
 import { after, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
-  CORPUS_DIR, CORPUS_MANIFEST_SHA256, loadReplayCorpus, materializeCase, replayGit,
+  CORPUS_DIR, CORPUS_MANIFEST_SHA256, loadReplayCorpus, replayGit, verifyCasePins,
   type ReplayCase, type ReplayCorpus,
 } from "../src/code-cross-check-replay.js";
 
@@ -108,7 +108,7 @@ describe("committed replay corpus (hermetic)", () => {
 });
 
 // ---------------------------------------------------------------------------------------------
-// Materialization: rebuild each snapshot from the checkout's own git objects.
+// Pin verification: rebuild each prefix tree from the checkout's own git objects.
 
 const pinnedShas = (): string[] => [...new Set(corpus.cases.flatMap((c) => [c.base_sha, c.squash_sha]))];
 
@@ -124,7 +124,7 @@ async function objectPresence(): Promise<{ present: string[]; absent: string[] }
   return { present, absent };
 }
 
-describe("committed replay corpus (materialization)", () => {
+describe("committed replay corpus (pins)", () => {
   let scratch: string;
   let presence: { present: string[]; absent: string[] };
   before(async () => {
@@ -132,8 +132,6 @@ describe("committed replay corpus (materialization)", () => {
     presence = await objectPresence();
   });
   after(async () => { await fs.rm(scratch, { recursive: true, force: true }); });
-
-  const read = async (dir: string, rel: string): Promise<string> => fs.readFile(path.join(dir, rel), "utf8");
 
   it("has all pinned objects, none (shallow checkout, skipped unless required), but never some", (t) => {
     if (presence.absent.length === 0) return;
@@ -143,23 +141,25 @@ describe("committed replay corpus (materialization)", () => {
   });
 
   for (const id of CASE_IDS) {
-    it(`${id}: rebuilds the pinned prefix snapshot and its signatures hold`, { timeout: 120_000 }, async (t) => {
+    it(`${id}: verifies every pin of the prefix tree and its signatures hold`, { timeout: 120_000 }, async (t) => {
       if (presence.present.length === 0 && presence.absent.length > 0 && process.env.UZI_REPLAY_CORPUS_REQUIRE_OBJECTS !== "1") {
         t.skip("corpus objects absent (shallow checkout)");
         return;
       }
       assert.equal(presence.absent.length, 0, "all pinned objects must be present");
       const c = byId(id);
-      const m = await materializeCase(CHECKOUT, c, scratch);
+      // Pins are proven and signature files read straight from the pinned tree: no snapshot export.
+      const m = await verifyCasePins(CHECKOUT, c, scratch);
+      const read = async (rel: string): Promise<string> => (await m.readFile(rel)).toString("utf8");
       try {
         for (const d of c.expected) {
-          const text = await read(m.snapshot, d.signature.path);
+          const text = await read(d.signature.path);
           assert.equal(text.includes(d.signature.literal), d.signature.present, `${id}/${d.id}`);
         }
         const counterpart = COUNTERPART[id];
         if (counterpart) {
           for (const d of byId(counterpart).expected) {
-            const text = await read(m.snapshot, d.signature.path);
+            const text = await read(d.signature.path);
             assert.equal(text.includes(d.signature.literal), !d.signature.present, `${id} must lack ${counterpart}/${d.id}`);
           }
         }

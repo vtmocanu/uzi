@@ -27,6 +27,11 @@ export const FIXTURE_PLAN = "Plan: make fetchAll return every item.";
 const baseFiles = {
   "src/client.ts": "// client\nexport function fetchAll(items: string[]): string[] {\n  const limit = 10;\n  return items.slice(0, limit);\n}\n",
   "src/other.ts": "export const other = 1;\n",
+  // Fidelity probes: a tracked file that .gitignore matches, and an export-subst file.
+  ".gitignore": "*.log\n",
+  "notes/ignored.log": "tracked but ignored\n",
+  ".gitattributes": "src/stamp.txt export-subst\n",
+  "src/stamp.txt": "$Format:%H$\n",
 };
 const prefixClient = "// feature: batching\n" + baseFiles["src/client.ts"];
 const squashClient = prefixClient.replace("const limit = 10;", "const limit = items.length;");

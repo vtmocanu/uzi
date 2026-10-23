@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   parseAdjudications, parseReplayRecords, sanitizedAggregate, scoreReplays,
-  type Adjudication, type ExpectedDefect, type GroupAggregate, type ReplayRecord, type ScoreCorpus,
+  CREDENTIAL_MODE, READER_IMPLEMENTATION, type Adjudication, type ExpectedDefect, type GroupAggregate, type ReplayRecord, type ScoreCorpus,
 } from "../src/code-cross-check-replay.js";
 import type { CodeFinding } from "../src/code-cross-check-contract.js";
 
@@ -14,20 +14,21 @@ const corpus: ScoreCorpus = {
   corpus_version: "v-test",
   brief_sha256: { codex: "c".repeat(64), claude: "d".repeat(64) },
   cases: [
-    { id: "d-a", kind: "defect", expected: [
+    { id: "d-a", kind: "defect", input_provenance: "reconstructed", expected: [
       expected({ id: "D1", line_range: [10, 20], use_line_range: true, match: ["off-by-one"] }),
       expected({ id: "D2", paths: ["src/b.ts", "src/c.ts"], match: ["Race"] }),
       expected({ id: "D3", detectability: "execution_only", paths: ["src/e.ts"], match: ["never"] }),
     ] },
-    { id: "d-b", kind: "defect", expected: [expected({ id: "D1", line_range: [1, 2], use_line_range: true })] },
-    { id: "c-a", kind: "control", expected: [] },
+    { id: "d-b", kind: "defect", input_provenance: "recorded", expected: [expected({ id: "D1", line_range: [1, 2], use_line_range: true })] },
+    { id: "c-a", kind: "control", input_provenance: "reconstructed", expected: [] },
   ],
 };
 const finding = (id: string, over: Partial<CodeFinding> = {}): CodeFinding => ({
   id, severity: "major", path: "src/a.ts", line: 1, title: "t-" + id, detail: "d-" + id, ...over,
 });
 const rec = (over: Partial<ReplayRecord> & { case_id: string }): ReplayRecord => ({
-  kind: over.case_id.startsWith("c-") ? "control" : "defect", input_provenance: "reconstructed", family: "claude", repeat: 1,
+  kind: over.case_id.startsWith("c-") ? "control" : "defect",
+  input_provenance: over.case_id === "d-b" ? "recorded" : "reconstructed", family: "claude", repeat: 1,
   corpus_version: "v-test", checker_version: { uzi_head: "h", agent_version: "v", corpus_version: "v-test" },
   brief_sha256: "d".repeat(64), model: "m", effort: "low", reader_implementation: "reader", credential_mode: "oauth_token",
   outcome: "completed", latency_ms: 100, cost_usd: 1, findings: [], ...over,
@@ -133,10 +134,10 @@ test("unknown cost is counted apart from zero; latency percentiles ignore missin
 
 test("provenance and family split into separate groups with their pins", () => {
   const agg = scoreReplays(corpus, [
-    rec({ case_id: "d-a", input_provenance: "reconstructed" }),
-    rec({ case_id: "d-a", input_provenance: "recorded" }),
-    rec({ case_id: "d-a", family: "codex", credential_mode: "api_key", model: "m2", repeat: 2 }),
-    rec({ case_id: "d-a", family: "codex", model: "m3", repeat: 3 }),
+    rec({ case_id: "d-a" }),
+    rec({ case_id: "d-b" }),
+    rec({ case_id: "d-a", family: "codex", brief_sha256: "c".repeat(64), credential_mode: "api_key", model: "m2", repeat: 2 }),
+    rec({ case_id: "d-a", family: "codex", brief_sha256: "c".repeat(64), model: "m3", repeat: 3 }),
   ]);
   assert.equal(agg.groups.length, 3);
   const codex = agg.groups.find((g) => g.family === "codex")!;
@@ -156,10 +157,49 @@ test("the sanitized aggregate carries no finding, issue or credential text", () 
 });
 
 test("record parsing is strict", () => {
-  const line = JSON.stringify(rec({ case_id: "d-a", findings: [finding("F1")] }));
-  assert.equal(parseReplayRecords(line + "\n" + line + "\n").length, 2);
+  const good = (over: Partial<ReplayRecord> = {}): string => JSON.stringify(rec({
+    case_id: "d-a", findings: [finding("F1")],
+    reader_implementation: READER_IMPLEMENTATION.claude, credential_mode: CREDENTIAL_MODE.claude, ...over,
+  }));
+  const line = good();
+  assert.equal(parseReplayRecords(line + "\n" + good({ repeat: 2 }) + "\n").length, 2);
+  assert.throws(() => parseReplayRecords(line + "\n" + line + "\n"), { message: "records_invalid" });
+  assert.throws(() => parseReplayRecords(good({ model: "safe\u202eevil" })), { message: "records_invalid" });
+  assert.throws(() => parseReplayRecords(good({ model: "sk-abcdefghijklmnop" })), { message: "records_invalid" });
+  assert.throws(() => parseReplayRecords(good({ effort: "extreme" as ReplayRecord["effort"] })), { message: "records_invalid" });
+  assert.throws(() => parseReplayRecords(good({ reader_implementation: "other" })), { message: "records_invalid" });
+  assert.throws(() => parseReplayRecords(good({ credential_mode: CREDENTIAL_MODE.codex })), { message: "records_invalid" });
+  assert.throws(() => parseReplayRecords(good({ family: "codex" })), { message: "records_invalid" });
+  assert.equal(parseReplayRecords(good({ latency_ms: null }))[0]!.latency_ms, null);
   assert.throws(() => parseReplayRecords(""), { message: "records_invalid" });
   assert.throws(() => parseReplayRecords(line.replace('"completed"', '"done"')), { message: "records_invalid" });
   assert.throws(() => parseReplayRecords(line.slice(0, -1) + ',"extra":1}'), { message: "records_invalid" });
   assert.throws(() => scoreReplays(corpus, [rec({ case_id: "nope" })]), { message: "score_unknown_case" });
+});
+
+test("scoring refuses records that disagree with the loaded corpus", () => {
+  const ok = rec({ case_id: "d-a" });
+  assert.doesNotThrow(() => scoreReplays(corpus, [ok]));
+  const bad = (over: Partial<ReplayRecord>): void => {
+    assert.throws(() => scoreReplays(corpus, [rec({ case_id: "d-a", ...over })]), { message: "records_invalid" }, JSON.stringify(Object.keys(over)));
+  };
+  bad({ corpus_version: "other" });
+  bad({ checker_version: { uzi_head: "h", agent_version: "v", corpus_version: "other" } });
+  bad({ brief_sha256: "e".repeat(64) });
+  bad({ brief_sha256: "d".repeat(64), family: "codex" });
+  bad({ kind: "control" });
+  bad({ input_provenance: "recorded" });
+  bad({ outcome: "model_timeout", findings: [finding("F1")] });
+  assert.throws(() => scoreReplays(corpus, [ok, { ...ok }]), { message: "records_invalid" });
+  // Groups follow the case's provenance.
+  assert.equal(scoreReplays(corpus, [rec({ case_id: "d-b" })]).groups[0]!.input_provenance, "recorded");
+});
+
+test("a null latency is skipped by the percentiles", () => {
+  const g = only([
+    rec({ case_id: "c-a", repeat: 1, latency_ms: 10 }),
+    rec({ case_id: "c-a", repeat: 2, outcome: "interrupted", latency_ms: null }),
+  ]);
+  assert.equal(g.latency_ms_median, 10);
+  assert.equal(g.latency_ms_max, 10);
 });

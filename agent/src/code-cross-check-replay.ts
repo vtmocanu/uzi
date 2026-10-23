@@ -3,7 +3,7 @@
 // scores their findings with a documented proxy. Nothing here is wired into the production runner.
 import fs from "node:fs/promises";
 import path from "node:path";
-import { execFile, spawn } from "node:child_process";
+import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import type { ClaimResponse } from "./protocol.js";
 import type { Logger } from "./log.js";
@@ -33,7 +33,8 @@ export const CREDENTIAL_MODE = { codex: "api_key", claude: "oauth_token" } as co
 export const BRIEF_TOOLS = { codex: "Read and Search", claude: "Read, Grep and Glob" } as const;
 
 export type ReplayFamily = "claude" | "codex";
-export type ReplayEffort = "low" | "medium" | "high" | "xhigh" | "max";
+export const REPLAY_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
+export type ReplayEffort = (typeof REPLAY_EFFORTS)[number];
 export const REPLAY_OUTCOMES = [
   "completed", "model_timeout", "malformed", "model_error", "checker_unavailable",
   "missing_auth", "interrupted", "confinement_failed",
@@ -368,50 +369,28 @@ export function replayGit(args: string[], o: { cwd?: string; env?: Record<string
   });
 }
 
-function archiveInto(gitDir: string, tree: string, dest: string, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const archive = spawn("git", ["--git-dir", gitDir, "archive", "--format=tar", tree], {
-      env: hermeticEnv(), stdio: ["ignore", "pipe", "ignore"], signal,
-    });
-    const tar = spawn("tar", ["-x", "-C", dest], {
-      env: { PATH: process.env.PATH ?? "", LANG: "C" }, stdio: ["pipe", "ignore", "ignore"], signal,
-    });
-    let failed = false;
-    let closed = 0;
-    const fail = (): void => {
-      if (failed) return;
-      failed = true;
-      archive.kill();
-      tar.kill();
-      reject(new Error("archive_failed"));
-    };
-    const onClose = (code: number | null): void => {
-      if (code !== 0) fail();
-      else if (++closed === 2 && !failed) resolve();
-    };
-    archive.on("error", fail);
-    tar.on("error", fail);
-    tar.stdin.on("error", () => {});
-    archive.stdout.pipe(tar.stdin);
-    archive.on("close", onClose);
-    tar.on("close", onClose);
-  });
+export interface VerifiedCase {
+  /** Scratch directory holding the bare repository and indexes; removed by cleanup(). */
+  work: string;
+  bare: string;
+  /** Exact blob bytes of `path` in the pinned prefix tree. */
+  readFile(path: string): Promise<Buffer>;
+  cleanup(): Promise<void>;
 }
 
-export interface MaterializedCase { snapshot: string; cleanup(): Promise<void> }
-
-/** Rebuild one case's pre-fix tree from the checkout's objects, prove every pin, and export it as a
- * single-commit repository. The checkout's own repository is only read, through an alternates link. */
-export async function materializeCase(checkout: string, c: ReplayCase, scratchDir: string, signal?: AbortSignal): Promise<MaterializedCase> {
+/** Prove every pin of one case against the checkout's own objects (read only, through an alternates
+ * link) without exporting a snapshot: objects present, base + prefix.patch -> prefix_tree, the prefix
+ * commit id, witness blob ids, removed.patch -> the squash tree, and the regenerated diff bytes. */
+export async function verifyCasePins(checkout: string, c: ReplayCase, scratchDir: string, signal?: AbortSignal): Promise<VerifiedCase> {
   await fs.mkdir(scratchDir, { recursive: true });
-  const dirs: string[] = [];
+  let work: string | undefined;
   const cleanup = async (): Promise<void> => {
-    await Promise.all(dirs.map((d) => fs.rm(d, { recursive: true, force: true })));
+    if (work) await fs.rm(work, { recursive: true, force: true });
   };
   try {
-    const work = await fs.mkdtemp(path.join(scratchDir, "replay-work-"));
-    dirs.push(work);
-    const bare = path.join(work, "bare.git");
+    const dir = await fs.mkdtemp(path.join(scratchDir, "replay-work-"));
+    work = dir;
+    const bare = path.join(dir, "bare.git");
     const objects = (await replayGit(["-C", checkout, "rev-parse", "--path-format=absolute", "--git-path", "objects"], { signal }))
       .toString("utf8").trim();
     await replayGit(["init", "--bare", "-q", bare], { signal });
@@ -425,12 +404,11 @@ export async function materializeCase(checkout: string, c: ReplayCase, scratchDi
         throw new ReplayError("corpus_objects_missing");
       }
     }
-    const index = path.join(work, "index");
-    const idx = { GIT_INDEX_FILE: index };
+    const idx = { GIT_INDEX_FILE: path.join(dir, "index") };
     const text = async (args: string[], env?: Record<string, string>): Promise<string> =>
       (await git(args, env)).toString("utf8").trim();
-    const prefixFile = path.join(work, "prefix.patch");
-    const removedFile = path.join(work, "removed.patch");
+    const prefixFile = path.join(dir, "prefix.patch");
+    const removedFile = path.join(dir, "removed.patch");
     await fs.writeFile(prefixFile, c.prefixPatch);
     await fs.writeFile(removedFile, c.removedPatch);
     await git(["read-tree", c.base_sha], idx);
@@ -447,15 +425,39 @@ export async function materializeCase(checkout: string, c: ReplayCase, scratchDi
     if (await text(["write-tree"], idx) !== await text(["rev-parse", `${c.squash_sha}^{tree}`])) return integrity();
     const diff = await git(["diff", ...REPLAY_DIFF_ARGS, c.base_sha, c.prefix_commit]);
     if (!diff.equals(c.prefixPatch)) return integrity();
+    return { work: dir, bare, cleanup, readFile: (file) => git(["cat-file", "blob", `${c.prefix_tree}:${file}`]) };
+  } catch (error) {
+    await cleanup();
+    if (error instanceof ReplayError || signal?.aborted) throw error;
+    return integrity();
+  }
+}
 
-    const snapshot = await fs.mkdtemp(path.join(scratchDir, "replay-snap-"));
-    dirs.push(snapshot);
-    await archiveInto(bare, c.prefix_tree, snapshot, signal);
-    await replayGit(["init", "-q"], { cwd: snapshot, signal });
-    await replayGit(["add", "-A"], { cwd: snapshot, signal });
+export interface MaterializedCase { snapshot: string; cleanup(): Promise<void> }
+
+/** verifyCasePins, then export the pinned prefix tree as a single-commit repository. Files are written
+ * with checkout-index (exact blob bytes, no export attributes) and the snapshot commit must reproduce
+ * prefix_tree exactly; tracked files that .gitignore matches are staged with -f. */
+export async function materializeCase(checkout: string, c: ReplayCase, scratchDir: string, signal?: AbortSignal): Promise<MaterializedCase> {
+  const verified = await verifyCasePins(checkout, c, scratchDir, signal);
+  let snapshot: string | undefined;
+  const cleanup = async (): Promise<void> => {
+    await verified.cleanup();
+    if (snapshot) await fs.rm(snapshot, { recursive: true, force: true });
+  };
+  try {
+    const dir = await fs.mkdtemp(path.join(scratchDir, "replay-snap-"));
+    snapshot = dir;
+    const idx = { GIT_INDEX_FILE: path.join(verified.work, "snapshot-index") };
+    await replayGit(["--git-dir", verified.bare, "read-tree", c.prefix_tree], { env: idx, signal });
+    await replayGit(["--git-dir", verified.bare, "--work-tree", dir, "checkout-index", "-a", "-f"], { env: idx, signal });
+    await replayGit(["init", "-q"], { cwd: dir, signal });
+    await replayGit(["add", "-A", "-f"], { cwd: dir, signal });
     await replayGit(["-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "-q", "--allow-empty",
-      "-m", `code cross-check replay snapshot ${c.id}`], { cwd: snapshot, env: replayIdentityEnv(), signal });
-    return { snapshot, cleanup };
+      "-m", `code cross-check replay snapshot ${c.id}`], { cwd: dir, env: replayIdentityEnv(), signal });
+    const tree = (await replayGit(["rev-parse", "HEAD^{tree}"], { cwd: dir, signal })).toString("utf8").trim();
+    if (tree !== c.prefix_tree) return integrity();
+    return { snapshot: dir, cleanup };
   } catch (error) {
     await cleanup();
     if (error instanceof ReplayError || signal?.aborted) throw error;
@@ -541,7 +543,8 @@ export interface ReplayRecord {
   reader_implementation: string;
   credential_mode: string;
   outcome: ReplayOutcome;
-  latency_ms: number;
+  /** Time spent inside checker.run only; null when no checker call was made. */
+  latency_ms: number | null;
   cost_usd: number | null;
   findings: CodeFinding[];
 }
@@ -579,6 +582,19 @@ function costOf(family: ReplayFamily, usage: Record<string, unknown>[]): number 
   return cost.kind === "metered" && Number.isFinite(cost.usd) && cost.usd >= 0 ? cost.usd : null;
 }
 
+/** Model identity gate shared by the CLI and the record parser. `env` adds the check that the model
+ * does not embed a credential-bearing environment value (values under 8 characters are ignored). */
+export function isSafeReplayModel(model: string, env: NodeJS.ProcessEnv = {}): boolean {
+  if (!model || Buffer.byteLength(model) > 100 || /[\s\p{Cc}\p{Cf}\uFFFD]/u.test(model) ||
+      !/^[\p{L}\p{N}][\p{L}\p{N}._:/-]*$/u.test(model) ||
+      /(?:sk-|gh[pousr]_|github_pat_|glpat-|xox[baprs]-)/i.test(model)) return false;
+  for (const key of Object.keys(env)) {
+    const value = env[key];
+    if (/(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)/i.test(key) && value && value.length >= 8 && model.includes(value)) return false;
+  }
+  return true;
+}
+
 const errText = (error: unknown): string => (error instanceof Error ? error.message : "");
 
 function classify(error: unknown, timedOut: boolean, outer: AbortSignal | undefined): ReplayOutcome {
@@ -610,10 +626,10 @@ export async function runReplays(deps: RunReplaysDeps): Promise<ReplayRecord[]> 
     for (const family of deps.families) {
       for (let repeat = 1; repeat <= deps.repeats; repeat++) {
         const token = family === "claude" ? deps.env.CLAUDE_CODE_OAUTH_TOKEN : deps.env.OPENAI_API_KEY;
-        const started = now();
         let outcome: ReplayOutcome;
         let findings: CodeFinding[] = [];
         let cost: number | null = null;
+        let latency: number | null = null;
         if (!token) outcome = "missing_auth";
         else if (deps.signal?.aborted) outcome = "interrupted";
         else {
@@ -641,8 +657,12 @@ export async function runReplays(deps: RunReplaysDeps): Promise<ReplayRecord[]> 
               const signal = AbortSignal.any(deps.signal ? [deps.signal, pass.signal] : [pass.signal]);
               let cleanupConfirmed = false;
               try {
-                const text = await checkerFor(family).run(claim, materialized.snapshot, home, signal,
-                  async (payload) => { usage.push({ ...payload }); }, () => { cleanupConfirmed = true; });
+                let text: string;
+                const began = now();
+                try {
+                  text = await checkerFor(family).run(claim, materialized.snapshot, home, signal,
+                    async (payload) => { usage.push({ ...payload }); }, () => { cleanupConfirmed = true; });
+                } finally { latency = Math.max(0, now() - began); }
                 signal.throwIfAborted();
                 if (!cleanupConfirmed) throw new CrossCheckConfinementError("cleanup_callback_missing");
                 findings = validateCodeFindings(text);
@@ -663,7 +683,7 @@ export async function runReplays(deps: RunReplaysDeps): Promise<ReplayRecord[]> 
           checker_version: { ...deps.checkerVersion, corpus_version: deps.corpus.corpus_version },
           brief_sha256: deps.corpus.brief_sha256[family], model: deps.model, effort: deps.effort,
           reader_implementation: READER_IMPLEMENTATION[family], credential_mode: CREDENTIAL_MODE[family],
-          outcome, latency_ms: outcome === "missing_auth" ? 0 : Math.max(0, now() - started), cost_usd: cost,
+          outcome, latency_ms: latency, cost_usd: cost,
           findings: outcome === "completed" ? findings : [],
         };
         await deps.writeRecord(rec);
@@ -678,7 +698,7 @@ export async function runReplays(deps: RunReplaysDeps): Promise<ReplayRecord[]> 
 // Scoring (pure)
 
 export interface Adjudication { record_key: string; finding_id: string; verdict: "false_positive" | "valid" | "duplicate" }
-type ScoreCase = Pick<ReplayCase, "id" | "kind" | "expected">;
+type ScoreCase = Pick<ReplayCase, "id" | "kind" | "input_provenance" | "expected">;
 export interface ScoreCorpus { corpus_version: string; brief_sha256: { codex: string; claude: string }; cases: ScoreCase[] }
 
 export interface DefectScore { case_id: string; id: string; attempted: number; completed: number; matched: number }
@@ -717,6 +737,8 @@ export interface Aggregate {
   groups: GroupAggregate[];
 }
 
+const invalidRecords = (): never => { throw new ReplayError("records_invalid"); };
+
 const SCORING_NOTE = "expected-defect matching is a proxy; unadjudicated findings are not confirmed false positives";
 
 function findingMatches(d: ExpectedDefect, f: CodeFinding): boolean {
@@ -738,7 +760,13 @@ export function scoreReplays(corpus: ScoreCorpus, records: ReplayRecord[], adjud
   const cases = new Map(corpus.cases.map((c) => [c.id, c]));
   const byKey = new Map<string, ReplayRecord>();
   for (const r of records) {
-    if (!cases.has(r.case_id)) throw new ReplayError("score_unknown_case");
+    const c = cases.get(r.case_id);
+    if (!c) throw new ReplayError("score_unknown_case");
+    // A record must agree with the loaded corpus; a mismatch is a stale or foreign records file.
+    if (byKey.has(recordKey(r)) || r.corpus_version !== corpus.corpus_version ||
+        r.checker_version.corpus_version !== corpus.corpus_version ||
+        r.brief_sha256 !== corpus.brief_sha256[r.family] || r.kind !== c.kind ||
+        r.input_provenance !== c.input_provenance || (r.outcome !== "completed" && r.findings.length > 0)) invalidRecords();
     byKey.set(recordKey(r), r);
   }
   const verdicts = new Map<string, Adjudication["verdict"]>();
@@ -751,7 +779,7 @@ export function scoreReplays(corpus: ScoreCorpus, records: ReplayRecord[], adjud
   }
   const groups = new Map<string, ReplayRecord[]>();
   for (const r of records) {
-    const key = `${r.family}\0${r.input_provenance}`;
+    const key = `${r.family}\0${cases.get(r.case_id)!.input_provenance}`;
     const list = groups.get(key);
     if (list) list.push(r); else groups.set(key, [r]);
   }
@@ -790,9 +818,9 @@ export function scoreReplays(corpus: ScoreCorpus, records: ReplayRecord[], adjud
     }
     const reached = list.filter((r) => r.outcome !== "missing_auth");
     const costs = reached.map((r) => r.cost_usd).filter((v): v is number => v !== null).sort((a, b) => a - b);
-    const latencies = reached.map((r) => r.latency_ms).sort((a, b) => a - b);
+    const latencies = reached.map((r) => r.latency_ms).filter((v): v is number => v !== null).sort((a, b) => a - b);
     const group: GroupAggregate = {
-      family: list[0]!.family, input_provenance: list[0]!.input_provenance,
+      family: list[0]!.family, input_provenance: cases.get(list[0]!.case_id)!.input_provenance,
       replays: list.length, completed, outcomes,
       incomplete_rate: rate(list.length - completed, list.length),
       defects: [...defects.values()],
@@ -846,8 +874,6 @@ export function sanitizedAggregate(agg: Aggregate): string {
 // ---------------------------------------------------------------------------------------------
 // Operator-supplied inputs to `score`
 
-const invalidRecords = (): never => { throw new ReplayError("records_invalid"); };
-
 function parseRecord(v: unknown): ReplayRecord {
   try {
     const r = strict(v, [
@@ -858,19 +884,23 @@ function parseRecord(v: unknown): ReplayRecord {
     const cost = r.cost_usd === null ? null : r.cost_usd;
     if (cost !== null && (typeof cost !== "number" || !Number.isFinite(cost) || cost < 0)) return invalidRecords();
     const latency = r.latency_ms;
-    if (typeof latency !== "number" || !Number.isFinite(latency) || latency < 0) return invalidRecords();
+    if (latency !== null && (typeof latency !== "number" || !Number.isFinite(latency) || latency < 0)) return invalidRecords();
     const caseId = str(r.case_id, 48);
     if (!CASE_ID.test(caseId)) return invalidRecords();
     const findings = decodeCodeFindings(r.findings);
+    const family = oneOf(r.family, ["claude", "codex"] as const);
+    const model = str(r.model, 100);
+    if (!isSafeReplayModel(model)) return invalidRecords();
     return {
       case_id: caseId, kind: oneOf(r.kind, ["defect", "control"] as const),
       input_provenance: oneOf(r.input_provenance, ["reconstructed", "recorded"] as const),
-      family: oneOf(r.family, ["claude", "codex"] as const), repeat: int(r.repeat, 1),
+      family, repeat: int(r.repeat, 1),
       corpus_version: str(r.corpus_version, 64),
       checker_version: { uzi_head: str(cv.uzi_head, 128), agent_version: str(cv.agent_version, 128), corpus_version: str(cv.corpus_version, 64) },
-      brief_sha256: hex(r.brief_sha256, HEX64), model: str(r.model, 100),
-      effort: oneOf(r.effort, ["low", "medium", "high", "xhigh", "max"] as const),
-      reader_implementation: str(r.reader_implementation, 128), credential_mode: str(r.credential_mode, 64),
+      brief_sha256: hex(r.brief_sha256, HEX64), model,
+      effort: oneOf(r.effort, REPLAY_EFFORTS),
+      reader_implementation: oneOf(r.reader_implementation, [READER_IMPLEMENTATION[family]]),
+      credential_mode: oneOf(r.credential_mode, [CREDENTIAL_MODE[family]]),
       outcome: oneOf(r.outcome, REPLAY_OUTCOMES), latency_ms: latency, cost_usd: cost, findings,
     };
   } catch { return invalidRecords(); }
@@ -878,11 +908,15 @@ function parseRecord(v: unknown): ReplayRecord {
 
 export function parseReplayRecords(text: string): ReplayRecord[] {
   const out: ReplayRecord[] = [];
+  const seen = new Set<string>();
   for (const line of text.split("\n")) {
     if (line.trim() === "") continue;
     let value: unknown;
     try { value = JSON.parse(line); } catch { return invalidRecords(); }
-    out.push(parseRecord(value));
+    const rec = parseRecord(value);
+    if (seen.has(recordKey(rec))) return invalidRecords();
+    seen.add(recordKey(rec));
+    out.push(rec);
   }
   if (out.length === 0) return invalidRecords();
   return out;
