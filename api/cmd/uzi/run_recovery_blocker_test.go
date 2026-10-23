@@ -18,15 +18,15 @@ func TestRecoveryBlockerVisibility(t *testing.T) {
 			t.Run(format+map[bool]string{false: "/owner", true: "/run"}[specific], func(t *testing.T) {
 				fc := &uzicli.FakeClient{
 					RecoveryHoldsResult: apitypes.RecoveryCustodyHoldsDTO{Holds: []apitypes.RecoveryCustodyHoldDTO{
-						{ID: "h1", RunID: "r1", State: "open", Attention: "source_only"},
-						{ID: "h2", RunID: "r1", State: "open", Attention: "needs_action", HasAvailableCapture: true},
+						{ID: "h1", RunID: recoveryHeldRunID, State: "open", Attention: "source_only"},
+						{ID: "h2", RunID: recoveryHeldRunID, State: "open", Attention: "needs_action", HasAvailableCapture: true},
 						{ID: "settled", RunID: "other", State: "released", Attention: "settled"},
 					}},
-					RunByID: map[string]apitypes.RunDTO{"r1": {Status: "failed", FailureReason: new(reason)}},
+					RunByID: map[string]apitypes.RunDTO{recoveryHeldRunID: {Status: "failed", FailureReason: new(reason)}},
 				}
 				args := []string{"run", "recovery"}
 				if specific {
-					args = append(args, "r1")
+					args = append(args, recoveryHeldRunID)
 				}
 				if format == "json" {
 					args = append(args, "--json")
@@ -42,7 +42,7 @@ func TestRecoveryBlockerVisibility(t *testing.T) {
 					t.Fatalf("run reads=%v", fc.RunVerbCalls)
 				}
 				if format != "json" {
-					if strings.Count(out, "run r1: "+reason) != 1 {
+					if strings.Count(out, "run "+recoveryHeldRunID+": "+reason) != 1 {
 						t.Fatalf("missing/doubled blocker: %s", out)
 					}
 					if format == "human" && (!strings.Contains(out, "custody") || !strings.Contains(out, "uzi run export")) {
@@ -86,14 +86,14 @@ func TestRecoveryBlockerUnavailable(t *testing.T) {
 			for _, asJSON := range []bool{false, true} {
 				fc := &uzicli.FakeClient{
 					RecoveryHoldsResult: apitypes.RecoveryCustodyHoldsDTO{Holds: []apitypes.RecoveryCustodyHoldDTO{
-						{ID: "h1", RunID: "r1", State: "open", Attention: "source_only"},
-						{ID: "h2", RunID: "r2", State: "open", Attention: "source_only"},
+						{ID: "h1", RunID: recoveryHeldRunID, State: "open", Attention: "source_only"},
+						{ID: "h2", RunID: recoveryOtherRunID, State: "open", Attention: "source_only"},
 					}},
 					GetRunHook: func(string) (apitypes.RunDTO, error) { return apitypes.RunDTO{}, readErr },
 				}
 				args := []string{"run", "recovery"}
 				if specific {
-					args = append(args, "r1")
+					args = append(args, recoveryHeldRunID)
 				}
 				if asJSON {
 					args = append(args, "--json")
@@ -122,8 +122,13 @@ func TestRecoveryBlockerUnavailable(t *testing.T) {
 
 func TestRecoveryBlockerUntrustedAndAbsent(t *testing.T) {
 	reason := "cap\nINJECT\ttext\r" + string(rune(27)) + "[31m"
-	runID := "r\nINJECT\t" + string(rune(27))
 	for _, specific := range []bool{false, true} {
+		runID := "r\nINJECT\t" + string(rune(27))
+		wantRun := "r INJECT"
+		if specific {
+			runID = recoveryHeldRunID
+			wantRun = recoveryHeldRunID
+		}
 		fc := &uzicli.FakeClient{
 			RecoveryHoldsResult: apitypes.RecoveryCustodyHoldsDTO{Holds: []apitypes.RecoveryCustodyHoldDTO{
 				{ID: "h", RunID: runID, State: "open", Attention: "source_only"},
@@ -137,7 +142,7 @@ func TestRecoveryBlockerUntrustedAndAbsent(t *testing.T) {
 		}
 		out, _, code := runCLI(t, fakeEnv(fc), args...)
 		if code != uzicli.ExitOK || strings.Contains(out, "\nINJECT") || strings.ContainsRune(out, rune(27)) ||
-			!strings.Contains(out, "run r INJECT: cap INJECT text[31m") {
+			!strings.Contains(out, "run "+wantRun+": cap INJECT text[31m") {
 			t.Fatalf("unsafe or missing reason: %q exit=%d", out, code)
 		}
 		out, _, code = runCLI(t, fakeEnv(fc), append(args, "--json")...)
@@ -160,11 +165,11 @@ func TestRecoveryBlockerUntrustedAndAbsent(t *testing.T) {
 	}
 	for _, status := range []string{"failed", "running"} {
 		fc := &uzicli.FakeClient{
-			RecoveryHoldsResult: apitypes.RecoveryCustodyHoldsDTO{Holds: []apitypes.RecoveryCustodyHoldDTO{{ID: "h", RunID: "r1", State: "open"}}},
-			RunByID:             map[string]apitypes.RunDTO{"r1": {Status: status}},
+			RecoveryHoldsResult: apitypes.RecoveryCustodyHoldsDTO{Holds: []apitypes.RecoveryCustodyHoldDTO{{ID: "h", RunID: recoveryHeldRunID, State: "open"}}},
+			RunByID:             map[string]apitypes.RunDTO{recoveryHeldRunID: {Status: status}},
 		}
 		if status == "running" {
-			fc.RunByID["r1"] = apitypes.RunDTO{Status: status, FailureReason: &reason}
+			fc.RunByID[recoveryHeldRunID] = apitypes.RunDTO{Status: status, FailureReason: &reason}
 		}
 		out, stderr, code := runCLI(t, fakeEnv(fc), "run", "recovery", "--json")
 		if code != uzicli.ExitOK || stderr != "" || strings.Contains(out, "failure_reason") {
@@ -178,33 +183,33 @@ func TestRecoveryBlockerUnavailableSibling(t *testing.T) {
 	fc := &uzicli.FakeClient{
 		RecoveryHoldsResult: apitypes.RecoveryCustodyHoldsDTO{Holds: []apitypes.RecoveryCustodyHoldDTO{
 			{ID: "deleted", RunID: "gone", State: "open", Attention: "source_only"},
-			{ID: "blocked", RunID: "r1", State: "open", Attention: "source_only"},
+			{ID: "blocked", RunID: recoveryHeldRunID, State: "open", Attention: "source_only"},
 		}},
-		RunByID: map[string]apitypes.RunDTO{"r1": {Status: "failed", FailureReason: new(reason)}},
+		RunByID: map[string]apitypes.RunDTO{recoveryHeldRunID: {Status: "failed", FailureReason: new(reason)}},
 	}
 	out, stderr, code := runCLI(t, fakeEnv(fc), "run", "recovery")
-	if code != uzicli.ExitOK || len(fc.RunVerbCalls) != 2 || !strings.Contains(out, "run r1: "+reason) ||
+	if code != uzicli.ExitOK || len(fc.RunVerbCalls) != 2 || !strings.Contains(out, "run "+recoveryHeldRunID+": "+reason) ||
 		!strings.Contains(out, "hold deleted: no recovery archive") || strings.Count(stderr, "\n") != 1 {
 		t.Fatalf("sibling skipped or custody lost: %s stderr=%s exit=%d reads=%v", out, stderr, code, fc.RunVerbCalls)
 	}
 	// A default fake 404 changes only stderr, never the existing human custody view.
 	fc.RunByID = nil
 	missing, _, code := runCLI(t, fakeEnv(fc), "run", "recovery")
-	fc.RunByID = map[string]apitypes.RunDTO{"gone": {}, "r1": {}}
+	fc.RunByID = map[string]apitypes.RunDTO{"gone": {}, recoveryHeldRunID: {}}
 	empty, stderr, emptyCode := runCLI(t, fakeEnv(fc), "run", "recovery")
 	if code != uzicli.ExitOK || emptyCode != uzicli.ExitOK || missing != empty || stderr != "" {
 		t.Fatalf("missing lookup changed human holds: missing=%s empty=%s stderr=%s", missing, empty, stderr)
 	}
 	// Run-specific lookup never reads other runs, even if they have open holds.
 	fc.RunVerbCalls = nil
-	_, _, code = runCLI(t, fakeEnv(fc), "run", "recovery", "r1")
+	_, _, code = runCLI(t, fakeEnv(fc), "run", "recovery", recoveryHeldRunID)
 	if code != uzicli.ExitOK || len(fc.RunVerbCalls) != 1 {
 		t.Fatalf("run filter failed: reads=%v exit=%d", fc.RunVerbCalls, code)
 	}
 }
 
 func TestRecoveryBlockerNoHoldsAndCancellation(t *testing.T) {
-	for _, args := range [][]string{{"run", "recovery"}, {"run", "recovery", "r1", "--json"}} {
+	for _, args := range [][]string{{"run", "recovery"}, {"run", "recovery", recoveryHeldRunID, "--json"}} {
 		fc := &uzicli.FakeClient{}
 		_, _, code := runCLI(t, fakeEnv(fc), args...)
 		if code != uzicli.ExitOK || len(fc.RunVerbCalls) != 0 {
@@ -212,7 +217,7 @@ func TestRecoveryBlockerNoHoldsAndCancellation(t *testing.T) {
 		}
 	}
 	fc := &uzicli.FakeClient{
-		RecoveryHoldsResult: apitypes.RecoveryCustodyHoldsDTO{Holds: []apitypes.RecoveryCustodyHoldDTO{{ID: "h", RunID: "r1", State: "open"}}},
+		RecoveryHoldsResult: apitypes.RecoveryCustodyHoldsDTO{Holds: []apitypes.RecoveryCustodyHoldDTO{{ID: "h", RunID: recoveryHeldRunID, State: "open"}}},
 		GetRunHook:          func(string) (apitypes.RunDTO, error) { return apitypes.RunDTO{}, context.Canceled },
 	}
 	out, _, code := runCLI(t, fakeEnv(fc), "run", "recovery", "--json")
