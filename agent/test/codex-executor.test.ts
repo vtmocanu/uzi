@@ -7846,7 +7846,7 @@ describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
       const fence = prompt.match(/^<advice_([a-f0-9]{16})>\n([^\n]+)\n<\/advice_\1>$/m);
       assert.ok(fence);
       assert.deepEqual(JSON.parse(fence[2]!), notes);
-      assert.match(prompt, /server canonical contract/);
+      assert.ok(prompt.includes(approvedPlan), "full approved A/B/C plan is preserved");
       assert.match(prompt, /canonical plan remains authoritative/);
       assert.match(prompt, /omitted requirement ONLY within the issue's stated scope; name that addition in the PR description/);
       assert.match(prompt, /Keep existing permissions and constraints/);
