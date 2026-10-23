@@ -14,11 +14,12 @@ import {
 
 installHarness();
 
-for (const scenario of ["wallpark", "clarification", "old-generation-foreground", "late-quiescence", "identical", "dirty", "closed", "unknown", "wrong-custodian", "wrong-repo", "wrong-live-run", "malformed", "live", "retained", "registry", "late-writer"] as const) {
+for (const scenario of ["wallpark", "wallpark-healthy", "wallpark-probe", "clarification", "old-generation-foreground", "late-quiescence", "identical", "dirty", "closed", "unknown", "wrong-custodian", "wrong-repo", "wrong-live-run", "malformed", "live", "retained", "registry", "late-writer"] as const) {
   const name = scenario === "identical"
     ? "#2901 before-model cancelled identical-tree inventory with no messages or checkpoint"
     : `V2 owner cancellation preserves frozen inventory: ${scenario}`;
   it(name, { skip: HELD_LINUX_ONLY }, async t => {
+    const wallpark = scenario === "wallpark" || scenario === "wallpark-healthy" || scenario === "wallpark-probe";
     const claim = gitlabClaim(30310, { claim_generation: 71, inventory_guarded: true });
     claim.secrets.codex = { auth_mode: "api_key", access_token: "fixture-key", capability: "fixture-capability" };
     const features = ["recovery_inventory_v1", "recovery_held_publication_v1", "recovery_held_publication_v2"];
@@ -72,18 +73,43 @@ for (const scenario of ["wallpark", "clarification", "old-generation-foreground"
     let dirtyBlob: string | undefined;
     let oldRoot: string | undefined;
     const rig = codexRig();
+    let capturePending = false, boundaryPending = false;
+    const cancelAdmissions: Array<{ capturePending: boolean; boundaryPending: boolean }> = [];
+    const withBoundary = rig.safety.withBoundary.bind(rig.safety);
+    rig.safety.withBoundary = async (request, action) => {
+      boundaryPending = true;
+      try { return await withBoundary(request, action); }
+      finally { boundaryPending = false; }
+    };
     const executor: Executor = {
+      ...(scenario === "wallpark-healthy" ? { safety: rig.safety } : {}),
       withCredentialFreeCapture: scenario === "registry"
-        ? async () => ({ kind: "incomplete", errors: [] }) : rig.capture,
+        ? async () => ({ kind: "incomplete", errors: [] }) : async (ms, action, purpose, signal, attempt) => {
+          if (purpose === "cancel") {
+            cancelAdmissions.push({ capturePending, boundaryPending });
+            assert.equal(capturePending, false, "independent cancel capture follows full capture-scope join");
+            assert.equal(boundaryPending, false, "independent cancel capture follows full healthy-boundary join");
+          }
+          capturePending = true;
+          try { return await rig.capture(ms, action, purpose, signal, attempt); }
+          finally { capturePending = false; }
+        },
       async run(ctx) {
         if (ctx.cancelRequested?.()) throw new Error("run cancelled");
         models++;
-        if (scenario === "wallpark" || scenario === "clarification") {
+        if (wallpark || scenario === "clarification") {
           oldRoot = commit(ctx.worktreePath, "before-cancel.txt");
           fs.writeFileSync(path.join(ctx.worktreePath, "cancel-dirty.txt"), "work before route cancellation\n");
           dirtyBlob = command(ctx.worktreePath, ["hash-object", "cancel-dirty.txt"]);
-          if (scenario === "wallpark") {
-            api.setWallParkResponse("cancelled");
+          if (wallpark) {
+            if (scenario === "wallpark-probe") {
+              mock.method(client, "reportWallPark", async () => {
+                const ownership = client.getRunOwnership.bind(client);
+                mock.method(client, "getRunOwnership", async (...args: Parameters<typeof ownership>) =>
+                  ({ ...await ownership(...args), status: "cancelled" as const }));
+                return { applied: false, status: "running" };
+              });
+            } else api.setWallParkResponse("cancelled");
             assert.equal(await ctx.parkForWall!({ completedCount: 1 }), "cancelled");
           } else {
             api.onState(claim.run_id, state => {
@@ -140,12 +166,14 @@ for (const scenario of ["wallpark", "clarification", "old-generation-foreground"
         assert.deepEqual(api.messages(claim.run_id), [], "no messages before cancellation observation");
       }
       if (scenario === "retained") flight.retainedEpisode = true;
-      if (scenario !== "old-generation-foreground" && scenario !== "late-quiescence" && scenario !== "wallpark" && scenario !== "clarification") r["observeCancellation"](flight);
+      if (scenario !== "old-generation-foreground" && scenario !== "late-quiescence" && !wallpark && scenario !== "clarification") r["observeCancellation"](flight);
       return out;
     };
     const capture = mock.method(recoveryOf(r), "captureAndUpload");
     await r.execute(claim);
-    assert.equal(models, scenario === "old-generation-foreground" || scenario === "late-quiescence" || scenario === "wallpark" || scenario === "clarification" ? 1 : 0);
+    if (wallpark) assert.deepEqual(cancelAdmissions, [{ capturePending: false, boundaryPending: false }],
+      "exactly one independent cancellation producer starts after the prior scope fully returns");
+    assert.equal(models, scenario === "old-generation-foreground" || scenario === "late-quiescence" || wallpark || scenario === "clarification" ? 1 : 0);
     assert.equal(api.states.filter(s => s.body.status === "failed").length, 1);
     if (scenario === "old-generation-foreground") {
       assert.equal(server.heldCalls.length, 0);
@@ -173,11 +201,15 @@ for (const scenario of ["wallpark", "clarification", "old-generation-foreground"
       assert.deepEqual(lateReads, [], "late quiescence cannot start fresh source inspection");
       assert.equal(server.failedAcked(), true, "honest terminal status transport remains independent of preservation expiry");
     }
-    const positive = scenario === "identical" || scenario === "dirty" || scenario === "wallpark" || scenario === "clarification";
+    const positive = scenario === "identical" || scenario === "dirty" || wallpark || scenario === "clarification";
     assert.equal(server.heldCalls.length, positive ? 1 : 0);
     assert.equal(capture.mock.callCount(), 0, "no archive before positive exact terminal authority");
     assert.equal(server.archiveReserves(), 0);
     if (positive) {
+      if (wallpark) {
+        assert.equal(capturePending, false);
+        assert.equal(boundaryPending, false);
+      }
       const records = await frozenRecords(claim);
       assert.equal(records.length, 1);
       assert.ok(freezes.failedAckedAtFreeze.length > 0);

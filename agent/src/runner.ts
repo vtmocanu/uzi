@@ -4037,6 +4037,14 @@ export class RunRunner {
           await dispatchFailure(flight.steering.claimFence() !== undefined ? new StaleClaimError() : new Error("run cancelled"));
           return false;
         }
+        if (flight.active?.shuttingDown) {
+          // Recovery has joined its capture scope. Keep the existing shutdown stop:
+          // no new capture, park request or graceful-shutdown authority is minted here.
+          flight.preserveRecoveryClone = true;
+          flight.preserveSession = true;
+          await batcher.close().catch(() => undefined);
+          return false;
+        }
         throw error;
       }
     };
@@ -15129,12 +15137,12 @@ export class RunRunner {
       const held: HeldAuthenticatedCapture = Object.freeze({ executor: flight.executor, safety, permit, signal, deadlineAt });
       this.authenticatedCaptureFlights.set(held, flight);
       try {
-        this.assertHeldAuthenticatedCapture(flight, held);
+        if (boundOperations) this.assertHeldAuthenticatedCapture(flight, held);
         // The outer finalize wrapper also serves sinks outside B. Narrow cleanup
         // acceptance begins when a capture scope or capture helper actually enters.
         if (boundOperations) await this.settleCaptureRequest(flight, held);
         const result = await action(held);
-        this.assertHeldAuthenticatedCapture(flight, held);
+        if (boundOperations) this.assertHeldAuthenticatedCapture(flight, held);
         return result;
       } finally {
         this.authenticatedCaptureFlights.delete(held);
@@ -15151,6 +15159,7 @@ export class RunRunner {
     primary: (held: HeldAuthenticatedCapture) => Promise<T>,
     fallback: (held: HeldFreeCapture, error: unknown) => Promise<T>,
     resume?: (error: unknown) => Promise<T>,
+    deferWallCancellation = false,
   ): Promise<T> {
     const progress = this.captureProgressFor(flight, episode);
     return this.runGatedSink(flight, async () => {
@@ -15160,11 +15169,12 @@ export class RunRunner {
       try {
         this.captureAuthority(flight, episode.healthyDeadlineAt);
         if (!flight.executor.safety) {
-          this.retainCaptureSource(flight);
+          if (!deferWallCancellation) this.retainCaptureSource(flight);
           const free = await this.runFreeCapture(claim, flight, episode.deadlineAt,
             AbortSignal.any([flight.steering.terminalLifecycleSignal(), this.shutdownSignal.signal]),
             held => fallback(held, new TrustedExecutionRefusal("authenticated capture safety unavailable")));
           if (free.kind !== "observed_empty") throw new TrustedExecutionRefusal("capture safety unavailable");
+          if (deferWallCancellation && progress.wallOutcome !== "cancelled") this.retainCaptureSource(flight);
           return free.value;
         }
         let value!: T;
@@ -15190,6 +15200,10 @@ export class RunRunner {
         return value;
       } catch (error) {
         this.validateJoinedCapture(flight, episode);
+        // A recorded wall cancellation hands off to its independent producer after
+        // join. Do not add B's inventory prohibition to that producer's existing guards.
+        if (progress.wallOutcome === "cancelled" && flight.steering.isCancelled() &&
+            flight.steering.claimFence() === undefined) throw error;
         this.retainCaptureSource(flight);
         if (progress.control) throw progress.control.error;
         if (progress.failure && resume) return resume(progress.failure.issued);
@@ -15215,6 +15229,8 @@ export class RunRunner {
         throw new TrustedExecutionRefusal("capture fallback did not observe an empty scope");
       }
     }).catch(async error => {
+      if (progress.wallOutcome === "cancelled" && flight.steering.isCancelled() &&
+          flight.steering.claimFence() === undefined) throw error;
       this.retainCaptureSource(flight);
       if (progress.control) throw progress.control.error;
       if (progress.failure && resume) return resume(progress.failure.issued);
@@ -19605,14 +19621,26 @@ export class RunRunner {
     if (this.isCodexCapture(claim, flight) && !options.dispositionOnly &&
         !options.heldAuthenticated && !options.heldCapture) {
       const episode = options.episode ?? this.newCaptureEpisode(flight);
-      return this.runCaptureRegion(claim, flight, episode,
-        async held => {
-          const result = await this.enterWallPark(flight, claim, runLog, { ...options, episode, heldAuthenticated: held, signal: held.signal });
-          this.captureProgressFor(flight, episode).wallOutcome = result;
-          return result;
-        },
-        held => this.enterWallPark(flight, claim, runLog, { ...options, episode, heldCapture: held, publishCheckpoint: false, signal: held.signal }),
-        () => this.resumeWallDisposition(claim, flight, runLog, options, episode));
+      let outcome: WallParkOutcome;
+      const capture = async (heldOptions: HoldCaptureOptions): Promise<WallParkOutcome> => {
+        const result = await this.enterWallPark(flight, claim, runLog, { ...options, episode, ...heldOptions });
+        this.captureProgressFor(flight, episode).wallOutcome = result;
+        return result;
+      };
+      try {
+        outcome = await this.runCaptureRegion(claim, flight, episode,
+          held => capture({ heldAuthenticated: held, signal: held.signal }),
+          held => capture({ heldCapture: held, publishCheckpoint: false, signal: held.signal }),
+          () => this.resumeWallDisposition(claim, flight, runLog, options, episode), true);
+      } catch (error) {
+        // The cancelled ACK revoked B. Only our recorded result can finish this
+        // wall callback after admission and cleanup have joined; fencing still wins.
+        if (flight.steering.claimFence() !== undefined || !flight.steering.isCancelled() ||
+            this.captureProgressFor(flight, episode).wallOutcome !== "cancelled") throw error;
+        outcome = "cancelled";
+      }
+      if (outcome === "cancelled") await this.finishWallCancellation(claim, flight);
+      return outcome;
     }
     const { batcher } = flight;
     // 1. Reap the agent tree BEFORE any credentialed capture git (REAP-BEFORE-GIT), like the
@@ -19728,7 +19756,11 @@ export class RunRunner {
       let provedRunning = false;
       try {
         const ownership = await this.getObservedRunOwnership(flight, options.signal);
-        if (ownership.status === "cancelled") return "cancelled";
+        if (ownership.status === "cancelled") {
+          this.observeCancellation(flight);
+          if (!options.heldAuthenticated && !options.heldCapture) await this.finishWallCancellation(claim, flight);
+          return "cancelled";
+        }
         provedRunning = ownership.status === "running" && ownership.claim_generation === flight.claimGeneration;
       } catch (err) {
         runLog.warn("wall park ownership probe failed; retaining local work", {
@@ -19765,14 +19797,9 @@ export class RunRunner {
     }
     if (status === "cancelled") {
       this.observeCancellation(flight);
-      if (claim.inventory_guarded === true && this.client.hasHeldPublicationV2() &&
-          this.isCredentialFreeOwnerCancel(claim, flight)) {
-        await this.disposeCredentialFreeOwnerCancel(claim, flight);
-        if (flight.heldDeferredCapture !== undefined) await this.settleHeldDeferred(claim, flight);
-      } else {
-        flight.preserveRecoveryClone = false;
-        flight.preserveSession = false;
-      }
+      // An independent cancellation producer cannot queue behind the scope held
+      // by this callback. The outer enterWallPark invocation runs it after join.
+      if (!options.heldAuthenticated && !options.heldCapture) await this.finishWallCancellation(claim, flight);
       runLog.info("wall park found the run cancelled; ending the run as a cancel", {
         run_id: flight.runId,
       });
@@ -19791,6 +19818,17 @@ export class RunRunner {
       server_status: status || "unknown",
     });
     return "refused";
+  }
+
+  private async finishWallCancellation(claim: ClaimResponse, flight: RunFlight): Promise<void> {
+    if (claim.inventory_guarded === true && this.client.hasHeldPublicationV2() &&
+        this.isCredentialFreeOwnerCancel(claim, flight)) {
+      await this.disposeCredentialFreeOwnerCancel(claim, flight);
+      if (flight.heldDeferredCapture !== undefined) await this.settleHeldDeferred(claim, flight);
+    } else {
+      flight.preserveRecoveryClone = false;
+      flight.preserveSession = false;
+    }
   }
 
   /**

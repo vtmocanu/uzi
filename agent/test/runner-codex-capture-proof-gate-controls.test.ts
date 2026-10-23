@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 import { it } from "node:test";
 import { setImmediate as tick } from "node:timers/promises";
 import { PlanRejectedError } from "../src/executor.js";
@@ -9,6 +11,7 @@ installHarness();
 for (const failed of [false,true]) it(`public gate extra actual Git ${failed?"publication failure":"approve"}`,async()=>{
   const o=observe(); const post:any[]=[]; let gates=0;
   let prefix:any[]=[]; let verdict:unknown; let refusal:unknown;
+  let clone="", stoppedReads=0, stoppedPubs=0;
   const publish=client.publishCheckpoint.bind(client);
   client.publishCheckpoint=async(...args)=>{
     const result=await publish(...args);
@@ -32,8 +35,8 @@ for (const failed of [false,true]) it(`public gate extra actual Git ${failed?"pu
   });
   let run: ReturnType<typeof runnerWith>;
   const exec=new FakeCodexExecutor(o.rig.safety,async ctx=>{
-    commitInTree(ctx.worktreePath,"PUBLIC.txt","gate actual bytes\n");o.arm();
-    try { verdict=await ctx.gatePlan!("Plan",[{id:"m1",title:"Changed"}]); } catch(error) {refusal=error;run.shutdown(); throw error;}
+    clone=ctx.worktreePath;commitInTree(clone,"PUBLIC.txt","gate actual bytes\n");o.arm();
+    try { verdict=await ctx.gatePlan!("Plan",[{id:"m1",title:"Changed"}]); } catch(error) {refusal=error;stoppedReads=o.observations().source.length;stoppedPubs=o.observations().pubs.length;run.shutdown(); throw error;}
     throw new PlanRejectedError("fixture rejection");
   },o.rig.settle,o.capture);
   try{
@@ -45,6 +48,10 @@ for (const failed of [false,true]) it(`public gate extra actual Git ${failed?"pu
     assert.equal(trackedFile(2852,"PUBLIC.txt"),"gate actual bytes\n","actual durable worker bare has captured source bytes");
     o.assertProof(true);
     if(failed){
+      assert.equal(fs.readFileSync(path.join(clone,"PUBLIC.txt"),"utf8"),"gate actual bytes\n","shutdown retains the source");
+      assert.equal(o.observations().source.length,stoppedReads,"shutdown starts no source recapture");
+      assert.equal(o.observations().pubs.length,stoppedPubs,"shutdown starts no checkpoint replay");
+      assert.equal(o.isActive(),false,"execute settles after the capture scope joins");
       assert.equal(gates,0,"failed optional publication never presents approval");
       assert.equal(verdict,undefined,"no gate result fabricated");
       assert.equal((refusal as Error)?.name,"TransientRecoveryError","existing gate witness policy refuses local-only capture");
