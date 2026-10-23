@@ -8,29 +8,29 @@
 #   b. `docker run` and `docker build` stay in the script's process group (timeout --foreground),
 #      so a process-group SIGINT (Ctrl-C) ends the script with 130 promptly, well under the
 #      30s CODEX_GIT_TRUST_TIMEOUT / CODEX_GIT_TRUST_BUILD_TIMEOUT; a group SIGTERM that the
-#      docker CLI ignores ends with 143 within the 10s kill grace. Without --foreground, GNU
-#      timeout setpgid's away and these cases time out red;
+#      docker CLI ignores ends with 143 within the 10s kill grace. A real build deadline
+#      still returns 124. Without --foreground, timeout setpgid's away and these cases fail;
 #   c. an unverified cleanup (container still listed) turns run exit 0 or 77 into 3 and keeps 1;
 #   d. CODEX_GIT_TRUST_BUILD_NETWORK=host forwards `--network host`; any other value warns and
 #      forwards nothing;
 #   e. every bind is `--mount type=bind,...,readonly` and no `-v`/`--volume` appears.
-# Linux only (reads /proc/<pid>/stat; needs GNU timeout --foreground): the Task target is
+# Linux only (reads /proc/<pid>/stat; needs timeout --foreground): the Task target is
 # `platforms: [linux]`. Prints PASS:/FAIL: per check and a MANDATORY `cases=N passed=N` tally, and
 # exits nonzero unless every check passed and at least MIN_CASES ran, so a gutted run cannot read
-# green. run.sh is started with `set -m` (its own process group) under GNU
+# green. run.sh is started with `set -m` (its own process group) under
 # `env --default-signal=INT,TERM`, so an INT/TERM ignore inherited from a backgrounded caller
 # (`task gate:repo &`) is reset in the child rather than reddening the signal cases.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="$HERE/run.sh"
-MIN_CASES=51
+MIN_CASES=59
 
 [ -f "$SCRIPT" ] || { echo "run.sh not found at $SCRIPT" >&2; exit 2; }
 [ -r /proc/self/stat ] || { echo "ERROR: needs /proc (Linux only)" >&2; exit 2; }
-timeout --foreground 5s true 2>/dev/null || { echo "ERROR: needs GNU timeout --foreground" >&2; exit 2; }
+timeout --foreground 5s true 2>/dev/null || { echo "ERROR: needs timeout --foreground" >&2; exit 2; }
 env --default-signal=INT,TERM true 2>/dev/null \
-  || { echo "ERROR: needs GNU env --default-signal (coreutils >= 8.31) to reset inherited INT/TERM ignores" >&2; exit 2; }
+  || { echo "ERROR: needs env --default-signal to reset inherited INT/TERM ignores" >&2; exit 2; }
 REAL_TIMEOUT="$(command -v timeout)"
 export REAL_TIMEOUT
 
@@ -213,8 +213,13 @@ done
 # ---- b. process-group signals reach docker run / docker build -------------------------------
 signal_case "b: fixture INT" fixture run INT 130 5 CODEX_GIT_TRUST_TIMEOUT=30
 signal_case "b: build INT" build build INT 130 5 CODEX_GIT_TRUST_BUILD_TIMEOUT=30
+signal_case "b: build TERM (docker ignores TERM)" build build TERM 143 15 \
+  CODEX_GIT_TRUST_BUILD_TIMEOUT=30 STUB_IGNORE_TERM=1
 signal_case "b: fixture TERM (docker ignores TERM)" fixture run TERM 143 15 \
   CODEX_GIT_TRUST_TIMEOUT=30 STUB_IGNORE_TERM=1
+run_sync build STUB_BLOCK=build CODEX_GIT_TRUST_BUILD_TIMEOUT=0.5s
+check "b: actual build deadline keeps exit 124" "$(t [ "$RC" = 124 ])" "got $RC"
+check "b: actual build deadline signals docker" "$(t grep -sqx TERM "$ST/build.signals")"
 
 # ---- c. exit-3 mapping for an unverified cleanup --------------------------------------------
 for spec in "0 0 0" "77 0 77" "1 0 1" "0 1 3" "77 1 3" "1 1 1"; do

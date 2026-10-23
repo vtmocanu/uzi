@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { procMountShowsAllProcesses, reapRunProcesses, scanOnce, snapshotMaintenanceBootstrap, type ProcTable, type ScanRequest } from "../src/run-quiescence.js";
+import { procMountShowsAllProcesses, reaperCaptureScope, quiesceRunAttempt, LiveAttemptRegistry, reapRunProcesses, scanOnce, snapshotMaintenanceBootstrap, type ProcTable, type ScanRequest } from "../src/run-quiescence.js";
 import { RecoveryMaintenance, MaintenanceResources } from "../src/recovery-maintenance.js";
 import type { RecordedRoot } from "../src/worker-spawn-mark.js";
 
@@ -274,4 +274,59 @@ test("#3031 the proc mount read is charged as one admin entry", async t => {
     producerWorkLimits: { adminEntries, metadataBytes: 16 * 1024 ** 2 } }));
   assert.equal((await run(14)).state, "unverified");
   assert.equal((await run(15)).state, "quiescent");
+});
+
+
+test("wrapped exclusive-idle ProcTable forwards executable and proc mount identity reads", async t => {
+  const f = await chargedSlot(t);
+  const req = exclusive(1);
+  req.exclusiveIdleBootstrap = [{ pid: 30, parentPid: self, startTime: 200, executable: "/image/esbuild" }];
+  const view = table({ ...base(), 30: { ppid: self, start: 200 } });
+  const executable = view.readExecutable!, mount = view.readProcMountInfo!;
+  let executableReads = 0, mountReads = 0;
+  view.readExecutable = pid => { executableReads++; return executable(pid); };
+  view.readProcMountInfo = () => { mountReads++; return mount(); };
+  const result = await f.run(() => reapRunProcesses(req, {
+    viaHelper: false, table: view, selfPid: self, sleep: async () => {},
+    producerWorkLimits: { adminEntries: 128, metadataBytes: 16 * 1024 ** 2 },
+  }));
+  assert.equal(result.state, "quiescent", result.detail);
+  assert.ok(executableReads > 0, "bootstrap executable identity must cross the metering wrapper");
+  assert.ok(mountReads > 0, "proc visibility must cross the metering wrapper");
+});
+
+test("capture scope refuses exclusive idle before all table and helper effects", async t => {
+  const f = await chargedSlot(t);
+  const previous = process.env.UZI_UID_SPLIT;
+  process.env.UZI_UID_SPLIT = "1";
+  let effects = 0;
+  const unexpected = () => { effects++; throw new Error("unexpected effect"); };
+  const scope = reaperCaptureScope({ attempt: undefined, signal: new AbortController().signal,
+    deadlineAt: Date.now() + 1000, live: () => true, spawn: async () => unexpected(),
+    track: unexpected, owner: {}, enterExclusive: unexpected, leaveExclusive: unexpected, validateExclusive: unexpected });
+  try {
+    await scope.run(async () => {
+      const result = await reapRunProcesses(exclusive(1), {
+        viaHelper: true, table: { listPids: unexpected, readStatus: unexpected,
+          readEnviron: unexpected, readCwd: unexpected, readStat: unexpected },
+        spawnHelper: unexpected, helperTmp: { make: unexpected, remove: unexpected }, kill: unexpected,
+      });
+      assert.equal(result.state, "unverified");
+      assert.equal(result.detail, "scoped reaper requires worker attempt construction");
+      const produce = (producerWorkLimits: { adminEntries: number; metadataBytes: number }) =>
+        f.run(() => quiesceRunAttempt({ mode: "capture", attempt: undefined, site: "retained_ops", processes: true,
+          targetPaths: [], cloneKey: "", registry: new LiveAttemptRegistry(), dockerHost: undefined,
+          producerWorkLimits }, { reap: { spawnHelper: unexpected }, docker: undefined }));
+      const invalid = await produce({} as never);
+      assert.equal(invalid.process?.detail, "invalid producer quiescence envelope");
+      const limited = await produce({ adminEntries: 128, metadataBytes: 16 * 1024 ** 2 });
+      assert.equal(limited.process?.state, "unverified");
+      assert.equal(limited.process?.detail, "scoped producer work limits unsupported");
+      assert.equal(effects, 0);
+    });
+  } finally {
+    scope.revoke();
+    if (previous === undefined) delete process.env.UZI_UID_SPLIT;
+    else process.env.UZI_UID_SPLIT = previous;
+  }
 });

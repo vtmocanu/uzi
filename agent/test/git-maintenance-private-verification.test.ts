@@ -12,6 +12,8 @@ import { GitCache } from "../src/git.js";
 import { MaintenanceResources, RecoveryMaintenance, type MaintenanceResource } from "../src/recovery-maintenance.js";
 import { RecoveryClosureLimitError } from "../src/recovery-closure.js";
 import { nullLogger } from "./helpers.js";
+import { createCodexExecutionSafety } from "../src/codex/safety.js";
+import { ExecutionRegistry, newLocalExecutionEpoch } from "../src/codex/registry.js";
 
 // The private verification pipeline runs on the Linux-only object snapshot (src/git.ts
 // snapshotMaintenanceObjects refuses off Linux with maintenance_object_snapshot_refused), so these
@@ -152,6 +154,8 @@ async function fixture(t: test.TestContext, decoded?: number | ((total: number) 
   const run = <T>(action: () => Promise<T>) => MaintenanceResources.run(admitted.value, () =>
     git.withBoundaryProcessSpawner(ownedGit, controller.signal, () =>
       git.withRecoveryOperation(controller.signal, Date.now() + 110000, action)));
+  const runCapture = <T>(action: () => Promise<T>) => MaintenanceResources.run(admitted.value, () =>
+    git.withRecoveryOperation(controller.signal, Date.now() + 110000, action));
   const before = async () => { effects++; await tick(); await hooks.effect?.(); };
   const seam = (name = "unit", consumer = async (_result: {
     pack: { path: string; byteSize: number; objectCount: number };
@@ -166,8 +170,31 @@ async function fixture(t: test.TestContext, decoded?: number | ((total: number) 
     await fs.rm(dir, { recursive: true, force: true });
   });
   return { dir, git, clone, base, seed, source, knownBase, tip, total, oids, poison, controller, requests, hooks,
-    run, seam, charge, fingerprint, original, physical, callbacks: () => callbacks, joined: () => joined, cancelled: () => cancelled };
+    run, runCapture, seam, charge, fingerprint, original, physical, callbacks: () => callbacks,
+    effects: () => effects, joined: () => joined, cancelled: () => cancelled };
 }
+
+test("private maintenance refuses genuine capture with valid resources before snapshot effects", async t => {
+  const f = await fixture(t);
+  const safety = createCodexExecutionSafety(new ExecutionRegistry(newLocalExecutionEpoch(2852)),
+    async () => { throw new Error("unexpected generic launch"); }, undefined, undefined,
+    async () => { throw new Error("unexpected capture launch"); });
+  const before = await f.fingerprint();
+  try {
+    const result = await f.runCapture(() => safety.withCredentialFreeCapture(10_000, context =>
+      f.git.withCredentialFreeCapture(context, async () => {
+        await assert.rejects(f.seam());
+        assert.equal(f.effects(), 0, "private verification refuses before snapshot writes");
+        assert.equal(f.requests.length, 0, "no maintenance child bypasses capture");
+        assert.equal(f.callbacks(), 0);
+        assert.deepEqual(await fs.readdir(f.git.recoveryRoot), []);
+      })));
+    assert.equal(result.kind, "observed_empty");
+    assert.equal(await f.fingerprint(), before);
+  } finally {
+    assert.equal((await safety.dispose({ boundary: "checkpoint", deadlineMs: 1000 })).kind, "disposed");
+  }
+});
 
 test("real shared-base private proof survives unavailable originals and ignores poisoned config", { skip: LINUX_ONLY }, async t => {
   const f = await fixture(t);

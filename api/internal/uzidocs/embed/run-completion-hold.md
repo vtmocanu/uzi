@@ -57,7 +57,16 @@ a pull/merge request:
    **in the same session** — no re-planning, no new run. Three identical
    consecutive completion attempts (same unmet IDs, branch head and worktree
    fingerprint) open the same question.
-3. If that window passes with no answer, the run parks in a **completion
+3. A run that has already reported at least one completed milestone and has
+   never made a completion attempt can also be caught when its lead stops
+   without calling `signal_done`: three consecutive turns with no tool
+   call, no subagent activity, no worktree change and no milestone progress
+   (the lead's wording is ignored; your input resets the count). The worker
+   then records an empty completion attempt that marks nothing complete and
+   opens the same question. This never opens or updates a pull/merge request
+   (like any completion check, it may push the branch tip to the run's
+   checkpoint ref as a durability checkpoint).
+4. If that window passes with no answer, the run parks in a **completion
    hold** — a `paused` run, but held for this structural reason rather than
    because you asked it to pause.
 
@@ -137,6 +146,24 @@ disagree about which one applies:
 - **Completion blocked** — the run is either asking you the completion
   question live, or has parked in the completion hold. Same label either way,
   since both mean the same thing: the run needs a decision.
+
+A stalled lead produces its own wording: the question says the lead stopped
+making progress without signalling done. If every milestone is already met, it
+says the contract is satisfied but the lead has not signalled done, and offers
+only **Continue**. If the window passes, the run is held and shows as **Completion blocked**,
+like any other completion hold; the hold does not carry stall-specific wording
+in the UI. On both Claude and Codex the activity feed shows a worker status
+line when the stall is caught: "no progress: the lead ended 3 consecutive
+turns with no tool call, no worktree change and no milestone progress without
+signalling done — running a completion check for an owner decision". When the
+window passes, Claude also shows "completion blocked: the lead stopped making
+progress without signalling done (N unmet frozen milestone(s)) — holding for
+an owner decision" as it enters the hold. The run is held for an
+owner decision rather than failing on the iteration budget. The attempt count
+includes the worker's stall attempt, so a run can show one attempt that the
+lead never made. If the stall is caught on the run's last iteration,
+**Continue** holds the run (Completion blocked) without a further turn,
+because no iteration is left.
 
 The completion panels show the bounded server-provided unmet-milestone list,
 the attempt count and the hold reason. The durable question feed also shows

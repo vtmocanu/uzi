@@ -9,6 +9,9 @@ import {
   updateCompletionStreak,
   routeCompletionHold,
   buildCompletionReworkFollowUp,
+  stallEligible,
+  progressSetsEqual,
+  NoProgressStallTracker,
 } from "../src/completion-attempt.js";
 
 describe("shared completion attempt", () => {
@@ -97,5 +100,76 @@ describe("shared completion attempt", () => {
       ),
       true,
     );
+  });
+});
+
+describe("issue #3139 stall helpers", () => {
+  const base = {
+    interlocked: true, issueRun: true, interactive: false, attemptSeamWired: true,
+    servedCompletionAttempts: 0 as number | undefined, completionAttempted: false,
+    seenCompletedCount: 1, servedCompletedCount: undefined as number | undefined,
+  };
+  const cases: [string, Partial<typeof base>, boolean][] = [
+    ["eligible: served 0 and a seen completed milestone", {}, true],
+    ["served completed count only", { seenCompletedCount: 0, servedCompletedCount: 2 }, true],
+    ["served attempts absent (older server)", { servedCompletionAttempts: undefined }, false],
+    ["served attempts 2", { servedCompletionAttempts: 2 }, false],
+    ["latch set", { completionAttempted: true }, false],
+    ["interactive", { interactive: true }, false],
+    ["non-issue run", { issueRun: false }, false],
+    ["attempt seam unwired", { attemptSeamWired: false }, false],
+    ["not interlocked", { interlocked: false }, false],
+    ["no completed milestone in either count", { seenCompletedCount: 0, servedCompletedCount: 0 }, false],
+    ["no completed milestone, served count absent", { seenCompletedCount: 0 }, false],
+  ];
+  for (const [name, patch, want] of cases) {
+    it(`stallEligible: ${name}`, () => assert.equal(stallEligible({ ...base, ...patch }), want));
+  }
+
+  it("progressSetsEqual uses set semantics and treats undefined as empty", () => {
+    assert.equal(progressSetsEqual(undefined, undefined), true);
+    assert.equal(progressSetsEqual(undefined, { completed: [], in_progress: [] }), true);
+    assert.equal(progressSetsEqual({ completed: ["a", "b", "a"], in_progress: ["c"] }, { completed: ["b", "a"], in_progress: ["c", "c"] }), true);
+    assert.equal(progressSetsEqual({ completed: ["a"], in_progress: [] }, { completed: ["a", "b"], in_progress: [] }), false);
+    assert.equal(progressSetsEqual({ completed: ["a"], in_progress: [] }, { completed: [], in_progress: ["a"] }), false);
+    assert.equal(progressSetsEqual(undefined, { completed: ["a"], in_progress: [] }), false);
+  });
+
+  describe("NoProgressStallTracker", () => {
+    const stall = (fingerprint: string | null) => ({ leadToolCall: false, subagentActivity: false, fingerprint, progressChanged: false });
+
+    it("counts the first stall turn as 1 and increments on the same fingerprint", () => {
+      const t = new NoProgressStallTracker();
+      assert.equal(t.observe(stall("fp")), 1);
+      assert.equal(t.observe(stall("fp")), 2);
+      assert.equal(t.observe(stall("fp")), 3);
+    });
+
+    it("a different fingerprint restarts at 1", () => {
+      const t = new NoProgressStallTracker();
+      t.observe(stall("a")); t.observe(stall("a"));
+      assert.equal(t.observe(stall("b")), 1);
+    });
+
+    for (const [name, turn] of [
+      ["a lead tool call", { ...stall("fp"), leadToolCall: true }],
+      ["subagent activity", { ...stall("fp"), subagentActivity: true }],
+      ["a progress change", { ...stall("fp"), progressChanged: true }],
+      ["an unreadable fingerprint", stall(null)],
+    ] as const) {
+      it(`${name} is a non-stall turn that resets the streak`, () => {
+        const t = new NoProgressStallTracker();
+        t.observe(stall("fp")); t.observe(stall("fp"));
+        assert.equal(t.observe(turn), 0);
+        assert.equal(t.observe(stall("fp")), 1);
+      });
+    }
+
+    it("reset() clears the streak", () => {
+      const t = new NoProgressStallTracker();
+      t.observe(stall("fp"));
+      t.reset();
+      assert.equal(t.observe(stall("fp")), 1);
+    });
   });
 });

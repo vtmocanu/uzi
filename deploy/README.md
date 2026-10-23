@@ -549,10 +549,10 @@ which takes uzi down. It fails closed, but the blast radius is the whole product
 | `workers.enabled` | `false` | The envelope + (with the controller) the whole feature. |
 | `workers.controller.enabled` | `true` | `false` = M3's envelope-only shape: namespace/RBAC/quotas/policies with nothing running. Also turns the api's hosting switch off — the two are one flag (`uzi.apiHostingEnabled`), because hosting with no controller means users provision workers nothing ever materializes. Only `kind-smoke.yaml` sets it. |
 | `workers.image.repository` | `ghcr.io/vtmocanu/uzi` | The **prefix**; the controller appends `/agent-<template>:<tag>`. Must match the prefix `release.yml` publishes the agent images under (`ghcr.io/vtmocanu/uzi/agent-base`, `.../agent-jvm`). |
-| `workers.image.tag` | concrete published pin (see `chart/values.yaml`) | **Decoupled from `Chart.AppVersion`** (PRD #422; reverses the old `""` → appVersion default). An app-only release leaves this tag alone and rolls zero worker pods when worker rendering is also unchanged. Controller template changes can still cause a paced same-image roll. Bump it to a new concrete version to deliberately advance the worker fleet, with the matching exact `workers.rollTargetVersion` below. The singleton controller admits a canary per owner/lane/capability pool and cordons busy workers when their turn is admitted; retained workers keep claiming. **Must be a concrete version string**: the chart wraps it in `required`, so a blank tag fails the render rather than silently reverting to appVersion — an out-of-tree per-cluster values file that relied on the old empty-tag default must now set one explicitly. See [adr/0422-decouple-worker-version.md](../adr/0422-decouple-worker-version.md). |
+| `workers.image.tag` | concrete published pin (see `chart/values.yaml`) | **Decoupled from `Chart.AppVersion`** (PRD #422; reverses the old `""` → appVersion default). An app-only release leaves this tag alone and rolls zero worker pods when worker rendering is also unchanged. Controller template changes can still cause a paced same-image roll. Bump it to a new concrete version to deliberately advance the worker fleet, with the matching exact `workers.rollTargetVersion` below. The singleton controller admits a canary per owner/lane/capability pool and cordons busy workers when their turn is admitted; eligible uncordoned retained workers keep claiming, with a separate custody-held migration-drain exception. **Must be a concrete version string**: the chart wraps it in `required`, so a blank tag fails the render rather than silently reverting to appVersion — an out-of-tree per-cluster values file that relied on the old empty-tag default must now set one explicitly. See [adr/0422-decouple-worker-version.md](../adr/0422-decouple-worker-version.md). |
 | `workers.controller.replicaCount` | `1` | Enabled controller rendering accepts `0` or `1`, with Recreate strategy. `0` stops reconciliation. Extra controllers outside the chart are unsupported; there is no multi-controller coordination. |
 | `workers.rollConcurrency` | `1` | Positive integer: concurrent admitted replacements per coverage pool after canary promotion. Busy draining reservations and unconfirmed writes consume slots. |
-| `workers.rollTargetVersion` | verified image stamp in published charts (`""` in source) | Exact verified baked version of the pinned worker image, including `+g<commit>`. Release packaging verifies each pinned template image signature and matching config at one resolved digest, then injects the common stamp. Per-cluster overrides still win; custom worker pins/source charts need a matching verified override. Remove a hand-set per-cluster `workers.rollTargetVersion` when using the published chart's worker pin: otherwise it becomes stale at the next pin bump and holds the roll again. ADR-1720's full stamp cannot be derived from those tags. Missing mapping holds paced rolls before cordoning; never infer it from the replacement or strip metadata. |
+| `workers.rollTargetVersion` | verified image stamp in published charts (`""` in source) | Exact verified baked version of the pinned worker image, including `+g<commit>`. Release packaging verifies each pinned template image signature and matching config at one resolved digest, then injects the common stamp. Per-cluster overrides still win; custom worker pins/source charts need a matching verified override. Remove a hand-set per-cluster `workers.rollTargetVersion` when using the published chart's worker pin: otherwise it becomes stale at the next pin bump and holds the roll again. ADR-1720's full stamp cannot be derived from those tags. Missing mapping holds ordinary paced rolls before their admission cordon; the separate migration drain below does not authorize replacement. Never infer the mapping from the replacement or strip metadata. |
 | `workers.drainDeadline` | `"24h"` | Compatible Go duration (`"1h"`, `"30m"`), with unchanged positive-only parsing; exposed as `UZI_WORKER_DRAIN_DEADLINE`. Now bounds only independent **nondrifted** pressure/nix-size maintenance, which can interrupt busy runs and delete /data unless custody-held. No elapsed timer permits busy spec-hash/generation replacement or associated recycle, even with no pacing entry/plain drain; shortening this value no longer forces image upgrades. No new knob. |
 | `workers.forceRoll` | `false` | **Global** emergency bypass of pacing, holds, incarnation proof and busy deferral for drifted workers, plus busy deferral for independent maintenance. May interrupt runs and lose all capacity; neither targeted nor a recovery guarantee. Custody-held data and independent DinD readiness/identity/pod-absence guards remain authoritative; DinD has no deadline or ForceRoll bypass. No automatic rollback. Restore `false` after the emergency. |
 | `workers.storageClass` | `""` (cluster default) | `standard` on dev-cluster. |
@@ -566,13 +566,42 @@ run blocks, including queued, paused and all waits/gates. Own pinned
 continuations/checkers may finish; unrelated new roots, unassigned children and
 judge intake are refused. An admitted busy drainer consumes pool concurrency
 (default one) without replacement coverage, canary proof or post-promotion proof and can
-hold the pool indefinitely. Unadmitted peers stay uncordoned and claimable,
-without a legacy-recycle escape; separately fenced DinD maintenance remains
+hold the pool indefinitely. Unadmitted peers normally stay uncordoned and claimable,
+except for eligible custody-held migration drains (see below), without a
+legacy-recycle escape; separately fenced DinD maintenance remains
 independent. Idle guards and custody still apply even with no assigned blockers.
 No timer automatically uncordons workers. Indefinite waits can delay capacity
 turnover and security fixes; choose global ForceRoll only as an explicit emergency
 trade-off. Unchanged retained zero-replica Deployment restore while busy keeps
 its existing guard.
+
+Custody-held old/unknown-layout Docker workers remain protected from replacement,
+including ForceRoll/recycle/maintenance. For persistent drifted workers, ordinary
+admission is planned first; then the controller may reuse `image_roll` to drain
+one eligible held worker with distinct live eligible uncordoned same-owner/lane
+coverage of its full frozen capabilities. Busy coverage is allowed; free slots
+are not required. This grants no admission, reservation, canary, roll slot or
+pod-template patch; run-bound workers are excluded. Full-poll observed held drains
+of any reason, including unrenderable targets, and selected/possibly committed
+drains block additional selection. Retained drains can delay ordinary rolls and
+remain after coverage loss. This is not a physical one-drain guarantee.
+
+No API/schema/protocol change or server-side fence is added; this controller-only
+exception reuses the existing reason and is deployment-order independent.
+Registration/restart and explicit undrained polls trigger eligible reconciliation
+without a fixed time bound. Claims can enter during registration or poll/write
+failure gaps; process-local uncertainty is lost on restart, and delayed timed-out
+cordons can commit after an undrained poll. Multiple held workers may physically
+drain. Review `blocking_reason`/health and preserve custody before an operator
+decision; no automatic discard. Custody-clear ordinary release can admit fresh
+work before later re-drain; worker-pin rollback retains custody refusal before ordinary
+release. Unknown-target multiple-drain diagnostics leave desired image/version
+empty, grant no mutation authority and may stamp the existing first
+`upgrading_since` through rolling fallback. Independent DinD, pressure and
+maintenance fences remain. Eviction, node drain and manual pod deletion are
+outside controller protection. See
+[operational limits](../docs/hosted-worker-roll-verification.md#migration-drain-policy-and-operational-limits)
+for idle terminal holds and chat continuation.
 
 Deploy the new API first, then the new singleton controller and matching chart
 RBAC, keeping `workers.image.tag` steady. Verify poll evidence and report support

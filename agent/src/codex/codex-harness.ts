@@ -551,6 +551,7 @@ export class CodexHarness implements RunHarness {
   private readonly childUsageLanes = new Map<string, Readonly<HarnessAttribution>>();
   private readonly pendingChildUsage = new Map<string, Extract<HarnessEvent, { kind: "usage_record" }>[]>();
   private closed = false;
+  private closeCompletion?: Promise<void>;
 
   // PRD #1332 C4a: the executor-claim-leg token accountant. It holds the IMMUTABLE thread->model
   // map and survives provider-epoch recreation inside this executor invocation. Each terminal emits
@@ -1048,8 +1049,17 @@ export class CodexHarness implements RunHarness {
    *  reap — that is quiesce/reap/dispose. Public so the executor's terminal cleanup can
    *  close the transport (rejecting any straggler request) after the registry reaps the
    *  provider root; the per-turn `HarnessTurn.close` seam routes here too. */
-  async close(): Promise<void> {
-    if (this.closed) return;
+  close(): Promise<void> {
+    if (this.closeCompletion) return this.closeCompletion;
+    let resolve!: () => void;
+    let reject!: (error: unknown) => void;
+    const completion = new Promise<void>((done, fail) => { resolve = done; reject = fail; });
+    this.closeCompletion = completion;
+    void this.closeOwned().then(resolve, reject);
+    return completion;
+  }
+
+  private async closeOwned(): Promise<void> {
     this.closed = true;
     this.turnClosed = true;
     this.stopRequested = true;
@@ -1057,11 +1067,16 @@ export class CodexHarness implements RunHarness {
     // than hang on that await while the transport is torn down underneath it.
     this.stopTurn?.();
     this.appServerAuth?.closeAdmissionAndCancel();
-    try {
-      await this.transport?.close();
-    } finally {
-      await this.appServerAuth?.drainInterceptedRequests();
+    let primary: unknown;
+    let failed = false;
+    try { await this.transport?.close(); }
+    catch (error) { primary = error; failed = true; }
+    try { await this.appServerAuth?.drainInterceptedRequests(); }
+    catch (error) {
+      if (failed) throw new AggregateError([primary, error], "codex harness close failed");
+      throw error;
     }
+    if (failed) throw primary;
   }
 
   /** Shared stop path for an owner abort / watchdog / requestStop / close: interrupt the
@@ -1482,20 +1497,30 @@ export class CodexHarness implements RunHarness {
         credentialValue: this.appServerAuth === undefined ? this.credentialValue : undefined,
       });
     } catch (error) {
-      // The launch aborted before producing a root: settle the reservation so it does
-      // not poison the epoch at quiesce, then re-throw the setup failure.
+      // This seam has no exact-attempt cleanup certificate. Constructor fields
+      // cannot prove that a failed native startup left no descendants.
+      this.registry.markLaunchCleanupUnconfirmed();
       this.registry.cancelReservation(reservation.reservation);
       throw error;
     }
     const admission = this.registry.registerRoot(reservation.reservation, launched.root);
     if (!admission.ok) {
-      // The registry POISONED on a kind / unknown-reservation mismatch: this root was
-      // never admitted, so model work must NOT proceed on it. Do NOT assign transport/
-      // notes; best-effort tear the just-launched root down (a poisoned epoch will not
-      // reap it), then fail closed. A close/dispose throw is swallowed — we are already
-      // failing the launch and only bound the cleanup.
-      await launched.transport.close().catch(() => {});
-      await launched.root.dispose(REGISTRY_ADMISSION_TEARDOWN_DEADLINE_MS).catch(() => {});
+      this.registry.retainRejectedRoot(reservation.reservation, launched.root);
+      const deadlineAt = Date.now() + REGISTRY_ADMISSION_TEARDOWN_DEADLINE_MS;
+      const remaining = () => Math.max(0, deadlineAt - Date.now());
+      const bounded = async (work: Promise<unknown>): Promise<void> => {
+        // Expiry revokes authority, never ownership of a started close/disposal.
+        try { await work; }
+        catch { this.registry.markLaunchCleanupUnconfirmed(); }
+        if (remaining() <= 0) this.registry.markLaunchCleanupUnconfirmed();
+      };
+      // Three attempts share one deadline; a failed channel does not skip root settlement.
+      await bounded(launched.transport.close());
+      const reaped = await this.registry.reapRoot(launched.root, remaining()).catch(() => undefined);
+      if (!reaped?.ok) this.registry.markLaunchCleanupUnconfirmed();
+      await bounded(this.registry.disposeTools(remaining()).then(outcome => {
+        if (outcome.kind !== "disposed") this.registry.markLaunchCleanupUnconfirmed();
+      }));
       throw new CodexHarnessError({ category: "protocol", message: "codex provider root failed registry admission" });
     }
     this.transport = launched.transport;
@@ -1712,7 +1737,14 @@ export class CodexHarness implements RunHarness {
         if (frame !== undefined) return frame;
         // A model-issued tool item on the root thread (issue #1800 inclusion evidence); any other
         // item update / unknown method is liveness only.
-        if (this.isModelIssuedItem(note)) return { kind: "activity", sessionId: this.threadId, modelInitiated: true };
+        if (this.isModelIssuedItem(note)) {
+          // issue #3139: native command/file/MCP items count as a lead tool call; a dynamic tool
+          // call is projected as a main-origin tool frame (non-signal only) and counted by the reducer.
+          if (this.isNativeLeadToolItem(note)) {
+            return { kind: "activity", sessionId: this.threadId, modelInitiated: true, leadToolCall: true };
+          }
+          return { kind: "activity", sessionId: this.threadId, modelInitiated: true };
+        }
         return { kind: "activity", sessionId: this.threadId };
       }
     }
@@ -2121,6 +2153,11 @@ export class CodexHarness implements RunHarness {
     if (params === undefined || params.threadId !== this.threadId) return false;
     const type = asString(asObject(params.item)?.type);
     return type === "commandExecution" || type === "fileChange" || type === "mcpToolCall" || type === "dynamicToolCall";
+  }
+
+  private isNativeLeadToolItem(note: Extract<CodexNotification, { kind: "activity" }>): boolean {
+    const type = asString(asObject(asObject(note.params)?.item)?.type);
+    return type === "commandExecution" || type === "fileChange" || type === "mcpToolCall";
   }
 
   // VERIFIED 2026-09-10: the native both-image packaged proof drove pinned Codex

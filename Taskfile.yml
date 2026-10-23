@@ -287,6 +287,9 @@ tasks:
     cmds:
       - task: lint:shell
       - task: lint:yaml
+      - task: check:uxlab-freeze
+      - task: test:uxlab-freeze
+      - task: test:uxlab-build
       - task: check:skill-triage-render
       # A web test importing an uncopied fixture passes gate:web but breaks the web image build (#2602).
       - task: test:web-docker-fixtures
@@ -300,6 +303,8 @@ tasks:
       # blocks of .github/actions/**/action.yml, the one class lint:shell and
       # lint:actions both miss. Same fail-open/REQUIRED contract, same UZI_LINT_ACTIONS_REQUIRED.
       - task: lint:actions:embedded
+      - task: test:worker-toolchain
+      - task: check:worker-toolchain
       # Hermetic fake-tool regression suite for the golangci-lint downloader and
       # build-Go guard: no network and no real release binary. It protects the
       # archive-cache trust boundary and the go/toolchain compatibility seam.
@@ -1069,8 +1074,23 @@ tasks:
       - ./scripts/sqlc.test.sh
       - ./scripts/sqlc-drift-gate.test.sh
 
+  check:uxlab-freeze:
+    desc: check root and uxlab charm-freeze pin parity
+    cmds:
+      - node ./scripts/check-uxlab-freeze.mjs
+
+  test:uxlab-freeze:
+    desc: hermetic uxlab freeze manifest parity regressions
+    cmds:
+      - node --test ./scripts/check-uxlab-freeze.test.mjs
+
+  test:uxlab-build:
+    desc: hermetic uxlab build preflight and PNG freshness contract
+    cmds:
+      - bash ./scripts/uxlab-build.test.sh
+
   test:renovate-go-toolchain:
-    desc: hermetic extraction and grouping contract for Go-toolchain Renovate updates
+    desc: hermetic Go-toolchain grouping and worker Go flake extraction contract
     cmds:
       - node ./scripts/renovate-go-toolchain.test.mjs
 
@@ -1190,7 +1210,8 @@ tasks:
       # value, every bind is a read-only --mount, and that `timeout --foreground` keeps
       # docker run/build in the script's process group so a group SIGINT exits 130
       # promptly. Prints a `cases=N passed=N` tally and fails below its case floor.
-      # Linux-only: reads each process's stat file and needs GNU timeout --foreground.
+      # Linux-only: reads each process's stat file and needs timeout --foreground
+      # plus env --default-signal, supported by GNU and uutils coreutils.
       - ./e2e/codex-git-trust/run.test.sh
 
   test:e2e-driver:
@@ -1223,6 +1244,7 @@ tasks:
   test:uzi-watcher-backups:
     desc: hermetic tests of uzi-watcher live-clone/bare-ref backups, retention, detached loop and the label-sync create retry
     cmds:
+      - python3 -B ./.agents/skills/uzi-watcher/scripts/backup-directory.test.py
       - ./.agents/skills/uzi-watcher/scripts/backup-runs.test.sh
       - ./.agents/skills/uzi-watcher/scripts/backup-loop.test.sh
       - ./.agents/skills/uzi-watcher/scripts/create-run.test.sh
@@ -1242,6 +1264,16 @@ tasks:
     desc: hermetic devbox workflow token isolation, validated lock transfer and proposal behavior
     cmds:
       - ./scripts/devbox-update.test.sh
+
+  check:worker-toolchain:
+    desc: worker package lock keys and resolved Go satisfy module go and toolchain requirements (offline)
+    cmds:
+      - python3 -B scripts/check-worker-toolchain.py
+
+  test:worker-toolchain:
+    desc: offline regression tests for worker lock drift and baked Go assertions
+    cmds:
+      - python3 -B scripts/check-worker-toolchain.test.py
 
   test:govulncheck-toolchain:
     desc: hermetic govulncheck module toolchain, host-native install, analysis environment and exit contract (fake go)
@@ -1272,6 +1304,7 @@ tasks:
       - ./.agents/skills/uzi-lander/scripts/takeover.test.sh
       - python3 -B ./.agents/skills/uzi-lander/scripts/takeover-timeout.test.py
       - ./.agents/skills/uzi-lander/scripts/takeover-mr-rework.test.sh
+      - python3 -B ./.agents/skills/uzi-lander/scripts/claims-atomic-lock.test.py
       - ./.agents/skills/uzi-lander/scripts/takeover-run-claim.test.sh
       - ./.agents/skills/uzi-lander/scripts/takeover-repo-fallback.test.sh
       - ./.agents/skills/uzi-lander/scripts/orphans.test.sh

@@ -148,11 +148,11 @@ type palette struct {
 	// The ANDON semantic colours, held as raw color.Color so a caller can compose a
 	// foreground word, a spine glyph or (for the amber band alone) a fill on the fly.
 	// stateColor/stateToken resolve a run's semantic colour from these. The board
-	// dims finished failure tokens with doneAlarm while retaining the failure signal.
+	// dims DONE-row failure and judge issues ink with doneAlarm, retaining their signals.
 	tungsten  color.Color // chrome / selection accent / eyebrows
 	amber     color.Color // andon attention: needs-you, the gate band, ⚑ ✎
-	alarm     color.Color // failed, judge "issues", high severity
-	doneAlarm color.Color // dimmed failure ink for DONE row state tokens
+	alarm     color.Color // active failures, judge severity, high severity, DONE failure count
+	doneAlarm color.Color // DONE failure state/issue ink and judge "issues" badges
 	stall     color.Color // stalled / looping / near-timeout health
 	sage      color.Color // running (deliberately dimmer — running is normal)
 	indigo    color.Color // planning
@@ -423,11 +423,18 @@ const (
 	providerRetryWord = "provider wait"
 )
 
+func tuiRejectedRun(r apitypes.RunDTO) bool {
+	return r.Status == "failed" && strOr(r.FailOrigin, "") == "base_diverged" && runpresentation.HumanStopReason(r.Status, strOr(r.StopKind, "")) == ""
+}
+
 // runStateToken gives typed provider, Codex relogin and credential holds their
 // own tokens; other runs use stateToken. Provider markers require matching status.
 func (p palette) runStateToken(r apitypes.RunDTO, isRevising bool) runToken {
 	if runpresentation.HumanStopReason(r.Status, strOr(r.StopKind, "")) != "" {
 		return p.stateToken(r.Status, r.Health, r.IsPlanning, isRevising, r.LandingState, strOr(r.StopKind, ""))
+	}
+	if tuiRejectedRun(r) {
+		return runToken{glyph: "·", word: "rejected", color: p.faintC}
 	}
 	if isProviderUnavailableHold(r) {
 		return runToken{glyph: "⊘", word: providerHoldWord, color: p.amber}

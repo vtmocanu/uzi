@@ -30,7 +30,13 @@ async function rig() {
 const applied = (status = "completed"): StateAck => ({ applied: true, status });
 
 describe("Worker heartbeat terminal sweep (issue #1512)", () => {
-  it("live G2 terminal retirement preserves guarded pending G1 finalize", async () => {
+  it("live G2 terminal retirement preserves guarded pending G1 finalize", async t => {
+    const realNow = Date.now.bind(Date);
+    let clockOffset = 0;
+    t.mock.method(Date, "now", () => realNow() + clockOffset);
+    const logger = recordingLogger();
+    const failedAttempts = (generation: number) => logger.info.filter(e =>
+      e.fields.run_id === RUN && e.fields.claim_generation === generation && e.fields.transition === "failed");
     const outbox = await rig();
     let beats = 0;
     let registrations = 0;
@@ -43,7 +49,7 @@ describe("Worker heartbeat terminal sweep (issue #1512)", () => {
       return register(...args);
     };
     const w = startSweepWorker({
-      outbox, client,
+      outbox, client, log: logger.log,
       runner: { recoveryInventoryPending: async (_runId, generation) => {
         checked.push(generation);
         return generation === 1 && g1Pending;
@@ -54,6 +60,12 @@ describe("Worker heartbeat terminal sweep (issue #1512)", () => {
       await outbox.journalFinalize(RUN, 1);
       await outbox.journalFinalize(RUN, 2);
       await outbox.journalTerminal(RUN, 2, "running", 0, { status: "completed" });
+      await pollUntil(() => !outbox.hasPendingTerminal(RUN, 2) && failedAttempts(1).length === 1 &&
+        (failedAttempts(2).length === 1 || !outbox.listPendingFinalizes().some(e => e.claim_generation === 2)),
+      3000, "terminal settled and initial finalize attempts completed");
+      // A heartbeat may attempt G2 before its terminal journal is ready. Let that cooldown
+      // expire too; advance only between polls because pollUntil uses Date.now for its deadline.
+      clockOffset += 15_000;
       await pollUntil(() => checked.includes(1) && !outbox.hasPendingTerminal(RUN, 2) &&
         !outbox.listPendingFinalizes().some(e => e.claim_generation === 2), 3000, "G2 retired");
       const seen = beats;
@@ -64,7 +76,10 @@ describe("Worker heartbeat terminal sweep (issue #1512)", () => {
         assert.equal(registrations, 1, "the worker has not re-registered");
         return beats >= seen + 5;
       }, 3000, "several heartbeats preserve guarded G1");
+      await pollUntil(() => failedAttempts(1).length === 2, 3000, "eligible retry still retains guarded G1");
       g1Pending = false;
+      // G1 has now failed twice, so its next cooldown is at most 30 seconds.
+      clockOffset += 30_000;
       await pollUntil(() => outbox.listPendingFinalizes().length === 0, 3000,
         "a live heartbeat retires G1 after its recovery inventory clears");
     } finally { await w.stop(); }

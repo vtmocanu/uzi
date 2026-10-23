@@ -13,6 +13,7 @@ import { RunRunner } from "../src/runner.js";
 import type { RunContext } from "../src/executor.js";
 import type { BoundaryPermit, BoundaryProcessRequest, CodexExecutionSafety } from "../src/harness.js";
 import { CodexBoundaryError } from "../src/codex/safety.js";
+import { codexRig } from "./runner-codex-sinks-fixture.js";
 import { GitCache } from "../src/git.js";
 import { nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
 import { defaultGitleaksShim, shimCalls, writeGitleaksShim as writeShim } from "./gitleaks-shim.js";
@@ -3285,39 +3286,55 @@ describe("mid-turn checkpoint round 3 (issue #1597 M2)", () => {
 
 /** A fake Codex facade enforcing the permit deadline (as the real one does). `inPermit()` says
  *  whether a permit is currently held. */
-function fakeCodex(): { safety: CodexExecutionSafety; inPermit: () => boolean; boundaryErrors: string[] } {
+function fakeCodex() {
+  let rig = codexRig();
+  let needsFreshEpoch = false;
   let held = false;
   const boundaryErrors: string[] = [];
   const safety: CodexExecutionSafety = {
     kind: "codex",
     withBoundary: async (req, action) => {
-      const ac = new AbortController();
-      const timer = setTimeout(() => ac.abort(new Error("boundary deadline")), req.deadlineMs);
-      held = true;
+      const deadlineAt = Math.min(Date.now() + Math.max(0, req.deadlineMs),
+        req.gracefulShutdownCheckpoint?.deadlineAt ?? Infinity);
+      const remaining = () => Math.max(0, deadlineAt - Date.now());
       try {
-        const value = await action({ epoch: 1, boundary: req.boundary, signal: ac.signal } as unknown as BoundaryPermit);
-        if (ac.signal.aborted) {
-          boundaryErrors.push(req.boundary);
-          throw new CodexBoundaryError("action", [{ category: "timeout", message: "late" }]);
+        // MODELED fresh-epoch continuation: these publication/cadence unit stubs have no
+        // live provider. Real fresh-provider/session tests elsewhere supply lifecycle proof.
+        // Defer replacement until normal activity, including after an accepted pause.
+        if (needsFreshEpoch) {
+          const oldRig = rig;
+          const disposal = await oldRig.safety.dispose({ boundary: "terminal", deadlineMs: remaining() });
+          assert.equal(disposal.kind, "disposed", "fresh epoch requires completed old-rig cleanup");
+          assert.ok(remaining() > 0, "old-rig cleanup must fit the original normal-boundary budget");
+          rig = codexRig();
+          needsFreshEpoch = false;
         }
-        return value;
-      } finally {
-        held = false;
-        clearTimeout(timer);
+        return await rig.safety.withBoundary({ ...req, deadlineMs: remaining() }, async permit => {
+          held = true;
+          try { return await action(permit); }
+          finally { held = false; }
+        });
+      } catch (error) {
+        if (error instanceof CodexBoundaryError) boundaryErrors.push(req.boundary);
+        throw error;
       }
     },
-    spawnBoundaryProcess: async (_permit, request) => {
-      const [command, ...args] = request.argv;
-      const child = spawn(command!, args, { cwd: request.cwd, env: request.env, stdio: ["pipe", "pipe", "pipe"] });
-      const completed = new Promise<{ code: number }>((resolve, reject) => {
-        child.once("error", reject);
-        child.once("exit", (code, sig) => resolve({ code: code ?? (sig ? 128 : 1) }));
-      });
-      return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, cancel: async () => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); await completed; }, completed };
-    },
-    dispose: async () => ({ kind: "disposed" }),
+    spawnBoundaryProcess: (permit, request) => rig.safety.spawnBoundaryProcess(permit, request),
+    dispose: req => rig.safety.dispose(req),
   };
-  return { safety, inPermit: () => held, boundaryErrors };
+  const capture: typeof rig.capture = async (deadlineMs, action, purpose, signal, attempt) => {
+    // Keep the real capture owner through completion; incomplete/error results cannot
+    // authorize replacing its poisoned registry, and settlement alone cannot do so either.
+    const captureRig = rig;
+    const result = await captureRig.capture(deadlineMs, action, purpose, signal, attempt);
+    if (result.kind === "observed_empty") needsFreshEpoch = true;
+    return result;
+  };
+  return {
+    safety, inPermit: () => held, boundaryErrors,
+    withCredentialFreeCapture: capture,
+    settleForCredentialFreeCapture: (deadlineMs: number) => rig.settle(deadlineMs),
+  };
 }
 
 describe("mid-turn checkpoint round 4 (issue #1597 M2)", () => {
@@ -3348,6 +3365,8 @@ describe("mid-turn checkpoint round 4 (issue #1597 M2)", () => {
               return { branch: ctx.branch };
             },
             safety: codex.safety,
+            withCredentialFreeCapture: codex.withCredentialFreeCapture,
+            settleForCredentialFreeCapture: codex.settleForCredentialFreeCapture,
           },
         }),
         ctl,
@@ -3513,6 +3532,8 @@ describe("mid-turn checkpoint round 4 (issue #1597 M2)", () => {
               return { branch: ctx.branch };
             },
             safety: codex.safety,
+            withCredentialFreeCapture: codex.withCredentialFreeCapture,
+            settleForCredentialFreeCapture: codex.settleForCredentialFreeCapture,
           },
         }),
         undefined,
@@ -3569,6 +3590,8 @@ describe("mid-turn checkpoint round 4: deferred publish vs shutdown (issue #1597
               throw new Error("aborted mid-turn");
             },
             safety,
+            withCredentialFreeCapture: codex.withCredentialFreeCapture,
+            settleForCredentialFreeCapture: codex.settleForCredentialFreeCapture,
           },
         }),
         undefined,
@@ -3649,6 +3672,8 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
             return { branch: ctx.branch };
           },
           safety: codex.safety,
+          withCredentialFreeCapture: codex.withCredentialFreeCapture,
+          settleForCredentialFreeCapture: codex.settleForCredentialFreeCapture,
         },
       }), ctl).execute(claim);
       assert.equal(finalStatus(claim.run_id), "completed", JSON.stringify(turnErrors.map(String)));
@@ -3689,6 +3714,8 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
             return { branch: ctx.branch };
           },
           safety: codex.safety,
+          withCredentialFreeCapture: codex.withCredentialFreeCapture,
+          settleForCredentialFreeCapture: codex.settleForCredentialFreeCapture,
         },
       }), undefined, { checkpointTickIntervalMs: 0 }).execute(claim);
       assert.equal(finalStatus(claim.run_id), "completed");
@@ -3750,6 +3777,8 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
               return { branch: ctx.branch };
             },
             safety: codex.safety,
+            withCredentialFreeCapture: codex.withCredentialFreeCapture,
+            settleForCredentialFreeCapture: codex.settleForCredentialFreeCapture,
           },
         }), ctl);
         await runner.execute(claim);
@@ -4005,6 +4034,8 @@ describe("mid-turn checkpoint round 4: gate_busy quick retry (issue #1597 M2)", 
               return { branch: ctx.branch };
             },
             safety: codex.safety,
+            withCredentialFreeCapture: codex.withCredentialFreeCapture,
+            settleForCredentialFreeCapture: codex.settleForCredentialFreeCapture,
           },
         }),
         ctl,

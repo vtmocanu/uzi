@@ -6,6 +6,8 @@ import path from "node:path";
 import { nullLogger, recordingLogger } from "./helpers.js";
 import {
   buildProvisionEnv,
+  prepareSupervisedProvision,
+  assertSupervisedProvisionRequest,
   filterShellenv,
   provisionTools,
   PROVISION_ENV_ALLOWLIST,
@@ -321,5 +323,53 @@ describe("provisionTools", () => {
     );
     assert.strictEqual(installCalls, 1);
     assert.deepStrictEqual(delays, []);
+  });
+});
+
+describe("fixed devbox request provenance", () => {
+  it("snapshots canonical args, worker-selected cwd and scrubbed shared environment", () => {
+    const input = { runDir: "/data/provision/run", homeDir: "/data/provision/home" };
+    const source = { PATH: "/usr/bin:/bin", SSL_CERT_FILE: "/cert", TMPDIR: "/tmp" };
+    const env = buildProvisionEnv(source, input.homeDir);
+    const args = ["shellenv", "--no-refresh-alias"];
+    const controller = new AbortController();
+    const req = prepareSupervisedProvision("devbox", args, { cwd: input.runDir, env }, input, source, controller.signal, () => {});
+    args[0] = "arbitrary";
+    env.HOME = "/elsewhere";
+    source.SSL_CERT_FILE = "/changed";
+    input.runDir = "/changed";
+    assertSupervisedProvisionRequest(req);
+    assert.deepEqual(req.args, ["devbox", "shellenv", "--no-refresh-alias"]);
+    assert.equal(req.cwd, "/data/provision/run");
+    assert.equal(req.env.HOME, "/data/provision/home");
+    assert.equal(req.env.SSL_CERT_FILE, "/cert");
+    assert.ok(Object.isFrozen(req) && Object.isFrozen(req.args) && Object.isFrozen(req.env));
+    controller.abort();
+    assert.throws(() => assertSupervisedProvisionRequest(req));
+  });
+
+  it("screens adversarial command, argv, cwd and env strings without executing them", () => {
+    const input = { runDir: "/data/provision/run", homeDir: "/data/provision/home" };
+    const source = { PATH: "/usr/bin:/bin" };
+    const env = buildProvisionEnv(source, input.homeDir);
+    const signal = new AbortController().signal;
+    for (const [command, args] of [["sh", ["-c", "echo forbidden"]], ["devbox", ["install", "; echo forbidden"]], ["devbox", ["shellenv"]], ["devbox", ["run", "arbitrary"]]] as const) {
+      assert.throws(() => prepareSupervisedProvision(command, args, { cwd: input.runDir, env }, input, source, signal, () => {}), /not canonical/);
+    }
+    for (const badEnv of [{ ...env, NODE_OPTIONS: "--require=arbitrary" }, { ...env, HOME: "/forged" }, { ...env, PATH: "/forged" }, { ...env, SSL_CERT_FILE: "/forged" }]) {
+      assert.throws(() => prepareSupervisedProvision("devbox", ["install"], { cwd: input.runDir, env: badEnv }, input, source, signal, () => {}), /not canonical/);
+    }
+    assert.throws(() => prepareSupervisedProvision("devbox", ["install"], { cwd: "/forged", env }, input, source, signal, () => {}), /not canonical/);
+    const invalidSource = { ...source, SSL_CERT_FILE: "/cert\u0000suffix" };
+    assert.throws(() => prepareSupervisedProvision("devbox", ["install"], {
+      cwd: input.runDir, env: buildProvisionEnv(invalidSource, input.homeDir),
+    }, input, invalidSource, signal, () => {}), /not canonical/);
+    const controller = new AbortController();
+    assert.throws(() => prepareSupervisedProvision("devbox", ["install"], {
+      cwd: input.runDir, env,
+    }, input, source, controller.signal, () => { controller.abort(); }));
+    assert.throws(() => prepareSupervisedProvision("devbox", ["install"], {
+      cwd: input.runDir, env,
+    }, input, source, signal, async () => {}), /guard must be synchronous/);
   });
 });

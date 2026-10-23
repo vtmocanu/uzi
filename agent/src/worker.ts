@@ -49,6 +49,7 @@ const SETTLEMENT_SWEEP_MS = 5 * 60_000;
 // and exact key until settlement. Rejections are handled by both tracking and the bounded waiter.
 const finalizeAuthorities = new Map<string, Promise<unknown>>();
 type FinalizeCandidate = { entry: PendingFinalize; identity: Readonly<object> };
+type FinalizeRetry = { entry: PendingFinalize; identity: Readonly<object>; logId: number; failures: number; nextEligible: number };
 const finalizeKey = (entry: PendingFinalize): string => `${entry.run_id}:${entry.claim_generation}`;
 
 /** Bound a wait without granting authority to a late result. Always remove the abort listener. */
@@ -197,7 +198,17 @@ export class Worker {
   private readonly acceptedFinalizes = new Map<string, Readonly<object>>();
   private finalizeRegistrationAccepted = false;
   private finalizeAttemptSequence = 0;
-  private readonly finalizeAttempts = new Map<string, number>();
+  private readonly finalizeAttempts = new Map<string, { identity: Readonly<object>; sequence: number }>();
+  private readonly finalizeRetries = new Map<string, FinalizeRetry>();
+  private finalizeRecordSequence = 0;
+
+  private logFinalizeRetry(entry: PendingFinalize, state: FinalizeRetry, transition: string): void {
+    this.log.info("outbox: finalize retry state changed", {
+      run_id: entry.run_id, claim_generation: entry.claim_generation,
+      record_identity: state.logId, attempt_count: state.failures,
+      next_eligible_time: state.nextEligible, transition,
+    });
+  }
 
   /** Independent heartbeat retry: at most 16 checks/deletions, five seconds per pass and one
    * second per candidate (authority and queued deletion). A failed candidate never blocks its siblings. Enumeration is
@@ -220,19 +231,37 @@ export class Worker {
     signal?.addEventListener("abort", abort, { once: true });
     const timer = setTimeout(() => pass.abort(new Error("finalize pass deadline")), passMs);
     try {
+      // Hidden terminal records and records outside a frozen registration batch still own
+      // their history. Only disappearance or a different authenticated identity resets it.
+      const present = new Map(outbox.listPendingFinalizeGenerations(true).flatMap(entry => {
+        const identity = outbox.finalizeRecordIdentity(entry.run_id, entry.claim_generation);
+        return identity ? [[finalizeKey(entry), { entry, identity }] as const] : [];
+      }));
+      for (const [key, attempt] of this.finalizeAttempts) {
+        if (present.get(key)?.identity !== attempt.identity) this.finalizeAttempts.delete(key);
+      }
+      for (const [key, state] of this.finalizeRetries) {
+        if (present.get(key)?.identity !== state.identity) {
+          this.logFinalizeRetry(state.entry, state,
+            present.has(key) ? "replaced" : "removed");
+          this.finalizeRetries.delete(key);
+        }
+      }
       const candidates = frozen ?? this.captureFinalizes();
       const entries = candidates.map(candidate => candidate.entry);
       const identities = new Map(candidates.map(candidate => [finalizeKey(candidate.entry), candidate.identity]));
-      const present = new Set(entries.map(finalizeKey));
-      for (const key of this.finalizeAttempts.keys()) {
-        if (!present.has(key)) this.finalizeAttempts.delete(key);
-      }
       entries.sort((a, b) =>
-        (this.finalizeAttempts.get(finalizeKey(a)) ?? 0) - (this.finalizeAttempts.get(finalizeKey(b)) ?? 0) ||
+        (this.finalizeAttempts.get(finalizeKey(a))?.sequence ?? 0) - (this.finalizeAttempts.get(finalizeKey(b))?.sequence ?? 0) ||
         (a.run_id < b.run_id ? -1 : a.run_id > b.run_id ? 1 : 0) ||
         a.claim_generation - b.claim_generation);
       const tasks: Promise<void>[] = [];
       for (const entry of entries) {
+        const key = finalizeKey(entry);
+        const identity = identities.get(key)!;
+        if (present.get(key)?.identity !== identity) continue;
+        const retry = this.finalizeRetries.get(key);
+        // Cooling candidates consume no attempt, authority slot, or predicate query.
+        if (retry && Date.now() < retry.nextEligible) continue;
         if (tasks.length >= 16) {
           if (!registrationLower) break;
           await Promise.all(tasks);
@@ -240,13 +269,19 @@ export class Worker {
         }
         if (finalizeAuthorities.size >= 16 || pass.signal.aborted ||
             Date.now() >= deadline) break;
-        const key = finalizeKey(entry);
         if (finalizeAuthorities.has(key)) continue;
         try {
           if (this.isFinalizeRunLive(entry.run_id)) continue;
-          this.finalizeAttempts.set(key, ++this.finalizeAttemptSequence);
-          tasks.push(this.retryPendingFinalize(outbox, entry, key, identities.get(key)!, pass.signal, deadline,
-            registrationLower?.has(identities.get(key)!) ?? false));
+          // A registration wave may outlive this identity; stale candidates own no retry or fairness state.
+          if (outbox.finalizeRecordIdentity(entry.run_id, entry.claim_generation) !== identity) continue;
+          this.finalizeAttempts.set(key, { identity, sequence: ++this.finalizeAttemptSequence });
+          const state = retry ?? { entry, identity, logId: ++this.finalizeRecordSequence, failures: 0, nextEligible: 0 };
+          if (!retry) {
+            this.finalizeRetries.set(key, state);
+            this.logFinalizeRetry(entry, state, "created");
+          }
+          tasks.push(this.retryPendingFinalize(outbox, entry, key, identity, pass.signal, deadline,
+            state, signal, registrationLower?.has(identity) ?? false));
         } catch (err) {
           this.log.warn("outbox: finalize candidate retained after live fence error", {
             run_id: entry.run_id, claim_generation: entry.claim_generation, error: errMessage(err),
@@ -277,9 +312,12 @@ export class Worker {
       });
   }
 
-  private async hasFinalizeAuthority(entry: PendingFinalize, identity: Readonly<object>, registrationLower: boolean): Promise<boolean> {
+  private async hasFinalizeAuthority(entry: PendingFinalize, identity: Readonly<object>, registrationLower: boolean,
+    step: (operation: string) => void): Promise<boolean> {
+    step("recovery-inventory pending");
     if (await this.runner.recoveryInventoryPending(entry.run_id, entry.claim_generation) !== false) return false;
     if (registrationLower || this.acceptedFinalizes.get(finalizeKey(entry)) === identity) return true;
+    step("ownership lookup");
     const ownership: unknown = await this.client.getRunOwnership(entry.run_id);
     if (!ownership || typeof ownership !== "object") return false;
     const proof = ownership as { status?: unknown; claim_generation?: unknown; inventory_guarded?: unknown };
@@ -291,15 +329,30 @@ export class Worker {
 
   private async retryPendingFinalize(
     outbox: Outbox, entry: PendingFinalize, key: string, identity: Readonly<object>, signal: AbortSignal, deadline: number,
-    registrationLower = false,
+    state: FinalizeRetry, shutdownSignal?: AbortSignal, registrationLower = false,
   ): Promise<void> {
-    const incarnation = this.client.capturePublicationCompletionRetirement?.();
     const authorityWait = new AbortController();
     const abort = () => authorityWait.abort(signal.reason);
     signal.addEventListener("abort", abort, { once: true });
-    const timer = setTimeout(() => authorityWait.abort(new Error("finalize authority deadline")),
-      reportProofTiming.finalizeAuthorityMs());
+    const attemptStarted = Date.now();
+    let operation = "completion-retirement capture";
+    let stepStarted = attemptStarted;
+    const step = (next: string) => { operation = next; stepStarted = Date.now(); };
+    let authorityDeadline: Readonly<{
+      authority_step: string; authority_step_elapsed_ms: number; authority_attempt_elapsed_ms: number;
+    }> | undefined;
+    const timer = setTimeout(() => {
+      if (authorityWait.signal.aborted) return;
+      // Snapshot before abort: late progress in the quarantined authority cannot rewrite expiry.
+      const expired = Date.now();
+      authorityDeadline = Object.freeze({
+        authority_step: operation, authority_step_elapsed_ms: expired - stepStarted,
+        authority_attempt_elapsed_ms: expired - attemptStarted,
+      });
+      authorityWait.abort(new Error("finalize authority deadline"));
+    }, reportProofTiming.finalizeAuthorityMs());
     try {
+      const incarnation = this.client.capturePublicationCompletionRetirement?.();
       // Install quarantine before invoking the predicate, including synchronously throwing doubles.
       const authority = Promise.resolve().then(async () => {
         const reportEligible = () => !signal.aborted && !authorityWait.signal.aborted && Date.now() < deadline &&
@@ -307,28 +360,34 @@ export class Worker {
         const retireWithExistingAuthority = async (): Promise<boolean> => {
           if (outbox.finalizeRecordIdentity(entry.run_id, entry.claim_generation) !== identity ||
               !reportEligible()) return false;
-          if (await this.hasFinalizeAuthority(entry, identity, registrationLower) !== true) return false;
+          if (await this.hasFinalizeAuthority(entry, identity, registrationLower, step) !== true) return false;
           const eligible = () => reportEligible() && !this.isFinalizeRunLive(entry.run_id);
           if (!eligible()) return false;
+          step("queued conditional deletion");
           const retired = await outbox.retireFinalizeIfEligible(
             entry.run_id, entry.claim_generation, eligible, authorityWait.signal, identity);
-          if (retired === true && incarnation && eligible())
+          if (retired === true && incarnation && eligible()) {
+            step("completion notification");
             await this.runner.notifyPublicationCompletionRetired(entry.run_id, entry.claim_generation, incarnation);
+          }
           return retired;
         };
         // Prefer the existing exact covering ACK clause before spending its deadline
         // on an archive-only proof. Ownership, identity and live fences still apply.
         if (typeof this.runner.recoveryFinalAcknowledged === "function" && reportEligible() &&
-            await this.runner.recoveryFinalAcknowledged(entry.run_id, entry.claim_generation) === true &&
+            (step("final-ACK check"), await this.runner.recoveryFinalAcknowledged(entry.run_id, entry.claim_generation)) === true &&
             await retireWithExistingAuthority()) return true;
         if (typeof this.runner.retireRecoveryReport === "function" && reportEligible()) {
+          step("recovery-report retirement");
           const retired = await this.runner.retireRecoveryReport(entry.run_id, entry.claim_generation, {
             expectedIdentity: identity, signal: authorityWait.signal, deadline, eligible: reportEligible,
           }, "finalize", outbox);
           if (retired.retired) {
             if (retired.authority === "acknowledged_final_report_only") return true;
-            if (incarnation && reportEligible() && !this.isFinalizeRunLive(entry.run_id)) await this.runner.notifyPublicationCompletionRetired(
-              entry.run_id, entry.claim_generation, incarnation);
+            if (incarnation && reportEligible() && !this.isFinalizeRunLive(entry.run_id)) {
+              step("completion notification");
+              await this.runner.notifyPublicationCompletionRetired(entry.run_id, entry.claim_generation, incarnation);
+            }
             return true;
           }
         }
@@ -339,14 +398,33 @@ export class Worker {
         if (finalizeAuthorities.get(key) === authority) finalizeAuthorities.delete(key);
       };
       void authority.then(settled, settled);
-      await waitForFinalize(authority, authorityWait.signal);
+      const retired = await waitForFinalize(authority, authorityWait.signal);
+      if (retired === true) {
+        if (this.finalizeRetries.get(key) === state) {
+          this.finalizeRetries.delete(key);
+          this.finalizeAttempts.delete(key);
+          this.logFinalizeRetry(entry, state, "retired");
+        }
+        return;
+      }
     } catch (err) {
       this.log.warn("outbox: finalize retry retained a generation", {
         run_id: entry.run_id, claim_generation: entry.claim_generation, error: errMessage(err),
+        ...authorityDeadline,
       });
     } finally {
       clearTimeout(timer);
       signal.removeEventListener("abort", abort);
+    }
+    // Only the bounded waiter records failure. The quarantined promise's late settlement
+    // cannot count twice or restore state for an identity removed/replaced in the meantime.
+    if (!shutdownSignal?.aborted && this.finalizeRetries.get(key) === state &&
+        outbox.finalizeRecordIdentity(entry.run_id, entry.claim_generation) === identity) {
+      state.failures++;
+      // Cap the exponent before arithmetic, then the base before downward uniform jitter.
+      const base = Math.min(15_000 * 2 ** Math.min(state.failures - 1, 6), 600_000);
+      state.nextEligible = Date.now() + base * (0.8 + 0.2 * Math.random());
+      this.logFinalizeRetry(entry, state, "failed");
     }
   }
 

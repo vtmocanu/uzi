@@ -114,7 +114,7 @@ for (const [index, kind] of ["recovery", "credential deferral", "disk", "provide
     // Keep the view active across the runner's catch/finally, not only the executor.
     const view = scopedRealView();
     const runner = runnerWith(() => ({
-      executor: kind === "credential deferral" ? new FakeCodexExecutor(rig.safety, behavior, rig.settle) : { run: behavior },
+      executor: kind === "credential deferral" ? new FakeCodexExecutor(rig.safety, behavior, undefined, rig.capture) : { run: behavior },
     }), gitlab, undefined, logger, { recoveryRetryMs: 1 });
     const readEnviron = procfsTable.readEnviron;
     procfsTable.readEnviron = (pid) => {

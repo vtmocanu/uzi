@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# plan-gate-fixture.sh — capture the run-plan-gate shot deterministically by driving a
+# plan-gate-fixture.sh: capture the run-plan-gate shot deterministically by driving a
 # throwaway uzi run to the plan-approval gate, shooting it, then cleaning up. Uses a
 # PERMANENT, labelled fixture issue kept CLOSED (so sweeps ignore it): reopen -> run to
-# the gate -> capture both themes -> cancel the run -> close the issue. A trap runs the
-# cleanup even on failure, so nothing is left active. It never approves the plan, so no
-# branch/MR is created. Spends one small (~1-3 min) billed planning run.
+# the gate -> capture both themes -> cancel the run -> close the issue. Gate-only
+# capture is the default; --approve also captures in-progress milestones and bills
+# approved execution. Cleanup is attempted on exit, including failure. Both modes
+# start a billed planning run.
 #
-# Usage: plan-gate-fixture.sh --repo <uzi-repo-id> [--gh-repo vtmocanu/uzi] [--stage <dir>] [--url <url>]
+# Usage: plan-gate-fixture.sh --repo <uzi-repo-id> [--gh-repo vtmocanu/uzi] [--stage <dir>] [--url <url>] [--approve] [--ms-wait <seconds>]
 set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -29,8 +30,8 @@ LABEL="screenshot-fixture"
 
 # Serialize: this fixture reuses one shared issue, and cleanup() removes ALL
 # agent/issue-$IID PRs plus the branch, so two overlapping runs would delete each
-# other's resources. Guard with an atomic mkdir lock (portable; flock is absent on
-# macOS), released by the cleanup trap (and by an early trap until that one is set).
+# other's resources. The supported macOS setup uses an exclusive BSD mkdir.
+# Cleanup traps release the lock, including an early trap until cleanup() is set.
 LOCKDIR="${TMPDIR:-/tmp}/uzi-plan-gate-fixture.$(printf '%s' "$GHREPO" | tr '/:' '__').lock"
 mkdir "$LOCKDIR" 2>/dev/null || { echo "another plan-gate-fixture run holds $LOCKDIR (remove it if stale)" >&2; exit 6; }
 trap 'rmdir "$LOCKDIR" 2>/dev/null || true' EXIT

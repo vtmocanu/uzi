@@ -32,8 +32,9 @@
 // input (#3148). The proof HARNESS, tests and documentation are EVIDENCE — agent/test/, e2e/, prds/,
 // docs/, adr/, specs/, .claude/, Taskfile.yml, *.md outside api/, any Go `*_test.go` outside agent/
 // (never compiled into a shipped or test-server binary) — and so are deploy/ (the Helm chart) and
-// scripts/ (repo tooling), which neither the image nor the proof builds or runs; they reach the
-// image only as the inert `COPY . /opt/uzi-src` source copy. The deny lists (agent/ minus agent/test/, then api/ minus Go tests) are
+// scripts/ (repo tooling), except scripts/check-worker-toolchain.py and scripts/sqlc.sh, which the
+// worker Dockerfiles COPY and execute during image construction. Other scripts reach the image
+// only as the inert `COPY . /opt/uzi-src` source copy. The deny lists are
 // checked FIRST so a runtime path can never be mis-shelved into the allow list; an unrecognized path
 // is `unclassified` and rejects (fail closed — a new top-level path must be classified deliberately).
 // receipts.test.ts PINS these lists to the real Dockerfile COPY set and the M3b test-server build
@@ -187,6 +188,7 @@ export function parseManifest(raw: unknown): { manifest: CandidateManifest } | {
 export type PathClass = "evidence" | "runtime" | "unclassified";
 
 export function classifyPath(p: string): PathClass {
+  if (p === "scripts/check-worker-toolchain.py" || p === "scripts/sqlc.sh") return "runtime";
   if (p.startsWith("agent/") && !p.startsWith("agent/test/")) return "runtime";
   if (p.startsWith("api/") && !p.endsWith("_test.go")) return "runtime";
   if (

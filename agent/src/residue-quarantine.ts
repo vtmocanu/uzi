@@ -155,7 +155,7 @@ export function assertResidueQuarantineOpen(site: ResidueQuarantineRefusalSite):
 /** True when a git child's env carries the forge credential: any `GIT_CONFIG_VALUE_n` that is a
  *  Basic Authorization header (gitEnv's PAT pair). Keyed on the env, not on the spawn identity,
  *  which defaults to `worker_pat` for PAT-less git too. */
-function carriesForgeCredential(childEnv: NodeJS.ProcessEnv): boolean {
+export function carriesForgeCredential(childEnv: NodeJS.ProcessEnv): boolean {
   return Object.entries(childEnv).some(
     ([k, v]) => k.startsWith("GIT_CONFIG_VALUE_") && typeof v === "string" && v.startsWith("Authorization: Basic"),
   );

@@ -2425,7 +2425,8 @@ promoted. Registration keeps its 64-byte display limit; altered/truncated
 versions withhold the incarnation binding. Missing mapping or evidence holds
 rather than falling back to unpaced replacement.
 
-Only admitted image turns receive a roll-owned cordon over the authenticated
+Admitted image turns and eligible custody-held layout migrations receive an
+`image_roll` cordon over the authenticated
 `POST /api/controller/workers/{id}/drain` control-write channel. The API's
 `draining_since` and reason remain separate from heartbeat-derived status.
 Under #3103, actual spec-hash/generation drift (image pin, template or size) and
@@ -2436,8 +2437,10 @@ API assignments are authoritative, not worker `reported_runs`. Own pinned
 continuations/checkers may finish; unrelated new roots, unassigned children and
 judge intake are refused. An admitted busy drainer consumes concurrency (default
 one), supplies no replacement coverage, canary proof or post-promotion proof, and can
-hold its pool indefinitely. Unadmitted healthy peers stay uncordoned and claimable,
-without a legacy-recycle escape; separately fenced DinD remains independent.
+hold its pool indefinitely. Unadmitted healthy peers normally stay uncordoned
+and claimable; eligible custody-held layout migration drains are the exception,
+without replacement admission or a legacy-recycle escape. Separately fenced
+DinD remains independent.
 Idle guards and custody still apply, even with no assigned blockers. Restoring
 an unchanged retained zero-replica Deployment while busy keeps its existing guard.
 
@@ -2514,7 +2517,23 @@ plain lane. DinD never uses ForceRoll or the drain deadline. Simultaneous pressu
 runs legacy first, DinD on a later tick; legacy busy deadlines now apply only to
 independent nondrifted maintenance, while global ForceRoll retains custody guards.
 A custody-held Docker worker whose pod still has the old layout (an emptyDir at
-`/data/runner`) is held on it, ForceRoll included, until custody releases; a
+`/data/runner`) is held on it, ForceRoll included, until custody releases. Persistent drifted workers
+may receive a migration drain after ordinary admission planning, using the
+existing `image_roll` reason, with a distinct live eligible uncordoned sibling
+in the same owner/lane individually covering the frozen full capability set
+(busy is allowed; free slots are not required). Run-bound workers are excluded
+from this drain selection. Observed drains of any reason in the full held
+inventory, selected drains and possibly committed drains occupy its budget,
+including unrenderable workers. A retained drain supplies no intake coverage
+and can delay later ordinary rolls; it remains if its covering sibling is lost.
+Selection is level-triggered after registration/restart or an explicit undrained
+poll, with no fixed time bound. Failed writes retain process-local uncertainty
+until poll evidence resolves it; restart loses that uncertainty. This is a
+controller selection limit, not a physical one-drain guarantee: a timed-out POST
+can commit after an undrained poll. No server-side fence, schema, protocol or
+API product change is added. Held outcomes and health expose the operator
+decision; no automatic discard is authorized. See the
+[migration drain operational limits](docs/hosted-worker-roll-verification.md#migration-drain-policy-and-operational-limits). A
 `runner-init` init container refuses a worker image without the
 `runner-shared-v1` layout marker. Kubelet eviction, node drain and manual pod
 deletion are not guarded. See

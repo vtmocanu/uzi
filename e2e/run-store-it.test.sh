@@ -203,7 +203,22 @@ case " $* " in
     esac
     printf 'ok\t%s\t0.01s\n' "$root"
     exit 0 ;;
-  *" ^TestCodexRefreshLostReplyE2E$ "*) name=TestCodexRefreshLostReplyE2E ;;
+  *" ^TestCodex(RefreshLostReply|RetainedStop)E2E$ "*)
+    if [ "$SCENARIO" = retained-go-fail ]; then echo "retained process failed"; exit 9; fi
+    for name in TestCodexRefreshLostReplyE2E TestCodexRetainedStopE2E; do
+      if [ "$name" != TestCodexRetainedStopE2E ] || [ "$SCENARIO" != retained-missing-run ]; then
+        echo "=== RUN   $name"
+      fi
+      if [ "$name" != TestCodexRetainedStopE2E ] || [ "$SCENARIO" != retained-missing-pass ]; then
+        echo "--- PASS: $name (0.01s)"
+      fi
+    done
+    case "$SCENARIO" in
+      retained-top-skip) echo "--- SKIP: TestCodexRetainedStopE2E (0.01s)" ;;
+      retained-sub-skip) echo "    --- SKIP: TestCodexRetainedStopE2E/child (0.01s)" ;;
+    esac
+    printf 'ok\t%s\t0.01s\n' "$root"
+    exit 0 ;;
 esac
 if [ "$SCENARIO" = go-fail ] && [ "$pkg" = ./internal/forgesvc/... ]; then
   echo "simulated Go failure" >&2
@@ -236,7 +251,7 @@ assert_case() {
 
 # Explicit expected order, independent of the runner's PKGS array.
 expected_pkgs=(store handler forgesvc schedsvc workersvc recovery poller)
-for scenario in success optional go-fail no-tests missing-ok top-skip sub-skip; do
+for scenario in success optional retained-missing-run retained-missing-pass retained-top-skip retained-sub-skip retained-go-fail go-fail no-tests missing-ok top-skip sub-skip; do
   case_dir="$TMP/$scenario"
   mkdir -p "$case_dir"
   optional=""
@@ -261,9 +276,9 @@ for scenario in success optional go-fail no-tests missing-ok top-skip sub-skip; 
       "$dsn" "$limit" "$pkg" >> "$case_dir/expected"
     if [ "$scenario" = go-fail ] && [ "$pkg" = forgesvc ]; then break; fi
   done
-  if [ "$scenario" = optional ]; then
+  if [ "$scenario" = optional ] || [[ "$scenario" = retained-* ]]; then
     # The optional leg retains its own selector and Go's default timeout policy.
-    printf '%s\ttest\t-buildvcs=false\t-count=1\t-v\t-race\t-p\t1\t-run\t^TestCodexRefreshLostReplyE2E$\t./internal/handler/...\n' \
+    printf '%s\ttest\t-buildvcs=false\t-count=1\t-v\t-race\t-p\t1\t-run\t^TestCodex(RefreshLostReply|RetainedStop)E2E$\t./internal/handler/...\n' \
       "$dsn" >> "$case_dir/expected"
   fi
   assert_case "ordered calls, exact flags, timeout reset and shared DSN" \
@@ -291,6 +306,13 @@ for scenario in success optional go-fail no-tests missing-ok top-skip sub-skip; 
         test "$(grep -cF 'Store integration tests passed.' "$case_dir/output" || true)" -eq 0
       # Exact go.log comparison above also proves no optional call after failure.
       case "$scenario" in
+        retained-go-fail)
+          assert_case "optional Go failure survives tee" test "$rc" -eq 9
+          ;;
+        retained-missing-run|retained-missing-pass|retained-top-skip|retained-sub-skip)
+          assert_case "retained proof guard reports missing evidence or skip" \
+            grep -qE 'combined Codex proof (skipped|did not run and pass)' "$case_dir/output"
+          ;;
         go-fail)
           assert_case "Go's nonzero exit survives tee" test "$rc" -eq 7
           assert_case "aggregate log retains early output and failing stderr" \

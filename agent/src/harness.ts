@@ -1,8 +1,8 @@
 // Neutral harness contract (PRD #1146 / #1106 M2, milestone m1).
 //
 // The provider-neutral type surface the run lane is being extracted behind. It
-// has NO provider SDK import — only type-only imports from the two uzi domain
-// modules that already own these shapes (`executor.ts`, `protocol.ts`). The
+// has NO provider SDK import. Domain shapes stay type-only; the shared local
+// refusal vocabulary imports only trusted worker errors. The
 // Claude adapter (`claude-harness.ts`) and the pure reducer (`harness-reducer.ts`)
 // speak these types; `sdk-executor.ts` remains the workflow owner that drives
 // them. See `e2e/codex-m0/harness-contract.md` §Contracts for the accepted design
@@ -11,6 +11,7 @@
 // zero-unused-export gate stays green).
 
 import type { Readable, Writable } from "node:stream";
+import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import type { CodeCrossCheckToolAccess } from "./code-cross-check-tools.js";
 import type { EmittedMessage } from "./executor.js";
 import type { PrSummaryClaim } from "./signals.js";
@@ -21,6 +22,34 @@ import type {
   MilestoneProgress,
   Proposal,
 } from "./protocol.js";
+
+// Process-local capture provenance. Only safety.captureOperation records it;
+// consumers cannot reconstruct it from error text, copied fields or JSON.
+const captureFailures = new WeakMap<object, Readonly<{
+  deadlineExpired: boolean; childCleanupFailed: boolean; externallyAborted: boolean; actionRevoked?: true;
+}>>();
+
+export function recordCaptureFailure(error: object, failure: {
+  deadlineExpired: boolean; childCleanupFailed: boolean; externallyAborted: boolean; actionRevoked?: true;
+}): void {
+  captureFailures.set(error, Object.freeze({ ...failure }));
+}
+
+export function captureFailureOf(error: unknown) {
+  return error !== null && typeof error === "object" ? captureFailures.get(error) : undefined;
+}
+
+/** Local identity of the epoch whose cleanup could not be proven. */
+export class EpochCleanupUnprovenError extends TrustedExecutionRefusal {
+  readonly #safety: CodexExecutionSafety;
+
+  constructor(safety: CodexExecutionSafety) {
+    super("prior Codex epoch cleanup unproven");
+    this.#safety = safety;
+  }
+
+  get safety(): CodexExecutionSafety { return this.#safety; }
+}
 
 export type HarnessKind = "claude" | "codex";
 export type HarnessEffort = "low" | "medium" | "high" | "xhigh" | "max";
@@ -215,7 +244,9 @@ export type HarnessEvent = HarnessEventMeta &
   (
     // `modelInitiated` (Codex only): the model itself issued a tool or item on the active root
     // thread (command, file change, MCP/dynamic tool call). Absent on pure lifecycle liveness.
-    | { kind: "activity"; modelInitiated?: true }
+    // `leadToolCall` (Codex only): a root native command/file/MCP item started this turn (issue
+    // #3139 stall signal); dynamic tool calls reach the reducer as main-origin tool frames instead.
+    | { kind: "activity"; modelInitiated?: true; leadToolCall?: true }
     // issue #1562 (ADR-1562): `freshSession` marks that this SDK process did NOT
     // continue the requested session (no resume requested, or the init session_id
     // differed). Threaded to projectInit so the persisted init frame gains
@@ -414,7 +445,10 @@ export type BoundaryStep =
   | "checkpoint_import_mutation"
   | "checkpoint_import_readback"
   | "checkpoint_code_head"
-  | "checkpoint_bridge";
+  | "checkpoint_bridge"
+  | "checkpoint_post_import"
+  | "checkpoint_steer"
+  | "checkpoint_post_bridge";
 
 /** Runner-supplied cause for the actual shutdown checkpoint; credential reauthorization is still required. */
 export interface GracefulShutdownCheckpoint {
@@ -496,6 +530,21 @@ export interface BoundaryPermit {
   /** Aborts at the boundary's wall deadline. Permit-held subprocesses and
    * shutdown publication must consume it; timeout never authorizes abandonment. */
   readonly signal: AbortSignal;
+}
+
+declare const credentialFreeCaptureBrand: unique symbol;
+declare const completedCaptureBrand: unique symbol;
+
+/** Bounded capture scope; only GitCache can bind its restricted subprocess lane. */
+export interface CredentialFreeCaptureContext {
+  readonly [credentialFreeCaptureBrand]: true;
+  readonly signal: AbortSignal;
+  readonly deadlineAt: number;
+}
+
+/** Exact completed acquisition evidence, not permission for ordinary admission. */
+export interface CompletedCredentialFreeCapture {
+  readonly [completedCaptureBrand]: true;
 }
 
 export interface BoundaryProcessRequest {
@@ -588,6 +637,9 @@ export interface ReducedTurnResult extends TurnSignals {
   sessionId?: string;
   finalText?: string;
   subagentActivity?: boolean;
+  /** issue #3139: true when this turn had a root (lead, main-origin) non-signal tool start.
+   *  Per-turn; subagent tool starts and signal tools never set it. */
+  leadToolCall?: boolean;
   /** issue #1197 (D-RC2a): the SDK terminal's POSITIVELY-reported turn count
    *  (`terminal.metrics.wire.num_turns`), coerced to a number ONLY when it is a
    *  finite number (mirrors limit.ts normalizeResetsAt's shape). Missing or garbage

@@ -1115,6 +1115,8 @@ export interface MilestoneAgent {
  * reference so a legitimately-scaled run does not self-trip its wall.
  */
 export interface IterationBudget {
+  /** Server-confirmed count off the same running ACK: zero permits stall eligibility;
+   * positive counts route later wall exhaustion to a hold. Absent means unknown. */
   completionAttempts?: number;
   usedWallSeconds?: number;
   maxIterations?: number;
