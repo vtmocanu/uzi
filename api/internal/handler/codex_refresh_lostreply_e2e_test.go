@@ -268,7 +268,7 @@ func TestCodexRefreshLostReplyE2E(t *testing.T) {
 					}
 					return strings.TrimSpace(string(out)), nil
 				}
-				ref := "refs/uzi-checkpoints/" + o.Branch
+				ref := "refs/uzi-checkpoints/" + o.CheckpointKey
 				if _, err := git(nil, "check-ref-format", ref); err != nil {
 					return pushbroker.Result{}, err
 				}
@@ -315,7 +315,19 @@ func TestCodexRefreshLostReplyE2E(t *testing.T) {
 				return pushbroker.Result{Ref: ref}, nil
 			})
 			svc.SetDeleteCheckpointFn(func(ctx context.Context, o pushbroker.DeleteOptions) error {
-				return exec.CommandContext(ctx, "git", "-C", origin, "update-ref", "-d", "refs/uzi-checkpoints/"+o.Branch).Run() //nolint:gosec // G204: fixed Git binary, owned directory and server-derived branch; no shell.
+				ref := o.Ref
+				if ref == "" {
+					key := o.CheckpointKey
+					if key == "" {
+						key = o.Branch
+					}
+					ref = "refs/uzi-checkpoints/" + key
+				}
+				args := []string{"-C", origin, "update-ref", "-d", ref}
+				if o.ExpectedOldTip != "" {
+					args = append(args, o.ExpectedOldTip)
+				}
+				return exec.CommandContext(ctx, "git", args...).Run() //nolint:gosec // G204: fixed Git binary, owned directory and server-derived ref and CAS tip; no shell.
 			})
 			owner, conn, repo, worker, run := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
 			defer func() {

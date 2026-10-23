@@ -12,6 +12,7 @@ import (
 	"unicode"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -219,7 +220,16 @@ func (s *Service) enqueueSalvage(ctx context.Context, now time.Time) (int64, err
 	for _, c := range cands {
 		// Retention branch columns carry checkpoint keys, including enrolled tasks.
 		coordinates, err := s.retentionCoordinates(ctx, c.ID, c.Kind, c.IssueIid)
-		if err != nil || coordinates == nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// The candidate was deleted after the list, like the live-run FK race below.
+			slog.Debug("salvage: run deleted before coordinate lookup", "run", c.ID)
+			continue
+		}
+		if err != nil {
+			slog.Error("salvage: checkpoint coordinates", "run", c.ID, "error", err)
+			return touched, fmt.Errorf("salvage: checkpoint coordinates %s: %w", c.ID, err)
+		}
+		if coordinates == nil {
 			continue
 		}
 		state, live := salvageStatePending, pgtype.UUID{Bytes: c.ID, Valid: true}

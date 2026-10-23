@@ -224,7 +224,7 @@ func TestWorkerRunPublishValid200(t *testing.T) {
 	if gotOpts.CloneURL != "https://gitlab.example.com/team/repo.git" {
 		t.Fatalf("clone url = %q", gotOpts.CloneURL)
 	}
-	if gotOpts.Branch != "agent/issue-42" || gotOpts.Username != "uzi-bot" || gotOpts.PAT != "pat" {
+	if gotOpts.WorkBranch != "agent/issue-42" || gotOpts.CheckpointKey != "agent/issue-42" || gotOpts.Username != "uzi-bot" || gotOpts.PAT != "pat" {
 		t.Fatalf("derived opts = %+v", gotOpts)
 	}
 	if gotOpts.DefaultBranch != "main" {
