@@ -1,8 +1,8 @@
 // Neutral harness contract (PRD #1146 / #1106 M2, milestone m1).
 //
 // The provider-neutral type surface the run lane is being extracted behind. It
-// has NO provider SDK import — only type-only imports from the two uzi domain
-// modules that already own these shapes (`executor.ts`, `protocol.ts`). The
+// has NO provider SDK import. Domain shapes stay type-only; the shared local
+// refusal vocabulary imports only trusted worker errors. The
 // Claude adapter (`claude-harness.ts`) and the pure reducer (`harness-reducer.ts`)
 // speak these types; `sdk-executor.ts` remains the workflow owner that drives
 // them. See `e2e/codex-m0/harness-contract.md` §Contracts for the accepted design
@@ -11,6 +11,7 @@
 // zero-unused-export gate stays green).
 
 import type { Readable, Writable } from "node:stream";
+import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import type { CodeCrossCheckToolAccess } from "./code-cross-check-tools.js";
 import type { EmittedMessage } from "./executor.js";
 import type { PrSummaryClaim } from "./signals.js";
@@ -21,6 +22,34 @@ import type {
   MilestoneProgress,
   Proposal,
 } from "./protocol.js";
+
+// Process-local capture provenance. Only safety.captureOperation records it;
+// consumers cannot reconstruct it from error text, copied fields or JSON.
+const captureFailures = new WeakMap<object, Readonly<{
+  deadlineExpired: boolean; childCleanupFailed: boolean; externallyAborted: boolean; actionRevoked?: true;
+}>>();
+
+export function recordCaptureFailure(error: object, failure: {
+  deadlineExpired: boolean; childCleanupFailed: boolean; externallyAborted: boolean; actionRevoked?: true;
+}): void {
+  captureFailures.set(error, Object.freeze({ ...failure }));
+}
+
+export function captureFailureOf(error: unknown) {
+  return error !== null && typeof error === "object" ? captureFailures.get(error) : undefined;
+}
+
+/** Local identity of the epoch whose cleanup could not be proven. */
+export class EpochCleanupUnprovenError extends TrustedExecutionRefusal {
+  readonly #safety: CodexExecutionSafety;
+
+  constructor(safety: CodexExecutionSafety) {
+    super("prior Codex epoch cleanup unproven");
+    this.#safety = safety;
+  }
+
+  get safety(): CodexExecutionSafety { return this.#safety; }
+}
 
 export type HarnessKind = "claude" | "codex";
 export type HarnessEffort = "low" | "medium" | "high" | "xhigh" | "max";
@@ -506,6 +535,21 @@ export interface BoundaryPermit {
   /** Aborts at the boundary's wall deadline. Permit-held subprocesses and
    * shutdown publication must consume it; timeout never authorizes abandonment. */
   readonly signal: AbortSignal;
+}
+
+declare const credentialFreeCaptureBrand: unique symbol;
+declare const completedCaptureBrand: unique symbol;
+
+/** Bounded capture scope; only GitCache can bind its restricted subprocess lane. */
+export interface CredentialFreeCaptureContext {
+  readonly [credentialFreeCaptureBrand]: true;
+  readonly signal: AbortSignal;
+  readonly deadlineAt: number;
+}
+
+/** Exact completed acquisition evidence, not permission for ordinary admission. */
+export interface CompletedCredentialFreeCapture {
+  readonly [completedCaptureBrand]: true;
 }
 
 export interface BoundaryProcessRequest {

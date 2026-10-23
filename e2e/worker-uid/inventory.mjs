@@ -7,7 +7,7 @@ const repo = fileURLToPath(new URL('../../', import.meta.url));
 const require = createRequire(path.join(repo, 'agent/package.json'));
 const { API } = await import(pathToFileURL(require.resolve('typescript/unstable/sync')));
 const { SyntaxKind } = await import(pathToFileURL(require.resolve('typescript/unstable/ast')));
-const files = ['codex-launcher', 'codex-executor', 'codex-shared-dir', 'entrypoint-migration', 'git-planning-diff', 'git-retained-permissions', 'claude-command-launcher', 'claude-command-real'];
+const files = ['codex-launcher', 'codex-executor', 'codex-shared-dir', 'entrypoint-migration', 'git-planning-diff', 'codex-capture-reaper-real', 'git-retained-permissions', 'claude-command-launcher', 'claude-command-real'];
 const singleFile = 'single-uid-preflight';
 const sharedFile = 'runner-shared-real';
 const e2eFiles = new Set(['memory-command-real', 'claude-command-real', singleFile, sharedFile]);
@@ -148,6 +148,17 @@ export function inventoryForSource(source, file) {
       if (!expected.some(test => test.names.length === 1 && test.names[0] === title)) {
         throw new Error(`${file}: missing required literal command proof: ${title}`);
       }
+    }
+  } else if (file === 'codex-capture-reaper-real') {
+    const required = [
+      'fixed capture reaper: real runner procfs and signal compatibility',
+      'fixed capture reaper: descendant settlement precedes verdict',
+      'fixed capture reaper: own mode kills owned residue before capture proceeds',
+      'fixed capture reaper: genuine report preserves the same owned writer',
+    ];
+    if (gates !== 1 || expected.length !== required.length || required.some(title =>
+      !expected.some(test => test.names.length === 2 && test.names[0] === 'fixed capture reaper: real worker profile' && test.names[1] === title))) {
+      throw new Error(`${file}: expected one UID gate and all required literal fixed reaper leaves`);
     }
   } else if (gates !== 1 || !expected.length) {
     throw new Error(`${file}: expected one UID gate with nonempty leaf inventory, found ${gates}`);

@@ -1755,10 +1755,11 @@ A newer release is available.
   never squeezed. `[h]` hides finished runs (completed/failed/cancelled),
   leaving the active and needs-you runs. The rows are grouped into three
   triage bands (NEEDS YOU, then ON THE FLOOR, then DONE) rather than one
-  flat table. DONE keeps failed and `needs landing` state tokens in dimmed red,
-  their issue links in full red, and their titles faint. Human-stopped runs
-  stay faint. When failures are present, the DONE heading adds a red
-  `K failed` count over the filtered rows. Each row reads left to right as a
+  flat table. Failed and `needs landing` DONE rows use one dimmed red for
+  their state tokens and issue links. On every DONE row, an `issues` judge
+  badge uses that same dimmed red. Human-stopped state tokens and all DONE
+  titles stay faint. When failures are present, the DONE heading adds a
+  full-red `K failed` count over the filtered rows. Each row reads left to right as a
   `▌` andon strip and
   status glyph, the run id, the status WORD in its own colour (a stalled run
   reads `▲ stalled`, because health folds into the status token rather than

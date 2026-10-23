@@ -1596,6 +1596,109 @@ for (const settled of [false, true]) {
     });
 }
 
+/** Fixture programs are literal inert marker writers; no screened payload is executed. */
+async function successorConfigEnvironment(body: () => Promise<void>): Promise<void> {
+  const saved = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith("GIT_")));
+  for (const key of Object.keys(saved)) delete process.env[key];
+  process.env.GIT_CONFIG_GLOBAL = "/dev/null";
+  try { await body(); }
+  finally {
+    for (const key of Object.keys(process.env)) if (key.startsWith("GIT_")) delete process.env[key];
+    Object.assign(process.env, saved);
+  }
+}
+
+function successorConfigShellLiteral(value: string): string {
+  return "'" + value.replaceAll("'", "'\\''") + "'";
+}
+
+function successorConfigProgram(name: string, passthrough: boolean): { script: string; marker: string } {
+  const script = path.join(fx.dataDir, name + ".sh");
+  const marker = path.join(fx.dataDir, name + ".marker");
+  // Fixture-owned paths are literal POSIX shell arguments, including spaces and dollar signs.
+  fs.writeFileSync(script, "#!/bin/sh\nprintf '%s\\n' \"$PWD\" >> " + successorConfigShellLiteral(marker) +
+    "\n" + (passthrough ? "cat\n" : "exit 0\n"), { mode: 0o700 });
+  return { script, marker };
+}
+
+for (const wip of [false, true]) {
+  for (const selfContained of [false, true]) {
+    test(`successor config isolation ordinary/WIP=${wip} selfContained=${selfContained}`, async () => {
+      await successorConfigEnvironment(async () => {
+        fs.writeFileSync(path.join(source.clonePath, ".gitattributes"), "work.txt filter=successorproof\n");
+        git(source.clonePath, ["add", ".gitattributes"]);
+        await cache.reserveRecoveryIteration(bare, branch, key, source);
+        const tip = await capture(wip);
+        await cache.recordRecoveryCapture(bare, branch, key, source, 1, tip);
+        const tree = git(bare, ["rev-parse", tip + "^{tree}"]);
+        const expectedHead = wip ? git(bare, ["rev-parse", tip + "^"]) : tip;
+        const filter = successorConfigProgram("predecessor-filter", true);
+        const hook = successorConfigProgram("predecessor-hook", false);
+        // Plants are installed only AFTER durable capture; capture need not execute them.
+        for (const direction of ["clean", "smudge"]) {
+          git(source.clonePath, ["config", "filter.successorproof." + direction, successorConfigShellLiteral(filter.script)]);
+        }
+        git(source.clonePath, ["config", "filter.successorproof.required", "true"]);
+        git(source.clonePath, ["config", "successorproof.origin", "predecessor-only"]);
+        const hooks = path.join(source.clonePath, ".git", "hooks");
+        fs.mkdirSync(hooks, { recursive: true });
+        fs.copyFileSync(hook.script, path.join(hooks, "post-checkout"));
+        fs.chmodSync(path.join(hooks, "post-checkout"), 0o700);
+        git(source.clonePath, ["config", "core.hooksPath", hooks]);
+        fs.writeFileSync(path.join(source.clonePath, ".git", "info", "attributes"),
+          "README.md filter=successorproof\n");
+        // Real Git reachability control in the owned predecessor fixture, then clear.
+        git(source.clonePath, ["checkout", "--force", "HEAD", "--", "work.txt", "README.md"]);
+        assert.ok(fs.readFileSync(filter.marker, "utf8").includes(source.clonePath), "local filter control executed");
+        assert.ok(fs.readFileSync(hook.marker, "utf8").includes(source.clonePath), "local hook control executed");
+        fs.unlinkSync(filter.marker);
+        fs.unlinkSync(hook.marker);
+        const successor = await cache.prepareRecoverySuccessor(bare, branch, key, source, 1, aid(2),
+          { selfContained });
+        assert.equal(fs.existsSync(filter.marker), false, "successor did not execute predecessor filter");
+        assert.equal(fs.existsSync(hook.marker), false, "successor did not execute predecessor hook");
+        const config = fs.readFileSync(path.join(successor.path, ".git", "config"), "utf8");
+        assert.doesNotMatch(config, /successorproof|predecessor-only/);
+        assert.equal(fs.existsSync(path.join(successor.path, ".git", "info", "attributes")), false);
+        assert.equal(fs.existsSync(path.join(successor.path, ".git", "hooks", "post-checkout")), false);
+        assert.equal(git(successor.path, ["rev-parse", "HEAD"]), expectedHead);
+        assert.equal(git(successor.path, ["write-tree"]), tree);
+        git(successor.path, ["merge-base", "--is-ancestor", expectedHead, tip]);
+        assert.equal(fs.readFileSync(path.join(successor.path, "work.txt"), "utf8"), "retained work\n");
+        assert.equal(fs.readFileSync(path.join(successor.path, "README.md"), "utf8"), "# fixture\n");
+        assert.equal(fs.readFileSync(path.join(successor.path, ".gitattributes"), "utf8"),
+          "work.txt filter=successorproof\n");
+        if (wip) assert.match(git(successor.path, ["diff", "--cached", "--name-only"]), /work.txt/);
+        if (selfContained) assert.equal(fs.existsSync(path.join(successor.path, ".git", "objects", "info", "alternates")), false);
+      });
+    });
+  }
+}
+
+test("successor config trusted worker global filter really executes with exact bytes", async () => {
+  await successorConfigEnvironment(async () => {
+    fs.writeFileSync(path.join(source.clonePath, ".gitattributes"), "work.txt filter=workerglobalproof\n");
+    git(source.clonePath, ["add", ".gitattributes"]);
+    await cache.reserveRecoveryIteration(bare, branch, key, source);
+    const tip = await capture();
+    await cache.recordRecoveryCapture(bare, branch, key, source, 1, tip);
+    const driver = successorConfigProgram("worker-global-filter", true);
+    const global = path.join(fx.dataDir, "trusted-worker.gitconfig");
+    git(fx.dataDir, ["config", "--file", global, "filter.workerglobalproof.clean", successorConfigShellLiteral(driver.script)]);
+    git(fx.dataDir, ["config", "--file", global, "filter.workerglobalproof.smudge", successorConfigShellLiteral(driver.script)]);
+    git(fx.dataDir, ["config", "--file", global, "filter.workerglobalproof.required", "true"]);
+    process.env.GIT_CONFIG_GLOBAL = global;
+    assert.equal(fs.existsSync(driver.marker), false);
+    const successor = await cache.prepareRecoverySuccessor(bare, branch, key, source, 1, aid(2));
+    const executions = fs.readFileSync(driver.marker, "utf8").trim().split("\n");
+    assert.ok(executions.length > 0, "trusted worker global driver executed");
+    assert.ok(executions.every(cwd => cwd !== source.clonePath), "driver ran outside predecessor");
+    assert.equal(fs.readFileSync(path.join(successor.path, "work.txt"), "utf8"), "retained work\n");
+    assert.equal(git(successor.path, ["write-tree"]), git(bare, ["rev-parse", tip + "^{tree}"]));
+    assert.equal(git(successor.path, ["rev-parse", "HEAD"]), tip);
+  });
+});
+
 // Issue #3153 PIN tests: `<dataDir>/runner` persists across a pod replacement on the Docker lane,
 // so a journaled clone that survived must be discovered by a fresh worker process. These pass on
 // the pre-fix agent code too (the pre-fix loss came from the emptyDir mount, not agent code); they

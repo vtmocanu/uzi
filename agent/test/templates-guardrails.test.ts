@@ -303,6 +303,13 @@ function templateDockerfiles(): { name: string; text: string }[] {
     });
 }
 
+function hasRootEntrypointUser(text: string): boolean {
+  const stages = text.split(/^FROM runtime AS release[ \t]*$/m);
+  if (stages.length !== 2 || /^\s*USER\s+/mi.test(stages[0]!) || /^\s*FROM\s+/mi.test(stages[1]!)) return false;
+  const users = [...stages[1]!.matchAll(/^\s*USER\s+([^\r\n]+)$/gmi)];
+  return (users.at(-1)?.[1]?.trim() ?? "root") === "root";
+}
+
 describe("worker template Dockerfiles keep guardrail layers", () => {
   const dockerfiles = templateDockerfiles();
   // The pinned-Codex install helper + runner-uid guard (PRD #1156 M3a) are SHARED by
@@ -324,11 +331,12 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
 
   for (const { name, text } of dockerfiles) {
     it(`${name}: drops to the non-root worker uid via the root-entry setpriv wrapper (PRD #51 A1)`, () => {
-      // The image runs as root and the entrypoint setpriv-drops to `worker`; there
-      // must be NO `USER` line (which would defeat the root startup window). Both the
+      // The image runs as root and the entrypoint setpriv-drops to `worker`; the
+      // runtime stage must keep its root identity, and build-only USER switches
+      // in release must restore root before the image's entrypoint runs. Both the
       // credential-holding `worker` and the cap-less `runner` uid must exist, and the
       // util-linux setpriv drop wrapper must be installed (busybox's cannot --reuid).
-      assert.doesNotMatch(text, /^\s*USER\s+/m, `${name}/Dockerfile must NOT set a USER — the entrypoint drops root -> worker`);
+      assert.equal(hasRootEntrypointUser(text), true, `${name}/Dockerfile must start its entrypoint as root`);
       assert.match(text, /adduser\s+-u\s+10001\s+-G\s+worker\b/, `${name}/Dockerfile must create the worker uid (10001)`);
       assert.match(text, /adduser\s+-u\s+10002\s+-G\s+runner\b/, `${name}/Dockerfile must create the runner uid (10002)`);
       assert.equal(hasRequiredSessionGroupMembership(text), true, `${name}/Dockerfile must create the dedicated provider-session reader group in a RUN instruction`);
@@ -340,6 +348,15 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
         /ENTRYPOINT\s*\[\s*"\/usr\/local\/sbin\/uzi-entrypoint"/,
         `${name}/Dockerfile ENTRYPOINT must be the root-entry drop wrapper`,
       );
+    });
+
+    it(`${name}: root-entry user guard rejects missing resets and later non-root stages`, () => {
+      const missingReset = text.replace(/^USER root[ \t]*$/gm, "");
+      assert.notEqual(missingReset, text, "mutation must remove the real release proof's root reset");
+      assert.equal(hasRootEntrypointUser(missingReset), false);
+      assert.equal(hasRootEntrypointUser(text + "\nUSER worker\n"), false);
+      assert.equal(hasRootEntrypointUser(text.replace(/^FROM runtime AS release/m, "USER runner\nFROM runtime AS release")), false);
+      assert.equal(hasRootEntrypointUser(text + "\nFROM runtime AS unexpected\n"), false);
     });
 
     it(`${name}: bakes its own template identity`, () => {
@@ -1251,13 +1268,39 @@ function escapeRe(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function manifestToolName(pkg: string): string {
+  // Match toolseed's trusted-manifest fragment/Go alias normalization, without
+  // treating unrelated flake namespaces as the baked Go compiler.
+  const attr = pkg.startsWith("github:NixOS/nixpkgs/") ? pkg.slice(pkg.lastIndexOf("#") + 1) : pkg;
+  return attr === "go_1_27" ? "go" : attr;
+}
+
+function assertManifestPins(manifest: string, lockText: string): void {
+  const locked = (JSON.parse(lockText) as { packages: Record<string, { resolved: string }> }).packages;
+  const input = "github:NixOS/nixpkgs/nixpkgs-unstable";
+  const stdenv = /^github:NixOS\/nixpkgs\/([0-9a-f]{40})(?:\?[^#]*)?$/.exec(locked[input]?.resolved ?? "");
+  assert.ok(stdenv, "lock must pin the toolchain stdenv at a concrete nixpkgs rev");
+  const packages = manifestPackages(manifest);
+  assert.ok(packages.length > 0, "manifest package list must not parse empty");
+  assert.deepEqual(Object.keys(locked).filter(key => key !== input).sort(), packages, "manifest and lock package keys must match");
+  for (const pkg of packages) {
+    const explicit = /^github:NixOS\/nixpkgs\/([0-9a-f]{40})#(.+)$/.exec(pkg);
+    const rev = explicit?.[1] ?? stdenv[1];
+    const attr = explicit?.[2] ?? pkg;
+    assert.match(locked[pkg]!.resolved, new RegExp(`^github:NixOS/nixpkgs/${rev}(?:\\?[^#]*)?#${escapeRe(attr)}$`),
+      `devbox.lock must preserve ${pkg}'s ${explicit ? "explicit" : "stdenv"} pin`);
+  }
+}
+
 describe("devbox-global default toolchain manifest", () => {
   const manifest = fs.readFileSync(path.resolve(templatesDir, "../devbox-global/devbox.json"), "utf8");
   const lock = fs.readFileSync(path.resolve(templatesDir, "../devbox-global/devbox.lock"), "utf8");
   it("lists go + python3 + pip", () => {
-    assert.match(manifest, /"go"/, "manifest must list go");
-    assert.match(manifest, /"python3"/, "manifest must list python3");
-    assert.match(manifest, /python3Packages\.pip|"pip"/, "manifest must list pip");
+    const tools = manifestPackages(manifest).map(manifestToolName);
+    assert.equal(tools.filter(name => name === "go").length, 1, "manifest must supply one Go compiler");
+    assert.ok(tools.includes("python3"), "manifest must list python3");
+    assert.ok(tools.includes("python3Packages.pip") || tools.includes("pip"), "manifest must list pip");
+    assert.notEqual(manifestToolName("github:example/tools/" + "a".repeat(40) + "#go_1_27"), "go");
   });
   // openssl is a baked base crypto/TLS CLI (cert gen / `openssl rand` / hashing), promoted
   // from tier-2 (run dd06c0ed) so its absence can't silently ship a worker that 127s any
@@ -1284,19 +1327,23 @@ describe("devbox-global default toolchain manifest", () => {
   // `kubernetes-helm` and `kubeconform` were added in 0.11.11 and this test kept passing
   // without checking a single one of their pins. A list written once in a test rots exactly
   // like a list written once in a Dockerfile.
-  it("pins EVERY manifest package in devbox.lock at the toolchain nixpkgs rev", () => {
-    const revMatch = /github:NixOS\/nixpkgs\/([0-9a-f]{40})#go\b/.exec(lock);
-    assert.ok(revMatch, "lock must pin go at a concrete nixpkgs rev to anchor the toolchain pin");
-    const rev = revMatch![1];
-    const packages = manifestPackages(manifest);
-    assert.ok(packages.length > 0, "manifest package list must not parse empty (the regex would silently pass)");
-    for (const pkg of packages) {
-      assert.match(
-        lock,
-        new RegExp(`github:NixOS/nixpkgs/${rev}#${escapeRe(pkg)}\\b`),
-        `devbox.lock must pin ${pkg} at the same rev (${rev}) as the rest of the toolchain`,
-      );
-    }
+  it("pins EVERY raw package at stdenv and preserves every explicit flake pin", () => {
+    assertManifestPins(manifest, lock);
+  });
+
+  it("rejects raw revision drift, explicit pin drift, and orphan lock keys", () => {
+    const original = JSON.parse(lock);
+    const raw = structuredClone(original);
+    raw.packages.gcc.resolved = "github:NixOS/nixpkgs/" + "0".repeat(40) + "#gcc";
+    assert.throws(() => assertManifestPins(manifest, JSON.stringify(raw)), /stdenv pin/);
+    const explicit = structuredClone(original);
+    const go = manifestPackages(manifest).find(pkg => pkg.endsWith("#go_1_27"))!;
+    assert.ok(go, "mutation needs the real explicit Go key");
+    explicit.packages[go].resolved = "github:NixOS/nixpkgs/" + "0".repeat(40) + "#go_1_27";
+    assert.throws(() => assertManifestPins(manifest, JSON.stringify(explicit)), /explicit pin/);
+    const orphan = structuredClone(original);
+    orphan.packages.unused = {};
+    assert.throws(() => assertManifestPins(manifest, JSON.stringify(orphan)), /package keys must match/);
   });
 
   // The build guard (agent/devbox-global/assert-toolchain.sh) enforces this at IMAGE BUILD

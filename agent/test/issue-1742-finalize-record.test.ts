@@ -90,7 +90,9 @@ async function registerWith(
     .registerWithRetry(new AbortController().signal);
 }
 
-it("rework-2464: authenticated legacy actual runner custody false still retains unoffered running finalize", async () => {
+it("rework-2464: authenticated legacy actual runner custody false still retains unoffered running finalize", async t => {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
   const root = tmpRoot();
   const outbox = makeOutbox(root);
   await outbox.init();
@@ -113,6 +115,7 @@ it("rework-2464: authenticated legacy actual runner custody false still retains 
   await seam.sweepPendingFinalizes();
   assert.deepEqual(await finalizeFiles(root, RUN_A), ["finalize-1.json"], "legacy running record retains");
   status = "completed";
+  now += 15000;
   await seam.sweepPendingFinalizes();
   assert.deepEqual(await finalizeFiles(root, RUN_A), [], "fresh terminal proof permits");
 });

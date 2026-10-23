@@ -213,7 +213,7 @@ func TestBoardLongTitleFillsJudgeAndWorkerBudget(t *testing.T) {
 	}, WorkerName: sp("worker-a"), JudgeVerdict: sp("issues"), JudgeTodoCount: 2}
 	rows := []apitypes.RunListItemDTO{r}
 	mc := m.boardMarkerCols(rows)
-	marker := stripANSI(m.verdictMarker("issues", 2, mc.verdictW, mc.countW, nil))
+	marker := stripANSI(m.verdictMarker("issues", 2, mc.verdictW, mc.countW, false, nil))
 	for _, width := range []int{120, 200} {
 		m.width = width
 		row := stripANSI(m.boardRow(r, false, mc, m.boardAccountCols(rows)))

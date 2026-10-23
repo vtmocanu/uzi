@@ -37,6 +37,8 @@ const PROTECTED_ENV_KEYS: ReadonlySet<string> = new Set([
   // live conflict; protecting it keeps the --no-sandbox guarantee durable against
   // allowlist drift, so a provisioned var can never overwrite or drop it.
   "AGENT_BROWSER_ARGS",
+  // Non-secret, worker-owned path to the immutable verified sqlc archive cache.
+  "UZI_SQLC_DIR",
   // issue #1783 (R2/R4): the run-attempt marker and the worker spawn mark. The quiescence
   // reaper attributes processes by them, so a provisioned var must never forge or drop one.
   RUN_ATTEMPT_ENV,
@@ -130,6 +132,7 @@ export function buildSdkEnv(
   // 5-bis: the agent's scratch on the runner's private 0700 TMPDIR under the split.
   const tmp = runnerTmpdir();
   if (tmp) env.TMPDIR = tmp;
+  if (process.env.UZI_SQLC_DIR) env.UZI_SQLC_DIR = process.env.UZI_SQLC_DIR;
   // Fold in the provisioned tool env. Only allowlisted keys reach here; PATH (if
   // present) is devbox's PATH with the tool bins prepended, so it replaces the
   // inherited one. Never let a provisioned var overwrite a PROTECTED key: the
@@ -203,6 +206,7 @@ export function buildCheckEnv(
   // 5-bis: check scratch on the runner's private 0700 TMPDIR under the split.
   const tmp = runnerTmpdir(source);
   if (tmp) env.TMPDIR = tmp;
+  if (source.UZI_SQLC_DIR) env.UZI_SQLC_DIR = source.UZI_SQLC_DIR;
   // TLS trust + locale so nix-provided toolchains and `npm ci` over HTTPS work. Prefer
   // the provisioned value, fall back to the image's; never invent, never carry else.
   for (const k of ["NIX_SSL_CERT_FILE", "SSL_CERT_FILE", "LOCALE_ARCHIVE"] as const) {

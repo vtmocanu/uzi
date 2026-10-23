@@ -171,7 +171,8 @@ names the commit that contains the chart. A per-cluster override still wins; cus
 matching override. ADR-1720's published bare SemVer tag cannot identify
 that complete stamp. Do not infer the target from the replacement, substitute
 the independently advancing API version, or strip build metadata. A missing
-mapping holds before cordoning. The controller's fully specified SemVer-tag
+mapping holds before ordinary admission cordoning; the separate custody-held
+migration drain grants no replacement authority. The controller's fully specified SemVer-tag
 mapping is not a way to recover metadata absent from a bare published tag.
 
 Registration retains its existing 64-byte display sanitization. Exact versions
@@ -194,9 +195,10 @@ recycle wait indefinitely for genuine idle, including run-bound workers outside
 pacing and calls with no pacing entry or a plain drain reason. An admitted busy
 drainer occupies concurrency (default one), supplies no replacement coverage,
 canary proof or post-promotion proof, and can hold its pool indefinitely. It may retain the canary
-reservation while busy, without supplying promotion proof. Unadmitted peers
-stay uncordoned and claimable; legacy recycle cannot evade admission or the busy
-guard. Separately fenced DinD maintenance remains independent.
+reservation while busy, without supplying promotion proof. Unadmitted peers normally
+stay uncordoned and claimable, except for eligible custody-held layout migration
+drains; legacy recycle cannot evade admission or the busy guard. Separately
+fenced DinD maintenance remains independent.
 
 Every assigned nonterminal run blocks, including queued, paused and all waits/gates.
 Own pinned continuations/checkers may finish; unrelated new roots, unassigned
@@ -217,6 +219,46 @@ It may interrupt runs and lose all capacity; it is neither targeted nor a recove
 guarantee. Custody-held data and independent DinD readiness/identity/pod-absence
 guards remain authoritative; DinD has no deadline or ForceRoll bypass. Restore
 `false` after the emergency; no automatic rollback follows it.
+
+**Custody-held migration drains.** Ordinary admission wins first. The controller
+then may reuse `image_roll` for a persistent old/unknown-layout Docker worker
+with custody held and drift, without admitting it, reserving it, selecting it as
+canary, taking a roll slot or patching its pod template. An incomplete own
+reservation is withdrawn; uncertainty still fences cohort completion. Run-bound
+workers are excluded from drain selection. One distinct live eligible uncordoned
+same-owner/lane sibling must individually cover the full frozen scheduling,
+protocol and ordinary/checker eligibility set. Busy is acceptable; partial
+siblings cannot cover by union, and free run slots are not required.
+
+Full-poll held workers drained for any reason occupy the owner/lane migration
+budget even when their template cannot render. Selected or possibly committed
+drains also occupy it. Drained held workers supply no usable intake coverage;
+later ordinary rolls may wait behind a retained drain. Losing the covering
+sibling after entry can remove all intake coverage; the retained drain stays.
+This limits additional selection, not the number of physically drained workers.
+
+Eligible reconciliation is level-triggered after registration/restart and
+explicit undrained polls; there is no fixed re-drain time bound. Failed writes
+retain process-local uncertainty until evidence resolves it, and restart loses
+it. Registration and poll/write failures allow claims in the gap. A timed-out
+cordon can commit after an explicit undrained poll, leaving multiple held workers
+physically drained. A server-side fence is explicitly outside the accepted
+controller-only scope: no schema, protocol or API product change. Custody-clear
+ordinary release predicates may reopen claims before later re-drain, admitting
+fresh work. Worker-pin rollback retains custody refusal before ordinary release; rollout
+order is independent for this exception, reusing `image_roll`.
+
+Diagnostics in `blocking_reason` and health name retained/pending drains,
+missing coverage and operator decisions. Multiple-drain diagnostics for an
+unknown target leave desired image/version empty; they are display-only and
+grant no mutation authority. The existing synthetic rolling fallback may stamp
+the first `upgrading_since`. Idle terminal holds require an operator custody
+decision; #3031's automatic path is not supplied here and no automatic discard
+is added. Chat continue drops the draining-worker pin and may cold-resume.
+See [operational limits](../docs/hosted-worker-roll-verification.md#migration-drain-policy-and-operational-limits).
+Custody guards on ForceRoll, recycle, maintenance and old/unknown layouts remain,
+as do independent DinD/pressure/maintenance guards. Eviction, node drain and
+manual pod deletion remain outside controller protection.
 
 ### D7 — Deploy API first; diagnostics do not control admission
 

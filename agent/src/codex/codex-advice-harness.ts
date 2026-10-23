@@ -21,7 +21,8 @@
 //   - `launchRoot(spec)` launches an ISOLATED provider root with its OWN disposable
 //     HOME and returns an in-memory {@link CodexTransport} plus a best-effort
 //     `dispose()`; production wires an advice launcher, tests inject a fake returning a
-//     scripted in-memory transport. There is NO registry and NO broker in this lane.
+//     scripted in-memory transport. Executor summaries bind external registry custody;
+//     the advice harness has no broker or worker callbacks.
 //
 // SECURITY: pinned app-server auth receives the provider credential only through its
 // private construction input and exchanges it on the initialize/login/refresh transport
@@ -39,6 +40,7 @@
 //     disposal; a cleanup warning NEVER replaces the primary failure; partial text is
 //     NEVER returned after a timeout.
 
+import { ownedSummaryHarnesses } from "./summary-ownership.js";
 import { renderCodexAdvice } from "./render.js";
 import {
   formatCodexClassification,
@@ -294,9 +296,12 @@ export class CodexAdviceHarness implements AdviceHarness {
       if (disposePromise !== undefined) return disposePromise;
       const d = disposeSeam;
       if (d === undefined) return Promise.resolve(); // a launch failure leaves nothing to dispose
-      disposePromise = d().catch((e) =>
-        this.log.warn(`${request.label} codex advice HOME cleanup failed`, { error: errMessage(e) }),
-      );
+      disposePromise = Promise.resolve().then(d).catch((e) => {
+        const failed = ownedSummaryHarnesses.get(this);
+        failed?.();
+        if (failed) throw e;
+        this.log.warn(`${request.label} codex advice HOME cleanup failed`, { error: errMessage(e) });
+      });
       return disposePromise;
     };
     const work = (async (): Promise<AdviceResult> => {
@@ -320,36 +325,61 @@ export class CodexAdviceHarness implements AdviceHarness {
     // launch that outlives the grace on the timeout path) still gets disposed here. Idempotent
     // with the finally's `disposeOnce`, so the root is torn down EXACTLY ONCE whichever wins;
     // `work`'s own rejection is swallowed (it was already surfaced by the race).
-    void work.then(() => disposeOnce(), () => disposeOnce());
+    const owned = ownedSummaryHarnesses.get(this);
+    if (!owned) void work.then(() => disposeOnce(), () => disposeOnce());
+    const settleOwned = async (failOwnership: () => void, preservePrimary: boolean): Promise<void> => {
+      let cleanupFailed = false;
+      const failed = () => { cleanupFailed = true; failOwnership(); };
+      try { this.appServerAuth?.closeAdmissionAndCancel(); } catch { failed(); }
+      try { await transportSeam?.close(); } catch { failed(); }
+      // Launch/setup and consume stay joined even when they outlive both grace windows.
+      await work.then(() => {}, () => {});
+      try { await transportSeam?.close(); } catch { failed(); }
+      try { await this.appServerAuth?.drainInterceptedRequests(); } catch { failed(); }
+      try { await disposeOnce(); } catch { failed(); }
+      if (cleanupFailed) {
+        const error = new Error("summary auth, transport or root cleanup failed");
+        // The registry records cleanup independently of the action's exact failure.
+        if (!preservePrimary) throw error;
+        this.log.warn("summary cleanup failed after advice failure", { error: errMessage(error) });
+      }
+    };
 
+    let primaryFailed = false;
     try {
       return await Promise.race([work, timeout]);
+    } catch (error) {
+      primaryFailed = true;
+      throw error;
     } finally {
       if (timer) clearTimeout(timer);
       request.signal.removeEventListener("abort", onExternalAbort);
-      // Shutdown ordering is load-bearing for a refresh intercepted while login is still
-      // pending: close admission/cancel first, close transport to reject the login RPC,
-      // then drain the auth owner. Draining before transport close creates a cycle.
-      this.appServerAuth?.closeAdmissionAndCancel();
-      try {
-        await transportSeam?.close();
-      } finally {
-        // Wait for streaming work to settle (bounded by grace after abort) before HOME
-        // disposal. Closing transport above lets pending setup unwind inside this grace.
-        await awaitSettled(work, request.graceMs ?? DEFAULT_ADVICE_GRACE_MS);
+      if (owned) await settleOwned(owned, primaryFailed);
+      else {
+        // Shutdown ordering is load-bearing for a refresh intercepted while login is still
+        // pending: close admission/cancel first, close transport to reject the login RPC,
+        // then drain the auth owner. Draining before transport close creates a cycle.
+        this.appServerAuth?.closeAdmissionAndCancel();
         try {
-          await this.appServerAuth?.drainInterceptedRequests();
-        } catch (e) {
-          // The terminal path drains before it returns, so an auth poison that affects
-          // the verdict already surfaced as the primary error there. Cleanup evidence
-          // must not replace a completed result or the exact timeout/abort rejection.
-          this.log.warn(`${request.label} codex advice auth cleanup failed`, {
-            error: errMessage(e),
-          });
+          await transportSeam?.close();
         } finally {
-          // Best-effort HOME/root disposal, exactly once, even when authentication draining
-          // fails. A late launch remains owned by work.then(disposeOnce) above.
-          await disposeOnce();
+          // Wait for streaming work to settle (bounded by grace after abort) before HOME
+          // disposal. Closing transport above lets pending setup unwind inside this grace.
+          await awaitSettled(work, request.graceMs ?? DEFAULT_ADVICE_GRACE_MS);
+          try {
+            await this.appServerAuth?.drainInterceptedRequests();
+          } catch (e) {
+            // The terminal path drains before it returns, so an auth poison that affects
+            // the verdict already surfaced as the primary error there. Cleanup evidence
+            // must not replace a completed result or the exact timeout/abort rejection.
+            this.log.warn(`${request.label} codex advice auth cleanup failed`, {
+              error: errMessage(e),
+            });
+          } finally {
+            // Best-effort HOME/root disposal, exactly once, even when authentication draining
+            // fails. A late launch remains owned by work.then(disposeOnce) above.
+            await disposeOnce();
+          }
         }
       }
     }

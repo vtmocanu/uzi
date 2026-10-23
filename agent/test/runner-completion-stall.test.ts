@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync, spawn } from "node:child_process";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createCodexExecutionSafety } from "../src/codex/safety.js";
 import { ExecutionRegistry, newLocalExecutionEpoch } from "../src/codex/registry.js";
 import type { WorkerClient } from "../src/client.js";
@@ -45,6 +46,7 @@ function commit(ctx: RunContext, file: string): string {
   return execFileSync("git", ["-C", ctx.worktreePath, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
 }
 
+const captureAttempt = new AsyncLocalStorage<Parameters<NonNullable<Executor["withCredentialFreeCapture"]>>[4]>();
 /** `provider: false` models a resumed flight whose fresh executor has no live provider root yet. */
 function codeSafety(provider = true) {
   const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
@@ -75,7 +77,7 @@ function codeSafety(provider = true) {
         stdin: child.stdin, stdout: child.stdout, stderr: child.stderr,
         waitChild: async () => terminal,
       };
-    });
+    }, undefined, undefined, { reaperAttempt: () => captureAttempt.getStore() });
 }
 
 const codexSecrets = { forge_pat: "fixture-pat", codex: { auth_mode: "api_key", capability: "fixture-cap", access_token: "fixture-access" } };
@@ -138,15 +140,20 @@ async function realDone(ctx: RunContext, seen: Observed): Promise<void> {
 type Lane = "claude" | "codex";
 
 function lead(lane: Lane, body: (ctx: RunContext) => Promise<ExecutorResult>, resumed = false): Executor {
+  let safety = lane === "codex" ? codeSafety(!resumed) : undefined;
+  const capture: NonNullable<Executor["withCredentialFreeCapture"]> = (ms, action, _purpose, signal, attempt) =>
+    captureAttempt.run(attempt, () => safety!.withCredentialFreeCapture(ms, action, signal));
   const executor: { -readonly [K in keyof Executor]: Executor[K] } = {
-    ...(lane === "codex" ? { safety: codeSafety(!resumed) } : { killAgentTree: () => {} }),
-    // The resumed flight's retained-work recovery settles its fresh executor first: nothing is live.
+    ...(safety ? { safety } : { killAgentTree: () => {} }),
+    // Retained recovery requires a callback-held capture, including the runner's exact
+    // attempt metadata. A one-shot observed_empty settlement is not capture authority.
     ...(resumed && lane === "codex" ? {
-      settleForCredentialFreeCapture: async () => ({ kind: "observed_empty" as const }),
+      settleForCredentialFreeCapture: (ms: number) => safety!.settleForCredentialFreeCapture(ms),
+      withCredentialFreeCapture: capture,
     } : {}),
     run: async ctx => {
       // Recovery disposes the empty registry it settled; the run itself starts a fresh one, as a real Codex executor does.
-      if (resumed && lane === "codex") executor.safety = codeSafety(true);
+      if (resumed && lane === "codex") executor.safety = safety = codeSafety(true);
       return body(ctx);
     },
   };
@@ -268,7 +275,7 @@ for (const lane of ["claude", "codex"] as const) {
 
         // Everything reviewed and published afterwards is the real done checkpoint's head H1.
         const { h0, h1 } = seen;
-        assert.ok(h0 && h1 && h0 !== h1);
+        assert.ok(h0 && h1 && h0 !== h1, JSON.stringify(api.states.filter(s => s.runId === claim.run_id && s.body.status === "failed").map(s => s.body.failure_reason)));
         assert.deepEqual(submitted.map(s => s.head_commit), [h1], "the cross-check reviewed H1, never the stall-time H0");
         assert.ok(pins.includes(h1), "the review snapshot was pinned at H1");
         assert.equal(api.completionPermitRequests.length, 1);

@@ -27,12 +27,16 @@ open/seal calls or a same-operation retry's coherent durable recovery evidence. 
 checks still precede the vault outcome and are revalidated before the reply; the narrowly tolerated
 quarantine refusal grants evidence-check coordinates, not credential release authority (D1).
 
-Rather than fail the run, the worker **parks** it: it confirms the run is still `running`, brings
-its Codex processes to a stop without touching the credential (a **credential-free settle**), then
-makes a **verified capture** of the work done so far, publishing it credential-free when it can. It
-reports `recovery_wait` with cause `vault_locked`, **keeps custody** of the run's source, and does
-**not open the merge request** while the vault stays locked. The park is promoted back to `queued`
-by a best-effort promotion on the owner's explicit successful vault unlock (issue #1792), with
+**Slice A contract, Refs #2852 (AI-synced 2026-10-18):** the held-capture and
+epoch-recreation amendments below define slice A's behavior at this revision.
+Earlier accepted protocol decisions retain their scope.
+
+Rather than fail the run, the worker **parks** it: it confirms the run is still `running`,
+settles Codex execution without touching the credential, and holds credential-free
+capture through verified GitCache capture, attempted authorized publication and full
+supervised-child settlement. It reports `recovery_wait` with cause `vault_locked`,
+keeps the exact source and custody, and does not open the merge request while the vault
+stays locked. The park is promoted back to `queued` by a best-effort promotion on the owner's explicit successful vault unlock (issue #1792), with
 the ordinary recovery timer as a backstop. A queued run whose vault is still locked idles at claim
 and shows "your vault is locked, so this run can't start" until an unlocked claim succeeds.
 It is then re-claimed and resumes — the resume costs at least one model turn, then finalize may
@@ -64,12 +68,13 @@ worker advertising `codex_account_park_v1` answers HTTP 409 with
 Message text, a generic refusal or the worker's account interpretation grants no authority.
 
 The worker interprets this boundary reply as `account_unavailable` and uses D3's
-credential-free ordering: confirm running ownership, settle execution, WIP commit,
-fetch-back into the bare tracking ref, verify, attempt publication, then report the park.
+credential-free ordering: confirm running ownership, settle execution, then hold the
+capture callback through WIP commit, fetch-back into the bare tracking ref, verification,
+attempted authorized publication and supervised-child settlement before reporting the park.
 Publication is best-effort, not a promise of an available server archive. Until capture
 and acknowledgement are verified, local work and session are retained and retried with
-capped backoff. After the park ACK, the tracking ref and session remain recovery sources;
-the live clone may retire under the independent quiescence checks. The custody hold is
+capped backoff. After the park ACK, the exact clone and existing journal stay retained
+even when covered; the tracking ref and session remain recovery sources. The custody hold is
 not settled by this path, and `worker_id` remains the source worker. Resume prefers that
 worker under the existing affinity rules, rather than guaranteeing it in every case.
 
@@ -181,14 +186,67 @@ credential is in hand, whatever additionally caused the block.
 ## D3: settle before capture, and no completion authority while locked
 
 The worker's park sequence, in order: confirm the run is still `running` (a stale or already-parked
-run does not re-park); stop the run's Codex processes without any credential operation (a
-**credential-free settle** — nothing in this path may attempt another refresh or release, since that
-would just re-hit the same lock); make a **verified capture** of the work completed so far,
-published credential-free when the publish path allows it; report `recovery_wait` with cause
+run does not re-park); stop Codex execution without any credential operation, then
+hold safety serialization, the epoch fence and closed admission through source reads,
+WIP commit, fetch-back, verification, authorized credential-free publication and full
+supervised-child settlement for this credential-free park scope. This does not
+extend authority to other shutdown-labelled sinks (#3109); the typed #3101
+shutdown authority and execution-cancellation separation below are unchanged.
+The intentionally poisoned, successfully settled registry
+admits this narrow capture lane, with no provider turn, normal callback, admission
+reopen, credential reconciliation, refresh or release, PAT, credential-bearing environment
+or overlay. Auth close joins raw refresh and direct-handler work, with synchronous
+epoch checks before token delivery and before/after release. Executor-owned summary
+and setup cleanup must join; an independent registry cleanup fault refuses capture,
+healthy credential reconciliation and recreation, separately from primary errors.
+The original absolute authority deadline expires without detaching owned cleanup or
+renewing authority. An incomplete proof grants no capture authority. Then report `recovery_wait` with cause
 `vault_locked` when the api advertises the `recovery_cause_vault_locked` protocol feature, else an
 untyped `recovery_wait`; keep the custody hold. The run does not open its merge request while parked this
 way — finalize, and the completion authority that would open the MR, run only after a successful
 resume past the lock.
+
+Retiring a verified ordinary or intentionally capture-drained epoch preserves the
+public Codex safety marker, so a normal runner boundary cannot fall into the legacy
+branch. A poisoned or disposed normal facade refuses before credential reconciliation.
+If a healthy checkpoint epoch fully tears down and the next provider's initial
+credential release exhausts, a later owned free capture can select a fresh production
+capture-only facade for that exact retired facade. Ordinary evidence is created
+only by `ProviderEpoch.dispose` replacing an abandoned epoch, with observed
+quiescence and matching-epoch reaping, successful disposal, harness close and
+fileop cleanup for that exact public facade, with the registry still disposed and
+unpoisoned.
+The exact registry's pre-reap epoch, root count and existing launch/callback
+cursors, with initially zero pending launches and callbacks, must remain unchanged
+through aggregate reaping, registry/harness/fileop cleanup and later eligibility
+checks; a newly admitted root or pending reservation invalidates the clean result
+and retains the old registry as unverified, even if disposal clears its tables.
+Terminal run cleanup and partial-build cleanup do not create this
+ordinary fact from cleared tracking tables. Intentional capture instead requires
+the exact completed scope/epoch/registry proof to revalidate clean teardown and an
+unchanged poison revision. Selection follows the
+owned joins and outstanding-registry drain checks; arbitrary disposed registries,
+cleared tables, failed cleanup, new poison or roots, and foreign facades do not
+qualify. The new acquisition still intentionally poisons its fresh registry through
+`settleForCapture`, with its own settlement under the original deadline and no
+model/provider, reconciliation, credential-release or PAT authority. This ordinary
+teardown evidence does not broaden cache eligibility or retention. Human decision
+C1 still permits `HeldRunCommandCache.drained` to
+read the exact existing completed-capture proof for cache settlement, requiring `disposed`
+state and `acceptsCompletedCapture`; later poison, changed root/launch/callback
+facts, unclean cache tracking or open roots retain the cache. This narrow reader
+grants no general clean status, admission, credential-release or capture authority.
+Refs #2852 (AI-synced 2026-10-18).
+Pre-start retained-source capture can bind that existing capture-only facade with
+optional worker-internal marker/key/path metadata. Its acquisition-local binding
+and refusal rules are specified in [ADR-1106](1106-codex-harness.md#process-root-ownership);
+this enables an eligible predecessor proof without a provider start, credential
+reconciliation or changes to the normal run binding. Missing metadata retains
+pre-start scoped-reaper refusal. Refs #2852 (AI-synced 2026-10-18).
+That acquisition still needs its own settlement and deadline. New poison or unknown
+cleanup retains the outstanding registry and refuses capture; this is not a blanket
+command-cache retention rule. Cache settlement uses the exact C1 checks above.
+(AI-synced 2026-10-18)
 
 This mirrors the credential-free discipline the reconcile closure already keeps (D2): once the
 vault is known to be locked, nothing on the park path may assume it can still reach the credential,
@@ -203,7 +261,8 @@ described below.
 
 The blocked-proof retention exception covers `vault_locked`, `refresh_unknown` and
 `account_unavailable` (the #1595 amendment above).
-Settlement must still be observed empty; quiescence, WIP commit, fetch-back, tracking-ref
+Settlement must be observed empty before the callback, and capture must complete with
+its supervised children settled; quiescence, WIP commit, fetch-back, tracking-ref
 verification, canonical and foreign-residue checks, and completion proofs remain required.
 A blocked proof retains the clone, session and custody with capped waits and no terminal
 blocked-capture cap for these three deferrals; it does not permit a park or completion without the
@@ -211,6 +270,27 @@ proof. Noncredential recovery keeps its existing terminal blocked-proof cap. Can
 shutdown and claim loss take precedence and retain their existing exit and stale-claim cleanup
 semantics (`handleRecoveryExhausted`, `agent/src/runner.ts`), subject to the narrow actual
 graceful-shutdown durability exception below.
+
+Owner pause uses this held credential-free capture discipline. Save the credential-free
+session before capture can drain the provider epoch. With proven cleanup, continuing
+after a failed or withdrawn pause or human/automatic changed-milestone gate revision
+recreates a possibly drained provider through the existing saved-session epoch path.
+Unproven cleanup still throws `EpochCleanupUnprovenError`. Only the exact matching
+refused/unacknowledged owner-pause safety facade receives accepted B1's
+`RetainedRecoveryStop`, retaining clone/session/journal/custody without a failed terminal
+report or new in-run epoch. This is not a blanket gate-revision error conversion.
+Subsequent execution remains conditional on existing budget/hold recovery policy;
+retained-source recovery starts a fresh attempt path and model session. See ADR-1783's
+B1 boundary below (AI-synced 2026-10-22).
+Newer cancellation, pause and vault-lock state are checked before credentials or model
+execution; a vault lock on recreation takes
+this ADR's credential-deferral park. An accepted owner-pause continuation uses
+fresh held capture authority for source
+HEAD/pin and guarded inventory; refused proof leaves the exact parked source,
+session, existing journal and custody intact without another capture or pause attempt.
+The approval path still skips persistence from the old, drained HOME. This does not make an open `awaiting_approval` gate parkable or
+change fresh-path retained recovery. See [ADR-1783](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect)
+for A's scope and the unshipped B/C gaps.
 
 ### Amendment #3101: actual graceful-shutdown durability
 
@@ -260,6 +340,17 @@ grace; source and custody remain retained on a fail-closed result. Local tests
 with promptly settled predecessors verify receiver content within the original
 grace, not a guarantee for stalled storage or hosted/shared-worker acceptance.
 See [ADR-1597](1597-midturn-checkpoint-durability.md#amendment-2026-10-19--3123-completion-budgets-and-safe-stops).
+
+**#3132 coexistence with slice A (Refs #2852) (AI-synced 2026-10-18):**
+Clean cooperative normal checkpoint stops do not replace `settleForCapture`'s
+intentional poison (N1 remains rejected). Normal boundary entry refuses a
+poisoned or disposed registry before queue admission or timer installation;
+the guard after the queue remains. A checkpoint queued before capture that
+later expires adds no poison to an already poisoned or disposed registry,
+preserving active capture's revision and full supervised-child settlement,
+and exact completed-capture evidence after disposal. Queue expiry while the
+registry is healthy still fails closed. The checkpoint wrapper forwards the
+same identity-branded Git request; this changes no product API, schema or deadline.
 
 ## D4: explicit unlock promotion with the ordinary recovery timer as backstop
 

@@ -1,3 +1,7 @@
+import { summaryOwnership } from "../src/codex/summary-ownership.js";
+import { provisionNative } from "./codex-provision-fixture.js";
+import { provisionRunTools } from "../src/provision-run.js";
+import { nativeRootForTest, installerBarrier } from "./codex-installer-fixture.js";
 import { m3Calls } from "./m3-recovery-fixture.js";
 import { PARK_RUN_CONTINUATION } from "../src/park-run.js";
 import { SummaryRunner, type IntentSummaryInput, type PlanSummaryInput } from "../src/summary-runner.js";
@@ -18,6 +22,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { CodexSessionStore } from "../src/codex/session-state.js";
 import { fakeGitHub, fakeGitlab } from "./runner-harness.js";
 import { realProcfsSkip } from "./real-procfs.js";
+import { newRunAttempt } from "../src/run-quiescence.js";
 
 const HAS_PROCFS = process.platform === "linux";
 // The real runner path opens the Codex session store and quiescence proofs through /proc/self/fd
@@ -32,6 +37,7 @@ import {
   buildRunLaneReconcile,
   buildAppServerRefreshBridge,
   makeCodexAdviceHarness,
+  makeProductionCodexAdviceHarnessFactory,
   CODEX_PRODUCTION_PROVIDER,
   CODEX_TASK_REVIEW_MODEL,
   makeDefaultSpawnCommand,
@@ -55,7 +61,7 @@ import { ProviderPolicyRefusal } from "../src/provider-policy-refusal.js";
 import { RunRunner } from "../src/runner.js";
 import { Outbox } from "../src/outbox.js";
 import { resolveRunKind } from "../src/run-kind.js";
-import { GitCache } from "../src/git.js";
+import { GitCache, assertCaptureLaunch } from "../src/git.js";
 import { FakeApi } from "./fake-api.js";
 import { makeFixture } from "./fixture-repo.js";
 import { makeClaim, testGitCacheOptions, recordingLogger, withReceipts } from "./helpers.js";
@@ -106,7 +112,7 @@ import { makeGitRepo, PR_SUMMARY_EXPECTED, PR_SUMMARY_INPUT } from "./pr-summary
 import type { Logger } from "../src/log.js";
 import type { DockerWiring } from "../src/docker-wiring.js";
 import type { AgentTemplate, MilestoneProgress } from "../src/protocol.js";
-import type { BoundaryRequest, BoundaryPermit } from "../src/harness.js";
+import { EpochCleanupUnprovenError, type BoundaryRequest, type BoundaryPermit } from "../src/harness.js";
 import type { CodexExecutionSafetyImpl } from "../src/codex/safety.js";
 import type {
   CacheCleanupResult,
@@ -293,8 +299,8 @@ class FakeTransport implements CodexTransport {
   private closedFlag = false;
   private interceptor?: (note: CodexNotification, frameBytes: number) => boolean;
 
-  /** Issue #1782: a refused wall park recreates the provider epoch, so a single-transport rig
-   *  hands the recreated epoch a SUCCESSOR transport whose request log and start counters feed
+  /** Issue #1782: when proven cleanup permits epoch recreation after a refused wall park,
+   *  a single-transport rig hands that epoch a SUCCESSOR transport whose request log and counters feed
    *  this (primary) transport, keeping cumulative assertions on `rig.transport` meaningful.
    *  Only `requests` and the thread/turn start counters are mirrored: responses, notifies, closes,
    *  requestOverride and the server-request interceptor stay per-transport and are NOT copied to a
@@ -920,6 +926,35 @@ interface Rig {
   deps: CodexExecutorDeps;
 }
 
+// These callers exercise GitCache's fixed capture producers after acquisition. The
+// production launch validator pins argv/env, including the cancel content helper.
+// OS streams/exit are real; the underlying fixture's drainage evidence stays modeled.
+function forwardCredentialFreeGitRoot(
+  spec: CodexEffectLaunchSpec, deadline: number | undefined, handle: CodexRootHandle, cancel = false,
+): CodexRootHandle {
+  const argv = spec.identity === "command"
+    ? spec.args.slice(spec.args.indexOf("--") + 1) : [spec.command, ...spec.args];
+  if (argv[0] !== "/usr/bin/git" && !(cancel && argv[0] === process.execPath)) return handle;
+  assertCaptureLaunch(spec);
+  assert.ok(deadline !== undefined && deadline > 0, "fixed capture launch requires its original finite deadline");
+  if (argv[0] === process.execPath) {
+    assert.equal(spec.identity, "command");
+    assert.equal(argv[1], "-e");
+    assert.equal(argv[3], spec.cwd);
+    assert.equal(argv.length, 5, "fixed cancel helper and original absolute deadline only");
+  }
+  const child = spawn(argv[0]!, argv.slice(1), { cwd: spec.cwd, env: spec.env, stdio: "pipe" });
+  // One deadline, one signal to this owned child; siblings are independent.
+  const timer = setTimeout(() => child.kill(), deadline);
+  const exited = new Promise<{ event: "child_exit"; code: number }>((resolve, reject) => {
+    child.once("error", error => { clearTimeout(timer); reject(error); });
+    child.once("close", code => { clearTimeout(timer); resolve({ event: "child_exit", code: code ?? 1 }); });
+  });
+  return { ...handle, transport: { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr },
+    waitChild: async () => exited,
+    dispose: async ms => { await exited; return handle.dispose(ms); } };
+}
+
 function makeRig(opts: { responder?: Responder; token?: string } = {}): Rig {
   const transport = new FakeTransport(opts.responder ?? defaultResponder);
   const client = fakeClient(opts.token);
@@ -1112,10 +1147,22 @@ describe("M3 actual runner memory Codex delivery", () => {
       pressure: (bytes: number) => { usage = bytes; }, samples: () => sampleId };
   }
 
-  for (const exhausted of [false, true]) {
-    it(exhausted ? "exhausted bound parks owner with matching callback and retained clone/home"
-      : "pressure joins callback/feed, blocks retry and rearms after sustained low Q", async () => {
+  for (const mode of ["retry", "exhausted", "late capture", "late cleanup"] as const) {
+    const exhausted = mode !== "retry";
+    const lateCapture = mode === "late capture";
+    const late = lateCapture || mode === "late cleanup";
+    it(late ? `memory deadline returns publicly while real Codex capture and finally stay owned: ${mode}`
+      : exhausted ? "exhausted bound parks owner with matching callback and retained clone/home"
+      : "pressure joins callback/feed, blocks retry and rearms after sustained low Q", { skip: late && NEEDS_PROCFS }, async t => {
       const f = await fixture(exhausted ? 1 : 0);
+      let releaseCapture!: () => void, releaseCleanup!: () => void, releaseSibling!: () => void;
+      const captureGate = new Promise<void>(resolve => { releaseCapture = resolve; });
+      const cleanupGate = new Promise<void>(resolve => { releaseCleanup = resolve; });
+      const siblingGate = new Promise<void>(resolve => { releaseSibling = resolve; });
+      const siblingHome = path.join(path.dirname(m2Runner.homeDir), "isolated-sibling");
+      let siblingClone = "", siblingReady = false;
+      let siblingWork: Promise<void> | undefined;
+      let captureEntered = false, cleanupEntered = false;
       let captureStatusReads = 0;
       if (exhausted) {
         // Empty source-only capture: fake effect handles cannot execute Git commands.
@@ -1128,12 +1175,14 @@ describe("M3 actual runner memory Codex delivery", () => {
       })]);
       const launch = rig.deps.launchEffectRoot!;
       let modelLaunches = 0, modelDisposals = 0, probeDisposals = 0, installSettled = false;
+      let captureActive = false;
       let finishModel: (() => void) | undefined;
       const finishes: (() => void)[] = [];
       rig.deps = { ...rig.deps, spawnCommand: undefined, deferRegistryTeardown: true,
         installDeps: async () => { installSettled = true; return { results: [], truncated: false }; },
         launchEffectRoot: async (spec, deadline) => {
           const handle = await launch(spec, deadline);
+          if (captureActive) return forwardCredentialFreeGitRoot(spec, deadline, handle);
           if (spec.args.includes("/usr/local/bin/uzi-codex-fileop")) return handle;
           const probe = spec.args.includes(ENV_PROBE_SCRIPT);
           const pressured = spec.args.includes("echo m3-pressure");
@@ -1168,6 +1217,17 @@ describe("M3 actual runner memory Codex delivery", () => {
         },
       };
       const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider, m2Runner.homeDir);
+      if (late) {
+        const teardown = (executor as any).tearDownEpoch.bind(executor);
+        t.mock.method(executor as any, "tearDownEpoch", async (...args: unknown[]) => {
+          if (captureEntered) {
+            cleanupEntered = true;
+            await cleanupGate;
+            await fs.writeFile(path.join(m2Runner.homeDir, "late-cleanup-proof"), "owned late cleanup");
+          }
+          return teardown(...args);
+        });
+      }
       let captured: CapturedMemoryContext | undefined;
       const settlements: unknown[] = [];
       const delivery: Executor = {
@@ -1178,6 +1238,20 @@ describe("M3 actual runner memory Codex delivery", () => {
           captured = ctx.capturedMemory?.();
           assert.ok(captured, "actual RunRunner supplies trusted captured memory before Codex admission");
           return executor.run(ctx);
+        },
+        withCredentialFreeCapture: async (ms, action, purpose, signal, attempt) => {
+          assert.ok(ms > 0 && ms <= 5000, "settlement stays inside the finite owner budget");
+          captureActive = true;
+          try {
+            const scopedAction: typeof action = late ? async held => {
+              captureEntered = true;
+              if (lateCapture) await captureGate;
+              return action(held);
+            } : action;
+            const result = await Reflect.apply(executor.withCredentialFreeCapture, executor, [ms, scopedAction, purpose, signal, attempt]);
+            settlements.push(result.kind === "observed_empty" ? { kind: result.kind } : result);
+            return result;
+          } finally { captureActive = false; }
         },
         settleForCredentialFreeCapture: async (...args) => {
           assert.ok(args[0] > 0 && args[0] <= 5000, "settlement stays inside the finite owner budget");
@@ -1190,9 +1264,20 @@ describe("M3 actual runner memory Codex delivery", () => {
       const monitoring = f.memory.run();
       const transport = rig.epochs[0]!.transport;
       const ownerLog = recordingLogger();
-      const running = m2Runner.runnerWith(() => ({ executor: delivery, homeDir: m2Runner.homeDir }),
+      const runner = m2Runner.runnerWith(runId => runId === f.claim.run_id
+        ? { executor: delivery, homeDir: m2Runner.homeDir }
+        : { homeDir: siblingHome, executor: { run: async ctx => {
+          siblingClone = ctx.worktreePath;
+          await fs.writeFile(path.join(siblingClone, "SIBLING.txt"), "isolated sibling source");
+          await fs.writeFile(path.join(siblingHome, "session-proof"), "isolated sibling home");
+          siblingReady = true;
+          await siblingGate;
+          return { branch: ctx.branch, pausedAt: { completedCount: 0 } };
+        } } },
         m2Runner.fakeGitlab().gitlab, undefined, ownerLog.logger,
-        { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000 }).execute(f.claim);
+        { memoryRuntime: f.memory, codexBoundaryDeadlineMs: lateCapture ? 500 : late ? 1500 : 5000 });
+      const running = runner.execute(f.claim);
+      let duplicate: Promise<void> | undefined;
       // Rescue only our fake roots/transport, never host processes. Owner waits allow 6s;
       // the 10s rescue settles execution even when an assertion fails before normal cleanup.
       const rescue = setTimeout(() => { finishes.forEach(finish => finish()); transport.end(); }, 10000);
@@ -1226,7 +1311,61 @@ describe("M3 actual runner memory Codex delivery", () => {
         assert.equal(f.reservations[0]!.claim_generation, 7);
         assert.equal(f.reservations[0]!.memory_episode, 3);
         assert.equal(f.reservations[0]!.register_nonce, "m3-original-registration");
-        if (!exhausted) {
+        if (late) {
+          await waitFor(() => captureEntered, "real Codex capture callback entered");
+          const memory = (captured!.flight as any).workerMemory;
+          let terminalDisposals = 0, duplicateGateCalls = 0;
+          const safety = executor.safety!;
+          const dispose = safety.dispose.bind(safety);
+          t.mock.method(safety, "dispose", async (...args: Parameters<typeof dispose>) => {
+            terminalDisposals++;
+            return dispose(...args);
+          });
+          await withTimeout(running, lateCapture ? 1500 : 3000, "memory deadline must not await Codex captureTail");
+          assert.equal(memory.settled === true, !lateCapture,
+            "cover both pending capture and capture already settled beneath pending executor cleanup");
+          assert.equal(runner.isExecuting(f.claim.run_id), true);
+          assert.equal(terminalDisposals, 0, "runner cannot dispose beneath the live capture");
+          assert.equal(await fs.readFile(path.join(m2Runner.homeDir, "m3-session-proof"), "utf8"), "original home");
+          assert.ok(await fs.stat(m2Runner.worktreeDirFor(2396)), "exact source retained");
+          assert.deepEqual(await runner.withRetainedSourceBoundary(f.claim.run_id, [], async () => "unsafe"), { entered: false });
+          const sibling: ClaimResponse = { ...m2Runner.gitlabClaim(2397, {
+            plan_md: "Approved isolated sibling", plan_approved: true, plan_source: "seeded" as const,
+          }), run_id: randomUUID(), claim_generation: 1, memory_episode: 0,
+            memory_policy: { version: 1, max_interventions: 2 }, memory_intervention_count: 0 };
+          await fs.mkdir(siblingHome, { recursive: true });
+          m2Runner.api.setOwnershipStatus(sibling.run_id, "running", 1);
+          f.pressure(100);
+          siblingWork = runner.execute(sibling);
+          await waitFor(() => siblingReady, "independent sibling executes in its own source")
+            .catch(error => { throw new Error(`${String(error)}; sibling states=${JSON.stringify(m2Runner.api.states.filter(s => s.runId === sibling.run_id))}; owner=${JSON.stringify(ownerLog.lines)}`); });
+          assert.notEqual(siblingClone, m2Runner.worktreeDirFor(2396));
+          assert.notEqual(siblingHome, m2Runner.homeDir);
+          t.mock.method(runner as any, "gateQueuedDuplicate", async () => { duplicateGateCalls++; return false; });
+          duplicate = runner.execute(f.claim);
+          await new Promise<void>(resolve => setImmediate(resolve));
+          assert.equal(duplicateGateCalls, 0, "same-run successor remains behind original capture");
+          releaseCapture();
+          await waitFor(() => cleanupEntered, "original Codex finally entered after capture");
+          await memory.operation;
+          assert.equal(memory.settled, true);
+          assert.notEqual(memory.executorSettled, true);
+          await new Promise<void>(resolve => setImmediate(resolve));
+          assert.equal(runner.isExecuting(f.claim.run_id), true, "tail still owns original executor cleanup");
+          assert.equal(duplicateGateCalls, 0, "capture completion alone cannot admit successor");
+          assert.equal(terminalDisposals, 0);
+          assert.deepEqual(await runner.withRetainedSourceBoundary(f.claim.run_id, [], async () => "unsafe"), { entered: false });
+          assert.equal(m2Runner.api.states.some(s => s.runId === f.claim.run_id &&
+            (s.body.status === "failed" || s.body.status === "completed" || (lateCapture && s.body.checkpoint_contains_latest === true))), false);
+          releaseCleanup();
+          await duplicate;
+          assert.equal(memory.executorSettled, true);
+          assert.equal(duplicateGateCalls, 1);
+          assert.equal(runner.isExecuting(f.claim.run_id), false);
+          assert.equal(await fs.readFile(path.join(m2Runner.homeDir, "late-cleanup-proof"), "utf8"), "owned late cleanup");
+          assert.equal(await fs.readFile(path.join(siblingClone, "SIBLING.txt"), "utf8"), "isolated sibling source");
+          assert.equal(await fs.readFile(path.join(siblingHome, "session-proof"), "utf8"), "isolated sibling home");
+        } else if (!exhausted) {
           assert.equal(captured!.commands.admitsCommands(captured!.context), false);
           transport.push(toolCall(23962, "Bash", { command: "echo m3-retry" },
             "m3-thread", "m3-turn", "m3-retry-call"));
@@ -1248,7 +1387,8 @@ describe("M3 actual runner memory Codex delivery", () => {
           await waitFor(() => transport.responses.length >= 4, "done callback response");
           transport.push(turnCompleted("completed", "m3-thread", "m3-turn"));
         } else {
-          await waitFor(() => f.parkReceipts.length === 1 || settlements.length > 0, "owner settlement", 6000);
+          await waitFor(() => f.parkReceipts.length === 1 || settlements.length > 0, "owner settlement", 6000)
+            .catch(error => { throw new Error(`${String(error)}; owner log: ${JSON.stringify(ownerLog.lines)}`); });
           assert.equal(installSettled, true, "dependency installer completed before owner capture");
           assert.equal(await fs.readFile(path.join(m2Runner.homeDir, "m3-session-proof"), "utf8"), "original home");
           assert.ok(await fs.stat(m2Runner.worktreeDirFor(2396)), "owner retains clone even before hold ACK");
@@ -1260,7 +1400,7 @@ describe("M3 actual runner memory Codex delivery", () => {
           transport.end();
         }
         await withTimeout(running, 12000, "M3 runner completion");
-        if (exhausted) {
+        if (exhausted && !late) {
           const parks = m2Runner.api.states.filter(s => s.body.recovery_cause === "worker_memory_pressure");
           assert.equal(parks.length, 1);
           assert.deepEqual(parks[0]!.body, { status: "recovery_wait", recovery_cause: "worker_memory_pressure",
@@ -1277,6 +1417,9 @@ describe("M3 actual runner memory Codex delivery", () => {
           assert.equal(captured!.commands.remaining(captured!.context), 0);
         }
       } finally {
+        releaseCapture();
+        releaseCleanup();
+        releaseSibling();
         finishes.forEach(finish => finish());
         transport.end();
         try { await withTimeout(running, 12000, "M3 runner cleanup"); }
@@ -1284,6 +1427,10 @@ describe("M3 actual runner memory Codex delivery", () => {
           clearTimeout(rescue);
           await f.memory.stop();
           await monitoring;
+          await duplicate;
+          await siblingWork;
+          await (captured?.flight as any)?.workerMemory?.operation;
+          await (captured?.flight as any)?.workerMemory?.executorRun;
         }
       }
     });
@@ -2083,7 +2230,26 @@ describe("#2493 initial credential release", () => {
         const url = await api.listen();
         const fx = makeFixture();
         const rig = makeMultiEpochRig([]);
-        rig.deps = { ...rig.deps, initialCredentialBaseDelayMs: 1 };
+        const effect = rig.deps.launchEffectRoot!;
+        rig.deps = { ...rig.deps, initialCredentialBaseDelayMs: 1,
+          launchEffectRoot: async (spec, deadline) => {
+            const handle = await effect(spec, deadline);
+            const argv = spec.command.endsWith("/uzi-codex-command-sandbox")
+              ? spec.args.slice(spec.args.indexOf("--") + 1) : [spec.command, ...spec.args];
+            if (argv[0] !== "/usr/bin/git") return handle;
+            // Capture now uses the production supervised adapter. The rig's
+            // otherwise-never-ending fileop streams cannot stand in for Git output.
+            const child = spawn(argv[0], argv.slice(1), { cwd: spec.cwd, env: spec.env, stdio: "pipe" });
+            const timer = setTimeout(() => child.kill(), deadline);
+            const exited = new Promise<{ event: "child_exit"; code: number }>((resolve, reject) => {
+              child.once("error", error => { clearTimeout(timer); reject(error); });
+              child.once("close", code => { clearTimeout(timer); resolve({ event: "child_exit", code: code ?? 1 }); });
+            });
+            return { ...handle, transport: { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr },
+              waitChild: async () => exited,
+              dispose: async ms => { await exited; return handle.dispose(ms); } };
+          },
+        };
         const diagnostics = recordingLog();
         const client = new WorkerClient(url, "recovery-release-worker", "test", diagnostics.log,
           { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
@@ -2193,6 +2359,26 @@ describe("#2493 initial credential release", () => {
     const url = await api.listen();
     const fx = makeFixture();
     const rig = makeMultiEpochRig([]);
+    const effect = rig.deps.launchEffectRoot!;
+    rig.deps = { ...rig.deps,
+      launchEffectRoot: async (spec, deadline) => {
+        const handle = await effect(spec, deadline);
+        const argv = spec.command.endsWith("/uzi-codex-command-sandbox")
+          ? spec.args.slice(spec.args.indexOf("--") + 1) : [spec.command, ...spec.args];
+        if (argv[0] !== "/usr/bin/git") return handle;
+        // Capture now uses the production supervised adapter. The rig's
+        // otherwise-never-ending fileop streams cannot stand in for Git output.
+        const child = spawn(argv[0], argv.slice(1), { cwd: spec.cwd, env: spec.env, stdio: "pipe" });
+        const timer = setTimeout(() => child.kill(), deadline);
+        const exited = new Promise<{ event: "child_exit"; code: number }>((resolve, reject) => {
+          child.once("error", error => { clearTimeout(timer); reject(error); });
+          child.once("close", code => { clearTimeout(timer); resolve({ event: "child_exit", code: code ?? 1 }); });
+        });
+        return { ...handle, transport: { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr },
+          waitChild: async () => exited,
+          dispose: async ms => { await exited; return handle.dispose(ms); } };
+      },
+    };
     const client = new WorkerClient(url, "shutdown-release-worker", "test", noopLog,
       { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
     client.protocolFeatures = ["run_checkpoint_durability"];
@@ -2206,15 +2392,20 @@ describe("#2493 initial credential release", () => {
       secrets: { forge_pat: "fixture-forge-pat-000000", codex: SUBSCRIPTION as never },
     });
     api.codexReleaseSequences.set(claim.run_id, Array.from({ length: 6 }, () => ({ status: 503 })));
-    const executor = makeExecutor({ ...rig, client: client as never }, bindingOf(SUBSCRIPTION));
+    let current = makeExecutor({ ...rig, client: client as never }, bindingOf(SUBSCRIPTION));
+    // Runner callbacks always address the current scope, including capture and safety.
+    const executor = new Proxy(current, { get: (_target, key) => {
+      if (key === "run") return runAfterDeclinedPause;
+      const value = Reflect.get(current, key);
+      return typeof value === "function" ? value.bind(current) : value;
+    } });
     const homeDir = path.join(fx.dataDir, "shutdown-home");
-    const original = executor.run.bind(executor);
     let releaseError: unknown;
     let terminal: AbortSignal | undefined;
     let checkpoint: RunContext["checkpoint"];
     let worktree = "";
     let pauseSignal: AbortSignal | undefined;
-    executor.run = async ctx => {
+    const runAfterDeclinedPause = async (ctx: RunContext) => {
       checkpoint = ctx.checkpoint;
       worktree = ctx.worktreePath;
       pauseSignal = ctx.signal;
@@ -2226,7 +2417,10 @@ describe("#2493 initial credential release", () => {
       assert.equal(await ctx.parkForPause!({ completedCount: 0 }), false, "actual runner declines undurable pause");
       api.appendInputs(claim.run_id, [{ id: 2, kind: "pause_cancel" }]);
       await waitFor(() => ctx.pauseModeRequested!() === null, "runner clears declined pause");
-      try { return await original(ctx); } catch (e) { releaseError = e; throw e; }
+      assert.equal((await current.safety!.dispose({ boundary: "terminal", deadlineMs: 1000 })).kind, "disposed");
+      // Capture-before-run permanently closes the old leg. A refused pause continues fresh.
+      current = makeExecutor({ ...rig, client: client as never }, bindingOf(SUBSCRIPTION));
+      try { return await current.run(ctx); } catch (e) { releaseError = e; throw e; }
     };
     const git = new GitCache(fx.dataDir, noopLog, undefined, testGitCacheOptions());
     const runner = new RunRunner(client, git,
@@ -2447,7 +2641,11 @@ describe("#2493 initial credential release", () => {
     const url = await api.listen();
     const fx = makeFixture();
     const rig = makeMultiEpochRig([]);
-    rig.deps = { ...rig.deps, initialCredentialBaseDelayMs: 1 };
+    const launchCapture = rig.deps.launchEffectRoot!;
+    rig.deps = { ...rig.deps, initialCredentialBaseDelayMs: 1,
+      launchEffectRoot: async (spec, deadline) =>
+        forwardCredentialFreeGitRoot(spec, deadline, await launchCapture(spec, deadline)),
+    };
     api.recoveryWaitRequiresRunning = true;
     const client = new WorkerClient(url, "release-worker", "test", noopLog, { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
     const claim = makeClaim({
@@ -2660,6 +2858,176 @@ describe("decoded Codex usage limits reach RunRunner #2360", () => {
         await api.close();
         fx.cleanup();
       }
+    });
+  }
+});
+
+describe("ordinary teardown capture eligibility", () => {
+  // Unit seam only: real registry and safety, modeled root evidence; no live-kernel claim.
+  for (const mode of ["late-accepted-root", "late-reservation", "late-reap-root", "late-reservation-repeat", "clean", "clean-repeat", "already-disposed", "already-disposed-no-facade", "later-poison", "late-root", "root-cleanup",
+    "harness-cleanup", "fileop-cleanup", "foreign-facade", "terminal"] as const) {
+    it(`ordinary teardown capture eligibility ${mode}`, async () => {
+      const rig = makeRig();
+      let launches = 0;
+      const launch = rig.deps.launchEffectRoot!;
+      rig.deps = { ...rig.deps, launchEffectRoot: async (...args) => { launches++; return launch(...args); } };
+      const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      const registry = new ExecutionRegistry(newLocalExecutionEpoch(2852));
+      const tracked = trackedRoot();
+      const reservationOnly = mode === "late-reservation" || mode === "late-reservation-repeat";
+      const lateMode = mode === "late-accepted-root" || reservationOnly || mode === "late-reap-root";
+      let injected = false;
+      let admissionState: string | undefined;
+      let admission: string | undefined;
+      let registered: boolean | undefined;
+      let lateReaps = 0;
+      let lateDisposals = 0;
+      let lateDisposed = false;
+      const lateRoot: RegisteredRoot = {
+        kind: "boundary_action",
+        reap: async () => {
+          lateReaps++;
+          return { ok: false, error: { category: "tool", message: "not observed empty" } };
+        },
+        dispose: async () => {
+          if (lateDisposed) return;
+          lateDisposed = true;
+          lateDisposals++; // Idempotent transport cleanup supplies no reap evidence.
+        },
+      };
+      const inject = () => {
+        if (injected) return;
+        injected = true;
+        admissionState = registry.state();
+        const late = registry.reserveLaunch("boundary_action");
+        admission = late.kind;
+        if (late.kind === "reserved" && !reservationOnly) {
+          registered = registry.registerRoot(late.reservation, lateRoot).ok;
+        }
+      };
+      const root: RegisteredRoot = { ...tracked.root,
+        reap: async ms => {
+          if (mode === "late-reap-root") inject();
+          return tracked.root.reap(ms);
+        },
+        dispose: async ms => {
+          await tracked.root.dispose(ms);
+          if (mode === "late-accepted-root" || reservationOnly) inject();
+          if (mode === "root-cleanup") throw new Error("root cleanup unconfirmed");
+        },
+      };
+      const reservation = registry.reserveLaunch(root.kind);
+      assert.equal(reservation.kind, "reserved");
+      if (reservation.kind !== "reserved") throw new Error("missing launch reservation");
+      assert.equal(registry.registerRoot(reservation.reservation, root).ok, true);
+      const facade = createCodexExecutionSafety(registry, async () => { throw new Error("no normal spawn"); });
+      exec.safety = mode === "already-disposed-no-facade" ? undefined : facade;
+      const initialSafety = exec.safety;
+      exec["epochSafeties"].set(registry, facade);
+      exec["unverifiedEpochRegistries"].add(registry);
+      if (mode === "already-disposed" || mode === "already-disposed-no-facade") assert.equal((await registry.disposeTools(1000)).kind, "disposed");
+      const harness = mode === "harness-cleanup"
+        ? { close: async () => { throw new Error("harness cleanup unconfirmed"); } } as unknown as CodexHarness : undefined;
+      const fileop = mode === "fileop-cleanup"
+        ? { ...fakeFileopHandle().handle, dispose: async () => { throw new Error("fileop cleanup unconfirmed"); } } : undefined;
+      const clean = await exec["tearDownEpoch"](registry, harness, fileop, 1000, true, mode === "terminal" ? undefined : "replacement");
+      const unverifiedAfterTeardown = exec["unverifiedEpochRegistries"].has(registry);
+      assert.equal(exec.safety, initialSafety, "teardown preserves the initial public refusal marker");
+      const reapsAfterFirst = tracked.reaped();
+      const secondClean = mode === "late-reservation-repeat" || mode === "clean-repeat"
+        ? await exec["tearDownEpoch"](registry, harness, fileop, 1000, true, "replacement") : undefined;
+      const unverifiedAfterSecond = exec["unverifiedEpochRegistries"].has(registry);
+      if (mode === "later-poison") registry.poison({ category: "tool", message: "late cleanup fault" });
+      if (mode === "late-root") {
+        assert.equal(registry.registerRoot(reservation.reservation, root).ok, false);
+        assert.equal(registry.isPoisoned(), true, "late invalid registration poisons disposed epoch");
+      }
+      if (mode === "foreign-facade") {
+        const foreign = new ExecutionRegistry(newLocalExecutionEpoch(2853));
+        assert.equal((await foreign.disposeTools(1000)).kind, "disposed");
+        exec.safety = createCodexExecutionSafety(foreign, async () => { throw new Error("no foreign spawn"); });
+      }
+      const current = exec.safety;
+      let actions = 0;
+      const result = await exec.withCredentialFreeCapture(1000, async () => {
+        actions++;
+        const fresh = [...exec["epochSafeties"]].find(([, safety]) => safety === exec.safety)?.[0];
+        assert.ok(fresh);
+        assert.notEqual(fresh, registry);
+        assert.equal(fresh.isPoisoned(), true, "N1: replacement still intentionally poisons before capture");
+        return "local-only";
+      });
+      if (mode === "late-reservation-repeat" || mode === "already-disposed-no-facade" || mode === "clean-repeat") {
+        // Keep evidence through public capture, including on the unfixed source.
+        const facts = {
+          clean, secondClean, unverifiedAfterTeardown, unverifiedAfterSecond,
+          unverifiedAfterCapture: exec["unverifiedEpochRegistries"].has(registry),
+          oldFacadeTrackedAfterCapture: exec["epochSafeties"].has(registry),
+          result: result.kind, actions, reapsAfterFirst, reapsAfterCapture: tracked.reaped(),
+          injected, admissionState, admission, registered, lateReaps, lateDisposals,
+          roots: registry.rootCount(), pending: registry.pendingLaunchCount(),
+          state: registry.state(), poison: registry.isPoisoned(), initialSafetyUndefined: initialSafety === undefined,
+          releases: rig.client.releaseCalls.length, refreshes: rig.client.refreshCalls.length,
+          launches, probes: rig.probeCalls.length,
+        };
+        console.log("ORDINARY_REPEAT_OBSERVATION " + mode + " " + JSON.stringify(facts));
+        const successful = mode === "clean-repeat";
+        const repeated = mode !== "already-disposed-no-facade";
+        assert.deepEqual(facts, {
+          clean: successful, secondClean: repeated ? successful : undefined,
+          unverifiedAfterTeardown: !successful, unverifiedAfterSecond: !successful,
+          unverifiedAfterCapture: !successful, oldFacadeTrackedAfterCapture: !successful,
+          result: successful ? "observed_empty" : "incomplete", actions: successful ? 1 : 0,
+          reapsAfterFirst: repeated ? 1 : 0, reapsAfterCapture: repeated ? 1 : 0,
+          injected: mode === "late-reservation-repeat",
+          admissionState: mode === "late-reservation-repeat" ? "closed" : undefined,
+          admission: mode === "late-reservation-repeat" ? "reserved" : undefined,
+          registered: undefined, lateReaps: 0, lateDisposals: 0, roots: 1, pending: 0,
+          state: "disposed", poison: false, initialSafetyUndefined: !repeated,
+          releases: 0, refreshes: 0, launches: 0, probes: 0,
+        }, "B2-R1: only proven clean repeats may forget the old epoch and admit capture");
+      }
+      if (lateMode) {
+        const facts = {
+          clean, unverifiedAfterTeardown,
+          unverifiedAfterCapture: exec["unverifiedEpochRegistries"].has(registry),
+          result: result.kind, actions, injected, admissionState, admission, registered,
+          initialReaps: tracked.reaped(), lateReaps, lateDisposals,
+          roots: registry.rootCount(), pending: registry.pendingLaunchCount(),
+          state: registry.state(), poison: registry.isPoisoned(),
+          releases: rig.client.releaseCalls.length, refreshes: rig.client.refreshCalls.length,
+          launches, probes: rig.probeCalls.length,
+        };
+        console.log("ORDINARY_OBSERVATION " + mode + " " + JSON.stringify(facts));
+        assert.deepEqual(facts, {
+          clean: false, unverifiedAfterTeardown: true, unverifiedAfterCapture: true,
+          result: "incomplete", actions: 0, injected: true, admissionState: "closed",
+          admission: "reserved", registered: reservationOnly ? undefined : true,
+          initialReaps: 1, lateReaps: 0, lateDisposals: reservationOnly ? 0 : 1,
+          roots: reservationOnly ? 1 : 2, pending: 0,
+          state: "disposed", poison: false, releases: 0, refreshes: 0, launches: 0, probes: 0,
+        });
+      } else if (mode === "clean" || mode === "clean-repeat") {
+        assert.deepEqual(result, { kind: "observed_empty", value: "local-only" });
+        assert.equal(actions, 1);
+        assert.notEqual(exec.safety, current, "ordinary proof selects a fresh capture-only facade");
+        await assert.rejects(exec.safety!.withBoundary({ boundary: "finalize", deadlineMs: 1000 },
+          async () => { throw new Error("normal boundary entered"); }),
+          error => error instanceof CodexBoundaryError || error instanceof TrustedExecutionRefusal);
+      } else {
+        assert.equal(result.kind, "incomplete");
+        assert.equal(actions, 0, "ineligible teardown must refuse before capture callback");
+        assert.equal(exec.safety, current);
+      }
+      if (!lateMode) {
+        assert.equal(clean, !["already-disposed", "already-disposed-no-facade", "root-cleanup", "harness-cleanup", "fileop-cleanup"].includes(mode));
+      }
+      assert.equal(launches, 0);
+      assert.equal(rig.client.releaseCalls.length, 0);
+      assert.equal(rig.client.refreshCalls.length, 0);
+      assert.equal(rig.probeCalls.length, 0);
+      await registry.disposeTools(1000);
+      await exec.safety?.dispose({ boundary: "terminal", deadlineMs: 1000 });
     });
   }
 });
@@ -3009,9 +3377,16 @@ describe("m1 credential-free owner cancel", () => {
       const recovery = makeRecoveryCoordinator(recoveryClient, recoveryGit);
       const rig = makeRig({ responder: quietResponder });
       rig.deps = { ...rig.deps, deferRegistryTeardown: true };
-      const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
       let settlingCancel = false;
+      const launchCancel = rig.deps.launchEffectRoot!;
+      rig.deps = { ...rig.deps, launchEffectRoot: async (spec, deadline) => {
+        const handle = await launchCancel(spec, deadline);
+        return settlingCancel ? forwardCredentialFreeGitRoot(spec, deadline, handle, true) : handle;
+      } };
+      const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
       let settlementKind: string | undefined;
+      let captureEntered = false;
+      let captureError: unknown;
       const reap = rig.root.reap.bind(rig.root);
       rig.root.reap = async (...args) => {
         if (scenario.quarantine === "settle" && settlingCancel && !quarantineSeamReached) await pauseForQuarantine();
@@ -3125,6 +3500,21 @@ describe("m1 credential-free owner cancel", () => {
           },
           get safety() { return executor.safety; },
           sandboxesCommands: true,
+          withCredentialFreeCapture: async (ms, action, purpose, signal, attempt) => {
+            settlingCancel = purpose === "cancel";
+            try {
+              const observedAction: typeof action = async context => {
+                captureEntered = true;
+                return action(context);
+              };
+              const result = await Reflect.apply(executor.withCredentialFreeCapture, executor, [ms, observedAction, purpose, signal, attempt]);
+              settlementKind = result.kind;
+              return result;
+            } catch (error) {
+              captureError = error;
+              throw error;
+            } finally { settlingCancel = false; }
+          },
           settleForCredentialFreeCapture: async (ms, purpose) => {
             settlingCancel = purpose === "cancel";
             try {
@@ -3430,7 +3820,16 @@ describe("m1 credential-free owner cancel", () => {
         if (scenario.releaseTransport) {
           assert.ok(realFlight, "real flight captured");
           assert.equal(dispositionObserved, true);
-          assert.equal(settlementKind, "observed_empty");
+          assert.equal(captureEntered, true, "real capture admission precedes the release ACK");
+          if (scenario.releaseTransport === "oversized") {
+            // Action errors are rethrown; they are not a returned settlement result.
+            assert.equal(settlementKind, undefined);
+            assert.ok(captureError instanceof Error);
+            assert.equal(captureError, releaseError, "capture preserves the exact overflow error");
+          } else {
+            assert.equal(settlementKind, "observed_empty");
+            assert.equal(captureError, undefined);
+          }
           assert.deepEqual({ disposition, ...preservationAfterDisposition }, {
             disposition: shouldRelease ? "released" : "retained",
             preserveRecoveryClone: !shouldRelease, preserveSession: !shouldRelease,
@@ -3477,7 +3876,11 @@ describe("m1 credential-free owner cancel", () => {
         assert.equal(records.some(record => record.generation === 7), !shouldRelease, "own journal follows exact release proof");
         assert.equal(await git.revParse(bare, `refs/uzi-recovery-pin/${claim.run_id}/8^{commit}`), startHead, "sibling pin untouched");
         assert.equal(await git.revParse(bare, `refs/uzi-recovery-pin/${claim.run_id}/7^{commit}`), shouldRelease ? null : startHead, "own exact-generation pin follows release proof");
-        if (!["before-cancel", "settle"].includes(scenario.quarantine ?? "")) {
+        if (scenario.drain === "root") {
+          assert.equal(settlementKind, "incomplete", "surviving provider refuses capture");
+          assert.equal(observations.includes("owner_cancel"), false, "no inspection before root drainage");
+          assert.equal(observations.includes("inspect"), false);
+        } else if (!["before-cancel", "settle"].includes(scenario.quarantine ?? "")) {
           assert.ok(observations.includes("owner_cancel"));
           assert.ok(cancelLogs.some(line => rec(line).msg === "owner cancel Docker teardown"), "Docker state logged when initial proof reached");
         }
@@ -5648,113 +6051,79 @@ describe("CodexExecutor: child-thread delegation demux (part C)", () => {
     assert.equal(replyOf1(rig).success, true, "the parent spawn_agent callback succeeded after the child settled");
   });
 
-  it("(20a) a refused wall-park re-drive runs on the recreated epoch's fresh registry, so the interrupted drive's unsettled callback cannot hold idle (issue #1782)", async () => {
-    const IDLE_MS = 90;
-    const rig = makeRig({ responder: (c) => {
-      if (c.method === "thread/start") return { thread: { id: "th-1" } };
-      if (c.method === "turn/start") {
-        if (c.turnStartCount === 1) c.transport.push(threadStarted());
-        return { turn: { id: "tn-1" } };
-      }
-      return {};
-    } });
-    rig.deps = { ...rig.deps, idleMs: IDLE_MS, wallMs: 50, boundaryDeadlineMs: 50 };
-
-    // Capture the real epoch registry as the executor subscribes its idle watchdog.
-    // Both drives must use this same registry; the first reservation stays unsettled.
-    const subscribe = ExecutionRegistry.prototype.subscribeCallbacks;
-    let registry: ExecutionRegistry | undefined;
-    const captureRegistry = (value: ExecutionRegistry): void => { registry = value; };
-    ExecutionRegistry.prototype.subscribeCallbacks = function (listener) {
-      captureRegistry(this);
-      return subscribe.call(this, listener);
-    };
-    let parks = 0;
-    const { ctx } = makeCtx({
-      parkForWall: async () => ++parks === 1 ? "refused" : "parked",
-      takeWallParkRefresh: () => ({ totalSeconds: 1, usedSeconds: 0 }),
-    });
-    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
-    try {
-      await waitFor(() => rig.transport.turnStartCount === 1 && registry !== undefined, "first drive and registry");
-      const epoch = registry!;
-      const stale = epoch.reserveCallback({ threadId: "th-1", turnId: "tn-1", callId: "stale", fingerprint: "stale" });
-      assert.equal(stale.kind, "admitted");
-
-      await waitFor(() => rig.transport.turnStartCount === 2, "refused park re-drive");
-      // Issue #1782: a refused park recreates the epoch, so the re-drive runs on a FRESH registry and
-      // the interrupted drive's unsettled callback is left behind on the disposed one.
-      assert.notEqual(registry, epoch, "the re-drive uses the recreated epoch's registry");
-      assert.equal(registry!.inFlightCallbackCount(), 0, "the fresh registry carries no stale callback");
-      const reDriveEpoch = registry!;
-      const current = reDriveEpoch.reserveCallback({ threadId: "th-1", turnId: "tn-1", callId: "current", fingerprint: "current" });
-      assert.equal(current.kind, "admitted");
-      if (current.kind !== "admitted") return;
-
-      await new Promise<void>((resolve) => setTimeout(resolve, IDLE_MS + 50));
-      assert.equal(parks, 1, "a callback admitted in the current drive suppresses idle");
-      reDriveEpoch.settleCallback(current.token, "ok");
-      assert.equal(reDriveEpoch.inFlightCallbackCount(), 0, "the current callback settled");
-      await assert.rejects(
-        withTimeout(running, 2000, "idle after the current callback settles"),
-        /codex run idle timeout/,
-        "the current drive idles even though the interrupted drive's callback never settled",
-      );
-      assert.equal(parks, 1, "idle did not consume the bounded wall budget");
-    } finally {
-      ExecutionRegistry.prototype.subscribeCallbacks = subscribe;
-      rig.transport.end();
-      await running.catch(() => undefined);
-    }
-  });
-
-  it("(20b) a same-registry re-drive after a withdrawn pause ignores an unsettled callback from the interrupted drive for idle", async () => {
-    // The withdrawn-pause `continue` in driveTurnWithWallPark re-drives on the SAME registry (no epoch
-    // recreation), so the cursor taken at the re-drive's start is the only thing keeping the
-    // interrupted drive's unsettled reservation from suppressing idle for the re-drive.
-    const IDLE_MS = 90;
-    const rig = makeRig({ responder: (c) => {
-      if (c.method === "thread/start") return { thread: { id: "th-1" } };
-      if (c.method === "turn/start") {
-        if (c.turnStartCount === 1) c.transport.push(threadStarted());
-        return { turn: { id: `tn-${c.turnStartCount}` } };
-      }
-      return {};
-    } });
-    rig.deps = { ...rig.deps, idleMs: IDLE_MS, wallMs: 5000, boundaryDeadlineMs: 50 };
-    const subscribe = ExecutionRegistry.prototype.subscribeCallbacks;
-    const registries: ExecutionRegistry[] = [];
-    ExecutionRegistry.prototype.subscribeCallbacks = function (listener) {
-      if (!registries.includes(this)) registries.push(this);
-      return subscribe.call(this, listener);
-    };
-    const controller = new AbortController();
-    const { ctx } = makeCtx({
-      signal: controller.signal,
-      pauseModeRequested: () => null, // the pause is withdrawn before it is handled
-    });
-    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
-    try {
-      await waitFor(() => rig.transport.turnStartCount === 1 && registries.length === 1, "first drive and registry");
-      const registry = registries[0]!;
-      const stale = registry.reserveCallback({ threadId: "th-1", turnId: "tn-1", callId: "stale", fingerprint: "stale" });
-      assert.equal(stale.kind, "admitted");
-      controller.abort(new PauseNowSignal());
-
-      await waitFor(() => rig.transport.turnStartCount === 2, "withdrawn-pause re-drive");
-      assert.equal(registries.length, 1, "the re-drive stayed on the same registry");
-      assert.equal(registry.inFlightCallbackCount(), 1, "the interrupted drive's callback is still unsettled");
-      await assert.rejects(
-        withTimeout(running, 2000, "idle on the re-drive"),
-        /codex run idle timeout/,
-        "the re-drive idles although the interrupted drive's callback never settled",
-      );
-    } finally {
-      ExecutionRegistry.prototype.subscribeCallbacks = subscribe;
-      rig.transport.end();
-      await running.catch(() => undefined);
-    }
-  });
+  for (const route of ["refused wall", "withdrawn pause"] as const) {
+    for (const drainOld of [false, true]) it(
+      `(20${route === "refused wall" ? "a" : "b"}) ${route} ${drainOld ? "recreates after the old callback settles before checking idle" : "refuses an unsettled old callback"}`,
+      async () => {
+        const IDLE_MS = 90;
+        const rig = makeRig({ responder: c => {
+          if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+          if (c.method === "turn/start") {
+            if (c.turnStartCount === 1) c.transport.push(threadStarted());
+            return { turn: { id: `tn-${c.turnStartCount}` } };
+          }
+          return {};
+        } });
+        rig.deps = { ...rig.deps, idleMs: IDLE_MS, wallMs: route === "refused wall" ? 50 : 5000,
+          boundaryDeadlineMs: 50 };
+        const subscribe = ExecutionRegistry.prototype.subscribeCallbacks;
+        const registries: ExecutionRegistry[] = [];
+        ExecutionRegistry.prototype.subscribeCallbacks = function (listener) {
+          if (!registries.includes(this)) registries.push(this);
+          return subscribe.call(this, listener);
+        };
+        const controller = new AbortController();
+        let parks = 0;
+        const { ctx } = makeCtx({
+          signal: controller.signal,
+          pauseModeRequested: () => null,
+          parkForWall: async () => { parks++; return "refused"; },
+          takeWallParkRefresh: () => ({ totalSeconds: 1, usedSeconds: 0 }),
+        });
+        const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+        // Rejection is expected in the uncertain case; observe it before waiting on fixture events.
+        void running.catch(() => undefined);
+        try {
+          await waitFor(() => rig.transport.turnStartCount === 1 && registries.length === 1, "first drive and registry");
+          const old = registries[0]!;
+          const stale = old.reserveCallback({ threadId: "th-1", turnId: "tn-1", callId: "stale", fingerprint: "stale" });
+          assert.equal(stale.kind, "admitted");
+          if (stale.kind !== "admitted") throw new Error("old callback was not admitted");
+          assert.equal(old.inFlightCallbackCount(), 1, "the old callback is pending before pause handling");
+          if (drainOld) old.settleCallback(stale.token, "ok");
+          if (route === "withdrawn pause") controller.abort(new PauseNowSignal());
+          if (!drainOld) {
+            await assert.rejects(withTimeout(running, 2000, "uncertain epoch refusal"),
+              /prior Codex epoch cleanup unproven/);
+            assert.equal(rig.providerLaunches(), 1, "uncertain old epoch admits no replacement");
+            assert.equal(rig.transport.turnStartCount, 1, "uncertain callback never permits continuation");
+            assert.equal(rig.client.releaseCalls.length, 1, "uncertain cleanup permits no fresh credential release");
+            assert.equal(rig.client.refreshCalls.length, 0, "uncertain cleanup permits no refresh");
+            old.settleCallback(stale.token, "ok");
+            return;
+          }
+          await waitFor(() => rig.transport.turnStartCount === 2, "fresh epoch re-drive");
+          assert.equal(rig.providerLaunches(), 2);
+          assert.equal(old.inFlightCallbackCount(), 0, "old callback was joined");
+          const fresh = registries.at(-1)!;
+          assert.notEqual(fresh, old, "even a withdrawn pause recreates the drained epoch");
+          assert.equal(fresh.inFlightCallbackCount(), 0);
+          const current = fresh.reserveCallback({ threadId: "th-1", turnId: "tn-2", callId: "current", fingerprint: "current" });
+          assert.equal(current.kind, "admitted");
+          if (current.kind !== "admitted") throw new Error("current callback was not admitted");
+          await new Promise<void>(resolve => setTimeout(resolve, IDLE_MS + 50));
+          assert.equal(parks, route === "refused wall" ? 1 : 0, "current callback suppresses idle without a stale wall park");
+          fresh.settleCallback(current.token, "ok");
+          await assert.rejects(withTimeout(running, 2000, "idle after current callback settles"), /codex run idle timeout/);
+          assert.equal(parks, route === "refused wall" ? 1 : 0, "idle does not consume the newer wall budget");
+        } finally {
+          ExecutionRegistry.prototype.subscribeCallbacks = subscribe;
+          rig.transport.end();
+          await running.catch(() => undefined);
+        }
+      },
+    );
+  }
 
   it("(C4a) a child's token_usage_updated flows through the REAL delegation flow and is charged to the CHILD's configured model, not the root's", async () => {
     // The executor→accountant wiring seam: startChildTurn calls harness.recordChildThreadModel
@@ -12116,6 +12485,151 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
     assert.deepEqual(c.holder.releases, [true]);
   });
 
+  for (const fault of ["none", "later-poison", "unclean-capture"] as const) {
+    it(`C3 public pause capture terminal cache settlement ${fault}`, async () => {
+      const c = cacheRig({ defer: true,
+        unclean: (_index, spec) => fault === "unclean-capture" && spec.args.includes("status"),
+      });
+      const exec = makeExecutor(c.rig, bindingOf(SUBSCRIPTION));
+      const git = new GitCache(process.env.TMPDIR!, noopLog);
+      let captures = 0;
+      const { ctx } = makeCtx({
+        pauseModeRequested: () => "now",
+        reportIteration: async () => ({ pauseRequested: false }),
+        parkForPause: async () => {
+          captures++;
+          const capture = () => exec.withCredentialFreeCapture(1000, async context => {
+            assert.deepEqual(c.holder.releases, [], "capture keeps the holder alive");
+            if (fault === "unclean-capture") {
+              assert.equal(await git.withCredentialFreeCapture(context,
+                () => git.worktreeStatus(WORKSPACE)), null, "unclean canonical Git has no trusted result");
+            }
+            return true;
+          });
+          if (fault === "unclean-capture") {
+            await assert.rejects(capture(), error => {
+              assert.ok(error instanceof CodexBoundaryError);
+              assert.equal(error.diagnostic, "codex boundary failed at action: capture child cleanup failed");
+              return true;
+            });
+          } else assert.equal((await capture()).kind, "observed_empty");
+          return true;
+        },
+      });
+      assert.ok((await withTimeout(exec.run(ctx), 3000, "C3 seeded pause")).pausedAt);
+      assert.equal(captures, 1, "real executor invokes the pause capture");
+      assert.deepEqual(c.holder.releases, [], "deferred run has not settled the holder");
+      if (fault === "later-poison") {
+        // Fault injection only; release and evidence lookup stay on the public production route.
+        const registry = [...exec["epochSafeties"]].find(([, safety]) => safety === exec.safety)?.[0];
+        assert.ok(registry);
+        registry.poison({ category: "tool", message: "C3 later cleanup uncertainty" });
+      }
+      if (fault === "unclean-capture") {
+        const root = c.specs.find(spec => spec.args.includes("status"));
+        assert.ok(root, "canonical scoped Git actually launched");
+        assert.ok(!root.args.includes("--cache"));
+        for (const key of CACHE_KEYS) assert.equal(root.env[key], undefined);
+      }
+      await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 1000 });
+      assert.deepEqual(c.holder.releases, [fault === "none"],
+        "only exact completed capture plus terminal disposal can drain the cache");
+      await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 1000 });
+      assert.deepEqual(c.holder.releases, [fault === "none"], "terminal settlement is idempotent");
+    });
+  }
+
+  it("pre-existing fault -> capture -> dispose => cache retained", async () => {
+    const c = cacheRig({ defer: true, holderResult: { state: "retained", reason: "undrained" } });
+    const exec = makeExecutor(c.rig, bindingOf(SUBSCRIPTION));
+    let captures = 0;
+    const { ctx } = makeCtx({
+      pauseModeRequested: () => "now",
+      reportIteration: async () => ({ pauseRequested: false }),
+      parkForPause: async () => {
+        const registry = [...exec["epochSafeties"]].find(([, safety]) => safety === exec.safety)?.[0];
+        assert.ok(registry);
+        // Inject only the fault; the executor still owns capture and proof recording.
+        registry.poison({ category: "tool", message: "pre-existing cleanup uncertainty" });
+        assert.equal(registry.isPoisoned(), true);
+        const result = await exec.withCredentialFreeCapture(1000, async () => {
+          captures++;
+          assert.deepEqual(c.holder.releases, [], "capture retains the live holder");
+          return true;
+        });
+        assert.equal(result.kind, "observed_empty");
+        const proof = exec["completedCaptures"].get(registry);
+        assert.ok(proof, "the real completed acquisition was recorded by the executor");
+        assert.equal(registry.acceptsCompletedCapture(proof), false,
+          "completion after a pre-existing fault cannot attest continuation cleanup");
+        assert.equal((exec.safety as CodexExecutionSafetyImpl).completedCaptureForTeardown(), undefined);
+        return true;
+      },
+    });
+    assert.ok((await withTimeout(exec.run(ctx), 3000, "pre-existing fault pause")).pausedAt);
+    assert.equal(captures, 1);
+    const registry = [...exec["epochSafeties"]].find(([, safety]) => safety === exec.safety)?.[0];
+    assert.ok(registry);
+    const proof = exec["completedCaptures"].get(registry);
+    assert.ok(proof);
+    assert.deepEqual(c.holder.releases, []);
+    await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 1000 });
+    assert.equal(registry.state(), "disposed", "public terminal disposal actually ran");
+    assert.equal(exec["completedCaptures"].get(registry), proof, "no substitute proof");
+    assert.equal(registry.acceptsCompletedCapture(proof), false);
+    assert.deepEqual(c.holder.releases, [false], "public terminal settlement retains the cache");
+    assert.deepEqual(c.removals, []);
+  });
+
+  it("HeldRunCommandCache requires disposal after a genuine intentional capture", async () => {
+    const c = cacheRig({ defer: true });
+    const exec = makeExecutor(c.rig, bindingOf(SUBSCRIPTION));
+    let captures = 0;
+    const { ctx } = makeCtx({
+      pauseModeRequested: () => "now",
+      reportIteration: async () => ({ pauseRequested: false }),
+      parkForPause: async () => {
+        assert.equal((await exec.withCredentialFreeCapture(1000, async () => {
+          captures++;
+          return true;
+        })).kind, "observed_empty");
+        return true;
+      },
+    });
+    assert.ok((await withTimeout(exec.run(ctx), 3000, "intentional capture pause")).pausedAt);
+    assert.equal(captures, 1);
+    const registry = [...exec["epochSafeties"]].find(([, safety]) => safety === exec.safety)?.[0];
+    assert.ok(registry);
+    const proof = exec["completedCaptures"].get(registry);
+    assert.ok(proof, "use only the executor's actual recorded completion");
+    assert.equal((exec.safety as CodexExecutionSafetyImpl).completedCaptureForTeardown(), proof);
+    assert.equal(registry.isPoisoned(), true, "intentional capture fenced ordinary admission");
+    assert.equal(registry.state(), "poisoned");
+    assert.equal(registry.acceptsCompletedCapture(proof), true);
+    const foreign = new ExecutionRegistry(newLocalExecutionEpoch(285299));
+    assert.equal(foreign.acceptsCompletedCapture(proof), false, "proof belongs to the exact registry");
+
+    const observer = fakeHolder([]);
+    const cache = new HeldRunCommandCache(observer.holder,
+      watched => exec["completedCaptures"].get(watched));
+    cache.watchRegistry(registry);
+    assert.equal(cache.drained(), false, "accepted completion alone is insufficient before disposal");
+    assert.deepEqual(c.holder.releases, []);
+    await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 1000 });
+    assert.equal(registry.state(), "disposed");
+    assert.equal(exec["completedCaptures"].get(registry), proof);
+    assert.equal(registry.acceptsCompletedCapture(proof), true);
+    assert.equal(cache.drained(), true, "verified disposal completes the false-to-true transition");
+    assert.deepEqual(c.holder.releases, [true], "the public terminal path also sees the exact proof");
+    await cache.settle(noopLog, async () => ({ state: "removed", reason: "" }),
+      { releaseMs: 100, removeMs: 100 });
+    assert.deepEqual(observer.releases, [true], "settle only after disposal; its result is cached");
+
+    registry.poison({ category: "tool", message: "new uncertainty after completed capture" });
+    assert.equal(registry.acceptsCompletedCapture(proof), false, "new poison invalidates the same proof");
+    assert.equal(cache.drained(), false);
+  });
+
   it("deferred mode with NO epoch built (setup failure) releases in run()'s finally", async () => {
     const c = cacheRig({ defer: true });
     c.rig.deps = {
@@ -13484,7 +13998,7 @@ describe("CodexExecutor milestone progress (issue #1674)", () => {
     m2Runner.installHarness();
 
     for (const decision of ["partial", "accept", "missing scope"] as const) {
-      it(`issue3089 Codex live ${decision} binds refreshed permit scope through finalization`, { timeout: 15000 }, async () => {
+      it(`issue3089 Codex live ${decision} binds refreshed permit scope through finalization`, { timeout: 15000 }, async (t) => {
         m2Runner.api.setRegisterProtocolFeatures(["claim_generation_fence", "completion_non_closing_v1"]);
         await m2Runner.client.register("codex-live-owner-decision");
         const forge = m2Runner.fakeGitlab();
@@ -13535,6 +14049,15 @@ describe("CodexExecutor milestone progress (issue #1674)", () => {
         ]);
         const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
         m2FollowPush(m2Runner.git, forge.pr);
+        const onAbort = () => t.diagnostic("issue3089 completion abort " + JSON.stringify({
+          decision, answered, providerLaunches: rig.providerLaunches(),
+          completionAttemptRequests: m2Runner.api.completionAttemptRequests.length,
+          completionPermitRequests: m2Runner.api.completionPermitRequests.length,
+          completionHoldRequests: m2Runner.api.completionHoldRequests.length,
+          statuses: m2Runner.api.states.filter(s => s.runId === claim.run_id).slice(-8).map(s => s.body.status),
+        }));
+        t.signal.addEventListener("abort", onAbort, { once: true });
+        t.after(() => t.signal.removeEventListener("abort", onAbort));
         await m2Runner.runner({ run: async ctx => {
           commitInTree(ctx.worktreePath, "issue3089.txt", "delivered first milestone\n");
           return executor.run(ctx);
@@ -14801,7 +15324,7 @@ describe("CodexExecutor: loop-top owner pause (issue #1764)", () => {
     assert.equal(events.at(-1), `reap:${homeOf(1)}`);
   });
 
-  it("(B8 pause) an owner `now` that lands during the refused, reaping park stays pending and parks after the epoch is recreated (issue #1782)", async () => {
+  it("(B8 pause) an owner `now` that lands during the refused, reaping park parks before credential release or epoch recreation (issue #1782)", async () => {
     const rig = makeMultiEpochRig([quietEpoch("th-1"), quietEpoch("th-1")]);
     const { events, homeOf } = persistSpy(rig);
     let exec!: CodexExecutor;
@@ -14833,7 +15356,7 @@ describe("CodexExecutor: loop-top owner pause (issue #1764)", () => {
     assert.ok(result.pausedAt, "the pending `now` was honoured after the refused park");
     assert.equal(parks.length, 1, "parkForPause ran once");
     assert.equal(rig.epochs[0]!.transport.turnStartCount, 1, "the reaped epoch got no further turn/start");
-    assert.notEqual(exec.safety, safetyAtPark, "the refused park recreated the epoch before the pause was handled");
+    assert.equal(exec.safety, safetyAtPark, "the newer pause was handled before credential release or epoch recreation");
     // The recreated epoch never launched, so its home never adopted the session: persisting it
     // would replace the generation persisted before the park with an empty one.
     assert.equal(rig.providerLaunches(), 1, "the recreated epoch never launched a provider root");
@@ -16936,9 +17459,8 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
     // ctx.onSessionId, which the executor calls after its evidence check on that same event), so a
     // stamp-on-first-event rule would fire on it; only model output may stamp.
     const rig = makeMultiEpochRig([
-      script("th-1", [quiet, (th, tn) => [done(11, th, tn)]], (n) => {
-        starts = n;
-      }),
+      script("th-1", [quiet], () => { starts++; }),
+      script("th-1", [(th, tn) => [done(11, th, tn)]], () => { starts++; }),
     ]);
     const seams = followUpSeams([A]);
     const startsAtStamp: number[] = [];
@@ -20493,6 +21015,545 @@ describe("2833 Codex inline summaries", () => {
     });
     return { rig, intents, plans };
   }
+  function ownedAdvice(clean: boolean, entered: ReturnType<typeof m1Barrier>, release: ReturnType<typeof m1Barrier>) {
+    return async (params: Parameters<NonNullable<ConstructorParameters<typeof CodexExecutor>[2]["codexAdviceHarnessFactory"]>>[0]) => {
+      const owner = summaryOwnership.get(params)!;
+      const advice = new FakeTransport(defaultResponder);
+      advice.push(turnCompleted()); // Null advisory, independent of root cleanup evidence.
+      return new CodexAdviceHarness({ provider, log: noopLog, launchRoot: async () => {
+        const handle = await owner.launch(async () => ({
+          started: { event: "started", supervisorPid: 200, childPid: 201, subreaper: true,
+            nondumpable: true, uid: RUNNER_UID, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+          supervisorPid: 200, transport: { stdin: null, stdout: null, stderr: null },
+          failed: undefined, whenFailed: new Promise<Error>(() => {}),
+          snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+          observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
+          waitChild: async () => ({ event: "child_exit", code: 0 }),
+          dispose: async () => {
+            entered.resolve(); await release.promise;
+            return clean
+              ? { clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } }
+              : { clean: false, reason: "survivor" };
+          },
+        }));
+        return { cwd: "/isolated", transport: advice, dispose: async () => {
+          if (!(await handle.dispose()).clean) throw new Error("unclean summary");
+        } };
+      } });
+    };
+  }
+
+  for (const primary of [undefined, new CodexCredentialDeferredError()]) {
+    it(`A summary cleanup preserves ${primary ? "exact primary object and type" : "standalone cleanup refusal"}`, async () => {
+      const entered = m1Barrier(), release = m1Barrier(), body = m1Barrier();
+      const { rig, intents } = summaryRig();
+      const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider, {
+        summarySettleMs: 0, codexAdviceHarnessFactory: ownedAdvice(false, entered, release),
+      });
+      const { ctx } = makeCtx({ kind: "issue", codeCrossCheckSummary: async () => {
+        await entered.promise;
+        body.resolve();
+        if (primary) throw primary;
+        return undefined;
+      } });
+      let returned = false;
+      const outcome = executor.run(ctx).then(value => ({ value }), error => ({ error })).then(value => {
+        returned = true; return value;
+      });
+      try {
+        await body.promise;
+        await drain();
+        assert.equal(returned, false, "primary failure still awaits full owned cleanup");
+        release.resolve();
+        const result = await outcome;
+        assert.ok("error" in result);
+        if (primary) { assert.equal(result.error, primary); assert.ok(result.error instanceof CodexCredentialDeferredError); }
+        else { assert.ok(result.error instanceof TrustedExecutionRefusal); assert.equal(result.error.message, "summary cleanup unproven"); }
+        let captured = false;
+        assert.equal((await executor.withCredentialFreeCapture(1000, async () => { captured = true; })).kind, "incomplete");
+        assert.equal(captured, false, "primary error preservation does not grant capture");
+        assert.deepEqual(intents, []);
+      } finally { release.resolve(); await outcome; }
+    });
+  }
+
+  for (const clean of [false, true]) for (const route of ["boundary", "recreation", "reuse", "refresh"] as const) {
+    it(`A summary null clean=${clean} gates ${route} credentials and permits`, async () => {
+      const entered = m1Barrier(), release = m1Barrier();
+      const plan = epochResponder("th-plan", "tn-plan", (t, th, tn) =>
+        t.push(toolCall(88, "submit_plan", { plan_md: "# Plan" }, th, tn, "plan")).push(turnCompleted("completed", th, tn)));
+      const quiet = epochResponder("th-1", "tn-1", () => {});
+      const rig = makeMultiEpochRig(route === "recreation" ? [plan, done] : route === "refresh" ? [quiet] : [done, done]);
+      let intents = 0, sinks = 0;
+      Object.assign(rig.client, { postIntentSummary: async () => { intents++; }, postPlanSummary: async () => {} });
+      rig.deps = { ...rig.deps, deferRegistryTeardown: true };
+      const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider, {
+        summarySettleMs: 0, codexAdviceHarnessFactory: ownedAdvice(clean, entered, release),
+      });
+      const { ctx } = makeCtx({ kind: "issue", ...(route === "recreation" ? { planApproved: false, approvedPlan: undefined } : {}),
+        gatePlan: async () => { await entered.promise; release.resolve(); return approve; },
+      });
+      const outcome = executor.run(ctx).then(value => ({ value }), error => ({ error }));
+      try {
+        await entered.promise;
+        if (route === "refresh") {
+          await waitForSummary(() => rig.epochs[0]!.transport.turnStartCount === 1, "lead turn");
+          rig.epochs[0]!.transport.push({ kind: "activity", method: "account/chatgptAuthTokens/refresh", requestId: 91, params: { reason: "unauthorized", previousAccountId: "verified-account" } });
+          release.resolve();
+          await waitForSummary(() => rig.epochs[0]!.transport.responses.some(r => r.requestId === 91), "refresh reply");
+          rig.epochs[0]!.transport.push(signalDone()).push(turnCompleted());
+        } else release.resolve();
+        const result = await outcome;
+        if (route === "recreation" && !clean) assert.ok("error" in result);
+        else if (route !== "refresh") assert.ok("value" in result, String("error" in result ? result.error : ""));
+        const releases = rig.client.releaseCalls.length, refreshes = rig.client.refreshCalls.length;
+        if (route === "boundary") {
+          const boundary = executor.safety!.withBoundary({ boundary: "finalize", deadlineMs: 1000 }, async () => { sinks++; });
+          if (clean) await boundary;
+          else await assert.rejects(boundary, /summary cleanup unproven/);
+          assert.equal(sinks, clean ? 1 : 0);
+          assert.equal(rig.client.refreshCalls.length, refreshes + (clean ? 1 : 0));
+        }
+        if (route === "reuse") {
+          const next = executor.run(makeCtx({ kind: "issue", summaryIntentPresent: true }).ctx);
+          if (clean) await next;
+          else await assert.rejects(next, /summary cleanup unproven/);
+          assert.equal(rig.client.releaseCalls.length, releases + (clean ? 1 : 0));
+        }
+        if (route === "recreation") assert.equal(releases, clean ? 2 : 1, "no release for uncertain prior summary");
+        if (route === "refresh") assert.equal(refreshes, clean ? 1 : 0, "app-server refresh consults summary cleanup first");
+        if (!clean) {
+          let captured = false;
+          assert.equal((await executor.withCredentialFreeCapture(1000, async () => { captured = true; })).kind, "incomplete");
+          assert.equal(captured, false);
+          assert.equal(rig.client.releaseCalls.length, releases);
+          assert.equal(rig.client.refreshCalls.length, refreshes);
+        }
+        assert.equal(intents, 0, "null advisory result never becomes content or cleanup proof");
+      } finally {
+        release.resolve();
+        for (const epoch of rig.epochs) epoch.transport.end();
+        await outcome;
+        await executor.safety?.dispose({ boundary: "terminal", deadlineMs: 1000 });
+      }
+    });
+  }
+
+  it("A summary boundary retains its original deadline across the owned join", async t => {
+    const entered = m1Barrier(), release = m1Barrier();
+    const rig = makeMultiEpochRig([epochResponder("th-1", "tn-1", () => {})]);
+    rig.deps = { ...rig.deps, deferRegistryTeardown: true };
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider, {
+      summarySettleMs: 0, codexAdviceHarnessFactory: ownedAdvice(true, entered, release),
+    });
+    const running = executor.run(makeCtx({ kind: "issue" }).ctx).catch(() => undefined);
+    let boundary: Promise<unknown> | undefined;
+    const now = Date.now.bind(Date);
+    let advance = 0, joined = false, sinks = 0;
+    t.mock.method(Date, "now", () => now() + advance);
+    try {
+      await entered.promise;
+      await waitForSummary(() => rig.epochs[0]!.transport.turnStartCount === 1, "lead startup");
+      boundary = executor.safety!.withBoundary({ boundary: "checkpoint", deadlineMs: 1000 }, async () => { sinks++; });
+      void boundary.then(() => { joined = true; }, () => { joined = true; });
+      await drain();
+      assert.equal(joined, false, "credential boundary awaits held full disposal");
+      assert.equal(rig.client.refreshCalls.length, 0);
+      advance = 2000; // Spend the existing deadline while disposal is still held.
+      release.resolve();
+      await assert.rejects(boundary);
+      assert.equal(sinks, 0);
+      assert.equal(rig.client.releaseCalls.length, 1);
+      assert.equal(rig.client.refreshCalls.length, 0, "joining never grants a fresh credential budget");
+    } finally {
+      advance = 0; release.resolve(); rig.epochs[0]!.transport.end();
+      await boundary?.catch(() => undefined); await running;
+      await executor.safety?.dispose({ boundary: "terminal", deadlineMs: 1000 });
+    }
+  });
+
+  it("A summary injected retired intent retains generic bounded continuation", async () => {
+    const entered = m1Barrier(), release = m1Barrier();
+    const { rig, intents } = summaryRig();
+    let calls = 0, oldSignal: AbortSignal | undefined;
+    const executor = makeExecutor(rig, bindingOf(API_KEY), noopLog, undefined, provider, {
+      summarySettleMs: 0,
+      summaryRunner: {
+        generateIntentSummary: async input => {
+          if (++calls > 1) return "Fresh intent";
+          oldSignal = input.signal;
+          entered.resolve(); await release.promise;
+          return "Retired intent";
+        },
+        generatePlanSummary: async () => null,
+      },
+    });
+    try {
+      const first = executor.run(makeCtx({ kind: "issue", codeCrossCheckSummary: async () => { await entered.promise; return undefined; } }).ctx);
+      await withTimeout(first, 1000, "generic first run abandons delivery");
+      assert.equal(oldSignal?.aborted, true);
+      // Resetting the current intent retires its still-pending flight; injected policy remains bounded.
+      await withTimeout(executor.run(makeCtx({ kind: "issue" }).ctx), 1000, "generic reuse does not join retired advice");
+      release.resolve(); await drain();
+      assert.deepEqual(intents, ["Fresh intent"]);
+    } finally { release.resolve(); }
+  });
+
+  for (const phase of ["factory", "launch", "dispose"] as const) for (const expired of [false, true]) {
+    it(`A owned summary ${phase} remains joined during ${expired ? "expired" : "unexpired"} capture`, async t => {
+      const entered = m1Barrier(), release = m1Barrier(), disposing = m1Barrier(), disposed = m1Barrier();
+      const registryPolls: (() => void)[] = [];
+      const timerHandles = new Set<ReturnType<typeof setTimeout>>();
+      const advisoryTimers = new Map<ReturnType<typeof setTimeout>, () => void>();
+      const realTimeout = globalThis.setTimeout;
+      const realClearTimeout = globalThis.clearTimeout;
+      const now = Date.now.bind(Date);
+      let advance = 0;
+      t.mock.method(Date, "now", () => now() + advance);
+      t.mock.method(globalThis, "clearTimeout", (handle: Parameters<typeof clearTimeout>[0]) => {
+        if (typeof handle === "object" && handle !== null) {
+          advisoryTimers.delete(handle);
+          timerHandles.delete(handle);
+        }
+        return realClearTimeout(handle);
+      });
+      t.mock.method(globalThis, "setTimeout", (fn: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+        const stack = new Error().stack ?? "";
+        if (stack.includes("settleIntentSummary")) {
+          // Deliver the executor advisory bound before observing raw summary custody.
+          const handle = realTimeout(() => {}, 60_000);
+          handle.unref();
+          timerHandles.add(handle);
+          advisoryTimers.set(handle, () => {
+            realClearTimeout(handle); timerHandles.delete(handle); fn(...args);
+          });
+          return handle;
+        }
+        if (expired && (ms ?? Infinity) <= 25 && stack.includes("settleForCapture")) {
+          // Deliver registry polling explicitly, without spending wall time.
+          const handle = realTimeout(() => {}, 60_000);
+          handle.unref();
+          timerHandles.add(handle);
+          registryPolls.push(() => {
+            realClearTimeout(handle); timerHandles.delete(handle); fn(...args);
+          });
+          return handle;
+        }
+        return realTimeout(() => fn(...args), ms);
+      });
+      let launches = 0, cleanups = 0, captured = false, callback = false;
+      const { rig, intents } = summaryRig();
+      // Keep the lead in flight independently of the summary.
+      rig.transport = new FakeTransport(c => c.method === "thread/start"
+        ? { thread: { id: "th-1" } } : c.method === "turn/start" ? { turn: { id: "tn-1" } } : {});
+      rig.deps = { ...rig.deps, launchProviderRoot: async () => ({ transport: rig.transport, root: trackedRoot().root, supervisorPid: 100 }) };
+      const native: CodexRootHandle = {
+        started: { event: "started", supervisorPid: 200, childPid: 201, subreaper: true,
+          nondumpable: true, uid: RUNNER_UID, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+        supervisorPid: 200, transport: { stdin: null, stdout: null, stderr: null }, failed: undefined, whenFailed: new Promise(() => {}),
+        snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+        observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
+        waitChild: async () => ({ event: "child_exit", code: 0 }),
+        dispose: async () => {
+          cleanups++; disposing.resolve(); await disposed.promise;
+          return { clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } };
+        },
+      };
+      const executor = makeExecutor(rig, bindingOf(API_KEY), noopLog, undefined, provider, {
+        codexAdviceHarnessFactory: async params => {
+          const owner = summaryOwnership.get(params);
+          if (phase === "factory") { entered.resolve(); await release.promise; }
+          const advice = new FakeTransport(c => c.method === "thread/start"
+            ? { thread: { id: "th-1" } } : c.method === "turn/start" ? { turn: { id: "tn-1" } } : {});
+          advice.push(turnCompleted());
+          return new CodexAdviceHarness({ provider, log: noopLog, launchRoot: async () => {
+            const start = async () => {
+              launches++;
+              // Primary exit is already known; only full supervisor settlement is held.
+              await native.waitChild(1_000);
+              if (phase === "launch") { entered.resolve(); await release.promise; }
+              return native;
+            };
+            const handle = owner ? await owner.launch(start) : await start();
+            return { cwd: "/isolated", transport: advice, dispose: async () => { await handle.dispose(); } };
+          } });
+        },
+      });
+      const running = executor.run(makeCtx({ kind: "issue" }).ctx).catch(() => undefined);
+      let capture: ReturnType<typeof executor.withCredentialFreeCapture> | undefined;
+      try {
+        if (phase === "dispose") await disposing.promise;
+        else await entered.promise;
+        await new Promise<void>(resolve => rig.transport.onFirstTurnStart(resolve));
+        capture = executor.withCredentialFreeCapture(5_000, async () => { callback = true; });
+        void capture.then(() => { captured = true; });
+        for (let i = 0; i < 40; i++) {
+          await drain();
+          const callbacks = [...advisoryTimers.values()];
+          advisoryTimers.clear();
+          callbacks.forEach(fire => fire());
+        }
+        await drain();
+        if (expired) {
+          advance = 6_000;
+          registryPolls.splice(0).forEach(fire => fire());
+        }
+        // Bound observation turns while every factory/start/disposal barrier stays held.
+        for (let i = 0; i < 40; i++) await drain();
+        assert.equal(captured, false, "capture deadline cannot detach held owned summary work");
+        assert.equal(callback, false);
+        if (phase === "factory") {
+          release.resolve(); disposed.resolve();
+        } else {
+          release.resolve(); await disposing.promise; await drain();
+          assert.equal(captured, false, "child exit does not prove full root disposal");
+          disposed.resolve();
+        }
+        assert.equal((await capture).kind, expired ? "incomplete" : "observed_empty");
+        if (expired) assert.equal(callback, false, "owned completion cannot renew an expired capture");
+        assert.equal(launches, phase === "factory" ? 0 : 1, "capture fences a late factory's fresh spawn");
+        assert.equal(cleanups, phase === "factory" ? 0 : 1, "full disposal has one owner");
+        assert.deepEqual(intents, [], "aborted advice never delivers");
+      } finally {
+        advance = 0;
+        release.resolve(); disposed.resolve(); rig.transport.end();
+        registryPolls.splice(0).forEach(fire => fire());
+        try { await capture; await running; }
+        finally {
+          for (const handle of timerHandles) realClearTimeout(handle);
+          timerHandles.clear(); advisoryTimers.clear(); registryPolls.length = 0;
+        }
+      }
+    });
+  }
+
+  for (const closure of ["terminal", "explicit close", "rejected admission", "expired capture"] as const) {
+    it(`A owned summary ${closure} joins held full root cleanup before returning`, async t => {
+      const disposing = m1Barrier(), release = m1Barrier();
+      const { rig, intents } = summaryRig();
+      rig.transport = new FakeTransport(c => c.method === "thread/start"
+        ? { thread: { id: "th-1" } } : c.method === "turn/start" ? { turn: { id: "tn-1" } } : {});
+      rig.deps = { ...rig.deps, launchProviderRoot: async () => ({ transport: rig.transport, root: trackedRoot().root, supervisorPid: 100 }) };
+      let rejectNext = false;
+      const rejectedRegistries = new Set<ExecutionRegistry>();
+      const register = ExecutionRegistry.prototype.registerRoot;
+      t.mock.method(ExecutionRegistry.prototype, "registerRoot", function (
+        this: ExecutionRegistry, ...args: Parameters<ExecutionRegistry["registerRoot"]>
+      ) {
+        if (rejectNext) {
+          rejectNext = false;
+          rejectedRegistries.add(this);
+          this.cancelReservation(args[0]);
+        }
+        return register.apply(this, args);
+      });
+      let consumes = 0, cleanups = 0, returned = false;
+      const executor = makeExecutor(rig, bindingOf(API_KEY), noopLog, undefined, provider, {
+        summarySettleMs: 0,
+        codexAdviceHarnessFactory: async params => {
+          const owner = summaryOwnership.get(params)!;
+          const advice = new FakeTransport(c => {
+            consumes++;
+            return c.method === "thread/start" ? { thread: { id: "th-1" } }
+              : c.method === "turn/start" ? { turn: { id: "tn-1" } } : {};
+          });
+          advice.push(turnCompleted());
+          return new CodexAdviceHarness({ provider, log: noopLog, launchRoot: async () => {
+            const handle = await owner.launch(async () => {
+              rejectNext = closure === "rejected admission";
+              return {
+                started: { event: "started", supervisorPid: 200, childPid: 201, subreaper: true,
+                  nondumpable: true, uid: RUNNER_UID, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+                supervisorPid: 200, transport: { stdin: null, stdout: null, stderr: null }, failed: undefined, whenFailed: new Promise(() => {}),
+                snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+                observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
+                waitChild: async () => ({ event: "child_exit", code: 0 }),
+                dispose: async () => {
+                  cleanups++; disposing.resolve(); await release.promise;
+                  return { clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } };
+                },
+              };
+            });
+            return { cwd: "/isolated", transport: advice, dispose: async () => { await handle.dispose(); } };
+          } });
+        },
+      });
+      const running = executor.run(makeCtx({ kind: "issue" }).ctx);
+      const outcome = running.then(value => { returned = true; return { value }; },
+        error => { returned = true; return { error }; });
+      let closing: Promise<void> | undefined;
+      let capture: ReturnType<typeof executor.withCredentialFreeCapture> | undefined;
+      let captured = false, callback = false;
+      try {
+        await disposing.promise;
+        await new Promise<void>(resolve => rig.transport.onFirstTurnStart(resolve));
+        if (closure === "rejected admission") {
+          assert.equal([...rejectedRegistries][0]?.rootCount(), 1, "rejected root remains retained");
+          assert.equal(consumes, 0, "rejected admission cannot enter advice consume");
+        }
+        let closed = false;
+        if (closure === "explicit close") {
+          closing = executor.closeAndSettlePlanSummary(0).then(() => { closed = true; });
+        }
+        if (closure === "expired capture") {
+          capture = executor.withCredentialFreeCapture(0, async () => { callback = true; });
+          void capture.then(() => { captured = true; });
+        }
+        rig.transport.push(signalDone()).push(turnCompleted());
+        for (let i = 0; i < 4; i++) await drain();
+        assert.equal(returned, false, "terminal settlement cannot detach a full root cleanup");
+        assert.equal(closed, false, "delivery bound expiration does not end owned custody");
+        assert.equal(captured, false, "capture expiry revokes authority while retaining the cleanup join");
+        assert.equal(callback, false);
+        release.resolve();
+        await closing;
+        const result = await outcome;
+        if (capture) {
+          assert.equal((await capture).kind, "incomplete");
+          assert.equal(callback, false, "cleanup completion cannot renew an expired capture");
+        }
+        if (closure === "rejected admission") {
+          assert.ok("error" in result);
+          assert.match(String(result.error), /cleanup unproven/);
+          let callback = false;
+          assert.equal((await executor.withCredentialFreeCapture(1000, async () => { callback = true; })).kind, "incomplete");
+          assert.equal(callback, false);
+        } else assert.ok("value" in result);
+        assert.equal(cleanups, 1);
+        assert.deepEqual(intents, []);
+      } finally { release.resolve(); rig.transport.end(); await closing; await capture; await outcome; }
+    });
+  }
+
+  it("A owned summary terminal joins an already admitted intent POST", async () => {
+    const posted = m1Barrier(), release = m1Barrier();
+    const { rig } = summaryRig();
+    rig.transport = new FakeTransport(c => c.method === "thread/start"
+      ? { thread: { id: "th-1" } } : c.method === "turn/start" ? { turn: { id: "tn-1" } } : {});
+    rig.deps = { ...rig.deps, launchProviderRoot: async () => ({ transport: rig.transport, root: trackedRoot().root, supervisorPid: 100 }) };
+    Object.assign(rig.client, { postIntentSummary: async () => { posted.resolve(); await release.promise; } });
+    const executor = makeExecutor(rig, bindingOf(API_KEY), noopLog, undefined, provider, {
+      summarySettleMs: 0,
+      codexAdviceHarnessFactory: async () => {
+        const advice = new FakeTransport(defaultResponder);
+        advice.push(agentMessage("Useful summary")).push(turnCompleted());
+        return new CodexAdviceHarness({ provider, log: noopLog, launchRoot: async () => ({
+          cwd: "/isolated", transport: advice, dispose: async () => {},
+        }) });
+      },
+    });
+    let returned = false;
+    const running = executor.run(makeCtx({ kind: "issue" }).ctx);
+    const observed = running.then(() => { returned = true; });
+    try {
+      await posted.promise;
+      rig.transport.push(signalDone()).push(turnCompleted());
+      for (let i = 0; i < 4; i++) await drain();
+      assert.equal(returned, false, "an already admitted POST remains part of actual flight completion");
+      release.resolve();
+      await observed;
+    } finally { release.resolve(); rig.transport.end(); await observed; }
+  });
+
+  for (const failure of ["unclean disposal", "unknown startup"] as const) it(
+    `A owned summary ${failure} survives advisory null and blocks capture and terminal success`, async () => {
+    const entered = m1Barrier(), release = m1Barrier();
+    const { rig, intents } = summaryRig();
+    const executor = makeExecutor(rig, bindingOf(API_KEY), noopLog, undefined, provider, {
+      codexAdviceHarnessFactory: async params => {
+        const owner = summaryOwnership.get(params)!;
+        const advice = new FakeTransport(c => c.method === "thread/start"
+          ? { thread: { id: "th-1" } } : c.method === "turn/start" ? { turn: { id: "tn-1" } } : {});
+        advice.push(turnCompleted());
+        return new CodexAdviceHarness({ provider, log: noopLog, launchRoot: async () => {
+          const handle = await owner.launch(async () => {
+            if (failure === "unknown startup") { entered.resolve(); await release.promise; throw new Error("unknown startup"); }
+            return {
+            started: { event: "started", supervisorPid: 200, childPid: 201, subreaper: true,
+              nondumpable: true, uid: RUNNER_UID, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+            supervisorPid: 200, transport: { stdin: null, stdout: null, stderr: null }, failed: undefined, whenFailed: new Promise(() => {}),
+            snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+            observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
+            waitChild: async () => ({ event: "child_exit", code: 0 }),
+            dispose: async () => { entered.resolve(); await release.promise; return { clean: false, reason: "survivor" }; },
+          }; });
+          return { cwd: "/isolated", transport: advice, dispose: async () => {
+            if (!(await handle.dispose()).clean) throw new Error("unclean summary");
+          } };
+        } });
+      },
+    });
+    const running = executor.run(makeCtx({ kind: "issue" }).ctx);
+    await entered.promise;
+    release.resolve();
+    await assert.rejects(running, /cleanup unproven/);
+    let callback = false;
+    assert.equal((await executor.withCredentialFreeCapture(1_000, async () => { callback = true; })).kind, "incomplete");
+    assert.equal(callback, false);
+    assert.deepEqual(intents, [], "cleanup failure is converted to advisory null");
+    assert.equal((await executor.settleForCredentialFreeCapture(1_000)).kind, "incomplete");
+  });
+
+  it("A owned summary credential await is fenced after capture closes", async () => {
+    const entered = m1Barrier(), release = m1Barrier();
+    const { rig, intents } = summaryRig();
+    const original = rig.client.releaseCodex.bind(rig.client);
+    let calls = 0;
+    rig.client.releaseCodex = async (...args) => {
+      calls++;
+      if (calls === 2) { entered.resolve(); await release.promise; }
+      return original(...args);
+    };
+    rig.transport = new FakeTransport(c => c.method === "thread/start"
+      ? { thread: { id: "th-1" } } : c.method === "turn/start" ? { turn: { id: "tn-1" } } : {});
+    rig.deps = { ...rig.deps, launchProviderRoot: async () => ({ transport: rig.transport, root: trackedRoot().root, supervisorPid: 100 }) };
+    const log = recordingLog();
+    const executor = makeExecutor(rig, bindingOf(API_KEY), log.log, undefined, provider, {
+      codexAdviceHarnessFactory: makeProductionCodexAdviceHarnessFactory(rig.client as never, log.log, "/unused-summary-home"),
+    });
+    const running = executor.run(makeCtx({ kind: "issue" }).ctx).catch(() => undefined);
+    await entered.promise;
+    await new Promise<void>(resolve => rig.transport.onFirstTurnStart(resolve));
+    const before = log.added.length;
+    const capture = executor.withCredentialFreeCapture(5_000, async () => {});
+    release.resolve();
+    try {
+      assert.equal((await capture).kind, "observed_empty");
+      assert.equal(calls, 2);
+      assert.equal(log.added.length, before, "no credential is admitted after the await closes");
+      assert.deepEqual(intents, []);
+    } finally { rig.transport.end(); await running; }
+  });
+
+  it("A owned summary succeeds and cleans each sequential executor use", async () => {
+    const { rig, intents } = summaryRig();
+    let posted = m1Barrier(), cleanups = 0;
+    Object.assign(rig.client, { postIntentSummary: async (_id: string, text: string) => { intents.push(text); posted.resolve(); } });
+    rig.deps = { ...rig.deps, launchProviderRoot: async () => {
+      rig.transport = new FakeTransport(c => c.method === "thread/start"
+        ? { thread: { id: "th-1" } } : c.method === "turn/start" ? { turn: { id: "tn-1" } } : {});
+      return { transport: rig.transport, root: trackedRoot().root, supervisorPid: 100 };
+    } };
+    const executor = makeExecutor(rig, bindingOf(API_KEY), noopLog, undefined, provider, {
+      codexAdviceHarnessFactory: async () => {
+        const advice = new FakeTransport(defaultResponder);
+        advice.push(agentMessage("Useful summary")).push(turnCompleted());
+        return new CodexAdviceHarness({ provider, log: noopLog, launchRoot: async () => ({
+          cwd: "/isolated", transport: advice, dispose: async () => { cleanups++; },
+        }) });
+      },
+    });
+    for (let use = 0; use < 2; use++) {
+      const running = executor.run(makeCtx({ kind: "issue" }).ctx);
+      await posted.promise;
+      rig.transport.push(signalDone()).push(turnCompleted());
+      await running;
+      posted = m1Barrier();
+    }
+    assert.deepEqual(intents, ["Useful summary", "Useful summary"]);
+    assert.equal(cleanups, 2);
+  });
+
   it("B1 Codex retains accepted plan summary after successful done checkpoint", async () => {
     const planResponder = epochResponder("th-plan", "tn-plan", (t, th, tn) =>
       t.push(toolCall(98, "submit_plan", { plan_md: "# Plan" }, th, tn, "plan"))
@@ -21185,10 +22246,10 @@ describe("2833 Codex inline summaries", () => {
         const result = await executor.run(ctx);
         assert.equal(!!(result.walled || result.pausedAt || result.completionHeld), accepted);
       }
-      assert.deepEqual(observations, [sink !== "request"]);
-      assert.deepEqual(posts, accepted || sink !== "request" ? [] : ["Preserved"]);
+      assert.deepEqual(observations, [true]);
+      assert.deepEqual(posts, []);
       resolve("Late"); await drain();
-      assert.deepEqual(posts, accepted || sink !== "request" ? [] : ["Preserved"]);
+      assert.deepEqual(posts, []);
     });
   }
   it("2833 advisory failures leave a successful seeded run unchanged", async () => {
@@ -21416,6 +22477,1551 @@ it("#3101 actual CodexExecutor completed installer preserves C through shutdown 
     runner.shutdown();
     try { await withTimeout(execution, 20_000, "actual executor cleanup"); }
     finally { proof.cleanup(); await api.close(); fx.cleanup(); }
+  }
+});
+
+
+
+describe("A capture lifecycle public run", () => {
+  const thread = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  const rolloutName = `rollout-${thread}.jsonl`;
+  const approve = { kind: "approve", selection: { status: "absent" } } as const;
+  const done = () => epochResponder(thread, "tn-done", (t, th, tn) =>
+    t.push(toolCall(901, "signal_done", {}, th, tn, "done")).push(turnCompleted("completed", th, tn)));
+  const plan = (n: number) => epochResponder(thread, `tn-plan-${n}`, (t, th, tn) =>
+    t.push(toolCall(800 + n, "submit_plan", { plan_md: `# Plan ${n}`,
+      milestones: [{ id: `m${n}`, title: `Milestone ${n}` }] }, th, tn, `plan-${n}`))
+      .push(turnCompleted("completed", th, tn)));
+
+  // Exercise the production store and actual epoch HOME removal, not a simulated generation counter.
+  async function fixture(responders: Responder[], configure?: (rig: MultiRig) => void, client?: WorkerClient) {
+    const dir = await fs.mkdtemp(path.resolve("../.uzi/scratch/a-lifecycle-"));
+    const rig = makeMultiEpochRig(responders);
+    const homes: string[] = [], persists: string[] = [], adopted: string[] = [], missing: string[] = [];
+    const launch = rig.deps.launchProviderRoot!;
+    const homeRoot = path.join(dir, "home");
+    await fs.mkdir(homeRoot);
+    const store = path.join(homeRoot, "codex-session-store");
+    rig.deps = { ...rig.deps,
+      sessionStore: { ...CodexSessionStore,
+        adopt: async (source, home, opts) => {
+          await fs.mkdir(home, { recursive: true });
+          const result = await CodexSessionStore.adopt(source, home, opts);
+          if (result.files) adopted.push(await fs.readFile(path.join(home, "sessions", rolloutName), "utf8"));
+          return result;
+        },
+        persist: async (home, target, opts) => {
+          persists.push(home);
+          try { await fs.access(path.join(home, "sessions", rolloutName)); }
+          catch { missing.push(home); }
+          return CodexSessionStore.persist(home, target, opts);
+        },
+      },
+      launchProviderRoot: async (spec, mode) => {
+        const result = await launch(spec, mode);
+        const home = path.join(spec.ownedDataRoot, "codex");
+        homes.push(home);
+        await fs.mkdir(path.join(home, "sessions"), { recursive: true });
+        await fs.writeFile(path.join(home, "sessions", rolloutName),
+          JSON.stringify({ type: "session_meta", payload: { id: thread, cwd: spec.cwd } }) + "\n"
+          + JSON.stringify({ type: "event_msg", payload: { message: `epoch-${homes.length}` } }) + "\n");
+        const reap = result.root.reap.bind(result.root), dispose = result.root.dispose.bind(result.root);
+        result.root.reap = async ms => {
+            const resultReap = await reap(ms);
+            if (resultReap.ok) await fs.rm(spec.ownedDataRoot, { recursive: true, force: true });
+            return resultReap;
+          };
+        result.root.dispose = async ms => {
+            await dispose(ms);
+            await fs.rm(spec.ownedDataRoot, { recursive: true, force: true });
+          };
+        return result;
+      },
+    };
+    configure?.(rig);
+    const exec = makeExecutor(client ? { ...rig, client: client as never } : rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider, homeRoot);
+    const generation = () => fs.readFile(path.join(store, "current"), "utf8");
+    const saved = async () => fs.readFile(path.join(store, "generations", (await generation()).trim(), "sessions", rolloutName), "utf8");
+    return { rig, exec, homeRoot, homes, persists, adopted, missing, generation, saved,
+      cleanup: () => fs.rm(dir, { recursive: true, force: true }) };
+  }
+
+
+  // SF1: original executor -> original RunRunner context callbacks, never a capture substitute.
+  for (const route of ["seed-now", "seed-milestone", "immediate", "milestone", "pre-turn"] as const) {
+    for (const outcome of (route.startsWith("seed-") ? ["accepted"] : route === "immediate"
+      ? ["accepted", "declined", "withdrawn", "capture-expired", "capture-expired-foreign", "capture-expired-cancel"] : ["accepted", "declined", "withdrawn"]) as readonly ("accepted" | "declined" | "withdrawn" | "capture-expired" | "capture-expired-foreign" | "capture-expired-cancel")[]) {
+      it(`SF1 real public pause ${route} ${outcome}`, async t => {
+        const captureExpired = outcome.startsWith("capture-expired");
+        const diagnostics = recordingLog();
+        const tmp = mock.method(os, "tmpdir", () => path.resolve("../.uzi/scratch"));
+        let repo: ReturnType<typeof makeFixture>;
+        try { repo = makeFixture({}, { testName: `SF1 ${route} ${outcome}` }); }
+        finally { tmp.mock.restore(); }
+        const api = new FakeApi("sf1-worker");
+        const url = await api.listen();
+        const client = new WorkerClient(url, "sf1-worker", "test", diagnostics.log,
+          { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
+        client.protocolFeatures = ["run_checkpoint_durability"];
+        const entered = installerBarrier(), rootEntered = installerBarrier(), rootRelease = installerBarrier();
+        const packEntered = installerBarrier(), packRelease = installerBarrier(), successor = installerBarrier();
+        const withdrawalApplied = installerBarrier(), pauseApplied = installerBarrier();
+        const sourceEntered = installerBarrier(), sourceRelease = installerBarrier();
+        let rootClean = false, savedGeneration = "", savedContent = "";
+        let context: RunContext | undefined, worktree = "", region = false, parks = 0;
+        let authAtEntry = 0, launchesAtEntry = 0, regionClosed = false;
+        let accepted: boolean | undefined;
+        let expireCapture: (() => void) | undefined;
+        let pauseSafety: CodexExecutionSafetyImpl | undefined;
+        const providerRegistries: ExecutionRegistry[] = [];
+        const roots = new Map<RegisteredRoot, boolean>();
+        const register = ExecutionRegistry.prototype.registerRoot;
+        const reap = ExecutionRegistry.prototype.reapRoot;
+        const registerProbe = mock.method(ExecutionRegistry.prototype, "registerRoot", function (
+          this: ExecutionRegistry, ...args: Parameters<ExecutionRegistry["registerRoot"]>
+        ) {
+          const result = register.apply(this, args);
+          if (result.ok && args[1].kind === "provider") providerRegistries.push(this);
+          if (result.ok && region && args[1].kind === "boundary_action") roots.set(args[1], false);
+          return result;
+        });
+        const reapProbe = mock.method(ExecutionRegistry.prototype, "reapRoot", async function (
+          this: ExecutionRegistry, ...args: Parameters<ExecutionRegistry["reapRoot"]>
+        ) {
+          const result = await reap.apply(this, args);
+          if (result.ok && roots.has(args[0])) roots.set(args[0], true);
+          return result;
+        });
+        const sourceSamples: { roots: RegisteredRoot[]; reaped: boolean }[] = [];
+        const packs: { tip: string; bytes: number }[] = [];
+        const fx = await fixture([
+          epochResponder(thread, "sf1-first", (t, th, tn) => {
+            entered.resolve();
+            if (route === "milestone" || route === "pre-turn") {
+              t.push(toolCall(9110, "report_progress", { completed: ["m1"], in_progress: [] }, th, tn, "sf1-progress"))
+                .push(toolCall(9111, "checkpoint", {}, th, tn, "sf1-checkpoint"))
+                .push(turnCompleted("completed", th, tn));
+            }
+          }),
+          resumedEpochResponder(thread, "sf1-successor", () => successor.resolve()),
+        ], rig => {
+          const root = rig.epochs[0]!.root, originalReap = root.reap.bind(root);
+          root.reap = async ms => {
+            savedGeneration = await fx.generation();
+            savedContent = await fx.saved();
+            rootEntered.resolve();
+            await rootRelease.promise;
+            const result = await originalReap(ms);
+            if (result.ok) rootClean = true;
+            return result;
+          };
+          const launch = rig.deps.launchEffectRoot!;
+          rig.deps = { ...rig.deps, launchEffectRoot: async (spec, deadline) => {
+            const handle = await launch(spec, deadline);
+            const argv = spec.command.endsWith("/uzi-codex-command-sandbox")
+              ? spec.args.slice(spec.args.indexOf("--") + 1) : [spec.command, ...spec.args];
+            if (argv[0] !== "/usr/bin/git" && argv[0] !== "/usr/local/bin/gitleaks") return handle;
+            const child = spawn(argv[0], argv.slice(1), { cwd: spec.cwd, env: spec.env, stdio: "pipe" });
+            const exited = new Promise<{ event: "child_exit"; code: number }>((resolve, reject) => {
+              child.once("error", reject);
+              child.once("close", code => resolve({ event: "child_exit", code: code ?? 1 }));
+            });
+            return { ...handle, transport: { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr },
+              waitChild: async () => exited,
+              dispose: async ms => { await exited; return handle.dispose(ms); } };
+          } };
+        }, client);
+        const git = new GitCache(repo.dataDir, diagnostics.log, undefined, testGitCacheOptions());
+        const claim = makeClaim({ claim_generation: 1,
+          repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: repo.originPath },
+          plan_approved: true, plan_source: "seeded", plan_md: "approved SF1 plan",
+          milestones: [{ id: "m1", title: "first" }, { id: "m2", title: "second" }],
+          ...(route.startsWith("seed-") ? { pause_pending: true, pause_mode: route === "seed-now" ? "now" as const : "milestone" as const } : {}),
+          secrets: { forge_pat: "fixture-forge-pat-000000", codex: SUBSCRIPTION as never },
+        });
+        api.codexAuthModes.set(claim.run_id, "subscription");
+        // A cooperative checkpoint advances the real subscription generation via refresh.
+        // Subsequent releases must not replay FakeApi's default generation 3.
+        api.codexReleaseSequences.set(claim.run_id, Array.from({ length: 8 }, (_, i) => ({
+          status: 200, body: { auth_mode: "subscription", access_token: "subscription-access",
+            generation: 3 + i, chatgpt_account_id: "verified-account", chatgpt_plan_type: null },
+        })));
+        api.setOwnershipStatus(claim.run_id, "running", 1);
+        if (outcome !== "accepted" && !captureExpired) api.failStateWhen(claim.run_id, b => b.status === "paused",
+          outcome === "withdrawn" ? { httpStatus: 409, runStatus: "running" } : { httpStatus: 400 });
+        let milestoneAck = false;
+        api.stateAckWire = (body, run) => {
+          if (route !== "milestone" || milestoneAck || body.iteration_count !== 2) return undefined;
+          milestoneAck = true;
+          return { status: 200, body: { run: { ...run, pause_requested: true, milestones_completed: ["m1"] } } };
+        };
+        const apply = client.applyInputs.bind(client);
+        client.applyInputs = async (...args) => {
+          const result = await apply(...args);
+          if (args[1].includes(9101)) pauseApplied.resolve();
+          if (args[1].includes(9102)) withdrawalApplied.resolve();
+          return result;
+        };
+        const checkRegion = () => {
+          assert.equal(api.codexRequests.length, authAtEntry, "actual caller region has zero release/refresh delta");
+          assert.equal(fx.rig.providerLaunches(), launchesAtEntry, "actual caller region admits no provider");
+        };
+        const wip = git.commitWipMarker.bind(git);
+        git.commitWipMarker = async (...args) => {
+          if (!region) return wip(...args);
+          checkRegion();
+          if (!route.startsWith("seed-")) {
+            assert.equal(rootClean, true, "original provider full-root reap precedes source Git");
+            await assert.rejects(fs.access(fx.homes[0]!), { code: "ENOENT" });
+            assert.equal(await fx.generation(), savedGeneration);
+            assert.equal(await fx.saved(), savedContent);
+          }
+          const before = new Set(roots.keys());
+          const result = await wip(...args);
+          const added = [...roots.keys()].filter(r => !before.has(r));
+          sourceSamples.push({ roots: added, reaped: added.every(r => roots.get(r)) });
+          sourceEntered.resolve();
+          await sourceRelease.promise;
+          checkRegion();
+          return result;
+        };
+        client.publishCheckpoint = async (_id, tip, pack) => {
+          let bytes = 0;
+          for await (const chunk of pack) bytes += Buffer.byteLength(chunk);
+          packs.push({ tip, bytes });
+          if (region) checkRegion();
+            for (const [file, expected] of [["SF1-COMMITTED.txt", "SF1 committed bytes\n"],
+              ["SF1-DIRTY.txt", "SF1 dirty bytes\n"]] as const) {
+              const read = spawnSync("/usr/bin/git", ["-C", worktree, "show", `${tip}:${file}`],
+                { encoding: "utf8", env: gitEnv() });
+              assert.equal(read.status, 0, read.stderr);
+              assert.equal(read.stdout, expected, "actual packed tip preserves source bytes");
+            }
+          if (region) {
+            packEntered.resolve();
+            await packRelease.promise;
+            checkRegion();
+          }
+          return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/sf1" } };
+        };
+        const run = fx.exec.run.bind(fx.exec);
+        fx.exec.run = async ctx => {
+          context = ctx; worktree = ctx.worktreePath;
+          if (route === "pre-turn") {
+            const report = ctx.reportIteration!.bind(ctx);
+            ctx.reportIteration = async (...args) => {
+              const result = await report(...args);
+              if (args[0] === 2) {
+                api.appendInputs(claim.run_id, [{ id: 9101, kind: "pause", body: "now" }]);
+                await pauseApplied.promise;
+                assert.equal(ctx.pauseModeRequested!(), "now");
+              }
+              return result || undefined;
+            };
+          }
+          commitInTree(worktree, "SF1-COMMITTED.txt", "SF1 committed bytes\n");
+          await fs.writeFile(path.join(worktree, "SF1-DIRTY.txt"), "SF1 dirty bytes\n");
+          return run(ctx);
+        };
+        const runner = new RunRunner(client, git, () => ({ executor: fx.exec, homeDir: fx.homeRoot }),
+          diagnostics.log, 20, undefined, { pollMs: 5,
+            checkpointTestHooks: { retryBackoffMs: [0, 0] },
+            quiesceRun: async () => ({
+              process: { state: "quiescent", processes: [], killed: [], detail: "fixture roots reaped" },
+              docker: { state: "not_wired", removed: [], detail: "not wired" },
+            }),
+          });
+        let pauseFlight: Parameters<typeof runner["handlePausePark"]>[1] | undefined;
+        if (outcome === "capture-expired-foreign" || outcome === "capture-expired-cancel") {
+          const run = fx.exec.run.bind(fx.exec);
+          t.mock.method(fx.exec, "run", async (...args: Parameters<typeof run>) => {
+            try { return await run(...args); }
+            catch (error) {
+              assert.ok(error instanceof EpochCleanupUnprovenError, "actual epoch guard rejected after disposal");
+              assert.equal(error.safety, pauseSafety, "guard names the exact failed epoch");
+              assert.ok(pauseFlight);
+              assert.equal(pauseFlight.refusedPauseCaptureSafety, pauseSafety);
+              if (outcome === "capture-expired-cancel") pauseFlight.steering.markCancelled();
+              else {
+                const foreign = createCodexExecutionSafety(new ExecutionRegistry(newLocalExecutionEpoch(285299)), async () => { throw new Error("unused foreign root"); }, async () => { throw new Error("unused foreign reconcile"); });
+                assert.notEqual(foreign, pauseSafety);
+                throw new EpochCleanupUnprovenError(foreign);
+              }
+              throw error;
+            }
+          });
+        }
+        const park = runner["handlePausePark"].bind(runner);
+        runner["handlePausePark"] = async (...args) => {
+          assert.equal(args[1].executor, fx.exec);
+          assert.ok(context);
+          pauseFlight = args[1];
+          parks++; region = true;
+          pauseSafety = fx.exec.safety as CodexExecutionSafetyImpl;
+          if (captureExpired) {
+            // Drive the real safety timer while its real publication action is held.
+            // No alternate executor/capture result and no completion proof are supplied.
+            pauseSafety["seams"].armDeadline = (_request, _ms, fire) => {
+              expireCapture = fire;
+              return () => {};
+            };
+          }
+          authAtEntry = api.codexRequests.length; launchesAtEntry = fx.rig.providerLaunches();
+          try { accepted = await park(...args); return accepted; }
+          finally {
+            checkRegion();
+            if (savedGeneration) {
+              assert.equal(await fx.generation(), savedGeneration, "last caller tail preserves saved generation");
+              assert.equal(await fx.saved(), savedContent, "last caller tail preserves exact saved bytes");
+            }
+            region = false; regionClosed = true;
+          }
+        };
+        const execution = runner.execute(claim);
+        void execution.catch(() => undefined);
+        const beforeEnd = <T,>(event: Promise<T>) => Promise.race([event, execution.then(() => {
+          throw new Error("SF1 execution settled before event: " + diagnostics.lines.filter(l => !l.includes('"level":"debug"')).join("\n"));
+        })]);
+        try {
+          if (route === "immediate") {
+            await beforeEnd(entered.promise);
+            api.appendInputs(claim.run_id, [{ id: 9101, kind: "pause", body: "now" }]);
+            await beforeEnd(rootEntered.promise);
+            assert.equal(sourceSamples.length, 0, "held original root excludes source operations");
+          }
+          rootRelease.resolve();
+          await beforeEnd(sourceEntered.promise);
+          if (outcome === "withdrawn") {
+            api.appendInputs(claim.run_id, [{ id: 9102, kind: "pause_cancel" }]);
+            await beforeEnd(withdrawalApplied.promise);
+            assert.equal(context!.pauseModeRequested!(), null, "actual steering consumed withdrawal after drain");
+          }
+          sourceRelease.resolve();
+          if (captureExpired) {
+            await beforeEnd(packEntered.promise);
+            assert.ok(expireCapture, "production capture armed its deadline");
+            expireCapture();
+          }
+          packRelease.resolve();
+          if (outcome === "accepted") {
+            await execution;
+            assert.equal(api.states.at(-1)?.body.status, "paused", "actual runner receives accepted paused ACK");
+          } else if (captureExpired) {
+            await execution;
+            assert.equal(regionClosed, true);
+            assert.equal(accepted, false, "real runner returns refusal after post-entry expiry");
+            assert.equal(pauseSafety!.completedCaptureForTeardown(), undefined, "expiry never mints clean completion");
+            assert.equal(fx.rig.providerLaunches(), 1, "unverified poisoned epoch cannot launch a provider");
+            assert.equal(providerRegistries.length, 1);
+            assert.equal(api.codexRequests.length, authAtEntry, "unverified old teardown cannot release a credential");
+            assert.equal(await fx.generation(), savedGeneration);
+            assert.equal(await fx.saved(), savedContent);
+            assert.equal(api.states.filter(s => s.body.status === "pause_failed").length, 1);
+            assert.equal(api.states.some(s => s.body.status === "failed"), outcome !== "capture-expired",
+              outcome === "capture-expired-foreign" ? "foreign facade guard remains an ordinary failure"
+                : outcome === "capture-expired-cancel" ? "newer cancellation retains generic cancellation dispatch"
+                  : "refused pause with unverified cleanup retains a nonterminal run");
+          } else {
+            await beforeEnd(successor.promise);
+            assert.equal(regionClosed, true);
+            assert.equal(accepted, false);
+            assert.equal(fx.rig.providerLaunches(), 2, "decline after drain creates a fresh provider epoch");
+            assert.equal(api.codexRequests.length, authAtEntry + 1, "fresh successor legitimately releases a credential after caller return");
+            assert.notEqual(fx.homes[0], fx.homes[1]);
+            assert.equal(providerRegistries.length, 2);
+            assert.notEqual(providerRegistries[0], providerRegistries[1], "production constructs a new registry");
+            assert.equal(providerRegistries[0]!.state(), "disposed", "verified old teardown precedes successor work");
+            assert.equal(fx.adopted[0], savedContent, "fresh epoch adopts exact persisted rollout bytes");
+            const resume = fx.rig.epochs[1]!.transport.requests.find(r => r.method === "thread/resume");
+            assert.equal(rec(resume!.params).threadId, thread);
+            assert.equal(await fx.generation(), savedGeneration);
+          }
+          await t.test("ACK + exact source/session bytes compatibility", () => {
+          assert.equal(parks, 1);
+          assert.ok(packs.length > 0 && packs.every(p => p.bytes > 0), "original pack streams were drained");
+          assert.deepEqual(fx.missing, [], "no persistence reads the removed HOME");
+          if (route.startsWith("seed-")) {
+            assert.equal(fx.rig.providerLaunches(), 0, JSON.stringify({ launchesAtEntry, authAtEntry, auth: api.codexRequests.length, turns: fx.rig.epochs[0]!.transport.turnStartCount }));
+            assert.equal(fx.rig.epochs[0]!.transport.turnStartCount, 0);
+            assert.equal(api.codexRequests.length, authAtEntry, "seeded capture adds no credentials to eager setup release");
+          }
+          assert.ok(sourceSamples.length > 0, "original source Git completed successfully");
+          });
+          await t.test("original source root supervision", () => {
+          // Shared paired assertion: old native dispatch completes Git but has no supervised roots.
+          assert.ok(sourceSamples.every(s => s.roots.length > 0 && s.reaped)
+            && roots.size > 0 && [...roots.values()].every(Boolean),
+            "successful source Git must register nonempty original boundary_action roots and reap all before return");
+          });
+        } finally {
+          rootRelease.resolve(); sourceRelease.resolve(); packRelease.resolve(); runner.shutdown();
+          await execution.catch(() => undefined);
+          registerProbe.mock.restore(); reapProbe.mock.restore();
+          await api.close(); repo.cleanup(); await fx.cleanup();
+        }
+      });
+    }
+  }
+
+  // Real executor caller + capture primitive proof; runner publication/ACK is proved separately.
+  for (const route of ["immediate", "milestone", "pre-turn"] as const) {
+    for (const outcome of ["accepted", "declined", "withdrawn"] as const) {
+      it(`A2 production pause ${route} ${outcome} holds drained epoch`, async () => {
+        const turn = installerBarrier(), rootEntered = installerBarrier(), rootRelease = installerBarrier();
+        const sourceEntered = installerBarrier(), sourceRelease = installerBarrier();
+        const first = route === "immediate"
+          ? epochResponder(thread, "tn-held", () => turn.resolve())
+          : epochResponder(thread, "tn-checkpoint", (t, th, tn) => {
+            t.push(toolCall(902, "checkpoint", {}, th, tn, "a2-checkpoint")).push(turnCompleted("completed", th, tn));
+          });
+        let armed = false, rootClean = false, sourceReads = 0, callbacks = 0, refreshes = 0;
+        const fx = await fixture([first, done()], rig => {
+          const root = rig.epochs[0]!.root, reap = root.reap.bind(root);
+          root.reap = async ms => {
+            if (armed) { rootEntered.resolve(); await rootRelease.promise; }
+            const result = await reap(ms);
+            if (result.ok) rootClean = true;
+            return result;
+          };
+        });
+        fx.rig.client.refreshCodex = async () => { refreshes++; throw new Error("unexpected refresh in A2 capture"); };
+        let mode: "now" | "milestone" | null = null;
+        let interrupt: (() => void) | undefined;
+        let savedGeneration = "", savedContent = "";
+        let releasesAtCapture = 0, launchesAtCapture = 0;
+        const controller = new AbortController();
+        const { ctx } = makeCtx({ signal: controller.signal,
+          pauseModeRequested: () => mode, onPauseNow: cb => { interrupt = cb; },
+          reportIteration: async iteration => {
+            if (route === "pre-turn" && iteration === 2) { mode = "now"; interrupt!(); }
+            return { pauseRequested: route === "milestone" && iteration === 2, completedCount: route === "milestone" ? 1 : 0 };
+          },
+          checkpoint: async () => undefined,
+          parkForPause: async at => {
+            callbacks++;
+            assert.equal(at.completedCount, route === "milestone" ? 1 : 0);
+            armed = true;
+            releasesAtCapture = fx.rig.client.releaseCalls.length;
+            launchesAtCapture = fx.rig.providerLaunches();
+            savedGeneration = await fx.generation(); savedContent = await fx.saved();
+            const capture = await fx.exec.withCredentialFreeCapture(1000, async () => {
+              sourceReads++;
+              assert.equal(rootClean, true, "source read requires completed full-root proof");
+              await assert.rejects(fs.access(fx.homes[0]!), { code: "ENOENT" });
+              assert.equal(await fx.generation(), savedGeneration, "drain retains session generation");
+              assert.equal(await fx.saved(), savedContent, "drain retains session bytes");
+              sourceEntered.resolve(); await sourceRelease.promise;
+              assert.equal(fx.rig.client.releaseCalls.length, releasesAtCapture, "held source region releases no credentials");
+              assert.equal(refreshes, 0, "held source region refreshes no credentials");
+              assert.equal(fx.rig.providerLaunches(), launchesAtCapture, "held source region admits no successor epoch");
+              if (outcome === "withdrawn") mode = null;
+              return outcome === "accepted";
+            });
+            assert.equal(capture.kind, "observed_empty");
+            return capture.kind === "observed_empty" && capture.value;
+          },
+        });
+        const run = fx.exec.run(ctx);
+        // Attach rejection handling before the controller awaits any latch.
+        void run.catch(() => undefined);
+        try {
+          if (route === "immediate") { await withTimeout(turn.promise, 3000, "A2 live turn"); mode = "now"; interrupt!(); }
+          await withTimeout(Promise.race([rootEntered.promise, run.then(() => { throw new Error("A2 run ended before root drain"); })]), 3000, "A2 root drain entered");
+          assert.equal(sourceReads, 0, "held full-root proof excludes source access");
+          assert.equal(fx.rig.providerLaunches(), launchesAtCapture);
+          assert.equal(fx.rig.client.releaseCalls.length, releasesAtCapture);
+          rootRelease.resolve();
+          await withTimeout(sourceEntered.promise, 3000, "A2 protected source entered");
+          assert.equal(callbacks, 1);
+          assert.equal(fx.rig.providerLaunches(), launchesAtCapture);
+          assert.equal(fx.rig.client.releaseCalls.length, releasesAtCapture);
+          sourceRelease.resolve();
+          const result = await withTimeout(run, 5000, "A2 pause route settled");
+          assert.equal(sourceReads, 1);
+          assert.equal(callbacks, 1, "spent pause generation never re-parks");
+          assert.equal(Boolean(result.pausedAt), outcome === "accepted");
+          assert.equal(fx.rig.providerLaunches(), outcome === "accepted" ? 1 : 2,
+            "declined or withdrawn post-drain route requires a fresh epoch");
+          assert.equal(fx.rig.client.releaseCalls.length, outcome === "accepted" ? releasesAtCapture : releasesAtCapture + 1);
+          assert.equal(refreshes, 0);
+          if (outcome !== "accepted") {
+            assert.match(fx.adopted[0]!, /epoch-1/, "fresh epoch adopts the captured session");
+            assert.equal(fx.rig.epochs[1]!.transport.turnStartCount, 1);
+          }
+          assert.deepEqual(fx.missing, [], "persist never reads a removed HOME");
+        } finally {
+          rootRelease.resolve(); sourceRelease.resolve(); controller.abort(new Error("A2 cleanup"));
+          await withTimeout(run.catch(() => undefined), 5000, "A2 cleanup");
+          await fx.cleanup();
+        }
+      });
+    }
+  }
+
+  for (const seeded of ["now", "milestone"] as const) {
+    it(`A2 production seeded ${seeded} zero-provider capture`, async () => {
+      const fx = await fixture([done()]);
+      const entered = installerBarrier(), release = installerBarrier();
+      let parks = 0, releasesAtEntry = 0, refreshes = 0;
+      fx.rig.client.refreshCodex = async () => { refreshes++; throw new Error("unexpected seeded capture refresh"); };
+      const { ctx } = makeCtx({ pauseModeRequested: () => seeded,
+        reportIteration: async () => ({ pauseRequested: false }),
+        parkForPause: async () => {
+          parks++; releasesAtEntry = fx.rig.client.releaseCalls.length;
+          const result = await fx.exec.withCredentialFreeCapture(1000, async () => {
+            entered.resolve(); await release.promise;
+            assert.equal(fx.rig.providerLaunches(), 0, "seeded first boundary launches no provider");
+            assert.equal(fx.rig.client.releaseCalls.length, releasesAtEntry, "seeded held capture releases no credential");
+            assert.equal(refreshes, 0, "seeded held capture refreshes no credential");
+            return true;
+          });
+          assert.equal(result.kind, "observed_empty");
+          return result.kind === "observed_empty" && result.value;
+        },
+      });
+      const run = fx.exec.run(ctx); void run.catch(() => undefined);
+      try {
+        await withTimeout(Promise.race([entered.promise, run.then(() => { throw new Error("seeded run ended before capture"); })]), 3000, "seeded capture entered");
+        assert.equal(fx.rig.providerLaunches(), 0);
+        assert.equal(fx.rig.client.releaseCalls.length, releasesAtEntry);
+        assert.equal(fx.rig.epochs[0]!.transport.turnStartCount, 0);
+        release.resolve();
+        assert.ok((await withTimeout(run, 5000, "seeded pause settled")).pausedAt);
+        assert.equal(parks, 1);
+      } finally { release.resolve(); await run.catch(() => undefined); await fx.cleanup(); }
+    });
+  }
+
+  it("A lifecycle missing facade control selects the runner's legacy action", async () => {
+    const boundaryHost = { git: { withBoundaryProcessSpawner: async (
+      _spawn: unknown, _signal: AbortSignal, action: () => Promise<void>,
+    ) => action() } } as unknown as RunRunner;
+    let actions = 0;
+    const legacy: Executor = { run: async ctx => ({ branch: ctx.branch }) };
+    await RunRunner.prototype["withCodexBoundaryOnly"].call(boundaryHost, legacy,
+      { boundary: "finalize", deadlineMs: 1000 }, async () => { actions++; });
+    assert.equal(actions, 1, "retired-facade refusal regression observes the actual legacy branch");
+  });
+
+  for (const trigger of ["pause", "human", "automatic"] as const) for (const lateCleanupFault of [false, true]) {
+    it(`A lifecycle server vault lock after drained ${trigger} capture, late cleanup fault=${lateCleanupFault}`, async () => {
+      const ready = installerBarrier();
+      const fx = await fixture([trigger === "pause"
+        ? epochResponder(thread, "tn-wait", () => ready.resolve()) : plan(1), done()]);
+      let locked = false, attempts = 0, refreshes = 0, captures = 0;
+      let generation = "", content = "";
+      let retiredRegistry: ExecutionRegistry | undefined;
+      let mode: "now" | null = null;
+      let interrupt: (() => void) | undefined;
+      const release = fx.rig.client.releaseCodex.bind(fx.rig.client);
+      fx.rig.client.releaseCodex = async (id, request) => {
+        attempts++;
+        if (locked) throw vaultLocked409("release");
+        return release(id, request);
+      };
+      fx.rig.client.refreshCodex = async () => {
+        refreshes++;
+        throw new Error("unexpected refresh after drain");
+      };
+      const capture = async () => {
+        const result = await fx.exec.withCredentialFreeCapture(1000, async () => {
+          captures++;
+          retiredRegistry = [...fx.exec["epochSafeties"]].find(([, facade]) => facade === fx.exec.safety)?.[0];
+          assert.ok(retiredRegistry, "the capture belongs to the exact live epoch");
+          generation = await fx.generation();
+          content = await fx.saved();
+          assert.match(content, /epoch-1/);
+          await assert.rejects(fs.access(fx.homes[0]!), { code: "ENOENT" });
+          locked = true;
+        });
+        assert.equal(result.kind, "observed_empty");
+        mode = null;
+      };
+      const controller = new AbortController();
+      const { ctx } = makeCtx({ signal: controller.signal,
+        planApproved: trigger === "pause", approvedPlan: trigger === "pause" ? "# Approved" : undefined,
+        pauseModeRequested: () => mode, onPauseNow: cb => { interrupt = cb; },
+        parkForPause: async () => { await capture(); return false; },
+        gatePlan: async () => {
+          await capture();
+          return trigger === "automatic"
+            ? { kind: "revise", feedback: "replace milestones", automatic: true, round: 1, items: [] }
+            : { kind: "revise", feedback: "replace milestones", inputId: 1 };
+        },
+      });
+      const run = fx.exec.run(ctx);
+      try {
+        if (trigger === "pause") {
+          await withTimeout(ready.promise, 3000, "turn before vault lock");
+          mode = "now"; interrupt!();
+        }
+        await assert.rejects(withTimeout(run, 5000, "vault deferred recreation"), (error: unknown) => {
+          assert.ok(error instanceof CodexCredentialDeferredError);
+          assert.equal(error.deferral, "vault_locked");
+          assert.equal(error.name, "CodexCredentialDeferredError");
+          return true;
+        });
+        assert.equal(captures, 1);
+        assert.equal(attempts, 2, "one server-discovered failing release is allowed");
+        assert.equal(fx.rig.client.releaseCalls.length, 1, "only pre-lock credentials succeeded");
+        assert.equal(fx.rig.providerLaunches(), 1);
+        assert.deepEqual(fx.rig.epochs.map(e => e.transport.turnStartCount), [1, 0]);
+        assert.deepEqual(fx.persists, fx.homes);
+        assert.deepEqual(fx.missing, []);
+        assert.equal(await fx.generation(), generation);
+        assert.equal(await fx.saved(), content);
+        let ordinaryActions = 0;
+        const boundaryHost = { git: { withBoundaryProcessSpawner: async (
+          _spawn: unknown, _signal: AbortSignal, action: () => Promise<void>,
+        ) => action() } } as unknown as RunRunner;
+        const ordinary = () => RunRunner.prototype["withCodexBoundaryOnly"].call(boundaryHost, fx.exec,
+          { boundary: "finalize", deadlineMs: 1000 }, async () => { ordinaryActions++; });
+        const refused = (error: unknown) => error instanceof CodexBoundaryError || error instanceof TrustedExecutionRefusal;
+        await assert.rejects(ordinary(), refused, "retired Codex safety must never fall through the legacy publication path");
+        assert.equal(ordinaryActions, 0);
+        assert.equal(attempts, 2);
+        assert.equal(refreshes, 0, "normal refusal cannot reconcile credentials on a retired epoch");
+        const retiredSafety = fx.exec.safety;
+        if (lateCleanupFault) retiredRegistry!.poison({ category: "tool", message: "late cleanup fault" });
+        let local = 0;
+        const captured = await fx.exec.withCredentialFreeCapture(1000, async () => {
+          local++;
+          assert.equal(await fx.saved(), content);
+          return "local-only";
+        });
+        if (lateCleanupFault) {
+          assert.equal(captured.kind, "incomplete");
+          assert.equal(local, 0, "a later poison cannot be erased by the teardown selector");
+          assert.equal(fx.exec.safety, retiredSafety);
+          assert.equal((await fx.exec.withCredentialFreeCapture(1000, async () => { local++; })).kind, "incomplete");
+          assert.equal(local, 0, "repeated refusal cannot turn old teardown into fresh proof");
+        } else {
+          assert.deepEqual(captured, { kind: "observed_empty", value: "local-only" });
+          assert.equal(local, 1);
+          assert.notEqual(fx.exec.safety, retiredSafety, "fresh capture-only facade owns capture admission");
+        }
+        await assert.rejects(ordinary(), refused, "capture-only replacement grants no normal boundary");
+        assert.equal(ordinaryActions, 0);
+        assert.equal(attempts, 2);
+        assert.equal(refreshes, 0);
+        assert.equal(fx.rig.providerLaunches(), 1);
+        assert.equal(await fx.generation(), generation);
+        assert.deepEqual(fx.missing, []);
+      } finally {
+        controller.abort(new Error("fixture cleanup"));
+        await withTimeout(run.catch(() => undefined), 5000, "vault cleanup");
+        await fx.cleanup();
+      }
+    });
+  }
+
+  for (const mode of ["wall", "now"] as const) {
+    it(`A lifecycle two successive ${mode} refusals capture fresh epochs`, async () => {
+      const turns = [installerBarrier(), installerBarrier()];
+      const fx = await fixture([
+        ...turns.map((ready, n) => epochResponder(thread, `tn-${n}`, () => ready.resolve())),
+        done(),
+      ]);
+      let pause: "wall" | "now" | null = null;
+      let interrupt: (() => void) | undefined;
+      let captures = 0;
+      const controller = new AbortController();
+      const capture = async () => {
+        const n = ++captures;
+        const before = await fx.generation();
+        const result = await fx.exec.withCredentialFreeCapture(1000, async () => {
+          assert.match(await fx.saved(), new RegExp(`epoch-${n}`));
+          await assert.rejects(fs.access(fx.homes[n - 1]!), { code: "ENOENT" });
+          return "refused";
+        });
+        assert.deepEqual(result, { kind: "observed_empty", value: "refused" });
+        assert.equal(await fx.generation(), before, "capture must retain the pre-drain generation");
+        pause = null; // The owner withdrew the request after capture.
+      };
+      const { ctx } = makeCtx({ signal: controller.signal,
+        pauseModeRequested: () => pause, onPauseNow: cb => { interrupt = cb; },
+        clearWallMode: () => { pause = null; },
+        parkForWall: async () => { await capture(); return "refused"; },
+        parkForPause: async () => { await capture(); return false; },
+      });
+      const run = fx.exec.run(ctx);
+      try {
+        for (const turn of turns) {
+          await withTimeout(turn.promise, 3000, "fresh epoch turn");
+          pause = mode;
+          interrupt!();
+        }
+        const result = await withTimeout(run, 5000, "repeated pause capture");
+        assert.equal(result.branch, ctx.branch);
+        assert.equal(result.pausedAt, undefined);
+        assert.equal(result.walled, undefined);
+        assert.equal(captures, 2);
+        assert.equal(fx.rig.providerLaunches(), 3);
+        assert.deepEqual(fx.rig.epochs.map(e => e.transport.turnStartCount), [1, 1, 1]);
+        assert.deepEqual(fx.persists, fx.homes, "each HOME saved once while live");
+        assert.deepEqual(fx.missing, []);
+        assert.equal(fx.adopted.length, 2);
+        assert.match(fx.adopted[0]!, /epoch-1/);
+        assert.match(fx.adopted[1]!, /epoch-2/);
+        assert.match(await fx.saved(), /epoch-3/);
+        for (const home of fx.homes) await assert.rejects(fs.access(home), { code: "ENOENT" });
+      } finally {
+        controller.abort(new Error("fixture cleanup"));
+        await withTimeout(run.catch(() => undefined), 5000, "pause cleanup");
+        await fx.cleanup();
+      }
+    });
+  }
+
+  it("A lifecycle incomplete pause capture refuses fresh credentials while old provider root is unclean", async t => {
+    const ready = installerBarrier();
+    let oldRegistry: ExecutionRegistry | undefined;
+    const providerRegistries = new Set<ExecutionRegistry>();
+    const register = ExecutionRegistry.prototype.registerRoot;
+    t.mock.method(ExecutionRegistry.prototype, "registerRoot", function (
+      this: ExecutionRegistry, ...args: Parameters<ExecutionRegistry["registerRoot"]>
+    ) {
+      const result = register.apply(this, args);
+      if (args[1].kind === "provider") providerRegistries.add(this);
+      return result;
+    });
+    let dirty = true, refusedReaps = 0, refusedDisposals = 0, cleanReaps = 0;
+    const fx = await fixture([epochResponder(thread, "tn-dirty", () => ready.resolve()), done()], rig => {
+      const old = rig.epochs[0]!.root;
+      const reap = old.reap.bind(old), dispose = old.dispose.bind(old);
+      old.reap = async ms => {
+        if (dirty) {
+          refusedReaps++;
+          return { ok: false, error: { category: "tool", message: "old provider full root remains unclean" } };
+        }
+        cleanReaps++;
+        return reap(ms);
+      };
+      old.dispose = async ms => {
+        if (dirty) { refusedDisposals++; throw new Error("old provider disposal unconfirmed"); }
+        await dispose(ms);
+      };
+      rig.deps = { ...rig.deps, deferRegistryTeardown: true };
+    });
+    let mode: "now" | null = null;
+    let interrupt: (() => void) | undefined;
+    let captures = 0, actions = 0;
+    let generation = "", content = "";
+    const releases: { state: string; roots: number; cleanReaps: number; generation: string; content: string; source: string }[] = [];
+    const release = fx.rig.client.releaseCodex.bind(fx.rig.client);
+    fx.rig.client.releaseCodex = async (...args) => {
+      if (captures) {
+        assert.ok(oldRegistry);
+        releases.push({ state: oldRegistry.state(), roots: oldRegistry.rootCount(), cleanReaps,
+          generation: await fx.generation(), content: await fx.saved(),
+          source: await fs.readFile(path.join(fx.homes[0]!, "sessions", rolloutName), "utf8") });
+      }
+      return release(...args);
+    };
+    const controller = new AbortController();
+    const { ctx } = makeCtx({ signal: controller.signal,
+      pauseModeRequested: () => mode, onPauseNow: cb => { interrupt = cb; },
+      parkForPause: async () => {
+        captures++;
+        const result = await fx.exec.withCredentialFreeCapture(1000, async () => { actions++; });
+        assert.equal(result.kind, "incomplete", "real registry cannot certify the dirty registered root");
+        if (result.kind === "incomplete") assert.match(JSON.stringify(result.errors), /root.*not cleanly reaped/);
+        assert.equal(actions, 0, "incomplete acquisition never enters the capture action");
+        assert.ok(oldRegistry);
+        assert.equal(oldRegistry.state(), "poisoned");
+        assert.equal(oldRegistry.rootCount(), 2, "provider and run-start environment probe remain registered");
+        assert.ok(refusedReaps > 0);
+        assert.equal(cleanReaps, 0);
+        generation = await fx.generation();
+        content = await fx.saved();
+        assert.match(content, /epoch-1/);
+        assert.equal(await fs.readFile(path.join(fx.homes[0]!, "sessions", rolloutName), "utf8"), content);
+        mode = null; // Failure ACK allows continuation, as in the runner's refused-pause context.
+        return false;
+      },
+    });
+    const run = fx.exec.run(ctx);
+    const settled = run.then(value => ({ value, error: undefined }), (error: unknown) => ({ value: undefined, error }));
+    try {
+      await withTimeout(ready.promise, 3000, "old provider turn before incomplete pause");
+      oldRegistry = providerRegistries.values().next().value;
+      mode = "now"; interrupt!();
+      const outcome = await withTimeout(settled, 5000, "dirty pause continuation");
+      t.diagnostic(JSON.stringify({ error: outcome.error instanceof Error ? { name: outcome.error.name, message: outcome.error.message } : outcome.error,
+        releases: fx.rig.client.releaseCalls.length, providers: fx.rig.providerLaunches(),
+        refusedReaps, refusedDisposals, cleanReaps, observations: releases }));
+      assert.equal(captures, 1);
+      assert.equal(cleanReaps, 0, "old root has no clean proof before fresh credential observation");
+      for (const observed of releases) {
+        assert.deepEqual(observed, { state: "poisoned", roots: 2, cleanReaps: 0,
+          generation, content, source: content }, "fresh release observes the exact retained old generation and source");
+      }
+      assert.deepEqual(fx.missing, [], "never persist a disposed HOME");
+      assert.equal(fx.rig.client.releaseCalls.length, 1,
+        "incomplete pause capture must refuse fresh credentials until the old provider root is clean");
+      assert.equal(fx.rig.providerLaunches(), 1, "no replacement provider before clean old-root evidence");
+      assert.equal(await fx.generation(), generation);
+      assert.equal(await fx.saved(), content);
+    } finally {
+      dirty = false; // Release the owned root seam before joining every operation.
+      controller.abort(new Error("fixture cleanup"));
+      await withTimeout(settled, 5000, "dirty pause cleanup");
+      await oldRegistry?.disposeTools(1000);
+      await fx.exec.safety?.dispose({ boundary: "terminal", deadlineMs: 1000 });
+      await fx.cleanup();
+    }
+  });
+
+  for (const automatic of [false, true]) {
+    it(`A lifecycle repeated ${automatic ? "automatic" : "human"} changed-milestone capture revises on fresh epochs`, async (t) => {
+      const fx = await fixture([plan(1), plan(2), plan(3), done()]);
+      let gates = 0, revisions = 0;
+      let capturedSafety: CodexExecutor["safety"];
+      let latestPlanPair: { harness: unknown; registry: unknown } | undefined;
+      let capturedPlanPair: typeof latestPlanPair;
+      // Observe the arguments before the method can recreate an epoch as a backstop.
+      const boundary = fx.exec as unknown as { driveTurnWithWallPark: (...args: unknown[]) => Promise<unknown> };
+      const drive = boundary.driveTurnWithWallPark.bind(fx.exec);
+      const entrySpy = t.mock.method(boundary, "driveTurnWithWallPark", (...args: unknown[]) => {
+        if (args[4] === "plan") {
+          if (gates > 0) {
+            assert.ok(capturedPlanPair, "plan pair saved at the last capture gate");
+            t.diagnostic(`revision plan entry after gate ${gates}: fresh harness=${args[1] !== capturedPlanPair.harness}, registry=${args[2] !== capturedPlanPair.registry}, safety=${fx.exec.safety !== capturedSafety}`);
+            assert.notEqual(args[1], capturedPlanPair.harness, "fresh harness at revision plan entry before the backstop");
+            assert.notEqual(args[2], capturedPlanPair.registry, "fresh registry at revision plan entry before the backstop");
+            assert.notEqual(fx.exec.safety, capturedSafety, "fresh safety at revision plan entry before the backstop");
+          }
+          latestPlanPair = { harness: args[1], registry: args[2] };
+        }
+        return drive(...args);
+      });
+      const controller = new AbortController();
+      const { ctx } = makeCtx({ signal: controller.signal, planApproved: false, approvedPlan: undefined,
+        beforePlanRevisionTurn: async () => {
+          revisions++;
+          assert.notEqual(fx.exec.safety, capturedSafety, "fresh safety before the human revision hook");
+        },
+        gatePlan: async (md, milestones) => {
+          const n = ++gates;
+          assert.equal(md, `# Plan ${n}`);
+          assert.deepEqual(milestones?.map(m => m.id), [`m${n}`]);
+          capturedSafety = fx.exec.safety;
+          assert.ok(latestPlanPair, "plan entry observed before capture");
+          capturedPlanPair = latestPlanPair;
+          const captured = await fx.exec.withCredentialFreeCapture(1000, async () => {
+            assert.match(await fx.saved(), new RegExp(`epoch-${n}`));
+            await assert.rejects(fs.access(fx.homes[n - 1]!), { code: "ENOENT" });
+            return await fx.generation();
+          });
+          assert.equal(captured.kind, "observed_empty");
+          if (captured.kind === "observed_empty") assert.equal(await fx.generation(), captured.value);
+          if (n === 3) return approve;
+          return automatic
+            ? { kind: "revise", feedback: `replace milestones round ${n}`, automatic: true, round: n, items: [] }
+            : { kind: "revise", feedback: `replace milestones round ${n}`, inputId: n };
+        },
+      });
+      const run = fx.exec.run(ctx);
+      try {
+        const result = await withTimeout(run, 5000, "repeated gate capture");
+        assert.equal(result.branch, ctx.branch);
+        assert.equal(gates, 3);
+        assert.equal(revisions, automatic ? 0 : 2);
+        assert.equal(fx.rig.providerLaunches(), 4);
+        assert.deepEqual(fx.rig.epochs.map(e => e.transport.turnStartCount), [1, 1, 1, 1]);
+        assert.deepEqual(fx.persists, fx.homes);
+        assert.deepEqual(fx.missing, []);
+        assert.equal(fx.adopted.length, 3);
+        for (let n = 0; n < 3; n++) assert.match(fx.adopted[n]!, new RegExp(`epoch-${n + 1}`));
+        assert.match(await fx.saved(), /epoch-4/);
+        for (const home of fx.homes) await assert.rejects(fs.access(home), { code: "ENOENT" });
+      } finally {
+        controller.abort(new Error("fixture cleanup"));
+        await withTimeout(run.catch(() => undefined), 5000, "gate cleanup");
+        entrySpy.mock.restore();
+        await fx.cleanup();
+      }
+    });
+  }
+  for (const exit of ["approve", "interrupted", "failed"] as const) {
+    it(`A lifecycle ${exit} gate capture preserves pre-drain generation`, async () => {
+      const fx = await fixture([plan(1), done()]);
+      let preDrain: string | undefined;
+      const failure = new Error("capture body failed");
+      const controller = new AbortController();
+      const { ctx } = makeCtx({ signal: controller.signal, planApproved: false, approvedPlan: undefined,
+        gatePlan: async () => {
+          const capture = fx.exec.withCredentialFreeCapture(1000, async () => {
+            preDrain = await fx.generation();
+            assert.match(await fx.saved(), /epoch-1/);
+            await assert.rejects(fs.access(fx.homes[0]!), { code: "ENOENT" });
+            if (exit === "failed") throw failure;
+            if (exit === "interrupted") controller.abort(new Error("capture interrupted"));
+          });
+          if (exit === "failed") await assert.rejects(capture, e => e === failure);
+          else assert.equal((await capture).kind, "observed_empty");
+          if (exit === "failed") throw failure;
+          return approve;
+        },
+      });
+      const run = fx.exec.run(ctx);
+      try {
+        if (exit === "failed") await assert.rejects(withTimeout(run, 5000, "failed capture"), e => e === failure);
+        else if (exit === "interrupted") await assert.rejects(withTimeout(run, 5000, "interrupted capture"), (e: unknown) =>
+          e instanceof CodexBoundaryError && e.errors.some(error => /capture deadline expired/.test(error.message)));
+        else assert.equal((await withTimeout(run, 5000, "approved capture")).branch, ctx.branch);
+        assert.ok(preDrain);
+        assert.deepEqual(fx.missing, []);
+        assert.deepEqual(fx.persists, fx.homes);
+        if (exit !== "approve") {
+          assert.equal(await fx.generation(), preDrain);
+          assert.match(await fx.saved(), /epoch-1/);
+          assert.equal(fx.rig.client.releaseCalls.length, 1);
+        }
+      } finally {
+        controller.abort(new Error("fixture cleanup"));
+        await withTimeout(run.catch(() => undefined), 5000, "capture exit cleanup");
+        await fx.cleanup();
+      }
+    });
+  }
+
+  for (const newer of ["cancel", "pause"] as const) {
+    it(`A lifecycle newer ${newer} during refused capture precedes credential release`, async () => {
+      const turn = installerBarrier();
+      const fx = await fixture([epochResponder(thread, "tn-quiet", () => turn.resolve()), done()]);
+      let mode: "wall" | "now" | null = null, cancelled = false;
+      let interrupt: (() => void) | undefined;
+      let captures = 0, ownerParks = 0;
+      const controller = new AbortController();
+      const { ctx } = makeCtx({ signal: controller.signal, cancelRequested: () => cancelled,
+        pauseModeRequested: () => mode, onPauseNow: cb => { interrupt = cb; },
+        clearWallMode: () => { if (mode === "wall") mode = null; },
+        parkForPause: async () => { ownerParks++; return true; },
+        parkForWall: async () => {
+          const result = await fx.exec.withCredentialFreeCapture(1000, async () => {
+            captures++;
+            if (newer === "cancel") cancelled = true;
+            else { mode = "now"; interrupt!(); }
+          });
+          assert.equal(result.kind, "observed_empty");
+          return "refused";
+        },
+      });
+      const run = fx.exec.run(ctx);
+      try {
+        await withTimeout(turn.promise, 3000, "turn before newer steering");
+        mode = "wall"; interrupt!();
+        if (newer === "cancel") await assert.rejects(withTimeout(run, 5000, "new cancel"), /run cancelled/);
+        else assert.ok((await withTimeout(run, 5000, "new pause")).pausedAt);
+        assert.equal(captures, 1);
+        assert.equal(ownerParks, newer === "pause" ? 1 : 0);
+        assert.equal(fx.rig.client.releaseCalls.length, 1);
+        assert.equal(fx.rig.providerLaunches(), 1);
+        assert.deepEqual(fx.missing, []);
+        assert.deepEqual(fx.persists, fx.homes);
+        assert.match(await fx.saved(), /epoch-1/);
+      } finally {
+        controller.abort(new Error("fixture cleanup"));
+        await withTimeout(run.catch(() => undefined), 5000, "steering cleanup");
+        await fx.cleanup();
+      }
+    });
+  }
+
+  for (const unclean of [false, true]) it(`A lifecycle healthy current terminal dispose old epoch unclean=${unclean}`, async () => {
+    const fx = await fixture([plan(1), done()]);
+    let helpers = 0, oldDisposals = 0;
+    fx.rig.deps = { ...fx.rig.deps, deferRegistryTeardown: true,
+      wireFileop: () => {
+        const helper = fakeFileopHandle().handle;
+        const first = ++helpers === 1;
+        return { ...helper, dispose: async () => {
+          if (first) {
+            oldDisposals++;
+            if (unclean) throw new Error("old helper cleanup unproven");
+          }
+          await helper.dispose();
+        } };
+      },
+    };
+    // Construct after installing the failing helper seam; the epoch registries remain production-owned.
+    const exec = makeExecutor(fx.rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider, fx.homeRoot);
+    const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined, gatePlan: async () => approve });
+    try {
+      assert.equal((await withTimeout(exec.run(ctx), 5000, "unclean old epoch run")).branch, ctx.branch);
+      assert.ok(oldDisposals > 0, "the real abandoned epoch attempted helper teardown");
+      assert.equal(fx.rig.providerLaunches(), 2);
+      const disposed = await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 1000 });
+      assert.equal(disposed.kind, unclean ? "incomplete" : "disposed");
+      if (disposed.kind === "incomplete") assert.match(JSON.stringify(disposed.errors), /terminal cleanup hook failed/);
+    } finally { await fx.cleanup(); }
+  });
+
+});
+
+describe("#2852 default installer binding", () => {
+  const done = epochResponder("th-1", "tn-1", t => { t.push(signalDone()).push(turnCompleted()); });
+  async function fixture(mode: "clean" | "unclean" | "startup" = "clean", responder = done, observe?: (phase: "spawn" | "primary") => void,
+    options: { ctx?: Partial<RunContext>; configure?: (rig: Rig) => void; lockfile?: string } = {}) {
+    const scratch = path.resolve("../.uzi/scratch");
+    const dir = await fs.mkdtemp(path.join(scratch, "installer-binding-"));
+    const repo = path.join(dir, "repo");
+    await fs.mkdir(repo);
+    await fs.writeFile(path.join(repo, "package.json"), '{"name":"installer-fixture","private":true}');
+    await fs.writeFile(path.join(repo, options.lockfile ?? "package-lock.json"), '{"lockfileVersion":3}');
+    const native = nativeRootForTest(mode, observe);
+    const rig = makeRig({ responder });
+    rig.deps = { ...rig.deps, installDeps: undefined,
+      provisionRunTools: async () => ({ toolEnv: { PATH: "/fixture/bin" } }),
+      launchCodexInstallerRootForTest: native.launcher,
+    };
+    options.configure?.(rig);
+    const log = recordingLog();
+    const exec = new CodexExecutor(log.log, path.join(dir, "home"),
+      { binding: bindingOf(SUBSCRIPTION), client: rig.client as never, provider },
+      { ...rig.deps, spawnCommand: answerEnvProbe(rig.deps.spawnCommand!, rig.probeCalls) });
+    const controller = new AbortController();
+    const { ctx, emitted } = makeCtx({ worktreePath: repo, signal: controller.signal, ...options.ctx });
+    let returned = false;
+    const run = exec.run(ctx).then(
+      value => ({ value, error: undefined }),
+      (error: unknown) => ({ value: undefined, error }),
+    ).finally(() => { returned = true; });
+    return { native, rig, exec, ctx, emitted, log, run, controller, returned: () => returned,
+      cleanup: async () => {
+        controller.abort(new Error("fixture cleanup"));
+        native.release();
+        await withTimeout(run, 5000, "#2852 owned run cleanup");
+        await native.destroy();
+        await fs.rm(dir, { recursive: true, force: true });
+      },
+    };
+  }
+
+  it("#2852 primary exit zero retains the default installer root until full disposal", async t => {
+    const reservations: ExecutionRegistry[] = [];
+    let installer: ExecutionRegistry | undefined;
+    let primaryState: { roots: number; pending: number } | undefined;
+    const reserve = ExecutionRegistry.prototype.reserveLaunch;
+    t.mock.method(ExecutionRegistry.prototype, "reserveLaunch", function (
+      this: ExecutionRegistry, ...args: Parameters<ExecutionRegistry["reserveLaunch"]>
+    ) {
+      const result = reserve.apply(this, args);
+      if (args[0] === "command") reservations.push(this);
+      return result;
+    });
+    const fx = await fixture("clean", done, phase => {
+      if (phase === "spawn") installer = reservations.at(-1);
+      else if (installer) primaryState = { roots: installer.rootCount(), pending: installer.pendingLaunchCount() };
+    });
+    try {
+      await withTimeout(fx.native.disposing, 3000, "default installer disposal requested");
+      assert.ok(installer, "installer reservation existed before actual launch");
+      assert.deepEqual(primaryState, { roots: 1, pending: 0 }, "installer registered BEFORE primary wait");
+      assert.deepEqual(fx.native.events, ["spawn", "primary-wait", "dispose-request"]);
+      assert.equal(fx.rig.transport.turnStartCount, 0, "primary exit cannot start implementation");
+      assert.equal(fx.rig.client.refreshCalls.length, 0);
+      assert.equal(fx.returned(), false);
+      fx.native.writeIgnoredOutput();
+      fx.native.release();
+      const result = await withTimeout(fx.run, 5000, "clean default installer run");
+      assert.equal(result.error, undefined);
+      assert.equal(fx.rig.transport.turnStartCount, 1);
+      assert.ok(fx.native.events.includes("drained"));
+      assert.ok(fx.emitted.some(m => JSON.stringify(m).includes("installed JS dependencies in .")));
+      assert.doesNotMatch(JSON.stringify([fx.emitted, fx.log.lines]), /installer-(output|error)-must-not-escape/);
+      const call = fx.native.calls[0]!;
+      assert.equal(call.options.cwd, fx.ctx.worktreePath);
+      assert.deepEqual(call.args.slice(-7), ["--expect-uid", "10002", "--", "/usr/bin/env", "npm", "ci", "--ignore-scripts"]);
+      assert.equal(call.options.env.HOME, path.join(path.dirname(fx.ctx.worktreePath), "home"));
+      assert.equal(call.options.env.PATH, "/fixture/bin");
+      assert.equal(call.options.env.GIT_TERMINAL_PROMPT, "0");
+      for (const key of ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GITHUB_TOKEN", "GITLAB_TOKEN", "UZI_WORKER_TOKEN", "NODE_OPTIONS"]) {
+        assert.equal(call.options.env[key], undefined, key);
+      }
+    } finally { await fx.cleanup(); }
+  });
+
+  it("#2852 cancel-purpose capture waits for full default installer drain independently of lifecycle", async () => {
+    const fx = await fixture();
+    const bodyEntered = installerBarrier();
+    const bodyRelease = installerBarrier();
+    let bodies = 0;
+    let capture: ReturnType<CodexExecutor["withCredentialFreeCapture"]> | undefined;
+    try {
+      await withTimeout(fx.native.disposing, 3000, "installer primary exited");
+      capture = fx.exec.withCredentialFreeCapture(5000, async () => {
+        bodies++;
+        bodyEntered.resolve();
+        await bodyRelease.promise;
+        return "captured";
+      }, "cancel", new AbortController().signal);
+      // The abort is delivered synchronously; disposal still owns the latch.
+      assert.equal(bodies, 0);
+      assert.equal(fx.rig.client.refreshCalls.length, 0);
+      assert.equal(fx.rig.sessionOps.persist, 0);
+      assert.equal(fx.returned(), false);
+      fx.native.release();
+      await withTimeout(bodyEntered.promise, 3000, "capture after installer full drain");
+      assert.ok(fx.native.events.includes("drained"));
+      assert.equal(fx.returned(), false, "run finally cannot overtake held capture body");
+      await assert.rejects(fx.exec.run(fx.ctx), /codex (run already active|epoch admission closed for capture)/);
+      bodyRelease.resolve();
+      assert.deepEqual(await capture, { kind: "observed_empty", value: "captured" });
+      await withTimeout(fx.run, 5000, "capture-first run finally");
+      assert.equal(bodies, 1);
+    } finally {
+      bodyRelease.resolve(); fx.native.release();
+      if (capture) await capture;
+      await fx.cleanup();
+    }
+  });
+
+  for (const mode of ["unclean", "startup"] as const) {
+    it(`#2852 ${mode} default installer never grants capture or credential reconcile`, async () => {
+      const cacheEntered = installerBarrier();
+      const cacheRelease = installerBarrier();
+      const fx = await fixture(mode, done, undefined, { configure: rig => {
+        rig.deps = { ...rig.deps, deferRegistryTeardown: true,
+          startCacheHolder: async token => ({ token, path: `/var/cache/uzi-codex-cmd/${token}`, alive: () => true,
+            release: async () => {
+              cacheEntered.resolve();
+              await cacheRelease.promise;
+              return { state: "removed", reason: "" };
+            },
+          }),
+        };
+      } });
+      let terminal: Promise<unknown> | undefined;
+      let bodies = 0;
+      try {
+        await withTimeout(fx.native.disposing, 3000, "uncertain root disposal requested");
+        fx.native.release();
+        const run = await withTimeout(fx.run, 5000, "uncertain installer terminal join");
+        assert.equal(fx.rig.transport.turnStartCount, 1, "best-effort failure remains a fulfilled installation fact");
+        assert.equal(run.error, undefined);
+        assert.ok(fx.emitted.some(m => JSON.stringify(m).includes(
+          mode === "unclean" ? "installer cleanup unconfirmed" : "installer startup failed")));
+        assert.equal(fx.emitted.some(m => JSON.stringify(m).includes("installed JS dependencies in .")), false,
+          "primary exit zero with unclean root cannot report success");
+        const releaseCalls = fx.rig.client.releaseCalls.length;
+        const refreshCalls = fx.rig.client.refreshCalls.length;
+        const capture = await fx.exec.withCredentialFreeCapture(1000, async () => { bodies++; }, "cancel");
+        assert.equal(capture.kind, "incomplete");
+        assert.equal(bodies, 0);
+        await assert.rejects(fx.exec.safety!.withBoundary({ boundary: "finalize", deadlineMs: 1000 }, async () => {
+          bodies++;
+        }));
+        assert.equal(bodies, 0);
+        assert.equal(fx.rig.client.releaseCalls.length, releaseCalls);
+        assert.equal(fx.rig.client.refreshCalls.length, refreshCalls);
+        let terminalReturned = false;
+        terminal = fx.exec.safety!.dispose({ boundary: "finalize", deadlineMs: 5000 }).then(result => {
+          terminalReturned = true;
+          return result;
+        }, (error: unknown) => {
+          terminalReturned = true;
+          return { kind: "rejected", error: String(error) };
+        });
+        await withTimeout(cacheEntered.promise, 3000, "independent terminal cache cleanup");
+        assert.equal(terminalReturned, false, "uncertain installer cannot detach independent cache cleanup");
+        assert.ok(fx.log.removed.length > 0, "released tokens still evicted");
+        assert.ok(fx.rig.disposed() > 0, "independent provider cleanup still attempted");
+        cacheRelease.resolve();
+        const terminalResult = await terminal as { kind: string; error?: string };
+        assert.equal(terminalResult.kind, "incomplete",
+          `terminal disposal must return incomplete after independent cleanup; observed ${JSON.stringify(terminalResult)}`);
+      } finally {
+        cacheRelease.resolve();
+        if (terminal) await terminal;
+        await fx.cleanup();
+      }
+    });
+  }
+
+  it("#2852 normal production reconcile waits for clean installer settlement", async () => {
+    const turn = installerBarrier();
+    const quiet = epochResponder("th-1", "tn-1", () => { turn.resolve(); });
+    const fx = await fixture("clean", quiet, undefined, { ctx: { planApproved: false, approvedPlan: undefined, gatePlan: async () => ({ kind: "cancel" }) as never } });
+    let boundary: Promise<unknown> | undefined;
+    let sinks = 0;
+    try {
+      await withTimeout(turn.promise, 3000, "planning overlaps default install");
+      await withTimeout(fx.native.disposing, 3000, "installer disposal held");
+      boundary = fx.exec.safety!.withBoundary({ boundary: "finalize", deadlineMs: 5000 }, async () => {
+        assert.ok(fx.native.events.includes("drained"));
+        sinks++;
+      });
+      assert.equal(sinks, 0);
+      assert.equal(fx.rig.client.refreshCalls.length, 0);
+      fx.native.release();
+      await withTimeout(boundary, 3000, "production reconcile after full drain");
+      assert.equal(sinks, 1);
+      assert.equal(fx.rig.client.refreshCalls.length, 1, "real run-lane credential reconcile executes after clean settlement");
+    } finally {
+      fx.native.release();
+      if (boundary) await boundary;
+      await fx.cleanup();
+    }
+  });
+
+  for (const order of ["capture-first", "terminal-first"] as const) {
+    it(`#2852 ${order} serializes pending session save and terminal ownership`, async () => {
+      const turn = installerBarrier();
+      const persistEntered = installerBarrier();
+      const persistRelease = installerBarrier();
+      const bodyEntered = installerBarrier();
+      const bodyRelease = installerBarrier();
+      const homes = new Set<string>();
+      const sources: string[] = [];
+      let generation = 7;
+      let savedFiles = 1;
+      let bodies = 0;
+      const responder = epochResponder("th-1", "tn-1", t => {
+        turn.resolve();
+        if (order === "terminal-first") t.push(signalDone()).push(turnCompleted());
+      });
+      const fx = await fixture("clean", responder, undefined, { configure: rig => {
+        const launch = rig.deps.launchProviderRoot!;
+        rig.deps = { ...rig.deps,
+          launchProviderRoot: async (spec, mode) => {
+            const result = await launch(spec, mode);
+            const home = path.join(spec.ownedDataRoot, "codex");
+            homes.add(home);
+            return { ...result, root: { ...result.root,
+              reap: async ms => {
+                const reaped = await result.root.reap(ms);
+                if (reaped.ok) homes.delete(home);
+                return reaped;
+              },
+              dispose: async ms => { await result.root.dispose(ms); homes.delete(home); },
+            } };
+          },
+          sessionStore: {
+            inspect: async () => "present",
+            adopt: async () => ({ files: savedFiles }),
+            remove: async () => { savedFiles = 0; },
+            persist: async home => {
+              sources.push(home);
+              persistEntered.resolve();
+              await persistRelease.promise;
+              generation++;
+              savedFiles = homes.has(home) ? 1 : 0;
+              return { files: savedFiles, bytes: savedFiles };
+            },
+          },
+        };
+      } });
+      let capture: ReturnType<CodexExecutor["withCredentialFreeCapture"]> | undefined;
+      try {
+        await withTimeout(fx.native.disposing, 3000, "default installer root disposal");
+        fx.native.release();
+        await withTimeout(turn.promise, 3000, "provider turn entered");
+        if (order === "terminal-first") {
+          await withTimeout(persistEntered.promise, 3000, "terminal persist owns tail");
+          await assert.rejects(fx.exec.run(fx.ctx), /codex run already active/);
+        }
+        capture = fx.exec.withCredentialFreeCapture(5000, async () => {
+          bodies++;
+          bodyEntered.resolve();
+          await bodyRelease.promise;
+          return "saved capture";
+        }, "cancel", new AbortController().signal);
+        await withTimeout(persistEntered.promise, 3000, "persist before capture drain");
+        fx.controller.abort(new Error("external lifecycle cancelled"));
+        assert.equal(fx.rig.reaped(), 0, "neither capture nor terminal may drain before persist settles");
+        assert.equal(fx.rig.disposed(), 0);
+        assert.equal(fx.rig.transport.closes, 0);
+        assert.equal(fx.returned(), false);
+        assert.equal(bodies, 0);
+        assert.equal(generation, 7);
+        persistRelease.resolve();
+        if (order === "capture-first") {
+          await withTimeout(bodyEntered.promise, 3000, "capture owns body");
+          assert.equal(fx.returned(), false);
+          assert.equal(fx.rig.transport.closes, 1, "capture closes auth transport before its body");
+          assert.equal(fx.rig.disposed(), 0, "terminal disposal queues behind capture body");
+          await assert.rejects(fx.exec.run(fx.ctx), /codex (run already active|epoch admission closed for capture)/);
+        }
+        bodyRelease.resolve();
+        const result = await withTimeout(capture, 3000, "serialized capture result");
+        if (order === "capture-first") {
+          assert.deepEqual(result, { kind: "observed_empty", value: "saved capture" });
+          assert.equal(bodies, 1);
+        } else {
+          assert.equal(result.kind, "incomplete", "terminal disposal cannot manufacture a new capture proof");
+          assert.equal(bodies, 0);
+        }
+        await withTimeout(fx.run, 3000, "terminal run completion");
+        assert.equal(generation, 8, "missing HOME after reap must not publish a second empty generation");
+        assert.equal(savedFiles, 1);
+        assert.equal(sources.length, 1);
+        assert.ok(sources[0]!.endsWith("/codex"));
+        assert.equal(homes.size, 0, "the reaped provider HOME is absent in the fixture");
+        assert.ok(fx.rig.transport.closes > 0);
+      } finally {
+        persistRelease.resolve(); bodyRelease.resolve(); fx.native.release();
+        if (capture) await capture;
+        await fx.cleanup();
+      }
+    });
+  }
+
+  it("#2852 all manager requests preserve canonical argv and scrubbed per-run environment", async () => {
+    const keys = ["UZI_RUNNER_TMPDIR", "TMPDIR", "NIX_SSL_CERT_FILE", "SSL_CERT_FILE", "LOCALE_ARCHIVE"];
+    const saved = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+    Object.assign(process.env, { UZI_RUNNER_TMPDIR: "/fixture/tmp", TMPDIR: "/ambient/tmp",
+      NIX_SSL_CERT_FILE: "/fixture/nix.pem", SSL_CERT_FILE: "/fixture/ssl.pem", LOCALE_ARCHIVE: "/fixture/locale" });
+    try {
+      for (const [manager, lockfile, args] of [
+        ["npm", "package-lock.json", ["ci", "--ignore-scripts"]],
+        ["pnpm", "pnpm-lock.yaml", ["install", "--frozen-lockfile", "--ignore-scripts", "--ignore-pnpmfile", "--config.manage-package-manager-versions=false"]],
+        ["yarn", "yarn.lock", ["install", "--frozen-lockfile", "--ignore-scripts"]],
+        ["bun", "bun.lock", ["install", "--frozen-lockfile", "--ignore-scripts"]],
+      ] as const) {
+        const fx = await fixture("clean", done, undefined, { lockfile });
+        try {
+          await withTimeout(fx.native.disposing, 3000, `canonical ${manager} root`);
+          const call = fx.native.calls[0]!;
+          assert.deepEqual(call.args.slice(-(args.length + 5)),
+            ["--expect-uid", "10002", "--", "/usr/bin/env", manager, ...args]);
+          assert.deepEqual(call.options.env, {
+            HOME: path.join(path.dirname(fx.ctx.worktreePath), "home"), PATH: "/fixture/bin",
+            TMPDIR: "/fixture/tmp", GIT_TERMINAL_PROMPT: "0", NIX_SSL_CERT_FILE: "/fixture/nix.pem",
+            SSL_CERT_FILE: "/fixture/ssl.pem", LOCALE_ARCHIVE: "/fixture/locale",
+            ...(manager === "yarn" ? { YARN_IGNORE_PATH: "1" } : {}),
+          });
+          fx.native.release();
+          assert.equal((await withTimeout(fx.run, 5000, `canonical ${manager} completion`)).error, undefined);
+        } finally { await fx.cleanup(); }
+      }
+    } finally {
+      for (const key of keys) {
+        const value = saved[key];
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+    }
+  });
+});
+
+describe("#2852 default provision binding", () => {
+  const done = epochResponder("th-1", "tn-1", t => { t.push(signalDone()).push(turnCompleted()); });
+  async function fixture(options: Parameters<typeof provisionNative>[0] = {}, packages = ["hello"], tier2 = false) {
+    const dir = await fs.mkdtemp(path.resolve("../.uzi/scratch/provision-binding-"));
+    const repo = path.join(dir, "repo");
+    await fs.mkdir(repo);
+    if (tier2) await fs.writeFile(path.join(repo, "devbox.json"), JSON.stringify({ packages: ["hello"] }));
+    const native = provisionNative(options);
+    const rig = makeRig({ responder: done });
+    const backoffEntered = installerBarrier(), releaseBackoff = installerBarrier();
+    rig.deps = { ...rig.deps, deferRegistryTeardown: true,
+      provisionRunTools: options.transientOnce && options.hold
+        ? (ctx, opts) => provisionRunTools(ctx, { ...opts,
+          provision: (input, deps) => {
+            assert.ok(opts.provision, "retain production supervised provision binding");
+            return opts.provision(input, { ...deps, sleep: async () => {
+              backoffEntered.resolve();
+              await releaseBackoff.promise;
+            } });
+          },
+        }) : undefined,
+      launchCodexProvisionRootForTest: native.launcher };
+    const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider, path.join(dir, "home"));
+    const controller = new AbortController();
+    const { ctx } = makeCtx({ runId: "28520000-0000-4000-8000-000000000001", worktreePath: repo,
+      signal: controller.signal, config: { tool_packages: packages, repo_devbox_opt_in: tier2 } as RunContext["config"] });
+    const run = exec.run(ctx).then(value => ({ value, error: undefined }), (error: unknown) => ({ value: undefined, error }));
+    return { native, rig, exec, controller, run, backoffEntered: backoffEntered.promise,
+      releaseBackoff: () => releaseBackoff.resolve(), cleanup: async () => {
+      controller.abort(); native.release(); releaseBackoff.resolve();
+      await withTimeout(run, 5000, "provision cleanup");
+      native.destroy(); await fs.rm(dir, { recursive: true, force: true });
+    } };
+  }
+
+  it("primary zero and held full root block capture, credentials and model startup", async () => {
+    const fx = await fixture({ hold: true });
+    try {
+      await withTimeout(fx.native.disposing, 2000, "provision root disposal");
+      assert.equal(fx.rig.client.releaseCalls.length, 0);
+      assert.equal(fx.rig.providerLaunches(), 0);
+      let body = 0, settled = false;
+      const capture = fx.exec.withCredentialFreeCapture(1000, async () => { body++; }).finally(() => { settled = true; });
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(body, 0); assert.equal(settled, false);
+      fx.native.release();
+      assert.equal((await withTimeout(capture, 3000, "provision capture")).kind, "observed_empty");
+      assert.equal(body, 1);
+      await withTimeout(fx.run, 3000, "captured provision");
+      assert.equal(fx.native.calls.length, 1, "no shellenv after capture");
+      assert.equal(fx.rig.client.releaseCalls.length, 0);
+      assert.equal(fx.rig.providerLaunches(), 0);
+    } finally { await fx.cleanup(); }
+  });
+
+  for (const unknown of [false, true]) it(`tier2-only degradation requires clean whole provisioning finisher unknown=${unknown}`, async () => {
+    const fx = await fixture({ unknown, code: 1, stderr: unknown ? "connection reset by peer" : undefined }, [], true);
+    try {
+      const result = await withTimeout(fx.run, 4000, "tier2 fallback");
+      assert.equal(!!result.value, !unknown);
+      assert.equal(fx.native.calls.length, 1);
+      assert.equal(fx.rig.providerLaunches(), unknown ? 0 : 1);
+      if (unknown) assert.equal(fx.rig.client.releaseCalls.length, 0);
+    } finally { await fx.cleanup(); }
+  });
+
+  it("clean nonzero network stderr retries through the unchanged devbox policy", async () => {
+    const fx = await fixture({ transientOnce: true });
+    try {
+      const result = await withTimeout(fx.run, 4000, "transient provision retry");
+      assert.ok(result.value);
+      assert.equal(fx.native.calls.length, 3, "install retry then shellenv");
+      assert.equal(fx.rig.probeCalls[0]?.opts.env?.NIX_SSL_CERT_FILE, "/fixture/cert", "output arriving before startup survives full settlement");
+      assert.equal(fx.rig.providerLaunches(), 1);
+    } finally { await fx.cleanup(); }
+  });
+
+  for (const phase of ["startup", "backoff"] as const) it(`capture cancels provisioning during ${phase}`, async () => {
+    const fx = await fixture({ hold: true, pendingStartup: phase === "startup", transientOnce: phase === "backoff" });
+    try {
+      await withTimeout(fx.native.spawned, 2000, "provision spawn");
+      if (phase === "backoff") {
+        await withTimeout(fx.native.disposing, 2000, "failed primary cleanup");
+        fx.native.release();
+        await withTimeout(fx.backoffEntered, 2000, "provision retry sleep entry");
+      }
+      let body = 0;
+      const capture = fx.exec.withCredentialFreeCapture(1000, async () => { body++; });
+      fx.native.release(); fx.releaseBackoff();
+      assert.equal((await withTimeout(capture, 3000, "cancel setup")).kind, "observed_empty");
+      await withTimeout(fx.run, 3000, "cancelled provisioning");
+      assert.equal(body, 1);
+      assert.equal(fx.native.calls.length, 1);
+      assert.equal(fx.rig.providerLaunches(), 0);
+      assert.equal(fx.rig.client.releaseCalls.length, 0);
+    } finally { await fx.cleanup(); }
+  });
+
+  for (const phase of ["startup", "backoff"] as const) it(`lifecycle cancellation joins provisioning during ${phase}`, async () => {
+    const fx = await fixture({ hold: true, pendingStartup: phase === "startup", transientOnce: phase === "backoff" });
+    try {
+      await withTimeout(fx.native.spawned, 2000, "lifecycle provision spawn");
+      if (phase === "backoff") {
+        await withTimeout(fx.native.disposing, 2000, "lifecycle primary cleanup");
+        fx.native.release();
+        await withTimeout(fx.backoffEntered, 2000, "provision retry sleep entry");
+      }
+      fx.controller.abort(new Error("owner cancellation"));
+      fx.native.release(); fx.releaseBackoff();
+      const result = await withTimeout(fx.run, 3000, "lifecycle cancelled provision");
+      assert.ok(result.error);
+      assert.equal(fx.native.calls.length, 1);
+      assert.equal(fx.rig.client.releaseCalls.length, 0);
+      assert.equal(fx.rig.providerLaunches(), 0);
+      assert.equal((await fx.exec.withCredentialFreeCapture(1000, async () => undefined, "cancel")).kind, "observed_empty");
+    } finally { await fx.cleanup(); }
+  });
+
+  it("rejected returned provision root stays owned until full cleanup", async t => {
+    const register = ExecutionRegistry.prototype.registerRoot;
+    const registries = new Set<ExecutionRegistry>();
+    t.mock.method(ExecutionRegistry.prototype, "registerRoot", function (
+      this: ExecutionRegistry, ...args: Parameters<ExecutionRegistry["registerRoot"]>
+    ) {
+      if (!registries.size && args[1].kind === "command") {
+        registries.add(this);
+        this.cancelReservation(args[0]);
+      }
+      return register.apply(this, args);
+    });
+    const fx = await fixture({ hold: true });
+    try {
+      await withTimeout(fx.native.disposing, 2000, "rejected root cleanup");
+      assert.equal(Array.from(registries)[0]?.rootCount(), 1);
+      let body = 0;
+      const capture = fx.exec.withCredentialFreeCapture(1000, async () => { body++; });
+      fx.native.release();
+      assert.equal((await withTimeout(capture, 3000, "rejected capture")).kind, "incomplete");
+      await withTimeout(fx.run, 3000, "rejected setup");
+      assert.equal(body, 0);
+      assert.equal(fx.rig.client.releaseCalls.length, 0);
+    } finally { await fx.cleanup(); }
+  });
+
+  for (const mode of ["clean", "zero", "failure", "unknown", "startup", "overflow"] as const) {
+    it(`production provisioning ${mode} preserves admission and cleanup`, async () => {
+      const fx = await fixture({ unknown: mode === "unknown", startup: mode === "startup",
+        overflow: mode === "overflow", code: mode === "failure" ? 1 : 0 }, mode === "zero" ? [] : ["hello"]);
+      try {
+        const result = await withTimeout(fx.run, 4000, "provision outcome");
+        const success = mode === "clean" || mode === "zero";
+        assert.equal(!!result.value, success);
+        assert.equal(fx.rig.providerLaunches(), success ? 1 : 0);
+        assert.equal(fx.native.calls.length, mode === "zero" ? 0 : mode === "clean" ? 2 : 1);
+        let body = 0;
+        const capture = await fx.exec.withCredentialFreeCapture(1000, async () => { body++; });
+        assert.equal(capture.kind, mode === "unknown" || mode === "startup" ? "incomplete" : "observed_empty");
+        assert.equal(body, mode === "unknown" || mode === "startup" ? 0 : 1);
+      } finally { await fx.cleanup(); }
+    });
+  }
+});
+
+it("#2852 fileop unknown failed start retains registry proof through terminal teardown", async () => {
+  const rig = makeRig();
+  const original = new Error("unknown fileop native start");
+  rig.deps = { ...rig.deps, launchEffectRoot: async () => { throw original; } };
+  const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+  const { ctx } = makeCtx();
+  await assert.rejects(withTimeout(exec.run(ctx), 3000, "failed fileop setup"));
+  let body = 0;
+  assert.equal((await exec.withCredentialFreeCapture(1000, async () => { body++; })).kind, "incomplete");
+  assert.equal(body, 0);
+  assert.equal(rig.providerLaunches(), 0);
+});
+
+
+it("A normal run binding refuses foreign capture and restores omitted fallback after throw and abort", async () => {
+  const home = await fs.mkdtemp(path.resolve("../.uzi/scratch/normal-binding-"));
+  const rig = makeRig({ responder: epochResponder("th-1", "tn-1", t => {
+    t.push(signalDone()).push(turnCompleted());
+  }) });
+  rig.deps = { ...rig.deps, deferRegistryTeardown: true };
+  const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider, home);
+  const normal = newRunAttempt("run-1", 1, WORKSPACE, () => []);
+  const foreign = newRunAttempt("run-1", 1, WORKSPACE, () => []);
+  const tuple = ({ marker, cloneKey, clonePath }: typeof normal) => ({ marker, cloneKey, clonePath });
+  const { ctx } = makeCtx({ runAttempt: tuple(normal) });
+  let actions = 0;
+  const refuseForeign = async () => {
+    const result = await exec.withCredentialFreeCapture(1000, async () => { actions++; }, "capture", undefined, tuple(foreign));
+    assert.equal(result.kind, "incomplete");
+    assert.equal(actions, 0, "valid foreign tuple must never enter callback");
+  };
+  try {
+    await withTimeout(exec.run(ctx), 5000, "normal binding public run");
+    await refuseForeign();
+    const exact = await exec.withCredentialFreeCapture(1000, async () => "exact normal tuple", "capture", undefined, tuple(normal));
+    assert.deepEqual(exact, { kind: "observed_empty", value: "exact normal tuple" });
+    const thrown = new Error("normal capture callback sentinel");
+    await assert.rejects(exec.withCredentialFreeCapture(1000, async () => { throw thrown; }, "capture", undefined, tuple(normal)), error => error === thrown);
+    assert.deepEqual(await exec.withCredentialFreeCapture(1000, async () => "fallback after throw"),
+      { kind: "observed_empty", value: "fallback after throw" });
+    await refuseForeign();
+    const controller = new AbortController();
+    await assert.rejects(exec.withCredentialFreeCapture(1000, async () => {
+      controller.abort(new Error("scoped action abort"));
+      return "aborted body entered";
+    }, "capture", controller.signal, tuple(normal)), error =>
+      error instanceof CodexBoundaryError && error.errors.some(e => e.category === "timeout"));
+    assert.equal(controller.signal.aborted, true);
+    assert.deepEqual(await exec.withCredentialFreeCapture(1000, async () => "fallback after abort"),
+      { kind: "observed_empty", value: "fallback after abort" });
+    await refuseForeign();
+  } finally {
+    await exec.safety?.dispose({ boundary: "terminal", deadlineMs: 1000 });
+    await fs.rm(home, { recursive: true, force: true });
   }
 });
 

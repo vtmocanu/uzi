@@ -132,7 +132,9 @@ it("rework-2464: failed registration supplies no handoff to later custody false 
   assert.deepEqual(outbox.listPendingFinalizeGenerations(), [entry()], "failed request confers no handoff");
 });
 
-it("rework-2464-mechanism: accepted offered identity survives pending custody and terminal hiding without reregister", async () => {
+it("rework-2464-mechanism: accepted offered identity survives pending custody and terminal hiding without reregister", async t => {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
   const { outbox } = await rig();
   await outbox.journalFinalize(RUN, 1);
   let pending = true;
@@ -146,6 +148,7 @@ it("rework-2464-mechanism: accepted offered identity survives pending custody an
   await w.sweepPendingFinalizes();
   await outbox.retireTerminal(RUN, 1);
   pending = false;
+  now += 15_000;
   await w.sweepPendingFinalizes();
   assert.deepEqual(outbox.listPendingFinalizeGenerations(), []);
   assert.equal(registrations, 1);
@@ -168,7 +171,9 @@ it("rework-2464-mechanism: replacement during fresh terminal ownership wait cann
   assert.deepEqual(outbox.listPendingFinalizeGenerations(), [entry()], "fresh proof was for original candidate");
 });
 
-it("rework-2464-mechanism: stalled ownership bounded wait quarantines slots, siblings progress, late proof cannot delete", async () => {
+it("rework-2464-mechanism: stalled ownership bounded wait quarantines slots, siblings progress, late proof cannot delete", async t => {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
   const { outbox } = await rig();
   for (let n = 1; n <= 20; n++) await outbox.journalFinalize(RUN, n);
   const proof = deferred<unknown>();
@@ -187,6 +192,7 @@ it("rework-2464-mechanism: stalled ownership bounded wait quarantines slots, sib
     await new Promise<void>(resolve => setImmediate(resolve));
     assert.equal(outbox.listPendingFinalizeGenerations().length, 20, "late results never delete");
     stalled = false;
+    now += 15_000;
     await w.sweepPendingFinalizes();
     assert.deepEqual(outbox.listPendingFinalizeGenerations(), [entry(RUN, 13), entry(RUN, 14), entry(RUN, 15), entry(RUN, 16)],
       "unattempted siblings receive slots first");
@@ -235,7 +241,9 @@ it("rework-2464-mechanism: accepted map is bounded for lifetime across subsequen
   assert.equal(outbox.listPendingFinalizeGenerations().length, 1, "later offer cannot add handoff");
 });
 
-it("rework-2464-mechanism: registration cleans frozen lower originals beyond 16 without saving their authority", async () => {
+it("rework-2464-mechanism: registration cleans frozen lower originals beyond 16 without saving their authority", async t => {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
   const { outbox } = await rig();
   for (let gen = 0; gen <= 20; gen++) await outbox.journalFinalize(RUN, gen);
   let pending = true;
@@ -248,6 +256,7 @@ it("rework-2464-mechanism: registration cleans frozen lower originals beyond 16 
   const accepted = (w as unknown as { acceptedFinalizes: Map<string, Readonly<object>> }).acceptedFinalizes;
   assert.equal(accepted.size, 1, "only offered G20 enters lifetime map");
   pending = false;
+  now += 15_000;
   await w.sweepPendingFinalizes();
   assert.deepEqual(outbox.listPendingFinalizeGenerations(), [entry()], "lower batch authority expires");
   assert.equal(ownershipReads, 1, "later lower retry needs fresh terminal proof");
@@ -263,7 +272,9 @@ for (const status of ["completed", "failed", "cancelled"]) {
 }
 
 // Defect regressions use only interfaces present on the historical base.
-it("rework-2464: real legacy omitted running finalize beyond 256 with pending overflow survives until terminal proof", async () => {
+it("rework-2464: real legacy omitted running finalize beyond 256 with pending overflow survives until terminal proof", async t => {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
   const { outbox, root } = await rig();
   const custody = await realRecoveryCoordinator(root);
   for (let n = 0; n < 257; n++) {
@@ -288,6 +299,7 @@ it("rework-2464: real legacy omitted running finalize beyond 256 with pending ov
   await outbox.retireTerminal(RUN2, 1);
   assert.equal(outbox.listPendingFinalizeGenerations().length, 3, "terminal-hidden record retains");
   status = "completed";
+  now += 15_000;
   await w.sweepPendingFinalizes();
   assert.deepEqual(outbox.listPendingFinalizeGenerations(), []);
 });
@@ -520,7 +532,9 @@ it("true, undefined, throw, rejection and missing predicate/API fail closed", as
   assert.equal(checks, 0);
 });
 
-it("candidate rejection retains custody while siblings clear, with no leaked authority slot", async () => {
+it("candidate rejection retains custody while siblings clear, with no leaked authority slot", async t => {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
   const { outbox, deleted } = fakeOutbox([entry(), entry(RUN2)]);
   let attempts = 0;
   const w = worker(outbox, { recoveryInventoryPending: async (id) => {
@@ -529,6 +543,7 @@ it("candidate rejection retains custody while siblings clear, with no leaked aut
   } });
   await w.sweepPendingFinalizes();
   assert.deepEqual(deleted, [entry(RUN2)]);
+  now += 15_000;
   await w.sweepPendingFinalizes();
   assert.equal(deleted.length, 2, "rejection settled its quarantine slot");
 });

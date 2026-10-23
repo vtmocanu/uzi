@@ -24,7 +24,7 @@
 # runs, which clone the TARGET repo fresh. So "the agent image changed in a way worth
 # rolling for" is the set of paths that change how a worker EXECUTES a run:
 #     agent/src  agent/package.json  agent/package-lock.json  agent/tsconfig.json
-#     agent/bin  agent/templates     agent/devbox-global     agent/codex
+#     agent/bin  agent/templates     agent/devbox-global     agent/codex scripts/sqlc.sh
 # (agent/codex -- the pinned Codex package lock, its install/assert scripts and the Go
 # supervisor the runtime stage builds -- was missing until #1720.)
 # (A self-improve run DOES read /opt/uzi-src, but it is admin-only / off by default; if

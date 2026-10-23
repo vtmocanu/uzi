@@ -60,7 +60,7 @@ import { expectedSemanticPark, type SemanticPark } from "./semantic-park.js";
 import { sameCompletionPending, type CompletionPending } from "./completion-pending.js";
 import type { BoundedCoverageTestTransport } from "./plan-contract-review.js";
 import type { PlanCrossCheckStateRequest, PlanCrossCheckDiffRefusal } from "./client.js";
-import type { BoundaryPermit, BoundaryRequest, BoundarySink, BoundaryStep, GracefulShutdownCheckpoint, SafeBoundary } from "./harness.js";
+import type { BoundaryPermit, BoundaryRequest, BoundarySink, BoundaryStep, CredentialFreeCaptureContext, GracefulShutdownCheckpoint, SafeBoundary } from "./harness.js";
 import { SinkGate } from "./sink-gate.js";
 import { cloneKeyOf } from "./attempt-path.js";
 import type { LeftReason, RunProcessReap } from "./run-procs.js";
@@ -86,6 +86,7 @@ import {
   type TickSpawnerTestHooks,
 } from "./tick-spawner.js";
 import { skillsPluginDir } from "./skills-plugin.js";
+import { captureFailureOf, EpochCleanupUnprovenError, type CodexExecutionSafety } from "./harness.js";
 import { CodexTurnFailedError } from "./codex/terminal-normalize.js";
 import { describeLimit, LimitReachedError } from "./limit.js";
 import type { Logger } from "./log.js";
@@ -589,6 +590,25 @@ type RecoveryParkCause =
   | { kind: "vault_locked" | "refresh_unknown" | "account_unavailable" | "credential_release_unavailable" }
   | { kind: "data_volume_full"; preventive: boolean };
 
+/* Exact local revocation from assertHeldFreeCapture, distinct from an arbitrary refusal. */
+class FreeCaptureScopeExpired extends TrustedExecutionRefusal {}
+
+/** Runner-local capability, valid only inside its matching flight's callback. */
+interface HeldFreeCapture {
+  readonly context?: CredentialFreeCaptureContext;
+  readonly signal?: AbortSignal;
+  readonly deadlineAt: number;
+}
+
+interface RecoveryCaptureOptions {
+  credentialFree?: boolean;
+  publish?: boolean;
+  terminalDisk?: boolean;
+  beforeMutation?: () => Promise<void>;
+  signal?: AbortSignal;
+  heldCapture?: HeldFreeCapture;
+}
+
 /** What {@link RunRunner.captureRecoveryRestorePoint} reports. `residueBlocked` (issue #1783 M3)
  *  is true when the capture was skipped because its quiescence proof (or the re-proof after its
  *  WIP marker) blocked; `residueDetail` is then that proof's detail. */
@@ -1079,7 +1099,7 @@ const GUARDED_COMMAND_SETTLE_MS = GUARDED_LANE_JOIN_MS;
  * retained work. Local, like TerminalReportError / StaleClaimError.
  */
 class RetainedRecoveryStop extends Error {
-  constructor() { super("retained recovery stopped; custody retained"); }
+  constructor(options?: ErrorOptions) { super("retained recovery stopped; custody retained", options); }
 }
 
 class RetainedRecoveryCancelled extends RetainedRecoveryStop {}
@@ -1945,6 +1965,9 @@ type MemoryFlight = {
   hold?: Readonly<{ context: MemoryContext; deadline: number; humanRevision: boolean }>;
   operation?: Promise<void>;
   settled?: boolean;
+  /** Original Codex run/finally stays owned after a bounded memory observation. */
+  executorRun?: Promise<void>;
+  executorSettled?: boolean;
   /** A rejected ownership probe cannot be revived by a later pause input. */
   ownershipRejected?: boolean;
   closing?: Promise<void>;
@@ -1978,6 +2001,10 @@ interface RunFlight {
   policyReconciliationPending?: boolean;
   policyHoldOutcome?: ImmutablePolicyOutcome;
   lastPersistedGateRevision?: number;
+  /** Local observer only; preservation keeps its own operation and authority. */
+  memoryHoldObserver?: () => void;
+  /** Exact facade of a refused/unacknowledged owner-pause capture; never cleanup or resume authority. */
+  refusedPauseCaptureSafety?: CodexExecutionSafety;
   sourceInherited?: ClosedSourceObservation;
   sourceFamilyMatched?: boolean;
   sourceBlockingNormal?: boolean;
@@ -2168,6 +2195,8 @@ interface RunFlight {
   /** issue #1783 (R2): this flight's execution attempt (its marker rides the agent CLI env), in
    *  the runner's live-attempt set from before the CLI spawns until the terminal finally. */
   attempt: RunAttempt | undefined;
+  /** Ephemeral helper owner during runFreeCapture; never a live execution attempt. */
+  activeCaptureAttempt?: RunAttempt;
   /** issue #1783 M2: in attempt-path mode (Docker-wired or recovery-enabled), the id minted BEFORE
    *  its clone is seeded: it names the attempt clone path, the recovery journal entry, the
    *  attempt ledger entry and the attempt marker alike. Undefined for a canonical-path seed. */
@@ -2622,6 +2651,7 @@ export interface RunnerOptions {
  * done.
  */
 export class RunRunner {
+  private readonly freeCaptureFlights = new WeakMap<HeldFreeCapture, RunFlight>();
   private readonly cancellationBudgetFactory: () => MaintenanceBudget;
   private readonly pollMs: number;
   private readonly planApprovalTimeoutMs: number;
@@ -3564,57 +3594,77 @@ export class RunRunner {
     const previous = this.executionTails.get(runId);
     let release!: (observation: ClosedSourceObservation | void) => void;
     const tail = new Promise<ClosedSourceObservation | void>((resolve) => { release = resolve; });
+    let resolveObserver!: () => void;
+    let rejectObserver!: (error: unknown) => void;
+    const observer = new Promise<void>((resolve, reject) => {
+      resolveObserver = resolve;
+      rejectObserver = reject;
+    });
+    let ownedMemory: Promise<void> | undefined;
+    let failed = false;
+    let primaryError: unknown;
+    const deliver = () => { if (failed) rejectObserver(primaryError); else resolveObserver(); };
     let observation: ClosedSourceObservation | void = undefined;
     let inherited: ClosedSourceObservation | void = undefined;
     // Install synchronously before factory work. A third claim must queue behind
     // the second even while the second is waiting for the first's cleanup.
     this.executionTails.set(runId, tail);
-    try {
-      // PRD #1809 D7: wait out an in-progress disk reclaim of THIS run before anything builds
-      // its executor or touches its HOME. Holding the lock only this long is enough: the
-      // executionTails entry installed above already makes every later reclaim see the run as
-      // executing (isExecuting) and skip it, so the only deletion that can overlap this
-      // execution is one that checked before that entry existed, and that one holds the lock.
-      // Forgetting the reclaim's cache-drop memo entry under the same lock orders it after any
-      // drop in progress (whose memo add runs under that lock), so the entry cannot outlive
-      // this execution's rebuilt caches.
-      if (this.diskLocks) {
-        const releaseDisk = await this.diskLocks.acquire(runId);
-        this.cachesDropped?.forget(runId);
-        releaseDisk();
-      } else {
-        this.cachesDropped?.forget(runId);
-      }
-      if (previous) {
-        // Only this exact pending tail conveys knowledge; nothing is retained for
-        // a caller arriving after release.
-        inherited = await previous;
-        // PRD #1391 Run B M4 — the generation-aware queued-duplicate router. A SECOND (or later) claim
-        // of this run serialised behind the first must NOT blindly re-execute: the first attempt may
-        // have journaled a terminal outcome, or a reclaim may have bumped the generation. Drain this
-        // run's pending terminal synchronously, then probe ownership and decide (proceed only on a
-        // claimed/running row AT this claim's generation). Ending here sends NO report — the run keeps
-        // its authoritative status for the api's own reclaim/sweep to resolve.
-        if (!(await this.gateQueuedDuplicate(claim))) return;
-        claim = await this.refreshQueuedClaimCursor(claim);
-      }
-      observation = await this.executeClaim(claim, inherited || undefined);
-    } finally {
+    void (async () => {
       try {
-        if (observation?.family && (observation.terminal === "normal_failed" || observation.terminal === "normal_blocked")) {
-          void this.recovery.resumeTerminalSource(runId, tail, claim.claim_generation ?? 0, this.shutdownSignal.signal).catch(() => {
-            this.log.warn("recovery: terminal saved evidence pass failed; source retained");
-          });
+        // PRD #1809 D7: wait out an in-progress disk reclaim of THIS run before anything builds
+        // its executor or touches its HOME. Holding the lock only this long is enough: the
+        // executionTails entry installed above already makes every later reclaim see the run as
+        // executing (isExecuting) and skip it, so the only deletion that can overlap this
+        // execution is one that checked before that entry existed, and that one holds the lock.
+        // Forgetting the reclaim's cache-drop memo entry under the same lock orders it after any
+        // drop in progress (whose memo add runs under that lock), so the entry cannot outlive
+        // this execution's rebuilt caches.
+        if (this.diskLocks) {
+          const releaseDisk = await this.diskLocks.acquire(runId);
+          this.cachesDropped?.forget(runId);
+          releaseDisk();
+        } else {
+          this.cachesDropped?.forget(runId);
         }
-      } catch {
-        this.log.warn("recovery: terminal saved evidence pass failed; source retained");
+        if (previous) {
+          inherited = await previous;
+          // PRD #1391 Run B M4 — the generation-aware queued-duplicate router. A SECOND (or later) claim
+          // of this run serialised behind the first must NOT blindly re-execute: the first attempt may
+          // have journaled a terminal outcome, or a reclaim may have bumped the generation. Drain this
+          // run's pending terminal synchronously, then probe ownership and decide (proceed only on a
+          // claimed/running row AT this claim's generation). Ending here sends NO report — the run keeps
+          // its authoritative status for the api's own reclaim/sweep to resolve.
+          if (!(await this.gateQueuedDuplicate(claim))) return;
+          claim = await this.refreshQueuedClaimCursor(claim);
+        }
+        observation = await this.executeClaim(claim, inherited || undefined, operation => { ownedMemory = operation; });
+      } catch (error) {
+        failed = true;
+        primaryError = error;
       } finally {
-        if (this.executionTails.get(runId) === tail) this.executionTails.delete(runId);
-        // Only callers that captured this pending tail can receive the observation.
-        // Nothing survives in the map after the final reservation is released.
-        release(observation);
+        // Public observation stays bounded; the same tail owns capture cleanup.
+        // Joining the original operation grants no fresh capture authority.
+        if (ownedMemory) {
+          deliver();
+          await Promise.allSettled([ownedMemory]);
+        }
+        try {
+          if (observation?.family && (observation.terminal === "normal_failed" || observation.terminal === "normal_blocked")) {
+            // Recovery awaits this same tail; registration must not await its pass.
+            void this.recovery.resumeTerminalSource(runId, tail, claim.claim_generation ?? 0, this.shutdownSignal.signal).catch(() => {
+              this.log.warn("recovery: terminal saved evidence pass failed; source retained");
+            });
+          }
+        } catch {
+          this.log.warn("recovery: terminal saved evidence pass failed; source retained");
+        } finally {
+          if (this.executionTails.get(runId) === tail) this.executionTails.delete(runId);
+          release(observation);
+          if (!ownedMemory) deliver();
+        }
       }
-    }
+    })();
+    return observer;
   }
 
   /**
@@ -3782,7 +3832,8 @@ export class RunRunner {
     }
   }
 
-  private async executeClaim(claim: ClaimResponse, inherited?: ClosedSourceObservation): Promise<ClosedSourceObservation | void> {
+  private async executeClaim(claim: ClaimResponse, inherited: ClosedSourceObservation | undefined,
+    ownMemory: (operation: Promise<void>) => void): Promise<ClosedSourceObservation | void> {
     let observedFlight: RunFlight | undefined;
     await MaintenanceBudget.runAttempt(`${claim.run_id}:${claim.claim_generation ?? 0}`, () => {
       if (!observedFlight) throw new Error("cancellation observed before flight initialization");
@@ -3790,7 +3841,7 @@ export class RunRunner {
     }, () => this.executeClaimInAttempt(claim, flight => {
       observedFlight = flight;
       flight.sourceInherited = inherited;
-    }));
+    }, ownMemory));
     // executeClaimInAttempt has now returned through its entire finally, including
     // HOME/cache/lifecycle cleanup. Catch selection and steering.stop alone are too early.
     const flight = observedFlight;
@@ -3852,7 +3903,8 @@ export class RunRunner {
     }) });
   }
 
-  private async executeClaimInAttempt(claim: ClaimResponse, onFlight: (flight: RunFlight) => void): Promise<void> {
+  private async executeClaimInAttempt(claim: ClaimResponse, onFlight: (flight: RunFlight) => void,
+    ownMemory: (operation: Promise<void>) => void): Promise<void> {
     const runId = claim.run_id;
     // PRD #1171 M3 (redactor canary hoist): register the Codex access-token + capability
     // canaries with the logger BEFORE makeExecutor, so a construction error inside the
@@ -3990,11 +4042,21 @@ export class RunRunner {
       // later owner pause. Hand off only after its original work truly settles.
       const memoryYieldsToPause = this.canYieldMemoryToOwnerPause(flight, failure);
       if (memoryYieldsToPause) this.retainWorkerMemoryCustody(flight);
-      const err = flight.workerMemory?.hold !== undefined
+      let err = flight.workerMemory?.hold !== undefined
         ? memoryYieldsToPause ? new PauseNowSignal() : new RetainedRecoveryStop()
         : flight.owedLimitStop !== undefined && !flight.steering?.isCancelled() &&
         !flight.active?.shuttingDown && flight.steering?.claimFence() === undefined
         ? flight.owedLimitStop : failure;
+      if (err instanceof EpochCleanupUnprovenError &&
+          err.safety === flight.refusedPauseCaptureSafety &&
+          !flight.steering.isCancelled() && flight.steering.claimFence() === undefined) {
+        // Cleanup can finish after newer steering arrives. Route that exact authority
+        // first; otherwise stop nonterminal without re-capturing the poisoned epoch.
+        const authority = flight.steering.checkpointAuthoritySignal();
+        if (flight.steering.getPauseMode() === "disk") err = new DiskParkSignal(false);
+        else if (authority.aborted) err = authority.reason;
+        else err = new RetainedRecoveryStop({ cause: err });
+      }
       // PRD #35: a usage-limit death is not an ordinary failure. Handled before the
       // generic path below because that path is terminal in both senses — it reports
       // `failed` and it lets the finally erase the session this run wants to resume from.
@@ -4460,10 +4522,7 @@ export class RunRunner {
         // run — the exact outcome the fetch-back exists to prevent.
       } else if (err instanceof OrdinaryOwnerPaused) {
         flight.parked = true;
-        await this.pinRecoveryGeneration(claim, flight, await this.currentRestorePointHead(flight))
-          .catch((error) => runLog.warn("recovery: owner pause pin failed", { error: errMessage(error) }));
-        if (claim.inventory_guarded === true)
-          await this.settleGuardedInventory(claim, flight, undefined, undefined, undefined, true);
+        await this.retainAcceptedOwnerPause(claim, flight, "recovery: owner pause pin failed");
         await batcher.close().catch(() => undefined);
       } else if (err instanceof PauseNowSignal) {
         // PRD #1190 M2: a `now` pause aborted a turn OUTSIDE the implement loop's own catch (e.g.
@@ -4475,7 +4534,7 @@ export class RunRunner {
         // sweeper to requeue rather than failing a run the owner asked to pause.
         // Only a first, supported owner-pause exit may qualify below.
         if (!priorSourceExitDenied && !flight.sourceNormalPark) flight.sourceDispatchDenied = false;
-        flight.parked = await this.handlePausePark(claim, flight, { completedCount: 0 }, "owner");
+        flight.parked = await this.handlePausePark(claim, flight, { completedCount: 0 }, { origin: "owner" });
         // Issue #1742 retirement site (c): the api accepted the owner pause park for this generation.
         if (flight.parked) await this.retireFinalizeRecord(flight, "pause_park_accepted");
         if (!flight.parked) {
@@ -4861,6 +4920,14 @@ export class RunRunner {
       if (flight.workerMemory) {
         flight.workerMemory.ended = true;
         flight.workerMemory.unsubscribe?.();
+        const pending = [
+          ...(!flight.workerMemory.settled && flight.workerMemory.operation ? [flight.workerMemory.operation] : []),
+          ...(!flight.workerMemory.executorSettled && flight.workerMemory.executorRun ? [flight.workerMemory.executorRun] : []),
+        ];
+        if (this.requiresFreeCaptureScope(claim, flight) && pending.length) {
+          flight.runLog.warn("codex capture operation pending; source reservation retained");
+          ownMemory(Promise.allSettled(pending).then(() => {}));
+        }
       }
       // PRD #1171 m4 (F1): the FINAL Codex registry disposal, after EVERY durability sink has
       // settled. A Codex executor's run() no longer disposes its registry on the normal path —
@@ -4877,6 +4944,7 @@ export class RunRunner {
       let terminalDisposeUnproven = false;
       if (executor.safety && !(flight.workerMemory?.closing && !flight.workerMemory.closingSettled) &&
           !(flight.workerMemory?.operation && !flight.workerMemory.settled) &&
+          !(flight.workerMemory?.executorRun && !flight.workerMemory.executorSettled) &&
           !this.memoryRuntime?.sinkReceipts.some(receipt => receipt.context.flight === flight)) {
         try {
           await executor.closeAndSettlePlanSummary?.(this.codexBoundaryDeadlineMs);
@@ -12242,6 +12310,7 @@ export class RunRunner {
     // Survives lifecycle interruptions after a completed pause attempt, including reconciliation.
     let parkContinuation: "attempt" | "reconcile" | "question" = "attempt";
     let parkOwnershipProbe: Promise<RunOwnershipResponse> | undefined;
+    let parkCaptureDeadlineAt: number | undefined;
     // Only the question helpers call this alias after a validated answer settles.
     const reportAnsweredState: typeof reportState = (body, ...args) => {
       if (body.status === "running" && flight.workerMemory) flight.workerMemory.resumeReady = true;
@@ -13263,12 +13332,8 @@ export class RunRunner {
           parkContinuation = "attempt";
           parkOwnershipProbe = undefined;
           flight.parked = true;
-          await this.pinRecoveryGeneration(claim, flight, await this.currentRestorePointHead(flight))
-            .catch((error) => runLog.warn("recovery: pause generation-evidence pin failed (custody retained)", {
-              run_id: runId, error: errMessage(error),
-            }));
-          if (claim.inventory_guarded === true)
-            await this.settleGuardedInventory(claim, flight, undefined, undefined, undefined, true);
+          await this.retainAcceptedOwnerPause(claim, flight,
+            "recovery: pause generation-evidence pin failed (custody retained)", parkCaptureDeadlineAt);
           return { kind: "paused" } as const;
         };
         const checkAck = (ack: StateAck): void => {
@@ -13300,7 +13365,8 @@ export class RunRunner {
             if (requested.status !== "running" && requested.status !== "paused")
               throw new TrustedExecutionRefusal("park run request refused");
             const parked = requested.applied && requested.status === "running" &&
-              await this.runGatedSink(flight, () => this.handlePausePark(claim, flight, pausedAt, "lead_park"));
+              await this.handlePausePark(claim, flight, pausedAt, { origin: "lead_park",
+                deadlineAt: parkCaptureDeadlineAt ??= Date.now() + this.codexBoundaryDeadlineMs });
             // Remember the completed false result before lifecycle reconciliation can interrupt.
             if (!parked) parkContinuation = "reconcile";
             if (steering.isCancelled()) return { kind: "cancel" };
@@ -13360,11 +13426,12 @@ export class RunRunner {
           // parkQuestion confirms running settlement before a consumed /park can authorize an attempt.
           parkContinuation = "attempt";
           parkOwnershipProbe = undefined;
+          parkCaptureDeadlineAt = undefined;
           if (!isParkAnswer(verdict)) return verdict;
         }
       },
       parkForPause: async (pausedAt) => {
-        const parked = await this.runGatedSink(flight, () => this.handlePausePark(claim, flight, pausedAt, "owner"));
+        const parked = await this.handlePausePark(claim, flight, pausedAt, { origin: "owner" });
         if (!parked) steering.rearmLifecycle();
         return parked;
       },
@@ -13539,11 +13606,17 @@ export class RunRunner {
         if (m4ResumeReviewedPlan && priorOwnerHistory.status === "complete" && priorOwnerHistory.entries.length > 0) {
           await this.awaitResumedDelivery(runId, steering, batcher, runLog, cancel.signal);
         }
-        try { result = await executor.run(ctx); }
+        let execution: Promise<ExecutorResult>;
+        try { execution = executor.run(ctx); }
         catch (value) {
           executionRejection.executorRejected = true;
           throw value;
         }
+        // Observer expiry is not an executor rejection. Only the original run
+        // supplies that private provenance, including a synchronously thrown error.
+        void execution.catch(() => { executionRejection.executorRejected = true; });
+        result = this.memoryRuntime && this.requiresFreeCaptureScope(claim, flight)
+          ? await this.awaitExecutorWithMemoryDeadline(flight, execution) : await execution;
         if (flight.workerMemory?.hold) {
           await this.reconcileWorkerMemory(flight);
           throw new RetainedRecoveryStop();
@@ -13920,7 +13993,7 @@ export class RunRunner {
         MaintenanceBudget.current()?.check();
         outcome = await this.quiesceImpl({
           mode,
-          attempt: flight.attempt,
+          attempt: flight.activeCaptureAttempt ?? flight.attempt,
           cloneKey,
           targetPaths,
           // A Codex run's supervisor proves its OWN attempt's process drain; a seed/capture sweep
@@ -14839,6 +14912,7 @@ export class RunRunner {
     barePath: string,
     onStep?: (step: BoundaryStep) => void,
   ): Promise<CheckpointOverlayContext | undefined> {
+    this.git.assertCredentialedCaptureAllowed();
     await this.requireTrackingOwned(flight, barePath, flight.branch!, undefined, onStep, "checkpoint_overlay");
     if (claim.repo.forge_type !== "github") return undefined;
     const defaultBranch =
@@ -14938,6 +15012,98 @@ export class RunRunner {
       await this.awaitTickSurvivorsGone(flight);
       return fn();
     });
+  }
+
+  private requiresFreeCaptureScope(claim: ClaimResponse, flight: RunFlight): boolean {
+    return !!(flight.executor.withCredentialFreeCapture || flight.executor.safety ||
+      flight.executor.sandboxesCommands || flight.executor.settleForCredentialFreeCapture || claim.secrets.codex);
+  }
+
+  /** Sink gate precedes executor admission; GitCache alone binds restricted spawning.
+   * The absolute deadline refuses expired work after sink admission and is passed
+   * through the executor lane; sink gate lock waiting itself is not bounded. */
+  private runFreeCapture<T>(
+    claim: ClaimResponse, flight: RunFlight, deadlineAt: number,
+    signal: AbortSignal | undefined, action: (held: HeldFreeCapture) => Promise<T>,
+    purpose: "capture" | "cancel" = "capture",
+    claudeCommandPolicy: "strict" | "warn" = "strict",
+  ): Promise<{ kind: "observed_empty"; value: T } | { kind: "incomplete" }> {
+    return this.runGatedSink(flight, async () => {
+      const requiresScope = this.requiresFreeCaptureScope(claim, flight);
+      const remaining = () => Math.max(0, deadlineAt - Date.now());
+      if (remaining() === 0 || signal?.aborted) return { kind: "incomplete" };
+      // Claude has no callback-held capture lane. Join its summary and settle its
+      // guarded commands under the caller policy and original budget before source access.
+      if (!flight.executor.withCredentialFreeCapture) {
+        try {
+          await flight.executor.closeAndSettlePlanSummary?.(remaining());
+          if (remaining() === 0 || signal?.aborted) return { kind: "incomplete" };
+          // Owner pause and changed-plan capture retain their legacy warn/reap policy.
+          // Every other entry requires confirmed command settlement before source access.
+          if (claudeCommandPolicy === "warn") {
+            await this.settleGuardedCommands(flight.executor, remaining());
+          } else if (flight.executor.settleWorkerCommands &&
+              !(await flight.executor.settleWorkerCommands(remaining())).confirmed) return { kind: "incomplete" };
+        } catch { return { kind: "incomplete" }; }
+        if (remaining() === 0 || signal?.aborted) return { kind: "incomplete" };
+      }
+      const captureAttempt = flight.executor.withCredentialFreeCapture
+        ? flight.predecessorCapture && flight.worktreePath
+          ? newRunAttempt(flight.runId, flight.claimGeneration, flight.worktreePath, () => [])
+          : flight.attempt
+        : undefined;
+      let actionEntered = false;
+      const invoke = async (context?: CredentialFreeCaptureContext) => {
+        const previousCaptureAttempt = flight.activeCaptureAttempt;
+        if (context) flight.activeCaptureAttempt = captureAttempt;
+        const held: HeldFreeCapture = {
+          context, signal: context?.signal ?? signal,
+          // Legacy callers retain their existing operation bounds. Only Codex
+          // acquires the new capture deadline; original caller signals still apply.
+          deadlineAt: context ? Math.min(deadlineAt, context.deadlineAt) : Infinity,
+        };
+        this.freeCaptureFlights.set(held, flight);
+        try {
+          this.assertHeldFreeCapture(flight, held);
+          const body = () => {
+            this.assertHeldFreeCapture(flight, held);
+            actionEntered = true;
+            return action(held);
+          };
+          return context
+            ? await this.git.withCredentialFreeCapture(context, body)
+            : await body();
+        } finally {
+          this.freeCaptureFlights.delete(held);
+          if (context) flight.activeCaptureAttempt = previousCaptureAttempt;
+        }
+      };
+      if (flight.executor.withCredentialFreeCapture) {
+        try {
+          const result = await flight.executor.withCredentialFreeCapture(remaining(), context => {
+            if (!context) throw new TrustedExecutionRefusal("credential-free capture context missing");
+            return invoke(context);
+          }, purpose, signal, captureAttempt ? Object.freeze({
+            marker: captureAttempt.marker, cloneKey: captureAttempt.cloneKey, clonePath: captureAttempt.clonePath,
+          }) : undefined);
+          return result.kind === "observed_empty" && !actionEntered ? { kind: "incomplete" } : result;
+        } catch (error) {
+          if (actionEntered) throw error;
+          return { kind: "incomplete" };
+        }
+      }
+      if (requiresScope) return { kind: "incomplete" };
+      return { kind: "observed_empty", value: await invoke() };
+    });
+  }
+
+  private assertHeldFreeCapture(flight: RunFlight, held: HeldFreeCapture): void {
+    if (this.freeCaptureFlights.get(held) !== flight) {
+      throw new TrustedExecutionRefusal("credential-free capture scope unavailable");
+    }
+    if (held.signal?.aborted || Date.now() >= held.deadlineAt) {
+      throw new FreeCaptureScopeExpired("credential-free capture scope unavailable");
+    }
   }
 
   private async retainedBareLockRemains(flight: RunFlight): Promise<boolean> {
@@ -16434,7 +16600,10 @@ export class RunRunner {
     runLog: Logger,
     runId: string,
     generation: number,
+    heldCapture?: HeldFreeCapture,
   ): Promise<string | null> {
+    const check = () => { if (heldCapture) this.assertHeldFreeCapture(flight, heldCapture); };
+    check();
     const barePath = flight.barePath;
     const worktreePath = flight.worktreePath;
     const branch = flight.branch;
@@ -16446,6 +16615,7 @@ export class RunRunner {
     // commitWipMarker's ambiguous false. A null (unreadable) status cannot assert clean ⇒ do not
     // transfer: retain the clone.
     const status = await this.git.worktreeStatus(worktreePath);
+    check();
     if (status === null) {
       runLog.warn("recovery: settle transfer — worktree status unreadable (cannot assert clean)");
       return null;
@@ -16454,6 +16624,7 @@ export class RunRunner {
       // DIRTY → commit the WIP marker and REQUIRE it committed; a false here is unambiguously a
       // commit FAILURE (we already know the tree is dirty), so the head is not transferable.
       const committed = await this.git.commitWipMarker(worktreePath, { onIncomplete: this.wipIncompleteHandler(flight, "restore_point") });
+      check();
       if (!committed) {
         runLog.warn("recovery: settle transfer — WIP commit of a dirty tree failed");
         return null;
@@ -16467,12 +16638,14 @@ export class RunRunner {
       runLog.warn("recovery: settle transfer — clone not provably quiescent after the WIP marker");
       return null;
     }
+    check();
     // Fetch the run's tip into the worker bare's tracking ref (refs/uzi-runner/<branch>), so the exact
     // clone-only head's objects are now present in the trusted bare. fetchAgentBranch THROWS on
     // failure (unlike the void fetchBackBestEffort), so a failed transfer is caught here.
     let fetched: Extract<TrackingUpdateResult, { kind: "updated" }>;
     try {
       fetched = await this.fetchTracking(flight, barePath, worktreePath, branch);
+      check();
     } catch (e) {
       runLog.warn("recovery: settle transfer fetch-back failed", { error: errMessage(e) });
       return null;
@@ -16480,6 +16653,7 @@ export class RunRunner {
     // POSITIVELY VERIFY the bare's tracking ref now covers the run's current HEAD (incl. any WIP
     // marker) before trusting it as the bundle source.
     const verified = await this.git.verifyRunnerTrackingCovers(barePath, worktreePath, branch);
+    check();
     if (!verified) {
       runLog.warn("recovery: settle transfer — the tracking ref does not cover the run HEAD");
       return null;
@@ -16494,6 +16668,7 @@ export class RunRunner {
     // between verify and read, so its reread is by-design, and its head feeds a PRD #218
     // owner-stamp-gated same-worker reseed, not a directly-archived cross-run bundle.)
     const head = await this.git.worktreeHead(worktreePath);
+    check();
     if (head === null || head !== fetched.candidateSha) {
       this.preservationRefused(flight, "ownership_unknown");
       runLog.warn("recovery: settle transfer — run HEAD does not match the proved fetched candidate");
@@ -16505,6 +16680,7 @@ export class RunRunner {
     // failed) means no durable replacement exists yet ⇒ retain the source clone and keep the hold
     // open, never a clone-only SHA fed to bundle production.
     const anchored = await this.git.anchorRecoveryHead(barePath, runId, generation, head);
+    check();
     if (!anchored) {
       runLog.warn("recovery: settle transfer — could not durably anchor the verified head in the trusted bare");
       return null;
@@ -16540,71 +16716,87 @@ export class RunRunner {
     // Every later boundary converges on the original freeze; never repeat clone mutations.
     if (flight.heldDeferredCapture !== undefined) return "retained";
     try {
-      const executor = flight.executor;
-      const settlement = executor.settleForCredentialFreeCapture
-        ? await executor.settleForCredentialFreeCapture(this.codexBoundaryDeadlineMs, "cancel")
-        : { kind: "incomplete" as const };
-      MaintenanceBudget.current()?.check();
-      if (residueQuarantine() !== undefined) return "retained";
-      const initial = await this.quiesceRun(flight, executor, {
-        mode: "own", site: "owner_cancel", forceProcessScan: true,
-      });
-      MaintenanceBudget.current()?.check();
-      if (residueQuarantine() !== undefined) return "retained";
-      // ADR1783: every Docker state is observed and logged before restore inspection;
-      // neither an unconfirmed teardown nor a Docker error blocks a process/Git proof.
-      flight.runLog.info("owner cancel Docker teardown", { ...initial.outcome.docker });
-      if (settlement.kind !== "observed_empty" || initial.blocked ||
-          (process.platform === "linux" && initial.outcome.process?.state !== "quiescent")) return "retained";
-      if (guardedV2) {
-        // Includes tracked/untracked WIP and all earlier owed roots, even with no checkpoint.
-        const source = await this.transferRestorePointToTrustedBare(flight, flight.runLog, flight.runId, gen);
+      const budget = MaintenanceBudget.current() ?? flight.cancellationBudget;
+      if (!budget || !flight.executor.withCredentialFreeCapture) return "retained";
+      budget.check();
+      const deadlineAt = Date.now() + budget.remainingMs();
+      const result = await this.runFreeCapture(claim, flight, deadlineAt, budget.signal, async held => {
+        const executor = flight.executor;
         MaintenanceBudget.current()?.check();
-        if (!source || residueQuarantine() !== undefined || fenced()) return "retained";
+        this.assertHeldFreeCapture(flight, held);
+        if (residueQuarantine() !== undefined) return "retained" as const;
+        const initial = await this.quiesceRun(flight, executor, {
+          mode: "own", site: "owner_cancel", forceProcessScan: true,
+        });
+        MaintenanceBudget.current()?.check();
+        this.assertHeldFreeCapture(flight, held);
+        if (residueQuarantine() !== undefined) return "retained" as const;
+        // ADR1783: every Docker state is observed and logged before restore inspection;
+        // neither an unconfirmed teardown nor a Docker error blocks a process/Git proof.
+        flight.runLog.info("owner cancel Docker teardown", { ...initial.outcome.docker });
+        if (initial.blocked ||
+            (process.platform === "linux" && initial.outcome.process?.state !== "quiescent")) return "retained" as const;
+        if (guardedV2) {
+          // Includes tracked/untracked WIP and all earlier owed roots, even with no checkpoint.
+          const source = await this.transferRestorePointToTrustedBare(flight, flight.runLog, flight.runId, gen, held);
+          MaintenanceBudget.current()?.check();
+          this.assertHeldFreeCapture(flight, held);
+          if (!source || residueQuarantine() !== undefined || fenced()) return "retained" as const;
+          const final = await this.quiesceRun(flight, executor, {
+            mode: "own", site: "owner_cancel_after_inspection", processOnly: true, forceProcessScan: true,
+          });
+          MaintenanceBudget.current()?.check();
+          this.assertHeldFreeCapture(flight, held);
+          if (residueQuarantine() !== undefined || final.blocked ||
+              (process.platform === "linux" && final.outcome.process?.state !== "quiescent") ||
+              (final.outcome.process?.killed.length ?? 0) > 0 || fenced()) return "retained" as const;
+          // Freeze only. A later authenticated terminal observation authorizes preservation.
+          await this.settleGuardedInventory(claim, flight, source, undefined, held.signal, true, { deferCapture: true });
+          return "retained" as const;
+        }
+        const trusted = flight.trustedPublishedStart;
+        if (!trusted || !/^[0-9a-f]{40}$/.test(trusted)) return "retained" as const;
+        const head = await this.git.credentialFreeCancelCleanHead(flight.worktreePath!, flight.barePath!, trusted);
+        MaintenanceBudget.current()?.check();
+        this.assertHeldFreeCapture(flight, held);
+        if (residueQuarantine() !== undefined) return "retained" as const;
+        const present = await this.git.revParse(flight.barePath!, `${trusted}^{commit}`);
+        MaintenanceBudget.current()?.check();
+        this.assertHeldFreeCapture(flight, held);
+        if (residueQuarantine() !== undefined) return "retained" as const;
+        // Finish every Git observation before the final process proof. A newly killed writer
+        // invalidates the observations even if the scan then reports quiescent.
         const final = await this.quiesceRun(flight, executor, {
           mode: "own", site: "owner_cancel_after_inspection", processOnly: true, forceProcessScan: true,
         });
         MaintenanceBudget.current()?.check();
-        if (residueQuarantine() !== undefined || final.blocked ||
+        this.assertHeldFreeCapture(flight, held);
+        if (residueQuarantine() !== undefined) return "retained" as const;
+        if (head !== trusted || present !== trusted || final.blocked ||
             (process.platform === "linux" && final.outcome.process?.state !== "quiescent") ||
-            (final.outcome.process?.killed.length ?? 0) > 0 || fenced()) return "retained";
-        // Freeze only. A later authenticated terminal observation authorizes preservation.
-        await this.settleGuardedInventory(claim, flight, source, undefined, undefined, true, { deferCapture: true });
-        return "retained";
-      }
-      const trusted = flight.trustedPublishedStart;
-      if (!trusted || !/^[0-9a-f]{40}$/.test(trusted)) return "retained";
-      const head = await this.git.credentialFreeCancelCleanHead(flight.worktreePath!, flight.barePath!, trusted);
-      MaintenanceBudget.current()?.check();
-      if (residueQuarantine() !== undefined) return "retained";
-      const present = await this.git.revParse(flight.barePath!, `${trusted}^{commit}`);
-      MaintenanceBudget.current()?.check();
-      if (residueQuarantine() !== undefined) return "retained";
-      // Finish every Git observation before the final process proof. A newly killed writer
-      // invalidates the observations even if the scan then reports quiescent.
-      const final = await this.quiesceRun(flight, executor, {
-        mode: "own", site: "owner_cancel_after_inspection", processOnly: true, forceProcessScan: true,
-      });
-      MaintenanceBudget.current()?.check();
-      if (residueQuarantine() !== undefined) return "retained";
-      if (head !== trusted || present !== trusted || final.blocked ||
-          (process.platform === "linux" && final.outcome.process?.state !== "quiescent") ||
-          (final.outcome.process?.killed.length ?? 0) > 0 || fenced()) return "retained";
-      // ADR1783 accepts Docker's late-create race. No code-capable Git runs between this
-      // final process proof and release; historical published start is not fresh forge evidence.
-      MaintenanceBudget.current()?.check();
-      if (residueQuarantine() !== undefined) return "retained";
-      const ack = await this.client.releaseRecoveryCustody(flight.runId, gen);
-      MaintenanceBudget.current()?.check();
-      if (residueQuarantine() !== undefined) return "retained";
-      if (fenced() || ack.run_id !== flight.runId || ack.generation !== gen ||
-          ack.released !== true || ack.holds_released !== 1 || ack.retained === true) return "retained";
-      await this.recovery.forgetGeneration(flight.runId, gen);
-      MaintenanceBudget.current()?.check();
-      if (residueQuarantine() !== undefined) return "retained";
-      await this.git.deleteRecoveryPin(flight.barePath!, flight.runId, gen);
-      MaintenanceBudget.current()?.check();
-      if (residueQuarantine() !== undefined) return "retained";
+            (final.outcome.process?.killed.length ?? 0) > 0 || fenced()) return "retained" as const;
+        // ADR1783 accepts Docker's late-create race. No code-capable Git runs between this
+        // final process proof and release; historical published start is not fresh forge evidence.
+        MaintenanceBudget.current()?.check();
+        this.assertHeldFreeCapture(flight, held);
+        if (residueQuarantine() !== undefined) return "retained" as const;
+        const ack = await this.client.releaseRecoveryCustody(flight.runId, gen);
+        MaintenanceBudget.current()?.check();
+        this.assertHeldFreeCapture(flight, held);
+        if (residueQuarantine() !== undefined) return "retained" as const;
+        if (fenced() || ack.run_id !== flight.runId || ack.generation !== gen ||
+            ack.released !== true || ack.holds_released !== 1 || ack.retained === true) return "retained" as const;
+        await this.recovery.forgetGeneration(flight.runId, gen);
+        MaintenanceBudget.current()?.check();
+        this.assertHeldFreeCapture(flight, held);
+        if (residueQuarantine() !== undefined) return "retained" as const;
+        await this.git.deleteRecoveryPin(flight.barePath!, flight.runId, gen);
+        MaintenanceBudget.current()?.check();
+        this.assertHeldFreeCapture(flight, held);
+        if (residueQuarantine() !== undefined) return "retained" as const;
+        return "released" as const;
+      }, "cancel");
+      if (result.kind !== "observed_empty" || result.value !== "released") return "retained";
       flight.preserveRecoveryClone = false;
       flight.preserveSession = false;
       return "released";
@@ -16942,11 +17134,7 @@ export class RunRunner {
     }
   }
 
-  /** Issue #1766 (R2): settle the executor for a credential-free capture. A Codex executor settles
-   *  its live registry (never reconciling or minting a permit); a legacy executor was already
-   *  reaped by the handler's `killAgentTree`; a `safety`-bearing executor without the method fails
-   *  closed. Never throws. */
-  private async settleForCredentialCapture(executor: Executor, deadlineMs = this.codexBoundaryDeadlineMs, purpose: "capture" | "cancel" = "capture"): Promise<CredentialFreeSettleOutcome> {
+  private async settleForCredentialCapture(executor: Executor, deadlineMs = this.codexBoundaryDeadlineMs, purpose: "capture" | "cancel" = "capture", mode: "credential-free" | "authenticated" = "credential-free"): Promise<CredentialFreeSettleOutcome> {
     const deadlineAt = Date.now() + Math.max(0, deadlineMs);
     await executor.closeAndSettlePlanSummary?.(deadlineMs);
     deadlineMs = Math.max(0, deadlineAt - Date.now());
@@ -16954,16 +17142,33 @@ export class RunRunner {
     // killAgentTree reap, so they settle (disposed and confirmed) before the capture proceeds.
     if (executor.settleWorkerCommands) {
       let confirmed = false;
-      try { confirmed = (await executor.settleWorkerCommands(deadlineMs)).confirmed; } catch { /* unconfirmed */ }
+      try { confirmed = (await executor.settleWorkerCommands(deadlineMs)).confirmed; } catch (error) {
+        if (canonicalRecoveryInterruption(error)) throw error;
+      }
       if (!confirmed) {
         return { kind: "incomplete", errors: [{ category: "protocol", message: "worker command settle unconfirmed" }] };
       }
       deadlineMs = Math.max(0, deadlineAt - Date.now());
     }
+    if (mode === "authenticated" && executor.safety) {
+      // The normal boundary verifies Codex roots and closes admission before source writes.
+      // A legacy credential-free settle would poison that authenticated boundary.
+      let entered = false;
+      try {
+        await this.reapForSink(executor, { boundary: "shutdown", deadlineMs }, async () => { entered = true; });
+      } catch (error) {
+        if (canonicalRecoveryInterruption(error)) throw error;
+        return { kind: "incomplete", errors: [{ category: "protocol", message: "authenticated capture settle threw" }] };
+      }
+      return entered
+        ? { kind: "observed_empty" }
+        : { kind: "incomplete", errors: [{ category: "protocol", message: "authenticated capture boundary not entered" }] };
+    }
     if (executor.settleForCredentialFreeCapture) {
       try {
         return await executor.settleForCredentialFreeCapture(deadlineMs, purpose);
-      } catch {
+      } catch (error) {
+        if (canonicalRecoveryInterruption(error)) throw error;
         return { kind: "incomplete", errors: [{ category: "protocol", message: "capture settle threw" }] };
       }
     }
@@ -17055,9 +17260,11 @@ export class RunRunner {
     // the custody hold KEPT (no post-park settle): a clone exists, and the api keeps custody for a
     // data_volume_full park.
     const disk = cause.kind === "data_volume_full" ? cause : undefined;
-    await executor.closeAndSettlePlanSummary?.();
-    await this.settleGuardedCommands(executor);
-    executor.killAgentTree?.();
+    if (!credentialDeferred) {
+      await executor.closeAndSettlePlanSummary?.();
+      await this.settleGuardedCommands(executor);
+      executor.killAgentTree?.();
+    }
     if (disk) {
       // The group reap above misses what the agent backgrounded: the pinned CLI runs every Bash
       // command detached, in its own session and process group. Kill every process attributed to
@@ -17098,7 +17305,6 @@ export class RunRunner {
     const terminal = TERMINAL_RUN_STATUSES;
     // Issue #1766: credential-deferral park progress. A transient park starts with both latched.
     let confirmedRunning = !credentialDeferred;
-    let settled = !credentialDeferred;
     let retries = 0;
     const shown = new Set<string>();
     const note = async (text: string): Promise<void> => {
@@ -17123,23 +17329,14 @@ export class RunRunner {
     // run already known terminal). True only for a VERIFIED capture; never throws.
     const captureForCredentialExit = async (publish: boolean): Promise<boolean> => {
       if (capture) return true;
-      if (!settled) {
-        const settlement = await this.settleForCredentialCapture(executor);
-        if (settlement.kind !== "observed_empty") {
-          runLog.warn("credential recovery park: the execution did not settle before exit; keeping the clone and session", {
-            run_id: flight.runId,
-            errors: settlement.errors.map((e) => e.category),
-          });
-          return false;
-        }
-        settled = true;
-      }
       try {
-        const attempt = await this.captureRecoveryRestorePoint(claim, flight, runLog, "recovery_capture", {
-          credentialFree: true,
-          publish,
-          terminalDisk: opts.terminalDisk,
-        });
+        const result = await this.runFreeCapture(claim, flight, Date.now() + this.codexBoundaryDeadlineMs,
+          this.shutdownSignal.signal, held => this.captureRecoveryRestorePoint(claim, flight, runLog, "recovery_capture", {
+            credentialFree: true, heldCapture: held, signal: held.signal,
+            publish, terminalDisk: opts.terminalDisk,
+          }), "capture", "strict");
+        if (result.kind !== "observed_empty") return false;
+        const attempt = result.value;
         if (attempt.verified) {
           capture = attempt;
           // issue #1783 M2: a verified capture of a PREDECESSOR attempt lets the terminal finally
@@ -17424,30 +17621,47 @@ export class RunRunner {
           await retryWait(false);
           continue;
         }
-        if (!settled) {
-          // Issue #1766 (R2): nothing of the run may still write to the clone while it is captured.
-          // An incomplete settle retains everything and retries; it never parks and never fails.
-          const settlement = await this.settleForCredentialCapture(executor);
-          if (settlement.kind !== "observed_empty") {
-            runLog.warn("credential recovery park: the execution did not settle; retaining work and retrying", {
-              run_id: flight.runId,
-              errors: settlement.errors.map((e) => e.category),
-            });
-            await note(feed.settleIncomplete);
-            await retryWait();
-            continue;
-          }
-          settled = true;
-          retries = 0;
-        }
         if (!capture) {
           let blockedDetail: string | undefined;
           let quarantinedCapture: ResidueQuarantinedError | undefined;
           try {
-            const attempt = await this.captureRecoveryRestorePoint(claim, flight, runLog, "recovery_capture", {
-              credentialFree: credentialDeferred,
-              terminalDisk: opts.terminalDisk,
-            });
+            let attempt: RecoveryCaptureResult;
+            if (credentialDeferred) {
+              const result = await this.runFreeCapture(claim, flight, Date.now() + this.codexBoundaryDeadlineMs,
+                this.shutdownSignal.signal, held => this.captureRecoveryRestorePoint(claim, flight, runLog, "recovery_capture", {
+                  credentialFree: true, heldCapture: held, signal: held.signal,
+                  terminalDisk: opts.terminalDisk,
+                }), "capture", "strict");
+              if (result.kind !== "observed_empty") {
+                await note(feed.settleIncomplete);
+                await retryWait();
+                continue;
+              }
+              attempt = result.value;
+            } else {
+              // Prove the authenticated drain before source writes; publication later acquires
+              // its own boundary. Neither step acquires a credential-free capture callback.
+              const settlement = await this.settleForCredentialCapture(executor, undefined, "capture", "authenticated");
+              if (settlement.kind !== "observed_empty") {
+                if (!opts.terminalDisk) {
+                  runLog.warn("credential recovery park: the execution did not settle; retaining work and retrying", {
+                    run_id: flight.runId,
+                    errors: settlement.errors.map((e) => e.category),
+                  });
+                  await note(feed.settleIncomplete);
+                  await retryWait();
+                  continue;
+                }
+                // Incomplete settlement grants no source permission; use the existing
+                // bounded unsafe-proof refusal while retaining clone, session and custody.
+                attempt = { verified: false, published: false, residueBlocked: true,
+                  residueDetail: "terminal disk capture: authenticated settlement incomplete" };
+              } else {
+                attempt = await this.captureRecoveryRestorePoint(claim, flight, runLog, "recovery_capture", {
+                  terminalDisk: opts.terminalDisk,
+                });
+              }
+            }
             if (attempt.residueBlocked) blockedDetail = attempt.residueDetail ?? "not quiescent";
             if (attempt.verified) {
               capture = attempt;
@@ -17468,7 +17682,8 @@ export class RunRunner {
               flight.keepGuardedInventoryOpen = true;
               feed = deferral === "vault_locked" ? VAULT_PARK_FEED : deferral === "account_unavailable" ? ACCOUNT_PARK_FEED : deferral === "credential_release_unavailable" ? RELEASE_UNAVAILABLE_PARK_FEED : REFRESH_UNKNOWN_PARK_FEED;
               confirmedRunning = false;
-              settled = false;
+            } else if (!(captureError instanceof ResidueQuarantinedError) && canonicalRecoveryInterruption(captureError)) {
+              throw captureError;
             }
             if (captureError instanceof ResidueQuarantinedError) quarantinedCapture = captureError;
             runLog.warn("recovery capture failed; retaining work for retry", {
@@ -17924,19 +18139,158 @@ export class RunRunner {
    * is `survivors`/`unverified` skips the fetch-back and the publish (undoing a marker it made) and
    * is a pause_failed per Decision 8: no durable checkpoint, no park, the run keeps running.
    *
-   * PRD #1171 m4 (pause-sink designation): this sink mints NO Codex permit. Its publish is
-   * credential-free (overlay undefined), so per the m4 structural rule (a path mints a permit IFF
-   * it does a PAT-bearing overlay publish or a terminal/finalize reap) it does not route through
-   * the reapForSink/withCodexBoundaryOnly helpers; its quiesceRun (for Codex, the Docker teardown
-   * only: the supervisor proves process drain) therefore runs outside any Codex permit.
+   * Codex holds its credential-free callback scope through source work, publication,
+   * pause settlement and inventory handling. No authenticated boundary is acquired.
    */
   private async handlePausePark(
     claim: ClaimResponse,
     flight: RunFlight,
     pausedAt: { completedCount: number; total?: number },
-    origin: "lead_park" | "owner",
+    options: { origin: "lead_park" | "owner"; deadlineAt?: number },
   ): Promise<boolean> {
-    const { runLog, batcher, reportState } = flight;
+    const refusedSafety = flight.executor.safety;
+    const deadlineAt = options.deadlineAt ?? Date.now() + this.codexBoundaryDeadlineMs;
+    return this.runGatedSink(flight, async () => {
+      // Only this invocation's exact paused ACK survives a later capture refusal.
+      // flight.parked may already be set by a different operation.
+      let pauseAcknowledged = false;
+      let refusalReported = false;
+      const reportRefusal = (residueBlocked: boolean, residueState?: string, signal?: AbortSignal) => {
+        if (refusalReported) return Promise.resolve(false as const);
+        refusalReported = true;
+        return this.reportPauseCaptureFailed(flight, residueBlocked, residueState, signal);
+      };
+      const retainAcknowledgedPause = (error?: unknown): true => {
+        flight.sourceJoinFailed = true;
+        flight.preserveRecoveryClone = true;
+        flight.preserveSession = true;
+        flight.keepGuardedInventoryOpen = true;
+        try {
+          flight.runLog.warn("recovery: acknowledged pause capture incomplete; custody retained", {
+            run_id: flight.runId,
+            diagnostic: error !== undefined && flight.redactText
+              ? redactThenSanitize(flight.redactText, codexBoundaryDiagnosticOf(error) ?? errMessage(error))
+              : "capture completion unverified",
+          });
+        } catch { /* Diagnostics cannot revoke an acknowledged pause. */ }
+        return true;
+      };
+      try {
+        const result = await this.runFreeCapture(claim, flight, deadlineAt, this.shutdownSignal.signal,
+          held => this.handlePauseParkHeld(claim, flight, held, pausedAt, options.origin, () => { pauseAcknowledged = true; }, reportRefusal),
+          "capture", "warn");
+        if (result.kind === "observed_empty") {
+          // A completed capture may still have no paused ACK. If this exact
+          // epoch later fails teardown, it needs the same B1 retained stop.
+          if (!result.value) flight.refusedPauseCaptureSafety = refusedSafety;
+          return result.value;
+        }
+      } catch (error) {
+        flight.sourceJoinFailed = true;
+        if (pauseAcknowledged) {
+          // runFreeCapture has joined scope cleanup; this preserves the pause, not capture proof.
+          return retainAcknowledgedPause(error);
+        }
+        // Newer lifecycle authority wins even when capture cleanup also failed.
+        this.shutdownSignal.signal.throwIfAborted();
+        if (flight.steering.getPauseMode() === "disk") throw new DiskParkSignal(false);
+        flight.steering.checkpointAuthoritySignal().throwIfAborted();
+        const capture = captureFailureOf(error);
+        if (!capture || !isCodexBoundaryError(error)) throw error;
+        let primary: unknown;
+        try {
+          const action = Object.getOwnPropertyDescriptor(error, "actionError");
+          if (!action || !("value" in action)) throw error;
+          primary = action.value;
+        } catch { throw error; }
+        if (primary instanceof StaleClaimError || primary instanceof DiskParkSignal ||
+            primary instanceof CredentialSwitchSignal || codexDeferralOf(primary) !== undefined) {
+          // Preserve exact control identity for the outer runner catch, without
+          // replacing its cause or adding cleanup fields to the control.
+          try {
+            flight.runLog.warn("pause park: capture cleanup failed during lifecycle control", {
+              run_id: flight.runId,
+              diagnostic: flight.redactText
+                ? redactThenSanitize(flight.redactText, codexBoundaryDiagnosticOf(error) ?? "capture completion unverified")
+                : "capture completion unverified",
+            });
+          } catch { /* Diagnostics must not replace the lifecycle control. */ }
+          throw primary;
+        }
+        if (capture.externallyAborted || (!capture.deadlineExpired && !capture.childCleanupFailed) ||
+            (primary !== undefined && !capture.actionRevoked && !(primary instanceof FreeCaptureScopeExpired))) throw error;
+      }
+      if (pauseAcknowledged) return retainAcknowledgedPause();
+      // Cooperative owner pause is already latched; only newer authority revocation wins here.
+      this.shutdownSignal.signal.throwIfAborted();
+      if (flight.steering.getPauseMode() === "disk") throw new DiskParkSignal(false);
+      flight.steering.checkpointAuthoritySignal().throwIfAborted();
+      flight.sourceJoinFailed = true;
+      flight.preserveRecoveryClone = true;
+      flight.preserveSession = true;
+      flight.runLog.warn("pause park: capture scope unavailable; the run continues", {
+        run_id: flight.runId,
+      });
+      flight.refusedPauseCaptureSafety = refusedSafety;
+      return reportRefusal(false);
+    });
+  }
+
+  /** An accepted owner pause can follow a failed capture or a question ACK.
+   * Neither outcome carries live source authority from handlePausePark. */
+  private async retainAcceptedOwnerPause(
+    claim: ClaimResponse, flight: RunFlight, pinFailureMessage: string, originalDeadlineAt?: number,
+  ): Promise<void> {
+    const settle = async (held?: HeldFreeCapture) => {
+      const check = () => { if (held) this.assertHeldFreeCapture(flight, held); };
+      check();
+      const head = await this.currentRestorePointHead(flight);
+      check();
+      await this.pinRecoveryGeneration(claim, flight, head)
+        .catch((error) => flight.runLog.warn(pinFailureMessage, {
+          run_id: flight.runId, error: errMessage(error),
+        }));
+      check();
+      if (claim.inventory_guarded === true)
+        await this.settleGuardedInventory(claim, flight, undefined, undefined, held?.signal, true);
+      check();
+    };
+    if (!this.requiresFreeCaptureScope(claim, flight)) return settle();
+    const retain = () => {
+      flight.preserveRecoveryClone = true;
+      flight.preserveSession = true;
+      flight.keepGuardedInventoryOpen = true;
+    };
+    // Consume the current operation's remaining budget, when present; queueing
+    // and the whole continuation share the same absolute capture deadline.
+    const budget = MaintenanceBudget.current();
+    const now = Date.now();
+    const deadlineAt = Math.min(originalDeadlineAt ?? now + this.codexBoundaryDeadlineMs,
+      now + (budget?.remainingMs() ?? Infinity));
+    const signal = budget
+      ? AbortSignal.any([this.shutdownSignal.signal, budget.signal])
+      : this.shutdownSignal.signal;
+    try {
+      const result = await this.runFreeCapture(claim, flight, deadlineAt, signal, held =>
+        this.git.withRecoveryOperation(held.signal!, held.deadlineAt, () => settle(held)));
+      if (result.kind === "observed_empty") return;
+    } catch (error) {
+      flight.runLog.warn("recovery: owner pause continuation unverified (custody retained)", {
+        run_id: flight.runId, error: errMessage(error),
+      });
+    }
+    // Keep the acknowledged park even when fresh admission refuses. No recapture
+    // or new pause attempt follows, and cleanup must retain the exact source.
+    retain();
+  }
+
+  private async handlePauseParkHeld(
+    claim: ClaimResponse, flight: RunFlight, held: HeldFreeCapture,
+    pausedAt: { completedCount: number; total?: number }, origin: "lead_park" | "owner", onPausedAck: () => void,
+    reportRefusal: (residueBlocked: boolean, residueState?: string, signal?: AbortSignal) => Promise<false>,
+  ): Promise<boolean> {
+    this.assertHeldFreeCapture(flight, held);
+    const { runLog, reportState, batcher } = flight;
     const barePath = flight.barePath;
     const runnerClone = flight.runnerClone;
     const branch = runnerClone?.branch ?? flight.branch;
@@ -17950,6 +18304,7 @@ export class RunRunner {
     // The clone is not flagged preserveRecoveryClone here: the run keeps running, and its terminal
     // retire runs its own quiescence gate before removing anything.
     const pauseQuiescence = await this.quiesceRun(flight, flight.executor, { mode: "own", site: "pause_park" });
+    this.assertHeldFreeCapture(flight, held);
     let residueBlocked = pauseQuiescence.blocked;
     let residueState = pauseQuiescence.outcome.process?.state;
 
@@ -17981,6 +18336,7 @@ export class RunRunner {
     let createdMarker: string | undefined;
     if (!residueBlocked && barePath && branch && runnerClone) {
       markerCreated = await this.git.commitWipMarker(runnerClone.path, { mode: "exclude", onIncomplete: this.wipIncompleteHandler(flight, "park"), onCommitted: (m) => { createdMarker = m; } }).catch(() => { flight.sourceJoinFailed = true; return false; });
+      this.assertHeldFreeCapture(flight, held);
       // issue #3239: sourceJoinFailed alone does not stop the fetch-back or publish below. A marker
       // whose rollback was refused was never vetted: refuse like an ownership failure, so nothing
       // is fetched or published and the run stays running (pause_failed) with its clone kept.
@@ -17992,6 +18348,7 @@ export class RunRunner {
         site: "pause_park:after_runner_git",
         processOnly: true,
       });
+      this.assertHeldFreeCapture(flight, held);
       if (reproof.blocked) {
         residueBlocked = true;
         residueState = reproof.outcome.process?.state;
@@ -18005,6 +18362,7 @@ export class RunRunner {
       const preTip = await this.git
         .branchTip(runnerClone.path, branch)
         .catch(() => { flight.sourceJoinFailed = true; return null; });
+      this.assertHeldFreeCapture(flight, held);
       let fetched: FetchBackOutcome = { kind: "updated" }; // ownership is checked even without a fetch
       if (preTip !== null && (preTip !== runnerClone.baseCommit ||
           runnerClone.seededFrom === "tracking" || runnerClone.seededFrom === "checkpoint")) {
@@ -18016,6 +18374,7 @@ export class RunRunner {
           runLog,
         );
       }
+      this.assertHeldFreeCapture(flight, held);
       if (fetched.kind !== "updated") flight.sourceJoinFailed = true;
       if (fetched.kind === "refused" || !await this.trackingOwned(
         flight, barePath, branch, fetched.kind === "updated" ? preTip ?? undefined : undefined,
@@ -18023,7 +18382,9 @@ export class RunRunner {
         this.preservationRefused(flight, "ownership_unknown");
         preservationRefused = true;
       }
+      this.assertHeldFreeCapture(flight, held);
       holdsLatest = !preservationRefused && await this.trackingHoldsLatest(fetched, barePath, runnerClone.path, branch);
+      this.assertHeldFreeCapture(flight, held);
       // PRD #1416 M3 (C7): bridge a divergent tracking tip BEFORE the pause-park publish so a resume
       // adopts B (the rewritten work), not the published tip. handlePausePark is checkpoint-first and
       // does NOT route through the doCheckpointPublish/reapForSink machinery C1/C5/C6 cover, so it is
@@ -18031,6 +18392,7 @@ export class RunRunner {
       // this one placement covers both. Best-effort — a park must never throw (D4).
       if (!preservationRefused) {
         const bridge = await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "pause-park");
+        this.assertHeldFreeCapture(flight, held);
         if (bridge.kind === "preservation_refused") preservationRefused = true;
         if (bridge.kind !== "clean" && bridge.kind !== "bridged") flight.sourceJoinFailed = true;
       }
@@ -18053,6 +18415,7 @@ export class RunRunner {
             .branchTip(runnerClone.path, branch)
             .catch(() => { flight.sourceJoinFailed = true; return null; })
         : null;
+      this.assertHeldFreeCapture(flight, held);
       if (cloneTip !== null && cloneTip === flight.lastPublishedTip) {
         published = true;
         // The clone's tip is the one a prior publish confirmed landed: the checkpoint holds it.
@@ -18063,6 +18426,7 @@ export class RunRunner {
           barePath,
           branch,
           undefined,
+          held.signal,
         );
         // PRD #1809 D8: the publish packed the tracking ref. When that ref does not hold the clone's
         // HEAD (the fetch-back failed), the checkpoint is OLDER than cloneTip: recording cloneTip as
@@ -18075,6 +18439,7 @@ export class RunRunner {
     }
 
     if (!published) {
+      this.assertHeldFreeCapture(flight, held);
       // The run CONTINUES (Decision 8), so a wip(park): marker we just made must not stay committed
       // at the clone HEAD: it would ride into the eventual MR and the restarted turn would build on a
       // throwaway commit. Restore its content to the uncommitted tree, the same shape the resume
@@ -18096,57 +18461,17 @@ export class RunRunner {
           runLog.warn("pause park: WIP marker not undone (marker oid unknown)", { run_id: flight.runId, branch });
         }
       }
-      // Decision 8: no durable checkpoint ⇒ no park. Report pause_failed (the server clears the
-      // pending request and keeps the run running), tell the owner the run is still running, and
-      // return false so the loop CONTINUES — a `now` pause restarts the aborted turn on the next
-      // iteration. The reason rides the worker's own feed message; the pause_failed report carries
-      // none (the server intercepts pause_failed BEFORE its status switch).
-      // issue #1783: a clone that is not provably quiescent reaches here with the fetch-back and the
-      // publish skipped (and, when only the re-proof after the marker blocked, the marker undone
-      // above); the log and the feed name that reason instead of a failed publish.
-      // Issue #1832: a pause that interrupted the pre-clone data-volume reclaim wait reaches here
-      // with nothing cloned or started; executeClaim then leaves the run for requeue, so neither
-      // "restarted the interrupted step" text below would be true.
-      const reclaimWait = flight.reclaimWaitInterrupted;
-      if (reclaimWait !== undefined) {
-        runLog.warn("pause during the data-volume reclaim wait; nothing to checkpoint, the run is left for requeue", {
-          run_id: flight.runId,
-          operation: reclaimWait,
-        });
-      } else if (residueBlocked) {
-        runLog.warn("pause park: clone not provably quiescent; no checkpoint taken, the run stays running", {
-          run_id: flight.runId,
-          state: residueState,
-        });
-      } else {
-        runLog.warn("could not publish a pause checkpoint; the run stays running", {
-          run_id: flight.runId,
-        });
-      }
-      batcher.emit({
-        kind: "pause_failed",
-        agent: "worker",
-        payload: {
-          text: reclaimWait !== undefined
-            ? "Could not pause: the run was still waiting for disk space to be reclaimed on the worker and had not started work on this worker, so there was nothing new to checkpoint. It has stopped on this worker and will start again when it is requeued."
-            : residueBlocked
-            ? "Could not pause: a process this run started could not be stopped, so no checkpoint was taken. The run is still running and has restarted the interrupted step."
-            : "Could not pause: the checkpoint could not be published. The run is still running and has restarted the interrupted step.",
-        },
-      });
-      await reportState({ status: "pause_failed" }).catch((e) =>
-        runLog.error("could not report pause_failed", { error: errMessage(e) }),
-      );
-      return false;
+      return reportRefusal(residueBlocked, residueState, held.signal);
     }
 
+    this.assertHeldFreeCapture(flight, held);
     // PRD #1809 D8: a published pause checkpoint older than the clone's HEAD is reported as such.
     // The pause still parks: its custody handling is unchanged (the pin below; the hold settles on
     // the resume-terminal or the reconciler).
     if (holdsLatest === false) this.logStaleParkCheckpoint(runLog, flight.runId, "pause");
     let ack: StateAck;
     try {
-      ack = await reportState({ status: "paused", ...this.checkpointDurabilityField(holdsLatest) });
+      ack = await reportState({ status: "paused", ...this.checkpointDurabilityField(holdsLatest) }, held.signal);
     } catch (e) {
       // The park report never landed. Not parked: the loop keeps running (its next report
       // self-heals), exactly as handleLimitReached cleans up when its park report throws.
@@ -18165,8 +18490,10 @@ export class RunRunner {
       });
       return false;
     }
-    flight.parked = true;
     flight.pauseParkAccepted = true;
+    onPausedAck();
+    flight.parked = true;
+    this.assertHeldFreeCapture(flight, held);
     runLog.info("run pause accepted; preserving its HOME for resume", {
       run_id: flight.runId,
     });
@@ -18175,12 +18502,16 @@ export class RunRunner {
     // stay credential-free even though issue #1783's gate reaped above (a pause never runs a PAT
     // git). Legacy custody remains pinned for resume. Guarded inventory capture below uses only
     // the trusted bare and join-token archive seam after the accepted park ACK.
+    this.assertHeldFreeCapture(flight, held);
+    const restoreHead = await this.currentRestorePointHead(flight);
+    this.assertHeldFreeCapture(flight, held);
     await this.pinRecoveryGeneration(
       claim,
       flight,
-      await this.currentRestorePointHead(flight),
+      restoreHead,
     ).catch(async (e) => {
       flight.sourceJoinFailed = true;
+      this.assertHeldFreeCapture(flight, held);
       runLog.warn("recovery: pause generation-evidence pin failed (custody retained)", {
         run_id: flight.runId,
         error: errMessage(e),
@@ -18188,7 +18519,9 @@ export class RunRunner {
         ...(await this.diskFullCauseOf(e, this.git.recoveryRoot)),
       });
     });
-    if (claim.inventory_guarded === true) await this.settleGuardedInventory(claim, flight, undefined, undefined, undefined, true);
+    this.assertHeldFreeCapture(flight, held);
+    if (claim.inventory_guarded === true) await this.settleGuardedInventory(claim, flight, undefined, undefined, held.signal, true);
+    this.assertHeldFreeCapture(flight, held);
     // Display-only delivery follows the accepted park and custody handling. Both emit and flush
     // can fail; neither may undo or retry the accepted pause.
     try {
@@ -18211,6 +18544,54 @@ export class RunRunner {
     return true;
   }
 
+  private async reportPauseCaptureFailed(
+    flight: RunFlight, residueBlocked: boolean, residueState?: string, signal?: AbortSignal,
+  ): Promise<false> {
+    const { runLog, batcher, reportState } = flight;
+    // Decision 8: no durable checkpoint ⇒ no park. Report pause_failed (the server clears the
+    // pending request and keeps the run running), tell the owner the run is still running, and
+    // return false so the loop CONTINUES — a `now` pause restarts the aborted turn on the next
+    // iteration. The reason rides the worker's own feed message; the pause_failed report carries
+    // none (the server intercepts pause_failed BEFORE its status switch).
+    // issue #1783: a clone that is not provably quiescent reaches here with the fetch-back and the
+    // publish skipped (and, when only the re-proof after the marker blocked, the marker undone
+    // above); the log and the feed name that reason instead of a failed publish.
+    // Issue #1832: a pause that interrupted the pre-clone data-volume reclaim wait reaches here
+    // with nothing cloned or started; executeClaim then leaves the run for requeue, so neither
+    // "restarted the interrupted step" text below would be true.
+    const reclaimWait = flight.reclaimWaitInterrupted;
+    if (reclaimWait !== undefined) {
+      runLog.warn("pause during the data-volume reclaim wait; nothing to checkpoint, the run is left for requeue", {
+        run_id: flight.runId,
+        operation: reclaimWait,
+      });
+    } else if (residueBlocked) {
+      runLog.warn("pause park: clone not provably quiescent; no checkpoint taken, the run stays running", {
+        run_id: flight.runId,
+        state: residueState,
+      });
+    } else {
+      runLog.warn("could not publish a pause checkpoint; the run stays running", {
+        run_id: flight.runId,
+      });
+    }
+    batcher.emit({
+      kind: "pause_failed",
+      agent: "worker",
+      payload: {
+        text: reclaimWait !== undefined
+          ? "Could not pause: the run was still waiting for disk space to be reclaimed on the worker and had not started work on this worker, so there was nothing new to checkpoint. It has stopped on this worker and will start again when it is requeued."
+          : residueBlocked
+          ? "Could not pause: a process this run started could not be stopped, so no checkpoint was taken. The run is still running and has restarted the interrupted step."
+          : "Could not pause: the checkpoint could not be published. The run is still running and has restarted the interrupted step.",
+      },
+    });
+    await reportState({ status: "pause_failed" }, signal).catch((e) =>
+      runLog.error("could not report pause_failed", { error: errMessage(e) }),
+    );
+    return false;
+  }
+
   /**
    * Capture dirty work as a WIP marker, fetch it into the worker-owned tracking
    * ref, and positively verify HEAD equality before attempting origin publish.
@@ -18225,26 +18606,36 @@ export class RunRunner {
         frozen === undefined || candidate === undefined ||
         (frozen.length === candidate.length && frozen.every((m, i) =>
           m.id === candidate[i]!.id && m.title === candidate[i]!.title))) return undefined;
+    const deadlineAt = Date.now() + 60_000;
     const signal = AbortSignal.any([ownerSignal, this.shutdownSignal.signal, AbortSignal.timeout(60_000)]);
-    const guard = async () => { signal.throwIfAborted(); };
     const priorPreserve = flight.preserveRecoveryClone;
     flight.preserveRecoveryClone = true;
-    const captured = await this.captureRecoveryRestorePoint(claim, flight, flight.runLog, "recovery_capture", {
-      credentialFree: true, signal, beforeMutation: guard,
-    });
-    await guard();
-    const source = captured.capturedHead;
-    const published = flight.lastCheckpointRefTip;
-    if (!captured.verified || !captured.published || !source || !published || !flight.barePath ||
-        !flight.worktreePath || !await this.git.isAncestorRef(flight.barePath, source, published) ||
-        await this.git.worktreeHead(flight.worktreePath) !== source) {
+    const result = await this.runFreeCapture(claim, flight, deadlineAt, signal, async held => {
+      const guard = async () => {
+        held.signal?.throwIfAborted();
+        this.assertHeldFreeCapture(flight, held);
+      };
+      const captured = await this.captureRecoveryRestorePoint(claim, flight, flight.runLog, "recovery_capture", {
+        credentialFree: true, signal: held.signal, beforeMutation: guard, heldCapture: held,
+      });
+      await guard();
+      const source = captured.capturedHead;
+      const published = flight.lastCheckpointRefTip;
+      if (!captured.verified || !captured.published || !source || !published || !flight.barePath ||
+          !flight.worktreePath || !await this.git.isAncestorRef(flight.barePath, source, published) ||
+          await this.git.worktreeHead(flight.worktreePath) !== source) {
+        throw new TransientRecoveryError("plan gate checkpoint could not be published and proven recoverable");
+      }
+      await guard();
+      // The executor callback fences admission through the witness checks; ordinary
+      // quiesceRun alone does not close executor admission.
+      return { source_head: source, published_checkpoint: published };
+    }, "capture", "warn");
+    if (result.kind !== "observed_empty") {
       throw new TransientRecoveryError("plan gate checkpoint could not be published and proven recoverable");
     }
-    await guard();
-    // The capture's quiesceRun closes the executor before any WIP/fetch/publish. This producer
-    // does not reopen execution; the existing gate wait owns approval and lifecycle interrupts.
     flight.preserveRecoveryClone = priorPreserve;
-    return { source_head: source, published_checkpoint: published };
+    return result.value;
   }
 
   private async captureRecoveryRestorePoint(
@@ -18252,7 +18643,34 @@ export class RunRunner {
     flight: RunFlight,
     runLog: Logger,
     site: "recovery_capture" | "credential_switch",
-    opts: { credentialFree?: boolean; publish?: boolean; terminalDisk?: boolean; beforeMutation?: () => Promise<void>; signal?: AbortSignal } = {},
+    opts: RecoveryCaptureOptions = {},
+  ): Promise<RecoveryCaptureResult> {
+    if (!opts.credentialFree) {
+      return this.captureRecoveryRestorePointBody(claim, flight, runLog, site, opts);
+    }
+    if (opts.heldCapture) {
+      this.assertHeldFreeCapture(flight, opts.heldCapture);
+      return this.captureRecoveryRestorePointBody(claim, flight, runLog, site, {
+        ...opts, signal: opts.heldCapture.signal,
+      });
+    }
+    const deadlineAt = Date.now() + this.codexBoundaryDeadlineMs;
+    const result = await this.runFreeCapture(claim, flight, deadlineAt, opts.signal,
+      held => this.captureRecoveryRestorePoint(claim, flight, runLog, site, {
+        ...opts, signal: held.signal, heldCapture: held,
+      }), "capture", "strict");
+    if (result.kind === "observed_empty") return result.value;
+    flight.preserveRecoveryClone = true;
+    flight.preserveSession = true;
+    return { verified: false, published: false, residueBlocked: true, residueDetail: "credential-free capture unverified" };
+  }
+
+  private async captureRecoveryRestorePointBody(
+    claim: ClaimResponse,
+    flight: RunFlight,
+    runLog: Logger,
+    site: "recovery_capture" | "credential_switch",
+    opts: RecoveryCaptureOptions,
   ): Promise<RecoveryCaptureResult> {
     const barePath = flight.barePath;
     const worktreePath = flight.worktreePath;
@@ -18378,13 +18796,13 @@ export class RunRunner {
     // emptiness and a re-reap re-invokes each RegisteredRoot.reap (idempotent). A blocked Codex
     // boundary is a best-effort recovery path: it leaves `published` false (the restore point is
     // still VERIFIED locally, so the caller's "saved on this worker" notice fires) and must NOT
-    // fail the capture. (Codex never reaches the TRANSIENT recovery — its executor throws no
-    // TransientRecoveryError — so this is defensive wiring.)
+    // fail the capture. Codex can enter transient recovery after provider retry exhaustion;
+    // publication remains best effort.
     //
     // Issue #1766: the credential recovery park captures `credentialFree`. Everything above is unchanged, but
     // the publish opens NO Codex boundary (its reconcile would retry the deferred credential operation) and
     // builds NO overlay (the overlay's default-fetch is PAT-bearing): it is the pause-park sink's
-    // credential-free join-token publish. The caller settled the execution before this capture.
+    // credential-free join-token publish. The matching executor callback remains held throughout.
     // `publish: false` (a run already known terminal) keeps the verified local capture and skips
     // the publish: a terminal run is never resumed from a checkpoint.
     if (opts.credentialFree) {
@@ -19566,10 +19984,38 @@ export class RunRunner {
     }
   }
 
+  /** Bound only the memory-hold observer; the original executor still owns its finally. */
+  private async awaitExecutorWithMemoryDeadline(flight: RunFlight, execution: Promise<ExecutorResult>): Promise<ExecutorResult> {
+    let onHold!: () => void;
+    let observing = false;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      onHold = () => {
+        const memory = flight.workerMemory;
+        if (!memory?.hold || observing) return;
+        observing = true;
+        memory.executorSettled = false;
+        memory.executorRun = execution.then(
+          () => { memory.executorSettled = true; },
+          () => { memory.executorSettled = true; },
+        );
+        // Same absolute hold deadline, no capture/disposal or new authority.
+        void this.joinWorkerMemory(memory.executorRun, memory.hold.deadline).catch(reject);
+      };
+      flight.memoryHoldObserver = onHold;
+      onHold();
+    });
+    try { return await Promise.race([execution, deadline]); }
+    finally { if (flight.memoryHoldObserver === onHold) flight.memoryHoldObserver = undefined; }
+  }
+
   private startWorkerMemoryPreservation(flight: RunFlight): Promise<void> {
     const memory = flight.workerMemory!;
     if (memory.operation) return memory.operation;
+    if (memory.ended) return Promise.resolve();
     const hold = memory.hold!;
+    // A prior refused pause may already have aborted cancel; observe the hold
+    // directly instead of depending on a second AbortController notification.
+    flight.memoryHoldObserver?.();
     // Preparation left tool outcome delivery open. This owner operation now stops
     // only the original model execution; its capture signal is independent.
     flight.cancel.abort(new RetainedRecoveryStop());
@@ -19593,58 +20039,61 @@ export class RunRunner {
         throw new RetainedRecoveryStop();
     };
     try {
+      identity();
       await this.git.withRecoveryOperation(lifecycle, deadline, async signal => {
-        const check = async () => {
-          identity();
-          signal.throwIfAborted();
-          let own: RunOwnershipResponse;
-          try { own = await this.getObservedRunOwnership(flight, signal); }
-          catch (error) {
-            if (isRunOwnershipLost(error, flight.runId)) memory.ownershipRejected = true;
-            throw error;
-          }
-          // Remember the rejection before a concurrent pause makes identity()
-          // throw: settling this operation does not restore its lost authority.
-          if ((own.status !== "running" && !(hold.humanRevision && own.status === "awaiting_approval")) ||
-              own.claim_generation !== context.claim_generation || own.claim_released === true) {
-            memory.ownershipRejected = true;
-            throw new RetainedRecoveryStop();
-          }
-          identity();
-          signal.throwIfAborted();
-        };
-        await check();
-        // Memory parking already stopped the model; settle under the independent owner deadline.
-        const settled = await this.settleForCredentialCapture(flight.executor, Math.max(1, deadline - Date.now()), "cancel");
-        await check();
-        if (settled.kind !== "observed_empty") throw new RetainedRecoveryStop();
-        let captured: RecoveryCaptureResult = { verified: false, published: false };
-        // Three attempts share one deadline. Failure holds this flight; siblings continue.
-        for (let attempt = 0; attempt < 3 && !captured.verified; attempt++) {
-          await check();
-          captured = await this.captureRecoveryRestorePoint(memory.claim, flight, flight.runLog, "recovery_capture", {
-            credentialFree: true, publish: true, signal, beforeMutation: check,
-          });
-        }
-        await check();
-        const delivered = await flight.batcher.flushOwned(signal);
-        await check();
-        if (!delivered || flight.batcher.isTripped() || flight.batcher.bufferedCount() !== 0 ||
-            flight.batcher.isSpilled() || this.outbox?.hasUndrainedMessages(flight.runId) ||
-            memory.feedback.size !== 0) throw new RetainedRecoveryStop();
-        const ack = await flight.reportState({
-          status: "recovery_wait", recovery_cause: "worker_memory_pressure",
-          register_nonce: context.register_nonce, claim_generation: context.claim_generation,
-          memory_episode: context.memory_episode,
-          ...(captured.verified && captured.published ? { checkpoint_contains_latest: true } : {}),
-        }, signal);
         identity();
-        signal.throwIfAborted();
-        const accepted = ack.memoryParkAccepted;
-        if (!accepted || accepted.run_id !== context.run_id || accepted.worker_id !== context.worker_id ||
-            accepted.register_nonce !== context.register_nonce ||
-            accepted.claim_generation !== context.claim_generation ||
-            accepted.memory_episode !== context.memory_episode) throw new RetainedRecoveryStop();
+        const result = await this.runFreeCapture(memory.claim, flight, deadline, signal, async held => {
+          const check = async () => {
+            this.assertHeldFreeCapture(flight, held);
+            identity();
+            signal.throwIfAborted();
+            let own: RunOwnershipResponse;
+            try { own = await this.getObservedRunOwnership(flight, held.signal); }
+            catch (error) {
+              if (isRunOwnershipLost(error, flight.runId)) memory.ownershipRejected = true;
+              throw error;
+            }
+            // Remember the rejection before a concurrent pause makes identity()
+            // throw: settling this operation does not restore its lost authority.
+            if ((own.status !== "running" && !(hold.humanRevision && own.status === "awaiting_approval")) ||
+                own.claim_generation !== context.claim_generation || own.claim_released === true) {
+              memory.ownershipRejected = true;
+              throw new RetainedRecoveryStop();
+            }
+            identity();
+            this.assertHeldFreeCapture(flight, held);
+          };
+          await check();
+          let captured: RecoveryCaptureResult = { verified: false, published: false };
+          // Three attempts share one deadline. Failure holds this flight; siblings continue.
+          for (let attempt = 0; attempt < 3 && !captured.verified; attempt++) {
+            await check();
+            captured = await this.captureRecoveryRestorePoint(memory.claim, flight, flight.runLog, "recovery_capture", {
+              credentialFree: true, heldCapture: held, publish: true, signal: held.signal, beforeMutation: check,
+            });
+          }
+          await check();
+          const delivered = await flight.batcher.flushOwned(held.signal ?? signal);
+          await check();
+          if (!delivered || flight.batcher.isTripped() || flight.batcher.bufferedCount() !== 0 ||
+              flight.batcher.isSpilled() || this.outbox?.hasUndrainedMessages(flight.runId) ||
+              memory.feedback.size !== 0) throw new RetainedRecoveryStop();
+          const ack = await flight.reportState({
+            status: "recovery_wait", recovery_cause: "worker_memory_pressure",
+            register_nonce: context.register_nonce, claim_generation: context.claim_generation,
+            memory_episode: context.memory_episode,
+            ...(captured.verified && captured.published ? { checkpoint_contains_latest: true } : {}),
+          }, held.signal);
+          identity();
+          signal.throwIfAborted();
+          const accepted = ack.memoryParkAccepted;
+          if (!accepted || accepted.run_id !== context.run_id || accepted.worker_id !== context.worker_id ||
+              accepted.register_nonce !== context.register_nonce ||
+              accepted.claim_generation !== context.claim_generation ||
+              accepted.memory_episode !== context.memory_episode) throw new RetainedRecoveryStop();
+          this.assertHeldFreeCapture(flight, held);
+        }, "cancel", "strict");
+        if (result.kind !== "observed_empty") throw new RetainedRecoveryStop();
         flight.parked = true;
       });
     } catch {
@@ -19657,7 +20106,8 @@ export class RunRunner {
     const memory = flight.workerMemory;
     const pause = flight.steering.getPauseMode();
     if (!memory?.hold || (pause !== "now" && pause !== "milestone") ||
-        Date.now() >= memory.hold.deadline || !memory.operation || memory.settled !== true || memory.ownershipRejected ||
+        Date.now() >= memory.hold.deadline || !memory.operation || memory.settled !== true ||
+        (memory.executorRun && !memory.executorSettled) || memory.ownershipRejected ||
         flight.parked || flight.holdOrWallParkConfirmed || flight.stoppedSourceKept ||
         flight.active?.shuttingDown || this.shuttingDownGlobal ||
         flight.steering.isCancelled() || flight.steering.claimFence() !== undefined ||
@@ -19687,6 +20137,7 @@ export class RunRunner {
       deadline).catch(() => {});
     if (memory.closing) await this.joinWorkerMemory(memory.closing, deadline).catch(() => {});
     if (memory.feedback.size || receipts.length || (memory.operation && !memory.settled) ||
+        (memory.executorRun && !memory.executorSettled) ||
         (memory.closing && !memory.closingSettled))
       this.retainWorkerMemoryCustody(flight);
   }
@@ -20390,14 +20841,19 @@ export class RunRunner {
           const check = () => this.requireRetainedOwnership(flight, iteration.deadline, signal);
           await check();
           // Prove the predecessor quiescent before credentialed forge refresh or disk reclamation.
-          const settlement = await this.settleForCredentialCapture(flight.executor, Math.max(1, Math.min(this.codexBoundaryDeadlineMs, iteration.deadline - Date.now())));
+          const quiescence = await this.runFreeCapture(claim, flight,
+            Math.min(iteration.deadline, Date.now() + this.codexBoundaryDeadlineMs), signal, async held => {
+              this.assertHeldFreeCapture(flight, held);
+              const proof = await this.quiesceRun(flight, flight.executor, {
+                mode: "capture", site: "predecessor_capture", targetPaths: [source.clonePath], propagateControl: true,
+              });
+              this.assertHeldFreeCapture(flight, held);
+              return proof;
+            }, "capture", "strict");
           await check();
-          if (settlement.kind !== "observed_empty") { blocker = "quiescence_failed"; throw finalize; }
-          const proof = await this.quiesceRun(flight, flight.executor, {
-            mode: "capture", site: "predecessor_capture", targetPaths: [source.clonePath], propagateControl: true,
-          });
-          await check();
-          if (proof.blocked) { blocker = "quiescence_failed"; throw finalize; }
+          if (quiescence.kind !== "observed_empty" || quiescence.value.blocked) {
+            blocker = "quiescence_failed"; throw finalize;
+          }
           sourceQuiescenceJoined = true;
           this.retainedLifecycleGuard(flight);
           // Command sandbox attribution precedes executor.run() and its safety facade.
@@ -20419,69 +20875,79 @@ export class RunRunner {
           await check();
           await this.git.ensureClone(claim.repo.clone_url, claim.secrets.forge_pat, claim.secrets.forge_username);
           await check();
-          const resumedTip = source.recovery && ["captured", "adopting"].includes(source.recovery.stage)
-            ? source.recovery.restoreTip : undefined;
-          const resumed = resumedTip && await this.git.verifiedRecoveryRestorePoint(bare, branch, key, source, resumedTip);
-          await check();
-          const captured = resumed
-            ? { verified: true, published: await this.publishCheckpointBestEffort(flight, bare, branch, undefined, signal) }
-            : await this.captureRecoveryRestorePoint(claim, flight, flight.runLog, "recovery_capture", {
-              credentialFree: true, beforeMutation: check, signal,
-            });
-          await check();
-          if (captured.residueBlocked) { blocker = "quiescence_failed"; throw finalize; }
-          if (!captured.verified) {
-            if (flight.owedLimitStop) { blocker = "preservation_failed"; throw finalize; }
-            throw new Error("retained local capture is unverified");
-          }
-          let tip = resumed ? resumedTip : await this.git.revParse(bare, `refs/uzi-runner/${branch}`);
-          await check();
-          if (!tip) throw new Error("retained tracking tip unavailable");
-          // issue #3194: the content the restore tip stands for. Plain captures stand for themselves;
-          // a guarded coverage wrapper takes the authenticated capture record's current tip below; a
-          // resumed capture keeps its episode's recorded source (recordRecoveryCapture carries it).
-          let capturedSource: string | undefined = resumed ? undefined : tip;
-
-          // Gate on the real guarded producer, including its verified thin fallback.
-          // Upload ambiguity is separate from positively journaled local bundle facts.
-          if (claim.inventory_guarded === true && this.recovery.enabled) {
-            const options = await this.owedOptions(flight, bare, branch);
-            if (options.context.generation === null) { blocker = "preservation_failed"; throw finalize; }
+          const captureResult = await this.runFreeCapture(claim, flight, iteration.deadline, signal, async held => {
+            const check = async () => {
+              this.assertHeldFreeCapture(flight, held);
+              await this.requireRetainedOwnership(flight, iteration.deadline, held.signal);
+              this.assertHeldFreeCapture(flight, held);
+            };
             await check();
-            const record = await this.recovery.freezeInventory({
-              context: options.context, currentSha: tip, originalSourceSha: tip, locallyQuiescent: true,
-              onCancellationObserved: () => this.observeCancellation(flight),
-              defaultBranch: claim.repo.default_branch?.trim() || await this.git.defaultBranchName(bare) || "main",
-            });
+            const resumedTip = source.recovery && ["captured", "adopting"].includes(source.recovery.stage)
+              ? source.recovery.restoreTip : undefined;
+            const resumed = resumedTip && await this.git.verifiedRecoveryRestorePoint(bare, branch, key, source, resumedTip);
             await check();
-            if (!record) { blocker = "preservation_failed"; throw finalize; }
-            const outcome = await this.recovery.captureAndUpload({
-              onCancellationObserved: () => this.observeCancellation(flight),
-              record: record!, barePath: bare, defaultBranch: record!.defaultBranch!,
-              signal,
-            });
+            const captured = resumed
+              ? { verified: true, published: await this.publishCheckpointBestEffort(flight, bare, branch, undefined, held.signal) }
+              : await this.captureRecoveryRestorePoint(claim, flight, flight.runLog, "recovery_capture", {
+                credentialFree: true, heldCapture: held, beforeMutation: check, signal: held.signal,
+              });
             await check();
-            const local = await this.recovery.verifiedLocalCapture(record!, signal);
-            if (outcome.reason === "oversized") { blocker = "oversize"; throw finalize; }
-            if (!local?.bundlePath || !local.checksum || !Array.isArray(local.prerequisiteShas)) {
-              if (outcome.reason === "bundle_failed" || outcome.reason === "capture_error") throw new Error("local bundle capture temporarily unavailable");
-              blocker = "prerequisites_unavailable"; throw finalize;
+            if (captured.residueBlocked) { blocker = "quiescence_failed"; throw finalize; }
+            if (!captured.verified) {
+              if (flight.owedLimitStop) { blocker = "preservation_failed"; throw finalize; }
+              throw new Error("retained local capture is unverified");
             }
-            // issue #3194: the wrapper -> source mapping comes only from this exact authenticated
-            // record of this run and generation. On a mismatch no captured source is passed, so the wrapper
-            // records itself as its source, which is never attested: the guard holds it (fail closed).
-            capturedSource = local!.runId === claim.run_id && local!.generation === options.context.generation &&
-              local!.inventoryCurrentSha === tip ? local!.inventoryCurrentSha : undefined;
-            tip = local!.sourceSha;
-            for (const prerequisite of local!.prerequisiteShas!) {
-              if (!await this.git.verifyRecoveryClosure(bare, prerequisite)) {
+            let tip = resumed ? resumedTip : await this.git.revParse(bare, `refs/uzi-runner/${branch}`);
+            await check();
+            if (!tip) throw new Error("retained tracking tip unavailable");
+            // issue #3194: the content the restore tip stands for. Plain captures stand for themselves;
+            // a guarded coverage wrapper takes the authenticated capture record's current tip below; a
+            // resumed capture keeps its episode's recorded source (recordRecoveryCapture carries it).
+            let capturedSource: string | undefined = resumed ? undefined : tip;
+
+            // Gate on the real guarded producer, including its verified thin fallback.
+            // Upload ambiguity is separate from positively journaled local bundle facts.
+            if (claim.inventory_guarded === true && this.recovery.enabled) {
+              const options = await this.owedOptions(flight, bare, branch);
+              if (options.context.generation === null) { blocker = "preservation_failed"; throw finalize; }
+              await check();
+              const record = await this.recovery.freezeInventory({
+                context: options.context, currentSha: tip, originalSourceSha: tip, locallyQuiescent: true,
+                onCancellationObserved: () => this.observeCancellation(flight),
+                defaultBranch: claim.repo.default_branch?.trim() || await this.git.defaultBranchName(bare) || "main",
+              });
+              await check();
+              if (!record) { blocker = "preservation_failed"; throw finalize; }
+              const outcome = await this.recovery.captureAndUpload({
+                onCancellationObserved: () => this.observeCancellation(flight),
+                record: record!, barePath: bare, defaultBranch: record!.defaultBranch!,
+                signal: held.signal,
+              });
+              await check();
+              const local = await this.recovery.verifiedLocalCapture(record!, held.signal);
+              if (outcome.reason === "oversized") { blocker = "oversize"; throw finalize; }
+              if (!local?.bundlePath || !local.checksum || !Array.isArray(local.prerequisiteShas)) {
+                if (outcome.reason === "bundle_failed" || outcome.reason === "capture_error") throw new Error("local bundle capture temporarily unavailable");
                 blocker = "prerequisites_unavailable"; throw finalize;
               }
-              await check();
+              // issue #3194: the wrapper -> source mapping comes only from this exact authenticated
+              // record of this run and generation. On a mismatch no captured source is passed, so the wrapper
+              // records itself as its source, which is never attested: the guard holds it (fail closed).
+              capturedSource = local!.runId === claim.run_id && local!.generation === options.context.generation &&
+                local!.inventoryCurrentSha === tip ? local!.inventoryCurrentSha : undefined;
+              tip = local!.sourceSha;
+              for (const prerequisite of local!.prerequisiteShas!) {
+                if (!await this.git.verifyRecoveryClosure(bare, prerequisite)) {
+                  blocker = "prerequisites_unavailable"; throw finalize;
+                }
+                await check();
+              }
             }
-          }
-          await check();
-          await this.git.recordRecoveryCapture(bare, branch, key, source, iteration.attempts, tip, capturedSource);
+            await check();
+            await this.git.recordRecoveryCapture(bare, branch, key, source, iteration.attempts, tip, capturedSource);
+            await check();
+          }, "capture", "strict");
+          if (captureResult.kind !== "observed_empty") { blocker = "quiescence_failed"; throw finalize; }
           await check();
           blocker = "adoption_failed";
           const attemptId = mintAttemptId(claim.claim_generation, new Date(this.now()));
@@ -20502,7 +20968,8 @@ export class RunRunner {
           await check();
           // Capture boundaries may have closed the Codex executor. A new factory instance owns
           // model admission; the predecessor executor never runs the resumed model.
-          if (claim.secrets.codex || flight.executor.safety || flight.executor.settleForCredentialFreeCapture) {
+          if (claim.secrets.codex || flight.executor.safety || flight.executor.sandboxesCommands ||
+              flight.executor.withCredentialFreeCapture || flight.executor.settleForCredentialFreeCapture) {
             blocker = "quiescence_failed";
             await flight.executor.closeAndSettlePlanSummary?.(Math.max(0, Math.min(this.codexBoundaryDeadlineMs, iteration.deadline - Date.now())));
             const disposal = await flight.executor.safety?.dispose({ boundary: "shutdown", deadlineMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, iteration.deadline - Date.now())) });

@@ -727,7 +727,7 @@ fi
 shipping_path_regressions() {
   # shellcheck source=scripts/lib/shipping-paths.sh
   . "$SCRIPTS_DIR/lib/shipping-paths.sh"
-  local expected="agent/src agent/package.json agent/package-lock.json agent/tsconfig.json agent/bin agent/templates agent/devbox-global agent/codex"
+  local expected="agent/src agent/package.json agent/package-lock.json agent/tsconfig.json agent/bin agent/templates agent/devbox-global agent/codex scripts/sqlc.sh"
   assert_eq "shared runtime set stays exact" "$expected" "$AGENT_PATHS"
   local p d out status subject
   for p in $expected; do
@@ -742,8 +742,8 @@ shipping_path_regressions() {
     if is_shipping "$p"; then fail "excluded $p"; else pass "excluded $p"; fi
   done
 
-  # Finite two-case loop: each failure is tallied and the sibling fixture still runs.
-  for p in agent/templates/base/runtime.txt agent/codex/runtime.txt; do
+  # Each failure is tallied and the sibling fixtures still run.
+  for p in agent/templates/base/runtime.txt agent/codex/runtime.txt scripts/sqlc.sh; do
     d="$(mktemp -d)"; seed_repo "$d"
     mkdir -p "$d/$(dirname "$p")"; echo 'runtime change' > "$d/$p"
     git -C "$d" add "$p"

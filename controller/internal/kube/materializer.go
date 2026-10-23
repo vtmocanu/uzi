@@ -101,10 +101,13 @@ type RecyclePolicy struct {
 const pvcBindTimeout = 10 * time.Minute
 
 type Materializer struct {
-	pacing   map[string]*protocol.Pacing
-	client   kubernetes.Interface
-	cfg      RenderConfig
-	resolver preset.Resolver
+	// Unconfirmed migration cordons remain unavailable until a fresh poll
+	// resolves their state. This process-local record is not a write fence.
+	migrationPending map[string]rollCoverage
+	pacing           map[string]*protocol.Pacing
+	client           kubernetes.Interface
+	cfg              RenderConfig
+	resolver         preset.Resolver
 	// cordoner is the api cordon-write channel (PRD #422 M4). Nil disables cordoning;
 	// see Cordoner. Injected the same way as resolver, so tests can drive it.
 	cordoner Cordoner
@@ -624,7 +627,7 @@ func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.Desired
 		e := tick.entries[w.ID]
 		if e != nil {
 			key := coverageKey(e.coverage)
-			if uncertain[key] {
+			if uncertain[key] || migrationLaneFenced(tick, e.coverage) {
 				continue // Unknown mutations require a new observation before sibling work.
 			}
 			if !e.admitted {
@@ -677,6 +680,7 @@ func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.Desired
 			errs = append(errs, fmt.Errorf("teardown %s: %w", o.ID, err))
 		}
 	}
+	m.finalizeMigrationNotice(tick)
 	return errors.Join(errs...)
 }
 
@@ -1053,9 +1057,12 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 	}
 	// Run-workdir layout migration guard (issue #3153), evaluated BEFORE rollDespiteBusy
 	// so it overrides ForceRoll and the paused-restore arm. Replacing an old-layout pod
-	// of a custody-held Docker worker destroys its in-pod run workdir. No patch, and no
-	// cordon or DrainingSince change: the worker keeps serving. layoutNone (pods known
-	// to be absent) is not held, which is what lets a paused worker be restored.
+	// of a custody-held Docker worker destroys its in-pod run workdir. This direct
+	// drift arm never patches or cordons; after ordinary admission, planRoll separately
+	// selects covered image_roll migration drains without admitting replacement.
+	// Retained or uncertain drains consume that owner/lane's migration budget.
+	// layoutNone (pods known to be absent)
+	// is not held, which is what lets a paused worker be restored.
 	// Narrow exception to the emergency ForceRoll; kubelet eviction and node drain
 	// cannot be guarded here.
 	if migrationHeld(w, obs.RunnerLayout) {

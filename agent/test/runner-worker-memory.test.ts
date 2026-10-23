@@ -17,7 +17,17 @@ import { commitInTree } from "./codex-reap-fixture.js";
 import { api, client, git, homeDir, fakeGitlab, gitlabClaim, input, installHarness,
   runnerWith, worktreeDirFor } from "./runner-harness.js";
 
+import { codexRig } from "./runner-codex-sinks-fixture.js";
+
 installHarness();
+
+function realCapture(prepare: () => void | Promise<void> = () => {}): NonNullable<Executor["withCredentialFreeCapture"]> {
+  const rig = codexRig();
+  return (deadlineMs, action, purpose, signal) => rig.capture(deadlineMs, async context => {
+    await prepare();
+    return action(context);
+  }, purpose, signal);
+}
 
 const settings = { enabled: true as const, reserveBytes: 100, hysteresisBytes: 100,
   sampleMs: 2, responseBudgetMs: 200, rearmMs: 10, maxInterventions: 2 };
@@ -259,14 +269,13 @@ for (const verdict of ["empty", "capture_failure", "ambiguous", "rotated", "dead
     let rescueTimer: ReturnType<typeof setTimeout> | undefined;
     fs.writeFileSync(homeDir + "/session-proof", "original session");
     const executor: Executor = {
-      settleForCredentialFreeCapture: async () => {
+      withCredentialFreeCapture: realCapture(async () => {
         const operation = captureScope.getStore();
         assert.ok(operation, "owner settlement runs inside a bounded Git recovery operation");
         operation.ownerCapture = true;
         prepared = true;
         assert.equal(fs.existsSync(homeDir + "/session-proof"), true);
-        return { kind: "observed_empty" };
-      },
+      }),
       run: async ctx => {
         const recoveryOperation = git.withRecoveryOperation.bind(git);
         git.withRecoveryOperation = (signal, deadline, action) => recoveryOperation(signal, deadline,
@@ -359,7 +368,7 @@ for (const verdict of ["accepted", "ambiguous", "generation", "deadline"] as con
     const register = f.memory.commands.register.bind(f.memory.commands);
     f.memory.commands.register = (...args) => { enrollments++; return register(...args); };
     const executor: Executor = {
-      settleForCredentialFreeCapture: async () => ({ kind: "observed_empty" }),
+      withCredentialFreeCapture: realCapture(),
       run: async ctx => {
         try {
           assert.equal(api.states.at(-1)!.body.status, "running",
@@ -656,11 +665,145 @@ for (const fail of [false, true]) {
   });
 }
 
-test("M3 late native park ACK stays owned after deadline and cannot mutate a reclaimed successor", async () => {
+for (const primaryError of [new Error("exact owner failure"), undefined]) {
+  test(`execution owner forwards exact primary rejection with pending completion error=${primaryError !== undefined}`, async () => {
+    const claim = gitlabClaim(2396);
+    const runner = runnerWith(() => ({ executor: { run: async () => {
+      throw new Error("owner-only executor must not run");
+    } } }), fakeGitlab().gitlab);
+    const owner = runner as unknown as {
+      executeClaim: (claim: ClaimResponse, inherited: unknown, own: (operation: Promise<void>) => void) => Promise<void>;
+      executionTails: Map<string, Promise<void>>;
+    };
+    const cleanup = releaseGate();
+    owner.executeClaim = async (_claim, _inherited, own) => {
+      own(cleanup.promise);
+      throw primaryError;
+    };
+    const observation = runner.execute(claim);
+    const tail = owner.executionTails.get(claim.run_id)!;
+    assert.ok(tail, "pending completion is strongly owned by existing map");
+    try {
+      await observation.then(() => assert.fail("expected exact rejection"), error => {
+        assert.equal(error, primaryError);
+        assert.equal(runner.isExecuting(claim.run_id), true);
+        assert.equal(owner.executionTails.get(claim.run_id), tail);
+      });
+      assert.equal(runner.isExecuting(claim.run_id), true);
+    } finally {
+      cleanup.resolve();
+      await tail;
+    }
+    assert.equal(runner.isExecuting(claim.run_id), false);
+  });
+}
+
+for (const rejects of [false, true]) {
+  test(`non-memory executor observation preserves settlement and exact error rejected=${rejects}`, async () => {
+    const runner = runnerWith(() => ({ executor: { run: async () => assert.fail("unused executor") } }), fakeGitlab().gitlab);
+    const owner = runner as unknown as {
+      awaitExecutorWithMemoryDeadline(flight: unknown, execution: Promise<unknown>): Promise<unknown>;
+    };
+    const gate = releaseGate(), cancel = new AbortController();
+    const memory: { executorRun?: Promise<void> } = {};
+    const result = {}, primary = new Error("exact non-memory executor failure");
+    const execution = gate.promise.then(() => { if (rejects) throw primary; return result; });
+    const observing = owner.awaitExecutorWithMemoryDeadline({ cancel, workerMemory: memory }, execution);
+    let settled = false;
+    void observing.then(() => { settled = true; }, () => { settled = true; });
+    try {
+      cancel.abort(new Error("ordinary cancellation"));
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(settled, false, "non-memory cancellation cannot detach executor cleanup");
+      assert.equal(memory.executorRun, undefined, "no memory ownership is invented without a hold");
+      gate.resolve();
+      if (rejects) await assert.rejects(observing, error => error === primary);
+      else assert.equal(await observing, result);
+    } finally {
+      gate.resolve();
+      await observing.catch(() => {});
+    }
+  });
+}
+
+test("memory hold after an earlier pause abort still bounds the executor observer", async t => {
+  const runner = runnerWith(() => ({ executor: { run: async () => assert.fail("unused executor") } }), fakeGitlab().gitlab);
+  const owner = runner as any;
+  const execution = releaseGate(), cleanup = releaseGate();
+  const cancel = new AbortController();
+  const priorPause = new PauseNowSignal();
+  cancel.abort(priorPause);
+  const memory: any = { ended: false };
+  const flight = { cancel, workerMemory: memory };
+  t.mock.method(owner, "preserveWorkerMemory", async () => cleanup.promise);
+  let returned = false, failure: unknown;
+  const observation = owner.awaitExecutorWithMemoryDeadline(flight, execution.promise).catch((error: unknown) => {
+    returned = true; failure = error;
+  });
+  memory.hold = { deadline: Date.now() - 1 };
+  const operation = owner.startWorkerMemoryPreservation(flight);
+  try {
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(returned, true, "the original spent hold deadline stops observation despite an already-aborted signal");
+    assert.equal((failure as Error).constructor.name, "RetainedRecoveryStop");
+    assert.equal(cancel.signal.reason, priorPause);
+    assert.notEqual(memory.executorSettled, true, "the original executor remains owned");
+    assert.notEqual(memory.settled, true, "the original capture remains owned");
+  } finally {
+    execution.resolve(); cleanup.resolve();
+    await observation; await operation;
+  }
+});
+
+test("execution owner ordinary observation follows tail deletion", async () => {
+  const claim = gitlabClaim(2396);
+  const runner = runnerWith(() => ({ executor: { run: async () => {
+    throw new Error("owner-only executor must not run");
+  } } }), fakeGitlab().gitlab);
+  const owner = runner as unknown as {
+    executeClaim: () => Promise<void>;
+    executionTails: Map<string, Promise<void>>;
+  };
+  owner.executeClaim = async () => {};
+  const observation = runner.execute(claim);
+  const tail = owner.executionTails.get(claim.run_id)!;
+  assert.ok(tail);
+  await observation.then(() => {
+    assert.equal(owner.executionTails.has(claim.run_id), false);
+    assert.equal(runner.isExecuting(claim.run_id), false);
+  });
+  await tail;
+});
+
+for (const claimCredential of [true, false]) {
+test(`M3 late native park ACK stays owned after deadline and cannot mutate a reclaimed successor credential=${claimCredential}`, async () => {
   const f = await setup(1);
+  const successorCredential = f.claim.secrets.codex;
   const monitoring = f.memory.run();
   const release = releaseGate();
   const successorRelease = releaseGate();
+  const cleanupRelease = releaseGate();
+  const duplicateRelease = releaseGate();
+  const captureReturnedGate = releaseGate();
+  const duplicateEnteredGate = releaseGate();
+  const rig = codexRig();
+  let fullReapCompleted = false;
+  const provider = rig.registry.reserveLaunch("provider");
+  assert.equal(provider.kind, "reserved");
+  if (provider.kind !== "reserved") throw new Error("provider reservation refused");
+  rig.registry.registerRoot(provider.reservation, {
+    kind: "provider",
+    reap: async () => {
+      fullReapCompleted = false;
+      await Promise.resolve();
+      fullReapCompleted = true;
+      return { ok: true };
+    },
+    dispose: async () => {},
+  });
+  let captureContext: Parameters<Parameters<typeof rig.capture>[1]>[0] | undefined;
+  let captureReturned = false, protectedScope: boolean | undefined, duplicateEntered = false;
+  let queuedWork: Promise<void> | undefined;
   const originalReadiness = git.normalizeRetainedSourceObjects;
   let readiness = 0;
   let original: MemoryFlightProof | undefined;
@@ -683,13 +826,30 @@ test("M3 late native park ACK stays owned after deadline and cannot mutate a rec
     return ack;
   };
   fs.writeFileSync(homeDir + "/session-proof", "original session");
-  git.worktreeStatus = async () => ["M fixture"];
+  git.worktreeStatus = async () => {
+    protectedScope ??= captureContext !== undefined && !captureContext.signal.aborted &&
+      rig.registry.state() === "poisoned" && rig.registry.pendingLaunchCount() === 0 &&
+      rig.registry.inFlightCallbackCount() === 0 && fullReapCompleted;
+    return ["M fixture"];
+  };
   git.commitWipMarker = async () => false;
   const executor: Executor = {
-    settleForCredentialFreeCapture: async () => ({ kind: "observed_empty" }),
+    withCredentialFreeCapture: async (deadline, action, purpose, signal) => {
+      try {
+        return await rig.capture(deadline, async context => {
+          captureContext = context;
+          return action(context);
+        }, purpose, signal);
+      } finally {
+        captureReturned = true;
+        captureReturnedGate.resolve();
+        await cleanupRelease.promise;
+      }
+    },
     run: async ctx => {
       const command = enroll(ctx);
       original = command.captured.flight as MemoryFlightProof;
+      if (!claimCredential) delete f.claim.secrets.codex;
       started = performance.now();
       f.pressure(950);
       const result = await command.captured.commands.watchOutcome(command.entry);
@@ -706,9 +866,12 @@ test("M3 late native park ACK stays owned after deadline and cannot mutate a rec
     await work;
     assert.ok(started !== undefined, "elapsed clock anchored at the pressure trigger");
     assert.ok(performance.now() - started < 1500, "runner deadline does not wait for uncooperative park return");
+    assert.equal(protectedScope, true, "fake protected source runs inside real drained capture scope");
+    assert.equal(captureReturned, false, "ACK still holds actual capture callback");
     const operation = original!.workerMemory!.operation!;
     assert.ok(operation, "original preservation promise remains on its flight");
     assert.notEqual(original!.workerMemory!.settled, true, "original work has not settled");
+    assert.equal(runner.isExecuting(f.claim.run_id), true, "execution tail owns the pending original capture");
     assert.equal(parkSignal!.aborted, true);
     assert.notEqual(original!.parked, true, "native acceptance alone cannot mark an expired flight parked");
     assert.equal(original!.retainedLocalCustody, true);
@@ -717,15 +880,29 @@ test("M3 late native park ACK stays owned after deadline and cannot mutate a rec
     assert.equal(api.states.filter(s => s.body.recovery_cause === "worker_memory_pressure").length, 1);
     assert.equal(api.messages(f.claim.run_id).filter(m => m.payload.event === "worker_memory_pressure").length, 1);
 
+    assert.deepEqual(await runner.withRetainedSourceBoundary(f.claim.run_id, [], async () => {
+      return "unexpected maintenance entry";
+    }), { entered: false }, "maintenance refuses before lock/capture acquisition");
+    const duplicateGate = runner as unknown as { gateQueuedDuplicate: () => Promise<boolean> };
+    duplicateGate.gateQueuedDuplicate = async () => {
+      duplicateEntered = true;
+      duplicateEnteredGate.resolve();
+      await duplicateRelease.promise;
+      return false;
+    };
+    queuedWork = runner.execute(f.claim);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(duplicateEntered, false, "same-run duplicate cannot reach its gate while ACK is pending");
     f.pressure(100);
     git.worktreeStatus = async () => [];
     api.memoryRegisterNonce = "successor-memory-registration";
     await client.register("memory-fixture", "base");
-    const next = { ...f.claim, claim_generation: 8, memory_episode: 4, memory_intervention_count: 1 };
+    const next = { ...f.claim, secrets: { ...f.claim.secrets, codex: successorCredential },
+      claim_generation: 8, memory_episode: 4, memory_intervention_count: 1 };
     api.setOwnershipStatus(next.run_id, "running", 8);
     // Host-only successor models the Codex sandbox profile with readiness already satisfied.
     git.normalizeRetainedSourceObjects = async () => { readiness++; };
-    const nextExecutor: Executor = { sandboxesCommands: true, run: async ctx => {
+    const nextExecutor: Executor = { sandboxesCommands: true, withCredentialFreeCapture: realCapture(), run: async ctx => {
       assert.equal(readiness, 1, "retained readiness completed before successor admission");
       successor = ctx.capturedMemory!();
       await successorRelease.promise;
@@ -754,7 +931,19 @@ test("M3 late native park ACK stays owned after deadline and cannot mutate a rec
     assert.notEqual(original!.workerMemory!.settled, true, "controlled release, not rescue, settles old park");
     const nextParked = nextFlight.parked;
     release.resolve();
+    await captureReturnedGate.promise;
+    assert.equal(captureReturned, true, "actual capture has returned before wrapper cleanup");
+    assert.equal(captureContext!.signal.aborted, true);
+    assert.notEqual(original!.workerMemory!.settled, true, "ACK return is not full wrapper cleanup");
+    assert.equal(duplicateEntered, false, "tail also owns delayed scope wrapper cleanup");
+    assert.equal(runner.isExecuting(f.claim.run_id), true);
+    cleanupRelease.resolve();
     await operation;
+    await duplicateEnteredGate.promise;
+    assert.equal(runner.isExecuting(f.claim.run_id), true, "old owner cannot delete replacement tail");
+    duplicateRelease.resolve();
+    await queuedWork;
+    assert.equal(runner.isExecuting(f.claim.run_id), false, "replacement releases only after owned join");
     assert.equal(original!.workerMemory!.operation, operation, "late completion settles the same original promise");
     assert.equal(original!.workerMemory!.settled, true);
     assert.notEqual(original!.parked, true);
@@ -765,16 +954,20 @@ test("M3 late native park ACK stays owned after deadline and cannot mutate a rec
   } finally {
     clearTimeout(rescue);
     release.resolve();
+    cleanupRelease.resolve();
+    duplicateRelease.resolve();
     successorRelease.resolve();
     await work;
     await original?.workerMemory?.operation;
     await original?.workerMemory?.closing;
     await successorWork;
+    await queuedWork;
     git.normalizeRetainedSourceObjects = originalReadiness;
     await f.memory.stop(); await monitoring;
     await Promise.allSettled(f.memory.sinkReceipts.map(receipt => receipt.completion));
   }
 });
+}
 
 for (const interruption of ["registration", "generation", "shutdown", "cancel"] as const) {
   test(`M3 capture interruption ${interruption} keeps original custody and prevents stale mutations`, async () => {
@@ -784,7 +977,7 @@ for (const interruption of ["registration", "generation", "shutdown", "cancel"] 
     let original: MemoryFlightProof | undefined;
     let reads = 0, writes = 0, fetches = 0;
     const executor: Executor = {
-      settleForCredentialFreeCapture: async () => ({ kind: "observed_empty" }),
+      withCredentialFreeCapture: realCapture(),
       run: async ctx => {
         const recover = git.withRecoveryOperation.bind(git);
         git.withRecoveryOperation = (signal, deadline, action) =>
@@ -1276,7 +1469,7 @@ for (const phase of ["drain", "feedback", "preserve"] as const) {
       return recover(signal, deadline, action);
     };
     const executor: Executor = {
-      settleForCredentialFreeCapture: async () => ({ kind: "observed_empty" }),
+      withCredentialFreeCapture: realCapture(),
       run: async ctx => {
         const captured = ctx.capturedMemory!()!;
         original = captured.flight as MemoryFlightProof;
@@ -1348,14 +1541,13 @@ for (const mode of ["now", "milestone"] as const) for (const originalFailure of 
     let pauseSent = false;
     fs.writeFileSync(homeDir + "/pause-session-proof", "retained session");
     const executor: Executor = {
-      settleForCredentialFreeCapture: async () => {
+      withCredentialFreeCapture: realCapture(async () => {
         if (!pauseSent) {
           pauseSent = true;
           api.appendInputs(f.claim.run_id, [input("pause", mode)]);
           await until(() => context?.pauseModeRequested?.() === mode);
         }
-        return { kind: "observed_empty" };
-      },
+      }),
       run: async ctx => {
         context = ctx;
         try {
@@ -1401,7 +1593,7 @@ for (const scenario of ["wall", "disk", "withdrawn", "cancel", "shutdown", "clai
     let runner: ReturnType<typeof runnerWith>;
     fs.writeFileSync(homeDir + "/pause-session-proof", "retained session");
     const executor: Executor = {
-      settleForCredentialFreeCapture: async () => {
+      withCredentialFreeCapture: realCapture(async () => {
         entered = true;
         if (scenario !== "already-parked") {
           api.appendInputs(f.claim.run_id, [input("pause", scenario === "wall" ? "wall" : "now")]);
@@ -1426,8 +1618,7 @@ for (const scenario of ["wall", "disk", "withdrawn", "cancel", "shutdown", "clai
           if (scenario === "unsettled") await release.promise; // Deliberately ignore cancellation.
           if (scenario === "expired") await new Promise(resolve => setTimeout(resolve, 250));
         }
-        return { kind: "observed_empty" };
-      },
+      }),
       run: async ctx => {
         context = ctx;
         try {
@@ -1483,7 +1674,7 @@ for (const rejection of ["generation", "non-running", "released", "not-owned"] a
     const fetch = git.fetchAgentBranch.bind(git);
     const publish = client.publishCheckpoint.bind(client);
     const executor: Executor = {
-      settleForCredentialFreeCapture: async () => ({ kind: "observed_empty" }),
+      withCredentialFreeCapture: realCapture(),
       run: async ctx => {
         try {
           const command = enroll(ctx);
@@ -1536,6 +1727,55 @@ for (const rejection of ["generation", "non-running", "released", "not-owned"] a
   });
 }
 
+
+test("terminal observation stays on the exact tail through owned memory and queued duplicates", async () => {
+  const claim = gitlabClaim(2396);
+  const runner = runnerWith(() => ({ executor: { run: async () => { throw new Error("unused"); } } }), fakeGitlab().gitlab);
+  const owner = runner as any;
+  const cleanup = releaseGate();
+  const observation = { terminal: "normal_failed", family: { original: "source" } };
+  const inherited: unknown[] = [];
+  let first = true, registered = 0, released = false;
+  let registrationState: unknown;
+  owner.gateQueuedDuplicate = async () => true;
+  owner.refreshQueuedClaimCursor = async (value: ClaimResponse) => value;
+  owner.executeClaim = async (_claim: ClaimResponse, previous: unknown, own: (operation: Promise<void>) => void) => {
+    inherited.push(previous);
+    if (!first) return;
+    first = false;
+    own(cleanup.promise);
+    return observation;
+  };
+  const publicFirst = runner.execute(claim);
+  const firstTail = owner.executionTails.get(claim.run_id);
+  void firstTail.then(() => { released = true; });
+  owner.recovery.resumeTerminalSource = async (_id: string, exact: Promise<unknown>) => {
+    registered++;
+    assert.equal(exact, firstTail);
+    assert.equal(released, false, "recovery is registered before tail resolution");
+    assert.notEqual(owner.executionTails.get(claim.run_id), firstTail, "a queued successor owns the map entry");
+    registrationState = await Promise.race([exact, Promise.resolve("pending at registration")]);
+    assert.equal(await exact, observation);
+  };
+  const publicSecond = runner.execute(claim);
+  const secondTail = owner.executionTails.get(claim.run_id);
+  const publicThird = runner.execute(claim);
+  const thirdTail = owner.executionTails.get(claim.run_id);
+  try {
+    await publicFirst;
+    assert.deepEqual(inherited, [undefined]);
+    assert.equal(registered, 0, "memory cleanup precedes recovery registration");
+    assert.equal(released, false);
+    assert.equal(owner.executionTails.get(claim.run_id), thirdTail);
+  } finally { cleanup.resolve(); }
+  assert.equal(await firstTail, observation);
+  await Promise.all([publicSecond, publicThird, secondTail, thirdTail]);
+  assert.deepEqual(inherited, [undefined, observation, undefined]);
+  assert.equal(registered, 1);
+  assert.equal(registrationState, "pending at registration", "recovery registration precedes promise resolution");
+  assert.equal(runner.isExecuting(claim.run_id), false);
+});
+
 // Issue #3240: a pause that cannot publish (nothing durable yet) reports pause_failed and the run
 // KEEPS RUNNING (Decision 8). pause_failed is a diagnostic, not a lifecycle change: the context the
 // Codex broker captured before the pause must stay exactly as it was, immediately after the failed
@@ -1549,16 +1789,17 @@ function snapshot(c: NonNullable<ReturnType<NonNullable<RunContext["capturedMemo
     remaining: c.commands.remaining(c.context),
   };
 }
-async function memoryRun(f: Awaited<ReturnType<typeof setup>>, body: (ctx: RunContext) => Promise<void>) {
+async function memoryRun(f: Awaited<ReturnType<typeof setup>>, body: (ctx: RunContext) => Promise<void>,
+  capture?: NonNullable<Executor["withCredentialFreeCapture"]>) {
   const monitoring = f.memory.run();
   let executorError: unknown, proof = false;
-  const executor: Executor = { run: async ctx => {
+  const executor: Executor = { withCredentialFreeCapture: capture, run: async ctx => {
     try { await body(ctx); proof = true; } catch (error) { executorError = error; throw error; }
     throw new Error("fixture proof complete");
   } };
   try {
     await runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined,
-      { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 1000 }).execute(f.claim);
+      { memoryRuntime: f.memory, codexBoundaryDeadlineMs: capture ? 30_000 : 1000 }).execute(f.claim);
   } catch (error) {
     // A body assertion failure wins over the runner's own rejection (e.g. a tolerated StaleClaimError).
     throw executorError ?? error;
@@ -1634,7 +1875,7 @@ test("a pause that parks still retires the captured memory context", async () =>
       assert.equal(await ctx.parkForPause!({ completedCount: 0, total: 1 }), true, "a publishable pause parks");
       assert.equal(before.commands.isCurrent(before.context, before.flight, before.lifecycleRevision), false,
         "a real park retires the context");
-    });
+    }, realCapture());
   } finally {
     (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = publish;
   }

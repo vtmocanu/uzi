@@ -27,7 +27,8 @@ case "$*" in
   "run get "*" --json")
     jq -n --arg h "$(pollfile health)" --arg w "$(cat "$WORK/worker_id")" --arg since "$(cat "$WORK/since" 2>/dev/null || true)" \
       --arg c "$(cat "$WORK/cause" 2>/dev/null || true)" \
-      '{status:"running",recovery_wait_cause:(if $c=="" then null else $c end),health:$h,health_reason:(if $h=="stalled" then "no progress 20m" else null end),health_since:(if $h=="ok" then null else ($since|if .=="" then null else . end) end),worker_id:(if $w=="" then null else $w end)}'
+      --arg hr "$(cat "$WORK/hold" 2>/dev/null || true)" \
+      '{status:"running",hold_reason:(if $hr=="" then null else $hr end),recovery_wait_cause:(if $c=="" then null else $c end),health:$h,health_reason:(if $h=="stalled" then "no progress 20m" else null end),health_since:(if $h=="ok" then null else ($since|if .=="" then null else . end) end),worker_id:(if $w=="" then null else $w end)}'
     mv "$WORK/poll.next" "$WORK/poll" ;;
   "worker list --json") cat "$WORK/workers" ;;
   *) echo "unexpected uzi call: $*" >&2; exit 1 ;;
@@ -36,7 +37,7 @@ STUB
 chmod +x "$WORK/bin/uzi"
 
 # scenario NAME STATUSES HEALTHS WORKER_ID WORKERS_JSON
-reset() { rm -f "$WORK/since" "$WORK/cause"; printf '%s\n' "$1" > "$WORK/status"; printf '%s\n' "$2" > "$WORK/health"; printf '%s' "$3" > "$WORK/worker_id"; printf '%s\n' "$4" > "$WORK/workers"; rm -f "$WORK/poll" "$WORK/poll.next"; echo 0 > "$WORK/poll"; }
+reset() { rm -f "$WORK/since" "$WORK/cause" "$WORK/hold"; printf '%s\n' "$1" > "$WORK/status"; printf '%s\n' "$2" > "$WORK/health"; printf '%s' "$3" > "$WORK/worker_id"; printf '%s\n' "$4" > "$WORK/workers"; rm -f "$WORK/poll" "$WORK/poll.next"; echo 0 > "$WORK/poll"; }
 run() { PATH="$WORK/bin:$PATH" bash "$SCRIPT" rid completed,failed,cancelled 0 "${1:-6}" 2>/dev/null; }
 fresh=$(date -u +%Y-%m-%dT%H:%M:%S.123456Z)
 old=$(date -u -d '-1 hour' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-1H +%Y-%m-%dT%H:%M:%SZ)
@@ -164,5 +165,20 @@ echo provider_outage > "$WORK/cause"
 rc=0; out=$(run) || rc=$?
 [ "$rc" -eq 3 ] || fail "timed recovery_wait should expire: $rc: $out"
 case "$out" in *STOP=*) fail "timed recovery_wait stopped: $out";; esac
+
+# 14. paused always stops (exit 0) with its hold_reason, even outside the stop set:
+#     a paused run never resumes on its own (#3304/#3303 parks sat unseen behind a terminal-only watch).
+reset "$(printf 'running\npaused')" ok "" '[]'
+echo budget_exhausted > "$WORK/hold"
+rc=0; out=$(run) || rc=$?
+[ "$rc" -eq 0 ] || fail "paused: want exit 0, got $rc: $out"
+case "$out" in *"status=paused"*"STOP=paused"*"hold_reason=budget_exhausted"*) ;; *) fail "paused stop line missing: $out";; esac
+case "$out" in *"RESULT=stop:paused") ;; *) fail "paused result missing: $out";; esac
+
+# 14b. the defaulted stop set stops on paused too
+reset paused ok "" '[]'
+rc=0; out=$(PATH="$WORK/bin:$PATH" WATCH_ATTENTION_POLLS=0 bash "$SCRIPT" rid "" 0 3) || rc=$?
+[ "$rc" -eq 0 ] || fail "default stop set paused: want exit 0, got $rc: $out"
+case "$out" in *"hold_reason=unknown"*"RESULT=stop:paused") ;; *) fail "default paused stop missing: $out";; esac
 
 echo "PASS: watch-run attention stop"

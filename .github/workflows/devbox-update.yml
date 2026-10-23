@@ -124,9 +124,18 @@ jobs:
         working-directory: agent/devbox-global
         run: |
           set -euo pipefail
+          cp devbox.lock "${RUNNER_TEMP}/worker-go-lock-before.json"
           for attempt in 1 2 3; do
             rm -f devbox.lock
-            if devbox update --no-install; then exit 0; fi
+            if devbox update --no-install; then
+              # Never publish a lock whose keys disagree with the committed manifest.
+              git diff --exit-code -- devbox.json
+              # An immutable flake has the same outputs after a full relock. Devbox omits
+              # their metadata; reuse it only if the complete resolved ref is unchanged.
+              python3 ../../scripts/check-worker-toolchain.py \
+                --restore-go-metadata "${RUNNER_TEMP}/worker-go-lock-before.json"
+              exit 0
+            fi
             if [ "${attempt}" -lt 3 ]; then
               echo "devbox update attempt ${attempt} failed; retrying after backoff..." >&2
               sleep "$((attempt * 20))"

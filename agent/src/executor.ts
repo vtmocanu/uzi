@@ -8,7 +8,7 @@ import type { Logger } from "./log.js";
 import type { CapturedMemoryContext } from "./codex/broker.js";
 import type { UsageSink } from "./usage-recorder.js";
 import type { RunCacheDropResult } from "./run-caches.js";
-import type { BoundarySink, CodexExecutionSafety, HarnessError } from "./harness.js";
+import type { BoundarySink, CodexExecutionSafety, CredentialFreeCaptureContext, HarnessError } from "./harness.js";
 import type {
   AgentSelection,
   AgentSource,
@@ -1021,6 +1021,17 @@ export interface Executor {
    * executor lacks it, and treats a legacy executor's `killAgentTree` reap as settled).
    */
   settleForCredentialFreeCapture?(deadlineMs: number, purpose?: "capture" | "cancel"): Promise<CredentialFreeSettleOutcome>;
+  /** Hold executor admission closed through the restricted capture callback and child drain.
+   * Acquisition failure returns incomplete with secret-free errors. Once the callback starts,
+   * its failure is preserved as a rejection. Expiry/cancellation never detaches owned cleanup.
+   */
+  withCredentialFreeCapture?<T>(
+    deadlineMs: number,
+    action: (context: CredentialFreeCaptureContext) => Promise<T>,
+    purpose?: "capture" | "cancel",
+    signal?: AbortSignal,
+    attempt?: Readonly<SdkAttemptEnv>,
+  ): Promise<{ kind: "observed_empty"; value: T } | { kind: "incomplete"; errors: readonly HarnessError[] }>;
 }
 
 /** Issue #1766: the result of {@link Executor.settleForCredentialFreeCapture}. */

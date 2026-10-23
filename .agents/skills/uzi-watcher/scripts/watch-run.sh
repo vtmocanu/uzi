@@ -14,6 +14,7 @@
 # Usage: watch-run.sh <run-id> [stop-csv] [interval-secs] [max-polls] [min-plan-seq]
 #   stop-csv (default) covers a plan gate, a question park, and every terminal
 #   state: completed,failed,cancelled,awaiting_approval,awaiting_input
+#   (`paused` and recovery_wait/worker_requeue_exhausted always stop; see below)
 #   For "watch to the end only" (after you have approved), pass:
 #     watch-run.sh <id> completed,failed,cancelled 60
 #
@@ -54,6 +55,9 @@
 # stop set (also when the stop set names recovery_wait): STOP=recovery_wait:worker_requeue_exhausted,
 # RESULT=stop:recovery_wait, exit 0. Other recovery_wait causes keep their existing behaviour: they
 # keep polling unless the stop set names recovery_wait.
+# `paused` never resumes on its own either (an owner pause, or hold_reason budget_exhausted /
+# completion hold that needs extend, resume or decide), so it always stops the watch, whatever the
+# stop set: STOP=paused, a NOTE with hold_reason, RESULT=stop:paused, exit 0.
 # Exit codes: 0 stop-set state (not necessarily success), 3 coverage elapsed,
 # 4 needs_attention. The final RESULT line distinguishes these outcomes.
 set -u
@@ -133,6 +137,14 @@ while [ "$i" -lt "$MAX" ]; do
       printf 'RESULT=stop:recovery_wait\n'
       exit 0
     fi
+  fi
+  if [ "$s" = paused ]; then
+    rj="$(uzi run get "$RID" --json 2>/dev/null)" || rj=""
+    hr="$(printf '%s' "$rj" | jq -r '.hold_reason // ""' 2>/dev/null)" || hr=""
+    printf 'STOP=paused\n'
+    printf 'NOTE paused never resumes on its own: hold_reason=%s; read it, then extend, resume, decide or wait for the owner\n' "${hr:-unknown}"
+    printf 'RESULT=stop:paused\n'
+    exit 0
   fi
   case ",$STOP," in
     *",$s,"*)

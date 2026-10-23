@@ -1,4 +1,5 @@
-# Generated artifacts — regenerate with `devbox run build`. Kept out of git because
+# Generated artifacts — ./build.sh in provisioned runs; devbox run build locally.
+# Kept out of git because
 # they are large binaries derived deterministically from the committed harness.
 frames/
 png/
