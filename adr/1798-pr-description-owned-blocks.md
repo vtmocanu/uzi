@@ -2,7 +2,7 @@
 
 **Status**: Accepted (PRD #1798, M1-M7 implemented; M8 docs/spec/ADR)
 **Date**: 2026-09-28
-**PRD**: [prds/1798-plain-english-pr-descriptions.md](../prds/1798-plain-english-pr-descriptions.md) — carries the full milestone breakdown and Decision Log D1-D17; this ADR restates the invariants a future edit to the renderer, the publisher or the completion interlock would otherwise break silently.
+**PRD**: [prds/done/1798-plain-english-pr-descriptions.md](../prds/done/1798-plain-english-pr-descriptions.md) — carries the full milestone breakdown and Decision Log D1-D17; this ADR restates the invariants a future edit to the renderer, the publisher or the completion interlock would otherwise break silently.
 **Related**: [ADR-1225](1225-structural-completion-interlock-invariants.md) (the completion interlock this PRD's renderer and publisher sit beside; ADR-1225's I4 is amended by this PRD, see its addendum).
 
 ## Decision (summary)
@@ -62,7 +62,7 @@ An `mr_rework` run, or a `ci_fix` that adopts an existing agent branch rather th
 
 ## Addendum (2026-10-02): PRD #1840 diagrams
 
-[PRD #1840](../prds/1840-pr-description-diagrams.md) D1 makes a diagram ordinary content inside I1's existing
+[PRD #1840](../prds/done/1840-pr-description-diagrams.md) D1 makes a diagram ordinary content inside I1's existing
 description region, after "What changed" and before "Verification"; it
 creates no third owned block and inherits I1's edit protection and
 precedence. The grounded editor returns structured nodes and edges, never

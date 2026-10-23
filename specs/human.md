@@ -710,7 +710,7 @@ ADR at `adr/0035-run-limit-retry.md`.
 
 ## Feature #1190 — Pause and resume a run on demand
 
-Tracked as GitHub issue vtmocanu/uzi#1190; PRD at `prds/1190-run-pause-resume.md`.
+Tracked as GitHub issue vtmocanu/uzi#1190; PRD at `prds/done/1190-run-pause-resume.md`.
 
 - A run's owner can pause it (after the current milestone, or at once) and resume it later; the run parks on a pushed checkpoint, spends nothing while paused, and its budget clock stops. [user, #1190]
 - #2852 slice A contract: Codex continuation after a possibly drained failed/withdrawn pause requires proven cleanup before saved-session epoch recreation under Feature #1783. Accepted B1 instead stops nonterminally on unproven cleanup for the exact refused/unacknowledged owner-pause safety facade, retaining clone/session/journal/custody without a new in-run epoch or failed terminal report. Subsequent execution depends on existing in-budget requeue or owner Resume/hold policy; retained-source recovery uses a fresh attempt path/model session, not the old model thread. (AI-synced 2026-10-22)
@@ -760,7 +760,7 @@ Tracked as GitLab issue vtmocanu/uzi#218; PRD at `prds/done/218-park-resume-work
 
 ## Feature #1392 — Park a run on a transient forge failure at clone or fetch
 
-Tracked as GitHub issue vtmocanu/uzi#1392; PRD at `prds/1392-forge-unreachable-preclone-park.md`.
+Tracked as GitHub issue vtmocanu/uzi#1392; PRD at `prds/done/1392-forge-unreachable-preclone-park.md`.
 
 - A transient forge failure (DNS/connect/5xx) at clone or fetch parks the run and auto-resumes it, rather than failing it; it fails only after a bounded number of forge parks (`RUN_FORGE_UNREACHABLE_MAX_PARKS`). A permanent forge error (401/403/404) still fails at once. [user 2026-09-15, PRD #1392]
 
@@ -792,7 +792,7 @@ decision on this feature is the team's and lives in `specs/ai.md` §448-§454.
 
 ## Feature #201 — Builtin agent-template drift signal
 
-Tracked as GitLab issue vtmocanu/uzi#201; PRD at `prds/201-builtin-drift-signal.md`.
+Tracked as GitLab issue vtmocanu/uzi#201; PRD at `prds/done/201-builtin-drift-signal.md`.
 Issue #201's body plus its note_22449 comment (2026-08-03) are the settled design
 for the whole of #201; this milestone (M4a) is the drift signal only.
 
@@ -848,7 +848,7 @@ Completes Feature #64/#175: `uzi version` reported both versions and never compa
 
 ## Feature #325 — TUI redesign ("factory shift board")
 
-Tracked as GitLab issue vtmocanu/uzi#325; PRD at `prds/325-tui-redesign.md`.
+Tracked as GitLab issue vtmocanu/uzi#325; PRD at `prds/done/325-tui-redesign.md`.
 Redesigns the shipped `uzi tui` (PRD #112). TUI/CLI-only.
 
 - The shipped TUI looked bad; redesign it to convey run status and support live-following legibly. [user 2026-08-15]
@@ -977,13 +977,13 @@ Tracked as GitHub issue vtmocanu/uzi#1226 (parent epic #1225); PRD at `prds/done
 
 ## Feature #1265 — RC-first release train
 
-Tracked as GitHub issue vtmocanu/uzi#1265; PRD at `prds/1265-rc-release-train.md`.
+Tracked as GitHub issue vtmocanu/uzi#1265; PRD at `prds/done/1265-rc-release-train.md`.
 
 - Releases are cut as release candidates by default; a stable release is promoted from the candidate's own commit. Stable-facing update surfaces (the `uzi-cli` formula, the GitHub Release marked latest, and the TUI update prompt for stable installs) never surface a candidate; the `uzi-cli-rc` formula and its TUI prompt follow the newer of stable and RC releases without changing formula ownership. Unknown-owner RC builds get the same selection with release notes only. Tap writes skip equal/older versions and refuse unreadable or malformed current versions. (AI-synced 2026-10-03, #2180)
 
 ## Feature #1349 — Recovery custody hardening
 
-Tracked as GitHub issue vtmocanu/uzi#1349; PRD at `prds/1349-recovery-custody-hardening.md`.
+Tracked as GitHub issue vtmocanu/uzi#1349; PRD at `prds/done/1349-recovery-custody-hardening.md`.
 
 - An owner can see retained unpublished committed work, recover an available archive, and explicitly discard one exact held source only after a warning distinguishes recoverable work from a possible only copy. [AI-synced 2026-09-14, #1349]
 - An older generation's custody hold adopted by a same-worker resume is released automatically on server-proven ancestry of its candidate commits against the completed run's published branch head (or, as before, once its own capture is durably archived); otherwise it is retained. [AI-synced 2026-09-24, #1582] For inventory-guarded holds, an archive with prerequisites does not authorize final custody release; the source remains retained until a verified final disposition or an explicit owner discard, except that an eligible completed issue, mr_rework or self_improve run's exact completing generation can release through the separately verified completed-publication receipt below. Older adopted generations gain no completed-publication authority. The maintainer-selected narrow #2506 exception permits automatic SERVER discard of earlier OPEN holds (generation < G) after fresh verification of the completed run's own exact recorded PR/MR as merged and locked recheck of owner/repo/connection/project/forge/base URL/MR/run/G. It includes nonancestor prior aggregates without ancestry, archive FINAL or publication-receipt proof. `merged_predecessor_discard` binds the audit; non-ready captures are cleaned up while available bytes, prerequisites, TTL and export remain. This grants no new worker source-deletion authority or worker/PVC fence/retention guarantee beyond existing owner-discard lifecycle consequences; operator-only #1786 disposal and retention guards remain. Option D's physical local-source AND available-archive disposal is DEFERRED to #2823 and #1373; #2506 is partial and nonclosing. See [ADR-2506](../adr/2506-merged-predecessor-discard.md). [human decision amendment, 2026-10-14] (AI-synced 2026-10-14)
@@ -1015,13 +1015,13 @@ Tracked as GitHub issue vtmocanu/uzi#2545; design in ADR-2545 (`adr/2545-failed-
 
 ## Feature #1810 — A finished run's checkpoint ref is retained, not deleted, while custody is open
 
-Tracked as GitHub issue vtmocanu/uzi#1810; PRD at `prds/1810-retain-failed-run-checkpoint-ref.md`.
+Tracked as GitHub issue vtmocanu/uzi#1810; PRD at `prds/done/1810-retain-failed-run-checkpoint-ref.md`.
 
 - A finished run's last published checkpoint ref stays on the forge while any of its custody holds is open — a failed or cancelled run, but also a completed run that still has an older generation's open hold — instead of being deleted at the terminal transition; a new run on the same branch moves it to a per-run recovery ref rather than being blocked by it, and it is deleted only once the run's last hold is released or discarded. [AI-synced 2026-09-27, #1810]
 
 ## Feature #1867 — A failed run's last published checkpoint gets a bounded, run-scoped salvage copy
 
-Tracked as GitHub issue vtmocanu/uzi#1867; PRD at `prds/1867-failed-run-salvage-ref.md`.
+Tracked as GitHub issue vtmocanu/uzi#1867; PRD at `prds/done/1867-failed-run-salvage-ref.md`.
 
 - On a forge listed in `UZI_SALVAGE_FORGES` (default empty: off), a failed, checkpoint-eligible run's last published checkpoint is copied to a run-scoped `refs/uzi-salvage/<run-id>`, only when it is still verified live under the branch checkpoint ref or its recovery ref, and expires after `UZI_RECOVERY_READY_RETENTION`; a `push_secret_blocked` failure is never salvaged, and salvage never deletes or moves the branch checkpoint ref or a recovery ref, which stay #1810's to manage. (AI-synced 2026-09-28)
 
@@ -1035,7 +1035,7 @@ Tracked as GitHub issue vtmocanu/uzi#1907; PRD at `prds/1907-product-tokens-api-
 
 ## Feature #1908 — Repo-less jobs over `/api/v1`
 
-Tracked as GitHub issue vtmocanu/uzi#1908; PRD at `prds/1908-repo-less-jobs-api.md`.
+Tracked as GitHub issue vtmocanu/uzi#1908; PRD at `prds/done/1908-repo-less-jobs-api.md`.
 
 - A `uzc_` or `uzp_` caller can create a repo-less `research` job over `/api/v1/jobs` with a prompt and inline text inputs, and can follow, list, cancel and read its structured result (a report plus findings). The job runs as the token's user on that user's own Claude credential, with no plan gate. (AI-synced 2026-09-30)
 - A job never touches a repo, a branch, a forge or `main`. It has no web or network tool unless it is bound to a site list its caller may use; then its only network tool is the uzi fetch tool, on the isolated lane. The api refuses forge, memory, publish and review worker routes for it. (AI-synced 2026-10-01)
@@ -1076,7 +1076,7 @@ Tracked as GitHub issue vtmocanu/uzi#1910; PRD at `prds/done/1910-connect-uzi-oa
 
 ## Feature #1390 — Api outage does not disturb a run on a still-live worker
 
-Tracked as GitHub issue vtmocanu/uzi#1390; PRD at `prds/1390-outage-requeue-readoption.md`.
+Tracked as GitHub issue vtmocanu/uzi#1390; PRD at `prds/done/1390-outage-requeue-readoption.md`.
 
 - An api outage does not disturb a run executing on a still-live worker: within one worker heartbeat of the api's return each such run is restored to the exact status it held (running, or waiting at its plan/question gate), without spending its re-queue budget or opening a new custody hold. [user, #1390]
 - A worker that has genuinely died still has its runs re-queued after the stale window, and failed only after a second window. [user, #1390]
@@ -1085,7 +1085,7 @@ Tracked as GitHub issue vtmocanu/uzi#1390; PRD at `prds/1390-outage-requeue-read
 
 ## Feature #1393 — A finished run's outcome survives an api outage
 
-Tracked as GitHub issue vtmocanu/uzi#1393; PRD at `prds/1391-worker-outbox-durable-reports.md`.
+Tracked as GitHub issue vtmocanu/uzi#1393; PRD at `prds/done/1391-worker-outbox-durable-reports.md`.
 
 - A run that finishes while the api is unreachable has its completed/failed outcome recorded durably on its worker before the first send, and that outcome — with its merge request — lands once the api returns and the run's own message backlog has replayed; it is never redone and never falsely marked failed by the outage. (AI-synced 2026-09-17)
 - While a worker still holds an unsent outcome for a run, no second execution of that run ever starts. (AI-synced 2026-09-17)
@@ -1153,7 +1153,7 @@ Tracked as GitHub issue vtmocanu/uzi#1995; ADR at `adr/1296-durable-run-recovery
 
 ## Feature #1484 — Admin in-app health
 
-Tracked as GitHub issue vtmocanu/uzi#1484; PRD at `prds/1484-admin-health-tab.md`.
+Tracked as GitHub issue vtmocanu/uzi#1484; PRD at `prds/done/1484-admin-health-tab.md`.
 
 - An admin gets a read-only, closed registry of checks over what uzi knows about itself (worker rolls, queue and capacity, controller liveness, background loops, the database, integrations, housekeeping). Health, Overview, overall status/counts, attention pips, history and `uzi admin health` retain all checks; the app-wide Danger banner, snooze, episodes and admin notices follow the server's separate `blocking` field for instance danger. Owner-only danger remains visible and exits CLI code 8 without an episode, admin DM or banner. [AI-synced 2026-10-05, #2293]
 - Health is the **last** admin tab, not the first; the sidebar pip and the Overview card are the entry points. [AI-synced 2026-10-03, #1484]
@@ -1216,7 +1216,7 @@ Tracked as GitHub issue vtmocanu/uzi#1598.
 
 ## Feature #1590 — Hold a Codex run on an unavailable subscription account
 
-Tracked as GitHub issue vtmocanu/uzi#1590; PRD at `prds/1590-codex-quarantine-claim-hold.md`; ADR at `adr/1590-codex-binding-same-identity-readmission.md`.
+Tracked as GitHub issue vtmocanu/uzi#1590; PRD at `prds/done/1590-codex-quarantine-claim-hold.md`; ADR at `adr/1590-codex-binding-same-identity-readmission.md`.
 
 - At claim time, a Codex subscription run whose account is quarantined or mid-re-login is held (`recovery_wait`) instead of failed for that state: issue, ci_fix, self_improve, prompt, task and mr_rework without an egress profile. Other kinds and egress-profile runs keep their handling. (AI-synced 2026-10-10; qualifies the 2026-09-24 claim-time promise)
 - The same eligible running runs park at a durability-boundary reconcile when the API confirms that hold class, after credential-free verified WIP capture and fetch-back, with best-effort publication, source custody, source-worker affinity and session retained. This requires worker capability `codex_account_park_v1` and API feature `recovery_cause_codex_account_unavailable`; the API re-decides the requested cause under claim fences and locks, never on the worker's word. Mid-turn app-server refresh and startup release keep their vault-only deferral handling; other kinds, non-credential faults, transient or ambiguous faults and binding-change `credential_unavailable` handling are unchanged. (AI-synced 2026-10-10; #1595 extension, mechanism in `adr/1766-codex-vault-lock-park.md`) #2852 slice A contract: credential-free Codex capture uses the held boundary under Feature #1783. (AI-synced 2026-10-18)
@@ -1311,7 +1311,7 @@ Tracked as GitHub issue vtmocanu/uzi#1795; decision record `adr/1795-gate-revisi
 
 ## Feature #1798 — Plain-English PR descriptions
 
-Tracked as GitHub issue vtmocanu/uzi#1798; PRD at `prds/1798-plain-english-pr-descriptions.md`.
+Tracked as GitHub issue vtmocanu/uzi#1798; PRD at `prds/done/1798-plain-english-pr-descriptions.md`.
 
 - Every PR uzi opens gets a plain-English description plus a computed size
   line; a human can see what it does and how big it is from the description
@@ -1369,7 +1369,7 @@ Tracked as GitHub issue vtmocanu/uzi#1864.
 
 ## PRD #1906 — Official-sources web research
 
-Tracked as GitHub issue vtmocanu/uzi#1906; design in `prds/1906-official-sources-web-research.md`.
+Tracked as GitHub issue vtmocanu/uzi#1906; design in `prds/done/1906-official-sources-web-research.md`.
 
 - A run bound to a site list may read web content only from hosts on that list, fetched through a uzi fetch service; it runs in a worker lane with no internet, and nothing (kill-switch, cleared requirements, self-reported capability, old agent) can place it outside that lane. (AI-synced 2026-09-29)
 - Site lists are named and admin-managed; a request may name a list (a job's `egress_profile`) but never supply hosts. Admins create and edit them in the web UI (cookie-only writes), the CLI can list and show them. (AI-synced 2026-10-01)
@@ -1443,7 +1443,7 @@ PRD at `prds/done/2603-run-now-summary.md`.
 
 ## Bug #1786 — Stopped-generation sources survive clone cleanup
 
-PRD at `prds/1786-preserve-worker-only-work.md`.
+PRD at `prds/done/1786-preserve-worker-only-work.md`.
 
 - A worker that stops a run because its claim went stale or was fenced keeps that generation's exact clone (unfetched commits, dirty and untracked files) and makes no further report, publish or tracking write through the stopped claim. The clone is kept even when a coverage check (clean, HEAD anchored at a tracking tip this run and generation owns, at an owed pin of this run, or on the worker bare's default branch, every other local ref reachable from it or from a ref of the worker bare, no stash) finds it covered: that verdict is a snapshot that cannot see a writer exiting after it, so on a stopped exit it is logged only, and the clone waits for explicit operator discard. Cost: every stale or fenced stop keeps its clone until discarded, attempt-ledger `reclaimed` entries persist, and on a worker with no Docker host every stopped canonical clone persists the key's attempt mode (later claims use fresh paths and sessions). Gitignored files and commits reachable only from the reflog are not covered by any capture. A successor's claim never counts as proof. Not shipped: writer exclusion through retirement (would allow releasing a covered stopped clone), and showing the coverage verdict in inspect output. (AI-synced 2026-10-13, #1786)
 - A stopped or fenced source is deleted only by explicit operator discard through the worker-local inspect/discard command, after the server shows no open hold of this worker on the run, no local recovery, settlement or terminal record remains, and the worker is idle with the run reserved. A parked predecessor remains after successful recapture and completion; recapture or a new claim alone grants no deletion authority. Existing verified-successor retirement, where applicable, retires its exact successor: the covering FINAL path reanchors the journal to retained predecessors without deleting them. Otherwise explicit operator discard is required; stopped/fenced authority is not broadened. There is no TTL or cap eviction of an unverified source, and capacity pressure is not deletion authority. (AI-synced 2026-10-13, #2852) [maintainer 2026-10-11] (AI-synced 2026-10-11, #1786)

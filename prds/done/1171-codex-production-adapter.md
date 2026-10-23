@@ -70,7 +70,7 @@ The gated plan must name the concrete modules, state transitions and failure pre
 
 ## Remaining execution graph after #1188
 
-**Account-meter coordination (#1209, dependency satisfied 2026-09-11):** [Codex account limits](../1209-codex-account-rate-limits.md) is a separate visibility PRD. This child delivered `codexauth.Client` production injection, worker release/refresh authorization and runtime durability boundaries. #1209 may consume the landed coordinator for its internal API-side account reader; it does not depend on M4-M7.
+**Account-meter coordination (#1209, dependency satisfied 2026-09-11):** [Codex account limits](1209-codex-account-rate-limits.md) is a separate visibility PRD. This child delivered `codexauth.Client` production injection, worker release/refresh authorization and runtime durability boundaries. #1209 may consume the landed coordinator for its internal API-side account reader; it does not depend on M4-M7.
 
 The merged dark core is a prerequisite, not work to reproduce. Preserve its transport, registry/safety owner, broker authority, renderer, run/advice harnesses, fd-anchored session store, file helper and OS identities. The new run implements only the deferred items recorded in the progress log.
 

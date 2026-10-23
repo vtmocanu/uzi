@@ -800,7 +800,7 @@ A few worth knowing:
   CI-fix run's queue starts empty and only ever holds what you actually sent
   mid-run.
 - **`run fetches <id>`** prints a research run's source log
-  ([PRD #1906](../prds/1906-official-sources-web-research.md)): one row per web
+  ([PRD #1906](../prds/done/1906-official-sources-web-research.md)): one row per web
   fetch the run attempted, oldest first, with `STARTED`, `VERDICT` (`allowed` or
   `refused`), `REASON`, `HTTP` status, `BYTES`, `CONTENT TYPE`, `URL` and
   `FINAL URL` (after redirects). The command follows every page of the log; a read taken while the run is still fetching can miss a row that commits late.

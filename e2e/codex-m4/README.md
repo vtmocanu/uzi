@@ -222,7 +222,7 @@ These are known, accepted limitations recorded honestly, not defects hiding behi
 - **These three Landlock-citing claims — sibling isolation via the command-root separation,
   `codex-o-command-root-home-denial`, and the base64/variable-indirection residual above — are
   `required`-mode claims.** They are proven on a Landlock-capable host running the command
-  sandbox's default `required` mode. On [PRD #1493](../../prds/1493-codex-k8s-uid-split-profile.md)'s
+  sandbox's default `required` mode. On [PRD #1493](../../prds/done/1493-codex-k8s-uid-split-profile.md)'s
   opt-in `best-effort` mode, on a kernel that reports Landlock unavailable, their Landlock-confinement
   guarantee no longer holds: the command runs unconfined, and containment is the uid split alone (the
   worker/runner/runner-cmd separation), not Landlock filesystem confinement. `best-effort` is never claimed to be

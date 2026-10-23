@@ -3,7 +3,7 @@
 **Status**: Accepted (implemented, issue #1247, M1–M10; maintainer M0 dev-cluster evidence pending)
 **Date**: 2026-09-17
 **Deciders**: architect (design + Decision Log D1–D14); two review passes (2026-09-15, 2026-09-16) that folded the switch protocol, the fence and the attribution journal; coder (implementation).
-**PRD**: [prds/1247-per-run-token-selection.md](../prds/1247-per-run-token-selection.md) — the full milestone breakdown, code anchors and Decision Log (D1–D14) live there; this ADR restates the four seams a future edit is most likely to break silently, and the one seam it deliberately leaves half-built.
+**PRD**: [prds/done/1247-per-run-token-selection.md](../prds/done/1247-per-run-token-selection.md) — the full milestone breakdown, code anchors and Decision Log (D1–D14) live there; this ADR restates the four seams a future edit is most likely to break silently, and the one seam it deliberately leaves half-built.
 **Related**: reuses [adr/1296-durable-run-recovery.md](1296-durable-run-recovery.md)'s custody `runs.claim_generation` as the switch fence rather than minting a second one; the pool ranking is [PRD #111](../prds/done/111-auto-select-anthropic-token.md)'s `autoselect.NextAvailable`/`autoChoice`; the per-leg usage fold this PRD extends is recorded in [adr/1079-run-usage-per-leg-fold.md](1079-run-usage-per-leg-fold.md).
 
 ## Decision (summary)

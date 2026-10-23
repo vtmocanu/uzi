@@ -5,7 +5,7 @@
 **Priority**: Medium
 **Owner**: TBD
 
-> Builds on PRD #364 (GitHub Projects v2 Status sync), #534 (visibility + collaborator sharing). Read `api/internal/forgesvc/projectsync.go` and `prds/364-github-project-status-sync.md` first — this PRD extends that machinery, it does not replace it.
+> Builds on PRD #364 (GitHub Projects v2 Status sync), #534 (visibility + collaborator sharing). Read `api/internal/forgesvc/projectsync.go` and `prds/done/364-github-project-status-sync.md` first — this PRD extends that machinery, it does not replace it.
 
 > **Scope guard for the uzi worker**: this PRD touches **no** `.github/workflows/**` file, in neither implementation nor validation. The worker PAT lacks `workflow` scope, so any workflow-file change in the branch diff is an atomic push rejection that loses the whole branch (`.claude/rules/prds.md`). Everything here is `api/`, `web/`, `docs/`, and tests — no CI/workflow edits.
 
@@ -34,7 +34,7 @@ The GitHub Projects v2 sync feature works but its UX is confusing and one capabi
 
 ## Resolved external facts (baked in — the worker has no open-web access)
 
-> The uzi worker runs with restricted egress (forge + `*.anthropic.com` + package caches; no open web). Every GitHub Projects v2 fact this PRD relies on is stated here as a resolved fact, sourced from PRD #364's own research (`prds/364-github-project-status-sync.md`) and this repo's code. The worker must **not** attempt to look any of these up online; it may re-verify by reading the cited code/PRD, both in-repo.
+> The uzi worker runs with restricted egress (forge + `*.anthropic.com` + package caches; no open web). Every GitHub Projects v2 fact this PRD relies on is stated here as a resolved fact, sourced from PRD #364's own research (`prds/done/364-github-project-status-sync.md`) and this repo's code. The worker must **not** attempt to look any of these up online; it may re-verify by reading the cited code/PRD, both in-repo.
 
 - **F-A — Owner-match on linking.** `linkProjectV2ToRepository` requires the project's owner to equal the repo's owner. `createProjectV2(ownerId)` accepts a **User or Organization** node id (`prds/364:43`, F8). A PAT can create projects only for itself (`viewer`) or for orgs it belongs to with the `project` scope — **never for another user**. Consequence: for a **user-owned** repo whose owner is not the bot, Provision cannot produce a linkable project (this is defect #1). For an **org-owned** repo where the bot is an org member with project rights, Provision works and is the safe path.
 - **F-B — `updateProjectV2Field(singleSelectOptions:[...])` is a full-list *replace*, not an append** (`prds/364:83,144`). To add one option you must read the field's current options and echo **every kept option back with its existing `id`**, add new ones without an id, and drop removed ones. A mis-echoed/omitted id makes GitHub treat the option as new, and **every item assigned to the original option loses its Status** (cleared to "No Status"). Corroborated by GitHub community discussion #198803 (`prds/364:144`).

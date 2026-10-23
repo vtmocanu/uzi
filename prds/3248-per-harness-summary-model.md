@@ -9,7 +9,7 @@
 **Related:**
 - #2833 shipped the Codex intent/plan summaries on a private pin.
 - #2721 and #2686: summary usage attribution. #2942: eligible kinds. #3014: the plan summary never blocks the verdict wait. #3010. #2603: the Now summary.
-- PRD #362 (`prds/done/362-run-summaries.md`) and PRD #1798 (`prds/1798-plain-english-pr-descriptions.md`, D13).
+- PRD #362 (`prds/done/362-run-summaries.md`) and PRD #1798 (`prds/done/1798-plain-english-pr-descriptions.md`, D13).
 - Children A, C, E, F, G, I, M, O.
 
 **Delivery:** one PRD, one gated implementation run, one PR; default harness, mr_rework=false. Three serial milestones. One additive migration, draft number 00349 (M1); main ends at 00346 at the pinned SHA, so assign the next free number at landing with `task migration:renumber`. The credential note needs no migration (module 6). The run needs Docker for the LiveDB store test. No implementation or validation writes under `.github/workflows/`.

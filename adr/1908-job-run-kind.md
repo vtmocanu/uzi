@@ -3,7 +3,7 @@
 **Status**: Accepted (PRD #1908 M1-M8 implemented; M9, hosted k8s acceptance, is maintainer-owned and pending)
 **Date**: 2026-09-30
 **Issue**: [vtmocanu/uzi#1908](https://github.com/vtmocanu/uzi/issues/1908)
-**PRD**: [prds/1908-repo-less-jobs-api.md](../prds/1908-repo-less-jobs-api.md)
+**PRD**: [prds/done/1908-repo-less-jobs-api.md](../prds/done/1908-repo-less-jobs-api.md)
 
 ## Decision (summary)
 
@@ -157,7 +157,7 @@ code did not support:
 
 ## References
 
-- [PRD #1908](../prds/1908-repo-less-jobs-api.md): Decisions, Decision Log (D-A to D-E, D-A2).
+- [PRD #1908](../prds/done/1908-repo-less-jobs-api.md): Decisions, Decision Log (D-A to D-E, D-A2).
 - [ADR-1907](1907-product-api-v1-contract.md): `/api/v1` contract and `RequireV1Caller`.
 - [ADR-0285](0285-worker-egress-tier-trust-model.md): the worker egress tiers that keep jobs off Docker workers.
 - `api/internal/store/queries/runtime.sql`, `api/internal/store/queries/jobs.sql`, `api/internal/workersvc/job_sweeps.go`, `api/internal/handler/job_refusal.go`, `agent/src/job-runner.ts`, `agent/src/job-workspace.ts`.

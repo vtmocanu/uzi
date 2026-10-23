@@ -3,7 +3,7 @@
 **Status**: Accepted (PRD #1265 M1–M6 merged; M7 first-live-cycle is the maintainer's, out of band)
 **Date**: 2026-09-13
 **Deciders**: Vlad Mocanu + agent team (PRD #1265 Decision Log)
-**PRD**: [prds/1265-rc-release-train.md](../prds/1265-rc-release-train.md) — the PRD carries the full Decision Log, milestone tests, and the measured semver table; this ADR carries the durable design shape and the seams a future change would break silently.
+**PRD**: [prds/done/1265-rc-release-train.md](../prds/done/1265-rc-release-train.md) — the PRD carries the full Decision Log, milestone tests, and the measured semver table; this ADR carries the durable design shape and the seams a future change would break silently.
 
 ## Decision (summary)
 

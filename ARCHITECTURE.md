@@ -807,7 +807,7 @@ for decisions and the pending acceptance checklist.
 
 PRD #2170 adds an opt-in, advisory check of the lead's committed code by the
 other model family before publication (see
-[PRD #2170](prds/2170-code-cross-check.md) for decisions and
+[PRD #2170](prds/done/2170-code-cross-check.md) for decisions and
 [docs/cross-check.md](docs/cross-check.md#code-cross-check) for the user view).
 It never blocks publication. It shares the `cross_checks` table
 (`stage = 'code'`, one attempt per lead) and the dedicated lane of #2169, but
@@ -1035,9 +1035,9 @@ chain in the diagram above, with no intervening `running`.
   selected reset or bounded fallback, not provider prose, account reads or polling.
   If that account is unavailable after promotion, Claim refuses it and Sweep holds
   it at `recovery_wait` / `codex_account_unavailable`. The account hold and
-  same-identity re-admission are defined by [PRD #1590](prds/1590-codex-quarantine-claim-hold.md)
+  same-identity re-admission are defined by [PRD #1590](prds/done/1590-codex-quarantine-claim-hold.md)
   and [ADR-1590](adr/1590-codex-binding-same-identity-readmission.md).
-  [PRD #1595](prds/1595-codex-boundary-account-park.md) extends this hold to eligible
+  [PRD #1595](prds/done/1595-codex-boundary-account-park.md) extends this hold to eligible
   running subscription boundary reconciles: a negotiated worker captures source
   credential-free before requesting a park; the API re-classifies under claim fences
   and run → alias → account locks, revokes the capability, and retains custody and
@@ -1121,7 +1121,7 @@ chain in the diagram above, with no intervening `running`.
   auto-resume on its own**: it is wound down explicitly with `uzi run stop`,
   or by its worker-side idle timeout. See
   [docs/handoff.md](docs/handoff.md#interactive-mode).
-- **running → paused (owner request)** ([PRD #1190](prds/1190-run-pause-resume.md)) — the
+- **running → paused (owner request)** ([PRD #1190](prds/done/1190-run-pause-resume.md)) — the
   owner-requested twin of `limit_wait`: `pause` (default: after the milestone
   or turn in flight; `--now`: drop it) is a **flag** on the still-running run,
   and the worker parks only after it publishes a checkpoint — a failed
@@ -1256,7 +1256,7 @@ chain in the diagram above, with no intervening `running`.
   and publish outcomes now surface on the run feed. See
   [ADR-628](adr/0628-cross-worker-resume-durability.md)'s #1030 amendment.
   The best-effort terminal-transition delete this amendment first added was
-  superseded by [PRD #1810](prds/1810-retain-failed-run-checkpoint-ref.md): the
+  superseded by [PRD #1810](prds/done/1810-retain-failed-run-checkpoint-ref.md): the
   ref is not deleted at any terminal transition while a custody hold
   stays open on the run (any writer, sweeper-driven included), and a new run
   needing the same branch slot moves the old tip to a per-run
@@ -1549,8 +1549,8 @@ chain in the diagram above, with no intervening `running`.
   `uzi run discard`; a Dashboard board alert and Workers resolution surface),
   with the per-run custody Slack nudge coalesced into one owner-level
   blocked-custody episode DM. See [docs/run-recovery.md](docs/run-recovery.md),
-  [PRD #1296](prds/1296-durable-run-recovery.md),
-  [PRD #1349](prds/1349-recovery-custody-hardening.md) and
+  [PRD #1296](prds/done/1296-durable-run-recovery.md),
+  [PRD #1349](prds/done/1349-recovery-custody-hardening.md) and
   [adr/1296-durable-run-recovery.md](adr/1296-durable-run-recovery.md) (with
   its 2026-09-14 PRD #1349 amendment).
   [Issue #1924](https://github.com/vtmocanu/uzi/issues/1924) adds generation-latched `inventory_guarded` custody for
@@ -2324,7 +2324,7 @@ where available, unconfined otherwise). A worker advertises the Codex
 capability only when the split is active and the configured mode can run a
 command on this kernel; otherwise it never
 claims a Codex-indicating run, which stays queued instead. See
-[PRD #1493](prds/1493-codex-k8s-uid-split-profile.md) for the full design and
+[PRD #1493](prds/done/1493-codex-k8s-uid-split-profile.md) for the full design and
 Decision Log, and [docs/configuration.md](docs/configuration.md#controller)
 for the operator-facing knobs. See [ADR-1106](adr/1106-codex-harness.md) for
 the Codex harness's own execution design; automatic issue harness selection
@@ -2547,7 +2547,7 @@ remain read-only at the API boundary, which holds no kube credentials. Local hea
 recorded in the PRD;
 hosted real-apiserver verification remains open. See
 [ADR-1470](adr/1470-paced-hosted-worker-rolls.md),
-[PRD #1470](prds/1470-paced-hosted-worker-rolls.md) and the
+[PRD #1470](prds/done/1470-paced-hosted-worker-rolls.md) and the
 [maintainer runbook](docs/hosted-worker-roll-verification.md).
 
 "Surge" here means the app stack surges forward on every release while old
@@ -2634,7 +2634,7 @@ exactly as the worker controller section above requires — so every
 Kubernetes-derived fact (a worker pod stuck rolling) still arrives only over the
 existing controller report; pod-level health of the `api`/`web`/database/controller
 pods themselves stays out of scope, owned by cluster monitoring. See
-[PRD #1484](prds/1484-admin-health-tab.md) and
+[PRD #1484](prds/done/1484-admin-health-tab.md) and
 [ADR-1484](adr/1484-in-app-health-boundary.md) for the checks, the boundary
 rationale, and the deferred items (version skew, per-connection sync freshness).
 

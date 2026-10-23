@@ -284,7 +284,7 @@ observe, so Standard pricing remains the D5 estimation policy, not a measurement
 `send_user_message_async` / `clock` tools match what `gpt-6-astra` already had. The vocabulary
 stays closed and product-owned.
 
-**Superseded 2026-09-23** by [PRD #1551](../prds/1551-per-harness-worker-model-defaults.md) for
+**Superseded 2026-09-23** by [PRD #1551](../prds/done/1551-per-harness-worker-model-defaults.md) for
 per-user defaults only: Claude and Codex now keep separate, retained per-user model defaults
 instead of one shared slot, and Codex's per-user default gained a narrow, capability-gated custom
 model ID. The closed curated vocabulary and closed effort contract recorded above still govern
