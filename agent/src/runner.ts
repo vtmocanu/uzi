@@ -4030,6 +4030,7 @@ export class RunRunner {
     }
     const executionRejection: ExecutionRejection = { rejected: false };
     const recoveryDisposition = async (action: () => Promise<boolean>): Promise<boolean> => {
+      const shuttingDownAtEntry = flight.active?.shuttingDown === true;
       try { return await action(); }
       catch (error) {
         // The capture promise has joined its safety scope before canonical dispatch.
@@ -4038,8 +4039,8 @@ export class RunRunner {
           await dispatchFailure(flight.steering.claimFence() !== undefined ? new StaleClaimError() : new Error("run cancelled"));
           return false;
         }
-        if (flight.active?.shuttingDown) {
-          // Recovery has joined its capture scope. Keep the existing shutdown stop:
+        if (shuttingDownAtEntry && flight.active?.shuttingDown) {
+          // Recovery entered during shutdown and has joined its capture scope. Keep the existing stop:
           // no new capture, park request or graceful-shutdown authority is minted here.
           flight.preserveRecoveryClone = true;
           flight.preserveSession = true;

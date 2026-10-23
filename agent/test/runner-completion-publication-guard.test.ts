@@ -685,6 +685,145 @@ describe("M3 publication-start completion guard", () => {
     });
   }
 
+  it("finalize cancellation waits for pending owned root and retains nonclean cleanup", async t => {
+    const claim = claimFor();
+    const runHome = path.join(homeDir, claim.run_id);
+    fs.mkdirSync(runHome, { recursive: true });
+    const sentinel = path.join(runHome, "SESSION_TRANSCRIPT");
+    fs.writeFileSync(sentinel, "session bytes\n");
+    let releaseCleanup!: () => void, cleanupEntered!: () => void, cancelled!: () => void, actionUnwound!: () => void;
+    const actionUnwinding = new Promise<void>(resolve => { actionUnwound = resolve; });
+    const cleanupGate = new Promise<void>(resolve => { releaseCleanup = resolve; });
+    const cleanupStarted = new Promise<void>(resolve => { cleanupEntered = resolve; });
+    const cancellationObserved = new Promise<void>(resolve => { cancelled = resolve; });
+    let injected = false, primaryExited = false, rootSettled = false;
+    let boundarySettled = false, executeSettled = false, joined = false;
+    let captures = 0, retries = 0, fallbacks = 0, retentions = 0;
+    let actual: Parameters<typeof acceptsJoinedCaptureCleanup>[1] | undefined;
+    let childCompletion: Promise<unknown> | undefined;
+    let operation: Promise<void> | undefined;
+    const rig = codexRig({
+      boundaryProcess: request => {
+        if (request.argv[0] !== "/pending-root-fixture/git") return undefined;
+        assert.equal(injected, false, "one fake registered root only");
+        injected = true;
+        return {
+          stdin: null, stdout: null, stderr: null,
+          waitChild: async () => { primaryExited = true; return { code: 0 }; },
+          root: {
+            kind: "boundary_action",
+            reap: async () => {
+              assert.equal(primaryExited, true);
+              cleanupEntered();
+              await cleanupGate;
+              rootSettled = true;
+              return { ok: false, error: { category: "tool", message: "test-owned root cleanup incomplete" } };
+            },
+            dispose: async () => {},
+          },
+        };
+      },
+    });
+    // This is a fake RegisteredRoot contract test, not OS process-tree proof.
+    const boundary = rig.safety.withBoundary.bind(rig.safety);
+    t.mock.method(rig.safety, "withBoundary", async (request: Parameters<typeof boundary>[0], action: Parameters<typeof boundary>[1]) => {
+      if (request.boundary !== "finalize") return boundary(request, action);
+      try {
+        return await boundary(request, async permit => {
+          actual = permit;
+          try { return await action(permit); }
+          finally { actionUnwound(); }
+        });
+      } finally {
+        boundarySettled = true;
+        if (actual) joined = acceptsJoinedCaptureCleanup(rig.safety, actual);
+      }
+    });
+    const probe = committing("Fixes #3090");
+    const executor = new FakeCodexExecutor(rig.safety, ctx => probe.executor.run(ctx), undefined,
+      () => { fallbacks++; throw new Error("unexpected fallback"); });
+    const forge = fakeGitlab();
+    const run = runnerWith(() => ({ executor, homeDir: runHome }), forge.gitlab);
+    let observedFlight: Parameters<typeof run["waitRecoveryRetry"]>[0] | undefined;
+    const retain = run["retainCaptureSource"].bind(run);
+    run["retainCaptureSource"] = flight => {
+      retentions++;
+      assert.equal(rootSettled, true, "nonclean root joined before continuation retains source");
+      assert.equal(boundarySettled, true, "private finalize handoff runs after parent join");
+      retain(flight);
+    };
+    run["captureHoldContext"] = async (_claim, flight) => {
+      captures++;
+      observedFlight = flight;
+      assert.ok(actual);
+      assert.equal(actual.signal.aborted, false, "root admitted under the actual live permit");
+      const child = await rig.safety.spawnBoundaryProcess(actual, {
+        argv: ["/pending-root-fixture/git", "--version"], cwd: probe.seen.clone!, env: {}, identity: "worker_pat",
+      });
+      childCompletion = child.completed;
+      void childCompletion.catch(() => undefined);
+      await cleanupStarted;
+      return { verified: false, published: false, mode: "same_worker_only", head: null };
+    };
+    run["waitRecoveryRetry"] = async flight => {
+      retries++;
+      run["observeCancellation"](flight);
+      assert.equal(flight.cancel.signal.aborted, true);
+      cancelled();
+    };
+    const push = t.mock.method(git, "pushBranch", async () => { throw new Error("unexpected push"); });
+    const publish = t.mock.method(client, "publishCheckpoint", async () => { throw new Error("unexpected checkpoint"); });
+    t.after(async () => {
+      // One idempotent event release; join every owned promise even on assertion failure.
+      releaseCleanup();
+      await childCompletion?.catch(() => undefined);
+      await operation?.catch(() => undefined);
+    });
+    operation = run.execute(claim).finally(() => { executeSettled = true; });
+    void operation.catch(() => undefined);
+    try {
+      await Promise.race([
+        Promise.all([cancellationObserved, actionUnwinding]),
+        operation.then(() => { throw new Error("execution ended before cancellation unwind barrier"); }),
+      ]);
+      assert.ok(observedFlight);
+      assert.ok(actual);
+      assert.equal(primaryExited, true);
+      assert.equal(rootSettled, false);
+      assert.equal(executeSettled, false);
+      assert.equal(boundarySettled, false);
+      assert.equal(acceptsJoinedCaptureCleanup(rig.safety, actual), false, "pending root cannot issue joined witness");
+      assert.equal(actual.signal.aborted, false, "no deadline fired to substitute for cancellation");
+      assert.equal(observedFlight.sourceExitDenied, undefined);
+      assert.equal(retentions, 0);
+      assert.equal(rig.releaseCalls(), 0);
+    } finally { releaseCleanup(); }
+    await operation;
+    await assert.rejects(childCompletion!, /root did not reap cleanly/);
+    assert.equal(rootSettled, true);
+    assert.equal(boundarySettled, true);
+    assert.equal(joined, false, "incomplete root cleanup cannot certify a clean cancellation");
+    assert.ok(retentions > 0, "post-join private continuation retains the source");
+    assert.equal(captures, 1);
+    assert.equal(retries, 1);
+    assert.equal(fallbacks, 0);
+    assert.equal(rig.releaseCalls(), 0);
+    assert.equal(push.mock.callCount(), 0);
+    assert.equal(publish.mock.callCount(), 0);
+    assert.equal(api.completionHoldRequests.length, 0);
+    assert.equal(api.completionPermitRequests.length, 0);
+    assert.equal(forge.calls.length, 0);
+    assert.equal(observedFlight!.sourceExitDenied, true);
+    assert.equal(observedFlight!.stoppedSourceKept, true);
+    assert.equal(observedFlight!.keepGuardedInventoryOpen, true);
+    assert.equal(observedFlight!.preserveRecoveryClone, true);
+    assert.equal(observedFlight!.preserveSession, true);
+    assert.equal(fs.readFileSync(path.join(probe.seen.clone!, "m3.txt"), "utf8"), "preserved work\n");
+    assert.equal(gitIn(probe.seen.clone!, ["rev-parse", "HEAD"]), probe.seen.head);
+    assert.equal(fs.readFileSync(sentinel, "utf8"), "session bytes\n");
+    assert.equal(terminal(claim.run_id).at(-1)!.body.failure_reason, "run cancelled");
+  });
+
   for (const fault of ["clean-direct", "quiescence-direct", "quiescence", "residue", "poison", "deadline-rollback", "independent", "custody"] as const) {
     it(`provisional cancellation preserves actual ${fault} guards`, async t => {
       const claim = claimFor();
