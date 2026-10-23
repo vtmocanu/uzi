@@ -8,6 +8,30 @@ import type { Readable } from "node:stream";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, recordingLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
 import { GitCache, WIP_PARK_COMMIT_PREFIX } from "../src/git.js";
+import { TickSpawner } from "../src/tick-spawner.js";
+import { createHash } from "node:crypto";
+
+/** Capture through the production boundary and settle every owned child, including on refusal. */
+async function captureRecovered(cache: GitCache, clone: { path: string; baseCommit: string }, bare: string): Promise<string> {
+  const controller = new AbortController();
+  const owner = new TickSpawner({ signal: controller.signal });
+  try {
+    return (await cache.withBoundaryProcessSpawner(owner.spawn, controller.signal,
+      () => cache.capturePlanningDiff(clone.path, clone.baseCommit, bare))).toString("utf8");
+  } finally {
+    controller.abort();
+    await owner.settled();
+    assert.deepEqual(owner.survivors(), []);
+  }
+}
+
+/** Independent expected bytes for the single-line new files used by these lifecycle fixtures. */
+function addedFilePatch(file: string, line: string): string {
+  const content = line + "\n";
+  const oid = createHash("sha1").update("blob " + Buffer.byteLength(content) + "\0").update(content).digest("hex").slice(0, 7);
+  return `diff --git b/${file} b/${file}\nnew file mode 100644\nindex 0000000..${oid}\n--- /dev/null\n+++ b/${file}\n@@ -0,0 +1 @@\n+${line}\n`;
+}
+
 
 // PRD #628 M3 — the cross-worker checkpoint recovery regression test (SC#2).
 //
@@ -269,6 +293,17 @@ describe("cross-worker checkpoint recovery (PRD #628 M3)", () => {
     assert.strictEqual(fs.existsSync(path.join(rc.path, "M1.txt")), true, "recovered work checked out");
     assert.strictEqual(fs.existsSync(path.join(rc.path, "M2.txt")), true, "recovered work checked out");
     assert.notStrictEqual(rc.checkpointSetAside, true, "a strictly-descending checkpoint is not set aside");
+    assert.equal(gitIn(bareB, ["rev-parse", rc.baseCommit]), cpTip);
+    gitB.setPlanningLimitsForTest({
+      sourceAllowance: 5, indexAllowance: 2 * 1024 * 1024,
+      pathAllowance: 20000, entryAllowance: 30000, directoryAllowance: 2048,
+      ignoreAllowance: 128 * 1024 * 1024, ignorePipeAllowance: 2 * 1024 * 1024,
+    });
+    assert.equal(await captureRecovered(gitB, rc, bareB), "");
+    // The recovered M1/M2 and default files exceed five bytes; only new source consumes the allowance.
+    fs.writeFileSync(path.join(rc.path, "NEXT.txt"), "next\n");
+    gitIn(rc.path, ["add", "NEXT.txt"]);
+    assert.equal(await captureRecovered(gitB, rc, bareB), addedFilePatch("NEXT.txt", "next"));
   });
 
   it("does NOT seed from a checkpoint that merely equals the floor (the strict-descendant guard bites cross-worker)", async () => {
@@ -355,6 +390,8 @@ describe("cross-worker checkpoint recovery (PRD #628 M3)", () => {
     assert.strictEqual(rc.seededFrom, "tracking", "adopted the same-worker tracking ref");
     assert.strictEqual(rc.baseCommit, forkPoint, "baseCommit is the marker's parent (the last real commit)");
     assert.strictEqual(rc.priorCommits, 0, "the marker is not counted as recovered committed work");
+    assert.equal(gitIn(bareA, ["rev-parse", rc.baseCommit]), forkPoint);
+    assert.equal(await captureRecovered(gitA, rc, bareA), addedFilePatch("WIP.txt", "in-progress work"));
   });
 
   it("commitWipMarker on a CLEAN tree makes no commit and returns false (PRD #759 M1)", async () => {
@@ -446,6 +483,8 @@ describe("cross-worker checkpoint recovery (PRD #628 M3)", () => {
     assert.strictEqual(rc.wipRecovered, true, "wipRecovered signals the diverged-WIP recovery");
     assert.notStrictEqual(rc.checkpointSetAside, true, "a recovered checkpoint is no longer set aside");
     assert.strictEqual(rc.baseCommit, floorSha, "the base is the origin floor (no committed checkpoint work recovered)");
+    assert.equal(gitIn(bareB, ["rev-parse", rc.baseCommit]), originTip);
+    assert.equal(await captureRecovered(gitB, rc, bareB), addedFilePatch("WIP.txt", "diverged in-progress work"));
     assert.strictEqual(rc.priorCommits, 1, "only the origin floor's own published commit ahead of default — no checkpoint commit recovered");
     const subjects = gitIn(rc.path, ["log", "--format=%s"]).split("\n");
     assert.ok(

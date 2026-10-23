@@ -1986,7 +1986,12 @@ describe("U2 real runner checked gate", () => {
     let scanned = "";
     const capture = git.capturePlanningDiff.bind(git);
     const scan = git.scanPatchForSecrets.bind(git);
-    git.capturePlanningDiff = async (clone, base) => { capturedBase = base; return capture(clone, base); };
+    git.capturePlanningDiff = async (clone, base, bare) => {
+      capturedBase = base;
+      assert.ok(bare);
+      assert.equal(path.basename(bare), path.basename(path.dirname(clone)) + ".git");
+      return capture(clone, base, bare);
+    };
     git.scanPatchForSecrets = async (diff) => { scanned = diff; return scan(diff); };
     api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body) });
     await start(checkedExec(async (ctx) => {

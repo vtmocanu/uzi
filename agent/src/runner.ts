@@ -12498,7 +12498,7 @@ export class RunRunner {
         let semanticDiff: Awaited<ReturnType<RunRunner["captureCheckedPlanningDiff"]>> | undefined;
         if (semanticGate) {
           if (!barePath) throw new Error("semantic candidate: bare source unavailable");
-          semanticDiff = await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, steering.lifecycleSignal(), runLog);
+          semanticDiff = await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, barePath, steering.lifecycleSignal(), runLog);
           if ("refusal" in semanticDiff) throw new Error(`semantic candidate: planning diff unavailable (${semanticDiff.refusal}: ${semanticDiff.diagnostic})`);
           semanticSources = await captureSemanticSources(this.git, {
             barePath, repo: claim.repo.id, headSha: runnerClone.baseCommit,
@@ -12585,7 +12585,7 @@ export class RunRunner {
               checkedFields = { status: "awaiting_approval", plan_cross_check_gate_reason: "codex_lead_unsupported" };
               checkedHuman = { phase: "publishinginitial", onApplied: () => releaseStateBarrier?.() };
             } else {
-              const captured = semanticDiff ?? await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, steering.lifecycleSignal(), runLog);
+              const captured = semanticDiff ?? await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, barePath, steering.lifecycleSignal(), runLog);
               if ("refusal" in captured) {
                 crossCheckReason = `plan cross-check: planning diff refused (${captured.refusal}: ${captured.diagnostic})`;
                 checkedFields = { status: "awaiting_approval", plan_cross_check_gate_reason: "planning_diff_refused",
@@ -20879,12 +20879,13 @@ export class RunRunner {
    *  revision rounds share ONE budget rather than resetting the clock each round. The
    *  autopilot short-circuit is unchanged and never returns a revise. */
   private async captureCheckedPlanningDiff(
-    clonePath: string, baseCommit: string, signal: AbortSignal, runLog: Logger,
+    clonePath: string, baseCommit: string, barePath: string | undefined, signal: AbortSignal, runLog: Logger,
   ): Promise<{ diff: string } | { refusal: PlanCrossCheckDiffRefusal; diagnostic: string }> {
     if (!/^[a-f0-9]{40}$/.test(baseCommit)) {
       runLog.warn("plan cross-check: planning diff refused", { refusal: "base_unavailable", diagnostic: "base_invalid" });
       return { refusal: "base_unavailable", diagnostic: "base_invalid" };
     }
+    if (!barePath) return { refusal: "base_unavailable", diagnostic: "bare_unavailable" };
     const scope = new AbortController();
     const ownerSignal = AbortSignal.any([signal, scope.signal]);
     const timer = setTimeout(() => scope.abort(), 60_000);
@@ -20893,7 +20894,7 @@ export class RunRunner {
     try {
       result = await this.git.withBoundaryProcessSpawner(spawner.spawn, ownerSignal, async () => {
         let bytes: Buffer;
-        try { bytes = await this.git.capturePlanningDiff(clonePath, baseCommit); }
+        try { bytes = await this.git.capturePlanningDiff(clonePath, baseCommit, barePath); }
         catch (error) {
           signal.throwIfAborted();
           const classified = classifyPlanningCaptureError(errMessage(error));
