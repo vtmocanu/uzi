@@ -87,6 +87,7 @@ async function fixture(options: {
   cache: GitCache; clone: string; bare: string; protectedRoot: string; base: string; data: string; tmp: string;
   git: (...args: string[]) => Promise<string>;
   bareGit: (...args: string[]) => Promise<string>;
+  looseBareObjects: () => Promise<void>;
   capture: (signal?: AbortSignal) => Promise<Buffer>;
   dispose: () => Promise<void>;
 }> {
@@ -152,6 +153,20 @@ async function fixture(options: {
     if (options.privateTmp) await fs.mkdir(tmp, { mode: 0o700 });
     return {
       data, tmp, clone, bare, protectedRoot, base, cache, bareGit, git: (...args) => run(clone, ...args),
+      // Replace the worker-owned bare's object store with the seed's loose objects, staged the
+      // same way as the seed itself because the worker cannot traverse the runner's TMPDIR.
+      looseBareObjects: async () => {
+        await nativeFs.rm(path.join(bare, "objects"), { recursive: true });
+        await nativeFs.mkdir(stage, { mode: 0o755 });
+        await nativeFs.chmod(stage, 0o777);
+        try {
+          await fs.cp(path.join(seed, ".git/objects"), path.join(stage, "objects"), { recursive: true });
+          await nativeFs.cp(path.join(stage, "objects"), path.join(bare, "objects"), { recursive: true });
+        } finally {
+          await fs.rm(path.join(stage, "objects"), { recursive: true, force: true });
+          await nativeFs.rmdir(stage);
+        }
+      },
       capture: async (signal = new AbortController().signal) => {
         const owner = new TickSpawner({ signal, killGraceMs: options.killGraceMs ?? 100 });
         const privateTmp = options.sandbox
@@ -307,10 +322,7 @@ async function proveBareReadOnly(t: TestContext, packed: boolean): Promise<void>
   try {
     if (packed) await f.bareGit("repack", "-a", "-d");
     else {
-      await nativeFs.rm(path.join(f.bare, "objects"), { recursive: true });
-      await fs.chmod(f.data, 0o755);
-      await nativeFs.cp(path.join(f.data, "seed/.git/objects"), path.join(f.bare, "objects"), { recursive: true });
-      await fs.chmod(f.data, 0o700);
+      await f.looseBareObjects();
     }
     const before = await bareInventory(path.dirname(f.bare));
     const protectedBefore = await nativeFs.stat(f.protectedRoot);
@@ -444,9 +456,7 @@ describe("Unit2 runner source capture", { skip: process.platform !== "linux" && 
       try {
         if (!kind.startsWith("packed")) {
           // Force a loose-only baseline so Git cannot prefer an authentic packed duplicate.
-          await nativeFs.rm(path.join(f.bare, "objects"), { recursive: true });
-          await fs.chmod(f.data, 0o755);
-          await nativeFs.cp(path.join(f.data, "seed/.git/objects"), path.join(f.bare, "objects"), { recursive: true });
+          await f.looseBareObjects();
         }
         await fs.unlink(path.join(f.clone, "tracked"));
         assert.match((await f.capture()).toString(), /-base/);
@@ -1497,10 +1507,7 @@ repackCp.spawn = function(...args) {
       const f = await fixture();
       try {
         // Remove authentic packed duplicates so the malformed loose body is selected.
-        await nativeFs.rm(path.join(f.bare, "objects"), { recursive: true });
-        await fs.chmod(f.data, 0o755);
-        await nativeFs.cp(path.join(f.data, "seed/.git/objects"), path.join(f.bare, "objects"), { recursive: true });
-        await fs.chmod(f.data, 0o700);
+        await f.looseBareObjects();
         const oid = (await f.bareGit("rev-parse", type === "commit" ? "HEAD" : type === "tree" ? "HEAD^{tree}" : "HEAD:tracked")).trim();
         const loose = path.join(f.bare, "objects", oid.slice(0, 2), oid.slice(2));
         await nativeFs.unlink(loose);
@@ -1516,10 +1523,7 @@ repackCp.spawn = function(...args) {
     it("primary proof: unavailable base with damaged compressed " + type + " body", async () => {
       const f = await fixture();
       try {
-        await nativeFs.rm(path.join(f.bare, "objects"), { recursive: true });
-        await fs.chmod(f.data, 0o755);
-        await nativeFs.cp(path.join(f.data, "seed/.git/objects"), path.join(f.bare, "objects"), { recursive: true });
-        await fs.chmod(f.data, 0o700);
+        await f.looseBareObjects();
         const oid = (await f.bareGit("rev-parse", type === "commit" ? "HEAD" : type === "tree" ? "HEAD^{tree}" : "HEAD:tracked")).trim();
         const loose = path.join(f.bare, "objects", oid.slice(0, 2), oid.slice(2));
         const original = inflateSync(await nativeFs.readFile(loose));
@@ -1557,10 +1561,7 @@ repackCp.spawn = function(...args) {
 
         // Corrupt worker-owned bare metadata under the authentic blob identity;
         // the unchanged worktree still hashes to that identity.
-        await nativeFs.rm(path.join(f.bare, "objects"), { recursive: true });
-        await fs.chmod(f.data, 0o755);
-        await nativeFs.cp(path.join(f.data, "seed/.git/objects"), path.join(f.bare, "objects"), { recursive: true });
-        await fs.chmod(f.data, 0o700);
+        await f.looseBareObjects();
         const name = kind === "symlink" ? "link" : "tracked";
         const oid = (await f.bareGit("rev-parse", "HEAD:" + name)).trim();
         const loose = path.join(f.bare, "objects", oid.slice(0, 2), oid.slice(2));
