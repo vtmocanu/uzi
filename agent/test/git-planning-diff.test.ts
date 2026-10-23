@@ -91,12 +91,15 @@ async function fixture(options: {
   dispose: () => Promise<void>;
 }> {
   const data = await fixtureIO.temporaryDirectory("planning-fixture-");
-  // Under the UID split each identity's TMPDIR is a private 0700 directory, so the worker-owned
-  // protected root goes in their shared parent, which the runner can traverse but not write.
+  // Under the UID split each identity's TMPDIR is a private 0700 directory. Place the worker-owned
+  // protected root beneath the shared traversable tmp parent. Its worker ownership and 0755 mode,
+  // together with the parent's ownership/sticky protection, prevent runner replacement or writes.
   const protectedParent = uidSplitActive() ? path.dirname(os.tmpdir()) : os.tmpdir();
   const protectedRoot = await nativeFs.mkdtemp(path.join(await nativeFs.realpath(protectedParent), "planning-protected-"));
   await nativeFs.chmod(protectedRoot, 0o755);
   let clone = "";
+  const stage = path.join(protectedRoot, "seed-stage");
+  const staged = path.join(stage, "seed.git");
   try {
     const seed = path.join(data, "seed");
     clone = path.join(protectedRoot, "runner", "repo", "issue-1");
@@ -111,14 +114,18 @@ async function fixture(options: {
     await options.seed?.(seed);
     await run(seed, "add", ".");
     await run(seed, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "base");
-    // Worker native IO owns the bare and protected parents. Runner IPC never
-    // creates authority; temporary read access to the seed is removed afterwards.
-    await fs.chmod(data, 0o755);
+    // Worker native IO owns the bare and protected parents. Runner IPC never creates
+    // authority. The worker cannot traverse the runner's private TMPDIR, so the runner
+    // stages a bare copy of the seed in a temporarily open directory, removed afterwards.
+    await nativeFs.mkdir(stage, { mode: 0o755 });
+    await nativeFs.chmod(stage, 0o777);
+    await run(seed, "clone", "--quiet", "--bare", "--no-local", seed, staged);
     await nativeFs.mkdir(path.dirname(bare), { recursive: true, mode: 0o755 });
     const bareGit = async (...args: string[]): Promise<string> => (await workerExec("git", ["-C", bare, ...args],
       { env: gitEnv(), timeout: 5000 })).stdout;
-    await workerExec("git", ["clone", "--quiet", "--bare", "--no-local", seed, bare], { env: gitEnv(), timeout: 5000 });
-    await fs.chmod(data, 0o700);
+    await workerExec("git", ["clone", "--quiet", "--bare", "--no-local", staged, bare], { env: gitEnv(), timeout: 5000 });
+    await fs.rm(staged, { recursive: true, force: true });
+    await nativeFs.rmdir(stage);
     await nativeFs.mkdir(path.dirname(clone), { recursive: true, mode: 0o755 });
     await nativeFs.chmod(path.dirname(clone), 0o777);
     await run(seed, "clone", "--quiet", options.shared ? "--shared" : "--no-local", bare, clone);
@@ -236,13 +243,19 @@ process.on("exit", () => meterFs.writeFileSync(${JSON.stringify(metricPath)}, JS
         }
       },
       dispose: async () => {
+        // The runner-owned clone sits in a worker-owned parent: reopen it so the runner can remove it.
+        await nativeFs.chmod(path.dirname(clone), 0o777);
         await fs.rm(clone, { recursive: true, force: true });
         await fs.rm(data, { recursive: true, force: true });
         await nativeFs.rm(protectedRoot, { recursive: true, force: true });
       },
     };
   } catch (error) {
-    if (clone) await fs.rm(clone, { recursive: true, force: true });
+    if (clone) {
+      await nativeFs.chmod(path.dirname(clone), 0o777).catch(() => undefined);
+      await fs.rm(clone, { recursive: true, force: true });
+    }
+    await fs.rm(staged, { recursive: true, force: true });
     await nativeFs.rm(protectedRoot, { recursive: true, force: true });
     await fs.rm(data, { recursive: true, force: true });
     throw error;
