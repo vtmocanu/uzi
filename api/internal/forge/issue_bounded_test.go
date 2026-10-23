@@ -36,7 +36,7 @@ func boundedIssueDriver(t *testing.T, driver string, rt http.RoundTripper) Forge
 
 // Serial: the transport override and lowered ceiling are package globals.
 func TestGetIssueBounded(t *testing.T) {
-	lowerGitLabLimit(t, 8<<10)
+	successLimit := int(issueResponseBytes)
 	for _, driver := range []string{"github", "gitlab", "forgejo"} {
 		for _, tc := range []struct {
 			name              string
@@ -46,10 +46,10 @@ func TestGetIssueBounded(t *testing.T) {
 			overflow, missing bool
 		}{
 			{name: "valid", status: 200, body: `{"iid":17,"number":17,"title":"small"}`},
-			{name: "exact success cap", status: 200, body: `{"iid":17,"number":17,"title":"small"}` + strings.Repeat(" ", (8<<10)-len(`{"iid":17,"number":17,"title":"small"}`))},
+			{name: "exact success cap", status: 200, body: `{"iid":17,"number":17,"title":"small"}` + strings.Repeat(" ", successLimit-len(`{"iid":17,"number":17,"title":"small"}`))},
 			{name: "exact error cap", status: 404, body: `{"message":"not found"}` + strings.Repeat(" ", (4<<10)-len(`{"message":"not found"}`)), missing: true},
 			{name: "missing", status: 404, body: `{"message":"not found"}`, missing: true},
-			{name: "over success", status: 200, body: `{"iid":17,"number":17,"body":"` + strings.Repeat("x", 9<<10) + `"}`, overflow: true},
+			{name: "over success", status: 200, body: `{"iid":17,"number":17,"body":"` + strings.Repeat("x", successLimit) + `"}`, overflow: true},
 			{name: "over error", status: 400, body: `{"message":"private-` + strings.Repeat("x", 5<<10) + `"}`, overflow: true},
 			{name: "over missing", status: 404, body: `{"message":"private-` + strings.Repeat("x", 5<<10) + `"}`, overflow: true},
 			{name: "over retryable", status: 500, body: strings.Repeat("x", 5<<10), overflow: true},
@@ -81,7 +81,10 @@ func TestGetIssueBounded(t *testing.T) {
 					if errors.As(err, &missing) {
 						t.Fatal("overflow classified as missing")
 					}
-					limit := int64(8 << 10)
+					if IsIssueResponseTooLarge(err) != (tc.status == http.StatusOK) || Class(err) != classifyError(nil, tc.status) {
+						t.Fatalf("lost response provenance or class: %+v class=%s", large, Class(err))
+					}
+					limit := issueResponseBytes
 					if tc.status != 200 {
 						limit = 4 << 10
 					}
@@ -110,25 +113,29 @@ func TestGetIssueBounded(t *testing.T) {
 	}
 }
 
-func TestGetIssueBoundedLeavesOrdinaryReadsUnchanged(t *testing.T) {
-	lowerGitLabLimit(t, 128)
+func TestGetIssueBoundedPreservesDriverLimits(t *testing.T) {
 	for _, driver := range []string{"github", "gitlab", "forgejo"} {
 		t.Run(driver, func(t *testing.T) {
-			body := `{"iid":17,"number":17,"title":"` + strings.Repeat("x", 1024) + `"}`
+			body := `{"iid":17,"number":17,"title":"` + strings.Repeat("x", int(issueResponseBytes)) + `"}`
 			rt := &fabRT{}
 			rt.fn = func(_ int, req *http.Request) (*http.Response, error) {
 				return rt.resp(req, 200, strings.NewReader(body)), nil
 			}
 			f := boundedIssueDriver(t, driver, rt)
 			issue, err := f.GetIssue(context.Background(), 7, 17)
-			if err != nil || issue.IID != 17 || len(issue.Title) != 1024 || rt.totalRead() != int64(len(body)) {
-				t.Fatalf("ordinary read changed: iid=%d title bytes=%d read=%d err=%v", issue.IID, len(issue.Title), rt.totalRead(), err)
+			if driver == "forgejo" {
+				if err != nil || issue.IID != 17 || len(issue.Title) != int(issueResponseBytes) {
+					t.Fatalf("ordinary Forgejo read changed: iid=%d title bytes=%d err=%v", issue.IID, len(issue.Title), err)
+				}
+			} else if !IsIssueResponseTooLarge(err) {
+				t.Fatalf("ordinary direct-issue ceiling/provenance changed: %v", err)
 			}
 			_, err = GetIssueBounded(context.Background(), f, 7, 17)
 			if !errors.Is(err, ErrResponseTooLarge) {
 				t.Fatalf("bounded read=%v", err)
 			}
 			// The failed bounded call must not poison a subsequent ordinary call.
+			body = `{"iid":17,"number":17,"title":"small"}`
 			issue, err = f.GetIssue(context.Background(), 7, 17)
 			if err != nil || issue.IID != 17 {
 				t.Fatalf("subsequent ordinary read=%+v err=%v", issue, err)
@@ -147,7 +154,9 @@ func TestGetIssueBoundedSkipsConditionalCacheBuffering(t *testing.T) {
 	}
 	cache := newETagTransportWithCache(rt, "fixture", &etagCache{})
 	transport := responseLimitTransport{base: cache}
-	ctx := withResponseLimit(context.Background(), &responseLimitState{})
+	state := newResponseLimitState(128)
+	state.continuationValidation = true
+	ctx := withResponseLimit(context.Background(), state)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/repos/acme/widgets/pulls/17", nil)
 	if err != nil {
 		t.Fatal(err)

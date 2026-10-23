@@ -74,7 +74,11 @@ func (g *github) GetIssue(ctx context.Context, projectID, issueIID int64) (Issue
 	if err != nil {
 		return Issue{}, g.wrapErr("get issue", err)
 	}
-	i, resp, err := g.client.Issues.Get(ctx, slug.owner, slug.repo, num)
+	state := issueResponseState(ctx)
+	i, resp, err := g.client.Issues.Get(withResponseLimit(ctx, state), slug.owner, slug.repo, num)
+	if state.overflow.Load() {
+		return Issue{}, g.wrapErr("get issue", state.err())
+	}
 	if err != nil {
 		wrapped := g.wrapErr("get issue", err)
 		if resp != nil && resp.Response != nil {
@@ -183,7 +187,11 @@ func (g *github) ListIssueComments(ctx context.Context, projectID, issueIID int6
 	wrap := func(e error) error { return g.wrapErr("list issue comments", e) }
 	return paginate(wrap, func(page int) ([]IssueComment, int, error) {
 		opt.Page = page
-		comments, resp, err := g.client.Issues.ListComments(ctx, slug.owner, slug.repo, num, opt)
+		state := newResponseLimitState(commentPageResponseBytes)
+		comments, resp, err := g.client.Issues.ListComments(withResponseLimit(ctx, state), slug.owner, slug.repo, num, opt)
+		if state.overflow.Load() {
+			return nil, 0, state.err()
+		}
 		if err != nil {
 			return nil, 0, err
 		}

@@ -91,6 +91,9 @@ func (f *forgejo) GetIssue(ctx context.Context, projectID, issueIID int64) (Issu
 	if err != nil {
 		return Issue{}, err
 	}
+	if state := responseLimitFrom(ctx); state != nil && state.continuationValidation {
+		state.issueTarget = true
+	}
 	i, resp, err := c.GetIssue(slug.owner, slug.repo, issueIID)
 	if err != nil {
 		wrapped := f.wrapErr("get issue", err)

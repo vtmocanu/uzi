@@ -74,7 +74,7 @@ func (g *gitLab) GetMergeRequestSummary(ctx context.Context, projectID, iid int6
 	state := &responseLimitState{}
 	mr, resp, err := g.client.MergeRequests.GetMergeRequest(projectID, iid, nil, gitlab.WithContext(withResponseLimit(ctx, state)))
 	if state.overflow.Load() {
-		return MergeRequestSummary{}, g.wrapErr("get merge request summary", &ResponseTooLargeError{})
+		return MergeRequestSummary{}, g.wrapErr("get merge request summary", mrOverflowError(state.err()))
 	}
 	if err != nil {
 		if resp != nil && resp.StatusCode == http.StatusNotFound {

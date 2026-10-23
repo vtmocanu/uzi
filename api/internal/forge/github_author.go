@@ -12,7 +12,11 @@ func (g *github) RepositoryAuthorEligibility(ctx context.Context, projectID, aut
 	if projectID <= 0 || authorID <= 0 {
 		return AuthorUnknown, ErrAuthorUnknown
 	}
-	u, userResp, err := g.client.Users.GetByID(ctx, authorID)
+	state := newResponseLimitState(objectResponseBytes)
+	u, userResp, err := g.client.Users.GetByID(withResponseLimit(ctx, state), authorID)
+	if state.overflow.Load() {
+		return AuthorUnknown, g.wrapErr("resolve repository author", state.err())
+	}
 	if err != nil {
 		return AuthorUnknown, g.wrapErr("resolve repository author", err)
 	}
@@ -20,7 +24,11 @@ func (g *github) RepositoryAuthorEligibility(ctx context.Context, projectID, aut
 		return AuthorUnknown, ErrAuthorUnknown
 	}
 	members, err := assessmentEvidence(ctx, evidenceKey{g, projectID, "collaborators"}, func(ctx context.Context) (map[int64]*gh.User, error) {
-		r, repoResp, err := g.client.Repositories.GetByID(ctx, projectID)
+		state := newResponseLimitState(objectResponseBytes)
+		r, repoResp, err := g.client.Repositories.GetByID(withResponseLimit(ctx, state), projectID)
+		if state.overflow.Load() {
+			return nil, g.wrapErr("author repository", state.err())
+		}
 		if err != nil {
 			return nil, g.wrapErr("author repository", err)
 		}
@@ -28,8 +36,12 @@ func (g *github) RepositoryAuthorEligibility(ctx context.Context, projectID, aut
 			return nil, ErrAuthorUnknown
 		}
 		all, err := paginate(func(e error) error { return g.wrapErr("author collaborators", e) }, func(page int) ([]*gh.User, int, error) {
-			users, resp, err := g.client.Repositories.ListCollaborators(ctx, r.GetOwner().GetLogin(), r.GetName(),
+			state := newResponseLimitState(objectResponseBytes)
+			users, resp, err := g.client.Repositories.ListCollaborators(withResponseLimit(ctx, state), r.GetOwner().GetLogin(), r.GetName(),
 				&gh.ListCollaboratorsOptions{Affiliation: "all", ListOptions: gh.ListOptions{Page: page, PerPage: 100}})
+			if state.overflow.Load() {
+				return nil, 0, state.err()
+			}
 			if err != nil {
 				return nil, 0, err
 			}
