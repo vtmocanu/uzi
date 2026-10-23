@@ -15160,6 +15160,7 @@ export class RunRunner {
     fallback: (held: HeldFreeCapture, error: unknown) => Promise<T>,
     resume?: (error: unknown) => Promise<T>,
     deferWallCancellation = false,
+    handoffDeferral?: (error: unknown) => Promise<T>,
   ): Promise<T> {
     const progress = this.captureProgressFor(flight, episode);
     return this.runGatedSink(flight, async () => {
@@ -15215,6 +15216,9 @@ export class RunRunner {
           throw error;
         }
         if (actionCompleted) throw error;
+        // Typed recovery returns to the existing A owner only after the primary joined.
+        // It has not accepted local evidence and must acquire its own proof per attempt.
+        if (handoffDeferral && codexDeferralOf(error) !== undefined) return handoffDeferral(error);
         if (!isCodexBoundaryError(error) && codexDeferralOf(error) === undefined &&
             Date.now() < episode.healthyDeadlineAt) {
           if (resume) return resume(error);
@@ -17490,7 +17494,8 @@ export class RunRunner {
     runLog: Logger,
     cause: RecoveryParkCause = { kind: "transient" },
     opts: { terminalDisk?: boolean; heldAuthenticated?: HeldAuthenticatedCapture; heldCapture?: HeldFreeCapture;
-      episode?: CaptureEpisode; freeFallback?: boolean; dispositionOnly?: boolean; dispositionSignal?: AbortSignal } = {},
+      episode?: CaptureEpisode; freeFallback?: boolean; dispositionOnly?: boolean; dispositionSignal?: AbortSignal;
+      credentialDeadlineAt?: number } = {},
   ): Promise<boolean> {
     const episode = opts.episode;
     if (opts.dispositionOnly && episode) this.validateJoinedCapture(flight, episode);
@@ -17542,7 +17547,10 @@ export class RunRunner {
             this.handleRecoveryExhausted(err, claim, flight, executor, batcher, reportState, runLog,
               deferral ? { kind: deferral } : cause,
               { ...opts, episode: captureEpisode, freeFallback: true, dispositionOnly: true, dispositionSignal: signal }));
-        });
+        }, false, error => this.git.withRecoveryOperation(this.shutdownSignal.signal, captureEpisode.deadlineAt, signal =>
+          this.handleRecoveryExhausted(err, claim, flight, executor, batcher, reportState, runLog,
+            { kind: codexDeferralOf(error)! },
+            { credentialDeadlineAt: captureEpisode.deadlineAt, dispositionSignal: signal })));
     }
     const report = reportState;
     reportState = async (body, signal = captureSignal) => {
@@ -17644,7 +17652,7 @@ export class RunRunner {
         });
         const result = opts.heldCapture
           ? { kind: "observed_empty" as const, value: await captureFree(opts.heldCapture) }
-          : await this.runFreeCapture(claim, flight, episode?.deadlineAt ?? Date.now() + this.codexBoundaryDeadlineMs,
+          : await this.runFreeCapture(claim, flight, opts.credentialDeadlineAt ?? episode?.deadlineAt ?? Date.now() + this.codexBoundaryDeadlineMs,
             this.shutdownSignal.signal, captureFree, "capture", "strict");
         if (result.kind !== "observed_empty") return false;
         const attempt = result.value;
@@ -17743,6 +17751,8 @@ export class RunRunner {
     let propagating = false;
     try {
       for (;;) {
+        if (opts.credentialDeadlineAt !== undefined &&
+            (Date.now() >= opts.credentialDeadlineAt || captureSignal?.aborted)) return false;
         if (opts.heldAuthenticated || opts.heldCapture) {
           if (flight.steering.claimFence() !== undefined) throw new StaleClaimError();
           if (flight.steering.isCancelled()) throw new Error("run cancelled");
@@ -17960,7 +17970,7 @@ export class RunRunner {
               });
               const result = opts.heldCapture
                 ? { kind: "observed_empty" as const, value: await captureFree(opts.heldCapture) }
-                : await this.runFreeCapture(claim, flight, episode?.deadlineAt ?? Date.now() + this.codexBoundaryDeadlineMs,
+                : await this.runFreeCapture(claim, flight, opts.credentialDeadlineAt ?? episode?.deadlineAt ?? Date.now() + this.codexBoundaryDeadlineMs,
                   this.shutdownSignal.signal, captureFree, "capture", "strict");
               if (result.kind !== "observed_empty") {
                 await note(credentialDeferred ? feed.settleIncomplete : "Capture boundary unavailable. Keeping the original work and session on this worker.");
@@ -18364,7 +18374,8 @@ export class RunRunner {
       // B2: the one cleanup-time snapshot, after the handler's return-path work.
       // A shutdown exit does no cleanup-time work inside the termination grace (own-mode quiesce, Docker
       // teardown, bare lock): the pending release is dropped and the latched preserve flag keeps the clone.
-      if (!propagating && (flight.active?.shuttingDown || this.shuttingDownGlobal)) pendingRelease = undefined;
+      if (!propagating && (flight.active?.shuttingDown || this.shuttingDownGlobal ||
+           (opts.credentialDeadlineAt !== undefined && Date.now() >= opts.credentialDeadlineAt))) pendingRelease = undefined;
       else if (!propagating) await settleCloneRelease();
       // The outer B wrapper still owns a continuation before any park request.
       // Its next credential-free/local-only disposition needs the same open batcher.
