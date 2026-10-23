@@ -4,6 +4,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { nullLogger } from "./helpers.js";
+import { followSuccessfulPush } from "./publication-fixture.js";
 import { StubExecutor, type Executor } from "../src/executor.js";
 import { RunRunner, composeWorkflowScopeReason } from "../src/runner.js";
 import { GitHubClient } from "../src/forge.js";
@@ -489,7 +490,11 @@ describe("RunRunner — worker-performed push + MR", () => {
   // true (origin carries a COMMITTED checkpoint a prior attempt landed, mirrored into the
   // bare) while this worker published nothing itself. It must FAIL with an actionable
   // reason, opening NEITHER a push NOR an MR — mirroring the undeclared-empty-diff FAIL path.
-  it("fails a report-only run that published a checkpoint (orphan guard), opening NO MR (issue #299)", async () => {
+  // #3360: an ISSUE run's declared report_only with a published checkpoint now falls back to
+  // non-closing delivery; the #299 failure remains when the candidate is confirmed empty
+  // (changedFiles []), also with scopeCapped evidence (conservative true + empty + scopeCapped).
+  for (const scopeCapped of [false, true]) {
+  it(`fails a report-only run that published a checkpoint with an EMPTY candidate (orphan guard)${scopeCapped ? " even when scopeCapped" : ""}, opening NO MR (issue #299 / #3360)`, async () => {
     const { gitlab, calls } = fakeGitlab();
     let pushed = false;
     git.pushBranch = (async () => {
@@ -499,11 +504,13 @@ describe("RunRunner — worker-performed push + MR", () => {
     // into the bare) — this worker did not publish it, so lastPublishedTip stays undefined
     // and the guard must key on hasCommittedCheckpoint.
     git.hasCommittedCheckpoint = (async () => true) as typeof git.hasCommittedCheckpoint;
+    git.changedFiles = (async () => []) as typeof git.changedFiles;
     const exec: Executor = {
       run: async (ctx) => ({
         branch: ctx.branch,
         reportOnly: true,
         summary: "verified: no code change needed",
+        ...(scopeCapped ? { scopeCapped: { completedCount: 0, total: 2 } } : {}),
       }),
     };
     const claim = gitlabClaim(23);
@@ -518,6 +525,7 @@ describe("RunRunner — worker-performed push + MR", () => {
     )!.body;
     assert.match(failed.failure_reason ?? "", /report_only/);
     assert.match(failed.failure_reason ?? "", /checkpoint/);
+    assert.doesNotMatch(failed.failure_reason ?? "", /report_only was not set/);
     assert.ok(
       !("report_only" in failed) || failed.report_only !== true,
       "the run FAILED — it is not a report-only completion",
@@ -525,6 +533,29 @@ describe("RunRunner — worker-performed push + MR", () => {
     assert.strictEqual(calls.length, 0, "no MR opened on the guarded report-only run");
     assert.strictEqual(pushed, false, "no branch pushed on the guarded report-only run");
     assert.strictEqual(fs.existsSync(worktreeDirFor(23)), false);
+  });
+  }
+
+  // #3360: changedFiles null (diff failure) keeps the guard's fail-open: the fallback delivers.
+  it("report-only with a published checkpoint and an UNREADABLE diff fails open into non-closing delivery (#3360)", async () => {
+    const forge = fakeGitlab();
+    const { gitlab, calls } = forge;
+    followSuccessfulPush(git, forge.pr);
+    git.hasCommittedCheckpoint = (async () => true) as typeof git.hasCommittedCheckpoint;
+    git.changedFiles = (async () => null) as typeof git.changedFiles;
+    const stub = new StubExecutor(nullLogger());
+    const exec: Executor = {
+      run: async (ctx) => ({ ...(await stub.run(ctx)), reportOnly: true, summary: "done" }),
+    };
+    const claim = gitlabClaim(24);
+    await runner(exec, gitlab).execute(claim);
+    const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed");
+    assert.equal(failed, undefined, failed?.body.failure_reason);
+    const posts = calls.filter((c) => c.method === "POST");
+    assert.equal(posts.length, 1, "one MR opened");
+    const description = String((JSON.parse(posts[0]!.body ?? "{}") as { description?: unknown }).description);
+    assert.doesNotMatch(description, /Closes #24/);
+    assert.match(description, /Issue remains open/);
   });
 
   // issue #341: a zero-commit `prompt` run (schedule-fired ad-hoc work) now has its OWN
