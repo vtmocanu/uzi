@@ -34,7 +34,7 @@ func manualMigrationDB(t *testing.T) (context.Context, string, *pgxpool.Pool) {
 		t.Fatalf("test database marker required: marked=%v err=%v", marked, err)
 	}
 	ctx, isolated := standIsolatedDB(t, "manual_migration_")
-	if err := store.MigrateTo(ctx, isolated, 348); err != nil {
+	if err := store.MigrateTo(ctx, isolated, 351); err != nil {
 		t.Fatal(err)
 	}
 	pool, err := store.OpenPool(ctx, isolated)
@@ -50,7 +50,7 @@ func TestManualCordonMigrationLifecycleLiveDB(t *testing.T) {
 	owner, worker := uuid.New(), uuid.New()
 	mustExec(ctx, t, pool, "INSERT INTO users(id,email,password_hash) VALUES($1,$2,'x')", owner, owner.String()+"@example.com")
 	mustExec(ctx, t, pool, "INSERT INTO workers(id,user_id,name,token_hash) VALUES($1,$2,'migration',$3)", worker, owner, worker[:])
-	if err := store.MigrateTo(ctx, dsn, 349); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 352); err != nil {
 		t.Fatal(err)
 	}
 	validated := func(want bool) {
@@ -95,17 +95,17 @@ func TestManualCordonMigrationLifecycleLiveDB(t *testing.T) {
 		return got
 	}
 	beforeValidation := manualFields()
-	if err := store.MigrateTo(ctx, dsn, 350); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 353); err != nil {
 		t.Fatal(err)
 	}
 	validated(true)
 	if after := manualFields(); after != beforeValidation {
 		t.Fatalf("constraint validation changed manual fields: before=%s after=%s", beforeValidation, after)
 	}
-	if err := store.MigrateTo(ctx, dsn, 351); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 354); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.MigrateDownTo(ctx, dsn, 349); err != nil {
+	if err := store.MigrateDownTo(ctx, dsn, 352); err != nil {
 		t.Fatal(err)
 	}
 	snapshot := func() string {
@@ -122,7 +122,7 @@ func TestManualCordonMigrationLifecycleLiveDB(t *testing.T) {
 			mustExec(ctx, t, pool, "UPDATE workers SET manual_cordoned_at=NULL,manual_cordoned_by=NULL,manual_cordoned_by_label=NULL,manual_cordon_reason=NULL WHERE id=$1", worker)
 		}
 		before := snapshot()
-		err := store.MigrateDownTo(ctx, dsn, 348)
+		err := store.MigrateDownTo(ctx, dsn, 351)
 		if err == nil || !strings.Contains(err.Error(), "manual cordon intent or audit history exists; rollback refused") {
 			t.Fatalf("guarded Down historyOnly=%v: %v", historyOnly, err)
 		}
@@ -131,7 +131,7 @@ func TestManualCordonMigrationLifecycleLiveDB(t *testing.T) {
 		}
 	}
 	mustExec(ctx, t, pool, "DELETE FROM worker_cordon_events")
-	if err := store.MigrateDownTo(ctx, dsn, 348); err != nil {
+	if err := store.MigrateDownTo(ctx, dsn, 351); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Migrate(ctx, dsn); err != nil {
@@ -160,7 +160,7 @@ func TestManualCordonMigrationLockRetryLiveDB(t *testing.T) {
 		t.Fatalf("lock timeout returned before 5s: %s", elapsed)
 	}
 	applied, _, _, err := store.SchemaVersionStatus(ctx, pool)
-	if err != nil || applied != 348 {
+	if err != nil || applied != 351 {
 		t.Fatalf("failed migration version=%d err=%v", applied, err)
 	}
 	if n := scalarInt(ctx, t, pool, "SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='workers' AND column_name LIKE 'manual_cordon%'"); n != 0 {

@@ -18,10 +18,10 @@
 # --- Package identity (upstream release coordinates) -------------------------------
 # Renovate updates this identity block and both per-arch tag/hash pairs in one PR.
 # install-codex.sh rejects disagreement even when only one architecture is built.
-CODEX_VERSION=0.162.1
-CODEX_MANIFEST_VERSION=0.162.1
-CODEX_TAG=rust-v0.162.1
-CODEX_SOURCE_COMMIT=092d3acd6bec3e3a14bdc7e7a2810ab628ab759d
+CODEX_VERSION=0.163.0
+CODEX_MANIFEST_VERSION=0.163.0
+CODEX_TAG=rust-v0.163.0
+CODEX_SOURCE_COMMIT=83086188ae0614bd882818ff1aa23f3194962012
 # Artifacts live at ${CODEX_BASE_URL}/${CODEX_TAG}/${artifact}.
 CODEX_BASE_URL=https://github.com/openai/codex/releases/download
 
@@ -37,17 +37,17 @@ CODEX_MANIFEST_PATH_DIR=codex-path
 # --- Expected archive members (all must exist at the archive root after extract) ---
 # The tarball extracts members AT THE ARCHIVE ROOT (no top-level prefix dir). Every
 # member below is required; a missing one rejects the package before installation.
-CODEX_MEMBERS=bin/codex bin/codex-code-mode-host codex-package.json codex-path/rg codex-resources/bwrap codex-resources/zsh/bin/zsh
+CODEX_MEMBERS=bin/codex bin/codex-code-mode-host codex-package.json codex-path/rg codex-resources/bwrap
 
 # --- Per-TARGETARCH artifact + integrity -------------------------------------------
 # amd64 -> x86_64 musl
 CODEX_TARGET_amd64=x86_64-unknown-linux-musl
 CODEX_ARTIFACT_amd64=codex-package-x86_64-unknown-linux-musl.tar.gz
-CODEX_TAG_amd64=rust-v0.162.1
-CODEX_SHA256_amd64=a676f5722aae0d86cbe3764332f08eab1fdd89dc0a300b3ad4ffbf48611fa3e3
+CODEX_TAG_amd64=rust-v0.163.0
+CODEX_SHA256_amd64=582646c6bf0561eb0de540f7fc85b9121b0091a826bc6e96830b7f1722122182
 
 # arm64 -> aarch64 musl
 CODEX_TARGET_arm64=aarch64-unknown-linux-musl
 CODEX_ARTIFACT_arm64=codex-package-aarch64-unknown-linux-musl.tar.gz
-CODEX_TAG_arm64=rust-v0.162.1
-CODEX_SHA256_arm64=53a9ce0b94beb27a63fdeb2f7704d95199e17b3898aa33b60461a1a93ac0d88b
+CODEX_TAG_arm64=rust-v0.163.0
+CODEX_SHA256_arm64=9d8ecf2d19d3e184877983902d6c85de48b3888dcb72c382a8a0c975845927fb

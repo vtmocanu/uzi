@@ -34,6 +34,24 @@ and releases custody against that ref. The archive above is then the fallback
 when publishing is not possible. See
 [Publishing terminal held work](#publishing-terminal-held-work).
 
+Background recovery passes now cancel their Git and HTTP work during worker
+shutdown and wait for that work to settle before releasing their locks.
+Foreground preservation keeps its existing grace period. An interrupted
+request still has an uncertain outcome; shutdown does not acknowledge an
+archive or authorize deleting its source.
+
+After an ordinary recovery archive upload succeeds and the run's work has
+fully settled, the worker promptly retries its saved custody finalization.
+It need not wait for the next heartbeat or restart. If settlement is uncertain,
+the saved archive remains available to the existing replay paths.
+
+Automatic model-free preservation of blocked or orphaned terminal work
+remains disabled, and its capacity remains unverified. This change adds no
+new automatic preservation guarantee for uncommitted or local-only work.
+Local sources keep their existing protection and inspection/discard paths. See the
+[terminal-producer delivery hold](../adr/1197-transient-recovery-park.md#terminal-producer-delivery-hold-issue-3031-2026-10-20)
+for the implementation boundary and outstanding acceptance.
+
 This is a safety net for a run that already produced real commits, not a
 guarantee against every possible failure. It does **not** cover uncommitted
 files (except the work-in-progress commit a terminal run's held ref carries), the SDK transcript, the worker's HOME directory, or a worker that

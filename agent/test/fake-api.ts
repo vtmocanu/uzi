@@ -44,6 +44,12 @@ export class FakeApi {
   /** Issue #2230: retain handler exceptions behind HTTP 500 for failure-only diagnostics. */
   readonly handlerExceptions: Array<{ method: string; path: string; error: string }> = [];
 
+  /** Opt-in raw HTTP reply; callbacks can sequence replies using recorded requests. */
+  publicationContextWire: ((request: { runId: string; body: Record<string, unknown> }) =>
+    { status: number; body?: unknown; rawBody?: string } |
+    Promise<{ status: number; body?: unknown; rawBody?: string }>) | undefined;
+  readonly publicationContextRequests: Array<{ runId: string; body: Record<string, unknown> }> = [];
+
   // --- control -------------------------------------------------------------
   private readonly claimQueue: ClaimResponse[] = [];
   private readonly inputsByRun = new Map<string, UserInput[]>();
@@ -1588,6 +1594,20 @@ export class FakeApi {
       if (!o || o.httpStatus === 404) return send(res, 404, { error: "run not found for this worker" });
       if (o.httpStatus !== 200 || !o.identity) return send(res, o.httpStatus, { error: "injected orphan failure" });
       return send(res, 200, o.identity);
+    }
+
+    const publicationContextMatch = /^\/api\/worker\/runs\/([^/]+)\/publication-context$/.exec(p);
+    if (req.method === "POST" && publicationContextMatch) {
+      const request = { runId: publicationContextMatch[1]!, body: json };
+      this.publicationContextRequests.push(request);
+      const reply = await this.publicationContextWire?.(request);
+      if (!reply) return send(res, 503, { error: "publication context unavailable" });
+      if (reply.rawBody !== undefined) {
+        res.writeHead(reply.status, { "Content-Type": "application/json" });
+        res.end(reply.rawBody);
+        return;
+      }
+      return send(res, reply.status, reply.body);
     }
 
     const interruptedMatch = /^\/api\/worker\/runs\/([^/]+)\/interrupted-calls$/.exec(p);

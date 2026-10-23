@@ -7,7 +7,7 @@ audience: operator
 # Egress profiles
 
 An egress profile is a named site list: the hosts an official-sources research
-run may read from ([PRD #1906](../prds/1906-official-sources-web-research.md)).
+run may read from ([PRD #1906](../prds/done/1906-official-sources-web-research.md)).
 Admins create and edit profiles; a run names one profile, never a list of
 domains.
 

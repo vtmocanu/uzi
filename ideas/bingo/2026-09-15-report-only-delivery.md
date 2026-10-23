@@ -226,8 +226,8 @@ GitLab issue comment: MR link on success; on failure, one comment with a run lin
   name `api/internal/settings/keys.go` for an additive kill-switch key; the keys are
   distinct, so the edits are non-conflicting. PRD #1253 (`prds/1253-run-merged-signal.md`,
   run-merged signal) is the opposite population — runs WITH an MR. PRD #1255
-  (`prds/1255-tui-forge-view.md`, still open) landed a `Conflicts *bool` on its forge
-  summary type (`prds/1255-tui-forge-view.md:231`), an unrelated TUI-forge lane.
+  (`prds/done/1255-tui-forge-view.md`, still open) landed a `Conflicts *bool` on its forge
+  summary type (`prds/done/1255-tui-forge-view.md:231`), an unrelated TUI-forge lane.
 - **Explicitly out of scope.** Closing the issue — a human already can
   (`prds/done/1034-close-reopen-from-board.md`), and "report-only ≠ resolved"
   (`.agents/skills/uzi-release/SKILL.md:52`). Changing the failure comment. A
@@ -255,7 +255,7 @@ Commands re-run at `ab1d7431`:
 | CreateIssueNote callers | `git grep -rn CreateIssueNote -- api/ \| grep -v -i test` | `poller/autopilot.go:280`, `poller/ci_autofix.go:247,293`, `poller/mr_review_watch.go:260`, `runlifecycle/lifecycle.go:470` — none carries report_md |
 | Completion notification kind | `git grep -n 'notifysvc.Notification{' -- api/ \| grep -v _test`, then read each `Kind:` (plus `notifysvc`'s own constructions) | 13+ distinct kinds (`run_failed`, `ci_autofix_*`, `mr_rework_halted`, `schedule_error`, `judge_review`, `guard_role_excluded`, `selfimprove_*`, `vault_locked`, `custody_episode`, `early_limit_reset`, `incidental_finding`) — none is a run completion |
 | report-only user docs | `git grep -rn -i 'report-only\|report only' -- docs/` | Only `docs/agent-templates.md:86`, unrelated wave-instruction sense |
-| Open PRDs on this surface | grep `runlifecycle`/`report_md` in `prds/1253-run-merged-signal.md`, `prds/1202-on-demand-mr-rework.md`, `prds/1233-structured-blockers-mr-rework.md`, `prds/1293-failed-run-rate-dashboard.md` | Zero matches in all four |
+| Open PRDs on this surface | grep `runlifecycle`/`report_md` in `prds/1253-run-merged-signal.md`, `prds/done/1202-on-demand-mr-rework.md`, `prds/done/1233-structured-blockers-mr-rework.md`, `prds/1293-failed-run-rate-dashboard.md` | Zero matches in all four |
 
 The five `ideas/bingo/` files and their dispositions: run-queue-priority shipped
 (`prds/done/320-run-queue-priority.md`); worker-pause-quiesce's adjacent work archived

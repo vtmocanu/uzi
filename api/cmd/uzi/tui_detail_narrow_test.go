@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/colorprofile"
@@ -30,6 +31,27 @@ func assertNarrowFrame(t *testing.T, label, content string, width int) {
 	}
 	if !crew {
 		t.Errorf("%s: no CREW row rendered (test would be vacuous):\n%s", label, stripANSI(content))
+	}
+}
+
+func TestRunDetailFooterVisibleAt40Columns(t *testing.T) {
+	now := time.Date(2026, time.October, 21, 12, 0, 0, 0, time.UTC)
+	for _, origin := range []string{"lead_park", "owner", ""} {
+		for _, dark := range []bool{false, true} {
+			for _, plain := range []bool{false, true} {
+				t.Run(fmt.Sprintf("origin=%q/dark=%t/plain=%t", origin, dark, plain), func(t *testing.T) {
+					content := detailPauseOrigin(dark, now, origin, 40, plain)
+					rows := strings.Split(strings.TrimRight(content, "\n"), "\n")
+					footer := rows[len(rows)-1]
+					if got := stripANSI(footer); !strings.HasPrefix(got, "esc back · ? keys · ") {
+						t.Errorf("final footer row lost navigation hints: %q", got)
+					}
+					if width := visualWidth(footer); width > 40 {
+						t.Errorf("final footer row is %d columns (> 40): %q", width, stripANSI(footer))
+					}
+				})
+			}
+		}
 	}
 }
 

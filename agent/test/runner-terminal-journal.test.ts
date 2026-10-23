@@ -1,3 +1,6 @@
+import { execFileSync } from "node:child_process";
+import { resolvePendingTerminal } from "../src/terminal-resolve.js";
+import { followSuccessfulPush } from "./publication-fixture.js";
 import { afterEach, describe, it } from "node:test";
 import { SinkGate } from "../src/sink-gate.js";
 import assert from "node:assert/strict";
@@ -9,7 +12,7 @@ import path from "node:path";
 import { nullLogger } from "./helpers.js";
 import { StubExecutor, type Executor, type ExecutorResult, type RunContext } from "../src/executor.js";
 import { Outbox, type RawWriteSeam } from "../src/outbox.js";
-import { api, fakeGitlab, gitlabClaim, installHarness, runner, simulateCommittedWork } from "./runner-harness.js";
+import { api, client, fx, git, fakeGitlab, gitlabClaim, installHarness, runner, simulateCommittedWork } from "./runner-harness.js";
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import { pollUntil, startSweepWorker, sweepClient } from "./worker-sweep-rig.js";
 import type { StateRequest } from "../src/protocol.js";
@@ -188,9 +191,12 @@ it("unit 1: deferred hook preserves finalize and latches across held-skip ACK re
 
 describe("RunRunner terminal journaling (PRD #1391 Run B M3b)", () => {
   it("journals the COMPLETED terminal write-ahead at finishCommittedPublish; a 409 running keeps the durable journal", async () => {
-    const { gitlab } = fakeGitlab();
+    const { gitlab, pr } = fakeGitlab();
     const outbox = await mkOutbox();
-    const claim = gitlabClaim(7, { claim_generation: 3 });
+    api.setRegisterProtocolFeatures(["refresh_publication_context_v1", "completion_non_closing_v1"]);
+    await client.register("source-journal");
+    const pushed = followSuccessfulPush(git, pr);
+    const claim = gitlabClaim(7, { claim_generation: 3, config: { non_closing: { reason: "Owner check pending" } } });
     simulateCommittedWork(); // a real completing run committed work, so the empty-diff guard stays quiet
     // The completed report is refused with a benign 409 `running` (nothing applied), so the
     // write-ahead journal is KEPT rather than retired — exactly the outage/lost-ack shape.
@@ -204,8 +210,33 @@ describe("RunRunner terminal journaling (PRD #1391 Run B M3b)", () => {
 
     assert.equal(outbox.hasPendingTerminal(claim.run_id, 3), true, "the completed outcome is journalled write-ahead and kept on a 409");
     const j = await outbox.readTerminalJournal(claim.run_id, 3);
-    assert.equal(j?.body.status, "completed", "the journal holds the terminal completed state");
+    assert.equal(j?.body.status, "completed", JSON.stringify(j?.body));
     assert.equal(j?.body.branch, "agent/issue-7", "with the pushed branch");
+    assert.deepEqual(j?.body.source_publication, { version: 1, published_head: pushed(), non_closing: true });
+    const original = structuredClone(j!.body);
+    // A caller copy and a later branch update cannot rebind durable replay.
+    (j!.body.source_publication as { published_head: string; non_closing: boolean }).published_head = "b".repeat(40);
+    (j!.body.source_publication as { non_closing: boolean }).non_closing = false;
+    execFileSync("git", ["-C", fx.originPath, "update-ref", "refs/heads/agent/issue-7", "refs/heads/main"]);
+    const replayed: StateRequest[] = [];
+    api.setRegisterProtocolFeatures([]);
+    await client.register("shrunk-replay");
+    await resolvePendingTerminal({ outbox, client, gapFillMax: 100, terminalMaxBytes: 1 << 20, log: nullLogger() }, {
+      runId: claim.run_id, claimGeneration: 3,
+      send: body => client.reportState(claim.run_id, body),
+    });
+    assert.deepEqual((await outbox.readTerminalJournal(claim.run_id, 3))?.body, original);
+    api.setRegisterProtocolFeatures(["refresh_publication_context_v1"]);
+    await client.register("restored-replay");
+    await resolvePendingTerminal({ outbox, client, gapFillMax: 100, terminalMaxBytes: 1 << 20, log: nullLogger() }, {
+      runId: claim.run_id, claimGeneration: 3,
+      send: async body => {
+        replayed.push(structuredClone(body));
+        return client.reportState(claim.run_id, body);
+      },
+    });
+    assert.deepEqual(replayed, [original]);
+    assert.equal(outbox.hasPendingTerminal(claim.run_id, 3), false, "successful replay retires the exact original");
     assert.equal(typeof j?.messagesThroughSeq, "number", "the fence is the run's durable emitted tail");
   });
 

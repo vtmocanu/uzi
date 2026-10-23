@@ -370,7 +370,7 @@ controlled, symlink-refusing channel.
 
 The decision above stands for the lead: only the lead receives the repo's
 `CLAUDE.md`, and "Subagents receive nothing" remains true of subagents. PRD
-[#2170](../prds/2170-code-cross-check.md) adds one more recipient, the read-only
+[#2170](../prds/done/2170-code-cross-check.md) adds one more recipient, the read-only
 checker child of the opt-in Code cross-check ([docs](../docs/cross-check.md#code-cross-check)).
 It is not a subagent: it is a separate run on the other model family.
 

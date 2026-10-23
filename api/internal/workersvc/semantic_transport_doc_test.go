@@ -39,7 +39,7 @@ func TestSemanticTransportLimitsDocumented(t *testing.T) {
 	if !strings.Contains(read("adr/2149-cross-check.md"), heading) {
 		t.Errorf("adr/2149-cross-check.md lacks the heading %q", heading)
 	}
-	for _, rel := range []string{"adr/1225-structural-completion-interlock-invariants.md", "prds/1230-semantic-completion-contract.md"} {
+	for _, rel := range []string{"adr/1225-structural-completion-interlock-invariants.md", "prds/done/1230-semantic-completion-contract.md"} {
 		for _, sentence := range []string{
 			"Maximum-size owner semantic transport is not production-readiness proof.",
 			"#1231 must verify maximum-size owner reads and decisions against production transport deadlines before activation.",

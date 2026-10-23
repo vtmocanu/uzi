@@ -321,8 +321,8 @@ func stateGlyphWord(status, health string, isPlanning, isRevising bool, landingS
 		}
 		return "~", "recovery wait"
 	case statusPaused:
-		// PRD #1190: an owner pause. The ‖ glyph (a pause bar) is its own vocabulary entry
-		// beside the two ~ parks — an owner did this, the ~ parks happened to the run — and
+		// PRD #1190: an ordinary pause, by the owner or the run's lead. The ‖ glyph (a pause
+		// bar) is its own vocabulary entry beside the two ~ parks, and
 		// it is the NO_COLOR twin of the wait ink below, legible under an Ascii profile the
 		// way ~ is. Without this the default arm would draw a faint "· paused", identical to
 		// queued, so a parked run would read as idle.

@@ -277,6 +277,12 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Queued owner follow-ups ride one turn together ([#3137](https://github.com/vtmocanu/uzi/pull/3137)).**
   All pending follow-ups, oldest first and each separately fenced, are delivered in the next ordinary turn up to a 40,000-code-point cap, so they no longer cost one charged iteration each.
 
+- **The run judge has a model setting per harness, set from Settings and Admin ([#3245](https://github.com/vtmocanu/uzi/pull/3245)).**
+  The Claude lane (`judge_model`) and the new Codex lane (`codex_judge_model`, curated ids only, built-in `gpt-6.1-sol`) each resolve user, then instance, then built-in for the judge run's harness, and a value invalid for that harness is skipped with a note. Settings → Run defaults → Run judge and Admin → Instance → Run judge both offer a Claude and a Codex judge model picker. A curated Codex id stored in `judge_model` is copied into the Codex lane and any Codex id there is skipped by Claude judges (Admin shows a warning; choose Default to clear it). An empty instance judge model resets to the built-in, enforced mode spends each user's credential for the run's harness, and `uzi settings get` prints a Model settings table.
+
+- **Codex pause and recovery preserve work under scoped credential-free capture (Refs #2852, #3191).**
+  Slice A keeps capture and cleanup owned through settlement; proven cleanup permits saved-session epoch recreation after possible drain. Accepted B1 retains clone/session/journal/custody nonterminally on unproven cleanup for the exact refused/unacknowledged owner-pause safety facade, without a new in-run epoch or failed terminal report; this is not a blanket changed-milestone gate revision error conversion. Later execution depends on existing budget/hold requeue or owner Resume policy; retained-source recovery starts a fresh attempt path/model session, not the old thread. Healthy credentialed capture closure (B) and strengthened terminal process proof (C) remain unshipped. (AI-synced 2026-10-22)
+
 ### Added
 
 - **Healthy busy workers no longer show custody attention.**
@@ -985,6 +991,51 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Docker-lane hosted workers keep their run clones on the data volume across pod replacement ([#3153](https://github.com/vtmocanu/uzi/pull/3153), #3215).**
   The worker image carrying the runner-shared layout must roll with or before the controller (a new controller refuses an older image), and a Docker worker holding recovery custody stays on the old emptyDir layout until custody releases, so its roll is held and ForceRoll does not override it.
 
+- **Settled Codex milestone imports can skip slow post-import work ([#3304](https://github.com/vtmocanu/uzi/pull/3304), #3315).**
+  After ownership settles, readback and steering honor the milestone soft budget while progress is reported and publication waits for a later checkpoint; successful import cleanup avoids unrelated owed inventory.
+
+- **Keep lander locks and backup snapshots exclusive on uutils hosts.**
+  Claim, review and merge locks use the atomic directory syscall instead of a CLI mkdir status. Backup cycles reserve unique timestamped directories, preserving older snapshots when captures start together.
+
+- **Agent test reports allow brief descendant exit time before warning.**
+  An initially live process group is observed for up to 500ms before reporting leftover processes, while interrupted runs retain their existing cleanup.
+
+- **UX lab builds reject missing freeze and incomplete screenshots ([#3310](https://github.com/vtmocanu/uzi/pull/3310), #3324).**
+  The shared entry point checks provisioned freeze before generation and rejects missing or stale PNGs; real-worker rendering, local Devbox, boundary controls and light/dark acceptance remain incomplete.
+
+- **GitHub and GitLab issue, author and comment responses are bounded before decoding ([#2371](https://github.com/vtmocanu/uzi/pull/2371)).**
+  Oversized successful target issue responses are rejected permanently. Oversized forge error pages and prerequisite repository lookups remain fetch failures, allowing schedules and autopilot to retry. Oversized comment or author responses withhold comment or permission evidence safely.
+
+- **Hosted workers carry Go and sqlc for offline builds ([#3305](https://github.com/vtmocanu/uzi/pull/3305)).**
+  The Go pin satisfies repository toolchains, sqlc uses a baked verified archive, and repository and image checks catch drift before rollout.
+
+- **Custody-held hosted workers can drain intake before layout migration ([#3307](https://github.com/vtmocanu/uzi/pull/3307)).**
+  Eligible old-layout Docker workers drain when a live sibling covers their capabilities, while custody still prevents replacement; retained and uncertain drains block further selection, and health reports multiple-drain intake risk.
+
+- **TUI base-change refusals appear as rejected ([#3200](https://github.com/vtmocanu/uzi/pull/3200)).**
+  Board rows, run headers and cached worker details show a neutral rejection, excluded from DONE failure counts, while human stops retain their existing labels.
+
+- **Resumed runs hold at their time limit after an earlier completion attempt ([#3282](https://github.com/vtmocanu/uzi/pull/3282)).**
+  Workers use server-confirmed completion history to enter the completion hold without repeated model turns past the deadline; Continue requires a budget extension first when time is exhausted.
+
+- **Non-closing source issues stay protected during PR refresh publication ([#3120](https://github.com/vtmocanu/uzi/pull/3120), #3328).**
+  MR rework and branch-adopting CI fixes refuse source-issue closing commits before push, using authenticated publication intent and preserving work when intent or commit evidence is unknown; older workers and other Forgejo branch pushes retain the documented limits.
+
+- **Run recovery requires a full run UUID ([#3335](https://github.com/vtmocanu/uzi/pull/3335)).**
+  Invalid IDs and prefixes fail with usage guidance before configuration or network access; accepted UUID forms are normalized so recovery filtering and diagnostics use the canonical run ID.
+
+- **DONE-row alarms share one dimmed red ([#3321](https://github.com/vtmocanu/uzi/pull/3321)).**
+  Failed and needs-landing issue links and every finished run's issues judge badge now match the dimmed DONE state ink, while active badges, the failure count and judge review severity keep full alarm red.
+
+- **A lead that stalls without calling signal_done now reaches the owner question instead of failing on the iteration budget ([#3139](https://github.com/vtmocanu/uzi/pull/3139)).**
+  An interlocked, non-interactive issue run with a completed milestone and no completion attempt records a worker-initiated empty attempt after three no-progress turns, asks the Completion blocked question and, if unanswered, holds; it never opens or updates a pull/merge request (it may push the checkpoint ref like any done checkpoint), and on Claude the older identical-text no-progress stop can still fail a run first.
+
+- **Pending finalize retries back off and identify the operation at authority expiry ([#3303](https://github.com/vtmocanu/uzi/pull/3303), #3316).**
+  Failed retirement attempts (false, exception, or authority deadline) use min(15 s × 2^(n-1), 10 min) × U(0.8, 1.0), where n counts consecutive failures per run/generation/authenticated record identity in memory. An attempted retirement retained when the shared pass deadline expires also counts once toward consecutive failures, even if it received less than the full 1 s authority budget; this throttles repeated unfinished attempts without granting retirement authority. Shutdown cancellation does not count. Pass cancellation stays distinct from an authority deadline in diagnostics. Retained records reset history only on identity change/disappearance or a fresh worker restart; heartbeat, ownership, inventory, ACK, and report changes are picked up on the next eligible bounded attempt without resetting cooldown. Existing sweeps drive retries without a new daemon or hooks, preserving custody guards and the 1 s authority and 5 s pass budgets. Deadline diagnostics freeze the active step and step/attempt elapsed milliseconds at expiry, with fixed labels 'recovery-inventory pending', 'final-ACK check', 'recovery-report retirement', and 'ownership lookup', plus accurate queued-deletion and completion-notification labels. Maintainer-supplied observations, not independently reproduced, as of 2026-10-22 07:00Z: completed ci_fix records 70513a36 (generation 1) and 6ad3c37f on different workers each logged about 240 authority deadlines/hour; the first resumed immediately after a pod roll, and no per-step trace exists. These observations establish systematic retries and survival of the durable record across restart, not the slow predicate. Retry history starts fresh after restart. No historical predicate cause has been established; diagnosis is deferred to the maintainer after deployment, and #3303 remains open.
+
+- **Preserve build interruption status across coreutils implementations.**
+  The Codex Git trust build wrapper returns 130 for SIGINT and 143 for SIGTERM on GNU and uutils hosts, while actual build deadline expiry still returns 124. Signal promptness, child delivery and cleanup checks remain enforced.
+
 ### Security
 
 - **Go toolchain 1.27.2 and golang.org/x/net 0.60.0 ([#2543](https://github.com/vtmocanu/uzi/pull/2543), supersedes #2536, #2537, #2465).**
@@ -998,6 +1049,9 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **GitLab merge request reads are size-limited before decoding ([#3038](https://github.com/vtmocanu/uzi/pull/3038), #3211).**
   `GetMergeRequest` now refuses a response body over 32 MiB (HTTP 200, 201, 202 or 204) or 4 KiB (any other status), counting wire bytes with content encoding refused, with a fixed error instead of buffering it, and a refusal is treated as unverified evidence by every caller.
+
+- **Workers keep the Nix store writable by its owner only (99a20753c).**
+  The worker images and every root-started worker boot now drop group write on `/nix/store`, so only the provisioning identity can add store entries.
 
 ## [0.85.2] - 2026-10-05
 

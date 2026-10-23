@@ -20170,7 +20170,7 @@ Done / Dismissed / All) and refetch as the user works the list. The uncapped gua
 Serves human: server-side run placement across a worker fleet (the mechanism-level refinement
 of the existing worker/run model; no new user-stated requirement — `specs/human.md` unchanged).
 Full rationale, rejected alternatives, and the D1–D12/R3 decision log: `adr/0216-fleet-aware-claim.md`
-and `prds/216-worker-load-balancing.md`.
+and `prds/done/216-worker-load-balancing.md`.
 
 - **Fleet-aware spread, in-statement**: a worker holding ≥1 active run-lane run (`claimed |
   running | awaiting_approval | awaiting_input`, `kind <> 'chat'`) **defers** a fresh queued
@@ -20512,7 +20512,7 @@ not a control.
 
 ## 511. Issue #297 — the self_improve picker gets a claim-time, status-keyed in-flight avoid-set (advisory, nonce-fenced untrusted), so it stops picking work an active run is already doing
 
-Design record `prds/297-selfimprove-inflight-reconciliation.md`. A self-improvement pick is free
+Design record `prds/done/297-selfimprove-inflight-reconciliation.md`. A self-improvement pick is free
 text with no issue coordinate, so it escapes the one-active-run index that hard-dedupes real issue
 runs. The motivating 2026-08-10 near-miss: a run with `branch=null` was actively working PRD #293
 M3 — invisible to any branch/MR-keyed dedup — and the picker was free to re-pick it. This makes
@@ -21262,7 +21262,7 @@ colour-coded status board. TUI/CLI-only — no API, DB, worker or web change; bl
   lint ratchet), so each milestone's acceptance is `task gate:api` (build + lint + deadcode + test)
   and every exported harness symbol stays reachable — not `go build`.
 
-See [prds/325-tui-redesign.md](../prds/325-tui-redesign.md) for the milestone/decision record and
+See [prds/done/325-tui-redesign.md](../prds/done/325-tui-redesign.md) for the milestone/decision record and
 the review-wave amendments; §368-§372 for the PRD #112 base this builds on (D7 §371, D8 ownership
 §372, package layout §370).
 
@@ -21322,7 +21322,7 @@ auth-vs-network class — consistent with the trusted-team posture already recor
 Slack" to non-admins, and the test-DM button staying clickable during `error` and surfacing a
 backend 502 — are recorded in the PRD.)
 
-See [prds/56-slack-notifications-ux.md](../prds/56-slack-notifications-ux.md) for the milestone/
+See [prds/done/56-slack-notifications-ux.md](../prds/done/56-slack-notifications-ux.md) for the milestone/
 decision/residual record; §142-§149 for the PRD #25 Slack base this extends (manager/state §142,
 identity-authz §145, notifier §146).
 
@@ -24272,4 +24272,4 @@ Serves human Feature #1296 (a run that commits work but fails to publish it at t
 - **Cleanup interlocks + release (D3).** The custody predicate is INSIDE both `DeleteEphemeralWorkerForRun` and `ReapEphemeralWorkers` (skip a held worker; the RESTRICT FK is the fail-closed backstop); `DeleteWorker`/`DeleteRepo` refuse (owner-scoped) with an enumerated 409; a new `custody_limit` `queuedReason` rung mirrors the claim admission; the controller honors a distinct `DesiredWorker.CustodyHeld` on every PVC-destroying path (recycle / disk-pressure / ForceRoll / elapsed drain all preserve a held `/data`), independent of Busy/DrainingSince/ForceRoll. Release is **generation-aware and per-hold**: a completed run releases ONLY its completing generation's hold (`ReleaseCustodyForRunWorker` in `SetState`; `ListReleasableCustodyHolds` guarded by `h.generation = r.claim_generation` + a per-hold ready-capture disjunct; the reconciler releases the SPECIFIC selected hold by id). A cross-worker orphaned older-generation hold is RETAINED until capture — the conservative no-data-loss choice (a per-run release would drop a sibling generation's last copy; fixed at `e58a6801`). Known gaps (all fail-safe, tracked in #1318): a CAPLESS orphan (its worker died before reserving any capture) has no owner self-serve discharge today — `DiscardCaptureForOwner` discards a capture, not the hold — so it is retained until an operator clears it (the D3 owner-explicit-discard leg for the capless case is unimplemented); the ≤8 custody-admission count is not serialized under concurrency (bounded overshoot by concurrency degree, self-correcting, no data loss); a same-worker multi-generation orphan whose best-effort terminal release errors is retained rather than auto-reaped (data-safe, consistent with "retain uncaptured work until owner action").
 - **Mixed fleets (D9).** Additive `recovery_archive_v1` protocol capability; old workers/servers are explicitly unsupported for automatic recovery (reported honestly, never a false promise) and complete ordinary runs unaffected.
 
-Cross-refs: `prds/1296-durable-run-recovery.md` (D1-D9), ADR `adr/1296-durable-run-recovery.md`, `docs/run-recovery.md`; migration `00223_recovery_archive.sql`; `api/internal/{recovery,store/queries/recovery.sql}`, `api/internal/workersvc/{sweep,health,service}.go`, `controller/internal/kube/materializer.go`, `agent/src/recovery.ts`, `web/src/components/RecoveryArchives.tsx`, `api/cmd/uzi/run_export.go`.
+Cross-refs: `prds/done/1296-durable-run-recovery.md` (D1-D9), ADR `adr/1296-durable-run-recovery.md`, `docs/run-recovery.md`; migration `00223_recovery_archive.sql`; `api/internal/{recovery,store/queries/recovery.sql}`, `api/internal/workersvc/{sweep,health,service}.go`, `controller/internal/kube/materializer.go`, `agent/src/recovery.ts`, `web/src/components/RecoveryArchives.tsx`, `api/cmd/uzi/run_export.go`.

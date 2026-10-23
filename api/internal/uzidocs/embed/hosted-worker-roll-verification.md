@@ -9,7 +9,7 @@ audience: contributor
 This is the maintainer's **open verification procedure**, not an executed test
 report. Local implementation and checks are recorded in the PRD; they do not
 complete this hosted verification. Record actual results before closing
-[PRD #1470](../prds/1470-paced-hosted-worker-rolls.md); local fake-client and
+[PRD #1470](../prds/done/1470-paced-hosted-worker-rolls.md); local fake-client and
 PostgreSQL evidence there does not establish hosted availability or real
 API-server optimistic-write ordering. Design: [ADR-1470](../adr/1470-paced-hosted-worker-rolls.md).
 

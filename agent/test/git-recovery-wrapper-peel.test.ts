@@ -8,6 +8,29 @@ import { GitCache, type PositiveOwedCandidateContext } from "../src/git.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, noProofReseed, testGitCacheOptions } from "./helpers.js";
 import { fixtureFetchTracking, fixtureTrackingOptions } from "./runner-tracking-fixture.js";
+import { TickSpawner } from "../src/tick-spawner.js";
+
+/** Capture through the production boundary and settle every owned child, including on refusal. */
+async function captureRecovered(cache: GitCache, clone: { path: string; baseCommit: string }, bare: string): Promise<string> {
+  const controller = new AbortController();
+  const owner = new TickSpawner({ signal: controller.signal });
+  try {
+    return (await cache.withBoundaryProcessSpawner(owner.spawn, controller.signal,
+      () => cache.capturePlanningDiff(clone.path, clone.baseCommit, bare))).toString("utf8");
+  } finally {
+    controller.abort();
+    await owner.settled();
+    assert.deepEqual(owner.survivors(), []);
+  }
+}
+
+/** Independent expected bytes for the single-line new files used by these lifecycle fixtures. */
+function addedFilePatch(file: string, line: string): string {
+  const content = line + "\n";
+  const oid = createHash("sha1").update("blob " + Buffer.byteLength(content) + "\0").update(content).digest("hex").slice(0, 7);
+  return `diff --git b/${file} b/${file}\nnew file mode 100644\nindex 0000000..${oid}\n--- /dev/null\n+++ b/${file}\n@@ -0,0 +1 @@\n+${line}\n`;
+}
+
 
 // issue #3239 M3: a retained-recovery successor must never adopt a `wip(park):` marker that is buried
 // under a recovery-coverage wrapper. Real git fixtures; genuine wrappers come from buildRecoveryCoverage.
@@ -109,6 +132,8 @@ test("issue #3239 (a): a genuine wrapper over a WIP marker adopts the marker's c
   await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, c, m);
   const successor = await cache.prepareRecoverySuccessor(bare, branch, key, source, r.attempts, aid(2));
   assert.equal(sha("HEAD", successor.path), sha(`${m}^`));
+  assert.equal(successor.baseCommit, sha(`${m}^`));
+  assert.equal(await captureRecovered(cache, successor, bare), addedFilePatch("work.txt", "work.txt"));
   assert.equal(git(successor.path, ["status", "--porcelain"]), "A  work.txt");
   const history = git(successor.path, ["rev-list", "HEAD"]).split("\n");
   assert.ok(!history.includes(m) && !history.includes(c), "neither the marker nor the wrapper is in history");

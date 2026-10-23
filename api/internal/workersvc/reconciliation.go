@@ -89,6 +89,15 @@ func (s *Service) SetStateReportWithReconciliation(ctx context.Context, worker s
 	if err := validateCompletedPublicationReport(worker, req); err != nil {
 		return result, err
 	}
+	if err := validateSourcePublicationRequest(req); err != nil {
+		return result, err
+	}
+	if replay, err := s.replaySourcePublication(ctx, worker, runID, req); replay != nil || err != nil {
+		if replay != nil {
+			return *replay, err
+		}
+		return result, err
+	}
 	if replay, err := s.replayCompletedPublication(ctx, worker, runID, req); replay != nil || err != nil {
 		if replay != nil {
 			return *replay, err

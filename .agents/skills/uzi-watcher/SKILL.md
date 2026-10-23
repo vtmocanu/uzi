@@ -627,7 +627,8 @@ extension-admission limit `workersvc.MaxRunWallSeconds`; an over-limit extend is
 the room left; a configuration-driven served total may exceed it, since the worker re-arms its
 timers in chunks, #2761). The successor is
 seeded from `origin/agent/issue-N` if that branch exists, otherwise from main. It never
-adopts another run's checkpoint, and `run create` has no base flag. `uzi handoff --base`
+adopts another run's checkpoint, and `run create` has no base flag. The gated
+issue-successor procedure below remains the recommendation. `uzi handoff --base`
 gives no plan gate, no `--harness` or `--token`, and an MR that closes nothing.
 
 1. **Capture commits plus dirty and untracked work.** Run `scripts/backup-runs.sh RUN`,
@@ -668,6 +669,29 @@ gives no plan gate, no `--harness` or `--token`, and an MR that closes nothing.
    override; never pin an excluded credential. Verify `harness`, `auto_approve=false` and
    `credential_override` (null when the server chose) from `uzi run get`. At the gate, require the plan to build on the existing
    commits and finish the in-progress milestone, and co-review it with the buddy.
+
+For an explicitly chosen handoff successor, complete the backup, recovery-ref
+publication and terminal-state verification above first, then use:
+
+```sh
+uzi handoff --base recover/issue-N --issue N --mr --file <spec>
+```
+
+Replace `N` with the issue IID. Use `--issue N` when continuing issue N;
+omit it for an unrelated recovery task. This remains a task with no plan
+gate or board association: `continued_issue_iid` records the duplicate-guard
+link, while `issue_iid` stays null. The server verifies an existing real
+forge issue in an owned repo (open or closed, no eligibility-label or PRD
+gate). Nonterminal issue-linked work, including `pool_wait`, blocks creation
+(HTTP 409, CLI exit 5); handoff has no `--force`. Review/then-fix children
+inherit the link, but best-effort creation after a parent becomes terminal
+leaves a gap with no continuous reservation when the chain is entirely terminal.
+A completed linked task's open or unknown-state MR blocks fresh issue runs
+unless `uzi run create --force` is used; force cannot bypass the active guard.
+Handoff creation checks active work, not completed open MRs. Task MRs remain
+non-closing; `--issue` itself generates neither an MR reference nor a closing keyword. Verify the linked IID
+with `uzi run get RUN --json` and keep the backup until the successor's
+committed and uncommitted work are verified, as above.
 
 ## Cross-session handoff
 

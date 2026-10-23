@@ -3,7 +3,7 @@
 **Status**: Accepted
 **Date**: 2026-09-20
 **Deciders**: Vlad (maintainer) + agent team
-**PRD**: [prds/1484-admin-health-tab.md](../prds/1484-admin-health-tab.md) (GitHub issue [vtmocanu/uzi#1484](https://github.com/vtmocanu/uzi/issues/1484)) — the PRD carries the milestones, the verified anchors, and the full Decision Log (D1-D16); this ADR carries the one durable boundary a future change to this feature must not cross.
+**PRD**: [prds/done/1484-admin-health-tab.md](../prds/done/1484-admin-health-tab.md) (GitHub issue [vtmocanu/uzi#1484](https://github.com/vtmocanu/uzi/issues/1484)) — the PRD carries the milestones, the verified anchors, and the full Decision Log (D1-D16); this ADR carries the one durable boundary a future change to this feature must not cross.
 
 ## Decision (summary)
 

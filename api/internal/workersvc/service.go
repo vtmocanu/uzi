@@ -38,6 +38,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/ciartifacts"
 	"github.com/vtmocanu/uzi/api/internal/config"
+	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/issueinput"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -1049,7 +1050,7 @@ type Store interface {
 	// gave the manual/board/Slack path is restored here (this SELECT still counts
 	// pool_wait as active).
 	HasActiveRunForIssue(ctx context.Context, arg store.HasActiveRunForIssueParams) (bool, error)
-	// GetOpenMRRunForIssue returns the MR iid of a completed issue run that still owns an
+	// GetOpenMRRunForIssue returns the MR iid of a completed issue or linked task run owning an
 	// OPEN merge request for the issue (issue #856), or pgx.ErrNoRows when none does. It
 	// backs createRun's create-time open-MR refusal (the open-MR dedup that --force bypasses).
 	GetOpenMRRunForIssue(ctx context.Context, arg store.GetOpenMRRunForIssueParams) (pgtype.Int8, error)
@@ -3918,6 +3919,7 @@ func branchMovedStopReason(reason *string) string {
 // column and the M2 worker client); the Go field stays
 // `State` to avoid churn in the switch below.
 type StateRequest struct {
+	SourcePublication          *SourcePublicationReport        `json:"source_publication,omitempty"`
 	RegisterNonce              string                          `json:"register_nonce,omitempty"`
 	MemoryEpisode              *int64                          `json:"memory_episode,omitempty"`
 	GateCheckpointWitness      *apitypes.GateCheckpointWitness `json:"gate_checkpoint_witness,omitempty"`
@@ -4355,6 +4357,15 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	if err := validateReportOnlyShape(req); err != nil {
 		return store.Run{}, false, err
 	}
+	if err := validateSourcePublicationRequest(req); err != nil {
+		return store.Run{}, false, err
+	}
+	if replay, err := s.replaySourcePublication(ctx, wkr, runID, req); replay != nil || err != nil {
+		if replay != nil {
+			return replay.Run, replay.Applied, err
+		}
+		return store.Run{}, false, err
+	}
 	if err := validateCompletedPublicationReport(wkr, req); err != nil {
 		return store.Run{}, false, err
 	}
@@ -4584,7 +4595,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		// Completed publication and ephemeral leasing serialize on the worker before the run.
 		// Keep leasing conditional on an ephemeral terminal report with the lease enabled.
 		leaseFence = req.ClaimGeneration != nil && s.ephemeralLease > 0 && wkr.Ephemeral && (req.State == "completed" || req.State == "failed")
-		if leaseFence || completedPublicationCapable(wkr, req) {
+		if leaseFence || completedPublicationCapable(wkr, req) || req.SourcePublication != nil {
 			if _, werr := qtx.GetWorkerForUpdate(ctx, wkr.ID); werr != nil {
 				if errors.Is(werr, pgx.ErrNoRows) {
 					return store.Run{}, false, ErrRunNotOwned // the worker row is gone: the run left it
@@ -4657,6 +4668,17 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		// Locked and current: the arms below mutate through the tx, and the lock is held
 		// until the post-mutation commit, so no ClaimRun/release can interleave. Use the
 		// freshly-locked snapshot for the arm's own reads of the run row.
+		if req.SourcePublication != nil && locked.Status == "completed" {
+			if !sourcePublicationIdentity(locked, req) {
+				return locked, false, ErrInvalidState
+			}
+			// The first report already settled this run. The outer report layer
+			// verifies recovery receipts after the deferred rollback releases locks.
+			return locked, true, nil
+		}
+		if err := validateSourcePublicationLive(locked, wkr, req); err != nil {
+			return locked, false, err
+		}
 		owned = locked
 		q = qtx
 	}
@@ -5429,6 +5451,11 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	// is a no-op once fenceTx is cleared. Legacy reports also commit their locked audit check;
 	// an arm that did not acquire this transaction skips the commit.
 	if fenceTx != nil {
+		if req.SourcePublication != nil && rows == 1 {
+			if err := bindSourcePublication(ctx, fenceTx, wkr, owned, req, settleScopeDisposition == "applied"); err != nil {
+				return owned, false, err
+			}
+		}
 		// PRD #2006: a genuinely applied terminal transition on an ephemeral worker (fence tx
 		// opened with the worker locked first) releases the completed run's custody hold and
 		// enters the lease in THIS transaction, so the terminal state, the release and the lease
@@ -7544,6 +7571,9 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		}
 		capture, err = issueinput.Fetch(ctx, f, row.ForgeProjectID, issueIID, row.BotForgeUserID)
 		if err != nil {
+			if forge.IsIssueResponseTooLarge(err) {
+				return store.Run{}, fmt.Errorf("%w: %w", ErrDescriptionTooLarge, err)
+			}
 			return store.Run{}, ErrForgeIssueRead
 		}
 	}

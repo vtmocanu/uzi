@@ -989,6 +989,7 @@ for (const mode of ["boot", "live"] as const) {
     let mono = 0, factories = 0;
     const budget = new MaintenanceBudget(600_000, () => mono);
     const seen: string[] = [];
+    const operationSignals: AbortSignal[] = [];
     const stage = (name: string) => {
       assert.equal(MaintenanceBudget.current(), budget);
       seen.push(name);
@@ -1000,15 +1001,25 @@ for (const mode of ["boot", "live"] as const) {
     Object.assign(f.git, {
       discoverOwedCandidates: async () => [],
       withRecoveryOperation: async (signal: AbortSignal, deadline: number, action: () => Promise<unknown>) => {
-        assert.equal(signal, budget.signal); assert.equal(deadline, Infinity);
-        stage("operation"); return action();
+        assert.equal(deadline, Infinity);
+        assert.equal(signal.aborted, false);
+        // Pass ownership is installed before a cancellation observation creates its budget.
+        if (MaintenanceBudget.current()) {
+          stage("operation");
+          operationSignals.push(signal);
+        }
+        return action();
       },
       checkpointPack: async (...args: Parameters<typeof pack>) => { stage("pack"); return pack(...args); },
     });
     Object.assign(f.client, {
       getRunOwnership: async () => { throw ownershipLost(); },
       releaseRecoveryCustody: async (...args: unknown[]) => {
-        stage("FINAL"); assert.equal(args[4], budget.signal); return release(...args);
+        stage("FINAL");
+        assert.ok(args[4] instanceof AbortSignal);
+        assert.equal(args[4].aborted, false);
+        operationSignals.push(args[4]);
+        return release(...args);
       },
     });
     f.state.status = "cancelled";
@@ -1020,6 +1031,10 @@ for (const mode of ["boot", "live"] as const) {
       assert.equal(factories, 1);
       assert.ok(seen.includes("pack")); assert.ok(seen.includes("FINAL"));
       assert.equal(f.order.includes("held"), true);
+      mono = 600_000;
+      assert.throws(() => budget.check(), /maintenance deadline/);
+      assert.ok(operationSignals.length > 0);
+      assert.ok(operationSignals.every(signal => signal.aborted), "all Git/FINAL signals retain the same attempt expiry");
     } finally { budget.dispose(); await f.close(); }
   });
 }
@@ -1036,7 +1051,9 @@ it("cancellation entry expired boot queue is inert and a later pass gets a fresh
   Object.assign(f.git, {
     enumerateOwedCandidates: async () => { entered(); await blocked; return enumerate(); },
     withRecoveryOperation: async (_signal: AbortSignal, deadline: number, action: () => Promise<unknown>) => {
-      assert.equal(deadline, Infinity); scoped(); return action();
+      assert.equal(deadline, Infinity);
+      if (MaintenanceBudget.current()) scoped();
+      return action();
     },
   });
   const holder = f.coordinator.freezeInventory({ context: f.context, currentSha: H, defaultBranch: "main" });
@@ -4422,18 +4439,27 @@ it("maintenance late valid FINAL ACK cannot authorize cleanup and saved FINAL re
   const arrived = new Promise<void>(r => { entered = r; });
   const wait = new Promise<void>(r => { settle = r; });
   Object.assign(f.client, { releaseRecoveryCustody: async (...args: unknown[]) => {
-    assert.equal(MaintenanceBudget.current(), budget);
-    assert.equal(args[4], budget.signal);
+    const passBudget = MaintenanceBudget.current();
+    assert.ok(passBudget);
+    assert.notEqual(passBudget, budget, "the pass inherits the caller clock without sharing cancellation");
+    assert.ok(passBudget.remainingMs() <= budget.remainingMs());
+    assert.ok(args[4] instanceof AbortSignal);
     entered(); await wait;
+    assert.equal(passBudget.signal.aborted, true);
+    assert.equal(args[4].aborted, true);
     return original(...args.slice(0, 4));
   } });
   const restarted = f.make(false, undefined, () => { released++; });
   try {
-    const pending = MaintenanceBudget.run(budget, () => restarted.resumePending(undefined, [before]));
-    await arrived;
+    let settled = false;
+    const pending = MaintenanceBudget.run(budget, () => restarted.resumePending(undefined, [before]))
+      .finally(() => { settled = true; });
+    await Promise.race([arrived, pending]);
     now = 600_000; assert.throws(() => budget.check());
+    await new Promise<void>(r => setImmediate(r));
+    assert.equal(settled, false, "the pass joins actual RPC settlement after deadline");
+    settle();
     await assert.rejects(pending, /maintenance deadline/);
-    settle(); await new Promise<void>(r => setImmediate(r));
     const kept = (await restarted.inspect("run-1"))[0]!;
     assert.notEqual(kept.finalAcknowledged, true);
     assert.deepEqual(kept.finalRequest, before.finalRequest);

@@ -114,7 +114,7 @@ func TestCIFixRunsLiveDB(t *testing.T) {
 		t.Fatalf("HasActiveIssueRunForIID(10) = %v, %v; want false", busy, err)
 	}
 
-	// ── the per-issue index is scoped to kind='issue': a ci_fix run never collides
+	// ── the per-issue index covers issue runs and linked tasks: a ci_fix run never collides
 	//    with an active issue run, and two issue runs on one issue still collide. ──
 	mustExec(ctx, t, pool,
 		`INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, status)

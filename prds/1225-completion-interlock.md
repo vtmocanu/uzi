@@ -1,10 +1,10 @@
 # Epic PRD #1225: Completion interlock with same-run rework and durable holds
 
 **Issue:** [#1225](https://github.com/vtmocanu/uzi/issues/1225)
-**Status:** Epic, not directly runnable. Implementation is split into eight ordered child PRDs.
+**Status:** Epic, not directly runnable. Re-scoped 2026-10-23: semantic auditing is cancelled (#1231 and #1233 closed not planned) and #1228 is detached; see the issue for current dispositions. Delivers structural containment, owner decisions and recoverable holds on both harnesses, preserving Git while provider-context continuity remains same-worker only.
 **Priority:** Normal (current issue taxonomy).
 **Origin:** Review of [PR #1220](https://github.com/vtmocanu/uzi/pull/1220) and run `b0ffd0ea` on 2026-09-09.
-**Execution:** Epic is not runnable; retain current taxonomy and do not add `uzi`. Serialize implementation children at dispatch after checking real dependencies and green main CI. #1226/#1227 and structural rollout #1626/#1627 already shipped. This refresh dispatches nothing; #1230/#1231 remain held on their explicit integration prerequisites.
+**Execution:** Epic is not runnable; never add `uzi`. Superseded 2026-10-23: no #1230/#1231 dispatch remains (#1231 is not planned; #1230 is delivered dormant with only maintainer check m6 owed). #1232 stays undispatched until its structural rewrite is reviewed. The child table below predates the re-scope; #1232 updates it at close-out.
 
 No implementation or validation under this epic may create or modify `.github/workflows/**`. Child migrations are numbered above the live head when each child lands. The children run sequentially to avoid shared `runner.ts`, completion-state and migration-constraint collisions.
 
@@ -25,10 +25,10 @@ The final product rejects an incomplete completion attempt without failing the r
 | 1 | [#1226 Structural completion interlock and exact-head permit](done/1226-structural-completion-interlock.md) | Frozen structural contract, hard claim clause, same-lead rework, permit and recoverable same-worker hold | none |
 | 2 | [#1227 Owner completion decisions and scope-reduced delivery](done/1227-completion-owner-decisions.md) | Continue/partial/accept authority, real contract revisions and truthful closing behavior | #1226 |
 | 3 | [#1228 Shared encrypted provider-context generations](1228-shared-context-generations.md) | One dark storage/codec primitive for run holds and #1214 PR sessions | #1227 by queue policy; no technical dependency |
-| 4 | [#1229 Durable run-hold capture and cross-worker resume](1229-durable-run-holds.md) | Verified provider context plus Git before park; restore before inspect on another worker | Not planned (closed 2026-10-15, #2746) |
-| 5 | [#1230 Semantic completion contract and plan coverage review](1230-semantic-completion-contract.md) | Dormant source-backed criteria, approval-point coverage and exact human-authorized maintainer acceptance | Shipped #1226/#1227; complete M4 also needs merged #3089 and corrected #3090 |
+| 4 | [#1229 Durable run-hold capture and cross-worker resume](done/1229-durable-run-holds.md) | Verified provider context plus Git before park; restore before inspect on another worker | Not planned (closed 2026-10-15, #2746) |
+| 5 | [#1230 Semantic completion contract and plan coverage review](done/1230-semantic-completion-contract.md) | Dormant source-backed criteria, approval-point coverage and exact human-authorized maintainer acceptance | Shipped #1226/#1227; complete M4 also needs merged #3089 and corrected #3090 |
 | 6 | [#1231 Independent completion auditor and semantic permit](1231-completion-auditor.md) | Bounded exact-head audit, evidence capture and default-on semantic enrollment with instance-admin controls | Completed #1230 and its actual authority/publication seams |
-| 7 | [#1233 Structured completion blockers and governed MR rework](1233-structured-blockers-mr-rework.md) | Server-owned blocker dispositions and contract-governed automatic/manual rework | #1227 + #1230 + #1231 |
+| 7 | [#1233 Structured completion blockers and governed MR rework](done/1233-structured-blockers-mr-rework.md) | Server-owned blocker dispositions and contract-governed automatic/manual rework | #1227 + #1230 + #1231 |
 | 8 | [#1232 Completion interlock integration, rollout and epic close-out](1232-completion-interlock-integration.md) | End-to-end/race proof, default enablement, consolidated docs and epic close | #1226-#1228, #1230, #1231 + #1233 (#1229 not planned) |
 
 Queue policy: remove `uzi` from the current child after its PR merges and main CI is green, then add `uzi` to the next child. The scheduled sweep's `max_issues=3` is not a serialization guarantee; the single eligibility label is.

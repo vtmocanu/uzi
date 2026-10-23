@@ -3,7 +3,7 @@
 **Status**: Accepted (implemented, issue #1190, M1–M5)
 **Date**: 2026-09-08
 **Deciders**: architect + UX review of the mock (2026-09-07); coder (implementation); reviewer.
-**PRD**: [prds/1190-run-pause-resume.md](../prds/1190-run-pause-resume.md) — carries the full milestone breakdown, code anchors, and Decision Log D1–D15; this ADR restates the negative-space invariants a future edit to a status list or a park-clearing statement would break silently, exactly the kind of rule the `TERMINAL_RUN_STATUSES` 🔴 note (`agent/src/home-reclaim.ts`) and [ADR-628](0628-cross-worker-resume-durability.md)'s affinity predicate already exist for.
+**PRD**: [prds/done/1190-run-pause-resume.md](../prds/done/1190-run-pause-resume.md) — carries the full milestone breakdown, code anchors, and Decision Log D1–D15; this ADR restates the negative-space invariants a future edit to a status list or a park-clearing statement would break silently, exactly the kind of rule the `TERMINAL_RUN_STATUSES` 🔴 note (`agent/src/home-reclaim.ts`) and [ADR-628](0628-cross-worker-resume-durability.md)'s affinity predicate already exist for.
 **Related**: reuses [ADR-628](0628-cross-worker-resume-durability.md)'s affinity leg for the cross-worker resume, [ADR-35](0035-run-limit-retry.md)'s park/promote shape as the direct precedent, and the gate-park budget accounting issue #783 introduced (kept, not the limit park's fresh-wall reset).
 
 ## Decision (summary)

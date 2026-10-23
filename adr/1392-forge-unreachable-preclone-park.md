@@ -4,7 +4,7 @@
 hosted acceptance are the maintainer's, out of band).
 **Date**: 2026-09-16
 **Issue**: [vtmocanu/uzi#1392](https://github.com/vtmocanu/uzi/issues/1392)
-**PRD**: [prds/1392-forge-unreachable-preclone-park.md](../prds/1392-forge-unreachable-preclone-park.md) —
+**PRD**: [prds/done/1392-forge-unreachable-preclone-park.md](../prds/done/1392-forge-unreachable-preclone-park.md) —
 carries the full Decision Log (D1-D10), the milestone breakdown and the verified code
 anchors; this ADR carries the durable design shape and the seams a future change must
 not silently break.

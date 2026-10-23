@@ -144,13 +144,13 @@ func TestRunHeldExpireNotFoundMapsExit(t *testing.T) {
 // `uzi run recovery` shows a released hold's held receipt: the ref and the commit it holds.
 func TestRunRecoveryRendersHeldReceipt(t *testing.T) {
 	dto := apitypes.RecoveryCustodyHoldsDTO{Holds: []apitypes.RecoveryCustodyHoldDTO{
-		{ID: "hold-1", RunID: "run1", Generation: 1, State: "released", Attention: "released", WorkerID: "w1",
+		{ID: "hold-1", RunID: recoveryHeldRunID, Generation: 1, State: "released", Attention: "released", WorkerID: "w1",
 			FinalPublicationID: "pub-1", HeldRef: "refs/uzi-held/run1/1",
 			FinalReceipt: &apitypes.RecoveryFinalDisposition{Kind: "held_publication", PublicationID: "pub-1",
 				SourceSha: "3333333333333333333333333333333333333333", CoverageDigest: "c"}},
-		{ID: "hold-2", RunID: "run1", Generation: 2, State: "open", Attention: "active", WorkerID: "w1"},
+		{ID: "hold-2", RunID: recoveryHeldRunID, Generation: 2, State: "open", Attention: "active", WorkerID: "w1"},
 	}}
-	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{RecoveryHoldsResult: dto}), "run", "recovery", "run1")
+	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{RecoveryHoldsResult: dto}), "run", "recovery", recoveryHeldRunID)
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d", code)
 	}

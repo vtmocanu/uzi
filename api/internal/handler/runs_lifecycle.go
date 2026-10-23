@@ -245,9 +245,10 @@ func (h *Handler) writeCredentialOverrideError(w http.ResponseWriter, err error)
 // branch from, and whether the worker should open an MR at the end. Context is
 // required; the other two default to "branch from local HEAD" and "no MR".
 type CreateTaskRunRequest struct {
-	Context    string `json:"context"`
-	BaseBranch string `json:"base_branch"`
-	OpenMr     bool   `json:"open_mr"`
+	ContinuedIssueIID *int64 `json:"continued_issue_iid"`
+	Context           string `json:"context"`
+	BaseBranch        string `json:"base_branch"`
+	OpenMr            bool   `json:"open_mr"`
 	// Interactive asks that the worker keep the run alive after signal_done (--interactive,
 	// PRD #517 M1), parking it in awaiting_followup to iterate conversationally rather than
 	// terminating; wound down with 'uzi run stop'. Defaults false (a plain handoff).
@@ -282,7 +283,7 @@ func (h *Handler) CreateTaskRun(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "context is required")
 		return
 	}
-	run, err := h.wsvc.CreateTaskRun(r.Context(), user.ID, repo.ID, req.Context, req.BaseBranch, req.OpenMr, req.ReviewRequested, req.ThenFixRequested, req.Interactive)
+	run, err := h.wsvc.CreateTaskRun(r.Context(), user.ID, repo.ID, req.Context, req.BaseBranch, req.OpenMr, req.ReviewRequested, req.ThenFixRequested, req.Interactive, req.ContinuedIssueIID)
 	if err != nil {
 		h.writeStartRunError(w, r, err)
 		return
@@ -337,6 +338,10 @@ func (h *Handler) writeStartRunError(w http.ResponseWriter, r *http.Request, err
 		return
 	}
 	switch {
+	case errors.Is(err, workersvc.ErrContinuedIssueNotFound):
+		httpx.Error(w, http.StatusNotFound, err.Error())
+	case errors.Is(err, workersvc.ErrContinuedIssueInvalid):
+		httpx.Error(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, workersvc.ErrForgeBuild):
 		slog.Error("start run: build forge for connection", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")

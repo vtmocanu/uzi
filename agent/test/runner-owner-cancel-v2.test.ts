@@ -8,7 +8,7 @@ import type { Executor } from "../src/executor.js";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import { api, client, fakeGitlab, git, gitlabClaim, installHarness, runner } from "./runner-harness.js";
 import {
-  HELD_LINUX_ONLY, JOIN_TOKEN, command, commit, frozenRecords, heldServer, packObjects,
+  HELD_LINUX_ONLY, JOIN_TOKEN, command, commit, deferTerminalEvidence, frozenRecords, heldServer, packObjects,
   recoveryOf, skipCheckpoints, watchFreezes,
 } from "./runner-held-publication-fixture.js";
 
@@ -144,6 +144,8 @@ for (const scenario of ["wallpark", "clarification", "old-generation-foreground"
       return out;
     };
     const capture = mock.method(recoveryOf(r), "captureAndUpload");
+    // Keep the explicit foreground/cancellation proof ahead of automatic saved-evidence replay.
+    deferTerminalEvidence(r, t);
     await r.execute(claim);
     assert.equal(models, scenario === "old-generation-foreground" || scenario === "late-quiescence" || scenario === "wallpark" || scenario === "clarification" ? 1 : 0);
     assert.equal(api.states.filter(s => s.body.status === "failed").length, 1);

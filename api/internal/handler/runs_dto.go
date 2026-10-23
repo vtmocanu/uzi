@@ -349,6 +349,10 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		s := uuid.UUID(r.ResumeOfRunID.Bytes).String()
 		dto.ResumeOfRunID = &s
 	}
+	if r.ContinuedIssueIid.Valid {
+		v := r.ContinuedIssueIid.Int64
+		dto.ContinuedIssueIID = &v
+	}
 	if r.IssueIid.Valid {
 		v := r.IssueIid.Int64
 		dto.IssueIID = &v

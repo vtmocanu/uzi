@@ -4,7 +4,7 @@
 **Date**: 2026-09-27
 **Deciders**: architect (design), team lead. Reviewed with the Codex peer (3 rounds).
 **Issue**: GitHub issue [vtmocanu/uzi#1795](https://github.com/vtmocanu/uzi/issues/1795).
-PRD: `prds/1795-gate-revision-bound-verdicts.md` (Decision Log carries the amendments cited
+PRD: `prds/done/1795-gate-revision-bound-verdicts.md` (Decision Log carries the amendments cited
 below).
 **Related**: builds on the plan-revision loop and gate epochs of PRD #41
 (`prds/done/41-plan-revision-gate.md`), the replayable verdict receipts and

@@ -18,6 +18,7 @@ import { GUARDED_LANE_JOIN_MS } from "./claude-command/lane.js";
 import type { CapturedMemoryContext } from "./codex/broker.js";
 import type { BaseAttestationHoldOutcome, MemoryIncarnation, WorkerMemoryPressureResult } from "./protocol.js";
 import { BASE_ATTESTATION_HOLD_REASON } from "./protocol.js";
+import { PublicationContextLatch } from "./publication-context.js";
 import { RequestError, StateReportUnappliedError, isRunOwnershipLost, isTransient, HELD_PUBLICATION_FEATURE, CREDENTIAL_SWITCH_HOLD_FEATURE } from "./client.js";
 import { RecoveryClosureLimitError, recoveryClosureLimitDetail, formatRecoveryDecodedLimit } from "./recovery-closure.js";
 import { MaintenanceBudget, RetainedSwitchSettlement } from "./maintenance-budget.js";
@@ -110,6 +111,7 @@ import { resolveAgentSelection, RUN_KINDS } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { deriveCloneKey, resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
 import { RecoveryCoordinator, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, type ClosedSourceObservation, type InventorySourceBoundaryContext, type CompletionSource, type RecoveryRecord, type RecoveryCoordinatorOptions } from "./recovery.js";
+import { classifyRecoveryOrigin } from "./recovery-origin.js";
 import {
   PUSHED_HEAD_UNRECORDED,
   PredecessorSettler,
@@ -933,6 +935,14 @@ class ClosingCommitRefusedSignal extends PublicationRefusedSignal {
   constructor(readonly head: string, readonly shas: string[] | null) {
     super("closing commit message refused");
     this.name = "ClosingCommitRefusedSignal";
+  }
+}
+
+/** A refresh has no affirmative, stable source authority for this exact candidate. */
+class PublicationContextRefusedSignal extends PublicationRefusedSignal {
+  constructor(readonly head: string | null) {
+    super("refresh publication context refused");
+    this.name = "PublicationContextRefusedSignal";
   }
 }
 
@@ -2024,6 +2034,13 @@ interface RunFlight {
     acknowledged?: true;
   };
   sourceCleanupJoined?: boolean;
+  /** Notification receipts only; never cleanup, execution or producer authority. */
+  archiveAccepted?: boolean;
+  evidenceCommands?: { confirmed: boolean; failed: boolean };
+  evidenceJoinsConfirmed?: boolean;
+  evidenceAuxiliaries?: "pending" | "joined" | "failed";
+  evidenceProcessJoined?: Executor;
+  evidenceJoinFailed?: boolean;
   workerMemory?: MemoryFlight;
   cancellationBudget?: MaintenanceBudget;
   /** A raw cancellation response did not prove this flight's generation. Never a release authority. */
@@ -2303,6 +2320,8 @@ interface RunFlight {
   publishedRealTips?: string[];
   /** Exact candidate of the successful finalize push, retained for completion bookkeeping. */
   successfulPushedSha?: string;
+  /** Registration support frozen at flight creation, before any publication. */
+  sourcePublicationNegotiated?: boolean;
   /** PRD #1230 D5: the frozen sources of the latest compiled semantic candidate and where they were
    *  captured, so a drift observation reads each PRD at the same commit. Detection input only. */
   semanticDrift?: { barePath: string; headSha: string; sources: FrozenSource[] };
@@ -2785,6 +2804,7 @@ export class RunRunner {
   /** Whole-execution ownership, including factory setup, batcher close and every
    * finally cleanup. A promoted claim can arrive before an old park ACK returns. */
   private readonly inventoryReservations = new Set<string>();
+  private readonly commandSettlements = new WeakMap<Executor, { confirmed: boolean; failed: boolean }>();
   private readonly executionTails = new Map<string, Promise<ClosedSourceObservation | void>>();
   /** PRD #218 M1: set by `shutdown()`. Read when a run registers so a run that starts
    *  DURING the shutdown drain (a late claim) is aborted immediately rather than running
@@ -3576,6 +3596,7 @@ export class RunRunner {
     let primaryError: unknown;
     const deliver = () => { if (failed) rejectObserver(primaryError); else resolveObserver(); };
     let observation: ClosedSourceObservation | void = undefined;
+    let evidenceReady = false;
     let inherited: ClosedSourceObservation | void = undefined;
     // Install synchronously before factory work. A third claim must queue behind
     // the second even while the second is waiting for the first's cleanup.
@@ -3608,7 +3629,8 @@ export class RunRunner {
           if (!(await this.gateQueuedDuplicate(claim))) return;
           claim = await this.refreshQueuedClaimCursor(claim);
         }
-        observation = await this.executeClaim(claim, inherited || undefined, operation => { ownedMemory = operation; });
+        observation = await this.executeClaim(claim, inherited || undefined, operation => { ownedMemory = operation; },
+          ready => { evidenceReady = ready; });
       } catch (error) {
         failed = true;
         primaryError = error;
@@ -3632,6 +3654,17 @@ export class RunRunner {
           if (this.executionTails.get(runId) === tail) this.executionTails.delete(runId);
           release(observation);
           if (!ownedMemory) deliver();
+          // Saved-evidence replay (issue #3031 N): after the tail is removed and released, and only after confirmed settlement, never during shutdown.
+          // Registration must not await its pass; replay never calls producer admission.
+          try {
+            if (evidenceReady && !this.shuttingDownGlobal && !this.shutdownSignal.signal.aborted) {
+              void this.recovery.resumeTerminalEvidence(runId, tail, claim.claim_generation ?? 0, this.shutdownSignal.signal).catch(() => {
+                this.log.warn("recovery: terminal saved archive replay failed; evidence retained");
+              });
+            }
+          } catch {
+            this.log.warn("recovery: terminal saved archive replay failed; evidence retained");
+          }
         }
       }
     })();
@@ -3803,7 +3836,7 @@ export class RunRunner {
   }
 
   private async executeClaim(claim: ClaimResponse, inherited: ClosedSourceObservation | undefined,
-    ownMemory: (operation: Promise<void>) => void): Promise<ClosedSourceObservation | void> {
+    ownMemory: (operation: Promise<void>) => void, evidenceSettled?: (ready: boolean) => void): Promise<ClosedSourceObservation | void> {
     let observedFlight: RunFlight | undefined;
     await MaintenanceBudget.runAttempt(`${claim.run_id}:${claim.claim_generation ?? 0}`, () => {
       if (!observedFlight) throw new Error("cancellation observed before flight initialization");
@@ -3811,10 +3844,21 @@ export class RunRunner {
     }, () => this.executeClaimInAttempt(claim, flight => {
       observedFlight = flight;
       flight.sourceInherited = inherited;
+      this.registerEvidenceExecutor(flight);
     }, ownMemory));
     // executeClaimInAttempt has now returned through its entire finally, including
     // HOME/cache/lifecycle cleanup. Catch selection and steering.stop alone are too early.
     const flight = observedFlight;
+    const observation = await this.closedSourceObservation(claim, flight);
+    const evidenceReady = !!flight && flight.archiveAccepted === true && flight.evidenceJoinsConfirmed === true &&
+      !flight.sourceJoinFailed && !flight.evidenceJoinFailed &&
+      flight.terminalResolved === true && !flight.parked && !flight.active?.shuttingDown &&
+      !this.shuttingDownGlobal && residueQuarantine() === undefined;
+    evidenceSettled?.(evidenceReady);
+    return observation;
+  }
+
+  private async closedSourceObservation(claim: ClaimResponse, flight?: RunFlight): Promise<ClosedSourceObservation | void> {
     const blocked = flight?.sourceNormalBlocked === true && flight.sourceFamilyMatched === true;
     const failed = flight?.sourceNormalFailure;
     const normalFailed = failed?.kind === "executor_failed" && failed.providerReaped === true &&
@@ -4889,6 +4933,8 @@ export class RunRunner {
         try {
           await executor.closeAndSettlePlanSummary?.(this.codexBoundaryDeadlineMs);
           const disposal = await executor.safety.dispose({ boundary: "terminal", deadlineMs: this.codexBoundaryDeadlineMs });
+          if (disposal.kind === "disposed") flight.evidenceProcessJoined = executor;
+          else flight.evidenceJoinFailed = true;
           if (disposal.kind === "incomplete") {
             terminalDisposeUnproven = true;
             flight.sourceJoinFailed = true;
@@ -4897,6 +4943,7 @@ export class RunRunner {
           }
         } catch (e) {
           terminalDisposeUnproven = true;
+          flight.evidenceJoinFailed = true;
           flight.sourceJoinFailed = true;
           flight.preserveRecoveryClone = true;
           runLog.warn("codex terminal dispose failed; retaining runner clone", { error: errMessage(e) });
@@ -4921,7 +4968,8 @@ export class RunRunner {
       // time we reach here, so a later drainer retire never needs to re-arm it; any
       // still-pending segments are drained and simply not re-armed (a no-op).
       this.rearm?.delete(runId);
-      await steering.stop().catch(() => { flight.sourceJoinFailed = true; });
+      let steeringJoined = false;
+      await steering.stop().then(() => { steeringJoined = true; }).catch(() => { flight.sourceJoinFailed = true; });
       // PRD #41: drop this run's plan-approval deadline + gate-tracking (normally cleared
       // when the gate resolves terminally, but a run that ends by any other path must not
       // leak either).
@@ -5262,6 +5310,24 @@ export class RunRunner {
         sourceOwedJoined &&
         !!flight.barePath && !!flight.branch && !retireBlocked &&
         (ownAttemptRetired || flight.preserveRecoveryClone);
+      const commands = flight.evidenceCommands;
+      // A retained-recovery successor can replace the executor. The old runtime's
+      // terminal receipt never proves settlement of that new owner.
+      // Normal teardown marks the memory flight ended and retires its context but keeps the object,
+      // so settlement is explicit evidence (the same pending checks the terminal disposal guard uses),
+      // never the object's absence.
+      const memory = flight.workerMemory;
+      const memorySettled = !memory || (memory.ended &&
+        !(memory.operation && !memory.settled) &&
+        !(memory.executorRun && !memory.executorSettled) &&
+        !(memory.closing && !memory.closingSettled) &&
+        memory.feedback.size === 0 && !memory.hold);
+      flight.evidenceJoinsConfirmed = flight.executor === executor && steeringJoined && flight.evidenceProcessJoined === executor &&
+        !flight.evidenceJoinFailed && !flight.sourceJoinFailed &&
+        (flight.evidenceAuxiliaries === undefined || flight.evidenceAuxiliaries === "joined") &&
+        (!executor.settleWorkerCommands || (commands === this.commandSettlements.get(executor) && commands?.confirmed === true && !commands.failed)) &&
+        memorySettled && !this.memoryRuntime?.sinkReceipts.some(receipt => receipt.context.flight === flight) &&
+        !batcher.isTripped() && !batcher.isSpilled() && batcher.bufferedCount() === 0;
     }
   }
 
@@ -6839,6 +6905,7 @@ export class RunRunner {
     // fetch-back). Undefined until then and for non-code-publishing / early-return kinds, so
     // the terminal drive is a no-op for report-only / not_code / pause / empty-diff exits.
     let recoveryRecord: RecoveryRecord | undefined;
+    let terminalCaptureVerified = false;
     // Drive the durable-recovery terminal action off the reported status, once H is pinned:
     // a `completed` full publication releases custody; a `failed` finalization captures +
     // uploads the verified bundle (model-free). Best-effort — it MUST NOT disturb the run's
@@ -6894,6 +6961,7 @@ export class RunRunner {
               (await this.git.defaultBranchName(capBarePath)) ||
               "main";
             const outcome = await this.recovery.captureAndUpload({
+              onArchiveAccepted: record => this.archiveAccepted(flight, record),
               onCancellationObserved: () => this.observeCancellation(flight),
               record: recoveryRecord,
               barePath: capBarePath,
@@ -6903,6 +6971,7 @@ export class RunRunner {
               forgeUsername: claim.secrets.forge_username,
               signal: boundarySignal,
             });
+            terminalCaptureVerified = outcome.state === "uploaded";
             runLog.info("recovery: finalization-failure capture outcome", {
               run_id: claim.run_id,
               capture_id: outcome.captureId,
@@ -6952,6 +7021,8 @@ export class RunRunner {
       logMessage: string,
       fields: Record<string, unknown>,
     ): Promise<void> => {
+      // Persist the source fence with the proof, including on boot-time replay.
+      if (body.source_publication !== undefined) body = { ...body, claim_generation: flight.claimGeneration };
       // Freeze delivered identity before journal installation and before fallback can change HEAD.
       const finalHead = body.head ?? flight.successfulPushedSha;
       if (flight.inventoryGuarded && ["issue", "mr_rework", "self_improve"].includes(flight.runKind) &&
@@ -7746,7 +7817,23 @@ export class RunRunner {
 
     const effectiveDeclared = result.nonClosing ?? claim.config?.non_closing;
     const issuePublication = resolveRunKind(claim.kind) === "issue" && typeof claim.issue_iid === "number";
+    const refreshPublication = resolveRunKind(claim.kind) === "mr_rework" ||
+      (resolveRunKind(claim.kind) === "ci_fix" && !!claim.pipeline && result.branch === claim.pipeline.ref);
+    const publicationContextLatch = new PublicationContextLatch();
     let closingGateIid = issuePublication && effectiveDeclared ? claim.issue_iid! : undefined;
+    const refreshPublicationContext = async (head: string | null): Promise<void> => {
+      if (!refreshPublication) return;
+      try {
+        if (!head) throw new PublicationContextRefusedSignal(head);
+        const context = await this.client.publicationContext(runId, {
+          claim_generation: flight.claimGeneration!, branch: result.branch, candidate_head: head,
+        }, boundarySignal);
+        closingGateIid = publicationContextLatch.observe(context);
+      } catch (error) {
+        rethrowWorkflowAbort(error);
+        throw new PublicationContextRefusedSignal(head);
+      }
+    };
     // PRD #1230 M4: set only from the publication-start ACK's non-empty maintainer-pending
     // projection. It widens the closing guard and the non-closing delivery decision; it is neither a
     // lead declaration (effectiveDeclared) nor a member of the legacy deferred-milestone set.
@@ -7761,19 +7848,24 @@ export class RunRunner {
       return commits.filter(c => closingDirectiveFor(c.message, closingGateIid!, closingRepoPath)).map(c => c.sha);
     };
     let prepushReported = false;
-    const refusePrepush = async (kind: "closing" | "unknown", head: string | null, evidence: string[] | null = null): Promise<void> => {
+    const refusePrepush = async (kind: "closing" | "unknown" | "context", head: string | null, evidence: string[] | null = null): Promise<void> => {
       if (prepushReported) return;
       prepushReported = true;
       // Never place unvalidated evidence or commit text in the feed or terminal journal.
       const shas = evidence !== null && evidence.every(sha => /^[a-fA-F0-9]{40}$/.test(sha)) ? evidence : null;
       const shown = (shas ?? []).slice(0, 5).join(", ");
       const more = (shas?.length ?? 0) > 5 ? ` and ${shas!.length - 5} more` : "";
-      const failureReason = kind === "unknown" ? COMPLETION_INTERLOCK_UNHELD_REASON : shas === null
+      const refusedCandidate = head && /^[a-fA-F0-9]{40}$/.test(head) ? head : "unavailable";
+      const refusalReason = kind === "context"
+        ? `refresh publication refused: source context could not be confirmed for candidate ${refusedCandidate}; publication stopped`
+        : kind === "unknown" ? COMPLETION_INTERLOCK_UNHELD_REASON : shas === null
         ? "non-closing delivery refused: could not read the commit messages to publish; publication stopped"
         : `non-closing delivery refused: commit message(s) close issue #${closingGateIid} (${shown}${more}); publication stopped; correcting them needs a history rewrite, left to the owner`;
-      const holdEligible = interlocked && !(effectiveDeclared && !this.client.hasFeature("completion_non_closing_v1"));
+      const failureReason = refreshPublication && kind === "closing"
+        ? `${refusalReason}; refused candidate ${refusedCandidate}` : refusalReason;
+      const holdEligible = !refreshPublication && interlocked && !(effectiveDeclared && !this.client.hasFeature("completion_non_closing_v1"));
       batcher.emit({ kind: "status", agent: "worker", payload: {
-        text: kind === "unknown"
+        text: kind === "context" ? failureReason : kind === "unknown"
           ? holdEligible
             ? "Completion state could not be confirmed before push; the run is held for the owner."
             : "Completion state could not be confirmed before push; publication stopped."
@@ -7781,8 +7873,15 @@ export class RunRunner {
       } });
       // An old API cannot retain declared intent on a new hold. Preserve the existing terminal path.
       if (!holdEligible) {
-        await closeBatcher();
-        await journalTerminalReport({ status: "failed", failure_reason: failureReason.slice(0, MAX_FAILURE_REASON_LEN) });
+        try {
+          await closeBatcher();
+          await journalTerminalReport({ status: "failed", failure_reason: failureReason.slice(0, MAX_FAILURE_REASON_LEN) });
+        } finally {
+          // Guarded inventory settlement owns its existing verified-cleanup policy. Legacy
+          // refresh refusals retain the local source unless the original pinned H was archived.
+          if (refreshPublication && claim.inventory_guarded !== true && !terminalCaptureVerified)
+            flight.preserveRecoveryClone = true;
+        }
         return;
       }
       const holdReason = kind === "unknown" ? "completion identity unresolvable" : "closing commit message refused";
@@ -8017,6 +8116,14 @@ export class RunRunner {
         closingGateIid = claim.issue_iid!;
     }
 
+    try {
+      await refreshPublicationContext(publicationOriginalHead);
+    } catch (error) {
+      if (!(error instanceof PublicationContextRefusedSignal)) throw error;
+      await refusePrepush("context", error.head);
+      return;
+    }
+
     // Early closing-commit refusal, placed AFTER the GitHub workflow precheck so a workflow-scope
     // refusal keeps precedence when a run trips both.
     if (closingGateIid !== undefined) {
@@ -8129,6 +8236,9 @@ export class RunRunner {
               throw new WorkflowScopeBlockedSignal();
             }
           }
+          // Every actual attempt re-resolves, including network retries and transformed candidates.
+          // This stays after ownership and workflow checks even when no closing scan was needed.
+          await refreshPublicationContext(sourceSha);
           // Issue #2779: the authoritative commit-message check on the owned candidate about to be
           // pushed. The finalize bridge can re-parent published checkpoint floors into this
           // candidate, so a closing commit reworded away from H can come back after the early check.
@@ -8823,6 +8933,7 @@ export class RunRunner {
       rethrowWorkflowAbort(e);
       if (e instanceof PublicationRefusedSignal) {
         if (e instanceof ClosingCommitRefusedSignal) await refusePrepush("closing", e.head, e.shas);
+        if (e instanceof PublicationContextRefusedSignal) await refusePrepush("context", e.head);
         return;
       }
       if (e instanceof ScratchPublicationError) throw e;
@@ -8905,6 +9016,7 @@ export class RunRunner {
         rethrowWorkflowAbort(e);
         if (e instanceof PublicationRefusedSignal) {
           if (e instanceof ClosingCommitRefusedSignal) await refusePrepush("closing", e.head, e.shas);
+          if (e instanceof PublicationContextRefusedSignal) await refusePrepush("context", e.head);
           return;
         }
         if (e instanceof RunResidueBlockedError) throw e;
@@ -9125,9 +9237,7 @@ export class RunRunner {
       );
     // D17: a refresh run (mr_rework, or a ci_fix adopting an existing branch rather than opening a
     // fresh ci-fix/pipeline-N one) refreshes only the region and never authors closing semantics.
-    const refreshRun =
-      runKind === "mr_rework" ||
-      (runKind === "ci_fix" && !!claim.pipeline && result.branch === claim.pipeline.ref);
+    const refreshRun = refreshPublication;
     const repoPath = repoPathFromUrl(claim.repo.url);
     // Amended D10: an issue run whose completion block is non-closing (an interlocked run until its
     // head is verified, an owner partial, a scope-capped run, an explicit declaration) has its whole body scanned for a
@@ -9568,6 +9678,9 @@ export class RunRunner {
       // interlocked run; undefined for a legacy run, so JSON.stringify drops it and the legacy
       // completed report is byte-for-byte unchanged on the wire.
       head: completionHead,
+      source_publication: flight.sourcePublicationNegotiated && flight.runKind === "issue"
+        ? { version: 1, published_head: flight.successfulPushedSha!, non_closing: nonClosingDelivery }
+        : undefined,
     }, "run completed", { branch: result.branch, mr_iid: mr.iid });
   }
 
@@ -9767,6 +9880,7 @@ export class RunRunner {
       cancel,
       steering,
       claimGeneration,
+      sourcePublicationNegotiated: this.client.hasFeature("refresh_publication_context_v1"),
       planRevisionRetryNegotiated: this.client.hasFeature(PLAN_REVISION_RETRY_FEATURE) && Number.isSafeInteger(claimGeneration) && claimGeneration > 0,
       owedDefaultBranch: claim.repo.default_branch?.trim() || undefined,
       checkpointDefaultBranch: claim.repo.default_branch ?? undefined,
@@ -11325,6 +11439,7 @@ export class RunRunner {
     // in-progress. Chaining every report through this single variable makes the reports
     // reach the api in the order they were made. The chain itself NEVER rejects (each link
     // is isolated below) so one failed report cannot break the ordering of later ones.
+    flight.evidenceAuxiliaries = "pending";
     let runningReportChain: Promise<unknown> = Promise.resolve();
     const enqueueRunningReport = <T>(task: () => Promise<T>, signal?: AbortSignal): Promise<T> => {
       if (signal) {
@@ -12440,7 +12555,7 @@ export class RunRunner {
         let semanticDiff: Awaited<ReturnType<RunRunner["captureCheckedPlanningDiff"]>> | undefined;
         if (semanticGate) {
           if (!barePath) throw new Error("semantic candidate: bare source unavailable");
-          semanticDiff = await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, steering.lifecycleSignal(), runLog);
+          semanticDiff = await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, barePath, steering.lifecycleSignal(), runLog);
           if ("refusal" in semanticDiff) throw new Error(`semantic candidate: planning diff unavailable (${semanticDiff.refusal}: ${semanticDiff.diagnostic})`);
           semanticSources = await captureSemanticSources(this.git, {
             barePath, repo: claim.repo.id, headSha: runnerClone.baseCommit,
@@ -12527,7 +12642,7 @@ export class RunRunner {
               checkedFields = { status: "awaiting_approval", plan_cross_check_gate_reason: "codex_lead_unsupported" };
               checkedHuman = { phase: "publishinginitial", onApplied: () => releaseStateBarrier?.() };
             } else {
-              const captured = semanticDiff ?? await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, steering.lifecycleSignal(), runLog);
+              const captured = semanticDiff ?? await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, barePath, steering.lifecycleSignal(), runLog);
               if ("refusal" in captured) {
                 crossCheckReason = `plan cross-check: planning diff refused (${captured.refusal}: ${captured.diagnostic})`;
                 checkedFields = { status: "awaiting_approval", plan_cross_check_gate_reason: "planning_diff_refused",
@@ -13375,7 +13490,10 @@ export class RunRunner {
         // (never the call's own timeout) and never throws.
         await nowSummary?.stop();
         await runningReportChain;
+        if (flight.evidenceAuxiliaries !== "failed") flight.evidenceAuxiliaries = "joined";
       } catch (settlementError) {
+        flight.evidenceAuxiliaries = "failed";
+        flight.evidenceJoinFailed = true;
         executionRejection.rejected = false;
         throw settlementError;
       }
@@ -13394,6 +13512,9 @@ export class RunRunner {
         if (m4ResumeReviewedPlan && priorOwnerHistory.status === "complete" && priorOwnerHistory.entries.length > 0) {
           await this.awaitResumedDelivery(runId, steering, batcher, runLog, cancel.signal);
         }
+        // A prior quiescence/command receipt cannot settle newly admitted model work.
+        flight.evidenceProcessJoined = undefined;
+        if (flight.evidenceCommands) flight.evidenceCommands.confirmed = false;
         let execution: Promise<ExecutorResult>;
         try { execution = executor.run(ctx); }
         catch (value) {
@@ -13798,6 +13919,10 @@ export class RunRunner {
       }
       MaintenanceBudget.current()?.check();
       outcome = fold(outcome);
+      if (!executor.safety) {
+        if (outcome.process?.state === "quiescent") flight.evidenceProcessJoined = executor;
+        else flight.evidenceJoinFailed = true;
+      }
       // Ordinary callers allow an absent process result. Private FAILED observation
       // requires explicit process proof, including the transfer's post-Git re-proof.
       if (flight.sourceNormalFailure && outcome.process?.state !== "quiescent") flight.sourceJoinFailed = true;
@@ -14116,6 +14241,7 @@ export class RunRunner {
     MaintenanceBudget.current()?.check();
     const barePath = flight.barePath!;
     const input = {
+      onArchiveAccepted: (accepted: RecoveryRecord) => this.archiveAccepted(flight, accepted),
       onCancellationObserved: () => this.observeCancellation(flight),
       record, barePath, defaultBranch: record.defaultBranch!, signal,
     };
@@ -16701,6 +16827,7 @@ export class RunRunner {
         (await this.git.defaultBranchName(barePath)) ||
         "main";
       const outcome = await this.recovery.captureAndUpload({
+        onArchiveAccepted: record => this.archiveAccepted(flight, record),
         onCancellationObserved: () => this.observeCancellation(flight),
         record,
         barePath,
@@ -16899,6 +17026,29 @@ export class RunRunner {
     return { kind: "unknown" };
   }
 
+  private registerEvidenceExecutor(flight: RunFlight): void {
+    if (flight.evidenceCommands?.failed) flight.evidenceJoinFailed = true;
+    const receipt = { confirmed: false, failed: false };
+    flight.evidenceCommands = receipt;
+    flight.evidenceProcessJoined = undefined;
+    this.commandSettlements.set(flight.executor, receipt);
+  }
+
+  private observeCommandSettlement(executor: Executor, confirmed: boolean): void {
+    const receipt = this.commandSettlements.get(executor);
+    if (!receipt) return;
+    receipt.confirmed = confirmed;
+    receipt.failed ||= !confirmed;
+  }
+
+  private archiveAccepted(flight: RunFlight, record: RecoveryRecord): void {
+    if (Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0 &&
+        flight.inventoryGuarded === true && record.inventoryGuarded === true && record.runId === flight.runId &&
+        Number.isSafeInteger(record.generation) && record.generation! > 0 && record.generation! <= flight.claimGeneration &&
+        classifyRecoveryOrigin(record.captureId) === "ordinary" &&
+        record.state === "uploaded" && !flight.parked) flight.archiveAccepted = true;
+  }
+
   /**
    * Issue #2471: before a sink that only calls killAgentTree acts, give a guard-bound Claude
    * executor the chance to dispose and confirm its model commands (a no-op for every other
@@ -16909,10 +17059,13 @@ export class RunRunner {
     if (!executor.settleWorkerCommands) return;
     const deadlineMs = Math.max(0, Math.min(GUARDED_COMMAND_SETTLE_MS, budgetMs ?? GUARDED_COMMAND_SETTLE_MS));
     try {
-      if (!(await executor.settleWorkerCommands(deadlineMs)).confirmed) {
+      const { confirmed } = await executor.settleWorkerCommands(deadlineMs);
+      this.observeCommandSettlement(executor, confirmed);
+      if (!confirmed) {
         this.log.warn("guarded worker commands were not confirmed settled before the sink");
       }
     } catch (err) {
+      this.observeCommandSettlement(executor, false);
       this.log.warn("guarded worker command settle failed", { error: errMessage(err) });
     }
   }
@@ -16928,6 +17081,7 @@ export class RunRunner {
       try { confirmed = (await executor.settleWorkerCommands(deadlineMs)).confirmed; } catch (error) {
         if (canonicalRecoveryInterruption(error)) throw error;
       }
+      this.observeCommandSettlement(executor, confirmed);
       if (!confirmed) {
         return { kind: "incomplete", errors: [{ category: "protocol", message: "worker command settle unconfirmed" }] };
       }
@@ -20546,6 +20700,7 @@ export class RunRunner {
               await check();
               if (!record) { blocker = "preservation_failed"; throw finalize; }
               const outcome = await this.recovery.captureAndUpload({
+                onArchiveAccepted: record => this.archiveAccepted(flight, record),
                 onCancellationObserved: () => this.observeCancellation(flight),
                 record: record!, barePath: bare, defaultBranch: record!.defaultBranch!,
                 signal: held.signal,
@@ -20603,6 +20758,7 @@ export class RunRunner {
             await check();
             if (flight.executor.safety && disposal?.kind !== "disposed") throw finalize;
             flight.executor = this.makeExecutor(claim.run_id, claim.secrets.codex).executor;
+            this.registerEvidenceExecutor(flight);
           }
           flight.batcher.emit({ kind: "status", agent: "worker", payload: {
             text: "retained work verified on a fresh local attempt; predecessor sources and custody retained",
@@ -20821,11 +20977,15 @@ export class RunRunner {
    *  revision rounds share ONE budget rather than resetting the clock each round. The
    *  autopilot short-circuit is unchanged and never returns a revise. */
   private async captureCheckedPlanningDiff(
-    clonePath: string, baseCommit: string, signal: AbortSignal, runLog: Logger,
+    clonePath: string, baseCommit: string, barePath: string | undefined, signal: AbortSignal, runLog: Logger,
   ): Promise<{ diff: string } | { refusal: PlanCrossCheckDiffRefusal; diagnostic: string }> {
     if (!/^[a-f0-9]{40}$/.test(baseCommit)) {
       runLog.warn("plan cross-check: planning diff refused", { refusal: "base_unavailable", diagnostic: "base_invalid" });
       return { refusal: "base_unavailable", diagnostic: "base_invalid" };
+    }
+    if (!barePath) {
+      runLog.warn("plan cross-check: planning diff refused", { refusal: "base_unavailable", diagnostic: "bare_unavailable" });
+      return { refusal: "base_unavailable", diagnostic: "bare_unavailable" };
     }
     const scope = new AbortController();
     const ownerSignal = AbortSignal.any([signal, scope.signal]);
@@ -20835,7 +20995,7 @@ export class RunRunner {
     try {
       result = await this.git.withBoundaryProcessSpawner(spawner.spawn, ownerSignal, async () => {
         let bytes: Buffer;
-        try { bytes = await this.git.capturePlanningDiff(clonePath, baseCommit); }
+        try { bytes = await this.git.capturePlanningDiff(clonePath, baseCommit, barePath); }
         catch (error) {
           signal.throwIfAborted();
           const classified = classifyPlanningCaptureError(errMessage(error));
@@ -21033,7 +21193,7 @@ export class RunRunner {
         // branch below (a human sees the plan + the nudge and can revise/reject). The verdict is
         // UNCHANGED — this arms guidance beside the approve, it does not alter it.
         if (proposesRewrite) steering.pushSafetySteer(composePlanGateNudge(publishedTip!));
-        if (checkedApproval) return { kind: "approve", approval: "cross_check", selection: { status: "ok", selection },
+        if (checkedApproval) return { kind: "approve", approval: "cross_check", findings: checkedApproval.findings, selection: { status: "ok", selection },
           canonical: { plan: checkedApproval.candidate.plan_md,
             milestones: checkedApproval.candidate.milestones as Milestone[],
             candidate_digest: checkedApproval.candidate_digest, claimGeneration: checkedApproval.candidate_generation } };
