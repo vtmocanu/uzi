@@ -256,6 +256,23 @@ function main(): void {
   child.on("close", (code, signal) => {
     void (async () => {
       let cleanup: Summary["cleanup"] = "not-needed";
+      if (termination === "none" && !interrupted && signal === null
+        && child.pid !== undefined && groupHasLiveMember(child.pid)) {
+        // Observe only an initially positive diagnostic probe. This never signals an uninterrupted
+        // group; 50ms polls over 500ms allow short-lived descendants to exit before warning.
+        const deadline = Date.now() + 500;
+        cleanup = "leftover";
+        while (termination === "none" && !interrupted && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          if (termination !== "none" || interrupted) break;
+          if (!groupHasLiveMember(child.pid)) {
+            cleanup = "not-needed";
+            break;
+          }
+        }
+      }
+      // Recheck after observation: a caller's signal must finish abnormal cleanup before finish
+      // clears the escalation timer.
       // Also when the runner itself died from a signal nobody here sent (OOM killer, kill -9): its
       // per-file children are then orphans in a detached group that nothing else will reap.
       if ((termination !== "none" || signal !== null) && child.pid !== undefined) {
@@ -273,7 +290,7 @@ function main(): void {
           cleanup = "unverified";
         }
         if (cleanup === "unverified") console.error("agent-tests: cleanup UNVERIFIED: the test process group may still be alive");
-      } else if (child.pid !== undefined && groupHasLiveMember(child.pid)) {
+      } else if (cleanup === "leftover") {
         // Diagnostic only: an uninterrupted run is not swept, so a test that leaves a process behind
         // is named here rather than silently killed.
         cleanup = "leftover";
