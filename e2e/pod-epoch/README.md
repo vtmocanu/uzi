@@ -25,8 +25,18 @@ Prints `SMOKE <posture> PASS` per posture and exits nonzero on any failure.
 `pe_daemon_replace` (remove, then create a new container on the same two
 volumes: successor pod epoch), `pe_events_start <file>` / `pe_events_stop`
 (exit status in `PE_EVENTS_RC`), `pe_server_info`, and an EXIT-trap cleanup
-that preserves the original exit status. Every call has a cap within a shared
-deadline (`PE_DEADLINE_SECONDS`, default 900 per posture).
+that preserves the original exit status. Every experiment call has a cap within
+a shared deadline (`PE_DEADLINE_SECONDS`, `^[1-9][0-9]{0,4}$`, default 900 per
+posture); cleanup and events teardown use fixed caps outside it.
+
+`PE_EVENTS_RC` is the raw exit status of the local exec; `PE_EVENTS_END` says
+why: `stopped` (we ended it), `ended` (it ended itself, e.g. daemon restart) or
+`deadline` (status 124). The stream is started with `--since` taken inside the
+daemon container, and the in-container `docker events` pid is killed and
+verified gone on stop. A second start while one is active fails.
+
+The library requires the caller's `set -euo pipefail` and one posture per
+(sub)shell; `pe_init` fails if called twice in the same shell.
 
 ## Safety rules
 
@@ -54,8 +64,15 @@ a harness-owned volume at the data root (the persisted DinD PVC) and another at
 
 Deviations:
 
-- Rootless passes `--storage-driver=vfs` to the image entrypoint (nested
-  overlay is not assumed); override with `PE_ROOTLESS_DOCKERD_FLAGS`.
+- Rootless runs the explicit command
+  `dockerd --host=unix:///run/dind/docker.sock --storage-driver=vfs` (nested
+  overlay is not assumed). Flags only would make the image entrypoint add
+  `--host=tcp://0.0.0.0:2375` and publish it on the shared bridge with TLS off.
+  Production rootless keeps `/certs` TLS on 2376; the harness binds unix only.
+  After every daemon start the harness checks (read-only, via `/proc/net/tcp*`)
+  that nothing listens on a non-loopback TCP port and fails otherwise.
+- The rootful posture omits production's MTU cap and the `--config-file`
+  default-network-opts; it uses the image defaults.
 - Rootless mounts a tmpfs at `/run/dind` (uid/gid 1000) in place of the pod
   `emptyDir`; it is cleared on a container restart.
 - Rootless: a labelled one-shot helper container chowns the two fresh volumes to
