@@ -698,6 +698,46 @@ describe("hash-attested maintenance WIP capture (W0-H)", { skip: process.platfor
     assert.equal(swapped, 1, "the swap ran exactly at the payload launch");
   });
 
+  // No pre-open lstat: the opened fd's isFile/identity check alone keeps a replacement's bytes unread.
+  // The payload helper is relaunched with fs.readSync observed (inode per read) in a test-only log.
+  for (const replace of [false, true]) test("payload reads " + (replace
+    ? "nothing from a regular file replaced between census and payload"
+    : "the unchanged census-time file (positive control)"), async t => {
+    const f = await fixture(t);
+    await f.dirty();
+    const target = path.join(f.root, "tracked"), log = path.join(f.dir, "payload-reads.log");
+    const original = fsSync.statSync(target, { bigint: true }).ino.toString();
+    let replacement = "";
+    f.intercept(request => {
+      const script = request.argv[1] === "-e" ? request.argv[2] ?? "" : "";
+      if (!script.startsWith("// uzi-wip-payload")) return undefined;
+      if (replace) {
+        fsSync.rmSync(target);
+        fsSync.writeFileSync(target, "CHANGED");
+        replacement = fsSync.statSync(target, { bigint: true }).ino.toString();
+      }
+      return `process.argv = [process.argv[0], ...${JSON.stringify(request.argv.slice(3))}];
+const observed = require("node:fs"), readSync = observed.readSync;
+observed.readSync = function (fd, ...rest) {
+  observed.appendFileSync(${JSON.stringify(log)}, observed.fstatSync(fd, { bigint: true }).ino + "\\n");
+  return readSync.call(observed, fd, ...rest);
+};
+` + script;
+    });
+    const refsBefore = f.refs();
+    const reads = () => fsSync.existsSync(log) ? fsSync.readFileSync(log, "utf8").split("\n").filter(Boolean) : [];
+    if (replace) {
+      await assert.rejects(f.capture(), REFUSED);
+      assert.notEqual(replacement, original, "the replacement is a new inode");
+      assert.ok(!reads().includes(replacement), "no byte of the replacement was read");
+      assert.ok(!f.launched("add"));
+      assertUnmoved(f, refsBefore);
+    } else {
+      assert.equal((await f.capture()).kind, "committed");
+      assert.ok(reads().includes(original), "the observation sees reads of the census-time file");
+    }
+  });
+
   // ------------------------------------------------- acceptance 2: forged clean index entry
 
   for (const visible of [false, true]) test("forged clean index entry over modified worktree bytes is refused protected (visible WIP: " + visible + ")", async t => {
