@@ -266,6 +266,7 @@ for (const mode of ["ordinary", "upload-rejected", "upload-failed", "commands-un
     const codex = ["disposed", "incomplete", "legacy_in_process", "dispose-rejected", "executor-replaced"].includes(mode);
     const safety: CodexExecutionSafety | undefined = codex ? {
       kind: "codex",
+      acceptsTerminalDisposal: () => false,
       withBoundary: async (request, action) => action({ epoch: 1, boundary: request.boundary,
         signal: new AbortController().signal } as BoundaryPermit),
       spawnBoundaryProcess: async () => { throw new Error("no subprocess admission in fixture"); },

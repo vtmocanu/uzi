@@ -92,6 +92,7 @@ function recordingSafety(): { safety: CodexExecutionSafety; spawns: BoundaryProc
   const spawns: BoundaryProcessRequest[] = [];
   const safety: CodexExecutionSafety = {
     kind: "codex",
+    acceptsTerminalDisposal: () => false,
     withBoundary: async (req, action) =>
       action({ epoch: 1, boundary: req.boundary, signal: new AbortController().signal } as unknown as BoundaryPermit),
     spawnBoundaryProcess: async (_permit, request) => {

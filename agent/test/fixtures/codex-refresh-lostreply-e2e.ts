@@ -156,6 +156,7 @@ const runner = new RunRunner(client, cache, (_runId, codex) => {
   );
   const safety = {
     kind: "codex" as const,
+    acceptsTerminalDisposal: inner.acceptsTerminalDisposal.bind(inner),
     withBoundary: ((request, action) => inner.withBoundary(request, async (permit) => {
       successfulBoundaries++;
       return await action(permit);

@@ -372,6 +372,8 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
   private readonly cleanupWitnesses = new WeakMap<BoundaryPermit, CleanupWitness>();
   private readonly cleanAbortedCompletions = new WeakSet<Promise<unknown>>();
   private disposing = false;
+  private disposalPromise?: Promise<ToolDisposal>;
+  private disposalOutcome?: ToolDisposal;
   private exclusiveReaper: object | undefined;
   private readonly reaperReservations = new WeakSet<BoundaryProcessRequest>();
   private heldCapture: CredentialFreeCaptureContext | undefined;
@@ -1338,7 +1340,10 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       // the registry has poisoned itself and never admitted this root. Do NOT reap an
       // unadmitted root; best-effort tear the just-spawned process down and surface the
       // poison so the boundary is never treated as clean.
-      await root.dispose(this.remainingMs(this.currentDeadlineAt)).catch(() => {});
+      this.registry.retainRejectedRoot(reserved.reservation, root);
+      await root.dispose(this.remainingMs(this.currentDeadlineAt)).catch(() => {
+        this.registry.markLaunchCleanupUnconfirmed();
+      });
       return { kind: "poisoned", error: registered.error };
     }
     // Hold the permit until this root reaps its whole descendant set.
@@ -1376,8 +1381,24 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
   /** Terminal disposal shares the acquisition queue with capture and boundaries.
    * The deadline bounds acquisition only; once owned, disposal joins its cleanup.
    * An expired acquisition retains its slot until the real predecessor settles. */
-  async dispose(request: BoundaryRequest): Promise<ToolDisposal> {
+  acceptsTerminalDisposal(outcome: ToolDisposal): boolean {
+    return this.disposalOutcome === outcome && this.registry.acceptsTerminalDisposal(outcome);
+  }
+
+  dispose(request: BoundaryRequest): Promise<ToolDisposal> {
     this.disposing = true;
+    if (this.disposalPromise) return this.disposalPromise;
+    let resolve!: (outcome: ToolDisposal) => void;
+    let reject!: (error: unknown) => void;
+    this.disposalPromise = new Promise((yes, no) => { resolve = yes; reject = no; });
+    void this.disposeQueued(request).then(outcome => {
+      this.disposalOutcome = outcome;
+      resolve(outcome);
+    }, reject);
+    return this.disposalPromise;
+  }
+
+  private async disposeQueued(request: BoundaryRequest): Promise<ToolDisposal> {
     const deadlineAt = this.now() + Math.max(0, request.deadlineMs);
     const prior = this.queueTail;
     let release!: () => void;
@@ -1480,6 +1501,11 @@ export function createCodexExecutionSafety(
         if (terminalHookFailure) return { kind: "incomplete", errors: [
           ...(outcome.value.kind === "incomplete" ? outcome.value.errors : []), terminalHookFailure,
         ] };
+        if (outcome.value.kind === "disposed" && !registry.acceptsTerminalDisposal(outcome.value)) {
+          const error: HarnessError = { category: "tool", message: "terminal cleanup hook invalidated disposal evidence" };
+          registry.poison(error);
+          return { kind: "incomplete", errors: [error] };
+        }
         return outcome.value;
       },
       spawnRoot,

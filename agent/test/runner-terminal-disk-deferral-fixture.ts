@@ -109,6 +109,7 @@ export function supervisedSafety(mode: "empty" | "absent" | "incomplete"): Codex
   // Deliberately unregistered facades cannot issue safety-owned cleanup evidence.
   return {
     kind: "codex",
+    acceptsTerminalDisposal: () => false,
     withBoundary: async () => {
       if (mode === "incomplete") throw new Error("supervisor settlement incomplete");
       return undefined as never;

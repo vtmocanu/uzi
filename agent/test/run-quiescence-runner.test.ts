@@ -228,6 +228,7 @@ describe("issue #1856: terminal Codex disposal gates clone retirement", () => {
       let clone = "";
       const safety: CodexExecutionSafety = {
         kind: "codex",
+        acceptsTerminalDisposal: () => false,
         withBoundary: async () => { throw new Error("unexpected boundary"); },
         spawnBoundaryProcess: async () => { throw new Error("unexpected spawn"); },
         dispose: async () => {

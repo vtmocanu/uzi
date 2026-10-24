@@ -2546,7 +2546,13 @@ describe("ordinary teardown capture eligibility", () => {
       const initialSafety = exec.safety;
       exec["epochSafeties"].set(registry, facade);
       exec["unverifiedEpochRegistries"].add(registry);
-      if (mode === "already-disposed" || mode === "already-disposed-no-facade") assert.equal((await registry.disposeTools(1000)).kind, "disposed");
+      if (mode === "already-disposed" || mode === "already-disposed-no-facade") {
+        const closed = await registry.quiesceChildren(1000);
+        assert.equal(closed.kind, "quiescent");
+        if (closed.kind !== "quiescent") throw new Error("prior drain did not quiesce");
+        assert.equal((await registry.reapProcesses(1000, closed.epoch)).kind, "observed_empty");
+        assert.equal((await registry.disposeTools(1000)).kind, "disposed");
+      }
       const harness = mode === "harness-cleanup"
         ? { close: async () => { throw new Error("harness cleanup unconfirmed"); } } as unknown as CodexHarness : undefined;
       const fileop = mode === "fileop-cleanup"
@@ -2565,6 +2571,10 @@ describe("ordinary teardown capture eligibility", () => {
       }
       if (mode === "foreign-facade") {
         const foreign = new ExecutionRegistry(newLocalExecutionEpoch(2853));
+        const closed = await foreign.quiesceChildren(1000);
+        assert.equal(closed.kind, "quiescent");
+        if (closed.kind !== "quiescent") throw new Error("foreign drain did not quiesce");
+        assert.equal((await foreign.reapProcesses(1000, closed.epoch)).kind, "observed_empty");
         assert.equal((await foreign.disposeTools(1000)).kind, "disposed");
         exec.safety = createCodexExecutionSafety(foreign, async () => { throw new Error("no foreign spawn"); });
       }
@@ -2599,12 +2609,13 @@ describe("ordinary teardown capture eligibility", () => {
           unverifiedAfterTeardown: !successful, unverifiedAfterSecond: !successful,
           unverifiedAfterCapture: !successful, oldFacadeTrackedAfterCapture: !successful,
           result: successful ? "observed_empty" : "incomplete", actions: successful ? 1 : 0,
-          reapsAfterFirst: repeated ? 1 : 0, reapsAfterCapture: repeated ? 1 : 0,
+          reapsAfterFirst: 1, reapsAfterCapture: 1,
           injected: mode === "late-reservation-repeat",
           admissionState: mode === "late-reservation-repeat" ? "closed" : undefined,
-          admission: mode === "late-reservation-repeat" ? "reserved" : undefined,
+          admission: mode === "late-reservation-repeat" ? "denied" : undefined,
           registered: undefined, lateReaps: 0, lateDisposals: 0, roots: 1, pending: 0,
-          state: "disposed", poison: false, initialSafetyUndefined: !repeated,
+          state: mode === "late-reservation-repeat" ? "poisoned" : "disposed",
+          poison: mode === "late-reservation-repeat", initialSafetyUndefined: !repeated,
           releases: 0, refreshes: 0, launches: 0, probes: 0,
         }, "B2-R1: only proven clean repeats may forget the old epoch and admit capture");
       }
@@ -2623,10 +2634,11 @@ describe("ordinary teardown capture eligibility", () => {
         assert.deepEqual(facts, {
           clean: false, unverifiedAfterTeardown: true, unverifiedAfterCapture: true,
           result: "incomplete", actions: 0, injected: true, admissionState: "closed",
-          admission: "reserved", registered: reservationOnly ? undefined : true,
-          initialReaps: 1, lateReaps: 0, lateDisposals: reservationOnly ? 0 : 1,
-          roots: reservationOnly ? 1 : 2, pending: 0,
-          state: "disposed", poison: false, releases: 0, refreshes: 0, launches: 0, probes: 0,
+          admission: mode === "late-reap-root" ? "reserved" : "denied",
+          registered: mode === "late-reap-root" ? true : undefined,
+          initialReaps: 1, lateReaps: 0, lateDisposals: mode === "late-reap-root" ? 1 : 0,
+          roots: mode === "late-reap-root" ? 2 : 1, pending: 0,
+          state: "poisoned", poison: true, releases: 0, refreshes: 0, launches: 0, probes: 0,
         });
       } else if (mode === "clean" || mode === "clean-repeat") {
         assert.deepEqual(result, { kind: "observed_empty", value: "local-only" });
@@ -11668,8 +11680,12 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
     const proof = exec["completedCaptures"].get(registry);
     assert.ok(proof);
     assert.deepEqual(c.holder.releases, []);
-    await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 1000 });
-    assert.equal(registry.state(), "disposed", "public terminal disposal actually ran");
+    const disposed = await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 1000 });
+    assert.equal(disposed.kind, "incomplete", "pre-existing uncertainty refuses disposal proof");
+    assert.equal(registry.state(), "poisoned");
+    assert.equal(registry.isPoisoned(), true);
+    assert.ok(registry.poisonErrors().some(error => error.message === "pre-existing cleanup uncertainty"),
+      "terminal disposal retains the original fault");
     assert.equal(exec["completedCaptures"].get(registry), proof, "no substitute proof");
     assert.equal(registry.acceptsCompletedCapture(proof), false);
     assert.deepEqual(c.holder.releases, [false], "public terminal settlement retains the cache");
@@ -11848,6 +11864,7 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
       const rlog = recordingLog();
       const exec = makeExecutor(c.rig, bindingOf(SUBSCRIPTION), rlog.log);
       await withTimeout(exec.run(makeCtx().ctx), 3000, "deferred cache run");
+      await exec.safety!.withBoundary({ boundary: "finalize", deadlineMs: 1000 }, async () => {});
       await exec.safety!.dispose({ boundary: "terminal", deadlineMs });
       assert.equal(c.holder.releaseTimeouts.length, 1);
       const t = c.holder.releaseTimeouts[0]!;
@@ -11861,7 +11878,8 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
     pushBashTurn(lost.rig, ["echo one"]);
     const exec = makeExecutor(lost.rig, bindingOf(SUBSCRIPTION));
     await withTimeout(exec.run(makeCtx().ctx), 3000, "deferred holder-loss run");
-    await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 2000 });
+    await exec.safety!.withBoundary({ boundary: "finalize", deadlineMs: 1000 }, async () => {});
+    assert.equal((await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 2000 })).kind, "disposed");
     assert.equal(lost.removeTimeouts.length, 1);
     assert.ok(lost.removeTimeouts[0]! >= 1000 && lost.removeTimeouts[0]! <= 2000, `remove wait ${lost.removeTimeouts[0]}`);
   });
@@ -22558,6 +22576,7 @@ describe("A capture lifecycle public run", () => {
       assert.equal((await withTimeout(exec.run(ctx), 5000, "unclean old epoch run")).branch, ctx.branch);
       assert.ok(oldDisposals > 0, "the real abandoned epoch attempted helper teardown");
       assert.equal(fx.rig.providerLaunches(), 2);
+      await exec.safety!.withBoundary({ boundary: "finalize", deadlineMs: 1000 }, async () => {});
       const disposed = await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 1000 });
       assert.equal(disposed.kind, unclean ? "incomplete" : "disposed");
       if (disposed.kind === "incomplete") assert.match(JSON.stringify(disposed.errors), /terminal cleanup hook failed/);

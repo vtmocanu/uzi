@@ -239,6 +239,10 @@ export class ExecutionRegistry {
   // so `settleForCapture` consults this flag, not the state enum, to refuse reading the
   // cleared (falsely empty) counts.
   private tablesCleared = false;
+  private disposalPromise?: Promise<ToolDisposal>;
+  private terminalDisposal?: {
+    outcome: ToolDisposal; revision: object; roots: number; launches: number; callbacks: number;
+  };
   private launchCleanupUnconfirmed = false;
 
   private readonly launches = new Map<string, LaunchReservation>();
@@ -343,7 +347,7 @@ export class ExecutionRegistry {
   }
 
   private admissionOpen(): boolean {
-    return this.currentState === "open";
+    return !this.tablesCleared && this.currentState === "open";
   }
 
   // --- poison (sticky) --------------------------------------------------------
@@ -377,6 +381,7 @@ export class ExecutionRegistry {
   beginCapture(observation: CaptureSettlement): { live: () => boolean; reserve: (request?: BoundaryProcessRequest) => LaunchReservationResult; complete: () => object | undefined; close: () => void } {
     if (this.captureObservations.get(observation) !== this.poisonRevision || this.currentState !== "poisoned" || this.tablesCleared || this.captureLane ||
         this.launches.size || this.inFlightCallbackCount() || this.roots.some(r => !r.reaped)) {
+      if (this.tablesCleared) this.poison({ category: "protocol", message: "beginCapture: registry disposal entered" });
       throw new Error("capture lane requires observed empty poisoned registry");
     }
     this.captureObservations.delete(observation);
@@ -389,7 +394,10 @@ export class ExecutionRegistry {
       live,
       reserve: (request) => {
         if (request) assertClosedReaperRequest(request);
-        if (!live()) return { kind: "denied", reason: "admission_closed" };
+        if (!live()) {
+          if (this.tablesCleared) this.poison({ category: "protocol", message: "capture launch: registry disposal entered" });
+          return { kind: "denied", reason: "admission_closed" };
+        }
         this.launchSeq += 1;
         const reservation: LaunchReservation = { id: `launch-${this.launchSeq}`, kind: "boundary_action" };
         this.launches.set(reservation.id, reservation);
@@ -426,6 +434,10 @@ export class ExecutionRegistry {
   // --- launch reservations ----------------------------------------------------
 
   reserveLaunch(kind: RootKind, reaperRequest?: BoundaryProcessRequest): LaunchReservationResult {
+    if (this.tablesCleared) {
+      this.poison({ category: "protocol", message: "reserveLaunch: registry disposal entered" });
+      return { kind: "denied", reason: "admission_closed" };
+    }
     if (reaperRequest) assertClosedReaperRequest(reaperRequest);
     // The trusted boundary-action lane: once admission has CLOSED (post-quiesce),
     // ordinary provider/command launches stay refused, but a permitted checkpoint/
@@ -447,6 +459,12 @@ export class ExecutionRegistry {
    *  `{ ok: false, error }`, so the caller tears the just-spawned root down instead
    *  of continuing to reap an unadmitted (now-poisoned) root. */
   registerRoot(reservation: LaunchReservation, root: RegisteredRoot): RegisterRootResult {
+    if (this.tablesCleared) {
+      const error: HarnessError = { category: "protocol", message: "registerRoot: registry disposal entered" };
+      this.poison(error);
+      this.retainRejectedRoot(reservation, root);
+      return { ok: false, error };
+    }
     const held = this.launches.get(reservation.id);
     if (!held) {
       const error: HarnessError = {
@@ -475,6 +493,7 @@ export class ExecutionRegistry {
   retainRejectedRoot(reservation: LaunchReservation, root: RegisteredRoot): void {
     if (!this.roots.some(rec => rec.root === root)) {
       this.roots.push({ root, reaped: false, disposed: false, admissionRejected: true });
+      if (this.tablesCleared) this.poison({ category: "protocol", message: "retainRejectedRoot: registry disposal entered" });
     }
     this.cancelReservation(reservation);
   }
@@ -489,6 +508,10 @@ export class ExecutionRegistry {
   // --- callback reservations (idempotency bookkeeping only) -------------------
 
   reserveCallback(request: CallbackReservationRequest): CallbackReservationResult {
+    if (this.tablesCleared) {
+      this.poison({ category: "protocol", message: "reserveCallback: registry disposal entered" });
+      return { kind: "denied", reason: "admission_closed" };
+    }
     const key = keyOf(request);
     const existing = this.callbacks.get(key);
     // An already-tracked key is handled BEFORE the admission/ceiling gates: it
@@ -855,40 +878,72 @@ export class ExecutionRegistry {
     return observation;
   }
 
-  /**
-   * Revokes admission, disposes every registered root, and drops handler/callback
-   * references. Idempotent: a second call returns `{ kind: "disposed" }` without
-   * re-disposing a root. A failing `dispose()` poisons and returns `incomplete`.
-   */
-  async disposeTools(deadlineMs: number): Promise<ToolDisposal> {
-    if (this.currentState === "disposed") return { kind: "disposed" };
-    // Set BEFORE the first await: a settle observing this registry mid-disposal (or after a
-    // failed one, which leaves the state "poisoned") must never read the tables as empty.
+  /** Exact historical success, revoked by any subsequent uncertainty or admission fault. */
+  acceptsTerminalDisposal(outcome: ToolDisposal): boolean {
+    const witness = this.terminalDisposal;
+    return witness !== undefined && witness.outcome === outcome && outcome.kind === "disposed" &&
+      this.tablesCleared && this.currentState === "disposed" && !this.captureLane &&
+      !this.launchCleanupUnconfirmed && witness.revision === this.poisonRevision &&
+      witness.roots === this.roots.length && witness.launches === this.launchSeq &&
+      witness.callbacks === this.callbackAdmissionSequence &&
+      this.roots.every(rec => rec.reaped && rec.disposed);
+  }
+
+  /** Close admission synchronously. One stored attempt joins all cleanup it starts;
+   * failures never skip siblings or allow a later call to retry/re-attest. */
+  disposeTools(deadlineMs: number): Promise<ToolDisposal> {
+    if (this.disposalPromise) return this.disposalPromise;
     this.tablesCleared = true;
+    const deadlineAt = Date.now() + Math.max(0, deadlineMs);
+    const revision = this.poisonRevision;
+    const roots = this.roots.length;
+    const launches = this.launchSeq;
+    const callbacks = this.callbackAdmissionSequence;
     const errors: HarnessError[] = [];
-    for (const rec of this.roots) {
-      if (rec.disposed) continue;
-      try {
-        await rec.root.dispose(deadlineMs);
-        rec.disposed = true;
-      } catch (e) {
-        errors.push({
-          category: "tool",
-          message: `disposeTools: root dispose failed (${safeErrorName(e)})`,
-        });
+    const eligible = (this.currentState === "closed" ||
+      (this.currentState === "poisoned" && this.capturePoisonRevision === revision)) &&
+      !this.captureLane && this.launches.size === 0 && this.inFlightCallbackCount() === 0 &&
+      !this.launchCleanupUnconfirmed && this.roots.every(rec => rec.reaped);
+    if (!eligible) {
+      const error: HarnessError = { category: "protocol", message: "disposeTools: epoch cleanup not proven at entry" };
+      errors.push(error);
+      this.poison(error);
+    }
+    // Defer root calls until the promise is installed, including synchronous reentrancy.
+    this.disposalPromise = Promise.resolve().then(async () => {
+      const remaining = () => Math.max(0, deadlineAt - Date.now());
+      const dispose = async (rec: RootRecord) => {
+        if (rec.disposed) return;
+        try {
+          await rec.root.dispose(remaining());
+          rec.disposed = true;
+        } catch (e) {
+          errors.push({ category: "tool", message: `disposeTools: root dispose failed (${safeErrorName(e)})` });
+        }
+      };
+      // Two finite snapshots: entry roots and roots rejected during their cleanup.
+      // Later arrivals remain retained and invalidate proof; no unbounded drain loop.
+      const initial = this.roots.slice();
+      for (const rec of initial) await dispose(rec);
+      const late = this.roots.slice(initial.length);
+      for (const rec of late) await dispose(rec);
+      if (this.poisonRevision !== revision || this.roots.length !== roots ||
+          this.launchSeq !== launches || this.callbackAdmissionSequence !== callbacks ||
+          this.captureLane || this.launchCleanupUnconfirmed || this.roots.some(rec => !rec.reaped || !rec.disposed)) {
+        errors.push({ category: "tool", message: "disposeTools: cleanup evidence changed or unconfirmed" });
       }
-    }
-    if (this.launchCleanupUnconfirmed || this.roots.some(rec => rec.admissionRejected && !rec.reaped)) {
-      errors.push({ category: "tool", message: "disposeTools: launch cleanup unconfirmed" });
-    }
-    this.callbacks.clear();
-    this.launches.clear();
-    if (errors.length > 0) {
-      this.poison(errors);
-      return { kind: "incomplete", errors };
-    }
-    this.currentState = "disposed";
-    return { kind: "disposed" };
+      this.callbacks.clear();
+      this.launches.clear();
+      if (errors.length) {
+        this.poison(errors);
+        return { kind: "incomplete", errors } as const;
+      }
+      const outcome = { kind: "disposed" } as const;
+      this.currentState = "disposed";
+      this.terminalDisposal = { outcome, revision, roots, launches, callbacks };
+      return outcome;
+    });
+    return this.disposalPromise;
   }
 
   private snapshotPoison(): readonly HarnessError[] {

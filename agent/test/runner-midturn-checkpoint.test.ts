@@ -2213,6 +2213,7 @@ describe("mid-turn checkpoint review follow-ups (issue #1597 M2)", () => {
     const scansInPermit: number[] = [];
     const safety: CodexExecutionSafety = {
       kind: "codex",
+      acceptsTerminalDisposal: () => false,
       withBoundary: async (req, action) => {
         const ac = new AbortController();
         const timer = setTimeout(() => ac.abort(new Error("boundary deadline")), req.deadlineMs);
@@ -2292,6 +2293,7 @@ describe("mid-turn checkpoint review follow-ups (issue #1597 M2)", () => {
     const scansInPermit: number[] = [];
     const safety: CodexExecutionSafety = {
       kind: "codex",
+      acceptsTerminalDisposal: () => false,
       withBoundary: async (req, action) => {
         const ac = new AbortController();
         const timer = setTimeout(() => ac.abort(new Error("boundary deadline")), req.deadlineMs);
@@ -2398,6 +2400,7 @@ describe("mid-turn checkpoint review follow-ups (issue #1597 M2)", () => {
     const permitSignals: AbortSignal[] = [];
     const safety: CodexExecutionSafety = {
       kind: "codex",
+      acceptsTerminalDisposal: () => false,
       withBoundary: async (req, action) => {
         const ac = new AbortController();
         permitSignals.push(ac.signal);
@@ -3293,6 +3296,7 @@ function fakeCodex() {
   const boundaryErrors: string[] = [];
   const safety: CodexExecutionSafety = {
     kind: "codex",
+    acceptsTerminalDisposal: () => false,
     withBoundary: async (req, action) => {
       const deadlineAt = Math.min(Date.now() + Math.max(0, req.deadlineMs),
         req.gracefulShutdownCheckpoint?.deadlineAt ?? Infinity);

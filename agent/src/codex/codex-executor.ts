@@ -112,6 +112,7 @@ import {
   evidencesModelProcessing,
   EpochCleanupUnprovenError,
   type BoundaryRequest,
+  type ToolDisposal,
   type BoundaryProcessRequest,
   type CodexExecutionSafety,
   type HarnessAgent,
@@ -2752,7 +2753,7 @@ export class CodexExecutor implements Executor {
         } catch { /* Disposal still joins every known root below. */ }
         try {
           const disposed = await registry.disposeTools(remaining());
-          if (drained && disposed.kind === "disposed" && !registry.isPoisoned()) {
+          if (drained && registry.acceptsTerminalDisposal(disposed) && !registry.isPoisoned()) {
             this.unverifiedEpochRegistries.delete(registry);
             this.epochSafeties.delete(registry);
           }
@@ -3247,7 +3248,7 @@ export class CodexExecutor implements Executor {
           } catch { /* Disposal still owns every returned root. */ }
           try {
             const disposed = await provisionRegistry.disposeTools(provisionRemaining());
-            provisionClean = drained && disposed.kind === "disposed" && !provisionRegistry.isPoisoned();
+            provisionClean = drained && provisionRegistry.acceptsTerminalDisposal(disposed) && !provisionRegistry.isPoisoned();
           } catch { provisionClean = false; }
           if (provisionClean) {
             this.unverifiedEpochRegistries.delete(provisionRegistry);
@@ -3380,7 +3381,7 @@ export class CodexExecutor implements Executor {
             } catch { /* Attempt disposal even after an unsuccessful observation. */ }
             try {
               const disposed = await registry.disposeTools(remaining());
-              installerCleanupClean = drained && disposed.kind === "disposed" && !registry.isPoisoned();
+              installerCleanupClean = drained && registry.acceptsTerminalDisposal(disposed) && !registry.isPoisoned();
             } catch { installerCleanupClean = false; }
             if (installerCleanupClean) {
               this.unverifiedEpochRegistries.delete(registry);
@@ -5098,6 +5099,7 @@ export class CodexExecutor implements Executor {
     // Only intentional capture poison with unchanged exact-epoch evidence permits
     // outstanding-set removal. Pre-existing faults remain unproven.
     const captureClean = () => captureProof !== undefined && registry.acceptsCompletedCapture(captureProof);
+    let terminalDisposal: ToolDisposal | undefined;
     let ordinaryDrained = false;
     let ordinaryObservationUnchanged: (() => boolean) | undefined;
     let registryClean = !disposeRegistry || (registry.state() === "disposed" &&
@@ -5129,13 +5131,21 @@ export class CodexExecutor implements Executor {
       }
       try {
         const disposal = await registry.disposeTools(remaining());
-        registryClean = drained && disposal.kind === "disposed";
+        terminalDisposal = disposal;
+        registryClean = drained && registry.acceptsTerminalDisposal(disposal);
+      } catch { registryClean = false; }
+    }
+    if (disposeRegistry && !terminalDisposal) {
+      try {
+        terminalDisposal = await registry.disposeTools(remaining());
+        registryClean &&= registry.acceptsTerminalDisposal(terminalDisposal);
       } catch { registryClean = false; }
     }
     try { await harness?.close(); } catch { registryClean = false; }
     try { await fileopHandle?.dispose(); } catch { registryClean = false; }
     // Closing transports can add poison too. Disposal alone never launders it.
     registryClean &&= !disposeRegistry || (registry.state() === "disposed" && (!registry.isPoisoned() || captureClean()));
+    registryClean &&= !disposeRegistry || (terminalDisposal !== undefined && registry.acceptsTerminalDisposal(terminalDisposal));
     registryClean &&= ordinaryObservationUnchanged?.() ?? true;
     if (disposeRegistry && registryClean) {
       // Preserve the public Codex refusal marker: absence would select legacy sinks.

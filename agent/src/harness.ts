@@ -601,6 +601,8 @@ export interface CodexExecutionSafety {
   // `finally`, after every sink has settled, to drop the roots/handlers. Idempotent
   // (disposeTools is), so a backstop dispose in the executor never double-disposes.
   dispose(request: BoundaryRequest): Promise<ToolDisposal>;
+  /** Exact successful terminal outcome, still backed by all cleanup evidence. */
+  acceptsTerminalDisposal(outcome: ToolDisposal): boolean;
 }
 
 // M3 addition required on the existing outer Executor contract in executor.ts:
