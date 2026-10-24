@@ -163,7 +163,25 @@ Recorded by the #1860 M0 run, 2026-10-24. Real-daemon results come from the harn
   - `k8s.io/kubernetes@v1.37.1`, matching the controller's `k8s.io/api v0.37.1`.
 
   The first Kubernetes zip fetch returned a 302 redirect with an empty body; following the redirect worked.
-- **Controlled daemon.** `e2e/pod-epoch/lib.sh` starts a privileged, digest-pinned DinD container per posture, on harness-owned volumes for the data root (the DinD PVC) and `/data/runner` (the shared workdir). Ownership is labelled and teardown removes by exact name only. A container restart stands in for a sidecar restart, and a remove-plus-recreate on the same volumes stands in for a successor pod. Wiring deviations from `controller/internal/kube/render_dind.go`: vfs storage in both postures; the rootless daemon is started as an explicit `dockerd --host=unix:///run/dind/docker.sock` (production keeps the image's `/certs` TLS listener on 2376; the harness binds the unix socket only and asserts no non-loopback TCP listener); a tmpfs `/run/dind`; the rootful daemon omits production's MTU cap and `--config-file` network defaults; and one container stands in for the worker container plus the sidecar. `e2e/pod-epoch/README.md` lists them all. Result at harness commit `feb39ab6`: `bash e2e/pod-epoch/smoke.sh all` **run, exit 0** (`SMOKE rootless PASS`, `SMOKE rootful PASS`, Engine 29.8.0, API 1.56). In both postures an `/events` stream held across a daemon restart ended by itself (`end=ended`, rc 0), and a later read-only `pe1860.owner` label check found no harness container or volume. The worker's own outer daemon is shared with other runs, so it was never a test subject.
+- **Controlled daemon.** `e2e/pod-epoch/lib.sh` models one worker pod per posture as three digest-pinned containers on the shared outer daemon:
+  - a pause container that owns the network namespace;
+  - a worker container that runs every Docker client command;
+  - a privileged DinD daemon container.
+
+  Harness-owned, labelled volumes stand in for the data root (the DinD PVC), `/data/runner` (the shared workdir) and, rootless only, the socket directory. Teardown removes by exact name only, after a label check, and the image `VOLUME` paths get tmpfs mounts, so nothing unlabelled is left on the outer daemon.
+
+  A `docker restart` of the daemon container stands in for a sidecar restart. Recreating the pod on the same volumes stands in for a successor pod.
+
+  Wiring deviations from `controller/internal/kube/render_dind.go` (all listed in `e2e/pod-epoch/README.md`):
+  - vfs storage in both postures;
+  - rootless runs an explicit `dockerd --host=unix:///run/dind-sock/docker.sock`. Production keeps the image's `/certs` TLS listener on 2376; the harness binds the unix socket only and asserts that no TCP port listens beyond loopback;
+  - rootless `XDG_RUNTIME_DIR` is a per-start tmpfs, where production uses a pod-lifetime `emptyDir`;
+  - rootful drops production's MTU cap and its `--config-file` network defaults;
+  - *inferred, not read:* `docker restart` keeps the container's writable layer, while a kubelet container restart creates a new container from the image.
+
+  The first smoke result (harness `feb39ab6`) ran the events client inside the daemon container, so it could not tell the daemon closing the stream from the client dying. It is superseded by the official run below.
+
+  The worker's own outer daemon is shared with other runs and was never a test subject.
 
 ### Q1. Termination evidence (source only)
 
@@ -353,3 +371,97 @@ Worker-pin rollouts follow release cuts that change the agent runtime: 29 non-RC
 **#3329 trigger.** Today it reads: *"Only while the worker is idle, inside the existing `retained_ops` claim-gate close, drain and `isIdle()` sequence. It is triggered from the periodic D7 pass in `disk-reclaim.ts`, and when disk admission refuses a claim on an idle worker."* The proposed replacement:
 
 > Reclaim runs only once per worker pod, at worker startup before any Docker client and before claim admission first opens, with controller-recorded predecessor-termination evidence bound to the predecessor pod UID, the successor `UZI_POD_UID` and the data and DinD-data PVC identities. It never runs from the periodic pass or from an admission refusal; those may at most request a fenced pod recycle (a new operation) that produces the next epoch.
+
+### Real-daemon results (Q2, Q3, Q4 probes, Q5)
+
+**Official run.** Run at harness commit `0658dee5`, clean tree, Engine 29.8.0, both postures, sequential on 2026-10-24.
+
+- **Result:** `smoke.sh`, `exp-restore.sh`, `exp-stopped.sh`, `exp-volumes-build.sh` and `exp-readonly.sh` each ran on `all` and exited 0.
+- **Verdicts:** every experiment prints `EXP … rootless PASS` and `EXP … rootful PASS`, and no `check.*` line is `FAIL`.
+- **Raw lines:** the `RESULT`/`EXP` lines are committed in `e2e/pod-epoch/results/m0-0658dee5.txt` (verbatim apart from stripped trailing whitespace).
+- **Cleanup:** no `pe1860.owner` container or volume remained, and the outer daemon's dangling-volume count was unchanged.
+- **Reviewer and auditor:** a reviewer and an auditor reviewed the scripts at that commit. No blocking or Medium findings remained; remaining notes are listed under "Limits of the experiments".
+- **Earlier run:** the run at `7d343ce6` passed too. Review then found three checks that could pass vacuously, which `0658dee5` fixed, so only the `0658dee5` run is cited.
+
+**Restore (Q2).** Seven fixtures on a persisted root, through a daemon restart and through a successor-pod replace.
+
+At the first API response:
+- **Already running:** `c-always`, `c-always-stopped` (stopped by hand, restarted anyway), `c-unless` and `c-onfail` (`running_at_first_response=4`).
+- **Not started:** `c-unless-stopped`, `c-no` and `c-no-stopped`. The `check.*.c-no*.not-started` checks pass.
+
+An events stream opened with `--since` set to the first-response time recorded **0 events** in a 20 s window (`window.events_after_first_response=0`), in both postures and both modes.
+- That window is supplementary. Its instrument was checked against a control of the same form: the same `--since` form, the timeout-kill status and empty stderr.
+- It agrees with the source finding that restore-time starts finish before the API serves.
+
+**Barrier predicate (Q2).** The case: only stopped `no`-policy containers, then a restart. At the first response:
+- no container is running, restarting or paused;
+- `swarm=inactive`, `live_restore=false`, `plugins=0`;
+- every policy is `no`.
+
+All 7 `check.barrier.*` checks pass. Positive controls showed the same instruments seeing running containers, non-`no` policies, `swarm=active` (bound to loopback), an installed plugin and `live_restore=true`.
+
+**Restart detection (Q2).** An `/events` stream was held from a separate client container on an idle daemon.
+
+| Trigger | Stream ended | Supplementary time to EOF (rootless / rootful) |
+|---|---|---|
+| Container restart | yes | 123 ms / 78 ms |
+| SIGKILL of dockerd | yes; the kill was asserted delivered (rootless in-container kill, rootful outer `docker kill`) | 215 ms / 102 ms |
+| SIGTERM of dockerd | yes | 201 ms / 99 ms |
+
+- **Negative control:** an untouched stream stayed open for 5 s.
+- **`GET /info` ID:** identical before and after every restart.
+- **Rootless socket inode:** a new socket inode was created on every start. This was measured against a hard link holding the old inode, because a plain inode comparison can reuse the number.
+- **Different kill9 subjects per posture:** the kill9 row measures different things. Rootful kills the whole daemon container from outside; rootless kills only dockerd inside the container. Each case's `delivery` line records which.
+- **Rootful kill9 recovery failure (recorded as a finding):** after a rootful kill9, the *same-container* restart **failed**:
+  - The error was `failed to save containerd pid to disk: process with PID 36 is still running`.
+  - A stale `/var/run/docker/containerd/containerd.pid`, `exists=yes content=36`, survived in the container's writable layer.
+  - The daemon then never served, which fails closed.
+  - With a `--time 10` stop on the `restart` case, a development run hung in the same "containerd is still running" state. The fixtures ignore SIGTERM, so the shortened grace preempted dockerd's own shutdown. The official script uses `--time 30`, Kubernetes' default grace.
+  - Whether production hits this depends on where the pid file lives:
+    - Rootful: production keeps it in a writable layer that a kubelet container restart replaces (inferred).
+    - Rootless: production keeps it in the pod-lifetime `dind-sock` `emptyDir`, which the harness's tmpfs does not reproduce, so the risk is **not exercised** there.
+  - Either way, the outcome is a daemon that does not serve, never a silent restart.
+
+**Stopped state (Q3).** A running `-v /data/runner/tree-B:/w` container was the positive control. The scanner saw:
+- the bind in the task's mount namespace (`mnt_strict=1`);
+- a cwd/fd in the tree (`fd=1`);
+- a deleted-inode fd.
+
+After `docker stop`, and again after a daemon restart, every scan found `refs=0` (mount, cwd, fd and memory-mapping references). Each of those scans proved it read dockerd's own mount namespace: `scan_complete=yes … dockerd_ns_read=yes`.
+
+After the tree was deleted (`after_rm exists=no`):
+
+| Request on the stopped container | Rootless | Rootful |
+|---|---|---|
+| `docker cp` into a `-v` container | **recreates** the tree: new inode, owner `1000:1000`, file copied | **recreates**: owner `0:0` |
+| `docker start` of an idle `-v` container | **recreates**: empty, new inode | **recreates**: empty, new inode |
+| `docker start` of a `--mount type=bind` container | fails: `bind source path does not exist` | same |
+| `docker cp` into that container | fails: `no such directory` | same |
+| `docker start` of a `--volumes-from` copy of it | **recreates** the tree | same |
+
+So nothing stopped can write to the deleted inode. A later *client request*, though, can recreate an empty directory at the deleted path. That makes Q4's client exclusion load-bearing, and the reclaim should remove stopped containers whose binds point into the tree.
+
+**Volumes and build cache (Q3).**
+- `v-plain` reports `local` with `null` options.
+- `v-bind` (`-o type=none -o o=bind -o device=/data/runner/tree-V`) reports its options. While in use it is bind-mounted in dockerd's own mount namespace (`strict_in_dockerd_ns=1`). It holds no reference after stop and after a restart.
+- So the predicate "local driver, empty `Options`" does separate the two.
+- A build with context `/data/runner/tree-K` and a cache mount left no mount, fd or mapping reference after the build, after the tree was deleted, or after a restart.
+  - Its 8 build-cache records survived the tree's deletion.
+  - During the build, the only holder seen was the buildx *client* (supplementary sampling).
+  - The mapping category is controlled by a process running a binary from inside a tree (`map=5`).
+
+**Read-only probes (Q4, Q6).** These were issued between two event markers:
+- `_ping`, `info` and `version`;
+- `ps -a`, plus `inspect` on every container;
+- `volume ls` / `inspect`, `plugin ls`, and a bounded `events` read.
+
+Result: **0 events** and a byte-identical inventory of containers, volumes, images and networks. A positive control (`volume create` plus `start`) produced events and changed the inventory. The predicate's inventory queries are therefore read-only on Engine 29.8.0.
+
+**Postures (Q5).** Every Q2, Q3 and Q4 experiment above ran and passed on both postures. The rootless pid-file and `emptyDir` restart case is **not exercised** (see above). Neither posture is UNRUN.
+
+**Limits of the experiments** (non-blocking review notes):
+- `exp-volumes-build.sh`'s zero-reference scans record scanned pid counts but do not assert namespace completeness per scan. `exp-stopped.sh`'s check is by namespace count, not by namespace set.
+- The listener check reads TCP only, not UDP.
+- The anonymous-volume check skips the one-shot chown helper, and its tmpfs path list is hard-coded from the pinned images.
+- The rootful socket check reports PASS where there is no socket to measure (not applicable).
+- These do not change any conclusion above; they bound the evidence.
