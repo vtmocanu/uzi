@@ -1,6 +1,6 @@
 # PRD #1860: Pod-epoch writer exclusion for settled attempt trees (M0 investigation)
 
-**Status**: M0 in progress, 2026-10-24 (preflight recorded). Item 1 of #1860, re-scoped (see Decision Log). Investigation-only: the single milestone M0 produces evidence and a go/no-go recommendation. Implementation is a later PRD, written only after the owner reviews M0.
+**Status**: M0 complete, 2026-10-24: evidence recorded under `## M0 evidence`, recommendation **go (conditional)**. Both postures ran their real-daemon experiments; Q1 is source-only as allowed. Awaiting owner review before an implementation PRD. Item 1 of #1860, re-scoped (see Decision Log). Investigation-only: the single milestone M0 produces evidence and a go/no-go recommendation. Implementation is a later PRD, written only after the owner reviews M0.
 
 ## Problem
 
@@ -147,6 +147,7 @@ Destructive or race experiments run only on disposable trees and a controlled da
 | 2026-10-24 | The rename fence plus inventory verdict is rejected. | A symlink-alias bind keeps writing after the rename and is reported under the alias. After the rename, process proofs lose in-tree processes (their cwd reads `/`). A deferred fence makes the tree look missing to every reader, and operator discard can then orphan it. Stopped leftovers would make it defer almost always. | Rename fence with path or inventory checks. |
 | 2026-10-24 | Pod-epoch reclaim, with a positive controller-supplied predecessor-termination guard and no fallback without evidence. | In-flight creates on the old daemon die with the old pod by construction. Graceful pod deletion and same-node RWO sharing defeat "new pod implies old pod gone", so evidence is required. | A documentation-only residual for force-delete. |
 | 2026-10-24 | Investigation-only PRD; implementation is a later PRD after owner review. | The guarantees depend on Kubernetes and daemon ordering, which must be source-backed before any deletion path exists. | Implementing with the experiments inline. |
+| 2026-10-24 | M0 recommendation: go, conditional on controller termination observation and persisted evidence, evidence delivery before `worker.run()`, and reclaim removing stopped containers bound into the tree. | Kubernetes 1.37.1 exposes a positive all-terminated signal; dockerd 29.8.0 starts nothing on restore under the barrier predicate; stopped state holds no reference (real-daemon, both postures). A held `/events` stream is evidence only, not the barrier. | No-go now on the grounds that today's controller captures no termination evidence. |
 
 ## M0 evidence
 
@@ -275,7 +276,7 @@ So a connection is accepted into the backlog early, but the **first HTTP respons
 
 The restart-policy rule costs nothing on the lead's sample: 0 of 11 workers had a non-`no` policy. Without the rule, a restore-started container is running at the barrier and the first check alone defers it.
 
-**Restart detection.** A sidecar restart re-runs `restore`, since `NewDaemon` runs it on every start. `GET /info` `ID` is persisted (`daemon/id.go`), and `SystemTime` is just the clock, so neither identifies an incarnation. Events live in an in-memory buffer (`daemon/events/events.go`), and `Shutdown` closes the event service. A stream opened before the inventory and held through deletion therefore ends on any daemon exit; a hard kill closes the socket. This is necessary but not sufficient (see the revision note below).
+**Restart detection.** A sidecar restart re-runs `restore`, since `NewDaemon` runs it on every start. `GET /info` `ID` is persisted (`daemon/id.go`), and `SystemTime` is just the clock, so neither identifies an incarnation. Events live in an in-memory buffer (`daemon/events/events.go`), and `Shutdown` closes the event service. A stream opened before the inventory and held through deletion therefore ends on any daemon exit; a hard kill closes the socket. This is supporting evidence only (see "Restart detection is evidence, not a barrier" below).
 - Rootless only, *inferred, not read*: the socket inode should change on each start.
 - Controller-side only: the `dind` `containerID` and `restartCount` change.
 
@@ -465,3 +466,88 @@ Result: **0 events** and a byte-identical inventory of containers, volumes, imag
 - The anonymous-volume check skips the one-shot chown helper, and its tmpfs path list is hard-coded from the pinned images.
 - The rootful socket check reports PASS where there is no socket to measure (not applicable).
 - These do not change any conclusion above; they bound the evidence.
+
+### Restart detection is evidence, not a barrier
+
+A held `/events` stream ending on every daemon restart is an **experiment observation**. By itself it is not a barrier that prevents writes during deletion. An EOF reports a restart after the fact, and a restore-time start fires before the new incarnation serves.
+
+Exclusion during deletion rests on three things established separately:
+
+1. **The no-client interval (Q4).** No worker-owned state-changing request can be issued until reclaim ends.
+2. **The barrier predicate (Q2).** Every container has restart policy `no`, swarm is inactive, there are no enabled plugins and live-restore is off. Under this predicate a restore, including an *unseen* restart, starts nothing.
+3. **Stopped state holds no reference (Q3).** Nothing stopped holds a mount, file descriptor or mapping into the tree.
+
+An implementation may keep the stream as an extra abort-and-defer trigger, but it must not cite the stream as the exclusion.
+
+### Q6. Eligibility estimate
+
+- **The sample.** The lead's sample (11 workers, read-only, 2026-10-24) has 10 of 11 passing the candidate predicate at that instant. The one failure was a busy worker. Adding "restart policy `no` for every container" keeps 10 of 11.
+- **At a pod epoch.** *Inferred from Q1 and Q2:* at a pod epoch every predecessor container is dead, and restore starts only non-`no` containers. None of the 11 sampled workers had one. So the running-container clause should pass on effectively every evidenced epoch, including the sampled busy worker.
+- **Stopped containers.** These are present on 7 of 11 workers, up to 27 per worker. They do not block eligibility. Instead, the reclaim removes those whose bind sources lie in a reclaimed tree (Q3), and otherwise leaves them.
+- **Volumes.** No sampled volume had a non-local driver or non-empty `Options`.
+- **What limits eligibility.** The predicate rarely does. Epoch evidence does (Q1, Q7).
+
+### Recommendation: **go**, conditional
+
+M0 answers Q1–Q7. Q1 is source-only, as the PRD allows. Q2–Q5 have real-daemon results on Engine 29.8.0 in **both** postures, and neither posture is UNRUN.
+
+The guarantees hold as follows:
+
+- **Predecessor writers.** These are excluded when there is controller evidence that one pod UID reached terminal phase with every container and init-container status `terminated` (Q1).
+  - That signal exists in Kubernetes 1.37.1.
+  - The current controller never captures it. It polls every 10 s with `list` only and checks absence.
+  - **Condition 1:** the controller must gain a termination observation, a watch or a fine-grained poll during termination, and persist the evidence before any successor can consume it.
+- **Successor writers.** These are excluded by placing the reclaim before `worker.run()` (Q4), with only the listed read-only probes and the reclaim's own removal of stopped containers bound into the tree.
+  - **Condition 2:** the evidence must reach the worker without the worker registering first, or the reclaim moves just before `registerWithRetry`.
+- **Persisted daemon state.** This is safe under the barrier predicate (Q2, Q3).
+  - **Condition 3:** reclaim must also delete those stopped containers whose binds point into the tree. Otherwise a later `docker start` or `docker cp` recreates an empty directory at the path.
+- **Cadence.** Epochs come from rollouts. The evidence above is needed to make those rollouts count. On-demand epochs need a new server-fenced "recycle pod, keep PVCs" operation (Q7). That is optional for a first slice but likely needed for workers that fill between releases.
+
+**Residuals** carried into the implementation PRD:
+- **No evidence, no reclaim.** Force delete, node loss, podgc and out-of-band pods are ineligible.
+- **Ordinary deletes waste an epoch.** A graceful delete, eviction or preemption consumes the one-shot without evidence.
+- **Rootless stale pid files are untested.** In the pod-lifetime `emptyDir`, a stale pid file could stop the daemon from starting after a sidecar restart. That fails closed, and it is not exercised by the harness.
+- **CRI kill semantics were not read.**
+- **The PRD's accepted residuals remain:** deliberate escapes such as the containerd socket, privileged containers with shared propagation, `--pid=host`, and rootful device reach.
+
+The go is conditional on conditions 1–3 being in the implementation PRD's scope. If the owner judges condition 1 (new controller watch or RBAC) unacceptable, the answer becomes no-go, with the gap named as "no positive termination evidence", and the item-2 mediation design is the fallback.
+
+### Implementation PRD outline (on go)
+
+1. **Controller evidence field.**
+   - Observe worker pods with a watch, or with a sub-second poll while a pod is terminating. This is new RBAC: `watch` on pods.
+   - Accept only the Q1 signal: terminal phase, matching container counts, and every entry `state.terminated`.
+   - Record a bounded evidence document containing:
+     - the predecessor pod UID;
+     - per-container `containerID` and `restartCount`;
+     - data and DinD-data PVC `metadata.uid` plus `spec.volumeName`;
+     - the observation time and controller generation.
+   - Persist it on the data PVC with the UID- and resourceVersion-guarded patch pattern of `mirrorRoll`. Then bind it to the successor UID once the successor is listed (same worker label and claims, current ReplicaSet).
+   - Deliver it to the worker through a downward-API projection or a pre-registration API read. The PRD chooses one.
+   - Defer on everything listed under Q1 "Binding".
+2. **Worker one-shot.**
+   - A marker keyed by `UZI_POD_UID` on the data PVC, outside `/data/runner` and not in `dind-sock`, written and fsynced before the first reclaim action.
+   - It is never reopened by a process restart, an interrupted reclaim or any uncertainty.
+   - The reclaim sits in `main.ts` after `startupReapVerdict` and before `worker.run()`.
+3. **Eligibility predicate.** Reclaim proceeds only when every one of these holds; anything else defers:
+   - evidence matches `UZI_POD_UID` and the current PVC identities;
+   - the daemon served its first API response;
+   - no container is running, restarting or paused;
+   - every container's restart policy is `no`;
+   - swarm is inactive, no plugins are enabled and live-restore is off;
+   - every volume uses the `local` driver with empty `Options`;
+   - an `/events` stream is held from before the inventory, as an extra abort-and-defer trigger only;
+   - each tree is settled under #3329's authorization.
+
+   For each eligible tree, remove the stopped containers whose bind sources lie under it, then delete in place with the existing retire and delete helpers.
+4. **ADR amendments.**
+   - ADR-1783: pod-epoch exclusion as a writer-exclusion proof for settled attempt trees on Docker-wired hosted workers. Compose and unwired lanes stay deferred.
+   - ADR-3153: an epoch-scoped exception to "automatic retention deletion stays off".
+   - Update `specs/human.md:1306`, which says "#1860 separate daemon mediation", and `:1452`.
+5. **#3329 trigger amendment.** Replace the idle periodic and admission-refusal triggers with the text proposed under Q7. Optionally add the fenced pod-recycle request.
+6. **Test seams.**
+   - Controller unit tests over pod-status fixtures: graceful, Recreate, eviction, force delete, podgc, a sidecar `waiting`, and a relist.
+   - Worker tests for the one-shot, ordering before `worker.run()`, and every deferral.
+   - A fake-daemon unit layer for predicate parsing.
+   - The real-daemon harness `e2e/pod-epoch/` extended with a reclaim run: stopped-container removal plus deletion under a held stream.
+   - #1858's pending-create control (`agent/test/clone-attempt-paths.test.ts`) as the RED/GREEN control.
