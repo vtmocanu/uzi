@@ -457,6 +457,13 @@ class CheckerTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "adjacent hard bracket"):
             self.verify()
 
+    def test_cache_heavy_post_cleanup_samples_count_as_low_dwell(self):
+        # Samples 7-9 follow cleanup: raw 200 MiB is above the quiet level, but 100 MiB of it is
+        # inactive file cache, so the working set stays 100 MiB and the dwell is still low.
+        for index in (6, 7, 8):
+            self.make_cache_heavy(self.reports[0]["rawSamples"][index], 200, 100)
+        self.verify()
+
     def test_working_set_baseline_derives_h_and_raw_baseline_stays_the_budget(self):
         for field, value in (("workingSetBaselineBytes", 99 * 1024 ** 2), ("baselineBytes", 99 * 1024 ** 2)):
             with self.subTest(field=field):
@@ -476,6 +483,11 @@ class CheckerTest(unittest.TestCase):
     def test_missing_inactive_file_is_refused(self):
         record = self.reports[0]["rawSamples"][0]
         del record["sample"]["stat"]["inactive_file"]
+        with self.assertRaisesRegex(ValueError, "raw stat mismatch"):
+            self.verify()
+
+    def test_inactive_file_must_match_raw_memory_stat(self):
+        self.reports[0]["rawSamples"][0]["sample"]["stat"]["inactive_file"] += 4096
         with self.assertRaisesRegex(ValueError, "raw stat mismatch"):
             self.verify()
 
@@ -499,22 +511,29 @@ class CheckerTest(unittest.TestCase):
     def test_unreadable_psi_needs_a_valid_recorded_errno(self):
         record = lambda r: r["rawSamples"][0]
         cases = (
-            ("no errno", lambda r: (record(r)["raw"].update({self.PSI: None}),
-                                    record(r)["sample"].update(pressure={"unavailable": "absent"}))),
-            ("other errno", lambda r: (record(r)["raw"].update({self.PSI: None}),
-                                       record(r).update(rawErrors={self.PSI: "EACCES"}))),
-            ("errno on a readable file", lambda r: record(r).update(rawErrors={self.PSI: "ENOENT"})),
-            ("foreign path", lambda r: record(r).update(rawErrors={"/sys/fs/cgroup/memory.current": "ENOENT"})),
-            ("missing field", lambda r: record(r).pop("rawErrors")),
-            ("null elsewhere", lambda r: (record(r)["raw"].update({"/sys/fs/cgroup/memory.stat": None}),
-                                          record(r).update(rawErrors={self.PSI: "ENOENT"}))),
+            ("no errno", "raw bytes unavailable/oversized",
+             lambda r: (record(r)["raw"].update({self.PSI: None}),
+                        record(r)["sample"].update(pressure={"unavailable": "absent"}))),
+            ("other errno", "raw errors",
+             lambda r: (record(r)["raw"].update({self.PSI: None}),
+                        record(r).update(rawErrors={self.PSI: "EACCES"}))),
+            ("errno on a readable file", None, lambda r: record(r).update(rawErrors={self.PSI: "ENOENT"})),
+            ("foreign path", None,
+             lambda r: record(r).update(rawErrors={"/sys/fs/cgroup/memory.current": "ENOENT"})),
+            ("missing field", None, lambda r: record(r).pop("rawErrors")),
+            ("null elsewhere", None, lambda r: (record(r)["raw"].update({"/sys/fs/cgroup/memory.stat": None}),
+                                                record(r).update(rawErrors={self.PSI: "ENOENT"}))),
         )
-        for name, mutate in cases:
+        for name, message, mutate in cases:
             with self.subTest(name=name):
                 self.setUp()
                 mutate(self.reports[0])
-                with self.assertRaises((ValueError, KeyError, TypeError)):
-                    self.verify()
+                if message:
+                    with self.assertRaisesRegex(ValueError, message):
+                        self.verify()
+                else:
+                    with self.assertRaises((ValueError, KeyError, TypeError)):
+                        self.verify()
 
     def test_absent_psi_still_requires_the_pin_and_the_hard_crossing(self):
         for report in self.reports:

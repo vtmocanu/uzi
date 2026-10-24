@@ -376,6 +376,15 @@ test("plan keeps the raw safety baseline and derives the hard-threshold baseline
   assert.equal(plan.workingSetBaselineBytes, 70 * MiB);
 });
 
+test("baseline jitter is the working-set spread, not the raw memory.current spread", () => {
+  // Working sets 60 / 110 / 105 (spread 50); raw currents 100 / 110 / 105 (spread 10).
+  const input = reportInput();
+  input.baseline = [cached(1, 100, 40), sample(2, 110), sample(3, 105)];
+  const report = calibrationReport(input);
+  assert.equal(report.jitterBytes, 50);
+  assert.deepEqual(report.baselineJitter, { minSampleId: 1, minBytes: 60, maxSampleId: 2, maxBytes: 110 });
+});
+
 test("a cache-heavy sample whose raw current reaches H but whose working set does not is not a hard crossing", () => {
   // Sample 5 is at H raw, yet 200 of its bytes are inactive file cache.
   // The bracket reportInput() states (crossing at sample 5) is refused.

@@ -375,7 +375,9 @@ A host kernel without PSI (no `memory.pressure`) makes the production reader rep
 when every available sample carried real PSI rows, so a report never claims PSI it did
 not read. The guarded leg's hard crossing, baseline and growth use the working set
 (`crossingWorkingSetBytes`, `baselineWorkingSetBytes`); `baselineBytes` and the raw
-`currentBytes` series column stay raw.
+`currentBytes` series column stay raw. Likewise `peakSeriesBytes` stays the raw
+`memory.current` peak, while `peakGrowthBytesPerSecond` is computed from the working-set
+column (the fourth series entry).
 
 [Issue #2397: partial investigation](issue-2397-investigation.md) records the
 available evidence and remaining diagnosis work.

@@ -133,9 +133,11 @@ elif args[0] == "start":
             print("UZI_NODE_DIAGNOSTIC_BEGIN")
             print(json.dumps({"schemaVersion": 1, "workload": workload, "leg": "guarded", "nodeVersion": "v24.0.0",
                               "psiAvailable": False, "baselineBytes": 100,
-                              "growth": {"series": [[1, 3.0, 100], [2, 250.0, 700]], "sampleCount": 2, "peakSeriesBytes": 700},
-                              "timeline": {"crossingSampleCompletedMs": 250.0}, "budget": {"crossingToReserveRequestMs": 5.0,
-                              "cancelToConfirmedDrainMs": 55.0, "crossingToConfirmedDrainMs": 110.0},
+                              "baselineWorkingSetBytes": 100,
+                              "growth": {"series": [[1, 3.0, 100, 100], [2, 250.0, 700, 700]], "sampleCount": 2,
+                                         "peakSeriesBytes": 700},
+                              "timeline": {"crossingSampleCompletedMs": 250.0, "crossingWorkingSetBytes": 700},
+                              "budget": {"crossingToReserveRequestMs": 5.0, "cancelToConfirmedDrainMs": 55.0, "crossingToConfirmedDrainMs": 110.0},
                               "tool": tool, "cleanup": cleanup}))
             print("UZI_NODE_DIAGNOSTIC_END")
             sys.exit(0 if mode != "diag-nonzero" else 3)
