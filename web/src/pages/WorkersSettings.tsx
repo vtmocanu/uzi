@@ -18,6 +18,7 @@ import { WorkerRunBadge } from "../components/WorkerRunBadge";
 import { WorkerPendingOutcomeBadge } from "../components/WorkerPendingOutcomeBadge";
 import { WorkerCordonBadge } from "../components/WorkerCordonBadge";
 import { WorkerCordonMetadata } from "../components/WorkerCordonMetadata";
+import { WorkerCordonControls } from "../components/WorkerCordonControls";
 import { WorkerMemoryAuthorityBadge } from "../components/WorkerMemoryAuthorityBadge";
 import { WorkerQuarantineBadge } from "../components/WorkerQuarantineBadge";
 import { WorkerLeaseBadge } from "../components/WorkerLeaseBadge";
@@ -78,6 +79,49 @@ const isPersistentHosted = (w: Worker) => w.kind === "hosted" && w.ephemeral !==
 
 export function WorkersSettings() {
   const [workers, setWorkers] = useState<Worker[]>([]);
+  // All list writers share success ordering; failed newer polls do not discard a
+  // valid initial response. A mutation ACK invalidates even lists begun while pending.
+  const ordering = useRef({ epoch: 0, next: 0, success: 0 });
+  const mounted = useRef(true);
+  const deleted = useRef(new Set<string>());
+  const locks = useRef(new Set<string>());
+  const [rowBusy, setRowBusy] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    mounted.current = true;
+    const order = ordering.current;
+    return () => { mounted.current = false; order.epoch++; };
+  }, []);
+  const acquire = useCallback((id: string) => {
+    if (!mounted.current || locks.current.has(id)) return false;
+    locks.current.add(id);
+    setRowBusy(new Set(locks.current));
+    return true;
+  }, []);
+  const release = useCallback((id: string) => {
+    locks.current.delete(id);
+    if (mounted.current) setRowBusy(new Set(locks.current));
+  }, []);
+  const acceptList = useCallback((list: Worker[], epoch: number, request: number) => {
+    const order = ordering.current;
+    if (!mounted.current || epoch !== order.epoch || request < order.success) return;
+    order.success = request;
+    setWorkers(list.filter((w) => !deleted.current.has(w.id)));
+  }, []);
+  const acceptWorker = useCallback((worker: Worker) => {
+    if (!mounted.current) return;
+    ordering.current.epoch++;
+    setWorkers((prev) => prev.map((w) => w.id !== worker.id ? w
+      : worker.custody_decisions_needed === undefined
+        ? { ...worker, custody_decisions_needed: w.custody_decisions_needed }
+        : worker));
+  }, []);
+  const changeCordon = useCallback(async (id: string, cordon: boolean, reason?: string) => {
+    if (!acquire(id)) throw new Error("Another worker action is pending.");
+    try {
+      const { worker } = await (cordon ? api.cordonWorker(id, reason) : api.uncordonWorker(id));
+      acceptWorker(worker);
+    } finally { release(id); }
+  }, [acquire, release, acceptWorker]);
   // The control plane's own release, from the same memoised GET /api/version the footer
   // uses — one coordinate, so the panel and the footer cannot disagree.
   const cpVersion = useAppVersion();
@@ -86,11 +130,13 @@ export function WorkersSettings() {
   // useAsyncData (PRD #950 M3, Tier C): `workers` is ALSO written by the separate
   // 10s poll and by the mutation handlers, so it stays local state and the fetcher
   // seeds it as a side effect; `tokens` is written only by this load, so it rides
-  // the hook's data bundle. The separate error-swallowing poll below is unchanged.
+  // the hook's data bundle. Both list paths use the ordering guard above.
   const { data, loading, error: loadError, reload } = useAsyncData(
-    async () => {
+    async (ctx) => {
+      const epoch = ordering.current.epoch;
+      const request = ++ordering.current.next;
       const [{ workers }, { secrets }] = await Promise.all([api.listWorkers(), api.listSecrets()]);
-      setWorkers(workers);
+      if (ctx.isCurrent()) acceptList(workers, epoch, request);
       return secrets.filter((s) => s.kind === "anthropic_token");
     },
     [],
@@ -254,6 +300,7 @@ export function WorkersSettings() {
   // to restart something will otherwise go looking for the control to do it.
   const rebind = useCallback(
     async (workerId: string, choice: string) => {
+      if (!acquire(workerId)) return;
       setError("");
       setTokenBusy(workerId);
       const mode: BindMode = choice === AUTO_OPTION ? "auto" : choice === "" ? "default" : "pinned";
@@ -263,14 +310,8 @@ export function WorkersSettings() {
           mode,
           mode === "pinned" ? choice : null,
         );
-        setWorkers((prev) => prev.map((w) => {
-          if (w.id !== worker.id) return w;
-          // Rebind may omit the list's custody sample. Preserve the latest row's
-          // count in that case; an explicit zero from the response is authoritative.
-          return worker.custody_decisions_needed === undefined
-            ? { ...worker, custody_decisions_needed: w.custody_decisions_needed }
-            : worker;
-        }));
+        if (!mounted.current) return;
+        acceptWorker(worker);
         announce(
           // F18's other half. A correct row summary beside a cheerful "now
           // auto-selects from your token pool" would leave the misleading half in the
@@ -289,9 +330,10 @@ export function WorkersSettings() {
           mode === "auto" && pooledCount === 0 ? "warning" : "success",
         );
       } catch (err) {
-        setError(errorMessage(err, "Failed to change the worker's token"));
+        if (mounted.current) setError(errorMessage(err, "Failed to change the worker's token"));
       } finally {
-        setTokenBusy("");
+        release(workerId);
+        if (mounted.current) setTokenBusy("");
       }
     },
     // `announce` is listed but stable (a setState wrapper, useCallback([]) above), so
@@ -319,7 +361,7 @@ export function WorkersSettings() {
     // added churn, so the M3 concern (a dep re-creating this callback on churn the
     // paragraph argues cannot happen) does not arise. Same treatment as Dashboard's
     // first-load effect; the exhaustive-deps disable directive is gone.
-    [pooledCount, announce],
+    [pooledCount, announce, acquire, release, acceptWorker],
   );
 
   // Liveness (PRD #49): re-fetch the fleet every 10s while the tab is visible — the
@@ -327,13 +369,15 @@ export function WorkersSettings() {
   // reload (heartbeat cadence 15s × this 10s poll). A poll error keeps the last-good
   // list (it must never blank the fleet or flash an error), unlike the first load.
   const poll = useCallback(async () => {
+    const epoch = ordering.current.epoch;
+    const request = ++ordering.current.next;
     try {
       const { workers } = await api.listWorkers();
-      setWorkers(workers);
+      acceptList(workers, epoch, request);
     } catch {
       // keep the last-good list
     }
-  }, []);
+  }, [acceptList]);
   usePollWhileVisible(poll, 10000);
 
   const create = async (e: FormEvent) => {
@@ -342,25 +386,31 @@ export function WorkersSettings() {
     setBusy(true);
     try {
       const { worker, token } = await api.createWorker(name.trim(), template);
+      if (!mounted.current) return;
       setNewToken({ worker: worker.name, token });
       setCopied(false);
       setName("");
       setTemplate(DEFAULT_WORKER_TEMPLATE);
       await reload();
     } catch (err) {
-      setError(errorMessage(err, "Failed to create worker"));
+      if (mounted.current) setError(errorMessage(err, "Failed to create worker"));
     } finally {
-      setBusy(false);
+      if (mounted.current) setBusy(false);
     }
   };
 
   const remove = async (id: string) => {
+    if (!acquire(id)) return;
     // Read the name before the row is gone — after load() it is unfindable.
     const name = workers.find((w) => w.id === id)?.name;
     setError("");
     setConfirmingDelete(null);
     try {
       await api.deleteWorker(id);
+      if (!mounted.current) return;
+      ordering.current.epoch++;
+      deleted.current.add(id);
+      setWorkers((prev) => prev.filter((w) => w.id !== id));
       // Both kinds announce. The one-click external delete stays one click — an
       // announcement is feedback AFTER the act, not friction before it, so it costs no
       // clicks and takes nothing back from the asymmetry the confirmation buys. A row
@@ -368,7 +418,9 @@ export function WorkersSettings() {
       announce(`Deleted ${stripUnsafeChars(name ?? "worker")}.`);
       await reload();
     } catch (err) {
-      setError(errorMessage(err, "Failed to delete worker"));
+      if (mounted.current) setError(errorMessage(err, "Failed to delete worker"));
+    } finally {
+      release(id);
     }
   };
 
@@ -446,7 +498,7 @@ export function WorkersSettings() {
     if (!newToken) return;
     try {
       await navigator.clipboard.writeText(newToken.token);
-      setCopied(true);
+      if (mounted.current) setCopied(true);
     } catch {
       // Clipboard may be unavailable (insecure context); the token stays visible
       // to copy manually.
@@ -849,7 +901,7 @@ export function WorkersSettings() {
                               ? AUTO_OPTION
                               : (w.anthropic_secret_label ?? "")
                           }
-                          disabled={tokenBusy === w.id}
+                          disabled={tokenBusy === w.id || rowBusy.has(w.id)}
                           onChange={(e) => void rebind(w.id, e.target.value)}
                         >
                           {/* web-ux F15: three of four options used to contain the
@@ -880,6 +932,7 @@ export function WorkersSettings() {
                       {confirmingDelete !== w.id && (
                         <Button
                           id={deleteButtonId(w.id)}
+                          disabled={rowBusy.has(w.id)}
                           variant="danger"
                           size="sm"
                           onClick={() => (w.kind === "hosted" ? setConfirmingDelete(w.id) : remove(w.id))}
@@ -890,6 +943,8 @@ export function WorkersSettings() {
                     </div>
                   </div>
                 </div>
+                <WorkerCordonControls worker={w} disabled={rowBusy.has(w.id) || confirmingDelete === w.id}
+                  onChange={(cordon, reason) => changeCordon(w.id, cordon, reason)} />
                 {/* Confirm-in-place, not a modal: same ruling as the provision form —
                     there is no modal primitive in web/ and a row action is not where to
                     invent one. It names what is destroyed rather than asking a
@@ -945,7 +1000,7 @@ export function WorkersSettings() {
                       re-downloads its tools from the internet.
                     </p>
                     <div className="flex items-center gap-1.5">
-                      <Button variant="danger" size="sm" onClick={() => remove(w.id)}>
+                      <Button variant="danger" size="sm" disabled={rowBusy.has(w.id)} onClick={() => remove(w.id)}>
                         Delete anyway
                       </Button>
                       <Button variant="ghost" size="sm" onClick={() => dismissConfirm(w.id)}>
@@ -1027,6 +1082,7 @@ export function WorkersSettings() {
             <HostedWorkers
               hostedCount={workers.filter(isPersistentHosted).length}
               onProvisioned={async (worker) => {
+                if (!mounted.current) return;
                 // Switch to Your workers AND announce in the SAME synchronous batch, both before
                 // any await (D "After a provision"). Both are plain state updates, so React
                 // batches them into ONE commit: by the time the [notice] focus effect runs, `tab`
