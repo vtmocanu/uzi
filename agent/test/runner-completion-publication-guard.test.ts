@@ -1,4 +1,5 @@
 import { beforeEach, describe, it } from "node:test";
+import { acceptsJoinedCaptureCleanup } from "../src/codex/safety.js";
 import type { SteeringChannel } from "../src/steering.js";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -626,18 +627,28 @@ describe("M3 publication-start completion guard", () => {
   }
 
   for (const codex of [false, true]) for (const abortWait of [false, true]) {
-    it(`prepush hold retry cancellation releases provisional clone and HOME retention (Codex=${codex}, abortWait=${abortWait})`, async () => {
+    it(`prepush hold retry cancellation releases provisional clone and HOME retention (Codex=${codex}, abortWait=${abortWait})`, async t => {
       const claim = claimFor();
       const runHome = path.join(homeDir, claim.run_id);
       fs.mkdirSync(runHome, { recursive: true });
       const sentinel = path.join(runHome, "SESSION_TRANSCRIPT");
       fs.writeFileSync(sentinel, "session bytes\n");
       const rig = codexRig();
+      let joined = false, fallbacks = 0;
+      const boundary = rig.safety.withBoundary.bind(rig.safety);
+      t.mock.method(rig.safety, "withBoundary", async (request: Parameters<typeof boundary>[0], action: Parameters<typeof boundary>[1]) => {
+        let actual: Parameters<typeof acceptsJoinedCaptureCleanup>[1] | undefined;
+        try { return await boundary(request, permit => { actual = permit; return action(permit); }); }
+        finally { if (actual) joined = acceptsJoinedCaptureCleanup(rig.safety, actual); }
+      });
       const probe = committing("Fixes #3090");
-      const executor = codex ? new FakeCodexExecutor(rig.safety, ctx => probe.executor.run(ctx)) : probe.executor;
+      const executor = codex ? new FakeCodexExecutor(rig.safety, ctx => probe.executor.run(ctx), undefined,
+        () => { fallbacks++; throw new Error("unexpected fallback"); }) : probe.executor;
       const forge = fakeGitlab();
       const run = runnerWith(() => ({ executor, homeDir: runHome }), forge.gitlab);
       let captures = 0, retries = 0;
+      let observedFlight: Parameters<typeof run["waitRecoveryRetry"]>[0] | undefined;
+      const push = t.mock.method(git, "pushBranch", async () => { throw new Error("unexpected push"); });
       run["captureHoldContext"] = async () => {
         captures++;
         return { verified: false, published: false, mode: "same_worker_only", head: null };
@@ -645,6 +656,9 @@ describe("M3 publication-start completion guard", () => {
       const wait = run["waitRecoveryRetry"].bind(run);
       run["waitRecoveryRetry"] = async flight => {
         retries++;
+        observedFlight = flight;
+        assert.equal(flight.sourceExitDenied, undefined, "no independent source denial before cancellation unwinds capture");
+        assert.equal(flight.stoppedSourceKept, false);
         const waiting = abortWait ? wait(flight, true, 10_000) : undefined;
         run["observeCancellation"](flight);
         assert.equal(flight.cancel.signal.aborted, true, "the hold's shared signal is aborted between capture attempts");
@@ -653,11 +667,269 @@ describe("M3 publication-start completion guard", () => {
       await run.execute(claim);
       assert.equal(captures, 1);
       assert.equal(retries, 1);
+      assert.equal(joined, codex, "actual safety issued a joined witness before artifact cleanup");
+      assert.equal(fallbacks, 0);
       assert.equal(api.completionHoldRequests.length, 0);
+      assert.ok(observedFlight, "the actual hold flight reached its retry");
+      assert.equal(observedFlight.sourceExitDenied, undefined);
+      assert.equal(observedFlight.stoppedSourceKept, false);
+      assert.equal(observedFlight.keepGuardedInventoryOpen, false);
+      assert.equal(observedFlight.preserveRecoveryClone, false);
+      assert.equal(observedFlight.preserveSession, false);
       assert.equal(fs.existsSync(worktreeDirFor(IID)), false, "cancel releases this hold's provisional clone retention");
       assert.equal(fs.existsSync(sentinel), false, "cancel releases this hold's provisional HOME retention");
+      assert.equal(push.mock.callCount(), 0);
+      assert.equal(api.completionPermitRequests.length, 0);
       assert.equal(terminal(claim.run_id).at(-1)!.body.failure_reason, "run cancelled");
       assert.equal(forge.calls.length, 0);
+    });
+  }
+
+  it("finalize cancellation waits for pending owned root and retains nonclean cleanup", async t => {
+    const claim = claimFor();
+    const runHome = path.join(homeDir, claim.run_id);
+    fs.mkdirSync(runHome, { recursive: true });
+    const sentinel = path.join(runHome, "SESSION_TRANSCRIPT");
+    fs.writeFileSync(sentinel, "session bytes\n");
+    let releaseCleanup!: () => void, cleanupEntered!: () => void, cancelled!: () => void, actionUnwound!: () => void;
+    const actionUnwinding = new Promise<void>(resolve => { actionUnwound = resolve; });
+    const cleanupGate = new Promise<void>(resolve => { releaseCleanup = resolve; });
+    const cleanupStarted = new Promise<void>(resolve => { cleanupEntered = resolve; });
+    const cancellationObserved = new Promise<void>(resolve => { cancelled = resolve; });
+    let injected = false, primaryExited = false, rootSettled = false;
+    let boundarySettled = false, executeSettled = false, joined = false;
+    let captures = 0, retries = 0, fallbacks = 0, retentions = 0;
+    let actual: Parameters<typeof acceptsJoinedCaptureCleanup>[1] | undefined;
+    let childCompletion: Promise<unknown> | undefined;
+    let operation: Promise<void> | undefined;
+    const rig = codexRig({
+      boundaryProcess: request => {
+        if (request.argv[0] !== "/pending-root-fixture/git") return undefined;
+        assert.equal(injected, false, "one fake registered root only");
+        injected = true;
+        return {
+          stdin: null, stdout: null, stderr: null,
+          waitChild: async () => { primaryExited = true; return { code: 0 }; },
+          root: {
+            kind: "boundary_action",
+            reap: async () => {
+              assert.equal(primaryExited, true);
+              cleanupEntered();
+              await cleanupGate;
+              rootSettled = true;
+              return { ok: false, error: { category: "tool", message: "test-owned root cleanup incomplete" } };
+            },
+            dispose: async () => {},
+          },
+        };
+      },
+    });
+    // This is a fake RegisteredRoot contract test, not OS process-tree proof.
+    const boundary = rig.safety.withBoundary.bind(rig.safety);
+    t.mock.method(rig.safety, "withBoundary", async (request: Parameters<typeof boundary>[0], action: Parameters<typeof boundary>[1]) => {
+      if (request.boundary !== "finalize") return boundary(request, action);
+      try {
+        return await boundary(request, async permit => {
+          actual = permit;
+          try { return await action(permit); }
+          finally { actionUnwound(); }
+        });
+      } finally {
+        boundarySettled = true;
+        if (actual) joined = acceptsJoinedCaptureCleanup(rig.safety, actual);
+      }
+    });
+    const probe = committing("Fixes #3090");
+    const executor = new FakeCodexExecutor(rig.safety, ctx => probe.executor.run(ctx), undefined,
+      () => { fallbacks++; throw new Error("unexpected fallback"); });
+    const forge = fakeGitlab();
+    const run = runnerWith(() => ({ executor, homeDir: runHome }), forge.gitlab);
+    let observedFlight: Parameters<typeof run["waitRecoveryRetry"]>[0] | undefined;
+    const retain = run["retainCaptureSource"].bind(run);
+    run["retainCaptureSource"] = flight => {
+      retentions++;
+      assert.equal(rootSettled, true, "nonclean root joined before continuation retains source");
+      assert.equal(boundarySettled, true, "private finalize handoff runs after parent join");
+      retain(flight);
+    };
+    run["captureHoldContext"] = async (_claim, flight) => {
+      captures++;
+      observedFlight = flight;
+      assert.ok(actual);
+      assert.equal(actual.signal.aborted, false, "root admitted under the actual live permit");
+      const child = await rig.safety.spawnBoundaryProcess(actual, {
+        argv: ["/pending-root-fixture/git", "--version"], cwd: probe.seen.clone!, env: {}, identity: "worker_pat",
+      });
+      childCompletion = child.completed;
+      void childCompletion.catch(() => undefined);
+      await cleanupStarted;
+      return { verified: false, published: false, mode: "same_worker_only", head: null };
+    };
+    run["waitRecoveryRetry"] = async flight => {
+      retries++;
+      run["observeCancellation"](flight);
+      assert.equal(flight.cancel.signal.aborted, true);
+      cancelled();
+    };
+    const push = t.mock.method(git, "pushBranch", async () => { throw new Error("unexpected push"); });
+    const publish = t.mock.method(client, "publishCheckpoint", async () => { throw new Error("unexpected checkpoint"); });
+    t.after(async () => {
+      // One idempotent event release; join every owned promise even on assertion failure.
+      releaseCleanup();
+      await childCompletion?.catch(() => undefined);
+      await operation?.catch(() => undefined);
+    });
+    operation = run.execute(claim).finally(() => { executeSettled = true; });
+    void operation.catch(() => undefined);
+    try {
+      await Promise.race([
+        Promise.all([cancellationObserved, actionUnwinding]),
+        operation.then(() => { throw new Error("execution ended before cancellation unwind barrier"); }),
+      ]);
+      assert.ok(observedFlight);
+      assert.ok(actual);
+      assert.equal(primaryExited, true);
+      assert.equal(rootSettled, false);
+      assert.equal(executeSettled, false);
+      assert.equal(boundarySettled, false);
+      assert.equal(acceptsJoinedCaptureCleanup(rig.safety, actual), false, "pending root cannot issue joined witness");
+      assert.equal(actual.signal.aborted, false, "no deadline fired to substitute for cancellation");
+      assert.equal(observedFlight.sourceExitDenied, undefined);
+      assert.equal(retentions, 0);
+      assert.equal(rig.releaseCalls(), 0);
+    } finally { releaseCleanup(); }
+    await operation;
+    await assert.rejects(childCompletion!, /root did not reap cleanly/);
+    assert.equal(rootSettled, true);
+    assert.equal(boundarySettled, true);
+    assert.equal(joined, false, "incomplete root cleanup cannot certify a clean cancellation");
+    assert.ok(retentions > 0, "post-join private continuation retains the source");
+    assert.equal(captures, 1);
+    assert.equal(retries, 1);
+    assert.equal(fallbacks, 0);
+    assert.equal(rig.releaseCalls(), 0);
+    assert.equal(push.mock.callCount(), 0);
+    assert.equal(publish.mock.callCount(), 0);
+    assert.equal(api.completionHoldRequests.length, 0);
+    assert.equal(api.completionPermitRequests.length, 0);
+    assert.equal(forge.calls.length, 0);
+    assert.equal(observedFlight!.sourceExitDenied, true);
+    assert.equal(observedFlight!.stoppedSourceKept, true);
+    assert.equal(observedFlight!.keepGuardedInventoryOpen, true);
+    assert.equal(observedFlight!.preserveRecoveryClone, true);
+    assert.equal(observedFlight!.preserveSession, true);
+    assert.equal(fs.readFileSync(path.join(probe.seen.clone!, "m3.txt"), "utf8"), "preserved work\n");
+    assert.equal(gitIn(probe.seen.clone!, ["rev-parse", "HEAD"]), probe.seen.head);
+    assert.equal(fs.readFileSync(sentinel, "utf8"), "session bytes\n");
+    assert.equal(terminal(claim.run_id).at(-1)!.body.failure_reason, "run cancelled");
+  });
+
+  for (const fault of ["clean-direct", "quiescence-direct", "quiescence", "residue", "poison", "deadline-rollback", "independent", "custody"] as const) {
+    it(`provisional cancellation preserves actual ${fault} guards`, async t => {
+      const claim = claimFor();
+      const runHome = path.join(homeDir, claim.run_id);
+      fs.mkdirSync(runHome, { recursive: true });
+      const sentinel = path.join(runHome, "SESSION_TRANSCRIPT");
+      fs.writeFileSync(sentinel, "session bytes\n");
+      const deadline = manualDeadline(fault.endsWith("-direct") ? "shutdown" : "finalize");
+      const rig = codexRig({ armDeadline: deadline.armDeadline });
+      let actual: Parameters<typeof acceptsJoinedCaptureCleanup>[1] | undefined;
+      let joined = false, permitAborted = false, fallbacks = 0, refusals = 0, retries = 0;
+      let observedFlight: Parameters<ReturnType<typeof runnerWith>["waitRecoveryRetry"]>[0] | undefined;
+      const boundary = rig.safety.withBoundary.bind(rig.safety);
+      t.mock.method(rig.safety, "withBoundary", async (request: Parameters<typeof boundary>[0], action: Parameters<typeof boundary>[1]) => {
+        try { return await boundary(request, permit => { actual = permit; return action(permit); }); }
+        finally {
+          if (actual) {
+            joined = acceptsJoinedCaptureCleanup(rig.safety, actual);
+            permitAborted = actual.signal.aborted;
+          }
+        }
+      });
+      const probe = committing("Fixes #3090");
+      const executor = new FakeCodexExecutor(rig.safety, async ctx => {
+        const result = await probe.executor.run(ctx);
+        if (fault === "custody") {
+          observedFlight!.preserveRecoveryClone = true;
+          observedFlight!.preserveSession = true;
+          observedFlight!.retainedLocalCustody = true;
+          observedFlight!.keepGuardedInventoryOpen = true;
+        }
+        if (fault.endsWith("-direct")) await ctx.enterCompletionHold!("direct cancel");
+        return result;
+      }, undefined, () => { fallbacks++; throw new Error("unexpected fallback"); });
+      const forge = fakeGitlab();
+      const run = runnerWith(() => ({ executor, homeDir: runHome }), forge.gitlab, undefined, undefined, {
+        quiesceRun: async request => {
+          const blocked = (fault.startsWith("quiescence") && request.site === "completion_hold") ||
+            (fault === "residue" && request.site === "hold_capture:after_runner_git");
+          if (blocked) {
+            refusals++;
+            const flight = observedFlight!;
+            run["observeCancellation"](flight);
+            assert.equal(flight.cancel.signal.aborted, true, "cancel is observed before refusal returns");
+          }
+          return {
+            process: { state: blocked ? "unverified" : "quiescent", processes: [], killed: [], detail: "event-driven clone proof" },
+            docker: { state: "not_wired", removed: [], detail: "" },
+          };
+        },
+      });
+      const build = run["buildFlight"].bind(run);
+      run["buildFlight"] = (...args) => {
+        const flight = build(...args);
+        observedFlight = flight;
+        return flight;
+      };
+      const capture = run["captureHoldContext"].bind(run);
+      run["captureHoldContext"] = async (...args) => {
+        observedFlight = args[1];
+        if (fault === "residue") return capture(...args);
+        return { verified: false, published: false, mode: "same_worker_only", head: null };
+      };
+      run["waitRecoveryRetry"] = async flight => {
+        retries++;
+        observedFlight = flight;
+        assert.equal(flight.sourceExitDenied, undefined);
+        if (fault === "poison") rig.registry.poison({ category: "tool", message: "independent opaque proof refusal" });
+        if (fault === "deadline-rollback") {
+          deadline.fire();
+          assert.ok(actual?.signal.aborted, "actual permit observed its owned deadline");
+          const earlier = Date.now() - 60_000;
+          t.mock.method(Date, "now", () => earlier);
+        }
+        if (fault === "independent") run["retainCaptureSource"](flight);
+        run["observeCancellation"](flight);
+      };
+      const push = t.mock.method(git, "pushBranch", async () => { throw new Error("unexpected push"); });
+      await run.execute(claim);
+      assert.ok(observedFlight);
+      assert.equal(refusals, fault.startsWith("quiescence") || fault === "residue" ? 1 : 0);
+      assert.equal(retries, fault.startsWith("quiescence") || fault === "residue" ? 0 : 1);
+      assert.equal(joined, fault !== "poison", "signed witness alone does not mask clone refusal or owned expiry");
+      assert.equal(permitAborted, fault === "deadline-rollback");
+      assert.equal(fallbacks, 0);
+      assert.equal(push.mock.callCount(), 0);
+      assert.equal(api.completionHoldRequests.length, 0);
+      assert.equal(api.completionPermitRequests.length, 0);
+      assert.equal(forge.calls.length, 0);
+      assert.equal(terminal(claim.run_id).at(-1)!.body.failure_reason, "run cancelled");
+      if (fault === "clean-direct") {
+        assert.equal(observedFlight.sourceExitDenied, undefined);
+        assert.equal(fs.existsSync(probe.seen.clone!), false);
+        assert.equal(fs.existsSync(sentinel), false);
+      } else {
+        assert.equal(observedFlight.sourceExitDenied, fault === "custody" ? undefined : true);
+        if (fault === "custody") {
+          assert.equal(observedFlight.retainedLocalCustody, true);
+          assert.equal(observedFlight.keepGuardedInventoryOpen, true);
+        }
+        assert.equal(observedFlight.preserveRecoveryClone, true);
+        assert.equal(observedFlight.preserveSession, true);
+        assert.equal(fs.readFileSync(path.join(probe.seen.clone!, "m3.txt"), "utf8"), "preserved work\n");
+        assert.equal(gitIn(probe.seen.clone!, ["rev-parse", "HEAD"]), probe.seen.head);
+        assert.equal(fs.readFileSync(sentinel, "utf8"), "session bytes\n");
+      }
     });
   }
 

@@ -27,7 +27,7 @@ function gitIn(cwd: string, ...args: string[]): string {
 }
 
 // The child inherits an already-open writable FD, but no run markers and no clone cwd.
-// It writes only on the IPC handshake. Each test waits for exit before permitting the final scan.
+// It writes only on the IPC handshake. The fixture joins its own child before checking retained bytes.
 async function writer(clone: string) {
   fs.writeFileSync(path.join(clone, "RACE.txt"), "captured bytes\n");
   gitIn(clone, "add", "RACE.txt");
@@ -74,8 +74,8 @@ process.send("ready");`], { cwd: fx.dataDir, env: { PATH: process.env.PATH }, st
 }
 
 for (const [index, kind] of ["recovery", "credential deferral", "disk", "provider direct", "provider reconciled", "live nonterminal", "switch outer", "switch in-place"].entries()) {
-  it(`M1 late-writer race: ${kind} keeps exact clone and plain journal despite positive coverage`,
-    { skip: process.platform !== "linux" }, async () => {
+  it(`M1 late-writer race: ${kind} keeps exact clone and plain journal ${kind === "credential deferral" ? "after joined capture and accepted park" : "despite positive coverage"}`,
+    { skip: process.platform !== "linux" }, async (t) => {
     const claim = gitlabClaim(28520 + index, { claim_generation: 1 });
     api.setOwnershipStatus(claim.run_id, "running", 1);
     const { gitlab } = fakeGitlab();
@@ -94,10 +94,35 @@ for (const [index, kind] of ["recovery", "credential deferral", "disk", "provide
       provider ? ["claim_generation_fence", "recovery_cause_provider_outage"] :
       ["claim_generation_fence", "recovery_cause_data_volume_full"];
     const rig = codexRig({ vaultLocked: () => true });
+    const deferred = kind === "credential deferral";
+    type Flight = { sourceExitDenied?: boolean; preserveRecoveryClone?: boolean; stoppedSourceKept?: boolean };
+    let flight: Flight | undefined;
+    let handlerFlight: Flight | undefined;
+    let joined = false, parkAck = false;
+    let capturedHead = "";
+    const lateReads: string[] = [], diagnosticReasons: string[] = [];
+    const admissions: unknown[] = [];
+    const capture: typeof rig.capture = async (...args) => {
+      const result = await rig.capture(...args);
+      if (deferred) {
+        // External adversary setup: this host child has no registered-root exclusion proof.
+        // The actual A callback has returned; the accepted ACK below gates the fixture write.
+        joined = true;
+      }
+      return result;
+    };
     const behavior = async (ctx: RunContext): Promise<ExecutorResult> => {
       clone = ctx.worktreePath;
       branch = ctx.branch;
-      try { w = await writer(clone); } catch (error) { fixtureError = error; throw error; }
+      try {
+        w = await writer(clone);
+        if (deferred) {
+          // Registered-root capture does not force a procfs scan. Calibrate the
+          // fixture's installed view explicitly without claiming writer exclusion.
+          procfsTable.readEnviron(w.pid);
+          assert.ok(calibrated, "fixture-owned calibration reads its live external writer");
+        }
+      } catch (error) { fixtureError = error; throw error; }
       // The real view is installed before any capture or cleanup proof.
       const execute = async (): Promise<ExecutorResult> => {
         if (kind === "credential deferral") return { branch: ctx.branch };
@@ -114,12 +139,50 @@ for (const [index, kind] of ["recovery", "credential deferral", "disk", "provide
     // Keep the view active across the runner's catch/finally, not only the executor.
     const view = scopedRealView();
     const runner = runnerWith(() => ({
-      executor: kind === "credential deferral" ? new FakeCodexExecutor(rig.safety, behavior, undefined, rig.capture) : { run: behavior },
+      executor: kind === "credential deferral" ? new FakeCodexExecutor(rig.safety, behavior, undefined, capture) : { run: behavior },
     }), gitlab, undefined, logger, { recoveryRetryMs: 1 });
+    if (deferred) {
+      const seam = runner as unknown as {
+        buildFlight(...args: unknown[]): Flight;
+        handleRecoveryExhausted(...args: unknown[]): Promise<boolean>;
+        retainStoppedSource(...args: unknown[]): Promise<unknown>;
+        executeClaim(...args: unknown[]): Promise<unknown>;
+      };
+      const build = seam.buildFlight.bind(runner);
+      t.mock.method(seam, "buildFlight", (...args: unknown[]) => flight = build(...args));
+      const handler = seam.handleRecoveryExhausted.bind(runner);
+      t.mock.method(seam, "handleRecoveryExhausted", (...args: unknown[]) => {
+        handlerFlight = args[2] as Flight;
+        return handler(...args);
+      });
+      const retain = seam.retainStoppedSource.bind(runner);
+      t.mock.method(seam, "retainStoppedSource", (...args: unknown[]) => {
+        diagnosticReasons.push(String(args[2]));
+        return retain(...args);
+      });
+      const executeClaim = seam.executeClaim.bind(runner);
+      t.mock.method(seam, "executeClaim", async (...args: unknown[]) => {
+        const result = await executeClaim(...args);
+        admissions.push(result);
+        return result;
+      });
+      const methods = git as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
+      for (const name of ["worktreeStatus", "worktreeHead", "worktreeCleanHardened",
+        "localRefsReachableFrom", "commitWipMarker", "trackingTip"]) {
+        const method = methods[name];
+        assert.ok(method, `fixture Git method ${name} exists`);
+        const original = method.bind(git);
+        t.mock.method(methods, name, (...args: unknown[]) => {
+          if (joined) lateReads.push(name);
+          return original(...args);
+        });
+      }
+    }
     const readEnviron = procfsTable.readEnviron;
     procfsTable.readEnviron = (pid) => {
       const result = readEnviron(pid);
-      // Only runner scans after writer() returned count as installed-view calibration.
+      // Legacy variants calibrate via runner scans; the registered-root variant
+      // performs its own installed-view calibration after writer() returns.
       if (w && pid === w.pid && !w.exited()) calibrated = true;
       return result;
     };
@@ -144,6 +207,7 @@ for (const [index, kind] of ["recovery", "credential deferral", "disk", "provide
       return result;
     };
     git.verifyRunnerTrackingCovers = async (...args) => {
+      if (deferred && joined) lateReads.push("verifyRunnerTrackingCovers");
       const result = await originalVerify(...args);
       verified ||= result;
       return result;
@@ -166,7 +230,26 @@ for (const [index, kind] of ["recovery", "credential deferral", "disk", "provide
         lost = true;
         throw new Error("lost park acknowledgement");
       }
-      return report(runId, body, signal);
+      const result = await report(runId, body, signal);
+      if (deferred && body.status === "recovery_wait" && !fixtureError) {
+        try {
+          assert.equal(flight?.sourceExitDenied, undefined, "park ACK precedes cleanup denial");
+          parkAck = result.applied === true && result.status === "recovery_wait";
+          assert.ok(parkAck, "park accepted before fixture late write");
+          assert.ok(joined, "actual capture fully joined before park ACK");
+          assert.equal(flight?.sourceExitDenied, undefined, "cleanup exit denial is not moved earlier");
+          assert.ok(calibrated, "installed real view read the live fixture writer");
+          capturedHead = gitIn(git.barePathFor(fx.originPath), "rev-parse", `refs/uzi-runner/${branch}`);
+          assert.equal(gitIn(git.barePathFor(fx.originPath), "show", `${capturedHead}:RACE.txt`), "captured bytes");
+          boundary = true;
+          await w!.write();
+        } catch (error) {
+          // A fixture assertion is not a simulated transport failure for the
+          // runner to retry. Return the real ACK, then surface the assertion.
+          fixtureError = error;
+        }
+      }
+      return result;
     };
     client.getRunOwnership = async (runId) => lost ?
       { status: "recovery_wait", claim_generation: 1 } : ownership(runId);
@@ -174,10 +257,27 @@ for (const [index, kind] of ["recovery", "credential deferral", "disk", "provide
       await withQuiescenceView(view, () => runner.execute(claim));
       if (fixtureError) throw fixtureError;
       if (!boundary) console.error("M1 boundary missing", JSON.stringify(lines));
-      assert.ok(boundary, "byte-check/final-scan boundary reached");
-      assert.ok(w!.exited(), "late writer exited before scan");
+      assert.ok(boundary, deferred ? "joined capture / park ACK boundary reached" : "byte-check/final-scan boundary reached");
+      assert.ok(w!.exited(), "fixture late writer joined before retained-byte assertions");
       assert.ok(verified, "capture verification positively observed");
-      if (!switching) assert.ok(covered, "cleanup verdict positively observed as covered");
+      if (deferred) {
+        assert.ok(joined && parkAck, "actual A callback fully joined after accepted park");
+        assert.ok(flight && flight === handlerFlight, "same actual buildFlight and handler flight");
+        assert.equal(flight.sourceExitDenied, true, "original cleanup point latches exit denial");
+        assert.equal(flight.preserveRecoveryClone, true);
+        assert.equal(flight.stoppedSourceKept, true);
+        assert.deepEqual(admissions, [undefined], "park exports no closed-source observation");
+        assert.equal(rig.registry.reserveLaunch("command").kind, "denied", "normal command admission refused");
+        assert.equal(rig.registry.reserveLaunch("provider").kind, "denied", "normal model admission refused");
+        assert.deepEqual(diagnosticReasons, [], "Codex park does not run stopped-source diagnostic");
+        assert.deepEqual(lateReads, [], "no product source reads after A proof release");
+        assert.equal(covered, false, "removed diagnostic was never invoked");
+        assert.equal(gitIn(clone, "rev-parse", "HEAD"), capturedHead, "late edit is clone-only work on captured generation");
+        assert.equal(gitIn(git.barePathFor(fx.originPath), "show", `${capturedHead}:RACE.txt`), "captured bytes",
+          "old capture remains older than retained late clone bytes");
+        const markers = gitIn(git.barePathFor(fx.originPath), "config", "--list");
+        assert.equal(markers.split("\n").some(line => line.startsWith(`uzi-stopped.${claim.run_id}.`)), false, "no new stopped-source marker");
+      } else if (!switching) assert.ok(covered, "cleanup verdict positively observed as covered");
       console.log(`M1 calibrated=${calibrated} boundary=${boundary} child_exit=${w!.exited()} verified=${verified} covered=${covered} kind=${kind}`);
       assert.ok(fs.existsSync(clone), "exact clone retained despite the positive snapshot verdict");
       assert.equal(fs.readFileSync(path.join(clone, "RACE.txt"), "utf8"), LATE);

@@ -6,7 +6,9 @@ import path from "node:path";
 import type { Executor, ExecutorResult, RunContext } from "../src/executor.js";
 import type { ExecutorFactory, RunRunner } from "../src/runner.js";
 import { DiskParkSignal } from "../src/cache-cap.js";
-import { CodexBoundaryError } from "../src/codex/safety.js";
+import { acceptsHeldCaptureCleanup, CodexBoundaryError } from "../src/codex/safety.js";
+import type { BoundaryPermit } from "../src/harness.js";
+import { quiesceRunAttempt } from "../src/run-quiescence.js";
 import { SdkExecutor, TransientRecoveryError } from "../src/sdk-executor.js";
 import { followSuccessfulPush } from "./publication-fixture.js";
 import { nullLogger } from "./helpers.js";
@@ -52,6 +54,7 @@ interface Rig {
   runner: RunRunner;
   custody: () => number;
   homePath: () => string;
+  assertRefusal: () => void;
 }
 
 function rigFor(harness: Harness, scenario: Scenario, homeRoot: string): Rig {
@@ -60,6 +63,13 @@ function rigFor(harness: Harness, scenario: Scenario, homeRoot: string): Rig {
   const error = scenario.error ?? (() => new TransientRecoveryError("provider transient error persisted", { providerOrigin: true }));
   let runHome = "";
   let thrown = false;
+  const refusalPhases: string[] = [];
+  let heldPermit: BoundaryPermit | undefined;
+  let codexOwner: ReturnType<typeof codexRig> | undefined;
+  let verifiedCaptures = 0;
+  const initialCleanup: boolean[] = [];
+  const reportCleanup: boolean[] = [];
+  const refusalProofs: { held: boolean; signalLive: boolean; rootsDrained: boolean; reaped: boolean; pending: number; callbacks: number; verifiedCaptures: number; state: string }[] = [];
   const behavior = async (ctx: RunContext): Promise<ExecutorResult> => {
     fs.mkdirSync(runHome, { recursive: true });
     fs.writeFileSync(path.join(runHome, "session"), "transcript", "utf8");
@@ -75,7 +85,7 @@ function rigFor(harness: Harness, scenario: Scenario, homeRoot: string): Rig {
       // Replacement executors own fresh provider roots, safety and capture authority.
       const rig = codexRig();
       let modelThrown = false;
-      let drainedAfterThrow = false;
+      codexOwner = rig;
       const instanceBehavior = async (ctx: RunContext): Promise<ExecutorResult> => {
         try {
           return await behavior(ctx);
@@ -88,12 +98,17 @@ function rigFor(harness: Harness, scenario: Scenario, homeRoot: string): Rig {
         const real = rig.safety.withBoundary.bind(rig.safety);
         rig.safety.withBoundary = async (req, action) => {
           const postThrowShutdown = modelThrown && req.boundary === "shutdown";
-          // Let the real strict drain finish before verified local capture. Inject the
-          // late publication/pre-report reap fault only after that successful return.
-          if (postThrowShutdown && drainedAfterThrow) throw new CodexBoundaryError("quiesce", [{ category: "protocol", message: "provider not reaped" }]);
-          const result = await real(req, action);
-          if (postThrowShutdown) drainedAfterThrow = true;
-          return result;
+          return real(req, async permit => {
+            if (!postThrowShutdown) return action(permit);
+            heldPermit = permit;
+            refusalPhases.push("held");
+            try {
+              return await action(permit);
+            } finally {
+              heldPermit = undefined;
+              refusalPhases.push("joined");
+            }
+          });
         };
       }
       return { homeDir: runHome, executor: new FakeCodexExecutor(rig.safety, instanceBehavior, undefined, rig.capture) };
@@ -105,7 +120,50 @@ function rigFor(harness: Harness, scenario: Scenario, homeRoot: string): Rig {
       return { homeDir: runHome, executor };
     };
   }
-  const runner = runnerWith(factory, gitlab, undefined, nullLogger(), { recovery: coord, recoveryRetryMs: 5 });
+  const runner = runnerWith(factory, gitlab, undefined, nullLogger(), {
+    recovery: coord, recoveryRetryMs: 5,
+    quiesceRun: async req => {
+      if (harness !== "codex" || !scenario.failReap || req.site !== "recovery_provider_settle")
+        return quiesceRunAttempt(req);
+      // Refuse clone quiescence at the actual pre-report site, after local capture.
+      // The real safety owner still proves its registered roots drained in this callback.
+      refusalPhases.push("pre_report_refused");
+      refusalProofs.push({
+        held: heldPermit !== undefined,
+        signalLive: heldPermit !== undefined && !heldPermit.signal.aborted,
+        rootsDrained: Boolean(codexOwner && !codexOwner.registry.hasLiveCommandRoot() && !codexOwner.registry.hasUnreapedBoundaryRoot()),
+        reaped: (codexOwner?.reaps() ?? 0) > 0,
+        pending: codexOwner?.registry.pendingLaunchCount() ?? -1,
+        callbacks: codexOwner?.registry.inFlightCallbackCount() ?? -1,
+        verifiedCaptures, state: codexOwner?.registry.state() ?? "absent",
+      });
+      return {
+        process: { state: "unverified", processes: [], killed: [], detail: "pre-settlement clone quiescence refused" },
+        docker: { state: "not_wired", removed: [], detail: "fixture has no Docker" },
+      };
+    },
+  });
+  if (harness === "codex" && scenario.failReap) {
+    const settle = runner["settleCaptureRequest"].bind(runner);
+    runner["settleCaptureRequest"] = async (...args) => {
+      await settle(...args);
+      const held = args[1];
+      if (held) {
+        const checkpoints = refusalProofs.length ? reportCleanup : initialCleanup;
+        checkpoints.push(held.safety === codexOwner?.safety && held.permit === heldPermit &&
+          acceptsHeldCaptureCleanup(held.safety, held.permit));
+      }
+    };
+    const capture = runner["captureRecoveryRestorePoint"].bind(runner);
+    runner["captureRecoveryRestorePoint"] = async (...args) => {
+      const result = await capture(...args);
+      if (result.verified) {
+        verifiedCaptures++;
+        refusalPhases.push("capture_verified");
+      }
+      return result;
+    };
+  }
   if (harness === "claude" && scenario.failReap) {
     const r = runner as unknown as { reapForSink: (...a: unknown[]) => Promise<void> };
     const real = r.reapForSink.bind(runner);
@@ -114,7 +172,16 @@ function rigFor(harness: Harness, scenario: Scenario, homeRoot: string): Rig {
       return real(...a);
     };
   }
-  return { runner, custody: spyCustodySettle(runner), homePath: () => runHome };
+  return {
+    runner, custody: spyCustodySettle(runner), homePath: () => runHome,
+    assertRefusal: () => {
+      if (harness !== "codex") return;
+      assert.ok(initialCleanup.length > 0 && initialCleanup.every(Boolean), "the runner used genuine full-root cleanup proof before capture");
+      assert.deepEqual(refusalProofs, [{ held: true, signalLive: true, rootsDrained: true, reaped: true, pending: 0, callbacks: 0, verifiedCaptures: 1, state: "closed" }], "one refusal after verified capture inside the live callback");
+      assert.deepEqual(reportCleanup, [true], "the real report checkpoint refreshed cleanup after the refused clone proof");
+      assert.deepEqual(refusalPhases, ["held", "capture_verified", "pre_report_refused", "joined"]);
+    },
+  };
 }
 
 async function withHome(fn: (homeRoot: string) => Promise<void>): Promise<void> {
@@ -223,6 +290,7 @@ describe("RunRunner #1733 — a provider outage parks typed provider_outage", ()
         assert.equal(sent.length, 1);
         assert.equal(sent[0]!.recovery_cause, "provider_outage");
         assert.equal(sent[0]!.productive_turns, 1);
+        rig.assertRefusal();
         assert.equal(rig.custody(), 0, "no settlement without positive proof");
         assert.equal(fs.existsSync(worktreeDirFor(3302)), true, "the clone is kept");
         assert.equal(fs.existsSync(rig.homePath()), true, "HOME is kept");
@@ -241,6 +309,7 @@ describe("RunRunner #1733 — a provider outage parks typed provider_outage", ()
         assert.equal(sent.length, 1);
         assert.equal(sent[0]!.recovery_cause, "provider_outage");
         assert.equal(sent[0]!.productive_turns, 3);
+        rig.assertRefusal();
         assert.equal(rig.custody(), 0);
         assert.equal(fs.existsSync(worktreeDirFor(3303)), true);
         assert.equal(fs.existsSync(rig.homePath()), true);
@@ -310,6 +379,7 @@ describe("RunRunner #1733 — a provider outage parks typed provider_outage", ()
         } finally {
           stop();
         }
+        rig.assertRefusal();
         assert.equal(fs.existsSync(worktreeDirFor(3331)), true, "clone kept: the reap was never proven");
         assert.equal(fs.existsSync(rig.homePath()), true, "HOME is kept");
         assert.equal(rig.custody(), 0, "no settlement without positive proof");

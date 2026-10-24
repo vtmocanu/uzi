@@ -232,8 +232,8 @@ func demoWorkers(now time.Time, runs []apitypes.RunListItemDTO) ([]apitypes.Work
 		}
 		all[i] = w
 	}
-	all[0].HostedSize, all[1].HostedSize = str("l"), str("l")
-	all[0].StatsMemLimitBytes, all[1].StatsMemLimitBytes = i64Ptr(8<<30), i64Ptr(8<<30)
+	all[0].HostedSize, all[1].HostedSize = str("l-highmem"), str("l")
+	all[0].StatsMemLimitBytes, all[1].StatsMemLimitBytes = i64Ptr(32<<30), i64Ptr(8<<30)
 	all[1].Docker, all[1].Capabilities, all[1].AnthropicBindMode = boolPtr(true), []string{"docker", "jvm"}, "auto"
 	all[1].StatsDiskDindInodes, all[1].StatsDiskDindTotalInodes = i64Ptr(97), i64Ptr(100)
 	all[1].OutboxPendingMessages = num(14)

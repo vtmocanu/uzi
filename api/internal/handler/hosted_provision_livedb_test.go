@@ -341,6 +341,36 @@ func TestProvisionHostedWorkerCoWriteLiveDB(t *testing.T) {
 	}
 }
 
+// Issue #3383: the l-highmem preset name survives provision -> row -> Poll verbatim.
+// hosted_size is not value-CHECKed, so only an exact round trip proves nothing
+// normalised or rejected the hyphenated name.
+func TestProvisionHostedWorkerHighMemoryPresetLiveDB(t *testing.T) {
+	h, _, q, box, userID := hostedLiveDB(t, "2")
+	ctx := context.Background()
+
+	wkr, err := h.provisionHostedWorker(ctx, userID, "highmem", "base", "l-highmem", false, 2)
+	if err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+	if !wkr.HostedSize.Valid || wkr.HostedSize.String != "l-highmem" {
+		t.Fatalf("hosted_size = %+v on the provisioned row, want exactly l-highmem", wkr.HostedSize)
+	}
+
+	resp, err := hostedsvc.New(q, box, time.Now, time.Hour).Poll(ctx)
+	if err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	for i := range resp.Workers {
+		if resp.Workers[i].ID == wkr.ID.String() {
+			if resp.Workers[i].Size != "l-highmem" {
+				t.Errorf("desired Size = %q, want l-highmem", resp.Workers[i].Size)
+			}
+			return
+		}
+	}
+	t.Fatal("the provisioned worker is absent from the controller's desired state")
+}
+
 // Nothing is sealed when the quota refuses: no worker, no parked ciphertext.
 //
 // It does NOT prove the rollback, and an earlier version of this comment claimed it

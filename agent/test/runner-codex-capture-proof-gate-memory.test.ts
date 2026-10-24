@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 import { it } from "node:test";
 import { performance } from "node:perf_hooks";
 import { setImmediate as tick } from "node:timers/promises";
@@ -79,6 +81,7 @@ function enroll(ctx: RunContext, toolId = "original-tool") {
 for (const refusal of [false,true]) it(`public gate actual Git initial-proof-${refusal?"refused":"accepted"}`,async()=>{
   const o=observe({refusal}); const post: Array<{kind:string;active:boolean}>=[]; let gates=0;
   let witnessChecks: typeof post = [];
+  let gateRefusal:unknown; let clone="", stoppedReads=0, stoppedPubs=0;
   const claim={...gitlabClaim(2852),claim_generation:7,
     execution_milestones:[{id:"m1",title:"Original"}]};
   client.protocolFeatures=["milestone_reconciliation_v1","claim_generation_fence","gate_revision_v1"];
@@ -97,8 +100,8 @@ for (const refusal of [false,true]) it(`public gate actual Git initial-proof-${r
   });
   let run: ReturnType<typeof runnerWith>;
   const exec=new FakeCodexExecutor(o.rig.safety,async ctx=>{
-    commitInTree(ctx.worktreePath,"PUBLIC.txt","gate actual bytes\n");o.arm();
-    try { await ctx.gatePlan!("Plan",[{id:"m1",title:"Changed"}]); } catch(error) {run.shutdown(); throw error;}
+    clone=ctx.worktreePath;commitInTree(clone,"PUBLIC.txt","gate actual bytes\n");o.arm();
+    try { await ctx.gatePlan!("Plan",[{id:"m1",title:"Changed"}]); } catch(error) {gateRefusal=error;stoppedReads=o.observations().source.length;stoppedPubs=o.observations().pubs.length;run.shutdown(); throw error;}
     throw new PlanRejectedError("fixture rejection");
   },o.rig.settle,o.capture);
   try{
@@ -106,7 +109,15 @@ for (const refusal of [false,true]) it(`public gate actual Git initial-proof-${r
       {checkpointIntervalMs:0,planApprovalTimeoutMs:2000,recoveryRetryMs:1});
     await o.execute(run.execute(claim));
     console.log("GATE_POST",JSON.stringify(post));
-    if(refusal){o.assertRefusal();assert.equal(gates,0);}
+    if(refusal){
+      o.assertRefusal();assert.equal(gates,0);
+      assert.equal((gateRefusal as Error)?.name,"TransientRecoveryError","retain the original witness refusal");
+      assert.equal(api.states.some(s=>s.body.gate_checkpoint_witness!==undefined),false);
+      assert.equal(fs.readFileSync(path.join(clone,"PUBLIC.txt"),"utf8"),"gate actual bytes\n","shutdown retains the source");
+      assert.equal(o.observations().source.length,stoppedReads,"shutdown starts no source recapture");
+      assert.equal(o.observations().pubs.length,stoppedPubs,"shutdown starts no checkpoint replay");
+      assert.equal(o.isActive(),false);
+    }
     else{
       o.assertProof(true);
       assert.equal(gates,1,"witness presented before existing reject authority");
