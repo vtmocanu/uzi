@@ -143,6 +143,13 @@ func (s *Service) assembleAndFinishRunClaim(ctx context.Context, wkr store.Worke
 		h.beforeAssembly(ctx, run)
 	}
 	payload, err := s.assembleClaim(ctx, wkr, run)
+	if err == nil {
+		// An over-limit claim would be refused by the worker's read cap and retried forever;
+		// fail the run terminally instead, keeping any minted Codex capability identity.
+		if serr := s.refuseOversizeRunClaim(payload); serr != nil {
+			err, payload = serr, nil
+		}
+	}
 	if h := s.claimHooks; h != nil && h.afterAssembly != nil {
 		h.afterAssembly(ctx, run, payload, err)
 	}
@@ -569,7 +576,7 @@ func claimAssemblyOrigin(err error) string {
 		return "guardrail_blocked"
 	case errors.Is(err, errCredentialUnavailable):
 		return "credential_unavailable"
-	case errors.Is(err, errToolPackagesRejected):
+	case errors.Is(err, errToolPackagesRejected), errors.Is(err, errClaimTooLarge):
 		return "provisioning_failed"
 	// ErrCrossCheckRefused is a separate sentinel grouped under the same origin; the legacy
 	// mr_rework refusal arrives via errGuardrailBlockedClaim (legacyReviewClaimError).
