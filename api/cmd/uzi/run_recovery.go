@@ -73,7 +73,7 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 			"recovery captures (id, state, source_sha, byte_size, created_at); a capture id is what " +
 			"`run export --capture` takes. A hold that outlived its deleted run lists `captures: []`.\n\n" +
 			"While the server retains the run's last published checkpoint on origin, the hold also " +
-			"names where it lives: `refs/uzi-checkpoints/<branch>`, or `refs/uzi-recovery/<run-id>` " +
+			"names where it lives: `refs/uzi-checkpoints/<checkpoint-key>`, or `refs/uzi-recovery/<run-id>` " +
 			"once a newer run on the same branch superseded it, with its tip and retention state " +
 			"(--json: checkpoint_ref, checkpoint_tip, checkpoint_state).",
 		Args: func(cmd *cobra.Command, args []string) error {

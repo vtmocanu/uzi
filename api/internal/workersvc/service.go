@@ -6563,9 +6563,9 @@ type PublishResult struct {
 
 // Publish is the api side of the M8 brokered origin push: the worker ships a delta
 // PACK plus the tip OID it claims, and the api — the SOLE holder of forge secrets —
-// derives the repo, branch, and PAT ENTIRELY from the run row, fetches origin's
+// derives the repo, authorized coordinates, and PAT ENTIRELY server-side, fetches origin's
 // base objects, applies the pack, and pushes it NON-FORCED to
-// refs/uzi-checkpoints/<branch>. A worker can never name the repo/ref/credential:
+// refs/uzi-checkpoints/<checkpoint-key>. A worker can never name the repo/ref/credential:
 // authorization is server-derived.
 //
 // It returns a benign PublishResult skip (nil error) for the outcomes the worker

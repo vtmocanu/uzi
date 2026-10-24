@@ -2234,7 +2234,7 @@ interface RunFlight {
    *  handlePausePark reads it to say what actually happened (nothing started on this worker, the
    *  run requeues). */
   reclaimWaitInterrupted?: string;
-  /** PRD #1062 M2 (#1036): the current tip of `refs/uzi-checkpoints/<branch>` as this run last
+  /** PRD #1062 M2 (#1036): the current tip of `refs/uzi-checkpoints/<checkpoint-key>` as this run last
    *  knows it — seeded from `claim.checkpoint_tip`, advanced to the declared overlay/real tip on
    *  every CONFIRMED publish. Fed to `checkpointPack` as the overlay's `prevCheckpointTip` so a
    *  second sequential overlay carries the prior tip as parent[0] (base-first) and the broker
@@ -4096,7 +4096,7 @@ export class RunRunner {
                 if ((await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "limit-park")).kind === "preservation_refused") return;
                 // PRD #628 M2: publish a ONE-SHOT checkpoint to origin so a DIFFERENT worker
                 // re-claiming this limit_wait run recovers the committed tree from
-                // refs/uzi-checkpoints/<branch> instead of cold-starting from default. Runs
+                // refs/uzi-checkpoints/<checkpoint-key> instead of cold-starting from default. Runs
                 // AFTER the fetch-back (checkpointPack reads the current tracking ref); an empty
                 // park brokers a null/zero pack and publishes nothing. PRD #1062 M2 (#1036): the
                 // park path is reaped above, so the overlay's PAT default-fetch is permitted.
@@ -4162,7 +4162,7 @@ export class RunRunner {
           // failure line naming the durability consequence (a resume on another worker restarts
           // from the default branch). The false case covers a real publish failure, an empty
           // park (null pack / no committed work) AND a blocked Codex boundary; in all, nothing
-          // landed on refs/uzi-checkpoints/<branch>. publishCheckpointBestEffort ALSO emits the
+          // landed on refs/uzi-checkpoints/<checkpoint-key>. publishCheckpointBestEffort ALSO emits the
           // specific HTTP/skip outcome (deduped). This batcher.emit lands because
           // handleLimitReached FLUSHES (not closes) the batcher on the park branch.
           // PRD #1809 D8: "published" keeps meaning only that a ref landed; a published checkpoint
@@ -4283,7 +4283,7 @@ export class RunRunner {
           //      undoes the requeue), exactly as the park path does — the shutdown branch
           //      previously did NOT do this, so uncommitted work was lost even from the marker.
           //   2. fetchBackBestEffort moves that tip to the local tracking ref.
-          //   3. publishCheckpointBestEffort brokers the delta to refs/uzi-checkpoints/<branch>
+          //   3. publishCheckpointBestEffort brokers the delta to refs/uzi-checkpoints/<checkpoint-key>
           //      AFTER the fetch-back (so checkpointPack reads the current tip), one-shot and
           //      unconditional on the join-token seam (never a git push / PAT), same signature
           //      the park path uses. So a DIFFERENT worker re-claiming this requeued run
@@ -10946,7 +10946,7 @@ export class RunRunner {
       });
     } else if (runnerClone.seededFrom === "checkpoint" && runnerClone.priorCommits > 0) {
       // PRD #122 M8: seeded off ANOTHER worker's brokered checkpoint (origin's
-      // refs/uzi-checkpoints/<branch>) — a cross-worker recovery the lead cannot infer
+      // refs/uzi-checkpoints/<checkpoint-key>) — a cross-worker recovery the lead cannot infer
       // from the tree alone. priorCommits counts what the checkpoint carries. Gated on
       // priorCommits > 0 (like the tracking notice above) so it never claims to have
       // "recovered 0 commit(s) from a checkpoint". #759 M5: a checkpoint can ALSO carry a
@@ -14738,7 +14738,7 @@ export class RunRunner {
    * PRD #122 M8 — broker the checkpoint pack to origin, best-effort. Mirrors
    * fetchBackBestEffort for symmetry: compute the delta pack of
    * `<origin|default>..refs/uzi-runner/<branch>` (null ⇒ nothing to publish) and ship it
-   * to the api's publish RPC, which lands it at `refs/uzi-checkpoints/<branch>` for another
+   * to the api's publish RPC, which lands it at `refs/uzi-checkpoints/<checkpoint-key>` for another
    * worker to recover cross-worker. Fired on BOTH the milestone (reap:true) checkpoint and
    * the PRD #267 time-gated (reap:false) checkpoint, always AFTER the fetch-back updated the
    * tracking ref checkpointPack reads. Every non-success — a null pack (nothing to publish),
@@ -20763,7 +20763,7 @@ export class RunRunner {
     const resume = claim.session_id != null || (claim.resume_phase === "implementing" &&
       claim.plan_approved === true && !!claim.plan_md?.trim() && frozenEvidence.tip != null);
     // issue #1042 M4: the OWNER ANCHOR for the cross-worker checkpoint adopt guard — the tip
-    // THIS run last published to its own refs/uzi-checkpoints/<branch> ref, persisted
+    // THIS run last published to its own refs/uzi-checkpoints/<checkpoint-key> ref, persisted
     // server-side on every publish (M2) and delivered on the claim. runnerCloneForBranch
     // adopts a mirrored checkpoint on the resume/unpushed leg ONLY when this equals the
     // checkpoint's current SHA, so a resumed run that never published its own checkpoint

@@ -28,7 +28,7 @@ import (
 // UZI_RECOVERY_READY_RETENTION has passed.
 //
 // Salvage is CREATE-ONLY toward every ref it does not own. The branch checkpoint ref
-// (refs/uzi-checkpoints/<branch>) and refs/uzi-recovery/<run-id> belong to the terminal
+// (refs/uzi-checkpoints/<checkpoint-key>) and refs/uzi-recovery/<run-id> belong to the terminal
 // path and PR #1819's checkpoint retention (PRD #1810): this file never deletes or moves
 // them, never calls deleteCheckpointFn, and never changes a custody hold. The only ref it
 // deletes is its own refs/uzi-salvage/<run-id>, CAS-bound to the recorded tip.

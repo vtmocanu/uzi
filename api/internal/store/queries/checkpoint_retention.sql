@@ -1,5 +1,5 @@
 -- PRD #1810: checkpoint-ref retention. A terminal run's published checkpoint ref
--- (refs/uzi-checkpoints/<branch>) is recorded in checkpoint_retentions and kept on origin
+-- (refs/uzi-checkpoints/<checkpoint-key>) is recorded in checkpoint_retentions and kept on origin
 -- while the run has an open custody hold (D1); it is deleted, compare-and-swap on the
 -- recorded tip, only once no hold is open. Every state transition below is guarded on the
 -- expected current state, so a racing writer moves zero rows instead of clobbering a newer

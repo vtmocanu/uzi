@@ -8,7 +8,7 @@
 // The security contract lives one layer up in workersvc.Publish (which derives
 // every field of Options from the run row, never from the worker). This package's
 // single job is the mechanical one, and its single security-relevant invariant is
-// NEVER FORCED: the push to refs/uzi-checkpoints/<branch> forwards the worker's pack
+// NEVER FORCED: the push to refs/uzi-checkpoints/<checkpoint-key> forwards the worker's pack
 // through a MANUAL git-receive-pack session (not remote.PushContext — see forwardPack
 // / issue #1009) whose single command carries the checkpoint tip AS FETCHED as its
 // Old. That gives the invariant two agreeing guards: locally, the declared tip is
@@ -280,7 +280,7 @@ func validManagedRef(ref string) bool {
 }
 
 // Publish fetches origin's base objects, applies the worker's delta pack, verifies
-// the declared tip, and pushes it — NON-FORCED — to refs/uzi-checkpoints/<branch>.
+// the declared tip, and pushes it — NON-FORCED — to refs/uzi-checkpoints/<checkpoint-key>.
 // With an existing checkpoint ref the tip must strictly descend it (equality is
 // AlreadyCurrent). With none, the tip must descend or equal the published
 // refs/heads/<branch> tip, and the push CREATES the ref (Old = zero hash), so a run
@@ -530,7 +530,7 @@ type DeleteOptions struct {
 	ExpectedOldTip string
 }
 
-// Delete removes refs/uzi-checkpoints/<branch> (or o.Ref, a checkpoint, recovery or
+// Delete removes refs/uzi-checkpoints/<checkpoint-key> (or o.Ref, a checkpoint, recovery or
 // salvage ref named in full) from the remote, BEST-EFFORT (PRD #1030 M4). A run's checkpoint ref is uzi-owned scratch state; once the run reaches
 // a terminal state it is stale, and a stale ref left behind later blocks a NEW run on
 // the same branch with a not_descendant skip (the new run's tip does not descend the

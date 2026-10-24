@@ -6,6 +6,10 @@ approval to edit it, form and substance alike: adding a requirement, rewording
 one, or changing what one means (`CLAUDE.md`, "Specs contract"). Keep entries
 terse and tag each AI edit `(AI-synced YYYY-MM-DD)`.
 
+## Task checkpoint coordinates (#3343)
+
+- Fresh compatible task claims freeze validated root work-branch and own-run checkpoint-key coordinates with `task_checkpoint_coordinates_v1`; issue/self-improvement keys stay exact, active legacy tasks are not converted, invalid lineage stays unsupported and old workers receive no descriptor. Authorization markers do not prove durability: known no-write may continue on the inherited branch; unavailable/mismatched confirmed anchors or unresolved writes without verified evidence retain custody and fail closed. Ordinary checkpoints are committed-only; WIP requires verified capture overlay. Read-only review, task MR behavior, custody/generation/CAS and issue-only milestone policy remain unchanged. Old API rollback can stall queue-head claims or reject whole mixed readoption batches; roll forward compatible API. Schema Down refuses enrolled rows; capability overrides cannot bypass compatibility. See [ADR-3343](../adr/3343-task-checkpoint-coordinates.md). (AI-synced 2026-10-24)
+
 ## Project
 
 - Name: "Uzinele Întunecate" (uzi) — an AI dark factory.

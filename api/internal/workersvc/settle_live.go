@@ -63,7 +63,7 @@ func validateLiveSettleRequest(req apitypes.RecoveryLiveSettleRequest) error {
 //	   which must be a valid branch name. An underivable or invalid branch is retained/not_eligible.
 //	f. binds source_sha to the server's captures exactly as the completed path does
 //	   (retained/candidate_mismatch).
-//	g. proves: reads the target head H ONCE (RefHead of refs/uzi-checkpoints/<branch>, or
+//	g. proves: reads the target head H ONCE (RefHead of refs/uzi-checkpoints/<checkpoint-key>, or
 //	   BranchHead), a 404 is retained/branch_missing, then asks whether each distinct
 //	   candidate is an ancestor of H (not_ancestor wins over ancestry_unknown).
 //	h. releases with the single guarded ReleasePredecessorCustodyHoldByLiveAncestry, which

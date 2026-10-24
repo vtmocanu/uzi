@@ -1302,11 +1302,13 @@ uzi run recovery <run-id> [--json]
   its run) or the server predates capture-hold linking. Owner-only.
 - While the server retains the run's last published checkpoint on origin (PRD #1810), the
   human-readable output adds a line per hold naming where it lives: `hold <id> checkpoint:
-  <ref> @ <12-char tip> (<state>)`, where `<ref>` is `refs/uzi-checkpoints/<branch>` or, once
-  a newer run on the same branch superseded it, `refs/uzi-recovery/<run-id>`. `--json` carries
+  <ref> @ <12-char tip> (<state>)`, where `<ref>` is `refs/uzi-checkpoints/<checkpoint-key>` or, once
+  a newer run using that key superseded it, `refs/uzi-recovery/<run-id>`. `--json` carries
   the same information as `checkpoint_ref`, `checkpoint_tip`, and `checkpoint_state` on each
   hold. A hold with no retained checkpoint ref omits the line (and the `--json` fields are
-  absent).
+  absent). The key keeps the exact legacy issue/self-improvement spelling; an enrolled
+  task uses `uzi/task/<its-own-run-id>`, even when its work branch belongs to a root
+  task. See [task checkpoint recovery](./run-recovery.md#task-checkpoint-recovery).
 
 - A hold with `terminal_record_rejection: "mac_failure"` also shows the fixed diagnostic:
   “terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody”.
@@ -1335,7 +1337,7 @@ uzi run discard <run-id> --hold <hold-id> --yes
   destroy the last copy of that work — export anything you might need first.
 - **Discarding a run's last open hold also deletes its retained checkpoint ref on the
   forge.** Once no hold of the run is left open, the server settles (CAS-deletes) whatever
-  ref still carries the run's tip (`refs/uzi-checkpoints/<branch>`, or `refs/uzi-recovery/<run-id>`
+  ref still carries the run's tip (`refs/uzi-checkpoints/<checkpoint-key>`, or `refs/uzi-recovery/<run-id>`
   once a newer run superseded it) — see the `run recovery` checkpoint line above. Both the
   `run discard` help and its confirmation prompt name this; fetch the ref first if you
   might still need it.
@@ -1432,7 +1434,7 @@ uzi copies a failed run's last **published** checkpoint to a run-scoped ref,
 (if the removal keeps failing, uzi stops trying and `SALVAGE_ERROR` names the ref that may
 remain).
 The copy is only what the run had checkpointed to the forge, so it may be behind the
-run's final local work. Salvage never moves or deletes the branch's own checkpoint ref.
+run's final local work. Salvage never moves or deletes the run's checkpoint ref.
 
 `uzi run get` on a failed run with a salvage record prints a `SALVAGE` block: the state
 with a one-line explanation, then `SALVAGE_REF`, `SALVAGE_TIP` (short), `SALVAGE_EXPIRES`

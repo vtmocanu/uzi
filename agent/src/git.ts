@@ -1890,7 +1890,7 @@ export interface CheckpointOverlayContext {
   cloneUrl?: string;
   /** The forge bot username for HTTP Basic auth. */
   username?: string;
-  /** The current tip of `refs/uzi-checkpoints/<branch>` as the run last knows it. When a
+  /** The current tip of `refs/uzi-checkpoints/<checkpoint-key>` as the run last knows it. When a
    *  40-hex value, it becomes the overlay's FIRST parent (base-first) so a second sequential
    *  overlay strictly descends the prior one and the broker accepts it as a fast-forward. */
   prevCheckpointTip?: string;
@@ -1984,7 +1984,7 @@ export interface RunnerClone {
    *  the recovered commit count, `"default"` on a RESUME admits the tree was lost.
    *
    *  PRD #122 M8 adds `"checkpoint"`: on a NOT-ownedHere leg (cross-worker / fresh)
-   *  the base came from origin's mirrored `refs/uzi-checkpoints/<branch>` — a DIFFERENT
+   *  the base came from origin's mirrored `refs/uzi-checkpoints/<checkpoint-key>` — a DIFFERENT
    *  worker's brokered checkpoint that strictly descends the floor (origin branch, else
    *  default). It is a resume leg like `"tracking"`, so priorCommits counts the recovered
    *  commits. */
@@ -3147,7 +3147,7 @@ export class GitCache {
    *     moved far past the fork point, which is exactly the case a uniform ancestor
    *     test discards the recovered work on).
    *
-   * PRD #122 M8 adds a FOURTH candidate, `refs/uzi-checkpoints/<branch>`, the CROSS-WORKER
+   * PRD #122 M8 adds a FOURTH candidate, `refs/uzi-checkpoints/<checkpoint-key>`, the CROSS-WORKER
    * signal path: a DIFFERENT worker brokered its checkpoint to origin (M8 publish), and
    * `fetch()` mirrored origin's checkpoint refs into this bare. It matters ONLY on the
    * NOT-ownedHere legs — when THIS run owns the local tracking ref, that ref is
@@ -10013,7 +10013,7 @@ export class GitCache {
    * GH013 backstop to fail open to).
    *
    * Park/shutdown/pause/capture publishes are NOT scanned by design: the api pushes them UNSCANNED
-   * to the forge's refs/uzi-checkpoints/<branch> (Service.Publish in
+   * to the forge's refs/uzi-checkpoints/<checkpoint-key> (Service.Publish in
    * api/internal/workersvc/service.go) — they are the run's last chance to be durable, and a blocked or slow scan
    * there would lose the work outright. This scan guards the frequent mid-run stream only, plus
    * the ONE scanned exception: an eligible terminal run's held publication (issues #2545/#3030), which uploads
@@ -14890,7 +14890,7 @@ try {
     await this.tryGit(barePath, ["remote", "set-head", "origin", "--auto"]);
     // PRD #122 M8 — mirror origin's brokered checkpoint refs into the bare, BEST-EFFORT.
     // This is the CROSS-WORKER signal path: a worker with no local refs/uzi-runner/<branch>
-    // can still pull ANOTHER worker's published refs/uzi-checkpoints/<branch> and seed off
+    // can still pull ANOTHER worker's published refs/uzi-checkpoints/<checkpoint-key> and seed off
     // it (runnerCloneForBranch's checkpoint candidate). Rides the authenticated fetch (the
     // PAT is available here). Tolerates absence — origin may carry no such refs (fetch
     // succeeds fetching nothing), and the `.catch` covers an older server or a permission
@@ -15205,7 +15205,7 @@ try {
       // equal trees do NOT imply equal histories, so a GENUINE divergent sibling C (e.g. a real
       // checkpoint commit that does NOT descend from H) whose tree coincidentally equals H's would be
       // dropped, and C's lineage would silently stop being an ancestor of B (degrading cross-worker
-      // `refs/uzi-checkpoints/<branch>` recovery).
+      // `refs/uzi-checkpoints/<checkpoint-key>` recovery).
       //
       // Detect TRUE idempotency instead: an additional floor f (index > 0) that is ALREADY a valid
       // bridge of H over every other floor needs no new commit. f qualifies iff ALL hold — H is an
@@ -19056,7 +19056,7 @@ export const WIP_PARK_COMMIT_PREFIX = "wip(park):" as const;
 
 /**
  * PRD #1062 M2 (#1036) — the commit-subject prefix that marks a `.github/workflows` overlay
- * transport wrapper on `refs/uzi-checkpoints/<branch>`. `checkpointPack` prefixes the synthetic
+ * transport wrapper on `refs/uzi-checkpoints/<checkpoint-key>`. `checkpointPack` prefixes the synthetic
  * wrapper's subject with it; adoption (`runnerCloneForBranch` via `isOverlayMarker`) recognises
  * it and peels the wrapper (discard its swapped `.github` tree, re-point to its last parent =
  * realTip) BEFORE the wip-park soft-reset. Exported so the agent Contract-B tests reference the
