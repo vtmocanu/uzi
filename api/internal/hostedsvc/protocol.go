@@ -55,7 +55,7 @@ type DesiredWorker struct {
 	// (Decision 7). Always set — a hosted row cannot exist without one
 	// (ck_workers_hosted_metadata).
 	Template string `json:"template"`
-	// Size is the S/M/L preset name, resolved to cpu/memory/PVC size by the
+	// Size is the preset name (s/m/l/l-highmem), resolved to cpu/memory/PVC size by the
 	// controller against its own copy of the preset constants. The api sends the
 	// NAME, not the resolved quantities: presets are code constants on both
 	// sides, and shipping resolved values would make the api the authority on a

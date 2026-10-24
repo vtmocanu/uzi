@@ -20,6 +20,8 @@ func TestRenderCPUSlots(t *testing.T) {
 		"s": {"250m", "1"},
 		"m": {"1", "4"},
 		"l": {"1", "4"},
+
+		"l-highmem": {"1", "4"},
 	}
 	for _, size := range sizes {
 		cpu, ok := expected[size]

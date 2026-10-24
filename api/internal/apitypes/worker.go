@@ -12,7 +12,7 @@ type WorkerDTO struct {
 	Name       string          `json:"name"`
 	Status     string          `json:"status"`
 	// Kind is "external" (a worker its owner runs by hand) or "hosted" (one the
-	// controller runs in the cluster, PRD #58). HostedSize is the S/M/L preset name,
+	// controller runs in the cluster, PRD #58). HostedSize is the preset name (s/m/l/l-highmem),
 	// null for an external worker. Together they are what lets the UI mark hosted
 	// rows (Decision 10: status stays heartbeat-driven for both kinds).
 	//

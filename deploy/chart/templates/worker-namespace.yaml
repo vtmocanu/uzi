@@ -83,11 +83,13 @@ metadata:
   requests.* key is counted but never enforced: a pod declaring nothing for it is
   admitted and contributes zero.
 
-  CPU and memory track the LARGEST size, `l` (the persistent default, ADR-2240;
+  CPU and memory are budgeted on `l` (the persistent default, ADR-2240;
   ephemeral workers default to the smaller `m`, #2412): 20 workers x 1 CPU
   = 20 CPU and 20 x 14Gi = 280Gi requested. Keep requests aligned with deployments
   x the default request, or admission caps the fleet below deployments (issue #1341).
-  ResourceQuotas are ceilings, not node-capacity reservations. STORAGE tracks `l`
+  ResourceQuotas are ceilings, not node-capacity reservations. `l-highmem` (24Gi
+  request, 32Gi limit) is deliberately not fleet-budgeted: it consumes more of this
+  shared budget. STORAGE tracks `l`
   too: 20 x (50Gi data + 20Gi nix) = 1400Gi of PVC. Requests follow render.go. The rendered-fleet regression
   checks CPU, memory and per-container LimitRange maxima.
 
@@ -121,7 +123,7 @@ spec:
   requests AND limits from its size preset, so these defaults should never apply —
   they exist for anything that reaches this namespace some other way.
 
-  `max` MUST stay >= the LARGEST preset's limits or the biggest preset stops being
+  `max` MUST stay >= the LARGEST preset's limits (l-highmem = 4 CPU / 32Gi) or the biggest preset stops being
   admissible, which would surface as a worker that provisions and never appears.
   There is deliberately NO `min`: it would have to sit below the seed
   initContainer's 100m/128Mi, and a min that low protects nothing while adding one

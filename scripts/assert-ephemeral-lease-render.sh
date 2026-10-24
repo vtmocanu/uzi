@@ -127,12 +127,13 @@ check_size "default size" "m"
 check_size "explicit small" "s" --set workers.ephemeralDefaultSize=s
 check_size "explicit large" "l" --set workers.ephemeralDefaultSize=l
 check_size "null secretEnv" "m" --set api.secretEnv=null
-for invalid in unknown M null ''; do
+check_size "explicit high-memory" "l-highmem" --set workers.ephemeralDefaultSize=l-highmem
+for invalid in unknown M L-HIGHMEM null ''; do
   if helm template uzi "$CHART" --set "workers.ephemeralDefaultSize=$invalid" > "$WORK/invalid.yaml" 2> "$WORK/invalid.err"; then
     echo "FAIL: invalid ephemeral size '$invalid' rendered successfully" >&2
     exit 1
   fi
-  if ! grep -qF 'workers.ephemeralDefaultSize must be one of s, m, l' "$WORK/invalid.err"; then
+  if ! grep -qF 'workers.ephemeralDefaultSize must be one of s, m, l, l-highmem' "$WORK/invalid.err"; then
     echo "BROKEN: render failed without the expected size validation diagnostic" >&2
     exit 2
   fi
@@ -147,4 +148,35 @@ if helm template uzi "$CHART" --set api.config.UZI_EPHEMERAL_DEFAULT_SIZE=l > "$
   exit 1
 fi
 grep -qF 'Set UZI_EPHEMERAL_DEFAULT_SIZE through workers.ephemeralDefaultSize, not api.config' "$WORK/config.err" || exit 2
-echo "OK: ephemeral size defaults to m, accepts s/l, tolerates null secretEnv and rejects invalid values and api.config/secretEnv duplicates"
+echo "OK: ephemeral size defaults to m, accepts s/l/l-highmem, tolerates null secretEnv and rejects invalid values and api.config/secretEnv duplicates"
+
+# Issue #3383: l-highmem's 32Gi memory limit must be admissible in every worker tier.
+# Render the three worker namespaces' LimitRanges with the full CI posture (docker tier
+# and isolated lane on) and assert each Container max is exactly 4 CPU / 32Gi. Exactly
+# three LimitRanges, so a tier silently dropping out is a BROKEN instrument, not a pass.
+helm template uzi "$CHART" -f "$SCRIPT_DIR/../deploy/values/ci-render.yaml" \
+  --show-only templates/worker-namespace.yaml \
+  --show-only templates/worker-docker-namespace.yaml \
+  --show-only templates/worker-isolated-namespace.yaml > "$WORK/limitranges.yaml"
+awk '
+  /^kind: LimitRange$/ { ranges++ }
+  /^    - type: / { in_container = ($3 == "Container"); in_max = 0 }
+  in_container && /^      max:$/ { in_max = 1; next }
+  in_container && in_max && /^        cpu:/ { c = $2; gsub(/"/, "", c) }
+  in_container && in_max && /^        memory:/ {
+    m = $2; gsub(/"/, "", m)
+    print c " " m
+    in_max = 0
+  }
+  END { print "ranges " ranges + 0 }
+' "$WORK/limitranges.yaml" > "$WORK/limitranges.out"
+if [ "$(grep -c '^ranges 3$' "$WORK/limitranges.out")" -ne 1 ]; then
+  echo "BROKEN: expected exactly 3 worker LimitRange documents (plain, docker, isolated), got: $(tail -n 1 "$WORK/limitranges.out")" >&2
+  exit 2
+fi
+if [ "$(grep -c '^4 32Gi$' "$WORK/limitranges.out")" -ne 3 ] || [ "$(wc -l < "$WORK/limitranges.out")" -ne 4 ]; then
+  echo "FAIL: every worker tier's Container LimitRange max must be exactly cpu 4 / memory 32Gi (l-highmem); got:" >&2
+  cat "$WORK/limitranges.out" >&2
+  exit 1
+fi
+echo "OK: all three worker LimitRanges admit l-highmem (Container max cpu 4 / memory 32Gi)"

@@ -82,27 +82,45 @@ func TestShippedLargeWorkerFleetFitsRequestQuotas(t *testing.T) {
 			cfg.IsolatedNamespace = "isolated-test"
 			cfg.FetcherURL = "https://fetcher.example.com"
 			for _, template := range preset.TemplateNames() {
+				// The per-container limitRange.max ceiling is a hard admission gate, so it
+				// holds for EVERY preset (including l-highmem), not just the budgeted one.
+				if len(preset.SizeNames()) == 0 {
+					t.Fatal("no preset sizes: the container max check would be vacuous")
+				}
+				for _, size := range preset.SizeNames() {
+					w := protocol.DesiredWorker{ID: "quota-test", Template: template, Size: size, Docker: tier.docker, Isolated: tier.isolated}
+					p := RenderDeployment(cfg, w, testSpec(t, template, size)).Spec.Template.Spec
+					all := append(append([]corev1.Container{}, p.Containers...), p.InitContainers...)
+					for _, dimension := range []struct {
+						name         corev1.ResourceName
+						containerMax string
+					}{
+						{corev1.ResourceCPU, tier.budget.Range.Max.CPU},
+						{corev1.ResourceMemory, tier.budget.Range.Max.Memory},
+					} {
+						max := chartQuantity(t, path, "limitRange.max", dimension.containerMax)
+						for _, container := range all {
+							limit := container.Resources.Limits[dimension.name]
+							if limit.Cmp(max) > 0 {
+								t.Errorf("%s/%s/%s container %s %s limit %s exceeds max %s", tier.name, template, size, container.Name, dimension.name, limit.String(), max.String())
+							}
+						}
+					}
+				}
+				// Quotas are shared budgets sized on `l`. The fleet arithmetic below is
+				// deliberately pinned to `l` and does NOT claim a whole fleet of l-highmem fits.
 				worker := protocol.DesiredWorker{ID: "quota-test", Template: template, Size: "l", Docker: tier.docker, Isolated: tier.isolated}
 				pod := RenderDeployment(cfg, worker, testSpec(t, template, "l")).Spec.Template.Spec
 				for _, dimension := range []struct {
-					name         corev1.ResourceName
-					ceiling      string
-					containerMax string
+					name    corev1.ResourceName
+					ceiling string
 				}{
-					{corev1.ResourceCPU, tier.budget.Quota.CPU, tier.budget.Range.Max.CPU},
-					{corev1.ResourceMemory, tier.budget.Quota.Memory, tier.budget.Range.Max.Memory},
+					{corev1.ResourceCPU, tier.budget.Quota.CPU},
+					{corev1.ResourceMemory, tier.budget.Quota.Memory},
 				} {
 					regular := resource.Quantity{}
 					for _, container := range pod.Containers {
 						regular.Add(container.Resources.Requests[dimension.name])
-					}
-					all := append(append([]corev1.Container{}, pod.Containers...), pod.InitContainers...)
-					max := chartQuantity(t, path, "limitRange.max", dimension.containerMax)
-					for _, container := range all {
-						limit := container.Resources.Limits[dimension.name]
-						if limit.Cmp(max) > 0 {
-							t.Errorf("%s/%s container %s %s limit %s exceeds max %s", tier.name, template, container.Name, dimension.name, limit.String(), max.String())
-						}
 					}
 					// Restartable init sidecars overlap later init containers and the apps.
 					// Admission uses max(apps + sidecars, each init + preceding sidecars).

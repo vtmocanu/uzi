@@ -116,6 +116,8 @@ func TestProvisionHostedWorkerValidatesTemplateAndSize(t *testing.T) {
 		// The UI upper-cases for display; the wire value is lowercase. An accepted
 		// "M" would be stored and sent, and never resolve on the controller side.
 		{"upper-case size", `{"template":"base","size":"M"}`},
+		{"upper-case high-memory size", `{"template":"base","size":"L-HIGHMEM"}`},
+		{"unknown high-memory spelling", `{"template":"base","size":"l_highmem"}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
