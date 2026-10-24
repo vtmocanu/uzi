@@ -505,7 +505,8 @@ describe("hash-attested maintenance WIP capture (W0-H)", { skip: process.platfor
       if (step !== "commit" || phase !== "dispatch" || visit !== 3) return;
       competing = f.gitIn("commit-tree", f.gitIn("rev-parse", "HEAD^{tree}").trim(), "-p", f.old, "-m", "competing writer").trim();
       f.gitIn("update-ref", BRANCH, competing, f.old);
-    } })), /update-ref --no-deref refs\/heads\/main .* failed: .*cannot lock ref 'refs\/heads\/main': is at .* but expected/);
+    // `s`: newer Git (2.55) prints a grafts deprecation hint line before the fatal CAS error.
+    } })), /update-ref --no-deref refs\/heads\/main .* failed: .*cannot lock ref 'refs\/heads\/main': is at .* but expected/s);
     assert.deepEqual(f.mutations(), ["write-tree", "commit-tree", "update-ref"], "the CAS was attempted");
     assert.match(competing, /^[0-9a-f]{40}$/);
     assert.equal(f.head(), competing, "the competing tip is kept");
