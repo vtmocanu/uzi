@@ -8,7 +8,8 @@ import { runInNewContext } from "node:vm";
 import test, { mock } from "node:test";
 import { fileURLToPath } from "node:url";
 import { publishAck, readControl, runProducer, validateControl, validatePaths } from "./calibration-producer.mjs";
-import { captureEventCounters, calibrationUnits, createCalibrationBrokers, expectedPrimaryExit, fixture, freshPostCleanupDwell, oomEventEvidence, plannedChargeClasses, projectFailedEvidence } from "./calibration-fixture.mjs";
+import { captureEventCounters, calibrationUnits, createCalibrationBrokers, expectedPrimaryExit, fixture, freshPostCleanupDwell, guardFacingSample, hardCrossing, oomEventEvidence, pinGuardPressure, plannedChargeClasses, projectFailedEvidence } from "./calibration-fixture.mjs";
+import { WorkerMemoryGuard } from "../../agent/src/worker-memory-guard.js";
 import { ExecutionRegistry, newLocalExecutionEpoch } from "../../agent/src/codex/registry.js";
 import { boundedCommandWait } from "../../agent/src/codex/memory-command.js";
 import type { SpawnCommandResult } from "../../agent/src/codex/broker.js";
@@ -399,4 +400,47 @@ test("parallel proof children accept only the exact existing scratch symlink", a
   assert.throws(() => runInNewContext(script, { ...context,
     symlinkSync: () => { throw Object.assign(new Error("permission denied"), { code: "EACCES" }); },
   }), /permission denied/);
+});
+
+// Samples 7-9 of the 1 GiB leg that failed on main 81f0318e (CI run 40012571860, #3363).
+function observedLeg() {
+  const limitBytes = 1024 ** 3, high = 283_803_648;
+  const psi = (total: number) => ({ some: { avg10: 0, avg60: 0, avg300: 0, total }, full: { avg10: 0, avg60: 0, avg300: 0, total } });
+  const at = (sampleId: number, currentBytes: number, total: number) => ({
+    available: true as const, sampleId, startedAtMs: sampleId * 250, completedAtMs: sampleId * 250 + 1, currentBytes, limitBytes,
+    stat: { anon: currentBytes, shmem: 0, slab_unreclaimable: 0, unevictable: 0 }, pressure: psi(total) });
+  const guard = new WorkerMemoryGuard({ enabled: true, reserveBytes: limitBytes - high, hysteresisBytes: 8 * 1024 ** 2,
+    sampleMs: 250, responseBudgetMs: 5000, rearmMs: 500, maxInterventions: 2 });
+  return { high, guard, s7: at(7, 251_277_312, 0), s8: at(8, 271_241_216, 1400), drained: at(9, 145_920_000, 1400),
+    crossing: at(9, 290_000_000, 2800) };
+}
+
+test("unpinned guard PSI intervenes early and leaves no hard crossing to measure", () => {
+  const { high, guard, s7, s8, drained } = observedLeg();
+  assert.equal(guard.evaluate(s7, s7.completedAtMs).kind, "idle");
+  assert.equal(guard.evaluate(s8, s8.completedAtMs).kind, "early");
+  assert.throws(() => hardCrossing([s7, s8, drained], high), /real hard crossing required; early PSI cannot replace it/);
+});
+
+test("guard-facing PSI pinned to the first load sample waits for the sampled hard crossing", () => {
+  const { high, guard, s7, s8, crossing } = observedLeg();
+  const pin = pinGuardPressure(s7);
+  assert.deepEqual(pin, { mode: "pinned_to_first_load_sample", sampleId: 7, pressure: s7.pressure });
+  assert.equal(guard.evaluate(guardFacingSample(s7, pin), s7.completedAtMs).kind, "idle");
+  assert.equal(guard.evaluate(guardFacingSample(s8, pin), s8.completedAtMs).kind, "idle");
+  assert.equal(guard.evaluate(guardFacingSample(crossing, pin), crossing.completedAtMs).kind, "hard");
+  assert.deepEqual(hardCrossing([s7, s8, crossing], high), { low: s8, above: crossing });
+});
+
+test("guard-facing copies leave the recorded samples and the pin unchanged", () => {
+  const { s7, s8 } = observedLeg();
+  const pin = pinGuardPressure(s7);
+  const recorded = structuredClone(s8), pinned = structuredClone(pin);
+  const facing = guardFacingSample(s8, pin);
+  assert.deepEqual(s8, recorded, "recorded sample unchanged");
+  assert.deepEqual(facing, { ...recorded, pressure: s7.pressure });
+  facing.stat.anon = 0; facing.pressure.full.total = 99; facing.pressure.some.total = 99;
+  s7.pressure.full.total = 77;
+  assert.deepEqual(s8, recorded, "guard-facing copy shares no nested object with the sample");
+  assert.deepEqual(pin, pinned, "pin shares no nested object with its source or the guard-facing copy");
 });

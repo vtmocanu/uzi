@@ -160,6 +160,25 @@ export function projectFailedEvidence(facts: {
     cleanup: { confirmed: null, startMs: facts.cleanupStart ?? null, endMs: facts.cleanupEnd ?? null },
   };
 }
+// The guard's early branch (growing full PSI projecting a crossing) can drain the load
+// before any sample reaches H, which leaves no hard crossing to measure (#3363). Hard-path
+// legs therefore hand the guard each measured sample with PSI pinned to the first load
+// sample's values; memory charges and every recorded sample stay measured.
+export type GuardPressurePin = { mode: "pinned_to_first_load_sample"; sampleId: number; pressure: Available["pressure"] };
+export function pinGuardPressure(first: Available): GuardPressurePin {
+  return { mode: "pinned_to_first_load_sample", sampleId: first.sampleId,
+    pressure: { some: { ...first.pressure.some }, full: { ...first.pressure.full } } };
+}
+export function guardFacingSample(value: Available, pin: GuardPressurePin): Available {
+  return { ...value, stat: { ...value.stat },
+    pressure: { some: { ...pin.pressure.some }, full: { ...pin.pressure.full } } };
+}
+export function hardCrossing<T extends { currentBytes: number }>(samples: readonly T[], high: number): { low: T; above: T } {
+  const index = samples.findIndex((s) => s.currentBytes >= high);
+  const low = samples[index - 1], above = samples[index];
+  assert.ok(index > 0 && low && above, "real hard crossing required; early PSI cannot replace it");
+  return { low, above };
+}
 // Bounded by MAX_SAMPLES at the caller. Invalid evidence refuses completion;
 // a high sample resets dwell, while a gap rejects the remaining contiguous run.
 export function freshPostCleanupDwell(samples: Sample[], cleanupEnd: number, atMs: number, guard: {
@@ -199,7 +218,7 @@ export async function fixture(manifestFile: string, fixtureId: string) {
   const report: Record<string, unknown> = {
     schemaVersion: 1, ...manifest.identity, ...expected, provenance: "measured",
     status: "FAILED", reasons: [], observed: null, guard: null, plan: null,
-    units: calibrationUnits, plannedChargeClasses: null, oomEvents: null, rawSamples: [], finalCleanup: null,
+    units: calibrationUnits, plannedChargeClasses: null, oomEvents: null, rawSamples: [], guardPressure: null, finalCleanup: null,
     samplingSchedule: { periodMs: 250, anchorMs: null, rows: [], maxPositiveLatenessMs: null, maxAbsoluteJitterMs: null },
     baseline: [], samples: [], response: null, derivation: null, trees: [],
     settlement: null, cleanup: null, outcome: { status: "failed", reasons: ["not settled"] },
@@ -211,6 +230,7 @@ export async function fixture(manifestFile: string, fixtureId: string) {
   const reasons: string[] = [];
   const rawSamples: { sample: Sample; raw: Record<string, string | null>; events: Record<string, number> | null }[] = [];
   const baseline: Available[] = [], samples: Available[] = [];
+  let guardPressure: GuardPressurePin | undefined;
   const schedulingObservations: CalibrationSchedulingObservation[] = [];
   let schedulingAnchor: number | null = null;
   let samplingSchedule: ReturnType<typeof calibrationSchedulingReport> | undefined;
@@ -507,7 +527,8 @@ export async function fixture(manifestFile: string, fixtureId: string) {
       sample: () => {
         const value = sample(); samples.push(value);
         if (value.currentBytes + plan.overheadBytes > plan.ceilingBytes) throw new Error("safety ceiling reached");
-        return value;
+        guardPressure ??= pinGuardPressure(value);
+        return guardFacingSample(value, guardPressure);
       },
       reserve: async (input, signal) => {
         const index = entries.findIndex((entry) => commands.outcome(entry) !== undefined);
@@ -550,9 +571,7 @@ export async function fixture(manifestFile: string, fixtureId: string) {
     const outcomes = acknowledgements.filter((item) => item.path === "/outcome");
     assert.equal(ack.length, 1); assert.equal(outcomes.length, 1);
     assert.equal(outcomes[0]!.ack.outcome, "confirmed_drained");
-    const highIndex = samples.findIndex((s) => s.currentBytes >= high);
-    const low = samples[highIndex - 1], above = samples[highIndex];
-    assert.ok(low && above, "real hard crossing required; early PSI cannot replace it");
+    const { low, above } = hardCrossing(samples, high);
     const observe = observations.find((o) => o.index === selected && o.startMs >= above.completedAtMs);
     const signal = signalWrites.filter((s) => s.index === selected);
     const disposal = disposals.find((d) => d.index === selected);
@@ -615,6 +634,7 @@ export async function fixture(manifestFile: string, fixtureId: string) {
       clean: cleaned.map((r) => r.status === "fulfilled" ? r.value : { unknown: true, failure: String(r.reason) }),
       joined: joined.map((r) => r.status), driverCompleted };
     report.baseline = baseline; report.samples = samples; report.rawSamples = rawSamples;
+    report.guardPressure = guardPressure ?? null;
     const oomEvents = oomEventEvidence(rawSamples);
     report.oomEvents = oomEvents;
     if (oomEvents && Object.values(oomEvents.delta).some((v) => v !== null && v < 0)) {
