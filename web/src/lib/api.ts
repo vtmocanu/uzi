@@ -1120,6 +1120,10 @@ const realApi = {
       template,
     }),
   deleteWorker: (id: string) => request<null>("DELETE", `/workers/${id}`),
+  cordonWorker: (id: string, reason?: string) =>
+    request<{ worker: Worker }>("POST", `/workers/${id}/cordon`, { reason }),
+  uncordonWorker: (id: string) =>
+    request<{ worker: Worker }>("DELETE", `/workers/${id}/cordon`),
   // Point a worker at one of the caller's named tokens, or clear the binding with
   // null so it falls back to the default (PRD #104 M3). Takes a LABEL, not an id —
   // the name is what a human picks. Lands on the worker's NEXT claim: no restart,

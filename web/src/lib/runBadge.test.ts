@@ -32,6 +32,21 @@ import { credentialSwitchHold } from "./credentialSwitchHold";
 import { isTerminalRun, TERMINAL_RUN_STATUSES } from "./runStatus";
 import type { LatestRun, Run, RunStatus, StopKind } from "./api";
 
+it("preserves manual health attribution in a sanitized cell title without changing failure text", () => {
+  const reason = "waiting for workers cordoned (manual): Ada\u001b[31m\u001b[0m (uuid) 2026-10-21T12:00:00Z\n\t\u001b]0;hidden\u0007<b>disk</b>\u202e 🚀";
+  const flagged = run({ status: "queued", health: "waiting_worker", health_reason: reason });
+  const b = healthBadge(flagged, 0);
+  expect(b?.kind === "badge" && b.title).toBe(
+    "waiting for workers cordoned (manual): Ada (uuid) 2026-10-21T12:00:00Z<b>disk</b> 🚀",
+  );
+  const card = runBadge(flagged, 0);
+  expect(card.kind === "badge" && card.title).toBe(b?.kind === "badge" && b.title);
+  const failure = runBadge(run({ status: "failed", failure_reason: "first\n\tsecond" }), 0);
+  expect(failure.kind === "badge" && failure.title).toBe("first\n\tsecond");
+  const hostile = healthBadge({ ...flagged, health_reason: {} as string }, 0);
+  expect(hostile?.kind === "badge" && hostile.title).toBeUndefined();
+});
+
 it("provider hold badge uses projection hold reason without a retry promise", () => {
   const badge = runBadge(run({ status: "paused", hold_reason: "provider_unavailable" }), 0);
   expect(badge).toMatchObject({ label: "provider unavailable: owner hold", tone: "warning", pulse: false });

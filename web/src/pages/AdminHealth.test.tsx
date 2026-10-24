@@ -599,6 +599,30 @@ async function fleetRow(name: string): Promise<HTMLElement> {
   return tr;
 }
 
+it("keeps offline fleet manual attribution beside automatic fences and blocking details, read-only", async () => {
+  await renderHealth(healthySilentDoc(), [fleetWorker({
+    name: "manual-fleet", status: "offline", retaining_unpublished_work: true,
+    draining_since: "2026-10-20T12:00:00Z", active_runs: 1,
+    manual_cordoned_at: "2026-10-21T12:00:00Z",
+    manual_cordoned_by: "actor-id", manual_cordoned_by_label: "\u001b[31mAda\u001b[0m\u202e",
+    manual_cordon_reason: "check\n\t<b>disk</b>\u001b]0;hidden\u0007",
+    upgrade_status: "upgrade_failed", upgrade_detail: "roll blocked",
+    upgrade_blocking_container: "worker", upgrade_blocking_reason: "ImagePullBackOff",
+  })]);
+  const row = await fleetRow("manual-fleet");
+  expect(within(row).getByText("draining")).toBeTruthy();
+  expect(within(row).getByText("cordoned (manual)").title).toBe(
+    "Cordoned (manual) — Ada · 2026-10-21T12:00:00Z · check<b>disk</b>",
+  );
+  expect(within(row).getByTitle("Ada").textContent).toBe("Ada");
+  expect(within(row).getByTitle("check<b>disk</b>").textContent).toBe("Reason: check<b>disk</b>");
+  expect(row.querySelector("time")?.getAttribute("datetime")).toBe("2026-10-21T12:00:00.000Z");
+  expect(within(row).getByText("worker: ImagePullBackOff")).toBeTruthy();
+  expect(within(row).getByText("roll blocked")).toBeTruthy();
+  expect(row.querySelectorAll("button, input")).toHaveLength(0);
+  expect(row.querySelector("b")).toBeNull();
+});
+
 describe("AdminHealth — Fleet card (M5)", () => {
   it.each(["up_to_date", "upgrading", "unknown", "upgrade_failed"] as const)(
     "shows sanitized draining detail as text alongside failures for %s", async (status) => {

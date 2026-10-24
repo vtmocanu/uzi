@@ -17,6 +17,7 @@ import { HostedWorkers } from "../components/HostedWorkers";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
 import { WorkerPendingOutcomeBadge } from "../components/WorkerPendingOutcomeBadge";
 import { WorkerCordonBadge } from "../components/WorkerCordonBadge";
+import { WorkerCordonMetadata } from "../components/WorkerCordonMetadata";
 import { WorkerMemoryAuthorityBadge } from "../components/WorkerMemoryAuthorityBadge";
 import { WorkerQuarantineBadge } from "../components/WorkerQuarantineBadge";
 import { WorkerLeaseBadge } from "../components/WorkerLeaseBadge";
@@ -727,6 +728,8 @@ export function WorkersSettings() {
                       <WorkerCustodyBadge worker={w} />
                     </div>
                   </div>
+
+                  <WorkerCordonMetadata worker={w} />
 
                   {/* Meta line — full width */}
                   <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-faint">
