@@ -1013,6 +1013,27 @@ describe("#2852 terminal disposal evidence", () => {
     });
   }
 
+  for (const faultAfterCapture of [false, true]) {
+    it(`completed capture after prior poison attests only terminal cleanup; later fault=${faultAfterCapture}`, async () => {
+      const reg = new ExecutionRegistry(newLocalExecutionEpoch(2852));
+      registerRoot(reg, new FakeRoot("provider"));
+      reg.poison({ category: "authorization", message: "credential unavailable" });
+      const lane = reg.beginCapture(await reg.settleForCapture(DEADLINE));
+      const capture = lane.complete();
+      assert.ok(capture);
+      lane.close();
+      assert.equal(reg.acceptsCompletedCapture(capture), false, "prior poison still refuses in-run continuation");
+      if (faultAfterCapture) reg.poison({ category: "protocol", message: "new uncertainty" });
+      const before = [reg.cleanupPoisonRevision, reg.rootCount(), reg.launchAdmissionCursor(), reg.callbackAdmissionCursor()];
+      const disposal = await reg.disposeTools(DEADLINE);
+      assert.equal(disposal.kind, faultAfterCapture ? "incomplete" : "disposed");
+      assert.equal(reg.acceptsTerminalDisposal(disposal), !faultAfterCapture);
+      assert.equal(reg.acceptsCompletedCapture(capture), false, "terminal disposal never grants continuation");
+      if (!faultAfterCapture)
+        assert.deepEqual([reg.cleanupPoisonRevision, reg.rootCount(), reg.launchAdmissionCursor(), reg.callbackAdmissionCursor()], before);
+    });
+  }
+
   it("clean capture evidence survives disposal without changing revision or cursors", async () => {
     const reg = new ExecutionRegistry(newLocalExecutionEpoch(2852));
     registerRoot(reg, new FakeRoot("provider"));

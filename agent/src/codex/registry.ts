@@ -227,6 +227,7 @@ export class ExecutionRegistry {
   private readonly completedCaptures = new WeakMap<object, {
     revision: object; roots: number; launches: number; callbacks: number; continuation: boolean;
   }>();
+  private completedCaptureForDisposal?: object;
   private readonly captureObservations = new WeakMap<object, object>();
   // STICKY poison witness. `state()` reports "poisoned" only until disposal masks
   // it as "disposed" (poison then survives ONLY in poisonList); this flag is set on
@@ -409,6 +410,9 @@ export class ExecutionRegistry {
         this.completedCaptures.set(proof, { revision, roots: this.roots.length,
           launches: this.launchSeq, callbacks: this.callbackAdmissionSequence,
           continuation: this.capturePoisonRevision === revision });
+        // Terminal cleanup may consume a completed A capture even when an earlier
+        // authorization refusal poisoned this epoch. This never grants continuation.
+        this.completedCaptureForDisposal = proof;
         return proof;
       },
       close: () => { if (this.captureLane === lane) this.captureLane = undefined; },
@@ -900,8 +904,12 @@ export class ExecutionRegistry {
     const launches = this.launchSeq;
     const callbacks = this.callbackAdmissionSequence;
     const errors: HarnessError[] = [];
+    const capture = this.completedCaptureForDisposal === undefined ? undefined
+      : this.completedCaptures.get(this.completedCaptureForDisposal);
+    const captured = capture?.revision === revision && capture.roots === roots &&
+      capture.launches === launches && capture.callbacks === callbacks;
     const eligible = (this.currentState === "closed" ||
-      (this.currentState === "poisoned" && this.capturePoisonRevision === revision)) &&
+      (this.currentState === "poisoned" && (this.capturePoisonRevision === revision || captured))) &&
       !this.captureLane && this.launches.size === 0 && this.inFlightCallbackCount() === 0 &&
       !this.launchCleanupUnconfirmed && this.roots.every(rec => rec.reaped);
     if (!eligible) {
