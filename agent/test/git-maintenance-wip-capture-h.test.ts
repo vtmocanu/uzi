@@ -712,8 +712,9 @@ describe("hash-attested maintenance WIP capture (W0-H)", { skip: process.platfor
       const script = request.argv[1] === "-e" ? request.argv[2] ?? "" : "";
       if (!script.startsWith("// uzi-wip-payload")) return undefined;
       if (replace) {
-        fsSync.rmSync(target);
-        fsSync.writeFileSync(target, "CHANGED");
+        // Created while the original still exists, then renamed over it: never a reused inode.
+        fsSync.writeFileSync(target + ".replacement", "CHANGED");
+        fsSync.renameSync(target + ".replacement", target);
         replacement = fsSync.statSync(target, { bigint: true }).ino.toString();
       }
       return `process.argv = [process.argv[0], ...${JSON.stringify(request.argv.slice(3))}];
