@@ -33,7 +33,12 @@ const IDENT = ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsig
 beforeEach(() => {
   newApi(); api.checkedTransport = true;
   api.usageHandler = () => ({ status: 200, body: {} });
-  git.capturePlanningDiff = async () => Buffer.from("");
+  git.capturePlanningDiff = async (clone, base, bare) => {
+    assert.ok(bare, "runner forwards explicit worker bare authority");
+    assert.match(base, /^[a-f0-9]{40}$/);
+    assert.ok(clone);
+    return Buffer.from("");
+  };
   fs.mkdirSync(path.join(fx.originPath, "prds"));
   fs.writeFileSync(path.join(fx.originPath, PRD), PRD_V1);
   gitIn(fx.originPath, ["add", "."]);

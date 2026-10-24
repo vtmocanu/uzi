@@ -294,6 +294,14 @@ func TestProviderHoldTypedCopyAndStopEligibility(t *testing.T) {
 				}
 				return
 			}
+			_, rootSection := blockSummary(blocks)
+			_, threadSection := blockSummary(thread)
+			if strings.Contains(rootSection, "‖ *Paused*") || strings.Contains(threadSection, "‖ *Paused*") {
+				t.Fatalf("provider hold must not use the ordinary pause header: root=%q thread=%q", rootSection, threadSection)
+			}
+			if strings.HasPrefix(fallback, "Paused · ") || strings.HasPrefix(tfallback, "Paused · ") {
+				t.Fatalf("provider hold must not use the ordinary pause fallback: root=%q thread=%q", fallback, tfallback)
+			}
 			for _, want := range []string{"Needs your attention", "provider unavailable", "Resume", "Cancel", "worker or a verified recovery capture"} {
 				if !strings.Contains(copy, want) {
 					t.Fatalf("missing %q: %s", want, copy)

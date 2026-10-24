@@ -188,7 +188,24 @@ func TestPolicySemanticSourceCheckedAcceptanceLiveDB(t *testing.T) {
 			req := semanticPolicySourceReport(t, c)
 			if human {
 				req.SemanticPark = strPtr(semanticParkMaintainerAuth)
+				publicationHistory := semanticPublicationHistory(t, e, c.run, next.ID)
+				if next.InterruptedAt.Valid {
+					t.Fatal("checker was interrupted before publication")
+				}
 				gate := presentSemanticGate(t, c, req)
+				if semanticPublicationHistory(t, e, c.run, next.ID) != publicationHistory {
+					t.Fatal("gate publication rewrote immutable feedback history")
+				}
+				published, err := e.q.GetPolicyStopCrossCheck(e.ctx, next.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !published.InterruptedAt.Valid || !published.InterruptedAt.Time.Equal(mustRun(t, e, c.run).StatusSince.Time) {
+					t.Fatal("gate publication did not stamp checker interruption at the state transition")
+				}
+				// Compare every history field across enqueue, ACK and acceptance,
+				// after settle_exited_plan_cross_check stamps interrupted_at.
+				history = acceptanceHistory(t, e, c.run)
 				approval, err := semanticGateApprove(c, f.userID, gate, nil)
 				if err != nil {
 					t.Fatal(err)
@@ -218,6 +235,21 @@ func TestPolicySemanticSourceCheckedAcceptanceLiveDB(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Gate publication may stamp only the current checker's interrupted_at through
+// settle_exited_plan_cross_check. Retain every other field, including complete
+// original bodies, findings and provenance, across that lifecycle transition.
+func semanticPublicationHistory(t *testing.T, e codexTestEnv, run, current uuid.UUID) string {
+	t.Helper()
+	var value string
+	if err := e.pool.QueryRow(e.ctx, `SELECT jsonb_build_array(
+ (SELECT jsonb_agg(to_jsonb(i) ORDER BY id) FROM run_user_inputs i WHERE run_id=$1 AND kind='revise_plan'),
+ (SELECT jsonb_agg(CASE WHEN c.id=$2 THEN to_jsonb(c)-'interrupted_at' ELSE to_jsonb(c) END ORDER BY id)
+  FROM cross_checks c WHERE lead_run_id=$1))::text`, run, current).Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	return value
 }
 
 func TestPolicySemanticSourceTakenAndRecoveryLiveDB(t *testing.T) {

@@ -78,11 +78,12 @@ limits. Final composed-lane timing and real-cgroup calibration remain M5b work.
 Before execution, the locked TypeScript parser derives the leaf inventory from
 the current source. The four ownership/cleanup files must each contain their
 recognized UID gate and at least one leaf. The fifth file,
-`agent/test/git-planning-diff.test.ts`, contributes exactly nine literal leaves
-inside the exact `Unit2 runner source capture` suite: two snapshot-copy
-cancellation leaves and seven symlink capture/refusal leaves. The suite itself
-is not targeted: generated titles, the command sandbox leaf, other capture
-leaves and the bounded stdout suite stay excluded. Missing or changed required
+`agent/test/git-planning-diff.test.ts`, contributes exactly twelve literal leaves
+inside the exact `Unit2 runner source capture` suite: two worktree cancellation
+leaves, seven symlink capture/refusal leaves, two trusted-bare read proofs under
+distinct worker/runner UIDs, and the enforced read-only command sandbox leaf.
+The suite itself is not targeted: generated titles, other capture leaves and
+the bounded stdout suite stay excluded. Missing or changed required
 titles, nonliteral replacements and duplicate identities fail closed. Targeted
 tests must use literal titles and static `it` / `describe` declarations. The command
 inventory also recognizes explicit `test(...)` in the `.mts` fixture and requires
@@ -208,7 +209,7 @@ The required task runs the scoped typecheck and inventory regression through
 
 Selection uses escaped, anchored full leaf names from that inventory. Any extra
 executed leaf fails; unrelated leaves may only be absent or skipped. The normal
-host shards continue to own the other tests in these files. This nine-leaf
+host shards continue to own the other tests in these files. This twelve-leaf
 selection proves only the selected capture behavior under the worker UID;
 acceptance of the full capture suite remains a separate full-capture run.
 
