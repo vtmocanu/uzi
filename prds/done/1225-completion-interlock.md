@@ -1,7 +1,7 @@
 # Epic PRD #1225: Completion interlock with same-run rework and durable holds
 
 **Issue:** [#1225](https://github.com/vtmocanu/uzi/issues/1225)
-**Status:** Closed 2026-10-23: structural interlock delivered; semantic auditing not shipped (#1231 and #1233 closed not planned, #1228 detached and parked, #1229 not planned). Delivers structural containment, owner decisions and recoverable holds on both harnesses, preserving Git while provider-context continuity remains same-worker only. Close-out evidence: #1232.
+**Status:** Closed 2026-10-23: structural interlock delivered; semantic auditing not shipped (#1231 and #1233 closed not planned, #1228 detached and parked, #1229 not planned). Delivers structural containment, owner decisions and recoverable holds on both harnesses, preserving Git while provider-context continuity remains same-worker only. Close-out evidence: #1232 (M1, M2 and records; its M3 mutation audit was not run and is still owed).
 **Priority:** Normal (current issue taxonomy).
 **Origin:** Review of [PR #1220](https://github.com/vtmocanu/uzi/pull/1220) and run `b0ffd0ea` on 2026-09-09.
 **Execution:** None. The epic is closed; never add `uzi`.
@@ -14,7 +14,7 @@ The original pre-#1226 failure trusted the lead's subset declaration: a worker c
 
 PR #1220 proved the failure: its run froze `m1..m5`, declared `m1..m4`, used only 8 of 25 iterations, had no scope cap, contradicted its own PRD on M3/M5, and still opened a closing PR. This is a lifecycle bug, not a prompt-quality problem.
 
-The final product rejects an incomplete completion attempt without failing the run or losing its work. It checkpoints Git and provider context, returns exact missing requirements to the same lead session while progress continues, and parks recoverably for owner action after bounded no progress. A closing PR for an interlocked issue run requires a profile-appropriate server permit bound to the exact final head: structural for structural-profile runs, independently audited semantic for semantic-profile runs.
+The final product rejects an incomplete completion attempt without failing the run or losing its work. It checkpoints Git and provider context, returns exact missing requirements to the same lead session while progress continues, and parks recoverably for owner action after bounded no progress. A closing PR for an interlocked issue run requires a profile-appropriate server permit bound to the exact final head: structural for structural-profile runs, independently audited semantic for semantic-profile runs (the semantic part was not delivered; every real run is structural or legacy).
 
 > Reject the completion attempt, not the run. Fail closed on publication and completion, preserve the work, and rework with the same lead by default.
 
@@ -29,7 +29,7 @@ The final product rejects an incomplete completion attempt without failing the r
 | 5 | [#1230 Semantic completion contract and plan coverage review](1230-semantic-completion-contract.md) | Dormant source-backed criteria, approval-point coverage and exact human-authorized maintainer acceptance (merged, dormant; m6 evidenced by PR #3356) | Shipped #1226/#1227; complete M4 also needs merged #3089 and corrected #3090 |
 | 6 | [#1231 Independent completion auditor and semantic permit](1231-completion-auditor.md) | Not planned (closed 2026-10-23): no supported credential path gives an enforceable whole-call bound for subscription credentials. Historical design: bounded exact-head audit, evidence capture and default-on semantic enrollment with instance-admin controls | Completed #1230 and its actual authority/publication seams |
 | 7 | [#1233 Structured completion blockers and governed MR rework](1233-structured-blockers-mr-rework.md) | Not planned (closed 2026-10-23, depends on #1231). Historical design: server-owned blocker dispositions and contract-governed automatic/manual rework | #1227 + #1230 + #1231 |
-| 8 | [#1232 Completion interlock integration, rollout and epic close-out](../1232-completion-interlock-integration.md) | Structural end-to-end and wire proof, mutation audit, records and epic close (no semantic rollout) | #1226, #1227, #1230 (#1228 detached; #1229, #1231 and #1233 not planned) |
+| 8 | [#1232 Completion interlock integration, rollout and epic close-out](../1232-completion-interlock-integration.md) | Structural end-to-end and wire proof, records and epic close (no semantic rollout); its mutation audit (M3) was not run and is still owed | #1226, #1227, #1230 (#1228 detached; #1229, #1231 and #1233 not planned) |
 
 Also delivered under this epic, outside the numbered sequence: [#1626](https://github.com/vtmocanu/uzi/issues/1626) (structural interlock default-on, admin kill-switch and same-branch guard) and [#1627 Codex completion interlock](1627-codex-completion-interlock.md) (the Codex harness).
 
@@ -69,11 +69,11 @@ These seams are fixed here so each merged child extends rather than replaces its
 - [x] #1230 merged for its dormant scope: dormant compiler/reviewer produce source-backed criteria under test, with coverage at exact approval decision points and exact human authority over maintainer exceptions; no repo setting or production calls. Owner check m6 is evidenced by PR #3356.
 - Not delivered: #1231 (new eligible issue runs use semantic enrollment by default, frozen instance-admin controls and hard capability routing). Closed not planned 2026-10-23.
 - Not delivered: #1233 (structured blocker policy gates completion and governed automatic/manual MR rework). Closed not planned 2026-10-23.
-- [x] #1232 merged: integrated structural lifecycle, wire and Codex-parity proof and the records close-out. Structural default-on shipped in #1626/#1627; no duplicate default flip or kill-switch removal. Semantic rollout and rollback proof does not apply because no semantic path was activated.
+- [ ] #1232: integrated structural lifecycle, wire and Codex-parity proof and the records close-out landed on its branch; its M3 mutation audit was not run (worker disk) and is still owed, so this row stays open until it lands. Structural default-on shipped in #1626/#1627; no duplicate default flip or kill-switch removal. Semantic rollout and rollback proof does not apply because no semantic path was activated.
 
 ## Hosted validation
 
-The hosted checks that were listed here as maintainer-operated post-merge validation are carried, unticked, in the acceptance ledger issue #3346 under a "#1225 completion interlock" heading. Live acceptance never keeps this PRD open, and nothing here claims those checks were performed.
+The hosted checks that were listed here as maintainer-operated post-merge validation are to be carried, unticked, into the acceptance ledger issue #3346 by the landing session under a "#1225 completion interlock" heading. Live acceptance never keeps this PRD open, and nothing here claims those checks were performed.
 
 ## Risks and durable decisions
 
@@ -83,7 +83,7 @@ The hosted checks that were listed here as maintainer-operated post-merge valida
 - A PAT-holding compromised worker remains outside scope; the hard claim clause addresses normal version skew.
 - Finalize-time base-align conflicts, non-fast-forward rejection and push-secret blocking retain their existing typed preserved-work behavior; this epic changes incomplete-completion handling, not every terminal finalization error.
 - A provider without a verified codec cannot be called cross-worker durable.
-- Moving the ADR-456 alignment block would be a large risky refactor; the children instead invalidate/recover semantic evidence on head drift.
+- Moving the ADR-456 alignment block would be a large risky refactor; the children instead invalidate/recover semantic evidence on head drift (semantic part not delivered).
 - No child may publish a partial closing PR because a later child is pending. Each PR states its own limited delivered behavior and leaves the epic open.
 
 ADR 1225 is created by #1226 and amended by later children. It records contract freeze, hard capability, permit/head binding, same-lead rejection, hold/capture order, owner authority, independent semantic audit and context-owner separation. `specs/human.md` received a narrow structural requirement in #1226; the semantic requirement planned for #1231 did not ship.
@@ -92,7 +92,7 @@ No `docs/ROADMAP.md` exists in the inspected checkout.
 
 ## Review record
 
-- 2026-10-24 (AI-synced): close-out by #1232. Structural interlock delivered on both harnesses and on by default; semantic completion auditing did not ship (#1231 and #1233 closed not planned 2026-10-23, no supported credential path gives an enforceable whole-call bound for subscription credentials). #1228 detached and parked, #1229 not planned, #1230 merged and dormant. Contracts 3, 10, 11 and 12 and the semantic acceptance rows are marked not delivered. Hosted checks moved to ledger issue #3346. PRD moved to `prds/done/`.
+- 2026-10-24 (AI-synced): close-out by #1232. Structural interlock delivered on both harnesses and on by default; semantic completion auditing did not ship (#1231 and #1233 closed not planned 2026-10-23, no supported credential path gives an enforceable whole-call bound for subscription credentials). #1228 detached and parked, #1229 not planned, #1230 merged and dormant. Contracts 3, 10, 11 and 12 and the semantic acceptance rows are marked not delivered. Hosted checks are to be appended to ledger issue #3346 at landing. #1232's M3 mutation audit was not run (worker disk). PRD moved to `prds/done/`.
 - 2026-10-17 (AI-synced, planned refresh): #1230/#1231 replace repo opt-in with default-on semantic enrollment and instance-admin controls, coverage only at exact approval points, and human-authorized pending maintainer acceptance. #3089/#3090 are unmerged integration gates, not shipped support. #1228 is no semantic technical prerequisite and #1229 stays not planned. Structural default-on already shipped; #1232 owns compatibility evidence, not another default flip. Historical opt-in decisions below are superseded in this planned design, not erased. No dispatch/live change; peer/independent review pending.
 
 - 2026-09-09: Initial combined PRD drafted after a three-round design discussion between the lead Codex session and `@brainstorm`.
