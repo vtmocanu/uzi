@@ -1,17 +1,70 @@
 import { needsAttention } from "../../components/WorkerUpgradeBadge";
-import type { BindMode } from "../../lib/api";
+import type { BindMode, Worker } from "../../lib/api";
+import { stripDisplayCell } from "../../lib/safeText";
 import { ApiError } from "../../lib/apiError";
 import { healthyFleetWorkers, incidentFleetWorkers, mockAdminWorkers, mockWorkers } from "../data";
 import { minsAgo } from "../data/time";
-import { delay, mockScenario } from "./shared";
+import { delay, mockScenario, requireSession } from "./shared";
 // secrets ↔ workers is the one accepted import cycle (PRD #991 D4): setWorkerBindMode
 // resolves a token label against the secrets roster, and secrets' deleteAnthropicTokenById
 // unbinds workers pinned to a deleted token. Both reads are inside function bodies and no
 // module-level initializer crosses the modules, so the cycle cannot throw at import.
 import { secrets } from "./secrets";
 
-export let workers = mockWorkers.map((w) => ({ ...w }));
+export let workers: Worker[] = mockWorkers.map((w) => ({ ...w }));
 let workerCounter = 0;
+
+// Store manual transitions separately so regenerated health-scenario rows retain them.
+// The prior effective flag is internal evidence, never a new Worker wire field.
+type ManualState = Pick<Worker, "manual_cordoned_at" | "manual_cordoned_by" | "manual_cordoned_by_label" | "manual_cordon_reason"> & {
+  priorEffective: boolean;
+};
+const manualStates = new Map<string, ManualState>();
+
+function ownerWorkers(): Worker[] {
+  return mockScenario() === "health-incident" ? incidentFleetWorkers() : workers;
+}
+
+function projectedWorker<T extends Worker>(w: T): T {
+  const manual = manualStates.get(w.id);
+  if (!manual) return { ...w };
+  const { priorEffective, ...tuple } = manual;
+  return {
+    ...w, ...tuple,
+    effective_cordoned: !!tuple.manual_cordoned_at || !!w.draining_since || priorEffective,
+  };
+}
+
+// Mirrors store.ManualCordonText: newline/tab become spaces, Cc/Cf and terminal
+// sequences are stripped, then the sanitized snapshot is trimmed and capped by runes.
+function manualText(value: string, limit: number): string {
+  const clean = stripDisplayCell(value.replace(/[\n\t]/g, " ")).trim();
+  return Array.from(clean).slice(0, limit).join("").trim();
+}
+
+function changeManualCordon(id: string, cordon: boolean, reason?: string): { worker: Worker } {
+  const actor = requireSession();
+  if (reason !== undefined && Array.from(reason).length > 500) {
+    throw new ApiError(400, "reason must be at most 500 codepoints");
+  }
+  const source = ownerWorkers().find((w) => w.id === id);
+  if (!source) throw new ApiError(404, "no such worker");
+  if (source.ephemeral) {
+    throw new ApiError(409, "manual cordon is only supported for persistent workers");
+  }
+  const current = projectedWorker(source);
+  if (!!current.manual_cordoned_at === cordon) return { worker: current };
+  const priorEffective = manualStates.get(id)?.priorEffective
+    ?? (!current.manual_cordoned_at && !!current.effective_cordoned);
+  manualStates.set(id, {
+    priorEffective,
+    manual_cordoned_at: cordon ? new Date().toISOString() : null,
+    manual_cordoned_by: cordon ? actor.id : null,
+    manual_cordoned_by_label: cordon ? manualText(actor.display_name ?? "", 200) || actor.id : null,
+    manual_cordon_reason: cordon ? manualText(reason ?? "", 500) || null : null,
+  });
+  return { worker: projectedWorker(source) };
+}
 
 export const workersApi = {
   // PRD #113 M6. Computed LIVE from the demo worker list rather than hardcoded, so the
@@ -30,11 +83,12 @@ export const workersApi = {
   // M5). AdminWorker extends Worker, so the shape is compatible. Every other scenario returns
   // the ordinary seeded fleet.
   listWorkers: async () => {
-    if (mockScenario() === "health-incident") {
-      return delay({ workers: incidentFleetWorkers().map((w) => ({ ...w })) });
-    }
-    return delay({ workers: workers.map((w) => ({ ...w })) });
+    return delay({ workers: ownerWorkers().map(projectedWorker) });
   },
+  cordonWorker: async (id: string, reason?: string): Promise<{ worker: Worker }> =>
+    delay(changeManualCordon(id, true, reason)),
+  uncordonWorker: async (id: string): Promise<{ worker: Worker }> =>
+    delay(changeManualCordon(id, false)),
   createWorker: async (name: string, template?: string) => {
     const w = {
       id: `w-new-${++workerCounter}`,
@@ -89,6 +143,7 @@ export const workersApi = {
   },
   deleteWorker: async (id: string) => {
     workers = workers.filter((w) => w.id !== id);
+    manualStates.delete(id);
     return delay(null);
   },
   // PRD #104 M3: rebind a worker to a named token, or clear it with null. Mirrors
@@ -106,7 +161,7 @@ export const workersApi = {
       w.anthropic_bind_mode = mode;
       w.anthropic_secret_id = null;
       w.anthropic_secret_label = null;
-      return delay({ worker: { ...w } });
+      return delay({ worker: projectedWorker(w) });
     }
     if (label === null || label.trim() === "") {
       throw new ApiError(400, "anthropic_bind_mode=pinned requires a token label in anthropic_token");
@@ -118,7 +173,7 @@ export const workersApi = {
     w.anthropic_bind_mode = "pinned";
     w.anthropic_secret_id = secret.id;
     w.anthropic_secret_label = secret.label;
-    return delay({ worker: { ...w } });
+    return delay({ worker: projectedWorker(w) });
   },
 
   // Hosted workers (PRD #58). The demo is the only place M5 can be seen working: on a
@@ -223,6 +278,6 @@ export const workersApi = {
           : scn === "health-silent" || scn === "health-degraded" || scn === "health-owner-only"
             ? healthyFleetWorkers()
             : mockAdminWorkers;
-    return delay({ workers: rows.map((w) => ({ ...w })) });
+    return delay({ workers: rows.map(projectedWorker) });
   },
 };

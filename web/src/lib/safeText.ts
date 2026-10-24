@@ -88,6 +88,22 @@ export function stripUnsafeChars(s: string): string {
   return s.replace(UNSAFE_CHAR, "");
 }
 
+// Complete terminal sequences must go before their introducers are stripped, otherwise
+// OSC payloads and CSI parameters would become visible text.
+// eslint-disable-next-line no-control-regex -- Terminal escape introducers/terminators are intentionally matched.
+const TERMINAL_SEQUENCE = /(?:\u001b\]|\u009d)[\s\S]*?(?:\u0007|\u001b\\|\u009c|$)|(?:\u001b[PX^_]|[\u0090\u0098\u009e\u009f])[\s\S]*?(?:\u001b\\|\u009c|$)|(?:\u001b\[|\u009b)[0-?]*[ -/]*[@-~]|\u001b[ -/]*[0-~]/gu;
+
+/** Display-only single cell/attribute boundary. Never use to normalize request inputs.
+ * Unlike stripUnsafeChars, this removes newlines/tabs as well as whole ANSI/OSC
+ * sequences. HTML stays literal text for React to escape. Non-string optional DTO
+ * values render empty rather than crashing or being coerced into misleading text.
+ */
+export function stripDisplayCell(value: unknown): string {
+  return typeof value === "string"
+    ? value.replace(TERMINAL_SEQUENCE, "").replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, "")
+    : "";
+}
+
 // The same predicate as UNSAFE_CHAR, wrapped in one capture group so `split` keeps each
 // offender as its own odd-indexed piece. Not global: split iterates on its own.
 const UNSAFE_CHAR_SPLIT = /((?![\n\t])[\p{Cc}\p{Cf}])/u;

@@ -1393,6 +1393,20 @@ describe("RunStopReason — the operator's cancel reason (#525, text channel)", 
   });
 });
 
+it("HealthFlag renders manual attribution as escaped single-cell text", () => {
+  const { container, rerender } = render(<HealthFlag run={run({
+    status: "queued", health: "waiting_worker",
+    health_reason: "waiting for workers cordoned (manual): Ada (uuid) 2026-10-21T12:00:00Z\n\t\u001b[31m<b>disk</b>\u001b[0m\u001b]0;hidden\u001b\\\u202e 🚀",
+  })} />);
+  expect(container.textContent).toContain(
+    "waiting for workers cordoned (manual): Ada (uuid) 2026-10-21T12:00:00Z<b>disk</b> 🚀",
+  );
+  expect(container.textContent).not.toMatch(/[\p{Cc}\p{Cf}]/u);
+  expect(container.querySelector("b")).toBeNull();
+  rerender(<HealthFlag run={run({ status: "queued", health: "waiting_worker", health_reason: {} as string })} />);
+  expect(container.textContent).not.toContain("[object Object]");
+});
+
 describe("HealthFlag — the health reason (#124, text channel)", () => {
   it("strips bidi/zero-width characters out of the rendered reason", () => {
     const { container } = render(
