@@ -654,6 +654,13 @@ Mock at `prds/mockups/113-worker-upgrade-status-mock.html`.
 - Dark-only, matching the product's two dark themes; no light variant. [user 2026-07-22] [superseded by PRD #1167: the panel is token-driven and now renders in every theme, light included; the light themes were approved in that PRD's decision log 2026-09-07 (AI-synced 2026-09-08)]
 - The mock is the accepted design for the fleet panel, the per-worker badges, the failed-worker detail strip, and the Workers-menu alert badge. [user 2026-07-22]
 
+**Deviations from the accepted mock, taken by the team during implementation — ratified [user 2026-07-26]:**
+
+- The raw pod-log pane is **dropped** and `pods/log` is refused: worker logs carry agent output over a user's cloned private repo, so granting it would make the controller a channel for customer source.
+- **"View pod events"** is a copy-the-`kubectl`-command affordance, not live in-app events (no `events: list` grant). Restorable later for one RBAC line plus a handler.
+- The **"1 release behind"** ordinal is dropped as not derivable (uzi knows two version strings, not the release sequence). Both versions are rendered instead.
+- **Mute** shipped as storage only — there is no way to set a mute from the UI in v1.
+
 ### Owner manual-cordon scope amendment — 2026-10-22
 
 This supplements the earlier upgrade and migration decisions above; implementation
@@ -666,13 +673,6 @@ with owner intent and owner commands. (AI-synced 2026-10-24)
 - Older serving APIs can admit after a successful cordon until every serving replica is compatible; a stalled rollout extends that interval. Older controllers may miscount manual coverage; compatible controllers are required for ordinary coverage guarantees, and earlier poll decisions may finish. No worker image/protocol prerequisite or activation flag is required. (AI-synced 2026-10-24)
 - Roll completion/incarnation proof and reservation completion are separate from serving eligibility. Manual workers supply no replacement coverage; idle workers can roll and return cordoned, while busy drift waits under #3103. An all-manual multi-worker pool may remain held; no zero-coverage bypass is added. #3153/#3307 migration coverage/custody, #3103 global ForceRoll semantics and independent DinD/pressure/maintenance guards above remain authoritative. (AI-synced 2026-10-24)
 - Web persistent external/hosted controls and owner CLI show manual metadata alongside combined fences. Health/admin surfaces remain diagnosis only, without cordon actions. A manual wait requires a nonempty entirely manually cordoned suitable population and no claimable assigned continuation; a suitable uncordoned busy or automatically drained peer prevents that diagnosis. Manual waits receive no upgrade-only exemption. No TTL, retention policy, provisioning repair or new force action is added. (AI-synced 2026-10-24)
-
-**Deviations from the accepted mock, taken by the team during implementation — ratified [user 2026-07-26]:**
-
-- The raw pod-log pane is **dropped** and `pods/log` is refused: worker logs carry agent output over a user's cloned private repo, so granting it would make the controller a channel for customer source.
-- **"View pod events"** is a copy-the-`kubectl`-command affordance, not live in-app events (no `events: list` grant). Restorable later for one RBAC line plus a handler.
-- The **"1 release behind"** ordinal is dropped as not derivable (uzi knows two version strings, not the release sequence). Both versions are rendered instead.
-- **Mute** shipped as storage only — there is no way to set a mute from the UI in v1.
 
 ## Feature #121 — Pre-provision a cloned repo's JS dependencies
 
