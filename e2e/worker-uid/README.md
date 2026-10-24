@@ -261,7 +261,12 @@ Each class has two producers, 1 MiB chunks, at most 16/32 rounds per producer,
 and a combined logical budget of 32/64 MiB; the four budgets sum to
 `plan.allocationBytes`. These are planned worst-case logical budgets, not measured
 per-class charges or extra headroom from shared cache. They remain null before
-a validated plan is available.
+a validated plan is available. `dirty_disk` and `fsynced_read_file_cache` are measured
+charge classes that need not cross the hard threshold: H applies to the working set
+(`memory.current` minus `inactive_file`), and clean or written-back page cache is
+reclaimable. The hard-crossing proof therefore rests at least on the anonymous and
+tmpfs shmem growth, which the working set always counts; re-read active file pages may
+add to it. The safety budget and ceiling stay on raw `memory.current`.
 
 `oomEvents` names the first/last raw sample IDs and their before/after
 `oom`, `oom_kill`, and `oom_group_kill` counters, plus literal after-minus-before
@@ -275,17 +280,23 @@ still requires stable OOM counters across every raw record.
 Guard-facing PSI is controlled on these hard-path legs; memory charges and crossing
 evidence remain measured. The monitor hands the production guard a copy of each
 measured sample whose `memory.pressure` totals and averages are pinned to the first
-load sample's, so the guard's early-PSI branch cannot drain the load before a sample
-reaches the hard threshold. `guardPressure` records the pin (mode
+load sample's, so the guard's early-PSI branch cannot drain the load before a sample's
+working set reaches the hard threshold. On a host without PSI the pin is the reader's
+absence marker (`{unavailable: "absent"|"unsupported"}`), which the guard never treats
+as early evidence either. `guardPressure` records the pin (mode
 `pinned_to_first_load_sample`, the source `sampleId` and its PSI); the checker requires
 it and binds it to the first load sample's raw-verified PSI. `samples` and `rawSamples`
 keep the unmodified reads, and the sampled hard crossing stays mandatory. Early-PSI
 coverage lives in `agent/test/worker-memory-guard.test.ts`.
 
 The version-1 derivation attributes every adjacent periodic sample pair by real
-sample IDs, signed raw byte delta, completion interval, positive byte/ms rate and
-read gap. Peak rate and maximum gap select the earliest pair on ties; baseline
-jitter names the earliest minimum/maximum baseline samples and their byte values.
+sample IDs, signed byte delta of the working set (`memory.current` minus
+`inactive_file`; the field keeps its `rawDeltaBytes` name as the unclamped delta),
+completion interval, positive byte/ms rate and read gap. Peak rate and maximum gap select the earliest pair on ties; baseline
+jitter names the earliest minimum/maximum baseline samples and their working-set byte
+values. The plan keeps `baselineBytes` (raw maximum, for the safety budget and ceiling)
+and adds `workingSetBaselineBytes`, from which `H = workingSetBaselineBytes + 32 MiB`.
+Crossing brackets, growth, jitter and the fresh quiet dwell all use the working set.
 `samplingSchedule` separately records the 250 ms requested anchor/ordinal/deadline,
 actual dispatch, reader start/completion and signed lateness (early ticks are valid),
 plus maximum positive lateness and maximum absolute jitter in milliseconds.
@@ -306,9 +317,13 @@ unknown evidence set to null. No next size starts after incomplete cleanup or
 an active-leg failure. A demonstrated unavailable reader before any command
 launch permits collecting the other size's failed prerequisite evidence.
 
-Earlier local prerequisite probes lacked `memory.pressure` at both sizes.
-On any such host this fixture fails before load; it has no PSI substitute (only the Node diagnostic guarded leg below does) or
-privileged fallback. CI acceptance requires both complete successful bound
+Earlier local prerequisite probes lacked `memory.pressure` at both sizes. PSI is now
+optional on this lane: the fixture runs the production reader unchanged, so such a host
+yields the reader's absence marker in `pressure` (no synthesized PSI, no privileged
+fallback). The raw evidence keeps `raw["/sys/fs/cgroup/memory.pressure"] = null` and
+records the read's errno in `rawErrors` (`ENOENT` for `absent`, `ENOTSUP` for
+`unsupported`); the checker accepts a null PSI file only with that binding and still
+requires the other raw files to be strings. CI acceptance requires both complete successful bound
 reports; local prerequisite failures and synthetic regressions provide no
 measurement acceptance. Docker-free regression data lives in
 `calibration_synthetic.py`. Focused regressions are:
@@ -336,7 +351,7 @@ a real `WorkerMemoryCommands` context, the real `WorkerMemoryReader` and the rea
 `UZI_NODE_DIAGNOSTIC_BEGIN/END` markers and is kept in `node-diagnostic.json`.
 
 The guarded measurement reports the node version; the sampled series
-(`[sampleId, ms, currentBytes]`, bounded to 200) and peak growth; the threshold-crossing
+(`[sampleId, ms, currentBytes, workingSetBytes]`, bounded to 200) and peak growth; the threshold-crossing
 sample, reservation request/grant, cancel and confirmed-drain times with the derived
 crossing-to-reserve, cancel-to-drain and crossing-to-drain latencies; the exact
 `worker_memory_pressure` tool result the lane returned for the attributed tool use (or the
@@ -355,11 +370,12 @@ plain workloads keep 30 s), above the leg's ~59 s in-container worst case, so a 
 outcome is recorded rather than cut by the host.
 
 A host kernel without PSI (no `memory.pressure`) makes the production reader report
-`absent`. Only in this guarded leg's harness the reader gets a `readBytes` that is the real
-bounded read except that an absent `memory.pressure` is replaced by an all-zero PSI
-document; every other file (current, max, stat, events) stays real. Any such run sets
-`psiSynthesized: true` in the measurement, so a report never claims real PSI. The two
-Codex fixtures above have no such substitute and still fail on that host.
+`absent`, and the guarded leg runs the production reader and monitor unchanged: no
+`memory.pressure` document is substituted. `psiAvailable` in the measurement is true only
+when every available sample carried real PSI rows, so a report never claims PSI it did
+not read. The guarded leg's hard crossing, baseline and growth use the working set
+(`crossingWorkingSetBytes`, `baselineWorkingSetBytes`); `baselineBytes` and the raw
+`currentBytes` series column stay raw.
 
 [Issue #2397: partial investigation](issue-2397-investigation.md) records the
 available evidence and remaining diagnosis work.

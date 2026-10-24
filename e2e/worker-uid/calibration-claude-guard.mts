@@ -22,7 +22,7 @@ import type { CapturedMemoryContext } from "../../agent/src/codex/broker.js";
 import { launchRunnerCommandRoot, type RunnerCommandRoot } from "../../agent/src/codex/launcher.js";
 import type { MemoryReservation, MemoryReservationRequest, WorkerMemoryPressureResult } from "../../agent/src/protocol.js";
 import { WorkerMemoryCommands } from "../../agent/src/worker-memory-commands.js";
-import { WorkerMemoryMonitor } from "../../agent/src/worker-memory-guard.js";
+import { WorkerMemoryMonitor, workingSetBytes } from "../../agent/src/worker-memory-guard.js";
 import { WorkerMemoryReader } from "../../agent/src/worker-memory-reader.js";
 
 export const SAMPLE_MS = 250;
@@ -39,8 +39,6 @@ export const QUIESCE_MS = 8000;
 export const SETTLE_MS = 8000;
 const SPILL_CAP_BYTES = 64 * 1024;
 const CGROUP = "/sys/fs/cgroup";
-const PSI_FILE = CGROUP + "/memory.pressure";
-const ZERO_PSI = "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
 const META = "claudecode/toolUseId";
 
 export type GuardedOutcome =
@@ -109,23 +107,17 @@ export async function measureGuardedLeg(input: GuardedLegInput) {
   const t0 = performance.now();
   const rel = (value: number) => round(value - t0);
   const now = () => performance.now();
-  let psiSynthesized = false;
-  // Everything but memory.pressure is the real read. Only an ABSENT memory.pressure (a kernel
-  // without PSI) is substituted, and the result says so; PSI is never claimed in that case.
-  const reader = new WorkerMemoryReader({ readBytes: (file, max) => {
-    try { return readBounded(file, max); } catch (error) {
-      if (file === PSI_FILE && (error as NodeJS.ErrnoException).code === "ENOENT") {
-        psiSynthesized = true;
-        return new TextEncoder().encode(ZERO_PSI);
-      }
-      throw error;
-    }
-  } });
+  // Every file is the real read through the production reader. A kernel without PSI makes the
+  // reader report its own absence marker; nothing is substituted, and `psiAvailable` records
+  // whether any sample carried real PSI.
+  let psiSamples = 0, psiAbsentSamples = 0;
+  const reader = new WorkerMemoryReader({ readBytes: readBounded });
 
-  const series: [number, number, number][] = [];
+  // [sampleId, completedMs, memory.current bytes, working-set bytes]
+  const series: [number, number, number, number][] = [];
   let sampleCount = 0, unavailableSamples = 0, firstUnavailable: unknown = null;
   let limitBytes = 0, highBytes = 0;
-  const found: { crossing: { sampleId: number; completedMs: number; startedMs: number; currentBytes: number } | null } = { crossing: null };
+  const found: { crossing: { sampleId: number; completedMs: number; startedMs: number; currentBytes: number; workingSetBytes: number } | null } = { crossing: null };
   type Sample = ReturnType<WorkerMemoryReader["sample"]>;
   const sample = (): Sample => {
     const value = reader.sample();
@@ -135,30 +127,35 @@ export async function measureGuardedLeg(input: GuardedLegInput) {
       firstUnavailable ??= { sampleId: value.sampleId, reason: value.reason };
       return value;
     }
-    if (series.length < MAX_SERIES) series.push([value.sampleId, rel(value.completedAtMs), value.currentBytes]);
-    if (highBytes > 0 && !found.crossing && value.currentBytes >= highBytes) {
-      found.crossing = { sampleId: value.sampleId, completedMs: rel(value.completedAtMs), startedMs: rel(value.startedAtMs), currentBytes: value.currentBytes };
+    const workingSet = workingSetBytes(value);
+    if ("unavailable" in value.pressure) psiAbsentSamples++; else psiSamples++;
+    if (series.length < MAX_SERIES) series.push([value.sampleId, rel(value.completedAtMs), value.currentBytes, workingSet]);
+    // The guard compares the working set (memory.current minus inactive file cache) with H.
+    if (highBytes > 0 && !found.crossing && workingSet >= highBytes) {
+      found.crossing = { sampleId: value.sampleId, completedMs: rel(value.completedAtMs), startedMs: rel(value.startedAtMs),
+        currentBytes: value.currentBytes, workingSetBytes: workingSet };
     }
     return value;
   };
 
   // Baseline before anything launches: this harness's own residency only.
-  const baseline: number[] = [];
+  const baseline: number[] = [], baselineWorkingSet: number[] = [];
   const eventsBefore = readText(CGROUP + "/memory.events");
   for (let i = 0; i < BASELINE_SAMPLES; i++) {
     const value = sample();
     if (!value.available) throw new Error("harness: cgroup reader unavailable at baseline: " + JSON.stringify(firstUnavailable));
     baseline.push(value.currentBytes);
+    baselineWorkingSet.push(workingSetBytes(value));
     limitBytes = value.limitBytes;
     await sleep(SAMPLE_MS);
   }
   assert.equal(limitBytes, input.limitBytes, "cgroup memory.max must equal the requested limit");
-  const baselineBytes = Math.max(...baseline);
+  const baselineBytes = Math.max(...baseline), baselineWorkingSetBytes = Math.max(...baselineWorkingSet);
   highBytes = Math.floor(limitBytes * HIGH_FRACTION);
   const reserveBytes = limitBytes - highBytes;
   const settings = { enabled: true as const, reserveBytes, hysteresisBytes: HYSTERESIS_BYTES, sampleMs: SAMPLE_MS,
     responseBudgetMs: RESPONSE_BUDGET_MS, rearmMs: REARM_MS, maxInterventions: 2 };
-  assert.ok(baselineBytes < highBytes - HYSTERESIS_BYTES, "baseline must sit below the quiet mark");
+  assert.ok(baselineWorkingSetBytes < highBytes - HYSTERESIS_BYTES, "baseline working set must sit below the quiet mark");
 
   const commands = new WorkerMemoryCommands();
   const flight = {};
@@ -328,6 +325,7 @@ export async function measureGuardedLeg(input: GuardedLegInput) {
     crossingSampleStartedMs: crossing?.startedMs ?? null,
     crossingSampleCompletedMs: crossing?.completedMs ?? null,
     crossingCurrentBytes: crossing?.currentBytes ?? null,
+    crossingWorkingSetBytes: crossing?.workingSetBytes ?? null,
     reserveRequestMs: marks["reserveRequestMs"] ?? null,
     reserveGrantMs: marks["reserveGrantMs"] ?? null,
     cancelStartMs,
@@ -348,7 +346,7 @@ export async function measureGuardedLeg(input: GuardedLegInput) {
   };
   let peakGrowthBytesPerSecond = 0;
   for (let i = 1; i < series.length; i++) {
-    const [, t1, b1] = series[i - 1]!, [, t2, b2] = series[i]!;
+    const [, t1, , b1] = series[i - 1]!, [, t2, , b2] = series[i]!;
     if (t2 > t1) peakGrowthBytesPerSecond = Math.max(peakGrowthBytesPerSecond, Math.round(((b2 - b1) / (t2 - t1)) * 1000));
   }
   // The workload child prints one JSON report line (calibration-diagnostic.mts runWorkload) when it
@@ -385,8 +383,9 @@ export async function measureGuardedLeg(input: GuardedLegInput) {
     measurementParameters: { note: "calibration measurement parameters, not production thresholds",
       highFraction: HIGH_FRACTION, highBytes, reserveBytes, hysteresisBytes: HYSTERESIS_BYTES, sampleMs: SAMPLE_MS,
       responseBudgetMs: RESPONSE_BUDGET_MS, rearmMs: REARM_MS, commandDeadlineMs: COMMAND_DEADLINE_MS, maxInterventions: 2 },
-    psiSynthesized,
-    baselineBytes, limitBytes,
+    // True only when every available sample carried real PSI rows (no absence marker).
+    psiAvailable: psiSamples > 0 && psiAbsentSamples === 0,
+    baselineBytes, baselineWorkingSetBytes, limitBytes,
     growth: { series, sampleCount, seriesTruncated: sampleCount - unavailableSamples > series.length, unavailableSamples,
       firstUnavailable, peakSeriesBytes: series.reduce((m, s) => Math.max(m, s[2]), 0), peakGrowthBytesPerSecond },
     timeline, budget,

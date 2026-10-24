@@ -19,7 +19,7 @@ type RealPressure = Extract<Pressure, { some: unknown }>;
 
 /** Working set: memory.current minus inactive file cache, clamped at zero.
  * An estimate of non-reclaimable pressure; it is not an OOM predictor. */
-function workingSetBytes(sample: Available): number {
+export function workingSetBytes(sample: Pick<Available, "currentBytes"> & { stat: Pick<Available["stat"], "inactive_file"> }): number {
   return Math.max(0, sample.currentBytes - sample.stat.inactive_file);
 }
 
