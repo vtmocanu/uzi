@@ -1060,7 +1060,7 @@ WITH claimant AS MATERIALIZED (
            OR NOT EXISTS (
                SELECT 1 FROM workers ow
                WHERE ow.id = r.worker_id
-                 AND (NOT fn_worker_accepts_new_intake(ow) OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced
+                 AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced
                       OR (ow.last_heartbeat_at IS NOT NULL
                           AND ow.last_heartbeat_at >= @heartbeat_cutoff)
                       -- #2705 pin P: a run the stale sweeper requeued (stale_requeue_generation
@@ -9777,7 +9777,7 @@ SELECT id, user_id, status, auto_approve,
        COALESCE(runs.status = 'queued' AND runs.kind <> 'cross_check'
                 AND runs.worker_id IS NOT NULL
                 AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = runs.worker_id
-                            AND (NOT fn_worker_accepts_new_intake(ow) OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced)), false)::boolean AS owner_hold_pinnable,
+                            AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced)), false)::boolean AS owner_hold_pinnable,
        COALESCE((SELECT ow.name FROM workers ow WHERE ow.id = runs.worker_id), '')::text AS stale_requeue_worker_name,
        (runs.kind = 'cross_check' AND EXISTS (SELECT 1 FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = runs.id WHERE pin.user_id = runs.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness AND (pin.model IS NOT NULL OR pin.effort IS NOT NULL)))::boolean AS cross_check_pin_required,
        (SELECT MIN(evidence.since) FROM (
@@ -9991,18 +9991,27 @@ SELECT w.id,
                    AND (NOT fn_ephemeral_docker_preference_applies(owner.ephemeral_docker_enabled, @worker_docker_enabled::boolean, run.repo_id, run.kind, run.egress_profile_id, @docker_repo_allowlist::uuid[]) OR COALESCE(w.docker_enabled, false)))) AS advisory_binding,
        (run.kind = 'cross_check' OR NOT w.ephemeral OR w.ephemeral_run_id = run.id OR (
            (fn_ephemeral_lease_admits(
-              w.lease_since, w.lease_repo_id, w.lease_branch, false,
+              w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
               @ephemeral_lease::interval, now(),
               run.repo_id, run.kind, run.branch, run.pipeline_ref, run.issue_iid, run.failure_snapshot, run.egress_profile_id)
                    AND (NOT fn_ephemeral_docker_preference_applies(owner.ephemeral_docker_enabled, @worker_docker_enabled::boolean, run.repo_id, run.kind, run.egress_profile_id, @docker_repo_allowlist::uuid[]) OR COALESCE(w.docker_enabled, false)))
            AND NOT EXISTS (SELECT 1 FROM workers bw WHERE bw.ephemeral AND bw.ephemeral_run_id = run.id)
            AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds ch WHERE ch.live_worker_id = w.id AND ch.state = 'open')
        )) AS strict_binding,
+       (run.kind = 'cross_check' OR NOT w.ephemeral OR w.ephemeral_run_id = run.id OR (
+           (fn_ephemeral_lease_admits(
+              w.lease_since, w.lease_repo_id, w.lease_branch, false,
+              @ephemeral_lease::interval, now(),
+              run.repo_id, run.kind, run.branch, run.pipeline_ref, run.issue_iid, run.failure_snapshot, run.egress_profile_id)
+                   AND (NOT fn_ephemeral_docker_preference_applies(owner.ephemeral_docker_enabled, @worker_docker_enabled::boolean, run.repo_id, run.kind, run.egress_profile_id, @docker_repo_allowlist::uuid[]) OR COALESCE(w.docker_enabled, false)))
+           AND NOT EXISTS (SELECT 1 FROM workers bw WHERE bw.ephemeral AND bw.ephemeral_run_id = run.id)
+           AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds ch WHERE ch.live_worker_id = w.id AND ch.state = 'open')
+       )) AS manual_binding,
        (run.worker_id = w.id) AS own_worker,
        (NOT w.ephemeral) AS persistent,
        (run.kind = 'cross_check' OR run.worker_id IS NULL OR run.worker_id = w.id
         OR NOT EXISTS (SELECT 1 FROM workers ow WHERE ow.id = run.worker_id
-                       AND (NOT fn_worker_accepts_new_intake(ow) OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced OR
+                       AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced OR
                             (ow.last_heartbeat_at IS NOT NULL AND ow.last_heartbeat_at >= @heartbeat_cutoff)
                             -- #2705 pin P, mirroring ClaimRun's stale-requeue grace arm.
                             OR (run.kind <> 'cross_check'
@@ -10101,12 +10110,12 @@ WHERE run.id = @run_id
        OR run.released_worker_nonce IS DISTINCT FROM w.snapshot_register_nonce)
 )
 SELECT COALESCE(bool_or(own_worker AND automatic_hold), false)::boolean AS automatic_owner_hold,
-       count(*) FILTER (WHERE strict_candidate AND heartbeat_recent AND online AND NOT hard_fenced AND affinity AND strict_binding)::bigint AS strict_eligible,
+       count(*) FILTER (WHERE strict_candidate AND heartbeat_recent AND online AND affinity AND strict_binding)::bigint AS strict_eligible,
        -- Legacy advisory availability deliberately ignores status and affinity.
        count(*) FILTER (WHERE strict_candidate AND heartbeat_recent AND NOT hard_fenced AND (accepts_intake OR own_worker) AND free_slot AND advisory_binding)::bigint AS claimable,
        count(*) FILTER (WHERE strict_candidate AND heartbeat_recent AND online AND NOT hard_fenced AND own_worker AND affinity AND free_slot AND advisory_binding)::bigint AS assigned_claimable,
        count(*) FILTER (WHERE strict_candidate AND heartbeat_recent AND online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::bigint AS draining_eligible,
-       count(*) FILTER (WHERE strict_candidate AND heartbeat_recent AND online AND accepts_intake AND affinity AND strict_binding)::bigint AS non_draining_eligible,
+       count(*) FILTER (WHERE strict_candidate AND heartbeat_recent AND online AND draining_since IS NULL AND affinity AND strict_binding)::bigint AS non_draining_eligible,
        count(*) FILTER (WHERE strict_candidate AND heartbeat_recent AND online AND draining_since IS NOT NULL AND own_worker AND affinity AND strict_binding)::bigint AS suitable_own_draining,
        max(draining_since) FILTER (WHERE strict_candidate AND heartbeat_recent AND online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::timestamptz AS latest_suitable_draining_since
        , count(*) FILTER (WHERE strict_candidate AND diagnostic_lane AND diagnostic_affinity AND affinity AND strict_binding)::bigint AS diagnostic_suitable
@@ -10117,11 +10126,11 @@ SELECT COALESCE(bool_or(own_worker AND automatic_hold), false)::boolean AS autom
        , (SELECT jsonb_build_object('pacing', c.pacing, 'observed_at', c.pacing_observed_at, 'blocking_reason', c.blocking_reason)
           FROM candidates c WHERE c.strict_candidate AND c.diagnostic_lane AND c.diagnostic_affinity AND c.affinity AND c.strict_binding AND c.through_roll
           ORDER BY (c.pacing->>'state' = 'held') DESC, c.id LIMIT 1)::jsonb AS diagnostic_roll_context
-       , count(*) FILTER (WHERE heartbeat_recent AND online AND diagnostic_affinity AND affinity AND strict_binding)::bigint AS manual_suitable
-       , count(*) FILTER (WHERE heartbeat_recent AND online AND diagnostic_affinity AND affinity AND strict_binding AND manual_cordoned_at IS NOT NULL)::bigint AS manual_cordoned
+       , count(*) FILTER (WHERE heartbeat_recent AND online AND diagnostic_affinity AND affinity AND manual_binding)::bigint AS manual_suitable
+       , count(*) FILTER (WHERE heartbeat_recent AND online AND diagnostic_affinity AND affinity AND manual_binding AND manual_cordoned_at IS NOT NULL)::bigint AS manual_cordoned
        , (SELECT jsonb_build_object('worker_id', c.id, 'actor_id', c.manual_cordoned_by,
                  'actor_label', c.manual_cordoned_by_label, 'at', c.manual_cordoned_at, 'reason', c.manual_cordon_reason)
-          FROM candidates c WHERE c.heartbeat_recent AND c.online AND c.diagnostic_affinity AND c.affinity AND c.strict_binding AND c.manual_cordoned_at IS NOT NULL
+          FROM candidates c WHERE c.heartbeat_recent AND c.online AND c.diagnostic_affinity AND c.affinity AND c.manual_binding AND c.manual_cordoned_at IS NOT NULL
           ORDER BY c.id LIMIT 1)::jsonb AS manual_context
 FROM candidates;
 
@@ -10440,7 +10449,7 @@ WHERE r.status = 'queued'
         r.worker_id IS NOT NULL AND r.kind <> 'cross_check'
     AND r.updated_at >= @affinity_cutoff::timestamptz
     AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = r.worker_id
-                AND (NOT fn_worker_accepts_new_intake(ow) OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced)), false)
+                AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced)), false)
   -- #2705: a run that ClaimRun is holding for its returning worker is not demand yet. This is
   -- the "effective pin" E, the claim pin plus the affinity ceiling, so it is true only while
   -- ClaimRun really blocks every peer:
@@ -10658,7 +10667,7 @@ WHERE r.status = 'queued'
         r.worker_id IS NOT NULL AND r.kind <> 'cross_check'
     AND r.updated_at >= @affinity_cutoff::timestamptz
     AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = r.worker_id
-                AND (NOT fn_worker_accepts_new_intake(ow) OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced)), false)
+                AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced)), false)
   -- #2705: a run that ClaimRun is holding for its returning worker is not demand yet. This is
   -- the "effective pin" E, the claim pin plus the affinity ceiling, so it is true only while
   -- ClaimRun really blocks every peer:

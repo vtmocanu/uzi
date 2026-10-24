@@ -290,6 +290,7 @@ tasks:
       - task: check:uxlab-freeze
       - task: test:uxlab-freeze
       - task: test:uxlab-build
+      - task: test:uxlab-pty
       - task: check:skill-triage-render
       # A web test importing an uncopied fixture passes gate:web but breaks the web image build (#2602).
       - task: test:web-docker-fixtures
@@ -1088,6 +1089,11 @@ tasks:
     desc: hermetic uxlab build preflight and PNG freshness contract
     cmds:
       - bash ./scripts/uxlab-build.test.sh
+
+  test:uxlab-pty:
+    desc: hermetic terminal interpreter regression controls
+    cmds:
+      - python3 -B -m unittest discover -s api/cmd/uzi/uxlab -p demo_pty_test.py -v
 
   test:renovate-go-toolchain:
     desc: hermetic Go-toolchain grouping and worker Go flake extraction contract

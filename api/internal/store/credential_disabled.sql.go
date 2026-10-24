@@ -292,7 +292,7 @@ func (q *Queries) LockUserJudgeBindingForShare(ctx context.Context, id uuid.UUID
 
 const lockWorkerBindingForShare = `-- name: LockWorkerBindingForShare :one
 SELECT anthropic_bind_mode, anthropic_secret_id,
-       (NOT fn_worker_accepts_new_intake(workers)
+       (draining_since IS NOT NULL
         OR (last_heartbeat_at IS NOT NULL AND last_heartbeat_at >= $1::timestamptz))::boolean
            AS holds_affinity
 FROM workers
