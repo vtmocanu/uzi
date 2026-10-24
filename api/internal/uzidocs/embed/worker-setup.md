@@ -49,6 +49,8 @@ docker run -d -e UZI_API_URL=https://uzi.example.com \
 
 The five capabilities support the root startup window; the entrypoint then drops to the unprivileged worker with only SETUID/SETGID, so it can launch agents under a separate runner UID. Keep the token bind mount writable: startup re-owns the mounted file to UID/GID 10001 and sets its mode to 0400. This changes the backing host file's permissions and, on Linux, its ownership; desktop container runtimes may map ownership differently. A generic read-only bind mount refuses to start because the entrypoint cannot enforce that token posture. File delivery keeps the join token out of the worker's environment.
 
+To cap Go build and runtime parallelism for the commands a worker runs, add `-e WORKER_GO_BUILD_PARALLELISM=2 -e WORKER_GO_MAXPROCS=2` to the `docker run` above, or set the same two variables in the compose `.env`. Both are optional and unset by default; see [Worker Go concurrency defaults](./configuration.md#worker-go-concurrency-defaults) for accepted values and limits.
+
 Put a TLS-terminating proxy in front of a worker reached over an untrusted network: `api` itself listens plain HTTP.
 
 ## Worker templates

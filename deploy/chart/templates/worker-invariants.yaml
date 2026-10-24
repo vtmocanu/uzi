@@ -1,4 +1,5 @@
 {{- $_ := include "uzi.workerMemoryGuardEnabled" . -}}
+{{- $_ := include "uzi.workerGoConcurrencyValidate" . -}}
 {{- if .Values.workers.enabled }}
 {{- /*
   THIS TEMPLATE RENDERS NOTHING, ON PURPOSE. It exists to evaluate the hosted-worker

@@ -478,6 +478,49 @@ Set on the `agent` compose service (profile `agent`) or on a standalone `docker 
 
 Duration values accept the same Go-style strings used server-side (`15s`, `3s`, `500ms`, `2h`) or a bare integer read as milliseconds.
 
+### Worker Go concurrency defaults
+
+Two optional settings (issue #3382) cap the Go build and runtime parallelism of
+commands the worker launches. Both are **unset by default**: nothing is rendered
+and no `GOFLAGS` or `GOMAXPROCS` is injected.
+
+| Worker environment variable | Helm `workers` key | Default | Meaning |
+|---|---|---|---|
+| `WORKER_GO_BUILD_PARALLELISM` | `goBuildParallelism` | empty | Sets `GOFLAGS=-p=N`: how many packages `go build` and `go test` build or run in parallel. |
+| `WORKER_GO_MAXPROCS` | `goMaxProcs` | empty | Sets `GOMAXPROCS=N`: the Go runtime's CPU parallelism. The `go` command's `-p` defaults to `GOMAXPROCS`, so this also bounds package parallelism when no `-p` is set. |
+
+Accepted values are positive decimal integers up to `2147483647`; surrounding
+whitespace is trimmed, empty means unset, and leading zeros are accepted
+(`007` is `7`). Zero, signs, fractions, non-digits and larger values are
+rejected: the chart render fails, the controller refuses to start, or the worker
+refuses to start, depending on where the value is set. There is no general
+`GOFLAGS` passthrough.
+
+The values apply to the scrubbed environment of Claude commands (native and
+guarded), Codex commands, worker-run checks and JavaScript dependency installs.
+Compose relays both variables from `.env`; hosted workers use the chart keys,
+and the controller receives them as `UZI_WORKER_GO_BUILD_PARALLELISM` and
+`UZI_WORKER_GO_MAXPROCS` and relays them into worker pods. Setting or changing
+either hosted value rolls every hosted worker pod; compose and self-run workers
+pick it up on restart. Both the controller and the worker image must come from a
+release containing this change; older ones ignore the settings.
+
+Limits:
+
+- This is not a worker-wide process or memory limit. Each concurrent command gets
+  the same value on its own.
+- An explicit `-p` flag, or a command or Taskfile that sets its own `GOFLAGS`,
+  replaces `-p=N`. `GOMAXPROCS` still applies, so `goMaxProcs` is the more
+  robust knob.
+- It does not cap per-test internal concurrency, child processes or memory, and
+  command code can replace its own environment.
+- On Codex, the worker's own Go helper processes (supervisor, sandbox and
+  file-operation helper) launched with the command environment also inherit
+  `GOMAXPROCS`.
+
+See [Worker setup](./worker-setup.md#3-run-the-worker) for supplying the values
+to a self-run worker.
+
 ### Worker memory guard
 
 The proactive worker memory guard is **off by default** (issue #2396).
