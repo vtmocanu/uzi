@@ -90,8 +90,20 @@ export function stripUnsafeChars(s: string): string {
 
 // Complete terminal sequences must go before their introducers are stripped, otherwise
 // OSC payloads and CSI parameters would become visible text.
-// eslint-disable-next-line no-control-regex -- Terminal escape introducers/terminators are intentionally matched.
-const TERMINAL_SEQUENCE = /(?:\u001b\]|\u009d)[\s\S]*?(?:\u0007|\u001b\\|\u009c|$)|(?:\u001b[PX^_]|[\u0090\u0098\u009e\u009f])[\s\S]*?(?:\u001b\\|\u009c|$)|(?:\u001b\[|\u009b)[0-?]*[ -/]*[@-~]|\u001b[ -/]*[0-~]/gu;
+// C0 executes/is ignored inside ESC/CSI without ending it; DEL is ignored too.
+// CAN/SUB cancel instead, and ESC restarts parsing at the next introducer.
+const EMBEDDED_CONTROL = String.raw`[\u0000-\u0017\u0019\u001c-\u001f\u007f]`;
+const ESC_START = String.raw`\u001b${EMBEDDED_CONTROL}*`;
+const CANCEL_OR_RESTART = String.raw`(?:[\u0018\u001a]|(?=\u001b)|$)`;
+const STRING_END = String.raw`(?:${ESC_START}\\|\u009c|${CANCEL_OR_RESTART})`;
+const TERMINAL_SEQUENCE = new RegExp(
+  // String terminators must be consumed here, before generic ESC removal.
+  String.raw`(?:${ESC_START}\]|\u009d)[^\u0007\u0018\u001a\u001b\u009c]*(?:\u0007|${STRING_END})` +
+  String.raw`|(?:${ESC_START}[PX^_]|[\u0090\u0098\u009e\u009f])[^\u0018\u001a\u001b\u009c]*${STRING_END}` +
+  String.raw`|(?:${ESC_START}\[|\u009b)${EMBEDDED_CONTROL}*(?:[0-?]${EMBEDDED_CONTROL}*)*(?:[ -/]${EMBEDDED_CONTROL}*)*(?:[@-~]|${CANCEL_OR_RESTART})` +
+  String.raw`|${ESC_START}(?:[ -/]${EMBEDDED_CONTROL}*)*(?:[0-~]|${CANCEL_OR_RESTART})`,
+  "gu",
+);
 
 /** Display-only single cell/attribute boundary. Never use to normalize request inputs.
  * Unlike stripUnsafeChars, this removes newlines/tabs as well as whole ANSI/OSC
