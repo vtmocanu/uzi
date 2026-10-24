@@ -47,7 +47,7 @@ export type ReplayErrorCode =
   | "corpus_integrity" | "brief_drift" | "diff_oversize" | "corpus_objects_missing"
   | "invalid_options" | "records_invalid" | "score_unknown_case"
   | "adjudication_invalid" | "adjudication_duplicate" | "adjudication_unknown_finding"
-  | "snapshot_untraversable";
+  | "snapshot_untraversable" | "cleanup_unconfirmed";
 
 /** The message is always the fixed code; file contents and git output are never echoed. */
 export class ReplayError extends Error {
@@ -762,6 +762,9 @@ export async function runReplays(deps: RunReplaysDeps): Promise<ReplayRecord[]> 
         let findings: CodeFinding[] = [];
         let cost: number | null = null;
         let latency: number | null = null;
+        // Set when a checker was invoked; an unconfirmed native cleanup stops the replay (below).
+        let invoked = false;
+        let cleanupConfirmed = false;
         if (!token) outcome = "missing_auth";
         else if (deps.signal?.aborted) outcome = "interrupted";
         else {
@@ -789,11 +792,11 @@ export async function runReplays(deps: RunReplaysDeps): Promise<ReplayRecord[]> 
               decodeCrossCheckClaim(claim.cross_check);
               timer = setTimeout(() => { timedOut = true; pass.abort(); }, timeoutMs);
               const signal = AbortSignal.any(deps.signal ? [deps.signal, pass.signal] : [pass.signal]);
-              let cleanupConfirmed = false;
               try {
                 let text: string;
                 const began = now();
                 try {
+                  invoked = true;
                   text = await checkerFor(family).run(claim, materialized.snapshot, home, signal,
                     async (payload) => { usage.push({ ...payload }); }, () => { cleanupConfirmed = true; });
                 } finally { latency = Math.max(0, now() - began); }
@@ -807,10 +810,14 @@ export async function runReplays(deps: RunReplaysDeps): Promise<ReplayRecord[]> 
             }
           } finally {
             if (timer) clearTimeout(timer);
-            await materialized?.cleanup();
-            // Under the split the HOME holds runner-owned and command-owned residue the worker cannot
-            // unlink: rmHomeTree removes it as those uids and is the plain worker removal otherwise.
-            if (home) await rmHomeTree(path.resolve(home));
+            // A checker that could not confirm its processes stopped may still use the snapshot and HOME:
+            // leave both in place (as the production runner keeps the snapshot) and stop the replay below.
+            if (!invoked || cleanupConfirmed) {
+              await materialized?.cleanup();
+              // Under the split the HOME holds runner-owned and command-owned residue the worker cannot
+              // unlink: rmHomeTree removes it as those uids and is the plain worker removal otherwise.
+              if (home) await rmHomeTree(path.resolve(home));
+            }
           }
         }
         const rec: ReplayRecord = {
@@ -824,6 +831,8 @@ export async function runReplays(deps: RunReplaysDeps): Promise<ReplayRecord[]> 
         };
         await deps.writeRecord(rec);
         records.push(rec);
+        // No further paid call may start while an earlier checker's processes may still be running.
+        if (invoked && !cleanupConfirmed) throw new ReplayError("cleanup_unconfirmed");
       }
     }
   }

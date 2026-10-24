@@ -186,6 +186,8 @@ export async function runReplayCli(args: string[], deps: ReplayCliDeps): Promise
   const names = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
   for (const name of names) deps.signals.on(name, onSignal);
   let scratch: string | undefined;
+  // An unconfirmed checker cleanup leaves its snapshot and HOME in use: never remove the run directory then.
+  let retain = false;
   try {
     if (command === "score") return await runScore(deps, rest);
     const root = deps.scratchRoot ?? path.join(deps.checkout, ".uzi/scratch");
@@ -195,6 +197,7 @@ export async function runReplayCli(args: string[], deps: ReplayCliDeps): Promise
       ? await runVerify(deps, abort.signal, scratch)
       : await runReplayCommand(deps, parsed!, abort.signal, root, scratch);
   } catch (error) {
+    retain = error instanceof ReplayError && error.code === "cleanup_unconfirmed";
     return fail(error instanceof ReplayError ? error.code : "startup_failed");
   } finally {
     abort.abort();
@@ -202,7 +205,8 @@ export async function runReplayCli(args: string[], deps: ReplayCliDeps): Promise
     // Plain worker removal: rmHomeTree would widen the 2710 run directory to group rwx on residue. Per-case
     // HOMEs (which the runner uids write into) are removed with rmHomeTree inside runReplays.
     // A cleanup failure must not replace the command's return code or add a second stdout line.
-    if (scratch) {
+    if (scratch && retain) deps.writeErr(JSON.stringify({ retained_run_dir: path.resolve(scratch) }));
+    else if (scratch) {
       try { await rmTreeForce(scratch); } catch { deps.writeErr(JSON.stringify({ error: "cleanup_failed" })); }
     }
   }

@@ -35,9 +35,11 @@ const checker = (fn: Fake) => {
   return { calls, run: async (...args: Run) => { calls.push(args); return fn(...args); } };
 };
 const completes = (text = findingsText): Fake => async (_c, _d, _h, _s, _p, confirm) => { confirm?.(); return text; };
-const waitForAbort: Fake = (_c, _d, _h, signal) => new Promise((_resolve, reject) => {
-  signal.addEventListener("abort", () => { reject(signal.reason); }, { once: true });
+// The real checkers confirm native cleanup whenever teardown was clean, also when the call then fails.
+const waitForAbort: Fake = (_c, _d, _h, signal, _p, confirm) => new Promise((_resolve, reject) => {
+  signal.addEventListener("abort", () => { confirm?.(); reject(signal.reason); }, { once: true });
 });
+const fails = (error: unknown): Fake => async (_c, _d, _h, _s, _p, confirm) => { confirm?.(); throw error; };
 
 // Injected uid layouts: the helpers pin `single` so an ambient UZI_UID_SPLIT=1 cannot select split mode.
 // `split` uses a group this process belongs to (the real 10002 needs the image).
@@ -140,12 +142,11 @@ test("outcomes are classified like the production runner and never record error 
   assert.equal((await outcome(completes())).outcome, "completed");
   assert.equal((await outcome(waitForAbort, { timeoutMs: 20 })).outcome, "model_timeout");
   assert.equal((await outcome(completes("not json"))).outcome, "malformed");
-  const boom = await outcome(async () => { throw new Error("SECRET-boom-text"); });
+  const boom = await outcome(fails(new Error("SECRET-boom-text")));
   assert.equal(boom.outcome, "model_error");
   assert.ok(!JSON.stringify(boom).includes("SECRET-boom-text"));
-  assert.equal((await outcome(async () => { throw new CrossCheckCheckerUnavailableError(); })).outcome, "checker_unavailable");
-  assert.equal((await outcome(async () => findingsText)).outcome, "confinement_failed");
-  assert.equal((await outcome(async () => { throw new Error("cross-check confinement refused: x"); })).outcome, "confinement_failed");
+  assert.equal((await outcome(fails(new CrossCheckCheckerUnavailableError()))).outcome, "checker_unavailable");
+  assert.equal((await outcome(fails(new Error("cross-check confinement refused: x")))).outcome, "confinement_failed");
 
   const outer = new AbortController();
   setTimeout(() => { outer.abort(); }, 30);
@@ -159,6 +160,33 @@ test("outcomes are classified like the production runner and never record error 
   assert.equal(rec.outcome, "missing_auth");
   assert.equal(missing.calls.length, 0);
   assert.deepEqual(rec.findings, []);
+});
+
+test("an unconfirmed checker cleanup records the attempt, keeps its snapshot and HOME, and stops the replay", async () => {
+  const snapshot = await fs.mkdtemp(path.join(tc.root, "unconfirmed-snap-"));
+  let snapshotCleanups = 0;
+  const materialize = async (): Promise<MaterializedCase> =>
+    ({ snapshot, cleanup: async () => { snapshotCleanups++; } }) as MaterializedCase;
+  let home = "";
+  const leaky = checker(async (_c, _d, h) => { home = h; return findingsText; });
+  const out: ReplayRecord[] = [];
+  await assert.rejects(runReplays({
+    checkout: tc.checkout, corpus: { ...corpus, cases: [defect] }, families: ["claude"], model: "haiku", effort: "low",
+    layout: single, repeats: 3, scratchDir: scratch, env, materialize, checkers: { claude: leaky },
+    checkerVersion: { uzi_head: "a".repeat(40), agent_version: "0.0.0-test" },
+    writeRecord: async (r) => { out.push(r); },
+  }), { message: "cleanup_unconfirmed" });
+  assert.equal(leaky.calls.length, 1, "no further paid call after an unconfirmed cleanup");
+  assert.deepEqual(out.map((r) => r.outcome), ["confinement_failed"]);
+  assert.equal(snapshotCleanups, 0, "the snapshot stays in place");
+  await fs.access(home);
+  await fs.rm(home, { recursive: true, force: true });
+
+  // A checker that throws without confirming is treated the same way.
+  const thrower = checker(async () => { throw new Error("cross-check cleanup unconfirmed"); });
+  await assert.rejects(replay({ repeats: 2, materialize, checkers: { claude: thrower } }), { message: "cleanup_unconfirmed" });
+  assert.equal(thrower.calls.length, 1);
+  await Promise.all(thrower.calls.map(([, , h]) => fs.rm(h, { recursive: true, force: true })));
 });
 
 test("cost is a number only when the family reports one", async () => {
@@ -289,6 +317,22 @@ test("a mid-run failure still reports the partial records file", async () => {
   assert.deepEqual(r.lines, ['{"error":"startup_failed"}']);
   assert.equal(r.errLines.length, 1);
   assert.ok(path.isAbsolute((JSON.parse(r.errLines[0]!) as { records_file: string }).records_file));
+});
+
+test("an unconfirmed checker cleanup keeps the run directory and names it on stderr only", async () => {
+  const root = await fs.mkdtemp(path.join(tc.root, "retain-"));
+  const r = await cli(replayArgs(["--authorize-real-model-calls"]), {
+    scratchRoot: root, checkers: { claude: checker(async () => findingsText) },
+  });
+  assert.equal(r.code, 1);
+  assert.deepEqual(r.lines, ['{"error":"cleanup_unconfirmed"}']);
+  const err = r.errLines.map((l) => JSON.parse(l) as { records_file?: string; retained_run_dir?: string });
+  assert.equal(err.length, 2);
+  assert.ok(path.isAbsolute(err[0]!.records_file!));
+  const kept = err[1]!.retained_run_dir!;
+  assert.ok(path.isAbsolute(kept));
+  await fs.access(kept);
+  await fs.rm(root, { recursive: true, force: true });
 });
 
 test("default wiring sends stdout lines to stdout and the locator channel to stderr", () => {
