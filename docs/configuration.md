@@ -497,8 +497,9 @@ rejected: the chart render fails, the controller refuses to start, or the worker
 refuses to start, depending on where the value is set. Helm decodes typed
 numbers (unquoted YAML, `--set`) before the template sees them, so those are
 checked by numeric value: a whole number from `1` to `2147483647`, relayed as its
-canonical decimal (`+1` or `0x10` arrive as `1` and `16`). Quote the value to have
-the spelling checked. There is no general `GOFLAGS` passthrough.
+canonical decimal (`+1` arrives as `1`; in a values file `0x10` and `1e3` also
+arrive as `16` and `1000`, while `--set` decodes only decimal integers). Quote the
+value in YAML or use `--set-string` to have the spelling checked. There is no general `GOFLAGS` passthrough.
 
 The values apply to the scrubbed environment of Claude commands (native and
 guarded), Codex commands, worker-run checks and JavaScript dependency installs.
