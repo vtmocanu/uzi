@@ -1184,6 +1184,10 @@ The api downloads and extracts selected archives, admitting **UTF-8 text
 only**, up to **50 files / 16 MiB per repair run / 4 MiB per file**.
 Administrators can lower the run limits in
 [Configuration](./configuration.md#job-files-and-product-skill-sets-prd-1909).
+Terminal colour codes (complete ANSI CSI sequences) are stripped, and any
+other control or format character except tab, newline and carriage return
+becomes a visible `\u{XXXX}` escape; NUL bytes or invalid UTF-8 still skip
+the file as `binary`. Limits apply to the normalised text.
 Archive paths, links, inflated bytes and download work are bounded before
 worker delivery. Content is scrubbed **before hashing and storage**.
 The bounded, untrusted manifest identifies kept files and refusal reasons;

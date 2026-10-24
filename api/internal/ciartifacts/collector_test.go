@@ -410,3 +410,41 @@ func TestExpiredArtifactRenderEscapes(t *testing.T) {
 		t.Fatalf("%q %v", got, err)
 	}
 }
+
+// A coloured harness log is text (#3386): complete ANSI CSI sequences are stripped and any
+// other unsafe rune is kept as a visible escape, before scrubbing, hashing and the per-file
+// budget, while NUL and invalid UTF-8 stay binary.
+func TestCollectorNormalizesTerminalText(t *testing.T) {
+	secret := "glpat-" + strings.Repeat("a", 20)
+	c := NewCollector(Limits{MaxFileBytes: 64}, func(s string) string { return strings.ReplaceAll(s, secret, "[redacted]") })
+	c.Add(context.Background(), "1", "logs", zipFixture(t,
+		zipItem{name: "phase.log", text: "\x1b[1m==> case 1\x1b[0m\n  \x1b[32mPASS\x1b[0m ok\r\n"},
+		zipItem{name: "plain.log", text: "==> case 1\n  PASS ok\r\n"},
+		zipItem{name: "unsafe.log", text: "a\x07b\x1b]0;t\x1b[1\x7fc‮d\x1b"},
+		zipItem{name: "secret.log", text: "glpat-\x1b[31m" + strings.Repeat("a", 20)},
+		zipItem{name: "expands.log", text: strings.Repeat("\x07", 9)},
+		zipItem{name: "nul", text: "a\x00b"},
+		zipItem{name: "utf8", text: "\xff"},
+	))
+	m, in := c.Result()
+	for i, want := range []string{"", "", "", "", "file_budget", "binary", "binary"} {
+		if m.Entries[i].Reason != want {
+			t.Fatalf("entry %d: %+v", i, m.Entries[i])
+		}
+	}
+	if m.Entries[0].SHA256 != m.Entries[1].SHA256 {
+		t.Fatalf("normalized equivalents differ: %+v %+v", m.Entries[0], m.Entries[1])
+	}
+	if len(in) != 3 {
+		t.Fatalf("inputs: %+v", in)
+	}
+	if got := string(in[0].Content); got != "==> case 1\n  PASS ok\r\n" {
+		t.Fatalf("coloured log: %q", got)
+	}
+	if got := string(in[1].Content); got != `a\u{0007}b\u{001B}]0;t\u{001B}[1\u{007F}c\u{202E}d\u{001B}` {
+		t.Fatalf("unsafe runes: %q", got)
+	}
+	if got := string(in[2].Content); got != "[redacted]" {
+		t.Fatalf("split secret: %q", got)
+	}
+}
