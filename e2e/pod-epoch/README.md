@@ -133,8 +133,13 @@ visible through the per-pid `ns/mnt` links), so the proc files of
     `vanished`, and an fd that closed between the listing and the stat is
     ignored; neither is an unreadable item. The script exits nonzero on an
     internal error (no `/data/runner` mount, empty id list, a failing awk).
-  Limits: a mount namespace with no process in it is unreachable; only inodes
-  recorded while the tree existed are matched after deletion. Positive control:
+  A zombie thread-group leader whose other threads still run counts as alive
+  (its unreadable items are reported, not "vanished"), and `NS-SEEN` is emitted
+  for every thread's mount namespace (`task/*/ns/mnt`), so a control namespace is
+  "gone" only if no task holds it.
+  Limits: a mount namespace with no task in it is unreachable (a namespace held
+  only by an nsfs fd or bind mount, with no task, is invisible and would count
+  as gone); only inodes recorded while the tree existed are matched after deletion. Positive control:
   a running container bound to the tree is seen as a strict mount hit in the
   task's own mount namespace and as an `FD` hit on the task's cwd, with the
   task's and dockerd's namespaces read and at least two mount namespaces
@@ -158,15 +163,34 @@ visible through the per-pid `ns/mnt` links), so the proc files of
   gate with `fd`, `cwd`, `root`, `exe` and `maps`, so permissions can only
   trigger the `ns-mnt` item; the reporting paths of the other items are not
   separately triggered (only the vanished-process accounting is seen in
-  ordinary runs).
+  ordinary runs). Synthetic checks of the instrument (not real-daemon results),
+  run on the worker host with the scan body extracted from `lib.sh`: (1) with a
+  `stat` stub that always fails (empty stat output) the pre-fix awk
+  (`NR == FNR`) reported only the 7 permission-denied `ns-mnt` items and none
+  of `cwd`, `root`, `exe`, `fd/<n>`; the fixed awk (`FILENAME == ARGV[1]`)
+  reported `SCANNED pids=39 mountns=1 unreadable=406 vanished=2` including
+  `what=cwd` and `what=root` lines. (2) A python process whose main thread exited
+  via `pthread_exit` while a thread sleeps (leader `State: Z`, 2 tasks): the
+  pre-fix `alive()` answered no, the fixed one answers yes.
 - **Inode retention** (`exp-stopped.sh`). A root process whose cwd is the tree
   keeps its inode allocated after `rm -rf`, because freed inode numbers are
   reused at once (observed). Without it "the recreated directory has a new
   inode" is not decidable from inode numbers. The same holder is the handle for
   listing the deleted directory (`ls -A` on the holder's per-pid `cwd` link, as
   root): its listing right after the deletion is the baseline, and
-  `check.heldA.no-writes` / `check.heldB.no-writes` require it unchanged (and
-  without the cp'd file) after `docker cp` and `docker start`.
+  `obs.heldA.listing_unchanged` / `obs.heldB.listing_unchanged` record whether it
+  is unchanged after `docker cp` and `docker start`. They are observations, not
+  checks: the kernel refuses to create entries in an unlinked directory, so an
+  unchanged listing cannot show that a request avoided writing there. The
+  meaningful checks are `check.start-idle.container-binds-recreated-inode` and
+  `check.start-cbind.container-binds-recreated-inode`: after a successful start,
+  `stat -c %i /w` run inside the container must equal the recreated tree's inode
+  and differ from every held deleted inode (a failed start is an allowed outcome,
+  recorded by `<name>.rc`); the recreated idle tree's inode is held too, so the
+  later `start-cbind` cannot meet a reused number. The tree-M section asserts
+  `check.start-c-mount.fails`, `check.cp-into-c-mount.fails`, and for `start-c-vf`
+  re-resolution plus the same container-inode check (tree-M's original inode is
+  held by a cwd holder).
   `check.cp-into-stopped.reresolution` and `check.start-idle.reresolution` pass
   only if the request failed or the tree was recreated on an inode different from
   every held deleted inode; the recreated tree of an idle start must be empty.
@@ -185,7 +209,17 @@ visible through the per-pid `ns/mnt` links), so the proc files of
   container. `check.<case>.writers-stopped-by-exit` requires the three readings
   identical (size, line count, last lines). The pod is then recreated on the same
   volumes and the restored writer must be `exited`, policy `no`, the file
-  unchanged after 3 s, and no writer process present. Recorded per case:
+  unchanged after 3 s (`check.<case>.restored.log-does-not-grow`; the exited
+  state and the absent writer processes of the new pod are observations,
+  `obs.<case>.restored.*`, as they cannot see an old-epoch survivor). Besides
+  `writers-stopped-by-exit`, `check.<case>.writers-active-until-signal` requires
+  the size at exit to exceed a reading taken just before the signal, and
+  `check.<case>.last-write-not-after-exit` requires the log's last modification
+  time (`stat -c %y` in the busybox helper, which has no sub-second `%Y` and no
+  `date +%N`) to be not after the outer `docker inspect` `State.FinishedAt` of the
+  daemon container (same host kernel clock); both values and their difference are
+  recorded (`last_write_mtime`, `finished_at`, `finished_minus_last_write_ms`).
+  Recorded per case:
   delivery, time to `exited`, size at exit, size after the window, last counters.
   Stand-in: this exercises the outer Docker 29.8.0 engine's containerd/runc stop
   path in place of kubelet plus CRI containerd. They share the shim/runc family;

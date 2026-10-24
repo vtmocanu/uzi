@@ -26,10 +26,11 @@ WINDOW_SECONDS=5
 EXIT_POLL_SECONDS=45
 
 # Executed by the helper container (mounts the run volume read-only at /rv).
-# Prints one line: size, line count, last line, and the last line of each writer.
+# Prints one line: size, line count, mtime (stat %y: busybox has no sub-second
+# %Y; spaces become _), last line, and the last line of each writer.
 READ_SCRIPT='f=/rv/$1/log
 [ -e "$f" ] || { echo "missing-log"; exit 1; }
-echo "size=$(stat -c %s "$f") lines=$(wc -l < "$f") last=$(tail -n 1 "$f") m=$(grep -E "^[0-9]+\$" "$f" | tail -n 1) x=$(grep "^x" "$f" | tail -n 1) c=$(grep "^c" "$f" | tail -n 1)"'
+echo "size=$(stat -c %s "$f") lines=$(wc -l < "$f") mt=$(stat -c %y "$f" | tr " " _) last=$(tail -n 1 "$f") m=$(grep -E "^[0-9]+\$" "$f" | tail -n 1) x=$(grep "^x" "$f" | tail -n 1) c=$(grep "^c" "$f" | tail -n 1)"'
 
 now_us() { echo "${EPOCHREALTIME/[.,]/}"; }
 
@@ -41,17 +42,29 @@ read_log() {
   pe_outer 20 exec "$1" sh -c "$READ_SCRIPT" rd "$2"
 }
 
+# ts_ns <timestamp>: epoch nanoseconds (host GNU date) of a stat %y or RFC 3339 time.
+ts_ns() {
+  local v
+  v=$(date -u -d "$1" +%s%N) || pe_fail "cannot parse time '$1'"
+  [[ $v =~ ^[0-9]+$ ]] || pe_fail "bad time '$1' -> '$v'"
+  echo "$v"
+}
+
 # fresh_read_log <name> <dir>: read it from a new labelled helper container
-# (same image, same volume, read-only), removed after (verified by label).
+# (same image, same volume, read-only) into FRESH_OUT, then remove it (verified by
+# label). Called directly, not through $(...), so the container is registered for
+# the EXIT cleanup in this shell; a failed run or removal fails the experiment.
+FRESH_OUT=''
 fresh_read_log() {
-  local name=$1 out
+  local name=$1 rc=0
+  FRESH_OUT=''
   PE_CONTAINERS+=("$name")
   pe_fill_tmpfs
-  out=$(pe_outer 60 run --name "$name" --label "$PE_LABEL_KEY=$PE_TOKEN" --user 0:0 \
+  FRESH_OUT=$(pe_outer 60 run --name "$name" --label "$PE_LABEL_KEY=$PE_TOKEN" --user 0:0 \
     --entrypoint sh "${PE_TMPFS_ARGS[@]}" -v "$PE_RUN_VOL:/rv:ro" "$PE_IMAGE" \
-    -c "$READ_SCRIPT" rd "$2") || { pe_rm_owned_container "$name" || true; return 1; }
-  pe_rm_owned_container "$name"
-  echo "$out"
+    -c "$READ_SCRIPT" rd "$2") || rc=$?
+  pe_rm_owned_container "$name" || pe_fail "could not remove helper container $name"
+  ((rc == 0)) || pe_fail "fresh helper read failed (rc=$rc)"
 }
 
 # same_log <line...>: all lines identical.
@@ -83,7 +96,7 @@ writer_procs() {
 term_case() {
   local mode=$1 dir=tree-W-$1 T w helper st rc=0 n k
   local s0 s1 t_sig t_exit t_read elapsed delivery spid ns_in ns_out
-  local at_exit after fresh restored held exitinfo
+  local at_exit after fresh restored held exitinfo pre_sig fin last_ns fin_ns
   T=$PE_RUN_DIR/$dir
   w=c-writer-$mode
   helper="$PE_DAEMON-rd-$mode"
@@ -124,6 +137,9 @@ term_case() {
   [[ $PE_EXP_STATUS != INCOMPLETE ]] || pe_exp_finish
 
   # ---- terminate the daemon container from the outer daemon -------------------
+  # The last reading before the signal (writers must still be writing then).
+  pre_sig=$(read_log "$helper" "$dir")
+  pe_res "$mode.log_before_signal" "$pre_sig"
   t_sig=$(now_us)
   case $mode in
     kill)
@@ -162,19 +178,31 @@ term_case() {
   # fresh helper container.
   sleep "$WINDOW_SECONDS"
   after=$(read_log "$helper" "$dir")
-  fresh=$(fresh_read_log "$PE_DAEMON-fr-$mode" "$dir")
+  fresh_read_log "$PE_DAEMON-fr-$mode" "$dir"
+  fresh=$FRESH_OUT
   pe_res "$mode.log_after_window.supplementary" "window=${WINDOW_SECONDS}s $after"
   pe_res "$mode.log_fresh_helper.supplementary" "$fresh"
   pe_res "$mode.size_at_exit" "$(kv "$at_exit" size)"
   pe_res "$mode.size_after_window" "$(kv "$after" size)"
   pe_res "$mode.last_counter" "main=$(kv "$after" m) exec=$(kv "$after" x) child=$(kv "$after" c)"
   pe_check "$mode.writers-stopped-by-exit" same_log "$at_exit" "$after" "$fresh"
+  pe_check "$mode.writers-active-until-signal" test "$(kv "$at_exit" size)" -gt "$(kv "$pre_sig" size)"
+  # The last write (file mtime, kernel clock) is not after the outer runtime's
+  # recorded exit time (dockerd, same host clock). Both values are recorded.
+  fin=$(pe_outer 10 inspect --type container -f '{{.State.FinishedAt}}' "$PE_DAEMON")
+  last_ns=$(ts_ns "$(kv "$after" mt | tr _ ' ')")
+  fin_ns=$(ts_ns "$fin")
+  pe_res "$mode.last_write_mtime" "$(kv "$after" mt)"
+  pe_res "$mode.finished_at" "$fin"
+  pe_res "$mode.finished_minus_last_write_ms" "$(((fin_ns - last_ns) / 1000000))"
+  pe_check "$mode.last-write-not-after-exit" test "$last_ns" -le "$fin_ns"
 
   # ---- recreate the pod on the same volumes; the restored writer is exited ------
   pe_daemon_replace
   st=$(pe_inner 10 inspect -f '{{.State.Status}}|{{.State.ExitCode}}|{{.RestartCount}}|{{.HostConfig.RestartPolicy.Name}}' "$w")
   pe_res "$mode.restored.writer_container" "$st"
-  pe_check "$mode.restored.writer-exited" test "${st%%|*}" = exited
+  # Observation, not a check: a stopped-state read cannot see an old-epoch survivor.
+  pe_res "obs.$mode.restored.writer-exited" "$([[ ${st%%|*} == exited ]] && echo yes || echo no)"
   pe_check "$mode.restored.restart-policy-no" test "${st##*|}" = no
   pe_res "$mode.restored.running_containers" "$(pe_inner 10 ps -q | wc -l)"
   sleep 3
@@ -183,7 +211,8 @@ term_case() {
   pe_check "$mode.restored.log-does-not-grow" same_log "$at_exit" "$restored"
   held=$(writer_procs)
   pe_res "$mode.restored.writer_processes" "$held"
-  pe_check "$mode.restored.no-writer-processes" test "$held" = 0
+  # Observation, not a check: it counts processes of the new pod's pid namespace only.
+  pe_res "obs.$mode.restored.no-writer-processes" "$([[ $held == 0 ]] && echo yes || echo no)"
   pe_rm_owned_container "$helper"
 }
 

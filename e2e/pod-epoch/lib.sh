@@ -782,7 +782,14 @@ min=${mi_dev#*:}
 dev_hex=$(printf '%02x:%02x' "$maj" "$min")
 alive() {
   [ -d "/proc/$1" ] || return 1
-  if grep -q '^State:[[:space:]]*Z' "/proc/$1/status" 2>/dev/null; then return 1; fi
+  if grep -q '^State:[[:space:]]*Z' "/proc/$1/status" 2>/dev/null; then
+    # a zombie thread-group leader whose other threads still run is alive
+    for ts in /proc/$1/task/*/status; do
+      [ -r "$ts" ] || continue
+      grep -q '^State:[[:space:]]*Z' "$ts" 2>/dev/null || return 0
+    done
+    return 1
+  fi
   return 0
 }
 # miss <pid> <item>: unreadable if the process still exists, else it vanished.
@@ -799,6 +806,15 @@ scan_one() {
   p=${d#/proc/}
   [ -d "$d" ] || { gone=1; return; }
   pids=$((pids + 1))
+  # every thread's mount namespace counts as seen (a namespace can be held by a
+  # non-leader thread only), so a control namespace is "gone" only if no task holds it
+  for tn in "$d"/task/*/ns/mnt; do
+    tns=$(readlink "$tn" 2>/dev/null) || continue
+    case "$nsseen" in *" $tns "*) ;; *)
+      nsseen="$nsseen$tns "
+      echo "NS-SEEN ns=$tns" ;;
+    esac
+  done
   if ! ns=$(readlink "$d/ns/mnt" 2>/dev/null) || [ -z "$ns" ]; then
     miss "$p" ns-mnt
     return
@@ -830,7 +846,7 @@ scan_one() {
   fi
   # shellcheck disable=SC2086  # the list is space-separated /proc paths
   if ! stat -L -c '%d:%i %n' $list > "$sto" 2>/dev/null; then
-    missing=$(printf '%s\n' $list | awk 'NR == FNR { ok[$2] = 1; next } !($1 in ok)' "$sto" -) \
+    missing=$(printf '%s\n' $list | awk 'FILENAME == ARGV[1] { ok[$2] = 1; next } !($1 in ok)' "$sto" -) \
       || ierr "awk over stat output failed"
     for it in $missing; do
       case "$it" in
