@@ -1413,7 +1413,18 @@ test("runtime freezes and validates configured policy; first null claim seeds it
     throw new Error("fixture end");
   } };
   try {
-    const r = runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined, { memoryRuntime: memory });
+    const r = runnerWith(() => {
+      // Each execution owns a fresh Codex epoch. A real closed/drained boundary
+      // permits normal teardown before this worker accepts the persisted claim.
+      const rig = codexRig();
+      return { executor: { ...executor, safety: rig.safety,
+        settleForCredentialFreeCapture: rig.settle, withCredentialFreeCapture: rig.capture,
+        run: async ctx => {
+          try { return await executor.run(ctx); }
+          finally { await rig.safety.withBoundary({ boundary: "checkpoint", deadlineMs: 1000 }, async () => {}); }
+        },
+      } };
+    }, fakeGitlab().gitlab, undefined, undefined, { memoryRuntime: memory });
     await r.execute({ ...f.claim, memory_policy: null });
     if (executorError) throw executorError;
     assert.equal(calls, 1, "first null-policy claim enters the actual runner");

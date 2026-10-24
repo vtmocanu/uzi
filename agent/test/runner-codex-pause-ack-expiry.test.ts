@@ -78,6 +78,9 @@ for (const [window, ackMode, origin] of [
         };
       },
     });
+    let terminalDisposal: Awaited<ReturnType<typeof rig.safety.dispose>> | undefined;
+    const dispose = rig.safety.dispose.bind(rig.safety);
+    t.mock.method(rig.safety, "dispose", async (request: Parameters<typeof dispose>[0]) => terminalDisposal = await dispose(request));
     const claim = { ...gitlabClaim(2852), claim_generation: 1, park_run_supported: true };
     const at = { completedCount: 1, total: 2 };
     const exec = new FakeCodexExecutor(rig.safety, async ctx => {
@@ -235,7 +238,15 @@ for (const [window, ackMode, origin] of [
         assert.equal(requests, ackMode === "previous-park" ? 2 : 1);
         assert.equal(deadline.fired(), window === "cleanup" ? 0 : 1);
       }
-      assert.equal(rig.registry.state(), "disposed", "execute disposes safety without reopening it");
+      const healthy = window === "healthy";
+      assert.deepEqual(rig.disposeBoundaries, ["terminal"], "execute joins terminal cleanup exactly once");
+      assert.ok(terminalDisposal);
+      assert.equal(terminalDisposal.kind, healthy ? "disposed" : "incomplete");
+      assert.equal(rig.safety.acceptsTerminalDisposal(terminalDisposal), healthy,
+        "only a clean capture leaves exact terminal proof");
+      assert.equal(rig.registry.state(), healthy ? "disposed" : "poisoned",
+        "deadline or root-cleanup uncertainty remains poisoned after disposal");
+      assert.ok(rig.disposes() >= 1, "terminal cleanup still disposes the owned provider root");
       let called = false;
       await assert.rejects(rig.safety.withBoundary({ boundary: "checkpoint", deadlineMs: 1000 }, async () => { called = true; }));
       assert.equal(called, false, "successor boundary remains refused");

@@ -82,7 +82,7 @@ for (const scenario of ["wallpark", "wallpark-healthy", "wallpark-probe", "clari
       finally { boundaryPending = false; }
     };
     const executor: Executor = {
-      ...(scenario === "wallpark-healthy" ? { safety: rig.safety } : {}),
+      safety: rig.safety,
       withCredentialFreeCapture: scenario === "registry"
         ? async () => ({ kind: "incomplete", errors: [] }) : async (ms, action, purpose, signal, attempt) => {
           if (purpose === "cancel") {
@@ -126,7 +126,8 @@ for (const scenario of ["wallpark", "wallpark-healthy", "wallpark-probe", "clari
         throw new Error("model must stay stopped");
       },
       killAgentTree() {},
-      async settleForCredentialFreeCapture() { return scenario === "registry" ? { kind: "incomplete", errors: [] } : { kind: "observed_empty" }; },
+      settleForCredentialFreeCapture: scenario === "registry"
+        ? async () => ({ kind: "incomplete", errors: [] }) : rig.settle,
     };
     const r = runner(executor, fakeGitlab().gitlab, JOIN_TOKEN, {
       cancellationBudgetFactory: scenario === "late-quiescence" ? () => {

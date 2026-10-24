@@ -74,6 +74,9 @@ describe("M2 serial post-permit completion custody", () => {
       const marker = path.join(runHome, "session.marker");
       const deadline = manualDeadline("finalize");
       const rig = codexRig({ armDeadline: deadline.armDeadline });
+      let terminalDisposal: Awaited<ReturnType<typeof rig.safety.dispose>> | undefined;
+      const dispose = rig.safety.dispose.bind(rig.safety);
+      t.mock.method(rig.safety, "dispose", async (request: Parameters<typeof dispose>[0]) => terminalDisposal = await dispose(request));
       let saved!: Buffer;
       let head!: string;
       let signal: AbortSignal | undefined;
@@ -158,7 +161,14 @@ describe("M2 serial post-permit completion custody", () => {
       assert.equal(checkpoint.mock.callCount(), 0, "no optional remote checkpoint");
       assert.deepEqual(rig.boundaries, ["finalize"], "the real outer boundary completes without nesting");
       assert.deepEqual(rig.disposeBoundaries, ["terminal"]);
-      assert.equal(rig.registry.state(), "disposed");
+      assert.ok(terminalDisposal);
+      assert.equal(terminalDisposal.kind, scenario === "deadline" ? "incomplete" : "disposed");
+      assert.equal(rig.safety.acceptsTerminalDisposal(terminalDisposal), scenario !== "deadline");
+      assert.equal(rig.registry.state(), scenario === "deadline" ? "poisoned" : "disposed");
+      assert.ok(rig.disposes() >= 1, "the provider root is disposed even when deadline uncertainty denies proof");
+      let admitted = false;
+      await assert.rejects(rig.safety.withBoundary({ boundary: "checkpoint", deadlineMs: 1000 }, async () => { admitted = true; }));
+      assert.equal(admitted, false, "terminal cleanup never reopens admission");
       assert.equal(run.isExecuting(claim.run_id), false);
       assert.ok(fs.existsSync(worktreeDirFor(iid)));
       assert.ok(fs.existsSync(marker));
