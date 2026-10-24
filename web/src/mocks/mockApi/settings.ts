@@ -1282,7 +1282,7 @@ export const settingsApi = {
         }
         next = { ...next, default_codex_model: val };
       } else {
-        if (val !== null && CODEX_CURATED_MODELS.includes(val)) {
+        if (val !== null && CODEX_ROLE_MODELS.includes(val)) {
           throw new ApiError(400, "default_claude_model: a Codex model is not valid for the Claude lane");
         }
         if (patch.default_claude_model !== undefined && (patch.default_claude_model?.trim() || null) !== val) {
@@ -1292,12 +1292,11 @@ export const settingsApi = {
       }
     }
     if (patch.default_claude_model !== undefined) {
-      // PRD #1551 M1/D3: blank clears to inherit (null); a curated Codex id is rejected
-      // here (cross-vocabulary 400). The Claude lane otherwise keeps its curated-plus-custom
-      // freedom, so any other id is stored as given.
+      // Blank clears to inherit (null); every known Codex role id is rejected here
+      // (cross-vocabulary 400). Other custom Claude ids remain accepted.
       const trimmed = patch.default_claude_model?.trim() ?? "";
       const val = trimmed === "" ? null : trimmed;
-      if (val !== null && CODEX_CURATED_MODELS.includes(val)) {
+      if (val !== null && CODEX_ROLE_MODELS.includes(val)) {
         throw new ApiError(400, "default_claude_model: a Codex model is not valid for the Claude lane");
       }
       next = { ...next, default_claude_model: val };
