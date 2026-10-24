@@ -51,6 +51,8 @@ function manualANSIText(value: string): string {
       continue;
     }
     if (byte === 0x18 || byte === 0x1a || byte === 0x9c) {
+      // ST dispatches strings, but executes as a raw byte in other states.
+      if (byte === 0x9c && state !== "osc" && state !== "dcs-string" && state !== "sos") output.push(byte);
       state = "ground";
     } else if (byte === 0x1b) {
       // x/ansi's DCS entry accepts ESC as passthrough data.
@@ -63,6 +65,8 @@ function manualANSIText(value: string): string {
       state = "ground";
     } else if (byte >= 0x80) {
       // Raw C1 bytes can occur after a string terminates inside UTF-8 data.
+      // Preserve ExecuteAction bytes; introducers and unassigned bytes emit nothing.
+      if (byte <= 0x9a && byte !== 0x90 && byte !== 0x98) output.push(byte);
       state = byte === 0x9b ? "csi" : byte === 0x90 ? "dcs"
         : byte === 0x9d ? "osc" : [0x98, 0x9e, 0x9f].includes(byte) ? "sos" : "ground";
     } else if (state === "ground") {
