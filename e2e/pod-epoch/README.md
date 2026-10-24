@@ -16,7 +16,7 @@ Experiments (each `bash e2e/pod-epoch/exp-<name>.sh <rootless|rootful|all>`):
 |---|---|---|
 | `exp-restore.sh` | Q2 | what a persisted data root starts before the first API response (`always`, `unless-stopped`, `on-failure`, `no`), after a sidecar restart and after a successor pod; whether anything changes afterwards; the barrier predicate; how a daemon restart is detected |
 | `exp-stopped.sh` | Q3 | a stopped container holds no mount or file reference; what `docker start` and `docker cp` do when the bind source has been deleted |
-| `exp-volumes-build.sh` | Q3 | plain versus bind-option `local` volumes; a build with the tree as context leaves no reference and a cache that outlives the tree |
+| `exp-volumes-build.sh` | Q3 | plain versus bind-option `local` volumes; a build with the tree as context leaves no mount, fd or mapping reference and a cache that outlives the tree |
 | `exp-readonly.sh` | Q4/Q6 | the reclaim predicate's read-only queries change nothing and emit no event |
 
 Each posture runs in its own subshell. Output is machine-greppable:
@@ -122,32 +122,54 @@ visible through the per-pid `ns/mnt` links), so the proc files of
     and root) has a recorded `st_dev:st_ino`, including inodes of since-deleted
     files held open.
   - `MAP`: a memory mapping of a recorded inode on the same device.
-  - `SCANNED pids=<n> mountns=<n>`.
+  - `NS-READ ns=<id> pid=<p>` per mount namespace read, then
+    `SCANNED pids=<n> mountns=<n>`.
   Limits: a mount namespace with no process in it is unreachable; only inodes
   recorded while the tree existed are matched after deletion. Positive control:
   a running container bound to the tree is seen as a strict mount hit in the
-  task's mount namespace and as an `FD` hit on the task's cwd, with at least two
-  mount namespaces scanned; a deleted directory held by a labelled cwd holder
-  process is seen; `exp-volumes-build.sh` shows a bind-option volume's mount in
-  dockerd's own mount namespace. The scanner is also run after removing the
-  control container to show it then reports zero.
+  task's own mount namespace and as an `FD` hit on the task's cwd, with the
+  task's and dockerd's namespaces read and at least two mount namespaces
+  scanned; a deleted directory held by a labelled cwd holder process is seen;
+  `exp-volumes-build.sh` shows a bind-option volume's mount in dockerd's own
+  mount namespace, and a process executing a file in a tree gives the `MAP`
+  control (if that fixture fails, MAP is reported `uncontrolled` and the
+  experiment is INCOMPLETE). The scanner is also run after removing the control
+  container to show it then reports zero. In `exp-stopped.sh` every later scan
+  must have read dockerd's namespace and at least as many namespaces as the
+  control scan less one (the task's own namespace ends with the task), else
+  `scan_complete` reads `scan-incomplete` and the experiment FAILs.
 - **Inode retention** (`exp-stopped.sh`). A root process whose cwd is the tree
   keeps its inode allocated after `rm -rf`, because freed inode numbers are
   reused at once (observed). Without it "the recreated directory has a new
   inode" is not decidable from inode numbers.
 - **Events window** (`exp-restore.sh`). `docker events --since <first-response
-  SystemTime>` for 20 s from the worker container; supplementary, paired with a
-  control that runs a container and requires at least 3 events from the same form
-  of command. Container states are also re-inspected at the end and compared
-  with the first-response inspect.
+  SystemTime>` for 20 s from the worker container (killed by `timeout`);
+  supplementary. It is valid only if its exit status equals the timeout-kill
+  status observed in its control, its stderr is empty and it ran at least 19 s;
+  otherwise `window.instrument-ok` FAILs (`window-instrument-failed`). The
+  control uses the same command shape and the same `--since` form (RFC3339Nano
+  `docker info --format {{.SystemTime}}`, taken just before it runs a container)
+  and requires at least 3 events. Container states are also re-inspected at the
+  end and compared with the first-response inspect.
 - **Markers** (`exp-readonly.sh`). Events are ordered, so a marker volume created
   before the snapshot and the control operations after it bound the query phase
   exactly; no sleep stands in for absence.
-- **Restart detection** (`exp-restore.sh`). `time_to_eof_ms` is measured from just
-  before the trigger command to the exit of the local client (20 ms polling) and
-  includes `docker exec`/`docker restart` start-up (about 100 ms). The rootless
-  socket is hard-linked before the trigger; the held inode stays allocated, so a
-  socket file recreated by the next start must show a different inode.
+- **Restart detection** (`exp-restore.sh`). `supp.time_to_eof_ms` (supplementary)
+  is measured from just before the trigger command to the exit of the local
+  client (20 ms polling) and includes `docker exec`/`docker restart` start-up
+  (about 100 ms). The control holds the idle stream open for 5 s and requires it
+  still open. The rootless socket is hard-linked before the trigger; the held
+  inode stays allocated, so a socket file recreated by the next start must show
+  a different inode; both inodes must read as numbers or the check FAILs.
+  `kill9` records the dockerd pids (with start times) and the daemon
+  container's pid and start time before the kill and requires the target gone
+  afterwards (`kill-delivered`, else `kill-not-delivered`). Rootful delivers it
+  with `docker kill --signal KILL` from the outer daemon (the kill must not
+  depend on dockerd's place in the container's pid namespace; measured here,
+  `docker-init` is PID 1 and dockerd is not); rootless kills the recorded pids from inside (dockerd is rootlesskit's
+  child). The delivery used is a RESULT line. The rootless recovery key is
+  `recovery.harness_tmpfs_runtime_dir` because rootless `XDG_RUNTIME_DIR` is a
+  per-start tmpfs here (production: a pod-lifetime `emptyDir`).
 
 ## Safety rules
 
@@ -180,8 +202,17 @@ Deviations:
   overlay is not assumed). Flags only would make the image entrypoint add
   `--host=tcp://0.0.0.0:2375` and publish it on the shared bridge with TLS off.
   Production rootless keeps `/certs` TLS on 2376; the harness binds unix only.
-  After every daemon start the harness checks (read-only, via `/proc/net/tcp*`)
-  that nothing listens on a non-loopback TCP port and fails otherwise.
+  After every daemon start, restart and first response, and after the Swarm
+  control's init (which binds `--listen-addr 127.0.0.1:2377`, `--data-path-addr
+  127.0.0.1`), the harness checks (read-only, via `/proc/net/tcp*`) that nothing
+  listens on a non-loopback TCP port and fails otherwise. (A raw `docker restart`
+  inside an experiment is covered where the script calls the check; the
+  `restore` experiment calls it after each restart, kill and recreate.)
+- Image `VOLUME` paths not mounted by a harness volume (`/var/lib/docker`, and
+  rootless also `/home/rootless/.local/share/docker`) get a tmpfs in the pause,
+  worker, helper and (where applicable) daemon containers, so no unlabelled
+  anonymous volume is created; `pe_assert_no_anon_volumes` inspects the pod's
+  containers read-only after each start and fails on any other volume.
 - The rootful posture omits production's MTU cap and the `--config-file`
   default-network-opts; it uses the image defaults.
 - Rootless mounts a tmpfs at `/run/dind` (uid/gid 1000, `XDG_RUNTIME_DIR`: pid
@@ -190,8 +221,8 @@ Deviations:
   harness volume shared with the worker container (production: one `dind-sock`
   emptyDir for both; the socket persists across a sidecar restart, the rest of
   `XDG_RUNTIME_DIR` does not here).
-- Rootless: a labelled one-shot helper container chowns the two fresh volumes to
-  1000:1000 (in a pod, `fsGroup`/subPath setup does this).
+- Rootless: a labelled one-shot helper container chowns the three fresh volumes
+  (data root, `/data/runner`, socket) to 1000:1000 (in a pod, `fsGroup`/subPath setup does this).
 - Rootful runs `dockerd --host=tcp://127.0.0.1:2375 --tls=false --storage-driver=vfs`.
 - The worker container does not mount `/data/runner`; act on the tree with
   `pe_inner_sh` (as the daemon uid) or `pe_root_sh`. The worker is a docker CLI

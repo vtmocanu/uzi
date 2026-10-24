@@ -3,7 +3,7 @@
 # entry keep a reference into a tree?
 #   1. a plain `local` volume has no Options; a bind-option `local` volume does
 #      (and bind-mounts the tree into dockerd's mount namespace while in use);
-#   2. a build whose context is the tree leaves no mount or file reference to it
+#   2. a build whose context is the tree leaves no mount, fd or mapping reference to it
 #      and a build cache that survives the tree's deletion and a daemon restart.
 # Usage: exp-volumes-build.sh <rootless|rootful|all>
 # Output: RESULT volumes-build <posture> <key>=<value> ... then EXP volumes-build <posture> PASS|FAIL|INCOMPLETE.
@@ -28,10 +28,7 @@ scan_summary() { # scan_summary <label> <scan-output>: record counts, set SCAN_R
   pe_res "$label.scanned" "$(grep '^SCANNED ' <<<"$out" | tail -1)"
 }
 
-# dockerd_mntns: the mount namespace id of dockerd.
-dockerd_mntns() {
-  pe_root_sh 10 'readlink /proc/$(pidof dockerd | cut -d" " -f1)/ns/mnt'
-}
+dockerd_mntns() { pe_dockerd_mntns; }
 
 # strict_in_ns <scan-output> <ns>: number of MNT-STRICT hits inside that namespace.
 strict_in_ns() {
@@ -43,7 +40,7 @@ cache_dump() { pe_inner 60 buildx du --verbose 2>&1; }
 
 run_posture() {
   local posture=$1 img TV TK ids scan dns out vopt n_before n_after types_before types_after
-  local bpid i samples during rc blog
+  local bpid i samples during rc blog TMAP mids gone
   pe_init "$posture"
   pe_exp_begin volumes-build
   img=$PE_FIXTURE_IMAGE
@@ -124,6 +121,29 @@ run_posture() {
   scan_summary control.tree-K-removed "$scan"
   pe_check control.tree-K-clear-before-build test "$SCAN_REFS" -eq 0
 
+  # Positive control for the MAP category: a running process whose executable
+  # is a file inside a tree has that file mapped, so the scanner must report a
+  # MAP line for it (and the exe as an FD line). If that does not show, MAP is
+  # reported as uncontrolled and the experiment is INCOMPLETE.
+  TMAP=$PE_RUN_DIR/tree-MAP
+  pe_inner_sh 20 "mkdir -p '$TMAP' && cp /bin/busybox '$TMAP/busybox'"
+  mids=$(pe_tree_ids "$TMAP")
+  if pe_inner 60 run -d --name c-map --entrypoint /w/busybox -v "$TMAP:/w" "$img" sleep 600 >/dev/null 2>&1; then
+    scan=$(pe_tree_scan "$TMAP" "$mids")
+    scan_summary control.map-fixture "$scan"
+    if grep -q '^MAP ' <<<"$scan"; then
+      pe_res control.map PASS
+    else
+      pe_res control.map "uncontrolled (a process executing a file in the tree produced no MAP line)"
+      pe_incomplete map-category "positive control failed: no MAP line for a mapped executable"
+    fi
+    pe_inner 60 rm -f c-map >/dev/null
+  else
+    pe_res control.map "uncontrolled (could not run the mapping fixture)"
+    pe_incomplete map-category "mapping fixture did not run"
+  fi
+  pe_inner_sh 20 "rm -rf '$TMAP'"
+
   if ! pe_inner 30 buildx version >/dev/null 2>&1; then
     pe_incomplete buildx "docker buildx is not available in the daemon container"
     pe_exp_finish
@@ -175,7 +195,8 @@ run_posture() {
   pe_res cache.after_build.df "$(pe_inner 60 system df -v 2>&1 | grep -A2 -i 'build cache' | head -4 | cut -c1-160)"
 
   pe_inner_sh 20 "rm -rf '$TK'"
-  pe_check tree-K.deleted test ! -n "$(pe_inner_sh 10 "ls -d '$TK' 2>/dev/null" || true)"
+  gone=$(pe_inner_sh 10 "if [ -e '$TK' ]; then echo present; else echo gone; fi") || gone=exec-failed
+  pe_check tree-K.deleted test "$gone" = gone
   out=$(cache_dump) || true
   n_after=$(grep -c '^ID:' <<<"$out" || true)
   types_after=$(grep '^Type:' <<<"$out" | sort | uniq -c | tr '\n' ';')

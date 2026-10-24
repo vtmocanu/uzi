@@ -32,6 +32,8 @@ PE_DATA_VOL=''
 PE_RUN_VOL=''
 PE_SOCK_VOL=''
 PE_SOCK_DIR=''
+PE_IMAGE_VOLUMES=()
+PE_TMPFS_ARGS=()
 PE_DEADLINE=0
 PE_CONTAINERS=()
 PE_VOLUMES=()
@@ -88,14 +90,6 @@ pe_inner_sh() {
     "XDG_RUNTIME_DIR=/run/dind" sh -c "$script"
 }
 
-# Same as pe_inner_sh with a fixed cap outside the shared deadline, so teardown
-# paths still run after the deadline is spent. Never calls pe_fail.
-pe_inner_sh_fixed() {
-  local cap=$1 script=$2
-  timeout --kill-after=2s "${cap}s" docker exec "$PE_DAEMON" env -i "PATH=$PE_PATH" \
-    "XDG_RUNTIME_DIR=/run/dind" sh -c "$script"
-}
-
 # pe_init <rootless|rootful>
 pe_init() {
   [[ -z $PE_TOKEN ]] || pe_fail 'pe_init already called in this shell'
@@ -109,6 +103,7 @@ pe_init() {
     rootless)
       PE_IMAGE=$PE_ROOTLESS_IMAGE
       PE_DATA_ROOT=/home/rootless/.local/share/docker
+      PE_IMAGE_VOLUMES=(/var/lib/docker /home/rootless/.local/share/docker)
       # The socket sits on a volume shared with the worker container (in
       # production it is the pod-lifetime dind-sock emptyDir). XDG_RUNTIME_DIR
       # (pid files, rootlesskit state) stays a per-start tmpfs.
@@ -118,6 +113,7 @@ pe_init() {
     rootful)
       PE_IMAGE=$PE_ROOTFUL_IMAGE
       PE_DATA_ROOT=/var/lib/docker
+      PE_IMAGE_VOLUMES=(/var/lib/docker)
       PE_ENDPOINT=tcp://127.0.0.1:2375
       ;;
     *) pe_fail "unknown posture: $PE_POSTURE" ;;
@@ -145,6 +141,39 @@ pe_init() {
   fi
 }
 
+# pe_fill_tmpfs <mounted-path...>: set PE_TMPFS_ARGS to a --tmpfs for every VOLUME
+# path the pinned DinD images declare that the container does not already mount,
+# so docker never creates an unlabelled anonymous volume for it.
+pe_fill_tmpfs() {
+  local v m skip
+  PE_TMPFS_ARGS=()
+  for v in "${PE_IMAGE_VOLUMES[@]}"; do
+    skip=0
+    for m in "$@"; do
+      [[ $v != "$m" ]] || skip=1
+    done
+    ((skip)) || PE_TMPFS_ARGS+=(--tmpfs "$v")
+  done
+}
+
+# pe_assert_no_anon_volumes: read-only `docker inspect` of the pod's containers;
+# fails if any mount is a volume other than a harness-owned one.
+pe_assert_no_anon_volumes() {
+  local name mounts v vol known
+  for name in "$PE_PAUSE" "$PE_WORKER" "$PE_DAEMON"; do
+    mounts=$(pe_outer 10 inspect --type container \
+      --format '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}} {{end}}{{end}}' "$name") \
+      || pe_fail "anonymous-volume check: inspect failed for $name"
+    for v in $mounts; do
+      known=0
+      for vol in "${PE_VOLUMES[@]}"; do
+        [[ $v != "$vol" ]] || known=1
+      done
+      ((known)) || pe_fail "unlabelled volume $v mounted in $name"
+    done
+  done
+}
+
 pe_volumes_create() {
   local vol
   for vol in "$PE_DATA_VOL" "$PE_RUN_VOL"; do
@@ -158,8 +187,9 @@ pe_volumes_create() {
     # one-shot helper (same image, no daemon started).
     local helper="$PE_DAEMON-init"
     PE_CONTAINERS+=("$helper")
+    pe_fill_tmpfs "$PE_DATA_ROOT"
     pe_outer 60 run --name "$helper" --label "$PE_LABEL_KEY=$PE_TOKEN" \
-      --user 0:0 --entrypoint sh \
+      --user 0:0 --entrypoint sh "${PE_TMPFS_ARGS[@]}" \
       -v "$PE_DATA_VOL:$PE_DATA_ROOT" -v "$PE_RUN_VOL:$PE_RUN_DIR" \
       -v "$PE_SOCK_VOL:$PE_SOCK_DIR" "$PE_IMAGE" \
       -c "mkdir -p $PE_DATA_ROOT $PE_RUN_DIR && chown 1000:1000 $PE_DATA_ROOT $PE_RUN_DIR $PE_SOCK_DIR" >/dev/null
@@ -214,21 +244,25 @@ pe_assert_no_public_listener() {
 #           the container and make "stream ended" meaningless).
 #   daemon  the DinD sidecar.
 pe_create_pause() {
+  pe_fill_tmpfs
   pe_outer 30 create --name "$PE_PAUSE" --label "$PE_LABEL_KEY=$PE_TOKEN" --network bridge \
-    --entrypoint sleep "$PE_IMAGE" 1000000 >/dev/null
+    "${PE_TMPFS_ARGS[@]}" --entrypoint sleep "$PE_IMAGE" 1000000 >/dev/null
 }
 
 pe_create_worker() {
   local wargs=(create --name "$PE_WORKER" --label "$PE_LABEL_KEY=$PE_TOKEN"
     --network "container:$PE_PAUSE" --entrypoint sleep)
   [[ $PE_POSTURE != rootless ]] || wargs+=(--user 1000:1000 -v "$PE_SOCK_VOL:$PE_SOCK_DIR")
-  pe_outer 30 "${wargs[@]}" "$PE_IMAGE" 1000000 >/dev/null
+  pe_fill_tmpfs
+  pe_outer 30 "${wargs[@]}" "${PE_TMPFS_ARGS[@]}" "$PE_IMAGE" 1000000 >/dev/null
 }
 
 pe_create_daemon() {
   local args=(create --name "$PE_DAEMON" --label "$PE_LABEL_KEY=$PE_TOKEN"
     --privileged --network "container:$PE_PAUSE"
     -v "$PE_DATA_VOL:$PE_DATA_ROOT" -v "$PE_RUN_VOL:$PE_RUN_DIR")
+  pe_fill_tmpfs "$PE_DATA_ROOT"
+  args+=("${PE_TMPFS_ARGS[@]}")
   case $PE_POSTURE in
     rootless)
       # Explicit command: with flags only, the image entrypoint adds
@@ -263,6 +297,7 @@ pe_daemon_container_recreate() {
   pe_outer 30 start "$PE_DAEMON" >/dev/null
   pe_wait_ready
   pe_assert_no_public_listener
+  pe_assert_no_anon_volumes
 }
 
 # pe_daemon_start: start the pod (pause, worker) and the daemon; wait ready.
@@ -272,6 +307,7 @@ pe_daemon_start() {
   pe_outer 30 start "$PE_DAEMON" >/dev/null
   pe_wait_ready
   pe_assert_no_public_listener
+  pe_assert_no_anon_volumes
 }
 
 pe_daemon_create_start() {
@@ -291,6 +327,7 @@ pe_pod_remove() {
 pe_daemon_restart() {
   pe_outer 60 restart --time 10 "$PE_DAEMON" >/dev/null
   pe_wait_ready
+  pe_assert_no_public_listener
 }
 
 # Successor pod epoch: a new pod (new network namespace, new worker container)
@@ -462,7 +499,8 @@ ps=$(docker --host "$E" ps -a --no-trunc --format '{{.ID}}|{{.Names}}|{{.State}}
 ids=$(echo "$ps" | cut -d'|' -f1)
 # shellcheck disable=SC2086
 [ -z "$ids" ] || docker --host "$E" inspect -f 'FR_INSPECT {{.Name}}|{{.State.Status}}|{{.State.StartedAt}}|{{.State.ExitCode}}|{{.RestartCount}}|{{.HostConfig.RestartPolicy.Name}}' $ids || { echo "FR_ERR inspect"; exit 1; }
-docker --host "$E" plugin ls -q | sed 's/^/FR_PLUGIN /'
+pl=$(docker --host "$E" plugin ls -q) || { echo "FR_ERR plugin"; exit 1; }
+[ -z "$pl" ] || echo "$pl" | sed 's/^/FR_PLUGIN /'
 echo FR_DONE
 EOS
   PE_FR_RC=''
@@ -690,7 +728,8 @@ pe_tree_ids() {
 }
 
 # pe_tree_scan <tree> <ids>: print reference lines, then a summary line
-# `SCANNED pids=<n> mountns=<n>`. <ids> is the output of pe_tree_ids, taken
+# `SCANNED pids=<n> mountns=<n>`, with one `NS-READ ns=<id> pid=<p>` line per
+# mount namespace whose mountinfo was read. <ids> is the output of pe_tree_ids, taken
 # while the tree existed.
 pe_tree_scan() {
   local tree=$1 ids=$2 body script
@@ -716,6 +755,7 @@ for d in /proc/[0-9]*; do
     if cat "$d/mountinfo" > /tmp/pe-mi.$$ 2>/dev/null; then
       seen="$seen$ns "
       nsn=$((nsn + 1))
+      echo "NS-READ ns=$ns pid=$p"
       awk -v ns="$ns" -v pid="$p" -v dev="$mi_dev" -v R="$mi_root" -v rel="$rel" '
         { strict = ($3 == dev && ($4 == R "/" rel || index($4, R "/" rel "/") == 1))
           if (strict) print "MNT-STRICT ns=" ns " pid=" pid " " $0
@@ -733,6 +773,15 @@ echo "SCANNED pids=$pids mountns=$nsn"
 EOS
   script="tree='$tree'"$'\n'"idsf=/tmp/pe-ids.\$\$"$'\n'"cat > \"\$idsf\" <<'PEIDS'"$'\n'"$ids"$'\n'"PEIDS"$'\n'"$body"$'\n''rm -f "$idsf"'
   pe_root_sh 60 "$script"
+}
+
+# pe_dockerd_mntns: the mount namespace id of dockerd (in rootless, the
+# rootlesskit child's namespace), from its per-process ns/mnt link.
+pe_dockerd_mntns() {
+  local ns
+  ns=$(pe_root_sh 10 'readlink /proc/$(pidof dockerd | cut -d" " -f1)/ns/mnt') || pe_fail 'cannot read the dockerd mount namespace'
+  [[ $ns == 'mnt:['* ]] || pe_fail "bad dockerd mount namespace: $ns"
+  echo "$ns"
 }
 
 # pe_scan_refs <scan-output>: count of reference lines (everything but SCANNED).

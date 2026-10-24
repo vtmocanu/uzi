@@ -58,8 +58,45 @@ scan_summary() { # scan_summary <label> <scan-output>: prints counts, sets SCAN_
   pe_res "$label.scanned" "$(grep '^SCANNED ' <<<"$out" | tail -1)"
 }
 
+DOCKERD_NS=''
+CTL_NSN=0
+
+# scan_complete <label> <scan-output>: a "zero references" reading counts only if
+# the scan read dockerd's own mount namespace and at least as many namespaces as
+# the control scan did less one (the task's own namespace ends with the task).
+scan_complete() {
+  local label=$1 out=$2 n
+  n=$(grep '^SCANNED ' <<<"$out" | sed -n 's/.*mountns=\([0-9]*\).*/\1/p' | tail -1)
+  if [[ $n =~ ^[0-9]+$ ]] && ((n >= CTL_NSN - 1)) && grep -qF "NS-READ ns=$DOCKERD_NS " <<<"$out"; then
+    pe_res "$label.scan_complete" "yes mountns=$n control_mountns=$CTL_NSN dockerd_ns_read=yes"
+  else
+    pe_res "$label.scan_complete" "scan-incomplete mountns=${n:-?} control_mountns=$CTL_NSN dockerd_ns=$DOCKERD_NS"
+    pe_mark_fail
+  fi
+}
+
+# assert_deleted <label> <path>: record the tree state and require that it is gone.
+assert_deleted() {
+  local state
+  state=$(tree_state "$2")
+  pe_res "$1" "$state"
+  pe_check "$1.exists-no" test "$(state_field "$state" exists)" = no
+}
+
+# ensure_stopped <label> <container>: record the state, force-stop if running.
+ensure_stopped() {
+  local st
+  st=$(pe_inner 10 inspect -f '{{.State.Status}}' "$2")
+  pe_res "$1.state_before" "$st"
+  if [[ $st == running ]]; then
+    pe_inner 60 stop -t 2 "$2" >/dev/null
+    pe_res "$1.forced_stop" yes
+  fi
+  pe_check "$1.stopped" test "$(pe_inner 10 inspect -f '{{.State.Status}}' "$2")" != running
+}
+
 run_posture() {
-  local posture=$1 img T TM state ino0 ino1 ino2 ids out tp scan nsn
+  local posture=$1 img T TM state ino0 ino1 ino2 ids out tp scan nsn tns
   pe_init "$posture"
   pe_exp_begin stopped
   img=$PE_FIXTURE_IMAGE
@@ -86,13 +123,22 @@ run_posture() {
   # task's mountinfo and a process (the task) with cwd in the tree.
   tp=$(pe_inner 10 inspect -f '{{.State.Pid}}' c-bind)
   pe_res control.task_pid "$tp"
+  DOCKERD_NS=$(pe_dockerd_mntns)
+  tns=$(pe_root_sh 10 "readlink /proc/$tp/ns/mnt")
+  pe_res control.namespaces "dockerd=$DOCKERD_NS task=$tns"
   scan=$(pe_tree_scan "$T" "$ids")
   scan_summary control.running "$scan"
   nsn=$(grep '^SCANNED ' <<<"$scan" | sed 's/.*mountns=//')
+  CTL_NSN=$nsn
+  pe_res control.strict_hit_namespaces "$(grep '^MNT-STRICT ' <<<"$scan" | awk '{print $2}' | sort | uniq -c | tr '\n' ';')"
   pe_res control.task_mountinfo "$(pe_root_sh 10 "grep ' /w ' /proc/$tp/mountinfo" || true)"
   pe_res control.task_cwd "$(pe_root_sh 10 "readlink /proc/$tp/cwd; stat -L -c %d:%i /proc/$tp/cwd" | tr '\n' ' ')"
-  if ! grep -q '^MNT-STRICT ' <<<"$scan" || ! grep -q "^FD pid=$tp " <<<"$scan" || ((nsn < 2)); then
-    pe_incomplete tree-scan "positive control failed: scanner did not see the running bind (strict mount hit, task cwd hit, >=2 mount namespaces)"
+  # The scanner must have read the task's and dockerd's namespaces, and the
+  # strict mount hit must be in the task's own namespace.
+  if [[ $tns != 'mnt:['* ]] || ! grep -qF "MNT-STRICT ns=$tns " <<<"$scan" \
+    || ! grep -qF "NS-READ ns=$tns " <<<"$scan" || ! grep -qF "NS-READ ns=$DOCKERD_NS " <<<"$scan" \
+    || ! grep -q "^FD pid=$tp " <<<"$scan" || ((nsn < 2)); then
+    pe_incomplete tree-scan "positive control failed: scanner did not see the running bind (strict mount hit in the task's mount namespace, task cwd hit, task and dockerd namespaces read, >=2 mount namespaces)"
     pe_exp_finish
   fi
   pe_res control.running PASS
@@ -102,18 +148,22 @@ run_posture() {
   pe_res c-bind.mounts_after_stop "$(pe_inner 10 inspect -f '{{json .Mounts}}' c-bind)"
   scan=$(pe_tree_scan "$T" "$ids")
   scan_summary after-stop "$scan"
+  scan_complete after-stop "$scan"
   pe_check after-stop.no-reference test "$SCAN_REFS" -eq 0
 
   pe_daemon_restart
+  DOCKERD_NS=$(pe_dockerd_mntns)
   scan=$(pe_tree_scan "$T" "$ids")
   scan_summary after-restart "$scan"
+  scan_complete after-restart "$scan"
   pe_check after-restart.no-reference test "$SCAN_REFS" -eq 0
 
   # ---- delete tree-B, then docker cp into the stopped container -----------
   hold_cwd "$T" tree-B "$ino0"
   pe_inner_sh 20 "rm -rf '$T'"
-  pe_res tree-B.after_rm "$(tree_state "$T")"
+  assert_deleted tree-B.after_rm "$T"
   scan=$(pe_tree_scan "$T" "$ids")
+  scan_complete after-rm "$scan"
   # Positive control for deleted inodes: the holder's cwd is the deleted tree.
   pe_res control.deleted_inode_fd "$(grep -c '^FD ' <<<"$scan" || true)"
   pe_check control.deleted-inode-visible test "$(grep -c '^FD ' <<<"$scan" || true)" -ge 1
@@ -127,7 +177,6 @@ run_posture() {
     pe_res tree-B.after_cp.recreated yes
     pe_res tree-B.after_cp.inode_differs "$([[ $ino1 != "$ino0" ]] && echo yes || echo no)"
     pe_res tree-B.after_cp.file "$(pe_inner_sh 10 "cat '$T/pe-cpfile' 2>&1" || true)"
-    pe_check after-cp.new-inode test "$ino1" != "$ino0"
     hold_cwd "$T" tree-B-cp "$ino1"
   else
     pe_res tree-B.after_cp.recreated no
@@ -139,7 +188,7 @@ run_posture() {
   pe_inner_sh 20 "mkdir -p '$T'"
   pe_inner 60 create --name c-bind-idle -v "$T:/w" "$img" sleep 600 >/dev/null
   pe_inner_sh 20 "rm -rf '$T'"
-  pe_res tree-B.before_idle_start "$(tree_state "$T")"
+  assert_deleted tree-B.before_idle_start "$T"
   attempt start-idle pe_inner 60 start c-bind-idle
   state=$(tree_state "$T")
   pe_res tree-B.after_idle_start "$state"
@@ -147,14 +196,16 @@ run_posture() {
   if [[ $state == exists=yes* ]]; then
     pe_res tree-B.after_idle_start.recreated yes
     pe_res tree-B.after_idle_start.empty "$([[ ${state##*list=} == '' ]] && echo yes || echo no)"
-    pe_check after-idle-start.new-inode-vs-initial test "$ino2" != "$ino0"
-    pe_check after-idle-start.new-inode-vs-cp test "$ino2" != "$ino1"
+    # Observations only: the cwd holders keep the earlier inode numbers allocated.
+    pe_res tree-B.after_idle_start.inode_differs_from_initial "$([[ $ino2 != "$ino0" ]] && echo yes || echo no)"
+    pe_res tree-B.after_idle_start.inode_differs_from_cp "$([[ $ino2 != "$ino1" ]] && echo yes || echo no)"
   else
     pe_res tree-B.after_idle_start.recreated no
   fi
   pe_inner 60 stop -t 2 c-bind-idle >/dev/null
 
   pe_inner_sh 20 "rm -rf '$T'"
+  assert_deleted tree-B.before_cbind_start "$T"
   attempt start-cbind pe_inner 60 start c-bind
   state=$(tree_state "$T")
   pe_res tree-B.after_cbind_start "$state"
@@ -166,14 +217,21 @@ run_posture() {
   pe_inner_sh 20 "mkdir -p '$TM'"
   pe_inner 60 run -d --name c-mount --mount "type=bind,src=$TM,dst=/w" "$img" sleep 600 >/dev/null
   pe_inner 60 create --name c-vf --volumes-from c-mount "$img" sleep 600 >/dev/null
-  pe_inner 60 stop -t 2 c-mount >/dev/null
+  ensure_stopped c-mount.before-delete c-mount
   pe_inner_sh 20 "rm -rf '$TM'"
+  assert_deleted tree-M.before_start_c_mount "$TM"
   attempt start-c-mount pe_inner 60 start c-mount
   pe_res tree-M.after_start_c_mount "$(tree_state "$TM")"
+  # c-mount is running again after its start: stop it so the cp and the
+  # volumes-from start act on a stopped container with a deleted source.
+  ensure_stopped c-mount.before-cp c-mount
   pe_inner_sh 20 "rm -rf '$TM'"
+  assert_deleted tree-M.before_cp_c_mount "$TM"
   attempt cp-into-c-mount pe_inner 30 cp /tmp/pe-cpfile c-mount:/w/
   pe_res tree-M.after_cp_c_mount "$(tree_state "$TM")"
+  ensure_stopped c-mount.before-c-vf c-mount
   pe_inner_sh 20 "rm -rf '$TM'"
+  assert_deleted tree-M.before_start_c_vf "$TM"
   attempt start-c-vf pe_inner 60 start c-vf
   pe_res tree-M.after_start_c_vf "$(tree_state "$TM")"
 

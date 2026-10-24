@@ -63,7 +63,7 @@ record_pre() {
 
 # parse_fr <file>: fill FR_* from a first-response poller output.
 parse_fr() {
-  local file=$1 line rest nm st sa ec rc pol
+  local file=$1 line rest nm st sa ec rc pol fr_done=0
   FR_STATUS=() FR_STARTED=() FR_EXIT=() FR_RESTARTS=() FR_POLICY=() FR_LIST=()
   FR_SWARM='' FR_LIVE='' FR_ID='' FR_TIME='' FR_PLUGINS=0 FR_PROBES=''
   while IFS= read -r line; do
@@ -90,9 +90,11 @@ parse_fr() {
         FR_POLICY[$nm]=$pol
         ;;
       'FR_PLUGIN '*) FR_PLUGINS=$((FR_PLUGINS + 1)) ;;
+      FR_DONE) fr_done=1 ;;
       FR_ERR*) pe_fail "first-response poller: $line" ;;
     esac
   done <"$file"
+  ((fr_done)) || pe_fail "first-response poller did not finish (no FR_DONE): $(tail -3 "$file")"
   [[ -n $FR_TIME && -n $FR_ID ]] || pe_fail "first-response poller produced no info line: $(head -3 "$file")"
 }
 
@@ -118,8 +120,26 @@ read_end_states() {
   done
 }
 
+# daemon_log_tail: the daemon container's last log lines, for failure messages.
+daemon_log_tail() { timeout --kill-after=2s 10s docker logs --tail 6 "$PE_DAEMON" 2>&1 | cut -c1-200 | tr '\n' '|' || true; }
+
+# window_run <seconds> <since> <outfile>: `docker events --since <since>` in the
+# worker container, killed by `timeout` after <seconds>. Sets WIN_RC (exit status
+# of the whole command) and WIN_MS (elapsed milliseconds); stderr goes to
+# <outfile>.err. Never aborts on a nonzero status: the caller judges it.
+window_run() {
+  local secs=$1 since=$2 out=$3 t0 t1
+  WIN_RC=0
+  t0=${EPOCHREALTIME/[.,]/}
+  pe_outer $((secs + 30)) exec "$PE_WORKER" env -i "PATH=$PE_PATH" sh -c \
+    "timeout $secs docker --host '$PE_ENDPOINT' events --since '$since' --format '{{json .}}'" \
+    >"$out" 2>"$out.err" || WIN_RC=$?
+  t1=${EPOCHREALTIME/[.,]/}
+  WIN_MS=$(((t1 - t0) / 1000))
+}
+
 run_case() { # run_case <restart|replace>
-  local mode=$1 fr evf n restarted stable=1 nev ctl_t ctl_lines running_at_first
+  local mode=$1 fr evf n restarted stable=1 nev ctl_t ctl_lines running_at_first win_rc win_ms win_ok
   fr=$SCRATCH/fr-$mode
   evf=$SCRATCH/window-$mode
   setup_containers
@@ -130,7 +150,11 @@ run_case() { # run_case <restart|replace>
   case $mode in
     restart)
       pe_first_response_start "$fr"
-      pe_outer 60 restart --time 10 "$PE_DAEMON" >/dev/null
+      # --time 30: four fixtures run `sleep` as PID 1 (ignores SIGTERM), so
+      # dockerd's own shutdown waits out their 10 s stop timeout. A 10 s kill
+      # timeout was observed to be followed by "containerd is still running"
+      # and a daemon that never answered (suspected cause: shutdown preempted).
+      pe_outer 60 restart --time 30 "$PE_DAEMON" >/dev/null
       ;;
     replace)
       # A successor pod: the old daemon is killed with its pod; the new pod starts
@@ -143,17 +167,18 @@ run_case() { # run_case <restart|replace>
       pe_outer 30 start "$PE_DAEMON" >/dev/null
       ;;
   esac
-  pe_first_response_wait || pe_fail "first-response poller failed ($mode) rc=$PE_FR_RC bytes=$(wc -c <"$fr"): $(tail -3 "$fr")"
+  pe_first_response_wait || pe_fail "first-response poller failed ($mode) rc=$PE_FR_RC bytes=$(wc -c <"$fr"): $(tail -3 "$fr") daemon-log: $(daemon_log_tail)"
   parse_fr "$fr"
+  pe_assert_no_public_listener
   pe_res "$mode.first_response.time" "$FR_TIME"
   pe_res "$mode.first_response.probes_before_success" "$FR_PROBES"
   pe_res "$mode.first_response.info" "swarm=$FR_SWARM live_restore=$FR_LIVE plugins=$FR_PLUGINS engine_id=$FR_ID"
 
   # The window: an events stream opened with --since = the first-response time.
   # Supplementary: a bounded observation, valid only with its positive control.
-  pe_outer $((WINDOW_SECONDS + 30)) exec "$PE_WORKER" env -i "PATH=$PE_PATH" sh -c \
-    "timeout $WINDOW_SECONDS docker --host '$PE_ENDPOINT' events --since '$FR_TIME' --format '{{json .}}'" \
-    >"$evf" 2>"$evf.err" || true
+  window_run "$WINDOW_SECONDS" "$FR_TIME" "$evf"
+  win_rc=$WIN_RC win_ms=$WIN_MS
+  pe_res "$mode.window.rc" "$win_rc elapsed_ms=$win_ms"
   pe_res "$mode.window.stderr_lines" "$(wc -l <"$evf.err")"
   read_end_states
 
@@ -186,16 +211,27 @@ run_case() { # run_case <restart|replace>
   pe_check "$mode.window.no-events-after-first-response" test "$nev" -eq 0
   pe_check "$mode.window.states-unchanged" test "$stable" -eq 1
 
-  # Positive control for the window instrument: same command form, with a
-  # container run (create/start/die/destroy) that it must see.
-  ctl_t=$(pe_worker_sh 5 'date +%s')
+  # Positive control for the window instrument: the same command shape and the
+  # same --since form (RFC3339Nano daemon SystemTime), with a container run
+  # (create/start/die/destroy) that it must see. Its exit status is also the
+  # reference for what this image's `timeout` returns when it kills the client.
+  ctl_t=$(pe_client 10 info --format '{{.SystemTime}}')
   pe_client 60 run --rm --name evctl "$PE_FIXTURE_IMAGE" true >/dev/null
-  pe_outer 20 exec "$PE_WORKER" env -i "PATH=$PE_PATH" sh -c \
-    "timeout 3 docker --host '$PE_ENDPOINT' events --since '$ctl_t' --format '{{json .}}'" \
-    >"$SCRATCH/ctl-$mode" 2>"$SCRATCH/ctl-$mode.err" || true
+  window_run 3 "$ctl_t" "$SCRATCH/ctl-$mode"
   ctl_lines=$(wc -l <"$SCRATCH/ctl-$mode")
   pe_res "$mode.window.control_events" "$ctl_lines"
+  pe_res "$mode.window.control_rc" "$WIN_RC (the timeout-kill status of this image's timeout)"
   pe_control "$mode.window-sees-events" test "$ctl_lines" -ge 3
+  # The window ran its full bounded time and ended by the timeout kill, with an
+  # empty stderr; any other end (immediate error, early exit) means the
+  # instrument failed and its zero-event reading proves nothing.
+  win_ok=window-instrument-failed
+  if [[ $win_rc == "$WIN_RC" && $WIN_RC != 0 && ! -s $evf.err && ! -s $SCRATCH/ctl-$mode.err ]] \
+    && ((win_ms >= (WINDOW_SECONDS - 1) * 1000)); then
+    win_ok=ok
+  fi
+  pe_res "$mode.window.instrument" "$win_ok (rc=$win_rc expected=$WIN_RC elapsed_ms=$win_ms stderr_bytes=$(wc -c <"$evf.err"))"
+  pe_check "$mode.window.instrument-ok" test "$win_ok" = ok
 }
 
 # ---- barrier predicate ------------------------------------------------------
@@ -208,8 +244,9 @@ run_barrier() {
   pe_inner 60 stop -t 1 b-stopped >/dev/null
   pe_first_response_start "$fr"
   pe_outer 60 restart --time 10 "$PE_DAEMON" >/dev/null
-  pe_first_response_wait || pe_fail "first-response poller failed (barrier) rc=$PE_FR_RC bytes=$(wc -c <"$fr"): $(tail -3 "$fr")"
+  pe_first_response_wait || pe_fail "first-response poller failed (barrier) rc=$PE_FR_RC bytes=$(wc -c <"$fr"): $(tail -3 "$fr") daemon-log: $(daemon_log_tail)"
   parse_fr "$fr"
+  pe_assert_no_public_listener
   pe_res barrier.first_response.info "swarm=$FR_SWARM live_restore=$FR_LIVE plugins=$FR_PLUGINS"
   running=$(count_fr_not_at_rest)
   for n in "${!FR_LIST[@]}"; do
@@ -256,7 +293,17 @@ run_barrier_controls() {
     *) cfg=/etc/docker/daemon.json ;;
   esac
 
-  if out=$(pe_client 60 swarm init --advertise-addr 127.0.0.1 2>&1); then
+  # Swarm control plane bound to loopback only (the pod network is shared); the
+  # data-path address too if this engine accepts it.
+  if out=$(pe_client 60 swarm init --advertise-addr 127.0.0.1 --listen-addr 127.0.0.1:2377 --data-path-addr 127.0.0.1 2>&1); then
+    pe_res control.swarm-init.flags "listen-addr=127.0.0.1:2377 data-path-addr=127.0.0.1"
+  elif out=$(pe_client 60 swarm init --advertise-addr 127.0.0.1 --listen-addr 127.0.0.1:2377 2>&1); then
+    pe_res control.swarm-init.flags "listen-addr=127.0.0.1:2377 (data-path-addr refused)"
+  else
+    out=${out:-init failed}
+  fi
+  if [[ $(pe_client 20 info --format '{{.Swarm.LocalNodeState}}') == active ]]; then
+    pe_assert_no_public_listener
     pe_res control.swarm-active.read "$(info_line)"
     pe_control swarm-state-readable test "$(info_line)" = 'swarm=active live=false'
     pe_client 60 swarm leave --force >/dev/null 2>&1 || true
@@ -279,12 +326,15 @@ run_barrier_controls() {
   pe_inner_sh 10 "mkdir -p \$(dirname $cfg) && printf '%s' '{\"live-restore\":true}' > $cfg"
   pe_outer 60 restart --time 10 "$PE_DAEMON" >/dev/null
   if try_ready 30; then
+    pe_assert_no_public_listener
     pe_res control.live-restore.read "$(info_line)"
     pe_control live-restore-readable test "$(info_line)" = 'swarm=inactive live=true'
   else
     pe_incomplete live-restore-readable "daemon did not start with live-restore on this posture"
   fi
-  pe_inner_sh 10 "rm -f $cfg"
+  # A new container instance (fresh writable layer) drops the config file
+  # whether or not the daemon came up with it, so no separate removal step
+  # (which would abort when the daemon container is down).
   pe_daemon_container_recreate
   pe_check barrier-controls.live-restore-off-again test "$(info_line)" = 'swarm=inactive live=false'
 }
@@ -308,21 +358,48 @@ hold_sock() {
   fi
 }
 
-held_sock_state() { # "recreated" if the socket path now has a different inode than the held one
-  if [[ $PE_POSTURE != rootless ]]; then
-    echo 'n/a (loopback tcp)'
-    return 0
+# held_sock_state: sets HELD_SOCK_STATE ("recreated" if the socket path now has a
+# different inode than the held one, "same-inode" otherwise) and returns 1 when
+# either inode could not be read as a number ("unmeasured").
+HELD_SOCK_STATE=''
+held_sock_state() {
+  HELD_SOCK_STATE='n/a (loopback tcp)'
+  [[ $PE_POSTURE == rootless ]] || return 0
+  local held='' cur=''
+  held=$(pe_worker_sh 5 "stat -c %i $PE_SOCK_DIR/docker.sock.held") || held=''
+  cur=$(pe_worker_sh 5 "stat -c %i $PE_SOCK_DIR/docker.sock") || cur=''
+  pe_worker_sh 5 "rm -f $PE_SOCK_DIR/docker.sock.held" || true
+  if [[ ! $held =~ ^[0-9]+$ || ! $cur =~ ^[0-9]+$ ]]; then
+    HELD_SOCK_STATE="unmeasured (held='$held' now='$cur')"
+    return 1
   fi
-  local held cur
-  held=$(pe_worker_sh 5 "stat -c %i $PE_SOCK_DIR/docker.sock.held")
-  cur=$(pe_worker_sh 5 "stat -c %i $PE_SOCK_DIR/docker.sock")
-  pe_worker_sh 5 "rm -f $PE_SOCK_DIR/docker.sock.held"
-  if [[ $held != "$cur" ]]; then echo "recreated (held=$held now=$cur)"; else echo "same-inode (held=$held now=$cur)"; fi
+  if [[ $held != "$cur" ]]; then HELD_SOCK_STATE="recreated (held=$held now=$cur)"; else HELD_SOCK_STATE="same-inode (held=$held now=$cur)"; fi
+}
+
+# containerd_pidfile_state: read, from the (stopped or running) daemon container's
+# writable layer, the containerd pid file the next start would find. Rootless
+# keeps it under XDG_RUNTIME_DIR, a tmpfs here, which `docker cp` cannot read.
+containerd_pidfile_state() {
+  local path out rc=0
+  case $PE_POSTURE in
+    rootless) path=/run/dind/docker/containerd/containerd.pid ;;
+    *) path=/var/run/docker/containerd/containerd.pid ;;
+  esac
+  timeout --kill-after=2s 20s docker cp "$PE_DAEMON:$path" - >"$SCRATCH/pidfile.tar" 2>"$SCRATCH/pidfile.err" || rc=$?
+  if ((rc == 0)); then
+    out=$(tar -xOf "$SCRATCH/pidfile.tar" 2>&1 | head -c 40) || out='(unreadable)'
+    echo "path=$path exists=yes content=${out//$'\n'/ }"
+  elif grep -qi 'could not find the file' "$SCRATCH/pidfile.err"; then
+    echo "path=$path exists=no"
+  else
+    echo "path=$path exists=unknown cp_rc=$rc err=$(head -c 160 "$SCRATCH/pidfile.err" | tr '\n' ' ')"
+  fi
 }
 
 # detect_case <control|restart|kill9|sigterm>
 detect_case() {
   local mode=$1 ef id_before id_after ino_before ino_after t0 eof_ms rpid worker_up state i recover
+  local ctr_before ctr_started dpids dscript delivery gone how running alive sock_rc rkey e pidlist=''
   ef=$SCRATCH/detect-$mode
   rm_known
   id_before=$(pe_client 20 info --format '{{.ID}}')
@@ -343,10 +420,25 @@ detect_case() {
   pe_control "detect.$mode.stream-open-before-trigger" kill -0 "$PE_EVENTS_PID"
 
   if [[ $mode == control ]]; then
+    # Hold the idle stream open for 5 s: an instrument that closes by itself
+    # (a client or daemon timeout) would otherwise pass as "ends only when told".
+    if pe_events_wait_end 5; then i=ended; else i=open; fi
+    pe_control detect.control.stream-held-open-5s test "$i" = open
     pe_events_stop || pe_fail 'events client not verified gone'
     pe_res "detect.control.end" "$PE_EVENTS_END rc=$PE_EVENTS_RC"
     pe_check detect.control.stream-ends-only-when-stopped test "$PE_EVENTS_END" = stopped
     return 0
+  fi
+
+  # Before a kill: the dockerd pids with their start times, and the daemon
+  # container's pid and start time, so the kill can be shown to have landed.
+  dpids='' ctr_started='' delivery=''
+  if [[ $mode == kill9 ]]; then
+    ctr_before=$(pe_outer 10 inspect --type container --format '{{.State.Pid}} {{.State.StartedAt}}' "$PE_DAEMON")
+    ctr_started=${ctr_before#* }
+    dpids=$(pe_root_sh 10 'for p in $(pidof dockerd); do echo "$p:$(cut -d" " -f22 /proc/$p/stat)"; done' | tr '\n' ' ')
+    pe_res "detect.$mode.target_before" "container_pid_startedat=[$ctr_before] dockerd_pid:starttime=[$dpids] container_init_comm=$(pe_root_sh 5 'cat /proc/1/comm') dockerd_is_pid1=$([[ " $dpids" == *' 1:'* ]] && echo yes || echo no)"
+    [[ -n ${dpids// /} ]] || pe_fail 'no dockerd pid found before kill'
   fi
 
   t0=${EPOCHREALTIME/[.,]/}
@@ -356,17 +448,61 @@ detect_case() {
       pe_outer 70 restart --time 10 "$PE_DAEMON" >/dev/null &
       rpid=$!
       ;;
-    kill9) pe_root_sh 10 'kill -9 $(pidof dockerd)' ;;
+    kill9)
+      # Rootful: deliver from the outer daemon, so the kill does not depend on
+      # dockerd's place in the pid namespace (an in-namespace SIGKILL to PID 1 is
+      # dropped). Rootless: dockerd is a child of rootlesskit, so an in-container
+      # kill reaches it. Either way the effect is verified below.
+      if [[ $PE_POSTURE == rootful ]]; then
+        delivery=outer-docker-kill
+        pe_outer 20 kill --signal KILL "$PE_DAEMON" >/dev/null || delivery='outer-docker-kill (command failed)'
+      else
+        delivery=in-container-kill-9
+        for e in $dpids; do pidlist+="${e%%:*} "; done
+        pe_root_sh 10 "kill -9 $pidlist" || delivery='in-container-kill-9 (command failed)'
+      fi
+      ;;
     sigterm) pe_root_sh 10 'kill -TERM $(pidof dockerd)' ;;
   esac
   if pe_events_wait_end 70; then
     eof_ms=$(((PE_EVENTS_EOF_US - t0) / 1000))
-    pe_res "detect.$mode.time_to_eof_ms" "$eof_ms"
+    pe_res "detect.$mode.supp.time_to_eof_ms" "$eof_ms"
   else
     eof_ms=none
-    pe_res "detect.$mode.time_to_eof_ms" "none within 70 s"
+    pe_res "detect.$mode.supp.time_to_eof_ms" "none within 70 s"
   fi
   if [[ -n $rpid ]]; then wait "$rpid" || pe_fail 'docker restart failed'; fi
+
+  if [[ $mode == kill9 ]]; then
+    # The kill must have removed the target: the container instance ended or was
+    # replaced, or every recorded dockerd pid is gone / has a different start time.
+    dscript='for e in '"$dpids"'; do p=${e%%:*}; s=${e#*:}; cur=$(cut -d" " -f22 /proc/$p/stat 2>/dev/null) || cur=""; [ "$cur" != "$s" ] || { echo alive; exit 0; }; done; echo gone'
+    gone=no how=''
+    for ((i = 0; i < 40; i++)); do
+      running=$(timeout --kill-after=2s 10s docker inspect --type container --format '{{.State.Running}} {{.State.StartedAt}}' "$PE_DAEMON") || {
+        sleep 0.25
+        continue
+      }
+      if [[ ${running%% *} == false ]]; then
+        gone=yes how=daemon-container-exited
+        break
+      fi
+      if [[ ${running#* } != "$ctr_started" ]]; then
+        gone=yes how=daemon-container-replaced
+        break
+      fi
+      alive=$(pe_root_sh 5 "$dscript") || alive=exec-failed
+      if [[ $alive == gone ]]; then
+        gone=yes how=dockerd-pids-gone
+        break
+      fi
+      sleep 0.25
+    done
+    pe_res "detect.$mode.delivery" "$delivery"
+    pe_res "detect.$mode.kill_effect" "target_gone=$gone how=${how:-none}"
+    if [[ $gone != yes ]]; then pe_res "detect.$mode.failure" kill-not-delivered; fi
+    pe_check "detect.$mode.kill-delivered" test "$gone" = yes
+  fi
   pe_events_stop || pe_fail 'events client not verified gone'
   pe_res "detect.$mode.stream_end" "$PE_EVENTS_END rc=$PE_EVENTS_RC"
   pe_check "detect.$mode.stream-ended-by-daemon" test "$PE_EVENTS_END" = ended -a "$eof_ms" != none
@@ -384,6 +520,7 @@ detect_case() {
   # Recovery: first a plain container restart (same writable layer); if that
   # cannot bring the daemon up, a new container instance (what kubelet does).
   if [[ $mode != restart ]]; then
+    pe_res "detect.$mode.containerd_pidfile_before_restart" "$(containerd_pidfile_state)"
     pe_outer 60 restart --time 5 "$PE_DAEMON" >/dev/null || true
     if try_ready 30; then
       recover=same-container-restart-ok
@@ -392,9 +529,17 @@ detect_case() {
       pe_res "detect.$mode.restart_failure_log" "$(timeout --kill-after=2s 10s docker logs --tail 5 "$PE_DAEMON" 2>&1 | cut -c1-200)"
       pe_daemon_container_recreate
     fi
-    pe_res "detect.$mode.recovery" "$recover"
+    rkey=recovery
+    if [[ $PE_POSTURE == rootless ]]; then
+      # Rootless XDG_RUNTIME_DIR (pid files, rootlesskit state) is a per-start
+      # tmpfs in this harness; in production it is a pod-lifetime emptyDir, so a
+      # same-container restart there keeps those files.
+      rkey=recovery.harness_tmpfs_runtime_dir
+    fi
+    pe_res "detect.$mode.$rkey" "$recover"
   fi
   pe_wait_ready
+  pe_assert_no_public_listener
   id_after=$(pe_client 20 info --format '{{.ID}}')
   ino_after=$(sock_inode)
   pe_res "detect.$mode.engine_id_after" "$id_after"
@@ -405,7 +550,10 @@ detect_case() {
   else
     pe_res "detect.$mode.socket_inode_changed_plain" 'n/a (loopback tcp)'
   fi
-  pe_res "detect.$mode.socket_file_vs_held_inode" "$(held_sock_state)"
+  sock_rc=0
+  held_sock_state || sock_rc=1
+  pe_res "detect.$mode.socket_file_vs_held_inode" "$HELD_SOCK_STATE"
+  pe_check "detect.$mode.socket-inodes-measured" test "$sock_rc" -eq 0
 }
 
 run_posture() {
