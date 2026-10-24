@@ -22,7 +22,8 @@
 #
 # EXIT CODES (the convention assert-drain-knobs-render.sh sets):
 #     2 = the instrument is broken (helm/chart missing, or the env var was absent from a
-#         render that was supposed to contain it)
+#         render that was supposed to contain it, or the LimitRange render failed or did
+#         not yield exactly three worker LimitRanges)
 #     1 = a case rendered the wrong value
 #     0 = every property holds
 # `task`'s own rc is 201 for any non-zero.
