@@ -157,12 +157,12 @@ for (const branch of ["no-bare", "verified-successor"] as const) {
           // processProof recheck from acknowledged's independent live guard.
           verified.acknowledged = async () => {
             const value = await acknowledged();
-            assert.equal(value, true, "actual runner FINAL callback authorized this exact successor");
             acknowledgements++;
             // The second check is writeRecovery's pre-commit guard. Omitting
             // runner forwarding then actually publishes the predecessor anchor
             // before a later independent FINAL check can refuse.
             if (acknowledgements === 2) {
+              assert.equal(value, true, "actual runner FINAL callback authorized this exact successor");
               entered.resolve();
               await release.promise;
             }
