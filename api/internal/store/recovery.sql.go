@@ -2242,9 +2242,14 @@ WHERE h.id = $8
         AND r.worker_id = $12::uuid
         AND r.claim_released_at IS NULL
         AND r.branch IS NOT DISTINCT FROM $13::text
+        AND r.kind = $14::text
+        AND r.issue_iid IS NOT DISTINCT FROM $15::bigint
+        AND r.checkpoint_coordinates IS NOT DISTINCT FROM $16::jsonb
+        AND (r.checkpoint_coordinates IS NULL
+             OR fn_checkpoint_coordinates(r) = r.checkpoint_coordinates)
         AND ($7::text <> 'checkpoint' OR (
-            r.kind = $14::text
-            AND r.issue_iid IS NOT DISTINCT FROM $15::bigint
+            (r.kind <> 'task' OR r.checkpoint_coordinates IS NOT NULL)
+            AND fn_checkpoint_coordinates(r)->>'checkpoint_key' = $6::text
         ))
       -- FOR SHARE (here and on the successor hold below): PostgreSQL re-checks a concurrent
       -- change only on the UPDATE's target row, not on rows a subquery merely reads. Locking
@@ -2286,6 +2291,7 @@ type ReleasePredecessorCustodyHoldByLiveAncestryParams struct {
 	CapturedBranch        pgtype.Text `json:"captured_branch"`
 	Kind                  string      `json:"kind"`
 	IssueIid              pgtype.Int8 `json:"issue_iid"`
+	CapturedCoordinates   []byte      `json:"captured_coordinates"`
 }
 
 // Issue #1751 M2: release ONE older-generation hold while the successor generation of the SAME
@@ -2293,7 +2299,7 @@ type ReleasePredecessorCustodyHoldByLiveAncestryParams struct {
 // worker's opinion) that the published target the successor pushed, the predecessor's
 // journaled source and the tip the successor adopted are each an ancestor of (or equal to) the
 // target's head. The target is the run's forge checkpoint ref (refs/uzi-checkpoints/<branch
-// derived from kind + run id + issue iid>) or the run branch; release_target names which and
+// authorized checkpoint key>) or the run branch; release_target names which and
 // release_branch the branch name the proof resolved. Every guard is re-asserted in this one
 // statement so a change between the proof and the write moves ZERO rows (the caller then
 // re-reads and answers state_changed):
@@ -2302,8 +2308,8 @@ type ReleasePredecessorCustodyHoldByLiveAncestryParams struct {
 //   - the run: same owner, still in a LIVE status (the allowlist below), still at the
 //     successor claim generation, still held by the caller worker with its claim unreleased,
 //     on the SAME runs.branch the service captured before it asked the forge (NULL-safe: a
-//     live issue run has none yet) and, for a checkpoint target, the SAME kind and issue iid
-//     the checkpoint branch was derived from;
+//     live issue run has none yet), frozen descriptor, kind and issue iid; a checkpoint
+//     target must still equal the resolver-authorized key;
 //   - the successor generation's OWN hold exists, is still open, and was taken by the same
 //     worker: the durability backstop settle_live.go relies on (a live checkpoint ref can
 //     still be advanced or, once the run ends with no open hold, deleted (PRD #1810), so the
@@ -2331,6 +2337,7 @@ func (q *Queries) ReleasePredecessorCustodyHoldByLiveAncestry(ctx context.Contex
 		arg.CapturedBranch,
 		arg.Kind,
 		arg.IssueIid,
+		arg.CapturedCoordinates,
 	)
 	if err != nil {
 		return 0, err

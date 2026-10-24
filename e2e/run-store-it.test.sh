@@ -184,6 +184,35 @@ root="github.com/vtmocanu/uzi/api/${pkg#./}"
 root="${root%/...}"
 name=TestSweepLiveDB
 case " $* " in
+  *" ^TestTaskCheckpointCrossWorkerRecoveryE2E$ "*)
+    name=TestTaskCheckpointCrossWorkerRecoveryE2E
+    if [ "$SCENARIO" = checkpoint-go-fail ]; then echo "checkpoint process failed"; exit 9; fi
+    cases=(
+      "$name" "$name/creation-hooks"
+      "$name/successful-write" "$name/successful-write/absent-exact-ref"
+      "$name/successful-write/mismatched-exact-ref" "$name/successful-write/unrelated-workbranch"
+      "$name/successful-write/runner-feed"
+      "$name/first-write-refused" "$name/lost-ack-after-requeue"
+    )
+    for mode in successful-write first-write-refused lost-ack-after-requeue; do
+      for old in ClaimRun ReadoptRunsFromSnapshot FrozenReadoptRunsFromSnapshot; do
+        cases+=("$name/$mode/historical-$old")
+      done
+    done
+    for proof in "${cases[@]}"; do
+      if [ "$SCENARIO" != checkpoint-missing-run ] || [ "$proof" != "$MISSING_CASE" ]; then
+        echo "=== RUN   $proof"
+      fi
+      if [ "$SCENARIO" != checkpoint-missing-pass ] || [ "$proof" != "$MISSING_CASE" ]; then
+        echo "        --- PASS: $proof (0.01s)"
+      fi
+    done
+    case "$SCENARIO" in
+      checkpoint-top-skip) echo "--- SKIP: $name (0.01s)" ;;
+      checkpoint-deep-skip) printf '\t            --- SKIP: %s/child (0.01s)\n' "$name" ;;
+    esac
+    printf 'ok\t%s\t0.01s\n' "$root"
+    exit 0 ;;
   *" ^TestCIArtifactsRepairE2E$ "*)
     name=TestCIArtifactsRepairE2E
     if [ "$SCENARIO" = artifact-go-fail ]; then echo "artifact process failed"; exit 9; fi
@@ -270,7 +299,7 @@ for scenario in success optional retained-missing-run retained-missing-pass reta
   : > "$case_dir/expected"
   for pkg in "${expected_pkgs[@]}"; do
     limit=10m
-    if [ "$pkg" = handler ]; then limit=20m; fi
+    if [ "$pkg" = store ] || [ "$pkg" = handler ]; then limit=20m; fi
     if [ "$pkg" = workersvc ]; then limit=45m; fi
     printf '%s\ttest\t-buildvcs=false\t-count=1\t-v\t-race\t-p\t1\t-timeout\t%s\t-run\tLiveDB$\t./internal/%s/...\n' \
       "$dsn" "$limit" "$pkg" >> "$case_dir/expected"
@@ -347,7 +376,7 @@ for scenario in artifact-success artifact-disabled artifact-go-fail artifact-top
   : > "$case_dir/expected"
   for pkg in "${expected_pkgs[@]}"; do
     limit=10m
-    if [ "$pkg" = handler ]; then limit=20m; fi
+    if [ "$pkg" = store ] || [ "$pkg" = handler ]; then limit=20m; fi
     if [ "$pkg" = workersvc ]; then limit=45m; fi
     printf '%s\ttest\t-buildvcs=false\t-count=1\t-v\t-race\t-p\t1\t-timeout\t%s\t-run\tLiveDB$\t./internal/%s/...\n' \
       "$dsn" "$limit" "$pkg" >> "$case_dir/expected"
@@ -377,6 +406,55 @@ for scenario in artifact-success artifact-disabled artifact-go-fail artifact-top
       *) printf 'FAIL: artifact transcript path missing (%s)\n' "$scenario"; fails=$((fails + 1)) ;;
     esac
   else assert_case "non-1 value does not enable artifact proof" test -z "$proof_log"; fi
+done
+
+# Required-name omission controls cover every named case, independently for RUN
+# and PASS, as well as process failure and skips at arbitrary indentation.
+checkpoint_name=TestTaskCheckpointCrossWorkerRecoveryE2E
+checkpoint_cases=(
+  "$checkpoint_name" "$checkpoint_name/creation-hooks"
+  "$checkpoint_name/successful-write"
+  "$checkpoint_name/successful-write/absent-exact-ref"
+  "$checkpoint_name/successful-write/mismatched-exact-ref"
+  "$checkpoint_name/successful-write/unrelated-workbranch"
+  "$checkpoint_name/successful-write/runner-feed"
+  "$checkpoint_name/first-write-refused" "$checkpoint_name/lost-ack-after-requeue"
+)
+for checkpoint_mode in successful-write first-write-refused lost-ack-after-requeue; do
+  for checkpoint_old in ClaimRun ReadoptRunsFromSnapshot FrozenReadoptRunsFromSnapshot; do
+    checkpoint_cases+=("$checkpoint_name/$checkpoint_mode/historical-$checkpoint_old")
+  done
+done
+for scenario in checkpoint-success checkpoint-disabled checkpoint-go-fail checkpoint-top-skip checkpoint-deep-skip checkpoint-missing-run checkpoint-missing-pass; do
+  missing_cases=("")
+  if [[ "$scenario" = checkpoint-missing-* ]]; then missing_cases=("${checkpoint_cases[@]}"); fi
+  for missing in "${missing_cases[@]}"; do
+    case_dir="$(mktemp -d "$TMP/checkpoint-case.XXXXXX")"
+    enabled=1
+    if [ "$scenario" = checkpoint-disabled ]; then enabled=2; fi
+    rc=0
+    PATH="$READYBIN:$PATH" CASE_DIR="$case_dir" SCENARIO="$scenario" MISSING_CASE="$missing" \
+      TMPDIR="$case_dir" UZI_STORE_IT_PG_WAIT_SECS=1 \
+      UZI_CODEX_REFRESH_LOSTREPLY_E2E="" UZI_HEARTBEAT_PROTOCOL_REFRESH_E2E="" \
+      UZI_CI_ARTIFACTS_E2E="" UZI_STALE_WORKER_CANCEL_E2E="" \
+      UZI_TASK_CHECKPOINT_RECOVERY_E2E="$enabled" bash "$SCRIPT" > "$case_dir/output" 2>&1 || rc=$?
+    if [ "$scenario" = checkpoint-success ] || [ "$scenario" = checkpoint-disabled ]; then
+      assert_case "checkpoint success/disabled exits zero" test "$rc" -eq 0
+    else
+      assert_case "checkpoint invalid evidence fails: $missing" test "$rc" -ne 0
+    fi
+    calls="$(wc -l < "$case_dir/go.log")"
+    if [ "$enabled" = 1 ]; then
+      assert_case "normal seven packages plus checkpoint leg" test "$calls" -eq 8
+      assert_case "checkpoint command bounded, uncached, serialized, race-enabled" \
+        grep -Fq "$(printf '\ttest\t-buildvcs=false\t-count=1\t-v\t-race\t-p\t1\t-timeout\t15m\t-run\t^TestTaskCheckpointCrossWorkerRecoveryE2E$\t./internal/workersvc/...')" "$case_dir/go.log"
+      proof_log="$(awk '/^Task checkpoint recovery proof log: / {print $NF}' "$case_dir/output")"
+      assert_case "checkpoint log retained" test -f "$proof_log"
+      case "$proof_log" in "$ROOT/.uzi/scratch/"*) rm -f "$proof_log" ;; esac
+    else
+      assert_case "non-1 value leaves seven-package sweep unchanged" test "$calls" -eq 7
+    fi
+  done
 done
 
 if [ "$fails" -eq 0 ]; then

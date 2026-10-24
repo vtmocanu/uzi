@@ -52,7 +52,9 @@ would launder a real "committed nothing" bug into a green run. So the undeclared
 a reason that names the remedy ("call signal_done with report_only: true"). The
 discrimination is precise: `git.changedFiles` returning `null` means the diff could not be
 computed — that keeps the normal push path (fail-open); only a CONFIRMED `[]` fails. A
-declared `report_only` has already returned before this guard is reached.
+declared `report_only` returns before this guard is reached, except the issue-run fallback
+(#3360, below): it does reach the guard, and a confirmed-empty fetched candidate fails with
+the same #299 reason.
 
 ### 3. A dedicated `report_md` column, not the transcript
 
@@ -90,10 +92,12 @@ report-only run, and an undeclared empty diff now fails loudly with an actionabl
 instead of opening an empty MR.
 
 **Accepted edge — declared report_only + committed work.** The declared path returns BEFORE
-`fetchAgentBranch`, so if a lead declares `report_only` on a run that DID commit code, that
-commit is not pushed — it is discarded when the runner clone is torn down. There is no
-inverse guard. This mirrors the `not_code` precedent, and the lead prompt frames report_only
-as "no code change to land"; documented here, not guarded.
+`fetchAgentBranch`, so if a lead declares `report_only` on a run that DID commit code and
+published no checkpoint, that commit is not pushed — it is discarded when the runner clone is
+torn down. There is no inverse guard for that case; when a committed checkpoint WAS published,
+the issue-run fallback below (#3360) applies instead. This mirrors the `not_code` precedent,
+and the lead prompt frames report_only as "no code change to land"; documented here, not
+guarded.
 
 **Checkpoint/resume: orphan guard (#299, refined by #759 and #2967).** A
 report-only completion opens no branch or MR to supersede a published checkpoint.
@@ -110,7 +114,7 @@ present, otherwise the resolved default branch. It can advance during reclaims:
 coverage over an older published base remains content-free even when today's floor
 tree differs. Conversely, an outside tree matching only the newer floor tip, with
 no matching boundary tree, does not prove content-free coverage.
-An outside tree matching no boundary, or unreadable proof, blocks completion. A confirmed
+An outside tree matching no boundary, or unreadable proof, blocks report-only completion. A confirmed
 publication with an unknown tip also blocks; a genuinely absent checkpoint without
 confirmed publication does not. The existing mirrored marker-only `wip(park):`
 exception (#759) retains its ancestry-based handling.
@@ -118,6 +122,32 @@ exception (#759) retains its ancestry-based handling.
 No checkpoint ref is deleted or rewritten by this guard. Recovery coverage creation,
 preservation and publication are unchanged. This is a content proof for the existing
 report-only decision, not a new worker-to-forge deletion capability.
+
+**Issue-run fallback (#3360).** On issue runs only, when the lead declares `report_only`
+but `hasCommittedCheckpoint` cannot establish that the checkpoint is content-free (same proof as above,
+unchanged), the worker no longer fails the run (#299). It sets a non-closing declaration
+(static worker reason "The lead declared report_only after committing work; the worker
+delivered it without closing the issue."), unless the lead or an earlier persisted claim
+already declared one, and routes the work through normal delivery as a non-closing MR. All
+publication, secret, closing-directive, completion-permit and recovery checks still apply,
+and a failed check still prevents completion.
+
+On interlocked runs whose API negotiates `completion_non_closing_v1`, the forced
+declaration is persisted first through one completion attempt (no milestones, claim
+generation, null worktree fingerprint) before fetch-back and the permit, so a later
+completion hold cannot lose it. A stale claim stops the run as a stale claim; any other
+refusal or exhausted retries keep the #299 failure (fail closed). If the fetched candidate
+diff is confirmed empty, the run fails with the existing #299 reason, scope-capped runs
+included; a diff read failure keeps the fail-open into the normal checks. The prompt-kind
+(#341) zero-diff orphan guard and other run kinds are unchanged.
+
+Known limits: the advisory code cross-check that `report_only` skips is not replayed. When
+the run requires a cross-check and the session produced no cross-check summary, the MR renders
+"Code cross-check incomplete: skipped: report_only was declared", and the persisted cross-check
+status does not replace that disclosure at publication. A summary from an earlier completion
+attempt in the same session is refreshed from the persisted status as usual. Against an API without
+`completion_non_closing_v1` the declaration is not persisted (the documented rollout
+limitation in `docs/worker-upgrades.md`, "Completion publication compatibility").
 
 **`report_md` rides the shared `RunDTO` embed.** `RunListItemDTO` embeds `RunDTO`
 (`api/internal/apitypes/run.go`), so `report_only`/`report_md` appear on the runs LIST as

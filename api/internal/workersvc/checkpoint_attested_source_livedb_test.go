@@ -105,11 +105,11 @@ func TestPublishAttestedSourceSetOnlyLiveDB(t *testing.T) {
 // never attached to the newer tip, and the newer pair stays intact.
 func TestLatePublishNeverBindsSourceToAnotherTipLiveDB(t *testing.T) {
 	f := newLiveAttemptFix(t)
-	late := &checkpointPush{s: f.svc1, runID: f.oldRun, branch: f.branch, ref: f.branchRef, attestedSource: attestText(attestS1)}
+	late := &checkpointPush{s: f.svc1, runID: f.oldRun, checkpointKey: f.branch, ref: f.branchRef, attestedSource: attestText(attestS1)}
 	if err := late.observePublishBase(f.e.ctx); err != nil {
 		t.Fatalf("observePublishBase: %v", err)
 	}
-	newer := &checkpointPush{s: f.svc1, runID: f.oldRun, branch: f.branch, ref: f.branchRef, attestedSource: attestText(attestS2)}
+	newer := &checkpointPush{s: f.svc1, runID: f.oldRun, checkpointKey: f.branch, ref: f.branchRef, attestedSource: attestText(attestS2)}
 	if err := newer.observePublishBase(f.e.ctx); err != nil {
 		t.Fatalf("observePublishBase: %v", err)
 	}
@@ -123,7 +123,7 @@ func TestLatePublishNeverBindsSourceToAnotherTipLiveDB(t *testing.T) {
 
 	// The late push of the SAME tip as the stored one (idempotent arm) carries its own frozen
 	// value with that tip only; an unattested one leaves the pair alone.
-	unattested := &checkpointPush{s: f.svc1, runID: f.oldRun, branch: f.branch, ref: f.branchRef}
+	unattested := &checkpointPush{s: f.svc1, runID: f.oldRun, checkpointKey: f.branch, ref: f.branchRef}
 	if err := unattested.observePublishBase(f.e.ctx); err != nil {
 		t.Fatalf("observePublishBase: %v", err)
 	}

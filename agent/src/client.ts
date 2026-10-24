@@ -1786,11 +1786,11 @@ export class WorkerClient {
         throw new Error("unknown dedicated claim marker");
       }
       // Dedicated requests are bounded even without a marker; unmarked ordinary
-      // claims keep their existing decoder.
+      // claims are read under CLAIM_RESPONSE_MAX_BYTES.
       const claim = (dedicated || marker === "cross_check" || res.headers.has("X-Uzi-Candidate-Identity-Version")
         ? JSON.parse(await readCrossCheckText(res, 2 * 1024 * 1024, deadline,
           dedicated || marker === "cross_check" ? "claim" : undefined))
-        : await res.json()) as ClaimResponse;
+        : JSON.parse(await readBoundedText(res, CLAIM_RESPONSE_MAX_BYTES, true, deadline))) as ClaimResponse;
       if (isRecord(claim) && claim.semantic_planning !== undefined) claim.semantic_planning = parseSemanticEnrollment(claim.semantic_planning);
       // PRD #1230 M4: a present-but-malformed maintainer-pending projection fails the claim closed.
       if (isRecord(claim) && isRecord(claim.config) && Object.hasOwn(claim.config, "completion_pending")) {
@@ -1880,7 +1880,7 @@ export class WorkerClient {
     const res = await this.fetchRaw("POST", path, {});
     if (res.status === 204) return null;
     if (res.status >= 400) throw await this.toError("POST", path, res);
-    const claim = (await res.json()) as ChatClaimResponse;
+    const claim = JSON.parse(await readBoundedText(res, CLAIM_RESPONSE_MAX_BYTES, true)) as ChatClaimResponse;
     validateClaimMemory(claim);
     return claim;
   }
@@ -3586,7 +3586,7 @@ export class WorkerClient {
     }
     const res = await fetch(this.baseUrl + path, init);
     if (res.status !== 200 && res.status !== 201) throw await this.toError("POST", path, res);
-    const text = await res.text();
+    const text = await readBoundedText(res, JOB_FILE_UPLOAD_RESPONSE_MAX_BYTES, true, signal);
     return { status: res.status, file: JSON.parse(text) as JobFileUploadResponse };
   }
 
@@ -3861,6 +3861,7 @@ export class WorkerClient {
   async reportWallPark(
     runId: string,
     args: { head: string; published: boolean; claimGeneration?: number; checkpointContainsLatest?: boolean },
+    signal?: AbortSignal,
   ): Promise<{ applied: boolean; status: string; budgetTotalSeconds?: number; budgetUsedSeconds?: number; completionAttempts?: number }> {
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/wall-park`;
     // Stamp the claim-lane generation through the shared send-gate + skew-safe fallback, exactly as
@@ -3873,7 +3874,7 @@ export class WorkerClient {
       if (includeField) body.claim_generation = args.claimGeneration;
       // PRD #1809 D8: the caller passes it only when the api advertised run_checkpoint_durability.
       if (args.checkpointContainsLatest !== undefined) body.checkpoint_contains_latest = args.checkpointContainsLatest;
-      const res = await this.fetchRaw("POST", path, body);
+      const res = await this.fetchRaw("POST", path, body, this.httpTimeoutMs, signal);
       if (res.status === 200 || res.status === 409) {
         const fields = await readRunAck(res);
         // Issue #1600: a refused park's 409 carries the run's fresh budget; pass it through so the
@@ -4646,6 +4647,19 @@ function retryAfterMsOf(h: string | null): number | undefined {
  * reserving another 64 KiB for keys/metadata stays below 6 MiB. Count actual streamed bytes,
  * never Content-Length; cross-check methods, strict gate and terminal RunDTO ACKs opt in. */
 const CROSS_CHECK_RESPONSE_MAX_BYTES = 6 * 1024 * 1024;
+/** Run and chat claim response budget. Go encoding/json escapes <, > and & and controls at 6 wire
+ * bytes per input byte. Stock worst case: completion_pending 18,955,056 (api
+ * TestSemanticCompletionPendingWireBound); plan_md 1 MiB request cap x6 = 6,291,456; skills at the
+ * default SKILLS_MAX_PER_RUN=32 x SKILL_MAX_BYTES=65,536 x6 = 12,582,912; completion_scope
+ * ~2,517,600; issue_description/job prompt 256 KiB x6 = 1,572,864; other bounded fields (comments,
+ * milestones, resume gate, pr_description, secrets, scalars) ~1.0 MB; builtin agent templates
+ * ~109 KB. Total ~43.3 MB (~41.3 MiB); 4x rounded up is 168 MiB (issue #2306). User/global agent
+ * templates (count and size, each only 1 MiB request-capped) and admin-raised SKILLS_MAX_PER_RUN /
+ * SKILL_MAX_BYTES are NOT server-bounded, so a claim past the cap is refused, never truncated, and
+ * the claim loop logs and retries. Count actual streamed bytes, never Content-Length. */
+const CLAIM_RESPONSE_MAX_BYTES = 168 * 1024 * 1024;
+/** Operational cap on the job-file upload acknowledgment; counts streamed bytes, not Content-Length. */
+const JOB_FILE_UPLOAD_RESPONSE_MAX_BYTES = 64 * 1024;
 /** PRD #1230 M4: a maximally escaped completion_pending projection stays below 20 MiB
  * (api TestSemanticCompletionPendingWireBound). The server's header grants that bounded
  * allowance on top of a state ACK's own cap; the projection must still decode strictly,

@@ -2612,6 +2612,14 @@ describe("issue #2593: lead gate-sequencing append", () => {
 });
 
 
+it("#3360 report_only guidance says it is not how to leave the issue open", () => {
+  const on = buildImplementPrompt({ branch: "b", subagentNames: [], first: true, iteration: 1, reportOnly: true }).replace(/\s+/g, " ");
+  assert.match(on, /`report_only` is not how to leave the issue open/);
+  assert.match(on, /omit `report_only`, and if the issue should stay open declare `non_closing` with a reason/);
+  const off = buildImplementPrompt({ branch: "b", subagentNames: [], first: true, iteration: 1 });
+  assert.ok(!off.includes("`report_only` is not how to leave the issue open"));
+});
+
 it("m2 non-closing guidance reaches the SDK implement builder", () => {
   const prompt = buildImplementPrompt({ branch: "b", subagentNames: [], first: true, iteration: 1 });
   assert.match(prompt, /issue runs only/i);

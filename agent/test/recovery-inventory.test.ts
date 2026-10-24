@@ -5015,3 +5015,28 @@ it("issue3152 live_pass_cap is not logged for dropped records that are not inven
     assert.deepEqual(lines, []);
   } finally { await f.close(); }
 });
+
+for (const key of [undefined, "uzi/task/11111111-1111-4111-8111-111111111111"]) {
+  it("task checkpoint held policy rejects an unbound or foreign key at freeze and journal reload: " + key, async () => {
+    const runId = "22222222-2222-4222-8222-222222222222";
+    const f = await fixture(true, os.tmpdir(), false, runId);
+    try {
+      f.context.kind = "task";
+      for (const candidate of f.state.candidates) for (const context of candidate.contexts) context.kind = "task";
+      const policy = { version: 1 as const, blocked: false, everKnown: false, flaggedCommits: [],
+        ciGlobs: null, confirmedTip: H, checkpointKey: key, extraFloors: [] };
+      const refused = await f.coordinator.freezeInventory({
+        context: f.context, currentSha: H, defaultBranch: "main", heldPolicy: policy,
+      });
+      assert.ok(refused);
+      assert.equal(refused.heldPolicy, undefined, "invalid confirmation cannot become a persisted scan floor");
+      const authorized = { ...policy, checkpointKey: "uzi/task/22222222-2222-4222-8222-222222222222" };
+      await patchAuthenticated(f, refused, { heldPolicy: authorized });
+      assert.deepEqual((await f.make().inspect(runId))[0]?.heldPolicy, authorized,
+        "the exact run key survives an authenticated journal reload without changing branch identity");
+      await patchAuthenticated(f, refused, { heldPolicy: policy });
+      assert.deepEqual(await f.make().inspect(runId), [],
+        "a valid journal MAC cannot authorize another task key or an unbound confirmed tip");
+    } finally { await f.close(); }
+  });
+}

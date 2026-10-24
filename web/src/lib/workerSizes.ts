@@ -15,7 +15,7 @@
 // number in this file that does not come from that golden.
 
 /** Curated size names, in display order (smallest first). Lowercase on the wire. */
-export const WORKER_SIZES = ["s", "m", "l"] as const;
+export const WORKER_SIZES = ["s", "m", "l", "l-highmem"] as const;
 
 export type WorkerSize = (typeof WORKER_SIZES)[number];
 
@@ -53,6 +53,7 @@ export const WORKER_SIZE_SPECS: Record<WorkerSize, WorkerSizeSpec> = {
   s: { cpuLimit: "1", memoryLimit: "4Gi", data: "5Gi" },
   m: { cpuLimit: "4", memoryLimit: "12Gi", data: "25Gi" },
   l: { cpuLimit: "4", memoryLimit: "20Gi", data: "50Gi" },
+  "l-highmem": { cpuLimit: "4", memoryLimit: "32Gi", data: "50Gi" },
 };
 
 /**
@@ -60,7 +61,7 @@ export const WORKER_SIZE_SPECS: Record<WorkerSize, WorkerSizeSpec> = {
  * to M (#2412), whose CPU limit is also 4 but whose memory reservation is smaller.
  * Both presets request 1 CPU; M has 25Gi persistent data and L has 50Gi. L requests
  * 1.75x as much memory (14Gi versus 8Gi), reserving more node capacity even while idle.
- * S and M remain explicit choices; existing
+ * S, M and L-HIGHMEM remain explicit choices; existing
  * workers keep the size stored at creation. Rationale: ADR-2240.
  */
 export const DEFAULT_WORKER_SIZE: WorkerSize = "l";

@@ -682,6 +682,8 @@ func (m tuiModel) workerKind(r workerRow) string {
 		size = "M"
 	case "L":
 		size = "L"
+	case "L-HIGHMEM":
+		size = "LHM"
 	}
 	kind += "·" + size
 	if r.w.Docker != nil && *r.w.Docker {
@@ -761,17 +763,18 @@ func workerMemoryText(w apitypes.WorkerDTO) string {
 	return fmt.Sprintf("%.1fG", used)
 }
 
-type workerTableWidths struct{ memory, version int }
+type workerTableWidths struct{ memory, version, kind int }
 
 // Measure the filtered fleet once; the header and every row share these widths.
 func (m tuiModel) workerTableWidths(rows []workerRow, width int) workerTableWidths {
-	columns := workerTableWidths{memory: workerMemoryMinWidth, version: 8}
+	columns := workerTableWidths{memory: workerMemoryMinWidth, version: 8, kind: 9}
 	for _, row := range rows {
 		text := workerMemoryText(row.w)
 		if workerState(row) == "offline" {
 			text = "~" + text
 		}
 		columns.memory = max(columns.memory, visualWidth(text))
+		columns.kind = max(columns.kind, visualWidth(m.workerKind(row)))
 		marker := 0
 		if row.w.UpgradeStatus == "outdated" || workerRollFailure(row.w.UpgradeStatus) {
 			marker = 1
@@ -780,7 +783,7 @@ func (m tuiModel) workerTableWidths(rows []workerRow, width int) workerTableWidt
 	}
 	// Cursor, name, state, kind, runs, cross-checks, resource cells, heartbeat, eleven separators,
 	// and one attention glyph; factory scope adds owner plus its separator.
-	fixed := 1 + 13 + 10 + 9 + 5 + 6 + workerCPUWidth + columns.memory + workerDiskWidth + 3 + 12
+	fixed := 1 + 13 + 10 + columns.kind + 5 + 6 + workerCPUWidth + columns.memory + workerDiskWidth + 3 + 12
 	if m.board.admin {
 		fixed += 8
 	}
@@ -805,7 +808,7 @@ func (m tuiModel) workerRowLine(r workerRow, selected bool, width int, columns w
 		fields = append(fields, cell(m.workerOwnerCell(r), 7, m.pal.faintC))
 	}
 	state := workerState(r)
-	fields = append(fields, cell(workerStateGlyph(state)+" "+state, 10, m.workerStateColor(state)), cell(m.workerKind(r), 9, m.pal.faintC), cell(workerSlots(r.w), 5, nil), cell(workerCrossCheckSlots(r.w), 6, nil))
+	fields = append(fields, cell(workerStateGlyph(state)+" "+state, 10, m.workerStateColor(state)), cell(m.workerKind(r), columns.kind, m.pal.faintC), cell(workerSlots(r.w), 5, nil), cell(workerCrossCheckSlots(r.w), 6, nil))
 	if width >= 120 {
 		cpu, disk := "?", "?"
 		var cpuC, diskC color.Color
@@ -907,7 +910,7 @@ func (m tuiModel) renderWorkersBody(height int, full bool) string {
 	if width >= 120 && m.board.admin {
 		cols = append(cols, padVisual("OWNER", 7))
 	}
-	cols = append(cols, padVisual("STATE", 10), padVisual("KIND", 9), padVisual("RUNS", 5), padVisual("CHECKS", 6))
+	cols = append(cols, padVisual("STATE", 10), padVisual("KIND", columns.kind), padVisual("RUNS", 5), padVisual("CHECKS", 6))
 	if width >= 120 {
 		cols = append(cols, padVisual("CPU", workerCPUWidth), padVisual("MEM", columns.memory), padVisual("DISK (worst)", workerDiskWidth), padVisual("VERSION", columns.version), padVisual("HB", 3))
 	}

@@ -12,9 +12,10 @@ around it. `S` is `.agents/skills/uzi-lander/scripts/`.
 - **Never push to a `renovate/*` branch.** Renovate rebases and force-pushes it, clobbering
   your commit; `S/land-prep.sh` refuses one. A needed fix goes on your own branch (below).
 - **Renovate rebases only at night** (`renovate.json` `schedule` plus `updateNotScheduled:
-  false`). By day a conflicting Renovate PR stays conflicting: tick its rebase checkbox
-  (honoured outside the schedule, on Renovate's next run, up to 4 h away), or re-apply
-  the same bump on your own branch off `main` and let Renovate close its PR.
+  false`), except vulnerability-alert PRs (`[security]`), which bypass the schedule and
+  hourly limit and can open and update by day. A conflicting non-security Renovate PR
+  normally waits until night: tick its rebase checkbox (honoured outside the schedule, on
+  Renovate's next run, up to 4 h away), or re-apply the same bump on your own branch off `main` and let Renovate close its PR.
 - **Patch updates automerge** (`renovate.json`, first `packageRules` entry): on a run inside
   its night schedule, Renovate rebases a behind branch, then merges once every check is green,
   at most one PR per run. A green patch PR can therefore still be open: awaiting the next

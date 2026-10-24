@@ -143,7 +143,7 @@ export const workersApi = {
       id: `w-hosted-${++workerCounter}`,
       // Empty name → the server derives one from template + size (handler's
       // derivedHostedWorkerName), now AWS-style `base.l-<4-hex>`: dot notation,
-      // lowercase t-shirt letter, random hex suffix. The M5 form sends none, so this
+      // lowercase size name, random hex suffix. The M5 form sends none, so this
       // is the live path. The real suffix is crypto/rand; the mock stands in a
       // counter-derived 4-hex from workerCounter (already ++'d for the id) to stay
       // deterministic-enough for tests — a plausible suffix, not byte-for-byte parity.

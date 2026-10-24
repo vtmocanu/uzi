@@ -474,6 +474,9 @@ describe("buildSignalMcpServer prd_done_path schema gate (PRD #72 M4)", () => {
     const enabled = doneToolShape(buildSignalMcpServer({ reportOnly: true }));
     assert.ok("report_only" in enabled, `expected report_only; got ${Object.keys(enabled).join(", ")}`);
     assert.ok("summary" in enabled);
+    const description = (enabled["report_only"] as { description?: string }).description ?? "";
+    assert.match(description, /NO code change/);
+    assert.match(description, /non_closing/, "report_only points to non_closing for leaving the issue open (#3360)");
   });
 
   it("exposes signal_done proposal UNGATED on run kind, and it is optional (PRD #929 M2)", () => {
@@ -1235,5 +1238,24 @@ describe("M3 park_run scanning", () => {
     assert.deepEqual(scanSignals(subagentToolUse("mcp__uzi__park_run", {})), {});
     assert.deepEqual(scanSignals(toolUse("mcp__uzi__park_run", { reason: "wait" })), {});
     assert.equal(isSignalToolName("mcp__uzi__park_run"), true);
+  });
+});
+
+describe("signal_done report_only texts scope the #3360 fallback to issue runs", () => {
+  const pinned = (text: string) => {
+    assert.match(text, /opens no merge request when no committed work was published to a checkpoint \(local commits are then not delivered\)/);
+    assert.match(text, /On issue runs, once committed work was published to a checkpoint, the committed branch is instead delivered as a non-closing merge request if its checks pass/);
+  };
+  it("pins the tool description", async () => {
+    const res = await callToolOverJsonRpc(buildSignalMcpServer({ reportOnly: true }), "signal_done", {}, "tools/list");
+    const tools = ((res["result"] as { tools?: { name: string; description?: string }[] } | undefined)?.tools) ?? [];
+    const done = tools.find((t) => t.name === "signal_done");
+    assert.ok(done, `signal_done listed; got ${JSON.stringify(res)}`);
+    pinned(done.description ?? "");
+  });
+  it("pins the completion acknowledgement", async () => {
+    const res = await callToolOverJsonRpc(buildSignalMcpServer({ reportOnly: true }), "signal_done", { summary: "s" });
+    const content = ((res["result"] as { content?: { type: string; text?: string }[] } | undefined)?.content) ?? [];
+    pinned(content.map((c) => c.text ?? "").join("\n"));
   });
 });

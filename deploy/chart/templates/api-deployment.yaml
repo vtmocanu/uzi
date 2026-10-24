@@ -3,8 +3,8 @@
 {{- include "uzi.validateSecretMountPath" . }}
 {{- if .Values.api.enabled }}
 {{- $ephemeralDefaultSize := .Values.workers.ephemeralDefaultSize }}
-{{- if not (has $ephemeralDefaultSize (list "s" "m" "l")) }}
-{{- fail "workers.ephemeralDefaultSize must be one of s, m, l" }}
+{{- if not (has $ephemeralDefaultSize (list "s" "m" "l" "l-highmem")) }}
+{{- fail "workers.ephemeralDefaultSize must be one of s, m, l, l-highmem" }}
 {{- end }}
 {{- if hasKey (.Values.api.secretEnv | default dict) "UZI_EPHEMERAL_DEFAULT_SIZE" }}
 {{- fail "Set UZI_EPHEMERAL_DEFAULT_SIZE through workers.ephemeralDefaultSize, not api.secretEnv" }}

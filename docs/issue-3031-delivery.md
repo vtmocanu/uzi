@@ -12,6 +12,14 @@ scoped acceptance, regression and mutation evidence recorded below. Full
 frozen-gate results belong to the PR verification record; live acceptance
 remains separate. No plan revision or producer enablement is included.
 
+## W0 delivery note (#3349)
+
+W0-H is delivered: hash-attested maintenance WIP capture with a plumbing
+commit (`add -A`, `write-tree` with a post-write-tree pin, a pre-commit
+`diff-tree` proof, `commit-tree`, then an `update-ref` compare-and-swap). The
+per-file core/8 MiB policy is the named cap. The terminal producer guard stays
+off. U4b, U4c, U4d, U5, F, M3, M4 and MO remain as recorded below.
+
 ## Reachable-behaviour changes
 
 - S: background recovery passes cancel their Git, lock-wait and HTTP work on
@@ -38,7 +46,15 @@ no published commit was rewritten.
 
 ## Material change needed
 
-W0 has two independent contract conflicts.
+W0 had two independent contract conflicts. **Both are resolved (#3349)** by
+the contract revision recorded in ADR-1197; the original evidence is kept
+below as history.
+
+- **Resolved (#3349), index transition.** The porcelain commit is replaced by
+  plumbing. Two sanctioned pins apply, in the `add -A` and `write-tree` scope,
+  and the P5 reference is the post-write-tree pin.
+- **Resolved (#3349), content policy.** The per-file core/8 MiB policy is
+  applied as the named only-lower cap, with the HEAD-tuple exemption.
 
 1. **Index transition.** W0 P1 requires the exact post-add index pin
    (dev/ino/size/mtime/ctime and trailing checksum) to survive commit and P5.
@@ -64,9 +80,11 @@ W0 has two independent contract conflicts.
    Keeping that refusal requires explicit reconciliation with W0's literal
    coverage contract; removing it would violate the policy and R2.
 
-No workaround is implemented. W0, U4b, U4c, U4d, U5, F, M3 and M4 remain
-incomplete. The composed measurement is unrun; no capacity projection is
-verified. No delta-transfer ADR amendment is installed without its code.
+Historical status (before #3349): no workaround was implemented, and W0, U4b,
+U4c, U4d, U5, F, M3 and M4 were incomplete. W0 is now delivered (see the note
+at the top); U4b, U4c, U4d, U5, F, M3 and M4 remain incomplete. The composed
+measurement is unrun and no capacity projection is verified. No delta-transfer
+ADR amendment is installed without its code.
 
 ## Requirement map
 
@@ -82,7 +100,7 @@ complete it.
 | A3 durable bounded pacing | M3.3 virtual-clock suite, MO1 real roll | Incomplete; run + maintainer |
 | A4 positive exact terminal custody | Groundwork + U5 unique-open listing matrix | Groundwork terminal-origin tests retained; U5 incomplete; run |
 | A5 immutable evidence first; replay proofs | U4d 2, U5 10, N 1–2 | N seed implemented; producer handoff/boot ordering incomplete; run |
-| A6 finite discovery/capture/fallback for every terminal status | W0 + composed gate including archive | Incomplete; no MEASURE output; run, MO7 if unavailable |
+| A6 finite discovery/capture/fallback for every terminal status | W0 + composed gate including archive | W0 measured (see MEASURE lines); composed gate still incomplete; run, MO7 if unavailable |
 | A7 R2401 and R1790 | M3.6–7; five diagnostics and independent durability | Producer acceptance incomplete; run |
 | A8 closed holds stop new evidence | U4d 5, M3.5 | Incomplete; run |
 | A9 no closure-based deletion | M3.7b, F | No new cleanup authority; producer proof incomplete; run |
@@ -108,17 +126,52 @@ complete it.
 | C1–C4, E1–E7 exclusion/family/stop controls | Groundwork + M3.2, MO2 | Groundwork retained; expanded matrix/live proof incomplete; run + maintainer |
 | Effect addendum | R8, M3.4, U4b 21 | No new producer effects; expanded matrix incomplete; run |
 | Restart discovery | U5 4b tests 7–8, 12–16 | Not delivered; run |
-| Hash-attested WIP completeness | W0 tests 1–7 | Blocked by material conflicts above; run |
+| Hash-attested WIP completeness | W0 tests 1–7 | W0 delivered (#3349) by `agent/test/git-maintenance-wip-capture-h.test.ts` (acceptance 1–11); run |
 | Guard removal / enablement | Separate follow-up, MO1–4 | Deferred by binding guard-off decision; follow-up owner + maintainer |
 | Item 11 shutdown joins | S acceptance and mutations, MO4 | Seed implemented; local evidence below; image acceptance unperformed; run + maintainer |
 
 ## Port and accounting mappings
 
-No W0/U4b helper is replaced or deleted. `git-maintenance-object-snapshot.test.ts`,
+### W0 port (#3349)
+
+W0-H replaces the capture's raw-tree input with hash-attested plumbing. No U4b
+helper is replaced or deleted. `git-maintenance-object-snapshot.test.ts` and
+`git-maintenance-private-verification.test.ts` remain; the U4b producer-specific
+port and old → new accounting tables remain incomplete with their
+implementation. No cap, timeout or test timeout changes.
+`maintenanceWipInput` (the old raw-tree helper) is no longer called by the
+capture. It is retained (no longer `private`) and its direct tests,
+`git-maintenance-wip-input.test.ts`, are unchanged.
+
+| Existing case | After W0 |
+|---|---|
+| `git-maintenance-wip-capture.test.ts`: fixture labeler | Maps write-tree, commit-tree and update-ref to `commit`, and adds pin, census and payload helper labels. |
+| Same file: "dirty capture uses three matched 16 MiB raw metadata envelopes without reducing source caps" | Renamed "dirty capture needs no fixed raw metadata envelope and does not reduce source caps". Asserts commit succeeds with 196 MiB metadata pre-spent, zero old envelope launches, one payload pass, and sourceBytes nearly free. |
+| Same file: "real tracked/untracked/binary WIP, ignored bytes and ordered owned effects" | New exact effect order: three `before:commit:dispatch`, each followed by a commit-group launch. The 192 MiB no-refund tail is replaced. |
+| Same file: per-step config-join assertions for add and commit | Moved to the acceptance file's "config turned unsafe before write-tree/commit-tree/update-ref" cases. |
+| Same file: "cached index stat cannot hide changed tracked bytes" (both) | Now refused with no add launch and the index byte-identical (stronger, R2). |
+| Same file: "monotonic deadline between proof and dispatch refuses the effect" | `join:proof` is replaced by `join:pin` plus two `join:ls-files`. |
+| Same file: "command failure <step>" | Intercepts by label. |
+| Same file: "unsafe source and exhausted quota refuse without a Git effect" | The exhausted half asserts no add or commit launch, with HEAD and index unchanged. Status now runs before payload bytes are known; this is design-forced by P3. |
+| Same file: all other cases | Unchanged. |
+| `runner-maintenance-terminal-source.test.ts`: chargedTransports | 12/14 become 16/18 (two extra commit dispatches x 2 fetches). |
+| `runner-maintenance-wip-boundary.test.ts`: "real owned boundary captures tracked/untracked/binary" | Phases now end `commit:prepare, commit:dispatch` x3. The classifier maps the commit group to `commit`. |
+
+Accounting map for the W0 capture (the 65 launches of the measurement above):
+
+| Counter | What is charged |
+|---|---|
+| launches | 1 per `execScoped` launch: metadata and config checks before status, add, write-tree, commit-tree and update-ref, at P0 and at the start of P5; pin reads around every launch, callback and stage; P0 plumbing; `ls-files` x2; `status` x2; `diff-index`; census x4 including race rechecks; payload; add; write-tree; `diff-tree` x2; commit-tree; pre-CAS `cat-file`; update-ref; P5 reads. |
+| sourceEntries | Every Git output row; census 1 per path; payload 5 per path, the reservation for a regular file's open, fstat, read completion, post-read fstat and post-read lstat (no pre-open lstat: the opened fd must match the census identity before any read; a symlink's lstat, readlink and lstat are conservatively overcharged at 5); race recheck 1 per path; 1 for the `for-each-ref` row. |
+| sourceBytes | Sum of current sizes, charged before the payload launch. |
+| adminEntries | 20 x (clone depth + 3) per metadata check; config rows; distinct directories + clone depth + 1 per census, payload and recheck stage. |
+| metadataBytes | Metadata-check precharge; all helper and Git output bytes; index size per pin read; sum of (path + 1 KiB) per stage. |
+| rpcAttempts | Not charged by the capture. Caller fresh observations add about 8 per capture. |
+
+### Earlier ports
+
+`git-maintenance-object-snapshot.test.ts`,
 `git-maintenance-private-verification.test.ts` and the original WIP cases remain.
-Their producer-specific port and old → new accounting tables remain incomplete
-with their implementation. No charge category, cap, timeout or test timeout
-changes.
 
 The ordinary replay compatibility map below is exhaustive for the 71 cases
 run across the three legacy files. All case titles and assertions are
@@ -264,9 +317,9 @@ measurement are unperformed. At the validation capture below, store-it had
 not yet run; the final PR records its actual outcome and retains MO6 if it remains
 unrun, as the conditional item above requires. MO7 remains unperformed.
 The current source is non-shallow with 2,123 commits; history availability
-is not a measurement blocker. The composed measurement cannot be built under
-the conflicting W0 contract. MO7 is not a substitute for resolving that
-conflict. Local environment limits and MO do not waive worker obligations.
+is not a measurement blocker. The W0 contract conflicts are resolved (#3349),
+but the composed measurement still cannot be built until U4b and the archive
+stage are delivered. MO7 is not a substitute for that delivery. Local environment limits and MO do not waive worker obligations.
 
 ## Validation record
 
@@ -392,9 +445,48 @@ remain failed records. The latest branch pipeline query returned `null`;
 exact-candidate CI is unvalidated. Three-forge compose phases and hosted
 acceptance remain unperformed; focused tests do not establish them.
 
+### W0 (#3349) evidence
+
+Focused W0 results, including `git-maintenance-wip-capture-h.test.ts`
+acceptance 1 to 11 and the amended existing files, are recorded in the PR.
+Gate results are likewise recorded there; none is claimed here.
+
 ## MEASURE lines
 
-Unrun: the W0/U4b composed pipeline cannot be implemented under the conflicting
-contract. No projected capacity is promoted to a measurement. The source
-checkout is non-shallow and has sufficient history; history availability is
-not the blocker.
+The composed W0/U4b/archive pipeline is still unmeasured: U4b and the archive
+stage are not delivered. The lines below are the **W0-only** measurement
+(#3349), taken on a representative clone of this repository at base
+`a1eba31831f9799a29857471514369d854ec8e72` (7,528 tracked files) with a
+realistic WIP: 4 tracked edits, 2 deletions, 3 untracked files and one
+staged-plus-unstaged file. It used a real slot with no injected allowances,
+and W was byte-compared independently.
+
+```
+MEASURE sourceEntries=60315
+MEASURE sourceBytes=135183189
+MEASURE metadataBytes=40607905
+MEASURE adminEntries=1684
+MEASURE launches=65
+MEASURE rpcAttempts=0
+MEASURE elapsed=1354
+```
+
+- Rerun after the review fixes (P5 config check, five-unit payload reservation)
+  in a Linux container (Node 24, Git 2.39.5) under the unchanged frozen caps:
+  `sourceEntries` is 60,315 of 65,536. The in-run measurement before those fixes
+  read sourceEntries=52786, adminEntries=1908, launches=62, elapsed=4241.
+- `adminEntries` and `metadataBytes` scale with the clone path's depth, and
+  `metadataBytes` varies slightly between runs.
+- `rpcAttempts` is 0 because the test callbacks make no RPCs. The caller's
+  R8 pairs add about 8 per capture (4 mutating dispatches x 2); this is
+  accounting, not a measurement.
+- The old capture on the same input refused with
+  `maintenance_wip_input_refused` after about 1 s, having reserved its full
+  64 MiB raw sourceBytes envelope.
+- Frozen caps: sourceEntries 65,536; sourceBytes and metadataBytes 256 MiB
+  each; adminEntries 4,096; launches 512; rpcAttempts 32.
+- The composed W0+U4b+archive figure remains an **unverified projection**.
+  No projected capacity is promoted to a measurement.
+- The helpers keep one directory handle open per distinct directory. An
+  `EMFILE` under a low `RLIMIT_NOFILE` refuses safely; the ceiling is
+  unmeasured.

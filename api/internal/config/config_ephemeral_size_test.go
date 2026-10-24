@@ -19,6 +19,8 @@ func TestLoadEphemeralDefaultSize(t *testing.T) {
 		{name: "explicit small", value: "s", want: "s"},
 		{name: "explicit medium", value: "m", want: "m"},
 		{name: "trimmed large", value: " l ", want: "l"},
+		{name: "explicit high memory", value: "l-highmem", want: "l-highmem"},
+		{name: "upper-case high memory falls back", value: "L-HIGHMEM", want: "m"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			autoselectEnv(t)

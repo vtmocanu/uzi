@@ -362,7 +362,7 @@ export function runStatusTone(
   // Recovery holds use warning: transient recovery and worker exhaustion are
   // non-terminal, though exhaustion requires an owner decision.
   if (status === "recovery_wait" || status === "worker_requeue_exhausted" || status === "worker_memory_pressure") return "warning";
-  // PRD #1190: a run its owner paused. INFO, not the warn the involuntary holds carry
+  // PRD #1190: an ordinary paused run. INFO, not the warn the involuntary holds carry
   // (D11): a pause is a chosen hold, not something blocking the run. Kept in step with
   // RUN_STATUS_TONES.paused (the runBadge.test.ts tone-agreement loop asserts it).
   if (status === "paused") return "info";
@@ -734,7 +734,7 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
         title:
           "Recovery is on hold. Open the run page for details and available actions.",
       };
-    // PRD #1190: a run its owner paused. Info-toned and STATIC (no elapsed on the badge —
+    // PRD #1190: an ordinary paused run. Info-toned and STATIC (no elapsed on the badge —
     // the per-card duration token carries `paused <elapsed>` via runDurationLabel). The
     // "‖" glyph matches StatusPill's "‖ paused" label so one status prints one word on
     // both surfaces (ui.test.tsx label-agreement loop). Unlike the two self-resuming
@@ -745,7 +745,7 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
         label: `‖ ${PARK_LABELS.paused}`,
         tone: "info",
         pulse: false,
-        title: "Paused by its owner. Resume it from the run page or with `uzi run resume`.",
+        title: "Paused. Resume it from the run page or with `uzi run resume`.",
       };
     case "failed":
       return {

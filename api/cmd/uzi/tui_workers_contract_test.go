@@ -15,7 +15,7 @@ func TestWorkersApprovedLowercaseKind(t *testing.T) {
 	for _, tc := range []struct {
 		size, kind        string
 		ephemeral, docker bool
-	}{{"l", "host·L", false, false}, {"m", "eph·M+dk", true, true}, {"S", "host·S", false, false}, {"future", "host·?", false, false}} {
+	}{{"l", "host·L", false, false}, {"m", "eph·M+dk", true, true}, {"S", "host·S", false, false}, {"future", "host·?", false, false}, {"l-highmem", "host·LHM", false, false}, {"l-highmem", "eph·LHM+dk", true, true}} {
 		r := workerRow{w: apitypes.WorkerDTO{Kind: "hosted", HostedSize: sp(tc.size), Ephemeral: tc.ephemeral, Docker: &tc.docker}}
 		if got := m.workerKind(r); got != tc.kind {
 			t.Errorf("size %q: got %q want %q", tc.size, got, tc.kind)

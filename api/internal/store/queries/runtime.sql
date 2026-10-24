@@ -1088,6 +1088,7 @@ WITH claimant AS MATERIALIZED (
       -- even when capability scheduling is disabled or the owner clears required_capabilities.
       AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = r.id)
            OR 'milestone_reconciliation_claim_v1' = ANY(@worker_protocol_caps::text[]))
+      AND (r.checkpoint_coordinates IS NULL OR 'task_checkpoint_coordinates_v1' = ANY(@worker_protocol_caps::text[]))
       AND (r.completion_contract_version IS NULL
            OR 'completion_interlock_v1' = ANY(@worker_protocol_caps::text[]))
       -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
@@ -1356,6 +1357,7 @@ WITH claimant AS MATERIALIZED (
                 -- the claimant's @worker_protocol_caps above).
                 AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = r.id)
                      OR 'milestone_reconciliation_claim_v1' = ANY(p.protocol_capabilities))
+      AND (r.checkpoint_coordinates IS NULL OR 'task_checkpoint_coordinates_v1' = ANY(p.protocol_capabilities))
                 AND (r.completion_contract_version IS NULL
                      OR 'completion_interlock_v1' = ANY(p.protocol_capabilities))
                 -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
@@ -4375,7 +4377,12 @@ UPDATE runs SET
     completion_final_head = sqlc.narg('completion_final_head'),
     status             = 'completed',
     status_since       = now(),
-    branch             = @branch,
+    -- Enrolled work branches are server-authorized, not optional completion metadata.
+    -- Preserve one on omission; an explicit different branch still hits the frozen guard.
+    branch             = CASE
+        WHEN checkpoint_coordinates IS NOT NULL AND sqlc.narg('branch')::text IS NULL THEN branch
+        ELSE sqlc.narg('branch')::text
+    END,
     mr_iid             = @mr_iid,
     -- The MR's web URL as the forge reported it (PRD #65 D8), written here because
     -- the worker that opens the MR is the only thing holding the URL at the moment
@@ -4393,13 +4400,13 @@ UPDATE runs SET
     fix_verdict        = COALESCE(sqlc.narg('fix_verdict'), fix_verdict),
     -- The PRD path this run's lead declared it moved (PRD #72 M4), NULL unless an
     -- issue run declared one that validated. Plain assignment for the same reason
-    -- mr_web_url above gives: the branch, the MR and the declared path are ONE fact
+    -- mr_web_url above gives: the MR and the declared path are ONE fact
     -- reported by one worker in one payload, so they must not persist under
     -- different conventions.
     prd_done_path      = @prd_done_path,
     -- issue #279: the report-only marker and the lead's persisted findings.
     -- Plain assignment for the same reason mr_web_url/prd_done_path above give:
-    -- the branch, the MR, the declared path AND this completion's report shape are
+    -- the MR, the declared path AND this completion's report shape are
     -- ONE fact reported by one worker in one payload, so they must not persist
     -- under different conventions. report_only plain-assigns on every completed
     -- transition (false for a normal MR completion — correct, it is the marker for
@@ -7213,6 +7220,10 @@ WITH candidates AS MATERIALIZED (
     WHERE a.worker_id = @worker_id AND a.run_id = r.id AND a.terminal_pending = false
   AND r.worker_id = @worker_id
   AND r.status = 'queued'
+  AND (r.checkpoint_coordinates IS NULL OR EXISTS (
+      SELECT 1 FROM workers coordinate_worker
+      WHERE coordinate_worker.id = @worker_id AND coordinate_worker.user_id = r.user_id
+        AND 'task_checkpoint_coordinates_v1' = ANY(coordinate_worker.protocol_capabilities)))
   AND (r.kind <> 'cross_check' OR r.claim_generation > 0)
   AND r.kind <> 'chat'
   AND r.claim_generation = a.claim_generation
@@ -7271,6 +7282,10 @@ FROM worker_active_runs a
 WHERE a.worker_id = @worker_id AND a.run_id = r.id AND a.terminal_pending = false
   AND r.worker_id = @worker_id
   AND r.status = 'queued'
+  AND (r.checkpoint_coordinates IS NULL OR EXISTS (
+      SELECT 1 FROM workers coordinate_worker
+      WHERE coordinate_worker.id = @worker_id AND coordinate_worker.user_id = r.user_id
+        AND 'task_checkpoint_coordinates_v1' = ANY(coordinate_worker.protocol_capabilities)))
   AND (r.kind <> 'cross_check' OR r.claim_generation > 0)
   AND r.kind <> 'chat'
   AND r.claim_generation = a.claim_generation
@@ -9969,6 +9984,7 @@ WHERE run.id = @run_id
         @capability_aware::boolean)
   AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = run.id)
        OR 'milestone_reconciliation_claim_v1' = ANY(w.protocol_capabilities))
+      AND (run.checkpoint_coordinates IS NULL OR 'task_checkpoint_coordinates_v1' = ANY(w.protocol_capabilities))
   AND (run.completion_contract_version IS NULL
        OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
   -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
@@ -10398,7 +10414,7 @@ WHERE r.status = 'queued'
   -- the CODE exclusion above keeps known CODE children on their own worker.
   -- PRD #2865: a GUARDED run (ci_config_guard) is demand too: with no worker reporting
   -- ci_config_guard_v1 online, only a freshly provisioned worker can claim it.
-  AND (cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR r.kind = 'cross_check' OR r.ci_config_guard OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]))
+  AND (r.checkpoint_coordinates IS NOT NULL OR cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR r.kind = 'cross_check' OR r.ci_config_guard OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]))
 
   AND NOT EXISTS (
       SELECT 1 FROM workers w
@@ -10422,6 +10438,7 @@ WHERE r.status = 'queued'
         -- Protocol requirements apply to persistent and leased workers alike.
         AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = r.id)
                       OR 'milestone_reconciliation_claim_v1' = ANY(w.protocol_capabilities))
+      AND (r.checkpoint_coordinates IS NULL OR 'task_checkpoint_coordinates_v1' = ANY(w.protocol_capabilities))
         AND (r.completion_contract_version IS NULL
                       OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
         -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
@@ -10628,6 +10645,7 @@ WHERE r.status = 'queued'
         -- Protocol requirements apply to persistent and leased workers alike.
         AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = r.id)
                       OR 'milestone_reconciliation_claim_v1' = ANY(w.protocol_capabilities))
+      AND (r.checkpoint_coordinates IS NULL OR 'task_checkpoint_coordinates_v1' = ANY(w.protocol_capabilities))
         AND (r.completion_contract_version IS NULL
                       OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
         -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
@@ -10704,6 +10722,7 @@ WHERE r.status = 'queued'
         -- Protocol requirements apply to persistent and leased workers alike.
         AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = r.id)
                       OR 'milestone_reconciliation_claim_v1' = ANY(w.protocol_capabilities))
+      AND (r.checkpoint_coordinates IS NULL OR 'task_checkpoint_coordinates_v1' = ANY(w.protocol_capabilities))
         AND (r.completion_contract_version IS NULL
                       OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
         -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside

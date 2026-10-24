@@ -60,7 +60,7 @@ for(const variant of ["accepted","guarded","failed"] as const) it(`A public tail
  }finally{git.branchTip=tip;git.undoWipMarkerOnBranch=undo;RecoveryCoordinator.prototype.pin=pin;RecoveryCoordinator.prototype.freezeInventory=freeze;RecoveryCoordinator.prototype.captureAndUpload=upload;o.restore();}
 });
 for(const branch of ["unrelated","moved"] as const)it(`A public tail actual Git gate ${branch} postcheck refusal`,async()=>{
- const o=observe();const post:any[]=[];let refusal:unknown;let verdict:unknown;let clone="";
+ const o=observe();const post:any[]=[];let refusal:unknown;let verdict:unknown;let clone="";let stoppedReads=0,stoppedPubs=0;
  const claim={...gitlabClaim(2852),claim_generation:7,execution_milestones:[{id:"m1",title:"Original"}]};
  client.protocolFeatures=["milestone_reconciliation_v1","claim_generation_fence","gate_revision_v1"];
  api.gateRevisions=true;api.stampGateBindings=true;
@@ -84,7 +84,7 @@ for(const branch of ["unrelated","moved"] as const)it(`A public tail actual Git 
  let run:ReturnType<typeof runnerWith>;
  const exec=new FakeCodexExecutor(o.rig.safety,async ctx=>{
   clone=ctx.worktreePath;commitInTree(clone,"PUBLIC.txt","gate tail source bytes\n");o.arm();
-  try{verdict=await ctx.gatePlan!("Plan",[{id:"m1",title:"Changed"}]);}catch(e){refusal=e;run.shutdown();throw e;}
+  try{verdict=await ctx.gatePlan!("Plan",[{id:"m1",title:"Changed"}]);}catch(e){refusal=e;stoppedReads=o.observations().source.length;stoppedPubs=o.observations().pubs.length;run.shutdown();throw e;}
   throw new PlanRejectedError("fixture");
  },o.rig.settle,o.capture);
  try{
@@ -92,6 +92,10 @@ for(const branch of ["unrelated","moved"] as const)it(`A public tail actual Git 
   await o.execute(run.execute(claim));
   console.log("TAIL_GATE",JSON.stringify({branch,post,refusal:refusal instanceof Error?refusal.name:refusal}));
   assert.equal(trackedFile(2852,"PUBLIC.txt"),"gate tail source bytes\n");
+  assert.equal(fs.readFileSync(path.join(clone,"PUBLIC.txt"),"utf8"),"gate tail source bytes\n","shutdown retains the source");
+  assert.equal(o.observations().source.length,stoppedReads,"shutdown starts no source recapture");
+  assert.equal(o.observations().pubs.length,stoppedPubs,"shutdown starts no checkpoint replay");
+  assert.equal(o.isActive(),false);
   assert.equal(verdict,undefined);assert.equal((refusal as Error)?.name,"TransientRecoveryError");
   assert.equal(api.states.some(s=>s.body.gate_checkpoint_witness!==undefined),false);
   assert.equal(api.states.some(s=>s.body.status==="awaiting_approval"),false);

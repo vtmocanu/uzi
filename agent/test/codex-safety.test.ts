@@ -10,6 +10,9 @@ import { selectCodexBinding } from "../src/codex/select.js";
 
 import {
   CodexBoundaryError,
+  acceptsHeldCaptureCleanup,
+  acceptsJoinedCaptureCleanup,
+  settleHeldCaptureCleanup,
   CodexExecutionSafetyImpl,
   createCodexExecutionSafety,
   type BoundaryActionIdentity,
@@ -2586,4 +2589,107 @@ describe("R2 terminal disposal acquisition", () => {
       assert.equal(budgets.length, 1);
     });
   }
+});
+
+
+for (const change of ["none", "empty-poison", "capped-poison", "dispose", "registry-dispose", "later-root"] as const) {
+  it(`authenticated cleanup witness binds exact facade and permit: ${change}`, async () => {
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(2862));
+    const safety = createCodexExecutionSafety(registry, spawnCounter().seam);
+    let saved!: BoundaryPermit;
+    await safety.withBoundary({ boundary: "shutdown", deadlineMs: 1000 }, async permit => {
+      saved = permit;
+      assert.equal(await settleHeldCaptureCleanup(safety, permit), true);
+      assert.equal(acceptsHeldCaptureCleanup(safety, permit), true);
+      assert.equal(acceptsJoinedCaptureCleanup(safety, permit), false);
+      assert.equal(await settleHeldCaptureCleanup({ ...safety }, permit), false);
+      assert.equal(await settleHeldCaptureCleanup(safety, { ...permit }), false);
+    });
+    assert.equal(acceptsHeldCaptureCleanup(safety, saved), false);
+    assert.equal(acceptsJoinedCaptureCleanup(safety, saved), true);
+    assert.equal(acceptsJoinedCaptureCleanup({ ...safety }, saved), false);
+    assert.equal(acceptsJoinedCaptureCleanup(safety, { ...saved }), false);
+    const foreign = createCodexExecutionSafety(new ExecutionRegistry(newLocalExecutionEpoch(2862)), spawnCounter().seam);
+    assert.equal(acceptsJoinedCaptureCleanup(foreign, saved), false);
+    if (change === "empty-poison") registry.poison([]);
+    if (change === "capped-poison") {
+      for (let i = 0; i < 70; i++) registry.poison({ category: "tool", message: "unknown poison" });
+      const revision = registry.cleanupPoisonRevision;
+      registry.poison([]);
+      assert.notEqual(registry.cleanupPoisonRevision, revision);
+    }
+    if (change === "dispose") await safety.dispose({ boundary: "shutdown", deadlineMs: 1000 });
+    if (change === "registry-dispose") await registry.disposeTools(1000);
+    if (change === "later-root") {
+      await safety.withBoundary({ boundary: "shutdown", deadlineMs: 1000 }, async permit => {
+        await safety.spawnBoundaryAction(permit, ["true"], "worker_pat");
+      });
+    }
+    assert.equal(acceptsJoinedCaptureCleanup(safety, saved), change === "none");
+  });
+}
+
+for (const failure of ["clean", "clean-after-primary", "dispose", "reap", "independent"] as const) {
+  it(`authenticated cleanup witness owns exact aborted completion: ${failure}`, async () => {
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(2863));
+    const processExecPath = process.execPath;
+    let expire!: () => void;
+    const reaping = defer<void>(), finishReap = defer<void>();
+    let saved!: BoundaryPermit, disposed = 0;
+    const safety = createCodexExecutionSafety(registry, spawnCounter().seam, undefined, undefined,
+      async () => ({ stdin: null, stdout: new PassThrough(), stderr: new PassThrough(),
+        waitChild: async () => {
+          if (failure === "independent") throw new Error("child-selected independent failure");
+          if (failure === "clean-after-primary") return { code: 0 };
+          return new Promise(() => {});
+        },
+        root: { kind: "boundary_action",
+          dispose: async () => { disposed++; if (failure === "dispose") throw new Error("dispose failed"); },
+          reap: async () => {
+            reaping.resolve();
+            await finishReap.promise;
+            return failure === "reap" ? { ok: false, error: { category: "tool", message: "reap failed" } } : { ok: true };
+          },
+        },
+      }), (_request, _ms, fire) => { expire = fire; return () => {}; });
+    await assert.rejects(safety.withBoundary({ boundary: "shutdown", deadlineMs: 1000 }, async permit => {
+      saved = permit;
+      const process = await safety.spawnBoundaryProcess(permit, { argv: [processExecPath], cwd: "/unused", env: {}, identity: "worker_pat" });
+      if (failure === "independent" || failure === "clean-after-primary") await reaping.promise;
+      expire();
+      finishReap.resolve();
+      await process.completed;
+    }));
+    assert.ok(disposed > 0);
+    assert.equal(registry.state(), "poisoned", "legacy refusal survives even affirmative child cleanup");
+    assert.equal(acceptsJoinedCaptureCleanup(safety, saved), failure === "clean" || failure === "clean-after-primary");
+    registry.poison([]);
+    assert.equal(acceptsJoinedCaptureCleanup(safety, saved), false, "later empty poison cannot borrow known cleanup");
+  });
+}
+
+it("held cleanup joins a later completion batch and refuses its failed reap", async () => {
+  const registry = new ExecutionRegistry(newLocalExecutionEpoch(2864));
+  const start = defer<void>();
+  const safety = createCodexExecutionSafety(registry, spawnCounter().seam, undefined, undefined,
+    async () => {
+      await start.promise;
+      return { stdin: null, stdout: new PassThrough(), stderr: new PassThrough(),
+        waitChild: async () => ({ code: 0 }),
+        root: { kind: "boundary_action", dispose: async () => {},
+          reap: async () => ({ ok: false, error: { category: "tool", message: "later batch failed" } }),
+        },
+      };
+    });
+  let saved!: BoundaryPermit;
+  await assert.rejects(safety.withBoundary({ boundary: "shutdown", deadlineMs: 1000 }, async permit => {
+    saved = permit;
+    const startup = safety.spawnBoundaryProcess(permit, { argv: [process.execPath], cwd: "/unused", env: {}, identity: "worker_pat" });
+    const settled = settleHeldCaptureCleanup(safety, permit);
+    start.resolve();
+    const child = await startup;
+    await child.completed.catch(() => undefined);
+    assert.equal(await settled, false);
+  }));
+  assert.equal(acceptsJoinedCaptureCleanup(safety, saved), false);
 });

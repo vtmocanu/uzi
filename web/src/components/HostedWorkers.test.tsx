@@ -313,6 +313,19 @@ describe("HostedWorkers provisioning", () => {
     await waitFor(() => expect(mockApi.provisionHostedWorker).toHaveBeenCalledWith("base", "l", false));
   });
 
+  it("offers l-highmem, keeps l as the default, and sends the exact lowercase name", async () => {
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false });
+    mockApi.provisionHostedWorker.mockResolvedValue({ worker: provisioned });
+    renderCard(0);
+    const select = (await screen.findByLabelText("Hosted worker size")) as HTMLSelectElement;
+    expect(select.value).toBe("l");
+    const option = Array.from(select.options).find((o) => o.value === "l-highmem");
+    expect(option?.textContent).toBe("L-HIGHMEM — up to 4 CPU / 32Gi RAM / 50Gi disk");
+    fireEvent.change(select, { target: { value: "l-highmem" } });
+    fireEvent.click(await provisionButton());
+    await waitFor(() => expect(mockApi.provisionHostedWorker).toHaveBeenCalledWith("base", "l-highmem", false));
+  });
+
   it("resets a chosen size to large after successful provisioning", async () => {
     mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false });
     mockApi.provisionHostedWorker.mockResolvedValue({ worker: provisioned });

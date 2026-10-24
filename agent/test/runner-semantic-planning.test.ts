@@ -12,7 +12,12 @@ beforeEach(() => {
   newApi(); api.checkedTransport = true;
   api.usageHandler = () => ({ status: 200, body: {} });
   // Isolate gate ordering from native alternate-object capture; no repository mutation.
-  git.capturePlanningDiff = async () => Buffer.from("");
+  git.capturePlanningDiff = async (clone, base, bare) => {
+    assert.ok(bare, "runner forwards explicit worker bare authority");
+    assert.match(base, /^[a-f0-9]{40}$/);
+    assert.ok(clone);
+    return Buffer.from("");
+  };
 });
 const timing = { preparationMs: 100, backoffMs: [1, 2] as const, requestMs: 1000, pollMs: 5 };
 const milestones = [{ id: "m1", title: "A" }];

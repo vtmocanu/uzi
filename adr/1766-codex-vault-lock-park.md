@@ -185,6 +185,20 @@ credential is in hand, whatever additionally caused the block.
 
 ## D3: settle before capture, and no completion authority while locked
 
+**Slice B amendment, Refs #2852 (AI-synced 2026-10-23):** wall, completion-hold
+and ordinary Codex recovery now hold process proof across the whole capture region.
+Before accepted local verification, a poisoned/refused/expired healthy phase can
+use A only after owned primary work joins and A establishes `observed_empty`.
+The same episode allows 180 s total, at most 120 s healthy, reserving fallback time;
+no retry or deferral renews it. Independent A credential-deferral episodes retain
+their existing bounds. Fallback performs no second refresh/release, credential
+overlay or PAT-bearing launch; wall/hold stay local-only and recovery keeps its
+existing join-token publication. Optional publication failure preserves verified
+local work without recapture. Cancellation, fencing and revoked shutdown authority
+never allow fallback; the typed #3109 graceful-shutdown path is unchanged.
+[ADR-1783](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect)
+records the held-finalize continuation and the remaining C/terminal/Docker gaps.
+
 The worker's park sequence, in order: confirm the run is still `running` (a stale or already-parked
 run does not re-park); stop Codex execution without any credential operation, then
 hold safety serialization, the epoch fence and closed admission through source reads,
@@ -290,7 +304,8 @@ HEAD/pin and guarded inventory; refused proof leaves the exact parked source,
 session, existing journal and custody intact without another capture or pause attempt.
 The approval path still skips persistence from the old, drained HOME. This does not make an open `awaiting_approval` gate parkable or
 change fresh-path retained recovery. See [ADR-1783](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect)
-for A's scope and the unshipped B/C gaps.
+for A's scope, B's implemented whole-region capture and the unshipped C gap
+(AI-synced 2026-10-23).
 
 ### Amendment #3101: actual graceful-shutdown durability
 
