@@ -22,19 +22,36 @@ type taskLifecycleFixture struct {
 
 func newTaskLifecycleFixture(t *testing.T) *taskLifecycleFixture {
 	t.Helper()
+	return newTaskLifecycleFixtureWithChild(t, false)
+}
+
+// thenFix selects the writable descendant; the default remains an advisory review.
+func newTaskLifecycleFixtureWithChild(t *testing.T, thenFix bool) *taskLifecycleFixture {
+	t.Helper()
 	f := newCustodyContinuationFixture(t, setupCodexLiveDB(t))
 	root := claimCoordinateTask(t, f)
 	// A terminal parent frees the worker's slot before the child's fresh claim.
 	f.env.exec("UPDATE runs SET status='failed',finished_at=now() WHERE id=$1", root.ID)
 	id := uuid.New()
-	f.env.exec(`INSERT INTO runs(id,user_id,repo_id,kind,branch,review_target_run_id,
-		dispatched_at,issue_title,issue_description,status)
-		VALUES($1,$2,$3,'task',$4,$5,now(),'child','lifecycle fixture','queued')`,
-		id, f.userID, f.repoID, "uzi/task/"+root.ID.String(), root.ID)
+	if thenFix {
+		f.env.exec(`INSERT INTO runs(id,user_id,repo_id,kind,branch,then_fix_of_run_id,
+			dispatched_at,issue_title,issue_description,status)
+			VALUES($1,$2,$3,'task',$4,$5,now(),'child','lifecycle fixture','queued')`,
+			id, f.userID, f.repoID, "uzi/task/"+root.ID.String(), root.ID)
+	} else {
+		f.env.exec(`INSERT INTO runs(id,user_id,repo_id,kind,branch,review_target_run_id,
+			dispatched_at,issue_title,issue_description,status)
+			VALUES($1,$2,$3,'task',$4,$5,now(),'child','lifecycle fixture','queued')`,
+			id, f.userID, f.repoID, "uzi/task/"+root.ID.String(), root.ID)
+	}
 	x := &taskLifecycleFixture{f: f, forge: newMemForge(), root: root,
 		rootKey: "uzi/task/" + root.ID.String(), childKey: "uzi/task/" + id.String(),
 		rootRef:  "refs/uzi-checkpoints/uzi/task/" + root.ID.String(),
 		childRef: "refs/uzi-checkpoints/uzi/task/" + id.String()}
+	if thenFix {
+		f.env.exec("UPDATE workers SET protocol_capabilities=$2 WHERE id=$1", f.workerID,
+			[]string{capability.TaskCheckpointCoordinatesV1, capability.RecoveryArchiveV1, capability.RecoveryInventoryV1})
+	}
 	x.child = x.claim(t, id)
 	f.wkr.ProtocolCapabilities = []string{capability.TaskCheckpointCoordinatesV1, capability.RecoveryArchiveV1}
 	f.svc.SetRetentionLockPool(f.env.pool)
@@ -81,10 +98,13 @@ func (x *taskLifecycleFixture) claim(t *testing.T, id uuid.UUID) store.Run {
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback(f.env.ctx) }()
-	if _, err := store.New(tx).GetWorkerForUpdate(f.env.ctx, f.workerID); err != nil {
+	worker, err := store.New(tx).GetWorkerForUpdate(f.env.ctx, f.workerID)
+	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := f.svc.claimCheckpointRun(f.env.ctx, tx, coordinateClaimParams(f))
+	params := coordinateClaimParams(f)
+	params.WorkerProtocolCaps = worker.ProtocolCapabilities
+	run, err := f.svc.claimCheckpointRun(f.env.ctx, tx, params)
 	if err != nil || run.ID != id || len(run.CheckpointCoordinates) == 0 {
 		t.Fatalf("fresh claim target=%s got=%s coordinates=%s err=%v", id, run.ID, run.CheckpointCoordinates, err)
 	}
