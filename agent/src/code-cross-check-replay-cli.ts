@@ -8,7 +8,7 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { rmHomeTree } from "./rmtree.js";
+import { rmTreeForce } from "./rmtree.js";
 import { uidSplitActive } from "./runner-uid.js";
 import {
   assertSnapshotTraversable, createReplayRunDir, isSafeReplayModel, loadReplayCorpus, materializeCase, parseAdjudications, parseReplayRecords, readReplayFile, REPLAY_EFFORTS,
@@ -112,6 +112,13 @@ async function runVerify(deps: ReplayCliDeps, signal: AbortSignal, scratch: stri
   return 0;
 }
 
+/** Create the raw records file. Raw findings are model output about repository code: owner-only, created exclusively. */
+export async function createReplayRecordsFile(root: string, nowMs: number): Promise<{ file: string; handle: fs.FileHandle }> {
+  const stamp = new Date(nowMs).toISOString().replace(/[:.]/g, "-");
+  const file = path.join(root, `code-cross-check-replay-${stamp}.jsonl`);
+  return { file, handle: await fs.open(file, "wx", 0o600) };
+}
+
 async function runReplayCommand(deps: ReplayCliDeps, a: ReplayArgs, signal: AbortSignal, root: string, scratch: string): Promise<number> {
   // Before any case, checker or credential: a helper uid that cannot reach the snapshot fails fast.
   if (deps.layout?.split ?? uidSplitActive()) await assertSnapshotTraversable(scratch);
@@ -119,10 +126,7 @@ async function runReplayCommand(deps: ReplayCliDeps, a: ReplayArgs, signal: Abor
   const now = deps.now ?? Date.now;
   const uzi_head = deps.uziHead ? await deps.uziHead() : await hermeticGit(["rev-parse", "HEAD"], deps.checkout);
   const checkerVersion = { uzi_head, agent_version: await agentVersion(deps.checkout) };
-  const stamp = new Date(now()).toISOString().replace(/[:.]/g, "-");
-  const file = path.join(root, `code-cross-check-replay-${stamp}.jsonl`);
-  // Raw findings are model output about repository code: owner-only, created exclusively.
-  const handle = await fs.open(file, "wx", 0o600);
+  const { file, handle } = await createReplayRecordsFile(root, now());
   let records: ReplayRecord[];
   const absFile = path.resolve(file);
   try {
@@ -195,7 +199,9 @@ export async function runReplayCli(args: string[], deps: ReplayCliDeps): Promise
   } finally {
     abort.abort();
     for (const name of names) deps.signals.removeListener(name, onSignal);
-    if (scratch) await rmHomeTree(scratch);
+    // Plain worker removal: rmHomeTree would widen the 2710 run directory to group rwx on residue. Per-case
+    // HOMEs (which the runner uids write into) are removed with rmHomeTree inside runReplays.
+    if (scratch) await rmTreeForce(scratch);
   }
 }
 

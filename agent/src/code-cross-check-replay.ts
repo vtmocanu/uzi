@@ -560,7 +560,8 @@ export async function materializeCase(
   try {
     const dir = await fs.mkdtemp(path.join(scratchDir, "replay-snap-"));
     snapshot = dir;
-    if (layout.split) await shareDirectory(dir, layout.gid, 0o2750);
+    // The snapshot stays a private 0700 mkdtemp through checkout and commit; shareSnapshotEntry opens the
+    // root (and everything under it) to group runner only after the prefix_tree check below.
     const idx = { GIT_INDEX_FILE: path.join(verified.work, "snapshot-index") };
     await replayGit(["--git-dir", verified.bare, "read-tree", c.prefix_tree], { env: idx, signal });
     await replayGit(["--git-dir", verified.bare, "--work-tree", dir, "checkout-index", "-a", "-f"], { env: idx, signal });

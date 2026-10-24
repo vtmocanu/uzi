@@ -519,6 +519,17 @@ test("the split snapshot is group-readable, never group-writable, and single-uid
   } finally { await p.cleanup(); }
 });
 
+test("under umask 002 the split snapshot still ends with no group write bit anywhere, root included", async () => {
+  const run = await createReplayRunDir(await fs.mkdtemp(path.join(tc.root, "umask-")), split);
+  const previous = process.umask(0o002);
+  let m;
+  try { m = await materializeCase(tc.checkout, defect, run, undefined, split); } finally { process.umask(previous); }
+  try {
+    assert.equal(await modeOf(m.snapshot), 0o2750);
+    for (const p of await walkAll(m.snapshot)) assert.equal((await fs.lstat(p)).mode & 0o022, 0, p);
+  } finally { await m.cleanup(); }
+});
+
 test("the snapshot walk never follows a tracked symlink to a file outside the snapshot", async () => {
   const outside = await fs.mkdtemp(path.join(tc.root, "outside-"));
   const secret = path.join(outside, "secret.txt");

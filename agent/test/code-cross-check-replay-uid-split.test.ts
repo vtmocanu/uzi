@@ -7,6 +7,7 @@ import { spawnSync } from "node:child_process";
 import {
   assertSnapshotTraversable, createReplayRunDir, loadReplayCorpus, runReplays, type ReplayRecord,
 } from "../src/code-cross-check-replay.js";
+import { createReplayRecordsFile } from "../src/code-cross-check-replay-cli.js";
 import { CodexCrossCheck } from "../src/codex/cross-check.js";
 import { wireFileopHelper } from "../src/codex/fileop-client.js";
 import { SUPERVISOR_BIN } from "../src/codex/launcher.js";
@@ -73,9 +74,11 @@ test("Codex fileop can stat and read the replay snapshot while the records file,
   try {
     fs.chownSync(fixtureRoot, -1, RUNNER_UID);
     fs.chmodSync(fixtureRoot, 0o710);
-    const recordsFile = path.join(fixtureRoot, "records.jsonl");
-    fs.writeFileSync(recordsFile, "private\n", { mode: 0o600 });
-    fs.chmodSync(recordsFile, 0o600);
+    // Created by the production helper the CLI uses (wx, 0600), not a hand-written stand-in.
+    const created = await createReplayRecordsFile(fixtureRoot, Date.now());
+    await created.handle.writeFile("private\n");
+    await created.handle.close();
+    const recordsFile = created.file;
 
     runDir = await createReplayRunDir(fixtureRoot);
     const runStat = fs.statSync(runDir);
