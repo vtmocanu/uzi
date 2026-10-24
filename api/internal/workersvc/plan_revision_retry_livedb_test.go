@@ -89,8 +89,13 @@ func TestPlanRevisionRetrySettlementLiveDB(t *testing.T) {
 			if !errors.Is(err, ErrStaleRevisionSource) || applied {
 				t.Fatalf("refusal: applied=%v err=%v", applied, err)
 			}
+			// The refused modes (historical, changed payload) charge once for claim 1 (issue #3081).
+			wantRefusals := int32(1)
+			if mode == "extra target" {
+				wantRefusals = 0
+			}
 			row := f.row(run)
-			if row.revision != 2 || row.refusals != 0 || row.status != "awaiting_approval" {
+			if row.revision != 2 || row.refusals != wantRefusals || row.status != "awaiting_approval" {
 				t.Fatalf("refusal changed newer plan: %+v", row)
 			}
 		})

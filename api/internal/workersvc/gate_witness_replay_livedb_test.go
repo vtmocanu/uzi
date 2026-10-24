@@ -135,6 +135,8 @@ func TestPlanRevisionWitnessRestorationLiveDB(t *testing.T) {
 	}
 	if after := reconciliationRow(t, f, id); !bytes.Equal(after.GatePresentedPayload, published.GatePresentedPayload) || after.GateRevision != 2 {
 		t.Fatal("old source replay changed the newer presentation")
+	} else if after.GateRefusalCount != 1 {
+		t.Fatalf("historical source replay charged %d refusals, want 1 (issue #3081)", after.GateRefusalCount)
 	}
 	opts.ExpectedGateRevision = i64(2)
 	opts.ExpectedResetStateDigest, err = ResetStateDigest(published)
