@@ -73,7 +73,7 @@ function rig(overrides: object = {}, reader?: Pick<WorkerMemoryReader, "sample">
     reader: reader ?? { sample: () => {
       const time = performance.now();
       return { available: true, sampleId: ++samples, startedAtMs: time, completedAtMs: time,
-        currentBytes: 950, limitBytes: 1000, stat: { anon: 1, shmem: 0, slab_unreclaimable: 0, unevictable: 0 },
+        currentBytes: 950, limitBytes: 1000, stat: { anon: 1, shmem: 0, slab_unreclaimable: 0, unevictable: 0, inactive_file: 0 },
         pressure: { some: { avg10: 0, avg60: 0, avg300: 0, total: 0 },
           full: { avg10: 0, avg60: 0, avg300: 0, total: 0 } } };
     } },
@@ -548,6 +548,69 @@ test("delayed historical sinks remain bound after retirement and never use a run
     assert.equal(f.memory.commands.admitsCommands(successor), true, "historical preservation cannot retire a successor");
   } finally {
     feedback.resolve();
+    await f.memory.stop(); await running;
+  }
+});
+
+test("PSI-less working-set hard crossing selects only the attributable command and delivers tool feedback", async () => {
+  const requests: import("../src/protocol.js").MemoryReservationRequest[] = [];
+  const f = rig({
+    reserveMemoryIntervention: async (request: import("../src/protocol.js").MemoryReservationRequest) => {
+      requests.push(request);
+      return { ...request, admitted: true, authorizing: true,
+        allowance: { limit: request.policy.max_interventions, used: request.policy.max_interventions - 1, remaining: 1 } };
+    },
+    reportMemoryInterventionOutcome: async (request: import("../src/protocol.js").MemoryOutcomeRequest) => {
+      const reserved = requests.find((r) => r.intervention_id === request.intervention_id)!;
+      return { ...reserved, admitted: true, authorizing: false, outcome: request.outcome,
+        allowance: { limit: reserved.policy.max_interventions, used: reserved.policy.max_interventions - 1, remaining: 1 } };
+    },
+  }, { sample: (() => {
+    let id = 0;
+    return () => {
+      const time = performance.now();
+      // current 990 is above H (900) only by raw usage; inactive_file 50 leaves a working set of 940, still >= H.
+      return { available: true as const, sampleId: ++id, startedAtMs: time, completedAtMs: time,
+        currentBytes: 990, limitBytes: 1000, stat: { anon: 1, shmem: 0, slab_unreclaimable: 0, unevictable: 0, inactive_file: 50 },
+        pressure: { unavailable: "absent" as const } };
+    };
+  })() });
+  const feedback: import("../src/protocol.js").WorkerMemoryPressureResult[] = [];
+  const context = f.memory.begin({ run_id: runId, worker_id: workerId, register_nonce: "fixture",
+    claim_generation: 1, memory_episode: 0, flight: {}, lifecycleRevision: 1 }, {
+    prepareFeedback: () => {}, preparePreservation: () => {}, preservationBudgetMs: 500,
+    feedback: async (result) => { feedback.push(result); }, preserve: async () => {},
+  });
+  const cancelled: string[] = [];
+  const enroll = (pid: number, toolId: string, rssBytes: number) => f.memory.commands.register(context, {
+    source: "codex-model-command", toolId, attemptId: "attempt", command: "inert " + toolId,
+    root: { pid, startTime: "10" },
+    observe: async () => {
+      const time = performance.now();
+      return { available: true, complete: true, startedAtMs: time, completedAtMs: time,
+        rows: [{ pid, startTime: "10", rssBytes }] };
+    },
+    cancel: async () => { cancelled.push(toolId); },
+    drain: async () => ({ confirmed: true }),
+  });
+  const victim = enroll(10, "tool-victim", 500);
+  const sibling = enroll(20, "tool-sibling", 10);
+  const join = f.memory.commands.prepareOutcome(victim);
+  const running = f.memory.run();
+  try {
+    const result = await join;
+    assert.equal(result.code, "worker_memory_pressure");
+    assert.equal(result.tool_id, "tool-victim");
+    assert.equal(result.command_id, victim.commandId);
+    assert.equal(result.outcome, "confirmed_drained");
+    assert.equal(result.observed_total_bytes, 990, "feedback keeps raw memory.current");
+    assert.deepEqual(cancelled, ["tool-victim"]);
+    assert.equal(requests.length, 1);
+    await until(() => feedback.length === 1);
+    assert.equal(feedback[0]!.tool_id, "tool-victim");
+    assert.equal(cancelled.includes("tool-sibling"), false, "sibling is never cancelled");
+    assert.equal(f.memory.commands.hasConfirmedStop(sibling), false);
+  } finally {
     await f.memory.stop(); await running;
   }
 });

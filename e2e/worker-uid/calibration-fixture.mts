@@ -165,13 +165,16 @@ export function projectFailedEvidence(facts: {
 // legs therefore hand the guard each measured sample with PSI pinned to the first load
 // sample's values; memory charges and every recorded sample stay measured.
 export type GuardPressurePin = { mode: "pinned_to_first_load_sample"; sampleId: number; pressure: Available["pressure"] };
+// Copies the absence marker when PSI is absent, the two rows otherwise.
+function copyPressure(pressure: Available["pressure"]): Available["pressure"] {
+  return "unavailable" in pressure ? { unavailable: pressure.unavailable }
+    : { some: { ...pressure.some }, full: { ...pressure.full } };
+}
 export function pinGuardPressure(first: Available): GuardPressurePin {
-  return { mode: "pinned_to_first_load_sample", sampleId: first.sampleId,
-    pressure: { some: { ...first.pressure.some }, full: { ...first.pressure.full } } };
+  return { mode: "pinned_to_first_load_sample", sampleId: first.sampleId, pressure: copyPressure(first.pressure) };
 }
 export function guardFacingSample(value: Available, pin: GuardPressurePin): Available {
-  return { ...value, stat: { ...value.stat },
-    pressure: { some: { ...pin.pressure.some }, full: { ...pin.pressure.full } } };
+  return { ...value, stat: { ...value.stat }, pressure: copyPressure(pin.pressure) };
 }
 export function hardCrossing<T extends { currentBytes: number }>(samples: readonly T[], high: number): { low: T; above: T } {
   const index = samples.findIndex((s) => s.currentBytes >= high);

@@ -213,7 +213,7 @@ test("ACK publication keeps old JSON readable until the owned temporary file is 
 const dwellGuard = { reserveBytes: 100, hysteresisBytes: 20, sampleMs: 250, responseBudgetMs: 5000, rearmMs: 500 };
 const lowSample = (at: number, sampleId: number, currentBytes = 50): Parameters<typeof freshPostCleanupDwell>[0][number] => ({
   available: true, sampleId, startedAtMs: at - 1, completedAtMs: at, currentBytes, limitBytes: 200,
-  stat: { anon: 0, shmem: 0, slab_unreclaimable: 0, unevictable: 0 },
+  stat: { anon: 0, shmem: 0, slab_unreclaimable: 0, unevictable: 0, inactive_file: 0 },
   pressure: { some: { avg10: 0, avg60: 0, avg300: 0, total: 0 }, full: { avg10: 0, avg60: 0, avg300: 0, total: 0 } },
 });
 
@@ -408,7 +408,7 @@ function observedLeg() {
   const psi = (total: number) => ({ some: { avg10: 0, avg60: 0, avg300: 0, total }, full: { avg10: 0, avg60: 0, avg300: 0, total } });
   const at = (sampleId: number, currentBytes: number, total: number) => ({
     available: true as const, sampleId, startedAtMs: sampleId * 250, completedAtMs: sampleId * 250 + 1, currentBytes, limitBytes,
-    stat: { anon: currentBytes, shmem: 0, slab_unreclaimable: 0, unevictable: 0 }, pressure: psi(total) });
+    stat: { anon: currentBytes, shmem: 0, slab_unreclaimable: 0, unevictable: 0, inactive_file: 0 }, pressure: psi(total) });
   const guard = new WorkerMemoryGuard({ enabled: true, reserveBytes: limitBytes - high, hysteresisBytes: 8 * 1024 ** 2,
     sampleMs: 250, responseBudgetMs: 5000, rearmMs: 500, maxInterventions: 2 });
   return { high, guard, s7: at(7, 251_277_312, 0), s8: at(8, 271_241_216, 1400), drained: at(9, 145_920_000, 1400),

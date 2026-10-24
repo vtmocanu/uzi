@@ -6,7 +6,7 @@ import type { WorkerMemoryReader } from "../src/worker-memory-reader.js";
 const MiB = 1024 * 1024;
 function sample(id: number, usage = 64 * MiB, limit = 1024 * MiB): Extract<ReturnType<WorkerMemoryReader["sample"]>, { available: true }> {
   return { available: true, sampleId: id, startedAtMs: id * 10, completedAtMs: id * 10 + 1,
-    currentBytes: usage, limitBytes: limit, stat: { anon: usage, shmem: 0, slab_unreclaimable: 0, unevictable: 0 },
+    currentBytes: usage, limitBytes: limit, stat: { anon: usage, shmem: 0, slab_unreclaimable: 0, unevictable: 0, inactive_file: 0 },
     pressure: { some: { avg10: 0, avg60: 0, avg300: 0, total: 0 }, full: { avg10: 0, avg60: 0, avg300: 0, total: 0 } } };
 }
 const baseline = [sample(1), sample(2), sample(3)];

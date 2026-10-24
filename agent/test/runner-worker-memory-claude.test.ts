@@ -106,7 +106,7 @@ async function setup(responseBudgetMs = settings.responseBudgetMs) {
       const time = performance.now();
       return { available: true, sampleId: 1, startedAtMs: time, completedAtMs: time,
         currentBytes: 0, limitBytes: 1000,
-        stat: { anon: 1, shmem: 0, slab_unreclaimable: 0, unevictable: 0 },
+        stat: { anon: 1, shmem: 0, slab_unreclaimable: 0, unevictable: 0, inactive_file: 0 },
         pressure: { some: { avg10: 0, avg60: 0, avg300: 0, total: 0 },
           full: { avg10: 0, avg60: 0, avg300: 0, total: 0 } } };
     } },
