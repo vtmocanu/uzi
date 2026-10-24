@@ -125,9 +125,13 @@ func ValidatePVCCeilings(cfg RenderConfig, resolver preset.Resolver) error {
 		largest := map[string]worst{}
 
 		// EVERY (template, size) pair, because DataSize varies by size and a template
-		// that resolves against a different table later must not slip past.
-		for _, template := range preset.TemplateNames() {
-			for _, size := range preset.SizeNames() {
+		// that resolves against a different table later must not slip past. Sorted, so
+		// a tie (l and l-highmem share 50Gi of data) always names the same preset.
+		templates, sizes := preset.TemplateNames(), preset.SizeNames()
+		sort.Strings(templates)
+		sort.Strings(sizes)
+		for _, template := range templates {
+			for _, size := range sizes {
 				spec, err := resolver.Resolve(template, size)
 				if err != nil {
 					return fmt.Errorf("resolving preset %q/%q to check PVC ceilings: %w", template, size, err)
