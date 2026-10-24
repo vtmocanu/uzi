@@ -5,7 +5,7 @@
 **Status:** Done (AI-synced 2026-10-24): M1 to M4 complete. M3: every D4 guard has a recorded red and green; one survivor was closed by a test, and two equivalent mutants are recorded (G12 deletion; the G8 resume-scope check, for sequential callers only). The hosted checks are carried to #3346 at landing. Rewritten 2026-10-23 for the re-scoped epic (structural only); revised the same day after lead and peer review. Anchors verified against origin/main `12f6df6edd6ff4e9812b9fd8bb84209fee5a0b80`.
 **Priority:** Normal.
 **Depends on:** PR #3356 merged. It records #1230's m6 evidence, moves the #1230 PRD to prds/done/1230-semantic-completion-contract.md, closes #1230, and edits `api/internal/workersvc/semantic_transport_doc_test.go`, `adr/2149-cross-check.md` and the #1225 epic PRD, all of which M4 also edits. The run must start from a base that contains #3356.
-**Execution:** Keep `Planned` without `uzi` until this rewrite is approved and #3356 has merged. One gated run, one PR, four serial milestones. The run needs Docker: `./e2e/run-store-it.sh` for the LiveDB gate, and a session-owned throwaway Postgres for the M3 mutation controls. No implementation or validation may create or modify `.github/workflows/**`.
+**Execution:** None. Completed; never dispatch.
 
 ## Problem
 

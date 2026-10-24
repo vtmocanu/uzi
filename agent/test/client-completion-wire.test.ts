@@ -25,12 +25,16 @@ function fixture(name: string): unknown {
   return JSON.parse(fixtureBytes(name));
 }
 
-/** The README's normalization, and nothing else: UUIDs and RFC 3339 timestamps in string values. */
-function normalize(v: unknown): unknown {
-  if (typeof v === "string") return v.replace(UUID_RE, NIL_UUID).replace(TS_RE, "2026-01-01T00:00:00Z");
-  if (Array.isArray(v)) return v.map(normalize);
+/** The README's normalization, and nothing else: the "id" UUID and the "issued_at" timestamp. */
+function normalize(v: unknown, key?: string): unknown {
+  if (typeof v === "string") {
+    if (key === "id") return v.replace(UUID_RE, NIL_UUID);
+    if (key === "issued_at") return v.replace(TS_RE, "2026-01-01T00:00:00Z");
+    return v;
+  }
+  if (Array.isArray(v)) return v.map((x) => normalize(x));
   if (v !== null && typeof v === "object") {
-    return Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([k, x]) => [k, normalize(x)]));
+    return Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([k, x]) => [k, normalize(x, k)]));
   }
   return v;
 }
@@ -58,6 +62,17 @@ async function bytesServer(raw: string): Promise<{ url: string; close: () => Pro
 function client(url: string): WorkerClient {
   return new WorkerClient(url, TOKEN, "0.1.0-test", nullLogger(), { sleep: async () => {} });
 }
+
+describe("completion wire normalization", () => {
+  it("rewrites only the id and issued_at values", () => {
+    const uuid = "5f0c1c2e-7d3a-4b8e-9a61-2c4d6e8f0a1b";
+    const ts = "2026-03-04T05:06:07Z";
+    assert.deepStrictEqual(
+      normalize({ id: uuid, issued_at: ts, run_id: uuid, expires_at: ts, note: [uuid, ts] }),
+      { id: NIL_UUID, issued_at: "2026-01-01T00:00:00Z", run_id: uuid, expires_at: ts, note: [uuid, ts] },
+    );
+  });
+});
 
 describe("completion wire fixtures decode through the real WorkerClient", () => {
   it("attempt-unmet.json: unmet [m5], attempt_count 1", async () => {

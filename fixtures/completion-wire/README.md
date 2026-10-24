@@ -17,9 +17,10 @@ Two tests read them, one per side, and neither reads the other:
 - `agent/test/client-completion-wire.test.ts` parses the same files with the
   worker client, so an api wire change reddens the agent gate and vice versa.
 
-Normalization (the only edits to the handler output): every UUID becomes
-`00000000-0000-4000-8000-000000000000` and every RFC 3339 timestamp becomes `2026-01-01T00:00:00Z`.
-Nothing else is rewritten. Files are pretty-printed with a two-space indent and a trailing newline;
+Normalization (the only edits to the handler output): the UUID value of an `"id"` field (the permit
+id) becomes `00000000-0000-4000-8000-000000000000` and the RFC 3339 value of an `"issued_at"` field
+becomes `2026-01-01T00:00:00Z`. Nothing else is rewritten: a UUID or timestamp under any other key
+is compared verbatim, and both tests pin that with a negative case. Files are pretty-printed with a two-space indent and a trailing newline;
 key order is the handler's own.
 
 The fixtures are RECORDED, never hand-authored. To re-record after a deliberate wire change, from `api/`:

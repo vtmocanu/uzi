@@ -22,9 +22,11 @@ const wireFixtureDir = "../../../fixtures/completion-wire"
 // wireRecordEnv, when "1", rewrites the fixtures from the handler output instead of comparing.
 const wireRecordEnv = "UZI_RECORD_COMPLETION_WIRE"
 
+// The normalized fields, and only these: the identity ("id", the permit id) and issue time
+// ("issued_at") values. A UUID or timestamp under any other key stays as the handler wrote it.
 var (
-	wireUUIDRe = regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
-	wireTimeRe = regexp.MustCompile(`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})`)
+	wireUUIDRe = regexp.MustCompile(`("id"\s*:\s*")[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"`)
+	wireTimeRe = regexp.MustCompile(`("issued_at"\s*:\s*")\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})"`)
 )
 
 const (
@@ -62,18 +64,34 @@ func wireRun(id uuid.UUID, completed string) store.Run {
 	}
 }
 
-// normalizeWire replaces UUIDs and RFC 3339 timestamps with fixed placeholders and pretty-prints
+// normalizeWire replaces the "id" UUID and "issued_at" timestamp with fixed placeholders and pretty-prints
 // with two-space indent (key order is the handler's own) plus a trailing newline.
 func normalizeWire(t *testing.T, raw []byte) []byte {
 	t.Helper()
-	s := wireUUIDRe.ReplaceAll(raw, []byte(wirePlaceholderUUID))
-	s = wireTimeRe.ReplaceAll(s, []byte(wirePlaceholderTime))
+	s := wireUUIDRe.ReplaceAll(raw, []byte(`${1}`+wirePlaceholderUUID+`"`))
+	s = wireTimeRe.ReplaceAll(s, []byte(`${1}`+wirePlaceholderTime+`"`))
 	var out bytes.Buffer
 	if err := json.Indent(&out, bytes.TrimSpace(s), "", "  "); err != nil {
 		t.Fatalf("indent: %v body=%s", err, raw)
 	}
 	out.WriteByte('\n')
 	return out.Bytes()
+}
+
+// TestNormalizeWireOnlyDesignatedFields pins the README's rule: a UUID or timestamp outside
+// "id" and "issued_at" is compared verbatim, so a wire change there still reddens the fixtures.
+func TestNormalizeWireOnlyDesignatedFields(t *testing.T) {
+	raw := []byte(`{"id":"5f0c1c2e-7d3a-4b8e-9a61-2c4d6e8f0a1b","issued_at":"2026-03-04T05:06:07Z",` +
+		`"run_id":"7a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","expires_at":"2026-03-04T05:06:07Z","note":"5f0c1c2e-7d3a-4b8e-9a61-2c4d6e8f0a1b"}`)
+	want := "{\n" +
+		`  "id": "` + wirePlaceholderUUID + "\",\n" +
+		`  "issued_at": "` + wirePlaceholderTime + "\",\n" +
+		`  "run_id": "7a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",` + "\n" +
+		`  "expires_at": "2026-03-04T05:06:07Z",` + "\n" +
+		`  "note": "5f0c1c2e-7d3a-4b8e-9a61-2c4d6e8f0a1b"` + "\n}\n"
+	if got := string(normalizeWire(t, raw)); got != want {
+		t.Fatalf("normalizeWire rewrote a non-designated field:\n got %s\nwant %s", got, want)
+	}
 }
 
 func TestCompletionWireFixtures(t *testing.T) {
