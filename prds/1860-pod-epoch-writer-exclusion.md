@@ -1,6 +1,6 @@
 # PRD #1860: Pod-epoch writer exclusion for settled attempt trees (M0 investigation)
 
-**Status**: Draft, 2026-10-24. Item 1 of #1860, re-scoped (see Decision Log). Investigation-only: the single milestone M0 produces evidence and a go/no-go recommendation. Implementation is a later PRD, written only after the owner reviews M0.
+**Status**: M0 in progress, 2026-10-24 (preflight recorded). Item 1 of #1860, re-scoped (see Decision Log). Investigation-only: the single milestone M0 produces evidence and a go/no-go recommendation. Implementation is a later PRD, written only after the owner reviews M0.
 
 ## Problem
 
@@ -74,7 +74,7 @@ Deliverables: the evidence record, plus any real-daemon experiment scripts under
 
 Establish all of the following, or M0 stops incomplete:
 
-- **Images to source.** The pinned images (the `docker:29-dind-rootless` and `docker:29-dind` digests in `deploy/chart/values.yaml` and `docker-compose.yml`) are Engine **29.8.0**; record this from the image config. Map them to source:
+- **Images to source.** The pinned images (the `docker:29-dind-rootless` and `docker:29-dind` digests in `deploy/chart/values.yaml`; `docker-compose.yml` pins only the rootless digest) are Engine **29.8.0**; record this from the image config. Map them to source:
   - `github.com/moby/moby/v2` (the Go proxy resolves the `docker-v29.8.0` tag as `v2.0.0-beta.23`);
   - BuildKit `v0.33.0`;
   - containerd `v2.3.4`;
@@ -147,3 +147,20 @@ Destructive or race experiments run only on disposable trees and a controlled da
 | 2026-10-24 | The rename fence plus inventory verdict is rejected. | A symlink-alias bind keeps writing after the rename and is reported under the alias. After the rename, process proofs lose in-tree processes (their cwd reads `/`). A deferred fence makes the tree look missing to every reader, and operator discard can then orphan it. Stopped leftovers would make it defer almost always. | Rename fence with path or inventory checks. |
 | 2026-10-24 | Pod-epoch reclaim, with a positive controller-supplied predecessor-termination guard and no fallback without evidence. | In-flight creates on the old daemon die with the old pod by construction. Graceful pod deletion and same-node RWO sharing defeat "new pod implies old pod gone", so evidence is required. | A documentation-only residual for force-delete. |
 | 2026-10-24 | Investigation-only PRD; implementation is a later PRD after owner review. | The guarantees depend on Kubernetes and daemon ordering, which must be source-backed before any deletion path exists. | Implementing with the experiments inline. |
+
+## M0 evidence
+
+Recorded by the #1860 M0 run, 2026-10-24. Real-daemon results come from the harness in `e2e/pod-epoch/`, which runs outside all gates; each result says whether it was run.
+
+### Preflight
+
+- **Images.** Both pins pulled by digest: `docker:29-dind-rootless@sha256:e17fa54c2ffd…84c0` (`deploy/chart/values.yaml:958`, `docker-compose.yml:514`) and `docker:29-dind@sha256:5efed980cba3…d17e` (`values.yaml:959`; compose does not pin the rootful image). Their image config has the same `DOCKER_VERSION=29.8.0`, `DOCKER_BUILDX_VERSION=0.37.0`, `DOCKER_COMPOSE_VERSION=5.5.1` and `DIND_COMMIT=8d9e3502…`. The rootless image runs as `User=rootless`.
+- **Runtime versions** (`--version` inside each image): `dockerd` 29.8.0 build `3ce5872`; containerd `v2.3.4` (`db880954…`); runc `1.5.1` (spec 1.3.0, built with go1.26.8); rootlesskit `3.1.0`, rootless image only; tini `0.19.0` (`docker-init`). A running daemon reports `GoVersion go1.26.8` and API `1.56` in both postures.
+- **Source.** All source was read through `proxy.golang.org`:
+  - `github.com/moby/moby/v2@v2.0.0-beta.23`, whose origin hash `3ce5872b79…` matches the dockerd build, so the `docker-v29.8.0` mapping holds. Its `go.mod` declares `go 1.26.3`; the shipped binary was built with go1.26.8.
+  - `github.com/moby/buildkit@v0.33.0`.
+  - `github.com/containerd/containerd/v2@v2.3.4`, whose hash matches the binary.
+  - `k8s.io/kubernetes@v1.37.1`, matching the controller's `k8s.io/api v0.37.1`.
+
+  The first Kubernetes zip fetch returned a 302 redirect with an empty body; following the redirect worked.
+- **Controlled daemon.** `e2e/pod-epoch/lib.sh` starts a privileged, digest-pinned DinD container per posture, on harness-owned volumes for the data root (the DinD PVC) and `/data/runner` (the shared workdir). Ownership is labelled and teardown removes by exact name only. A container restart stands in for a sidecar restart, and a remove-plus-recreate on the same volumes stands in for a successor pod. Wiring deviations: vfs storage, a tmpfs `/run/dind`, and a single container instead of separate worker and sidecar containers. They are listed in `e2e/pod-epoch/README.md`. Result: `bash e2e/pod-epoch/smoke.sh all` **run, exit 0**, with `SMOKE rootless PASS` and `SMOKE rootful PASS` on Engine 29.8.0. The worker's own outer daemon is shared with other runs, so it was never a test subject.
