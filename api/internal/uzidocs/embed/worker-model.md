@@ -52,6 +52,30 @@ override uses that pin unless the schedule applies its model to all agents.
 Your worker-model setting does not override a subagent pin. **Chat always
 uses your Claude lane**, whichever harness is your default.
 
+## Claude model guard and recovery
+
+Saving the Claude worker lane (`default_claude_model`, or legacy
+`default_model` when resolved to Claude) rejects these known Codex role IDs:
+`gpt-5.6-sol`, `gpt-6-astra`, `gpt-6-luna`, `gpt-6-sol` and `gpt-6.1-sol`.
+This is a closed list, not model-family guessing: valid custom Claude IDs
+outside it remain accepted. The Codex lane's accepted models are unchanged.
+
+Previously stored preferences are not migrated or cleared. Ordinary Claude
+worker claims skip a stored lane value from this list and add a fallback
+note to the run feed, using the existing fallback: the `lead` template's
+model, then the SDK default. A compatible schedule or frozen per-run model
+still takes precedence. Chat and jobs log a server warning and skip the
+lane value, using their own runner defaults when no applicable override
+wins. Frozen-model compatibility and cross-check pin rules are unchanged;
+this guard applies to the worker lane.
+
+In **Settings → Run defaults**, **Not a Claude model** identifies the
+problem. Click **Reset to Default** to clear the draft, then **Save
+defaults** to persist it. The warning and reset action also appear when
+only Codex is usable and the Claude picker is hidden, because the grouped
+save resends both lanes. `uzi settings get` still shows the stored
+preference until you save a change; there is no new CLI command.
+
 ## Custom Codex model
 
 Codex's dropdown offers the curated `gpt-6-astra`, `gpt-5.6-sol` and
