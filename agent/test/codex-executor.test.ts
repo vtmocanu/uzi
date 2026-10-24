@@ -7836,7 +7836,11 @@ describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
       assert.ok(turnTexts(rig, 0)[0]!.includes(issueDescription), "planning received all four issue criteria");
       assert.equal(rig.providerLaunches(), 2, "normal approval epoch recreation retained");
       const request = rig.epochs[1]!.transport.requests.find(r => r.method === "turn/start")!;
-      return (request.params as { input: { text: string }[] }).input[0]!.text;
+      const prompt = (request.params as { input: { text: string }[] }).input[0]!.text;
+      const normalized = prompt.replace(/\s+/g, " ");
+      assert.ok(normalized.includes("it supersedes the plan you drafted in this thread and, except for in-scope additions the approval advice above permits, the issue text; do not re-plan or resubmit it."));
+      assert.ok(!normalized.includes("supersedes the issue text and the plan you drafted"));
+      return prompt;
     }
     const baseline = await capture();
     assert.equal(await capture(null), baseline);
