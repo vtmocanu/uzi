@@ -1008,7 +1008,10 @@ async function removePinnedTree(
         });
       }
       // chmod follows the magic link to the pinned inode, never a path.
-      if (split && !policy.runnerOwned) await fs.chmod(SELF_FD + leafPin.fd, (st.mode & 0o7777) | 0o770);
+      if (split && !policy.runnerOwned) {
+        policy.beforeDestroy?.();
+        await fs.chmod(SELF_FD + leafPin.fd, (st.mode & 0o7777) | 0o770);
+      }
       const expect = await identityOf(leafPin.fd);
       const wrappers =
         opts.wrappers ?? (split ? [runnerCommand, commandRootCommand, runnerCommand, asWorker] : [asWorker]);
