@@ -455,6 +455,29 @@ describe("buildCheckEnv scrubs worker-impersonation vars (M9)", () => {
     const r = await defaultCheckRunner(env, 5000)(probe, wt);
     assert.equal(r.status, "passed", "the check subprocess must NOT inherit the worker/API/token vars");
   });
+
+  // Issue #3382: a real check subprocess spawned by defaultCheckRunner under the built env. The
+  // probe exits 0 only when its own environment carries exactly the expected Go values.
+  it("issue #3382: a check spawned under the built env sees the configured Go concurrency (end to end)", async () => {
+    const wt = mkdtempSync(join(scratchRoot, "si-go-"));
+    mkdirSync(join(wt, "api"), { recursive: true });
+    const probeFor = (script: string): SelfImproveCheck => ({ name: "go env probe", cwd: "api", command: "sh", args: ["-c", script] });
+    const toolEnv = { PATH: process.env.PATH ?? "/usr/bin:/bin", GOFLAGS: "-toolexec=evil" };
+    try {
+      configureGoConcurrency({ buildParallelism: 2, maxProcs: 3 });
+      const set = buildCheckEnv(source, wt, toolEnv);
+      const setRun = await defaultCheckRunner(set, 5000)(
+        probeFor('[ "$GOFLAGS" = "-p=2" ] && [ "$GOMAXPROCS" = "3" ]'), wt);
+      assert.equal(setRun.status, "passed", "the spawned check carries GOFLAGS=-p=2 and GOMAXPROCS=3");
+      configureGoConcurrency({});
+      const unset = buildCheckEnv(source, wt, toolEnv);
+      const unsetRun = await defaultCheckRunner(unset, 5000)(
+        probeFor('[ -z "${GOMAXPROCS+x}" ] && [ "$GOFLAGS" != "-p=2" ]'), wt);
+      assert.equal(unsetRun.status, "passed", "an unset setting adds no GOMAXPROCS and no -p flag");
+    } finally {
+      configureGoConcurrency({});
+    }
+  });
 });
 
 // The `prepareCheckDeps` block that stood here went with the function (PRD #121 M2):

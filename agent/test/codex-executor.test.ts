@@ -9033,6 +9033,50 @@ describe("CodexExecutor: credential-free command env (item 6)", () => {
     assert.equal(env.UZI_CODEX_COMMANDENV_CANARY, undefined, "process.env is not inherited into the credential-free command identity");
   });
 
+  // Issue #3382: asserted at the launch seams of a real executor run (the fileop root's launch
+  // spec and the env the command seam receives), with a provisioned toolEnv in play.
+  for (const [label, settings, expected] of [
+    ["both set", { buildParallelism: 2, maxProcs: 3 }, { GOFLAGS: "-p=2", GOMAXPROCS: "3" }],
+    ["unset", {}, {}],
+  ] as const) {
+    it(`issue #3382: run() launches commands with the configured Go concurrency (${label}) next to a provisioned toolEnv`, async () => {
+      const rig = makeRig();
+      rig.deps = {
+        ...rig.deps,
+        provisionRunTools: async () => ({
+          toolEnv: { PATH: "/provisioned/go/bin" } as Record<string, string>,
+        }),
+      };
+      rig.transport
+        .push(threadStarted())
+        .push(toolCall(1, "Bash", { command: "go build ./..." }, "th-1", "tn-1", "c-go"))
+        .push(signalDone())
+        .push(turnCompleted("completed"))
+        .end();
+      try {
+        configureGoConcurrency(settings);
+        await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "go concurrency run");
+      } finally {
+        configureGoConcurrency({});
+      }
+      assert.equal(rig.fileopSpawns.length, 1);
+      assert.equal(rig.spawnCommandCalls.length, 1, "the Bash effect reached the command seam");
+      const launched = [
+        rig.fileopSpawns[0]!.env,
+        (rig.spawnCommandCalls[0]!.opts as { env: NodeJS.ProcessEnv }).env,
+      ];
+      for (const env of launched) {
+        assert.ok(String(env.PATH).includes("/provisioned/go/bin"), "the provisioned PATH rides in the same env");
+        assert.equal(env.GOFLAGS, (expected as { GOFLAGS?: string }).GOFLAGS);
+        assert.equal(env.GOMAXPROCS, (expected as { GOMAXPROCS?: string }).GOMAXPROCS);
+        if (label === "unset") {
+          assert.equal(Object.hasOwn(env, "GOFLAGS"), false, "an unset setting adds no GOFLAGS key");
+          assert.equal(Object.hasOwn(env, "GOMAXPROCS"), false);
+        }
+      }
+    });
+  }
+
   // PRD #1493 M3 (part C) — the sandbox mode in the emitted --mode token comes ONLY from the
   // worker Config, never from a UZI_CODEX_COMMAND_SANDBOX value smuggled through the
   // model-influenced tool env. The fileop root's sandbox argv is the observable proof.

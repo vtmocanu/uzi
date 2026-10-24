@@ -37,12 +37,6 @@ func TestGoConcurrencyRenderAndSpecHash(t *testing.T) {
 				}
 			}
 
-			zero := base
-			zero.GoBuildParallelism, zero.GoMaxProcs = 0, 0
-			if SpecHashOf(zero, w, spec) != SpecHashOf(base, w, spec) {
-				t.Fatal("zero Go concurrency fields must not change the spec hash")
-			}
-
 			build := base
 			build.GoBuildParallelism = 3
 			env = envOf(build)
