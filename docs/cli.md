@@ -2059,7 +2059,7 @@ rail_min_width = 36        # default 26
   row is unchanged.
 - `rail_min_width` raises the rail's floor, and may exceed the automatic
   44-column cap. The 60-column transcript minimum still wins on a terminal
-  too narrow for both. Values below 26 are rejected; `0` means the default.
+  too narrow for both. Values below 26 are rejected.
 
 An invalid value for any `[tui]` key stops `uzi tui` with a usage error
 naming the key. Like `split`, both keys are ignored by `--demo` and

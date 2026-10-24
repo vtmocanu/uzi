@@ -1859,12 +1859,11 @@ func tuiConfigPrefs(store *uzicli.Store) (tuiPrefs, error) {
 		return tuiPrefs{}, tuiSplitValueError(store, cfg.TUI.Split)
 	}
 	prefs.milestoneNumbers = cfg.TUI.MilestoneNumbers
-	switch w := cfg.TUI.RailMinWidth; {
-	case w == 0:
-	case w < laneRailWidth:
-		return tuiPrefs{}, tuiRailMinWidthValueError(store, itoa(w))
-	default:
-		prefs.railMinWidth = w
+	if w := cfg.TUI.RailMinWidth; w != nil {
+		if *w < laneRailWidth {
+			return tuiPrefs{}, tuiRailMinWidthValueError(store, itoa(*w))
+		}
+		prefs.railMinWidth = *w
 	}
 	return prefs, nil
 }

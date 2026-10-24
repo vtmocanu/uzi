@@ -226,7 +226,6 @@ func TestTUIConfigPrefsMilestoneNumbersAndRailMinWidth(t *testing.T) {
 		{"absent", "[tui]\n", false, 26},
 		{"numbers false", "[tui]\nmilestone_numbers = false\n", false, 26},
 		{"numbers true", "[tui]\nmilestone_numbers = true\n", true, 26},
-		{"rail zero means default", "[tui]\nrail_min_width = 0\n", false, 26},
 		{"rail 26", "[tui]\nrail_min_width = 26\n", false, 26},
 		{"rail 40", "[tui]\nrail_min_width = 40\n", false, 40},
 		{"both with split", "[tui]\nsplit = \"off\"\nmilestone_numbers = true\nrail_min_width = 32\n", true, 32},
@@ -243,6 +242,7 @@ func TestTUIConfigPrefsMilestoneNumbersAndRailMinWidth(t *testing.T) {
 		name, body, key string
 	}{
 		{"rail below floor", "[tui]\nrail_min_width = 25\n", "[tui] rail_min_width"},
+		{"rail zero", "[tui]\nrail_min_width = 0\n", "[tui] rail_min_width"},
 		{"rail negative", "[tui]\nrail_min_width = -1\n", "[tui] rail_min_width"},
 		{"rail string", "[tui]\nrail_min_width = \"wide\"\n", "[tui] rail_min_width"},
 		{"rail float", "[tui]\nrail_min_width = 30.5\n", "[tui] rail_min_width"},
@@ -271,7 +271,7 @@ func TestTUIConfigPrefsMilestoneNumbersAndRailMinWidth(t *testing.T) {
 }
 
 func TestTUIConfigPrefsSurviveContextAndLoginWrites(t *testing.T) {
-	cfg := &uzicli.Config{Contexts: map[string]uzicli.Context{}, TUI: uzicli.TUIConfig{MilestoneNumbers: true, RailMinWidth: 36}}
+	cfg := &uzicli.Config{Contexts: map[string]uzicli.Context{}, TUI: uzicli.TUIConfig{MilestoneNumbers: true, RailMinWidth: ip32(36)}}
 	env := seedStore(t, cfg, &uzicli.Credentials{Contexts: map[string]uzicli.Credential{}})
 	if _, stderr, code := runCLI(t, env, "context", "set", "work", "--url", "https://work.example"); code != uzicli.ExitOK {
 		t.Fatalf("context set exit=%d stderr=%s", code, stderr)
@@ -280,7 +280,7 @@ func TestTUIConfigPrefsSurviveContextAndLoginWrites(t *testing.T) {
 		t.Fatalf("finishLogin: %v", err)
 	}
 	got, err := env.Store.LoadConfig()
-	if err != nil || !got.TUI.MilestoneNumbers || got.TUI.RailMinWidth != 36 {
+	if err != nil || !got.TUI.MilestoneNumbers || got.TUI.RailMinWidth == nil || *got.TUI.RailMinWidth != 36 {
 		t.Fatalf("config after writes=%+v err=%v", got, err)
 	}
 }
