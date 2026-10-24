@@ -280,7 +280,11 @@ func TestTaskCheckpointEnrolledChildSalvageLiveDB(t *testing.T) {
 	// The promoted row's RESTRICT pointer belongs only to this synthetic remote.
 	// Do not leave it for another test's instance-wide salvage sweep.
 	t.Cleanup(func() {
-		if _, err := f.env.pool.Exec(f.env.ctx, "DELETE FROM run_salvage WHERE run_id=$1", x.child.ID); err != nil {
+		// Remove eligibility in the same statement as the synthetic remote's
+		// row: a later instance-wide sweep must not re-enqueue this fixture.
+		if _, err := f.env.pool.Exec(f.env.ctx, `WITH ineligible AS (
+			UPDATE runs SET fail_origin='plan_rejected' WHERE id=$1 RETURNING id
+		) DELETE FROM run_salvage WHERE run_id IN (SELECT id FROM ineligible)`, x.child.ID); err != nil {
 			t.Errorf("cleanup child salvage: %v", err)
 		}
 	})

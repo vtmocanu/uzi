@@ -96,7 +96,12 @@ func taskCheckpointCreation(t *testing.T, env codexTestEnv, repoRoot string) {
 		if o.WorkBranch != "uzi/task/"+root.ID.String() || o.CheckpointKey != "uzi/task/"+publishingID {
 			t.Fatalf("broker received wrong inherited coordinates: %+v", o)
 		}
-		return pushbroker.Publish(ctx, o)
+		result, err := pushbroker.Publish(ctx, o)
+		wantRef := "refs/uzi-checkpoints/uzi/task/" + publishingID
+		if err == nil && result.Ref != wantRef {
+			t.Fatalf("broker actual destination=%q want literal %q", result.Ref, wantRef)
+		}
+		return result, err
 	})
 	publish := func(id uuid.UUID, claim *ClaimPayload) {
 		t.Helper()

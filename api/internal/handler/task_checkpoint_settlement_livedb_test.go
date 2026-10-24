@@ -1,16 +1,35 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
+// Pin actual proof operands; the shared forge otherwise accepts unknown SHAs.
+type taskCheckpointSettlementForge struct {
+	*liveFakeForge
+	candidates map[string]int
+}
+
+func (f *taskCheckpointSettlementForge) CompareAncestry(ctx context.Context, projectID int64, head, candidate string) (forge.Ancestry, error) {
+	if head != settleHead || (candidate != settlePushed && candidate != settleSource && candidate != settleAdopted) {
+		return forge.AncestryUnknown, fmt.Errorf("unexpected settlement proof: head=%q candidate=%q", head, candidate)
+	}
+	f.candidates[candidate]++
+	return f.liveFakeForge.CompareAncestry(ctx, projectID, head, candidate)
+}
+
 func TestTaskCheckpointDescendantLiveSettlementLiveDB(t *testing.T) {
 	f := newTaskCheckpointHandlerFixture(t)
+	proof := &taskCheckpointSettlementForge{liveFakeForge: f.lf, candidates: make(map[string]int)}
+	f.wsvc.SetForges(settleForgeBuilder{f: proof})
 	succ := f.successor()
 	before := f.authoritySnapshot()
 	body := liveBody(f.firstGeneration, succ, settlePushed, settleSource, settleAdopted, apitypes.RecoverySettleTargetCheckpoint)
@@ -29,6 +48,11 @@ func TestTaskCheckpointDescendantLiveSettlementLiveDB(t *testing.T) {
 	hc, cc := f.fake.calls()
 	if len(refs) != 1 || refs[0] != "refs/uzi-checkpoints/"+f.childKey || len(branches) != 0 || hc != 0 || cc != 3 {
 		t.Fatalf("proof refs=%v branches=%v BranchHead=%d CompareAncestry=%d", refs, branches, hc, cc)
+	}
+	for _, sha := range []string{settlePushed, settleSource, settleAdopted} {
+		if proof.candidates[sha] != 1 {
+			t.Fatalf("proof candidate %s called %d times, want once", sha, proof.candidates[sha])
+		}
 	}
 	// Compare all run/attempt/input fields and all other hold rows, including
 	// timestamps. The sole allowed mutation is the predecessor's release row.
