@@ -143,7 +143,7 @@ func TestManualCordonMigrationLockRetryLiveDB(t *testing.T) {
 		t.Fatalf("lock timeout returned before 5s: %s", elapsed)
 	}
 	applied, _, _, err := store.SchemaVersionStatus(ctx, pool)
-	if err != nil || applied != 348 {
+	if err != nil || applied != 354 {
 		t.Fatalf("failed migration version=%d err=%v", applied, err)
 	}
 	if n := scalarInt(ctx, t, pool, "SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='workers' AND column_name LIKE 'manual_cordon%'"); n != 0 {

@@ -678,7 +678,6 @@ func (h *Handler) CreateWorker(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ListWorkers returns the current user's workers with derived busy status.
 // workerDTOWithOverlays uses the list row's live activity counts and list diagnostics.
 func (h *Handler) workerDTOWithOverlays(ctx context.Context, row store.ListWorkersByUserRow) apitypes.WorkerDTO {
 	ids := []uuid.UUID{row.ID}
@@ -696,6 +695,7 @@ func (h *Handler) workerDTOWithOverlays(ctx context.Context, row store.ListWorke
 	return dto
 }
 
+// ListWorkers returns the current user's workers with derived busy status.
 func (h *Handler) ListWorkers(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
