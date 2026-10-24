@@ -218,6 +218,15 @@ Landing order: merge after #3356; append these lines to #3346; then close #1225 
   | G11 stamping honors the switch | `1a4c52b8` | `health.go` `completionInterlockOn`: `return on` changed to `return on \|\| !on` (always true; a bare `return true` does not compile because `on` would be unused) | `cd api && go test -race -count=1 -p 1 -v -run '^(TestCompletionInterlockExplicitFalseKeepsClaudeLegacyLiveDB\|TestCompletionLifecycleKillSwitchAfterCreateLiveDB)$' ./internal/workersvc` | both FAIL: `completion_default_on_livedb_test.go:107: … completion_contract_version = 1, want NULL (legacy)`, and subtest "legacy run stays legacy after the switch goes true" `completion_lifecycle_livedb_test.go:682: … completion_contract_version = 1, want NULL (legacy)`. The "stamped run keeps its clause" subtest stays green | both tests and both subtests `--- PASS` |
   | G12 `authorize_maintainer` refused on structural | `1a4c52b8` | `completion_decision.go:427`: inside `if prior.Profile != "semantic" {`, `return ErrCompletionDecisionInvalid` changed to `return nil` (permissive; deleting the check is the equivalent mutant recorded above) | `cd api && go test -race -count=1 -p 1 -v -run '^(TestValidateDecision\|TestCompletionLifecycleAuthorizeMaintainerRefusedLiveDB)$' ./internal/workersvc` | both FAIL. `completion_owner_decision_test.go:324: authorize_maintainer on a structural contract: want ErrCompletionDecisionInvalid, got <nil>` (the only failing subtest). `completion_lifecycle_livedb_test.go:721: authorize_maintainer on a structural held run: err=<nil>, want ErrCompletionDecisionInvalid`. A separate fold that deleted the whole check stayed green, confirming the equivalence | all `--- PASS` |
 
+  The run's working checkout was never mutated: after G12, `git status` was clean and `git diff 1a4c52b8 HEAD` touched only this PRD.
+
+  Final integration validation, on unmodified source `1a4c52b8`:
+  - The unmodified `env -u UZI_SQLC_DIR TMPDIR=.uzi/scratch ./e2e/run-store-it.sh` ran until the 60-minute command limit stopped it inside workersvc. By then `ok` was recorded for store (806s), handler (812s), forgesvc and schedsvc.
+  - Using the recorded split fallback, workersvc (1666s), recovery and poller then ran with the script's exact `go test -buildvcs=false -count=1 -v -race -p 1 -timeout <pkg> -run 'LiveDB$'` command against a fresh throwaway Postgres.
+  - Every package reports `ok`.
+  - The six `TestCompletionLifecycle*LiveDB` tests and all three `TestDecideCompletionNonOwnerHiddenLiveDB` subtests PASS.
+  - `scripts/livedb-skip-guard.sh` over the combined logs reports `LiveDB: 4528 passed, 0 skipped`. That count includes the partial workersvc output from the run that was cut off.
+
 - 2026-10-23: Revised after lead and Codex peer review. Decisions on the four open questions:
   - Q1: reword the pinned preconditions to "Any future semantic activation must …" and update every literal and the test together (D6).
   - Q2: #1230 m6 is evidenced by #3356, so this PR archives the epic PRD and #1225 closes after the remaining hosted checks are carried, unticked, into #3346 (D5). #3356 is a stated dependency.
