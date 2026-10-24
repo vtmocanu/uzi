@@ -465,7 +465,10 @@ describe("RunRunner — PRD #1809 D8: an overlay publish after a failed fetch-ba
     });
   });
 
-  it("a report_only completion after that publish is refused, not left to orphan the checkpoint", async () => {
+  // #3360: an issue run that declares report_only after publishing committed work now attempts
+  // non-closing delivery instead of the #299 failure. Here the finalize fetch-back still fails, so
+  // the run fails on that, and it neither completes report-only nor opens a merge request.
+  it("a report_only completion after that publish is not completed report-only and opens no MR", async () => {
     await withHomeRoot(async (homeRoot) => {
       const tips = stubPublish();
       failFetchBackAfter(1);
@@ -485,14 +488,13 @@ describe("RunRunner — PRD #1809 D8: an overlay publish after a failed fetch-ba
       assert.strictEqual(tips.length, 1, "the milestone checkpoint landed (the older tracking tip)");
       const [failed] = reports(claim.run_id, "failed");
       assert.ok(failed, "the run failed");
-      assert.match(failed.failure_reason ?? "", /report_only/);
-      assert.match(failed.failure_reason ?? "", /checkpoint/);
+      assert.match(failed.failure_reason ?? "", /No space left on device/, "the fallback reached the finalize fetch-back");
       assert.strictEqual(reports(claim.run_id, "completed").length, 0, "it did not complete report-only");
       assert.strictEqual(calls.length, 0, "no MR opened");
     });
   });
 
-  it("a declined pause that published the older tip also blocks a later report_only completion", async () => {
+  it("a declined pause that published the older tip also keeps a later report_only from completing report-only", async () => {
     await withHomeRoot(async (homeRoot) => {
       const tips = stubPublish();
       failFetchBackAfter(1);
@@ -513,7 +515,7 @@ describe("RunRunner — PRD #1809 D8: an overlay publish after a failed fetch-ba
       assert.strictEqual(tips.length, 1, "the pause published the older tracking tip");
       const [failed] = reports(claim.run_id, "failed");
       assert.ok(failed, "the run failed");
-      assert.match(failed.failure_reason ?? "", /report_only/);
+      assert.match(failed.failure_reason ?? "", /No space left on device/, "the fallback reached the finalize fetch-back");
       assert.strictEqual(reports(claim.run_id, "completed").length, 0, "it did not complete report-only");
       assert.strictEqual(calls.length, 0, "no MR opened");
     });
