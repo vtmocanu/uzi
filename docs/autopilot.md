@@ -118,7 +118,7 @@ There is no new issue comment for these refusals; the existing
 
 ## Semantic runs park instead of auto-approving (dormant)
 
-**Dormant.** Production enrollment is off until [PRD #1231](https://github.com/vtmocanu/uzi/issues/1231): no production code creates a semantic run today, so every real autopilot run keeps the behavior described above (the *structural* profile, which makes zero coverage calls). This section describes the built-but-unreachable path that only tests exercise. Nothing here is live behavior.
+**Dormant.** Production enrollment is off and not planned (the semantic completion auditor, #1231, was closed not planned; any future activation needs a new approved design): no production code creates a semantic run today, so every real autopilot run keeps the behavior described above (the *structural* profile, which makes zero coverage calls). This section describes the built-but-unreachable path that only tests exercise. Nothing here is live behavior.
 
 A *semantic* run (see [Cross-check](./cross-check.md#semantic-contract-profile-dormant)) compares the issue and linked PRD against the proposed plan before it proceeds. On such a run autopilot auto-approves only when all of these hold:
 

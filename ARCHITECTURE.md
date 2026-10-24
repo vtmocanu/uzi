@@ -1221,7 +1221,9 @@ chain in the diagram above, with no intervening `running`.
   provider-context durability is honestly `same_worker_only`. An admin can turn
   the switch off from Admin → Instance → **Completion check**; a run created
   before the default changed is unaffected, since the switch is read once, at
-  create. See
+  create. Semantic completion auditing did not ship (#1231 was closed not
+  planned); #1230's semantic contract is merged but dormant, with no production
+  enrollment. See
   [docs/run-completion-hold.md](docs/run-completion-hold.md) and
   [adr/1225-structural-completion-interlock-invariants.md](adr/1225-structural-completion-interlock-invariants.md)
   for the negative-space invariants a future edit could break silently.

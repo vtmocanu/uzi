@@ -466,14 +466,16 @@ Neither an earlier push nor a human edit is undone by this guard.
 
 This remains structural enforcement for every production run. #1230 D4 is
 implemented but dormant (see [Maintainer outstanding proof on semantic
-runs](#maintainer-outstanding-proof-on-semantic-runs-dormant)); #1231, which
-activates semantic enrollment and the completion audit, is still open.
+runs](#maintainer-outstanding-proof-on-semantic-runs-dormant)); semantic
+enrollment and the completion audit did not ship (#1231 was closed not
+planned), so no production run enforces them.
 Live deployment acceptance has not been performed; mocked tests or an
 existing PR do not establish it.
 
 ## Maintainer outstanding proof on semantic runs (dormant)
 
-**Dormant.** Production enrollment is off until #1231, no production code
+**Dormant.** Production enrollment is off and not planned (#1231 was closed not
+planned; any future activation needs a new approved design), no production code
 writes a semantic planning record, and only tests inject the path; a real run
 is structural or legacy and shows none of this. The rules below describe what
 the built code does once a run is enrolled, and nothing in this section is live

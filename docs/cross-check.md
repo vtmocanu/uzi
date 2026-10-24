@@ -366,7 +366,8 @@ including when none advertises `cross_check_codex_lead_v1`.
 
 ## Semantic contract profile (dormant)
 
-**Dormant.** Production enrollment is off until #1231, no production code creates a
+**Dormant.** Production enrollment is off and not planned (#1231 was closed not planned;
+any future activation needs a new approved design), no production code creates a
 semantic run and only tests inject the path. A real run uses the *structural*
 profile described everywhere else on this page.
 

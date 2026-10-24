@@ -74,8 +74,9 @@ activate semantic completion or establish live deployment acceptance.
 
 ## Semantic completion capabilities (dormant)
 
-**Dormant.** Production enrollment is off until #1231, so no real run needs these
-capabilities yet. They are built so the fleet can be upgraded ahead of
+**Dormant.** Production enrollment is off and not planned (#1231 was closed not planned;
+any future activation needs a new approved design), so no real run needs these
+capabilities. They were built so the fleet could be upgraded ahead of
 activation; new workers advertise both unconditionally.
 
 | Capability | Who needs it | If missing |
@@ -84,8 +85,8 @@ activation; new workers advertise both unconditionally.
 | `completion_semantic_publication_v1` | A semantic lead worker: a hard claim clause, and also a negotiated API feature the worker consults before publishing | A semantic run stays queued with a health reason naming the protocol. A worker without the API feature holds instead of publishing pending maintainer proof. |
 
 `completion_non_closing_v1` alone is not enough for either. The two semantic
-capabilities do not imply each other, and neither implies readiness for the
-#1231 completion audit. Workers without them keep claiming structural and legacy
+capabilities do not imply each other, and neither implies readiness for a
+completion audit (not shipped). Workers without them keep claiming structural and legacy
 runs as before. Roll the API first, then the workers, as for
 [`completion_non_closing_v1`](#completion-publication-compatibility); see
 [Autopilot](autopilot.md#semantic-runs-park-instead-of-auto-approving-dormant) for
