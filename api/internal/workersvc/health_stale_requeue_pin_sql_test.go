@@ -65,7 +65,7 @@ func TestOwnerHoldSQLMirrorsClaimRun(t *testing.T) {
 	if !strings.Contains(claim, "ORr.updated_at<@affinity_cutoff)") {
 		t.Fatal("ClaimRun affinity predicate lacks strict ceiling")
 	}
-	start := strings.Index(claim, "(NOTfn_worker_accepts_new_intake(ow)OR")
+	start := strings.Index(claim, "(ow.draining_sinceISNOTNULLOR")
 	if start < 0 {
 		t.Fatal("ClaimRun owner predicate missing")
 	}

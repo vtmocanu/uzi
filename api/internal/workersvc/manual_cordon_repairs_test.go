@@ -143,8 +143,8 @@ func TestManualCordonHealthLeaseAvailabilityLiveDB(t *testing.T) {
 		if draining {
 			want = 0
 		}
-		if counts.Claimable != want || counts.ManualSuitable != 1 {
-			t.Fatalf("draining=%v counts=%+v want claimable=%d diagnostic suitable=1", draining, counts, want)
+		if counts.StrictEligible != want || counts.Claimable != want || counts.ManualSuitable != 1 {
+			t.Fatalf("draining=%v counts=%+v want strict and claimable=%d manual suitable=1", draining, counts, want)
 		}
 	}
 }
@@ -286,6 +286,37 @@ func TestManualCordonReadFailurePrerequisitePriority(t *testing.T) {
 			fs.active = []store.ListActiveRunsForHealthRow{r}
 			if n := svc.detectRunHealth(context.Background(), t0); n != 1 || lastWrite(t, fs, r.ID).HealthReason.String != want {
 				t.Fatalf("prerequisite priority: changes=%d writes=%+v want=%q", n, fs.writes, want)
+			}
+		})
+	}
+}
+
+func TestManualCordonPersistentHistoricalEligibilityLiveDB(t *testing.T) {
+	for _, mode := range []string{"ordinary", "hard fence", "manual only"} {
+		t.Run(mode, func(t *testing.T) {
+			e := setupInterlockLiveDB(t)
+			svc := e.permitService(t)
+			run := e.seedQueuedRun(t, nil, nil)
+			worker := e.seedHeartbeatWorker(t, nil)
+			at := time.Now().UTC().Truncate(time.Microsecond)
+			e.exec(t, `UPDATE workers SET maintenance_fenced=$2,maintenance_activity_floor=$3 WHERE id=$1`, worker, mode == "hard fence", at)
+			if _, err := store.ChangeWorkerManualCordon(e.ctx, e.pool, e.userID, worker, "lane operator", pgtype.Text{}, mode == "manual only"); err != nil {
+				t.Fatal(err)
+			}
+			counts, err := svc.workerEligibilityForHealth(e.ctx, at, run, true)
+			wantNonDraining, wantClaimable := int64(1), int64(1)
+			if mode == "hard fence" {
+				wantNonDraining = 0
+			}
+			if mode != "ordinary" {
+				wantClaimable = 0
+			}
+			wantManual := int64(0)
+			if mode == "manual only" {
+				wantManual = 1
+			}
+			if err != nil || counts.StrictEligible != 1 || counts.NonDrainingEligible != wantNonDraining || counts.Claimable != wantClaimable || counts.ManualSuitable != 1 || counts.ManualCordoned != wantManual {
+				t.Fatalf("%s counts=%+v err=%v want strict=1 nonDraining=%d claimable=%d manualSuitable=1 manualCordoned=%d", mode, counts, err, wantNonDraining, wantClaimable, wantManual)
 			}
 		})
 	}

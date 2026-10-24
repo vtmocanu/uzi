@@ -346,3 +346,26 @@ func TestCredentialDisabledPendingPauseConvergesLiveDB(t *testing.T) {
 		})
 	}
 }
+
+func TestCredentialPromoterManualCordonAffinityLiveDB(t *testing.T) {
+	for _, mode := range []string{"stale manual", "fresh manual", "draining manual"} {
+		t.Run(mode, func(t *testing.T) {
+			fx := newCDFix(t)
+			fx.setEnabled(fx.pinTok, false)
+			setManualCordonForTest(t, fx.env, fx.userID, fx.workerID, true)
+			fx.env.exec(`UPDATE workers SET last_heartbeat_at=now()-interval '1 hour',draining_since=NULL WHERE id=$1`, fx.workerID)
+			switch mode {
+			case "fresh manual":
+				fx.env.exec(`UPDATE workers SET last_heartbeat_at=now() WHERE id=$1`, fx.workerID)
+			case "draining manual":
+				fx.env.exec(`UPDATE workers SET draining_since=now() WHERE id=$1`, fx.workerID)
+			}
+			run := fx.parkedRun(t, "issue")
+			fx.svc.RequestCredentialDisabledPromotion(fx.userID)
+			r := assertHeld(t, fx.env, run, mode != "stale manual")
+			if r.WorkerID != pgconv.UUID(fx.workerID) {
+				t.Fatalf("promotion lost worker affinity: %v", r.WorkerID)
+			}
+		})
+	}
+}
