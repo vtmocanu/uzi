@@ -1832,12 +1832,13 @@ type tuiPrefs struct {
 	split            string
 	milestoneNumbers bool
 	railMinWidth     int
+	blink            bool
 }
 
 // tuiConfigPrefs validates the real TUI's preferences before opening a screen.
 // Demo and sketch return before this call, so their layout remains automatic.
 func tuiConfigPrefs(store *uzicli.Store) (tuiPrefs, error) {
-	prefs := tuiPrefs{split: "auto", railMinWidth: laneRailWidth}
+	prefs := tuiPrefs{split: "auto", railMinWidth: laneRailWidth, blink: true}
 	if store == nil {
 		return prefs, nil
 	}
@@ -1859,6 +1860,9 @@ func tuiConfigPrefs(store *uzicli.Store) (tuiPrefs, error) {
 		return tuiPrefs{}, tuiSplitValueError(store, cfg.TUI.Split)
 	}
 	prefs.milestoneNumbers = cfg.TUI.MilestoneNumbers
+	if cfg.TUI.Blink != nil {
+		prefs.blink = *cfg.TUI.Blink
+	}
 	if w := cfg.TUI.RailMinWidth; w != nil {
 		if *w < laneRailWidth {
 			return tuiPrefs{}, tuiRailMinWidthValueError(store, itoa(*w))
@@ -1892,6 +1896,11 @@ func tuiRawValueError(store *uzicli.Store) error {
 			return tuiMilestoneNumbersValueError(store, fmt.Sprint(value))
 		}
 	}
+	if value, present := section["blink"]; present {
+		if _, isBool := value.(bool); !isBool {
+			return tuiBlinkValueError(store, fmt.Sprint(value))
+		}
+	}
 	if value, present := section["rail_min_width"]; present {
 		if _, isInt := value.(int64); !isInt {
 			return tuiRailMinWidthValueError(store, fmt.Sprint(value))
@@ -1910,6 +1919,18 @@ func tuiMilestoneNumbersValueError(store *uzicli.Store, value string) error {
 	return uzicli.Exitf(uzicli.ExitUsage,
 		"%s: [tui] milestone_numbers=%s; accepted values are true or false",
 		filepath.Join(store.Dir(), "config.toml"), value)
+}
+
+func tuiBlinkValueError(store *uzicli.Store, value string) error {
+	return uzicli.Exitf(uzicli.ExitUsage,
+		"%s: [tui] blink=%s; accepted values are true or false",
+		filepath.Join(store.Dir(), "config.toml"), value)
+}
+
+// tuiNoBlink is the reduced-motion opt-out: UZI_TUI_NO_BLINK=1 or [tui] blink = false. Either one
+// pins the static frame; neither can re-enable motion the other turned off.
+func tuiNoBlink(prefs tuiPrefs) bool {
+	return os.Getenv("UZI_TUI_NO_BLINK") == "1" || !prefs.blink
 }
 
 func tuiRailMinWidthValueError(store *uzicli.Store, value string) error {
@@ -1974,7 +1995,7 @@ func newTUICmd(env Env, gf *globalFlags) *cobra.Command {
 			m.skewCheck = enabled && uzicli.IsStampedVersion(version)
 			// The reduced-motion opt-out is read ONCE here, with the CLI's os.Getenv idiom
 			// (root.go), never per render (PRD #1064 D4).
-			m.noBlink = os.Getenv("UZI_TUI_NO_BLINK") == "1"
+			m.noBlink = tuiNoBlink(prefs)
 			// The startup update prompt's seams (PRD #1251 M1), assigned like showVersion above:
 			// the brew shell-out, the config store for the per-version dismissal, and the resolved
 			// server URL the dismissal is keyed under. resolveSettings already succeeded inside

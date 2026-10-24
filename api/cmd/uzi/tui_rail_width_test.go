@@ -275,7 +275,7 @@ func TestTUIConfigPrefsMilestoneNumbersAndRailMinWidth(t *testing.T) {
 }
 
 func TestTUIConfigPrefsSurviveContextAndLoginWrites(t *testing.T) {
-	cfg := &uzicli.Config{Contexts: map[string]uzicli.Context{}, TUI: uzicli.TUIConfig{MilestoneNumbers: true, RailMinWidth: ip32(36)}}
+	cfg := &uzicli.Config{Contexts: map[string]uzicli.Context{}, TUI: uzicli.TUIConfig{MilestoneNumbers: true, RailMinWidth: ip32(36), Blink: new(bool)}}
 	env := seedStore(t, cfg, &uzicli.Credentials{Contexts: map[string]uzicli.Credential{}})
 	if _, stderr, code := runCLI(t, env, "context", "set", "work", "--url", "https://work.example"); code != uzicli.ExitOK {
 		t.Fatalf("context set exit=%d stderr=%s", code, stderr)
@@ -284,7 +284,7 @@ func TestTUIConfigPrefsSurviveContextAndLoginWrites(t *testing.T) {
 		t.Fatalf("finishLogin: %v", err)
 	}
 	got, err := env.Store.LoadConfig()
-	if err != nil || !got.TUI.MilestoneNumbers || got.TUI.RailMinWidth == nil || *got.TUI.RailMinWidth != 36 {
+	if err != nil || !got.TUI.MilestoneNumbers || got.TUI.RailMinWidth == nil || *got.TUI.RailMinWidth != 36 || got.TUI.Blink == nil || *got.TUI.Blink {
 		t.Fatalf("config after writes=%+v err=%v", got, err)
 	}
 }
@@ -348,5 +348,48 @@ func TestTUILeadContextBarKeepsMinimumBudget(t *testing.T) {
 	narrow, wide := bar(100), bar(200)
 	if cells(narrow) == 0 || cells(wide) != cells(narrow) {
 		t.Fatalf("lead context bar must not grow with the rail: 100 cols %q (%d cells), 200 cols %q (%d cells)", narrow, cells(narrow), wide, cells(wide))
+	}
+}
+
+func TestTUIConfigPrefsBlink(t *testing.T) {
+	store := uzicli.NewStore(t.TempDir())
+	write := func(t *testing.T, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(store.Dir(), "config.toml"), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct {
+		name, body, env string
+		blink, noBlink  bool
+	}{
+		{"absent", "[tui]\n", "", true, false},
+		{"true", "[tui]\nblink = true\n", "", true, false},
+		{"false", "[tui]\nblink = false\n", "", false, true},
+		{"env wins over true", "[tui]\nblink = true\n", "1", true, true},
+		{"env alone", "[tui]\n", "1", true, true},
+		{"env other value", "[tui]\n", "0", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("UZI_TUI_NO_BLINK", tc.env)
+			write(t, tc.body)
+			prefs, err := tuiConfigPrefs(store)
+			if err != nil || prefs.blink != tc.blink {
+				t.Fatalf("prefs=%+v err=%v, want blink=%v", prefs, err, tc.blink)
+			}
+			if got := tuiNoBlink(prefs); got != tc.noBlink {
+				t.Fatalf("tuiNoBlink = %v, want %v", got, tc.noBlink)
+			}
+		})
+	}
+	for _, body := range []string{"[tui]\nblink = \"false\"\n", "[tui]\nblink = 0\n"} {
+		write(t, body)
+		_, err := tuiConfigPrefs(store)
+		if uzicli.ExitCodeFor(err) != uzicli.ExitUsage || !strings.Contains(err.Error(), "[tui] blink") || !strings.Contains(err.Error(), "config.toml") {
+			t.Fatalf("%q: want a usage error naming [tui] blink, got %v", body, err)
+		}
+	}
+	if prefs, err := tuiConfigPrefs(nil); err != nil || !prefs.blink {
+		t.Fatalf("nil store must keep the blink on: prefs=%+v err=%v", prefs, err)
 	}
 }
