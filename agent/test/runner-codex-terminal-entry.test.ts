@@ -115,6 +115,16 @@ for (const state of ["open", "closing"] as const) {
     let closing: Promise<unknown> | undefined;
     const admission = rig.registry.reserveLaunch("provider");
     assert.equal(admission.kind, "reserved");
+    const cleanup = rig.registry.reserveLaunch("provider");
+    assert.equal(cleanup.kind, "reserved");
+    if (cleanup.kind === "reserved") rig.registry.registerRoot(cleanup.reservation, {
+      kind: "provider", reap: async () => ({ ok: true }),
+      dispose: async () => {
+        // Settle the actual waiter through its admission event, including on the
+        // unfixed base where disposal itself does not poison/signal closing.
+        if (admission.kind === "reserved") rig.registry.cancelReservation(admission.reservation);
+      },
+    });
     // Throw immediately after clone creation, before the normal successful boundary.
     // Suppress failure reporting at its existing seam so it cannot reap this epoch.
     t.mock.method(seam, "reportGenericFailure", async () => { failures++; });
