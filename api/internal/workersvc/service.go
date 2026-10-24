@@ -2896,6 +2896,9 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 			return store.Worker{}, err
 		}
 		maxRequeues := int32(s.p.RunMaxRequeues) //nolint:gosec // G115: RunMaxRequeues is a small bounded config int (env RUN_MAX_REQUEUES), never near int32 range
+		if err := qtx.OptInCheckpointCoordinates(ctx); err != nil {
+			return store.Worker{}, err
+		}
 		readopted, err = qtx.FrozenReadoptRunsFromSnapshot(ctx, store.FrozenReadoptRunsFromSnapshotParams{WorkerID: updated.ID, FrozenTargets: frozen, LockedParentIds: parents})
 		if err != nil {
 			return store.Worker{}, err
@@ -3444,7 +3447,7 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 	// Snapshot carried + tx beginner: ONE transaction in the canonical lock order (D8), so a
 	// sibling's concurrent FOR UPDATE SKIP LOCKED claim cannot see this claimant's pre-locked runs
 	// or replaced snapshot until it commits.
-	tx, err := s.txBeginner.Begin(ctx)
+	tx, err := s.beginReadCommitted(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -3517,7 +3520,7 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		return nil, err
 	}
 	committed = true
-	return s.assembleAndFinishRunClaim(ctx, wkr, run, params.RecoveryCapable)
+	return s.assembleAndFinishRunClaim(ctx, reread, run, params.RecoveryCapable)
 }
 
 // requestActivePairs extracts the index-aligned (run_id, claim_generation) pairs a claim's request
@@ -4596,12 +4599,17 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		// Completed publication and ephemeral leasing serialize on the worker before the run.
 		// Keep leasing conditional on an ephemeral terminal report with the lease enabled.
 		leaseFence = req.ClaimGeneration != nil && s.ephemeralLease > 0 && wkr.Ephemeral && (req.State == "completed" || req.State == "failed")
-		if leaseFence || completedPublicationCapable(wkr, req) || req.SourcePublication != nil {
+		if len(owned.CheckpointCoordinates) > 0 || leaseFence || completedPublicationCapable(wkr, req) || req.SourcePublication != nil {
 			if _, werr := qtx.GetWorkerForUpdate(ctx, wkr.ID); werr != nil {
 				if errors.Is(werr, pgx.ErrNoRows) {
 					return store.Run{}, false, ErrRunNotOwned // the worker row is gone: the run left it
 				}
 				return store.Run{}, false, werr
+			}
+		}
+		if len(owned.CheckpointCoordinates) > 0 {
+			if err := qtx.OptInCheckpointCoordinates(ctx); err != nil {
+				return store.Run{}, false, err
 			}
 		}
 		locked, lerr := qtx.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)})
@@ -4695,6 +4703,16 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		}
 		fenceTx = tx
 		qtx := store.New(tx)
+		if len(owned.CheckpointCoordinates) > 0 {
+			if _, err := qtx.GetWorkerForUpdate(ctx, wkr.ID); err != nil {
+				return store.Run{}, false, err
+			}
+		}
+		if len(owned.CheckpointCoordinates) > 0 {
+			if err := qtx.OptInCheckpointCoordinates(ctx); err != nil {
+				return store.Run{}, false, err
+			}
+		}
 		locked, lerr := qtx.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)})
 		if lerr != nil {
 			if errors.Is(lerr, pgx.ErrNoRows) {
@@ -6547,9 +6565,9 @@ type PublishResult struct {
 
 // Publish is the api side of the M8 brokered origin push: the worker ships a delta
 // PACK plus the tip OID it claims, and the api — the SOLE holder of forge secrets —
-// derives the repo, branch, and PAT ENTIRELY from the run row, fetches origin's
+// derives the repo, authorized coordinates, and PAT ENTIRELY server-side, fetches origin's
 // base objects, applies the pack, and pushes it NON-FORCED to
-// refs/uzi-checkpoints/<branch>. A worker can never name the repo/ref/credential:
+// refs/uzi-checkpoints/<checkpoint-key>. A worker can never name the repo/ref/credential:
 // authorization is server-derived.
 //
 // It returns a benign PublishResult skip (nil error) for the outcomes the worker
@@ -6601,6 +6619,24 @@ func (s *Service) PublishAttested(ctx context.Context, wkr store.Worker, runID u
 			return PublishResult{}, ErrStaleClaim
 		}
 	}
+	// Task destinations require the currently registered consumer, not just a
+	// descriptor left by an earlier compatible generation. Re-read under the
+	// worker lock already held by beginClaimMutation before admitting any write.
+	if owned.Kind == runkind.Task && len(owned.CheckpointCoordinates) != 0 {
+		registered := wkr
+		if tx != nil {
+			registered, err = store.New(tx).GetWorkerForUpdate(ctx, wkr.ID)
+			if err != nil {
+				return PublishResult{}, err
+			}
+		}
+		if registered.UserID != owned.UserID || !slices.Contains(registered.ProtocolCapabilities, capability.TaskCheckpointCoordinatesV1) {
+			return PublishResult{Skipped: "unsupported"}, nil
+		}
+		if generation == nil {
+			return PublishResult{}, ErrMissingClaimGeneration
+		}
+	}
 	// Release admission locks before retention locking or forge I/O. Publish needs
 	// the full service dependencies, rather than the claim-control facade.
 	if tx != nil {
@@ -6609,21 +6645,16 @@ func (s *Service) PublishAttested(ctx context.Context, wkr store.Worker, runID u
 		}
 	}
 
-	// 2. Branch is derived SERVER-SIDE from validated run-row fields (kind, the run's
-	// uuid, the issue iid) — never from the worker, and never from owned.Branch.
-	// runs.branch is written ONLY at completion (SetRunCompleted), so it is NULL/empty
-	// for a `running` run; a checkpoint publish fires MID-RUN, so reading it would make
-	// the whole feature inert. Checkpoints fire for the checkpoint-eligible set — an
-	// issue run (agent/issue-<iid>) and a self_improve run (uzi/self-improve/<runID>,
-	// PRD #1062 M3) — so any other kind, or an issue run missing its iid, is an
-	// unsupported publish we skip (best-effort) rather than fault. checkpointBranch
-	// dispatches on kind FIRST (a self_improve run also carries a valid issue_iid, its
-	// stable tracking issue), and derives the branch only from run-row fields, so no
-	// worker-controlled string ever flows into the refspec.
-	branch, ok := checkpointBranch(owned.Kind, runID, owned.IssueIid)
-	if !ok {
+	// 2. Use server-authorized coordinates; tasks require frozen enrollment.
+	coordinates, err := publicationCoordinates(owned)
+	if err != nil {
+		return PublishResult{}, err
+	}
+	if coordinates == nil {
 		return PublishResult{Published: false, Ref: "", Skipped: "unsupported"}, nil
 	}
+	// Retention and slot ownership use the checkpoint key, not the work head.
+	branch := coordinates.CheckpointKey
 	ref := checkpointRefPrefix + branch
 
 	// 3. Repo + connection facts (clone URL, base URL, default branch, bot username,
@@ -6676,7 +6707,8 @@ func (s *Service) PublishAttested(ctx context.Context, wkr store.Worker, runID u
 	opts := pushbroker.Options{
 		CloneURL:      cloneURL,
 		BaseURL:       rc.BaseUrl,
-		Branch:        branch,
+		WorkBranch:    coordinates.WorkBranch,
+		CheckpointKey: coordinates.CheckpointKey,
 		DefaultBranch: rc.DefaultBranch.String,
 		Username:      rc.BotUsername,
 		PAT:           string(botPAT),
@@ -6698,7 +6730,7 @@ func (s *Service) PublishAttested(ctx context.Context, wkr store.Worker, runID u
 	// waits out checkpointSupersessionCooling after its terminal commit, and each push is recorded
 	// durably before it is sent (checkpoint_publish_attempts), so one whose outcome is unknown and
 	// that lands late anyway is reconciled by the sweeper (reconcilePublishAttempts).
-	push := &checkpointPush{s: s, runID: runID, run: owned, branch: branch, ref: ref, opts: opts, routedAt: routedAt,
+	push := &checkpointPush{s: s, runID: runID, run: owned, checkpointKey: branch, ref: ref, opts: opts, routedAt: routedAt,
 		attestedSource: pgconv.TextPtr(attestedSource)}
 	if terminalStatuses[owned.Status] && s.retentionWired() {
 		return s.publishTerminalLocked(ctx, push, tipOid)
@@ -6745,7 +6777,7 @@ func (s *Service) PublishAttested(ctx context.Context, wkr store.Worker, runID u
 // one whose outcome is unknown and that the forge applies after the lock is released is reconciled
 // by the sweeper.
 func (s *Service) publishTerminalLocked(ctx context.Context, push *checkpointPush, tipOid string) (PublishResult, error) {
-	owned, branch, ref := push.run, push.branch, push.ref
+	owned, branch, ref := push.run, push.checkpointKey, push.ref
 	runID := owned.ID
 	var (
 		res    PublishResult
@@ -6820,7 +6852,7 @@ func (s *Service) pushCheckpoint(ctx context.Context, push *checkpointPush) erro
 		if admissionErr := push.prepareLiveAttempt(ctx); admissionErr != nil {
 			return admissionErr
 		}
-		if s.freeCheckpointSlot(ctx, push.run, push.branch) {
+		if s.freeCheckpointSlot(ctx, push.run, push.checkpointKey) {
 			err = push.pushOnce(ctx)
 		}
 	}

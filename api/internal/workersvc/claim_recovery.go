@@ -91,7 +91,7 @@ func (t pgxClaimFinishTx) Rollback(ctx context.Context) error { return t.tx.Roll
 // nor a transactional store there is no fenced writer, so it refuses rather than falling back.
 func (s *Service) beginClaimFinish(ctx context.Context) (claimFinishTx, error) {
 	if s.txBeginner != nil {
-		tx, err := s.txBeginner.Begin(ctx)
+		tx, err := s.beginReadCommitted(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -235,6 +235,18 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		return nil, "", err
 	}
 	defer func() { _ = q.Rollback(ctx) }()
+	if len(run.CheckpointCoordinates) > 0 {
+		live, ok := q.(pgxClaimFinishTx)
+		if !ok {
+			return nil, "", errClaimRecoveryNoTx
+		}
+		if _, err := live.GetWorkerForUpdate(ctx, identity.workerID); err != nil {
+			return nil, "", err
+		}
+		if err := live.OptInCheckpointCoordinates(ctx); err != nil {
+			return nil, "", err
+		}
+	}
 	// Intrinsic pin failures and every Claude checker claim enter lead-first: the
 	// locked credential re-check may decide the check. The persisted stage selects
 	// the verdict lock and settlement before the child row is locked.
@@ -380,6 +392,21 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		}
 	}
 	if decision == nil {
+		if locked.Kind == runkind.Task && len(locked.CheckpointCoordinates) > 0 && payload != nil {
+			live, ok := q.(pgxClaimFinishTx)
+			if !ok {
+				return nil, "", errClaimRecoveryNoTx
+			}
+			// A fresh READ COMMITTED statement after the run lock observes confirmation
+			// and attempt admission together. False is evidence only at this admission.
+			projection, err := live.GetClaimCheckpointRecovery(ctx, locked.ID)
+			if err != nil {
+				return nil, "", err
+			}
+			payload.CheckpointTip = textPtr(projection.CheckpointTip)
+			payload.CheckpointAttestedSource = textPtr(projection.CheckpointAttestedSource)
+			payload.CheckpointWriteUnresolved = &projection.CheckpointWriteUnresolved
+		}
 		if err := q.Commit(ctx); err != nil {
 			return nil, "", err
 		}

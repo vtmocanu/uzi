@@ -203,6 +203,10 @@ for (const seam of cases) {
 }
 
 it("3304 publishing diagnostics trace overlay, initial and retry snapshots, and owed reconciliation", async t => {
+  const runId = "33041100-0000-4000-8000-000000000001";
+  const repoId = "33041100-0000-4000-8000-000000000002";
+  const branch = `uzi/task/${runId}`;
+  const published = { published: true, ref: `refs/uzi-checkpoints/${branch}` };
   const clock = virtualBoundaryClock();
   const bare = git.barePathFor(fx.originPath);
   const acquired: BoundaryStep[] = [], transitions: BoundaryStep[] = [];
@@ -235,9 +239,9 @@ it("3304 publishing diagnostics trace overlay, initial and retry snapshots, and 
   };
   t.mock.method(client, "publishCheckpoint", async (_id: string, _tip: string, pack: Parameters<typeof client.publishCheckpoint>[2]) => {
     await drain(pack);
-    if (!tracing) return { ok: true, body: { published: true } };
+    if (!tracing) return { ok: true, body: published };
     publications++;
-    return publications === 1 ? { ok: false, httpStatus: 500 } : { ok: true, body: { published: true } };
+    return publications === 1 ? { ok: false, httpStatus: 500 } : { ok: true, body: published };
   });
   const subject = runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined, {
     github: fakeGitHub().github,
@@ -289,8 +293,12 @@ it("3304 publishing diagnostics trace overlay, initial and retry snapshots, and 
     return result;
   });
   client.protocolFeatures = ["run_checkpoint_durability"];
-  await subject.execute(gitlabClaim(330411, { kind: "task", branch: "feature/publishing-diagnostics", issue_iid: null, open_mr: false,
-    repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath,
+  await subject.execute(gitlabClaim(330411, { kind: "task", run_id: runId, branch, issue_iid: null, open_mr: false,
+    claim_generation: 1, checkpoint_write_unresolved: false,
+    checkpoint_coordinates: { version: 1, kind: "task", run_id: runId,
+      user_id: "33041100-0000-4000-8000-000000000003", repo_id: repoId, issue_iid: null,
+      work_branch: branch, checkpoint_key: branch, provenance: [runId] },
+    repo: { id: repoId, url: "https://github.com/org/repo", clone_url: fx.originPath,
       forge_type: "github", default_branch: "main" } }));
   assert.equal(completed, true, "runner must not swallow an executor assertion: " + JSON.stringify({ publications, acquired, transitions, states: api.states }));
 });

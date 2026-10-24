@@ -1092,29 +1092,64 @@ omit them. See [ADR-1296](../adr/1296-durable-run-recovery.md) and
 [ADR-2417](../adr/2417-guarded-local-retention.md) for the identity and cleanup
 boundaries.
 
+### Task checkpoint recovery
+
+Checkpoint keys identify the broker's recovery ref separately from the work
+branch. The existing keys stay exactly `agent/issue-<iid>` for issue runs and
+`uzi/self-improve/<run-id>` for self-improvement runs. An enrolled task uses
+`uzi/task/<its-own-run-id>` as its key. A root task works on that same-named
+branch; a review or then-fix descendant inherits the validated root's
+`uzi/task/<root-run-id>` work branch while keeping its own checkpoint key.
+Distinct descendants therefore do not share checkpoint refs.
+
+Enrollment happens on a fresh claim by a compatible API and a worker advertising
+`task_checkpoint_coordinates_v1`. The server freezes an immutable
+`checkpoint_coordinates` snapshot of the authorized work branch, checkpoint
+key and validated lineage. Legacy active tasks are not converted in place.
+Invalid lineage remains unsupported; an old worker receives no descriptor and
+cannot claim or readopt an enrolled task. A legacy, unenrolled task retains its
+existing branch-based execution without gaining task checkpoint publication.
+See [rollout and rollback](./configuration.md#task-checkpoint-rollout-and-rollback).
+
+**The descriptor is an authorization marker, not evidence that work was saved.**
+With verified no-write evidence, a task can continue from its inherited branch.
+A confirmed checkpoint anchor that is unavailable or mismatched, or an unresolved
+write without independently verified recovery evidence, fails closed and retains
+custody. An owner stamp alone does not resolve an uncertain write.
+
+Ordinary checkpoints preserve committed work. Dirty tracked and untracked work
+requires the existing verified recovery-capture overlay path; task enrollment
+does not add dirty-tree bytes to ordinary checkpoint publishes. Existing source,
+generation, custody, retention and compare-and-swap checks remain in force.
+Review-only runs push nothing, and task branch/MR finalization is unchanged.
+
 ### Published checkpoint refs
 
+Here, `<checkpoint-key>` is the key described above, which may differ from the
+work branch. Descendant tasks use distinct keys, so sharing a work branch does
+not by itself require supersession.
+
 A finished run that already published a checkpoint to your forge keeps that
-ref, `refs/uzi-checkpoints/<branch>`, for as long as any of its custody
+ref, `refs/uzi-checkpoints/<checkpoint-key>`, for as long as any of its custody
 holds is still open — a failed or cancelled run, but also a completed run
 that still has an open hold from an older generation of the same run. It's
 not deleted the moment the run ends, so the published copy stays reachable
 even if the worker and its disk are gone. Once every hold on the run is
 released or discarded, uzi removes the ref.
 
-If you start a new run on the same branch while the old ref is still held,
+If you start a new run using the same checkpoint key while the old ref is still held,
 uzi normally moves the old tip out of the way rather than blocking your
 new run: it creates `refs/uzi-recovery/<run-id>` pointing at the old run's
-tip, frees `refs/uzi-checkpoints/<branch>` for the new run, and keeps the
+tip, frees `refs/uzi-checkpoints/<checkpoint-key>` for the new run, and keeps the
 old ref around under its own name until that run's holds are resolved. A
-stuck supersession — for example, the branch is not actually at the tip
+stuck supersession — for example, the checkpoint ref is not actually at the tip
 its record names — is the exception: it can refuse your new run's
 checkpoints until the old run's holds all release, rather than blocking
 just the one publish that hit it.
 
 `uzi run recovery <run-id>` shows which ref uzi's record names for a run's
 checkpoint, its tip commit, and its retention state — so you usually know
-whether to fetch the branch ref or the recovery ref. It can lag briefly
+whether to fetch the checkpoint ref or the recovery ref. It can lag briefly
 during an in-progress supersession, or leave a stray ref untracked in a
 narrow window described in
 [ADR-1810](../adr/1810-checkpoint-retention-follows-custody.md#consequences);
@@ -1124,7 +1159,7 @@ the next fetch overwrites, so the commit could become unreachable once uzi
 deletes the ref:
 
 ```sh
-git fetch origin refs/uzi-checkpoints/<branch>:refs/heads/recovered/<run-id>
+git fetch origin refs/uzi-checkpoints/<checkpoint-key>:refs/heads/recovered/<run-id>
 git fetch origin refs/uzi-recovery/<run-id>:refs/heads/recovered/<run-id>
 ```
 
@@ -1951,7 +1986,7 @@ has passed. With the setting empty, or for an unlisted forge, nothing about
 a failed run's checkpoint changes.
 
 On an enabled forge, a periodic sweep verifies the tip is still current —
-still at the branch's own checkpoint ref, `refs/uzi-checkpoints/<branch>`,
+still at the run's checkpoint ref, `refs/uzi-checkpoints/<checkpoint-key>`,
 or at its recovery ref, `refs/uzi-recovery/<run-id>` (see
 [Where the work is kept](#where-the-work-is-kept)) — and, only then, copies
 it into a run-scoped `refs/uzi-salvage/<run-id>`. A promoted copy expires
@@ -1959,7 +1994,7 @@ after `UZI_RECOVERY_READY_RETENTION` (the same window as the archive
 retention above), by CAS-deleting the salvage ref; if that delete keeps failing, uzi
 gives up after a bounded number of attempts and the last error names the ref that may
 remain. Salvage never deletes or
-moves any other ref: the branch checkpoint ref and any recovery ref stay
+moves any other ref: the checkpoint ref and any recovery ref stay
 [custody retention](#where-the-work-is-kept)'s, never salvage's, to manage
 — salvage only ever reads them as a source, and only ever creates or deletes
 its own ref.

@@ -1,3 +1,4 @@
+import { TASK_CHECKPOINT_COORDINATES_CAPABILITY } from "./checkpoint-coordinates.js";
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
 import { TerminalRejectionCoordinator } from "./terminal-rejections.js";
@@ -884,6 +885,7 @@ export class Worker {
         // OUTSIDE required_capabilities and the capability_aware kill-switch, so an old
         // image that omits it can never claim an interlocked run or open a custody hold.
         const protocolCapabilities = [
+          TASK_CHECKPOINT_COORDINATES_CAPABILITY,
           "completion_interlock_v1",
           "recovery_archive_v1",
           "recovery_archive_v2",

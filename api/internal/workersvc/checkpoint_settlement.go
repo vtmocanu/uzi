@@ -626,7 +626,7 @@ func (s *Service) exitStuckSupersessionLocked(ctx context.Context, row store.Che
 			return false, err
 		}
 		if derr := s.deleteCheckpointFn(ctx, pushbroker.DeleteOptions{
-			CloneURL: f.cloneURL, Branch: row.Branch, Ref: step.ref, Username: f.username, PAT: f.pat, ExpectedOldTip: tip,
+			CloneURL: f.cloneURL, CheckpointKey: row.Branch, Ref: step.ref, Username: f.username, PAT: f.pat, ExpectedOldTip: tip,
 		}); derr != nil {
 			return false, s.recordRetentionFailure(ctx, row, retentionSuperseding,
 				"delete "+step.ref+": "+scrubForgeError(derr.Error(), f.pat))
@@ -708,7 +708,7 @@ func (s *Service) auditRecoveryRefLocked(ctx context.Context, runID uuid.UUID, f
 		return false, err
 	}
 	if derr := s.deleteCheckpointFn(ctx, pushbroker.DeleteOptions{
-		CloneURL: f.cloneURL, Branch: row.Branch, Ref: recoveryRef, Username: f.username, PAT: f.pat, ExpectedOldTip: row.Tip,
+		CloneURL: f.cloneURL, CheckpointKey: row.Branch, Ref: recoveryRef, Username: f.username, PAT: f.pat, ExpectedOldTip: row.Tip,
 	}); derr != nil {
 		return false, s.deferRetentionVerify(ctx, row, "delete stray recovery ref: "+scrubForgeError(derr.Error(), f.pat))
 	}

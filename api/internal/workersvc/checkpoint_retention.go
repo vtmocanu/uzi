@@ -235,7 +235,7 @@ func destroyRetentionConn(conn *pgxpool.Conn) {
 // the rest of that family: a terminal run's late first publish whose TrackTerminalCheckpointPublish
 // insert failed, or that landed while retention was unwired in this api. The cases:
 //
-//   - an ineligible kind (checkpointBranch), or any missing retention seam: no forge call (RETAIN);
+//   - an ineligible or unenrolled run, or any missing retention seam: no forge call (RETAIN);
 //   - a run that published a checkpoint and has an OPEN custody hold (any generation): a
 //     `retained` record, and no forge call. The ref stays on origin for recovery;
 //   - a run that published a checkpoint and has NO open hold (a completed run whose hold was
@@ -268,12 +268,13 @@ func (s *Service) retainOrDeleteCheckpoint(ctx context.Context, runID uuid.UUID,
 // recorded: one whose checkpoint tip was persisted only after its terminal transition (a late first
 // publish whose own track insert failed, or ran while retention was unwired).
 func (s *Service) recordCheckpointRetention(ctx context.Context, runID uuid.UUID, kind string, issueIid pgtype.Int8) (inserted, settle bool) {
-	branch, ok := checkpointBranch(kind, runID, issueIid)
-	if !ok {
-		return false, false
-	}
 	ctx, cancel := retentionBookkeepingCtx(ctx)
 	defer cancel()
+	coordinates, err := s.retentionCoordinates(ctx, runID, kind, issueIid)
+	if err != nil || coordinates == nil {
+		return false, false
+	}
+	branch := coordinates.CheckpointKey // checkpoint_retentions.branch stores the destination key.
 	ref := checkpointRefPrefix + branch
 
 	held, err := s.q.InsertCheckpointRetentionIfHeld(ctx, store.InsertCheckpointRetentionIfHeldParams{RunID: runID, Branch: branch, Ref: ref})
@@ -534,7 +535,7 @@ func (s *Service) deleteRetainedRef(ctx context.Context, f retentionForge, row s
 	}
 	return s.deleteCheckpointFn(ctx, pushbroker.DeleteOptions{
 		CloneURL:       f.cloneURL,
-		Branch:         row.Branch,
+		CheckpointKey:  row.Branch,
 		Ref:            row.Ref,
 		Username:       f.username,
 		PAT:            f.pat,
@@ -648,7 +649,7 @@ func (s *Service) trackPublishedCheckpoint(ctx context.Context, push *checkpoint
 	if !s.retentionWired() {
 		return false, true
 	}
-	runID, branch, ref := push.runID, push.branch, push.ref
+	runID, branch, ref := push.runID, push.checkpointKey, push.ref
 	state, err := s.q.TrackTerminalCheckpointPublish(ctx, store.TrackTerminalCheckpointPublishParams{
 		RunID: runID, Branch: branch, Ref: ref, Tip: tip,
 		ExpectedTip: push.base.recordTip, ExpectedRunTip: push.base.runTip,

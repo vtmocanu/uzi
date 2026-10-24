@@ -18,6 +18,11 @@
 # Isolated: unique container + published loopback port, torn down on exit; never
 # touches the user's own stacks or DBs.
 #
+# M4 acceptance (lead-owned; run from repository root):
+# UZI_TASK_CHECKPOINT_RECOVERY_E2E=1 ./e2e/run-store-it.sh
+# ReviewRunner's existing review-runner.test.ts push/fetch-back counter regression
+# also covers the read-only review policy; the target field alone does not prove it.
+#
 # Run standalone, or alongside ./e2e/run-e2e.sh as the full store-SQL E2E gate.
 set -euo pipefail
 # The Go suites and agent fixtures below create host-side repos: they must not read
@@ -93,6 +98,8 @@ if ! docker exec "$NAME" pg_isready -h 127.0.0.1 -U uzi -d uzi >/dev/null 2>&1; 
   exit 1
 fi
 
+# The combined task proof uses the same isolated database, but stays outside the
+# normal LiveDB$ sweep and requires Node only when explicitly enabled.
 say "running the live-DB integration tests"
 cd "$ROOT/api"
 # -buildvcs=false: this linked worktree confuses go's VCS stamping (git run from
@@ -154,12 +161,13 @@ LOG="$(mktemp "${TMPDIR:-/tmp}/uzi-store-it-log.XXXXXX")" || {
 }
 # Keep local LiveDB deadlines bounded per package. The integrated #3120 sweep
 # exhausted workersvc's cumulative 30m budget before completion (the last test
-# passes in isolation); allow 45m for the complete inventory. Handler retains 20m.
-# Test selection, assertions, race/skip checks and package serialization stay the
-# same. This is not a speedup. Reset other packages to 10m each iteration.
+# passes in isolation); allow 45m for the complete inventory. The #3343 baseline
+# also exhausted store's 10m budget after 525 passing cases; its then-running test
+# passes in isolation. Store and handler get 20m. Selection, assertions, race/skip
+# checks and serialization stay the same. Other packages reset to 10m each iteration.
 for p in "${PKGS[@]}"; do
   timeout=10m
-  if [ "$p" = "./internal/handler/..." ]; then
+  if [ "$p" = "./internal/store/..." ] || [ "$p" = "./internal/handler/..." ]; then
     timeout=20m
   elif [ "$p" = "./internal/workersvc/..." ]; then
     timeout=45m
@@ -187,6 +195,47 @@ for p in "${PKGS[@]}"; do
   fi
 done
 rm -f "$LOG"
+
+if [ "${UZI_TASK_CHECKPOINT_RECOVERY_E2E:-}" = "1" ]; then
+  mkdir -p "$ROOT/.uzi/scratch"
+  TASK_CHECKPOINT_LOG="$(mktemp "$ROOT/.uzi/scratch/gate-log.XXXXXX")"
+  printf 'Task checkpoint recovery proof log: %s\n' "$TASK_CHECKPOINT_LOG"
+  task_checkpoint_rc=0
+  UZI_TEST_DATABASE_URL="$DSN" go test -buildvcs=false -count=1 -v -race -p 1 \
+    -timeout 15m -run '^TestTaskCheckpointCrossWorkerRecoveryE2E$' ./internal/workersvc/... \
+    > "$TASK_CHECKPOINT_LOG" 2>&1 || task_checkpoint_rc=$?
+  printf 'EXIT=%s\n' "$task_checkpoint_rc" >> "$TASK_CHECKPOINT_LOG"
+  cat "$TASK_CHECKPOINT_LOG"
+  if [ "$task_checkpoint_rc" -ne 0 ] ||
+    grep -q -- '--- SKIP:' "$TASK_CHECKPOINT_LOG"; then
+    echo "task checkpoint combined proof failed or skipped: $TASK_CHECKPOINT_LOG" >&2
+    exit 1
+  fi
+  task_checkpoint_name=TestTaskCheckpointCrossWorkerRecoveryE2E
+  task_checkpoint_cases=(
+    "$task_checkpoint_name"
+    "$task_checkpoint_name/creation-hooks"
+    "$task_checkpoint_name/successful-write"
+    "$task_checkpoint_name/successful-write/absent-exact-ref"
+    "$task_checkpoint_name/successful-write/mismatched-exact-ref"
+    "$task_checkpoint_name/successful-write/unrelated-workbranch"
+    "$task_checkpoint_name/successful-write/runner-feed"
+    "$task_checkpoint_name/first-write-refused"
+    "$task_checkpoint_name/lost-ack-after-requeue"
+  )
+  for task_checkpoint_mode in successful-write first-write-refused lost-ack-after-requeue; do
+    for task_checkpoint_old in ClaimRun ReadoptRunsFromSnapshot FrozenReadoptRunsFromSnapshot; do
+      task_checkpoint_cases+=("$task_checkpoint_name/$task_checkpoint_mode/historical-$task_checkpoint_old")
+    done
+  done
+  for task_checkpoint_case in "${task_checkpoint_cases[@]}"; do
+    if ! grep -Fxq "=== RUN   $task_checkpoint_case" "$TASK_CHECKPOINT_LOG" ||
+      ! grep -Eq "^[[:space:]]*--- PASS: $task_checkpoint_case \\(" "$TASK_CHECKPOINT_LOG"; then
+      echo "task checkpoint combined proof missing RUN/PASS: $task_checkpoint_case ($TASK_CHECKPOINT_LOG)" >&2
+      exit 1
+    fi
+  done
+fi
 
 # This opt-in leg shares the live throwaway DSN but is outside the LiveDB name
 # filter. Existing Go-only CI lanes neither require Node nor prove this composition.

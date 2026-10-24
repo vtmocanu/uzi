@@ -1890,7 +1890,7 @@ export interface CheckpointOverlayContext {
   cloneUrl?: string;
   /** The forge bot username for HTTP Basic auth. */
   username?: string;
-  /** The current tip of `refs/uzi-checkpoints/<branch>` as the run last knows it. When a
+  /** The current tip of `refs/uzi-checkpoints/<checkpoint-key>` as the run last knows it. When a
    *  40-hex value, it becomes the overlay's FIRST parent (base-first) so a second sequential
    *  overlay strictly descends the prior one and the broker accepts it as a fast-forward. */
   prevCheckpointTip?: string;
@@ -1984,7 +1984,7 @@ export interface RunnerClone {
    *  the recovered commit count, `"default"` on a RESUME admits the tree was lost.
    *
    *  PRD #122 M8 adds `"checkpoint"`: on a NOT-ownedHere leg (cross-worker / fresh)
-   *  the base came from origin's mirrored `refs/uzi-checkpoints/<branch>` — a DIFFERENT
+   *  the base came from origin's mirrored `refs/uzi-checkpoints/<checkpoint-key>` — a DIFFERENT
    *  worker's brokered checkpoint that strictly descends the floor (origin branch, else
    *  default). It is a resume leg like `"tracking"`, so priorCommits counts the recovered
    *  commits. */
@@ -2208,6 +2208,8 @@ interface GatheredBare {
 }
 
 export class GitCache {
+  // Credentialed preparation proof, scoped to an exact authorized task destination.
+  private readonly taskCheckpointFreshness = new Map<string, string | null>();
   private readonly reposRoot: string;
   /** Runner-owned clone store (the working trees). A distinct /data subtree from the
    *  worker-only `repos/` bare cache, so the M3 ownership carve-out is a clean
@@ -2715,7 +2717,7 @@ export class GitCache {
   }
 
   /** Clone the repo bare if absent, else fetch to refresh. Returns the bare path. */
-  async ensureClone(repoUrl: string, pat?: string, username?: string): Promise<string> {
+  async ensureClone(repoUrl: string, pat?: string, username?: string, checkpointKey?: string): Promise<string> {
     const barePath = this.barePathFor(repoUrl);
     const scope = httpScopeForUrl(repoUrl);
     return this.withLock(barePath, async () => {
@@ -2748,6 +2750,37 @@ export class GitCache {
           log: this.log,
           label: "clone/fetch",
         });
+      }
+      if (checkpointKey !== undefined) {
+        if (!/^uzi\/task\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(checkpointKey)) throw new Error("invalid task checkpoint key");
+        const proofKey = barePath + "\n" + checkpointKey;
+        this.taskCheckpointFreshness.delete(proofKey);
+        const ref = `refs/uzi-checkpoints/${checkpointKey}`;
+        // Exact ls-remote proves absence; fetch plus equality proves freshness. Failure
+        // leaves no proof. Recovery sinks do no network work and cannot trust the mirror.
+        try {
+          const advertised = (await this.runGit(barePath, ["ls-remote", "--refs", "origin", ref], pat, scope, username)).trim();
+          if (advertised === "") {
+            await this.runGit(barePath, ["update-ref", "-d", ref]);
+            this.taskCheckpointFreshness.set(proofKey, null);
+          } else {
+            const fields = advertised.split(/\s+/);
+            if (fields.length !== 2 || !SHA40_RE.test(fields[0]!) || fields[1] !== ref)
+              throw new Error("unverifiable task checkpoint advertisement");
+            await this.runGit(barePath, ["fetch", "origin", `+${ref}:${ref}`], pat, scope, username);
+            const tip = (await this.runGit(barePath, ["rev-parse", "--verify", `${ref}^{commit}`])).trim();
+            if (tip !== fields[0]) throw new Error("task checkpoint moved during preparation");
+            this.taskCheckpointFreshness.set(proofKey, tip);
+          }
+        } catch (err) {
+          if (isCheckpointBoundaryFailure(err)) throw err;
+          this.log.warn("task checkpoint freshness unavailable", { checkpointKey });
+        }
+        // Keep at most 256 preparations, oldest first. An evicted proof reads as
+        // unavailable in runnerCloneForBranch, so cold recovery fails closed.
+        if (this.taskCheckpointFreshness.size > 256) {
+          this.taskCheckpointFreshness.delete(this.taskCheckpointFreshness.keys().next().value!);
+        }
       }
       return barePath;
     });
@@ -3023,7 +3056,7 @@ export class GitCache {
     resume = false,
     expectedCheckpointTip?: string,
     attempt?: AttemptSeedOptions,
-    opts?: { selfContained?: boolean },
+    opts?: { selfContained?: boolean; checkpointKey?: string | null; checkpointWriteUnresolved?: boolean },
   ): Promise<RunnerClone> {
     return this.runnerCloneForBranch(barePath, `agent/issue-${issueIid}`, `issue-${issueIid}`, reseed, runId, resume, expectedCheckpointTip, attempt, opts);
   }
@@ -3114,7 +3147,7 @@ export class GitCache {
    *     moved far past the fork point, which is exactly the case a uniform ancestor
    *     test discards the recovered work on).
    *
-   * PRD #122 M8 adds a FOURTH candidate, `refs/uzi-checkpoints/<branch>`, the CROSS-WORKER
+   * PRD #122 M8 adds a FOURTH candidate, `refs/uzi-checkpoints/<checkpoint-key>`, the CROSS-WORKER
    * signal path: a DIFFERENT worker brokered its checkpoint to origin (M8 publish), and
    * `fetch()` mirrored origin's checkpoint refs into this bare. It matters ONLY on the
    * NOT-ownedHere legs — when THIS run owns the local tracking ref, that ref is
@@ -3190,7 +3223,7 @@ export class GitCache {
     resume = false,
     expectedCheckpointTip?: string,
     attempt?: AttemptSeedOptions,
-    opts?: { selfContained?: boolean },
+    opts?: { selfContained?: boolean; checkpointKey?: string | null; checkpointWriteUnresolved?: boolean },
   ): Promise<RunnerClone> {
     if (attempt) return this.attemptCloneForBranch(barePath, branch, key, runId, resume, expectedCheckpointTip, attempt, opts);
     return this.withLock(barePath, async () => {
@@ -3420,7 +3453,7 @@ export class GitCache {
     resume: boolean,
     expectedCheckpointTip: string | undefined,
     attempt: AttemptSeedOptions,
-    opts?: { selfContained?: boolean },
+    opts?: { selfContained?: boolean; checkpointKey?: string | null; checkpointWriteUnresolved?: boolean },
   ): Promise<RunnerClone> {
     // A key must never be mistaken for a retained artifact (or be one): a git branch component
     // cannot start with `.`, so a key derived from a valid branch never does either.
@@ -3851,7 +3884,7 @@ export class GitCache {
     runId: string | undefined,
     resume: boolean,
     expectedCheckpointTip: string | undefined,
-    opts?: { selfContained?: boolean; recoveryTip?: string },
+    opts?: { selfContained?: boolean; recoveryTip?: string; checkpointKey?: string | null; checkpointWriteUnresolved?: boolean },
   ): Promise<RunnerClone> {
     // (A bare block: the body below kept its original indentation when issue #1783 M2 lifted it
     // out of runnerCloneForBranch's lock callback, so its diff stays reviewable.)
@@ -3918,8 +3951,26 @@ export class GitCache {
       // PRD #122 M8 cross-worker candidate: origin's checkpoint ref, mirrored into the bare
       // by fetch(). Consulted ONLY on the not-ownedHere legs (see the doc comment). A
       // disjoint checkpoint is treated as absent (so no checkpointSetAside is emitted for it).
-      const checkpointRef = `refs/uzi-checkpoints/${branch}`;
-      const checkpointExistsRaw = await this.refExists(barePath, checkpointRef);
+      const checkpointKey = opts?.checkpointKey === undefined ? branch : opts.checkpointKey;
+      const checkpointRef = `refs/uzi-checkpoints/${checkpointKey ?? branch}`;
+      const taskCheckpoint = checkpointKey?.startsWith("uzi/task/") === true;
+      if (taskCheckpoint && checkpointKey !== `uzi/task/${runId}`)
+        throw new Error("task checkpoint key does not match its run");
+      const freshness = this.taskCheckpointFreshness.get(barePath + "\n" + checkpointKey);
+      // Only prepareRecoverySuccessor supplies recoveryTip, after checking the exact
+      // source, pin and recovery clock. A tracking owner stamp proves identity, not
+      // completeness of a capture, and cannot discharge an outstanding write.
+      const verifiedCapture = !!opts?.recoveryTip;
+      if (taskCheckpoint && !verifiedCapture && opts?.checkpointWriteUnresolved !== false)
+        throw new Error("task checkpoint write unresolved or unknown; recovery retained");
+      if (taskCheckpoint && !verifiedCapture && !ownedHere) {
+        if (freshness === undefined) throw new Error("task checkpoint freshness unavailable; recovery retained");
+        if (expectedCheckpointTip ? freshness !== expectedCheckpointTip : freshness !== null)
+          throw new Error("task checkpoint owner anchor mismatch; recovery retained");
+      }
+      const checkpointExistsRaw = checkpointKey !== null &&
+        (!taskCheckpoint || (freshness !== undefined && freshness !== null)) &&
+        await this.refExists(barePath, checkpointRef);
       const checkpointDisjoint = checkpointExistsRaw && defaultRef !== undefined
         && !(await this.sharesHistory(barePath, checkpointRef, defaultRef));
       if (checkpointDisjoint) {
@@ -3974,8 +4025,8 @@ export class GitCache {
             expectedCheckpointTip !== "" &&
             expectedCheckpointTip === checkpointSha;
           if (ownerMatch) {
-            if (resume && !originExists) {
-              // PATH A — PRD #1030 M3 resume-adopt, unchanged. RESUME with an UNPUSHED branch:
+            if ((resume || taskCheckpoint) && !originExists) {
+              // PATH A — resume or descriptor-authorized task, with an UNPUSHED branch:
               // `main` advancing during a rate-limit park diverges an otherwise-valid mirrored
               // checkpoint from the moved default, and Path B's strict-descendant test would
               // wrongly set it aside and cold-start the run, losing the committed milestones
@@ -4032,6 +4083,21 @@ export class GitCache {
               },
             );
           }
+        }
+      }
+      if (taskCheckpoint && !verifiedCapture) {
+        if (!expectedCheckpointTip) {
+          if (freshness === undefined) throw new Error("task checkpoint freshness unavailable; recovery retained");
+          if (freshness !== null) throw new Error("task checkpoint owner anchor mismatch; recovery retained");
+        } else {
+          const selected = (await this.runGit(barePath, ["rev-parse", "--verify", `${baseRef}^{commit}`])).trim();
+          // The selected history must retain the anchor's real work. The bounded
+          // wrapper verifier permits only the existing workflow transport boundary;
+          // it cannot forgive a missing real commit or a divergent published branch.
+          if (!SHA40_RE.test(expectedCheckpointTip) ||
+              !(await this.isAncestor(barePath, expectedCheckpointTip, selected) ||
+                await this.verifyWrapperOnlyHistory(barePath, expectedCheckpointTip, selected)))
+            throw new Error("task checkpoint cannot be safely adopted; recovery retained");
         }
       }
       if (opts?.recoveryTip) {
@@ -7232,7 +7298,7 @@ export class GitCache {
    * This return value is usable only by the current caller, never by rediscovery after reclaim. */
   async prepareRecoverySuccessor(
     barePath: string, branch: string, key: string, expected: RecoverySource, iteration: number,
-    attemptId: string, opts?: { selfContained?: boolean },
+    attemptId: string, opts?: { selfContained?: boolean; checkpointKey?: string | null; checkpointWriteUnresolved?: boolean },
   ): Promise<RunnerClone> {
     if (!ATTEMPT_ID_RE.test(attemptId)) throw new Error("invalid successor attempt");
     return this.withLock(barePath, async () => {
@@ -9950,7 +10016,7 @@ export class GitCache {
    * GH013 backstop to fail open to).
    *
    * Park/shutdown/pause/capture publishes are NOT scanned by design: the api pushes them UNSCANNED
-   * to the forge's refs/uzi-checkpoints/<branch> (Service.Publish in
+   * to the forge's refs/uzi-checkpoints/<checkpoint-key> (Service.Publish in
    * api/internal/workersvc/service.go) — they are the run's last chance to be durable, and a blocked or slow scan
    * there would lose the work outright. This scan guards the frequent mid-run stream only, plus
    * the ONE scanned exception: an eligible terminal run's held publication (issues #2545/#3030), which uploads
@@ -15022,7 +15088,7 @@ try {
     await this.tryGit(barePath, ["remote", "set-head", "origin", "--auto"]);
     // PRD #122 M8 — mirror origin's brokered checkpoint refs into the bare, BEST-EFFORT.
     // This is the CROSS-WORKER signal path: a worker with no local refs/uzi-runner/<branch>
-    // can still pull ANOTHER worker's published refs/uzi-checkpoints/<branch> and seed off
+    // can still pull ANOTHER worker's published refs/uzi-checkpoints/<checkpoint-key> and seed off
     // it (runnerCloneForBranch's checkpoint candidate). Rides the authenticated fetch (the
     // PAT is available here). Tolerates absence — origin may carry no such refs (fetch
     // succeeds fetching nothing), and the `.catch` covers an older server or a permission
@@ -15071,10 +15137,12 @@ try {
     barePath: string,
     branch: string,
     confirmedPublication?: { tip: string | undefined },
+    checkpointKey: string | null = branch,
   ): Promise<boolean> {
     if (confirmedPublication && (!confirmedPublication.tip ||
         !(await this.checkpointHasOnlyBoundaryTrees(barePath, branch, confirmedPublication.tip)))) return true;
-    const ref = `refs/uzi-checkpoints/${branch}`;
+    if (checkpointKey === null) return false;
+    const ref = `refs/uzi-checkpoints/${checkpointKey}`;
     const refStatus = await this.tryGitExit(barePath, ["show-ref", "--verify", "--quiet", ref]);
     if (refStatus === 1) return false; // Proven absence, not an unreadable ref or failed command.
     if (refStatus !== 0) return true;
@@ -15335,7 +15403,7 @@ try {
       // equal trees do NOT imply equal histories, so a GENUINE divergent sibling C (e.g. a real
       // checkpoint commit that does NOT descend from H) whose tree coincidentally equals H's would be
       // dropped, and C's lineage would silently stop being an ancestor of B (degrading cross-worker
-      // `refs/uzi-checkpoints/<branch>` recovery).
+      // `refs/uzi-checkpoints/<checkpoint-key>` recovery).
       //
       // Detect TRUE idempotency instead: an additional floor f (index > 0) that is ALREADY a valid
       // bridge of H over every other floor needs no new commit. f qualifies iff ALL hold — H is an
@@ -19463,7 +19531,7 @@ export const WIP_PARK_COMMIT_PREFIX = "wip(park):" as const;
 
 /**
  * PRD #1062 M2 (#1036) — the commit-subject prefix that marks a `.github/workflows` overlay
- * transport wrapper on `refs/uzi-checkpoints/<branch>`. `checkpointPack` prefixes the synthetic
+ * transport wrapper on `refs/uzi-checkpoints/<checkpoint-key>`. `checkpointPack` prefixes the synthetic
  * wrapper's subject with it; adoption (`runnerCloneForBranch` via `isOverlayMarker`) recognises
  * it and peels the wrapper (discard its swapped `.github` tree, re-point to its last parent =
  * realTip) BEFORE the wip-park soft-reset. Exported so the agent Contract-B tests reference the
