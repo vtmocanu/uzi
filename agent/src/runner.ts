@@ -17528,8 +17528,9 @@ export class RunRunner {
     cause: RecoveryParkCause = { kind: "transient" },
     opts: { terminalDisk?: boolean; heldAuthenticated?: HeldAuthenticatedCapture; heldCapture?: HeldFreeCapture;
       episode?: CaptureEpisode; freeFallback?: boolean; dispositionOnly?: boolean; dispositionSignal?: AbortSignal;
-      credentialDeadlineAt?: number } = {},
+      credentialDeadlineAt?: number; diskCause?: Extract<RecoveryParkCause, { kind: "data_volume_full" }> } = {},
   ): Promise<boolean> {
+    const disk = cause.kind === "data_volume_full" ? cause : opts.diskCause;
     const episode = opts.episode;
     if (opts.dispositionOnly && episode) this.validateJoinedCapture(flight, episode);
     const progress = episode ? this.captureProgressFor(flight, episode) : undefined;
@@ -17552,7 +17553,7 @@ export class RunRunner {
           const deferral = codexDeferralOf(error);
           return this.handleRecoveryExhausted(err, claim, flight, executor, batcher, reportState, runLog,
             deferral ? { kind: deferral } : cause,
-            { ...opts, episode: captureEpisode, heldCapture: held, freeFallback: true });
+            { ...opts, diskCause: disk, episode: captureEpisode, heldCapture: held, freeFallback: true });
         }, async error => {
           this.validateJoinedCapture(flight, captureEpisode);
           const settled = this.captureProgressFor(flight, captureEpisode);
@@ -17579,11 +17580,15 @@ export class RunRunner {
           return this.withCaptureDisposition(flight, captureEpisode, signal =>
             this.handleRecoveryExhausted(err, claim, flight, executor, batcher, reportState, runLog,
               deferral ? { kind: deferral } : cause,
-              { ...opts, episode: captureEpisode, freeFallback: true, dispositionOnly: true, dispositionSignal: signal }));
-        }, false, error => this.git.withRecoveryOperation(this.shutdownSignal.signal, captureEpisode.deadlineAt, signal =>
-          this.handleRecoveryExhausted(err, claim, flight, executor, batcher, reportState, runLog,
-            { kind: codexDeferralOf(error)! },
-            { credentialDeadlineAt: captureEpisode.deadlineAt, dispositionSignal: signal })));
+              { ...opts, diskCause: disk, episode: captureEpisode, freeFallback: true, dispositionOnly: true, dispositionSignal: signal }));
+        }, false, error => this.git.withRecoveryOperation(
+          AbortSignal.any([flight.steering.terminalLifecycleSignal(), this.shutdownSignal.signal]),
+          captureEpisode.deadlineAt, signal =>
+            this.handleRecoveryExhausted(err, claim, flight, executor, batcher, reportState, runLog,
+              { kind: codexDeferralOf(error)! },
+              // Carry policy context, never the joined episode or expired held capabilities.
+              { terminalDisk: opts.terminalDisk, diskCause: disk,
+                credentialDeadlineAt: captureEpisode.deadlineAt, dispositionSignal: signal })));
     }
     const report = reportState;
     reportState = async (body, signal = captureSignal) => {
@@ -17602,7 +17607,6 @@ export class RunRunner {
     // stop's counted one). The transient park's steps, with the typed cause on the park report and
     // the custody hold KEPT (no post-park settle): a clone exists, and the api keeps custody for a
     // data_volume_full park.
-    const disk = cause.kind === "data_volume_full" ? cause : undefined;
     if (!credentialFree()) {
       await executor.closeAndSettlePlanSummary?.();
       await this.settleGuardedCommands(executor);
@@ -17686,7 +17690,7 @@ export class RunRunner {
         const result = opts.heldCapture
           ? { kind: "observed_empty" as const, value: await captureFree(opts.heldCapture) }
           : await this.runFreeCapture(claim, flight, opts.credentialDeadlineAt ?? episode?.deadlineAt ?? Date.now() + this.codexBoundaryDeadlineMs,
-            this.shutdownSignal.signal, captureFree, "capture", "strict");
+            captureSignal ?? this.shutdownSignal.signal, captureFree, "capture", "strict");
         if (result.kind !== "observed_empty") return false;
         const attempt = result.value;
         if (attempt.verified) {
@@ -17784,6 +17788,7 @@ export class RunRunner {
     let propagating = false;
     try {
       for (;;) {
+        if (opts.terminalDisk) this.terminalDiskInterruption(flight);
         if (opts.credentialDeadlineAt !== undefined &&
             (Date.now() >= opts.credentialDeadlineAt || captureSignal?.aborted)) return false;
         if (opts.heldAuthenticated || opts.heldCapture) {
@@ -18004,7 +18009,7 @@ export class RunRunner {
               const result = opts.heldCapture
                 ? { kind: "observed_empty" as const, value: await captureFree(opts.heldCapture) }
                 : await this.runFreeCapture(claim, flight, opts.credentialDeadlineAt ?? episode?.deadlineAt ?? Date.now() + this.codexBoundaryDeadlineMs,
-                  this.shutdownSignal.signal, captureFree, "capture", "strict");
+                  captureSignal ?? this.shutdownSignal.signal, captureFree, "capture", "strict");
               if (result.kind !== "observed_empty") {
                 await note(credentialDeferred ? feed.settleIncomplete : "Capture boundary unavailable. Keeping the original work and session on this worker.");
                 await retryWait();
@@ -19813,8 +19818,10 @@ export class RunRunner {
       try {
         const ownership = await this.getObservedRunOwnership(flight, options.signal);
         if (ownership.status === "cancelled") {
-          this.observeCancellation(flight);
-          if (!options.heldAuthenticated && !options.heldCapture) await this.finishWallCancellation(claim, flight);
+          if (this.isCodexCapture(claim, flight)) {
+            this.observeCancellation(flight);
+            if (!options.heldAuthenticated && !options.heldCapture) await this.finishWallCancellation(claim, flight);
+          }
           return "cancelled";
         }
         provedRunning = ownership.status === "running" && ownership.claim_generation === flight.claimGeneration;
