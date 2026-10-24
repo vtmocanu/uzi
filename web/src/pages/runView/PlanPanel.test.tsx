@@ -967,8 +967,17 @@ describe("PlanPanel — repo capability hint and Docker allowlist (#3391)", () =
     mockApi.setRepoRequiredCapabilities.mockRejectedValue(new Error("boom"));
     panel({ repo: repoFor() });
     fireEvent.click(screen.getByRole("button", { name: "Require on repo" }));
-    expect(await screen.findByText("Update failed")).toBeTruthy();
+    expect((await screen.findByRole("alert")).textContent).toBe("Update failed");
     expect(screen.getByRole("button", { name: "Require on repo" })).toBeTruthy();
+  });
+
+  it("names and sends only capabilities the repo hint can hold", async () => {
+    mockApi.setRepoRequiredCapabilities.mockResolvedValue({ repo: repoFor({ required_capabilities: ["docker"] }) });
+    panel({ repo: repoFor(), caps: ["docker", "gpu"] });
+    expect(screen.getByText(hintRe).textContent).not.toContain("gpu");
+    fireEvent.click(screen.getByRole("button", { name: "Require on repo" }));
+    await waitFor(() => expect(screen.queryByText(hintRe)).toBeNull());
+    expect(mockApi.setRepoRequiredCapabilities).toHaveBeenCalledWith("repo1", ["docker"]);
   });
 
   it("shows no hint when the repo already requires it", () => {

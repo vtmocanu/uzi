@@ -853,7 +853,7 @@ export function PlanPanel({
                   </div>
                 )}
                 {repo && requireError?.repoId === repo.id && (
-                  <p className="mt-1.5 text-xs text-danger">{requireError.message}</p>
+                  <p role="alert" className="mt-1.5 text-xs text-danger">{requireError.message}</p>
                 )}
                 {repo && requiredCaps.includes("docker") && repo.docker_allowlisted === false && (
                   <p className="mt-1.5 text-xs text-warn">{isAdmin ? DOCKER_ALLOWLIST_ADMIN : DOCKER_ALLOWLIST_MEMBER}</p>

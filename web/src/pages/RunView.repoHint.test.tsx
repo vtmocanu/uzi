@@ -76,11 +76,14 @@ it("never shows one run's repo lines on another run or on a repo-less run", asyn
   await act(async () => {});
   expect(screen.getByText(HINT)).toBeTruthy();
   expect(screen.getByText(ALLOWLIST)).toBeTruthy();
-  await go("B");
+  // Straight from X's run to the repo-less run, so a leftover X repo would show here.
+  await go("N");
   expect(screen.getByText(/Run requirements/)).toBeTruthy();
   expect(screen.queryByText(HINT)).toBeNull();
   expect(screen.queryByText(ALLOWLIST)).toBeNull();
-  await go("N");
+  await go("A");
+  expect(screen.getByText(ALLOWLIST)).toBeTruthy();
+  await go("B");
   expect(screen.getByText(/Run requirements/)).toBeTruthy();
   expect(screen.queryByText(HINT)).toBeNull();
   expect(screen.queryByText(ALLOWLIST)).toBeNull();
@@ -126,4 +129,17 @@ it("keeps the allowlist state when the save response omits the computed fields",
   expect(screen.queryByText(HINT)).toBeNull();
   expect(screen.queryByText(ALLOWLIST)).toBeNull();
   expect(api.setRepoRequiredCapabilities).toHaveBeenCalledWith("X", ["docker"]);
+});
+
+it("keeps a real allowlist gap when the save response omits the computed fields", async () => {
+  vi.mocked(api.listRepos).mockResolvedValue({ repos: [X_BAD()] });
+  vi.mocked(api.setRepoRequiredCapabilities).mockResolvedValue({
+    repo: { id: "X", required_capabilities: ["docker"] } as unknown as Repo,
+  });
+  mount();
+  await act(async () => {});
+  expect(screen.getByText(ALLOWLIST)).toBeTruthy();
+  await act(async () => { fireEvent.click(screen.getByRole("button", REQUIRE)); });
+  expect(screen.queryByText(HINT)).toBeNull();
+  expect(screen.getByText(ALLOWLIST)).toBeTruthy();
 });
