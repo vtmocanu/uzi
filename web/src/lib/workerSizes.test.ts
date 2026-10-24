@@ -137,6 +137,10 @@ describe("the picker's option text", () => {
     expect(sizeSummary("s")).toBe("up to 1 CPU / 4Gi RAM / 5Gi disk");
   });
 
+  it("labels the l-highmem preset with its own quantities", () => {
+    expect(sizeOptionLabel("l-highmem")).toBe("L-HIGHMEM — up to 4 CPU / 32Gi RAM / 50Gi disk");
+  });
+
   it("degrades to the bare label for an unknown size rather than throwing", () => {
     // Deployment skew is the only way here (a newer api shipping a size this bundle
     // predates); a settings page that crashes on it would be a worse outcome than one
