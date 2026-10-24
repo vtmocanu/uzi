@@ -25,6 +25,9 @@ const (
 	JVM = "jvm"
 )
 
+// TaskCheckpointCoordinatesV1 negotiates immutable server-authorized checkpoint coordinates.
+const TaskCheckpointCoordinatesV1 = "task_checkpoint_coordinates_v1"
+
 // CompletionInterlockV1 is the PROTOCOL capability a worker self-reports (PRD #1226
 // M1, D2) to declare it implements the structural completion protocol. It is
 // DELIBERATELY NOT a member of the scheduler `vocabulary` above: it lives in a
@@ -35,9 +38,6 @@ const (
 // workers.protocol_capabilities, OUTSIDE required_capabilities, ClearRunRequiredCapabilities
 // and the capability_aware kill-switch, so an incapable worker can never claim an
 // interlocked run through any of those bypass paths.
-// TaskCheckpointCoordinatesV1 negotiates immutable server-authorized checkpoint coordinates.
-const TaskCheckpointCoordinatesV1 = "task_checkpoint_coordinates_v1"
-
 const CompletionInterlockV1 = "completion_interlock_v1"
 
 // MilestoneReconciliationClaimV1 identifies workers that stamp the captured claim
