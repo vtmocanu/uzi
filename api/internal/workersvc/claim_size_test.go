@@ -35,14 +35,14 @@ func TestClaimSizeLimitMatchesSharedFixture(t *testing.T) {
 	}
 }
 
-const claimSizeTemplateSecret = "TEMPLATE-BODY-MARKER"
+const claimSizeTemplateMarker = "TEMPLATE-BODY-MARKER"
 
 // claimSizeStore is an issue-run fake store whose user templates encode at 6 bytes per '<'.
 func claimSizeStore(t *testing.T) *fakeStore {
 	t.Helper()
 	fs := scheduleModelStore(t, pgtype.Text{}, pgtype.Text{})
 	fs.templates = []store.AgentTemplate{
-		{Name: "big", Description: "d", PromptBody: claimSizeTemplateSecret + strings.Repeat("<", 4096)},
+		{Name: "big", Description: "d", PromptBody: claimSizeTemplateMarker + strings.Repeat("<", 4096)},
 	}
 	return fs
 }
@@ -65,7 +65,7 @@ func TestOversizeRunClaimFailsTerminallyClaimSize(t *testing.T) {
 	if !strings.HasPrefix(got.FailureReason.String, "claim too large:") {
 		t.Fatalf("FailureReason = %q", got.FailureReason.String)
 	}
-	if strings.Contains(got.FailureReason.String, claimSizeTemplateSecret) {
+	if strings.Contains(got.FailureReason.String, claimSizeTemplateMarker) {
 		t.Fatal("failure reason leaked template content")
 	}
 }
