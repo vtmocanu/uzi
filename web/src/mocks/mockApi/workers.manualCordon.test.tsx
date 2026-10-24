@@ -29,6 +29,22 @@ afterEach(() => vi.restoreAllMocks());
 describe("mock manual cordons", () => {
   // Expected snapshots recorded from store.ManualCordonText at c3dd0c3d with Go 1.27.3.
   it.each([
+    // Post-ST snapshots recorded from actual store.ManualCordonText at 48e42433, Go 1.27.3.
+    ["osc-execute-tail", "a\u001b]\u1700b", "a\ufffdb"],
+    ["dcs-execute-tail", "a\u001bPq\u1700b", "a\ufffdb"],
+    ["osc-title-execute-tail", "a\u001b]title\u2700\u001b\\b", "a\ufffdb"],
+    ["osc-a0-tail", "a\u001b]\u1720b", "ab"],
+    ["dcs-a0-tail", "a\u001bPq\u1720b", "ab"],
+    ["osc-two-execute-tails", "a\u001b]\u{1c000}b", "a\ufffd\ufffdb"],
+    ["dcs-two-execute-tails", "a\u001bPq\u{1c000}b", "a\ufffd\ufffdb"],
+    ["osc-repeated-st", "a\u001b]\u171cb", "a\ufffdb"],
+    ["osc-csi-tail", "a\u001b]\u171bb", "a"],
+    ["osc-dcs-tail", "a\u001b]\u1710b", "a"],
+    ["osc-osc-tail", "a\u001b]\u171db", "a"],
+    ["osc-sos-tail", "a\u001b]\u1718b", "a"],
+    ["osc-inside-unicode", "a\u001b]\u1600\u001b\\b", "ab"],
+    ["dcs-inside-unicode", "a\u001bPq\u1600\u001b\\b", "ab"],
+    ["osc-execute-then-a0", "a\u001b]\u{1c020}b", "a\ufffdb"],
     ["ordinary", " a\nb\tc ", "a b c"],
     ["lf-csi", "a\u001b[3\n1mb", "a b"],
     ["tab-csi", "a\u001b[3\t1mb", "a b"],
