@@ -63,10 +63,10 @@ func TestDeleteWorkerActiveRunsConflictNamesRuns(t *testing.T) {
 		t.Fatalf("active_runs = %+v, want 2 entries", body.ActiveRuns)
 	}
 	first, second := body.ActiveRuns[0], body.ActiveRuns[1]
-	if first.Kind != "issue" || first.Status != "queued" || first.Title != "Fix login" || first.IssueIID == nil || *first.IssueIID != 7 {
+	if first.ID != "11111111-1111-4111-8111-111111111111" || first.Kind != "issue" || first.Status != "queued" || first.Title != "Fix login" || first.IssueIID == nil || *first.IssueIID != 7 {
 		t.Errorf("first run = %+v, want issue/queued/Fix login/#7", first)
 	}
-	if second.Kind != "chat" || second.Status != "running" || second.Title != "chat about X" || second.IssueIID != nil {
+	if second.ID != "22222222-2222-4222-8222-222222222222" || second.Kind != "chat" || second.Status != "running" || second.Title != "chat about X" || second.IssueIID != nil {
 		t.Errorf("second run = %+v, want chat/running/chat about X/null iid", second)
 	}
 	if deleted() {

@@ -231,6 +231,10 @@ func TestHTTPClientDeleteWorkerCustodyConflict(t *testing.T) {
 		if errors.As(err, &custody) {
 			t.Fatalf("an active-runs 409 (no custody_holds) must NOT be the custody type: %v", err)
 		}
+		var active *WorkerActiveRunsConflictError
+		if errors.As(err, &active) {
+			t.Fatalf("a 409 without active_runs must stay a plain *ExitError, got %T: %v", err, err)
+		}
 		if ExitCodeFor(err) != ExitConflict {
 			t.Errorf("ExitCodeFor = %d, want %d", ExitCodeFor(err), ExitConflict)
 		}
