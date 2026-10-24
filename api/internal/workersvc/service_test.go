@@ -597,6 +597,7 @@ type fakeStore struct {
 	countActiveParams  *store.CountWorkerNonTerminalRunsParams
 	listActiveRows     []store.ListWorkerNonTerminalRunsRow
 	listActiveParams   *store.ListWorkerNonTerminalRunsParams
+	listActiveErr      error
 	deleteWorkerRows   int64
 	deleteWorkerParams *store.DeleteWorkerForUserParams
 	// PRD #529 M4 ephemeral teardown: delEphemeralRuns is the rows-affected the fake
@@ -1826,7 +1827,7 @@ func (f *fakeStore) CountWorkerNonTerminalRuns(_ context.Context, arg store.Coun
 }
 func (f *fakeStore) ListWorkerNonTerminalRuns(_ context.Context, arg store.ListWorkerNonTerminalRunsParams) ([]store.ListWorkerNonTerminalRunsRow, error) {
 	f.listActiveParams = &arg
-	return f.listActiveRows, nil
+	return f.listActiveRows, f.listActiveErr
 }
 func (f *fakeStore) DeleteWorkerForUser(_ context.Context, arg store.DeleteWorkerForUserParams) (int64, error) {
 	f.deleteWorkerParams = &arg
@@ -5197,6 +5198,24 @@ func TestDeleteWorkerActiveRunsEmptyListStillRefuses(t *testing.T) {
 	}
 	if fs.deleteWorkerParams != nil {
 		t.Fatal("no delete should be issued while the worker owns active runs")
+	}
+}
+
+func TestDeleteWorkerActiveRunsListErrorIsReturned(t *testing.T) {
+	// A failing listing must surface as-is (not be masked as a 409) and must not delete.
+	boom := errors.New("list runs failed")
+	fs := &fakeStore{countActiveRuns: 2, listActiveErr: boom, deleteWorkerRows: 1}
+	svc := New(fs, newBox(t), testParams())
+	err := svc.DeleteWorker(context.Background(), uuid.New(), uuid.New())
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want the injected list error", err)
+	}
+	var active *WorkerHasActiveRunsError
+	if errors.As(err, &active) {
+		t.Fatalf("err = %v, must not be a *WorkerHasActiveRunsError", err)
+	}
+	if fs.deleteWorkerParams != nil {
+		t.Fatal("no delete should be issued when the listing fails")
 	}
 }
 

@@ -217,12 +217,13 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 						})
 					} else {
 						w := cmd.ErrOrStderr()
+						_, _ = fmt.Fprintf(w, "worker has %d active run(s):\n", active.Total)
 						for _, r := range runs {
 							title := cellText(r.Title)
 							if title == "" {
-								title = shortID(r.ID)
+								title = cellText(shortID(r.ID))
 							}
-							_, _ = fmt.Fprintf(w, "%s  %s  %s  %s\n", shortID(r.ID), cellText(r.Kind), cellText(r.Status), title)
+							_, _ = fmt.Fprintf(w, "%s  %s  %s  %s\n", cellText(shortID(r.ID)), cellText(r.Kind), cellText(r.Status), title)
 						}
 						if more := active.Total - int64(len(runs)); more > 0 {
 							_, _ = fmt.Fprintf(w, "and %d more\n", more)

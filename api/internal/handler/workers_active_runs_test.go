@@ -74,6 +74,34 @@ func TestDeleteWorkerActiveRunsConflictNamesRuns(t *testing.T) {
 	}
 }
 
+// TestDeleteWorkerActiveRunsEmptyListEncodesEmptyArray pins the race where the count says
+// runs exist but the listing is empty: active_runs must be [] (not null) and the total
+// still comes from the count.
+func TestDeleteWorkerActiveRunsEmptyListEncodesEmptyArray(t *testing.T) {
+	st, deleted := activeRunsDeleteStore(t, nil, 2, 0)
+	h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
+
+	rec := httptest.NewRecorder()
+	h.DeleteWorker(rec, deleteWorkerReq(store.User{ID: uuid.New()}, uuid.New()))
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("DELETE = %d, want 409\nbody: %s", rec.Code, rec.Body.String())
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode body: %v (%s)", err, rec.Body.String())
+	}
+	if got := string(raw["active_runs"]); got != "[]" {
+		t.Errorf("active_runs = %s, want []", got)
+	}
+	if got := string(raw["active_runs_total"]); got != "2" {
+		t.Errorf("active_runs_total = %s, want 2", got)
+	}
+	if deleted() {
+		t.Error("a worker with active runs must not be deleted")
+	}
+}
+
 // TestDeleteWorkerCustodyConflictUnchangedWithoutActiveRuns is the control: a custody
 // refusal with no active runs keeps its own body and gains no active_runs key.
 func TestDeleteWorkerCustodyConflictUnchangedWithoutActiveRuns(t *testing.T) {

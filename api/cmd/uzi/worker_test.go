@@ -387,6 +387,7 @@ func TestWorkerRmActiveRunsConflict(t *testing.T) {
 		t.Fatalf("DeleteWorker calls=%d, want 1", fc.DeleteWorkerCalls)
 	}
 	for _, want := range []string{
+		"worker has 5 active run(s):",
 		"11111111  issue  queued  Fix login",
 		"22222222  chat  running  chat about X",
 		"and 3 more",
@@ -395,6 +396,21 @@ func TestWorkerRmActiveRunsConflict(t *testing.T) {
 	} {
 		if !strings.Contains(errb, want) {
 			t.Errorf("active-runs refusal missing %q; stderr=%q", want, errb)
+		}
+	}
+}
+
+// TestWorkerRmActiveRunsEmptyListStillExplains: when the runs finished between the count and
+// the listing, the refusal still says why and how many, and the guidance remains.
+func TestWorkerRmActiveRunsEmptyListStillExplains(t *testing.T) {
+	fc := &uzicli.FakeClient{Err: activeRunsErr(2)}
+	_, errb, code := runCLI(t, fakeEnv(fc), "worker", "rm", "w1")
+	if code != uzicli.ExitConflict {
+		t.Fatalf("exit = %d, want %d\nstderr: %s", code, uzicli.ExitConflict, errb)
+	}
+	for _, want := range []string{"worker has 2 active run(s):", "and 2 more", "uzi run cancel <run-id>"} {
+		if !strings.Contains(errb, want) {
+			t.Errorf("empty-list refusal missing %q; stderr=%q", want, errb)
 		}
 	}
 }

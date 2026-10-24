@@ -63,12 +63,14 @@ func TestListWorkerNonTerminalRunsLiveDB(t *testing.T) {
 	}
 
 	// Rows that must not appear: another worker of the same user, and a second user's run
-	// pointed at this worker (the cross-tenant case the user_id scope exists for).
-	insert(fx.userID, other, "issue", "running", nil, "other worker", 1)
+	// pointed at this worker (the cross-tenant case the user_id scope exists for). They are
+	// non-terminal and OLDER than every qualifying row, so a weakened predicate would pull
+	// them into the oldest-first first 10.
+	insert(fx.userID, other, "issue", "running", nil, "other worker", 300)
 	user2 := uuid.New()
 	mustExec(fx.ctx, t, fx.pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
 		user2, fmt.Sprintf("list-%s@e2e", user2))
-	insert(user2, w, "chat", "running", nil, "foreign user", 1)
+	insert(user2, w, "chat", "running", nil, "foreign user", 301)
 
 	rows, err := fx.q.ListWorkerNonTerminalRuns(fx.ctx, store.ListWorkerNonTerminalRunsParams{
 		WorkerID: pgtype.UUID{Bytes: w, Valid: true}, UserID: fx.userID,
