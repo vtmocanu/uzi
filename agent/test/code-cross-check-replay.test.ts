@@ -39,11 +39,18 @@ const waitForAbort: Fake = (_c, _d, _h, signal) => new Promise((_resolve, reject
   signal.addEventListener("abort", () => { reject(signal.reason); }, { once: true });
 });
 
+// Injected uid layouts: the helpers pin `single` so an ambient UZI_UID_SPLIT=1 cannot select split mode.
+// `split` uses a group this process belongs to (the real 10002 needs the image).
+const groups = process.getgroups?.() ?? [];
+const splitGid = groups.find((g) => g !== process.getgid?.()) ?? process.getgid!();
+const split = { split: true, gid: splitGid };
+const single = { split: false, gid: splitGid };
+
 async function replay(over: Partial<RunReplaysDeps> & { checkers?: RunReplaysDeps["checkers"] } = {}): Promise<ReplayRecord[]> {
   const out: ReplayRecord[] = [];
   const records = await runReplays({
     checkout: tc.checkout, corpus: { ...corpus, cases: [defect] }, families: ["claude"], model: "haiku", effort: "low",
-    repeats: 1, scratchDir: scratch, env, checkerVersion: { uzi_head: "a".repeat(40), agent_version: "0.0.0-test" },
+    layout: single, repeats: 1, scratchDir: scratch, env, checkerVersion: { uzi_head: "a".repeat(40), agent_version: "0.0.0-test" },
     writeRecord: async (r) => { out.push(r); }, ...over,
   });
   assert.deepEqual(out, records);
@@ -196,7 +203,7 @@ async function cli(args: string[], over: Partial<Parameters<typeof runReplayCli>
   const errLines: string[] = [];
   const code = await runReplayCli(args, {
     checkout: tc.checkout, env, write: (l) => { lines.push(l); }, writeErr: (l) => { errLines.push(l); },
-    signals: quietSignals, manifestSha256: tc.manifestSha256,
+    signals: quietSignals, manifestSha256: tc.manifestSha256, layout: single,
     uziHead: async () => "b".repeat(40), ...over,
   });
   return { code, lines, errLines };
@@ -404,7 +411,7 @@ const git = async (cwd: string, args: string[], env?: Record<string, string>): P
   (await replayGit(args, { cwd, env })).toString("utf8").trim();
 
 test("materialize exports the pre-fix tree as a single parentless commit and cleans up", async () => {
-  const m = await materializeCase(tc.checkout, defect, scratch);
+  const m = await materializeCase(tc.checkout, defect, scratch, undefined, single);
   try {
     const client = await fs.readFile(path.join(m.snapshot, "src/client.ts"), "utf8");
     assert.ok(client.includes("const limit = 10;"));
@@ -414,12 +421,12 @@ test("materialize exports the pre-fix tree as a single parentless commit and cle
     assert.equal(await git(m.snapshot, ["rev-parse", "--show-toplevel"]), await fs.realpath(m.snapshot));
   } finally { await m.cleanup(); }
   assert.deepEqual(await fs.readdir(scratch), []);
-  const control = await materializeCase(tc.checkout, corpus.cases.find((c) => c.id === tc.controlId)!, scratch);
+  const control = await materializeCase(tc.checkout, corpus.cases.find((c) => c.id === tc.controlId)!, scratch, undefined, single);
   try { assert.equal(await fs.readFile(path.join(control.snapshot, "src/other.ts"), "utf8"), "export const other = 2;\n"); } finally { await control.cleanup(); }
 });
 
 test("materialize writes exact blobs: tracked-but-ignored and export-subst files, tree equals prefix_tree", async () => {
-  const m = await materializeCase(tc.checkout, defect, scratch);
+  const m = await materializeCase(tc.checkout, defect, scratch, undefined, single);
   try {
     assert.equal(await fs.readFile(path.join(m.snapshot, "notes/ignored.log"), "utf8"), "tracked but ignored\n");
     assert.equal(await git(m.snapshot, ["ls-files", "notes/ignored.log"]), "notes/ignored.log");
@@ -473,27 +480,23 @@ test("materialize refuses a snapshot whose tree differs from prefix_tree (a gitl
   };
   // Every pin holds, so verification passes and only the snapshot tree check can refuse.
   await (await verifyCasePins(tc.checkout, gitlink, scratch)).cleanup();
-  await assert.rejects(materializeCase(tc.checkout, gitlink, scratch), { message: "corpus_integrity" });
+  await assert.rejects(materializeCase(tc.checkout, gitlink, scratch, undefined, single), { message: "corpus_integrity" });
   assert.deepEqual(await fs.readdir(scratch), []);
 });
 
 test("materialize reports a missing base object and an unpinned tree, leaving no scratch behind", async () => {
   const missing: ReplayCase = { ...defect, base_sha: "1".repeat(40) };
-  await assert.rejects(materializeCase(tc.checkout, missing, scratch), { message: "corpus_objects_missing" });
+  await assert.rejects(materializeCase(tc.checkout, missing, scratch, undefined, single), { message: "corpus_objects_missing" });
   const wrongTree: ReplayCase = { ...defect, prefix_tree: "2".repeat(40) };
-  await assert.rejects(materializeCase(tc.checkout, wrongTree, scratch), { message: "corpus_integrity" });
+  await assert.rejects(materializeCase(tc.checkout, wrongTree, scratch, undefined, single), { message: "corpus_integrity" });
   const wrongWitness: ReplayCase = { ...defect, witnesses: [{ ...defect.witnesses[0]!, blob_id: "3".repeat(40) }] };
-  await assert.rejects(materializeCase(tc.checkout, wrongWitness, scratch), { message: "corpus_integrity" });
+  await assert.rejects(materializeCase(tc.checkout, wrongWitness, scratch, undefined, single), { message: "corpus_integrity" });
   assert.deepEqual(await fs.readdir(scratch), []);
 });
 
 // ---------------------------------------------------------------------------------------------
 // uid-split sharing, injected with a group this process belongs to (the real 10002 needs the image)
 
-const groups = process.getgroups?.() ?? [];
-const splitGid = groups.find((g) => g !== process.getgid?.()) ?? process.getgid!();
-const split = { split: true, gid: splitGid };
-const single = { split: false, gid: splitGid };
 const modeOf = async (p: string): Promise<number> => (await fs.lstat(p)).mode & 0o7777;
 
 async function walkAll(dir: string): Promise<string[]> {
