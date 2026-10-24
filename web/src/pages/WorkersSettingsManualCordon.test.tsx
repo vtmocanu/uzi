@@ -272,7 +272,9 @@ describe("list success ordering and canonical fields", () => {
     await screen.findByRole("button", { name: "Uncordon target" });
     expect(mock.cordonWorker).toHaveBeenCalledWith("target", undefined);
   });
-  it("does not publish a pending mutation after unmount", async () => {
+  // React drops state updates after unmount; this is settlement smoke coverage,
+  // not evidence that the production mounted/alive guards prevented callbacks.
+  it("settles a pending mutation after unmount without remounting controls", async () => {
     const pending = deferred<{ worker: Worker }>();
     mock.cordonWorker.mockReturnValue(pending.promise);
     await ready(); cordon();
