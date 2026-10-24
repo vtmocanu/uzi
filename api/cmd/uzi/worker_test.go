@@ -362,6 +362,85 @@ func TestWorkerRmCustodyConflictJSON(t *testing.T) {
 	}
 }
 
+// activeRunsErr builds the typed active-runs refusal (#3390) the HTTP client returns.
+func activeRunsErr(total int64, runs ...uzicli.WorkerActiveRun) *uzicli.WorkerActiveRunsConflictError {
+	return &uzicli.WorkerActiveRunsConflictError{
+		Runs: runs, Total: total,
+		Err: uzicli.Exitf(uzicli.ExitConflict, "worker has active runs; cancel them before deleting it"),
+	}
+}
+
+// TestWorkerRmActiveRunsConflict: the refusal names each blocking run on stderr, says how
+// many more there are beyond the server's cap, gives the cancel guidance, and exits
+// conflict after exactly one delete attempt.
+func TestWorkerRmActiveRunsConflict(t *testing.T) {
+	iid := int64(7)
+	fc := &uzicli.FakeClient{Err: activeRunsErr(5,
+		uzicli.WorkerActiveRun{ID: "11111111-aaaa-bbbb-cccc-dddddddddddd", Kind: "issue", Status: "queued", IssueIID: &iid, Title: "Fix login"},
+		uzicli.WorkerActiveRun{ID: "22222222-aaaa-bbbb-cccc-dddddddddddd", Kind: "chat", Status: "running", Title: "chat about X"},
+	)}
+	_, errb, code := runCLI(t, fakeEnv(fc), "worker", "rm", "w1")
+	if code != uzicli.ExitConflict {
+		t.Fatalf("exit = %d, want %d\nstderr: %s", code, uzicli.ExitConflict, errb)
+	}
+	if fc.DeleteWorkerCalls != 1 {
+		t.Fatalf("DeleteWorker calls=%d, want 1", fc.DeleteWorkerCalls)
+	}
+	for _, want := range []string{
+		"11111111  issue  queued  Fix login",
+		"22222222  chat  running  chat about X",
+		"and 3 more",
+		"uzi run cancel <run-id>",
+		"retry",
+	} {
+		if !strings.Contains(errb, want) {
+			t.Errorf("active-runs refusal missing %q; stderr=%q", want, errb)
+		}
+	}
+}
+
+// TestWorkerRmActiveRunsSanitizesTitle: a run title is untrusted text, so control bytes
+// must not reach the terminal, and an empty title falls back to the short id.
+func TestWorkerRmActiveRunsSanitizesTitle(t *testing.T) {
+	fc := &uzicli.FakeClient{Err: activeRunsErr(2,
+		uzicli.WorkerActiveRun{ID: "11111111-aaaa-bbbb-cccc-dddddddddddd", Kind: "issue", Status: "queued", Title: "\x1b[31mevil\x07"},
+		uzicli.WorkerActiveRun{ID: "22222222-aaaa-bbbb-cccc-dddddddddddd", Kind: "chat", Status: "running", Title: ""},
+	)}
+	_, errb, code := runCLI(t, fakeEnv(fc), "worker", "rm", "w1")
+	if code != uzicli.ExitConflict {
+		t.Fatalf("exit = %d, want %d", code, uzicli.ExitConflict)
+	}
+	if strings.ContainsAny(errb, "\x1b\x07") {
+		t.Errorf("stderr carries control bytes: %q", errb)
+	}
+	if !strings.Contains(errb, "evil") {
+		t.Errorf("stderr = %q, want the sanitized title text", errb)
+	}
+	if !strings.Contains(errb, "22222222  chat  running  22222222") {
+		t.Errorf("stderr = %q, want the short id as the empty-title fallback", errb)
+	}
+}
+
+// TestWorkerRmActiveRunsConflictJSON: --json carries the structured refusal on stdout and
+// prints no per-run lines on stderr.
+func TestWorkerRmActiveRunsConflictJSON(t *testing.T) {
+	fc := &uzicli.FakeClient{Err: activeRunsErr(5,
+		uzicli.WorkerActiveRun{ID: "11111111-aaaa-bbbb-cccc-dddddddddddd", Kind: "issue", Status: "queued", Title: "Fix login"},
+	)}
+	out, errb, code := runCLI(t, fakeEnv(fc), "worker", "rm", "w1", "--json")
+	if code != uzicli.ExitConflict {
+		t.Fatalf("exit = %d, want %d", code, uzicli.ExitConflict)
+	}
+	for _, want := range []string{`"deleted": false`, `"active_runs_total": 5`, `"active_runs": [`, `"title": "Fix login"`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rm --json = %q, want it to carry %s", out, want)
+		}
+	}
+	if strings.Contains(errb, "11111111") || strings.Contains(errb, "more") {
+		t.Errorf("--json must not print per-run lines on stderr: %q", errb)
+	}
+}
+
 func TestWorkerRmRequiresArg(t *testing.T) {
 	fc := &uzicli.FakeClient{}
 	_, _, code := runCLI(t, fakeEnv(fc), "worker", "rm")

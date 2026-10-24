@@ -11712,6 +11712,57 @@ func (q *Queries) ListWaitingWorkerRuns(ctx context.Context) ([]ListWaitingWorke
 	return items, nil
 }
 
+const listWorkerNonTerminalRuns = `-- name: ListWorkerNonTerminalRuns :many
+SELECT id, kind, status, issue_iid, COALESCE(title, issue_title) AS display_title FROM runs
+WHERE worker_id = $1
+  AND user_id = $2
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+ORDER BY created_at, id
+LIMIT 10
+`
+
+type ListWorkerNonTerminalRunsParams struct {
+	WorkerID pgtype.UUID `json:"worker_id"`
+	UserID   uuid.UUID   `json:"user_id"`
+}
+
+type ListWorkerNonTerminalRunsRow struct {
+	ID           uuid.UUID   `json:"id"`
+	Kind         string      `json:"kind"`
+	Status       string      `json:"status"`
+	IssueIid     pgtype.Int8 `json:"issue_iid"`
+	DisplayTitle string      `json:"display_title"`
+}
+
+// The delete-refusal listing (#3390): names the runs CountWorkerNonTerminalRuns counted,
+// with exactly its predicate (user-scoped, so a cross-tenant attempt still 404s). Capped at
+// 10 oldest-first; the caller takes the total from the count, not from this list's length.
+func (q *Queries) ListWorkerNonTerminalRuns(ctx context.Context, arg ListWorkerNonTerminalRunsParams) ([]ListWorkerNonTerminalRunsRow, error) {
+	rows, err := q.db.Query(ctx, listWorkerNonTerminalRuns, arg.WorkerID, arg.UserID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListWorkerNonTerminalRunsRow{}
+	for rows.Next() {
+		var i ListWorkerNonTerminalRunsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Kind,
+			&i.Status,
+			&i.IssueIid,
+			&i.DisplayTitle,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listWorkerPendingSince = `-- name: ListWorkerPendingSince :many
 SELECT run_id, claim_generation, terminal_pending_since
 FROM worker_active_runs

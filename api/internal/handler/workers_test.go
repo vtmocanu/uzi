@@ -19,15 +19,20 @@ import (
 )
 
 // deleteWorkerStore is a minimal workersvc.Store for the DeleteWorker handler tests:
-// it answers only the three queries wsvc.DeleteWorker reaches (active-run count, open
-// custody count, the delete itself) and panics on anything else (embedded interface),
-// so a mapping test cannot pass silently through an unexercised path.
+// it answers only the four queries wsvc.DeleteWorker reaches (active-run count, active-run
+// listing, open custody count, the delete itself) and panics on anything else (embedded
+// interface), so a mapping test cannot pass silently through an unexercised path.
 type deleteWorkerStore struct {
 	workersvc.Store
 	activeRuns int64
+	listRuns   []store.ListWorkerNonTerminalRunsRow
 	holds      int64
 	deleteRows int64
 	deleted    bool
+}
+
+func (s *deleteWorkerStore) ListWorkerNonTerminalRuns(context.Context, store.ListWorkerNonTerminalRunsParams) ([]store.ListWorkerNonTerminalRunsRow, error) {
+	return s.listRuns, nil
 }
 
 func (s *deleteWorkerStore) CountWorkerNonTerminalRuns(context.Context, store.CountWorkerNonTerminalRunsParams) (int64, error) {

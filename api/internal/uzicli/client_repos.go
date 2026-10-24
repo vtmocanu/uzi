@@ -16,7 +16,7 @@ import (
 // WorkerCustodyConflictError is the DISTINGUISHABLE typed error DeleteWorker returns
 // when the server refuses the delete with a 409 because the worker still retains
 // unpublished committed work for durable recovery (PRD #1296 M4b, D3) — as opposed to
-// the ordinary active-runs 409, which stays a plain *ExitError. It carries the open-hold
+// the active-runs 409 (see WorkerActiveRunsConflictError). It carries the open-hold
 // count and the server's message so `uzi worker rm` can print the recover-or-discard
 // guidance instead of a bare "conflict".
 //
@@ -33,6 +33,29 @@ type WorkerCustodyConflictError struct {
 
 func (e *WorkerCustodyConflictError) Error() string { return e.Err.Error() }
 func (e *WorkerCustodyConflictError) Unwrap() error { return e.Err }
+
+// WorkerActiveRun is one run blocking a worker delete, as the server names it in the
+// active-runs 409 (#3390). IssueIID is nil for runs without an issue (chats).
+type WorkerActiveRun struct {
+	ID       string `json:"id"`
+	Kind     string `json:"kind"`
+	Status   string `json:"status"`
+	IssueIID *int64 `json:"issue_iid"`
+	Title    string `json:"title"`
+}
+
+// WorkerActiveRunsConflictError is the typed error DeleteWorker returns for the
+// active-runs 409 when the server names the blocking runs (#3390). Runs is the server's
+// capped listing (non-nil, possibly empty); Total is the real count, which can exceed
+// len(Runs). Like WorkerCustodyConflictError it wraps the *ExitError (ExitConflict).
+type WorkerActiveRunsConflictError struct {
+	Runs  []WorkerActiveRun
+	Total int64
+	Err   *ExitError
+}
+
+func (e *WorkerActiveRunsConflictError) Error() string { return e.Err.Error() }
+func (e *WorkerActiveRunsConflictError) Unwrap() error { return e.Err }
 
 func (c *HTTPClient) ListWorkers(ctx context.Context) ([]apitypes.WorkerDTO, error) {
 	var env struct {
@@ -53,12 +76,20 @@ func (c *HTTPClient) DeleteWorker(ctx context.Context, id string) error {
 	// A 409 carrying a `custody_holds` count is the recovery-custody refusal (PRD #1296
 	// M4b): the worker still retains unpublished committed work whose only durable copy
 	// this delete would destroy. Surface it as a DISTINGUISHABLE typed error so
-	// `uzi worker rm` can print the recover-or-discard guidance; the ordinary active-runs
-	// 409 (no count) falls through to the shared statusError → ExitConflict path unchanged.
+	// `uzi worker rm` can print the recover-or-discard guidance. A 409 carrying an
+	// `active_runs` key names the blocking runs (#3390); a 409 with neither key (an older
+	// server) falls through to the shared statusError → ExitConflict path unchanged.
 	if resp.StatusCode == http.StatusConflict {
 		if holds, ok := custodyHoldsFromBody(body); ok {
 			return &WorkerCustodyConflictError{
 				Holds: holds,
+				Err:   statusError(resp.StatusCode, body, resp.Header.Get("Retry-After")),
+			}
+		}
+		if runs, total, ok := activeRunsFromBody(body); ok {
+			return &WorkerActiveRunsConflictError{
+				Runs:  runs,
+				Total: total,
 				Err:   statusError(resp.StatusCode, body, resp.Header.Get("Retry-After")),
 			}
 		}
@@ -78,6 +109,25 @@ func custodyHoldsFromBody(body []byte) (int64, bool) {
 		return 0, false
 	}
 	return *b.CustodyHolds, true
+}
+
+// activeRunsFromBody reads the `active_runs` listing and `active_runs_total` from a
+// delete-refusal body and reports whether the listing key was present. Presence is keyed
+// through a pointer to the slice so an explicit empty array still counts as present; Runs
+// is returned non-nil.
+func activeRunsFromBody(body []byte) ([]WorkerActiveRun, int64, bool) {
+	var b struct {
+		ActiveRuns *[]WorkerActiveRun `json:"active_runs"`
+		Total      int64              `json:"active_runs_total"`
+	}
+	if json.Unmarshal(body, &b) != nil || b.ActiveRuns == nil {
+		return nil, 0, false
+	}
+	runs := *b.ActiveRuns
+	if runs == nil {
+		runs = []WorkerActiveRun{}
+	}
+	return runs, b.Total, true
 }
 
 func (c *HTTPClient) DeleteRepo(ctx context.Context, id string) error {

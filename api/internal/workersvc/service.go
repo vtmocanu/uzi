@@ -428,6 +428,18 @@ func (e *WorkerHasCustodyError) Error() string {
 }
 func (e *WorkerHasCustodyError) Unwrap() error { return ErrWorkerHasCustody }
 
+// WorkerHasActiveRunsError names the runs that block a worker delete (#3390). Runs is
+// the capped listing (oldest first) and may be shorter than Total, or empty if the runs
+// finished between the count and the listing; Total always comes from the count. It
+// unwraps to ErrWorkerHasActiveRuns, so callers that only match the sentinel are unchanged.
+type WorkerHasActiveRunsError struct {
+	Runs  []store.ListWorkerNonTerminalRunsRow
+	Total int64
+}
+
+func (e *WorkerHasActiveRunsError) Error() string { return ErrWorkerHasActiveRuns.Error() }
+func (e *WorkerHasActiveRunsError) Unwrap() error { return ErrWorkerHasActiveRuns }
+
 // PauseRefusedError carries the SPECIFIC user-facing reason a pause was refused (PRD #1190
 // M1) and unwraps to ErrPauseNotRunning or ErrPauseNotSupported, so the handler both matches
 // the sentinel (→ 409) and surfaces the run-specific sentence via err.Error(). The message is
@@ -490,6 +502,8 @@ type Store interface {
 	// run, guarded (embedded) on the worker holding no non-terminal run (PRD #529 M4).
 	DeleteEphemeralWorkerForRun(ctx context.Context, arg store.DeleteEphemeralWorkerForRunParams) (int64, error)
 	CountWorkerNonTerminalRuns(ctx context.Context, arg store.CountWorkerNonTerminalRunsParams) (int64, error)
+	// Issue #3390: the capped listing behind a delete refusal (WorkerHasActiveRunsError).
+	ListWorkerNonTerminalRuns(ctx context.Context, arg store.ListWorkerNonTerminalRunsParams) ([]store.ListWorkerNonTerminalRunsRow, error)
 	// Issue #2602: the run-detail blocked-by hint (MaybeBlockedByRun).
 	GetLatestRunQuestion(ctx context.Context, runID uuid.UUID) ([]byte, error)
 	RunQuestionAnswerExists(ctx context.Context, arg store.RunQuestionAnswerExistsParams) (bool, error)
@@ -7239,7 +7253,8 @@ func (s *Service) ListWorkers(ctx context.Context, userID uuid.UUID) ([]store.Li
 // DeleteWorker revokes a worker (its token stops authenticating). A worker that
 // still owns a non-terminal run is refused (ErrWorkerHasActiveRuns): deleting it
 // would NULL the run's worker_id and strand it (see ErrWorkerHasActiveRuns). The
-// count-then-delete is not one statement, but the worst a lost race does is
+// refusal is a *WorkerHasActiveRunsError naming up to 10 of the blocking runs (#3390).
+// The count-then-delete is not one statement, but the worst a lost race does is
 // re-queue one run to a now-deleted worker_id, which the next claim's affinity
 // fallback and the running/claimed sweeps still recover.
 //
@@ -7260,7 +7275,13 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 		return err
 	}
 	if active > 0 {
-		return ErrWorkerHasActiveRuns
+		rows, err := s.q.ListWorkerNonTerminalRuns(ctx, store.ListWorkerNonTerminalRunsParams{
+			WorkerID: pgconv.UUID(workerID), UserID: userID,
+		})
+		if err != nil {
+			return err
+		}
+		return &WorkerHasActiveRunsError{Runs: rows, Total: active}
 	}
 	// OWNER-SCOPED (userID): the count filters on user_id so a FOREIGN owner's held worker
 	// returns 0 here and falls through to the owner-scoped DeleteWorkerForUser → 404, instead
