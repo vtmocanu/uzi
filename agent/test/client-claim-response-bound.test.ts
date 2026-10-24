@@ -9,18 +9,20 @@ import { nullLogger } from "./helpers.js";
 const MIB = 1024 * 1024;
 const CAP = 168 * MIB;
 
-/** `{}` then a reused 1 MiB block of spaces until `totalBytes` have been enqueued (valid JSON). */
+/** `{`, a reused 1 MiB block of spaces until `totalBytes` have been enqueued, then a closing
+ *  `"run_id":"r1"}` (valid JSON). The trailing field is only visible after a full read. */
 function paddedBody(totalBytes: number): Response {
   const block = new Uint8Array(MIB).fill(0x20);
   let sent = 0;
   const stream = new ReadableStream<Uint8Array>({
     pull(controller) {
       if (sent === 0) {
-        controller.enqueue(new TextEncoder().encode("{}"));
-        sent = 2;
+        controller.enqueue(new TextEncoder().encode("{"));
+        sent = 1;
         return;
       }
       if (sent >= totalBytes) {
+        controller.enqueue(new TextEncoder().encode('"run_id":"r1"}'));
         controller.close();
         return;
       }
@@ -54,6 +56,7 @@ describe("claim response bound", () => {
 
   it("claimRun accepts a legitimate stock-maximum (~42 MiB) body", async () => {
     const claim = await clientFor(42 * MIB).claimRun();
-    assert.deepEqual(claim, {});
+    // The field follows ~42 MiB of padding, so a prefix or truncated read cannot produce it.
+    assert.deepEqual(claim, { run_id: "r1" });
   });
 });
