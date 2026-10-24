@@ -33,6 +33,7 @@ function rig(t: TestContext, entries = [entry()]) {
   const add = (e: PendingFinalize) => records.set(key(e), { entry: e, identity: {} });
   entries.forEach(add);
   const hidden = new Set<string>();
+  const policies = new Set<string>();
   const queries: string[] = [];
   const deleted: PendingFinalize[] = [];
   const logger = recordingLogger();
@@ -40,6 +41,7 @@ function rig(t: TestContext, entries = [entry()]) {
   logger.log.warn = (msg, fields) => { warnings.push({ msg, fields: fields ?? {} }); };
   let predicate: (id: string, gen: number) => Promise<boolean> = async () => true;
   const outbox = {
+    hasUnresolvedPolicy: (id: string) => policies.has(id),
     listPendingFinalizeGenerations: (includeTerminal = false) => [...records.values()]
       .filter(c => includeTerminal || !hidden.has(c.entry.run_id)).map(c => c.entry),
     finalizeRecordIdentity: (id: string, gen: number) => records.get(key(entry(id, gen)))?.identity,
@@ -68,13 +70,27 @@ function rig(t: TestContext, entries = [entry()]) {
     runner as unknown as RunRunner, {} as ChatRunner, {} as JudgeRunner, {} as ReviewRunner,
     logger.log, () => ({ ok: true, missing: [] }), outbox) as unknown as Sweep;
   const w = newWorker();
-  return { w, newWorker, client, runner, outbox, records, hidden, queries, deleted, add, logger, warnings,
+  return { w, newWorker, client, runner, outbox, records, hidden, policies, queries, deleted, add, logger, warnings,
     setPredicate: (fn: typeof predicate) => { predicate = fn; },
     advance: (ms: number) => { now += ms; },
     now: () => now,
     failures: () => logger.info.filter(log => log.fields.transition === "failed"),
   };
 }
+
+it("unresolved policy excludes finalize retry authority while an eligible sibling proceeds", async t => {
+  const r = rig(t, [entry(A), entry(B)]);
+  const identity = r.records.get(`${A}:1`)!.identity;
+  r.policies.add(A);
+  r.setPredicate(async () => false);
+  await r.w.sweepPendingFinalizes();
+  assert.equal(r.records.get(`${A}:1`)?.identity, identity, "policy source retains its exact finalize");
+  assert.ok(!r.queries.includes(`${A}:1`), "policy source obtains no retry authority");
+  assert.deepEqual(r.deleted, [entry(B)], "independent sibling can retire");
+  r.policies.delete(A);
+  await r.w.sweepPendingFinalizes();
+  assert.ok(!r.records.has(`${A}:1`), "resolved policy permits ordinary finalize retirement");
+});
 
 // Copy this file unchanged and select this name on ee190c042: only existing Worker/outbox
 // interfaces and call counts are used, so baseline fails on a premature retry.

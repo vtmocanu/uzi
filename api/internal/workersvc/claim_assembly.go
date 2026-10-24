@@ -169,7 +169,7 @@ func resumePhaseFor(run store.Run, planApproved bool) string {
 		return "awaiting_input"
 	case hasPlan && planApproved:
 		return "implementing"
-	case hasPlan && !planApproved && run.SessionID.Valid && strings.TrimSpace(run.SessionID.String) != "":
+	case hasPlan && !planApproved && ((run.SessionID.Valid && strings.TrimSpace(run.SessionID.String) != "") || (run.PolicyRefusalCount > 0 && run.GateRevision > 0)):
 		return "awaiting_approval"
 	default:
 		return ""
@@ -611,8 +611,9 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 
 	// plan_approved is computed once here so both the PlanApproved field and the
 	// resume_phase derivation (PRD #1247 M5, D13) read the SAME value — see the payload
-	// literal for the full provenance of the three disjuncts.
-	planApproved := run.AutoApprove || rc.HumanPlanApproved || run.PlanSource == planSourceSeeded
+	// literal for the full provenance of the three ordinary disjuncts. Constrained
+	// revision/source authority overrides them before resume phase selection.
+	planApproved := policyRevisionPlanApproved(ctx, s.q, run, run.AutoApprove || rc.HumanPlanApproved || run.PlanSource == planSourceSeeded)
 	// PRD #1247 M5, D13: the server-derived phase a resumed claim RESTORES instead of
 	// re-entering the planning turn. Empty for a fresh run (omitted by omitempty).
 	resumePhase := resumePhaseFor(run, planApproved)
@@ -697,13 +698,15 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		return nil, err
 	}
 	payload := &ClaimPayload{
-		CIRepair:         ciRepair,
-		InventoryGuarded: inventoryGuarded,
-		RunID:            run.ID.String(),
-		Kind:             run.Kind,
-		IssueIID:         issueIID,
-		IssueTitle:       run.IssueTitle,
-		IssueDescription: run.IssueDescription,
+		CIRepair:               ciRepair,
+		InventoryGuarded:       inventoryGuarded,
+		PolicyHoldResume:       run.PolicyRefusalCount > 0,
+		PolicyHoldFreshSession: run.PolicyRefusalCount > 0 && run.PolicyFreshClaimGeneration.Valid && run.PolicyFreshClaimGeneration.Int64 == run.ClaimGeneration,
+		RunID:                  run.ID.String(),
+		Kind:                   run.Kind,
+		IssueIID:               issueIID,
+		IssueTitle:             run.IssueTitle,
+		IssueDescription:       run.IssueDescription,
 		// PRD #381: the structured comments snapshot, decoded above. omitempty keeps a
 		// comment-less run's claim byte-identical to today's.
 		IssueComments: issueComments,

@@ -271,47 +271,50 @@ type ControllerReportStatus struct {
 }
 
 type CrossCheck struct {
-	ID                      uuid.UUID          `json:"id"`
-	LeadRunID               uuid.UUID          `json:"lead_run_id"`
-	Stage                   string             `json:"stage"`
-	Round                   int32              `json:"round"`
-	LeadClaimGeneration     int64              `json:"lead_claim_generation"`
-	PlanMd                  pgtype.Text        `json:"plan_md"`
-	Milestones              []byte             `json:"milestones"`
-	RequiredCapabilities    []string           `json:"required_capabilities"`
-	RequiredTools           []string           `json:"required_tools"`
-	SizeClass               pgtype.Text        `json:"size_class"`
-	BaseCommit              pgtype.Text        `json:"base_commit"`
-	PlanningDiff            pgtype.Text        `json:"planning_diff"`
-	CandidateDigest         []byte             `json:"candidate_digest"`
-	CheckerRunID            pgtype.UUID        `json:"checker_run_id"`
-	CheckerHarness          pgtype.Text        `json:"checker_harness"`
-	CheckerModel            pgtype.Text        `json:"checker_model"`
-	CheckerEffort           pgtype.Text        `json:"checker_effort"`
-	Verdict                 string             `json:"verdict"`
-	ReasonClass             pgtype.Text        `json:"reason_class"`
-	Findings                []byte             `json:"findings"`
-	DecidedAt               pgtype.Timestamptz `json:"decided_at"`
-	DeadlineAt              pgtype.Timestamptz `json:"deadline_at"`
-	CreatedAt               pgtype.Timestamptz `json:"created_at"`
-	CheckerModelSource      pgtype.Text        `json:"checker_model_source"`
-	CheckerEffortSource     pgtype.Text        `json:"checker_effort_source"`
-	AutomaticRevisionLimit  int32              `json:"automatic_revision_limit"`
-	AutomaticRoundsEnabled  bool               `json:"automatic_rounds_enabled"`
-	InterruptedAt           pgtype.Timestamptz `json:"interrupted_at"`
-	WaitCredited            bool               `json:"wait_credited"`
-	HeadCommit              pgtype.Text        `json:"head_commit"`
-	Outcome                 pgtype.Text        `json:"outcome"`
-	CodeContext             []byte             `json:"code_context"`
-	GuidanceSnapshot        pgtype.Text        `json:"guidance_snapshot"`
-	GuidanceText            pgtype.Text        `json:"guidance_text"`
-	GuidanceDigest          []byte             `json:"guidance_digest"`
-	RepoInstructionsEnabled bool               `json:"repo_instructions_enabled"`
-	RepoInstructionsText    pgtype.Text        `json:"repo_instructions_text"`
-	RepoInstructionsDigest  []byte             `json:"repo_instructions_digest"`
-	Dispositions            []byte             `json:"dispositions"`
-	FinalizedAt             pgtype.Timestamptz `json:"finalized_at"`
-	RepoInstructionsCommit  pgtype.Text        `json:"repo_instructions_commit"`
+	ID                              uuid.UUID          `json:"id"`
+	LeadRunID                       uuid.UUID          `json:"lead_run_id"`
+	Stage                           string             `json:"stage"`
+	Round                           int32              `json:"round"`
+	LeadClaimGeneration             int64              `json:"lead_claim_generation"`
+	PlanMd                          pgtype.Text        `json:"plan_md"`
+	Milestones                      []byte             `json:"milestones"`
+	RequiredCapabilities            []string           `json:"required_capabilities"`
+	RequiredTools                   []string           `json:"required_tools"`
+	SizeClass                       pgtype.Text        `json:"size_class"`
+	BaseCommit                      pgtype.Text        `json:"base_commit"`
+	PlanningDiff                    pgtype.Text        `json:"planning_diff"`
+	CandidateDigest                 []byte             `json:"candidate_digest"`
+	CheckerRunID                    pgtype.UUID        `json:"checker_run_id"`
+	CheckerHarness                  pgtype.Text        `json:"checker_harness"`
+	CheckerModel                    pgtype.Text        `json:"checker_model"`
+	CheckerEffort                   pgtype.Text        `json:"checker_effort"`
+	Verdict                         string             `json:"verdict"`
+	ReasonClass                     pgtype.Text        `json:"reason_class"`
+	Findings                        []byte             `json:"findings"`
+	DecidedAt                       pgtype.Timestamptz `json:"decided_at"`
+	DeadlineAt                      pgtype.Timestamptz `json:"deadline_at"`
+	CreatedAt                       pgtype.Timestamptz `json:"created_at"`
+	CheckerModelSource              pgtype.Text        `json:"checker_model_source"`
+	CheckerEffortSource             pgtype.Text        `json:"checker_effort_source"`
+	AutomaticRevisionLimit          int32              `json:"automatic_revision_limit"`
+	AutomaticRoundsEnabled          bool               `json:"automatic_rounds_enabled"`
+	InterruptedAt                   pgtype.Timestamptz `json:"interrupted_at"`
+	WaitCredited                    bool               `json:"wait_credited"`
+	HeadCommit                      pgtype.Text        `json:"head_commit"`
+	Outcome                         pgtype.Text        `json:"outcome"`
+	CodeContext                     []byte             `json:"code_context"`
+	GuidanceSnapshot                pgtype.Text        `json:"guidance_snapshot"`
+	GuidanceText                    pgtype.Text        `json:"guidance_text"`
+	GuidanceDigest                  []byte             `json:"guidance_digest"`
+	RepoInstructionsEnabled         bool               `json:"repo_instructions_enabled"`
+	RepoInstructionsText            pgtype.Text        `json:"repo_instructions_text"`
+	RepoInstructionsDigest          []byte             `json:"repo_instructions_digest"`
+	Dispositions                    []byte             `json:"dispositions"`
+	FinalizedAt                     pgtype.Timestamptz `json:"finalized_at"`
+	RepoInstructionsCommit          pgtype.Text        `json:"repo_instructions_commit"`
+	RevisionDisposition             pgtype.Text        `json:"revision_disposition"`
+	RevisionSettledAt               pgtype.Timestamptz `json:"revision_settled_at"`
+	RevisionSupersededByStopInputID pgtype.Int8        `json:"revision_superseded_by_stop_input_id"`
 }
 
 type CustodyEpisodeNotice struct {
@@ -1086,6 +1089,20 @@ type Run struct {
 	CheckpointAttestedSource    pgtype.Text        `json:"checkpoint_attested_source"`
 	SourcePublicationIntent     []byte             `json:"source_publication_intent"`
 	ContinuedIssueIid           pgtype.Int8        `json:"continued_issue_iid"`
+	PolicyRefusalCount          int32              `json:"policy_refusal_count"`
+	PolicyLastTag               pgtype.Text        `json:"policy_last_tag"`
+	PolicyLastPhase             pgtype.Text        `json:"policy_last_phase"`
+	PolicyLastCorrelationID     pgtype.Text        `json:"policy_last_correlation_id"`
+	PolicyLastRefusedAt         pgtype.Timestamptz `json:"policy_last_refused_at"`
+	PolicyHoldProvenance        pgtype.Text        `json:"policy_hold_provenance"`
+	PolicyHoldPublished         pgtype.Bool        `json:"policy_hold_published"`
+	PolicyHoldDetail            pgtype.Text        `json:"policy_hold_detail"`
+	PolicyLastOutcomeID         pgtype.UUID        `json:"policy_last_outcome_id"`
+	PolicyLastSourceGeneration  pgtype.Int8        `json:"policy_last_source_generation"`
+	PolicyFreshClaimGeneration  pgtype.Int8        `json:"policy_fresh_claim_generation"`
+	PolicyStopResolution        []byte             `json:"policy_stop_resolution"`
+	PolicyRevisionSource        []byte             `json:"policy_revision_source"`
+	PolicyCandidateCrossCheckID pgtype.UUID        `json:"policy_candidate_cross_check_id"`
 }
 
 type RunCompletionAttempt struct {
@@ -1396,6 +1413,8 @@ type RunUserInput struct {
 	GateRevision            pgtype.Int8        `json:"gate_revision"`
 	IncludedAt              pgtype.Timestamptz `json:"included_at"`
 	InclusionReported       bool               `json:"inclusion_reported"`
+	SettledAt               pgtype.Timestamptz `json:"settled_at"`
+	SupersededByStopInputID pgtype.Int8        `json:"superseded_by_stop_input_id"`
 }
 
 type SemanticCandidateHistory struct {

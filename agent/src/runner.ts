@@ -4,7 +4,9 @@ import { prepareFrozenHeld, type FrozenHeldPolicy } from "./frozen-held.js";
 import { interruptedSnapshot, prepareInterruptedCalls } from "./interrupted-calls.js";
 import { CodeCrossCheckGate, persistedCodeCrossCheckSummary } from "./code-cross-check-gate.js";
 import { readRepoInstructionsAtCommit } from "./repo-instructions-at-commit.js";
-import { ProviderPolicyRefusal, policyRefusalMessage } from "./provider-policy-refusal.js";
+import { resolvePendingPolicy } from "./policy-resolve.js";
+import type { ImmutablePolicyOutcome } from "./protocol.js";
+import { PolicyResumeRejected, ProviderPolicyRefusal, policyRefusalMessage } from "./provider-policy-refusal.js";
 import { isParkAnswer } from "./park-run.js";
 import { TrustedExecutionRefusal, legacyTrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import { AsyncResource } from "node:async_hooks";
@@ -2000,6 +2002,15 @@ type SourceGenesis = Readonly<{
 }>;
 
 interface RunFlight {
+  /** Scope from the initial authoritative running ACK, before resume can reset progress. */
+  resumeScope?: StateAck;
+  /** A reached policy Stop needs a fresh authoritative scope ACK before execution. */
+  policyStopAtResume?: boolean;
+  policyHoldSupported?: boolean;
+  policyHoldIntent?: PolicyResumeRejected | ProviderPolicyRefusal;
+  policyReconciliationPending?: boolean;
+  policyHoldOutcome?: ImmutablePolicyOutcome;
+  lastPersistedGateRevision?: number;
   /** Local observer only; preservation keeps its own operation and authority. */
   memoryHoldObserver?: () => void;
   /** Exact facade of a refused/unacknowledged owner-pause capture; never cleanup or resume authority. */
@@ -2869,7 +2880,7 @@ export class RunRunner {
         recoveryRoot: this.git.recoveryRoot,
         terminalRecordProtection: (runId) => this.git.hasPhysicalTerminalProtection(runId),
         pendingGenerationReport: (runId, generation) => !!this.outbox &&
-          (this.outbox.isDisabled() || this.outbox.hasPendingTerminal(runId, generation) ||
+          (this.outbox.isDisabled() || this.outbox.hasPendingTerminal(runId, generation) || this.outbox.hasPendingPolicyForGeneration(runId, generation) ||
             !!this.outbox.finalizeRecordIdentity(runId, generation)),
         isExecuting: (runId) => this.isExecuting(runId) && !this.inventoryReservations.has(runId),
         writerExclusion: opts.maintenanceExclusion,
@@ -3107,12 +3118,30 @@ export class RunRunner {
       typeof body.completion_final_head === "string" && /^[0-9a-f]{40}$/.test(body.completion_final_head);
   }
 
+  /** Capture before sending, never after the ACK: a rebound policy has a different identity. */
+  async preparePolicyTerminalAck(runId: string, generation: number, body: StateRequest): Promise<ReportRetirementContext | undefined> {
+    if ((body.status !== "completed" && body.status !== "failed") || !this.outbox?.hasPendingPolicy(runId)) return undefined;
+    try {
+      const observation = await this.outbox.readPolicyForRetirement(runId, generation);
+      if (observation?.request.source_generation === generation && observation.request.claim_generation === generation)
+        return observation.context;
+    } catch { /* Unknown evidence grants no admission settlement. */ }
+    return undefined;
+  }
+
   async observeSettlementTerminalAck(
     runId: string,
     claimGeneration: number,
     body: StateRequest,
     ack: StateAck,
+    policyObservation?: ReportRetirementContext,
   ): Promise<void> {
+    if (policyObservation && (body.status === "completed" || body.status === "failed") &&
+        !ack.staleClaim && ack.status !== undefined && TERMINAL_RUN_STATUSES.has(ack.status)) {
+      await this.outbox?.markPolicyServerSettled(runId, claimGeneration, policyObservation).catch(() => {
+        this.log.warn("policy terminal acknowledgement unresolved; evidence retained");
+      });
+    }
     if (body.status === "completed" && body.completion_final_head)
       this.attemptedPublicationTerminals.set(this.completionKey(runId, claimGeneration), {});
     const receipt = ack.completedPublicationReceipt;
@@ -3802,8 +3831,9 @@ export class RunRunner {
         // issue #1582 M2: the replayed ACK is applied to the settlement journal BEFORE the resolve
         // retires the outbox entry.
         send: async (body, sig) => {
+          const policy = await this.preparePolicyTerminalAck(runId, gen, body);
           const ack = await this.client.reportState(runId, { ...body, claim_generation: gen }, sig);
-          await this.observeSettlementTerminalAck(runId, gen, body, ack);
+          await this.observeSettlementTerminalAck(runId, gen, body, ack, policy);
           return ack;
         },
       });
@@ -4018,6 +4048,35 @@ export class RunRunner {
       if (flight.completionHoldOutcome === "unresolved") {
         await batcher.close().catch(() => undefined);
         runLog.warn("completion hold unresolved; retaining artifacts without terminal dispatch");
+        return;
+      }
+      if (flight.policyReconciliationPending && !flight.steering.isCancelled() &&
+          !flight.steering.claimFence() && !flight.active?.shuttingDown) {
+        runLog.warn("policy reconciliation unavailable; retaining evidence without terminal dispatch");
+        await batcher.close().catch(() => undefined);
+        return;
+      }
+      const policy = flight.policyHoldIntent ?? (this.admitPolicyHold(claim, failure, flight.policyHoldSupported === true) ? failure : undefined);
+      if (policy && !flight.steering.isCancelled() && !flight.steering.claimFence() && !flight.active?.shuttingDown) {
+        flight.policyHoldIntent = policy;
+        // Retry a failed sink admission while active. Individual capture and delivery attempts
+        // are bounded; delayed retries end on Cancel, fencing or shutdown.
+        for (;;) {
+          try {
+            if (await this.runGatedSink(flight, () => this.enterPolicyHold(claim, flight, policy))) return;
+            break;
+          } catch (holdError) {
+            if (flight.steering.isCancelled() || flight.steering.claimFence() || flight.active?.shuttingDown) {
+              flight.policyHoldIntent = undefined;
+              await dispatchFailure(flight.steering.claimFence() ? new StaleClaimError() : holdError);
+              return;
+            }
+            runLog.warn("policy hold sink unresolved; active claim blocked");
+            await this.waitRecoveryRetry(flight, true, Math.max(250, this.recoveryRetryMs));
+          }
+        }
+        flight.policyHoldIntent = undefined;
+        await this.reportGenericFailure(claim, flight, policy);
         return;
       }
       // The owed-candidate cap stopped this run by aborting its attempt: report the cap, not the
@@ -4800,6 +4859,8 @@ export class RunRunner {
       this.bindWorkerMemory(claim, flight);
       await this.phaseClone(claim, flight);
       executor = flight.executor;
+      await this.recordRecoveryGenerationEvidence(claim, flight);
+      if (await this.reconcileClaimPolicies(flight)) return;
       const sessionId = await this.phaseResume(claim, flight);
       // PRD #1349 M2 (D1/D3): after clone/reseed and BEFORE model work, record this run's exact
       // claim generation into the durable journal (the restore point it starts from) and
@@ -4807,7 +4868,6 @@ export class RunRunner {
       // pin lets a later empty-turn park or early terminal exit disposition the EXACT hold
       // without inferring `current - 1`; the inventory is observational only (settlement is
       // deferred to the final durable head). Credential-free and best-effort.
-      await this.recordRecoveryGenerationEvidence(claim, flight);
       await this.phasePreflightHandoff(claim, flight, sessionId, executionRejection);
       // PRD #1171 m4: the finalize sink. phasePreflightHandoff already ran the
       // security-boundary reap (its killAgentTree?.() — no-op for Codex); this wrapper adds the
@@ -5433,6 +5493,88 @@ export class RunRunner {
     }
   }
 
+  /** One bounded inactive policy attempt; ACK alone never supplies source or custody authority. */
+  async retirePolicyReport(runId: string, sourceGeneration: number,
+    context: ReportRetirementContext = {}): Promise<boolean> {
+    const outbox = this.outbox;
+    if (!outbox || context.signal?.aborted || context.eligible?.() === false) return false;
+    const deadline = Math.min(Date.now() + reportProofTiming.proofBudgetMs(), context.deadline ?? Infinity);
+    if (deadline <= Date.now()) return false;
+    const abort = new AbortController();
+    const cancel = () => abort.abort(context.signal?.reason);
+    context.signal?.addEventListener("abort", cancel, { once: true });
+    const timer = setTimeout(() => abort.abort(new Error("policy report proof deadline")),
+      Math.max(1, deadline - Date.now()));
+    const budget = { signal: abort.signal, deadline };
+    let retired = false;
+    try {
+      const observed = await outbox.readPolicyForRetirement(runId, sourceGeneration, { ...context, ...budget });
+      if (!observed || observed.policy.server_settled !== true ||
+          (context.expectedIdentity && context.expectedIdentity !== observed.context.expectedIdentity)) return false;
+      const policy = observed.policy;
+      let sourceIdentity: string | undefined;
+      let sourceBare = "";
+      await this.recovery.withPolicyReportRetirementProof(runId, sourceGeneration,
+        policy.delivery.claim_generation, policy.outcome.head, budget,
+        action => this.withReportSourceReservation(runId, action),
+        async (bare, covered) => {
+          sourceBare = bare;
+          const readSources = () => this.git.readInventoryCloneHeads(bare, runId, true);
+          const first = await readSources();
+          if (first.kind !== "verified" || process.platform !== "linux") return false;
+          const identity = JSON.stringify(first);
+          if (sourceIdentity !== undefined && sourceIdentity !== identity) return false;
+          for (const head of first.heads) if (!await covered(head)) return false;
+          // Two complete inspections, each bracketed by observational process checks.
+          for (let pass = 0; pass < 2; pass++) {
+            for (const clone of first.clones) {
+              budget.signal.throwIfAborted();
+              if (this.liveAttempts.isLivePath(clone.clonePath) || !clone.head || !clone.identity) return false;
+              const observe = () => this.quiesceImpl({
+                mode: "capture", attempt: undefined, cloneKey: cloneKeyOf(clone.clonePath).cloneKey,
+                targetPaths: [clone.clonePath], processes: true, dockerHost: undefined, registry: this.liveAttempts,
+                otherClaimInFlight: [...this.executionTails.keys()].some(id => id !== runId),
+                site: "report_retirement", reportBudget: budget,
+              });
+              const before = await observe();
+              if (before.process?.state !== "quiescent" || before.process.killed.length !== 0) return false;
+              if (await this.git.credentialFreeCancelCleanHead(clone.clonePath, bare, clone.head) !== clone.head) return false;
+              const after = await observe();
+              if (after.process?.state !== "quiescent" || after.process.killed.length !== 0) return false;
+            }
+            if (JSON.stringify(await readSources()) !== identity) return false;
+          }
+          sourceIdentity = identity;
+          return true;
+        },
+        async proofEligible => {
+          // Outbox aborts its private proof controller after freshProof. Eligibility
+          // deliberately closes over the outer source/custody budget instead.
+          const eligible = () => proofEligible() && !budget.signal.aborted && Date.now() < deadline &&
+            context.eligible?.() !== false && !outbox.hasUndrainedMessages(runId) &&
+            !outbox.isTerminalResolveHeld(runId, policy.delivery.claim_generation);
+          retired = await outbox.retirePolicyIfEligible(runId, sourceGeneration, {
+            ...observed.context, ...budget, eligible,
+            freshProof: async current => {
+              if (!eligible() || JSON.stringify(current) !== JSON.stringify(policy) || !sourceIdentity ||
+                  JSON.stringify(await this.git.readInventoryCloneHeads(sourceBare, runId, true)) !== sourceIdentity ||
+                  !eligible()) return undefined;
+              return { outcome_id: policy.outcome.outcome_id, source_generation: sourceGeneration,
+                claim_generation: policy.delivery.claim_generation, inventory_complete: true,
+                sources_safe: true, custody_settled: true };
+            },
+          });
+        });
+    } catch {
+      // Failed observations retain this exact policy and every source; siblings may still proceed.
+    } finally {
+      clearTimeout(timer);
+      context.signal?.removeEventListener("abort", cancel);
+      abort.abort();
+    }
+    return retired;
+  }
+
   /** Proof and unlink share C/S/J/B/O; no reusable archive proof escapes this call. */
   async retireRecoveryReport(runId: string, generation: number, context: ReportRetirementContext,
     kind: "terminal" | "finalize" = "terminal", outbox = this.outbox): Promise<{ retired: false } | { retired: true; authority: "acknowledged_final_report_only" | "existing_archive" }> {
@@ -5805,7 +5947,7 @@ export class RunRunner {
       flight.cancel.abort(new RetainedRecoveryStop());
       return;
     }
-    if (flight.pauseParkAccepted || flight.completionHoldOutcome === "unresolved") return;
+    if (flight.policyHoldIntent || flight.policyReconciliationPending || flight.pauseParkAccepted || flight.completionHoldOutcome === "unresolved") return;
     const outbox = this.outbox;
     if (outbox) outbox.holdTerminalResolve(flight.runId, flight.claimGeneration);
     try {
@@ -9899,6 +10041,7 @@ export class RunRunner {
     // running-report ACK's pauseRequested regressed. In the normal case the ACK also re-fires
     // pauseRequested, so the seed is a real safety net rather than the sole trigger.
     if (claim.pause_pending) steering.seedPauseRequested(claim.pause_mode);
+    if (claim.policy_hold_resume === true) steering.guardInitialDelivery();
     // Issue #1604: a resumed claim with an unapproved persisted plan.
     if (claim.plan_approved !== true && !!claim.plan_md?.trim()) {
       // (D3) Every executor reads the inputs sent before the release before any plan is offered
@@ -9914,7 +10057,10 @@ export class RunRunner {
       // never re-presents), its first gate shows a plan no human has seen: it bumps the epoch like
       // a revision gate, so a replayed approve/reject still buffered goes stale. So does a claim
       // whose replayed verdicts cannot be judged: nothing replayed settles its first gate.
-      if (!replayJudged || executor.resumesAtGate !== true || claim.resume_phase !== "awaiting_approval")
+      const verifiedPolicyGate = claim.policy_hold_resume === true && this.policyHoldEligible(claim) &&
+        claim.resume_phase === "awaiting_approval" && replayJudged &&
+        Number.isSafeInteger(claim.resume_gate_revision) && (claim.resume_gate_revision ?? 0) > 0;
+      if (!replayJudged || (executor.resumesAtGate !== true && !verifiedPolicyGate) || claim.resume_phase !== "awaiting_approval")
         this.gatedRuns.add(runId);
       // PRD #1795 (decision 7): a claim whose first gate RE-PRESENTS the persisted gate (the no-bump
       // first gate above: an SDK executor at resume_phase "awaiting_approval" with judged replays)
@@ -9956,6 +10102,8 @@ export class RunRunner {
     // re-plumbing this closure; the annotation is the only change, and awaiting a
     // value nobody binds behaves exactly as before.
     const flight: RunFlight = {
+      policyHoldSupported: this.policyHoldEligible(claim) && this.client.supportsPolicyHold(),
+      lastPersistedGateRevision: Number.isSafeInteger(claim.resume_gate_revision) && (claim.resume_gate_revision ?? 0) > 0 ? claim.resume_gate_revision : undefined,
       runId,
       executor,
       runHome,
@@ -10111,6 +10259,10 @@ export class RunRunner {
         if (checked && stamped.claim_generation !== flight.claimGeneration)
           throw new Error("plan cross-check: state generation changed");
         const diskSeq = body.status !== undefined ? this.diskGovernor?.statusRequested(runId, body.status) : undefined;
+        // Nonterminal sends must enter the client in the released checked-state turn.
+        // Even an empty async policy probe would delay the session sender by a microtask.
+        const policyObservation = body.status === "completed" || body.status === "failed"
+          ? await this.preparePolicyTerminalAck(runId, flight.claimGeneration, body) : undefined;
         const transport = () => checked === "semantic"
           ? this.client.reportSemanticPlanGateState(runId, stamped, signal)
           : checked ? this.client.reportPlanCrossCheckGateState(runId, stamped, signal)
@@ -10123,6 +10275,8 @@ export class RunRunner {
         let ack: StateAck;
         try { ack = await sending; }
         finally { senders.delete(sending); }
+        if (ack.applied === true && ack.status === "awaiting_approval" && Number.isSafeInteger(ack.gateRevision) && (ack.gateRevision ?? 0) > 0)
+          flight.lastPersistedGateRevision = Math.max(flight.lastPersistedGateRevision ?? 0, ack.gateRevision!);
         if (diskSeq !== undefined) this.diskGovernor?.statusAcked(runId, diskSeq, ack.status);
         // PRD #1247 M5b (MINOR-7): the held-state switch signal rides the state ACK too — the
         // advertised SECONDARY transport beside /inputs. Feed it into the SAME generation-checked,
@@ -10188,7 +10342,7 @@ export class RunRunner {
         // write-ahead `pushed` head on a completed outcome, else stop the records). Here, inside the
         // send, so it lands BEFORE the terminal resolve retires the outbox journal.
         if (body.status === "completed" || body.status === "failed") {
-          await this.observeSettlementTerminalAck(runId, flight.claimGeneration, body, ack);
+          await this.observeSettlementTerminalAck(runId, flight.claimGeneration, body, ack, policyObservation);
         }
         // The non-stale terminal ACK supplies authoritative status. Cancellation can stamp
         // a failed request cancelled; StateRequest itself has no cancelled status.
@@ -10690,6 +10844,7 @@ export class RunRunner {
     // continuing the phase clone would work a claim the run has already left. Throw the non-`failed`
     // stop signal rather than clone-and-run on it.
     const runningAck = await reportState({ status: "running" });
+    flight.resumeScope = runningAck;
     if (!runningAck.applied && runningAck.status !== undefined && TERMINAL_RUN_STATUSES.has(runningAck.status)) {
       runLog.info("first running report refused with a terminal status; stopping the phase clone", {
         run_id: runId,
@@ -11057,6 +11212,30 @@ export class RunRunner {
     // could be recovered" on exactly that successful recovery. With branch 3 ahead of it, the
     // loss notice fires only when NOTHING — committed or WIP — was recovered: the residual
     // #218-M3 loss case.
+    const scope = flight.resumeScope;
+    const reachedPolicyStop = claim.policy_hold_resume === true && claim.kind === "issue" &&
+      claim.interactive !== true && claim.plan_approved === true && !!claim.milestones?.length &&
+      typeof scope?.scopeCeiling === "number" && typeof scope.completedCount === "number" &&
+      scope.completedCount > 0 && scope.completedCount >= scope.scopeCeiling;
+    flight.policyStopAtResume = reachedPolicyStop;
+    const hasPolicyCompletedWork = claim.policy_hold_resume === true &&
+      typeof scope?.completedCount === "number" && scope.completedCount > 0;
+    const recoveredWork = runnerClone.priorCommits > 0 || runnerClone.wipRecovered === true;
+    if (hasPolicyCompletedWork && !recoveredWork) {
+      batcher.emit({ kind: "status", agent: "worker", payload: {
+        text: "completed work is unavailable on this worker — continuation cannot deliver it; keeping completion and scope unchanged",
+      } });
+      throw new PolicyResumeRejected();
+    }
+    if (claim.policy_hold_resume === true && claim.policy_hold_fresh_session !== true && !reachedPolicyStop) {
+      let present = false;
+      if (claim.session_id && !flight.effectiveAttemptPaths && this.dockerHost === undefined && runHome && claim.secrets.codex) {
+        try {
+          present = await CodexSessionStore.inspectSession(join(runHome, "codex-session-store"), claim.session_id) === "present";
+        } catch { /* An unreadable store cannot authorize a fresh conversation. */ }
+      }
+      if (!present) throw new PolicyResumeRejected();
+    }
     const wipRecovered = runnerClone.wipRecovered === true;
     if (runnerClone.seededFrom === "tracking" && runnerClone.priorCommits > 0) {
       batcher.emit({
@@ -11143,7 +11322,7 @@ export class RunRunner {
     // feed message at ~:603: a brand-new first attempt has no prior milestones to clear,
     // so it must NOT emit a spurious extra run-start report (that perturbs the status-report
     // sequence other runner tests assert, e.g. runner-push-mr).
-    if (claim.session_id != null && runnerClone.seededFrom === "default") {
+    if (!hasPolicyCompletedWork && claim.session_id != null && runnerClone.seededFrom === "default") {
       try {
         await reportState({ status: "running", seeded_from_default: true });
       } catch (e) {
@@ -12343,6 +12522,9 @@ export class RunRunner {
     const semanticGate = semanticPlanning ? new SemanticPlanningGate(this.client, runId, flight.claimGeneration,
       steering.lifecycleSignal(), this.semanticCoverageTestTransport) : undefined;
     const ctx: RunContext = {
+      policyHoldSupported: flight.policyHoldSupported === true,
+      policyHoldResume: claim.policy_hold_resume === true,
+      policyHoldFreshSession: claim.policy_hold_fresh_session === true,
       semanticPlanning,
       ...(claim.kind === "prompt" && claim.config?.ci_config_guard === true && claim.ci_repair != null ? {
         prepareCIEvidence: async () => {
@@ -12597,7 +12779,8 @@ export class RunRunner {
         if (outcome === "gave_up") steering.rearmLifecycle();
         return outcome;
       },
-      resumePhase: claim.resume_phase,
+      resumePhase: claim.policy_hold_resume === true && claim.resume_phase === "awaiting_approval" &&
+        !this.gateResumes.has(runId) ? undefined : claim.resume_phase,
       // Persist the SDK session id the moment the executor learns it, so a
       // re-queued run can resume it. Best-effort.
       onSessionId: (sessionId) => {
@@ -12948,6 +13131,7 @@ export class RunRunner {
           claim.config ?? null,
           { confirmRunning: revisionRecovery?.hasActiveRevision === true },
         ),
+      pullFollowUp: selection => steering.pullFollowUp(selection),
       pullFollowUps: (remainingRunes, batchEmpty) => steering.pullFollowUps(remainingRunes, batchEmpty),
       // Issue #1800: the executor reports a pulled follow-up once the turn carrying it reached the model.
       followUpIncluded: (id) => steering.markFollowUpIncluded(id),
@@ -13080,6 +13264,11 @@ export class RunRunner {
                 : {}),
             }),
           );
+          if (flight.policyStopAtResume &&
+              (typeof ack.scopeCeiling !== "number" || typeof ack.completedCount !== "number" ||
+               !Array.isArray(ack.completedIds))) {
+            throw new PolicyResumeRejected();
+          }
           const b: IterationBudget = {};
           if (typeof ack.budgetMaxIterations === "number")
             b.maxIterations = ack.budgetMaxIterations;
@@ -13134,6 +13323,11 @@ export class RunRunner {
           // report error) would let the flight keep running a whole turn on a run the sweep already
           // parked; the fence rejects every write, but the wasted turn is avoided by stopping now.
           if (e instanceof ServerWallParkedError) throw e;
+          if (flight.policyStopAtResume) {
+            this.policyControlGuard(flight);
+            if (e instanceof StaleClaimError || e instanceof PolicyResumeRejected) throw e;
+            throw new PolicyResumeRejected();
+          }
           runLog.warn("could not report iteration", { error: errMessage(e) });
           return undefined;
         }
@@ -13581,6 +13775,12 @@ export class RunRunner {
       } catch (settlementError) {
         flight.evidenceAuxiliaries = "failed";
         flight.evidenceJoinFailed = true;
+        if (flight.policyHoldIntent && steering.claimFence()) throw new StaleClaimError();
+        if (flight.policyHoldIntent && steering.isCancelled()) throw new Error("run cancelled");
+        if (flight.policyHoldIntent && !steering.isCancelled() && !steering.claimFence()) {
+          runLog.warn("policy hold execution settlement failed; retaining admitted outcome");
+          return;
+        }
         executionRejection.rejected = false;
         throw settlementError;
       }
@@ -13589,6 +13789,18 @@ export class RunRunner {
       this.diskGovernor?.enterRun(flight.runId);
       nowSummary?.start();
       try {
+        if (claim.policy_hold_resume === true) {
+          this.policyControlGuard(flight);
+          if (steering.operatorConstraints() === null) throw new PolicyResumeRejected();
+          try {
+            await steering.awaitInitialDelivery(cancel.signal);
+          } catch (error) {
+            if (!(error instanceof GateInputDeliveryError)) throw error;
+            this.policyControlGuard(flight);
+            throw new PolicyResumeRejected();
+          }
+          this.policyControlGuard(flight);
+        }
         // Issue #3149: the history dedup (isLiveFollowUpId) reads steering.isLiveDeliveryId when the
         // first implement prompt is composed. A legacy consumed-but-unapplied follow-up is in the
         // GET /follow-ups snapshot AND replayed live by the steering's first GET /inputs, which
@@ -13620,6 +13832,11 @@ export class RunRunner {
         const codeSummary = await ctx.codeCrossCheckSummary?.();
         if (codeSummary) result.codeCrossCheckSummary = codeSummary;
       } catch (value) {
+        if (this.admitPolicyHold(claim, value, flight.policyHoldSupported === true)) {
+          flight.policyHoldIntent = value;
+          flight.preserveRecoveryClone = true;
+          flight.preserveSession = true;
+        }
         executionRejection.rejected = true;
         executionRejection.value = value;
         throw value;
@@ -19165,6 +19382,162 @@ export class RunRunner {
    * captureHoldContext runs the credentialed publish under its own withCodexBoundaryOnly (harness-
    * aware), the SAME reuse the completion hold relies on.
    */
+  private policyHoldEligible(claim: ClaimResponse): boolean {
+    const kind = claim.kind;
+    return !!claim.secrets.codex && claim.interactive !== true &&
+      (kind === "issue" || kind === "task" || kind === "prompt" || kind === "self_improve");
+  }
+
+  private admitPolicyHold(claim: ClaimResponse, error: unknown, supported: boolean): error is PolicyResumeRejected | ProviderPolicyRefusal {
+    if (error instanceof PolicyResumeRejected) return claim.policy_hold_resume === true;
+    return this.policyHoldEligible(claim) && supported &&
+      error instanceof ProviderPolicyRefusal && error.policyRefusal.origin === "root";
+  }
+
+  private policyControlGuard(flight: RunFlight): void {
+    if (flight.steering.isCancelled()) throw new Error("run cancelled");
+    if (flight.steering.claimFence()) throw new StaleClaimError();
+    if (flight.active?.shuttingDown) flight.cancel.signal.throwIfAborted();
+  }
+
+  /** Authenticated reconciliation precedes resume and executor entry. No physical retirement:
+   * retained sources need the separate fresh custody proof. */
+  private async reconcileClaimPolicies(flight: RunFlight): Promise<boolean> {
+    const outbox = this.outbox;
+    if (!outbox?.hasPendingPolicy(flight.runId)) return false;
+    flight.policyReconciliationPending = true;
+    flight.preserveRecoveryClone = true;
+    flight.preserveSession = true;
+    const records = outbox.listPendingPolicies(flight.runId);
+    for (const record of records) {
+      this.policyControlGuard(flight);
+      const source = record.outcome.source_generation;
+      let observation = await outbox.readPolicyForRetirement(flight.runId, source);
+      if (!observation) { await flight.batcher.close().catch(() => undefined); return true; }
+      if (observation.policy.server_settled && observation.request.claim_generation === flight.claimGeneration) continue;
+      const binding = await outbox.bindPolicyDelivery(flight.runId, source, flight.claimGeneration, observation.context.expectedIdentity!);
+      if (!binding.bound) { await flight.batcher.close().catch(() => undefined); return true; }
+      observation = await outbox.readPolicyForRetirement(flight.runId, source);
+      if (!observation) { await flight.batcher.close().catch(() => undefined); return true; }
+      const result = await resolvePendingPolicy({ outbox, client: this.client, log: flight.runLog },
+        { runId: flight.runId, sourceGeneration: source });
+      this.policyControlGuard(flight);
+      if (result.kind === "observed") {
+        if (result.ack.disposition === "already_applied" || result.ack.disposition === "resolved_newer_policy") continue;
+        if (result.ack.disposition === "applied") {
+          flight.parked = true;
+          flight.holdOrWallParkConfirmed = true;
+          await this.retireFinalizeRecord(flight, "policy_hold");
+        }
+      }
+      await flight.batcher.close().catch(() => undefined);
+      return true;
+    }
+    // ACKs settle only their own records. Reauthenticate the complete run inventory,
+    // including siblings introduced during delivery or skipped by a cached settlement.
+    this.policyControlGuard(flight);
+    await outbox.refreshPolicyInventory(flight.cancel.signal, flight.runId);
+    this.policyControlGuard(flight);
+    if (!records.length || outbox.hasUnresolvedPolicy(flight.runId)) {
+      flight.runLog.warn("policy evidence unavailable; claim blocked pending reconciliation");
+      // Unknown evidence cannot form a wire outcome. Retain active ownership and source/session
+      // custody indefinitely with delayed retries; Cancel/shutdown/fencing ends this wait.
+      for (;;) {
+        this.policyControlGuard(flight);
+        await this.waitRecoveryRetry(flight, true, Math.max(250, this.recoveryRetryMs));
+      }
+    }
+    flight.policyReconciliationPending = false;
+    return false;
+  }
+
+  /** Capture is bounded by the existing hold attempts and boundary deadlines. Delivery only
+   * follows durable admission; disk failure keeps active ownership with delayed retries. */
+  private async enterPolicyHold(
+    claim: ClaimResponse, flight: RunFlight, error: PolicyResumeRejected | ProviderPolicyRefusal,
+  ): Promise<boolean> {
+    flight.preserveRecoveryClone = true;
+    flight.preserveSession = true;
+    this.policyControlGuard(flight);
+    let captured: { verified: boolean; head: string | null; published: boolean } | undefined;
+    let quiescent = false;
+    try {
+      await flight.executor.closeAndSettlePlanSummary?.(this.codexBoundaryDeadlineMs);
+      flight.executor.killAgentTree?.();
+      this.policyControlGuard(flight);
+      const proof = await this.quiesceRun(flight, flight.executor, { mode: "own", site: "wall_park" });
+      quiescent = !proof.blocked;
+      for (let attempt = 0; quiescent && attempt < COMPLETION_HOLD_CAPTURE_ATTEMPTS; attempt++) {
+        this.policyControlGuard(flight);
+        try {
+          const result = await this.captureHoldContext(claim, flight, flight.runLog);
+          if (result.residueBlocked) { quiescent = false; break; }
+          if (result.verified) { captured = result; break; }
+        } catch {
+          this.policyControlGuard(flight);
+          flight.runLog.warn("policy hold capture failed; retaining local evidence");
+        }
+        if (attempt + 1 < COMPLETION_HOLD_CAPTURE_ATTEMPTS) await this.waitRecoveryRetry(flight);
+      }
+    } catch {
+      this.policyControlGuard(flight);
+      flight.runLog.warn("policy hold cleanup failed; retaining local evidence");
+    }
+    this.policyControlGuard(flight);
+    const head = captured?.verified ? captured.head : null;
+    await this.pinRecoveryGeneration(claim, flight, head).catch(() => {
+      flight.runLog.warn("policy hold generation pin failed; retaining local evidence");
+    });
+    // plan_revising and usage must reach the server before the policy transition.
+    await flight.batcher.flush().catch(() => {
+      flight.runLog.warn("policy hold message flush failed; retaining journal");
+    });
+    const payload = error instanceof ProviderPolicyRefusal ? error.policyRefusal : undefined;
+    const sessionId = flight.observedSessionId ?? claim.session_id;
+    const outcome = flight.policyHoldOutcome ??= Object.freeze({
+      outcome_id: randomUUID(), source_generation: flight.claimGeneration,
+      detail: payload ? "refused" : "resume_rejected",
+      ...(payload ? { tag: payload.policy_tag, phase: payload.phase, correlation_id: payload.correlation_id } : {}),
+      ...(sessionId ? { session_id: sessionId } : {}),
+      head: head ?? "", published: !!head && captured?.published === true,
+      ...(head && captured?.published ? { checkpoint_contains_latest: true } : {}),
+      ...(flight.lastPersistedGateRevision ? { expected_gate_revision: flight.lastPersistedGateRevision } : {}),
+    });
+    let retries = 0;
+    for (;;) {
+      this.policyControlGuard(flight);
+      const journal = await this.outbox?.journalPolicy(flight.runId, outcome);
+      if (journal?.journaled) break;
+      flight.runLog.warn("policy hold journal unavailable; active claim blocked");
+      // Unlimited disk recovery opportunity, bounded attempts and capped backoff; no send/model.
+      await this.waitRecoveryRetry(flight, true, Math.min(30000, Math.max(250, this.recoveryRetryMs) * 2 ** Math.min(retries++, 6)));
+    }
+    const outbox = this.outbox!;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      this.policyControlGuard(flight);
+      const result = await resolvePendingPolicy({ outbox, client: this.client, log: flight.runLog },
+        { runId: flight.runId, sourceGeneration: outcome.source_generation });
+      this.policyControlGuard(flight);
+      if (result.kind === "unsupported") return false;
+      if (result.kind === "observed" && result.ack.disposition !== "pending" &&
+          result.ack.disposition !== "unauthenticated_historical_outcome") {
+        if (result.ack.disposition === "applied") {
+          flight.parked = true;
+          flight.holdOrWallParkConfirmed = true;
+        }
+        await this.retireFinalizeRecord(flight, "policy_hold");
+        if (result.ack.disposition === "applied" && quiescent && head && claim.inventory_guarded === true)
+          await this.settleGuardedInventory(claim, flight, undefined, undefined, undefined, true).catch(() => {
+            flight.runLog.warn("policy hold inventory settlement failed; retaining custody");
+          });
+        break;
+      }
+      if (attempt === 0) await this.waitRecoveryRetry(flight);
+    }
+    await flight.batcher.close().catch(() => undefined);
+    return true;
+  }
+
   private async enterWallPark(
     flight: RunFlight,
     claim: ClaimResponse,

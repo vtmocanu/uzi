@@ -1,4 +1,17 @@
 {
+  "policy_refusal": {
+    "count": 1,
+    "last_tag": "x",
+    "last_phase": "x",
+    "last_correlation_id": "x",
+    "last_refused_at": "2020-01-02T03:04:05Z",
+    "detail": "x",
+    "provenance": "x",
+    "published": true,
+    "action_if_match": "x",
+    "can_resume": true,
+    "can_cancel": true
+  },
   "worker_recovery": {
     "episode": 1,
     "automatic_requeue_limit": 1,

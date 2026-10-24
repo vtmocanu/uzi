@@ -25,10 +25,11 @@ const (
 	ReceiptSwitchPending = "switch_pending"
 	ReceiptReleased      = "released"
 	ReceiptStale         = "stale"
+	ReceiptSettledByStop = "superseded_by_stop"
 )
 
 // InputReceiptConflictError is ErrInputReceiptConflict with the claim's inactive
-// reason, empty when the claim is active and the rows themselves conflict.
+// reason or ReceiptSettledByStop. Other row conflicts may have an empty reason.
 type InputReceiptConflictError struct{ Reason string }
 
 func (e *InputReceiptConflictError) Error() string { return ErrInputReceiptConflict.Error() }
@@ -132,6 +133,19 @@ func (s *Service) inputReceipt(ctx context.Context, wkr store.Worker, runID uuid
 	if len(rows) != len(ids) {
 		return InputReceiptResult{}, ErrInputReceiptInvalid
 	}
+	// Preflight the entire batch before transferring receipts or returning bodies.
+	// The run lock serializes this read with confirmed Stop settlement.
+	if slices.ContainsFunc(rows, func(row store.ListInputReceiptRowsRow) bool { return row.SettledAt.Valid }) {
+		return InputReceiptResult{}, &InputReceiptConflictError{Reason: ReceiptSettledByStop}
+	}
+	// Accepted policy Stop makes pending approvals inert. Preflight every ID before
+	// returning bodies or stamping siblings. Preserve an exact APPLIED retry of
+	// independently applied history; the ordinary receipt checks still fence it.
+	if !discarded && len(run.PolicyStopResolution) != 0 &&
+		slices.ContainsFunc(rows, func(row store.ListInputReceiptRowsRow) bool { return row.Kind == "approve_plan" }) &&
+		!(applied && !slices.ContainsFunc(rows, func(row store.ListInputReceiptRowsRow) bool { return !row.AppliedAt.Valid })) {
+		return InputReceiptResult{}, &InputReceiptConflictError{Reason: dispositionSuperseded}
+	}
 	// Issue #1604: only an approve_plan can be discarded. Every other kind is either acted on
 	// (APPLIED) or replayed to the next claim; settling it without acting would drop it.
 	if discarded && slices.ContainsFunc(rows, func(row store.ListInputReceiptRowsRow) bool { return row.Kind != "approve_plan" }) {
@@ -218,6 +232,21 @@ func (s *Service) inputReceipt(ctx context.Context, wkr store.Worker, runID uuid
 		}
 		out = append(out, inputDTO(row.ID, row.Kind, row.Body, row.CreatedAt, row.GateBinding, row.GateRevision))
 	}
+	var acceptance *store.AcceptPolicyRevisionSourceParams
+	unapplied := int64(0)
+	if applied {
+		for _, row := range rows {
+			if !row.AppliedAt.Valid {
+				unapplied++
+			}
+		}
+		if active {
+			acceptance, err = preparePolicyRevisionAcceptance(ctx, tx, wkr, runID, generation, rows)
+			if err != nil {
+				return InputReceiptResult{}, err
+			}
+		}
+	}
 	if len(toAck) > 0 {
 		stamped, err := q.AckRunInputRows(ctx, store.AckRunInputRowsParams{RunID: runID, Ids: toAck, ClaimGeneration: pgtype.Int8{Int64: generation, Valid: true}, WorkerID: pgconv.UUID(wkr.ID),
 			InclusionReported: slices.Contains(wkr.ProtocolCapabilities, capability.InputInclusionV1)})
@@ -238,9 +267,21 @@ func (s *Service) inputReceipt(ctx context.Context, wkr store.Worker, runID uuid
 		}
 	}
 	if applied {
-		_, err = q.ApplyRunInputRows(ctx, store.ApplyRunInputRowsParams{RunID: runID, Ids: ids, ClaimGeneration: pgtype.Int8{Int64: generation, Valid: true}, WorkerID: pgconv.UUID(wkr.ID)})
+		stamped, err := q.ApplyRunInputRows(ctx, store.ApplyRunInputRowsParams{RunID: runID, Ids: ids, ClaimGeneration: pgtype.Int8{Int64: generation, Valid: true}, WorkerID: pgconv.UUID(wkr.ID)})
 		if err != nil {
 			return InputReceiptResult{}, err
+		}
+		if acceptance != nil {
+			if stamped != unapplied {
+				return InputReceiptResult{}, fmt.Errorf("input apply changed concurrently")
+			}
+			accepted, err := q.AcceptPolicyRevisionSource(ctx, *acceptance)
+			if err != nil {
+				return InputReceiptResult{}, err
+			}
+			if accepted != 1 {
+				return InputReceiptResult{}, fmt.Errorf("policy revision acceptance changed concurrently")
+			}
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -312,6 +353,13 @@ func (s *Service) IncludeInputs(ctx context.Context, wkr store.Worker, runID uui
 	}
 	if reconciled && (generation <= 0 || run.ClaimReleasedAt.Valid) {
 		return InputReceiptResult{Inputs: []InputDTO{}, Active: false, Reason: ReceiptStale}, nil
+	}
+	rows, err := q.ListInputReceiptRows(ctx, store.ListInputReceiptRowsParams{RunID: runID, Ids: ids})
+	if err != nil {
+		return InputReceiptResult{}, err
+	}
+	if slices.ContainsFunc(rows, func(row store.ListInputReceiptRowsRow) bool { return row.SettledAt.Valid }) {
+		return InputReceiptResult{}, &InputReceiptConflictError{Reason: ReceiptSettledByStop}
 	}
 	stamped, err := q.IncludeRunInputRows(ctx, store.IncludeRunInputRowsParams{RunID: runID, Ids: ids})
 	if err != nil {

@@ -115,12 +115,13 @@ const statusPaused = "paused"
 // stays on the worker. Resume and extend are refused: the owner recovers or exports the work, or
 // starts a successor run.
 const (
-	holdProviderUnavailable = "provider_unavailable"
-	providerOutageCause     = "provider_outage"
-	holdBudgetExhausted     = "budget_exhausted"
-	holdCompletionBlocked   = "completion_blocked"
-	holdCredentialDisabled  = "credential_disabled" //nolint:gosec // G101: a run hold-reason VOCABULARY value (the server enum), not a credential.
-	holdBaseAttestation     = "base_attestation_missing"
+	holdProviderPolicyRefusal = "provider_policy_refusal"
+	holdProviderUnavailable   = "provider_unavailable"
+	providerOutageCause       = "provider_outage"
+	holdBudgetExhausted       = "budget_exhausted"
+	holdCompletionBlocked     = "completion_blocked"
+	holdCredentialDisabled    = "credential_disabled" //nolint:gosec // G101: a run hold-reason VOCABULARY value (the server enum), not a credential.
+	holdBaseAttestation       = "base_attestation_missing"
 )
 
 // logsPollInterval is how often `uzi run logs --follow` re-polls
@@ -478,15 +479,22 @@ func gateRevisionMismatchError(runID string, expected *int64, current int64) err
 // cancel/reject applied without a live worker) is surfaced so the caller knows the
 // action took effect immediately rather than being queued. expectedGateRevision binds a
 // plan-gate verdict to a gate revision (PRD #1795 D5; nil for every other kind).
-func submitInput(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runID, kind, body string, sel *apitypes.AgentSelection, discardPendingOutcome bool, expectedGateRevision *int64) error {
-	return submitBoundInput(env, gf, c, cmd, runID, kind, body, sel, discardPendingOutcome, expectedGateRevision, nil)
+func submitInput(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runID, kind, body string, sel *apitypes.AgentSelection, discardPendingOutcome bool, expectedGateRevision *int64, actionIfMatch ...string) error {
+	return submitBoundInput(env, gf, c, cmd, runID, kind, body, sel, discardPendingOutcome, expectedGateRevision, nil, actionIfMatch...)
 }
 
-func submitBoundInput(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runID, kind, body string, sel *apitypes.AgentSelection, discardPendingOutcome bool, expectedGateRevision *int64, approval *apitypes.SemanticGateApproval) error {
+func submitBoundInput(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runID, kind, body string, sel *apitypes.AgentSelection, discardPendingOutcome bool, expectedGateRevision *int64, approval *apitypes.SemanticGateApproval, actionIfMatch ...string) error {
 	var res apitypes.RunInputResponse
 	var err error
-	if approval != nil {
-		res, err = c.SubmitRunInputWithOptions(cmd.Context(), runID, apitypes.RunInputRequest{Kind: kind, Body: body, Selection: sel, ExpectedGateRevision: expectedGateRevision, SemanticApproval: approval})
+	token := ""
+	if len(actionIfMatch) > 0 {
+		token = actionIfMatch[0]
+	}
+	if approval != nil || token != "" {
+		res, err = c.SubmitRunInputWithOptions(cmd.Context(), runID, uzicli.RunInputOptions{
+			Kind: kind, Body: body, Selection: sel, DiscardPendingOutcome: discardPendingOutcome,
+			ExpectedGateRevision: expectedGateRevision, SemanticApproval: approval, ActionIfMatch: token,
+		})
 	} else {
 		res, err = c.SubmitRunInput(cmd.Context(), runID, kind, body, sel, discardPendingOutcome, expectedGateRevision)
 	}

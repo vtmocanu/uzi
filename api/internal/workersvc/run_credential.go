@@ -75,10 +75,10 @@ type SetRunCredentialResult struct {
 // validates the requested override through the ONE validator (typed 404/409/422/400), then
 // dispatches on the run's CURRENT status:
 //
-//   - queued / limit_wait / pool_wait / recovery_wait / paused: write the override columns
-//     FIRST (idempotent), then the state-specific transition (an early promote for a parked
-//     run; nothing more for queued). A 0-row promote (a raced claim/cancel) is
-//     ErrCredentialSwitchRaced → 409.
+//   - queued / limit_wait / pool_wait / recovery_wait / paused: save the override and perform
+//     the state-specific transition (an early promote for a parked run; nothing more for queued).
+//     Paused override/resume changes commit together when transactional. A settling hold returns
+//     ErrRunHoldSettling; other 0-row promotions return ErrCredentialSwitchRaced → 409.
 //   - awaiting_approval / awaiting_input / awaiting_followup / running: a worker holds the
 //     session, so this is the HELD-STATE switch (PRD #1247 M5, D4/D14). If the holding worker
 //     advertises the credential_switch capability, the override columns AND the switch stamp are
@@ -90,7 +90,7 @@ type SetRunCredentialResult struct {
 // It returns the re-read run plus the D6 warning. Validation runs BEFORE the status
 // dispatch, so an invalid override on any run (held or terminal included) is refused with
 // the validator's error and nothing is written — the validator itself performs no write.
-func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID, mode string, secretID *uuid.UUID) (SetRunCredentialResult, error) {
+func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID, mode string, secretID *uuid.UUID, presentedToken ...string) (SetRunCredentialResult, error) {
 	run, err := s.q.GetRunByIDForUser(ctx, store.GetRunByIDForUserParams{ID: runID, UserID: userID})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -124,6 +124,19 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 	}
 	switch run.Status {
 	case "paused":
+		if s.txBeginner != nil && (PolicyOwnerConstrained(run) || run.HoldReason.String != "credential_disabled") {
+			token := ""
+			if len(presentedToken) > 0 {
+				token = presentedToken[0]
+			}
+			if err := s.setPausedCredential(ctx, run, resolved, token); err != nil {
+				return SetRunCredentialResult{}, err
+			}
+			break
+		}
+		if PolicyOwnerConstrained(run) {
+			return SetRunCredentialResult{}, ErrCredentialSwitchRaced
+		}
 		if run.HoldReason.Valid && run.HoldReason.String == "credential_disabled" {
 			// PRD #1732 D2/D14: the reassignment writes the override and leaves the hold in
 			// the promoter's lock order, so it and a concurrent promotion serialize: exactly
@@ -381,11 +394,76 @@ func (s *Service) setCredentialAndPromote(ctx context.Context, observed store.Ru
 	return nil
 }
 
-// resumePausedForCredential is the paused arm of `uzi run set-token`: it resumes any paused run
-// the way the owner's resume does (PRD #1497 M1), with AllowCompletionBlockedHold so a completion
-// hold still resumes here as before. A budget_exhausted wall park with no remaining budget is
-// refused by the budget guard (0 rows -> ErrCredentialSwitchRaced); the owner extends such a run
-// rather than set-token-ing it. A provider hold's streak is cleared by ResumePausedRun itself.
+// setPausedCredential holds the existing secret mutation lock before the run lock.
+// The override and resume commit together; an observed hold change refuses both.
+func (s *Service) setPausedCredential(ctx context.Context, observed store.Run, resolved *CredentialOverride, token string) error {
+	if s.beforeCredentialSwitchTx != nil {
+		s.beforeCredentialSwitchTx()
+	}
+	return s.withSecretMutation(ctx, observed.UserID, func(sq secretMutationQueries) error {
+		q, ok := sq.(*store.Queries)
+		if !ok {
+			return ErrCredentialSwitchRaced
+		}
+		current, err := q.GetRunByIDForUpdate(ctx, observed.ID)
+		if err != nil {
+			return err
+		}
+		if current.UserID != observed.UserID || current.Status != "paused" ||
+			current.HoldReason != observed.HoldReason || current.ClaimGeneration != observed.ClaimGeneration ||
+			current.PolicyLastOutcomeID != observed.PolicyLastOutcomeID ||
+			!current.StatusSince.Time.Equal(observed.StatusSince.Time) {
+			return ErrCredentialSwitchRaced
+		}
+		if err := lockPinnedOverrideEnabled(ctx, q, current.UserID, resolved, ErrCredentialOverrideSecretNotFound); err != nil {
+			return err
+		}
+		if PolicyOwnerConstrained(current) {
+			if _, err := s.resumePolicyHoldLocked(ctx, q, current, token, PolicyResumeRequest{Mode: "preserve"}); err != nil {
+				return err
+			}
+		} else {
+			staleCutoff := s.staleWorkerCutoff()
+			if _, err := q.ResumePausedRun(ctx, store.ResumePausedRunParams{
+				ID: current.ID, UserID: current.UserID, AllowCompletionBlockedHold: true,
+				GlobalTimeoutSeconds: int32(s.p.RunTimeout.Seconds()),
+				StaleCutoff:          staleCutoff,
+			}); err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					settling, fenceErr := q.CredentialSwitchHoldSettling(ctx, store.CredentialSwitchHoldSettlingParams{
+						RunID: current.ID, StaleCutoff: staleCutoff,
+					})
+					if fenceErr != nil {
+						return fmt.Errorf("set run credential: read hold fence: %w", fenceErr)
+					}
+					if settling {
+						return ErrRunHoldSettling
+					}
+					return ErrCredentialSwitchRaced
+				}
+				return err
+			}
+			if _, err := q.CreateRunInput(ctx, store.CreateRunInputParams{RunID: current.ID, Kind: "resume"}); err != nil {
+				return err
+			}
+		}
+		rows, err := q.SetRunCredentialOverride(ctx, store.SetRunCredentialOverrideParams{
+			Mode: pgOverrideMode(resolved), SecretID: pgOverrideSecretID(resolved), ID: current.ID, UserID: current.UserID,
+		})
+		if err != nil {
+			return err
+		}
+		if rows != 1 {
+			return ErrCredentialSwitchRaced
+		}
+		return nil
+	})
+}
+
+// resumePausedForCredential is the ordinary paused arm of `uzi run set-token`. It uses the
+// owner's ResumePausedRun bookkeeping with AllowCompletionBlockedHold. A spent wall budget
+// refuses the resume; the owner extends it rather than set-token-ing it. ResumePausedRun
+// clears a provider hold's streak itself.
 func (s *Service) resumePausedForCredential(ctx context.Context, userID, runID uuid.UUID) error {
 	if _, err := s.q.ResumePausedRun(ctx, store.ResumePausedRunParams{
 		ID:                         runID,

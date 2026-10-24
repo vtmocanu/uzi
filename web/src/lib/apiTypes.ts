@@ -2571,6 +2571,8 @@ export interface Worker {
   // api-contract parity check pins the null/value shape against the recorded fixtures.
   outbox_pending_messages?: number | null;
   outbox_pending_terminal?: number | null;
+  // Retained policy outcomes, including acknowledged custody evidence; not message backlog.
+  outbox_pending_policy?: number | null;
   outbox_stale_retired?: number | null;
   outbox_blocked?: string | null;
   // The worker's own self-reported run id for the oldest blocked outcome (the entry
@@ -2770,6 +2772,144 @@ export interface Milestone {
   title: string;
 }
 
+// Policy Stop reviews bind the exact feedback and execution scope presented to the owner.
+// Positive int64 IDs and generations remain decimal strings, including above 2^53.
+export type PolicyRevisionRef =
+  | { source: "run_user_input"; input_id: string }
+  | { source: "plan_cross_check"; cross_check_id: string };
+
+export interface PolicyStopGateContext {
+  revision: string;
+  presentation_id: string;
+  payload_digest: string;
+}
+
+export interface PolicyRevisionSourceV1 {
+  version: 1;
+  gate: PolicyStopGateContext | null;
+  primary_revision: PolicyRevisionRef | null;
+  associated_cross_checks: { source: "plan_cross_check"; cross_check_id: string }[] | null;
+}
+
+export interface PolicyStopGatePayload {
+  revise_count: number | null;
+  checkpoint_witness: { source_head: string; published_checkpoint: string } | null;
+  witness_worker_id: string | null;
+  witness_claim_generation: string | null;
+  plan_md: string | null;
+  milestones: unknown;
+  required_capabilities: string[] | null;
+  required_tools: string[] | null;
+  size_class: string | null;
+}
+
+export interface PolicyStopExecution {
+  contract_version: number | null;
+  contract_revision: string | null;
+  contract: unknown;
+  frozen: Milestone[] | null;
+  completed_ids: string[] | null;
+  current_ceiling: number | null;
+  proposed_ceiling: number;
+}
+
+export interface PolicyStopHumanFeedback {
+  input_id: string;
+  body: string | null;
+  created_at: string | null;
+  gate_binding: string | null;
+  gate_revision: string | null;
+  consumed_at: string | null;
+  consumed_claim_generation: string | null;
+  consumed_worker_id: string | null;
+  applied_at: string | null;
+  included_at: string | null;
+  inclusion_reported: boolean;
+  disposition: string | null;
+  settled_at: string | null;
+  superseded_by_stop_input_id: string | null;
+}
+
+export interface PolicyStopCrossCheckCandidate {
+  plan_md: string | null;
+  milestones: unknown;
+  required_capabilities: string[] | null;
+  required_tools: string[] | null;
+  size_class: string | null;
+  base_commit: string | null;
+  planning_diff: string | null;
+}
+
+export interface PolicyStopCrossCheckFeedback {
+  cross_check_id: string;
+  lead_run_id: string;
+  stage: string;
+  round: number;
+  candidate_generation: string;
+  candidate_digest: string;
+  candidate: PolicyStopCrossCheckCandidate;
+  verdict: string;
+  supersede: boolean;
+  reason_class: string | null;
+  findings: unknown;
+  created_at: string | null;
+  decided_at: string | null;
+  deadline_at: string | null;
+  interrupted_at: string | null;
+  finalized_at: string | null;
+  automatic_revision_limit: number;
+  automatic_rounds_enabled: boolean;
+  checker_run_id: string | null;
+  checker_harness: string | null;
+  checker_model: string | null;
+  checker_effort: string | null;
+  checker_model_source: string | null;
+  checker_effort_source: string | null;
+  revision_disposition: string | null;
+  revision_settled_at: string | null;
+  revision_superseded_by_stop_input_id: string | null;
+}
+
+export interface PolicyStopManifest {
+  candidate_cross_check_id: string | null;
+  version: 1;
+  run_id: string;
+  outcome_id: string;
+  source_generation: string;
+  review_generation: string;
+  source_context: PolicyRevisionSourceV1;
+  hold: { reason: string | null; policy_detail: string | null; since: string };
+  gate: (PolicyStopGateContext & { payload: PolicyStopGatePayload }) | null;
+  execution: PolicyStopExecution;
+  human_feedback: PolicyStopHumanFeedback[] | null;
+  cross_check_feedback: PolicyStopCrossCheckFeedback[] | null;
+}
+
+export interface PolicyStopReview {
+  manifest: PolicyStopManifest;
+  stop_if_match: string;
+}
+
+export interface PolicyStopReceipt {
+  disposition: "accepted" | "already_accepted";
+  resolution_id: string;
+  scope_input_id: string;
+  scope_ceiling: number;
+  accepted_at: string;
+  review_generation: string;
+  superseded_revisions: PolicyRevisionRef[] | null;
+}
+
+export interface RunInputResponse {
+  server_side: boolean;
+  id?: number;
+  created_at?: string;
+  extension_seconds?: number;
+  deadline_at?: string;
+  resumed?: boolean;
+  policy_stop?: PolicyStopReceipt;
+}
+
 // MilestoneAgent is one entry of a run's per-in-progress-milestone agent attribution
 // (PRD #1224): the milestone id, the acting agent's validated kebab-case identifier
 // (byte-exact so it matches current_activity.agent for the live-enrichment join), and an
@@ -2954,6 +3094,7 @@ export interface SemanticDriftDTO {
 }
 
 export interface Run {
+  policy_refusal?: PolicyRefusal;
   completion_pending?: CompletionPendingDTO;
   semantic_gate?: import("./semanticGate").SemanticGateDTO;
   semantic_drift?: SemanticDriftDTO;
@@ -5221,4 +5362,18 @@ export interface MilestoneResetOptions {
     expected_completion_revision: number | null;
   };
   expected_reset_state_digest: string;
+}
+
+export interface PolicyRefusal {
+ count: number;
+ last_tag: "cyberPolicy" | "misalignmentPolicyViolation" | null;
+ last_phase: "planning" | "implementation" | null;
+ last_correlation_id: string | null;
+ last_refused_at: string | null;
+ detail: "refused" | "resume_rejected" | null;
+ provenance: "verified" | "unverified" | null;
+ published: boolean | null;
+ action_if_match: string;
+ can_resume: boolean;
+ can_cancel: boolean;
 }

@@ -57,7 +57,9 @@ import {
 } from "../src/codex/codex-executor.js";
 import { WorkerClient, RequestError, CodexRequestFailure } from "../src/client.js";
 import { ProviderPolicyRefusal } from "../src/provider-policy-refusal.js";
+
 import { RunRunner } from "../src/runner.js";
+import { Outbox } from "../src/outbox.js";
 import { resolveRunKind } from "../src/run-kind.js";
 import { GitCache, assertCaptureLaunch } from "../src/git.js";
 import { FakeApi } from "./fake-api.js";
@@ -485,6 +487,338 @@ function tokenUsageUpdated(
     params: { threadId, turnId, tokenUsage: usage },
   };
 }
+
+describe("M1 policy hold executor transport (#3068)", () => {
+  async function boundedRun(bodies: string[]) {
+    const ch = new SteeringChannel(withReceipts({ getInputs: async () => ({ inputs: [] }) } as never),
+      "run-1", 1, noopLog, new AbortController());
+    ch.requeueUnincludedFollowUps(bodies.map((body, i) => ({ id: i + 1, kind: "follow_up", body, inclusion_reported: true })));
+    const included: number[] = [];
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        c.transport.push(signalDone()).push(turnCompleted());
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    try {
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx({
+        sessionId: "th-1", policyHoldSupported: true, policyHoldResume: true,
+        pullFollowUp: selection => ch.pullFollowUp(selection), followUpIncluded: id => included.push(id),
+      }).ctx), 3000, "UTF8 bounded guidance");
+      const text = (rig.transport.requests.find(r => r.method === "turn/start")!.params as { input: { text: string }[] }).input[0]!.text;
+      return { addition: text.slice(text.indexOf("\nPolicy resume guidance from the worker:"), text.lastIndexOf(FOLLOW_UP_TRAILER) + FOLLOW_UP_TRAILER.length), included };
+    } catch (error) {
+      assert.equal(rig.transport.turnStartCount, 0, "oversized guidance rejects before model turn");
+      assert.deepEqual(included, [], "no receipt for rejected guidance");
+      throw error;
+    } finally { await ch.stop(); }
+  }
+
+  it("enforces the exact rendered UTF8 limit including frames, fences, separators and trailer", async () => {
+    const small = await boundedRun(["x"]);
+    const bodyBytes = 65536 - Buffer.byteLength(small.addition, "utf8") + 1;
+    const body = "é".repeat(Math.floor(bodyBytes / 2)) + (bodyBytes % 2 ? "x" : "");
+    const exact = await boundedRun([body]);
+    assert.equal(Buffer.byteLength(exact.addition, "utf8"), 65536);
+    assert.deepEqual(exact.included, [1]);
+    const twoSmall = await boundedRun(["x", "y"]);
+    const older = "界".repeat(5000);
+    const currentBytes = 65536 - Buffer.byteLength(twoSmall.addition, "utf8") + 2 - Buffer.byteLength(older, "utf8");
+    const current = "é".repeat(Math.floor(currentBytes / 2)) + (currentBytes % 2 ? "z" : "");
+    const twoExact = await boundedRun([older, current]);
+    assert.equal(Buffer.byteLength(twoExact.addition, "utf8"), 65536);
+    assert.deepEqual(twoExact.included, [1, 2]);
+    await assert.rejects(boundedRun([body + "x"]), (err: Error) => err.name === "PolicyResumeRejected");
+    await assert.rejects(boundedRun(["界".repeat(24000), "only inspect"]),
+      (err: Error) => err.name === "PolicyResumeRejected");
+  });
+
+  it("retains one non-fitting historical candidate and rejects its next delivery without draining siblings", async () => {
+    const ch = new SteeringChannel(withReceipts({ getInputs: async () => ({ inputs: [] }) } as never),
+      "run-1", 1, noopLog, new AbortController());
+    ch.requeueUnincludedFollowUps([
+      { id: 1, kind: "follow_up", body: "OLD:" + "a".repeat(33000), inclusion_reported: true },
+      { id: 2, kind: "follow_up", body: "still queued", inclusion_reported: true },
+      { id: 3, kind: "follow_up", body: "CURRENT:" + "b".repeat(33000), inclusion_reported: true },
+    ]);
+    const included: number[] = [];
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        c.transport.push(agentMessage("processed current")).push(turnCompleted());
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    try {
+      await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx({
+        sessionId: "th-1", policyHoldSupported: true, policyHoldResume: true,
+        pullFollowUp: selection => ch.pullFollowUp(selection), followUpIncluded: id => included.push(id),
+      }).ctx), 3000, "one deferred candidate"), (err: Error) => err.name === "PolicyResumeRejected");
+      assert.equal(rig.transport.turnStartCount, 1);
+      assert.deepEqual(included, [3]);
+      assert.equal(ch.pullFollowUp()?.id, 2, "no second historical candidate was pulled");
+      const text = (rig.transport.requests.find(r => r.method === "turn/start")!.params as { input: { text: string }[] }).input[0]!.text;
+      assert.ok(text.includes("CURRENT:" + "b".repeat(33000)));
+      assert.ok(!text.includes("OLD:"), "no partial historical delivery");
+    } finally { await ch.stop(); }
+  });
+
+  it("retains narrowing across historical delivery and prioritizes a new owner update next boundary", async () => {
+    const ch = new SteeringChannel(withReceipts({ getInputs: async () => ({ inputs: [] }) } as never),
+      "run-1", 1, noopLog, new AbortController());
+    ch.requeueUnincludedFollowUps([
+      { id: 1, kind: "follow_up", body: "OLD-ONE restart every subsystem", inclusion_reported: true },
+      { id: 2, kind: "follow_up", body: "OLD-TWO change unrelated service", inclusion_reported: true },
+      { id: 3, kind: "follow_up", body: "NARROW-THREE parser inspection only", inclusion_reported: true },
+    ]);
+    const included: number[] = [];
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        const tn = `tn-${c.turnStartCount}`;
+        c.transport.push(agentMessage("processed", "th-1"));
+        if (c.turnStartCount === 3) c.transport.push(signalDone("th-1", tn));
+        c.transport.push(turnCompleted("completed", "th-1", tn));
+        return { turn: { id: tn } };
+      }
+      return {};
+    } });
+    try {
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx({
+        sessionId: "th-1", policyHoldSupported: true, policyHoldResume: true,
+        pullFollowUp: selection => ch.pullFollowUp(selection), followUpIncluded: id => {
+          included.push(id);
+          if (id === 2) ch.requeueUnincludedFollowUps([
+            { id: 4, kind: "follow_up", body: "NEW-FOUR read one parser file only", inclusion_reported: true },
+          ]);
+        },
+      }).ctx), 3000, "retained narrowing");
+      const texts = rig.transport.requests.filter(r => r.method === "turn/start")
+        .map(r => (r.params as { input: { text: string }[] }).input[0]!.text);
+      assert.equal(texts.length, 3);
+      assert.ok(texts[0]!.indexOf("OLD-ONE") < texts[0]!.indexOf("NARROW-THREE"));
+      assert.ok(texts[1]!.includes("OLD-TWO") && texts[1]!.includes("NARROW-THREE"));
+      assert.ok(texts[1]!.includes("never permits restarting work outside the current narrowing"));
+      assert.ok(texts[1]!.includes("highest priority over historical requests"));
+      assert.ok(texts[2]!.includes("NEW-FOUR"));
+      assert.ok(!texts[2]!.includes("NARROW-THREE"));
+      assert.deepEqual(included, [1, 3, 2, 4], "retained narrowing is never receipted twice");
+    } finally { await ch.stop(); }
+  });
+  it("bounds policy guidance with 4096 backlog rows and newest narrowing before model evidence", async () => {
+    const ch = new SteeringChannel(withReceipts({ getInputs: async () => ({ inputs: [] }) } as never),
+      "run-1", 1, noopLog, new AbortController());
+    ch.requeueUnincludedFollowUps([
+      ...Array.from({ length: 4096 }, (_, n) => ({ id: n + 1, kind: "follow_up" as const,
+        body: `HISTORICAL-${n + 1}:` + "x".repeat(4096), inclusion_reported: true })),
+      { id: 4097, kind: "follow_up", body: "LATEST-NARROWING: only inspect the parser", inclusion_reported: true },
+    ]);
+    const included: number[] = [];
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") return { turn: { id: "tn-1" } };
+      return {};
+    } });
+    const { ctx } = makeCtx({ sessionId: "th-1", policyHoldSupported: true, policyHoldResume: true,
+      pullFollowUp: selection => ch.pullFollowUp(selection), followUpIncluded: id => included.push(id) });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    try {
+      await waitFor(() => rig.transport.turnStartCount === 1, "bounded first root");
+      const text = (rig.transport.requests.find(r => r.method === "turn/start")!.params as { input: { text: string }[] }).input[0]!.text;
+      const start = text.indexOf("\nPolicy resume guidance from the worker:");
+      // Include every separator, nonce fence, trailer and worker frame in the measurement.
+      assert.ok(Buffer.byteLength(start < 0 ? text : text.slice(start, text.lastIndexOf(FOLLOW_UP_TRAILER) + FOLLOW_UP_TRAILER.length), "utf8") <= 65536);
+      assert.ok(text.includes("LATEST-NARROWING"));
+      assert.equal((text.match(/<follow_up_[0-9a-f]{16}>/g) ?? []).length / 2, 2);
+      assert.equal(ch.hasPendingFollowUpOutcome(), true);
+      assert.deepEqual(included, [], "turn initialization is not model evidence");
+      rig.transport.push(agentMessage("processed narrowing"));
+      await waitFor(() => included.length === 2, "actual model evidence");
+      assert.deepEqual(included, [1, 4097]);
+    } finally {
+      rig.transport.push(signalDone()).push(turnCompleted()).end();
+      await withTimeout(running, 3000, "bounded guidance cleanup");
+      await ch.stop();
+    }
+  });
+  for (const kind of [undefined, "ci_fix", "job", "chat", "judge", "mr_rework", "cross_check"] as const) {
+    it(`excludes unadmitted kind ${String(kind)} from refusal precedence`, async () => {
+      let mode: "wall" | null = null;
+      let interrupt: (() => void) | undefined;
+      let parks = 0;
+      const rig = makeRig();
+      rig.transport.push({ kind: "turn_completed", method: "turn/completed", threadId: "th-1", turnId: "tn-1", status: "failed",
+        params: { threadId: "th-1", turn: { id: "tn-1", status: "failed", error: { codexErrorInfo: "cyberPolicy" } } } }).end();
+      const { ctx } = makeCtx({ kind, policyHoldSupported: true,
+        onPauseNow: cb => { interrupt = cb; }, pauseModeRequested: () => mode,
+        parkForWall: async () => { parks++; return "parked"; } });
+      const emit = ctx.emit;
+      ctx.emit = message => {
+        emit(message);
+        if (message.payload.event === "provider_policy_refusal") { mode = "wall"; interrupt?.(); }
+      };
+      const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "M1 excluded kind");
+      assert.ok(result.walled);
+      assert.equal(parks, 1);
+      assert.equal(rig.transport.turnStartCount, 1);
+    });
+  }
+  it("excludes interactive issue roots from negotiated refusal precedence", async () => {
+    let mode: "wall" | null = null;
+    let parks = 0;
+    let interrupt: (() => void) | undefined;
+    const rig = makeRig();
+    rig.transport.push({ ...turnCompleted("failed"), params: { threadId: "th-1",
+      turn: { id: "tn-1", status: "failed", error: { codexErrorInfo: "cyberPolicy" } } } }).end();
+    const { ctx, emitted } = makeCtx({ kind: "issue", interactive: true, policyHoldSupported: true,
+      onPauseNow: cb => { interrupt = cb; }, pauseModeRequested: () => mode, parkForWall: async () => { parks++; return "parked"; } });
+    ctx.emit = message => { emitted.push(message); if (message.payload.event === "provider_policy_refusal") { mode = "wall"; interrupt?.(); } };
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "interactive exclusion");
+    assert.ok(result.walled);
+    assert.equal(parks, 1);
+    assert.equal(rig.transport.turnStartCount, 1);
+  });
+  for (const phase of ["plan", "implement"] as const) {
+    for (const mode of ["missing", "rejected", "substituted", "preserved", "unmarked"] as const) {
+      for (const fresh of [false, true]) it(`${phase} ${mode} resume authority fresh=${fresh}`, async () => {
+        const rig = makeRig({ responder: c => {
+          if (c.method === "thread/resume") {
+            if (mode === "rejected" || mode === "unmarked") throw new CodexTransportError({ category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)" });
+            return { thread: { id: mode === "substituted" ? "different" : "th-1" } };
+          }
+          if (c.method === "thread/start") return { thread: { id: "th-1" } };
+          if (c.method === "turn/start") {
+            if (phase === "plan") c.transport.push(toolCall(1, "submit_plan", { plan_md: "preserved plan" }, "th-1", "tn-1", "c-plan")).push(turnCompleted("completed"));
+            else c.transport.push(signalDone()).push(turnCompleted("completed"));
+            return { turn: { id: "tn-1" } };
+          }
+          return {};
+        } });
+        const { ctx, emitted } = makeCtx({ policyHoldSupported: true, policyHoldResume: mode !== "unmarked", policyHoldFreshSession: fresh,
+          sessionId: mode === "missing" ? undefined : "th-1", planApproved: phase !== "plan",
+          gatePlan: async () => { throw new Error("plan reached"); } });
+        const running = withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "M1 resume");
+        const lost = mode === "missing" || mode === "rejected" || mode === "substituted";
+        const blocked = !fresh && lost;
+        if (blocked) await assert.rejects(running, (err: Error) => err.name === "PolicyResumeRejected");
+        else if (phase === "plan") await assert.rejects(running, /plan reached/);
+        else await running;
+        assert.equal(rig.transport.requests.filter(r => r.method === "thread/start").length, mode === "unmarked" || fresh && lost ? 1 : 0);
+        assert.equal(rig.transport.turnStartCount, blocked ? 0 : 1);
+        assert.equal(emitted.filter(m => m.payload.event === "resume_lineage_break").length,
+          mode === "unmarked" || fresh && (mode === "rejected" || mode === "substituted") ? 1 : 0);
+      });
+    }
+    for (const tag of ["cyberPolicy", "misalignmentPolicyViolation"] as const) {
+      for (const kind of ["issue", "task", "prompt", "self_improve"] as const)
+      for (const control of ["none", "now", "wall", "cancel"] as const) it(`${kind} ${phase} ${tag} precedence ${control}`, async () => {
+        let interrupt: (() => void) | undefined;
+        let mode: "now" | "wall" | null = null;
+        let cancelled = false;
+        let parks = 0;
+        const rig = makeRig({ responder: c => {
+          if (c.method === "thread/start") return { thread: { id: "th-1" } };
+          if (c.method === "turn/start") {
+            c.transport.push({ kind: "turn_completed", method: "turn/completed", threadId: "th-1", turnId: "tn-1", status: "failed",
+              params: { threadId: "th-1", turn: { id: "tn-1", status: "failed", error: { codexErrorInfo: tag } } } });
+            return { turn: { id: "tn-1" } };
+          }
+          return {};
+        } });
+        const { ctx, emitted } = makeCtx({ kind, policyHoldSupported: true, planApproved: phase !== "plan",
+          gatePlan: async () => { throw new Error("unexpected gate"); },
+          onPauseNow: cb => { interrupt = cb; }, pauseModeRequested: () => mode, cancelRequested: () => cancelled,
+          parkForWall: async () => { parks++; return "parked"; }, parkForPause: async () => { parks++; return true; } });
+        const emit = ctx.emit;
+        ctx.emit = m => {
+          emit(m);
+          if (m.payload.event === "provider_policy_refusal") {
+            if (control === "cancel") cancelled = true;
+            if (control === "now" || control === "wall") { mode = control; interrupt?.(); }
+          }
+        };
+        await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "M1 precedence"), (err: Error) => {
+          if (control === "cancel") return /cancel/i.test(err.message) && !(err instanceof ProviderPolicyRefusal);
+          assert.ok(err instanceof ProviderPolicyRefusal, `got ${err.name}: ${err.message}`);
+          assert.equal(err.policyRefusal.policy_tag, tag);
+          assert.equal(err.policyRefusal.phase, phase === "plan" ? "planning" : "implementation");
+          return true;
+        });
+        assert.equal(parks, 0);
+        assert.equal(rig.transport.turnStartCount, 1);
+        assert.equal(emitted.filter(m => m.payload.event === "provider_policy_refusal").length, 1);
+      });
+    }
+  }
+  it("retains the constraint after a successful turn and epoch recreation", async () => {
+    const rig = makeMultiEpochRig([
+      resumedEpochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "checkpoint", {}, th, tn, "c-ckpt")).push(turnCompleted("completed", th, tn));
+      }),
+      c => {
+        if (c.method === "thread/resume") throw new CodexTransportError({
+          category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)",
+        });
+        return {};
+      },
+    ]);
+    const { ctx, emitted } = makeCtx({ sessionId: "th-1", policyHoldSupported: true, policyHoldResume: true,
+      checkpoint: async () => undefined });
+    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "M1 recreated epoch"),
+      (err: Error) => err.name === "PolicyResumeRejected");
+    assert.equal(rig.providerLaunches(), 2);
+    assert.equal(rig.epochs[0]!.transport.turnStartCount, 1);
+    assert.equal(rig.epochs[1]!.transport.turnStartCount, 0);
+    assert.equal(rig.epochs.flatMap(e => e.transport.requests).filter(r => r.method === "thread/start").length, 0);
+    assert.equal(emitted.filter(m => m.payload.event === "resume_lineage_break").length, 0);
+    assert.equal(ctx.policyHoldResume, true);
+  });
+  it("reports failed persistence and preserves the typed outcome with deferred registry teardown", async () => {
+    const rig = makeRig();
+    rig.transport.push({ kind: "turn_completed", method: "turn/completed", threadId: "th-1", turnId: "tn-1", status: "failed",
+      params: { threadId: "th-1", turn: { id: "tn-1", status: "failed", error: { codexErrorInfo: "cyberPolicy" } } } }).end();
+    rig.deps = { ...rig.deps, deferRegistryTeardown: true,
+      sessionStore: { ...rig.deps.sessionStore!, persist: async () => { throw new Error("PROVIDER_PRIVATE_DETAIL"); } } };
+    const warnings: string[] = [];
+    const details: unknown[] = [];
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION), { ...noopLog, warn: (message, fields) => { warnings.push(message); details.push(fields); } });
+    try {
+      await assert.rejects(withTimeout(executor.run(makeCtx({ kind: "issue", policyHoldSupported: true }).ctx),
+        3000, "M1 persist degradation"), ProviderPolicyRefusal);
+      assert.ok(warnings.includes("Codex session persistence failed"));
+      assert.ok(!JSON.stringify(details).includes("PROVIDER_PRIVATE_DETAIL"));
+      assert.equal(rig.sessionOps.removeCalls, 0);
+    } finally { await executor.safety?.dispose({ boundary: "terminal", deadlineMs: 200 }); }
+  });
+  it("Cancel arriving during policy cleanup wins after sibling cleanup settles", async () => {
+    const rig = makeRig();
+    rig.transport.push({ kind: "turn_completed", method: "turn/completed", threadId: "th-1", turnId: "tn-1", status: "failed",
+      params: { threadId: "th-1", turn: { id: "tn-1", status: "failed", error: { codexErrorInfo: "cyberPolicy" } } } }).end();
+    const abort = new AbortController();
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    executor.closeAndSettlePlanSummary = async () => { abort.abort(); throw new Error("summary cleanup failed"); };
+    await assert.rejects(withTimeout(executor.run(makeCtx({ kind: "issue", policyHoldSupported: true, signal: abort.signal }).ctx),
+      3000, "M1 cleanup cancel"), /run cancelled/);
+    assert.ok(rig.transport.closes > 0);
+  });
+  it("retains the admitted refusal when final summary cleanup rejects", async () => {
+    const rig = makeRig();
+    rig.transport.push({ kind: "turn_completed", method: "turn/completed", threadId: "th-1", turnId: "tn-1", status: "failed",
+      params: { threadId: "th-1", turn: { id: "tn-1", status: "failed", error: { codexErrorInfo: "cyberPolicy" } } } }).end();
+    const details: unknown[] = [];
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION), { ...noopLog, warn: (_message, fields) => { details.push(fields); } });
+    executor.closeAndSettlePlanSummary = async () => { throw new Error("PROVIDER_PRIVATE_DETAIL"); };
+    await assert.rejects(withTimeout(executor.run(makeCtx({
+      kind: "issue", policyHoldSupported: true,
+    }).ctx), 3000, "M1 cleanup"), ProviderPolicyRefusal);
+    assert.ok(rig.transport.closes > 0, "transport cleanup still runs");
+    assert.ok(!JSON.stringify(details).includes("PROVIDER_PRIVATE_DETAIL"));
+  });
+});
+
 
 // --- binding + client + context builders ---------------------------------------
 function bindingOf(codex: Record<string, unknown>): CodexBinding {
@@ -1650,6 +1984,51 @@ describe("Codex usage-limit wall and vault precedence #2360", () => {
     assert.equal(rig.transport.turnStartCount, 1);
     assert.equal(rig.client.releaseCalls.length, 1);
   });
+});
+
+describe("M1 observed policy refusal versus vault latch", () => {
+  for (const negotiated of [false, true]) for (const cancel of [false, true]) {
+    it(`observed refusal competes with vault: negotiated=${negotiated} cancel=${cancel}`, async () => {
+      let cancelled = false, refreshes = 0;
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") {
+          c.transport.push({ ...turnCompleted("failed"), params: { threadId: "th-1",
+            turn: { id: "tn-1", status: "failed", error: { codexErrorInfo: "cyberPolicy" } } } });
+          return { turn: { id: "tn-1" } };
+        }
+        return {};
+      } });
+      rig.client.refreshCodex = async () => {
+        refreshes++;
+        if (cancel) cancelled = true;
+        throw vaultLocked409("refresh");
+      };
+      const { ctx, emitted } = makeCtx({ kind: "issue", policyHoldSupported: negotiated,
+        cancelRequested: () => cancelled });
+      const emit = ctx.emit;
+      ctx.emit = async message => {
+        emit(message);
+        if (message.payload.event !== "provider_policy_refusal") return;
+        // The terminal is already observed. Deliver a real intercepted app-server request
+        // while its publication is awaiting us, so the actual refresh bridge latches the vault.
+        rig.transport.deliverServerRequest({ kind: "activity", method: "account/chatgptAuthTokens/refresh",
+          requestId: 91, params: { reason: "unauthorized", previousAccountId: null } });
+        await waitFor(() => refreshes === 1, "vault refresh reached the API");
+        await tick();
+      };
+      const error = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx),
+        3000, "observed policy/vault precedence").then(() => undefined, (e: unknown) => e);
+      assert.equal(refreshes, 1);
+      assert.equal(emitted.filter(m => m.payload.event === "provider_policy_refusal").length, 1);
+      if (cancel) {
+        assert.ok(error instanceof Error && /cancel/i.test(error.message));
+        assert.ok(!(error instanceof ProviderPolicyRefusal));
+      } else if (negotiated) assert.ok(error instanceof ProviderPolicyRefusal, String(error));
+      else assert.ok(error instanceof CodexCredentialDeferredError, String(error));
+      assert.equal(rig.transport.turnStartCount, 1);
+    });
+  }
 });
 
 describe("#2493 initial credential release", () => {
@@ -3543,6 +3922,635 @@ describe("m1 credential-free owner cancel", () => {
           fx.cleanup();
           await fs.rm(recovery.root, { recursive: true, force: true });
         }
+      }
+    });
+});
+
+
+describe("M1 composed policy guidance delivery", () => {
+  async function negotiateComposedPolicy(api: FakeApi, client: WorkerClient): Promise<void> {
+    api.setRegisterProtocolFeatures(["provider_policy_hold", "claim_generation_fence", "active_run_snapshot", "gate_revision_v1"]);
+    await client.register("m1-composed", undefined, 1, undefined, [
+      "provider_policy_hold_v1", "credential_switch_v1", "input_receipts_v1", "input_inclusion_v1", "gate_revision_v1",
+    ]);
+    assert.equal(client.supportsPolicyHold(), true);
+  }
+
+  async function finishCleanup(errors: unknown[], steps: (() => unknown)[]): Promise<void> {
+    // Each step is attempted once, in order; a failure never skips sibling cleanup.
+    for (const step of steps) {
+      try { await step(); } catch (error) { errors.push(error); }
+    }
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) throw new AggregateError(errors, "M1 observation and cleanup failures");
+  }
+
+  it("finishCleanup retains the initiating error before independent cleanup failures and attempts every step in order", async () => {
+    const initiating = new Error("observation failed");
+    const join = new Error("join failed");
+    const assertion = new assert.AssertionError({ message: "cleanup assertion failed" });
+    const apiClose = new Error("API close failed");
+    const removal = new Error("fixture removal failed");
+    const calls: string[] = [];
+
+    await assert.rejects(finishCleanup([initiating], [
+      () => { calls.push("release"); },
+      () => { calls.push("shutdown"); },
+      async () => {
+        calls.push("join");
+        await Promise.resolve();
+        calls.push("join settled");
+        throw join;
+      },
+      () => { calls.push("assertion"); throw assertion; },
+      () => { calls.push("next assertion"); },
+      async () => { calls.push("API close"); throw apiClose; },
+      () => { calls.push("removal"); throw removal; },
+      () => { calls.push("last cleanup"); },
+    ]), error => {
+      assert.ok(error instanceof AggregateError);
+      assert.equal(error.errors.length, 5);
+      assert.equal(error.errors[0], initiating);
+      assert.equal(error.errors[1], join);
+      assert.equal(error.errors[2], assertion);
+      assert.equal(error.errors[3], apiClose);
+      assert.equal(error.errors[4], removal);
+      return true;
+    });
+    assert.deepEqual(calls, [
+      "release", "shutdown", "join", "join settled", "assertion", "next assertion",
+      "API close", "removal", "last cleanup",
+    ]);
+  });
+
+  for (const source of ["initiating", "cleanup"] as const)
+    it(`finishCleanup preserves single ${source} error identity and completes later steps`, async () => {
+      const failure = new Error("sole failure");
+      const calls: string[] = [];
+      await assert.rejects(finishCleanup(source === "initiating" ? [failure] : [], [
+        () => {
+          calls.push("first");
+          if (source === "cleanup") throw failure;
+        },
+        async () => { calls.push("last"); },
+      ]), error => {
+        assert.equal(error, failure);
+        return true;
+      });
+      assert.deepEqual(calls, ["first", "last"]);
+    });
+
+  it("finishCleanup rejects an early return on cleanup failure after attempting later steps", async () => {
+    const join = new Error("join failed");
+    const apiClose = new Error("API close failed");
+    const calls: string[] = [];
+    async function rejectedCase() {
+      try {
+        return "rejected case";
+      } finally {
+        await finishCleanup([], [
+          async () => { calls.push("join"); throw join; },
+          () => { calls.push("API close"); throw apiClose; },
+          () => { calls.push("removal"); },
+        ]);
+      }
+    }
+    await assert.rejects(rejectedCase(), error => {
+      assert.ok(error instanceof AggregateError);
+      assert.equal(error.errors.length, 2);
+      assert.equal(error.errors[0], join);
+      assert.equal(error.errors[1], apiClose);
+      return true;
+    });
+    assert.deepEqual(calls, ["join", "API close", "removal"]);
+  });
+
+  it("finishCleanup preserves an early return when every cleanup step succeeds", async () => {
+    const calls: string[] = [];
+    async function rejectedCase() {
+      try {
+        return "rejected case";
+      } finally {
+        await finishCleanup([], [
+          async () => {
+            calls.push("join");
+            await Promise.resolve();
+            calls.push("join settled");
+          },
+          () => { calls.push("API close"); },
+          () => { calls.push("removal"); },
+        ]);
+      }
+    }
+    assert.equal(await rejectedCase(), "rejected case");
+    assert.deepEqual(calls, ["join", "join settled", "API close", "removal"]);
+  });
+
+  // Each claim owns a fresh executor/transport; the API, worker home and session store survive.
+  async function preservingFixture(atGate = false) {
+    const diagnostics = recordingLog();
+    const api = new FakeApi("m1-replay-worker");
+    const url = await api.listen();
+    const fx = makeFixture();
+    const homeDir = path.join(fx.dataDir, "m1-replay-home");
+    await fs.mkdir(homeDir, { recursive: true });
+    const thread = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    const prior = path.join(fx.dataDir, "prior");
+    await fs.mkdir(path.join(prior, "sessions"), { recursive: true });
+    await fs.writeFile(path.join(prior, "sessions", `rollout-${thread}.jsonl`),
+      JSON.stringify({ type: "session_meta", payload: { id: thread } }) + "\n");
+    await CodexSessionStore.persist(prior, path.join(homeDir, "codex-session-store"));
+    const claim = makeClaim({
+      kind: "issue", interactive: false, claim_generation: 1, session_id: thread,
+      policy_hold_resume: true,
+      repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+      secrets: { forge_pat: "fixture-forge-pat-000000", codex: SUBSCRIPTION as never },
+      ...(atGate ? { plan_approved: false, plan_source: "agent", plan_md: "persisted original plan",
+        resume_phase: "awaiting_approval", resume_plan_at: "2026-10-01T00:00:00Z" } : {}),
+    });
+    api.inclusionTracking = true;
+    api.gateRevisions = true;
+    if (atGate) {
+      api.seedGate(claim.run_id, { revision: 7,
+        presentationId: "0f5c2d4e-1111-4a2b-8c3d-000000000001",
+        payload: { plan_md: claim.plan_md ?? undefined, milestones: claim.milestones } });
+      Object.assign(claim, api.gateResumeFields(claim.run_id));
+    }
+    const client = new WorkerClient(url, "m1-replay-worker", "test", noopLog,
+      { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
+    await negotiateComposedPolicy(api, client);
+    const outbox = new Outbox({ root: path.join(fx.dataDir, "outbox"), log: noopLog,
+      runMaxBytes: 64 << 20, maxBytes: 128 << 20, retentionMs: 86400000 });
+    await outbox.init();
+    const git = new GitCache(fx.dataDir, noopLog, undefined, testGitCacheOptions());
+    const forge = fakeGitlab();
+    let finalPushes = 0;
+    git.pushBranch = async () => { finalPushes++; throw new Error("unexpected final branch push"); };
+    const owned: { runner: RunRunner; running: Promise<void> }[] = [];
+    function start(generation = 1, crashBeforeIdentity = false) {
+      api.setInputClaimGeneration(claim.run_id, generation);
+      api.setOwnershipStatus(claim.run_id, "running", generation);
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start") {
+          if (crashBeforeIdentity) runner.shutdown();
+          return { thread: { id: thread } };
+        }
+        if (c.method === "thread/resume") return { thread: { id: thread } };
+        if (c.method === "turn/start") return { turn: { id: "tn-1" } };
+        return {};
+      } });
+      rig.deps = { ...rig.deps, deferRegistryTeardown: true,
+        sessionStore: { ...rig.deps.sessionStore!, inspect: async () => "present" } };
+      const executor = new CodexExecutor(diagnostics.log, homeDir,
+        { binding: bindingOf(SUBSCRIPTION), client: rig.client as never, provider }, rig.deps);
+      const runner = new RunRunner(client, git, () => ({ executor, homeDir }), diagnostics.log, 20, undefined, {
+        pollMs: 5, outbox, recoveryRetryMs: 1, codexBoundaryDeadlineMs: 200, gitlab: forge.gitlab,
+        quiesceRun: async () => ({
+          process: { state: "quiescent", processes: [], killed: [], detail: "fixture roots reaped" },
+          docker: { state: "not_wired", removed: [], detail: "not wired" },
+        }),
+      });
+      const running = runner.execute({ ...claim, claim_generation: generation });
+      owned.push({ runner, running });
+      return { rig, runner, running };
+    }
+    async function cancel(running: Promise<void>) {
+      api.appendInputs(claim.run_id, [{ id: 99, kind: "cancel" }]);
+      await withTimeout(running, 5000, "M1 owner cancellation");
+      assert.ok(api.inputReceiptCalls.some(row => row.kind === "ack" && row.ids.includes(99)));
+    }
+    async function cleanup(errors: unknown[]) {
+      // At most three claims; stop every owned runner before the five-second join.
+      await finishCleanup(errors, [
+        ...owned.map(entry => () => entry.runner.shutdown()),
+        () => withTimeout(Promise.all(owned.map(entry => entry.running)), 5000, "M1 replay cleanup"),
+        () => assert.equal(finalPushes, 0),
+        () => assert.equal(forge.calls.length, 0),
+        () => api.close(),
+        () => fx.cleanup(),
+      ]);
+    }
+    return { api, client, fx, claim, thread, start, cancel, cleanup, diagnostics, homeDir };
+  }
+
+  for (const session of ["usable", "missing", "exact fresh retry"] as const)
+  for (const recovered of [true, false])
+    it(`M2 numeric-ceiling/no-owner-Stop negative control session=${session} recovered=${recovered}`, async () => {
+      const f = await preservingFixture(true);
+      const errors: unknown[] = [];
+      try {
+        // A numeric ceiling alone is not an accepted owner Stop or a feedback resolution.
+        // Keep the unapproved candidate and pending revision; no Stop input is supplied.
+        Object.assign(f.claim, {
+          policy_hold_fresh_session: session === "exact fresh retry",
+          session_id: session === "exact fresh retry" ? null : f.thread,
+          execution_milestones: [{ id: "m1", title: "delivered" }, { id: "m2", title: "remaining" }],
+        });
+        f.api.setStateAckScope(f.claim.run_id, { scope_ceiling: 1, milestones_completed: ["m1"] });
+        f.api.setInputs(f.claim.run_id, [{ id: 13, kind: "revise_plan", body: "pending revision feedback",
+          gate_binding: "bound", gate_revision: 7, created_at: "2026-10-02T00:00:00Z" }]);
+        if (session === "missing") {
+          await fs.rm(path.join(f.homeDir, "codex-session-store"), { recursive: true, force: true });
+        }
+        if (recovered) {
+          const branch = `agent/issue-${f.claim.issue_iid}`;
+          const checkout = spawnSync("git", ["-C", f.fx.originPath, "checkout", "-b", branch]);
+          assert.equal(checkout.status, 0, checkout.stderr.toString());
+          commitInTree(f.fx.originPath, "delivered.txt", "completed milestone\n");
+          assert.equal(spawnSync("git", ["-C", f.fx.originPath, "checkout", "main"]).status, 0);
+        }
+        const { rig, running } = f.start(session === "exact fresh retry" ? 3 : 2);
+        await waitFor(() => rig.transport.turnStartCount > 0 || f.api.policyHoldRequests.length > 0 ||
+          f.api.states.some(row => ["awaiting_approval", "completed", "failed"].includes(String(row.body.status))),
+          "revision turn, resume rejection, or forbidden old gate/terminal state", 15000);
+        // Capture observations before cancellation; cancellation legitimately closes the gate.
+        const turns = rig.transport.turnStartCount;
+        const threadStarts = rig.transport.threadStartCount;
+        const resumes = rig.transport.requests.filter(row => row.method === "thread/resume");
+        const revisionPrompt = JSON.stringify(rig.transport.requests.find(row => row.method === "turn/start")?.params);
+        const gates = f.api.states.filter(row => row.body.status === "awaiting_approval");
+        const feedbackApplied = f.api.isApplied(f.claim.run_id, 13);
+        const approved = f.api.humanPlanApproved(f.claim.run_id);
+        const holds = f.api.policyHoldRequests.map(row => row.body.detail);
+        const executable = recovered && session !== "missing";
+        assert.equal(turns, executable ? 1 : 0, "numeric ceiling cannot supersede pending revision or authorize missing source/session");
+        assert.equal(approved, false, "numeric ceiling must never infer plan approval");
+        assert.equal(feedbackApplied, false, "feedback stays pending before any revised plan persistence ACK");
+        assert.equal(f.api.inputReceiptCalls.some(row => row.ids.includes(13) && row.kind !== "ack"), false,
+          "no owner Stop exists to settle or discard pending revision feedback");
+        assert.equal(f.api.states.some(row => row.body.seeded_from_default), false);
+        assert.equal(f.api.states.some(row => ["completed", "failed"].includes(String(row.body.status))), false);
+        assert.equal(gates.length, 0, "old candidate gate must not supersede pending revision");
+        if (executable) {
+          assert.ok(revisionPrompt.includes("pending revision feedback"), "revision turn must carry the matching feedback");
+          assert.deepEqual(holds, []);
+          assert.equal(threadStarts, session === "exact fresh retry" ? 1 : 0, "only exact fresh consent permits a new conversation");
+          assert.equal(resumes.length, session === "usable" ? 1 : 0);
+          if (session === "usable") assert.ok(JSON.stringify(resumes[0]!.params).includes(f.thread),
+            "revision preserves the usable conversation");
+        } else {
+          assert.deepEqual(holds, ["resume_rejected"], recovered
+            ? "missing preserving session cannot use a numeric ceiling as a Stop bypass"
+            : "session availability and fresh consent never substitute for delivery source");
+          assert.equal(threadStarts, 0, "rejection cannot fall back to a fresh thread");
+          assert.equal(resumes.length, 0);
+          assert.equal(rig.providerLaunches(), 0);
+        }
+        if (holds.length) await withTimeout(running, 5000, "unavailable source or session re-parks");
+        else await f.cancel(running);
+      } catch (error) { errors.push(error); } finally { await f.cleanup(errors); }
+    });
+
+  for (const full of [false, true]) for (const fresh of [false, true])
+  for (const boundary of ["failure", "missing ceiling", "missing count", "missing IDs"] as const)
+    it(`M2 required Stop ACK full=${full} fresh=${fresh} boundary=${boundary}`, async (t) => {
+      const f = await preservingFixture();
+      const errors: unknown[] = [];
+      let boundaries = 0;
+      try {
+        Object.assign(f.claim, { plan_approved: true, plan_md: "approved delivery", plan_source: "seeded",
+          policy_hold_fresh_session: fresh, session_id: fresh ? null : f.thread,
+          milestones: [{ id: "m1", title: "one" }, { id: "m2", title: "two" }] });
+        // Recover real delivery before preflight; this test targets the subsequent ACK seam.
+        const branch = `agent/issue-${f.claim.issue_iid}`;
+        const checkout = spawnSync("git", ["-C", f.fx.originPath, "checkout", "-b", branch]);
+        assert.equal(checkout.status, 0, checkout.stderr.toString());
+        commitInTree(f.fx.originPath, "delivered.txt", "completed milestone\n");
+        assert.equal(spawnSync("git", ["-C", f.fx.originPath, "checkout", "main"]).status, 0);
+        f.api.setStateAckScope(f.claim.run_id, { scope_ceiling: full ? 2 : 1,
+          milestones_completed: full ? ["m1", "m2"] : ["m1"] });
+        const report = f.client.reportState.bind(f.client);
+        t.mock.method(f.client, "reportState", async (...args: Parameters<typeof report>) => {
+          if (args[1].iteration_count !== undefined) {
+            boundaries++;
+            if (boundary === "failure") throw new Error("iteration transport unavailable");
+            const ack = await report(...args);
+            if (boundary === "missing ceiling") delete ack.scopeCeiling;
+            if (boundary === "missing count") delete ack.completedCount;
+            if (boundary === "missing IDs") delete ack.completedIds;
+            return ack;
+          }
+          return report(...args);
+        });
+        const reportHold = f.client.reportPolicyHold.bind(f.client);
+        type Witness = { kind: "hold ACK"; ack: Awaited<ReturnType<typeof reportHold>> } |
+          { kind: "forbidden root turn" };
+        let observe!: (event: Witness) => void;
+        const witnessed = new Promise<Witness>(resolve => { observe = resolve; });
+        t.mock.method(f.client, "reportPolicyHold", async (...args: Parameters<typeof reportHold>) => {
+          // WorkerClient.reportPolicyHold resolves only after the real HTTP reply is decoded.
+          const ack = await reportHold(...args);
+          observe({ kind: "hold ACK", ack });
+          return ack;
+        });
+        const { rig, running } = f.start();
+        const removeTurnListener = rig.transport.onFirstTurnStart(() => observe({ kind: "forbidden root turn" }));
+        try {
+          const outcome = await Promise.race([
+            witnessed,
+            running.then(() => ({ kind: "premature execution end" } as const),
+              error => ({ kind: "premature execution rejection", error: String(error) } as const)),
+          ]);
+          if (outcome.kind !== "hold ACK") {
+            t.diagnostic(JSON.stringify({ outcome, boundaries, lines: f.diagnostics.lines, states: f.api.states }));
+          }
+          if (outcome.kind === "forbidden root turn") await f.cancel(running);
+          assert.equal(outcome.kind, "hold ACK", "required ACK rejection must receive a decoded policy hold ACK before execution ends");
+          if (outcome.kind === "hold ACK") assert.equal(outcome.ack.disposition, "applied");
+          await withTimeout(running, 5000, "required Stop ACK hold");
+        } finally {
+          removeTurnListener();
+        }
+        assert.equal(boundaries, 1);
+        assert.equal(rig.providerLaunches(), 0, "no lead root may start without the required ACK");
+        assert.equal(rig.transport.turnStartCount, 0);
+        assert.equal(f.api.policyHoldRequests[0]?.body.detail, "resume_rejected");
+        assert.equal(f.api.states.some(s => s.body.seeded_from_default), false);
+        assert.equal(f.api.states.some(s => s.body.status === "completed"), false);
+      } catch (error) { errors.push(error); } finally { await f.cleanup(errors); }
+    });
+
+  for (const persisted of [false, true]) it(`M2 fresh claim crash persisted=${persisted} cannot replay grant`, async () => {
+    const f = await preservingFixture();
+    const errors: unknown[] = [];
+    try {
+      f.claim.policy_hold_fresh_session = true;
+      f.claim.session_id = null;
+      f.api.setInputs(f.claim.run_id, [{ id: 21, kind: "follow_up", body: "fresh narrowing: inspect parser only" }]);
+      const first = f.start(2, !persisted);
+      if (persisted) {
+        await waitFor(() => first.rig.transport.turnStartCount === 1, "authorized fresh turn");
+        first.rig.transport.push(agentMessage("processed fresh narrowing", f.thread));
+        await waitFor(() => f.api.states.some(s => s.body.session_id === f.thread), "new identity reported");
+        assert.ok(JSON.stringify(first.rig.transport.requests.find(r => r.method === "turn/start")?.params)
+          .includes("fresh narrowing: inspect parser only"));
+        first.runner.shutdown();
+      }
+      await withTimeout(first.running, 5000, "fresh claim crash");
+      assert.equal(first.rig.transport.threadStartCount, 1);
+      assert.equal(first.rig.transport.turnStartCount, persisted ? 1 : 0);
+      assert.equal(f.api.states.some(s => s.body.session_id === f.thread), persisted);
+      f.claim.policy_hold_fresh_session = false; // Next claim's trusted server equality result.
+      f.claim.session_id = persisted ? f.thread : null;
+      const second = f.start(3);
+      if (persisted) {
+        await waitFor(() => second.rig.transport.turnStartCount === 1, "reclaim preserves new identity");
+        assert.equal(second.rig.transport.requests.filter(r => r.method === "thread/resume").length, 1);
+        second.runner.shutdown();
+      }
+      await withTimeout(second.running, 5000, "reclaimed fresh claim");
+      assert.equal(second.rig.transport.threadStartCount, 0);
+      if (!persisted) {
+        assert.equal(second.rig.transport.turnStartCount, 0);
+        assert.equal(f.api.policyHoldRequests.at(-1)?.body.detail, "resume_rejected");
+      } else {
+        await fs.rm(path.join(f.homeDir, "codex-session-store"), { recursive: true, force: true });
+        const third = f.start(4);
+        await withTimeout(third.running, 5000, "later eviction remains constrained");
+        assert.equal(third.rig.transport.threadStartCount, 0);
+        assert.equal(third.rig.transport.turnStartCount, 0);
+        assert.equal(f.api.policyHoldRequests.at(-1)?.body.detail, "resume_rejected");
+      }
+      assert.equal(f.api.states.some(s => s.body.status === "failed" || s.body.status === "completed"), false);
+    } catch (error) { errors.push(error); } finally { await f.cleanup(errors); }
+  });
+
+  it("M1 two-claim crash after ACK replays unincluded guidance before model evidence", async () => {
+    const f = await preservingFixture();
+    const errors: unknown[] = [];
+    try {
+      f.api.setInputs(f.claim.run_id, [{ id: 11, kind: "follow_up", body: "old ACKed unincluded guidance" }]);
+      const first = f.start();
+      await waitFor(() => first.rig.transport.turnStartCount === 1, "first claim initialized turn");
+      assert.equal(f.api.isAcked(f.claim.run_id, 11), true);
+      assert.ok(JSON.stringify(first.rig.transport.requests.find(r => r.method === "turn/start")?.params)
+        .includes("old ACKed unincluded guidance"));
+      assert.equal(f.api.inclusionCalls.length, 0);
+      first.runner.shutdown();
+      await withTimeout(first.running, 5000, "first claim actual shutdown");
+      assert.equal(f.api.states.some(row => ["failed", "completed", "cancelled"].includes(String(row.body.status))), false);
+      assert.equal(f.api.isInputIncluded(f.claim.run_id, 11), false);
+      f.api.appendInputs(f.claim.run_id, [{ id: 12, kind: "follow_up", body: "next claim narrowing guidance" }]);
+      const second = f.start(2);
+      await waitFor(() => second.rig.transport.turnStartCount === 1, "second claim first root").catch(error => {
+        throw new Error(`${String(error)}\n${f.diagnostics.lines.join("\n")}\n${JSON.stringify(f.api.states)}`);
+      });
+      const prompt = JSON.stringify(second.rig.transport.requests.find(r => r.method === "turn/start")?.params);
+      assert.ok(prompt.includes("old ACKed unincluded guidance"), prompt);
+      assert.ok(prompt.includes("next claim narrowing guidance"), prompt);
+      for (const { rig } of [first, second]) {
+        assert.equal(rig.transport.threadStartCount, 0);
+        assert.equal(rig.transport.requests.filter(r => r.method === "thread/resume").length, 1);
+        assert.ok(JSON.stringify(rig.transport.requests.find(r => r.method === "thread/resume")?.params).includes(f.thread));
+      }
+      assert.equal(f.api.inclusionCalls.length, 0, "neither claim initialization proves model inclusion");
+      second.rig.transport.push(agentMessage("model processed replay", f.thread));
+      await waitFor(() => f.api.isInputIncluded(f.claim.run_id, 11) && f.api.isInputIncluded(f.claim.run_id, 12),
+        "replayed guidance inclusion");
+      assert.deepEqual(f.api.inclusionCalls, [{ runId: f.claim.run_id, ids: [11, 12], generation: 2 }]);
+      await f.cancel(second.running);
+    } catch (error) { errors.push(error); } finally { await f.cleanup(errors); }
+  });
+
+  it("M1 verified persisted gate without feedback re-presents old plan without a planning turn", async () => {
+    const f = await preservingFixture(true);
+    const errors: unknown[] = [];
+    try {
+      const { rig, running } = f.start();
+      await waitFor(() => f.api.states.some(row => row.body.status === "awaiting_approval"), "old gate re-presentation");
+      const gates = f.api.states.filter(row => row.body.status === "awaiting_approval");
+      assert.equal(gates.length, 1);
+      assert.equal(gates[0]!.body.plan_md, "persisted original plan");
+      assert.equal(f.api.gateOf(f.claim.run_id).revision, 7);
+      assert.equal(f.api.gateOf(f.claim.run_id).presentationId, f.claim.resume_gate_presentation_id);
+      assert.equal(rig.transport.threadStartCount, 0);
+      assert.equal(rig.transport.turnStartCount, 0);
+      assert.equal(f.api.humanPlanApproved(f.claim.run_id), false);
+      await f.cancel(running);
+    } catch (error) { errors.push(error); } finally { await f.cleanup(errors); }
+  });
+
+  it("M1 verified pending revision settles feedback only after new plan gate ACK 7 to 8", async () => {
+    const f = await preservingFixture(true);
+    const errors: unknown[] = [];
+    let release!: () => void;
+    const ack = new Promise<void>(resolve => { release = resolve; });
+    try {
+      f.api.setInputs(f.claim.run_id, [{ id: 13, kind: "revise_plan", body: "pending revision feedback",
+        gate_binding: "bound", gate_revision: 7, created_at: "2026-10-02T00:00:00Z" }]);
+      f.api.afterPersistState(f.claim.run_id, body => body.status === "awaiting_approval", ack);
+      const { rig, running } = f.start();
+      await waitFor(() => rig.transport.turnStartCount === 1, "revision first root");
+      assert.ok(JSON.stringify(rig.transport.requests.find(r => r.method === "turn/start")?.params)
+        .includes("pending revision feedback"));
+      assert.equal(f.api.states.filter(row => row.body.status === "awaiting_approval").length, 0);
+      assert.equal(f.api.isApplied(f.claim.run_id, 13), false);
+      rig.transport.push(toolCall(713, "submit_plan", { plan_md: "new revised plan" }, f.thread, "tn-1", "revision-plan"));
+      await waitFor(() => rig.transport.responses.some(row => row.requestId === 713), "actual submit_plan response");
+      assert.equal(f.api.isApplied(f.claim.run_id, 13), false, "submit_plan alone cannot settle feedback");
+      rig.transport.push(turnCompleted("completed", f.thread, "tn-1"));
+      await waitFor(() => f.api.gateOf(f.claim.run_id).revision === 8, "new gate persisted");
+      assert.equal(f.api.states.filter(row => row.body.status === "awaiting_approval").at(-1)?.body.plan_md, "new revised plan");
+      assert.equal(f.api.inputReceiptCalls.some(row => row.kind === "applied" && row.ids.includes(13)), false,
+        "persisted new gate waits for its ACK before settling revision feedback");
+      release();
+      await waitFor(() => f.api.isApplied(f.claim.run_id, 13), "original revise input settled after new gate ACK");
+      assert.equal(f.api.inputReceiptCalls.filter(row => row.kind === "applied" && row.ids.includes(13)).length, 1);
+      assert.equal(f.api.humanPlanApproved(f.claim.run_id), false);
+      assert.equal(rig.transport.threadStartCount, 0);
+      assert.equal(rig.transport.turnStartCount, 1, "new gate awaits owner action before implementation");
+      await f.cancel(running);
+    } catch (error) { errors.push(error); } finally {
+      await finishCleanup(errors, [release, () => f.cleanup([])]);
+    }
+  });
+
+  for (const [scenario, tag] of [
+    ["delayed GET", "cyberPolicy"], ["delayed GET", "misalignmentPolicyViolation"],
+    ["delayed ACK", "cyberPolicy"], ["delayed ACK", "misalignmentPolicyViolation"],
+    ["verified revision", "cyberPolicy"], ["verified revision", "misalignmentPolicyViolation"],
+    ["failed GET", "cyberPolicy"], ["failed ACK", "cyberPolicy"], ["failed reload", "cyberPolicy"],
+    ["missing session", "cyberPolicy"], ["Docker path", "cyberPolicy"], ["provider rejected", "cyberPolicy"],
+  ] as const)
+    it(`M1 composed ${scenario} ${tag} preserves guidance and policy custody`, async () => {
+      const api = new FakeApi("m1-worker");
+      const url = await api.listen();
+      const fx = makeFixture();
+      const homeDir = path.join(fx.dataDir, "m1-home");
+      await fs.mkdir(homeDir, { recursive: true });
+      const thread = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+      const prior = path.join(fx.dataDir, "prior");
+      await fs.mkdir(path.join(prior, "sessions"), { recursive: true });
+      await fs.writeFile(path.join(prior, "sessions", `rollout-${thread}.jsonl`),
+        JSON.stringify({ type: "session_meta", payload: { id: thread } }) + "\n");
+      await CodexSessionStore.persist(prior, path.join(homeDir, "codex-session-store"));
+      const revision = scenario === "verified revision";
+      const claim = makeClaim({
+        kind: "issue", interactive: false, claim_generation: 1, session_id: thread,
+        policy_hold_resume: true,
+        ...(scenario === "delayed ACK" ? { plan_approved: true, plan_md: "approved implementation plan" } : {}),
+        repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+        secrets: { forge_pat: "fixture-forge-pat-000000", codex: SUBSCRIPTION as never },
+        ...(revision ? { plan_approved: false, plan_md: "persisted original plan",
+          resume_phase: "awaiting_approval", resume_plan_at: "2026-10-01T00:00:00Z",
+          resume_gate_revision: 7 } : {}),
+      });
+      api.inclusionTracking = true;
+      const client = new WorkerClient(url, "m1-worker", "test", noopLog,
+        { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
+      await negotiateComposedPolicy(api, client);
+      api.setInputs(claim.run_id, [
+        { id: 11, kind: "follow_up", body: "old consumed guidance" },
+        { id: 12, kind: "follow_up", body: "new narrowing guidance" },
+        ...(revision ? [{ id: 13, kind: "revise_plan" as const, body: "pending revision feedback",
+          gate_binding: "bound", gate_revision: 7, created_at: "2026-10-02T00:00:00Z" }] : []),
+      ]);
+      await client.ackInputs(claim.run_id, [11], 1);
+      await client.applyInputs(claim.run_id, [11], 1);
+      if (scenario === "missing session") claim.session_id = null;
+      const rejected = scenario.startsWith("failed") || ["missing session", "Docker path", "provider rejected"].includes(scenario);
+      if (scenario === "failed GET") api.failInputGets(claim.run_id, Infinity, 400);
+      if (scenario === "failed ACK") api.failInputReceipts("ack", 400);
+      if (scenario === "failed reload") api.overrideFollowUps(claim.run_id, 400, { error: "definitive reload rejection" });
+      const get = api.holdNextInputGet(claim.run_id);
+      const releaseAck = scenario === "delayed ACK" ? api.holdNextInputReceipt("ack") : () => {};
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/resume") {
+          if (scenario === "provider rejected") throw new CodexTransportError({ category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)" });
+          return { thread: { id: thread } };
+        }
+        if (c.method === "turn/start") return { turn: { id: "tn-1" } };
+        return {};
+      } });
+      rig.deps = { ...rig.deps, deferRegistryTeardown: true,
+        sessionStore: { ...rig.deps.sessionStore!, inspect: async () => "present" } };
+      const outbox = new Outbox({ root: path.join(fx.dataDir, "outbox"), log: noopLog,
+        runMaxBytes: 64 << 20, maxBytes: 128 << 20, retentionMs: 86400000 });
+      await outbox.init();
+      const executor = new CodexExecutor(noopLog, homeDir,
+        { binding: bindingOf(SUBSCRIPTION), client: rig.client as never, provider }, rig.deps);
+      const git = new GitCache(fx.dataDir, noopLog, undefined, testGitCacheOptions());
+      const forge = fakeGitlab();
+      let finalPushes = 0;
+      git.pushBranch = async () => { finalPushes++; throw new Error("unexpected final branch push"); };
+      const running = new RunRunner(client, git, () => ({ executor, homeDir }), noopLog, 20, undefined, {
+        pollMs: 5, outbox, recoveryRetryMs: 1, gitlab: forge.gitlab,
+        dockerHost: scenario === "Docker path" ? "tcp://docker:2375" : undefined,
+        quiesceRun: async () => ({
+          process: { state: scenario === "Docker path" ? "quiescent" : "unverified", processes: [], killed: [], detail: "retain fixture" },
+          docker: { state: "not_wired", removed: [], detail: "not wired" },
+        }),
+      }).execute(claim);
+      const errors: unknown[] = [];
+      try {
+        if (rejected) {
+          get.release();
+          await withTimeout(running, 5000, "bounded resume delivery rejection");
+          assert.equal(api.policyHoldRequests.length, 1);
+          const body = api.policyHoldRequests[0]!.body;
+          assert.equal(body.detail, "resume_rejected");
+          assert.equal(body.tag, undefined);
+          assert.equal(body.correlation_id, undefined);
+          assert.equal(rig.transport.turnStartCount, 0);
+          assert.equal(rig.transport.threadStartCount, 0);
+          assert.equal(api.inclusionCalls.length, 0);
+          assert.equal(api.states.some(row => ["failed", "completed"].includes(String(row.body.status))), false);
+          assert.equal(outbox.listPendingPolicies(claim.run_id).length, 1);
+          return;
+        }
+        await withTimeout(get.entered, 3000, "held input GET");
+        assert.equal(rig.transport.turnStartCount, 0, "GET must complete before root turn");
+        assert.equal(api.inclusionCalls.length, 0);
+        get.release();
+        if (scenario === "delayed ACK") {
+          await waitFor(() => api.inputReceiptCalls.some(row => row.kind === "ack" && row.ids.includes(12)), "held ACK entered");
+          assert.equal(rig.transport.turnStartCount, 0, "ACK must complete before root turn");
+          assert.equal(api.inclusionCalls.length, 0);
+          releaseAck();
+        }
+        await waitFor(() => rig.transport.turnStartCount === 1, "first resumed root turn");
+        const request = rig.transport.requests.find(row => row.method === "turn/start");
+        const prompt = JSON.stringify(request?.params);
+        assert.ok(prompt.includes("old consumed guidance"), prompt);
+        assert.ok(prompt.includes("new narrowing guidance"), prompt);
+        if (revision) {
+          assert.ok(prompt.includes("pending revision feedback"), prompt);
+          assert.equal(api.states.filter(row => row.body.status === "awaiting_approval").length, 0,
+            "pending revise enters revision directly without a duplicate original gate");
+        }
+        assert.equal(rig.transport.threadStartCount, 0);
+        assert.equal(api.inclusionCalls.length, 0, "thread/turn initialization is not model evidence");
+        rig.transport.push(agentMessage("model processed guidance", thread));
+        await waitFor(() => api.isInputIncluded(claim.run_id, 11) && api.isInputIncluded(claim.run_id, 12),
+          "both guidance rows included after model evidence");
+        rig.transport.push({ ...turnCompleted("failed", thread, "tn-1"), params: {
+          threadId: thread, turn: { id: "tn-1", status: "failed", error: { codexErrorInfo: tag } },
+        } });
+        await withTimeout(running, 5000, "composed policy guidance settlement");
+        assert.equal(rig.transport.turnStartCount, 1);
+        assert.equal(api.policyHoldRequests.length, 1);
+        assert.equal(api.policyHoldRequests[0]!.body.detail, "refused");
+        assert.equal(api.policyHoldRequests[0]!.body.tag, tag);
+        assert.equal(api.policyHoldRequests[0]!.body.session_id, thread);
+        assert.equal(api.states.some(row => ["failed", "completed"].includes(String(row.body.status))), false);
+        assert.equal(outbox.listPendingPolicies(claim.run_id).length, 1);
+        assert.equal(rig.transport.requests.filter(row => row.method === "thread/resume").length, 1);
+        assert.ok(JSON.stringify(rig.transport.requests.find(row => row.method === "thread/resume")?.params).includes(thread));
+        if (revision) assert.equal(api.inputReceiptCalls.some(row => row.kind === "applied" && row.ids.includes(13)), false,
+          "refused revision feedback remains unsettled");
+      } catch (error) {
+        errors.push(error);
+      } finally {
+        await finishCleanup(errors, [
+          () => get.release(),
+          releaseAck,
+          () => rig.transport.push(turnCompleted("failed", thread, "tn-1")),
+          () => withTimeout(running, 5000, "composed cleanup"),
+          () => assert.equal(finalPushes, 0, "policy holds never publish a final branch"),
+          () => assert.equal(forge.calls.length, 0, "policy holds never create or update an MR"),
+          () => api.close(),
+          () => fx.cleanup(),
+        ]);
       }
     });
 });
@@ -12076,6 +13084,33 @@ describe("approved m1 Codex resume reconciliation", () => {
 });
 
 describe("Codex completion interlock", () => {
+  for (const full of [false, true]) for (const session of [undefined, "th-1"])
+  for (const fresh of [false, true]) it(`M2 Stop boundary full=${full} session=${session} fresh=${fresh}`, async () => {
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        c.transport.push(signalDone()).push(turnCompleted());
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    const { ctx, emitted } = makeCtx({ kind: "issue", completionInterlock: true,
+      policyHoldResume: true, policyHoldFreshSession: fresh, sessionId: session,
+      frozenMilestones: [{ id: "m1", title: "one" }, { id: "m2", title: "two" }],
+      recordCompletionAttempt: async () => ({ unmet: [], attemptCount: 1 }),
+      reportIteration: async () => ({ scopeCeiling: full ? 2 : 1, completedCount: full ? 2 : 1,
+        completedIds: full ? ["m1", "m2"] : ["m1"] }),
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "M2 Stop");
+    assert.equal(rig.transport.turnStartCount, 0);
+    assert.equal(rig.transport.requests.some(r => r.method === "thread/start"), false);
+    assert.equal(rig.providerLaunches(), 0, "lazy lead root stays unopened");
+    assert.deepEqual(result.scopeCapped, full ? undefined : { completedCount: 1, total: 2 });
+    assert.equal(emitted.filter(m => m.kind === "steer_ack").length, 1);
+    assert.equal(result.completionHeld, undefined);
+  });
+
   it("issue3089 m4 Codex non_closing alone preserves m2 through autonomous rework and three-attempt stall", async () => {
     const input = { non_closing: { reason: "Owner says defer m2" }, milestones_completed: ["m1"] };
     const milestones = [
@@ -12412,8 +13447,8 @@ describe("Codex completion interlock", () => {
   for (const scenario of [
     { name: "zero", ack: { scopeCeiling: 0, completedCount: 0 }, capped: 0 },
     { name: "overshoot", ack: { scopeCeiling: 1, completedCount: 2 }, capped: 2 },
-    { name: "full total", ack: { scopeCeiling: 1, completedCount: 3 } },
-    { name: "above total", ack: { scopeCeiling: 1, completedCount: 4 } },
+    { name: "full total", ack: { scopeCeiling: 1, completedCount: 3 }, full: true },
+    { name: "above total", ack: { scopeCeiling: 1, completedCount: 4 }, full: true },
     { name: "missing count", ack: { scopeCeiling: 0 } },
     { name: "below ceiling", ack: { scopeCeiling: 2, completedCount: 1 } },
     { name: "absent ceiling", ack: { completedCount: 2 } },
@@ -12434,8 +13469,8 @@ describe("Codex completion interlock", () => {
       });
       const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(c.ctx), 5000, scenario.name);
       assert.deepEqual(result.scopeCapped, scenario.capped === undefined ? undefined : { completedCount: scenario.capped, total: 3 });
-      assert.equal(rig.providerLaunches(), scenario.capped === undefined ? 1 : 0);
-      assert.equal(c.emitted.filter((m) => m.kind === "steer_ack").length, scenario.capped === undefined ? 0 : 1);
+      assert.equal(rig.providerLaunches(), scenario.capped === undefined && !scenario.full ? 1 : 0);
+      assert.equal(c.emitted.filter((m) => m.kind === "steer_ack").length, scenario.capped === undefined && !scenario.full ? 0 : 1);
     });
   }
 

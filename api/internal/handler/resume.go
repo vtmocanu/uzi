@@ -1,10 +1,14 @@
 package handler
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -15,13 +19,15 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
+// JSON escaping can require six encoded bytes for one decoded ASCII byte.
+const policyResumeBodyMaxBytes = 6*workersvc.PolicyResumeGuidanceMaxBytes + 1024
+
 // ResumeRunNow resumes an owner-held pool_wait or paused run, or starts a new
 // worker-recovery episode for recovery_wait/worker_requeue_exhausted. The owner-scoped
 // read returns 404 for foreign/absent runs. Each status-scoped write refuses races
 // and ineligible holds with 409; successful transitions write a resume audit row.
 //
-// A POST verb with no payload: there is nothing to configure (unlike expedite's expedite/clear),
-// so it deliberately reads NO request body.
+// Policy holds require the presented If-Match; ordinary bodyless callers remain compatible.
 func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -37,6 +43,63 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 	run, err := h.q.GetRunByIDForUser(r.Context(), store.GetRunByIDForUserParams{ID: runID, UserID: user.ID})
 	if err != nil {
 		httpx.Error(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	var policyReq workersvc.PolicyResumeRequest
+	policyOptions := false
+	if r.Body != nil {
+		raw, readErr := io.ReadAll(io.LimitReader(r.Body, policyResumeBodyMaxBytes+1))
+		if readErr != nil || len(raw) > policyResumeBodyMaxBytes || !utf8.Valid(raw) {
+			httpx.Error(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(raw))
+		var decoded *struct {
+			Mode     json.RawMessage `json:"mode"`
+			Guidance json.RawMessage `json:"guidance"`
+		}
+		err := httpx.DecodeJSONStrictBounded(r, &decoded, policyResumeBodyMaxBytes)
+		if (err != nil && !errors.Is(err, io.EOF)) || (err == nil && decoded == nil) {
+			httpx.Error(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		if decoded != nil {
+			policyOptions = len(decoded.Mode) > 0 || len(decoded.Guidance) > 0
+			if len(decoded.Mode) > 0 && (string(decoded.Mode) == "null" || json.Unmarshal(decoded.Mode, &policyReq.Mode) != nil || (policyReq.Mode != "preserve" && policyReq.Mode != "fresh")) {
+				httpx.Error(w, http.StatusBadRequest, "mode must be preserve or fresh")
+				return
+			}
+			if len(decoded.Guidance) > 0 && (string(decoded.Guidance) == "null" || json.Unmarshal(decoded.Guidance, &policyReq.Guidance) != nil) {
+				httpx.Error(w, http.StatusBadRequest, "guidance must be a string")
+				return
+			}
+		}
+	}
+	policyHold := workersvc.PolicyOwnerConstrained(run)
+	if !policyHold && policyOptions {
+		httpx.Error(w, http.StatusConflict, "policy guidance requires a policy hold")
+		return
+	}
+	if policyHold {
+		run, err = h.wsvc.ResumePolicyHold(r.Context(), user.ID, runID, r.Header.Get("If-Match"), policyReq)
+		if err != nil {
+			if errors.Is(err, workersvc.ErrInvalidState) {
+				httpx.Error(w, http.StatusBadRequest, "invalid policy resume: mode must be preserve or fresh and guidance must be valid UTF-8 without NUL, at most 16000 bytes")
+				return
+			}
+			if errors.Is(err, workersvc.ErrStaleClaim) {
+				httpx.Error(w, http.StatusConflict, "policy hold changed; upgrade your client and refetch the presented action")
+				return
+			}
+			if errors.Is(err, workersvc.ErrWallParkStopUnavailable) {
+				httpx.Error(w, http.StatusConflict, err.Error())
+				return
+			}
+			httpx.Error(w, http.StatusInternalServerError, "policy resume unavailable")
+			return
+		}
+		httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)})
 		return
 	}
 

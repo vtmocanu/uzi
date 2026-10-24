@@ -31,13 +31,17 @@ export async function reportRetirementFixture(t: TestContext, options: {
   priorPendingArchiveFinal?: boolean;
   priorArchiveWithoutFinal?: boolean;
   coverPriorFinal?: boolean;
+  policyCustody?: boolean;
+  policyLegacyCurrent?: boolean;
 } = {}) {
   const generation = 2, archiveGeneration = options.archiveGeneration ?? generation;
-  const claim = gitlabClaim(2652, { claim_generation: generation, inventory_guarded: true });
+  const claim = gitlabClaim(2652, { claim_generation: generation, inventory_guarded: options.policyLegacyCurrent !== true });
   const token = "report-retirement-journal-key";
   const captureId = "00000000-0000-4000-8000-000000002652";
   const holdId = "33333333-3333-4333-8333-333333333333";
   let status = "running";
+  // An explicit olderSource can be pinned under a real hold, then closed after capture.
+  let olderHoldOpen = options.olderOpenHold === true || options.olderSource === true;
   let manifest: RecoveryUploadManifest | undefined;
   let uploadedBytes: Buffer | undefined;
   const calls = { final: 0, cloneCleanup: 0, sourceDelete: 0, pinDelete: 0, sends: 0, cancelledAcks: 0, priorArchiveFinal: 0 };
@@ -45,6 +49,7 @@ export async function reportRetirementFixture(t: TestContext, options: {
   const capture = { mode: "healthy" as "healthy" | "throw" | "expired" | "unbound" | "checksum" };
   const originalFetch = globalThis.fetch;
   let workerId = "";
+  const policyCustody = { openGeneration: undefined as number | undefined, unknown: false, generations: [] as number[] };
   api.setRegisterProtocolFeatures(["recovery_inventory_v1", "terminal_rejection_report"]);
   t.mock.method(globalThis, "fetch", async (input: string | URL | Request, init?: RequestInit) => {
     const url = new URL(input instanceof Request ? input.url : String(input));
@@ -52,7 +57,20 @@ export async function reportRetirementFixture(t: TestContext, options: {
         url.pathname !== `/api/worker/runs/${claim.run_id}/terminal-rejection-custody`) {
       return originalFetch(input, init);
     }
-    assert.equal(Number(url.searchParams.get("generation")), generation);
+    const requestedGeneration = Number(url.searchParams.get("generation"));
+    if (options.policyCustody) {
+      assert.ok(Number.isSafeInteger(requestedGeneration) && requestedGeneration > 0);
+      policyCustody.generations.push(requestedGeneration);
+      const open = policyCustody.openGeneration === requestedGeneration;
+      return Response.json({
+        run_id: claim.run_id, worker_id: workerId, generation: requestedGeneration,
+        exact_holds: policyCustody.unknown ? [] : [{ id: holdId, state: open ? "open" : "released" }],
+        sibling_holds: [], exact_count: policyCustody.unknown ? 0 : 1, sibling_count: 0,
+        complete: true, exact_complete: true, sibling_complete: true,
+        outcome: policyCustody.unknown ? "unknown" : open ? "retained" : "settled",
+      });
+    }
+    assert.equal(requestedGeneration, generation);
     assert.ok(workerId);
     return Response.json({
       run_id: claim.run_id, worker_id: workerId, generation,
@@ -72,13 +90,13 @@ export async function reportRetirementFixture(t: TestContext, options: {
     const beforePriorFinal = options.priorArchiveWithoutFinal && ownership.generation === 1 &&
       captures.has("00000000-0000-4000-8000-000000002651");
     return { status: ownership.mode === "unknown" || beforePriorFinal ? "unknown" : status,
-      claim_generation: ownership.generation, inventory_guarded: true };
+      claim_generation: ownership.generation, inventory_guarded: options.policyLegacyCurrent !== true };
   };
   const captures = new Map<string, { manifest: RecoveryUploadManifest; bytes: Buffer }>();
   client.listRecoveryHolds = async runId => ({ run_id: runId, holds: [...(options.currentArchiveReleased || (options.priorPendingArchiveFinal && ownership.generation < generation) ? [] : [{
     hold_id: holdId, generation: archiveGeneration, inventory_guarded: true,
     has_available_capture: !!manifest,
-  }]), ...(options.olderOpenHold ? [{ hold_id: "44444444-4444-4444-8444-444444444444",
+  }]), ...(olderHoldOpen ? [{ hold_id: "44444444-4444-4444-8444-444444444444",
     generation: 1, inventory_guarded: true,
     has_available_capture: options.priorPendingArchiveFinal === true && captures.has("00000000-0000-4000-8000-000000002651") }] : [])] });
   const historyEvents: string[] = [];
@@ -318,6 +336,8 @@ export async function reportRetirementFixture(t: TestContext, options: {
       };
     },
   });
+  // Keep the ordinary terminal control pending independently of the policy proof.
+  if (options.policyLegacyCurrent) r.recoveryInventoryPending = async () => true;
   const flight = r.execute(claim);
   // Every test has bounded node-test timeout; cleanup releases both event barriers on assertion failure.
   t.after(async () => { leave.resolve(); await flight; });
@@ -358,7 +378,7 @@ export async function reportRetirementFixture(t: TestContext, options: {
     archive = (await coordinator.inspect(claim.run_id)).find(row => row.generation === archiveGeneration && row.state === "uploaded")!;
   } else {
     await git.fetchAgentBranch(bare, clone, branch, claim.run_id, { context });
-    if (options.olderOpenHold && options.olderSource !== false) assert.ok(await coordinator.pin({ runId: claim.run_id, generation: 1,
+    if (options.olderSource ?? options.olderOpenHold) assert.ok(await coordinator.pin({ runId: claim.run_id, generation: 1,
       inventoryGuarded: true, kind: "issue", branch, sourceSha: head }));
     assert.ok(await coordinator.pin({ runId: claim.run_id, generation: archiveGeneration,
       inventoryGuarded: true, kind: "issue", branch, sourceSha: head }));
@@ -367,6 +387,7 @@ export async function reportRetirementFixture(t: TestContext, options: {
     assert.equal((await coordinator.captureAndUpload({ record: inventory, barePath: bare, defaultBranch: "main" })).state, "uploaded");
     archive = (await coordinator.inspect(claim.run_id)).find(row => row.captureId === inventory.captureId)!;
   }
+  if (!options.olderOpenHold) olderHoldOpen = false;
   assert.ok(archive, "real uploaded archive exists");
   assert.equal(archive.generation, archiveGeneration);
   assert.equal(archive.finalAcknowledged === true, false);
@@ -482,6 +503,12 @@ export async function reportRetirementFixture(t: TestContext, options: {
     }) as unknown as typeof setTimeout);
     return {
       count: () => captured.length,
+      fireFirst: () => {
+        const callback = captured.shift();
+        if (!callback) return false;
+        callback();
+        return true;
+      },
       fire: () => { for (const callback of captured.splice(0)) callback(); },
       restore: () => mock.mock.restore(),
     };
@@ -570,6 +597,6 @@ export async function reportRetirementFixture(t: TestContext, options: {
             docker: { state: "not_wired", removed: [], detail: "" } };
         } }) };
   };
-  return { historyEvents, predecessorH1, predecessorH2, priorFinal, predecessorClone, successorAdmission, recoveryOf, acknowledgeArchive, restartedRunner, headroomMs, headroom, useHeadroom, captureTimers, claim, generation, archive, outbox, registry, r, coordinator, replay, expireNextProof, replayPositive, positiveStage, assertFinalizePending, assertPending,
+  return { policyCustody, historyEvents, predecessorH1, predecessorH2, priorFinal, predecessorClone, successorAdmission, recoveryOf, acknowledgeArchive, restartedRunner, headroomMs, headroom, useHeadroom, captureTimers, claim, generation, archive, outbox, registry, r, coordinator, replay, expireNextProof, replayPositive, positiveStage, assertFinalizePending, assertPending,
     assertCustody, ownership, capture, clone, bare, head, cmd, commit, context, calls, liveFlight, processObservation };
 }

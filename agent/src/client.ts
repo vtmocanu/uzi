@@ -55,6 +55,8 @@ import {
   type CompletionPermitRequest,
   type CompletionPermitResponse,
   type WallParkRequest,
+  type PolicyHoldRequest,
+  type PolicyHoldAck,
   type ReportFindingRequest,
   type HeartbeatRequest,
   type DindMaintenance,
@@ -117,6 +119,43 @@ import {
   BASE_ATTESTATION_HOLD_REASON,
 } from "./protocol.js";
 
+export class PolicyHoldUnsupported extends Error {
+  constructor() { super("policy hold route unsupported"); this.name = "PolicyHoldUnsupported"; }
+}
+
+/** Closed ACK vocabulary; unknown states and identity mismatches carry no authority. */
+export function decodePolicyHoldAck(value: unknown, request: PolicyHoldRequest): PolicyHoldAck {
+  const invalid = (): never => { throw new Error("invalid policy hold acknowledgement"); };
+  if (!value || typeof value !== "object" || Array.isArray(value)) return invalid();
+  const ack = value as Record<string, unknown>;
+  const terminal = ["completed", "failed", "cancelled"];
+  const nonterminal = ["queued", "claimed", "running", "awaiting_approval", "awaiting_input",
+    "awaiting_followup", "paused", "limit_wait", "pool_wait", "recovery_wait"];
+  if (Object.keys(ack).some(key => !["disposition", "outcome_id", "status", "hold_reason", "claim_generation"].includes(key)) ||
+      !terminalUUID(ack.outcome_id) || ack.outcome_id !== request.outcome_id ||
+      !terminalGeneration(ack.claim_generation) || ack.claim_generation !== request.claim_generation ||
+      typeof ack.status !== "string" || ![...terminal, ...nonterminal].includes(ack.status) ||
+      (ack.hold_reason !== undefined && typeof ack.hold_reason !== "string")) return invalid();
+  switch (ack.disposition) {
+    case "applied":
+      if (ack.status !== "paused" || ack.hold_reason !== "provider_policy_refusal") return invalid();
+      break;
+    case "already_applied":
+    case "unauthenticated_historical_outcome": break;
+    case "recorded":
+    case "resolved_newer_policy":
+      if (!nonterminal.includes(ack.status)) return invalid();
+      break;
+    case "terminal":
+      if (!terminal.includes(ack.status)) return invalid();
+      break;
+    case "pending": break;
+    default: return invalid();
+  }
+  return { disposition: ack.disposition, outcome_id: ack.outcome_id, status: ack.status,
+    claim_generation: ack.claim_generation, ...(ack.hold_reason !== undefined ? { hold_reason: ack.hold_reason as string } : {}) };
+}
+
 export type PlanCrossCheckGateReason = "revise" | "block" | "malformed" | "model_error" | "model_timeout"
   | "checker_unavailable" | "confinement_failed" | "timed_out" | "superseded"
   | "codex_lead_unsupported" | "planning_diff_refused" | "interrupted" | "candidate_refused" | "checker_failed"
@@ -151,7 +190,7 @@ export interface PlanCrossCheckFindings {
 export type PlanCrossCheckResponse = ({ reconciliation?: PlanCrossCheckReconciliation } & (
   | { result: "parked"; verdict: string; reason_class: string; lead_last_seq: number; reconciliation: PlanCrossCheckReconciliation }
   | { result: "no_row"; reason_class: "no_candidate"; lead_last_seq: number }
-  | { result: "candidate"; round: number; automatic_revision_limit: number; automatic_rounds_enabled: boolean; checker_run_id: string | null; candidate_digest: string;
+  | { result: "candidate"; round: number; automatic_revision_limit: number; automatic_rounds_enabled: boolean; cross_check_id?: string; checker_run_id: string | null; candidate_digest: string;
       candidate_generation: number; candidate: PlanCrossCheckCandidate;
       verdict: "pending" | "approve" | "revise" | "block" | "failed";
       reason_class: "" | "approve" | PlanCrossCheckGateReason;
@@ -251,7 +290,7 @@ function decodePlanCrossCheckResponse(value: unknown, generation: number, round:
     const verdict = wire.verdict === undefined ? "" : wire.verdict;
     const reason = wire.reason_class === undefined ? "" : wire.reason_class;
     if (!reconciliation || reconciliation.gateRevision < 1 ||
-        ["candidate", "candidate_digest", "candidate_generation", "checker_run_id", "findings", "round", "deadline_at"]
+        ["candidate", "candidate_digest", "candidate_generation", "cross_check_id", "checker_run_id", "findings", "round", "deadline_at"]
           .some((key) => key in wire) ||
         !(crossCheckPair(verdict, reason) ||
           (verdict === "" && (reason === "" || CROSS_CHECK_GATE_REASONS.has(reason as string))))) return invalid();
@@ -261,6 +300,8 @@ function decodePlanCrossCheckResponse(value: unknown, generation: number, round:
   const snapshot = crossCheckSnapshot(wire, true);
   if (wire.result !== "candidate" || !crossCheckRound(wire.round) || wire.round !== round || !snapshot ||
       !Number.isSafeInteger(wire.candidate_generation) || (wire.candidate_generation as number) <= 0 ||
+      ("cross_check_id" in wire && (typeof wire.cross_check_id !== "string" || wire.cross_check_id.length !== 36 ||
+        !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(wire.cross_check_id))) ||
       (wire.checker_run_id !== null && (typeof wire.checker_run_id !== "string" ||
         !/^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$/.test(wire.checker_run_id))) ||
       typeof wire.candidate_digest !== "string" || !/^[a-fA-F0-9]{64}$/.test(wire.candidate_digest) ||
@@ -1353,6 +1394,7 @@ export class WorkerClient {
    * optimistic so the next request self-recovers once the api rolls forward).
    */
   private hasCredentialSwitchCapability = false;
+  private hasPolicyHoldCapability = false;
 
   /**
    * The per-registration nonce the api minted on the last successful register (PRD #1390
@@ -1458,6 +1500,7 @@ export class WorkerClient {
     this.latestDindMaintenanceValue = undefined;
     this.registerNonce = undefined;
     this.registrationReport = undefined;
+    this.hasPolicyHoldCapability = false;
     const originalCapabilities = Array.isArray(protocolCapabilities) ? [...protocolCapabilities] : undefined;
     const body: RegisterRequest = { name, version: this.version };
     // Only send the field when known: an image without ENV WORKER_TEMPLATE reports
@@ -1521,6 +1564,7 @@ export class WorkerClient {
     // capability, so the send-gate can stamp the claim generation optimistically (its runs
     // are fenced server-side) even when a one-shot register missed the negotiated feature.
     this.hasCredentialSwitchCapability = originalCapabilities?.includes("credential_switch_v1") ?? false;
+    this.hasPolicyHoldCapability = originalCapabilities?.includes("provider_policy_hold_v1") ?? false;
     this.hasExactHoldCapability = originalCapabilities?.includes("recovery_held_publication_v2") ?? false;
     this.hasMemoryAuthorityClaimCapability = originalCapabilities?.includes("worker_memory_authority_claim_v1") ?? false;
     // PRD #1390 M2a: capture the per-registration nonce the api minted, stamped onto every
@@ -4389,6 +4433,44 @@ export class WorkerClient {
     await action(eligible);
   }
 
+  /** Callback-only authority for the actual generations authenticated by the locked source proof.
+   * At most 256 observations share one deadline; any unknown or open custody retains the report. */
+  async withPolicyReportRetirementCustody(
+    runId: string, current: number, generations: readonly number[],
+    budget: { signal: AbortSignal; deadline: number },
+    action: (eligible: () => boolean) => Promise<void>,
+    guardedCurrentEvidence = false,
+  ): Promise<void> {
+    const workerId = this.registeredWorkerId;
+    const registration = this.registrationReport;
+    const nonce = this.registerNonce;
+    const eligible = () => !!workerId && workerId === this.registeredWorkerId &&
+      registration === this.registrationReport && nonce === this.registerNonce &&
+      this.hasFeature("recovery_inventory_v1") && this.hasFeature("terminal_rejection_report") &&
+      !budget.signal.aborted && Date.now() < budget.deadline;
+    if (!terminalUUID(runId) || !terminalGeneration(current) || current <= 0 ||
+        !generations.length || generations.length > 256 ||
+        generations.some(g => !terminalGeneration(g) || g <= 0 || g > current) ||
+        !generations.includes(current) || !eligible()) return;
+    const ownership = await this.getRunOwnership(runId, budget);
+    const legacyCurrent = ownership.inventory_guarded === false && !guardedCurrentEvidence &&
+      !this.inventoryGuardedClaims.has(`${runId}:${current}`);
+    if (!eligible() || !["completed", "failed", "cancelled"].includes(ownership.status) ||
+        ownership.claim_generation !== current || (ownership.inventory_guarded !== true && !legacyCurrent)) return;
+    for (const generation of new Set(generations)) {
+      if (!eligible()) return;
+      if (generation === current && legacyCurrent) continue;
+      const custody = await this.getTerminalRejectionCustody(runId, generation, workerId!,
+        budget.signal, Math.max(1, budget.deadline - Date.now()));
+      if (!eligible() || !custody || custody.outcome !== "settled" || !custody.complete ||
+          !custody.exact_complete || !custody.sibling_complete || custody.exact_count < 1 ||
+          custody.exact_count !== custody.exact_holds.length || custody.sibling_count !== 0 ||
+          custody.sibling_holds.length !== 0 ||
+          !custody.exact_holds.every(h => h.state === "released" || h.state === "discarded")) return;
+    }
+    if (eligible()) await action(eligible);
+  }
+
   async getTerminalRejectionCustody(runId: string, generation: number, workerId: string, signal?: AbortSignal, timeoutMs = this.httpTimeoutMs): Promise<TerminalRejectionCustodyResponse | undefined> {
     if (!this.hasFeature("terminal_rejection_report")) return undefined;
     if (!terminalUUID(runId) || !terminalUUID(workerId) || !terminalGeneration(generation)) throw terminalResponseError();
@@ -4426,6 +4508,38 @@ export class WorkerClient {
     if ((obj.outcome === "settled" && !settled) || (obj.outcome === "retained" && obj.exact_complete && !open) ||
         (obj.complete && obj.outcome !== (open ? "retained" : settled ? "settled" : "unknown"))) throw terminalResponseError();
     return response as TerminalRejectionCustodyResponse;
+  }
+
+  /** Requires the original implemented capabilities and every negotiated lease prerequisite. */
+  supportsPolicyHold(): boolean {
+    return this.hasPolicyHoldCapability && this.hasCredentialSwitchCapability &&
+      this.hasFeature("provider_policy_hold") && this.hasFeature("claim_generation_fence") &&
+      this.hasFeature("active_run_snapshot");
+  }
+
+  /** One attempt; deadline covers headers and body. No generation-stripping retry. */
+  async reportPolicyHold(runId: string, body: PolicyHoldRequest, callerSignal?: AbortSignal): Promise<PolicyHoldAck> {
+    body = { ...body };
+    const signal = AbortSignal.any([AbortSignal.timeout(this.httpTimeoutMs), ...(callerSignal ? [callerSignal] : [])]);
+    signal.throwIfAborted();
+    // Negotiation admits new refusals; an already durable intent must still reconcile
+    // after a cache refresh or rollback, without dropping its generation fence.
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/policy-hold`;
+    try {
+      const res = await this.fetchRaw("POST", path, body, this.httpTimeoutMs, signal);
+      const text = await readBoundedText(res, 4096, true, signal);
+      if (res.status === 405 || (res.status === 404 && (text === "404 page not found\n" || text === "404 page not found"))) {
+        throw new PolicyHoldUnsupported();
+      }
+      if (!res.ok && res.status !== 409) throw new Error("policy hold request failed");
+      const ack = decodePolicyHoldAck(JSON.parse(text), body);
+      if (res.status === 409 && ack.disposition !== "pending" && ack.disposition !== "unauthenticated_historical_outcome") throw new Error("invalid policy hold acknowledgement");
+      return ack;
+    } catch (err) {
+      signal.throwIfAborted();
+      if (err instanceof PolicyHoldUnsupported) throw err;
+      throw new Error("policy hold request failed");
+    }
   }
 
   private async terminalRejectionJSON(method: "GET" | "POST", path: string, body: unknown, callerSignal: AbortSignal | undefined, timeoutMs: number): Promise<unknown> {

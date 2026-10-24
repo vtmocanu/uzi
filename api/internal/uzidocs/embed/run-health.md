@@ -126,6 +126,41 @@ a guarantee that every latest edit is recoverable elsewhere.
 See [Provider outage streaks](./run-recovery-wait.md#provider-outage-streaks)
 for resets, the `0` off switch and mixed-fleet limits.
 
+## Codex policy holds and capable workers
+
+A negotiated eligible root Codex refusal is `paused` /
+`provider_policy_refusal`, an owner hold rather than a finished failure or a
+running stalled/looping warning. `resume_rejected` means the original
+conversation could not be continued; it keeps the refusal count and last
+metadata. A server-wall race can instead keep `budget_exhausted` with policy
+context: **extend first**, and review the preserving/fresh choice. Extension
+adds time, not fresh-session consent.
+
+For a constrained queued run, **waiting for worker** can say
+**no online worker supports preserving policy-hold continuation
+(provider_policy_hold_v1); provision a capable worker**. This requirement
+survives cleared hold reasons and successful continuation while nonterminal
+count > 0, independently of capability-scheduling overrides. Normal placement,
+affinity, vault and custody checks still apply; a worker elsewhere in the fleet
+is not necessarily eligible for this run. Activation needs API-first deployment,
+snapshots, generation fencing and positive pending-outcome lease protection.
+
+Use the [M2 CLI choices](./cli.md#codex-policy-refusal-owner-hold): preserving
+Resume with guidance, explicit fresh-session retry, eligible Stop, or Cancel.
+Each later fresh claim needs new consent. Stop starts no lead turn and finalizes
+recovered completed scope through normal publication guards. Web/TUI/Slack
+policy controls remain pending M3. Failed capture/publication stays local-only
+or unverified; a hold is not proof that the provider will accept resume.
+
+The hold has no expiry, refusal cap, automatic refusal retry or harness switch.
+Normal affinity and the issue lock remain; open custody counts against admission
+(default 8). A nonterminal run keeps a hosted worker busy and may delay upgrade
+until the drain deadline. Eviction/storage loss can still destroy conversation
+or local-only source; Cancel and custody discard remain distinct. Pending
+policy delivery uses the existing pending-outcome lease, not an expiry for an
+acknowledged hold. See [both accepted replay limits](./run-recovery.md#policy-hold-preservation-and-replay-limits)
+and [rollback precautions](../adr/3068-provider-policy-hold.md#rollout-resources-and-rollback).
+
 ## Giving a run more time
 
 A run that can time out shows its wall-clock budget in the header, right

@@ -1,6 +1,29 @@
 import { describe, it } from "node:test";
+import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
-import { admitPolicyTurn, validatePolicyRefusal, ProviderPolicyRefusal } from "../src/provider-policy-refusal.js";
+import { admitPolicyTurn, validatePolicyRefusal, ProviderPolicyRefusal, PolicyResumeRejected } from "../src/provider-policy-refusal.js";
+
+describe("M1 policy hold shared correlation boundaries (#3068)", () => {
+  it("resume rejection is a fixed content-free error without refusal metadata", () => {
+    const error = new PolicyResumeRejected();
+    assert.ok(error instanceof Error);
+    assert.equal(error.name, "PolicyResumeRejected");
+    assert.equal(error.message, "Codex policy hold resume rejected");
+    assert.deepEqual(Object.keys(error).sort(), ["detail", "name"]);
+    assert.equal(error.detail, "resume_rejected");
+    assert.equal("policyRefusal" in error, false);
+  });
+  const fixtures = JSON.parse(readFileSync(new URL("../../fixtures/policy-hold/correlation.json", import.meta.url), "utf8")) as { name: string; value: string; valid: boolean }[];
+  for (const tag of ["cyberPolicy", "misalignmentPolicyViolation"] as const) {
+    for (const fixture of fixtures) it(`${tag}: ${fixture.name}`, () => {
+      const payload = { ...admitPolicyTurn("plan"), event: "provider_policy_refusal", provider: "codex",
+        category: "policy_refusal", policy_tag: tag, origin: "root", correlation_id: fixture.value };
+      assert.equal(!!validatePolicyRefusal(payload), fixture.valid);
+      assert.equal(!!validatePolicyRefusal({ ...payload, origin: "child", role: "coder",
+        correlation_id: admitPolicyTurn("implement").correlation_id, parent_correlation_id: fixture.value }), fixture.valid);
+    });
+  }
+});
 
 describe("policy refusal closed metadata (#2321)", () => {
   const root = () => ({ ...admitPolicyTurn("plan"), event: "provider_policy_refusal" as const,

@@ -94,7 +94,18 @@ func newRunDecideCmd(env Env, gf *globalFlags) *cobra.Command {
 					return uzicli.Exitf(uzicli.ExitUsage, "--reason is only valid with --partial or --accept")
 				}
 				guidance, _ := cmd.Flags().GetString("guidance")
-				run, err := c.ContinueCompletionDecision(cmd.Context(), id, guidance)
+				if err := validatePolicyGuidance(guidance); err != nil {
+					return err
+				}
+				presented, err := c.GetRun(cmd.Context(), id)
+				if err != nil {
+					return err
+				}
+				token, err := policyActionToken(presented)
+				if err != nil {
+					return err
+				}
+				run, err := c.ContinueCompletionDecisionWithOptions(cmd.Context(), id, guidance, uzicli.RunActionOptions{ActionIfMatch: token})
 				if err != nil {
 					return err
 				}
@@ -128,11 +139,11 @@ func newRunDecideCmd(env Env, gf *globalFlags) *cobra.Command {
 				if len(keep) == 0 {
 					return uzicli.Exitf(uzicli.ExitUsage, "no milestone ids in --partial")
 				}
-				rev, err := runCompletionRevision(cmd, c, id)
+				rev, token, err := runCompletionRevision(cmd, c, id)
 				if err != nil {
 					return err
 				}
-				run, err := c.PartialCompletionDecision(cmd.Context(), id, keep, reason, rev)
+				run, err := c.PartialCompletionDecisionWithOptions(cmd.Context(), id, keep, reason, rev, uzicli.RunActionOptions{ActionIfMatch: token})
 				if err != nil {
 					return err
 				}
@@ -162,11 +173,11 @@ func newRunDecideCmd(env Env, gf *globalFlags) *cobra.Command {
 			if len(criteria) == 0 {
 				return uzicli.Exitf(uzicli.ExitUsage, "no criterion ids in --accept")
 			}
-			rev, err := runCompletionRevision(cmd, c, id)
+			rev, token, err := runCompletionRevision(cmd, c, id)
 			if err != nil {
 				return err
 			}
-			run, err := c.AcceptCompletionDecision(cmd.Context(), id, criteria, reason, rev)
+			run, err := c.AcceptCompletionDecisionWithOptions(cmd.Context(), id, criteria, reason, rev, uzicli.RunActionOptions{ActionIfMatch: token})
 			if err != nil {
 				return err
 			}
@@ -217,13 +228,14 @@ func parseIDList(raw string) []string {
 // completion-blocked — which partial/accept require — so it is an honest ExitConflict here rather
 // than a misleading server 400 ("contract_revision required"). A foreign/unknown run surfaces as
 // the GetRun 404 (ExitNotFound) automatically.
-func runCompletionRevision(cmd *cobra.Command, c uzicli.Client, id string) (int, error) {
+func runCompletionRevision(cmd *cobra.Command, c uzicli.Client, id string) (int, string, error) {
 	run, err := c.GetRun(cmd.Context(), id)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	if run.CompletionRevision == nil {
-		return 0, uzicli.Exitf(uzicli.ExitConflict, "run %s has no completion contract to revise (it is not completion-blocked)", id)
+		return 0, "", uzicli.Exitf(uzicli.ExitConflict, "run %s has no completion contract to revise (it is not completion-blocked)", id)
 	}
-	return *run.CompletionRevision, nil
+	token, err := policyActionToken(run)
+	return *run.CompletionRevision, token, err
 }

@@ -1,0 +1,72 @@
+[
+  {
+    "name": "one",
+    "value": "pr-00000000000000000000000000000000-1",
+    "valid": true
+  },
+  {
+    "name": "safe_max",
+    "value": "pr-00000000000000000000000000000000-9007199254740991",
+    "valid": true
+  },
+  {
+    "name": "unsafe",
+    "value": "pr-00000000000000000000000000000000-9007199254740992",
+    "valid": false
+  },
+  {
+    "name": "zero",
+    "value": "pr-00000000000000000000000000000000-0",
+    "valid": false
+  },
+  {
+    "name": "leading_zero",
+    "value": "pr-00000000000000000000000000000000-01",
+    "valid": false
+  },
+  {
+    "name": "seventeen_digits",
+    "value": "pr-00000000000000000000000000000000-10000000000000000",
+    "valid": false
+  },
+  {
+    "name": "upper_nonce",
+    "value": "pr-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-1",
+    "valid": false
+  },
+  {
+    "name": "short_nonce",
+    "value": "pr-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-1",
+    "valid": false
+  },
+  {
+    "name": "long_nonce",
+    "value": "pr-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-1",
+    "valid": false
+  },
+  {
+    "name": "newline",
+    "value": "pr-00000000000000000000000000000000-1\n",
+    "valid": false
+  },
+  {
+    "name": "control",
+    "value": "pr-00000000000000000000000000000000-1\u0000",
+    "valid": false
+  },
+  {
+    "name": "negative",
+    "value": "pr-00000000000000000000000000000000--1",
+    "valid": false
+  },
+  {
+    "name": "empty",
+    "value": "pr-00000000000000000000000000000000-",
+    "valid": false
+  },
+  {
+    "name": "leading_space",
+    "value": " pr-00000000000000000000000000000000-1",
+    "valid": false
+  }
+]

@@ -352,6 +352,11 @@ export interface HarnessAgent {
 }
 
 export interface RunTurnRequest {
+  /** Trusted worker admission and until-terminal constraint; never prompt-derived. */
+  policyHoldSupported?: boolean;
+  policyHoldResume?: boolean;
+  /** Server-derived permission for this exact claim only (M2 owner action). */
+  policyHoldFreshSession?: boolean;
   semanticPlanning?: import("./semantic-plan.js").SemanticPlanning;
   /** Worker has materialized and bound the current claim evidence reader. */
   ciEvidencePrepared?: boolean;

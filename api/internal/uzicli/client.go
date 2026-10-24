@@ -114,6 +114,7 @@ type Client interface {
 	// /api/runs/{id}/resume-now, RequireUser so a CLI token can reach it. A non-held run
 	// is a 409 → ExitConflict (5); a foreign/absent run is 404 → 4. No request body.
 	ResumeRunNow(ctx context.Context, id string) (apitypes.RunDTO, error)
+	ResumeRunNowWithOptions(ctx context.Context, id string, opts RunResumeOptions) (apitypes.RunDTO, error)
 	// SetRunCredential is the `uzi run set-token` verb (PRD #1247 M4, D4/D12): POST
 	// /api/runs/{id}/credential {mode, secret_id?}, RequireUser so a uzc_ CLI Bearer reaches
 	// it. It re-points which Anthropic token a queued or parked run spends (promoting a
@@ -146,6 +147,7 @@ type Client interface {
 	// → ExitConflict (5); guidance too long is 400 → ExitUsage (2) — via the shared status→exit
 	// mapping.
 	ContinueCompletionDecision(ctx context.Context, id string, guidance string) (apitypes.RunDTO, error)
+	ContinueCompletionDecisionWithOptions(ctx context.Context, id string, guidance string, opts RunActionOptions) (apitypes.RunDTO, error)
 	// PartialCompletionDecision records the owner's PARTIAL (scope-reduced) decision on a
 	// completion-blocked run (PRD #1227 M5): POST /api/runs/{id}/completion/decision
 	// {decision:"partial", keep, reason, contract_revision}, RequireUser so a `uzc_` token reaches
@@ -156,6 +158,7 @@ type Client interface {
 	// revision is 409 → ExitConflict (5); a missing reason, a non-positive revision or an unknown
 	// milestone id is 400 → ExitUsage (2) — via the shared status→exit mapping.
 	PartialCompletionDecision(ctx context.Context, id string, keep []string, reason string, contractRevision int) (apitypes.RunDTO, error)
+	PartialCompletionDecisionWithOptions(ctx context.Context, id string, keep []string, reason string, contractRevision int, opts RunActionOptions) (apitypes.RunDTO, error)
 	// AcceptCompletionDecision records the owner's ACCEPT (criteria-waived) decision on a
 	// completion-blocked run (PRD #1227 M5): POST /api/runs/{id}/completion/decision
 	// {decision:"accept", criteria, reason, contract_revision}, RequireUser so a `uzc_` token
@@ -164,6 +167,7 @@ type Client interface {
 	// contract revision the server fences on. Returns the resumed run. It shares
 	// PartialCompletionDecision's status→exit mapping (404/409/400 → 4/5/2).
 	AcceptCompletionDecision(ctx context.Context, id string, criteria []string, reason string, contractRevision int) (apitypes.RunDTO, error)
+	AcceptCompletionDecisionWithOptions(ctx context.Context, id string, criteria []string, reason string, contractRevision int, opts RunActionOptions) (apitypes.RunDTO, error)
 	// SelfRateLimits returns the caller's OWN per-token rate-limit meters, each
 	// carrying the server-computed auto-selection status: GET /api/me/rate-limits.
 	//
@@ -931,10 +935,18 @@ func isLoopbackURL(u *url.URL) bool {
 // HTTP-status classification, since some callers (the poll loop) branch on
 // non-error statuses like 202/410 that others treat as failures.
 func (c *HTTPClient) doJSONRead(ctx context.Context, method, path string, reqBody any) (*http.Response, []byte, error) {
-	return c.doJSONReadOwner(ctx, method, path, reqBody, false)
+	return c.doJSONReadOwnerHeaders(ctx, method, path, reqBody, false, nil)
+}
+
+func (c *HTTPClient) doJSONReadHeaders(ctx context.Context, method, path string, reqBody any, headers http.Header) (*http.Response, []byte, error) {
+	return c.doJSONReadOwnerHeaders(ctx, method, path, reqBody, false, headers)
 }
 
 func (c *HTTPClient) doJSONReadOwner(ctx context.Context, method, path string, reqBody any, ownerRun bool) (*http.Response, []byte, error) {
+	return c.doJSONReadOwnerHeaders(ctx, method, path, reqBody, ownerRun, nil)
+}
+
+func (c *HTTPClient) doJSONReadOwnerHeaders(ctx context.Context, method, path string, reqBody any, ownerRun bool, headers http.Header) (*http.Response, []byte, error) {
 	var body io.Reader
 	if reqBody != nil {
 		b, err := json.Marshal(reqBody)
@@ -946,6 +958,11 @@ func (c *HTTPClient) doJSONReadOwner(ctx context.Context, method, path string, r
 	req, err := c.newRequest(ctx, method, path, body)
 	if err != nil {
 		return nil, nil, err
+	}
+	for key, values := range headers {
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
 	}
 	if input, ok := reqBody.(apitypes.RunInputRequest); ok && input.SemanticApproval != nil {
 		req.Header.Set(apitypes.SemanticIdentityHeader, apitypes.SemanticIdentityVersion)

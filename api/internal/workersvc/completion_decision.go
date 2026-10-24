@@ -47,6 +47,7 @@ const maxCompletionReasonBytes = 8 * 1024
 // authorize_maintainer renews exact existing semantic maintainer UUIDs and their
 // frozen reason/conditions/verification steps; it never reclassifies or verifies work.
 type CompletionDecisionInput struct {
+	ActionIfMatch    string `json:"-"`
 	Maintainers      []apitypes.SemanticMaintainerApproval
 	Decision         string
 	Guidance         string
@@ -112,8 +113,8 @@ type CompletionDecisionInput struct {
 // All writes happen BEFORE the resume transition (paused case) so the follow_up is enqueued while
 // the run is still paused and the new claim cannot race past it. For the live awaiting_input
 // window there is no transition, so ordering is immaterial there.
-func (s *Service) ContinueCompletionDecision(ctx context.Context, userID, runID uuid.UUID, guidance string) (store.Run, error) {
-	run, err := s.GetRun(ctx, userID, runID)
+func (s *Service) ContinueCompletionDecision(ctx context.Context, userID, runID uuid.UUID, guidance string, presentedToken ...string) (store.Run, error) {
+	_, err := s.GetRun(ctx, userID, runID)
 	if err != nil {
 		return store.Run{}, err
 	}
@@ -121,21 +122,40 @@ func (s *Service) ContinueCompletionDecision(ctx context.Context, userID, runID 
 	// NUL-strip it like the partial/accept reason (#1227): a NUL raises SQLSTATE 22021 and fails
 	// the decision (#1728). An all-NUL guidance strips to "", the existing bare-continue case.
 	guidance, _ = stripNUL(guidance)
-	// The continue writes are NON-transactional and otherwise byte-identical to #1226: the shared
-	// resumeCompletionBlocked helper (also used by the #1227 partial/accept transaction) executes
-	// them against s.q, with followupGuidance == auditBody == guidance.
-	if err := resumeCompletionBlocked(ctx, s.q, run, userID, guidance, guidance, int32(s.p.RunTimeout.Seconds()), s.staleWorkerCutoff()); err != nil {
+	// Every completion decision uses the run lock: a policy report can arrive
+	// after the owner pre-read in either the paused or live question window.
+	if s.txBeginner == nil {
+		return store.Run{}, fmt.Errorf("completion decision transaction unavailable")
+	}
+	tx, err := s.beginReadCommitted(ctx)
+	if err != nil {
 		return store.Run{}, err
 	}
-	// Re-read owner-scoped so the DTO reflects the resumed (queued) status for the paused case,
-	// and the unchanged awaiting_input status for the live case.
+	defer func() { _ = tx.Rollback(ctx) }()
+	q := store.New(tx)
+	locked, err := q.GetRunByIDForUpdate(ctx, runID)
+	if err != nil {
+		return store.Run{}, err
+	}
+	if locked.UserID != userID {
+		return store.Run{}, ErrRunNotFound
+	}
+	token := ""
+	if len(presentedToken) > 0 {
+		token = presentedToken[0]
+	}
+	if err := s.resumeCompletionBlocked(ctx, q, locked, userID, guidance, guidance, token); err != nil {
+		return store.Run{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return store.Run{}, err
+	}
 	return s.GetRun(ctx, userID, runID)
 }
 
 // resumeCompletionBlocked performs the shared resume mechanics for an owner decision on a
 // completion-blocked run (PRD #1226 D7 / #1227 M1), against a query surface q (the pool-backed
-// s.q for the non-transactional continue path, or a tx-bound *store.Queries for the partial/accept
-// transaction). It dispatches on the two completion-blocked states and refuses a run in neither:
+// transaction-bound queries for continue and partial/accept). It dispatches on the two completion-blocked states and refuses a run in neither:
 //
 //   - awaiting_input + completionQuestionOpen(run) + a live open_question_id: the LIVE window. The
 //     decision resumes IN PLACE (no status transition — the worker reports running itself). The
@@ -154,7 +174,11 @@ func (s *Service) ContinueCompletionDecision(ctx context.Context, userID, runID 
 // ConsumeRunInputs so the worker never drains it) and CLEARS the served budget_exhausted steer
 // (D3). For the partial/accept path the caller runs this LAST inside the transaction, so a
 // not-blocked run rolls back the revision bump and permit invalidation atomically.
-func resumeCompletionBlocked(ctx context.Context, q Store, run store.Run, userID uuid.UUID, followupGuidance, auditBody string, globalTimeoutSeconds int32, staleCutoff pgtype.Timestamptz) error {
+func (s *Service) resumeCompletionBlocked(ctx context.Context, q Store, run store.Run, userID uuid.UUID, followupGuidance, auditBody, token string) error {
+	constrained := PolicyOwnerConstrained(run)
+	if constrained && (token == "" || token != PolicyHoldActionToken(run)) {
+		return ErrStaleClaim
+	}
 	live := false
 	paused := false
 	switch {
@@ -183,7 +207,7 @@ func resumeCompletionBlocked(ctx context.Context, q Store, run store.Run, userID
 		}); err != nil {
 			return err
 		}
-	} else if followupGuidance != "" {
+	} else if followupGuidance != "" && !constrained {
 		if _, err := q.CreateRunInput(ctx, store.CreateRunInputParams{
 			RunID: run.ID, Kind: "follow_up", Body: pgconv.TextOrNull(followupGuidance),
 		}); err != nil {
@@ -198,6 +222,16 @@ func resumeCompletionBlocked(ctx context.Context, q Store, run store.Run, userID
 	if _, err := q.ClearCompletionBudgetExhausted(ctx, run.ID); err != nil {
 		return err
 	}
+	if paused && constrained {
+		lockedQueries, ok := q.(*store.Queries)
+		if !ok {
+			return fmt.Errorf("policy completion resume requires locked queries")
+		}
+		_, err := s.resumePolicyHoldLocked(ctx, lockedQueries, run, token, PolicyResumeRequest{
+			Mode: "preserve", Guidance: followupGuidance, completionDecision: true,
+		})
+		return err
+	}
 	if paused {
 		// PRD #1497 M1 (D6): ResumePausedRun refuses a completion_blocked hold to the owner-facing /
 		// credential resume paths; the completion decision endpoint is its dedicated exception, so it
@@ -207,8 +241,8 @@ func resumeCompletionBlocked(ctx context.Context, q Store, run store.Run, userID
 			ID:                         run.ID,
 			UserID:                     userID,
 			AllowCompletionBlockedHold: true,
-			GlobalTimeoutSeconds:       globalTimeoutSeconds,
-			StaleCutoff:                staleCutoff,
+			GlobalTimeoutSeconds:       int32(s.p.RunTimeout.Seconds()),
+			StaleCutoff:                s.staleWorkerCutoff(),
 		}); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return ErrCompletionNotBlocked
@@ -237,7 +271,7 @@ func completionQuestionOpen(run store.Run) bool {
 // dispatches on req.Decision:
 //
 //   - "continue": owner-only via ContinueCompletionDecision, with the existing NUL stripping;
-//     no transaction or contract change.
+//     decisions lock the run before writing; no contract change.
 //   - "partial" / "accept": OWNER-SCOPED (GetRun authorizes the caller, exactly like continue and
 //     CreateRunInput), then ONE transaction that, under the run's FOR UPDATE row lock (the mutex,
 //     like completeRunWithPermitLease): re-checks ownership against the locked row, fences on the
@@ -255,7 +289,7 @@ func (s *Service) DecideCompletion(ctx context.Context, userID uuid.UUID, runID 
 	switch req.Decision {
 	case "continue":
 		// Owner-only, as #1226 apart from the #1728 NUL strip (ContinueCompletionDecision's GetRun is owner-scoped).
-		return s.ContinueCompletionDecision(ctx, userID, runID, req.Guidance)
+		return s.ContinueCompletionDecision(ctx, userID, runID, req.Guidance, req.ActionIfMatch)
 	case "partial", "accept", "authorize_maintainer":
 		// handled below
 	default:
@@ -319,6 +353,9 @@ func (s *Service) DecideCompletion(ctx context.Context, userID uuid.UUID, runID 
 	// TOCTOU while staying strictly owner-only — no admin bypass, so no admin_ro token can write.
 	if locked.UserID != userID {
 		return store.Run{}, ErrRunNotFound
+	}
+	if PolicyOwnerConstrained(locked) && (req.ActionIfMatch == "" || req.ActionIfMatch != PolicyHoldActionToken(locked)) {
+		return store.Run{}, ErrStaleClaim
 	}
 	// The revision fence. An unfrozen row (revision NULL) is not revisable → conflict (fail-closed;
 	// a retry after the freeze lands succeeds). Otherwise compare-and-set on cur:
@@ -392,7 +429,7 @@ func (s *Service) DecideCompletion(ctx context.Context, userID uuid.UUID, runID 
 	if err != nil {
 		return store.Run{}, err
 	}
-	if err := resumeCompletionBlocked(ctx, qtx, locked, locked.UserID, dec.Reason, auditBody, int32(s.p.RunTimeout.Seconds()), s.staleWorkerCutoff()); err != nil {
+	if err := s.resumeCompletionBlocked(ctx, qtx, locked, locked.UserID, dec.Reason, auditBody, req.ActionIfMatch); err != nil {
 		return store.Run{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {

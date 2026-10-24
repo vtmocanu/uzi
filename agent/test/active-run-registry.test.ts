@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
-import type { PendingTerminal } from "../src/outbox.js";
+import type { PendingTerminal, PendingPolicy } from "../src/outbox.js";
 
 // PRD #1390 M2a / #1391 Run B M4 — the worker-side active-run registry: the source of every
 // ActiveSnapshot the worker sends on the heartbeat, the run-lane claim, and the register request.
@@ -12,6 +12,117 @@ import type { PendingTerminal } from "../src/outbox.js";
 
 const RUN_A = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 const RUN_B = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+
+describe("combined policy inventory", () => {
+  const policy = (run_id: string, source: number, current: number, settled = false): PendingPolicy => ({
+    run_id, outcome: { outcome_id: "11111111-1111-4111-8111-111111111111",
+      source_generation: source, detail: "resume_rejected", head: "", published: false },
+    delivery: { claim_generation: current, inventory_generation: current }, since: source,
+    ...(settled ? { server_settled: true as const } : {}),
+  });
+
+  it("deduplicates mixed terminal/policy generations before cap choice and boot registration", () => {
+    const policies = [policy(RUN_A, 1, 5), policy(RUN_A, 2, 4), policy(RUN_B, 1, 2, true)];
+    const reg = new ActiveRunRegistry(() => [pt(RUN_A, 3)], () => 1, () => policies);
+    reg.add(RUN_A, 4);
+    const boot = reg.buildRegisterSnapshot();
+    assert.deepEqual(boot.pending_all, [{ run_id: RUN_A, claim_generation: 5 }]);
+    assert.equal(boot.pending_overflow, true);
+    const snap = reg.build();
+    assert.equal(snap.pending_overflow, false);
+    assert.equal(snap.active.length, 1);
+    assert.equal(snap.active[0]!.claim_generation, 5);
+    assert.equal(snap.active[0]!.terminal_pending, true);
+  });
+
+  it("merges only policy-affected runs and uses delivery inventory rather than source generation", () => {
+    const policies = [policy(RUN_A, 1, 4), policy(RUN_A, 2, 5)];
+    const reg = new ActiveRunRegistry(
+      () => [pt(RUN_A, 3), pt(RUN_A, 6), pt(RUN_B, 1), pt(RUN_B, 2)],
+      () => 3, () => policies,
+    );
+    const snap = reg.build();
+    assert.deepEqual(snap.active.map(e => [e.run_id, e.claim_generation]),
+      [[RUN_A, 6], [RUN_B, 1], [RUN_B, 2]]);
+    assert.deepEqual(snap.pending_all, [
+      { run_id: RUN_A, claim_generation: 6 },
+      { run_id: RUN_B, claim_generation: 1 },
+      { run_id: RUN_B, claim_generation: 2 },
+    ]);
+    assert.equal(snap.pending_overflow, false);
+  });
+
+  for (const cap of [0, 1, 8]) {
+    it(`old policy inventory preserves a newer live claim during prepare at cap ${cap}`, () => {
+      const policies = [policy(RUN_A, 1, 1)];
+      const original = structuredClone(policies);
+      let calls = 0;
+      const reg = new ActiveRunRegistry(undefined, () => cap, () => {
+        calls += 1;
+        return calls === 1 ? policies : [];
+      });
+      reg.add(RUN_A, 3);
+      reg.setPhase(RUN_A, "awaiting_input");
+      const snap = reg.build();
+      assert.equal(calls, 1, "one policy observation feeds the whole projection");
+      assert.deepEqual(snap.active, [
+        { run_id: RUN_A, claim_generation: 3, phase: "awaiting_input", terminal_pending: false },
+      ]);
+      assert.deepEqual(snap.pending_all, [{ run_id: RUN_A, claim_generation: 1 }]);
+      assert.equal(snap.pending_overflow, cap === 0);
+      assert.deepEqual(policies, original, "projection cannot settle or rebind the old journal");
+      const stable = new ActiveRunRegistry(undefined, () => cap, () => policies);
+      stable.add(RUN_A, 3);
+      assert.equal(stable.claimsPausedByPendingOverflow(), cap === 0);
+    });
+  }
+
+  for (const generation of [3, 4]) {
+    it(`pending delivery generation ${generation} takes precedence over live generation 3`, () => {
+      const reg = new ActiveRunRegistry(undefined, () => 8, () => [policy(RUN_A, 1, generation)]);
+      reg.add(RUN_A, 3);
+      assert.deepEqual(reg.build().active, [
+        { run_id: RUN_A, claim_generation: generation, phase: "running", terminal_pending: true },
+      ]);
+    });
+  }
+
+  it("settled policies neither coalesce legacy duplicates nor hide live runs", () => {
+    const reg = new ActiveRunRegistry(
+      () => [pt(RUN_B, 1), pt(RUN_B, 2)], () => 8,
+      () => [policy(RUN_A, 1, 9, true), policy(RUN_B, 1, 9, true)],
+    );
+    reg.add(RUN_A, 3);
+    assert.deepEqual(reg.build().active, [
+      { run_id: RUN_A, claim_generation: 3, phase: "running", terminal_pending: false },
+      { run_id: RUN_B, claim_generation: 1, phase: "running", terminal_pending: true },
+      { run_id: RUN_B, claim_generation: 2, phase: "running", terminal_pending: true },
+    ]);
+    assert.equal(reg.claimsPausedByPendingOverflow(), false);
+  });
+
+  it("an unowned terminal cannot hide a leasable policy for the same run", () => {
+    const unowned = { ...pt(RUN_A, 9), blocked: true, blocked_reason: "run_not_owned" as const };
+    const reg = new ActiveRunRegistry(() => [unowned], () => 1, () => [policy(RUN_A, 1, 3)]);
+    assert.equal(reg.build().active[0]!.claim_generation, 3);
+    assert.equal(reg.claimsPausedByPendingOverflow(), false);
+    assert.equal(reg.buildRegisterSnapshot().pending_all![0]!.claim_generation, 9);
+  });
+
+  it("cap zero protects all and overflow rotates one slot per distinct run", () => {
+    const policies = [policy(RUN_A, 1, 3), policy(RUN_A, 2, 3), policy(RUN_B, 1, 4)];
+    let cap = 0;
+    const reg = new ActiveRunRegistry(undefined, () => cap, () => policies);
+    assert.equal(reg.claimsPausedByPendingOverflow(), true);
+    assert.deepEqual(reg.build().active, []);
+    cap = 1;
+    const seen = new Set([reg.build().active[0]!.run_id, reg.build().active[0]!.run_id]);
+    assert.deepEqual(seen, new Set([RUN_A, RUN_B]));
+    cap = 2;
+    assert.equal(reg.claimsPausedByPendingOverflow(), false);
+    assert.equal(reg.build().pending_all!.length, 2);
+  });
+});
 
 /** Build a PendingTerminal fixture. `since` orders the round-robin (oldest-first); `blocked`
  *  promotes an entry into the fixed listing slots. */

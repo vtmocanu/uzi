@@ -58,6 +58,7 @@ import { isParkAnswer, parkRunEnabled, parkRunEligible, PARK_RUN_CONTINUATION } 
 import { ownedSummaryFactories, ownedSummaryHarnesses, summaryCallDeadlines, summaryOwnership, type SummaryOwnership } from "./summary-ownership.js";
 import { MaintenanceBudget } from "../maintenance-budget.js";
 import { chunkedTimeout } from "../chunked-timeout.js";
+import { PolicyResumeRejected, ProviderPolicyRefusal } from "../provider-policy-refusal.js";
 import { CI_EVIDENCE_READ, readCIEvidence, ciEvidencePrompt } from "../ci-evidence-tools.js";
 import { TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
 import { checkedImplementationContext, nextAutomaticRound, validateCheckedPlanBundle } from "../checked-plan.js";
@@ -125,7 +126,7 @@ import {
   type TurnStreamEnd,
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
-import { interruptedSnapshotNote, interruptedCallsNote, NON_CLOSING_REMINDER, COMPLETION_CONTRACT_GUIDANCE, CURRENT_EXECUTION_STATE_GUIDANCE, depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, renderPlanApprovalAdvice, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBatch, REVIEWED_RESUME_APPROVAL_GUIDANCE, selectPriorOwnerHistory, renderPriorOwnerHistory } from "../prompt.js";
+import { interruptedSnapshotNote, interruptedCallsNote, NON_CLOSING_REMINDER, COMPLETION_CONTRACT_GUIDANCE, CURRENT_EXECUTION_STATE_GUIDANCE, depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, renderPlanApprovalAdvice, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBlock, FOLLOW_UP_TRAILER, renderFollowUpBatch, REVIEWED_RESUME_APPROVAL_GUIDANCE, selectPriorOwnerHistory, renderPriorOwnerHistory } from "../prompt.js";
 import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts, type EnvProbeSpawner } from "../env-probe.js";
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
@@ -395,7 +396,8 @@ class CodexVaultLockState {
   /** True once a refresh was deferred by a locked vault; never cleared within one run() call. */
   latched = false;
   /** True from the first plan-gate submission until approval: the server row is awaiting_approval
-   *  and can never park, so a lock seen in that window is not latched (see onVaultLocked). */
+   *  and cannot credential-park, so a vault lock there is not latched. Negotiated policy
+   *  refusal holds use their separate sink (see onVaultLocked). */
   gateOpen = false;
   /** The live turn's trip, set by driveCodexTurn for the turn's duration. */
   activeTurnTrip: ((reason: string) => void) | undefined;
@@ -2114,6 +2116,14 @@ function childInterruptDeadlineMs(boundaryDeadlineMs: number): number {
   return Math.min(5_000, Math.max(1, Math.floor(boundaryDeadlineMs / 4)));
 }
 
+
+function admittedPolicyOutcome(ctx: RunContext, error: unknown): error is PolicyResumeRejected | ProviderPolicyRefusal {
+  if (error instanceof PolicyResumeRejected) return ctx.policyHoldResume === true;
+  return ctx.policyHoldSupported === true && ctx.interactive !== true
+    && (ctx.kind === "issue" || ctx.kind === "task" || ctx.kind === "prompt" || ctx.kind === "self_improve")
+    && error instanceof ProviderPolicyRefusal && error.policyRefusal.origin === "root";
+}
+
 export class CodexExecutor implements Executor {
   /** M3/M4 (PRD #1171): the Codex outer safety facade, POPULATED at the top of `run()` (before
    *  any model work) with the per-sink auth-mode reconcile closure. The runner's durability
@@ -2905,6 +2915,21 @@ export class CodexExecutor implements Executor {
     // each epoch's local-execution epoch and its own owned HOME; `provisionDir` is the ONE per-run
     // provisioning dir the finally removes.
     let epoch: ProviderEpoch | undefined;
+    let policyOutcome: PolicyResumeRejected | ProviderPolicyRefusal | undefined;
+    const checkPolicyCancellation = (): void => {
+      if (policyOutcome && (ctx.cancelRequested?.() || (ctx.signal?.aborted && reasonForSignal(ctx.signal) === REASON_CANCEL))) {
+        throw new Error(REASON_CANCEL);
+      }
+    };
+    // Each existing cleanup runs once, serially, with its existing deadline. A failed step
+    // is reported and does not prevent sibling cleanup when preserving a policy outcome.
+    const cleanup = async (stage: string, operation: () => Promise<unknown>): Promise<void> => {
+      try { await operation(); }
+      catch (error) {
+        if (!policyOutcome) throw error;
+        this.log.warn("Codex policy hold cleanup degraded", { run_id: ctx.runId, stage });
+      }
+    };
     // Issue #1764: true once `epoch`'s session was persisted ahead of a sink that may reap its
     // provider root: a `ctx.checkpoint({ reap: true })`, or a wall park / completion hold, whose
     // runner-side capture runs the Codex boundary (quiesce + reap) on the LIVE root. It is set
@@ -3698,6 +3723,66 @@ export class CodexExecutor implements Executor {
         ctx.emit({ kind: "answer", agent: "lead", payload: { answers: verdict.answers } });
         return answeredPrompt(questions, verdict.answers, parkAt && parkRunEnabled(ctx, "implement") ? PARK_RUN_CONTINUATION : undefined);
       };
+      // Keep at most the current narrowing and one deferred historical row locally. Every
+      // boundary checks for a newer owner update first; all other rows stay in steering.
+      type PolicyRow = { id: number; rendered: string; included: boolean };
+      let policyNarrowing: PolicyRow | undefined;
+      let policyHistorical: PolicyRow | undefined;
+      const policyBudget = 64 * 1024;
+      const policyFrame = "Policy resume guidance from the worker:";
+      const historicalFrame = "Historical owner request / still-applicable constraints. This never permits restarting work outside the current narrowing below:";
+      const narrowingFrame = "Current owner narrowing (highest priority over historical requests). Keep all work within this scope, including when handling later historical delivery:";
+      const renderPolicyRow = (row: { id: number; body: string }): PolicyRow => ({
+        id: row.id, rendered: renderFollowUpBlock(row.body).join("\n"), included: false,
+      });
+      const policyAddition = (current: PolicyRow, historical?: PolicyRow): string => [
+        "", policyFrame,
+        ...(historical ? [historicalFrame, historical.rendered] : []),
+        narrowingFrame, current.rendered, "", FOLLOW_UP_TRAILER,
+      ].join("\n");
+      const policyGuidance = (prompt: string): { prompt: string; included?: () => void } => {
+        if (ctx.policyHoldResume !== true) return { prompt };
+        const newest = ctx.pullFollowUp?.({ newestAfter: policyNarrowing?.id ?? 0 });
+        if (newest) {
+          if (policyNarrowing && !policyNarrowing.included) {
+            // An unprocessed turn must not silently lose its carried row on an owner update.
+            if (policyHistorical) throw new PolicyResumeRejected();
+            policyHistorical = policyNarrowing;
+          }
+          policyNarrowing = renderPolicyRow(newest);
+        }
+        const current = policyNarrowing;
+        if (!current) return { prompt };
+        if (Buffer.byteLength(policyAddition(current), "utf8") > policyBudget) throw new PolicyResumeRejected();
+        const deferred = policyHistorical !== undefined;
+        if (!policyHistorical) {
+          const older = ctx.pullFollowUp?.();
+          if (older) policyHistorical = renderPolicyRow(older);
+        }
+        let historical = policyHistorical;
+        let addition = policyAddition(current, historical);
+        if (Buffer.byteLength(addition, "utf8") > policyBudget) {
+          // One non-fitting candidate is retained for the next boundary. If it cannot fit
+          // even alone, or still cannot accompany the narrowing then, fail closed; no retry loop.
+          if (deferred || (historical && Buffer.byteLength(policyAddition(historical), "utf8") > policyBudget)) {
+            throw new PolicyResumeRejected();
+          }
+          historical = undefined;
+          addition = policyAddition(current);
+        }
+        const riding = historical ? [historical, current] : [current];
+        return {
+          prompt: prompt + addition,
+          included: () => {
+            for (const row of riding) {
+              if (row.included) continue;
+              row.included = true;
+              ctx.followUpIncluded?.(row.id);
+            }
+            if (historical && policyHistorical === historical) policyHistorical = undefined;
+          },
+        };
+      };
       const drivePlan = async (initialPrompt: string, humanRevision = false) => {
         // issue #2213: a quarantined worker stops a run cleanly at the plan and revise boundaries,
         // before the next prompt is built; the call-site gates remain the guarantee.
@@ -3712,7 +3797,8 @@ export class CodexExecutor implements Executor {
           let turn: Awaited<ReturnType<CodexExecutor["driveTurnWithWallPark"]>>;
           try {
             if (humanRevision) await ctx.beforePlanRevisionTurn?.();
-            turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, shared.selection.current, { completedCount: 0 }, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completion);
+            const guidance = policyGuidance(prompt);
+            turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", guidance.prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, shared.selection.current, { completedCount: 0 }, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completion, undefined, guidance.included);
           } catch (error) {
             if (!humanRevision || !(error instanceof TransientRecoveryError) || !error.providerOrigin || !ctx.retryPlanRevisionTurn) throw error;
             // The runner hook owns backoff and control checks. Redrive without a new cap,
@@ -3774,10 +3860,21 @@ export class CodexExecutor implements Executor {
         // timer's REASON_WALL, or a `wall` PauseNowSignal) parks the run instead of failing it, even
         // during planning. The current flight has not attempted completion yet, but a refusal
         // can report prior server completion attempts and must then route to the completion hold.
-        const planTurn = await drivePlan(this.planPrompt(ctx, environmentFacts));
-        if (planTurn.kind === "walled") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
-        if (planTurn.kind === "held") return { branch: ctx.branch, completionHeld: { reason: planTurn.reason } };
-        let planResult = planTurn.result;
+        const restorePolicyGate = ctx.policyHoldResume === true && ctx.resumePhase === "awaiting_approval" && !!ctx.approvedPlan?.trim();
+        let resumedVerdict = restorePolicyGate ? await ctx.takeResumedGateEvent?.(ctx.signal) : undefined;
+        if (resumedVerdict && !["revise", "reject", "cancel"].includes(resumedVerdict.kind)) {
+          ctx.emit({ kind: "status", agent: "worker", payload: { text: "ignoring unmatched carried plan verdict" } });
+          resumedVerdict = undefined;
+        }
+        let planResult: ReducedTurnResult;
+        if (restorePolicyGate) {
+          planResult = { done: false, plan: ctx.approvedPlan!, milestones: ctx.frozenMilestones ?? undefined };
+        } else {
+          const planTurn = await drivePlan(this.planPrompt(ctx, environmentFacts));
+          if (planTurn.kind === "walled") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
+          if (planTurn.kind === "held") return { branch: ctx.branch, completionHeld: { reason: planTurn.reason } };
+          planResult = planTurn.result;
+        }
         let planMd = planResult.plan;
         if (planMd === undefined || planMd.trim().length === 0) {
           throw new TrustedExecutionRefusal("codex plan turn produced no plan");
@@ -3786,9 +3883,10 @@ export class CodexExecutor implements Executor {
         // report as rejectedMilestones, so the server rejects the candidate as a unit instead of
         // reading "no milestones" (or a narrowed list) as the completion contract.
         // Issue #1789: from the first gate submission until approval the server row is
-        // awaiting_approval and can never park, so a vault-lock latch must not change a turn's outcome.
+        // awaiting_approval and cannot credential-park. An admitted policy hold remains possible;
+        // a vault-lock latch must not change a turn's outcome.
         pauseNow.vaultLock.gateOpen = true;
-        let verdict = await ctx.gatePlan(planMd, planResult.rejectedMilestones ?? planResult.milestones, beginPlanSummary(), undefined, planResult.semanticSubmission);
+        let verdict = resumedVerdict ?? await ctx.gatePlan(planMd, planResult.rejectedMilestones ?? planResult.milestones, beginPlanSummary(), undefined, planResult.semanticSubmission);
         const maxRevisions = planMaxRevisionsOf(ctx.config);
         // Human revises only: an automatic (cross-check) round never spends this budget, so a later
         // human revise keeps its full plan_max_revisions (sdk-executor parity, PRD #2150/#2460).
@@ -4045,12 +4143,17 @@ export class CodexExecutor implements Executor {
         lastServedCompletionAttempts = served?.completionAttempts;
         lastServedCompletedCount = served?.completedCount;
         const boundaryCap = isIssueRun ? scopeCapAtBoundary({ served, frozen: milestones }) : undefined;
-        if (boundaryCap) {
-          scopeCapped = { completedCount: boundaryCap.completedCount, total: boundaryCap.total };
+        // A reached Stop ceiling may already cover the whole frozen plan. Use the
+        // ordinary loop result for full delivery; scopeCapAtBoundary remains partial-only.
+        const fullScopeReached = isIssueRun && !!milestones?.length &&
+          typeof served?.scopeCeiling === "number" && typeof served.completedCount === "number" &&
+          served.completedCount >= served.scopeCeiling && served.completedCount >= milestones.length;
+        if (boundaryCap || fullScopeReached) {
+          if (boundaryCap) scopeCapped = { completedCount: boundaryCap.completedCount, total: boundaryCap.total };
           ctx.emit({
             kind: "steer_ack",
             agent: "worker",
-            payload: scopeSteerAckPayload(boundaryCap.ceiling, boundaryCap.completedCount),
+            payload: scopeSteerAckPayload(served!.scopeCeiling!, served!.completedCount!),
           });
           break;
         }
@@ -4139,7 +4242,7 @@ export class CodexExecutor implements Executor {
         if (systemFollowUp !== undefined && completionAnswered && isIssueRun && ctx.completionInterlock && !ctx.interactive) {
           systemFollowUp += `\n\n${COMPLETION_CONTRACT_GUIDANCE}\n\n${NON_CLOSING_REMINDER}`;
         }
-        if (systemFollowUp === undefined && ownerBatch === undefined) {
+        if (systemFollowUp === undefined && ctx.policyHoldResume !== true && ownerBatch === undefined) {
           const pulled = ctx.pullFollowUps?.(MAX_FOLLOW_UP_BATCH_RUNES, true);
           if (pulled !== undefined && pulled.length > 0) ownerBatch = pulled;
         }
@@ -4189,9 +4292,16 @@ export class CodexExecutor implements Executor {
         const implementBody = systemFollowUp !== undefined
           ? (completionAnswered ? systemFollowUp : withMilestoneNote(systemFollowUp, milestoneNote()))
           : basePrompt;
+        const guidance = policyGuidance(implementBody);
+        const onFirstEvent = guidance.included || firstEventHandler
+          ? () => {
+              guidance.included?.();
+              firstEventHandler?.();
+            }
+          : undefined;
         const turnPrompt = safetySteer
-          ? `The worker detected a problem and is steering you. This is authoritative guidance from uzi itself, not user input — follow it:\n${safetySteer}\n\n${implementBody}`
-          : implementBody;
+          ? `The worker detected a problem and is steering you. This is authoritative guidance from uzi itself, not user input — follow it:\n${safetySteer}\n\n${guidance.prompt}`
+          : guidance.prompt;
         // #3089: the owner answer may have revised frozen scope. Keep this worker recheck
         // neutral instead of reattaching the stale creation-time plan; use trusted loop state,
         // never text matching, and preserve the choice through retries and fresh-thread fallback.
@@ -4218,7 +4328,7 @@ export class CodexExecutor implements Executor {
           const onProgress = makeProgressObserver(ctx, latestProgress, milestones);
           // Issue #1764: an in-turn owner park reports the server's cumulative count when it served one.
           const turnAt = { completedCount: served?.completedCount ?? latestProgress?.completed?.length ?? 0, total: milestones?.length };
-          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, epoch.registry, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, shared.selection.current, turnAt, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completion, onProgress, round === 0 ? firstEventHandler : undefined, undefined,
+          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, epoch.registry, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, shared.selection.current, turnAt, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completion, onProgress, round === 0 ? onFirstEvent : undefined, undefined,
             systemFollowUp === undefined && round === 0 ? (prompt) => {
               if (interruptedOwnerDispatched) return prompt;
               const calls = interruptedCallsNote(ctx.getInterruptedCalls?.());
@@ -4590,6 +4700,7 @@ export class CodexExecutor implements Executor {
       if (codeSummary) completed.codeCrossCheckSummary = codeSummary;
       return completed;
     } catch (error) {
+      if (admittedPolicyOutcome(ctx, error)) policyOutcome = error;
       bodyFailed = true;
       throw error;
     } finally {
@@ -4605,7 +4716,7 @@ export class CodexExecutor implements Executor {
         this.captureMayHaveDrained = undefined;
         this.epochAdmission = undefined;
         summaryState.closed = true;
-        await this.closeAndSettlePlanSummary();
+        await cleanup("summary", () => this.closeAndSettlePlanSummary());
         if (summaryResult && (ctx.claimFenced?.() || ctx.cancelRequested?.() || lifecycleSignal.aborted)) {
           delete summaryResult.summaryPlan;
           delete summaryResult.summaryDeltas;
@@ -4613,7 +4724,7 @@ export class CodexExecutor implements Executor {
         this.summaryLifecycleClosed = true;
         this.summaryRunActive = false;
         lifecycleSignal.removeEventListener("abort", intentAbort);
-        await settleInstall();
+        await cleanup("install", settleInstall);
         ctx.signal?.removeEventListener("abort", forwardInstallAbort);
         if (!this.deps.deferRegistryTeardown || epoch === undefined) {
           ctx.signal?.removeEventListener("abort", forwardLifecycleAbort);
@@ -4629,9 +4740,10 @@ export class CodexExecutor implements Executor {
         if (epoch) {
           // Issue #1764: a reaped epoch's home is gone; its session was persisted right before the
           // reap, so re-persisting would only overwrite that generation with an empty one.
-          if (beforeReapPersist) await beforeReapPersist;
-          if (!reapedSinceLastPersist) await epoch.persistSession();
-          await this.tearDownEpoch(epoch.registry, epoch.harness, epoch.fileopHandle, boundaryDeadlineMs, !this.deps.deferRegistryTeardown);
+          if (beforeReapPersist) await cleanup("pre-reap session persistence", () => beforeReapPersist!);
+          const finalEpoch = epoch;
+          if (!reapedSinceLastPersist) await cleanup("session persistence", () => finalEpoch.persistSession());
+          await cleanup("epoch teardown", () => this.tearDownEpoch(finalEpoch.registry, finalEpoch.harness, finalEpoch.fileopHandle, boundaryDeadlineMs, !this.deps.deferRegistryTeardown));
         }
         // (C) Evict the DURING-run released tokens (every epoch's provider-root launches + refreshes)
         // from the logger's secret set — AFTER the harness/transport is closed above, so no late log
@@ -4650,12 +4762,14 @@ export class CodexExecutor implements Executor {
         // Remove the per-run provisioning dir (the synthesized devbox.json + profile symlinks).
         // The nix STORE is global (on the data volume), NOT here, so this never evicts the
         // warm-start cache. Best-effort, mirroring sdk-executor. Absent ⇒ nothing was provisioned.
-        if (provisionDir) await removeProvisionDir(provisionDir, this.log);
+        if (provisionDir) await cleanup("provision directory", () => removeProvisionDir(provisionDir!, this.log));
         if (!bodyFailed && !this.deps.deferRegistryTeardown && [...this.unverifiedEpochRegistries].some(
           registry => this.ownedSummaryRegistries.has(registry))) {
           throw new TrustedExecutionRefusal("summary cleanup unproven");
         }
       });
+      // Cancel arriving during cleanup supersedes the retained policy outcome.
+      checkPolicyCancellation();
     }
   }
 
@@ -5042,15 +5156,17 @@ export class CodexExecutor implements Executor {
         resumeSessionId,
         buildPhaseBroker,
         // Persist THIS epoch's credential-free session subset into the SHARED store. Best-effort:
-        // a persist failure never blocks the reap/recreation (the store fails safe to a fresh
-        // session on the next adopt).
+        // a persist failure is reported and never blocks reap/recreation. A constrained
+        // request still requires its preserved identity or an exact fresh grant.
         // Issue #1782: an epoch recreated after a refused wall park persists nothing until its
         // provider has launched and adopted the session, so an unpopulated home never replaces the
         // generation persisted before the park.
         persistSession: async (): Promise<void> => {
           await settleDepsInstall();
           if (opts.persistAfterLaunchOnly && !launched) return;
-          await this.sessionStore.persist(codexHome, storeDir).catch(() => undefined);
+          await this.sessionStore.persist(codexHome, storeDir).catch(() => {
+            this.log.warn("Codex session persistence failed", { run_id: ctx.runId });
+          });
         },
         // Full teardown of an ABANDONED epoch on recreation: quiesce + reap (best-effort) +
         // disposeTools the registry (WITHOUT the onDispose token-eviction hook — a live token must
@@ -5162,8 +5278,9 @@ export class CodexExecutor implements Executor {
   /**
    * Drive ONE Codex turn, reimplementing the run-lane PRECEDENCE from sdk-executor.ts
    * driveTurn:
-   *   (a) a watchdog/cancel trip is FIRST-WINS — checked before/after the loop and in the
-   *       catch, so it beats a raw AbortError AND a later terminal;
+   *   (a) Cancel wins. An admitted root policy outcome survives watchdog/pause/wall/vault
+   *       trips. Otherwise the first watchdog/cancel trip beats a raw AbortError or
+   *       a later terminal, preserving the ordinary run-lane precedence;
    *   (b) a query/iteration/close THROW propagates (the harness's own unexpected-EOF is a
    *       `protocol` throw, NEVER a fabricated success);
    *   (c) a `turn_finished` `outcome:"failed"` is classified ONCE and materialized+thrown
@@ -5288,6 +5405,7 @@ export class CodexExecutor implements Executor {
           // A rejected thread/resume has started no model turn. The persisted rollout may
           // have disappeared or the provider may refuse it despite a successful preflight.
           if (!resumeId || !(error instanceof CodexResumeError)) throw error;
+          if (ctx.policyHoldResume === true && ctx.policyHoldFreshSession !== true) throw new PolicyResumeRejected();
           this.log.warn("codex provider rejected resumed thread; starting a fresh session", { run_id: ctx.runId });
           ctx.emit({ kind: "status", agent: "worker", payload: {
             text: "the earlier Codex session was rejected by the provider — continuing WITHOUT its earlier context, so some work may be repeated",
@@ -5341,10 +5459,15 @@ export class CodexExecutor implements Executor {
         }
       }
       if (terminal?.policyRefusal) {
+        const refusal = new ProviderPolicyRefusal(terminal.policyRefusal);
+        if (admittedPolicyOutcome(ctx, refusal)) {
+          if (tripReason === REASON_CANCEL || ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+          throw refusal;
+        }
         const pending = ctx.cancelRequested?.() ? REASON_CANCEL : this.pendingInterruption(ctx, pauseNow, wall);
         if (pending !== undefined) trip(pending);
       }
-      // (a) FIRST-WINS trip.
+      // (a) Ordinary FIRST-WINS after the admitted policy outcome check above.
       if (tripReason) throw this.tripError(tripReason, tripToken!);
       // (c) a failed terminal is classified ONCE and materialized+thrown here.
       if (sawTerminal && terminal && terminal.outcome === "failed") {
@@ -5362,6 +5485,11 @@ export class CodexExecutor implements Executor {
       // bounded, scrubbed tail.
       if (rootText) result.finalText = scrubLeadText(rootText);
     } catch (err) {
+      // An admitted policy outcome survives pause/wall/vault trips; Cancel still wins.
+      if (admittedPolicyOutcome(ctx, err)) {
+        if (tripReason === REASON_CANCEL || ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+        throw err;
+      }
       // (a) again: a trip beats the raw aborted/protocol error the iterator threw.
       if (tripReason) throw this.tripError(tripReason, tripToken!);
       throw err instanceof Error ? err : new Error(errMessage(err));
@@ -5538,6 +5666,10 @@ export class CodexExecutor implements Executor {
         // the next turn trips at its start and every boundary reconcile defers on the latch.
         return { kind: "turn", result };
       } catch (caught) {
+        if (admittedPolicyOutcome(ctx, caught)) {
+          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+          throw caught;
+        }
         let err: unknown = caught instanceof PauseNowSignal
           ? new CodexTurnTripError(REASON_PAUSE, pauseNow.capture()) : caught;
         // Issue #1789: a vault-lock latch in force turns the turn's failure into a deferral. Cancel
@@ -5981,6 +6113,9 @@ export class CodexExecutor implements Executor {
       phase,
       ownerDecisionRequested: ctx.completionInterlock === true && resolveRunKind(ctx.kind) === "issue" && !ctx.interactive,
       parkRunSupported: ctx.parkRunSupported,
+      policyHoldSupported: ctx.policyHoldSupported,
+      policyHoldResume: ctx.policyHoldResume,
+      policyHoldFreshSession: ctx.policyHoldFreshSession,
       // Phase-independent: the root vocabulary is registered once at thread/start and survives
       // the approval thread/resume; the broker gates the phase.
       nonInteractiveIssue: (ctx.kind ?? "issue") === "issue" && !ctx.interactive,

@@ -87,7 +87,7 @@ _inventory_diagnostic_rows() {
     FROM recovery_custody_holds h JOIN runs r ON r.id=h.run_id LEFT JOIN recovery_captures c ON c.hold_id=h.id
     WHERE h.user_id=(SELECT id FROM users WHERE email='$ADMIN_EMAIL') ORDER BY h.created_at,c.created_at"
   apiget /api/recovery/holds | jq -c '{kind:"owner_recovery",aggregate,holds:[.holds[]|{id,run_id,generation,state,attention,has_available_capture,capture_state,final_receipt}]}'
-  apiget /api/workers | jq -c '{kind:"workers",workers:[.workers[]|{id,status,max_concurrent_runs,outbox_pending_messages,outbox_pending_terminal,outbox_blocked,reported_runs}]}'
+  apiget /api/workers | jq -c '{kind:"workers",workers:[.workers[]|{id,status,max_concurrent_runs,outbox_pending_messages,outbox_pending_terminal,outbox_pending_policy,outbox_blocked,reported_runs}]}'
   local run
   while IFS= read -r run; do
     apiget "/api/runs/$run" | jq -c '{kind:"owner_run",run:(.run|{id,status,health,health_reason,outcome_pending,worker_recovery,fail_origin})}'

@@ -3,6 +3,7 @@ package uzicli
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strconv"
 
@@ -231,15 +232,55 @@ func (c *HTTPClient) SetRunPriority(ctx context.Context, id string, expedite boo
 	return env.Run, nil
 }
 
+type RunResumeOptions struct {
+	Guidance string `json:"guidance,omitempty"`
+	// Mode is preserve or fresh; validation remains the API's responsibility.
+	Mode          string `json:"mode,omitempty"`
+	ActionIfMatch string `json:"-"`
+}
+
 func (c *HTTPClient) ResumeRunNow(ctx context.Context, id string) (apitypes.RunDTO, error) {
 	var env struct {
 		Run apitypes.RunDTO `json:"run"`
 	}
-	// No request body — resume-now is a payload-less POST verb.
 	if err := c.postJSON(ctx, "/api/runs/"+url.PathEscape(id)+"/resume-now", nil, &env); err != nil {
 		return apitypes.RunDTO{}, err
 	}
 	return env.Run, nil
+}
+
+// ResumeRunNowWithOptions forwards only the owner's explicitly presented binding.
+// Conflicts return without fetching or replacing that binding.
+func (c *HTTPClient) ResumeRunNowWithOptions(ctx context.Context, id string, opts RunResumeOptions) (apitypes.RunDTO, error) {
+	var body any
+	if opts.Guidance != "" || opts.Mode != "" {
+		body = opts
+	}
+	var env struct {
+		Run apitypes.RunDTO `json:"run"`
+	}
+	if err := c.postJSONAction(ctx, "/api/runs/"+url.PathEscape(id)+"/resume-now", body, &env, opts.ActionIfMatch); err != nil {
+		return apitypes.RunDTO{}, err
+	}
+	return env.Run, nil
+}
+
+// RunActionOptions carries the quoted If-Match value the caller presented.
+type RunActionOptions struct {
+	ActionIfMatch string `json:"-"`
+}
+
+// postJSONAction uses the ordinary authenticated transport and status mapping.
+func (c *HTTPClient) postJSONAction(ctx context.Context, path string, body, out any, actionIfMatch string) error {
+	headers := http.Header{}
+	if actionIfMatch != "" {
+		headers.Set("If-Match", actionIfMatch)
+	}
+	resp, raw, err := c.doJSONReadHeaders(ctx, http.MethodPost, path, body, headers)
+	if err != nil {
+		return err
+	}
+	return decode2xx(resp, raw, path, out)
 }
 
 // SetRunCredentialOverride is the wire shape of PRD #1247 M4's `uzi run set-token` body:
@@ -248,8 +289,9 @@ func (c *HTTPClient) ResumeRunNow(ctx context.Context, id string) (apitypes.RunD
 // mirroring `uzi run create --token`) and empty for the other three modes. It mirrors the
 // server's inline request struct and the create path's CreateRunCredentialOverride.
 type SetRunCredentialOverride struct {
-	Mode     string
-	SecretID string
+	Mode          string
+	SecretID      string
+	ActionIfMatch string `json:"-"`
 }
 
 // setRunCredentialBody is the JSON wire body. secret_id is a `*string` with `omitempty` so
@@ -273,7 +315,7 @@ func (c *HTTPClient) SetRunCredential(ctx context.Context, id string, override S
 		Run     apitypes.RunDTO `json:"run"`
 		Warning string          `json:"warning"`
 	}
-	if err := c.postJSON(ctx, "/api/runs/"+url.PathEscape(id)+"/credential", body, &env); err != nil {
+	if err := c.postJSONAction(ctx, "/api/runs/"+url.PathEscape(id)+"/credential", body, &env, override.ActionIfMatch); err != nil {
 		return apitypes.RunDTO{}, "", err
 	}
 	return env.Run, env.Warning, nil
@@ -343,11 +385,15 @@ type completionDecisionRequest struct {
 // completion-blocked is 409 → ExitConflict (5); guidance too long / a bad decision is 400 →
 // ExitUsage (2).
 func (c *HTTPClient) ContinueCompletionDecision(ctx context.Context, id string, guidance string) (apitypes.RunDTO, error) {
+	return c.ContinueCompletionDecisionWithOptions(ctx, id, guidance, RunActionOptions{})
+}
+
+func (c *HTTPClient) ContinueCompletionDecisionWithOptions(ctx context.Context, id string, guidance string, opts RunActionOptions) (apitypes.RunDTO, error) {
 	body := completionDecisionRequest{Decision: "continue", Guidance: guidance}
 	var env struct {
 		Run apitypes.RunDTO `json:"run"`
 	}
-	if err := c.postJSON(ctx, "/api/runs/"+url.PathEscape(id)+"/completion/decision", body, &env); err != nil {
+	if err := c.postJSONAction(ctx, "/api/runs/"+url.PathEscape(id)+"/completion/decision", body, &env, opts.ActionIfMatch); err != nil {
 		return apitypes.RunDTO{}, err
 	}
 	return env.Run, nil
@@ -363,11 +409,15 @@ func (c *HTTPClient) ContinueCompletionDecision(ctx context.Context, id string, 
 // NOT completion-blocked or a stale revision is 409 → ExitConflict (5); a missing/oversized reason,
 // a non-positive revision or an unknown milestone id is 400 → ExitUsage (2).
 func (c *HTTPClient) PartialCompletionDecision(ctx context.Context, id string, keep []string, reason string, contractRevision int) (apitypes.RunDTO, error) {
+	return c.PartialCompletionDecisionWithOptions(ctx, id, keep, reason, contractRevision, RunActionOptions{})
+}
+
+func (c *HTTPClient) PartialCompletionDecisionWithOptions(ctx context.Context, id string, keep []string, reason string, contractRevision int, opts RunActionOptions) (apitypes.RunDTO, error) {
 	body := completionDecisionRequest{Decision: "partial", Keep: keep, Reason: reason, ContractRevision: contractRevision}
 	var env struct {
 		Run apitypes.RunDTO `json:"run"`
 	}
-	if err := c.postJSON(ctx, "/api/runs/"+url.PathEscape(id)+"/completion/decision", body, &env); err != nil {
+	if err := c.postJSONAction(ctx, "/api/runs/"+url.PathEscape(id)+"/completion/decision", body, &env, opts.ActionIfMatch); err != nil {
 		return apitypes.RunDTO{}, err
 	}
 	return env.Run, nil
@@ -382,11 +432,15 @@ func (c *HTTPClient) PartialCompletionDecision(ctx context.Context, id string, k
 // foreign/unknown run, 409 (5) for a run not completion-blocked or a stale revision, 400 (2) for a
 // missing/oversized reason, a non-positive revision or an unknown criterion id.
 func (c *HTTPClient) AcceptCompletionDecision(ctx context.Context, id string, criteria []string, reason string, contractRevision int) (apitypes.RunDTO, error) {
+	return c.AcceptCompletionDecisionWithOptions(ctx, id, criteria, reason, contractRevision, RunActionOptions{})
+}
+
+func (c *HTTPClient) AcceptCompletionDecisionWithOptions(ctx context.Context, id string, criteria []string, reason string, contractRevision int, opts RunActionOptions) (apitypes.RunDTO, error) {
 	body := completionDecisionRequest{Decision: "accept", Criteria: criteria, Reason: reason, ContractRevision: contractRevision}
 	var env struct {
 		Run apitypes.RunDTO `json:"run"`
 	}
-	if err := c.postJSON(ctx, "/api/runs/"+url.PathEscape(id)+"/completion/decision", body, &env); err != nil {
+	if err := c.postJSONAction(ctx, "/api/runs/"+url.PathEscape(id)+"/completion/decision", body, &env, opts.ActionIfMatch); err != nil {
 		return apitypes.RunDTO{}, err
 	}
 	return env.Run, nil
@@ -569,7 +623,7 @@ func (c *HTTPClient) SubmitRunInput(ctx context.Context, runID, kind, body strin
 
 func (c *HTTPClient) SubmitRunInputWithOptions(ctx context.Context, runID string, opts RunInputOptions) (apitypes.RunInputResponse, error) {
 	var out apitypes.RunInputResponse
-	if err := c.postJSON(ctx, "/api/runs/"+url.PathEscape(runID)+"/inputs", opts, &out); err != nil {
+	if err := c.postJSONAction(ctx, "/api/runs/"+url.PathEscape(runID)+"/inputs", opts, &out, opts.ActionIfMatch); err != nil {
 		return apitypes.RunInputResponse{}, err
 	}
 	return out, nil

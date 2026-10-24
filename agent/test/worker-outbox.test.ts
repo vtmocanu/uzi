@@ -76,6 +76,8 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
     let maxConcurrent = 0;
     let drainCalls = 0;
     const outbox = {
+      listPendingPolicies: () => [],
+      hasUnresolvedPolicy: () => false,
       uncleanRuns: () => [],
       // PRD #1391 Run B M4: the boot terminal resolve reads these; these drainer tests carry no
       // pending terminal, so the store is enabled and lists nothing (resolveBootTerminals no-ops).
@@ -125,6 +127,8 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
     const rearm = new Map<string, () => void>([["r1", () => (rearmed += 1)]]);
     let retired = false;
     const outbox = {
+      listPendingPolicies: () => [],
+      hasUnresolvedPolicy: () => false,
       uncleanRuns: () => [],
       // PRD #1391 Run B M4: the boot terminal resolve reads these; these drainer tests carry no
       // pending terminal, so the store is enabled and lists nothing (resolveBootTerminals no-ops).
@@ -180,6 +184,8 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
     let retiredTerminal = 0;
     const { logger, lines } = recordingLogger();
     const outbox = {
+      listPendingPolicies: () => [],
+      hasUnresolvedPolicy: () => false,
       uncleanRuns: () => [],
       isDisabled: () => false,
       // Empty until the drain retires the segments — mirroring a terminal journaled AFTER boot and
@@ -274,6 +280,8 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
     const reports: string[] = [];
     let skipRecorded = 0;
     const outbox = {
+      listPendingPolicies: () => [],
+      hasUnresolvedPolicy: () => false,
       uncleanRuns: () => [],
       isDisabled: () => false,
       listPendingTerminals: () => (retired ? [{ run_id: "r1", claim_generation: 5 }] : []),
@@ -349,6 +357,8 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
     const gate = new Promise<void>((r) => (release = r));
     let drainStarted = 0;
     const outbox = {
+      listPendingPolicies: () => [],
+      hasUnresolvedPolicy: () => false,
       uncleanRuns: () => [],
       // PRD #1391 Run B M4: the boot terminal resolve reads these; these drainer tests carry no
       // pending terminal, so the store is enabled and lists nothing (resolveBootTerminals no-ops).
@@ -399,6 +409,8 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
   it("the BOOT drain runs even when heartbeats never succeed", async () => {
     let drainCalls = 0;
     const outbox = {
+      listPendingPolicies: () => [],
+      hasUnresolvedPolicy: () => false,
       uncleanRuns: () => [],
       // PRD #1391 Run B M4: the boot terminal resolve reads these; these drainer tests carry no
       // pending terminal, so the store is enabled and lists nothing (resolveBootTerminals no-ops).

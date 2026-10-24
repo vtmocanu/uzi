@@ -210,6 +210,7 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 	claimGeneration := r.ClaimGeneration
 	dto := apitypes.RunDTO{
 		ID:               r.ID.String(),
+		PolicyRefusal:    policyRefusalDTO(r),
 		Kind:             r.Kind,
 		IssueTitle:       r.IssueTitle,
 		IssueDescription: r.IssueDescription,
@@ -515,12 +516,18 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 	// milestone ISSUE run with >= 1 completed milestone and the finalize allowance unused. Read
 	// after MilestonesCompleted is decoded above so len() is the real completed count.
 	dto.CanStopAtWall = r.Status == "paused" && r.HoldReason.Valid && r.HoldReason.String == "budget_exhausted" &&
-		r.Kind == "issue" && !r.Interactive && r.BudgetFinalizeSeconds == 0 && len(dto.MilestonesCompleted) >= 1
+		r.Kind == "issue" && !r.Interactive && r.PolicyRefusalCount == 0 && r.BudgetFinalizeSeconds == 0 && len(dto.MilestonesCompleted) >= 1
 	// PRD #1733: the server-derived Stop gate for a provider hold — a paused 'provider_unavailable'
 	// milestone ISSUE run with >= 1 completed milestone (Stop is the scope ceiling plus the owner's
 	// resume, which would finalize nothing otherwise; SubmitInput refuses the same case).
 	dto.CanStopAtProviderHold = r.Status == "paused" && r.HoldReason.Valid && r.HoldReason.String == "provider_unavailable" &&
 		r.Kind == "issue" && !r.Interactive && len(dto.MilestonesCompleted) >= 1
+	if workersvc.PolicyOwnerConstrained(r) {
+		dto.CanStopAtProviderHold = workersvc.PolicyOwnerCanStop(r, globalTimeout)
+		if dto.PolicyRefusal != nil {
+			dto.PolicyRefusal.CanResume = workersvc.PolicyOwnerResumable(r) && (r.HoldReason.String != "budget_exhausted" || workersvc.PolicyOwnerBudgetAvailable(r, globalTimeout))
+		}
+	}
 	// PRD #634 M2: the operator scope ceiling rides the running-report ACK and the claim
 	// payload (both built here) so the worker honors it at the loop top and across a
 	// re-claim. pgtype.Int4 → *int, null (unbounded) when no scope directive was written.
@@ -808,6 +815,36 @@ func deriveProgress(dto *apitypes.RunDTO) {
 func applyRevising(dto *apitypes.RunDTO, revising bool) {
 	dto.IsRevising = revising
 	deriveProgress(dto)
+}
+
+func policyRefusalDTO(r store.Run) *apitypes.PolicyRefusalDTO {
+	if r.PolicyRefusalCount == 0 && !r.PolicyLastOutcomeID.Valid {
+		return nil
+	}
+	dto := &apitypes.PolicyRefusalDTO{
+		Count:             r.PolicyRefusalCount,
+		LastTag:           textPtrValue(r.PolicyLastTag.Valid, r.PolicyLastTag.String),
+		LastPhase:         textPtrValue(r.PolicyLastPhase.Valid, r.PolicyLastPhase.String),
+		LastCorrelationID: textPtrValue(r.PolicyLastCorrelationID.Valid, r.PolicyLastCorrelationID.String),
+		Detail:            textPtrValue(r.PolicyHoldDetail.Valid, r.PolicyHoldDetail.String),
+		Provenance:        textPtrValue(r.PolicyHoldProvenance.Valid, r.PolicyHoldProvenance.String),
+		CanResume:         workersvc.PolicyOwnerResumable(r),
+		CanCancel:         r.Status != "completed" && r.Status != "failed" && r.Status != "cancelled",
+	}
+	if r.PolicyLastRefusedAt.Valid {
+		t := r.PolicyLastRefusedAt.Time
+		dto.LastRefusedAt = &t
+	}
+	if r.PolicyHoldPublished.Valid {
+		v := r.PolicyHoldPublished.Bool
+		dto.Published = &v
+	}
+	// Live completion decisions also need the presented policy identity.
+	// Action availability remains separate from this precondition.
+	if workersvc.PolicyOwnerConstrained(r) {
+		dto.ActionIfMatch = workersvc.PolicyHoldActionToken(r)
+	}
+	return dto
 }
 
 // memoryHoldDTO projects persisted episode accounting only for an owner memory hold.

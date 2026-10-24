@@ -108,6 +108,73 @@ const wire = () => ({ result: "candidate", round: 1, checker_run_id: null,
 const client = () => new WorkerClient("http://example.com", "fixture-join", "test", nullLogger(),
   { sleep: async () => {} });
 
+const crossCheckID = "abcdef01-2345-4678-9abc-def012345678";
+
+it("submit and poll preserve canonical cross-check identity independently of child provenance", async (t) => {
+  for (const checker_run_id of ["12345678-abcd-4321-8abc-123456789abc", null]) {
+    const body = { ...wire(), cross_check_id: crossCheckID, checker_run_id };
+    const methods: string[] = [];
+    t.mock.method(globalThis, "fetch", async (_url: unknown, init?: RequestInit) => {
+      methods.push(init?.method ?? "GET");
+      return Response.json(body);
+    });
+    const c = client();
+    for (const response of [await c.submitPlanCrossCheck("run", 3, candidate),
+      await c.planCrossCheckStatus("run", 3)]) {
+      assert.equal(response.result, "candidate");
+      if (response.result !== "candidate") throw new Error("missing candidate");
+      assert.equal(response.cross_check_id, crossCheckID);
+      assert.equal(response.checker_run_id, checker_run_id);
+      assert.notEqual(response.cross_check_id, response.checker_run_id);
+      assert.equal(response.verdict, "approve");
+    }
+    assert.deepEqual(methods, ["POST", "GET"]);
+  }
+});
+
+it("legacy submit and poll leave absent cross-check identity unknown", async (t) => {
+  for (const checker_run_id of ["12345678-abcd-4321-8abc-123456789abc", null]) {
+    t.mock.method(globalThis, "fetch", async () => Response.json({ ...wire(), checker_run_id }));
+    const c = client();
+    for (const response of [await c.submitPlanCrossCheck("run", 3, candidate),
+      await c.planCrossCheckStatus("run", 3)]) {
+      assert.equal(response.result, "candidate");
+      if (response.result !== "candidate") throw new Error("missing candidate");
+      assert.equal("cross_check_id" in response, false);
+      assert.equal(response.cross_check_id, undefined);
+      assert.equal(response.checker_run_id, checker_run_id);
+      assert.equal(response.verdict, "approve");
+    }
+  }
+});
+
+it("submit and poll reject malformed present cross-check identity", async (t) => {
+  for (const cross_check_id of [crossCheckID.toUpperCase(), "not-uuid", null, 42, {}, [],
+    crossCheckID + "\n", crossCheckID + "\r", crossCheckID + "\u0000",
+    crossCheckID + "\u001b", crossCheckID.replace("a", "\u0000")]) {
+    t.mock.method(globalThis, "fetch", async () => Response.json({ ...wire(), cross_check_id }));
+    await assert.rejects(client().submitPlanCrossCheck("run", 3, candidate), /invalid cross-check response/);
+    await assert.rejects(client().planCrossCheckStatus("run", 3), /invalid cross-check response/);
+  }
+});
+
+it("parked submit and poll exclude cross-check identity even when null", async (t) => {
+  const parked = { result: "parked", verdict: "revise", reason_class: "revise", lead_last_seq: 4,
+    claim_generation: 3, plan_cross_check_settled: true, gate_revision: 2,
+    current_plan_sha256: "a".repeat(64), gate_presentation_id: crossCheckID,
+    gate_payload_digest: "b".repeat(64) };
+  for (const extra of [{}, { cross_check_id: crossCheckID }, { cross_check_id: null }]) {
+    t.mock.method(globalThis, "fetch", async () => Response.json({ ...parked, ...extra }));
+    for (const call of [
+      () => client().submitPlanCrossCheck("run", 3, candidate),
+      () => client().planCrossCheckStatus("run", 3),
+    ]) {
+      if ("cross_check_id" in extra) await assert.rejects(call(), /invalid parked cross-check response/);
+      else assert.equal((await call()).result, "parked");
+    }
+  }
+});
+
 it("submit and status validate stored variants before exposing approve", async (t) => {
   const malformed = [null, {}, { ...wire(), round: 2 }, { ...wire(), candidate_digest: "g".repeat(64) },
     { ...wire(), candidate_generation: 0 }, { ...wire(), checker_run_id: "not-uuid" },

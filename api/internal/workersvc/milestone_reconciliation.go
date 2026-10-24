@@ -330,6 +330,10 @@ func (s *Service) reconcileMilestoneApproval(ctx context.Context, owner uuid.UUI
 	if run.UserID != owner {
 		return SubmitInputResult{}, ErrRunNotFound
 	}
+	// A Stop accepted after the outer read also prevents older consent replay.
+	if len(run.PolicyStopResolution) != 0 {
+		return SubmitInputResult{}, stopReviewConflict("policy_stop_gate_resolved")
+	}
 	if semantic, err := semanticEnrollmentPresent(ctx, q, run.ID); err != nil || semantic {
 		if err != nil {
 			return SubmitInputResult{}, err

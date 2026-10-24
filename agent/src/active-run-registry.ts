@@ -4,7 +4,7 @@ import type {
   ActiveSnapshotPhase,
   FinalizeResumeEntry,
 } from "./protocol.js";
-import type { PendingTerminal } from "./outbox.js";
+import type { PendingTerminal, PendingPolicy } from "./outbox.js";
 
 /** PRD #1391 Run B M4: the outbox pending-terminal lister the registry reads (a function seam so the
  *  registry never imports the concrete Outbox, keeping its unit tests light). Returns every run with
@@ -98,6 +98,7 @@ export class ActiveRunRegistry {
   constructor(
     private readonly pendingLister?: PendingTerminalLister,
     private readonly capGetter?: OutboxCapGetter,
+    private readonly policyLister?: () => PendingPolicy[],
   ) {}
 
   /** Register a run as executing at `running`, at the generation it was claimed at.
@@ -157,7 +158,7 @@ export class ActiveRunRegistry {
    * whenever anything is pending).
    */
   claimsPausedByPendingOverflow(): boolean {
-    const count = this.leasable(this.pendingOutcomes()).length;
+    const count = this.pendingOutcomes(false).entries.length;
     if (count === 0) return false;
     return count > this.effectiveCap();
   }
@@ -180,8 +181,37 @@ export class ActiveRunRegistry {
     return cap !== undefined && Number.isFinite(cap) && cap > 0 ? Math.floor(cap) : 0;
   }
 
-  private pendingOutcomes(): PendingTerminal[] {
-    return this.pendingLister?.().filter(entry => entry.server_settled !== true) ?? [];
+  private pendingOutcomes(includeNotOwned = true): {
+    entries: PendingTerminal[];
+    policyRuns: Set<string>;
+  } {
+    const entries: PendingTerminal[] = this.pendingLister?.().filter(entry => entry.server_settled !== true) ?? [];
+    const policyRuns = new Set<string>();
+    for (const p of this.policyLister?.() ?? []) {
+      if (p.server_settled) continue;
+      policyRuns.add(p.run_id);
+      entries.push({ run_id: p.run_id, claim_generation: p.delivery.inventory_generation,
+        phase: "running", blocked: false, since: p.since });
+    }
+    // Only unsettled policy runs coalesce. Terminal-only arrays retain their legacy identities,
+    // counts and ordering, including duplicate run IDs used by the API rejection contract.
+    const projected: PendingTerminal[] = [];
+    const policySlots = new Map<string, number>();
+    for (const p of includeNotOwned ? entries : this.leasable(entries)) {
+      if (!policyRuns.has(p.run_id)) {
+        projected.push(p);
+        continue;
+      }
+      const slot = policySlots.get(p.run_id);
+      if (slot === undefined) {
+        policySlots.set(p.run_id, projected.length);
+        projected.push(p);
+      } else if (p.claim_generation > projected[slot]!.claim_generation) {
+        // Delivery inventory authority wins, never the policy's original source generation.
+        projected[slot] = p;
+      }
+    }
+    return { entries: projected, policyRuns };
   }
 
   /**
@@ -197,7 +227,7 @@ export class ActiveRunRegistry {
    */
   buildRegisterSnapshot(finalizeResume: readonly FinalizeResumeEntry[] = []): ActiveSnapshot {
     this.epoch += 1;
-    const pending = this.pendingOutcomes();
+    const { entries: pending } = this.pendingOutcomes();
     return {
       snapshot_epoch: this.epoch,
       active: [],
@@ -219,17 +249,20 @@ export class ActiveRunRegistry {
    */
   build(): ActiveSnapshot {
     this.epoch += 1;
-    const pending = this.leasable(this.pendingOutcomes());
+    const { entries: pending, policyRuns } = this.pendingOutcomes(false);
     const pendingByRun = new Map(pending.map((p) => [p.run_id, p]));
 
     const active: ActiveSnapshotEntry[] = [];
-    // Live executions this worker is running, EXCEPT any that also carry a LEASABLE pending terminal
-    // (those are listed below as terminal_pending, and the cap governs them). In practice a run leaves
-    // the live registry as it journals its terminal, so an overlap is a brief corner case. A
-    // run_not_owned journal is not leasable (filtered above), so a live run sharing its id is listed
-    // live at its own generation: the api drops it unless it attributes the run to this worker.
+    const newerLiveRuns = new Set<string>();
+    // A fresh claim can be registered before prepare reconciles an old policy journal. Keep its
+    // actual liveness visible without rebinding that journal or removing its backlog protection.
+    // Terminal-only overlaps retain the legacy pending precedence.
     for (const [runId, entry] of this.runs) {
-      if (pendingByRun.has(runId)) continue;
+      const prior = pendingByRun.get(runId);
+      if (prior) {
+        if (!policyRuns.has(runId) || entry.claimGeneration <= prior.claim_generation) continue;
+        newerLiveRuns.add(runId);
+      }
       active.push({
         run_id: runId,
         claim_generation: entry.claimGeneration,
@@ -240,7 +273,7 @@ export class ActiveRunRegistry {
 
     // Pending-terminal entries, deterministically selected so the `active` array never lists more
     // than `cap` of them (the api rejects an over-cap snapshot whole).
-    for (const p of this.selectPendingForBuild(pending)) {
+    for (const p of this.selectPendingForBuild(pending.filter(p => !newerLiveRuns.has(p.run_id)))) {
       active.push({
         run_id: p.run_id,
         claim_generation: p.claim_generation,
@@ -249,9 +282,7 @@ export class ActiveRunRegistry {
       });
     }
 
-    // Issue #2009: preserve active construction, including duplicate run IDs across generations.
-    // pending_all provides coverage only if the API accepts the enclosing snapshot; duplicate
-    // active runs still reject the whole snapshot and therefore provide no pending_all coverage.
+    // Count all pending inventory even when a newer live claim occupies its active wire slot.
     return {
       snapshot_epoch: this.epoch,
       active,

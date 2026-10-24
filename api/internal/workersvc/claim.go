@@ -24,6 +24,8 @@ import (
 // structured templates (PRD #3 provides several subagents that map to
 // programmatic SDK AgentDefinitions), not a single `template`.
 type ClaimPayload struct {
+	PolicyHoldResume        bool                         `json:"policy_hold_resume,omitempty"`
+	PolicyHoldFreshSession  bool                         `json:"policy_hold_fresh_session,omitempty"`
 	SemanticPlanning        *apitypes.SemanticEnrollment `json:"semantic_planning,omitempty"`
 	MemoryEpisode           int64                        `json:"memory_episode"`
 	MemoryInterventionCount int32                        `json:"memory_intervention_count"`

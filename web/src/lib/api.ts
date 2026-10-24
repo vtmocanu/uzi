@@ -23,6 +23,7 @@ export const MOCK_MODE = import.meta.env.VITE_UZI_MOCK === "1";
 // type import below names only the DTOs this module's own code (realApi, the
 // request helpers, ProjectSyncVisibility) references in its signatures.
 import type {
+  RunInputResponse,
   AdminBlockedRepos,
   AdminDockerAllowlistRepos,
   AdminCodexRateLimits,
@@ -1305,7 +1306,7 @@ const realApi = {
     reset?: MilestoneResetOptions,
     semanticApproval?: SemanticGateApproval,
   ) =>
-    request<{ server_side: boolean; id?: number; created_at?: string }>(
+    request<RunInputResponse>(
       "POST",
       `/runs/${id}/inputs`,
       {

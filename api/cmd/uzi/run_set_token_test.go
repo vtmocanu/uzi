@@ -19,6 +19,7 @@ import (
 // findSecretByLabel) to {pinned, secret_id:<id>}, so the server receives an id, not a label.
 func TestRunSetTokenLabelResolvesToPinned(t *testing.T) {
 	fc := &uzicli.FakeClient{
+		RunByID:     map[string]apitypes.RunDTO{"run-9": {ID: "run-9", Kind: "issue", Status: statusPaused}},
 		SetTokenRun: apitypes.RunDTO{ID: "run-9", Status: "queued", Kind: "issue"},
 		Secrets: []apitypes.SecretDTO{
 			{ID: "sec-a", Kind: "anthropic_token", Label: "default-key"},
@@ -47,7 +48,8 @@ func TestRunSetTokenLabelResolvesToPinned(t *testing.T) {
 // resolve WITHOUT a ListSecrets round-trip (a keyword never touches the server for a label).
 func TestRunSetTokenKeywords(t *testing.T) {
 	for _, mode := range []string{"auto", "default", "inherit"} {
-		fc := &uzicli.FakeClient{SetTokenRun: apitypes.RunDTO{ID: "run-9", Status: "queued", Kind: "issue"}}
+		fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"run-9": {ID: "run-9", Kind: "issue", Status: statusPaused}},
+			SetTokenRun: apitypes.RunDTO{ID: "run-9", Status: "queued", Kind: "issue"}}
 		_, _, code := runCLI(t, fakeEnv(fc), "run", "set-token", "run-9", "--"+mode)
 		if code != uzicli.ExitOK {
 			t.Fatalf("--%s: exit = %d, want 0", mode, code)
@@ -69,6 +71,7 @@ func TestRunSetTokenKeywords(t *testing.T) {
 // LastSetTokenRunID stays empty).
 func TestRunSetTokenUnknownLabelRefusedClientSide(t *testing.T) {
 	fc := &uzicli.FakeClient{
+		RunByID:     map[string]apitypes.RunDTO{"run-9": {ID: "run-9", Kind: "issue", Status: statusPaused}},
 		SetTokenRun: apitypes.RunDTO{ID: "run-9", Status: "queued", Kind: "issue"},
 		Secrets:     []apitypes.SecretDTO{{ID: "sec-a", Kind: "anthropic_token", Label: "default-key"}},
 	}
@@ -88,6 +91,7 @@ func TestRunSetTokenUnknownLabelRefusedClientSide(t *testing.T) {
 // refused naming that secret's kind, still client-side with no request sent.
 func TestRunSetTokenWrongKindLabelNamesKind(t *testing.T) {
 	fc := &uzicli.FakeClient{
+		RunByID:     map[string]apitypes.RunDTO{"run-9": {ID: "run-9", Kind: "issue", Status: statusPaused}},
 		SetTokenRun: apitypes.RunDTO{ID: "run-9", Status: "queued", Kind: "issue"},
 		Secrets:     []apitypes.SecretDTO{{ID: "sec-c", Kind: "openai_api_key", Label: "shared-label"}},
 	}
@@ -106,7 +110,8 @@ func TestRunSetTokenWrongKindLabelNamesKind(t *testing.T) {
 // TestRunSetTokenNoChoiceIsUsageError: neither a label nor a mode flag is a client-side
 // usage error (exactly one is required, D12), and no request is sent.
 func TestRunSetTokenNoChoiceIsUsageError(t *testing.T) {
-	fc := &uzicli.FakeClient{SetTokenRun: apitypes.RunDTO{ID: "run-9", Status: "queued", Kind: "issue"}}
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"run-9": {ID: "run-9", Kind: "issue", Status: statusPaused}},
+		SetTokenRun: apitypes.RunDTO{ID: "run-9", Status: "queued", Kind: "issue"}}
 	_, errb, code := runCLI(t, fakeEnv(fc), "run", "set-token", "run-9")
 	if code != uzicli.ExitUsage {
 		t.Fatalf("exit = %d, want %d (usage)", code, uzicli.ExitUsage)
@@ -129,6 +134,7 @@ func TestRunSetTokenMutuallyExclusive(t *testing.T) {
 	}
 	for _, args := range cases {
 		fc := &uzicli.FakeClient{
+			RunByID:     map[string]apitypes.RunDTO{"run-9": {ID: "run-9", Kind: "issue", Status: statusPaused}},
 			SetTokenRun: apitypes.RunDTO{ID: "run-9", Status: "queued", Kind: "issue"},
 			Secrets:     []apitypes.SecretDTO{{ID: "sec-b", Kind: "anthropic_token", Label: "prod-key"}},
 		}
@@ -154,6 +160,7 @@ func TestRunSetTokenPrintsWarningToStderr(t *testing.T) {
 	// field as a hardcoded credential (it is a D6 warning message, not a secret).
 	warn := "auto has no pooled token with headroom right now; the run will hold in pool_wait until one is available"
 	fc := &uzicli.FakeClient{
+		RunByID:         map[string]apitypes.RunDTO{"run-9": {ID: "run-9", Kind: "issue", Status: statusPaused}},
 		SetTokenRun:     apitypes.RunDTO{ID: "run-9", Status: "queued", Kind: "issue"},
 		SetTokenWarning: warn,
 	}
@@ -175,6 +182,7 @@ func TestRunSetTokenPrintsWarningToStderr(t *testing.T) {
 func TestRunSetTokenJSONWarningToStderr(t *testing.T) {
 	warn := "auto has no pooled token with headroom right now; the run will hold in pool_wait until one is available"
 	fc := &uzicli.FakeClient{
+		RunByID:         map[string]apitypes.RunDTO{"run-9": {ID: "run-9", Kind: "issue", Status: statusPaused}},
 		SetTokenRun:     apitypes.RunDTO{ID: "run-9", Status: "queued", Kind: "issue"},
 		SetTokenWarning: warn,
 	}

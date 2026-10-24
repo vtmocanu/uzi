@@ -285,6 +285,10 @@ export interface RunContext {
    *  a resume locally, so passing an unresolvable id fails the whole run before the
    *  first turn instead of resuming anything. */
   sessionId?: string | null;
+  /** Negotiated worker admission, retained refusal constraint, and exact-claim fresh grant. */
+  policyHoldSupported?: boolean;
+  policyHoldResume?: boolean;
+  policyHoldFreshSession?: boolean;
   /** Best-effort positive branch commit count, independent of SDK session survival.
    *  Planning and first implementation prompts consume it. On resumed snapshots,
    *  interruptedSnapshot supersedes the legacy continuation wording even when this
@@ -464,7 +468,10 @@ export interface RunContext {
    *  records only the worker's receipt via the steering poll; included_at is the separate record
    *  that the turn carrying it reached the model (not that the model acted on it). */
   pullFollowUps?(remainingRunes: number, batchEmpty: boolean): { id: number; body: string }[];
-  /** Issue #1800: follow-up `id` (from pullFollowUps or a park's `followup` outcome) was in a prompt
+  /** Policy resumes take the highest queued id above newestAfter to prioritize new owner
+   *  narrowing, leaving older rows queued; omitted selection takes one row in FIFO order. */
+  pullFollowUp?(selection?: { newestAfter: number }): { id: number; body: string } | undefined;
+  /** Issue #1800: follow-up `id` (from pullFollowUps, pullFollowUp or a park's `followup` outcome) was in a prompt
    *  whose turn reached the model (a model-evidencing event arrived). Called once per follow-up; the runner reports
    *  it to the api (POST /inputs/included). Optional; absent (a stub) ⇒ nothing is reported. */
   followUpIncluded?(id: number): void;

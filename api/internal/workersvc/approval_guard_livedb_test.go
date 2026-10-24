@@ -14,8 +14,109 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// All submissions and publications use the real Service and migrated database.
-// SQL below only seeds historical controls and injects a run-scoped storage fault.
+// Submissions and publications use the real Service and migrated database.
+// SQL seeds historical controls, Stop denial fixtures, and a run-scoped storage fault.
+
+// approvalGuardStaleReader replaces only the outer owner read. Transactional
+// queries still bind to the real pool and observe the persisted resolution.
+type approvalGuardStaleReader struct {
+	Store
+	observed store.Run
+	reads    int
+}
+
+func (s *approvalGuardStaleReader) GetRunByIDForUser(ctx context.Context, arg store.GetRunByIDForUserParams) (store.Run, error) {
+	if arg.ID != s.observed.ID || arg.UserID != s.observed.UserID {
+		return s.Store.GetRunByIDForUser(ctx, arg)
+	}
+	s.reads++
+	return s.observed, nil
+}
+
+// This minimal persisted resolution is ONLY a denial fixture. It does not prove
+// positive Stop confirmation or policy revision source authority.
+func approvalGuardSeedStopDenial(t *testing.T, f *gateFix, id uuid.UUID, revisionInput int64) {
+	t.Helper()
+	var scope int64
+	if err := f.pool.QueryRow(f.ctx, "INSERT INTO run_user_inputs(run_id,kind,body) VALUES($1,'scope','denial fixture') RETURNING id", id).Scan(&scope); err != nil {
+		t.Fatal(err)
+	}
+	if revisionInput != 0 {
+		f.exec(`UPDATE run_user_inputs SET disposition='superseded_by_stop',
+ settled_at=now(),superseded_by_stop_input_id=$2 WHERE id=$1`, revisionInput, scope)
+	}
+	f.exec(`UPDATE runs SET policy_stop_resolution=jsonb_build_object('version',1,'scope_input_id',$2::bigint) WHERE id=$1`, id, scope)
+}
+
+func TestApprovalGuardLockedStopResolutionLiveDB(t *testing.T) {
+	for _, route := range []string{"plain", "selected", "reconciliation plain", "reconciliation selected", "reconciliation replay", "reconciliation foreign owner"} {
+		t.Run(route, func(t *testing.T) {
+			var f *gateFix
+			var id uuid.UUID
+			var opts SubmitInputOptions
+			if strings.HasPrefix(route, "reconciliation") {
+				f, id, opts = newMilestoneReconciliationFix(t)
+			} else {
+				f = newGateFix(t, 3)
+				id = f.gatedRun()
+				opts.ExpectedGateRevision = i64(1)
+			}
+			approvalGuardSelectionFixture(t, f, id)
+			f.liveWorker()
+			opts.OverrideCapabilities = true
+			var sel *AgentSelection
+			if route == "selected" || route == "reconciliation selected" {
+				sel = &AgentSelection{Source: AgentSourceOwn}
+			}
+			var revisionInput int64
+			if route == "reconciliation replay" {
+				// Establish a genuine durable consent replay before seeding Stop.
+				opts.ExpectedResetStateDigest = reconciliationRaceDigest(t, f, id)
+				if _, err := f.svc.SubmitInputWithOptions(f.ctx, f.userID, id, "approve_plan", "", sel, opts); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				revisionInput = approvalGuardRevise(t, f, id)
+			}
+			observed := reconciliationRow(t, f, id)
+			if opts.Reconciliation != nil && route != "reconciliation replay" {
+				opts.ExpectedResetStateDigest = reconciliationRaceDigest(t, f, id)
+			}
+			if route == "reconciliation foreign owner" {
+				observed.UserID = uuid.New()
+			}
+			if len(observed.PolicyStopResolution) != 0 {
+				t.Fatal("outer reader must predate Stop resolution")
+			}
+			approvalGuardSeedStopDenial(t, f, id, revisionInput)
+			if revisionInput != 0 {
+				// Stop settlement deliberately leaves applied_at NULL, so the
+				// unchanged ordinary pending predicate would still refuse.
+				approvalGuardPending(t, f, id, revisionInput)
+			}
+			stale := &approvalGuardStaleReader{Store: f.q, observed: observed}
+			svc := reconciliationRaceService(f.svc, stale)
+			svc.SetTxBeginner(f.pool)
+			before := reconciliationRaceSnapshot(t, f, id)
+			_, err := svc.SubmitInputWithOptions(f.ctx, observed.UserID, id, "approve_plan", "", sel, opts)
+			if route == "reconciliation foreign owner" {
+				if !errors.Is(err, ErrRunNotFound) {
+					t.Errorf("foreign owner refusal=%v, want ErrRunNotFound", err)
+				}
+			} else {
+				var conflict *PolicyStopReviewConflict
+				if !errors.As(err, &conflict) || conflict.Reason != "policy_stop_gate_resolved" {
+					t.Errorf("locked Stop refusal=%v, want policy_stop_gate_resolved", err)
+				}
+			}
+			if stale.reads != 1 {
+				t.Errorf("outer stale reads=%d, want 1", stale.reads)
+			}
+			reconciliationRaceUnchanged(t, f, id, before)
+		})
+	}
+}
+
 func approvalGuardRevise(t *testing.T, f *gateFix, id uuid.UUID) int64 {
 	t.Helper()
 	res, err := f.submit(id, "revise_plan", nil, SubmitInputOptions{ExpectedGateRevision: i64(1)})

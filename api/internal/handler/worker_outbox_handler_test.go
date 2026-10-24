@@ -57,7 +57,7 @@ func TestWorkerRegisterAdvertisesHeartbeatOutboxFeature(t *testing.T) {
 // TestWorkerHeartbeatOverlaysOutboxOntoDTO pins that a heartbeat reporting a non-zero
 // outbox depth reaches the returned WorkerDTO via overlayOutbox: the depth is recorded
 // in the tracker for this worker (Heartbeat) and overlaid onto the response DTO for the
-// same worker. Disabling overlayOutbox (making it a no-op) leaves the five fields null
+// same worker. Disabling overlayOutbox (making it a no-op) leaves the six fields null
 // and fails this test.
 func TestWorkerHeartbeatOverlaysOutboxOntoDTO(t *testing.T) {
 	h := newProtocolHandler(t, &protocolStore{})
@@ -73,6 +73,7 @@ func TestWorkerHeartbeatOverlaysOutboxOntoDTO(t *testing.T) {
 		Worker struct {
 			OutboxPendingMessages *int `json:"outbox_pending_messages"`
 			OutboxPendingTerminal *int `json:"outbox_pending_terminal"`
+			OutboxPendingPolicy   *int `json:"outbox_pending_policy"`
 			OutboxStaleRetired    *int `json:"outbox_stale_retired"`
 		} `json:"worker"`
 	}
@@ -84,6 +85,9 @@ func TestWorkerHeartbeatOverlaysOutboxOntoDTO(t *testing.T) {
 	}
 	if resp.Worker.OutboxStaleRetired == nil || *resp.Worker.OutboxStaleRetired != 2 {
 		t.Fatalf("outbox_stale_retired = %v, want 2", resp.Worker.OutboxStaleRetired)
+	}
+	if resp.Worker.OutboxPendingPolicy == nil || *resp.Worker.OutboxPendingPolicy != 0 {
+		t.Fatalf("legacy outbox_pending_policy = %v, want 0", resp.Worker.OutboxPendingPolicy)
 	}
 	if resp.Worker.OutboxPendingTerminal == nil || *resp.Worker.OutboxPendingTerminal != 0 {
 		t.Fatalf("outbox_pending_terminal = %v, want 0 (set together the moment any component is non-zero)", resp.Worker.OutboxPendingTerminal)
@@ -129,7 +133,37 @@ func TestWorkerHeartbeatWithoutOutboxLeavesDTONull(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200, body %q", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), `"outbox_pending_messages":null`) {
+	if !strings.Contains(rec.Body.String(), `"outbox_pending_messages":null`) || !strings.Contains(rec.Body.String(), `"outbox_pending_policy":null`) {
 		t.Fatalf("no outbox report must leave outbox_pending_messages null, got %q", rec.Body.String())
+	}
+}
+
+func TestWorkerHeartbeatPolicyOnlyOutboxAndDrain(t *testing.T) {
+	h := newProtocolHandler(t, &protocolStore{})
+	body := `{"version":"1","outbox":[{"run_id":"` + uuid.New().String() + `","pending_messages":0,"pending_terminal":0,"pending_policy":2,"stale_retired":0,"since":1}]}`
+	for _, tc := range []struct{ body, policy, messages, terminal string }{
+		{body, "2", "0", "0"},
+		{`{"version":"1","outbox":[]}`, "null", "null", "null"},
+	} {
+		rec := httptest.NewRecorder()
+		h.WorkerHeartbeat(rec, workerReq(http.MethodPost, tc.body, uuid.Nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+		}
+		var resp struct {
+			Worker map[string]json.RawMessage `json:"worker"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		for key, want := range map[string]string{
+			"outbox_pending_policy":   tc.policy,
+			"outbox_pending_messages": tc.messages,
+			"outbox_pending_terminal": tc.terminal,
+		} {
+			if string(resp.Worker[key]) != want {
+				t.Fatalf("%s = %s, want %s", key, resp.Worker[key], want)
+			}
+		}
 	}
 }

@@ -53,6 +53,7 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 // a struct rather than a growing tail of booleans so an added bypass never re-widens SubmitInput's
 // fixed signature (matching the SubmitInputWithCapabilityOverride precedent, now folded in here).
 type SubmitInputOptions struct {
+	ActionIfMatch string
 	// OverrideCapabilities is the PRD #84 M4 4c "run without the capability" override, meaningful
 	// only with approve_plan (see SubmitInputWithCapabilityOverride).
 	OverrideCapabilities bool
@@ -101,6 +102,30 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	run, err := s.GetRun(ctx, userID, runID)
 	if err != nil {
 		return SubmitInputResult{}, err
+	}
+	// A Stop token always identifies this transaction, including an accepted replay
+	// after the run moved. Never fall through to an ordinary scope write.
+	// A running constrained run with transaction binding and no such token/resolution
+	// retains ordinary Stop; an unbound service keeps the prior fail-closed behavior.
+	if kind == "stop" && (strings.HasPrefix(opts.ActionIfMatch, `"policy-`) || len(run.PolicyStopResolution) != 0 || (PolicyOwnerConstrained(run) && (run.Status != "running" || s.txBeginner == nil))) {
+		if opts.ExpectedGateRevision != nil {
+			return SubmitInputResult{}, ErrExpectedGateRevisionNotApplicable
+		}
+		if sel != nil {
+			return SubmitInputResult{}, ErrInvalidSelection
+		}
+		if opts.Reconciliation != nil || opts.OverrideCapabilities || opts.DiscardPendingOutcome || opts.ExpectedResetStateDigest != "" {
+			return SubmitInputResult{}, stopReviewConflict("policy_stop_options_invalid")
+		}
+		accepted, err := s.confirmPolicyStop(ctx, userID, runID, opts.ActionIfMatch, body)
+		if err != nil {
+			return SubmitInputResult{}, err
+		}
+		ceiling := accepted.ScopeCeiling
+		return SubmitInputResult{ScopeCeiling: &ceiling, Resumed: accepted.Resumed, PolicyStop: accepted.Receipt}, nil
+	}
+	if len(run.PolicyStopResolution) != 0 && (gateVerdictKind(kind) || kind == "scope") {
+		return SubmitInputResult{}, stopReviewConflict("policy_stop_gate_resolved")
 	}
 	if opts.Reconciliation != nil {
 		if kind != "approve_plan" {
@@ -250,7 +275,7 @@ func (s *Service) submitInputForRun(ctx context.Context, userID, runID uuid.UUID
 	if IsBaseAttestationHeld(run) && (kind == "extend" || kind == "stop") {
 		return SubmitInputResult{}, ErrBaseAttestationHeld
 	}
-	if run.Status == "paused" && run.HoldReason.Valid && run.HoldReason.String == "budget_exhausted" {
+	if run.Status == "paused" && run.HoldReason.Valid && run.HoldReason.String == "budget_exhausted" && !PolicyOwnerConstrained(run) {
 		switch kind {
 		case "extend":
 			secs, err := strconv.Atoi(strings.TrimSpace(body))
@@ -497,8 +522,8 @@ func (s *Service) submitInputForRun(ctx context.Context, userID, runID uuid.UUID
 					// failed fan-out (PublishState, notify, judge, scope settle, checkpoint
 					// delete) or report ServerSide success. With an expected revision it is a
 					// mismatch naming the re-read's revision, even if the re-read matches again.
-					// Without one the only predicates are owner + non-terminal, and the owner was
-					// just verified: the run finished (or vanished) under the submit.
+					// Without one, re-read also distinguishes an accepted Stop from a run that
+					// finished (or vanished) under the submit.
 					return SubmitInputResult{}, s.verdictNotWritten(ctx, userID, runID, opts.ExpectedGateRevision, ErrRunTerminal)
 				}
 			}
@@ -880,13 +905,15 @@ func (s *Service) submitApproval(ctx context.Context, userID uuid.UUID, run stor
 			if !errors.Is(err, pgx.ErrNoRows) || expected != nil || !refusable {
 				return SubmitInputResult{}, store.RunUserInput{}, err
 			}
-			// An unbound refusal on a refusable attempt is the #2680 source predicate (the
-			// unbound path has no other refusal besides a vanished run, which the re-read below
-			// tells apart). The re-read runs on every refusal, the last included, so a run that
-			// vanished or finished is classified as such rather than as source contention.
+			// Re-read an unbound refusal to distinguish the #2680 source predicate from
+			// accepted Stop, disappearance, or completion. Include the last attempt so
+			// none of these outcomes is misreported as source contention.
 			refreshed, gerr := s.GetRun(ctx, userID, run.ID)
 			if gerr != nil {
 				return SubmitInputResult{}, store.RunUserInput{}, gerr // ErrRunNotFound stays a 404
+			}
+			if len(refreshed.PolicyStopResolution) != 0 {
+				return SubmitInputResult{}, store.RunUserInput{}, stopReviewConflict("policy_stop_gate_resolved")
 			}
 			if terminalStatuses[refreshed.Status] {
 				return SubmitInputResult{}, store.RunUserInput{}, ErrRunTerminal
@@ -1158,6 +1185,9 @@ func (s *Service) submitScopeCeiling(ctx context.Context, run store.Run, ceiling
 		if current.UserID != run.UserID {
 			return SubmitInputResult{}, ErrRunNotFound
 		}
+		if len(current.PolicyStopResolution) != 0 {
+			return SubmitInputResult{}, stopReviewConflict("policy_stop_gate_resolved")
+		}
 		priorFrozen, _ := canonicalRawJSON(run.MilestonesFrozen)
 		currentFrozen, _ := canonicalRawJSON(current.MilestonesFrozen)
 		if current.ContractRevision != run.ContractRevision || current.GateRevision != run.GateRevision || !bytes.Equal(priorFrozen, currentFrozen) {
@@ -1165,6 +1195,11 @@ func (s *Service) submitScopeCeiling(ctx context.Context, run store.Run, ceiling
 		}
 		if terminalStatuses[current.Status] {
 			return SubmitInputResult{}, ErrRunTerminal
+		}
+		// An ordinary Stop cannot cross a refusal or its preserving resume to queued.
+		// Constrained runs must still be running when this lock is acquired.
+		if len(stopping) > 0 && stopping[0] && current.Status != "running" && PolicyOwnerConstrained(current) {
+			return SubmitInputResult{}, ErrStaleClaim
 		}
 		frozen, err := DecodeMilestones(current.MilestonesFrozen)
 		if err != nil {

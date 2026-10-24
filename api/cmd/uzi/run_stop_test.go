@@ -1,7 +1,10 @@
 package main
 
 import (
+	"strings"
 	"testing"
+
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
@@ -12,7 +15,7 @@ import (
 // MUTATION PROOF: wire the stop command to any other kind constant and LastInputKind is
 // no longer "stop".
 func TestRunStopPostsStopKind(t *testing.T) {
-	fc := &uzicli.FakeClient{}
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r1": {ID: "r1", Kind: "issue", Status: "running"}}}
 	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "stop", "r1", "-m", "wind down please")
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
@@ -28,7 +31,7 @@ func TestRunStopPostsStopKind(t *testing.T) {
 // The stop message is OPTIONAL, like a cancel reason — no -m still succeeds with an
 // empty body.
 func TestRunStopWithoutMessageSucceeds(t *testing.T) {
-	fc := &uzicli.FakeClient{}
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r1": {ID: "r1", Kind: "issue", Status: "running"}}}
 	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "stop", "r1")
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
@@ -55,14 +58,25 @@ func TestRunStopExitCodes(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			fc := &uzicli.FakeClient{Err: tc.err}
-			_, _, code := runCLI(t, fakeEnv(fc), "run", "stop", "r1")
+			fc := &uzicli.FakeClient{}
+			wantMutation := ""
+			if tc.want == uzicli.ExitNotFound {
+				fc.Err = tc.err
+			} else {
+				fc.RunByID = map[string]apitypes.RunDTO{"r1": {ID: "r1", Kind: "issue", Status: "completed"}}
+				fc.SubmitRunInputErr = tc.err
+				wantMutation = kindStop
+			}
+			_, stderr, code := runCLI(t, fakeEnv(fc), "run", "stop", "r1")
 			if code != tc.want {
 				t.Fatalf("exit = %d, want %d", code, tc.want)
 			}
-			// The kind still reached the client before the error surfaced.
-			if fc.LastInputKind != kindStop {
-				t.Errorf("submit-input kind = %q, want %q", fc.LastInputKind, kindStop)
+			// A missing presentation must abort before the mutation.
+			if !strings.Contains(stderr, tc.err.Error()) {
+				t.Errorf("error lost: %q, want %q", stderr, tc.err.Error())
+			}
+			if fc.LastInputKind != wantMutation {
+				t.Errorf("submit-input kind = %q, want %q", fc.LastInputKind, wantMutation)
 			}
 		})
 	}

@@ -416,19 +416,20 @@ func adminWorkerDTOFromRow(row store.ListAllWorkersRow, cpVersion, pinnedWorkerV
 // DTO. The depth lives in workersvc's restart-losing tracker, not in a store.Worker
 // row, so workerDTOFromWorker/workerDTOFromRow (which read only the row) cannot carry
 // it and this overlay runs at each response site that should show it. Left NIL (the
-// five fields marshal null) when the worker has no tracked depth, so a worker with no
+// six fields marshal null) when the worker has no tracked depth, so a worker with no
 // outbox shows nulls; set together the moment any component is non-zero. A nil wsvc
 // (defensive; the handler always wires one) is a no-op.
 func (h *Handler) overlayOutbox(dto *apitypes.WorkerDTO, workerID uuid.UUID) {
 	if h.wsvc == nil {
 		return
 	}
-	pm, pt, sr, blocked, blockedRunID := h.wsvc.OutboxAggregate(workerID)
-	if pm == 0 && pt == 0 && sr == 0 && blocked == nil {
-		return // no tracked depth → leave the five fields null
+	pm, pt, pp, sr, blocked, blockedRunID := h.wsvc.OutboxAggregate(workerID)
+	if pm == 0 && pt == 0 && pp == 0 && sr == 0 && blocked == nil {
+		return // no tracked depth → leave the six fields null
 	}
 	dto.OutboxPendingMessages = &pm
 	dto.OutboxPendingTerminal = &pt
+	dto.OutboxPendingPolicy = &pp
 	dto.OutboxStaleRetired = &sr
 	dto.OutboxBlocked = blocked
 	dto.OutboxBlockedRunID = blockedRunID

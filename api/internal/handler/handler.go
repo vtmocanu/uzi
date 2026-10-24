@@ -1041,6 +1041,7 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// 409); it resumes the run (paused → queued) or delivers the decision to the live
 				// worker, spending no forge and minting nothing.
 				r.Post("/{id}/completion/decision", h.ContinueCompletionDecision)
+				r.Get("/{id}/policy-stop-review", h.PolicyStopReview)
 				// Per-run MR-rework override (PRD #841 M2, Decision D3). RequireUser — NOT the
 				// cookie-only RequireAuth group where wait-on-limit sits — because this is a
 				// pure preference toggle with no resource-consent dimension (parking a run
@@ -1244,6 +1245,7 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// three-term deadline. paused = parked (clean up), anything else = the owner extended in the
 		// window, restart the turn. Mirrors the completion/hold ack contract.
 		r.Post("/runs/{id}/wall-park", h.WorkerRunWallPark)
+		r.Post("/runs/{id}/policy-hold", h.WorkerRunPolicyHold)
 		r.Post("/runs/{id}/pause", h.WorkerRunPause)
 		// issue #3194: the --require-base base-attestation HOLD. The worker's preflight guard found
 		// retained work no checkpoint attests; the service parks its own live claim (running ->

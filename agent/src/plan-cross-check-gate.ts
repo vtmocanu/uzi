@@ -79,6 +79,8 @@ export async function checkPlan(options: CheckPlanOptions): Promise<CheckedPlanD
          !isDeepStrictEqual(response.candidate.semantic_candidate, candidate.semantic_candidate)) ||
         !Number.isFinite(deadline) || deadline > Date.now() + 2 * 60 * 60 * 1000 ||
         (identity && (response.candidate_digest !== identity.candidate_digest ||
+          response.cross_check_id !== identity.cross_check_id ||
+          ("cross_check_id" in response) !== ("cross_check_id" in identity) ||
           response.checker_run_id !== identity.checker_run_id ||
           response.deadline_at !== identity.deadline_at ||
           response.automatic_revision_limit !== identity.automatic_revision_limit ||

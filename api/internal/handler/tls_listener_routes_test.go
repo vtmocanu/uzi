@@ -73,6 +73,7 @@ func TestTLSListenerServesOnlyTheWorkerAndControllerSurface(t *testing.T) {
 		{http.MethodGet, "/api/admin/workers"},
 		{http.MethodGet, "/api/me"},
 		{http.MethodGet, "/api/runs"},
+		{http.MethodGet, "/api/runs/00000000-0000-0000-0000-000000000001/policy-stop-review"},
 		{http.MethodGet, "/api/ws"}, // the agent never opens one; verified by grep
 		{http.MethodGet, "/api/health"},
 		{http.MethodGet, "/api/version"}, // public info route, plain listener only — like /api/health

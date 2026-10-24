@@ -205,6 +205,7 @@ type MemoryHoldDTO struct {
 
 // RunDTO is the web view of a run; worker-internal session_id and last_seq are omitted.
 type RunDTO struct {
+	PolicyRefusal                                  *PolicyRefusalDTO     `json:"policy_refusal,omitempty"`
 	CompletionPending                              *CompletionPendingDTO `json:"completion_pending,omitempty"`
 	SemanticGate                                   *SemanticGateDTO      `json:"semantic_gate,omitempty"`
 	SemanticDrift                                  *SemanticDriftDTO     `json:"semantic_drift,omitempty"`
@@ -1067,6 +1068,7 @@ type CredentialEpochDTO struct {
 // RunDTO / RunListItemDTO source fields exactly; the nested value types are reused. There is
 // exactly one worker_name here, the list-level one (RunListItemDTO.WorkerName).
 type RunSummaryItemDTO struct {
+	PolicyRefusal  *PolicyRefusalDTO  `json:"policy_refusal,omitempty"`
 	WorkerRecovery *WorkerRecoveryDTO `json:"worker_recovery,omitempty"`
 	MemoryHold     *MemoryHoldDTO     `json:"memory_hold,omitempty"`
 
@@ -1850,6 +1852,7 @@ type RunSummaryItemDTO struct {
 // key-set test in run_summary_test.go fails until the field is placed here on purpose.
 func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 	return RunSummaryItemDTO{
+		PolicyRefusal:               item.PolicyRefusal,
 		WorkerRecovery:              item.WorkerRecovery,
 		MemoryHold:                  item.MemoryHold,
 		ID:                          item.ID,
@@ -2016,6 +2019,7 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 	return RunListItemDTO{
 		RunDTO: RunDTO{
+			PolicyRefusal:               s.PolicyRefusal,
 			WorkerRecovery:              s.WorkerRecovery,
 			MemoryHold:                  s.MemoryHold,
 			ID:                          s.ID,
@@ -2234,8 +2238,10 @@ type MessageDTO struct {
 // RunInputRequest is the POST /api/runs/{id}/inputs body: a steering input
 // (approve/reject/follow-up/cancel).
 type RunInputRequest struct {
-	Kind string `json:"kind"`
-	Body string `json:"body"`
+	// ActionIfMatch is Go-only client transport metadata, excluded from JSON.
+	ActionIfMatch string `json:"-"`
+	Kind          string `json:"kind"`
+	Body          string `json:"body"`
 	// Selection is the PRD #37 agent choice, sent STRUCTURED and legal only with
 	// approve_plan. The client never composes the worker-bound input body itself:
 	// the server validates this against the run's real roster and writes its own
@@ -2292,6 +2298,8 @@ type RunInputResponse struct {
 	// step (extend-and-resume, or stop). omitempty — absent (false) on every other path, including a
 	// plain extend of a running run — so the CLI can say the run resumed, not merely that time was added.
 	Resumed bool `json:"resumed,omitempty"`
+	// PolicyStop is the immutable acceptance receipt for an exact reviewed Stop.
+	PolicyStop *PolicyStopReceipt `json:"policy_stop,omitempty"`
 }
 
 // SteerInputDTO is one steer-queue entry (PRD #95, #634), served by
@@ -2412,4 +2420,19 @@ type RunJobFindingDTO struct {
 	URL       *string `json:"url"`
 	File      *string `json:"file"`
 	Line      *int    `json:"line"`
+}
+
+// PolicyRefusalDTO contains only typed policy metadata and preservation evidence.
+type PolicyRefusalDTO struct {
+	Count             int32      `json:"count"`
+	LastTag           *string    `json:"last_tag"`
+	LastPhase         *string    `json:"last_phase"`
+	LastCorrelationID *string    `json:"last_correlation_id"`
+	LastRefusedAt     *time.Time `json:"last_refused_at"`
+	Detail            *string    `json:"detail"`
+	Provenance        *string    `json:"provenance"`
+	Published         *bool      `json:"published"`
+	ActionIfMatch     string     `json:"action_if_match"`
+	CanResume         bool       `json:"can_resume"`
+	CanCancel         bool       `json:"can_cancel"`
 }

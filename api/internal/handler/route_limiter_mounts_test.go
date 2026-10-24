@@ -517,6 +517,9 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/repos/{id}/tool-profile", noLimiter},
 	{"GET", "/api/runs/", noLimiter},
 	{"GET", "/api/runs/{id}", noLimiter},
+	// Issue #3068: owner-only, read-only Stop confirmation snapshot. Local DB reads,
+	// no forge request or model spend, matching the owner input and review reads.
+	{"GET", "/api/runs/{id}/policy-stop-review", noLimiter},
 	// PRD #1296 M2 owner recovery-archive routes. noLimiter — owner-scoped DB reads/writes
 	// with no forge call and no token spend (the streaming download is bounded by the
 	// recovery service's own per-process concurrency cap, not a per-user limiter).
@@ -854,6 +857,8 @@ var wantRouteMounts = []routeMount{
 	// own run with no forge call → noLimiter, exactly like the completion/hold report beside it (both
 	// are fenced server-side, not by a per-user limiter).
 	{"POST", "/api/worker/runs/{id}/wall-park", noLimiter},
+	// Policy holds are worker-authenticated, generation-fenced DB writes without forge calls.
+	{"POST", "/api/worker/runs/{id}/policy-hold", noLimiter},
 	{"POST", "/api/worker/runs/{id}/pause", noLimiter},
 	// issue #3194: the base-attestation HOLD report, fenced server-side like the wall park above.
 	{"POST", "/api/worker/runs/{id}/base-attestation-hold", noLimiter},

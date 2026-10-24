@@ -1120,6 +1120,7 @@ type Store interface {
 	// queued run (runs.ci_config_guard) whose owner has NO online worker self-reporting the
 	// 'ci_config_guard_v1' protocol capability gets reasonNoCIConfigGuardCapableWorker.
 	CountOnlineWorkersSatisfyingCIConfigGuard(ctx context.Context, userID uuid.UUID) (int64, error)
+	CountOnlineWorkersSatisfyingPolicyHold(ctx context.Context, arg store.CountOnlineWorkersSatisfyingPolicyHoldParams) (int64, error)
 	// CountOnlineWorkersSatisfyingCodexHarness backs PRD #1332 M5A's (D3) queued-reason rung: a
 	// CODEX-INDICATING queued run whose owner has NO online worker advertising the 'codex_harness_v1'
 	// protocol capability gets reasonNoCodexCapableWorker — the run's non-bypassable Codex claim
@@ -1412,6 +1413,10 @@ type Store interface {
 
 // Params are the runtime knobs the service needs, mirrored from config.
 type Params struct {
+	PolicyStopNegotiated bool
+	// Policy hold activation is reserved for M2; tests explicitly negotiate the seam.
+	PolicyHoldNegotiated      bool
+	PolicyHoldSnapshotEnabled bool
 	// CustodyHoldLimit supplies the per-owner custody admission limit (the custody_hold_limit
 	// admin setting; see CustodyHoldLimitReader). Nil means no usable value: claims refuse
 	// and the health pill reports the setting unreadable, never a fallback number.
@@ -3127,10 +3132,10 @@ func (s *Service) ResidueQuarantineFor(workerID uuid.UUID) (ResidueQuarantine, b
 }
 
 // OutboxAggregate returns a worker's summed outbox depth (PRD #1391 M5) for the
-// WorkerDTO overlay: pending messages, pending terminals, stale-retired frames, and
+// WorkerDTO overlay: pending messages, pending terminals, pending policy holds, stale-retired frames, and
 // the oldest blocked reason and that entry's run id (nil when nothing is blocked). All zero and nil when the
 // worker has no tracked depth, so a worker with no outbox shows nulls.
-func (s *Service) OutboxAggregate(workerID uuid.UUID) (pendingMessages, pendingTerminal, staleRetired int, blocked, blockedRunID *string) {
+func (s *Service) OutboxAggregate(workerID uuid.UUID) (pendingMessages, pendingTerminal, pendingPolicy, staleRetired int, blocked, blockedRunID *string) {
 	return s.outbox.workerAggregate(workerID)
 }
 
@@ -4628,6 +4633,12 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 			// stale_claim disposition. The deferred Rollback releases the lock.
 			return locked, false, ErrStaleClaim
 		}
+		// An owner-resumable policy hold keeps the old worker for custody. Refuse
+		// ordinary reports under the existing fence before any metadata writes or
+		// post-transition MR reconciliation. A fresh claimed/running flight continues.
+		if PolicyOwnerConstrained(locked) && (locked.Status == "paused" || locked.Status == "queued") {
+			return locked, false, nil
+		}
 		if req.ExpectedGateRevision != nil && locked.StopKind.String != "cancelled" {
 			if !gateReportAdmissible(locked.Status) {
 				return locked, false, nil
@@ -4738,6 +4749,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	var providerHeld bool
 	switch req.State {
 	case "running":
+		var autopilotAcceptance *policyAutopilotAcceptance
 		// RC1 (issue #1197): an AUTOPILOT run auto-approves its own plan and NEVER reports
 		// awaiting_approval, so its approved plan text rides THIS self-contained `running`
 		// report instead. Persist it via the guarded, idempotent SetRunAutopilotPlan whose
@@ -4773,6 +4785,12 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 				fenceTx = tx
 				q = store.New(tx)
 			}
+			// owned is the locked prewrite snapshot. No first-plan proof is
+			// prepared for a heartbeat, stored-plan retry or unfenced report.
+			autopilotAcceptance, err = preparePolicyAutopilotAcceptance(ctx, fenceTx, wkr, owned, req.ClaimGeneration)
+			if err != nil {
+				return store.Run{}, false, err
+			}
 			var planRows int64
 			planParams := store.SetRunAutopilotPlanParams{
 				PlanMd: planBody, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
@@ -4796,6 +4814,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 			planRows, err = q.SetRunAutopilotPlan(ctx, planParams)
 			if err != nil {
 				return store.Run{}, false, err
+			}
+			if autopilotAcceptance != nil && planRows != 1 {
+				return store.Run{}, false, fmt.Errorf("%w: policy autopilot plan fence: affected %d rows", ErrInvalidState, planRows)
 			}
 			if planRows == 0 {
 				// A concurrent cancel/park is a state refusal, not an invalid plan.
@@ -4874,6 +4895,23 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 			}
 		}
 		rows, err = q.SetRunRunning(ctx, runningParams)
+		if err == nil && rows == 0 && req.PlanMd != nil && fenceTx != nil && autopilotAcceptance == nil {
+			// Source uncertainty does not relax the normal plan/running atomic
+			// pair. Return a refusal before commit; deferred rollback also undoes
+			// the preceding guarded plan write.
+			return owned, false, nil
+		}
+		if autopilotAcceptance != nil {
+			if err != nil {
+				return store.Run{}, false, err
+			}
+			if rows != 1 {
+				return store.Run{}, false, fmt.Errorf("policy autopilot running fence: affected %d rows", rows)
+			}
+			if err := acceptPolicyAutopilotRevision(ctx, fenceTx, autopilotAcceptance, stripNULParam(req.PlanMd), req.CandidateDigest); err != nil {
+				return store.Run{}, false, err
+			}
+		}
 	case "awaiting_approval":
 		// PRD #122 M1: the CANDIDATE milestone list rides the pre-approval report.
 		// milestonesParam validates + kind-gates it (Decision 12/13) and returns NULL
@@ -5023,6 +5061,17 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 			approvalParams.SizeClass = pgtype.Text{}
 			approvalParams.MilestonesCandidate = retainedMilestonesCandidate(decision.retained)
 		}
+		rebindSource := decision.class == gateClassPublish && fenceTx != nil &&
+			policyEligible(owned) && !owned.TargetRunID.Valid && len(owned.PolicyStopResolution) == 0 &&
+			owned.ClaimGeneration > 0 && owned.WorkerID.Valid && uuid.UUID(owned.WorkerID.Bytes) == wkr.ID &&
+			!owned.ClaimReleasedAt.Valid
+		var publicationSource *apitypes.PolicyRevisionSourceV1
+		if rebindSource {
+			publicationSource, err = policyRevisionSourceBeforePublication(ctx, q, owned)
+			if err != nil {
+				return store.Run{}, false, err
+			}
+		}
 		rows, err = q.SetRunAwaitingApproval(ctx, approvalParams)
 		if err == nil && rows > 0 {
 			// Allocation only when the report was actually applied, in the same transaction.
@@ -5033,6 +5082,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 			case gateClassRetain:
 				rev = owned.GateRevision
 				err = q.ResetRunGateRefusals(ctx, runID)
+			}
+			if err == nil && rebindSource {
+				err = rebindPolicyRevisionSource(ctx, q.(*store.Queries), owned, publicationSource, rev)
 			}
 			if err == nil && req.RevisionInputID != nil {
 				err = settleRevisionTargets(ctx, q.(*store.Queries), owned, wkr.ID, req)
@@ -8051,6 +8103,7 @@ func (s *Service) AdminRunOutcomesPerUser(ctx context.Context) ([]store.AdminRun
 
 // SubmitInputResult reports how a steering input was handled.
 type SubmitInputResult struct {
+	PolicyStop *apitypes.PolicyStopReceipt
 	// ServerSide is true when a cancel/reject was applied directly because no
 	// live poller would ever consume it.
 	ServerSide bool

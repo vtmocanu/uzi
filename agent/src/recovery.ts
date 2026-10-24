@@ -261,6 +261,7 @@ export interface RecoveryOutcome {
  *  structurally; a test supplies a fake. */
 export interface RecoveryArchiveClient {
   withAcknowledgedFinalReportCustody?: WorkerClient["withAcknowledgedFinalReportCustody"];
+  withPolicyReportRetirementCustody?: WorkerClient["withPolicyReportRetirementCustody"];
   hasFeature?(feature: string): boolean;
   hasHeldPublicationV2?: WorkerClient["hasHeldPublicationV2"];
   publishHeld?: WorkerClient["publishHeld"];
@@ -1703,6 +1704,21 @@ export class RecoveryCoordinator {
   }
 
 
+  /** Policy unlink stays inside the current C/S/J/B boundary; no interval proof escapes. */
+  async withPolicyReportRetirementProof(
+    runId: string, sourceGeneration: number, deliveryGeneration: number, head: string,
+    budget: { signal: AbortSignal; deadline: number },
+    reserve: Parameters<RecoveryCoordinator["retireArchivedReport"]>[3],
+    inspectSources: Parameters<RecoveryCoordinator["retireArchivedReport"]>[4],
+    action: Parameters<RecoveryCoordinator["retireArchivedReport"]>[5],
+  ): Promise<void> {
+    if (!Number.isSafeInteger(sourceGeneration) || sourceGeneration <= 0 ||
+        sourceGeneration > deliveryGeneration || (head !== "" && !/^[0-9a-f]{40}$/.test(head)) ||
+        !this.client.withPolicyReportRetirementCustody) return;
+    await this.retireArchivedReport(runId, deliveryGeneration, budget, reserve, inspectSources, action,
+      { sourceGeneration, head });
+  }
+
   /** C -> S -> J -> B -> O. This operation consumes archive observations only;
    * the callback performs the conditional exact unlink before any boundary releases.
    * At most 256 journals and their captures are considered; a bad candidate retains
@@ -1714,9 +1730,10 @@ export class RecoveryCoordinator {
     inspectSources: (bare: string, covered: (head: string) => Promise<boolean>,
       laterHead: (head: string) => boolean) => Promise<boolean>,
     remove: (ownTailEligible: () => boolean) => Promise<void>,
+    policy?: { sourceGeneration: number; head: string },
   ): Promise<void> {
     return this.withCancellationAttempt({ runId, generation, inventoryGuarded: true } as RecoveryRecord,
-      () => this.retireArchivedReportWithinAttempt(runId, generation, budget, reserve, inspectSources, remove));
+      () => this.retireArchivedReportWithinAttempt(runId, generation, budget, reserve, inspectSources, remove, policy));
   }
 
   private async retireArchivedReportWithinAttempt(
@@ -1726,6 +1743,7 @@ export class RecoveryCoordinator {
     inspectSources: (bare: string, covered: (head: string) => Promise<boolean>,
       laterHead: (head: string) => boolean) => Promise<boolean>,
     remove: (ownTailEligible: () => boolean) => Promise<void>,
+    policy?: { sourceGeneration: number; head: string },
   ): Promise<void> {
     if (!this.enabled || !Number.isSafeInteger(generation) || generation <= 0 ||
         !this.git.withBareLock || !this.git.withReportProofBudget ||
@@ -1739,13 +1757,14 @@ export class RecoveryCoordinator {
       () => reserve(ownTailEligible => this.withJournalLock(runId, async () => {
         check();
         const sources = await this.checkedRecords(runId, budget);
-        const records = sources.filter(r => r.generation === generation && r.inventoryGuarded === true &&
+        const records = sources.filter(r => (policy ? Number.isSafeInteger(r.generation) && r.generation! > 0 && r.generation! <= generation : r.generation === generation) && r.inventoryGuarded === true &&
           r.state === "uploaded" && r.serverCaptureId && r.coverageDigest && r.coverageContext &&
           r.originalSourceSha && r.inventoryCurrentSha && Array.isArray(r.originalRoots) &&
           /^[0-9a-f]{40}$/.test(r.sourceSha) && /^[0-9a-f]{64}$/.test(r.checksum ?? "") &&
           Number.isSafeInteger(r.byteSize) && r.byteSize! > 0 &&
           r.reason !== "inventory_snapshot_changed" && r.reason !== "inventory_quiescence_breach");
-        if (records.length !== 1) return;
+        if (!records.length || (!policy && records.length !== 1)) return;
+        records.sort((a, b) => (b.generation ?? 0) - (a.generation ?? 0));
         for (const record of records) {
           check();
           const bare = record.bareDir && await ownedRecoveryIO(() => this.git.withReportProofBudget!(budget,
@@ -1762,7 +1781,17 @@ export class RecoveryCoordinator {
             if (!healthyInventoryStatus(status, record, this.now())) return false;
             check();
             const owed = await ownedRecoveryIO(() => this.git.enumerateOwedUnderLock!(bare, runId));
-            const settledEarlier = await this.settledEarlierGenerations(sources, generation);
+            // Policy proofs cover every authenticated obligation, including closed older sources.
+            const actualGenerations = new Set<number>([generation, ...(policy ? [policy.sourceGeneration] : [])]);
+            if (policy) {
+              const roots = [...owed, ...sources.flatMap(s => s.originalRoots ?? [])];
+              const attributed = [...sources.map(s => s.generation), ...roots.flatMap(r => r.contexts.map(c => c.generation))];
+              if (roots.some(r => !r.contexts.length) ||
+                  attributed.some(g => !Number.isSafeInteger(g) || g! <= 0 || g! > generation)) return false;
+              for (const g of attributed) actualGenerations.add(g!);
+              if (actualGenerations.size > 256) return false;
+            }
+            const settledEarlier = policy ? new Set<number>() : await this.settledEarlierGenerations(sources, generation);
             const laterContext = (c: OwedCandidate["contexts"][number]) =>
               Number.isSafeInteger(c.generation) && c.generation! > generation;
             const laterHead = (sha: string) => {
@@ -1799,12 +1828,28 @@ export class RecoveryCoordinator {
             // Frozen original/current heads remain requirements even if their pins disappeared.
             for (const head of [record.originalSourceSha!, record.inventoryCurrentSha!,
                 ...record.originalRoots!.map(r => r.sha)]) if (!await covered(head)) return false;
-            if (!await inspectSources(bare, covered, laterHead)) return false;
+            if (policy && policy.head !== "" && !await covered(policy.head)) return false;
+            if (!await inspectSources(bare, covered, policy ? () => false : laterHead)) return false;
             check();
             if (canonicalJson(await this.checkedRecords(runId, budget)) !== canonicalJson(sources) ||
                 canonicalJson(await ownedRecoveryIO(() => this.git.enumerateOwedUnderLock!(bare, runId))) !== canonicalJson(owed)) return false;
             if (!ownTailEligible()) return false;
-            await remove(ownTailEligible);
+            if (policy) {
+              await this.client.withPolicyReportRetirementCustody!(runId, generation,
+                [...actualGenerations].sort((a, b) => a - b), budget, async custodyEligible => {
+                  MaintenanceBudget.current()?.check();
+                  check();
+                  if (canonicalJson(await this.checkedRecords(runId, budget)) !== canonicalJson(sources) ||
+                      canonicalJson(await ownedRecoveryIO(() => this.git.enumerateOwedUnderLock!(bare, runId))) !== canonicalJson(owed) ||
+                      !await inspectSources(bare, covered, () => false)) return;
+                  MaintenanceBudget.current()?.check();
+                  const eligible = () => ownTailEligible() && custodyEligible() &&
+                    !budget.signal.aborted && Date.now() < budget.deadline &&
+                    residueQuarantine() === undefined && healthyInventoryStatus(status, record, this.now());
+                  if (eligible()) await remove(eligible);
+                }, sources.some(s => s.generation === generation && s.inventoryGuarded === true));
+              MaintenanceBudget.current()?.check();
+            } else await remove(ownTailEligible);
             return true;
           })));
           if (removed) return;
