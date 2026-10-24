@@ -605,6 +605,28 @@ describe("hash-attested maintenance WIP capture (W0-H)", { skip: process.platfor
     assert.equal(f.gitIn("show", "HEAD:tracked"), "changed");
   });
 
+  test("unsafe config planted in the commit callback refuses at P5 before any P5 launch, W retained", async t => {
+    const f = await fixture(t);
+    await f.dirty();
+    await assert.rejects(f.capture(f.hooks({ after: step => {
+      if (step === "commit") f.gitIn("config", "filter.planted.clean", "touch planted");
+    } })), REFUSED);
+    assert.notEqual(f.head(), f.old, "post-CAS: W retained, never rewound");
+    assert.equal(f.gitIn("show", "HEAD:tracked"), "changed");
+    const after = f.events.indexOf("after:commit");
+    assert.deepEqual(f.events.slice(after).filter(e => e.startsWith("launch:")),
+      ["launch:pin", "launch:metadata", "launch:config"], "only the pin and config check ran after the callback");
+  });
+
+  test("clean: an index replaced in the status callback refuses instead of returning clean", async t => {
+    const f = await fixture(t);
+    const refsBefore = f.refs();
+    await assert.rejects(f.capture(f.hooks({ after: step => { if (step === "status") replaceIndex(f.root); } })), REFUSED);
+    assert.deepEqual(f.mutations(), []);
+    assert.ok(!f.launched("add"));
+    assertUnmoved(f, refsBefore);
+  });
+
   test("stage-1 census over cap refuses before any lstat", async t => {
     const f = await fixture(t);
     const m = meter(t);
@@ -638,12 +660,42 @@ describe("hash-attested maintenance WIP capture (W0-H)", { skip: process.platfor
     assert.ok(!f.launched("add"));
     assertUnmoved(f, refsBefore);
     assert.deepEqual(m.attempts.at(-1), ["sourceBytes", 15], "the payload byte precharge failed");
-    // The stage-2 per-step precharge (4 entries x 2 files) was charged before the byte charge failed and is not refunded.
-    assert.deepEqual(m.attempts.at(-2), ["sourceEntries", 8]);
-    assert.deepEqual(m.calls.at(-1), ["sourceEntries", 8], "the charge stays recorded, not reversed");
+    // The stage-2 per-step precharge (5 entries x 2 files) was charged before the byte charge failed and is not refunded.
+    assert.deepEqual(m.attempts.at(-2), ["sourceEntries", 10]);
+    assert.deepEqual(m.calls.at(-1), ["sourceEntries", 10], "the charge stays recorded, not reversed");
     // The slot is revoked by the exhaustion: a later tiny consume still fails.
     assert.throws(() => f.run(() => MaintenanceResources.consume("sourceEntries", 1)), /maintenance_/);
     assert.throws(() => f.run(() => MaintenanceResources.consume("launches", 1)), /maintenance_/);
+  });
+
+  // Stage 2 opens a regular file with no pre-open lstat: open + fstat identity carry the check.
+  const swaps: Array<{ name: string; swap: (target: string) => void }> = [
+    { name: "none (positive control)", swap: () => undefined },
+    { name: "symlink", swap: target => { fsSync.rmSync(target); fsSync.symlinkSync("tracked.real", target); } },
+    { name: "FIFO", swap: target => { fsSync.rmSync(target); execFileSync("mkfifo", [target]); } },
+  ];
+  for (const c of swaps) test("a regular file swapped for " + c.name + " between census and payload", async t => {
+    const f = await fixture(t);
+    await f.dirty();
+    await fs.writeFile(path.join(f.root, "tracked.real"), "changed");
+    const refsBefore = f.refs();
+    let swapped = 0;
+    f.intercept(request => {
+      const script = request.argv[1] === "-e" ? request.argv[2] ?? "" : "";
+      if (script.startsWith("// uzi-wip-payload") && swapped++ === 0) c.swap(path.join(f.root, "tracked"));
+      return undefined;
+    });
+    if (c.name.startsWith("none")) {
+      const result = await f.capture();
+      assert.equal(result.kind, "committed");
+      assert.equal(f.gitIn("show", "HEAD:tracked"), "changed");
+    } else {
+      await assert.rejects(f.capture(), REFUSED);
+      assert.ok(!f.launched("add"), "refused in the payload stage, before add");
+      assert.deepEqual(f.mutations(), []);
+      assertUnmoved(f, refsBefore);
+    }
+    assert.equal(swapped, 1, "the swap ran exactly at the payload launch");
   });
 
   // ------------------------------------------------- acceptance 2: forged clean index entry
@@ -938,12 +990,12 @@ describe("hash-attested maintenance WIP capture (W0-H)", { skip: process.platfor
     const result = await f.capture();
     assert.equal(result.kind, "committed");
     const depth = f.root.split("/").filter(Boolean).length; // cloneDepth as the capture counts it
-    assert.equal(f.configRows.length, 6, "six configChecks listed the configuration");
-    const configRows = f.configRows.reduce((sum, n) => sum + n, 0); // rows the six listings actually printed
+    assert.equal(f.configRows.length, 7, "seven configChecks listed the configuration");
+    const configRows = f.configRows.reduce((sum, n) => sum + n, 0); // rows the seven listings actually printed
     // Fixture: T = {tracked, .gitignore} (2 paths); one unstaged edit of `tracked`; nothing staged or untracked.
     //
     // launches: every Git or helper child charges 1 (metered at launch).
-    //   configCheck (metadata helper + `config`) x6: P0, status-dispatch, add-dispatch, 3 commit dispatches = 12
+    //   configCheck (metadata helper + `config`) x7: P0, status-dispatch, add-dispatch, 3 commit dispatches, P5 = 14
     //   P0 plain: --shared-index-path, symbolic-ref, for-each-ref, rev-parse HEAD, cat-file                  =  5
     //   P1: pin read, ls-files --stage, ls-files -v, repin                                                  =  4
     //   status dispatch: repin                                                                              =  1
@@ -954,24 +1006,25 @@ describe("hash-attested maintenance WIP capture (W0-H)", { skip: process.platfor
     //     write-tree, post-write-tree pin read, diff-tree                                                   =  8
     //   commit-tree dispatch: repin x3 + commit-tree + the pre-CAS cat-file of W                           =  5
     //   update-ref dispatch: repin x3 + update-ref                                                          =  4
-    //   P5: repin, cat-file, symbolic-ref, rev-parse, status, diff-tree, race census, repin                 =  8
-    //                                                                                              total   = 62
-    assert.equal(m.totals.launches, 62);
-    assert.equal(f.launches(), 62, "every charged launch reached the owner exactly once");
+    //   P5: repin x2 (around its configCheck), cat-file, symbolic-ref, rev-parse, status, diff-tree,
+    //     race census, repin                                                                                 =  9
+    //                                                                                              total   = 65
+    assert.equal(m.totals.launches, 65);
+    assert.equal(f.launches(), 65, "every charged launch reached the owner exactly once");
     // sourceEntries: one unit per Git output row or helper step.
     //   P0 for-each-ref branch row 1; ls-files --stage 2; ls-files -v 2; status rows 1 (`1 .M ... tracked`);
-    //   census stage 1: 1 per lstat x 2 paths = 2; payload stage 2: 4 per file (open, fstat, read, post-read fstat) x 2 = 8;
+    //   census stage 1: 1 per lstat x 2 paths = 2; payload stage 2: 5 per file (open, fstat, read, post-read fstat, post-read lstat) x 2 = 10;
     //   race census over the single manifest path: before add 1, before write-tree 1, P5 1 = 3;
     //   diff-tree rows after write-tree: raw row + path = 2; P5 diff-tree 2; P5 status rows 0.
-    assert.equal(m.totals.sourceEntries, 1 + 2 + 2 + 1 + 2 + 8 + 3 + 2 + 2);
+    assert.equal(m.totals.sourceEntries, 1 + 2 + 2 + 1 + 2 + 10 + 3 + 2 + 2);
     // sourceBytes: the payload precharge is the sum of the current sizes: "changed" (7) + ".gitignore" "ignored\n" (8).
     assert.equal(m.totals.sourceBytes, 7 + 8);
     // adminEntries: each configCheck charges 20 x (depth + 3) helper visits plus one per printed config row
     //   (the fixture's own keys plus the code-exec pins every runner-uid git launch carries: read off the real
-    //   `config --null --list` output of each of the six checks, not recomputed);
+    //   `config --null --list` output of each of the seven checks, not recomputed);
     //   each census/payload stage charges (distinct directories incl. root = 1) + depth + 1: stage 1, payload,
     //   2 pre-launch race rechecks and the P5 recheck = 5 stages.
-    assert.equal(m.totals.adminEntries, 6 * 20 * (depth + 3) + configRows + 5 * (1 + depth + 1));
+    assert.equal(m.totals.adminEntries, 7 * 20 * (depth + 3) + configRows + 5 * (1 + depth + 1));
     assert.equal(m.totals.rpcAttempts ?? 0, 0, "the capture itself makes no RPC");
     assert.equal(m.totals.metadataBytes !== undefined && m.totals.metadataBytes > 0, true);
   });

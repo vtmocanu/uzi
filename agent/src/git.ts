@@ -12024,7 +12024,9 @@ try {
       const worktree = new Map<string, string>();
       if (present.length) {
         const readPaths = present.map(i => universe[i]!);
-        charge(readPaths, 4, total);
+        // Five per path: a regular file's open, fstat, read completion, post-read fstat and
+        // post-read lstat. A symlink's lstat, readlink and lstat are overcharged at five.
+        charge(readPaths, 5, total);
         const hashed = await helper(MAINTENANCE_WIP_PAYLOAD_HELPER, [clonePath, String(total)],
           JSON.stringify(present.map(i => [universe[i], lines[i]])), 96 * present.length + 64);
         const out = hashed.split("\n");
@@ -12070,8 +12072,9 @@ try {
     } finally {
       if (statusAttempted) await callbacks.afterRunnerGit("status");
     }
-    if (clean) return { kind: "clean", head: oldHead, parent: null };
+    // The status callback interval is rechecked before either outcome, clean included.
     await repin(pin0);
+    if (clean) return { kind: "clean", head: oldHead, parent: null };
     const raceRecheck = async (): Promise<void> => {
       if (race.paths.length === 0) return;
       const current = await census(race.paths, race.allow);
@@ -12154,6 +12157,9 @@ try {
     }
 
     // P5: post-capture proof. A failure here refuses with the source retained; no ref is rewound.
+    // The commit callback may have changed the clone: check config/metadata before any P5 launch.
+    await repin(postTreePin);
+    await configCheck();
     await repin(postTreePin);
     const commit = await read(["cat-file", "-p", newHead]);
     if (commit !== expectedCommit()) throw refused();
@@ -18090,9 +18096,12 @@ finally { for (const fd of fds) { try { fs.closeSync(fd); } catch { process.exit
 `;
 
 // Stage 2: hash every present path. Input: JSON [[path, censusLine]]; argv[2] bounds the
-// total bytes. Regular files open O_NOFOLLOW|O_NONBLOCK, must still match the census
-// identity, are read in <= 64 KiB chunks plus a 1-byte EOF probe (growth refuses) and are
-// re-checked after the read. Symlinks use readlink with the same before/after identity.
+// total bytes. Regular files open O_NOFOLLOW|O_NONBLOCK|O_NOCTTY with no pre-open lstat:
+// the opened fd must be a regular file matching the census identity before any read (a
+// swapped-in symlink fails the open, a FIFO or socket fails the open or the fstat, and the
+// runner cannot create device nodes). They are read in <= 64 KiB chunks plus a 1-byte EOF
+// probe (growth refuses) and re-checked by fstat and path lstat after the read. Symlinks use
+// readlink with the same before/after lstat identity.
 const MAINTENANCE_WIP_PAYLOAD_HELPER = "// uzi-wip-payload\n" + MAINTENANCE_WIP_TREE_PRELUDE + String.raw`
 try {
   const limit = Number(process.argv[2]);
@@ -18106,15 +18115,14 @@ try {
     const size = Number(expected.split(" ")[2]);
     total += size;
     if (!Number.isSafeInteger(size) || total > limit) refuse();
-    if (identity(fs.lstatSync(p, { bigint: true })) !== expected) refuse();
     if (expected[0] === "l") {
-      if (size > 4096) refuse();
+      if (size > 4096 || identity(fs.lstatSync(p, { bigint: true })) !== expected) refuse();
       const target = fs.readlinkSync(p, { encoding: "buffer" });
       if (target.length !== size || identity(fs.lstatSync(p, { bigint: true })) !== expected) refuse();
       out.push("120000 " + createHash("sha1").update("blob " + size + "\0").update(target).digest("hex"));
       continue;
     }
-    const fd = open(p, C.O_RDONLY | C.O_NOFOLLOW | C.O_NONBLOCK);
+    const fd = open(p, C.O_RDONLY | C.O_NOFOLLOW | C.O_NONBLOCK | C.O_NOCTTY);
     try {
       const opened = fs.fstatSync(fd, { bigint: true });
       if (!opened.isFile() || identity(opened) !== expected) refuse();
