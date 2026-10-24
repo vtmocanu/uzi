@@ -5,6 +5,17 @@ import (
 	"testing"
 )
 
+func TestValidAcceptsHighMemoryPresetExactly(t *testing.T) {
+	if !Valid("l-highmem") {
+		t.Error(`Valid("l-highmem") = false, want true`)
+	}
+	for _, bad := range []string{"L-HIGHMEM", "L-Highmem", "l_highmem", "lhighmem", "xl", " l-highmem"} {
+		if Valid(bad) {
+			t.Errorf("Valid(%q) = true, want false", bad)
+		}
+	}
+}
+
 func TestValid(t *testing.T) {
 	for _, name := range Names {
 		if !Valid(name) {

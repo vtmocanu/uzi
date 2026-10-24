@@ -11,12 +11,14 @@ export interface FrozenHeldPolicy {
   flaggedCommits: string[];
   ciGlobs: string[] | null;
   confirmedTip?: string;
+  /** Task checkpoint evidence belongs to this exact run key, never merely its branch. */
+  checkpointKey?: string;
   extraFloors: string[];
 }
 export type HeldGit = Pick<GitCache, "resolveCheckpointRange" | "secretScanCheckpointRange" |
   "ancestry" | "rangeTouchesWorkflows" | "changedFilesNoRenames" | "checkpointPack">;
 
-export function validFrozenHeldPolicy(value: unknown): value is FrozenHeldPolicy {
+export function validFrozenHeldPolicy(value: unknown, owner?: { kind: string; runId: string }): value is FrozenHeldPolicy {
   if (!value || typeof value !== "object") return false;
   const p = value as FrozenHeldPolicy;
   const sha = (s: unknown) => typeof s === "string" && /^[0-9a-f]{40}$/.test(s);
@@ -26,7 +28,12 @@ export function validFrozenHeldPolicy(value: unknown): value is FrozenHeldPolicy
     p.flaggedCommits.length <= 256 && p.flaggedCommits.every(sha) &&
     (p.ciGlobs === null || strings(p.ciGlobs)) &&
     (p.confirmedTip === undefined || sha(p.confirmedTip)) &&
-    Array.isArray(p.extraFloors) && p.extraFloors.every(sha);
+    (p.checkpointKey === undefined || (typeof p.checkpointKey === "string" &&
+      /^uzi\/task\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(p.checkpointKey))) &&
+    Array.isArray(p.extraFloors) && p.extraFloors.every(sha) &&
+    (!owner || ((p.checkpointKey === undefined ||
+      (owner.kind === "task" && p.checkpointKey === `uzi/task/${owner.runId}`)) &&
+      (owner.kind !== "task" || p.confirmedTip === undefined || p.checkpointKey !== undefined)));
 }
 
 /** One range flows through scan, guards and pack. The pack cap bounds buffered bytes;

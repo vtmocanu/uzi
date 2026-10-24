@@ -1032,8 +1032,25 @@ describe("RunRunner — live settle on a confirmed checkpoint publish (issue #17
     });
   }
 
-  for (const kind of ["task", "ci_fix", "mr_rework", "prompt"]) {
-    it(`a confirmed CHECKPOINT publish of a ${kind} run fires nothing (checkpoint target is issue/self_improve only)`, async () => {
+  // Enrolled-task checkpoint and branch settlement are covered through execute in
+  // task-checkpoint-runner.test.ts (enrollment=true); legacy tasks must stay ineligible.
+  it("an unenrolled task refuses CHECKPOINT publication and never settles live custody", async () => {
+    const r = await liveRig();
+    try {
+      await r.settlement.put(adoptedRecord(r, HOLD_A));
+      const flight = liveFlight({ runKind: "task" });
+      assert.equal(await publish(r, flight, PUBLISHED_OK), false);
+      assert.equal(flight.lastCheckpointRefTip, undefined);
+      assert.equal(flight.lastAttemptedCheckpointRefTip, undefined);
+      assert.equal(r.observed.length, 0);
+      assert.equal((await r.settlement.listRun(RUN_ID))[0]!.live, undefined);
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  for (const kind of ["ci_fix", "mr_rework", "prompt"]) {
+    it(`a confirmed CHECKPOINT publish of a ${kind} run fires nothing (checkpoint target excludes this kind)`, async () => {
       const r = await liveRig();
       try {
         await r.settlement.put(adoptedRecord(r, HOLD_A));

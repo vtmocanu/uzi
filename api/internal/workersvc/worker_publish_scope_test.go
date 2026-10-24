@@ -73,7 +73,7 @@ func TestPublishWorkflowScopeRejectedSkipsCleanly(t *testing.T) {
 // run-uuid-keyed branch uzi/self-improve/<runID>, NOT the issue branch — proving the
 // server-side gate dispatches on kind FIRST. It would FAIL against the old issue-only gate
 // (which returned Skipped:"unsupported" for any non-issue kind). The captured
-// pushbroker.Options.Branch, the returned Ref, and the persisted tip are all asserted.
+// pushbroker.Options coordinates, the returned Ref, and the persisted tip are all asserted.
 func TestPublishSelfImproveDerivesRunIDBranch(t *testing.T) {
 	box := newBox(t)
 	sealed, err := box.Seal([]byte("pat"))
@@ -105,6 +105,7 @@ func TestPublishSelfImproveDerivesRunIDBranch(t *testing.T) {
 	})
 
 	runID := uuid.New()
+	fs.runOwned.ID = runID
 	wantBranch := "uzi/self-improve/" + runID.String()
 	res, err := svc.Publish(context.Background(), worker(), runID, "0123456789abcdef0123456789abcdef01234567", []byte("pack"))
 	if err != nil {
@@ -116,8 +117,8 @@ func TestPublishSelfImproveDerivesRunIDBranch(t *testing.T) {
 	if res.Skipped != "" {
 		t.Errorf("Skipped = %q, want \"\" (self_improve must not be an unsupported skip)", res.Skipped)
 	}
-	if captured.Branch != wantBranch {
-		t.Errorf("pushbroker Branch = %q, want %q (run-uuid-keyed, NOT the issue branch)", captured.Branch, wantBranch)
+	if captured.WorkBranch != wantBranch || captured.CheckpointKey != wantBranch {
+		t.Errorf("pushbroker Branch = %q, want %q (run-uuid-keyed, NOT the issue branch)", captured.CheckpointKey, wantBranch)
 	}
 	if res.Ref != "refs/uzi-checkpoints/"+wantBranch {
 		t.Errorf("Ref = %q, want %q", res.Ref, "refs/uzi-checkpoints/"+wantBranch)

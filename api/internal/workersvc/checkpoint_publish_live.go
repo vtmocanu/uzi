@@ -58,6 +58,12 @@ func (s *Service) confirmLivePublishAttempt(ctx context.Context, a store.Checkpo
 			return false, ErrStaleClaim
 		}
 	}
+	if run.Kind == "task" {
+		coordinates, coordinateErr := publicationCoordinates(run)
+		if coordinateErr != nil || coordinates == nil || a.Branch != coordinates.CheckpointKey || a.Ref != checkpointRefPrefix+coordinates.CheckpointKey {
+			return false, nil
+		}
+	}
 	if terminalStatuses[run.Status] {
 		return false, nil
 	}
@@ -69,7 +75,7 @@ func (s *Service) confirmLivePublishAttempt(ctx context.Context, a store.Checkpo
 		return false, fmt.Errorf("lock live checkpoint attempt: %w", err)
 	}
 	if !current.ReconcileReadyAt.Valid || current.RunID != a.RunID ||
-		current.Ref != a.Ref || current.Tip != a.Tip || current.AttestedSource != a.AttestedSource {
+		current.Branch != a.Branch || current.Ref != a.Ref || current.Tip != a.Tip || current.AttestedSource != a.AttestedSource {
 		return false, nil
 	}
 	rec, err := q.LockCheckpointRetentionForConfirmation(ctx, a.RunID)

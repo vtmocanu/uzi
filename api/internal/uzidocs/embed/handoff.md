@@ -99,6 +99,13 @@ A handoff can end with a second opinion instead of ending with your pull:
   them to the same `uzi/task/<run-id>` branch, so the whole loop — task,
   review, fix — runs without a manual step in between.
 
+For enrolled tasks, the checkpoint ref is `refs/uzi-checkpoints/uzi/task/<run-id>`.
+A writable `--then-fix` descendant keeps the validated root task's work branch
+but uses its own run UUID for its checkpoint key. Review runs remain read-only
+and push nothing; branch publication and the requested MR still happen through
+the existing task finalization flow. See [task checkpoint recovery](./run-recovery.md#task-checkpoint-recovery)
+for enrollment, recovery evidence and legacy-worker limits.
+
 ## Interactive mode
 
 A one-shot task is done when the agent calls `signal_done`: it finalizes
@@ -112,13 +119,13 @@ uzi handoff -m "add input validation to the signup form" --interactive
 ```
 
 - **Park, not finish.** On `signal_done`, an interactive task
-  checkpoint-pushes `uzi/task/<run-id>` and enters a new non-terminal status,
+  attempts to publish committed work through the checkpoint broker and enters a non-terminal status,
   `awaiting_followup`, holding its SDK session, clone and branch alive rather
   than tearing them down.
 - **`uzi run follow-up <run-id>` wakes it.** The *same* agent session resumes
   with full context (a session-id resume, not a fresh session with the
   history replayed), takes turns against your follow-up until the next
-  `signal_done`, checkpoint-pushes, and parks again — repeat as many times as
+  `signal_done`, attempts another checkpoint publish, and parks again — repeat as many times as
   you like.
 - **`uzi run stop <run-id>` winds it down on purpose.** Unlike `uzi run
   cancel`, which aborts mid-turn, `stop` finishes the current turn and
@@ -129,8 +136,8 @@ uzi handoff -m "add input validation to the signup form" --interactive
   follow-up or a stop, the worker's own clock (`WORKER_TASK_IDLE_TIMEOUT`,
   default 30 minutes) finalizes the task the same way `run stop` does — push,
   then `completed` — so a parked task never pins a worker slot indefinitely.
-  Work is checkpoint-pushed at *every* park, not only at wind-down, so a
-  worker dying mid-session never strands unpushed commits.
+  A checkpoint publish is attempted at each park. Recovery depends on verified
+  publication or a verified recovery capture; a park alone is not durability proof.
 - **A plain (non-interactive) handoff gets its own wall-clock and iteration
   budgets.** It runs under a dedicated default of 4h (`HANDOFF_RUN_TIMEOUT`) and
   a dedicated implement ⇄ review cap of 10 (`HANDOFF_RUN_MAX_ITERATIONS`),

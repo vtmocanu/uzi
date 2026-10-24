@@ -37,9 +37,12 @@ covers resumed-tip verification, direct publication or capture through
 That held scope ends after `recordRecoveryCapture`; fresh successor creation from the
 durable bare pin is outside capture and reads only predecessor lstat metadata, not
 old clone bytes. Ordinary seeding trust is unchanged. Refusing every credential-free
-capture would strand capturable work in the ephemeral clone rather than the durable
+capture would strand capturable work in the source clone rather than the durable
 worker bare and regress verified park/pause preservation; successful local capture
 still proves neither archive availability nor permission to delete the predecessor.
+Older Docker emptyDir layouts risked losing that source on pod replacement;
+ADR-3153 migrated workers retain it on the data PVC. Neither layout grants deletion
+authority (AI-synced 2026-10-23).
 Pre-start retained-source proof uses a fresh unregistered process marker bound to
 the exact source, as specified in [ADR-1783](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect).
 It is not the source attempt identity or a recovery-record capture ID; it changes
@@ -48,12 +51,25 @@ conflicts and inside clone proof/reproof still apply. Refs #2852 (AI-synced 2026
 Exact completed-capture evidence also has a narrow disposed-registry cache
 attestation reader under [ADR-1783](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect);
 this grants no source cleanup or general clean status. Refs #2852 (AI-synced 2026-10-18).
-Existing terminal executor disposal does not close the gap between snapshot coverage
-and writer-exclusion proof; strengthened terminal proof (C) and healthy credentialed pre-publish closure (B)
-remain unshipped. A does not establish Docker writer exclusion:
-accepted-but-invisible creates (#1860), daemon/sibling writers and Claude terminal
-residuals remain. Per-attempt cgroups (#1862) are not supplied by A. #1858 grants
-no automatic reclaim, and #2746 custody SETTLE remains separate from physical CLEANUP.
+**Slice B amendment, Refs #2852 (AI-synced 2026-10-23):** healthy Codex wall
+park, completion hold and ordinary recovery hold registered-root exclusion across
+capture and its source-dependent settlement. Refused proof or an expired budget
+keeps the exact source/session and existing inventory; it does not fabricate a
+verified head or ACK. A locally verified result survives optional publication
+failure. Credential-free fallback requires joined primary work and fresh A proof,
+uses only remaining episode time, and skips credentialed settlement. Unexpected
+Codex switch entries retain without capture; Claude switching is unchanged.
+The [capture contract](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect)
+records budgets, capability lifetime and held-finalize continuation.
+
+Existing terminal executor disposal and disposeTools are unchanged. B does not
+close the gap between terminal snapshot coverage and writer-exclusion proof;
+strengthened terminal proof (C) remains unshipped. Neither A nor B establishes
+Docker writer exclusion: accepted-but-invisible creates (#1860), daemon/sibling
+writers and Claude terminal residuals remain. Per-attempt cgroups (#1862) are not
+supplied. #1858 grants no automatic reclaim, and #2746 custody SETTLE remains
+separate from physical CLEANUP. Refusal/capacity rates are unknown, retained bytes
+can grow, and capacity pressure grants no deletion authority.
 
 None of the following is proof: a successor's claim, a released hold (including a successor's
 release of a predecessor hold), a terminal run status, or a capture result remembered from
@@ -140,7 +156,10 @@ the remaining snapshot-based terminal release is an open limitation under #2852:
   is written as for any other stopped source; the clone waits for explicit operator discard.
 - **Park release paths** (recovery, provider outage, credential-switch, disk and live
   non-terminal final parks) keep the exact clone and existing journal even when covered.
-  Coverage is diagnostic when checked; shutdown still skips the check. No stopped-source
+  Coverage is diagnostic when checked; shutdown still skips the check. Codex
+  recovery_park_keep skips the post-scope clone diagnostic at the original cleanup
+  site after its original guards, preserving sourceExitDenied and retention latches;
+  Claude and terminal reasons are unchanged (AI-synced 2026-10-23). No stopped-source
   marker or `reclaimed` entry is added by the park.
 - **Terminal exits** (`completed`, `failed`, `cancelled`, with `record: "none"`) retain the
   existing covered release at the handler's exit. The late-writer snapshot residual remains
@@ -258,9 +277,12 @@ positive server evidence that its run is terminal; an absent or released hold is
 `handleRecoveryExhausted` no longer clears `preserveRecoveryClone` at a capture or at an exit
 site. A site marks terminal release as eligible (`markReleaseEligible`), marks a park to
 keep (`markParkKeep`, reason `recovery_park_keep`), or keeps the clone outright (`keepClone`).
-The handler's `finally` runs `settleCloneRelease` once after the return-path work; this
-orders the snapshot after that work but does not exclude an independent late writer.
-It calls `retainStoppedSource` with the capture's `capturedHead`. A terminal exit can
+The handler's `finally` runs `settleCloneRelease` once after the return-path work.
+After the original guards, Codex recovery_park_keep retains and sets sourceExitDenied
+without a post-scope clone diagnostic; the pending slot is consumed at that original
+cleanup site (AI-synced 2026-10-23). Other reasons and Claude retain the existing
+`retainStoppedSource` call with the capture's `capturedHead`; this orders their snapshot
+after return-path work but does not exclude an independent late writer. A terminal exit can
 release the clone when `verifyStoppedSourceCovered` returns `covered`; on a park or an exit
 that stops the generation the verdict is diagnostic and the clone stays (see Coverage above).
 A remembered capture result, a memo without a `capturedHead` (including the degraded `{ verified: false }` stub) and a

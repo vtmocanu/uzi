@@ -1292,7 +1292,7 @@ export class RecoveryCoordinator {
             originalSourceSha, originalRoots: roots, inventoryCurrentSha: input.currentSha,
             coverageDigest: digest, coverageContext: context,
             ...(exactHoldBinding ? { exactHoldBinding } : {}),
-            ...(input.heldPolicy && validFrozenHeldPolicy(input.heldPolicy) ? { heldPolicy: input.heldPolicy } : {}),
+            ...(input.heldPolicy && validFrozenHeldPolicy(input.heldPolicy, context) ? { heldPolicy: input.heldPolicy } : {}),
             branch: context.branch, kind: context.kind, createdAt: this.now(), state: "pinned",
             bareDir: path.basename(context.barePath), defaultBranch: input.defaultBranch,
             finalizationPin: true,
@@ -5369,7 +5369,7 @@ function coerceRecord(obj: Record<string, unknown>): RecoveryRecord | null {
     record.heldCreateUncertain = obj.heldCreateUncertain;
   }
   if (obj.heldPolicy !== undefined) {
-    if (!record.inventoryGuarded || !validFrozenHeldPolicy(obj.heldPolicy)) return null;
+    if (!record.inventoryGuarded || !validFrozenHeldPolicy(obj.heldPolicy, record)) return null;
     record.heldPolicy = obj.heldPolicy;
   }
   if (obj.exactHoldBinding !== undefined) {

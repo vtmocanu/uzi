@@ -544,9 +544,11 @@ async function seedResidueForBranch(
   key: string,
   ownerRunId: string,
   marker: string,
+  checkpointKey?: string | null,
 ): Promise<{ bare: string; branch: string; clonePath: string }> {
   const bare = await git.ensureClone(fx.originPath);
-  const clone = await git.runnerCloneForBranch(bare, branch, key, noProofReseed, ownerRunId);
+  const clone = await git.runnerCloneForBranch(bare, branch, key, noProofReseed, ownerRunId,
+    undefined, undefined, undefined, { checkpointKey });
   fs.writeFileSync(path.join(clone.path, marker), "owner-only bytes\n");
   await git.markRecoveryCapture(bare, clone.path, branch, ownerRunId);
   return { bare, branch, clonePath: clone.path };
@@ -1369,6 +1371,7 @@ describe("atomic runner-clone release (#1315) + owner-derived reclaim (#1319)", 
           `task-${ownerRunId}`,
           ownerRunId,
           "FOREIGN.txt",
+          null, // An unenrolled task has no checkpoint key, as runnerCloneForClaim supplies.
         );
         // Owner-derived branch `uzi/task/DIFFERENT` ≠ journal branch `uzi/task/foo` → (c) FIRES,
         // but owner-derived slug `task-<ownerRunId>` reproduces the journaled path exactly → (d)

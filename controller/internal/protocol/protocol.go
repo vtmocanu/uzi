@@ -43,7 +43,7 @@ type DesiredWorker struct {
 	DrainingReason *string       `json:"draining_reason,omitempty"`
 	ID             string        `json:"id"`
 	Template       string        `json:"template"`
-	// Size is the preset NAME (S/M/L). Resolving it to cpu/memory/PVC quantities is
+	// Size is the preset NAME (s/m/l/l-highmem). Resolving it to cpu/memory/PVC quantities is
 	// this side's job: the api is not allowed to know what a pod spec looks like.
 	Size string `json:"size"`
 	// Docker is the rootless-DinD sidecar opt-in (PRD #83 M3). true → render this

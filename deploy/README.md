@@ -429,6 +429,18 @@ the effective Docker `dindDataSize`. Defaults cover 20 restricted workers at
 (`10 x (40 + 20)`), with a PVC ceiling of at least 40Gi. Its chart guard also checks
 run-bound data overrides. Allow budget for existing claims and their requested growth.
 
+The `l-highmem` worker size (#3383) requests 24Gi and is limited to 32Gi of memory.
+Before using it, raise any per-cluster override of `limitRange.max.memory` on all
+three tiers (`workers.limitRange`, `workers.docker.limitRange`,
+`workers.isolatedLane.limitRange`) to at least 32Gi; the chart default is now 32Gi
+(was 20Gi). CPU max, `maxPVCStorage` and all quotas are unchanged, and the
+controller has no boot-time memory check, so a lower ceiling leaves `l-highmem`
+pods inadmissible. Quotas are shared budgets sized on `l`; each `l-highmem` worker
+consumes more of them, and a fleet is not guaranteed to fit. Check node
+allocatable memory (24Gi plus sidecars) and namespace quota headroom first. A quota
+hit shows as the worker Deployment's `ReplicaFailure`. Existing workers are not
+resized.
+
 For each existing L or run-bound worker's data PVC, inspect its request and StorageClass:
 
 ```sh

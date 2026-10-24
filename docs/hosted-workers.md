@@ -42,7 +42,7 @@ particular token afterwards from **Settings → Workers** if you want one.
 `base` (Node + git, most repos) or `jvm` (`base` plus a JDK).
 
 **Size** picks how much CPU, memory, and disk the worker gets: **S**, **M**,
-or **L** (the default), with larger presets providing more capacity. The provision
+**L** (the default), or **L-HIGHMEM**, with larger presets providing more capacity. The provision
 form shows the exact numbers next to each option when you pick — they live
 there, not here, so they can't say something different from what you'll
 actually get. Every size also gets the same 20Gi tools cache (`/nix`),
@@ -59,14 +59,20 @@ New ephemeral hosted workers default to **M** (1 CPU / 8Gi memory
 requested, 4 CPU / 12Gi memory limits), saving 6Gi of memory reservation per
 worker compared with **L**. New persistent workers still preselect **L**
 (1 CPU / 14Gi requested, 4 CPU / 20Gi limits) for more memory headroom.
-New persistent **M** workers allocate 25Gi of `/data`, and **L** workers allocate
-50Gi. Ephemeral data uses its independent 40Gi default. Existing data volumes
+**L-HIGHMEM** (1 CPU / 24Gi memory requested, 4 CPU / 32Gi limits) is for
+memory-heavy builds and test suites that outgrow **L**. It is a capacity choice,
+not a guarantee against out-of-memory kills, and it reserves 10Gi more node memory
+than **L**, so pick it only when a workload needs it. A pod only fits on a node with
+at least 24Gi allocatable plus its sidecars, and a fleet of them can hit the
+worker namespace's shared quota, which shows as a failed replica on the worker's
+Deployment. New persistent **M** workers allocate 25Gi of `/data`, and **L** and
+**L-HIGHMEM** workers allocate 50Gi. Ephemeral data uses its independent 40Gi default. Existing data volumes
 keep their current capacity: the controller does not resize existing PVCs.
 Operators can [expand them in place](https://github.com/vtmocanu/uzi/blob/main/deploy/README.md#expanding-existing-worker-data-volumes)
 on a StorageClass that supports volume expansion.
-Existing workers keep their stored size; existing **M** workers receive the
+Existing workers keep their stored size and are not switched to another size; existing **M** workers receive the
 1-CPU request and 4-CPU limit when the controller next rolls their pod spec.
-Operators set `workers.ephemeralDefaultSize` in the chart (`s`, `m`, or `l`);
+Operators set `workers.ephemeralDefaultSize` in the chart (`s`, `m`, `l`, or `l-highmem`);
 invalid values fail rendering, and so does setting
 `UZI_EPHEMERAL_DEFAULT_SIZE` in `api.config` or `api.secretEnv` (move it to
 `workers.ephemeralDefaultSize`). Non-chart deployments can set

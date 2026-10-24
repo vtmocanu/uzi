@@ -18,8 +18,10 @@ installHarness();
 
 const STOP = "stop after recording the clone options (issue #1769 test)";
 
+type CloneOptions = Parameters<GitCache["runnerCloneForBranch"]>[8];
+
 class RecordingGit extends GitCache {
-  readonly seen: Array<{ selfContained?: boolean } | undefined> = [];
+  readonly seen: CloneOptions[] = [];
   /** issue #1783 M2: the attempt id each seed was handed (undefined = the canonical seed). */
   readonly attempts: Array<string | undefined> = [];
   constructor(dataDir: string) {
@@ -34,7 +36,7 @@ class RecordingGit extends GitCache {
     _resume?: boolean,
     _expectedCheckpointTip?: string,
     attempt?: AttemptSeedOptions,
-    opts?: { selfContained?: boolean },
+    opts?: CloneOptions,
   ): Promise<RunnerClone> {
     this.seen.push(opts);
     this.attempts.push(attempt?.attemptId);
@@ -87,25 +89,25 @@ async function recordSeed(
   return recording;
 }
 
-async function seedOptsFor(executor: Executor, issue: number): Promise<Array<{ selfContained?: boolean } | undefined>> {
+async function seedOptsFor(executor: Executor, issue: number): Promise<CloneOptions[]> {
   return (await recordSeed(executor, issue)).seen;
 }
 
 describe("RunRunner — self-contained runner clone for sandboxed commands and required planning capture", () => {
   it("a Claude/stub executor (no safety) seeds with selfContained false", async () => {
     const seen = await seedOptsFor({ run: neverRun }, 1769);
-    assert.deepStrictEqual(seen, [{ selfContained: false }]);
+    assert.deepStrictEqual(seen, [{ selfContained: false, checkpointKey: "agent/issue-1769", checkpointWriteUnresolved: undefined }]);
   });
 
   it("a Claude/stub executor with required planning cross-check seeds with selfContained true", async () => {
     const recording = await recordSeed({ run: neverRun }, 2149, { crossCheckRequired: true });
-    assert.deepStrictEqual(recording.seen, [{ selfContained: true }]);
+    assert.deepStrictEqual(recording.seen, [{ selfContained: true, checkpointKey: "agent/issue-2149", checkpointWriteUnresolved: undefined }]);
     assert.deepStrictEqual(recording.attempts, [undefined], "the unwired worker uses the canonical seed");
   });
 
   it("a Claude/stub executor with planning cross-check explicitly off seeds with selfContained false", async () => {
     const recording = await recordSeed({ run: neverRun }, 2150, { crossCheckRequired: false });
-    assert.deepStrictEqual(recording.seen, [{ selfContained: false }]);
+    assert.deepStrictEqual(recording.seen, [{ selfContained: false, checkpointKey: "agent/issue-2150", checkpointWriteUnresolved: undefined }]);
   });
 
   it("a Claude/stub executor with required planning cross-check on Docker RESUME seeds a self-contained attempt", async () => {
@@ -114,7 +116,7 @@ describe("RunRunner — self-contained runner clone for sandboxed commands and r
       resume: true,
       crossCheckRequired: true,
     });
-    assert.deepStrictEqual(recording.seen, [{ selfContained: true }]);
+    assert.deepStrictEqual(recording.seen, [{ selfContained: true, checkpointKey: "agent/issue-2151", checkpointWriteUnresolved: undefined }]);
     assert.strictEqual(recording.attempts.length, 1);
     assert.ok(recording.attempts[0], "the Docker-wired seed carries an attempt id");
   });
@@ -124,12 +126,12 @@ describe("RunRunner — self-contained runner clone for sandboxed commands and r
     assert.strictEqual(executor.safety, undefined, "safety is populated only inside run()");
     assert.strictEqual(executor.sandboxesCommands, true);
     const seen = await seedOptsFor(executor, 1770);
-    assert.deepStrictEqual(seen, [{ selfContained: true }]);
+    assert.deepStrictEqual(seen, [{ selfContained: true, checkpointKey: "agent/issue-1770", checkpointWriteUnresolved: undefined }]);
   });
 
   it("the signal is sandboxesCommands, not safety: a safety-only executor seeds with selfContained false", async () => {
     const seen = await seedOptsFor({ run: neverRun, safety: fakeSafety() }, 1771);
-    assert.deepStrictEqual(seen, [{ selfContained: false }]);
+    assert.deepStrictEqual(seen, [{ selfContained: false, checkpointKey: "agent/issue-1771", checkpointWriteUnresolved: undefined }]);
   });
 
   // issue #1783 M2 x #1769: a Docker-wired worker seeds a fresh ATTEMPT path on every claim,
@@ -140,7 +142,7 @@ describe("RunRunner — self-contained runner clone for sandboxed commands and r
       dockerHost: "unix:///nonexistent/uzi-test-docker.sock",
       resume: true,
     });
-    assert.deepStrictEqual(recording.seen, [{ selfContained: true }]);
+    assert.deepStrictEqual(recording.seen, [{ selfContained: true, checkpointKey: "agent/issue-1773", checkpointWriteUnresolved: undefined }]);
     assert.strictEqual(recording.attempts.length, 1);
     assert.ok(recording.attempts[0], "the Docker-wired seed carries an attempt id");
   });
@@ -150,7 +152,7 @@ describe("RunRunner — self-contained runner clone for sandboxed commands and r
       dockerHost: "unix:///nonexistent/uzi-test-docker.sock",
       resume: true,
     });
-    assert.deepStrictEqual(recording.seen, [{ selfContained: false }]);
+    assert.deepStrictEqual(recording.seen, [{ selfContained: false, checkpointKey: "agent/issue-1774", checkpointWriteUnresolved: undefined }]);
     assert.ok(recording.attempts[0], "the Docker-wired seed carries an attempt id");
   });
 

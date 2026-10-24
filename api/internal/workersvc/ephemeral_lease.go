@@ -182,7 +182,7 @@ func (s *Service) claimRunInTx(ctx context.Context, tx pgx.Tx, qtx *store.Querie
 	leased := s.ephemeralLease > 0 && reread.Ephemeral && reread.LeaseSince.Valid &&
 		reread.LeaseRepoID.Valid && reread.LeaseBranch.Valid
 	if !leased {
-		run, err := qtx.ClaimRun(ctx, params)
+		run, err := s.claimCheckpointRun(ctx, tx, params)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return store.Run{}, false, nil
@@ -208,7 +208,7 @@ func (s *Service) claimRunInTx(ctx context.Context, tx pgx.Tx, qtx *store.Querie
 	if err != nil {
 		return store.Run{}, false, err
 	}
-	run, err := store.New(sp).ClaimRun(ctx, params)
+	run, err := s.claimCheckpointRun(ctx, sp, params)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			_ = sp.Rollback(ctx) // nothing claimed; leave the savepoint
@@ -253,7 +253,7 @@ func (s *Service) claimRunInTx(ctx context.Context, tx pgx.Tx, qtx *store.Querie
 // snapshot-less claim has none of. GetWorkerForUpdate returns the row as locked, which is the
 // re-read the lease params need.
 func (s *Service) claimRunLeasedNoSnapshot(ctx context.Context, wkr store.Worker, params store.ClaimRunParams, report MemoryAuthorityReport) (*ClaimPayload, error) {
-	tx, err := s.txBeginner.Begin(ctx)
+	tx, err := s.beginReadCommitted(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -287,5 +287,5 @@ func (s *Service) claimRunLeasedNoSnapshot(ctx context.Context, wkr store.Worker
 	if !claimed {
 		return nil, nil // idle
 	}
-	return s.assembleAndFinishRunClaim(ctx, wkr, run, params.RecoveryCapable)
+	return s.assembleAndFinishRunClaim(ctx, locked, run, params.RecoveryCapable)
 }

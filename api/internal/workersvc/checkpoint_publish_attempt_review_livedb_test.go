@@ -114,7 +114,7 @@ func TestReconcileNeverMovesTipBackwardsLiveDB(t *testing.T) {
 				once.Do(func() {
 					// The newer publish: its base read before its forge call, then its writes, as
 					// publishOutcome makes them after that push returned success.
-					push := &checkpointPush{s: f.svc2, runID: f.oldRun, branch: f.branch, ref: f.branchRef}
+					push := &checkpointPush{s: f.svc2, runID: f.oldRun, checkpointKey: f.branch, ref: f.branchRef}
 					if err := push.observePublishBase(f.e.ctx); err != nil {
 						t.Errorf("observe the newer publish's base: %v", err)
 					}
@@ -278,7 +278,7 @@ func TestPublishOutcomeKeepsUntrackedAttemptLiveDB(t *testing.T) {
 	outcome := func(t *testing.T, f *supersedeFix) {
 		t.Helper()
 		id := f.recordAttempt(t, lateTip)
-		push := &checkpointPush{s: f.svc1, runID: f.oldRun, branch: f.branch, ref: f.branchRef, landed: id}
+		push := &checkpointPush{s: f.svc1, runID: f.oldRun, checkpointKey: f.branch, ref: f.branchRef, landed: id}
 		if err := push.observePublishBase(f.e.ctx); err != nil {
 			t.Fatalf("observePublishBase: %v", err)
 		}

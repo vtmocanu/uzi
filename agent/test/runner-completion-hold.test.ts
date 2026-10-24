@@ -547,10 +547,10 @@ for (const route of ["POST", "ownership probe"] as const) {
 }
 
 describe("3282 completion hold shutdown scope", () => {
-  for (const verified of [true, false]) {
+  for (const codex of [true, false]) for (const verified of [true, false]) {
     for (const allowDegradedCapture of [false, true]) {
-      it(`3282 shutdown during ${verified ? "verified" : "unverified"} capture with ${allowDegradedCapture ? "degraded" : "normal"} options preserves baseline hold behavior`, async t => {
-        const issue = 328210 + Number(verified) * 2 + Number(allowDegradedCapture);
+      it(`3282 ${codex ? "Codex" : "Claude"} shutdown during ${verified ? "verified" : "unverified"} capture with ${allowDegradedCapture ? "degraded" : "normal"} options preserves authority`, async t => {
+        const issue = 328210 + Number(codex) * 10 + Number(verified) * 2 + Number(allowDegradedCapture);
         const claim = { ...gitlabClaim(issue), claim_generation: 7 };
         const home = seedHome();
         const rig = codexRig();
@@ -560,7 +560,7 @@ describe("3282 completion hold shutdown scope", () => {
         let holdError: unknown;
         const push = t.mock.method(git, "pushBranch", async () => { throw new Error("unexpected publication"); });
         api.setCompletionHoldResponse("paused", 200);
-        const executor = new FakeCodexExecutor(rig.safety, async ctx => {
+        const behavior: Executor["run"] = async ctx => {
           git.worktreeStatus = (async () => []) as typeof git.worktreeStatus;
           mockCommittedTracking(git, CAPTURED_HEAD);
           git.verifyRunnerTrackingCovers = (async () => {
@@ -581,23 +581,36 @@ describe("3282 completion hold shutdown scope", () => {
             branch: ctx.branch,
             ...(held ? { completionHeld: { reason: "shutdown scope" } } : { walled: { reason: "shutdown scope" } }),
           };
-        });
+        };
+        const executor: Executor = codex ? new FakeCodexExecutor(rig.safety, behavior) : { run: behavior };
         runner = runnerWith(() => ({ executor, homeDir: home.homeDir }), gitlab, undefined, undefined,
           { recoveryRetryMs: 1 });
         const expectedHold = verified || allowDegradedCapture;
         try {
           await runner.execute(claim);
-          assert.equal(held, expectedHold, "shutdown preserves the ordinary hold boolean rather than throwing for requeue");
-          assert.equal(holdError, undefined, "the sink does not throw DataVolumeWaitShutdown");
-          assert.equal(attempts, 1, "shutdown prevents another capture attempt");
-          assert.equal(api.completionHoldRequests.length, Number(expectedHold));
-          if (expectedHold) {
-            assert.equal(api.completionHoldRequests[0]!.runId, claim.run_id);
-            assert.equal(api.completionHoldRequests[0]!.body.head, verified ? CAPTURED_HEAD : "");
+          if (codex) {
+            // B refuses ordinary source/report work after authority revocation. The
+            // typed graceful-shutdown checkpoint has its separate #3109 contract.
+            assert.equal(held, undefined);
+            assert.ok(holdError, "revoked capture unwinds before reporting a hold");
+            assert.equal(attempts, 1);
+            assert.equal(api.completionHoldRequests.length, 0);
+            assert.ok(fs.existsSync(worktreeDirFor(issue)), "unverified source is retained");
+            assert.ok(fs.existsSync(home.sentinel), "session is retained");
+            assert.equal(rig.boundaries.includes("finalize"), false);
+          } else {
+            assert.equal(held, expectedHold, "shutdown preserves the ordinary hold boolean rather than throwing for requeue");
+            assert.equal(holdError, undefined, "the sink does not throw DataVolumeWaitShutdown");
+            assert.equal(attempts, 1, "shutdown prevents another capture attempt");
+            assert.equal(api.completionHoldRequests.length, Number(expectedHold));
+            if (expectedHold) {
+              assert.equal(api.completionHoldRequests[0]!.runId, claim.run_id);
+              assert.equal(api.completionHoldRequests[0]!.body.head, verified ? CAPTURED_HEAD : "");
+            }
+            assert.equal(fs.existsSync(worktreeDirFor(issue)), expectedHold, "only a hold retains the clone");
+            assert.equal(fs.existsSync(home.sentinel), expectedHold, "ordinary false clears provisional HOME retention");
+            assert.equal(rig.boundaries.includes("finalize"), false, "Claude retains the legacy facade branch");
           }
-          assert.equal(fs.existsSync(worktreeDirFor(issue)), expectedHold, "only a hold retains the clone");
-          assert.equal(fs.existsSync(home.sentinel), expectedHold, "ordinary false clears provisional HOME retention");
-          assert.equal(rig.boundaries.includes("finalize"), !expectedHold, "only an established hold bypasses the boundary");
           assert.equal(api.completionPermitRequests.length, 0);
           assert.equal(push.mock.callCount(), 0);
           assert.equal(calls.length, 0);

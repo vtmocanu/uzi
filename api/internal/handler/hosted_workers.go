@@ -175,9 +175,9 @@ func (h *Handler) ProvisionHostedWorker(w http.ResponseWriter, r *http.Request) 
 // deliberately does not select the name, since object names derive from the uuid —
 // so a derived, non-unique name is safe and purely cosmetic.
 //
-// The format is AWS-style dot notation: template + the t-shirt letter, plus a short
-// random hex id, e.g. "base.l-a32f". The random suffix lets the name self-disambiguate
-// so two large `base` workers never visibly collide; random (not a counter) means no
+// The format is AWS-style dot notation: template + the preset name (s/m/l/l-highmem),
+// plus a short random hex id, e.g. "base.l-a32f". The random suffix lets the name
+// self-disambiguate so two large `base` workers never visibly collide; random (not a counter) means no
 // new state to keep and no reused or gap numbers after a delete. The name stays
 // cosmetic and is NOT unique-constrained. Generating the suffix reads from crypto/rand,
 // which can in principle fail — hence the error return, matching jointoken.Generate.

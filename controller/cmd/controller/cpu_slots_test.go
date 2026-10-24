@@ -21,10 +21,10 @@ func TestWarnSharedCPU(t *testing.T) {
 	}
 	sizes := preset.SizeNames()
 	sort.Strings(sizes)
-	if !reflect.DeepEqual(sizes, []string{"l", "m", "s"}) {
+	if !reflect.DeepEqual(sizes, []string{"l", "l-highmem", "m", "s"}) {
 		t.Fatalf("available sizes = %v; update explicit CPU expectations", sizes)
 	}
-	limits := map[string]string{"s": "1", "m": "4", "l": "4"}
+	limits := map[string]string{"s": "1", "m": "4", "l": "4", "l-highmem": "4"}
 	for _, slots := range []int{0, 1, 2, 256} {
 		t.Run(fmt.Sprintf("slots=%d", slots), func(t *testing.T) {
 			var output bytes.Buffer

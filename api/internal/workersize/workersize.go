@@ -28,7 +28,7 @@ package workersize
 // Lowercase, and that matters: these strings go on the wire verbatim as
 // DesiredWorker.Size and are stored as workers.hosted_size. The UI upper-cases for
 // display; nothing upper-cased is ever a value.
-var Names = []string{"s", "m", "l"}
+var Names = []string{"s", "m", "l", "l-highmem"}
 
 // Valid reports whether name is a known size preset (registry membership). Used at
 // provision, where the choice must be one we actually ship.

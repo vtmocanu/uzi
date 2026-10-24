@@ -198,7 +198,7 @@ type ListLiveSalvageRefsForRepoRow struct {
 
 // What the repo-removal 409 names, per live row: the run, its state (a 'pending' row is
 // named as a pending run whether or not its ref was already created), and salvage_ref, the
-// run-scoped salvage ref once created (empty before). The branch-scoped checkpoint ref is
+// run-scoped salvage ref once created (empty before). The checkpoint-key-scoped ref is
 // never named: #1810's retention owns it, not salvage. Owner-scoped like the count. Bounded
 // by lim rows.
 func (q *Queries) ListLiveSalvageRefsForRepo(ctx context.Context, arg ListLiveSalvageRefsForRepoParams) ([]ListLiveSalvageRefsForRepoRow, error) {
@@ -231,7 +231,8 @@ JOIN forge_connections c ON c.id = p.connection_id
 WHERE r.status = 'failed'
   AND r.fail_origin IS DISTINCT FROM 'plan_rejected'
   AND r.checkpoint_tip IS NOT NULL
-  AND ((r.kind = 'issue' AND r.issue_iid IS NOT NULL) OR r.kind = 'self_improve')
+  AND fn_checkpoint_coordinates(r) IS NOT NULL
+  AND (r.kind <> 'task' OR r.checkpoint_coordinates IS NOT NULL)
   AND c.forge_type = ANY($1::text[])
   AND r.finished_at >= $2::timestamptz
   AND NOT EXISTS (SELECT 1 FROM run_salvage s WHERE s.run_id = r.id)

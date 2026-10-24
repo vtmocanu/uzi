@@ -45,7 +45,8 @@ metadata:
 {{- if .Values.workers.isolatedLane.quota.enabled }}
 {{- /*
   The lane's own ResourceQuota covers 10 x (40Gi run-bound data + 20Gi nix) =
-  600Gi across 20 claims. Same side effect: a quota on
+  600Gi across 20 claims. CPU and memory are budgeted on `l`; `l-highmem` is not
+  fleet-budgeted and consumes more of the shared budget. Same side effect: a quota on
   requests.cpu or requests.memory makes admission reject a pod with a container that
   declares none, so the controller renders explicit requests on every container.
 */}}
@@ -69,7 +70,8 @@ spec:
 {{- if .Values.workers.isolatedLane.limitRange.enabled }}
 {{- /*
   The backstop, never the source: every lane worker pod arrives from the controller with
-  explicit requests and limits. `max` must stay >= the largest worker preset's limits;
+  explicit requests and limits. `max` must stay >= the largest worker preset's limits
+  (l-highmem = 4 CPU / 32Gi);
   maxPVCStorage must admit run-bound data (40Gi by default) and the 20Gi nix claim.
 */}}
 ---

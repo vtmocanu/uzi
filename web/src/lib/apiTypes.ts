@@ -2363,7 +2363,7 @@ export interface Worker {
   status: string; // "offline" | "online"
   // Hosted workers (PRD #58). kind is never null — the column is NOT NULL DEFAULT
   // 'external' — so every worker carries one and a pre-#58 row reports "external".
-  // hosted_size is the preset name ("s"|"m"|"l", lowercase on the wire) and is null
+  // hosted_size is the preset name ("s"|"m"|"l"|"l-highmem", lowercase on the wire) and is null
   // for an external worker. hosted_generation is deliberately not here: it is
   // controller-internal and the DTO does not carry it.
   kind: "external" | "hosted";

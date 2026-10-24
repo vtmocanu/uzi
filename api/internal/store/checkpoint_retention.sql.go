@@ -150,22 +150,30 @@ func (q *Queries) CheckLiveCheckpointPublishAdmission(ctx context.Context, arg C
 }
 
 const checkpointTipClaimedByOtherRun = `-- name: CheckpointTipClaimedByOtherRun :one
+WITH subject AS (
+    SELECT r.kind, fn_checkpoint_coordinates(r)->>'checkpoint_key' AS checkpoint_key
+    FROM runs r WHERE r.id = $2
+      AND (r.kind <> 'task' OR r.checkpoint_coordinates IS NOT NULL)
+)
 SELECT (
     EXISTS (
         SELECT 1 FROM runs r
         WHERE r.repo_id = $1 AND r.id <> $2 AND r.checkpoint_tip = $3::text
+          AND (subject.kind <> 'task' OR fn_checkpoint_coordinates(r)->>'checkpoint_key' = subject.checkpoint_key)
     )
     OR EXISTS (
         SELECT 1 FROM checkpoint_publish_attempts a
         JOIN runs r ON r.id = a.run_id
         WHERE r.repo_id = $1 AND a.run_id <> $2 AND a.tip = $3::text
+          AND (subject.kind <> 'task' OR a.ref = 'refs/uzi-checkpoints/' || subject.checkpoint_key)
     )
     OR EXISTS (
         SELECT 1 FROM checkpoint_retentions c
         WHERE c.repo_id = $1 AND c.run_id <> $2 AND c.tip = $3::text
+          AND (subject.kind <> 'task' OR c.branch = subject.checkpoint_key)
           AND c.state IN ('retained', 'superseding', 'superseded', 'settling')
     )
-)::bool AS claimed
+)::bool AS claimed FROM subject
 `
 
 type CheckpointTipClaimedByOtherRunParams struct {
@@ -176,7 +184,8 @@ type CheckpointTipClaimedByOtherRunParams struct {
 
 // Whether any OTHER run of the repo claims this tip (its persisted checkpoint tip, an outstanding
 // publish attempt, or a live retention record): a branch ref at such a tip is never deleted as
-// this run's late publish.
+// this run's late publish. Enrolled tasks scope each arm to their authorized
+// destination; legacy issue/self ownership remains repository-wide.
 func (q *Queries) CheckpointTipClaimedByOtherRun(ctx context.Context, arg CheckpointTipClaimedByOtherRunParams) (bool, error) {
 	row := q.db.QueryRow(ctx, checkpointTipClaimedByOtherRun, arg.RepoID, arg.RunID, arg.Tip)
 	var claimed bool
@@ -191,13 +200,17 @@ SET checkpoint_tip = $1::text,
     -- Issue #3194: set-only, from the confirmed attempt row's own frozen value (bound below).
     checkpoint_attested_source = COALESCE($2::text, r.checkpoint_attested_source)
 WHERE r.id = $3
+  AND (r.kind <> 'task' OR (r.checkpoint_coordinates IS NOT NULL
+       AND fn_checkpoint_coordinates(r) = r.checkpoint_coordinates
+       AND $4::text = 'refs/uzi-checkpoints/' || (fn_checkpoint_coordinates(r)->>'checkpoint_key')))
   AND r.status NOT IN ('completed', 'failed', 'cancelled')
-  AND (r.checkpoint_tip IS NOT DISTINCT FROM $4::text
+  AND (r.checkpoint_tip IS NOT DISTINCT FROM $5::text
        OR r.checkpoint_tip = $1::text)
   AND EXISTS (
       SELECT 1 FROM checkpoint_publish_attempts a
-      WHERE a.id = $5 AND a.run_id = r.id
-        AND a.ref = $6::text AND a.tip = $1::text
+      WHERE a.id = $6 AND a.run_id = r.id
+        AND a.ref = $4::text AND a.tip = $1::text
+        AND (r.kind <> 'task' OR a.branch = fn_checkpoint_coordinates(r)->>'checkpoint_key')
         AND a.attested_source IS NOT DISTINCT FROM $2::text
         AND a.reconcile_ready_at IS NOT NULL
         AND (r.checkpoint_tip IS NULL OR r.checkpoint_tip = a.tip
@@ -213,21 +226,24 @@ WHERE r.id = $3
             AND c.ref = $8::text
             AND c.recovery_ref IS NOT DISTINCT FROM $9::text
             AND c.state = $10::text AND c.tip = $11::text
-            AND c.ref = $6::text AND c.recovery_ref IS NULL
+            AND c.ref = $4::text AND c.recovery_ref IS NULL
             AND c.state IN ('retained', 'settling', 'deleted', 'abandoned')
       ))
   )
   AND NOT EXISTS (
       SELECT 1 FROM runs other
       WHERE other.repo_id = r.repo_id AND other.id <> r.id AND other.checkpoint_tip = $1::text
+        AND (r.kind <> 'task' OR fn_checkpoint_coordinates(other)->>'checkpoint_key' = fn_checkpoint_coordinates(r)->>'checkpoint_key')
   )
   AND NOT EXISTS (
       SELECT 1 FROM checkpoint_publish_attempts a JOIN runs other ON other.id = a.run_id
       WHERE other.repo_id = r.repo_id AND a.run_id <> r.id AND a.tip = $1::text
+        AND (r.kind <> 'task' OR a.ref = 'refs/uzi-checkpoints/' || (fn_checkpoint_coordinates(r)->>'checkpoint_key'))
   )
   AND NOT EXISTS (
       SELECT 1 FROM checkpoint_retentions c
       WHERE c.repo_id = r.repo_id AND c.run_id <> r.id AND c.tip = $1::text
+        AND (r.kind <> 'task' OR c.branch = fn_checkpoint_coordinates(r)->>'checkpoint_key')
         AND c.state IN ('retained', 'superseding', 'superseded', 'settling')
   )
 `
@@ -236,9 +252,9 @@ type ConfirmLiveCheckpointPublishAttemptParams struct {
 	Tip                 string      `json:"tip"`
 	AttestedSource      pgtype.Text `json:"attested_source"`
 	RunID               uuid.UUID   `json:"run_id"`
+	Ref                 string      `json:"ref"`
 	ExpectedTip         pgtype.Text `json:"expected_tip"`
 	AttemptID           uuid.UUID   `json:"attempt_id"`
-	Ref                 string      `json:"ref"`
 	HadRetention        bool        `json:"had_retention"`
 	ObservedRef         string      `json:"observed_ref"`
 	ObservedRecoveryRef pgtype.Text `json:"observed_recovery_ref"`
@@ -254,9 +270,9 @@ func (q *Queries) ConfirmLiveCheckpointPublishAttempt(ctx context.Context, arg C
 		arg.Tip,
 		arg.AttestedSource,
 		arg.RunID,
+		arg.Ref,
 		arg.ExpectedTip,
 		arg.AttemptID,
-		arg.Ref,
 		arg.HadRetention,
 		arg.ObservedRef,
 		arg.ObservedRecoveryRef,
@@ -465,7 +481,7 @@ type InsertCheckpointRetentionIfHeldParams struct {
 }
 
 // PRD #1810: checkpoint-ref retention. A terminal run's published checkpoint ref
-// (refs/uzi-checkpoints/<branch>) is recorded in checkpoint_retentions and kept on origin
+// (refs/uzi-checkpoints/<checkpoint-key>) is recorded in checkpoint_retentions and kept on origin
 // while the run has an open custody hold (D1); it is deleted, compare-and-swap on the
 // recorded tip, only once no hold is open. Every state transition below is guarded on the
 // expected current state, so a racing writer moves zero rows instead of clobbering a newer
@@ -646,7 +662,8 @@ FROM runs r
 WHERE r.status IN ('completed', 'failed', 'cancelled')
   AND r.checkpoint_tip IS NOT NULL
   AND r.repo_id IS NOT NULL
-  AND ((r.kind = 'issue' AND r.issue_iid IS NOT NULL) OR r.kind = 'self_improve')
+  AND fn_checkpoint_coordinates(r) IS NOT NULL
+  AND (r.kind <> 'task' OR r.checkpoint_coordinates IS NOT NULL)
   AND r.status_since >= (SELECT m.enabled_at FROM checkpoint_retention_meta m)
   -- The scan's lower bound, as a scalar subquery (an InitPlan) so the planner uses it as the
   -- index condition on idx_runs_checkpoint_backfill: a join filter against the meta row would
@@ -694,7 +711,7 @@ type ListCheckpointRetentionBackfillRow struct {
 // steady-state pass reads only recent candidates. The overlap covers commit-order skew: both
 // columns are the writer's transaction time, so a run committed after a pass advanced the
 // watermark past its key is still inside the window on the next pass. The caller derives the
-// branch in Go (checkpointBranch), records the run through the terminal-time inserts, and
+// authorized checkpoint key in Go, records the run through the terminal-time inserts, and
 // advances the watermark (AdvanceCheckpointRetentionBackfillWatermark) from what the page proved.
 func (q *Queries) ListCheckpointRetentionBackfill(ctx context.Context, arg ListCheckpointRetentionBackfillParams) ([]ListCheckpointRetentionBackfillRow, error) {
 	rows, err := q.db.Query(ctx, listCheckpointRetentionBackfill, arg.OnlyRunID, arg.MaxRows)
@@ -1012,7 +1029,7 @@ func (q *Queries) LockCheckpointRetentionForConfirmation(ctx context.Context, ru
 }
 
 const lockRunForLiveCheckpointConfirmation = `-- name: LockRunForLiveCheckpointConfirmation :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation, budget_finalize_seconds, released_worker_id, released_worker_nonce, gate_revision, gate_presentation_id, gate_presented_payload, gate_payload_digest, gate_refusal_count, gate_refusal_generation, disk_park_count, checkpoint_contains_latest, egress_profile_id, egress_snapshot, job_type, finalize_resume_generation, job_protocol, first_started_at, plan_cross_check_required, plan_cross_check_gate_reason, issue_raw_digest, issue_saved_body, issue_input_reason, auto_approve_blocked_reasons, plan_cross_check_diff_refusal, worker_recovery_episode, requeue_episode_baseline, worker_recovery_evidence, cross_check_lane, cross_check_lane_generation, completion_final_head, code_cross_check_required, provider_park_count, provider_park_streak_started_at, ci_config_guard, memory_episode, memory_intervention_count, memory_policy, completion_non_closing_reason, ci_artifact_manifest, checkpoint_attested_source, source_publication_intent, continued_issue_iid FROM runs WHERE id = $1 FOR UPDATE
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation, budget_finalize_seconds, released_worker_id, released_worker_nonce, gate_revision, gate_presentation_id, gate_presented_payload, gate_payload_digest, gate_refusal_count, gate_refusal_generation, disk_park_count, checkpoint_contains_latest, egress_profile_id, egress_snapshot, job_type, finalize_resume_generation, job_protocol, first_started_at, plan_cross_check_required, plan_cross_check_gate_reason, issue_raw_digest, issue_saved_body, issue_input_reason, auto_approve_blocked_reasons, plan_cross_check_diff_refusal, worker_recovery_episode, requeue_episode_baseline, worker_recovery_evidence, cross_check_lane, cross_check_lane_generation, completion_final_head, code_cross_check_required, provider_park_count, provider_park_streak_started_at, ci_config_guard, memory_episode, memory_intervention_count, memory_policy, completion_non_closing_reason, ci_artifact_manifest, checkpoint_attested_source, source_publication_intent, continued_issue_iid, checkpoint_coordinates FROM runs WHERE id = $1 FOR UPDATE
 `
 
 // Serialize confirmation with the terminal status update and its retention trigger.
@@ -1200,6 +1217,7 @@ func (q *Queries) LockRunForLiveCheckpointConfirmation(ctx context.Context, id u
 		&i.CheckpointAttestedSource,
 		&i.SourcePublicationIntent,
 		&i.ContinuedIssueIid,
+		&i.CheckpointCoordinates,
 	)
 	return i, err
 }

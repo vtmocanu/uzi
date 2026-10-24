@@ -269,6 +269,12 @@ export class ExecutionRegistry {
     return this.epochValue;
   }
 
+  /** Opaque identity changes on every poison, including empty/capped evidence. */
+  get cleanupPoisonRevision(): object { return this.poisonRevision; }
+
+  /** Disposal entry is sticky even if disposal fails before changing state. */
+  get registryTablesCleared(): boolean { return this.tablesCleared; }
+
   poisonErrors(): readonly HarnessError[] {
     return this.poisonList;
   }

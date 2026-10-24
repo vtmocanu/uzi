@@ -2,6 +2,7 @@
   "sizes": [
     "s",
     "m",
-    "l"
+    "l",
+    "l-highmem"
   ]
 }

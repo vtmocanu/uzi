@@ -12,6 +12,7 @@ import (
 	"unicode"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -27,7 +28,7 @@ import (
 // UZI_RECOVERY_READY_RETENTION has passed.
 //
 // Salvage is CREATE-ONLY toward every ref it does not own. The branch checkpoint ref
-// (refs/uzi-checkpoints/<branch>) and refs/uzi-recovery/<run-id> belong to the terminal
+// (refs/uzi-checkpoints/<checkpoint-key>) and refs/uzi-recovery/<run-id> belong to the terminal
 // path and PR #1819's checkpoint retention (PRD #1810): this file never deletes or moves
 // them, never calls deleteCheckpointFn, and never changes a custody hold. The only ref it
 // deletes is its own refs/uzi-salvage/<run-id>, CAS-bound to the recorded tip.
@@ -217,10 +218,18 @@ func (s *Service) enqueueSalvage(ctx context.Context, now time.Time) (int64, err
 	}
 	var touched int64
 	for _, c := range cands {
-		// The query already restricts to checkpoint-eligible kinds; derive the branch the
-		// same way Publish does (never from a worker string).
-		branch, ok := checkpointBranch(c.Kind, c.ID, c.IssueIid)
-		if !ok {
+		// Retention branch columns carry checkpoint keys, including enrolled tasks.
+		coordinates, err := s.retentionCoordinates(ctx, c.ID, c.Kind, c.IssueIid)
+		if errors.Is(err, pgx.ErrNoRows) {
+			// The candidate was deleted after the list, like the live-run FK race below.
+			slog.Debug("salvage: run deleted before coordinate lookup", "run", c.ID)
+			continue
+		}
+		if err != nil {
+			slog.Error("salvage: checkpoint coordinates", "run", c.ID, "error", err)
+			return touched, fmt.Errorf("salvage: checkpoint coordinates %s: %w", c.ID, err)
+		}
+		if coordinates == nil {
 			continue
 		}
 		state, live := salvageStatePending, pgtype.UUID{Bytes: c.ID, Valid: true}
@@ -232,7 +241,7 @@ func (s *Service) enqueueSalvage(ctx context.Context, now time.Time) (int64, err
 			UserID:    c.UserID,
 			RepoID:    c.RepoID,
 			ForgeType: c.ForgeType,
-			Branch:    branch,
+			Branch:    coordinates.CheckpointKey,
 			Tip:       c.CheckpointTip,
 			LiveRunID: live,
 			State:     state,
