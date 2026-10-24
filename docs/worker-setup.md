@@ -663,8 +663,8 @@ intervention also needs real PSI in two consecutive samples, so a host without
 `memory.pressure` (read fails with `ENOENT` or `ENOTSUP`) runs hard-only.
 Other PSI read errors, or malformed PSI, make the sample unavailable and
 inhibit intervention. The worker logs one warning when PSI is unavailable
-("early intervention disabled, hard intervention continues on valid core
-accounting") and one info line when it is restored. The working set is an
+("worker memory guard: cgroup memory PSI unavailable; early intervention
+disabled, hard intervention continues on valid core accounting") and one info line when it is restored. The working set is an
 estimate, not an OOM predictor: inactive file pages can be dirty or slow to
 reclaim, so it can underestimate pressure (dirty/writeback validation is
 deferred), and allocation bursts, stalled sampling, node pressure and
