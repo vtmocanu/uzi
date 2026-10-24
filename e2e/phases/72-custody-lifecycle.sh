@@ -24,9 +24,9 @@
 # and api/internal/workersvc/claim_custody_livedb_test.go). It:
 #
 #   WEDGE   — seeds the owner with LIMIT open holds of its own, so admission-counted
-#             holds are at or above the limit independent of baseline settlement (holds
-#             left by earlier phases can only settle while the worker is idle, so the
-#             baseline may shrink but never grow). It creates a code run, and shows it
+#             holds are at or above the limit independent of baseline settlement (an
+#             idle worker opens no new claim holds, so the baseline can only shrink as
+#             earlier phases' holds settle). It creates a code run, and shows it
 #             stays QUEUED with online + idle worker samples while
 #             the server's own custody aggregate reports it BLOCKED (blocked_runs >= 1 —
 #             the SAME predicate ClaimRun and workersvc/health.go's reasonCustodyLimit
@@ -76,6 +76,9 @@ say "PRD #1349 M7: custody-limit wedge repro + owner-disposition unblock"
 # would otherwise inherit the seeded custody. Skips when the owner was never resolved.
 custody_seed_cleanup() {
   [ -n "${ADMIN_ID:-}" ] || return 0
+  [ -n "${SEED_IDENT:-}" ] || return 0
+  # Cancel the wedge run first (when it exists) so it is not left claimable once the seeds go.
+  [ -n "${WEDGE_RUN:-}" ] && { apipost "/api/runs/$WEDGE_RUN/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1 || true; }
   db_psql "DELETE FROM recovery_custody_holds WHERE user_id = '$ADMIN_ID' AND original_worker_identity = '${SEED_IDENT:-}'" >/dev/null 2>&1 || true
 }
 trap 'if [ "$?" -ne 0 ]; then cat "$RUNROOT/custody-window.jsonl" 2>/dev/null || true; inventory_diagnostic_snapshot || true; custody_seed_cleanup || true; fi' EXIT
@@ -113,11 +116,13 @@ assert_custody_worker_idle() {
 # wait_custody_headroom in lib.sh does); prints "counted open limit".
 custody_aggregate() {
   local snapshot
-  snapshot="$(apiget /api/recovery/holds)" || fail "custody aggregate: API error"
+  # fail prints to stdout and exits; inside the caller's command substitution that text would be
+  # swallowed, so send it to stderr where the log keeps it.
+  snapshot="$(apiget /api/recovery/holds)" || fail "custody aggregate: API error" >&2
   printf '%s' "$snapshot" | jq -er '.aggregate | [.admission_counted_holds, .open_holds, .custody_hold_limit]
     | if all(.[]; type == "number" and . >= 0 and . == floor) then map(tostring) | join(" ")
       else error("invalid") end' \
-    || fail "custody aggregate: invalid admission_counted_holds/open_holds/custody_hold_limit"
+    || fail "custody aggregate: invalid admission_counted_holds/open_holds/custody_hold_limit" >&2
 }
 
 # --- 0) preconditions: sample an online, idle worker + owner below the limit --
@@ -151,8 +156,8 @@ pass "preconditions: worker sampled online + idle at entry, owner has $C0 baseli
 
 # --- 1) WEDGE: seed LIMIT open holds, regardless of the baseline ---------------
 # Seed a full LIMIT of our own, tagged with SEED_IDENT so cleanup targets exactly these rows.
-# The baseline (C0 holds from earlier phases, e.g. one pending FINAL) can only settle while the
-# worker is idle, so it may shrink under us but never grow: seeding LIMIT keeps
+# The baseline (C0 holds from earlier phases, e.g. one pending FINAL): an idle worker opens no
+# new claim holds, so it can only shrink as those holds settle, never grow: seeding LIMIT keeps
 # admission_counted_holds >= LIMIT independent of any baseline release.
 # These are HOLD-only fixtures (no captures/chunks): they mirror how the live incident's
 # abruptly-lost, capture-less sources sit 'open' awaiting an owner decision, and how
@@ -225,8 +230,8 @@ pass "server confirms the block: aggregate.blocked_runs=$BLOCKED (queued code ru
 
 # --- 3) UNBLOCK: dispose exactly K seeded holds through the real owner path (M5) ---
 # Dropping below the limit needs K = counted - LIMIT + 1 discards. K comes from one validated
-# aggregate snapshot. The baseline only settles while the worker is idle, so counted can only
-# fall from here and K is an upper bound: if counted grew instead, the unblock wait below
+# aggregate snapshot. An idle worker opens no new claim holds, so the baseline can only shrink
+# as earlier holds settle; counted can only fall from here and K is an upper bound: if counted grew instead, the unblock wait below
 # fails (never a false pass).
 AGG_LINE="$(custody_aggregate)" || fail "custody aggregate unreadable"
 read -r UNB_COUNTED UNB_OPEN _ <<< "$AGG_LINE"

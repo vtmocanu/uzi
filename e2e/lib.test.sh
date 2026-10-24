@@ -665,24 +665,33 @@ diagnostic_trap() {
 # The custody phase's trap also removes its own seeds on failure only, scoped to the owner
 # and SEED_IDENT; the cleanup function is extracted from the real phase.
 custody_trap_cleanup() {
-  local status="$1" log="$SEQ_DIR/trap-sql"
+  local status="$1" wedge="${2:-}" log="$SEQ_DIR/trap-sql"
+  local src="${CUSTODY_PHASE_TEST_SOURCE:-$ROOT/e2e/phases/72-custody-lifecycle.sh}"
   : > "$log"
   RUNROOT="$SEQ_DIR"
   # shellcheck disable=SC2034  # consumed by the extracted cleanup function
   ADMIN_ID=owner SEED_IDENT=e2e-72-custody-seed
-  db_psql() { printf '%s\n' "$1" >> "$log"; }
+  # shellcheck disable=SC2034  # consumed by the extracted cleanup function
+  WEDGE_RUN="$wedge"
+  db_psql() { printf 'SQL %s\n' "$1" >> "$log"; }
+  apipost() { printf 'POST %s %s\n' "$1" "$2" >> "$log"; }
   inventory_diagnostic_snapshot() { :; }
-  eval "$(awk '/^custody_seed_cleanup\(\) \{/,/^\}/' "$ROOT/e2e/phases/72-custody-lifecycle.sh")"
-  eval "$(awk '/^trap .*inventory_diagnostic_snapshot/' "$ROOT/e2e/phases/72-custody-lifecycle.sh")"
+  eval "$(awk '/^custody_seed_cleanup\(\) \{/,/^\}/' "$src")"
+  eval "$(awk '/^trap .*inventory_diagnostic_snapshot/' "$src")"
   exit "$status"
 }
-cases=$((cases + 2))
+cases=$((cases + 3))
 rc=0; (custody_trap_cleanup 7) >/dev/null 2>&1 || rc=$?
 sql="$(cat "$SEQ_DIR/trap-sql")"
-if [ "$rc" = 7 ] && [[ "$sql" == DELETE*"user_id = 'owner'"*"original_worker_identity = 'e2e-72-custody-seed'"* ]]; then
+if [ "$rc" = 7 ] && [[ "$sql" == "SQL DELETE"*"user_id = 'owner'"*"original_worker_identity = 'e2e-72-custody-seed'"* && "$sql" != *POST* ]]; then
   passed=$((passed + 1)); echo "PASS: custody trap deletes only its own seeds on failure and keeps the status"
 else echo "FAIL: custody trap seed cleanup on failure: rc=$rc sql=[$sql]"; fi
-rc=0; (custody_trap_cleanup 0) >/dev/null 2>&1 || rc=$?
+rc=0; (custody_trap_cleanup 7 wedge-run) >/dev/null 2>&1 || rc=$?
+sql="$(cat "$SEQ_DIR/trap-sql")"
+if [ "$rc" = 7 ] && [[ "$sql" == "POST /api/runs/wedge-run/inputs "*cancel*$'\n'"SQL DELETE"*"original_worker_identity = 'e2e-72-custody-seed'"* ]]; then
+  passed=$((passed + 1)); echo "PASS: custody trap cancels the wedge run before deleting the seeds"
+else echo "FAIL: custody trap cancel-before-delete: rc=$rc log=[$sql]"; fi
+rc=0; (custody_trap_cleanup 0 wedge-run) >/dev/null 2>&1 || rc=$?
 if [ "$rc" = 0 ] && [ ! -s "$SEQ_DIR/trap-sql" ]; then
   passed=$((passed + 1)); echo "PASS: custody trap leaves seeds alone on success"
 else echo "FAIL: custody trap touched the DB on success: rc=$rc"; fi
@@ -1175,8 +1184,9 @@ done
 # the wedge run iff counted = B + undiscarded seeds < 8, and wait_status FAILS unless the
 # model says the run was claimed, so a phase that discards too few holds cannot pass.
 # Args: PHASE_FILE BASELINE SETTLE(never|poll1|discard1) CLAIM(gate|always)
+#       [AGG(normal|seed-short|post-nodiff|post-high)]
 custody_model_phase() {
-  local phase="$1" baseline="$2" settle="$3" claim="$4"
+  local phase="$1" baseline="$2" settle="$3" claim="$4" agg="${5:-normal}"
   local M="$SEQ_DIR/model"
   rm -rf "$M"; mkdir -p "$M"
   echo "$baseline" > "$M/b"; echo 0 > "$M/seeds"; echo 0 > "$M/attached"
@@ -1232,6 +1242,14 @@ custody_model_phase() {
         counted="$(model_counted)"; open="$counted"
         # A claimed run's fresh hold is open but excluded from admission counting.
         if [ "$claim" != always ] && model_claimed; then open=$((counted + 1)); fi
+        # Aggregate-serving faults: seed-short serves counted=LIMIT-1 on the first read after
+        # seeding; post-nodiff serves open == counted after the claim; post-high serves
+        # counted >= LIMIT after the claim.
+        if [ "$agg" = seed-short ] && [ "$(cat "$M/seeds")" != 0 ] && [ ! -e "$M/short-served" ]; then
+          : > "$M/short-served"; counted=7; open=7
+        elif [ "$agg" = post-nodiff ] && [ "$(cat "$M/claimed")" = 1 ]; then open="$counted"
+        elif [ "$agg" = post-high ] && [ "$(cat "$M/claimed")" = 1 ]; then counted=8; open=9
+        fi
         jq -nc --argjson c "$counted" --argjson o "$open" --argjson b "$([ "$(cat "$M/claimed")" = 1 ] && echo 0 || echo 1)" \
           '{aggregate:{open_holds:$o,admission_counted_holds:$c,custody_hold_limit:8,blocked_runs:$b}}' ;;
       /api/runs/wedge) if model_claimed; then echo '{"run":{"status":"running"}}'; else echo '{"run":{"status":"queued"}}'; fi ;;
@@ -1277,6 +1295,10 @@ custody_model_phase() {
 }
 # mutant: K forced to 1 in a scratch copy of the phase (the pre-fix single-discard unblock).
 sed 's/^K=\$((UNB_COUNTED - LIMIT + 1))$/K=1/' "$CUSTODY_PHASE_TEST_SOURCE" > "$SEQ_DIR/phase72-k1.sh"
+# mutant: seed only LIMIT - C0 holds (the baseline-dependent seeding), seed-count assertion adjusted.
+sed -e 's/^NEED=\$LIMIT$/NEED=$((LIMIT - C0))/' \
+    -e 's/^\[ "\$SEEDED" = "\$LIMIT" \] || fail/[ "$SEEDED" = "$NEED" ] || fail/' \
+    "$CUSTODY_PHASE_TEST_SOURCE" > "$SEQ_DIR/phase72-base.sh"
 model_case() {
   local name="$1" want="$2" needle="$3"; shift 3
   cases=$((cases + 1))
@@ -1291,6 +1313,10 @@ model_case "baseline settling between the two discards" pass 'discards=2' "$CUST
 model_case "empty baseline needs one discard" pass 'discards=1' "$CUSTODY_PHASE_TEST_SOURCE" 0 never gate
 model_case "mutant with a single discard cannot unblock a baseline of 1" fail 'never claimed' "$SEQ_DIR/phase72-k1.sh" 1 never gate
 model_case "product control: claim while counted >= limit fails the negative window" fail "wedge run left 'queued'" "$CUSTODY_PHASE_TEST_SOURCE" 1 never always
+model_case "mutant seeding LIMIT - baseline wedges nothing when the baseline settles" fail "wedge run left 'queued'" "$SEQ_DIR/phase72-base.sh" 1 poll1 gate
+model_case "post-claim aggregate with open == counted fails" fail 'open_holds - admission_counted_holds = 0' "$CUSTODY_PHASE_TEST_SOURCE" 0 never gate post-nodiff
+model_case "post-claim aggregate with counted >= limit fails" fail 'still >= 8 after the unblock' "$CUSTODY_PHASE_TEST_SOURCE" 0 never gate post-high
+model_case "post-seed aggregate below the limit fails" fail 'after seeding 8 holds' "$CUSTODY_PHASE_TEST_SOURCE" 0 never gate seed-short
 
 # Exercise the actual handoff startup/trap, stopping before transport and dispatch.
 # The compose double records its exported environment, not source-code spelling.
