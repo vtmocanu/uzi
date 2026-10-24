@@ -437,6 +437,9 @@ func TestWorkerRmActiveRunsSanitizesTitle(t *testing.T) {
 	if !strings.Contains(errb, "22222222  chat  running  22222222") {
 		t.Errorf("stderr = %q, want the short id as the empty-title fallback", errb)
 	}
+	if !strings.Contains(errb, "[2J33-a  chat  running  [2J33-a") {
+		t.Errorf("stderr = %q, want the hostile-id row printed sanitized", errb)
+	}
 }
 
 // TestWorkerRmActiveRunsConflictJSON: --json carries the structured refusal on stdout and

@@ -511,7 +511,7 @@ export function WorkersSettings() {
       {/* The page-level error alert stays ABOVE the tabs (D-unchanged). */}
       {(error || loadError) && <Alert message={error || loadError} />}
       {error && activeRunsBlock && (
-        <ul aria-label="Runs blocking this delete" className="mt-2 space-y-1 text-sm text-fg-muted">
+        <ul aria-label="Runs blocking this delete" className="mt-2 space-y-1 text-sm text-muted">
           {activeRunsBlock.runs.map((r) => {
             const title = stripUnsafeChars(r.title).trim() || r.id;
             const to = r.kind === "chat" ? `/chat/${encodeURIComponent(r.id)}` : `/runs/${encodeURIComponent(r.id)}`;
