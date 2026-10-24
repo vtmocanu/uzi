@@ -243,6 +243,10 @@ def verify_report(report, manifest, expected, synthetic=False):
             require(previous is None or sample["sampleId"] > previous["sampleId"], "sample sequence")
             previous = sample
     require(samples[0]["startedAtMs"] >= baseline[-1]["completedAtMs"], "baseline/load order")
+    # The guard saw measured samples with PSI pinned to the first load sample, so a hard
+    # crossing, never an early-PSI intervention, produced this leg (#3363).
+    require(same(report.get("guardPressure"), {"mode": "pinned_to_first_load_sample",
+            "sampleId": samples[0]["sampleId"], "pressure": samples[0]["pressure"]}), "guard-facing PSI pin")
     bmax = max(s["currentBytes"] for s in baseline)
     rounds = 16 if limit == 1024 ** 3 else 32
     require(same(report["plan"], {"limitBytes": limit, "ceilingBytes": limit // 2, "baselineBytes": bmax,

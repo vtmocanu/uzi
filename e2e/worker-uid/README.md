@@ -272,6 +272,16 @@ No raw records are discarded. Host-aborted unknown metadata is null.
 The positive checker independently verifies these fields from raw evidence and
 still requires stable OOM counters across every raw record.
 
+Guard-facing PSI is controlled on these hard-path legs; memory charges and crossing
+evidence remain measured. The monitor hands the production guard a copy of each
+measured sample whose `memory.pressure` totals and averages are pinned to the first
+load sample's, so the guard's early-PSI branch cannot drain the load before a sample
+reaches the hard threshold. `guardPressure` records the pin (mode
+`pinned_to_first_load_sample`, the source `sampleId` and its PSI); the checker requires
+it and binds it to the first load sample's raw-verified PSI. `samples` and `rawSamples`
+keep the unmodified reads, and the sampled hard crossing stays mandatory. Early-PSI
+coverage lives in `agent/test/worker-memory-guard.test.ts`.
+
 The version-1 derivation attributes every adjacent periodic sample pair by real
 sample IDs, signed raw byte delta, completion interval, positive byte/ms rate and
 read gap. Peak rate and maximum gap select the earliest pair on ties; baseline

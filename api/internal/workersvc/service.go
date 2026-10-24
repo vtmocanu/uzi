@@ -4961,14 +4961,12 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 				return store.Run{}, false, err
 			}
 		}
-		if req.ExpectedGateRevision != nil {
-			if decision.class == gateClassDeclined {
-				return owned, false, nil
-			}
-			// Recovery source refusals never charge the presentation-refusal counter.
-			if decision.refusal != nil {
-				return owned, false, ErrStaleRevisionSource
-			}
+		if req.ExpectedGateRevision != nil && decision.class == gateClassDeclined {
+			return owned, false, nil
+		}
+		// A refused recovery-source report skips the source checks below and is charged
+		// against RUN_GATE_REFUSAL_MAX like any other refusal (issue #3081).
+		if req.ExpectedGateRevision != nil && decision.refusal == nil {
 			if req.RevisionInputID != nil && decision.class == gateClassRetain && revisionReceiptReplay(owned, req) {
 				if reconciliationOut != nil && owned.PlanCrossCheckRequired {
 					proof, err := captureLeadReconciliation(ctx, q.(*store.Queries), wkr, runID, *req.ClaimGeneration)
@@ -5010,6 +5008,10 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 			// classification. An id-bearing report always carries claim_generation (checked
 			// above), and only an id-bearing report can be refused.
 			gateRefusal = decision.refusal
+			if req.ExpectedGateRevision != nil {
+				// The count commits; the recovery-source worker still sees the stale source.
+				gateRefusal = ErrStaleRevisionSource
+			}
 			rows, err = s.recordGateRefusal(ctx, q, owned, wkr, *req.ClaimGeneration, decision.refusal, sessionID)
 			break
 		}

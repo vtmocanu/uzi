@@ -289,6 +289,89 @@ existing dormant limits above remain the boundary, not new guarantees.
 See the [delivery report](../docs/issue-3031-delivery.md) for the requirement
 map and outstanding evidence.
 
+### W0-H hash-attested maintenance WIP capture (issue #3349, 2026-10-23)
+
+This revision supersedes the W0 index-transition and content-policy
+conflicts recorded in the two subsections above, which stay as history. It
+changes `captureMaintenanceWip` only; its signature, result kinds and
+`status`/`add`/`commit` callbacks are unchanged.
+
+**Capture.** The capture runs in the clone as the runner UID. Afterwards
+clone HEAD is the capture commit W (single parent `sourceSha`) and the
+worktree is clean, so existing consumers use it unchanged.
+
+**Hash attestation.**
+- P1 proves the clone's own index (identity plus trailing checksum) and
+  lists the tracked set T. Unmerged entries, gitlinks, assume-unchanged
+  and skip-worktree flags refuse.
+- P2 reads the status and `diff-index --cached` manifest of declared
+  changes.
+- P3 hashes every path in T and the non-ignored untracked set in two stages,
+  a metadata census and then the payload, each reserved before it runs and
+  never refunded. Every tracked path's worktree oid must equal its index oid
+  unless the manifest declares it. An undeclared difference refuses; the stat
+  cache is never trusted.
+- The expected net delta E is every path whose worktree (mode, oid) differs
+  from its HEAD tuple, plus deletions. A manifest and staged set that cancel
+  to an empty E refuse protected, as before.
+
+**Plumbing commit.** Porcelain `commit` is no longer used. The capture runs
+`add -A`, `write-tree`, a pre-commit `diff-tree` proof that tree X equals E
+exactly, then `commit-tree` and `update-ref`. W has deterministic identity
+and dates (both the committer date of `sourceSha`), so identical content
+reproduces W. `update-ref` is a compare-and-swap on the plain branch ref and
+never writes `HEAD`; it refuses if the branch moved, writes no ref and
+leaves the competing tip. Before the swap a refusal leaves HEAD at
+`sourceSha`; after a successful swap a failed post-capture proof refuses
+with the source retained, and no ref is rolled back.
+
+**Index transitions (contract revision).** Exactly two index transitions are
+sanctioned, each pinned in the scope of the command that makes it: `add -A`
+and `write-tree` (Git rewrites the index there when its cache-tree is
+stale). The post-`write-tree` pin is the P5 reference, so the earlier
+requirement that P5 equal the post-`add` pin is replaced. Every interval
+between pins is checked; any other index change refuses with the source
+protected and no ref update.
+
+**Semantics and refusals.**
+- Final-worktree semantics as with `add -A`: staged intermediate content is
+  not preserved. Tracked-but-ignored paths stay in T and are captured.
+- A detached HEAD, or a branch ref that is itself symbolic, refuses.
+- `eol`, `ident` and `working-tree-encoding` conversions make the hashed and
+  staged oids disagree and refuse, at the latest at the tree proof.
+- A source commit whose committer date is outside the accepted canonical
+  form (leading-zero timestamp, `-0000`, or a zone outside ±14:59) refuses
+  in P0, before any commit-group launch. Independently, W's exact text is
+  proved before the branch CAS, so any header Git normalizes refuses with
+  the branch unmoved.
+- Two states the previous capture committed now refuse with the source
+  retained: a tracked file replaced by a directory (a census type change),
+  and an intent-to-add index entry (`git add -N`), which the strict index
+  and status cross-checks reject.
+
+**Content policy (resolves the earlier content-policy conflict).** The
+per-file policy of the [requirements record](../specs/human.md) and the
+[WIP policy amendment](0759-protect-run-work-usage-limit-park.md#amendment-2026-10-21-issue-3239-the-wip-auto-save-refuses-core-dumps-and-oversized-files-and-vets-its-own-marker)
+applies to the maintenance capture. A path in E whose basename matches the
+core pattern (`core`, `core.<digits>`), or whose new content exceeds 8 MiB,
+refuses the whole capture with the source retained. Exactly 8 MiB succeeds.
+A path whose current tuple equals its HEAD tuple (the staged old side if
+staged, else the index entry) is exempt, and a deletion never refuses. The
+capture never omits a file and claims complete coverage. This is the only
+cap lower than the frozen slot caps and applies in addition to them.
+
+**Accounting.** Slot limits are unchanged. Each Git launch charges one
+launch plus its actual output rows as `sourceEntries` and its output bytes
+as `metadataBytes`. The census and payload stages are reserved once and
+consumed, not re-reserved. Each index pin read charges `metadataBytes`
+equal to the index size. The caller's fresh observation pairs cost about 8
+`rpcAttempts` per capture (4 mutating dispatches), against the cap of 32.
+Representative measurement: see the delivery report.
+
+**Boundary.** The composed W0, U4b and archive capacity remains an unverified
+projection. The terminal producer guard stays off. U4b, U4c, U4d, U5, F, M3
+and M4 remain undelivered, and MO is unperformed.
+
 ### Server-owned backoff
 
 `SetRunRecoveryWait` admits only the owning worker's running, non-judge run.
@@ -627,3 +710,37 @@ was measured at roughly 1.5 GiB in October 2026; continued growth can eventually
 require another policy decision. Deadline, cancellation, archive and storage
 quota boundaries remain unchanged. The decoded cap still does not bound
 Git-internal decompression memory.
+
+## Amendment 2026-10-24, #3179: an event-free Claude stream is a recovery outcome
+
+The decision says that missing metrics and nonempty turns retain their existing
+outcomes. This amendment carves out one narrow additional recovery outcome: a
+Claude turn whose harness stream ends cleanly with no events at all and no
+terminal. Such a stream has no turn count, so it was never positively empty, and
+the implement loop folded it into a finished iteration, losing the plan, worker
+safety steer, first-turn content and held owner batch the attempt carried.
+
+An event-free attempt is now retried in process through the same bounded retry as
+the other outcomes (same retry count, backoff and cancel, idle and wall
+precedence), with the original prompt and callbacks:
+
+- The plan, the drained worker safety steer and the held owner batch are retained
+  for the retry. No new outer iteration begins. The owner inclusion receipt is
+  issued only once an attempt shows model-processing evidence.
+- The interrupted-calls note is re-sent only after an event-free attempt, and
+  mirrors exactly what the immediately preceding dispatch appended (including
+  nothing). An attempt that processed its prompt never has its note repeated.
+- The retry preserves the requested resumable session identity because the
+  event-free attempt reported no replacement identity.
+- Exhaustion throws the recovery park error with an event-free message and
+  `providerOrigin` false. Retry notices say the stream ended without any events;
+  they never claim zero turns or provider processing.
+- Plan phase: an event-free planning turn now retries and then parks, where it
+  previously ended as `REASON_NO_PLAN`. A planning turn with a terminal and no plan
+  is unchanged.
+
+Known boundaries. A stream that yields only init or rate-limit events and then
+ends is not covered. A park after exhausted retries does not carry the drained
+steer, as with the positively-empty path today. The Codex lane is out of scope.
+The evidence is a scripted executor reproduction; no real-provider occurrence has
+been observed. The ADR-1416 steering bridge is unchanged.

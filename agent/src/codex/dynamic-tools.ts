@@ -136,7 +136,10 @@ function definition(name: string, grants: RunGrants): Omit<CodexDynamicToolSpec,
             }, ["reason"], false),
           } : {}),
           summary: STRING,
-          report_only: { type: "boolean" },
+          report_only: {
+            type: "boolean",
+            description: "Issue runs only: set true ONLY when the run's deliverable is a report, command output, or a verification result with NO code change to land, so the worker records the findings and opens no merge request. Omit it (or set false) when a code change was committed. It does not leave the issue open; to leave the issue open use `non_closing`. If committed work was already published to a checkpoint, the committed branch is delivered as a non-closing merge request instead. Omit on other run kinds.",
+          },
           non_closing: {
             ...objectSchema({ reason: STRING }, ["reason"], false),
             description: "Issue runs only: declare that this delivery leaves the issue open. Reason must contain 1–500 Unicode code points after trimming. Omit on other run kinds.",

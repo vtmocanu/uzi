@@ -39,11 +39,23 @@ async function fixture(t: test.TestContext, monotonicNow?: () => number) {
   const events: string[] = [];
   let launches = 0, joins = 0;
   let intercept: ((request: BoundaryProcessRequest) => string | undefined) | undefined;
+  // The commit group (write-tree, commit-tree, update-ref) is one "commit" owner label, so
+  // launch:commit / join:commit keep meaning "a commit-group mutation launched". Runner-owned
+  // helper children are told apart by the marker comment on their first script line.
+  const gitCommands = ["status", "add", "write-tree", "commit-tree", "update-ref", "config", "ls-files", "rev-parse",
+    "cat-file", "symbolic-ref", "for-each-ref", "diff-index", "diff-tree"];
+  const labelOf = (argv: readonly string[]) => {
+    const command = argv.find(arg => gitCommands.includes(arg));
+    if (command) return ["write-tree", "commit-tree", "update-ref"].includes(command) ? "commit" : command;
+    const script = argv[1] === "-e" ? argv[2] ?? "" : "";
+    for (const helper of ["pin", "census", "payload"]) if (script.startsWith("// uzi-wip-" + helper)) return helper;
+    return script.includes("entryLimit") ? "proof" : "metadata";
+  };
   const owner = async (request: BoundaryProcessRequest) => {
     launches++;
     const argv = [...request.argv];
-    const command = argv.find(arg => ["status", "add", "commit", "config", "ls-files", "rev-parse", "cat-file", "ls-tree"].includes(arg));
-    const label = command ?? (argv[2]?.includes("entryLimit") ? "proof" : "metadata");
+    const label = labelOf(argv);
+    const command = gitCommands.includes(label) || label === "commit" ? label : undefined;
     events.push("launch:" + label);
     if (MaintenanceResources.active()) {
       if (command === "status") assert.equal(request.env.GIT_OPTIONAL_LOCKS, "0");
@@ -72,6 +84,7 @@ async function fixture(t: test.TestContext, monotonicNow?: () => number) {
     await fs.rm(dir, { recursive: true, force: true });
   });
   return { root, dir, git, old, initialIndex, gitIn, run, owned, capture, events, before, after, signal,
+    label: (request: BoundaryProcessRequest) => labelOf(request.argv),
     launches: () => launches, intercept: (fn: typeof intercept) => { intercept = fn; },
     dirty: () => fs.writeFile(path.join(root, "tracked"), "changed"),
     head: () => gitIn("rev-parse", "HEAD").trim(),
@@ -80,20 +93,18 @@ async function fixture(t: test.TestContext, monotonicNow?: () => number) {
 }
 
 describe("guarded maintenance WIP capture", { skip: process.platform !== "linux" && "Linux /proc capture required" }, () => {
-  test("dirty capture uses three matched 16 MiB raw metadata envelopes without reducing source caps", async t => {
+  // W0: the three fixed raw metadata envelopes are replaced by one two-stage hashing pass
+  // charged for what it actually reads, so a dirty capture still succeeds with the same
+  // 196 MiB of metadataBytes already spent and never launches the old raw envelope helper.
+  test("dirty capture needs no fixed raw metadata envelope and does not reduce source caps", async t => {
     const f = await fixture(t);
     await f.dirty();
-    let proofs = 0;
-    f.intercept(request => {
-      if (request.argv[2]?.includes("entryLimit")) {
-        proofs++;
-        assert.deepEqual(request.argv.slice(4, 7), [String(64 * 1024 ** 2), "16384", String(16 * 1024 ** 2)]);
-      }
-      return undefined;
-    });
     f.run(() => MaintenanceResources.consume("metadataBytes", 196 * 1024 ** 2));
     assert.equal((await f.capture()).kind, "committed");
-    assert.equal(proofs, 3);
+    assert.equal(f.events.filter(e => e === "launch:proof").length, 0, "no fixed raw envelope helper");
+    assert.equal(f.events.filter(e => e === "launch:payload").length, 1, "one payload pass");
+    // The source caps are untouched: nearly the whole 256 MiB sourceBytes allowance is still free.
+    f.run(() => MaintenanceResources.consume("sourceBytes", 256 * 1024 ** 2 - 1024));
   });
 
   test("real tracked/untracked/binary WIP, ignored bytes and ordered owned effects", async t => {
@@ -115,22 +126,28 @@ describe("guarded maintenance WIP capture", { skip: process.platform !== "linux"
     assert.equal(await fs.readFile(path.join(f.root, "ignored"), "utf8"), "private");
     assert.equal(f.gitIn("show", "-s", "--format=%P"), f.old + "\n");
     assert.ok(f.gitIn("show", "-s", "--format=%s").startsWith(WIP_PARK_COMMIT_PREFIX));
-    const effects = f.events.filter(event => /^(before|after):|^(launch|join):(status|add|commit)$/.test(event));
-    assert.deepEqual(effects, ["status", "add", "commit"].flatMap(step =>
-      ["before:" + step + ":prepare", "before:" + step + ":dispatch", "launch:" + step, "join:" + step, "after:" + step]));
-    assert.equal(f.events.filter(e => e === "launch:proof").length, 3);
-    for (const step of ["status", "add", "commit"]) {
-      const start = f.events.indexOf("before:" + step + ":prepare");
-      const end = f.events.indexOf("before:" + step + ":dispatch", start + 1);
-      const preparation = f.events.slice(start + 1, end);
-      assert.ok(preparation.includes("join:metadata"));
-      assert.ok(preparation.includes("join:config"));
-      assert.equal(preparation.filter(e => e === "join:ls-files").length, 2);
-      assert.equal(preparation.at(-1), "join:proof");
-    }
-    // The three raw reservations consume 192 MiB; no refund after tiny proofs.
-    f.run(() => MaintenanceResources.consume("sourceBytes", 64 * 1024 ** 2));
-    assert.throws(() => f.run(() => MaintenanceResources.consume("sourceBytes", 1)), /maintenance_/);
+    // The caller-visible effects, up to the commit group's quiescence: the commit step is
+    // three mutating launches (write-tree, commit-tree, update-ref), each with its own
+    // (commit, dispatch) callback immediately before it. The later P5 proof is read-only.
+    const proven = f.events.slice(0, f.events.indexOf("after:commit") + 1);
+    const effects = proven.filter(event => /^(before|after):|^(launch|join):(status|add|commit)$/.test(event));
+    assert.deepEqual(effects, [
+      ...["status", "add"].flatMap(step =>
+        ["before:" + step + ":prepare", "before:" + step + ":dispatch", "launch:" + step, "join:" + step, "after:" + step]),
+      "before:commit:prepare",
+      ...[0, 1, 2].flatMap(() => ["before:commit:dispatch", "launch:commit", "join:commit"]),
+      "after:commit",
+    ]);
+    // P0/P1 happen in the first (status, prepare) window, before the status dispatch callback.
+    const preparation = f.events.slice(f.events.indexOf("before:status:prepare") + 1, f.events.indexOf("before:status:dispatch"));
+    assert.ok(preparation.includes("join:metadata"));
+    assert.ok(preparation.includes("join:config"));
+    assert.equal(preparation.filter(e => e === "join:ls-files").length, 2);
+    assert.ok(preparation.includes("join:pin"));
+    assert.equal(proven.filter(e => e === "launch:payload").length, 1);
+    assert.equal(f.events.filter(e => e === "launch:proof").length, 0);
+    // No 192 MiB raw reservation remains: only the few hashed bytes were charged to sourceBytes.
+    f.run(() => MaintenanceResources.consume("sourceBytes", 256 * 1024 ** 2 - 1024));
   });
 
   test("caller quiescence is awaited before any next preparation", async t => {
@@ -222,18 +239,14 @@ describe("guarded maintenance WIP capture", { skip: process.platform !== "linux"
     assert.notEqual(result?.kind, "clean", "forged index stat cache must not hide changed tracked bytes");
     // Issue #3222: an earlier refusal (e.g. at the index-mode guard) must not pass for this check.
     assert.ok(f.events.includes("launch:status"), "the capture reaches the stat-cache check");
-    if (visible) assert.ok(f.events.includes("launch:add"), "visible WIP is staged before the refusal");
-    if (result?.kind === "committed") {
-      assert.equal(f.gitIn("show", "HEAD:tracked"), "modified", "successful tree must include masked tracked bytes");
-      assert.equal(f.gitIn("show", "HEAD:visible"), "new");
-    } else {
-      assert.equal(f.head(), f.old);
-      if (visible) {
-        assert.equal(f.gitIn("show", ":tracked"), "original");
-        assert.equal(f.gitIn("show", ":visible"), "new");
-      } else assert.deepEqual(await f.index(), before);
-      assert.ok(!f.events.includes("launch:commit"));
-    }
+    // W0 hashes every tracked path before any effect: the forged stat cache is refused in P3,
+    // with no add launch and the index byte-identical (stronger than refusing after staging).
+    assert.equal(result, undefined, "the forged stat cache is refused");
+    assert.ok(!f.events.includes("launch:add"), "refused before add");
+    assert.ok(!f.events.includes("launch:commit"));
+    assert.equal(f.head(), f.old);
+    assert.deepEqual(await f.index(), before);
+    assert.equal(f.gitIn("show", ":tracked"), "original");
     assert.equal(await fs.readFile(path.join(f.root, "tracked"), "utf8"), "modified");
   });
 
@@ -340,7 +353,7 @@ describe("guarded maintenance WIP capture", { skip: process.platform !== "linux"
 
     test("command failure " + stop + " still joins caller quiescence and throws", async t => {
       const f = await fixture(t); await f.dirty();
-      f.intercept(request => request.argv.includes(stop) ? "process.exitCode = 7" : undefined);
+      f.intercept(request => f.label(request) === stop ? "process.exitCode = 7" : undefined);
       await assert.rejects(f.capture(), /failed/);
       assert.equal(f.head(), f.old);
       assert.equal(f.events.at(-1), "after:" + stop);
@@ -430,7 +443,9 @@ describe("guarded maintenance WIP capture", { skip: process.platform !== "linux"
     await assert.rejects(f.capture({ beforeStep: async (step, phase) => {
       await f.before(step, phase); if (++visits === 2) clock = 121000;
     }, afterRunnerGit: f.after }), /maintenance_/);
-    assert.ok(f.events.includes("join:proof"));
+    // The first-pass proof (index pin and tracked-set listings) completed before the deadline.
+    assert.ok(f.events.includes("join:pin"));
+    assert.equal(f.events.filter(e => e === "join:ls-files").length, 2);
     assert.ok(!f.events.includes("launch:status"));
   });
 
@@ -525,7 +540,12 @@ describe("guarded maintenance WIP capture", { skip: process.platform !== "linux"
     assert.ok(!f.events.includes("launch:status"));
     f.run(() => MaintenanceResources.consume("sourceBytes", 256 * 1024 ** 2));
     await assert.rejects(f.capture(), /maintenance_/);
-    assert.ok(!f.events.includes("launch:status"));
+    // W0 charges the payload (sourceBytes) from the census after the read-only status, so the
+    // exhausted quota refuses before any mutating Git effect rather than before status.
+    assert.ok(!f.events.includes("launch:add"));
+    assert.ok(!f.events.includes("launch:commit"));
+    assert.equal(f.head(), f.old);
+    assert.deepEqual(await f.index(), f.initialIndex);
   });
 
   test("unscoped/discovery/no owner, missing callbacks, invalid arguments and aborted scope refuse", async t => {

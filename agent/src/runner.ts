@@ -7304,6 +7304,36 @@ export class RunRunner {
     // above). killAgentTree was already called at the security boundary above, so we do
     // NOT double-call it here (the not_code block's second call is a redundancy — not
     // copied). Returns before fetchAgentBranch: there is no branch to fetch or push.
+    // #3360: an ISSUE run that declares report_only after publishing a checkpoint is
+    // delivered as a non-closing MR instead of failing; this flag lets the empty-diff
+    // guard below fail closed with the #299 reason when the candidate has nothing to land.
+    let reportOnlyFallback = false;
+    // Set only when the fallback itself synthesized the skipped cross-check disclosure below.
+    let reportOnlySkippedCrossCheck = false;
+    // The #299 orphan-checkpoint failure of the issue path, shared by the non-issue and
+    // fail-closed branches of the #3360 fallback and the empty-candidate guard.
+    const failReportOnlyOrphan = async (): Promise<void> => {
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: "report_only was set but this run published a checkpoint to origin; failing to avoid orphaning it",
+        },
+      });
+      await closeBatcher();
+      // PRD #1391 Run B M3 (N1): journal write-ahead so the typed orphan-checkpoint failure
+      // survives an outage as this exact outcome, not a generic agent_failure.
+      await journalTerminalReport({
+        status: "failed",
+        failure_reason:
+          "signal_done was called with report_only, but this run published committed work to a checkpoint ref (refs/uzi-checkpoints/" +
+          runnerClone.branch +
+          ") on origin. A report-only completion opens no branch or merge request and would orphan that checkpoint. If this run has code to land, call signal_done WITHOUT report_only so the work lands as a merge request; report_only is only valid for a run that committed nothing.",
+      });
+      runLog.info("run failed: report_only declared after a checkpoint was published", {
+        run_id: runId,
+      });
+    };
     if (result.reportOnly) {
       // #299/#2967: report-only opens no MR to supersede a published checkpoint.
       // Check the prior/cross-worker mirrored ref AND this worker's exact confirmed
@@ -7315,45 +7345,92 @@ export class RunRunner {
         await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch,
           landedCheckpoint ? { tip: flight.lastCheckpointRefTip } : undefined);
       if (publishedCheckpoint) {
+        if (resolveRunKind(claim.kind) !== "issue") {
+          await failReportOnlyOrphan();
+          return;
+        }
+        // #3360: the lead declared report_only but committed work is already published.
+        // Deliver it as a NON-CLOSING merge request rather than orphaning it; fall through
+        // to the normal fetch-back and delivery path. Every downstream non-closing guard
+        // (closing-commit refusal, permit, title/body, source_publication) keys off
+        // result.nonClosing via effectiveDeclared.
+        reportOnlyFallback = true;
+        if (!(result.nonClosing ?? claim.config?.non_closing)) {
+          result.nonClosing = {
+            reason: "The lead declared report_only after committing work; the worker delivered it without closing the issue.",
+          };
+        }
+        if (claim.code_cross_check_required === true && !result.codeCrossCheckSummary) {
+          result.codeCrossCheckSummary = { incomplete: "skipped: report_only was declared" };
+          reportOnlySkippedCrossCheck = true;
+        }
         batcher.emit({
           kind: "status",
           agent: "worker",
           payload: {
-            text: "report_only was set but this run published a checkpoint to origin; failing to avoid orphaning it",
+            text: "report_only was set but this run published committed work to origin; the worker will attempt non-closing delivery",
+          },
+        });
+        if (interlocked && this.client.hasFeature("completion_non_closing_v1")) {
+          // Record the declared non-closing intent with the API unconditionally (unlike the
+          // pre-push hold path, no prior attempt stands in for it). Fail closed: if it cannot
+          // be recorded nothing has been pushed, so surface the #299 failure.
+          const fallbackHead = await this.git.branchTip(runnerClone.path, runnerClone.branch);
+          const fallbackSignal = boundarySignal
+            ? AbortSignal.any([flight.cancel.signal, boundarySignal])
+            : flight.cancel.signal;
+          let recorded = false;
+          for (let attempt = 0; attempt < 3 && !recorded; attempt++) {
+            fallbackSignal.throwIfAborted();
+            try {
+              await this.client.recordCompletionAttempt(runId, {
+                milestonesCompleted: [], head: fallbackHead, worktreeFingerprint: null,
+                claimGeneration: flight.claimGeneration,
+                nonClosing: result.nonClosing ?? claim.config?.non_closing,
+              }, fallbackSignal);
+              recorded = true;
+            } catch (error) {
+              fallbackSignal.throwIfAborted();
+              if (error instanceof RequestError && (error.status === 409 || error.status === 404)) {
+                let refusal: { reason?: unknown; error?: unknown } | undefined;
+                try { refusal = JSON.parse(error.body); } catch { /* Unknown refusal fails closed below. */ }
+                if ((error.status === 409 && (refusal?.reason === "stale_claim" ||
+                      refusal?.error === "run is not in a live claimed state for this worker")) ||
+                    (error.status === 404 && refusal?.error === "run not found for this worker"))
+                  throw new StaleClaimError();
+              }
+              if (!isTransient(error) || attempt === 2) {
+                runLog.warn("report_only fallback completion attempt unresolved; failing closed", { error: errMessage(error) });
+                break;
+              }
+              await sleep(250 * 2 ** attempt, fallbackSignal);
+            }
+          }
+          if (!recorded) {
+            await failReportOnlyOrphan();
+            return;
+          }
+        }
+      }
+      if (!reportOnlyFallback) {
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text: "report-only run: recording findings; no branch pushed and no merge request opened",
           },
         });
         await closeBatcher();
-        // PRD #1391 Run B M3 (N1): journal write-ahead so the typed orphan-checkpoint failure
-        // survives an outage as this exact outcome, not a generic agent_failure.
+        // PRD #1391 Run B M3 (N1): journal write-ahead so the report_only completion (report_md) is
+        // the durable outcome after an outage, not a generic agent_failure.
         await journalTerminalReport({
-          status: "failed",
-          failure_reason:
-            "signal_done was called with report_only, but this run published committed work to a checkpoint ref (refs/uzi-checkpoints/" +
-            runnerClone.branch +
-            ") on origin. A report-only completion opens no branch or merge request and would orphan that checkpoint. If this run has code to land, call signal_done WITHOUT report_only so the work lands as a merge request; report_only is only valid for a run that committed nothing.",
+          status: "completed",
+          report_only: true,
+          report_md: result.summary,
         });
-        runLog.info("run failed: report_only declared after a checkpoint was published", {
-          run_id: runId,
-        });
+        runLog.info("run completed report-only (no MR)", { run_id: runId });
         return;
       }
-      batcher.emit({
-        kind: "status",
-        agent: "worker",
-        payload: {
-          text: "report-only run: recording findings; no branch pushed and no merge request opened",
-        },
-      });
-      await closeBatcher();
-      // PRD #1391 Run B M3 (N1): journal write-ahead so the report_only completion (report_md) is
-      // the durable outcome after an outage, not a generic agent_failure.
-      await journalTerminalReport({
-        status: "completed",
-        report_only: true,
-        report_md: result.summary,
-      });
-      runLog.info("run completed report-only (no MR)", { run_id: runId });
-      return;
     }
 
     // (b) fetch-back (PRD #51 M3): the agent committed in the RUNNER clone, so the
@@ -7549,15 +7626,22 @@ export class RunRunner {
     }
 
     // issue #279: an UNDECLARED zero-diff guard, ISSUE runs only. A declared report_only
-    // already returned above, so reaching here on an issue run with a confirmed-empty diff
-    // is the ambiguous "forgot to commit / should have set report_only" case — a
-    // committed-nothing issue run must not open an empty MR.
+    // without a published checkpoint already returned above, so reaching here with a
+    // confirmed-empty diff is the ambiguous "forgot to commit / should have set report_only"
+    // case — a committed-nothing issue run must not open an empty MR. #3360: a declared
+    // report_only that fell back to non-closing delivery (reportOnlyFallback) with a
+    // confirmed-empty candidate has nothing to land, so it keeps the #299 failure.
     if (resolveRunKind(claim.kind) === "issue") {
       const changedForGuard = await this.git.changedFiles(barePath, trackingRef);
+      if (reportOnlyFallback && changedForGuard !== null && changedForGuard.length === 0) {
+        await failReportOnlyOrphan();
+        return;
+      }
       // changedFiles returns null on diff-FAILURE (keep pushing — fail open) and [] on a
       // CONFIRMED-empty diff. report_only is the sanctioned zero-diff success — a declared
-      // report_only already returned above, so reaching here undeclared+empty is the
-      // ambiguous case; fail with an actionable reason instead of opening an empty MR.
+      // report_only either returned above or (with a published checkpoint) took the #3360
+      // fallback handled just above, so reaching here undeclared+empty is the ambiguous
+      // case; fail with an actionable reason instead of opening an empty MR.
       if (changedForGuard !== null && changedForGuard.length === 0) {
         // PRD #634 M3: an operator scope directive can truncate a run at its very first
         // milestone boundary, before any milestone produced committed work — a legitimate
@@ -9174,7 +9258,10 @@ export class RunRunner {
     // preserved text around it.
     // Rebuild persisted evidence at publication as well as session completion: a superseded
     // completed row must not carry the earlier attempt's counts into a reconciled MR.
-    if (claim.code_cross_check_required === true && result.codeCrossCheckSummary) {
+    // #3360: the report_only fallback's own synthesized "skipped" disclosure must not be replaced
+    // by a persisted status row (which can be absent or an earlier same-generation completed
+    // check); a summary an earlier completion attempt produced is still refreshed.
+    if (claim.code_cross_check_required === true && result.codeCrossCheckSummary && !reportOnlySkippedCrossCheck) {
       try {
         result.codeCrossCheckSummary = persistedCodeCrossCheckSummary(
           await this.client.codeCrossCheckStatus(claim.run_id, flight.claimGeneration,

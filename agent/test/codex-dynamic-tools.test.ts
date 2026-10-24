@@ -63,6 +63,19 @@ describe("m1 non-closing dynamic schema", () => {
   });
 });
 
+describe("#3360 report_only dynamic schema", () => {
+  it("describes report_only as no-code-change and points to non_closing", () => {
+    const spec = buildCodexDynamicTools(grants(["signal_done"])).find(s => s.name === "signal_done")!;
+    const props = spec.inputSchema.properties as Record<string, Record<string, unknown>>;
+    const declaration = props["report_only"]!;
+    assert.equal(declaration.type, "boolean");
+    assert.match(String(declaration.description), /no code change/i);
+    assert.match(String(declaration.description), /non_closing/);
+    assert.match(String(declaration.description), /^Issue runs only:/);
+    assert.match(String(declaration.description), /already published to a checkpoint, the committed branch is delivered as a non-closing merge request/);
+  });
+});
+
 describe("#2986 root-only long command schema", () => {
   for (const isRoot of [true, false]) {
     it(`advertises long_running only with root grant ${isRoot}`, () => {

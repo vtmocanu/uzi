@@ -397,6 +397,36 @@ class CheckerTest(unittest.TestCase):
                 with self.assertRaises((ValueError, KeyError, TypeError)):
                     self.verify()
 
+    def test_guard_facing_psi_pin_is_required_and_bound_to_the_first_load_sample(self):
+        def later_pressure(r):
+            r["guardPressure"]["pressure"] = copy.deepcopy(r["samples"][1]["pressure"])
+            r["guardPressure"]["pressure"]["full"]["total"] = 1400
+        cases = (("missing", lambda r: r.pop("guardPressure")),
+                 ("null", lambda r: r.update(guardPressure=None)),
+                 ("unpinned mode", lambda r: r["guardPressure"].update(mode="measured")),
+                 ("later source sample", lambda r: r["guardPressure"].update(sampleId=r["samples"][1]["sampleId"])),
+                 ("baseline source sample", lambda r: r["guardPressure"].update(sampleId=r["baseline"][0]["sampleId"])),
+                 ("pressure not from the source", later_pressure),
+                 ("extra field", lambda r: r["guardPressure"].update(early=True)))
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                manifest, reports, cleanup = case()
+                mutate(reports[1])
+                with self.assertRaisesRegex(ValueError, "guard-facing PSI pin"):
+                    check.verify(manifest, encode(reports), cleanup, synthetic=True)
+
+    def test_hard_crossing_is_still_required_with_a_valid_pin(self):
+        manifest, reports, cleanup = case()
+        mib = 1024 ** 2
+        record = reports[0]["rawSamples"][5]  # sample 6, the only one at or above H
+        self.assertEqual(record["sample"]["currentBytes"], 136 * mib)
+        record["sample"]["currentBytes"] = record["sample"]["stat"]["anon"] = 130 * mib
+        record["raw"]["/sys/fs/cgroup/memory.current"] = str(130 * mib) + "\n"
+        record["raw"]["/sys/fs/cgroup/memory.stat"] = record["raw"]["/sys/fs/cgroup/memory.stat"].replace(
+            "anon " + str(136 * mib), "anon " + str(130 * mib))
+        with self.assertRaisesRegex(ValueError, "real hard crossing bracket"):
+            check.verify(manifest, encode(reports), cleanup, synthetic=True)
+
     def test_reserve_inequality_is_recomputed_before_derivation(self):
         # 20MiB growth in one millisecond exceeds the fixed reserve when charged
         # over the full hard-bracket-to-drain latency.
