@@ -628,7 +628,7 @@ require another policy decision. Deadline, cancellation, archive and storage
 quota boundaries remain unchanged. The decoded cap still does not bound
 Git-internal decompression memory.
 
-## Amendment 2026-10-24 — #3179: an event-free Claude stream is a recovery outcome
+## Amendment 2026-10-24, #3179: an event-free Claude stream is a recovery outcome
 
 The decision says that missing metrics and nonempty turns retain their existing
 outcomes. This amendment carves out one narrow additional recovery outcome: a
@@ -647,8 +647,8 @@ precedence), with the original prompt and callbacks:
 - The interrupted-calls note is re-sent only after an event-free attempt, and
   mirrors exactly what the immediately preceding dispatch appended (including
   nothing). An attempt that processed its prompt never has its note repeated.
-- The retry resumes the session the attempt was requested with; a stream with no
-  events cannot have started another.
+- The retry preserves the requested resumable session identity because the
+  event-free attempt reported no replacement identity.
 - Exhaustion throws the recovery park error with an event-free message and
   `providerOrigin` false. Retry notices say the stream ended without any events;
   they never claim zero turns or provider processing.

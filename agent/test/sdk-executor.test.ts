@@ -6378,28 +6378,34 @@ describe("SdkExecutor event-free stream recovery (issue #3179)", () => {
   });
 
   it("cancellation during the event-free backoff throws REASON_CANCELLED, not recovery", async () => {
-    const { queryFn } = fakeTurns([[]]);
+    const { queryFn, turns } = fakeTurns([[]]);
     const ac = new AbortController();
     const probe = makeCtx({ signal: ac.signal });
-    const t = setTimeout(() => ac.abort(), 40);
-    try {
-      await assert.rejects(
-        new SdkExecutor(nullLogger(), homeDir, fastRecovery(queryFn, 2, 1000)).run(probe.ctx),
-        (err: unknown) => err instanceof Error && /run cancelled/.test(err.message) && !(err instanceof TransientRecoveryError),
-      );
-    } finally {
-      clearTimeout(t);
-    }
+    const slices: number[] = [];
+    // Cancel exactly at entry into the backoff that follows the event-free attempt: no timers.
+    const emptyTurnSleep = async (ms: number): Promise<void> => { slices.push(ms); ac.abort(); };
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, { ...fastRecovery(queryFn, 2, 1000), emptyTurnSleep }).run(probe.ctx),
+      (err: unknown) => err instanceof Error && /run cancelled/.test(err.message) && !(err instanceof TransientRecoveryError),
+    );
+    assert.equal(turns.length, 1, "the event-free attempt ran once and nothing was re-dispatched");
+    assert.equal(slices.length, 1, "the cancel landed in the first backoff slice");
   });
 
-  it("a spent wall trips the wall outcome, not recovery, after an event-free attempt", async () => {
+  it("a spent wall trips the wall outcome, not recovery, after an event-free attempt", async (t) => {
     const { queryFn, turns } = fakeTurns([[]]);
-    const probe = makeCtx({ config: { run_timeout_seconds: 0.5 } });
+    let now = Date.now();
+    t.mock.method(Date, "now", () => now);
+    const probe = makeCtx({ config: { run_timeout_seconds: 60 } });
+    let slices = 0;
+    // Each backoff slice advances the mocked clock past the whole wall: no real waits.
+    const emptyTurnSleep = async (): Promise<void> => { slices++; now += 61_000; };
     await assert.rejects(
-      new SdkExecutor(nullLogger(), homeDir, fastRecovery(queryFn, 2, 2000)).run(probe.ctx),
+      new SdkExecutor(nullLogger(), homeDir, { ...fastRecovery(queryFn, 2, 1000), emptyTurnSleep }).run(probe.ctx),
       (err: unknown) => err instanceof Error && /wall-clock timeout/.test(err.message) && !(err instanceof TransientRecoveryError),
     );
-    assert.ok(turns.length <= 2, `bounded SDK calls, got ${turns.length}`);
+    assert.equal(slices, 1, "the event-free attempt completed and entered the backoff");
+    assert.equal(turns.length, 1, "the wall-tripped re-drive made no SDK dispatch");
   });
 
   it("a terminal-fenced run makes no further dispatch after an event-free attempt", async () => {

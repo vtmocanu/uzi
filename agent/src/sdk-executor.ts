@@ -572,6 +572,9 @@ export interface SdkExecutorOptions {
    *  {@link EMPTY_TURN_MAX_RETRIES}; finite nonnegative overrides are floored,
    *  with zero disabling in-process retries. Invalid values use the default. */
   emptyTurnMaxRetries?: number;
+  /** issue #3179: the sleep each between-retry backoff slice awaits (default `sleep`). Tests
+   *  inject one to observe entry into the backoff and control time without real waits. */
+  emptyTurnSleep?: (ms: number) => Promise<void>;
   /** PRD #1809 D4: how long the quiet-point probe waits for the previous turn's processes to
    *  exit before it calls the run busy (default {@link QUIET_SETTLE_MS}). Injected in tests. */
   quietSettleMs?: number;
@@ -958,6 +961,7 @@ export class SdkExecutor implements Executor {
   /** issue #1197 (D-RC2b): base in-process backoff between positively-empty turn
    *  retries (× the attempt number). Injectable so tests run the retry paths fast. */
   private readonly emptyTurnBackoffBaseMs: number;
+  private readonly emptyTurnSleep: (ms: number) => Promise<void>;
   /** issue #1197 (D-RC2b): bounded in-process re-drive count for a positively-empty
    *  turn before escalating to {@link TransientRecoveryError}. Injectable for tests. */
   private readonly emptyTurnMaxRetries: number;
@@ -1053,6 +1057,7 @@ export class SdkExecutor implements Executor {
     // #1197: accept finite nonnegative overrides. Zero deliberately disables the
     // delay/retries; invalid values fall back. The test backoff knob can lower
     // the production delay, never extend it into an effectively unbounded wait.
+    this.emptyTurnSleep = opts.emptyTurnSleep ?? sleep;
     this.emptyTurnBackoffBaseMs =
       typeof opts.emptyTurnBackoffBaseMs === "number"
         && Number.isFinite(opts.emptyTurnBackoffBaseMs)
@@ -5435,7 +5440,7 @@ export class SdkExecutor implements Executor {
       if (state.wallRemainingMs <= 0) return;
       const slice = Math.min(EMPTY_TURN_BACKOFF_SLICE_MS, remaining);
       const before = Date.now();
-      await sleep(slice);
+      await this.emptyTurnSleep(slice);
       // Catch a cancel that landed mid-sleep promptly, before debiting/looping.
       if (state.tripReason) throw this.tripError(state);
       // Debit the ACTUAL elapsed time (mirrors disarmWall) so the subsequent turn's
