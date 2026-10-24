@@ -4,7 +4,7 @@
 # critical: no
 # lane:     gitlab
 # executor: any
-# requires: REPO_ID DUMMY_ANTHROPIC
+# requires: REPO_ID DUMMY_ANTHROPIC DUMMY_FORGE_PAT UZI_BIN
 # provides: -
 # handoff:  -
 # mutates:  compose:agent(stopped) (:40, never restarted in-phase); a spare anthropic_token(console-key, deleted); a binding-test worker; runs created then cancelled
@@ -213,3 +213,229 @@ CANCELLED_N="$(db_psql "WITH c AS (
 [ "$CANCELLED_N" = 3 ] \
   || fail "binding phase cleanup: expected to terminate 3 leftover claimed runs, cancelled $CANCELLED_N (B1=$RUN_B1 B2=$RUN_B2 B3=$RUN_B3)"
 pass "binding-phase cleanup: the three claimed binding runs terminated so they cannot dirty the auto-stop queue"
+
+# Manual intake is tested under a fresh owner: no admin agent or another phase's
+# workers can enter the suitable-worker denominator. Keep the agent-stopped
+# handoff above intact. This subshell gives the shared cookie helpers only our jar.
+(
+  M5_FIXTURE="$(db_psql 'SELECT gen_random_uuid()')"
+  [[ "$M5_FIXTURE" =~ ^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$ ]] || fail "manual intake: invalid fixture UUID"
+  M5_EMAIL="manual-$M5_FIXTURE@uzi.e2e"
+  M5_LABEL="Manual owner $M5_FIXTURE"
+  M5_REASON="e2e-manual-intake-$M5_FIXTURE"
+  JAR="$RUNROOT/manual-$M5_FIXTURE.jar"
+  M5_OWNER="" M5_CONNECTION="" M5_REPO="" M5_WORKER="" M5_EPHEMERAL=""
+  M5_RUNS=()
+  m5_uuid() { [[ "$1" =~ ^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$ ]]; }
+  m5_cleanup() {
+    [ -n "$M5_OWNER" ] || return 0
+    m5_uuid "$M5_OWNER" || return 1
+    local run rc=0 remaining deleted
+    # At most our one created run. Independent terminalizations are best-effort;
+    # any failure prevents cascading deletion from concealing unfinished work.
+    for run in "${M5_RUNS[@]}"; do
+      db_psql "UPDATE runs SET status='cancelled', status_since=now(), finished_at=now(), updated_at=now()
+        WHERE id='$run' AND user_id='$M5_OWNER' AND repo_id='$M5_REPO'
+          AND status NOT IN ('completed','failed','cancelled')" >/dev/null || rc=1
+    done
+    [ "$rc" = 0 ] || return 1
+    remaining="$(db_psql "SELECT count(*) FROM runs WHERE user_id='$M5_OWNER'
+      AND status NOT IN ('completed','failed','cancelled')")" || return 1
+    [ "$remaining" = 0 ] || return 1
+    # No public DeleteUser exists. Only this newly registered identity is removed;
+    # workers/runs, connection/repos and encrypted credential cascade from it.
+    deleted="$(db_psql "DELETE FROM users WHERE id='$M5_OWNER' AND email='$M5_EMAIL' RETURNING id")" || return 1
+    [ "$deleted" = "$M5_OWNER" ] || return 1
+    [ "$(db_psql "SELECT (SELECT count(*) FROM workers WHERE user_id='$M5_OWNER')
+      + (SELECT count(*) FROM runs WHERE user_id='$M5_OWNER')
+      + (SELECT count(*) FROM forge_connections WHERE user_id='$M5_OWNER')
+      + (SELECT count(*) FROM user_secrets WHERE user_id='$M5_OWNER')")" = 0 ] || return 1
+    M5_OWNER=""
+  }
+  m5_exit() {
+    local rc=$?
+    if ! m5_cleanup; then
+      echo "manual intake: owned fixture cleanup failed" >&2
+      rc=1
+    fi
+    exit "$rc"
+  }
+  trap m5_exit EXIT
+  # Registration unlock is best-effort in auth.go. Secret creation and the later
+  # positive claim, rather than registration alone, establish vault eligibility.
+  M5_REG="$(curl -fsS -c "$JAR" -X POST "$BASE/api/auth/register" -H 'Content-Type: application/json' \
+    -d "{\"email\":\"$M5_EMAIL\",\"password\":\"e2e-manual-$M5_FIXTURE\",\"display_name\":\"$M5_LABEL\"}")"
+  M5_OWNER="$(printf '%s' "$M5_REG" | jq -er '.user.id')"
+  m5_uuid "$M5_OWNER" || fail "manual intake: registration returned no owner UUID"
+  [ "$(db_psql "SELECT count(*) FROM users WHERE id='$M5_OWNER' AND email='$M5_EMAIL' AND NOT is_admin")" = 1 ] \
+    || fail "manual intake: registration did not create the exact non-admin owner"
+  [ -n "$(csrf)" ] || fail "manual intake: registration did not issue CSRF"
+  M5_CONNECTION="$(printf '{"forge_type":"gitlab","base_url":"https://forge-fake.e2e","token":"%s"}' "$DUMMY_FORGE_PAT" \
+    | curl -fsS -b "$JAR" -X POST "$BASE/api/forge/connections" -H 'Content-Type: application/json' \
+      -H "X-CSRF-Token: $(csrf)" --data-binary @- | jq -er '.connection.id')"
+  m5_uuid "$M5_CONNECTION" || fail "manual intake: connection returned no UUID"
+  [ "$(db_psql "SELECT count(*) FROM forge_connections WHERE id='$M5_CONNECTION' AND user_id='$M5_OWNER'")" = 1 ] \
+    || fail "manual intake: connection owner mismatch"
+  M5_REPO="$(apiget "/api/forge/connections/$M5_CONNECTION/projects" \
+    | jq -er '[.repos[] | select(.path_with_namespace == "group/repo")] | select(length == 1) | .[0].id')"
+  m5_uuid "$M5_REPO" || fail "manual intake: projects returned no repo UUID"
+  [ "$(db_psql "SELECT count(*) FROM repos WHERE id='$M5_REPO' AND connection_id='$M5_CONNECTION'")" = 1 ] \
+    || fail "manual intake: repo connection mismatch"
+  apiput "/api/repos/$M5_REPO" '{"enabled":true}' | jq -e --arg id "$M5_REPO" \
+    '.repo.id == $id and .repo.enabled == true' >/dev/null || fail "manual intake: repo enable failed"
+  M5_CREDENTIAL="sk-ant-""e2e-manual-$M5_FIXTURE"
+  M5_SECRET="$(printf '{"token":"%s","label":"manual-intake"}' "$M5_CREDENTIAL" \
+    | curl -fsS -b "$JAR" -X POST "$BASE/api/me/secrets/anthropic_token" \
+      -H 'Content-Type: application/json' -H "X-CSRF-Token: $(csrf)" --data-binary @- | jq -er '.secret.id')"
+  m5_uuid "$M5_SECRET" || fail "manual intake: encrypted secret creation failed"
+  [ "$(db_psql "SELECT count(*) FROM user_secrets WHERE id='$M5_SECRET' AND user_id='$M5_OWNER'
+    AND kind='anthropic_token' AND sealed_with='dek' AND octet_length(ciphertext)>0")" = 1 ] \
+    || fail "manual intake: secret was not encrypted for the new owner"
+  UZI_TOKEN_VAL="$(apipost /api/me/cli-tokens "{\"name\":\"manual-$M5_FIXTURE\"}" | jq -er '.token')"
+  [[ "$UZI_TOKEN_VAL" == uzc_* ]] || fail "manual intake: owner CLI token missing"
+
+  M5_CREATED="$(apipost /api/workers "{\"name\":\"manual-$M5_FIXTURE\"}")"
+  M5_WORKER="$(printf '%s' "$M5_CREATED" | jq -er '.worker.id')"
+  m5_uuid "$M5_WORKER" || fail "manual intake: persistent worker UUID missing"
+  M5_JOIN="$(printf '%s' "$M5_CREATED" | jq -er '.token')"
+  [[ "$M5_JOIN" == uzw_* ]] || fail "manual intake: worker join token missing"
+  [ "$(db_psql "SELECT count(*) FROM workers WHERE id='$M5_WORKER' AND user_id='$M5_OWNER' AND NOT ephemeral")" = 1 ] \
+    || fail "manual intake: persistent worker ownership mismatch"
+  curl -fsS -X POST "$BASE/api/worker/register" -H "Authorization: Bearer $M5_JOIN" \
+    -H 'Content-Type: application/json' \
+    -d "{\"name\":\"manual-$M5_FIXTURE\",\"version\":\"0.0.0-e2e\",\"protocol_capabilities\":[\"completion_interlock_v1\"]}" >/dev/null
+  m5_heartbeat() {
+    curl -fsS --max-time 10 -X POST "$BASE/api/worker/heartbeat" -H "Authorization: Bearer $M5_JOIN" \
+      -H 'Content-Type: application/json' -d '{}' >/dev/null
+  }
+  m5_heartbeat
+  m5_worker() {
+    apiget /api/workers | jq -ec --arg id "$M5_WORKER" '[.workers[] | select(.id == $id)] | select(length == 1) | .[0]'
+  }
+  m5_worker | jq -e '.status == "online" and .ephemeral == false and .manual_cordoned_at == null
+    and .manual_cordoned_by == null and .manual_cordoned_by_label == null and .manual_cordon_reason == null' >/dev/null \
+    || fail "manual intake: new worker was not online and manually clear"
+
+  # Public CreateWorker has no ephemeral flag. Seed only this freshly API-created
+  # worker as ephemeral, as manual_cordon_livedb_test.go does; never fake affinity.
+  M5_EPHEMERAL="$(apipost /api/workers "{\"name\":\"ephemeral-$M5_FIXTURE\"}" | jq -er '.worker.id')"
+  m5_uuid "$M5_EPHEMERAL" || fail "manual intake: ephemeral fixture UUID missing"
+  [ "$(db_psql "UPDATE workers SET ephemeral=true WHERE id='$M5_EPHEMERAL' AND user_id='$M5_OWNER'
+    AND NOT ephemeral RETURNING id")" = "$M5_EPHEMERAL" ] || fail "manual intake: ephemeral seed owner mismatch"
+  m5_ephemeral_snapshot() {
+    db_psql "SELECT jsonb_build_object(
+      'tuple',jsonb_build_array(manual_cordoned_at,manual_cordoned_by,manual_cordoned_by_label,manual_cordon_reason),
+      'events',(SELECT COALESCE(jsonb_agg(to_jsonb(e) ORDER BY e.occurred_at,e.id),'[]'::jsonb)
+        FROM worker_cordon_events e WHERE e.worker_id=w.id))::text
+      FROM workers w WHERE id='$M5_EPHEMERAL' AND user_id='$M5_OWNER'"
+  }
+  M5_EPHEMERAL_BEFORE="$(m5_ephemeral_snapshot)"
+  [ -n "$M5_EPHEMERAL_BEFORE" ] || fail "manual intake: missing ephemeral snapshot"
+  for M5_METHOD in POST DELETE; do
+    M5_REJECTION="$(curl -sS -w $'\n%{http_code}' -b "$JAR" -X "$M5_METHOD" \
+      "$BASE/api/workers/$M5_EPHEMERAL/cordon" -H 'Content-Type: application/json' \
+      -H "X-CSRF-Token: $(csrf)" -d '{}')"
+    [ "${M5_REJECTION##*$'\n'}" = 409 ] || fail "manual intake: ephemeral $M5_METHOD did not return 409"
+    printf '%s' "${M5_REJECTION%$'\n'*}" | jq -e \
+      '.error == "manual cordon is only supported for persistent workers"' >/dev/null \
+      || fail "manual intake: ephemeral conflict reason mismatch"
+    [ "$(m5_ephemeral_snapshot)" = "$M5_EPHEMERAL_BEFORE" ] \
+      || fail "manual intake: ephemeral rejection changed manual tuple or audit events"
+  done
+  # Remove the unsuitable peer before health classification, leaving exactly one
+  # persistent peer for this owner. No shared worker lifecycle is changed here.
+  [ "$(db_psql "DELETE FROM workers WHERE id='$M5_EPHEMERAL' AND user_id='$M5_OWNER' AND ephemeral RETURNING id")" = "$M5_EPHEMERAL" ] \
+    || fail "manual intake: ephemeral cleanup failed"
+  M5_EPHEMERAL=""
+  [ "$(db_psql "SELECT count(*) FROM workers WHERE user_id='$M5_OWNER'")" = 1 ] \
+    || fail "manual intake: expected only the owned persistent worker"
+
+  M5_HELD="$(uzi_cli worker cordon "$M5_WORKER" --reason "$M5_REASON" --json)"
+  printf '%s' "$M5_HELD" | jq -e --arg id "$M5_WORKER" --arg actor "$M5_OWNER" \
+    --arg label "$M5_LABEL" --arg reason "$M5_REASON" '.id == $id and .effective_cordoned == true
+      and (.manual_cordoned_at | type == "string") and .manual_cordoned_by == $actor
+      and .manual_cordoned_by_label == $label and .manual_cordon_reason == $reason' >/dev/null \
+    || fail "manual intake: CLI cordon metadata mismatch"
+  M5_AT="$(printf '%s' "$M5_HELD" | jq -er '.manual_cordoned_at')"
+  # Compare the manual contract only: activity/heartbeat fields can change between
+  # reads. CLI emits WorkerDTO directly; API mutation responses wrap .worker.
+  m5_manual_tuple() {
+    jq -Sc '{id,manual_cordoned_at,manual_cordoned_by,manual_cordoned_by_label,manual_cordon_reason,effective_cordoned}'
+  }
+  M5_FIRST="$(printf '%s' "$M5_HELD" | m5_manual_tuple)"
+  M5_NOOP="$(apipost "/api/workers/$M5_WORKER/cordon" '{"reason":"must not replace first attributes"}' | jq -ec '.worker')"
+  [ "$(printf '%s' "$M5_NOOP" | m5_manual_tuple)" = "$M5_FIRST" ] \
+    || fail "manual intake: repeat cordon overwrote first attributes or API/CLI JSON diverged"
+  [ "$(m5_worker | m5_manual_tuple)" = "$M5_FIRST" ] || fail "manual intake: owner list metadata differs"
+
+  M5_IID="$(apipost "/api/repos/$M5_REPO/issues" \
+    "{\"title\":\"E2E manual $M5_FIXTURE\",\"description\":\"implements prds/4-agent-runtime-workers.md\"}" | jq -er '.card.iid')"
+  [[ "$M5_IID" =~ ^[0-9]+$ ]] || fail "manual intake: issue creation failed"
+  M5_RUN="$(create_run "$M5_REPO" "$M5_IID")"
+  m5_uuid "$M5_RUN" || fail "manual intake: queued run UUID missing"
+  M5_RUNS+=("$M5_RUN")
+  [ "$(db_psql "SELECT count(*) FROM runs WHERE id='$M5_RUN' AND user_id='$M5_OWNER'
+    AND repo_id='$M5_REPO' AND worker_id IS NULL AND status='queued'")" = 1 ] \
+    || fail "manual intake: run was not an owned unassigned queued run"
+  m5_heartbeat
+  # Claim bodies contain decrypted credentials: shell variables + builtin printf
+  # only, never disk, external-command argv, or failure dumps.
+  M5_RAW="$(curl -sS --max-time 10 -w $'\n%{http_code}' -X POST "$BASE/api/worker/runs/claim" -H "Authorization: Bearer $M5_JOIN")"
+  [ "${M5_RAW##*$'\n'}" = 204 ] || fail "manual intake: cordoned worker admitted new intake"
+  M5_DEADLINE=$((SECONDS + 90))
+  M5_HEALTH_OK=0
+  # Check a 90-second deadline between iterations, with each of the two HTTP
+  # calls capped at ten seconds (at most 20 seconds in flight past the deadline).
+  # An HTTP failure aborts immediately; no sibling work is hidden by this poll.
+  while [ "$SECONDS" -lt "$M5_DEADLINE" ]; do
+    m5_heartbeat
+    M5_RUN_DTO="$(curl -fsS --max-time 10 -b "$JAR" "$BASE/api/runs/$M5_RUN")"
+    printf '%s' "$M5_RUN_DTO" | jq -e --arg id "$M5_RUN" \
+      '.run.id == $id and .run.worker_id == null and .run.status == "queued"' >/dev/null \
+      || fail "manual intake: blocked run changed assignment or status"
+    if printf '%s' "$M5_RUN_DTO" | jq -e --arg actor "$M5_OWNER" --arg label "$M5_LABEL" --arg reason "$M5_REASON" --arg at "${M5_AT:0:19}" \
+      '.run.health_reason // "" | startswith("waiting for workers cordoned (manual):")
+        and contains($actor) and contains($label) and contains($reason) and contains($at)' >/dev/null; then
+      M5_HEALTH_OK=1
+      break
+    fi
+    sleep 2
+  done
+  [ "$M5_HEALTH_OK" = 1 ] || fail "manual intake: RunDTO never reported attributed manual-cordon health"
+  # Clear only the exact fixture's hold. A changed identity is never adopted.
+  [ "$(m5_worker | m5_manual_tuple)" = "$M5_FIRST" ] || fail "manual intake: hold identity changed before uncordon"
+  M5_CLEARED="$(uzi_cli worker uncordon "$M5_WORKER" --json)"
+  printf '%s' "$M5_CLEARED" | jq -e --arg id "$M5_WORKER" '.id == $id and .manual_cordoned_at == null
+    and .manual_cordoned_by == null and .manual_cordoned_by_label == null
+    and .manual_cordon_reason == null and .effective_cordoned == false' >/dev/null \
+    || fail "manual intake: explicit uncordon did not clear only manual metadata"
+  m5_worker | jq -e '.manual_cordoned_at == null and .manual_cordoned_by == null
+    and .manual_cordoned_by_label == null and .manual_cordon_reason == null' >/dev/null \
+    || fail "manual intake: cleared metadata did not persist"
+  # Positive control on the SAME unrelated new intake, after the health evidence:
+  # the earlier 204 must not merely reflect an ineligible credential/repo fixture.
+  for _ in 1 2 3 4 5 6; do
+    m5_heartbeat
+    M5_RAW="$(curl -sS --max-time 10 -w $'\n%{http_code}' -X POST "$BASE/api/worker/runs/claim" -H "Authorization: Bearer $M5_JOIN")"
+    M5_CODE="${M5_RAW##*$'\n'}"
+    case "$M5_CODE" in
+      200) break ;;
+      204) sleep 1 ;;
+      *) fail "manual intake: positive claim returned HTTP $M5_CODE" ;;
+    esac
+  done
+  [ "$M5_CODE" = 200 ] || fail "manual intake: uncordoned fixture remained ineligible after six attempts"
+  printf '%s' "${M5_RAW%$'\n'*}" | jq -e --arg run "$M5_RUN" \
+    '.run_id == $run and (.secrets.anthropic_oauth_token | type == "string" and length > 0)' >/dev/null \
+    || fail "manual intake: positive claim identity or credential missing"
+  M5_DELIVERED="$(printf '%s' "${M5_RAW%$'\n'*}" | jq -er '.secrets.anthropic_oauth_token')"
+  [ "$M5_DELIVERED" = "$M5_CREDENTIAL" ] || fail "manual intake: positive claim delivered the wrong owner credential"
+  [ "$(db_psql "SELECT count(*) FROM runs WHERE id='$M5_RUN' AND user_id='$M5_OWNER'
+    AND repo_id='$M5_REPO' AND worker_id='$M5_WORKER' AND status='claimed'")" = 1 ] \
+    || fail "manual intake: positive claim did not assign the exact owned run"
+  # Like binding cleanup above, terminalize this owned synthetic claim before
+  # deleting workers or their owner; no poller exists to consume cancellation.
+  m5_cleanup || fail "manual intake: success cleanup failed"
+  trap - EXIT
+  pass "isolated owner: manual metadata/noop/JSON, ephemeral 409, new-intake 204, attributed health and positive uncordoned claim"
+)
