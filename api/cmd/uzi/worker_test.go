@@ -418,9 +418,11 @@ func TestWorkerRmActiveRunsEmptyListStillExplains(t *testing.T) {
 // TestWorkerRmActiveRunsSanitizesTitle: a run title is untrusted text, so control bytes
 // must not reach the terminal, and an empty title falls back to the short id.
 func TestWorkerRmActiveRunsSanitizesTitle(t *testing.T) {
-	fc := &uzicli.FakeClient{Err: activeRunsErr(2,
+	fc := &uzicli.FakeClient{Err: activeRunsErr(3,
 		uzicli.WorkerActiveRun{ID: "11111111-aaaa-bbbb-cccc-dddddddddddd", Kind: "issue", Status: "queued", Title: "\x1b[31mevil\x07"},
 		uzicli.WorkerActiveRun{ID: "22222222-aaaa-bbbb-cccc-dddddddddddd", Kind: "chat", Status: "running", Title: ""},
+		// A hostile id: the id column and the empty-title fallback both pass through cellText.
+		uzicli.WorkerActiveRun{ID: "\x1b[2J33-aaaa", Kind: "chat", Status: "running", Title: ""},
 	)}
 	_, errb, code := runCLI(t, fakeEnv(fc), "worker", "rm", "w1")
 	if code != uzicli.ExitConflict {

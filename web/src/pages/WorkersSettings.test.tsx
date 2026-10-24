@@ -943,6 +943,29 @@ describe("WorkersSettings hosted delete confirms; external delete does not (PRD 
       expect(screen.queryByRole("list", { name: LIST })).toBeNull();
     });
 
+    it("clears the list when a token rebind fails afterwards", async () => {
+      mockApi.listWorkers.mockResolvedValue({ workers: [externalW] });
+      mockApi.listSecrets.mockResolvedValue({
+        secrets: [aSecret(), aSecret({ id: "sec-console", label: "console-key", is_default: false, auto_eligible: true })],
+      });
+      mockApi.deleteWorker.mockRejectedValue(
+        new ApiError(409, MSG, {
+          error: MSG,
+          active_runs: [{ id: "r-1", kind: "issue", status: "queued", issue_iid: 7, title: "Fix login" }],
+          active_runs_total: 1,
+        }),
+      );
+      mockApi.setWorkerBindMode.mockRejectedValue(new ApiError(500, "rebind exploded", { error: "rebind exploded" }));
+      renderPage();
+      fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+      expect(await screen.findByRole("list", { name: LIST })).toBeTruthy();
+
+      fireEvent.change(await screen.findByLabelText("Anthropic token for laptop"), { target: { value: "console-key" } });
+
+      expect(await screen.findByText("rebind exploded")).toBeTruthy();
+      expect(screen.queryByRole("list", { name: LIST })).toBeNull();
+    });
+
     it("clears the list when a retried delete succeeds", async () => {
       mockApi.listWorkers.mockResolvedValue({ workers: [externalW] });
       mockApi.deleteWorker
