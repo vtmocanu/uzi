@@ -71,6 +71,7 @@ func TestTaskCheckpointReviewCompletionLiveDB(t *testing.T) {
 				State: "completed", ClaimGeneration: &b.ClaimGeneration,
 			})
 			if !enrolled {
+				// Known bug #3393: unenrolled task review completion is refused; flip this when #3393 lands.
 				// Legacy task completion still attempts NULL, which runs_kind_shape
 				// refuses. This fix must not change that separate existing behavior.
 				var pgErr *pgconn.PgError
