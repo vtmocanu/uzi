@@ -901,6 +901,66 @@ describe("WorkersSettings hosted delete confirms; external delete does not (PRD 
       expect(screen.getByRole("link", { name: "Idle chat" }).getAttribute("href")).toBe("/chat/c-1");
       expect(screen.getByRole("link", { name: "Fix login" }).getAttribute("href")).toBe("/runs/r-1");
       expect(screen.getByText("and 1 more")).toBeTruthy();
+      expect(screen.getByText("(chat, running)")).toBeTruthy();
+      expect(screen.getByText("(issue, queued)")).toBeTruthy();
+    });
+
+    it("does not list runs for a non-409 error even when the body carries active_runs", async () => {
+      mockApi.listWorkers.mockResolvedValue({ workers: [externalW] });
+      mockApi.deleteWorker.mockRejectedValue(
+        new ApiError(500, "boom", {
+          error: "boom",
+          active_runs: [{ id: "r-1", kind: "issue", status: "queued", issue_iid: 7, title: "Fix login" }],
+          active_runs_total: 1,
+        }),
+      );
+      renderPage();
+      fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+
+      expect(await screen.findByText("boom")).toBeTruthy();
+      expect(screen.queryByRole("list", { name: LIST })).toBeNull();
+    });
+
+    it("clears the list when a different action fails afterwards", async () => {
+      mockApi.listWorkers.mockResolvedValue({ workers: [externalW] });
+      mockApi.deleteWorker.mockRejectedValue(
+        new ApiError(409, MSG, {
+          error: MSG,
+          active_runs: [{ id: "r-1", kind: "issue", status: "queued", issue_iid: 7, title: "Fix login" }],
+          active_runs_total: 1,
+        }),
+      );
+      mockApi.createWorker.mockRejectedValue(new ApiError(500, "create exploded", { error: "create exploded" }));
+      renderPage();
+      fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+      expect(await screen.findByRole("list", { name: LIST })).toBeTruthy();
+
+      openAddTab();
+      fireEvent.change(screen.getByPlaceholderText(/laptop, ci-runner-1/), { target: { value: "nas" } });
+      fireEvent.click(screen.getByRole("button", { name: "Generate join token" }));
+
+      expect(await screen.findByText("create exploded")).toBeTruthy();
+      expect(screen.queryByRole("list", { name: LIST })).toBeNull();
+    });
+
+    it("clears the list when a retried delete succeeds", async () => {
+      mockApi.listWorkers.mockResolvedValue({ workers: [externalW] });
+      mockApi.deleteWorker
+        .mockRejectedValueOnce(
+          new ApiError(409, MSG, {
+            error: MSG,
+            active_runs: [{ id: "r-1", kind: "issue", status: "queued", issue_iid: 7, title: "Fix login" }],
+            active_runs_total: 1,
+          }),
+        )
+        .mockResolvedValueOnce(null);
+      renderPage();
+      fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+      expect(await screen.findByRole("list", { name: LIST })).toBeTruthy();
+
+      fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+      await waitFor(() => expect(mockApi.deleteWorker).toHaveBeenCalledTimes(2));
+      await waitFor(() => expect(screen.queryByRole("list", { name: LIST })).toBeNull());
     });
 
     it("shows the overflow line for an empty list with a positive total", async () => {
