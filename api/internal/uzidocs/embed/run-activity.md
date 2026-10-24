@@ -847,10 +847,26 @@ proof retains the source, session and inventory without inventing success or an 
 Cancellation, fencing and shutdown revocation grant no fallback; ordinary Codex
 capture stops after shutdown revokes authority. The typed #3109 graceful checkpoint
 path stays separate. Codex recovery parks skip the later post-scope clone diagnostic;
-Claude and terminal/stale paths keep their prior behavior. Terminal disposal does
-not close C's snapshot/late-writer gap: strengthened terminal proof remains unshipped.
-Docker writer exclusion, accepted-but-invisible creates (#1860) and Claude terminal
-residuals also remain open. See
+Claude and stale paths keep their prior behavior. Subsequent C defers Codex
+release-dependent coverage until exact executor/facade disposal. Skipped,
+incomplete or swapped proof retains clone, journal, inventory and paired skills,
+logging `codex terminal disposal unproven; retaining runner clone`.
+Disposal synchronously and irrevocably closes admission; open/closing entry,
+pending launches/callbacks, unmatched poison, late admission or unclean cleanup
+stays incomplete. Its exact revocable witness is checked through retirement,
+using inert hardened reads after disposal. Settlement inside A/B defers the
+request without normal/free safety-queue reacquisition.
+
+Current-process completion sources bind exact executor/facade in memory before
+durable bind. KnownCodex missing/non-disposed/swapped proof retains before
+inventory and never falls back to legacy inspection. KnownClaude is unchanged.
+Owner decision 2026-10-24 narrows R1857-02(e): **persisted completion sources without reliable provenance**
+keep today's behavior for both harnesses, without prior-process topology proof or
+durable format changes. C strengthens registered processes; unregistered/sibling
+writers, Docker accepted-but-invisible creates (#1860) and Claude terminal residuals
+remain. Per-attempt cgroups (#1862) remain unshipped, automatic reclaim stays
+disabled (#1858), and custody SETTLE remains separate from physical CLEANUP
+(#2746). This does not complete #2852. (AI-synced 2026-10-24) See
 [ADR-1783's A/B contract](../adr/1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect)
 for the original 180-second episode, 120-second healthy phase and 60-second fallback
 reserve, shared with parent deadlines, retries and joined cleanup. (AI-synced 2026-10-23)

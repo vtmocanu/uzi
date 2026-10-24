@@ -489,9 +489,30 @@ private authenticated capability is bound to its exact flight/executor and callb
 lifetime; Git children use the existing supervisor and await full cleanup. A's
 credential-free fallback starts only after the primary scope joins, within the
 same deadline. Unexpected Codex credential-switch entries retain without capture.
-Claude behavior and terminal disposal remain unchanged. The linked
+B left Claude behavior and terminal disposal unchanged; subsequent C strengthens
+terminal disposal as described below. The linked
 [sink contract](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect)
-records the budget, held-finalize continuation, publication and remaining C/Docker limits.
+records the budget, held-finalize continuation, publication and remaining writer limits.
+
+**Subsequent slice C contract, Refs #2852 (AI-synced 2026-10-24):**
+`tablesCleared` synchronously and irrevocably closes admission at disposal entry.
+`disposeTools` is single-flight; open/closing entry, pending launches/callbacks,
+unmatched poison, late roots/admission faults or unclean cleanup stays incomplete.
+The exact disposal result is revocable, bound to registry facts and successful
+facade cleanup; cleared tables or an optional killAgentTree call are not proof.
+Release-dependent coverage waits for disposal of the exact executor/facade.
+Skipped/incomplete/swapped proof retains clone, journal, inventory and paired skills
+with a distinct terminal-disposal diagnostic. A/B handler settlement defers this
+request without reacquiring either safety queue. Post-disposal source reads are
+inert and hardened; witness checks continue through destructive dispatches.
+Current-process completion bindings record exact executor/facade in memory before
+durable bind; knownCodex missing/non-disposed/swapped proof retains before inventory,
+with no legacy fallback. KnownClaude is unchanged. Owner decision 2026-10-24
+narrows R1857-02(e): persisted/unknown-provenance sources keep today's behavior for
+both harnesses, without prior-process topology proof or durable format changes.
+This is registered-process strengthening; Docker accepted invisible creates (#1860),
+unregistered/sibling writers and Claude terminal residuals remain. The canonical
+sink contract records the unchanged retention and ownership boundaries.
 
 Pre-start capture uses the existing capture-only facade. A later owned capture can
 also select a fresh production capture-only facade for the exact retired public

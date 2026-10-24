@@ -316,6 +316,9 @@ authority. See [ADR-1597's residual boundaries](1597-midturn-checkpoint-durabili
   capture boundary. B's authenticated context instead carries the existing permit
   under private exact-flight/executor/safety identity and callback lifetime checks;
   a structural lookalike or an error field grants no authority (AI-synced 2026-10-23).
+  Subsequent C consumes an exact revocable disposal witness for release-dependent
+  terminal checks; it neither reuses A/B callback authority after unwind nor
+  reacquires either safety queue (AI-synced 2026-10-24).
   [ADR-1106](1106-codex-harness.md#process-root-ownership)
   records the canonical empty helper/askpass launch policy and separate
   credential-presence check for the trusted worker identity `worker_pat`.
@@ -483,19 +486,59 @@ authority. See [ADR-1597's residual boundaries](1597-midturn-checkpoint-durabili
   Claude behavior is unchanged. Codex recovery-park
   cleanup skips its post-scope clone diagnostic at the original cleanup site, after
   the original guards, preserving sourceExitDenied and retention latches. Claude
-  and terminal reasons retain their prior paths.
+  and stale reasons retain their prior paths; subsequent C defers release-capable
+  Codex terminal checks as specified below.
 
-  Terminal paths already have executor disposal; B changes neither disposeTools
-  nor slice C's still-unshipped strengthened terminal proof. Snapshot coverage
-  before writer-exclusion proof remains a gap. `CodexExecutor` has no killAgentTree
-  implementation, so the direct optional call is not Codex process proof. Neither
-  A nor B proves Docker writer exclusion: accepted-but-invisible daemon creates
-  (#1860), daemon/sibling writers and Claude residuals remain.
+  **Subsequent slice C contract, Refs #2852 (AI-synced 2026-10-24):**
+  `disposeTools` synchronously and irrevocably closes admission with
+  `tablesCleared` before yielding. Concurrent and repeated callers join one stored
+  disposal attempt; cleared tables cannot turn a failed attempt into success.
+  Entry while open or closing, pending launches or callbacks, an active capture
+  lane, unreaped roots, unmatched poison, late roots/admission faults or unclean
+  cleanup produces `incomplete`. A closed epoch or exact capture-drained epoch
+  can qualify, including the unchanged completed-capture witness after intentional
+  poison; that terminal use grants no in-run continuation.
+  The exact result object is a revocable disposal witness, bound to registry,
+  poison revision, root count and launch/callback cursors, reaped/disposed roots
+  and successful facade cleanup. Later uncertainty or admission faults revoke it.
+  See [registry disposal](../agent/src/codex/registry.ts) and
+  [facade acceptance](../agent/src/codex/safety.ts).
+
+  Release-capable Codex handler settlement inside A/B records a deferred request;
+  it does no coverage read, process scan or normal/free safety-queue reacquisition.
+  Outer terminal cleanup consumes it after disposal of the exact executor/facade.
+  Skipped, incomplete, rejected or swapped proof retains clone, journal, inventory
+  and paired skills, with the distinct diagnostic
+  `codex terminal disposal unproven; retaining runner clone`.
+  Release-dependent coverage uses inert hardened reads after disposal, with bounded
+  nofollow inventory and marked no-transport Git inspection. The live witness is
+  rechecked across awaits, bare-lock waits and destructive dispatches, including
+  skills deletion. Existing independent preservation, custody, receipts, memory
+  settlement, cancellation, fencing, quarantine and Docker checks can still veto;
+  `sourceExitDenied` stays sticky. A supplies no structural completion permit;
+  C's exact witness is a deny-only prerequisite, not general deletion authority.
+
+  Current-process completion sources record the exact flight/executor/facade and
+  source identity in memory before awaiting durable bind, including partial or
+  failed binds. A `knownCodex` source with missing, non-disposed, changed or
+  swapped proof retains before the first inventory read and never falls back to
+  legacy inspection. Registered same-executor/facade HEAD/root advancement remains
+  allowed; conflicting provenance cannot replace an older binding. Bindings are
+  forgotten after confirmed completion-source cleanup, with no matching pending
+  binder. KnownClaude is unchanged. Owner decision 2026-10-24 narrows R1857-02(e):
+  persisted/unknown-provenance sources retain today's behavior for both harnesses.
+  No prior-process topology proof or durable format change is supplied.
+
+  `CodexExecutor` has no killAgentTree implementation; that optional call is not
+  Codex proof. C strengthens registered-process exclusion, not daemon or sibling
+  exclusion. Accepted-but-invisible Docker creates (#1860), unregistered writers
+  and Claude terminal residuals remain.
 
   A accounts for **R1857-01 and the credential-free half of R1857-05**, using
   shared R1857-07/08 controls. B covers R1857-03/-04, the credentialed half of
   R1857-05, R1857-06 by Codex unreachability plus worker refusal, and its R1857-07/08
-  controls. A plus B does not complete #2852 or claim C's R1857-02 coverage.
+  controls. C implements the registered-process portion of R1857-02 within the
+  owner-narrowed provenance boundary; A/B/C do not complete #2852.
   Per-attempt cgroups (#1862) remain unshipped, not an available proof. #1858
   still forbids automatic retention reclaim. Preservation authority is not
   deletion authority: #2746's custody SETTLE and physical CLEANUP stay separate.
@@ -542,8 +585,9 @@ Process proof remains limited to the boundary that actually runs: the Linux
 reaper where enabled, the existing credentialed Codex supervisor boundary, or
 A's callback-held credential-free GitCache capture or B's whole-region healthy
 Codex capture (contracts above). B closes the healthy pre-publish process gap
-through source-dependent settlement; C's terminal release proof remains unchanged
-and unshipped (AI-synced 2026-10-23). Claude/stub process handling is unchanged.
+through source-dependent settlement. Subsequent C defers Codex release-dependent
+coverage until exact executor/facade disposal and revalidates its revocable witness
+through retirement (AI-synced 2026-10-24). Claude/stub process handling is unchanged.
 This says nothing about a Docker
 container — the Docker teardown that runs alongside it is best-effort cleanup,
 not proof, so a container that still binds the clone path can, in principle,
@@ -619,8 +663,9 @@ ssh-agent an unrelated tool started, not necessarily this run's own — is a
 covers. Canonical reseed and predecessor/orphan capture run `seed`/`capture`
 mode, which scans regardless of executor. Claude and stub `own` mode sites
 also scan. Codex `own` mode sites skip the process scan and use their own
-supervisor boundary at credentialed sinks; the remaining Codex terminal gap is
-described in the Invariants section (AI-synced 2026-10-23). Under the revised decision below, only
+supervisor boundary at credentialed sinks and C's exact disposal witness at
+release-dependent terminal sinks; the remaining provenance and writer limits are
+described in the Invariants section (AI-synced 2026-10-24). Under the revised decision below, only
 concurrent-claim and single-uid cases can still lock out these scanning sites
 solely because of an unattributed unreadable process. The fresh-attempt seed
 exception remains because seeding a fresh path moves or frees nothing.
@@ -814,10 +859,10 @@ The original follow-ups are recorded below with their later disposition where kn
   #1860 separately owns daemon mediation. The unchanged `beforeFree` /
   `freeCanonicalClonePath` and quarantine flow still has a **process-proof /
   daemon pending-create residual**: a create already accepted by the daemon can
-  complete after the process proof and clean listings. #2852's terminal/Docker
-  writer-exclusion remainder is not fixed. Currently unwired status is not durable
-  proof that a path was never exposed to a daemon.
-- **Follow-up 4 — #2852 remains partial after slices A and B (AI-synced 2026-10-23).** A holds owner
+  complete after the process proof and clean listings. C's registered-process
+  strengthening does not fix #2852's Docker/unregistered-writer remainder.
+  Currently unwired status is not durable proof of no prior daemon exposure.
+- **Follow-up 4 — #2852 remains partial after slices A/B/C (AI-synced 2026-10-24).** A holds owner
   pause and credential-free recovery, memory-pressure and retained-source capture
   through supervised-child settlement, including the narrow lane of an intentionally
   poisoned, successfully settled registry. It restores neither normal admission
@@ -830,15 +875,21 @@ The original follow-ups are recorded below with their later disposition where kn
   error conversion. Vault lock on recreation takes credential deferral (AI-synced 2026-10-22).
   B now holds healthy Codex wall/hold/ordinary-recovery capture through source-dependent
   settlement, with joined A fallback under the original episode deadline; Codex switch
-  entries retain/refuse early. Slice C's strengthened terminal proof remains unshipped.
+  entries retain/refuse early. Subsequent C strengthens registered-process terminal
+  release: coverage follows exact executor/facade disposal under a revocable witness;
+  skipped/incomplete/swapped proof retains the source and paired skills.
   Existing credentialed permits remain required at their sinks; B carries the permit
   under private callback identity/lifetime checks, while A supplies no structural
   completion permit. The invariant above records fallback and finalize-continuation limits.
   Owned summary/setup/auth cleanup remains joined after authority or delivery expiry,
   with independent cleanup faults refusing capture and credential continuation.
-  Existing terminal executor disposal does
-  not close the gap between snapshot coverage and writer-exclusion proof. A provides no daemon mediation,
-  per-attempt cgroup proof or safe automatic retention reclaim; neither does B.
+  Owner decision 2026-10-24 narrows R1857-02(e) to positively bound current-process
+  Codex completion sources. The residual is **persisted completion sources without reliable provenance**:
+  both harnesses keep today's behavior there, with no prior-process topology proof
+  or durable format change. KnownClaude stays unchanged; knownCodex cannot fall
+  back to legacy inspection when its exact proof fails. C supplies no daemon
+  mediation, unregistered/sibling-writer exclusion, Claude terminal proof,
+  per-attempt cgroup proof or safe automatic retention reclaim.
   Refusal/capacity rates remain unknown and retained bytes can grow. Retention and
   capacity pressure confer no deletion authority. Refs #2852.
 - **Follow-up 5 — a per-attempt cgroup v2 boundary.** Proper per-run process
@@ -1073,7 +1124,8 @@ grow with inventory; no cap skips safety checks.
 Normal cleanup, `beforeFree` / `freeCanonicalClonePath`, quarantine, capture and
 operator discard contracts remain unchanged. The process-proof / daemon
 pending-create residual remains; #1860 is separate daemon mediation, and #2852's
-terminal/Docker writer-exclusion remainder is not fixed. This delivers no proxy,
+Docker and unregistered-writer remainder is not fixed by C's registered-process
+strengthening. This delivers no proxy,
 marker, ledger, API, schema, configuration flag or new infrastructure.
 
 Attributed attempts and paired skills may use the existing guarded
