@@ -447,7 +447,11 @@ export interface MaterializedCase { snapshot: string; cleanup(): Promise<void> }
 
 /** The uid layout the replay creates directories for. `split`/`gid` are injectable so unit tests can
  * exercise the split modes with a group the test process belongs to; production uses the defaults. */
-export interface ReplayUidLayout { split: boolean; gid: number }
+export interface ReplayUidLayout {
+  split: boolean; gid: number;
+  /** Test-only observer, awaited just before each snapshot entry's owner/mode change. */
+  onShare?: (entry: string) => void | Promise<void>;
+}
 const defaultReplayLayout = (): ReplayUidLayout => ({ split: uidSplitActive(), gid: RUNNER_UID });
 
 /** Set the group and the exact mode through an O_NOFOLLOW directory handle (never a path-following chown). */
@@ -474,10 +478,15 @@ export async function createReplayRunDir(root: string, layout: ReplayUidLayout =
 }
 
 /** Group-share one snapshot entry through an O_NOFOLLOW handle whose identity matches the lstat that
- * typed it, then recurse into directories. Symlinks are skipped (never followed or mutated); any type
- * other than file or directory is refused. Directories become 2750; files keep their owner bits and gain
- * group read (and group execute where the owner has it), never group write, and lose every other bit. */
-async function shareSnapshotEntry(entry: string, typed: Stats, gid: number): Promise<void> {
+ * typed it. Symlinks are skipped (never followed or mutated); any type other than file or directory is
+ * refused. Directories become 2750; files keep their owner bits and gain group read (and group execute
+ * where the owner has it), never group write, and lose every other bit.
+ *
+ * The walk is post-order: a directory's children are narrowed first (the worker owner's rwx is enough to
+ * read the directory), and only then is the directory itself given to group runner. Under a permissive
+ * umask checkout-index leaves children group-writable, so a pre-order walk would expose group-writable
+ * descendants beneath an already-opened parent. The root is therefore opened last. */
+async function shareSnapshotEntry(entry: string, typed: Stats, layout: ReplayUidLayout): Promise<void> {
   if (typed.isSymbolicLink()) return;
   const isDir = typed.isDirectory();
   if (!isDir && !typed.isFile()) return integrity();
@@ -488,16 +497,18 @@ async function shareSnapshotEntry(entry: string, typed: Stats, gid: number): Pro
   try {
     const st = await handle.stat();
     if (st.dev !== typed.dev || st.ino !== typed.ino || st.isDirectory() !== isDir) return integrity();
+    if (isDir) {
+      for (const name of await fs.readdir(entry)) {
+        const child = path.join(entry, name);
+        await shareSnapshotEntry(child, await fs.lstat(child), layout);
+      }
+    }
     const owner = st.mode & 0o700;
     const mode = isDir ? 0o2750 : owner | ((owner & 0o400) >> 3) | ((owner & 0o100) >> 3);
-    await handle.chown(st.uid, gid);
+    await layout.onShare?.(entry);
+    await handle.chown(st.uid, layout.gid);
     await handle.chmod(mode);
   } finally { await handle.close(); }
-  if (!isDir) return;
-  for (const name of await fs.readdir(entry)) {
-    const child = path.join(entry, name);
-    await shareSnapshotEntry(child, await fs.lstat(child), gid);
-  }
 }
 
 /** An identity that must be able to search every ancestor of the run directory. */
@@ -571,7 +582,7 @@ export async function materializeCase(
       "-m", `code cross-check replay snapshot ${c.id}`], { cwd: dir, env: replayIdentityEnv(), signal });
     const tree = (await replayGit(["rev-parse", "HEAD^{tree}"], { cwd: dir, signal })).toString("utf8").trim();
     if (tree !== c.prefix_tree) return integrity();
-    if (layout.split) await shareSnapshotEntry(dir, await fs.lstat(dir), layout.gid);
+    if (layout.split) await shareSnapshotEntry(dir, await fs.lstat(dir), layout);
     return { snapshot: dir, cleanup };
   } catch (error) {
     await cleanup();

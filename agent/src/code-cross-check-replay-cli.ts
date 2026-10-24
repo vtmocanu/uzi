@@ -201,7 +201,10 @@ export async function runReplayCli(args: string[], deps: ReplayCliDeps): Promise
     for (const name of names) deps.signals.removeListener(name, onSignal);
     // Plain worker removal: rmHomeTree would widen the 2710 run directory to group rwx on residue. Per-case
     // HOMEs (which the runner uids write into) are removed with rmHomeTree inside runReplays.
-    if (scratch) await rmTreeForce(scratch);
+    // A cleanup failure must not replace the command's return code or add a second stdout line.
+    if (scratch) {
+      try { await rmTreeForce(scratch); } catch { deps.writeErr(JSON.stringify({ error: "cleanup_failed" })); }
+    }
   }
 }
 

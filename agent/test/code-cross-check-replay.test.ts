@@ -530,6 +530,37 @@ test("under umask 002 the split snapshot still ends with no group write bit anyw
   } finally { await m.cleanup(); }
 });
 
+test("the split snapshot root stays closed until every descendant is narrowed (umask 002)", async () => {
+  const run = await createReplayRunDir(await fs.mkdtemp(path.join(tc.root, "order-")), split);
+  const calls: string[] = [];
+  const violations: string[] = [];
+  let rootOpenAtFirst: number | undefined;
+  const observed = {
+    ...split,
+    onShare: async (entry: string): Promise<void> => {
+      calls.push(entry);
+      // The only replay-snap-* directory in this fresh run directory is the snapshot root.
+      const name = (await fs.readdir(run)).find((n) => n.startsWith("replay-snap-"))!;
+      const snapshotRoot = path.join(run, name);
+      if (calls.length === 1) rootOpenAtFirst = (await modeOf(snapshotRoot)) & 0o070;
+      if (entry !== snapshotRoot) return;
+      for (const p of await walkAll(snapshotRoot)) {
+        const st = await fs.lstat(p);
+        if (!st.isSymbolicLink() && (st.mode & 0o022) !== 0) violations.push(p);
+      }
+    },
+  };
+  const previous = process.umask(0o002);
+  let m;
+  try { m = await materializeCase(tc.checkout, defect, run, undefined, observed); } finally { process.umask(previous); }
+  const snapshotRoot = m.snapshot;
+  try {
+    assert.equal(calls.at(-1), snapshotRoot, "the root is shared last");
+    assert.equal(rootOpenAtFirst, 0, "root not group-accessible when the walk starts");
+    assert.deepEqual(violations, [], "every descendant is narrowed before the root opens");
+  } finally { await m.cleanup(); }
+});
+
 test("the snapshot walk never follows a tracked symlink to a file outside the snapshot", async () => {
   const outside = await fs.mkdtemp(path.join(tc.root, "outside-"));
   const secret = path.join(outside, "secret.txt");

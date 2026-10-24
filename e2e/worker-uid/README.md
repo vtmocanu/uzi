@@ -98,7 +98,7 @@ An eighth file, `e2e/worker-uid/claude-command-real.test.mts`, contributes twelv
 
 A tenth file, `agent/test/code-cross-check-replay-uid-split.test.ts`, contributes one `INIT_SKIP`-gated leaf for the offline code cross-check replay (issue #3357): the real Codex fileop helper, launched as the command uid, stats and reads a file of the replay snapshot, while uid 10003 and the runner uid are denied (DAC) on the records file (created through the CLI's own helper), on listing the replay run directory, and on the replay-work repository. It calls no provider or model.
 
-The default inventory retains the five old files and adds the retained recovery file, the claude-command-launcher file (its three literal leaves above) and the claude-command-real file (its twelve); `node e2e/worker-uid/inventory.mjs command` emits the separate command
+The default inventory retains the five old files and adds the retained recovery file, the claude-command-launcher file (its three literal leaves above), the claude-command-real file (its twelve), the ninth file `codex-capture-reaper-real` and the tenth file `code-cross-check-replay-uid-split`; `node e2e/worker-uid/inventory.mjs command` emits the separate command
 inventory and `node e2e/worker-uid/inventory.mjs single` the single-uid inventory. `expected.json` / `results.xml`, `command-expected.json` /
 `command-results.xml` and `single-expected.json` / `single-<n>-results.xml` are checked separately. The JUnit
 checker requires each leaf exactly once and
