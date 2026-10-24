@@ -46,7 +46,7 @@ These seams are fixed here so each merged child extends rather than replaces its
 3. **Permit wire (semantic part not delivered).** The request reserves optional audit and finding fields from #1226. Structural permits accept null/empty fields; semantic permits would have required them after #1231.
 4. **Completion transaction.** Permit consumption and `SetRunCompleted` are one service transaction with a generation-activation hook so #1214 (and any reopened #1229) does not replace the terminal seam.
 5. **Hold writer.** `SetRunCompletionHold` positively admits owned `running|awaiting_input` attempts. It is distinct from owner-requested `SetRunPaused`.
-6. **Capture hook.** Park ordering is Git capture/ACK, `captureHoldContext`, hold transition/ACK, then release. #1226 returns `same_worker_only`; #1229 (not planned) would have supplied durable context without reordering the fence.
+6. **Capture hook.** Park ordering (ADR-1225 I6): set the preserve flags, reap the agent tree before any credentialed Git, then `captureHoldContext` (WIP commit, fetch and tracking-ref verification, best-effort publish), then `SetRunCompletionHold` with a literal `paused` ACK, then release. #1226 returns `same_worker_only`; #1229 (not planned) would have supplied durable context without reordering the fence.
 7. **Claim handoff.** Completion contract/attempt/hold metadata is one additive object. Provider context uses a distinct server handoff, never `session_id` as authority.
 8. **Owner decision path.** One `completion_decision` input/endpoint begins with continue in #1226 and gains partial/accept in #1227.
 9. **No-progress routing.** After attempt one, no-progress and budget exhaustion call one completion-hold function; before attempt one, legacy behavior remains.
