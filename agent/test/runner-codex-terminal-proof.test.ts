@@ -182,7 +182,7 @@ for (const [index, mode] of modes.entries()) {
     assert.equal(flight.deferredTerminalRelease, undefined, "request is consumed once");
     if (["healthy", "dirty", "keep-during-coverage", "revoked", "skills-revoked"].includes(mode))
       assert.equal(coveredCalls, 1, "the postdisposal coverage path was exercised");
-    assert.equal(fs.existsSync(tree), mode !== "healthy" && mode !== "skills-revoked", JSON.stringify({ coveredCalls, veto: flight.terminalReleaseOwner?.veto, proof: seam.terminalProcessProof(flight) }));
+    assert.equal(fs.existsSync(tree), mode !== "healthy" && mode !== "skills-revoked", JSON.stringify({ coveredCalls, veto: flight.terminalReleaseOwner?.veto, disposalRecorded: flight.terminalDisposal !== undefined }));
     assert.equal(fs.existsSync(path.join(skillsPluginDir(tree), "proof.marker")), mode !== "healthy", "paired skills obey the live disposal guard");
     if (["rejected", "incomplete", "foreign-result", "swapped-executor", "swapped-facade", "swapped-source", "swapped-generation", "swapped-attempt", "late-cancel"].includes(mode) || mode.startsWith("skipped")) {
       assert.equal(coveredCalls, 0, "invalid disposal cannot reach coverage");
