@@ -100,7 +100,7 @@ describe("owner manual intake controls", () => {
     else cordon();
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toBe(message);
-    expect(document.activeElement).toBe(alert);
+    await waitFor(() => expect(document.activeElement).toBe(alert));
     expect(screen.getByRole("button", { name: isHeld ? "Uncordon target" : "Cordon" })).toBeTruthy();
     if (isHeld) expect(row().textContent).toContain("first reason");
   });
