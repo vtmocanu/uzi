@@ -829,10 +829,14 @@ export async function runReplays(deps: RunReplaysDeps): Promise<ReplayRecord[]> 
           outcome, latency_ms: latency, cost_usd: cost,
           findings: outcome === "completed" ? findings : [],
         };
+        if (invoked && !cleanupConfirmed) {
+          // No further paid call may start while an earlier checker's processes may still be running, and
+          // the stop (which keeps the run directory) must not depend on recording the attempt succeeding.
+          try { await deps.writeRecord(rec); records.push(rec); } catch { /* the stop below still applies */ }
+          throw new ReplayError("cleanup_unconfirmed");
+        }
         await deps.writeRecord(rec);
         records.push(rec);
-        // No further paid call may start while an earlier checker's processes may still be running.
-        if (invoked && !cleanupConfirmed) throw new ReplayError("cleanup_unconfirmed");
       }
     }
   }

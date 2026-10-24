@@ -187,6 +187,32 @@ test("an unconfirmed checker cleanup records the attempt, keeps its snapshot and
   await assert.rejects(replay({ repeats: 2, materialize, checkers: { claude: thrower } }), { message: "cleanup_unconfirmed" });
   assert.equal(thrower.calls.length, 1);
   await Promise.all(thrower.calls.map(([, , h]) => fs.rm(h, { recursive: true, force: true })));
+
+  // An unconfirmed timeout keeps its classified outcome and still stops the replay.
+  const hung = checker((_c, _d, _h, signal) => new Promise<string>((_resolve, reject) => {
+    signal.addEventListener("abort", () => { reject(signal.reason); }, { once: true });
+  }));
+  const timedOut: ReplayRecord[] = [];
+  await assert.rejects(runReplays({
+    checkout: tc.checkout, corpus: { ...corpus, cases: [defect] }, families: ["claude"], model: "haiku", effort: "low",
+    layout: single, repeats: 2, timeoutMs: 20, scratchDir: scratch, env, materialize, checkers: { claude: hung },
+    checkerVersion: { uzi_head: "a".repeat(40), agent_version: "0.0.0-test" },
+    writeRecord: async (r) => { timedOut.push(r); },
+  }), { message: "cleanup_unconfirmed" });
+  assert.equal(hung.calls.length, 1);
+  assert.deepEqual(timedOut.map((r) => r.outcome), ["model_timeout"]);
+  await Promise.all(hung.calls.map(([, , h]) => fs.rm(h, { recursive: true, force: true })));
+
+  // A failing record write (for example ENOSPC) neither hides the stop nor allows a second call.
+  const diskFull = checker(async () => findingsText);
+  await assert.rejects(replay({
+    repeats: 2, materialize, checkers: { claude: diskFull },
+    writeRecord: async () => { throw Object.assign(new Error("no space"), { code: "ENOSPC" }); },
+  }), { message: "cleanup_unconfirmed" });
+  assert.equal(diskFull.calls.length, 1);
+  assert.equal(snapshotCleanups, 0);
+  await fs.access(diskFull.calls[0]![2]);
+  await Promise.all(diskFull.calls.map(([, , h]) => fs.rm(h, { recursive: true, force: true })));
 });
 
 test("cost is a number only when the family reports one", async () => {
