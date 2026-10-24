@@ -1,3 +1,4 @@
+import { configureGoConcurrency } from "../src/go-concurrency.js";
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -399,6 +400,21 @@ describe("buildCheckEnv scrubs worker-impersonation vars (M9)", () => {
     NIX_SSL_CERT_FILE: "/etc/ssl/cert.pem",
     ANTHROPIC_API_KEY: "sk-should-not-be-here-either",
   };
+
+  it("issue #3382: the configured Go concurrency reaches the check env; none when unset", () => {
+    try {
+      configureGoConcurrency({ buildParallelism: 2, maxProcs: 3 });
+      const env = buildCheckEnv(source, "/home/checks", { PATH: "/tools/bin" });
+      assert.equal(env.GOFLAGS, "-p=2");
+      assert.equal(env.GOMAXPROCS, "3");
+      configureGoConcurrency({});
+      const bare = buildCheckEnv(source, "/home/checks", { PATH: "/tools/bin" });
+      assert.equal(Object.hasOwn(bare, "GOFLAGS"), false);
+      assert.equal(Object.hasOwn(bare, "GOMAXPROCS"), false);
+    } finally {
+      configureGoConcurrency({});
+    }
+  });
 
   it("the built env contains NONE of the worker/API/token vars, by construction", () => {
     const env = buildCheckEnv(source, "/home/checks", { PATH: "/tools/bin:/base/bin", NIX_SSL_CERT_FILE: "/etc/ssl/cert.pem" });

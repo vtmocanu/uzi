@@ -65,6 +65,7 @@ import { recordRoot, type RecordedRoot, type StartTimeReader } from "../worker-s
 import path from "node:path";
 import { ATTEMPT_ID_RE, cloneKeyOf } from "../attempt-path.js";
 import type { SdkAttemptEnv } from "../sdk-env.js";
+import { goConcurrencyEnv } from "../go-concurrency.js";
 import { randomUUID } from "node:crypto";
 import { boundedCommandWait, enrollMemoryCommand } from "./memory-command.js";
 import { scopeCapAtBoundary, scopeCapAtDone, scopeSteerAckPayload } from "../scope-cap.js";
@@ -6495,6 +6496,8 @@ export function commandSandboxArgv(
  *     displace or drop the boundary dirs (the fixed prefix always wins on a collision).
  *   - the OTHER allowlisted vars (NIX_SSL_CERT_FILE / LOCALE_ARCHIVE) are folded in.
  *   - an optional startup-resolved Docker host is set after the toolEnv fold.
+ *   - the worker's optional Go concurrency defaults (GOFLAGS=-p=N, GOMAXPROCS=N; issue #3382)
+ *     are set after the fold; absent settings add no key.
  *   - a `toolEnv` entry can NEVER overwrite a boundary literal (PATH/TMPDIR/LANG/HOME) or a
  *     PROTECTED_ENV_KEYS member — {@link COMMAND_ENV_PROTECTED_KEYS} unions both, because
  *     PROTECTED_ENV_KEYS alone omits PATH/TMPDIR/LANG. `commandEffectSpec` later overrides
@@ -6521,6 +6524,8 @@ export function buildCommandEnv(tmpdir: string, toolEnv: Record<string, string>,
     if (isGitConfigEnvKey(k)) continue;
     env[k] = v;
   }
+  // Issue #3382: the worker's optional Go build concurrency defaults, applied after the fold.
+  Object.assign(env, goConcurrencyEnv());
   if (dockerHost !== undefined) env.DOCKER_HOST = dockerHost;
   return env;
 }

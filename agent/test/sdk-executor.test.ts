@@ -14,6 +14,7 @@ import { commitDependencySlice, exerciseDependencyWaitRunner, exerciseExpiredWal
 const HAS_PROCFS = process.platform === "linux";
 import type { Options as SdkOptions, SDKMessage, HookInput } from "@anthropic-ai/claude-agent-sdk";
 import { SdkExecutor, resolveLeadModel, embedSeededPlan, TransientRecoveryError, ProviderTransientError, type SdkQueryFn, type SdkExecutorOptions, type ContextUsageReading } from "../src/sdk-executor.js";
+import { configureGoConcurrency } from "../src/go-concurrency.js";
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { LimitReachedError } from "../src/limit.js";
 import { EnvProbeCleanupError } from "../src/env-probe.js";
@@ -3624,6 +3625,37 @@ describe("SdkExecutor tool provisioning (PRD #18 M3)", () => {
     assert.strictEqual(env.NIX_SSL_CERT_FILE, "/etc/ssl/cert.pem");
     // The credential is still there and untouched by provisioning.
     assert.strictEqual(env.CLAUDE_CODE_OAUTH_TOKEN, OAUTH);
+  });
+
+  it("issue #3382: the configured Go concurrency reaches the SDK env on every turn, absent when unset", async () => {
+    const provision: SdkExecutorOptions["provision"] = async () => ({
+      toolEnv: { PATH: "/nix/go/bin:/usr/bin", GOFLAGS: "-toolexec=evil" },
+    });
+    try {
+      for (const settings of [{ buildParallelism: 2, maxProcs: 3 }, {}]) {
+        configureGoConcurrency(settings);
+        const { queryFn, turns } = fakeTurns([
+          [submitPlan("# plan"), resultSuccess()],
+          [signalDone(), resultSuccess()],
+        ]);
+        const probe = makeCtx({ runId: "66666666-6666-6666-6666-666666666666", config: { tool_packages: ["go"] } });
+        await new SdkExecutor(nullLogger(), homeDir, { queryFn, provision }).run(probe.ctx);
+        assert.ok(turns.length >= 2);
+        for (const t of turns) {
+          const env = t.options.env as Record<string, string | undefined>;
+          assert.strictEqual(env.PATH, "/nix/go/bin:/usr/bin");
+          if (settings.buildParallelism === undefined) {
+            // The unset case still carries the provisioned value; the worker adds nothing.
+            assert.strictEqual(Object.hasOwn(env, "GOMAXPROCS"), false);
+          } else {
+            assert.strictEqual(env.GOFLAGS, "-p=2");
+            assert.strictEqual(env.GOMAXPROCS, "3");
+          }
+        }
+      }
+    } finally {
+      configureGoConcurrency({});
+    }
   });
 
   it("provisions under the SHARED HOME while the SDK $HOME is per-run (PRD #42 Decision 5)", async () => {

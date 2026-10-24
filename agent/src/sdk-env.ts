@@ -21,6 +21,7 @@
 // (resume). PATH is inherited so the bundled Claude Code CLI can find `git`,
 // `bash`, and coreutils.
 
+import { goConcurrencyEnv } from "./go-concurrency.js";
 import { runnerPath, runnerTmpdir } from "./runner-uid.js";
 import { RUN_ATTEMPT_ENV, RUN_CLONE_ENV, RUN_CLONE_KEY_ENV, WORKER_SPAWN_ENV } from "./worker-spawn-mark.js";
 
@@ -143,6 +144,10 @@ export function buildSdkEnv(
     if (PROTECTED_ENV_KEYS.has(k)) continue;
     env[k] = v;
   }
+  // Issue #3382: the worker's optional Go build concurrency defaults (GOFLAGS=-p=N,
+  // GOMAXPROCS=N). Worker-set, applied AFTER the fold so a provisioned var cannot
+  // override them; absent settings add no key at all. Not protected keys.
+  Object.assign(env, goConcurrencyEnv());
   // DOCKER_HOST is worker-set (not agent-set) and NOT in PROTECTED_ENV_KEYS: the
   // provision allowlist never emits it, so the fold above cannot carry it. Set it AFTER
   // the fold so a provisioned var can never clobber the worker's wired endpoint.
@@ -213,6 +218,8 @@ export function buildCheckEnv(
     const v = toolEnv?.[k] ?? source[k];
     if (v) env[k] = v;
   }
+  // Issue #3382: the worker's optional Go build concurrency defaults reach checks too.
+  Object.assign(env, goConcurrencyEnv());
   return env;
 }
 

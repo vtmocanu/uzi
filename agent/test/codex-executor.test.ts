@@ -63,6 +63,7 @@ import { GitCache, assertCaptureLaunch } from "../src/git.js";
 import { FakeApi } from "./fake-api.js";
 import { makeFixture } from "./fixture-repo.js";
 import { makeClaim, testGitCacheOptions, recordingLogger, withReceipts } from "./helpers.js";
+import { configureGoConcurrency } from "../src/go-concurrency.js";
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import { WORKER_UID, RUNNER_UID, runnerCommand, commandRootCommand } from "../src/runner-uid.js";
@@ -8948,6 +8949,27 @@ describe("CodexExecutor: credential-free command env (item 6)", () => {
     assert.equal(env.LOCALE_ARCHIVE, "/nix/locale-archive");
     assert.equal(env.LANG, "C");
     assert.equal(env.TMPDIR, "/private/tmp");
+  });
+
+  it("issue #3382: applies the configured Go concurrency after the toolEnv fold, and adds no key when unset", () => {
+    const tool = { PATH: "/provisioned/go/bin", GOFLAGS: "-toolexec=evil", GOMAXPROCS: "99" };
+    try {
+      configureGoConcurrency({ buildParallelism: 2, maxProcs: 3 });
+      const set = buildCommandEnv("/private/tmp", tool);
+      assert.equal(set.GOFLAGS, "-p=2");
+      assert.equal(set.GOMAXPROCS, "3");
+      assert.equal(set.PATH, `${FIXED_PATH}:/provisioned/go/bin`);
+      configureGoConcurrency({ maxProcs: 4 });
+      const partial = buildCommandEnv("/private/tmp", {});
+      assert.equal(partial.GOMAXPROCS, "4");
+      assert.equal(Object.hasOwn(partial, "GOFLAGS"), false);
+      configureGoConcurrency({});
+      const unset = buildCommandEnv("/private/tmp", {});
+      assert.equal(Object.hasOwn(unset, "GOFLAGS"), false);
+      assert.equal(Object.hasOwn(unset, "GOMAXPROCS"), false);
+    } finally {
+      configureGoConcurrency({});
+    }
   });
 
   it("with no provisioned PATH the fixed boundary PATH stands alone", () => {
