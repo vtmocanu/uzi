@@ -82,7 +82,7 @@ loses a name collision, or that would push a run over the count cap, is
 dropped rather than failing the run; both kinds of drop are logged as a
 message in the run's transcript so it is never a silent surprise. When
 skills and repo skills combined exceed the cap, repo skills (lowest
-precedence) are the ones dropped first.
+precedence) are the ones dropped first. Raised skill limits, or many large agent templates, can push a run's claim past the 168 MiB worker claim limit; such a run fails with `claim too large` instead of being retried.
 
 ## Product skills
 

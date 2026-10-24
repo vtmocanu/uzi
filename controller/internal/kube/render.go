@@ -549,6 +549,11 @@ type RenderConfig struct {
 	MemoryGuardRearmMs          int64
 	MemoryGuardResponseBudgetMs int64
 	MemoryGuardMaxInterventions int64
+	// GoBuildParallelism / GoMaxProcs render WORKER_GO_BUILD_PARALLELISM /
+	// WORKER_GO_MAXPROCS. 0 omits the env, so unset config leaves the pod template
+	// (and its spec hash) byte-identical.
+	GoBuildParallelism int
+	GoMaxProcs         int
 	// CrossCheckSlots is rendered as WORKER_CROSS_CHECK_SLOTS without a fallback:
 	// zero disables cross-checks. config.Load supplies the production default 1.
 	CrossCheckSlots int
@@ -1031,6 +1036,12 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 			corev1.EnvVar{Name: "WORKER_MEMORY_GUARD_RESPONSE_BUDGET_MS", Value: strconv.FormatInt(cfg.MemoryGuardResponseBudgetMs, 10)},
 			corev1.EnvVar{Name: "WORKER_MEMORY_GUARD_MAX_INTERVENTIONS", Value: strconv.FormatInt(cfg.MemoryGuardMaxInterventions, 10)},
 		)
+	}
+	if cfg.GoBuildParallelism > 0 {
+		env = append(env, corev1.EnvVar{Name: "WORKER_GO_BUILD_PARALLELISM", Value: strconv.Itoa(cfg.GoBuildParallelism)})
+	}
+	if cfg.GoMaxProcs > 0 {
+		env = append(env, corev1.EnvVar{Name: "WORKER_GO_MAXPROCS", Value: strconv.Itoa(cfg.GoMaxProcs)})
 	}
 	if len(cfg.APICAPEM) > 0 {
 		// Node reads this path before startup and agent/src/client.ts uses plain fetch

@@ -4377,10 +4377,12 @@ UPDATE runs SET
     completion_final_head = sqlc.narg('completion_final_head'),
     status             = 'completed',
     status_since       = now(),
-    -- Enrolled work branches are server-authorized, not optional completion metadata.
-    -- Preserve one on omission; an explicit different branch still hits the frozen guard.
+    -- Task work branches are server-named at creation and runs_kind_shape forbids NULL, so
+    -- they are not optional completion metadata: preserve one on omission (#3393, e.g. a
+    -- review run's branchless completion). Other kinds keep plain assignment. An explicit
+    -- different branch on an enrolled task still hits the frozen-coordinate guard.
     branch             = CASE
-        WHEN checkpoint_coordinates IS NOT NULL AND sqlc.narg('branch')::text IS NULL THEN branch
+        WHEN runs.kind = 'task' AND sqlc.narg('branch')::text IS NULL THEN branch
         ELSE sqlc.narg('branch')::text
     END,
     mr_iid             = @mr_iid,

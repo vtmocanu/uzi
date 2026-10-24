@@ -12,7 +12,7 @@ function sample(id: number, time: number, current = 100, overrides: Partial<Samp
   return {
     available: true, sampleId: id, startedAtMs: time, completedAtMs: time,
     currentBytes: current, limitBytes: 1000,
-    stat: { anon: 10, shmem: 10, slab_unreclaimable: 10, unevictable: 10 },
+    stat: { anon: 10, shmem: 10, slab_unreclaimable: 10, unevictable: 10, inactive_file: 0 },
     pressure: { some: { avg10: 0, avg60: 0, avg300: 0, total: 0 },
       full: { avg10: 0, avg60: 0, avg300: 0, total: 0 } }, ...overrides,
   };
@@ -24,17 +24,60 @@ function intervention(guard: WorkerMemoryGuard) {
   return ticket;
 }
 
-test("total usage alone crosses H; stats are neither summed nor file charges subtracted", () => {
+type Rows = Extract<Sample["pressure"], { full: unknown }>;
+const rows = (value: Sample): Rows => value.pressure as Rows;
+const absent = { unavailable: "absent" } as const;
+const stat = (inactive_file: number, anon = 10) => ({ anon, shmem: 10, slab_unreclaimable: 10, unevictable: 10, inactive_file });
+const psi = (total: number) => ({ some: { avg10: 0, avg60: 0, avg300: 0, total: 0 }, full: { avg10: 0, avg60: 0, avg300: 0, total } });
+
+test("working set (current minus inactive file, clamped at zero) crosses H; other stats are not summed", () => {
   const guard = new WorkerMemoryGuard(settings);
   assert.deepEqual(guard.thresholds(1000), { highBytes: 800, quietBytes: 700 });
-  const hugeStats = { anon: 900, shmem: 900, slab_unreclaimable: 900, unevictable: 900 };
+  const hugeStats = { anon: 900, shmem: 900, slab_unreclaimable: 900, unevictable: 900, inactive_file: 0 };
   assert.equal(guard.evaluate(sample(1, 0, 200, { stat: hugeStats }), 0).kind, "idle");
   assert.equal(guard.evaluate(sample(2, 10, 800), 10).kind, "hard");
+  // Raw usage above H is idle while the working set stays below it.
+  const cache = new WorkerMemoryGuard(settings);
+  assert.equal(cache.evaluate(sample(1, 0, 1000, { stat: stat(201) }), 0).kind, "idle");
+  assert.equal(cache.evaluate(sample(2, 10, 1000, { stat: stat(200) }), 10).kind, "hard");
+  // inactive_file larger than current clamps to zero rather than going negative. A single idle
+  // sample cannot show this (a negative working set is idle too); the early projection can:
+  // clamped, previous ws is 0 so growth is 300 and 300 + 3*100 = 600 < H (800) -> idle.
+  // Unclamped, previous ws is -400 so growth is 700 and 300 + 7*100 = 1000 >= H -> early.
+  const clamp = new WorkerMemoryGuard(settings);
+  assert.equal(clamp.evaluate(sample(1, 0, 100, { stat: stat(500) }), 0).kind, "idle");
+  assert.equal(clamp.evaluate(sample(2, 100, 300, { stat: stat(0, 11), pressure: psi(1) }), 100).kind, "idle");
+});
+
+test("inactive_file must be a nonnegative safe integer or the sample inhibits", () => {
+  for (const bad of [-1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, undefined as unknown as number]) {
+    assert.equal(new WorkerMemoryGuard(settings).evaluate(sample(1, 0, 900, { stat: stat(bad) }), 0).kind, "inhibited", String(bad));
+  }
+  assert.equal(new WorkerMemoryGuard(settings).evaluate(sample(1, 0, 900, { stat: stat(0) }), 0).kind, "hard");
+});
+
+test("explicit PSI absence is valid and hard-crosses on working set; malformed pressure shapes inhibit", () => {
+  for (const reason of ["absent", "unsupported"] as const) {
+    const guard = new WorkerMemoryGuard(settings);
+    assert.equal(guard.evaluate(sample(1, 0, 900, { pressure: { unavailable: reason } }), 0).kind, "hard");
+  }
+  const mixed = { ...psi(0), unavailable: "absent" } as unknown as Sample["pressure"];
+  for (const bad of [
+    mixed,
+    { unavailable: "other" } as unknown as Sample["pressure"],
+    { unavailable: "absent", extra: 1 } as unknown as Sample["pressure"],
+    {} as unknown as Sample["pressure"],
+    { some: psi(0).some } as unknown as Sample["pressure"],
+    { full: psi(0).full } as unknown as Sample["pressure"],
+    null as unknown as Sample["pressure"],
+  ]) assert.equal(new WorkerMemoryGuard(settings).evaluate(sample(1, 0, 900, { pressure: bad }), 0).kind, "inhibited", JSON.stringify(bad));
+  // Cache-heavy absence samples stay idle: no PSI never means hard by raw usage.
+  assert.equal(new WorkerMemoryGuard(settings).evaluate(sample(1, 0, 990, { pressure: absent, stat: stat(400) }), 0).kind, "idle");
 });
 
 test("early trigger needs total growth projection, increasing full PSI, and at least one stat growth", () => {
   const grown = sample(2, 100, 750, {
-    stat: { anon: 11, shmem: 9, slab_unreclaimable: 9, unevictable: 9 },
+    stat: { anon: 11, shmem: 9, slab_unreclaimable: 9, unevictable: 9, inactive_file: 0 },
     pressure: { some: { avg10: 0, avg60: 0, avg300: 0, total: 0 },
       full: { avg10: 0, avg60: 0, avg300: 0, total: 1 } },
   });
@@ -54,12 +97,89 @@ test("early trigger needs total growth projection, increasing full PSI, and at l
   assert.equal(falling.evaluate(grown, 100).kind, "idle");
 });
 
+test("early projection uses working-set growth, not raw current growth", () => {
+  const grown = sample(2, 100, 850, { stat: stat(100, 11), pressure: psi(1) });
+  const guard = new WorkerMemoryGuard(settings);
+  guard.evaluate(sample(1, 0, 700), 0);
+  // ws 700 -> 750 over 100ms projects to 800 = H; raw current 850 alone would already exceed H.
+  assert.equal(guard.evaluate(grown, 100).kind, "early");
+  // Same raw growth, but inactive_file absorbs it: the working set falls, so no projection reaches H.
+  const cache = new WorkerMemoryGuard(settings);
+  cache.evaluate(sample(1, 0, 700), 0);
+  assert.equal(cache.evaluate(sample(2, 100, 850, { stat: stat(200, 11), pressure: psi(1) }), 100).kind, "idle");
+});
+
+test("early intervention never fires without real PSI on both the previous and the current sample", () => {
+  const growing = (id: number, time: number, current: number, anon: number, pressure: Sample["pressure"]) =>
+    sample(id, time, current, { stat: stat(0, anon), pressure });
+  const cases: [Sample["pressure"], Sample["pressure"]][] = [
+    [absent, absent], [psi(0), absent], [absent, psi(1)], [{ unavailable: "unsupported" }, psi(5)],
+  ];
+  for (const [before, after] of cases) {
+    const guard = new WorkerMemoryGuard(settings);
+    guard.evaluate(growing(1, 0, 700, 10, before), 0);
+    assert.equal(guard.evaluate(growing(2, 100, 790, 11, after), 100).kind, "idle", JSON.stringify([before, after]));
+  }
+  // Restoration: the first real-PSI sample after absence is still idle; the second can fire.
+  const guard = new WorkerMemoryGuard(settings);
+  guard.evaluate(growing(1, 0, 700, 10, absent), 0);
+  assert.equal(guard.evaluate(growing(2, 100, 750, 11, psi(1)), 100).kind, "idle");
+  assert.equal(guard.evaluate(growing(3, 200, 790, 12, psi(2)), 200).kind, "early");
+  // Real-PSI behaviour is unchanged.
+  const real = new WorkerMemoryGuard(settings);
+  real.evaluate(growing(1, 0, 700, 10, psi(0)), 0);
+  assert.equal(real.evaluate(growing(2, 100, 790, 11, psi(1)), 100).kind, "early");
+});
+
+test("cache-heavy raw usage above H stays idle despite ticking full PSI and stat growth, also after rearm", () => {
+  const cacheHeavy = (id: number, time: number, anon: number, total: number) =>
+    sample(id, time, 990, { stat: stat(400, anon), pressure: psi(total) });
+  const fresh = new WorkerMemoryGuard(settings);
+  assert.equal(fresh.evaluate(cacheHeavy(1, 0, 10, 0), 0).kind, "idle");
+  assert.equal(fresh.evaluate(cacheHeavy(2, 100, 11, 5), 100).kind, "idle");
+  assert.equal(fresh.evaluate(cacheHeavy(3, 200, 12, 9), 200).kind, "idle");
+
+  const guard = new WorkerMemoryGuard(settings);
+  const ticket = intervention(guard);
+  guard.confirmDrain(ticket);
+  guard.resolveOutcome(ticket);
+  guard.evaluate(sample(2, 50), 50);
+  assert.equal(guard.evaluate(sample(3, 150), 150).kind, "rearmed");
+  assert.equal(guard.evaluate(cacheHeavy(4, 250, 10, 0), 250).kind, "idle");
+  assert.equal(guard.evaluate(cacheHeavy(5, 350, 11, 5), 350).kind, "idle");
+  assert.equal(guard.evaluate(cacheHeavy(6, 450, 12, 9), 450).kind, "idle");
+  assert.equal(guard.beginIntervention(), undefined);
+});
+
+test("quiet rearm uses working set below Q but still needs drain, resolution and the full fresh dwell", () => {
+  const cacheQuiet = (id: number, time: number) => sample(id, time, 900, { stat: stat(400) });
+  const guard = new WorkerMemoryGuard(settings);
+  const ticket = intervention(guard);
+  // Neither drained nor resolved: a low working set alone never rearms.
+  guard.evaluate(cacheQuiet(2, 50), 50);
+  assert.equal(guard.evaluate(cacheQuiet(3, 150), 150).kind, "idle");
+  guard.confirmDrain(ticket);
+  guard.evaluate(cacheQuiet(4, 200), 200);
+  assert.equal(guard.evaluate(cacheQuiet(5, 300), 300).kind, "idle");
+  guard.resolveOutcome(ticket);
+  // Dwell starts at the first quiet sample after resolution and needs the full rearm window.
+  assert.equal(guard.evaluate(cacheQuiet(6, 350), 350).kind, "idle");
+  assert.equal(guard.evaluate(cacheQuiet(7, 400), 400).kind, "idle");
+  assert.equal(guard.state.armed, false);
+  // A working set at Q resets the dwell even though raw usage is unchanged.
+  assert.equal(guard.evaluate(sample(8, 450, 900, { stat: stat(200) }), 450).kind, "idle");
+  assert.equal(guard.evaluate(cacheQuiet(9, 500), 500).kind, "idle");
+  assert.equal(guard.evaluate(cacheQuiet(10, 550), 550).kind, "idle");
+  assert.equal(guard.state.armed, false);
+  assert.equal(guard.evaluate(cacheQuiet(11, 600), 600).kind, "rearmed");
+});
+
 test("early preceding sample must itself be fresh; hard threshold does not require PSI", () => {
   const guard = new WorkerMemoryGuard(settings);
   guard.evaluate(sample(1, 0, 700), 0);
   const next = sample(2, 201, 750);
   next.stat.anon = 20;
-  next.pressure.full.total = 5;
+  rows(next).full.total = 5;
   assert.equal(guard.evaluate(next, 201).kind, "idle");
   assert.equal(guard.evaluate(sample(3, 202, 900), 202).kind, "hard");
 });
@@ -145,6 +265,21 @@ test("incomplete sample, changed limit, quiet-boundary equality and observation 
   }
 });
 
+test("an observation gap restarts the dwell on working set, not raw current", () => {
+  const guard = new WorkerMemoryGuard(settings);
+  const ticket = intervention(guard);
+  guard.confirmDrain(ticket);
+  guard.resolveOutcome(ticket);
+  guard.evaluate(sample(2, 50), 50);
+  // Gap (300ms > sampleMs + responseBudgetMs): raw current 900 >= Q (700) but working set 500 < Q.
+  const cacheQuiet = (id: number, time: number) => sample(id, time, 900, { stat: stat(400) });
+  assert.equal(guard.evaluate(cacheQuiet(3, 350), 350).kind, "idle");
+  assert.equal(guard.evaluate(cacheQuiet(4, 400), 400).kind, "idle");
+  assert.equal(guard.state.armed, false);
+  // The dwell began at 350, so rearm is due at 450 (a raw-current restart would defer it to 500).
+  assert.equal(guard.evaluate(cacheQuiet(5, 450), 450).kind, "rearmed");
+});
+
 test("independent run/episode interventions are not lifetime capped; mutated sample cannot rewrite history", () => {
   const guard = new WorkerMemoryGuard({ ...settings, maxInterventions: 1 });
   const ticket = intervention(guard);
@@ -163,7 +298,7 @@ test("independent run/episode interventions are not lifetime capped; mutated sam
   first.stat.anon = 99;
   const second = sample(2, 100, 750);
   second.stat.anon = 11;
-  second.pressure.full.total = 1;
+  rows(second).full.total = 1;
   assert.equal(history.evaluate(second, 100).kind, "early");
 });
 

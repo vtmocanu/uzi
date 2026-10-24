@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { runReadOnlyModelPass } from "./model-pass.js";
 import { defaultQueryFn } from "./sdk-messages.js";
+import { parseGoConcurrency } from "./go-concurrency.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
 import type { TeardownTestDeps } from "./rmtree.js";
 import { makePrDescriptionEvalCodexFactory } from "./codex/codex-executor.js";
@@ -97,6 +98,8 @@ export async function runEvalCli(args: string[], deps: EvalCliDeps): Promise<num
   for (const name of signals) deps.signals.on(name, onSignal);
   let failed = false;
   try {
+    // Issue #3382: parsed once; an invalid value takes the startup_failed path below.
+    const go = parseGoConcurrency(deps.env);
     await fs.mkdir(path.join(deps.checkout, ".uzi/scratch"), { recursive: true });
     const fixtures = await loadEditorFixtures(deps.checkout);
     const auth = opts.harness === "claude" ? deps.env.CLAUDE_CODE_OAUTH_TOKEN : deps.env.OPENAI_API_KEY;
@@ -120,7 +123,7 @@ export async function runEvalCli(args: string[], deps: EvalCliDeps): Promise<num
           clearTimeout(timer);
           timer = undefined;
           if (signal.aborted) result.error = abort.signal.aborted ? "interrupted" : "timeout";
-          else result = await evaluateEditorResponse(deps.checkout, fixture, response);
+          else result = await evaluateEditorResponse(deps.checkout, fixture, response, go);
         }
       } catch {
         result.error = abort.signal.aborted ? "interrupted" : timedOut ? "timeout" : "provider_failed";

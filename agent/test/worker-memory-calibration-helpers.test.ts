@@ -6,10 +6,15 @@ import type { WorkerMemoryReader } from "../src/worker-memory-reader.js";
 const MiB = 1024 * 1024;
 function sample(id: number, usage = 64 * MiB, limit = 1024 * MiB): Extract<ReturnType<WorkerMemoryReader["sample"]>, { available: true }> {
   return { available: true, sampleId: id, startedAtMs: id * 10, completedAtMs: id * 10 + 1,
-    currentBytes: usage, limitBytes: limit, stat: { anon: usage, shmem: 0, slab_unreclaimable: 0, unevictable: 0 },
+    currentBytes: usage, limitBytes: limit, stat: { anon: usage, shmem: 0, slab_unreclaimable: 0, unevictable: 0, inactive_file: 0 },
     pressure: { some: { avg10: 0, avg60: 0, avg300: 0, total: 0 }, full: { avg10: 0, avg60: 0, avg300: 0, total: 0 } } };
 }
 const baseline = [sample(1), sample(2), sample(3)];
+// Page-cache-heavy sample: raw memory.current includes `inactive` bytes of reclaimable file cache.
+function cached(id: number, usage: number, inactive: number) {
+  const value = sample(id, usage);
+  return { ...value, stat: { ...value.stat, inactive_file: inactive } };
+}
 
 test("dedicated 1Gi/2Gi budgets account for baseline, four charge classes, two producers and overhead", () => {
   for (const limit of [1024 * MiB, 2048 * MiB]) {
@@ -362,4 +367,42 @@ test("two ordered legs at the same H use adjacent crossings after prior cleanup 
   assert.equal(report.reserveCheck.requiredBytes, 710);
   input.response.legs.reverse();
   assert.throws(() => calibrationReport(input), /misordered|bracket/);
+});
+
+test("plan keeps the raw safety baseline and derives the hard-threshold baseline from the working set", () => {
+  const plan = calibrationPlan({ dedicated: true, windowMs: 30000,
+    baseline: [cached(1, 100 * MiB, 40 * MiB), cached(2, 110 * MiB, 40 * MiB), cached(3, 105 * MiB, 60 * MiB)] });
+  assert.equal(plan.baselineBytes, 110 * MiB);
+  assert.equal(plan.workingSetBaselineBytes, 70 * MiB);
+});
+
+test("baseline jitter is the working-set spread, not the raw memory.current spread", () => {
+  // Working sets 60 / 110 / 105 (spread 50); raw currents 100 / 110 / 105 (spread 10).
+  const input = reportInput();
+  input.baseline = [cached(1, 100, 40), sample(2, 110), sample(3, 105)];
+  const report = calibrationReport(input);
+  assert.equal(report.jitterBytes, 50);
+  assert.deepEqual(report.baselineJitter, { minSampleId: 1, minBytes: 60, maxSampleId: 2, maxBytes: 110 });
+});
+
+test("a cache-heavy sample whose raw current reaches H but whose working set does not is not a hard crossing", () => {
+  // Sample 5 is at H raw, yet 200 of its bytes are inactive file cache.
+  // The bracket reportInput() states (crossing at sample 5) is refused.
+  const stale = reportInput();
+  stale.samples = [sample(4, 200), cached(5, 300, 200), sample(6, 500)];
+  assert.throws(() => calibrationReport(stale), /hard crossing bracket/);
+  // Growth and jitter are working-set based: the cache-only rise is invisible.
+  const flat = reportInput();
+  flat.samples = [cached(4, 200, 0), cached(5, 400, 200), cached(6, 500, 200)];
+  flat.response.legs[0]!.hardBracket = { lastBelowSampleId: 5, firstAtOrAboveSampleId: 6, lowerMs: 50, upperMs: 61 };
+  flat.response.legs[0]!.spans = { observe: { ...flat.response.legs[0]!.spans.observe, startMs: 61, endMs: 62 },
+    reservation: { ...flat.response.legs[0]!.spans.reservation, startMs: 62, endMs: 63 },
+    signal: { ...flat.response.legs[0]!.spans.signal, startMs: 63, endMs: 64 },
+    drain: { ...flat.response.legs[0]!.spans.drain, startMs: 64, endMs: 70 },
+    cleanup: { ...flat.response.legs[0]!.spans.cleanup, startMs: 70, endMs: 75 } };
+  flat.response.legs[0]!.ack.atMs = 63;
+  flat.response.legs[0]!.exit.atMs = 70;
+  const report = calibrationReport(flat);
+  assert.equal(report.netGrowthBytes, 100);
+  assert.equal(report.samplePairs[0]!.rawDeltaBytes, 0);
 });

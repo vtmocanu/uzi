@@ -12,6 +12,15 @@ CAP = 8 * 1024 * 1024
 MIB = 1024 ** 2
 BINDING = ("reportId", "legId", "interventionId", "treeId", "toolId", "reservationId")
 EVENTS = ("oom", "oom_kill", "oom_group_kill")
+STAT_KEYS = ("anon", "shmem", "slab_unreclaimable", "unevictable", "inactive_file")
+PSI_PATH = "/sys/fs/cgroup/memory.pressure"
+# errno code of a failed memory.pressure read -> the reader's absence marker for it
+PSI_ABSENCE = {"ENOENT": {"unavailable": "absent"}, "ENOTSUP": {"unavailable": "unsupported"}}
+
+
+def working_set(sample):
+    """memory.current minus inactive file cache, clamped at zero: the guard's own metric."""
+    return max(0, sample["currentBytes"] - sample["stat"]["inactive_file"])
 
 
 def require(value, message):
@@ -210,8 +219,14 @@ def verify_report(report, manifest, expected, synthetic=False):
         require(set(raw) == {"/proc/self/cgroup", *("/sys/fs/cgroup/" + name for name in
                 ("memory.current", "memory.max", "memory.stat", "memory.pressure", "memory.events"))},
                 "default raw paths")
-        require(all(isinstance(v, str) for v in raw.values()) and
-                sum(len(v.encode()) for v in raw.values()) <= 6144, "raw bytes unavailable/oversized")
+        # Only memory.pressure may be unreadable, and only with a validated errno recorded for it.
+        errors = record["rawErrors"]
+        require(isinstance(errors, dict) and set(errors) <= {PSI_PATH}
+                and all(isinstance(v, str) and v in PSI_ABSENCE for v in errors.values()), "raw errors")
+        require(all(isinstance(v, str) or (v is None and k == PSI_PATH and k in errors) for k, v in raw.items())
+                and (raw[PSI_PATH] is None or PSI_PATH not in errors)
+                and sum(len(v.encode()) for v in raw.values() if v is not None) <= 6144,
+                "raw bytes unavailable/oversized")
         require(raw["/proc/self/cgroup"] == "0::/\n", "raw membership")
         current = raw["/sys/fs/cgroup/memory.current"].strip()
         maximum = raw["/sys/fs/cgroup/memory.max"].strip()
@@ -221,9 +236,13 @@ def verify_report(report, manifest, expected, synthetic=False):
             integer(value)
         require(sample["currentBytes"] == int(current) and limit == int(maximum), "raw sample mismatch")
         stat = fields(raw["/sys/fs/cgroup/memory.stat"])
-        require(same(sample["stat"], {key: stat[key] for key in
-                ("anon", "shmem", "slab_unreclaimable", "unevictable")}), "raw stat mismatch")
-        require(same(sample["pressure"], psi(raw["/sys/fs/cgroup/memory.pressure"])), "raw PSI mismatch")
+        # inactive_file feeds the working set, so it is required; extra keys must still match raw.
+        require(set(STAT_KEYS) <= set(sample["stat"]) and all(key in stat for key in sample["stat"]) and
+                same(sample["stat"], {key: stat[key] for key in sample["stat"]}), "raw stat mismatch")
+        if raw[PSI_PATH] is None:
+            require(same(sample["pressure"], PSI_ABSENCE[errors[PSI_PATH]]), "raw PSI absence marker mismatch")
+        else:
+            require(same(sample["pressure"], psi(raw[PSI_PATH])), "raw PSI mismatch")
         events = fields(raw["/sys/fs/cgroup/memory.events"])
         require(all(k in events for k in EVENTS) and same(record["events"], events), "raw event mismatch")
         parsed[sid] = sample
@@ -247,9 +266,12 @@ def verify_report(report, manifest, expected, synthetic=False):
     # crossing, never an early-PSI intervention, produced this leg (#3363).
     require(same(report.get("guardPressure"), {"mode": "pinned_to_first_load_sample",
             "sampleId": samples[0]["sampleId"], "pressure": samples[0]["pressure"]}), "guard-facing PSI pin")
+    # Raw bytes bound the safety budget and ceiling; the working set derives the hard threshold H.
     bmax = max(s["currentBytes"] for s in baseline)
+    wsmax = max(working_set(s) for s in baseline)
     rounds = 16 if limit == 1024 ** 3 else 32
     require(same(report["plan"], {"limitBytes": limit, "ceilingBytes": limit // 2, "baselineBytes": bmax,
+            "workingSetBaselineBytes": wsmax,
             "allocationBytes": 8 * rounds * MIB, "overheadBytes": 64 * MIB, "chunkBytes": MIB,
             "rounds": rounds, "windowMs": 30000}), "fixed allocation plan")
     require(same(report["plannedChargeClasses"], [
@@ -263,7 +285,7 @@ def verify_report(report, manifest, expected, synthetic=False):
     high = limit - integer(guard["reserveBytes"])
     require(same(guard, {"enabled": True, "reserveBytes": limit - high, "hysteresisBytes": 8 * MIB,
             "sampleMs": 250, "responseBudgetMs": 5000, "rearmMs": 500, "maxInterventions": 2}), "guard settings")
-    require(high == bmax + 32 * MIB and 0 < high - 8 * MIB < high < limit, "H/Q/L thresholds")
+    require(high == wsmax + 32 * MIB and 0 < high - 8 * MIB < high < limit, "H/Q/L thresholds")
     response = report["response"]
     require(response["provenance"] == report["provenance"] and response["reportId"] == expected["reportId"]
             and len(response["legs"]) == 1, "response identity/leg count")
@@ -274,12 +296,12 @@ def verify_report(report, manifest, expected, synthetic=False):
             and binding["treeId"] in expected["treeIds"]
             and binding["interventionId"] == binding["reservationId"], "leg binding")
     require(leg["hardThresholdBytes"] == high, "hard threshold")
-    index = next((n for n, s in enumerate(samples) if s["currentBytes"] >= high), None)
+    index = next((n for n, s in enumerate(samples) if working_set(s) >= high), None)
     require(index is not None and index > 0, "real hard crossing bracket")
     low, above = samples[index - 1:index + 1]
     bracket = {"lastBelowSampleId": low["sampleId"], "firstAtOrAboveSampleId": above["sampleId"],
                "lowerMs": low["startedAtMs"], "upperMs": above["completedAtMs"]}
-    require(same(leg["hardBracket"], bracket) and low["currentBytes"] < high, "adjacent hard bracket")
+    require(same(leg["hardBracket"], bracket) and working_set(low) < high, "adjacent hard bracket")
     spans = leg["spans"]
     end = bracket["upperMs"]
     for kind in ("observe", "reservation", "signal", "drain", "cleanup"):
@@ -307,14 +329,14 @@ def verify_report(report, manifest, expected, synthetic=False):
     for low_sample, high_sample in zip(samples, samples[1:]):
         delta_ms = high_sample["completedAtMs"] - low_sample["completedAtMs"]
         require(delta_ms > 0, "nonpositive sample interval")
-        delta = high_sample["currentBytes"] - low_sample["currentBytes"]
+        delta = working_set(high_sample) - working_set(low_sample)
         growth.append(max(0, delta) / delta_ms)
         pairs.append({"fromSampleId": low_sample["sampleId"], "toSampleId": high_sample["sampleId"],
                       "rawDeltaBytes": delta, "elapsedMs": delta_ms, "positiveRateBytesPerMs": growth[-1],
                       "readGapMs": high_sample["startedAtMs"] - low_sample["completedAtMs"]})
     rate = max(growth)
     latency = spans["drain"]["endMs"] - bracket["lowerMs"]
-    jitter = bmax - min(s["currentBytes"] for s in baseline)
+    jitter = wsmax - min(working_set(s) for s in baseline)
     required = rate * latency + jitter
     require(guard["reserveBytes"] > required, "strict reserve inequality")
     dleg = {"binding": binding, "hardBracket": bracket,
@@ -329,15 +351,15 @@ def verify_report(report, manifest, expected, synthetic=False):
                   "samplePairs": pairs,
                   "peakPositiveGrowthPair": max(pairs, key=lambda p: p["positiveRateBytesPerMs"]),
                   "maxSampleGapPair": max(pairs, key=lambda p: p["readGapMs"]),
-                  "baselineJitter": {"minSampleId": min(baseline, key=lambda s: s["currentBytes"])["sampleId"],
-                                     "minBytes": min(s["currentBytes"] for s in baseline),
-                                     "maxSampleId": max(baseline, key=lambda s: s["currentBytes"])["sampleId"],
-                                     "maxBytes": bmax},
+                  "baselineJitter": {"minSampleId": min(baseline, key=working_set)["sampleId"],
+                                     "minBytes": min(working_set(s) for s in baseline),
+                                     "maxSampleId": max(baseline, key=working_set)["sampleId"],
+                                     "maxBytes": wsmax},
                   "peakPositiveGrowthRateBytesPerMs": rate,
                   "maxSampleGapMs": max(b["startedAtMs"] - a["completedAtMs"] for a, b in zip(samples, samples[1:])),
                   "worstEndToEndLatencyMs": latency, "conservativeStageSumMs": sum(dleg["stageLatenciesMs"].values()),
-                  "netGrowthBytes": samples[-1]["currentBytes"] - samples[0]["currentBytes"],
-                  "monotonicGrowth": all(b["currentBytes"] >= a["currentBytes"] for a, b in zip(samples, samples[1:])),
+                  "netGrowthBytes": working_set(samples[-1]) - working_set(samples[0]),
+                  "monotonicGrowth": all(working_set(b) >= working_set(a) for a, b in zip(samples, samples[1:])),
                   "responseMeasured": not synthetic, "accepted": not synthetic,
                   "reserveCheck": {"reserveBytes": guard["reserveBytes"], "requiredBytes": required, "satisfied": True}}
     require(same(report["derivation"], derivation), "recomputed derivation mismatch")
@@ -412,7 +434,7 @@ def verify_report(report, manifest, expected, synthetic=False):
     for sample in samples:
         if sample["startedAtMs"] <= spans["cleanup"]["endMs"]:
             continue
-        if sample["currentBytes"] >= quiet:
+        if working_set(sample) >= quiet:
             low_dwell = []
         else:
             low_dwell.append(sample)

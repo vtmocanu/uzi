@@ -18,6 +18,8 @@ import {
 import { GUARDED_COMMAND_DESCRIPTION, GUARDED_SERVER_TIMEOUT_MS, buildGuardedCommandServer } from "../src/claude-command/server.js";
 import type { WorkerMemoryPressureResult } from "../src/protocol.js";
 import { WorkerMemoryCommands } from "../src/worker-memory-commands.js";
+import { configureGoConcurrency } from "../src/go-concurrency.js";
+import { buildSdkEnv } from "../src/sdk-env.js";
 
 const WT = path.resolve(".");
 const ticks = "18446744073709551615";
@@ -188,6 +190,32 @@ test("a call without a matching, well-formed, unconsumed hook record is refused 
   assert.match(text(await h.lane.handle({ command: "echo hi" }, { _meta: { [META]: "toolu_ok" } })), /could not be attributed/);
   assert.equal(h.specs.length, 1);
 });
+
+// Issue #3382: asserted at the launch seam, the spec.env the lane hands to the supervisor launch.
+for (const [label, settings, expected] of [
+  ["set", { buildParallelism: 2, maxProcs: 3 }, { GOFLAGS: "-p=2", GOMAXPROCS: "3" }],
+  ["unset", {}, {}],
+] as const) {
+  test(`issue #3382: a guarded command launches with the configured Go concurrency (${label}) from a buildSdkEnv cliEnv`, { timeout: 10000 }, async () => {
+    try {
+      configureGoConcurrency(settings);
+      const h = harness({ cliEnv: buildSdkEnv("oauth-secret", "/home/runner", { PATH: "/provisioned/go/bin" }) });
+      assert.match(text(await h.call({ command: "echo hi" })), /^Exit code: 0/);
+      assert.equal(h.specs.length, 1);
+      const env = h.specs[0]!.env as Record<string, string | undefined>;
+      assert.equal(env.PATH, "/provisioned/go/bin");
+      assert.equal(env.GOFLAGS, (expected as { GOFLAGS?: string }).GOFLAGS);
+      assert.equal(env.GOMAXPROCS, (expected as { GOMAXPROCS?: string }).GOMAXPROCS);
+      assert.equal(Object.hasOwn(env, "CLAUDE_CODE_OAUTH_TOKEN"), false, "the credential never reaches the command");
+      if (label === "unset") {
+        assert.equal(Object.hasOwn(env, "GOFLAGS"), false);
+        assert.equal(Object.hasOwn(env, "GOMAXPROCS"), false);
+      }
+    } finally {
+      configureGoConcurrency({});
+    }
+  });
+}
 
 test("both matchers firing for one call record once; a consumed id never re-arms", { timeout: 10000 }, async () => {
   const h = harness();

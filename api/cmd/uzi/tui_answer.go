@@ -687,7 +687,7 @@ func (m tuiModel) renderAnswerDetail() string {
 	card := m.answerCardLines(room)
 	if len(card)+5 <= room {
 		header = append(header, card...)
-		header = append(header, strings.TrimRight(m.joinColumns(m.renderLaneRail(), m.renderTranscript(), laneRailWidth), "\n"))
+		header = append(header, strings.TrimRight(m.joinColumns(m.renderLaneRail(), m.renderTranscript(), m.railWidth()), "\n"))
 	} else {
 		header = append(header, card...)
 	}

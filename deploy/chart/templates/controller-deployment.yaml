@@ -178,6 +178,16 @@ spec:
             - name: UZI_WORKER_MEMORY_GUARD_MAX_INTERVENTIONS
               value: {{ .Values.workers.memoryGuard.maxInterventions | toString | trim | quote }}
             {{- end }}
+            {{- $goBuildParallelism := include "uzi.workerGoSetting" (dict "name" "goBuildParallelism" "root" .) }}
+            {{- if $goBuildParallelism }}
+            - name: UZI_WORKER_GO_BUILD_PARALLELISM
+              value: {{ $goBuildParallelism | quote }}
+            {{- end }}
+            {{- $goMaxProcs := include "uzi.workerGoSetting" (dict "name" "goMaxProcs" "root" .) }}
+            {{- if $goMaxProcs }}
+            - name: UZI_WORKER_GO_MAXPROCS
+              value: {{ $goMaxProcs | quote }}
+            {{- end }}
             - name: UZI_WORKER_MAX_CONCURRENT_RUNS
               value: {{ .Values.workers.maxConcurrentRuns | quote }}
             # Unconditional: Helm treats 0 as empty, but it disables this lane.

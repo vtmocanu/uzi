@@ -1759,7 +1759,7 @@ A newer release is available.
   in-progress milestone's cell blinks** `▰`/`▱` in the tungsten colour (the
   same warm accent as the done fill) on a half-second tick — a static `▱`
   frame renders instead when the terminal isn't interactive (a piped or
-  offline render) or with `UZI_TUI_NO_BLINK=1` set (a reduced-motion opt-out,
+  offline render) or with `UZI_TUI_NO_BLINK=1` or `[tui] blink = false` set (a reduced-motion opt-out,
   read once at startup). The **selected row**
   additionally gains a second line naming the active lane's role, task
   label and age — the run's current activity, the same information [the run
@@ -1839,7 +1839,7 @@ A newer release is available.
   for a milestone in progress — a `◕` that blinks `◕`/`○` in the faint grey
   colour (the same colour as a not-started `○`; the row is told apart by the
   `◕` shape, its motion and a brighter title, never by colour), a static `◕`
-  under `UZI_TUI_NO_BLINK=1` or a non-tty render. The rail's eyebrow also
+  under `UZI_TUI_NO_BLINK=1`, `[tui] blink = false` or a non-tty render. The rail's eyebrow also
   carries a compact `▰`/`▱` micro-bar that blinks one cell per milestone in
   progress in tungsten, the twin of the board's, and names the in-progress
   milestone(s) after the count (e.g. `· m1, m2`, capped at two then `+N`).
@@ -2038,6 +2038,41 @@ split = "off"
 `split = "auto"` is the default; `auto` and `off` are the supported values.
 The `off` setting also disables `s`. `uzi tui --demo` and
 `uzi tui --sketch` use `auto` regardless of this setting.
+
+The run detail's left rail grows with the terminal: about a fifth of its
+width, at least 26 columns and at most 44, so milestone titles, crew labels
+and the now line truncate less on a wide terminal. Once the terminal is
+92 columns or wider the transcript always keeps at least 60 columns; below
+that the rail stays at 26 columns. Three more `[tui]` keys tune the detail view:
+
+```toml
+[tui]
+milestone_numbers = true   # default false
+rail_min_width = 36        # default 26
+blink = false              # default true
+```
+
+- `milestone_numbers = true` prefixes each rail milestone title with its
+  position in the approved list (`M1`, `M2`, …, right-aligned once there are
+  ten or more), and the `MILESTONES` header names the in-progress milestones
+  by the same positions (`· M2`) instead of their ids. When the run already
+  wrote the same number at the start of the title (`M3 `, `m3 - `, `M3:` on
+  the third row), it is dropped so the row is not doubled. A different
+  number stays, so a plan numbered from zero reads `M1 M0 investigation`
+  and the run's own numbering is never hidden. A word that merely starts
+  with a number, like `M3Migration`, is left alone. The board row is
+  unchanged.
+- `rail_min_width` raises the rail's floor, and may exceed the automatic
+  44-column cap. The 60-column transcript minimum still wins on a terminal
+  too narrow for both. Values below 26 are rejected.
+- `blink = false` pins the static frame instead of the half-second blink of
+  in-progress milestones, the same reduced-motion opt-out as
+  `UZI_TUI_NO_BLINK=1`. Either one turns the blink off; `blink = true` does
+  not override the environment variable.
+
+An invalid value for any `[tui]` key stops `uzi tui` with a usage error
+naming the key. Like `split`, these keys are ignored by `--demo` and
+`--sketch`.
 
 ### Keybindings
 

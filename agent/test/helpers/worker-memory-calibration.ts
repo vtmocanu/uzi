@@ -1,13 +1,18 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { Worker } from "node:worker_threads";
+import { workingSetBytes } from "../../src/worker-memory-guard.js";
 import type { WorkerMemoryReader } from "../../src/worker-memory-reader.js";
 
 type Sample = ReturnType<WorkerMemoryReader["sample"]>;
 type Available = Extract<Sample, { available: true }>;
 type Producer = { step: () => Promise<void>; stop: () => Promise<void> };
 export type CalibrationPlan = Readonly<{
-  limitBytes: number; ceilingBytes: number; baselineBytes: number;
+  limitBytes: number; ceilingBytes: number;
+  /** Raw memory.current maximum: the safety budget and ceiling stay on raw bytes. */
+  baselineBytes: number;
+  /** Working-set maximum (memory.current minus inactive_file): derives the hard threshold H. */
+  workingSetBaselineBytes: number;
   allocationBytes: number; overheadBytes: number; chunkBytes: number; rounds: number; windowMs: number;
 }>;
 type Plan = CalibrationPlan;
@@ -41,13 +46,14 @@ export function calibrationPlan(input: {
     throw new Error("dedicated finite 1Gi/2Gi fixture and <=30s window required");
   }
   const baselineBytes = Math.max(...input.baseline.map((sample) => sample.currentBytes));
+  const workingSetBaselineBytes = Math.max(...input.baseline.map(workingSetBytes));
   const overheadBytes = 64 * MiB, ceilingBytes = limitBytes / 2;
   const rounds = limitBytes === 1024 * MiB ? 16 : 32, chunkBytes = MiB;
   const allocationBytes = 2 * 4 * rounds * chunkBytes;
   if (baselineBytes + allocationBytes + overheadBytes > ceilingBytes) {
     throw new Error("baseline plus allocations and producer overhead exceeds 50% limit");
   }
-  return Object.freeze({ limitBytes, baselineBytes, overheadBytes, ceilingBytes,
+  return Object.freeze({ limitBytes, baselineBytes, workingSetBaselineBytes, overheadBytes, ceilingBytes,
     rounds, chunkBytes, allocationBytes, windowMs: input.windowMs });
 }
 
@@ -68,6 +74,8 @@ export async function calibrationLoad(plan: Plan, ports: {
     || plan.chunkBytes !== MiB || plan.rounds !== (plan.limitBytes === 1024 * MiB ? 16 : 32)
     || plan.allocationBytes !== 8 * plan.rounds * plan.chunkBytes
     || !Number.isSafeInteger(plan.baselineBytes) || plan.baselineBytes < 0
+    || !Number.isSafeInteger(plan.workingSetBaselineBytes) || plan.workingSetBaselineBytes < 0
+    || plan.workingSetBaselineBytes > plan.baselineBytes
     || !Number.isSafeInteger(plan.overheadBytes) || plan.overheadBytes < 64 * MiB
     || plan.baselineBytes + plan.allocationBytes + plan.overheadBytes > plan.ceilingBytes
     || !Number.isInteger(plan.windowMs) || plan.windowMs < 1 || plan.windowMs > 30000) {
@@ -261,16 +269,18 @@ export function calibrationReport(input: CalibrationReportInput) {
     || !Number.isSafeInteger(input.reserveBytes) || input.reserveBytes <= 0
     || input.reserveBytes >= input.samples[0]!.limitBytes) throw new Error("invalid calibration report");
   // Strict comparisons retain the earliest sample/pair on ties.
-  const min = input.baseline.reduce((a, b) => b.currentBytes < a.currentBytes ? b : a);
-  const max = input.baseline.reduce((a, b) => b.currentBytes > a.currentBytes ? b : a);
-  const baselineJitter = { minSampleId: min.sampleId, minBytes: min.currentBytes,
-    maxSampleId: max.sampleId, maxBytes: max.currentBytes };
-  const jitterBytes = max.currentBytes - min.currentBytes;
+  // Crossing, jitter and growth mirror the guard's working-set metric; only the
+  // safety budget and ceiling above stay on raw memory.current.
+  const min = input.baseline.reduce((a, b) => workingSetBytes(b) < workingSetBytes(a) ? b : a);
+  const max = input.baseline.reduce((a, b) => workingSetBytes(b) > workingSetBytes(a) ? b : a);
+  const baselineJitter = { minSampleId: min.sampleId, minBytes: workingSetBytes(min),
+    maxSampleId: max.sampleId, maxBytes: workingSetBytes(max) };
+  const jitterBytes = workingSetBytes(max) - workingSetBytes(min);
   const samplePairs: CalibrationSamplePair[] = input.samples.slice(1).map((current, index) => {
     const previous = input.samples[index]!;
     const elapsedMs = current.completedAtMs - previous.completedAtMs;
     if (elapsedMs <= 0) throw new Error("nonmonotonic calibration time");
-    const rawDeltaBytes = current.currentBytes - previous.currentBytes;
+    const rawDeltaBytes = workingSetBytes(current) - workingSetBytes(previous);
     return { fromSampleId: previous.sampleId, toSampleId: current.sampleId, rawDeltaBytes, elapsedMs,
       positiveRateBytesPerMs: Math.max(0, rawDeltaBytes) / elapsedMs,
       readGapMs: current.startedAtMs - previous.completedAtMs };
@@ -288,9 +298,9 @@ export function calibrationReport(input: CalibrationReportInput) {
       || leg.hardThresholdBytes !== input.samples[0]!.limitBytes - input.reserveBytes) throw new Error("invalid leg binding or threshold");
     seen.add(b.legId);
     const highIndex = input.samples.findIndex((sample) => sample.startedAtMs >= previousCleanupEndMs
-      && sample.currentBytes >= leg.hardThresholdBytes);
+      && workingSetBytes(sample) >= leg.hardThresholdBytes);
     const low = input.samples[highIndex - 1], high = input.samples[highIndex];
-    if (!low || !high || !bracket || low.currentBytes >= leg.hardThresholdBytes
+    if (!low || !high || !bracket || workingSetBytes(low) >= leg.hardThresholdBytes
       || bracket.lastBelowSampleId !== low.sampleId || bracket.firstAtOrAboveSampleId !== high.sampleId
       || bracket.lowerMs !== low.startedAtMs || bracket.upperMs !== high.completedAtMs) {
       throw new Error("missing or mismatched hard crossing bracket");
@@ -337,8 +347,8 @@ export function calibrationReport(input: CalibrationReportInput) {
     elapsedMs: input.samples.at(-1)!.completedAtMs - input.samples[0]!.startedAtMs,
     baselineJitter, samplePairs, peakPositiveGrowthPair, maxSampleGapPair,
     jitterBytes, peakPositiveGrowthRateBytesPerMs, maxSampleGapMs, worstEndToEndLatencyMs, conservativeStageSumMs,
-    netGrowthBytes: input.samples.at(-1)!.currentBytes - input.samples[0]!.currentBytes,
-    monotonicGrowth: input.samples.every((sample, index) => index === 0 || sample.currentBytes >= input.samples[index - 1]!.currentBytes),
+    netGrowthBytes: workingSetBytes(input.samples.at(-1)!) - workingSetBytes(input.samples[0]!),
+    monotonicGrowth: input.samples.every((sample, index) => index === 0 || workingSetBytes(sample) >= workingSetBytes(input.samples[index - 1]!)),
     responseMeasured: response.provenance === "measured",
     accepted: response.provenance === "measured" && satisfied,
     reserveCheck: { reserveBytes: input.reserveBytes, requiredBytes, satisfied } };

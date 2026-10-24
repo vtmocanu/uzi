@@ -697,6 +697,17 @@ workers:
   # Dedicated cross-check lane slots; 0 disables the lane. Accepted range [0, 16].
   # Relayed through UZI_WORKER_CROSS_CHECK_SLOTS to WORKER_CROSS_CHECK_SLOTS.
   crossCheckSlots: 1
+  # Optional Go concurrency defaults for worker commands (issue #3382). Empty = no
+  # override and nothing is rendered. A positive integer <= 2147483647: strings
+  # must be decimal digits, typed numbers are checked by value after Helm decodes
+  # them; anything else fails the render. Relayed through UZI_WORKER_GO_BUILD_PARALLELISM /
+  # UZI_WORKER_GO_MAXPROCS to WORKER_GO_BUILD_PARALLELISM / WORKER_GO_MAXPROCS, which
+  # set GOFLAGS=-p=N and GOMAXPROCS=N for agent commands, worker checks and JS installs.
+  # Setting or changing either value rolls every hosted worker pod once it holds no
+  # non-terminal run. Per command, not
+  # an aggregate worker limit. See docs/configuration.md.
+  goBuildParallelism: ""
+  goMaxProcs: ""
   # The WORKER container's requests.ephemeral-storage (issue #224 →
   # UZI_WORKER_EPHEMERAL_REQUEST). Docker workers get workers.docker.ephemeralRequest
   # INSTEAD of this, not on top of it.

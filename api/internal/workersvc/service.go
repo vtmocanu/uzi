@@ -1820,6 +1820,9 @@ type Service struct {
 	// JobFiles(). Optional (nil-safe); set via SetJobFiles.
 	jobFiles         *JobFiles
 	ciArtifactLimits ciartifacts.Limits
+	// claimSizeLimit overrides claimResponseMaxBytes for the run-lane claim size refusal when
+	// positive; only tests set it.
+	claimSizeLimit int
 	// genMu guards genRuns (the runs with a generated-output storage in flight, each with at most
 	// one pending behind it) and genClosed (set by DrainGeneratedOutputs); genWG tracks the detached
 	// generated-output storages (startJobResultOutputs); genTimeout, genReplyBound and genMax

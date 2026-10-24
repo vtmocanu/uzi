@@ -4,7 +4,7 @@ import type { Config } from "./config.js";
 import type { Logger } from "./log.js";
 import type { MemoryPolicy, WorkerMemoryPressureResult } from "./protocol.js";
 import { WorkerMemoryCommands } from "./worker-memory-commands.js";
-import { WorkerMemoryMonitor } from "./worker-memory-guard.js";
+import { WorkerMemoryMonitor, isMarker, realPressure } from "./worker-memory-guard.js";
 import { WorkerMemoryReader } from "./worker-memory-reader.js";
 
 type Context = ReturnType<WorkerMemoryCommands["begin"]>;
@@ -56,7 +56,7 @@ export class WorkerMemoryRuntime {
   constructor(
     settings: Extract<NonNullable<Config["memoryGuard"]>, { enabled: true }>,
     private readonly client: Pick<WorkerClient, "revokeMemoryAuthority" | "memoryIncarnation" | "subscribeMemoryInvalidation" | "reserveMemoryIntervention" | "reportMemoryInterventionOutcome">,
-    log: Pick<Logger, "error">,
+    log: Pick<Logger, "error" | "warn" | "info">,
     options: { reader?: Pick<WorkerMemoryReader, "sample">; now?: () => number; secrets?: readonly string[] } = {},
   ) {
     if (!Number.isSafeInteger(settings.maxInterventions) || settings.maxInterventions < 1
@@ -72,8 +72,31 @@ export class WorkerMemoryRuntime {
       }
       return bound;
     };
+    // PSI state follows available samples only; unavailable samples neither change it nor log.
+    // tick() is unguarded in the monitor loop, so a throwing logger must not escape.
+    let psi: "unknown" | "present" | "absent" = "unknown";
+    const safeLog = (emit: () => void): void => { try { emit(); } catch { /* diagnostics are best effort */ } };
+    const sampleWithDiagnostics = (): ReturnType<WorkerMemoryReader["sample"]> => {
+      const sample = reader.sample();
+      if (!sample.available) return sample;
+      const pressure = sample.pressure as typeof sample.pressure | undefined;
+      // Only the exact marker or exactly the two real PSI rows change PSI state; any other
+      // (malformed) shape is the guard's to reject and neither changes state nor logs here.
+      if (isMarker(pressure)) {
+        if (psi !== "absent") {
+          psi = "absent";
+          safeLog(() => log.warn("worker memory guard: cgroup memory PSI unavailable; early intervention disabled, hard intervention continues on valid core accounting", { reason: pressure.unavailable }));
+        }
+      } else if (realPressure(pressure) && Object.keys(pressure as object).length === 2) {
+        if (psi === "absent") {
+          safeLog(() => log.info("worker memory guard: cgroup memory PSI restored; early intervention resumes after consecutive PSI samples"));
+        }
+        psi = "present";
+      }
+      return sample;
+    };
     this.monitor = new WorkerMemoryMonitor(settings, {
-      sample: () => reader.sample(),
+      sample: sampleWithDiagnostics,
       now: options.now ?? (() => performance.now()),
       commands: this.commands,
       incarnation: () => client.memoryIncarnation,

@@ -11,8 +11,8 @@ type Sample = {
   available: true;
   currentBytes: number;
   limitBytes: number;
-  stat: { anon: number; shmem: number; slab_unreclaimable: number; unevictable: number };
-  pressure: { some: Psi; full: Psi };
+  stat: { anon: number; shmem: number; slab_unreclaimable: number; unevictable: number; inactive_file: number };
+  pressure: { some: Psi; full: Psi } | { unavailable: "absent" | "unsupported" };
 } | { available: false; reason: UnavailableReason });
 
 const MAX_SAMPLE_BYTES = 64 * 1024;
@@ -45,7 +45,7 @@ function integer(raw: string): number {
 }
 
 function stat(raw: string): Extract<Sample, { available: true }>["stat"] {
-  const required = ["anon", "shmem", "slab_unreclaimable", "unevictable"] as const;
+  const required = ["anon", "shmem", "slab_unreclaimable", "unevictable", "inactive_file"] as const;
   const fields = new Map<string, number>();
   for (const line of raw.trim().split("\n")) {
     const parts = line.trim().split(/\s+/);
@@ -59,6 +59,7 @@ function stat(raw: string): Extract<Sample, { available: true }>["stat"] {
     shmem: fields.get("shmem")!,
     slab_unreclaimable: fields.get("slab_unreclaimable")!,
     unevictable: fields.get("unevictable")!,
+    inactive_file: fields.get("inactive_file")!,
   };
 }
 
@@ -96,7 +97,11 @@ function pressure(raw: string): { some: Psi; full: Psi } {
   return { some: rows.get("some")!, full: rows.get("full")! };
 }
 
-/** Total cgroup v2 memory, independent of StatsCollector's display accounting.
+/** Cgroup v2 memory.current plus the memory.stat fields the guard's working-set policy
+ * needs (inactive_file), independent of StatsCollector's display accounting.
+ * memory.pressure is optional: a read failing with exactly ENOENT or ENOTSUP yields
+ * an explicit { unavailable } marker (never zeros); every other failure still makes
+ * the whole sample unavailable.
  * readBytes must enforce its byte budget before allocating/decoding file contents;
  * returning one sentinel byte beyond the budget signals oversized input.
  * Times use the injected monotonic clock's domain. Consumers can measure age from
@@ -118,11 +123,12 @@ export class WorkerMemoryReader {
     const sampleId = ++this.sequence;
     let remaining = MAX_SAMPLE_BYTES;
     let reason: UnavailableReason = "malformed";
-    const read = (file: string): string => {
+    const read = (file: string, optional?: { code?: string }): string => {
       let bytes: Uint8Array;
       try {
         bytes = (this.options.readBytes ?? boundedRead)(file, remaining);
-      } catch {
+      } catch (error) {
+        if (optional) optional.code = (error as { code?: unknown } | null)?.code as string | undefined;
         reason = "absent";
         throw new Error("absent");
       }
@@ -150,7 +156,15 @@ export class WorkerMemoryReader {
       const limitBytes = integer(limit);
       if (limitBytes === 0) throw new Error("malformed");
       const memoryStat = stat(read(`${root}/memory.stat`));
-      const memoryPressure = pressure(read(`${root}/memory.pressure`));
+      const failure: { code?: string } = {};
+      let memoryPressure: Extract<Sample, { available: true }>["pressure"];
+      try {
+        memoryPressure = pressure(read(`${root}/memory.pressure`, failure));
+      } catch (error) {
+        if (failure.code === "ENOENT") memoryPressure = { unavailable: "absent" };
+        else if (failure.code === "ENOTSUP") memoryPressure = { unavailable: "unsupported" };
+        else throw error;
+      }
       return {
         available: true, sampleId, startedAtMs, completedAtMs: now(),
         currentBytes, limitBytes, stat: memoryStat, pressure: memoryPressure,

@@ -31,7 +31,7 @@ def case():
         for n, (start, current) in enumerate(((0, 100), (250, 100), (500, 100),
                                             (1000, 100), (1250, 120), (1500, 136),
                                             (1750, 100), (2000, 100), (2250, 100)), 1):
-            stat = {"anon": current * mib, "shmem": 0, "slab_unreclaimable": 0, "unevictable": 0}
+            stat = {"anon": current * mib, "shmem": 0, "slab_unreclaimable": 0, "unevictable": 0, "inactive_file": 0}
             events = {"oom": 0, "oom_kill": 0, "oom_group_kill": 0}
             sample = {"available": True, "sampleId": n, "startedAtMs": start, "completedAtMs": start + 1,
                       "currentBytes": current * mib, "limitBytes": limit, "stat": stat, "pressure": copy.deepcopy(psi)}
@@ -40,7 +40,7 @@ def case():
                    "/sys/fs/cgroup/memory.stat": "".join(f"{k} {v}\n" for k, v in stat.items()),
                    "/sys/fs/cgroup/memory.pressure": "some avg10=0 avg60=0 avg300=0 total=0\nfull avg10=0 avg60=0 avg300=0 total=0\n",
                    "/sys/fs/cgroup/memory.events": "oom 0\noom_kill 0\noom_group_kill 0\n"}
-            raw_samples.append({"sample": sample, "raw": raw, "events": events})
+            raw_samples.append({"sample": sample, "raw": raw, "rawErrors": {}, "events": events})
         baseline = [r["sample"] for r in raw_samples[:3]]
         samples = [r["sample"] for r in raw_samples[3:]]
         bracket = {"lastBelowSampleId": 5, "firstAtOrAboveSampleId": 6, "lowerMs": 1250, "upperMs": 1501}
@@ -134,7 +134,7 @@ def case():
                                           "pressure": copy.deepcopy(samples[0]["pressure"])},
                         "guard": {"enabled": True, "reserveBytes": reserve, "hysteresisBytes": 8 * mib,
                                   "sampleMs": 250, "responseBudgetMs": 5000, "rearmMs": 500, "maxInterventions": 2},
-                        "plan": {"limitBytes": limit, "ceilingBytes": limit // 2, "baselineBytes": 100 * mib,
+                        "plan": {"limitBytes": limit, "ceilingBytes": limit // 2, "baselineBytes": 100 * mib, "workingSetBaselineBytes": 100 * mib,
                                  "allocationBytes": 8 * rounds * mib, "overheadBytes": 64 * mib,
                                  "chunkBytes": mib, "rounds": rounds, "windowMs": 30000},
                         "response": {"provenance": "synthetic", "reportId": expected["reportId"], "legs": [leg]},

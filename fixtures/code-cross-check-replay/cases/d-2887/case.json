@@ -1,0 +1,54 @@
+{
+  "id": "d-2887",
+  "kind": "defect",
+  "input_provenance": "reconstructed",
+  "plan_source": "synthetic",
+  "source": {
+    "pr": 2933,
+    "issue": 2887
+  },
+  "squash_sha": "c22a0993e47513dcc51f3518608974cf4701bd88",
+  "base_sha": "9190ca590fe9e41041cf398599223f47125bfa80",
+  "prefix_tree": "de4effb1e0fc5b35db46930b94bec9013abc4622",
+  "prefix_commit": "c555328c7e7514abff82ae68dee3622b79fa043e",
+  "reversal": "inferred",
+  "artifacts": {
+    "issue.md": "e61ffc690e2fbc613176a225942a746cda4a6853ca9609bfdb02781ee3d96aba",
+    "plan.md": "871065c3830393d3b6163ab111aa2e1ea3b73dc2677a53797a56ec9dd5ffe68c",
+    "prefix.patch": "31c1cf1225d6f3e93e65efb7c4785086fe2368afdf5ff785a1fcc7de9f49b0bd",
+    "removed.patch": "f4e6f841c201fb532c9ac064f1d4d49ea873687f98a86d0c8e8abe7192fc7ac4"
+  },
+  "witnesses": [
+    {
+      "file": "witness/fixture-repo.test.ts.blob",
+      "path": "agent/test/fixture-repo.test.ts",
+      "blob_id": "804bd2826e08843db5af6b8bb4af7dda9e82e7f6",
+      "sha256": "6825d8ab1ebecae81d86c705ad47c95eebf70c70b44c8b61ddd183963e2e8306"
+    }
+  ],
+  "expected": [
+    {
+      "id": "D1",
+      "paths": [
+        "agent/test/fixture-repo.ts",
+        "agent/test/fixture-repo.test.ts"
+      ],
+      "line_range": null,
+      "use_line_range": false,
+      "match": [
+        "\\b(?:cleanup|rmSync|remov\\w*)\\b[\\s\\S]*\\b(?:fail\\w*|throw\\w*|error)\\b[\\s\\S]*\\b(?:original|normali[sz]\\w*|mask\\w*|replac\\w*|precedence|swallow\\w*)",
+        "\\b(?:original|normali[sz]ation)\\s+error\\b[\\s\\S]*\\b(?:cleanup|remov\\w*|rmSync)",
+        "\\b(?:no|missing|lacks?|untested)\\b[\\s\\S]*\\btest[\\s\\S]*\\b(?:cleanup|remov\\w*|rmSync)\\b[\\s\\S]*\\bfail"
+      ],
+      "detectability": "read_only",
+      "rationale": "Test gap: nothing pins that the original normalization error survives when removing the failed scratch root also fails.",
+      "in_diff": true,
+      "signature": {
+        "path": "agent/test/fixture-repo.test.ts",
+        "literal": "cleanupFails",
+        "present": false,
+        "witness": "witness/fixture-repo.test.ts.blob"
+      }
+    }
+  ]
+}

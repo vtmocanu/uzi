@@ -176,6 +176,12 @@ type Config struct {
 	WorkerMemoryGuardResponseBudgetMs int64
 	WorkerMemoryGuardMaxInterventions int64
 
+	// WorkerGoBuildParallelism / WorkerGoMaxProcs are optional caps relayed as
+	// WORKER_GO_BUILD_PARALLELISM / WORKER_GO_MAXPROCS. 0 means unset (the env is
+	// not rendered).
+	WorkerGoBuildParallelism int
+	WorkerGoMaxProcs         int
+
 	// --- Codex uid-split profile (PRD #1493 M1) -------------------------------
 	// WorkerUIDSplit opts the fleet into the Codex uid-split worker profile
 	// (UZI_WORKER_UID_SPLIT, default false). When on, the controller renders the
@@ -462,6 +468,9 @@ func loadWorkerSettings(cfg *Config) error {
 	// pod. Raising it opts into the intra-user concurrency residuals documented in
 	// docs/worker-setup.md (PRD #58 Decision 7).
 	if err := loadWorkerMemoryGuard(cfg); err != nil {
+		return err
+	}
+	if err := loadWorkerGoConcurrency(cfg); err != nil {
 		return err
 	}
 

@@ -4,6 +4,7 @@ import type { RunContext } from "../src/executor.js";
 import type { installJsDeps, JsDepsInstall } from "../src/js-deps.js";
 import { startDepsInstall, reportDepsInstall, safeDirLabel } from "../src/js-deps-provision.js";
 import { depsProvisionImplementNote } from "../src/prompt.js";
+import { configureGoConcurrency } from "../src/go-concurrency.js";
 import { recordingLogger } from "./helpers.js";
 
 function probe() {
@@ -48,6 +49,36 @@ describe("harness-neutral JS dependency provisioning", () => {
     assert.deepEqual(await promise, { results: [], truncated: false });
     assert.deepEqual(p.lines, []);
   });
+
+  // Issue #3382: asserted at the installer launch seam (the env the install receives).
+  for (const [label, settings, expected] of [
+    ["set", { buildParallelism: 2, maxProcs: 3 }, { GOFLAGS: "-p=2", GOMAXPROCS: "3" }],
+    ["unset", {}, {}],
+  ] as const) {
+    it(`issue #3382: the install env carries the configured Go concurrency (${label}) next to a provisioned toolEnv`, async () => {
+      const p = probe();
+      let seen: NodeJS.ProcessEnv | undefined;
+      const install: typeof installJsDeps = (_root, env) => {
+        seen = env;
+        return Promise.resolve({ results: [], truncated: false });
+      };
+      try {
+        configureGoConcurrency(settings);
+        await startDepsInstall(p.ctx, p.logger, "/fixture/run-home",
+          { PATH: "/fixture/tools/bin", GOFLAGS: "-toolexec=evil" }, new AbortController().signal, install);
+      } finally {
+        configureGoConcurrency({});
+      }
+      assert.ok(seen, "installer received an env");
+      assert.equal(seen.PATH, "/fixture/tools/bin");
+      assert.equal(seen.GOFLAGS, (expected as { GOFLAGS?: string }).GOFLAGS);
+      assert.equal(seen.GOMAXPROCS, (expected as { GOMAXPROCS?: string }).GOMAXPROCS);
+      if (label === "unset") {
+        assert.equal(Object.hasOwn(seen, "GOFLAGS"), false);
+        assert.equal(Object.hasOwn(seen, "GOMAXPROCS"), false);
+      }
+    });
+  }
 
   for (const synchronous of [true, false]) {
     it(`normalizes ${synchronous ? "synchronous throws" : "rejections"} before a delayed join`, async () => {

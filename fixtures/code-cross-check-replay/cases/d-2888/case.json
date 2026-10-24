@@ -1,0 +1,56 @@
+{
+  "id": "d-2888",
+  "kind": "defect",
+  "input_provenance": "reconstructed",
+  "plan_source": "synthetic",
+  "source": {
+    "pr": 2926,
+    "issue": 2888
+  },
+  "squash_sha": "64e4ff7395791ee9875a7114f153a3abe0dc0095",
+  "base_sha": "374343d0319956d4c3be492da0174510554e6b99",
+  "prefix_tree": "01b366f0c2e8bff603517e1631f7f52e108fd41e",
+  "prefix_commit": "a822cfb5f9429adce580b9aff5370f29927fef65",
+  "reversal": "recovered",
+  "artifacts": {
+    "issue.md": "723a9738c11b9e75a59bf89eeb2e4e9a61a63cd28035c515fc3c03139ac6bb60",
+    "plan.md": "38e0a7cc97de6e23fc57d6f43c0b2eb93d19b0669a953da34b02c588b6c8e946",
+    "prefix.patch": "22b2a67b32dba8686fdb84177b857073ac64506133d7814dc84f89b624c40d03",
+    "removed.patch": "2a21fe826d4ad4732b957e2dc95aaa58c351f5d43bcbe0db46dd4f93edaa66f2"
+  },
+  "witnesses": [
+    {
+      "file": "witness/client.ts.blob",
+      "path": "agent/src/client.ts",
+      "blob_id": "7713e99f85f57c3ecd356f29e290936370e19e1b",
+      "sha256": "9cc42dd9f9cd5ec9e914896315a3c9ccb547ac90627c55852dca55b3ee77ad3c"
+    }
+  ],
+  "expected": [
+    {
+      "id": "D3",
+      "paths": [
+        "agent/src/client.ts"
+      ],
+      "line_range": [
+        3712,
+        3743
+      ],
+      "use_line_range": true,
+      "match": [
+        "\\bcancel(?:lation|led|s)?\\b[\\s\\S]*\\b(?:never\\s+(?:settl|resolv)|hang(?:s|ing)?\\b|(?:does|do|may|might|can)\\s*(?:not|n't)\\s+(?:settl|resolv))",
+        "\\b(?:never\\s+(?:settl|resolv)|hang(?:s|ing)?\\b)[\\s\\S]*\\bcancel",
+        "\\bawait(?:ed|s|ing)?\\b[\\s\\S]*\\bcancel[\\s\\S]*\\b(?:never|hang(?:s|ing)?\\b|not\\s+(?:settl|resolv))"
+      ],
+      "detectability": "read_only",
+      "rationale": "readBoundedText awaits reader.cancel() in its finally block, so a response source whose cancellation never settles keeps an overflow or abort error from reaching the caller.",
+      "in_diff": false,
+      "signature": {
+        "path": "agent/src/client.ts",
+        "literal": "    await reader.cancel().catch(() => undefined);",
+        "present": true,
+        "witness": "witness/client.ts.blob"
+      }
+    }
+  ]
+}

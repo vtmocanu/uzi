@@ -63,6 +63,7 @@ import { GitCache, assertCaptureLaunch } from "../src/git.js";
 import { FakeApi } from "./fake-api.js";
 import { makeFixture } from "./fixture-repo.js";
 import { makeClaim, testGitCacheOptions, recordingLogger, withReceipts } from "./helpers.js";
+import { configureGoConcurrency } from "../src/go-concurrency.js";
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import { WORKER_UID, RUNNER_UID, runnerCommand, commandRootCommand } from "../src/runner-uid.js";
@@ -804,7 +805,7 @@ describe("M3 actual runner memory Codex delivery", () => {
         const time = performance.now();
         return { available: true, sampleId: ++sampleId, startedAtMs: time, completedAtMs: time,
           currentBytes: usage, limitBytes: 1000,
-          stat: { anon: 1, shmem: 0, slab_unreclaimable: 0, unevictable: 0 },
+          stat: { anon: 1, shmem: 0, slab_unreclaimable: 0, unevictable: 0, inactive_file: 0 },
           pressure: { some: { avg10: 0, avg60: 0, avg300: 0, total: 0 },
             full: { avg10: 0, avg60: 0, avg300: 0, total: 0 } } };
       } },
@@ -8950,6 +8951,27 @@ describe("CodexExecutor: credential-free command env (item 6)", () => {
     assert.equal(env.TMPDIR, "/private/tmp");
   });
 
+  it("issue #3382: applies the configured Go concurrency after the toolEnv fold, and adds no key when unset", () => {
+    const tool = { PATH: "/provisioned/go/bin", GOFLAGS: "-toolexec=evil", GOMAXPROCS: "99" };
+    try {
+      configureGoConcurrency({ buildParallelism: 2, maxProcs: 3 });
+      const set = buildCommandEnv("/private/tmp", tool);
+      assert.equal(set.GOFLAGS, "-p=2");
+      assert.equal(set.GOMAXPROCS, "3");
+      assert.equal(set.PATH, `${FIXED_PATH}:/provisioned/go/bin`);
+      configureGoConcurrency({ maxProcs: 4 });
+      const partial = buildCommandEnv("/private/tmp", {});
+      assert.equal(partial.GOMAXPROCS, "4");
+      assert.equal(Object.hasOwn(partial, "GOFLAGS"), false);
+      configureGoConcurrency({});
+      const unset = buildCommandEnv("/private/tmp", {});
+      assert.equal(Object.hasOwn(unset, "GOFLAGS"), false);
+      assert.equal(Object.hasOwn(unset, "GOMAXPROCS"), false);
+    } finally {
+      configureGoConcurrency({});
+    }
+  });
+
   it("with no provisioned PATH the fixed boundary PATH stands alone", () => {
     assert.equal(buildCommandEnv("/private/tmp", {}).PATH, FIXED_PATH);
   });
@@ -9010,6 +9032,50 @@ describe("CodexExecutor: credential-free command env (item 6)", () => {
     assert.equal(env.LOCALE_ARCHIVE, "/nix/locale-archive");
     assert.equal(env.UZI_CODEX_COMMANDENV_CANARY, undefined, "process.env is not inherited into the credential-free command identity");
   });
+
+  // Issue #3382: asserted at the launch seams of a real executor run (the fileop root's launch
+  // spec and the env the command seam receives), with a provisioned toolEnv in play.
+  for (const [label, settings, expected] of [
+    ["both set", { buildParallelism: 2, maxProcs: 3 }, { GOFLAGS: "-p=2", GOMAXPROCS: "3" }],
+    ["unset", {}, {}],
+  ] as const) {
+    it(`issue #3382: run() launches commands with the configured Go concurrency (${label}) next to a provisioned toolEnv`, async () => {
+      const rig = makeRig();
+      rig.deps = {
+        ...rig.deps,
+        provisionRunTools: async () => ({
+          toolEnv: { PATH: "/provisioned/go/bin" } as Record<string, string>,
+        }),
+      };
+      rig.transport
+        .push(threadStarted())
+        .push(toolCall(1, "Bash", { command: "go build ./..." }, "th-1", "tn-1", "c-go"))
+        .push(signalDone())
+        .push(turnCompleted("completed"))
+        .end();
+      try {
+        configureGoConcurrency(settings);
+        await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "go concurrency run");
+      } finally {
+        configureGoConcurrency({});
+      }
+      assert.equal(rig.fileopSpawns.length, 1);
+      assert.equal(rig.spawnCommandCalls.length, 1, "the Bash effect reached the command seam");
+      const launched = [
+        rig.fileopSpawns[0]!.env,
+        (rig.spawnCommandCalls[0]!.opts as { env: NodeJS.ProcessEnv }).env,
+      ];
+      for (const env of launched) {
+        assert.ok(String(env.PATH).includes("/provisioned/go/bin"), "the provisioned PATH rides in the same env");
+        assert.equal(env.GOFLAGS, (expected as { GOFLAGS?: string }).GOFLAGS);
+        assert.equal(env.GOMAXPROCS, (expected as { GOMAXPROCS?: string }).GOMAXPROCS);
+        if (label === "unset") {
+          assert.equal(Object.hasOwn(env, "GOFLAGS"), false, "an unset setting adds no GOFLAGS key");
+          assert.equal(Object.hasOwn(env, "GOMAXPROCS"), false);
+        }
+      }
+    });
+  }
 
   // PRD #1493 M3 (part C) — the sandbox mode in the emitted --mode token comes ONLY from the
   // worker Config, never from a UZI_CODEX_COMMAND_SANDBOX value smuggled through the

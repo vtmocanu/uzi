@@ -132,10 +132,12 @@ elif args[0] == "start":
             if mode == "guarded-unquiesced": cleanup["quiesceConfirmed"] = False
             print("UZI_NODE_DIAGNOSTIC_BEGIN")
             print(json.dumps({"schemaVersion": 1, "workload": workload, "leg": "guarded", "nodeVersion": "v24.0.0",
-                              "psiSynthesized": True, "baselineBytes": 100,
-                              "growth": {"series": [[1, 3.0, 100], [2, 250.0, 700]], "sampleCount": 2, "peakSeriesBytes": 700},
-                              "timeline": {"crossingSampleCompletedMs": 250.0}, "budget": {"crossingToReserveRequestMs": 5.0,
-                              "cancelToConfirmedDrainMs": 55.0, "crossingToConfirmedDrainMs": 110.0},
+                              "psiAvailable": False, "baselineBytes": 100,
+                              "baselineWorkingSetBytes": 100,
+                              "growth": {"series": [[1, 3.0, 100, 100], [2, 250.0, 700, 700]], "sampleCount": 2,
+                                         "peakSeriesBytes": 700},
+                              "timeline": {"crossingSampleCompletedMs": 250.0, "crossingWorkingSetBytes": 700},
+                              "budget": {"crossingToReserveRequestMs": 5.0, "cancelToConfirmedDrainMs": 55.0, "crossingToConfirmedDrainMs": 110.0},
                               "tool": tool, "cleanup": cleanup}))
             print("UZI_NODE_DIAGNOSTIC_END")
             sys.exit(0 if mode != "diag-nonzero" else 3)
@@ -274,7 +276,7 @@ class RunnerTest(unittest.TestCase):
                           for workload in calibration.DIAG_WORKLOADS + calibration.DIAG_GUARDED_WORKLOADS])
         guarded = [r for r in measured if r.get("leg") == "guarded"]
         self.assertEqual(len(guarded), 2)
-        self.assertTrue(all(r["psiSynthesized"] is True for r in guarded))
+        self.assertTrue(all(r["psiAvailable"] is False for r in guarded))
         creates = [c for c in calls if c[:2] == ["docker", "create"]
                    and "-diag-" in c[c.index("--name") + 1]]
         starts = {c[-1] for c in calls if c[:2] == ["docker", "start"]}
@@ -518,10 +520,10 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(stderr.getvalue().count("node=" + results[0]["nodeVersion"]), 8)
         journal = [json.loads(line) for line in (directory / "requests.jsonl").read_text().splitlines()]
         self.assertEqual(len(journal), 8)
-        # The guarded measurement keeps its tool result and says whether PSI was synthesized.
+        # The guarded measurement keeps its tool result and says whether real PSI was available.
         for result in [r for r in results if r.get("leg") == "guarded"]:
             self.assertEqual(result["tool"]["pressure"]["code"], "worker_memory_pressure")
-            self.assertIs(result["psiSynthesized"], True)
+            self.assertIs(result["psiAvailable"], False)
 
     def test_diagnostic_oom_or_timeout_is_a_recorded_measurement_not_failure(self):
         for mode in ("diag-oom", "diag-timeout"):

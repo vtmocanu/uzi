@@ -2,12 +2,12 @@ package workersvc
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"testing"
 
-	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/google/uuid"
 	"github.com/vtmocanu/uzi/api/internal/capability"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -66,29 +66,17 @@ func TestTaskCheckpointReviewCompletionLiveDB(t *testing.T) {
 					t.Fatal("foreign branch changed the review or its frozen coordinates")
 				}
 			}
-			// ReviewRunner reports only completed + generation, without a branch.
+			// ReviewRunner's exact body (agent/src/review-runner.ts: { status: "completed",
+			// claim_generation }), without a branch. Enrolled or not, a task completion keeps
+			// its server-named branch (#3393) and the completed review enqueues then-fix.
 			completed, applied, _, err := f.svc.SetStateReport(f.env.ctx, f.wkr, review.ID, StateRequest{
 				State: "completed", ClaimGeneration: &b.ClaimGeneration,
 			})
-			if !enrolled {
-				// Known bug #3393: unenrolled task review completion is refused; flip this when #3393 lands.
-				// Legacy task completion still attempts NULL, which runs_kind_shape
-				// refuses. This fix must not change that separate existing behavior.
-				var pgErr *pgconn.PgError
-				if !errors.As(err, &pgErr) || pgErr.Code != "23514" || pgErr.ConstraintName != "runs_kind_shape" || applied {
-					t.Fatalf("legacy omission changed: applied=%v err=%v", applied, err)
-				}
-				retained := mustRun(t, f.env, review.ID)
-				if retained.Status != review.Status || retained.Branch != review.Branch || countTaskRunsForThenFixOriginal(t, f.env, root.ID) != 0 {
-					t.Fatal("legacy refusal changed the review or enqueued then-fix")
-				}
-				return
-			}
 			if err != nil || !applied || completed.Status != "completed" {
 				t.Fatalf("review completion applied=%v status=%s err=%v", applied, completed.Status, err)
 			}
 			if completed.Branch != root.Branch || !bytes.Equal(completed.CheckpointCoordinates, review.CheckpointCoordinates) {
-				t.Fatal("omitted branch lost the enrolled work branch or coordinates")
+				t.Fatal("omitted branch lost the task work branch or changed its coordinates")
 			}
 			fixID, _ := firstTaskRunForThenFixOriginal(t, f.env, root.ID)
 			fix := mustRun(t, f.env, fixID)
@@ -96,9 +84,52 @@ func TestTaskCheckpointReviewCompletionLiveDB(t *testing.T) {
 				t.Fatal("completion did not enqueue then-fix on the inherited root branch")
 			}
 			c := claim(fix)
-			if c.CheckpointCoordinates.WorkBranch != root.Branch.String || c.CheckpointCoordinates.CheckpointKey != "uzi/task/"+fix.ID.String() {
+			// An unenrolled then-fix claim carries no descriptor (claim asserts that).
+			if enrolled && (c.CheckpointCoordinates.WorkBranch != root.Branch.String || c.CheckpointCoordinates.CheckpointKey != "uzi/task/"+fix.ID.String()) {
 				t.Fatal("then-fix claim lost the inherited work branch or own checkpoint key")
 			}
 		})
 	}
+}
+
+// TestRunCompletedBranchOmissionControlsLiveDB pins the #3393 preservation to task runs: an
+// issue run's branchless completion still writes NULL, and an unenrolled task's explicit
+// branch still replaces the stored one.
+func TestRunCompletedBranchOmissionControlsLiveDB(t *testing.T) {
+	f := newCustodyContinuationFixture(t, setupCodexLiveDB(t))
+	complete := func(id uuid.UUID, branch *string) store.Run {
+		t.Helper()
+		n, err := f.env.q.SetRunCompleted(f.env.ctx, store.SetRunCompletedParams{
+			ID: id, WorkerID: pgconv.UUID(f.workerID), Branch: stripNULParam(branch),
+		})
+		if err != nil || n != 1 {
+			t.Fatalf("SetRunCompleted = %d, %v; want 1 row", n, err)
+		}
+		run := mustRun(t, f.env, id)
+		if run.Status != "completed" {
+			t.Fatalf("status = %s, want completed", run.Status)
+		}
+		return run
+	}
+	t.Run("issue_omitted_branch_stores_null", func(t *testing.T) {
+		f.nextIID++
+		id := uuid.New()
+		f.env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, worker_id, claim_generation, branch)
+		            VALUES ($1, $2, $3, 'issue', $4, 't', 'd', 'running', $5, 1, 'agent/issue-control')`,
+			id, f.userID, f.repoID, f.nextIID, f.workerID)
+		if run := complete(id, nil); run.Branch.Valid {
+			t.Fatalf("issue completion without branch kept %q, want NULL", run.Branch.String)
+		}
+	})
+	t.Run("unenrolled_task_explicit_branch_stored", func(t *testing.T) {
+		id := uuid.New()
+		f.env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_title, issue_description, status, worker_id, claim_generation, branch)
+		            VALUES ($1, $2, $3, 'task', 't', 'd', 'running', $4, 1, 'uzi/task-created')`,
+			id, f.userID, f.repoID, f.workerID)
+		explicit := "uzi/task-explicit"
+		run := complete(id, &explicit)
+		if run.Branch.String != explicit || run.CheckpointCoordinates != nil {
+			t.Fatalf("explicit task branch stored %q (coordinates %s), want %q", run.Branch.String, run.CheckpointCoordinates, explicit)
+		}
+	})
 }

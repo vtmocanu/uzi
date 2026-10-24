@@ -499,6 +499,55 @@ Set on the `agent` compose service (profile `agent`) or on a standalone `docker 
 
 Duration values accept the same Go-style strings used server-side (`15s`, `3s`, `500ms`, `2h`) or a bare integer read as milliseconds.
 
+### Worker Go concurrency defaults
+
+Two optional settings (issue #3382) cap the Go build and runtime parallelism of
+commands the worker launches. Both are **unset by default**: nothing is rendered
+and no `GOFLAGS` or `GOMAXPROCS` is injected.
+
+| Worker environment variable | Helm `workers` key | Default | Meaning |
+|---|---|---|---|
+| `WORKER_GO_BUILD_PARALLELISM` | `goBuildParallelism` | empty | Sets `GOFLAGS=-p=N`: how many packages `go build` and `go test` build or run in parallel. |
+| `WORKER_GO_MAXPROCS` | `goMaxProcs` | empty | Sets `GOMAXPROCS=N`: the Go runtime's CPU parallelism. The `go` command's `-p` defaults to `GOMAXPROCS`, so this also bounds package parallelism when no `-p` is set. |
+
+String values (quoted YAML, `--set-string`, and the controller and worker
+environment) must be positive decimal digits up to `2147483647`; surrounding
+whitespace is trimmed, empty means unset, and leading zeros are accepted
+(`007` is `7`). Zero, signs, fractions, non-digits and larger values are
+rejected: the chart render fails, the controller refuses to start, or the worker
+refuses to start, depending on where the value is set. Helm decodes typed
+numbers (unquoted YAML, `--set`) before the template sees them, so those are
+checked by numeric value: a whole number from `1` to `2147483647`, relayed as its
+canonical decimal (`+1` arrives as `1`; in a values file `0x10` and `1e3` also
+arrive as `16` and `1000`, while `--set` decodes only decimal integers). Quote the
+value in YAML or use `--set-string` to have the spelling checked. There is no general `GOFLAGS` passthrough.
+
+The values apply to the scrubbed environment of Claude commands (native and
+guarded), Codex commands, worker-run checks and JavaScript dependency installs.
+Compose relays both variables from `.env`; hosted workers use the chart keys,
+and the controller receives them as `UZI_WORKER_GO_BUILD_PARALLELISM` and
+`UZI_WORKER_GO_MAXPROCS` and relays them into worker pods. Setting or changing
+either hosted value rolls every hosted worker pod once it holds no non-terminal
+run; compose and self-run workers
+pick it up on restart. Both the controller and the worker image must come from a
+release containing this change; older ones ignore the settings.
+
+Limits:
+
+- This is not a worker-wide process or memory limit. Each concurrent command gets
+  the same value on its own.
+- An explicit `-p` flag, or a command or Taskfile that sets its own `GOFLAGS`,
+  replaces `-p=N`. `GOMAXPROCS` still applies, so `goMaxProcs` is the more
+  robust knob.
+- It does not cap per-test internal concurrency, child processes or memory, and
+  command code can replace its own environment.
+- On Codex, the worker's own Go helper processes (supervisor, sandbox and
+  file-operation helper) launched with the command environment also inherit
+  `GOMAXPROCS`.
+
+See [Worker setup](./worker-setup.md#3-run-the-worker) for supplying the values
+to a self-run worker.
+
 ### Worker memory guard
 
 The proactive worker memory guard is **off by default** (issue #2396).
@@ -535,8 +584,28 @@ These `_MS` settings take decimal milliseconds, not Go-style durations.
 For a finite cgroup limit `L = memory.max`, the guard computes
 `H = L - reserveBytes` and `Q = H - hysteresisBytes`, requiring
 `0 < Q < H < L`. Unavailable, stale or incompatible cgroup evidence inhibits
-intervention; an unlimited cgroup does not supply a usable limit. Total
-`memory.current` is authoritative, with no file-memory subtraction.
+intervention; an unlimited cgroup does not supply a usable limit. Pressure
+is the working set, `max(0, memory.current - inactive_file)`; it is compared with `H`
+and drives the early projection and the below-`Q` quiet dwell (the early
+projection runs only with PSI).
+`memory.stat` must contain `inactive_file`, else the sample is unavailable.
+The working set is an estimate, not guaranteed non-reclaimable memory and not
+an OOM predictor: inactive file pages can be dirty, under writeback or slow to
+reclaim, so the subtraction can underestimate pressure (dirty/writeback
+validation is deferred). Feedback's `observed_total_bytes` stays the raw
+`memory.current` and can exceed the working set that triggered.
+
+Cgroup memory PSI (`memory.pressure`) is optional. A read failing with exactly
+`ENOENT` or `ENOTSUP` marks PSI absent; any other error, or malformed or
+oversized PSI, makes the whole sample unavailable. Early intervention needs real
+PSI in two consecutive samples, an increasing full-PSI total, growth in
+`anon`, `shmem`, `slab_unreclaimable` or `unevictable`, and a working-set
+projection reaching `H` within the response budget. Without PSI only the hard
+path (working set at or above `H`) can fire. The worker logs one `warn`
+("worker memory guard: cgroup memory PSI unavailable; early intervention
+disabled, hard intervention continues on valid core accounting", field `reason`) on initial absence or
+loss, and one `info` ("worker memory guard: cgroup memory PSI restored; early
+intervention resumes after consecutive PSI samples") on restoration; repeats are silent.
 Approximate command-tree RSS ranks eligible targets; it does not measure
 cgroup usage or prove that memory was freed.
 

@@ -8,6 +8,7 @@ import type { CodexHarnessAvailability } from "./codex/codex-capability.js";
 import { TRANSIENT_TRIP_MS } from "./batcher.js";
 import { errMessage } from "./util.js";
 import { parseRecoveryDecodedLimitBytes } from "./recovery-closure.js";
+import { parseBoundedPositiveInt, parseGoConcurrency, type GoConcurrency } from "./go-concurrency.js";
 
 // Worker configuration, parsed from env (PRD #4 §Configuration).
 //
@@ -214,6 +215,8 @@ export interface Config {
    * only — the chat lane has its own, distinct ceiling (chatSessions above).
    */
   maxConcurrentRuns: number;
+  /** Optional WORKER_GO_BUILD_PARALLELISM / WORKER_GO_MAXPROCS (issue #3382); `{}` when unset. */
+  goConcurrency: GoConcurrency;
   /** Explicit opt-in; limit-relative thresholds are validated by the memory guard. */
   memoryGuard?: { enabled: false } | {
     enabled: true;
@@ -541,9 +544,8 @@ function memoryGuardConfig(env: NodeJS.ProcessEnv): NonNullable<Config["memoryGu
     throw new Error("WORKER_MEMORY_GUARD_ENABLED must be a boolean");
   }
   function explicitInteger(name: string, ceiling: number): number {
-    const raw = env[name]?.trim() ?? "";
-    const value = Number(raw);
-    if (!/^[0-9]+$/.test(raw) || !Number.isSafeInteger(value) || value <= 0 || value > ceiling) {
+    const value = parseBoundedPositiveInt(env[name]?.trim() ?? "", ceiling);
+    if (value === undefined) {
       throw new Error(`${name} must be an explicit positive integer <= ${ceiling}`);
     }
     return value;
@@ -638,6 +640,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     // the safe default. The soft-ceiling warn lives in main.ts (needs the logger,
     // built after this parse) — see MAX_CONCURRENT_RUNS_SOFT_CEILING.
     maxConcurrentRuns: positiveInt(env, "WORKER_MAX_CONCURRENT_RUNS", 1),
+    goConcurrency: parseGoConcurrency(env),
     memoryGuard: memoryGuardConfig(env),
     // Populated by main.ts after an async liveness probe (see the field doc); the sync
     // parse cannot probe, so the default is "no daemon wired".

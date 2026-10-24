@@ -84,6 +84,7 @@ phase worker-proof capture "$REPORT_DIR/results.xml" "$((${WORKER_UID_TIMEOUT:-6
   /app/uzi-worker-uid-proof/agent/test/git-planning-diff.test.ts \
   /app/uzi-worker-uid-proof/agent/test/codex-capture-reaper-real.test.ts \
   /app/uzi-worker-uid-proof/agent/test/git-retained-permissions.test.ts \
+  /app/uzi-worker-uid-proof/agent/test/code-cross-check-replay-uid-split.test.ts \
   /app/uzi-worker-uid-proof/agent/test/claude-command-launcher.test.ts \
   /app/uzi-worker-uid-proof/e2e/worker-uid/claude-command-real.test.mts
 rc=$?

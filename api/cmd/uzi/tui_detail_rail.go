@@ -4,7 +4,10 @@ package main
 // identities/rows, and the milestone-progress fold.
 
 import (
+	"fmt"
 	"image/color"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -100,7 +103,7 @@ func (m tuiModel) railWorkerLine() string {
 
 // railWaitingMaxRows bounds the waiting explanation's height on the rail. Five rows keep the
 // stale-requeue pin reason's deadline AND a typical previous worker's name (up to about 50
-// characters) visible at laneRailWidth (issue #2705: the name is often shown nowhere else once
+// characters) visible even at the minimum laneRailWidth (issue #2705: the name is often shown nowhere else once
 // the run is queued); a longer user-chosen name is ellipsized.
 const railWaitingMaxRows = 5
 
@@ -110,7 +113,7 @@ const railWaitingLabel = "queued ▸ "
 // railWaitingLine explains why a queued run is waiting (issue #2705: for example a stale-requeued
 // run held for its returning worker, with the deadline). It draws only for a queued run whose
 // health is waiting_worker and carries a reason, wraps to railWaitingMaxRows rows within
-// laneRailWidth, and is also counted by railAutoFolded before the protected blocks. The reason is
+// railWidth(), and is also counted by railAutoFolded before the protected blocks. The reason is
 // server text but derived from worker names, so it goes through renderer.Plain (D7).
 func (m tuiModel) railWaitingLine() string {
 	run := m.detail.run
@@ -118,8 +121,8 @@ func (m tuiModel) railWaitingLine() string {
 		return ""
 	}
 	text := struct{ runHealthReason string }{runHealthReason: *run.HealthReason}
-	plain := m.renderer.Plain(text.runHealthReason, laneRailWidth*railWaitingMaxRows+railWaitingMaxRows)
-	rows := wrapWords(railWaitingLabel+plain, laneRailWidth, railWaitingMaxRows)
+	plain := m.renderer.Plain(text.runHealthReason, m.railWidth()*railWaitingMaxRows+railWaitingMaxRows)
+	rows := wrapWords(railWaitingLabel+plain, m.railWidth(), railWaitingMaxRows)
 	if len(rows) == 0 {
 		return ""
 	}
@@ -388,8 +391,10 @@ func (m tuiModel) laneRow(l agentLane, selected bool, st crewState, suffix strin
 		line += paintSeg(m.pal.faintC, bg, false, suffix)
 	}
 	if showMeter {
-		// The bar fills whatever the rail has left after the ▸● <role><suffix> prefix,
+		// The bar fills whatever the 26-col budget has left after the ▸● <role><suffix> prefix,
 		// the meter's own leading space, its separator space, and the 4-col percent (=6).
+		// The bar keeps the minimum rail's budget on a wider rail, like the account meters: a longer
+		// bar adds no information beside the printed percent (issue #3406).
 		barW := laneRailWidth - visualWidth(line) - 6
 		if barW < 0 {
 			barW = 0
@@ -397,7 +402,7 @@ func (m tuiModel) laneRow(l agentLane, selected bool, st crewState, suffix strin
 		line += m.contextMeterCell(bg, fill, barW)
 	}
 	var sb strings.Builder
-	sb.WriteString(padSeg(line, laneRailWidth, bg) + "\n")
+	sb.WriteString(padSeg(line, m.railWidth(), bg) + "\n")
 	if l.Label != "" {
 		// The machine's own words about its task: italic (degrading to plain under NO_COLOR),
 		// faint. Still UNTRUSTED → renderer.Plain.
@@ -406,15 +411,63 @@ func (m tuiModel) laneRow(l agentLane, selected bool, st crewState, suffix strin
 			lst = lst.Background(bg)
 		}
 		label := paintSeg(nil, bg, false, "   ") + lst.Render(m.renderer.Plain(l.Label, laneLabelCap))
-		sb.WriteString(padSeg(label, laneRailWidth, bg) + "\n")
+		sb.WriteString(padSeg(label, m.railWidth(), bg) + "\n")
 	}
 	return sb.String()
 }
 
-// milestoneTitleCap is the per-row title budget in the crew rail (laneRailWidth 26 minus
-// the " ✓ " glyph prefix). joinColumns clamps the whole left column anyway, but Plain must
-// cap the UNTRUSTED title itself (D7), so it caps at the width the rail can actually show.
-const milestoneTitleCap = 22
+// milestoneTitleCap is the per-row title budget in the crew rail (railWidth minus the " ✓ "
+// glyph prefix, 22 at the minimum rail). joinColumns clamps the whole left column anyway, but
+// Plain must cap the UNTRUSTED title itself (D7), so it caps at the width the rail can show.
+func (m tuiModel) milestoneTitleCap() int { return m.railWidth() - 4 }
+
+// milestoneNumberPrefix matches a model-written leading milestone number ("M3 ", "m4 - ",
+// "M5:", a bare "M9"), but not a word that merely starts with one ("M3Migration", "M3D").
+var milestoneNumberPrefix = regexp.MustCompile(`^\s*[Mm](\d+)(?:\s*[:.)\-]\s*|\s+|$)`)
+
+// numberedMilestoneTitle splits a rail title into the [tui] milestone_numbers position prefix
+// (1-based frozen position, right-aligned to the widest one, plus a space) and the title text.
+// A model-written leading number is dropped only when it equals the position; a different one
+// (a zero-based plan's "M0 investigation") stays, so the number the plan and transcript use is
+// never hidden. A title that is nothing but a number keeps its original text. The prefix is ours
+// and trusted; the title still goes through renderer.Plain, which trims leading space and so
+// cannot carry the alignment itself.
+func numberedMilestoneTitle(pos, total int, title string) (prefix, rest string) {
+	if loc := milestoneNumberPrefix.FindStringSubmatchIndex(title); loc != nil && strings.TrimSpace(title[loc[1]:]) != "" {
+		if n, err := strconv.Atoi(title[loc[2]:loc[3]]); err == nil && n == pos {
+			title = title[loc[1]:]
+		}
+	}
+	return fmt.Sprintf("%*s ", len(itoa(total))+1, "M"+itoa(pos)), title
+}
+
+// milestonePositionLabels maps milestone ids to their 1-based frozen positions ("M2"), keeping an
+// id the frozen list does not hold as-is.
+func milestonePositionLabels(ms []apitypes.Milestone, ids []string) []string {
+	pos := make(map[string]int, len(ms))
+	for i, mi := range ms {
+		if _, seen := pos[mi.ID]; !seen {
+			pos[mi.ID] = i + 1
+		}
+	}
+	labels := make([]string, len(ids))
+	for i, id := range ids {
+		labels[i] = id
+		if p, ok := pos[id]; ok {
+			labels[i] = "M" + itoa(p)
+		}
+	}
+	return labels
+}
+
+// milestoneRowParts is a rail milestone row's trusted position prefix ("" unless [tui]
+// milestone_numbers is on) and the title text the caller still draws through renderer.Plain.
+func (m tuiModel) milestoneRowParts(pos, total int, title string) (prefix, rest string) {
+	if !m.milestoneNumbers {
+		return "", title
+	}
+	return numberedMilestoneTitle(pos, total, title)
+}
 
 // milestoneProgress folds a run's frozen milestone list into (done, total, reported), shared by
 // the crew-rail block and the board badge so their COUNTS cannot disagree. `done` counts frozen
@@ -574,7 +627,7 @@ func uniqueMilestoneAgentMatch(eff map[string]apitypes.MilestoneAgent, activityA
 // in-progress id list, BUDGETED to fit maxWidth visual columns (the width the rail line can carry):
 // up to two ids joined by ", ", then " +N" for the rest (`m1`, `m1, m2`, `m1, m2 +1`), dropping to a
 // single id + a larger " +N" when two ids would overflow maxWidth — so a long-slug pair still fits
-// the fixed 26-col rail and the in-flight COUNT is folded into +N, never clamped away. Each id is
+// the rail (26 cols at the minimum) and the in-flight COUNT is folded into +N, never clamped away. Each id is
 // UNTRUSTED (a frozen key) and goes through renderer.Plain(id, 12); the +N is a plain integer.
 // Empty for no ids (or a maxWidth too small to hold one). Both this and the bar's cell count derive
 // from milestoneInProgressIDs, so the shown set never overstates what the bar counts.
@@ -783,14 +836,19 @@ func (m tuiModel) renderMilestones() string {
 	eyebrow := m.pal.faint.Render("MILESTONES") + " " + bar + m.pal.faint.Render(milestoneCount(done, total, reported))
 	// `· <id>, <id> +N` lists the in-progress milestones (frozen order) the bar counts — the in-flight
 	// set carried without motion for a static/non-tty frame. joinColumns clamps EVERY rail line to
-	// laneRailWidth (26) in the composed View, so the suffix is budgeted to the rail's continuation
+	// railWidth() (26 at the minimum) in the composed View, so the suffix is budgeted to the rail's continuation
 	// width (milestoneIPSuffix folds a long-id overflow into " +N") and, when appending it inline
 	// would push the eyebrow past the rail, dropped to its own continuation line — so the line always
-	// fits the 26-col rail and the in-flight count never ellipsizes away in the composed view (#1176).
-	switch suffix := m.milestoneIPSuffix(ipIDs, laneRailWidth-visualWidth("· ")); {
+	// fits the rail and the in-flight count never ellipsizes away in the composed view (#1176).
+	// Under [tui] milestone_numbers the suffix names positions (`· M2`), the numbering the rows use.
+	ipLabels := ipIDs
+	if m.milestoneNumbers {
+		ipLabels = milestonePositionLabels(ms, ipIDs)
+	}
+	switch suffix := m.milestoneIPSuffix(ipLabels, m.railWidth()-visualWidth("· ")); {
 	case suffix == "":
 		sb.WriteString(eyebrow + "\n")
-	case visualWidth(eyebrow)+visualWidth(" · "+suffix) <= laneRailWidth:
+	case visualWidth(eyebrow)+visualWidth(" · "+suffix) <= m.railWidth():
 		sb.WriteString(eyebrow + m.pal.faint.Render(" · "+suffix) + "\n")
 	default:
 		sb.WriteString(eyebrow + "\n")
@@ -817,7 +875,7 @@ func (m tuiModel) renderMilestones() string {
 		// live non-owner is never suppressed. The per-milestone owner lines below stay quiet (no age).
 		sb.WriteString(m.railNowLines(act, " ", "   "))
 	}
-	for _, mi := range ms {
+	for i, mi := range ms {
 		glyph := m.pal.faint.Render("○") // not started
 		style := m.pal.faint
 		switch {
@@ -834,7 +892,9 @@ func (m tuiModel) renderMilestones() string {
 			glyph = m.milestoneRowCell(blink)
 			style = lipgloss.NewStyle() // current — plain terminal fg, like the web's text-fg
 		}
-		sb.WriteString(" " + glyph + " " + style.Render(m.renderer.Plain(mi.Title, milestoneTitleCap)) + "\n")
+		// The prefix and the title share the row's title budget (D7: the title is capped by Plain).
+		prefix, title := m.milestoneRowParts(i+1, len(ms), mi.Title)
+		sb.WriteString(" " + glyph + " " + style.Render(prefix+m.renderer.Plain(title, m.milestoneTitleCap()-visualWidth(prefix))) + "\n")
 		// The now line rides beneath the in-progress milestone it belongs to. With LIVE LANES present
 		// (PRD #1353 M6) the lanes are authoritative: each in-progress milestone gets a QUIET declared
 		// owner line (role + label, NO age — the lead cannot prove the owner is live) plus one LANE
@@ -894,7 +954,7 @@ func (m tuiModel) railNowLines(act *apitypes.RunActivity, arrowIndent, labelInde
 		m.pal.faint.Render(" · "+relAge(act.At)) + "\n")
 	if lbl := activityLabel(act); lbl != "" {
 		lst := lipgloss.NewStyle().Foreground(m.pal.faintC).Italic(true)
-		sb.WriteString(labelIndent + lst.Render(m.renderer.Plain(lbl, milestoneTitleCap)) + "\n")
+		sb.WriteString(labelIndent + lst.Render(m.renderer.Plain(lbl, m.milestoneTitleCap())) + "\n")
 	}
 	return sb.String()
 }
@@ -919,7 +979,7 @@ func (m tuiModel) railMilestoneAgentLines(role, label, age, arrowIndent, labelIn
 	sb.WriteString(line + "\n")
 	if label != "" {
 		lst := lipgloss.NewStyle().Foreground(m.pal.faintC).Italic(true)
-		sb.WriteString(labelIndent + lst.Render(m.renderer.Plain(label, milestoneTitleCap)) + "\n")
+		sb.WriteString(labelIndent + lst.Render(m.renderer.Plain(label, m.milestoneTitleCap())) + "\n")
 	}
 	return sb.String()
 }
@@ -927,7 +987,7 @@ func (m tuiModel) railMilestoneAgentLines(role, label, age, arrowIndent, labelIn
 // railLaneLines renders the crew rail's LIVE LANE lines beneath an in-progress milestone (PRD #1353
 // M6): one lane = one subagent working the milestone right now. It mirrors railNowLines' `↳`-line +
 // italic-label shape but carries a lane's full live frame across up to three lines, each within the
-// fixed 26-col rail so joinColumns never clamps the load-bearing role/age off:
+// rail even at its minimum 26 cols so joinColumns never clamps the load-bearing role/age off:
 //
 //	↳ <role> · <age>       — the acting lane's role and how long ago its live frame landed
 //	<tool> <detail>        — the live tool + its most identifying argument (faint), dropped when empty
@@ -946,9 +1006,9 @@ func (m tuiModel) railLaneLines(agent, label, tool, detail, age, arrowIndent, la
 	}
 	sb.WriteString(line + "\n")
 	// The live tool + its most identifying argument on its OWN line so the arrow line above keeps the
-	// role/age even at the 26-col rail width. Both folded through renderer.Plain; empty segments drop.
+	// role/age even at the minimum 26-col rail width. Both folded through renderer.Plain; empty segments drop.
 	tool = m.renderer.Plain(tool, 14)
-	detail = m.renderer.Plain(detail, milestoneTitleCap)
+	detail = m.renderer.Plain(detail, m.milestoneTitleCap())
 	td := ""
 	switch {
 	case tool != "" && detail != "":
@@ -963,7 +1023,7 @@ func (m tuiModel) railLaneLines(agent, label, tool, detail, age, arrowIndent, la
 	}
 	if label != "" {
 		lst := lipgloss.NewStyle().Foreground(m.pal.faintC).Italic(true)
-		sb.WriteString(labelIndent + lst.Render(m.renderer.Plain(label, milestoneTitleCap)) + "\n")
+		sb.WriteString(labelIndent + lst.Render(m.renderer.Plain(label, m.milestoneTitleCap())) + "\n")
 	}
 	return sb.String()
 }

@@ -143,7 +143,7 @@ function rig(over: { maxInterventions?: number } = {}) {
       const t = now();
       return {
         available: true, sampleId: ++sampleId, startedAtMs: t, completedAtMs: t, currentBytes: usage, limitBytes: LIMIT,
-        stat: { anon: 10, shmem: 10, slab_unreclaimable: 10, unevictable: 10 },
+        stat: { anon: 10, shmem: 10, slab_unreclaimable: 10, unevictable: 10, inactive_file: 0 },
         pressure: { some: { avg10: 0, avg60: 0, avg300: 0, total: 0 }, full: { avg10: 0, avg60: 0, avg300: 0, total: 0 } },
       };
     },
