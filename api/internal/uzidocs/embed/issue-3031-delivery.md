@@ -157,12 +157,12 @@ capture. It is retained (no longer `private`) and its direct tests,
 | `runner-maintenance-terminal-source.test.ts`: chargedTransports | 12/14 become 16/18 (two extra commit dispatches x 2 fetches). |
 | `runner-maintenance-wip-boundary.test.ts`: "real owned boundary captures tracked/untracked/binary" | Phases now end `commit:prepare, commit:dispatch` x3. The classifier maps the commit group to `commit`. |
 
-Accounting map for the W0 capture (the 62 launches of the measurement above):
+Accounting map for the W0 capture (the 65 launches of the measurement above):
 
 | Counter | What is charged |
 |---|---|
-| launches | 1 per `execScoped` launch: metadata and config checks before status, add, write-tree, commit-tree and update-ref and at P0; pin reads around every launch, callback and stage; P0 plumbing; `ls-files` x2; `status` x2; `diff-index`; census x4 including race rechecks; payload; add; write-tree; `diff-tree` x2; commit-tree; pre-CAS `cat-file`; update-ref; P5 reads. |
-| sourceEntries | Every Git output row; census 1 per path; payload 4 per path (open, fstat, read completion, post-read fstat); race recheck 1 per path; 1 for the `for-each-ref` row. |
+| launches | 1 per `execScoped` launch: metadata and config checks before status, add, write-tree, commit-tree and update-ref, at P0 and at the start of P5; pin reads around every launch, callback and stage; P0 plumbing; `ls-files` x2; `status` x2; `diff-index`; census x4 including race rechecks; payload; add; write-tree; `diff-tree` x2; commit-tree; pre-CAS `cat-file`; update-ref; P5 reads. |
+| sourceEntries | Every Git output row; census 1 per path; payload 5 per path, the reservation for a regular file's open, fstat, read completion, post-read fstat and post-read lstat (no pre-open lstat: the opened fd must match the census identity before any read; a symlink's lstat, readlink and lstat are conservatively overcharged at 5); race recheck 1 per path; 1 for the `for-each-ref` row. |
 | sourceBytes | Sum of current sizes, charged before the payload launch. |
 | adminEntries | 20 x (clone depth + 3) per metadata check; config rows; distinct directories + clone depth + 1 per census, payload and recheck stage. |
 | metadataBytes | Metadata-check precharge; all helper and Git output bytes; index size per pin read; sum of (path + 1 KiB) per stage. |
@@ -462,16 +462,21 @@ staged-plus-unstaged file. It used a real slot with no injected allowances,
 and W was byte-compared independently.
 
 ```
-MEASURE sourceEntries=52786
+MEASURE sourceEntries=60315
 MEASURE sourceBytes=135183189
-MEASURE metadataBytes=40071384
-MEASURE adminEntries=1908
-MEASURE launches=62
+MEASURE metadataBytes=40607905
+MEASURE adminEntries=1684
+MEASURE launches=65
 MEASURE rpcAttempts=0
-MEASURE elapsed=4241
+MEASURE elapsed=1354
 ```
 
-- `metadataBytes` varied slightly between runs (about 40.06 to 40.07 M).
+- Rerun after the review fixes (P5 config check, five-unit payload reservation)
+  in a Linux container (Node 24, Git 2.39.5) under the unchanged frozen caps:
+  `sourceEntries` is 60,315 of 65,536. The in-run measurement before those fixes
+  read sourceEntries=52786, adminEntries=1908, launches=62, elapsed=4241.
+- `adminEntries` and `metadataBytes` scale with the clone path's depth, and
+  `metadataBytes` varies slightly between runs.
 - `rpcAttempts` is 0 because the test callbacks make no RPCs. The caller's
   R8 pairs add about 8 per capture (4 mutating dispatches x 2); this is
   accounting, not a measurement.
