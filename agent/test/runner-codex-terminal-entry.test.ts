@@ -10,6 +10,7 @@ installHarness();
 type Flight = {
   executor: Executor; worktreePath: string; runId: string; claimGeneration: number;
   preserveRecoveryClone?: boolean; stoppedSourceKept?: boolean; sourceExitDenied?: boolean;
+  evidenceProcessJoined?: Executor;
   deferredTerminalRelease?: Record<string, unknown>;
   terminalDisposal?: { source: Record<string, unknown>; result: { kind: string } };
 };
@@ -102,6 +103,98 @@ it("M2 entry seam: every release reason defers reads and safety with live admiss
     if (pending.kind === "reserved") rig.registry.cancelReservation(pending.reservation);
   }
 });
+
+for (const identity of ["facadeless", "swapped-to-Claude"] as const) {
+  it(`M2 direct release entry: ${identity} Codex retains before sensitive access`, async t => {
+    const rig = codexRig();
+    const executor: Executor = Object.assign(
+      new FakeCodexExecutor(rig.safety, async () => { throw new Error("unused"); }), { sandboxesCommands: true });
+    if (identity === "facadeless") executor.safety = undefined;
+    const runner = runnerWith(() => ({ executor }), fakeGitlab().gitlab);
+    const seam = runner as unknown as Seam;
+    const clone = seam.phaseClone.bind(runner);
+    let checking = false, reads = 0, scans = 0, acquisitions = 0;
+    let flight: Flight | undefined, entryError: unknown;
+    for (const name of ["worktreeHead", "worktreeStatus", "verifyStoppedSourceCovered"] as const) {
+      const original = git[name].bind(git);
+      t.mock.method(git, name, async (...args: unknown[]) => {
+        if (checking) { reads++; throw new Error("premature source read"); }
+        return Reflect.apply(original, git, args);
+      });
+    }
+    const quiescence = runner as unknown as { quiesceRun(...args: unknown[]): Promise<unknown> };
+    const quiesce = quiescence.quiesceRun.bind(runner);
+    t.mock.method(quiescence, "quiesceRun", async (...args: unknown[]) => {
+      if (checking) { scans++; throw new Error("premature process scan"); }
+      return quiesce(...args);
+    });
+    for (const name of ["withBoundary", "dispose"] as const) {
+      const original = rig.safety[name].bind(rig.safety);
+      t.mock.method(rig.safety, name, async (...args: unknown[]) => {
+        if (checking) { acquisitions++; throw new Error("premature safety acquisition"); }
+        return Reflect.apply(original, rig.safety, args);
+      });
+    }
+    t.mock.method(seam, "reportGenericFailure", async () => {});
+    t.mock.method(seam, "phaseClone", async (...args: unknown[]) => {
+      await clone(...args);
+      flight = args[1] as Flight;
+      executor.safety = undefined;
+      if (identity === "swapped-to-Claude") flight.executor = { run: executor.run.bind(executor) };
+      checking = true;
+      try {
+        // Independent custody is already latched and must remain independent.
+        flight.preserveRecoveryClone = true;
+        for (const reason of reasons) {
+          assert.equal(await seam.retainStoppedSource(flight, flight.executor, reason,
+            { memo: false, stale: true, record: "none" }), "retained_local");
+          assert.equal(flight.preserveRecoveryClone, true);
+          assert.equal(flight.stoppedSourceKept, true);
+          assert.equal(flight.sourceExitDenied, true);
+          assert.equal(flight.deferredTerminalRelease, undefined, "no facade can supply a release request");
+        }
+      } catch (error) { entryError = error; } finally { checking = false; }
+      throw new Error("entry control complete before model admission");
+    });
+    await runner.execute(gitlabClaim(identity === "facadeless" ? 285692 : 285693, { claim_generation: 3 }));
+    if (entryError !== undefined) throw entryError;
+    assert.ok(flight, "actual buildFlight and clone reached the direct release entry");
+    assert.equal(reads, 0, "no HEAD/status/coverage");
+    assert.equal(scans, 0, "no procfs or process scan");
+    assert.equal(acquisitions, 0, "no queue acquisition or disposal");
+    assert.equal(flight.preserveRecoveryClone, true);
+    assert.equal(fs.existsSync(flight.worktreePath), true);
+  });
+}
+
+for (const codex of [true, false]) {
+  it(`M2 procfs positive writer: initial ${codex ? "Codex" : "Claude"} identity survives executor replacement`,
+    { skip: process.platform !== "linux" }, async t => {
+    const executor: Executor = { sandboxesCommands: codex, run: async ctx => ({ branch: ctx.branch }) };
+    const runner = runnerWith(() => ({ executor }), fakeGitlab().gitlab);
+    const seam = runner as unknown as Seam & {
+      quiesceRun(flight: Flight, executor: Executor, opts: { mode: "own"; site: string }):
+        Promise<{ blocked: boolean; outcome: { process?: { state: string } } }>;
+    };
+    const clone = seam.phaseClone.bind(runner);
+    let observed: { blocked: boolean; state?: string; joined: boolean } | undefined;
+    t.mock.method(seam, "reportGenericFailure", async () => {});
+    t.mock.method(seam, "phaseClone", async (...args: unknown[]) => {
+      await clone(...args);
+      const flight = args[1] as Flight;
+      flight.executor = { run: executor.run };
+      const q = await seam.quiesceRun(flight, flight.executor, { mode: "own", site: "terminal_retire" });
+      observed = { blocked: q.blocked, state: q.outcome.process?.state,
+        joined: flight.evidenceProcessJoined === flight.executor };
+      throw new Error("snapshot writer control complete before model admission");
+    });
+    await runner.execute(gitlabClaim(codex ? 285694 : 285695, { claim_generation: 3 }));
+    assert.ok(observed, "actual flight and quiescence scan completed");
+    assert.equal(observed.state, "quiescent", "real hermetic procfs snapshot is positive");
+    assert.equal(observed.blocked, false, "snapshot blocking behavior is unchanged");
+    assert.equal(observed.joined, !codex, "snapshot grants joined evidence only to Claude");
+  });
+}
 
 for (const state of ["open", "closing"] as const) {
   it(`M2 terminal disposal refuses current-run ${state} epoch after early throw`, async t => {

@@ -69,9 +69,11 @@ async function setup(codex = true) {
 }
 
 // Existing runner/coordinator seams only: these cases can run unchanged on the unfixed base.
-for (const outcome of ["missing", "incomplete"] as const) {
+for (const outcome of ["missing", "incomplete", "missing-facade", "swapped-to-Claude"] as const) {
   it(`M3 binder behavioral: ${outcome} current-process Codex disposal refuses before inventory`, async t => {
     const f = await setup();
+    if (outcome === "missing-facade") f.executor.safety = undefined;
+    if (outcome === "swapped-to-Claude") f.flight.executor = { run: async ctx => ({ branch: ctx.branch }) };
     assert.ok(await f.p.recovery.pin({ runId: f.claim.run_id, generation: 29, kind: "issue",
       branch: f.source.context.branch, sourceSha: f.source.expectedHead, inventoryGuarded: true }));
     await f.p.bindCompletionSource(f.flight);

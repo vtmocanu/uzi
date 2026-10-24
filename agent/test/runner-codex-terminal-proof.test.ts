@@ -31,7 +31,7 @@ function barrier() {
 const modes = ["healthy", "dirty", "rejected", "incomplete", "foreign-result", "swapped-executor",
   "swapped-facade", "swapped-source", "swapped-generation", "swapped-attempt", "revoked",
   "independent-keep", "keep-during-coverage", "skipped", "skipped-operation", "skipped-executor",
-  "skipped-receipt", "skills-revoked", "late-cancel", "claude"] as const;
+  "skipped-receipt", "skipped-facade", "skipped-identity-swap", "skills-revoked", "late-cancel", "claude"] as const;
 for (const [index, mode] of modes.entries()) {
   it(`terminal source release: ${mode}`, async t => {
     const lifecycle = new AbortController();
@@ -116,6 +116,12 @@ for (const [index, mode] of modes.entries()) {
       const retireMemory = memory.retireWorkerMemory.bind(runner);
       t.mock.method(memory, "retireWorkerMemory", (actual: Flight) => {
         retireMemory(actual);
+        if (mode === "skipped-facade") { executor.safety = undefined; return; }
+        if (mode === "skipped-identity-swap") {
+          executor.safety = undefined;
+          actual.executor = { run: behavior };
+          return;
+        }
         if (mode === "skipped-receipt") {
           Object.assign(runner, { memoryRuntime: { sinkReceipts: [{ context: { flight: actual } }] } });
         } else {
