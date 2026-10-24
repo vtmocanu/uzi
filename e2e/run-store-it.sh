@@ -161,12 +161,13 @@ LOG="$(mktemp "${TMPDIR:-/tmp}/uzi-store-it-log.XXXXXX")" || {
 }
 # Keep local LiveDB deadlines bounded per package. The integrated #3120 sweep
 # exhausted workersvc's cumulative 30m budget before completion (the last test
-# passes in isolation); allow 45m for the complete inventory. Handler retains 20m.
-# Test selection, assertions, race/skip checks and package serialization stay the
-# same. This is not a speedup. Reset other packages to 10m each iteration.
+# passes in isolation); allow 45m for the complete inventory. The #3343 baseline
+# also exhausted store's 10m budget after 525 passing cases; its then-running test
+# passes in isolation. Store and handler get 20m. Selection, assertions, race/skip
+# checks and serialization stay the same. Other packages reset to 10m each iteration.
 for p in "${PKGS[@]}"; do
   timeout=10m
-  if [ "$p" = "./internal/handler/..." ]; then
+  if [ "$p" = "./internal/store/..." ] || [ "$p" = "./internal/handler/..." ]; then
     timeout=20m
   elif [ "$p" = "./internal/workersvc/..." ]; then
     timeout=45m
