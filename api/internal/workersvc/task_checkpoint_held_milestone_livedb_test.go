@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -110,6 +112,9 @@ func TestTaskCheckpointWritableDescendantHeldPublicationLiveDB(t *testing.T) {
 		if _, err := pushbroker.PrepareHeldPack(ctx, wrong); err == nil {
 			t.Fatal("thin-pack control: root decoy unexpectedly supplied the child-only base")
 		} else {
+			if !errors.Is(err, plumbing.ErrObjectNotFound) || !strings.HasPrefix(err.Error(), "pushbroker: apply pack:") {
+				t.Fatalf("thin-pack control failed before the missing child base was checked: %v", err)
+			}
 			t.Logf("PrepareHeldPack thin-pack control key=%s (root decoy, child-only base excluded): %v", wrong.CheckpointKey, err)
 		}
 		prepared, err := pushbroker.PrepareHeldPack(ctx, o)
