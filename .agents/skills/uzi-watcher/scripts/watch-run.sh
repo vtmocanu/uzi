@@ -57,8 +57,8 @@
 # Owner-decision park: `recovery_wait` with recovery_wait_cause `worker_requeue_exhausted` never
 # resumes on its own (the owner must Resume or Cancel), so it always stops the watch, whatever the
 # stop set (also when the stop set names recovery_wait): STOP=recovery_wait:worker_requeue_exhausted,
-# RESULT=stop:recovery_wait, exit 0. Other recovery_wait causes keep their existing behaviour: they
-# keep polling unless the stop set names recovery_wait.
+# RESULT=stop:recovery_wait, exit 0. Other recovery_wait causes keep polling unless the stop set names
+# recovery_wait, except a `data_volume_full` park, which is an attention signal (above).
 # `paused` never resumes on its own either (an owner pause, or hold_reason budget_exhausted /
 # completion hold that needs extend, resume or decide), so it always stops the watch, whatever the
 # stop set: STOP=paused, a NOTE with hold_reason, RESULT=stop:paused, exit 0.
