@@ -346,7 +346,9 @@ for (const movement of ["bridge", "concurrent clone tip"] as const) {
     });
     let base = "", originalH = "", movedTip = "", clone = "", branch = "", bare = "";
     let publishesAtGate: [number, number] | undefined;
-    const publishedBranch = "feature/code-snapshot";
+    const taskRun = "21750000-0000-4000-8000-000000000001";
+    const taskRepo = "21750000-0000-4000-8000-000000000002";
+    const publishedBranch = `uzi/task/${taskRun}`;
     if (movement === "bridge") {
       execFileSync("git", ["-C", fx.originPath, "checkout", "-b", publishedBranch]);
       fs.writeFileSync(path.join(fx.originPath, "published.txt"), "published floor\n");
@@ -392,7 +394,13 @@ for (const movement of ["bridge", "concurrent clone tip"] as const) {
     };
     const forge = fakeGitlab();
     await runner(exec, forge.gitlab).execute(gitlabClaim(2175, { code_cross_check_required: true, claim_generation: 1,
-      ...(movement === "bridge" ? { kind: "task", branch: publishedBranch, open_mr: false } : {}) }));
+      ...(movement === "bridge" ? { kind: "task", run_id: taskRun, issue_iid: null,
+        branch: publishedBranch, open_mr: false, checkpoint_write_unresolved: false,
+        repo: { id: taskRepo, url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+        checkpoint_coordinates: { version: 1, kind: "task", run_id: taskRun,
+          user_id: "21750000-0000-4000-8000-000000000003", repo_id: taskRepo, issue_iid: null,
+          work_branch: publishedBranch, checkpoint_key: publishedBranch, provenance: [taskRun] },
+      } : {}) }));
     assert.ok(reaps > 0, "checkpoint reaped the executor");
     // The executor's own done_checkpoint publishes; the gate's step on the interlocked exit makes no publication of its own.
     assert.ok(publishesAtGate && publishesAtGate[0] > 0, "the executor's checkpoint published before the gate");
