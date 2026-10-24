@@ -207,6 +207,7 @@ So the kubelet's own final DELETE comes after the processes are gone and after t
 - `status.phase ∈ {Failed, Succeeded}`;
 - `len(containerStatuses)` and `len(initContainerStatuses)` equal the spec's container counts;
 - every entry has `state.terminated` set. Any `waiting` or `running` entry, including a sidecar mid-restart, disqualifies the pod.
+- every terminated entry is runtime-reported: it has a `containerID`, its reason is not `ContainerStatusUnknown` or `Unknown`, and its exit code is not 255 (see the runtime link below).
 
 A pod stopped before every container ever ran can show `waiting` and defers, which is safe.
 - **Runtime link (containerd CRI + runc, read; added after a cross-check).** The chain from `terminated` to "no process of that container survives":
