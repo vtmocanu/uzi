@@ -45,11 +45,12 @@ describe("buildCodexConfigToml: stock native-disabled config", () => {
   });
 
   it("pins every [features] native knob to its disabled value", () => {
+    assert.doesNotMatch(toml, /^\s*remote_models\s*=/m, "the removed compatibility key is omitted");
     for (const key of [
       "apps", "plugins", "shell_tool", "view_image", "sleep_tool", "apply_patch_freeform",
       "shell_snapshot", "shell_snapshot_v2",
       "code_mode", "code_mode_only", "code_mode_host", "code_mode_prewarm",
-      "remote_models", "unified_exec", "hooks", "multi_agent", "multi_agent_v2",
+      "unified_exec", "hooks", "multi_agent", "multi_agent_v2",
       "enable_request_compression",
     ]) {
       assert.match(toml, new RegExp(`^${key} = false$`, "m"), `${key} must be false`);

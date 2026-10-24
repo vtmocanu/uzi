@@ -574,7 +574,6 @@ export class CodexAdviceHarness implements AdviceHarness {
         code_mode_only: false,
         code_mode_host: false,
         code_mode_prewarm: false,
-        remote_models: false,
         unified_exec: false,
         hooks: false,
         multi_agent: false,

@@ -53,7 +53,6 @@ const NATIVE_FEATURES = [
   "multi_agent_v2",
   "plugins",
   "apps",
-  "remote_models",
 ];
 
 /** Split a config.toml TEXT into sections keyed by table header ("" = the root table,
@@ -90,6 +89,7 @@ describe("codex U failure closure (a): production hooks are DISABLED (config.ts)
       const sections = tomlSections(toml);
       const root = sections.get("") ?? [];
       const features = sections.get("features") ?? [];
+      assert.doesNotMatch(toml, /^\s*remote_models\s*=/m, `${label}: the removed compatibility key is omitted`);
       const projectsKey = [...sections.keys()].find((k) => k.startsWith("projects."));
       const projects = projectsKey !== undefined ? sections.get(projectsKey)! : [];
 
@@ -122,6 +122,7 @@ describe("codex U failure closure (a): production hooks are DISABLED (config.ts)
     const loopbackRun = config.buildCodexLoopbackTestConfigToml({ ...opts, authMode: "subscription", codeModeHost: true }, "http://127.0.0.1:5599/v1");
     for (const [label, toml] of [["prod api_key (run lane)", prodApiRun], ["prod subscription (run lane)", prodSubRun], ["loopback (run lane)", loopbackRun]] as const) {
       const features = tomlSections(toml).get("features") ?? [];
+      assert.doesNotMatch(toml, /^\s*remote_models\s*=/m, `${label}: the removed compatibility key is omitted`);
       // The run lane flips ONLY code_mode_host on (line-anchored) …
       assert.match(toml, /^code_mode_host = true$/m, `${label}: the run lane enables code_mode_host = true`);
       // … while hooks stay off and no hook-trust bypass appears …

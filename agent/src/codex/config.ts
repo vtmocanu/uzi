@@ -100,7 +100,6 @@ function nativeDisabledConfigLines(
     `code_mode_only = false`,
     `code_mode_host = ${codeModeHost}`,
     `code_mode_prewarm = false`,
-    `remote_models = false`,
     `unified_exec = false`,
     `hooks = false`,
     `multi_agent = false`,
@@ -118,12 +117,21 @@ function nativeDisabledConfigLines(
 /**
  * Build the `config.toml` TEXT with native effectful surfaces disabled (#1566 exceptions above).
  *
- * Configurable native effectful surfaces are pinned off: `project_doc_max_bytes
- * = 0`, `web_search = "disabled"`, analytics/feedback/agents off, the whole
- * `[features]` family (apps / plugins / shell_snapshot* / code_mode* / remote_models
- * / unified_exec / hooks / multi_agent* / enable_request_compression) off, and
- * `check_for_update_on_startup = false`. The canonical project is provisioned
- * explicitly `untrusted`. The provider block carries zero retries and no websockets.
+ * The controls emitted by nativeDisabledConfigLines disable native effectful
+ * surfaces, project docs, web search, analytics, feedback, agents and startup
+ * update checks. The canonical project is explicitly `untrusted`; the provider
+ * block carries zero retries and no websockets.
+ *
+ * At the unchanged Codex 0.163.0 pin, `remote_models` is a removed, useless
+ * compatibility flag, so it is omitted. Model metadata may refresh under the
+ * supported runtime authentication/discovery/cache policy; uzi's curated picker
+ * and validation policy remain independent of that metadata refresh.
+ * Upstream RemoteModels and Stage::Removed documentation:
+ * https://github.com/openai/codex/blob/83086188ae0614bd882818ff1aa23f3194962012/codex-rs/features/src/lib.rs#L1400-L1403
+ * https://github.com/openai/codex/blob/83086188ae0614bd882818ff1aa23f3194962012/codex-rs/features/src/lib.rs#L61-L62
+ * Upstream should_refresh_models and refresh_after_auth_change:
+ * https://github.com/openai/codex/blob/83086188ae0614bd882818ff1aa23f3194962012/codex-rs/models-manager/src/manager.rs#L675-L679
+ * https://github.com/openai/codex/blob/83086188ae0614bd882818ff1aa23f3194962012/codex-rs/models-manager/src/manager.rs#L405-L417
  */
 export function buildCodexConfigToml(opts: CodexConfigOptions): string {
   const { model, provider, projectPath } = opts;
