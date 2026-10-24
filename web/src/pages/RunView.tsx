@@ -15,7 +15,7 @@ import {
   type Run,
   type Worker,
 } from "../lib/api";
-import { useAuth } from "../auth/AuthContext";
+import { useAuth, useOptionalAuth } from "../auth/AuthContext";
 import { mergeRequestUrl } from "../lib/forgeUrls";
 import { errorMessage } from "../lib/apiError";
 import { changedMilestones } from "../lib/milestoneReset";
@@ -1816,6 +1816,7 @@ export function RunView() {
     return () => { requestRef.current++; };
   }, [refreshIncidentalSummary]);
   const [repoWebUrl, setRepoWebUrl] = useState<string | null>(null);
+  const [repo, setRepo] = useState<Repo | null>(null);
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [actionErr, setActionErr] = useState("");
   // Issue #3181: the server's refusal of a Resume on a settling token-switch hold, bound to the
@@ -1870,17 +1871,36 @@ export function RunView() {
 
   // Resolve the repo's web URL (for the MR link); the run itself does not carry
   // it. Best-effort — the MR iid is shown as text if the repo is not resolvable.
+  // Issue #3391: the same fetch keeps the run's repo for the plan gate's capability hint and
+  // Docker-allowlist line. Keyed on the repo id (not the run object) and cancelled on change, so a
+  // late list for a previous run's repo can never land on the run now shown.
+  const runRepoId = run?.repo_id;
+  const repoIdRef = useRef(runRepoId);
+  repoIdRef.current = runRepoId;
   useEffect(() => {
+    setRepo(null);
+    setRepoWebUrl(null);
     // A repo-less run (a job, PRD #1908) has no repo and no MR to link.
-    if (!run?.repo_id) return;
+    if (!runRepoId) return;
+    let cancelled = false;
     api
       .listRepos()
       .then(({ repos }: { repos: Repo[] }) => {
-        const repo = repos.find((r) => r.id === run.repo_id);
-        setRepoWebUrl(repo?.web_url ?? null);
+        if (cancelled) return;
+        const match = repos.find((r) => r.id === runRepoId) ?? null;
+        setRepo(match);
+        setRepoWebUrl(match?.web_url ?? null);
       })
-      .catch(() => setRepoWebUrl(null));
-  }, [run]);
+      .catch(() => { if (!cancelled) setRepoWebUrl(null); });
+    return () => { cancelled = true; };
+  }, [runRepoId]);
+  // The PATCH response omits the computed allowlist fields, so only the capability list is
+  // merged into the held repo. Ignored when the viewer has moved to another repo meanwhile.
+  const onRepoRequiredCapabilities = useCallback((repoId: string, caps: string[]) => {
+    if (repoIdRef.current !== repoId) return;
+    setRepo((prev) => (prev && prev.id === repoId ? { ...prev, required_capabilities: caps } : prev));
+  }, []);
+  const isAdmin = useOptionalAuth()?.user?.is_admin === true;
 
   // PRD #84 M4 4d: the workers list backs the plan-gate readiness summary — a required
   // capability is "met" when the run's ASSIGNED worker (run.worker_id) advertises it. Only
@@ -2612,6 +2632,9 @@ export function RunView() {
           workers={workers}
           busy={busy}
           canSteer={canSteer}
+          repo={repo && repo.id === run.repo_id ? repo : undefined}
+          isAdmin={isAdmin}
+          onRepoRequiredCapabilities={onRepoRequiredCapabilities}
           revisionMismatch={revisionMismatch}
           onApprove={(selection, overrideCapabilities, expectedGateRevision, semanticApproval) =>
             void gateAct(expectedGateRevision, () =>
