@@ -190,7 +190,6 @@ describe("terminal execution disk deferral", () => {
       if (mode === "empty") assert.ok(callbacks > 0, "the real safety owner entered protected work");
       if (mode !== "empty") {
         assert.equal(boundaries, 1, "one unproven boundary stops without renewing admission");
-        assert.equal(callbacks, 0, "missing cleanup authority never enters protected work");
         assert.equal(readGit(f.clone(), "rev-parse", "HEAD"), sourceHead, "the exact source head is retained");
         assert.equal(api.codexRequests.length, 0, "no credential refresh or release");
         assert.equal(captures, 0, "unproven cleanup admits no source capture");

@@ -855,9 +855,11 @@ residuals also remain open. See
 for the original 180-second episode, 120-second healthy phase and 60-second fallback
 reserve, shared with parent deadlines, retries and joined cleanup. (AI-synced 2026-10-23)
 
-A process the worker *can* positively tie, by ancestry, to another live run's
-own recorded root, or to a long-lived process the worker itself launched
-(not the agent), is not this case: it is attributed and does not block.
+A process the worker *can* positively tie, by ancestry, to a long-lived process
+the worker itself launched (not the agent), is not this case: it is attributed
+and does not block. A process tied to another live run's own recorded root is a
+`live_attempt_conflict` survivor in every mode: it is never signalled, and it
+blocks the result.
 When the check is unproven
 instead because an in-scope process was seen but could not be confirmed
 stopped, the failure reason reports only how many such processes survived
