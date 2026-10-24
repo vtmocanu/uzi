@@ -311,6 +311,29 @@ test("verify materializes every case; a wrong manifest pin fails with a fixed co
   assert.deepEqual(wrong.lines, ['{"error":"corpus_integrity"}']);
 });
 
+test("a run-dir cleanup failure keeps the return code and stdout, and is reported once on stderr", {
+  skip: process.getuid?.() === 0 ? "root bypasses directory permissions, so the removal cannot be made to fail" : false,
+}, async () => {
+  const root = await fs.mkdtemp(path.join(tc.root, "cleanup-fail-"));
+  try {
+    const locked = async () => {
+      // Make the run dir's parent read-only so the final removal of the run dir fails with EACCES.
+      const materialize = async (_checkout: string, _c: ReplayCase, dir: string): Promise<MaterializedCase> => {
+        await fs.chmod(root, 0o500);
+        return { snapshot: dir, cleanup: async () => {} } as MaterializedCase;
+      };
+      return cli(["verify"], { scratchRoot: root, materialize });
+    };
+    const r = await locked();
+    assert.equal(r.code, 0);
+    assert.deepEqual(r.lines, ['{"verify":"ok","cases":2}']);
+    assert.deepEqual(r.errLines, ['{"error":"cleanup_failed"}']);
+  } finally {
+    await fs.chmod(root, 0o700);
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 async function tamper(file: string, run: () => Promise<void>): Promise<void> {
   const original = await fs.readFile(file);
   const flipped = Buffer.from(original);

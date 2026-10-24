@@ -477,8 +477,11 @@ export async function createReplayRunDir(root: string, layout: ReplayUidLayout =
   return dir;
 }
 
-/** Group-share one snapshot entry through an O_NOFOLLOW handle whose identity matches the lstat that
- * typed it. Symlinks are skipped (never followed or mutated); any type other than file or directory is
+/** Group-share one snapshot entry. Each entry is opened O_NOFOLLOW and its dev/ino must match the lstat
+ * that typed it, so the chmod/chown acts on the checked handle. The directory listing itself is not
+ * handle-bound: it is fs.readdir(entry) by path, and each child is re-checked the same way (lstat, then
+ * O_NOFOLLOW open, then dev/ino). That is acceptable because the snapshot root stays a worker-private
+ * 0700 directory until this walk finishes, so nothing else can swap entries under it meanwhile. Symlinks are skipped (never followed or mutated); any type other than file or directory is
  * refused. Directories become 2750; files keep their owner bits and gain group read (and group execute
  * where the owner has it), never group write, and lose every other bit.
  *
