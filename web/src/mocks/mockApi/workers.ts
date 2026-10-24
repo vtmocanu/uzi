@@ -1,6 +1,5 @@
 import { needsAttention } from "../../components/WorkerUpgradeBadge";
 import type { BindMode, Worker } from "../../lib/api";
-import { stripDisplayCell } from "../../lib/safeText";
 import { ApiError } from "../../lib/apiError";
 import { healthyFleetWorkers, incidentFleetWorkers, mockAdminWorkers, mockWorkers } from "../data";
 import { minsAgo } from "../data/time";
@@ -35,11 +34,74 @@ function projectedWorker<T extends Worker>(w: T): T {
   };
 }
 
-// Mirrors store.ManualCordonText: newline/tab become spaces, Cc/Cf and terminal
-// sequences are stripped, then the sanitized snapshot is trimmed and capped by runes.
+// Snapshot-only equivalent of x/ansi.Strip's print/execute actions. Its UTF-8 byte
+// handling matters: Unicode C1 runes aren't 8-bit introducers, while OSC/DCS payload
+// bytes are ignored. ESC/CSI execute LF/tab; control strings do not.
+// One forward pass over the input bytes, without retries or nested scans.
+function manualANSIText(value: string): string {
+  type State = "ground" | "esc" | "esc-intermediate" | "csi" | "csi-intermediate"
+    | "dcs" | "dcs-param" | "dcs-intermediate" | "dcs-string" | "osc" | "sos";
+  let state: State = "ground";
+  let utf8Remaining = 0;
+  const output: number[] = [];
+  for (const byte of new TextEncoder().encode(value)) {
+    if (utf8Remaining > 0) {
+      output.push(byte);
+      utf8Remaining--;
+      continue;
+    }
+    if (byte === 0x18 || byte === 0x1a || byte === 0x9c) {
+      state = "ground";
+    } else if (byte === 0x1b) {
+      // x/ansi's DCS entry accepts ESC as passthrough data.
+      state = state === "dcs" ? "dcs-string" : "esc";
+    } else if (state === "osc" || state === "dcs-string") {
+      if (state === "osc" && byte === 0x07) state = "ground";
+    } else if (byte >= 0xc2 && byte <= 0xf4) {
+      output.push(byte);
+      utf8Remaining = byte < 0xe0 ? 1 : byte < 0xf0 ? 2 : 3;
+      state = "ground";
+    } else if (byte >= 0x80) {
+      // Raw C1 bytes can occur after a string terminates inside UTF-8 data.
+      state = byte === 0x9b ? "csi" : byte === 0x90 ? "dcs"
+        : byte === 0x9d ? "osc" : [0x98, 0x9e, 0x9f].includes(byte) ? "sos" : "ground";
+    } else if (state === "ground") {
+      output.push(byte);
+    } else if (state === "sos") {
+      // ASCII payload is ignored; Unicode above follows x/ansi's UTF-8 transition.
+    } else if (state === "esc" || state === "esc-intermediate") {
+      if (byte < 0x20) output.push(byte);
+      else if (byte === 0x7f) continue;
+      else if (byte < 0x30) state = "esc-intermediate";
+      else if (state === "esc-intermediate") state = "ground";
+      else {
+        state = byte === 0x5b ? "csi" : byte === 0x50 ? "dcs"
+          : byte === 0x5d ? "osc" : [0x58, 0x5e, 0x5f].includes(byte) ? "sos" : "ground";
+      }
+    } else if (state === "csi" || state === "csi-intermediate") {
+      if (byte < 0x20) output.push(byte);
+      else if (byte === 0x7f) continue;
+      else if (byte < 0x30) state = "csi-intermediate";
+      else if (byte >= 0x40 || state === "csi-intermediate") state = "ground";
+    } else {
+      // DCS entry/parameters/intermediates ignore controls, then enter payload.
+      if (state === "dcs" && byte >= 0x08 && byte <= 0x0d) state = "dcs-string";
+      else if (byte < 0x20 || byte === 0x7f) continue;
+      else if (byte < 0x30) state = "dcs-intermediate";
+      else if (byte >= 0x40 || state === "dcs-intermediate") state = "dcs-string";
+      else state = "dcs-param";
+    }
+  }
+  return new TextDecoder().decode(new Uint8Array(output));
+}
+
+// Mirrors store.ManualCordonText: ANSI first, then CellText's Cc/Cf removal and
+// LF/tab folding. Internal Zl/Zp survive storage; stripDisplayCell is display-only.
 function manualText(value: string, limit: number): string {
-  const clean = stripDisplayCell(value.replace(/[\n\t]/g, " ")).trim();
-  return Array.from(clean).slice(0, limit).join("").trim();
+  // Go strings.TrimSpace uses Unicode White_Space (unlike JS trim's BOM exception).
+  const trim = (text: string) => text.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, "");
+  const clean = trim(manualANSIText(value).replace(/[\n\t]/g, " ").replace(/[\p{Cc}\p{Cf}]/gu, ""));
+  return trim(Array.from(clean).slice(0, limit).join(""));
 }
 
 function changeManualCordon(id: string, cordon: boolean, reason?: string): { worker: Worker } {
