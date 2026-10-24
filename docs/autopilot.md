@@ -147,7 +147,7 @@ Three further rules:
 
 ### Coverage transport limitation
 
-Codex currently lacks an enforceable token cap. Claude's output cap alone does not prove a conservative full-call bound. Complete large sources can exceed the 40,000-token allowance. Unsupported or unbounded transports and inadmissibly large inputs yield unavailable without a model call. #1231 must establish enforceable bounds before activation.
+Codex currently lacks an enforceable token cap. Claude's output cap alone does not prove a conservative full-call bound. Complete large sources can exceed the 40,000-token allowance. Unsupported or unbounded transports and inadmissibly large inputs yield unavailable without a model call. Any future semantic activation must establish enforceable bounds before activation.
 
 The shipped workers supply no coverage transport at all, so even an enrolled run would park as `coverage_unavailable`. See [ADR-1225](../adr/1225-structural-completion-interlock-invariants.md#coverage-transport-limitation).
 
