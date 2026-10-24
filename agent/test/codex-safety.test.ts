@@ -2699,6 +2699,22 @@ it("held cleanup joins a later completion batch and refuses its failed reap", as
 });
 
 describe("#2852 facade terminal disposal witness", () => {
+  for (const change of ["poison", "root"] as const) {
+    it(`refuses disposal evidence invalidated by a nonthrowing hook (${change})`, async () => {
+      const registry = new ExecutionRegistry(newLocalExecutionEpoch(2852));
+      await registry.quiesceChildren(1000);
+      await registry.reapProcesses(1000, registry.epoch());
+      const safety = createCodexExecutionSafety(registry, spawnCounter().seam, undefined, () => {
+        if (change === "poison") registry.poison([]);
+        else registry.registerRoot({ id: "late", kind: "command" }, new FakeRoot("command"));
+      });
+      const outcome = await safety.dispose(req("terminal"));
+      assert.equal(outcome.kind, "incomplete", "registry success cannot outlive hook invalidation");
+      assert.equal(safety.acceptsTerminalDisposal(outcome), false);
+      assert.equal(registry.rootCount(), change === "root" ? 1 : 0);
+    });
+  }
+
   for (const change of ["none", "poison", "root", "throw"] as const) {
     it(`joins hooks and attests only unchanged success (${change})`, async () => {
       const registry = new ExecutionRegistry(newLocalExecutionEpoch(2852));
