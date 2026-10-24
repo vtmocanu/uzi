@@ -36,7 +36,7 @@ pass "built the uzi CLI binary"
 # to "user" ⇒ a uzc_ token capped to the owner's (admin's) own authority.
 UZI_TOKEN_VAL="$(apipost "/api/me/cli-tokens" '{"name":"e2e-m2-cli-smoke"}' | jq -r '.token')"
 { [ -n "$UZI_TOKEN_VAL" ] && [ "$UZI_TOKEN_VAL" != null ] && [ "${UZI_TOKEN_VAL#uzc_}" != "$UZI_TOKEN_VAL" ]; } \
-  || fail "did not mint a uzc_ CLI token via POST /api/me/cli-tokens (got '${UZI_TOKEN_VAL:-<none>}')"
+  || fail "did not mint a uzc_ CLI token via POST /api/me/cli-tokens"
 pass "minted a uzc_ CLI token via POST /api/me/cli-tokens (headless \$UZI_TOKEN auth)"
 
 # Run the CLI hermetically: HOME → the scratch rundir so it never reads/writes the
@@ -77,7 +77,71 @@ CLI_GATE_JSON="$(uzi_cli run get "$RUN_CLI" --json)" || fail "could not read CLI
 printf '%s\n' "$CLI_GATE_JSON" | jq -e --arg run "$RUN_CLI" \
   '.id == $run and .status == "awaiting_approval" and (has("semantic_gate") | not) and (has("completion_pending") | not)' >/dev/null \
   || fail "production CLI gate was inconsistent or exposed dormant semantic data"
+# This run is already held by the real stub executor. Approval below exercises its
+# ongoing assigned execution, not a fresh queued claim (SubmitInput enqueues input).
+CLI_WORKER_ID="$(printf '%s' "$CLI_GATE_JSON" | jq -er '.worker_id | select(type == "string" and length > 0)')"
+CLI_OWNER_ID="$(db_psql "SELECT user_id FROM runs WHERE id='$RUN_CLI'")"
+CLI_OWNER_LABEL="$(db_psql "SELECT display_name FROM users WHERE id='$CLI_OWNER_ID'")"
+CLI_HOLD_REASON="e2e-cli-assigned-$(db_psql 'SELECT gen_random_uuid()')"
+CLI_HOLD_ARMED=0 CLI_HOLD_AT=""
+cli_manual_worker() {
+  apiget /api/workers | jq -ec --arg id "$CLI_WORKER_ID" '[.workers[] | select(.id == $id)] | select(length == 1) | .[0]'
+}
+cli_restore_manual_hold() {
+  [ "$CLI_HOLD_ARMED" = 1 ] || return 0
+  local current cleared
+  current="$(cli_manual_worker)" || return 1
+  # An ambiguous cordon response can still have committed. Only our unique reason
+  # and actor may authorize clearing; a replacement hold is left untouched.
+  if printf '%s' "$current" | jq -e '.manual_cordoned_at == null' >/dev/null; then
+    CLI_HOLD_ARMED=0
+    return 0
+  fi
+  printf '%s' "$current" | jq -e --arg id "$CLI_WORKER_ID" --arg actor "$CLI_OWNER_ID" \
+    --arg label "$CLI_OWNER_LABEL" --arg reason "$CLI_HOLD_REASON" --arg at "$CLI_HOLD_AT" \
+    '.id == $id and .manual_cordoned_by == $actor and .manual_cordoned_by_label == $label
+      and .manual_cordon_reason == $reason and ($at == "" or .manual_cordoned_at == $at)' >/dev/null || return 1
+  cleared="$(uzi_cli worker uncordon "$CLI_WORKER_ID" --json)" || return 1
+  printf '%s' "$cleared" | jq -e --arg id "$CLI_WORKER_ID" '.id == $id
+    and .manual_cordoned_at == null and .manual_cordoned_by == null
+    and .manual_cordoned_by_label == null and .manual_cordon_reason == null' >/dev/null || return 1
+  cli_manual_worker | jq -e '.manual_cordoned_at == null and .manual_cordoned_by == null
+    and .manual_cordoned_by_label == null and .manual_cordon_reason == null' >/dev/null || return 1
+  CLI_HOLD_ARMED=0
+}
+cli_hold_exit() {
+  local rc=$?
+  if ! cli_restore_manual_hold; then
+    echo "cli assigned-work cleanup: manual hold changed or could not be restored" >&2
+    rc=1
+  fi
+  exit "$rc"
+}
+# Refuse to adopt a pre-existing operator hold. The phase subshell owns this EXIT
+# trap; the outer driver's stack teardown remains registered in its own shell.
+trap cli_hold_exit EXIT
+[ "$(db_psql "SELECT count(*) FROM workers WHERE id='$CLI_WORKER_ID' AND user_id='$CLI_OWNER_ID'")" = 1 ] \
+  || fail "CLI assigned worker does not belong to the run owner"
+cli_manual_worker | jq -e '.ephemeral == false and .manual_cordoned_at == null
+  and .manual_cordoned_by == null and .manual_cordoned_by_label == null and .manual_cordon_reason == null' >/dev/null \
+  || fail "CLI assigned worker already has manual intent or is ephemeral; left untouched"
+CLI_HOLD_ARMED=1
+CLI_HELD="$(uzi_cli worker cordon "$CLI_WORKER_ID" --reason "$CLI_HOLD_REASON" --json)"
+printf '%s' "$CLI_HELD" | jq -e --arg id "$CLI_WORKER_ID" --arg actor "$CLI_OWNER_ID" \
+  --arg label "$CLI_OWNER_LABEL" --arg reason "$CLI_HOLD_REASON" \
+  '.id == $id and .effective_cordoned == true and (.manual_cordoned_at | type == "string")
+    and .manual_cordoned_by == $actor and .manual_cordoned_by_label == $label
+    and .manual_cordon_reason == $reason' >/dev/null || fail "CLI cordon metadata mismatch"
+CLI_HOLD_AT="$(printf '%s' "$CLI_HELD" | jq -er '.manual_cordoned_at')"
 uzi_cli run approve "$RUN_CLI" >/dev/null || fail "uzi run approve failed (exit $?)"
 wait_status "$RUN_CLI" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
-pass "uzi run approve drove RUN_CLI past the gate to completed (CLI approve route/DTO intact)"
+apiget "/api/runs/$RUN_CLI" | jq -e --arg run "$RUN_CLI" --arg worker "$CLI_WORKER_ID" \
+  '.run.id == $run and .run.status == "completed" and .run.worker_id == $worker' >/dev/null \
+  || fail "CLI approval did not complete on the same assigned worker"
+cli_manual_worker | jq -e --arg at "$CLI_HOLD_AT" --arg reason "$CLI_HOLD_REASON" \
+  '.manual_cordoned_at == $at and .manual_cordon_reason == $reason' >/dev/null \
+  || fail "assigned execution unexpectedly cleared the manual hold"
+cli_restore_manual_hold || fail "could not restore newly owned CLI manual hold"
+trap - EXIT
+pass "CLI approve completed on the same manually cordoned worker; explicit uncordon cleared manual metadata"
 

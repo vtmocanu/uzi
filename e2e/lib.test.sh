@@ -1200,6 +1200,143 @@ for spec in 'success:stub:unset' 'success:stub:0' 'success:stub:empty' 'success:
   else echo "FAIL: handoff timing scope $spec: result=$got events=[$events] output=[$output]"; fi
 done
 
+# Drive the shipped phase-18 continuation/EXIT scope with mocked API/CLI
+# transports. These cases assert restoration and intent preservation on failures,
+# not just the metadata predicate in isolation.
+manual_hold_case() {
+  bash -euo pipefail -s -- "$ROOT" "$SEQ_DIR" "$1" <<'BASH'
+ROOT="$1" SEQ_DIR="$2" MODE="$3"
+RUN_CLI=run-owned COMPLETE_TIMEOUT_DEFAULT=5
+CLI_GATE_JSON='{"worker_id":"worker-owned"}'
+printf '%s' '{"id":"worker-owned","ephemeral":false,"manual_cordoned_at":null,"manual_cordoned_by":null,"manual_cordoned_by_label":null,"manual_cordon_reason":null}' > "$SEQ_DIR/manual-worker"
+set_hold() {
+  jq --arg reason "$1" '.manual_cordoned_at="2026-10-24T00:00:00Z" | .manual_cordoned_by="owner-owned"
+    | .manual_cordoned_by_label="Owner" | .manual_cordon_reason=$reason | .effective_cordoned=true' \
+    "$SEQ_DIR/manual-worker" > "$SEQ_DIR/manual-next"
+  mv "$SEQ_DIR/manual-next" "$SEQ_DIR/manual-worker"
+}
+[ "$MODE" != prior ] || set_hold prior-intent
+db_psql() {
+  case "$1" in
+    *gen_random_uuid*) echo fixture-owned ;;
+    *'SELECT user_id'*) echo owner-owned ;;
+    *'SELECT display_name'*) echo Owner ;;
+    *'SELECT count('* ) echo 1 ;;
+    *) return 1 ;;
+  esac
+}
+apiget() {
+  case "$1" in
+    /api/workers) jq '{workers:[.]}' "$SEQ_DIR/manual-worker" ;;
+    /api/runs/run-owned) echo '{"run":{"id":"run-owned","status":"completed","worker_id":"worker-owned"}}' ;;
+    *) return 1 ;;
+  esac
+}
+uzi_cli() {
+  printf '%s\n' "$1 $2" >> "$SEQ_DIR/manual-calls"
+  case "$1 $2" in
+    'worker cordon')
+      set_hold "$CLI_HOLD_REASON"
+      [ "$MODE" != ambiguous ] || return 7
+      cat "$SEQ_DIR/manual-worker" ;;
+    'run approve')
+      [ "$MODE" != replacement ] || set_hold replacement-intent
+      [ "$MODE" != approval ] || return 7 ;;
+    'worker uncordon')
+      [ "$MODE" != restore ] || return 7
+      jq '.manual_cordoned_at=null | .manual_cordoned_by=null | .manual_cordoned_by_label=null
+        | .manual_cordon_reason=null' "$SEQ_DIR/manual-worker" > "$SEQ_DIR/manual-next"
+      mv "$SEQ_DIR/manual-next" "$SEQ_DIR/manual-worker"
+      cat "$SEQ_DIR/manual-worker" ;;
+    *) return 1 ;;
+  esac
+}
+wait_status() { [ "$MODE" != completion ]; }
+fail() { echo "$*" >&2; exit 1; }
+pass() { :; }
+# shellcheck disable=SC1090  # shipped phase suffix, mocked transports
+source <(awk '/^# This run is already held/ {emit=1} emit' "$ROOT/e2e/phases/18-cli-smoke.sh")
+BASH
+}
+for mode in success prior approval completion ambiguous replacement restore; do
+  cases=$((cases + 1))
+  : > "$SEQ_DIR/manual-calls"
+  if output="$(manual_hold_case "$mode" 2>&1)"; then got=pass; else got=fail; fi
+  calls="$(cat "$SEQ_DIR/manual-calls")"
+  reason="$(jq -r '.manual_cordon_reason' "$SEQ_DIR/manual-worker")"
+  valid=false
+  case "$mode" in
+    success) [ "$got" = pass ] && [ "$reason" = null ] && [[ "$calls" == *'worker uncordon'* ]] && valid=true ;;
+    prior) [ "$got" = fail ] && [ "$reason" = prior-intent ] && [ -z "$calls" ] && valid=true ;;
+    replacement) [ "$got" = fail ] && [ "$reason" = replacement-intent ] && [[ "$calls" != *'worker uncordon'* ]] && valid=true ;;
+    restore) [ "$got" = fail ] && [[ "$reason" == e2e-cli-assigned-* ]] && [[ "$output" == *cleanup* ]] && valid=true ;;
+    *) [ "$got" = fail ] && [ "$reason" = null ] && [[ "$calls" == *'worker uncordon'* ]] && valid=true ;;
+  esac
+  if [ "$valid" = true ]; then
+    passed=$((passed + 1)); echo "PASS: assigned CLI manual hold $mode"
+  else echo "FAIL: assigned CLI manual hold $mode result=$got reason=$reason calls=[$calls] output=[$output]"; fi
+done
+
+# The isolated-owner cleanup must terminalize its exact runs before cascading
+# resource deletion. Exercise the real local EXIT trap, including failure stops.
+manual_owner_cleanup_case() {
+  bash -euo pipefail -s -- "$ROOT" "$SEQ_DIR" "$1" <<'BASH'
+ROOT="$1" SEQ_DIR="$2" MODE="$3"
+M5_OWNER=11111111-1111-4111-8111-111111111111
+M5_REPO=22222222-2222-4222-8222-222222222222
+M5_EMAIL=fixture-owned@uzi.e2e
+M5_RUNS=(33333333-3333-4333-8333-333333333333)
+case "$MODE" in
+  uncreated) M5_OWNER="" ;;
+  invalid-owner) M5_OWNER=not-a-uuid ;;
+  sql-owner) M5_OWNER="invalid'"; M5_OWNER+=" OR '1'='1" ;;
+esac
+db_psql() {
+  printf '%s\n' "$1" >> "$SEQ_DIR/manual-cleanup"
+  case "$1" in
+    'UPDATE runs'*)
+      [[ "$1" == *"id='33333333-3333-4333-8333-333333333333' AND user_id='11111111-1111-4111-8111-111111111111' AND repo_id='22222222-2222-4222-8222-222222222222'"* ]] || return 1
+      [ "$MODE" != terminal-failure ] ;;
+    'SELECT count(*) FROM runs'*)
+      [ "$MODE" != still-active ] && echo 0 || echo 1 ;;
+    'DELETE FROM users'*)
+      [[ "$1" == *"id='11111111-1111-4111-8111-111111111111' AND email='fixture-owned@uzi.e2e'"* ]] || return 1
+      echo 11111111-1111-4111-8111-111111111111 ;;
+    'SELECT (SELECT count(*) FROM workers'*) echo 0 ;;
+    *) return 1 ;;
+  esac
+}
+# shellcheck disable=SC1090  # actual phase-local cleanup and EXIT handler
+source <(awk '/^  m5_uuid\(\)/ {emit=1} emit {print} /^  trap m5_exit EXIT/ {exit}' "$ROOT/e2e/phases/50-worker-token-binding.sh")
+case "$MODE" in
+  success) m5_cleanup; trap - EXIT ;;
+  # A successful body must still fail when the EXIT handler cannot safely clean.
+  invalid-owner|sql-owner) exit 0 ;;
+  *) exit 7 ;;
+esac
+BASH
+}
+for mode in success failure uncreated terminal-failure still-active invalid-owner sql-owner; do
+  cases=$((cases + 1))
+  : > "$SEQ_DIR/manual-cleanup"
+  if output="$(manual_owner_cleanup_case "$mode" 2>&1)"; then got=pass; else got=fail; fi
+  calls="$(cat "$SEQ_DIR/manual-cleanup")"
+  valid=false
+  case "$mode" in
+    uncreated) [ "$got" = fail ] && [ -z "$calls" ] && valid=true ;;
+    invalid-owner|sql-owner)
+      [ "$got" = fail ] && [ -z "$calls" ] && [[ "$output" == *'owned fixture cleanup failed'* ]] && valid=true ;;
+    terminal-failure|still-active)
+      [ "$got" = fail ] && [[ "$calls" != *'DELETE FROM users'* ]] && [[ "$output" == *cleanup* ]] && valid=true ;;
+    *)
+      [ "$mode" = success ] && want=pass || want=fail
+      [ "$got" = "$want" ] && [[ "$calls" == 'UPDATE runs'*'DELETE FROM users'* ]] && valid=true ;;
+  esac
+  if [ "$valid" = true ]; then
+    passed=$((passed + 1)); echo "PASS: manual owner cleanup $mode"
+  else echo "FAIL: manual owner cleanup $mode result=$got calls=[$calls] output=[$output]"; fi
+done
+
 node --test "$ROOT/e2e/settlement-diagnostic.test.mjs"
 node --test "$ROOT/e2e/recovery-record-projection.test.mjs"
 echo "cases=$cases passed=$passed"
