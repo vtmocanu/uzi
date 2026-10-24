@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/colorprofile"
@@ -126,19 +127,22 @@ func TestNumberedMilestoneTitle(t *testing.T) {
 	}{
 		{1, 4, "Merge base a86d6146", "M1 Merge base a86d6146"},
 		{2, 4, "M2 range review", "M2 range review"},
-		{3, 4, "M7 mismatched number", "M3 mismatched number"},
+		{3, 4, "M7 mismatched number", "M3 M7 mismatched number"}, // a different number stays
+		{1, 4, "M0 investigation", "M1 M0 investigation"},         // zero-based plans read honestly
 		{4, 4, "m4 - records, single-commit", "M4 records, single-commit"},
-		{1, 4, "M5: Fail-closed", "M1 Fail-closed"},
-		{1, 4, "M6.Gate positively", "M1 Gate positively"},
-		{1, 4, "   M7) Behavioral proof", "M1 Behavioral proof"},
-		{1, 4, "M8:Informative", "M1 Informative"},
-		{1, 4, "M12 two digits", "M1 two digits"},
-		{1, 4, "M3Migration of the store", "M1 M3Migration of the store"},
-		{1, 4, "M3D render pass", "M1 M3D render pass"},
-		{1, 4, "Milestone 3: left alone", "M1 Milestone 3: left alone"},
+		{1, 4, "M1: Fail-closed", "M1 Fail-closed"},
+		{1, 4, "M1.Gate positively", "M1 Gate positively"},
+		{1, 4, "   M1) Behavioral proof", "M1 Behavioral proof"},
+		{1, 4, "M1:Informative", "M1 Informative"},
+		{1, 4, "M01 leading zero", "M1 leading zero"},
+		{12, 12, "M12 two digits", "M12 two digits"},
+		{1, 12, "M12 two digits", " M1 M12 two digits"},
+		{3, 4, "M3Migration of the store", "M3 M3Migration of the store"},
+		{3, 4, "M3D render pass", "M3 M3D render pass"},
+		{3, 4, "Milestone 3: left alone", "M3 Milestone 3: left alone"},
 		{1, 4, "Mark the spot", "M1 Mark the spot"},
-		{4, 4, "M9", "M4 M9"},       // stripping would leave nothing: keep the original
-		{4, 4, "M9 - ", "M4 M9 - "}, // separator only: same fallback
+		{4, 4, "M4", "M4 M4"},       // stripping would leave nothing: keep the original
+		{4, 4, "M4 - ", "M4 M4 - "}, // separator only: same fallback
 		{2, 12, "M2 range review", " M2 range review"},
 		{12, 12, "Wrap up", "M12 Wrap up"},
 		{7, 100, "Seventh", "  M7 Seventh"},
@@ -166,7 +170,7 @@ func TestTUIMilestoneNumbersComposedView(t *testing.T) {
 	}
 
 	on := milestoneBlockRegion(t, railTestModel(t, run, 120, func(m *tuiModel) { m.milestoneNumbers = true }).View().Content)
-	const wantOn = "MILESTONES ▰▱▱▱ 1/4 · m2\n" +
+	const wantOn = "MILESTONES ▰▱▱▱ 1/4 · M2\n" +
 		" ✓ M1 Merge base a86d6146\n" +
 		" ◕ M2 range review\n" +
 		" ○ M3 isolated mutation\n" +
@@ -296,5 +300,53 @@ func TestTUIRailWidthInAnswerComposer(t *testing.T) {
 	}
 	if got := railColumnWidth(t, m.View().Content, "CREW"); got != 40 {
 		t.Fatalf("answer composer rail column at 200 cols = %d, want 40", got)
+	}
+}
+
+// A zero-based plan with slug ids: rows keep the model's own (different) numbers after the
+// position, and the header names the in-progress milestone by position, not by its slug id.
+func TestTUIMilestoneNumbersZeroBasedPlanAndHeader(t *testing.T) {
+	run := apitypes.RunDTO{ID: "run-3406", Kind: "issue", Status: "running", Health: "ok", IssueTitle: "Rail width",
+		Milestones: []apitypes.Milestone{
+			{ID: "spike", Title: "M0 investigation"},
+			{ID: "impl", Title: "M1 implement"},
+			{ID: "docs", Title: "M2 docs"},
+		},
+		MilestonesCompleted:  []string{"spike"},
+		MilestonesInProgress: []string{"impl"}}
+	got := milestoneBlockRegion(t, railTestModel(t, run, 120, func(m *tuiModel) { m.milestoneNumbers = true }).View().Content)
+	const want = "MILESTONES ▰▱▱ 1/3 · M2\n" +
+		" ✓ M1 M0 investigation\n" +
+		" ◕ M2 M1 implement\n" +
+		" ○ M3 M2 docs"
+	if got != want {
+		t.Errorf("zero-based plan drifted.\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+	off := milestoneBlockRegion(t, railTestModel(t, run, 120, nil).View().Content)
+	if !strings.HasPrefix(off, "MILESTONES ▰▱▱ 1/3 · impl\n") {
+		t.Errorf("numbering off must keep the id in the header, got:\n%s", off)
+	}
+}
+
+// The lead lane's context bar keeps the 26-col budget on a wider rail, like the account meters.
+func TestTUILeadContextBarKeepsMinimumBudget(t *testing.T) {
+	bar := func(width int) string {
+		m := tuiTestModel(t, &uzicli.FakeClient{}, "run-3406")
+		m.width = width
+		next, _ := m.Update(tea.ColorProfileMsg{Profile: colorprofile.Ascii})
+		run := railTestRun("Only milestone")
+		m = applyDetail(next.(tuiModel), run, []apitypes.MessageDTO{leadCtxMsg(1, 124000, 200000, 62, time.Now())})
+		for _, ln := range strings.Split(stripANSI(m.View().Content), "\n") {
+			if i := strings.Index(ln, "▏"); i >= 0 && strings.Contains(ln[:i], "lead") && strings.Contains(ln[:i], "62%") {
+				return strings.TrimSpace(ln[:i])
+			}
+		}
+		t.Fatalf("width %d: no lead row with a context meter", width)
+		return ""
+	}
+	cells := func(s string) int { return strings.Count(s, "▰") + strings.Count(s, "▱") }
+	narrow, wide := bar(100), bar(200)
+	if cells(narrow) == 0 || cells(wide) != cells(narrow) {
+		t.Fatalf("lead context bar must not grow with the rail: 100 cols %q (%d cells), 200 cols %q (%d cells)", narrow, cells(narrow), wide, cells(wide))
 	}
 }

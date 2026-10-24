@@ -2053,10 +2053,14 @@ rail_min_width = 36        # default 26
 
 - `milestone_numbers = true` prefixes each rail milestone title with its
   position in the approved list (`M1`, `M2`, …, right-aligned once there are
-  ten or more) and drops a number the run already wrote at the start of the
-  title (`M3 `, `m4 - `, `M5:`), so every row reads the same way. A word
-  that merely starts with one, like `M3Migration`, is left alone. The board
-  row is unchanged.
+  ten or more), and the `MILESTONES` header names the in-progress milestones
+  by the same positions (`· M2`) instead of their ids. When the run already
+  wrote the same number at the start of the title (`M3 `, `m3 - `, `M3:` on
+  the third row), it is dropped so the row is not doubled. A different
+  number stays, so a plan numbered from zero reads `M1 M0 investigation`
+  and the run's own numbering is never hidden. A word that merely starts
+  with a number, like `M3Migration`, is left alone. The board row is
+  unchanged.
 - `rail_min_width` raises the rail's floor, and may exceed the automatic
   44-column cap. The 60-column transcript minimum still wins on a terminal
   too narrow for both. Values below 26 are rejected.

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"image/color"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -390,9 +391,11 @@ func (m tuiModel) laneRow(l agentLane, selected bool, st crewState, suffix strin
 		line += paintSeg(m.pal.faintC, bg, false, suffix)
 	}
 	if showMeter {
-		// The bar fills whatever the rail has left after the ▸● <role><suffix> prefix,
+		// The bar fills whatever the 26-col budget has left after the ▸● <role><suffix> prefix,
 		// the meter's own leading space, its separator space, and the 4-col percent (=6).
-		barW := m.railWidth() - visualWidth(line) - 6
+		// The bar keeps the minimum rail's budget on a wider rail, like the account meters: a longer
+		// bar adds no information beside the printed percent (issue #3406).
+		barW := laneRailWidth - visualWidth(line) - 6
 		if barW < 0 {
 			barW = 0
 		}
@@ -420,18 +423,41 @@ func (m tuiModel) milestoneTitleCap() int { return m.railWidth() - 4 }
 
 // milestoneNumberPrefix matches a model-written leading milestone number ("M3 ", "m4 - ",
 // "M5:", a bare "M9"), but not a word that merely starts with one ("M3Migration", "M3D").
-var milestoneNumberPrefix = regexp.MustCompile(`^\s*[Mm]\d+(?:\s*[:.)\-]\s*|\s+|$)`)
+var milestoneNumberPrefix = regexp.MustCompile(`^\s*[Mm](\d+)(?:\s*[:.)\-]\s*|\s+|$)`)
 
 // numberedMilestoneTitle splits a rail title into the [tui] milestone_numbers position prefix
-// (1-based frozen position, right-aligned to the widest one, plus a space) and the title text
-// with any model-written leading number removed. A title that is nothing but a number keeps its
-// original text. The prefix is ours and trusted; the title still goes through renderer.Plain,
-// which trims leading space and so cannot carry the alignment itself.
+// (1-based frozen position, right-aligned to the widest one, plus a space) and the title text.
+// A model-written leading number is dropped only when it equals the position; a different one
+// (a zero-based plan's "M0 investigation") stays, so the number the plan and transcript use is
+// never hidden. A title that is nothing but a number keeps its original text. The prefix is ours
+// and trusted; the title still goes through renderer.Plain, which trims leading space and so
+// cannot carry the alignment itself.
 func numberedMilestoneTitle(pos, total int, title string) (prefix, rest string) {
-	if loc := milestoneNumberPrefix.FindStringIndex(title); loc != nil && strings.TrimSpace(title[loc[1]:]) != "" {
-		title = title[loc[1]:]
+	if loc := milestoneNumberPrefix.FindStringSubmatchIndex(title); loc != nil && strings.TrimSpace(title[loc[1]:]) != "" {
+		if n, err := strconv.Atoi(title[loc[2]:loc[3]]); err == nil && n == pos {
+			title = title[loc[1]:]
+		}
 	}
 	return fmt.Sprintf("%*s ", len(itoa(total))+1, "M"+itoa(pos)), title
+}
+
+// milestonePositionLabels maps milestone ids to their 1-based frozen positions ("M2"), keeping an
+// id the frozen list does not hold as-is.
+func milestonePositionLabels(ms []apitypes.Milestone, ids []string) []string {
+	pos := make(map[string]int, len(ms))
+	for i, mi := range ms {
+		if _, seen := pos[mi.ID]; !seen {
+			pos[mi.ID] = i + 1
+		}
+	}
+	labels := make([]string, len(ids))
+	for i, id := range ids {
+		labels[i] = id
+		if p, ok := pos[id]; ok {
+			labels[i] = "M" + itoa(p)
+		}
+	}
+	return labels
 }
 
 // milestoneRowParts is a rail milestone row's trusted position prefix ("" unless [tui]
@@ -814,7 +840,12 @@ func (m tuiModel) renderMilestones() string {
 	// width (milestoneIPSuffix folds a long-id overflow into " +N") and, when appending it inline
 	// would push the eyebrow past the rail, dropped to its own continuation line — so the line always
 	// fits the rail and the in-flight count never ellipsizes away in the composed view (#1176).
-	switch suffix := m.milestoneIPSuffix(ipIDs, m.railWidth()-visualWidth("· ")); {
+	// Under [tui] milestone_numbers the suffix names positions (`· M2`), the numbering the rows use.
+	ipLabels := ipIDs
+	if m.milestoneNumbers {
+		ipLabels = milestonePositionLabels(ms, ipIDs)
+	}
+	switch suffix := m.milestoneIPSuffix(ipLabels, m.railWidth()-visualWidth("· ")); {
 	case suffix == "":
 		sb.WriteString(eyebrow + "\n")
 	case visualWidth(eyebrow)+visualWidth(" · "+suffix) <= m.railWidth():
