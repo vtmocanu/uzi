@@ -825,7 +825,7 @@ func workerMemoryText(w apitypes.WorkerDTO) string {
 
 type workerTableWidths struct {
 	memory, version, kind, intake int
-	dense                   bool
+	dense                         bool
 }
 
 // Measure the filtered fleet once; the header and every row share these widths.

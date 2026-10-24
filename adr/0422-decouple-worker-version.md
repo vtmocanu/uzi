@@ -108,7 +108,7 @@ Repeating the current state preserves the first timestamp, actor and reason and
 adds no event. A real transition and one `worker_cordon_events` event commit in
 the same transaction; uncordon's event keeps the previous reason. This adds no
 audit read/prune API, retention policy or DB-enforced append-only guarantee
-(`api/internal/store/manual_cordon.go`, migrations 00352/00353/00354).
+(`api/internal/store/manual_cordon.go`, migrations 00355/00356/00357).
 
 **Intake boundary.** Compatible API claim paths serialize with cordon through a
 worker-row lock at READ COMMITTED and re-read intake state after that lock.
