@@ -2501,6 +2501,39 @@ Admitted image turns and eligible custody-held layout migrations receive an
 `image_roll` cordon over the authenticated
 `POST /api/controller/workers/{id}/drain` control-write channel. The API's
 `draining_since` and reason remain separate from heartbeat-derived status.
+
+Owner manual cordon is an independent persistent-worker intake boundary
+(scope amendment 2026-10-22, implementation recorded 2026-10-24).
+`POST`/`DELETE /api/workers/{id}/cordon` use existing `RequireUser` session
+plus CSRF or user CLI-token authentication and strict ownership even for admins.
+Persistent hosted/external workers (`ephemeral=false`) support it; ownership
+is checked before the ephemeral HTTP 409 refusal. The web Workers controls and
+`uzi worker cordon <id> [-m <reason>]` / `uzi worker uncordon <id>`
+(both `--json`) share this owner API. Health/admin surfaces remain read-only.
+
+Manual timestamp, actor UUID/label snapshot and optional reason are separate
+from automatic drains and maintenance. Transition plus audit event commits in
+one READ COMMITTED transaction under the owner-qualified worker lock;
+compatible claims re-read combined intake state after the same worker lock.
+Idempotent repeats preserve original metadata without another event.
+Registration, roll, restart, deadlines, ForceRoll and reason-owned automatic
+release preserve manual intent; explicit owner uncordon or deletion ends it.
+Held continuations/checkers/chat remain subject to existing fences; cordon
+cancels no run, ends no chat and adds no continuation affinity.
+
+Manual workers supply no serving/replacement coverage. Incarnation proof and
+reservation completion remain distinct from serving eligibility, so an idle
+manual worker can roll and return cordoned; busy drift still waits under #3103.
+An all-manual multi-worker pool may remain held, without a zero-coverage bypass.
+Custody/migration (#3153/#3307) and DinD/pressure/maintenance guards remain
+independent. Earlier poll decisions may finish. Older serving APIs can admit
+after a successful cordon until every serving replica is compatible; stalled
+rollout extends that interval. Older controllers may miscount manual coverage,
+so ordinary coverage guarantees require compatible controllers. No worker-image
+protocol requirement or activation flag is added. Contract and rationale:
+[ADR-422 D5a](adr/0422-decouple-worker-version.md#d5a--owner-manual-cordon-is-persistent-intent-scope-amendment-2026-10-22);
+user lifecycle: [manual cordon](docs/hosted-workers.md#pause-new-work-with-a-manual-cordon).
+
 Under #3103, actual spec-hash/generation drift (image pin, template or size) and
 associated recycle wait indefinitely for genuine idle, including run-bound
 workers outside pacing and calls with no pacing entry or a plain drain reason.
@@ -2554,7 +2587,7 @@ holds its tier's ResourceQuota indefinitely (issue #360). The requeue-then-manua
 interrupted — by independent nondrifted maintenance expiry, global force-roll,
 or an uncontrolled pod loss)
 is unchanged by this PRD. Full rationale, the Decision Log, and what remains
-open (a CLI drain verb, live-cluster validation) are in
+open (live-cluster validation; the owner CLI manual-cordon deferral is superseded) are in
 [adr/0422-decouple-worker-version.md](adr/0422-decouple-worker-version.md).
 
 ### Worker disk: observed on the heartbeat, self-healed by the controller (PRD #837)

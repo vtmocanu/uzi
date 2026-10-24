@@ -1612,10 +1612,23 @@ into `file`/`dismiss`/`resolve`. `undo` keys on the `disposition_id` field (read
   heartbeat instead. `uzi worker list` / `uzi admin workers` show the runs
   each worker reports executing and in which phase.
 - `uzi worker cordon <id> [-m <reason>]` pauses new intake on your persistent
-  worker; held work continues. `uzi worker uncordon <id>` clears only manual
-  intent; automatic drains and other fences can remain. Both return the updated
-  worker with `--json`. Run-bound/ephemeral workers return HTTP 409:
-  `manual cordon is only supported for persistent workers`.
+  hosted or external worker; held work continues subject to other fences.
+  `uzi worker uncordon <id>` clears only manual intent; automatic drains,
+  maintenance and custody remain independent. Both return the updated worker
+  with `--json`. Reasons are limited to 500 Unicode code points before
+  trimming/sanitization; blank becomes null. A repeat preserves the first
+  timestamp, actor and reason. Run-bound/ephemeral workers return HTTP 409:
+  `manual cordon is only supported for persistent workers`. Ownership is strict
+  even for admins; no admin write or worker-create command is added. Manual
+  intent survives registration, roll, restart, deadlines and ForceRoll until
+  explicit uncordon or deletion; offline status is independent. It does not
+  cancel runs, end chats or create continuation affinity. An idle worker may
+  roll and return cordoned, but supplies no serving coverage; an all-manual
+  multi-worker pool may remain held. Health/admin views are diagnosis only.
+  Older serving APIs can admit after cordon until every replica is compatible
+  (a stalled rollout extends this window); older controllers may miscount
+  coverage, and earlier poll decisions may finish. Compatible controllers are
+  required for ordinary coverage guarantees; no worker-image upgrade is needed.
 - `uzi worker set-token <worker-id> <label>|--default|--auto` — choose which
   Anthropic credential a worker's runs spend. A **label** pins it to that token;
   **`--default`** uses your default one; **`--auto`** lets uzi pick per claim from
