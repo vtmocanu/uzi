@@ -114,7 +114,7 @@ present, otherwise the resolved default branch. It can advance during reclaims:
 coverage over an older published base remains content-free even when today's floor
 tree differs. Conversely, an outside tree matching only the newer floor tip, with
 no matching boundary tree, does not prove content-free coverage.
-An outside tree matching no boundary, or unreadable proof, blocks completion. A confirmed
+An outside tree matching no boundary, or unreadable proof, blocks report-only completion. A confirmed
 publication with an unknown tip also blocks; a genuinely absent checkpoint without
 confirmed publication does not. The existing mirrored marker-only `wip(park):`
 exception (#759) retains its ancestry-based handling.
@@ -124,7 +124,7 @@ preservation and publication are unchanged. This is a content proof for the exis
 report-only decision, not a new worker-to-forge deletion capability.
 
 **Issue-run fallback (#3360).** On issue runs only, when the lead declares `report_only`
-but `hasCommittedCheckpoint` proves committed work was published (same proof as above,
+but `hasCommittedCheckpoint` cannot establish that the checkpoint is content-free (same proof as above,
 unchanged), the worker no longer fails the run (#299). It sets a non-closing declaration
 (static worker reason "The lead declared report_only after committing work; the worker
 delivered it without closing the issue."), unless the lead or an earlier persisted claim
