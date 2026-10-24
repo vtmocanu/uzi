@@ -227,6 +227,13 @@ Landing order: merge after #3356; append these lines to #3346; then close #1225 
   - The six `TestCompletionLifecycle*LiveDB` tests and all three `TestDecideCompletionNonOwnerHiddenLiveDB` subtests PASS.
   - `scripts/livedb-skip-guard.sh` over the combined logs reports `LiveDB: 4528 passed, 0 skipped`. That count is not a count of distinct tests: the workersvc tests that ran before the cut-off are counted twice.
 
+- 2026-10-24 (implementation run, M4 close-out after M3): the full `task gate:api` was not run in-worker. Earlier runs on this issue were killed with exit 137 under the container memory limit (memory exhaustion suspected), so the approved plan (rule R1) replaced it with focused evidence, and CI `test-api` and `test-api-store-it` must pass before landing. Run serially, all EXIT=0, on the branch with this PRD archived:
+  - `task check-docs:web` and `task gate:repo`.
+  - `task fmt-check:api`, `vet:api`, `build:api`, `check:sqlc-drift`, `lint:api` (0 issues; `origin/main` resolved to the real base `bc1422eb`, so the ratchet compared against it), `deadcode:api`.
+  - `go test -race -count=1 -p 1` over `./internal/uzidocs`, `./internal/handler` and `./internal/workersvc`. These packages cover the embedded-docs equality and `TestSemanticTransportLimitsDocumented`; their LiveDB tests ran in the M3 sweep.
+  - The M4 bullet's literal gate list names `task gate:api`; R1 is the recorded deviation.
+
+  The M3 records went into ADR-1225's close-out and the epic PRD, and this PRD moved to `prds/done/`. The agent side changed no files after M2 apart from the base merge; the merge's agent tests are left to CI. One focused case was rerun after the merge: the Codex b0ffd0ea case.
 - 2026-10-23: Revised after lead and Codex peer review. Decisions on the four open questions:
   - Q1: reword the pinned preconditions to "Any future semantic activation must …" and update every literal and the test together (D6).
   - Q2: #1230 m6 is evidenced by #3356, so this PR archives the epic PRD and #1225 closes after the remaining hosted checks are carried, unticked, into #3346 (D5). #3356 is a stated dependency.
