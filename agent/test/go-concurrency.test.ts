@@ -112,7 +112,7 @@ describe("loadConfig goConcurrency", () => {
 });
 
 describe("real go toolchain", () => {
-  it("accepts the check-env GOFLAGS and honours GOMAXPROCS", { timeout: 150_000 }, async () => {
+  it("accepts the check-env GOFLAGS and honours GOMAXPROCS", { timeout: 90_000 }, async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-go-conc-"));
     try {
       const src = path.join(dir, "src");
@@ -139,7 +139,7 @@ describe("real go toolchain", () => {
         GOTOOLCHAIN: "local",
       };
       const out = await new Promise<string>((resolve, reject) => {
-        execFile("go", ["run", "."], { cwd: src, env, timeout: 120_000, maxBuffer: 1 << 20 },
+        execFile("go", ["run", "."], { cwd: src, env, timeout: 75_000, maxBuffer: 1 << 20 },
           (err, stdout, stderr) => err ? reject(new Error(`go run failed: ${err.message}\n${stderr}`)) : resolve(stdout));
       });
       assert.equal(out.trim(), "3|-p=2");
