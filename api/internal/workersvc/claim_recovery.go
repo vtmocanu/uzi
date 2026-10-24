@@ -144,8 +144,8 @@ func (s *Service) assembleAndFinishRunClaim(ctx context.Context, wkr store.Worke
 	}
 	payload, err := s.assembleClaim(ctx, wkr, run)
 	if err == nil {
-		// An over-limit claim would be refused by the worker's read cap and retried forever;
-		// fail the run terminally instead, keeping any minted Codex capability identity.
+		// An over-limit claim would be refused by the worker's read cap; fail here with a
+		// clear reason instead, preserving any minted Codex capability identity.
 		if serr := s.refuseOversizeRunClaim(payload); serr != nil {
 			err, payload = serr, nil
 		}
