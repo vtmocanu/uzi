@@ -84,7 +84,8 @@ describe("owner manual intake controls", () => {
     expect(document.activeElement).toBe(screen.getByRole("button", { name: "Cordon target" }));
     cordon("second draft");
     const uncordon = await screen.findByRole("button", { name: "Uncordon target" });
-    expect(document.activeElement).toBe(uncordon);
+    // The trigger can appear before the asynchronous success effect restores focus.
+    await waitFor(() => expect(document.activeElement).toBe(uncordon));
     expect(within(row()).getByText("first actor")).toBeTruthy();
     expect(within(row()).getByText("2026-10-01T00:00:00.000Z")).toBeTruthy();
     expect(row().textContent).toContain("first reason");
