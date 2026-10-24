@@ -1,7 +1,7 @@
 # Epic PRD #1225: Completion interlock with same-run rework and durable holds
 
 **Issue:** [#1225](https://github.com/vtmocanu/uzi/issues/1225)
-**Status:** Closed 2026-10-23: structural interlock delivered; semantic auditing not shipped (#1231 and #1233 closed not planned, #1228 detached and parked, #1229 not planned). Delivers structural containment, owner decisions and recoverable holds on both harnesses, preserving Git while provider-context continuity remains same-worker only. Close-out evidence: #1232 (lifecycle, wire and Codex-parity tests, a mutation audit of every structural guard, and the records).
+**Status:** Closed 2026-10-23: structural interlock delivered; semantic auditing not shipped (#1231 and #1233 closed not planned, #1228 detached and parked, #1229 not planned). Delivers structural containment, owner decisions and recoverable holds on both harnesses, preserving Git while provider-context continuity remains same-worker only. Close-out evidence: #1232 (lifecycle, wire and Codex-parity tests, a mutation audit of every D4 guard (G1 to G12), and the records).
 **Priority:** Normal (current issue taxonomy).
 **Origin:** Review of [PR #1220](https://github.com/vtmocanu/uzi/pull/1220) and run `b0ffd0ea` on 2026-09-09.
 **Execution:** None. The epic is closed; never add `uzi`.
@@ -69,7 +69,7 @@ These seams are fixed here so each merged child extends rather than replaces its
 - [x] #1230 merged for its dormant scope: dormant compiler/reviewer produce source-backed criteria under test, with coverage at exact approval decision points and exact human authority over maintainer exceptions; no repo setting or production calls. Owner check m6 is evidenced by PR #3356.
 - Not delivered: #1231 (new eligible issue runs use semantic enrollment by default, frozen instance-admin controls and hard capability routing). Closed not planned 2026-10-23.
 - Not delivered: #1233 (structured blocker policy gates completion and governed automatic/manual MR rework). Closed not planned 2026-10-23.
-- [x] #1232: integrated structural lifecycle, wire and Codex-parity proof, a mutation audit of every structural guard (one survivor closed by a test) and the records close-out. Structural default-on shipped in #1626/#1627; no duplicate default flip or kill-switch removal. Semantic rollout and rollback proof does not apply because no semantic path was activated.
+- [x] #1232: integrated structural lifecycle, wire and Codex-parity proof, a mutation audit of every D4 guard, G1 to G12 (one survivor closed by a test) and the records close-out. Structural default-on shipped in #1626/#1627; no duplicate default flip or kill-switch removal. Semantic rollout and rollback proof does not apply because no semantic path was activated.
 
 ## Hosted validation
 
