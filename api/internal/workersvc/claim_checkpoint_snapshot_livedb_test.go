@@ -32,7 +32,7 @@ func TestClaimCheckpointRecoveryWaitSnapshotLiveDB(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer holder.Rollback(context.Background())
+			defer func() { _ = holder.Rollback(context.Background()) }()
 			if _, err := holder.Exec(ctx, "SELECT id FROM runs WHERE id=$1 FOR UPDATE", id); err != nil {
 				t.Fatal(err)
 			}

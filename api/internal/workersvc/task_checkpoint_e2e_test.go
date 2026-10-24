@@ -81,7 +81,7 @@ func taskCheckpointCreation(t *testing.T, env codexTestEnv, repoRoot string) {
 	base := taskCheckpointGit(t, origin, "-c", "user.name=fixture", "-c", "user.email=fixture@example.test", "commit-tree", tree, "-m", "base")
 	taskCheckpointGit(t, origin, "update-ref", "refs/heads/main", base)
 	tip := taskCheckpointGit(t, origin, "-c", "user.name=fixture", "-c", "user.email=fixture@example.test", "commit-tree", tree, "-p", base, "-m", "saved work")
-	packCmd := exec.Command("git", "-C", origin, "pack-objects", "--stdout", "--revs")
+	packCmd := exec.Command("git", "-C", origin, "pack-objects", "--stdout", "--revs") // #nosec G204 -- fixed Git command and test-owned origin directory; no shell
 	packCmd.Env = taskCheckpointEnv()
 	packCmd.Stdin = strings.NewReader(tip + "\n")
 	pack, err := packCmd.Output()
@@ -193,7 +193,7 @@ func taskCheckpointTransfer(t *testing.T, env codexTestEnv, root, agent, mode st
 	if err := os.Chown(scratch, os.Getuid(), os.Getgid()); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(scratch, 0700); err != nil {
+	if err := os.Chmod(scratch, 0700); err != nil { // #nosec G302 -- private MkdirTemp directory used as TMPDIR needs owner traversal
 		t.Fatal(err)
 	}
 	origin := filepath.Join(scratch, "origin.git")
@@ -230,7 +230,7 @@ func taskCheckpointTransfer(t *testing.T, env codexTestEnv, root, agent, mode st
 		}
 		ctx, cancel := context.WithTimeout(env.ctx, 2*time.Minute)
 		defer cancel()
-		cmd := exec.CommandContext(ctx, "node", "--import", "tsx", "test/fixtures/task-checkpoint-recovery-e2e.ts", action, config)
+		cmd := exec.CommandContext(ctx, "node", "--import", "tsx", "test/fixtures/task-checkpoint-recovery-e2e.ts", action, config) // #nosec G204 -- fixed Node fixture, test-defined action and private config path; no shell
 		cmd.Dir = agent
 		cmd.Env = append(taskCheckpointEnv(), "TMPDIR="+scratch)
 		out, err := cmd.CombinedOutput()
@@ -270,14 +270,14 @@ func taskCheckpointTransfer(t *testing.T, env codexTestEnv, root, agent, mode st
 	cfg["url"] = remote.URL + "/origin.git"
 	node(t, "prepare")
 	var state struct{ Tip, Base, Committed, Marker string }
-	data, err := os.ReadFile(filepath.Join(scratch, "state.json"))
+	data, err := os.ReadFile(filepath.Join(scratch, "state.json")) // #nosec G304 -- fixed fixture filename in the test-owned private MkdirTemp directory
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := json.Unmarshal(data, &state); err != nil {
 		t.Fatal(err)
 	}
-	pack, err := os.ReadFile(filepath.Join(scratch, "checkpoint.pack"))
+	pack, err := os.ReadFile(filepath.Join(scratch, "checkpoint.pack")) // #nosec G304 -- fixed fixture filename in the test-owned private MkdirTemp directory
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -494,7 +494,7 @@ func taskCheckpointEnv() []string {
 }
 func taskCheckpointGit(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...) // #nosec G204 -- fixed Git executable with test-defined arguments and fixture paths; no shell
 	cmd.Env = taskCheckpointEnv()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -556,7 +556,7 @@ func taskCheckpointSmartHTTP(origin string) http.Handler {
 		if advertise {
 			w.Header().Set("Content-Type", "application/x-"+service+"-advertisement")
 			prefix := "# service=" + service + "\n"
-			_, _ = fmt.Fprintf(w, "%04x%s0000", len(prefix)+4, prefix)
+			_, _ = fmt.Fprintf(w, "%04x%s0000", len(prefix)+4, prefix) // #nosec G705 -- switch-allowlisted Git service in a smart-HTTP advertisement, not HTML
 		} else {
 			w.Header().Set("Content-Type", "application/x-"+service+"-result")
 		}

@@ -173,7 +173,7 @@ func (tx *claimProjectionFaultTx) QueryRow(ctx context.Context, sql string, args
 		if isolation != "read committed" {
 			return claimProjectionErrorRow{errors.New("claim finish did not force READ COMMITTED")}
 		}
-		if _, err := tx.Tx.Exec(ctx, "UPDATE runs SET issue_title='projection rollback marker' WHERE id=$1", tx.b.runID); err != nil {
+		if _, err := tx.Exec(ctx, "UPDATE runs SET issue_title='projection rollback marker' WHERE id=$1", tx.b.runID); err != nil {
 			return claimProjectionErrorRow{err}
 		}
 		if tx.b.mode == "missing" {
