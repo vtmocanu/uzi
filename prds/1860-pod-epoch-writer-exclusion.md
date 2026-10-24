@@ -166,7 +166,7 @@ Recorded by the #1860 M0 run, 2026-10-24. Real-daemon results come from the harn
   The first Kubernetes zip fetch returned a 302 redirect with an empty body; following the redirect worked.
 - **Controlled daemon.** `e2e/pod-epoch/lib.sh` models one worker pod per posture as three digest-pinned containers on the shared outer daemon:
   - a pause container that owns the network namespace;
-  - a worker container that runs every Docker client command;
+  - a worker container that holds the `/events` stream and the first-response and window clients (fixture setup and the cp/start/read-only probe commands run the Docker CLI inside the daemon container, which does not change daemon API semantics);
   - a privileged DinD daemon container.
 
   Harness-owned, labelled volumes stand in for the data root (the DinD PVC), `/data/runner` (the shared workdir) and, rootless only, the socket directory. Teardown removes by exact name only, after a label check, and the image `VOLUME` paths get tmpfs mounts, so nothing unlabelled is left on the outer daemon.
@@ -239,9 +239,9 @@ It must persist that record *before* any successor can consume it. The precedent
 
 The worker defers when:
 - any field is missing;
-- the PVC UID or PV name changed;
+- the PVC UID or PV name changed, except across a controller-planned DinD-PVC replacement (the ADR-1759 recycle), which the evidence must record as old and new DinD-PVC identity, the controller having already observed the predecessor's termination. Without that rule every DinD maintenance recycle would defer;
 - the predecessor equals the successor;
-- more than one live pod, or another pod naming the claims, was seen;
+- more than one live pod (a pod whose phase is not terminal and that is not the evidenced predecessor), or another pod naming the claims, was seen. This makes graceful delete, API eviction and preemption ineligible in practice, because their successor overlaps a non-terminal predecessor; under Recreate the terminal predecessor object may still exist when the successor appears, which this definition allows;
 - a controller restart came between observation and persistence;
 - the cluster runs a Kubernetes version other than 1.37.x.
 
@@ -277,7 +277,7 @@ So a connection is accepted into the backlog early, but the **first HTTP respons
 The restart-policy rule costs nothing on the lead's sample: 0 of 11 workers had a non-`no` policy. Without the rule, a restore-started container is running at the barrier and the first check alone defers it.
 
 **Restart detection.** A sidecar restart re-runs `restore`, since `NewDaemon` runs it on every start. `GET /info` `ID` is persisted (`daemon/id.go`), and `SystemTime` is just the clock, so neither identifies an incarnation. Events live in an in-memory buffer (`daemon/events/events.go`), and `Shutdown` closes the event service. A stream opened before the inventory and held through deletion therefore ends on any daemon exit; a hard kill closes the socket. This is supporting evidence only (see "Restart detection is evidence, not a barrier" below).
-- Rootless only, *inferred, not read*: the socket inode should change on each start.
+- Rootless only: the socket inode changes on each start (not read in source; measured, see Real-daemon results).
 - Controller-side only: the `dind` `containerID` and `restartCount` change.
 
 **Stopped state (Q3).**
@@ -336,6 +336,7 @@ The `dind-init` and `dind-meter` sidecars make no Docker API calls (`render_dind
 **Not worker-owned, but able to reach the daemon:**
 - On rootful, every process in the pod network namespace can reach the daemon over loopback TCP (`render_dind.go`, `dindLoopbackTCP`). That includes run-agent children that outlive a worker *process* restart within the same container.
 - Containers on the daemon can reach it too, with host networking or a mounted socket. Running containers are already excluded by the eligibility rule.
+- On rootless, production keeps the image's TLS listener on 2376 (the harness deviation note above). *Inferred from the image entrypoint and `render_dind.go`'s mounts:* it requires client certificates that exist only in the `dind` container's filesystem, since the pod mounts no `/certs` volume, so no other pod container holds credentials for it.
 
 **No-client interval.** Insert the once-per-pod reclaim in `main.ts` after the `startupReapVerdict` block and before `worker.run()`. Nothing worker-owned has sent a request there, and the only allowed requests are read-only: the reclaim's own `GET /_ping`, `GET /info`, `GET /containers/json?all=1`, `GET /containers/{id}/json`, `GET /volumes`, `GET /plugins` and `GET /events`; the kubelet `docker info` probe; and the connect-only wiring probe. The reclaim's own `DELETE` of stopped containers that bind into the tree, and of nothing else, is the single exception it makes.
 
@@ -363,7 +364,7 @@ Placing the reclaim later is possible only before `registerWithRetry` (`worker.t
 | Legacy data recycle and worker teardown | uzi | no: the data PVC is deleted | absence |
 | Eviction, drain, manual delete | kubelet or operator | yes | no (outside the controller's control; `adr/3153-runner-shared-pvc-subpath.md` D7 calls them unguardable for its migration guard). An OOM kill restarts a container in the same pod, so it is not an epoch |
 
-Worker-pin rollouts follow release cuts that change the agent runtime: 29 non-RC tags since 2026-08-24, and RCs almost daily in late October 2026 (`git tag`). The rollout rate itself was not measured. It could match a days-scale fill rate, but only if the controller actually captures termination evidence at those rollouts, which today's 10 s absence-only poll does not do.
+Worker-pin rollouts follow release cuts that change the agent runtime: 29 non-RC tags since 2026-08-24, and RCs almost daily in late October 2026 (`git tag`). The worker pin (`deploy/chart/values.yaml` `workers.image.tag`, which the controller stamps into the pod-spec hash) changed in 74 commits on 46 distinct days between 2026-08-24 and 2026-10-24 (`git log -L` on that line), so a pin roll was available on roughly three days in four. *Inferred:* how soon a cluster applies a pin depends on its GitOps sync, which was not measured. That rate could match a days-scale fill rate, but only if the controller actually captures termination evidence at those rollouts, which today's 10 s absence-only poll does not do.
 
 **On demand.** An idle worker **cannot** request its own pod recycle. Its heartbeat disk stats do feed `diskOverThreshold` (`api/internal/workersvc/service.go`), which drives the controller's legacy data recycle (`maintenance.go` `legacyRecycleDue`), but that recycle deletes the data PVC. `dind-maintenance.ts` only answers a server operation that the controller (`maintenance.go` `reconcileDinD`) starts on DinD-volume pressure, under server fences (`api/internal/workersvc/dind_maintenance.go`, ADR-1759 D7). Data-volume pressure enters only the legacy recycle, which deletes `/data/runner` and skips custody-held workers. An on-demand epoch therefore needs a new, fenced request type, such as "recycle pod, keep PVCs". That is the later PRD's choice.
 
@@ -381,8 +382,8 @@ Worker-pin rollouts follow release cuts that change the agent runtime: 29 non-RC
 - **Verdicts:** every experiment prints `EXP … rootless PASS` and `EXP … rootful PASS`, and no `check.*` line is `FAIL`.
 - **Raw lines:** the `RESULT`/`EXP` lines are committed in `e2e/pod-epoch/results/m0-0658dee5.txt` (verbatim apart from stripped trailing whitespace).
 - **Cleanup:** no `pe1860.owner` container or volume remained, and the outer daemon's dangling-volume count was unchanged.
-- **Reviewer and auditor:** a reviewer and an auditor reviewed the scripts at that commit. No blocking or Medium findings remained; remaining notes are listed under "Limits of the experiments".
-- **Earlier run:** the run at `7d343ce6` passed too. Review then found three checks that could pass vacuously, which `0658dee5` fixed, so only the `0658dee5` run is cited.
+- **Reviewer and auditor:** this run's reviewer and auditor reviewed the scripts at that commit (review reports are in the run transcript, not the repo). No blocking or Medium findings remained; remaining notes are listed under "Limits of the experiments".
+- **Earlier run:** at `7d343ce6`, after one ENOSPC failure on the shared outer daemon and a retry, the run passed too. Review then found checks that could pass vacuously (kill delivery, the events-window instrument, plugin-listing errors), which `0658dee5` fixed together with other fail-closed hardening, so only the `0658dee5` run is cited.
 
 **Restore (Q2).** Seven fixtures on a persisted root, through a daemon restart and through a successor-pod replace.
 
@@ -412,12 +413,12 @@ All 7 `check.barrier.*` checks pass. Positive controls showed the same instrumen
 - **Negative control:** an untouched stream stayed open for 5 s.
 - **`GET /info` ID:** identical before and after every restart.
 - **Rootless socket inode:** a new socket inode was created on every start. This was measured against a hard link holding the old inode, because a plain inode comparison can reuse the number.
-- **Different kill9 subjects per posture:** the kill9 row measures different things. Rootful kills the whole daemon container from outside; rootless kills only dockerd inside the container. Each case's `delivery` line records which.
+- **Different kill9 subjects per posture:** the kill9 row measures different things. Rootful kills the whole daemon container from outside; rootless signals only dockerd inside the container (the container then exits with it, exit 137). Each case's `delivery` line records which.
 - **Rootful kill9 recovery failure (recorded as a finding):** after a rootful kill9, the *same-container* restart **failed**:
   - The error was `failed to save containerd pid to disk: process with PID 36 is still running`.
   - A stale `/var/run/docker/containerd/containerd.pid`, `exists=yes content=36`, survived in the container's writable layer.
   - The daemon then never served, which fails closed.
-  - With a `--time 10` stop on the `restart` case, a development run hung in the same "containerd is still running" state. The fixtures ignore SIGTERM, so the shortened grace preempted dockerd's own shutdown. The official script uses `--time 30`, Kubernetes' default grace.
+  - With a `--time 10` stop on the `restart` case, one development run hung with "containerd is still running" (a related stale-containerd state, not the same message); the `7d343ce6` official run with `--time 10` did not hang, so it is intermittent. *Suspected, not proven:* the fixtures ignore SIGTERM, so the short grace preempted dockerd's own shutdown. The official script's restore restart step uses `--time 30`, Kubernetes' default grace; its other restarts (no running fixtures) use `--time 10`.
   - Whether production hits this depends on where the pid file lives:
     - Rootful: production keeps it in a writable layer that a kubelet container restart replaces (inferred).
     - Rootless: production keeps it in the pod-lifetime `dind-sock` `emptyDir`, which the harness's tmpfs does not reproduce, so the risk is **not exercised** there.
@@ -426,7 +427,7 @@ All 7 `check.barrier.*` checks pass. Positive controls showed the same instrumen
 **Stopped state (Q3).** A running `-v /data/runner/tree-B:/w` container was the positive control. The scanner saw:
 - the bind in the task's mount namespace (`mnt_strict=1`);
 - a cwd/fd in the tree (`fd=1`);
-- a deleted-inode fd.
+- and, from a separate harness cwd holder measured after `rm -rf`, a deleted-inode fd (`control.deleted_inode_fd=1`).
 
 After `docker stop`, and again after a daemon restart, every scan found `refs=0` (mount, cwd, fd and memory-mapping references). Each of those scans proved it read dockerd's own mount namespace: `scan_complete=yes … dockerd_ns_read=yes`.
 
@@ -452,7 +453,7 @@ So nothing stopped can write to the deleted inode. A later *client request*, tho
   - The mapping category is controlled by a process running a binary from inside a tree (`map=5`).
 
 **Read-only probes (Q4, Q6).** These were issued between two event markers:
-- `_ping`, `info` and `version`;
+- `info` and `version` (the CLI's `/_ping` negotiation is implied, not a separate request);
 - `ps -a`, plus `inspect` on every container;
 - `volume ls` / `inspect`, `plugin ls`, and a bounded `events` read.
 
@@ -489,7 +490,7 @@ An implementation may keep the stream as an extra abort-and-defer trigger, but i
 
 ### Recommendation: **go**, conditional
 
-M0 answers Q1–Q7. Q1 is source-only, as the PRD allows. Q2–Q5 have real-daemon results on Engine 29.8.0 in **both** postures, and neither posture is UNRUN.
+M0 answers Q1–Q7. Q1 is source-only, as the PRD allows. Q2, Q3, Q5 and Q4's read-only probes have real-daemon results on Engine 29.8.0 in **both** postures (Q4's no-client interval is source-only), and neither posture is UNRUN.
 
 The guarantees hold as follows:
 
@@ -500,8 +501,8 @@ The guarantees hold as follows:
 - **Successor writers.** These are excluded by placing the reclaim before `worker.run()` (Q4), with only the listed read-only probes and the reclaim's own removal of stopped containers bound into the tree.
   - **Condition 2:** the evidence must reach the worker without the worker registering first, or the reclaim moves just before `registerWithRetry`.
 - **Persisted daemon state.** This is safe under the barrier predicate (Q2, Q3).
-  - **Condition 3:** reclaim must also delete those stopped containers whose binds point into the tree. Otherwise a later `docker start` or `docker cp` recreates an empty directory at the path.
-- **Cadence.** Epochs come from rollouts. The evidence above is needed to make those rollouts count. On-demand epochs need a new server-fenced "recycle pod, keep PVCs" operation (Q7). That is optional for a first slice but likely needed for workers that fill between releases.
+  - **Condition 3:** reclaim must also delete those stopped containers whose binds point into the tree. Otherwise a later `docker start` or `docker cp` recreates an empty directory at the path. That directory is a new inode, so nothing reaches the deleted data, but it resurrects a path that readers of the recorded path, the ledger and `backup-runs.sh` treat as gone. The match must cover ancestor binds (for example `-v /data/runner:/x`) and binds that resolve into the tree through a symlink alias, not just sources under the tree's prefix. The existing `boundContainers`/`isWithinPath` plus the `teardownDocker` DELETE in `agent/src/run-quiescence.ts` can be reused, but they inherit those prefix-match limits.
+- **Cadence.** Epochs come from worker-pin rollouts (a pin change on 46 of the last 61 days) and, with the DinD-PVC binding rule under Q1, from DinD maintenance recycles. The evidence above is needed to make those count. On-demand epochs need a new server-fenced "recycle pod, keep PVCs" operation (Q7). That is optional for a first slice but likely needed for workers that fill between releases.
 
 **Residuals** carried into the implementation PRD:
 - **No evidence, no reclaim.** Force delete, node loss, podgc and out-of-band pods are ineligible.
@@ -522,11 +523,11 @@ The go is conditional on conditions 1–3 being in the implementation PRD's scop
      - per-container `containerID` and `restartCount`;
      - data and DinD-data PVC `metadata.uid` plus `spec.volumeName`;
      - the observation time and controller generation.
-   - Persist it on the data PVC with the UID- and resourceVersion-guarded patch pattern of `mirrorRoll`. Then bind it to the successor UID once the successor is listed (same worker label and claims, current ReplicaSet).
+   - Persist it as an annotation on the data PVC *object*, with the UID- and resourceVersion-guarded patch pattern of `mirrorRoll`. Then bind it to the successor UID once the successor is listed (same worker label and claims, current ReplicaSet).
    - Deliver it to the worker through a downward-API projection or a pre-registration API read. The PRD chooses one.
    - Defer on everything listed under Q1 "Binding".
 2. **Worker one-shot.**
-   - A marker keyed by `UZI_POD_UID` on the data PVC, outside `/data/runner` and not in `dind-sock`, written and fsynced before the first reclaim action.
+   - A marker *file* keyed by `UZI_POD_UID` on the data volume's filesystem, outside `/data/runner` and not in `dind-sock`, written and fsynced before the first reclaim action.
    - It is never reopened by a process restart, an interrupted reclaim or any uncertainty.
    - The reclaim sits in `main.ts` after `startupReapVerdict` and before `worker.run()`.
 3. **Eligibility predicate.** Reclaim proceeds only when every one of these holds; anything else defers:
@@ -536,10 +537,10 @@ The go is conditional on conditions 1–3 being in the implementation PRD's scop
    - every container's restart policy is `no`;
    - swarm is inactive, no plugins are enabled and live-restore is off;
    - every volume uses the `local` driver with empty `Options`;
-   - an `/events` stream is held from before the inventory, as an extra abort-and-defer trigger only;
+   - an `/events` stream is held from before the inventory, as an extra abort-and-defer trigger only, and confirmed live with `since` or a first event, because the daemon flushes `200` before it registers the subscription (Q2 source);
    - each tree is settled under #3329's authorization.
 
-   For each eligible tree, remove the stopped containers whose bind sources lie under it, then delete in place with the existing retire and delete helpers.
+   For each eligible tree, remove the stopped containers whose binds resolve into it (condition 3), then delete in place with the existing retire and delete helpers.
 4. **ADR amendments.**
    - ADR-1783: pod-epoch exclusion as a writer-exclusion proof for settled attempt trees on Docker-wired hosted workers. Compose and unwired lanes stay deferred.
    - ADR-3153: an epoch-scoped exception to "automatic retention deletion stays off".
