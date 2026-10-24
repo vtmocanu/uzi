@@ -70,7 +70,7 @@ Deployment. New persistent **M** workers allocate 25Gi of `/data`, and **L** and
 keep their current capacity: the controller does not resize existing PVCs.
 Operators can [expand them in place](https://github.com/vtmocanu/uzi/blob/main/deploy/README.md#expanding-existing-worker-data-volumes)
 on a StorageClass that supports volume expansion.
-Existing workers keep their stored size and are not resized; existing **M** workers receive the
+Existing workers keep their stored size and are not switched to another size; existing **M** workers receive the
 1-CPU request and 4-CPU limit when the controller next rolls their pod spec.
 Operators set `workers.ephemeralDefaultSize` in the chart (`s`, `m`, `l`, or `l-highmem`);
 invalid values fail rendering, and so does setting
