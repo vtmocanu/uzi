@@ -6065,8 +6065,8 @@ export class CodexExecutor implements Executor {
           "",
           "Your plan was cross-checked and the server contract above was approved. Implement THAT contract now",
           "on the current branch, delegating to your subagents and iterating until the review passes. It is",
-          "your authoritative instruction for this run: it supersedes the issue text and the plan you drafted",
-          "in this thread; do not re-plan or resubmit it.",
+          "your authoritative instruction for this run: it supersedes the plan you drafted in this thread and,",
+          "except for in-scope additions the approval advice above permits, the issue text; do not re-plan or resubmit it.",
         ].join("\n")
       : gatedPlan !== undefined
       ? [
