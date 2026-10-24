@@ -45,6 +45,9 @@ read_log() {
 # ts_ns <timestamp>: epoch nanoseconds (host GNU date) of a stat %y or RFC 3339 time.
 ts_ns() {
   local v
+  # An empty or partial value would parse as "today" and pass vacuously.
+  [[ $1 =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}[T\ ][0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]+ ]] \
+    || pe_fail "missing or malformed time '$1'"
   v=$(date -u -d "$1" +%s%N) || pe_fail "cannot parse time '$1'"
   [[ $v =~ ^[0-9]+$ ]] || pe_fail "bad time '$1' -> '$v'"
   echo "$v"
