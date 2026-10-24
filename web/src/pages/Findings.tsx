@@ -803,7 +803,11 @@ export function Findings() {
       {repoDrafts && (
         <section aria-label="Issues to file, one per repo" className="space-y-3">
           {repoDrafts.map((d) => (
-            <div key={d.key} className="rounded-lg border border-edge bg-raised/40 px-3 py-2.5">
+            <section
+              key={d.key}
+              aria-label={`Issue for ${d.repoLabel}`}
+              className="rounded-lg border border-edge bg-raised/40 px-3 py-2.5"
+            >
               <p className="mb-2 text-sm font-medium text-fg">
                 {d.ids.length === 1 ? "File 1 finding" : `File ${d.ids.length} findings`} in {d.repoLabel} as one issue
               </p>
@@ -846,7 +850,7 @@ export function Findings() {
                   onCancel={() => closeRepoDraft(d.key)}
                 />
               )}
-            </div>
+            </section>
           ))}
         </section>
       )}

@@ -1277,6 +1277,49 @@ describe("Findings page - file one issue per repo (issue #3410)", () => {
     expect(screen.queryAllByText(/issue #91/)).toHaveLength(1);
   });
 
+  it("names each card's fields by label within its repo region", async () => {
+    draftsById();
+    await renderAll(rows.slice(0, 3));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select all 3 shown" }));
+    fireEvent.click(perRepoButton(2));
+    const atlasRegion = await screen.findByRole("region", { name: "Issue for vtmocanu/atlas" });
+    expect(((await within(atlasRegion).findByLabelText("Title")) as HTMLInputElement).value).toBe("Draft d3");
+    expect((within(atlasRegion).getByLabelText("Description") as HTMLTextAreaElement).value).toBe("desc d3");
+    const uziRegion = screen.getByRole("region", { name: "Issue for vtmocanu/uzi" });
+    expect((within(uziRegion).getByLabelText("Title") as HTMLInputElement).value).toBe("Draft d1+d2");
+  });
+
+  it("two filings completing out of order each keep their receipt and drop only their own rows", async () => {
+    draftsById();
+    const pending = new Map<string, (v: FindingGroupFileResult) => void>();
+    mockApi.fileFindingGroup.mockImplementation(
+      (body) => new Promise<FindingGroupFileResult>((r) => pending.set((body.ids ?? [])[0], r)),
+    );
+    await renderAll();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select all 4 shown" }));
+    fireEvent.click(perRepoButton(3));
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "Create issue" })).toHaveLength(3));
+    const region = (repo: string) => screen.getByRole("region", { name: `Issue for vtmocanu/${repo}` });
+    fireEvent.change(within(region("zeta")).getByLabelText("Title"), { target: { value: "zeta edit" } });
+
+    const listCalls = mockApi.listFindings.mock.calls.length;
+    fireEvent.click(within(region("uzi")).getByRole("button", { name: "Create issue" }));
+    fireEvent.click(within(region("atlas")).getByRole("button", { name: "Create issue" }));
+    expect(mockApi.fileFindingGroup).toHaveBeenCalledTimes(2);
+
+    // Resolve in reverse order of the clicks.
+    await act(async () => pending.get("d3")!({ operation_id: "op-a", disposition_ids: ["d3"], phase: "settled", issue: issue(95) }));
+    await act(async () =>
+      pending.get("d1")!({ operation_id: "op-u", disposition_ids: ["d1", "d2"], phase: "settled", issue: issue(96) }),
+    );
+    await within(region("uzi")).findByText("Filed 2 findings as issue #96.");
+    expect(within(region("atlas")).getByText("Filed 1 finding as issue #95.")).toBeTruthy();
+    await waitFor(() => expect(mockApi.listFindings.mock.calls.length).toBeGreaterThan(listCalls));
+    await screen.findByText("Alpha bug");
+    expect(screen.getByText("1 finding selected")).toBeTruthy();
+    expect((within(region("zeta")).getByLabelText("Title") as HTMLInputElement).value).toBe("zeta edit");
+  });
+
   it("a definite failure keeps that card's edits for retry and leaves a sibling's receipt", async () => {
     draftsById();
     mockApi.fileFindingGroup.mockImplementation(async (body): Promise<FindingGroupFileResult> => {

@@ -100,8 +100,8 @@ against the same issue, and any warning uzi returns is shown with the result.
 
 A selection that spans several repos files **one issue per repo**, because a
 forge issue lives in one repo: the button reads **File N issues, one per repo**,
-where N is the number of repos. Select all in the **All repos** view to file
-everything in one go. uzi opens one draft per repo, each listing every selected
+where N is the number of repos. Select all in the **All repos** view to prepare
+one issue per repo. uzi opens one draft per repo, each listing every selected
 finding of that repo (a repo with a single selected finding gets its own
 issue), and you file each draft with its own **Create issue**. Each repo may
 hold at most 50 selected findings. Every draft is its own group filing with the
