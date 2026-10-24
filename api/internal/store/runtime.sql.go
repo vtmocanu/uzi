@@ -19143,7 +19143,12 @@ UPDATE runs SET
     completion_final_head = $1,
     status             = 'completed',
     status_since       = now(),
-    branch             = $2,
+    -- Enrolled work branches are server-authorized, not optional completion metadata.
+    -- Preserve one on omission; an explicit different branch still hits the frozen guard.
+    branch             = CASE
+        WHEN checkpoint_coordinates IS NOT NULL AND $2::text IS NULL THEN branch
+        ELSE $2::text
+    END,
     mr_iid             = $3,
     -- The MR's web URL as the forge reported it (PRD #65 D8), written here because
     -- the worker that opens the MR is the only thing holding the URL at the moment
@@ -19161,13 +19166,13 @@ UPDATE runs SET
     fix_verdict        = COALESCE($6, fix_verdict),
     -- The PRD path this run's lead declared it moved (PRD #72 M4), NULL unless an
     -- issue run declared one that validated. Plain assignment for the same reason
-    -- mr_web_url above gives: the branch, the MR and the declared path are ONE fact
+    -- mr_web_url above gives: the MR and the declared path are ONE fact
     -- reported by one worker in one payload, so they must not persist under
     -- different conventions.
     prd_done_path      = $7,
     -- issue #279: the report-only marker and the lead's persisted findings.
     -- Plain assignment for the same reason mr_web_url/prd_done_path above give:
-    -- the branch, the MR, the declared path AND this completion's report shape are
+    -- the MR, the declared path AND this completion's report shape are
     -- ONE fact reported by one worker in one payload, so they must not persist
     -- under different conventions. report_only plain-assigns on every completed
     -- transition (false for a normal MR completion — correct, it is the marker for
