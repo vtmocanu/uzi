@@ -163,7 +163,7 @@ Recorded by the #1860 M0 run, 2026-10-24. Real-daemon results come from the harn
   - `k8s.io/kubernetes@v1.37.1`, matching the controller's `k8s.io/api v0.37.1`.
 
   The first Kubernetes zip fetch returned a 302 redirect with an empty body; following the redirect worked.
-- **Controlled daemon.** `e2e/pod-epoch/lib.sh` starts a privileged, digest-pinned DinD container per posture, on harness-owned volumes for the data root (the DinD PVC) and `/data/runner` (the shared workdir). Ownership is labelled and teardown removes by exact name only. A container restart stands in for a sidecar restart, and a remove-plus-recreate on the same volumes stands in for a successor pod. Wiring deviations from `controller/internal/kube/render_dind.go`: vfs storage in both postures; the rootless daemon is started as an explicit `dockerd --host=unix:///run/dind/docker.sock` (production keeps the image's `/certs` TLS listener on 2376; the harness binds the unix socket only and asserts no non-loopback TCP listener); a tmpfs `/run/dind`; the rootful daemon omits production's MTU cap and `--config-file` network defaults; and one container stands in for the worker container plus the sidecar. `e2e/pod-epoch/README.md` lists them all. Result at harness commit `feb39ab6`: `bash e2e/pod-epoch/smoke.sh all` **run, exit 0** (`SMOKE rootless PASS`, `SMOKE rootful PASS`, Engine 29.8.0, API 1.56). In both postures an `/events` stream held across a daemon restart ended by itself (`end=ended`, rc 0), and no harness container or volume was left. The worker's own outer daemon is shared with other runs, so it was never a test subject.
+- **Controlled daemon.** `e2e/pod-epoch/lib.sh` starts a privileged, digest-pinned DinD container per posture, on harness-owned volumes for the data root (the DinD PVC) and `/data/runner` (the shared workdir). Ownership is labelled and teardown removes by exact name only. A container restart stands in for a sidecar restart, and a remove-plus-recreate on the same volumes stands in for a successor pod. Wiring deviations from `controller/internal/kube/render_dind.go`: vfs storage in both postures; the rootless daemon is started as an explicit `dockerd --host=unix:///run/dind/docker.sock` (production keeps the image's `/certs` TLS listener on 2376; the harness binds the unix socket only and asserts no non-loopback TCP listener); a tmpfs `/run/dind`; the rootful daemon omits production's MTU cap and `--config-file` network defaults; and one container stands in for the worker container plus the sidecar. `e2e/pod-epoch/README.md` lists them all. Result at harness commit `feb39ab6`: `bash e2e/pod-epoch/smoke.sh all` **run, exit 0** (`SMOKE rootless PASS`, `SMOKE rootful PASS`, Engine 29.8.0, API 1.56). In both postures an `/events` stream held across a daemon restart ended by itself (`end=ended`, rc 0), and a later read-only `pe1860.owner` label check found no harness container or volume. The worker's own outer daemon is shared with other runs, so it was never a test subject.
 
 ### Q1. Termination evidence (source only)
 
@@ -171,7 +171,7 @@ Source: `k8s.io/kubernetes@v1.37.1`, `k8s.io/apiserver@v0.37.1`, `k8s.io/client-
 
 **Kubelet ordering.**
 1. `Kubelet.SyncTerminatingPod` (`pkg/kubelet/kubelet.go`) calls `killPod`. It then re-reads the runtime and fails if any container still runs. Only after that does it write a status built with `podIsTerminal=true`.
-2. `getPhase` (`pkg/kubelet/kubelet_pods.go`) returns `Failed`/`Succeeded` only when no regular container and no restartable (native sidecar) init container is running or unknown.
+2. `getPhase` (`pkg/kubelet/kubelet_pods.go`) with `podIsTerminal` waits for regular and restartable (native sidecar) init containers to stop. The exception is a non-restartable init failure, which returns `Failed` early; item 3 still guards that case.
 3. `status.mergePodStatus` (`pkg/kubelet/status/status_manager.go`) withholds a terminal phase while `PodCouldHaveRunningContainers` is true.
 4. `Kubelet.SyncTerminatedPod` then waits for volume unmount (`volumeManager.WaitForUnmount`, `podVolumesExist`). It destroys the pod cgroup (`pcm.Destroy`) and finally calls `statusManager.TerminatePod`, which sets `podIsFinished`.
 5. `status.syncPod` PATCHes that status, then `canBeDeleted` requires `DeletionTimestamp`, a terminal phase and `podIsFinished`. Only then does it send `DELETE` with grace 0 and a UID precondition.
@@ -209,7 +209,7 @@ A pod stopped before every container ever ran can show `waiting` and defers, whi
 - It polls with a full LIST every 10 s (`controller/internal/config/config.go:329`, `CONTROLLER_POLL_INTERVAL`). It has `list`-only pod RBAC (`deploy/chart/templates/worker-rbac.yaml`), no watch and no in-memory pod state.
 - It already counts terminating pods (`controller/internal/kube/materializer.go:421`) and reads the DinD PVC UID.
 - It never reads an all-terminated status as proof. Its DinD recycle and volume recycle check *absence* only: `maintenance.go` waits for `WorkerPodCount==0`.
-- The terminal-status window lasts from the end of `SyncTerminatingPod` to the kubelet DELETE, typically seconds. A 10 s poll often misses it and then sees only absence, which is not evidence. Most epochs would therefore defer unless the controller observes termination more finely: a watch on the worker's pods or a shorter poll while a pod is terminating. A watch would need new RBAC.
+- The terminal-status window lasts from the end of `SyncTerminatingPod` to the kubelet DELETE. *Inferred, not measured:* it is often short, since unmount time is unbounded but usually small. A 10 s poll can miss it and then sees only absence, which is not evidence. Most epochs would therefore defer unless the controller observes termination more finely: a watch on the worker's pods or a shorter poll while a pod is terminating. A watch would need new RBAC.
 
 **Binding.** The controller should durably record:
 - the predecessor pod UID;
@@ -235,17 +235,17 @@ Source: `github.com/moby/moby/v2@v2.0.0-beta.23`, `containerd/v2@v2.3.4`, `build
 **Startup order.** In `daemon/command/daemon.go` (`daemonCLI.start`):
 1. API listeners are bound first (`loadListeners`).
 2. A managed containerd child starts.
-3. `daemon.NewDaemon` runs, in this order: the volume service; the engine ID (`daemon/id.go`, persisted `engine-id`); the plugin manager, which restarts enabled managed plugins (`daemon/pkg/plugin/manager.go:reload`); then `d.restore`.
+3. `daemon.NewDaemon` runs, in this order: the plugin manager, which restarts enabled managed plugins (`daemon/pkg/plugin/manager.go:reload`); the volume service; the engine ID (`daemon/id.go`, persisted `engine-id`); then `d.restore`.
 4. Swarm restarts if state persists (`daemon/cluster/cluster.go:Start`). Then `RestartSwarmContainers` and BuildKit init run.
 5. Only then does `httpServer.Serve` run.
 
-So a connection is accepted into the backlog early, but the **first HTTP response comes only after restore and every restore-time start**. `/events` writes `200` and flushes on subscribe (`daemon/server/router/system/system_routes.go:getEvents`).
+So a connection is accepted into the backlog early, but the **first HTTP response comes only after restore and every restore-time start**. `/events` writes and flushes `200` just *before* it registers the subscription (`daemon/server/router/system/system_routes.go:getEvents`), so a received `200` does not by itself prove the subscription is live; a caller should use `since` or observe a first event.
 
 **`restore`** (`daemon/daemon.go`):
 - It kills any surviving containerd task, since live-restore is off by default (`daemon/command/config_unix.go`).
-- It marks containers persisted as running `stopped` with exit 255.
+- It marks containers persisted as running `stopped`, keeping the task's real exit code, or 255 when containerd reports none.
 - It removes `AutoRemove` leftovers.
-- It synchronously starts every container with `cfg.AutoRestart && ShouldRestart() && HasBeenStartedBefore`, before the API serves. `ShouldRestart` (`daemon/internal/restartmanager/restartmanager.go`) is true for `always`; for `unless-stopped` unless manually stopped; for `on-failure` on a non-zero exit, which includes the 255 above. It is never true for `no`.
+- It synchronously starts every container with `cfg.AutoRestart && ShouldRestart() && HasBeenStartedBefore`, before the API serves. `ShouldRestart` (`daemon/internal/restartmanager/restartmanager.go`) is true for `always`; for `unless-stopped` unless manually stopped; for `on-failure` on a non-zero exit, which includes the 255 above, while under `MaximumRetryCount`. It is never true for `no`.
 - After the barrier, the only runtime restart path is `daemon/monitor.go:handleContainerExit`, which needs a running container. Health checks run only for running containers (`daemon/health.go`).
 
 **Barrier candidate.** After the first API response, if all of the following hold, nothing restored can start or take a mount without a new client request:
@@ -258,7 +258,7 @@ So a connection is accepted into the backlog early, but the **first HTTP respons
 The restart-policy rule costs nothing on the lead's sample: 0 of 11 workers had a non-`no` policy. Without the rule, a restore-started container is running at the barrier and the first check alone defers it.
 
 **Restart detection.** A sidecar restart re-runs `restore`, since `NewDaemon` runs it on every start. `GET /info` `ID` is persisted (`daemon/id.go`), and `SystemTime` is just the clock, so neither identifies an incarnation. Events live in an in-memory buffer (`daemon/events/events.go`), and `Shutdown` closes the event service. A stream opened before the inventory and held through deletion therefore ends on any daemon exit; a hard kill closes the socket. This is necessary but not sufficient (see the revision note below).
-- Rootless only: the socket inode changes on each start.
+- Rootless only, *inferred, not read*: the socket inode should change on each start.
 - Controller-side only: the `dind` `containerID` and `restartCount` change.
 
 **Stopped state (Q3).**
@@ -304,11 +304,11 @@ Seed: `git grep -l -E 'dockerRequest\(|execDocker\(|teardownDocker\(|dockerRunni
 | Client | Requests | Class | Earliest |
 |---|---|---|---|
 | Wiring probe (`docker-wiring.ts`) | TCP/unix connect only | none | step 1 |
-| Kubelet startup probe (`render_dind.go:336` rootful, `:352` rootless) | `docker info` (`/_ping`, `GET /info`) | read-only | before the worker container, and again on every `dind` restart |
+| Kubelet startup probe (`render_dind.go:336` rootful, `:353` rootless) | `docker info` (`/_ping`, `GET /info`) | read-only | before the worker container, and again on every `dind` restart |
 | `terminalMaintenanceProof` (`run-quiescence.ts:810`, wired at `main.ts:615`) → `dockerRunningContainers` | `GET /containers/json` | read-only | after register, on recovery and terminal paths |
 | `teardownDocker` (`run-quiescence.ts`) via `quiesceRunAttempt` | `GET /containers/json?all=1`, then `DELETE /containers/{id}?force=1&v=1` | listing, then **removal** | **before admission**: `resumePendingRecoveries` (`worker.ts:545`), heartbeat `resumeLiveRecoveries`, `forgetCompletedGeneration` (`recovery.ts`), only when a retained clone exists |
 | Run-lane `quiesceRun` (`runner.ts`) and the retained-ops quiesce (`ops/retained-source-server.ts`) | as above | removal | after `worker.ts:595` |
-| DinD prune (`dind-prune.ts:100-106`) | `ps -q`, `image prune`, `builder prune` | read-only, then removal | after `:595`, plus at least two over-threshold meter samples |
+| DinD prune (`dind-prune.ts:98-106`) | `ps -q`, `image prune -f`, `builder prune -f`, `image prune -a -f --filter until=24h` | read-only, then removal | after `:595`, plus at least two over-threshold meter samples |
 | DinD maintenance (`dind-maintenance.ts:10`) | `GET /version`, `volume prune -f` | read-only, then removal | after `:595`, on a server-fenced `ready` |
 | Run agents (`sdk-env.ts`, `codex/codex-executor.ts` set `DOCKER_HOST`; `guardrails.ts` allows docker) | anything (create, start, exec, cp, build, volume create) | **state-changing** | after a claim |
 
@@ -324,16 +324,16 @@ The cost of that placement is that it comes before registration and API contact,
 
 Placing the reclaim later is possible only before `registerWithRetry` (`worker.ts:528`). Any later placement needs a latch: on recovery (`resumePending` and `resumeLive` both reach `teardownDocker`), on the prune and maintenance loops, on the retained-source server, and on the claim loops.
 
-**Process residual.** A worker *process* restart inside a live container keeps run-agent children, and with them potential clients. The one-shot is keyed by `UZI_POD_UID`, so only the first process of a pod may reclaim. A crash-restarted process sees the consumed marker and defers, which is the PRD's one-shot rule.
+**Process residual.** A worker *process* restart inside a live container keeps run-agent children, and with them potential clients. Under the *proposed* one-shot, keyed by `UZI_POD_UID` (no such marker exists today), only the first process of a pod would reclaim. A crash-restarted process would see the consumed marker and defer.
 
 ### Q7. Cadence (source and issue text)
 
 **Fill rate (#3329).**
 - First worker: a 25 GiB `/data` at 100 %. `/data/runner` held 23 GiB in 15 trees, of which 10 settled trees held about 12.5 GiB.
-- The same day it recurred on three more workers: one at 100 % on 25 GiB, and two with 50 GiB `/data` volumes, one holding 20 settled trees out of 23.
+- Comments dated 2026-10-24 record recurrences on three more workers: one at 100 % on 25 GiB, and two with 50 GiB `/data` volumes, one holding 20 settled trees out of 23.
 - Settled trees on one worker survived a pod replacement onto a newer agent image (#3329, 2026-10-24 comment).
 
-On a busy worker, the volume fills within days.
+*Inferred:* the issue gives no rate, but the recurrences suggest a busy worker fills its volume within days.
 
 **Epochs.**
 
@@ -342,11 +342,11 @@ On a busy worker, the volume fills within days.
 | Template or pin drift rollout (`materializer.go`, Recreate) | Deployment controller after a uzi patch | yes | no, only ordering |
 | DinD-only maintenance recycle (`maintenance.go`, ADR-1759) | uzi, on DinD-volume pressure only | yes; the DinD PVC is new | absence only (`WorkerPodCount==0`) |
 | Legacy data recycle and worker teardown | uzi | no: the data PVC is deleted | absence |
-| Eviction, drain, manual delete, OOM | kubelet or operator | yes | no (`adr/3153-runner-shared-pvc-subpath.md` D7, unguardable) |
+| Eviction, drain, manual delete | kubelet or operator | yes | no (outside the controller's control; `adr/3153-runner-shared-pvc-subpath.md` D7 calls them unguardable for its migration guard). An OOM kill restarts a container in the same pod, so it is not an epoch |
 
 Worker-pin rollouts follow release cuts that change the agent runtime: 29 non-RC tags since 2026-08-24, and RCs almost daily in late October 2026 (`git tag`). The rollout rate itself was not measured. It could match a days-scale fill rate, but only if the controller actually captures termination evidence at those rollouts, which today's 10 s absence-only poll does not do.
 
-**On demand.** An idle worker **cannot** request its own pod recycle. `dind-maintenance.ts` only answers a server operation that the controller (`maintenance.go` `reconcileDinD`) starts on DinD-volume pressure, under server fences (`api/internal/workersvc/dind_maintenance.go`, ADR-1759 D7). Data-volume pressure enters only the legacy recycle, which deletes `/data/runner` and skips custody-held workers. An on-demand epoch therefore needs a new, fenced request type, such as "recycle pod, keep PVCs". That is the later PRD's choice.
+**On demand.** An idle worker **cannot** request its own pod recycle. Its heartbeat disk stats do feed `diskOverThreshold` (`api/internal/workersvc/service.go`), which drives the controller's legacy data recycle (`maintenance.go` `legacyRecycleDue`), but that recycle deletes the data PVC. `dind-maintenance.ts` only answers a server operation that the controller (`maintenance.go` `reconcileDinD`) starts on DinD-volume pressure, under server fences (`api/internal/workersvc/dind_maintenance.go`, ADR-1759 D7). Data-volume pressure enters only the legacy recycle, which deletes `/data/runner` and skips custody-held workers. An on-demand epoch therefore needs a new, fenced request type, such as "recycle pod, keep PVCs". That is the later PRD's choice.
 
 **What is lost.** A graceful delete, an eviction or a preemption lets the successor start while the predecessor terminates. That pod's one-shot is consumed and it defers. A node drain does this to every worker it touches.
 
