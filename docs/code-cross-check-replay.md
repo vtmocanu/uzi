@@ -23,26 +23,26 @@ Real-model calls cost money. They need the maintainer's own authorization for pa
 1. Check the pins and materialize every case offline:
 
    ```sh
-   npm run eval:code-cross-check -- verify
+   npm run --silent eval:code-cross-check -- verify
    ```
 
 2. Replay each family. `--family` (`claude` or `codex`), `--model`, `--effort` (`low`, `medium`, `high`, `xhigh`, `max`) and `--repeats` (1 to 20) are required; `--timeout-ms` is optional (default and maximum 15 minutes). The approved plan suggests five repeats, which is 30 paid checker calls per family for the six cases. A missing credential does not stop the run up front: every record is `missing_auth` and the command exits 1. Record the model and effort you used; the sanitized aggregate carries both.
 
    ```sh
-   npm run eval:code-cross-check -- replay --family claude --model <model> --effort <effort> --repeats 5 --authorize-real-model-calls
-   npm run eval:code-cross-check -- replay --family codex --model <model> --effort <effort> --repeats 5 --authorize-real-model-calls
+   npm run --silent eval:code-cross-check -- replay --family claude --model <model> --effort <effort> --repeats 5 --authorize-real-model-calls
+   npm run --silent eval:code-cross-check -- replay --family codex --model <model> --effort <effort> --repeats 5 --authorize-real-model-calls
    ```
 
-Stdout is JSON lines of fixed codes, ids, counts and pins. Invalid arguments give `{"error":"invalid_cli"}` without echoing them. `replay` prints the absolute path of the records file, then the sanitized aggregate. It exits 0 only when every replay completed, otherwise 1. The raw records go to an owner-only `.uzi/scratch/code-cross-check-replay-<timestamp>.jsonl` file in the checkout. They hold model output about repository code and are never printed.
+Stdout is JSON lines of fixed codes, ids, counts and pins. Invalid arguments give `{"error":"invalid_cli"}` without echoing them. `replay` prints only the sanitized aggregate on stdout; the absolute path of the records file (a `{"records_file":...}` locator) goes to stderr, because it can carry your username or checkout location. Do not merge stderr into published output (no `2>&1`). Use `npm run --silent`: plain `npm run` echoes the command line, arguments included, to stdout. It exits 0 only when every replay completed, otherwise 1. The raw records go to an owner-only `.uzi/scratch/code-cross-check-replay-<timestamp>.jsonl` file in the checkout. They hold model output about repository code and are never printed.
 
 Each record carries the checker version (uzi head, agent version, corpus version), the brief SHA-256, model, effort, reader implementation, credential mode (`oauth_token` for Claude, `api_key` for Codex), the outcome, the latency of the checker call only, the cost (`null` means unknown) and the findings.
 
 ## Score
 
-`score` is offline. It resolves a relative path against the checkout root:
+`score` is offline. It resolves a relative path against the checkout root, so pass the checkout-relative `.uzi/scratch/<file>` path rather than the absolute one:
 
 ```sh
-npm run eval:code-cross-check -- score <records.jsonl> [--adjudications <file>]
+npm run --silent eval:code-cross-check -- score <records.jsonl> [--adjudications <file>]
 ```
 
 The aggregate is grouped by family and input provenance. Reconstructed-input and recorded-input cases are reported separately. A group reports:
@@ -66,7 +66,7 @@ Any adjudicated unmatched or control finding leaves `unadjudicated_findings` (an
 
 ## Publish
 
-Post only the sanitized aggregate (the stdout of `replay` or `score`) as a comment on issue #3167. Keep the records file and the adjudications private and local.
+Post only the JSON lines from stdout of `replay` or `score` (the sanitized aggregate), never stderr, as a comment on issue #3167. Keep the records file and the adjudications private and local.
 
 ## Changing the corpus
 

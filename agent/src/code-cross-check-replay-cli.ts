@@ -1,7 +1,8 @@
 // Maintainer-run entry for the offline code cross-check replay harness (PRD 3167 M1).
 // Subcommands: verify, replay (real model calls, explicitly authorized), score (offline).
-// Stdout is JSON lines of fixed codes, ids, counts, pins and the absolute records-file path; raw records
-// go to a 0600 file and never to stdout. `score` resolves a relative records or adjudications path
+// Stdout is JSON lines of fixed codes, ids, counts and pins only. The absolute records-file locator goes to
+// stderr (it can carry a username or checkout location, so never merge stderr into published output); raw
+// records go to a 0600 file and never to stdout. `score` resolves a relative records or adjudications path
 // against the checkout root (not the cwd, which is agent/ under `npm run`).
 import path from "node:path";
 import fs from "node:fs/promises";
@@ -18,6 +19,8 @@ export interface ReplayCliDeps {
   checkout: string;
   env: NodeJS.ProcessEnv;
   write: (line: string) => void;
+  /** Local-only diagnostics (the records-file locator); never published. */
+  writeErr: (line: string) => void;
   signals: {
     on(name: "SIGINT" | "SIGTERM" | "SIGHUP", handler: () => void): unknown;
     removeListener(name: "SIGINT" | "SIGTERM" | "SIGHUP", handler: () => void): unknown;
@@ -124,10 +127,10 @@ async function runReplayCommand(deps: ReplayCliDeps, a: ReplayArgs, signal: Abor
       writeRecord: async (rec) => { await handle.appendFile(JSON.stringify(rec) + "\n"); },
     });
   } catch (error) {
-    deps.write(JSON.stringify({ records_file: absFile }));
+    deps.writeErr(JSON.stringify({ records_file: absFile }));
     throw error;
   } finally { await handle.close(); }
-  deps.write(JSON.stringify({ records_file: absFile }));
+  deps.writeErr(JSON.stringify({ records_file: absFile }));
   deps.write(sanitizedAggregate(scoreReplays(corpus, records)));
   return records.every((r) => r.outcome === "completed") ? 0 : 1;
 }
@@ -190,11 +193,18 @@ export async function runReplayCli(args: string[], deps: ReplayCliDeps): Promise
   }
 }
 
-const checkout = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+/** Process wiring for the main guard: stdout carries the publishable lines, stderr the local locator. */
+export function defaultReplayCliDeps(checkout: string): ReplayCliDeps {
+  return {
+    checkout, env: process.env, signals: process,
+    write: (line) => { process.stdout.write(line + "\n"); },
+    writeErr: (line) => { process.stderr.write(line + "\n"); },
+  };
+}
+
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  runReplayCli(process.argv.slice(2), {
-    checkout, env: process.env, signals: process, write: (line) => { process.stdout.write(line + "\n"); },
-  }).then((code) => { process.exitCode = code; }).catch(() => {
+  const checkout = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+  runReplayCli(process.argv.slice(2), defaultReplayCliDeps(checkout)).then((code) => { process.exitCode = code; }).catch(() => {
     process.stdout.write(JSON.stringify({ error: "startup_failed" }) + "\n");
     process.exitCode = 1;
   });

@@ -10,7 +10,7 @@ import {
   type MaterializedCase, type ReplayCase, type ReplayCorpus, type ReplayRecord, type RunReplaysDeps,
 } from "../src/code-cross-check-replay.js";
 import type { ClaudeCrossCheck } from "../src/claude-cross-check.js";
-import { runReplayCli } from "../src/code-cross-check-replay-cli.js";
+import { defaultReplayCliDeps, runReplayCli } from "../src/code-cross-check-replay-cli.js";
 import { codeCrossCheckBrief, crossCheckPrompt } from "../src/codex/cross-check.js";
 import { decodeCrossCheckClaim } from "../src/code-cross-check-contract.js";
 import { CrossCheckCheckerUnavailableError } from "../src/codex/model-rejection.js";
@@ -193,11 +193,13 @@ test("latency times only the checker call and is null when no checker ran", asyn
 const quietSignals = new EventEmitter();
 async function cli(args: string[], over: Partial<Parameters<typeof runReplayCli>[1]> = {}) {
   const lines: string[] = [];
+  const errLines: string[] = [];
   const code = await runReplayCli(args, {
-    checkout: tc.checkout, env, write: (l) => { lines.push(l); }, signals: quietSignals, manifestSha256: tc.manifestSha256,
+    checkout: tc.checkout, env, write: (l) => { lines.push(l); }, writeErr: (l) => { errLines.push(l); },
+    signals: quietSignals, manifestSha256: tc.manifestSha256,
     uziHead: async () => "b".repeat(40), ...over,
   });
-  return { code, lines };
+  return { code, lines, errLines };
 }
 const replayArgs = (extra: string[] = []) =>
   ["replay", "--family", "claude", "--model", "haiku", "--effort", "low", "--repeats", "1", ...extra];
@@ -233,27 +235,30 @@ test("invalid arguments are never echoed and credential-bearing models are refus
 test("raw records go to an owner-only file; stdout carries ids, counts and pins only", async () => {
   const r = await cli(replayArgs(["--authorize-real-model-calls"]), { checkers: { claude: checker(completes()) } });
   assert.equal(r.code, 0);
-  const { records_file } = JSON.parse(r.lines[0]!) as { records_file: string };
+  assert.equal(r.errLines.length, 1);
+  const { records_file } = JSON.parse(r.errLines[0]!) as { records_file: string };
   assert.ok(path.isAbsolute(records_file));
+  assert.equal(r.lines.length, 1);
+  assert.ok(!r.lines.join("\n").includes("records_file"));
   const file = records_file;
   assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
   const raw = await fs.readFile(file, "utf8");
   assert.ok(raw.includes("UNIQUE-TITLE-XYZ"));
   const stdout = r.lines.join("\n");
-  for (const text of ["UNIQUE-TITLE-XYZ", "UNIQUE-DETAIL-XYZ", FIXTURE_TITLE, FIXTURE_BODY, env.CLAUDE_CODE_OAUTH_TOKEN]) {
+  for (const text of ["UNIQUE-TITLE-XYZ", "UNIQUE-DETAIL-XYZ", FIXTURE_TITLE, FIXTURE_BODY, env.CLAUDE_CODE_OAUTH_TOKEN, tc.root]) {
     assert.ok(!stdout.includes(text), "stdout must not carry " + text);
   }
-  const aggregate = JSON.parse(r.lines[1]!) as { groups: { replays: number }[] };
+  const aggregate = JSON.parse(r.lines[0]!) as { groups: { replays: number }[] };
   assert.equal(aggregate.groups.reduce((n, g) => n + g.replays, 0), 2);
 
   // The offline scorer reads the same file and agrees.
   const scored = await cli(["score", file]);
   assert.equal(scored.code, 0);
-  assert.equal(scored.lines[0], r.lines[1]);
+  assert.equal(scored.lines[0], r.lines[0]);
   // A path relative to the checkout root also works, whatever the cwd is.
   const relative = await cli(["score", path.relative(tc.checkout, file)]);
   assert.equal(relative.code, 0);
-  assert.equal(relative.lines[0], r.lines[1]);
+  assert.equal(relative.lines[0], r.lines[0]);
   const bad = await cli(["score", file, "--adjudications", path.join(tc.root, "missing.json")]);
   assert.equal(bad.code, 1);
   assert.deepEqual(bad.lines, ['{"error":"adjudication_invalid"}']);
@@ -274,9 +279,29 @@ test("a mid-run failure still reports the partial records file", async () => {
     checkers: { claude: checker(completes()) },
   });
   assert.equal(r.code, 1);
-  assert.equal(r.lines.length, 2);
-  assert.ok(path.isAbsolute((JSON.parse(r.lines[0]!) as { records_file: string }).records_file));
-  assert.deepEqual(r.lines[1], '{"error":"startup_failed"}');
+  assert.deepEqual(r.lines, ['{"error":"startup_failed"}']);
+  assert.equal(r.errLines.length, 1);
+  assert.ok(path.isAbsolute((JSON.parse(r.errLines[0]!) as { records_file: string }).records_file));
+});
+
+test("default wiring sends stdout lines to stdout and the locator channel to stderr", () => {
+  const out: string[] = [];
+  const err: string[] = [];
+  const realOut = process.stdout.write;
+  const realErr = process.stderr.write;
+  const capture = (sink: string[]) => (chunk: string | Uint8Array): boolean => { sink.push(String(chunk)); return true; };
+  process.stdout.write = capture(out) as typeof process.stdout.write;
+  process.stderr.write = capture(err) as typeof process.stderr.write;
+  try {
+    const deps = defaultReplayCliDeps(tc.checkout);
+    deps.write("to-stdout");
+    deps.writeErr("to-stderr");
+  } finally {
+    process.stdout.write = realOut;
+    process.stderr.write = realErr;
+  }
+  assert.deepEqual(out, ["to-stdout\n"]);
+  assert.deepEqual(err, ["to-stderr\n"]);
 });
 
 test("verify materializes every case; a wrong manifest pin fails with a fixed code", async () => {
