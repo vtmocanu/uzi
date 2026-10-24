@@ -7,8 +7,8 @@
 # requires: -
 # provides: UZI_BIN UZI_TOKEN_VAL RUN_CLI
 # handoff:  -
-# mutates:  -
-# restores: -
+# mutates:  temporary manual hold on the assigned persistent live worker
+# restores: guarded EXIT clears only new matching intent; preserves pre-existing/replacement intent; cleanup failure FAILs
 # --- Leg 2: uzi CLI smoke against the live api -------------------------------
 # The uzi CLI (api/cmd/uzi, docs/cli.md) is a second consumer of the SAME API the web UI
 # drives; a route/DTO/behavior change that only touches web/ can leave it silently stale
@@ -77,8 +77,8 @@ CLI_GATE_JSON="$(uzi_cli run get "$RUN_CLI" --json)" || fail "could not read CLI
 printf '%s\n' "$CLI_GATE_JSON" | jq -e --arg run "$RUN_CLI" \
   '.id == $run and .status == "awaiting_approval" and (has("semantic_gate") | not) and (has("completion_pending") | not)' >/dev/null \
   || fail "production CLI gate was inconsistent or exposed dormant semantic data"
-# This run is already held by the real stub executor. Approval below exercises its
-# ongoing assigned execution, not a fresh queued claim (SubmitInput enqueues input).
+# This run is already held by the assigned live worker. Approval below exercises
+# its ongoing assigned execution (SubmitInput enqueues input).
 CLI_WORKER_ID="$(printf '%s' "$CLI_GATE_JSON" | jq -er '.worker_id | select(type == "string" and length > 0)')"
 CLI_OWNER_ID="$(db_psql "SELECT user_id FROM runs WHERE id='$RUN_CLI'")"
 CLI_OWNER_LABEL="$(db_psql "SELECT display_name FROM users WHERE id='$CLI_OWNER_ID'")"
