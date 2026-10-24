@@ -14,7 +14,7 @@ Two tests read them, one per side, and neither reads the other:
 
 - `api/internal/handler/completion_wire_fixture_test.go` (`TestCompletionWireFixtures`) drives the real
   handlers over a stubbed store and asserts the normalized response bytes equal each file.
-- `agent/test/client-completion-wire.test.ts` (added by a later unit) parses the same files with the
+- `agent/test/client-completion-wire.test.ts` parses the same files with the
   worker client, so an api wire change reddens the agent gate and vice versa.
 
 Normalization (the only edits to the handler output): every UUID becomes

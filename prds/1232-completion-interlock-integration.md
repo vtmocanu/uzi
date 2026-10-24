@@ -99,7 +99,7 @@ For SQL guards, mutate the generated query string in the export's `api/internal/
 |---|---|---|
 | G1 | missing-milestone denial: `computeUnmetCriteria` (`api/internal/workersvc/completion_permit.go`) | `TestComputeUnmetCriteria`, `TestPermitMissingMilestonesLiveDB`, M1 continue case |
 | G2a | Claude executor gate: the `unmet.length === 0` branch after `recordAttempt` in `agent/src/sdk-executor.ts` (origin/main lines 3949 to 3965) | `runner-completion-1220-regression.test.ts` Claude arm "b0ffd0ea shape: 5 frozen / 4 declared" |
-| G2b | Codex executor gate: the `unmet.length === 0` branch after `recordAttempt` in `agent/src/codex/codex-executor.ts` (origin/main lines 4398 to 4400) | the M2 Codex arm of the same file |
+| G2b | Codex executor gate: the `unmet.length === 0` branch after `recordAttempt` in `agent/src/codex/codex-executor.ts` (origin/main lines 4398 to 4400) | the M2 Codex arm in `agent/test/codex-executor.test.ts` (`describe("Codex completion interlock")`, "b0ffd0ea shape: 5 frozen / 4 declared …") |
 | G3 | Claude claim clause `completion_interlock_v1` (ClaimRun in `runtime.sql.go`) | `TestClaimInterlockHardClauseBlocksIncapableWorkerLiveDB`, M1 continue case |
 | G4 | Codex claim clause `codex_completion_interlock_v1` | `TestCodexCompletionClaimLiveDB` |
 | G5 | exact-head consume in the completion transaction | `TestCompletionWrongHeadStaysNonTerminalLiveDB` |
@@ -149,7 +149,7 @@ M1 → M2 → M3 → M4, serial in one run. M1 and M2 own disjoint files, but M3
   - Go side: a test in `api/internal/handler/` drives `WorkerRunCompletionAttempt` and `WorkerRunCompletionPermit` over the existing `protocolStore` fake and asserts byte-equal normalized JSON. The fixtures are recorded from this output, never hand-authored.
   - Agent side: `agent/test/client-completion-wire.test.ts` decodes each fixture through the real client. It also configures `fake-api.ts` for the same scenario and asserts the fake's normalized response deep-equals the fixture, values included: unmet IDs (`["m5"]`, not `[]`), denial reason, grant identity, head, contract revision and `completion_scope`. Matching keys and types alone does not pass.
   - Add a Go handler test for `WorkerRunCompletionHold` over the `protocolStore` fake: 200 with `paused`; 409 with the real status when refused (`running`) and on a repeat after an applied hold (`paused`); 404 when not owned; 409 when a capability worker omits `claim_generation`.
-  - Extend `agent/test/runner-completion-1220-regression.test.ts` with a `CodexExecutor` arm of the b0ffd0ea shape (checkpoint first, m5 named on the same thread, never finalizes) and its positive control.
+  - Add a `CodexExecutor` arm of the b0ffd0ea shape to `agent/test/codex-executor.test.ts`, using that file's local harness (approved plan; not `runner-completion-1220-regression.test.ts`), (checkpoint first, m5 named on the same thread, never finalizes) and its positive control.
   - Gates: `task gate:api`, `task gate:agent`, each once to a log.
 - [ ] **M3: mutation audit.** Run D4 for every guard in its table. Record a results table in this PRD's Decision Log: guard, source SHA, mutation diff, command, focused test that went red with its intended assertion text, and the matching unmodified green result (the final sweep's log line for Go LiveDB targets; a separate unmodified focused run for agent targets G2a, G2b and G9). A guard without both a recorded red and its matching green is not proven. Add a test for every survivor. A guard that turns out to be absent or broken in production code is a stop-and-report, not a fix. Without Docker, mark the LiveDB rows (G1, G3 to G8, G10 to G12) "not run" and leave this milestone unchecked; never record them as passed.
 - [ ] **M4: records, archival and epic close-out.**
@@ -192,6 +192,8 @@ These are owed maintainer validation, not worker milestones. The run neither exe
 Landing order: merge after #3356; append these lines to #3346; then close #1225 with a comment linking the merged PR and the ledger lines. An implementation run cannot edit issues, so the landing session performs the #3346 append and the closure.
 
 ## Decision Log
+
+- 2026-10-24 (implementation run): the approved plan placed the Codex #1220 arm in `agent/test/codex-executor.test.ts` with its file-local harness rather than extracting that harness into `runner-completion-1220-regression.test.ts`; G2b targets it. M2 fake-api parity uses value-level knobs only (`setCompletionAttemptUnmet`, `setCompletionPermitDenyUnmet`, `setCompletionPermitId`), so the parity test pins the fake's shape, omission rules and the values it owns (`attempt_count`, `finding_ids`, `completion_scope`); the unmet IDs, deny reason and permit id it compares are injected by the scenario. G12: deleting the `prior.Profile != "semantic"` guard is behaviour-equivalent (an earlier contract check refuses maintainer-bearing structural contracts, and `validateMaintainerSelection` refuses plain ones with the same sentinel), so M3 mutates it to a permissive `return nil` and records the deletion as an equivalent mutant.
 
 - 2026-10-23: Revised after lead and Codex peer review. Decisions on the four open questions:
   - Q1: reword the pinned preconditions to "Any future semantic activation must …" and update every literal and the test together (D6).

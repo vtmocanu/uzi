@@ -16,8 +16,9 @@ import (
 )
 
 // holdStore stubs the SetRunCompletionHold query: held is returned when holdErr is nil, otherwise
-// holdErr (pgx.ErrNoRows = the hold's guard refused). The inherited ownedRun/ownedErr feed the
-// service's re-read of the run on a refused hold.
+// holdErr (pgx.ErrNoRows = the hold's guard refused). The inherited ownedRun feeds the service's
+// re-read of the run on a refused hold; ownedErr is consulted by the ownership pre-check, which
+// runs before the hold query, so the not-owned case never reaches SetRunCompletionHold.
 type holdStore struct {
 	protocolStore
 	held    store.Run
