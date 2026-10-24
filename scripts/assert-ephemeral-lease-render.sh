@@ -1,5 +1,6 @@
 #!/bin/sh
-# Assert the API Deployment renders ephemeral size (issue #2412) and
+# Assert the API Deployment renders ephemeral size (issue #2412, l-highmem #3383), that
+# every worker tier's LimitRange admits the largest preset (issue #3383), and
 # UZI_EPHEMERAL_LEASE (PRD #2006) from
 # workers.ephemeralLease: the "2h" default, null -> "2h", an explicit 0 surviving as "0",
 # and a --set override such as 30m taking effect.
@@ -154,13 +155,17 @@ echo "OK: ephemeral size defaults to m, accepts s/l/l-highmem, tolerates null se
 # Render the three worker namespaces' LimitRanges with the full CI posture (docker tier
 # and isolated lane on) and assert each Container max is exactly 4 CPU / 32Gi. Exactly
 # three LimitRanges, so a tier silently dropping out is a BROKEN instrument, not a pass.
-helm template uzi "$CHART" -f "$SCRIPT_DIR/../deploy/values/ci-render.yaml" \
+if ! helm template uzi "$CHART" -f "$SCRIPT_DIR/../deploy/values/ci-render.yaml" \
   --show-only templates/worker-namespace.yaml \
   --show-only templates/worker-docker-namespace.yaml \
-  --show-only templates/worker-isolated-namespace.yaml > "$WORK/limitranges.yaml"
+  --show-only templates/worker-isolated-namespace.yaml > "$WORK/limitranges.yaml" 2> "$WORK/limitranges.err"; then
+  echo "BROKEN: the LimitRange render failed:" >&2
+  cat "$WORK/limitranges.err" >&2
+  exit 2
+fi
 awk '
   /^kind: LimitRange$/ { ranges++ }
-  /^    - type: / { in_container = ($3 == "Container"); in_max = 0 }
+  /^    - type: / { in_container = ($3 == "Container"); in_max = 0; c = "" }
   in_container && /^      max:$/ { in_max = 1; next }
   in_container && in_max && /^        cpu:/ { c = $2; gsub(/"/, "", c) }
   in_container && in_max && /^        memory:/ {

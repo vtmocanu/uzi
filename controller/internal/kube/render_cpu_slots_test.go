@@ -17,10 +17,9 @@ func TestRenderCPUSlots(t *testing.T) {
 	sizes := preset.SizeNames()
 	sort.Strings(sizes)
 	expected := map[string]struct{ request, limit string }{
-		"s": {"250m", "1"},
-		"m": {"1", "4"},
-		"l": {"1", "4"},
-
+		"s":         {"250m", "1"},
+		"m":         {"1", "4"},
+		"l":         {"1", "4"},
 		"l-highmem": {"1", "4"},
 	}
 	for _, size := range sizes {

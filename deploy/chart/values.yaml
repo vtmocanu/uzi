@@ -783,7 +783,7 @@ workers:
   ephemeralLease: "2h"
   # Issue #2412: a run-bound worker needs one run's memory headroom, not a
   # persistent L worker's two-run budget. M reserves 8Gi instead of 14Gi while
-  # both presets request 1 CPU and can burst to 4 CPU. Valid values: s, m, l; invalid values fail
+  # both presets request 1 CPU and can burst to 4 CPU. Valid values: s, m, l, l-highmem; invalid values fail
   # chart rendering. Existing workers keep their stored size; persistent workers
   # still preselect L. Set the size only here: the same key in api.config or
   # api.secretEnv fails the render.
