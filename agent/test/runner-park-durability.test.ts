@@ -97,6 +97,7 @@ const limitEnd = async (): Promise<ExecutorResult> => {
 const reports = (runId: string, status: string): StateRequest[] =>
   api.states.filter((s) => s.runId === runId && s.body.status === status).map((s) => s.body);
 
+const FALLBACK_STATUS = "report_only was set but this run published committed work to origin; the worker will attempt non-closing delivery";
 const statusTexts = (runId: string): string[] =>
   api
     .messages(runId)
@@ -414,7 +415,8 @@ describe("RunRunner — PRD #1809 D8: the wall park reports what its checkpoint 
 //   - the checkpoint floor C is the tracking tip (a floor at the unpublished clone HEAD would let a
 //     later bridge or #1416 steer treat never-published work as durable);
 //   - lastPublishedTip stays unset (hasNewWork keeps retrying the clone HEAD);
-//   - but a checkpoint DID land, so a report_only completion must still refuse to orphan it (N1).
+//   - but a checkpoint DID land, so a report_only completion must still not orphan it (N1): since
+//     #3360 an issue run attempts non-closing delivery and never completes report-only.
 describe("RunRunner — PRD #1809 D8: an overlay publish after a failed fetch-back", () => {
   /** A GitHub claim (so the milestone checkpoint takes the overlay path) whose overlay pack is
    *  the plain tracking ref: the overlay's default-tip wrapper would need a forge fetch. */
@@ -472,8 +474,9 @@ describe("RunRunner — PRD #1809 D8: an overlay publish after a failed fetch-ba
     await withHomeRoot(async (homeRoot) => {
       const tips = stubPublish();
       failFetchBackAfter(1);
-      const { github } = fakeGitHub();
-      const { gitlab, calls } = fakeGitlab();
+      // A GitHub claim: count writes on the GitHub fake, which would carry any MR.
+      const { github, calls } = fakeGitHub();
+      const { gitlab } = fakeGitlab();
       const claim = overlayClaim(18098);
       await runnerWith(
         twoMilestoneFactory(
@@ -488,6 +491,7 @@ describe("RunRunner — PRD #1809 D8: an overlay publish after a failed fetch-ba
       assert.strictEqual(tips.length, 1, "the milestone checkpoint landed (the older tracking tip)");
       const [failed] = reports(claim.run_id, "failed");
       assert.ok(failed, "the run failed");
+      assert.ok(statusTexts(claim.run_id).includes(FALLBACK_STATUS), "the #3360 fallback ran");
       assert.match(failed.failure_reason ?? "", /No space left on device/, "the fallback reached the finalize fetch-back");
       assert.strictEqual(reports(claim.run_id, "completed").length, 0, "it did not complete report-only");
       assert.strictEqual(calls.length, 0, "no MR opened");
@@ -515,6 +519,7 @@ describe("RunRunner — PRD #1809 D8: an overlay publish after a failed fetch-ba
       assert.strictEqual(tips.length, 1, "the pause published the older tracking tip");
       const [failed] = reports(claim.run_id, "failed");
       assert.ok(failed, "the run failed");
+      assert.ok(statusTexts(claim.run_id).includes(FALLBACK_STATUS), "the #3360 fallback ran");
       assert.match(failed.failure_reason ?? "", /No space left on device/, "the fallback reached the finalize fetch-back");
       assert.strictEqual(reports(claim.run_id, "completed").length, 0, "it did not complete report-only");
       assert.strictEqual(calls.length, 0, "no MR opened");
