@@ -234,6 +234,7 @@ export class ExecutionRegistry {
   // ANY poison and NEVER cleared, so callers can ask "was this epoch ever poisoned?"
   // independent of the disposal-masked state enum.
   private poisoned = false;
+  private nonAuthorizationPoison = false;
   // Issue #1766: STICKY witness that `disposeTools` has cleared (or begun clearing) the
   // callback and launch tables. Set at the TOP of `disposeTools`, before any await or clear,
   // and NEVER reset. A failed disposal leaves `state()` at "poisoned" rather than "disposed",
@@ -358,6 +359,9 @@ export class ExecutionRegistry {
   poison(errors: HarnessError | readonly HarnessError[]): void {
     this.poisonRevision = {};
     const list = Array.isArray(errors) ? errors : [errors];
+    // Authorization refusal can precede terminal-only capture cleanup. Every other
+    // fault, including an empty diagnostic, remains unproven after that capture.
+    this.nonAuthorizationPoison ||= list.length === 0 || list.some(e => e.category !== "authorization");
     // Append only while under MAX_POISON_ERRORS; once at the cap we stop retaining
     // reasons (keeping the FIRST, most-diagnostic ones). This is the unconditional
     // backstop for ALL poison sources — present and future — so that no number of
@@ -906,7 +910,7 @@ export class ExecutionRegistry {
     const errors: HarnessError[] = [];
     const capture = this.completedCaptureForDisposal === undefined ? undefined
       : this.completedCaptures.get(this.completedCaptureForDisposal);
-    const captured = capture?.revision === revision && capture.roots === roots &&
+    const captured = !this.nonAuthorizationPoison && capture?.revision === revision && capture.roots === roots &&
       capture.launches === launches && capture.callbacks === callbacks;
     const eligible = (this.currentState === "closed" ||
       (this.currentState === "poisoned" && (this.capturePoisonRevision === revision || captured))) &&

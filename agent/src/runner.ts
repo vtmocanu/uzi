@@ -5159,8 +5159,10 @@ export class RunRunner {
       }
       const processProof = (): boolean => terminalSafety === undefined ||
         (this.terminalProcessProof(flight) && this.terminalMemorySettled(flight));
+      // A checkpointed park retires its ordinary clone too; custody flags and the
+      // exact disposal witness still veto release when cleanup is unproven.
       const cloneReleaseProof = (): boolean => processProof() && !flight.preserveRecoveryClone &&
-        !flight.parked && !flight.stoppedSourceKept;
+        !flight.stoppedSourceKept;
       const successorProcessProof = (): boolean => processProof() && !flight.parked && !flight.stoppedSourceKept &&
         !flight.retainedLocalCustody && this.terminalMemorySettled(flight) && !flight.steering.isCancelled();
       const beforeDestroy = (): void => {
