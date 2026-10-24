@@ -21080,6 +21080,9 @@ export class RunRunner {
     // Release-capable Codex exits request work only. No Git reads, process scan, or
     // safety acquisition is permitted in the handler's still-held A/B region.
     if (this.requiresCodexTerminalProof(flight, executor) && handler?.record === "none" && reason !== "recovery_park_keep") {
+      // Stale-claim inventory exclusion is independent of release eligibility.
+      // A vetoed or invalidated request may never reach post-disposal coverage.
+      if (handler.stale) flight.keepGuardedInventoryOpen = true;
       const safety = executor.safety;
       if (!safety) {
         // No exact facade means no release request or legacy coverage; latch before any read.

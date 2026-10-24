@@ -11,6 +11,7 @@ type Flight = {
   executor: Executor; worktreePath: string; runId: string; claimGeneration: number;
   preserveRecoveryClone?: boolean; stoppedSourceKept?: boolean; sourceExitDenied?: boolean;
   evidenceProcessJoined?: Executor;
+  keepGuardedInventoryOpen?: boolean;
   deferredTerminalRelease?: Record<string, unknown>;
   terminalDisposal?: { source: Record<string, unknown>; result: { kind: string } };
 };
@@ -80,6 +81,7 @@ it("M2 entry seam: every release reason defers reads and safety with live admiss
         assert.equal(rig.registry.pendingLaunchCount(), 1);
         assert.equal(flight.preserveRecoveryClone, true);
         assert.equal(flight.sourceExitDenied, true);
+        assert.equal(flight.keepGuardedInventoryOpen, true, reason + ": stale inventory guard precedes deferral");
         const request = flight.deferredTerminalRelease!;
         assert.ok(Object.isFrozen(request), reason + ": immutable request");
         assert.equal(request.reason, reason);
@@ -102,6 +104,62 @@ it("M2 entry seam: every release reason defers reads and safety with live admiss
   } finally {
     if (pending.kind === "reserved") rig.registry.cancelReservation(pending.reservation);
   }
+});
+
+it("stale deferred release keeps guarded inventory closed despite veto or invalidation", async t => {
+  const rig = codexRig();
+  const executor = new FakeCodexExecutor(rig.safety, async () => { throw new Error("model must not run"); });
+  const runner = runnerWith(() => ({ executor }), fakeGitlab().gitlab, "stale-inventory-proof");
+  const seam = runner as unknown as Seam & {
+    settleGuardedInventory(claim: ReturnType<typeof gitlabClaim>, flight: Flight): Promise<void>;
+    owedOptions(...args: unknown[]): Promise<never>;
+    terminalProcessProof(flight: Flight): boolean;
+  };
+  const claim = gitlabClaim(285696, { claim_generation: 3 });
+  const clone = seam.phaseClone.bind(runner);
+  let actual: Flight | undefined;
+  const cases: { flight: Flight; reason: string; mode: string }[] = [];
+  let guardedWork = 0;
+  t.mock.method(seam, "owedOptions", async () => {
+    guardedWork++;
+    throw new Error("guarded inventory reached ownership/capture preparation");
+  });
+  t.mock.method(seam, "reportGenericFailure", async () => {});
+  t.mock.method(seam, "phaseClone", async (...args: unknown[]) => {
+    await clone(...args);
+    actual = args[1] as Flight;
+    for (const reason of ["plan_revision_recovery_stopped", "stale_revision_rejection", "terminal_disk_precheck"]) {
+      for (const mode of ["deferred", "prior-veto", "later-keep", "changed-source"]) {
+        const flight: Flight = { ...actual, preserveRecoveryClone: mode === "prior-veto" };
+        await seam.retainStoppedSource(flight, executor, reason, { memo: false, stale: true, record: "none" });
+        if (mode === "later-keep") flight.preserveRecoveryClone = true;
+        if (mode === "changed-source") flight.worktreePath += "-changed";
+        cases.push({ flight, reason, mode });
+      }
+    }
+    // An independently kept real flight reaches a successful terminal disposal,
+    // so incomplete disposal cannot incidentally supply the inventory guard.
+    actual.preserveRecoveryClone = true;
+    await rig.safety.withBoundary({ boundary: "finalize", deadlineMs: 120000 }, async () => {});
+    throw new Error("stale inventory matrix complete before model admission");
+  });
+  await runner.execute(claim);
+  assert.ok(actual);
+  assert.equal(seam.terminalProcessProof(actual), true, "exact executor disposal succeeded");
+  assert.equal(cases.length, 12);
+  const beforeStaleCallbacks = guardedWork;
+  for (const { flight, reason, mode } of cases) {
+    assert.equal(flight.keepGuardedInventoryOpen, true, reason + "/" + mode);
+    if (mode === "prior-veto" || mode === "later-keep")
+      assert.equal(flight.deferredTerminalRelease, undefined, mode + ": no request to restore the latch later");
+    await seam.settleGuardedInventory(claim, flight);
+  }
+  assert.equal(guardedWork, beforeStaleCallbacks, "stale reporting callbacks cannot prepare ownership, freeze or upload");
+  // Prove the real settle path is enabled: removing only this guard reaches its
+  // first preparation step even though sourceExitDenied remains set.
+  const control: Flight = { ...cases[0]!.flight, keepGuardedInventoryOpen: false };
+  await seam.settleGuardedInventory(claim, control);
+  assert.equal(guardedWork, beforeStaleCallbacks + 1, "positive control reaches guarded inventory preparation");
 });
 
 for (const identity of ["facadeless", "swapped-to-Claude"] as const) {
