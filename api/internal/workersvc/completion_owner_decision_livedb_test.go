@@ -273,6 +273,31 @@ func TestDecideCompletionNonOwnerHiddenLiveDB(t *testing.T) {
 			t.Fatal("a refused foreign decision must NOT invalidate the permit")
 		}
 	})
+
+	t.Run("foreign caller with an invalid decision is hidden before validation", func(t *testing.T) {
+		// The owner check must run BEFORE reason/revision validation: otherwise a foreign caller
+		// sending an invalid decision gets ErrCompletionDecisionInvalid (a 4xx), which reveals that
+		// the run exists. Both an empty reason and a non-positive revision must still read as 404.
+		runID := e.seedFrozenRun(t, wid, []string{"m1", "m2"}, nil, false)
+		e.parkCompletionBlocked(t, runID)
+		foreign := uuid.New()
+		for name, in := range map[string]CompletionDecisionInput{
+			"empty reason":      {Decision: "partial", Keep: []string{"m1"}, Reason: "", ContractRevision: 1},
+			"zero contract rev": {Decision: "partial", Keep: []string{"m1"}, Reason: "r", ContractRevision: 0},
+		} {
+			_, err := svc.DecideCompletion(e.ctx, foreign, runID, in)
+			if errors.Is(err, ErrCompletionDecisionInvalid) {
+				t.Fatalf("%s: a foreign caller got ErrCompletionDecisionInvalid, leaking that the run exists; got %v", name, err)
+			}
+			if !errors.Is(err, ErrRunNotFound) {
+				t.Fatalf("%s: a foreign caller with an invalid decision must be hidden as ErrRunNotFound; got %v", name, err)
+			}
+		}
+		_, rev := e.readContract(t, runID)
+		if rev == nil || *rev != 1 {
+			t.Fatalf("a hidden invalid decision must change nothing; contract_revision = %v", rev)
+		}
+	})
 }
 
 // TestDecideCompletionConflictLiveDB: a stale revision and a conflicting second decision both return
