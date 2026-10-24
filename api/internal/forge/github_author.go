@@ -35,8 +35,7 @@ func (g *github) RepositoryAuthorEligibility(ctx context.Context, projectID, aut
 		if repoResp == nil || !completeAuthorResponse(repoResp.Response) || r == nil || r.GetID() != projectID || r.GetOwner().GetLogin() == "" || r.GetName() == "" {
 			return nil, ErrAuthorUnknown
 		}
-		all, err := paginate(func(e error) error { return g.wrapErr("author collaborators", e) }, func(page int) ([]*gh.User, int, error) {
-			state := newResponseLimitState(objectResponseBytes)
+		all, err := paginateResponses(func(e error) error { return g.wrapErr("author collaborators", e) }, objectResponseBytes, collaboratorListResponseBytes, func(page int, state *responseLimitState) ([]*gh.User, int, error) {
 			users, resp, err := g.client.Repositories.ListCollaborators(withResponseLimit(ctx, state), r.GetOwner().GetLogin(), r.GetName(),
 				&gh.ListCollaboratorsOptions{Affiliation: "all", ListOptions: gh.ListOptions{Page: page, PerPage: 100}})
 			if state.overflow.Load() {

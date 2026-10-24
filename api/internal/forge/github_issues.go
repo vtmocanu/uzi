@@ -185,9 +185,8 @@ func (g *github) ListIssueComments(ctx context.Context, projectID, issueIID int6
 	}
 	opt := &gh.IssueListCommentsOptions{ListOptions: gh.ListOptions{PerPage: githubPerPage}}
 	wrap := func(e error) error { return g.wrapErr("list issue comments", e) }
-	return paginate(wrap, func(page int) ([]IssueComment, int, error) {
+	return paginateResponses(wrap, commentPageResponseBytes, commentListResponseBytes, func(page int, state *responseLimitState) ([]IssueComment, int, error) {
 		opt.Page = page
-		state := newResponseLimitState(commentPageResponseBytes)
 		comments, resp, err := g.client.Issues.ListComments(withResponseLimit(ctx, state), slug.owner, slug.repo, num, opt)
 		if state.overflow.Load() {
 			return nil, 0, state.err()
