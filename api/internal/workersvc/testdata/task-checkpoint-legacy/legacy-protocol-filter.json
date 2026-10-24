@@ -1,0 +1,6 @@
+{
+  "source_sha": "03d273fde1901d4185ac7590bae4b6a9f78ef8ea",
+  "advertised": ["task_checkpoint_coordinates_v1", "recovery_archive_v1", "docker", "unknown", "task_checkpoint_coordinates_v1"],
+  "legacy_output": ["recovery_archive_v1"],
+  "candidate_output": ["task_checkpoint_coordinates_v1", "recovery_archive_v1"]
+}
