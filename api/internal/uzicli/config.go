@@ -52,6 +52,10 @@ type Config struct {
 // TUIConfig holds the CLI's non-secret TUI preferences.
 type TUIConfig struct {
 	Split string `toml:"split,omitempty"`
+	// MilestoneNumbers prefixes each detail-rail milestone title with its frozen position.
+	MilestoneNumbers bool `toml:"milestone_numbers,omitempty"`
+	// RailMinWidth raises the detail rail's width floor; 0 keeps the default (26).
+	RailMinWidth int `toml:"rail_min_width,omitempty"`
 }
 
 // Context is one named endpoint's non-secret settings.

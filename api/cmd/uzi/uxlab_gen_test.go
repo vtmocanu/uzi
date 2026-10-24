@@ -133,6 +133,9 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"detail-codex":                  func(d bool) string { return detailCodex(d, now) },
 		"detail-blocked-by":             func(d bool) string { return detailBlockedBy(d, now) },
 		"detail-milestones-attributed":  func(d bool) string { return detailMilestonesAttributed(d, now) },
+		"detail-rail-wide":              func(d bool) string { return detailRailScene(d, now, 200, false) },
+		"detail-rail-numbered":          func(d bool) string { return detailRailScene(d, now, frameWidth, true) },
+		"detail-rail-numbered-wide":     func(d bool) string { return detailRailScene(d, now, 200, true) },
 		"detail-crew-autofold":          func(d bool) string { return detailCrewAutofold(d, now) },
 		"detail-planning":               func(d bool) string { return detailPlanning(d, now) },
 		"detail-focus-transcript":       func(d bool) string { return detailFocusTranscript(d, now) },
@@ -1704,5 +1707,30 @@ func boardDoneFailures(dark, selected bool) string {
 	if selected {
 		m.board.cursor = 1
 	}
+	return m.View().Content
+}
+
+// detailRailScene is a running milestone run whose titles mix model-written M<n> prefixes with
+// bare titles (issue #3406), rendered at the given terminal width with [tui] milestone_numbers
+// on or off, to show the responsive rail width and the positional numbering.
+func detailRailScene(dark bool, now time.Time, width int, numbers bool) string {
+	run := apitypes.RunDTO{ID: detailRunID, Kind: "issue", Status: "running", Health: "ok",
+		IssueTitle:  "Add rate-limit headroom to the scheduler poll",
+		IssueIID:    ip(452),
+		IssueWebURL: sp("https://github.com/vtmocanu/uzi/issues/452"),
+		StartedAt:   tp(now.Add(-4 * time.Minute)),
+		Milestones: []apitypes.Milestone{
+			{ID: "m1", Title: "Merge base a86d6146 and rebase onto main"},
+			{ID: "m2", Title: "M2 range review of the scheduler change"},
+			{ID: "m3", Title: "M3 isolated mutation testing"},
+			{ID: "m4", Title: "m4 - records, single-commit history"},
+		},
+		MilestonesCompleted:  []string{"m1"},
+		MilestonesInProgress: []string{"m2"}}
+	run.AnthropicSecretID, run.AnthropicSecretLabel = sp("sec-meta"), sp("meta")
+	m := detailBase(dark, run, now, true)
+	m.milestoneNumbers = numbers
+	m = step(m, tea.WindowSizeMsg{Width: width, Height: frameHeight})
+	m = withLiveStream(m)
 	return m.View().Content
 }

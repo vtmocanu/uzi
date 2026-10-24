@@ -145,7 +145,7 @@ func (m tuiModel) rateWindowCell(label string, w *apitypes.RateLimitWindow, barW
 	}
 	// Inline reset countdown after the percent, when Anthropic reported a reset time for this
 	// window (issue #588). shortDuration clamps a past reset to "0s". The strip is width-clamped
-	// downstream and the rail row is width-locked to laneRailWidth (26), which is why the two
+	// downstream and the rail meter row keeps the fixed laneRailWidth (26) budget, which is why the two
 	// surfaces space the countdown differently: the board appends a single space + bare duration,
 	// the rail a 2-col gap + a 6-col right-aligned field (max real value "23h59m" = 6 cols).
 	if w.ResetsAt != nil {

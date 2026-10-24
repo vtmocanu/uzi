@@ -2039,6 +2039,32 @@ split = "off"
 The `off` setting also disables `s`. `uzi tui --demo` and
 `uzi tui --sketch` use `auto` regardless of this setting.
 
+The run detail's left rail grows with the terminal: about a fifth of its
+width, at least 26 columns and at most 44, so milestone titles, crew labels
+and the now line truncate less on a wide terminal. Once the terminal is
+92 columns or wider the transcript always keeps at least 60 columns; below
+that the rail stays at 26 columns. Two more `[tui]` keys tune the rail:
+
+```toml
+[tui]
+milestone_numbers = true   # default false
+rail_min_width = 36        # default 26
+```
+
+- `milestone_numbers = true` prefixes each rail milestone title with its
+  position in the approved list (`M1`, `M2`, …, right-aligned once there are
+  ten or more) and drops a number the run already wrote at the start of the
+  title (`M3 `, `m4 - `, `M5:`), so every row reads the same way. A word
+  that merely starts with one, like `M3Migration`, is left alone. The board
+  row is unchanged.
+- `rail_min_width` raises the rail's floor, and may exceed the automatic
+  44-column cap. The 60-column transcript minimum still wins on a terminal
+  too narrow for both. Values below 26 are rejected; `0` means the default.
+
+An invalid value for any `[tui]` key stops `uzi tui` with a usage error
+naming the key. Like `split`, both keys are ignored by `--demo` and
+`--sketch`.
+
 ### Keybindings
 
 ```
