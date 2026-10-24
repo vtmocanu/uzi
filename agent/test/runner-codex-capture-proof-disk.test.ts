@@ -44,11 +44,22 @@ for (const exit of ["loop-park","loop-terminal-after-refusal","confirm-terminal"
       assert.equal(o.rig.releaseCalls(), 0);
       assert.equal(custody(), 0);
       assert.equal(f.forge.calls.length, 0);
-      assert.equal(trackedFile(2201,"COMMITTED.txt"),"committed sentinel\n");
-      assert.equal(trackedFile(2201,"DIRTY.txt"),"dirty sentinel\n");
+      if (exit === "confirm-terminal") {
+        // Terminal confirmation revokes capture authority before any source access.
+        assert.equal(trackedFile(2201, "COMMITTED.txt"), null);
+        assert.equal(trackedFile(2201, "DIRTY.txt"), null);
+        assert.equal(fs.readFileSync(path.join(f.clone(), "COMMITTED.txt"), "utf8"), "committed sentinel\n");
+        assert.equal(fs.readFileSync(path.join(f.clone(), "DIRTY.txt"), "utf8"), "dirty sentinel\n");
+        assert.equal(o.observations().source.length, 0);
+        assert.equal(o.observations().pubs.length, 0);
+        assert.equal(o.observations().spawns, 0);
+      } else {
+        assert.equal(trackedFile(2201,"COMMITTED.txt"),"committed sentinel\n");
+        assert.equal(trackedFile(2201,"DIRTY.txt"),"dirty sentinel\n");
+      }
       assert.equal(parks().length,exit==="loop-park"?1:0);
       if(exit==="loop-terminal-after-refusal") assert.equal(attempts,2,"one refusal followed by terminal exit capture");
-      o.assertProof(exit!=="confirm-terminal" && exit!=="loop-terminal-after-refusal");
+      if (exit !== "confirm-terminal") o.assertProof(exit !== "loop-terminal-after-refusal");
     } finally {o.restore();}
   });
 }

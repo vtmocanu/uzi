@@ -18218,7 +18218,7 @@ export class RunRunner {
               ? { status: "recovery_wait", recovery_cause: "vault_locked" }
               : cause.kind === "account_unavailable" && this.client.protocolFeatures.includes("recovery_cause_codex_account_unavailable")
                 ? { status: "recovery_wait", recovery_cause: "codex_account_unavailable" }
-                : disk
+                : !credentialDeferred && disk
                 ? this.diskParkBody(claim, disk.preventive)
                 : { status: "recovery_wait" }),
             ...(!providerOrigin && !credentialDeferred && (cause.kind === "transient" || disk) &&
@@ -18271,7 +18271,7 @@ export class RunRunner {
             if (await this.dispositionProviderPark(claim, flight, runLog, providerReap, ack.status, opts.heldAuthenticated?.signal)) keepClone();
             return true;
           }
-          if (ack.status === "recovery_wait" && disk) {
+          if (ack.status === "recovery_wait" && !credentialDeferred && disk) {
             runLog.info("run parked mid-run for its data volume; its caches are dropped and it resumes automatically", {
               run_id: flight.runId,
               cause: "data_volume_full",
