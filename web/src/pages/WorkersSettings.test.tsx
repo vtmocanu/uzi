@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { WorkersSettings } from "./WorkersSettings";
+import { ApiError } from "../lib/apiError";
 import { api, type SecretMeta, type Worker } from "../lib/api";
 import { incidentFleetWorkers } from "../mocks/data/health";
 
@@ -874,6 +875,56 @@ describe("WorkersSettings hosted delete confirms; external delete does not (PRD 
 
     await waitFor(() => expect(mockApi.deleteWorker).toHaveBeenCalledWith("w-x"));
     expect(screen.queryByRole("button", { name: "Delete anyway" })).toBeNull();
+  });
+
+  describe("409 active-runs refusal", () => {
+    const MSG = "worker has active runs; cancel them before deleting it";
+    const LIST = "Runs blocking this delete";
+
+    it("lists the blocking runs with links and the overflow count", async () => {
+      mockApi.listWorkers.mockResolvedValue({ workers: [externalW] });
+      mockApi.deleteWorker.mockRejectedValue(
+        new ApiError(409, MSG, {
+          error: MSG,
+          active_runs: [
+            { id: "c-1", kind: "chat", status: "running", issue_iid: null, title: "Idle chat" },
+            { id: "r-1", kind: "issue", status: "queued", issue_iid: 7, title: "Fix login" },
+          ],
+          active_runs_total: 3,
+        }),
+      );
+      renderPage();
+      fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+
+      expect(await screen.findByText(MSG)).toBeTruthy();
+      expect(screen.getByRole("list", { name: LIST })).toBeTruthy();
+      expect(screen.getByRole("link", { name: "Idle chat" }).getAttribute("href")).toBe("/chat/c-1");
+      expect(screen.getByRole("link", { name: "Fix login" }).getAttribute("href")).toBe("/runs/r-1");
+      expect(screen.getByText("and 1 more")).toBeTruthy();
+    });
+
+    it("shows the overflow line for an empty list with a positive total", async () => {
+      mockApi.listWorkers.mockResolvedValue({ workers: [externalW] });
+      mockApi.deleteWorker.mockRejectedValue(
+        new ApiError(409, MSG, { error: MSG, active_runs: [], active_runs_total: 2 }),
+      );
+      renderPage();
+      fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+
+      expect(await screen.findByText(MSG)).toBeTruthy();
+      expect(screen.getByRole("list", { name: LIST })).toBeTruthy();
+      expect(screen.getByText("and 2 more")).toBeTruthy();
+    });
+
+    it("keeps today's behaviour for a 409 without active_runs", async () => {
+      mockApi.listWorkers.mockResolvedValue({ workers: [externalW] });
+      mockApi.deleteWorker.mockRejectedValue(new ApiError(409, MSG, { error: MSG }));
+      renderPage();
+      fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+
+      expect(await screen.findByText(MSG)).toBeTruthy();
+      expect(screen.queryByRole("list", { name: LIST })).toBeNull();
+    });
   });
 
   it("arms only the row that was clicked", async () => {
