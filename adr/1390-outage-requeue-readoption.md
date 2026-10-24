@@ -4,7 +4,7 @@
 M6 hosted acceptance are the maintainer's, out of band).
 **Date**: 2026-09-17
 **Issue**: [vtmocanu/uzi#1390](https://github.com/vtmocanu/uzi/issues/1390)
-**PRD**: [prds/1390-outage-requeue-readoption.md](../prds/1390-outage-requeue-readoption.md) —
+**PRD**: [prds/done/1390-outage-requeue-readoption.md](../prds/done/1390-outage-requeue-readoption.md) —
 carries the full Decision Log (D1-D11), the milestone breakdown and the verified code
 anchors; this ADR carries only the seams other code must respect and why they are shaped
 as they are.

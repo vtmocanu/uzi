@@ -463,7 +463,7 @@ did** — folding does not make this one large change.
 > **M10 SHIPPED, on its own, and NOT in the order below.** It is #201's M4a, merged as
 > MR !171: a computed `differs_from_builtin`, a "differs from shipped" badge, a
 > shipped-vs-stored diff, and `GET /agent-templates/{id}/builtin`. Spec of record is
-> `prds/201-builtin-drift-signal.md`; design decisions are `specs/ai.md` §476-§478.
+> `prds/done/201-builtin-drift-signal.md`; design decisions are `specs/ai.md` §476-§478.
 >
 > **1. The ORDER BELOW IS INVERTED, and following it costs a migration you do not need.**
 > M8 (`version`) is listed before M9 (hash) and both are gated behind M1's parser change.

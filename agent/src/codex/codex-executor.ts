@@ -73,7 +73,7 @@ import { constants as FS } from "node:fs";
 import type { Readable, Writable } from "node:stream";
 
 import type { Logger } from "../log.js";
-import { CodexRequestFailure, RequestError, codexDeferralReason, codexRefreshFailure, isTransientStatus, type WorkerClient } from "../client.js";
+import { CodexRequestFailure, RequestError, codexDeferralReason, codexRefreshFailure, isTransientStatus, type PlanCrossCheckFindings, type WorkerClient } from "../client.js";
 import { TransientRecoveryError } from "../sdk-executor.js";
 import { classifyLimitEvidence, LimitReachedError } from "../limit.js";
 import { CodexTurnFailedError, formatCodexClassification, isCodexTransientClassification } from "./terminal-normalize.js";
@@ -125,7 +125,7 @@ import {
   type TurnStreamEnd,
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
-import { interruptedSnapshotNote, interruptedCallsNote, NON_CLOSING_REMINDER, COMPLETION_CONTRACT_GUIDANCE, CURRENT_EXECUTION_STATE_GUIDANCE, depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBatch, REVIEWED_RESUME_APPROVAL_GUIDANCE, selectPriorOwnerHistory, renderPriorOwnerHistory } from "../prompt.js";
+import { interruptedSnapshotNote, interruptedCallsNote, NON_CLOSING_REMINDER, COMPLETION_CONTRACT_GUIDANCE, CURRENT_EXECUTION_STATE_GUIDANCE, depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, renderPlanApprovalAdvice, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBatch, REVIEWED_RESUME_APPROVAL_GUIDANCE, selectPriorOwnerHistory, renderPriorOwnerHistory } from "../prompt.js";
 import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts, type EnvProbeSpawner } from "../env-probe.js";
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
@@ -3658,6 +3658,7 @@ export class CodexExecutor implements Executor {
       let gatedPlan: string | undefined;
       // PRD #2460: the approved plan is a checked server bundle, restated in the implement prompt.
       let checkedPlan = false;
+      let checkedFindings: PlanCrossCheckFindings | null | undefined;
       // Issue #1674: the milestone breakdown of the plan version the gate approved (the final
       // planResult.milestones after any revise rounds, mirroring sdk-executor's
       // `frozenMilestones = candidateMilestones`). ctx.frozenMilestones comes from the claim and is
@@ -3852,6 +3853,7 @@ export class CodexExecutor implements Executor {
           gatedPlan = canonical.plan;
           approvedMilestones = canonical.milestones;
           checkedPlan = true;
+          checkedFindings = verdict.findings;
         } else {
           gatedPlan = planMd;
           approvedMilestones = planResult.milestones;
@@ -4160,7 +4162,7 @@ export class CodexExecutor implements Executor {
           installState.noted = true;
         }
         const ownerPrompt = this.implementPrompt(ctx, gatedPlan, milestoneNote(), environmentFacts,
-          checkedPlan ? { milestones: approvedMilestones } : undefined);
+          checkedPlan ? { milestones: approvedMilestones, findings: checkedFindings } : undefined);
         const ownerBase = depsNote ? `${ownerPrompt}\n\n${depsNote}` : ownerPrompt;
         // Issue #3149: earlier owner follow-ups ride only the first implement turn of a reviewed-plan
         // resume (never a system-text turn), deduped by id against this turn's live batch and the
@@ -6051,14 +6053,14 @@ export class CodexExecutor implements Executor {
    *  and the clarification continuation replace this prompt for their turn and do not carry the
    *  block. Empty block ⇒ byte-identical. */
   private implementPrompt(ctx: RunContext, gatedPlan?: string, milestoneNote = "", facts?: EnvFacts,
-    checked?: { milestones: Milestone[] | undefined }): string {
+    checked?: { milestones: Milestone[] | undefined; findings?: PlanCrossCheckFindings | null }): string {
     const approved = ctx.approvedPlan?.trim();
     // PRD #2460: a cross-check approved the server's normalized candidate, not the lead's local plan.
     // The contract (plan prose plus the full milestone list) leads every implement attempt and
     // supersedes whatever the plan thread holds.
     const body = gatedPlan !== undefined && checked !== undefined
       ? [
-          checkedImplementationContext(gatedPlan, checked.milestones ?? []).trimEnd(),
+          checkedImplementationContext(gatedPlan, checked.milestones ?? []).trimEnd() + renderPlanApprovalAdvice(checked.findings),
           "",
           "Your plan was cross-checked and the server contract above was approved. Implement THAT contract now",
           "on the current branch, delegating to your subagents and iterating until the review passes. It is",

@@ -59,7 +59,7 @@ resetResidueQuarantineAfterEach();
 // Most privileged steps are injected; the worker-UID regression exercises the
 // production runner-tree creator with real setpriv and the worker image binaries.
 
-const CODEX_BIN = "/opt/uzi-codex/0.162.1/bin/codex";
+const CODEX_BIN = "/opt/uzi-codex/0.163.0/bin/codex";
 const SUPERVISOR_BIN = "/usr/local/bin/uzi-codex-supervisor";
 const RUNNER_UID = 10002;
 const DATA_ROOT = "/data/run/root-1";

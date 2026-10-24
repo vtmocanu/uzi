@@ -110,8 +110,8 @@ task test:codex-m3b:host
 task check:codex-m4-receipts
 ```
 
-`test:codex-m4` needs the pinned `codex-cli 0.162.1` package (`agent/codex/codex-package.lock`):
-either the image-baked absolute path at `/opt/uzi-codex/0.162.1`, or a rootless test-cache
+`test:codex-m4` needs the pinned `codex-cli 0.163.0` package (`agent/codex/codex-package.lock`):
+either the image-baked absolute path at `/opt/uzi-codex/0.163.0`, or a rootless test-cache
 provision via `provision.ts` (`install-codex.sh` with SHA256-verified layout) on a Linux
 contributor/CI host without the baked package. D7 point 3's strict macOS Linux-container
 invocation is now reproducibly callable: `task test:codex-m4:macos` runs
@@ -222,7 +222,7 @@ These are known, accepted limitations recorded honestly, not defects hiding behi
 - **These three Landlock-citing claims — sibling isolation via the command-root separation,
   `codex-o-command-root-home-denial`, and the base64/variable-indirection residual above — are
   `required`-mode claims.** They are proven on a Landlock-capable host running the command
-  sandbox's default `required` mode. On [PRD #1493](../../prds/1493-codex-k8s-uid-split-profile.md)'s
+  sandbox's default `required` mode. On [PRD #1493](../../prds/done/1493-codex-k8s-uid-split-profile.md)'s
   opt-in `best-effort` mode, on a kernel that reports Landlock unavailable, their Landlock-confinement
   guarantee no longer holds: the command runs unconfined, and containment is the uid split alone (the
   worker/runner/runner-cmd separation), not Landlock filesystem confinement. `best-effort` is never claimed to be

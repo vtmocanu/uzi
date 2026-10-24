@@ -33,6 +33,9 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 ### Changed
 
+- **Routine dependency updates ([#3297](https://github.com/vtmocanu/uzi/pull/3297), [#3296](https://github.com/vtmocanu/uzi/pull/3296), [#3359](https://github.com/vtmocanu/uzi/pull/3359), [#3375](https://github.com/vtmocanu/uzi/pull/3375)).**
+  Dependency manifest and image bumps that carry no entry of their own.
+
 - **Routine dependency updates ([#3266](https://github.com/vtmocanu/uzi/pull/3266), [#3290](https://github.com/vtmocanu/uzi/pull/3290)).**
   Dependency manifest and image bumps that carry no entry of their own.
 
@@ -282,6 +285,12 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Codex pause and recovery preserve work under scoped credential-free capture (Refs #2852, #3191).**
   Slice A keeps capture and cleanup owned through settlement; proven cleanup permits saved-session epoch recreation after possible drain. Accepted B1 retains clone/session/journal/custody nonterminally on unproven cleanup for the exact refused/unacknowledged owner-pause safety facade, without a new in-run epoch or failed terminal report; this is not a blanket changed-milestone gate revision error conversion. Later execution depends on existing budget/hold requeue or owner Resume policy; retained-source recovery starts a fresh attempt path/model session, not the old thread. Healthy credentialed capture closure (B) and strengthened terminal process proof (C) remain unshipped. (AI-synced 2026-10-22)
+
+- **Plan cross-check approvals carry advisory requirement coverage ([#3334](https://github.com/vtmocanu/uzi/pull/3334), [#3168](https://github.com/vtmocanu/uzi/pull/3168)).**
+  Both lead families receive fenced approval notes and summaries; coverage alone does not block, while omitted stated safety, security and data-integrity constraints retain defect handling.
+
+- **Codex workers use native runtime rust-v0.163.0 ([#3352](https://github.com/vtmocanu/uzi/pull/3352); supersedes #3020).**
+  Upgrade from rust-v0.162.1 with matching launcher, runtime probe, and conformance version pins. The package no longer bundles a patched zsh, so the installer stops requiring it.
 
 ### Added
 
@@ -1035,6 +1044,24 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Preserve build interruption status across coreutils implementations.**
   The Codex Git trust build wrapper returns 130 for SIGINT and 143 for SIGTERM on GNU and uutils hosts, while actual build deadline expiry still returns 124. Signal promptness, child delivery and cleanup checks remain enforced.
+
+- **Background recovery joins its work during shutdown ([#3031](https://github.com/vtmocanu/uzi/pull/3031)).**
+  Recovery passes cancel and join Git and HTTP work while foreground preservation keeps its existing grace and uncertain requests retain their original identity. Successful ordinary archive uploads also trigger saved custody finalization after the run's work has fully settled, without waiting for a heartbeat or restart. Uncertain settlement retains the existing replay path. The terminal maintenance producer remains disabled.
+
+- **Ordinary pause summaries avoid unsupported owner attribution ([#3154](https://github.com/vtmocanu/uzi/pull/3154)).**
+  Run badge tooltips and Slack pause notifications now say Paused without assuming who paused the run, while preserving resume guidance and checkpoint details.
+
+- **Large clean repositories avoid the fixed planning-capture source ceiling ([#3353](https://github.com/vtmocanu/uzi/pull/3353), [#3338](https://github.com/vtmocanu/uzi/pull/3338)).**
+  Capture budgets now account for the trusted base, while file, metadata and deadline limits still send unsafe or oversized captures to the human plan gate.
+
+- **Issue recovery handoffs participate in duplicate-run guards ([#3326](https://github.com/vtmocanu/uzi/pull/3326)).**
+  Optional `uzi handoff --issue <iid>` records an existing-issue link without a plan gate, board association or generated MR closing keyword; review/fix children inherit the link with a best-effort creation gap.
+
+- **Run detail keeps back and help hints visible in narrow terminals ([#3155](https://github.com/vtmocanu/uzi/pull/3155)).**
+  The footer shows esc back and ? keys first so both remain visible at 40 columns.
+
+- **Issue runs that declare report_only after committing work now deliver it as a non-closing MR ([#3360](https://github.com/vtmocanu/uzi/pull/3360)).**
+  When a checkpoint with committed work was already published, the worker sets a non-closing declaration and uses normal delivery instead of failing the run; the skipped advisory cross-check is not replayed, and when a cross-check is required and none ran earlier in the session the MR discloses it as incomplete ("Code cross-check incomplete: skipped: report_only was declared").
 
 ### Security
 

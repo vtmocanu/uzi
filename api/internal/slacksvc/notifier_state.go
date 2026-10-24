@@ -914,14 +914,14 @@ func renderThreadBlocks(rc store.GetSlackRunContextRow, base string) (blocks []s
 			}
 			return blocks, fmt.Sprintf("Needs your attention · provider unavailable · %s#%d", repo, iid(rc.IssueIid)), true
 		}
-		// PRD #1190 M1: the owner-requested park. Led with "‖ Paused by you" so a reader can
-		// tell a user pause from the ⏸️ usage-limit line above. The last checkpoint-published
+		// PRD #1190 M1: an ordinary pause. The notifier has no pause-origin evidence, so
+		// the header stays neutral about who paused the run. The last checkpoint-published
 		// branch tip (checkpoint_tip) rides the detail as `checkpoint <short>` — its first 7
 		// chars — when present, and is omitted when the run has published none (the "omit when
 		// absent" convention); the resume hint names both surfaces. checkpoint_tip is worker-
 		// supplied, so it is EscapeMrkdwn'd like every other such field before the whole detail
 		// is ScrubSecrets'd. All non-terminal, like limit_wait above.
-		blocks = []slack.Block{threadSectionBlock("‖ *Paused by you*")}
+		blocks = []slack.Block{threadSectionBlock("‖ *Paused*")}
 		var detail strings.Builder
 		if n := len(decodeMilestoneIDs(rc.MilestonesCompleted)); n > 0 {
 			fmt.Fprintf(&detail, "after milestone %d · ", n)
@@ -939,7 +939,7 @@ func renderThreadBlocks(rc store.GetSlackRunContextRow, base string) (blocks []s
 			ctxElems = append(ctxElems, el)
 		}
 		blocks = append(blocks, slack.NewContextBlock("slack_thread_paused_ctx", ctxElems...))
-		return blocks, fmt.Sprintf("Paused by you · %s#%d", repo, iid(rc.IssueIid)), true
+		return blocks, fmt.Sprintf("Paused · %s#%d", repo, iid(rc.IssueIid)), true
 
 	default:
 		return nil, "", false

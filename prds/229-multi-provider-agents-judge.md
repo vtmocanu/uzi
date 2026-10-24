@@ -79,7 +79,7 @@ Added 2026-09-26 (AI-synced) as #1106's M7 parent-PRD repoint. [PRD #1106](done/
 - Named Codex subscription logins and OpenAI API keys as typed secret kinds, with one Codex default, a credential frozen per run, coordinated refresh, and no silent subscription-to-key fallback (#1106 D3/D4/D11/D15). This covers D9 for the two fixed-endpoint kinds.
 - The guardrail conformance suite with one adversarial fixture per clause, run against both harnesses, including the repo-isolation clause (D8, D16).
 - The advice lane (judge, review, summary) on Codex. The judge inherits the harness of the run it judges, so a Codex-only user keeps the judge.
-- Harness-aware usage and cost status (metered, subscription, unreported), and implemented Codex account rate-limit meters ([#1209](1209-codex-account-rate-limits.md)); #1209's live maintainer acceptance remains pending.
+- Harness-aware usage and cost status (metered, subscription, unreported), and implemented Codex account rate-limit meters ([#1209](done/1209-codex-account-rate-limits.md)); #1209's live maintainer acceptance remains pending.
 - Web, CLI and TUI harness selection; user docs for connecting Codex.
 - Live hosted Kubernetes verification on a Codex subscription seat. The real OpenAI API-key run was deferred (#1106 D17).
 

@@ -462,7 +462,7 @@ clone was destroyed, recreated at the same path, and the session still resolved
 - **PRD #110** — the closed decision record on pushing during a run. R2's
   starting point, not a settled objection at park time.
 - **PRD #216** — dissects the *same* run and the *same* 14:41:12 re-claim
-  (`prds/216-worker-load-balancing.md:29-32`), and independently records that it
+  (`prds/done/216-worker-load-balancing.md:29-32`), and independently records that it
   returned to its prior worker, so run 78's loss was **not** a cross-worker
   effect. It also rewrites `ClaimRun`, which is where R1's affinity grace lives:
   a live dependency in both directions.

@@ -130,6 +130,8 @@ def case():
                         "observed": {"uid": 10003, "noNewPrivs": True, "capsZero": True, "membership": "0::/",
                                      "limitBytes": limit, "diskType": 123, "shmemType": 0x01021994},
                         "rawSamples": raw_samples, "baseline": baseline, "samples": samples,
+                        "guardPressure": {"mode": "pinned_to_first_load_sample", "sampleId": samples[0]["sampleId"],
+                                          "pressure": copy.deepcopy(samples[0]["pressure"])},
                         "guard": {"enabled": True, "reserveBytes": reserve, "hysteresisBytes": 8 * mib,
                                   "sampleMs": 250, "responseBudgetMs": 5000, "rearmMs": 500, "maxInterventions": 2},
                         "plan": {"limitBytes": limit, "ceilingBytes": limit // 2, "baselineBytes": 100 * mib,

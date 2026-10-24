@@ -138,19 +138,239 @@ split is the boundary.
 in `agent/src/recovery.ts` stops new-origin admission after saved-evidence
 replay, so production never charges the producer ledger, closes the exclusion
 gate or captures WIP. The bootstrap snapshot above is still taken at boot.
-The change that adds the verified transfer, archive handoff and boot
-rediscovery removes the guard.
+Guard removal belongs to a separate follow-up PR after the complete producer
+pipeline and composed measurement pass. That PR also requires the real-image
+PVC roll, live-producer process tree, writer exclusion and process-level
+shutdown checks on its branch-built image. This delivery keeps the guard off;
+merging ordinary recovery fixes does not enable the terminal producer.
 
 Reachable now, independently of the guard: after a run ends failed or
 blocked, the runner starts a pass that retries that run's saved custody
 FINAL under the existing replay proofs, and live re-drive waits while it
-holds the pass set. On shutdown the worker aborts every recovery pass and
-joins it. A pass step that ignores the abort (a git child, an RPC on its
-own timeout) still runs to its own limit, which can outlast the container
-grace. Before the join, such a step was neither aborted nor joined, and the
-handles it held could equally keep the process alive after `worker.run()`
-returned. Linking the pass abort into every git and RPC scope is owed
-before the guard is removed.
+holds the pass set. Each tracked pass owns an async-local signal combining
+its caller's cancellation with recovery shutdown. The Git recovery scope
+first adopts any inherited caller budget; pass ownership then isolates it
+in a child with the same remaining clock. Scope ordering prevents late
+adoption from attaching pass shutdown to the caller's controller. That
+signal reaches its Git operations and lock waits, its cancellation budget
+(including a budget activated later), and every recovery HTTP attempt. Each
+owned response registers cleanup at transport fulfillment, before caller
+postchecks. Body and reader cleanup share the first cancellation promise;
+requested cleanup joins at the RPC boundary before caller locks unwind, and
+pass teardown joins any remaining response. Reader ownership lasts through
+source settlement. RPC membership uses a separate async-local set, preserving
+the original mutable attempt context and clock. This adds no timer or authority.
+Shutdown closes pass
+admission, aborts those owned operations and joins actual settlement; a Git
+child is reaped before its lock is released. An HTTP request interrupted
+after send retains the existing uncertain outcome and request identity;
+shutdown invents no ACK, release or cleanup proof.
+
+This scope does not cancel foreground or run-lane preservation. Caller-owned
+cancellation, the graceful checkpoint/credential allowance and bounded
+imports keep their existing deadlines and joins. Process-level production
+image shutdown latency remains a separate maintainer acceptance check.
+
+After an ordinary guarded archive upload is accepted and read back from its
+authenticated journal, the runner also notifies a separate saved-evidence-only
+pass once its execution tail and exclusion have been released. Notification
+requires actual process, command, steering and auxiliary settlement; an
+executor replacement or new execution invalidates prior settlement receipts.
+Unconfirmed settlement, rejected uploads and shutdown suppress notification.
+This pass uses the existing FINAL and ACK proofs, admits no producer, charges
+no maintenance slot and adds no timer. Saved evidence remains available to the
+ordinary boot/live replay paths when notification is suppressed.
+
+### Terminal-producer delivery hold (issue #3031, 2026-10-20)
+
+The W0-H capture redesign and its dependent producer pipeline are not
+implemented in this delivery. The frozen design requires the clone's index
+identity and trailing checksum, pinned immediately after `add -A`, to remain
+unchanged before and after `commit` and through the post-capture proof.
+Trusted same-UID fixtures on Git 2.54.0 instead observed a legitimate
+cache-tree rebuild during commit, despite both `--no-optional-locks` and
+`GIT_OPTIONAL_LOCKS=0`. Dirty tracked/untracked, staged-only, unstaged and
+racy same-size cases all produced the expected single-parent commit and a
+clean worktree, but replaced the pinned index. In the ordinary dirty case,
+its size changed from 271 to 309 bytes and its `TREE` payload from 15 to 53
+bytes; inode and checksum changed while index entries stayed identical.
+The postcommit index remained stable through the later read-only checks.
+
+This is a material conflict with the required capture success path, not a
+capacity measurement or a protected over-cap success. Accepting a new
+postcommit pin or changing the capture commands needs an explicit contract
+revision. No such workaround, delta-transfer contract, producer freeze,
+archive handoff or durable producer rediscovery is shipped here. The
+composed resource gate remains unrun; capacity projections are unverified.
+Existing capture/transfer helpers and their tests remain in place.
+
+The intended W0-H proof hashes tracked and non-ignored untracked bytes,
+checks undeclared worktree/index differences and the exact final net delta,
+and retains in-clone, runner-UID, final-worktree `add -A` semantics. The
+stat-cache-only alternative was rejected because forged clean metadata can
+hide modified bytes. Conversion attributes remain a planned protected
+refusal. These are undelivered requirements, not guarantees of this release.
+
+The planned attempt-v1 lineage and table-v2 provenance writer are also
+undelivered. The maintenance table and HMAC stay at v1; no provenance write
+or initialization is added at attempt seeding. The accepted shortfall of
+the planned provenance scheme covers legacy/pre-upgrade or orphaned
+sources, canonical reseeds, adopted sources and seeds with unrecorded
+provenance: those categories have no new restart-preservation guarantee
+and retain their existing protected exits. The in-memory rediscovery aid,
+continuation phase table and boot/live materialization-order change remain
+unimplemented. No ledger history is translated, reset or exported.
+
+The existing dormant maintenance limits remain unchanged:
+
+| Dimension | Existing limit |
+|---|---|
+| Decoded bytes | Configured C, default 8 GiB, ceiling 64 GiB; 3 × C per cycle |
+| Slots and time | At most 3 × 120 s; 360 s aggregate; at least 180 s spacing; fixed 24 h eligibility window |
+| Closure/source entries | 65,536 each per slot |
+| Administrative entries | 4,096 per slot |
+| Source/artifact/metadata bytes | 256 MiB each per slot |
+| Sources / launches / RPC attempts | 128 / 512 / 32 per slot |
+| Discovery | 10 s, 32 MiB metadata, 4,096 administrative entries, 512 launches, 16 RPC attempts, 4 candidates |
+| Durable table / marker / index capacity | 16 MiB / 1 MiB / 4,096 entries |
+
+Existing authenticated ledger history is required for production allowance;
+missing, partial, tampered or wrong-key history grants none. Whole-root
+removal retains the existing first-initialization residual. This delivery
+adds no ledger backup/restore artifact or historical-reader format change,
+and does not expand ADR-1786 authority. Production-image/PVC and three-forge
+compose/k8s acceptance remain maintainer-owned and unperformed.
+
+### Terminal-producer hold validation (issue #3031, 2026-10-22)
+
+The current approved W0 P1 still pins the post-`add -A` index's device,
+inode, size, mtime, ctime and trailing checksum before and after commit and
+through P5. A fresh isolated reproduction on Git 2.54.0 with
+`--no-optional-locks` and `GIT_OPTIONAL_LOCKS=0`: ordinary add then commit
+changed index size from 174 to 193 bytes, replaced its inode, and changed
+the trailing checksum from `88f9ac4900f5211559744ad9f7bcfdc3493c11d1` to
+`2d4d8e449815a6fcd5b4e9fa951d903164e746ed`. The `ls-files --stage`
+entries were identical and status was clean. This independently reproduces
+the existing index conflict above on the merged candidate.
+
+There is also a content-policy conflict. W0 P3 replaces the old 64 MiB /
+16,384-entry envelope with frozen slot caps "with no hidden lower cap";
+W0 P4 requires `add -A` to commit the final worktree for all of T union U
+(tracked and non-ignored untracked paths). The current
+[requirements record](../specs/human.md) at line 755 prohibits WIP auto-save
+of core dumps and files over 8 MiB. The
+[WIP policy amendment](0759-protect-run-work-usage-limit-park.md#amendment-2026-10-21-issue-3239-the-wip-auto-save-refuses-core-dumps-and-oversized-files-and-vets-its-own-marker)
+explicitly includes `captureMaintenanceWip`.
+The [maintenance capture tests](../agent/test/git-maintenance-wip-capture.test.ts)
+at lines 271–317 preserve refusal before commit for new/changed oversized
+content and core files, success at exactly 8 MiB, and exemption for unchanged
+core/oversized content already in HEAD. The literal all-content/no-hidden-lower-cap
+contract conflicts with that policy.
+
+Under R3, disagreement with a higher source or an impossible required
+acceptance means finish independent work, introduce no workaround, and
+leave dependent milestones incomplete. Re-pinning after commit, weakening
+the identity proof, omitting protected content or hiding the 8 MiB refusal
+inside slot accounting would each change the contract. A material revision
+must explicitly reconcile P1/P5 with legitimate index replacement and
+P3/P4 with the core/8 MiB policy, then specify the revised acceptance and
+repeat the required reviews and gates. No such revision is approved here.
+
+The reachable changes are S (owned recovery-pass shutdown, including the
+response-handoff cleanup join) and N (saved-evidence replay notification).
+Scoped acceptance, regression and mutation results are recorded in the
+report below; frozen-gate and live acceptance remain separate. New-origin
+production remains disabled. W0, U4b, U4c, U4d, U5, F, M3 and M4 remain
+incomplete; MO is unperformed. No delta transfer, provenance P, boot/live
+ordering change or U5 delivery is claimed. Existing capture/transfer helpers
+and resource accounting stay unchanged. Ordinary LIVE/foreground test cases
+are retained case-for-case with controlled automatic-notification timing. The named accepted provenance shortfall and
+existing dormant limits above remain the boundary, not new guarantees.
+See the [delivery report](../docs/issue-3031-delivery.md) for the requirement
+map and outstanding evidence.
+
+### W0-H hash-attested maintenance WIP capture (issue #3349, 2026-10-23)
+
+This revision supersedes the W0 index-transition and content-policy
+conflicts recorded in the two subsections above, which stay as history. It
+changes `captureMaintenanceWip` only; its signature, result kinds and
+`status`/`add`/`commit` callbacks are unchanged.
+
+**Capture.** The capture runs in the clone as the runner UID. Afterwards
+clone HEAD is the capture commit W (single parent `sourceSha`) and the
+worktree is clean, so existing consumers use it unchanged.
+
+**Hash attestation.**
+- P1 proves the clone's own index (identity plus trailing checksum) and
+  lists the tracked set T. Unmerged entries, gitlinks, assume-unchanged
+  and skip-worktree flags refuse.
+- P2 reads the status and `diff-index --cached` manifest of declared
+  changes.
+- P3 hashes every path in T and the non-ignored untracked set in two stages,
+  a metadata census and then the payload, each reserved before it runs and
+  never refunded. Every tracked path's worktree oid must equal its index oid
+  unless the manifest declares it. An undeclared difference refuses; the stat
+  cache is never trusted.
+- The expected net delta E is every path whose worktree (mode, oid) differs
+  from its HEAD tuple, plus deletions. A manifest and staged set that cancel
+  to an empty E refuse protected, as before.
+
+**Plumbing commit.** Porcelain `commit` is no longer used. The capture runs
+`add -A`, `write-tree`, a pre-commit `diff-tree` proof that tree X equals E
+exactly, then `commit-tree` and `update-ref`. W has deterministic identity
+and dates (both the committer date of `sourceSha`), so identical content
+reproduces W. `update-ref` is a compare-and-swap on the plain branch ref and
+never writes `HEAD`; it refuses if the branch moved, writes no ref and
+leaves the competing tip. Before the swap a refusal leaves HEAD at
+`sourceSha`; after a successful swap a failed post-capture proof refuses
+with the source retained, and no ref is rolled back.
+
+**Index transitions (contract revision).** Exactly two index transitions are
+sanctioned, each pinned in the scope of the command that makes it: `add -A`
+and `write-tree` (Git rewrites the index there when its cache-tree is
+stale). The post-`write-tree` pin is the P5 reference, so the earlier
+requirement that P5 equal the post-`add` pin is replaced. Every interval
+between pins is checked; any other index change refuses with the source
+protected and no ref update.
+
+**Semantics and refusals.**
+- Final-worktree semantics as with `add -A`: staged intermediate content is
+  not preserved. Tracked-but-ignored paths stay in T and are captured.
+- A detached HEAD, or a branch ref that is itself symbolic, refuses.
+- `eol`, `ident` and `working-tree-encoding` conversions make the hashed and
+  staged oids disagree and refuse, at the latest at the tree proof.
+- A source commit whose committer date is outside the accepted canonical
+  form (leading-zero timestamp, `-0000`, or a zone outside ±14:59) refuses
+  in P0, before any commit-group launch. Independently, W's exact text is
+  proved before the branch CAS, so any header Git normalizes refuses with
+  the branch unmoved.
+- Two states the previous capture committed now refuse with the source
+  retained: a tracked file replaced by a directory (a census type change),
+  and an intent-to-add index entry (`git add -N`), which the strict index
+  and status cross-checks reject.
+
+**Content policy (resolves the earlier content-policy conflict).** The
+per-file policy of the [requirements record](../specs/human.md) and the
+[WIP policy amendment](0759-protect-run-work-usage-limit-park.md#amendment-2026-10-21-issue-3239-the-wip-auto-save-refuses-core-dumps-and-oversized-files-and-vets-its-own-marker)
+applies to the maintenance capture. A path in E whose basename matches the
+core pattern (`core`, `core.<digits>`), or whose new content exceeds 8 MiB,
+refuses the whole capture with the source retained. Exactly 8 MiB succeeds.
+A path whose current tuple equals its HEAD tuple (the staged old side if
+staged, else the index entry) is exempt, and a deletion never refuses. The
+capture never omits a file and claims complete coverage. This is the only
+cap lower than the frozen slot caps and applies in addition to them.
+
+**Accounting.** Slot limits are unchanged. Each Git launch charges one
+launch plus its actual output rows as `sourceEntries` and its output bytes
+as `metadataBytes`. The census and payload stages are reserved once and
+consumed, not re-reserved. Each index pin read charges `metadataBytes`
+equal to the index size. The caller's fresh observation pairs cost about 8
+`rpcAttempts` per capture (4 mutating dispatches), against the cap of 32.
+Representative measurement: see the delivery report.
+
+**Boundary.** The composed W0, U4b and archive capacity remains an unverified
+projection. The terminal producer guard stays off. U4b, U4c, U4d, U5, F, M3
+and M4 remain undelivered, and MO is unperformed.
 
 ### Server-owned backoff
 
@@ -189,7 +409,7 @@ cleanup serialization and message-cursor refresh.
 
 **Status**: Accepted (PRD #1392 M1-M4 committed on this branch).
 **Issue**: [vtmocanu/uzi#1392](https://github.com/vtmocanu/uzi/issues/1392)
-**PRD**: [prds/1392-forge-unreachable-preclone-park.md](../prds/1392-forge-unreachable-preclone-park.md)
+**PRD**: [prds/done/1392-forge-unreachable-preclone-park.md](../prds/done/1392-forge-unreachable-preclone-park.md)
 
 "Verified capture before a promotable park" above assumes a clone already
 exists to inspect, WIP-commit and fetch. That assumption does not hold for
@@ -490,3 +710,37 @@ was measured at roughly 1.5 GiB in October 2026; continued growth can eventually
 require another policy decision. Deadline, cancellation, archive and storage
 quota boundaries remain unchanged. The decoded cap still does not bound
 Git-internal decompression memory.
+
+## Amendment 2026-10-24, #3179: an event-free Claude stream is a recovery outcome
+
+The decision says that missing metrics and nonempty turns retain their existing
+outcomes. This amendment carves out one narrow additional recovery outcome: a
+Claude turn whose harness stream ends cleanly with no events at all and no
+terminal. Such a stream has no turn count, so it was never positively empty, and
+the implement loop folded it into a finished iteration, losing the plan, worker
+safety steer, first-turn content and held owner batch the attempt carried.
+
+An event-free attempt is now retried in process through the same bounded retry as
+the other outcomes (same retry count, backoff and cancel, idle and wall
+precedence), with the original prompt and callbacks:
+
+- The plan, the drained worker safety steer and the held owner batch are retained
+  for the retry. No new outer iteration begins. The owner inclusion receipt is
+  issued only once an attempt shows model-processing evidence.
+- The interrupted-calls note is re-sent only after an event-free attempt, and
+  mirrors exactly what the immediately preceding dispatch appended (including
+  nothing). An attempt that processed its prompt never has its note repeated.
+- The retry preserves the requested resumable session identity because the
+  event-free attempt reported no replacement identity.
+- Exhaustion throws the recovery park error with an event-free message and
+  `providerOrigin` false. Retry notices say the stream ended without any events;
+  they never claim zero turns or provider processing.
+- Plan phase: an event-free planning turn now retries and then parks, where it
+  previously ended as `REASON_NO_PLAN`. A planning turn with a terminal and no plan
+  is unchanged.
+
+Known boundaries. A stream that yields only init or rate-limit events and then
+ends is not covered. A park after exhausted retries does not carry the drained
+steer, as with the positively-empty path today. The Codex lane is out of scope.
+The evidence is a scripted executor reproduction; no real-provider occurrence has
+been observed. The ADR-1416 steering bridge is unchanged.

@@ -777,6 +777,61 @@ func TestGateRevisionRefusalCapLiveDB(t *testing.T) {
 	})
 }
 
+// Issue #3081: a refused report carrying expected_gate_revision answers ErrStaleRevisionSource
+// but is still charged against RUN_GATE_REFUSAL_MAX, once per claim generation.
+func TestGateRevisionRefusalCapExpectedRevisionLiveDB(t *testing.T) {
+	historicalRun := func(g *gateFix) (uuid.UUID, *uuid.UUID) {
+		run := g.newRun("issue")
+		a := uid()
+		g.mustPublish(run, gateReq(i64(1), a), 1)
+		g.mustPublish(run, gateReq(i64(1), uid()), 2)
+		return run, a
+	}
+	recovery := func(gen int64, a *uuid.UUID) StateRequest {
+		req := gateReq(&gen, a)
+		req.ExpectedGateRevision = i64(2)
+		return req
+	}
+
+	t.Run("charged per claim generation and fails the run past the cap", func(t *testing.T) {
+		f := newGateFix(t, 1)
+		run, a := historicalRun(f)
+		for i := 0; i < 2; i++ {
+			if _, applied, _, err := f.report(run, recovery(1, a)); !errors.Is(err, ErrStaleRevisionSource) || applied {
+				t.Fatalf("claim 1 refusal %d = (applied %v, err %v)", i, applied, err)
+			}
+			if r := f.row(run); r.refusals != 1 || r.refusalGen == nil || *r.refusalGen != 1 || r.status != "awaiting_approval" {
+				t.Fatalf("claim 1 refusal %d: count %d gen %v status %s", i, r.refusals, r.refusalGen, r.status)
+			}
+		}
+		gen := f.reclaim(run)
+		got, applied, _, err := f.report(run, recovery(gen, a))
+		if !errors.Is(err, ErrStaleRevisionSource) || applied || got.Status != "failed" {
+			t.Fatalf("cap refusal = (status %q, applied %v, err %v)", got.Status, applied, err)
+		}
+		r := f.row(run)
+		const wantReason = "the plan gate could not be re-presented: a historical presentation refused across 2 claims"
+		if r.status != "failed" || r.failOrigin == nil || *r.failOrigin != "gate_presentation_refused" ||
+			r.failureReason == nil || *r.failureReason != wantReason || r.refusals != 2 {
+			t.Fatalf("cap failure row = status %s origin %v reason %v count %d", r.status, r.failOrigin, r.failureReason, r.refusals)
+		}
+	})
+
+	t.Run("unlimited when the cap is 0", func(t *testing.T) {
+		g := newGateFix(t, 0)
+		run, a := historicalRun(g)
+		for i := 0; i < 4; i++ {
+			gen := g.reclaim(run)
+			if _, _, _, err := g.report(run, recovery(gen, a)); !errors.Is(err, ErrStaleRevisionSource) {
+				t.Fatal(err)
+			}
+		}
+		if r := g.row(run); r.status != "awaiting_approval" || r.refusals != 4 {
+			t.Fatalf("cap 0 = %+v, want never failed", r)
+		}
+	})
+}
+
 func TestGateRevisionRefusalFencingLiveDB(t *testing.T) {
 	f := newGateFix(t, 1)
 

@@ -5,7 +5,7 @@ UX, landed in `9e3e7362`, before this ADR); M7 (integration proof and hosted
 acceptance handoff) is still pending, ahead of merge/feature acceptance.
 **Date**: 2026-09-13
 **Issue**: [vtmocanu/uzi#1296](https://github.com/vtmocanu/uzi/issues/1296)
-**PRD**: [prds/1296-durable-run-recovery.md](../prds/1296-durable-run-recovery.md) — carries
+**PRD**: [prds/done/1296-durable-run-recovery.md](../prds/done/1296-durable-run-recovery.md) — carries
 the full Decision Log (D1-D9), the milestone breakdown and the verified code anchors; this
 ADR restates the invariants a future edit to a claim clause, a custody-release path or a
 cleanup guard must not silently break.
@@ -239,7 +239,7 @@ not an implicit consequence of either existing one.
 proof and this documentation update) is in progress; M8 (hosted-k8s acceptance and
 release) is maintainer-owned and **not shipped** in this work.
 **Issue**: [vtmocanu/uzi#1349](https://github.com/vtmocanu/uzi/issues/1349)
-**PRD**: [prds/1349-recovery-custody-hardening.md](../prds/1349-recovery-custody-hardening.md) —
+**PRD**: [prds/done/1349-recovery-custody-hardening.md](../prds/done/1349-recovery-custody-hardening.md) —
 carries the full Decision Log (D1-D12), the milestone breakdown and the verified code anchors.
 
 The decisions above stand unchanged — the two-record model, the two-lifetime FK model, the
@@ -394,7 +394,7 @@ context. Clearing below the limit closes the episode; a later crossing can notif
 
 **Status**: Accepted (PRD #1392 M1-M4 committed on this branch).
 **Issue**: [vtmocanu/uzi#1392](https://github.com/vtmocanu/uzi/issues/1392)
-**PRD**: [prds/1392-forge-unreachable-preclone-park.md](../prds/1392-forge-unreachable-preclone-park.md)
+**PRD**: [prds/done/1392-forge-unreachable-preclone-park.md](../prds/done/1392-forge-unreachable-preclone-park.md)
 
 D2 above (as amended by PRD #1349) permits a hold to leave `open` only on one of four kinds of
 durable evidence: publication, an available archive, a fresh-forge no-output proof, or an owner

@@ -8,6 +8,7 @@ import { EventEmitter } from "node:events";
 import { attemptGeneration, formatAttemptId } from "../src/attempt-path.js";
 import {
   GitCache,
+  RECOVERY_BUNDLE_REF,
   RETAINED_MAX_DESCRIPTORS,
   type AttemptLedgerState,
   type AttemptSeedOptions,
@@ -789,6 +790,21 @@ describe("verifyStoppedSourceCovered", () => {
     commitOffBranch(a, head, "refs/tags/release", "release.txt");
     gitIn(bare, ["fetch", "-q", "--", a.path, "refs/tags/release:refs/tags/release"]);
     assert.equal(await verify(a, head), "covered");
+  });
+
+  it("does not count a stale transient recovered-source ref as holding a clone side ref", { skip: LINUX_ONLY }, async () => {
+    const { a, head } = await captured();
+    // The head anchor is legitimately held (owned runner ref and owed pin) before and after the plant.
+    assert.equal(await verify(a, head), "covered", "control: the head anchor is valid");
+    const side = commitOffBranch(a, head, "refs/heads/side", "side.txt");
+    // An aborted bundle pass can leave this ref in the persistent bare; it only retains objects.
+    gitIn(bare, ["fetch", "-q", "--", a.path, `refs/heads/side:${RECOVERY_BUNDLE_REF}`]);
+    assert.equal(gitIn(bare, ["rev-parse", RECOVERY_BUNDLE_REF]), side);
+    assert.equal(gitIn(a.path, ["status", "--porcelain"]), "");
+    assert.equal(await verify(a, head), "not_covered", "the side commit is reachable only via the stale transient ref");
+    gitIn(bare, ["update-ref", "-d", RECOVERY_BUNDLE_REF]);
+    gitIn(bare, ["fetch", "-q", "--", a.path, "refs/heads/side:refs/remotes/origin/side"]);
+    assert.equal(await verify(a, head), "covered", "control: a real bare ref holding the same commit still covers it");
   });
 
   it("is not covered when a commit exists only under refs/remotes/ in the clone", async () => {

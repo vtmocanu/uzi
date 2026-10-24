@@ -6,13 +6,13 @@ import (
 	"compress/flate"
 	"context"
 	"errors"
+	"fmt"
 	"github.com/vtmocanu/uzi/api/internal/termsafe"
 	"io"
 	"math"
 	"path"
 	"strconv"
 	"strings"
-	"unicode"
 	"unicode/utf8"
 )
 
@@ -176,14 +176,14 @@ func (c *Collector) Add(ctx context.Context, artifactID, artifactName string, zi
 		if reason == "" {
 			paths[normalized] = true
 		}
-		if reason == "" && (!utf8.Valid(data) || bytes.IndexByte(data, 0) >= 0 || bytes.ContainsFunc(data, func(r rune) bool { return unicode.IsControl(r) && r != '\n' && r != '\r' && r != '\t' })) {
+		if reason == "" && (!utf8.Valid(data) || bytes.IndexByte(data, 0) >= 0) {
 			reason = "binary"
 		}
 		if reason == "" && len(data) == 0 {
 			reason = "empty"
 		}
 		if reason == "" {
-			data = []byte(c.scrub(string(data)))
+			data = []byte(c.scrub(normalizeText(string(data))))
 			if !utf8.Valid(data) || bytes.IndexByte(data, 0) >= 0 {
 				reason = "binary"
 			}
@@ -385,4 +385,45 @@ func unquoteMetadata(q string) string {
 	// strconv.Unquote is used in artifacts.go's display contract too.
 	s, _ = strconv.Unquote(q)
 	return s
+}
+
+// normalizeText makes valid UTF-8 text inert before it is scrubbed, hashed and counted:
+// complete ANSI CSI sequences (terminal colour codes) are dropped so a coloured log stays
+// readable, and every other termsafe.Unsafe rune except \n, \r and \t becomes a visible
+// \u{XXXX} escape, so no raw control or format rune reaches the repair run.
+func normalizeText(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		if n := csiLen(s[i:]); n > 0 {
+			i += n
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r != '\n' && r != '\r' && r != '\t' && termsafe.Unsafe(r) {
+			fmt.Fprintf(&b, `\u{%04X}`, r)
+		} else {
+			b.WriteString(s[i : i+size])
+		}
+		i += size
+	}
+	return b.String()
+}
+
+// csiLen is the byte length of the complete ECMA-48 CSI sequence at the start of s
+// (ESC '[', parameter bytes, intermediate bytes, one final byte), or 0 when there is none.
+func csiLen(s string) int {
+	if len(s) < 3 || s[0] != 0x1b || s[1] != '[' {
+		return 0
+	}
+	i := 2
+	for i < len(s) && s[i] >= 0x30 && s[i] <= 0x3f {
+		i++
+	}
+	for i < len(s) && s[i] >= 0x20 && s[i] <= 0x2f {
+		i++
+	}
+	if i < len(s) && s[i] >= 0x40 && s[i] <= 0x7e {
+		return i + 1
+	}
+	return 0
 }

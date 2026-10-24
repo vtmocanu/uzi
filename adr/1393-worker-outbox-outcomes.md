@@ -4,7 +4,7 @@
 acceptance is the maintainer's, out of band).
 **Date**: 2026-09-17
 **Issue**: [vtmocanu/uzi#1393](https://github.com/vtmocanu/uzi/issues/1393)
-**PRD**: [prds/1391-worker-outbox-durable-reports.md](../prds/1391-worker-outbox-durable-reports.md) —
+**PRD**: [prds/done/1391-worker-outbox-durable-reports.md](../prds/done/1391-worker-outbox-durable-reports.md) —
 carries the full Decision Log (D1-D13), the two-issue split (Run A #1391 ships the message
 outbox; Run B #1393, this ADR, ships write-ahead terminal reports, the api fence and claim
 protection) and the verified code anchors; this ADR carries only the seams other code must

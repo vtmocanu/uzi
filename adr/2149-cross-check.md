@@ -89,7 +89,37 @@ of the reported production timings.
 
 ## Planning-diff capture: symlinks, gitlinks and budgets (2026-10-07, #2410)
 
-Capture budgets are split: the object-store snapshot copy has its own 128 MiB budget, streamed in 16 KiB chunks that yield on a roughly 20 ms clock so SIGTERM cleanup runs inside the 2 s kill grace, and the source reads (worktree compares and verified object reads) keep a separate 128 MiB budget. Measured once during #2410 on a clone of this repository at 24f28b1d through a real TickSpawner: snapshot 74.3 MiB, source 99.7 MiB (about 78% of its budget, the tighter headroom), peak temporary tree near 74.3 MiB, wall 6.6 s against the 28 s deadline.
+#3338 replaces the object-store snapshot copy and its budget with direct reads from the explicit worker-held bare repository. `capturePlanningDiff` receives that authority from the worker; the command-identity helper reads base objects only from its pinned object directory, never from the clone's object store or configuration. Git runs in neutral private scratch, excluding clone configuration and replacement refs, with hooks and transports disabled and neutral attributes suppressing filters and text conversion. Bare `alternates` and `http-alternates` are rejected, including before each object query. Required objects are checked for type, size and content hash; missing or detectably corrupt required objects yield `base_unavailable`. Other Git failures, including a concurrent repack race, may yield diagnostic `git_refused` (`diff_failed`). Capture takes no long-lived bare lock.
+
+The immutable base commit/tree walk supplies the baselines below. One batched sizing query over its blob identities validates ordered object ids, blob types and sizes, with independently derived input/output pipe bounds and checked arithmetic. Duplicate blob ids may share a query record, but each path occurrence contributes credit. Observed current-file/link bytes must agree with the credited size before an unchanged-hash return; fetched before-images must also agree. Clone inputs, including index metadata, grant no credit. A prior agent commit recovered into the worker bare is an eligible base; this authority is not restricted to forge-origin commits.
+
+| Baseline | Definition |
+|---|---|
+| B | Sum of base blob sizes per leaf path, including duplicate blob ids at different paths. |
+| C | Verified commit and tree bytes read during discovery, including repeated tree occurrences. |
+| N | Base leaf-path count. |
+| D | Base directory occurrences, including the root. |
+| E | Base entry occurrences, excluding the checkout's root `.git` entry. |
+| I | Canonical v2/v3 padded index size: 32 header/checksum bytes plus each base leaf's 8-byte-padded entry (63 bytes plus full relative UTF-8 path bytes). |
+| G | Base regular `.gitignore` bytes per path; symlink ignores contribute no credit. |
+| Q | Full relative UTF-8 path bytes for each base entry, plus a slash for directories and a NUL per record. |
+
+After discovery, independent clone counters start at zero except source reads, which start at C:
+
+| Counter | Bound |
+|---|---|
+| Source reads: current worktree bytes and verified before-images | B + C + 128 MiB. Clean or deleted paths fit within base credit; changed paths charge roughly their new size against the allowance, in addition to their base before-image. |
+| Index bytes / index entries | I + 2 MiB / N + 20,000. |
+| Union of base/index paths and final comparison candidates | N + 20,000. |
+| Walk entries / directories | E + 1 root `.git` + 30,000 / D + 2,048. |
+| Ignore/exclude reads, outside the source counter | G + 128 MiB. |
+| Cumulative ignore-query input / output | Q + 2 MiB each, independently. |
+
+Base discovery has per-object, depth and deadline bounds, with no aggregate base cap or cache. No additional absolute ceiling is imposed on the base-relative totals. The sizing query does not extend the deadlines. Current regular files are read completely through pinned descriptors with `O_NOFOLLOW`; a clean-looking index stat is no shortcut. Per-file reads remain capped at 4 MiB, commit/tree objects at 2 MiB each, depth at 64, each ignore/exclude read at 64 KiB, patch/output at 512 KiB, and non-ignored untracked files at 200. The helper retains its 28 s deadline, the outer capture its 30 s deadline, and individual Git commands at most 5 s within the helper deadline. Discovery, walks, comparisons and chunked reads yield on a roughly 20 ms clock so cancellation can run cleanup within the production 2 s SIGTERM kill grace.
+
+There is no object-store snapshot or snapshot budget. The `snapshot_cap` refusal token remains for persisted compatibility, not as an active budget. The #2410 timing at 24f28b1d was a single historical snapshot-implementation sample, not a benchmark of this implementation. Existing `selfContained` switches remain in place. Under split UIDs the helper can read the bare but cannot write it; single-UID operation retains the accepted lack of OS write isolation. This adds no provider-command or model grants.
+
+Hosted post-merge acceptance remains maintainer-owned and unverified here: measure clean HEAD capture including base sizing and report the sample count (one sample is not a p95); verify bare read/write posture on Docker and kube-native workers; and observe an auto-approved scheduled run proceeding without a gate. Capture refusal retains the existing human fallback.
 
 Symlink posture: an unchanged tracked symlink is accepted by hashing its raw target against the base blob through a pinned parent descriptor; targets are never opened or followed. Added, removed, retargeted, file/link-swapped and untracked non-ignored symlinks refuse with `unsupported_entry`, and a symlinked `.gitignore` is treated as absent, as Git does.
 
@@ -145,7 +175,7 @@ Every Claude `cross_check` claim takes the lead lock before the child lock, incl
 
 ### Not shipped
 
-Code cross-check was out of scope here and is now implemented by #2170 (see [PRD #2170](../prds/2170-code-cross-check.md) and [Cross-check](../docs/cross-check.md#code-cross-check)). A Claude child claims through the dedicated cross-check lane of #2169 like a Codex child (a legacy plan-stage run slot only during a mixed-image roll), and additionally needs `cross_check_codex_lead_v1`. Hosted authenticated Claude model acceptance is not proven by local tests.
+Code cross-check was out of scope here and is now implemented by #2170 (see [PRD #2170](../prds/done/2170-code-cross-check.md) and [Cross-check](../docs/cross-check.md#code-cross-check)). A Claude child claims through the dedicated cross-check lane of #2169 like a Codex child (a legacy plan-stage run slot only during a mixed-image roll), and additionally needs `cross_check_codex_lead_v1`. Hosted authenticated Claude model acceptance is not proven by local tests.
 
 ## Default and plan prompt amendment (2026-10-17, #3091)
 
@@ -200,7 +230,7 @@ and acceptance limits above remain historical records.
 
 ## #1230 coverage-park and semantic digest amendment (2026-10-20)
 
-This amendment records the dormant [PRD #1230](../prds/1230-semantic-completion-contract.md) M4 additions to the plan gate. Everything in it is reachable only through a run with a `semantic_planning` enrollment; production enrollment is off until #1231, no production code writes one, and only tests inject the path. The structural and legacy meanings of the sections above are unchanged. Nothing here is hosted-acceptance proof.
+This amendment records the dormant [PRD #1230](../prds/done/1230-semantic-completion-contract.md) M4 additions to the plan gate. Everything in it is reachable only through a run with a `semantic_planning` enrollment; production enrollment is off until #1231, no production code writes one, and only tests inject the path. The structural and legacy meanings of the sections above are unchanged. Nothing here is hosted-acceptance proof.
 
 ### The `semantic_v1` candidate digest
 
@@ -225,3 +255,63 @@ Consistent with D16, a human revision of the plan triggers no new cross-family c
 ### Coverage transport limitation
 
 Production coverage review reaches no model today: see the [coverage transport limitation](1225-structural-completion-interlock-invariants.md#coverage-transport-limitation) in ADR-1225. Until #1231 establishes enforceable bounds, a production call would settle as coverage-unavailable (`semantic_park: coverage_unavailable`) rather than reach a model.
+
+## Advisory plan coverage amendment (2026-10-23, #3334 / #3168 M1)
+
+This amendment records [PRD #3168](../prds/3168-plan-cross-check-coverage.md)
+M1's advisory coverage contract, implemented through child #3334. It narrows
+the universal missing-disposition REVISE rule in the 2026-10-17 amendment for
+coverage notes; defect disposition rules remain. It does not activate the
+dormant semantic coverage profile above.
+
+The shared `crossCheckBrief` asks both checker families to enumerate
+requirements and acceptance criteria from the supplied issue snapshot and
+repository PRDs linked by the issue. Existing read/search tools, deadlines
+and limits apply; issue comments are not supplied, and no URL fetching or new
+tool access is added. Omitted or partly covered requirements use warning with
+the mandatory summary prefix `Requirement gap:`. Requirements verifiable only
+on hosted, live or maintainer-only surfaces use info with `Coverage uncertainty:`.
+Every coverage item uses one of these prefixes; defects never use either.
+Missing, external, unreadable or oversized sources receive a summary
+`Coverage uncertainty:` note and are never reported as covered. No defect
+found does not mean requirement covered.
+
+Coverage alone never justifies REVISE or BLOCK, including a missing or declined
+prior coverage disposition. An omitted requirement stated by the issue as a
+safety, security or data-integrity constraint remains an error defect, with no
+coverage prefix, requiring REVISE under existing defect rules. Missing or
+incomplete defect dispositions still call for REVISE, never BLOCK solely for
+that omission; a supported decline cannot waive a mandatory defect requirement.
+Defects come first within the existing 20-item cap. Coverage fills spare space;
+overflow is counted in the summary as `N coverage notes omitted`. Coverage
+items and the omitted count never displace a defect.
+
+The runner passes approving findings to both lead executors.
+`renderPlanApprovalAdvice` in `agent/src/prompt.ts` delivers every item,
+including noncoverage warning/info, plus the complete bounded summary,
+including summary-only findings. Absent/null findings or an empty summary
+with no items leave implementation-prompt bytes unchanged. Approval and
+automatic revision advice share nonce fencing, with eight nonce attempts and
+entity escaping on exhaustion. The fenced text is untrusted, non-gating advice:
+verify against issue, code and uzi rules, decline conflicts with reasons, and
+retain existing permissions and constraints. The approved canonical plan
+remains authoritative. An omitted requirement may be implemented only within
+the issue's stated scope and must be named in the PR description. Code
+cross-check reviews the implementation when enabled; scope, permissions and
+canonical authority apply independently.
+
+No additional gate, re-plan or revision round is required. There is no new
+wire/API/schema field, capability or persistence. Advice is worker-local and
+lost on reclaim; the dormant semantic human-gate path drops it when it drops
+`checkedApproval`. Mixed workers retain that boundary: old leads discard
+approving findings, old checkers supply no new coverage account, and new leads
+render received findings. These are instruction and delivery contracts, not
+behavioral convergence guarantees. Code-stage revision prompt bytes stay
+unchanged.
+
+Instruction-contract tests and captured provider requests verify guidance and
+both-executor delivery; they do not prove model behavior. Fixed-nonce goldens
+pin unchanged code-stage revision prompts. Required validation and its observed
+results are tracked in PRD #3168's M1 progress section. Child #3334 requires no
+maintainer replay; parent #3168 remains open for M2. No live model convergence,
+cost or latency measurement is claimed.

@@ -78,11 +78,12 @@ limits. Final composed-lane timing and real-cgroup calibration remain M5b work.
 Before execution, the locked TypeScript parser derives the leaf inventory from
 the current source. The four ownership/cleanup files must each contain their
 recognized UID gate and at least one leaf. The fifth file,
-`agent/test/git-planning-diff.test.ts`, contributes exactly nine literal leaves
-inside the exact `Unit2 runner source capture` suite: two snapshot-copy
-cancellation leaves and seven symlink capture/refusal leaves. The suite itself
-is not targeted: generated titles, the command sandbox leaf, other capture
-leaves and the bounded stdout suite stay excluded. Missing or changed required
+`agent/test/git-planning-diff.test.ts`, contributes exactly twelve literal leaves
+inside the exact `Unit2 runner source capture` suite: two worktree cancellation
+leaves, seven symlink capture/refusal leaves, two trusted-bare read proofs under
+distinct worker/runner UIDs, and the enforced read-only command sandbox leaf.
+The suite itself is not targeted: generated titles, other capture leaves and
+the bounded stdout suite stay excluded. Missing or changed required
 titles, nonliteral replacements and duplicate identities fail closed. Targeted
 tests must use literal titles and static `it` / `describe` declarations. The command
 inventory also recognizes explicit `test(...)` in the `.mts` fixture and requires
@@ -208,7 +209,7 @@ The required task runs the scoped typecheck and inventory regression through
 
 Selection uses escaped, anchored full leaf names from that inventory. Any extra
 executed leaf fails; unrelated leaves may only be absent or skipped. The normal
-host shards continue to own the other tests in these files. This nine-leaf
+host shards continue to own the other tests in these files. This twelve-leaf
 selection proves only the selected capture behavior under the worker UID;
 acceptance of the full capture suite remains a separate full-capture run.
 
@@ -270,6 +271,16 @@ remain in failed reports; reader unavailability does not erase known event evide
 No raw records are discarded. Host-aborted unknown metadata is null.
 The positive checker independently verifies these fields from raw evidence and
 still requires stable OOM counters across every raw record.
+
+Guard-facing PSI is controlled on these hard-path legs; memory charges and crossing
+evidence remain measured. The monitor hands the production guard a copy of each
+measured sample whose `memory.pressure` totals and averages are pinned to the first
+load sample's, so the guard's early-PSI branch cannot drain the load before a sample
+reaches the hard threshold. `guardPressure` records the pin (mode
+`pinned_to_first_load_sample`, the source `sampleId` and its PSI); the checker requires
+it and binds it to the first load sample's raw-verified PSI. `samples` and `rawSamples`
+keep the unmodified reads, and the sampled hard crossing stays mandatory. Early-PSI
+coverage lives in `agent/test/worker-memory-guard.test.ts`.
 
 The version-1 derivation attributes every adjacent periodic sample pair by real
 sample IDs, signed raw byte delta, completion interval, positive byte/ms rate and

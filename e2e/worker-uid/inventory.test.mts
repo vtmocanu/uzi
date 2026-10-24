@@ -10,6 +10,45 @@ const repo = fileURLToPath(new URL("../../", import.meta.url));
 const require = createRequire(path.join(repo, "agent/package.json"));
 const { API } = await import(pathToFileURL(require.resolve("typescript/unstable/sync")).href);
 const { inventoryForSource } = await import(new URL("./inventory.mjs", import.meta.url).href);
+test("capture inventory requires the cancellation, trusted bare and sandbox proofs", () => {
+  const captureFile = "agent/test/git-planning-diff.test.ts";
+  const source = readFileSync(path.join(repo, captureFile), "utf8");
+  const required = [
+    "cancels during worktree comparisons and leaves no temp tree",
+    "cancels while many tiny worktree entries are walked and leaves no temp tree",
+    "reads loose trusted bare objects as the real runner uid without write authority",
+    "reads packed trusted bare objects as the real runner uid without write authority",
+    "captures under the enforced required command sandbox",
+  ];
+  mkdirSync(path.join(repo, ".uzi/scratch"), { recursive: true });
+  const scratch = mkdtempSync(path.join(repo, ".uzi/scratch/capture-inventory."));
+  const api = new API({ cwd: scratch });
+  try {
+    const fixtures = [{ name: "actual", source, error: false }];
+    for (let i = 0; i < required.length; i++) {
+      const title = JSON.stringify(required[i]);
+      assert.ok(source.includes(title));
+      fixtures.push({ name: "renamed-" + i, source: source.replace(title, JSON.stringify(required[i] + " changed")), error: true });
+      fixtures.push({ name: "nonliteral-" + i, source: source.replace(title, title + ' + ""'), error: true });
+    }
+    writeFileSync(path.join(scratch, "tsconfig.json"), JSON.stringify({ files: fixtures.map(f => f.name + ".mts") }));
+    for (const fixture of fixtures) writeFileSync(path.join(scratch, fixture.name + ".mts"), fixture.source);
+    const program = api.updateSnapshot({ openProjects: [path.join(scratch, "tsconfig.json")] }).getProjects()[0].program;
+    for (const fixture of fixtures) {
+      const collect = () => inventoryForSource(program.getSourceFile(path.join(scratch, fixture.name + ".mts")), "git-planning-diff");
+      if (fixture.error) assert.throws(collect, /missing required literal capture leaf/, fixture.name);
+      else {
+        const leaves = collect();
+        assert.equal(leaves.length, 12);
+        for (const title of required) assert.ok(leaves.some((leaf: { names: string[] }) => leaf.names[1] === title), title);
+      }
+    }
+  } finally {
+    api.close();
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
 const title = "real adopted detached tree: eligibility, identity refusal, concurrent cleanup and exact pressure failure";
 const realTitle = "real supervisor observation fixtures execute under the command UID";
 const file = "e2e/worker-uid/memory-command-real.test.mts";

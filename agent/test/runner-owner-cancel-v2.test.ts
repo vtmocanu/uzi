@@ -8,7 +8,7 @@ import type { Executor } from "../src/executor.js";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import { api, client, fakeGitlab, git, gitlabClaim, installHarness, runner } from "./runner-harness.js";
 import {
-  HELD_LINUX_ONLY, JOIN_TOKEN, command, commit, frozenRecords, heldServer, packObjects,
+  HELD_LINUX_ONLY, JOIN_TOKEN, command, commit, deferTerminalEvidence, frozenRecords, heldServer, packObjects,
   recoveryOf, skipCheckpoints, watchFreezes,
 } from "./runner-held-publication-fixture.js";
 
@@ -170,6 +170,8 @@ for (const scenario of ["wallpark", "wallpark-healthy", "wallpark-probe", "clari
       return out;
     };
     const capture = mock.method(recoveryOf(r), "captureAndUpload");
+    // Keep the explicit foreground/cancellation proof ahead of automatic saved-evidence replay.
+    deferTerminalEvidence(r, t);
     await r.execute(claim);
     if (wallpark) assert.deepEqual(cancelAdmissions, [{ capturePending: false, boundaryPending: false }],
       "exactly one independent cancellation producer starts after the prior scope fully returns");

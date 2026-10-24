@@ -381,3 +381,39 @@ describe("produceRecoveryBundle — leakage & size bounds (PRD #1296 D5/D6)", ()
     );
   });
 });
+
+describe("produceRecoveryBundle — transient ref after a recovery abort (#3031 S)", () => {
+  it("an aborted pass may leave the transient ref; a later successful bundle replaces and deletes it", async t => {
+    const controller = new AbortController();
+    const owner = cache as unknown as { streamBundleWithCap: (...args: unknown[]) => Promise<void> };
+    const mocked = t.mock.method(owner, "streamBundleWithCap", async () => {
+      // The ref exists at bundle-create time; abort the recovery signal here.
+      controller.abort(new Error("recovery shutdown"));
+      throw new Error("bundle create interrupted");
+    });
+    await assert.rejects(() => cache.produceRecoveryBundle(topo.workerBare, {
+      sourceSha: topo.headSha, outPath: path.join(topo.base, "aborted.bundle"), forgeTip: topo.baseSha,
+    }, controller.signal));
+    mocked.mock.restore();
+    // The accepted limitation: the aborted pass honoured its fence, so the ref may remain.
+    const left = git(topo.workerBare, ["for-each-ref", "--format=%(objectname)", RECOVERY_BUNDLE_REF]);
+    assert.ok(left === "" || left === topo.headSha);
+
+    // A different H2 (child of H) on the same bare.
+    git(topo.workDir, ["checkout", topo.branch]);
+    fs.writeFileSync(path.join(topo.workDir, "second.txt"), "second\n");
+    git(topo.workDir, ["add", "."]);
+    git(topo.workDir, ["commit", "-m", "feat: second"]);
+    const h2 = git(topo.workDir, ["rev-parse", "HEAD"]);
+    git(topo.workDir, ["push", "worker", `${topo.branch}:${topo.branch}`]);
+    const outPath = path.join(topo.base, "second.bundle");
+    const result = await cache.produceRecoveryBundle(topo.workerBare, {
+      sourceSha: h2, outPath, forgeTip: topo.baseSha,
+    });
+    assert.equal(result.sourceSha, h2);
+    const heads = git(topo.base, ["bundle", "list-heads", outPath]).split("\n").filter(Boolean);
+    assert.deepEqual(heads, [`${h2} ${RECOVERY_BUNDLE_REF}`], "the bundle's single ref points at H2");
+    assert.equal(git(topo.workerBare, ["for-each-ref", "--format=%(refname)", RECOVERY_BUNDLE_REF]), "",
+      "no transient ref remains after the successful pass");
+  });
+});

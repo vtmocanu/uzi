@@ -3,7 +3,7 @@
 **Status**: Accepted; maintainer hosted verification remains open
 **Date**: 2026-10-12
 **Deciders**: approved issue #1470 plan, PRD Decision Log 1–17
-**Related**: [PRD #1470](../prds/1470-paced-hosted-worker-rolls.md), [ADR-422](0422-decouple-worker-version.md), [ADR-1720](1720-agent-runtime-base.md), [ADR-1759](1759-dind-data-metering-and-prune.md)
+**Related**: [PRD #1470](../prds/done/1470-paced-hosted-worker-rolls.md), [ADR-422](0422-decouple-worker-version.md), [ADR-1720](1720-agent-runtime-base.md), [ADR-1759](1759-dind-data-metering-and-prune.md)
 
 ## Context
 

@@ -4,7 +4,7 @@
 **Date**: 2026-09-27
 **Deciders**: architect (design), team lead. Reviewed with the Codex peer (3 rounds).
 **Issue**: GitHub issue [vtmocanu/uzi#1795](https://github.com/vtmocanu/uzi/issues/1795).
-PRD: `prds/1795-gate-revision-bound-verdicts.md` (Decision Log carries the amendments cited
+PRD: `prds/done/1795-gate-revision-bound-verdicts.md` (Decision Log carries the amendments cited
 below).
 **Related**: builds on the plan-revision loop and gate epochs of PRD #41
 (`prds/done/41-plan-revision-gate.md`), the replayable verdict receipts and
@@ -23,10 +23,15 @@ change before the write.
 The negotiated `plan_revision_retry_v1` contract compares
 `expected_gate_revision`, claim generation and unreleased ownership under the
 same run-row lock as recovered publication, predecessor supersession or terminal
-rejection. A stale source cannot mutate a newer plan, settle its inputs, grant
-approval or consume a generic presentation
-refusal budget. Cancellation retains its epoch-exempt owner-stop behavior and
+rejection. A stale source cannot mutate a newer plan, settle its inputs or grant
+approval. Cancellation retains its epoch-exempt owner-stop behavior and
 claim-generation/release fences.
+
+Presentation refusals carrying `expected_gate_revision` count once per claim
+generation toward the presentation refusal budget, even when that revision is
+stale (#3081). Accounting commits before returning `ErrStaleRevisionSource`.
+Source mismatches without a presentation refusal remain uncharged; ownership,
+generation and released-claim fences remain authoritative.
 
 Recognize an identical current presentation and payload with the same committed
 receipt set after validating ownership and claim authority: its first accepted

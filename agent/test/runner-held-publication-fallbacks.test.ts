@@ -1,4 +1,4 @@
-import { describe, it, mock } from "node:test";
+import { describe, it, mock, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -8,7 +8,7 @@ import type { HeldPublishResult } from "../src/client.js";
 import { fakeGitHub, fakeGitlab, fx, git, gitlabClaim, installHarness, runner } from "./runner-harness.js";
 import {
   HELD_LINUX_ONLY, JOIN_TOKEN, PUBLICATION_ID, SERVER_CAPTURE_ID, assertCustodyRetained, badRequest, bare, command, commit,
-  failedStates, failingWork, frozenRecords, heldServer, patShaped, pinRef, redrive, retained, skipCheckpoints,
+  deferTerminalEvidence, failedStates, failingWork, frozenRecords, heldServer, patShaped, pinRef, redrive, retained, skipCheckpoints,
   watchFreezes, type FinalCall, type HeldCall, type HeldServer, type Work,
 } from "./runner-held-publication-fixture.js";
 
@@ -26,7 +26,7 @@ interface Scenario {
 }
 
 let nextIid = 2600;
-async function scenario(opts: {
+async function scenario(t: TestContext, opts: {
   setup?: (s: Scenario) => void | Promise<void>;
   extra?: (ctx: RunContext) => Promise<void> | void;
   features?: readonly string[];
@@ -41,6 +41,7 @@ async function scenario(opts: {
   const work: Partial<Work> = {};
   const r = runner(failingWork(work, opts.extra, opts.failWith), gitlab, JOIN_TOKEN, { checkpointIntervalMs: 1, ...opts.runnerOptions });
   await opts.setup?.({ claim, server, work, r });
+  deferTerminalEvidence(r, t);
   await r.execute(claim);
   return { claim, server, work, r };
 }
@@ -89,9 +90,9 @@ async function assertArchived(s: Scenario, label: string, expectedHeldCalls: num
 }
 
 describe("held publication falls back to the archive", () => {
-  it("a new WIP secret is never uploaded and is remembered as flagged", { skip: HELD_LINUX_ONLY }, async () => {
+  it("a new WIP secret is never uploaded and is remembered as flagged", { skip: HELD_LINUX_ONLY }, async t => {
     let flagged = 0;
-    const s = await scenario({
+    const s = await scenario(t, {
       extra: ctx => { fs.writeFileSync(path.join(ctx.worktreePath, "leak.txt"), `token=${patShaped()}\n`); },
       setup: ({ r }) => {
         const real = r["recordFlaggedCommits"].bind(r);
@@ -105,8 +106,8 @@ describe("held publication falls back to the archive", () => {
     await assertArchived(s, "wip secret", 0);
   });
 
-  it("a remembered flagged ancestor is never uploaded, even when the fresh scan sees nothing", { skip: HELD_LINUX_ONLY }, async () => {
-    const s = await scenario({
+  it("a remembered flagged ancestor is never uploaded, even when the fresh scan sees nothing", { skip: HELD_LINUX_ONLY }, async t => {
+    const s = await scenario(t, {
       setup: ({ server }) => {
         // The range scan is forced clean once the failure is sent (as if the flagged commit sat behind
         // a floor); the mid-run checkpoint scan stays real and remembers the commit.
@@ -123,8 +124,8 @@ describe("held publication falls back to the archive", () => {
   });
 
   for (const reason of ["deadline", "range_invalid", "scan_untrusted", "too_many_merges", "count_failed"] as const) {
-    it(`an untrusted scan (${reason}) archives`, { skip: HELD_LINUX_ONLY }, async () => {
-      const s = await scenario({
+    it(`an untrusted scan (${reason}) archives`, { skip: HELD_LINUX_ONLY }, async t => {
+      const s = await scenario(t, {
         setup: ({ server }) => {
           const real = git.secretScanCheckpointRange.bind(git);
           git.secretScanCheckpointRange = async (...a) => server.failedAcked() ? { trusted: false, findings: [], reason } : real(...a);
@@ -134,8 +135,8 @@ describe("held publication falls back to the archive", () => {
     });
   }
 
-  it("a scan that throws archives", { skip: HELD_LINUX_ONLY }, async () => {
-    const s = await scenario({
+  it("a scan that throws archives", { skip: HELD_LINUX_ONLY }, async t => {
+    const s = await scenario(t, {
       setup: ({ server }) => {
         const real = git.secretScanCheckpointRange.bind(git);
         git.secretScanCheckpointRange = async (...a) => { if (server.failedAcked()) throw new Error("scanner crashed"); return real(...a); };
@@ -144,8 +145,8 @@ describe("held publication falls back to the archive", () => {
     await assertArchived(s, "scan throws", 0);
   });
 
-  it("an unresolved range archives", { skip: HELD_LINUX_ONLY }, async () => {
-    const s = await scenario({
+  it("an unresolved range archives", { skip: HELD_LINUX_ONLY }, async t => {
+    const s = await scenario(t, {
       setup: ({ server }) => {
         const real = git.resolveCheckpointRange.bind(git);
         git.resolveCheckpointRange = async (...a) => server.failedAcked() ? null : real(...a);
@@ -154,14 +155,14 @@ describe("held publication falls back to the archive", () => {
     await assertArchived(s, "range unresolved", 0);
   });
 
-  it("a workflow change in the scanned range archives", { skip: HELD_LINUX_ONLY }, async () => {
-    const s = await scenario({ extra: ctx => { commit(ctx.worktreePath, ".github/workflows/ci.yml", "name: ci\n"); } });
+  it("a workflow change in the scanned range archives", { skip: HELD_LINUX_ONLY }, async t => {
+    const s = await scenario(t, { extra: ctx => { commit(ctx.worktreePath, ".github/workflows/ci.yml", "name: ci\n"); } });
     await assertArchived(s, "workflow change", 0);
   });
 
-  it("a branch merely stale against the default branch's workflow files is still held", async () => {
+  it("a branch merely stale against the default branch's workflow files is still held", async t => {
     let defaultWorkflowTip = "";
-    const s = await scenario({
+    const s = await scenario(t, {
       extra: async () => {
         // The default branch gains a workflow change after the run's clone was seeded; the bare learns
         // it, but it is not in the run's history, so it is not a change the run authors.
@@ -175,8 +176,8 @@ describe("held publication falls back to the archive", () => {
     await assertCustodyRetained(s.server, s.claim, s.work, "stale branch");
   });
 
-  it("a pack over the cap is never sent and archives", { skip: HELD_LINUX_ONLY }, async () => {
-    const s = await scenario({ runnerOptions: { checkpointTestHooks: { heldPackMaxBytes: 16 } } });
+  it("a pack over the cap is never sent and archives", { skip: HELD_LINUX_ONLY }, async t => {
+    const s = await scenario(t, { runnerOptions: { checkpointTestHooks: { heldPackMaxBytes: 16 } } });
     await assertArchived(s, "pack over cap", 0);
   });
 
@@ -196,8 +197,8 @@ describe("held publication falls back to the archive", () => {
     ["a network error", () => { throw new TypeError("fetch failed"); }],
   ];
   for (const [name, answer] of answers) {
-    it(`step A ${name} archives on the same record`, { skip: HELD_LINUX_ONLY }, async () => {
-      const s = await scenario({ setup: ({ server }) => { server.heldAnswer = answer; } });
+    it(`step A ${name} archives on the same record`, { skip: HELD_LINUX_ONLY }, async t => {
+      const s = await scenario(t, { setup: ({ server }) => { server.heldAnswer = answer; } });
       await assertArchived(s, `step A ${name}`, 1);
     });
   }
@@ -208,9 +209,9 @@ describe("held publication falls back to the archive", () => {
     ["an api without the held feature", { features: ["recovery_inventory_v1"] }],
     ["a feature withdrawn before the run", { setup: ({ server }: { server: HeldServer }) => { server.features.delete("recovery_held_publication_v1"); } }],
   ] as const) {
-    it(`${name} archives exactly as before`, async () => {
+    it(`${name} archives exactly as before`, async t => {
       const freezes: boolean[] = [];
-      const s = await scenario({ ...options, setup: async (ctx) => {
+      const s = await scenario(t, { ...options, setup: async (ctx) => {
         await (options as { setup?: (c: typeof ctx) => void }).setup?.(ctx);
         freezes.push(...watchFreezes(ctx.server).failedAckedAtFreeze);
       } });
@@ -228,7 +229,7 @@ describe("held publication falls back to the archive", () => {
     });
   }
 
-  it("push_secret_blocked and worker_residue_blocked failures never defer or publish", async () => {
+  it("push_secret_blocked and worker_residue_blocked failures never defer or publish", async t => {
     const claim = gitlabClaim(2590, {
       claim_generation: 51, inventory_guarded: true,
       repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, forge_type: "github" },
@@ -244,12 +245,13 @@ describe("held publication falls back to the archive", () => {
       commit(ctx.worktreePath, "committed.txt", "work\n");
       return { branch: ctx.branch };
     } }, fakeGitlab().gitlab, JOIN_TOKEN, { github });
+    deferTerminalEvidence(r, t);
     await r.execute(claim);
     assert.equal(failedStates(claim.run_id)[0]!.fail_origin, "push_secret_blocked");
     assert.equal(server.heldCalls.length, 0, "a secret-blocked run never reaches step A");
     assert.equal(server.archiveUploads(), 1, "the secret-blocked run archives, as before");
     assert.equal((await frozenRecords(claim))[0]?.state, "uploaded");
-    const residue = await scenario({ failWith: `${REASON_WORKER_RESIDUE_BLOCKED}: a process survived` });
+    const residue = await scenario(t, { failWith: `${REASON_WORKER_RESIDUE_BLOCKED}: a process survived` });
     assert.equal(failedStates(residue.claim.run_id)[0]!.fail_origin, "worker_residue_blocked");
     assert.equal(residue.server.heldCalls.length, 0);
     assert.ok(residue.server.archiveUploads() >= 1, "the ordinary residue-blocked flow archives");
@@ -272,9 +274,9 @@ describe("held publication falls back to the archive", () => {
     assert.equal(eligible(undefined), false);
   });
 
-  it("the held path never receives the forge credential", async () => {
+  it("the held path never receives the forge credential", async t => {
     const fetches: Array<{ failedAcked: boolean; args: unknown[] }> = [];
-    const s = await scenario({
+    const s = await scenario(t, {
       setup: ({ server }) => {
         const real = git.fetchDefaultTip.bind(git);
         git.fetchDefaultTip = async (...a) => { fetches.push({ failedAcked: server.failedAcked(), args: a }); return real(...a); };
@@ -299,8 +301,8 @@ describe("a held FINAL the api refuses", () => {
     ["a downgrade 400", c => badRequest(c.run_id)],
   ];
   for (const [name, refusal] of definitive) {
-    it(`definitive ${name} falls back to the archive, custody held until its FINAL is ACKed`, { skip: HELD_LINUX_ONLY }, async () => {
-      const s = await scenario({
+    it(`definitive ${name} falls back to the archive, custody held until its FINAL is ACKed`, { skip: HELD_LINUX_ONLY }, async t => {
+      const s = await scenario(t, {
         setup: ({ claim, server }) => {
           server.finalAnswer = call => call.disposition?.kind === "held_publication"
             ? refusal(claim)
@@ -337,8 +339,8 @@ describe("a held FINAL the api refuses", () => {
     ["a transport error", () => new Error("socket hang up")],
     ["a 503", (c: { run_id: string }) => new Error("503 from " + c.run_id)],
   ] as const) {
-    it(`a non-definitive ${name} keeps the journaled FINAL and the hold across a restart`, { skip: HELD_LINUX_ONLY }, async () => {
-      const s = await scenario({
+    it(`a non-definitive ${name} keeps the journaled FINAL and the hold across a restart`, { skip: HELD_LINUX_ONLY }, async t => {
+      const s = await scenario(t, {
         setup: ({ claim, server }) => {
           server.finalAnswer = call => call.disposition?.kind === "held_publication"
             ? (answer as (c: typeof claim) => Error | ReturnType<typeof retained>)(claim)
@@ -369,8 +371,8 @@ describe("a held FINAL the api refuses", () => {
     });
   }
 
-  it("a client-side feature absence on replay is non-definitive: the FINAL is kept and the hold stays open", { skip: HELD_LINUX_ONLY }, async () => {
-    const s = await scenario();
+  it("a client-side feature absence on replay is non-definitive: the FINAL is kept and the hold stays open", { skip: HELD_LINUX_ONLY }, async t => {
+    const s = await scenario(t);
     const { claim, server, work, r } = s;
     const journaled = await assertCustodyRetained(server, claim, work, "held FINAL journaled");
     server.features.delete("recovery_held_publication_v1");
@@ -386,8 +388,8 @@ describe("a held FINAL the api refuses", () => {
     assert.deepEqual(server.finals[0]!.disposition, journaled.finalRequest!.disposition);
   });
 
-  it("a held FINAL kept as unavailable and definitively refused after a restart reaches the capture on the resumed pass", { skip: HELD_LINUX_ONLY }, async () => {
-    const s = await scenario({
+  it("a held FINAL kept as unavailable and definitively refused after a restart reaches the capture on the resumed pass", { skip: HELD_LINUX_ONLY }, async t => {
+    const s = await scenario(t, {
       setup: ({ claim, server }) => {
         server.finalAnswer = () => retained(claim, "held_publication_unavailable");
       },
@@ -418,8 +420,8 @@ describe("a held FINAL the api refuses", () => {
     assert.equal(server.holdOpen(), false);
   });
 
-  it("a crash after the failed send resumes into the archive capture on the same record", async () => {
-    const s = await scenario({
+  it("a crash after the failed send resumes into the archive capture on the same record", async t => {
+    const s = await scenario(t, {
       setup: ({ r }) => {
         // The process dies after the failed terminal is ACKed and before the held step runs.
         mock.method(r as unknown as Record<string, (...a: unknown[]) => unknown>, "settleHeldDeferred", async () => undefined);
@@ -449,9 +451,9 @@ describe("a held FINAL the api refuses", () => {
 });
 
 describe("a WIP transfer that fails retains custody", () => {
-  it("freezes nothing, uploads nothing and sends no FINAL; the hold and the sources stay", async () => {
+  it("freezes nothing, uploads nothing and sends no FINAL; the hold and the sources stay", async t => {
     let broken = false;
-    const s = await scenario({
+    const s = await scenario(t, {
       setup: ({ server }) => {
         const real = git.fetchAgentBranch.bind(git);
         git.fetchAgentBranch = async (...a) => { if (broken) throw new Error("injected transfer failure"); return real(...a); };

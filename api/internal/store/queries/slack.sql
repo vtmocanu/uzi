@@ -155,7 +155,7 @@ RETURNING *;
 -- (migration 00163), stamped now() on every status transition including the park.
 --
 -- checkpoint_tip (PRD #1190) is selected FROM THE RUNS ROW, for the same "explicit column
--- list" reason as stop_kind/rate_limit_type above: the `‖ Paused by you · checkpoint <short>`
+-- list" reason as stop_kind/rate_limit_type above: the `‖ Paused · checkpoint <short>`
 -- line in the paused thread arm needs the last checkpoint-published branch tip, and there is
 -- no other way to reach it through this query. It is a nullable TEXT column (00185), NULL/empty
 -- for a run that never published a checkpoint, which the Go side omits (the arm's "omit when

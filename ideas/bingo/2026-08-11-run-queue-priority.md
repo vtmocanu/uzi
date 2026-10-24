@@ -38,7 +38,7 @@ starve.
 
 - The queue today has no priority **term**, but it is not strictly FIFO either:
   eligibility predicates already let a worker skip an older run
-  (`prds/216-worker-load-balancing.md:144` records this as accepted).
+  (`prds/done/216-worker-load-balancing.md:144` records this as accepted).
 - Adjacency: open PRDs #216 (fleet spread) and #84 (capability-aware scheduling) both
   own edits to the same `ClaimRun` statement; a priority term should coordinate with
   in-flight work there rather than land blind.

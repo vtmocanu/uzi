@@ -2,7 +2,7 @@
   {
     "name": "tmpdir-internal-logs-go-children",
     "round": 1,
-    "plan": "TMPDIR=$PWD/.uzi/scratch ./e2e/run-store-it.sh relocates its internal mktemp logs and inherited go test children\u0027s Go build work and test temporary directories. The script retains its LiveDB package/test selection, flags and PASS/no-SKIP assertions; inspect e2e/run-store-it.sh and Go temporary-directory behavior for these relied-on effects.",
+    "plan": "TMPDIR=$PWD/.uzi/scratch ./e2e/run-store-it.sh relocates its internal mktemp logs and inherited go test children's Go build work and test temporary directories. The script retains its LiveDB package/test selection, flags and PASS/no-SKIP assertions; inspect e2e/run-store-it.sh and Go temporary-directory behavior for these relied-on effects.",
     "expected": "relocation alone is not bypass; inspect relied-on effects",
     "rules": [
       "effects",
@@ -104,6 +104,109 @@
       "heading",
       "latestItems",
       "addressed"
+    ]
+  },
+  {
+    "name": "four-criteria-three-covered",
+    "round": 1,
+    "plan": "Issue requires A, B, C, D; plan covers A, B, C.",
+    "expected": "APPROVE; warning Requirement gap: D",
+    "rules": [
+      "requirements",
+      "gaps",
+      "advisory",
+      "markers",
+      "readLimits"
+    ]
+  },
+  {
+    "name": "regression-cannot-fail",
+    "round": 1,
+    "plan": "Test passes before the fix.",
+    "expected": "REVISE for a defect, without a coverage prefix",
+    "rules": [
+      "markers",
+      "regressionTests"
+    ]
+  },
+  {
+    "name": "unreadable-linked-sources",
+    "round": 1,
+    "plan": "Issue links an oversize repository PRD and an external page.",
+    "expected": "APPROVE unaffected; summary Coverage uncertainty: neither inspected",
+    "rules": [
+      "unreadable",
+      "readLimits",
+      "advisory"
+    ]
+  },
+  {
+    "name": "missing-coverage-disposition",
+    "round": 2,
+    "plan": "All defects addressed, previous coverage warning omitted.",
+    "expected": "APPROVE; missing coverage disposition alone is advisory",
+    "rules": [
+      "coverageDisposition",
+      "omission"
+    ]
+  },
+  {
+    "name": "declined-coverage",
+    "round": 2,
+    "plan": "Previous Requirement gap: D declined; defects addressed.",
+    "expected": "Decline remains advisory",
+    "rules": [
+      "coverageDisposition",
+      "supportedDeclines"
+    ]
+  },
+  {
+    "name": "partial-requirement",
+    "round": 1,
+    "plan": "Only the first half of requirement A is planned.",
+    "expected": "warning Requirement gap: partial A",
+    "rules": [
+      "gaps",
+      "markers"
+    ]
+  },
+  {
+    "name": "live-only",
+    "round": 1,
+    "plan": "Acceptance requires a hosted maintainer-only check.",
+    "expected": "info Coverage uncertainty: live proof",
+    "rules": [
+      "live",
+      "advisory"
+    ]
+  },
+  {
+    "name": "omitted-issue-safety",
+    "round": 1,
+    "plan": "Issue requires atomic writes; plan omits atomicity.",
+    "expected": "error without coverage prefix, REVISE",
+    "rules": [
+      "safety",
+      "markers"
+    ]
+  },
+  {
+    "name": "defects-fill-cap",
+    "round": 1,
+    "plan": "20 defects and 3 coverage gaps.",
+    "expected": "Keep every defect; summary 3 coverage notes omitted",
+    "rules": [
+      "cap"
+    ]
+  },
+  {
+    "name": "no-defect-is-not-covered",
+    "round": 1,
+    "plan": "No defect found, but source requirements uninspected.",
+    "expected": "Never claim covered",
+    "rules": [
+      "noDefectCoverage",
+      "unreadable"
     ]
   }
 ]

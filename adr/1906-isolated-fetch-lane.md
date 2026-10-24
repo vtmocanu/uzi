@@ -3,7 +3,7 @@
 **Status**: Accepted (PRD #1906 M1-M7 implemented; M8, job integration, and M9, live k8s acceptance, are not done: no run is bound to a site list yet and no lane measurement has been taken on a real cluster)
 **Date**: 2026-09-29
 **Issue**: [vtmocanu/uzi#1906](https://github.com/vtmocanu/uzi/issues/1906)
-**PRD**: [prds/1906-official-sources-web-research.md](../prds/1906-official-sources-web-research.md)
+**PRD**: [prds/done/1906-official-sources-web-research.md](../prds/done/1906-official-sources-web-research.md)
 **Related**: [ADR-0285](0285-worker-egress-tier-trust-model.md) (the two-tier egress model this lane sits beside), [#1651](https://github.com/vtmocanu/uzi/issues/1651) (the allowlist is IP-level, not host-level)
 
 ## Decision (summary)

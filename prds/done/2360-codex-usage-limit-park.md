@@ -4,7 +4,7 @@
 **Hosted acceptance**: #2362 remains pending, separately maintainer-owned.
 **Issue**: [#2360](https://github.com/vtmocanu/uzi/issues/2360)
 **Priority**: High
-**Related**: [PRD #35](35-run-limit-retry.md) and [ADR-0035](../../adr/0035-run-limit-retry.md) (the `limit_wait` park this PRD extends), [PRD #1209](../1209-codex-account-rate-limits.md) (Codex account meters; it excluded parking), [PRD #1590](../1590-codex-quarantine-claim-hold.md) (the Codex account hold, a different trigger), #2099 (transient Codex provider retry), #1595 (unusable credential account mid-run, a different trigger), #2361 (follow-up: a persistent Codex `rateLimitExceeded` throttle).
+**Related**: [PRD #35](35-run-limit-retry.md) and [ADR-0035](../../adr/0035-run-limit-retry.md) (the `limit_wait` park this PRD extends), [PRD #1209](1209-codex-account-rate-limits.md) (Codex account meters; it excluded parking), [PRD #1590](1590-codex-quarantine-claim-hold.md) (the Codex account hold, a different trigger), #2099 (transient Codex provider retry), #1595 (unusable credential account mid-run, a different trigger), #2361 (follow-up: a persistent Codex `rateLimitExceeded` throttle).
 
 ## Problem
 

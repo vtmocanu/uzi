@@ -261,7 +261,8 @@ it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, { skip: ["origin-admis
           assert.equal(transferCalls, 1);
           assert.equal(transferEntered, 1);
           assert.equal(transferSettled, mode !== "origin-transfer-final-family");
-          assert.equal(chargedTransports, mode === "origin-transfer-final-family" || mode === "origin-transfer-head" ? 12 : 14, "warm real WorkerClient list/exact transports");
+          // W0-H: the commit group has three dispatches (write-tree, commit-tree, update-ref), +4 rpcAttempts (2 extra dispatches x 2 fetches): 12/14 -> 16/18.
+          assert.equal(chargedTransports, mode === "origin-transfer-final-family" || mode === "origin-transfer-head" ? 16 : 18, "warm real WorkerClient list/exact transports");
           assert.equal(discoveryTransports, 4, "discovery has separate counters");
           t.diagnostic(JSON.stringify({ chargedTransports, discoveryTransports, transferCalls, transferEntered, transferSettled }));
           if (mode !== "origin-transfer-head") assert.notEqual(after.head, before.head);
@@ -354,7 +355,8 @@ it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, { skip: ["origin-admis
       assert.equal(transferEntered, 1);
       assert.equal(transferBodyComplete, true);
       assert.equal(transferSettled, mode !== "origin-transfer-final-family");
-      assert.equal(chargedTransports, mode === "origin-transfer-final-family" || mode === "origin-transfer-head" ? 12 : 14);
+      // W0-H: the commit group has three dispatches (write-tree, commit-tree, update-ref), +4 rpcAttempts (2 extra dispatches x 2 fetches): 12/14 -> 16/18.
+      assert.equal(chargedTransports, mode === "origin-transfer-final-family" || mode === "origin-transfer-head" ? 16 : 18);
       assert.equal(discoveryTransports, 4);
       assert.equal(resourceTotals.rpcAttempts, chargedTransports, "all charged strict client attempts counted");
       const caps = { decoded: git.recoveryDecodedLimitBytes, closureEntries: 65536, sourceBytes: 256 * 1024 ** 2,

@@ -1,11 +1,11 @@
 # PRD #1228: Shared encrypted provider-context generations
 
 **Issue:** [#1228](https://github.com/vtmocanu/uzi/issues/1228)
-**Parent epic:** [#1225](https://github.com/vtmocanu/uzi/issues/1225)
+**Related:** [#1214](https://github.com/vtmocanu/uzi/issues/1214), conditional on the #2083 decision; formerly a child of [#1225](https://github.com/vtmocanu/uzi/issues/1225), detached 2026-10-23.
 **Consumers:** Retained PR sessions in #1214. Completion holds in #1229 were a consumer until #1229 was closed as not planned (2026-10-15).
-**Status:** Planned, blocked on the one-at-a-time sequence after #1227.
-**Priority:** High.
-**Execution:** Keep `Planned` without `uzi`. Add `uzi` only after #1227 merges and main CI is green.
+**Status:** Parked (`Later`), superseded 2026-10-23: the two-consumer premise below is obsolete (#1229 not planned; #1214 durable retention is conditional on #2083). No implementation before #2083 selects durable retention and a reviewed, consumer-backed redesign replaces this PRD.
+**Priority:** Normal.
+**Execution:** Keep `Later` without `uzi`; do not build the dark primitive described below.
 
 This child creates a dark, neutral storage/codec primitive with no active lifecycle consumer. That is intentional: two independent features need the same security-sensitive transport, and implementing it once prevents divergent schemas and allowlists. No implementation or validation may modify `.github/workflows/**`.
 
