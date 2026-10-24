@@ -1273,7 +1273,7 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 
 		// Checkpoint publish (PRD #122 M8): the worker POSTs a raw delta packfile +
 		// tip OID; the api derives repo/branch/PAT from the run row and pushes it
-		// NON-FORCED to refs/uzi-checkpoints/<branch>. Inherits RequireWorker; feeds
+		// NON-FORCED to refs/uzi-checkpoints/<checkpoint-key>. Inherits RequireWorker; feeds
 		// BOTH the plain and TLS listeners from this one mount.
 		//
 		// TODO(PRD#122 M8): rate-limit /publish. Deliberately unlimited today: the

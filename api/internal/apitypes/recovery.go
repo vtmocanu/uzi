@@ -326,9 +326,9 @@ type RecoveryExactHold struct {
 // ReleasedAt is null while the hold is open.
 //
 // CheckpointRef/CheckpointTip/CheckpointState (PRD #1810 M3, D3) say where the run's last
-// published checkpoint lives on origin while the api retains it: the branch checkpoint ref
-// (refs/uzi-checkpoints/<branch>), or refs/uzi-recovery/<run id> once a new run on the branch
-// superseded it; the tip it points at; and the retention record's state (retained |
+// published checkpoint lives on origin while the api retains it: the checkpoint-key ref
+// (refs/uzi-checkpoints/<checkpoint-key>), or refs/uzi-recovery/<run id> once a new run
+// sharing the checkpoint slot superseded it; the tip it points at; and the retention record's state (retained |
 // superseding | superseded | settling). All three are absent when the run has no live
 // retention record.
 type RecoveryCustodyHoldDTO struct {

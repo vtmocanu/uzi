@@ -456,7 +456,7 @@ WHERE h.id = @hold_id
 -- worker's opinion) that the published target the successor pushed, the predecessor's
 -- journaled source and the tip the successor adopted are each an ancestor of (or equal to) the
 -- target's head. The target is the run's forge checkpoint ref (refs/uzi-checkpoints/<branch
--- derived from kind + run id + issue iid>) or the run branch; release_target names which and
+-- authorized checkpoint key>) or the run branch; release_target names which and
 -- release_branch the branch name the proof resolved. Every guard is re-asserted in this one
 -- statement so a change between the proof and the write moves ZERO rows (the caller then
 -- re-reads and answers state_changed):
@@ -465,8 +465,8 @@ WHERE h.id = @hold_id
 --   * the run: same owner, still in a LIVE status (the allowlist below), still at the
 --     successor claim generation, still held by the caller worker with its claim unreleased,
 --     on the SAME runs.branch the service captured before it asked the forge (NULL-safe: a
---     live issue run has none yet) and, for a checkpoint target, the SAME kind and issue iid
---     the checkpoint branch was derived from;
+--     live issue run has none yet), frozen descriptor, kind and issue iid; a checkpoint
+--     target must still equal the resolver-authorized key;
 --   * the successor generation's OWN hold exists, is still open, and was taken by the same
 --     worker: the durability backstop settle_live.go relies on (a live checkpoint ref can
 --     still be advanced or, once the run ends with no open hold, deleted (PRD #1810), so the
@@ -514,9 +514,14 @@ WHERE h.id = @hold_id
         AND r.worker_id = @worker_id::uuid
         AND r.claim_released_at IS NULL
         AND r.branch IS NOT DISTINCT FROM sqlc.narg('captured_branch')::text
+        AND r.kind = @kind::text
+        AND r.issue_iid IS NOT DISTINCT FROM sqlc.narg('issue_iid')::bigint
+        AND r.checkpoint_coordinates IS NOT DISTINCT FROM sqlc.narg('captured_coordinates')::jsonb
+        AND (r.checkpoint_coordinates IS NULL
+             OR fn_checkpoint_coordinates(r) = r.checkpoint_coordinates)
         AND (@target::text <> 'checkpoint' OR (
-            r.kind = @kind::text
-            AND r.issue_iid IS NOT DISTINCT FROM sqlc.narg('issue_iid')::bigint
+            (r.kind <> 'task' OR r.checkpoint_coordinates IS NOT NULL)
+            AND fn_checkpoint_coordinates(r)->>'checkpoint_key' = @proven_branch::text
         ))
       -- FOR SHARE (here and on the successor hold below): PostgreSQL re-checks a concurrent
       -- change only on the UPDATE's target row, not on rows a subquery merely reads. Locking
