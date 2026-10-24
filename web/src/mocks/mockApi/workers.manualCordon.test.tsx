@@ -27,6 +27,65 @@ beforeEach(() => vi.clearAllMocks());
 afterEach(() => vi.restoreAllMocks());
 
 describe("mock manual cordons", () => {
+  // Expected snapshots recorded from store.ManualCordonText at c3dd0c3d with Go 1.27.3.
+  it.each([
+    ["ordinary", " a\nb\tc ", "a b c"],
+    ["lf-csi", "a\u001b[3\n1mb", "a b"],
+    ["tab-csi", "a\u001b[3\t1mb", "a b"],
+    ["del-csi", "a\u001b[3\u007f1mb", "ab"],
+    ["lf-esc", "a\u001b\n7b", "a b"],
+    ["tab-legacy", "a\u001b(\t0b", "a b"],
+    ["sgr", "a\u001b[31mb\u001b[0m", "ab"],
+    ["string-]", "a\u001b]0;hidden\n\ttext\u001b\\b", "ab"],
+    ["bel-]", "a\u001b]hidden\u0007b", "ab"],
+    ["cancel-]", "a\u001b]hidden\u0018b", "ab"],
+    ["unicode-]", "a\u001b]hé🚀\u001b\\b", "ab"],
+    ["string-P", "a\u001bP0;hidden\n\ttext\u001b\\b", "ab"],
+    ["bel-P", "a\u001bPhidden\u0007b", "a"],
+    ["cancel-P", "a\u001bPhidden\u0018b", "ab"],
+    ["unicode-P", "a\u001bPhé🚀\u001b\\b", "ab"],
+    ["string-X", "a\u001bX0;hidden\n\ttext\u001b\\b", "ab"],
+    ["bel-X", "a\u001bXhidden\u0007b", "a"],
+    ["cancel-X", "a\u001bXhidden\u0018b", "ab"],
+    ["unicode-X", "a\u001bXhé🚀\u001b\\b", "aé🚀b"],
+    ["string-^", "a\u001b^0;hidden\n\ttext\u001b\\b", "ab"],
+    ["bel-^", "a\u001b^hidden\u0007b", "a"],
+    ["cancel-^", "a\u001b^hidden\u0018b", "ab"],
+    ["unicode-^", "a\u001b^hé🚀\u001b\\b", "aé🚀b"],
+    ["string-_", "a\u001b_0;hidden\n\ttext\u001b\\b", "ab"],
+    ["bel-_", "a\u001b_hidden\u0007b", "a"],
+    ["cancel-_", "a\u001b_hidden\u0018b", "ab"],
+    ["unicode-_", "a\u001b_hé🚀\u001b\\b", "aé🚀b"],
+    ["c1-csi", "a\u009b31mb", "a31mb"],
+    ["c1-osc", "a\u009dtitle\u0007b", "atitleb"],
+    ["c1-in-csi", "a\u001b[3\u009b32mb", "a32mb"],
+    ["c1-in-osc", "a\u001b]title\u009b31mtextb", "a"],
+    ["c1-st", "a\u001b]title\u009cb", "ab"],
+    ["html", " <b>漢🚀\u2028x\u2029y\u202ez\ue000</b> ", "<b>漢🚀\u2028x\u2029yz\ue000</b>"],
+    ["blank", "\u001b[31m \n\t\u202e", ""],
+    ["cancel-csi", "a\u001b[3\n\u00181mb", "a 1mb"],
+    ["restart", "a\u001b[3\u001b[31mb", "ab"],
+    ["incomplete", "a\u001b[3\n", "a"],
+    ["dcs-entry-lf", "a\u001bP\ntext\u001b\\b", "ab"],
+    ["cap", " 🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀 ", "🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀", "🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀  🚀"],
+  ])("matches server actor/reason snapshots for %s through list and no-op", async (_name, input, expected, actorExpected = expected) => {
+    const { api, workers, state } = await fresh();
+    const id = workers[0].id;
+    state.session!.display_name = input;
+    const first = (await api.cordonWorker(id, input)).worker;
+    const listed = (await api.listWorkers()).workers.find((w) => w.id === id)!;
+    state.session = { ...state.session!, id: "replacement-owner", display_name: "Replacement" };
+    const repeated = (await api.cordonWorker(id, "replacement reason")).worker;
+    const listedAgain = (await api.listWorkers()).workers.find((w) => w.id === id)!;
+    // Individual bounded assertions retain useful failures without dumping the fleet.
+    for (const snapshot of [first, listed, repeated, listedAgain]) {
+      expect(snapshot.manual_cordon_reason).toBe(expected || null);
+      expect(snapshot.manual_cordoned_by_label).toBe(actorExpected || "owner-id");
+      expect(snapshot.manual_cordoned_by).toBe("owner-id");
+      expect(snapshot.manual_cordoned_at).toBe(first.manual_cordoned_at);
+    }
+  });
+
   it("leaves an initially uncordoned worker unchanged on uncordon, and bounds actor snapshots by code points", async () => {
     const { api, workers, state } = await fresh();
     const source = workers[0];
