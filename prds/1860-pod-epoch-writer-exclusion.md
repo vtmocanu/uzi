@@ -1,6 +1,6 @@
 # PRD #1860: Pod-epoch writer exclusion for settled attempt trees (M0 investigation)
 
-**Status**: M0 complete, 2026-10-24: evidence recorded under `## M0 evidence`, recommendation **go (conditional)**. Both postures ran their real-daemon experiments. Q1 is source-backed through the containerd CRI and runc path; its kernel pid-namespace step is corroborated by a real-daemon termination experiment, not read in source. Awaiting owner review before an implementation PRD. Item 1 of #1860, re-scoped (see Decision Log). Investigation-only: the single milestone M0 produces evidence and a go/no-go recommendation. Implementation is a later PRD, written only after the owner reviews M0.
+**Status**: M0 complete, 2026-10-24: evidence recorded under `## M0 evidence`, recommendation **go (conditional)**. Both postures ran their real-daemon experiments. Q1 is source-backed through the containerd CRI and runc path for runtime-reported exits. Synthetic `terminated` and EXITED statuses defer. The kernel pid-namespace step is corroborated by a real-daemon termination experiment, not read in source. Awaiting owner review before an implementation PRD. Item 1 of #1860, re-scoped (see Decision Log). Investigation-only: the single milestone M0 produces evidence and a go/no-go recommendation. Implementation is a later PRD, written only after the owner reviews M0.
 
 ## Problem
 
@@ -210,12 +210,17 @@ So the kubelet's own final DELETE comes after the processes are gone and after t
 
 A pod stopped before every container ever ran can show `waiting` and defers, which is safe.
 - **Runtime link (containerd CRI + runc, read; added after a cross-check).** The chain from `terminated` to "no process of that container survives":
-  1. **Kubelet.** `kuberuntime_container.go:killContainer` calls CRI `StopContainer` with the grace period. The runtime does SIGTERM, then SIGKILL. `kubelet_pods.go:convertToAPIContainerStatuses` sets `state.terminated` only when CRI reports `CONTAINER_EXITED` (`kuberuntime/helpers.go`).
+  1. **Kubelet.** `kuberuntime_container.go:killContainer` calls CRI `StopContainer` with the grace period. The runtime does SIGTERM, then SIGKILL. `kubelet_pods.go:convertToAPIContainerStatuses` sets `state.terminated` when CRI reports `CONTAINER_EXITED` (`kuberuntime/helpers.go`). It also *synthesizes* `terminated` without a runtime exit in two cases: reason `ContainerStatusUnknown` (exit 137) for a previously running container the runtime no longer knows, and reason `Completed` for an init container with no CRI status. The predicate must reject both. It defers on reason `ContainerStatusUnknown`, on any terminated entry without a `containerID`, and on an init-container `Completed` that has no runtime status behind it.
   2. **Pod namespaces.** The pod shares no process namespace: `render.go` sets neither `ShareProcessNamespace` nor `HostPID`, and `kuberuntime/util/util.go:PidNamespaceForPod` defaults to a per-container namespace. So `dind` is init of its own pid namespace. The inner dockerd, containerd, shims and inner tasks are its descendants, inner tasks in nested namespaces.
-  3. **containerd CRI** (`containerd/v2@v2.3.4`). EXITED means `FinishedAt != 0` (`internal/cri/store/container/status.go`). That is set only in `internal/cri/server/events.go:handleContainerExit`, on the shim's TaskExit event, after `task.Delete(…, WithProcessKill)`. `container_stop.go:stopContainer` sends the signal, then SIGKILL on timeout, and waits for that stop.
+  3. **containerd CRI** (`containerd/v2@v2.3.4`). EXITED means `FinishedAt != 0` (`internal/cri/store/container/status.go`). On the normal path it is set in `internal/cri/server/events.go:handleContainerExit`, on the shim's TaskExit event, after `task.Delete(…, WithProcessKill)`. It is also set *without* a reaped init:
+     - `restart.go`, when after a containerd restart the task is missing or `Wait` fails: exit 255, reason `Unknown`;
+     - `container_start.go`, on a start failure;
+     - `container_stop.go:cleanupUnknownContainer` and the exit monitor's error path in `events.go`, which pass a locally made exit (exit 255).
+
+     Those synthetic exits do not prove the container's processes are gone. The predicate therefore defers on exit code 255 or reason `Unknown`; a genuine exit of 255 also defers, which fails closed. `container_stop.go:stopContainer` sends the signal, then SIGKILL on timeout, and waits for that stop.
   4. **runc shim** (`cmd/containerd-shim-runc-v2/task/service.go:handleInitExit`). The shim is a subreaper (`pkg/shim/shim_linux.go`) and publishes init's TaskExit only after reaping init. For a *private* pid namespace, `runc/util.go:ShouldKillAllOnExit` is false, so it adds no kill-all.
   5. **runc** (`opencontainers/runc@v1.5.1`). `libcontainer/container_linux.go:Signal` and `state_linux.go:destroy` rely on the kernel to kill the rest of a private pid namespace when its init dies. They use `cgroup.kill` only for shared namespaces.
-  6. **The kernel step.** When a pid namespace's init dies, the kernel SIGKILLs every process in that namespace and its descendant namespaces, and init is not reaped until they are gone (pid_namespaces(7)). This step rests on kernel semantics that M0 **did not read** (no kernel source). runc's comments state it, and the real-daemon `exp-termination` result below confirms it on this stack.
+  6. **The kernel step.** When a pid namespace's init dies, the kernel SIGKILLs every process in that namespace and its descendant namespaces, and init is not reaped until they are gone. The first half is documented in pid_namespaces(7); the reaping order and descendant namespaces are not documented there. This step rests on kernel behaviour that M0 **did not read** (no kernel source). runc's comments state it, and the real-daemon `exp-termination` result below confirms it on this stack.
 - **Not covered by the runtime link.** CRI-O, Kata or gVisor runtime classes, and a process that escaped the `dind` pid namespace (a deliberate escape, as in the PRD's accepted residuals). A cluster on a runtime other than containerd with runc is outside this evidence and must defer.
 
 **Per case.**
@@ -392,7 +397,7 @@ The harness was then hardened:
 - **cp/start outcomes are checks**, and the experiments check the inode a container actually binds.
 - **New experiment:** `exp-termination.sh`.
 
-At harness commit `016ba790`, clean tree, Engine 29.8.0, `exp-stopped`, `exp-volumes-build` and `exp-termination` each exited 0 on `all`, with `EXP … PASS` in both postures. There was no `FAIL`, no `INCOMPLETE`, and every scan read `unreadable=0`. `exp-stopped` and `exp-volumes-build` ran at `4cf133d8`, and the only change since then is `exp-termination.sh`. Their lines are committed in `e2e/pod-epoch/results/m0-xcheck-016ba790.txt`. Where a Q3 statement below depends on a re-run check, it is supported by that file. Restore, read-only and smoke results come from the earlier run, whose scripts did not change.
+On a clean tree, Engine 29.8.0, `exp-stopped`, `exp-volumes-build` and `exp-termination` each exited 0 on `all`, with `EXP … PASS` in both postures. There was no `FAIL`, no `INCOMPLETE`, and every instrument scan read `unreadable=0`; only the deliberate uid-65534 control reports unreadable items. `exp-stopped` and `exp-volumes-build` ran at `4cf133d8`, and the only change since then is `exp-termination.sh`. Their lines are committed in `e2e/pod-epoch/results/m0-xcheck-016ba790.txt`. Where a Q3 statement below depends on a re-run check, it is supported by that file. Restore, read-only and smoke results come from the earlier run. Since then their scripts changed only by one comment line, and `lib.sh` changed only in the tree-scan functions they never call.
 
 **Official run.** Run at harness commit `0658dee5`, clean tree, Engine 29.8.0, both postures, sequential on 2026-10-24.
 
@@ -447,7 +452,7 @@ All 7 `check.barrier.*` checks pass. Positive controls showed the same instrumen
 - a cwd/fd in the tree (`fd=1`);
 - and, from a separate harness cwd holder measured after `rm -rf`, a deleted-inode fd (`control.deleted_inode_fd=1`).
 
-After `docker stop`, and again after a daemon restart, every scan found `refs=0` (mount, cwd, fd and memory-mapping references). Each of those scans proved it read dockerd's own mount namespace: `scan_complete=yes … dockerd_ns_read=yes` at `0658dee5`. At `016ba790` each was also complete under the fail-closed gate (`unreadable=0`, namespace set covered).
+After `docker stop`, and again after a daemon restart, every scan found `refs=0` (mount, cwd, fd and memory-mapping references). Each of those scans proved it read dockerd's own mount namespace: `scan_complete=yes … dockerd_ns_read=yes` at `0658dee5`. At `4cf133d8` (the cross-check run of `exp-stopped`) each was also complete under the fail-closed gate (`unreadable=0`, namespace set covered).
 
 After the tree was deleted (`after_rm exists=no`):
 
@@ -459,7 +464,7 @@ After the tree was deleted (`after_rm exists=no`):
 | `docker cp` into that container | fails: `no such directory` | same |
 | `docker start` of a `--volumes-from` copy of it | **recreates** the tree | same |
 
-At `016ba790` these outcomes are checks. `cp`/`start` either fail or recreate the tree on an inode distinct from every held deleted inode, and the started container's `/w` is that recreated inode (`check.*.reresolution`, `check.*.container-binds-recreated-inode`). `--mount` start and cp fail (`check.start-c-mount.fails`, `check.cp-into-c-mount.fails`). Linux refuses to create entries in an unlinked directory, so the held deleted trees are recorded only as observations (`obs.held*.listing_*`). So nothing stopped can write to the deleted inode. A later *client request*, though, can recreate an empty directory at the deleted path. That makes Q4's client exclusion load-bearing, and the reclaim should remove stopped containers whose binds point into the tree.
+At `4cf133d8` these outcomes are checks. `cp`/`start` either fail or recreate the tree on an inode distinct from every held deleted inode, and the started container's `/w` is that recreated inode (`check.*.reresolution`, `check.*.container-binds-recreated-inode`). `--mount` start and cp fail (`check.start-c-mount.fails`, `check.cp-into-c-mount.fails`). Linux refuses to create entries in an unlinked directory, so the held deleted trees are recorded only as observations (`obs.held*.listing_*`). So nothing stopped can write to the deleted inode. A later *client request*, though, can recreate an empty directory at the deleted path. That makes Q4's client exclusion load-bearing, and the reclaim should remove stopped containers whose binds point into the tree.
 
 **Volumes and build cache (Q3).**
 - `v-plain` reports `local` with `null` options.
@@ -481,18 +486,18 @@ Result: **0 events** and a byte-identical inventory of containers, volumes, imag
 
 All of the following pass in both postures, for both cases:
 - `writers-active-until-signal`: the log grew between the last pre-signal read and the exit.
-- `writers-stopped-by-exit`: the log size is identical at the moment the outer engine reports `exited`, after a 5 s supplementary window, from a fresh reader, and 3 s after pod recreation.
+- `writers-stopped-by-exit`: the log is identical at the moment the outer engine reports `exited`, after a 5 s supplementary window, and from a fresh reader.
 - `last-write-not-after-exit`: the log's last mtime is not later than the container's `FinishedAt`, by 17 to 51 ms.
-- `restored.log-does-not-grow`: after the pod is recreated, the restored `no`-policy writer stays exited.
+- `restored.log-does-not-grow` and `restored.restart-policy-no`: 3 s after the pod is recreated the log is unchanged, and the writer's policy is `no`. Observations, not checks: the restored writer is exited, and no writer process exists.
 
 Two further observations:
-- The writers ignored SIGTERM: under `docker stop` they kept writing for the full 10 s grace and died only at SIGKILL.
+- Under `docker stop`, which signals the daemon container's PID 1, all three writers kept writing for the full 10 s grace. The log grew 236→1393 bytes in rootless and 251→1402 in rootful. They stopped at the final SIGKILL (exit 137).
 - This exercises the outer Docker 29.8.0 engine's containerd and runc stop path as a stand-in for kubelet plus CRI containerd: the same shim and runc family, but not the CRI plugin.
 
 **Postures (Q5).** Every Q2, Q3 and Q4 experiment above ran and passed on both postures. The rootless pid-file and `emptyDir` restart case is **not exercised** (see above). Neither posture is UNRUN.
 
 **Limits of the experiments** (non-blocking review notes):
-- The scans' remaining blind spot is a mount namespace held only by an nsfs fd or bind mount, with no task in it. The `SCAN-UNREADABLE` positive control can trigger only the namespace-read item by permission. The other items' reporting was checked on crafted input (an always-failing `stat`, a zombie thread-group leader with a live thread), not on a real daemon.
+- The scans' remaining blind spot is a mount namespace held only by an nsfs fd or bind mount, with no task in it. The `SCAN-UNREADABLE` positive control can trigger only the namespace-read item by permission. The coder checked the other items' reporting on crafted input (an always-failing `stat`, a zombie thread-group leader with a live thread), as described in `e2e/pod-epoch/README.md`. Those checks are not committed tests and were not run on a real daemon.
 - `last-write-not-after-exit` uses file mtime from the kernel's coarse clock, which can read up to one tick early.
 - The termination experiment uses the Docker engine's containerd and runc stop path, not kubelet with the CRI plugin.
 - The listener check reads TCP only, not UDP.
@@ -551,7 +556,8 @@ The go is conditional on conditions 1–3 being in the implementation PRD's scop
 1. **Controller evidence field.**
    - Observe worker pods with a watch, or with a sub-second poll while a pod is terminating. This is new RBAC: `watch` on pods.
    - Accept only the Q1 signal: terminal phase, matching container counts, and every entry `state.terminated`.
-   - Accept it only when the node runs containerd (with runc; the node's `status.nodeInfo.containerRuntimeVersion`) and the pod has no `runtimeClassName`. Any other runtime defers (Q1 runtime link).
+   - Accept it only when the node runs containerd (the node's `status.nodeInfo.containerRuntimeVersion`, which needs new cluster-scoped `get` on nodes) and the pod has no `runtimeClassName`. That field cannot show the runtime handler, so "the default handler is runc" needs an operator-declared chart value; without it, defer. Any other runtime defers, including the chart's documented sysbox path (`runtimeClassName: sysbox-runc`) (Q1 runtime link).
+   - Reject synthetic statuses: any terminated entry with reason `ContainerStatusUnknown` or `Unknown`, exit code 255, no `containerID`, or an init `Completed` without runtime status defers.
    - Record a bounded evidence document containing:
      - the predecessor pod UID;
      - per-container `containerID` and `restartCount`;
