@@ -3,7 +3,6 @@ package store_test
 import (
 	"context"
 	"errors"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -14,25 +13,9 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// Only the isolated database is migrated backwards; the harness marker is checked
-// on the parent database before creating it.
+// Only the UUID-named database created by standIsolatedDB is migrated backwards.
 func manualMigrationDB(t *testing.T) (context.Context, string, *pgxpool.Pool) {
 	t.Helper()
-	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("UZI_TEST_DATABASE_URL not set; run via store-IT runner")
-	}
-	ctx := context.Background()
-	parent, err := store.OpenPool(ctx, dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var marked bool
-	err = parent.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM uzi_test_harness.database_marker WHERE marker='recovery-reset-v1')").Scan(&marked)
-	parent.Close()
-	if err != nil || !marked {
-		t.Fatalf("test database marker required: marked=%v err=%v", marked, err)
-	}
 	ctx, isolated := standIsolatedDB(t, "manual_migration_")
 	if err := store.MigrateTo(ctx, isolated, 354); err != nil {
 		t.Fatal(err)

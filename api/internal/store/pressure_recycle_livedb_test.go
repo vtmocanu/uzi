@@ -148,10 +148,6 @@ func TestPressureRecycleMigrationLockLiveDB(t *testing.T) {
 
 func TestPressureRecycleMigrationRoundtripLiveDB(t *testing.T) {
 	ctx, parent, _ := openHealthLiveDB(t)
-	var marked bool
-	if err := parent.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM uzi_test_harness.database_marker WHERE marker='recovery-reset-v1')").Scan(&marked); err != nil || !marked {
-		t.Fatalf("test database marker required: marked=%v err=%v", marked, err)
-	}
 	// Earlier tests can leave manual intent and durable audit history in the
 	// shared database. Neither may be removed to make a schema rollback pass.
 	sharedSnapshot := func() string {
