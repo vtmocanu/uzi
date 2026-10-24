@@ -643,7 +643,9 @@ test("traversal preflight decision: owner class alone applies to the owner, then
 });
 
 test("the traversal preflight refuses a symlinked ancestor and a private ancestor, and passes an open chain", async () => {
-  const base = await fs.mkdtemp(path.join(tc.root, "pre-"));
+  // Canonical base: a host temp root under a symlinked ancestor (macOS /var -> /private/var) would
+  // make the open-chain positive fail the realpath check it is not testing.
+  const base = await fs.realpath(await fs.mkdtemp(path.join(tc.root, "pre-")));
   const real = path.join(base, "real");
   await fs.mkdir(path.join(real, "run"), { recursive: true });
   await fs.symlink(real, path.join(base, "link"));
