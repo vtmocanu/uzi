@@ -46,16 +46,23 @@ for (const mode of ["claude", "stub", "codex"] as const) {
 
 for (const control of ["park", "pause", "cancel", "shutdown"] as const) {
   it(`typed terminal-disk handoff: actual ${control} disposition`, async t => {
+    let elapsed = 0;
+    const realNow = Date.now.bind(Date);
+    t.mock.method(Date, "now", () => realNow() + elapsed);
     const rig = codexRig();
     const publication = spyPublishLands();
     t.after(publication);
     let ctx!: RunContext, deferred = false, interrupted = false, captureCalls = 0;
     let operationDeadline: number | undefined, expectedDeadline: number | undefined;
+    let handoffSignal: AbortSignal | undefined;
+    let handoffAbortedDuringCapture: boolean | undefined, captureAbortedDuringCapture: boolean | undefined;
     const freeDeadlines: number[] = [];
     const boundary = rig.safety.withBoundary.bind(rig.safety);
     t.mock.method(rig.safety, "withBoundary", async (request: Parameters<typeof boundary>[0]) => {
       assert.equal(deferred, false, "no credential boundary after typed deferral");
       expectedDeadline = Date.now() + request.deadlineMs + 60_000;
+      // Advance virtual admission time so renewing the end-to-end deadline is observable.
+      elapsed += 1_000;
       deferred = true;
       throw new CodexBoundaryError("reconcile", [], undefined, "vault_locked");
     });
@@ -72,6 +79,9 @@ for (const control of ["park", "pause", "cancel", "shutdown"] as const) {
             if (control === "shutdown") f.runner.shutdown();
             else api.setInputs(f.claim.run_id, [{ id: 1, kind: control, ...(control === "pause" ? { body: "now" } : {}) }]);
             await waitForAbort(ctx.signal!);
+            // Observe the actual pending handoff/capture, before its action can exit.
+            handoffAbortedDuringCapture = handoffSignal?.aborted;
+            captureAbortedDuringCapture = signal?.aborted;
           }
           return action(held);
         }, purpose, signal, attempt);
@@ -82,7 +92,10 @@ for (const control of ["park", "pause", "cancel", "shutdown"] as const) {
     const git = (await import("./runner-harness.js")).git;
     const operation = git.withRecoveryOperation.bind(git);
     t.mock.method(git, "withRecoveryOperation", async <T>(signal: AbortSignal, deadline: number, action: (signal: AbortSignal) => Promise<T>) => {
-      if (deferred && operationDeadline === undefined) operationDeadline = deadline;
+      if (deferred && operationDeadline === undefined) {
+        operationDeadline = deadline;
+        handoffSignal = signal;
+      }
       return operation(signal, deadline, action);
     });
     await f.runner.execute(f.claim);
@@ -99,6 +112,10 @@ for (const control of ["park", "pause", "cancel", "shutdown"] as const) {
       assert.ok(api.messages(f.claim.run_id).some(row => JSON.stringify(row).includes("worker's data volume is nearly full")), "disk context reaches actual ACK disposition");
     } else {
       assert.equal(interrupted, true);
+      if (control !== "pause") {
+        assert.equal(handoffAbortedDuringCapture, true, "terminal interruption aborts the pending handoff signal");
+        assert.equal(captureAbortedDuringCapture, true, "terminal interruption reaches the pending free capture signal");
+      }
       assert.equal(parks().length, 0, "interruption forbids recovery park");
       if (control === "cancel") {
         assert.ok(api.states.some(row => row.body.status === "failed" && row.body.failure_reason === "run cancelled"));
