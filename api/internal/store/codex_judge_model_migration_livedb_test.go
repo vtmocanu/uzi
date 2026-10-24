@@ -306,6 +306,7 @@ func TestCodexJudgeModelMigrationInstanceLiveDB(t *testing.T) {
 func TestCodexJudgeModelMigrationDownLiveDB(t *testing.T) {
 	ctx := context.Background()
 	v := migrationVersionByName(t, "codex_judge_model")
+	fixture := newCJMigrationTemplate(t, v-1)
 
 	for _, tc := range []struct {
 		name      string
@@ -321,7 +322,10 @@ func TestCodexJudgeModelMigrationDownLiveDB(t *testing.T) {
 		{"empty Codex row writes nothing", nil, "", "", false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			pool, dsn := codexJudgeMigrationDB(t, v)
+			pool, dsn := fixture.Clone(t)
+			if err := MigrateTo(ctx, dsn, v); err != nil {
+				t.Fatalf("MigrateTo(%d): %v", v, err)
+			}
 			var authorID any
 			if tc.author {
 				authorID = cjSeedUser(t, pool, nil)
