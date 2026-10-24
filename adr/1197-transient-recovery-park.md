@@ -627,3 +627,37 @@ was measured at roughly 1.5 GiB in October 2026; continued growth can eventually
 require another policy decision. Deadline, cancellation, archive and storage
 quota boundaries remain unchanged. The decoded cap still does not bound
 Git-internal decompression memory.
+
+## Amendment 2026-10-24 — #3179: an event-free Claude stream is a recovery outcome
+
+The decision says that missing metrics and nonempty turns retain their existing
+outcomes. This amendment carves out one narrow additional recovery outcome: a
+Claude turn whose harness stream ends cleanly with no events at all and no
+terminal. Such a stream has no turn count, so it was never positively empty, and
+the implement loop folded it into a finished iteration, losing the plan, worker
+safety steer, first-turn content and held owner batch the attempt carried.
+
+An event-free attempt is now retried in process through the same bounded retry as
+the other outcomes (same retry count, backoff and cancel, idle and wall
+precedence), with the original prompt and callbacks:
+
+- The plan, the drained worker safety steer and the held owner batch are retained
+  for the retry. No new outer iteration begins. The owner inclusion receipt is
+  issued only once an attempt shows model-processing evidence.
+- The interrupted-calls note is re-sent only after an event-free attempt, and
+  mirrors exactly what the immediately preceding dispatch appended (including
+  nothing). An attempt that processed its prompt never has its note repeated.
+- The retry resumes the session the attempt was requested with; a stream with no
+  events cannot have started another.
+- Exhaustion throws the recovery park error with an event-free message and
+  `providerOrigin` false. Retry notices say the stream ended without any events;
+  they never claim zero turns or provider processing.
+- Plan phase: an event-free planning turn now retries and then parks, where it
+  previously ended as `REASON_NO_PLAN`. A planning turn with a terminal and no plan
+  is unchanged.
+
+Known boundaries. A stream that yields only init or rate-limit events and then
+ends is not covered. A park after exhausted retries does not carry the drained
+steer, as with the positively-empty path today. The Codex lane is out of scope.
+The evidence is a scripted executor reproduction; no real-provider occurrence has
+been observed. The ADR-1416 steering bridge is unchanged.

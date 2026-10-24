@@ -6252,6 +6252,200 @@ describe("SdkExecutor empty-turn recovery (issue #1197 D-RC2b)", () => {
   });
 });
 
+// Issue #3179: a Claude turn whose SDK stream ends with NO events and no terminal used to fold into a
+// finished iteration (numTurns undefined is not positively empty), losing the plan, safety steer and
+// held owner batch the attempt carried. It now retries in place through the same bounded retry.
+describe("SdkExecutor event-free stream recovery (issue #3179)", () => {
+  const EVENT_FREE_NOTICE = /stream ended without any events; retrying/;
+  const fastRecovery = (queryFn: SdkQueryFn, maxRetries = 2, backoff = 0): SdkExecutorOptions => ({
+    queryFn,
+    emptyTurnBackoffBaseMs: backoff,
+    emptyTurnMaxRetries: maxRetries,
+  });
+  /** A script that records the moment its attempt starts streaming, then yields `msgs`. */
+  const attempt = (log: string[], name: string, msgs: SDKMessage[]): Script =>
+    () => { log.push(name); return msgs as unknown as AsyncIterable<unknown>; };
+  const statusTexts = (emits: EmittedMessage[]): string[] =>
+    emits.filter((m) => m.kind === "status").map((m) => String(m.payload["text"]));
+  const occurrences = (haystack: string, needle: string): number => haystack.split(needle).length - 1;
+
+  const variants: Array<[string, Partial<RunContext>]> = [
+    ["seeded", { seeded: true, reviewedPlanResume: false }],
+    ["reviewed-plan resume", { seeded: false, reviewedPlanResume: true }],
+  ];
+  for (const [name, variant] of variants) {
+    it(`${name}: an event-free first implement attempt is retried with the plan, steer and held owner batch intact`, async () => {
+      const log: string[] = [];
+      let steerPulls = 0;
+      let ownerGiven = false;
+      const { queryFn, turns } = fakeTurns([
+        attempt(log, "attempt 1", []),
+        attempt(log, "attempt 2", [assistantText("working", "s-retry"), resultSuccess("s-retry")]),
+        attempt(log, "attempt 3", [signalDone("s-retry"), resultSuccess("s-retry")]),
+      ]);
+      const probe = makeCtx({
+        planApproved: true, approvedPlan: "# Approved PLAN-MARK", sessionId: null,
+        config: { max_iterations: 5 },
+        ...variant,
+        pullSafetySteer: () => (steerPulls++ === 0 ? "STEER-MARK" : undefined),
+        pullFollowUps: () => {
+          if (ownerGiven) return [];
+          ownerGiven = true;
+          return [{ id: 77, body: "OWNER-BODY-MARK" }];
+        },
+        followUpIncluded: (id) => { log.push(`included ${id}`); },
+      });
+      await new SdkExecutor(nullLogger(), homeDir, fastRecovery(queryFn)).run(probe.ctx);
+
+      assert.equal(turns.length, 3, "event-free attempt + retry + the follow-on iteration");
+      const retried = turns[1]!.promptText ?? "";
+      for (const mark of ["PLAN-MARK", "STEER-MARK", "OWNER-BODY-MARK"]) {
+        assert.equal(occurrences(retried, mark), 1, `${mark} appears exactly once in the retried prompt`);
+      }
+      assert.deepEqual(log.filter((l) => l.startsWith("included")), ["included 77"], "one inclusion receipt");
+      assert.ok(log.indexOf("included 77") > log.indexOf("attempt 2"), "the receipt waits for model-processing evidence");
+      const iterations = statusTexts(probe.emits).filter((t) => t.startsWith("implement/review iteration"));
+      assert.deepEqual(iterations, ["implement/review iteration 1", "implement/review iteration 2"],
+        "the event-free attempt did not consume an iteration");
+      assert.equal(turns[2]!.options.resume, "s-retry", "the next turn resumes the retried attempt's session");
+      assert.ok(statusTexts(probe.emits).some((t) => EVENT_FREE_NOTICE.test(t)), "a truthful retry notice is emitted");
+    });
+  }
+
+  const interruptedCtx = (extra: Partial<RunContext>) => {
+    const snapshot = { base: "interrupted", interruptedEdits: false, commits: 0 } as const;
+    let gets = 0;
+    const probe = makeCtx({
+      seeded: true, planApproved: true, approvedPlan: "approved", interruptedSnapshot: snapshot,
+      config: { max_iterations: 5 },
+      getInterruptedCalls: () => { gets++; return m3Calls(); },
+      ...extra,
+    });
+    return { probe, gets: () => gets };
+  };
+
+  it("consecutive event-free attempts each re-send the interrupted-calls note, fetched once", async () => {
+    const { queryFn, turns } = fakeTurns([[], [], [signalDone(), resultSuccess()]]);
+    const { probe, gets } = interruptedCtx({});
+    await new SdkExecutor(nullLogger(), homeDir, fastRecovery(queryFn)).run(probe.ctx);
+    assert.equal(turns.length, 3);
+    for (const t of turns) assert.match(t.promptText ?? "", /interrupted_calls_/);
+    assert.equal(gets(), 1);
+  });
+
+  it("a note delivered to an attempt that processed it is not re-sent after a later event-free attempt", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [assistantText("started", "s1"), resultApiError(529, "API Error: 529 Overloaded", "s1")],
+      [],
+      [signalDone("s1"), resultSuccess("s1")],
+    ]);
+    const { probe, gets } = interruptedCtx({});
+    await new SdkExecutor(nullLogger(), homeDir, fastRecovery(queryFn)).run(probe.ctx);
+    assert.equal(turns.length, 3);
+    assert.match(turns[0]!.promptText ?? "", /interrupted_calls_/);
+    assert.doesNotMatch(turns[1]!.promptText ?? "", /interrupted_calls_/);
+    assert.doesNotMatch(turns[2]!.promptText ?? "", /interrupted_calls_/);
+    assert.equal(gets(), 1);
+  });
+
+  it("exhausted event-free planning retries park with an event-free message, not a zero-turn claim", async () => {
+    const { queryFn, turns } = fakeTurns([[]]);
+    const probe = makeCtx();
+    const err = await new SdkExecutor(nullLogger(), homeDir, fastRecovery(queryFn, 2)).run(probe.ctx).then(
+      () => undefined, (e: unknown) => e);
+    assert.ok(err instanceof TransientRecoveryError);
+    assert.match(err.message, /without any events/);
+    assert.equal(err.providerOrigin, false);
+    assert.equal(turns.length, 3, "1 + maxRetries drives");
+    const notices = statusTexts(probe.emits).filter((t) => /retrying/.test(t));
+    assert.equal(notices.length, 2);
+    for (const n of notices) {
+      assert.match(n, EVENT_FREE_NOTICE);
+      assert.doesNotMatch(n, /0 turns/);
+    }
+    assert.deepEqual(probe.gated, []);
+  });
+
+  it("exhausted event-free implement retries park with an event-free message", async () => {
+    const { queryFn, turns } = fakeTurns([[]]);
+    const probe = makeCtx({ seeded: true, planApproved: true, approvedPlan: "approved" });
+    const err = await new SdkExecutor(nullLogger(), homeDir, fastRecovery(queryFn, 1)).run(probe.ctx).then(
+      () => undefined, (e: unknown) => e);
+    assert.ok(err instanceof TransientRecoveryError);
+    assert.match(err.message, /without any events/);
+    assert.equal(err.providerOrigin, false);
+    assert.equal(turns.length, 2);
+  });
+
+  it("cancellation during the event-free backoff throws REASON_CANCELLED, not recovery", async () => {
+    const { queryFn } = fakeTurns([[]]);
+    const ac = new AbortController();
+    const probe = makeCtx({ signal: ac.signal });
+    const t = setTimeout(() => ac.abort(), 40);
+    try {
+      await assert.rejects(
+        new SdkExecutor(nullLogger(), homeDir, fastRecovery(queryFn, 2, 1000)).run(probe.ctx),
+        (err: unknown) => err instanceof Error && /run cancelled/.test(err.message) && !(err instanceof TransientRecoveryError),
+      );
+    } finally {
+      clearTimeout(t);
+    }
+  });
+
+  it("a spent wall trips the wall outcome, not recovery, after an event-free attempt", async () => {
+    const { queryFn, turns } = fakeTurns([[]]);
+    const probe = makeCtx({ config: { run_timeout_seconds: 0.5 } });
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, fastRecovery(queryFn, 2, 2000)).run(probe.ctx),
+      (err: unknown) => err instanceof Error && /wall-clock timeout/.test(err.message) && !(err instanceof TransientRecoveryError),
+    );
+    assert.ok(turns.length <= 2, `bounded SDK calls, got ${turns.length}`);
+  });
+
+  it("a terminal-fenced run makes no further dispatch after an event-free attempt", async () => {
+    const abort = new AbortController();
+    let queries = 0;
+    const { queryFn } = fakeTurns([() => { queries++; abort.abort(); return [] as unknown as AsyncIterable<unknown>; }]);
+    const probe = makeCtx({
+      seeded: true, planApproved: true, approvedPlan: "approved", terminalLifecycleSignal: abort.signal,
+    });
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, fastRecovery(queryFn)).run(probe.ctx),
+      (err: unknown) => !(err instanceof TransientRecoveryError),
+    );
+    assert.equal(queries, 1);
+  });
+
+  it("plan phase: an event-free planning turn is retried and its plan reaches the gate", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [],
+      [submitPlan("# P"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ agents: [lead, coder, reviewer] });
+    await new SdkExecutor(nullLogger(), homeDir, fastRecovery(queryFn)).run(probe.ctx);
+    assert.deepEqual(probe.gated, ["# P"]);
+    assert.equal(turns.length, 3);
+  });
+
+  it("guard: a planning turn with a terminal but no plan still fails REASON_NO_PLAN without retry", async () => {
+    const { queryFn, turns } = fakeTurns([[resultNoTurns()]]);
+    const probe = makeCtx();
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, fastRecovery(queryFn)).run(probe.ctx),
+      (err: unknown) => err instanceof Error && /without submitting a plan/.test(err.message) && !(err instanceof TransientRecoveryError),
+    );
+    assert.equal(turns.length, 1);
+  });
+
+  it("guard: a stream that yielded an event but no terminal is not treated as event-free", async () => {
+    const { queryFn } = fakeTurns([[assistantText("partial")]]);
+    const probe = makeCtx({ seeded: true, planApproved: true, approvedPlan: "approved", config: { max_iterations: 1 } });
+    await new SdkExecutor(nullLogger(), homeDir, fastRecovery(queryFn)).run(probe.ctx).catch(() => undefined);
+    assert.ok(!statusTexts(probe.emits).some((t) => EVENT_FREE_NOTICE.test(t)), "no event-free retry notice");
+  });
+});
+
 // PRD #1349 M3: a POSITIVELY-empty turn caused by a HARD rate limit routes to the
 // usage-limit wait path (LimitReachedError → runner.ts handleLimitReached, which respects
 // wait_on_limit) instead of the endless-local recovery_wait park (TransientRecoveryError).
