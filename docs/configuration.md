@@ -514,8 +514,27 @@ These `_MS` settings take decimal milliseconds, not Go-style durations.
 For a finite cgroup limit `L = memory.max`, the guard computes
 `H = L - reserveBytes` and `Q = H - hysteresisBytes`, requiring
 `0 < Q < H < L`. Unavailable, stale or incompatible cgroup evidence inhibits
-intervention; an unlimited cgroup does not supply a usable limit. Total
-`memory.current` is authoritative, with no file-memory subtraction.
+intervention; an unlimited cgroup does not supply a usable limit. Pressure
+is the working set, `max(0, memory.current - inactive_file)`; it drives `H`,
+the early projection and the below-`Q` quiet dwell, with or without PSI.
+`memory.stat` must contain `inactive_file`, else the sample is unavailable.
+The working set is an estimate, not guaranteed non-reclaimable memory and not
+an OOM predictor: inactive file pages can be dirty, under writeback or slow to
+reclaim, so the subtraction can underestimate pressure (dirty/writeback
+validation is deferred). Feedback's `observed_total_bytes` stays the raw
+`memory.current` and can exceed the working set that triggered.
+
+Cgroup memory PSI (`memory.pressure`) is optional. A read failing with exactly
+`ENOENT` or `ENOTSUP` marks PSI absent; any other error, or malformed or
+oversized PSI, makes the whole sample unavailable. Early intervention needs real
+PSI in two consecutive samples, an increasing full-PSI total, growth in
+`anon`, `shmem`, `slab_unreclaimable` or `unevictable`, and a working-set
+projection reaching `H` within the response budget. Without PSI only the hard
+path (working set at or above `H`) can fire. The worker logs one `warn`
+("cgroup memory PSI unavailable; early intervention disabled, hard intervention
+continues on valid core accounting", field `reason`) on initial absence or
+loss, and one `info` ("cgroup memory PSI restored; early intervention resumes
+after consecutive PSI samples") on restoration; repeats are silent.
 Approximate command-tree RSS ranks eligible targets; it does not measure
 cgroup usage or prove that memory was freed.
 

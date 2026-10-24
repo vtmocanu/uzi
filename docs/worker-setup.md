@@ -650,12 +650,26 @@ while the original flight still owns settlement, feedback and source custody.
 One monitor shares the worker's cgroup budget across its configured
 concurrency. It can intervene in enrolled **Codex and Claude model shell commands**,
 using the exact registered supervisor and process start ticks; approximate
-tree RSS ranks candidates while total cgroup usage determines pressure.
-It does not subtract file memory. Internal probes,
+tree RSS ranks candidates while the cgroup working set,
+`max(0, memory.current - inactive_file)`, determines pressure. Internal probes,
 provider/credential processes, boundary/checkpoint/capture operations and
 cross-checker authority are outside the delivered adapters' scope. Enrollment
 adds no process authority and changes no concurrency setting; see
 [ADR-2396](../adr/2396-worker-memory-guard.md).
+
+Cgroup memory PSI is optional. The hard path (working set at or above the
+limit minus reserve) fires on PSI-capable and PSI-less hosts alike; early
+intervention also needs real PSI in two consecutive samples, so a host without
+`memory.pressure` (read fails with `ENOENT` or `ENOTSUP`) runs hard-only.
+Other PSI read errors, or malformed PSI, make the sample unavailable and
+inhibit intervention. The worker logs one warning when PSI is unavailable
+("early intervention disabled, hard intervention continues on valid core
+accounting") and one info line when it is restored. The working set is an
+estimate, not an OOM predictor: inactive file pages can be dirty or slow to
+reclaim, so it can underestimate pressure (dirty/writeback validation is
+deferred), and allocation bursts, stalled sampling, node pressure and
+Docker-in-Docker memory remain outside it. See
+[configuration](./configuration.md#worker-memory-guard).
 
 A confirmed command drain, resolved outcome and fresh low-usage dwell are
 required before another intervention/retry. The per-run memory-episode
