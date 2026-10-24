@@ -195,6 +195,42 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 					}
 					return uzicli.Exitf(uzicli.ExitConflict, "%s", guidance)
 				}
+				// #3390: the active-runs refusal names the blocking runs so the operator
+				// knows what to cancel. Run titles are server/forge text, so every field
+				// goes through cellText before it reaches the terminal. The guidance stays
+				// unbackticked and does not start with the binary name, which the
+				// instruction scanner would otherwise try to resolve as a command.
+				var active *uzicli.WorkerActiveRunsConflictError
+				if errors.As(err, &active) {
+					const guidance = "cancel them (uzi run cancel <run-id>) or wait for them to finish, and retry"
+					runs := active.Runs
+					if runs == nil {
+						runs = []uzicli.WorkerActiveRun{}
+					}
+					if p := env.printer(gf); p.Format == uzicli.FormatJSON {
+						_ = p.JSON(map[string]any{
+							"id":                args[0],
+							"deleted":           false,
+							"error":             guidance,
+							"active_runs":       runs,
+							"active_runs_total": active.Total,
+						})
+					} else {
+						w := cmd.ErrOrStderr()
+						_, _ = fmt.Fprintf(w, "worker has %d active run(s):\n", active.Total)
+						for _, r := range runs {
+							title := cellText(r.Title)
+							if title == "" {
+								title = cellText(shortID(r.ID))
+							}
+							_, _ = fmt.Fprintf(w, "%s  %s  %s  %s\n", cellText(shortID(r.ID)), cellText(r.Kind), cellText(r.Status), title)
+						}
+						if more := active.Total - int64(len(runs)); more > 0 {
+							_, _ = fmt.Fprintf(w, "and %d more\n", more)
+						}
+					}
+					return uzicli.Exitf(uzicli.ExitConflict, "%s", guidance)
+				}
 				return err
 			}
 			p := env.printer(gf)

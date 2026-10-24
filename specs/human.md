@@ -355,6 +355,7 @@ Tracked as GitLab issue vtmocanu/uzi#37; PRD at `prds/done/37-run-agent-selectio
 Tracked as GitLab issue vtmocanu/uzi#41; PRD at `prds/done/41-plan-revision-gate.md`.
 
 - At the plan gate the user can request changes (bounded rounds) to steer the plan without killing the run.
+- At the plan gate, when the plan requires a capability the repo's hint lacks, the steering user can add it to the repo with one click (later runs then route to a capable worker); when the plan needs Docker and the repo is not on the Docker worker allowlist, the gate says so. (AI-synced 2026-10-24, #3391)
 
 ## Feature #40 — Token usage & cost reporting (per run / per user / factory-wide)
 

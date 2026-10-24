@@ -595,6 +595,9 @@ type fakeStore struct {
 	// Delete worker.
 	countActiveRuns    int64
 	countActiveParams  *store.CountWorkerNonTerminalRunsParams
+	listActiveRows     []store.ListWorkerNonTerminalRunsRow
+	listActiveParams   *store.ListWorkerNonTerminalRunsParams
+	listActiveErr      error
 	deleteWorkerRows   int64
 	deleteWorkerParams *store.DeleteWorkerForUserParams
 	// PRD #529 M4 ephemeral teardown: delEphemeralRuns is the rows-affected the fake
@@ -1821,6 +1824,10 @@ func (f *fakeStore) UserHasAutoEligibleAnthropicToken(_ context.Context, _ uuid.
 func (f *fakeStore) CountWorkerNonTerminalRuns(_ context.Context, arg store.CountWorkerNonTerminalRunsParams) (int64, error) {
 	f.countActiveParams = &arg
 	return f.countActiveRuns, nil
+}
+func (f *fakeStore) ListWorkerNonTerminalRuns(_ context.Context, arg store.ListWorkerNonTerminalRunsParams) ([]store.ListWorkerNonTerminalRunsRow, error) {
+	f.listActiveParams = &arg
+	return f.listActiveRows, f.listActiveErr
 }
 func (f *fakeStore) DeleteWorkerForUser(_ context.Context, arg store.DeleteWorkerForUserParams) (int64, error) {
 	f.deleteWorkerParams = &arg
@@ -5147,11 +5154,22 @@ func TestDeleteWorkerRejectedWhileHoldingActiveRuns(t *testing.T) {
 	// A worker with a non-terminal run may not be deleted: the FK is ON DELETE SET
 	// NULL, so deleting would strand the run (an awaiting_approval run matches no
 	// sweep once its worker_id is gone).
-	fs := &fakeStore{countActiveRuns: 1}
+	runID := uuid.New()
+	fs := &fakeStore{countActiveRuns: 1, listActiveRows: []store.ListWorkerNonTerminalRunsRow{
+		{ID: runID, Kind: "issue", Status: "queued", IssueIid: pgtype.Int8{Int64: 7, Valid: true}, DisplayTitle: "Fix login"},
+	}}
 	svc := New(fs, newBox(t), testParams())
 	user, wkrID := uuid.New(), uuid.New()
-	if err := svc.DeleteWorker(context.Background(), user, wkrID); err != ErrWorkerHasActiveRuns {
+	err := svc.DeleteWorker(context.Background(), user, wkrID)
+	if !errors.Is(err, ErrWorkerHasActiveRuns) {
 		t.Fatalf("err = %v, want ErrWorkerHasActiveRuns", err)
+	}
+	var active *WorkerHasActiveRunsError
+	if !errors.As(err, &active) {
+		t.Fatalf("err = %T, want *WorkerHasActiveRunsError", err)
+	}
+	if active.Total != 1 || len(active.Runs) != 1 || active.Runs[0].ID != runID || active.Runs[0].DisplayTitle != "Fix login" {
+		t.Fatalf("active = %+v, want the one seeded run and total 1", active)
 	}
 	if fs.deleteWorkerParams != nil {
 		t.Fatal("no delete should be issued while the worker owns active runs")
@@ -5159,6 +5177,45 @@ func TestDeleteWorkerRejectedWhileHoldingActiveRuns(t *testing.T) {
 	// The guard is user-scoped so a cross-tenant attempt still 404s (never 409).
 	if fs.countActiveParams == nil || fs.countActiveParams.UserID != user {
 		t.Fatalf("active-run count must be scoped to the requesting user: %+v", fs.countActiveParams)
+	}
+	if fs.listActiveParams == nil || fs.listActiveParams.UserID != user || fs.listActiveParams.WorkerID != pgconv.UUID(wkrID) {
+		t.Fatalf("active-run listing must be scoped to the requesting user and worker: %+v", fs.listActiveParams)
+	}
+}
+
+func TestDeleteWorkerActiveRunsEmptyListStillRefuses(t *testing.T) {
+	// The runs may finish between the count and the listing; the count still decides, and
+	// Total comes from it rather than from the (empty) list.
+	fs := &fakeStore{countActiveRuns: 3, deleteWorkerRows: 1}
+	svc := New(fs, newBox(t), testParams())
+	err := svc.DeleteWorker(context.Background(), uuid.New(), uuid.New())
+	var active *WorkerHasActiveRunsError
+	if !errors.As(err, &active) || !errors.Is(err, ErrWorkerHasActiveRuns) {
+		t.Fatalf("err = %v, want *WorkerHasActiveRunsError", err)
+	}
+	if active.Total != 3 || len(active.Runs) != 0 {
+		t.Fatalf("active = %+v, want total 3 and no runs", active)
+	}
+	if fs.deleteWorkerParams != nil {
+		t.Fatal("no delete should be issued while the worker owns active runs")
+	}
+}
+
+func TestDeleteWorkerActiveRunsListErrorIsReturned(t *testing.T) {
+	// A failing listing must surface as-is (not be masked as a 409) and must not delete.
+	boom := errors.New("list runs failed")
+	fs := &fakeStore{countActiveRuns: 2, listActiveErr: boom, deleteWorkerRows: 1}
+	svc := New(fs, newBox(t), testParams())
+	err := svc.DeleteWorker(context.Background(), uuid.New(), uuid.New())
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want the injected list error", err)
+	}
+	var active *WorkerHasActiveRunsError
+	if errors.As(err, &active) {
+		t.Fatalf("err = %v, must not be a *WorkerHasActiveRunsError", err)
+	}
+	if fs.deleteWorkerParams != nil {
+		t.Fatal("no delete should be issued when the listing fails")
 	}
 }
 

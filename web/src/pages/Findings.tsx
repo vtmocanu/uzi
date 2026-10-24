@@ -31,6 +31,7 @@ import { Link, useSearchParams } from "react-router-dom";
 import {
   api,
   ApiError,
+  type FindingGroupFileResult,
   type IncidentalFinding,
   type IncidentalFindingBacklog,
   type Repo,
@@ -42,7 +43,7 @@ import { formatAgo } from "../lib/rateLimits";
 import { stripUnsafeChars } from "../lib/safeText";
 import { useDemoMode } from "../lib/demoMode";
 import { maskRepoPath } from "../lib/demoMask";
-import { Alert, cx, EmptyState, ListSkeleton, PageHeader } from "../components/ui";
+import { Alert, Button, cx, EmptyState, ListSkeleton, PageHeader } from "../components/ui";
 import { BugIcon, ChevronDownIcon, ChevronRightIcon, XIcon } from "../components/icons";
 import { TriageSummary } from "./RunView";
 import { useSetFindingsOpen } from "../components/FindingsOpenContext";
@@ -122,19 +123,65 @@ type FindingsToast = { message: string; undo: string[] };
 // GROUP_MAX mirrors the server's 1-50 cap on one grouped filing (issue #1724).
 const GROUP_MAX = 50;
 
-// groupFileIneligibility returns why the selected rows cannot be filed as one issue, or "" when
-// they can (issue #1724): 2..50 rows, every one open with evidence (finding_id), all one repo.
+// partitionByRepo splits the selected rows into one group per repo (issue #3410), preserving the
+// selection's first-seen repo order and its row order within each repo. Each partition is one
+// grouped filing: the server refuses a mixed-repo group, since a forge issue lives in one repo.
+function partitionByRepo(rows: IncidentalFinding[]): IncidentalFinding[][] {
+  const byRepo = new Map<string, IncidentalFinding[]>();
+  for (const r of rows) {
+    const part = byRepo.get(r.repo_id);
+    if (part) part.push(r);
+    else byRepo.set(r.repo_id, [r]);
+  }
+  return [...byRepo.values()];
+}
+
+// groupFileIneligibility returns why the selected rows cannot be filed as grouped issues, or ""
+// when they can (issues #1724, #3410): at least 2 rows, every one open with evidence (finding_id),
+// and at most 50 per repo. A selection spanning several repos files one issue per repo, so a repo
+// with a single selected row becomes a one-member group.
 function groupFileIneligibility(rows: IncidentalFinding[]): string {
   if (rows.length < 2) return "Select at least 2 findings to file as one issue.";
-  if (rows.length > GROUP_MAX) return `Select at most ${GROUP_MAX} findings to file as one issue.`;
   // A row claimed by an unfinished group filing has status "filing" (not selectable at all) and
   // group_operation_id set, so this check is defence in depth.
   if (rows.some((r) => r.group_operation_id)) return "A selected finding is already being filed as a group.";
   if (rows.some((r) => r.status !== "open")) return "Only open findings can be filed as one issue.";
   if (rows.some((r) => !r.finding_id)) return "Some selected findings have no evidence to file.";
-  if (rows.some((r) => r.repo_id !== rows[0].repo_id)) return "Select findings from one repo to file them together.";
+  const parts = partitionByRepo(rows);
+  if (parts.length === 1 && rows.length > GROUP_MAX) return `Select at most ${GROUP_MAX} findings to file as one issue.`;
+  if (parts.some((p) => p.length > GROUP_MAX)) return `Select at most ${GROUP_MAX} findings per repo to file one issue per repo.`;
   return "";
 }
+
+// A per-repo draft of a multi-repo filing (issue #3410). ids are captured when the review opens and
+// the card is keyed on them, so each card posts exactly the ids its draft was loaded for. Once its
+// filing returns, `result` replaces the draft card with a receipt that stays until the user closes
+// it, so a sibling card's outcome can never overwrite it.
+type RepoDraftResult =
+  | { kind: "filed"; message: string; url: string; iid: number; queued: boolean }
+  | { kind: "pending"; message: string }
+  | { kind: "conflict"; message: string };
+type RepoDraft = { key: string; ids: string[]; repoLabel: string; result?: RepoDraftResult };
+
+type GroupFileBody = { title: string; description: string; labels: string[]; send_to_uzi?: boolean };
+
+// groupFileMessage is the text a grouped filing reports, shared by the single-repo notice and the
+// per-repo receipts so the two cannot drift. The web has no release action, so a 202 (no issue)
+// points at the CLI release after the user inspects the forge.
+function groupFileMessage(count: number, res: FindingGroupFileResult): string {
+  if (res.issue) {
+    // The forge issue exists, so no release hint: release is refused once the issue is recorded and
+    // would reopen the members (a duplicate issue) while the operation is in flight.
+    const filed = `Filed ${count} ${count === 1 ? "finding" : "findings"} as issue #${res.issue.iid}.`;
+    return res.warning || res.phase !== "settled"
+      ? `${filed} ${res.warning ?? ""} Operation ${res.operation_id} (${res.phase}).`.replace(/ {2,}/g, " ")
+      : filed;
+  }
+  const detail = res.warning ? `${res.warning} ` : "";
+  return `${detail}Operation ${res.operation_id} (${res.phase}). The web has no release action. Check the forge for an issue for these findings first. If there is none, once the operation's deadline has passed (a few minutes), run: uzi findings release ${res.operation_id} --confirm-no-issue`;
+}
+
+const GROUP_CONFLICT_NOTICE = "One or more of those findings were already filed or are being filed. The list has been refreshed.";
 
 export function Findings() {
   const demo = useDemoMode();
@@ -163,6 +210,9 @@ export function Findings() {
   // File as one issue is disabled while the card is open, so a changed selection cannot be posted
   // under an old draft (and the user's edits are never silently discarded by a reload).
   const [groupTarget, setGroupTarget] = useState<{ ids: string[]; repoLabel: string } | null>(null);
+  // The multi-repo review (issue #3410): one draft per repo, null when none is open. Like
+  // groupTarget, it disables the bar's filing button while open.
+  const [repoDrafts, setRepoDrafts] = useState<RepoDraft[] | null>(null);
   const [notice, setNoticeText] = useState("");
   const [groupConfirmation, setGroupConfirmation] = useState<{ url: string; iid: number; queued: boolean } | null>(null);
   const setNotice = useCallback((text: string) => {
@@ -219,6 +269,7 @@ export function Findings() {
     setResolvedIds(new Set());
     setSelected(new Set());
     setGroupTarget(null);
+    setRepoDrafts(null);
     setNotice("");
   }, [bucket, repoFilter, runAnchor, setNotice]);
 
@@ -336,28 +387,16 @@ export function Findings() {
   // rethrows so the card keeps the user's edits and shows the error. The web has no release action,
   // so a 202 (no issue) points at the CLI release after the user inspects the forge.
   const fileGroup = useCallback(
-    async (ids: string[], body: { title: string; description: string; labels: string[]; send_to_uzi?: boolean }) => {
+    async (ids: string[], body: GroupFileBody) => {
       setActionErr("");
       setNotice("");
       try {
         const res = await api.fileFindingGroup({ ids, ...body });
         setGroupTarget(null);
         setSelected(new Set());
+        setNotice(groupFileMessage(ids.length, res));
         if (res.issue) {
-          // The forge issue exists, so no release hint: release is refused once the issue is recorded
-          // and would reopen the members (a duplicate issue) while the operation is in flight.
-          const filed = `Filed ${ids.length} findings as issue #${res.issue.iid}.`;
-          setNotice(
-            res.warning || res.phase !== "settled"
-              ? `${filed} ${res.warning ?? ""} Operation ${res.operation_id} (${res.phase}).`.replace(/ {2,}/g, " ")
-              : filed,
-          );
           setGroupConfirmation({ url: res.issue.web_url, iid: res.issue.iid, queued: body.send_to_uzi === true });
-        } else {
-          const detail = res.warning ? `${res.warning} ` : "";
-          setNotice(
-            `${detail}Operation ${res.operation_id} (${res.phase}). The web has no release action. Check the forge for an issue for these findings first. If there is none, once the operation's deadline has passed (a few minutes), run: uzi findings release ${res.operation_id} --confirm-no-issue`,
-          );
         }
         load();
         reloadStats();
@@ -365,7 +404,7 @@ export function Findings() {
         if (e instanceof ApiError && e.status === 409) {
           setGroupTarget(null);
           setSelected(new Set());
-          setNotice("One or more of those findings were already filed or are being filed. The list has been refreshed.");
+          setNotice(GROUP_CONFLICT_NOTICE);
           load();
           reloadStats();
           return;
@@ -375,6 +414,47 @@ export function Findings() {
     },
     [load, reloadStats, setNotice],
   );
+
+  // fileRepoDraft files one card of a multi-repo review (issue #3410) with fileGroup's server
+  // semantics, but scoped to that card: its outcome becomes the card's receipt, only its ids leave
+  // the selection, and every other card keeps its draft and edits. A non-409 error rethrows so the
+  // card keeps the user's edits and shows the error for a retry.
+  const fileRepoDraft = useCallback(
+    async (key: string, ids: string[], body: GroupFileBody) => {
+      setActionErr("");
+      const settle = (result: RepoDraftResult) => {
+        setRepoDrafts((prev) => prev && prev.map((d) => (d.key === key ? { ...d, result } : d)));
+        setSelected((prev) => {
+          const next = new Set(prev);
+          for (const id of ids) next.delete(id);
+          return next;
+        });
+        load();
+        reloadStats();
+      };
+      try {
+        const res = await api.fileFindingGroup({ ids, ...body });
+        const message = groupFileMessage(ids.length, res);
+        settle(
+          res.issue
+            ? { kind: "filed", message, url: res.issue.web_url, iid: res.issue.iid, queued: body.send_to_uzi === true }
+            : { kind: "pending", message },
+        );
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 409) {
+          settle({ kind: "conflict", message: GROUP_CONFLICT_NOTICE });
+          return;
+        }
+        throw e;
+      }
+    },
+    [load, reloadStats],
+  );
+  const closeRepoDraft = (key: string) =>
+    setRepoDrafts((prev) => {
+      const next = (prev ?? []).filter((d) => d.key !== key);
+      return next.length > 0 ? next : null;
+    });
 
   // settle patches every row a bulk verdict response re-read (exactly the rows that moved, never the
   // skipped ones) and returns their disposition ids — the Undo set.
@@ -525,15 +605,29 @@ export function Findings() {
     const byDisposition = new Map((backlog?.findings ?? []).map((f) => [f.disposition_id, f]));
     return activeSelected.map((id) => byDisposition.get(id)).filter((f): f is IncidentalFinding => !!f);
   }, [backlog, activeSelected]);
-  const groupDisabledReason = groupTarget
-    ? "Close the open draft before filing a different selection."
-    : groupFileIneligibility(selectedRows);
+  const selectedPartitions = useMemo(() => partitionByRepo(selectedRows), [selectedRows]);
+  const groupDisabledReason =
+    groupTarget || repoDrafts
+      ? "Close the open draft before filing a different selection."
+      : groupFileIneligibility(selectedRows);
+  const groupLabel =
+    selectedPartitions.length > 1 ? `File ${selectedPartitions.length} issues, one per repo` : "File as one issue";
   const openGroup = () => {
     if (groupDisabledReason || selectedRows.length === 0) return;
-    setGroupTarget({
-      ids: [...activeSelected],
-      repoLabel: stripUnsafeChars(maskRepoPath(selectedRows[0].repo_path, demo)),
-    });
+    setNotice("");
+    if (selectedPartitions.length === 1) {
+      setGroupTarget({
+        ids: [...activeSelected],
+        repoLabel: stripUnsafeChars(maskRepoPath(selectedRows[0].repo_path, demo)),
+      });
+      return;
+    }
+    setRepoDrafts(
+      selectedPartitions.map((part) => {
+        const ids = part.map((f) => f.disposition_id as string);
+        return { key: ids.join(","), ids, repoLabel: stripUnsafeChars(maskRepoPath(part[0].repo_path, demo)) };
+      }),
+    );
   };
   const allSelected = selectableIds.length > 0 && activeSelected.length === selectableIds.length;
   const someSelected = activeSelected.length > 0;
@@ -705,6 +799,62 @@ export function Findings() {
         </div>
       )}
 
+      {/* The multi-repo review (issue #3410), outside the list block for the same reason. */}
+      {repoDrafts && (
+        <section aria-label="Issues to file, one per repo" className="space-y-3">
+          {repoDrafts.map((d) => (
+            <section
+              key={d.key}
+              aria-label={`Issue for ${d.repoLabel}`}
+              className="rounded-lg border border-edge bg-raised/40 px-3 py-2.5"
+            >
+              <p className="mb-2 text-sm font-medium text-fg">
+                {d.ids.length === 1 ? "File 1 finding" : `File ${d.ids.length} findings`} in {d.repoLabel} as one issue
+              </p>
+              {d.result ? (
+                <div role="status" className="space-y-1 text-sm text-muted">
+                  <p>{d.result.message}</p>
+                  {d.result.kind === "filed" && (
+                    <>
+                      <TriageStateChip
+                        {...findingState({ status: "filed", filed_issue_iid: d.result.iid, filed_issue_url: d.result.url })}
+                      />
+                      {d.result.queued && (
+                        <>
+                          <p>{SEND_TO_UZI_CONFIRMED}</p>
+                          <p>{SEND_TO_UZI_HELP}</p>
+                        </>
+                      )}
+                    </>
+                  )}
+                  <Button size="sm" variant="ghost" onClick={() => closeRepoDraft(d.key)}>
+                    Close
+                  </Button>
+                </div>
+              ) : (
+                <IssueDraftCard
+                  allowSendToUzi
+                  fixedRepoLabel={d.repoLabel}
+                  loadDraft={async () => {
+                    const draft = await api.findingGroupIssueDraft(d.ids);
+                    return { title: draft.title, description: draft.description, labels: draft.labels, provenance: "" };
+                  }}
+                  onCreate={(values) =>
+                    fileRepoDraft(d.key, d.ids, {
+                      title: values.title,
+                      description: values.description,
+                      labels: values.labels,
+                      ...(values.send_to_uzi ? { send_to_uzi: true } : {}),
+                    })
+                  }
+                  onCancel={() => closeRepoDraft(d.key)}
+                />
+              )}
+            </section>
+          ))}
+        </section>
+      )}
+
       {loading && <ListSkeleton rows={4} />}
 
       {!loading && backlog && (
@@ -759,6 +909,7 @@ export function Findings() {
           onMarkDone={() => markDone(activeSelected)}
           onDismiss={(reason) => dismiss(activeSelected, reason)}
           onFileGroup={openGroup}
+          fileGroupLabel={groupLabel}
           fileGroupDisabledReason={groupDisabledReason}
         />
       )}

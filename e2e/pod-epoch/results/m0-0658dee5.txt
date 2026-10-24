@@ -1,0 +1,717 @@
+### smoke.log
+HEAD=0658dee55eb8fb9c01f3100e0a92767b7cced514 dirty=0
+2026-10-24T13:25:52Z
+LISTENERS rootless no non-loopback TCP listener
+EVENTS rootless restart: PE_EVENTS_RC=0 end=ended lines=11
+EVENTS rootless stop: PE_EVENTS_RC=143 end=stopped lines=7
+SMOKE rootless PASS
+LISTENERS rootful no non-loopback TCP listener
+EVENTS rootful restart: PE_EVENTS_RC=0 end=ended lines=11
+EVENTS rootful stop: PE_EVENTS_RC=143 end=stopped lines=7
+SMOKE rootful PASS
+EXIT=0
+### exp-restore.log
+HEAD=0658dee55eb8fb9c01f3100e0a92767b7cced514 dirty=0
+2026-10-24T13:26:41Z
+RESULT restore rootless engine=29.8.0
+RESULT restore rootless restart.pre.c-always=status=running started=2026-10-24T13:26:48.40719785Z
+RESULT restore rootless restart.pre.c-always-stopped=status=exited started=2026-10-24T13:26:48.853541804Z
+RESULT restore rootless restart.pre.c-unless=status=running started=2026-10-24T13:26:50.658255393Z
+RESULT restore rootless restart.pre.c-unless-stopped=status=exited started=2026-10-24T13:26:51.251504106Z
+RESULT restore rootless restart.pre.c-onfail=status=running started=2026-10-24T13:26:53.02004364Z
+RESULT restore rootless restart.pre.c-no=status=running started=2026-10-24T13:26:53.555552309Z
+RESULT restore rootless restart.pre.c-no-stopped=status=exited started=2026-10-24T13:26:54.083316813Z
+RESULT restore rootless restart.first_response.time=2026-10-24T13:27:10.040193146Z
+RESULT restore rootless restart.first_response.probes_before_success=73
+RESULT restore rootless restart.first_response.info=swarm=inactive live_restore=false plugins=0 engine_id=4b6f811a-9031-45ba-81cb-1f3461483b6b
+RESULT restore rootless restart.window.rc=143 elapsed_ms=20134
+RESULT restore rootless restart.window.stderr_lines=0
+RESULT restore rootless restart.first.c-always=status=running list_state=running restarted_by_first_response=yes exit=0 restart_count=0 policy=always
+RESULT restore rootless restart.end.c-always=status=running changed_since_first_response=no
+RESULT restore rootless restart.first.c-always-stopped=status=running list_state=running restarted_by_first_response=yes exit=0 restart_count=0 policy=always
+RESULT restore rootless restart.end.c-always-stopped=status=running changed_since_first_response=no
+RESULT restore rootless restart.first.c-unless=status=running list_state=running restarted_by_first_response=yes exit=0 restart_count=0 policy=unless-stopped
+RESULT restore rootless restart.end.c-unless=status=running changed_since_first_response=no
+RESULT restore rootless restart.first.c-unless-stopped=status=exited list_state=exited restarted_by_first_response=no exit=137 restart_count=0 policy=unless-stopped
+RESULT restore rootless restart.end.c-unless-stopped=status=exited changed_since_first_response=no
+RESULT restore rootless restart.first.c-onfail=status=running list_state=running restarted_by_first_response=yes exit=0 restart_count=0 policy=on-failure
+RESULT restore rootless restart.end.c-onfail=status=running changed_since_first_response=no
+RESULT restore rootless restart.first.c-no=status=exited list_state=exited restarted_by_first_response=no exit=137 restart_count=0 policy=no
+RESULT restore rootless restart.end.c-no=status=exited changed_since_first_response=no
+RESULT restore rootless restart.first.c-no-stopped=status=exited list_state=exited restarted_by_first_response=no exit=137 restart_count=0 policy=no
+RESULT restore rootless restart.end.c-no-stopped=status=exited changed_since_first_response=no
+RESULT restore rootless restart.running_at_first_response=4
+RESULT restore rootless check.restart.c-no.not-started=PASS
+RESULT restore rootless check.restart.c-no-stopped.not-started=PASS
+RESULT restore rootless restart.window.seconds=20 (bounded, supplementary)
+RESULT restore rootless restart.window.events_after_first_response=0
+RESULT restore rootless check.restart.window.no-events-after-first-response=PASS
+RESULT restore rootless check.restart.window.states-unchanged=PASS
+RESULT restore rootless restart.window.control_events=7
+RESULT restore rootless restart.window.control_rc=143 (the timeout-kill status of this image's timeout)
+RESULT restore rootless control.restart.window-sees-events=PASS
+RESULT restore rootless restart.window.instrument=ok (rc=143 expected=143 elapsed_ms=20134 stderr_bytes=0)
+RESULT restore rootless check.restart.window.instrument-ok=PASS
+RESULT restore rootless replace.pre.c-always=status=running started=2026-10-24T13:27:38.036110357Z
+RESULT restore rootless replace.pre.c-always-stopped=status=exited started=2026-10-24T13:27:38.564086624Z
+RESULT restore rootless replace.pre.c-unless=status=running started=2026-10-24T13:27:40.305722197Z
+RESULT restore rootless replace.pre.c-unless-stopped=status=exited started=2026-10-24T13:27:40.771459654Z
+RESULT restore rootless replace.pre.c-onfail=status=running started=2026-10-24T13:27:42.512902366Z
+RESULT restore rootless replace.pre.c-no=status=running started=2026-10-24T13:27:42.977388038Z
+RESULT restore rootless replace.pre.c-no-stopped=status=exited started=2026-10-24T13:27:43.550147641Z
+RESULT restore rootless replace.first_response.time=2026-10-24T13:27:51.442027336Z
+RESULT restore rootless replace.first_response.probes_before_success=2
+RESULT restore rootless replace.first_response.info=swarm=inactive live_restore=false plugins=0 engine_id=4b6f811a-9031-45ba-81cb-1f3461483b6b
+RESULT restore rootless replace.window.rc=143 elapsed_ms=20178
+RESULT restore rootless replace.window.stderr_lines=0
+RESULT restore rootless replace.first.c-always=status=running list_state=running restarted_by_first_response=yes exit=0 restart_count=0 policy=always
+RESULT restore rootless replace.end.c-always=status=running changed_since_first_response=no
+RESULT restore rootless replace.first.c-always-stopped=status=running list_state=running restarted_by_first_response=yes exit=0 restart_count=0 policy=always
+RESULT restore rootless replace.end.c-always-stopped=status=running changed_since_first_response=no
+RESULT restore rootless replace.first.c-unless=status=running list_state=running restarted_by_first_response=yes exit=0 restart_count=0 policy=unless-stopped
+RESULT restore rootless replace.end.c-unless=status=running changed_since_first_response=no
+RESULT restore rootless replace.first.c-unless-stopped=status=exited list_state=exited restarted_by_first_response=no exit=137 restart_count=0 policy=unless-stopped
+RESULT restore rootless replace.end.c-unless-stopped=status=exited changed_since_first_response=no
+RESULT restore rootless replace.first.c-onfail=status=running list_state=running restarted_by_first_response=yes exit=0 restart_count=0 policy=on-failure
+RESULT restore rootless replace.end.c-onfail=status=running changed_since_first_response=no
+RESULT restore rootless replace.first.c-no=status=exited list_state=exited restarted_by_first_response=no exit=255 restart_count=0 policy=no
+RESULT restore rootless replace.end.c-no=status=exited changed_since_first_response=no
+RESULT restore rootless replace.first.c-no-stopped=status=exited list_state=exited restarted_by_first_response=no exit=137 restart_count=0 policy=no
+RESULT restore rootless replace.end.c-no-stopped=status=exited changed_since_first_response=no
+RESULT restore rootless replace.running_at_first_response=4
+RESULT restore rootless check.replace.c-no.not-started=PASS
+RESULT restore rootless check.replace.c-no-stopped.not-started=PASS
+RESULT restore rootless replace.window.seconds=20 (bounded, supplementary)
+RESULT restore rootless replace.window.events_after_first_response=0
+RESULT restore rootless check.replace.window.no-events-after-first-response=PASS
+RESULT restore rootless check.replace.window.states-unchanged=PASS
+RESULT restore rootless replace.window.control_events=7
+RESULT restore rootless replace.window.control_rc=143 (the timeout-kill status of this image's timeout)
+RESULT restore rootless control.replace.window-sees-events=PASS
+RESULT restore rootless replace.window.instrument=ok (rc=143 expected=143 elapsed_ms=20178 stderr_bytes=0)
+RESULT restore rootless check.replace.window.instrument-ok=PASS
+RESULT restore rootless barrier.first_response.info=swarm=inactive live_restore=false plugins=0
+RESULT restore rootless barrier.containers=b-stopped=exited/no b-exited=exited/no
+RESULT restore rootless check.barrier.no-running-restarting-paused-by-inspect=PASS
+RESULT restore rootless check.barrier.no-running-restarting-paused-by-list=PASS
+RESULT restore rootless check.barrier.every-policy-is-no=PASS
+RESULT restore rootless check.barrier.swarm-inactive=PASS
+RESULT restore rootless check.barrier.plugin-ls-empty=PASS
+RESULT restore rootless check.barrier.live-restore-disabled=PASS
+RESULT restore rootless check.barrier.has-containers=PASS
+RESULT restore rootless control.barrier.fr-sees-running-containers=PASS
+RESULT restore rootless control.barrier.fr-sees-restart-policies=PASS
+RESULT restore rootless control.swarm-init.flags=listen-addr=127.0.0.1:2377 data-path-addr=127.0.0.1
+RESULT restore rootless control.swarm-active.read=swarm=active live=false
+RESULT restore rootless control.swarm-state-readable=PASS
+RESULT restore rootless check.barrier-controls.swarm-back-to-inactive=PASS
+RESULT restore rootless control.plugin-ls-readable=PASS
+RESULT restore rootless check.barrier-controls.plugin-removed=PASS
+RESULT restore rootless control.live-restore.read=swarm=inactive live=true
+RESULT restore rootless control.live-restore-readable=PASS
+RESULT restore rootless check.barrier-controls.live-restore-off-again=PASS
+RESULT restore rootless detect.control.engine_id_before=4b6f811a-9031-45ba-81cb-1f3461483b6b
+RESULT restore rootless detect.control.socket_inode_before=841629
+RESULT restore rootless control.detect.control.stream-receives-events=PASS
+RESULT restore rootless control.detect.control.stream-open-before-trigger=PASS
+RESULT restore rootless control.detect.control.stream-held-open-5s=PASS
+RESULT restore rootless detect.control.end=stopped rc=143
+RESULT restore rootless check.detect.control.stream-ends-only-when-stopped=PASS
+RESULT restore rootless detect.restart.engine_id_before=4b6f811a-9031-45ba-81cb-1f3461483b6b
+RESULT restore rootless detect.restart.socket_inode_before=841629
+RESULT restore rootless control.detect.restart.stream-receives-events=PASS
+RESULT restore rootless control.detect.restart.stream-open-before-trigger=PASS
+RESULT restore rootless detect.restart.supp.time_to_eof_ms=123
+RESULT restore rootless detect.restart.stream_end=ended rc=0
+RESULT restore rootless check.detect.restart.stream-ended-by-daemon=PASS
+RESULT restore rootless check.detect.restart.client-container-survived=PASS
+RESULT restore rootless detect.restart.daemon_container_after=running exit=0
+RESULT restore rootless detect.restart.engine_id_after=4b6f811a-9031-45ba-81cb-1f3461483b6b
+RESULT restore rootless detect.restart.socket_inode_after=841666
+RESULT restore rootless check.detect.restart.engine-id-identical=PASS
+RESULT restore rootless detect.restart.socket_inode_changed_plain=yes
+RESULT restore rootless detect.restart.socket_file_vs_held_inode=recreated (held=841629 now=841666)
+RESULT restore rootless check.detect.restart.socket-inodes-measured=PASS
+RESULT restore rootless detect.kill9.engine_id_before=4b6f811a-9031-45ba-81cb-1f3461483b6b
+RESULT restore rootless detect.kill9.socket_inode_before=841666
+RESULT restore rootless control.detect.kill9.stream-receives-events=PASS
+RESULT restore rootless control.detect.kill9.stream-open-before-trigger=PASS
+RESULT restore rootless detect.kill9.target_before=container_pid_startedat=[1070218 2026-10-24T13:29:00.219020432Z] dockerd_pid:starttime=[73:140221172 ] container_init_comm=rootlesskit dockerd_is_pid1=no
+RESULT restore rootless detect.kill9.supp.time_to_eof_ms=215
+RESULT restore rootless detect.kill9.delivery=in-container-kill-9
+RESULT restore rootless detect.kill9.kill_effect=target_gone=yes how=daemon-container-exited
+RESULT restore rootless check.detect.kill9.kill-delivered=PASS
+RESULT restore rootless detect.kill9.stream_end=ended rc=1
+RESULT restore rootless check.detect.kill9.stream-ended-by-daemon=PASS
+RESULT restore rootless check.detect.kill9.client-container-survived=PASS
+RESULT restore rootless detect.kill9.daemon_container_after=exited exit=137
+RESULT restore rootless detect.kill9.containerd_pidfile_before_restart=path=/run/dind/docker/containerd/containerd.pid exists=no
+RESULT restore rootless detect.kill9.recovery.harness_tmpfs_runtime_dir=same-container-restart-ok
+RESULT restore rootless detect.kill9.engine_id_after=4b6f811a-9031-45ba-81cb-1f3461483b6b
+RESULT restore rootless detect.kill9.socket_inode_after=841629
+RESULT restore rootless check.detect.kill9.engine-id-identical=PASS
+RESULT restore rootless detect.kill9.socket_inode_changed_plain=yes
+RESULT restore rootless detect.kill9.socket_file_vs_held_inode=recreated (held=841666 now=841629)
+RESULT restore rootless check.detect.kill9.socket-inodes-measured=PASS
+RESULT restore rootless detect.sigterm.engine_id_before=4b6f811a-9031-45ba-81cb-1f3461483b6b
+RESULT restore rootless detect.sigterm.socket_inode_before=841629
+RESULT restore rootless control.detect.sigterm.stream-receives-events=PASS
+RESULT restore rootless control.detect.sigterm.stream-open-before-trigger=PASS
+RESULT restore rootless detect.sigterm.supp.time_to_eof_ms=201
+RESULT restore rootless detect.sigterm.stream_end=ended rc=0
+RESULT restore rootless check.detect.sigterm.stream-ended-by-daemon=PASS
+RESULT restore rootless check.detect.sigterm.client-container-survived=PASS
+RESULT restore rootless detect.sigterm.daemon_container_after=exited exit=0
+RESULT restore rootless detect.sigterm.containerd_pidfile_before_restart=path=/run/dind/docker/containerd/containerd.pid exists=no
+RESULT restore rootless detect.sigterm.recovery.harness_tmpfs_runtime_dir=same-container-restart-ok
+RESULT restore rootless detect.sigterm.engine_id_after=4b6f811a-9031-45ba-81cb-1f3461483b6b
+RESULT restore rootless detect.sigterm.socket_inode_after=841635
+RESULT restore rootless check.detect.sigterm.engine-id-identical=PASS
+RESULT restore rootless detect.sigterm.socket_inode_changed_plain=yes
+RESULT restore rootless detect.sigterm.socket_file_vs_held_inode=recreated (held=841629 now=841635)
+RESULT restore rootless check.detect.sigterm.socket-inodes-measured=PASS
+EXP restore rootless PASS
+RESULT restore rootful engine=29.8.0
+RESULT restore rootful restart.pre.c-always=status=running started=2026-10-24T13:29:35.261095214Z
+RESULT restore rootful restart.pre.c-always-stopped=status=exited started=2026-10-24T13:29:35.954623658Z
+RESULT restore rootful restart.pre.c-unless=status=running started=2026-10-24T13:29:37.806142532Z
+RESULT restore rootful restart.pre.c-unless-stopped=status=exited started=2026-10-24T13:29:38.503231875Z
+RESULT restore rootful restart.pre.c-onfail=status=running started=2026-10-24T13:29:40.503453005Z
+RESULT restore rootful restart.pre.c-no=status=running started=2026-10-24T13:29:41.095008619Z
+RESULT restore rootful restart.pre.c-no-stopped=status=exited started=2026-10-24T13:29:41.7778729Z
+RESULT restore rootful restart.first_response.time=2026-10-24T13:29:59.846990279Z
+RESULT restore rootful restart.first_response.probes_before_success=75
+RESULT restore rootful restart.first_response.info=swarm=inactive live_restore=false plugins=0 engine_id=ddb9a0af-7409-40f1-be85-54de412100ab
+RESULT restore rootful restart.window.rc=143 elapsed_ms=20166
+RESULT restore rootful restart.window.stderr_lines=0
+RESULT restore rootful restart.first.c-always=status=running list_state=running restarted_by_first_response=yes exit=0 restart_count=0 policy=always
+RESULT restore rootful restart.end.c-always=status=running changed_since_first_response=no
+RESULT restore rootful restart.first.c-always-stopped=status=running list_state=running restarted_by_first_response=yes exit=0 restart_count=0 policy=always
+RESULT restore rootful restart.end.c-always-stopped=status=running changed_since_first_response=no
+RESULT restore rootful restart.first.c-unless=status=running list_state=running restarted_by_first_response=yes exit=0 restart_count=0 policy=unless-stopped
+RESULT restore rootful restart.end.c-unless=status=running changed_since_first_response=no
+RESULT restore rootful restart.first.c-unless-stopped=status=exited list_state=exited restarted_by_first_response=no exit=137 restart_count=0 policy=unless-stopped
+RESULT restore rootful restart.end.c-unless-stopped=status=exited changed_since_first_response=no
+RESULT restore rootful restart.first.c-onfail=status=running list_state=running restarted_by_first_response=yes exit=0 restart_count=0 policy=on-failure
+RESULT restore rootful restart.end.c-onfail=status=running changed_since_first_response=no
+RESULT restore rootful restart.first.c-no=status=exited list_state=exited restarted_by_first_response=no exit=137 restart_count=0 policy=no
+RESULT restore rootful restart.end.c-no=status=exited changed_since_first_response=no
+RESULT restore rootful restart.first.c-no-stopped=status=exited list_state=exited restarted_by_first_response=no exit=137 restart_count=0 policy=no
+RESULT restore rootful restart.end.c-no-stopped=status=exited changed_since_first_response=no
+RESULT restore rootful restart.running_at_first_response=4
+RESULT restore rootful check.restart.c-no.not-started=PASS
+RESULT restore rootful check.restart.c-no-stopped.not-started=PASS
+RESULT restore rootful restart.window.seconds=20 (bounded, supplementary)
+RESULT restore rootful restart.window.events_after_first_response=0
+RESULT restore rootful check.restart.window.no-events-after-first-response=PASS
+RESULT restore rootful check.restart.window.states-unchanged=PASS
+RESULT restore rootful restart.window.control_events=7
+RESULT restore rootful restart.window.control_rc=143 (the timeout-kill status of this image's timeout)
+RESULT restore rootful control.restart.window-sees-events=PASS
+RESULT restore rootful restart.window.instrument=ok (rc=143 expected=143 elapsed_ms=20166 stderr_bytes=0)
+RESULT restore rootful check.restart.window.instrument-ok=PASS
+RESULT restore rootful replace.pre.c-always=status=running started=2026-10-24T13:30:28.231341453Z
+RESULT restore rootful replace.pre.c-always-stopped=status=exited started=2026-10-24T13:30:28.723103741Z
+RESULT restore rootful replace.pre.c-unless=status=running started=2026-10-24T13:30:30.928699512Z
+RESULT restore rootful replace.pre.c-unless-stopped=status=exited started=2026-10-24T13:30:31.500896602Z
+RESULT restore rootful replace.pre.c-onfail=status=running started=2026-10-24T13:30:33.208202034Z
+RESULT restore rootful replace.pre.c-no=status=running started=2026-10-24T13:30:33.719718511Z
+RESULT restore rootful replace.pre.c-no-stopped=status=exited started=2026-10-24T13:30:34.16234694Z
+RESULT restore rootful replace.first_response.time=2026-10-24T13:30:41.931684967Z
+RESULT restore rootful replace.first_response.probes_before_success=8
+RESULT restore rootful replace.first_response.info=swarm=inactive live_restore=false plugins=0 engine_id=ddb9a0af-7409-40f1-be85-54de412100ab
+RESULT restore rootful replace.window.rc=143 elapsed_ms=20123
+RESULT restore rootful replace.window.stderr_lines=0
+RESULT restore rootful replace.first.c-always=status=running list_state=running restarted_by_first_response=yes exit=0 restart_count=0 policy=always
+RESULT restore rootful replace.end.c-always=status=running changed_since_first_response=no
+RESULT restore rootful replace.first.c-always-stopped=status=running list_state=running restarted_by_first_response=yes exit=0 restart_count=0 policy=always
+RESULT restore rootful replace.end.c-always-stopped=status=running changed_since_first_response=no
+RESULT restore rootful replace.first.c-unless=status=running list_state=running restarted_by_first_response=yes exit=0 restart_count=0 policy=unless-stopped
+RESULT restore rootful replace.end.c-unless=status=running changed_since_first_response=no
+RESULT restore rootful replace.first.c-unless-stopped=status=exited list_state=exited restarted_by_first_response=no exit=137 restart_count=0 policy=unless-stopped
+RESULT restore rootful replace.end.c-unless-stopped=status=exited changed_since_first_response=no
+RESULT restore rootful replace.first.c-onfail=status=running list_state=running restarted_by_first_response=yes exit=0 restart_count=0 policy=on-failure
+RESULT restore rootful replace.end.c-onfail=status=running changed_since_first_response=no
+RESULT restore rootful replace.first.c-no=status=exited list_state=exited restarted_by_first_response=no exit=255 restart_count=0 policy=no
+RESULT restore rootful replace.end.c-no=status=exited changed_since_first_response=no
+RESULT restore rootful replace.first.c-no-stopped=status=exited list_state=exited restarted_by_first_response=no exit=137 restart_count=0 policy=no
+RESULT restore rootful replace.end.c-no-stopped=status=exited changed_since_first_response=no
+RESULT restore rootful replace.running_at_first_response=4
+RESULT restore rootful check.replace.c-no.not-started=PASS
+RESULT restore rootful check.replace.c-no-stopped.not-started=PASS
+RESULT restore rootful replace.window.seconds=20 (bounded, supplementary)
+RESULT restore rootful replace.window.events_after_first_response=0
+RESULT restore rootful check.replace.window.no-events-after-first-response=PASS
+RESULT restore rootful check.replace.window.states-unchanged=PASS
+RESULT restore rootful replace.window.control_events=7
+RESULT restore rootful replace.window.control_rc=143 (the timeout-kill status of this image's timeout)
+RESULT restore rootful control.replace.window-sees-events=PASS
+RESULT restore rootful replace.window.instrument=ok (rc=143 expected=143 elapsed_ms=20123 stderr_bytes=0)
+RESULT restore rootful check.replace.window.instrument-ok=PASS
+RESULT restore rootful barrier.first_response.info=swarm=inactive live_restore=false plugins=0
+RESULT restore rootful barrier.containers=b-stopped=exited/no b-exited=exited/no
+RESULT restore rootful check.barrier.no-running-restarting-paused-by-inspect=PASS
+RESULT restore rootful check.barrier.no-running-restarting-paused-by-list=PASS
+RESULT restore rootful check.barrier.every-policy-is-no=PASS
+RESULT restore rootful check.barrier.swarm-inactive=PASS
+RESULT restore rootful check.barrier.plugin-ls-empty=PASS
+RESULT restore rootful check.barrier.live-restore-disabled=PASS
+RESULT restore rootful check.barrier.has-containers=PASS
+RESULT restore rootful control.barrier.fr-sees-running-containers=PASS
+RESULT restore rootful control.barrier.fr-sees-restart-policies=PASS
+RESULT restore rootful control.swarm-init.flags=listen-addr=127.0.0.1:2377 data-path-addr=127.0.0.1
+RESULT restore rootful control.swarm-active.read=swarm=active live=false
+RESULT restore rootful control.swarm-state-readable=PASS
+RESULT restore rootful check.barrier-controls.swarm-back-to-inactive=PASS
+RESULT restore rootful control.plugin-ls-readable=PASS
+RESULT restore rootful check.barrier-controls.plugin-removed=PASS
+RESULT restore rootful control.live-restore.read=swarm=inactive live=true
+RESULT restore rootful control.live-restore-readable=PASS
+RESULT restore rootful check.barrier-controls.live-restore-off-again=PASS
+RESULT restore rootful detect.control.engine_id_before=ddb9a0af-7409-40f1-be85-54de412100ab
+RESULT restore rootful detect.control.socket_inode_before=n/a (loopback tcp)
+RESULT restore rootful control.detect.control.stream-receives-events=PASS
+RESULT restore rootful control.detect.control.stream-open-before-trigger=PASS
+RESULT restore rootful control.detect.control.stream-held-open-5s=PASS
+RESULT restore rootful detect.control.end=stopped rc=143
+RESULT restore rootful check.detect.control.stream-ends-only-when-stopped=PASS
+RESULT restore rootful detect.restart.engine_id_before=ddb9a0af-7409-40f1-be85-54de412100ab
+RESULT restore rootful detect.restart.socket_inode_before=n/a (loopback tcp)
+RESULT restore rootful control.detect.restart.stream-receives-events=PASS
+RESULT restore rootful control.detect.restart.stream-open-before-trigger=PASS
+RESULT restore rootful detect.restart.supp.time_to_eof_ms=78
+RESULT restore rootful detect.restart.stream_end=ended rc=0
+RESULT restore rootful check.detect.restart.stream-ended-by-daemon=PASS
+RESULT restore rootful check.detect.restart.client-container-survived=PASS
+RESULT restore rootful detect.restart.daemon_container_after=running exit=0
+RESULT restore rootful detect.restart.engine_id_after=ddb9a0af-7409-40f1-be85-54de412100ab
+RESULT restore rootful detect.restart.socket_inode_after=n/a (loopback tcp)
+RESULT restore rootful check.detect.restart.engine-id-identical=PASS
+RESULT restore rootful detect.restart.socket_inode_changed_plain=n/a (loopback tcp)
+RESULT restore rootful detect.restart.socket_file_vs_held_inode=n/a (loopback tcp)
+RESULT restore rootful check.detect.restart.socket-inodes-measured=PASS
+RESULT restore rootful detect.kill9.engine_id_before=ddb9a0af-7409-40f1-be85-54de412100ab
+RESULT restore rootful detect.kill9.socket_inode_before=n/a (loopback tcp)
+RESULT restore rootful control.detect.kill9.stream-receives-events=PASS
+RESULT restore rootful control.detect.kill9.stream-open-before-trigger=PASS
+RESULT restore rootful detect.kill9.target_before=container_pid_startedat=[1085943 2026-10-24T13:31:39.998033441Z] dockerd_pid:starttime=[25:140237130 ] container_init_comm=docker-init dockerd_is_pid1=no
+RESULT restore rootful detect.kill9.supp.time_to_eof_ms=102
+RESULT restore rootful detect.kill9.delivery=outer-docker-kill
+RESULT restore rootful detect.kill9.kill_effect=target_gone=yes how=daemon-container-exited
+RESULT restore rootful check.detect.kill9.kill-delivered=PASS
+RESULT restore rootful detect.kill9.stream_end=ended rc=1
+RESULT restore rootful check.detect.kill9.stream-ended-by-daemon=PASS
+RESULT restore rootful check.detect.kill9.client-container-survived=PASS
+RESULT restore rootful detect.kill9.daemon_container_after=exited exit=137
+RESULT restore rootful detect.kill9.containerd_pidfile_before_restart=path=/var/run/docker/containerd/containerd.pid exists=yes content=36
+RESULT restore rootful detect.kill9.restart_failure_log=time="2026-10-24T13:31:47.012147919Z" level=warning msg="Binding to an IP address, even on localhost, can also give access to scripts run in a browser. Be safe out there!" host="tcp://127.0.0.1:2375" | time="2026-10-24T13:31:47.012157153Z" level=warning msg="[DEPRECATION NOTICE] In future versions this will be a hard failure preventing the daemon from starting! Learn more at: https://docs.docker.com | time="2026-10-24T13:31:48.013296111Z" level=info msg="containerd not running, starting managed containerd" | time="2026-10-24T13:31:48.016469118Z" level=info msg="Daemon shutdown complete" error="failed to start containerd: failed to save containerd pid to disk: process with PID 36 is still running" | failed to start containerd: failed to save containerd pid to disk: process with PID 36 is still running
+RESULT restore rootful detect.kill9.recovery=same-container-restart-FAILED
+RESULT restore rootful detect.kill9.engine_id_after=ddb9a0af-7409-40f1-be85-54de412100ab
+RESULT restore rootful detect.kill9.socket_inode_after=n/a (loopback tcp)
+RESULT restore rootful check.detect.kill9.engine-id-identical=PASS
+RESULT restore rootful detect.kill9.socket_inode_changed_plain=n/a (loopback tcp)
+RESULT restore rootful detect.kill9.socket_file_vs_held_inode=n/a (loopback tcp)
+RESULT restore rootful check.detect.kill9.socket-inodes-measured=PASS
+RESULT restore rootful detect.sigterm.engine_id_before=ddb9a0af-7409-40f1-be85-54de412100ab
+RESULT restore rootful detect.sigterm.socket_inode_before=n/a (loopback tcp)
+RESULT restore rootful control.detect.sigterm.stream-receives-events=PASS
+RESULT restore rootful control.detect.sigterm.stream-open-before-trigger=PASS
+RESULT restore rootful detect.sigterm.supp.time_to_eof_ms=99
+RESULT restore rootful detect.sigterm.stream_end=ended rc=0
+RESULT restore rootful check.detect.sigterm.stream-ended-by-daemon=PASS
+RESULT restore rootful check.detect.sigterm.client-container-survived=PASS
+RESULT restore rootful detect.sigterm.daemon_container_after=exited exit=0
+RESULT restore rootful detect.sigterm.containerd_pidfile_before_restart=path=/var/run/docker/containerd/containerd.pid exists=no
+RESULT restore rootful detect.sigterm.recovery=same-container-restart-ok
+RESULT restore rootful detect.sigterm.engine_id_after=ddb9a0af-7409-40f1-be85-54de412100ab
+RESULT restore rootful detect.sigterm.socket_inode_after=n/a (loopback tcp)
+RESULT restore rootful check.detect.sigterm.engine-id-identical=PASS
+RESULT restore rootful detect.sigterm.socket_inode_changed_plain=n/a (loopback tcp)
+RESULT restore rootful detect.sigterm.socket_file_vs_held_inode=n/a (loopback tcp)
+RESULT restore rootful check.detect.sigterm.socket-inodes-measured=PASS
+EXP restore rootful PASS
+DONE restore all rc=0
+EXIT=0
+### exp-stopped.log
+HEAD=0658dee55eb8fb9c01f3100e0a92767b7cced514 dirty=0
+2026-10-24T13:32:38Z
+RESULT stopped rootless engine=29.8.0
+RESULT stopped rootless tree-B.inode.initial=841666
+RESULT stopped rootless tree-B.ids=2192:841666 2192:842214 2192:842897
+RESULT stopped rootless control.task_pid=413
+RESULT stopped rootless control.namespaces=dockerd=mnt:[4026534641] task=mnt:[4026534767]
+RESULT stopped rootless control.running.refs=2
+RESULT stopped rootless control.running.mnt_strict=1
+RESULT stopped rootless control.running.mnt_loose=0
+RESULT stopped rootless control.running.fd=1
+RESULT stopped rootless control.running.map=0
+RESULT stopped rootless control.running.scanned=SCANNED pids=9 mountns=3
+RESULT stopped rootless control.strict_hit_namespaces=      1 ns=mnt:[4026534767];
+RESULT stopped rootless control.task_mountinfo=10707 10698 8:144 /volumes/pe1860-rootless-f9bf723f232cb602-run/_data/tree-B /w rw,relatime - ext4 /dev/sdj rw,seclabel
+RESULT stopped rootless control.task_cwd=/w 2192:841666
+RESULT stopped rootless control.running=PASS
+RESULT stopped rootless c-bind.mounts_after_stop=[{"Type":"bind","Source":"/data/runner/tree-B","Destination":"/w","Mode":"","RW":true,"Propagation":"rprivate"}]
+RESULT stopped rootless after-stop.refs=0
+RESULT stopped rootless after-stop.mnt_strict=0
+RESULT stopped rootless after-stop.mnt_loose=0
+RESULT stopped rootless after-stop.fd=0
+RESULT stopped rootless after-stop.map=0
+RESULT stopped rootless after-stop.scanned=SCANNED pids=8 mountns=2
+RESULT stopped rootless after-stop.scan_complete=yes mountns=2 control_mountns=3 dockerd_ns_read=yes
+RESULT stopped rootless check.after-stop.no-reference=PASS
+RESULT stopped rootless after-restart.refs=0
+RESULT stopped rootless after-restart.mnt_strict=0
+RESULT stopped rootless after-restart.mnt_loose=0
+RESULT stopped rootless after-restart.fd=0
+RESULT stopped rootless after-restart.map=0
+RESULT stopped rootless after-restart.scanned=SCANNED pids=7 mountns=2
+RESULT stopped rootless after-restart.scan_complete=yes mountns=2 control_mountns=3 dockerd_ns_read=yes
+RESULT stopped rootless check.after-restart.no-reference=PASS
+RESULT stopped rootless tree-B.after_rm=exists=no
+RESULT stopped rootless check.tree-B.after_rm.exists-no=PASS
+RESULT stopped rootless after-rm.scan_complete=yes mountns=2 control_mountns=3 dockerd_ns_read=yes
+RESULT stopped rootless control.deleted_inode_fd=1
+RESULT stopped rootless check.control.deleted-inode-visible=PASS
+RESULT stopped rootless cp-into-stopped.rc=0
+RESULT stopped rootless cp-into-stopped.out=
+RESULT stopped rootless tree-B.after_cp=exists=yes ino=841646 own=1000:1000 mode=755 list=pe-cpfile,
+RESULT stopped rootless tree-B.after_cp.recreated=yes
+RESULT stopped rootless tree-B.after_cp.inode_differs=yes
+RESULT stopped rootless tree-B.after_cp.file=copied
+RESULT stopped rootless tree-B.before_idle_start=exists=no
+RESULT stopped rootless check.tree-B.before_idle_start.exists-no=PASS
+RESULT stopped rootless start-idle.rc=0
+RESULT stopped rootless start-idle.out=c-bind-idle
+RESULT stopped rootless tree-B.after_idle_start=exists=yes ino=957113 own=1000:1000 mode=755 list=
+RESULT stopped rootless tree-B.after_idle_start.recreated=yes
+RESULT stopped rootless tree-B.after_idle_start.empty=yes
+RESULT stopped rootless tree-B.after_idle_start.inode_differs_from_initial=yes
+RESULT stopped rootless tree-B.after_idle_start.inode_differs_from_cp=yes
+RESULT stopped rootless tree-B.before_cbind_start=exists=no
+RESULT stopped rootless check.tree-B.before_cbind_start.exists-no=PASS
+RESULT stopped rootless start-cbind.rc=0
+RESULT stopped rootless start-cbind.out=c-bind
+RESULT stopped rootless tree-B.after_cbind_start=exists=yes ino=957107 own=1000:1000 mode=755 list=f,
+RESULT stopped rootless tree-B.after_cbind_start.note=c-bind's own command writes f into /w, so a non-empty listing is expected
+RESULT stopped rootless c-mount.before-delete.state_before=running
+RESULT stopped rootless c-mount.before-delete.forced_stop=yes
+RESULT stopped rootless check.c-mount.before-delete.stopped=PASS
+RESULT stopped rootless tree-M.before_start_c_mount=exists=no
+RESULT stopped rootless check.tree-M.before_start_c_mount.exists-no=PASS
+RESULT stopped rootless start-c-mount.rc=1
+RESULT stopped rootless start-c-mount.out=Error response from daemon: invalid mount config for type "bind": bind source path does not exist: /data/runner/tree-M failed to start containers: c-mount
+RESULT stopped rootless tree-M.after_start_c_mount=exists=no
+RESULT stopped rootless c-mount.before-cp.state_before=exited
+RESULT stopped rootless check.c-mount.before-cp.stopped=PASS
+RESULT stopped rootless tree-M.before_cp_c_mount=exists=no
+RESULT stopped rootless check.tree-M.before_cp_c_mount.exists-no=PASS
+RESULT stopped rootless cp-into-c-mount.rc=1
+RESULT stopped rootless cp-into-c-mount.out=time="2026-10-24T13:33:03Z" level=error msg="Can't add file /tmp/pe-cpfile to tar: io: read/write on closed pipe" no such directory
+RESULT stopped rootless tree-M.after_cp_c_mount=exists=no
+RESULT stopped rootless c-mount.before-c-vf.state_before=exited
+RESULT stopped rootless check.c-mount.before-c-vf.stopped=PASS
+RESULT stopped rootless tree-M.before_start_c_vf=exists=no
+RESULT stopped rootless check.tree-M.before_start_c_vf.exists-no=PASS
+RESULT stopped rootless start-c-vf.rc=0
+RESULT stopped rootless start-c-vf.out=c-vf
+RESULT stopped rootless tree-M.after_start_c_vf=exists=yes ino=959765 own=1000:1000 mode=755 list=
+EXP stopped rootless PASS
+RESULT stopped rootful engine=29.8.0
+RESULT stopped rootful tree-B.inode.initial=841663
+RESULT stopped rootful tree-B.ids=2192:841663 2192:842213 2192:842895
+RESULT stopped rootful control.task_pid=360
+RESULT stopped rootful control.namespaces=dockerd=mnt:[4026534634] task=mnt:[4026534641]
+RESULT stopped rootful control.running.refs=2
+RESULT stopped rootful control.running.mnt_strict=1
+RESULT stopped rootful control.running.mnt_loose=0
+RESULT stopped rootful control.running.fd=1
+RESULT stopped rootful control.running.map=0
+RESULT stopped rootful control.running.scanned=SCANNED pids=6 mountns=2
+RESULT stopped rootful control.strict_hit_namespaces=      1 ns=mnt:[4026534641];
+RESULT stopped rootful control.task_mountinfo=10643 10587 8:144 /volumes/pe1860-rootful-54d2443d5588f3c3-run/_data/tree-B /w rw,relatime - ext4 /dev/sdj rw,seclabel
+RESULT stopped rootful control.task_cwd=/w 2192:841663
+RESULT stopped rootful control.running=PASS
+RESULT stopped rootful c-bind.mounts_after_stop=[{"Type":"bind","Source":"/data/runner/tree-B","Destination":"/w","Mode":"","RW":true,"Propagation":"rprivate"}]
+RESULT stopped rootful after-stop.refs=0
+RESULT stopped rootful after-stop.mnt_strict=0
+RESULT stopped rootful after-stop.mnt_loose=0
+RESULT stopped rootful after-stop.fd=0
+RESULT stopped rootful after-stop.map=0
+RESULT stopped rootful after-stop.scanned=SCANNED pids=4 mountns=1
+RESULT stopped rootful after-stop.scan_complete=yes mountns=1 control_mountns=2 dockerd_ns_read=yes
+RESULT stopped rootful check.after-stop.no-reference=PASS
+RESULT stopped rootful after-restart.refs=0
+RESULT stopped rootful after-restart.mnt_strict=0
+RESULT stopped rootful after-restart.mnt_loose=0
+RESULT stopped rootful after-restart.fd=0
+RESULT stopped rootful after-restart.map=0
+RESULT stopped rootful after-restart.scanned=SCANNED pids=4 mountns=1
+RESULT stopped rootful after-restart.scan_complete=yes mountns=1 control_mountns=2 dockerd_ns_read=yes
+RESULT stopped rootful check.after-restart.no-reference=PASS
+RESULT stopped rootful tree-B.after_rm=exists=no
+RESULT stopped rootful check.tree-B.after_rm.exists-no=PASS
+RESULT stopped rootful after-rm.scan_complete=yes mountns=1 control_mountns=2 dockerd_ns_read=yes
+RESULT stopped rootful control.deleted_inode_fd=1
+RESULT stopped rootful check.control.deleted-inode-visible=PASS
+RESULT stopped rootful cp-into-stopped.rc=0
+RESULT stopped rootful cp-into-stopped.out=
+RESULT stopped rootful tree-B.after_cp=exists=yes ino=841632 own=0:0 mode=755 list=pe-cpfile,
+RESULT stopped rootful tree-B.after_cp.recreated=yes
+RESULT stopped rootful tree-B.after_cp.inode_differs=yes
+RESULT stopped rootful tree-B.after_cp.file=copied
+RESULT stopped rootful tree-B.before_idle_start=exists=no
+RESULT stopped rootful check.tree-B.before_idle_start.exists-no=PASS
+RESULT stopped rootful start-idle.rc=0
+RESULT stopped rootful start-idle.out=c-bind-idle
+RESULT stopped rootful tree-B.after_idle_start=exists=yes ino=957114 own=0:0 mode=755 list=
+RESULT stopped rootful tree-B.after_idle_start.recreated=yes
+RESULT stopped rootful tree-B.after_idle_start.empty=yes
+RESULT stopped rootful tree-B.after_idle_start.inode_differs_from_initial=yes
+RESULT stopped rootful tree-B.after_idle_start.inode_differs_from_cp=yes
+RESULT stopped rootful tree-B.before_cbind_start=exists=no
+RESULT stopped rootful check.tree-B.before_cbind_start.exists-no=PASS
+RESULT stopped rootful start-cbind.rc=0
+RESULT stopped rootful start-cbind.out=c-bind
+RESULT stopped rootful tree-B.after_cbind_start=exists=yes ino=957108 own=0:0 mode=755 list=f,
+RESULT stopped rootful tree-B.after_cbind_start.note=c-bind's own command writes f into /w, so a non-empty listing is expected
+RESULT stopped rootful c-mount.before-delete.state_before=running
+RESULT stopped rootful c-mount.before-delete.forced_stop=yes
+RESULT stopped rootful check.c-mount.before-delete.stopped=PASS
+RESULT stopped rootful tree-M.before_start_c_mount=exists=no
+RESULT stopped rootful check.tree-M.before_start_c_mount.exists-no=PASS
+RESULT stopped rootful start-c-mount.rc=1
+RESULT stopped rootful start-c-mount.out=Error response from daemon: invalid mount config for type "bind": bind source path does not exist: /data/runner/tree-M failed to start containers: c-mount
+RESULT stopped rootful tree-M.after_start_c_mount=exists=no
+RESULT stopped rootful c-mount.before-cp.state_before=exited
+RESULT stopped rootful check.c-mount.before-cp.stopped=PASS
+RESULT stopped rootful tree-M.before_cp_c_mount=exists=no
+RESULT stopped rootful check.tree-M.before_cp_c_mount.exists-no=PASS
+RESULT stopped rootful cp-into-c-mount.rc=1
+RESULT stopped rootful cp-into-c-mount.out=no such directory
+RESULT stopped rootful tree-M.after_cp_c_mount=exists=no
+RESULT stopped rootful c-mount.before-c-vf.state_before=exited
+RESULT stopped rootful check.c-mount.before-c-vf.stopped=PASS
+RESULT stopped rootful tree-M.before_start_c_vf=exists=no
+RESULT stopped rootful check.tree-M.before_start_c_vf.exists-no=PASS
+RESULT stopped rootful start-c-vf.rc=0
+RESULT stopped rootful start-c-vf.out=c-vf
+RESULT stopped rootful tree-M.after_start_c_vf=exists=yes ino=959766 own=0:0 mode=755 list=
+EXP stopped rootful PASS
+DONE stopped all rc=0
+EXIT=0
+### exp-volumes-build.log
+HEAD=0658dee55eb8fb9c01f3100e0a92767b7cced514 dirty=0
+2026-10-24T13:33:32Z
+RESULT volumes-build rootless engine=29.8.0
+RESULT volumes-build rootless dockerd.mntns=mnt:[4026534641]
+RESULT volumes-build rootless v-plain.driver_options=local null
+RESULT volumes-build rootless check.v-plain.local-and-no-options=PASS
+RESULT volumes-build rootless v-bind.driver_options=local {"device":"/data/runner/tree-V","o":"bind","type":"none"}
+RESULT volumes-build rootless check.v-bind.options-non-empty=PASS
+RESULT volumes-build rootless v-bind.running.refs=2
+RESULT volumes-build rootless v-bind.running.mnt_strict=2
+RESULT volumes-build rootless v-bind.running.mnt_loose=0
+RESULT volumes-build rootless v-bind.running.fd=0
+RESULT volumes-build rootless v-bind.running.map=0
+RESULT volumes-build rootless v-bind.running.scanned=SCANNED pids=10 mountns=3
+RESULT volumes-build rootless v-bind.running.hit_namespaces=      1 MNT-STRICT ns=mnt:[4026534641];      1 MNT-STRICT ns=mnt:[4026534767];
+RESULT volumes-build rootless v-bind.running.strict_in_dockerd_ns=1
+RESULT volumes-build rootless control.volume-visible=PASS
+RESULT volumes-build rootless v-bind.after-stop.refs=0
+RESULT volumes-build rootless v-bind.after-stop.mnt_strict=0
+RESULT volumes-build rootless v-bind.after-stop.mnt_loose=0
+RESULT volumes-build rootless v-bind.after-stop.fd=0
+RESULT volumes-build rootless v-bind.after-stop.map=0
+RESULT volumes-build rootless v-bind.after-stop.scanned=SCANNED pids=9 mountns=2
+RESULT volumes-build rootless v-bind.after-stop.strict_in_dockerd_ns=0
+RESULT volumes-build rootless v-bind.after-restart.refs=0
+RESULT volumes-build rootless v-bind.after-restart.mnt_strict=0
+RESULT volumes-build rootless v-bind.after-restart.mnt_loose=0
+RESULT volumes-build rootless v-bind.after-restart.fd=0
+RESULT volumes-build rootless v-bind.after-restart.map=0
+RESULT volumes-build rootless v-bind.after-restart.scanned=SCANNED pids=7 mountns=2
+RESULT volumes-build rootless v-bind.after-restart.strict_in_dockerd_ns=0
+RESULT volumes-build rootless tree-K.ids=2192:957119 2192:957120 2192:957121
+RESULT volumes-build rootless control.tree-K-bound.refs=1
+RESULT volumes-build rootless control.tree-K-bound.mnt_strict=1
+RESULT volumes-build rootless control.tree-K-bound.mnt_loose=0
+RESULT volumes-build rootless control.tree-K-bound.fd=0
+RESULT volumes-build rootless control.tree-K-bound.map=0
+RESULT volumes-build rootless control.tree-K-bound.scanned=SCANNED pids=9 mountns=3
+RESULT volumes-build rootless control.tree-K-removed.refs=0
+RESULT volumes-build rootless control.tree-K-removed.mnt_strict=0
+RESULT volumes-build rootless control.tree-K-removed.mnt_loose=0
+RESULT volumes-build rootless control.tree-K-removed.fd=0
+RESULT volumes-build rootless control.tree-K-removed.map=0
+RESULT volumes-build rootless control.tree-K-removed.scanned=SCANNED pids=8 mountns=2
+RESULT volumes-build rootless check.control.tree-K-clear-before-build=PASS
+RESULT volumes-build rootless control.map-fixture.refs=7
+RESULT volumes-build rootless control.map-fixture.mnt_strict=1
+RESULT volumes-build rootless control.map-fixture.mnt_loose=0
+RESULT volumes-build rootless control.map-fixture.fd=1
+RESULT volumes-build rootless control.map-fixture.map=5
+RESULT volumes-build rootless control.map-fixture.scanned=SCANNED pids=10 mountns=3
+RESULT volumes-build rootless control.map=PASS
+RESULT volumes-build rootless cache.before_build.records=0
+RESULT volumes-build rootless during-build.holder=FD cmd=[/usr/local/libexec/docker/cli-plugins/docker-buildx --host unix:///run] 2192:957119 /proc/1091/fd/12
+RESULT volumes-build rootless build.rc=0
+RESULT volumes-build rootless build.log_tail=#9 writing image sha256:44841159bce7795eda2a5eacd865b92295131f7193ed54dfce8c5a79d29a60f2 done | #9 naming to docker.io/library/k-img done | #9 DONE 0.8s
+RESULT volumes-build rootless during-build.supplementary_sampling=samples=45 refs_total=1 (bounded sampling, supplementary)
+RESULT volumes-build rootless after-build.refs=0
+RESULT volumes-build rootless after-build.mnt_strict=0
+RESULT volumes-build rootless after-build.mnt_loose=0
+RESULT volumes-build rootless after-build.fd=0
+RESULT volumes-build rootless after-build.map=0
+RESULT volumes-build rootless after-build.scanned=SCANNED pids=9 mountns=2
+RESULT volumes-build rootless check.after-build.no-reference=PASS
+RESULT volumes-build rootless cache.after_build.records=8
+RESULT volumes-build rootless cache.after_build.types=      1 Type:         exec.cachemount;      4 Type:         regular;      3 Type:         source.local;
+RESULT volumes-build rootless check.cache.exists-after-build=PASS
+RESULT volumes-build rootless cache.after_build.df=Build cache usage: 496B |  | CACHE ID       CACHE TYPE        SIZE      CREATED         LAST USED                USAGE     SHARED
+RESULT volumes-build rootless check.tree-K.deleted=PASS
+RESULT volumes-build rootless cache.after_tree_delete.records=8
+RESULT volumes-build rootless check.cache.survives-tree-delete=PASS
+RESULT volumes-build rootless after-tree-delete.refs=0
+RESULT volumes-build rootless after-tree-delete.mnt_strict=0
+RESULT volumes-build rootless after-tree-delete.mnt_loose=0
+RESULT volumes-build rootless after-tree-delete.fd=0
+RESULT volumes-build rootless after-tree-delete.map=0
+RESULT volumes-build rootless after-tree-delete.scanned=SCANNED pids=9 mountns=2
+RESULT volumes-build rootless check.after-tree-delete.no-reference=PASS
+RESULT volumes-build rootless after-restart.refs=0
+RESULT volumes-build rootless after-restart.mnt_strict=0
+RESULT volumes-build rootless after-restart.mnt_loose=0
+RESULT volumes-build rootless after-restart.fd=0
+RESULT volumes-build rootless after-restart.map=0
+RESULT volumes-build rootless after-restart.scanned=SCANNED pids=7 mountns=2
+RESULT volumes-build rootless check.after-restart.no-reference=PASS
+RESULT volumes-build rootless cache.after_restart.records=8
+RESULT volumes-build rootless check.cache.survives-restart=PASS
+EXP volumes-build rootless PASS
+RESULT volumes-build rootful engine=29.8.0
+RESULT volumes-build rootful dockerd.mntns=mnt:[4026534634]
+RESULT volumes-build rootful v-plain.driver_options=local null
+RESULT volumes-build rootful check.v-plain.local-and-no-options=PASS
+RESULT volumes-build rootful v-bind.driver_options=local {"device":"/data/runner/tree-V","o":"bind","type":"none"}
+RESULT volumes-build rootful check.v-bind.options-non-empty=PASS
+RESULT volumes-build rootful v-bind.running.refs=2
+RESULT volumes-build rootful v-bind.running.mnt_strict=2
+RESULT volumes-build rootful v-bind.running.mnt_loose=0
+RESULT volumes-build rootful v-bind.running.fd=0
+RESULT volumes-build rootful v-bind.running.map=0
+RESULT volumes-build rootful v-bind.running.scanned=SCANNED pids=6 mountns=2
+RESULT volumes-build rootful v-bind.running.hit_namespaces=      1 MNT-STRICT ns=mnt:[4026534634];      1 MNT-STRICT ns=mnt:[4026534641];
+RESULT volumes-build rootful v-bind.running.strict_in_dockerd_ns=1
+RESULT volumes-build rootful control.volume-visible=PASS
+RESULT volumes-build rootful v-bind.after-stop.refs=0
+RESULT volumes-build rootful v-bind.after-stop.mnt_strict=0
+RESULT volumes-build rootful v-bind.after-stop.mnt_loose=0
+RESULT volumes-build rootful v-bind.after-stop.fd=0
+RESULT volumes-build rootful v-bind.after-stop.map=0
+RESULT volumes-build rootful v-bind.after-stop.scanned=SCANNED pids=4 mountns=1
+RESULT volumes-build rootful v-bind.after-stop.strict_in_dockerd_ns=0
+RESULT volumes-build rootful v-bind.after-restart.refs=0
+RESULT volumes-build rootful v-bind.after-restart.mnt_strict=0
+RESULT volumes-build rootful v-bind.after-restart.mnt_loose=0
+RESULT volumes-build rootful v-bind.after-restart.fd=0
+RESULT volumes-build rootful v-bind.after-restart.map=0
+RESULT volumes-build rootful v-bind.after-restart.scanned=SCANNED pids=4 mountns=1
+RESULT volumes-build rootful v-bind.after-restart.strict_in_dockerd_ns=0
+RESULT volumes-build rootful tree-K.ids=2192:957119 2192:957120 2192:957121
+RESULT volumes-build rootful control.tree-K-bound.refs=1
+RESULT volumes-build rootful control.tree-K-bound.mnt_strict=1
+RESULT volumes-build rootful control.tree-K-bound.mnt_loose=0
+RESULT volumes-build rootful control.tree-K-bound.fd=0
+RESULT volumes-build rootful control.tree-K-bound.map=0
+RESULT volumes-build rootful control.tree-K-bound.scanned=SCANNED pids=6 mountns=2
+RESULT volumes-build rootful control.tree-K-removed.refs=0
+RESULT volumes-build rootful control.tree-K-removed.mnt_strict=0
+RESULT volumes-build rootful control.tree-K-removed.mnt_loose=0
+RESULT volumes-build rootful control.tree-K-removed.fd=0
+RESULT volumes-build rootful control.tree-K-removed.map=0
+RESULT volumes-build rootful control.tree-K-removed.scanned=SCANNED pids=4 mountns=1
+RESULT volumes-build rootful check.control.tree-K-clear-before-build=PASS
+RESULT volumes-build rootful control.map-fixture.refs=7
+RESULT volumes-build rootful control.map-fixture.mnt_strict=1
+RESULT volumes-build rootful control.map-fixture.mnt_loose=0
+RESULT volumes-build rootful control.map-fixture.fd=1
+RESULT volumes-build rootful control.map-fixture.map=5
+RESULT volumes-build rootful control.map-fixture.scanned=SCANNED pids=6 mountns=2
+RESULT volumes-build rootful control.map=PASS
+RESULT volumes-build rootful cache.before_build.records=0
+RESULT volumes-build rootful during-build.holder=FD cmd=[/usr/local/libexec/docker/cli-plugins/docker-buildx --host tcp://127.0] 2192:957119 /proc/911/fd/12
+RESULT volumes-build rootful build.rc=0
+RESULT volumes-build rootful build.log_tail=#9 writing image sha256:80c49a14ed339431b7d836af243de79613dffce440f7be9862b54356ae45b44d done | #9 naming to docker.io/library/k-img done | #9 DONE 0.4s
+RESULT volumes-build rootful during-build.supplementary_sampling=samples=36 refs_total=29 (bounded sampling, supplementary)
+RESULT volumes-build rootful after-build.refs=0
+RESULT volumes-build rootful after-build.mnt_strict=0
+RESULT volumes-build rootful after-build.mnt_loose=0
+RESULT volumes-build rootful after-build.fd=0
+RESULT volumes-build rootful after-build.map=0
+RESULT volumes-build rootful after-build.scanned=SCANNED pids=4 mountns=1
+RESULT volumes-build rootful check.after-build.no-reference=PASS
+RESULT volumes-build rootful cache.after_build.records=8
+RESULT volumes-build rootful cache.after_build.types=      1 Type:         exec.cachemount;      4 Type:         regular;      3 Type:         source.local;
+RESULT volumes-build rootful check.cache.exists-after-build=PASS
+RESULT volumes-build rootful cache.after_build.df=Build cache usage: 496B |  | CACHE ID       CACHE TYPE        SIZE      CREATED         LAST USED                USAGE     SHARED
+RESULT volumes-build rootful check.tree-K.deleted=PASS
+RESULT volumes-build rootful cache.after_tree_delete.records=8
+RESULT volumes-build rootful check.cache.survives-tree-delete=PASS
+RESULT volumes-build rootful after-tree-delete.refs=0
+RESULT volumes-build rootful after-tree-delete.mnt_strict=0
+RESULT volumes-build rootful after-tree-delete.mnt_loose=0
+RESULT volumes-build rootful after-tree-delete.fd=0
+RESULT volumes-build rootful after-tree-delete.map=0
+RESULT volumes-build rootful after-tree-delete.scanned=SCANNED pids=4 mountns=1
+RESULT volumes-build rootful check.after-tree-delete.no-reference=PASS
+RESULT volumes-build rootful after-restart.refs=0
+RESULT volumes-build rootful after-restart.mnt_strict=0
+RESULT volumes-build rootful after-restart.mnt_loose=0
+RESULT volumes-build rootful after-restart.fd=0
+RESULT volumes-build rootful after-restart.map=0
+RESULT volumes-build rootful after-restart.scanned=SCANNED pids=4 mountns=1
+RESULT volumes-build rootful check.after-restart.no-reference=PASS
+RESULT volumes-build rootful cache.after_restart.records=8
+RESULT volumes-build rootful check.cache.survives-restart=PASS
+EXP volumes-build rootful PASS
+DONE volumes-build all rc=0
+EXIT=0
+### exp-readonly.log
+HEAD=0658dee55eb8fb9c01f3100e0a92767b7cced514 dirty=0
+2026-10-24T13:34:38Z
+RESULT readonly rootless engine=29.8.0
+RESULT readonly rootless fixtures=containers=[c-created c-exited c-stopped ] running=0
+RESULT readonly rootless check.fixtures.nothing-running=PASS
+RESULT readonly rootless snapshot1.bytes=20084
+RESULT readonly rootless check.snapshot1.has-all-kinds=PASS
+RESULT readonly rootless queries.events_read_lines=7
+RESULT readonly rootless queries.issued=version(_ping) info ps-a-json inspect-each volume-ls volume-inspect-each plugin-ls events-since-until
+RESULT readonly rootless inventory.identical=yes
+RESULT readonly rootless control.inventory_changed=yes
+RESULT readonly rootless control.events=volume-create-line=20 container-start-line=22
+RESULT readonly rootless stream.marker1_line=19
+RESULT readonly rootless stream.first_control_line=20
+RESULT readonly rootless stream.events_during_query_phase=0
+RESULT readonly rootless check.stream.zero-events-during-query-phase=PASS
+RESULT readonly rootless check.stream.still-open=PASS
+RESULT readonly rootless stream.end=stopped
+EXP readonly rootless PASS
+RESULT readonly rootful engine=29.8.0
+RESULT readonly rootful fixtures=containers=[c-created c-exited c-stopped ] running=0
+RESULT readonly rootful check.fixtures.nothing-running=PASS
+RESULT readonly rootful snapshot1.bytes=19820
+RESULT readonly rootful check.snapshot1.has-all-kinds=PASS
+RESULT readonly rootful queries.events_read_lines=1
+RESULT readonly rootful queries.issued=version(_ping) info ps-a-json inspect-each volume-ls volume-inspect-each plugin-ls events-since-until
+RESULT readonly rootful inventory.identical=yes
+RESULT readonly rootful control.inventory_changed=yes
+RESULT readonly rootful control.events=volume-create-line=20 container-start-line=22
+RESULT readonly rootful stream.marker1_line=19
+RESULT readonly rootful stream.first_control_line=20
+RESULT readonly rootful stream.events_during_query_phase=0
+RESULT readonly rootful check.stream.zero-events-during-query-phase=PASS
+RESULT readonly rootful check.stream.still-open=PASS
+RESULT readonly rootful stream.end=stopped
+EXP readonly rootful PASS
+DONE readonly all rc=0
+EXIT=0

@@ -7,7 +7,7 @@ import { useCallback, useEffect, useRef, useState, type FormEvent } from "react"
 import { Link, useSearchParams } from "react-router-dom";
 
 import { api, type BindMode, type Worker } from "../lib/api";
-import { errorMessage } from "../lib/apiError";
+import { ApiError, errorMessage } from "../lib/apiError";
 import { Alert, Badge, Button, Card, EmptyState, Field, Input, PageHeader, SectionTitle, Select, Skeleton, cx } from "../components/ui";
 import { FleetUpgradePanel, WorkerUpgradeBadge, WorkerUpgradeDetail } from "../components/WorkerUpgradeBadge";
 import { useAppVersion } from "../components/AppShell";
@@ -54,6 +54,30 @@ const rowNameId = (workerId: string) => `worker-name-${workerId}`;
 const AUTO_OPTION = "\u0000auto";
 
 const deleteWarningId = (workerId: string) => `worker-delete-warning-${workerId}`;
+
+// The runs a refused delete (409 "worker has active runs") names, so the owner can open
+// and cancel them. Additive server contract: absent on an older server or any other 409.
+type BlockingRun = { id: string; kind: string; status: string; title: string };
+type ActiveRunsBlock = { runs: BlockingRun[]; total: number };
+
+// Reads `active_runs` / `active_runs_total` off a 409 body. An empty array is still a
+// block (the server capped it to nothing but reports a positive total), so only a
+// missing or malformed field returns null.
+function readActiveRunsBlock(body: unknown): ActiveRunsBlock | null {
+  if (typeof body !== "object" || body === null) return null;
+  const b = body as Record<string, unknown>;
+  if (!Array.isArray(b.active_runs)) return null;
+  const runs: BlockingRun[] = [];
+  for (const r of b.active_runs) {
+    if (typeof r !== "object" || r === null) return null;
+    const e = r as Record<string, unknown>;
+    if (typeof e.id !== "string" || typeof e.kind !== "string" || typeof e.status !== "string") return null;
+    if (e.title !== undefined && e.title !== null && typeof e.title !== "string") return null;
+    runs.push({ id: e.id, kind: e.kind, status: e.status, title: typeof e.title === "string" ? e.title : "" });
+  }
+  const total = typeof b.active_runs_total === "number" ? b.active_runs_total : runs.length;
+  return { runs, total };
+}
 
 // Two-tab page (PRD #1063): "Your workers" (the fleet) and "Add a worker" (the forms).
 // The tab recipe is COPIED from Schedules.tsx, not extracted into a shared primitive
@@ -111,6 +135,7 @@ export function WorkersSettings() {
   const [template, setTemplate] = useState<string>(DEFAULT_WORKER_TEMPLATE);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [activeRunsBlock, setActiveRunsBlock] = useState<ActiveRunsBlock | null>(null);
   // newToken holds the plaintext join token for the just-created worker. It is
   // shown exactly once (only its hash is stored server-side) and cleared on the
   // next action.
@@ -254,6 +279,7 @@ export function WorkersSettings() {
   const rebind = useCallback(
     async (workerId: string, choice: string) => {
       setError("");
+      setActiveRunsBlock(null);
       setTokenBusy(workerId);
       const mode: BindMode = choice === AUTO_OPTION ? "auto" : choice === "" ? "default" : "pinned";
       try {
@@ -288,6 +314,7 @@ export function WorkersSettings() {
           mode === "auto" && pooledCount === 0 ? "warning" : "success",
         );
       } catch (err) {
+        setActiveRunsBlock(null);
         setError(errorMessage(err, "Failed to change the worker's token"));
       } finally {
         setTokenBusy("");
@@ -338,6 +365,7 @@ export function WorkersSettings() {
   const create = async (e: FormEvent) => {
     e.preventDefault();
     setError("");
+    setActiveRunsBlock(null);
     setBusy(true);
     try {
       const { worker, token } = await api.createWorker(name.trim(), template);
@@ -347,6 +375,7 @@ export function WorkersSettings() {
       setTemplate(DEFAULT_WORKER_TEMPLATE);
       await reload();
     } catch (err) {
+      setActiveRunsBlock(null);
       setError(errorMessage(err, "Failed to create worker"));
     } finally {
       setBusy(false);
@@ -357,6 +386,7 @@ export function WorkersSettings() {
     // Read the name before the row is gone — after load() it is unfindable.
     const name = workers.find((w) => w.id === id)?.name;
     setError("");
+    setActiveRunsBlock(null);
     setConfirmingDelete(null);
     try {
       await api.deleteWorker(id);
@@ -367,6 +397,7 @@ export function WorkersSettings() {
       announce(`Deleted ${stripUnsafeChars(name ?? "worker")}.`);
       await reload();
     } catch (err) {
+      setActiveRunsBlock(err instanceof ApiError && err.status === 409 ? readActiveRunsBlock(err.body) : null);
       setError(errorMessage(err, "Failed to delete worker"));
     }
   };
@@ -479,6 +510,25 @@ export function WorkersSettings() {
       />
       {/* The page-level error alert stays ABOVE the tabs (D-unchanged). */}
       {(error || loadError) && <Alert message={error || loadError} />}
+      {error && activeRunsBlock && (
+        <ul aria-label="Runs blocking this delete" className="mt-2 space-y-1 text-sm text-muted">
+          {activeRunsBlock.runs.map((r) => {
+            const title = stripUnsafeChars(r.title).trim() || r.id;
+            const to = r.kind === "chat" ? `/chat/${encodeURIComponent(r.id)}` : `/runs/${encodeURIComponent(r.id)}`;
+            return (
+              <li key={r.id}>
+                <Link to={to} className="underline hover:text-fg">
+                  {title}
+                </Link>{" "}
+                ({stripUnsafeChars(r.kind)}, {stripUnsafeChars(r.status)})
+              </li>
+            );
+          })}
+          {activeRunsBlock.total > activeRunsBlock.runs.length && (
+            <li>and {activeRunsBlock.total - activeRunsBlock.runs.length} more</li>
+          )}
+        </ul>
+      )}
 
       {/* Tab bar (PRD #1063), the Schedules recipe copied verbatim (D6): a role=tablist
           with two role=tab buttons carrying ids, aria-selected, aria-controls, a roving

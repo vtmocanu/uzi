@@ -32,9 +32,13 @@
 # Attention stop (read-only; never changes run state). A dead run can read `running`
 # forever, so status-only polling cannot see it. When the run is non-terminal and NOT yet in
 # the stop set, each poll also reads `uzi run get --json` and counts a poll as "attention"
-# when either holds:
+# when any of these holds:
 #   - health is set, not `ok`, and not in WATCH_ATTENTION_IGNORE_HEALTH (default `slow`,
 #     the near-timeout hint): stalled, looping, waiting_worker, approval_idle, ...
+#   - status is recovery_wait with recovery_wait_cause `data_volume_full` (a counted disk park: the
+#     worker's data volume is nearly full; the run fails once its counted parks reach the cap, so
+#     an unattended loop of parks must not pass silently). Its episode is
+#     `data_volume_full@park<disk_park_count>`, so acking one park still alerts on the next.
 #   - status is running/claimed, the run has a worker_id, and `uzi worker list --json`
 #     shows that worker's last_heartbeat_at older than WATCH_HEARTBEAT_STALE_SECS
 #     (default 180; the api default WORKER_HEARTBEAT_STALE is 45s, configurable). An unreadable worker list
@@ -53,8 +57,8 @@
 # Owner-decision park: `recovery_wait` with recovery_wait_cause `worker_requeue_exhausted` never
 # resumes on its own (the owner must Resume or Cancel), so it always stops the watch, whatever the
 # stop set (also when the stop set names recovery_wait): STOP=recovery_wait:worker_requeue_exhausted,
-# RESULT=stop:recovery_wait, exit 0. Other recovery_wait causes keep their existing behaviour: they
-# keep polling unless the stop set names recovery_wait.
+# RESULT=stop:recovery_wait, exit 0. Other recovery_wait causes keep polling unless the stop set names
+# recovery_wait, except a `data_volume_full` park, which is an attention signal (above).
 # `paused` never resumes on its own either (an owner pause, or hold_reason budget_exhausted /
 # completion hold that needs extend, resume or decide), so it always stops the watch, whatever the
 # stop set: STOP=paused, a NOTE with hold_reason, RESULT=stop:paused, exit 0.
@@ -83,7 +87,7 @@ max_plan_seq() {
 # attention_check returns 0 (and sets ATTN_EVIDENCE) when this poll shows attention, 1 when
 # it does not or nothing is readable. Never writes to uzi.
 attention_check() {
-  local status="$1" rj="$2" health reason since wid hb_age="" wstatus="" hb dat=0 wl w
+  local status="$1" rj="$2" health reason since wid hb_age="" wstatus="" hb dat=0 wl w parks ep disk=""
   printf '%s' "$rj" | jq -e 'type=="object"' >/dev/null 2>&1 || return 1
   health="$(printf '%s' "$rj" | jq -r '.health // ""')"
   reason="$(printf '%s' "$rj" | jq -r '(.health_reason // "")|gsub("\n";" ")|.[0:200]')"
@@ -100,6 +104,15 @@ attention_check() {
             esac ;;
        esac ;;
   esac
+  if [ "$status" = recovery_wait ] && [ "$(printf '%s' "$rj" | jq -r '.recovery_wait_cause // ""')" = data_volume_full ]; then
+    parks="$(printf '%s' "$rj" | jq -r '.disk_park_count // "unknown"')"
+    ep="data_volume_full@park$parks"
+    disk=" recovery_wait_cause=data_volume_full disk_park_count=$parks"
+    case ",$ATTN_ACK," in
+      *",$ep,"*) ;;
+      *) dat=1; ATTN_EPISODE="${ATTN_EPISODE:+$ATTN_EPISODE,}$ep" ;;
+    esac
+  fi
   if [ -n "$wid" ] && { [ "$status" = running ] || [ "$status" = claimed ]; }; then
     wl="$(uzi worker list --json 2>/dev/null)" || wl=""
     w="$(printf '%s' "$wl" | jq -c --arg id "$wid" '[.[]?|select(.id==$id)]|first // empty' 2>/dev/null)" || w=""
@@ -114,7 +127,7 @@ attention_check() {
     fi
   fi
   [ "$dat" -eq 1 ] || return 1
-  ATTN_EVIDENCE="status=$status health=${health:-none} health_reason='${reason}' health_since=${since:-none} worker=${wid:-none} worker_status=${wstatus:-unknown} heartbeat_age_secs=${hb_age:-unknown} (stale after ${HB_STALE}s)"
+  ATTN_EVIDENCE="status=$status health=${health:-none} health_reason='${reason}' health_since=${since:-none} worker=${wid:-none} worker_status=${wstatus:-unknown} heartbeat_age_secs=${hb_age:-unknown} (stale after ${HB_STALE}s)$disk"
   return 0
 }
 

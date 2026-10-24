@@ -292,6 +292,12 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Codex workers use native runtime rust-v0.163.0 ([#3352](https://github.com/vtmocanu/uzi/pull/3352); supersedes #3020).**
   Upgrade from rust-v0.162.1 with matching launcher, runtime probe, and conformance version pins. The package no longer bundles a patched zsh, so the installer stops requiring it.
 
+- **The guarded maintenance WIP capture now hash-attests the worktree and commits through plumbing ([#3349](https://github.com/vtmocanu/uzi/pull/3349)).**
+  It hashes every tracked and non-ignored untracked path (a tracked path must match its index entry unless status declares it changed), proves the tree equals the expected delta, and updates the branch with a compare-and-swap, all within the existing slot limits; it stays dormant because the terminal producer remains disabled.
+
+- **The worker memory guard measures the cgroup working set and no longer needs PSI ([#3384](https://github.com/vtmocanu/uzi/pull/3384), [#3405](https://github.com/vtmocanu/uzi/pull/3405)).**
+  Hosts without memory.pressure, where an enabled guard never intervened before, now intervene at the hard threshold on valid core accounting (early intervention needs PSI), and PSI-capable hosts compare the working set (memory.current minus inactive_file), so file-cache-heavy hosts intervene later and return to quiet sooner; the working set is an estimate and can underestimate pressure from dirty or slow-to-reclaim file pages.
+
 ### Added
 
 - **Healthy busy workers no longer show custody attention.**
@@ -398,6 +404,21 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **CI-watch schedules select GitHub artifact evidence ([#3100](https://github.com/vtmocanu/uzi/pull/3100), [#2866](https://github.com/vtmocanu/uzi/pull/2866)).**
   Owners can select artifact names or globs in user and catalog-default CI-watch forms; blank fetches none. Repair runs receive bounded, scrubbed UTF-8 evidence through read-only tools, while GitLab and Forgejo remain logs-only.
+
+- **`[tui] blink = false` turns off the TUI blink from the CLI config ([#3406](https://github.com/vtmocanu/uzi/pull/3406)).**
+  It is the same reduced-motion opt-out as `UZI_TUI_NO_BLINK=1`; either one pins the static frame.
+
+- **Findings: a multi-repo selection files one issue per repo ([#3410](https://github.com/vtmocanu/uzi/pull/3410)).**
+  Selecting findings across repos now offers one editable draft per repo instead of a disabled button.
+
+- **The TUI run detail rail grows on wide terminals and can number milestones ([#3406](https://github.com/vtmocanu/uzi/pull/3406)).**
+  The rail widens to about a fifth of the terminal (26 to 44 columns, `[tui] rail_min_width` raises the floor), and the opt-in `[tui] milestone_numbers` prefixes each rail milestone with its position.
+
+- **Hosted workers can use the l-highmem size for memory-heavy gates ([#3383](https://github.com/vtmocanu/uzi/pull/3383), [#3397](https://github.com/vtmocanu/uzi/pull/3397)).**
+  It requests 24Gi and is limited to 32Gi with 50Gi of data; it is a capacity choice, not an OOM guarantee, and worker LimitRange memory max rises to 32Gi on every tier while quotas stay unchanged.
+
+- **Operators can set Go build and test concurrency defaults for worker commands ([#3382](https://github.com/vtmocanu/uzi/pull/3382), [#3400](https://github.com/vtmocanu/uzi/pull/3400)).**
+  Optional `workers.goBuildParallelism` / `workers.goMaxProcs` (Compose: `WORKER_GO_BUILD_PARALLELISM` / `WORKER_GO_MAXPROCS`) set `GOFLAGS=-p=N` and `GOMAXPROCS=N` for agent commands and worker checks.
 
 ### Fixed
 
@@ -1062,6 +1083,33 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Issue runs that declare report_only after committing work now deliver it as a non-closing MR ([#3360](https://github.com/vtmocanu/uzi/pull/3360)).**
   When a checkpoint with committed work was already published, the worker sets a non-closing declaration and uses normal delivery instead of failing the run; the skipped advisory cross-check is not replayed, and when a cross-check is required and none ran earlier in the session the MR discloses it as incomplete ("Code cross-check incomplete: skipped: report_only was declared").
+
+- **Task checkpoints keep each run's recovery identity separate from its inherited work branch ([#3343](https://github.com/vtmocanu/uzi/pull/3343)).**
+  Fresh compatible claims freeze validated coordinates; unresolved writes retain custody, and old API rollback can block claims or mixed readoption batches until a compatible API is restored.
+
+- **Runs whose claim would exceed the worker's claim limit now fail with a clear reason ([#3396](https://github.com/vtmocanu/uzi/pull/3396)).**
+  The api measures each run claim before handing it to a worker; an over-limit claim fails the run with `claim too large` (provisioning_failed) instead of being refused by the worker and requeued.
+
+- **CI-repair artifact evidence keeps colour-coded text logs ([#3386](https://github.com/vtmocanu/uzi/pull/3386)).**
+  Complete ANSI colour sequences are stripped and other control or format characters become visible escapes, instead of the whole file being skipped as binary; NUL and invalid UTF-8 are still refused.
+
+- **Worker claims bound their response bodies ([#2306](https://github.com/vtmocanu/uzi/pull/2306)).**
+  Run and chat claim responses and job-file upload acknowledgments are now read under a streamed-byte cap (168 MiB for claims, 64 KiB for upload acks) instead of an unbounded parse. A claim past the cap is refused, never truncated.
+
+- **A task review run without checkpoint enrollment now completes, so its requested then-fix run starts ([#3393](https://github.com/vtmocanu/uzi/pull/3393)).**
+  A task completion that omits its branch now keeps the server-named branch instead of writing NULL, which the database refused.
+
+- **Refused plan-gate recovery reports count toward `RUN_GATE_REFUSAL_MAX` ([#3081](https://github.com/vtmocanu/uzi/pull/3081)).**
+  A worker report that names the gate revision it is recovering from, and whose presentation is refused, now counts against the per-run refusal cap. Like other refusals, it counts once per claim generation, and the run fails with `fail_origin=gate_presentation_refused` once the cap is passed. The worker still receives the stale-revision-source answer, and `RUN_GATE_REFUSAL_MAX=0` remains unlimited.
+
+- **Codex parks and recovery protect local capture from late process writers ([#2852](https://github.com/vtmocanu/uzi/pull/2852), [#3394](https://github.com/vtmocanu/uzi/pull/3394)).**
+  Wall parks, completion holds and ordinary recovery keep supervised process exclusion across capture, preserve verified local work when publication fails, and retain the source when proof cannot be established; terminal and Docker writer exclusion remain open.
+
+- **An event-free agent stream no longer loses the turn's plan and guidance ([#3179](https://github.com/vtmocanu/uzi/pull/3179)).**
+  A Claude turn whose SDK stream ends without any events is now retried in place with the same prompt, then parked for recovery, instead of counting as a finished iteration.
+
+- **The controller's PVC-ceiling refusal names the same preset every time ([#3383](https://github.com/vtmocanu/uzi/pull/3383), [#3401](https://github.com/vtmocanu/uzi/pull/3401)).**
+  With l and l-highmem both at 50Gi of data, the message picked whichever came first in map order; presets are now checked in sorted order.
 
 ### Security
 

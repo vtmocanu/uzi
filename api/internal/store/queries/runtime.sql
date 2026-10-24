@@ -492,6 +492,17 @@ WHERE worker_id = @worker_id
   AND user_id = @user_id
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
+-- name: ListWorkerNonTerminalRuns :many
+-- The delete-refusal listing (#3390): names the runs CountWorkerNonTerminalRuns counted,
+-- with exactly its predicate (user-scoped, so a cross-tenant attempt still 404s). Capped at
+-- 10 oldest-first; the caller takes the total from the count, not from this list's length.
+SELECT id, kind, status, issue_iid, COALESCE(title, issue_title) AS display_title FROM runs
+WHERE worker_id = @worker_id
+  AND user_id = @user_id
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+ORDER BY created_at, id
+LIMIT 10;
+
 -- name: CountInProgressRunsForUser :one
 -- The Runs nav badge count (PRD #239): the caller's non-terminal runs, scoped to the
 -- same kinds the Runs page (ListRunsForUser) shows — chat, judge and cross-check children excluded, so the

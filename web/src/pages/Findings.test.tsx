@@ -10,6 +10,7 @@ import { useAuth } from "../auth/AuthContext";
 import {
   api,
   ApiError,
+  type FindingGroupFileResult,
   type IncidentalFinding,
   type Repo,
   type IncidentalFindingBacklog,
@@ -819,17 +820,12 @@ describe("Findings page - File as one issue (issue #1724)", () => {
   const tick = (title: string) => fireEvent.click(screen.getByRole("checkbox", { name: `Select ${title}` }));
   const groupButton = () => screen.getByRole("button", { name: "File as one issue" }) as HTMLButtonElement;
 
-  it("is disabled with a visible reason for 1 row, mixed repos, a non-open row and an evidence-less row", async () => {
+  it("is disabled with a visible reason for 1 row, a non-open row and an evidence-less row", async () => {
     await renderAll();
     tick("Alpha bug");
     expect(groupButton().disabled).toBe(true);
     expect(groupButton().title).toBe("Select at least 2 findings to file as one issue.");
     expect(screen.getByText(/Select at least 2 findings to file as one issue\./)).toBeTruthy();
-
-    tick("Gamma bug");
-    expect(groupButton().disabled).toBe(true);
-    expect(groupButton().title).toMatch(/one repo/);
-    tick("Gamma bug");
 
     tick("Orphan bug");
     expect(groupButton().disabled).toBe(true);
@@ -1152,5 +1148,231 @@ describe("Findings page - File as one issue (issue #1724)", () => {
     expect(screen.getByDisplayValue("kept edit")).toBeTruthy();
     expect((screen.getByRole("checkbox", { name: "Send to uzi" }) as HTMLInputElement).checked).toBe(true);
     expect(screen.queryByText(/Queued for uzi/)).toBeNull();
+  });
+});
+
+describe("Findings page - file one issue per repo (issue #3410)", () => {
+  const atlas = { repo_id: "repo-atlas", repo_path: "vtmocanu/atlas" };
+  const zeta = { repo_id: "repo-zeta", repo_path: "vtmocanu/zeta" };
+  const rows = [
+    finding({ disposition_id: "d1", finding_id: "f1", last_title: "Alpha bug" }),
+    finding({ disposition_id: "d2", finding_id: "f2", last_title: "Beta bug" }),
+    finding({ disposition_id: "d3", finding_id: "f3", last_title: "Gamma bug", ...atlas }),
+    finding({ disposition_id: "d7", finding_id: "f7", last_title: "Zeta bug", ...zeta }),
+  ];
+
+  async function renderAll(findings = rows) {
+    mockApi.listFindings.mockResolvedValue(backlog({ bucket: "all", findings }));
+    renderFindings(["/findings?bucket=all"]);
+    await screen.findByText(findings[0].last_title);
+  }
+  const tick = (title: string) => fireEvent.click(screen.getByRole("checkbox", { name: `Select ${title}` }));
+  const perRepoButton = (n: number) =>
+    screen.getByRole("button", { name: `File ${n} issues, one per repo` }) as HTMLButtonElement;
+  // The draft card for one repo, found by its repo-scoped header.
+  const card = (header: RegExp) => screen.getByText(header).parentElement as HTMLElement;
+  // Each repo's draft is titled after its own ids, so a test can tell the cards apart.
+  function draftsById() {
+    mockApi.findingGroupIssueDraft.mockImplementation(async (ids: string[]) => ({
+      repo_id: "r",
+      disposition_ids: ids,
+      title: `Draft ${ids.join("+")}`,
+      description: `desc ${ids.join("+")}`,
+      labels: ["uzi"],
+    }));
+  }
+  const issue = (iid: number) => ({ iid, web_url: `https://gitlab.example.com/x/-/issues/${iid}`, title: "t" });
+
+  it("offers one issue per repo for a mixed selection, even two singleton repos", async () => {
+    await renderAll();
+    tick("Alpha bug");
+    tick("Gamma bug");
+    expect(perRepoButton(2).disabled).toBe(false);
+    expect(perRepoButton(2).title).toBe("");
+    tick("Zeta bug");
+    expect(perRepoButton(3).disabled).toBe(false);
+    // Back to one repo: the original single-issue action.
+    tick("Gamma bug");
+    tick("Zeta bug");
+    tick("Beta bug");
+    expect((screen.getByRole("button", { name: "File as one issue" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("select-all across repos opens one draft per repo with that repo's ids", async () => {
+    draftsById();
+    await renderAll();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select all 4 shown" }));
+    fireEvent.click(perRepoButton(3));
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "Create issue" })).toHaveLength(3));
+    expect(mockApi.findingGroupIssueDraft.mock.calls.map((c) => c[0])).toEqual([["d1", "d2"], ["d3"], ["d7"]]);
+    expect(screen.getByText("File 2 findings in vtmocanu/uzi as one issue")).toBeTruthy();
+    expect(screen.getByText("File 1 finding in vtmocanu/atlas as one issue")).toBeTruthy();
+    expect(screen.getByDisplayValue("Draft d1+d2")).toBeTruthy();
+    // The button stays disabled while the review is open.
+    expect(perRepoButton(3).disabled).toBe(true);
+    expect(perRepoButton(3).title).toMatch(/Close the open draft/);
+  });
+
+  it("caps each repo at 50, not the whole selection", async () => {
+    const uzi = (n: number) =>
+      Array.from({ length: n }, (_, i) => finding({ disposition_id: `u${i}`, finding_id: `uf${i}`, last_title: `Uzi ${i}` }));
+    const two = [
+      finding({ disposition_id: "a0", finding_id: "af0", last_title: "Atlas 0", ...atlas }),
+      finding({ disposition_id: "a1", finding_id: "af1", last_title: "Atlas 1", ...atlas }),
+    ];
+    await renderAll([...uzi(50), ...two]);
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select all 52 shown" }));
+    expect(perRepoButton(2).disabled).toBe(false);
+    cleanup();
+
+    await renderAll([...uzi(51), ...two]);
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select all 53 shown" }));
+    expect(perRepoButton(2).disabled).toBe(true);
+    expect(perRepoButton(2).title).toBe("Select at most 50 findings per repo to file one issue per repo.");
+  });
+
+  it("keeps each card's outcome on its own card: unsettled issue, 202, 409, and a draft left untouched", async () => {
+    draftsById();
+    mockApi.fileFindingGroup.mockImplementation(async (body): Promise<FindingGroupFileResult> => {
+      const ids = body.ids ?? [];
+      if (ids[0] === "d1") {
+        return {
+          operation_id: "op-u", disposition_ids: ids, phase: "issue_recorded", issue: issue(91),
+          warning: "Issue created but rows did not settle.",
+        };
+      }
+      if (ids[0] === "d3") return { operation_id: "op-202", disposition_ids: ids, phase: "returned_uncertain" };
+      throw new ApiError(409, "finding not fileable");
+    });
+    await renderAll([...rows, finding({ disposition_id: "d8", finding_id: "f8", last_title: "Omega bug", repo_id: "repo-omega", repo_path: "vtmocanu/omega" })]);
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select all 5 shown" }));
+    fireEvent.click(perRepoButton(4));
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "Create issue" })).toHaveLength(4));
+    const omega = card(/in vtmocanu\/omega as one issue/);
+    fireEvent.change(within(omega).getByDisplayValue("Draft d8"), { target: { value: "omega edit" } });
+
+    fireEvent.click(within(card(/in vtmocanu\/uzi as one issue/)).getByRole("button", { name: "Create issue" }));
+    await within(card(/in vtmocanu\/uzi as one issue/)).findByText(
+      /Filed 2 findings as issue #91\. Issue created but rows did not settle\. Operation op-u \(issue_recorded\)\./,
+    );
+    expect(within(card(/in vtmocanu\/uzi as one issue/)).getByRole("link", { name: /Filed #91/ })).toBeTruthy();
+    // Only that card's rows left the selection.
+    expect(screen.getByText("3 findings selected")).toBeTruthy();
+
+    fireEvent.click(within(card(/in vtmocanu\/atlas as one issue/)).getByRole("button", { name: "Create issue" }));
+    const atlasCard = card(/in vtmocanu\/atlas as one issue/);
+    await within(atlasCard).findByText(/Operation op-202 \(returned_uncertain\)\./);
+    expect(within(atlasCard).getByText(/uzi findings release op-202 --confirm-no-issue/)).toBeTruthy();
+    expect(within(atlasCard).queryByRole("button", { name: "Create issue" })).toBeNull();
+
+    fireEvent.click(within(card(/in vtmocanu\/zeta as one issue/)).getByRole("button", { name: "Create issue" }));
+    await within(card(/in vtmocanu\/zeta as one issue/)).findByText(/already filed or are being filed/);
+
+    // Every earlier receipt survives the later outcomes, and the untouched draft keeps its edit.
+    expect(within(card(/in vtmocanu\/uzi as one issue/)).getByText(/issue #91/)).toBeTruthy();
+    expect(within(card(/in vtmocanu\/atlas as one issue/)).getByText(/op-202/)).toBeTruthy();
+    expect(within(card(/in vtmocanu\/omega as one issue/)).getByDisplayValue("omega edit")).toBeTruthy();
+    expect(screen.getByText("1 finding selected")).toBeTruthy();
+    // No page-wide notice: a sibling's outcome must not overwrite a receipt.
+    expect(screen.queryAllByText(/issue #91/)).toHaveLength(1);
+  });
+
+  it("names each card's fields by label within its repo region", async () => {
+    draftsById();
+    await renderAll(rows.slice(0, 3));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select all 3 shown" }));
+    fireEvent.click(perRepoButton(2));
+    const atlasRegion = await screen.findByRole("region", { name: "Issue for vtmocanu/atlas" });
+    expect(((await within(atlasRegion).findByLabelText("Title")) as HTMLInputElement).value).toBe("Draft d3");
+    expect((within(atlasRegion).getByLabelText("Description") as HTMLTextAreaElement).value).toBe("desc d3");
+    const uziRegion = screen.getByRole("region", { name: "Issue for vtmocanu/uzi" });
+    expect((within(uziRegion).getByLabelText("Title") as HTMLInputElement).value).toBe("Draft d1+d2");
+  });
+
+  it("two filings completing out of order each keep their receipt and drop only their own rows", async () => {
+    draftsById();
+    const pending = new Map<string, (v: FindingGroupFileResult) => void>();
+    mockApi.fileFindingGroup.mockImplementation(
+      (body) => new Promise<FindingGroupFileResult>((r) => pending.set((body.ids ?? [])[0], r)),
+    );
+    await renderAll();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select all 4 shown" }));
+    fireEvent.click(perRepoButton(3));
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "Create issue" })).toHaveLength(3));
+    const region = (repo: string) => screen.getByRole("region", { name: `Issue for vtmocanu/${repo}` });
+    fireEvent.change(within(region("zeta")).getByLabelText("Title"), { target: { value: "zeta edit" } });
+
+    const listCalls = mockApi.listFindings.mock.calls.length;
+    fireEvent.click(within(region("uzi")).getByRole("button", { name: "Create issue" }));
+    fireEvent.click(within(region("atlas")).getByRole("button", { name: "Create issue" }));
+    expect(mockApi.fileFindingGroup).toHaveBeenCalledTimes(2);
+
+    // Resolve in reverse order of the clicks.
+    await act(async () => pending.get("d3")!({ operation_id: "op-a", disposition_ids: ["d3"], phase: "settled", issue: issue(95) }));
+    await act(async () =>
+      pending.get("d1")!({ operation_id: "op-u", disposition_ids: ["d1", "d2"], phase: "settled", issue: issue(96) }),
+    );
+    await within(region("uzi")).findByText("Filed 2 findings as issue #96.");
+    expect(within(region("atlas")).getByText("Filed 1 finding as issue #95.")).toBeTruthy();
+    await waitFor(() => expect(mockApi.listFindings.mock.calls.length).toBeGreaterThan(listCalls));
+    await screen.findByText("Alpha bug");
+    expect(screen.getByText("1 finding selected")).toBeTruthy();
+    expect((within(region("zeta")).getByLabelText("Title") as HTMLInputElement).value).toBe("zeta edit");
+  });
+
+  it("a definite failure keeps that card's edits for retry and leaves a sibling's receipt", async () => {
+    draftsById();
+    mockApi.fileFindingGroup.mockImplementation(async (body): Promise<FindingGroupFileResult> => {
+      const ids = body.ids ?? [];
+      if (ids[0] === "d3") return { operation_id: "op-ok", disposition_ids: ids, phase: "settled", issue: issue(92) };
+      throw new ApiError(502, "forge rejected the request");
+    });
+    await renderAll(rows.slice(0, 3));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select all 3 shown" }));
+    fireEvent.click(perRepoButton(2));
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "Create issue" })).toHaveLength(2));
+    fireEvent.click(within(card(/in vtmocanu\/atlas as one issue/)).getByRole("button", { name: "Create issue" }));
+    await within(card(/in vtmocanu\/atlas as one issue/)).findByText("Filed 1 finding as issue #92.");
+
+    const uzi = card(/in vtmocanu\/uzi as one issue/);
+    fireEvent.change(within(uzi).getByDisplayValue("Draft d1+d2"), { target: { value: "kept edit" } });
+    fireEvent.click(within(uzi).getByRole("button", { name: "Create issue" }));
+    await within(uzi).findByText(/forge rejected the request/);
+    expect(within(uzi).getByDisplayValue("kept edit")).toBeTruthy();
+    expect(within(card(/in vtmocanu\/atlas as one issue/)).getByText("Filed 1 finding as issue #92.")).toBeTruthy();
+    expect(screen.getByText("2 findings selected")).toBeTruthy();
+  });
+
+  it("a double click on a card's Create posts once", async () => {
+    draftsById();
+    let resolve: (v: unknown) => void = () => {};
+    mockApi.fileFindingGroup.mockImplementation(() => new Promise((r) => (resolve = r)) as never);
+    await renderAll(rows.slice(0, 3));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select all 3 shown" }));
+    fireEvent.click(perRepoButton(2));
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "Create issue" })).toHaveLength(2));
+    const create = within(card(/in vtmocanu\/atlas as one issue/)).getByRole("button", { name: "Create issue" });
+    fireEvent.click(create);
+    fireEvent.click(create);
+    expect(mockApi.fileFindingGroup).toHaveBeenCalledTimes(1);
+    await act(async () => resolve({ operation_id: "op", disposition_ids: ["d3"], phase: "settled", issue: issue(93) }));
+    await within(card(/in vtmocanu\/atlas as one issue/)).findByText("Filed 1 finding as issue #93.");
+  });
+
+  it("Cancel and Close remove a card, and the review ends with the last one", async () => {
+    draftsById();
+    mockApi.fileFindingGroup.mockResolvedValue({ operation_id: "op", disposition_ids: ["d3"], phase: "settled", issue: issue(94) });
+    await renderAll(rows.slice(0, 3));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select all 3 shown" }));
+    fireEvent.click(perRepoButton(2));
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "Create issue" })).toHaveLength(2));
+    fireEvent.click(within(card(/in vtmocanu\/uzi as one issue/)).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByText(/in vtmocanu\/uzi as one issue/)).toBeNull();
+    fireEvent.click(within(card(/in vtmocanu\/atlas as one issue/)).getByRole("button", { name: "Create issue" }));
+    await within(card(/in vtmocanu\/atlas as one issue/)).findByText("Filed 1 finding as issue #94.");
+    fireEvent.click(within(card(/in vtmocanu\/atlas as one issue/)).getByRole("button", { name: "Close" }));
+    expect(screen.queryByRole("region", { name: "Issues to file, one per repo" })).toBeNull();
+    // The cancelled repo's rows are still selected and can be filed on their own.
+    expect((screen.getByRole("button", { name: "File as one issue" }) as HTMLButtonElement).disabled).toBe(false);
   });
 });

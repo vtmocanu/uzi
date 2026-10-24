@@ -98,6 +98,16 @@ location and title; change the title, description, or labels as you would for a
 single finding, then file. Once the filing settles, every selected finding shows as **Filed**
 against the same issue, and any warning uzi returns is shown with the result.
 
+A selection that spans several repos files **one issue per repo**, because a
+forge issue lives in one repo: the button reads **File N issues, one per repo**,
+where N is the number of repos. Select all in the **All repos** view to prepare
+one issue per repo. uzi opens one draft per repo, each listing every selected
+finding of that repo (a repo with a single selected finding gets its own
+issue), and you file each draft with its own **Create issue**. Each repo may
+hold at most 50 selected findings. Every draft is its own group filing with the
+rules below, so one repo's failure or uncertain result does not affect the
+others; each draft shows its own result until you close it.
+
 Filing is all or nothing: uzi claims every selected finding before it talks to
 the forge, so a finding that is already filed, dismissed, or mid-filing blocks
 the whole group instead of leaving it half filed. The issue carries a hidden

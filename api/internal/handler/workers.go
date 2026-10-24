@@ -785,6 +785,16 @@ func appendUpgradeBlockers(dto *apitypes.WorkerDTO, blockers map[uuid.UUID]worke
 	dto.UpgradeDetail = &detail
 }
 
+// workerActiveRunDTO is one run blocking a worker delete in the 409 body (#3390).
+// issue_iid is null for runs with no issue (chats).
+type workerActiveRunDTO struct {
+	ID       string `json:"id"`
+	Kind     string `json:"kind"`
+	Status   string `json:"status"`
+	IssueIID *int64 `json:"issue_iid"`
+	Title    string `json:"title"`
+}
+
 // DeleteWorker revokes a worker owned by the current user.
 func (h *Handler) DeleteWorker(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
@@ -798,6 +808,7 @@ func (h *Handler) DeleteWorker(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.wsvc.DeleteWorker(r.Context(), user.ID, id); err != nil {
 		var custody *workersvc.WorkerHasCustodyError
+		var activeRuns *workersvc.WorkerHasActiveRunsError
 		switch {
 		case errors.Is(err, workersvc.ErrWorkerNotFound):
 			httpx.Error(w, http.StatusNotFound, "worker not found")
@@ -813,6 +824,25 @@ func (h *Handler) DeleteWorker(w http.ResponseWriter, r *http.Request) {
 			httpx.JSON(w, http.StatusConflict, map[string]any{
 				"error":         fmt.Sprintf("this worker is retaining unpublished committed work for recovery in %d custody hold(s); recover it (uzi run export) or explicitly discard those recovery archives before removing it", custody.Holds),
 				"custody_holds": custody.Holds,
+			})
+		case errors.As(err, &activeRuns):
+			// #3390: name the blocking runs (capped by the service; the total is the
+			// authoritative count) so the operator knows what to cancel. The error string
+			// is unchanged for callers that only read it. runs is non-nil so an empty
+			// listing (runs finished mid-request) still encodes as [], not null.
+			runs := make([]workerActiveRunDTO, 0, len(activeRuns.Runs))
+			for _, r := range activeRuns.Runs {
+				dto := workerActiveRunDTO{ID: r.ID.String(), Kind: r.Kind, Status: r.Status, Title: r.DisplayTitle}
+				if r.IssueIid.Valid {
+					iid := r.IssueIid.Int64
+					dto.IssueIID = &iid
+				}
+				runs = append(runs, dto)
+			}
+			httpx.JSON(w, http.StatusConflict, map[string]any{
+				"error":             "worker has active runs; cancel them before deleting it",
+				"active_runs":       runs,
+				"active_runs_total": activeRuns.Total,
 			})
 		case errors.Is(err, workersvc.ErrWorkerHasActiveRuns):
 			httpx.Error(w, http.StatusConflict, "worker has active runs; cancel them before deleting it")
