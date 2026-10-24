@@ -90,9 +90,8 @@ func CodexCuratedModels() []string { return codexCuratedModelsSlice() }
 // h's closed vocabulary (PRD #1429 D6, narrowed by PRD #1551 M4). Since M4 the per-harness user
 // lanes are read from GetUserHarnessModelDefaults, with stale Claude-lane Codex role ids
 // filtered separately using agenttmpl.CodexRoleModels. Lane values never traverse this function;
-// its callers are the frozen-run.model
-// precedence check in claim/judge assembly (and the Go mirror of the custom-Codex re-check, which
-// exploits that the Codex arm below is true iff the id is empty or curated). An empty (inherit)
+// its callers check frozen-run.model precedence in ordinary/job assembly and re-check the
+// custom-Codex capability (where the Codex arm is true iff the id is empty or curated). An empty (inherit)
 // model is always compatible — the worker uses its own harness default. The frozen-pin rules are:
 //
 //   - Codex harness: ONLY a known Codex model is compatible. A Claude alias, or a custom/unknown
