@@ -6409,17 +6409,19 @@ describe("SdkExecutor event-free stream recovery (issue #3179)", () => {
   });
 
   it("a terminal-fenced run makes no further dispatch after an event-free attempt", async () => {
-    const abort = new AbortController();
+    let fenced = false;
     let queries = 0;
-    const { queryFn } = fakeTurns([() => { queries++; abort.abort(); return [] as unknown as AsyncIterable<unknown>; }]);
+    const { queryFn } = fakeTurns([() => { queries++; fenced = true; return [] as unknown as AsyncIterable<unknown>; }]);
     const probe = makeCtx({
-      seeded: true, planApproved: true, approvedPlan: "approved", terminalLifecycleSignal: abort.signal,
+      seeded: true, planApproved: true, approvedPlan: "approved", claimFenced: () => fenced,
     });
     await assert.rejects(
       new SdkExecutor(nullLogger(), homeDir, fastRecovery(queryFn)).run(probe.ctx),
-      (err: unknown) => !(err instanceof TransientRecoveryError),
+      (err: unknown) => err instanceof Error && /run cancelled/.test(err.message) && !(err instanceof TransientRecoveryError),
     );
     assert.equal(queries, 1);
+    // The event-free retry path was entered (base folds the attempt into a finished iteration instead).
+    assert.match(statusTexts(probe.emits).join("\n"), EVENT_FREE_NOTICE);
   });
 
   it("plan phase: an event-free planning turn is retried and its plan reaches the gate", async () => {
