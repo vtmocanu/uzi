@@ -1290,6 +1290,16 @@ case "$MODE" in
   uncreated) M5_OWNER="" ;;
   invalid-owner) M5_OWNER=not-a-uuid ;;
   sql-owner) M5_OWNER="invalid'"; M5_OWNER+=" OR '1'='1" ;;
+  invalid-fixture|invalid-email|invalid-label)
+    M5_OWNER="" M5_REG_ARMED=1
+    M5_FIXTURE=44444444-4444-4444-8444-444444444444
+    M5_EMAIL="manual-$M5_FIXTURE@uzi.e2e"
+    M5_LABEL="Manual owner $M5_FIXTURE"
+    case "$MODE" in
+      invalid-fixture) M5_FIXTURE="invalid'" ;;
+      invalid-email) M5_EMAIL="invalid'" ;;
+      invalid-label) M5_LABEL="invalid'" ;;
+    esac ;;
 esac
 db_psql() {
   printf '%s\n' "$1" >> "$SEQ_DIR/manual-cleanup"
@@ -1311,12 +1321,12 @@ source <(awk '/^  m5_uuid\(\)/ {emit=1} emit {print} /^  trap m5_exit EXIT/ {exi
 case "$MODE" in
   success) m5_cleanup; trap - EXIT ;;
   # A successful body must still fail when the EXIT handler cannot safely clean.
-  invalid-owner|sql-owner) exit 0 ;;
+  invalid-owner|sql-owner|invalid-fixture|invalid-email|invalid-label) exit 0 ;;
   *) exit 7 ;;
 esac
 BASH
 }
-for mode in success failure uncreated terminal-failure still-active invalid-owner sql-owner; do
+for mode in success failure uncreated terminal-failure still-active invalid-owner sql-owner invalid-fixture invalid-email invalid-label; do
   cases=$((cases + 1))
   : > "$SEQ_DIR/manual-cleanup"
   if output="$(manual_owner_cleanup_case "$mode" 2>&1)"; then got=pass; else got=fail; fi
@@ -1324,7 +1334,7 @@ for mode in success failure uncreated terminal-failure still-active invalid-owne
   valid=false
   case "$mode" in
     uncreated) [ "$got" = fail ] && [ -z "$calls" ] && valid=true ;;
-    invalid-owner|sql-owner)
+    invalid-owner|sql-owner|invalid-fixture|invalid-email|invalid-label)
       [ "$got" = fail ] && [ -z "$calls" ] && [[ "$output" == *'owned fixture cleanup failed'* ]] && valid=true ;;
     terminal-failure|still-active)
       [ "$got" = fail ] && [[ "$calls" != *'DELETE FROM users'* ]] && [[ "$output" == *cleanup* ]] && valid=true ;;
@@ -1335,6 +1345,96 @@ for mode in success failure uncreated terminal-failure still-active invalid-owne
   if [ "$valid" = true ]; then
     passed=$((passed + 1)); echo "PASS: manual owner cleanup $mode"
   else echo "FAIL: manual owner cleanup $mode result=$got calls=[$calls] output=[$output]"; fi
+done
+
+# Drive registration and EXIT cleanup together, so a lost curl response cannot
+# hide an identity committed before owner assignment. All transports are offline.
+manual_registration_case() {
+  bash -euo pipefail -s -- "$ROOT" "$SEQ_DIR" "$1" <<'BASH'
+ROOT="$1" SEQ_DIR="$2" MODE="$3"
+BASE=http://fixture.invalid RUNROOT="$SEQ_DIR"
+fixture=44444444-4444-4444-8444-444444444444
+owner=11111111-1111-4111-8111-111111111111
+email="manual-$fixture@uzi.e2e"
+label="Manual owner $fixture"
+[ "$MODE" != preexisting ] || : > "$SEQ_DIR/registration-account"
+fail() { echo "$*" >&2; exit 1; }
+db_psql() {
+  printf '%s\n' "$1" >> "$SEQ_DIR/registration-sql"
+  case "$1" in
+    'SELECT gen_random_uuid()') echo "$fixture" ;;
+    'SELECT count(*) FROM users WHERE email='*)
+      [ "$1" = "SELECT count(*) FROM users WHERE email='$email'" ] || return 1
+      [ ! -f "$SEQ_DIR/registration-account" ] && echo 0 || echo 1 ;;
+    'SELECT id FROM users WHERE email='*)
+      [ "$1" = "SELECT id FROM users WHERE email='$email' AND display_name='$label' AND NOT is_admin" ] || return 1
+      [ "$MODE" != lookup-error ] || return 7
+      if [ -f "$SEQ_DIR/registration-account" ]; then
+        [ "$MODE" != invalid-result ] && echo "$owner" || echo not-a-uuid
+      fi ;;
+    'SELECT count(*) FROM users WHERE id='*)
+      [ "$1" = "SELECT count(*) FROM users WHERE id='$owner' AND email='$email' AND NOT is_admin" ] || return 1
+      echo 1 ;;
+    'SELECT count(*) FROM runs'*) echo 0 ;;
+    'DELETE FROM users'*)
+      [ "$1" = "DELETE FROM users WHERE id='$owner' AND email='$email' RETURNING id" ] || return 1
+      rm "$SEQ_DIR/registration-account"
+      echo "$owner" ;;
+    'SELECT (SELECT count(*) FROM workers'*) echo 0 ;;
+    *) return 1 ;;
+  esac
+}
+curl() {
+  printf 'register\n' >> "$SEQ_DIR/registration-http"
+  [[ " $* " == *" $BASE/api/auth/register "* ]] || return 1
+  [ "$MODE" = not-committed ] || : > "$SEQ_DIR/registration-account"
+  case "$MODE" in
+    confirmed) printf '{"user":{"id":"%s"}}\n' "$owner" ;;
+    empty-response) return 0 ;;
+    *) return 7 ;;
+  esac
+}
+# shellcheck disable=SC1090  # actual setup through owner confirmation and EXIT trap
+source <(awk '
+  /^  M5_FIXTURE=/ {emit=1; print "("}
+  /\[ -n "\$\(csrf\)"/ && emit {print ")"; exit}
+  emit {print}
+' "$ROOT/e2e/phases/50-worker-token-binding.sh")
+BASH
+}
+for mode in lost-response empty-response not-committed preexisting lookup-error invalid-result confirmed; do
+  cases=$((cases + 1))
+  rm -f "$SEQ_DIR/registration-account"
+  : > "$SEQ_DIR/registration-sql"
+  : > "$SEQ_DIR/registration-http"
+  if output="$(manual_registration_case "$mode" 2>&1)"; then got=pass; else got=fail; fi
+  calls="$(cat "$SEQ_DIR/registration-sql")"
+  http="$(cat "$SEQ_DIR/registration-http")"
+  valid=false
+  case "$mode" in
+    lost-response|empty-response)
+      [ "$got" = fail ] && [ "$http" = register ] && [ ! -f "$SEQ_DIR/registration-account" ] \
+        && [[ "$calls" == *'SELECT id FROM users'*'DELETE FROM users'* ]] \
+        && [[ "$output" != *'owned fixture cleanup failed'* ]] && valid=true ;;
+    confirmed)
+      [ "$got" = pass ] && [ "$http" = register ] && [ ! -f "$SEQ_DIR/registration-account" ] \
+        && [[ "$calls" != *'SELECT id FROM users'* ]] && [[ "$calls" == *'DELETE FROM users'* ]] && valid=true ;;
+    not-committed)
+      [ "$got" = fail ] && [ "$http" = register ] && [ ! -f "$SEQ_DIR/registration-account" ] \
+        && [[ "$calls" == *'SELECT id FROM users'* ]] && [[ "$calls" != *'DELETE FROM users'* ]] \
+        && [[ "$output" != *'owned fixture cleanup failed'* ]] && valid=true ;;
+    preexisting)
+      [ "$got" = fail ] && [ -z "$http" ] && [ -f "$SEQ_DIR/registration-account" ] \
+        && [[ "$calls" == *'SELECT count(*) FROM users WHERE email='* ]] \
+        && [[ "$calls" != *'SELECT id FROM users'* ]] && [[ "$calls" != *'DELETE FROM users'* ]] && valid=true ;;
+    lookup-error|invalid-result)
+      [ "$got" = fail ] && [ "$http" = register ] && [ -f "$SEQ_DIR/registration-account" ] \
+        && [[ "$calls" != *'DELETE FROM users'* ]] \
+        && [[ "$output" == *'owned fixture cleanup failed'* ]] && valid=true ;;
+  esac
+  if [ "$valid" = true ]; then
+    passed=$((passed + 1)); echo "PASS: manual registration cleanup $mode"
+  else echo "FAIL: manual registration cleanup $mode result=$got sql=[$calls] http=[$http] output=[$output]"; fi
 done
 
 node --test "$ROOT/e2e/settlement-diagnostic.test.mjs"

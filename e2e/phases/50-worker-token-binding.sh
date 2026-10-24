@@ -7,8 +7,8 @@
 # requires: REPO_ID DUMMY_ANTHROPIC DUMMY_FORGE_PAT UZI_BIN
 # provides: -
 # handoff:  -
-# mutates:  compose:agent(stopped) (:40, never restarted in-phase); a spare anthropic_token(console-key, deleted); a binding-test worker; runs created then cancelled
-# restores: - (agent restart is ENFORCED downstream: 59-restart-agent provides SCHED_AGENT_UP, required by 60-62; 51 needs it stopped so 50 cannot restore it itself)
+# mutates:  compose:agent(stopped); spare anthropic_token(console-key, deleted); binding-test worker and cancelled runs; isolated owner, connection/repos, vault credential, CLI token, persistent/ephemeral workers and run; cordon AUDIT snapshots intentionally retained
+# restores: isolated owner resources cascade-delete after run terminalization via guarded EXIT cleanup (failure FAILs); cordon AUDIT snapshots intentionally retained; original agent stays stopped for 51, restart ENFORCED by 59-restart-agent providing SCHED_AGENT_UP for 60-62
 # ---------------------------------------------------------------------------
 # PRD #104: a worker's token binding reaches the CLAIM PAYLOAD, and a rebind takes
 # effect on the very next claim with no restart.
@@ -225,12 +225,25 @@ pass "binding-phase cleanup: the three claimed binding runs terminated so they c
   M5_REASON="e2e-manual-intake-$M5_FIXTURE"
   JAR="$RUNROOT/manual-$M5_FIXTURE.jar"
   M5_OWNER="" M5_CONNECTION="" M5_REPO="" M5_WORKER="" M5_EPHEMERAL=""
+  M5_REG_ARMED=0
   M5_RUNS=()
   m5_uuid() { [[ "$1" =~ ^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$ ]]; }
   m5_cleanup() {
-    [ -n "$M5_OWNER" ] || return 0
-    m5_uuid "$M5_OWNER" || return 1
     local run rc=0 remaining deleted
+    if [ -z "$M5_OWNER" ]; then
+      [ "${M5_REG_ARMED:-0}" = 1 ] || return 0
+      # Only an absent-before-POST, nonce-derived identity may be recovered.
+      # Validate every interpolated fixture value before this single lookup.
+      m5_uuid "$M5_FIXTURE" || return 1
+      [ "$M5_EMAIL" = "manual-$M5_FIXTURE@uzi.e2e" ] || return 1
+      [ "$M5_LABEL" = "Manual owner $M5_FIXTURE" ] || return 1
+      M5_OWNER="$(db_psql "SELECT id FROM users WHERE email='$M5_EMAIL' AND display_name='$M5_LABEL' AND NOT is_admin")" || return 1
+      if [ -z "$M5_OWNER" ]; then
+        M5_REG_ARMED=0
+        return 0
+      fi
+    fi
+    m5_uuid "$M5_OWNER" || return 1
     # At most our one created run. Independent terminalizations are best-effort;
     # any failure prevents cascading deletion from concealing unfinished work.
     for run in "${M5_RUNS[@]}"; do
@@ -251,6 +264,7 @@ pass "binding-phase cleanup: the three claimed binding runs terminated so they c
       + (SELECT count(*) FROM forge_connections WHERE user_id='$M5_OWNER')
       + (SELECT count(*) FROM user_secrets WHERE user_id='$M5_OWNER')")" = 0 ] || return 1
     M5_OWNER=""
+    M5_REG_ARMED=0
   }
   m5_exit() {
     local rc=$?
@@ -263,12 +277,16 @@ pass "binding-phase cleanup: the three claimed binding runs terminated so they c
   trap m5_exit EXIT
   # Registration unlock is best-effort in auth.go. Secret creation and the later
   # positive claim, rather than registration alone, establish vault eligibility.
+  [ "$(db_psql "SELECT count(*) FROM users WHERE email='$M5_EMAIL'")" = 0 ] \
+    || fail "manual intake: fixture email already exists or preflight failed; left untouched"
+  M5_REG_ARMED=1
   M5_REG="$(curl -fsS -c "$JAR" -X POST "$BASE/api/auth/register" -H 'Content-Type: application/json' \
     -d "{\"email\":\"$M5_EMAIL\",\"password\":\"e2e-manual-$M5_FIXTURE\",\"display_name\":\"$M5_LABEL\"}")"
   M5_OWNER="$(printf '%s' "$M5_REG" | jq -er '.user.id')"
   m5_uuid "$M5_OWNER" || fail "manual intake: registration returned no owner UUID"
   [ "$(db_psql "SELECT count(*) FROM users WHERE id='$M5_OWNER' AND email='$M5_EMAIL' AND NOT is_admin")" = 1 ] \
     || fail "manual intake: registration did not create the exact non-admin owner"
+  M5_REG_ARMED=0
   [ -n "$(csrf)" ] || fail "manual intake: registration did not issue CSRF"
   M5_CONNECTION="$(printf '{"forge_type":"gitlab","base_url":"https://forge-fake.e2e","token":"%s"}' "$DUMMY_FORGE_PAT" \
     | curl -fsS -b "$JAR" -X POST "$BASE/api/forge/connections" -H 'Content-Type: application/json' \
