@@ -111,7 +111,7 @@ import type {
 import { resolveAgentSelection, RUN_KINDS } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { deriveCloneKey, resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
-import { RecoveryCoordinator, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, type ClosedSourceObservation, type InventorySourceBoundaryContext, type CompletionSource, type RecoveryRecord, type RecoveryCoordinatorOptions } from "./recovery.js";
+import { RecoveryCoordinator, canonicalJson, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, type ClosedSourceObservation, type InventorySourceBoundaryContext, type CompletionSource, type RecoveryRecord, type RecoveryCoordinatorOptions } from "./recovery.js";
 import { classifyRecoveryOrigin } from "./recovery-origin.js";
 import {
   PUSHED_HEAD_UNRECORDED,
@@ -2049,6 +2049,12 @@ type TerminalSource = Readonly<{
   flightAttemptId: string | undefined;
   cancelled: boolean; cancelAborted: boolean;
 }>;
+/** Process-local deny-only provenance; serialized completion sources compare by value. */
+type CompletionSourceBinding = Readonly<{
+  key: string; signature: string; contextSignature: string; flight: RunFlight; executor: Executor;
+  kind: "knownCodex" | "knownClaude"; source?: TerminalSource;
+}>;
+
 type DeferredTerminalRelease = TerminalSource & Readonly<{
   reason: string; memo: boolean; capturedHead?: string; stale: boolean; record: "none";
 }>;
@@ -2874,6 +2880,10 @@ export class RunRunner {
   private readonly inventoryReservations = new Set<string>();
   private readonly commandSettlements = new WeakMap<Executor, { confirmed: boolean; failed: boolean }>();
   private readonly executionTails = new Map<string, Promise<ClosedSourceObservation | void>>();
+  // A boundary pass alone is not full cleanup. Only the coordinator completion notification retires bindings.
+  private readonly completionSourceBindings = new Map<string, readonly CompletionSourceBinding[]>();
+  private readonly conflictedCompletionSources = new Set<CompletionSourceBinding>();
+  private readonly completionSourceBinds = new Set<CompletionSourceBinding>();
   /** PRD #218 M1: set by `shutdown()`. Read when a run registers so a run that starts
    *  DURING the shutdown drain (a late claim) is aborted immediately rather than running
    *  to completion past the grace window. */
@@ -2945,6 +2955,7 @@ export class RunRunner {
         terminalSettlementConfirmed: runId => !this.executionTails.has(runId),
         withInventorySourceBoundary: (context, action) => this.withInventorySourceBoundary(context, action),
         withCompletionSourceBoundary: (source, action) => this.withCompletionSourceBoundary(source, action),
+        onCompletionSourceForgotten: source => this.forgetCompletionSourceBinding(source),
         withTerminalSourceBoundary: (runId, paths, action, signal) => {
           const pressureOpen = () => this.dataVolume?.preflight() !== "data_volume_full";
           if (!pressureOpen()) return Promise.resolve({ entered: false as const });
@@ -3282,24 +3293,100 @@ export class RunRunner {
     }
   }
 
+  private completionSourceIdentity(source: CompletionSource): string {
+    const ctx = source.context;
+    return JSON.stringify([ctx.runId, ctx.generation, ctx.barePath, ctx.branch, source.clonePath, source.attemptId]);
+  }
+
+  private rememberCompletionSource(source: CompletionSource, flight: RunFlight,
+    executor: Executor, terminalSource: TerminalSource | undefined): CompletionSourceBinding {
+    const group = this.completionKey(source.context.runId, source.context.generation);
+    const bindings = this.completionSourceBindings.get(group) ?? [];
+    const key = this.completionSourceIdentity(source), signature = canonicalJson(source);
+    const contextSignature = canonicalJson(source.context);
+    const kind = terminalSource ? "knownCodex" : "knownClaude";
+    const same = bindings.find(b => b.key === key && b.signature === signature && b.flight === flight &&
+      b.executor === executor && b.source?.safety === terminalSource?.safety && b.kind === kind);
+    if (same && !this.completionSourceBinds.has(same)) return same;
+    const binding: CompletionSourceBinding = Object.freeze({ key, signature, contextSignature, flight, executor, kind, source: terminalSource });
+    // HEAD/roots updates still reach the durable binder; changed Codex provenance only vetoes cleanup.
+    for (const old of bindings) {
+      if (old.key === key && (old.kind === "knownCodex" || kind === "knownCodex") &&
+          (old.flight !== flight || old.executor !== executor || old.source?.safety !== terminalSource?.safety ||
+            old.contextSignature !== contextSignature)) {
+        this.conflictedCompletionSources.add(old);
+        this.conflictedCompletionSources.add(binding);
+      }
+    }
+    this.completionSourceBindings.set(group, Object.freeze([...bindings, binding]));
+    return binding;
+  }
+
+  private forgetCompletionSourceBinding(source: CompletionSource): void {
+    const group = this.completionKey(source.context.runId, source.context.generation);
+    const bindings = this.completionSourceBindings.get(group);
+    if (!bindings) return;
+    const key = this.completionSourceIdentity(source);
+    // A binder may already own provenance while waiting on the coordinator's journal lock.
+    // Its partial write must never become an unclassified current-process source.
+    if (bindings.some(b => b.key === key && this.completionSourceBinds.has(b))) return;
+    const remaining = bindings.filter(b => b.key !== key);
+    for (const binding of bindings) if (binding.key === key) this.conflictedCompletionSources.delete(binding);
+    if (remaining.length) this.completionSourceBindings.set(group, Object.freeze(remaining));
+    else this.completionSourceBindings.delete(group);
+  }
+
+  private classifyCompletionSource(source: CompletionSource):
+    { kind: "knownCodex"; binding?: CompletionSourceBinding } | { kind: "knownClaude" | "noReliableBinding" } {
+    const bindings = this.completionSourceBindings.get(this.completionKey(source.context.runId, source.context.generation)) ?? [];
+    const exact = bindings.filter(b => b.key === this.completionSourceIdentity(source));
+    const codex = exact.filter(b => b.kind === "knownCodex");
+    if (codex.length) return { kind: "knownCodex", binding: codex.find(b => b.signature === canonicalJson(source)) };
+    if (exact.length) return { kind: "knownClaude" };
+    // Same run/generation is recognizable even if clone, attempt, bare or branch was changed.
+    // A different positively bound tuple above remains independent; path alone grants nothing.
+    return { kind: bindings.some(b => b.kind === "knownCodex") ? "knownCodex" : "noReliableBinding" };
+  }
+
+  private completionSourceProof(source: CompletionSource, binding: CompletionSourceBinding): boolean {
+    const current = this.classifyCompletionSource(source);
+    return current.kind === "knownCodex" && current.binding === binding &&
+      !this.conflictedCompletionSources.has(binding) && binding.signature === canonicalJson(source) &&
+      binding.key === this.completionSourceIdentity(source) && binding.source !== undefined &&
+      source.context.runId === binding.source.runId && source.context.generation === binding.source.generation &&
+      source.context.barePath === binding.source.barePath && source.context.branch === binding.source.branch &&
+      source.clonePath === binding.source.clonePath && source.attemptId === binding.source.attemptId &&
+      binding.flight.executor === binding.executor && this.terminalSourceCurrent(binding.flight, binding.source) &&
+      this.terminalProcessProof(binding.flight) && binding.flight.terminalDisposal?.source.executor === binding.executor &&
+      binding.flight.terminalDisposal.source.safety === binding.source.safety;
+  }
+
   /** Reserve execution through completion retirement's disposal under the bare lock. Successor admission
    * replaces this tail and stops any further destruction while waiting for our release. */
   private async withCompletionSourceBoundary(source: CompletionSource,
     action: (canDelete: () => boolean) => Promise<void>): Promise<"passed" | "retained"> {
     const ctx = source.context;
-    if (this.executionTails.has(ctx.runId) || process.platform !== "linux") return "retained";
+    const classification = this.classifyCompletionSource(source);
+    const proof = (): boolean => {
+      const current = this.classifyCompletionSource(source);
+      if (classification.kind !== "knownCodex") return current.kind !== "knownCodex";
+      return classification.binding !== undefined && this.completionSourceProof(source, classification.binding);
+    };
+    // A known Codex source never falls through to legacy inspection without the live disposal witness.
+    if (!proof() || this.executionTails.has(ctx.runId) || process.platform !== "linux") return "retained";
     let release!: () => void;
     const tail = new Promise<void>(resolve => { release = resolve; });
     this.executionTails.set(ctx.runId, tail);
     this.inventoryReservations.add(ctx.runId);
-    const open = (): boolean => this.executionTails.get(ctx.runId) === tail && residueQuarantine() === undefined &&
+    const open = (): boolean => proof() && this.executionTails.get(ctx.runId) === tail && residueQuarantine() === undefined &&
       !this.liveAttempts.isLivePath(source.clonePath);
     try {
       const inventory = await this.git.readInventoryCloneHeads(ctx.barePath, ctx.runId);
       if (inventory.kind !== "verified" || !open()) return "retained";
       const clone = inventory.clones.find(c => c.clonePath === source.clonePath);
       if (!clone) {
-        if (!await this.git.completionSourceAlreadyRetired(ctx.barePath, ctx.branch, ctx.runId, source.clonePath, source.attemptId) || !open()) return "retained";
+        if (!await this.git.completionSourceAlreadyRetired(ctx.barePath, ctx.branch, ctx.runId, source.clonePath, source.attemptId,
+          classification.kind === "knownCodex" ? { processProof: open } : undefined) || !open()) return "retained";
         await action(open);
         return "passed";
       }
@@ -3311,11 +3398,12 @@ export class RunRunner {
         site: "completion_source" };
       const before = await this.quiesceImpl(request);
       if (before.process?.state !== "quiescent" || !open()) return "retained";
-      if (await this.git.worktreeHead(source.clonePath) !== source.expectedHead) return "retained";
+      if (await this.git.worktreeHead(source.clonePath) !== source.expectedHead || !open()) return "retained";
       const after = await this.quiesceImpl({ ...request, dockerHost: undefined, site: "completion_source:after_git" });
       if (after.process?.state !== "quiescent" || !open()) return "retained";
       await this.git.retireRunnerClone(ctx.barePath, source.clonePath, ctx.branch, ctx.runId, {
         discard: true, attemptId: source.attemptId, completionSource: { expectedHead: source.expectedHead, canDelete: open },
+        ...(classification.kind === "knownCodex" ? { processProof: open } : {}),
       });
       if (!open()) return "retained";
       await action(open);
@@ -3622,6 +3710,8 @@ export class RunRunner {
   private async bindCompletionSource(flight: RunFlight): Promise<void> {
     if (!flight.barePath || !flight.worktreePath || !flight.branch || flight.predecessorCapture ||
         !flight.runnerClone || flight.runnerClone.path !== flight.worktreePath || flight.runnerClone.branch !== flight.branch) return;
+    const executor = flight.executor;
+    const terminalSource = executor.safety ? this.terminalSource(flight, executor, executor.safety) : undefined;
     try {
       const context = (await this.owedOptions(flight, flight.barePath, flight.branch)).context;
       if (!context || context.generation === null || "legacy" in context) return;
@@ -3631,8 +3721,13 @@ export class RunRunner {
       const roots = candidates.map(r => ({ sha: r.sha,
         contexts: r.contexts.filter(c => c.generation === flight.claimGeneration && !("origin" in c)) }))
         .filter(r => r.contexts.length > 0);
-      await this.recovery.bindCompletionSource({ context: context as CompletionSource["context"],
-        clonePath: flight.worktreePath, attemptId: flight.runnerClone?.attemptId, expectedHead, roots });
+      const source: CompletionSource = { context: context as CompletionSource["context"],
+        clonePath: flight.worktreePath, attemptId: flight.runnerClone?.attemptId, expectedHead, roots };
+      // Install before the durable write: false/throw may already have persisted part of the cohort.
+      const binding = this.rememberCompletionSource(source, flight, executor, terminalSource);
+      this.completionSourceBinds.add(binding);
+      try { await this.recovery.bindCompletionSource(source); }
+      finally { this.completionSourceBinds.delete(binding); }
     } catch (err) {
       flight.runLog.warn("recovery: completion source provenance unavailable; deletion remains protected", { error: errMessage(err) });
     }

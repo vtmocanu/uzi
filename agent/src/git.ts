@@ -10750,24 +10750,30 @@ export class GitCache {
    */
   /** Credential-free exact prior retirement proof. Absence alone is never attribution. */
   async completionSourceAlreadyRetired(barePath: string, branch: string, runId: string,
-    clonePath: string, attemptId: string | undefined): Promise<boolean> {
-    if (!attemptId) return false;
+    clonePath: string, attemptId: string | undefined, opts: { processProof?: () => boolean } = {}): Promise<boolean> {
+    const processOpen = (): boolean => opts.processProof === undefined || opts.processProof() === true;
+    if (!attemptId || !processOpen()) return false;
     return this.withLock(barePath, async () => {
+      if (!processOpen()) return false;
       const entry = (await this.readAttemptLedger(barePath, branch)).get(attemptId);
-      if (entry?.runId !== runId || entry.clonePath !== clonePath || entry.state !== "retired") return false;
+      if (!processOpen() || entry?.runId !== runId || entry.clonePath !== clonePath || entry.state !== "retired") return false;
       const open = async (): Promise<boolean> =>
-        !await this.hasPhysicalTerminalProtection(runId) && residueQuarantine() === undefined;
+        processOpen() && !await this.hasPhysicalTerminalProtection(runId) && processOpen() && residueQuarantine() === undefined;
       if (!await open()) return false;
       const pending = await this.readRecoveryCapture(barePath, branch);
+      if (!processOpen()) return false;
       if (pending && (pending.runId !== runId || pending.clonePath !== clonePath || pending.attemptId !== attemptId))
         return false; // A successor/adoption owns this branch now.
       if (pending?.recovery || pending?.retainedSources?.length) return false;
       try { await fs.lstat(clonePath); return false; }
       catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
       if (!await open()) return false;
-      // Durable retirement already proves disposal; only finish this exact old journal.
-      if (pending) await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
-      return true;
+      // The retired ledger proves attribution only. The caller may independently require live process exclusion.
+      if (pending) {
+        if (!processOpen()) return false;
+        await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
+      }
+      return processOpen();
     });
   }
 

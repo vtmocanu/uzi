@@ -446,6 +446,8 @@ export interface RecoveryCoordinatorOptions {
     captureWip?: GitCache["captureMaintenanceWip"];
     withMaintenanceTransfer?: <V>(action: (check: () => void) => Promise<V>) => Promise<V>;
   }) => Promise<T>, signal?: AbortSignal) => Promise<{ entered: false } | { entered: true; value: T }>;
+  /** Notification only, after exact-source and generation cleanup actually completed. */
+  onCompletionSourceForgotten?: (source: CompletionSource) => void;
   withCompletionSourceBoundary?: (
     source: CompletionSource,
     action: (canDelete: () => boolean) => Promise<void>,
@@ -906,6 +908,7 @@ const recoveryJournalLocks = new RunDiskLocks();
 export class RecoveryCoordinator {
   private readonly withInventorySourceBoundary: RecoveryCoordinatorOptions["withInventorySourceBoundary"];
   private readonly withCompletionSourceBoundary: RecoveryCoordinatorOptions["withCompletionSourceBoundary"];
+  private readonly onCompletionSourceForgotten: RecoveryCoordinatorOptions["onCompletionSourceForgotten"];
   private readonly isExecuting: (runId: string) => boolean;
   private bootOwed: Awaited<ReturnType<NonNullable<RecoveryBundleProducer["discoverOwedCandidates"]>>> = [];
   private readonly terminalRecordProtection: RecoveryCoordinatorOptions["terminalRecordProtection"];
@@ -1082,6 +1085,7 @@ export class RecoveryCoordinator {
     }) : undefined;
     this.withInventorySourceBoundary = opts.withInventorySourceBoundary;
     this.withCompletionSourceBoundary = opts.withCompletionSourceBoundary;
+    this.onCompletionSourceForgotten = opts.onCompletionSourceForgotten;
     this.isExecuting = opts.isExecuting ?? (() => false);
     this.terminalRecordProtection = opts.terminalRecordProtection;
     this.pendingGenerationReport = opts.pendingGenerationReport;
@@ -4268,7 +4272,8 @@ export class RecoveryCoordinator {
         recoverySources, authority.completionReceipt!.final_head,
         () => residueQuarantine() === undefined && !isExecuting(runId) && !this.isExecuting(runId), "completion-check"));
       if (preflight !== "verified") return;
-      await this.withCompletionSourceBoundary!(source, async canDelete => {
+      let forgotten = false;
+      const boundary = await this.withCompletionSourceBoundary!(source, async canDelete => {
         const result = await ownedRecoveryIO(() => this.git.cleanupRecoveryGeneration!(bare, ctx, source.roots, pins,
           recoverySources, authority.completionReceipt!.final_head, canDelete, "completion"));
         if (result !== "removed") return;
@@ -4281,7 +4286,10 @@ export class RecoveryCoordinator {
         for (const record of selected) if (record.captureId !== authority.captureId) await unlink(this.recordPath(record));
         await unlink(this.recordPath(authority));
         await ownedRecoveryIO(() => fs.rmdir(this.runDir(runId))).catch(() => undefined);
+        forgotten = true;
       });
+      // A pass whose action returned early, or any partial failure, keeps provenance.
+      if (boundary === "passed" && forgotten) this.onCompletionSourceForgotten?.(source);
     });
     await this.submitRedundancyClaims(claims, budget);
   }

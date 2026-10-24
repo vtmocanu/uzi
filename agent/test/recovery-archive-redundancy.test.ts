@@ -303,7 +303,8 @@ async function bounded<T>(work: Promise<T>, event: string): Promise<T> {
   } finally { clearTimeout(timer); }
 }
 
-async function harness(opts: { features?: string[]; redundancyTimer?: (fire: () => void, ms: number) => () => void } = {}) {
+async function harness(opts: { features?: string[]; redundancyTimer?: (fire: () => void, ms: number) => () => void;
+  onCompletionSourceForgotten?: () => void } = {}) {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), "redundancy-"));
   await fsp.chmod(root, 0o700);
   const runId = "22222222-2222-4222-8222-222222222222";
@@ -405,6 +406,7 @@ async function harness(opts: { features?: string[]; redundancyTimer?: (fire: () 
   const make = () => new RecoveryCoordinator({
     recoveryRoot: path.join(root, "journal"), workerToken: TOKEN, log: nullLogger(), client: client as never, git: git as never,
     withCompletionSourceBoundary: async (_s, action) => { await action(() => true); return "passed"; },
+    onCompletionSourceForgotten: opts.onCompletionSourceForgotten,
     ...(opts.redundancyTimer === undefined ? {} : { testHooks: { redundancyTimer: opts.redundancyTimer } }),
   });
   const coordinator = make();
@@ -448,6 +450,32 @@ async function harness(opts: { features?: string[]; redundancyTimer?: (fire: () 
     return (await coordinator.inspect(runId)).find(r => r.captureId === rec.source.captureId)!;
   }
   return { root, ctx, runId, state, git, coordinator, make, uploaded, receipted, sign, close: () => fsp.rm(root, { recursive: true, force: true }) };
+}
+
+// Lifecycle notification controls only: the fixture's boundary is not process proof.
+for (const refusal of ["early-return", "partial-unlink"] as const) {
+  it(`M3 cleanup notification: ${refusal} preserves binding until full cohort unlink`, async t => {
+    let notifications = 0;
+    const h = await harness({ onCompletionSourceForgotten: () => { notifications++; } });
+    try {
+      const rec = await h.uploaded(false);
+      const authority = await h.receipted(rec);
+      const unlink = fsp.unlink.bind(fsp);
+      const block = refusal === "partial-unlink" ? t.mock.method(fsp, "unlink", async (target: Parameters<typeof fsp.unlink>[0]) => {
+        if (String(target).endsWith(path.sep + authority.captureId + ".json")) throw new Error("deliberate authority unlink refusal");
+        return unlink(target);
+      }) : undefined;
+      if (refusal === "early-return") h.state.cleanup = "retained";
+      await h.coordinator.resumePending(undefined, [authority]);
+      assert.equal(notifications, 0, "a passed boundary with unfinished action is not full cleanup");
+      assert.ok((await h.coordinator.inspect(h.runId)).some(r => r.captureId === authority.captureId));
+      block?.mock.restore();
+      h.state.cleanup = "removed";
+      await h.coordinator.resumePending(undefined, [authority]);
+      assert.equal(notifications, 1, "only completed cleanup releases process-local provenance");
+      assert.deepEqual(await h.coordinator.inspect(h.runId), []);
+    } finally { await h.close(); }
+  });
 }
 
 describe("RecoveryCoordinator redundancy claims", () => {
