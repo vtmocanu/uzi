@@ -1187,7 +1187,8 @@ Administrators can lower the run limits in
 Terminal colour codes (complete ANSI CSI sequences) are stripped, and any
 other control or format character except tab, newline and carriage return
 becomes a visible `\u{XXXX}` escape; NUL bytes or invalid UTF-8 still skip
-the file as `binary`. Limits apply to the normalised text.
+the file as `binary`. The per-file limit applies both before normalisation and
+after normalisation and scrubbing; retention limits apply to the resulting text.
 Archive paths, links, inflated bytes and download work are bounded before
 worker delivery. Content is scrubbed **before hashing and storage**.
 The bounded, untrusted manifest identifies kept files and refusal reasons;

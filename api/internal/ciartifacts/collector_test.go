@@ -420,7 +420,7 @@ func TestCollectorNormalizesTerminalText(t *testing.T) {
 	c.Add(context.Background(), "1", "logs", zipFixture(t,
 		zipItem{name: "phase.log", text: "\x1b[1m==> case 1\x1b[0m\n  \x1b[32mPASS\x1b[0m ok\r\n"},
 		zipItem{name: "plain.log", text: "==> case 1\n  PASS ok\r\n"},
-		zipItem{name: "unsafe.log", text: "a\x07b\x1b]0;t\x1b[1\x7fc‮d\x1b"},
+		zipItem{name: "unsafe.log", text: "a\x07b\x1b]0;t\x1b[1\x7fc\u202ed\x1b"},
 		zipItem{name: "secret.log", text: "glpat-\x1b[31m" + strings.Repeat("a", 20)},
 		zipItem{name: "expands.log", text: strings.Repeat("\x07", 9)},
 		zipItem{name: "nul", text: "a\x00b"},
