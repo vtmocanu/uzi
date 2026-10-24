@@ -10,7 +10,7 @@ import {
   type MaterializedCase, type ReplayCase, type ReplayCorpus, type ReplayRecord, type RunReplaysDeps,
 } from "../src/code-cross-check-replay.js";
 import type { ClaudeCrossCheck } from "../src/claude-cross-check.js";
-import { defaultReplayCliDeps, runReplayCli } from "../src/code-cross-check-replay-cli.js";
+import { createReplayRecordsFile, defaultReplayCliDeps, runReplayCli } from "../src/code-cross-check-replay-cli.js";
 import { codeCrossCheckBrief, crossCheckPrompt } from "../src/codex/cross-check.js";
 import { decodeCrossCheckClaim } from "../src/code-cross-check-contract.js";
 import { CrossCheckCheckerUnavailableError } from "../src/codex/model-rejection.js";
@@ -359,6 +359,24 @@ test("an unconfirmed checker cleanup keeps the run directory and names it on std
   assert.ok(path.isAbsolute(kept));
   await fs.access(kept);
   await fs.rm(root, { recursive: true, force: true });
+
+  // A records-file close failure after the unconfirmed teardown must not undo the retention.
+  const root2 = await fs.mkdtemp(path.join(tc.root, "retain-close-"));
+  const r2 = await cli(replayArgs(["--authorize-real-model-calls"]), {
+    scratchRoot: root2, checkers: { claude: checker(async () => findingsText) },
+    openRecords: async (dir, nowMs) => {
+      const real = await createReplayRecordsFile(dir, nowMs);
+      return { file: real.file, handle: {
+        appendFile: (data: string) => real.handle.appendFile(data),
+        close: async () => { await real.handle.close(); throw new Error("close failed"); },
+      } as Pick<fs.FileHandle, "appendFile" | "close"> };
+    },
+  });
+  assert.equal(r2.code, 1);
+  const kept2 = r2.errLines.map((l) => JSON.parse(l) as { retained_run_dir?: string }).find((e) => e.retained_run_dir);
+  assert.ok(kept2, "the run directory is still reported as retained");
+  await fs.access(kept2.retained_run_dir!);
+  await fs.rm(root2, { recursive: true, force: true });
 });
 
 test("default wiring sends stdout lines to stdout and the locator channel to stderr", () => {

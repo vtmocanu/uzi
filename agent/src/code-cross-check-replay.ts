@@ -690,6 +690,9 @@ export interface RunReplaysDeps {
   env: NodeJS.ProcessEnv;
   checkers?: { claude?: Pick<ClaudeCrossCheck, "run">; codex?: Pick<CodexCrossCheck, "run"> };
   materialize?: typeof materializeCase;
+  /** Called once, before the attempt is recorded, when a checker could not confirm its native cleanup: the caller
+   *  latches retention of the run directory before any later step can fail. */
+  onCleanupUnconfirmed?: () => void;
   /** Test seam for the uid layout of the directories the replay creates; production derives it from the environment. */
   layout?: ReplayUidLayout;
   signal?: AbortSignal;
@@ -830,6 +833,7 @@ export async function runReplays(deps: RunReplaysDeps): Promise<ReplayRecord[]> 
           findings: outcome === "completed" ? findings : [],
         };
         if (invoked && !cleanupConfirmed) {
+          deps.onCleanupUnconfirmed?.();
           // No further paid call may start while an earlier checker's processes may still be running, and
           // the stop (which keeps the run directory) must not depend on recording the attempt succeeding.
           try { await deps.writeRecord(rec); records.push(rec); } catch { /* the stop below still applies */ }

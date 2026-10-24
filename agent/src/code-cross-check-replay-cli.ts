@@ -35,6 +35,8 @@ export interface ReplayCliDeps {
   materialize?: RunReplaysDeps["materialize"];
   manifestSha256?: string;
   uziHead?: () => Promise<string>;
+  /** Test seam for the raw records file; production uses {@link createReplayRecordsFile}. */
+  openRecords?: (root: string, nowMs: number) => Promise<{ file: string; handle: Pick<fs.FileHandle, "appendFile" | "close"> }>;
 }
 
 interface ReplayArgs {
@@ -119,14 +121,16 @@ export async function createReplayRecordsFile(root: string, nowMs: number): Prom
   return { file, handle: await fs.open(file, "wx", 0o600) };
 }
 
-async function runReplayCommand(deps: ReplayCliDeps, a: ReplayArgs, signal: AbortSignal, root: string, scratch: string): Promise<number> {
+async function runReplayCommand(
+  deps: ReplayCliDeps, a: ReplayArgs, signal: AbortSignal, root: string, scratch: string, latchRetain: () => void,
+): Promise<number> {
   // Before any case, checker or credential: a helper uid that cannot reach the snapshot fails fast.
   if (deps.layout?.split ?? uidSplitActive()) await assertSnapshotTraversable(scratch);
   const corpus = await loadReplayCorpus(deps.checkout, { manifestSha256: deps.manifestSha256 });
   const now = deps.now ?? Date.now;
   const uzi_head = deps.uziHead ? await deps.uziHead() : await hermeticGit(["rev-parse", "HEAD"], deps.checkout);
   const checkerVersion = { uzi_head, agent_version: await agentVersion(deps.checkout) };
-  const { file, handle } = await createReplayRecordsFile(root, now());
+  const { file, handle } = await (deps.openRecords ?? createReplayRecordsFile)(root, now());
   let records: ReplayRecord[];
   const absFile = path.resolve(file);
   try {
@@ -134,6 +138,7 @@ async function runReplayCommand(deps: ReplayCliDeps, a: ReplayArgs, signal: Abor
       checkout: deps.checkout, corpus, families: [a.family], model: a.model, effort: a.effort, repeats: a.repeats,
       timeoutMs: a.timeoutMs, scratchDir: scratch, env: deps.env, checkers: deps.checkers,
       materialize: deps.materialize, layout: deps.layout, signal, now: deps.now, checkerVersion,
+      onCleanupUnconfirmed: latchRetain,
       writeRecord: async (rec) => { await handle.appendFile(JSON.stringify(rec) + "\n"); },
     });
   } catch (error) {
@@ -186,7 +191,8 @@ export async function runReplayCli(args: string[], deps: ReplayCliDeps): Promise
   const names = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
   for (const name of names) deps.signals.on(name, onSignal);
   let scratch: string | undefined;
-  // An unconfirmed checker cleanup leaves its snapshot and HOME in use: never remove the run directory then.
+  // An unconfirmed checker cleanup leaves its snapshot and HOME in use: never remove the run directory then. The
+  // replay latches this before recording the attempt, so a later record, close or locator failure cannot undo it.
   let retain = false;
   try {
     if (command === "score") return await runScore(deps, rest);
@@ -195,9 +201,8 @@ export async function runReplayCli(args: string[], deps: ReplayCliDeps): Promise
     scratch = await createReplayRunDir(path.resolve(root), deps.layout);
     return command === "verify"
       ? await runVerify(deps, abort.signal, scratch)
-      : await runReplayCommand(deps, parsed!, abort.signal, root, scratch);
+      : await runReplayCommand(deps, parsed!, abort.signal, root, scratch, () => { retain = true; });
   } catch (error) {
-    retain = error instanceof ReplayError && error.code === "cleanup_unconfirmed";
     return fail(error instanceof ReplayError ? error.code : "startup_failed");
   } finally {
     abort.abort();
