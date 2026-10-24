@@ -36,7 +36,8 @@ const baseFiles = {
 const prefixClient = "// feature: batching\n" + baseFiles["src/client.ts"];
 const squashClient = prefixClient.replace("const limit = 10;", "const limit = items.length;");
 
-export async function buildTempCorpus(): Promise<TempCorpus> {
+/** `symlinks` maps a tracked path to its link target; the links exist in the base tree and so in every case. */
+export async function buildTempCorpus(opts: { symlinks?: Record<string, string> } = {}): Promise<TempCorpus> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "replay-fixture-"));
   const checkout = path.join(root, "checkout");
   await fs.mkdir(checkout);
@@ -44,21 +45,23 @@ export async function buildTempCorpus(): Promise<TempCorpus> {
   const git = async (args: string[], env?: Record<string, string>): Promise<string> =>
     (await replayGit(args, { cwd: checkout, env })).toString("utf8").trim();
   let n = 0;
-  const treeWith = async (parent: string | null, files: Record<string, string>): Promise<string> => {
+  const treeWith = async (parent: string | null, files: Record<string, string>, links: Record<string, string> = {}): Promise<string> => {
     const env = { GIT_INDEX_FILE: path.join(root, `index-${n++}`) };
     await git(parent ? ["read-tree", parent] : ["read-tree", "--empty"], env);
-    for (const [name, content] of Object.entries(files)) {
-      const tmp = path.join(root, `blob-${n++}`);
-      await fs.writeFile(tmp, content);
-      const id = await git(["hash-object", "-w", tmp]);
-      await git(["update-index", "--add", "--cacheinfo", `100644,${id},${name}`], env);
+    for (const [mode, entries] of [["100644", files], ["120000", links]] as const) {
+      for (const [name, content] of Object.entries(entries)) {
+        const tmp = path.join(root, `blob-${n++}`);
+        await fs.writeFile(tmp, content);
+        const id = await git(["hash-object", "-w", tmp]);
+        await git(["update-index", "--add", "--cacheinfo", `${mode},${id},${name}`], env);
+      }
     }
     return git(["write-tree"], env);
   };
   const commit = (tree: string, parent: string | null, message: string): Promise<string> =>
     git(["commit-tree", tree, ...(parent ? ["-p", parent] : []), "-m", message], replayIdentityEnv());
 
-  const baseTree = await treeWith(null, baseFiles);
+  const baseTree = await treeWith(null, baseFiles, opts.symlinks);
   const base = await commit(baseTree, null, "base");
   // Defect: prefix = feature only; squash = feature plus the fix hunk.
   const prefixTree = await treeWith(baseTree, { "src/client.ts": prefixClient });

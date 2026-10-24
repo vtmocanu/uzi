@@ -8,11 +8,13 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { rmHomeTree } from "./rmtree.js";
+import { uidSplitActive } from "./runner-uid.js";
 import {
-  isSafeReplayModel, loadReplayCorpus, materializeCase, parseAdjudications, parseReplayRecords, readReplayFile, REPLAY_EFFORTS,
+  assertSnapshotTraversable, createReplayRunDir, isSafeReplayModel, loadReplayCorpus, materializeCase, parseAdjudications, parseReplayRecords, readReplayFile, REPLAY_EFFORTS,
   ReplayError,
   runReplays, sanitizedAggregate, scoreReplays,
-  type ReplayEffort, type ReplayFamily, type ReplayRecord, type RunReplaysDeps,
+  type ReplayEffort, type ReplayFamily, type ReplayRecord, type ReplayUidLayout, type RunReplaysDeps,
 } from "./code-cross-check-replay.js";
 
 export interface ReplayCliDeps {
@@ -26,6 +28,8 @@ export interface ReplayCliDeps {
     removeListener(name: "SIGINT" | "SIGTERM" | "SIGHUP", handler: () => void): unknown;
   };
   scratchRoot?: string;
+  /** Test seam for the uid layout; production derives it from the environment. */
+  layout?: ReplayUidLayout;
   now?: () => number;
   checkers?: RunReplaysDeps["checkers"];
   materialize?: RunReplaysDeps["materialize"];
@@ -102,13 +106,15 @@ async function runVerify(deps: ReplayCliDeps, signal: AbortSignal, scratch: stri
   const materialize = deps.materialize ?? materializeCase;
   for (const c of corpus.cases) {
     signal.throwIfAborted();
-    await (await materialize(deps.checkout, c, scratch, signal)).cleanup();
+    await (await materialize(deps.checkout, c, scratch, signal, deps.layout)).cleanup();
   }
   deps.write(JSON.stringify({ verify: "ok", cases: corpus.cases.length }));
   return 0;
 }
 
 async function runReplayCommand(deps: ReplayCliDeps, a: ReplayArgs, signal: AbortSignal, root: string, scratch: string): Promise<number> {
+  // Before any case, checker or credential: a helper uid that cannot reach the snapshot fails fast.
+  if (deps.layout?.split ?? uidSplitActive()) await assertSnapshotTraversable(scratch);
   const corpus = await loadReplayCorpus(deps.checkout, { manifestSha256: deps.manifestSha256 });
   const now = deps.now ?? Date.now;
   const uzi_head = deps.uziHead ? await deps.uziHead() : await hermeticGit(["rev-parse", "HEAD"], deps.checkout);
@@ -123,7 +129,7 @@ async function runReplayCommand(deps: ReplayCliDeps, a: ReplayArgs, signal: Abor
     records = await runReplays({
       checkout: deps.checkout, corpus, families: [a.family], model: a.model, effort: a.effort, repeats: a.repeats,
       timeoutMs: a.timeoutMs, scratchDir: scratch, env: deps.env, checkers: deps.checkers,
-      materialize: deps.materialize, signal, now: deps.now, checkerVersion,
+      materialize: deps.materialize, layout: deps.layout, signal, now: deps.now, checkerVersion,
       writeRecord: async (rec) => { await handle.appendFile(JSON.stringify(rec) + "\n"); },
     });
   } catch (error) {
@@ -180,7 +186,7 @@ export async function runReplayCli(args: string[], deps: ReplayCliDeps): Promise
     if (command === "score") return await runScore(deps, rest);
     const root = deps.scratchRoot ?? path.join(deps.checkout, ".uzi/scratch");
     await fs.mkdir(root, { recursive: true });
-    scratch = await fs.mkdtemp(path.join(root, "replay-run-"));
+    scratch = await createReplayRunDir(path.resolve(root), deps.layout);
     return command === "verify"
       ? await runVerify(deps, abort.signal, scratch)
       : await runReplayCommand(deps, parsed!, abort.signal, root, scratch);
@@ -189,7 +195,7 @@ export async function runReplayCli(args: string[], deps: ReplayCliDeps): Promise
   } finally {
     abort.abort();
     for (const name of names) deps.signals.removeListener(name, onSignal);
-    if (scratch) await fs.rm(scratch, { recursive: true, force: true });
+    if (scratch) await rmHomeTree(scratch);
   }
 }
 

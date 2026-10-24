@@ -5,7 +5,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
-  BRIEF_TOOLS, buildReplayClaim, codexReleaseSeam, loadReplayCorpus, materializeCase, REPLAY_DIFF_ARGS, replayGit, replayIdentityEnv, runReplays,
+  assertSnapshotTraversable, BRIEF_TOOLS, buildReplayClaim, createReplayRunDir, snapshotTraversalGap, type AncestorFacts, codexReleaseSeam, loadReplayCorpus, materializeCase, REPLAY_DIFF_ARGS, replayGit, replayIdentityEnv, runReplays,
   verifyCasePins,
   type MaterializedCase, type ReplayCase, type ReplayCorpus, type ReplayRecord, type RunReplaysDeps,
 } from "../src/code-cross-check-replay.js";
@@ -462,4 +462,138 @@ test("materialize reports a missing base object and an unpinned tree, leaving no
   const wrongWitness: ReplayCase = { ...defect, witnesses: [{ ...defect.witnesses[0]!, blob_id: "3".repeat(40) }] };
   await assert.rejects(materializeCase(tc.checkout, wrongWitness, scratch), { message: "corpus_integrity" });
   assert.deepEqual(await fs.readdir(scratch), []);
+});
+
+// ---------------------------------------------------------------------------------------------
+// uid-split sharing, injected with a group this process belongs to (the real 10002 needs the image)
+
+const groups = process.getgroups?.() ?? [];
+const splitGid = groups.find((g) => g !== process.getgid?.()) ?? process.getgid!();
+const split = { split: true, gid: splitGid };
+const single = { split: false, gid: splitGid };
+const modeOf = async (p: string): Promise<number> => (await fs.lstat(p)).mode & 0o7777;
+
+async function walkAll(dir: string): Promise<string[]> {
+  const out: string[] = [];
+  for (const e of await fs.readdir(dir, { withFileTypes: true })) {
+    const p = path.join(dir, e.name);
+    out.push(p);
+    if (e.isDirectory()) out.push(...await walkAll(p));
+  }
+  return out;
+}
+
+test("the split run directory is search-only for the runner group; single-uid stays 0700", async () => {
+  const root = await fs.mkdtemp(path.join(tc.root, "rundir-"));
+  const shared = await createReplayRunDir(root, split);
+  const plain = await createReplayRunDir(root, single);
+  assert.equal(await modeOf(shared), 0o2710);
+  assert.equal((await fs.lstat(shared)).gid, splitGid);
+  assert.equal(await modeOf(plain), 0o700);
+});
+
+test("the split snapshot is group-readable, never group-writable, and single-uid keeps its modes", async () => {
+  const run = await createReplayRunDir(await fs.mkdtemp(path.join(tc.root, "snap-")), split);
+  const m = await materializeCase(tc.checkout, defect, run, undefined, split);
+  try {
+    assert.equal(await modeOf(m.snapshot), 0o2750);
+    const entries = await walkAll(m.snapshot);
+    assert.ok(entries.some((p) => p.includes(`${path.sep}.git${path.sep}objects${path.sep}`)));
+    for (const p of entries) {
+      const st = await fs.lstat(p);
+      assert.equal(st.gid, splitGid, p);
+      if (st.isDirectory()) assert.equal(st.mode & 0o7777, 0o2750, p);
+      else {
+        assert.ok(st.isFile());
+        assert.equal(st.mode & 0o040, 0o040, `group read: ${p}`);
+        assert.equal(st.mode & 0o020, 0, `no group write: ${p}`);
+        assert.equal(st.mode & 0o007, 0, `no other access: ${p}`);
+      }
+    }
+  } finally { await m.cleanup(); }
+  const plainRun = await createReplayRunDir(await fs.mkdtemp(path.join(tc.root, "snap-")), single);
+  const p = await materializeCase(tc.checkout, defect, plainRun, undefined, single);
+  try {
+    assert.equal(await modeOf(p.snapshot), 0o700);
+    assert.equal((await fs.lstat(p.snapshot)).gid, process.getgid!());
+  } finally { await p.cleanup(); }
+});
+
+test("the snapshot walk never follows a tracked symlink to a file outside the snapshot", async () => {
+  const outside = await fs.mkdtemp(path.join(tc.root, "outside-"));
+  const secret = path.join(outside, "secret.txt");
+  await fs.writeFile(secret, "private\n", { mode: 0o600 });
+  await fs.chmod(secret, 0o600);
+  const before = await fs.stat(secret);
+  const linked = await buildTempCorpus({ symlinks: { "link-out": secret } });
+  try {
+    const lc = await loadReplayCorpus(linked.checkout, { manifestSha256: linked.manifestSha256 });
+    const c = lc.cases.find((x) => x.id === linked.defectId)!;
+    const run = await createReplayRunDir(await fs.mkdtemp(path.join(tc.root, "link-")), split);
+    const m = await materializeCase(linked.checkout, c, run, undefined, split);
+    try {
+      assert.equal(await fs.readlink(path.join(m.snapshot, "link-out")), secret);
+      const after = await fs.stat(secret);
+      assert.equal(after.mode & 0o7777, 0o600);
+      assert.equal(after.gid, before.gid);
+      assert.equal(await modeOf(path.join(m.snapshot, "src/client.ts")) & 0o040, 0o040);
+    } finally { await m.cleanup(); }
+  } finally { await linked.cleanup(); }
+});
+
+test("runReplays creates the per-case HOME as runner-group 2770 under the split and 0700 otherwise", async () => {
+  const seen: { mode: number; gid: number }[] = [];
+  const probe = checker(async (_c, _d, home, _s, _p, confirm) => {
+    const st = await fs.lstat(home);
+    seen.push({ mode: st.mode & 0o7777, gid: st.gid });
+    confirm?.();
+    return findingsText;
+  });
+  for (const layout of [split, single]) {
+    const dir = await createReplayRunDir(await fs.mkdtemp(path.join(tc.root, "home-")), layout);
+    const records = await replay({ scratchDir: dir, layout, checkers: { claude: probe } });
+    assert.equal(records[0]!.outcome, "completed");
+    assert.deepEqual(await fs.readdir(dir), []);
+  }
+  assert.deepEqual(seen, [{ mode: 0o2770, gid: splitGid }, { mode: 0o700, gid: process.getgid!() }]);
+});
+
+test("traversal preflight decision: owner class alone applies to the owner, then group, then other", () => {
+  const dir = (uid: number, gid: number, mode: number): AncestorFacts[] => [{ path: "/x", uid, gid, mode }];
+  const gap = (a: AncestorFacts[]): string | null => snapshotTraversalGap(a);
+  assert.equal(gap(dir(0, 0, 0o755)), null, "world-searchable");
+  assert.equal(gap(dir(10001, 10001, 0o701)), null, "other search covers both uids");
+  assert.equal(gap(dir(10001, 10002, 0o710)), null, "group runner covers the command uid and the runner owner-less group member");
+  assert.equal(gap(dir(10001, 10001, 0o700)), "/x", "worker-private ancestor");
+  assert.equal(gap(dir(10001, 10001, 0o750)), "/x", "an unrelated group grants neither");
+  assert.equal(gap(dir(10001, 10002, 0o701)), "/x", "group members use the group class, not other");
+  assert.equal(gap(dir(10003, 10002, 0o070)), "/x", "the owner uid is denied by its own bits even if the group could search");
+  assert.equal(gap(dir(10002, 10002, 0o710)), null, "owner runner via owner bits, command uid via group");
+  assert.equal(gap(dir(10002, 10002, 0o070)), "/x", "owner runner has no owner search");
+  assert.equal(gap([{ path: "/a", uid: 0, gid: 0, mode: 0o755 }, { path: "/b", uid: 10001, gid: 10001, mode: 0o700 }, { path: "/c", uid: 10001, gid: 10001, mode: 0o700 }]), "/b", "first offender");
+  assert.equal(snapshotTraversalGap(dir(10001, 10001, 0o700), [{ uid: 10001, groups: [10001] }]), null);
+});
+
+test("the traversal preflight refuses a symlinked ancestor and a private ancestor, and passes an open chain", async () => {
+  const base = await fs.mkdtemp(path.join(tc.root, "pre-"));
+  const real = path.join(base, "real");
+  await fs.mkdir(path.join(real, "run"), { recursive: true });
+  await fs.symlink(real, path.join(base, "link"));
+  const me = [{ uid: process.getuid!(), groups: process.getgroups!() }];
+  await assertSnapshotTraversable(path.join(real, "run"), me);
+  await assert.rejects(assertSnapshotTraversable(path.join(base, "link", "run"), me), { message: "snapshot_untraversable" });
+  // tc.root is a 0700 mkdtemp: the real reader uids (10003 and 10002) cannot all search it.
+  await assert.rejects(assertSnapshotTraversable(path.join(real, "run")), { message: "snapshot_untraversable" });
+  await assert.rejects(assertSnapshotTraversable(path.join(base, "missing", "run"), me), { message: "snapshot_untraversable" });
+});
+
+test("a split replay start fails snapshot_untraversable before any case, record file or checker call", async () => {
+  const root = await fs.mkdtemp(path.join(tc.root, "cli-split-"));
+  const guard = checker(completes());
+  const r = await cli(replayArgs(["--authorize-real-model-calls"]), { scratchRoot: root, layout: split, checkers: { claude: guard } });
+  assert.equal(r.code, 1);
+  assert.deepEqual(r.lines, ['{"error":"snapshot_untraversable"}']);
+  assert.deepEqual(r.errLines, []);
+  assert.equal(guard.calls.length, 0);
+  assert.deepEqual(await fs.readdir(root), []);
 });

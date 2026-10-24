@@ -2,6 +2,7 @@
 // existing checker classes unchanged against a frozen corpus of reconstructed pre-fix snapshots and
 // scores their findings with a documented proxy. Nothing here is wired into the production runner.
 import fs from "node:fs/promises";
+import { constants as FS, type Stats } from "node:fs";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
@@ -16,7 +17,8 @@ import { decodeCrossCheckClaim, decodeCodeFindings, type CodeFinding } from "./c
 import { deriveCodexRunCost } from "./codex/token-accounting.js";
 import type { CodexModelUsageEntry } from "./codex/token-accounting.js";
 import { SECRET_PATH_PREFIXES } from "./guardrails.js";
-import { uidSplitActive } from "./runner-uid.js";
+import { CODEX_SESSION_GID, COMMAND_UID, RUNNER_UID, uidSplitActive } from "./runner-uid.js";
+import { rmHomeTree } from "./rmtree.js";
 
 const replayLog: Logger = {
   debug() {}, info() {}, warn() {}, error() {}, addSecret() {}, removeSecret() {},
@@ -44,7 +46,8 @@ export type ReplayOutcome = (typeof REPLAY_OUTCOMES)[number];
 export type ReplayErrorCode =
   | "corpus_integrity" | "brief_drift" | "diff_oversize" | "corpus_objects_missing"
   | "invalid_options" | "records_invalid" | "score_unknown_case"
-  | "adjudication_invalid" | "adjudication_duplicate" | "adjudication_unknown_finding";
+  | "adjudication_invalid" | "adjudication_duplicate" | "adjudication_unknown_finding"
+  | "snapshot_untraversable";
 
 /** The message is always the fixed code; file contents and git output are never echoed. */
 export class ReplayError extends Error {
@@ -435,10 +438,119 @@ export async function verifyCasePins(checkout: string, c: ReplayCase, scratchDir
 
 export interface MaterializedCase { snapshot: string; cleanup(): Promise<void> }
 
+// ---------------------------------------------------------------------------------------------
+// uid-split sharing. Under the worker/runner split the Codex fileop helper runs as the command uid
+// (runner-cmd, supplementary member of group runner) and the provider as runner, but every directory the
+// replay creates is a worker-owned mkdtemp (0700). Only the run directory (search only), the snapshot
+// (read only) and the per-case HOME (the Codex HOME contract) are opened to group runner; the bare
+// work repository, the records file and every other path stay private.
+
+/** The uid layout the replay creates directories for. `split`/`gid` are injectable so unit tests can
+ * exercise the split modes with a group the test process belongs to; production uses the defaults. */
+export interface ReplayUidLayout { split: boolean; gid: number }
+const defaultReplayLayout = (): ReplayUidLayout => ({ split: uidSplitActive(), gid: RUNNER_UID });
+
+/** Set the group and the exact mode through an O_NOFOLLOW directory handle (never a path-following chown). */
+async function shareDirectory(dir: string, gid: number, mode: number): Promise<void> {
+  const handle = await fs.open(dir, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
+  try {
+    // chown first: a non-root chown clears the setgid bit, so the chmod must follow it.
+    await handle.chown(process.getuid?.() ?? -1, gid);
+    await handle.chmod(mode);
+  } finally { await handle.close(); }
+}
+
+/** The per-run scratch directory. Single-uid it is the plain 0700 mkdtemp. Under the split it is group
+ * runner with mode 2710: search only, so the command and provider uids can reach the snapshot inside it
+ * but cannot list or read its other entries. */
+export async function createReplayRunDir(root: string, layout: ReplayUidLayout = defaultReplayLayout()): Promise<string> {
+  const dir = await fs.mkdtemp(path.join(root, "replay-run-"));
+  if (!layout.split) return dir;
+  try { await shareDirectory(dir, layout.gid, 0o2710); } catch (error) {
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
+  }
+  return dir;
+}
+
+/** Group-share one snapshot entry through an O_NOFOLLOW handle whose identity matches the lstat that
+ * typed it, then recurse into directories. Symlinks are skipped (never followed or mutated); any type
+ * other than file or directory is refused. Directories become 2750; files keep their owner bits and gain
+ * group read (and group execute where the owner has it), never group write, and lose every other bit. */
+async function shareSnapshotEntry(entry: string, typed: Stats, gid: number): Promise<void> {
+  if (typed.isSymbolicLink()) return;
+  const isDir = typed.isDirectory();
+  if (!isDir && !typed.isFile()) return integrity();
+  const flags = isDir
+    ? FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW
+    : FS.O_RDONLY | FS.O_NOFOLLOW | FS.O_NONBLOCK;
+  const handle = await fs.open(entry, flags);
+  try {
+    const st = await handle.stat();
+    if (st.dev !== typed.dev || st.ino !== typed.ino || st.isDirectory() !== isDir) return integrity();
+    const owner = st.mode & 0o700;
+    const mode = isDir ? 0o2750 : owner | ((owner & 0o400) >> 3) | ((owner & 0o100) >> 3);
+    await handle.chown(st.uid, gid);
+    await handle.chmod(mode);
+  } finally { await handle.close(); }
+  if (!isDir) return;
+  for (const name of await fs.readdir(entry)) {
+    const child = path.join(entry, name);
+    await shareSnapshotEntry(child, await fs.lstat(child), gid);
+  }
+}
+
+/** An identity that must be able to search every ancestor of the run directory. */
+export interface TraversalIdentity { uid: number; groups: readonly number[] }
+export interface AncestorFacts { path: string; uid: number; gid: number; mode: number }
+/** The command uid (supplementary group runner) runs the fileop helper; the provider runs as runner. */
+const SNAPSHOT_READERS: readonly TraversalIdentity[] = [
+  { uid: COMMAND_UID, groups: [COMMAND_UID, RUNNER_UID] },
+  { uid: RUNNER_UID, groups: [RUNNER_UID, CODEX_SESSION_GID] },
+];
+
+/** The first ancestor that denies search (execute) to one of `identities`, else null. POSIX precedence:
+ * the owner class applies alone when the uid matches, else the group class when any group matches,
+ * else other. */
+export function snapshotTraversalGap(ancestors: readonly AncestorFacts[], identities: readonly TraversalIdentity[] = SNAPSHOT_READERS): string | null {
+  for (const a of ancestors) {
+    for (const who of identities) {
+      const bit = who.uid === a.uid ? 0o100 : who.groups.includes(a.gid) ? 0o010 : 0o001;
+      if ((a.mode & bit) === 0) return a.path;
+    }
+  }
+  return null;
+}
+
+/** Startup preflight under the split: the run directory must be its own realpath (the helpers require
+ * the root to equal its resolved path as their own uid) and every ancestor up to / must be searchable by
+ * both reader identities. Nothing the CLI did not create is ever chmod'ed; a gap fails with
+ * snapshot_untraversable before any case or provider call. */
+export async function assertSnapshotTraversable(runDir: string, identities: readonly TraversalIdentity[] = SNAPSHOT_READERS): Promise<void> {
+  const refuse = (): never => { throw new ReplayError("snapshot_untraversable"); };
+  try {
+    const abs = path.resolve(runDir);
+    if (await fs.realpath(abs) !== abs) return refuse();
+    const ancestors: AncestorFacts[] = [];
+    for (let dir = path.dirname(abs); ; dir = path.dirname(dir)) {
+      const st = await fs.lstat(dir);
+      if (!st.isDirectory()) return refuse();
+      ancestors.push({ path: dir, uid: st.uid, gid: st.gid, mode: st.mode });
+      if (dir === path.dirname(dir)) break;
+    }
+    if (snapshotTraversalGap(ancestors, identities) !== null) refuse();
+  } catch (error) {
+    if (error instanceof ReplayError) throw error;
+    refuse();
+  }
+}
+
 /** verifyCasePins, then export the pinned prefix tree as a single-commit repository. Files are written
  * with checkout-index (exact blob bytes, no export attributes) and the snapshot commit must reproduce
  * prefix_tree exactly; tracked files that .gitignore matches are staged with -f. */
-export async function materializeCase(checkout: string, c: ReplayCase, scratchDir: string, signal?: AbortSignal): Promise<MaterializedCase> {
+export async function materializeCase(
+  checkout: string, c: ReplayCase, scratchDir: string, signal?: AbortSignal, layout: ReplayUidLayout = defaultReplayLayout(),
+): Promise<MaterializedCase> {
   const verified = await verifyCasePins(checkout, c, scratchDir, signal);
   let snapshot: string | undefined;
   const cleanup = async (): Promise<void> => {
@@ -448,6 +560,7 @@ export async function materializeCase(checkout: string, c: ReplayCase, scratchDi
   try {
     const dir = await fs.mkdtemp(path.join(scratchDir, "replay-snap-"));
     snapshot = dir;
+    if (layout.split) await shareDirectory(dir, layout.gid, 0o2750);
     const idx = { GIT_INDEX_FILE: path.join(verified.work, "snapshot-index") };
     await replayGit(["--git-dir", verified.bare, "read-tree", c.prefix_tree], { env: idx, signal });
     await replayGit(["--git-dir", verified.bare, "--work-tree", dir, "checkout-index", "-a", "-f"], { env: idx, signal });
@@ -457,6 +570,7 @@ export async function materializeCase(checkout: string, c: ReplayCase, scratchDi
       "-m", `code cross-check replay snapshot ${c.id}`], { cwd: dir, env: replayIdentityEnv(), signal });
     const tree = (await replayGit(["rev-parse", "HEAD^{tree}"], { cwd: dir, signal })).toString("utf8").trim();
     if (tree !== c.prefix_tree) return integrity();
+    if (layout.split) await shareSnapshotEntry(dir, await fs.lstat(dir), layout.gid);
     return { snapshot: dir, cleanup };
   } catch (error) {
     await cleanup();
@@ -561,6 +675,8 @@ export interface RunReplaysDeps {
   env: NodeJS.ProcessEnv;
   checkers?: { claude?: Pick<ClaudeCrossCheck, "run">; codex?: Pick<CodexCrossCheck, "run"> };
   materialize?: typeof materializeCase;
+  /** Test seam for the uid layout of the directories the replay creates; production derives it from the environment. */
+  layout?: ReplayUidLayout;
   signal?: AbortSignal;
   now?: () => number;
   writeRecord: (record: ReplayRecord) => Promise<void>;
@@ -613,6 +729,7 @@ export async function runReplays(deps: RunReplaysDeps): Promise<ReplayRecord[]> 
       !Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_TIMEOUT_MS) throw new ReplayError("invalid_options");
   const now = deps.now ?? Date.now;
   const materialize = deps.materialize ?? materializeCase;
+  const layout = deps.layout ?? defaultReplayLayout();
   const defaults: { claude?: ClaudeCrossCheck; codex?: CodexCrossCheck } = {};
   // Built lazily, only for a family that is run and only once its credential is present.
   const checkerFor = (family: ReplayFamily): Pick<ClaudeCrossCheck | CodexCrossCheck, "run"> => {
@@ -641,13 +758,15 @@ export async function runReplays(deps: RunReplaysDeps): Promise<ReplayRecord[]> 
           const usage: Record<string, unknown>[] = [];
           const pass = new AbortController();
           try {
-            try { materialized = await materialize(deps.checkout, c, deps.scratchDir, deps.signal); } catch (error) {
+            try { materialized = await materialize(deps.checkout, c, deps.scratchDir, deps.signal, layout); } catch (error) {
               if (!deps.signal?.aborted) throw error;
               outcome = "interrupted";
             }
             if (materialized) {
               home = await fs.mkdtemp(path.join(deps.scratchDir, "replay-home-"));
-              await fs.chmod(home, uidSplitActive() ? 0o2770 : 0o700);
+              // The Codex HOME contract is worker:runner and group-writable; single-uid stays private.
+              if (layout.split) await shareDirectory(home, layout.gid, 0o2770);
+              else await fs.chmod(home, 0o700);
               const claim = buildReplayClaim(c, c.inputs, family,
                 { model: deps.model, effort: deps.effort, timeoutMs, repeat },
                 { claudeToken: deps.env.CLAUDE_CODE_OAUTH_TOKEN, openaiKey: deps.env.OPENAI_API_KEY }, now());
@@ -674,7 +793,9 @@ export async function runReplays(deps: RunReplaysDeps): Promise<ReplayRecord[]> 
           } finally {
             if (timer) clearTimeout(timer);
             await materialized?.cleanup();
-            if (home) await fs.rm(home, { recursive: true, force: true });
+            // Under the split the HOME holds runner-owned and command-owned residue the worker cannot
+            // unlink: rmHomeTree removes it as those uids and is the plain worker removal otherwise.
+            if (home) await rmHomeTree(path.resolve(home));
           }
         }
         const rec: ReplayRecord = {
