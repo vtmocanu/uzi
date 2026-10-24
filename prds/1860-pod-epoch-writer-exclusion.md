@@ -453,7 +453,7 @@ So nothing stopped can write to the deleted inode. A later *client request*, tho
   - The mapping category is controlled by a process running a binary from inside a tree (`map=5`).
 
 **Read-only probes (Q4, Q6).** These were issued between two event markers:
-- `info` and `version` (the CLI's own `GET /_ping` negotiation is included, not a separate command);
+- `info` and `version` (the CLI's own `/_ping` negotiation is included, not a separate command);
 - `ps -a`, plus `inspect` on every container;
 - `volume ls` / `inspect`, `plugin ls`, and a bounded `events` read.
 

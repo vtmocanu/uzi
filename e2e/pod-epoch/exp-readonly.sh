@@ -106,7 +106,7 @@ run_posture() {
   pe_check snapshot1.has-all-kinds test "$(grep -c '^## ' "$snap1")" -eq 6
 
   # ---- the reclaim predicate's read-only queries -------------------------------
-  pe_inner 30 version >/dev/null # includes GET /_ping
+  pe_inner 30 version >/dev/null # includes /_ping (HEAD, GET fallback)
   pe_inner 30 info >/dev/null 2>&1
   pe_inner 30 ps -a --no-trunc --format json >/dev/null
   for c in c-exited c-stopped c-created; do
