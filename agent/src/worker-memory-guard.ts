@@ -23,15 +23,17 @@ export function workingSetBytes(sample: Pick<Available, "currentBytes"> & { stat
   return Math.max(0, sample.currentBytes - sample.stat.inactive_file);
 }
 
-function isMarker(p: unknown): p is Extract<Pressure, { unavailable: unknown }> {
+/** Exactly the explicit PSI-unavailable marker; any other shape is not one. */
+export function isMarker(p: unknown): p is Extract<Pressure, { unavailable: unknown }> {
   if (typeof p !== "object" || p === null) return false;
   const keys = Object.keys(p);
   const reason = (p as { unavailable?: unknown }).unavailable;
   return keys.length === 1 && keys[0] === "unavailable" && (reason === "absent" || reason === "unsupported");
 }
 
-function realPressure(p: Pressure | undefined): RealPressure | undefined {
-  return p !== undefined && "some" in p && "full" in p ? p : undefined;
+/** Real PSI rows: an object with the some and full rows (and nothing else is checked here). */
+export function realPressure(p: Pressure | undefined): RealPressure | undefined {
+  return p !== undefined && typeof p === "object" && p !== null && "some" in p && "full" in p ? p : undefined;
 }
 
 /** Copies the marker or both rows so caller-owned samples cannot rewrite history. */

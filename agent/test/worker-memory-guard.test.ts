@@ -40,9 +40,13 @@ test("working set (current minus inactive file, clamped at zero) crosses H; othe
   const cache = new WorkerMemoryGuard(settings);
   assert.equal(cache.evaluate(sample(1, 0, 1000, { stat: stat(201) }), 0).kind, "idle");
   assert.equal(cache.evaluate(sample(2, 10, 1000, { stat: stat(200) }), 10).kind, "hard");
-  // inactive_file larger than current clamps to zero rather than going negative.
+  // inactive_file larger than current clamps to zero rather than going negative. A single idle
+  // sample cannot show this (a negative working set is idle too); the early projection can:
+  // clamped, previous ws is 0 so growth is 300 and 300 + 3*100 = 600 < H (800) -> idle.
+  // Unclamped, previous ws is -400 so growth is 700 and 300 + 7*100 = 1000 >= H -> early.
   const clamp = new WorkerMemoryGuard(settings);
   assert.equal(clamp.evaluate(sample(1, 0, 100, { stat: stat(500) }), 0).kind, "idle");
+  assert.equal(clamp.evaluate(sample(2, 100, 300, { stat: stat(0, 11), pressure: psi(1) }), 100).kind, "idle");
 });
 
 test("inactive_file must be a nonnegative safe integer or the sample inhibits", () => {
@@ -259,6 +263,21 @@ test("incomplete sample, changed limit, quiet-boundary equality and observation 
     assert.equal(guard.state.armed, false);
     assert.equal(guard.evaluate(sample(5, nextTime + 150, 100, { limitBytes }), nextTime + 150).kind, "rearmed");
   }
+});
+
+test("an observation gap restarts the dwell on working set, not raw current", () => {
+  const guard = new WorkerMemoryGuard(settings);
+  const ticket = intervention(guard);
+  guard.confirmDrain(ticket);
+  guard.resolveOutcome(ticket);
+  guard.evaluate(sample(2, 50), 50);
+  // Gap (300ms > sampleMs + responseBudgetMs): raw current 900 >= Q (700) but working set 500 < Q.
+  const cacheQuiet = (id: number, time: number) => sample(id, time, 900, { stat: stat(400) });
+  assert.equal(guard.evaluate(cacheQuiet(3, 350), 350).kind, "idle");
+  assert.equal(guard.evaluate(cacheQuiet(4, 400), 400).kind, "idle");
+  assert.equal(guard.state.armed, false);
+  // The dwell began at 350, so rearm is due at 450 (a raw-current restart would defer it to 500).
+  assert.equal(guard.evaluate(cacheQuiet(5, 450), 450).kind, "rearmed");
 });
 
 test("independent run/episode interventions are not lifetime capped; mutated sample cannot rewrite history", () => {

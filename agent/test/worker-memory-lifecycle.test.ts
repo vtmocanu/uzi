@@ -569,7 +569,10 @@ test("PSI-less working-set hard crossing selects only the attributable command a
     let id = 0;
     return () => {
       const time = performance.now();
-      // current 990 is above H (900) only by raw usage; inactive_file 50 leaves a working set of 940, still >= H.
+      // This test proves the PSI-less (absent marker) path: with no PSI, only a hard crossing can
+      // intervene. Working set 990 - 50 = 940 >= H (900). The working-set-versus-raw distinction is
+      // pinned in the guard tests; the working set never exceeds raw current, so a working-set
+      // crossing is always a raw crossing too.
       return { available: true as const, sampleId: ++id, startedAtMs: time, completedAtMs: time,
         currentBytes: 990, limitBytes: 1000, stat: { anon: 1, shmem: 0, slab_unreclaimable: 0, unevictable: 0, inactive_file: 50 },
         pressure: { unavailable: "absent" as const } };
@@ -598,7 +601,10 @@ test("PSI-less working-set hard crossing selects only the attributable command a
   const join = f.memory.commands.prepareOutcome(victim);
   const running = f.memory.run();
   try {
-    const result = await join;
+    // Bounded join: a regression fails fast here instead of hanging the file.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("bounded join: no intervention outcome")), 2000); });
+    const result = await Promise.race([join, deadline]).finally(() => clearTimeout(timer));
     assert.equal(result.code, "worker_memory_pressure");
     assert.equal(result.tool_id, "tool-victim");
     assert.equal(result.command_id, victim.commandId);

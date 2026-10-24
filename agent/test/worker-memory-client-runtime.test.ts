@@ -379,7 +379,7 @@ for (const phase of ["absent-grow", "before-reserve", "pending-reserve", "after-
 }
 
 type RuntimeSample = ReturnType<import("../src/worker-memory-reader.js").WorkerMemoryReader["sample"]>;
-async function runScripted(script: readonly ("U" | "A" | "S" | "P")[], logger: { warn: (m: string, f?: Record<string, unknown>) => void; info: (m: string, f?: Record<string, unknown>) => void }) {
+async function runScripted(script: readonly ("U" | "A" | "S" | "P" | "X" | "M" | "E")[], logger: { warn: (m: string, f?: Record<string, unknown>) => void; info: (m: string, f?: Record<string, unknown>) => void }) {
   let calls = 0;
   const client = {
     memoryIncarnation: undefined, subscribeMemoryInvalidation: () => () => {}, revokeMemoryAuthority: () => {},
@@ -395,7 +395,9 @@ async function runScripted(script: readonly ("U" | "A" | "S" | "P")[], logger: {
       if (kind === "U") return { available: false, reason: "malformed", sampleId: id, startedAtMs: now, completedAtMs: now };
       return { available: true, sampleId: id, startedAtMs: now, completedAtMs: now, currentBytes: 100, limitBytes: 1000,
         stat: { anon: 1, shmem: 0, slab_unreclaimable: 0, unevictable: 0, inactive_file: 0 },
-        pressure: kind === "A" ? { unavailable: "absent" } : kind === "S" ? { unavailable: "unsupported" } : { some: psi, full: psi } };
+        pressure: (kind === "A" ? { unavailable: "absent" } : kind === "S" ? { unavailable: "unsupported" }
+          : kind === "X" ? { unavailable: "other" } : kind === "M" ? { some: psi, full: psi, unavailable: "absent" }
+          : kind === "E" ? {} : { some: psi, full: psi }) as RuntimeSample extends { pressure: infer T } ? T : never };
     } },
   });
   const running = runtime.run();
@@ -419,6 +421,17 @@ test("runtime logs nothing for unavailable samples or steady PSI presence", asyn
   const sink = { warn: () => { events.push("warn"); }, info: () => { events.push("info"); } };
   await runScripted(["U", "U", "P", "P", "U", "P"], sink);
   assert.deepEqual(events, []);
+});
+
+test("malformed pressure shapes neither log nor change PSI state", async () => {
+  // X = unknown marker reason, M = rows plus marker, E = empty object. Each is the guard's to reject.
+  const events: string[] = [];
+  const sink = { warn: () => { events.push("warn"); }, info: () => { events.push("info"); } };
+  await runScripted(["P", "X", "M", "E", "P"], sink);
+  assert.deepEqual(events, [], "malformed shapes must not read as PSI absence");
+  // After a genuine absence they must not read as restoration, nor re-arm the transition log.
+  await runScripted(["A", "X", "M", "E", "A", "P"], sink);
+  assert.deepEqual(events, ["warn", "info"]);
 });
 
 test("a throwing diagnostic logger never rejects the sampler", async () => {
