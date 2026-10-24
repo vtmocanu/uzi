@@ -1207,6 +1207,12 @@ done
 go_conc_render --set-string workers.goBuildParallelism=007 --set-string 'workers.goMaxProcs= 0010 ' \
   > "$WORK/go-case.yaml"
 go_conc_expect "$WORK/go-case.yaml" 7 10 "leading zeros and whitespace"
+# Helm decodes typed values before the template sees them, so --set +1 arrives as the
+# number 1 and is accepted (the canonical decimal is relayed); only --set-string keeps
+# the spelling and rejects it (see the invalid loop below).
+go_conc_render --set workers.goBuildParallelism=+1 --set workers.goMaxProcs=+1 \
+  > "$WORK/go-case.yaml"
+go_conc_expect "$WORK/go-case.yaml" 1 1 "typed +1 decoded by helm"
 # Blank is unset, not an error.
 go_conc_render --set-string workers.goBuildParallelism='  ' --set-string workers.goMaxProcs= \
   > "$WORK/go-case.yaml"
@@ -1242,13 +1248,6 @@ for hosting in true false; do
     }
   done
 done
-# Compose must pass exactly these two names through the agent service, empty by default.
-if [ "$(yq -r '.services.agent.environment.WORKER_GO_BUILD_PARALLELISM' "$REPO_DIR/docker-compose.yml")" != "\${WORKER_GO_BUILD_PARALLELISM:-}" ] ||
-  [ "$(yq -r '.services.agent.environment.WORKER_GO_MAXPROCS' "$REPO_DIR/docker-compose.yml")" != "\${WORKER_GO_MAXPROCS:-}" ] ||
-  [ "$(grep -cE '^[[:space:]]*WORKER_GO_[A-Z_]+:' "$REPO_DIR/docker-compose.yml")" != 2 ]; then
-  echo "FAIL: compose go concurrency env inventory" >&2; exit 1
-fi
-echo "OK: go concurrency defaults, canonical values, numeric bounds, controller-off invariants and compose inventory"
 # --- simple postgres: TCP readiness, socket liveness ---------------------------
 # Parse the focused render and Compose source, rather than accepting tokens from
 # another object/container or from an echo command.
@@ -1269,6 +1268,15 @@ case "$YQ_VERSION_RAW" in
     exit 2
     ;;
 esac
+
+# Compose must pass exactly these two names through the agent service, empty by default.
+# After the yq guard above, so a missing yq reports BROKEN rather than FAIL.
+if [ "$(yq -r '.services.agent.environment.WORKER_GO_BUILD_PARALLELISM' "$REPO_DIR/docker-compose.yml")" != "\${WORKER_GO_BUILD_PARALLELISM:-}" ] ||
+  [ "$(yq -r '.services.agent.environment.WORKER_GO_MAXPROCS' "$REPO_DIR/docker-compose.yml")" != "\${WORKER_GO_MAXPROCS:-}" ] ||
+  [ "$(grep -cE '^[[:space:]]*WORKER_GO_[A-Z_]+:' "$REPO_DIR/docker-compose.yml")" != 2 ]; then
+  echo "FAIL: compose go concurrency env inventory" >&2; exit 1
+fi
+echo "OK: go concurrency defaults, canonical values, numeric bounds, controller-off invariants and compose inventory"
 
 PG_RENDER="$WORK/postgres-simple.yaml"
 if ! helm template uzi "$STRIPPED" --set database.mode=simple \

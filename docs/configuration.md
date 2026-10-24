@@ -489,19 +489,24 @@ and no `GOFLAGS` or `GOMAXPROCS` is injected.
 | `WORKER_GO_BUILD_PARALLELISM` | `goBuildParallelism` | empty | Sets `GOFLAGS=-p=N`: how many packages `go build` and `go test` build or run in parallel. |
 | `WORKER_GO_MAXPROCS` | `goMaxProcs` | empty | Sets `GOMAXPROCS=N`: the Go runtime's CPU parallelism. The `go` command's `-p` defaults to `GOMAXPROCS`, so this also bounds package parallelism when no `-p` is set. |
 
-Accepted values are positive decimal integers up to `2147483647`; surrounding
+String values (quoted YAML, `--set-string`, and the controller and worker
+environment) must be positive decimal digits up to `2147483647`; surrounding
 whitespace is trimmed, empty means unset, and leading zeros are accepted
 (`007` is `7`). Zero, signs, fractions, non-digits and larger values are
 rejected: the chart render fails, the controller refuses to start, or the worker
-refuses to start, depending on where the value is set. There is no general
-`GOFLAGS` passthrough.
+refuses to start, depending on where the value is set. Helm decodes typed
+numbers (unquoted YAML, `--set`) before the template sees them, so those are
+checked by numeric value: a whole number from `1` to `2147483647`, relayed as its
+canonical decimal (`+1` or `0x10` arrive as `1` and `16`). Quote the value to have
+the spelling checked. There is no general `GOFLAGS` passthrough.
 
 The values apply to the scrubbed environment of Claude commands (native and
 guarded), Codex commands, worker-run checks and JavaScript dependency installs.
 Compose relays both variables from `.env`; hosted workers use the chart keys,
 and the controller receives them as `UZI_WORKER_GO_BUILD_PARALLELISM` and
 `UZI_WORKER_GO_MAXPROCS` and relays them into worker pods. Setting or changing
-either hosted value rolls every hosted worker pod; compose and self-run workers
+either hosted value rolls every hosted worker pod once it holds no non-terminal
+run; compose and self-run workers
 pick it up on restart. Both the controller and the worker image must come from a
 release containing this change; older ones ignore the settings.
 
