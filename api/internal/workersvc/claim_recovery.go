@@ -143,13 +143,6 @@ func (s *Service) assembleAndFinishRunClaim(ctx context.Context, wkr store.Worke
 		h.beforeAssembly(ctx, run)
 	}
 	payload, err := s.assembleClaim(ctx, wkr, run)
-	if err == nil {
-		// An over-limit claim would be refused by the worker's read cap; fail here with a
-		// clear reason instead, preserving any minted Codex capability identity.
-		if serr := s.refuseOversizeRunClaim(payload); serr != nil {
-			err, payload = serr, nil
-		}
-	}
 	if h := s.claimHooks; h != nil && h.afterAssembly != nil {
 		h.afterAssembly(ctx, run, payload, err)
 	}
@@ -414,10 +407,22 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 			payload.CheckpointAttestedSource = textPtr(projection.CheckpointAttestedSource)
 			payload.CheckpointWriteUnresolved = &projection.CheckpointWriteUnresolved
 		}
-		if err := q.Commit(ctx); err != nil {
-			return nil, "", err
+		// Issue #3396: measure the final payload, after every projection above, so a claim
+		// that would exceed the worker's read cap fails here with a clear reason instead of
+		// being delivered and refused. The exact-claim identity checks above already ran
+		// against this payload, so the terminal path below settles this exact mint.
+		if serr := s.refuseOversizeRunClaim(payload); serr != nil {
+			if !errors.Is(serr, errClaimTooLarge) {
+				return nil, "", serr // a marshal error is not this classification: roll back
+			}
+			decision, origin = serr, "provisioning_failed"
+			holdClass, transient = false, false
+		} else {
+			if err := q.Commit(ctx); err != nil {
+				return nil, "", err
+			}
+			return payload, "", nil
 		}
-		return payload, "", nil
 	}
 
 	expected := 0

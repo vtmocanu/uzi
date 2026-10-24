@@ -107,16 +107,10 @@ func TestOversizeRunClaimBoundaryMatchesWireBody(t *testing.T) {
 	}
 }
 
-func TestOversizeRunClaimCodexMintIdentityAndCrossCheckExempt(t *testing.T) {
-	secret, _ := mintCodexCapability()
-	payload := &ClaimPayload{Kind: "issue", IssueTitle: strings.Repeat("x", 512),
-		Secrets: ClaimSecrets{Codex: &ClaimCodexSecrets{AuthMode: codexAuthModeAPIKey, Capability: formatCodexCapability(7, secret)}}}
+func TestOversizeRunClaimTypedAndCrossCheckExempt(t *testing.T) {
+	payload := &ClaimPayload{Kind: "issue", IssueTitle: strings.Repeat("x", 512)}
 	svc := &Service{claimSizeLimit: 64}
 	err := svc.refuseOversizeRunClaim(payload)
-	var minted *codexMintedClaimError
-	if !errors.As(err, &minted) || minted.epoch != 7 || string(minted.hash) != string(hashCodexCapability(secret)) {
-		t.Fatalf("mint identity lost: %v", err)
-	}
 	if !errors.Is(err, errClaimTooLarge) {
 		t.Fatalf("not errClaimTooLarge: %v", err)
 	}

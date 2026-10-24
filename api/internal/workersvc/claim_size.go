@@ -29,6 +29,7 @@ const claimResponseMaxBytes = 168 << 20
 var errClaimTooLarge = errors.New("claim too large")
 
 // refuseOversizeRunClaim refuses a run-lane claim whose wire body would exceed the worker's cap.
+// finishRunClaimTx calls it on the final payload, after the task checkpoint projection.
 // cross_check claims are exempt: MarshalCrossCheckClaim already applies a tighter envelope. The
 // reason carries sizes only, never claim content.
 func (s *Service) refuseOversizeRunClaim(payload *ClaimPayload) error {
@@ -48,7 +49,5 @@ func (s *Service) refuseOversizeRunClaim(payload *ClaimPayload) error {
 	if wire <= limit {
 		return nil
 	}
-	// crossCheckAssemblyError now also serves this refusal: it preserves a minted Codex
-	// capability's identity so finishRunClaim settles that exact mint instead of going idle.
-	return crossCheckAssemblyError(payload, fmt.Errorf("%w: encoded claim is %d bytes, over the %d-byte worker claim limit; reduce agent templates, or the skill limits (SKILLS_MAX_PER_RUN, SKILL_MAX_BYTES) if raised, or the run's content", errClaimTooLarge, wire, limit))
+	return fmt.Errorf("%w: encoded claim is %d bytes, over the %d-byte worker claim limit; reduce agent templates, or the skill limits (SKILLS_MAX_PER_RUN, SKILL_MAX_BYTES) if raised, or the run's content", errClaimTooLarge, wire, limit)
 }

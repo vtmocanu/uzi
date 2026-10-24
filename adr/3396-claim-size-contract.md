@@ -4,9 +4,10 @@ Status: accepted, #3396.
 
 ## Decision
 
-The api bounds the run-lane claim in aggregate. After a run claim is assembled and
-before delivery it measures the encoded body (`len(json.Marshal(payload))+1`, the
-`httpx.WriteJSON` body). If that exceeds the worker's claim read cap (168 MiB,
+The api bounds the run-lane claim in aggregate. Inside the exact-claim finish
+transaction, after every projection onto the payload (the task checkpoint recovery
+fields) and before commit and delivery, it measures the final encoded body
+(`len(json.Marshal(payload))+1`, the `httpx.WriteJSON` body). If that exceeds the worker's claim read cap (168 MiB,
 176160768 bytes), the claim is not delivered and the run fails terminally through the
 fenced exact-claim finish with `fail_origin` `provisioning_failed` and a reason
 starting `claim too large:`. A minted Codex capability is revoked with its identity
