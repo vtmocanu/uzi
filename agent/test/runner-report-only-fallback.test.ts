@@ -203,6 +203,27 @@ describe("report_only fallback to non-closing delivery (#3360)", () => {
     assert.doesNotMatch(forge.pr.description, /Closes #3366/);
   });
 
+  it("code_cross_check_required: an earlier attempt's summary is still refreshed from the persisted status", async (t) => {
+    await negotiate();
+    const { forge } = setup();
+    const row = (generation: number): import("../src/code-cross-check-contract.js").CodeCrossCheckRecord => ({
+      stage: "code", round: 1, candidate_generation: generation, head_commit: "b".repeat(40), base_commit: "a".repeat(40),
+      candidate_digest: "c".repeat(64), checker_run_id: "child", checker_harness: "codex", checker_model: "test-checker",
+      checker_effort: "high", outcome: "completed", reason_class: null, findings: [], dispositions: null,
+      finalized_at: new Date().toISOString(), interrupted_at: null, deadline_at: new Date().toISOString(),
+    });
+    // The earlier attempt's completed summary rides the result; the persisted row is now from another
+    // generation, so publication must apply persistedCodeCrossCheckSummary and render it interrupted.
+    t.mock.method(client, "codeCrossCheckStatus", async () => row(6));
+    const claim = gitlabClaim(3371, { claim_generation: 7, code_cross_check_required: true });
+    await runner(reportOnlyExecutor({ extra: { codeCrossCheckSummary: row(7) } }), forge.gitlab).execute(claim);
+
+    assert.ok(terminal(claim.run_id, "completed"), JSON.stringify(api.states.map((s) => s.body)));
+    assert.match(forge.pr.description, /Code cross-check incomplete: interrupted/);
+    assert.doesNotMatch(forge.pr.description, /checked `/);
+    assert.doesNotMatch(forge.pr.description, /skipped: report/);
+  });
+
   it("a config.non_closing declaration keeps its own reason in the attempt and the MR body", async () => {
     await negotiate();
     const { forge } = setup();

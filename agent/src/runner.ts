@@ -7308,6 +7308,8 @@ export class RunRunner {
     // delivered as a non-closing MR instead of failing; this flag lets the empty-diff
     // guard below fail closed with the #299 reason when the candidate has nothing to land.
     let reportOnlyFallback = false;
+    // Set only when the fallback itself synthesized the skipped cross-check disclosure below.
+    let reportOnlySkippedCrossCheck = false;
     // The #299 orphan-checkpoint failure of the issue path, shared by the non-issue and
     // fail-closed branches of the #3360 fallback and the empty-candidate guard.
     const failReportOnlyOrphan = async (): Promise<void> => {
@@ -7360,6 +7362,7 @@ export class RunRunner {
         }
         if (claim.code_cross_check_required === true && !result.codeCrossCheckSummary) {
           result.codeCrossCheckSummary = { incomplete: "skipped: report_only was declared" };
+          reportOnlySkippedCrossCheck = true;
         }
         batcher.emit({
           kind: "status",
@@ -9255,9 +9258,10 @@ export class RunRunner {
     // preserved text around it.
     // Rebuild persisted evidence at publication as well as session completion: a superseded
     // completed row must not carry the earlier attempt's counts into a reconciled MR.
-    // #3360: the report_only fallback's own "skipped" disclosure must not be replaced by a
-    // persisted status row (which can be absent or an earlier same-generation completed check).
-    if (claim.code_cross_check_required === true && result.codeCrossCheckSummary && !reportOnlyFallback) {
+    // #3360: the report_only fallback's own synthesized "skipped" disclosure must not be replaced
+    // by a persisted status row (which can be absent or an earlier same-generation completed
+    // check); a summary an earlier completion attempt produced is still refreshed.
+    if (claim.code_cross_check_required === true && result.codeCrossCheckSummary && !reportOnlySkippedCrossCheck) {
       try {
         result.codeCrossCheckSummary = persistedCodeCrossCheckSummary(
           await this.client.codeCrossCheckStatus(claim.run_id, flight.claimGeneration,

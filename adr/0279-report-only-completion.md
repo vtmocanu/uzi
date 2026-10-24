@@ -143,9 +143,9 @@ included; a diff read failure keeps the fail-open into the normal checks. The pr
 
 Known limits: the advisory code cross-check that `report_only` skips is not replayed. When
 the run requires a cross-check and the session produced no cross-check summary, the MR renders
-"Code cross-check incomplete: skipped: report_only was declared"; a summary from an earlier
-completion attempt in the same session is kept as-is. Either way the persisted cross-check
-status does not replace the fallback's summary at publication. Against an API without
+"Code cross-check incomplete: skipped: report_only was declared", and the persisted cross-check
+status does not replace that disclosure at publication. A summary from an earlier completion
+attempt in the same session is refreshed from the persisted status as usual. Against an API without
 `completion_non_closing_v1` the declaration is not persisted (the documented rollout
 limitation in `docs/worker-upgrades.md`, "Completion publication compatibility").
 
