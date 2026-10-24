@@ -17,6 +17,7 @@ Experiments (each `bash e2e/pod-epoch/exp-<name>.sh <rootless|rootful|all>`):
 | `exp-restore.sh` | Q2 | what a persisted data root starts before the first API response (`always`, `unless-stopped`, `on-failure`, `no`), after a sidecar restart and after a successor pod; whether anything changes afterwards; the barrier predicate; how a daemon restart is detected |
 | `exp-stopped.sh` | Q3 | a stopped container holds no mount or file reference; what `docker start` and `docker cp` do when the bind source has been deleted |
 | `exp-volumes-build.sh` | Q3 | plain versus bind-option `local` volumes; a build with the tree as context leaves no mount, fd or mapping reference and a cache that outlives the tree |
+| `exp-termination.sh` | Q1 | when the DinD sidecar container is ended the way kubelet ends a container (outer `docker kill -s KILL`; outer `docker stop --time 10`), every writer inside it (a container's main loop, a backgrounded child, a `docker exec`'d loop, all in the inner container's own nested pid namespace) has stopped by the time the outer runtime reports the container `exited`, read from a separate read-only helper container on the same volume; and the successor pod's restored writer container (policy `no`) is exited and its file does not grow |
 | `exp-readonly.sh` | Q4/Q6 | the reclaim predicate's read-only queries change nothing and emit no event |
 
 Each posture runs in its own subshell. Output is machine-greppable:
@@ -122,8 +123,16 @@ visible through the per-pid `ns/mnt` links), so the proc files of
     and root) has a recorded `st_dev:st_ino`, including inodes of since-deleted
     files held open.
   - `MAP`: a memory mapping of a recorded inode on the same device.
-  - `NS-READ ns=<id> pid=<p>` per mount namespace read, then
-    `SCANNED pids=<n> mountns=<n>`.
+  - `NS-SEEN ns=<id>` per distinct mount namespace some live process was in,
+    `NS-READ ns=<id> pid=<p>` per mount namespace whose mountinfo was read, and
+    `SCAN-UNREADABLE pid=<p> what=<item>` per item that could not be read
+    (`ns-mnt`, `mountinfo`, `fd-dir`, `cwd`, `root`, `exe`, `fd/<n>`, `maps`)
+    while the process still existed, then
+    `SCANNED pids=<n> mountns=<n> unreadable=<n> vanished=<n>`. A process that
+    exited (or is a zombie) by the time a failure is examined counts once in
+    `vanished`, and an fd that closed between the listing and the stat is
+    ignored; neither is an unreadable item. The script exits nonzero on an
+    internal error (no `/data/runner` mount, empty id list, a failing awk).
   Limits: a mount namespace with no process in it is unreachable; only inodes
   recorded while the tree existed are matched after deletion. Positive control:
   a running container bound to the tree is seen as a strict mount hit in the
@@ -134,14 +143,54 @@ visible through the per-pid `ns/mnt` links), so the proc files of
   mount namespace, and a process executing a file in a tree gives the `MAP`
   control (if that fixture fails, MAP is reported `uncontrolled` and the
   experiment is INCOMPLETE). The scanner is also run after removing the control
-  container to show it then reports zero. In `exp-stopped.sh` every later scan
-  must have read dockerd's namespace and at least as many namespaces as the
-  control scan less one (the task's own namespace ends with the task), else
-  `scan_complete` reads `scan-incomplete` and the experiment FAILs.
+  container to show it then reports zero. Every zero-reference conclusion in
+  `exp-stopped.sh` and `exp-volumes-build.sh` (`pe_check_clear`) requires a
+  complete scan (`pe_scan_complete`): `unreadable=0`, dockerd's current mount
+  namespace among the `NS-READ` lines, and every mount namespace the control
+  scan read either read again or no longer observed (`NS-SEEN`) by any live
+  process (recorded as `ns_gone`). Otherwise the line is
+  `<label>.scan=incomplete reason=...`, the check is `INCOMPLETE scan=incomplete`
+  and the experiment is INCOMPLETE (exit 3); any reference found is still a FAIL.
+  Positive control that `SCAN-UNREADABLE` fires (`pe_unreadable_control`): the
+  same scan as uid 65534 cannot follow root-owned processes' per-pid links, so it
+  must report lines equal to its `unreadable=` count, while the root scan of the
+  same tree reports 0. Limit: the `ns/mnt` readlink shares one ptrace-access
+  gate with `fd`, `cwd`, `root`, `exe` and `maps`, so permissions can only
+  trigger the `ns-mnt` item; the reporting paths of the other items are not
+  separately triggered (only the vanished-process accounting is seen in
+  ordinary runs).
 - **Inode retention** (`exp-stopped.sh`). A root process whose cwd is the tree
   keeps its inode allocated after `rm -rf`, because freed inode numbers are
   reused at once (observed). Without it "the recreated directory has a new
-  inode" is not decidable from inode numbers.
+  inode" is not decidable from inode numbers. The same holder is the handle for
+  listing the deleted directory (`ls -A` on the holder's per-pid `cwd` link, as
+  root): its listing right after the deletion is the baseline, and
+  `check.heldA.no-writes` / `check.heldB.no-writes` require it unchanged (and
+  without the cp'd file) after `docker cp` and `docker start`.
+  `check.cp-into-stopped.reresolution` and `check.start-idle.reresolution` pass
+  only if the request failed or the tree was recreated on an inode different from
+  every held deleted inode; the recreated tree of an idle start must be empty.
+- **Writer termination** (`exp-termination.sh`). In the posture's daemon a
+  writer container (`-v /data/runner/tree-W-<case>:/w`, restart `no`) appends a
+  counter every 100 ms from its main loop, a backgrounded child and a
+  `docker exec`'d loop (`<n>`, `c<k>`, `x<k>` lines). Positive controls: the file
+  grows over about 1 s and all three writers have written (read through the
+  helper), and the writer container's pid namespace differs from the daemon
+  container's. The daemon container is then ended from the outer daemon (case
+  `kill`: `docker kill -s KILL`; case `stop`: `docker stop --time 10`),
+  `docker inspect` is polled (20 ms) for `exited`, and the file is read at once
+  through a labelled helper container (read-only mount of the run volume)
+  started beforehand so that the first read is a single exec; after 5 s
+  (supplementary) it is read again, and once more from a fresh labelled helper
+  container. `check.<case>.writers-stopped-by-exit` requires the three readings
+  identical (size, line count, last lines). The pod is then recreated on the same
+  volumes and the restored writer must be `exited`, policy `no`, the file
+  unchanged after 3 s, and no writer process present. Recorded per case:
+  delivery, time to `exited`, size at exit, size after the window, last counters.
+  Stand-in: this exercises the outer Docker 29.8.0 engine's containerd/runc stop
+  path in place of kubelet plus CRI containerd. They share the shim/runc family;
+  this is not the CRI plugin, so the CRI's own timeouts, signalling and status
+  reporting are not exercised.
 - **Events window** (`exp-restore.sh`). `docker events --since <first-response
   SystemTime>` for 20 s from the worker container (killed by `timeout`);
   supplementary. It is valid only if its exit status equals the timeout-kill

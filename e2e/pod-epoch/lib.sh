@@ -727,53 +727,149 @@ pe_tree_ids() {
   pe_root_sh 20 "find '$1' -exec stat -c '%d:%i' {} + | sort -u"
 }
 
-# pe_tree_scan <tree> <ids>: print reference lines, then a summary line
-# `SCANNED pids=<n> mountns=<n>`, with one `NS-READ ns=<id> pid=<p>` line per
-# mount namespace whose mountinfo was read. <ids> is the output of pe_tree_ids, taken
-# while the tree existed.
-pe_tree_scan() {
-  local tree=$1 ids=$2 body script
+# pe_sh_as <user> <cap> <script>: sh -c inside the daemon container as <user>
+# (uid[:gid]); instrument use only, like pe_root_sh.
+pe_sh_as() {
+  local user=$1 cap=$2 script=$3
+  pe_outer "$cap" exec --user "$user" "$PE_DAEMON" env -i "PATH=$PE_PATH" \
+    "XDG_RUNTIME_DIR=/run/dind" sh -c "$script"
+}
+
+# pe_tree_scan_as <user> <tree> <ids>: the scan below run as <user>. As root it is
+# the instrument; as an unprivileged uid it is the positive control that the
+# instrument reports what it cannot read (SCAN-UNREADABLE).
+#
+# Output: reference lines (MNT-STRICT, MNT-LOOSE, FD, MAP), one `NS-SEEN ns=<id>`
+# per distinct mount namespace some live process was observed in, one
+# `NS-READ ns=<id> pid=<p>` per namespace whose mountinfo was read, one
+# `SCAN-UNREADABLE pid=<p> what=<item>` per item that could not be read while the
+# process still existed, then the summary
+#   SCANNED pids=<n> mountns=<n> unreadable=<n> vanished=<n>
+# <ids> is the output of pe_tree_ids, taken while the tree existed.
+#
+# Items checked per process: ns-mnt (readlink), mountinfo (once per new
+# namespace), fd-dir (listing), cwd, root, exe, fd/<n> (stat -L) and maps. A
+# failure counts as unreadable only if the process is still alive afterwards
+# (exists and not a zombie); a process that exited during the scan is counted in
+# `vanished` (once), and an fd that closed between the listing and the stat (its
+# link no longer exists) is ignored. The script exits non-zero on an internal
+# error (no /data/runner mount, empty id list, a failing awk); unreadable items
+# are reported, not errors.
+pe_tree_scan_as() {
+  local user=$1 tree=$2 ids=$3 body script
   [[ $tree == "$PE_RUN_DIR"/* ]] || pe_fail "pe_tree_scan: tree outside $PE_RUN_DIR: $tree"
   read -r -d '' body <<'EOS' || true
+internal=0
+unread=0
+vanished=0
+pids=0
+nsn=0
+seen=' '
+nsseen=' '
+gone=0
+mi=/tmp/pe-mi.$$
+sto=/tmp/pe-st.$$
+trap 'rm -f "$idsf" "$mi" "$sto"' EXIT
+ierr() { echo "SCAN-ERROR $*" >&2; internal=1; }
+[ -s "$idsf" ] || { ierr "empty id list"; exit 6; }
 rel=${tree#/data/runner/}
 mi_line=$(grep ' /data/runner ' /proc/self/mountinfo | head -1)
-[ -n "$mi_line" ] || { echo "SCAN-ERROR no /data/runner mount" >&2; exit 5; }
+[ -n "$mi_line" ] || { ierr "no /data/runner mount"; exit 5; }
 mi_dev=$(echo "$mi_line" | awk '{print $3}')
 mi_root=$(echo "$mi_line" | awk '{print $4}')
 maj=${mi_dev%:*}
 min=${mi_dev#*:}
 dev_hex=$(printf '%02x:%02x' "$maj" "$min")
-pids=0
-nsn=0
-seen=' '
-for d in /proc/[0-9]*; do
+alive() {
+  [ -d "/proc/$1" ] || return 1
+  if grep -q '^State:[[:space:]]*Z' "/proc/$1/status" 2>/dev/null; then return 1; fi
+  return 0
+}
+# miss <pid> <item>: unreadable if the process still exists, else it vanished.
+miss() {
+  if alive "$1"; then
+    echo "SCAN-UNREADABLE pid=$1 what=$2"
+    unread=$((unread + 1))
+  else
+    gone=1
+  fi
+}
+scan_one() {
+  d=$1
   p=${d#/proc/}
-  [ -d "$d" ] || continue
+  [ -d "$d" ] || { gone=1; return; }
   pids=$((pids + 1))
-  ns=$(readlink "$d/ns/mnt" 2>/dev/null) || continue
+  if ! ns=$(readlink "$d/ns/mnt" 2>/dev/null) || [ -z "$ns" ]; then
+    miss "$p" ns-mnt
+    return
+  fi
+  case "$nsseen" in *" $ns "*) ;; *)
+    nsseen="$nsseen$ns "
+    echo "NS-SEEN ns=$ns" ;;
+  esac
   case "$seen" in *" $ns "*) ;; *)
-    if cat "$d/mountinfo" > /tmp/pe-mi.$$ 2>/dev/null; then
+    if cat "$d/mountinfo" > "$mi" 2>/dev/null; then
       seen="$seen$ns "
       nsn=$((nsn + 1))
       echo "NS-READ ns=$ns pid=$p"
       awk -v ns="$ns" -v pid="$p" -v dev="$mi_dev" -v R="$mi_root" -v rel="$rel" '
         { strict = ($3 == dev && ($4 == R "/" rel || index($4, R "/" rel "/") == 1))
           if (strict) print "MNT-STRICT ns=" ns " pid=" pid " " $0
-          else if (index($0, "/" rel) > 0) print "MNT-LOOSE ns=" ns " pid=" pid " " $0 }' /tmp/pe-mi.$$
+          else if (index($0, "/" rel) > 0) print "MNT-LOOSE ns=" ns " pid=" pid " " $0 }' "$mi" \
+        || ierr "awk over mountinfo failed"
+    else
+      miss "$p" mountinfo
     fi ;;
   esac
-  cmd=$(tr "\0" " " 2>/dev/null < "$d/cmdline" | cut -c1-70)
-  stat -L -c '%d:%i %N' "$d/cwd" "$d/root" "$d/exe" "$d"/fd/* 2>/dev/null \
-    | awk -v pid="$p" -v cmd="$cmd" 'NR == FNR { ids[$1] = 1; next } ($1 in ids) { print "FD pid=" pid " cmd=[" cmd "] " $0 }' "$idsf" /dev/stdin
-  awk -v pid="$p" -v dev="$dev_hex" 'NR == FNR { split($1, a, ":"); inos[a[2]] = 1; next }
-    ($4 == dev && ($5 in inos)) { print "MAP pid=" pid " " $0 }' "$idsf" "$d/maps" 2>/dev/null
-done
-rm -f /tmp/pe-mi.$$
-echo "SCANNED pids=$pids mountns=$nsn"
-EOS
-  script="tree='$tree'"$'\n'"idsf=/tmp/pe-ids.\$\$"$'\n'"cat > \"\$idsf\" <<'PEIDS'"$'\n'"$ids"$'\n'"PEIDS"$'\n'"$body"$'\n''rm -f "$idsf"'
-  pe_root_sh 60 "$script"
+  cmd=$(tr "\0" " " < "$d/cmdline" 2>/dev/null | cut -c1-70)
+  list="$d/cwd $d/root $d/exe"
+  if fds=$(ls -1 "$d/fd" 2>/dev/null); then
+    for f in $fds; do list="$list $d/fd/$f"; done
+  else
+    miss "$p" fd-dir
+  fi
+  # shellcheck disable=SC2086  # the list is space-separated /proc paths
+  if ! stat -L -c '%d:%i %n' $list > "$sto" 2>/dev/null; then
+    missing=$(printf '%s\n' $list | awk 'NR == FNR { ok[$2] = 1; next } !($1 in ok)' "$sto" -) \
+      || ierr "awk over stat output failed"
+    for it in $missing; do
+      case "$it" in
+        */fd/*)
+          # an fd that closed between the listing and the stat is not unreadable
+          [ -L "$it" ] || { alive "$p" || gone=1; continue; } ;;
+      esac
+      miss "$p" "${it#"$d"/}"
+    done
+  fi
+  hits=$(awk -v pid="$p" -v cmd="$cmd" 'NR == FNR { ids[$1] = 1; next } ($1 in ids) { print "FD pid=" pid " cmd=[" cmd "] " $0 }' "$idsf" "$sto") \
+    || ierr "awk over stat hits failed"
+  if [ -n "$hits" ]; then
+    echo "$hits" | while IFS= read -r h; do
+      echo "$h -> $(readlink "${h##* }" 2>/dev/null)"
+    done
+  fi
+  if maps=$(awk -v pid="$p" -v dev="$dev_hex" 'NR == FNR { split($1, a, ":"); inos[a[2]] = 1; next }
+    ($4 == dev && ($5 in inos)) { print "MAP pid=" pid " " $0 }' "$idsf" "$d/maps" 2>/dev/null); then
+    [ -z "$maps" ] || echo "$maps"
+  else
+    miss "$p" maps
+  fi
 }
+for dd in /proc/[0-9]*; do
+  gone=0
+  scan_one "$dd"
+  [ "$gone" = 0 ] || vanished=$((vanished + 1))
+done
+echo "SCANNED pids=$pids mountns=$nsn unreadable=$unread vanished=$vanished"
+[ "$internal" = 0 ] || exit 6
+exit 0
+EOS
+  script="tree='$tree'"$'\n'"idsf=/tmp/pe-ids.\$\$"$'\n'"cat > \"\$idsf\" <<'PEIDS'"$'\n'"$ids"$'\n'"PEIDS"$'\n'"$body"
+  pe_sh_as "$user" 60 "$script"
+}
+
+# pe_tree_scan <tree> <ids>: the instrument, as root.
+pe_tree_scan() { pe_tree_scan_as 0:0 "$1" "$2"; }
 
 # pe_dockerd_mntns: the mount namespace id of dockerd (in rootless, the
 # rootlesskit child's namespace), from its per-process ns/mnt link.
@@ -787,4 +883,111 @@ pe_dockerd_mntns() {
 # pe_scan_refs <scan-output>: count of reference lines (everything but SCANNED).
 pe_scan_refs() {
   grep -cE '^(MNT-STRICT|MNT-LOOSE|FD|MAP) ' <<<"$1" || true
+}
+
+# pe_scan_summary <label> <scan-output>: record counts, set SCAN_REFS.
+pe_scan_summary() {
+  local label=$1 out=$2 unr
+  SCAN_REFS=$(pe_scan_refs "$out")
+  pe_res "$label.refs" "$SCAN_REFS"
+  pe_res "$label.mnt_strict" "$(grep -c '^MNT-STRICT ' <<<"$out" || true)"
+  pe_res "$label.mnt_loose" "$(grep -c '^MNT-LOOSE ' <<<"$out" || true)"
+  pe_res "$label.fd" "$(grep -c '^FD ' <<<"$out" || true)"
+  pe_res "$label.map" "$(grep -c '^MAP ' <<<"$out" || true)"
+  pe_res "$label.scanned" "$(grep '^SCANNED ' <<<"$out" | tail -1)"
+  unr=$(grep '^SCAN-UNREADABLE ' <<<"$out" | head -5 || true)
+  [[ -z $unr ]] || pe_res "$label.unreadable_items" "$unr"
+}
+
+# Scan-completeness. A "zero references" reading counts only if the scan was
+# complete. PE_SCAN_CTL holds the control scan (taken while a reference was
+# known to exist) and PE_DOCKERD_NS the current dockerd mount namespace; the
+# calling script sets both (pe_scan_control, and PE_DOCKERD_NS=$(pe_dockerd_mntns)
+# again after every daemon restart).
+PE_SCAN_CTL=''
+PE_DOCKERD_NS=''
+
+# pe_scan_control <scan-output>: remember the control scan.
+pe_scan_control() { PE_SCAN_CTL=$1; }
+
+# pe_scan_complete <label> <scan-output>: records `<label>.scan=complete ...` and
+# returns 0, or records `<label>.scan=incomplete reason=...`, marks the
+# experiment INCOMPLETE and returns 1. Complete means all of: a SCANNED summary
+# line with unreadable=0; dockerd's mount namespace among the NS-READ lines;
+# and every mount namespace read by the control scan either read again or no
+# longer observed (NS-SEEN) by any live process in this scan. The namespaces
+# dropped for that last reason are recorded (ns_gone).
+pe_scan_complete() {
+  local label=$1 out=$2 sline unr van n ns ctl_ns gone='' reason=''
+  sline=$(grep '^SCANNED ' <<<"$out" | tail -1 || true)
+  if [[ $sline =~ ^SCANNED\ pids=[0-9]+\ mountns=([0-9]+)\ unreadable=([0-9]+)\ vanished=([0-9]+)$ ]]; then
+    n=${BASH_REMATCH[1]}
+    unr=${BASH_REMATCH[2]}
+    van=${BASH_REMATCH[3]}
+  else
+    pe_res "$label.scan" "incomplete reason=no-summary-line"
+    pe_incomplete tree-scan "$label: scan has no summary line"
+    return 1
+  fi
+  ((unr == 0)) || reason+="unreadable=$unr "
+  if [[ -z $PE_DOCKERD_NS ]] || ! grep -qF "NS-READ ns=$PE_DOCKERD_NS " <<<"$out"; then
+    reason+="dockerd-ns-not-read(${PE_DOCKERD_NS:-unset}) "
+  fi
+  if [[ -z $PE_SCAN_CTL ]]; then
+    reason+="no-control-scan "
+  else
+    while IFS= read -r ctl_ns; do
+      [[ -n $ctl_ns ]] || continue
+      if grep -qF "NS-READ ns=$ctl_ns " <<<"$out"; then
+        continue
+      elif grep -qxF "NS-SEEN ns=$ctl_ns" <<<"$out"; then
+        reason+="control-ns-seen-but-not-read($ctl_ns) "
+      else
+        gone+="$ctl_ns,"
+      fi
+    done < <(sed -n 's/^NS-READ ns=\(.*\) pid=.*$/\1/p' <<<"$PE_SCAN_CTL" | sort -u)
+  fi
+  if [[ -n $reason ]]; then
+    pe_res "$label.scan" "incomplete reason=${reason% } mountns=$n unreadable=$unr vanished=$van"
+    pe_incomplete tree-scan "$label: scan incomplete"
+    return 1
+  fi
+  pe_res "$label.scan" "complete mountns=$n unreadable=$unr vanished=$van dockerd_ns_read=yes ns_gone=${gone%,}"
+  return 0
+}
+
+# pe_check_clear <name> <label> <scan-output>: the "no reference" check. Any
+# reference is a FAIL whatever the completeness; zero references is a PASS only
+# if the scan was complete, else the check is INCOMPLETE (scan=incomplete).
+pe_check_clear() {
+  local name=$1 label=$2 out=$3 refs complete=0
+  refs=$(pe_scan_refs "$out")
+  if pe_scan_complete "$label" "$out"; then complete=1; fi
+  if ((refs > 0)); then
+    pe_res "check.$name" FAIL
+    PE_EXP_STATUS=FAIL
+  elif ((complete)); then
+    pe_res "check.$name" PASS
+  else
+    pe_res "check.$name" "INCOMPLETE scan=incomplete"
+  fi
+}
+
+# pe_unreadable_control <tree> <ids>: positive control that the scan reports
+# what it cannot read. Scanned as an unprivileged uid, it cannot follow another
+# uid's per-process links, so SCAN-UNREADABLE must fire (and its count must
+# match the summary), while the same scan as root reports none. Limitation: the
+# ns/mnt readlink shares the ptrace-access gate with fd, cwd, root, exe and maps,
+# so this control exercises the ns-mnt item; the other items are not separately
+# triggerable by permissions.
+pe_unreadable_control() {
+  local tree=$1 ids=$2 out root_out n lines
+  out=$(pe_tree_scan_as 65534:65534 "$tree" "$ids") || { pe_res control.unreadable "unprivileged scan exited non-zero"; return 1; }
+  root_out=$(pe_tree_scan "$tree" "$ids") || { pe_res control.unreadable "root scan exited non-zero"; return 1; }
+  lines=$(grep -c '^SCAN-UNREADABLE ' <<<"$out" || true)
+  n=$(sed -n 's/^SCANNED .* unreadable=\([0-9]*\) .*$/\1/p' <<<"$out" | tail -1)
+  pe_res control.unreadable_nonroot "lines=$lines summary=${n:-?} first=$(grep -m1 '^SCAN-UNREADABLE ' <<<"$out" || true)"
+  pe_res control.unreadable_root "$(grep '^SCANNED ' <<<"$root_out" | tail -1)"
+  [[ $n =~ ^[0-9]+$ ]] && ((lines >= 1 && lines == n)) \
+    && grep -q ' unreadable=0 ' <<<"$root_out"
 }

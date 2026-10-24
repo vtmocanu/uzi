@@ -14,21 +14,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$here/lib.sh"
 : "${PE_DEADLINE_SECONDS:=1500}"
 
-SCAN_REFS=0
 declare -A HITS
-
-scan_summary() { # scan_summary <label> <scan-output>: record counts, set SCAN_REFS
-  local label=$1 out=$2
-  SCAN_REFS=$(pe_scan_refs "$out")
-  pe_res "$label.refs" "$SCAN_REFS"
-  pe_res "$label.mnt_strict" "$(grep -c '^MNT-STRICT ' <<<"$out" || true)"
-  pe_res "$label.mnt_loose" "$(grep -c '^MNT-LOOSE ' <<<"$out" || true)"
-  pe_res "$label.fd" "$(grep -c '^FD ' <<<"$out" || true)"
-  pe_res "$label.map" "$(grep -c '^MAP ' <<<"$out" || true)"
-  pe_res "$label.scanned" "$(grep '^SCANNED ' <<<"$out" | tail -1)"
-}
-
-dockerd_mntns() { pe_dockerd_mntns; }
 
 # strict_in_ns <scan-output> <ns>: number of MNT-STRICT hits inside that namespace.
 strict_in_ns() {
@@ -40,7 +26,7 @@ cache_dump() { pe_inner 60 buildx du --verbose 2>&1; }
 
 run_posture() {
   local posture=$1 img TV TK ids scan dns out vopt n_before n_after types_before types_after
-  local bpid i samples during rc blog TMAP mids gone
+  local bpid i samples during unr rc blog TMAP mids gone
   pe_init "$posture"
   pe_exp_begin volumes-build
   img=$PE_FIXTURE_IMAGE
@@ -55,7 +41,8 @@ run_posture() {
   TV=$PE_RUN_DIR/tree-V
   pe_inner_sh 20 "mkdir -p '$TV' && echo v > '$TV/file'"
   ids=$(pe_tree_ids "$TV")
-  dns=$(dockerd_mntns)
+  dns=$(pe_dockerd_mntns)
+  PE_DOCKERD_NS=$dns
   pe_res dockerd.mntns "$dns"
 
   pe_inner 20 volume create v-plain >/dev/null
@@ -76,7 +63,7 @@ run_posture() {
     pe_exp_finish
   fi
   scan=$(pe_tree_scan "$TV" "$ids")
-  scan_summary v-bind.running "$scan"
+  pe_scan_summary v-bind.running "$scan"
   pe_res v-bind.running.hit_namespaces "$(grep -E '^MNT-' <<<"$scan" | awk '{print $1, $2}' | sort | uniq -c | tr '\n' ';')"
   n_after=$(strict_in_ns "$scan" "$dns")
   pe_res v-bind.running.strict_in_dockerd_ns "$n_after"
@@ -86,16 +73,22 @@ run_posture() {
     pe_exp_finish
   fi
   pe_res control.volume-visible PASS
+  pe_scan_control "$scan"
+  # Positive control that the scanner reports what it cannot read.
+  pe_control scan-unreadable pe_unreadable_control "$TV" "$ids"
 
   pe_inner 60 stop -t 2 c-vb >/dev/null
   scan=$(pe_tree_scan "$TV" "$ids")
-  scan_summary v-bind.after-stop "$scan"
+  pe_scan_summary v-bind.after-stop "$scan"
   pe_res v-bind.after-stop.strict_in_dockerd_ns "$(strict_in_ns "$scan" "$dns")"
+  pe_check_clear v-bind.after-stop.no-reference v-bind.after-stop "$scan"
   pe_daemon_restart
-  dns=$(dockerd_mntns)
+  dns=$(pe_dockerd_mntns)
+  PE_DOCKERD_NS=$dns
   scan=$(pe_tree_scan "$TV" "$ids")
-  scan_summary v-bind.after-restart "$scan"
+  pe_scan_summary v-bind.after-restart "$scan"
   pe_res v-bind.after-restart.strict_in_dockerd_ns "$(strict_in_ns "$scan" "$dns")"
+  pe_check_clear v-bind.after-restart.no-reference v-bind.after-restart "$scan"
 
   # ---- build --------------------------------------------------------------
   TK=$PE_RUN_DIR/tree-K
@@ -111,15 +104,16 @@ run_posture() {
   # container bound to it is seen; once removed, it is not.
   pe_inner 60 run -d --name c-ctl -v "$TK:/w" "$img" sleep 600 >/dev/null
   scan=$(pe_tree_scan "$TK" "$ids")
-  scan_summary control.tree-K-bound "$scan"
+  pe_scan_summary control.tree-K-bound "$scan"
   if ! grep -q '^MNT-STRICT ' <<<"$scan"; then
     pe_incomplete tree-scan "positive control failed: bind of tree-K not seen"
     pe_exp_finish
   fi
+  pe_scan_control "$scan"
   pe_inner 60 rm -f c-ctl >/dev/null
   scan=$(pe_tree_scan "$TK" "$ids")
-  scan_summary control.tree-K-removed "$scan"
-  pe_check control.tree-K-clear-before-build test "$SCAN_REFS" -eq 0
+  pe_scan_summary control.tree-K-removed "$scan"
+  pe_check_clear control.tree-K-clear-before-build control.tree-K-removed "$scan"
 
   # Positive control for the MAP category: a running process whose executable
   # is a file inside a tree has that file mapped, so the scanner must report a
@@ -130,7 +124,7 @@ run_posture() {
   mids=$(pe_tree_ids "$TMAP")
   if pe_inner 60 run -d --name c-map --entrypoint /w/busybox -v "$TMAP:/w" "$img" sleep 600 >/dev/null 2>&1; then
     scan=$(pe_tree_scan "$TMAP" "$mids")
-    scan_summary control.map-fixture "$scan"
+    pe_scan_summary control.map-fixture "$scan"
     if grep -q '^MAP ' <<<"$scan"; then
       pe_res control.map PASS
     else
@@ -160,11 +154,13 @@ run_posture() {
   bpid=$!
   samples=0
   during=0
+  unr=0
   for ((i = 0; i < 120; i++)); do
     kill -0 "$bpid" 2>/dev/null || break
     scan=$(pe_tree_scan "$TK" "$ids")
     samples=$((samples + 1))
     during=$((during + $(pe_scan_refs "$scan")))
+    unr=$((unr + $(sed -n 's/^SCANNED .* unreadable=\([0-9]*\) .*$/\1/p' <<<"$scan" | tail -1)))
     while IFS= read -r hit; do
       [[ -n $hit && -z ${HITS[$hit]:-} ]] || continue
       HITS[$hit]=1
@@ -176,15 +172,15 @@ run_posture() {
   pe_res build.rc "$rc"
   pe_res build.log_tail "$(tail -3 "$blog" | cut -c1-200)"
   rm -f "$blog"
-  pe_res during-build.supplementary_sampling "samples=$samples refs_total=$during (bounded sampling, supplementary)"
+  pe_res during-build.supplementary_sampling "samples=$samples refs_total=$during unreadable_total=$unr (bounded sampling, supplementary)"
   if ((rc != 0)); then
     pe_incomplete build "docker build failed (rc=$rc)"
     pe_exp_finish
   fi
 
   scan=$(pe_tree_scan "$TK" "$ids")
-  scan_summary after-build "$scan"
-  pe_check after-build.no-reference test "$SCAN_REFS" -eq 0
+  pe_scan_summary after-build "$scan"
+  pe_check_clear after-build.no-reference after-build "$scan"
 
   out=$(cache_dump) || true
   n_before=$(grep -c '^ID:' <<<"$out" || true)
@@ -203,13 +199,15 @@ run_posture() {
   pe_res cache.after_tree_delete.records "$n_after"
   pe_check cache.survives-tree-delete test "$n_after" -eq "$n_before" -a "$types_after" = "$types_before"
   scan=$(pe_tree_scan "$TK" "$ids")
-  scan_summary after-tree-delete "$scan"
-  pe_check after-tree-delete.no-reference test "$SCAN_REFS" -eq 0
+  pe_scan_summary after-tree-delete "$scan"
+  pe_check_clear after-tree-delete.no-reference after-tree-delete "$scan"
 
   pe_daemon_restart
+  # shellcheck disable=SC2034  # read by pe_scan_complete in lib.sh
+  PE_DOCKERD_NS=$(pe_dockerd_mntns)
   scan=$(pe_tree_scan "$TK" "$ids")
-  scan_summary after-restart "$scan"
-  pe_check after-restart.no-reference test "$SCAN_REFS" -eq 0
+  pe_scan_summary after-restart "$scan"
+  pe_check_clear after-restart.no-reference after-restart "$scan"
   out=$(cache_dump) || true
   n_after=$(grep -c '^ID:' <<<"$out" || true)
   pe_res cache.after_restart.records "$n_after"

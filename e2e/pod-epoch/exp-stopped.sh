@@ -21,58 +21,66 @@ state_field() { # state_field <state> <key>
   echo "${rest%% *}"
 }
 
-# hold_cwd <dir> <label>: a root process in the daemon container whose cwd is
-# <dir>. It keeps the directory's inode allocated after rm -rf, so a directory
-# recreated later cannot reuse the inode number, and it is itself a positive
-# control for the scanner on a deleted directory. Verified by label.
+# hold_cwd <dir> <label> <inode>: a root process in the daemon container whose
+# cwd is <dir>. It keeps the directory's inode allocated after rm -rf, so a
+# directory recreated later cannot reuse the inode number, it is itself a
+# positive control for the scanner on a deleted directory, and its
+# /proc/<pid>/cwd is the handle through which the deleted directory is listed.
+# Sets HOLD_PID. Verified by label.
+HOLD_PID=''
 hold_cwd() {
   pe_outer 10 exec -d --user 0:0 "$PE_DAEMON" env -i "PATH=$PE_PATH" \
     sh -c "cd '$1' && exec sleep 3600" >/dev/null
-  pe_root_sh 10 "
+  HOLD_PID=$(pe_root_sh 10 "
     for d in /proc/[0-9]*; do
       c=\$(tr '\\0' ' ' 2>/dev/null < \$d/cmdline) || continue
       [ \"\$c\" = 'sleep 3600 ' ] || continue
-      [ \"\$(stat -L -c %i \$d/cwd 2>/dev/null)\" = '$3' ] && { echo held; exit 0; }
+      [ \"\$(stat -L -c %i \$d/cwd 2>/dev/null)\" = '$3' ] && { echo \${d#/proc/}; exit 0; }
     done
-    exit 1" >/dev/null || pe_fail "cwd holder for $2 did not start"
+    exit 1") || pe_fail "cwd holder for $2 did not start"
+  [[ $HOLD_PID =~ ^[0-9]+$ ]] || pe_fail "cwd holder for $2: bad pid '$HOLD_PID'"
+}
+
+# held_listing <pid>: the entries of the (deleted) directory the holder's cwd
+# refers to, listed through its /proc/<pid>/cwd as root.
+held_listing() {
+  pe_root_sh 10 "ls -A /proc/$1/cwd | tr '\\n' ','"
 }
 
 # attempt <label> <cmd...>: run, record rc and the first 200 chars of output.
+# Sets ATTEMPT_RC.
+ATTEMPT_RC=0
 attempt() {
   local label=$1 out rc=0
   shift
   out=$("$@" 2>&1) || rc=$?
   out=${out//$'\n'/ }
+  ATTEMPT_RC=$rc
   pe_res "$label.rc" "$rc"
   pe_res "$label.out" "${out:0:200}"
 }
 
-scan_summary() { # scan_summary <label> <scan-output>: prints counts, sets SCAN_REFS
-  local label=$1 out=$2
-  SCAN_REFS=$(pe_scan_refs "$out")
-  pe_res "$label.refs" "$SCAN_REFS"
-  pe_res "$label.mnt_strict" "$(grep -c '^MNT-STRICT ' <<<"$out" || true)"
-  pe_res "$label.mnt_loose" "$(grep -c '^MNT-LOOSE ' <<<"$out" || true)"
-  pe_res "$label.fd" "$(grep -c '^FD ' <<<"$out" || true)"
-  pe_res "$label.map" "$(grep -c '^MAP ' <<<"$out" || true)"
-  pe_res "$label.scanned" "$(grep '^SCANNED ' <<<"$out" | tail -1)"
+# reresolved_ok <rc> <state> <held-inode...>: the allowed outcomes of a request
+# that re-resolves a deleted bind source: the request failed, or the tree was
+# recreated on an inode different from every held deleted inode.
+reresolved_ok() {
+  local rc=$1 state=$2 ino held
+  shift 2
+  ((rc != 0)) && return 0
+  [[ $state == exists=yes* ]] || return 1
+  ino=$(state_field "$state" ino)
+  for held in "$@"; do
+    [[ $ino != "$held" ]] || return 1
+  done
+  return 0
 }
 
-DOCKERD_NS=''
-CTL_NSN=0
-
-# scan_complete <label> <scan-output>: a "zero references" reading counts only if
-# the scan read dockerd's own mount namespace and at least as many namespaces as
-# the control scan did less one (the task's own namespace ends with the task).
-scan_complete() {
-  local label=$1 out=$2 n
-  n=$(grep '^SCANNED ' <<<"$out" | sed -n 's/.*mountns=\([0-9]*\).*/\1/p' | tail -1)
-  if [[ $n =~ ^[0-9]+$ ]] && ((n >= CTL_NSN - 1)) && grep -qF "NS-READ ns=$DOCKERD_NS " <<<"$out"; then
-    pe_res "$label.scan_complete" "yes mountns=$n control_mountns=$CTL_NSN dockerd_ns_read=yes"
-  else
-    pe_res "$label.scan_complete" "scan-incomplete mountns=${n:-?} control_mountns=$CTL_NSN dockerd_ns=$DOCKERD_NS"
-    pe_mark_fail
-  fi
+# listing_is <pid> <expected>: the held deleted directory still lists exactly
+# <expected> (the listing taken right after it was deleted), and not the cp'd file.
+listing_is() {
+  local now
+  now=$(held_listing "$1") || return 1
+  [[ $now == "$2" && $now != *pe-cpfile* ]]
 }
 
 # assert_deleted <label> <path>: record the tree state and require that it is gone.
@@ -96,7 +104,8 @@ ensure_stopped() {
 }
 
 run_posture() {
-  local posture=$1 img T TM state ino0 ino1 ino2 ids out tp scan nsn tns
+  local posture=$1 img T TM state ino0 ino1 ino2 ids tp scan nsn tns
+  local holdA='' holdB='' baseA='' baseB='' held_inos pre
   pe_init "$posture"
   pe_exp_begin stopped
   img=$PE_FIXTURE_IMAGE
@@ -123,47 +132,56 @@ run_posture() {
   # task's mountinfo and a process (the task) with cwd in the tree.
   tp=$(pe_inner 10 inspect -f '{{.State.Pid}}' c-bind)
   pe_res control.task_pid "$tp"
-  DOCKERD_NS=$(pe_dockerd_mntns)
+  PE_DOCKERD_NS=$(pe_dockerd_mntns)
   tns=$(pe_root_sh 10 "readlink /proc/$tp/ns/mnt")
-  pe_res control.namespaces "dockerd=$DOCKERD_NS task=$tns"
+  pe_res control.namespaces "dockerd=$PE_DOCKERD_NS task=$tns"
   scan=$(pe_tree_scan "$T" "$ids")
-  scan_summary control.running "$scan"
-  nsn=$(grep '^SCANNED ' <<<"$scan" | sed 's/.*mountns=//')
-  CTL_NSN=$nsn
+  pe_scan_summary control.running "$scan"
+  nsn=$(grep '^SCANNED ' <<<"$scan" | sed -n 's/.*mountns=\([0-9]*\).*/\1/p')
+  pe_scan_control "$scan"
   pe_res control.strict_hit_namespaces "$(grep '^MNT-STRICT ' <<<"$scan" | awk '{print $2}' | sort | uniq -c | tr '\n' ';')"
   pe_res control.task_mountinfo "$(pe_root_sh 10 "grep ' /w ' /proc/$tp/mountinfo" || true)"
   pe_res control.task_cwd "$(pe_root_sh 10 "readlink /proc/$tp/cwd; stat -L -c %d:%i /proc/$tp/cwd" | tr '\n' ' ')"
   # The scanner must have read the task's and dockerd's namespaces, and the
   # strict mount hit must be in the task's own namespace.
   if [[ $tns != 'mnt:['* ]] || ! grep -qF "MNT-STRICT ns=$tns " <<<"$scan" \
-    || ! grep -qF "NS-READ ns=$tns " <<<"$scan" || ! grep -qF "NS-READ ns=$DOCKERD_NS " <<<"$scan" \
+    || ! grep -qF "NS-READ ns=$tns " <<<"$scan" || ! grep -qF "NS-READ ns=$PE_DOCKERD_NS " <<<"$scan" \
     || ! grep -q "^FD pid=$tp " <<<"$scan" || ((nsn < 2)); then
     pe_incomplete tree-scan "positive control failed: scanner did not see the running bind (strict mount hit in the task's mount namespace, task cwd hit, task and dockerd namespaces read, >=2 mount namespaces)"
     pe_exp_finish
   fi
   pe_res control.running PASS
+  # Positive control that the scanner reports what it cannot read.
+  pe_control scan-unreadable pe_unreadable_control "$T" "$ids"
 
   # ---- stop ---------------------------------------------------------------
   pe_inner 60 stop -t 2 c-bind >/dev/null
   pe_res c-bind.mounts_after_stop "$(pe_inner 10 inspect -f '{{json .Mounts}}' c-bind)"
   scan=$(pe_tree_scan "$T" "$ids")
-  scan_summary after-stop "$scan"
-  scan_complete after-stop "$scan"
-  pe_check after-stop.no-reference test "$SCAN_REFS" -eq 0
+  pe_scan_summary after-stop "$scan"
+  pe_check_clear after-stop.no-reference after-stop "$scan"
 
   pe_daemon_restart
-  DOCKERD_NS=$(pe_dockerd_mntns)
+  PE_DOCKERD_NS=$(pe_dockerd_mntns)
   scan=$(pe_tree_scan "$T" "$ids")
-  scan_summary after-restart "$scan"
-  scan_complete after-restart "$scan"
-  pe_check after-restart.no-reference test "$SCAN_REFS" -eq 0
+  pe_scan_summary after-restart "$scan"
+  pe_check_clear after-restart.no-reference after-restart "$scan"
 
   # ---- delete tree-B, then docker cp into the stopped container -----------
+  # The first holder keeps the original directory (ino0) allocated. Its
+  # listing right after rm -rf is the baseline: nothing may be written into the
+  # deleted directory afterwards.
   hold_cwd "$T" tree-B "$ino0"
+  holdA=$HOLD_PID
+  pre=$(tree_state "$T")
+  pe_res tree-B.listing_before_rm "$pre"
   pe_inner_sh 20 "rm -rf '$T'"
   assert_deleted tree-B.after_rm "$T"
+  baseA=$(held_listing "$holdA") || pe_fail "cannot list the deleted tree-B through holder $holdA"
+  pe_res tree-B.heldA.listing_after_rm "[$baseA]"
   scan=$(pe_tree_scan "$T" "$ids")
-  scan_complete after-rm "$scan"
+  pe_scan_summary after-rm "$scan"
+  pe_scan_complete after-rm "$scan" || true
   # Positive control for deleted inodes: the holder's cwd is the deleted tree.
   pe_res control.deleted_inode_fd "$(grep -c '^FD ' <<<"$scan" || true)"
   pe_check control.deleted-inode-visible test "$(grep -c '^FD ' <<<"$scan" || true)" -ge 1
@@ -172,15 +190,22 @@ run_posture() {
   attempt cp-into-stopped pe_inner 30 cp /tmp/pe-cpfile c-bind:/w/
   state=$(tree_state "$T")
   pe_res tree-B.after_cp "$state"
-  ino1=$(state_field "$state" ino)
+  held_inos=$ino0
+  ino1=''
   if [[ $state == exists=yes* ]]; then
+    ino1=$(state_field "$state" ino)
     pe_res tree-B.after_cp.recreated yes
     pe_res tree-B.after_cp.inode_differs "$([[ $ino1 != "$ino0" ]] && echo yes || echo no)"
     pe_res tree-B.after_cp.file "$(pe_inner_sh 10 "cat '$T/pe-cpfile' 2>&1" || true)"
     hold_cwd "$T" tree-B-cp "$ino1"
+    holdB=$HOLD_PID
+    held_inos="$ino0 $ino1"
   else
     pe_res tree-B.after_cp.recreated no
   fi
+  # Allowed outcomes: the cp failed, or the tree was recreated on an inode that
+  # is none of the held deleted ones.
+  pe_check cp-into-stopped.reresolution reresolved_ok "$ATTEMPT_RC" "$state" "$ino0"
 
   # ---- delete again; docker start of an idle -v container and of c-bind ---
   # c-bind-idle is created while the tree exists (mirroring c-bind), with a
@@ -189,19 +214,26 @@ run_posture() {
   pe_inner 60 create --name c-bind-idle -v "$T:/w" "$img" sleep 600 >/dev/null
   pe_inner_sh 20 "rm -rf '$T'"
   assert_deleted tree-B.before_idle_start "$T"
+  if [[ -n $holdB ]]; then
+    baseB=$(held_listing "$holdB") || pe_fail "cannot list the deleted cp-recreated tree through holder $holdB"
+    pe_res tree-B.heldB.listing_after_rm "[$baseB]"
+  fi
   attempt start-idle pe_inner 60 start c-bind-idle
   state=$(tree_state "$T")
   pe_res tree-B.after_idle_start "$state"
-  ino2=$(state_field "$state" ino)
   if [[ $state == exists=yes* ]]; then
+    ino2=$(state_field "$state" ino)
     pe_res tree-B.after_idle_start.recreated yes
     pe_res tree-B.after_idle_start.empty "$([[ ${state##*list=} == '' ]] && echo yes || echo no)"
-    # Observations only: the cwd holders keep the earlier inode numbers allocated.
     pe_res tree-B.after_idle_start.inode_differs_from_initial "$([[ $ino2 != "$ino0" ]] && echo yes || echo no)"
     pe_res tree-B.after_idle_start.inode_differs_from_cp "$([[ $ino2 != "$ino1" ]] && echo yes || echo no)"
   else
     pe_res tree-B.after_idle_start.recreated no
   fi
+  # shellcheck disable=SC2086  # held_inos is a space-separated inode list
+  pe_check start-idle.reresolution reresolved_ok "$ATTEMPT_RC" "$state" $held_inos
+  # A recreated tree for an idle container must be empty.
+  pe_check start-idle.recreated-tree-empty test "$ATTEMPT_RC" -ne 0 -o "${state##*list=}" = ''
   pe_inner 60 stop -t 2 c-bind-idle >/dev/null
 
   pe_inner_sh 20 "rm -rf '$T'"
@@ -211,6 +243,16 @@ run_posture() {
   pe_res tree-B.after_cbind_start "$state"
   pe_res tree-B.after_cbind_start.note "c-bind's own command writes f into /w, so a non-empty listing is expected"
   pe_inner 60 stop -t 2 c-bind >/dev/null
+
+  # The held deleted trees received no writes through any of the requests above:
+  # each still lists what it listed right after its deletion (empty), and the
+  # cp'd file is in neither.
+  pe_res tree-B.heldA.listing_final "[$(held_listing "$holdA" || echo error)]"
+  pe_check heldA.no-writes listing_is "$holdA" "$baseA"
+  if [[ -n $holdB ]]; then
+    pe_res tree-B.heldB.listing_final "[$(held_listing "$holdB" || echo error)]"
+    pe_check heldB.no-writes listing_is "$holdB" "$baseB"
+  fi
 
   # ---- --mount type=bind and --volumes-from -------------------------------
   TM=$PE_RUN_DIR/tree-M
