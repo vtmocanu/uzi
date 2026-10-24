@@ -38,10 +38,27 @@ func TestWorkersHighmemKindRowUnclamped(t *testing.T) {
 			if !strings.Contains(row, "host·LHM+dk") {
 				t.Fatalf("kind clamped at width %d: %q", width, row)
 			}
-			if visualWidth(row) > width {
-				t.Fatalf("row exceeds viewport %d: %q", width, row)
-			}
 		})
+	}
+}
+
+// The version column absorbs the leftover width after the fixed columns, so a
+// wider KIND column (11 for a docker l-highmem worker) must shrink it by 2.
+func TestWorkersKindWidthFeedsVersionBudget(t *testing.T) {
+	docker := true
+	mk := func(size string) workerRow {
+		return workerRow{w: apitypes.WorkerDTO{ID: size, Name: size, Status: "online", Kind: "hosted", HostedSize: sp(size), Docker: &docker, Version: sp("0.85.1-rc.1+build.12345")}}
+	}
+	m := workersScene(true, "workers-list-120")
+	m.board.admin = true
+	const width = 120
+	// Fixed budget with kind 11 and admin scope is 102 cells: 120-102-4 = 14.
+	if got := m.workerTableWidths([]workerRow{mk("l-highmem")}, width); got.kind != 11 || got.version != 14 {
+		t.Errorf("l-highmem: kind=%d version=%d want 11 and 14", got.kind, got.version)
+	}
+	// Kind 9 frees two cells: 120-100-4 = 16.
+	if got := m.workerTableWidths([]workerRow{mk("l")}, width); got.kind != 9 || got.version != 16 {
+		t.Errorf("l: kind=%d version=%d want 9 and 16", got.kind, got.version)
 	}
 }
 

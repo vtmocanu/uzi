@@ -774,7 +774,7 @@ func (m tuiModel) workerTableWidths(rows []workerRow, width int) workerTableWidt
 			text = "~" + text
 		}
 		columns.memory = max(columns.memory, visualWidth(text))
-		columns.kind = min(max(columns.kind, visualWidth(m.workerKind(row))), 11)
+		columns.kind = max(columns.kind, visualWidth(m.workerKind(row)))
 		marker := 0
 		if row.w.UpgradeStatus == "outdated" || workerRollFailure(row.w.UpgradeStatus) {
 			marker = 1
