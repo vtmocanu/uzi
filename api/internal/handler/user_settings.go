@@ -299,8 +299,8 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		// Closed-list cross-vocabulary guard (D3): a curated Codex id must not sit in the
-		// Claude lane. No prefix guessing — only the curated Codex ids are rejected.
+		// Closed-list cross-vocabulary guard: a known Codex role id must not sit in
+		// the Claude lane. Custom ids outside that shared set remain provider-validated.
 		if err := rejectCodexIDInClaudeLane("default_claude_model", v); err != nil {
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 			return
@@ -982,12 +982,6 @@ func validateHarness(raw *string) (pgtype.Text, error) {
 	}
 }
 
-// curatedCodexModels is the closed Codex model vocabulary (PRD #1551 D3), a hand-kept
-// mirror of workersvc.codexModels and the web CLAUDE_MODEL_ALIASES sibling. Used ONLY by
-// the closed-list cross-vocabulary guard: a value in this set is rejected from the Claude
-// lane. Deliberately NOT a prefix check — no `gpt-` guessing.
-var curatedCodexModels = agenttmpl.CuratedCodexModels
-
 // knownClaudeAliases is the closed Claude alias set the web ModelSelect curates
 // (CLAUDE_MODEL_ALIASES: opus, sonnet, haiku, fable). Used ONLY by the cross-vocabulary
 // guard: one of these is rejected from the Codex lane. A full custom Claude id (e.g.
@@ -995,11 +989,13 @@ var curatedCodexModels = agenttmpl.CuratedCodexModels
 // `claude-` prefix check (D3).
 var knownClaudeAliases = agenttmpl.KnownClaudeAliases
 
-// rejectCodexIDInClaudeLane fails when a validated model value is a curated Codex id sitting
+// rejectCodexIDInClaudeLane fails when a validated model value is a Codex role id sitting
 // in a Claude-vocabulary field (PRD #1551 D3). A NULL/blank (clear) value never trips it.
 func rejectCodexIDInClaudeLane(field string, v pgtype.Text) error {
-	if v.Valid && curatedCodexModels[v.String] {
-		return fmt.Errorf("%s: %q is a Codex model id and cannot be a Claude model default", field, v.String)
+	if v.Valid {
+		if _, err := agenttmpl.ValidateClaudeLaneModel(v.String); err != nil {
+			return fmt.Errorf("%s: %w", field, err)
+		}
 	}
 	return nil
 }

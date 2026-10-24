@@ -88,19 +88,19 @@ func CodexCuratedModels() []string { return codexCuratedModelsSlice() }
 
 // harnessModelCompatible screens a FROZEN run.model value (a schedule/per-run pin) against harness
 // h's closed vocabulary (PRD #1429 D6, narrowed by PRD #1551 M4). Since M4 the per-harness user
-// lanes are read straight from GetUserHarnessModelDefaults and already carry their harness, so a
-// LANE VALUE NEVER traverses this function — its ONLY remaining caller is the frozen-run.model
+// lanes are read from GetUserHarnessModelDefaults, with stale Claude-lane Codex role ids
+// filtered separately using agenttmpl.CodexRoleModels. Lane values never traverse this function;
+// its callers are the frozen-run.model
 // precedence check in claim/judge assembly (and the Go mirror of the custom-Codex re-check, which
 // exploits that the Codex arm below is true iff the id is empty or curated). An empty (inherit)
-// model is always compatible — the worker uses its own harness default. The rule NEVER lets a
-// Claude alias reach a Codex claim or a Codex-only model reach a Claude claim:
+// model is always compatible — the worker uses its own harness default. The frozen-pin rules are:
 //
 //   - Codex harness: ONLY a known Codex model is compatible. A Claude alias, or a custom/unknown
 //     id whose Codex-compatibility cannot be known here, is refused so a frozen pin falls back to
 //     the owner's Codex lane — the conservative direction the PRD requires (Codex has a closed
 //     vocabulary, so a frozen non-curated pin is never forwarded; a CUSTOM Codex id reaches a run
 //     only through the per-user Codex lane, D5, never through this frozen-pin path).
-//   - Claude harness: a known Codex-only model is refused; every other value (a Claude alias OR a
+//   - Claude harness: a curated Codex model is refused; every other value (a Claude alias OR a
 //     custom full Claude id like claude-opus-4-8) passes through unchanged, preserving today's
 //     honour-any-custom-id behaviour.
 func harnessModelCompatible(h Harness, model string) bool {

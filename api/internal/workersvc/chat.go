@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"strings"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -374,6 +376,10 @@ func (s *Service) assembleChatClaim(ctx context.Context, run store.Run) (*ChatCl
 		return nil, fmt.Errorf("harness model defaults lookup: %w", err)
 	}
 	defaultModel := lanes.DefaultClaudeModel
+	if defaultModel.Valid && agenttmpl.CodexRoleModels[strings.TrimSpace(defaultModel.String)] {
+		slog.Warn("chat claim: dropped Codex role model from Claude lane", "run_id", run.ID.String(), "model", strings.TrimSpace(defaultModel.String))
+		defaultModel = pgtype.Text{}
+	}
 
 	defaultEffort, err := s.q.GetUserDefaultEffort(ctx, run.UserID)
 	if err != nil {
