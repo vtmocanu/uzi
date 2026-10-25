@@ -69,19 +69,12 @@ func SetInstanceIntakePause(ctx context.Context, q *Queries, active bool, reason
 		newReason.String = IntakePauseReasonText(reason)
 		newReason.Valid = newReason.String != ""
 	}
-	if !cur.Active && !active {
-		if reseeded == 0 {
-			return cur, false, nil
-		}
-		// The singleton was missing (effectively paused) and this lifts it: the effective
-		// state changed, so audit it as an "off" by the caller.
-		if err := q.InsertInstanceIntakePauseEvent(ctx, InsertInstanceIntakePauseEventParams{
-			ByUserID: byUserID, ByLabel: label, Action: "off",
-		}); err != nil {
-			return InstanceIntakePause{}, false, err
-		}
-		return cur, true, nil
+	if !cur.Active && !active && reseeded == 0 {
+		return cur, false, nil
 	}
+	// A missing singleton reads as paused, so lifting a re-seeded row (inactive off to off) is
+	// a real change: it falls through to the same "off" update as a normal lift, so the row's
+	// by_label matches the event.
 	action := "on"
 	keepAttribution := false
 	switch {
@@ -173,21 +166,46 @@ func textPtr(t pgtype.Text) *string {
 	return &v
 }
 
-// ReadMaintenanceReadout reads every section in one REPEATABLE READ READ ONLY transaction so
-// counts and lists share a snapshot; AsOf is that transaction's now().
+// ReadMaintenanceReadout is ReadMaintenance without the pause state.
 func ReadMaintenanceReadout(ctx context.Context, db cordonTxBeginner) (MaintenanceReadout, error) {
+	_, out, err := ReadMaintenance(ctx, db)
+	return out, err
+}
+
+// ReadMaintenance reads the pause state and every readout section in one REPEATABLE READ
+// READ ONLY transaction; AsOf is that transaction's now().
+//
+// REPEATABLE READ is load-bearing: the sections are separate statements, and under READ
+// COMMITTED each would take a fresh snapshot, so a run moving between statuses mid-read could
+// appear in two sections (or none) and the counts would disagree with the lists. One snapshot
+// makes the counts, the lists, Clear() and the pause state mutually consistent as of AsOf.
+func ReadMaintenance(ctx context.Context, db cordonTxBeginner) (IntakePauseState, MaintenanceReadout, error) {
 	tx, err := db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
-		return MaintenanceReadout{}, err
+		return IntakePauseState{}, MaintenanceReadout{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	q := New(tx)
-	var out MaintenanceReadout
+	// The first statement fixes the snapshot, so the state is read from it too.
 	asOf, err := q.MaintenanceSnapshotNow(ctx)
 	if err != nil {
-		return MaintenanceReadout{}, err
+		return IntakePauseState{}, MaintenanceReadout{}, err
 	}
-	out.AsOf = asOf.Time
+	st, err := ReadInstanceIntakePause(ctx, q)
+	if err != nil {
+		return IntakePauseState{}, MaintenanceReadout{}, err
+	}
+	out, err := readMaintenanceSections(ctx, q, asOf.Time)
+	if err != nil {
+		return IntakePauseState{}, MaintenanceReadout{}, err
+	}
+	return st, out, nil
+}
+
+func readMaintenanceSections(ctx context.Context, q *Queries, asOf time.Time) (MaintenanceReadout, error) {
+	var out MaintenanceReadout
+	var err error
+	out.AsOf = asOf
 	out.Active.Items = []MaintenanceItem{}
 	out.Held.Items = []MaintenanceItem{}
 	out.Custody.Items = []MaintenanceItem{}

@@ -74,10 +74,3 @@ type MaintenanceAdminDTO struct {
 	State   MaintenanceAdminStateDTO `json:"state"`
 	Readout MaintenanceReadoutDTO    `json:"readout"`
 }
-
-// MaintenanceUpdateRequest is the PUT /api/admin/maintenance body. Reason is ignored when
-// Active is false.
-type MaintenanceUpdateRequest struct {
-	Active bool   `json:"active"`
-	Reason string `json:"reason"`
-}

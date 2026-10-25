@@ -3,6 +3,7 @@ package store_test
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -312,5 +313,37 @@ func TestMaintenanceReadoutCapLiveDB(t *testing.T) {
 	}
 	if got.Active.Items == nil || got.Held.Items == nil || got.Custody.Items == nil || got.IdleBoundWorkers.Items == nil {
 		t.Fatal("empty sections must be non-nil slices")
+	}
+}
+
+// The readout's active query must be able to use idx_runs_nonterminal_since: its status IN
+// list implies the index's NOT IN predicate. enable_seqscan=off proves the path exists.
+func TestMaintenanceActiveQueryUsesNonterminalIndexLiveDB(t *testing.T) {
+	f := newReadoutFixture(t)
+	f.run(seedRun{status: "running"})
+	mustExec(f.ctx, t, f.pool, `ANALYZE runs`)
+	tx, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(f.ctx) }()
+	if _, err := tx.Exec(f.ctx, `SET LOCAL enable_seqscan = off`); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := tx.Query(f.ctx, `EXPLAIN SELECT r.id FROM runs r WHERE r.status IN ('claimed', 'running') ORDER BY r.status_since, r.id LIMIT 50`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var plan strings.Builder
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			t.Fatal(err)
+		}
+		plan.WriteString(line + "\n")
+	}
+	if !strings.Contains(plan.String(), "idx_runs_nonterminal_since") {
+		t.Fatalf("plan did not use idx_runs_nonterminal_since:\n%s", plan.String())
 	}
 }

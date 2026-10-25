@@ -244,6 +244,10 @@ func TestIntakePauseMissingRowLiveDB(t *testing.T) {
 	if err != nil || len(evs) != 1 || evs[0].Action != "off" || evs[0].ByUserID != by || evs[0].ByLabel.String != "Admin" {
 		t.Fatalf("lifting a missing singleton must write one off event by the caller: %+v err=%v", evs, err)
 	}
+	// The row's attribution matches the event, as after a normal off.
+	if cur, err := fx.q.GetInstanceIntakePause(fx.ctx); err != nil || cur.ByUserID != by || cur.ByLabel.String != "Admin" {
+		t.Fatalf("re-seeded lift must attribute the row to the caller: %+v err=%v", cur, err)
+	}
 	var rows int
 	if err := fx.pool.QueryRow(fx.ctx, `SELECT count(*) FROM instance_intake_pause`).Scan(&rows); err != nil || rows != 1 {
 		t.Fatalf("singleton not re-seeded: rows=%d err=%v", rows, err)

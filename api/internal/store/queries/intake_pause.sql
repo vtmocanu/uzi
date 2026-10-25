@@ -94,7 +94,9 @@ WITH open_holds AS (
     SELECT h.id AS hold_id, h.run_id, h.user_id, h.repo_id, h.created_at, f.decision_needed
     FROM recovery_custody_hold_facts f
     JOIN recovery_custody_holds h ON h.id = f.id
-    WHERE f.state = 'open'
+    -- h.state repeats the filter so the partial open-holds index applies to this second
+    -- reference too (f.state is h.state in the view) instead of a full scan of the table.
+    WHERE f.state = 'open' AND h.state = 'open'
 ), per_run AS (
     SELECT DISTINCT ON (run_id) hold_id, run_id, user_id, repo_id, created_at,
            bool_or(decision_needed) OVER (PARTITION BY run_id) AS needs_owner

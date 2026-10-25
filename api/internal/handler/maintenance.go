@@ -40,11 +40,27 @@ func pgTextStr(t pgtype.Text) *string {
 	return &s
 }
 
+// maintenanceLabelMax caps a rendered owner label or repo path.
+const maintenanceLabelMax = 200
+
+// termSafe sanitizes user-authored text (display name, email, repo path) at the render
+// boundary: ESC and other control sequences, bidi overrides and newlines never reach the
+// admin readout's consumers (terminal CLI, TUI).
+func termSafe(s string) string { return store.ManualCordonText(s, maintenanceLabelMax) }
+
+func termSafePtr(s *string) *string {
+	if s == nil {
+		return nil
+	}
+	v := termSafe(*s)
+	return &v
+}
+
 func maintenanceItems(in []store.MaintenanceItem) []apitypes.MaintenanceItemDTO {
 	out := make([]apitypes.MaintenanceItemDTO, 0, len(in))
 	for _, it := range in {
 		d := apitypes.MaintenanceItemDTO{RunID: it.RunID.String(), Kind: it.Kind, Status: it.Status,
-			OwnerLabel: it.OwnerLabel, Repo: it.Repo, Since: timeStr(it.Since), Tag: it.Tag}
+			OwnerLabel: termSafe(it.OwnerLabel), Repo: termSafePtr(it.Repo), Since: timeStr(it.Since), Tag: it.Tag}
 		if it.HoldID != nil {
 			s := it.HoldID.String()
 			d.HoldID = &s
@@ -62,7 +78,7 @@ func maintenanceReadoutDTO(m store.MaintenanceReadout) apitypes.MaintenanceReado
 	workers := make([]apitypes.MaintenanceWorkerDTO, 0, len(m.IdleBoundWorkers.Items))
 	for _, w := range m.IdleBoundWorkers.Items {
 		workers = append(workers, apitypes.MaintenanceWorkerDTO{WorkerID: w.WorkerID.String(),
-			OwnerLabel: w.OwnerLabel, RunID: w.RunID.String(), Since: timeStr(w.Since)})
+			OwnerLabel: termSafe(w.OwnerLabel), RunID: w.RunID.String(), Since: timeStr(w.Since)})
 	}
 	return apitypes.MaintenanceReadoutDTO{
 		AsOf:             m.AsOf.UTC().Format(time.RFC3339),
@@ -138,8 +154,8 @@ func (h *Handler) AdminPutMaintenance(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	// Commit on every nil error, a no-op included: the helper may have re-seeded a missing
-	// singleton before concluding there was nothing more to change.
+	// Commit on every nil error: a change must persist, and even a no-op may have re-seeded
+	// a missing singleton (a true no-op writes nothing, so committing it is harmless).
 	if err := tx.Commit(ctx); err != nil {
 		slog.Error("maintenance commit", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -156,13 +172,7 @@ func (h *Handler) writeMaintenanceAdmin(w http.ResponseWriter, r *http.Request) 
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	st, err := store.ReadInstanceIntakePause(r.Context(), h.q)
-	if err != nil {
-		slog.Error("read intake pause", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return
-	}
-	readout, err := store.ReadMaintenanceReadout(r.Context(), h.pool)
+	st, readout, err := store.ReadMaintenance(r.Context(), h.pool)
 	if err != nil {
 		slog.Error("maintenance readout", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -170,7 +180,7 @@ func (h *Handler) writeMaintenanceAdmin(w http.ResponseWriter, r *http.Request) 
 	}
 	httpx.JSON(w, http.StatusOK, apitypes.MaintenanceAdminDTO{
 		State: apitypes.MaintenanceAdminStateDTO{
-			Active: st.Active, Since: pgTimeStr(st.Since), Reason: pgTextStr(st.Reason), ByLabel: pgTextStr(st.ByLabel),
+			Active: st.Active, Since: pgTimeStr(st.Since), Reason: pgTextStr(st.Reason), ByLabel: termSafePtr(pgTextStr(st.ByLabel)),
 		},
 		Readout: maintenanceReadoutDTO(readout),
 	})
