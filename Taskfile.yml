@@ -2175,7 +2175,7 @@ tasks:
       # carry per-arch aliases. The generic version-only customManager in
       # renovate.json matches the annotation; go datasource, semver.
       # renovate: datasource=go depName=govulncheck-api packageName=golang.org/x/vuln
-      - ./scripts/govulncheck-gate.sh api golang.org/x/vuln/cmd/govulncheck@v1.8.0
+      - ./scripts/govulncheck-gate.sh api golang.org/x/vuln/cmd/govulncheck@v1.9.0
 
   test:api:
     desc: api unit tests (-race -count=1; live-DB tests self-skip)
@@ -2378,7 +2378,7 @@ tasks:
       # `gate:controller` - read vulncheck:api's comment before editing either.
       # Renovate-tracked too (alias -controller, shared packageName); see vulncheck:api.
       # renovate: datasource=go depName=govulncheck-controller packageName=golang.org/x/vuln
-      - ./scripts/govulncheck-gate.sh controller golang.org/x/vuln/cmd/govulncheck@v1.8.0
+      - ./scripts/govulncheck-gate.sh controller golang.org/x/vuln/cmd/govulncheck@v1.9.0
 
   test:controller:
     desc: controller unit tests (-race -count=1)
