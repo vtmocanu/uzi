@@ -1138,3 +1138,17 @@ The unchanged-writers comparison records `captureMaintenanceWip`, `cloneBare`,
 and `pinSettlementRefs` unchanged against 76cd0a66. No production writer or W0-H change
 is part of U4b. Same-uid actors, storage loss, shallow-source writers and separate
 maintainer hardening remain outside this change.
+
+### U4b validation limit observed during M2
+
+The required full-gate fixture, including W0 and coordinator effects under its
+existing temporary-directory wrapper, exhausted the unchanged adminEntries limit.
+A narrowed reproduction refused the next 1-entry scratch-parent stat at 4,096
+entries, after proof and during the canonical-import phase's post-import-range
+dispatch guard; it used 16 charged RPCs plus 4 discovery attempts. The earlier direct
+fixture success at 3,983 admin entries does not establish this wrapped path's
+capacity. This over-cap result is R3 material-change evidence, not permission to
+raise the cap, shorten the failing path, remove proofs/checks or grant output/cleanup
+authority. The implementation remains guarded off and completion is blocked pending
+a capacity/contract decision. Detailed all-dimension counters and independent test
+fixture repairs are recorded in `docs/issue-3031-delivery.md` and the PR evidence.

@@ -2,6 +2,8 @@ import test, { mock } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
+import os from "node:os";
+import type { GitCache } from "../src/git.js";
 import { createHash, createHmac } from "node:crypto";
 import { RecoveryCoordinator, canonicalJson, type ClosedSourceObservation, type RecoveryArchiveClient, type RecoveryRecord } from "../src/recovery.js";
 import { MaintenanceResources } from "../src/recovery-maintenance.js";
@@ -26,7 +28,7 @@ async function fixture(t: test.TestContext, mode: string, options: {
   observeStatus?: (call: number) => string;
   currentGeneration?: number;
 } = {}) {
-  const root = await fs.mkdtemp(path.resolve("../.uzi/scratch/terminal-origin-"));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "terminal-origin-"));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const recoveryRoot = path.join(root, "recovery");
   const ledgerRoot = path.join(root, "recovery-maintenance");
@@ -49,7 +51,7 @@ async function fixture(t: test.TestContext, mode: string, options: {
   let originChanged = false;
   let metadata = observation.family!.metadata;
   let repo = repoId, quiescent = true, quiesceCalls = 0, holdCalls = 0, headCalls = 0, sourceHead = sha;
-  let chargedRpc = 0, discoveryRpc = 0;
+  let chargedRpc = 0, discoveryRpc = 0, imports = 0;
   let afterCharge: (() => Promise<void> | void) | undefined;
   const signal = new AbortController();
   const token = Object.freeze({}), chargedToken = Object.freeze({});
@@ -79,6 +81,19 @@ async function fixture(t: test.TestContext, mode: string, options: {
     releaseRecoveryCustody: async () => { throw new Error("FINAL forbidden"); },
   };
   const git = {
+    // Coordinator-only model: NO object or child-settlement proof. The real runner suite supplies both.
+    importMaintenanceTip: async (request: Parameters<GitCache["importMaintenanceTip"]>[0]):
+      ReturnType<GitCache["importMaintenanceTip"]> => {
+      await request.prepare();
+      const snapshot = await git.matchMaintenanceSourceFamily();
+      if (!snapshot) throw new Error("modeled import family refused");
+      await request.validateFamily({ sources: [...snapshot.sources], metadata: snapshot.metadata,
+        origin: await git.maintenanceOriginDigest() });
+      await request.beforeSemantic();
+      imports++;
+      events.push("canonical-import");
+      return { kind: "imported", sourceSha: request.tip };
+    },
     matchMaintenanceSourceFamily: async () => {
       if (!MaintenanceResources.discoveryActive()) {
         events.push("paid-scan");
@@ -188,16 +203,18 @@ async function fixture(t: test.TestContext, mode: string, options: {
     unquiescent: () => { quiescent = false; }, headChanged: () => { sourceHead = "e".repeat(40); },
     afterCharge: (action: () => Promise<void> | void) => { afterCharge = action; },
     metadata: (value: string) => { metadata = value; },
-    counts: () => ({ quiesceCalls, holdCalls, headCalls, chargedRpc, discoveryRpc }),
+    counts: () => ({ quiesceCalls, holdCalls, headCalls, chargedRpc, discoveryRpc, imports }),
     tokenState: () => [client.isCurrentTerminalMaintenanceHold!(token),
       client.isCurrentTerminalMaintenanceHold!(chargedToken)] };
 }
 
+// R5: WIP fixtures run on the Linux worker filesystem, including modeled refusal cases.
+const wipOptions = { skip: process.platform !== "linux" && "Linux WIP fixtures required" };
 const terminalStatuses = ["failed", "cancelled", "completed"] as const;
 
 for (const status of terminalStatuses) {
   for (const earlierGeneration of [false, true]) {
-    test("terminal WIP exact status: " + status + (earlierGeneration ? " earlier generation" : ""), async t => {
+    test("terminal WIP exact status: " + status + (earlierGeneration ? " earlier generation" : ""), wipOptions, async t => {
       const f = await fixture(t, "committed", { status, currentGeneration: earlierGeneration ? 9 : 1 });
       const observation: ClosedSourceObservation = earlierGeneration ? {
         ...f.observation, terminal: "normal_blocked",
@@ -223,6 +240,7 @@ for (const status of terminalStatuses) {
       assert.deepEqual(cycle.outputs, [digest(record.captureId),
         digest(["maintenance-wip-v1", cycle.identity, "e".repeat(40)])]);
       assert.deepEqual(f.events.filter(event => event.startsWith("git-")), ["git-status", "git-add", "git-commit"]);
+      assert.equal(f.counts().imports, 1);
       assert.ok(f.events.indexOf("authenticated-before-raw") < f.events.indexOf("git-status"));
       await f.unchanged();
       await f.run(f.make(), observation);
@@ -234,7 +252,7 @@ for (const status of terminalStatuses) {
 
 for (const status of ["queued", "claimed", "running", "awaiting_approval", "awaiting_input", "awaiting_followup",
   "limit_wait", "pool_wait", "paused", "recovery_wait", "parked", "stopped", "unknown", ""]) {
-  test("terminal WIP rejects initial exact status: " + JSON.stringify(status), async t => {
+  test("terminal WIP rejects initial exact status: " + JSON.stringify(status), wipOptions, async t => {
     const f = await fixture(t, "committed", { status });
     await f.run();
     assert.equal(f.counts().holdCalls, 1);
@@ -248,7 +266,7 @@ for (const status of ["queued", "claimed", "running", "awaiting_approval", "awai
 
 // With both journal directories present the observations are: discovery, before
 // charge, pre-publication, before temporary open, before rename, add, commit,
-// transfer entry and post-settlement lineage acceptance. Each fixture stops at its selected observation.
+// modeled canonical import dispatch and post-settlement lineage acceptance. Each fixture stops at its selected observation.
 const observationBoundaries = [
   { call: 2, name: "before charge", origins: 0, outputs: 0, git: [] },
   { call: 3, name: "pre-publication", origins: 0, outputs: 0, git: [] },
@@ -256,19 +274,21 @@ const observationBoundaries = [
   { call: 5, name: "before rename", origins: 0, outputs: 1, git: [] },
   { call: 6, name: "before add", origins: 1, outputs: 1, git: ["git-status"] },
   { call: 7, name: "before commit", origins: 1, outputs: 1, git: ["git-status", "git-add"] },
-  { call: 8, name: "transfer entry", origins: 1, outputs: 1, git: ["git-status", "git-add", "git-commit"] },
+  { call: 8, name: "canonical import dispatch", origins: 1, outputs: 1, git: ["git-status", "git-add", "git-commit"] },
   { call: 9, name: "post-settlement lineage", origins: 1, outputs: 1, git: ["git-status", "git-add", "git-commit"] },
 ];
 for (const [index, status] of terminalStatuses.entries()) {
   const nonterminal = ["running", "parked", "unknown"][index]!;
   for (const boundary of observationBoundaries) {
-    test("terminal WIP exact status transition: " + status + " to " + nonterminal + " " + boundary.name, async t => {
+    test("terminal WIP exact status transition: " + status + " to " + nonterminal + " " + boundary.name, wipOptions, async t => {
       const f = await fixture(t, "committed", {
         observeStatus: call => call < boundary.call ? status : nonterminal,
       });
       await fs.mkdir(f.dir, { recursive: true });
       await f.run();
       assert.equal(f.counts().holdCalls, boundary.call);
+      assert.equal(f.counts().imports, boundary.call === 9 ? 1 : 0,
+        "observation 8 refuses import dispatch; observation 9 refuses output after modeled import");
       assert.equal(await f.chargeCount(), boundary.call === 2 ? 0 : 1);
       assert.equal((await f.prefixes()).length, boundary.origins);
       const records = await f.coordinator.inspect(runId);
@@ -301,7 +321,7 @@ for (const [index, status] of terminalStatuses.entries()) {
 for (const mode of ["committed", "missing-bridge", "initial-stop", "before-add-stop", "before-commit-stop", "post-commit-stop",
   "post-commit-custody", "return-stop", "return-family", "return-origin", "return-custody", "wrong-head",
   "invalid-kind", "invalid-parent", "invalid-clean", "invalid-sha"]) {
-  test("terminal WIP coordinator: " + mode, async t => {
+  test("terminal WIP coordinator: " + mode, wipOptions, async t => {
     const f = await fixture(t, mode);
     await f.run();
     assert.equal(await f.chargeCount(), mode === "missing-bridge" ? 0 : 1);
@@ -333,7 +353,7 @@ for (const mode of ["committed", "missing-bridge", "initial-stop", "before-add-s
   });
 }
 
-for (const directories of [0, 1, 2]) test("terminal WIP charged transports with " + directories + " cold directories", async t => {
+for (const directories of [0, 1, 2]) test("terminal WIP charged transports with " + directories + " cold directories", wipOptions, async t => {
   const f = await fixture(t, "committed");
   if (directories < 2) await fs.mkdir(f.recoveryRoot);
   if (directories === 0) await fs.mkdir(f.dir);
@@ -345,7 +365,7 @@ for (const directories of [0, 1, 2]) test("terminal WIP charged transports with 
 });
 
 for (const mode of ["missing-phase", "wrong-phase", "dispatch-first", "late-missing-phase", "late-wrong-phase"])
-test("terminal WIP refuses unspecified callback authority: " + mode, async t => {
+test("terminal WIP refuses unspecified callback authority: " + mode, wipOptions, async t => {
   const f = await fixture(t, mode);
   await f.run();
   const cycle = (await f.table()).cycles[0];
@@ -360,7 +380,7 @@ for (const point of ["status-dispatch", "add-prepare", "commit-prepare", "after-
 for (const change of ["stop", "origin", "head", "token"]) {
   // Commit's post-proof intentionally omits old HEAD until the verified result.
   if (point === "after-commit" && change === "head") continue;
-  test("terminal WIP local read-only refusal: " + point + " " + change, async t => {
+  test("terminal WIP local read-only refusal: " + point + " " + change, wipOptions, async t => {
     const f = await fixture(t, "local-" + point + "-" + change);
     await f.run();
     const cycle = (await f.table()).cycles[0];

@@ -10,7 +10,7 @@ Refs #3031. This is an incomplete delivery under the supplied plan's R3.
 The terminal producer remains disabled. S and N are implemented, with the
 scoped acceptance, regression and mutation evidence recorded below. C1/U4b is
 implemented with the guard off; its focused acceptance, test ports, accounting and
-conditional ADR amendment are recorded below. C2–C8 are not delivered. Full
+conditional ADR amendment are recorded below. C2–C8 are not delivered. U4b completion is currently blocked by the M2 resource refusal recorded under material change needed below. Full
 frozen-gate results belong to the PR verification record; live acceptance
 remains separate. The U4b contract revision is recorded below; no producer enablement is included.
 
@@ -1177,3 +1177,95 @@ separately by the composed worker paths.
 All seven named unchanged-writer/capture methods were byte-compared against baseline
 76cd0a66 after implementation. The flag remains false. Final old-helper sweeps contain
 no owned present-tense source/test callers; historical inventory titles remain in docs.
+
+## U4b M2: material change needed — disposable-scratch administration budget
+
+The implementation is committed at `81993269`. The mandatory full
+`task gate:agent` run on that revision did **not** pass: the command reached its
+120-minute tool bound and its process tree was reaped. The last unit report remained
+`running`, with 631/690 files done, 20,415 tests observed, 20,296 passed, 104 failed
+and 15 skipped. No final unit summary was produced and Codex M4 was not reached.
+This is incomplete failed validation, not a complete CI or gate result.
+
+Four real dirty preservation-path cases refused with
+`maintenance_resource_exhausted` at the unchanged `adminEntries=4096` limit.
+A narrowed reproduction under the same existing process/tmpdir wrappers reproduced
+it without full-suite contention (`gate-log.eaP9IG`, exit 1, one test,
+35,885.902498 ms). The next charge was one admin entry in importer `scratchCheck`,
+called by the pre-spawn guard before the post-import range command. The proof-phase
+snapshot had already consumed 3,926 admin entries; import-phase entry was 3,979.
+The import/handoff could not complete within the reservation. The earlier direct
+fixture's 3,983-entry successful observation is retained as history, not substituted
+for this required gate's refusal. The deeper wrapper path adds real parent checks;
+no path was shortened to make the failing example fit.
+
+| Dimension | Refused wrapped path, including W0 and coordinator effects | Limit |
+|---|---:|---:|
+| launches | 191 | 512 |
+| metadataBytes | 31,070,720 | 256 MiB |
+| adminEntries | 4,096; next 1 refused | 4,096 |
+| sources | 118 | 128 |
+| rpcAttempts | 16 charged + 4 discovery = 20 physical attempts (10 pairs) | 32 |
+| sourceEntries | 10,789 | 65,536 |
+| sourceBytes | 200,998 | 256 MiB |
+| artifactBytes | 2,042 | 256 MiB |
+| closureEntries | 16 | 65,536 |
+| decoded | 478 | 8 GiB, or tighter inherited C |
+
+R3 applies to the over-cap result. No cap, timeout, test timeout, selected object
+set, required proof, writer, guard or disposal rule has been changed to work around
+it. In particular, the tests' input path has not been shortened and scratch-parent
+checks have not been removed. A material capacity/contract decision is required
+before dependent completion work and a successful full-gate claim. Candidate
+review, mutation evidence and hosted/downstream records are not waived.
+
+### Independent M2 fixture repairs
+
+The full run also exposed two omitted coordinator test-fixture ports. Their duck-typed
+Git objects lacked the new importer and therefore refused at the capability check
+before the observations the tests intended to exercise. They are repaired without
+production-source changes:
+
+| Existing cases | Port and retained assertions |
+|---|---|
+| `recovery-maintenance-resources.test.ts`: terminal caller shares both observations' metadataBytes/adminEntries/rpcAttempts/candidates allowance before charge | Throwing importer seam plus explicit zero-import counter; both observations still share the original allowance, capture remains zero and no ledger is created. |
+| All 91 cases in `recovery-terminal-wip-coordinator.test.ts` | Explicit coordinator-only imported-result model calls local preparation and family/origin validation, then the semantic pair immediately before modeled import. It claims no object or child-settlement proof. Original status, generation, journal, source, custody, ledger and callback assertions remain. New counters distinguish denied import from denied output. WIP fixtures use Linux-only options and container-internal `os.tmpdir()`. |
+| The three exact-status transition titles ending `transfer entry`: failed to running; cancelled to parked; completed to unknown | Same three cases now end `canonical import dispatch`, accurately locating observation 8. Observation 9 remains post-settlement output acceptance. No read-only command acquires an extra pair. |
+| `git-maintenance-wip-capture-h.test.ts`: clone HEAD=W / plain clone and bundle positive | Native bundle verification now explicitly uses `cwd: f.root`, the owned fixture repository. Every clone/bundle/connectivity assertion and W0-H production pin sequence, P5, 65 launches and 5-unit payload accounting remain unchanged. |
+
+The stale coordinator fixture reproduced 90 failures and one pass
+(`gate-log.nIiRLF`); the four resource cases reproduced `0 !== 2`. Both full
+fixture files now pass all 111 tests (`gate-log.4OY1Gl`), and the W0 positive passes
+(`gate-log.gYsOl0`). The existing charged RPC assertions remain 14/16/18 for
+0/1/2 cold journal directories, plus 4 discovery attempts. These coordinator-only
+figures are not the real W0-H three-dispatch commit path or C2 capacity evidence.
+Lint, typecheck, knip and diff checking passed for these repairs
+(`2UYOWE`, `NhHQTJ`, `0fDUDt`, `LvjT8O`).
+
+### Baseline triage and review boundaries
+
+Five environment-allowlist assertions (chat, Codex and SDK executor) reproduce on
+baseline `76cd0a66` with inherited `UZI_SQLC_DIR`, and pass on both base and candidate
+when only that inherited toolchain variable is unset. Four-case raw comparison:
+candidate `VN0T9Z`, base `KuXAkm`; sanitized comparison `yeZQou`/`HliMcX`.
+The SDK single case is `fsuVik`/`AFtHir` raw and `OtMMUu`/`A7cOFo` sanitized.
+Those initial failures remain failed-check evidence. No environment allowlist or
+production dependency was changed. These failure-triage timings are not a healthy
+before/after test-matrix performance comparison.
+
+The W0 bundle check also failed on baseline because its implicit cwd discovered
+the unrelated runner checkout after stripping Git safety settings. A native thin-env
+repo setup probe confirmed dubious ownership (`ooBd2M`, exit 128). Selecting the
+owned fixture repository corrects the test context rather than weakening Git safety.
+
+The initial reviewer found no blocking source defect and requested the missing
+baseline/candidate timing record. Its four focused Linux checks were rerun with
+TMPDIR/TMP/TEMP unset: native `/tmp` was case-sensitive and all four passed in
+21,288.913 ms. The earlier worktree-TMPDIR invocation is superseded. The initial
+tester and auditor dispatches were cancelled; partial mutation artifacts are not
+complete sign-offs. Surviving or invalid mutants still require adjudication, and
+completion is not claimed by this record.
+
+The PR diff map's test area additionally includes these two coordinator fixture
+ports and the W0 verification-cwd correction. Their changes have no new production
+charge sites. All parent issue and C2–C8 boundaries remain unchanged.
