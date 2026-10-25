@@ -11131,7 +11131,7 @@ export class GitCache {
         throw new CloneRetainedByQuarantineError();
       }
       if (anchored) await checkSuccessor(anchored);
-      checkProcessProof();
+      if (!opts.completionSource) checkProcessProof();
       if (!verified && !opts.completionSource && still?.runId === ownerRunId && still.clonePath === clonePath) {
         await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
       }
@@ -11167,9 +11167,11 @@ export class GitCache {
     //    the canonical is already free and the journal already cleared, so a partial
     //    scratch rm is harmless residue.
     const { holding, scratch } = result;
-    checkProcessProof();
-    const protectedNow = await this.hasPhysicalTerminalProtection(ownerRunId) ||
-      (opts.completionSource !== undefined && !opts.completionSource.canDelete());
+    let protectedNow = false;
+    if (!opts.completionSource) {
+      checkProcessProof();
+      protectedNow = await this.hasPhysicalTerminalProtection(ownerRunId);
+    }
     // issue #2213: a latch that landed during the protection read keeps the holding and scratch dirs.
     if (!opts.completionSource && residueQuarantine() !== undefined) {
       unproven();
@@ -11191,6 +11193,8 @@ export class GitCache {
           throw new Error("completion disposal protection changed");
       };
       try {
+        checkProcessProof();
+        protectedNow = await this.hasPhysicalTerminalProtection(ownerRunId) || !opts.completionSource.canDelete();
         if (!result.renamed || !opts.discard) throw new Error("completion disposal was not established");
         open();
         if (holding && opts.discard) await fs.rm(holding, { recursive: true, force: true });

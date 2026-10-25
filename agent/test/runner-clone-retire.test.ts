@@ -2346,7 +2346,7 @@ describe("M2 Git retirement process proof", () => {
       const retirement = git.retireRunnerClone(bare, clonePath, branch, owner, {
         discard: phase !== "retained-copy", processProof: () => live,
       });
-      const rejected = assert.rejects(retirement);
+      const rejected = assert.rejects(retirement, /process proof revoked/);
       await entered.promise;
       live = false;
       release.resolve();
@@ -2355,6 +2355,93 @@ describe("M2 Git retirement process proof", () => {
       assert.equal(fs.readFileSync(path.join(clonePath, "proof.txt"), "utf8"), "owner-only bytes\n");
       assert.deepEqual(readJournal(bare, branch), journal);
     });
+  }
+
+  for (const revocation of ["sync", "microtask"] as const) {
+    for (const exdev of [false, true]) {
+      it(`completion post-move ${revocation} proof revocation restores attributed attempt (EXDEV=${exdev})`, async (t) => {
+        const owner = randomUUID(), branch = "agent/issue-2852";
+        const bare = await git.ensureClone(fx.originPath);
+        const attemptId = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "0123456789abcdef");
+        const clone = await git.createOrAttachRunnerClone(bare, 2852, noProofReseed, owner, false, undefined,
+          { attemptId, isLive: () => false, beforeSeed: async () => {} });
+        const clonePath = clone.path;
+        const bytes = Buffer.from("owner-only bytes\n");
+        fs.writeFileSync(path.join(clonePath, "proof.txt"), bytes);
+        await git.markRecoveryCapture(bare, clonePath, branch, owner, attemptId);
+        const command = (...args: string[]) => execFileSync("git", ["-C", bare, ...args],
+          { env: GIT_ENV, encoding: "utf8", stdio: "pipe" });
+        const journal = command("config", "--get", `uzi-recovery.${branch}.clone`);
+        const readLedger = () => command("config", "--get-all", `uzi-attempts.${branch}.entry`);
+        const ledger = readLedger();
+        const entries = ledger.trim().split("\n").map(raw => JSON.parse(raw) as {
+          attemptId: string; runId: string; clonePath: string; state: string;
+        });
+        assert.equal(entries.length, 1);
+        assert.deepEqual(entries[0], { attemptId, runId: owner, clonePath, state: "live" });
+        const head = await git.worktreeHead(clonePath);
+        assert.ok(head);
+        let live = true, armed = false, revokedAfterMove = false;
+        let movedTo: string | undefined;
+        const moves: { from: string; to: string }[] = [];
+        const disposals: string[] = [];
+        const rename = fsp.rename.bind(fsp);
+        t.mock.method(fsp, "rename", async (...args: Parameters<typeof fsp.rename>) => {
+          const from = String(args[0]), to = String(args[1]);
+          if (exdev && from === clonePath && path.dirname(to) === holdingRoot())
+            throw Object.assign(new Error("cross device"), { code: "EXDEV" });
+          await rename(...args);
+          moves.push({ from, to });
+          if (from === clonePath) movedTo = to;
+        });
+        const rm = fsp.rm.bind(fsp);
+        t.mock.method(fsp, "rm", async (...args: Parameters<typeof fsp.rm>) => {
+          if (args[1]?.recursive) disposals.push(String(args[0]));
+          return rm(...args);
+        });
+        const revoke = () => {
+          assert.ok(movedTo, "proof revocation follows a successful physical move");
+          assert.equal(fs.existsSync(clonePath), false, "canonical is absent when proof is revoked");
+          assert.equal(fs.readFileSync(path.join(movedTo, "proof.txt")).equals(bytes), true,
+            "holding/scratch contains the exact bytes when proof is revoked");
+          revokedAfterMove = true;
+          live = false;
+        };
+        await assert.rejects(git.retireRunnerClone(bare, clonePath, branch, owner, {
+          discard: true, attemptId, processProof: () => live,
+          completionSource: {
+            expectedHead: head,
+            canDelete: () => {
+              if (!armed && movedTo && !fs.existsSync(clonePath)) {
+                armed = true;
+                if (revocation === "sync") revoke();
+                else queueMicrotask(revoke);
+                assert.equal(live, revocation === "microtask", "microtask revocation waits until canDelete returns");
+              }
+              return true;
+            },
+          },
+        }), /process proof revoked/);
+        assert.equal(armed, true, "post-move canDelete observation was reached");
+        assert.equal(revokedAfterMove, true, "rejection was not an earlier fallback refusal");
+        assert.ok(movedTo);
+        if (exdev) {
+          assert.equal(path.basename(movedTo), "clone");
+          assert.match(path.basename(path.dirname(movedTo)), /^\.retire-/);
+          assert.equal(path.dirname(path.dirname(movedTo)), runnerRoot());
+        } else assert.equal(path.dirname(movedTo), holdingRoot());
+        assert.equal(moves.length, 2, "one successful move and one actual rollback rename");
+        assert.deepEqual(moves[0], { from: clonePath, to: movedTo });
+        assert.deepEqual(moves[1], { from: movedTo, to: clonePath });
+        assert.equal(fs.existsSync(movedTo), false);
+        assert.equal(fs.readFileSync(path.join(clonePath, "proof.txt")).equals(bytes), true);
+        assert.equal(await git.worktreeHead(clonePath), head);
+        assert.equal(command("config", "--get", `uzi-recovery.${branch}.clone`) === journal, true,
+          "entire recovery journal is unchanged");
+        assert.equal(readLedger() === ledger, true, "entire live ledger is unchanged; no retirement appended");
+        assert.equal(disposals.length, 0, "no successful-retirement recursive disposal was attempted");
+      });
+    }
   }
 
   it("no-bare removal rechecks the proof after pinned traversal awaits", async (t) => {
