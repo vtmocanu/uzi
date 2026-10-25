@@ -1,7 +1,27 @@
 #!/usr/bin/env bash
 # Lander-only real-image proof. No network Git, runtime-image override, or retries.
 set -euo pipefail
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+REPO="$(python3 -I - "${BASH_SOURCE[0]}" <<'PY'
+import os
+from pathlib import Path
+import sys
+import unicodedata
+
+def validate(value):
+    if any(unicodedata.category(c) in {"Cc", "Cf", "Cs", "Zl", "Zp"} for c in value):
+        raise ValueError("unsafe path")
+
+try:
+    validate(sys.argv[1])
+    validate(os.getcwd())
+    repo = str(Path(sys.argv[1]).resolve(strict=True).parents[2])
+    validate(repo)
+except (OSError, ValueError, RuntimeError, IndexError):
+    print("pod epoch proof FAIL: unsafe or unresolved checkout path", file=sys.stderr)
+    sys.exit(1)
+print(repo)
+PY
+)"
 cd "$REPO"
 die() { printf 'pod epoch proof FAIL: %s\n' "$*" >&2; exit 1; }
 HEAD_REQUIRED=${UZI_POD_EPOCH_PROOF_HEAD:?set the FINAL reviewed full 40-hex PR head}
@@ -58,6 +78,8 @@ run() {
     *-build|*-worker-uid) seconds=7220 ;;
   esac
   python3 -I - "$REPO" "$EVIDENCE" "$name" "$limit" "$seconds" "$@" <<'PY' || rc=$?
+import contextlib
+import io
 import json
 from pathlib import Path
 import sys
@@ -69,22 +91,51 @@ from bounded import REPORT_BYTES, capture
 limit = REPORT_BYTES if limit == "default" else int(limit)
 base = Path(evidence) / phase
 print(json.dumps({"kind": "command_phase", "phase": phase}), flush=True)
-rc = capture(['/bin/sh', '-c', 'exec "$@" 2>&1', 'proof', *argv],
-             str(base) + ".raw", float(seconds), limit)
+class DiagnosticBuffer:
+    # Keep only 64 KiB; overflow fails after capture has reaped its producer.
+    def __init__(self):
+        self.data = bytearray()
+        self.overflow = False
+
+    def write(self, text):
+        data = text.encode("utf-8", errors="backslashreplace")
+        available = 65536 - len(self.data)
+        self.data.extend(data[:available])
+        self.overflow |= len(data) > available
+        return len(text)
+
+    def flush(self):
+        pass
+
+diagnostics = DiagnosticBuffer()
+with contextlib.redirect_stderr(diagnostics):
+    rc = capture(['/bin/sh', '-c', 'exec "$@" 2>&1', 'proof', *argv],
+                 str(base) + ".raw", float(seconds), limit)
+if diagnostics.overflow:
+    rc = 125
 # Raw artifacts are opaque, untrusted binary. Only escaped records render.
 rendered = 0
 render_limit = limit * 8 + 65536
 with open(str(base) + ".raw", "rb") as raw, open(str(base) + ".log", "w", encoding="ascii") as log:
-    while chunk := raw.read(16384):
-        record = json.dumps({"kind": "command_output", "phase": phase,
-                             "text": chunk.decode("utf-8", errors="replace")},
-                            ensure_ascii=True) + "\n"
-        rendered += len(record)
-        if rendered > render_limit:
-            rc = rc or 125
-            break
-        log.write(record)
-        sys.stdout.write(record)
+    # Both streams use the same chunks and one shared rendered-byte allowance.
+    for kind, source in (("command_output", raw),
+                         ("capture_diagnostic", io.BytesIO(diagnostics.data))):
+        while chunk := source.read(16384):
+            record = json.dumps({"kind": kind, "phase": phase,
+                                 "text": chunk.decode("utf-8", errors="replace")},
+                                ensure_ascii=True) + "\n"
+            rendered += len(record)
+            if rendered > render_limit:
+                rc = rc or 125
+                break
+            log.write(record)
+            sys.stdout.write(record)
+    if diagnostics.overflow:
+        record = json.dumps({"kind": "capture_diagnostic", "phase": phase,
+                             "text": "helper diagnostic overflow: limit 65536 bytes"}) + "\n"
+        if rendered + len(record) <= render_limit:
+            log.write(record)
+            sys.stdout.write(record)
 print(json.dumps({"kind": "command_status", "phase": phase, "exit": rc}), flush=True)
 sys.exit(rc)
 PY

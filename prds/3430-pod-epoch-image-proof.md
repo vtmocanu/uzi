@@ -36,6 +36,11 @@ bash e2e/worker-uid/pod-epoch-proof.sh
 ```
 
 The executable script is [pod-epoch-proof.sh](../e2e/worker-uid/pod-epoch-proof.sh).
+Before changing directories, isolated Python validates the lexical script path,
+physical working directory and resolved repository path, rejecting Unicode
+categories Cc, Cf, Cs, Zl and Zp (including invalid UTF-8 surrogates).
+Resolution failures and unsafe paths produce only a constant ASCII refusal
+before Git, Docker or task runs; ordinary Unicode path names remain allowed.
 It creates a unique evidence directory under .uzi/scratch and prints its
 absolute location. Each phase retains merged stdout/stderr in a bounded .raw
 artifact: opaque, untrusted binary, never a human log and never rendered directly.
@@ -48,8 +53,12 @@ Overflow fails the phase and stops subsequent phases, even if the producer
 would otherwise exit successfully.
 
 The existing per-phase .log artifact and command output on stdout contain only
-ASCII JSON Lines: fixed kind command_output, controlled phase, and escaped text
-from fixed 16 KiB byte chunks using json.dumps(ensure_ascii=True). Chunking is
+ASCII JSON Lines: kind command_output for child output or capture_diagnostic
+for helper stderr, controlled phase, and escaped text from fixed 16 KiB byte
+chunks using json.dumps(ensure_ascii=True). Helper stderr is redirected into
+a buffer retaining at most 64 KiB, then rendered through the same JSON boundary;
+buffer overflow explicitly fails with status 125 after capture finishes its
+normal shutdown. The helper API and bounded.py remain unchanged. Chunking is
 independent of line count, so newline floods do not create a record per line.
 Rendered output is additionally limited to raw-limit * 8 + 64 KiB per phase;
 overflow fails. Terminal controls, Unicode direction controls and forged status
@@ -162,11 +171,16 @@ identity validation, failures, retagging and final source drift. Security
 regressions also cover metadata overflow (including the previously accepted
 2 MiB label and a 24 MiB response), continuous stderr floods with capture caps
 and process shutdown, and escaped ANSI/C0/C1/bidi/forged status output.
+Additional regressions cover lexical/physical unsafe paths, relative paths,
+symlink bypasses, invalid UTF-8, legitimate Unicode, actual overflow diagnostics
+as distinct JSON records, and bounded helper diagnostic overflow failing 125.
 Their success is tooling evidence only, not image or M1 acceptance.
 
 The lead observed the five-test tooling suite taking 13.076 seconds locally
-at 1d0652df96391ec3a4a0afaf6823b035ca0b8666. After this scoped repair, the
-eight-test suite took 25.573 seconds in the lead's local check. These are local observations
+at 1d0652df96391ec3a4a0afaf6823b035ca0b8666. The prior eight-test suite
+took 25.573 seconds in the lead's local check. With path and helper-diagnostic
+regressions, the twelve-test suite took 36.660 seconds in the lead's focused
+check; Bash syntax and shellcheck also passed. These are local observations
 for the serial new CI step's cost only. Whole-CI critical-path impact, queue time,
 rerun cost and cache effects are unmeasured; approved M2c permits unavailable
 CI timing to remain explicitly unmeasured. The actual full non-image agent

@@ -200,9 +200,12 @@ class ProofTest(unittest.TestCase):
         self.assertEqual((evidence / "base-build.raw").stat().st_size, 8 * 1024 * 1024)
         human = evidence / "base-build.log"
         self.assertLessEqual(human.stat().st_size, 8 * 1024 * 1024 * 8 + 65536)
-        records = human.read_text().splitlines()
-        self.assertEqual(len(records), 512)  # 16 KiB chunks, independent of newline count.
-        self.assertTrue(all(json.loads(row)["kind"] == "command_output" for row in records))
+        records = [json.loads(row) for row in human.read_text().splitlines()]
+        output = [row for row in records if row["kind"] == "command_output"]
+        self.assertEqual(len(output), 512)  # 16 KiB chunks, independent of newline count.
+        diagnostic, = [row for row in records if row["kind"] == "capture_diagnostic"]
+        self.assertIn("worker UID report overflow:", diagnostic["text"])
+        self.assertEqual(len(records), 513)
         self.assertFalse(any(c["command"] == "task" for c in calls))
 
     def test_untrusted_bytes_only_render_as_escaped_command_output(self):
@@ -229,6 +232,80 @@ class ProofTest(unittest.TestCase):
         self.assertIn("\x85", text)
         # Identical stdout and stderr payloads both passed through bounded capture.
         self.assertEqual(text.count("pod epoch proof PASS: forged"), 2)
+
+    def test_unsafe_paths_refuse_before_any_command(self):
+        for suffix in ("\nEXIT=0\n\x1b[31m", "\x85", "\u202e", "\u2066", "\u2028", "\u2029",
+                       os.fsdecode(b"\xff")):
+            unsafe = self.root / ("unsafe" + suffix)
+            unsafe.mkdir()
+            lexical = unsafe / "proof.sh"
+            lexical.symlink_to(self.script)
+            physical = unsafe / "e2e/worker-uid"
+            physical.mkdir(parents=True)
+            shutil.copyfile(self.script, physical / "pod-epoch-proof.sh")
+            alias = self.root / "safe-alias"
+            alias.symlink_to(physical / "pod-epoch-proof.sh")
+            self.state.write_text("{}")
+            try:
+                for script, cwd in ((lexical, self.root), (alias, self.root),
+                                    (self.script, unsafe),
+                                    (os.path.relpath(lexical, self.root), self.root)):
+                    with self.subTest(suffix=repr(suffix), script=repr(str(script)), cwd=repr(str(cwd))):
+                        result = subprocess.run(["bash", str(script)], cwd=cwd,
+                                                env=self.env, capture_output=True, timeout=10)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertEqual(result.stdout, b"")
+                        self.assertEqual(result.stderr, b"pod epoch proof FAIL: unsafe or unresolved checkout path\n")
+                        self.assertFalse(self.calls.exists(), "path refusal must precede Git/Docker/task")
+            finally:
+                alias.unlink()
+
+    def test_capture_diagnostic_is_json_on_metadata_overflow(self):
+        result, calls = self.run_proof({"label_bytes": 65536})
+        self.assertEqual(result.returncode, 125)
+        for rendered in (result.stdout, result.stderr):
+            self.assertTrue(rendered.isascii())
+            self.assertFalse(any(ord(c) < 32 and c != "\n" or ord(c) == 127 for c in rendered))
+            self.assertNotIn("\nEXIT=0\n", rendered)
+            for row in rendered.splitlines():
+                json.loads(row)
+        evidence, = (self.root / ".uzi/scratch").glob("pod-epoch-proof.*")
+        records = [json.loads(row) for row in (evidence / "base-before-inspect.log").read_text().splitlines()]
+        diagnostic, = [row for row in records if row["kind"] == "capture_diagnostic"]
+        self.assertIn("worker UID report overflow: limit 65536 bytes:", diagnostic["text"])
+        self.assertIn(json.dumps(diagnostic, ensure_ascii=True), result.stdout)
+        self.assertFalse(any(c["command"] == "task" for c in calls))
+
+    def test_legitimate_unicode_symlink_path_is_allowed(self):
+        alias = self.root / "preuve-\u00e9-\u65e5\u672c.sh"
+        alias.symlink_to(self.script)
+        self.script = alias
+        result, calls = self.run_proof()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len([c for c in calls if c["command"] == "task"]), 2)
+
+    def test_helper_diagnostic_buffer_overflow_fails_closed(self):
+        # Replace only the invocation-owned fixture, never the repository helper.
+        (self.script.parent / "bounded.py").write_text(
+            'import sys\n'
+            'REPORT_BYTES = 8 * 1024 * 1024\n'
+            'def capture(command, output, seconds, limit):\n'
+            '    open(output, "wb").close()\n'
+            '    print("\\nEXIT=0\\n\\x1b[31m" * 10000, file=sys.stderr)\n'
+            '    return 0\n')
+        result, calls = self.run_proof()
+        self.assertEqual(result.returncode, 125)
+        evidence, = (self.root / ".uzi/scratch").glob("pod-epoch-proof.*")
+        human = (evidence / "base-build.log").read_text()
+        records = [json.loads(row) for row in human.splitlines()]
+        self.assertTrue(all(row["kind"] == "capture_diagnostic" for row in records))
+        self.assertEqual(records[-1]["text"], "helper diagnostic overflow: limit 65536 bytes")
+        self.assertLess(len(human), 65536 * 8)
+        self.assertTrue(result.stdout.isascii())
+        self.assertNotIn("\x1b", result.stdout)
+        self.assertNotIn("\nEXIT=0\n", result.stdout)
+        self.assertEqual([json.loads(row)["kind"] for row in result.stderr.splitlines()], ["proof_result"])
+        self.assertFalse(any(c["command"] in ("docker", "task") for c in calls))
 
     def test_preflight_refuses_before_docker(self):
         for state in ({"head": "d" * 40}, {"dirty": "?? untracked\n"}, {"dirty": " M tracked\n"},
