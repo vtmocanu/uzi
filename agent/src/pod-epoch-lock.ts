@@ -1,54 +1,17 @@
-import { createRequire } from "node:module";
-import type * as fs from "node:fs";
-import type { spawn } from "node:child_process";
+import * as fs from "node:fs";
+import { createRuntime } from "../templates/pod-epoch-init.cjs";
+import type { createRuntime as CreateRuntime, PodEpochOwnership } from "../templates/pod-epoch-init.d.cts";
 
-type HelperResult = { code: number; output: string };
-type OwnershipMode = "shared" | "exclusive" | "unsupported";
+export type { PodEpochOwnership } from "../templates/pod-epoch-init.d.cts";
 
-export interface PodEpochOwnership {
-  readonly mode: OwnershipMode;
-  consume(podUid: string): Promise<{
-    result: "fresh" | "existing" | "full";
-    mayEvaluate: boolean;
-  }>;
-  /** Corroboration only, and never true without exclusive epoch ownership. */
-  matchesEntry(current: string, previous: string): boolean;
-  /** Admission stays closed until this resolves; closes EX before opening SH. */
-  reacquireShared(): Promise<void>;
-  close(): void;
-}
-
-/** Overrides are for hermetic tests; production uses /data, uid/gid10001 and /usr/bin/flock. */
-interface RuntimeOptions {
-  root?: string;
-  uid?: number;
-  gid?: number;
-  io?: typeof fs;
-  spawnProcess?: typeof spawn;
-  now?: () => number;
-  sleep?: (ms: number, signal?: AbortSignal) => Promise<unknown>;
-  run?: (args: string[], fd: number | undefined, signal: AbortSignal | undefined, deadline: number) => Promise<HelperResult>;
-}
-
-interface PodEpochRuntime {
-  /** M1 callers leave firstMode unset. Exclusive is reserved for the future verdict pass. */
-  acquire(options?: { firstMode?: "shared" | "exclusive"; signal?: AbortSignal }): Promise<PodEpochOwnership>;
-  seed(podUid: string, signal?: AbortSignal): Promise<"updated" | "busy" | "unsupported" | "invalid">;
-  prepare(): string;
-  hold(expected: string, fd?: number, signal?: AbortSignal): Promise<void>;
-}
-
-// The exact same implementation runs before Node worker startup without tsx.
-const require = createRequire(import.meta.url);
-const { createRuntime } = require("../templates/pod-epoch-init.cjs");
-
-export const createPodEpoch = createRuntime as (options?: RuntimeOptions) => PodEpochRuntime;
+// Load the shared plain CJS implementation before the main bootstrap snapshot.
+export const createPodEpoch: typeof CreateRuntime = createRuntime;
 
 /** Call only after acquiring epoch ownership, before ensureRunnerTmpdir or writers. */
 export function restoreEpochRuntimeTmpdir(
   ownership: PodEpochOwnership,
   environment: NodeJS.ProcessEnv = process.env,
-  io: typeof fs = require("node:fs") as typeof fs,
+  io: typeof fs = fs,
 ): void {
   // Consult the live handle, including unsupported-storage participants.
   if (!["shared", "exclusive", "unsupported"].includes(ownership.mode)) {
