@@ -4384,6 +4384,8 @@ export class RecoveryCoordinator {
         .sort((a, b) => Number(!!a.finalAcknowledged) - Number(!!b.finalAcknowledged))) await unlink(this.recordPath(record));
       await unlink(this.recordPath(ack));
       await ownedRecoveryIO(() => fs.rmdir(this.runDir(runId))).catch(() => undefined);
+      const witness = this.completionCleanupWitnesses.get(`${runId}:${generation}`);
+      if (witness) witness.fullyForgotten = true;
       this.onCompletionGenerationForgotten?.(runId, generation);
     });
     await this.submitRedundancyClaims(claims, budget);
@@ -4488,6 +4490,36 @@ export class RecoveryCoordinator {
   async inspect(runId: string): Promise<RecoveryRecord[]> {
     if (!this.enabled) return [];
     return this.listRecords(runId);
+  }
+
+  // Only active runner binders retain this evidence; idle generations leave no tombstone.
+  private readonly completionCleanupWitnesses = new Map<string, { fullyForgotten: boolean; active: number }>();
+
+  registerCompletionCleanupWitness(runId: string, generation: number): {
+    fullyForgotten(): boolean; release(): void;
+  } {
+    const key = `${runId}:${generation}`;
+    let group = this.completionCleanupWitnesses.get(key);
+    if (!group) {
+      group = { fullyForgotten: false, active: 0 };
+      this.completionCleanupWitnesses.set(key, group);
+    }
+    group.active++;
+    const shared = group;
+    let released = false;
+    return {
+      fullyForgotten: () => !released && shared.fullyForgotten,
+      release: () => {
+        if (released) return;
+        released = true;
+        if (--shared.active === 0) this.completionCleanupWitnesses.delete(key);
+      },
+    };
+  }
+
+  private invalidateCompletionCleanupWitness(record: RecoveryRecord): void {
+    const group = this.completionCleanupWitnesses.get(`${record.runId}:${record.generation}`);
+    if (group) group.fullyForgotten = false;
   }
 
   async bindCompletionSource(source: CompletionSource): Promise<boolean> {
@@ -4807,6 +4839,7 @@ export class RecoveryCoordinator {
 
   /** Atomic rename with a fresh MAC (0600 file, 0700 dir). The caller holds this run's journal lock. */
   private async writeRecordUnlocked(record: RecoveryRecord): Promise<void> {
+    this.invalidateCompletionCleanupWitness(record);
     if (!this.key) throw new Error("recovery: MAC key unavailable");
     const mac = this.computeMac(record);
     const dir = this.runDir(record.runId);
@@ -4821,6 +4854,7 @@ export class RecoveryCoordinator {
    * The caller owns the journal lock and has durably indexed this immutable ID. */
   private async writeProducerOriginUnlocked(record: RecoveryRecord, check: () => void,
     fresh: () => Promise<void>): Promise<void> {
+    this.invalidateCompletionCleanupWitness(record);
     const sync = async (dir: string) => {
       check();
       const handle = await fs.open(dir, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);

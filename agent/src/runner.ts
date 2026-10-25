@@ -3741,8 +3741,14 @@ export class RunRunner {
       // Install before the durable write: false/throw may already have persisted part of the cohort.
       const binding = this.rememberCompletionSource(source, flight, executor, terminalSource);
       this.completionSourceBinds.add(binding);
+      const witness = this.recovery.registerCompletionCleanupWitness(context.runId, context.generation);
       try { await this.recovery.bindCompletionSource(source); }
-      finally { this.completionSourceBinds.delete(binding); }
+      finally {
+        this.completionSourceBinds.delete(binding);
+        try {
+          if (witness.fullyForgotten()) this.forgetCompletionSourceBindings(context.runId, context.generation);
+        } finally { witness.release(); }
+      }
     } catch (err) {
       flight.runLog.warn("recovery: completion source provenance unavailable; deletion remains protected", { error: errMessage(err) });
     }

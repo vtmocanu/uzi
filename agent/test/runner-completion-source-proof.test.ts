@@ -4,6 +4,8 @@ import { execFileSync } from "node:child_process";
 import type { CompletionSource, RecoveryCoordinator, RecoveryRecord } from "../src/recovery.js";
 import type { Executor } from "../src/executor.js";
 import type { CodexExecutionSafety } from "../src/harness.js";
+import { RunDiskLocks } from "../src/run-disk-locks.js";
+import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import { mintAttemptId } from "../src/run-quiescence.js";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
@@ -217,7 +219,8 @@ it("M3 private legacy positive: known Claude source retains legacy cleanup", { s
 
 // Lifecycle controls: the authenticated coordinator and runner callback are real;
 // the physical Git cleanup is stubbed, so these cases do not attest process proof.
-for (const outcome of ["success", "partial-retry", "pending-bind"] as const) {
+for (const outcome of ["success", "partial-retry", "pending-bind", "concurrent-binds", "late-bind",
+  "normal-success", "normal-failure", "normal-uncertain", "producer-success", "producer-failure", "producer-uncertain"] as const) {
   it(`fallback binding lifecycle: ${outcome}`, async t => {
     const f = await setup();
     const group = f.claim.run_id + ":29";
@@ -254,26 +257,59 @@ for (const outcome of ["success", "partial-retry", "pending-bind"] as const) {
     f.remember(siblingRun);
     const siblingGroups = [...f.p.completionSourceBindings].filter(([key]) => key !== group);
 
-    const cleanup = t.mock.method(git, "cleanupRecoveryGeneration", async () => "removed" as const);
+    const holdsBind = !["success", "partial-retry"].includes(outcome);
+    const cleanupEntered = barrier(), cleanupRelease = barrier();
+    const cleanup = t.mock.method(git, "cleanupRecoveryGeneration", async () => {
+      cleanupEntered.open();
+      if (holdsBind) await cleanupRelease.wait;
+      return "removed" as const;
+    });
     const unlink = fsp.unlink.bind(fsp);
     const refusal = outcome === "partial-retry" ? t.mock.method(fsp, "unlink", async (target: Parameters<typeof fsp.unlink>[0]) => {
       if (String(target) === ackFile) throw new Error("deliberate fallback ACK unlink failure");
       return unlink(target);
     }) : undefined;
-    let releaseBind: (() => void) | undefined;
-    let pending: Promise<void> | undefined;
-    if (outcome === "pending-bind") {
-      let entered!: () => void;
-      const started = new Promise<void>(resolve => { entered = resolve; });
-      const held = new Promise<void>(resolve => { releaseBind = resolve; });
-      t.mock.method(f.p.recovery, "bindCompletionSource", async () => {
-        entered();
-        await held;
-        return true;
-      });
-      pending = f.p.bindCompletionSource(f.flight);
-      await started;
-      assert.equal(f.p.completionSourceBinds.has(original), true, "real binder is held before its durable write");
+    const binders: Array<{ installed: ReturnType<typeof barrier>; acquired: ReturnType<typeof barrier>;
+      release: ReturnType<typeof barrier>; pending?: Promise<void> }> = [];
+    const acquire = RunDiskLocks.prototype.acquire;
+    const bindResults: boolean[] = [];
+    const bind = f.p.recovery.bindCompletionSource.bind(f.p.recovery);
+    t.mock.method(f.p.recovery, "bindCompletionSource", async (source: CompletionSource) => {
+      const result = await bind(source);
+      bindResults.push(result);
+      return result;
+    });
+    let nextBinder = 0;
+    t.mock.method(RunDiskLocks.prototype, "acquire", async function (this: RunDiskLocks,
+      key: string, signal?: AbortSignal) {
+      const gate = key === path.resolve(git.recoveryRoot, f.claim.run_id) ? binders[nextBinder] : undefined;
+      const tails = (this as unknown as { tails: Map<string, Promise<void>> }).tails;
+      const before = tails.get(key);
+      const result = acquire.call(this, key, signal);
+      if (!gate) return result;
+      nextBinder++;
+      assert.notEqual(tails.get(key), before, "real acquire installed the journal-lock waiter synchronously");
+      gate.installed.open();
+      const release = await result;
+      gate.acquired.open();
+      await gate.release.wait; // Own the real lock, but delay the real binder body.
+      return release;
+    });
+    const startBinder = async () => {
+      const gate = { installed: barrier(), acquired: barrier(), release: barrier(), pending: undefined as Promise<void> | undefined };
+      binders.push(gate);
+      gate.pending = f.p.bindCompletionSource(f.flight);
+      await gate.installed.wait;
+      return gate;
+    };
+    const controlWitness = holdsBind ? undefined : f.p.recovery.registerCompletionCleanupWitness(f.claim.run_id, 29);
+    let forgetting: Promise<void> | undefined;
+    if (holdsBind) {
+      forgetting = f.p.recovery.forgetGeneration(f.claim.run_id, 29);
+      await cleanupEntered.wait;
+      await startBinder();
+      if (outcome === "concurrent-binds") await startBinder();
+      assert.ok(f.p.completionSourceBinds.size, "actual runner binders wait on fallback's journal lock");
     }
     try {
       if (refusal) {
@@ -281,17 +317,24 @@ for (const outcome of ["success", "partial-retry", "pending-bind"] as const) {
         assert.equal(f.p.classifyCompletionSource(f.source).kind, "knownCodex");
         assert.equal(f.p.completionSourceBindings.get(group)?.length, 4, "partial failure retains the full group");
         assert.ok(fs.existsSync(ackFile));
+        assert.equal(controlWitness!.fullyForgotten(), false, "partial ACK unlink never proves cleanup");
         for (const binding of [original, advanced, conflicting])
           assert.equal(f.p.conflictedCompletionSources.has(binding), true);
         refusal.mock.restore();
       }
-      await f.p.recovery.forgetGeneration(f.claim.run_id, 29);
+      cleanupRelease.open();
+      if (forgetting) await forgetting;
+      else await f.p.recovery.forgetGeneration(f.claim.run_id, 29);
+      if (holdsBind) await binders[0]!.acquired.wait;
       assert.equal(cleanup.mock.callCount(), refusal ? 2 : 1);
-      assert.deepEqual(await f.p.recovery.inspect(f.claim.run_id), []);
+      if (!holdsBind) {
+        assert.deepEqual(await f.p.recovery.inspect(f.claim.run_id), []);
+        assert.equal(controlWitness!.fullyForgotten(), true);
+      }
       assert.equal(fs.existsSync(ackFile), false);
-      if (pending) {
+      if (holdsBind) {
         const retained = f.p.completionSourceBindings.get(group)!;
-        assert.equal(retained.length, 3);
+        assert.equal(retained.length, 3 + binders.length - 1);
         for (const binding of [original, advanced, conflicting]) {
           assert.equal(retained.includes(binding), true);
           assert.equal(f.p.conflictedCompletionSources.has(binding), true);
@@ -301,6 +344,69 @@ for (const outcome of ["success", "partial-retry", "pending-bind"] as const) {
         const inventory = t.mock.method(git, "readInventoryCloneHeads", async () => assert.fail("pending provenance used legacy inventory"));
         assert.equal(await f.p.withCompletionSourceBoundary(f.source, async () => assert.fail("pending bind deleted")), "retained");
         assert.equal(inventory.mock.callCount(), 0);
+        if (outcome === "late-bind") await startBinder();
+        const recreated = outcome.startsWith("normal-") || outcome.startsWith("producer-");
+        if (recreated) {
+          const witness = f.p.recovery.registerCompletionCleanupWitness(f.claim.run_id, 29);
+          assert.equal(witness.fullyForgotten(), true, "late lease inherits shared proof");
+          const writer = f.p.recovery as unknown as JournalWriter;
+          const producer = outcome.startsWith("producer-");
+          const firstIO = producer ? "lstat" : "mkdir";
+          const originalIO = fsp[firstIO].bind(fsp);
+          let ioSeen = false;
+          const first = t.mock.method(fsp, firstIO, async (...args: unknown[]) => {
+            ioSeen = true;
+            assert.equal(witness.fullyForgotten(), false, "write invalidates BEFORE its first IO await");
+            if (outcome.endsWith("failure")) throw new Error("deliberate first IO failure");
+            return (originalIO as (...args: unknown[]) => Promise<unknown>)(...args);
+          });
+          const rename = fsp.rename.bind(fsp);
+          const uncertain = outcome.endsWith("uncertain") ? t.mock.method(fsp, "rename", async (...args: Parameters<typeof fsp.rename>) => {
+            await rename(...args);
+            throw new Error("deliberate uncertain rename after persistence");
+          }) : undefined;
+          try {
+            const writing = producer
+              ? MaintenanceBudget.runProducer(() => writer.writeProducerOriginUnlocked(frozen, () => {}, async () => {}))
+              : writer.writeRecordUnlocked(frozen);
+            assert.equal(witness.fullyForgotten(), false, "invalidation is synchronous at writer entry");
+            if (outcome.endsWith("success")) await writing;
+            else await assert.rejects(writing, /deliberate/);
+            assert.equal(ioSeen, true);
+            assert.equal(witness.fullyForgotten(), false);
+          } finally {
+            first.mock.restore(); uncertain?.mock.restore(); witness.release(); witness.release();
+          }
+        }
+        for (const [i, binder] of binders.entries()) {
+          await binder.acquired.wait;
+          binder.release.open();
+          await binder.pending;
+          if (i + 1 < binders.length) {
+            const retained = f.p.completionSourceBindings.get(group)!;
+            for (const binding of [original, advanced, conflicting]) {
+              assert.equal(retained.includes(binding), true, "another matching binder retains every identity version");
+              assert.equal(f.p.conflictedCompletionSources.has(binding), true);
+            }
+          }
+        }
+        if (recreated) {
+          const retained = f.p.completionSourceBindings.get(group)!;
+          assert.ok(retained?.length, "recreation invalidates cleanup proof even on failed/uncertain writes");
+          for (const binding of [original, advanced, conflicting]) {
+            assert.equal(retained.includes(binding), true);
+            assert.equal(f.p.conflictedCompletionSources.has(binding), true);
+          }
+          assert.equal(f.p.classifyCompletionSource(f.source).kind, "knownCodex");
+        } else {
+          assert.deepEqual(bindResults, binders.map(() => false), "each real binder finds empty records and returns false");
+          assert.deepEqual(await f.p.recovery.inspect(f.claim.run_id), []);
+          assert.equal(f.p.completionSourceBindings.has(group), false, "settled real binders release the fully forgotten generation");
+          for (const binding of [original, advanced, conflicting, other])
+            assert.equal(f.p.conflictedCompletionSources.has(binding), false, "settlement removes identity conflicts");
+        }
+        assert.equal(inventory.mock.callCount(), 0);
+
       } else {
         assert.equal(f.p.completionSourceBindings.has(group), false, "full cleanup, including retry, drops the flight/executor group");
         for (const binding of [original, advanced, conflicting, other])
@@ -309,8 +415,64 @@ for (const outcome of ["success", "partial-retry", "pending-bind"] as const) {
       for (const [key, bindings] of siblingGroups)
         assert.equal(f.p.completionSourceBindings.get(key), bindings, "sibling run/generation remains unchanged");
     } finally {
-      releaseBind?.();
-      await pending;
+      cleanupRelease.open();
+      for (const gate of binders) gate.release.open();
+      await Promise.all(binders.map(gate => gate.pending));
+      await forgetting;
+      controlWitness?.release(); controlWitness?.release();
+    }
+    // Behavioral cases deliberately use only pre-existing APIs, so they can be copied to the base.
+    if (outcome !== "pending-bind" && outcome !== "concurrent-binds" && outcome !== "late-bind") {
+      const internals = f.p.recovery as unknown as { completionCleanupWitnesses: Map<string, unknown> };
+      assert.equal(internals.completionCleanupWitnesses.size, 0, "last release removes shared evidence");
+      const fresh = f.p.recovery.registerCompletionCleanupWitness(f.claim.run_id, 29);
+      assert.equal(fresh.fullyForgotten(), false, "a new group cannot inherit a tombstone");
+      fresh.release();
     }
   });
 }
+
+function barrier() {
+  let open!: () => void;
+  const wait = new Promise<void>(resolve => { open = resolve; });
+  return { wait, open };
+}
+
+interface JournalWriter {
+  writeRecordUnlocked(record: RecoveryRecord): Promise<void>;
+  writeProducerOriginUnlocked(record: RecoveryRecord, check: () => void, fresh: () => Promise<void>): Promise<void>;
+}
+
+for (const result of ["false", "throw"] as const) {
+  it(`cleanup witness: unproven ${result} binder preserves provenance and releases its lease`, async t => {
+    const f = await setup();
+    t.mock.method(f.p.recovery, "bindCompletionSource", async () => {
+      if (result === "throw") throw new Error("deliberate unproven bind failure");
+      return false;
+    });
+    await f.p.bindCompletionSource(f.flight);
+    assert.equal(f.p.classifyCompletionSource(f.source).kind, "knownCodex");
+    assert.equal(f.p.completionSourceBinds.size, 0);
+    const internals = f.p.recovery as unknown as { completionCleanupWitnesses: Map<string, unknown> };
+    assert.equal(internals.completionCleanupWitnesses.size, 0);
+  });
+}
+
+it("cleanup witness: empty cleanup never proves; leases are exact, idempotent and bounded", async () => {
+  const f = await setup();
+  const internals = f.p.recovery as unknown as { completionCleanupWitnesses: Map<string, unknown> };
+  for (let generation = 29; generation < 39; generation++) {
+    const a = f.p.recovery.registerCompletionCleanupWitness(f.claim.run_id, generation);
+    const b = f.p.recovery.registerCompletionCleanupWitness(f.claim.run_id, generation);
+    const sibling = f.p.recovery.registerCompletionCleanupWitness("33333333-3333-4333-8333-333333333333", generation);
+    await f.p.recovery.forgetGeneration(f.claim.run_id, generation);
+    assert.equal(a.fullyForgotten(), false);
+    assert.equal(b.fullyForgotten(), false);
+    assert.equal(sibling.fullyForgotten(), false);
+    a.release(); a.release();
+    assert.equal(a.fullyForgotten(), false);
+    assert.equal(internals.completionCleanupWitnesses.size, 2);
+    b.release(); sibling.release();
+    assert.equal(internals.completionCleanupWitnesses.size, 0);
+  }
+});
