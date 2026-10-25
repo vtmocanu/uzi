@@ -304,17 +304,21 @@ type tuiModel struct {
 	// splitLatch changes only on resize; bottomTab survives collapse and drill-ins.
 	splitLatch, splitOff, fromSplit bool
 	splitMode                       string
-	topTab                          tuiView
-	bottomTab                       tuiView
-	boardReplied                    bool
-	splitNote                       string
-	workerDetail                    workerDetailState
-	workerOrigin                    workerOrigin
-	workerNav                       workerNavigation
-	workerGen                       uint64
-	workers                         workersState
-	board                           boardState
-	detail                          detailState
+	// milestoneNumbers and railMinWidth are the validated [tui] milestone_numbers / rail_min_width,
+	// read once at startup (tuiConfigPrefs). railMinWidth 0 means the default laneRailWidth floor.
+	milestoneNumbers bool
+	railMinWidth     int
+	topTab           tuiView
+	bottomTab        tuiView
+	boardReplied     bool
+	splitNote        string
+	workerDetail     workerDetailState
+	workerOrigin     workerOrigin
+	workerNav        workerNavigation
+	workerGen        uint64
+	workers          workersState
+	board            boardState
+	detail           detailState
 	// pulls is the forge `pulls` screen's state (PRD #1255 M4a). It carries its OWN
 	// reqSeq/waitID/tickGen poll-guard counters (a copy of the board's chain, not a share)
 	// so the two lists poll independently.
@@ -1757,7 +1761,7 @@ func (m tuiModel) filtering() bool {
 }
 
 func (m tuiModel) transcriptWidth() int {
-	w := m.width - laneRailWidth - 6
+	w := m.width - m.railWidth() - railChromeCols
 	if w < 20 {
 		w = 20
 	}
@@ -1823,46 +1827,116 @@ func (m tuiModel) renderHelp() string {
 		m.pal.faint.Render("any key returns")
 }
 
-// tuiSplitConfigMode validates the real TUI's preference before opening a screen.
+// tuiPrefs is the real TUI's validated [tui] config.
+type tuiPrefs struct {
+	split            string
+	milestoneNumbers bool
+	railMinWidth     int
+	blink            bool
+}
+
+// tuiConfigPrefs validates the real TUI's preferences before opening a screen.
 // Demo and sketch return before this call, so their layout remains automatic.
-func tuiSplitConfigMode(store *uzicli.Store) (string, error) {
+func tuiConfigPrefs(store *uzicli.Store) (tuiPrefs, error) {
+	prefs := tuiPrefs{split: "auto", railMinWidth: laneRailWidth, blink: true}
 	if store == nil {
-		return "auto", nil
+		return prefs, nil
 	}
 	cfg, err := store.LoadConfig()
 	if err != nil {
 		// A valid TOML value of the wrong type fails typed decoding before
-		// Split can be validated. Inspect that one key without changing how
-		// unrelated config errors are reported.
-		if body, readErr := os.ReadFile(filepath.Join(store.Dir(), "config.toml")); readErr == nil {
-			var raw map[string]any
-			if decodeErr := toml.Unmarshal(body, &raw); decodeErr == nil {
-				if section, ok := raw["tui"].(map[string]any); ok {
-					if value, present := section["split"]; present {
-						if split, isString := value.(string); isString && (split == "" || split == "auto" || split == "off") {
-							return "", err
-						}
-						return "", tuiSplitValueError(store, fmt.Sprint(value))
-					}
-				}
-			}
+		// the [tui] keys can be validated. Inspect those keys without changing
+		// how unrelated config errors are reported.
+		if valueErr := tuiRawValueError(store); valueErr != nil {
+			return tuiPrefs{}, valueErr
 		}
-		return "", err
+		return tuiPrefs{}, err
 	}
 	switch cfg.TUI.Split {
 	case "", "auto":
-		return "auto", nil
 	case "off":
-		return "off", nil
+		prefs.split = "off"
 	default:
-		return "", tuiSplitValueError(store, cfg.TUI.Split)
+		return tuiPrefs{}, tuiSplitValueError(store, cfg.TUI.Split)
 	}
+	prefs.milestoneNumbers = cfg.TUI.MilestoneNumbers
+	if cfg.TUI.Blink != nil {
+		prefs.blink = *cfg.TUI.Blink
+	}
+	if w := cfg.TUI.RailMinWidth; w != nil {
+		if *w < laneRailWidth {
+			return tuiPrefs{}, tuiRailMinWidthValueError(store, itoa(*w))
+		}
+		prefs.railMinWidth = *w
+	}
+	return prefs, nil
+}
+
+// tuiRawValueError names a [tui] key whose TOML type makes the typed decode fail, or returns nil.
+func tuiRawValueError(store *uzicli.Store) error {
+	body, err := os.ReadFile(filepath.Join(store.Dir(), "config.toml"))
+	if err != nil {
+		return nil
+	}
+	var raw map[string]any
+	if toml.Unmarshal(body, &raw) != nil {
+		return nil
+	}
+	section, ok := raw["tui"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	if value, present := section["split"]; present {
+		if split, isString := value.(string); !isString || (split != "" && split != "auto" && split != "off") {
+			return tuiSplitValueError(store, fmt.Sprint(value))
+		}
+	}
+	if value, present := section["milestone_numbers"]; present {
+		if _, isBool := value.(bool); !isBool {
+			return tuiMilestoneNumbersValueError(store, fmt.Sprint(value))
+		}
+	}
+	if value, present := section["blink"]; present {
+		if _, isBool := value.(bool); !isBool {
+			return tuiBlinkValueError(store, fmt.Sprint(value))
+		}
+	}
+	if value, present := section["rail_min_width"]; present {
+		if _, isInt := value.(int64); !isInt {
+			return tuiRailMinWidthValueError(store, fmt.Sprint(value))
+		}
+	}
+	return nil
 }
 
 func tuiSplitValueError(store *uzicli.Store, value string) error {
 	return uzicli.Exitf(uzicli.ExitUsage,
 		"%s: [tui] split=%q; accepted values are \"auto\" or \"off\"",
 		filepath.Join(store.Dir(), "config.toml"), value)
+}
+
+func tuiMilestoneNumbersValueError(store *uzicli.Store, value string) error {
+	return uzicli.Exitf(uzicli.ExitUsage,
+		"%s: [tui] milestone_numbers=%s; accepted values are true or false",
+		filepath.Join(store.Dir(), "config.toml"), value)
+}
+
+func tuiBlinkValueError(store *uzicli.Store, value string) error {
+	return uzicli.Exitf(uzicli.ExitUsage,
+		"%s: [tui] blink=%s; accepted values are true or false",
+		filepath.Join(store.Dir(), "config.toml"), value)
+}
+
+// tuiNoBlink is the reduced-motion opt-out: UZI_TUI_NO_BLINK=1 or [tui] blink = false. Either one
+// pins the static frame; neither can re-enable motion the other turned off.
+func tuiNoBlink(prefs tuiPrefs) bool {
+	return os.Getenv("UZI_TUI_NO_BLINK") == "1" || !prefs.blink
+}
+
+func tuiRailMinWidthValueError(store *uzicli.Store, value string) error {
+	return uzicli.Exitf(uzicli.ExitUsage,
+		"%s: [tui] rail_min_width=%s; accepted values are whole numbers of at least %d",
+		filepath.Join(store.Dir(), "config.toml"), value, laneRailWidth)
 }
 
 // newTUICmd wires `uzi tui [run-id]`.
@@ -1895,7 +1969,7 @@ func newTUICmd(env Env, gf *globalFlags) *cobra.Command {
 			if cmd.Flags().Changed("sketch") {
 				return runTUISketch(cmd.Context(), env, sketch)
 			}
-			mode, err := tuiSplitConfigMode(env.Store)
+			prefs, err := tuiConfigPrefs(env.Store)
 			if err != nil {
 				return err
 			}
@@ -1908,7 +1982,9 @@ func newTUICmd(env Env, gf *globalFlags) *cobra.Command {
 				runID = args[0]
 			}
 			m := newTUIModel(cmd.Context(), c, runID)
-			m.splitMode = mode
+			m.splitMode = prefs.split
+			m.milestoneNumbers = prefs.milestoneNumbers
+			m.railMinWidth = prefs.railMinWidth
 			// Gate the footer version readout and its auto-probe. showVersion is the off-switch
 			// gate alone (versionCheckEnabled: the injection/quiet/env switches) and governs
 			// whether the readout renders — a `dev` build still shows its version. The auto-probe
@@ -1919,7 +1995,7 @@ func newTUICmd(env Env, gf *globalFlags) *cobra.Command {
 			m.skewCheck = enabled && uzicli.IsStampedVersion(version)
 			// The reduced-motion opt-out is read ONCE here, with the CLI's os.Getenv idiom
 			// (root.go), never per render (PRD #1064 D4).
-			m.noBlink = os.Getenv("UZI_TUI_NO_BLINK") == "1"
+			m.noBlink = tuiNoBlink(prefs)
 			// The startup update prompt's seams (PRD #1251 M1), assigned like showVersion above:
 			// the brew shell-out, the config store for the per-version dismissal, and the resolved
 			// server URL the dismissal is keyed under. resolveSettings already succeeded inside

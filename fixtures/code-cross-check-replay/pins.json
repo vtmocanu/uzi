@@ -1,0 +1,15 @@
+{
+  "corpus_version": "2026-10-23.1",
+  "brief_sha256": {
+    "codex": "29e410c44476fb6e2560fd03c2d990de24cee2193e6df6c250085cb1b39252a5",
+    "claude": "27f677678fbf3ffb78c08ec6d5549ca4ceaf722b6997e8599a5fe03092413192"
+  },
+  "reader_implementation": {
+    "codex": "codex fileop Read+Search",
+    "claude": "claude sdk Read+Grep+Glob"
+  },
+  "credential_mode": {
+    "codex": "api_key",
+    "claude": "oauth_token"
+  }
+}

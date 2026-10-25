@@ -75,6 +75,9 @@ export function IssueDraftCard({
 }) {
   const demo = useDemoMode();
   const sendHelpId = useId();
+  // Label ids, so each field has an accessible name even with several cards on one page (#3410).
+  const titleId = useId();
+  const descriptionId = useId();
   const needsRepo = repos !== undefined;
 
   const [seed, setSeed] = useState<IssueDraftSeed | null>(null);
@@ -220,13 +223,14 @@ export function IssueDraftCard({
 
             {/* Inert text (never Markdown): the server re-sanitises at the POST boundary. */}
             <div className="space-y-1">
-              <label className="block text-xs text-muted">Title</label>
-              <Input value={title} onChange={(e) => setTitle(e.target.value)} />
+              <label htmlFor={titleId} className="block text-xs text-muted">Title</label>
+              <Input id={titleId} value={title} onChange={(e) => setTitle(e.target.value)} />
             </div>
 
             <div className="space-y-1">
-              <label className="block text-xs text-muted">Description</label>
+              <label htmlFor={descriptionId} className="block text-xs text-muted">Description</label>
               <Textarea
+                id={descriptionId}
                 rows={10}
                 value={description}
                 onChange={(e) => setDescription(e.target.value)}

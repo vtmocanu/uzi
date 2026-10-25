@@ -421,6 +421,13 @@ export class FakeApi {
   completionAttemptWire: ((body: Record<string, unknown>) => Record<string, unknown>) | undefined;
   readonly completionAttemptRequests: Record<string, unknown>[] = [];
   completionPermitScope: NonNullable<CompletionPermitResponse["permit"]>["completion_scope"] = {};
+  /** Value-level knobs (PRD #1232 M2): the server-authoritative unmet milestone ids the attempt
+   *  reply carries (default none) and, on a permit denial, the `unmet` ids; plus the granted
+   *  permit's id (default `permit-<runId>`). Unlike the *Wire hooks they leave the reply shape
+   *  to the fake, so a wire-parity test can compare the fake's own bytes to a recorded fixture. */
+  private completionAttemptUnmet: string[] = [];
+  private completionPermitDenyUnmet: string[] | undefined;
+  private completionPermitId: string | undefined;
   private completionPermitGranted = true;
   private completionPermitDenyReason: string | undefined;
   private completionPermitHttpStatus = 200;
@@ -1098,6 +1105,21 @@ export class FakeApi {
     this.completionPermitFailTimes = opts.failTimes;
   }
 
+  /** Value-level: the unmet milestone ids the next completion-attempt replies carry. */
+  setCompletionAttemptUnmet(ids: string[]): void {
+    this.completionAttemptUnmet = [...ids];
+  }
+
+  /** Value-level: the `unmet` ids a denied permit reply carries (omitted when never set). */
+  setCompletionPermitDenyUnmet(ids: string[]): void {
+    this.completionPermitDenyUnmet = [...ids];
+  }
+
+  /** Value-level: the id a granted permit carries (default `permit-<runId>`). */
+  setCompletionPermitId(id: string): void {
+    this.completionPermitId = id;
+  }
+
   /** Observe each /state report as it lands, so a test can react to a value the
    *  WORKER minted rather than one the test guessed. PRD #88 needs this: the answer
    *  to a clarification must name the question id the runner generated at the park,
@@ -1655,7 +1677,7 @@ export class FakeApi {
       if (this.completionAttemptRequests.length <= this.completionAttemptFailTimes && this.completionAttemptHttpStatus !== 200)
         return send(res, this.completionAttemptHttpStatus, { error: this.completionAttemptHttpStatus === 409 ? "run is not in a live claimed state for this worker" : "injected attempt failure" });
       const count = (this.admittedAttempts.get(runId) ?? this.publicationState.get(runId)?.attempts ?? 0) + 1;
-      const reply = this.completionAttemptWire?.(json) ?? { unmet: [], attempt_count: count };
+      const reply = this.completionAttemptWire?.(json) ?? { unmet: this.completionAttemptUnmet, attempt_count: count };
       this.admittedAttempts.set(runId, count);
       const state = this.publicationState.get(runId);
       if (state) state.attempts = count;
@@ -1680,12 +1702,15 @@ export class FakeApi {
       if (this.completionPermitWire) return send(res, 200, this.completionPermitWire(json));
       const body: Record<string, unknown> = { granted: this.completionPermitGranted };
       if (this.completionPermitGranted) body.permit = {
-        id: `permit-${runId}`, contract_revision: json.contract_revision,
+        id: this.completionPermitId ?? `permit-${runId}`, contract_revision: json.contract_revision,
         branch: json.branch, head: json.head, issued_at: "2026-10-17T00:00:00Z", finding_ids: [],
         ...(this.completionPermitScope !== undefined ? { completion_scope: this.completionPermitScope } : {}),
       };
       if (!this.completionPermitGranted && this.completionPermitDenyReason !== undefined) {
         body["deny_reason"] = this.completionPermitDenyReason;
+      }
+      if (!this.completionPermitGranted && this.completionPermitDenyUnmet !== undefined) {
+        body["unmet"] = this.completionPermitDenyUnmet;
       }
       return send(res, 200, body);
     }

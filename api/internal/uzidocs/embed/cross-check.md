@@ -366,7 +366,8 @@ including when none advertises `cross_check_codex_lead_v1`.
 
 ## Semantic contract profile (dormant)
 
-**Dormant.** Production enrollment is off until #1231, no production code creates a
+**Dormant.** Production enrollment is off and not planned (#1231 was closed not planned;
+any future activation needs a new approved design), no production code creates a
 semantic run and only tests inject the path. A real run uses the *structural*
 profile described everywhere else on this page.
 
@@ -397,7 +398,7 @@ Design record: [ADR-2149 amendment](../adr/2149-cross-check.md#1230-coverage-par
 
 ### Coverage transport limitation
 
-Codex currently lacks an enforceable token cap. Claude's output cap alone does not prove a conservative full-call bound. Complete large sources can exceed the 40,000-token allowance. Unsupported or unbounded transports and inadmissibly large inputs yield unavailable without a model call. #1231 must establish enforceable bounds before activation.
+Codex currently lacks an enforceable token cap. Claude's output cap alone does not prove a conservative full-call bound. Complete large sources can exceed the 40,000-token allowance. Unsupported or unbounded transports and inadmissibly large inputs yield unavailable without a model call. Any future semantic activation must establish enforceable bounds before activation.
 
 See [ADR-1225](../adr/1225-structural-completion-interlock-invariants.md#coverage-transport-limitation).
 

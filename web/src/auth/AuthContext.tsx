@@ -362,3 +362,8 @@ export function useAuth(): AuthState {
   if (!ctx) throw new Error("useAuth must be used within AuthProvider");
   return ctx;
 }
+
+// For surfaces rendered where a provider may be absent (RunView tests mount none); callers must treat undefined as non-admin.
+export function useOptionalAuth(): AuthState | undefined {
+  return useContext(AuthContext);
+}

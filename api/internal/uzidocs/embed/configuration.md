@@ -413,14 +413,35 @@ against runner cleanup and the recovery lifecycle on 2026-09-08.
 
 `config.Load` also parses `WORKER_HEARTBEAT_INTERVAL` and `WORKER_POLL_INTERVAL` into the server's `Config` struct. The api reads its copy of `WORKER_HEARTBEAT_INTERVAL` for the active-run snapshot freshness fences (`WORKER_HEARTBEAT_STALE` plus one interval) and the [run health](run-health.md#what-the-flags-mean) undelivered-outcome threshold (4 intervals); the stale-worker sweeper itself acts on `WORKER_HEARTBEAT_STALE`. `WORKER_POLL_INTERVAL` now has one API-side use: its parsed value is the multiplier `WORKER_SPREAD_GRACE` defaults from (`3×`, see the row above) — otherwise it, too, is not a server knob despite being parsed here. The values that actually matter for pacing the worker's own poll loop are the **worker's own copy** of these same-named variables, consumed by the `agent` binary and wired to the `agent` compose service; see the Worker container table below.
 
+### Task checkpoint rollout and rollback
+
+Upgrade the API before enrolling tasks with workers advertising
+`task_checkpoint_coordinates_v1`. Enrollment is a fresh compatible claim's
+immutable server snapshot; existing active legacy tasks are not converted.
+Old workers receive no task coordinate descriptor and cannot claim or readopt
+enrolled tasks. Invalid lineage remains unsupported.
+
+**Rolling back to an old API can reduce availability.** Database guards can
+stall queue-head claims or reject a whole readoption batch containing an
+enrolled task, including otherwise compatible peers in that batch. Roll forward
+to a compatible API to restore progress. Capability overrides cannot bypass
+coordinate compatibility or these database guards.
+
+Migration 00352's schema Down refuses while enrolled rows exist, including
+terminal rows, and requires READ COMMITTED isolation. Do not clear frozen
+descriptors to force a downgrade. Keep the compatible schema/API and preserve
+custody while resolving the incident. See [ADR-3343](../adr/3343-task-checkpoint-coordinates.md)
+for the rollout boundary and [task checkpoint recovery](./run-recovery.md#task-checkpoint-recovery)
+for publication evidence.
+
 ### Checkpoints: two tiers (PRD #122 M8, PRD #267)
 
-A run's committed work is published to origin (`refs/uzi-checkpoints/<branch>`, credential-free — the worker never `git push`es; a pack is brokered through the api) on two independent triggers, so a different worker that later re-claims the run can recover it (`seededFrom: "checkpoint"`) instead of redoing it:
+A run's committed work is published to origin (`refs/uzi-checkpoints/<checkpoint-key>`, credential-free — the worker never `git push`es; a pack is brokered through the api) on two independent triggers, so a different worker that later re-claims the run can recover it (`seededFrom: "checkpoint"`) instead of redoing it:
 
-1. **Milestone-cooperative.** When the lead signals a completed milestone, the worker reaps the agent tree, fetches the committed work back, and publishes it to origin. This is the original mechanism (PRD #122 M6/M8) and still fires on every milestone boundary.
+1. **Milestone-cooperative.** When the lead signals a completed milestone, the worker reaps the agent tree, fetches the committed work back, and publishes it to origin. This is the original mechanism (PRD #122 M6/M8) and applies to the existing issue-only milestone policy; task checkpoint enrollment does not make task runs milestone-eligible.
 2. **Time-gated iteration boundary** (PRD #267). Every iteration boundary the lead does *not* cooperatively checkpoint already fetches committed work back locally without reaping (so a backgrounded process the lead is using, e.g. a dev server, survives). That fallback now *also* publishes to origin — without reaping — once `CHECKPOINT_INTERVAL` has elapsed since the last logical origin publish attempt, provided the branch tip has moved. This bounds worst-case data loss from a worker-disk loss to roughly one `CHECKPOINT_INTERVAL` of committed work, instead of a whole milestone's worth on a long first milestone where nothing has reached origin yet.
 
-Only **committed** work is captured either way — a checkpoint fetches back commits, not the dirty working tree, so uncommitted changes are not protected by either tier. Cross-worker recovery is identical for both: both write the same `refs/uzi-checkpoints/<branch>` mirror.
+Only **committed** work is captured either way — a checkpoint fetches back commits, not the dirty working tree, so uncommitted changes are not protected by either tier. Cross-worker recovery uses the same `refs/uzi-checkpoints/<checkpoint-key>` mirror for both. Dirty work requires the separate verified recovery-capture overlay path. Keys remain exactly `agent/issue-<iid>` and `uzi/self-improve/<run-id>` for existing issue and self-improvement runs; an enrolled task uses `uzi/task/<its-own-run-id>`, independently of its validated root's work branch. See [task checkpoint recovery](./run-recovery.md#task-checkpoint-recovery).
 
 **Checkpoint HTTP retries (issue #296).** Each logical checkpoint publish makes at most three HTTP requests total, retrying only explicit numeric HTTP 500–599 after 250ms and 1000ms. Any supplied caller deadline or abort signal is shared across attempts; each HTTP request retains its own client timeout. Some callers supply no outer signal, so the first request's timeout does not bound the total operation. Each retry opens a fresh producer stream for the fixed original source, candidate and floor after rechecking ownership, scratch/floor safety and the remediation hold; the abandoned producer is explicitly cancelled and settled before replay. HTTP 4xx, nonconfirming 2xx, skips, local errors, transport exceptions and aborts are not retried. The `CHECKPOINT_INTERVAL` gate (default `20m`) measures logical operations, not these internal requests. A confirming ACK also requires producer exit zero; ambiguous attempts remain available for later overlay chaining. Intermediate 5xx responses appear in numeric operator retry logs; a continuing 5xx failure reaches the deduped feed only after the third request. A successful retry emits one positive “checkpoint publishing recovered — published to origin” feed line even when no earlier failure was recorded there. These retries do not guarantee durability for divergent heads or resolve the cause of production HTTP 500 responses.
 
@@ -478,6 +499,55 @@ Set on the `agent` compose service (profile `agent`) or on a standalone `docker 
 
 Duration values accept the same Go-style strings used server-side (`15s`, `3s`, `500ms`, `2h`) or a bare integer read as milliseconds.
 
+### Worker Go concurrency defaults
+
+Two optional settings (issue #3382) cap the Go build and runtime parallelism of
+commands the worker launches. Both are **unset by default**: nothing is rendered
+and no `GOFLAGS` or `GOMAXPROCS` is injected.
+
+| Worker environment variable | Helm `workers` key | Default | Meaning |
+|---|---|---|---|
+| `WORKER_GO_BUILD_PARALLELISM` | `goBuildParallelism` | empty | Sets `GOFLAGS=-p=N`: how many packages `go build` and `go test` build or run in parallel. |
+| `WORKER_GO_MAXPROCS` | `goMaxProcs` | empty | Sets `GOMAXPROCS=N`: the Go runtime's CPU parallelism. The `go` command's `-p` defaults to `GOMAXPROCS`, so this also bounds package parallelism when no `-p` is set. |
+
+String values (quoted YAML, `--set-string`, and the controller and worker
+environment) must be positive decimal digits up to `2147483647`; surrounding
+whitespace is trimmed, empty means unset, and leading zeros are accepted
+(`007` is `7`). Zero, signs, fractions, non-digits and larger values are
+rejected: the chart render fails, the controller refuses to start, or the worker
+refuses to start, depending on where the value is set. Helm decodes typed
+numbers (unquoted YAML, `--set`) before the template sees them, so those are
+checked by numeric value: a whole number from `1` to `2147483647`, relayed as its
+canonical decimal (`+1` arrives as `1`; in a values file `0x10` and `1e3` also
+arrive as `16` and `1000`, while `--set` decodes only decimal integers). Quote the
+value in YAML or use `--set-string` to have the spelling checked. There is no general `GOFLAGS` passthrough.
+
+The values apply to the scrubbed environment of Claude commands (native and
+guarded), Codex commands, worker-run checks and JavaScript dependency installs.
+Compose relays both variables from `.env`; hosted workers use the chart keys,
+and the controller receives them as `UZI_WORKER_GO_BUILD_PARALLELISM` and
+`UZI_WORKER_GO_MAXPROCS` and relays them into worker pods. Setting or changing
+either hosted value rolls every hosted worker pod once it holds no non-terminal
+run; compose and self-run workers
+pick it up on restart. Both the controller and the worker image must come from a
+release containing this change; older ones ignore the settings.
+
+Limits:
+
+- This is not a worker-wide process or memory limit. Each concurrent command gets
+  the same value on its own.
+- An explicit `-p` flag, or a command or Taskfile that sets its own `GOFLAGS`,
+  replaces `-p=N`. `GOMAXPROCS` still applies, so `goMaxProcs` is the more
+  robust knob.
+- It does not cap per-test internal concurrency, child processes or memory, and
+  command code can replace its own environment.
+- On Codex, the worker's own Go helper processes (supervisor, sandbox and
+  file-operation helper) launched with the command environment also inherit
+  `GOMAXPROCS`.
+
+See [Worker setup](./worker-setup.md#3-run-the-worker) for supplying the values
+to a self-run worker.
+
 ### Worker memory guard
 
 The proactive worker memory guard is **off by default** (issue #2396).
@@ -514,8 +584,28 @@ These `_MS` settings take decimal milliseconds, not Go-style durations.
 For a finite cgroup limit `L = memory.max`, the guard computes
 `H = L - reserveBytes` and `Q = H - hysteresisBytes`, requiring
 `0 < Q < H < L`. Unavailable, stale or incompatible cgroup evidence inhibits
-intervention; an unlimited cgroup does not supply a usable limit. Total
-`memory.current` is authoritative, with no file-memory subtraction.
+intervention; an unlimited cgroup does not supply a usable limit. Pressure
+is the working set, `max(0, memory.current - inactive_file)`; it is compared with `H`
+and drives the early projection and the below-`Q` quiet dwell (the early
+projection runs only with PSI).
+`memory.stat` must contain `inactive_file`, else the sample is unavailable.
+The working set is an estimate, not guaranteed non-reclaimable memory and not
+an OOM predictor: inactive file pages can be dirty, under writeback or slow to
+reclaim, so the subtraction can underestimate pressure (dirty/writeback
+validation is deferred). Feedback's `observed_total_bytes` stays the raw
+`memory.current` and can exceed the working set that triggered.
+
+Cgroup memory PSI (`memory.pressure`) is optional. A read failing with exactly
+`ENOENT` or `ENOTSUP` marks PSI absent; any other error, or malformed or
+oversized PSI, makes the whole sample unavailable. Early intervention needs real
+PSI in two consecutive samples, an increasing full-PSI total, growth in
+`anon`, `shmem`, `slab_unreclaimable` or `unevictable`, and a working-set
+projection reaching `H` within the response budget. Without PSI only the hard
+path (working set at or above `H`) can fire. The worker logs one `warn`
+("worker memory guard: cgroup memory PSI unavailable; early intervention
+disabled, hard intervention continues on valid core accounting", field `reason`) on initial absence or
+loss, and one `info` ("worker memory guard: cgroup memory PSI restored; early
+intervention resumes after consecutive PSI samples") on restoration; repeats are silent.
 Approximate command-tree RSS ranks eligible targets; it does not measure
 cgroup usage or prove that memory was freed.
 

@@ -1302,11 +1302,13 @@ uzi run recovery <run-id> [--json]
   its run) or the server predates capture-hold linking. Owner-only.
 - While the server retains the run's last published checkpoint on origin (PRD #1810), the
   human-readable output adds a line per hold naming where it lives: `hold <id> checkpoint:
-  <ref> @ <12-char tip> (<state>)`, where `<ref>` is `refs/uzi-checkpoints/<branch>` or, once
-  a newer run on the same branch superseded it, `refs/uzi-recovery/<run-id>`. `--json` carries
+  <ref> @ <12-char tip> (<state>)`, where `<ref>` is `refs/uzi-checkpoints/<checkpoint-key>` or, once
+  a newer run using that key superseded it, `refs/uzi-recovery/<run-id>`. `--json` carries
   the same information as `checkpoint_ref`, `checkpoint_tip`, and `checkpoint_state` on each
   hold. A hold with no retained checkpoint ref omits the line (and the `--json` fields are
-  absent).
+  absent). The key keeps the exact legacy issue/self-improvement spelling; an enrolled
+  task uses `uzi/task/<its-own-run-id>`, even when its work branch belongs to a root
+  task. See [task checkpoint recovery](./run-recovery.md#task-checkpoint-recovery).
 
 - A hold with `terminal_record_rejection: "mac_failure"` also shows the fixed diagnostic:
   “terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody”.
@@ -1335,7 +1337,7 @@ uzi run discard <run-id> --hold <hold-id> --yes
   destroy the last copy of that work — export anything you might need first.
 - **Discarding a run's last open hold also deletes its retained checkpoint ref on the
   forge.** Once no hold of the run is left open, the server settles (CAS-deletes) whatever
-  ref still carries the run's tip (`refs/uzi-checkpoints/<branch>`, or `refs/uzi-recovery/<run-id>`
+  ref still carries the run's tip (`refs/uzi-checkpoints/<checkpoint-key>`, or `refs/uzi-recovery/<run-id>`
   once a newer run superseded it) — see the `run recovery` checkpoint line above. Both the
   `run discard` help and its confirmation prompt name this; fetch the ref first if you
   might still need it.
@@ -1432,7 +1434,7 @@ uzi copies a failed run's last **published** checkpoint to a run-scoped ref,
 (if the removal keeps failing, uzi stops trying and `SALVAGE_ERROR` names the ref that may
 remain).
 The copy is only what the run had checkpointed to the forge, so it may be behind the
-run's final local work. Salvage never moves or deletes the branch's own checkpoint ref.
+run's final local work. Salvage never moves or deletes the run's checkpoint ref.
 
 `uzi run get` on a failed run with a salvage record prints a `SALVAGE` block: the state
 with a one-line explanation, then `SALVAGE_REF`, `SALVAGE_TIP` (short), `SALVAGE_EXPIRES`
@@ -1757,7 +1759,7 @@ A newer release is available.
   in-progress milestone's cell blinks** `▰`/`▱` in the tungsten colour (the
   same warm accent as the done fill) on a half-second tick — a static `▱`
   frame renders instead when the terminal isn't interactive (a piped or
-  offline render) or with `UZI_TUI_NO_BLINK=1` set (a reduced-motion opt-out,
+  offline render) or with `UZI_TUI_NO_BLINK=1` or `[tui] blink = false` set (a reduced-motion opt-out,
   read once at startup). The **selected row**
   additionally gains a second line naming the active lane's role, task
   label and age — the run's current activity, the same information [the run
@@ -1837,7 +1839,7 @@ A newer release is available.
   for a milestone in progress — a `◕` that blinks `◕`/`○` in the faint grey
   colour (the same colour as a not-started `○`; the row is told apart by the
   `◕` shape, its motion and a brighter title, never by colour), a static `◕`
-  under `UZI_TUI_NO_BLINK=1` or a non-tty render. The rail's eyebrow also
+  under `UZI_TUI_NO_BLINK=1`, `[tui] blink = false` or a non-tty render. The rail's eyebrow also
   carries a compact `▰`/`▱` micro-bar that blinks one cell per milestone in
   progress in tungsten, the twin of the board's, and names the in-progress
   milestone(s) after the count (e.g. `· m1, m2`, capped at two then `+N`).
@@ -2036,6 +2038,41 @@ split = "off"
 `split = "auto"` is the default; `auto` and `off` are the supported values.
 The `off` setting also disables `s`. `uzi tui --demo` and
 `uzi tui --sketch` use `auto` regardless of this setting.
+
+The run detail's left rail grows with the terminal: about a fifth of its
+width, at least 26 columns and at most 44, so milestone titles, crew labels
+and the now line truncate less on a wide terminal. Once the terminal is
+92 columns or wider the transcript always keeps at least 60 columns; below
+that the rail stays at 26 columns. Three more `[tui]` keys tune the detail view:
+
+```toml
+[tui]
+milestone_numbers = true   # default false
+rail_min_width = 36        # default 26
+blink = false              # default true
+```
+
+- `milestone_numbers = true` prefixes each rail milestone title with its
+  position in the approved list (`M1`, `M2`, …, right-aligned once there are
+  ten or more), and the `MILESTONES` header names the in-progress milestones
+  by the same positions (`· M2`) instead of their ids. When the run already
+  wrote the same number at the start of the title (`M3 `, `m3 - `, `M3:` on
+  the third row), it is dropped so the row is not doubled. A different
+  number stays, so a plan numbered from zero reads `M1 M0 investigation`
+  and the run's own numbering is never hidden. A word that merely starts
+  with a number, like `M3Migration`, is left alone. The board row is
+  unchanged.
+- `rail_min_width` raises the rail's floor, and may exceed the automatic
+  44-column cap. The 60-column transcript minimum still wins on a terminal
+  too narrow for both. Values below 26 are rejected.
+- `blink = false` pins the static frame instead of the half-second blink of
+  in-progress milestones, the same reduced-motion opt-out as
+  `UZI_TUI_NO_BLINK=1`. Either one turns the blink off; `blink = true` does
+  not override the environment variable.
+
+An invalid value for any `[tui]` key stops `uzi tui` with a usage error
+naming the key. Like `split`, these keys are ignored by `--demo` and
+`--sketch`.
 
 ### Keybindings
 

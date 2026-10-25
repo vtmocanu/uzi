@@ -4647,17 +4647,13 @@ function retryAfterMsOf(h: string | null): number | undefined {
  * reserving another 64 KiB for keys/metadata stays below 6 MiB. Count actual streamed bytes,
  * never Content-Length; cross-check methods, strict gate and terminal RunDTO ACKs opt in. */
 const CROSS_CHECK_RESPONSE_MAX_BYTES = 6 * 1024 * 1024;
-/** Run and chat claim response budget. Go encoding/json escapes <, > and & and controls at 6 wire
- * bytes per input byte. Stock worst case: completion_pending 18,955,056 (api
- * TestSemanticCompletionPendingWireBound); plan_md 1 MiB request cap x6 = 6,291,456; skills at the
- * default SKILLS_MAX_PER_RUN=32 x SKILL_MAX_BYTES=65,536 x6 = 12,582,912; completion_scope
- * ~2,517,600; issue_description/job prompt 256 KiB x6 = 1,572,864; other bounded fields (comments,
- * milestones, resume gate, pr_description, secrets, scalars) ~1.0 MB; builtin agent templates
- * ~109 KB. Total ~43.3 MB (~41.3 MiB); 4x rounded up is 168 MiB (issue #2306). User/global agent
- * templates (count and size, each only 1 MiB request-capped) and admin-raised SKILLS_MAX_PER_RUN /
- * SKILL_MAX_BYTES are NOT server-bounded, so a claim past the cap is refused, never truncated, and
- * the claim loop logs and retries. Count actual streamed bytes, never Content-Length. */
-const CLAIM_RESPONSE_MAX_BYTES = 168 * 1024 * 1024;
+/** Run and chat claim response cap. One figure shared with the api: fixtures/claims/claim-response-limit.json
+ * pins it from both sides, and the api's workersvc claimResponseMaxBytes carries the budget derivation
+ * (ADR-3396). The api refuses an over-limit run-lane claim before delivery and fails the run with
+ * `claim too large` (provisioning_failed); chat claims carry no templates, skills or issue content and
+ * are bounded by construction. A claim past the cap from an older api is still refused here, never
+ * truncated. Count actual streamed bytes, never Content-Length. */
+export const CLAIM_RESPONSE_MAX_BYTES = 168 * 1024 * 1024;
 /** Operational cap on the job-file upload acknowledgment; counts streamed bytes, not Content-Length. */
 const JOB_FILE_UPLOAD_RESPONSE_MAX_BYTES = 64 * 1024;
 /** PRD #1230 M4: a maximally escaped completion_pending projection stays below 20 MiB

@@ -696,14 +696,19 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	if err != nil {
 		return nil, err
 	}
+	coordinates, err := checkpointCoordinatesForWorker(wkr, run)
+	if err != nil {
+		return nil, err
+	}
 	payload := &ClaimPayload{
-		CIRepair:         ciRepair,
-		InventoryGuarded: inventoryGuarded,
-		RunID:            run.ID.String(),
-		Kind:             run.Kind,
-		IssueIID:         issueIID,
-		IssueTitle:       run.IssueTitle,
-		IssueDescription: run.IssueDescription,
+		CheckpointCoordinates: coordinates,
+		CIRepair:              ciRepair,
+		InventoryGuarded:      inventoryGuarded,
+		RunID:                 run.ID.String(),
+		Kind:                  run.Kind,
+		IssueIID:              issueIID,
+		IssueTitle:            run.IssueTitle,
+		IssueDescription:      run.IssueDescription,
 		// PRD #381: the structured comments snapshot, decoded above. omitempty keeps a
 		// comment-less run's claim byte-identical to today's.
 		IssueComments: issueComments,

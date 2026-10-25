@@ -11,11 +11,11 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import cases from "../../../../fixtures/plan-revision/cases.json";
 import { PlanPanel, derivePlanDiffBase, derivePlanRevision } from "./PlanPanel";
 import { act } from "react";
-import { api, ApiError, type AgentSelectionInput, type Run, type RunMessage, type SecretMeta } from "../../lib/api";
+import { api, ApiError, type AgentSelectionInput, type Repo, type Run, type RunMessage, type SecretMeta } from "../../lib/api";
 
 vi.mock("../../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../lib/api")>();
-  return { ...actual, api: { ...actual.api, setRunCredential: vi.fn(), listSecrets: vi.fn() } };
+  return { ...actual, api: { ...actual.api, setRunCredential: vi.fn(), listSecrets: vi.fn(), setRepoRequiredCapabilities: vi.fn() } };
 });
 const mockApi = vi.mocked(api);
 
@@ -922,5 +922,114 @@ describe("plan comparison boundaries", () => {
     expect(button.getAttribute("aria-expanded")).toBe("false");
     fireEvent.click(button);
     expect(screen.getByText("+0 / -0 lines")).toBeTruthy();
+  });
+});
+
+describe("PlanPanel — repo capability hint and Docker allowlist (#3391)", () => {
+  const MEMBER = "this repo isn't on the Docker worker repo allowlist, so your Docker workers can't run it; ask an admin to add it under Admin → Instance → Docker worker repo allowlist";
+  const ADMIN = "this repo isn't on the Docker worker repo allowlist, so your Docker workers can't run it; add it under Admin → Instance → Docker worker repo allowlist";
+  const hintRe = /This repo doesn't require/;
+  function repoFor(over: Partial<Repo> = {}): Repo {
+    return { id: "repo1", required_capabilities: [], docker_allowlisted: true, ...over } as unknown as Repo;
+  }
+  function panel(props: { repo?: Repo; isAdmin?: boolean; canSteer?: boolean; caps?: string[]; onRepo?: (id: string, caps: string[]) => void }) {
+    render(
+      <PlanPanel
+        run={run({ required_capabilities: props.caps ?? ["docker"] })}
+        busy={false}
+        canSteer={props.canSteer ?? true}
+        onApprove={vi.fn()}
+        onReject={vi.fn()}
+        {...({ repo: props.repo, isAdmin: props.isAdmin, onRepoRequiredCapabilities: props.onRepo } as object)}
+      />,
+    );
+  }
+
+  it("offers to require the missing capability and hides the hint once saved", async () => {
+    mockApi.setRepoRequiredCapabilities.mockResolvedValue({ repo: repoFor({ required_capabilities: ["docker"] }) });
+    const onRepo = vi.fn();
+    panel({ repo: repoFor(), onRepo });
+    expect(screen.getByText(hintRe)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Require on repo" }));
+    await waitFor(() => expect(screen.queryByText(hintRe)).toBeNull());
+    expect(mockApi.setRepoRequiredCapabilities).toHaveBeenCalledWith("repo1", ["docker"]);
+    expect(onRepo).toHaveBeenCalledWith("repo1", ["docker"]);
+  });
+
+  it("keeps the repo's existing capabilities when adding", async () => {
+    mockApi.setRepoRequiredCapabilities.mockResolvedValue({ repo: repoFor({ required_capabilities: ["jvm", "docker"] }) });
+    panel({ repo: repoFor({ required_capabilities: ["jvm"] }) });
+    fireEvent.click(screen.getByRole("button", { name: "Require on repo" }));
+    await waitFor(() => expect(mockApi.setRepoRequiredCapabilities).toHaveBeenCalledWith("repo1", ["jvm", "docker"]));
+  });
+
+  it("shows the failure inline", async () => {
+    mockApi.setRepoRequiredCapabilities.mockRejectedValue(new Error("boom"));
+    panel({ repo: repoFor() });
+    fireEvent.click(screen.getByRole("button", { name: "Require on repo" }));
+    expect((await screen.findByRole("alert")).textContent).toBe("Update failed");
+    expect(screen.getByRole("button", { name: "Require on repo" })).toBeTruthy();
+  });
+
+  it("names and sends only capabilities the repo hint can hold", async () => {
+    mockApi.setRepoRequiredCapabilities.mockResolvedValue({ repo: repoFor({ required_capabilities: ["docker"] }) });
+    panel({ repo: repoFor(), caps: ["docker", "gpu"] });
+    expect(screen.getByText(hintRe).textContent).not.toContain("gpu");
+    fireEvent.click(screen.getByRole("button", { name: "Require on repo" }));
+    await waitFor(() => expect(screen.queryByText(hintRe)).toBeNull());
+    expect(mockApi.setRepoRequiredCapabilities).toHaveBeenCalledWith("repo1", ["docker"]);
+  });
+
+  it("shows no hint when the repo already requires it", () => {
+    panel({ repo: repoFor({ required_capabilities: ["docker"] }) });
+    expect(screen.getByText(/Run requirements/)).toBeTruthy();
+    expect(screen.queryByText(hintRe)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Require on repo" })).toBeNull();
+  });
+
+  it("hides the hint and button from a viewer who cannot steer", () => {
+    panel({ repo: repoFor(), canSteer: false });
+    expect(screen.getByText(/Run requirements/)).toBeTruthy();
+    expect(screen.queryByText(hintRe)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Require on repo" })).toBeNull();
+  });
+
+  it("words the allowlist gap for a member and for an admin", () => {
+    panel({ repo: repoFor({ docker_allowlisted: false, required_capabilities: ["docker"] }) });
+    expect(screen.getByText(MEMBER)).toBeTruthy();
+    cleanup();
+    panel({ repo: repoFor({ docker_allowlisted: false, required_capabilities: ["docker"] }), isAdmin: true });
+    expect(screen.getByText(ADMIN)).toBeTruthy();
+    expect(screen.queryByText(MEMBER)).toBeNull();
+  });
+
+  it("states the allowlist gap even to a viewer who cannot steer", () => {
+    panel({ repo: repoFor({ docker_allowlisted: false, required_capabilities: ["docker"] }), canSteer: false });
+    expect(screen.getByText(MEMBER)).toBeTruthy();
+  });
+
+  it("says nothing about the allowlist when allowlisted or docker is not required", () => {
+    panel({ repo: repoFor({ docker_allowlisted: true, required_capabilities: ["docker"] }) });
+    expect(screen.getByText(/Run requirements/)).toBeTruthy();
+    expect(screen.queryByText(MEMBER)).toBeNull();
+    cleanup();
+    panel({ repo: repoFor({ docker_allowlisted: false, required_capabilities: ["jvm"] }), caps: ["jvm"] });
+    expect(screen.getByText(/Run requirements/)).toBeTruthy();
+    expect(screen.queryByText(MEMBER)).toBeNull();
+  });
+
+  it("renders neither line nor button without a repo", () => {
+    panel({});
+    expect(screen.getByText(/Run requirements/)).toBeTruthy();
+    expect(screen.queryByText(hintRe)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Require on repo" })).toBeNull();
+  });
+
+  it("does not invent an allowlist gap from a PATCH response that omits the computed fields", async () => {
+    mockApi.setRepoRequiredCapabilities.mockResolvedValue({ repo: { id: "repo1", required_capabilities: ["docker"] } as unknown as Repo });
+    panel({ repo: repoFor({ docker_allowlisted: true }) });
+    fireEvent.click(screen.getByRole("button", { name: "Require on repo" }));
+    await waitFor(() => expect(screen.queryByText(hintRe)).toBeNull());
+    expect(screen.queryByText(MEMBER)).toBeNull();
   });
 });

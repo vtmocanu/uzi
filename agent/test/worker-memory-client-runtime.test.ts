@@ -122,7 +122,7 @@ for (const mode of ["lost-response", "failure", "malformed", "parked-replay", "u
           const now = performance.now();
           return { available: true, sampleId: ++sampleId, startedAtMs: now, completedAtMs: now,
             currentBytes: usage, limitBytes: 1000,
-            stat: { anon: 1, shmem: 0, slab_unreclaimable: 0, unevictable: 0 },
+            stat: { anon: 1, shmem: 0, slab_unreclaimable: 0, unevictable: 0, inactive_file: 0 },
             pressure: { some: { avg10: 0, avg60: 0, avg300: 0, total: 0 },
               full: { avg10: 0, avg60: 0, avg300: 0, total: 0 } } };
         } },
@@ -292,7 +292,7 @@ for (const phase of ["absent-grow", "before-reserve", "pending-reserve", "after-
         const psi = { avg10: 0, avg60: 0, avg300: 0, total: 0 };
         return { available: true, sampleId: ++sampleId, startedAtMs: now, completedAtMs: now,
           currentBytes: usage, limitBytes: 1000,
-          stat: { anon: 1, shmem: 0, slab_unreclaimable: 0, unevictable: 0 }, pressure: { some: psi, full: psi } };
+          stat: { anon: 1, shmem: 0, slab_unreclaimable: 0, unevictable: 0, inactive_file: 0 }, pressure: { some: psi, full: psi } };
       } },
     });
     const context = runtime.begin({ run_id: run, worker_id: worker, register_nonce: nonce,
@@ -377,3 +377,65 @@ for (const phase of ["absent-grow", "before-reserve", "pending-reserve", "after-
     }
   });
 }
+
+type RuntimeSample = ReturnType<import("../src/worker-memory-reader.js").WorkerMemoryReader["sample"]>;
+async function runScripted(script: readonly ("U" | "A" | "S" | "P" | "X" | "M" | "E")[], logger: { warn: (m: string, f?: Record<string, unknown>) => void; info: (m: string, f?: Record<string, unknown>) => void }) {
+  let calls = 0;
+  const client = {
+    memoryIncarnation: undefined, subscribeMemoryInvalidation: () => () => {}, revokeMemoryAuthority: () => {},
+    reserveMemoryIntervention: async () => { throw new Error("unexpected"); },
+    reportMemoryInterventionOutcome: async () => { throw new Error("unexpected"); },
+  } as unknown as WorkerClient;
+  const psi = { avg10: 0, avg60: 0, avg300: 0, total: 0 };
+  const runtime = new WorkerMemoryRuntime(settings, client, { ...nullLogger(), ...logger }, {
+    reader: { sample: (): RuntimeSample => {
+      const kind = script[Math.min(calls, script.length - 1)]!;
+      const now = performance.now();
+      const id = ++calls;
+      if (kind === "U") return { available: false, reason: "malformed", sampleId: id, startedAtMs: now, completedAtMs: now };
+      return { available: true, sampleId: id, startedAtMs: now, completedAtMs: now, currentBytes: 100, limitBytes: 1000,
+        stat: { anon: 1, shmem: 0, slab_unreclaimable: 0, unevictable: 0, inactive_file: 0 },
+        pressure: (kind === "A" ? { unavailable: "absent" } : kind === "S" ? { unavailable: "unsupported" }
+          : kind === "X" ? { unavailable: "other" } : kind === "M" ? { some: psi, full: psi, unavailable: "absent" }
+          : kind === "E" ? {} : { some: psi, full: psi }) as RuntimeSample extends { pressure: infer T } ? T : never };
+    } },
+  });
+  const running = runtime.run();
+  try { await until(() => calls >= script.length + 2); }
+  finally { await runtime.stop(); await running; }
+}
+
+test("runtime logs PSI availability transitions once, from available samples only", async () => {
+  const events: { level: string; msg: string; fields?: Record<string, unknown> }[] = [];
+  const record = (level: string) => (msg: string, fields?: Record<string, unknown>) => { events.push({ level, msg, fields }); };
+  await runScripted(["U", "A", "A", "U", "A", "P", "P", "U", "P", "S", "S", "S"], { warn: record("warn"), info: record("info") });
+  assert.deepEqual(events.map((e) => e.level), ["warn", "info", "warn"]);
+  assert.equal(events[0]!.msg, "worker memory guard: cgroup memory PSI unavailable; early intervention disabled, hard intervention continues on valid core accounting");
+  assert.equal(events[0]!.fields?.reason, "absent");
+  assert.equal(events[1]!.msg, "worker memory guard: cgroup memory PSI restored; early intervention resumes after consecutive PSI samples");
+  assert.equal(events[2]!.fields?.reason, "unsupported");
+});
+
+test("runtime logs nothing for unavailable samples or steady PSI presence", async () => {
+  const events: string[] = [];
+  const sink = { warn: () => { events.push("warn"); }, info: () => { events.push("info"); } };
+  await runScripted(["U", "U", "P", "P", "U", "P"], sink);
+  assert.deepEqual(events, []);
+});
+
+test("malformed pressure shapes neither log nor change PSI state", async () => {
+  // X = unknown marker reason, M = rows plus marker, E = empty object. Each is the guard's to reject.
+  const events: string[] = [];
+  const sink = { warn: () => { events.push("warn"); }, info: () => { events.push("info"); } };
+  await runScripted(["P", "X", "M", "E", "P"], sink);
+  assert.deepEqual(events, [], "malformed shapes must not read as PSI absence");
+  // After a genuine absence they must not read as restoration, nor re-arm the transition log.
+  await runScripted(["A", "X", "M", "E", "A", "P"], sink);
+  assert.deepEqual(events, ["warn", "info"]);
+});
+
+test("a throwing diagnostic logger never rejects the sampler", async () => {
+  let attempts = 0;
+  await runScripted(["A", "A", "P"], { warn: () => { attempts++; throw new Error("logger failure"); }, info: () => { attempts++; throw new Error("logger failure"); } });
+  assert.equal(attempts, 2);
+});

@@ -14,7 +14,37 @@ const STAT_FIELDS = ["anon", "shmem", "slab_unreclaimable", "unevictable"] as co
 function natural(n: number): boolean { return Number.isSafeInteger(n) && n >= 0; }
 function positive(n: number): boolean { return natural(n) && n > 0; }
 
-/** Pure total-usage policy. No timers, signals, process inspection or reservation IO.
+type Pressure = Available["pressure"];
+type RealPressure = Extract<Pressure, { some: unknown }>;
+
+/** Working set: memory.current minus inactive file cache, clamped at zero.
+ * An estimate of non-reclaimable pressure; it is not an OOM predictor. */
+export function workingSetBytes(sample: Pick<Available, "currentBytes"> & { stat: Pick<Available["stat"], "inactive_file"> }): number {
+  return Math.max(0, sample.currentBytes - sample.stat.inactive_file);
+}
+
+/** Exactly the explicit PSI-unavailable marker; any other shape is not one. */
+export function isMarker(p: unknown): p is Extract<Pressure, { unavailable: unknown }> {
+  if (typeof p !== "object" || p === null) return false;
+  const keys = Object.keys(p);
+  const reason = (p as { unavailable?: unknown }).unavailable;
+  return keys.length === 1 && keys[0] === "unavailable" && (reason === "absent" || reason === "unsupported");
+}
+
+/** Real PSI rows: an object with the some and full rows (and nothing else is checked here). */
+export function realPressure(p: Pressure | undefined): RealPressure | undefined {
+  return p !== undefined && typeof p === "object" && p !== null && "some" in p && "full" in p ? p : undefined;
+}
+
+/** Copies the marker or both rows so caller-owned samples cannot rewrite history. */
+function copyPressure(p: Pressure, freeze = false): Pressure {
+  const out: Pressure = "unavailable" in p ? { unavailable: p.unavailable }
+    : { some: freeze ? Object.freeze({ ...p.some }) : { ...p.some }, full: freeze ? Object.freeze({ ...p.full }) : { ...p.full } };
+  return freeze ? Object.freeze(out) : out;
+}
+
+/** Pure working-set policy (memory.current minus inactive file). Early intervention
+ * additionally needs real PSI on consecutive samples. No timers, signals, process inspection or reservation IO.
  * beginIntervention is a synchronous single-flight seam, not an ACK/reservation adapter.
  * The global unconfirmed-drain fence survives invalid samples and limit changes.
  * Intervention count is diagnostic; episode allowance belongs to the durable API.
@@ -74,9 +104,12 @@ export class WorkerMemoryGuard {
     if (Number.isFinite(now)) this.lastNow = Math.max(this.lastNow, now);
     if (!ordered || now - sample.startedAtMs > this.config.sampleMs + this.config.responseBudgetMs
       || sample.available !== true || !natural(sample.currentBytes) || !positive(sample.limitBytes)
-      || !sample.stat || !sample.pressure?.full || !sample.pressure.some) return false;
-    if (!STAT_FIELDS.every((field) => natural(sample.stat[field]))) return false;
-    return [sample.pressure.full, sample.pressure.some].every((psi) => natural(psi.total)
+      || !sample.stat || !sample.pressure) return false;
+    if (!STAT_FIELDS.every((field) => natural(sample.stat[field])) || !natural(sample.stat.inactive_file)) return false;
+    if (isMarker(sample.pressure)) return true;
+    const rows = sample.pressure as Partial<RealPressure>;
+    if (!rows.full || !rows.some || Object.keys(sample.pressure).length !== 2) return false;
+    return [rows.full, rows.some].every((psi) => natural(psi.total)
       && [psi.avg10, psi.avg60, psi.avg300].every((avg) => Number.isFinite(avg) && avg >= 0 && avg <= 100));
   }
 
@@ -103,13 +136,11 @@ export class WorkerMemoryGuard {
     }
     const previous = this.previous;
     // Copy nested fields: caller-owned samples cannot rewrite policy history.
-    this.previous = {
-      ...sample, stat: { ...sample.stat },
-      pressure: { some: { ...sample.pressure.some }, full: { ...sample.pressure.full } },
-    };
+    this.previous = { ...sample, stat: { ...sample.stat }, pressure: copyPressure(sample.pressure) };
+    const workingSet = workingSetBytes(sample);
     if (!this.armed) {
       const ready = this.intervention !== undefined && this.drained && this.resolved;
-      if (!ready || sample.currentBytes >= quietBytes) this.dwell = undefined;
+      if (!ready || workingSet >= quietBytes) this.dwell = undefined;
       else if (this.dwell === undefined) this.dwell = sample.completedAtMs;
       else if (sample.completedAtMs > this.dwell && sample.completedAtMs - this.dwell >= this.config.rearmMs
         && previous !== undefined
@@ -121,23 +152,25 @@ export class WorkerMemoryGuard {
       }
       // A gap in observations cannot establish continuous low usage.
       if (previous === undefined || sample.startedAtMs - previous.completedAtMs > this.config.sampleMs + this.config.responseBudgetMs) {
-        this.dwell = ready && sample.currentBytes < quietBytes ? sample.completedAtMs : undefined;
+        this.dwell = ready && workingSet < quietBytes ? sample.completedAtMs : undefined;
       }
       return { kind: "idle", ...thresholds };
     }
     if (this.state.pendingIntervention) return { kind: "inhibited", ...thresholds };
-    if (sample.currentBytes >= highBytes) {
+    if (workingSet >= highBytes) {
       this.proposal = true;
       return { kind: "hard", ...thresholds };
     }
-    if (previous && previous.limitBytes === sample.limitBytes
+    const currentPsi = realPressure(sample.pressure);
+    const previousPsi = previous && realPressure(previous.pressure);
+    if (previous && currentPsi && previousPsi && previous.limitBytes === sample.limitBytes
       && now - previous.startedAtMs <= this.config.sampleMs + this.config.responseBudgetMs
       && sample.completedAtMs > previous.completedAtMs
-      && sample.pressure.full.total > previous.pressure.full.total
+      && currentPsi.full.total > previousPsi.full.total
       && STAT_FIELDS.some((field) => sample.stat[field] > previous.stat[field])) {
-      const totalGrowth = Math.max(0, sample.currentBytes - previous.currentBytes);
+      const totalGrowth = Math.max(0, workingSet - workingSetBytes(previous));
       const rate = totalGrowth / (sample.completedAtMs - previous.completedAtMs);
-      if (sample.currentBytes + rate * this.config.responseBudgetMs >= highBytes) {
+      if (workingSet + rate * this.config.responseBudgetMs >= highBytes) {
         this.proposal = true;
         return { kind: "early", ...thresholds };
       }
@@ -278,7 +311,7 @@ export class WorkerMemoryMonitor {
     const pressure = this.pressure.evaluate(input, now);
     this.applicable = pressure.kind === "hard" || pressure.kind === "early";
     this.latest = pressure.kind !== "inhibited" && input.available ? {
-      ...input, stat: { ...input.stat }, pressure: { some: { ...input.pressure.some }, full: { ...input.pressure.full } },
+      ...input, stat: { ...input.stat }, pressure: copyPressure(input.pressure),
     } : undefined;
     const decision = this.guard.evaluate(input, now);
     if (decision.kind === "rearmed" && this.held) {
@@ -467,7 +500,7 @@ export class WorkerMemoryMonitor {
     const a: Authority = Object.freeze({
       context: entry.context, phaseRevision: selected.phaseRevision, entry, incarnation: Object.freeze({ ...incarnation }),
       sample: Object.freeze({ ...this.latest, stat: Object.freeze({ ...this.latest.stat }),
-        pressure: Object.freeze({ some: Object.freeze({ ...this.latest.pressure.some }), full: Object.freeze({ ...this.latest.pressure.full }) }) }),
+        pressure: copyPressure(this.latest.pressure, true) }),
       request: Object.freeze({
         run_id: entry.context.run_id, worker_id: entry.context.worker_id, register_nonce: entry.context.register_nonce,
         claim_generation: entry.context.claim_generation, memory_episode: entry.context.memory_episode,

@@ -17,6 +17,7 @@ export function MultiSelectBar({
   onMarkDone,
   onDismiss,
   onFileGroup,
+  fileGroupLabel = "File as one issue",
   fileGroupDisabledReason,
 }: {
   count: number;
@@ -25,7 +26,10 @@ export function MultiSelectBar({
   onDismiss: (reason: "wont_do" | "not_an_issue") => void;
   // "File as one issue" (issue #1724). A non-empty fileGroupDisabledReason disables the button and
   // is shown as its title and in the hint line, so the user can see why the selection is ineligible.
+  // fileGroupLabel names what the click opens: "File N issues, one per repo" when the selection
+  // spans N repos (issue #3410).
   onFileGroup?: () => void;
+  fileGroupLabel?: string;
   fileGroupDisabledReason?: string;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
@@ -77,7 +81,7 @@ export function MultiSelectBar({
               disabled={!!fileGroupDisabledReason}
               title={fileGroupDisabledReason || undefined}
             >
-              File as one issue
+              {fileGroupLabel}
             </Button>
           )}
           <Button size="sm" variant="secondary" onClick={onMarkDone}>

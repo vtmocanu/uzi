@@ -489,7 +489,7 @@ frame renders when the terminal isn't interactive (a piped or offline render)
 or when blink is turned off — the checklist row's static frame is the filled
 `◕` (never a bare `○`, which would be indistinguishable from a not-started
 sibling) and the micro-bar's is `▱`.
-Set `UZI_TUI_NO_BLINK=1` to pin the static frame yourself, a reduced-motion
+Set `UZI_TUI_NO_BLINK=1`, or `blink = false` under `[tui]` in the CLI config, to pin the static frame yourself, a reduced-motion
 opt-out. The crew rail
 carries its own now line under the in-progress row (`↳ <role> · <age>`,
 with the task label beneath it), and the board's selected row gains a

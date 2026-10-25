@@ -266,7 +266,7 @@ test("production monotonic monitor selects and cancels the enrolled adapter, lea
       const time = performance.now();
       const psi = { avg10: 0, avg60: 0, avg300: 0, total: 0 };
       return { available: true, sampleId: 1, startedAtMs: time, completedAtMs: time,
-        currentBytes: 900, limitBytes: 1000, stat: { anon: 10, shmem: 0, slab_unreclaimable: 0, unevictable: 0 },
+        currentBytes: 900, limitBytes: 1000, stat: { anon: 10, shmem: 0, slab_unreclaimable: 0, unevictable: 0, inactive_file: 0 },
         pressure: { some: psi, full: psi } };
     },
     reserve: async (request) => { reservations++; return { ...request, admitted: true, authorizing: true,
@@ -582,7 +582,7 @@ test("pressure feedback never grants ordinary disposal for denied revoked or ret
         const time = performance.now();
         const psi = { avg10: 0, avg60: 0, avg300: 0, total: 0 };
         return { available: true, sampleId: 1, startedAtMs: time, completedAtMs: time,
-          currentBytes: 900, limitBytes: 1000, stat: { anon: 10, shmem: 0, slab_unreclaimable: 0, unevictable: 0 },
+          currentBytes: 900, limitBytes: 1000, stat: { anon: 10, shmem: 0, slab_unreclaimable: 0, unevictable: 0, inactive_file: 0 },
           pressure: { some: psi, full: psi } };
       },
       reserve: async (request) => {
@@ -739,7 +739,7 @@ test("long_running selected victim retains pressure outcome when effective deadl
       const now = performance.now();
       const psi = { avg10: 0, avg60: 0, avg300: 0, total: 0 };
       return { available: true, sampleId: 1, startedAtMs: now, completedAtMs: now,
-        currentBytes: 900, limitBytes: 1000, stat: { anon: 10, shmem: 0, slab_unreclaimable: 0, unevictable: 0 },
+        currentBytes: 900, limitBytes: 1000, stat: { anon: 10, shmem: 0, slab_unreclaimable: 0, unevictable: 0, inactive_file: 0 },
         pressure: { some: psi, full: psi } };
     },
     reserve: async request => ({ ...request, admitted: true, authorizing: true,

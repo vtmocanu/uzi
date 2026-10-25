@@ -230,7 +230,7 @@ and acceptance limits above remain historical records.
 
 ## #1230 coverage-park and semantic digest amendment (2026-10-20)
 
-This amendment records the dormant [PRD #1230](../prds/done/1230-semantic-completion-contract.md) M4 additions to the plan gate. Everything in it is reachable only through a run with a `semantic_planning` enrollment; production enrollment is off until #1231, no production code writes one, and only tests inject the path. The structural and legacy meanings of the sections above are unchanged. Nothing here is hosted-acceptance proof.
+This amendment records the dormant [PRD #1230](../prds/done/1230-semantic-completion-contract.md) M4 additions to the plan gate. Everything in it is reachable only through a run with a `semantic_planning` enrollment; production enrollment is off and not planned (#1231 was closed not planned), no production code writes one, and only tests inject the path. The structural and legacy meanings of the sections above are unchanged. Nothing here is hosted-acceptance proof.
 
 ### The `semantic_v1` candidate digest
 
@@ -250,11 +250,11 @@ Consistent with D16, a human revision of the plan triggers no new cross-family c
 
 ### Enrollment boundary for #1231
 
-#1231 must enroll inside the run-creation transaction, before the first claim, so the digest scheme and capability clauses above are non-vacuous from the first planning claim.
+#1231 was closed not planned (2026-10-23), so nothing enrolls today. The boundary binds any future enrollment: it must happen inside the run-creation transaction, before the first claim, so the digest scheme and capability clauses above are non-vacuous from the first planning claim.
 
 ### Coverage transport limitation
 
-Production coverage review reaches no model today: see the [coverage transport limitation](1225-structural-completion-interlock-invariants.md#coverage-transport-limitation) in ADR-1225. Until #1231 establishes enforceable bounds, a production call would settle as coverage-unavailable (`semantic_park: coverage_unavailable`) rather than reach a model.
+Production coverage review reaches no model today: see the [coverage transport limitation](1225-structural-completion-interlock-invariants.md#coverage-transport-limitation) in ADR-1225. Because no enforceable bounds exist (#1231 is not planned), a production call would settle as coverage-unavailable (`semantic_park: coverage_unavailable`) rather than reach a model.
 
 ## Advisory plan coverage amendment (2026-10-23, #3334 / #3168 M1)
 

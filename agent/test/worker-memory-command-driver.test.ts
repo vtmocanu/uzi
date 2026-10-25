@@ -15,7 +15,7 @@ function fixture(windowMs = 1000) {
   const baseline = [1, 2, 3].map((sampleId) => ({
     available: true, sampleId, startedAtMs: sampleId, completedAtMs: sampleId,
     currentBytes: 64 * 1024 ** 2, limitBytes: 1024 ** 3,
-    stat: { anon: 0, shmem: 0, slab_unreclaimable: 0, unevictable: 0 },
+    stat: { anon: 0, shmem: 0, slab_unreclaimable: 0, unevictable: 0, inactive_file: 0 },
     pressure: { some: { avg10: 0, avg60: 0, avg300: 0, total: 0 }, full: { avg10: 0, avg60: 0, avg300: 0, total: 0 } },
   } satisfies Extract<ReturnType<WorkerMemoryReader["sample"]>, { available: true }>));
   const plan = calibrationPlan({ dedicated: true, baseline, windowMs });

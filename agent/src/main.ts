@@ -1,6 +1,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig, MAX_CONCURRENT_RUNS_SOFT_CEILING, type ExecutorKind, type Config } from "./config.js";
+import { configureGoConcurrency } from "./go-concurrency.js";
 import { createLogger, type Logger } from "./log.js";
 import { maintenanceBootstrapRoots, readMaintenancePosture, recordMaintenanceBootstrap, snapshotMaintenanceBootstrap, terminalMaintenanceProof } from "./run-quiescence.js";
 import { MaintenanceWriterExclusion } from "./maintenance-exclusion.js";
@@ -346,6 +347,12 @@ async function main(): Promise<void> {
   log.addSecret(config.workerToken);
   fatalLog = log;
   lifecyclePhase = "startup";
+  // Issue #3382: optional Go build concurrency defaults for every scrubbed command env.
+  configureGoConcurrency(config.goConcurrency);
+  log.info("go concurrency defaults", {
+    build_parallelism: config.goConcurrency.buildParallelism ?? "unset",
+    max_procs: config.goConcurrency.maxProcs ?? "unset",
+  });
   // #3031 E6: bounded, non-gating posture diagnostics; the producer never gates on them.
   const bootstrap = maintenanceBootstrapRoots();
   log.info("terminal maintenance bootstrap posture", { ...readMaintenancePosture(),

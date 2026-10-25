@@ -121,7 +121,7 @@ func (m tuiModel) selectedCodexRateMeters() (shown []apitypes.CodexAccountRateLi
 // codexAccountLabel draws a Codex account's identity — its aliases joined, or the account id
 // when it carries no alias — capped to width. It carries no default badge (PRD #1653
 // amendment): the label is always drawn now, and the suffix cost columns the strip and the
-// 26-col rail cannot spare. The aliases are USER-authored and drawn through renderer.Plain
+// minimum 26-col rail cannot spare. The aliases are USER-authored and drawn through renderer.Plain
 // (D7); an all-control-byte alias set scrubs to "" and falls back to the (safe) account id.
 // "Aliases" is in d7UntrustedFields.
 func (m tuiModel) codexAccountLabel(a apitypes.CodexAccountRateLimitDTO, width int) string {
@@ -273,10 +273,10 @@ func (m tuiModel) railCodexRateMeters(now time.Time, usedRows int) string {
 	accumulated := 0
 	for _, a := range shown {
 		dim := a.Status == "stale"
-		lines := []string{m.pal.faint.Render(m.codexAccountLabel(a, laneRailWidth))}
+		lines := []string{m.pal.faint.Render(m.codexAccountLabel(a, m.railWidth()))}
 		for _, b := range a.Buckets {
 			if b.ID != codexMainBucketID {
-				lines = append(lines, m.pal.faint.Render(m.codexBucketLabel(b, laneRailWidth)))
+				lines = append(lines, m.pal.faint.Render(m.codexBucketLabel(b, m.railWidth())))
 			}
 			lines = append(lines, m.codexRailWindowLine(b.Primary, dim, now))
 			if b.Secondary != nil {

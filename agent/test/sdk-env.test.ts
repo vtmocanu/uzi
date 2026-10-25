@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { buildSdkEnv, type SdkEnv } from "../src/sdk-env.js";
+import { buildCheckEnv, buildSdkEnv, type SdkEnv } from "../src/sdk-env.js";
+import { configureGoConcurrency } from "../src/go-concurrency.js";
 import { runnerPath } from "../src/runner-uid.js";
 
 // The sparse-env guarantee (primary directive): the SDK subprocess sees ONLY
@@ -176,5 +177,49 @@ describe("buildSdkEnv", () => {
     assert.strictEqual(env.ANTHROPIC_AUTH_TOKEN, undefined);
     assert.ok(!JSON.stringify(env).includes("attacker"));
     assert.strictEqual(env.PATH, "/nix/bin");
+  });
+});
+
+describe("Go concurrency defaults (issue #3382)", () => {
+  afterEach(() => { configureGoConcurrency({}); });
+  const hostile = { PATH: "/nix/bin", GOFLAGS: "-toolexec=evil", GOMAXPROCS: "99" };
+
+  it("adds no GOFLAGS or GOMAXPROCS key when unset, in either builder", () => {
+    for (const env of [buildSdkEnv(FAKE_OAUTH, HOME_DIR), buildCheckEnv({ GOFLAGS: "-x", GOMAXPROCS: "8" }, HOME_DIR)]) {
+      assert.equal(Object.hasOwn(env, "GOFLAGS"), false);
+      assert.equal(Object.hasOwn(env, "GOMAXPROCS"), false);
+    }
+  });
+
+  it("buildSdkEnv carries each setting, overriding a provisioned value, without touching protected keys", () => {
+    configureGoConcurrency({ buildParallelism: 2 });
+    let env = buildSdkEnv(FAKE_OAUTH, HOME_DIR);
+    assert.equal(env.GOFLAGS, "-p=2");
+    assert.equal(Object.hasOwn(env, "GOMAXPROCS"), false);
+    configureGoConcurrency({ maxProcs: 3 });
+    env = buildSdkEnv(FAKE_OAUTH, HOME_DIR);
+    assert.equal(env.GOMAXPROCS, "3");
+    assert.equal(Object.hasOwn(env, "GOFLAGS"), false);
+    configureGoConcurrency({ buildParallelism: 2, maxProcs: 3 });
+    env = buildSdkEnv(FAKE_OAUTH, HOME_DIR, hostile);
+    assert.equal(env.GOFLAGS, "-p=2");
+    assert.equal(env.GOMAXPROCS, "3");
+    assert.equal(env.PATH, "/nix/bin");
+    assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, FAKE_OAUTH);
+    assert.equal(env.HOME, HOME_DIR);
+    assert.equal(env.ANTHROPIC_API_KEY, undefined);
+  });
+
+  it("buildCheckEnv carries the settings with a provisioned PATH and ignores host GOFLAGS", () => {
+    configureGoConcurrency({ buildParallelism: 2, maxProcs: 3 });
+    const env = buildCheckEnv({ GOFLAGS: "-toolexec=evil", GOMAXPROCS: "99", PATH: "/img" }, HOME_DIR, { PATH: "/nix/bin" });
+    assert.equal(env.GOFLAGS, "-p=2");
+    assert.equal(env.GOMAXPROCS, "3");
+    assert.equal(env.PATH, "/nix/bin");
+    assert.equal(env.HOME, HOME_DIR);
+    configureGoConcurrency({ maxProcs: 4 });
+    const only = buildCheckEnv({ GOFLAGS: "-x" }, HOME_DIR);
+    assert.equal(only.GOMAXPROCS, "4");
+    assert.equal(Object.hasOwn(only, "GOFLAGS"), false);
   });
 });

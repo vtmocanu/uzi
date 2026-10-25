@@ -63,7 +63,7 @@ func wrapWords(text string, width, maxRows int) []string {
 // renderProgress is the crew rail's PROGRESS block (PRD #2602), drawn above MILESTONES and
 // separate from renderMilestones so it still renders for a planning, plan-gate or
 // no-milestone run (renderMilestones returns "" for an empty frozen list). The rail is
-// laneRailWidth columns: the block is a top line (the percent or a state flag, with the
+// railWidth() columns (26 at the minimum): the block is a top line (the percent or a state flag, with the
 // milestone done/total counts when available in the percent state) followed by optional
 // phase, Now-note, since, planning and may-be-blocked-by lines.
 //
@@ -94,7 +94,7 @@ func (m tuiModel) renderProgress() string {
 		}
 		lines = append(lines, top)
 		if p.Phase != "" {
-			lines = append(lines, faint("phase ▸ ")+m.renderer.Plain(p.Phase, laneRailWidth-visualWidth("phase ▸ ")))
+			lines = append(lines, faint("phase ▸ ")+m.renderer.Plain(p.Phase, m.railWidth()-visualWidth("phase ▸ ")))
 		}
 		if p.NowNote != nil {
 			lines = append(lines, m.nowNoteLines(p.NowNote, faint)...)
@@ -150,11 +150,11 @@ func (m tuiModel) renderProgress() string {
 
 // nowNoteLines draws the model-written (untrusted) Now summary (PRD #2603 mock 4) inside the rail:
 // the text wraps under a `now` label, capped at nowMaxRows rows, and `model summary · <age> ago`
-// rides the last text row when it fits laneRailWidth, else its own faint row, so the marking is
+// rides the last text row when it fits railWidth(), else its own faint row, so the marking is
 // never clamped away by joinColumns. It returns nil for a blank note.
 func (m tuiModel) nowNoteLines(note *apitypes.ProgressNote, faint func(string) string) []string {
 	indent := strings.Repeat(" ", visualWidth(nowLabel))
-	rowW := laneRailWidth - visualWidth(nowLabel)
+	rowW := m.railWidth() - visualWidth(nowLabel)
 	text := m.renderer.Plain(note.Text, rowW*nowMaxRows+nowMaxRows)
 	wrapped := wrapWords(text, rowW, nowMaxRows)
 	if len(wrapped) == 0 {
@@ -166,7 +166,7 @@ func (m tuiModel) nowNoteLines(note *apitypes.ProgressNote, faint func(string) s
 	}
 	last := len(wrapped) - 1
 	// The label and the hanging indent are the same width, so one test covers every row count.
-	inline := visualWidth(indent)+visualWidth(wrapped[last])+3+visualWidth(tag) <= laneRailWidth
+	inline := visualWidth(indent)+visualWidth(wrapped[last])+3+visualWidth(tag) <= m.railWidth()
 	var lines []string
 	for i, row := range wrapped {
 		prefix := indent

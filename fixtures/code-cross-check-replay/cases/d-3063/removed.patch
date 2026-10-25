@@ -1,0 +1,13 @@
+diff --git a/web/src/lib/apiTypes.ts b/web/src/lib/apiTypes.ts
+index fadfd7d8..bb94b182 100644
+--- a/web/src/lib/apiTypes.ts
++++ b/web/src/lib/apiTypes.ts
+@@ -4529,7 +4529,7 @@ export interface FileFindingRequest {
+ }
+ 
+ export interface FindingGroupFileRequest {
+-  ids?: string[] | null;
++  ids: string[] | null;
+   title?: string | null;
+   description?: string | null;
+   labels?: string[] | null;

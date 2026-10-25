@@ -139,8 +139,9 @@ func newTestClient(srv *httptest.Server) *HTTPClient {
 // TestHTTPClientDeleteWorkerCustodyConflict pins the M4b client contract (PRD #1296):
 // a 409 carrying a `custody_holds` count is surfaced as a DISTINGUISHABLE
 // *WorkerCustodyConflictError carrying the count and the server message, while still
-// resolving to ExitConflict for a caller that returns it straight to main; an ordinary
-// active-runs 409 (no count) stays a plain *ExitError; and a 204 is success.
+// resolving to ExitConflict for a caller that returns it straight to main; an active-runs
+// 409 naming its runs (#3390) is the typed *WorkerActiveRunsConflictError, while one without
+// an active_runs key stays a plain *ExitError; and a 204 is success.
 func TestHTTPClientDeleteWorkerCustodyConflict(t *testing.T) {
 	t.Run("custody 409 is the typed error", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -169,7 +170,56 @@ func TestHTTPClientDeleteWorkerCustodyConflict(t *testing.T) {
 		}
 	})
 
-	t.Run("active-runs 409 stays a plain ExitError", func(t *testing.T) {
+	t.Run("active-runs 409 names its runs", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"error":"worker has active runs; cancel them before deleting it","active_runs":[{"id":"r1","kind":"issue","status":"queued","issue_iid":7,"title":"Fix login"},{"id":"r2","kind":"chat","status":"running","issue_iid":null,"title":"chat"}],"active_runs_total":5}`))
+		}))
+		defer srv.Close()
+
+		err := newTestClient(srv).DeleteWorker(context.Background(), "w1")
+		var active *WorkerActiveRunsConflictError
+		if !errors.As(err, &active) {
+			t.Fatalf("err = %v (%T), want *WorkerActiveRunsConflictError", err, err)
+		}
+		if active.Total != 5 || len(active.Runs) != 2 {
+			t.Fatalf("active = %+v, want total 5 and 2 runs", active)
+		}
+		if r := active.Runs[0]; r.ID != "r1" || r.Kind != "issue" || r.Status != "queued" || r.Title != "Fix login" || r.IssueIID == nil || *r.IssueIID != 7 {
+			t.Errorf("run 0 = %+v", r)
+		}
+		if r := active.Runs[1]; r.ID != "r2" || r.IssueIID != nil {
+			t.Errorf("run 1 = %+v, want nil issue iid", r)
+		}
+		if !strings.Contains(active.Error(), "worker has active runs") {
+			t.Errorf("Error() = %q, want the server message", active.Error())
+		}
+		if ExitCodeFor(err) != ExitConflict {
+			t.Errorf("ExitCodeFor = %d, want %d", ExitCodeFor(err), ExitConflict)
+		}
+	})
+
+	t.Run("empty active_runs array still counts as present", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"error":"worker has active runs; cancel them before deleting it","active_runs":[],"active_runs_total":2}`))
+		}))
+		defer srv.Close()
+
+		err := newTestClient(srv).DeleteWorker(context.Background(), "w1")
+		var active *WorkerActiveRunsConflictError
+		if !errors.As(err, &active) {
+			t.Fatalf("err = %v (%T), want *WorkerActiveRunsConflictError", err, err)
+		}
+		if active.Runs == nil || len(active.Runs) != 0 || active.Total != 2 {
+			t.Fatalf("active = %+v, want non-nil empty Runs and total 2", active)
+		}
+		if ExitCodeFor(err) != ExitConflict {
+			t.Errorf("ExitCodeFor = %d, want %d", ExitCodeFor(err), ExitConflict)
+		}
+	})
+
+	t.Run("active-runs 409 without active_runs stays a plain ExitError", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusConflict)
 			_, _ = w.Write([]byte(`{"error":"worker has active runs; cancel them before deleting it"}`))
@@ -180,6 +230,10 @@ func TestHTTPClientDeleteWorkerCustodyConflict(t *testing.T) {
 		var custody *WorkerCustodyConflictError
 		if errors.As(err, &custody) {
 			t.Fatalf("an active-runs 409 (no custody_holds) must NOT be the custody type: %v", err)
+		}
+		var active *WorkerActiveRunsConflictError
+		if errors.As(err, &active) {
+			t.Fatalf("a 409 without active_runs must stay a plain *ExitError, got %T: %v", err, err)
 		}
 		if ExitCodeFor(err) != ExitConflict {
 			t.Errorf("ExitCodeFor = %d, want %d", ExitCodeFor(err), ExitConflict)

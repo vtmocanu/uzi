@@ -57,7 +57,7 @@ test("fixture abort settles only its exact producer callback while its sibling r
 test("planned charge metadata names four fixed logical budgets without starting load", () => {
   for (const [rounds, budget] of [[16, 33554432], [32, 67108864]] as const) {
     const plan = { limitBytes: rounds / 16 * 1024 ** 3, ceilingBytes: rounds / 16 * 512 * 1024 ** 2,
-      baselineBytes: 0, allocationBytes: 4 * budget, overheadBytes: 64 * 1024 ** 2,
+      baselineBytes: 0, workingSetBaselineBytes: 0, allocationBytes: 4 * budget, overheadBytes: 64 * 1024 ** 2,
       chunkBytes: 1048576, rounds, windowMs: 30000 };
     assert.deepEqual(plannedChargeClasses(plan), [
       "touched_anonymous", "dirty_disk", "fsynced_read_file_cache", "tmpfs_shmem",
@@ -213,7 +213,7 @@ test("ACK publication keeps old JSON readable until the owned temporary file is 
 const dwellGuard = { reserveBytes: 100, hysteresisBytes: 20, sampleMs: 250, responseBudgetMs: 5000, rearmMs: 500 };
 const lowSample = (at: number, sampleId: number, currentBytes = 50): Parameters<typeof freshPostCleanupDwell>[0][number] => ({
   available: true, sampleId, startedAtMs: at - 1, completedAtMs: at, currentBytes, limitBytes: 200,
-  stat: { anon: 0, shmem: 0, slab_unreclaimable: 0, unevictable: 0 },
+  stat: { anon: 0, shmem: 0, slab_unreclaimable: 0, unevictable: 0, inactive_file: 0 },
   pressure: { some: { avg10: 0, avg60: 0, avg300: 0, total: 0 }, full: { avg10: 0, avg60: 0, avg300: 0, total: 0 } },
 });
 
@@ -408,7 +408,7 @@ function observedLeg() {
   const psi = (total: number) => ({ some: { avg10: 0, avg60: 0, avg300: 0, total }, full: { avg10: 0, avg60: 0, avg300: 0, total } });
   const at = (sampleId: number, currentBytes: number, total: number) => ({
     available: true as const, sampleId, startedAtMs: sampleId * 250, completedAtMs: sampleId * 250 + 1, currentBytes, limitBytes,
-    stat: { anon: currentBytes, shmem: 0, slab_unreclaimable: 0, unevictable: 0 }, pressure: psi(total) });
+    stat: { anon: currentBytes, shmem: 0, slab_unreclaimable: 0, unevictable: 0, inactive_file: 0 }, pressure: psi(total) });
   const guard = new WorkerMemoryGuard({ enabled: true, reserveBytes: limitBytes - high, hysteresisBytes: 8 * 1024 ** 2,
     sampleMs: 250, responseBudgetMs: 5000, rearmMs: 500, maxInterventions: 2 });
   return { high, guard, s7: at(7, 251_277_312, 0), s8: at(8, 271_241_216, 1400), drained: at(9, 145_920_000, 1400),
@@ -443,4 +443,41 @@ test("guard-facing copies leave the recorded samples and the pin unchanged", () 
   s7.pressure.full.total = 77;
   assert.deepEqual(s8, recorded, "guard-facing copy shares no nested object with the sample");
   assert.deepEqual(pin, pinned, "pin shares no nested object with its source or the guard-facing copy");
+});
+
+test("an absent-PSI host pins the absence marker, never hits early, and still needs the sampled hard crossing", () => {
+  const absent = (value: ReturnType<typeof observedLeg>["s7"], marker: "absent" | "unsupported") => ({ ...value, pressure: { unavailable: marker } });
+  for (const marker of ["absent", "unsupported"] as const) {
+    const { guard, s7, s8, crossing } = observedLeg(); // a fresh guard: its sample sequence is ordered
+    const pin = pinGuardPressure(absent(s7, marker));
+    assert.deepEqual(pin, { mode: "pinned_to_first_load_sample", sampleId: 7, pressure: { unavailable: marker } });
+    assert.equal(guard.evaluate(guardFacingSample(absent(s8, marker), pin), s8.completedAtMs).kind, "idle");
+    assert.equal(guard.evaluate(guardFacingSample(absent(crossing, marker), pin), crossing.completedAtMs).kind, "hard");
+    // The marker is copied: later edits to the source or to a guard-facing copy cannot reach the pin.
+    const source = absent(s7, marker), copy = pinGuardPressure(source);
+    (source.pressure as { unavailable: string }).unavailable = "changed";
+    assert.deepEqual(copy.pressure, { unavailable: marker });
+  }
+  // Without real PSI nothing intervenes early, so a drained load still leaves no crossing.
+  const { high, s7, s8 } = observedLeg();
+  assert.throws(() => hardCrossing([s7, s8], high), /real hard crossing required; early PSI cannot replace it/);
+});
+
+test("cache-heavy samples whose raw current reaches H are not a hard crossing", () => {
+  const { high, guard, s7, s8, crossing } = observedLeg();
+  // Raw current is above H, but 60 MB of it is inactive file cache that the guard subtracts.
+  const cached = { ...crossing, currentBytes: high + 10, stat: { ...crossing.stat, inactive_file: 60_000_000 } };
+  assert.equal(guard.evaluate(guardFacingSample(cached, pinGuardPressure(s7)), cached.completedAtMs).kind, "idle");
+  assert.throws(() => hardCrossing([s7, s8, cached], high), /real hard crossing required; early PSI cannot replace it/);
+  assert.deepEqual(hardCrossing([s7, cached, crossing], high), { low: cached, above: crossing });
+});
+
+test("post-cleanup dwell is judged on the working set, not raw current", () => {
+  // Quiet is 200 - 100 - 20 = 80: a 100-byte sample with 40 bytes of inactive file is quiet.
+  const cachedQuiet = (at: number, id: number) => ({ ...lowSample(at, id, 100),
+    stat: { anon: 0, shmem: 0, slab_unreclaimable: 0, unevictable: 0, inactive_file: 40 } });
+  const samples = [1250, 1500, 1750].map((at, i) => cachedQuiet(at, i + 1));
+  assert.equal(freshPostCleanupDwell(samples, 1100, 1750, dwellGuard, 200), true);
+  const busy = samples.map((sample) => ({ ...sample, stat: { ...sample.stat, inactive_file: 0 } }));
+  assert.equal(freshPostCleanupDwell(busy, 1100, 1750, dwellGuard, 200), false);
 });

@@ -589,7 +589,7 @@ async function runSharedCloneSection(
   const bare = await gitCache.ensureClone(originPath);
 
   // 3. A wip(park) marker over the pre-advance floor, published as THIS run's own checkpoint
-  //    (refs/uzi-checkpoints/<branch>) — the git-materialize.test.ts "owner-matched diverged
+  //    (refs/uzi-checkpoints/<checkpoint-key>) — the git-materialize.test.ts "owner-matched diverged
   //    checkpoint leg" template, driven through the real GitCache.
   const branch = "agent/issue-shared-clone";
   const seedRunId = "run-shared-a";

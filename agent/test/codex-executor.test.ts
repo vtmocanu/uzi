@@ -63,6 +63,7 @@ import { GitCache, assertCaptureLaunch } from "../src/git.js";
 import { FakeApi } from "./fake-api.js";
 import { makeFixture } from "./fixture-repo.js";
 import { makeClaim, testGitCacheOptions, recordingLogger, withReceipts } from "./helpers.js";
+import { configureGoConcurrency } from "../src/go-concurrency.js";
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import { WORKER_UID, RUNNER_UID, runnerCommand, commandRootCommand } from "../src/runner-uid.js";
@@ -804,7 +805,7 @@ describe("M3 actual runner memory Codex delivery", () => {
         const time = performance.now();
         return { available: true, sampleId: ++sampleId, startedAtMs: time, completedAtMs: time,
           currentBytes: usage, limitBytes: 1000,
-          stat: { anon: 1, shmem: 0, slab_unreclaimable: 0, unevictable: 0 },
+          stat: { anon: 1, shmem: 0, slab_unreclaimable: 0, unevictable: 0, inactive_file: 0 },
           pressure: { some: { avg10: 0, avg60: 0, avg300: 0, total: 0 },
             full: { avg10: 0, avg60: 0, avg300: 0, total: 0 } } };
       } },
@@ -7847,7 +7848,11 @@ describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
       assert.ok(turnTexts(rig, 0)[0]!.includes(issueDescription), "planning received all four issue criteria");
       assert.equal(rig.providerLaunches(), 2, "normal approval epoch recreation retained");
       const request = rig.epochs[1]!.transport.requests.find(r => r.method === "turn/start")!;
-      return (request.params as { input: { text: string }[] }).input[0]!.text;
+      const prompt = (request.params as { input: { text: string }[] }).input[0]!.text;
+      const normalized = prompt.replace(/\s+/g, " ");
+      assert.ok(normalized.includes("it supersedes the plan you drafted in this thread and, except for in-scope additions the approval advice above permits, the issue text; do not re-plan or resubmit it."));
+      assert.ok(!normalized.includes("supersedes the issue text and the plan you drafted"));
+      return prompt;
     }
     const baseline = await capture();
     assert.equal(await capture(null), baseline);
@@ -8962,6 +8967,27 @@ describe("CodexExecutor: credential-free command env (item 6)", () => {
     assert.equal(env.TMPDIR, "/private/tmp");
   });
 
+  it("issue #3382: applies the configured Go concurrency after the toolEnv fold, and adds no key when unset", () => {
+    const tool = { PATH: "/provisioned/go/bin", GOFLAGS: "-toolexec=evil", GOMAXPROCS: "99" };
+    try {
+      configureGoConcurrency({ buildParallelism: 2, maxProcs: 3 });
+      const set = buildCommandEnv("/private/tmp", tool);
+      assert.equal(set.GOFLAGS, "-p=2");
+      assert.equal(set.GOMAXPROCS, "3");
+      assert.equal(set.PATH, `${FIXED_PATH}:/provisioned/go/bin`);
+      configureGoConcurrency({ maxProcs: 4 });
+      const partial = buildCommandEnv("/private/tmp", {});
+      assert.equal(partial.GOMAXPROCS, "4");
+      assert.equal(Object.hasOwn(partial, "GOFLAGS"), false);
+      configureGoConcurrency({});
+      const unset = buildCommandEnv("/private/tmp", {});
+      assert.equal(Object.hasOwn(unset, "GOFLAGS"), false);
+      assert.equal(Object.hasOwn(unset, "GOMAXPROCS"), false);
+    } finally {
+      configureGoConcurrency({});
+    }
+  });
+
   it("with no provisioned PATH the fixed boundary PATH stands alone", () => {
     assert.equal(buildCommandEnv("/private/tmp", {}).PATH, FIXED_PATH);
   });
@@ -9022,6 +9048,50 @@ describe("CodexExecutor: credential-free command env (item 6)", () => {
     assert.equal(env.LOCALE_ARCHIVE, "/nix/locale-archive");
     assert.equal(env.UZI_CODEX_COMMANDENV_CANARY, undefined, "process.env is not inherited into the credential-free command identity");
   });
+
+  // Issue #3382: asserted at the launch seams of a real executor run (the fileop root's launch
+  // spec and the env the command seam receives), with a provisioned toolEnv in play.
+  for (const [label, settings, expected] of [
+    ["both set", { buildParallelism: 2, maxProcs: 3 }, { GOFLAGS: "-p=2", GOMAXPROCS: "3" }],
+    ["unset", {}, {}],
+  ] as const) {
+    it(`issue #3382: run() launches commands with the configured Go concurrency (${label}) next to a provisioned toolEnv`, async () => {
+      const rig = makeRig();
+      rig.deps = {
+        ...rig.deps,
+        provisionRunTools: async () => ({
+          toolEnv: { PATH: "/provisioned/go/bin" } as Record<string, string>,
+        }),
+      };
+      rig.transport
+        .push(threadStarted())
+        .push(toolCall(1, "Bash", { command: "go build ./..." }, "th-1", "tn-1", "c-go"))
+        .push(signalDone())
+        .push(turnCompleted("completed"))
+        .end();
+      try {
+        configureGoConcurrency(settings);
+        await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "go concurrency run");
+      } finally {
+        configureGoConcurrency({});
+      }
+      assert.equal(rig.fileopSpawns.length, 1);
+      assert.equal(rig.spawnCommandCalls.length, 1, "the Bash effect reached the command seam");
+      const launched = [
+        rig.fileopSpawns[0]!.env,
+        (rig.spawnCommandCalls[0]!.opts as { env: NodeJS.ProcessEnv }).env,
+      ];
+      for (const env of launched) {
+        assert.ok(String(env.PATH).includes("/provisioned/go/bin"), "the provisioned PATH rides in the same env");
+        assert.equal(env.GOFLAGS, (expected as { GOFLAGS?: string }).GOFLAGS);
+        assert.equal(env.GOMAXPROCS, (expected as { GOMAXPROCS?: string }).GOMAXPROCS);
+        if (label === "unset") {
+          assert.equal(Object.hasOwn(env, "GOFLAGS"), false, "an unset setting adds no GOFLAGS key");
+          assert.equal(Object.hasOwn(env, "GOMAXPROCS"), false);
+        }
+      }
+    });
+  }
 
   // PRD #1493 M3 (part C) — the sandbox mode in the emitted --mode token comes ONLY from the
   // worker Config, never from a UZI_CODEX_COMMAND_SANDBOX value smuggled through the
@@ -12694,6 +12764,84 @@ describe("Codex completion interlock", () => {
     assert.ok(rig.sessionOps.persist >= 2);
     assert.ok(rig.epochs[1]!.transport.requests.some((r) => r.method === "thread/resume"));
     assert.match(JSON.stringify(rig.epochs[1]!.transport.requests.find((r) => r.method === "turn/start")?.params), /m2: Remaining/);
+  });
+
+  // PRD #1232 M2: the Codex arm of the #1220 (b0ffd0ea) regression, mirroring the Claude arm in
+  // runner-completion-1220-regression.test.ts. Five milestones frozen, the lead declares four.
+  const FROZEN_FIVE = ["m1", "m2", "m3", "m4", "m5"].map((id) => ({ id, title: `title of ${id}` }));
+  const declareEpoch = (n: number, declared: string[], first: boolean): Responder => {
+    const frames = (t: FakeTransport, th: string, tn: string): void => {
+      t.push(toolCall(n, "signal_done", { milestones_completed: declared }, th, tn, `done-${n}`))
+        .push(turnCompleted("completed", th, tn));
+    };
+    return first ? epochResponder("th-1", `tn-${n}`, frames) : resumedEpochResponder("th-1", `tn-${n}`, frames);
+  };
+  const turnPrompts = (rig: MultiRig): string[] =>
+    rig.epochs.map((e) => JSON.stringify(e.transport.requests.find((r) => r.method === "turn/start")?.params));
+
+  it("b0ffd0ea shape: 5 frozen / 4 declared checkpoints first, names m5 on the SAME thread, never finalizes", async () => {
+    const four = ["m1", "m2", "m3", "m4"];
+    const rig = makeMultiEpochRig([declareEpoch(1, four, true), declareEpoch(2, four, false), declareEpoch(3, four, false)]);
+    const order: string[] = [];
+    const attempts: unknown[] = [];
+    const holds: string[] = [];
+    const { ctx } = makeCtx({
+      kind: "issue", completionInterlock: true, config: { max_iterations: 10 },
+      frozenMilestones: FROZEN_FIVE,
+      checkpoint: async () => { order.push("checkpoint"); },
+      worktreeFingerprint: async () => "TIP\n M docs/adr.md",
+      recordCompletionAttempt: async (args) => {
+        order.push("attempt");
+        attempts.push(args);
+        return { unmet: ["m5"], attemptCount: attempts.length };
+      },
+      askCompletionQuestion: async (unmet) => {
+        assert.deepEqual(unmet, ["m5"]);
+        order.push("ask");
+        return { outcome: "expired" };
+      },
+      enterCompletionHold: async (reason) => { order.push("hold"); holds.push(reason); return true; },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "codex b0ffd0ea");
+
+    assert.deepEqual(order.slice(0, 2), ["checkpoint", "attempt"], "checkpoint precedes the first server attempt");
+    assert.deepEqual(attempts, Array.from({ length: 3 }, () => ({
+      declared: four, head: "TIP", worktreeFingerprint: "TIP\n M docs/adr.md",
+    })), "three identical no-progress attempts, each declaring only m1..m4");
+    // Same thread: every re-prompt is a thread/resume of th-1 whose turn names m5 and its title.
+    const prompts = turnPrompts(rig);
+    assert.equal(rig.providerLaunches(), 3);
+    for (const [i, epoch] of rig.epochs.slice(1).entries()) {
+      const resumes = epoch.transport.requests.filter((r) => r.method === "thread/resume");
+      assert.deepEqual(resumes.map((r) => rec(r.params).threadId), ["th-1"], `epoch ${i + 1} resumed th-1`);
+      assert.match(prompts[i + 1]!, /m5: title of m5/);
+      assert.doesNotMatch(prompts[i + 1]!, /m4: title of m4/, "only the unmet milestone is named");
+    }
+    // Never finalized: parked in the hold, no publishable (non-held) result.
+    assert.equal(holds.length, 1);
+    assert.deepEqual(order.slice(-2), ["ask", "hold"]);
+    assert.deepEqual(result.completionHeld, { reason: holds[0] });
+    assert.deepEqual(result.milestonesCompleted, four);
+  });
+
+  it("mutation control (positive): all 5 declared (unmet empties) finalizes", async () => {
+    const rig = makeMultiEpochRig([declareEpoch(1, ["m1", "m2", "m3", "m4", "m5"], true)]);
+    const attempts: unknown[] = [];
+    const holds: string[] = [];
+    const { ctx } = makeCtx({
+      kind: "issue", completionInterlock: true, config: { max_iterations: 10 },
+      frozenMilestones: FROZEN_FIVE,
+      checkpoint: async () => {},
+      worktreeFingerprint: async () => "TIP\n M docs/adr.md",
+      recordCompletionAttempt: async (args) => { attempts.push(args); return { unmet: [], attemptCount: attempts.length }; },
+      enterCompletionHold: async (reason) => { holds.push(reason); return true; },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "codex 5 declared");
+    assert.equal(attempts.length, 1, "one attempt, then finalize");
+    assert.deepEqual(holds, []);
+    assert.equal(result.completionHeld, undefined);
+    assert.equal(rig.providerLaunches(), 1, "no rework turn");
+    assert.deepEqual(result.milestonesCompleted, ["m1", "m2", "m3", "m4", "m5"]);
   });
 
   it("asks at three identical attempts, continues with guidance, then holds on expiry", async () => {

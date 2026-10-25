@@ -10,7 +10,7 @@ This child makes arbitrary issue/PRD requirements explicit at planning time. It 
 
 ## Owner transport activation precondition (AI-synced 2026-10-21)
 
-Maximum-size owner semantic transport is not production-readiness proof. An owner semantic gate can approach 80 MiB before the ordinary run fields, while the production API listener has 15-second read and write timeouts. A four-core worker reported about 11 seconds of server CPU for a maximum-size owner decision and race-enabled maximum-size LiveDB timeouts. These reports are not a measured production wall-time margin. The race fixtures use two-minute client budgets and omit the production listener deadlines; the non-race fixtures retain them. #1231 must verify maximum-size owner reads and decisions against production transport deadlines before activation.
+Maximum-size owner semantic transport is not production-readiness proof. An owner semantic gate can approach 80 MiB before the ordinary run fields, while the production API listener has 15-second read and write timeouts. A four-core worker reported about 11 seconds of server CPU for a maximum-size owner decision and race-enabled maximum-size LiveDB timeouts. These reports are not a measured production wall-time margin. The race fixtures use two-minute client budgets and omit the production listener deadlines; the non-race fixtures retain them. Any future semantic activation must verify maximum-size owner reads and decisions against production transport deadlines before activation.
 
 ## Problem and outcome
 

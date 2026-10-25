@@ -1,0 +1,53 @@
+{
+  "id": "d-3063",
+  "kind": "defect",
+  "input_provenance": "reconstructed",
+  "plan_source": "synthetic",
+  "source": {
+    "pr": 3063,
+    "issue": 2991
+  },
+  "squash_sha": "391b2478e092e40f2790202437d9e3c38cb48453",
+  "base_sha": "976724a58221d50da40569a439288a49fac0db0e",
+  "prefix_tree": "7fa8dd1085f8178715b2d9b6ca0e0a7849bc191e",
+  "prefix_commit": "1d4f717b9b4f03d42b69316a8145cac594c3b26b",
+  "reversal": "inferred",
+  "artifacts": {
+    "issue.md": "6907b03b1cbf9cf0fa20c63a4880e1101e15ba336dbc0b4230e0495e850df992",
+    "plan.md": "1de2341ca402f4140a4778c9bc98b067c998f31126cb1182b42c738c2bace359",
+    "prefix.patch": "249c283b80c5ccece5e6eff8730419406dcfc1aebccdff7bcec84d259b69c147",
+    "removed.patch": "a6f2b9dc321651f4b892a1de9b900823e9aac221ab15f4ec4753aa09909c6339"
+  },
+  "witnesses": [
+    {
+      "file": "witness/apiTypes.ts.blob",
+      "path": "web/src/lib/apiTypes.ts",
+      "blob_id": "fadfd7d80e02bf7ee11dc572d6887833c099e7b9",
+      "sha256": "0f050ada70cc2bfd3a2e98e141ce2fee13c1d5b6a995e6a6f2dd7ae01e43e8e6"
+    }
+  ],
+  "expected": [
+    {
+      "id": "D4",
+      "paths": [
+        "web/src/lib/apiTypes.ts",
+        "web/src/lib/api.ts"
+      ],
+      "line_range": null,
+      "use_line_range": false,
+      "match": [
+        "\\bids\\b[\\s\\S]*(optional|required|missing|omit|undefined)",
+        "(optional|required)[\\s\\S]*\\bids\\b"
+      ],
+      "detectability": "read_only",
+      "rationale": "FindingGroupFileRequest declares ids as optional although the grouped file endpoint requires it, so a request can be built without any finding ids.",
+      "in_diff": true,
+      "signature": {
+        "path": "web/src/lib/apiTypes.ts",
+        "literal": "  ids?: string[] | null;",
+        "present": true,
+        "witness": "witness/apiTypes.ts.blob"
+      }
+    }
+  ]
+}

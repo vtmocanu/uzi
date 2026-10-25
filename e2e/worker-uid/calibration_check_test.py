@@ -66,7 +66,7 @@ class CheckerTest(unittest.TestCase):
         raw["sample"]["currentBytes"] = 109051904
         raw["sample"]["stat"]["anon"] = 109051904
         raw["raw"]["/sys/fs/cgroup/memory.current"] = "109051904\n"
-        raw["raw"]["/sys/fs/cgroup/memory.stat"] = "anon 109051904\nshmem 0\nslab_unreclaimable 0\nunevictable 0\n"
+        raw["raw"]["/sys/fs/cgroup/memory.stat"] = "anon 109051904\nshmem 0\nslab_unreclaimable 0\nunevictable 0\ninactive_file 0\n"
         derivation = report["derivation"]
         derivation["samplePairs"][0].update(rawDeltaBytes=16777216, positiveRateBytesPerMs=67108.864)
         derivation.update(peakPositiveGrowthPair=copy.deepcopy(derivation["samplePairs"][0]),
@@ -426,6 +426,125 @@ class CheckerTest(unittest.TestCase):
             "anon " + str(136 * mib), "anon " + str(130 * mib))
         with self.assertRaisesRegex(ValueError, "real hard crossing bracket"):
             check.verify(manifest, encode(reports), cleanup, synthetic=True)
+
+    PSI = "/sys/fs/cgroup/memory.pressure"
+
+    @staticmethod
+    def make_cache_heavy(record, current_mib, inactive_mib):
+        """Raw memory.current includes inactive file cache; anon stays unchanged."""
+        mib = 1024 ** 2
+        sample = record["sample"]
+        sample["currentBytes"] = current_mib * mib
+        sample["stat"]["inactive_file"] = inactive_mib * mib
+        record["raw"]["/sys/fs/cgroup/memory.current"] = str(current_mib * mib) + "\n"
+        record["raw"]["/sys/fs/cgroup/memory.stat"] = "".join(f"{k} {v}\n" for k, v in sample["stat"].items())
+
+    def absent_psi(self, report, errno, marker):
+        for record in report["rawSamples"]:
+            record["raw"][self.PSI] = None
+            record["rawErrors"] = {self.PSI: errno}
+            record["sample"]["pressure"] = {"unavailable": marker}
+        report["guardPressure"]["pressure"] = {"unavailable": marker}
+
+    def test_cache_heavy_raw_current_is_not_a_hard_crossing(self):
+        # Sample 5 is 160 MiB raw (above H=132 MiB) but 40 MiB is inactive file cache: its
+        # working set is the unchanged 120 MiB, so the real crossing stays at sample 6.
+        self.make_cache_heavy(self.reports[0]["rawSamples"][4], 160, 40)
+        self.verify()
+        report = self.reports[0]
+        report["response"]["legs"][0]["hardBracket"].update(lastBelowSampleId=4, firstAtOrAboveSampleId=5,
+                                                            lowerMs=1000, upperMs=1251)
+        with self.assertRaisesRegex(ValueError, "adjacent hard bracket"):
+            self.verify()
+
+    def test_cache_heavy_post_cleanup_samples_count_as_low_dwell(self):
+        # Samples 7-9 follow cleanup: raw 200 MiB is above the quiet level, but 100 MiB of it is
+        # inactive file cache, so the working set stays 100 MiB and the dwell is still low.
+        for index in (6, 7, 8):
+            self.make_cache_heavy(self.reports[0]["rawSamples"][index], 200, 100)
+        self.verify()
+
+    def test_working_set_baseline_derives_h_and_raw_baseline_stays_the_budget(self):
+        for field, value in (("workingSetBaselineBytes", 99 * 1024 ** 2), ("baselineBytes", 99 * 1024 ** 2)):
+            with self.subTest(field=field):
+                self.setUp()
+                self.reports[0]["plan"][field] = value
+                with self.assertRaisesRegex(ValueError, "fixed allocation plan"):
+                    self.verify()
+        # A cache-heavy baseline sample: raw maximum 150 MiB, working-set maximum still 100 MiB.
+        self.setUp()
+        self.make_cache_heavy(self.reports[0]["rawSamples"][1], 150, 50)
+        self.reports[0]["plan"]["baselineBytes"] = 150 * 1024 ** 2
+        self.verify()
+        self.reports[0]["plan"]["workingSetBaselineBytes"] = 150 * 1024 ** 2
+        with self.assertRaisesRegex(ValueError, "fixed allocation plan"):
+            self.verify()
+
+    def test_missing_inactive_file_is_refused(self):
+        record = self.reports[0]["rawSamples"][0]
+        del record["sample"]["stat"]["inactive_file"]
+        with self.assertRaisesRegex(ValueError, "raw stat mismatch"):
+            self.verify()
+
+    def test_inactive_file_must_match_raw_memory_stat(self):
+        self.reports[0]["rawSamples"][0]["sample"]["stat"]["inactive_file"] += 4096
+        with self.assertRaisesRegex(ValueError, "raw stat mismatch"):
+            self.verify()
+
+    def test_absent_psi_with_errno_binding_is_accepted(self):
+        for errno, marker in (("ENOENT", "absent"), ("ENOTSUP", "unsupported")):
+            with self.subTest(errno=errno):
+                self.setUp()
+                for report in self.reports:
+                    self.absent_psi(report, errno, marker)
+                self.verify()
+
+    def test_absent_psi_marker_must_match_the_recorded_errno(self):
+        for errno, marker in (("ENOENT", "unsupported"), ("ENOTSUP", "absent")):
+            with self.subTest(errno=errno, marker=marker):
+                self.setUp()
+                self.absent_psi(self.reports[0], errno, marker)
+                self.reports[0]["rawSamples"][2]["sample"]["pressure"] = {"unavailable": "unsupported" if marker == "absent" else "absent"}
+                with self.assertRaisesRegex(ValueError, "raw PSI absence marker mismatch"):
+                    self.verify()
+
+    def test_unreadable_psi_needs_a_valid_recorded_errno(self):
+        record = lambda r: r["rawSamples"][0]
+        cases = (
+            ("no errno", "raw bytes unavailable/oversized",
+             lambda r: (record(r)["raw"].update({self.PSI: None}),
+                        record(r)["sample"].update(pressure={"unavailable": "absent"}))),
+            ("other errno", "raw errors",
+             lambda r: (record(r)["raw"].update({self.PSI: None}),
+                        record(r).update(rawErrors={self.PSI: "EACCES"}))),
+            ("errno on a readable file", None, lambda r: record(r).update(rawErrors={self.PSI: "ENOENT"})),
+            ("foreign path", None,
+             lambda r: record(r).update(rawErrors={"/sys/fs/cgroup/memory.current": "ENOENT"})),
+            ("missing field", None, lambda r: record(r).pop("rawErrors")),
+            ("null elsewhere", None, lambda r: (record(r)["raw"].update({"/sys/fs/cgroup/memory.stat": None}),
+                                                record(r).update(rawErrors={self.PSI: "ENOENT"}))),
+        )
+        for name, message, mutate in cases:
+            with self.subTest(name=name):
+                self.setUp()
+                mutate(self.reports[0])
+                if message:
+                    with self.assertRaisesRegex(ValueError, message):
+                        self.verify()
+                else:
+                    with self.assertRaises((ValueError, KeyError, TypeError)):
+                        self.verify()
+
+    def test_absent_psi_still_requires_the_pin_and_the_hard_crossing(self):
+        for report in self.reports:
+            self.absent_psi(report, "ENOENT", "absent")
+        self.verify()
+        self.reports[1]["guardPressure"]["pressure"] = {"unavailable": "unsupported"}
+        with self.assertRaisesRegex(ValueError, "guard-facing PSI pin"):
+            self.verify()
+        self.reports[1]["guardPressure"] = None
+        with self.assertRaisesRegex(ValueError, "guard-facing PSI pin"):
+            self.verify()
 
     def test_reserve_inequality_is_recomputed_before_derivation(self):
         # 20MiB growth in one millisecond exceeds the fixed reserve when charged

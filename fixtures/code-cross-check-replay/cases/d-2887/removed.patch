@@ -1,0 +1,67 @@
+diff --git a/agent/test/fixture-repo.test.ts b/agent/test/fixture-repo.test.ts
+index 804bd282..60664e02 100644
+--- a/agent/test/fixture-repo.test.ts
++++ b/agent/test/fixture-repo.test.ts
+@@ -286,25 +286,43 @@ async function scratchPermissionsChild(): Promise<void> {
+ 
+ function scratchNormalizationFailureChild(): void {
+   const operation = process.env.UZI_SCRATCH_NORMALIZATION_FAILURE as "chownSync" | "chmodSync";
+-  const originals = { chownSync: fs.chownSync, chmodSync: fs.chmodSync };
++  // With UZI_SCRATCH_CLEANUP_FAILURE the root's removal also fails: the original error must survive.
++  const cleanupFails = process.env.UZI_SCRATCH_CLEANUP_FAILURE === "1";
++  const originals = { chownSync: fs.chownSync, chmodSync: fs.chmodSync, rmSync: fs.rmSync };
+   const failure = new Error("injected scratch normalization failure");
++  const cleanupFailure = new Error("injected scratch cleanup failure");
+   let target: fs.PathLike | undefined;
+   let caught: unknown;
+   try {
+     const fail = (root: fs.PathLike): never => { target = root; throw failure; };
+     if (operation === "chownSync") fs.chownSync = fail;
+     else fs.chmodSync = fail;
++    if (cleanupFails) {
++      fs.rmSync = ((p: fs.PathLike, opts?: fs.RmOptions) => {
++        if (target !== undefined && String(p) === String(target)) throw cleanupFailure;
++        return originals.rmSync(p, opts);
++      }) as typeof fs.rmSync;
++    }
+     try { makeScratchRoot("scratch-fail-"); } catch (error) { caught = error; }
+   } finally {
+     if (operation === "chownSync") fs.chownSync = originals.chownSync;
+     else fs.chmodSync = originals.chmodSync;
++    fs.rmSync = originals.rmSync;
+   }
+   assert.equal(fs[operation], originals[operation]);
++  assert.equal(fs.rmSync, originals.rmSync);
+   assert.equal(caught, failure, "preserves the exact normalization error");
+   assert.ok(target);
+-  assert.equal(fs.existsSync(target), false);
+   const lines = readLedger(process.env.UZI_TMPDIR_GUARD_LEDGER!);
+-  assert.deepEqual(lines.map(line => [line.event, line.path]), [["created", target], ["removed", target]]);
++  if (cleanupFails) {
++    // The failed removal is not recorded, and the retained root is cleaned up here.
++    assert.equal(fs.existsSync(target), true);
++    assert.deepEqual(lines.map(line => [line.event, line.path]), [["created", target]]);
++    fs.rmSync(target, { recursive: true, force: true });
++  } else {
++    assert.equal(fs.existsSync(target), false);
++    assert.deepEqual(lines.map(line => [line.event, line.path]), [["created", target], ["removed", target]]);
++  }
+   assert.deepEqual(fs.readdirSync(process.env.TMPDIR!), ["ledger"]);
+ }
+ 
+@@ -470,6 +488,15 @@ if (process.env.UZI_SCRATCH_PERMISSIONS_CHILD) {
+         } finally { fs.rmSync(outer, { recursive: true, force: true }); }
+       });
+     }
++
++    for (const operation of ["chownSync", "chmodSync"]) {
++      it(`keeps the ${operation} error when removing the failed scratch root also fails`, { skip: !supported ? "POSIX identity unavailable" : false }, () => {
++        const outer = fs.mkdtempSync(path.join(os.tmpdir(), "fixture-repo-scratch-cleanup-failure-"));
++        try {
++          runChild(outer, { UZI_SCRATCH_NORMALIZATION_FAILURE: operation, UZI_SCRATCH_CLEANUP_FAILURE: "1" }, path.join(outer, "ledger"));
++        } finally { fs.rmSync(outer, { recursive: true, force: true }); }
++      });
++    }
+   });
+ 
+   describe("makeFixture inherited Git environment isolation", () => {

@@ -49,6 +49,8 @@ docker run -d -e UZI_API_URL=https://uzi.example.com \
 
 The five capabilities support the root startup window; the entrypoint then drops to the unprivileged worker with only SETUID/SETGID, so it can launch agents under a separate runner UID. Keep the token bind mount writable: startup re-owns the mounted file to UID/GID 10001 and sets its mode to 0400. This changes the backing host file's permissions and, on Linux, its ownership; desktop container runtimes may map ownership differently. A generic read-only bind mount refuses to start because the entrypoint cannot enforce that token posture. File delivery keeps the join token out of the worker's environment.
 
+To cap Go build and runtime parallelism for the commands a worker runs, add `-e WORKER_GO_BUILD_PARALLELISM=2 -e WORKER_GO_MAXPROCS=2` to the `docker run` above, or set the same two variables in the compose `.env`. Both are optional and unset by default; see [Worker Go concurrency defaults](./configuration.md#worker-go-concurrency-defaults) for accepted values and limits.
+
 Put a TLS-terminating proxy in front of a worker reached over an untrusted network: `api` itself listens plain HTTP.
 
 ## Worker templates
@@ -650,12 +652,26 @@ while the original flight still owns settlement, feedback and source custody.
 One monitor shares the worker's cgroup budget across its configured
 concurrency. It can intervene in enrolled **Codex and Claude model shell commands**,
 using the exact registered supervisor and process start ticks; approximate
-tree RSS ranks candidates while total cgroup usage determines pressure.
-It does not subtract file memory. Internal probes,
+tree RSS ranks candidates while the cgroup working set,
+`max(0, memory.current - inactive_file)`, determines pressure. Internal probes,
 provider/credential processes, boundary/checkpoint/capture operations and
 cross-checker authority are outside the delivered adapters' scope. Enrollment
 adds no process authority and changes no concurrency setting; see
 [ADR-2396](../adr/2396-worker-memory-guard.md).
+
+Cgroup memory PSI is optional. The hard path (working set at or above the
+limit minus reserve) fires on PSI-capable and PSI-less hosts alike; early
+intervention also needs real PSI in two consecutive samples, so a host without
+`memory.pressure` (read fails with `ENOENT` or `ENOTSUP`) runs hard-only.
+Other PSI read errors, or malformed PSI, make the sample unavailable and
+inhibit intervention. The worker logs one warning when PSI is unavailable
+("worker memory guard: cgroup memory PSI unavailable; early intervention
+disabled, hard intervention continues on valid core accounting") and one info line when it is restored. The working set is an
+estimate, not an OOM predictor: inactive file pages can be dirty or slow to
+reclaim, so it can underestimate pressure (dirty/writeback validation is
+deferred), and allocation bursts, stalled sampling, node pressure and
+Docker-in-Docker memory remain outside it. See
+[configuration](./configuration.md#worker-memory-guard).
 
 A confirmed command drain, resolved outcome and fresh low-usage dwell are
 required before another intervention/retry. The per-run memory-episode
