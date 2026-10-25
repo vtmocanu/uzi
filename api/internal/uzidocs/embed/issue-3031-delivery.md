@@ -1322,3 +1322,32 @@ used a nonexistent docs task name and is not a successful docs check. Independen
 review must still validate the applied repairs. The R3 administration-budget block,
 incomplete full gate and unperformed proofs remain open; no formal partial or
 acceptance decision has waived them.
+
+At `f4dcfd8f`, the scoped reviewer, tester and auditor found no introduced repair
+defect; the auditor closed the original importer CWE-117 finding. The tester's
+17-case focused baseline passed. Restoring the old branch predicate, dropping
+byte mode, bypassing the shallow predicate, omitting the second query and
+substituting source objects for the private index's canonical alternate each
+compiled and turned its intended assertions red. These add applied-candidate
+proof, not a complete per-test mutation map. Global ordinary storage/logging
+sanitation remains unchanged; the repair closes the new importer input path only.
+
+The tester retained two actual green close-join mutants: dropping the outer
+`await closePins()` was masked on the selected paths by the helper's independent
+join; dropping the actual per-pin close promises also survived because the tests
+released their latch before later asynchronous cleanup reached its assertions.
+Neither green mutant is counted as red evidence. The held-close fixture now wraps
+the real completion promise with a consumption observer and retains all prior
+terminal, cleanup, handle and child assertions. A third early-walk-failure case
+exercises the outer join before any helper/private view exists. Failure cleanup
+also releases the latch and awaits the operation. All three focused cases, lint,
+typecheck and knip passed (`gmvVqf`); independent mutation/review confirmation of
+this last fixture repair remains required.
+
+Standalone `env -u UZI_SQLC_DIR task test:codex-m4` passed on `f4dcfd8f`
+(`WNwUTs`, exit 0): 189 tests, zero skips/failures/cancellations, 180 seconds for
+that stage. The completeness checker satisfied the required Claude/U, Codex/U and
+Codex/P matrix (37 clauses, 64 executed evidence results). The full gate did not
+reach this stage; this standalone success does not turn that incomplete run green.
+No production-source change follows this M4 result. Hosted CI, affected compose
+phases and C2–C8 remain separately owned and unrun as stated above.

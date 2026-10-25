@@ -18,20 +18,28 @@ async function refused(f: Fixture, message = "maintenance_source_layout_unsuppor
   await f.retained();
 }
 // Real descriptors and entries; the latch observes terminal ordering without a timer.
-for (const stageFailure of [false, true]) {
-  test("delta close ordering: held source pin joins before cleanup (stage failure=" + stageFailure + ")", linux, async t => {
+for (const { stageFailure, walkFailure } of [
+  { stageFailure: false, walkFailure: false },
+  { stageFailure: true, walkFailure: false },
+  { stageFailure: false, walkFailure: true },
+]) {
+  test(walkFailure ? "delta close ordering: early walk failure joins held source pin before return" :
+    "delta close ordering: held source pin joins before cleanup (stage failure=" + stageFailure + ")", linux, async t => {
     const f = await maintenanceDeltaFixture(t);
     const open = fs.open.bind(fs), unlink = fs.unlink.bind(fs), rmdir = fs.rmdir.bind(fs);
     let release!: () => void, reached!: () => void;
     const held = new Promise<void>(resolve => { release = resolve; });
     const closing = new Promise<void>(resolve => { reached = resolve; });
-    t.after(release);
     let sourceObjectsFd: number | undefined, injected = false, closeCalls = 0, closed = false;
+    let heldCloseObserved = false;
     let terminalPhase = false, settled = false;
     const removed: string[] = [], premature: string[] = [];
     const pinCloses: number[] = [];
     let joinedPins = 0;
     f.cache.afterPhase = async phase => { if (phase === "import") terminalPhase = true; };
+    f.cache.beforePhase = async phase => {
+      if (walkFailure && phase === "walk") { injected = true; throw new Error("fixture_walk_failed"); }
+    };
     t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
       const file = await open(...args);
       if (args[0] === path.join(f.request.outDir, "proof", "objects", "pack", "stage.pack") && stageFailure) {
@@ -53,8 +61,21 @@ for (const stageFailure of [false, true]) {
           sourceObjectsFd === undefined) {
         sourceObjectsFd = file.fd;
         const close = file.close.bind(file);
-        t.mock.method(file, "close", async () => {
-          closeCalls++; reached(); await held; await close(); closed = true;
+        t.mock.method(file, "close", () => {
+          closeCalls++; reached();
+          const completion = (async () => { await held; await close(); closed = true; })();
+          // A transparent promise proxy exposes consumption of the held completion.
+          // Unlike an elapsed-turn check, this catches dropping the close promise
+          // even when later asynchronous cleanup has not yet reached an unlink.
+          return new Proxy(completion, {
+            get(target, property) {
+              if (property === "then") {
+                heldCloseObserved = true;
+                return target.then.bind(target);
+              }
+              return Reflect.get(target, property, target);
+            },
+          });
         });
       }
       return file;
@@ -75,14 +96,20 @@ for (const stageFailure of [false, true]) {
       return rmdir(...args);
     });
     const outcome = f.run().then(value => ({ value }), error => ({ error })).finally(() => { settled = true; });
+    t.after(async () => { release(); await outcome; });
     await closing;
     await immediate();
+    assert.equal(heldCloseObserved, true, "owner consumes the held pin-close completion");
     assert.equal(settled, false, "terminal result waits for held close");
     assert.equal(removed.length, 0, "no owned entry unlinked while close held");
     assert.deepEqual(premature, [], "no cleanup attempted before pin closes join");
-    assert.ok((await fs.lstat(path.join(f.request.outDir, "read", "HEAD"))).isFile());
+    if (walkFailure) await assert.rejects(fs.lstat(f.request.outDir), { code: "ENOENT" });
+    else assert.ok((await fs.lstat(path.join(f.request.outDir, "read", "HEAD"))).isFile());
     if (stageFailure) assert.ok((await fs.lstat(path.join(f.request.outDir, "proof", "objects", "pack", "stage.pack"))).isFile());
-    if (stageFailure) {
+    if (walkFailure) {
+      assert.equal(injected, true, "failure occurs after source pins but before private views");
+      assert.equal(f.requests.length, 0);
+    } else if (stageFailure) {
       assert.equal(injected, true, "actual stage write failure injected");
       assert.equal(f.requests.filter(canonicalImport).length, 0);
     } else {
@@ -96,9 +123,13 @@ for (const stageFailure of [false, true]) {
     assert.equal(joinedPins, pinCloses.length, "every pin close joined");
     assert.ok(pinCloses.every(count => count === 1), "each pin closed once");
     assert.deepEqual(premature, []);
-    assert.ok(removed.length > 0, "cleanup follows joined closes");
+    if (walkFailure) assert.equal(removed.length, 0, "early failure created no owned scratch");
+    else assert.ok(removed.length > 0, "cleanup follows joined closes");
     assert.equal(new Set(removed).size, removed.length, "each entry unlinked only once");
-    if (stageFailure) {
+    if (walkFailure) {
+      assert.ok("error" in result);
+      assert.match(String(result.error), /fixture_walk_failed/);
+    } else if (stageFailure) {
       assert.ok("error" in result);
       assert.match(String(result.error), /maintenance_pack_staging_refused/);
     } else {
