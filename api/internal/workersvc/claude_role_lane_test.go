@@ -207,7 +207,7 @@ func TestClaimClaudeFrozenCodexRoleModel(t *testing.T) {
 						}
 						dropped = append(dropped, frozen)
 					}
-					if len(notes) != len(dropped) || pl.LastSeq != int32(17+len(dropped)) {
+					if len(notes) != len(dropped) || int(pl.LastSeq) != 17+len(dropped) {
 						t.Fatalf("fallback notes=%d last_seq=%d, want %d notes", len(notes), pl.LastSeq, len(dropped))
 					}
 					for i, want := range dropped {
@@ -215,7 +215,7 @@ func TestClaimClaudeFrozenCodexRoleModel(t *testing.T) {
 						if err := json.Unmarshal(notes[i].Payload, &note); err != nil {
 							t.Fatal(err)
 						}
-						if note.Harness != "claude" || note.DroppedModel != want || notes[i].Seq != int32(18+i) ||
+						if note.Harness != "claude" || note.DroppedModel != want || int(notes[i].Seq) != 18+i ||
 							!notes[i].ClaimGeneration.Valid || notes[i].ClaimGeneration.Int64 != 2 {
 							t.Fatalf("fallback note %d=%+v, message=%+v", i, note, notes[i])
 						}
@@ -254,7 +254,7 @@ func TestClaimClaudeRoleLaneFallbackSequence(t *testing.T) {
 		if err := json.Unmarshal(notes[i].Payload, &note); err != nil {
 			t.Fatal(err)
 		}
-		if notes[i].Seq != int32(18+i) || note.DroppedModel != want {
+		if int(notes[i].Seq) != 18+i || note.DroppedModel != want {
 			t.Fatalf("note %d: %+v %+v", i, notes[i], note)
 		}
 	}
