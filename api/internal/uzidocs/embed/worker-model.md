@@ -66,8 +66,9 @@ fallback note to the run feed, using the existing fallback: the `lead`
 template's model, then the SDK default. A compatible schedule or frozen per-run model
 still takes precedence. Chat and jobs log a server warning and skip the
 lane value, using their own runner defaults when no applicable override
-wins. Frozen-model compatibility and cross-check pin rules are unchanged;
-this guard applies to the worker lane.
+wins. Frozen Claude schedule or legacy run models reject the same Codex role
+IDs and fall back to the validated Claude lane or its default. Codex frozen
+model acceptance and cross-check pin rules are unchanged.
 
 In **Settings → Run defaults**, **Not a Claude model** identifies the
 problem. Click **Reset to Default** to clear the draft, then **Save

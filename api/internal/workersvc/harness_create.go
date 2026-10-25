@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -59,7 +60,7 @@ type RawCredentialOverride struct {
 // ids and catalog discovery never adds more. It mirrors the agent's
 // agent/src/codex/render.ts CODEX_ROLE_MODELS and codex-pricing.ts price table, except
 // gpt-6-luna: the agent's set carries it (the Now summary model, PRD #2603, and so also honoured
-// as a template role pin), while this picker and frozen-run vocabulary deliberately leave it out.
+// as a template role pin), while this picker and Codex frozen-run vocabulary deliberately leave it out.
 var codexModels = map[string]bool{
 	"gpt-6-astra": true,
 	"gpt-5.6-sol": true,
@@ -99,7 +100,7 @@ func CodexCuratedModels() []string { return codexCuratedModelsSlice() }
 //     the owner's Codex lane — the conservative direction the PRD requires (Codex has a closed
 //     vocabulary, so a frozen non-curated pin is never forwarded; a CUSTOM Codex id reaches a run
 //     only through the per-user Codex lane, D5, never through this frozen-pin path).
-//   - Claude harness: a curated Codex model is refused; every other value (a Claude alias OR a
+//   - Claude harness: a known Codex role model is refused; every other value (a Claude alias OR a
 //     custom full Claude id like claude-opus-4-8) passes through unchanged, preserving today's
 //     honour-any-custom-id behaviour.
 func harnessModelCompatible(h Harness, model string) bool {
@@ -111,7 +112,7 @@ func harnessModelCompatible(h Harness, model string) bool {
 	case HarnessCodex:
 		return codexModels[m]
 	case HarnessClaude:
-		return !codexModels[m]
+		return !agenttmpl.CodexRoleModels[m]
 	default:
 		return true
 	}

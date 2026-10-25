@@ -61,7 +61,6 @@ func TestClaimClaudeRoleLane(t *testing.T) {
 		}
 	}
 	cases = append(cases, laneCase{name: "compatible-frozen-wins", lane: pgconv.TextOrNull("gpt-6-luna"), frozen: pgconv.TextOrNull("claude-frozen"), want: "claude-frozen", dropped: true})
-	cases = append(cases, laneCase{name: "existing-frozen-luna-compatibility", lane: pgconv.TextOrNull("gpt-6-sol"), frozen: pgconv.TextOrNull("gpt-6-luna"), want: "gpt-6-luna", dropped: true})
 	for _, path := range []string{"ordinary", "chat", "job"} {
 		for _, tc := range cases {
 			if path == "chat" && tc.frozen.Valid {
@@ -155,6 +154,77 @@ func TestClaimClaudeRoleLane(t *testing.T) {
 					t.Fatalf("warning found=%v logs=%s", warnFound, logs.String())
 				}
 			})
+		}
+	}
+}
+
+func TestClaimClaudeFrozenCodexRoleModel(t *testing.T) {
+	for _, path := range []string{"ordinary", "job"} {
+		for _, tc := range []struct {
+			name string
+			lane pgtype.Text
+			want string
+		}{
+			{name: "valid lane", lane: pgconv.TextOrNull("claude-custom"), want: "claude-custom"},
+			{name: "unset lane"},
+			{name: "filtered lane", lane: pgconv.TextOrNull("gpt-6-sol")},
+		} {
+			for _, frozen := range []string{"gpt-6-luna", " \tgpt-6-luna \n"} {
+				t.Run(path+"/"+tc.name+"/"+frozen, func(t *testing.T) {
+					pin := pgconv.TextOrNull(frozen)
+					fs := scheduleModelStore(t, pin, tc.lane)
+					fs.claimRun.Harness = harnessClaude
+					fs.claimRun.Kind = runkind.Issue
+					fs.claimRun.LastSeq = 17
+					fs.claimRun.ClaimGeneration = 2
+					if path == "job" {
+						fs.claimRun.Kind = runkind.Job
+					}
+					pl, err := New(&roleLaneStore{fs}, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if pl == nil {
+						t.Fatal("missing claim")
+					}
+					model := pl.Config.DefaultModel
+					if (model == nil) != (tc.want == "") || (model != nil && *model != tc.want) {
+						t.Fatalf("frozen Codex role reached Claude claim: model=%v, want %q", model, tc.want)
+					}
+					if fs.defaultModel != tc.lane || fs.claimRun.Model != pin {
+						t.Fatal("stored run or user model changed")
+					}
+					var notes []store.InsertRunMessageParams
+					for _, message := range fs.insertedMessages {
+						if message.Kind == harnessModelFallbackKind {
+							notes = append(notes, message)
+						}
+					}
+					var dropped []string
+					if path == "ordinary" {
+						if tc.name == "filtered lane" {
+							dropped = append(dropped, "gpt-6-sol")
+						}
+						dropped = append(dropped, frozen)
+					}
+					if len(notes) != len(dropped) || pl.LastSeq != int32(17+len(dropped)) {
+						t.Fatalf("fallback notes=%d last_seq=%d, want %d notes", len(notes), pl.LastSeq, len(dropped))
+					}
+					for i, want := range dropped {
+						var note harnessModelFallbackPayload
+						if err := json.Unmarshal(notes[i].Payload, &note); err != nil {
+							t.Fatal(err)
+						}
+						if note.Harness != "claude" || note.DroppedModel != want || notes[i].Seq != int32(18+i) ||
+							!notes[i].ClaimGeneration.Valid || notes[i].ClaimGeneration.Int64 != 2 {
+							t.Fatalf("fallback note %d=%+v, message=%+v", i, note, notes[i])
+						}
+					}
+					if path == "ordinary" && (fs.lastSeqUpdated == nil || *fs.lastSeqUpdated != pl.LastSeq) {
+						t.Fatal("stored fallback sequence differs from claim")
+					}
+				})
+			}
 		}
 	}
 }
