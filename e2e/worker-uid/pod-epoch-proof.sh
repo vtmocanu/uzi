@@ -26,37 +26,77 @@ done
 mkdir -p "$REPO/.uzi/scratch"
 EVIDENCE="$(mktemp -d "$REPO/.uzi/scratch/pod-epoch-proof.XXXXXXXX")"
 TOKEN=${EVIDENCE##*/}
-printf 'pod epoch evidence: %s\n' "$EVIDENCE"
+python3 -I - "$EVIDENCE" <<'PY'
+import json
+import sys
+print(json.dumps({"kind": "proof_evidence", "path": sys.argv[1]}, ensure_ascii=True))
+PY
 printf '%s\n' "$HEAD_REQUIRED" > "$EVIDENCE/proof-head"
 printf '%s\n' "$ATTEMPT" > "$EVIDENCE/attempt"
 finish() {
   local rc=$?
   trap - EXIT
   printf 'EXIT=%s\n' "$rc" > "$EVIDENCE/result"
-  if [ "$rc" -eq 0 ]; then
-    printf 'pod epoch proof PASS: both images at %s; evidence %s\n' "$HEAD_REQUIRED" "$EVIDENCE"
-  else
-    printf 'pod epoch proof FAIL: exit=%s; evidence %s\n' "$rc" "$EVIDENCE" >&2
-  fi
+  python3 -I - "$rc" "$HEAD_REQUIRED" "$EVIDENCE" <<'PY'
+import json
+import sys
+rc, head, evidence = sys.argv[1:]
+print(json.dumps({"kind": "proof_result", "exit": int(rc),
+                  "status": "PASS" if rc == "0" else "FAIL",
+                  "head": head, "evidence": evidence}, ensure_ascii=True),
+      file=sys.stdout if rc == "0" else sys.stderr)
+PY
   exit "$rc"
 }
 trap finish EXIT
 run() {
   local name=$1 rc=0
   shift
-  printf 'phase=%s argv:' "$name"
-  printf ' %q' "$@"
-  printf '\n'
-  "$@" 2>&1 | tee "$EVIDENCE/$name.log" || rc=$?
+  local limit=default seconds=80
+  case "$name" in
+    *-inspect) limit=65536 ;;
+    *-build|*-worker-uid) seconds=7220 ;;
+  esac
+  python3 -I - "$REPO" "$EVIDENCE" "$name" "$limit" "$seconds" "$@" <<'PY' || rc=$?
+import json
+from pathlib import Path
+import sys
+
+repo, evidence, phase, limit, seconds, *argv = sys.argv[1:]
+sys.path.insert(0, str(Path(repo) / "e2e/worker-uid"))
+from bounded import REPORT_BYTES, capture
+
+limit = REPORT_BYTES if limit == "default" else int(limit)
+base = Path(evidence) / phase
+print(json.dumps({"kind": "command_phase", "phase": phase}), flush=True)
+rc = capture(['/bin/sh', '-c', 'exec "$@" 2>&1', 'proof', *argv],
+             str(base) + ".raw", float(seconds), limit)
+# Raw artifacts are opaque, untrusted binary. Only escaped records render.
+rendered = 0
+render_limit = limit * 8 + 65536
+with open(str(base) + ".raw", "rb") as raw, open(str(base) + ".log", "w", encoding="ascii") as log:
+    while chunk := raw.read(16384):
+        record = json.dumps({"kind": "command_output", "phase": phase,
+                             "text": chunk.decode("utf-8", errors="replace")},
+                            ensure_ascii=True) + "\n"
+        rendered += len(record)
+        if rendered > render_limit:
+            rc = rc or 125
+            break
+        log.write(record)
+        sys.stdout.write(record)
+print(json.dumps({"kind": "command_status", "phase": phase, "exit": rc}), flush=True)
+sys.exit(rc)
+PY
   printf '%s\n' "$rc" > "$EVIDENCE/$name.exit"
   return "$rc"
 }
-# Each command gets one attempt; failure stops siblings. Build/lane: <=2h+10s
-# each; metadata/package probes: <=60s+10s each. No background processes.
+# Each command gets one attempt; failure stops siblings. Outer capture includes
+# GNU timeout's grace and capture's own five-second shutdown/join allowance.
 inspect_image() {
   local template=$1 tag=$2 stage=$3
   run "$template-$stage-inspect" timeout --kill-after=10s 60s docker image inspect "$tag"
-  python3 -I - "$EVIDENCE/$template-$stage-inspect.log" "$HEAD_REQUIRED" "$template" \
+  python3 -I - "$EVIDENCE/$template-$stage-inspect.raw" "$HEAD_REQUIRED" "$template" \
     "$EVIDENCE/$template-$stage.id" <<'PY'
 import json
 import re
@@ -64,7 +104,11 @@ import sys
 from pathlib import Path
 
 raw, head, template, output = sys.argv[1:]
-items = json.loads(Path(raw).read_text())
+with Path(raw).open("rb") as source:
+    data = source.read(65536 + 1)
+if len(data) > 65536:
+    raise ValueError("image inspect exceeds 64 KiB")
+items = json.loads(data)
 assert isinstance(items, list) and len(items) == 1, "ambiguous image inspect"
 item = items[0]
 assert re.fullmatch(r"sha256:[0-9a-f]{64}", item["Id"]), "invalid image ID"
@@ -114,19 +158,19 @@ for template in base jvm; do
     ' proof "$HELPER_HASH" "$ENTRY_HASH"
   assert_source
   inspect_image "$template" "$tag" prelane
-  cmp "$EVIDENCE/$template-before.id" "$EVIDENCE/$template-prelane.id"
+  cmp -s "$EVIDENCE/$template-before.id" "$EVIDENCE/$template-prelane.id"
   run "$template-worker-uid" timeout --kill-after=10s 7200s env \
     WORKER_UID_SKIP_BUILD=1 "WORKER_UID_IMAGE=$tag" \
     "WORKER_MEMORY_CALIBRATION_RUN_ID=$HEAD_REQUIRED-$template" \
     "WORKER_MEMORY_CALIBRATION_ATTEMPT=$ATTEMPT" task test:agent:worker-uid
   inspect_image "$template" "$tag" after
-  cmp "$EVIDENCE/$template-before.id" "$EVIDENCE/$template-after.id"
+  cmp -s "$EVIDENCE/$template-before.id" "$EVIDENCE/$template-after.id"
   assert_source
 done
 # Recheck BOTH tags at completion, including base after the JVM lane.
 for template in base jvm; do
   tag="$(< "$EVIDENCE/$template.tag")"
   inspect_image "$template" "$tag" final
-  cmp "$EVIDENCE/$template-before.id" "$EVIDENCE/$template-final.id"
+  cmp -s "$EVIDENCE/$template-before.id" "$EVIDENCE/$template-final.id"
 done
 assert_source

@@ -37,11 +37,32 @@ bash e2e/worker-uid/pod-epoch-proof.sh
 
 The executable script is [pod-epoch-proof.sh](../e2e/worker-uid/pod-epoch-proof.sh).
 It creates a unique evidence directory under .uzi/scratch and prints its
-absolute location. Command stdout/stderr is also captured there in per-phase
-logs, with separate exit-status files and a final result file. Preserve that
-directory and the worker-UID/calibration report directories named inside its
-lane logs as lander evidence. A preflight refusal occurs before the evidence
-directory exists and exits nonzero.
+absolute location. Each phase retains merged stdout/stderr in a bounded .raw
+artifact: opaque, untrusted binary, never a human log and never rendered directly.
+Inspect capture is limited to 64 KiB; build, lane and package capture to 8 MiB
+(the existing bounded.py REPORT_BYTES default). The isolated Python wrapper
+imports the trusted sibling bounded.py through the explicit repository path,
+without changing its capture API. It merges streams through a fixed shell
+launcher with arguments passed separately, never interpolated as shell source.
+Overflow fails the phase and stops subsequent phases, even if the producer
+would otherwise exit successfully.
+
+The existing per-phase .log artifact and command output on stdout contain only
+ASCII JSON Lines: fixed kind command_output, controlled phase, and escaped text
+from fixed 16 KiB byte chunks using json.dumps(ensure_ascii=True). Chunking is
+independent of line count, so newline floods do not create a record per line.
+Rendered output is additionally limited to raw-limit * 8 + 64 KiB per phase;
+overflow fails. Terminal controls, Unicode direction controls and forged status
+rows remain escaped text inside command_output records. Trusted command_phase
+and command_status records, plus proof_evidence and proof_result records, are
+separate from command output; separate .exit files and the final result file
+retain actual statuses. Inspect validation reads
+only .raw, at most 64 KiB plus one overflow sentinel before JSON parsing.
+Python -I preserves validation despite inherited PYTHONOPTIMIZE.
+
+Preserve that directory and the worker-UID/calibration report directories named
+inside its escaped lane records as lander evidence. A preflight refusal occurs
+before the evidence directory exists and exits nonzero.
 
 ## Commands and identity relationships
 
@@ -103,9 +124,12 @@ evidence.
 
 Every build/lane has one attempt and a two-hour timeout plus ten-second kill
 grace; metadata and package probes have a one-minute timeout plus the same
-grace. Failure stops subsequent phases and exits nonzero. There are no
-extraction retries. The script does not remove images or volumes; the existing
-lane owns and cleans its own journaled resources. Preserve generated tags
+grace. Outer capture deadlines are 7220 seconds for build/lane and 80 seconds
+for metadata/package, including timeout grace and bounded.py's five-second
+owned-process-group shutdown/join. Each command is attempted once; failure
+stops subsequent phases and exits nonzero. There are no extraction retries.
+The script does not remove images or volumes; the existing lane owns and
+cleans its own journaled resources. Preserve generated tags
 until evidence review and remove only positively attributed resources later.
 
 ## Remaining acceptance
@@ -134,5 +158,17 @@ python3 -B e2e/worker-uid/pod_epoch_proof_test.py
 The Python tests use fake git/docker/task executables under invocation-owned
 scratch. They inspect command arguments as data, never execute the in-image
 probe payload, and exercise preflight refusal, both template invocations,
-identity validation, failures, retagging and final source drift. Their success
-is tooling evidence only, not image or M1 acceptance.
+identity validation, failures, retagging and final source drift. Security
+regressions also cover metadata overflow (including the previously accepted
+2 MiB label and a 24 MiB response), continuous stderr floods with capture caps
+and process shutdown, and escaped ANSI/C0/C1/bidi/forged status output.
+Their success is tooling evidence only, not image or M1 acceptance.
+
+The lead observed the five-test tooling suite taking 13.076 seconds locally
+at 1d0652df96391ec3a4a0afaf6823b035ca0b8666. After this scoped repair, the
+eight-test suite took 25.573 seconds in the lead's local check. These are local observations
+for the serial new CI step's cost only. Whole-CI critical-path impact, queue time,
+rerun cost and cache effects are unmeasured; approved M2c permits unavailable
+CI timing to remain explicitly unmeasured. The actual full non-image agent
+gate remains pending with the lead; its correct-UID environment preflight
+already passed. This scoped security repair does not run that gate.

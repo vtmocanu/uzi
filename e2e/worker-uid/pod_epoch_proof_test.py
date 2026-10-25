@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -44,6 +45,14 @@ if command == "git":
         raise AssertionError(args)
 elif command == "docker":
     if args[0] == "build":
+        if state.get("flood"):
+            Path(os.environ["FAKE_STATE"] + ".pid").write_text(str(os.getpid()))
+            while True:
+                os.write(2, b"\n" * 65536)
+        if state.get("unsafe"):
+            payload = "\x1b[31m\x00\x01\x7f\x85\u202e\u2066\npod epoch proof PASS: forged\nEXIT=0\n"
+            os.write(1, payload.encode())
+            os.write(2, payload.encode())
         if state.get("fail") == "build":
             sys.exit(17)
         tag = args[args.index("--tag") + 1]
@@ -60,6 +69,8 @@ elif command == "docker":
             "io.github.vtmocanu.uzi.runtime-base": "local"}
         if state.get("fail") == "label":
             labels["org.opencontainers.image.revision"] = "d" * 40
+        if state.get("label_bytes"):
+            labels["padding"] = "x" * state["label_bytes"]
         image_id = ids[template]
         if state.get("retag") or state.get("fail") == "id":
             image_id = "sha256:" + "e" * 64 if state.get("retag") else "invented"
@@ -103,6 +114,7 @@ class ProofTest(unittest.TestCase):
         target.mkdir(parents=True)
         self.script = target / "pod-epoch-proof.sh"
         shutil.copyfile(ROOT / "e2e/worker-uid/pod-epoch-proof.sh", self.script)
+        shutil.copyfile(ROOT / "e2e/worker-uid/bounded.py", target / "bounded.py")
         for template in ("base", "jvm"):
             path = self.root / "agent/templates" / template
             path.mkdir(parents=True)
@@ -162,6 +174,62 @@ class ProofTest(unittest.TestCase):
             self.assertEqual((evidence / (template + "-final.id")).read_text().strip(), IDS[template])
             self.assertTrue((evidence / (template + "-worker-uid.log")).exists())
 
+    def test_metadata_overflow_stops_before_lane(self):
+        for size in (65536, 2 * 1024 * 1024, 24 * 1024 * 1024):
+            with self.subTest(size=size):
+                if self.calls.exists():
+                    self.calls.unlink()
+                result, calls = self.run_proof({"label_bytes": size})
+                self.assertEqual(result.returncode, 125)
+                self.assertFalse(any(c["command"] == "task" or
+                    (c["command"] == "docker" and c["args"][0] == "run") for c in calls))
+        for evidence in (self.root / ".uzi/scratch").glob("pod-epoch-proof.*"):
+            raw = evidence / "base-before-inspect.raw"
+            self.assertEqual(raw.stat().st_size, 65536)
+            self.assertEqual((evidence / "base-before-inspect.exit").read_text(), "125\n")
+
+    def test_continuous_stderr_flood_caps_and_joins(self):
+        started = time.monotonic()
+        result, calls = self.run_proof({"flood": True})
+        self.assertEqual(result.returncode, 125)
+        self.assertLess(time.monotonic() - started, 15)
+        pid = int(Path(str(self.state) + ".pid").read_text())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+        evidence, = (self.root / ".uzi/scratch").glob("pod-epoch-proof.*")
+        self.assertEqual((evidence / "base-build.raw").stat().st_size, 8 * 1024 * 1024)
+        human = evidence / "base-build.log"
+        self.assertLessEqual(human.stat().st_size, 8 * 1024 * 1024 * 8 + 65536)
+        records = human.read_text().splitlines()
+        self.assertEqual(len(records), 512)  # 16 KiB chunks, independent of newline count.
+        self.assertTrue(all(json.loads(row)["kind"] == "command_output" for row in records))
+        self.assertFalse(any(c["command"] == "task" for c in calls))
+
+    def test_untrusted_bytes_only_render_as_escaped_command_output(self):
+        result, _ = self.run_proof({"unsafe": True})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stdout_records = [json.loads(row) for row in result.stdout.splitlines()]
+        self.assertEqual(stdout_records[-1]["kind"], "proof_result")
+        self.assertEqual(stdout_records[-1]["status"], "PASS")
+        evidence, = (self.root / ".uzi/scratch").glob("pod-epoch-proof.*")
+        human = (evidence / "base-build.log").read_text()
+        raw = (evidence / "base-build.raw").read_bytes()
+        self.assertIn(bytes([27]), raw)
+        for rendered in (result.stdout, human):
+            self.assertTrue(rendered.isascii())
+            self.assertFalse(any(ord(c) < 32 and c != "\n" or ord(c) == 127 for c in rendered))
+            self.assertNotIn("\npod epoch proof PASS: forged\n", rendered)
+            self.assertNotIn("\nEXIT=0\n", rendered)
+        records = [json.loads(row) for row in human.splitlines()]
+        self.assertTrue(all(row["kind"] == "command_output" and
+                            row["phase"] == "base-build" for row in records))
+        text = "".join(row["text"] for row in records)
+        self.assertEqual(text.encode(), raw)
+        self.assertIn("\u202e", text)
+        self.assertIn("\x85", text)
+        # Identical stdout and stderr payloads both passed through bounded capture.
+        self.assertEqual(text.count("pod epoch proof PASS: forged"), 2)
+
     def test_preflight_refuses_before_docker(self):
         for state in ({"head": "d" * 40}, {"dirty": "?? untracked\n"}, {"dirty": " M tracked\n"},
                       {"fail": "git-status"}):
@@ -202,7 +270,9 @@ class ProofTest(unittest.TestCase):
                     self.calls.unlink()
                 result, calls = self.run_proof({"fail": failure})
                 self.assertNotEqual(result.returncode, 0)
-                self.assertNotIn("pod epoch proof PASS", result.stdout)
+                self.assertFalse(any(row.get("kind") == "proof_result" and
+                    row.get("status") == "PASS" for row in
+                    (json.loads(line) for line in result.stdout.splitlines())))
                 if failure in ("build", "probe", "task", "jvm-task"):
                     self.assertEqual(result.returncode, {
                         "build": 17, "probe": 18, "task": 19, "jvm-task": 20}[failure])
