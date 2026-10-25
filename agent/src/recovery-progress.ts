@@ -18,6 +18,8 @@ export interface RecoveryProgress {
   deadline: number;
   // Positive server claim fence that owns this deadline window; absent on legacy records.
   claimGeneration?: number;
+  // Server recovery allowance; absence is logically zero for legacy journals.
+  episode?: number;
   backoffMs: number;
   stage: "capturing" | "captured" | "adopting" | "ready-for-model" | "blocked";
   restoreTip?: string;
@@ -58,13 +60,14 @@ export function recoverySource(v: unknown): RecoverySource {
 
 export function recoveryProgress(v: unknown): RecoveryProgress {
   const o = object(v);
-  keys(o, ["version", "source", "attempts", "startedAt", "deadline", "claimGeneration", "backoffMs", "stage", "restoreTip", "restoreSource", "successor", "blocker"]);
+  keys(o, ["version", "source", "attempts", "startedAt", "deadline", "claimGeneration", "episode", "backoffMs", "stage", "restoreTip", "restoreSource", "successor", "blocker"]);
   if (o.version !== 1 || !Number.isSafeInteger(o.attempts) || (o.attempts as number) < 1 || (o.attempts as number) > 3 ||
       !Number.isSafeInteger(o.startedAt) || (o.startedAt as number) < 0 ||
       !Number.isSafeInteger(o.deadline) || o.deadline !== (o.startedAt as number) + 300_000 ||
       !Number.isSafeInteger(o.backoffMs) || (o.backoffMs as number) < 0 || (o.backoffMs as number) > 480_000 ||
       !["capturing", "captured", "adopting", "ready-for-model", "blocked"].includes(o.stage as string)) invalid();
   if (o.claimGeneration !== undefined && (!Number.isSafeInteger(o.claimGeneration) || (o.claimGeneration as number) < 1)) invalid();
+  if (Object.hasOwn(o, "episode") && (!Number.isSafeInteger(o.episode) || (o.episode as number) < 0)) invalid();
   recoverySource(o.source);
   if (o.successor !== undefined) recoverySource(o.successor);
   if (o.restoreTip !== undefined && (typeof o.restoreTip !== "string" || !/^[0-9a-f]{40}$/.test(o.restoreTip))) invalid();

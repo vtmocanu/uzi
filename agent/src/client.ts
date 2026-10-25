@@ -1791,6 +1791,8 @@ export class WorkerClient {
         ? JSON.parse(await readCrossCheckText(res, 2 * 1024 * 1024, deadline,
           dedicated || marker === "cross_check" ? "claim" : undefined))
         : JSON.parse(await readBoundedText(res, CLAIM_RESPONSE_MAX_BYTES, true, deadline))) as ClaimResponse;
+      if (isRecord(claim) && (!Number.isSafeInteger(claim.worker_recovery_episode) ||
+          (claim.worker_recovery_episode as number) < 0)) delete claim.worker_recovery_episode;
       if (isRecord(claim) && claim.semantic_planning !== undefined) claim.semantic_planning = parseSemanticEnrollment(claim.semantic_planning);
       // PRD #1230 M4: a present-but-malformed maintainer-pending projection fails the claim closed.
       if (isRecord(claim) && isRecord(claim.config) && Object.hasOwn(claim.config, "completion_pending")) {
@@ -1881,6 +1883,8 @@ export class WorkerClient {
     if (res.status === 204) return null;
     if (res.status >= 400) throw await this.toError("POST", path, res);
     const claim = JSON.parse(await readBoundedText(res, CLAIM_RESPONSE_MAX_BYTES, true)) as ChatClaimResponse;
+    if (isRecord(claim) && (!Number.isSafeInteger(claim.worker_recovery_episode) ||
+        (claim.worker_recovery_episode as number) < 0)) delete claim.worker_recovery_episode;
     validateClaimMemory(claim);
     return claim;
   }

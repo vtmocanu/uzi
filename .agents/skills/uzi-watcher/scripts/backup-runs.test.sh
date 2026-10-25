@@ -577,6 +577,41 @@ for kind in protected ordinary; do
       || fail "claimGeneration $kind/$generation: retained dirty bytes missing"
     echo "PASS claimGeneration $kind/$generation"
   done
+  # Episode is optional legacy progress, or a nonnegative safe integer.
+  # Reuse the real dirty clone; malformed evidence must never attribute its bytes.
+  for episode in legacy 0 2 9007199254740991 -1 1.5 9007199254740992 '"1"' null true false '[]' '{}'; do
+    value="$progress_journal"
+    [ "$episode" = legacy ] || value="$(printf '%s' "$value" | jq --argjson episode "$episode" '.recovery.episode=$episode')"
+    if [ "$kind" = protected ]; then
+      value="$(printf '%s' "$value" | jq '{version:1,branch:"agent/issue-4242",key:"issue-4242",journal:.}')"
+      git --git-dir="$BARE" config "uzi-retained.$rid.journal" "$value"
+    else
+      git --git-dir="$BARE" config "$JKEY" "$value"
+    fi
+    rc="$(backup_rc "$dest" "$rid")"
+    case "$episode" in
+      legacy|0|2|9007199254740991)
+        [ "$rc" -eq 0 ] || fail "episode $kind/$episode: exit $rc; log: $(cat "$dest/latest-attempt/backup.log")"
+        tar -xOzf "$dest/latest/issue-4242.tgz" ./issue-4242.meta.txt | grep -qxF "clone=$predecessor" \
+          || fail "episode $kind/$episode: wrong clone attributed"
+        tar -xOzf "$dest/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+claim-generation-dirty' \
+          || fail "episode $kind/$episode: retained dirty bytes missing"
+        ;;
+      *)
+        [ "$rc" -ne 0 ] || fail "episode $kind/$episode: malformed episode accepted"
+        [ ! -e "$dest/latest-attempt/issue-4242.tgz" ] || fail "episode $kind/$episode: invalid journal attributed source"
+        ;;
+    esac
+    echo "PASS episode $kind/$episode"
+  done
+  if [ "$kind" = protected ]; then
+    value="$(printf '%s' "$progress_journal" | jq '.recovery += {episode:2,unknownEpisodeField:0} | {version:1,branch:"agent/issue-4242",key:"issue-4242",journal:.}')"
+    git --git-dir="$BARE" config "uzi-retained.$rid.journal" "$value"
+    rc="$(backup_rc "$dest" "$rid")"
+    [ "$rc" -ne 0 ] || fail "episode protected: unknown progress key accepted"
+    [ ! -e "$dest/latest-attempt/issue-4242.tgz" ] || fail "episode protected: unknown progress key attributed source"
+    echo "PASS episode protected: unknown progress key refused"
+  fi
   if [ "$kind" = protected ]; then
     for blocker in readiness_cleanup_unconfirmed unknown_cleanup_blocker; do
       value="$(printf '%s' "$progress_journal" | jq --arg blocker "$blocker" '.recovery.blocker=$blocker | {version:1,branch:"agent/issue-4242",key:"issue-4242",journal:.}')"

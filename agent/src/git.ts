@@ -6899,42 +6899,51 @@ export class GitCache {
     return true;
   }
 
-  /** Precharge one of three total iterations before capture. Legacy journals start at zero.
-   * A positively fenced new claim gets one five-minute window; same-claim recreation keeps it.
-   * Callers without a positive fence retain the legacy deadline and cannot rebase it.
+  /** Precharge one of three iterations before capture. Legacy journals start at zero.
+   * A newer server episode with a new positive claim fence renews attempts and its five-minute
+   * window, including budget exhaustion. Other blockers are permanent. A new claim fence alone
+   * can rebase the deadline but cannot renew attempts; callers without it keep the old window.
    * recoveryRetryMs is the existing base (1..30000ms). Returned backoff is base times
    * 2^(charged attempts - 1), capped at 16x base; caller sleeps outside lock/deadline. */
   async reserveRecoveryIteration(
-    barePath: string, branch: string, key: string, expected: RecoverySource, recoveryRetryMs = 1_000, claimGeneration?: number,
+    barePath: string, branch: string, key: string, expected: RecoverySource, recoveryRetryMs = 1_000, claimGeneration?: number, episode?: number,
   ): Promise<RecoveryProgress> {
     if (claimGeneration !== undefined && (!Number.isSafeInteger(claimGeneration) || claimGeneration < 1)) throw new Error("invalid recovery claim fence");
     if (!Number.isSafeInteger(recoveryRetryMs) || recoveryRetryMs < 1 || recoveryRetryMs > 30_000) throw new Error("invalid recovery backoff");
+    if (!Number.isSafeInteger(episode) || (episode as number) < 0) episode = undefined;
     return this.withLock(barePath, async () => {
       const journal = await this.checkedRecovery(barePath, branch, key, expected);
       const old = journal.recovery;
-      if (old?.stage === "blocked") throw new Error("recovery episode is blocked");
       if (old?.claimGeneration !== undefined && (claimGeneration === undefined || claimGeneration < old.claimGeneration)) {
         throw new Error("stale recovery claim fence");
       }
+      if (old?.stage === "blocked" && old.blocker !== "budget_exhausted") throw new Error("recovery episode is blocked");
       const newWindow = claimGeneration !== undefined && old?.claimGeneration !== claimGeneration;
+      const renewal = old !== undefined && (episode ?? 0) > (old.episode ?? 0);
       const now = Date.now();
       if (!Number.isSafeInteger(now) || now < 0 || !Number.isSafeInteger(now + 300_000) || (old && now < old.startedAt)) {
-        if (old) await this.writeRecovery(barePath, branch, { ...journal, recovery: { ...old, stage: "blocked", blocker: "clock_invalid" } });
+        if (old && old.stage !== "blocked" && (!renewal || newWindow)) {
+          await this.writeRecovery(barePath, branch, { ...journal, recovery: { ...old, stage: "blocked", blocker: "clock_invalid" } });
+        }
         throw new Error("invalid recovery clock");
       }
-      if (old && (old.attempts >= 3 || (!newWindow && now >= old.deadline))) {
+      if (renewal && !newWindow) throw new Error("recovery episode requires a new claim fence");
+      if (old?.stage === "blocked" && !renewal) throw new Error("recovery episode is blocked");
+      if (old && !renewal && (old.attempts >= 3 || (!newWindow && now >= old.deadline))) {
         await this.writeRecovery(barePath, branch, { ...journal, recovery: { ...old, stage: "blocked", blocker: "budget_exhausted" } });
         throw new Error("recovery budget exhausted");
       }
       const source = old?.source ?? recoverySource({ runId: journal.runId, clonePath: journal.clonePath,
         ...(journal.attemptId ? { attemptId: journal.attemptId } : {}) });
       const recovery: RecoveryProgress = {
-        ...old, version: 1, source, attempts: (old?.attempts ?? 0) + 1,
+        ...old, version: 1, source, attempts: renewal ? 1 : (old?.attempts ?? 0) + 1,
         startedAt: newWindow ? now : old?.startedAt ?? now,
         deadline: newWindow ? now + 300_000 : old?.deadline ?? now + 300_000,
         ...(claimGeneration === undefined ? {} : { claimGeneration }),
-        backoffMs: recoveryRetryMs * 2 ** Math.min(old?.attempts ?? 0, 4), stage: "capturing",
+        ...(!old || renewal ? (episode !== undefined && episode > 0 ? { episode } : {}) : {}),
+        backoffMs: recoveryRetryMs * 2 ** Math.min(renewal ? 0 : old?.attempts ?? 0, 4), stage: "capturing",
       };
+      if (renewal) delete recovery.blocker;
       await this.runGit(barePath, ["config", "--local", `uzi-attemptmode.${key}.enabled`, "true"]);
       await this.writeRecovery(barePath, branch, { ...journal, recovery });
       return recovery;
@@ -7115,7 +7124,7 @@ export class GitCache {
    * expectedEpisode null requires absence; omission preserves legacy unguarded callers. */
   async blockRecoveryEpisode(
     barePath: string, branch: string, key: string, expected: RecoverySource,
-    reason: RecoveryBlocker, expectedEpisode?: Pick<RecoveryProgress, "startedAt" | "deadline" | "attempts"> | null,
+    reason: RecoveryBlocker, expectedEpisode?: Pick<RecoveryProgress, "startedAt" | "deadline" | "attempts" | "episode" | "claimGeneration"> | null,
     guard?: () => void,
   ): Promise<void> {
     if (!["capture_failed", "source_missing", "adoption_failed", "budget_exhausted", "clock_invalid", "oversize", "prerequisites_unavailable", "quiescence_failed", "preservation_failed", "decoded_history_limit", "readiness_cleanup_unconfirmed"].includes(reason)) throw new Error("invalid blocker");
@@ -7126,7 +7135,9 @@ export class GitCache {
       if (expectedEpisode && (!journal.recovery ||
           journal.recovery.startedAt !== expectedEpisode.startedAt ||
           journal.recovery.deadline !== expectedEpisode.deadline ||
-          journal.recovery.attempts !== expectedEpisode.attempts)) throw new Error("recovery episode changed");
+          journal.recovery.attempts !== expectedEpisode.attempts ||
+          journal.recovery.episode !== expectedEpisode.episode ||
+          journal.recovery.claimGeneration !== expectedEpisode.claimGeneration)) throw new Error("recovery episode changed");
       if (journal.recovery?.stage === "blocked") return;
       const now = Date.now();
       // Without an episode only a proven missing source can create the terminal record.
@@ -7348,7 +7359,7 @@ export class GitCache {
     });
   }
 
-  /** The only budget reset. Call AFTER a successfully settled model turn, with actual
+  /** Clear the completed episode after a successfully settled model turn, with actual
    * processing evidence from the worker. A failed journal write keeps the old budget.
    * This does not release source/pin/custody; explicit owner disposition is separate. */
   async completeRecoveryEpisode(

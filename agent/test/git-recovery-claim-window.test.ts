@@ -1,11 +1,17 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { GitCache, type RecoveryJournalEntry } from "../src/git.js";
-import { recoveryProgress } from "../src/recovery-progress.js";
+import { recoveryProgress, type RecoveryBlocker } from "../src/recovery-progress.js";
 import { RequestError } from "../src/client.js";
 import { RunRunner } from "../src/runner.js";
 import { SinkGate } from "../src/sink-gate.js";
 import { nullLogger } from "./helpers.js";
+
+const permanentBlockers = {
+  capture_failed: true, source_missing: true, adoption_failed: true, clock_invalid: true,
+  oversize: true, prerequisites_unavailable: true, quiescence_failed: true,
+  preservation_failed: true, decoded_history_limit: true, readiness_cleanup_unconfirmed: true,
+} satisfies Record<Exclude<RecoveryBlocker, "budget_exhausted">, true>;
 
 // Exercise the production reservation and parser with persistent journal storage in memory.
 // Source/lock/Git IO are stubs here; the real-Git and runner suites cover those Linux boundaries.
@@ -34,12 +40,178 @@ function fixture(t: TestContext) {
     seam.runGit = async () => "";
     return cache;
   }
-  const reserve = (gen?: number, cache = recreate()) =>
-    cache.reserveRecoveryIteration("/tmp/bare", "branch", "key", source, 1000, gen);
+  const reserve = (gen?: number, cache = recreate(), episode?: number) =>
+    cache.reserveRecoveryIteration("/tmp/bare", "branch", "key", source, 1000, gen, episode);
   return { reserve, recreate, source, read: () => structuredClone(journal),
     write: (value: RecoveryJournalEntry) => { journal = structuredClone(value); },
     advance: (ms: number) => { now += ms; } };
 }
+
+for (const state of ["partly-used", "exhausted-unblocked", "budget-blocked"] as const) {
+  test(`new server episode renews ${state} with a fresh window and base backoff`, async t => {
+    const f = fixture(t);
+    await f.reserve(4, f.recreate(), 7);
+    if (state !== "partly-used") {
+      await f.reserve(4, f.recreate(), 7);
+      await f.reserve(4, f.recreate(), 7);
+    }
+    if (state === "budget-blocked") await assert.rejects(f.reserve(4, f.recreate(), 7), /budget/);
+    const before = f.read();
+    f.advance(400_000);
+    const renewed = await f.reserve(5, f.recreate(), 8);
+    const expected = { ...before.recovery! };
+    delete expected.blocker;
+    assert.deepEqual(renewed, {
+      ...expected, episode: 8, claimGeneration: 5, attempts: 1,
+      startedAt: 1_400_000, deadline: 1_700_000, backoffMs: 1000, stage: "capturing",
+    });
+    assert.equal(Object.hasOwn(renewed, "blocker"), false);
+    assert.deepEqual(f.read(), { ...before, recovery: renewed });
+    assert.equal((await f.reserve(6, f.recreate(), 8)).attempts, 2);
+    const third = await f.reserve(7, f.recreate());
+    assert.equal(third.attempts, 3, "an older API cannot refund the renewed allowance");
+    assert.equal(third.episode, 8, "an older API cannot lower the durable episode");
+    await assert.rejects(f.reserve(8, f.recreate(), 8), /budget/);
+    assert.equal(f.read().recovery?.attempts, 3);
+    assert.equal(f.read().recovery?.episode, 8);
+  });
+}
+
+test("legacy absent episode is logically zero and can renew once without serializing zero", async t => {
+  const f = fixture(t);
+  await f.reserve(4);
+  const legacy = f.read();
+  assert.equal(Object.hasOwn(legacy.recovery!, "episode"), false);
+  const renewed = await f.reserve(5, f.recreate(), 1);
+  assert.equal(renewed.episode, 1);
+  assert.equal(renewed.attempts, 1);
+  assert.equal((await f.reserve(6, f.recreate(), 0)).attempts, 2);
+  assert.equal(f.read().recovery?.episode, 1, "explicit zero cannot lower stored allowance");
+});
+
+test("initial zero episode preserves legacy reservation bytes", async t => {
+  const f = fixture(t);
+  await f.reserve(1);
+  const legacy = f.read();
+  f.write(f.source);
+  await f.reserve(1, f.recreate(), 0);
+  assert.equal(JSON.stringify(f.read()), JSON.stringify(legacy));
+});
+
+test("initial reservation records a positive server episode without changing legacy serialization", async t => {
+  const f = fixture(t);
+  const first = await f.reserve(1, f.recreate(), 7);
+  assert.equal(first.episode, 7);
+  assert.equal(first.attempts, 1);
+  assert.equal(first.backoffMs, 1000);
+  assert.equal(first.deadline, 1_300_000);
+});
+
+for (const blocker of Object.keys(permanentBlockers) as Exclude<RecoveryBlocker, "budget_exhausted">[]) {
+  test(`newer episode cannot renew permanent ${blocker}; runner stops before ownership`, async t => {
+    const f = fixture(t);
+    await f.reserve(4, f.recreate(), 7);
+    const before = f.read();
+    before.recovery = { ...before.recovery!, stage: "blocked", blocker };
+    f.write(before);
+    f.advance(400_000);
+    await assert.rejects(f.reserve(5, f.recreate(), 8), /blocked/);
+    assert.deepEqual(f.read(), before);
+    const h = runnerFixture(f, async () => ({ status: "running", claim_generation: 5 }));
+    await assert.rejects(h.run(5, 8));
+    assert.equal(h.ownershipReads(), 0);
+    assert.equal(h.quiescenceCalls(), 0);
+    assert.deepEqual(f.read(), before);
+  });
+}
+
+for (const state of ["partly-used", "budget-blocked"] as const) {
+  for (const generation of [undefined, 3, 4]) {
+    test(`newer episode with ${String(generation)} fence preserves ${state} whole journal`, async t => {
+      const f = fixture(t);
+      await f.reserve(4, f.recreate(), 7);
+      if (state === "budget-blocked") {
+        await f.reserve(4, f.recreate(), 7);
+        await f.reserve(4, f.recreate(), 7);
+        await assert.rejects(f.reserve(4, f.recreate(), 7), /budget/);
+      }
+      const before = f.read();
+      await assert.rejects(f.reserve(generation, f.recreate(), 8), /fence/);
+      assert.deepEqual(f.read(), before);
+      if (state === "budget-blocked") {
+        const h = runnerFixture(f, async () => ({ status: "running", claim_generation: generation }));
+        await assert.rejects(h.run(generation, 8));
+        assert.equal(h.quiescenceCalls(), 0);
+        assert.deepEqual(f.read(), before, "runner failure finalization cannot rewrite blocked predecessor");
+      }
+    });
+  }
+}
+
+function runnerFixture(f: ReturnType<typeof fixture>, ownership: () => Promise<unknown>) {
+  let reads = 0, quiescence = 0;
+  const runner = Object.assign(Object.create(RunRunner.prototype), {
+    git: f.recreate(), recoveryRetryMs: 1000, codexBoundaryDeadlineMs: 1000,
+    freeCaptureFlights: new WeakMap(), shutdownSignal: new AbortController(),
+    client: { getRunOwnership: async () => { reads++; return ownership(); } },
+    cloneCoordinates: () => ({ branch: "branch" }),
+    retainedLifecycleGuard: () => {},
+    retainedLifecycleSignal: () => new AbortController().signal,
+    quiesceRun: async () => { quiescence++; return { blocked: true }; },
+    reportGenericFailure: async () => {},
+  });
+  return {
+    ownershipReads: () => reads, quiescenceCalls: () => quiescence,
+    run: (generation: number | undefined, episode: number) => runner.recoverRetainedClaim({
+      run_id: f.source.runId, secrets: {}, worker_recovery_episode: episode,
+    }, {
+      barePath: "/tmp/bare", runId: f.source.runId, claimGeneration: generation,
+      executor: { run: async () => ({ branch: "branch" }) }, sinkGate: new SinkGate(),
+      survivingTickGroups: [], runLog: nullLogger(),
+    }, "key", f.read()),
+  };
+}
+
+for (const ownership of ["owned", "unavailable", "stale"] as const) {
+  test(`budget-blocked renewal ${ownership} passes real ownership and quiescence wrappers`, async t => {
+    const f = fixture(t);
+    for (let i = 0; i < 3; i++) await f.reserve(4, f.recreate(), 7);
+    await assert.rejects(f.reserve(4, f.recreate(), 7), /budget/);
+    const before = f.read();
+    f.advance(400_000);
+    const h = runnerFixture(f, async () => {
+      if (ownership === "unavailable") throw new TypeError("fetch failed");
+      return { status: "running", claim_generation: ownership === "owned" ? 5 : 4 };
+    });
+    await assert.rejects(h.run(5, 8));
+    assert.ok(h.ownershipReads() > 0);
+    assert.equal(h.quiescenceCalls(), ownership === "owned" ? 1 : 0);
+    if (ownership === "owned") {
+      const progress = f.read().recovery!;
+      assert.equal(progress.episode, 8);
+      assert.equal(progress.claimGeneration, 5);
+      assert.equal(progress.attempts, 1);
+      assert.equal(progress.startedAt, 1_400_000);
+      assert.equal(progress.deadline, 1_700_000);
+      assert.equal(progress.backoffMs, 1000);
+      assert.equal(progress.blocker, "quiescence_failed");
+    } else assert.deepEqual(f.read(), before);
+  });
+}
+
+test("rollback during budget-blocked newer episode leaves whole journal unchanged through runner failure", async t => {
+  const f = fixture(t);
+  for (let i = 0; i < 3; i++) await f.reserve(4, f.recreate(), 7);
+  await assert.rejects(f.reserve(4, f.recreate(), 7), /budget/);
+  const before = f.read();
+  f.advance(-1);
+  await assert.rejects(f.reserve(5, f.recreate(), 8), /clock/);
+  assert.deepEqual(f.read(), before);
+  const h = runnerFixture(f, async () => ({ status: "running", claim_generation: 5 }));
+  await assert.rejects(h.run(5, 8));
+  assert.equal(h.quiescenceCalls(), 0);
+  assert.deepEqual(f.read(), before);
+});
 
 test("fresh fenced claim after an interrupted long turn rebases deadline without refunding attempts", async t => {
   const f = fixture(t);
@@ -71,7 +243,7 @@ test("fourth reservation stays refused across fresh claims", async t => {
   assert.equal(f.read().recovery?.attempts, 3);
 });
 
-for (const blocker of ["decoded_history_limit", "clock_invalid", "quiescence_failed", "budget_exhausted", "readiness_cleanup_unconfirmed"] as const) {
+for (const blocker of [...Object.keys(permanentBlockers), "budget_exhausted"] as RecoveryBlocker[]) {
   test(`already blocked ${blocker} survives a new claim and expiry unchanged`, async t => {
     const f = fixture(t);
     await f.reserve(1);

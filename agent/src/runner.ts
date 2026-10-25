@@ -21423,7 +21423,8 @@ export class RunRunner {
     if (deadline !== undefined && Date.now() >= deadline) throw new Error("recovery deadline exhausted");
   }
 
-  /** At most three durably precharged iterations in this claim and all its successors.
+  /** At most three durably precharged iterations per server recovery episode.
+   * A newer episode with a fresh owned claim can renew budget exhaustion; other blockers persist.
    * Each failed capture blocks only this run; waits are bounded by the persisted episode clock. */
   private async recoverRetainedClaim(
     claim: ClaimResponse, flight: RunFlight, key: string, source: RecoveryJournalEntry,
@@ -21493,7 +21494,10 @@ export class RunRunner {
       flight.sourceNormalBlocked = flight.sourceBlockingNormal && flight.sourceBlockedReport === true;
       throw new RetainedRecoveryStop();
     };
-    if (source.recovery?.stage === "blocked") await fail();
+    const recoveryEpisode = Number.isSafeInteger(claim.worker_recovery_episode) &&
+      (claim.worker_recovery_episode ?? -1) >= 0 ? claim.worker_recovery_episode : undefined;
+    if (source.recovery?.stage === "blocked" &&
+        (source.recovery.blocker !== "budget_exhausted" || (recoveryEpisode ?? 0) <= (source.recovery.episode ?? 0))) await fail();
     for (;;) {
       this.retainedLifecycleGuard(flight);
       let reservation: Awaited<ReturnType<GitCache["reserveRecoveryIteration"]>>;
@@ -21520,7 +21524,7 @@ export class RunRunner {
               throw new RetainedRecoveryStop();
             }
           }
-          return this.git.reserveRecoveryIteration(bare, branch, key, source, this.recoveryRetryMs, flight.claimGeneration);
+          return this.git.reserveRecoveryIteration(bare, branch, key, source, this.recoveryRetryMs, flight.claimGeneration, recoveryEpisode);
         });
       } catch (error) {
         this.retainedLifecycleGuard(flight);
