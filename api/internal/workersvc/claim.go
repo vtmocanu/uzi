@@ -66,6 +66,12 @@ type ClaimPayload struct {
 	LastSeq                  int32   `json:"last_seq"` // resume: continue message numbering
 	IterationCount           int32   `json:"iteration_count"`
 	RequeueCount             int32   `json:"requeue_count"`
+	// WorkerRecoveryEpisode is the run row's owner-authorized recovery episode.
+	// ResumeWorkerRecoveryEpisode alone increments it; automatic requeues and claims
+	// preserve it. Always present, including zero; older workers ignore the key.
+	// Run-backed cross-check claims use the child run's episode, never the lead's.
+	// Non-run cross-check records have no recovery episode to project.
+	WorkerRecoveryEpisode int64 `json:"worker_recovery_episode"`
 	// ClaimGeneration is the general claim-lane counter (PRD #1296 M1, D2), incremented
 	// atomically in the ClaimRun transaction that produced this payload and read straight
 	// off the returned run row. The worker binds its durable source-journal identity to

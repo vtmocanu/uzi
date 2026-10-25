@@ -87,6 +87,8 @@ const (
 // Like ClaimPayload it is returned only over the claim response and must never be
 // logged.
 type ChatClaimPayload struct {
+	// WorkerRecoveryEpisode has the same row-backed meaning as ClaimPayload.WorkerRecoveryEpisode.
+	WorkerRecoveryEpisode   int64         `json:"worker_recovery_episode"`
 	MemoryEpisode           int64         `json:"memory_episode"`
 	MemoryInterventionCount int32         `json:"memory_intervention_count"`
 	MemoryPolicy            *MemoryPolicy `json:"memory_policy"`
@@ -402,6 +404,7 @@ func (s *Service) assembleChatClaim(ctx context.Context, run store.Run) (*ChatCl
 		LastSeq:                 run.LastSeq,
 		RequeueCount:            run.RequeueCount,
 		ClaimGeneration:         run.ClaimGeneration,
+		WorkerRecoveryEpisode:   run.WorkerRecoveryEpisode,
 		MemoryEpisode:           run.MemoryEpisode,
 		MemoryInterventionCount: run.MemoryInterventionCount,
 		MemoryPolicy:            frozenMemoryPolicy,

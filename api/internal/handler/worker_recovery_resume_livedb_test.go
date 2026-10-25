@@ -110,11 +110,8 @@ func TestWorkerRecoveryResumeClaimEpisodesLiveDB(t *testing.T) {
 				if err := tx.Commit(fx.ctx); err != nil {
 					t.Fatal(err)
 				}
-				claimed, err := fx.q.GetRunByIDForUser(fx.ctx, store.GetRunByIDForUserParams{ID: id, UserID: fx.userID})
-				if err != nil {
-					t.Fatal(err)
-				}
-				return claimed
+				// Inspect ClaimRun's actual RETURNING projection, not a later SELECT.
+				return row
 			}
 			fence := func(w uuid.UUID, generation int64, want bool) {
 				t.Helper()
@@ -162,7 +159,7 @@ func TestWorkerRecoveryResumeClaimEpisodesLiveDB(t *testing.T) {
 					t.Fatalf("resume DTO=%+v lifetime=%d", wr, body.Run.RequeueCount)
 				}
 				resumed, err := fx.q.GetRunByIDForUser(fx.ctx, store.GetRunByIDForUserParams{ID: id, UserID: fx.userID})
-				if err != nil || resumed.Status != "queued" || resumed.RequeueEpisodeBaseline != lifetime || resumed.RecoveryWaitCause.Valid ||
+				if err != nil || resumed.Status != "queued" || resumed.WorkerRecoveryEpisode != heldBeforeResume.WorkerRecoveryEpisode+1 || resumed.RequeueEpisodeBaseline != lifetime || resumed.RecoveryWaitCause.Valid ||
 					len(resumed.WorkerRecoveryEvidence) != 0 || resumed.StaleRequeueGeneration.Valid || !resumed.ClaimReleasedAt.Valid ||
 					resumed.ClaimGeneration != generation || resumed.StartedAt != original.StartedAt || resumed.BudgetWallSeconds != original.BudgetWallSeconds ||
 					resumed.CheckpointTip.String != tip || resumed.IterationCount != 4 || (resumed.BudgetPausedSeconds-heldBeforeResume.BudgetPausedSeconds < 120 || resumed.BudgetPausedSeconds-heldBeforeResume.BudgetPausedSeconds > 125) {
@@ -194,7 +191,7 @@ func TestWorkerRecoveryResumeClaimEpisodesLiveDB(t *testing.T) {
 				}
 				claimed := claim(worker, false)
 				generation++
-				if claimed.ClaimGeneration != generation || claimed.ClaimReleasedAt.Valid {
+				if claimed.WorkerRecoveryEpisode != episode || claimed.ClaimGeneration != generation || claimed.ClaimReleasedAt.Valid {
 					t.Fatalf("claim generation/release=%d/%v", claimed.ClaimGeneration, claimed.ClaimReleasedAt.Valid)
 				}
 				fence(oldWorker, generation, false)
@@ -210,7 +207,7 @@ func TestWorkerRecoveryResumeClaimEpisodesLiveDB(t *testing.T) {
 					lifetime++
 					claimed = claim(worker, false)
 					generation++
-					if claimed.RequeueCount != lifetime || claimed.ClaimGeneration != generation {
+					if claimed.WorkerRecoveryEpisode != episode || claimed.RequeueCount != lifetime || claimed.ClaimGeneration != generation {
 						t.Fatalf("automatic history=%d/%d generation=%d/%d", claimed.RequeueCount, lifetime, claimed.ClaimGeneration, generation)
 					}
 				}
