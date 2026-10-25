@@ -12,15 +12,19 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const ensureInstanceIntakePauseRow = `-- name: EnsureInstanceIntakePauseRow :exec
+const ensureInstanceIntakePauseRow = `-- name: EnsureInstanceIntakePauseRow :execrows
 INSERT INTO instance_intake_pause (id) VALUES (true) ON CONFLICT (id) DO NOTHING
 `
 
 // Re-seeds a deleted singleton (inactive) so a transition can proceed and lift the
-// fail-closed pause a missing row implies.
-func (q *Queries) EnsureInstanceIntakePauseRow(ctx context.Context) error {
-	_, err := q.db.Exec(ctx, ensureInstanceIntakePauseRow)
-	return err
+// fail-closed pause a missing row implies. Returns 1 when it re-created the row, so the
+// caller can audit lifting a missing singleton (effective state paused to unpaused).
+func (q *Queries) EnsureInstanceIntakePauseRow(ctx context.Context) (int64, error) {
+	result, err := q.db.Exec(ctx, ensureInstanceIntakePauseRow)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const getInstanceIntakePause = `-- name: GetInstanceIntakePause :one
@@ -97,6 +101,289 @@ func (q *Queries) ListInstanceIntakePauseEvents(ctx context.Context, rowLimit in
 	return items, nil
 }
 
+const listMaintenanceActiveRuns = `-- name: ListMaintenanceActiveRuns :many
+SELECT r.id AS run_id, r.kind, r.status,
+       COALESCE(NULLIF(u.display_name, ''), u.email, '')::text AS owner_label,
+       rp.path_with_namespace AS repo, r.status_since AS since,
+       count(*) OVER ()::bigint AS total
+FROM runs r
+LEFT JOIN users u ON u.id = r.user_id
+LEFT JOIN repos rp ON rp.id = r.repo_id
+WHERE r.status IN ('claimed', 'running')
+ORDER BY r.status_since, r.id
+LIMIT 50
+`
+
+type ListMaintenanceActiveRunsRow struct {
+	RunID      uuid.UUID          `json:"run_id"`
+	Kind       string             `json:"kind"`
+	Status     string             `json:"status"`
+	OwnerLabel string             `json:"owner_label"`
+	Repo       pgtype.Text        `json:"repo"`
+	Since      pgtype.Timestamptz `json:"since"`
+	Total      int64              `json:"total"`
+}
+
+func (q *Queries) ListMaintenanceActiveRuns(ctx context.Context) ([]ListMaintenanceActiveRunsRow, error) {
+	rows, err := q.db.Query(ctx, listMaintenanceActiveRuns)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListMaintenanceActiveRunsRow{}
+	for rows.Next() {
+		var i ListMaintenanceActiveRunsRow
+		if err := rows.Scan(
+			&i.RunID,
+			&i.Kind,
+			&i.Status,
+			&i.OwnerLabel,
+			&i.Repo,
+			&i.Since,
+			&i.Total,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listMaintenanceCustodyRuns = `-- name: ListMaintenanceCustodyRuns :many
+WITH open_holds AS (
+    SELECT h.id AS hold_id, h.run_id, h.user_id, h.repo_id, h.created_at, f.decision_needed
+    FROM recovery_custody_hold_facts f
+    JOIN recovery_custody_holds h ON h.id = f.id
+    WHERE f.state = 'open'
+), per_run AS (
+    SELECT DISTINCT ON (run_id) hold_id, run_id, user_id, repo_id, created_at,
+           bool_or(decision_needed) OVER (PARTITION BY run_id) AS needs_owner
+    FROM open_holds
+    ORDER BY run_id, created_at, hold_id
+)
+SELECT p.run_id, COALESCE(r.kind, '')::text AS kind, COALESCE(r.status, '')::text AS status,
+       COALESCE(NULLIF(u.display_name, ''), u.email, '')::text AS owner_label,
+       rp.path_with_namespace AS repo, p.created_at AS since,
+       (CASE WHEN p.needs_owner THEN 'needs_owner' ELSE 'progressing' END)::text AS tag,
+       p.hold_id,
+       count(*) OVER ()::bigint AS total
+FROM per_run p
+LEFT JOIN runs r ON r.id = p.run_id
+LEFT JOIN users u ON u.id = p.user_id
+LEFT JOIN repos rp ON rp.id = p.repo_id
+ORDER BY p.created_at, p.run_id
+LIMIT 50
+`
+
+type ListMaintenanceCustodyRunsRow struct {
+	RunID      uuid.UUID          `json:"run_id"`
+	Kind       string             `json:"kind"`
+	Status     string             `json:"status"`
+	OwnerLabel string             `json:"owner_label"`
+	Repo       pgtype.Text        `json:"repo"`
+	Since      pgtype.Timestamptz `json:"since"`
+	Tag        string             `json:"tag"`
+	HoldID     uuid.UUID          `json:"hold_id"`
+	Total      int64              `json:"total"`
+}
+
+// One item per run with an OPEN custody hold (terminal runs included), from the oldest open
+// hold. tag needs_owner exactly when any of the run's open holds has decision_needed.
+func (q *Queries) ListMaintenanceCustodyRuns(ctx context.Context) ([]ListMaintenanceCustodyRunsRow, error) {
+	rows, err := q.db.Query(ctx, listMaintenanceCustodyRuns)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListMaintenanceCustodyRunsRow{}
+	for rows.Next() {
+		var i ListMaintenanceCustodyRunsRow
+		if err := rows.Scan(
+			&i.RunID,
+			&i.Kind,
+			&i.Status,
+			&i.OwnerLabel,
+			&i.Repo,
+			&i.Since,
+			&i.Tag,
+			&i.HoldID,
+			&i.Total,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listMaintenanceHeldRuns = `-- name: ListMaintenanceHeldRuns :many
+SELECT r.id AS run_id, r.kind, r.status,
+       COALESCE(NULLIF(u.display_name, ''), u.email, '')::text AS owner_label,
+       rp.path_with_namespace AS repo, r.status_since AS since,
+       (CASE WHEN (r.status = 'awaiting_approval' AND NOT r.auto_approve)
+                  OR r.status IN ('awaiting_input', 'paused')
+                  OR (r.status = 'recovery_wait'
+                      AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure'))
+             THEN 'needs_owner' ELSE 'progressing' END)::text AS tag,
+       count(*) OVER ()::bigint AS total
+FROM runs r
+LEFT JOIN users u ON u.id = r.user_id
+LEFT JOIN repos rp ON rp.id = r.repo_id
+WHERE r.status IN ('awaiting_approval', 'awaiting_input', 'awaiting_followup', 'paused',
+                   'limit_wait', 'recovery_wait', 'pool_wait')
+   OR (r.status = 'queued' AND fn_run_admitted_during_intake_pause(r))
+ORDER BY r.status_since, r.id
+LIMIT 50
+`
+
+type ListMaintenanceHeldRunsRow struct {
+	RunID      uuid.UUID          `json:"run_id"`
+	Kind       string             `json:"kind"`
+	Status     string             `json:"status"`
+	OwnerLabel string             `json:"owner_label"`
+	Repo       pgtype.Text        `json:"repo"`
+	Since      pgtype.Timestamptz `json:"since"`
+	Tag        string             `json:"tag"`
+	Total      int64              `json:"total"`
+}
+
+// Held: parked on a non-claim status, or queued but already admitted (a requeued run or a
+// cross_check child still claims during the pause). tag needs_owner = only the owner can move it.
+func (q *Queries) ListMaintenanceHeldRuns(ctx context.Context) ([]ListMaintenanceHeldRunsRow, error) {
+	rows, err := q.db.Query(ctx, listMaintenanceHeldRuns)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListMaintenanceHeldRunsRow{}
+	for rows.Next() {
+		var i ListMaintenanceHeldRunsRow
+		if err := rows.Scan(
+			&i.RunID,
+			&i.Kind,
+			&i.Status,
+			&i.OwnerLabel,
+			&i.Repo,
+			&i.Since,
+			&i.Tag,
+			&i.Total,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listMaintenanceIdleBoundWorkers = `-- name: ListMaintenanceIdleBoundWorkers :many
+SELECT w.id AS worker_id,
+       COALESCE(NULLIF(u.display_name, ''), u.email, '')::text AS owner_label,
+       r.id AS run_id, w.created_at AS since,
+       count(*) OVER ()::bigint AS total
+FROM workers w
+JOIN runs r ON r.id = w.ephemeral_run_id
+LEFT JOIN users u ON u.id = w.user_id
+WHERE w.ephemeral AND r.status = 'queued' AND NOT fn_run_admitted_during_intake_pause(r)
+ORDER BY w.created_at, w.id
+LIMIT 50
+`
+
+type ListMaintenanceIdleBoundWorkersRow struct {
+	WorkerID   uuid.UUID          `json:"worker_id"`
+	OwnerLabel string             `json:"owner_label"`
+	RunID      uuid.UUID          `json:"run_id"`
+	Since      pgtype.Timestamptz `json:"since"`
+	Total      int64              `json:"total"`
+}
+
+// Informational: ephemeral workers bound to a queued run the pause will not admit.
+func (q *Queries) ListMaintenanceIdleBoundWorkers(ctx context.Context) ([]ListMaintenanceIdleBoundWorkersRow, error) {
+	rows, err := q.db.Query(ctx, listMaintenanceIdleBoundWorkers)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListMaintenanceIdleBoundWorkersRow{}
+	for rows.Next() {
+		var i ListMaintenanceIdleBoundWorkersRow
+		if err := rows.Scan(
+			&i.WorkerID,
+			&i.OwnerLabel,
+			&i.RunID,
+			&i.Since,
+			&i.Total,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listMaintenanceQueuedRuns = `-- name: ListMaintenanceQueuedRuns :many
+SELECT r.id AS run_id, r.kind, r.status,
+       COALESCE(NULLIF(u.display_name, ''), u.email, '')::text AS owner_label,
+       rp.path_with_namespace AS repo, r.status_since AS since,
+       count(*) OVER ()::bigint AS total
+FROM runs r
+LEFT JOIN users u ON u.id = r.user_id
+LEFT JOIN repos rp ON rp.id = r.repo_id
+WHERE r.status = 'queued' AND NOT fn_run_admitted_during_intake_pause(r)
+ORDER BY r.status_since, r.id
+LIMIT 50
+`
+
+type ListMaintenanceQueuedRunsRow struct {
+	RunID      uuid.UUID          `json:"run_id"`
+	Kind       string             `json:"kind"`
+	Status     string             `json:"status"`
+	OwnerLabel string             `json:"owner_label"`
+	Repo       pgtype.Text        `json:"repo"`
+	Since      pgtype.Timestamptz `json:"since"`
+	Total      int64              `json:"total"`
+}
+
+// Informational: new roots that will not claim until the pause lifts.
+func (q *Queries) ListMaintenanceQueuedRuns(ctx context.Context) ([]ListMaintenanceQueuedRunsRow, error) {
+	rows, err := q.db.Query(ctx, listMaintenanceQueuedRuns)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListMaintenanceQueuedRunsRow{}
+	for rows.Next() {
+		var i ListMaintenanceQueuedRunsRow
+		if err := rows.Scan(
+			&i.RunID,
+			&i.Kind,
+			&i.Status,
+			&i.OwnerLabel,
+			&i.Repo,
+			&i.Since,
+			&i.Total,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lockInstanceIntakePause = `-- name: LockInstanceIntakePause :one
 SELECT id, active, since, by_user_id, by_label, reason FROM instance_intake_pause WHERE id FOR UPDATE
 `
@@ -114,6 +401,23 @@ func (q *Queries) LockInstanceIntakePause(ctx context.Context) (InstanceIntakePa
 		&i.Reason,
 	)
 	return i, err
+}
+
+const maintenanceSnapshotNow = `-- name: MaintenanceSnapshotNow :one
+
+SELECT now()::timestamptz AS as_of
+`
+
+// PRD #3454 maintenance readout. Run in ONE REPEATABLE READ READ ONLY transaction
+// (store.ReadMaintenanceReadout) so counts and lists share a snapshot. Every non-terminal
+// status lands in exactly one of active / held / queued; custody is a separate, overlapping
+// view of open recovery holds. Each list query returns the exact total in total (window
+// count before LIMIT) and its oldest 50 rows.
+func (q *Queries) MaintenanceSnapshotNow(ctx context.Context) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, maintenanceSnapshotNow)
+	var as_of pgtype.Timestamptz
+	err := row.Scan(&as_of)
+	return as_of, err
 }
 
 const runAdmittableForEphemeralProvision = `-- name: RunAdmittableForEphemeralProvision :one

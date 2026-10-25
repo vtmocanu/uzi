@@ -35,6 +35,8 @@ $$;
 -- +goose StatementEnd
 
 -- +goose StatementBegin
+-- BEGIN ATOMIC records column dependencies on runs.kind and runs.claim_generation: a future
+-- type change to either must drop and recreate this function.
 -- Admitted = claimed at least once, or a cross-check child (ClaimRun already binds it to a
 -- claimed lead). Everything else is a new root (PRD #3454 D4). Kept separate from
 -- fn_worker_accepts_new_intake so capacity and capability projections stay truthful (D2).

@@ -224,8 +224,9 @@ func TestIntakePauseMissingRowLiveDB(t *testing.T) {
 		t.Fatalf("admitted run must claim with missing row: %s %v", got.ID, err)
 	}
 
-	// Lifting: an "off" transition re-seeds the row (inactive) and is otherwise a no-op,
-	// leaving the instance unpaused with no event.
+	// Lifting: an "off" transition re-seeds the row (inactive); the effective state changed
+	// from paused to unpaused, so it is a change audited as an "off" event by the caller.
+	mustExec(fx.ctx, t, fx.pool, `DELETE FROM instance_intake_pause_events`)
 	tx, err := fx.pool.Begin(fx.ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -233,11 +234,15 @@ func TestIntakePauseMissingRowLiveDB(t *testing.T) {
 	defer func() { _ = tx.Rollback(fx.ctx) }()
 	by := pgtype.UUID{Bytes: fx.userID, Valid: true}
 	lifted, changed, err := store.SetInstanceIntakePause(fx.ctx, store.New(tx), false, "", by, "Admin")
-	if err != nil || changed || lifted.Active {
+	if err != nil || !changed || lifted.Active {
 		t.Fatalf("lift on missing row: %+v changed=%v err=%v", lifted, changed, err)
 	}
 	if err := tx.Commit(fx.ctx); err != nil {
 		t.Fatal(err)
+	}
+	evs, err := fx.q.ListInstanceIntakePauseEvents(fx.ctx, 10)
+	if err != nil || len(evs) != 1 || evs[0].Action != "off" || evs[0].ByUserID != by || evs[0].ByLabel.String != "Admin" {
+		t.Fatalf("lifting a missing singleton must write one off event by the caller: %+v err=%v", evs, err)
 	}
 	var rows int
 	if err := fx.pool.QueryRow(fx.ctx, `SELECT count(*) FROM instance_intake_pause`).Scan(&rows); err != nil || rows != 1 {
