@@ -2963,6 +2963,7 @@ export class RunRunner {
         withInventorySourceBoundary: (context, action) => this.withInventorySourceBoundary(context, action),
         withCompletionSourceBoundary: (source, action) => this.withCompletionSourceBoundary(source, action),
         onCompletionSourceForgotten: source => this.forgetCompletionSourceBinding(source),
+        onCompletionGenerationForgotten: (runId, generation) => this.forgetCompletionSourceBindings(runId, generation),
         withTerminalSourceBoundary: (runId, paths, action, signal) => {
           const pressureOpen = () => this.dataVolume?.preflight() !== "data_volume_full";
           if (!pressureOpen()) return Promise.resolve({ entered: false as const });
@@ -3330,15 +3331,22 @@ export class RunRunner {
   }
 
   private forgetCompletionSourceBinding(source: CompletionSource): void {
-    const group = this.completionKey(source.context.runId, source.context.generation);
+    this.forgetCompletionSourceBindings(source.context.runId, source.context.generation, this.completionSourceIdentity(source));
+  }
+
+  private forgetCompletionSourceBindings(runId: string, generation: number, key?: string): void {
+    const group = this.completionKey(runId, generation);
     const bindings = this.completionSourceBindings.get(group);
     if (!bindings) return;
-    const key = this.completionSourceIdentity(source);
     // A binder may already own provenance while waiting on the coordinator's journal lock.
-    // Its partial write must never become an unclassified current-process source.
-    if (bindings.some(b => b.key === key && this.completionSourceBinds.has(b))) return;
-    const remaining = bindings.filter(b => b.key !== key);
-    for (const binding of bindings) if (binding.key === key) this.conflictedCompletionSources.delete(binding);
+    // Its partial write must never become an unclassified current-process source; preserve
+    // every version of its identity, including conflicting bindings.
+    const pendingKeys = new Set(bindings.filter(b => this.completionSourceBinds.has(b)).map(b => b.key));
+    const remaining = bindings.filter(binding => {
+      if ((key !== undefined && binding.key !== key) || pendingKeys.has(binding.key)) return true;
+      this.conflictedCompletionSources.delete(binding);
+      return false;
+    });
     if (remaining.length) this.completionSourceBindings.set(group, Object.freeze(remaining));
     else this.completionSourceBindings.delete(group);
   }

@@ -448,6 +448,8 @@ export interface RecoveryCoordinatorOptions {
   }) => Promise<T>, signal?: AbortSignal) => Promise<{ entered: false } | { entered: true; value: T }>;
   /** Notification only, after exact-source and generation cleanup actually completed. */
   onCompletionSourceForgotten?: (source: CompletionSource) => void;
+  /** Notification only, after guarded archive/FINAL cleanup removed the full generation. */
+  onCompletionGenerationForgotten?: (runId: string, generation: number) => void;
   withCompletionSourceBoundary?: (
     source: CompletionSource,
     action: (canDelete: () => boolean) => Promise<void>,
@@ -909,6 +911,7 @@ export class RecoveryCoordinator {
   private readonly withInventorySourceBoundary: RecoveryCoordinatorOptions["withInventorySourceBoundary"];
   private readonly withCompletionSourceBoundary: RecoveryCoordinatorOptions["withCompletionSourceBoundary"];
   private readonly onCompletionSourceForgotten: RecoveryCoordinatorOptions["onCompletionSourceForgotten"];
+  private readonly onCompletionGenerationForgotten: RecoveryCoordinatorOptions["onCompletionGenerationForgotten"];
   private readonly isExecuting: (runId: string) => boolean;
   private bootOwed: Awaited<ReturnType<NonNullable<RecoveryBundleProducer["discoverOwedCandidates"]>>> = [];
   private readonly terminalRecordProtection: RecoveryCoordinatorOptions["terminalRecordProtection"];
@@ -1086,6 +1089,7 @@ export class RecoveryCoordinator {
     this.withInventorySourceBoundary = opts.withInventorySourceBoundary;
     this.withCompletionSourceBoundary = opts.withCompletionSourceBoundary;
     this.onCompletionSourceForgotten = opts.onCompletionSourceForgotten;
+    this.onCompletionGenerationForgotten = opts.onCompletionGenerationForgotten;
     this.isExecuting = opts.isExecuting ?? (() => false);
     this.terminalRecordProtection = opts.terminalRecordProtection;
     this.pendingGenerationReport = opts.pendingGenerationReport;
@@ -4380,6 +4384,7 @@ export class RecoveryCoordinator {
         .sort((a, b) => Number(!!a.finalAcknowledged) - Number(!!b.finalAcknowledged))) await unlink(this.recordPath(record));
       await unlink(this.recordPath(ack));
       await ownedRecoveryIO(() => fs.rmdir(this.runDir(runId))).catch(() => undefined);
+      this.onCompletionGenerationForgotten?.(runId, generation);
     });
     await this.submitRedundancyClaims(claims, budget);
   }
