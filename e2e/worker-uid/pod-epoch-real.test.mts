@@ -5,6 +5,7 @@ import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:chil
 import { createRequire } from "node:module";
 import { createInterface } from "node:readline";
 import { test } from "node:test";
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 import { entrypointFixture } from "./pod-epoch-entrypoint-fixture.mjs";
@@ -38,6 +39,14 @@ function fixture() {
   const runtime = createRuntime({ root, io, uid: 10001, gid: 10001 });
   const children: Owned[] = [];
   return { root, runtime,
+    async exclusive() {
+      const held = await runtime.acquire({ firstMode: "exclusive" });
+      if (held.mode !== "exclusive") {
+        held.close();
+        assert.fail("proof requires actual EX; a fallback SH cannot establish the test precondition");
+      }
+      return held;
+    },
     async child(split = false) { const child = new Owned(root, split); children.push(child); await child.ready(); return child; },
     async close() {
       try { await Promise.all(children.map(child => child.stop())); }
@@ -209,7 +218,7 @@ test("pod epoch rendered seed and runner-init wait under EX in both real UID mod
       fs.writeFileSync(path.join(f.root, "provision/keep"), "protected");
       const rendered = sandbox.initScript(seed);
       const before = protectedSnapshot(f.root);
-      holder = await f.runtime.acquire({ firstMode: "exclusive" });
+      holder = await f.exclusive();
       boot = sandbox.start(single, rendered);
       await boot.wait("EPOCH_HOLD_LOCK_CONFLICT");
       assert.ok(protectedSnapshot(f.root) === before, "rendered initializer cannot mutate protected state under EX");
@@ -295,7 +304,7 @@ test("pod epoch real entrypoint fences protected initialization under EX and con
     fs.unlinkSync(sandbox.bootstrap);
     fs.renameSync(sandbox.bootstrap + "-saved", sandbox.bootstrap);
     const initializationBefore = protectedSnapshot(f.root);
-    holder = await f.runtime.acquire({ firstMode: "exclusive" });
+    holder = await f.exclusive();
     const boot = sandbox.start(); launched.push(boot);
     await boot.wait("EPOCH_LOCK_CONFLICT");
     assert.ok(protectedSnapshot(f.root) === initializationBefore, "all pre-SH validation is read-only, including temporary directory metadata");
@@ -305,7 +314,7 @@ test("pod epoch real entrypoint fences protected initialization under EX and con
     assert.equal(fs.lstatSync(path.join(f.root, "token")).uid, 0, "token alias metadata untouched under EX");
     holder.close(); holder = undefined;
     await boot.wait("EPOCH_INIT_DONE");
-    holder = await f.runtime.acquire({ firstMode: "exclusive" });
+    holder = await f.exclusive();
     const gapBefore = protectedSnapshot(f.root);
     boot.child.stdin.write("continue\n");
     await boot.wait("EPOCH_NPM_READY"); await boot.join();
@@ -321,7 +330,7 @@ test("pod epoch real entrypoint fences protected initialization under EX and con
     const after = fs.lstatSync(f.root);
     assert.equal(after.ino, posture.ino); assert.equal(after.gid, posture.gid);
     assert.equal(after.mode & 0o7777, posture.mode & 0o7777, "mounted data-root fsGroup posture preserved");
-    holder = await f.runtime.acquire({ firstMode: "exclusive" });
+    holder = await f.exclusive();
     const singleBefore = protectedSnapshot(f.root);
     const single = sandbox.start(true); launched.push(single);
     await single.wait("EPOCH_INIT_DONE");
@@ -336,6 +345,54 @@ test("pod epoch real entrypoint fences protected initialization under EX and con
     // Release EX before joining: never finish with an owned initializer waiting.
     try { await Promise.all(launched.map(boot => boot.join())); }
     finally { sandbox.close(); await f.close(); }
+  }
+});
+
+test("pod epoch private API CA survives both real UID launch chains without relaxing preload refusal", { timeout: 60000 }, async () => {
+  const f = fixture(), sandbox = entrypointFixture(f.root);
+  const secret = "/run/uzi-epoch-ca-" + randomUUID();
+  const launched: ReturnType<typeof sandbox.start>[] = [];
+  let created = false;
+  let holder: Awaited<ReturnType<typeof f.runtime.acquire>> | undefined;
+  try {
+    fs.mkdirSync(secret, { mode: 0o755 }); created = true;
+    const generation = path.join(secret, "..generation");
+    fs.mkdirSync(generation);
+    const ca = path.join(generation, "ca.crt"), key = path.join(generation, "key.pem");
+    const certificate = spawnSync("/opt/uzi-toolchain/bin/openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes",
+      "-keyout", key, "-out", ca, "-days", "1", "-subj", "/CN=pod-epoch-private-ca",
+      "-addext", "basicConstraints=critical,CA:TRUE"], { encoding: "utf8", timeout: 10000 });
+    assert.equal(certificate.status, 0, certificate.stderr);
+    fs.unlinkSync(key);
+    fs.chmodSync(ca, 0o440); fs.chownSync(ca, 0, 10001);
+    fs.writeFileSync(path.join(generation, "worker_token"), "epoch-test-token", { mode: 0o440 });
+    fs.chownSync(path.join(generation, "worker_token"), 0, 10001);
+    fs.symlinkSync("..generation", path.join(secret, "..data"));
+    for (const file of ["ca.crt", "worker_token"]) fs.symlinkSync("..data/" + file, path.join(secret, file));
+    const extra = { NODE_EXTRA_CA_CERTS: path.join(secret, "ca.crt"), UZI_WORKER_TOKEN_FILE: path.join(secret, "worker_token") };
+    await f.runtime.seed(S);
+    assert.notEqual(sandbox.reject({ ...extra, NODE_OPTIONS: "--require=/data/untrusted.cjs" }).status, 0,
+      "private CA never permits executable preloads");
+    for (const single of [false, true]) {
+      const boot = sandbox.start(single, undefined, extra); launched.push(boot);
+      await boot.wait("EPOCH_INIT_DONE");
+      holder = await f.exclusive();
+      const before = protectedSnapshot(f.root);
+      boot.child.stdin.write("continue\n");
+      await boot.wait("EPOCH_NPM_READY"); await boot.join();
+      assert.ok(protectedSnapshot(f.root) === before, "CA bootstrap writes no protected state");
+      holder.close(); holder = undefined;
+    }
+    const log = fs.readFileSync(sandbox.log, "utf8");
+    assert.equal(log.split("\n").filter(line => line.startsWith("CA_TRUST ")).length, 2,
+      "both actual Node trust stores loaded the projected CA");
+    assert.ok(!log.includes("POSTURE_VIOLATION"));
+    const stat = fs.statSync(ca);
+    assert.equal(stat.uid, 0); assert.equal(stat.gid, 10001); assert.equal(stat.mode & 0o7777, 0o440);
+  } finally {
+    holder?.close();
+    try { await Promise.all(launched.map(boot => boot.join())); }
+    finally { if (created) fs.rmSync(secret, { recursive: true }); sandbox.close(); await f.close(); }
   }
 });
 

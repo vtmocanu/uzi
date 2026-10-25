@@ -44,6 +44,7 @@ FIND=/usr/bin/find
 NODE=/usr/local/bin/node
 EPOCH_HELPER=/usr/local/lib/uzi/pod-epoch-init.cjs
 EPOCH_BOOTSTRAP=/tmp/uzi-epoch-bootstrap
+EPOCH_SECRET_PREFIX=/run
 DATA_DIR=/data
 BUSYBOX=/bin/busybox
 
@@ -67,11 +68,37 @@ epoch_environment() {
   "$BUSYBOX" env | while IFS='=' read -r epoch_name _epoch_value; do
     epoch_name=$(printf '%s' "$epoch_name" | "$BUSYBOX" tr '[:upper:]' '[:lower:]')
     case "$epoch_name" in
-      node_version) ;; # Image metadata, not a Node runtime option.
+      node_version|node_extra_ca_certs) ;; # Image metadata or the validated controller CA below.
       node_*|ld_*|dyld_*|openssl_conf|openssl_modules|npm_*|tsx_*|esbuild_binary_path|bash_env|env|shellopts|bashopts)
         epoch_refuse 'unsupported loader or npm configuration' ;;
     esac
   done
+  # #1761: the controller supports a private API CA in its read-only Secret.
+  # Validate it with native tools BEFORE Node/OpenSSL reads the environment.
+  if [ -n "${NODE_EXTRA_CA_CERTS-}" ]; then
+    epoch_ca="$NODE_EXTRA_CA_CERTS"
+    epoch_token="${UZI_WORKER_TOKEN_FILE:-/run/secrets/worker_token}"
+    [ "$epoch_ca" = "${epoch_token%/*}/ca.crt" ] || epoch_refuse 'CA must be the controller Secret ca.crt'
+    epoch_ca_mount="${epoch_ca%/ca.crt}"
+    case "$epoch_ca_mount" in
+      "$EPOCH_SECRET_PREFIX"/*) epoch_ca_leaf="${epoch_ca_mount#"$EPOCH_SECRET_PREFIX"/}" ;;
+      *) epoch_refuse 'CA Secret must be directly under /run' ;;
+    esac
+    case "$epoch_ca_leaf" in
+      ''|*[!a-z0-9._-]*|[!a-z0-9]*) epoch_refuse 'invalid CA Secret directory' ;;
+    esac
+    [ -f "$epoch_ca" ] || epoch_refuse 'CA target must be a regular file'
+    epoch_ca_real="$("$BUSYBOX" readlink -f "$epoch_ca")" || epoch_refuse 'cannot resolve CA target'
+    case "$epoch_ca_real" in
+      "$epoch_ca_mount"/*) ;;
+      *) epoch_refuse 'CA target escapes its Secret mount' ;;
+    esac
+    epoch_ca_posture="$("$BUSYBOX" stat -L -c '%u %g %a' "$epoch_ca")" || epoch_refuse 'cannot inspect CA target'
+    case "$epoch_ca_posture" in
+      "0 10001 440") ;;
+      *) epoch_refuse 'CA must retain root:worker mode 0440 Secret posture' ;;
+    esac
+  fi
 }
 
 # Read-only, image-baked Node, never tsx. All path components must be real directories.

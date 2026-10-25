@@ -39,7 +39,7 @@ function fixture(rootMode = false) {
   const id = stub("id", `echo ${rootMode ? 0 : uid}\n`);
   const tini = stub("tini", `
 [ ! -e /proc/self/fd/9 ] || { echo leaked-fd9 >&2; exit 8; }
-printf 'runtime=%s\\nbootstrap=%s\\ncache=%s\\ntsx=%s\\n' "$UZI_EPOCH_RUNTIME_TMPDIR" "$TMPDIR" "$npm_config_cache" "$TSX_DISABLE_CACHE"
+printf 'runtime=%s\\nbootstrap=%s\\ncache=%s\\ntsx=%s\\nca=%s\\n' "$UZI_EPOCH_RUNTIME_TMPDIR" "$TMPDIR" "$npm_config_cache" "$TSX_DISABLE_CACHE" "\${NODE_EXTRA_CA_CERTS-}"
 printf 'arg=%s\\n' "$@"
 `);
   const chown = stub("chown", 'printf "chown %s\\n" "$*" >> "$OPLOG"\n');
@@ -66,6 +66,8 @@ if (process.argv[2] === 'hold') {
     .replace("NODE=/usr/local/bin/node", `NODE=${process.execPath}`)
     .replace("EPOCH_HELPER=/usr/local/lib/uzi/pod-epoch-init.cjs", `EPOCH_HELPER=${helper}`)
     .replace("EPOCH_BOOTSTRAP=/tmp/uzi-epoch-bootstrap", `EPOCH_BOOTSTRAP=${bootstrap}`)
+    .replace("EPOCH_SECRET_PREFIX=/run", `EPOCH_SECRET_PREFIX=${root}/run`)
+    .replace('"0 10001 440"', `"${uid} ${gid} 440"`)
     .replace("DATA_DIR=/data", `DATA_DIR=${data}`)
     .replace("NIX_DIR=/nix", `NIX_DIR=${nix}`)
     .replaceAll("/home/worker", home)
@@ -102,6 +104,54 @@ describe("pod epoch entrypoint", () => {
       assert.equal(fs.existsSync(path.join(f.data, ".uzi-epoch.lock")), false, "no replacement inode created before SH");
       assert.equal(fs.existsSync(path.join(f.data, "missing-epoch-target")), false, "no dangling-symlink target created before SH");
       assert.equal(fs.readFileSync(f.log, "utf8"), "prepare\n", "no hold or protected operation after failed read-only open");
+    } finally { f.close(); }
+  });
+
+  for (const rootMode of [false, true]) for (const leaf of ["secrets", "uzi-secrets"]) {
+    it("preserves the projected private API CA in " + (rootMode ? "split" : "single") + " mode at " + leaf, () => {
+      const f = fixture(rootMode);
+      try {
+        const mount = path.join(f.root, "run", leaf), generation = path.join(mount, "..generation");
+        fs.mkdirSync(generation, { recursive: true });
+        const certificate = path.join(generation, "ca.crt");
+        fs.writeFileSync(certificate, "", { mode: 0o440 });
+        fs.chownSync(certificate, uid, gid);
+        fs.symlinkSync("..generation", path.join(mount, "..data"));
+        fs.symlinkSync("..data/ca.crt", path.join(mount, "ca.crt"));
+        const ca = path.join(mount, "ca.crt");
+        if (rootMode) {
+          // Transport the root launch as in the dedicated FD9/scratch test;
+          // real UID migration is covered by the candidate-image lane.
+          fs.mkdirSync(path.join(f.runtime, "uzi-worker"), { mode: 0o700 });
+          fs.chownSync(path.join(f.runtime, "uzi-worker"), uid, gid);
+          f.rewrite(text => {
+            const prefix = text.slice(0, text.indexOf("# --- (a) B4"));
+            const launch = text.slice(text.indexOf('export TMPDIR="$WORKER_TMPDIR"'));
+            return (prefix + '\nWORKER_TMPDIR="$DATA_DIR/runner/.tmp/uzi-worker"\nRUNNER_TMPDIR="$DATA_DIR/runner/.tmp/uzi-runner"\n' + launch)
+              .replace("SETPRIV=/bin/setpriv", `SETPRIV=${path.join(f.root, "tini")}`);
+          });
+        }
+        const result = f.run({ NODE_EXTRA_CA_CERTS: ca, UZI_WORKER_TOKEN_FILE: path.join(mount, "worker_token") });
+        assert.equal(result.status, 0, result.stderr);
+        assert.ok(result.stdout.includes("ca=" + ca), "Node CA configuration survives the exec chain");
+      } finally { f.close(); }
+    });
+  }
+  it("rejects private CA aliases and unsafe posture before invoking Node", () => {
+    const f = fixture();
+    try {
+      const mount = path.join(f.root, "run", "uzi-secrets");
+      fs.mkdirSync(mount, { recursive: true });
+      const ca = path.join(mount, "ca.crt");
+      fs.writeFileSync(ca, "", { mode: 0o600 });
+      fs.chownSync(ca, uid, gid);
+      const env = { NODE_EXTRA_CA_CERTS: ca, UZI_WORKER_TOKEN_FILE: path.join(mount, "worker_token") };
+      assert.notEqual(f.run(env).status, 0, "writable/non-Secret certificate posture rejected");
+      fs.unlinkSync(ca);
+      fs.writeFileSync(path.join(f.data, "ca.crt"), "", { mode: 0o440 });
+      fs.symlinkSync(path.join(f.data, "ca.crt"), ca);
+      assert.notEqual(f.run(env).status, 0, "persistent certificate alias rejected before Node reads it");
+      assert.equal(fs.existsSync(f.log), false);
     } finally { f.close(); }
   });
 

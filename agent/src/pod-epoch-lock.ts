@@ -39,17 +39,16 @@ interface PodEpochRuntime {
 }
 
 // The exact same implementation runs before Node worker startup without tsx.
-const baked = createRequire(import.meta.url)("../templates/pod-epoch-init.cjs") as {
-  createRuntime(options?: RuntimeOptions): PodEpochRuntime;
-};
+const require = createRequire(import.meta.url);
+const { createRuntime } = require("../templates/pod-epoch-init.cjs");
 
-export const createPodEpoch = baked.createRuntime;
+export const createPodEpoch = createRuntime as (options?: RuntimeOptions) => PodEpochRuntime;
 
 /** Call only after acquiring epoch ownership, before ensureRunnerTmpdir or writers. */
 export function restoreEpochRuntimeTmpdir(
   ownership: PodEpochOwnership,
   environment: NodeJS.ProcessEnv = process.env,
-  io: typeof fs = createRequire(import.meta.url)("node:fs") as typeof fs,
+  io: typeof fs = require("node:fs") as typeof fs,
 ): void {
   // Consult the live handle, including unsupported-storage participants.
   if (!["shared", "exclusive", "unsupported"].includes(ownership.mode)) {

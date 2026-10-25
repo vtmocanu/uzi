@@ -51,6 +51,12 @@ assert.equal(process.env.TMPDIR, ${JSON.stringify(bootstrap)}, 'pre-main TMPDIR 
 assert.equal(os.tmpdir(), ${JSON.stringify(bootstrap)});
 assert.equal(process.env.npm_config_cache, ${JSON.stringify(bootstrap)});
 assert.equal(process.env.TSX_DISABLE_CACHE, '1');
+if (process.env.NODE_EXTRA_CA_CERTS) {
+  const crypto = await import('node:crypto'), tls = await import('node:tls');
+  const expected = new crypto.X509Certificate(fs.readFileSync(process.env.NODE_EXTRA_CA_CERTS));
+  assert.ok(tls.getCACertificates('extra').some(pem => new crypto.X509Certificate(pem).fingerprint256 === expected.fingerprint256), 'Node trust store loads the controller private CA');
+  fs.appendFileSync(${JSON.stringify(log)}, 'CA_TRUST ' + process.env.NODE_EXTRA_CA_CERTS + '\\n');
+}
 const made = fs.mkdtempSync(os.tmpdir() + '/dependency-');
 fs.appendFileSync(${JSON.stringify(log)}, 'BOOTSTRAP ' + made + '\\n');
 console.log('EPOCH_NPM_READY');
@@ -105,12 +111,12 @@ if(s.ino!==${initialRoot.ino}||s.uid!==${initialRoot.uid}||s.gid!==${initialRoot
       fs.writeFileSync(rendered, transformed, { mode: 0o755 });
       return rendered;
     },
-    start(single = false, script = file) {
+    start(single = false, script = file, extra: Record<string, string> = {}) {
       const argv = ["/bin/sh", script, "npm", "run", "start"];
       const command = single ? "/bin/setpriv" : argv.shift()!;
       const args = single ? ["--reuid", "10001", "--regid", "10001", "--clear-groups",
         "--bounding-set", "-all", "--inh-caps", "-all", "--ambient-caps", "-all", "--", ...argv] : argv;
-      const child = spawn(command, args, { env, cwd: app, stdio: ["pipe", "pipe", "pipe"], detached: true });
+      const child = spawn(command, args, { env: { ...env, ...extra }, cwd: app, stdio: ["pipe", "pipe", "pipe"], detached: true });
       let output = "";
       const waiters = new Map<string, () => void>();
       let failure = "";

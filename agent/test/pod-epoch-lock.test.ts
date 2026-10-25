@@ -312,7 +312,7 @@ test("real host utility must identify as util-linux", async (t) => {
   await assert.rejects(runtime.acquire(), /util-linux|flock/);
 });
 
-test("two-process kernel fd lifetime (BusyBox adapter is not the util-linux image proof)", async (t) => {
+test("two-process kernel fd lifetime (BusyBox adapter is not the util-linux image proof)", { skip: process.platform !== "linux" }, async (t) => {
   const f = fixture(t);
   await f.runtime.seed(S);
   // Only the adapter substitutes BusyBox's flags/exit code. The worker's trusted

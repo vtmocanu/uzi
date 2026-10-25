@@ -16,6 +16,7 @@ const epochLeaves = [
   'pod epoch real Node fd survives flock helper exit, excludes peers and releases only with its owner',
   'pod epoch real concurrent consumers preserve S to T to S history and the full immutable ledger bound',
   'pod epoch real entrypoint fences protected initialization under EX and confines both UID bootstrap launches',
+  'pod epoch private API CA survives both real UID launch chains without relaxing preload refusal',
   'pod epoch restores observable persistent worker and runner scratch in both UID modes and refuses invalid saved paths',
 ];
 const e2eFiles = new Set(['memory-command-real', 'claude-command-real', singleFile, sharedFile, epochFile]);
