@@ -2626,6 +2626,7 @@ for (const check of ["process_not_quiescent_before_git", "process_not_quiescent_
 
 async function fixture(sourceBoundary: boolean | "runner" = false, rootParent = os.tmpdir(), receiptModel = false, runId = "run-1",
   runnerOptions: ConstructorParameters<typeof RunRunner>[6] = {}) {
+  await fs.mkdir(rootParent, { recursive: true });
   const root = makeScratchRoot("inventory-", rootParent);
   const context: PositiveOwedCandidateContext = {
     runId, generation: 7, kind: "issue", branch: "task",
