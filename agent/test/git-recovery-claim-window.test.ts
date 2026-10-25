@@ -214,6 +214,29 @@ test("rollback during budget-blocked newer episode leaves whole journal unchange
   assert.deepEqual(f.read(), before);
 });
 
+// Boundary kept from before #3330: rollback on an unblocked record still persists clock_invalid,
+// and that permanent blocker is never renewed by a later owner Resume.
+for (const state of ["partly-used", "exhausted-unblocked"] as const) {
+  test(`rollback during newer episode blocks unblocked ${state} as clock_invalid without renewal`, async t => {
+    const f = fixture(t);
+    await f.reserve(4, f.recreate(), 7);
+    if (state === "exhausted-unblocked") {
+      await f.reserve(4, f.recreate(), 7);
+      await f.reserve(4, f.recreate(), 7);
+    }
+    const before = f.read();
+    f.advance(-1);
+    await assert.rejects(f.reserve(5, f.recreate(), 8), /clock/);
+    assert.deepEqual(f.read(), {
+      ...before, recovery: { ...before.recovery!, stage: "blocked", blocker: "clock_invalid" },
+    });
+    const blocked = f.read();
+    f.advance(400_000);
+    await assert.rejects(f.reserve(6, f.recreate(), 9), /blocked/);
+    assert.deepEqual(f.read(), blocked);
+  });
+}
+
 test("fresh fenced claim after an interrupted long turn rebases deadline without refunding attempts", async t => {
   const f = fixture(t);
   const first = await f.reserve(1);

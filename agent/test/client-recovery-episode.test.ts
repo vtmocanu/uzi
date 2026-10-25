@@ -90,5 +90,21 @@ for (const [label, episode] of [
       decoded.claim_generation, decoded.worker_recovery_episode,
     ), /blocked/);
     assert.deepEqual(journal, before);
+
+    // A partly used source under the same dropped episode is charged, never renewed.
+    journal = {
+      ...source, recovery: {
+        version: 1, source, attempts: 1, startedAt: 1_000_000, deadline: 1_300_000,
+        backoffMs: 1000, stage: "capturing", claimGeneration: 4, episode: 7,
+      },
+    };
+    const charged = await cache.reserveRecoveryIteration(
+      "/tmp/bare", "branch", "key", source, 1000,
+      decoded.claim_generation, decoded.worker_recovery_episode,
+    );
+    assert.equal(charged.attempts, 2);
+    assert.equal(charged.episode, 7);
+    assert.equal(charged.backoffMs, 2000);
+    assert.deepEqual(journal.recovery, charged);
   });
 }
