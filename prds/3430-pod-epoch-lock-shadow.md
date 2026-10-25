@@ -1,6 +1,18 @@
 # PRD #3430: Pod-epoch lock and shadow reclaim verdicts on Docker-wired workers
 
-**Status**: Draft (architecture and lead/buddy reviewed; contract corrections approved 2026-10-25; implementation in progress, M1 image proof pending). PRD A of two for #3329's disposal with the writer-exclusion proof PRD #1860 M0 recommended (`prds/1860-pod-epoch-writer-exclusion.md`). This PRD deletes **nothing**: it ships the epoch lock, the controller handoff and a shadow verdict. PRD B (#3431) adds deletion once this PRD's shadow acceptance passes. **Blocked by** #3421 (`dind-meter` SIGTERM). The CRI-O source audit is committed beside it in `prds/3430-pod-epoch-crio-audit.md`.
+**Status**: Draft (architecture and lead/buddy reviewed; contract corrections approved 2026-10-25; M1 source committed, required validation blocked; M2 and live acceptance pending). PRD A of two for #3329's disposal with the writer-exclusion proof PRD #1860 M0 recommended (`prds/1860-pod-epoch-writer-exclusion.md`). This PRD deletes **nothing**: it ships the epoch lock, the controller handoff and a shadow verdict. PRD B (#3431) adds deletion once this PRD's shadow acceptance passes. **Dependency** #3421 (`dind-meter` SIGTERM): its source fix is present; current validation blockers are recorded below. The CRI-O source audit is committed beside it in `prds/3430-pod-epoch-crio-audit.md`.
+
+## Implementation evidence (2026-10-25)
+
+M0's approved contract amendment is committed. M1 source is committed through `cd0218a3`: lifetime epoch ownership, protected initialization, pod-entry records, bounded durable consumption, bootstrap scratch isolation and data-root posture preservation. The worker's tentative shadow EX path remains disabled until M2. This branch adds no attempt-tree deletion.
+
+The full controller gate passed at `388f6d77`; subsequent source changes affect agent imports and tests only. At `cd0218a3`, agent typecheck, lint, knip, worker-UID typecheck and 65 focused tests passed with zero skips. The maintenance-bootstrap E5 guard remains unchanged; static imports and an exact token-posture mutation target repair the two M1 regressions found by broader testing.
+
+M1 acceptance remains incomplete. The full agent gate at `388f6d77` reached its 120-minute command deadline. Several failures reproduced on the base: inherited `UZI_SQLC_DIR` affected environment assertions, and checkout/scratch ownership differs from the command identity. The checkout is owned by UID/GID 10002, scratch inherits group 10002, and commands ran as UID/GID 10003. A private-maintenance positive test passed on both revisions when only its owned fixture-parent group matched the command group. The remaining full gate must run in a matching checkout-owner environment; these failures are not waived.
+
+Both local image-build paths failed with Docker `ENOSPC`. The latest pinned-runtime release build at `cd0218a3` failed in the existing SQLC/toolchain check, before the new flock packaging step. The shipped util-linux descriptor/lifetime proof and worker-UID image lane remain **unperformed**, not replaced by host BusyBox tests or future CI. Docker storage recovery is required.
+
+The latest scoped repair passed reviewer and tester review. Three auditor attempts were cancelled without a report, so its required scoped audit remains incomplete. This evidence record does not complete M1 or waive any criterion. M2a, M2b and M2c remain unstarted; M3 runtime attestation and live acceptance remain pending. Keep this PRD Draft and in place.
 
 ## Problem
 
