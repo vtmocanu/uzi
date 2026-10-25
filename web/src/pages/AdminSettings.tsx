@@ -43,6 +43,7 @@ import { CustodyHoldLimitCard } from "./adminSettings/CustodyHoldLimitCard";
 import { HostedWorkerQuotaCard } from "./adminSettings/HostedWorkerQuotaCard";
 import { EphemeralWorkersCard } from "./adminSettings/EphemeralWorkersCard";
 import { UpdatesSettingsCard } from "./adminSettings/UpdatesSettingsCard";
+import { MaintenanceCard } from "./adminSettings/MaintenanceCard";
 import { SummarySettingsCard } from "./adminSettings/SummarySettingsCard";
 import { AgentSourceSettingsCard } from "./adminSettings/AgentSourceSettingsCard";
 import { HealthSettingsCard } from "./adminSettings/HealthSettingsCard";
@@ -196,8 +197,11 @@ export function AdminSettings() {
   );
 
   useEffect(() => {
-    if (!loading && hash === "#agent-source") {
-      document.getElementById("agent-source")?.scrollIntoView?.({ block: "start" });
+    // Deep links that arrive before the cards render: the browser's own hash jump has
+    // nothing to land on yet, so scroll once loading settles (the maintenance banner's
+    // "Manage maintenance" link is one).
+    if (!loading && (hash === "#agent-source" || hash === "#maintenance")) {
+      document.getElementById(hash.slice(1))?.scrollIntoView?.({ block: "start" });
     }
   }, [loading, hash]);
 
@@ -277,6 +281,7 @@ export function AdminSettings() {
       : []),
     { id: "forge-labels", label: "Forge labels" },
     ...(!loading && saved ? [{ id: "run-judge", label: "Run judge" }] : []),
+    ...(!loading ? [{ id: "maintenance", label: "Maintenance mode" }] : []),
     ...(!loading && oidcStatus !== "disabled"
       ? [{ id: "sso", label: "Single sign-on" }]
       : []),
@@ -468,6 +473,12 @@ export function AdminSettings() {
       {!loading && (
         <section id="agent-source" className="scroll-mt-6">
           <AgentSourceSettingsCard />
+        </section>
+      )}
+
+      {!loading && (
+        <section id="maintenance" className="scroll-mt-6">
+          <MaintenanceCard />
         </section>
       )}
 

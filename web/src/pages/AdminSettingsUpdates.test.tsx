@@ -25,6 +25,7 @@ vi.mock("../lib/api", async (importActual) => {
       updateCheckAgentSource: vi.fn(),
       getReleaseCheck: vi.fn(),
       checkReleaseNow: vi.fn(),
+      getAdminMaintenance: vi.fn(),
     },
   };
 });
@@ -124,6 +125,13 @@ const releaseCheck = (
 beforeEach(() => {
   mockApi.getSettings.mockResolvedValue(settingsResponse());
   mockApi.vaultMigration.mockResolvedValue({ master_sealed: 0 });
+  // PRD #3454: the Maintenance card loads too; off with a clear readout, so it renders no
+  // second Retry button beside the Updates card's.
+  const none = { count: 0, items: [] };
+  mockApi.getAdminMaintenance.mockResolvedValue({
+    state: { active: false, since: null, reason: null, by_label: null },
+    readout: { as_of: "2026-10-25T12:00:00Z", clear: true, active: none, held: none, custody: none, queued: none, idle_bound_workers: none },
+  });
   mockApi.adminListDockerAllowlistRepos.mockResolvedValue({ repos: [] });
   mockApi.getAgentSource.mockResolvedValue({ agent_source: emptyAgentSource() });
   mockApi.getReleaseCheck.mockResolvedValue({ release_check: releaseCheck() });
