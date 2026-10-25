@@ -4710,40 +4710,53 @@ describe("CodexExecutor: credential bridge + isolation", () => {
     assert.ok(emitted.some((m) => m.payload.event === "resume_lineage_break"));
   });
 
-  it("(13) the fileop helper is spawned with a SCRUBBED, replaced env (no inherited secrets)", async () => {
-    const rig = makeRig();
-    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
-    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "fileop run");
-    assert.equal(rig.fileopSpawns.length, 1);
-    const spawn0 = rig.fileopSpawns[0];
-    assert.ok(spawn0);
-    const env = spawn0.env;
-    // No packages provisioned in this rig (the real provisionRunTools is a no-op with no
-    // config.tool_packages), so the command env is exactly the fixed scrubbed keys — no
-    // folded nix vars, and the PATH is the fixed toolchain+system boundary (item 6). Issue
-    // #1716 adds the worker's two-pair git trust: reset safe.directory, then trust only the
-    // checkout. WORKSPACE does not exist, so the canonical path is the ENOENT fallback.
-    assert.deepEqual(
-      Object.keys(env).sort(),
-      [
-        "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_KEY_1", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_VALUE_1",
-        "HOME", "LANG", "PATH", "TMPDIR",
-      ],
-      "exactly the scrubbed keys",
-    );
-    assert.equal(env.GIT_CONFIG_COUNT, "2");
-    assert.equal(env.GIT_CONFIG_KEY_0, "safe.directory");
-    assert.equal(env.GIT_CONFIG_VALUE_0, "", "pair 0 resets every inherited safe.directory entry");
-    assert.equal(env.GIT_CONFIG_KEY_1, "safe.directory");
-    assert.equal(env.GIT_CONFIG_VALUE_1, path.resolve(WORKSPACE), "pair 1 trusts only the run's checkout");
-    assert.equal(env.PATH, "/opt/uzi-toolchain/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
-    assert.equal(env.LANG, "C");
-    assert.match(String(env.HOME), /^\/tmp\/uzi-codex-command-/);
-    assert.equal(env.TMPDIR, env.HOME, "one random Landlock-allowed tmp per command root");
-    // Nothing inherited from the worker: no PAT/token/provider credential shape.
-    assert.doesNotMatch(JSON.stringify(env), new RegExp(FRESH_TOKEN + "|run-cap|claim-tok"));
-    assert.equal(spawn0.worktreePath, WORKSPACE);
-  });
+  for (const sqlcDir of [undefined, "/synthetic/uzi-sqlc-cache"]) {
+    it(`(13) the fileop helper is spawned with a SCRUBBED, replaced env (no inherited secrets) (UZI_SQLC_DIR ${sqlcDir === undefined ? "absent" : "present"})`, async () => {
+      const savedSqlcDir = process.env.UZI_SQLC_DIR;
+      try {
+        if (sqlcDir === undefined) delete process.env.UZI_SQLC_DIR;
+        else process.env.UZI_SQLC_DIR = sqlcDir;
+        const rig = makeRig();
+        rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+        await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "fileop run");
+        assert.equal(rig.fileopSpawns.length, 1);
+        const spawn0 = rig.fileopSpawns[0];
+        assert.ok(spawn0);
+        const env = spawn0.env;
+        // No packages provisioned in this rig (the real provisionRunTools is a no-op with no
+        // config.tool_packages), so the command env is exactly the fixed scrubbed keys — no
+        // folded nix vars, and the PATH is the fixed toolchain+system boundary (item 6). Issue
+        // #1716 adds the worker's two-pair git trust: reset safe.directory, then trust only the
+        // checkout. WORKSPACE does not exist, so the canonical path is the ENOENT fallback.
+        assert.deepEqual(
+          Object.keys(env).sort(),
+          [
+            "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_KEY_1", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_VALUE_1",
+            "HOME", "LANG", "PATH", "TMPDIR",
+            ...(sqlcDir === undefined ? [] : ["UZI_SQLC_DIR"]),
+          ],
+          "exactly the scrubbed keys",
+        );
+        assert.equal(Object.hasOwn(env, "UZI_SQLC_DIR"), sqlcDir !== undefined);
+        assert.equal(env.UZI_SQLC_DIR, sqlcDir);
+        assert.equal(env.GIT_CONFIG_COUNT, "2");
+        assert.equal(env.GIT_CONFIG_KEY_0, "safe.directory");
+        assert.equal(env.GIT_CONFIG_VALUE_0, "", "pair 0 resets every inherited safe.directory entry");
+        assert.equal(env.GIT_CONFIG_KEY_1, "safe.directory");
+        assert.equal(env.GIT_CONFIG_VALUE_1, path.resolve(WORKSPACE), "pair 1 trusts only the run's checkout");
+        assert.equal(env.PATH, "/opt/uzi-toolchain/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+        assert.equal(env.LANG, "C");
+        assert.match(String(env.HOME), /^\/tmp\/uzi-codex-command-/);
+        assert.equal(env.TMPDIR, env.HOME, "one random Landlock-allowed tmp per command root");
+        // Nothing inherited from the worker: no PAT/token/provider credential shape.
+        assert.doesNotMatch(JSON.stringify(env), new RegExp(FRESH_TOKEN + "|run-cap|claim-tok"));
+        assert.equal(spawn0.worktreePath, WORKSPACE);
+      } finally {
+        if (savedSqlcDir === undefined) delete process.env.UZI_SQLC_DIR;
+        else process.env.UZI_SQLC_DIR = savedSqlcDir;
+      }
+    });
+  }
 
   it("(14) terminal cleanup reaps the registry roots, persists the session, and NEVER removes the store (m4-3)", async () => {
     const rig = makeRig();
@@ -19502,36 +19515,41 @@ describe("Codex dependency provisioning M2", () => {
     assert.ok(emitted.some((m) => JSON.stringify(m).includes("web: cancelled")));
   });
 
-  it("installer gets the full scrubbed allowlist, per-run HOME, PATH/TMPDIR fallbacks and TLS/locale precedence", async () => {
-    const keys = ["PATH", "UZI_RUNNER_PATH", "TMPDIR", "UZI_RUNNER_TMPDIR", "NIX_SSL_CERT_FILE", "SSL_CERT_FILE", "LOCALE_ARCHIVE",
-      "GITLAB_TOKEN", "GITHUB_TOKEN", "UZI_WORKER_TOKEN", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NODE_OPTIONS", "M2_ARBITRARY"];
-    const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
-    try {
-      Object.assign(process.env, { PATH: "/source/bin", UZI_RUNNER_PATH: "/runner/bin", TMPDIR: "/source/tmp", UZI_RUNNER_TMPDIR: "/runner/tmp",
-        NIX_SSL_CERT_FILE: "/source/nix.pem", SSL_CERT_FILE: "/source/ssl.pem", LOCALE_ARCHIVE: "/source/locale",
-        GITLAB_TOKEN: "fixture-pat", GITHUB_TOKEN: "fixture-pat", UZI_WORKER_TOKEN: "fixture-join", OPENAI_API_KEY: "fixture-provider",
-        ANTHROPIC_API_KEY: "fixture-provider", NODE_OPTIONS: "fixture-options", M2_ARBITRARY: "fixture-arbitrary" });
-      for (const fallback of [false, true]) {
-        if (fallback) { delete process.env.UZI_RUNNER_PATH; delete process.env.UZI_RUNNER_TMPDIR; }
-        const rig = makeRig({ responder: doneResponder });
-        const seen: NodeJS.ProcessEnv[] = [];
-        rig.deps = { ...rig.deps, provisionRunTools: async () => ({ toolEnv: fallback ? {} as Record<string, string> : {
-          PATH: "/provision/bin", NIX_SSL_CERT_FILE: "/provision/nix.pem", LOCALE_ARCHIVE: "/provision/locale",
-          HOME: "/wrong/home", TMPDIR: "/wrong/tmp", NODE_OPTIONS: "wrong-options", GITLAB_TOKEN: "wrong-pat", M2_ARBITRARY: "wrong",
-        } }), installDeps: async (cwd, env) => {
-          assert.equal(cwd, WORKSPACE); seen.push(env); return empty;
-        } };
-        await makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx);
-        assert.deepEqual(seen, [{
-          PATH: fallback ? "/source/bin" : "/provision/bin", HOME: "/data/agent-home/run-1", GIT_TERMINAL_PROMPT: "0",
-          TMPDIR: fallback ? "/source/tmp" : "/runner/tmp", NIX_SSL_CERT_FILE: fallback ? "/source/nix.pem" : "/provision/nix.pem",
-          SSL_CERT_FILE: "/source/ssl.pem", LOCALE_ARCHIVE: fallback ? "/source/locale" : "/provision/locale",
-        }]);
+  for (const sqlcDir of [undefined, "/synthetic/uzi-sqlc-cache"]) {
+    it(`installer gets the full scrubbed allowlist, per-run HOME, PATH/TMPDIR fallbacks and TLS/locale precedence (UZI_SQLC_DIR ${sqlcDir === undefined ? "absent" : "present"})`, async () => {
+      const keys = ["UZI_SQLC_DIR", "PATH", "UZI_RUNNER_PATH", "TMPDIR", "UZI_RUNNER_TMPDIR", "NIX_SSL_CERT_FILE", "SSL_CERT_FILE", "LOCALE_ARCHIVE",
+        "GITLAB_TOKEN", "GITHUB_TOKEN", "UZI_WORKER_TOKEN", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NODE_OPTIONS", "M2_ARBITRARY"];
+      const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+      try {
+        if (sqlcDir === undefined) delete process.env.UZI_SQLC_DIR;
+        else process.env.UZI_SQLC_DIR = sqlcDir;
+        Object.assign(process.env, { PATH: "/source/bin", UZI_RUNNER_PATH: "/runner/bin", TMPDIR: "/source/tmp", UZI_RUNNER_TMPDIR: "/runner/tmp",
+          NIX_SSL_CERT_FILE: "/source/nix.pem", SSL_CERT_FILE: "/source/ssl.pem", LOCALE_ARCHIVE: "/source/locale",
+          GITLAB_TOKEN: "fixture-pat", GITHUB_TOKEN: "fixture-pat", UZI_WORKER_TOKEN: "fixture-join", OPENAI_API_KEY: "fixture-provider",
+          ANTHROPIC_API_KEY: "fixture-provider", NODE_OPTIONS: "fixture-options", M2_ARBITRARY: "fixture-arbitrary" });
+        for (const fallback of [false, true]) {
+          if (fallback) { delete process.env.UZI_RUNNER_PATH; delete process.env.UZI_RUNNER_TMPDIR; }
+          const rig = makeRig({ responder: doneResponder });
+          const seen: NodeJS.ProcessEnv[] = [];
+          rig.deps = { ...rig.deps, provisionRunTools: async () => ({ toolEnv: fallback ? {} as Record<string, string> : {
+            PATH: "/provision/bin", NIX_SSL_CERT_FILE: "/provision/nix.pem", LOCALE_ARCHIVE: "/provision/locale",
+            HOME: "/wrong/home", TMPDIR: "/wrong/tmp", NODE_OPTIONS: "wrong-options", GITLAB_TOKEN: "wrong-pat", M2_ARBITRARY: "wrong",
+          } }), installDeps: async (cwd, env) => {
+            assert.equal(cwd, WORKSPACE); seen.push(env); return empty;
+          } };
+          await makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx);
+          assert.deepEqual(seen, [{
+            PATH: fallback ? "/source/bin" : "/provision/bin", HOME: "/data/agent-home/run-1", GIT_TERMINAL_PROMPT: "0",
+            TMPDIR: fallback ? "/source/tmp" : "/runner/tmp", NIX_SSL_CERT_FILE: fallback ? "/source/nix.pem" : "/provision/nix.pem",
+            SSL_CERT_FILE: "/source/ssl.pem", LOCALE_ARCHIVE: fallback ? "/source/locale" : "/provision/locale",
+            ...(sqlcDir === undefined ? {} : { UZI_SQLC_DIR: sqlcDir }),
+          }]);
+        }
+      } finally {
+        for (const key of keys) { const value = saved[key]; if (value === undefined) delete process.env[key]; else process.env[key] = value; }
       }
-    } finally {
-      for (const key of keys) { const value = saved[key]; if (value === undefined) delete process.env[key]; else process.env[key] = value; }
-    }
-  });
+    });
+  }
 });
 
 // issue #2213 — a quarantined worker starts no new Codex provider turn. Layer: CodexExecutor.run over
@@ -23022,41 +23040,46 @@ describe("#2852 default installer binding", () => {
     });
   }
 
-  it("#2852 all manager requests preserve canonical argv and scrubbed per-run environment", async () => {
-    const keys = ["UZI_RUNNER_TMPDIR", "TMPDIR", "NIX_SSL_CERT_FILE", "SSL_CERT_FILE", "LOCALE_ARCHIVE"];
-    const saved = Object.fromEntries(keys.map(key => [key, process.env[key]]));
-    Object.assign(process.env, { UZI_RUNNER_TMPDIR: "/fixture/tmp", TMPDIR: "/ambient/tmp",
-      NIX_SSL_CERT_FILE: "/fixture/nix.pem", SSL_CERT_FILE: "/fixture/ssl.pem", LOCALE_ARCHIVE: "/fixture/locale" });
-    try {
-      for (const [manager, lockfile, args] of [
-        ["npm", "package-lock.json", ["ci", "--ignore-scripts"]],
-        ["pnpm", "pnpm-lock.yaml", ["install", "--frozen-lockfile", "--ignore-scripts", "--ignore-pnpmfile", "--config.manage-package-manager-versions=false"]],
-        ["yarn", "yarn.lock", ["install", "--frozen-lockfile", "--ignore-scripts"]],
-        ["bun", "bun.lock", ["install", "--frozen-lockfile", "--ignore-scripts"]],
-      ] as const) {
-        const fx = await fixture("clean", done, undefined, { lockfile });
-        try {
-          await withTimeout(fx.native.disposing, 3000, `canonical ${manager} root`);
-          const call = fx.native.calls[0]!;
-          assert.deepEqual(call.args.slice(-(args.length + 5)),
-            ["--expect-uid", "10002", "--", "/usr/bin/env", manager, ...args]);
-          assert.deepEqual(call.options.env, {
-            HOME: path.join(path.dirname(fx.ctx.worktreePath), "home"), PATH: "/fixture/bin",
-            TMPDIR: "/fixture/tmp", GIT_TERMINAL_PROMPT: "0", NIX_SSL_CERT_FILE: "/fixture/nix.pem",
-            SSL_CERT_FILE: "/fixture/ssl.pem", LOCALE_ARCHIVE: "/fixture/locale",
-            ...(manager === "yarn" ? { YARN_IGNORE_PATH: "1" } : {}),
-          });
-          fx.native.release();
-          assert.equal((await withTimeout(fx.run, 5000, `canonical ${manager} completion`)).error, undefined);
-        } finally { await fx.cleanup(); }
+  for (const sqlcDir of [undefined, "/synthetic/uzi-sqlc-cache"]) {
+    it(`#2852 all manager requests preserve canonical argv and scrubbed per-run environment (UZI_SQLC_DIR ${sqlcDir === undefined ? "absent" : "present"})`, async () => {
+      const keys = ["UZI_SQLC_DIR", "UZI_RUNNER_TMPDIR", "TMPDIR", "NIX_SSL_CERT_FILE", "SSL_CERT_FILE", "LOCALE_ARCHIVE"];
+      const saved = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+      Object.assign(process.env, { UZI_RUNNER_TMPDIR: "/fixture/tmp", TMPDIR: "/ambient/tmp",
+        NIX_SSL_CERT_FILE: "/fixture/nix.pem", SSL_CERT_FILE: "/fixture/ssl.pem", LOCALE_ARCHIVE: "/fixture/locale" });
+      try {
+        if (sqlcDir === undefined) delete process.env.UZI_SQLC_DIR;
+        else process.env.UZI_SQLC_DIR = sqlcDir;
+        for (const [manager, lockfile, args] of [
+          ["npm", "package-lock.json", ["ci", "--ignore-scripts"]],
+          ["pnpm", "pnpm-lock.yaml", ["install", "--frozen-lockfile", "--ignore-scripts", "--ignore-pnpmfile", "--config.manage-package-manager-versions=false"]],
+          ["yarn", "yarn.lock", ["install", "--frozen-lockfile", "--ignore-scripts"]],
+          ["bun", "bun.lock", ["install", "--frozen-lockfile", "--ignore-scripts"]],
+        ] as const) {
+          const fx = await fixture("clean", done, undefined, { lockfile });
+          try {
+            await withTimeout(fx.native.disposing, 3000, `canonical ${manager} root`);
+            const call = fx.native.calls[0]!;
+            assert.deepEqual(call.args.slice(-(args.length + 5)),
+              ["--expect-uid", "10002", "--", "/usr/bin/env", manager, ...args]);
+            assert.deepEqual(call.options.env, {
+              HOME: path.join(path.dirname(fx.ctx.worktreePath), "home"), PATH: "/fixture/bin",
+              TMPDIR: "/fixture/tmp", GIT_TERMINAL_PROMPT: "0", NIX_SSL_CERT_FILE: "/fixture/nix.pem",
+              SSL_CERT_FILE: "/fixture/ssl.pem", LOCALE_ARCHIVE: "/fixture/locale",
+              ...(sqlcDir === undefined ? {} : { UZI_SQLC_DIR: sqlcDir }),
+              ...(manager === "yarn" ? { YARN_IGNORE_PATH: "1" } : {}),
+            });
+            fx.native.release();
+            assert.equal((await withTimeout(fx.run, 5000, `canonical ${manager} completion`)).error, undefined);
+          } finally { await fx.cleanup(); }
+        }
+      } finally {
+        for (const key of keys) {
+          const value = saved[key];
+          if (value === undefined) delete process.env[key]; else process.env[key] = value;
+        }
       }
-    } finally {
-      for (const key of keys) {
-        const value = saved[key];
-        if (value === undefined) delete process.env[key]; else process.env[key] = value;
-      }
-    }
-  });
+    });
+  }
 });
 
 describe("#2852 default provision binding", () => {

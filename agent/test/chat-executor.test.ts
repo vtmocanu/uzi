@@ -324,23 +324,36 @@ describe("ChatExecutor session env + assembly", () => {
     );
   });
 
-  it("hands the SDK a sparse env (no worker secrets) and the read-only tool set every turn", async () => {
-    const { queryFn, turns } = fakeTurns([[assistantText("answer"), resultSuccess()]]);
-    const probe = makeCtx(["how does the plan gate work?", undefined]);
-    await new ChatExecutor(nullLogger(), homeDir, { queryFn, scheduler: new FakeScheduler(), secretPaths: [TOKEN_FILE] }).run(probe.ctx);
-    assert.strictEqual(turns.length, 1);
-    const o = turns[0]!.options;
-    // Core keys + TMPDIR (5-bis per-uid scratch, when the ambient env has one); TMPDIR is not a secret.
-    // AGENT_BROWSER_ARGS is a non-secret browser launch FLAG (buildSdkEnv, issue #709) — it guarantees
-    // --no-sandbox survives a shim bypass; it is not a credential or a worktree path.
-    const expectedEnvKeys = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AGENT_BROWSER_ARGS"]);
-    if (process.env.UZI_RUNNER_TMPDIR || process.env.TMPDIR) expectedEnvKeys.add("TMPDIR");
-    assert.deepStrictEqual(new Set(Object.keys(o.env!)), expectedEnvKeys);
-    assert.deepStrictEqual(o.tools, [...CHAT_BASE_TOOLS]);
-    assert.strictEqual(o.cwd, UZI_SRC_DIR);
-    // The user message rode the prompt stream as-is.
-    assert.match(turns[0]!.promptText ?? "", /plan gate/);
-  });
+  for (const sqlcDir of [undefined, "/synthetic/uzi-sqlc-cache"]) {
+    it(`hands the SDK a sparse env (no worker secrets) and the read-only tool set every turn (UZI_SQLC_DIR ${sqlcDir === undefined ? "absent" : "present"})`, async () => {
+      const savedSqlcDir = process.env.UZI_SQLC_DIR;
+      try {
+        if (sqlcDir === undefined) delete process.env.UZI_SQLC_DIR;
+        else process.env.UZI_SQLC_DIR = sqlcDir;
+        const { queryFn, turns } = fakeTurns([[assistantText("answer"), resultSuccess()]]);
+        const probe = makeCtx(["how does the plan gate work?", undefined]);
+        await new ChatExecutor(nullLogger(), homeDir, { queryFn, scheduler: new FakeScheduler(), secretPaths: [TOKEN_FILE] }).run(probe.ctx);
+        assert.strictEqual(turns.length, 1);
+        const o = turns[0]!.options;
+        // Core keys + TMPDIR (5-bis per-uid scratch, when the ambient env has one); TMPDIR is not a secret.
+        // AGENT_BROWSER_ARGS is a non-secret browser launch FLAG (buildSdkEnv, issue #709) — it guarantees
+        // --no-sandbox survives a shim bypass; it is not a credential or a worktree path.
+        const expectedEnvKeys = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AGENT_BROWSER_ARGS"]);
+        if (process.env.UZI_RUNNER_TMPDIR || process.env.TMPDIR) expectedEnvKeys.add("TMPDIR");
+        if (sqlcDir !== undefined) expectedEnvKeys.add("UZI_SQLC_DIR");
+        assert.deepStrictEqual(new Set(Object.keys(o.env!)), expectedEnvKeys);
+        assert.strictEqual(Object.hasOwn(o.env!, "UZI_SQLC_DIR"), sqlcDir !== undefined);
+        assert.strictEqual(o.env!.UZI_SQLC_DIR, sqlcDir);
+        assert.deepStrictEqual(o.tools, [...CHAT_BASE_TOOLS]);
+        assert.strictEqual(o.cwd, UZI_SRC_DIR);
+        // The user message rode the prompt stream as-is.
+        assert.match(turns[0]!.promptText ?? "", /plan gate/);
+      } finally {
+        if (savedSqlcDir === undefined) delete process.env.UZI_SQLC_DIR;
+        else process.env.UZI_SQLC_DIR = savedSqlcDir;
+      }
+    });
+  }
 
   it("persists the SDK session id once, then resumes it on the next turn", async () => {
     const { queryFn, turns } = fakeTurns([
