@@ -137,6 +137,24 @@ describe("pod epoch entrypoint", () => {
       } finally { f.close(); }
     });
   }
+  it("requires the complete kubelet writable-root permission predicate before initialization", () => {
+    const f = fixture();
+    try {
+      // Execute the real pre-Node validator alone, so absent owner access cannot
+      // accidentally turn a wrongly accepted posture into a later open failure.
+      f.rewrite(text => text.slice(0, text.indexOf("# --- PRD #58:")) + "\nexit 0\n");
+      for (const mode of [0o2770, 0o2775, 0o2070, 0o2670, 0o2570, 0o2370, 0o770, 0o2777]) {
+        fs.chmodSync(f.data, mode);
+        const result = f.run();
+        if (mode === 0o2770 || mode === 0o2775) assert.equal(result.status, 0, result.stderr);
+        else {
+          assert.notEqual(result.status, 0, "must refuse incomplete kubelet owner/group predicate: " + mode.toString(8));
+          assert.match(result.stderr, /data root must preserve/, "posture refusal precedes every initializer");
+        }
+      }
+    } finally { fs.chmodSync(f.data, 0o2770); f.close(); }
+  });
+
   it("rejects private CA aliases and unsafe posture before invoking Node", () => {
     const f = fixture();
     try {

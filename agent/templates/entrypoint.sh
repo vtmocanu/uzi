@@ -123,7 +123,7 @@ function privateDirectory(file, mode) {
   }
 }
 const data = directory(root);
-if (data.gid !== 10001 || (data.mode & 0o2070) !== 0o2070 ||
+if (data.gid !== 10001 || (data.mode & 0o2770) !== 0o2770 ||
     (data.mode & 0o002) || ![0, 10001].includes(data.uid)) {
   throw new Error('data root must preserve trusted fsGroup access and setgid');
 }

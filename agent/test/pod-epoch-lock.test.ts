@@ -114,6 +114,36 @@ test("path replacement during acquisition and shell pre-open race are rejected",
   await assert.rejects(runtime.acquire(), /inode changed/);
 });
 
+test("device and inode comparison preserves identities above the Number safe range", async (t) => {
+  const f = fixture(t);
+  await f.runtime.seed(S);
+  const file = path.join(f.root, epochName);
+  const actual = fs.statSync(file, { bigint: true });
+  const heldInode = 9007199254740992n;
+  let namedInode = heldInode;
+  function inode(stat: fs.Stats | fs.BigIntStats, value: bigint) {
+    Object.defineProperty(stat, "ino", { value: typeof stat.ino === "bigint" ? value : Number(value) });
+    return stat;
+  }
+  const runtime = createPodEpoch({ ...f.options, io: {
+    ...f.options.io,
+    fstatSync: (...args: Parameters<typeof fs.fstatSync>) => {
+      const stat = fs.fstatSync(...args);
+      return BigInt(stat.ino) === actual.ino ? inode(stat, heldInode) : stat;
+    },
+    lstatSync: (...args: Parameters<typeof fs.lstatSync>) => {
+      const stat = fs.lstatSync(...args);
+      assert.ok(stat);
+      return args[0] === file ? inode(stat, namedInode) : stat;
+    },
+  } as typeof fs });
+  const same = await runtime.acquire();
+  same.close();
+  namedInode++;
+  assert.equal(Number(heldInode), Number(namedInode), "Number conversion would hide this replacement");
+  await assert.rejects(runtime.acquire(), /inode changed/);
+});
+
 test("only contention retries; epoch and ledger have distinct finite bounds", async (t) => {
   const f = fixture(t);
   await f.runtime.seed(S);

@@ -205,6 +205,48 @@ func TestPodEpochInitExecMissingAfterPrepareNeverCreatesState(t *testing.T) {
 	}
 }
 
+func TestPodEpochInitExecCompleteKubeletRootPredicate(t *testing.T) {
+	for _, tc := range []struct {
+		perms         os.FileMode
+		setgid, valid bool
+	}{
+		{0o770, true, true}, {0o775, true, true}, {0o070, true, false},
+		{0o670, true, false}, {0o570, true, false}, {0o370, true, false},
+		{0o770, false, false}, {0o777, true, false},
+	} {
+		t.Run(fmt.Sprintf("mode=%o/setgid=%v", tc.perms, tc.setgid), func(t *testing.T) {
+			h := newEpochInitHost(t)
+			mode := tc.perms
+			if tc.setgid {
+				mode |= os.ModeSetgid
+			}
+			if err := os.Chmod(h.data, mode); err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := os.Chmod(h.data, 0o700); err != nil {
+					t.Error(err)
+				}
+			}()
+			script := h.script(true)
+			at := strings.Index(script, h.python+" "+h.helper+" seed")
+			if at < 0 {
+				t.Fatal("posture-prefix boundary absent")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, "/bin/bash", "-c", script[:at]) //nolint:gosec // G204: literal read-only validator with test-owned paths.
+			out, err := cmd.CombinedOutput()
+			if tc.valid && err != nil {
+				t.Fatalf("matching root refused: %v %s", err, out)
+			}
+			if !tc.valid && (err == nil || !strings.Contains(string(out), "unsafe data root posture")) {
+				t.Fatalf("nonmatching root accepted or failed after validation: %v %s", err, out)
+			}
+		})
+	}
+}
+
 func TestPodEpochInitExecColdAndWarmSeedRecordBeforeShared(t *testing.T) {
 	h := newEpochInitHost(t)
 	h.posture()

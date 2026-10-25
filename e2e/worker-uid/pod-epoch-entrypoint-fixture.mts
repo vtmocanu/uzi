@@ -1,5 +1,6 @@
-// Transport only baked path constants, as entrypoint-migration and runner-shared do.
-// Mutation commands remain real image binaries; wrappers record before exec.
+// Instrument copied image sources and transport their fixed data paths. Kernel
+// locks and filesystem operations stay real; only tmpfs classification is overridden.
+// Stop at the configuration boundary so the proof cannot register or claim work.
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -32,11 +33,20 @@ export function entrypointFixture(data: string) {
   // instrumented after the permitted /proc snapshot, before any epoch operation.
   fs.cpSync(new URL("../../agent/src/", import.meta.url), path.join(app, "src"), { recursive: true });
   fs.mkdirSync(path.join(app, "templates"));
-  fs.writeFileSync(path.join(app, "templates/pod-epoch-init.cjs"), helperSource);
+  const rootDefault = "const root = options.root ?? '/data';";
+  assert.equal(helperSource.split(rootDefault).length, 2, "worker root transport applies once");
+  fs.writeFileSync(path.join(app, "templates/pod-epoch-init.cjs"), helperSource
+    .replace("const fs = require('node:fs');",
+      "const realFs = require('node:fs'); const fs = { ...realFs, statfsSync: (...a) => ({ ...realFs.statfsSync(...a), type: 0xef53 }) };")
+    .replace(rootDefault, "const root = options.root ?? " + JSON.stringify(data) + ";")
+    .replace("else resolve({ code, output });",
+      "else { if (code === 200) console.error('EPOCH_MAIN_LOCK_CONFLICT'); resolve({ code, output }); }"));
+  const runtimeFile = path.join(app, "src/pod-epoch-lock.ts");
+  fs.writeFileSync(runtimeFile, fs.readFileSync(runtimeFile, "utf8").replaceAll('"/data', JSON.stringify(data).slice(0, -1)));
   fs.symlinkSync("/app/node_modules", path.join(app, "node_modules"));
-  fs.writeFileSync(path.join(app, "package.json"), JSON.stringify({
-    type: "module", scripts: { start: "tsx src/main.ts" },
-  }));
+  const packageJson = JSON.parse(fs.readFileSync("/app/package.json", "utf8"));
+  assert.equal(packageJson.scripts.start, "tsx src/main.ts");
+  fs.writeFileSync(path.join(app, "package.json"), JSON.stringify(packageJson));
   const mainFile = path.join(app, "src/main.ts");
   const originalMain = fs.readFileSync(mainFile, "utf8");
   const marker = "  recordMaintenanceBootstrap(snapshotMaintenanceBootstrap());";
@@ -60,9 +70,31 @@ if (process.env.NODE_EXTRA_CA_CERTS) {
 const made = fs.mkdtempSync(os.tmpdir() + '/dependency-');
 fs.appendFileSync(${JSON.stringify(log)}, 'BOOTSTRAP ' + made + '\\n');
 console.log('EPOCH_NPM_READY');
-return;
 `;
-  fs.writeFileSync(mainFile, originalMain.replace(marker, marker + '\n' + probe));
+  const configBoundary = "  const config = loadConfig();";
+  assert.equal(originalMain.split(configBoundary).length, 2, "configuration interception applies once");
+  const observeOwnership = `
+  const config = await (async () => {
+    assert.equal(epochOwnership?.mode, 'shared', 'actual main holds SH before configuration');
+    assert.ok(['fresh', 'existing'].includes(epochConsumption?.result ?? ''), 'actual main durably consumes before configuration');
+    const ledger = fs.readFileSync(${JSON.stringify(data + '/.uzi-epoch-consumed')}, 'utf8');
+    assert.ok(ledger.startsWith('UZIEC01\\n'));
+    assert.equal(ledger.slice(8).split('\\n').filter(uid => uid === process.env.UZI_POD_UID).length, 1, 'pod consumption is durable and unique');
+    const expected = ${JSON.stringify(data + '/runner/.tmp')} + (process.env.UZI_UID_SPLIT === '1' ? '/uzi-worker' : '');
+    assert.equal(process.env.TMPDIR, expected, 'actual main restores persistent TMPDIR before configuration');
+    assert.equal(os.tmpdir(), expected, 'actual main os.tmpdir uses persistent scratch');
+    assert.equal(process.env.UZI_EPOCH_RUNTIME_TMPDIR, undefined);
+    assert.equal(process.env.npm_config_cache, undefined, 'bootstrap npm cache does not reach run children');
+    const made = fs.mkdtempSync(os.tmpdir() + '/main-owned-');
+    fs.appendFileSync(${JSON.stringify(log)}, 'MAIN_OWNED ' + made + '\\n');
+    console.log('EPOCH_MAIN_OWNED');
+    await new Promise(resolve => process.stdin.once('data', resolve));
+    process.exit(0);
+  })();
+`;
+  fs.writeFileSync(mainFile, originalMain.replace(marker, marker + '\n' + probe)
+    .replace(configBoundary, observeOwnership)
+    .replace('process.env.UZI_DATA_DIR !== "/data"', 'process.env.UZI_DATA_DIR !== ' + JSON.stringify(data)));
   let script = entrypoint.replace("DATA_DIR=/data", "DATA_DIR=" + data)
     .replace("NIX_DIR=/nix", "NIX_DIR=" + nix)
     .replace("EPOCH_HELPER=/usr/local/lib/uzi/pod-epoch-init.cjs", "EPOCH_HELPER=" + helper)
@@ -85,7 +117,7 @@ if(s.ino!==${initialRoot.ino}||s.uid!==${initialRoot.uid}||s.gid!==${initialRoot
   const file = path.join(root, "entrypoint.sh");
   fs.writeFileSync(file, script, { mode: 0o755 });
   const env = { PATH: rootPath, HOME: home, TMPDIR: data + "/runner/.tmp",
-    UZI_EPOCH_LOCK: "1", UZI_POD_UID: "22222222-2222-4222-8222-222222222222", UZI_WORKER_TOKEN_FILE: data + "/token" };
+    UZI_EPOCH_LOCK: "1", UZI_DATA_DIR: data, UZI_POD_UID: "22222222-2222-4222-8222-222222222222", UZI_WORKER_TOKEN_FILE: data + "/token" };
   return { root, log, home, app, bootstrap,
     reject(extra: Record<string, string> = {}, args = ["npm", "run", "start"], cwd = app) {
       return spawnSync("/bin/sh", [file, ...args], { env: { ...env, ...extra }, cwd,
@@ -136,7 +168,7 @@ if(s.ino!==${initialRoot.ino}||s.uid!==${initialRoot.uid}||s.gid!==${initialRoot
         async wait(needle: string) {
           if (output.includes(needle)) return;
           await new Promise<void>((resolve, reject) => {
-            const timer = setTimeout(() => reject(new Error("entrypoint readiness deadline: " + needle + "\n" + failure)), 8000);
+            const timer = setTimeout(() => reject(new Error("entrypoint readiness deadline: " + needle + "\n" + failure)), 20000);
             waiters.set(needle, () => { clearTimeout(timer); waiters.delete(needle); resolve(); });
             closed.then(code => {
               clearTimeout(timer); waiters.delete(needle);

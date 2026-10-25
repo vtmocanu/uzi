@@ -237,7 +237,7 @@ test("pod epoch rendered seed and runner-init wait under EX in both real UID mod
         assert.equal(fs.readFileSync(path.join(f.root, "provision/keep"), "utf8"), "protected");
       }
       assert.equal(fs.lstatSync(f.root).gid, 10001);
-      assert.equal(fs.lstatSync(f.root).mode & 0o2070, 0o2070);
+      assert.equal(fs.lstatSync(f.root).mode & 0o2770, 0o2770);
     } finally {
       holder?.close();
       try { await boot?.join(); } finally { sandbox.close(); await f.close(); }
@@ -317,9 +317,15 @@ test("pod epoch real entrypoint fences protected initialization under EX and con
     holder = await f.exclusive();
     const gapBefore = protectedSnapshot(f.root);
     boot.child.stdin.write("continue\n");
-    await boot.wait("EPOCH_NPM_READY"); await boot.join();
-    assert.ok(protectedSnapshot(f.root) === gapBefore, "real npm/tsx/static imports make no protected writes in reacquisition gap");
+    await boot.wait("EPOCH_NPM_READY");
+    await boot.wait("EPOCH_MAIN_LOCK_CONFLICT");
+    assert.ok(protectedSnapshot(f.root) === gapBefore, "real npm/tsx/main waits without protected writes in reacquisition gap");
     holder.close(); holder = undefined;
+    await boot.wait("EPOCH_MAIN_OWNED");
+    assert.equal(flock(f.root, "-x"), 200, "actual main retains SH before configuration/admission");
+    boot.child.stdin.write("stop\n");
+    await boot.join();
+    assert.equal(flock(f.root, "-x"), 0, "actual main process exit releases ownership");
     const operations = fs.readFileSync(sandbox.log, "utf8");
     assert.ok(!operations.includes("POSTURE_VIOLATION"), "root posture holds after every initializer operation, even if later restored");
     for (const target of ["runner", "repos", ".uzi-epoch-consumed", "jobs", "token"]) {
@@ -335,9 +341,14 @@ test("pod epoch real entrypoint fences protected initialization under EX and con
     const single = sandbox.start(true); launched.push(single);
     await single.wait("EPOCH_INIT_DONE");
     single.child.stdin.write("continue\n");
-    await single.wait("EPOCH_NPM_READY"); await single.join();
-    assert.ok(protectedSnapshot(f.root) === singleBefore, "single-uid real dependency startup writes remain container-local");
+    await single.wait("EPOCH_NPM_READY");
+    await single.wait("EPOCH_MAIN_LOCK_CONFLICT");
+    assert.ok(protectedSnapshot(f.root) === singleBefore, "single-uid main waits without protected writes");
     holder.close(); holder = undefined;
+    await single.wait("EPOCH_MAIN_OWNED");
+    assert.equal(flock(f.root, "-x"), 200, "single-uid actual main retains SH");
+    single.child.stdin.write("stop\n");
+    await single.join();
     assert.equal(fs.readFileSync(sandbox.log, "utf8").split("\n").filter(line => line.startsWith("BOOTSTRAP ")).length, 2,
       "both UID exec paths reach the instrumented known npm invocation with private bootstrap scratch and FD9 closed");
   } finally {
@@ -379,9 +390,14 @@ test("pod epoch private API CA survives both real UID launch chains without rela
       holder = await f.exclusive();
       const before = protectedSnapshot(f.root);
       boot.child.stdin.write("continue\n");
-      await boot.wait("EPOCH_NPM_READY"); await boot.join();
-      assert.ok(protectedSnapshot(f.root) === before, "CA bootstrap writes no protected state");
+      await boot.wait("EPOCH_NPM_READY");
+      await boot.wait("EPOCH_MAIN_LOCK_CONFLICT");
+      assert.ok(protectedSnapshot(f.root) === before, "CA bootstrap waits without protected writes");
       holder.close(); holder = undefined;
+      await boot.wait("EPOCH_MAIN_OWNED");
+      assert.equal(flock(f.root, "-x"), 200, "CA worker main retains SH before configuration");
+      boot.child.stdin.write("stop\n");
+      await boot.join();
     }
     const log = fs.readFileSync(sandbox.log, "utf8");
     assert.equal(log.split("\n").filter(line => line.startsWith("CA_TRUST ")).length, 2,

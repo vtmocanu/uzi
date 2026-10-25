@@ -897,7 +897,7 @@ func dockerNixSeedScript() string {
 const fs = require("node:fs");
 const s = fs.lstatSync("/data-seed");
 if (!s.isDirectory() || s.isSymbolicLink() || s.gid !== 10001 ||
-    (s.mode & 0o2070) !== 0o2070 || (s.mode & 0o002) ||
+    (s.mode & 0o2770) !== 0o2770 || (s.mode & 0o002) ||
     ![0, 10001].includes(s.uid)) throw new Error("unsafe data root posture");
 '
 /usr/local/bin/node /usr/local/lib/uzi/pod-epoch-init.cjs seed /data-seed "$UZI_POD_UID"

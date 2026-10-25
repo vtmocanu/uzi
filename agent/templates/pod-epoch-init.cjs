@@ -92,14 +92,15 @@ function createRuntime(options = {}) {
     return type === 0xef53 || type === 0x58465342;
   }
   function metadata(stat, mode, owner = uid) {
-    if (!stat.isFile() || stat.uid !== owner || stat.gid !== gid ||
-        (stat.mode & 0o7777) !== mode || stat.nlink !== 1) {
+    if (!stat.isFile() || stat.uid !== BigInt(owner) || stat.gid !== BigInt(gid) ||
+        (stat.mode & 0o7777n) !== BigInt(mode) || stat.nlink !== 1n) {
       throw new Error('unsafe epoch state metadata');
     }
   }
   function verify(fd, file, mode = 0o600, expected, owner = uid) {
-    const held = io.fstatSync(fd);
-    const named = io.lstatSync(file);
+    // Keep 64-bit device/inode identities exact, including inode64 XFS.
+    const held = io.fstatSync(fd, { bigint: true });
+    const named = io.lstatSync(file, { bigint: true });
     metadata(held, mode, owner);
     metadata(named, mode, owner);
     if (identity(held) !== identity(named) || (expected && identity(held) !== expected)) {
@@ -174,7 +175,7 @@ function createRuntime(options = {}) {
       length += count;
     }
     const after = verify(fd, file, mode, identity(before), owner);
-    if (length > limit || length !== before.size || after.size !== before.size) {
+    if (length > limit || length !== Number(before.size) || after.size !== before.size) {
       throw new Error('epoch state changed or exceeds bound');
     }
     // UTF-8 replacement and non-ASCII bytes must not normalize into valid state.
