@@ -109,6 +109,7 @@ import { rmTeardownTree, rmRunnerTeardownTree } from "../rmtree.js";
 import { asText } from "../tool-evidence.js";
 import { installJsDeps, prepareSupervisedInstall, DEFAULT_INSTALL_TIMEOUT_MS, MAX_PROJECT_DIRS, type InstallExec, type JsDepsInstall } from "../js-deps.js";
 import { startDepsInstall, reportDepsInstall } from "../js-deps-provision.js";
+import { readRepoInstructions } from "../repo-instructions.js";
 import {
   evidencesModelProcessing,
   EpochCleanupUnprovenError,
@@ -126,7 +127,7 @@ import {
   type TurnStreamEnd,
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
-import { interruptedSnapshotNote, interruptedCallsNote, NON_CLOSING_REMINDER, COMPLETION_CONTRACT_GUIDANCE, CURRENT_EXECUTION_STATE_GUIDANCE, depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, renderPlanApprovalAdvice, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBatch, REVIEWED_RESUME_APPROVAL_GUIDANCE, selectPriorOwnerHistory, renderPriorOwnerHistory } from "../prompt.js";
+import { buildRepoInstructionsContext, interruptedSnapshotNote, interruptedCallsNote, NON_CLOSING_REMINDER, COMPLETION_CONTRACT_GUIDANCE, CURRENT_EXECUTION_STATE_GUIDANCE, depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, renderPlanApprovalAdvice, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBatch, REVIEWED_RESUME_APPROVAL_GUIDANCE, selectPriorOwnerHistory, renderPriorOwnerHistory } from "../prompt.js";
 import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts, type EnvProbeSpawner } from "../env-probe.js";
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
@@ -1986,6 +1987,7 @@ export interface CodexExecutorOptions {
  * an owned HOME are minted anew per epoch.
  */
 interface EpochSharedContext {
+  readonly repoInstructions?: string;
   readonly provider: CodexProviderConfig;
   readonly binding: CodexBinding;
   readonly worktreePath: string;
@@ -2852,6 +2854,30 @@ export class CodexExecutor implements Executor {
           baseUrl: this.deps.appServerAuthOpenAIBaseUrlForTest,
         };
     const worktreePath = ctx.worktreePath;
+    // Snapshot and frame once per execution, before provisioning, dependency installation,
+    // or agent writes. Every root request and replacement epoch shares these bytes and nonce.
+    let repoInstructions: string | undefined;
+    if (ctx.repoClaudemdEnabled) {
+      const result = await readRepoInstructions(worktreePath);
+      if ("text" in result) {
+        repoInstructions = buildRepoInstructionsContext(result.text);
+        ctx.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text: repoInstructions
+              ? `repo instructions: injected root CLAUDE.md as advisory lead context (${Buffer.byteLength(result.text, "utf8")} bytes)`
+              : "repo instructions: not injected (empty)",
+          },
+        });
+      } else {
+        ctx.emit({
+          kind: "status",
+          agent: "worker",
+          payload: { text: `repo instructions: not injected (${result.dropped})` },
+        });
+      }
+    }
     this.reaperAttempt = ctx.runAttempt ? Object.freeze({ ...ctx.runAttempt }) : undefined;
     const storeDir = path.join(this.homeRoot, "codex-session-store");
     const boundaryDeadlineMs = this.deps.boundaryDeadlineMs ?? DEFAULT_BOUNDARY_DEADLINE_MS;
@@ -3500,6 +3526,7 @@ export class CodexExecutor implements Executor {
       // its own fresh credential + owned HOME on top of it.
       const claimRedact = ctx.redactText ?? ((s: string): string => s);
       const shared: EpochSharedContext = {
+        repoInstructions,
         provider,
         binding,
         vaultLock: pauseNow.vaultLock,
@@ -3713,7 +3740,7 @@ export class CodexExecutor implements Executor {
           let turn: Awaited<ReturnType<CodexExecutor["driveTurnWithWallPark"]>>;
           try {
             if (humanRevision) await ctx.beforePlanRevisionTurn?.();
-            turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, shared.selection.current, { completedCount: 0 }, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completion);
+            turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, shared.selection.current, shared.repoInstructions, { completedCount: 0 }, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completion);
           } catch (error) {
             if (!humanRevision || !(error instanceof TransientRecoveryError) || !error.providerOrigin || !ctx.retryPlanRevisionTurn) throw error;
             // The runner hook owns backoff and control checks. Redrive without a new cap,
@@ -4219,7 +4246,7 @@ export class CodexExecutor implements Executor {
           const onProgress = makeProgressObserver(ctx, latestProgress, milestones);
           // Issue #1764: an in-turn owner park reports the server's cumulative count when it served one.
           const turnAt = { completedCount: served?.completedCount ?? latestProgress?.completed?.length ?? 0, total: milestones?.length };
-          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, epoch.registry, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, shared.selection.current, turnAt, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completion, onProgress, round === 0 ? firstEventHandler : undefined, undefined,
+          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, epoch.registry, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, shared.selection.current, shared.repoInstructions, turnAt, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completion, onProgress, round === 0 ? firstEventHandler : undefined, undefined,
             systemFollowUp === undefined && round === 0 ? (prompt) => {
               if (interruptedOwnerDispatched) return prompt;
               const calls = interruptedCallsNote(ctx.getInterruptedCalls?.());
@@ -4268,7 +4295,7 @@ export class CodexExecutor implements Executor {
             let disposition: Awaited<ReturnType<NonNullable<RunContext["requestParkRun"]>>> | undefined;
             const outcome = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer,
               "implement", nextPrompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker,
-              shared.selection.current, at, shared.scrubProjected, beforeReapingSink, pauseNow,
+              shared.selection.current, shared.repoInstructions, at, shared.scrubProjected, beforeReapingSink, pauseNow,
               recreateEpochAfterReap, completion, onProgress, undefined, async () => {
                 await beforeReapingSink();
                 disposition = await ctx.requestParkRun!(at);
@@ -4741,7 +4768,7 @@ export class CodexExecutor implements Executor {
       provider, binding, worktreePath, storeDir, homeRoot, boundaryDeadlineMs, childTurnDeadlineMs,
       commandEnv, commandSandbox, screenPolicy, toolHandlers, registerToken, committedGeneration, launchEffectRoot,
       spawnBoundaryRoot, boundaryProcessSpawner, reconcile, onTerminalDispose, accountant, scrubProjected,
-      commandCache, lifecycleSignal, selection, vaultLock, settleDepsInstall,
+      commandCache, lifecycleSignal, selection, vaultLock, settleDepsInstall, repoInstructions,
     } = shared;
 
     // Per-epoch trust-boundary REVALIDATION: re-verify the run HOME + codex-data parent's
@@ -4899,7 +4926,7 @@ export class CodexExecutor implements Executor {
         ));
       const buildPhaseBroker = (phase: "plan" | "implement", signal?: AbortSignal): CodexCallbackBroker => {
         const runPlan = buildCodexRunPlan(
-          this.buildRunRequest(ctx, phase, this.phasePrompt(ctx, phase), undefined, new AbortController().signal, selection.current),
+          this.buildRunRequest(ctx, phase, this.phasePrompt(ctx, phase), undefined, new AbortController().signal, selection.current, repoInstructions),
         );
         const scrubToolResult = (result: NonNullable<SpawnCommandResult["memoryPressure"]>) => ({
           ...result, command: scrubProjected(result.command),
@@ -5185,6 +5212,7 @@ export class CodexExecutor implements Executor {
     wall: RunWall,
     buildPhaseBroker: (phase: "plan" | "implement", signal?: AbortSignal) => CodexCallbackBroker,
     selection: AgentSelection | undefined,
+    repoInstructions: string | undefined,
     scrubLeadText: (s: string) => string,
     onProgress: (progress: MilestoneProgress) => void,
     pauseNow: CodexPauseNowState,
@@ -5279,7 +5307,7 @@ export class CodexExecutor implements Executor {
       if (tripReason) throw this.tripError(tripReason, tripToken!);
       armIdle();
       if (beforeDispatch) prompt = beforeDispatch(prompt);
-      const request = this.buildRunRequest(ctx, phase, prompt, resumeId, turnAbort.signal, selection, ownerCompletionRecheck);
+      const request = this.buildRunRequest(ctx, phase, prompt, resumeId, turnAbort.signal, selection, repoInstructions, ownerCompletionRecheck);
       let turn = harness.startTurn(request);
       let events = turn.events[Symbol.asyncIterator]();
       let first = await (async () => {
@@ -5294,7 +5322,7 @@ export class CodexExecutor implements Executor {
             text: "the earlier Codex session was rejected by the provider — continuing WITHOUT its earlier context, so some work may be repeated",
             event: "resume_lineage_break",
           } });
-          turn = harness.startTurn(this.buildRunRequest(ctx, phase, prompt, undefined, turnAbort.signal, selection, ownerCompletionRecheck));
+          turn = harness.startTurn(this.buildRunRequest(ctx, phase, prompt, undefined, turnAbort.signal, selection, repoInstructions, ownerCompletionRecheck));
           events = turn.events[Symbol.asyncIterator]();
           return events.next();
         }
@@ -5483,6 +5511,7 @@ export class CodexExecutor implements Executor {
     wall: RunWall,
     buildPhaseBrokerIn: (phase: "plan" | "implement", signal?: AbortSignal) => CodexCallbackBroker,
     selection: AgentSelection | undefined,
+    repoInstructions: string | undefined,
     at: { completedCount: number; total?: number },
     scrubLeadText: (s: string) => string,
     beforeReapingSink: () => Promise<void>,
@@ -5527,7 +5556,7 @@ export class CodexExecutor implements Executor {
         }
         this.assertCaptureAdmission();
         const result = idleOperation ? await idleOperation() : await this.driveCodexTurn(
-          ctx, harness, registry, reducer, phase, prompt, resumeId, idleMs, wall, buildPhaseBroker, selection, scrubLeadText, onProgress, pauseNow, onFirstEvent, beforeDispatch, ownerCompletionRecheck,
+          ctx, harness, registry, reducer, phase, prompt, resumeId, idleMs, wall, buildPhaseBroker, selection, repoInstructions, scrubLeadText, onProgress, pauseNow, onFirstEvent, beforeDispatch, ownerCompletionRecheck,
         );
         // PRD #1497 M2 (CodeRabbit !1504): honor a sticky owner cancel that RACED a REFUSED
         // wall-park re-drive in EVERY phase. The wall PauseNowSignal permanently spent the shared
@@ -5910,6 +5939,7 @@ export class CodexExecutor implements Executor {
     resumeId: string | undefined,
     signal: AbortSignal,
     selection: AgentSelection | undefined,
+    repoInstructions?: string,
     ownerCompletionRecheck = false,
   ): RunTurnRequest {
     let leadBody: string | undefined;
@@ -5965,6 +5995,7 @@ export class CodexExecutor implements Executor {
     const systemPrompt = buildLeadSystemPrompt(leadBody, {
       kind: ctx.kind,
       harness: "codex",
+      repoInstructions,
       repoSourced,
       // Issue #3272: only an implement-phase request of an owner-supplied plan gets the seeded variant.
       seeded: phase === "implement" && isSeededOwnerPlan(ctx),
