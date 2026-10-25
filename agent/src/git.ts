@@ -11117,7 +11117,7 @@ export class GitCache {
         if (movedTo !== undefined) {
           await fs.rename(movedTo, clonePath).then(
             async () => {
-              if (scratch) await this.removeBestEffort(scratch, "retire-rollback-scratch", "tree", checkProcessProof);
+              if (scratch) await this.removeBestEffort(scratch, "retire-rollback-scratch", "emptyDir");
             },
             (renameErr: unknown) =>
               this.log.warn("retireRunnerClone: worker residue quarantine latched mid-retire and the clone could not be moved back; it is retained at the holding path", {
@@ -11258,7 +11258,7 @@ export class GitCache {
                 await this.worktreeHead(movedTo) !== opts.completionSource.expectedHead)
               throw new Error("completion rollback source cannot be verified");
             await fs.rename(movedTo, clonePath);
-            if (scratch) await this.removeBestEffort(scratch, "completion-rollback-scratch", "emptyDir", checkProcessProof);
+            if (scratch) await this.removeBestEffort(scratch, "completion-rollback-scratch", "emptyDir");
           } catch (rollbackError) {
             this.log.warn("retireRunnerClone: completion rollback retained residue", {
               clone: clonePath, retained_at: movedTo, error: gitErrorMessage(rollbackError),
