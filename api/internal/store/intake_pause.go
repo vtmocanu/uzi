@@ -39,15 +39,21 @@ func ReadInstanceIntakePause(ctx context.Context, q *Queries) (IntakePauseState,
 	return IntakePauseState{InstanceIntakePause: row}, nil
 }
 
-// SetInstanceIntakePause applies a transition under the singleton's row lock. q must be
-// bound to the caller's transaction so the state change and its audit event commit
-// together; the caller commits. changed is false for a no-op (off to off, or on to on
-// with an identical reason), which writes no event.
+// SetInstanceIntakePause applies a transition under the singleton's row lock. q MUST be
+// bound to the caller's open transaction (store.New(tx)), never the pool: the row change
+// and its audit event are two statements that only commit or roll back together inside
+// that transaction, and the caller commits. changed is false for a no-op (off to off, or
+// on to on with an identical reason), which writes no event. A deleted singleton is
+// re-seeded inactive first, so a PUT can lift the fail-closed pause a missing row implies.
 //
-//	off to on: since = now, event "on"
-//	on to on, different reason: reason only (since kept), event "reason"
+//	off to on: since = now, attribution = the caller, event "on"
+//	on to on, different reason: reason only (since and attribution kept), event "reason"
+//	  by the caller
 //	on to off: reason and since cleared, event "off"
 func SetInstanceIntakePause(ctx context.Context, q *Queries, active bool, reason string, byUserID pgtype.UUID, byLabel string) (state InstanceIntakePause, changed bool, err error) {
+	if err := q.EnsureInstanceIntakePauseRow(ctx); err != nil {
+		return InstanceIntakePause{}, false, err
+	}
 	cur, err := q.LockInstanceIntakePause(ctx)
 	if err != nil {
 		return InstanceIntakePause{}, false, err
@@ -63,23 +69,19 @@ func SetInstanceIntakePause(ctx context.Context, q *Queries, active bool, reason
 		return cur, false, nil
 	}
 	action := "on"
-	var since pgtype.Timestamptz
+	keepAttribution := false
 	switch {
 	case active && cur.Active:
 		if cur.Reason == newReason {
 			return cur, false, nil
 		}
-		action, since = "reason", cur.Since
+		action, keepAttribution = "reason", true
 	case active:
-		// Stamped by the database clock (the transaction's now()), like the audit event.
-		if err := q.db.QueryRow(ctx, "SELECT now()").Scan(&since); err != nil {
-			return InstanceIntakePause{}, false, err
-		}
 	default:
 		action = "off"
 	}
 	updated, err := q.UpdateInstanceIntakePause(ctx, UpdateInstanceIntakePauseParams{
-		Active: active, Since: since, ByUserID: byUserID, ByLabel: label, Reason: newReason,
+		Active: active, KeepAttribution: keepAttribution, ByUserID: byUserID, ByLabel: label, Reason: newReason,
 	})
 	if err != nil {
 		return InstanceIntakePause{}, false, err

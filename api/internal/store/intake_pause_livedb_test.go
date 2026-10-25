@@ -223,6 +223,99 @@ func TestIntakePauseMissingRowLiveDB(t *testing.T) {
 	if got, err := fx.claim(w, false, nil); err != nil || got.ID != root {
 		t.Fatalf("admitted run must claim with missing row: %s %v", got.ID, err)
 	}
+
+	// Lifting: an "off" transition re-seeds the row (inactive) and is otherwise a no-op,
+	// leaving the instance unpaused with no event.
+	tx, err := fx.pool.Begin(fx.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(fx.ctx) }()
+	by := pgtype.UUID{Bytes: fx.userID, Valid: true}
+	lifted, changed, err := store.SetInstanceIntakePause(fx.ctx, store.New(tx), false, "", by, "Admin")
+	if err != nil || changed || lifted.Active {
+		t.Fatalf("lift on missing row: %+v changed=%v err=%v", lifted, changed, err)
+	}
+	if err := tx.Commit(fx.ctx); err != nil {
+		t.Fatal(err)
+	}
+	var rows int
+	if err := fx.pool.QueryRow(fx.ctx, `SELECT count(*) FROM instance_intake_pause`).Scan(&rows); err != nil || rows != 1 {
+		t.Fatalf("singleton not re-seeded: rows=%d err=%v", rows, err)
+	}
+	if err := fx.pool.QueryRow(fx.ctx, `SELECT fn_instance_intake_paused()`).Scan(&paused); err != nil || paused {
+		t.Fatalf("pause not lifted: paused=%v err=%v", paused, err)
+	}
+	newRoot := fx.queuedRun()
+	if got, err := fx.claim(w, false, nil); err != nil || got.ID != newRoot {
+		t.Fatalf("new root must claim after lift: %s %v", got.ID, err)
+	}
+}
+
+// A reason-only edit by a second admin keeps the row's attribution (the event records
+// the editor).
+func TestIntakePauseReasonEditKeepsAttributionLiveDB(t *testing.T) {
+	fx := newFleetFixture(t)
+	t.Cleanup(func() { mustExec(fx.ctx, t, fx.pool, "DELETE FROM users WHERE id=$1", fx.userID) })
+	restoreIntakePause(t, fx.pool)
+	userB := uuid.New()
+	mustExec(fx.ctx, t, fx.pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, userB, userB.String()+"@intake-pause.test")
+	t.Cleanup(func() { mustExec(fx.ctx, t, fx.pool, "DELETE FROM users WHERE id=$1", userB) })
+	a := pgtype.UUID{Bytes: fx.userID, Valid: true}
+	b := pgtype.UUID{Bytes: userB, Valid: true}
+
+	apply := func(by pgtype.UUID, label, reason string) {
+		t.Helper()
+		tx, err := fx.pool.Begin(fx.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(fx.ctx) }()
+		if _, _, err := store.SetInstanceIntakePause(fx.ctx, store.New(tx), true, reason, by, label); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(fx.ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	apply(a, "Admin A", "first")
+	apply(b, "Admin B", "second")
+
+	st, err := store.ReadInstanceIntakePause(fx.ctx, fx.q)
+	if err != nil || st.ByUserID != a || st.ByLabel.String != "Admin A" || st.Reason.String != "second" {
+		t.Fatalf("row attribution must stay with A, reason updated: %+v err=%v", st, err)
+	}
+	evs, err := fx.q.ListInstanceIntakePauseEvents(fx.ctx, 10)
+	if err != nil || len(evs) != 2 || evs[0].Action != "reason" || evs[0].ByUserID != b || evs[0].ByLabel.String != "Admin B" {
+		t.Fatalf("reason event must record B: %+v err=%v", evs, err)
+	}
+}
+
+// The row change and its audit event are atomic: a rolled-back transaction leaves neither.
+func TestIntakePauseRollbackIsAtomicLiveDB(t *testing.T) {
+	fx := newFleetFixture(t)
+	t.Cleanup(func() { mustExec(fx.ctx, t, fx.pool, "DELETE FROM users WHERE id=$1", fx.userID) })
+	restoreIntakePause(t, fx.pool)
+	mustExec(fx.ctx, t, fx.pool, `DELETE FROM instance_intake_pause_events`)
+	tx, err := fx.pool.Begin(fx.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, changed, err := store.SetInstanceIntakePause(fx.ctx, store.New(tx), true, "rolled back",
+		pgtype.UUID{Bytes: fx.userID, Valid: true}, "Admin"); err != nil || !changed {
+		t.Fatalf("set in tx: changed=%v err=%v", changed, err)
+	}
+	if err := tx.Rollback(fx.ctx); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.ReadInstanceIntakePause(fx.ctx, fx.q)
+	if err != nil || st.Active || st.RowMissing || st.Reason.Valid {
+		t.Fatalf("row change persisted after rollback: %+v err=%v", st, err)
+	}
+	evs, err := fx.q.ListInstanceIntakePauseEvents(fx.ctx, 10)
+	if err != nil || len(evs) != 0 {
+		t.Fatalf("event persisted after rollback: %+v err=%v", evs, err)
+	}
 }
 
 // Transitions: events, since semantics, no-ops, reason sanitizing.

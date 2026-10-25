@@ -29,7 +29,7 @@ CREATE INDEX instance_intake_pause_events_at_idx ON instance_intake_pause_events
 -- eligible through fn_run_admitted_during_intake_pause. Deliberately no exception
 -- swallowing: a read error fails the claim statement (PRD #3454 D2).
 CREATE FUNCTION fn_instance_intake_paused() RETURNS boolean
-LANGUAGE sql STABLE AS $$
+LANGUAGE sql STABLE PARALLEL SAFE AS $$
  SELECT COALESCE((SELECT active FROM instance_intake_pause WHERE id), true);
 $$;
 -- +goose StatementEnd
@@ -39,9 +39,10 @@ $$;
 -- claimed lead). Everything else is a new root (PRD #3454 D4). Kept separate from
 -- fn_worker_accepts_new_intake so capacity and capability projections stay truthful (D2).
 CREATE FUNCTION fn_run_admitted_during_intake_pause(r runs) RETURNS boolean
-LANGUAGE sql STABLE AS $$
+LANGUAGE sql STABLE PARALLEL SAFE
+BEGIN ATOMIC
  SELECT r.claim_generation > 0 OR r.kind = 'cross_check';
-$$;
+END;
 -- +goose StatementEnd
 
 -- +goose Down

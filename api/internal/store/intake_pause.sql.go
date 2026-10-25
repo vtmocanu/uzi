@@ -11,6 +11,17 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const ensureInstanceIntakePauseRow = `-- name: EnsureInstanceIntakePauseRow :exec
+INSERT INTO instance_intake_pause (id) VALUES (true) ON CONFLICT (id) DO NOTHING
+`
+
+// Re-seeds a deleted singleton (inactive) so a transition can proceed and lift the
+// fail-closed pause a missing row implies.
+func (q *Queries) EnsureInstanceIntakePauseRow(ctx context.Context) error {
+	_, err := q.db.Exec(ctx, ensureInstanceIntakePauseRow)
+	return err
+}
+
 const getInstanceIntakePause = `-- name: GetInstanceIntakePause :one
 
 SELECT id, active, since, by_user_id, by_label, reason FROM instance_intake_pause WHERE id
@@ -107,26 +118,31 @@ func (q *Queries) LockInstanceIntakePause(ctx context.Context) (InstanceIntakePa
 const updateInstanceIntakePause = `-- name: UpdateInstanceIntakePause :one
 UPDATE instance_intake_pause SET
     active     = $1::boolean,
-    since      = $2::timestamptz,
-    by_user_id = $3::uuid,
-    by_label   = $4::text,
+    since      = CASE WHEN NOT $1::boolean THEN NULL
+                      WHEN NOT active THEN now()
+                      ELSE since END,
+    by_user_id = CASE WHEN $2::boolean THEN by_user_id ELSE $3::uuid END,
+    by_label   = CASE WHEN $2::boolean THEN by_label ELSE $4::text END,
     reason     = $5::text
 WHERE id
 RETURNING id, active, since, by_user_id, by_label, reason
 `
 
 type UpdateInstanceIntakePauseParams struct {
-	Active   bool               `json:"active"`
-	Since    pgtype.Timestamptz `json:"since"`
-	ByUserID pgtype.UUID        `json:"by_user_id"`
-	ByLabel  pgtype.Text        `json:"by_label"`
-	Reason   pgtype.Text        `json:"reason"`
+	Active          bool        `json:"active"`
+	KeepAttribution bool        `json:"keep_attribution"`
+	ByUserID        pgtype.UUID `json:"by_user_id"`
+	ByLabel         pgtype.Text `json:"by_label"`
+	Reason          pgtype.Text `json:"reason"`
 }
 
+// Right-hand column references are the row's pre-update values. since is stamped here
+// (transaction now()) only on off to on, kept on a reason-only edit, cleared on off.
+// keep_attribution leaves by_user_id/by_label untouched (a reason-only edit).
 func (q *Queries) UpdateInstanceIntakePause(ctx context.Context, arg UpdateInstanceIntakePauseParams) (InstanceIntakePause, error) {
 	row := q.db.QueryRow(ctx, updateInstanceIntakePause,
 		arg.Active,
-		arg.Since,
+		arg.KeepAttribution,
 		arg.ByUserID,
 		arg.ByLabel,
 		arg.Reason,
