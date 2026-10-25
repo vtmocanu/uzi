@@ -369,12 +369,21 @@ test("pod epoch private API CA survives both real UID launch chains without rela
     fs.mkdirSync(secret, { mode: 0o755 }); created = true;
     const generation = path.join(secret, "..generation");
     fs.mkdirSync(generation);
-    const ca = path.join(generation, "ca.crt"), key = path.join(generation, "key.pem");
-    const certificate = spawnSync("/opt/uzi-toolchain/bin/openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes",
-      "-keyout", key, "-out", ca, "-days", "1", "-subj", "/CN=pod-epoch-private-ca",
-      "-addext", "basicConstraints=critical,CA:TRUE"], { encoding: "utf8", timeout: 10000 });
-    assert.equal(certificate.status, 0, certificate.stderr);
-    fs.unlinkSync(key);
+    const ca = path.join(generation, "ca.crt");
+    // Public test-only CA; no private key is needed to prove Node loads it.
+    // The image's OpenSSL lives under /nix, masked by this lane's empty tmpfs.
+    fs.writeFileSync(ca, `-----BEGIN CERTIFICATE-----
+MIIBlDCCATugAwIBAgIUYNB2ixWrk3AVkzhcIqyTBCqEdlowCgYIKoZIzj0EAwIw
+HzEdMBsGA1UEAwwUcG9kLWVwb2NoLXByaXZhdGUtY2EwIBcNMjYxMDI1MTcyNzAz
+WhgPMjEyNjEwMDExNzI3MDNaMB8xHTAbBgNVBAMMFHBvZC1lcG9jaC1wcml2YXRl
+LWNhMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEw+4PV9pO6YOSorIWbVXkiGua
+72YEn+NdRq2RBVDWkn4hiYA0A8cFmuOriO9k9Uxvj+LvlaAgsJa4KOY8CU0x6qNT
+MFEwHQYDVR0OBBYEFOyRYyhou7ybrD0H94lhC/d+GU5qMB8GA1UdIwQYMBaAFOyR
+Yyhou7ybrD0H94lhC/d+GU5qMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwID
+RwAwRAIgYSUU8KMJPlJUMpgJc/bqxWWAgYSb+SIiu/ecrfw3i3oCIE9xWEc+hWat
+II9AfazIwMDPRH6tsY2oac56bpTHDdCS
+-----END CERTIFICATE-----
+`);
     fs.chmodSync(ca, 0o440); fs.chownSync(ca, 0, 10001);
     fs.writeFileSync(path.join(generation, "worker_token"), "epoch-test-token", { mode: 0o440 });
     fs.chownSync(path.join(generation, "worker_token"), 0, 10001);

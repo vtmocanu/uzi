@@ -152,8 +152,9 @@ function createRuntime(options = {}) {
       return false;
     }
     try {
-      io.fchownSync(fd, uid, gid);
+      // Set mode while still the creator: CHOWN does not grant FOWNER.
       io.fchmodSync(fd, 0o600);
+      io.fchownSync(fd, uid, gid);
       verify(fd, file);
       if (mutex) await lock(fd, 'exclusive', 5000, signal);
       if (contents && io.writeSync(fd, contents, 0, 'ascii') !== Buffer.byteLength(contents)) {
@@ -312,8 +313,9 @@ function createRuntime(options = {}) {
     try {
       fd = io.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT |
         fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
-      io.fchownSync(fd, uid, gid);
+      // Hand off ownership only after the creator has set the final mode.
       io.fchmodSync(fd, 0o644);
+      io.fchownSync(fd, uid, gid);
       const contents = JSON.stringify({ current: podUid, previous: old?.current ?? null }) + '\n';
       if (io.writeSync(fd, contents, 0, 'ascii') !== contents.length) throw new Error('short pod entry write');
       io.fsyncSync(fd);

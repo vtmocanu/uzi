@@ -59,6 +59,66 @@ test("seed is durable and idempotent; S T S cannot rearm the one-shot", async (t
   assert(f.calls.filter((call) => call.fd !== undefined).every((call) => call.args.join(" ").endsWith("-n -E 200 3")));
 });
 
+for (const supported of [true, false]) {
+  test(`seed sets modes before handing ownership away without FOWNER (supported=${supported})`, async (t) => {
+    const f = fixture(t);
+    const caller = process.getuid!();
+    const worker = caller + 1;
+    // Model CHOWN and DAC_OVERRIDE, but no FOWNER: descriptors retain access
+    // after chown, while chmod still requires the inode's current owner.
+    const owners = new Map<bigint, number>();
+    const handoffs: number[] = [];
+    const statOwner = (stat: fs.Stats | fs.BigIntStats) => {
+      const owner = owners.get(BigInt(stat.ino));
+      if (owner !== undefined) {
+        Object.defineProperty(stat, "uid", {
+          value: typeof stat.uid === "bigint" ? BigInt(owner) : owner,
+        });
+        Object.defineProperty(stat, "gid", {
+          value: typeof stat.gid === "bigint" ? BigInt(process.getgid!()) : process.getgid!(),
+        });
+      }
+      return stat;
+    };
+    const runtime = createPodEpoch({ ...f.options, uid: worker, io: {
+      ...f.options.io,
+      statfsSync: () => ({ type: supported ? 0xef53 : 0x6969 }),
+      fchownSync: (fd: number, uid: number, gid: number) => {
+        assert.equal(gid, process.getgid!());
+        const stat = fs.fstatSync(fd, { bigint: true });
+        handoffs.push(Number(stat.mode & 0o7777n));
+        owners.set(stat.ino, uid);
+      },
+      fchmodSync: (fd: number, mode: fs.Mode) => {
+        const stat = fs.fstatSync(fd, { bigint: true });
+        if ((owners.get(stat.ino) ?? caller) !== caller) {
+          throw Object.assign(new Error("chmod requires inode ownership without FOWNER"), { code: "EPERM" });
+        }
+        fs.fchmodSync(fd, mode);
+      },
+      fstatSync: (...args: Parameters<typeof fs.fstatSync>) => statOwner(fs.fstatSync(...args)),
+      lstatSync: (...args: Parameters<typeof fs.lstatSync>) => {
+        const stat = fs.lstatSync(...args);
+        assert.ok(stat);
+        return statOwner(stat);
+      },
+    } as unknown as typeof fs });
+    await runtime.seed(S);
+    const ledgerInode = fs.statSync(path.join(f.root, ledgerName)).ino;
+    const epochInode = supported ? fs.statSync(path.join(f.root, epochName)).ino : undefined;
+    await runtime.seed(T);
+    assert.deepEqual(handoffs, supported ? [0o600, 0o600, 0o644, 0o644] : [0o600, 0o644, 0o644]);
+    assert.equal(fs.statSync(path.join(f.root, ledgerName)).ino, ledgerInode);
+    if (supported) assert.equal(fs.statSync(path.join(f.root, epochName)).ino, epochInode);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.root, recordName), "utf8")), { current: T, previous: S });
+    const held = await runtime.acquire();
+    try {
+      assert.deepEqual(await held.consume(S), { result: "fresh", mayEvaluate: false });
+    } finally { held.close(); }
+    assert.equal(fs.readFileSync(path.join(f.root, ledgerName), "utf8"), "UZIEC01\n" + S + "\n");
+  });
+}
+
 test("unsupported storage never opens epoch file; metadata mutex grants no authority", async (t) => {
   const f = fixture(t);
   f.options.io = { ...f.options.io, statfsSync: () => ({ type: 0x6969 }) } as unknown as typeof fs;
