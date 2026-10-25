@@ -2526,9 +2526,12 @@ reservation completion remain distinct from serving eligibility, so an idle
 manual worker can roll and return cordoned; busy drift still waits under #3103.
 An all-manual multi-worker pool may remain held, without a zero-coverage bypass.
 Custody/migration (#3153/#3307) and DinD/pressure/maintenance guards remain
-independent. Earlier poll decisions may finish. Older serving APIs can admit
-after a successful cordon until every serving replica is compatible; stalled
-rollout extends that interval. Older controllers may miscount manual coverage,
+independent. Earlier poll decisions may finish. After migration 00355, older
+ClaimRun SQL with the previous explicit worker projection fails with SQLSTATE
+42846, including ordinary candidates; rollback can prolong this claim outage.
+Older chat claims can still admit work and ignore manual intent. Deploy every
+compatible serving API before relying on enforcement. Older controllers may
+miscount manual coverage,
 so ordinary coverage guarantees require compatible controllers. No worker-image
 protocol requirement or activation flag is added. Contract and rationale:
 [ADR-422 D5a](adr/0422-decouple-worker-version.md#d5a--owner-manual-cordon-is-persistent-intent-scope-amendment-2026-10-22);

@@ -2619,8 +2619,9 @@ The Workers page has the same owner controls. Health and admin views remain
 read-only. An idle manually cordoned hosted worker may roll and return cordoned;
 it supplies no serving coverage, and a multi-worker pool without an uncordoned
 provider can remain held. See [manual cordon lifecycle and deployment caveats](./hosted-workers.md#pause-new-work-with-a-manual-cordon),
-including older serving APIs admitting after cordon until their rollout completes
-and older controllers miscounting coverage.
+including older ClaimRun SQL failing after the worker-schema extension (rollback
+can prolong that outage), older chat claims ignoring manual intent, and older
+controllers miscounting coverage.
 
 ### Worker lane capacity
 

@@ -236,9 +236,12 @@ cordoned. A busy worker still waits under the ordinary roll policy. Manually
 cordoned workers do not provide replacement coverage, so a multi-worker pool
 with no uncordoned provider can remain held.
 
-During deployment, older serving APIs may admit new work after a successful
-cordon until every serving API is compatible; a stalled rollout extends that
-window. Older controllers may count manual workers as coverage; use compatible
+After migration 00355, older APIs whose ClaimRun SQL projects the previous
+worker columns fail claims with SQLSTATE 42846 before selecting a run, including
+ordinary runs. Update every serving API; rollback can prolong this claim outage.
+Older chat claims can still admit work and ignore manual intent. Do not rely on
+cordon enforcement until every serving API is compatible.
+Older controllers may count manual workers as coverage; use compatible
 controllers for ordinary coverage guarantees. Decisions from an earlier poll
 may finish. No worker-image upgrade or feature activation flag is required.
 See [CLI manual cordon](./cli.md#manual-worker-cordon) for response fields.

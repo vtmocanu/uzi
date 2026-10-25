@@ -122,10 +122,13 @@ continue. The combined predicate is `fn_worker_accepts_new_intake`, mirrored by
 (`api/internal/store/queries/runtime.sql`, `api/internal/store/queries/chat.sql`,
 `api/internal/workersvc/ephemeral_lease.go`).
 
-Older serving API replicas may still admit new work after a successful cordon
-until every serving replica is compatible; a stalled rollout extends that
-interval. Older controllers may miscount manual workers as coverage. Compatible
-controllers are required for ordinary coverage guarantees; decisions from an
+After migration 00355, older ClaimRun SQL with the previous explicit worker
+projection fails with SQLSTATE 42846 before selecting a run, including ordinary
+runs: its record no longer casts to the extended workers composite. Every
+serving API must update; rollback can prolong the claim outage. Older chat claims
+can still admit work and ignore manual intent. Older controllers may miscount
+manual workers as coverage. Compatible controllers are required for ordinary
+coverage guarantees; decisions from an
 earlier poll may finish. Deploy compatible APIs and controllers before relying
 on the combined policy; worker images need no feature-specific upgrade.
 

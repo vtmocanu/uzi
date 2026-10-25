@@ -80,10 +80,12 @@ with an isolated hosted deployment owns these live observations. Follow
 for the contract; preserve #3103/#3153/#3307 checks below.
 
 1. Deploy compatible serving APIs and the compatible singleton controller before
-   relying on intake or ordinary coverage guarantees. Older serving replicas
-   can admit work after a successful cordon until their rollout completes;
-   stalled rollout extends this window. Older controllers may count manual
-   workers as coverage. Earlier poll decisions may finish. No worker-image
+   relying on intake or ordinary coverage guarantees. After migration 00355,
+   older ClaimRun SQL with the previous worker projection fails with SQLSTATE
+   42846, including ordinary candidates; rollback can prolong the claim outage.
+   Older chat claims can still admit work and ignore manual intent.
+   Older controllers may count manual workers as coverage. Earlier poll decisions
+   may finish. No worker-image
    prerequisite, worker-protocol change or activation flag is required.
 2. On persistent hosted and external workers, exercise Workers **Cordon** with
    an optional reason, then **Uncordon**, plus
