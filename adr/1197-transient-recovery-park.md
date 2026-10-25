@@ -456,7 +456,8 @@ with a finite **five-minute deadline window**. The original first-reservation
 episode deadline policy is replaced by the #2958 amendment below. Retries use the
 existing exponential delay capped at 16 times the base. Capture, publication and
 successor handoff preserve the reservation count. Reset of that count requires
-a trusted, successfully settled real model turn.
+a trusted, successfully settled real model turn. (The #3330 amendment below
+supersedes that sentence: an explicit owner Resume also renews the count.)
 
 A permanent blocker or exhaustion reports terminal `failed` with
 `keepCustody`; it neither auto-reclaims nor exposes failed-run Resume.
@@ -653,13 +654,17 @@ count, backoff and source attribution. No predecessor attempt id is interpreted
 as a claim fence. An unfenced legacy caller keeps the original deadline policy.
 Clock rollback and invalid clocks still refuse; three charged reservations still
 refuse a fourth even across fresh claims. Only trusted settled model processing
-clears the episode and its cumulative count.
+clears the episode and its cumulative count. (The last two statements are
+superseded by the #3330 amendment below: a fresh claim alone still cannot renew,
+but an explicit owner Resume can. Clock refusal is unchanged.)
 
 The entry reservation wrapper permits ownership verification and this authorized
 rebase before applying the persisted window. Failure classification uses the
 current claim's window, never a superseded deadline. Already-blocked records stay
 blocked with their original reason, including decoded-history exhaustion; neither
-a reclaim nor a deployment upgrade revives them. Source protection, custody,
+a reclaim nor a deployment upgrade revives them (superseded for
+`budget_exhausted` blockers only by the #3330 amendment below; every other
+blocker stays permanent). Source protection, custody,
 publication proof, closure verification limits and retry backoff are unchanged.
 No claim fence, timer renewal or successful local verification authorizes deletion
 or release of retained work.
@@ -744,3 +749,68 @@ ends is not covered. A park after exhausted retries does not carry the drained
 steer, as with the positively-empty path today. The Codex lane is out of scope.
 The evidence is a scripted executor reproduction; no real-provider occurrence has
 been observed. The ADR-1416 steering bridge is unchanged.
+
+## Amendment 2026-10-25, #3330: an owner Resume renews the retained-source budget
+
+Maintainer decision: **only** an explicit owner Resume of a run in
+`recovery_wait` with cause `worker_requeue_exhausted` renews the retained-source
+recovery budget. This supersedes three earlier statements: the #2512 amendment's
+"Reset of that count requires a trusted, successfully settled real model turn",
+the #2958 amendment's "three charged reservations still refuse a fourth even
+across fresh claims", and its "neither a reclaim nor a deployment upgrade revives
+them" (for `budget_exhausted` blockers only). A successful settled model turn
+still clears the completed episode, unchanged.
+
+Mechanism:
+
+- `runs.worker_recovery_episode` is incremented by exactly 1 only by
+  `ResumeWorkerRecoveryEpisode`, reached only from the owner Resume for
+  `worker_requeue_exhausted`. Every worker claim payload carries it as
+  `worker_recovery_episode`. The worker treats a non-safe-integer or negative
+  value as absent.
+- The retained source's durable `RecoveryProgress` journal gains an optional
+  `episode`, the episode of the last renewal. Absent reads as 0, a malformed
+  value is refused, and it is written only when above 0, so a never-resumed
+  journal is byte-identical to before.
+- `reserveRecoveryIteration` checks, in order: the stale fence, refusal of any
+  blocker other than `budget_exhausted`, the clock, then renewal. It renews iff
+  the claim's episode is above the stored episode **and** the claim is a new
+  generation (a new window). That applies to a partly used, exhausted or
+  `budget_exhausted`-blocked source. Renewal charges 1 of the 3 iterations,
+  opens a new five-minute window, restarts backoff from its base, clears the
+  blocker and stores the episode. The stored episode never decreases, one Resume
+  renews at most once, and the cap stays 3 iterations per episode, so a fourth
+  reservation is refused again.
+- Renewal still takes the new-window ownership proof, and each renewed iteration
+  re-proves quiescence before capture.
+
+Never renews: a new claim generation alone, server requeue or reclaim, the
+`data_volume_full` park retry, successor handoff, the memory-pressure Resume
+(`ResumeMemoryEpisode`), the model-free preservation producer of #3031 (it still
+never renews), any other blocker (`clock_invalid`, `decoded_history_limit`,
+`readiness_cleanup_unconfirmed`, `capture_failed`, `source_missing`, a corrupt
+journal), a same, older or missing episode, a same or missing claim generation
+(journal left unchanged), and clock rollback. A claim from an older api carries
+no episode and never renews.
+
+Clock-rollback boundary: a rollback on a record already blocked
+`budget_exhausted` leaves it byte-identical (not rewritten to `clock_invalid`),
+and a renewal on the same claim generation writes nothing. A rollback with a
+newer episode and a new generation on an unblocked record still persists
+`clock_invalid` as before, and that permanent blocker is never renewed by a later
+Resume.
+
+Known overlap: `fail()` records a failure after the deadline as
+`budget_exhausted`, so such a record becomes renewable. That is safe because each
+renewed iteration proves quiescence again.
+
+Rollout needs no capability flag: either deployment order works. An older api
+sends no episode, so nothing renews; an older worker ignores the claim field.
+Accepted race: a run resumed before its worker upgraded has a legacy journal
+(reads 0), so it gets one renewal on its next claim, still at most one per
+Resume. An episode that goes backwards (database restore, a down/up of migration
+00309) fails safe: nothing renews until it passes the stored value. Worker
+downgrade while recovery is pending stays unsupported: an older worker cannot
+parse the new journal field, treats the journal as corrupt and fails closed.
+
+Scope: the `data_volume_full` task-run symptom is not fixed here (#3329).

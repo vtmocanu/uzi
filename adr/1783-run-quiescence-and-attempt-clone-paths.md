@@ -885,7 +885,9 @@ durable source-bound budget of 3 total iterations (blocked and nonblocked
 together), with a five-minute deadline from the first reservation and the
 existing exponential retry cap of 16 times its base. Reservations survive
 crash, reclaim and successor handoff; reset requires a trusted, successfully
-settled real model turn. External restarts require a genuinely fenced
+settled real model turn, or an explicit owner Resume of a
+`worker_requeue_exhausted` hold renews it (up to 3 more iterations; see the
+[ADR-1197 #3330 amendment](1197-transient-recovery-park.md#amendment-2026-10-25-3330-an-owner-resume-renews-the-retained-source-budget)). External restarts require a genuinely fenced
 successor, not reuse of a discovered ready successor as execution authority.
 
 A permanent blocker or exhaustion ends `failed` with `keepCustody`, no

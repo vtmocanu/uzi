@@ -428,9 +428,16 @@ and process recreation within that claim preserve the window. A later verified
 claim renews only the deadline, retaining the cumulative count, source attribution
 and exponential retry cap of 16 times the base delay. A legacy episode without a
 claim fence binds once to a positively verified claim; its old claim identity is
-never inferred. Already-blocked episodes retain their original reason and never
-renew. Reset of the reservation count requires a trusted, successfully settled
-real model turn. Recovery adopts work on a fresh attempt path and model
+never inferred. Already-blocked episodes retain their original reason; only a
+`budget_exhausted` blocker can renew, and only as described below. A trusted, successfully settled real model turn resets the
+reservation count. So does an explicit owner Resume of a run held at
+`recovery_wait` with cause `worker_requeue_exhausted`: the next fresh claim
+(episode above the journal's stored one) charges 1 of 3, opens a new window and
+clears a `budget_exhausted` blocker, at most once per Resume and still capped at
+3 iterations. No server requeue, `data_volume_full` retry, memory-pressure
+Resume or new claim alone renews, and no other blocker is ever renewed (see the
+[ADR-1197 #3330 amendment](../adr/1197-transient-recovery-park.md#amendment-2026-10-25-3330-an-owner-resume-renews-the-retained-source-budget)).
+Recovery adopts work on a fresh attempt path and model
 session even on an unwired worker; ordinary unwired keys that never entered
 retained recovery keep same-path continuity.
 

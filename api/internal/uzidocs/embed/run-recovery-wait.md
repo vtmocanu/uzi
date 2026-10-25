@@ -175,11 +175,15 @@ deadline from the first reservation**. Reservation happens before work and
 survives crash, reclaim and successor handoff. Retry delays use the existing
 exponential backoff capped at 16 times its base. Capture, publication,
 adoption or reclaim does not reset the budget; a trusted, successfully
-settled real model turn does.
+settled real model turn does, and so does an owner Resume of a
+`worker_requeue_exhausted` hold (see
+[Worker recovery exhausted](#worker-recovery-exhausted)). Nothing else renews it.
 
 A permanent blocker or exhausted budget ends the run **failed**, keeping
 local work and custody. It does not park for automatic reclaim or offer
-Resume. Actual quiescence failure uses `worker_residue_blocked`; a missing
+Resume on the failed run. Only an exhausted-budget (`budget_exhausted`) blocker
+is ever renewable, and only by the owner Resume above; every other permanent
+blocker stays permanent. Actual quiescence failure uses `worker_residue_blocked`; a missing
 source, invalid recovery clock, preservation or adoption failure, missing
 needed prerequisites, or an oversized fallback is not a quiescence failure.
 Transient capture, forge or disk failures consume the same reserved budget.
@@ -569,6 +573,13 @@ survives on the worker.
    baseline, not a reset monotonic physical-death counter. The existing wall budget
    survives; held time is banked only if its clock already started, and old
    approval/input waits are banked at park. Cancel uses the usual confirmation.
+
+Each owner Resume also renews an exhausted or partly used retained-source
+recovery budget (up to 3 more iterations, at most once per Resume), on the
+run's next fresh claim; nothing else does. A server requeue, the
+`data_volume_full` park retry, the memory-pressure Resume and a new claim alone
+never renew it. See [Bounded retained-source recovery](#bounded-retained-source-recovery)
+and the [ADR-1197 #3330 amendment](../adr/1197-transient-recovery-park.md#amendment-2026-10-25-3330-an-owner-resume-renews-the-retained-source-budget).
 
 Historical evidence persists until owner Resume or Cancel. Capture expiry
 neither fails nor promotes the hold; there is no automatic reclassification
