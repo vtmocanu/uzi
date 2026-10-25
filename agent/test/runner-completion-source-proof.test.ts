@@ -1,11 +1,12 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import type { CompletionSource, RecoveryCoordinator } from "../src/recovery.js";
+import type { CompletionSource, RecoveryCoordinator, RecoveryRecord } from "../src/recovery.js";
 import type { Executor } from "../src/executor.js";
 import type { CodexExecutionSafety } from "../src/harness.js";
 import { mintAttemptId } from "../src/run-quiescence.js";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import path from "node:path";
 import { codexRig, FakeCodexExecutor, commitInTree } from "./runner-codex-sinks-fixture.js";
 import { fx, git, client, gitlabClaim, fakeGitlab, installHarness, runnerWith } from "./runner-harness.js";
@@ -21,6 +22,9 @@ interface Flight {
 }
 interface PrivateRunner {
   recovery: RecoveryCoordinator;
+  completionSourceBindings: Map<string, readonly unknown[]>;
+  completionSourceBinds: Set<unknown>;
+  conflictedCompletionSources: Set<unknown>;
   buildFlight(...args: unknown[]): Flight;
   terminalSource(flight: Flight, executor: Executor, safety: CodexExecutionSafety): unknown;
   rememberCompletionSource(source: CompletionSource, flight: Flight, executor: Executor, terminal: unknown): unknown;
@@ -210,3 +214,103 @@ it("M3 private legacy positive: known Claude source retains legacy cleanup", { s
   }), "passed");
   assert.equal(actions, 1);
 });
+
+// Lifecycle controls: the authenticated coordinator and runner callback are real;
+// the physical Git cleanup is stubbed, so these cases do not attest process proof.
+for (const outcome of ["success", "partial-retry", "pending-bind"] as const) {
+  it(`fallback binding lifecycle: ${outcome}`, async t => {
+    const f = await setup();
+    const group = f.claim.run_id + ":29";
+    assert.ok(await f.p.recovery.pin({ runId: f.claim.run_id, generation: 29, kind: "issue",
+      branch: f.source.context.branch, sourceSha: f.source.expectedHead, inventoryGuarded: true }));
+    await f.p.bindCompletionSource(f.flight);
+    assert.ok(f.p.completionSourceBindings.get(group)?.length, "real runner binder installed provenance");
+    const frozen = await f.p.recovery.freezeInventory({ context: f.source.context,
+      currentSha: f.source.expectedHead, originalSourceSha: f.source.expectedHead,
+      defaultBranch: "main", locallyQuiescent: true });
+    assert.ok(frozen?.coverageDigest);
+    const writer = f.p.recovery as unknown as { writeRecordUnlocked(record: RecoveryRecord): Promise<void> };
+    // Represent an authenticated archive FINAL accepted without a publication receipt.
+    await writer.writeRecordUnlocked({ ...frozen, serverCaptureId: "fallback-archive",
+      finalAcknowledged: true, finalRequest: { disposition: { kind: "archive",
+        capture_id: "fallback-archive", source_sha: frozen.sourceSha, coverage_digest: frozen.coverageDigest } } });
+    const records = await f.p.recovery.inspect(f.claim.run_id);
+    assert.equal(records.length, 2);
+    assert.ok(records.every(r => !r.completionReceipt), "this is the archive/FINAL path");
+    const ackFile = path.join(git.recoveryRoot, f.claim.run_id, frozen.captureId + ".json");
+    assert.ok(fs.existsSync(ackFile));
+
+    const original = f.remember();
+    const advanced = f.remember({ ...f.source, expectedHead: "b".repeat(40) });
+    const replacement = new FakeCodexExecutor(f.rig.safety, async ctx => ({ branch: ctx.branch }));
+    const conflicting = f.remember(f.source, replacement);
+    const otherSource = { ...f.source, attemptId: mintAttemptId(29), clonePath: f.source.clonePath + "-other" };
+    const other = f.remember(otherSource);
+    for (const binding of [original, advanced, conflicting])
+      assert.equal(f.p.conflictedCompletionSources.has(binding), true, "fixture carries real identity conflicts");
+    const siblingGeneration = { ...f.source, context: { ...f.source.context, generation: 30 } };
+    const siblingRun = { ...f.source, context: { ...f.source.context, runId: "33333333-3333-4333-8333-333333333333" } };
+    f.remember(siblingGeneration);
+    f.remember(siblingRun);
+    const siblingGroups = [...f.p.completionSourceBindings].filter(([key]) => key !== group);
+
+    const cleanup = t.mock.method(git, "cleanupRecoveryGeneration", async () => "removed" as const);
+    const unlink = fsp.unlink.bind(fsp);
+    const refusal = outcome === "partial-retry" ? t.mock.method(fsp, "unlink", async (target: Parameters<typeof fsp.unlink>[0]) => {
+      if (String(target) === ackFile) throw new Error("deliberate fallback ACK unlink failure");
+      return unlink(target);
+    }) : undefined;
+    let releaseBind: (() => void) | undefined;
+    let pending: Promise<void> | undefined;
+    if (outcome === "pending-bind") {
+      let entered!: () => void;
+      const started = new Promise<void>(resolve => { entered = resolve; });
+      const held = new Promise<void>(resolve => { releaseBind = resolve; });
+      t.mock.method(f.p.recovery, "bindCompletionSource", async () => {
+        entered();
+        await held;
+        return true;
+      });
+      pending = f.p.bindCompletionSource(f.flight);
+      await started;
+      assert.equal(f.p.completionSourceBinds.has(original), true, "real binder is held before its durable write");
+    }
+    try {
+      if (refusal) {
+        await assert.rejects(f.p.recovery.forgetGeneration(f.claim.run_id, 29), /deliberate fallback ACK unlink failure/);
+        assert.equal(f.p.classifyCompletionSource(f.source).kind, "knownCodex");
+        assert.equal(f.p.completionSourceBindings.get(group)?.length, 4, "partial failure retains the full group");
+        assert.ok(fs.existsSync(ackFile));
+        for (const binding of [original, advanced, conflicting])
+          assert.equal(f.p.conflictedCompletionSources.has(binding), true);
+        refusal.mock.restore();
+      }
+      await f.p.recovery.forgetGeneration(f.claim.run_id, 29);
+      assert.equal(cleanup.mock.callCount(), refusal ? 2 : 1);
+      assert.deepEqual(await f.p.recovery.inspect(f.claim.run_id), []);
+      assert.equal(fs.existsSync(ackFile), false);
+      if (pending) {
+        const retained = f.p.completionSourceBindings.get(group)!;
+        assert.equal(retained.length, 3);
+        for (const binding of [original, advanced, conflicting]) {
+          assert.equal(retained.includes(binding), true);
+          assert.equal(f.p.conflictedCompletionSources.has(binding), true);
+        }
+        assert.equal(retained.includes(other), false, "another identity in the same generation is released");
+        assert.equal(f.p.classifyCompletionSource(f.source).kind, "knownCodex");
+        const inventory = t.mock.method(git, "readInventoryCloneHeads", async () => assert.fail("pending provenance used legacy inventory"));
+        assert.equal(await f.p.withCompletionSourceBoundary(f.source, async () => assert.fail("pending bind deleted")), "retained");
+        assert.equal(inventory.mock.callCount(), 0);
+      } else {
+        assert.equal(f.p.completionSourceBindings.has(group), false, "full cleanup, including retry, drops the flight/executor group");
+        for (const binding of [original, advanced, conflicting, other])
+          assert.equal(f.p.conflictedCompletionSources.has(binding), false);
+      }
+      for (const [key, bindings] of siblingGroups)
+        assert.equal(f.p.completionSourceBindings.get(key), bindings, "sibling run/generation remains unchanged");
+    } finally {
+      releaseBind?.();
+      await pending;
+    }
+  });
+}

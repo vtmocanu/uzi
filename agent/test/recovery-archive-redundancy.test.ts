@@ -304,7 +304,8 @@ async function bounded<T>(work: Promise<T>, event: string): Promise<T> {
 }
 
 async function harness(opts: { features?: string[]; redundancyTimer?: (fire: () => void, ms: number) => () => void;
-  onCompletionSourceForgotten?: () => void } = {}) {
+  onCompletionSourceForgotten?: () => void;
+  onCompletionGenerationForgotten?: (runId: string, generation: number) => void } = {}) {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), "redundancy-"));
   await fsp.chmod(root, 0o700);
   const runId = "22222222-2222-4222-8222-222222222222";
@@ -316,6 +317,8 @@ async function harness(opts: { features?: string[]; redundancyTimer?: (fire: () 
     releaseError: undefined as Error | undefined,
     cleanup: "removed" as "removed" | "retained",
     cleanupCalls: 0,
+    pendingReport: false,
+    executing: false,
     claimResult: "ok" as "ok" | "none" | "throw" | "hang",
     claimReads: [] as Array<Record<string, unknown>>,
     claimStarted: undefined as (() => void) | undefined,
@@ -407,6 +410,9 @@ async function harness(opts: { features?: string[]; redundancyTimer?: (fire: () 
     recoveryRoot: path.join(root, "journal"), workerToken: TOKEN, log: nullLogger(), client: client as never, git: git as never,
     withCompletionSourceBoundary: async (_s, action) => { await action(() => true); return "passed"; },
     onCompletionSourceForgotten: opts.onCompletionSourceForgotten,
+    onCompletionGenerationForgotten: opts.onCompletionGenerationForgotten,
+    pendingGenerationReport: () => state.pendingReport,
+    isExecuting: () => state.executing,
     ...(opts.redundancyTimer === undefined ? {} : { testHooks: { redundancyTimer: opts.redundancyTimer } }),
   });
   const coordinator = make();
@@ -756,3 +762,52 @@ describe("RecoveryCoordinator redundancy claims", () => {
     });
   });
 });
+
+for (const outcome of ["success", "retained", "pending-report", "closed", "partial-unlink"] as const) {
+  it(`fallback generation notification: ${outcome} and successful retry`, async t => {
+    const notifications: Array<[string, number]> = [];
+    let files: string[] = [];
+    const h = await harness({ onCompletionGenerationForgotten: (runId, generation) => {
+      assert.ok(files.length > 0);
+      for (const file of files) assert.equal(fs.existsSync(file), false, "notify only after every bundle/journal, ACK included, is gone");
+      notifications.push([runId, generation]);
+    } });
+    try {
+      const rec = await h.uploaded(true);
+      const records = await h.coordinator.inspect(h.runId);
+      assert.ok(records.every(r => !r.completionReceipt));
+      const dir = path.join(h.root, "journal", h.runId);
+      files = records.flatMap(r => [path.join(dir, r.captureId + ".json"), path.join(dir, r.captureId + ".bundle")]);
+      const ackFile = path.join(dir, rec.archive.captureId + ".json");
+      assert.ok(fs.existsSync(ackFile));
+      if (outcome === "retained") h.state.cleanup = "retained";
+      if (outcome === "pending-report") h.state.pendingReport = true;
+      if (outcome === "closed") h.state.executing = true;
+      const unlink = fsp.unlink.bind(fsp);
+      const refusal = outcome === "partial-unlink" ? t.mock.method(fsp, "unlink", async (target: Parameters<typeof fsp.unlink>[0]) => {
+        if (String(target) === ackFile) throw new Error("deliberate fallback unlink refusal");
+        return unlink(target);
+      }) : undefined;
+      if (refusal) {
+        await assert.rejects(h.coordinator.forgetGeneration(h.runId, 7), /deliberate fallback unlink refusal/);
+      } else {
+        await h.coordinator.forgetGeneration(h.runId, 7);
+      }
+      if (outcome !== "success") {
+        assert.deepEqual(notifications, [], "incomplete cleanup retains process-local provenance");
+        assert.ok(fs.existsSync(ackFile), "covering ACK survives the incomplete pass");
+        refusal?.mock.restore();
+        h.state.cleanup = "removed";
+        h.state.pendingReport = false;
+        h.state.executing = false;
+        await h.coordinator.forgetGeneration(h.runId, 7);
+      }
+      assert.deepEqual(notifications, [[h.runId, 7]]);
+      assert.deepEqual(await h.coordinator.inspect(h.runId), []);
+      assert.ok(h.state.proveCalls.length > 0, "redundancy claims are still submitted after notification");
+      assert.equal(h.state.proveCalls.at(-1)!.lockFree, true);
+      await h.coordinator.forgetGeneration(h.runId, 7);
+      assert.deepEqual(notifications, [[h.runId, 7]], "empty/legacy retry does not notify");
+    } finally { await h.close(); }
+  });
+}
