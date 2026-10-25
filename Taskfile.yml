@@ -2830,6 +2830,7 @@ tasks:
     desc: Docker-free worker UID report checker and shell wrapper regressions
     cmds:
       - python3 e2e/worker-uid/check_test.py
+      - python3 -B e2e/worker-uid/pod_epoch_proof_test.py
       - python3 e2e/worker-uid/run_test.py
       - python3 e2e/worker-uid/gate_test.py
       - python3 -B e2e/worker-uid/calibration_check_test.py
