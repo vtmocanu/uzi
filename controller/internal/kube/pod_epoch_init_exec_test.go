@@ -224,7 +224,7 @@ func TestPodEpochInitExecCompleteKubeletRootPredicate(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer func() {
-				if err := os.Chmod(h.data, 0o700); err != nil {
+				if err := os.Chmod(h.data, 0o700); err != nil { //nolint:gosec // G302: private test directory needs owner search permission for cleanup.
 					t.Error(err)
 				}
 			}()

@@ -11,7 +11,7 @@ import (
 )
 
 func TestPodEpochSeedScriptMatchesGolden(t *testing.T) {
-	const path = "testdata/pod-epoch-seed.sh"
+	const path = "testdata/pod-epoch-seed.golden"
 	got := dockerNixSeedScript()
 	if os.Getenv("UPDATE_GOLDEN") == "1" {
 		if err := os.WriteFile(path, []byte(got), 0o600); err != nil {

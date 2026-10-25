@@ -125,7 +125,7 @@ if(s.ino!==${initialRoot.ino}||s.uid!==${initialRoot.uid}||s.gid!==${initialRoot
     },
     initScript(seed: boolean) {
       const golden = fs.readFileSync(new URL(seed
-        ? "../../controller/internal/kube/testdata/pod-epoch-seed.sh"
+        ? "../../controller/internal/kube/testdata/pod-epoch-seed.golden"
         : "../../controller/internal/kube/testdata/runner-shared-init.sh", import.meta.url), "utf8");
       const source = path.join(root, "seed-source"), target = path.join(root, "seed-target");
       for (const d of [source, target]) if (!fs.existsSync(d)) fs.mkdirSync(d);
