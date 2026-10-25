@@ -1663,7 +1663,8 @@ func TestDindMeterSidecarIsAnUnprivilegedReadOnlyStatfsSampler(t *testing.T) {
 				`'v1 %s %s\n'`,
 				"> /run/uzi-dind-meter/statfs.tmp",
 				"mv -f /run/uzi-dind-meter/statfs.tmp /run/uzi-dind-meter/statfs",
-				"sleep 30",
+				"trap 'exit 0' TERM",
+				"sleep 30 & wait $!",
 			} {
 				if !strings.Contains(script, want) {
 					t.Errorf("dind-meter script is missing %q:\n%s", want, script)
@@ -1684,7 +1685,9 @@ func TestDindMeterSidecarIsAnUnprivilegedReadOnlyStatfsSampler(t *testing.T) {
 // The meter script runs for real under /bin/sh against a scratch dir (the only part of the
 // sidecar a unit test can execute): one loop iteration writes exactly one v1 line of six
 // integers, and a stat failure writes nothing and keeps looping. The paths are rewritten to
-// scratch dirs and `sleep` is replaced so the loop ends after the sampled iteration.
+// scratch dirs and the interruptible wait (`sleep 30 & wait $!`) is replaced by `exit 0` so
+// the loop ends after the sampled iteration (replacing only `sleep 30` would leave
+// `exit 0 &`, a background subshell, and the loop would never end).
 func TestDindMeterScriptWritesOneV1LineAtomically(t *testing.T) {
 	const sh = "/bin/sh"
 	if _, err := os.Stat(sh); err != nil {
@@ -1700,7 +1703,7 @@ func TestDindMeterScriptWritesOneV1LineAtomically(t *testing.T) {
 		script := strings.NewReplacer(
 			dindMeterDataDir, dataDir,
 			dindMeterDir, outDir,
-			"sleep 30", "exit 0",
+			"sleep 30 & wait $!", "exit 0",
 		).Replace(dindMeterScript())
 		cmd := exec.Command(sh, "-c", script) //nolint:gosec // G204: runs the renderer's own meter script with test-controlled temp paths, not user input
 		var stdout, stderr strings.Builder
