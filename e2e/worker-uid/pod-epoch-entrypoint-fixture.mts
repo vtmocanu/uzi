@@ -5,6 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline";
+import { commandWrapper } from "./pod-epoch-command-wrapper.mjs";
 
 const entrypoint = fs.readFileSync(new URL("../../agent/templates/entrypoint.sh", import.meta.url), "utf8");
 const helperSource = fs.readFileSync(new URL("../../agent/templates/pod-epoch-init.cjs", import.meta.url), "utf8");
@@ -72,14 +73,7 @@ if(s.ino!==${initialRoot.ino}||s.uid!==${initialRoot.uid}||s.gid!==${initialRoot
   for (const [symbol, binary] of [["CHOWN", "/bin/chown"], ["CHMOD", "/bin/chmod"],
     ["MKDIR", "/bin/mkdir"], ["RM", "/bin/rm"]] as const) {
     const wrapper = path.join(root, symbol.toLowerCase());
-    fs.writeFileSync(wrapper, `#!/bin/sh
-/usr/local/bin/node -e '${checkRoot}'
-printf '%s\\n' "${symbol} $*" >> '${log}'
-rc=0
-${binary} "$@" || rc=$?
-/usr/local/bin/node -e '${checkRoot}'
-exit "$rc"
-`, { mode: 0o755 });
+    fs.writeFileSync(wrapper, commandWrapper({ binary, symbol, check: checkRoot, log }), { mode: 0o755 });
     script = script.replace(symbol + "=" + binary, symbol + "=" + wrapper);
   }
   const file = path.join(root, "entrypoint.sh");

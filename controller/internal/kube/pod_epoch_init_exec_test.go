@@ -57,6 +57,7 @@ elif command == "prepare":
     event("prepare")
     s = os.stat(lock)
     print(str(s.st_dev) + ":" + str(s.st_ino))
+    if os.environ.get("EPOCH_FIXTURE_REMOVE_ON_PREPARE") == "1": os.unlink(lock)
 elif command == "hold":
     event("SH-wait")
     fd = int(sys.argv[4])
@@ -144,7 +145,7 @@ func (h *epochInitHost) command(seed bool, uid string) (*exec.Cmd, context.Cance
 		h.t.Skip("root runner-init requires image worker/runner accounts; covered by the worker-uid image lane")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-	cmd := exec.CommandContext(ctx, "/bin/bash", "-c", h.script(seed))
+	cmd := exec.CommandContext(ctx, "/bin/bash", "-c", h.script(seed)) //nolint:gosec // G204: fixed rendered script and test-owned fixture paths, not user input.
 	cmd.Env = append(os.Environ(), "UZI_EPOCH_LOCK=1", "UZI_POD_UID="+uid)
 	return cmd, cancel
 }
@@ -181,6 +182,29 @@ func (h *epochInitHost) posture() {
 	}
 }
 
+func TestPodEpochInitExecMissingAfterPrepareNeverCreatesState(t *testing.T) {
+	for _, seed := range []bool{true, false} {
+		t.Run(fmt.Sprintf("seed=%v", seed), func(t *testing.T) {
+			h := newEpochInitHost(t)
+			h.posture()
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer cancel()
+			// Failure precedes UID-specific writes, including on a root host.
+			cmd := exec.CommandContext(ctx, "/bin/bash", "-c", h.script(seed)) //nolint:gosec // G204: only fixed rendered source and test-owned paths.
+			cmd.Env = append(os.Environ(), "UZI_EPOCH_LOCK=1", "UZI_POD_UID=pod-race", "EPOCH_FIXTURE_REMOVE_ON_PREPARE=1")
+			if out, err := cmd.CombinedOutput(); err == nil {
+				t.Fatalf("raced open succeeded: %s", out)
+			}
+			if _, err := os.Lstat(filepath.Join(h.data, ".uzi-epoch.lock")); !os.IsNotExist(err) {
+				t.Fatalf("shell created a replacement before SH: %v", err)
+			}
+			if strings.Contains(h.events(), "SH-acquired") || strings.Contains(h.events(), "body-SH") {
+				t.Fatal("protected initialization continued after raced open")
+			}
+		})
+	}
+}
+
 func TestPodEpochInitExecColdAndWarmSeedRecordBeforeShared(t *testing.T) {
 	h := newEpochInitHost(t)
 	h.posture()
@@ -213,7 +237,7 @@ func TestPodEpochInitExecBusyRecordSkipsButProtectedInitWaits(t *testing.T) {
 			h.posture()
 			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 			defer cancel()
-			blocker := exec.CommandContext(ctx, h.python, h.helper, "block", h.data)
+			blocker := exec.CommandContext(ctx, h.python, h.helper, "block", h.data) //nolint:gosec // G204: interpreter from LookPath, literal helper and paths owned by this test.
 			if err := blocker.Start(); err != nil {
 				t.Fatal(err)
 			}
@@ -264,7 +288,7 @@ func TestPodEpochInitExecBusyRecordSkipsButProtectedInitWaits(t *testing.T) {
 			}
 			h.awaitEvent("SH-acquired")
 			// An independent nonblocking EX succeeds after shell exit: FD9 was released.
-			probe := exec.CommandContext(ctx, h.python, "-c", "import fcntl,sys; f=open(sys.argv[1]); fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)", filepath.Join(h.data, ".uzi-epoch.lock"))
+			probe := exec.CommandContext(ctx, h.python, "-c", "import fcntl,sys; f=open(sys.argv[1]); fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)", filepath.Join(h.data, ".uzi-epoch.lock")) //nolint:gosec // G204: fixed Python source and a test-owned path.
 			if out, err := probe.CombinedOutput(); err != nil {
 				t.Fatalf("FD9 leaked: %v %s", err, out)
 			}

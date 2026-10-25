@@ -268,7 +268,7 @@ NIX_HAD_FSGROUP=
 if [ "${UZI_EPOCH_LOCK-}" = 1 ]; then
   epoch_identity=$("$NODE" "$EPOCH_HELPER" prepare "$DATA_DIR")
   if [ "$epoch_identity" != unsupported ]; then
-    exec 9<>"$DATA_DIR/.uzi-epoch.lock"
+    exec 9<"$DATA_DIR/.uzi-epoch.lock"
   fi
   "$NODE" "$EPOCH_HELPER" hold "$DATA_DIR" "$epoch_identity" 9
 fi

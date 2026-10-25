@@ -47,7 +47,13 @@ printf 'arg=%s\\n' "$@"
   fs.writeFileSync(helper, `
 const fs = require('node:fs');
 fs.appendFileSync(process.env.OPLOG, process.argv[2] + '\\n');
-if (process.argv[2] === 'prepare') console.log('1:1');
+if (process.argv[2] === 'prepare') {
+  console.log('1:1');
+  if (process.env.REMOVE_EPOCH_ON_PREPARE) {
+    fs.unlinkSync(process.argv[3] + '/.uzi-epoch.lock');
+    if (process.env.DANGLING_EPOCH_ON_PREPARE) fs.symlinkSync('missing-epoch-target', process.argv[3] + '/.uzi-epoch.lock');
+  }
+}
 if (process.argv[2] === 'hold') {
   fs.fstatSync(9);
   if (process.env.FAIL_HOLD) process.exit(7);
@@ -88,6 +94,17 @@ if (process.argv[2] === 'hold') {
 }
 
 describe("pod epoch entrypoint", () => {
+  for (const dangling of [false, true]) it("never creates state when prepared epoch disappears" + (dangling ? " behind a dangling symlink" : ""), () => {
+    const f = fixture(true);
+    try {
+      const result = f.run({ REMOVE_EPOCH_ON_PREPARE: "1", ...(dangling ? { DANGLING_EPOCH_ON_PREPARE: "1" } : {}) });
+      assert.notEqual(result.status, 0, "read-only open must refuse the raced pathname");
+      assert.equal(fs.existsSync(path.join(f.data, ".uzi-epoch.lock")), false, "no replacement inode created before SH");
+      assert.equal(fs.existsSync(path.join(f.data, "missing-epoch-target")), false, "no dangling-symlink target created before SH");
+      assert.equal(fs.readFileSync(f.log, "utf8"), "prepare\n", "no hold or protected operation after failed read-only open");
+    } finally { f.close(); }
+  });
+
   it("confines single-uid bootstrap and closes inherited FD9 before tini", () => {
     const f = fixture();
     try {

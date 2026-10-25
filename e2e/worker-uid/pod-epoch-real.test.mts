@@ -312,6 +312,7 @@ test("pod epoch real entrypoint fences protected initialization under EX and con
     assert.ok(protectedSnapshot(f.root) === gapBefore, "real npm/tsx/static imports make no protected writes in reacquisition gap");
     holder.close(); holder = undefined;
     const operations = fs.readFileSync(sandbox.log, "utf8");
+    assert.ok(!operations.includes("POSTURE_VIOLATION"), "root posture holds after every initializer operation, even if later restored");
     for (const target of ["runner", "repos", ".uzi-epoch-consumed", "jobs", "token"]) {
       assert.ok(operations.split("\n").some(line => line.startsWith("CHOWN ") && line.includes(f.root + "/" + target)),
         "positive protected mutation after release: " + target);

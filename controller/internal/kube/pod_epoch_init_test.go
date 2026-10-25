@@ -91,7 +91,7 @@ func TestPodEpochInitRender(t *testing.T) {
 func TestPodEpochInitUsesVolumeRootAndClosesDescriptor(t *testing.T) {
 	for name, script := range map[string]string{"seed": dockerNixSeedScript(), "runner": runnerInitScript()} {
 		for _, want := range []string{
-			"prepare /data-seed", "exec 9<>/data-seed/.uzi-epoch.lock",
+			"prepare /data-seed", "exec 9</data-seed/.uzi-epoch.lock",
 			"hold /data-seed \"$identity\" 9", "exec 9>&-",
 		} {
 			if !strings.Contains(script, want) {

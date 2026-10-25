@@ -881,7 +881,7 @@ func podEpochSharedInit() string {
 	return `if [ "${UZI_EPOCH_LOCK:-}" = 1 ]; then
   identity="$(/usr/local/bin/node /usr/local/lib/uzi/pod-epoch-init.cjs prepare /data-seed)"
   if [ "$identity" != unsupported ]; then
-    exec 9<>/data-seed/.uzi-epoch.lock
+    exec 9</data-seed/.uzi-epoch.lock
     /usr/local/bin/node /usr/local/lib/uzi/pod-epoch-init.cjs hold /data-seed "$identity" 9
     trap 'exec 9>&-' EXIT
   fi
