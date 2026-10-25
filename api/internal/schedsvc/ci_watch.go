@@ -118,12 +118,13 @@ func ciClassify(r forge.WorkflowRun) ciClass {
 
 // ciKey is one watched workflow's newest completed default-branch execution.
 type ciKey struct {
-	key   string
-	run   forge.WorkflowRun
-	obs   workersvc.CIObservation
-	class ciClass
-	ep    store.CiWatchEpisode
-	hasEp bool
+	key    string
+	recent []forge.WorkflowRun
+	run    forge.WorkflowRun
+	obs    workersvc.CIObservation
+	class  ciClass
+	ep     store.CiWatchEpisode
+	hasEp  bool
 }
 
 // parseCIWorkflows reads the schedule's selector list: NULL (or null) means every workflow.
@@ -332,6 +333,7 @@ func ciTargetFor(base workersvc.CIWatchTarget, k *ciKey) workersvc.CIWatchTarget
 // (so an older execution completing late never outranks a newer one).
 func ciNewestPerKey(forgeType, branch string, runs []forge.WorkflowRun) []*ciKey {
 	best := map[string]*ciKey{}
+	recent := map[string]map[int64]forge.WorkflowRun{}
 	for _, r := range runs {
 		if ciIgnoredEvent(r.Event) || !ciCompleted(r) || r.WorkflowKey == "" {
 			continue
@@ -340,6 +342,15 @@ func ciNewestPerKey(forgeType, branch string, runs []forge.WorkflowRun) []*ciKey
 			continue
 		}
 		obs := workersvc.CIObservation{RunID: r.ID, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt}
+		if recent[r.WorkflowKey] == nil {
+			recent[r.WorkflowKey] = map[int64]forge.WorkflowRun{}
+		}
+		old, exists := recent[r.WorkflowKey][r.ID]
+		if !exists || workersvc.CIObservationNewer(forgeType, obs, workersvc.CIObservation{
+			RunID: old.ID, CreatedAt: old.CreatedAt, UpdatedAt: old.UpdatedAt,
+		}) {
+			recent[r.WorkflowKey][r.ID] = r
+		}
 		if cur, ok := best[r.WorkflowKey]; ok && !workersvc.CIObservationNewer(forgeType, obs, cur.obs) {
 			continue
 		}
@@ -347,6 +358,18 @@ func ciNewestPerKey(forgeType, branch string, runs []forge.WorkflowRun) []*ciKey
 	}
 	keys := make([]*ciKey, 0, len(best))
 	for _, k := range best {
+		for _, r := range recent[k.key] {
+			k.recent = append(k.recent, r)
+		}
+		sort.Slice(k.recent, func(i, j int) bool {
+			a, b := k.recent[i], k.recent[j]
+			return workersvc.CIObservationOrder(forgeType,
+				workersvc.CIObservation{RunID: a.ID, CreatedAt: a.CreatedAt},
+				workersvc.CIObservation{RunID: b.ID, CreatedAt: b.CreatedAt}) > 0
+		})
+		if len(k.recent) > 10 {
+			k.recent = k.recent[:10]
+		}
 		keys = append(keys, k)
 	}
 	sort.Slice(keys, func(i, j int) bool { return keys[i].key < keys[j].key })
@@ -478,7 +501,7 @@ func (e *Scheduler) ciStartOne(ctx context.Context, sched store.RunSchedule, rep
 			reserve = required + 10 // separating newline and the fixed artifact fence
 		}
 		desc, tooLarge := composeCIRepairDescription(body, guidanceOf(sched), ciEvidence{
-			Workflow: k.run.Name, URL: k.run.WebURL, SHA: k.run.SHA, Jobs: snap.FailedJobs,
+			Workflow: k.run.Name, URL: k.run.WebURL, SHA: k.run.SHA, Jobs: snap.FailedJobs, Recent: k.recent,
 		}, cfg.MaxJobs, reserve)
 		if tooLarge {
 			res.skips = append(res.skips, ciSkip(k, SkipDescriptionTooLarge))

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -226,7 +227,7 @@ func TestCIWatchGreenStartsNothing(t *testing.T) {
 // Acceptance example 2: one red workflow starts exactly one guarded repair run whose
 // description holds the catalog instruction and a fenced evidence block.
 func TestCIWatchRedStartsOneRun(t *testing.T) {
-	h := newCIHarness(t, ciRed("1", 100, 0))
+	h := newCIHarness(t, ciRed("1", 100, 0), ciGreenRun("1", 99, -1))
 	s := h.schedule()
 	out := h.fire(t, s)
 	if len(out.Started) != 1 || len(out.Skips) != 0 {
@@ -236,6 +237,32 @@ func TestCIWatchRedStartsOneRun(t *testing.T) {
 		t.Fatalf("repair creates = %d, want 1", len(h.runs.ciRepairs))
 	}
 	p := h.runs.ciRepairs[0]
+	expected := workersvc.FailureSnapshot{
+		PipelineID: 100, Ref: "main", SHA: "sha1", WebURL: "https://forge.example/runs/100",
+		FailedJobs: []workersvc.SnapshotJob{{Name: "e2e", Stage: "test",
+			WebURL: "https://forge.example/jobs", LogTail: "--- FAIL: TestNightly\nboom"}},
+	}
+	if p.Episode.Signature != workersvc.FailureSignature(expected) {
+		t.Fatalf("signature = %q, want original snapshot signature", p.Episode.Signature)
+	}
+	if !strings.Contains(p.Description, "#99 | SHA: sha1 | conclusion: success | created: 2026-10-01T11:59:00Z") {
+		t.Fatal("older listing execution did not reach production description")
+	}
+	if !reflect.DeepEqual(h.cf.jobCalls, []int64{100}) || len(h.cf.listOpts) != 1 ||
+		h.cf.listOpts[0] != (forge.ListWorkflowRunsOptions{Branch: "main", Limit: 100}) {
+		t.Fatalf("unexpected history reads: listing=%+v jobs=%v", h.cf.listOpts, h.cf.jobCalls)
+	}
+	older := ciRun("1", 98, -2, "cancelled", "")
+	older.SHA = "changed-older-sha"
+	h2 := newCIHarness(t, ciRed("1", 100, 0), older)
+	h2.fire(t, h2.schedule())
+	if len(h2.runs.ciRepairs) != 1 || h2.runs.ciRepairs[0].Episode.Signature != p.Episode.Signature ||
+		!strings.Contains(h2.runs.ciRepairs[0].Description, "#98 | SHA: changed-older-sha | conclusion: cancelled") {
+		t.Fatal("older history change altered signature or failed to reach description")
+	}
+	if !reflect.DeepEqual(h2.cf.jobCalls, []int64{100}) || len(h2.cf.listOpts) != 1 || len(h2.cf.getCalls) != len(h.cf.getCalls) {
+		t.Fatal("changed older history added forge requests")
+	}
 	if p.AutoApprove {
 		t.Fatal("the catalog default must reach the run with auto-approve off")
 	}
@@ -726,4 +753,161 @@ func TestCIWatchHandledExecutionWhileRunActive(t *testing.T) {
 	wantOnlySkip(t, h.fire(t, h.schedule()), SkipAlreadyRunning)
 	h.st.activeSchedule = false
 	wantOnlySkip(t, h.fire(t, h.schedule()), SkipCIAlreadyHandled)
+}
+
+func TestCINewestPerKeyRecentSelection(t *testing.T) {
+	runs := []forge.WorkflowRun{
+		ciRed("a", 1, 0), ciGreenRun("a", 2, 1), ciRun("a", 3, 2, "cancelled", ""),
+		ciRun("a", 4, 3, "skipped", ""), ciRun("a", 5, 4, "neutral", ""),
+		ciRun("a", 6, 5, "stale", ""), ciRun("a", 7, 6, "failed", ""),
+		ciRun("a", 8, 7, "success", ""), ciRun("a", 9, 8, "completed", "timed_out"),
+		ciRun("a", 10, 9, "completed", "action_required"), ciRed("a", 11, 10),
+		ciGreenRun("a", 12, 10), // equal-created tie is resolved by ID
+		ciRed("b", 50, 50),
+	}
+	runs[2].Branch = "" // accepted from branch-filtered listing
+	oldRevision := runs[10]
+	oldRevision.SHA = "old-revision"
+	newRevision := oldRevision
+	newRevision.SHA, newRevision.Conclusion = "new-revision", "success"
+	newRevision.UpdatedAt = newRevision.UpdatedAt.Add(time.Hour)
+	runs[10] = oldRevision
+	runs = append(runs, newRevision, oldRevision) // later array position must not win
+	for _, ev := range []string{"pull_request", "pull_request_target", "pull_request_review", "merge_request_event", "external_pull_request_event", "workflow_run"} {
+		r := ciRed("a", 200, 200)
+		r.Event = ev
+		runs = append(runs, r)
+	}
+	for _, status := range []string{"queued", "in_progress", "running", "pending", "waiting"} {
+		runs = append(runs, ciRun("a", 201, 201, status, ""))
+	}
+	otherBranch := ciRed("a", 202, 202)
+	otherBranch.Branch = "feature"
+	runs = append(runs, otherBranch, ciRed("", 203, 203))
+	before := append([]forge.WorkflowRun(nil), runs...)
+	for _, provider := range []string{"github", "gitlab", "forgejo"} {
+		t.Run(provider, func(t *testing.T) {
+			for _, reverse := range []bool{false, true} {
+				input := append([]forge.WorkflowRun(nil), runs...)
+				if reverse {
+					for i, j := 0, len(input)-1; i < j; i, j = i+1, j-1 {
+						input[i], input[j] = input[j], input[i]
+					}
+				}
+				inputBefore := append([]forge.WorkflowRun(nil), input...)
+				keys := ciNewestPerKey(provider, "main", input)
+				if !reflect.DeepEqual(input, inputBefore) {
+					t.Fatal("input listing mutated")
+				}
+				if len(keys) != 2 || keys[0].key != "a" || keys[1].key != "b" ||
+					keys[0].run.ID != 12 || keys[0].class != ciClassGreen || keys[1].run.ID != 50 {
+					t.Fatalf("newest selection changed: %+v", keys)
+				}
+				var ids []int64
+				for _, r := range keys[0].recent {
+					ids = append(ids, r.ID)
+				}
+				if !reflect.DeepEqual(ids, []int64{12, 11, 10, 9, 8, 7, 6, 5, 4, 3}) {
+					t.Fatalf("recent execution order = %v", ids)
+				}
+				if keys[0].recent[1].SHA != "new-revision" || keys[0].recent[1].Conclusion != "success" ||
+					len(keys[1].recent) != 1 || keys[1].recent[0].ID != 50 {
+					t.Fatalf("revision/key mixing: %+v", keys[0].recent)
+				}
+			}
+		})
+	}
+	if !reflect.DeepEqual(runs, before) {
+		t.Fatal("input listing mutated")
+	}
+}
+
+func TestCINewestPerKeyRecentProviderOrderingAndNewestRevision(t *testing.T) {
+	runs := []forge.WorkflowRun{ciRed("a", 90, 0), ciRed("a", 2, 10), ciGreenRun("a", 3, 10)}
+	newRevision := runs[2]
+	newRevision.UpdatedAt = newRevision.UpdatedAt.Add(time.Hour)
+	newRevision.SHA, newRevision.Conclusion = "newest-revision", "failure"
+	runs = append(runs, newRevision, runs[2])
+	for _, tc := range []struct {
+		provider string
+		ids      []int64
+		newest   int64
+		sha      string
+	}{
+		{"github", []int64{3, 2, 90}, 3, "newest-revision"},
+		{"gitlab", []int64{3, 2, 90}, 3, "newest-revision"},
+		{"forgejo", []int64{90, 3, 2}, 90, "shaa"},
+	} {
+		t.Run(tc.provider, func(t *testing.T) {
+			keys := ciNewestPerKey(tc.provider, "main", runs)
+			var ids []int64
+			for _, r := range keys[0].recent {
+				ids = append(ids, r.ID)
+			}
+			if !reflect.DeepEqual(ids, tc.ids) || keys[0].run.ID != tc.newest ||
+				keys[0].run.SHA != tc.sha || keys[0].class != ciClassRed {
+				t.Fatalf("history=%v newest=%+v", ids, keys[0].run)
+			}
+		})
+	}
+}
+
+func TestCIWatchHistoryListingFailureNeverWrites(t *testing.T) {
+	for _, err := range []error{errors.New("503"), forge.ErrCIReadBudget, forge.ErrForgeVersionUnsupported} {
+		h := newCIHarness(t, ciRed("a", 100, 0), ciGreenRun("a", 99, -1))
+		h.cf.listErr = err
+		_, gotErr := h.sched.fireOne(context.Background(), h.schedule())
+		if err.Error() == "503" && gotErr == nil {
+			t.Fatal("ordinary listing failure must remain transient")
+		}
+		if len(h.cf.listOpts) != 1 || len(h.cf.jobCalls) != 0 || len(h.cf.getCalls) != 0 ||
+			len(h.runs.ciRepairs) != 0 || len(h.runs.ciTransitions) != 0 || len(h.st.ciEpisodeLookup) != 0 {
+			t.Fatalf("listing failure read/wrote history state: jobs=%v repairs=%d transitions=%d", h.cf.jobCalls, len(h.runs.ciRepairs), len(h.runs.ciTransitions))
+		}
+	}
+}
+
+func TestCIWatchHistoryReductionKeepsOriginalSignature(t *testing.T) {
+	h := newCIHarness(t, ciRed("a", 100, 0), ciGreenRun("a", 99, -1))
+	s := h.schedule()
+	s.Origin = "custom"
+	s.Prompt = pgtype.Text{String: "Base.", Valid: true}
+	if out := h.fire(t, s); len(out.Started) != 1 {
+		t.Fatal("initial repair did not start")
+	}
+	initial := h.runs.ciRepairs[0]
+	// Leave exactly enough space for the fixed evidence header, job omission and
+	// history omission. The trusted prefix must survive byte-for-byte.
+	_, initialEvidence := fencedBlock(t, initial.Description)
+	metadata := initialEvidence[:strings.Index(initialEvidence, "\n--- job:")]
+	minimal := metadata + "\n[… 1 more failed jobs omitted]\n\nRecent executions\n" +
+		"partial history: this listing could omit older executions.\n" +
+		"[… 2 recent executions omitted from presentation]\n"
+	// The delimiter remains three backticks once all untrusted rows/tails are gone.
+	prefixSize := len(initial.Description) - len(initialEvidence) - 8
+	promptSize := len("Base.") + workersvc.MaxIssueDescriptionBytes - (prefixSize + len(minimal) + 8)
+	s.Prompt.String = strings.Repeat("b", promptSize)
+	h2 := newCIHarness(t, ciRed("a", 100, 0), ciRun("a", 98, -2, "cancelled", ""))
+	if out := h2.fire(t, s); len(out.Started) != 1 {
+		t.Fatal("minimal reduced repair did not start")
+	}
+	reduced := h2.runs.ciRepairs[0]
+	_, content := fencedBlock(t, reduced.Description)
+	if content != minimal || !strings.HasPrefix(reduced.Description, s.Prompt.String) {
+		t.Fatalf("unexpected reduced evidence: %q", content)
+	}
+	expected := workersvc.FailureSnapshot{
+		PipelineID: 100, Ref: "main", SHA: "shaa", WebURL: "https://forge.example/runs/100",
+		FailedJobs: []workersvc.SnapshotJob{{Name: "e2e", Stage: "test", WebURL: "https://forge.example/jobs",
+			LogTail: "--- FAIL: TestNightly\nboom"}},
+	}
+	if reduced.Episode.Signature != workersvc.FailureSignature(expected) ||
+		reduced.Episode.Signature != initial.Episode.Signature {
+		t.Fatal("forced history/job presentation reduction changed original snapshot signature")
+	}
+	if len(reduced.Description) != workersvc.MaxIssueDescriptionBytes ||
+		!reflect.DeepEqual(h2.cf.jobCalls, []int64{100}) || len(h2.cf.listOpts) != 1 ||
+		len(h2.cf.getCalls) != len(h.cf.getCalls) {
+		t.Fatal("forced reduction changed request budget or failed exact description bound")
+	}
 }
