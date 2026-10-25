@@ -333,6 +333,11 @@ export class CrossCheckRunner {
       if (timer) clearTimeout(timer);
       timer = undefined;
       await finishTelemetry();
+      if (reason === "malformed") {
+        this.log.warn("cross-check verdict malformed", { run_id: runId, stage: code ? "code" : "plan",
+          subreason: err instanceof CrossCheckMalformedError ? err.subreason ?? "unknown" : "unknown",
+        });
+      }
       if (err instanceof CrossCheckConfinementError || reason === "confinement_failed") {
         // The Claude token has already left the secret registry. Do not log errMessage(err).
         this.log.warn("cross-check confinement refused", { run_id: runId, stage: code ? "code" : "plan",

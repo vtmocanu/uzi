@@ -125,7 +125,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import { Outbox } from "../src/outbox.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, recordingLogger } from "./helpers.js";
 
 await fs.mkdir(path.resolve(import.meta.dirname, "../../.uzi/scratch"), { recursive: true });
 
@@ -351,6 +351,7 @@ for (const mode of ["stale-running", "stale-verdict", "malformed", "delivery", "
   let removals = 0;
   const cancel = new AbortController();
   const c = { ...claim(), claim_generation: 7 };
+  const recorded = recordingLogger();
   const client = {
    reportState: async (_id: string, body: any) => {
     states.push(body.status);
@@ -378,7 +379,7 @@ for (const mode of ["stale-running", "stale-verdict", "malformed", "delivery", "
    removeRunnerClone: async () => { removals++; },
   } as unknown as GitCache;
   try {
-   await new CrossCheckRunner(client, git, nullLogger(), { homeRoot: root, pollMs: 1,
+   await new CrossCheckRunner(client, git, recorded.logger, { homeRoot: root, pollMs: 1,
     modelTimeoutMs: mode === "timeout" ? 5 : 1000,
     model: { run: async (_claim, _checkout, _home, signal) => {
      modelCalls++;
@@ -394,6 +395,9 @@ for (const mode of ["stale-running", "stale-verdict", "malformed", "delivery", "
      return mode === "malformed" ? "prefix " + verdict : verdict;
     } },
    }).execute(c, cancel.signal);
+   if (mode === "timeout" || mode === "timeout-probe") {
+    assert.ok(!JSON.stringify(recorded.lines).includes("cross-check verdict malformed"));
+   }
    if (mode === "stale-running") {
     assert.deepEqual(states, ["running"]);
     assert.equal(modelCalls, 0);
@@ -421,6 +425,75 @@ for (const mode of ["stale-running", "stale-verdict", "malformed", "delivery", "
    }
   } finally { await fs.rm(root, { recursive: true, force: true }); }
  });
+}
+
+for (const stage of ["plan", "code"] as const) {
+ for (const mode of ["typed explicit", "typed unannotated", "plain JSON error", "returned invalid JSON"] as const) {
+  it("malformed diagnostic runner " + stage + " " + mode, async () => {
+   const root = await fs.mkdtemp(path.join(path.resolve(import.meta.dirname, "../../.uzi/scratch"), "malformed-diagnostic-"));
+   const recorded = recordingLogger();
+   const sentinel = "SENTINEL-malformed-provider-output-3432";
+   const states: Record<string, unknown>[] = [];
+   const decisions: unknown[] = [];
+   const messages: unknown[] = [];
+   const c = { ...claim(), claim_generation: 7 };
+   if (stage === "code") c.cross_check = {
+    ...c.cross_check!, stage: "code", round: 1, head_commit: "b".repeat(40),
+    candidate_digest: "c".repeat(64), code_context: { task: "Inspect committed code" }, guidance_snapshot: "",
+   };
+   let modelCalls = 0;
+   let diffReads = 0;
+   let removals = 0;
+   const client = {
+    reportState: async (_id: string, body: Record<string, unknown>) => { states.push(body); return { applied: true }; },
+    getInputs: async () => ({ inputs: [] }),
+    postMessages: async (_id: string, batch: unknown[]) => { messages.push(...batch); },
+    reportCrossCheckVerdict: async (_id: string, _generation: number, body: unknown) => {
+     assert.equal(stage, "plan"); decisions.push(body);
+    },
+    reportCodeCrossCheckVerdict: async (_id: string, _generation: number, body: unknown) => {
+     assert.equal(stage, "code"); decisions.push(body);
+    },
+    getCodeSnapshotCleanup: async () => ({ row_present: false }),
+   } as unknown as WorkerClient;
+   const git = {
+    ensureClone: async () => { assert.equal(stage, "plan"); return "/bare"; },
+    existingBarePathFor: async () => "/bare",
+    runnerCloneAtCommit: async () => "/checkout",
+    readBare: async () => { diffReads++; return { text: "committed patch", truncated: false }; },
+    removeRunnerClone: async () => { removals++; },
+   } as unknown as GitCache;
+   try {
+    await new CrossCheckRunner(client, git, recorded.logger, { homeRoot: root, pollMs: 1, modelTimeoutMs: 1000,
+     model: { run: async (_claim, _checkout, _home, _signal, _usage, cleanupConfirmed) => {
+      modelCalls++;
+      if (stage === "code") { assert.equal(typeof cleanupConfirmed, "function"); cleanupConfirmed!(); }
+      if (mode === "typed explicit") throw new CrossCheckMalformedError(sentinel, "finding_schema");
+      if (mode === "typed unannotated") throw new CrossCheckMalformedError(sentinel);
+      if (mode === "plain JSON error") throw new Error("JSON " + sentinel);
+      return "{invalid JSON " + sentinel;
+     } },
+    }).execute(c);
+    assert.equal(modelCalls, 1);
+    assert.equal(diffReads, stage === "code" ? 1 : 0);
+    assert.equal(removals, 1);
+    assert.deepEqual(states, [
+     { status: "running", claim_generation: 7 },
+     { status: "failed", failure_reason: "The cross-check did not complete.", claim_generation: 7 },
+    ]);
+    assert.deepEqual(decisions, [stage === "plan"
+     ? { verdict: "failed", reason_class: "malformed", summary: "The cross-check did not complete.", items: [] }
+     : { outcome: "failed", reason_class: "malformed", findings: [] }]);
+    assert.equal(JSON.stringify({ logs: recorded.lines, messages, decisions, states }).includes(sentinel), false);
+    const warnings = recorded.lines.filter((line) => (line as { level?: string }).level === "warn");
+    assert.deepEqual(warnings, [{
+     level: "warn", msg: "cross-check verdict malformed", run_id: "check", stage,
+     subreason: mode === "typed explicit" ? "finding_schema"
+      : mode === "returned invalid JSON" && stage === "code" ? "code_findings" : "unknown",
+    }]);
+   } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
+ }
 }
 
 it("exact-commit clone stays on immutable base after default and tracking refs advance", async () => {

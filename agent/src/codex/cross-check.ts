@@ -21,7 +21,13 @@ import { CodexUsageAccountant } from "./token-accounting.js";
 import { launchCodexRoot, launchCodexEffectRoot, CODEX_BIN, SUPERVISOR_BIN, PROVIDER_CHILD_ARGV, type CodexRootHandle } from "./launcher.js";
 import { prepareCodexRunHome, buildAppServerRefreshBridge } from "./codex-executor.js";
 
-export class CrossCheckMalformedError extends Error {}
+type CrossCheckMalformedSubreason = "invalid_json" | "verdict_schema" | "finding_schema" | "findings_cap" | "code_findings" | "result_cap" | "unknown";
+
+export class CrossCheckMalformedError extends Error {
+ constructor(message: string, readonly subreason?: CrossCheckMalformedSubreason) {
+  super(message);
+ }
+}
 
 const SANDBOX = "/usr/local/bin/uzi-codex-command-sandbox";
 const FILEOP = "/usr/local/bin/uzi-codex-fileop";
@@ -101,7 +107,7 @@ export function validateCodeFindings(text: string): ReturnType<typeof decodeCode
   const findings = object(value);
   if (!findings || Object.keys(findings).join(",") !== "findings") throw new Error("invalid code findings object");
   return decodeCodeFindings(findings.findings);
- } catch { throw new CrossCheckMalformedError("invalid code checker findings"); }
+ } catch { throw new CrossCheckMalformedError("invalid code checker findings", "code_findings"); }
 }
 
 // No mutable Set is handed to the broker, renderer or caller.
@@ -497,7 +503,7 @@ function hasOutput(usage: CodexThreadTokenUsage): boolean {
 // absent here. The server repeats its validation before storing a verdict.
 export function validateVerdict(text: string): void {
  let value: unknown;
- try { value = JSON.parse(text); } catch { throw new CrossCheckMalformedError("cross-check invalid verdict JSON"); }
+ try { value = JSON.parse(text); } catch { throw new CrossCheckMalformedError("cross-check invalid verdict JSON", "invalid_json"); }
  const verdict = object(value);
  const validKeys = (record: Record<string, unknown>, keys: string[]): boolean =>
   Object.keys(record).length === keys.length && keys.every((key) => Object.hasOwn(record, key));
@@ -505,7 +511,7 @@ export function validateVerdict(text: string): void {
   || typeof verdict.verdict !== "string" || !["approve", "revise", "block"].includes(verdict.verdict)
   || typeof verdict.summary !== "string" || Buffer.byteLength(verdict.summary) > 4096
   || !Array.isArray(verdict.items) || verdict.items.length > 20) {
-  throw new CrossCheckMalformedError("cross-check invalid verdict schema");
+  throw new CrossCheckMalformedError("cross-check invalid verdict schema", "verdict_schema");
  }
  let bytes = 0;
  for (const raw of verdict.items) {
@@ -513,11 +519,11 @@ export function validateVerdict(text: string): void {
   if (!item || !validKeys(item, ["file", "severity", "summary", "rationale"])
    || typeof item.severity !== "string" || !["info", "warning", "error"].includes(item.severity)
    || !["file", "summary", "rationale"].every((key) => typeof item[key] === "string")) {
-   throw new CrossCheckMalformedError("cross-check invalid finding schema");
+   throw new CrossCheckMalformedError("cross-check invalid finding schema", "finding_schema");
   }
   const size = Buffer.byteLength(JSON.stringify(item));
   bytes += size;
-  if (size > 2048 || bytes > 32 * 1024) throw new CrossCheckMalformedError("cross-check findings exceed cap");
+  if (size > 2048 || bytes > 32 * 1024) throw new CrossCheckMalformedError("cross-check findings exceed cap", "findings_cap");
  }
 }
 
