@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import type { ProcessQuiescence } from "./run-quiescence.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
 import type { ExclusionRefusal, MaintenanceExclusion, MaintenanceWriterExclusion } from "./maintenance-exclusion.js";
 import { MaintenanceResources as M1MaintenanceResources, RecoveryMaintenance, type MaintenanceAdmission } from "./recovery-maintenance.js";
@@ -397,10 +398,82 @@ const INVENTORY_SOURCE_CHECKS = [
   "source_identity_changed", "physical_sources_without_boundary",
 ] as const;
 type InventorySourceCheck = typeof INVENTORY_SOURCE_CHECKS[number];
+type ProcessSourceCheck = "process_not_quiescent_before_git" | "process_not_quiescent_after_git";
+const INVENTORY_PROCESS_CODES = [
+  "status_unreadable", "status_unparsable", "unreadable_unattributed", "unreadable_no_other_claim",
+  "own_attempt", "live_attempt_conflict", "terminal_attempt", "unmarked_in_scope",
+  "unattributed_in_scope", "exclusive_idle_identity_unreadable", "exclusive_idle_status_unreadable",
+  "exclusive_idle_status_unparsable", "exclusive_idle_writer_present",
+] as const;
+interface InventoryProcessSummary {
+  quiescence_state: "survivors" | "unverified" | "missing";
+  quiescence_process_counts: Record<string, number>;
+  killed: number;
+  other_claim_in_flight?: boolean;
+}
+function missingInventoryProcessSummary(otherClaimInFlight?: boolean): InventoryProcessSummary {
+  return { quiescence_state: "missing", quiescence_process_counts: {}, killed: 0,
+    ...(typeof otherClaimInFlight === "boolean" ? { other_claim_in_flight: otherClaimInFlight } : {}) };
+}
+
+/** Diagnostic projection only: no process identity or free text crosses this seam. */
+export function inventoryProcessDiagnostic(
+  check: ProcessSourceCheck, process: ProcessQuiescence | undefined, otherClaimInFlight: boolean,
+): InventorySourceDiagnostic {
+  let summary = missingInventoryProcessSummary(otherClaimInFlight);
+  try {
+    if (process) {
+      const counts: Record<string, number> = {};
+      let admitted = 0;
+      for (const entry of process.processes) {
+        const reason: unknown = entry.reason;
+        const known = typeof reason === "string" && INVENTORY_PROCESS_CODES.some(code => code === reason);
+        const key = known && (Object.hasOwn(counts, reason) || admitted < 8) ? reason : "other";
+        if (key !== "other" && !Object.hasOwn(counts, key)) admitted++;
+        counts[key] = (counts[key] ?? 0) + 1;
+      }
+      if (process.state === "survivors" || process.state === "unverified")
+        summary = { quiescence_state: process.state, quiescence_process_counts: counts,
+          killed: process.killed.length, other_claim_in_flight: otherClaimInFlight };
+    }
+  } catch { /* Summary failure must preserve the original refusal and request boolean. */ }
+  return { check, summary };
+}
+
+/** Revalidate callback data independently; malformed summaries carry no process evidence. */
+function projectInventoryProcessSummary(diagnostic: { summary?: unknown }): InventoryProcessSummary {
+  let otherClaimInFlight: boolean | undefined;
+  try {
+    const summary = diagnostic.summary as InventoryProcessSummary | undefined;
+    if (!summary) return missingInventoryProcessSummary();
+    const requestBoolean = summary.other_claim_in_flight;
+    if (typeof requestBoolean === "boolean") otherClaimInFlight = requestBoolean;
+    const state = summary.quiescence_state;
+    const killed = summary.killed;
+    const rawCounts = summary.quiescence_process_counts;
+    if (!["survivors", "unverified", "missing"].includes(state) ||
+        (requestBoolean !== undefined && typeof requestBoolean !== "boolean") ||
+        !Number.isSafeInteger(killed) || killed < 0 ||
+        !rawCounts || typeof rawCounts !== "object" || Array.isArray(rawCounts))
+      return missingInventoryProcessSummary(otherClaimInFlight);
+    const counts: Record<string, number> = {};
+    let admitted = 0;
+    for (const [key, count] of Object.entries(rawCounts)) {
+      if ((key !== "other" && !INVENTORY_PROCESS_CODES.some(code => code === key)) ||
+          !Number.isSafeInteger(count) || count < 0)
+        return missingInventoryProcessSummary(otherClaimInFlight);
+      if (key !== "other" && ++admitted > 8) return missingInventoryProcessSummary(otherClaimInFlight);
+      if (count > 0) counts[key] = count;
+    }
+    return { quiescence_state: state, quiescence_process_counts: counts, killed,
+      ...(otherClaimInFlight === undefined ? {} : { other_claim_in_flight: otherClaimInFlight }) };
+  } catch { return missingInventoryProcessSummary(otherClaimInFlight); }
+}
 type InventoryReadCause = typeof INVENTORY_READ_CAUSES[number];
 export type InventorySourceDiagnostic =
   | { check: "inventory_read_not_verified"; cause: InventoryReadCause }
-  | { check: Exclude<InventorySourceCheck, "inventory_read_not_verified"> };
+  | { check: ProcessSourceCheck; summary?: InventoryProcessSummary }
+  | { check: Exclude<InventorySourceCheck, "inventory_read_not_verified" | ProcessSourceCheck> };
 export interface InventorySourceBoundaryContext {
   runId: string;
   generation: number;
@@ -1501,15 +1574,21 @@ export class RecoveryCoordinator {
           ...(captureId ? { capture_id: captureId } : {}),
           source_boundary_reason: first?.check ?? "inventory_source_not_quiescent",
           ...(first?.check === "inventory_read_not_verified" ? { inventory_read_cause: first.cause } : {}),
+          ...(first?.check === "process_not_quiescent_before_git" || first?.check === "process_not_quiescent_after_git"
+            ? first.summary : {}),
         });
       } catch { MaintenanceBudget.current()?.check(); /* Logging cannot affect custody. */ }
     };
     return {
       context: { ...context, reportDiagnostic: (diagnostic: InventorySourceDiagnostic) => {
-        if (first || !INVENTORY_SOURCE_CHECKS.includes(diagnostic.check)) return;
-        first = diagnostic.check === "inventory_read_not_verified"
-          ? { check: diagnostic.check, cause: inventoryReadCause(diagnostic) }
-          : { check: diagnostic.check };
+        if (first) return;
+        const check = diagnostic.check;
+        if (!INVENTORY_SOURCE_CHECKS.includes(check)) return;
+        // Latch the validated check before any optional summary accessor can fail.
+        first = check === "inventory_read_not_verified"
+          ? { check, cause: inventoryReadCause(diagnostic) } : { check };
+        if (check === "process_not_quiescent_before_git" || check === "process_not_quiescent_after_git")
+          first = { check, summary: projectInventoryProcessSummary(diagnostic as { summary?: unknown }) };
         logRetention();
       } },
       reason: () => inventorySourceReason(first),

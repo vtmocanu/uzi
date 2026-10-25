@@ -112,7 +112,7 @@ import type {
 import { resolveAgentSelection, RUN_KINDS } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { deriveCloneKey, resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
-import { RecoveryCoordinator, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, type ClosedSourceObservation, type InventorySourceBoundaryContext, type CompletionSource, type RecoveryRecord, type RecoveryCoordinatorOptions } from "./recovery.js";
+import { RecoveryCoordinator, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, inventoryProcessDiagnostic, type ClosedSourceObservation, type InventorySourceBoundaryContext, type CompletionSource, type RecoveryRecord, type RecoveryCoordinatorOptions } from "./recovery.js";
 import { classifyRecoveryOrigin } from "./recovery-origin.js";
 import {
   PUSHED_HEAD_UNRECORDED,
@@ -3300,12 +3300,12 @@ export class RunRunner {
           if (process.platform !== "linux") return refuse({ check: "non_linux_host" });
           if (this.liveAttempts.isLivePath(clone.clonePath)) return refuse({ check: "live_attempt_path" });
           const before = await this.quiesceImpl(request);
-          if (before.process?.state !== "quiescent") return refuse({ check: "process_not_quiescent_before_git" });
+          if (before.process?.state !== "quiescent") return refuse(inventoryProcessDiagnostic("process_not_quiescent_before_git", before.process, request.otherClaimInFlight));
           const status = await this.git.worktreeStatus(clone.clonePath);
           const after = await this.quiesceImpl({ ...request, dockerHost: undefined, site: "inventory_source:after_runner_git" });
           if (status === null) return refuse({ check: "worktree_status_unreadable" });
           if (status.length !== 0) return refuse({ check: "worktree_status_dirty" });
-          if (after.process?.state !== "quiescent") return refuse({ check: "process_not_quiescent_after_git" });
+          if (after.process?.state !== "quiescent") return refuse(inventoryProcessDiagnostic("process_not_quiescent_after_git", after.process, request.otherClaimInFlight));
         }
         const afterGit = await this.git.readInventoryCloneHeads(barePath, runId);
         if (afterGit.kind !== "verified")

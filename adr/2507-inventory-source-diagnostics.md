@@ -35,6 +35,41 @@ Only the two existing retention writes encode the reason:
 
 A callback-free boundary still requires positive discovery of an empty clones array. Missing, unknown, malformed and physical-source inventories retain custody. Diagnostics add no runner release guards.
 
+## Amendment 2026-10-25 — bounded process summaries (#3467)
+
+Only `process_not_quiescent_before_git` and `process_not_quiescent_after_git`
+add `quiescence_state` (survivors, unverified or missing),
+`quiescence_process_counts`, `killed` (array length only), and the exact
+request boolean `other_claim_in_flight`. Missing process evidence produces
+missing, an empty counts object and zero killed. Legacy check-only callbacks
+produce those defaults with the boolean absent.
+
+The producer admits these exact reason codes: status_unreadable,
+status_unparsable, unreadable_unattributed, unreadable_no_other_claim,
+own_attempt, live_attempt_conflict, terminal_attempt, unmarked_in_scope,
+unattributed_in_scope, exclusive_idle_identity_unreadable,
+exclusive_idle_status_unreadable, exclusive_idle_status_unparsable and
+exclusive_idle_writer_present. At most eight distinct known keys are admitted;
+further distinct keys fold into `other`. Admitted repeats continue counting
+after saturation; folded repeats continue counting in `other`. Unknown,
+non-string and composed reasons (including kill-unconfirmed suffixes) fold
+into `other` without coercion. Zero buckets are omitted.
+
+The coordinator independently projects the safe state enum, actual boolean,
+finite nonnegative safe-integer counts and killed length, and at most eight
+allowlisted keys plus `other`. Extra fields are discarded. Malformed or
+unreadable summaries fall back to missing/empty/zero, preserving a separately
+read valid boolean when available. The validated check is latched before summary
+access. Producer summary failures preserve the original check and request boolean;
+reporter and logger failures retain their existing first-report isolation.
+
+No detail, PID, comm, cwd, argv or environment is read for the summary or logged.
+This diagnostic projection adds no scan or quiescence request and changes no
+proof order, refusal decision, FINAL, custody, retry or authenticated journal
+reason. Connected hermetic tests stub only the existing quiesceRun seam and
+assert exact inventory/quiescence/status traces; they do not measure procfs
+directory scans or claim live worker acceptance.
+
 ## Retry and compatibility
 
 The exact live retry set retains `capture_error`, `restart_upload_failed`, `upload_transient`, `credential_rejected` and `inventory_source_not_quiescent`, and adds every non-read check encoding and all six read-cause encodings above. Both the legacy unsuffixed reason and the check-only `inventory_source_not_quiescent:inventory_read_not_verified` remain accepted. Matching uses complete strings; unknown checks, causes and extra suffixes confer neither needs-action eligibility nor transient backoff. Uploaded records keep their existing eligibility even with an unknown reason.

@@ -127,7 +127,9 @@ for (const failure of ["process", "dirty", "unreadable"] as const) {
       runId: "run-1", generation: 7, barePath: "/fixture/repo.git", reportDiagnostic: d => diagnostics.push(d),
     }, async () => assert.fail("release")), "retained");
     assert.deepEqual(diagnostics, [{ check: failure === "process" ? "process_not_quiescent_before_git" :
-      failure === "dirty" ? "worktree_status_dirty" : "worktree_status_unreadable" }]);
+      failure === "dirty" ? "worktree_status_dirty" : "worktree_status_unreadable",
+      ...(failure === "process" ? { summary: { quiescence_state: "unverified", quiescence_process_counts: {},
+        killed: 0, other_claim_in_flight: false } } : {}) }]);
     assert.deepEqual(visited, ["/fixture/first:inventory_source", "/fixture/first:status",
       "/fixture/first:inventory_source:after_runner_git", "/fixture/second:inventory_source",
       ...(failure === "process" ? [] : ["/fixture/second:status", "/fixture/second:inventory_source:after_runner_git"])]);
