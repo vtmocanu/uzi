@@ -1,6 +1,6 @@
 # PRD #3430: Pod-epoch lock and shadow reclaim verdicts on Docker-wired workers
 
-**Status**: Draft (architecture and lead/buddy reviewed; contract corrections approved 2026-10-25; implementation not started). PRD A of two for #3329's disposal with the writer-exclusion proof PRD #1860 M0 recommended (`prds/1860-pod-epoch-writer-exclusion.md`). This PRD deletes **nothing**: it ships the epoch lock, the controller handoff and a shadow verdict. PRD B (#3431) adds deletion once this PRD's shadow acceptance passes. **Blocked by** #3421 (`dind-meter` SIGTERM). The CRI-O source audit is committed beside it in `prds/3430-pod-epoch-crio-audit.md`.
+**Status**: Draft (architecture and lead/buddy reviewed; contract corrections approved 2026-10-25; implementation in progress, M1 image proof pending). PRD A of two for #3329's disposal with the writer-exclusion proof PRD #1860 M0 recommended (`prds/1860-pod-epoch-writer-exclusion.md`). This PRD deletes **nothing**: it ships the epoch lock, the controller handoff and a shadow verdict. PRD B (#3431) adds deletion once this PRD's shadow acceptance passes. **Blocked by** #3421 (`dind-meter` SIGTERM). The CRI-O source audit is committed beside it in `prds/3430-pod-epoch-crio-audit.md`.
 
 ## Problem
 
