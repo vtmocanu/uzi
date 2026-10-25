@@ -421,14 +421,14 @@ func (q *Queries) MaintenanceSnapshotNow(ctx context.Context) (pgtype.Timestampt
 }
 
 const runAdmittableForEphemeralProvision = `-- name: RunAdmittableForEphemeralProvision :one
-SELECT (NOT fn_instance_intake_paused() OR fn_run_admitted_during_intake_pause(r))::boolean AS admittable
+SELECT (NOT (SELECT fn_instance_intake_paused()) OR fn_run_admitted_during_intake_pause(r))::boolean AS admittable
 FROM runs r
 WHERE r.id = $1
 `
 
 // PRD #3454: the ephemeral provisioner's per-candidate recheck, run inside provisionOne's
 // transaction right after the advisory lock. Plain snapshot read: NO row lock (a FOR UPDATE /
-// FOR SHARE here deadlocks against the lease path, see workersvc/ephemeral_lease.go). false means
+// FOR SHARE here could deadlock against the lease path, see the 40P01 note in workersvc/ephemeral_lease.go). false means
 // the pause is on and the run is not admitted; no row means the run is gone.
 func (q *Queries) RunAdmittableForEphemeralProvision(ctx context.Context, runID uuid.UUID) (bool, error) {
 	row := q.db.QueryRow(ctx, runAdmittableForEphemeralProvision, runID)

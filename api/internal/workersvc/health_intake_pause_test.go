@@ -49,8 +49,9 @@ func TestHealthIntakePauseNotHeldKeepsWorkerReason(t *testing.T) {
 	}
 }
 
-// After the lift the run starts a new episode: health_since restamped, nudge-eligible again.
-func TestHealthLeftMaintenanceRestampsAndNudges(t *testing.T) {
+// After the lift health_since is restamped but the run does not nudge on that tick (no Slack DM
+// burst for the whole backlog); a later ok->flagged episode nudges normally.
+func TestHealthLeftMaintenanceRestampsWithoutNudge(t *testing.T) {
 	r := runRow("queued")
 	r.StatusSince = ago(40 * time.Minute)
 	r.Health = healthWaitingWorker
@@ -72,7 +73,7 @@ func TestHealthLeftMaintenanceRestampsAndNudges(t *testing.T) {
 	if !w.HealthSince.Valid || !w.HealthSince.Time.Equal(t0) {
 		t.Fatalf("health_since = %v, want restamped to now %v (the pause must not count as stuck time)", w.HealthSince, t0)
 	}
-	if len(b.healthNudges) != 1 || !b.healthNudges[0] || !w.HealthNotifiedAt.Valid {
-		t.Fatalf("nudge = %v notifiedAt = %v, want a nudge after leaving maintenance", b.healthNudges, w.HealthNotifiedAt)
+	if len(b.healthNudges) != 1 || b.healthNudges[0] || w.HealthNotifiedAt.Valid {
+		t.Fatalf("nudge = %v notifiedAt = %v, want NO nudge on the lift tick", b.healthNudges, w.HealthNotifiedAt)
 	}
 }

@@ -460,11 +460,12 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		// nudge (its flag was already waiting_worker) and would carry the hold in its "stuck for".
 		leftPin := target != healthOK && r.Health == healthWaitingWorker && r.HealthReason.Valid &&
 			isStaleRequeuePinReason(r.HealthReason.String) && !isStaleRequeuePinReason(reason)
-		// PRD #3454: a run leaving the maintenance hold starts a new episode too, so its "stuck for"
-		// excludes the pause and a run still stuck after the lift can nudge.
+		// PRD #3454: a run leaving the maintenance hold has health_since restamped so its "stuck for"
+		// excludes the pause, but it is NOT nudge-eligible on that tick: the whole backlog leaves the
+		// hold at once, and nudging here would burst a Slack DM per run right after the lift. A later
+		// ok->flagged episode nudges normally.
 		leftMaintenance := target != healthOK && r.Health == healthWaitingWorker && r.HealthReason.Valid &&
 			r.HealthReason.String == reasonMaintenance && reason != reasonMaintenance
-		leftPin = leftPin || leftMaintenance
 		nudge := target != healthOK && (r.Health == healthOK || leftPin) &&
 			(cooldown == 0 || !r.HealthNotifiedAt.Valid || now.Sub(r.HealthNotifiedAt.Time) >= cooldown)
 		// PRD #1349 M6 (D10): SUPPRESS the per-run Slack nudge for the custody-limit reason. The
@@ -516,7 +517,7 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 			nudge = false
 		}
 		since := healthSince(now, target, r)
-		if leftPin {
+		if leftPin || leftMaintenance {
 			since = pgconv.Time(now)
 		}
 		notifiedAt := pgtype.Timestamptz{}
@@ -1162,17 +1163,17 @@ type healthEligibilityResult struct {
 }
 
 func (s *Service) queuedReasonWithEligibility(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds, early bool, projection *healthEligibilityResult) string {
+	// PRD #3454: the instance intake pause outranks every rung, the handoff one included, since the
+	// pause is the reason ClaimRun matches nothing.
+	if r.IntakePauseHeld {
+		return reasonMaintenance
+	}
 	// PRD #400 Decision 6 / issue #1367: an undispatched task run (its uzi/task/<id> branch
 	// push or dispatch never landed) is NOT waiting for a worker — ClaimRun never offers it
 	// (kind<>'task' OR dispatched_at IS NOT NULL), so none of the fleet reasons below is the
 	// real cause. Report the honest saga-setup reason; the sweeper (SweepTaskNeverDispatched)
 	// expires it to 'failed' with a terminal failure_reason after DispatchGrace. A dispatched
 	// queued task (DispatchedAt.Valid) falls through to the normal rungs.
-	// PRD #3454: the instance intake pause outranks every rung, the handoff one included, since the
-	// pause is the reason ClaimRun matches nothing.
-	if r.IntakePauseHeld {
-		return reasonMaintenance
-	}
 	if r.Kind == "task" && !r.DispatchedAt.Valid {
 		return reasonHandoffSetup
 	}

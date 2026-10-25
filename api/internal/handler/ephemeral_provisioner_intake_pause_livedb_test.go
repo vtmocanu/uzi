@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -17,36 +18,44 @@ import (
 // The pause is instance-global; run-store-it.sh runs packages with -p 1, and each test lifts it on
 // cleanup so a sibling never sees a stale pause.
 
-// setIntakePause flips the singleton through the production store helper (tx-bound).
-func (fx *ephemeralFixture) setIntakePause(active bool) {
-	fx.t.Helper()
+// tryIntakePause flips the singleton through the production store helper (tx-bound).
+func (fx *ephemeralFixture) tryIntakePause(active bool) error {
 	tx, err := fx.pool.Begin(fx.ctx)
 	if err != nil {
-		fx.t.Fatalf("begin pause tx: %v", err)
+		return fmt.Errorf("begin pause tx: %w", err)
 	}
 	if _, _, err := store.SetInstanceIntakePause(fx.ctx, store.New(tx), active, "u2 test", pgtype.UUID{}, "test"); err != nil {
 		_ = tx.Rollback(fx.ctx)
-		fx.t.Fatalf("SetInstanceIntakePause(%v): %v", active, err)
+		return fmt.Errorf("SetInstanceIntakePause(%v): %w", active, err)
 	}
 	if err := tx.Commit(fx.ctx); err != nil {
-		fx.t.Fatalf("commit pause tx: %v", err)
+		return fmt.Errorf("commit pause tx: %w", err)
 	}
+	return nil
+}
+
+func (fx *ephemeralFixture) setIntakePause(active bool) {
+	fx.t.Helper()
+	if err := fx.tryIntakePause(active); err != nil {
+		fx.t.Fatal(err)
+	}
+}
+
+// liftPauseOnCleanup guarantees the instance-global pause is lifted when the test ends and reports
+// a failure to do so, since a stale pause would silently starve every sibling suite.
+func (fx *ephemeralFixture) liftPauseOnCleanup() {
+	fx.t.Helper()
+	fx.t.Cleanup(func() {
+		if err := fx.tryIntakePause(false); err != nil {
+			fx.t.Errorf("cleanup: lifting the intake pause failed, siblings may see a stale pause: %v", err)
+		}
+	})
 }
 
 func (fx *ephemeralFixture) pauseIntakeForTest() {
 	fx.t.Helper()
 	fx.setIntakePause(true)
-	fx.t.Cleanup(func() {
-		tx, err := fx.pool.Begin(fx.ctx)
-		if err != nil {
-			return
-		}
-		if _, _, err := store.SetInstanceIntakePause(fx.ctx, store.New(tx), false, "", pgtype.UUID{}, "test"); err != nil {
-			_ = tx.Rollback(fx.ctx)
-			return
-		}
-		_ = tx.Commit(fx.ctx)
-	})
+	fx.liftPauseOnCleanup()
 }
 
 // admit marks a queued run as a replacement (claim_generation > 0), which the pause admits.
@@ -59,49 +68,101 @@ func (fx *ephemeralFixture) admit(runID uuid.UUID) {
 
 // TestEphemeralProvisionPassIntakePauseBatchLiveDB: more not-admitted roots than the bounded batch
 // (50) must not crowd the one admitted replacement out of the demand window, and no root gets a
-// worker while paused; lifting the pause provisions roots again.
+// worker while paused; lifting the pause provisions every root. One case per demand query that
+// carries the pause conjunct: capability gap (Unplaceable), saturation and isolated lane.
 func TestEphemeralProvisionPassIntakePauseBatchLiveDB(t *testing.T) {
-	fx := newEphemeralFixture(t, true)
-	fx.onlineWorker("base-only", false) // cannot satisfy docker
-	const roots = 55                    // > ephemeralProvisionBatch (50)
-	rootIDs := make(map[uuid.UUID]bool, roots)
-	for i := 0; i < roots; i++ {
-		rootIDs[fx.queuedRun([]string{"docker"})] = true
+	const roots = 55 // > ephemeralProvisionBatch (50)
+	cases := []struct {
+		name  string
+		delay time.Duration
+		// setup seeds the fleet and returns the seeder of one queued run the lane's demand query selects.
+		setup func(fx *ephemeralFixture) (root func() uuid.UUID)
+		// finish runs after all runs exist.
+		finish func(fx *ephemeralFixture)
+	}{
+		{
+			name: "capability gap",
+			setup: func(fx *ephemeralFixture) func() uuid.UUID {
+				fx.onlineWorker("base-only", false) // cannot satisfy docker
+				return func() uuid.UUID { return fx.queuedRun([]string{"docker"}) }
+			},
+		},
+		{
+			name:  "saturation",
+			delay: time.Minute,
+			setup: func(fx *ephemeralFixture) func() uuid.UUID {
+				// The only capable worker is at its run cap, so every queued root is slot-blocked.
+				fx.activeRunOn(fx.onlineWorkerWithCap("persistent busy", false, 1))
+				return func() uuid.UUID { return fx.queuedRun([]string{}) }
+			},
+			finish: func(fx *ephemeralFixture) {
+				if _, err := fx.pool.Exec(fx.ctx,
+					`UPDATE runs SET status_since = now() - interval '2 hours' WHERE user_id = $1 AND status = 'queued'`, fx.userID); err != nil {
+					fx.t.Fatalf("age queued runs past the saturation delay: %v", err)
+				}
+			},
+		},
+		{
+			name: "isolated lane",
+			setup: func(fx *ephemeralFixture) func() uuid.UUID {
+				prof := fx.boundProfile()
+				return func() uuid.UUID { return fx.boundQueuedRun(prof, nil) }
+			},
+		},
 	}
-	admitted := fx.queuedRun([]string{"docker"})
-	fx.admit(admitted)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newEphemeralFixture(t, true)
+			// Lowest-registered cleanup runs last: drop the 56 queued runs so they never crowd the LIMIT
+			// window of sibling suites' demand queries.
+			t.Cleanup(func() {
+				if _, err := fx.pool.Exec(fx.ctx, `DELETE FROM workers WHERE user_id = $1`, fx.userID); err != nil {
+					t.Errorf("cleanup workers: %v", err)
+				}
+				if _, err := fx.pool.Exec(fx.ctx, `DELETE FROM runs WHERE user_id = $1`, fx.userID); err != nil {
+					t.Errorf("cleanup runs: %v", err)
+				}
+			})
+			root := tc.setup(fx)
+			rootIDs := make(map[uuid.UUID]bool, roots)
+			for i := 0; i < roots; i++ {
+				rootIDs[root()] = true
+			}
+			admitted := root()
+			fx.admit(admitted)
+			if tc.finish != nil {
+				tc.finish(fx)
+			}
 
-	// 55 queued docker roots would otherwise crowd the LIMIT window of sibling suites' demand queries.
-	t.Cleanup(func() {
-		_, _ = fx.pool.Exec(fx.ctx, `DELETE FROM workers WHERE user_id = $1`, fx.userID)
-		_, _ = fx.pool.Exec(fx.ctx, `DELETE FROM runs WHERE user_id = $1`, fx.userID)
-	})
-	fx.pauseIntakeForTest()
-	// Cap well above the run count so the per-user cap never explains the outcome.
-	prov := fx.provisioner(true, 100)
-	if _, err := prov.ProvisionPass(fx.ctx); err != nil {
-		t.Fatalf("ProvisionPass (paused): %v", err)
-	}
-	rows := fx.ephemeralRows()
-	if len(rows) != 1 || rows[0].runID != admitted {
-		t.Fatalf("paused pass provisioned %d workers (%v), want exactly one for the admitted run %s", len(rows), rows, admitted)
-	}
+			fx.pauseIntakeForTest()
+			// Cap well above the run count so the per-user cap never explains the outcome.
+			prov := fx.provisionerWithDelay(true, 100, tc.delay)
+			if _, err := prov.ProvisionPass(fx.ctx); err != nil {
+				t.Fatalf("ProvisionPass (paused): %v", err)
+			}
+			rows := fx.ephemeralRows()
+			if len(rows) != 1 || rows[0].runID != admitted {
+				t.Fatalf("paused pass provisioned %d workers (%v), want exactly one for the admitted run %s", len(rows), rows, admitted)
+			}
 
-	fx.setIntakePause(false)
-	// Roots drain across ticks at 50 per pass; two passes cover 55 plus the already-served one.
-	for i := 0; i < 2; i++ {
-		if _, err := prov.ProvisionPass(fx.ctx); err != nil {
-			t.Fatalf("ProvisionPass (lifted) %d: %v", i, err)
-		}
-	}
-	got := 0
-	for _, r := range fx.ephemeralRows() {
-		if rootIDs[r.runID] {
-			got++
-		}
-	}
-	if got == 0 {
-		t.Fatal("after the pause lifted no root run was provisioned")
+			fx.setIntakePause(false)
+			// Roots drain at 50 per pass; three passes leave slack for sibling rows and must provision
+			// every root exactly once (the per-user cap is far above 56).
+			for i := 0; i < 3; i++ {
+				if _, err := prov.ProvisionPass(fx.ctx); err != nil {
+					t.Fatalf("ProvisionPass (lifted) %d: %v", i, err)
+				}
+			}
+			got := 0
+			for _, r := range fx.ephemeralRows() {
+				if rootIDs[r.runID] {
+					got++
+				}
+			}
+			if got != roots {
+				t.Fatalf("after the pause lifted %d of %d root runs were provisioned", got, roots)
+			}
+		})
 	}
 }
 
@@ -113,7 +174,7 @@ func TestEphemeralProvisionOneRechecksIntakePauseLiveDB(t *testing.T) {
 	fx := newEphemeralFixture(t, true)
 	fx.onlineWorker("base-only", false)
 	fx.queuedRun([]string{"docker"})
-	fx.t.Cleanup(func() { fx.setIntakePause(false) })
+	fx.liftPauseOnCleanup()
 
 	holder, err := fx.pool.Begin(fx.ctx)
 	if err != nil {
