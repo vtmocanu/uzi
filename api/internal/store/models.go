@@ -459,6 +459,24 @@ type IncidentalFinding struct {
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
 }
 
+type InstanceIntakePause struct {
+	ID       bool               `json:"id"`
+	Active   bool               `json:"active"`
+	Since    pgtype.Timestamptz `json:"since"`
+	ByUserID pgtype.UUID        `json:"by_user_id"`
+	ByLabel  pgtype.Text        `json:"by_label"`
+	Reason   pgtype.Text        `json:"reason"`
+}
+
+type InstanceIntakePauseEvent struct {
+	ID       uuid.UUID          `json:"id"`
+	At       pgtype.Timestamptz `json:"at"`
+	ByUserID pgtype.UUID        `json:"by_user_id"`
+	ByLabel  pgtype.Text        `json:"by_label"`
+	Action   string             `json:"action"`
+	Reason   pgtype.Text        `json:"reason"`
+}
+
 type Issue struct {
 	ID             uuid.UUID          `json:"id"`
 	RepoID         uuid.UUID          `json:"repo_id"`
