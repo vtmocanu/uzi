@@ -246,10 +246,11 @@ const EMPTY_TURN_BACKOFF_SLICE_MS = 250;
  *    transient provider error that persisted, or (issue #3179) a stream that ended with no
  *    events and no terminal at all;
  *  - the Codex lane, `CodexExecutor.driveTurnWithWallPark` (issue #2099): a turn that kept
- *    failing with a transient provider classification after its bounded same-thread retries.
+ *    failing with a transient provider classification after its bounded same-thread retries,
+ *    or an eligible non-human-revision turn that idled with zero model-processing evidence (#3462).
  *
- * This is NEVER thrown for a genuine wall/idle/cancel/pause interruption (those keep their
- * existing terminal/cancelled/paused outcome) nor, on the Claude lane, for a turn that RAN but
+ * Except for that Codex zero-evidence idle, wall/idle/cancel/pause interruptions keep their
+ * existing terminal/cancelled/paused outcome. It is never thrown on the Claude lane for a turn that RAN but
  * did not submit a plan (that stays REASON_NO_PLAN). A distinct typed error is what lets the
  * runner catch route it to the non-terminal park instead of the generic failure path.
  */

@@ -381,7 +381,7 @@ interface PauseNowToken {
  * caller that matches on it) plus the pause-now snapshot taken when the trip fired.
  */
 class CodexTurnTripError extends Error {
-  constructor(reason: string, readonly pauseToken: PauseNowToken) {
+  constructor(reason: string, readonly pauseToken: PauseNowToken, readonly processedEvents?: number) {
     super(reason);
   }
 }
@@ -3740,7 +3740,7 @@ export class CodexExecutor implements Executor {
           let turn: Awaited<ReturnType<CodexExecutor["driveTurnWithWallPark"]>>;
           try {
             if (humanRevision) await ctx.beforePlanRevisionTurn?.();
-            turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, shared.selection.current, shared.repoInstructions, { completedCount: 0 }, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completion);
+            turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, shared.selection.current, shared.repoInstructions, { completedCount: 0 }, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completion, undefined, undefined, undefined, undefined, false, !humanRevision);
           } catch (error) {
             if (!humanRevision || !(error instanceof TransientRecoveryError) || !error.providerOrigin || !ctx.retryPlanRevisionTurn) throw error;
             // The runner hook owns backoff and control checks. Redrive without a new cap,
@@ -4253,7 +4253,7 @@ export class CodexExecutor implements Executor {
               const snapshot = interruptedSnapshotNote(ctx.interruptedSnapshot);
               interruptedOwnerDispatched = true;
               return [prompt, snapshot, calls].filter(Boolean).join("\n\n");
-            } : undefined, ownerCompletionRecheck);
+            } : undefined, ownerCompletionRecheck, true);
           if (implTurn.kind === "walled") return { branch: ctx.branch, agentSelection, walled: { reason: REASON_WALL } };
           if (implTurn.kind === "held") return { branch: ctx.branch, agentSelection, completionHeld: { reason: implTurn.reason } };
           // Issue #1764: an owner `now` pause dropped the turn and ctx.parkForPause parked the run.
@@ -5304,7 +5304,7 @@ export class CodexExecutor implements Executor {
     const effectsAbort = new AbortController();
     try {
       harness.useBroker(buildPhaseBroker(phase, AbortSignal.any([turnAbort.signal, effectsAbort.signal])));
-      if (tripReason) throw this.tripError(tripReason, tripToken!);
+      if (tripReason) throw this.tripError(tripReason, tripToken!, processedEvents);
       armIdle();
       if (beforeDispatch) prompt = beforeDispatch(prompt);
       const request = this.buildRunRequest(ctx, phase, prompt, resumeId, turnAbort.signal, selection, repoInstructions, ownerCompletionRecheck);
@@ -5374,7 +5374,7 @@ export class CodexExecutor implements Executor {
         if (pending !== undefined) trip(pending);
       }
       // (a) FIRST-WINS trip.
-      if (tripReason) throw this.tripError(tripReason, tripToken!);
+      if (tripReason) throw this.tripError(tripReason, tripToken!, processedEvents);
       // (c) a failed terminal is classified ONCE and materialized+thrown here.
       if (sawTerminal && terminal && terminal.outcome === "failed") {
         const thrown = terminal.failure
@@ -5392,7 +5392,7 @@ export class CodexExecutor implements Executor {
       if (rootText) result.finalText = scrubLeadText(rootText);
     } catch (err) {
       // (a) again: a trip beats the raw aborted/protocol error the iterator threw.
-      if (tripReason) throw this.tripError(tripReason, tripToken!);
+      if (tripReason) throw this.tripError(tripReason, tripToken!, processedEvents);
       throw err instanceof Error ? err : new Error(errMessage(err));
     } finally {
       effectsAbort.abort();
@@ -5406,7 +5406,7 @@ export class CodexExecutor implements Executor {
     }
     // No await separates cleanup from this live-state check and notification entry.
     // The async notification owner must recheck its ownership before journaling.
-    if (tripReason) throw this.tripError(tripReason, tripToken!);
+    if (tripReason) throw this.tripError(tripReason, tripToken!, processedEvents);
     if (sawTerminal && terminal?.outcome === "success" && processedEvents > 0 &&
         !ctx.cancelRequested?.() && !ctx.terminalLifecycleSignal?.aborted && !vaultLock.latched &&
         this.pendingInterruption(ctx, pauseNow, wall) === undefined &&
@@ -5475,8 +5475,8 @@ export class CodexExecutor implements Executor {
     }
   }
 
-  private tripError(reason: string, pauseToken: PauseNowToken): Error {
-    return new CodexTurnTripError(reason, pauseToken);
+  private tripError(reason: string, pauseToken: PauseNowToken, processedEvents: number): Error {
+    return new CodexTurnTripError(reason, pauseToken, processedEvents);
   }
 
   /**
@@ -5488,7 +5488,7 @@ export class CodexExecutor implements Executor {
    * phasePublish skips finalize, or `paused`. With proven cleanup, a REFUSED wall park (owner
    * extended) re-drives the turn on a recreated provider epoch (issue #1782: capture may have
    * reaped the root). Unproven cleanup throws before recreation. Idle trips hold after an attempt
-   * and otherwise rethrow; other errors propagate unchanged.
+   * and otherwise park eligible zero-evidence turns; other errors propagate unchanged.
    *
    * Issue #1764: an owner now/milestone pause that dropped the turn (REASON_PAUSE, mode not `wall`)
    * is honoured, never cancelled. In the implement phase it parks through ctx.parkForPause
@@ -5523,6 +5523,7 @@ export class CodexExecutor implements Executor {
     idleOperation?: () => Promise<ReducedTurnResult>,
     beforeDispatch?: (prompt: string) => string,
     ownerCompletionRecheck = false,
+    zeroEvidenceRecoveryEligible = false,
   ): Promise<
     | { kind: "turn"; result: ReducedTurnResult }
     | { kind: "walled" }
@@ -5543,7 +5544,7 @@ export class CodexExecutor implements Executor {
       resumeId = fresh.resumeSessionId;
       buildPhaseBroker = fresh.buildPhaseBroker;
     };
-    for (;;) {
+    turnLoop: for (;;) {
       try {
         // Use consumable lifecycle state, not the sticky pause mode, before releasing again.
         const pending = this.pendingInterruption(ctx, pauseNow, wall);
@@ -5617,72 +5618,104 @@ export class CodexExecutor implements Executor {
             );
           }
         }
-        const msg = err instanceof Error ? err.message : "";
-        // Issue #1764: the interrupt generation this path handles, captured before any await; a
-        // newer `now`/`wall` that lands during an await below stays pending for the re-drive.
-        // A REASON_PAUSE trip is snapshotted here, not at the trip: steering aborts the shared
-        // signal BEFORE it fires the same pause's interrupt, so a trip-time snapshot would miss
-        // that pause's own generation. Any other trip (the own wall timer) uses the snapshot taken
-        // when it fired, so an owner `now` that landed after it is never consumed by its park.
-        const pauseToken = msg !== REASON_PAUSE && err instanceof CodexTurnTripError
-          ? err.pauseToken
-          : pauseNow.capture();
-        const mode = ctx.pauseModeRequested?.();
-        // A pending cancel wins over a pause of either kind.
-        if (msg === REASON_PAUSE && ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
-        if (msg === REASON_PAUSE && mode == null) {
-          // Issue #1764: the pause was withdrawn (pause_cancel) before it was handled: never park,
-          // never cancel. Preserve the interrupted thread and replace its epoch before reuse.
-          await beforeReapingSink();
-          pauseNow.consume(pauseToken);
-          continue;
-        }
-        if (msg === REASON_PAUSE && mode !== "wall") {
-          // Issue #1764: an owner now/milestone pause dropped the live turn. The plan phase has no
-          // in-executor park: the plan loop hands it to the runner as a PauseNowSignal.
-          if (phase === "plan") {
+        // Only a real turn's measured zero-evidence idle can park. Synthetic trips and
+        // owner revision turns retain their existing failure contract.
+        const zeroEvidenceIdle = zeroEvidenceRecoveryEligible && !idleOperation &&
+          err instanceof CodexTurnTripError && err.message === REASON_IDLE && err.processedEvents === 0;
+        let recoveryCheckedAt = Date.now();
+        const recoveryInterruption = (): CodexTurnTripError | undefined => {
+          // The turn disarmed its wall timer. Charge only this candidate's post-idle
+          // capture/hold waits so a budget spent there still takes the wall route.
+          const now = Date.now();
+          wall.remainingMs -= Math.max(0, now - recoveryCheckedAt);
+          recoveryCheckedAt = now;
+          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+          const reason = this.pendingInterruption(ctx, pauseNow, wall);
+          return reason === undefined ? undefined : new CodexTurnTripError(reason, pauseNow.capture());
+        };
+        if (zeroEvidenceIdle) err = recoveryInterruption() ?? err;
+        // At most one idle capture and one declined hold; each new interruption leaves
+        // the idle arm and follows the existing pause/wall route with its own snapshot.
+        routeTrip: for (;;) {
+          const msg = err instanceof Error ? err.message : "";
+          // Issue #1764: the interrupt generation this path handles, captured before any await; a
+          // newer `now`/`wall` that lands during an await below stays pending for the re-drive.
+          // A REASON_PAUSE trip is snapshotted here, not at the trip: steering aborts the shared
+          // signal BEFORE it fires the same pause's interrupt, so a trip-time snapshot would miss
+          // that pause's own generation. Any other trip (the own wall timer) uses the snapshot taken
+          // when it fired, so an owner `now` that landed after it is never consumed by its park.
+          const pauseToken = msg !== REASON_PAUSE && err instanceof CodexTurnTripError
+            ? err.pauseToken
+            : pauseNow.capture();
+          const mode = ctx.pauseModeRequested?.();
+          // A pending cancel wins over a pause of either kind.
+          if (msg === REASON_PAUSE && ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+          if (msg === REASON_PAUSE && mode == null) {
+            // Issue #1764: the pause was withdrawn (pause_cancel) before it was handled: never park,
+            // never cancel. Preserve the interrupted thread and replace its epoch before reuse.
             await beforeReapingSink();
-            return { kind: "paused", at };
+            pauseNow.consume(pauseToken);
+            continue turnLoop;
           }
-          // The runner can capture before deciding the pause; requestPause persists first.
-          if (await this.requestPause(ctx, at, beforeReapingSink)) return { kind: "paused", at };
-          // A declined pause re-enters the loop; captured-epoch recreation requires proven cleanup.
-          pauseNow.consume(pauseToken);
-          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
-          continue;
+          if (msg === REASON_PAUSE && mode !== "wall") {
+            // Issue #1764: an owner now/milestone pause dropped the live turn. The plan phase has no
+            // in-executor park: the plan loop hands it to the runner as a PauseNowSignal.
+            if (phase === "plan") {
+              await beforeReapingSink();
+              return { kind: "paused", at };
+            }
+            // The runner can capture before deciding the pause; requestPause persists first.
+            if (await this.requestPause(ctx, at, beforeReapingSink)) return { kind: "paused", at };
+            // A declined pause re-enters the loop; captured-epoch recreation requires proven cleanup.
+            pauseNow.consume(pauseToken);
+            if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+            continue turnLoop;
+          }
+          const wallTrip = msg === REASON_WALL || msg === REASON_PAUSE;
+          if (ctx.completionInterlock && (wallTrip ? completion?.attempted() || completion?.history.priorAttempt : completion?.attempted()) && (wallTrip || msg === REASON_IDLE)) {
+            const reason = wallTrip ? REASON_WALL : REASON_IDLE;
+            // Issue #1764: the hold's capture reaps the live provider root; persist first.
+            if (ctx.enterCompletionHold) await beforeReapingSink();
+            const held = await routeCompletionHold(ctx, reason, true, wallTrip ? { allowDegradedCapture: true } : undefined);
+            if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+            if (held) return { kind: "held", reason };
+            if (wallTrip) return { kind: "walled" };
+          }
+          if (zeroEvidenceIdle && msg === REASON_IDLE) {
+            const interrupted = recoveryInterruption();
+            if (interrupted) { err = interrupted; continue routeTrip; }
+            if (!pauseNow.vaultLock.latched) {
+              await beforeReapingSink();
+              const afterCapture = recoveryInterruption();
+              if (afterCapture) { err = afterCapture; continue routeTrip; }
+              if (!pauseNow.vaultLock.latched) {
+                throw new TransientRecoveryError("provider sent no model output within the idle timeout");
+              }
+            }
+          }
+          // Not a wall trip: legacy propagation.
+          if (!wallTrip) throw err;
+          const outcome = await this.parkAtWall(ctx, at, beforeReapingSink, pauseNow, pauseToken, wall, completion);
+          if (outcome === "held") return { kind: "held", reason: REASON_WALL };
+          if (outcome === "parked") return { kind: "walled" };
+          if (outcome === "refused") {
+            // The owner extended: re-drive the turn. It skips reportIteration, so re-arm the run-wide
+            // wall from the refusal's own budget first, or the re-drive would trip at once.
+            // Issue #1789: a vault lock latched before or during the refused park defers now
+            // (cancel first): recreating the epoch would release a new credential for a turn the
+            // latch drops at its start anyway.
+            if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+            if (pauseNow.vaultLock.latched) throw new CodexCredentialDeferredError();
+            // A newer pause is handled before releasing credentials for the replacement epoch.
+            if (this.pendingInterruption(ctx, pauseNow, wall) === REASON_PAUSE) continue turnLoop;
+            // Issue #1782: the refused capture may have reaped the provider root (closing the
+            // registry for good); the re-drive requires recreation after proven cleanup.
+            if (!idleOperation) await adoptFresh();
+            if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+            continue turnLoop;
+          }
+          throw err; // "unwired": no seam wired (stub/test) — legacy propagation of the wall trip
         }
-        const wallTrip = msg === REASON_WALL || msg === REASON_PAUSE;
-        if (ctx.completionInterlock && (wallTrip ? completion?.attempted() || completion?.history.priorAttempt : completion?.attempted()) && (wallTrip || msg === REASON_IDLE)) {
-          const reason = wallTrip ? REASON_WALL : REASON_IDLE;
-          // Issue #1764: the hold's capture reaps the live provider root; persist first.
-          if (ctx.enterCompletionHold) await beforeReapingSink();
-          const held = await routeCompletionHold(ctx, reason, true, wallTrip ? { allowDegradedCapture: true } : undefined);
-          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
-          if (held) return { kind: "held", reason };
-          if (wallTrip) return { kind: "walled" };
-        }
-        // Not a wall trip: legacy propagation.
-        if (!wallTrip) throw err;
-        const outcome = await this.parkAtWall(ctx, at, beforeReapingSink, pauseNow, pauseToken, wall, completion);
-        if (outcome === "held") return { kind: "held", reason: REASON_WALL };
-        if (outcome === "parked") return { kind: "walled" };
-        if (outcome === "refused") {
-          // The owner extended: re-drive the turn. It skips reportIteration, so re-arm the run-wide
-          // wall from the refusal's own budget first, or the re-drive would trip at once.
-          // Issue #1789: a vault lock latched before or during the refused park defers now
-          // (cancel first): recreating the epoch would release a new credential for a turn the
-          // latch drops at its start anyway.
-          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
-          if (pauseNow.vaultLock.latched) throw new CodexCredentialDeferredError();
-          // A newer pause is handled before releasing credentials for the replacement epoch.
-          if (this.pendingInterruption(ctx, pauseNow, wall) === REASON_PAUSE) continue;
-          // Issue #1782: the refused capture may have reaped the provider root (closing the
-          // registry for good); the re-drive requires recreation after proven cleanup.
-          if (!idleOperation) await adoptFresh();
-          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
-          continue;
-        }
-        throw err; // "unwired": no seam wired (stub/test) — legacy propagation of the wall trip
       }
     }
   }

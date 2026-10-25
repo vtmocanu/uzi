@@ -3957,9 +3957,12 @@ describe("CodexExecutor: run() control flow (run-lane precedence)", () => {
     try {
       await assert.rejects(
         withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "idle run"),
-        /idle timeout/,
+        (error: Error) => error instanceof TransientRecoveryError && !error.providerOrigin,
       );
       assert.equal(lateTerminalDelivered, true, "the idle trip wins despite delivery of a late terminal");
+      await tick();
+      assert.equal(rig.transport.turnStartCount, 1, "a late terminal cannot start a second turn");
+      assert.equal(rig.sessionOps.persist, 1, "the idle recovery settles once");
     } finally {
       removeAbortListener();
     }
@@ -5120,7 +5123,7 @@ describe("CodexExecutor: child-thread delegation demux (part C)", () => {
           await new Promise<void>(resolve => setTimeout(resolve, IDLE_MS + 50));
           assert.equal(parks, route === "refused wall" ? 1 : 0, "current callback suppresses idle without a stale wall park");
           fresh.settleCallback(current.token, "ok");
-          await assert.rejects(withTimeout(running, 2000, "idle after current callback settles"), /codex run idle timeout/);
+          await assert.rejects(withTimeout(running, 2000, "idle after current callback settles"), TransientRecoveryError);
           assert.equal(parks, route === "refused wall" ? 1 : 0, "idle does not consume the newer wall budget");
         } finally {
           ExecutionRegistry.prototype.subscribeCallbacks = subscribe;
@@ -12691,7 +12694,7 @@ describe("Codex completion interlock", () => {
         parkForWall: async () => { parks++; return "parked"; },
       });
       const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
-      if (trip === "idle") await assert.rejects(withTimeout(running, 3000, "pre-attempt idle"), /codex run idle timeout/);
+      if (trip === "idle") await assert.rejects(withTimeout(running, 3000, "pre-attempt idle"), TransientRecoveryError);
       else assert.deepEqual((await withTimeout(running, 3000, "pre-attempt wall")).walled, { reason: "codex run wall-clock timeout" });
       assert.equal(attempts, 0);
       assert.equal(holds, 0);
@@ -12717,7 +12720,7 @@ describe("Codex completion interlock", () => {
     assert.equal(result.completionHeld, undefined);
   });
 
-  it("rethrows idle after an attempt when the completion hold is refused", async () => {
+  it("recovers zero-evidence idle after an attempt when the completion hold is refused", async () => {
     const rig = makeMultiEpochRig([firstEpoch(1), quietEpoch(2)]);
     rig.deps = { ...rig.deps, wallMs: 5000, idleMs: 30 };
     const holds: string[] = [];
@@ -12728,7 +12731,7 @@ describe("Codex completion interlock", () => {
       enterCompletionHold: async (reason) => { holds.push(reason); return false; },
       parkForWall: async () => { parks++; return "parked"; },
     });
-    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "refused idle hold"), /codex run idle timeout/);
+    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "refused idle hold"), TransientRecoveryError);
     assert.deepEqual(holds, ["codex run idle timeout"]);
     assert.equal(parks, 0);
   });
@@ -17874,6 +17877,376 @@ describe("CodexExecutor planning settlement (#1733)", () => {
   }
 });
 
+describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
+  const recoveryMessage = "provider sent no model output within the idle timeout";
+  const isRecovery = (error: unknown): boolean => {
+    assert.ok(error instanceof TransientRecoveryError, String(error));
+    assert.equal(error.message, recoveryMessage);
+    assert.equal(error.providerOrigin, false);
+    return true;
+  };
+  // Readiness uses bounded real event-loop turns, independently of the frozen Date.
+  async function until(predicate: () => boolean): Promise<void> {
+    for (let n = 0; n < 500; n++) {
+      if (predicate()) return;
+      await tick();
+    }
+    assert.ok(predicate(), "event barrier was not reached");
+  }
+
+  for (const retry of [false, true]) it(`3462 ${retry ? "serverOverloaded then silent retry" : "first-turn silence"} parks without another start`, async t => {
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        c.transport.push(threadStarted());
+        if (retry && c.turnStartCount === 1) c.transport.push({
+          kind: "turn_completed", method: "turn/completed", threadId: "th-1", turnId: "tn-1", status: "failed",
+          params: { threadId: "th-1", turn: { id: "tn-1", status: "failed", error: { codexErrorInfo: "serverOverloaded" } } },
+        });
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    rig.deps = { ...rig.deps, idleMs: 100, wallMs: 5000, transientBackoffBaseMs: 1 };
+    const { ctx, emitted } = makeCtx();
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    void running.catch(() => undefined);
+    try {
+      await until(() => rig.transport.turnStartCount === 1);
+      if (retry) {
+        await until(() => emitted.some(m => /transient error/.test(String(rec(m.payload).text))));
+        await tick();
+        t.mock.timers.tick(1);
+        await until(() => rig.transport.turnStartCount === 2);
+      }
+      await tick();
+      t.mock.timers.tick(100);
+      await assert.rejects(running, isRecovery);
+      assert.equal(rig.transport.turnStartCount, retry ? 2 : 1);
+      assert.equal(rig.sessionOps.persist, 1, "persist the live session before recovery capture");
+      assert.equal(emitted.filter(m => /transient error/.test(String(rec(m.payload).text))).length, retry ? 1 : 0);
+    } finally { rig.transport.end(); t.mock.timers.reset(); }
+  });
+
+  for (const evidence of ["lifecycle", "text", "tool"] as const) it(`3462 ${evidence} before silence has the correct evidence contract`, async t => {
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        c.transport.push(threadStarted());
+        if (evidence === "text") c.transport.push(agentMessage("working"));
+        else if (evidence === "tool") c.transport.push(toolCall(91, "Bash", { command: "true" }, "th-1", "tn-1", "settled-tool"));
+        else c.transport.push({ kind: "turn_started", method: "turn/started", threadId: "th-1", turnId: "tn-1", params: {} })
+          .push(tokenUsageUpdated("th-1", "tn-1", { inputTokens: 10 }))
+          .push({ kind: "codex_error", method: "error", threadId: "th-1", turnId: "tn-1", willRetry: true,
+            params: { threadId: "th-1", turnId: "tn-1", willRetry: true, error: { message: "retrying" } } });
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    rig.deps = { ...rig.deps, idleMs: 100, wallMs: 5000 };
+    const { ctx, emitted } = makeCtx();
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    void running.catch(() => undefined);
+    try {
+      await until(() => evidence === "tool" ? rig.transport.responses.some(r => r.requestId === 91)
+        : evidence === "text" ? emitted.some(m => m.kind === "text") : rig.transport.turnStartCount === 1);
+      for (let i = 0; i < 5; i++) await tick();
+      t.mock.timers.tick(100);
+      await assert.rejects(running, evidence === "lifecycle" ? isRecovery : (error: unknown) => {
+        assert.ok(error instanceof Error && !(error instanceof TransientRecoveryError));
+        assert.equal(error.message, "codex run idle timeout");
+        return true;
+      });
+      assert.equal(rig.transport.turnStartCount, 1);
+    } finally { rig.transport.end(); t.mock.timers.reset(); }
+  });
+
+  for (const interruption of ["none", "pause", "wall", "cancel"] as const) it(`3462 ${interruption} during pre-recovery persistence`, async t => {
+    const rig = makeRig();
+    let entered = false;
+    let release!: () => void;
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    rig.deps = { ...rig.deps, idleMs: 100, wallMs: 1000,
+      sessionStore: { ...rig.deps.sessionStore!, persist: async () => {
+        entered = true; await barrier; return { files: 0, bytes: 0 };
+      } },
+    };
+    let mode: "now" | null = null;
+    let interrupt: (() => void) | undefined;
+    let cancelled = false, pauses = 0, walls = 0;
+    const { ctx } = makeCtx({
+      onPauseNow: cb => { interrupt = cb; }, pauseModeRequested: () => mode,
+      cancelRequested: () => cancelled,
+      parkForPause: async () => { pauses++; return true; },
+      parkForWall: async () => { walls++; return "parked"; },
+    });
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    void running.catch(() => undefined);
+    try {
+      await until(() => rig.transport.turnStartCount === 1);
+      await tick(); t.mock.timers.tick(100);
+      await until(() => entered);
+      if (interruption === "pause") { mode = "now"; interrupt?.(); }
+      if (interruption === "wall") t.mock.timers.tick(1000);
+      if (interruption === "cancel") cancelled = true;
+      release();
+      if (interruption === "none") await assert.rejects(running, isRecovery);
+      else if (interruption === "cancel") await assert.rejects(running, /cancel/);
+      else {
+        const result = await running;
+        assert.ok(interruption === "pause" ? result.pausedAt : result.walled);
+      }
+      assert.equal(pauses, interruption === "pause" ? 1 : 0);
+      assert.equal(walls, interruption === "wall" ? 1 : 0);
+      assert.equal(rig.transport.turnStartCount, 1, "no unintended redrive");
+    } finally { release(); rig.transport.end(); t.mock.timers.reset(); }
+  });
+
+  for (const interruption of ["none", "pause", "wall", "cancel"] as const) it(`3462 declined completion hold rechecks ${interruption}`, async t => {
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", transport => transport.push(signalDone()).push(turnCompleted("completed"))),
+      epochResponder("th-2", "tn-2", () => {}),
+    ]);
+    rig.deps = { ...rig.deps, idleMs: 100, wallMs: 1000 };
+    let entered = false, release!: () => void;
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    let mode: "now" | null = null, interrupt: (() => void) | undefined;
+    let cancelled = false, holds = 0, pauses = 0, walls = 0;
+    const { ctx } = makeCtx({ kind: "issue", completionInterlock: true, config: { max_iterations: 3 },
+      recordCompletionAttempt: async () => ({ unmet: ["m2"], attemptCount: 1 }),
+      enterCompletionHold: async reason => {
+        holds++;
+        if (reason === "codex run wall-clock timeout") return false;
+        entered = true; await barrier; return false;
+      },
+      onPauseNow: cb => { interrupt = cb; }, pauseModeRequested: () => mode,
+      cancelRequested: () => cancelled,
+      parkForPause: async () => {
+        pauses++;
+        // A newer generation during a declined pause must survive consumption of
+        // the handled generation, and park before any replacement turn starts.
+        if (pauses === 1) { interrupt?.(); return false; }
+        return true;
+      },
+      parkForWall: async () => { walls++; return "parked"; },
+    });
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    void running.catch(() => undefined);
+    try {
+      await until(() => rig.epochs[1]!.transport.turnStartCount === 1);
+      await tick(); t.mock.timers.tick(100);
+      await until(() => entered);
+      if (interruption === "pause") { mode = "now"; interrupt?.(); }
+      if (interruption === "wall") t.mock.timers.tick(1000);
+      if (interruption === "cancel") cancelled = true;
+      release();
+      if (interruption === "none") await assert.rejects(running, isRecovery);
+      else if (interruption === "cancel") await assert.rejects(running, /cancel/);
+      else {
+        const result = await running;
+        assert.ok(interruption === "pause" ? result.pausedAt : result.walled);
+      }
+      assert.equal(holds, interruption === "wall" ? 2 : 1);
+      assert.equal(pauses, interruption === "pause" ? 2 : 0);
+      assert.equal(walls, 0, "declined wall completion hold stops without wall capture");
+      assert.equal(rig.providerLaunches(), 2);
+      assert.equal(rig.epochs[1]!.transport.turnStartCount, 1);
+    } finally { release(); for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
+  });
+
+  it("3462 a vault latch after the first idle trip retains the idle outcome", async t => {
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        c.transport.push(threadStarted()).push({ kind: "activity", method: "account/chatgptAuthTokens/refresh", requestId: 91,
+          params: { reason: "unauthorized", previousAccountId: null } });
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    let refreshing = false, release!: () => void;
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    rig.client.refreshCodex = async () => {
+      refreshing = true; await barrier;
+      throw new RequestError("POST", "/refresh", 409, JSON.stringify({ reason: "vault_locked" }));
+    };
+    rig.deps = { ...rig.deps, idleMs: 100, wallMs: 5000 };
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx);
+    void running.catch(() => undefined);
+    try {
+      await until(() => refreshing);
+      t.mock.timers.tick(100); release();
+      await assert.rejects(running, (error: unknown) => {
+        assert.ok(error instanceof Error && !(error instanceof TransientRecoveryError));
+        assert.equal(error.message, "codex run idle timeout"); return true;
+      });
+      assert.equal(rig.transport.turnStartCount, 1);
+      assert.equal(rig.client.releaseCalls.length, 1);
+    } finally { release(); rig.transport.end(); t.mock.timers.reset(); }
+  });
+
+  for (const followup of ["none", "clarification", "prose"] as const) it(`3462 human revision ${followup} silence retains terminal idle`, async t => {
+    const silentTurn = followup === "none" ? 2 : 3;
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) c.transport.push(threadStarted())
+          .push(toolCall(1, "submit_plan", { plan_md: "initial" }, "th-1", "tn-1", "plan"))
+          .push(turnCompleted("completed"));
+        else if (c.turnStartCount === 2 && followup !== "none") {
+          c.transport.push(followup === "prose" ? agentMessage("I will revise this")
+            : toolCall(2, "ask_user", { questions: [{ question: "Which?", header: "Target" }] }, "th-1", "tn-1", "ask"))
+            .push(turnCompleted("completed"));
+        }
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    rig.deps = { ...rig.deps, idleMs: 100, wallMs: 5000 };
+    let retries = 0, gates = 0;
+    const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined,
+      gatePlan: async () => { gates++; return { kind: "revise", feedback: "change", inputId: 11 }; },
+      askUser: async () => ({ kind: "answer", answers: ["server"] }),
+      retryPlanRevisionTurn: async () => { retries++; },
+    });
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    void running.catch(() => undefined);
+    try {
+      await until(() => rig.transport.turnStartCount === silentTurn);
+      await tick(); t.mock.timers.tick(100);
+      await assert.rejects(running, (error: unknown) => {
+        assert.ok(error instanceof Error && !(error instanceof TransientRecoveryError));
+        assert.equal(error.message, "codex run idle timeout"); return true;
+      });
+      assert.equal(retries, 0); assert.equal(gates, 1);
+      assert.equal(rig.transport.turnStartCount, silentTurn);
+    } finally { rig.transport.end(); t.mock.timers.reset(); }
+  });
+
+  it("3462 a typed idle trip with undefined evidence cannot recover", async t => {
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") return { turn: { id: "tn-1" } };
+      return {};
+    } });
+    rig.deps = { ...rig.deps, idleMs: 100, wallMs: 5000 };
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    // Exercise the real typed error without exporting the private error class.
+    const seam = executor as unknown as {
+      tripError(reason: string, token: { seq: number; sharedPauseAbort: boolean }, evidence?: number): Error;
+    };
+    const trip = seam.tripError.bind(seam);
+    let typed: Error | undefined;
+    seam.tripError = (reason, token) => {
+      typed = trip(reason, token, undefined);
+      assert.equal((typed as Error & { processedEvents?: number }).processedEvents, undefined);
+      return typed;
+    };
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const running = executor.run(makeCtx().ctx);
+    void running.catch(() => undefined);
+    try {
+      await until(() => rig.transport.turnStartCount === 1);
+      await tick(); t.mock.timers.tick(100);
+      await assert.rejects(running, (error: unknown) => {
+        assert.equal(error, typed);
+        assert.ok(error instanceof Error && !(error instanceof TransientRecoveryError));
+        assert.equal(error.message, "codex run idle timeout");
+        return true;
+      });
+      assert.equal(rig.transport.turnStartCount, 1);
+    } finally { rig.transport.end(); t.mock.timers.reset(); }
+  });
+
+  it("3462 real runner human revision zero-output idle fails and closes the gate", async () => {
+    const api = new FakeApi("revision-idle-worker");
+    const url = await api.listen();
+    const fx = makeFixture();
+    const diagnostics = recordingLog();
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) c.transport.push(threadStarted())
+          .push(toolCall(1, "submit_plan", { plan_md: "# Initial plan" }, "th-1", "tn-1", "plan"))
+          .push(turnCompleted("completed"));
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    rig.deps = { ...rig.deps, idleMs: 100, wallMs: 5000, deferRegistryTeardown: true };
+    const client = new WorkerClient(url, "revision-idle-worker", "test", diagnostics.log, {
+      sleep: async () => {}, terminalRetrySchedule: [1, 1],
+    });
+    const claim = makeClaim({
+      repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+      auto_approve: false, plan_approved: false,
+      secrets: { forge_pat: "fixture-forge-pat-000000", codex: SUBSCRIPTION as never },
+    });
+    api.onState(claim.run_id, body => {
+      if (body.status === "awaiting_approval") api.setInputs(claim.run_id,
+        [{ id: 1, kind: "revise_plan", body: "tighten the scope" }]);
+    });
+    let produced: unknown;
+    let revisions = 0;
+    let retries = 0;
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const run = executor.run.bind(executor);
+    executor.run = async ctx => {
+      const gate = ctx.gatePlan!;
+      const retry = ctx.retryPlanRevisionTurn;
+      ctx.gatePlan = async (...args) => {
+        const verdict = await gate(...args);
+        assert.equal(verdict.kind, "revise");
+        if (verdict.kind === "revise") assert.equal(verdict.feedback, "tighten the scope");
+        revisions++;
+        return verdict;
+      };
+      ctx.retryPlanRevisionTurn = async (...args) => { retries++; await retry?.(...args); };
+      try { return await run(ctx); } catch (error) { produced = error; throw error; }
+    };
+    try {
+      const git = new GitCache(fx.dataDir, diagnostics.log, undefined, testGitCacheOptions());
+      await new RunRunner(client, git, () => ({ executor }), diagnostics.log, 20, undefined, {
+        pollMs: 5,
+        quiesceRun: async () => ({
+          process: { state: "quiescent", processes: [], killed: [], detail: "fixture roots reaped" },
+          docker: { state: "not_wired", removed: [], detail: "not wired" },
+        }),
+      }).execute(claim);
+      assert.ok(produced instanceof Error && !(produced instanceof TransientRecoveryError), diagnostics.lines.join("\n"));
+      assert.equal(produced.message, "codex run idle timeout");
+      assert.equal(revisions, 1);
+      assert.equal(retries, 0);
+      assert.equal(rig.transport.turnStartCount, 2);
+      const states = api.states.filter(s => s.runId === claim.run_id).map(s => s.body);
+      assert.equal(states.filter(s => s.status === "awaiting_approval").length, 1);
+      assert.equal(states.filter(s => s.status === "failed").length, 1);
+      assert.equal(states.at(-1)?.status, "failed", "the revision gate ends in a terminal state");
+      assert.equal(states.at(-1)?.failure_reason, "codex run idle timeout");
+      assert.ok(!states.some(s => s.status === "recovery_wait"));
+    } finally { rig.transport.end(); await api.close(); fx.cleanup(); }
+  });
+
+  it("3462 a plain idle-message Error has unknown evidence and cannot recover", async () => {
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") throw new Error("codex run idle timeout");
+      return {};
+    } });
+    await assert.rejects(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), (error: unknown) => {
+      assert.ok(error instanceof Error && !(error instanceof TransientRecoveryError));
+      assert.equal(error.message, "codex run idle timeout"); return true;
+    });
+    assert.equal(rig.transport.turnStartCount, 1);
+  });
+});
+
 describe("CodexExecutor: transient provider retry (issue #2099)", () => {
   /** A failed `turn/completed` carrying a terminal `turn.error.codexErrorInfo`. */
   function turnCompletedWithError(codexErrorInfo: unknown, threadId = "th-1", turnId = "tn-1"): CodexNotification {
@@ -18071,13 +18444,21 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     assert.equal(retryNotices(emitted).length, 2);
   });
 
-  it("rateLimitExceeded exhaustion from the real executor reaches the runner typed provider_outage park", async () => {
+  for (const silence of [false, true]) it(`real runner ${silence ? "3462 silence parks and resumes the persisted session" : "rateLimitExceeded exhaustion reaches typed provider_outage"}`, async () => {
+    const parkedId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
     const api = new FakeApi("rate-limit-worker");
     const url = await api.listen();
     const fx = makeFixture();
     const diagnostics = recordingLog();
-    const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, "rateLimitExceeded") });
-    tinyBackoff(rig, { deferRegistryTeardown: true });
+    const rig = makeRig({ responder: silence ? c => {
+      if (c.method === "thread/start") return { thread: { id: parkedId } };
+      if (c.method === "turn/start") {
+        c.transport.push(threadStarted(parkedId));
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } : failingThenDone(Number.MAX_SAFE_INTEGER, "rateLimitExceeded") });
+    tinyBackoff(rig, { deferRegistryTeardown: true, ...(silence ? { idleMs: 30 } : {}) });
     const launchCapture = rig.deps.launchEffectRoot!;
     const captureGitLaunches: CodexEffectLaunchSpec[] = [];
     rig.deps = { ...rig.deps, launchEffectRoot: async (spec, deadline) => {
@@ -18090,6 +18471,13 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
       sleep: async () => {}, terminalRetrySchedule: [1, 1],
     });
     client.protocolFeatures = ["claim_generation_fence", "recovery_cause_provider_outage"];
+    if (silence) {
+      client.protocolFeatures.push("run_checkpoint_durability");
+      client.publishCheckpoint = async (_runId, _tip, pack) => {
+        for await (const _chunk of pack) { /* Drain the supervised capture's real pack. */ }
+        return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/test" } };
+      };
+    }
     api.recoveryWaitRequiresRunning = true;
     const claim = makeClaim({
       repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
@@ -18099,6 +18487,12 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     });
     const git = new GitCache(fx.dataDir, diagnostics.log, undefined, testGitCacheOptions());
     const barePath = git.barePathFor(claim.repo.clone_url);
+    let parkedClone: Awaited<ReturnType<GitCache["createOrAttachRunnerClone"]>> | undefined;
+    const createClone = git.createOrAttachRunnerClone.bind(git);
+    git.createOrAttachRunnerClone = async (...args) => {
+      parkedClone = await createClone(...args);
+      return parkedClone;
+    };
     const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
     const homeDir = path.join(fx.dataDir, "rate-limit-home");
     let produced: unknown;
@@ -18106,6 +18500,14 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     const run = executor.run.bind(executor);
     executor.run = async ctx => {
       clonePath = ctx.worktreePath;
+      if (silence) {
+        const source = path.join(fx.dataDir, "session-source");
+        await fs.mkdir(path.join(source, "sessions"), { recursive: true });
+        await fs.mkdir(homeDir, { recursive: true });
+        await fs.writeFile(path.join(source, "sessions", `rollout-${parkedId}.jsonl`),
+          JSON.stringify({ type: "session_meta", payload: { id: parkedId, cwd: ctx.worktreePath } }) + "\n");
+        await CodexSessionStore.persist(source, path.join(homeDir, "codex-session-store"));
+      }
       // Read the fixture's actual refs without launching an extra unsupervised Git child.
       const readFixtureHead = async (gitdir: string): Promise<string> => {
         const head = (await fs.readFile(path.join(gitdir, "HEAD"), "utf8")).trim();
@@ -18139,19 +18541,65 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
           }),
         }).execute(claim);
       assert.ok(produced instanceof TransientRecoveryError, diagnostics.lines.join("\n"));
-      assert.equal(produced.providerOrigin, true);
+      assert.equal(produced.providerOrigin, !silence);
       assert.ok(captureGitLaunches.some(spec => spec.identity === "worker_pat" && spec.cwd === barePath),
         "capture uses real supervised Git in the trusted worker bare");
       assert.ok(captureGitLaunches.some(spec => spec.identity === "command" && spec.cwd === clonePath),
         "capture uses real supervised Git in the runner clone");
-      assert.equal(rig.transport.turnStartCount, 3, "the real producer spent exactly two retries");
+      assert.equal(rig.transport.turnStartCount, silence ? 1 : 3, "silence parks directly; classified errors spend two retries");
       const reports = api.states.filter(s => s.runId === claim.run_id && s.body.status === "recovery_wait");
       assert.equal(reports.length, 1, diagnostics.lines.join("\n"));
-      assert.equal(reports[0]!.body.recovery_cause, "provider_outage");
-      assert.equal(reports[0]!.body.productive_turns, 0, "failed rate-limit attempts are not productive");
+      assert.equal(reports[0]!.body.recovery_cause, silence ? undefined : "provider_outage");
+      assert.equal(reports[0]!.body.productive_turns, silence ? undefined : 0);
       assert.equal(reports[0]!.body.claim_generation, 3);
       assert.equal(rig.client.refreshCalls.length, 1, "only the held recovery boundary reconciles credentials");
       assert.ok(!api.states.some(s => s.body.status === "failed" || s.body.status === "limit_wait"));
+      if (silence) {
+        assert.equal(reports[0]!.body.session_id, parkedId);
+        assert.equal(await CodexSessionStore.inspect(path.join(homeDir, "codex-session-store")), "present");
+        const resumed = makeRig({ responder: c => {
+          if (c.method === "thread/resume") return { thread: { id: parkedId } };
+          if (c.method === "turn/start") {
+            c.transport.push(signalDone(parkedId)).push(turnCompleted("completed", parkedId));
+            return { turn: { id: "tn-1" } };
+          }
+          return {};
+        } });
+        resumed.deps = { ...resumed.deps, deferRegistryTeardown: true,
+          launchEffectRoot: rig.deps.launchEffectRoot,
+          sessionStore: { ...resumed.deps.sessionStore!, inspect: async () => "present" },
+        };
+        const resumeExecutor = makeExecutor(resumed, bindingOf(SUBSCRIPTION));
+        const resumeRun = resumeExecutor.run.bind(resumeExecutor);
+        resumeExecutor.run = async ctx => {
+          assert.equal(ctx.sessionId, parkedId);
+          const head = commitInTree(ctx.worktreePath, "RESUMED.txt", "recovered work\n");
+          assert.equal((await fs.readFile(path.join(ctx.worktreePath, ".git", "refs", "heads", ctx.branch), "utf8")).trim(), head,
+            "the resumed work is committed on the runner branch before supervised capture");
+          return resumeRun(ctx);
+        };
+        // Pin the resolvable-path fixture: retained-source successor selection has its
+        // own tests and intentionally changes cwd. This leg exercises the real runner's
+        // session adoption and transport resume when that path remains resolvable.
+        assert.ok(parkedClone);
+        git.discoverRetainedRecovery = async () => undefined;
+        git.recoveryAttemptMode = async () => false;
+        git.createOrAttachRunnerClone = async () => parkedClone!;
+        api.setOwnershipStatus(claim.run_id, "running", 3);
+        api.setInputClaimGeneration(claim.run_id, 3);
+        await new RunRunner(client, git, () => ({ executor: resumeExecutor, homeDir }), diagnostics.log, 20, undefined, {
+          gitlab: fakeGitlab().gitlab, pollMs: 5,
+          quiesceRun: async () => ({
+            process: { state: "quiescent", processes: [], killed: [], detail: "fixture roots reaped" },
+            docker: { state: "not_wired", removed: [], detail: "not wired" },
+          }),
+        }).execute({ ...claim, session_id: parkedId, claim_generation: 3, last_seq: 1000 });
+        assert.equal(resumed.transport.requests.filter(r => r.method === "thread/resume").length, 1, diagnostics.lines.join("\n"));
+        assert.equal(rec(resumed.transport.requests.find(r => r.method === "thread/resume")!.params).threadId, parkedId);
+        assert.equal(resumed.transport.requests.filter(r => r.method === "thread/start").length, 0);
+        assert.equal(api.states.at(-1)?.body.status, "completed", diagnostics.lines.join("\n"));
+        assert.equal(api.states.filter(s => s.body.status === "recovery_wait").length, 1);
+      }
     } finally { await api.close(); fx.cleanup(); }
   });
 
@@ -23628,7 +24076,7 @@ describe("3282 Codex historical completion wall routing", () => {
 
 
 describe("3282 historical boundary regressions", () => {
-  it("3282 historical-only idle remains an idle error without hold or wall park", async () => {
+  it("3282 historical-only zero-evidence idle recovers without hold or wall park", async () => {
     const rig = makeMultiEpochRig([epochResponder("th-1", "tn-1", () => {})]);
     rig.deps = { ...rig.deps, idleMs: 20, wallMs: 5000 };
     let holds = 0, parks = 0;
@@ -23637,7 +24085,7 @@ describe("3282 historical boundary regressions", () => {
       enterCompletionHold: async () => { holds++; return true; },
       parkForWall: async () => { parks++; return "parked"; },
     });
-    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "historical idle"), /codex run idle timeout/);
+    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "historical idle"), TransientRecoveryError);
     assert.equal(holds, 0); assert.equal(parks, 0);
     assert.equal(rig.providerLaunches(), 1);
     assert.equal(rig.epochs[0]!.transport.turnStartCount, 1);
