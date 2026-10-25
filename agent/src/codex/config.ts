@@ -127,11 +127,9 @@ function nativeDisabledConfigLines(
  * supported runtime authentication/discovery/cache policy; uzi's curated picker
  * and validation policy remain independent of that metadata refresh.
  * Upstream RemoteModels and Stage::Removed documentation:
- * https://github.com/openai/codex/blob/83086188ae0614bd882818ff1aa23f3194962012/codex-rs/features/src/lib.rs#L1400-L1403
- * https://github.com/openai/codex/blob/83086188ae0614bd882818ff1aa23f3194962012/codex-rs/features/src/lib.rs#L61-L62
+ * https://github.com/openai/codex/blob/83086188ae0614bd882818ff1aa23f3194962012/codex-rs/features/src/lib.rs
  * Upstream should_refresh_models and refresh_after_auth_change:
- * https://github.com/openai/codex/blob/83086188ae0614bd882818ff1aa23f3194962012/codex-rs/models-manager/src/manager.rs#L675-L679
- * https://github.com/openai/codex/blob/83086188ae0614bd882818ff1aa23f3194962012/codex-rs/models-manager/src/manager.rs#L405-L417
+ * https://github.com/openai/codex/blob/83086188ae0614bd882818ff1aa23f3194962012/codex-rs/models-manager/src/manager.rs
  */
 export function buildCodexConfigToml(opts: CodexConfigOptions): string {
   const { model, provider, projectPath } = opts;
