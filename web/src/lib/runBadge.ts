@@ -38,6 +38,9 @@ export type RunBadge =
       tone: BadgeTone;
       pulse: boolean;
       title?: string;
+      // wrap lets a sentence-length label (the maintenance wait) wrap instead of
+      // overflowing a narrow card; absent keeps the usual one-line pill.
+      wrap?: boolean;
     };
 
 // MrChipState is the MR chip's display variant (PRD #33 Decision 2, a
@@ -503,13 +506,17 @@ export function healthBadge(
   // PRD #3454: a maintenance-held run is waiting ON PURPOSE. This takes precedence over
   // every health flag (the server's detector may still say waiting_worker): a calm INFO
   // pill, no pulse, no elapsed "stuck for" clock, since the wait is the admin's drain.
+  // The visible label is the full PRD sentence (reason included), wrapping on a narrow
+  // card; the title repeats it for a truncating surface.
   if (isMaintenanceQueued(run)) {
+    const text = maintenanceQueueText(maintenanceReason);
     return {
       kind: "badge",
-      label: "waiting: maintenance",
+      label: text,
       tone: "info",
       pulse: false,
-      title: maintenanceQueueText(maintenanceReason),
+      title: text,
+      wrap: true,
     };
   }
   if (!shouldShowHealthFlag(run.health, run.status)) return null;

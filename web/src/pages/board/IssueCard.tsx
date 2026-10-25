@@ -434,7 +434,7 @@ export function IssueCard({
             <MrChip mrIid={badge.mrIid} mrState={badge.mrState} href={mrHref} forgeType={card.forge_type} />
           ) : (
             <span className={badge.pulse ? "animate-pulse" : ""}>
-              <Badge tone={badge.tone} title={badge.title}>
+              <Badge tone={badge.tone} title={badge.title} wrap={badge.wrap}>
                 {badge.label}
               </Badge>
             </span>

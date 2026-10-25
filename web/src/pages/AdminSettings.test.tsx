@@ -306,12 +306,6 @@ describe("agent-source Health navigation", () => {
 describe("AdminSettings — vault migration (PRD #32)", () => {
   it("hides the migration notice when nothing is master-sealed", async () => {
     mockApi.vaultMigration.mockResolvedValue({ master_sealed: 0 });
-  // PRD #3454: the Maintenance card self-loads; off with a clear readout.
-  const none = { count: 0, items: [] };
-  mockApi.getAdminMaintenance.mockResolvedValue({
-    state: { active: false, since: null, reason: null, by_label: null },
-    readout: { as_of: "2026-10-25T12:00:00Z", clear: true, active: none, held: none, custody: none, queued: none, idle_bound_workers: none },
-  });
     renderPage();
     await screen.findByLabelText("uzi label");
     expect(screen.queryByText(/pre-vault encryption/i)).toBeNull();

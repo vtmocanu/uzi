@@ -10,13 +10,13 @@ import { useMaintenance } from "../lib/useMaintenance";
 // board card uses, so the label and gating stay defined in one place. The title
 // carries the owner-only reason when present (a non-owner's health_reason is null).
 export function RunHealthBadge({ run, nowMs = Date.now() }: { run: HealthFlaggable; nowMs?: number }) {
-  // PRD #3454: a maintenance-held run shows the calm "waiting: maintenance" pill instead,
+  // PRD #3454: a maintenance-held run shows the calm "waiting: uzi is in maintenance mode" pill instead,
   // its tooltip carrying the admin's reason from the shared maintenance state.
   const maintenanceReason = useMaintenance().status?.reason;
   const badge = healthBadge(run, nowMs, maintenanceReason);
   if (!badge || badge.kind !== "badge") return null;
   return (
-    <Badge tone={badge.tone} title={badge.title}>
+    <Badge tone={badge.tone} title={badge.title} wrap={badge.wrap}>
       {badge.label}
     </Badge>
   );

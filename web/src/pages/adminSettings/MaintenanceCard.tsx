@@ -11,7 +11,7 @@ import {
 import { errorMessage } from "../../lib/apiError";
 import { formatLocalTime } from "../../lib/budget";
 import { useDemoMode } from "../../lib/demoMode";
-import { maskName, maskRepoPath } from "../../lib/demoMask";
+import { maskEmail, maskName, maskRepoPath } from "../../lib/demoMask";
 import { formatElapsed } from "../../lib/runBadge";
 import { stripDisplayCell } from "../../lib/safeText";
 import { useAsyncData } from "../../lib/useAsyncData";
@@ -42,6 +42,12 @@ function Age({ since }: { since: string | null }) {
   const t = since ? Date.parse(since) : NaN;
   if (!since || !Number.isFinite(t)) return <span className="text-faint">unknown</span>;
   return <span title={`Since ${formatLocalTime(since) ?? since}`}>{formatElapsed(Date.now() - t)}</span>;
+}
+
+// maskLabel masks a person label in demo mode: the server's label is a display name or, when
+// a user has none, an email, and each shape has its own mask.
+function maskLabel(label: string, demo: boolean): string {
+  return label.includes("@") ? maskEmail(label, demo) : maskName(label, demo);
 }
 
 // shortRunId keeps a UUID scannable in a dense table (its first 8 characters, the full id in
@@ -109,7 +115,7 @@ function RunTable({ items, label }: { items: MaintenanceRunItem[]; label: string
               </td>
               <td className="px-3 py-1.5 text-muted">{stripDisplayCell(it.kind)}</td>
               <td className="px-3 py-1.5 text-muted">{stripDisplayCell(it.status).replace(/_/g, " ")}</td>
-              <td className="px-3 py-1.5">{maskName(stripDisplayCell(it.owner_label), demo)}</td>
+              <td className="px-3 py-1.5">{maskLabel(stripDisplayCell(it.owner_label), demo)}</td>
               <td className="max-w-[12rem] truncate px-3 py-1.5 text-muted">
                 {it.repo ? maskRepoPath(stripDisplayCell(it.repo), demo) : <span className="text-faint">none</span>}
               </td>
@@ -130,7 +136,7 @@ function WorkerTable({ items }: { items: MaintenanceIdleWorker[] }) {
       {items.map((w) => (
         <li key={w.worker_id} className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 px-3 py-1.5">
           <span className="font-mono text-xs">{stripDisplayCell(w.worker_id)}</span>
-          <span className="text-muted">{maskName(stripDisplayCell(w.owner_label), demo)}</span>
+          <span className="text-muted">{maskLabel(stripDisplayCell(w.owner_label), demo)}</span>
           <span className="text-muted">
             waits to claim{" "}
             <Link to={`/runs/${encodeURIComponent(w.run_id)}`} className="font-mono text-xs text-info hover:underline">
@@ -163,6 +169,7 @@ function Counter({ label, count, blocker }: { label: string; count: number; bloc
 // it is safe to evict nodes. The web is the only writer (D6); PUT is admin + CSRF.
 export function MaintenanceCard() {
   const { reload: reloadBanner } = useMaintenance();
+  const demo = useDemoMode();
   const [data, setData] = useState<AdminMaintenance | null>(null);
   const [reason, setReason] = useState("");
   const [busy, setBusy] = useState<"toggle" | "reason" | null>(null);
@@ -231,7 +238,7 @@ export function MaintenanceCard() {
   const state = data?.state;
   const readout = data?.readout;
   const since = formatLocalTime(state?.since);
-  const by = state?.by_label ? stripDisplayCell(state.by_label) : "";
+  const by = state?.by_label ? maskLabel(stripDisplayCell(state.by_label), demo) : "";
   const blockersLeft = readout ? readout.active.count + readout.held.count + readout.custody.count : 0;
 
   return (
@@ -325,7 +332,11 @@ export function MaintenanceCard() {
                 ) : (
                   <p className="flex items-center gap-2 text-sm font-medium text-warn" data-maintenance-clear="false">
                     <span aria-hidden="true" className="inline-block h-2 w-2 rounded-full bg-warn" />
-                    Not yet clear: {blockersLeft} {blockersLeft === 1 ? "blocker" : "blockers"} left (as of {asOfTime(readout.as_of)})
+                    {/* "clear" is the server's verdict; a blocker it counts that the lists do not
+                        (a claim landing between the reads) must not read as "0 blockers left". */}
+                    {blockersLeft > 0
+                      ? `Not yet clear: ${blockersLeft} ${blockersLeft === 1 ? "blocker" : "blockers"} left (as of ${asOfTime(readout.as_of)})`
+                      : `Not yet clear (as of ${asOfTime(readout.as_of)})`}
                   </p>
                 )}
                 <p className="mt-1 text-xs text-muted">

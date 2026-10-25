@@ -1441,10 +1441,11 @@ describe("maintenance queue reason", () => {
   it("takes precedence over waiting for worker on the board badge and the list pill", () => {
     const expected = {
       kind: "badge",
-      label: "waiting: maintenance",
+      label: "waiting: uzi is in maintenance mode",
       tone: "info",
       pulse: false,
       title: "waiting: uzi is in maintenance mode",
+      wrap: true,
     };
     expect(runBadge(held, NOW)).toEqual(expected);
     expect(healthBadge(held, NOW)).toEqual(expected);
@@ -1453,6 +1454,8 @@ describe("maintenance queue reason", () => {
   it("appends the admin's reason as one sanitized cell", () => {
     const b = runBadge(held, NOW, "Node pool upgrade\n\u202e<b>x</b>");
     expect(b.kind === "badge" && b.title).toBe("waiting: uzi is in maintenance mode (Node pool upgrade<b>x</b>)");
+    // PRD acceptance example 1: the card's VISIBLE text is the full sentence, reason included.
+    expect(b.kind === "badge" && b.label).toBe("waiting: uzi is in maintenance mode (Node pool upgrade<b>x</b>)");
     expect(maintenanceQueueText("  ")).toBe("waiting: uzi is in maintenance mode");
     expect(maintenanceQueueText(null)).toBe("waiting: uzi is in maintenance mode");
   });

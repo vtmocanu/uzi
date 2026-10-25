@@ -246,6 +246,14 @@ describe("RunProgressCell (PRD #2602)", () => {
     expect(cell.textContent).toBe(`Progress: ${state}`);
   });
 
+  it("queued by maintenance: the sr-only word names why the run waits (PRD #3454)", () => {
+    const { container } = renderCell({ status: "queued", queue_reason: "maintenance", progress: progress({ state: "queued" }) });
+    const cell = cellOf(container) as HTMLElement;
+    expect(cell.getAttribute("data-run-progress")).toBe("queued");
+    expect(cell.className).toBe("sr-only");
+    expect(cell.textContent).toBe("Progress: queued: uzi is in maintenance mode");
+  });
+
   it("none: screen-reader-only no estimate without a visible placeholder", () => {
     const { container } = renderCell({ progress: progress({ state: "none" }) });
     const cell = cellOf(container) as HTMLElement;

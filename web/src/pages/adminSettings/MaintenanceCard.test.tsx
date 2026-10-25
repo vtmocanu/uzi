@@ -4,6 +4,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { MemoryRouter } from "react-router-dom";
 
 import { MaintenanceCard } from "./MaintenanceCard";
+import { setDemoMode } from "../../lib/demoMode";
 import { api, type AdminMaintenance, type MaintenanceRunItem } from "../../lib/api";
 
 vi.mock("../../lib/api", async (importOriginal) => {
@@ -14,6 +15,7 @@ const mockApi = vi.mocked(api);
 
 afterEach(() => {
   cleanup();
+  setDemoMode(false);
   vi.resetAllMocks();
 });
 
@@ -95,6 +97,32 @@ describe("MaintenanceCard", () => {
     expect(within(other).queryByText("needs owner")).toBeNull();
     expect(within(held).getByText("Showing 2 of 60.")).toBeTruthy();
     expect(reasonInput().value).toBe("Node pool upgrade");
+  });
+
+  it("trusts the server's clear verdict: not clear with every count at zero", async () => {
+    // Every listed category is empty, yet the server says not clear (a claim landed between
+    // its reads). The card follows readout.clear and never says "0 blockers left".
+    const d = doc({ active: true });
+    d.readout = { ...d.readout, clear: false };
+    await renderCard(d);
+    const line = document.querySelector('[data-maintenance-clear="false"]')!;
+    expect(line.textContent).toMatch(/^Not yet clear \(as of .+\)$/);
+    expect(line.textContent).not.toMatch(/blocker/);
+    expect(document.querySelector('[data-maintenance-clear="true"]')).toBeNull();
+  });
+
+  it("masks the turned-on-by and owner labels in demo mode, email and name alike", async () => {
+    setDemoMode(true);
+    const d = doc({ active: true, clear: false });
+    d.state.by_label = "ada.lovelace@example.com";
+    d.readout.active.items = [item({ run_id: "run-a", status: "running", owner_label: "Grace Hopper" })];
+    await renderCard(d);
+    expect(document.getElementById("maintenance-state")!.textContent).toContain("turned on by Ada");
+    expect(document.body.textContent).not.toContain("lovelace");
+    expect(document.body.textContent).not.toContain("example.com");
+    const row = document.querySelector('[data-maintenance-run="run-a"]') as HTMLElement;
+    expect(within(row).getByText("Grace")).toBeTruthy();
+    expect(document.body.textContent).not.toContain("Hopper");
   });
 
   it("turning on PUTs active with the typed reason, and turning off PUTs inactive", async () => {
