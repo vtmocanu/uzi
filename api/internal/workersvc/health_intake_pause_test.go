@@ -51,7 +51,7 @@ func TestHealthIntakePauseNotHeldKeepsWorkerReason(t *testing.T) {
 
 // After the lift health_since is restamped but the run does not nudge on that tick (no Slack DM
 // burst for the whole backlog); a run still stuck after the lift nudges only on a later
-// ok->flagged episode (accepted).
+// ok->flagged episode (accepted; PRD #3454 D12).
 func TestHealthLeftMaintenanceRestampsWithoutNudge(t *testing.T) {
 	r := runRow("queued")
 	r.StatusSince = ago(40 * time.Minute)

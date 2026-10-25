@@ -178,10 +178,13 @@ func (h *Handler) writeMaintenanceAdmin(w http.ResponseWriter, r *http.Request) 
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, apitypes.MaintenanceAdminDTO{
-		State: apitypes.MaintenanceAdminStateDTO{
-			Active: st.Active, Since: pgTimeStr(st.Since), Reason: pgTextStr(st.Reason), ByLabel: termSafePtr(pgTextStr(st.ByLabel)),
-		},
-		Readout: maintenanceReadoutDTO(readout),
-	})
+	httpx.JSON(w, http.StatusOK, apitypes.MaintenanceAdminDTO{State: maintenanceStateDTO(st), Readout: maintenanceReadoutDTO(readout)})
+}
+
+// maintenanceStateDTO maps the pause row to its wire form. by_label is the user-authored label of
+// whoever flipped the pause, so it is sanitized at this boundary like the readout labels.
+func maintenanceStateDTO(st store.IntakePauseState) apitypes.MaintenanceAdminStateDTO {
+	return apitypes.MaintenanceAdminStateDTO{
+		Active: st.Active, Since: pgTimeStr(st.Since), Reason: pgTextStr(st.Reason), ByLabel: termSafePtr(pgTextStr(st.ByLabel)),
+	}
 }

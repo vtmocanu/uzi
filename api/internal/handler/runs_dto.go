@@ -725,9 +725,6 @@ func (h *Handler) overlayCodexAccountActions(ctx context.Context, dtos ...*apity
 	}
 }
 
-// queueReasonMaintenance is the only queue_reason value (PRD #3454).
-const queueReasonMaintenance = "maintenance"
-
 // queueReasonPtr maps a SQL-derived queue_reason column (” = none) to the wire pointer.
 func queueReasonPtr(s string) *string {
 	if s == "" {

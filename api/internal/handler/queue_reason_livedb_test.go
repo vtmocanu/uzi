@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/google/uuid"
@@ -11,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/clitoken"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -134,6 +136,30 @@ func TestQueueReasonLiveDB(t *testing.T) {
 		}
 		return out
 	}
+	adminTok := cliMintToken(t, e.pool, cliSeedUser(t, e.pool, true), clitoken.ScopeAdminRO)
+	adminSummary := func() map[uuid.UUID]string {
+		r := e.call(http.MethodGet, "/api/admin/runs?view=summary", adminTok, "")
+		if r.status != http.StatusOK {
+			t.Fatalf("GET admin runs summary = %d %s", r.status, r.body)
+		}
+		var resp struct {
+			Runs []json.RawMessage `json:"runs"`
+		}
+		if err := json.Unmarshal(r.body, &resp); err != nil {
+			t.Fatal(err)
+		}
+		out := map[uuid.UUID]string{}
+		for _, raw := range resp.Runs {
+			var id struct {
+				ID uuid.UUID `json:"id"`
+			}
+			if err := json.Unmarshal(raw, &id); err != nil {
+				t.Fatal(err)
+			}
+			out[id.ID] = queueReasonOf(t, raw)
+		}
+		return out
+	}
 	check := func(phase string, pausedHeld bool) {
 		t.Helper()
 		want := ""
@@ -158,6 +184,18 @@ func TestQueueReasonLiveDB(t *testing.T) {
 				t.Errorf("%s: run list lacks %s run %s", phase, name, c.id)
 			} else if got != c.want {
 				t.Errorf("%s: list %s queue_reason = %q, want %q", phase, name, got, c.want)
+			}
+		}
+		admin := adminSummary()
+		for name, c := range map[string]struct {
+			id   uuid.UUID
+			want string
+		}{"held": {held, want}, "admitted": {admitted, ""}} {
+			got, ok := admin[c.id]
+			if !ok {
+				t.Errorf("%s: admin summary lacks %s run %s", phase, name, c.id)
+			} else if got != c.want {
+				t.Errorf("%s: admin summary %s queue_reason = %q, want %q", phase, name, got, c.want)
 			}
 		}
 		dto := v1Get(jobID)
@@ -198,8 +236,8 @@ func TestQueueReasonLiveDB(t *testing.T) {
 	}
 }
 
-// The board's latest run: every card projection (list + single-card) takes queue_reason from the
-// same SQL derivation.
+// The board's latest run (list projection) takes queue_reason from the same SQL derivation as the
+// single-card projection, which TestQueueReasonMoveIssueLiveDB covers.
 func TestQueueReasonBoardLiveDB(t *testing.T) {
 	ctx := context.Background()
 	f := newBoardOrderFixture(ctx, t, 1, 2, 3)
@@ -247,4 +285,44 @@ func TestQueueReasonBoardLiveDB(t *testing.T) {
 	want("paused", reasons(), "maintenance")
 	setQueueReasonPause(t, f.pool, false)
 	want("after the lift", reasons(), "")
+}
+
+// The single-card response (MoveIssue) carries the latest run's queue_reason too, so a drag never
+// blanks the badge the board is showing.
+func TestQueueReasonMoveIssueLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newMoveFixture(ctx, t, &moveStub{})
+	setQueueReasonPause(t, f.pool, false) // explicit baseline: an absent singleton row reads as paused
+	t.Cleanup(func() { setQueueReasonPause(t, f.pool, false) })
+	mustExecT(ctx, t, f.pool,
+		`INSERT INTO issues (repo_id, forge_issue_iid, title, state, labels, web_url, has_prd_link, forge_updated_at, synced_at)
+		 VALUES ($1, 320, 't', 'opened', '[]'::jsonb, 'https://x', false, now(), now())`, f.repoID)
+	mustExecT(ctx, t, f.pool,
+		`INSERT INTO runs (user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, claim_generation)
+		 VALUES ($1, $2, 'issue', 320, 't', 'd', 'queued', 0)`, f.user.ID, f.repoID)
+
+	move := func() string {
+		t.Helper()
+		rr := httptest.NewRecorder()
+		f.h.MoveIssue(rr, boardWriterReq(f.user, f.repoID, "320", `{"to_column":"Planned"}`))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("move status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+		}
+		var resp struct {
+			Card struct {
+				LatestRun json.RawMessage `json:"latest_run"`
+			} `json:"card"`
+		}
+		if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil || len(resp.Card.LatestRun) == 0 {
+			t.Fatalf("move body has no card.latest_run: %v %s", err, rr.Body.String())
+		}
+		return queueReasonOf(t, resp.Card.LatestRun)
+	}
+	if got := move(); got != "" {
+		t.Errorf("before the pause: single-card queue_reason = %q, want none", got)
+	}
+	setQueueReasonPause(t, f.pool, true)
+	if got := move(); got != "maintenance" {
+		t.Errorf("paused: single-card queue_reason = %q, want maintenance", got)
+	}
 }

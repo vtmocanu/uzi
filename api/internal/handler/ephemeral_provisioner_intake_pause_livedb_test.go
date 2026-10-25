@@ -197,7 +197,7 @@ func TestEphemeralProvisionOneRechecksIntakePauseLiveDB(t *testing.T) {
 		if err := fx.pool.QueryRow(fx.ctx,
 			`SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted
 			   AND classid::bigint = $1 AND objid::bigint = $2`,
-			int64(uint32(store.HostedProvisionLockClass)), int64(uint32(key))).Scan(&waiting); err != nil {
+			int64(store.HostedProvisionLockClass)&0xFFFFFFFF, int64(key)&0xFFFFFFFF).Scan(&waiting); err != nil {
 			t.Fatalf("probe pg_locks: %v", err)
 		}
 		if waiting > 0 {

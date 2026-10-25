@@ -388,7 +388,7 @@ func (q *Queries) ListMaintenanceQueuedRuns(ctx context.Context) ([]ListMaintena
 
 const listRunQueueReasons = `-- name: ListRunQueueReasons :many
 SELECT r.id AS run_id,
-       (CASE WHEN r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r) THEN 'maintenance' ELSE '' END)::text AS queue_reason
+       'maintenance'::text AS queue_reason
 FROM runs r
 WHERE r.id = ANY($1::uuid[])
   AND r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r)

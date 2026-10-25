@@ -147,7 +147,7 @@ LIMIT 50;
 -- the pause. Only runs that are queued, not admitted, while intake is paused are returned (reason
 -- "maintenance"); every other id is absent.
 SELECT r.id AS run_id,
-       (CASE WHEN r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r) THEN 'maintenance' ELSE '' END)::text AS queue_reason
+       'maintenance'::text AS queue_reason
 FROM runs r
 WHERE r.id = ANY(@run_ids::uuid[])
   AND r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r);
