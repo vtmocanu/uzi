@@ -35,7 +35,9 @@ when the first attempt started a new session.
 
 Retry backoff consumes the turn's wall budget. Genuine wall/idle timeout,
 typed pause and cancellation remain higher-priority outcomes; budget
-exhaustion is not itself a reason to enter recovery.
+exhaustion is not itself a reason to enter recovery. The #3462 amendment below
+adds a narrow Codex zero-model-processing-evidence idle exception to this
+historical timeout precedence.
 
 ### Verified capture before a promotable park
 
@@ -746,7 +748,8 @@ precedence), with the original prompt and callbacks:
 
 Known boundaries. A stream that yields only init or rate-limit events and then
 ends is not covered. A park after exhausted retries does not carry the drained
-steer, as with the positively-empty path today. The Codex lane is out of scope.
+steer, as with the positively-empty path today. The Codex lane is out of scope
+for #3179; the #3462 amendment below separately covers its zero-evidence idle.
 The evidence is a scripted executor reproduction; no real-provider occurrence has
 been observed. The ADR-1416 steering bridge is unchanged.
 
@@ -814,3 +817,70 @@ downgrade while recovery is pending stays unsupported: an older worker cannot
 parse the new journal field, treats the journal as corrupt and fails closed.
 
 Scope: the `data_volume_full` task-run symptom is not fixed here (#3329).
+
+## Amendment 2026-10-25, #3462: Codex zero-evidence idle enters ordinary recovery
+
+An eligible Codex lead turn that reaches the idle timeout with zero
+model-processing evidence now enters ordinary recovery. This is the narrow
+exception to the historical genuine wall/idle precedence above; it does not
+extend #3179's Claude event-free-stream rule to Codex.
+
+The measurement is `processedEvents === 0` on a real `CodexTurnTripError`
+for `REASON_IDLE`, using the existing `evidencesModelProcessing` predicate
+in [the harness contract](../agent/src/harness.ts). It is not a raw event
+count: lifecycle events can arrive without proving model processing.
+Assistant-authored main-origin frames admitted by that predicate and
+model-initiated activity count as evidence. Unknown evidence, a synthetic
+trip or an ordinary error whose text happens to match the idle reason
+does not qualify.
+
+[CodexExecutor.driveTurnWithWallPark](../agent/src/codex/codex-executor.ts)
+persists the session through the existing pre-reaping sink and throws
+`TransientRecoveryError` with
+the exact message `provider sent no model output within the idle timeout`.
+It leaves `providerOrigin` false. The runner captures and verifies the
+restore point before reporting an ordinary, untyped `recovery_wait`, without
+`provider_outage` or provider-streak accounting: silence proves neither a
+provider error nor that the model processed the prompt.
+
+Eligibility covers initial planning, automatic plan revisions and implementation
+model turns.
+`drivePlan` excludes human plan-revision turns throughout the invocation,
+including their clarification and prose-only followups. Those idle outcomes
+retain the existing failure contract. Productive idle, callback-based idle
+suppression, `idleOperation`, child turns and the Claude lane are unchanged.
+The [SDK recovery-error comment](../agent/src/sdk-executor.ts) records the
+same Codex exception.
+
+Cancellation, pending pause and spent wall take their existing routes before
+recovery. Completion hold is considered before the zero-evidence idle park;
+an accepted hold wins. After a declined idle completion hold and after
+pre-recovery persistence/capture, the executor rechecks interruption state
+and charges the elapsed wait against the remaining wall budget. A late cancel,
+pause or spent wall therefore takes its existing route instead of becoming
+ordinary recovery. A latched vault lock prevents this conversion; a lock
+latched after the idle trip preserves the earlier idle outcome.
+
+There is no in-process retry or transient-retry debit for this idle outcome,
+including silence after a #2099 retry. The existing #2099 classified-provider
+retry count and same-thread retries remain unchanged; that in-process
+backoff stays clamped to the remaining wall budget. A fresh
+harness is required after the recovery park: `turn/interrupt` is a
+best-effort cancellation request, not proof that the provider turn terminated,
+so ending the local stream does not authorize another turn on that harness.
+The existing verified-capture and settlement requirements still apply.
+
+Ordinary recovery retains its uncapped lifetime park count and existing
+exponential server backoff clamped at the configured maximum, plus jitter.
+Repeated silence can recover until the run wall requires an owner park or
+the owner cancels. This adds no provider-outage
+cap. A resolvable persisted session can resume on the new harness. If the
+provider rejects `thread/resume`, the existing fresh-thread fallback emits
+`resume_lineage_break` and warns that earlier context is lost and work may
+be repeated.
+
+**Evidence boundary.** Evidence is limited to scripted app-server/executor
+and runner fixtures in [the Codex executor tests](../agent/test/codex-executor.test.ts).
+The resume fixture covers a resolvable non-Docker session path, with
+retained-source successor selection bypassed; it does not establish general
+successor-path or Docker resume coverage. There is no live-provider proof.
