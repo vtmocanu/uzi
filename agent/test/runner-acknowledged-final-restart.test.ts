@@ -688,9 +688,70 @@ for (const { caller, afterUnlinkFault, liveClient } of [
         () => ({ ok: true, missing: [] }), freshOutbox, new Map());
       assert.equal(await freshOutbox.readTerminalJournal(claim.run_id, generation), undefined,
         "finalize discovery runs without a companion terminal");
-      await (worker as unknown as { sweepPendingFinalizes(): Promise<void> }).sweepPendingFinalizes();
-      assert.deepEqual(freshOutbox.listPendingFinalizeGenerations(), [],
-        "acknowledged archive retires worker finalize retry despite redundant FINAL and lost clone");
+      const sweep = async () => {
+        await (worker as unknown as { sweepPendingFinalizes(): Promise<void> }).sweepPendingFinalizes();
+        assert.deepEqual(freshOutbox.listPendingFinalizeGenerations(), [],
+          "acknowledged archive retires worker finalize retry despite redundant FINAL and lost clone");
+      };
+      if (caller === "worker finalize retry" && liveClient && !afterUnlinkFault) {
+        const withReservationDelay = async (action: () => Promise<void>) => {
+          let offset = 0;
+          const realNow = Date.now.bind(Date);
+          const boundary = freshRunner as unknown as BoundaryRunner;
+          const realReserve = boundary.withReportSourceReservation.bind(freshRunner);
+          const clock = t.mock.method(Date, "now", () => realNow() + offset);
+          const reservation = t.mock.method(boundary, "withReportSourceReservation",
+            (runId: string, reservedAction: (eligible: () => boolean) => Promise<void>) => {
+              assert.equal(runId, claim.run_id, "the real reservation boundary names the expected run");
+              offset = 1_500;
+              return realReserve(runId, reservedAction);
+            });
+          try {
+            await action();
+            assert.ok(reservation.mock.callCount() > 0, "retirement reached the real reservation boundary");
+          } finally {
+            offset = 0;
+            reservation.mock.restore();
+            clock.mock.restore();
+          }
+        };
+        const expectedIdentity = freshOutbox.finalizeRecordIdentity(claim.run_id, generation);
+        assert.ok(expectedIdentity);
+        const log = Reflect.get(freshRunner, "log") as ReturnType<typeof nullLogger>;
+        const retained = t.mock.method(log, "debug");
+        try {
+          // Keep production timing: expiry at the real reservation must retain the report.
+          await withReservationDelay(async () => {
+            assert.deepEqual(await freshRunner.retireRecoveryReport(claim.run_id, generation,
+              { expectedIdentity }, "finalize", freshOutbox), { retired: false });
+          });
+          const reasons = retained.mock.calls.filter(({ arguments: [message, fields] }) =>
+            message === "recovery: report retained" && fields?.run_id === claim.run_id &&
+            fields?.generation === generation).map(({ arguments: [, fields] }) => fields?.error);
+          assert.deepEqual(reasons, ["report proof unavailable"]);
+          assert.equal(freshOutbox.finalizeRecordIdentity(claim.run_id, generation), expectedIdentity);
+          assert.deepEqual(freshOutbox.listPendingFinalizeGenerations(),
+            [{ run_id: claim.run_id, claim_generation: 29 }]);
+          assert.deepEqual(await freshCoordinator.inspect(claim.run_id), records);
+          assert.deepEqual(completionSnapshot(), bindingsBefore);
+        } finally {
+          retained.mock.restore();
+        }
+
+        // Like the later physical control, lend only this positive sweep bounded headroom.
+        const proofBudget = t.mock.method(reportProofTiming, "proofBudgetMs", () => 10_000);
+        const finalizeAuthority = t.mock.method(reportProofTiming, "finalizeAuthorityMs", () => 10_000);
+        const finalizePass = t.mock.method(reportProofTiming, "finalizePassMs", () => 10_000);
+        try {
+          await withReservationDelay(sweep);
+        } finally {
+          finalizePass.mock.restore();
+          finalizeAuthority.mock.restore();
+          proofBudget.mock.restore();
+        }
+      } else {
+        await sweep();
+      }
     }
     assert.deepEqual(outcomes.at(-1), { retired: true, authority: "acknowledged_final_report_only" });
     assert.equal(notification.mock.callCount(), 0);
