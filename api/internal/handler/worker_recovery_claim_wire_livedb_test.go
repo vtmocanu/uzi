@@ -40,7 +40,8 @@ func TestWorkerRecoveryOwnerResumeServiceClaimWireLiveDB(t *testing.T) {
 	svc.SetTxBeginner(fx.pool)
 	oldWorker := fx.onlineWorker("recovery-wire-old", false)
 	newWorker := fx.onlineWorker("recovery-wire-new", false)
-	exec("UPDATE workers SET protocol_capabilities=$2 WHERE id=ANY($1::uuid[])", []uuid.UUID{oldWorker, newWorker}, []string{capability.RecoveryArchiveV1})
+	memoryResumeWorker := fx.onlineWorker("recovery-wire-memory-resume", false)
+	exec("UPDATE workers SET protocol_capabilities=$2 WHERE id=ANY($1::uuid[])", []uuid.UUID{oldWorker, newWorker, memoryResumeWorker}, []string{capability.RecoveryArchiveV1})
 	id := fx.queuedRun([]string{})
 	claim := func(workerID uuid.UUID, want int64) {
 		t.Helper()
@@ -119,7 +120,25 @@ func TestWorkerRecoveryOwnerResumeServiceClaimWireLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	exec("UPDATE runs SET status='recovery_wait',recovery_wait_cause='worker_memory_pressure',claim_released_at=now() WHERE id=$1", id)
+	const memoryNonce = "recovery-wire-memory-nonce"
+	exec("UPDATE workers SET protocol_capabilities=$2,snapshot_register_nonce=$3 WHERE id=$1", newWorker,
+		[]string{capability.RecoveryArchiveV1, capability.WorkerMemoryPressureV1}, memoryNonce)
+	memoryWorker, err := fx.q.GetWorkerByID(fx.ctx, newWorker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cause := "worker_memory_pressure"
+	parked, applied, err := svc.SetState(fx.ctx, memoryWorker, id, workersvc.StateRequest{
+		State: "recovery_wait", RecoveryCause: &cause, ClaimGeneration: &beforeMemory.ClaimGeneration,
+		RegisterNonce: memoryNonce, MemoryEpisode: &beforeMemory.MemoryEpisode})
+	if err != nil || !applied {
+		t.Fatalf("memory park applied=%v err=%v", applied, err)
+	}
+	if parked.Status != "recovery_wait" || parked.RecoveryWaitCause.String != cause ||
+		!parked.ClaimReleasedAt.Valid || parked.ReleasedWorkerID != (pgtype.UUID{Bytes: newWorker, Valid: true}) ||
+		!parked.ReleasedWorkerNonce.Valid || parked.ReleasedWorkerNonce.String != memoryNonce {
+		t.Fatalf("memory park release fences: %+v", parked)
+	}
 	if rec := recoveryResumeRequest(h, id, fx.userID); rec.Code != http.StatusOK {
 		t.Fatalf("memory Resume=%d %s", rec.Code, rec.Body.String())
 	}
@@ -130,5 +149,5 @@ func TestWorkerRecoveryOwnerResumeServiceClaimWireLiveDB(t *testing.T) {
 		afterMemory.RequeueEpisodeBaseline != beforeMemory.RequeueEpisodeBaseline {
 		t.Fatalf("memory Resume changed independent recovery counters: before=%+v after=%+v err=%v", beforeMemory, afterMemory, err)
 	}
-	claim(newWorker, 1)
+	claim(memoryResumeWorker, 1)
 }

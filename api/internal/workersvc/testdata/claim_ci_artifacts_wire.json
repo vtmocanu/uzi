@@ -13,6 +13,7 @@
   "last_seq": 0,
   "iteration_count": 0,
   "requeue_count": 0,
+  "worker_recovery_episode": 0,
   "claim_generation": 7,
   "plan_md": null,
   "auto_approve": false,
