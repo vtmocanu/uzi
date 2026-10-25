@@ -1,12 +1,14 @@
-import { useEffect, useId, useRef, useState, type FormEvent } from "react";
+import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from "react";
 import type { Worker } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { stripDisplayCell } from "../lib/safeText";
 import { Button, Field } from "./ui";
 
-export function WorkerCordonControls({ worker, disabled, onChange }: {
+export function WorkerCordonControls({ worker, disabled, hideAction = false, onChange, children }: {
   worker: Worker;
   disabled: boolean;
+  hideAction?: boolean;
+  children: (button: ReactNode, panel: ReactNode) => ReactNode;
   onChange: (cordon: boolean, reason?: string) => Promise<void>;
 }) {
   const id = useId();
@@ -49,22 +51,27 @@ export function WorkerCordonControls({ worker, disabled, onChange }: {
       if (alive.current) setPending(false);
     }
   };
-  if (worker.ephemeral === true) return null;
+  if (worker.ephemeral === true) return children(null, null);
   const name = stripDisplayCell(worker.name);
-  return (
-    <div className="space-y-2">
-      <p className="text-xs text-muted">
-        Manual cordon stops new intake. Assigned work can continue subject to other restrictions.
-        Uncordon removes only the manual hold.
-      </p>
-      {!open && <Button id={id} size="sm" variant="secondary" disabled={disabled || pending}
-        aria-label={`${worker.manual_cordoned_at ? "Uncordon" : "Cordon"} ${name}`}
-        onClick={() => worker.manual_cordoned_at ? void submit(false) : setOpen(true)}>
-        {worker.manual_cordoned_at ? "Uncordon" : "Cordon"}
-      </Button>}
+  const button = !open && !hideAction ? <>
+    <Button id={id} size="sm" className="h-8" variant="secondary" disabled={disabled || pending}
+      aria-label={`${worker.manual_cordoned_at ? "Uncordon" : "Cordon"} ${name}`}
+      aria-describedby={worker.manual_cordoned_at ? `${id}-uncordon-help` : undefined}
+      onClick={() => worker.manual_cordoned_at ? void submit(false) : setOpen(true)}>
+      {worker.manual_cordoned_at ? "Uncordon" : "Cordon"}
+    </Button>
+    {worker.manual_cordoned_at && <span id={`${id}-uncordon-help`} className="sr-only">
+      Uncordon removes only the manual hold.
+    </span>}
+  </> : null;
+  const panel = (open || error) ? (
+    <div className="w-full space-y-2">
       {open && <form className="space-y-2" onSubmit={(e) => submit(true, e)} onKeyDown={(e) => {
         if (e.key === "Escape" && !pending) { e.preventDefault(); close(); }
       }}>
+        <p className="text-xs text-muted">
+          Manual cordon stops new intake. Assigned work can continue subject to other restrictions.
+        </p>
         <Field label="Reason (optional)">
           <textarea id={`${id}-reason`} className="w-full rounded-lg border border-edge bg-raised px-3 py-2 text-sm text-fg"
             value={reason} disabled={disabled || pending}
@@ -77,5 +84,6 @@ export function WorkerCordonControls({ worker, disabled, onChange }: {
       </form>}
       {error && <div ref={alert} role="alert" tabIndex={-1} className="text-sm text-danger">{error}</div>}
     </div>
-  );
+  ) : null;
+  return children(button, panel);
 }

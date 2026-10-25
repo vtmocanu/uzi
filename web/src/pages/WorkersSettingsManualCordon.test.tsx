@@ -54,6 +54,37 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.useRealTimers(); });
 
 describe("owner manual intake controls", () => {
+  it.each([false, true])("places the manual action between the token picker and Delete in a wrapping row (held=%s)", async (isHeld) => {
+    mock.listSecrets.mockResolvedValue({ secrets: [
+      { id: "a", kind: "anthropic_token", label: "a" }, { id: "b", kind: "anthropic_token", label: "b" },
+    ] as never });
+    await ready([isHeld ? held : worker()]);
+    const select = within(row()).getByRole("combobox");
+    const action = within(row()).getByRole("button", { name: isHeld ? "Uncordon target" : "Cordon target" });
+    const remove = within(row()).getByRole("button", { name: "Delete" });
+    expect(action.parentElement).toBe(select.parentElement);
+    expect(remove.parentElement).toBe(select.parentElement);
+    expect(select.compareDocumentPosition(action) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(action.compareDocumentPosition(remove) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(remove.parentElement?.lastElementChild).toBe(remove);
+    expect(select.parentElement?.classList.contains("flex-wrap")).toBe(true);
+    expect(select.parentElement?.parentElement?.classList.contains("flex-wrap")).toBe(true);
+    if (!isHeld) {
+      fireEvent.click(action);
+      const form = screen.getByLabelText("Reason (optional)").closest("form")!;
+      expect(select.parentElement?.contains(form)).toBe(false);
+      expect(row().contains(form)).toBe(true);
+      expect(form.parentElement?.previousElementSibling?.contains(select)).toBe(true);
+      expect(document.activeElement).toBe(screen.getByLabelText("Reason (optional)"));
+    }
+  });
+  it.each([false, true])("hides the manual action while confirming a hosted delete (held=%s)", async (isHeld) => {
+    await ready([{ ...(isHeld ? held : worker()), kind: "hosted" }]);
+    fireEvent.click(within(row()).getByRole("button", { name: "Delete" }));
+    expect(within(row()).getByRole("group", { name: "Confirm deleting target" })).toBeTruthy();
+    expect(within(row()).queryByRole("button", { name: /^(Cordon|Uncordon) target$/ })).toBeNull();
+    expect(mock.deleteWorker).not.toHaveBeenCalled();
+  });
   it("offers persistent external and hosted actions with hosting off, excluding an ephemeral peer and accepting old optional fields", async () => {
     await ready([worker({ manual_cordoned_at: undefined }), worker({ id: "host", name: "host", kind: "hosted" }),
       worker({ id: "temp", name: "temp", ephemeral: true })]);

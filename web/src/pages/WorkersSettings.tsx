@@ -725,282 +725,288 @@ export function WorkersSettings() {
                 // the app's ring convention — is safe: it can only appear right after the jump.
                 className="flex flex-col gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2.5 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring focus:ring-offset-2 focus:ring-offset-ink"
               >
-                <div>
-                  {/* Row 1 — identity | badges. min-w-0 + break-words lets a long name
-                      shrink/wrap instead of shoving the badge cluster; the badge cluster
-                      is flex-wrap (the original single right-side group was NOT) so it
-                      rewraps under the name at narrow widths rather than overflowing. */}
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0 break-words">
-                      {/* Own workers here, but stripped for the same reason and with the
-                          same helper as the admin fleet list (RunsList.tsx): the field is
-                          unstripped at ingest, and one page treating it as safe while the
-                          other does not is how the next reader picks the wrong precedent.
+                <WorkerCordonControls worker={w} disabled={rowBusy.has(w.id) || confirmingDelete === w.id}
+                  hideAction={confirmingDelete === w.id}
+                  onChange={(cordon, reason) => changeCordon(w.id, cordon, reason)}>
+                  {(cordonButton, cordonPanel) => <>
+                    <div>
+                      {/* Row 1 — identity | badges. min-w-0 + break-words lets a long name
+                          shrink/wrap instead of shoving the badge cluster; the badge cluster
+                          is flex-wrap (the original single right-side group was NOT) so it
+                          rewraps under the name at narrow widths rather than overflowing. */}
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0 break-words">
+                          {/* Own workers here, but stripped for the same reason and with the
+                              same helper as the admin fleet list (RunsList.tsx): the field is
+                              unstripped at ingest, and one page treating it as safe while the
+                              other does not is how the next reader picks the wrong precedent.
 
-                          F12's argument reaches the same cell from the other side and is
-                          why the helper is stripUnsafeChars rather than sanitizeLabel.
-                          React escapes HTML, so there is no XSS — but escaping does
-                          nothing to an RLO, which reorders the text around it and can make
-                          a worker render as one it is not. sanitizeLabel is Cf-only by
-                          design (it mirrors the Go validateSecretLabel predicate for token
-                          labels); stripUnsafeChars is Cc+Cf, so it is the superset, and it
-                          is what the same field's two aria-labels below already use. The
-                          CLI's two name cells got the equivalent treatment via cellText.
+                              F12's argument reaches the same cell from the other side and is
+                              why the helper is stripUnsafeChars rather than sanitizeLabel.
+                              React escapes HTML, so there is no XSS — but escaping does
+                              nothing to an RLO, which reorders the text around it and can make
+                              a worker render as one it is not. sanitizeLabel is Cf-only by
+                              design (it mirrors the Go validateSecretLabel predicate for token
+                              labels); stripUnsafeChars is Cc+Cf, so it is the superset, and it
+                              is what the same field's two aria-labels below already use. The
+                              CLI's two name cells got the equivalent treatment via cellText.
 
-                          This used to argue from "a worker name is validated for LENGTH
-                          ONLY, so it has LESS protection than a token label" — no longer
-                          true as of #169, which put the same Cc+Cf rule on the ingest side
-                          (`termsafe.Validate` in handler/workers.go). The helper choice is
-                          unchanged, and the reason is now the stronger one: rows stored
-                          before that validator landed cannot be cleaned retroactively, so
-                          this strip still has real work to do. */}
-                      <span id={rowNameId(w.id)} className="font-medium text-fg">{stripUnsafeChars(w.name)}</span>
-                      <span className="ml-2 align-middle">
-                        <WorkerUpgradeBadge worker={w} />
-                      </span>
-                    </div>
-                    <div className="flex flex-wrap items-center justify-end gap-1.5">
-                      {/* Marked by the row's own data, not by the hosting config: if an
-                          admin turns hosting off while a user still holds hosted rows,
-                          the rows stay listed (nothing may strand them) and must stay
-                          honest about what they are. Hiding the badge there would leave
-                          them looking like workers the user forgot to start. */}
-                      {w.kind === "hosted" && (
-                        <>
-                          <Badge tone="info" title="Runs in the cluster: the controller starts and stops its container, not you.">
-                            hosted
-                          </Badge>
-                          {/* The docker capability (PRD #83 M3) is real TEXT — the word
-                              "docker" — not a letter or an icon. Badge renders a bare
-                              <span>, whose ARIA role is `generic`, where naming is
-                              PROHIBITED: aria-label is ignored outright and title degrades
-                              to a hover tooltip no screen reader is obliged to read, while
-                              sr-only would answer the screen reader and still leave a
-                              sighted keyboard or touch user a symbol with nothing to hover.
-                              A word reaches sighted, keyboard, and screen-reader users at
-                              once, and needs no ARIA to do it. Absence needs no badge, so a
-                              worker without the sidecar renders nothing. */}
-                          {w.docker === true && <Badge>docker</Badge>}
-                          {/* Ephemeral (PRD #529/#649): an auto-provisioned, run-bound
-                              throwaway hosted worker the api spun up on demand. It is
-                              removed after its run finishes and any lease (PRD #2006)
-                              ends; the `leased` badge beside it shows that window. Like
-                              the docker badge above, it is a
-                              WORD ("ephemeral"), not an icon or a letter — Badge is a bare
-                              <span> (ARIA role `generic`, where naming is prohibited), so a
-                              word is the only thing that reaches sighted, keyboard, and
-                              screen-reader users at once. `plan`-toned (indigo): calm and
-                              transient, distinct from the `hosted` info badge and the plain
-                              `docker` chip — this is a normal state, not an error. Ephemeral
-                              is always kind:"hosted", so it sits inside the hosted group;
-                              absence renders nothing. */}
-                          {w.ephemeral === true && (
+                              This used to argue from "a worker name is validated for LENGTH
+                              ONLY, so it has LESS protection than a token label" — no longer
+                              true as of #169, which put the same Cc+Cf rule on the ingest side
+                              (`termsafe.Validate` in handler/workers.go). The helper choice is
+                              unchanged, and the reason is now the stronger one: rows stored
+                              before that validator landed cannot be cleaned retroactively, so
+                              this strip still has real work to do. */}
+                          <span id={rowNameId(w.id)} className="font-medium text-fg">{stripUnsafeChars(w.name)}</span>
+                          <span className="ml-2 align-middle">
+                            <WorkerUpgradeBadge worker={w} />
+                          </span>
+                        </div>
+                        <div className="flex flex-wrap items-center justify-end gap-1.5">
+                          {/* Marked by the row's own data, not by the hosting config: if an
+                              admin turns hosting off while a user still holds hosted rows,
+                              the rows stay listed (nothing may strand them) and must stay
+                              honest about what they are. Hiding the badge there would leave
+                              them looking like workers the user forgot to start. */}
+                          {w.kind === "hosted" && (
+                            <>
+                              <Badge tone="info" title="Runs in the cluster: the controller starts and stops its container, not you.">
+                                hosted
+                              </Badge>
+                              {/* The docker capability (PRD #83 M3) is real TEXT — the word
+                                  "docker" — not a letter or an icon. Badge renders a bare
+                                  <span>, whose ARIA role is `generic`, where naming is
+                                  PROHIBITED: aria-label is ignored outright and title degrades
+                                  to a hover tooltip no screen reader is obliged to read, while
+                                  sr-only would answer the screen reader and still leave a
+                                  sighted keyboard or touch user a symbol with nothing to hover.
+                                  A word reaches sighted, keyboard, and screen-reader users at
+                                  once, and needs no ARIA to do it. Absence needs no badge, so a
+                                  worker without the sidecar renders nothing. */}
+                              {w.docker === true && <Badge>docker</Badge>}
+                              {/* Ephemeral (PRD #529/#649): an auto-provisioned, run-bound
+                                  throwaway hosted worker the api spun up on demand. It is
+                                  removed after its run finishes and any lease (PRD #2006)
+                                  ends; the `leased` badge beside it shows that window. Like
+                                  the docker badge above, it is a
+                                  WORD ("ephemeral"), not an icon or a letter — Badge is a bare
+                                  <span> (ARIA role `generic`, where naming is prohibited), so a
+                                  word is the only thing that reaches sighted, keyboard, and
+                                  screen-reader users at once. `plan`-toned (indigo): calm and
+                                  transient, distinct from the `hosted` info badge and the plain
+                                  `docker` chip — this is a normal state, not an error. Ephemeral
+                                  is always kind:"hosted", so it sits inside the hosted group;
+                                  absence renders nothing. */}
+                              {w.ephemeral === true && (
+                                <Badge
+                                  tone="plan"
+                                  title="Auto-provisioned on demand for a run that needed a capability no online worker had. Removed after that run finishes and any lease ends."
+                                >
+                                  ephemeral
+                                </Badge>
+                              )}
+                              {/* Leased (PRD #2006): renders only while
+                                  ephemeral_lease_expires_at is in the future; absent or past
+                                  renders nothing. See WorkerLeaseBadge. */}
+                              <WorkerLeaseBadge worker={w} />
+                            </>
+                          )}
+                          {hasTemplateDrift(w.template_declared, w.template_reported) && (
                             <Badge
-                              tone="plan"
-                              title="Auto-provisioned on demand for a run that needed a capability no online worker had. Removed after that run finishes and any lease ends."
+                              tone="warning"
+                              title={`Declared ${w.template_declared}, but the worker reports ${w.template_reported}. Rebuild it with WORKER_TEMPLATE=${w.template_declared} to match.`}
                             >
-                              ephemeral
+                              template drift
                             </Badge>
                           )}
-                          {/* Leased (PRD #2006): renders only while
-                              ephemeral_lease_expires_at is in the future; absent or past
-                              renders nothing. See WorkerLeaseBadge. */}
-                          <WorkerLeaseBadge worker={w} />
-                        </>
-                      )}
-                      {hasTemplateDrift(w.template_declared, w.template_reported) && (
-                        <Badge
-                          tone="warning"
-                          title={`Declared ${w.template_declared}, but the worker reports ${w.template_reported}. Rebuild it with WORKER_TEMPLATE=${w.template_declared} to match.`}
-                        >
-                          template drift
-                        </Badge>
-                      )}
-                      {/* Server-authoritative capability set (PRD #84 M1), rendered as
-                          small read-only chips beside the template/drift badge. The set is
-                          Filter-ed server-side to the {docker, jvm} vocabulary, so a name
-                          here is always known; empty/absent renders nothing. */}
-                      {w.capabilities?.map((cap) => (
-                        <Badge key={cap} title={`Worker capability: ${cap}`}>
-                          {cap}
-                        </Badge>
-                      ))}
-                      <Badge tone={w.status === "online" ? "ok" : "neutral"} dot>
-                        {w.status}
-                      </Badge>
-                      <WorkerCordonBadge worker={w} />
-                      <WorkerQuarantineBadge worker={w} />
-                      <WorkerMemoryAuthorityBadge worker={w} />
-                      <WorkerRunBadge worker={w} />
-                      <WorkerPendingOutcomeBadge worker={w} />
-                      <WorkerCustodyBadge worker={w} />
-                    </div>
-                  </div>
+                          {/* Server-authoritative capability set (PRD #84 M1), rendered as
+                              small read-only chips beside the template/drift badge. The set is
+                              Filter-ed server-side to the {docker, jvm} vocabulary, so a name
+                              here is always known; empty/absent renders nothing. */}
+                          {w.capabilities?.map((cap) => (
+                            <Badge key={cap} title={`Worker capability: ${cap}`}>
+                              {cap}
+                            </Badge>
+                          ))}
+                          <Badge tone={w.status === "online" ? "ok" : "neutral"} dot>
+                            {w.status}
+                          </Badge>
+                          <WorkerCordonBadge worker={w} />
+                          <WorkerQuarantineBadge worker={w} />
+                          <WorkerMemoryAuthorityBadge worker={w} />
+                          <WorkerRunBadge worker={w} />
+                          <WorkerPendingOutcomeBadge worker={w} />
+                          <WorkerCustodyBadge worker={w} />
+                        </div>
+                      </div>
 
-                  <WorkerCordonMetadata worker={w} />
+                      <WorkerCordonMetadata worker={w} />
 
-                  {/* Meta line — full width */}
-                  <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-faint">
-                    {w.template_reported ? (
-                      <span>template {w.template_reported}</span>
-                    ) : (
-                      w.template_declared && <span>template {w.template_declared} (awaiting report)</span>
-                    )}
-                    {/* Size envelope (PRD #84 M1): the container mem ceiling from the
-                        latest stats sample. Null when unlimited / process-fallback /
-                        no sample yet — then say nothing rather than "0". Read-only. */}
-                    {w.stats_mem_limit_bytes != null && w.stats_mem_limit_bytes > 0 && (
-                      <span>· {formatBytes(w.stats_mem_limit_bytes)} limit</span>
-                    )}
-                    {/* Issue #124: worker self-reported (sanitizeSelfReported at ingest). */}
-                    {w.version && <span>· v{stripUnsafeChars(w.version)}</span>}
-                    {w.status === "online" && w.online_since && (
-                      <span>· up {formatUptimeSince(w.online_since)}</span>
-                    )}
-                    {w.last_heartbeat_at && (
-                      <span>· last seen {new Date(w.last_heartbeat_at).toLocaleString()}</span>
-                    )}
-                  </div>
+                      {/* Meta line — full width */}
+                      <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-faint">
+                        {w.template_reported ? (
+                          <span>template {w.template_reported}</span>
+                        ) : (
+                          w.template_declared && <span>template {w.template_declared} (awaiting report)</span>
+                        )}
+                        {/* Size envelope (PRD #84 M1): the container mem ceiling from the
+                            latest stats sample. Null when unlimited / process-fallback /
+                            no sample yet — then say nothing rather than "0". Read-only. */}
+                        {w.stats_mem_limit_bytes != null && w.stats_mem_limit_bytes > 0 && (
+                          <span>· {formatBytes(w.stats_mem_limit_bytes)} limit</span>
+                        )}
+                        {/* Issue #124: worker self-reported (sanitizeSelfReported at ingest). */}
+                        {w.version && <span>· v{stripUnsafeChars(w.version)}</span>}
+                        {w.status === "online" && w.online_since && (
+                          <span>· up {formatUptimeSince(w.online_since)}</span>
+                        )}
+                        {w.last_heartbeat_at && (
+                          <span>· last seen {new Date(w.last_heartbeat_at).toLocaleString()}</span>
+                        )}
+                      </div>
 
-                  {/* Row 2 — effective token | controls */}
-                  <div className="mt-1 flex items-end justify-between gap-3">
-                    {/* The EFFECTIVE token, always stated (PRD #104 M6), and it has
-                        to be right in BOTH directions. Rendering blank for an unbound
-                        worker reads as "no token" when the truth is "the default" —
-                        but saying "your default token" on an account holding NO tokens
-                        is the same failure mirrored: it over-claims a credential that
-                        does not exist, on an account where every run will fail, and
-                        offers nowhere to go. Three states, not two (web-ux D2).
-                        A bound worker is rendered from the LIST payload, which always
-                        carries the label alongside the id — never from a source that
-                        could supply an id with a null label. */}
-                    <div className="min-w-0 text-xs text-muted">
-                      {/* auto is checked FIRST and independently of the id, because an
-                          auto worker holds no pin at all — reading the id first would
-                          fall through to "spends your default token", which an auto
-                          worker never does: with an empty pool its runs HOLD (#754),
-                          not spend the default. The server already resolves a
-                          pinned-but-idless worker to `default` (D9), so no rule is
-                          re-derived here. */}
-                      {w.anthropic_bind_mode === "auto" && pooledCount === 0 ? (
-                        // web-ux F18. An auto worker whose owner has pooled NOTHING
-                        // HOLDS every claim in pool_wait (#754) rather than spending the
-                        // default — and the page said "auto-selects from your token pool"
-                        // with a straight face. That is R7's silent no-op moved up one level:
-                        // M2 closed it on the TOKEN surface (a pooled token that can
-                        // never be picked shows why), and it stayed open on the WORKER
-                        // surface, which is where the choice is actually made.
-                        //
-                        // 🔴 THE CONDITION IS `pooled`, NOT `tokens.length`, and the
-                        // neighbouring precedent below is the trap: copying its
-                        // `tokens.length === 0` shape produces a guard that is silent
-                        // in exactly the case that matters — a user holding four tokens
-                        // with none opted in. auto_eligible rides SecretMeta already,
-                        // so this costs no fetch.
-                        <span className="text-warn">
-                          auto-selects, but your{" "}
-                          <Link to="/settings" className="underline hover:text-fg">
-                            token pool
-                          </Link>{" "}
-                          is empty — its runs will hold until you add a token
-                        </span>
-                      ) : w.anthropic_bind_mode === "auto" ? (
-                        <span>
-                          auto-selects from your{" "}
-                          <Link to="/settings" className="underline hover:text-fg">
-                            token pool
-                          </Link>
-                        </span>
-                      ) : w.anthropic_secret_id ? (
-                        <>
-                          spends{" "}
-                          <strong className="font-medium text-fg">
-                            {w.anthropic_secret_label ?? "a named token"}
-                          </strong>
-                        </>
-                      ) : tokens.length === 0 ? (
-                        <span className="text-warn">
-                          no Anthropic token —{" "}
-                          <Link to="/settings" className="underline hover:text-fg">
-                            add one in Settings
-                          </Link>{" "}
-                          or its runs will fail
-                        </span>
-                      ) : (
-                        <span>spends your default token</span>
-                      )}
+                      {/* Row 2 — effective token | controls */}
+                      <div className="mt-1 flex flex-wrap items-end justify-between gap-3">
+                        {/* The EFFECTIVE token, always stated (PRD #104 M6), and it has
+                            to be right in BOTH directions. Rendering blank for an unbound
+                            worker reads as "no token" when the truth is "the default" —
+                            but saying "your default token" on an account holding NO tokens
+                            is the same failure mirrored: it over-claims a credential that
+                            does not exist, on an account where every run will fail, and
+                            offers nowhere to go. Three states, not two (web-ux D2).
+                            A bound worker is rendered from the LIST payload, which always
+                            carries the label alongside the id — never from a source that
+                            could supply an id with a null label. */}
+                        <div className="min-w-0 text-xs text-muted">
+                          {/* auto is checked FIRST and independently of the id, because an
+                              auto worker holds no pin at all — reading the id first would
+                              fall through to "spends your default token", which an auto
+                              worker never does: with an empty pool its runs HOLD (#754),
+                              not spend the default. The server already resolves a
+                              pinned-but-idless worker to `default` (D9), so no rule is
+                              re-derived here. */}
+                          {w.anthropic_bind_mode === "auto" && pooledCount === 0 ? (
+                            // web-ux F18. An auto worker whose owner has pooled NOTHING
+                            // HOLDS every claim in pool_wait (#754) rather than spending the
+                            // default — and the page said "auto-selects from your token pool"
+                            // with a straight face. That is R7's silent no-op moved up one level:
+                            // M2 closed it on the TOKEN surface (a pooled token that can
+                            // never be picked shows why), and it stayed open on the WORKER
+                            // surface, which is where the choice is actually made.
+                            //
+                            // 🔴 THE CONDITION IS `pooled`, NOT `tokens.length`, and the
+                            // neighbouring precedent below is the trap: copying its
+                            // `tokens.length === 0` shape produces a guard that is silent
+                            // in exactly the case that matters — a user holding four tokens
+                            // with none opted in. auto_eligible rides SecretMeta already,
+                            // so this costs no fetch.
+                            <span className="text-warn">
+                              auto-selects, but your{" "}
+                              <Link to="/settings" className="underline hover:text-fg">
+                                token pool
+                              </Link>{" "}
+                              is empty — its runs will hold until you add a token
+                            </span>
+                          ) : w.anthropic_bind_mode === "auto" ? (
+                            <span>
+                              auto-selects from your{" "}
+                              <Link to="/settings" className="underline hover:text-fg">
+                                token pool
+                              </Link>
+                            </span>
+                          ) : w.anthropic_secret_id ? (
+                            <>
+                              spends{" "}
+                              <strong className="font-medium text-fg">
+                                {w.anthropic_secret_label ?? "a named token"}
+                              </strong>
+                            </>
+                          ) : tokens.length === 0 ? (
+                            <span className="text-warn">
+                              no Anthropic token —{" "}
+                              <Link to="/settings" className="underline hover:text-fg">
+                                add one in Settings
+                              </Link>{" "}
+                              or its runs will fail
+                            </span>
+                          ) : (
+                            <span>spends your default token</span>
+                          )}
+                        </div>
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          {/* Hosted deletes confirm; external ones stay one click, and that
+                              asymmetry is the whole point. Deleting an EXTERNAL worker
+                              revokes a token — the container keeps running and the user
+                              re-registers to recover. Deleting a HOSTED one takes its disks
+                              with it (PRD: "PVCs accrue cost — deleted with the worker"),
+                              which nothing undoes. Same button, wildly different blast
+                              radius, so only the expensive one asks. */}
+                          {/* Token picker (PRD #104 M3/M6). Rendered only when the user
+                              holds more than one token — with one credential there is
+                              nothing to choose between, and an always-visible picker would
+                              imply otherwise. Takes effect on the worker's NEXT claim: no
+                              restart, no re-minted join token. */}
+                          {tokens.length > 1 && confirmingDelete !== w.id && (
+                            <Select
+                              aria-label={`Anthropic token for ${stripUnsafeChars(w.name)}`}
+                              className="h-8 max-w-[11rem] text-xs"
+                              // Driven by the MODE first (PRD #111 M3): an auto worker
+                              // selects the sentinel, everything else falls back to the
+                              // label, and a worker whose pinned token was deleted arrives
+                              // here as mode "default" with a null label — so it shows
+                              // "default token", which is what it now spends.
+                              value={
+                                w.anthropic_bind_mode === "auto"
+                                  ? AUTO_OPTION
+                                  : (w.anthropic_secret_label ?? "")
+                              }
+                              disabled={tokenBusy === w.id || rowBusy.has(w.id)}
+                              onChange={(e) => void rebind(w.id, e.target.value)}
+                            >
+                              {/* web-ux F15: three of four options used to contain the
+                                  word "default" — `default token` (the user's default),
+                                  `default (default)` (a token NAMED default), and M3's new
+                                  auto. The two account-level choices now read as sentences
+                                  and the named tokens sit under a group label, so the
+                                  question each option answers is different from the others. */}
+                              <option value="">Use my default token</option>
+                              <option value={AUTO_OPTION}>Auto-select from the pool</option>
+                              <optgroup label="Pin to a token">
+                                {/* PRD #1732 D5: a disabled token cannot be newly bound, so it
+                                    is not offered. The one this worker is ALREADY bound to
+                                    stays visible, marked, so the select never snaps to
+                                    another option and hides the binding (D2 keeps it). */}
+                                {tokens
+                                  .filter((t) => t.enabled !== false || t.id === w.anthropic_secret_id)
+                                  .map((t) => (
+                                    <option key={t.id} value={t.label} disabled={t.enabled === false}>
+                                      {t.label}
+                                      {t.is_default ? " (your default)" : ""}
+                                      {t.enabled === false ? " (disabled)" : ""}
+                                    </option>
+                                  ))}
+                              </optgroup>
+                            </Select>
+                          )}
+                          {cordonButton}
+                          {confirmingDelete !== w.id && (
+                            <Button
+                              id={deleteButtonId(w.id)}
+                              disabled={rowBusy.has(w.id)}
+                              variant="danger"
+                              size="sm"
+                              onClick={() => (w.kind === "hosted" ? setConfirmingDelete(w.id) : remove(w.id))}
+                            >
+                              Delete
+                            </Button>
+                          )}
+                        </div>
+                      </div>
                     </div>
-                    <div className="flex items-center gap-1.5">
-                      {/* Hosted deletes confirm; external ones stay one click, and that
-                          asymmetry is the whole point. Deleting an EXTERNAL worker
-                          revokes a token — the container keeps running and the user
-                          re-registers to recover. Deleting a HOSTED one takes its disks
-                          with it (PRD: "PVCs accrue cost — deleted with the worker"),
-                          which nothing undoes. Same button, wildly different blast
-                          radius, so only the expensive one asks. */}
-                      {/* Token picker (PRD #104 M3/M6). Rendered only when the user
-                          holds more than one token — with one credential there is
-                          nothing to choose between, and an always-visible picker would
-                          imply otherwise. Takes effect on the worker's NEXT claim: no
-                          restart, no re-minted join token. */}
-                      {tokens.length > 1 && confirmingDelete !== w.id && (
-                        <Select
-                          aria-label={`Anthropic token for ${stripUnsafeChars(w.name)}`}
-                          className="h-8 max-w-[11rem] text-xs"
-                          // Driven by the MODE first (PRD #111 M3): an auto worker
-                          // selects the sentinel, everything else falls back to the
-                          // label, and a worker whose pinned token was deleted arrives
-                          // here as mode "default" with a null label — so it shows
-                          // "default token", which is what it now spends.
-                          value={
-                            w.anthropic_bind_mode === "auto"
-                              ? AUTO_OPTION
-                              : (w.anthropic_secret_label ?? "")
-                          }
-                          disabled={tokenBusy === w.id || rowBusy.has(w.id)}
-                          onChange={(e) => void rebind(w.id, e.target.value)}
-                        >
-                          {/* web-ux F15: three of four options used to contain the
-                              word "default" — `default token` (the user's default),
-                              `default (default)` (a token NAMED default), and M3's new
-                              auto. The two account-level choices now read as sentences
-                              and the named tokens sit under a group label, so the
-                              question each option answers is different from the others. */}
-                          <option value="">Use my default token</option>
-                          <option value={AUTO_OPTION}>Auto-select from the pool</option>
-                          <optgroup label="Pin to a token">
-                            {/* PRD #1732 D5: a disabled token cannot be newly bound, so it
-                                is not offered. The one this worker is ALREADY bound to
-                                stays visible, marked, so the select never snaps to
-                                another option and hides the binding (D2 keeps it). */}
-                            {tokens
-                              .filter((t) => t.enabled !== false || t.id === w.anthropic_secret_id)
-                              .map((t) => (
-                                <option key={t.id} value={t.label} disabled={t.enabled === false}>
-                                  {t.label}
-                                  {t.is_default ? " (your default)" : ""}
-                                  {t.enabled === false ? " (disabled)" : ""}
-                                </option>
-                              ))}
-                          </optgroup>
-                        </Select>
-                      )}
-                      {confirmingDelete !== w.id && (
-                        <Button
-                          id={deleteButtonId(w.id)}
-                          disabled={rowBusy.has(w.id)}
-                          variant="danger"
-                          size="sm"
-                          onClick={() => (w.kind === "hosted" ? setConfirmingDelete(w.id) : remove(w.id))}
-                        >
-                          Delete
-                        </Button>
-                      )}
-                    </div>
-                  </div>
-                </div>
-                <WorkerCordonControls worker={w} disabled={rowBusy.has(w.id) || confirmingDelete === w.id}
-                  onChange={(cordon, reason) => changeCordon(w.id, cordon, reason)} />
+                    {cordonPanel}
+                  </>}
+                </WorkerCordonControls>
                 {/* Confirm-in-place, not a modal: same ruling as the provision form —
                     there is no modal primitive in web/ and a row action is not where to
                     invent one. It names what is destroyed rather than asking a
