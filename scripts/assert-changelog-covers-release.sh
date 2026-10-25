@@ -269,7 +269,12 @@ while read -r sha; do
   # the zero-ref diagnostic under set -euo pipefail. All grep -q calls stay on files.
   # Scan each position without consuming boundaries so adjacent refs survive;
   # inspect the character after the full numeric token to reject partial numbers.
-  refs="$(awk '
+  # LC_ALL=C: a byte-wise awk (macOS awk 20200816) aborts under a UTF-8 locale when
+  # the scan starts inside a multibyte character. Bytes above 0x7F count as word
+  # characters, so a non-ASCII letter still blocks a boundary as [[:alnum:]] did
+  # under UTF-8; non-ASCII punctuation now blocks one too (fails closed).
+  refs="$(LC_ALL=C awk '
+    function word(c) { return c ~ /[[:alnum:]_]/ || c > "\177" }
     function extract(text, body,    i, rest, token, pattern, before, after) {
       text = tolower(text)
       if (body)
@@ -282,8 +287,8 @@ while read -r sha; do
         token = substr(rest, 1, RLENGTH)
         before = i > 1 ? substr(text, i - 1, 1) : ""
         after = substr(rest, RLENGTH + 1, 1)
-        if ((body || substr(token, 1, 1) != "#") && before ~ /[[:alnum:]_]/) continue
-        if (after ~ /[[:alnum:]_]/) continue
+        if ((body || substr(token, 1, 1) != "#") && word(before)) continue
+        if (word(after)) continue
         sub(/^[^0-9]*/, "", token)
         print token
       }

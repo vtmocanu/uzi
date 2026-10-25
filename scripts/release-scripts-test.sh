@@ -421,6 +421,21 @@ identity_regressions() {
     identity_case "subject rejected: $subject" "$subject" "" 1 ""
   done
   identity_case "zero refs" "Ship" "" 1 ""
+  # Non-ASCII commit text under a UTF-8 locale: a byte-wise awk (macOS awk 20200816) aborted
+  # with "towc: multibyte conversion failure" when the scan started inside a multibyte character.
+  local utf8
+  utf8="$(locale -a 2>/dev/null | grep -ixE 'c\.utf-?8|en_us\.utf-?8' | head -1 || true)"
+  if [ -n "$utf8" ]; then
+    LC_ALL="$utf8" identity_case "UTF-8 subject accepted" "Ship · m2 (#1317)" "" 0 ""
+    LC_ALL="$utf8" identity_case "UTF-8 body accepted" "Ship" "Rows · m2; fixes #1317" 0 ""
+    # A non-ASCII letter is still a word character at either boundary.
+    LC_ALL="$utf8" identity_case "UTF-8 subject rejected: trailing letter" "Ship issue-1317é" "" 1 ""
+    LC_ALL="$utf8" identity_case "UTF-8 subject rejected: leading letter" "Ship éissue 1317" "" 1 ""
+    LC_ALL="$utf8" identity_case "UTF-8 body rejected: leading letter" "Ship" "préfixes #1317" 1 ""
+    LC_ALL="$utf8" identity_case "UTF-8 body rejected: trailing letter" "Ship" "Fixes #1317é" 1 ""
+  else
+    fail "a UTF-8 locale is available for the multibyte identity cases"
+  fi
   for subject in "Ship (#1317)" "Ship #1317" "Ship issue 1317" "Ship ISSUE-1317" \
     "Ship PRD 1317" "Ship pRd #1317" "Merge agent/issue-1317" \
     "Ship https://example.com/issue-1317" "Ship api/PRD 1317/file" \
