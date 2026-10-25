@@ -386,6 +386,42 @@ func (q *Queries) ListMaintenanceQueuedRuns(ctx context.Context) ([]ListMaintena
 	return items, nil
 }
 
+const listRunQueueReasons = `-- name: ListRunQueueReasons :many
+SELECT r.id AS run_id,
+       (CASE WHEN r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r) THEN 'maintenance' ELSE '' END)::text AS queue_reason
+FROM runs r
+WHERE r.id = ANY($1::uuid[])
+  AND r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r)
+`
+
+type ListRunQueueReasonsRow struct {
+	RunID       uuid.UUID `json:"run_id"`
+	QueueReason string    `json:"queue_reason"`
+}
+
+// PRD #3454: the derived queue_reason for a set of runs, evaluated at read time so it never lags
+// the pause. Only runs that are queued, not admitted, while intake is paused are returned (reason
+// "maintenance"); every other id is absent.
+func (q *Queries) ListRunQueueReasons(ctx context.Context, runIds []uuid.UUID) ([]ListRunQueueReasonsRow, error) {
+	rows, err := q.db.Query(ctx, listRunQueueReasons, runIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListRunQueueReasonsRow{}
+	for rows.Next() {
+		var i ListRunQueueReasonsRow
+		if err := rows.Scan(&i.RunID, &i.QueueReason); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lockInstanceIntakePause = `-- name: LockInstanceIntakePause :one
 SELECT id, active, since, by_user_id, by_label, reason FROM instance_intake_pause WHERE id FOR UPDATE
 `

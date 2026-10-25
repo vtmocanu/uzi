@@ -141,3 +141,13 @@ LEFT JOIN users u ON u.id = w.user_id
 WHERE w.ephemeral AND r.status = 'queued' AND NOT fn_run_admitted_during_intake_pause(r)
 ORDER BY w.created_at, w.id
 LIMIT 50;
+
+-- name: ListRunQueueReasons :many
+-- PRD #3454: the derived queue_reason for a set of runs, evaluated at read time so it never lags
+-- the pause. Only runs that are queued, not admitted, while intake is paused are returned (reason
+-- "maintenance"); every other id is absent.
+SELECT r.id AS run_id,
+       (CASE WHEN r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r) THEN 'maintenance' ELSE '' END)::text AS queue_reason
+FROM runs r
+WHERE r.id = ANY(@run_ids::uuid[])
+  AND r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r);

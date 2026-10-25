@@ -462,8 +462,9 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 			isStaleRequeuePinReason(r.HealthReason.String) && !isStaleRequeuePinReason(reason)
 		// PRD #3454: a run leaving the maintenance hold has health_since restamped so its "stuck for"
 		// excludes the pause, but it is NOT nudge-eligible on that tick: the whole backlog leaves the
-		// hold at once, and nudging here would burst a Slack DM per run right after the lift. A later
-		// ok->flagged episode nudges normally.
+		// hold at once, and nudging here would burst a Slack DM per run right after the lift. Accepted
+		// trade-off (PRD #3454 Decision Log): a run still stuck after the lift is not nudged until it
+		// clears to ok and flags again; only that later ok->flagged episode nudges.
 		leftMaintenance := target != healthOK && r.Health == healthWaitingWorker && r.HealthReason.Valid &&
 			r.HealthReason.String == reasonMaintenance && reason != reasonMaintenance
 		nudge := target != healthOK && (r.Health == healthOK || leftPin) &&

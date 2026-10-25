@@ -153,6 +153,7 @@ func v1JobDTO(v workersvc.JobView) apitypes.V1JobDTO {
 		CreatedAt:        v.CreatedAt,
 		StartedAt:        v.StartedAt,
 		FinishedAt:       v.FinishedAt,
+		QueueReason:      v.QueueReason,
 	}
 }
 

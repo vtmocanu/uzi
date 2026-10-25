@@ -220,4 +220,5 @@ func (h *Handler) overlayListCodexAccountActions(r *http.Request, items []apityp
 		dtos = append(dtos, &items[i].RunDTO)
 	}
 	h.overlayCodexAccountActions(r.Context(), dtos...)
+	h.overlayQueueReasons(r.Context(), dtos...)
 }

@@ -800,6 +800,18 @@ components:
             - string
             - "null"
           format: date-time
+        queue_reason:
+          type:
+            - string
+            - "null"
+          enum:
+            - maintenance
+            - null
+          description: >-
+            Optional. "maintenance" while the instance is in maintenance mode and holds
+            this queued job back; the job starts when maintenance ends and its wall-clock
+            limit counts from then, not from queueing. Absent or null otherwise.
+            status stays queued.
     JobList:
       type: object
       required:
