@@ -2,6 +2,7 @@ import test, { describe } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
+import os from "node:os";
 import { execFileSync } from "node:child_process";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import { MaintenanceResources, RecoveryMaintenance } from "../src/recovery-maintenance.js";
@@ -28,7 +29,7 @@ const refused = /maintenance_wip_boundary_refused/;
 const callbacks: Callbacks = { beforeStep: async () => {}, afterRunnerGit: async () => {} };
 
 async function fixture(t: test.TestContext, extra: Partial<RunnerOptions> = {}) {
-  const dir = await fs.mkdtemp(path.resolve("../.uzi/scratch/runner-wip-"));
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "runner-wip-"));
   const root = path.join(dir, "source");
   await fs.mkdir(root);
   const gitIn = (...args: string[]) => execFileSync("/usr/bin/git", ["-C", root, ...args],
