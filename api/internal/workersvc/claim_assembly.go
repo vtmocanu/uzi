@@ -387,15 +387,20 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			defaultModel = lanes.DefaultCodexModel
 		} else {
 			defaultModel = lanes.DefaultClaudeModel
+			if defaultModel.Valid && agenttmpl.CodexRoleModels[strings.TrimSpace(defaultModel.String)] {
+				dropped := strings.TrimSpace(defaultModel.String)
+				defaultModel = pgtype.Text{}
+				recordedLastSeq = s.recordHarnessModelFallbackNote(ctx, run, recordedLastSeq, harness, dropped)
+			}
 		}
 		// PRD #300 / PRD #1551 D4: a schedule can freeze a per-run model onto the run
 		// (runs.model). It wins over the owner's lane ONLY when it is compatible with the run
 		// harness; delivered on the SAME default_model claim field, so the worker is unchanged
 		// (Decision 7) and a subagent template's own model: pin still wins. An INCOMPATIBLE
 		// frozen model records the existing visible fallback note and falls back to the owner's
-		// lane for that harness (D4 as written), never the worker's bare harness default. Lane
-		// values already carry their harness and NEVER traverse harnessModelCompatible — it now
-		// screens only frozen run.model values.
+		// lane for that harness, or the harness default when that lane is unset or dropped.
+		// Lane values use the shared Codex role set above to discard stale Claude-lane ids;
+		// harnessModelCompatible screens only frozen run.model values.
 		if run.Model.Valid {
 			if harnessModelCompatible(harness, run.Model.String) {
 				defaultModel = run.Model

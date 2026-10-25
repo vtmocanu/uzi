@@ -546,20 +546,29 @@ export function RunDefaults() {
   const badgeOnClaude = showClaudeLane && !effectiveIsCodex;
   const badgeOnCodex = showCodexLane && effectiveIsCodex;
 
-  // Independent dirty state per field: changing the harness never dirties a model, and
-  // an untouched lane is not resent. Each lane compares its trimmed draft to its own
-  // saved snapshot (the same "only a saved value reaches a run" rule the model warning
-  // gates on). The model warnings block Save for a shape the server would reject.
-  const claudeWarning = modelFieldWarning(claudeModel);
+  // Dirty state is independent per field, but Save resends BOTH model lanes together
+  // with the harness. Compare each trimmed draft to its own saved snapshot.
+  const claudeRoleModel = CODEX_ROLE_MODELS.includes(claudeModel.trim());
+  const claudeWarning = claudeRoleModel
+    ? `Not a Claude model: ${claudeModel.trim()} is a Codex model. The stored value is skipped and the existing Claude worker default is used. Reset to Default to clear it.`
+    : modelFieldWarning(claudeModel);
+  const claudeRoleRecovery = claudeRoleModel && (
+    <div className="flex flex-wrap items-center gap-3">
+      <Alert message={claudeWarning} tone="warning" />
+      <Button type="button" disabled={defaultsBusy} onClick={() => setClaudeModel("")}>
+        Reset to Default
+      </Button>
+    </div>
+  );
   const codexWarning = modelFieldWarning(codexModel);
   const harnessDirty = defaultHarness !== savedHarness;
   const claudeDirty = claudeModel.trim() !== savedClaudeModel;
   const codexDirty = codexModel.trim() !== savedCodexModel;
   const anyDirty = harnessDirty || claudeDirty || codexDirty;
-  // Only a shown lane's warning can block Save — a hidden lane's stored value is never
-  // edited here, so it cannot be dirty or invalid from this form.
+  // A known Claude rejection also blocks when hidden, since grouped Save resends it.
+  // Shape-only warnings keep their existing visible-lane gating.
   const blockingWarning =
-    (showClaudeLane && claudeWarning !== "") || (showCodexLane && codexWarning !== "");
+    claudeRoleModel || (showClaudeLane && claudeWarning !== "") || (showCodexLane && codexWarning !== "");
 
   // saveDefaults writes the harness pin and BOTH lanes in one PUT (D1), never the
   // legacy default_model (D3: new clients don't send it). Present-value sets, null
@@ -1155,7 +1164,9 @@ export function RunDefaults() {
                       customAriaLabel="Custom Claude model ID"
                     />
                   </Field>
-                  {claudeWarning && <Alert message={claudeWarning} tone="warning" />}
+                  {claudeRoleModel
+                    ? claudeRoleRecovery
+                    : claudeWarning && <Alert message={claudeWarning} tone="warning" />}
                   <p className="text-xs text-faint">
                     Curated Claude aliases plus a custom model ID. Leave on{" "}
                     <em>Inherit</em> to use the lead template's model (opus by default);
@@ -1198,6 +1209,7 @@ export function RunDefaults() {
               )}
             </div>
 
+            {!showClaudeLane && claudeRoleRecovery}
             {showHarnessSelector && <Alert tone="info" message={retentionCopy} />}
 
             <Button

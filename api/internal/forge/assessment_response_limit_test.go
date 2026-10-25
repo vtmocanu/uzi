@@ -28,12 +28,12 @@ var assessmentLimitCases = []assessmentLimitCase{
 	{"github", "user", "/user/5", `{"id":5,"login":"alice"}`, 1048576},
 	{"github", "repository", "/repositories/7", `{"id":7,"name":"r","owner":{"login":"o"}}`, 1048576},
 	{"github", "collaborators", "/repos/o/r/collaborators", `[{"id":5,"login":"alice","permissions":{"pull":true,"triage":true,"push":false,"maintain":false,"admin":false}}]`, 1048576},
-	{"github", "comments", "/repos/o/r/issues/9/comments", `[{"body":"comment","user":{"id":5,"login":"alice"}}]`, 8388608},
+	{"github", "comments", "/repos/o/r/issues/9/comments", `[{"body":"comment","user":{"id":5,"login":"alice"}}]`, 4194304},
 	{"gitlab", "issue", "/projects/7/issues/9", `{"iid":9,"title":"title","description":"description","author":{"id":5,"username":"alice"}}`, 2097152},
 	{"gitlab", "user", "/users/5", `{"id":5,"username":"alice","state":"active"}`, 1048576},
 	{"gitlab", "member", "/projects/7/members/all/5", `{"id":5,"username":"alice","state":"active","access_level":30}`, 1048576},
 	{"gitlab", "project", "/projects/7", `{"id":7}`, 1048576},
-	{"gitlab", "comments", "/projects/7/issues/9/notes", `[{"body":"comment","author":{"id":5,"username":"alice"}}]`, 8388608},
+	{"gitlab", "comments", "/projects/7/issues/9/notes", `[{"body":"comment","author":{"id":5,"username":"alice"}}]`, 4194304},
 }
 
 func assessmentDefault(path string) (string, int) {
@@ -399,8 +399,12 @@ func TestAssessmentPageTwoDiscardsEvidence(t *testing.T) {
 				}
 				states = append(states, s)
 				if strings.HasSuffix(r.URL.Path, c.path) {
-					if s.ceiling != c.ceiling {
-						t.Fatalf("ceiling=%d want %d", s.ceiling, c.ceiling)
+					wantCeiling := c.ceiling
+					if c.name == "comments" && r.URL.Query().Get("page") == "2" {
+						wantCeiling -= int64(len(c.body))
+					}
+					if s.ceiling != wantCeiling {
+						t.Fatalf("ceiling=%d want %d", s.ceiling, wantCeiling)
 					}
 					s.ceiling = 512
 				}

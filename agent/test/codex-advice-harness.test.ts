@@ -672,6 +672,7 @@ describe("CodexAdviceHarness: the advice ceiling without worker callbacks", () =
       trust_level: "untrusted",
     });
     const features = config.features as Record<string, boolean>;
+    assert.equal(Object.hasOwn(features, "remote_models"), false, "the removed compatibility key is omitted");
     assert.deepEqual(
       Object.keys(features).sort(),
       [
@@ -686,7 +687,6 @@ describe("CodexAdviceHarness: the advice ceiling without worker callbacks", () =
         "multi_agent",
         "multi_agent_v2",
         "plugins",
-        "remote_models",
         "shell_snapshot",
         "shell_snapshot_v2",
         "shell_tool",

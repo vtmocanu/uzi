@@ -92,6 +92,7 @@ func (*ResponseTooLargeError) Unwrap() error { return ErrResponseTooLarge }
 // folds it into an empty ErrorResponse. One state is created per marked call and
 // never shared between calls.
 type responseLimitState struct {
+	ledger                 *responseLedger
 	overflow               atomic.Bool
 	ceiling                int64
 	issueTarget            bool
@@ -164,6 +165,44 @@ const objectResponseBytes int64 = 1 << 20
 // metadata. It does not promise that every escaped page fits.
 const commentPageResponseBytes int64 = 8 << 20
 
+// Assessment budgets count complete transfer-decoded bodies, including discarded
+// fields and whitespace. The comment budget provides headroom over the projection's
+// 200 comments and 32 KiB of body text (internal/issueinput/projection.go).
+// Collaborators allow one comment-page ceiling across the membership snapshot.
+const commentListResponseBytes int64 = 4 << 20
+const collaboratorListResponseBytes int64 = 8 << 20
+
+// responseLedger belongs to one serial list/eligibility call, never a driver.
+type responseLedger struct {
+	remaining int64
+	status    int
+}
+
+func (b *responseLedger) state(perResponse int64) *responseLimitState {
+	// Exhausted eligibility calls are refused by the transport before a request;
+	// keep a positive ceiling so exhaustion can never select the default limit.
+	ceiling := perResponse
+	if b.remaining > 0 {
+		ceiling = min(perResponse, b.remaining)
+	}
+	s := newResponseLimitState(ceiling)
+	s.ledger = b
+	return s
+}
+
+// ledgerBody charges reads before either buffering or SDK decoding sees bytes.
+// The surrounding cap permits only one overflow probe, which is never delivered.
+type ledgerBody struct {
+	io.ReadCloser
+	ledger *responseLedger
+}
+
+func (b ledgerBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	b.ledger.remaining -= int64(n)
+	return n, err
+}
+
 func newResponseLimitState(ceiling int64) *responseLimitState {
 	return &responseLimitState{ceiling: ceiling}
 }
@@ -173,6 +212,9 @@ type responseLimitKey struct{}
 // withResponseLimit marks ctx so responseLimitTransport bounds the response
 // bodies of the requests made under it. Unmarked requests pass through unchanged.
 func withResponseLimit(ctx context.Context, state *responseLimitState) context.Context {
+	if state.ledger != nil {
+		ctx = context.WithValue(ctx, ciRepairJSONKey{}, false)
+	}
 	return context.WithValue(ctx, responseLimitKey{}, state)
 }
 
@@ -322,6 +364,14 @@ func (t responseLimitTransport) RoundTrip(req *http.Request) (*http.Response, er
 	if state == nil || isCIJSON(req.Context()) {
 		return t.base.RoundTrip(req)
 	}
+	if state.ledger != nil {
+		if state.overflow.Load() {
+			return nil, state.err()
+		}
+		if state.ledger.remaining <= 0 {
+			return nil, state.recordOverflow(state.ledger.status)
+		}
+	}
 	req = req.Clone(req.Context())
 	req.Header.Set("Accept-Encoding", "identity")
 	resp, err := t.base.RoundTrip(req)
@@ -340,8 +390,13 @@ func (t responseLimitTransport) RoundTrip(req *http.Request) (*http.Response, er
 		return resp, nil
 	}
 	limit := state.ceiling
-	if limit == 0 {
+	if limit == 0 && state.ledger == nil {
 		limit = gitLabMaxResponseBytes
+	}
+	if state.ledger != nil {
+		limit = min(limit, state.ledger.remaining)
+		state.ledger.status = resp.StatusCode
+		resp.Body = ledgerBody{ReadCloser: resp.Body, ledger: state.ledger}
 	}
 	switch code := resp.StatusCode; {
 	case statusSDKSuccess(code):

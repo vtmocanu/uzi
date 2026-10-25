@@ -110,24 +110,29 @@ func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel,
 	}, workersvc.UpgradeParams{})
 	bindingID, bindingLabel := bindingForMode(w.AnthropicBindMode, w.AnthropicSecretID, secretLabel)
 	return apitypes.WorkerDTO{
-		UpgradeStatus:        upgradeStatus,
-		UpgradeDetail:        textPtrValue(upgradeDetail != "", upgradeDetail),
-		UpgradeTarget:        upgradeTarget,
-		AnthropicSecretID:    bindingID,
-		AnthropicSecretLabel: bindingLabel,
-		AnthropicBindMode:    effectiveBindMode(w.AnthropicBindMode, w.AnthropicSecretID),
-		ID:                   w.ID.String(),
-		Name:                 w.Name,
-		Status:               w.Status,
-		Kind:                 w.Kind,
-		HostedSize:           textPtrValue(w.HostedSize.Valid, w.HostedSize.String),
-		Docker:               boolPtrValue(w.DockerEnabled),
-		Ephemeral:            w.Ephemeral,
-		Capabilities:         w.Capabilities,
-		Busy:                 busy,
-		ActiveRuns:           activeRuns,
-		MaxConcurrentRuns:    intPtrValue(w.MaxConcurrentRuns),
-		MaxCrossCheckSlots:   intPtrValue(w.MaxCrossCheckSlots),
+		ManualCordonedAt:      timePtr(w.ManualCordonedAt.Valid, w.ManualCordonedAt.Time),
+		ManualCordonedBy:      uuidPtrValue(w.ManualCordonedBy),
+		ManualCordonedByLabel: textPtrValue(w.ManualCordonedByLabel.Valid, w.ManualCordonedByLabel.String),
+		ManualCordonReason:    textPtrValue(w.ManualCordonReason.Valid, w.ManualCordonReason.String),
+		EffectiveCordoned:     !store.WorkerAcceptsNewIntake(store.Worker{ManualCordonedAt: w.ManualCordonedAt, DrainingSince: w.DrainingSince, MaintenanceFenced: w.MaintenanceFenced, MaintenancePhase: w.MaintenancePhase}),
+		UpgradeStatus:         upgradeStatus,
+		UpgradeDetail:         textPtrValue(upgradeDetail != "", upgradeDetail),
+		UpgradeTarget:         upgradeTarget,
+		AnthropicSecretID:     bindingID,
+		AnthropicSecretLabel:  bindingLabel,
+		AnthropicBindMode:     effectiveBindMode(w.AnthropicBindMode, w.AnthropicSecretID),
+		ID:                    w.ID.String(),
+		Name:                  w.Name,
+		Status:                w.Status,
+		Kind:                  w.Kind,
+		HostedSize:            textPtrValue(w.HostedSize.Valid, w.HostedSize.String),
+		Docker:                boolPtrValue(w.DockerEnabled),
+		Ephemeral:             w.Ephemeral,
+		Capabilities:          w.Capabilities,
+		Busy:                  busy,
+		ActiveRuns:            activeRuns,
+		MaxConcurrentRuns:     intPtrValue(w.MaxConcurrentRuns),
+		MaxCrossCheckSlots:    intPtrValue(w.MaxCrossCheckSlots),
 		// Seed reported_runs to a non-nil [] (PRD #1390 M2c): the DB overlay only runs on the
 		// list/patch surfaces, so this keeps every OTHER WorkerDTO producer (register, heartbeat,
 		// create, hosted-provision) marshaling an array rather than null.
@@ -176,10 +181,15 @@ func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion, pinnedWorkerVersi
 	rowBindingID, rowBindingLabel := bindingForMode(
 		w.AnthropicBindMode, w.AnthropicSecretID, w.AnthropicSecretLabel.String)
 	return apitypes.WorkerDTO{
-		RollPacing:    freshPacingJSON(w.RollPacing, w.RollPacingObservedAt, now),
-		UpgradeStatus: upgradeStatus,
-		UpgradeDetail: textPtrValue(upgradeDetail != "", upgradeDetail),
-		UpgradeTarget: upgradeTarget,
+		ManualCordonedAt:      timePtr(w.ManualCordonedAt.Valid, w.ManualCordonedAt.Time),
+		ManualCordonedBy:      uuidPtrValue(w.ManualCordonedBy),
+		ManualCordonedByLabel: textPtrValue(w.ManualCordonedByLabel.Valid, w.ManualCordonedByLabel.String),
+		ManualCordonReason:    textPtrValue(w.ManualCordonReason.Valid, w.ManualCordonReason.String),
+		EffectiveCordoned:     !store.WorkerAcceptsNewIntake(store.Worker{ManualCordonedAt: w.ManualCordonedAt, DrainingSince: w.DrainingSince, MaintenanceFenced: w.MaintenanceFenced, MaintenancePhase: w.MaintenancePhase}),
+		RollPacing:            freshPacingJSON(w.RollPacing, w.RollPacingObservedAt, now),
+		UpgradeStatus:         upgradeStatus,
+		UpgradeDetail:         textPtrValue(upgradeDetail != "", upgradeDetail),
+		UpgradeTarget:         upgradeTarget,
 		// Blocking diagnostics are meaningful for failed statuses; this list path has the join that
 		// carries them at all.
 		UpgradeBlockingKind:      textPtrValue(upgradeStatus == workersvc.UpgradeStatusCapacityBlocked, workersvc.EffectiveBlockingKind(sig)),
@@ -666,6 +676,23 @@ func (h *Handler) CreateWorker(w http.ResponseWriter, r *http.Request) {
 		"worker": workerDTOFromWorker(wkr, 0, false, tokenLabel, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt),
 		"token":  token,
 	})
+}
+
+// workerDTOWithOverlays uses the list row's live activity counts and list diagnostics.
+func (h *Handler) workerDTOWithOverlays(ctx context.Context, row store.ListWorkersByUserRow) apitypes.WorkerDTO {
+	ids := []uuid.UUID{row.ID}
+	dto := workerDTOFromRow(row, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
+	if row.Kind == "hosted" && row.DrainingSince.Valid {
+		appendUpgradeBlockers(&dto, h.upgradeBlockersByWorker(ctx, ids), row.ID)
+	}
+	if count, ok := h.custodyDecisionsByWorker(ctx, ids)[row.ID]; ok {
+		dto.CustodyDecisionsNeeded = &count
+	}
+	h.overlayEphemeralLease(&dto, row.LeaseSince, row.DrainingSince)
+	h.overlayWorkerReports(&dto, row.ID)
+	h.overlayReportedRuns(&dto, h.reportedRunsByWorker(ctx, ids), row.ID)
+	overlayRunDisk(&dto, h.runDiskByWorker(ctx, ids), row.ID)
+	return dto
 }
 
 // ListWorkers returns the current user's workers with derived busy status.

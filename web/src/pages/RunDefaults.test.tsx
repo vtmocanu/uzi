@@ -13,7 +13,7 @@ import { RunDefaults } from "./RunDefaults";
 import { api, ApiError, type User } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 import type { ModelSettingCell, UserSettings } from "../lib/apiTypes";
-import { CODEX_CURATED_MODELS } from "../lib/codexModels";
+import { CODEX_CURATED_MODELS, CODEX_ROLE_MODELS } from "../lib/codexModels";
 import { mockTemplates } from "../mocks/data";
 
 vi.mock("../lib/api", async (importActual) => {
@@ -1301,6 +1301,79 @@ describe("Run defaults — harness and worker models card (PRD #1551 M3)", () =>
 
   const saveButton = () =>
     screen.getByRole("button", { name: "Save defaults" }) as HTMLButtonElement;
+
+  it.each(CODEX_ROLE_MODELS)("recovers the stored Claude role ID %s only after explicit reset", async id => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
+    mockApi.getMySettings.mockResolvedValue(settings({ default_claude_model: ` ${id} ` }));
+    mockApi.putMySettings.mockResolvedValue(settings({ default_harness: "codex", default_codex_model: "gpt-6-sol" }));
+    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+    await waitFor(() => expect((screen.getByLabelText("Custom Claude model ID") as HTMLInputElement).value).toBe(` ${id} `));
+    expect(screen.getByText(/^Not a Claude model/).textContent).toContain("stored value is skipped");
+    expect(screen.getByText(/^Not a Claude model/).textContent).toContain("existing Claude worker default");
+    fireEvent.change(screen.getByLabelText("Default harness"), { target: { value: "codex" } });
+    fireEvent.change(screen.getByLabelText("Codex model"), { target: { value: "gpt-6-sol" } });
+    expect(saveButton().disabled).toBe(true);
+    fireEvent.click(saveButton());
+    expect(mockApi.putMySettings).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Reset to Default" }));
+    await waitFor(() => expect((screen.getByLabelText("Claude model") as HTMLSelectElement).value).toBe("inherit"));
+    expect(screen.queryByText(/^Not a Claude model/)).toBeNull();
+    expect(mockApi.putMySettings).not.toHaveBeenCalled();
+    expect(saveButton().disabled).toBe(false);
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({
+      default_harness: "codex", default_claude_model: null, default_codex_model: "gpt-6-sol",
+    }));
+  });
+
+  it.each(["claude-private-model", "gpt-looking-custom"])("keeps custom Claude ID %s saveable", async id => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
+    mockApi.getMySettings.mockResolvedValue(settings({ default_claude_model: id }));
+    mockApi.putMySettings.mockResolvedValue(settings({ default_claude_model: id, default_harness: "codex" }));
+    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+    await waitFor(() => expect((screen.getByLabelText("Custom Claude model ID") as HTMLInputElement).value).toBe(id));
+    expect(screen.queryByText(/^Not a Claude model/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reset to Default" })).toBeNull();
+    fireEvent.change(screen.getByLabelText("Default harness"), { target: { value: "codex" } });
+    expect(saveButton().disabled).toBe(false);
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({
+      default_harness: "codex", default_claude_model: id, default_codex_model: null,
+    }));
+  });
+
+  it("recovers hidden Claude luna, preserving Codex and harness drafts after a failed reset-save", async () => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [codexKey] });
+    mockApi.getMySettings.mockResolvedValue(settings({ default_claude_model: "gpt-6-luna", default_harness: "codex" }));
+    let rejectSave!: (reason: Error) => void;
+    mockApi.putMySettings.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectSave = reject; }));
+    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+    await screen.findByText(/^Not a Claude model/);
+    expect(screen.queryByLabelText("Claude model")).toBeNull();
+    expect(screen.queryByLabelText("Default harness")).toBeNull();
+    fireEvent.change(screen.getByLabelText("Codex model"), { target: { value: "gpt-6-sol" } });
+    expect(saveButton().disabled).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Reset to Default" }));
+    expect(mockApi.putMySettings).not.toHaveBeenCalled();
+    expect(screen.queryByText(/^Not a Claude model/)).toBeNull();
+    expect(saveButton().disabled).toBe(false);
+    fireEvent.click(saveButton());
+    const patch = { default_harness: "codex", default_claude_model: null, default_codex_model: "gpt-6-sol" };
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith(patch));
+    expect(saveButton().disabled).toBe(true);
+    rejectSave(new ApiError(400, "Reset save failed"));
+    await screen.findByText("Reset save failed");
+    await waitFor(() => expect(saveButton().disabled).toBe(false));
+    expect(screen.queryByText(/^Not a Claude model/)).toBeNull();
+    expect((screen.getByLabelText("Codex model") as HTMLSelectElement).value).toBe("gpt-6-sol");
+    mockApi.putMySettings.mockResolvedValue(settings(patch));
+    fireEvent.click(saveButton());
+    await screen.findByText(/Defaults saved/);
+    expect(mockApi.putMySettings).toHaveBeenNthCalledWith(2, patch);
+  });
 
   it("both usable: shows the harness selector, both lanes, and the badge on the effective (Claude) lane", async () => {
     mockAuth(baseUser);

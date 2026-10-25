@@ -670,6 +670,19 @@ Mock at `prds/mockups/113-worker-upgrade-status-mock.html`.
 - The **"1 release behind"** ordinal is dropped as not derivable (uzi knows two version strings, not the release sequence). Both versions are rendered instead.
 - **Mute** shipped as storage only — there is no way to set a mute from the UI in v1.
 
+### Owner manual-cordon scope amendment — 2026-10-22
+
+This supplements the earlier upgrade and migration decisions above; implementation
+recorded 2026-10-24. It supersedes ADR-422's historical admin-manual-drain deferral
+with owner intent and owner commands. (AI-synced 2026-10-24)
+
+- An owner can cordon/uncordon a persistent hosted or external worker (`ephemeral=false`) from Workers or `uzi worker cordon <id> [-m <reason>]` / `uzi worker uncordon <id>`, both with `--json`. Existing `RequireUser` session+CSRF or user CLI-token authentication applies. Ownership is strict even for admins and checked before persistent-only refusal; an owned ephemeral worker returns HTTP 409 with exactly `manual cordon is only supported for persistent workers`. No new admin write or worker-create CLI is authorized. (AI-synced 2026-10-24)
+- `POST`/`DELETE /api/workers/{id}/cordon` accept an empty body or one strict object, at most 8 KiB encoded. Optional reason is raw-bounded to 500 Unicode code points before trimming/sanitization; blank becomes NULL. Stable actor UUID and sanitized label snapshot (at most 200 code points) are independent of automatic fields. Repeats preserve first attributes without an event; a real transition and one audit event commit together, with the previous reason on uncordon. No audit read/prune API or DB-enforced append-only guarantee is added. (AI-synced 2026-10-24)
+- Manual intent survives registration, roll, restart, deadlines, ForceRoll and reason-owned automatic release until explicit owner uncordon or deletion. Automatic draining, maintenance, custody and replacement guards remain independent. Offline status remains liveness, not manual intent. Held work continues subject to other fences; cordon adds no cancellation, continuation affinity, chat end or maintenance bypass. Compatible claim/cordon paths serialize on the worker row at READ COMMITTED. (AI-synced 2026-10-24)
+- After migration 00355, older ClaimRun SQL with the previous explicit worker projection fails with SQLSTATE 42846, including ordinary candidates; rollback can prolong the claim outage. Older chat claims can still admit work and ignore manual intent. Deploy compatible serving APIs before relying on enforcement. Older controllers may miscount manual coverage; compatible controllers are required for ordinary coverage guarantees, and earlier poll decisions may finish. No worker image/protocol prerequisite or activation flag is required. (AI-synced 2026-10-25)
+- Roll completion/incarnation proof and reservation completion are separate from serving eligibility. Manual workers supply no replacement coverage; idle workers can roll and return cordoned, while busy drift waits under #3103. An all-manual multi-worker pool may remain held; no zero-coverage bypass is added. #3153/#3307 migration coverage/custody, #3103 global ForceRoll semantics and independent DinD/pressure/maintenance guards above remain authoritative. (AI-synced 2026-10-24)
+- Web persistent external/hosted controls and owner CLI show manual metadata alongside combined fences. Health/admin surfaces remain diagnosis only, without cordon actions. A manual wait requires a nonempty entirely manually cordoned suitable population and no claimable assigned continuation; a suitable uncordoned busy or automatically drained peer prevents that diagnosis. Manual waits receive no upgrade-only exemption. No TTL, retention policy, provisioning repair or new force action is added. (AI-synced 2026-10-24)
+
 ## Feature #121 — Pre-provision a cloned repo's JS dependencies
 
 Tracked as GitLab issue vtmocanu/uzi#121; PRD at `prds/done/121-clone-js-deps-provision.md`.

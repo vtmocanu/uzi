@@ -25,6 +25,17 @@ import (
 // pool and DSN. The migration version is derived from the file name, so a renumber needs no edit.
 func codexJudgeMigrationDB(t *testing.T, version int64) (*pgxpool.Pool, string) {
 	t.Helper()
+	_, dsn := cjCreateDatabase(t, "")
+	if err := MigrateTo(context.Background(), dsn, version); err != nil {
+		t.Fatalf("MigrateTo(%d): %v", version, err)
+	}
+	return cjOpenPool(t, dsn), dsn
+}
+
+// cjCreateDatabase owns only the generated database; template, when supplied,
+// names the historical fixture created by newCJMigrationTemplate.
+func cjCreateDatabase(t *testing.T, template string) (string, string) {
+	t.Helper()
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("UZI_TEST_DATABASE_URL not set; run via the store-IT runner for live-DB coverage")
@@ -35,25 +46,24 @@ func codexJudgeMigrationDB(t *testing.T, version int64) (*pgxpool.Pool, string) 
 	if err != nil {
 		t.Fatalf("open admin pool: %v", err)
 	}
-	if _, err := adminPool.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()); err != nil {
-		adminPool.Close()
+	defer adminPool.Close()
+	create := "CREATE DATABASE " + pgx.Identifier{name}.Sanitize()
+	if template != "" {
+		create += " TEMPLATE " + pgx.Identifier{template}.Sanitize() + " ALLOW_CONNECTIONS true"
+	}
+	if _, err := adminPool.Exec(ctx, create); err != nil {
 		t.Fatalf("create database %s: %v", name, err)
 	}
-	adminPool.Close()
-
-	var pool *pgxpool.Pool
 	t.Cleanup(func() {
-		if pool != nil {
-			pool.Close()
-		}
 		cleanup, err := OpenPool(ctx, dsn)
 		if err != nil {
-			t.Logf("cleanup: open admin pool to drop %s: %v", name, err)
+			t.Errorf("cleanup: open admin pool to drop %s: %v", name, err)
 			return
 		}
 		defer cleanup.Close()
 		if _, err := cleanup.Exec(ctx, "DROP DATABASE IF EXISTS "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)"); err != nil {
-			t.Logf("cleanup: drop database %s: %v", name, err)
+			t.Errorf("cleanup: drop database %s: %v", name, err)
+			return
 		}
 	})
 	u, err := url.Parse(dsn)
@@ -61,15 +71,76 @@ func codexJudgeMigrationDB(t *testing.T, version int64) (*pgxpool.Pool, string) 
 		t.Fatalf("parse dsn: %v", err)
 	}
 	u.Path = "/" + name
-	newDSN := u.String()
-	if err := MigrateTo(ctx, newDSN, version); err != nil {
-		t.Fatalf("MigrateTo(%d): %v", version, err)
-	}
-	pool, err = OpenPool(ctx, newDSN)
+	return name, u.String()
+}
+
+func cjOpenPool(t *testing.T, dsn string) *pgxpool.Pool {
+	t.Helper()
+	pool, err := OpenPool(context.Background(), dsn)
 	if err != nil {
 		t.Fatalf("open work pool: %v", err)
 	}
-	return pool, newDSN
+	t.Cleanup(pool.Close)
+	return pool
+}
+
+type cjMigrationTemplate struct {
+	name    string
+	version int64
+}
+
+func newCJMigrationTemplate(t *testing.T, version int64) cjMigrationTemplate {
+	t.Helper()
+	name, dsn := cjCreateDatabase(t, "")
+	ctx := context.Background()
+	if err := MigrateTo(ctx, dsn, version); err != nil {
+		t.Fatalf("MigrateTo(%d): %v", version, err)
+	}
+	pool := cjOpenPool(t, dsn)
+	cjAssertHistorical(t, pool, version)
+	for _, key := range []string{"judge_model", "codex_judge_model"} {
+		if _, ok := cjAppValue(t, pool, key); ok {
+			t.Fatalf("historical template already has app_settings key %s", key)
+		}
+	}
+	// OpenPool pings the database; close its connections before sealing it.
+	// MigrateTo closes its own SQL handle before returning.
+	pool.Close()
+	adminPool, err := OpenPool(ctx, os.Getenv("UZI_TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatalf("open admin pool to seal template: %v", err)
+	}
+	defer adminPool.Close()
+	if _, err := adminPool.Exec(ctx, "ALTER DATABASE "+pgx.Identifier{name}.Sanitize()+" ALLOW_CONNECTIONS false"); err != nil {
+		t.Fatalf("seal historical template %s: %v", name, err)
+	}
+	return cjMigrationTemplate{name: name, version: version}
+}
+
+func (fixture cjMigrationTemplate) Clone(t *testing.T) (*pgxpool.Pool, string) {
+	t.Helper()
+	_, dsn := cjCreateDatabase(t, fixture.name)
+	pool := cjOpenPool(t, dsn)
+	cjAssertHistorical(t, pool, fixture.version)
+	return pool, dsn
+}
+
+func cjAssertHistorical(t *testing.T, pool *pgxpool.Pool, version int64) {
+	t.Helper()
+	var applied int64
+	var higher int
+	if err := pool.QueryRow(context.Background(), `SELECT
+		COALESCE(max(version_id) FILTER (WHERE is_applied), 0),
+		count(*) FILTER (WHERE is_applied AND version_id > $1)
+		FROM goose_db_version`, version).Scan(&applied, &higher); err != nil {
+		t.Fatalf("read historical migration version: %v", err)
+	}
+	if applied != version || higher != 0 {
+		t.Fatalf("historical migration version = %d with %d applied higher, want %d and none higher", applied, higher, version)
+	}
+	if cjCodexColumns(t, pool) != 0 {
+		t.Fatalf("codex_judge_model already exists at v%d; the test would be vacuous", version)
+	}
 }
 
 func cjExec(t *testing.T, pool *pgxpool.Pool, sql string, args ...any) {
@@ -175,11 +246,12 @@ func TestCodexJudgeModelMigrationUsersLiveDB(t *testing.T) {
 func TestCodexJudgeModelMigrationInstanceLiveDB(t *testing.T) {
 	ctx := context.Background()
 	v := migrationVersionByName(t, "codex_judge_model")
+	fixture := newCJMigrationTemplate(t, v-1)
 	updatedAt := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
 
 	t.Run("curated padded value is copied trimmed with its author and time", func(t *testing.T) {
 		for _, id := range curatedIDs() {
-			pool, dsn := codexJudgeMigrationDB(t, v-1)
+			pool, dsn := fixture.Clone(t)
 			admin := cjSeedUser(t, pool, nil)
 			raw := "\t" + id + " \n\v"
 			cjExec(t, pool, `INSERT INTO app_settings (key, value, updated_by, updated_at) VALUES ('judge_model', $1, $2, $3)`, raw, admin, updatedAt)
@@ -205,7 +277,7 @@ func TestCodexJudgeModelMigrationInstanceLiveDB(t *testing.T) {
 
 	for _, notCopied := range []string{"gpt-6-luna", "opus", "", "vgpt-6-sol"} {
 		t.Run("no Codex row for "+notCopied, func(t *testing.T) {
-			pool, dsn := codexJudgeMigrationDB(t, v-1)
+			pool, dsn := fixture.Clone(t)
 			cjExec(t, pool, `INSERT INTO app_settings (key, value) VALUES ('judge_model', $1)`, notCopied)
 			if err := MigrateTo(ctx, dsn, v); err != nil {
 				t.Fatalf("MigrateTo(%d): %v", v, err)
@@ -220,7 +292,7 @@ func TestCodexJudgeModelMigrationInstanceLiveDB(t *testing.T) {
 	}
 
 	t.Run("an existing codex_judge_model row is not overwritten", func(t *testing.T) {
-		pool, dsn := codexJudgeMigrationDB(t, v-1)
+		pool, dsn := fixture.Clone(t)
 		cjExec(t, pool, `INSERT INTO app_settings (key, value) VALUES ('judge_model', 'gpt-6-sol'), ('codex_judge_model', 'gpt-6-astra')`)
 		if err := MigrateTo(ctx, dsn, v); err != nil {
 			t.Fatalf("MigrateTo(%d): %v", v, err)
@@ -234,6 +306,7 @@ func TestCodexJudgeModelMigrationInstanceLiveDB(t *testing.T) {
 func TestCodexJudgeModelMigrationDownLiveDB(t *testing.T) {
 	ctx := context.Background()
 	v := migrationVersionByName(t, "codex_judge_model")
+	fixture := newCJMigrationTemplate(t, v-1)
 
 	for _, tc := range []struct {
 		name      string
@@ -249,7 +322,10 @@ func TestCodexJudgeModelMigrationDownLiveDB(t *testing.T) {
 		{"empty Codex row writes nothing", nil, "", "", false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			pool, dsn := codexJudgeMigrationDB(t, v)
+			pool, dsn := fixture.Clone(t)
+			if err := MigrateTo(ctx, dsn, v); err != nil {
+				t.Fatalf("MigrateTo(%d): %v", v, err)
+			}
 			var authorID any
 			if tc.author {
 				authorID = cjSeedUser(t, pool, nil)

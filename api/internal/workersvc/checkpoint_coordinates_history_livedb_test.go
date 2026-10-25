@@ -127,7 +127,15 @@ func TestCheckpointCoordinatesArchivedAdmissionLiveDB(t *testing.T) {
 						t.Fatal(err)
 					}
 					_, err = sp.Exec(env.ctx, sql, args...)
-					requireCoordinateSQLState(t, err, "23514")
+					if name == "ClaimRun" {
+						// Migration 00355 extends workers. The archived explicit projection
+						// no longer casts to that composite, before enrollment is checked.
+						// Current SQL without opt-in still requires 23514 in
+						// TestCheckpointCoordinatesClaimCompatibilityLiveDB/historical_API.
+						requireCoordinateSQLState(t, err, "42846")
+					} else {
+						requireCoordinateSQLState(t, err, "23514")
+					}
 					if err := sp.Rollback(env.ctx); err != nil {
 						t.Fatal(err)
 					}
@@ -140,5 +148,45 @@ func TestCheckpointCoordinatesArchivedAdmissionLiveDB(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+// The composite mismatch affects ordinary intake too, not just enrolled tasks.
+func TestArchivedClaimRunRejectsOrdinaryCandidateLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	f := newCustodyContinuationFixture(t, env)
+	id := f.seedRun("queued", 0)
+	run := mustRun(t, env, id)
+	if run.Kind != "issue" || len(run.CheckpointCoordinates) != 0 {
+		t.Fatal("control must be an unenrolled ordinary issue")
+	}
+	before := coordinateAuthoritySnapshot(t, env, id)
+	params := coordinateClaimParams(f)
+	sql, args := historicalCoordinateQuery(t, "ClaimRun", params)
+	_, err := env.pool.Exec(env.ctx, sql, args...)
+	requireCoordinateSQLState(t, err, "42846")
+	if after := coordinateAuthoritySnapshot(t, env, id); after != before {
+		t.Fatal("archived ordinary claim changed persisted authority")
+	}
+
+	// Current SQL can claim the same candidate: ordinary eligibility is intact.
+	tx, err := env.pool.Begin(env.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(env.ctx) }()
+	q := store.New(tx)
+	if _, err := q.GetWorkerForUpdate(env.ctx, f.workerID); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := q.ClaimRun(env.ctx, params)
+	if err != nil || claimed.ID != id || claimed.ClaimGeneration != run.ClaimGeneration+1 {
+		t.Fatalf("current ordinary claim=%s generation=%d err=%v", claimed.ID, claimed.ClaimGeneration, err)
+	}
+	if err := tx.Rollback(env.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if after := coordinateAuthoritySnapshot(t, env, id); after != before {
+		t.Fatal("ordinary control rollback changed persisted authority")
 	}
 }

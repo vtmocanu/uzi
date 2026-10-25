@@ -49,6 +49,6 @@ func rollWaitReason(now time.Time, counts store.CountOnlineWorkersClaimableForRu
 // provider must be a healthy active drainer before the upgrade exemption applies.
 // Callers independently validate the stored reason and finite overlap timestamps.
 func DrainOnlyEligibleForHealth(counts store.CountOnlineWorkersClaimableForRunRow) bool {
-	return counts.DrainingEligible > 0 && counts.NonDrainingEligible == 0 && counts.SuitableOwnDraining == 0 &&
+	return counts.ManualCordoned == 0 && counts.DrainingEligible > 0 && counts.NonDrainingEligible == 0 && counts.SuitableOwnDraining == 0 &&
 		(counts.DiagnosticRolling == 0 || counts.DiagnosticDrainingOnly == counts.DiagnosticSuitable)
 }

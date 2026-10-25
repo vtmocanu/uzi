@@ -148,7 +148,7 @@ func etagAllowlisted(path string) bool {
 // allowlist pass straight through the wrapped transport untouched.
 func (t *etagTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	limit := responseLimitFrom(req.Context())
-	if isCIJSON(req.Context()) || (limit != nil && limit.continuationValidation) || req.Method != http.MethodGet || !etagAllowlisted(req.URL.Path) {
+	if isCIJSON(req.Context()) || (limit != nil && (limit.continuationValidation || limit.ledger != nil)) || req.Method != http.MethodGet || !etagAllowlisted(req.URL.Path) {
 		// Non-conditional passthrough: still record the response's rate state so the
 		// reserve reflects the true current Remaining for EVERY GitHub call this PAT
 		// makes, not only the allowlisted read paths (PRD #1255 D4).

@@ -589,7 +589,7 @@ export const CODEX_CLAUSES: ClauseRow[] = [
       "every builder in the DEFAULT/advice posture (prod api_key, prod subscription, loopback) pins "
       + "hooks=false with NO hooks=true, NO bypass_hook_trust / dangerously-bypass-hook-trust, every "
       + "native EXECUTION feature (shell_tool/unified_exec/code_mode/code_mode_only/code_mode_prewarm/"
-      + "apply_patch_freeform/shell_snapshot*/multi_agent*/plugins/apps/remote_models) off, "
+      + "apply_patch_freeform/shell_snapshot*/multi_agent*/plugins/apps) off, "
       + "project_doc_max_bytes=0 and trust_level=untrusted; a non-loopback provider URL is rejected. "
       + "code_mode_host is the ONE posture-dependent exception: it is the authority-free callback-routing "
       + "execution HOST (environments:[], untrusted project, broker-mediated callbacks only), pinned OFF "

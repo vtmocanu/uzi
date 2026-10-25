@@ -38,6 +38,8 @@ import { maskEmail } from "../lib/demoMask";
 import { attentionChecks, healthVerdict, isAttention } from "../lib/healthView";
 import { formatAgo, useNow } from "../lib/rateLimits";
 import { stripUnsafeChars } from "../lib/safeText";
+import { WorkerCordonBadge } from "../components/WorkerCordonBadge";
+import { WorkerCordonMetadata } from "../components/WorkerCordonMetadata";
 import { useHealthStatus } from "../lib/useAdminHealth";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 
@@ -613,6 +615,8 @@ function FleetRow({ worker: w, demo }: { worker: AdminWorker; demo: boolean }) {
         )}
       </td>
       <td className="px-4 py-3">
+        <div className="flex flex-wrap gap-1"><WorkerCordonBadge worker={w} /></div>
+        <WorkerCordonMetadata worker={w} />
         <BlockingCell worker={w} />
       </td>
       <td className="px-4 py-3 tabular-nums text-muted">

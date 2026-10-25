@@ -58,6 +58,43 @@ func TestDecodePollAcceptsSharedEvidenceGolden(t *testing.T) {
 	}
 }
 
+func TestDecodePollManualCordon(t *testing.T) {
+	for _, tc := range []struct {
+		name, fields                       string
+		manual, effective, present, reject bool
+	}{
+		{"omitted", "", false, false, false, false},
+		{"manual", `,"manual_cordoned_at":"2026-01-02T03:04:05Z","effective_cordoned":true`, true, true, true, false},
+		{"effective_only", `,"effective_cordoned":true`, false, true, true, false},
+		{"explicit_false", `,"effective_cordoned":false`, false, false, true, false},
+		{"invalid_timestamp", `,"manual_cordoned_at":"invalid"`, false, false, false, true},
+		{"invalid_bool", `,"effective_cordoned":"true"`, false, false, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `{"workers":[{"id":"00000000-0000-0000-0000-000000000001"` + tc.fields + "}]}"
+
+			got, err := decodePoll(&http.Response{Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)})
+			if tc.reject {
+				if err == nil || got.Workers != nil {
+					t.Fatal("malformed field accepted as desired state")
+				}
+				return
+			}
+			if err != nil || len(got.Workers) != 1 {
+				t.Fatalf("decode: %+v %v", got, err)
+			}
+			w := got.Workers[0]
+			if (w.ManualCordonedAt != nil) != tc.manual || (w.EffectiveCordoned != nil) != tc.present ||
+				(w.EffectiveCordoned != nil && *w.EffectiveCordoned != tc.effective) {
+				t.Fatalf("lost cordon fields: %+v", w)
+			}
+			if tc.manual && !w.ManualCordonedAt.Equal(time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)) {
+				t.Fatal("manual timestamp changed")
+			}
+		})
+	}
+}
+
 func TestBoundedPollRejectsWholeSnapshot(t *testing.T) {
 	secret := "join-token-plaintext-fixture"
 	valid := pollFixture(1, secret)

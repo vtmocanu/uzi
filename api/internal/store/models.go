@@ -1649,6 +1649,10 @@ type Worker struct {
 	RegisteredPodUid         pgtype.UUID        `json:"registered_pod_uid"`
 	RollHeartbeatAt          pgtype.Timestamptz `json:"roll_heartbeat_at"`
 	DrainingReason           pgtype.Text        `json:"draining_reason"`
+	ManualCordonedAt         pgtype.Timestamptz `json:"manual_cordoned_at"`
+	ManualCordonedBy         pgtype.UUID        `json:"manual_cordoned_by"`
+	ManualCordonedByLabel    pgtype.Text        `json:"manual_cordoned_by_label"`
+	ManualCordonReason       pgtype.Text        `json:"manual_cordon_reason"`
 }
 
 type WorkerActiveRun struct {
@@ -1661,6 +1665,17 @@ type WorkerActiveRun struct {
 	SnapshotEpoch        int64              `json:"snapshot_epoch"`
 	ReportedAt           pgtype.Timestamptz `json:"reported_at"`
 	TerminalPendingSince pgtype.Timestamptz `json:"terminal_pending_since"`
+}
+
+type WorkerCordonEvent struct {
+	ID         uuid.UUID          `json:"id"`
+	OwnerID    uuid.UUID          `json:"owner_id"`
+	WorkerID   uuid.UUID          `json:"worker_id"`
+	ActorID    uuid.UUID          `json:"actor_id"`
+	ActorLabel string             `json:"actor_label"`
+	Action     string             `json:"action"`
+	OccurredAt pgtype.Timestamptz `json:"occurred_at"`
+	Reason     pgtype.Text        `json:"reason"`
 }
 
 type WorkerPendingOutcomeIdentity struct {
