@@ -310,6 +310,8 @@ tasks:
       # build-Go guard: no network and no real release binary. It protects the
       # archive-cache trust boundary and the go/toolchain compatibility seam.
       - task: test:golangci-wrapper
+      # Best-effort deadcode diagnostics and gate verdicts, with fake Go only.
+      - task: test:deadcode-gate
       # Hermetic tests of the oasdiff wrapper's verified-archive cache (PRD #1908 M5): fake
       # curl/uname, a real fixture tarball, no network. Same protection as the line above.
       - task: test:oasdiff-wrapper
@@ -990,6 +992,11 @@ tasks:
       # into vtmocanu/homebrew-tap on every v* tag.
       - ./scripts/lint-formula.sh Formula/uzi-cli.rb
       - ./scripts/lint-formula.sh Formula/uzi-cli-rc.rb
+
+  test:deadcode-gate:
+    desc: hermetic deadcode verdict and optional diagnostic contracts (fake Go)
+    cmds:
+      - ./scripts/deadcode-gate.test.sh
 
   test:golangci-wrapper:
     desc: hermetic tests of the verified golangci-lint archive cache and build-Go guard
