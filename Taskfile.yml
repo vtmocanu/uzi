@@ -649,6 +649,12 @@ tasks:
   gate:agent:
     desc: agent - deps-check, lint, deadcode, typecheck, test
     cmds:
+      - task: check:agent
+      - task: test:agent
+
+  check:agent:
+    desc: agent - deps-check, lint, deadcode, typecheck
+    cmds:
       # deps-check first, same placement and the same reasons as gate:web above -
       # read that target's comment, including the two limits and the one state in
       # which `npm ls` lies. This package is the one where the standing remedy for a
@@ -662,7 +668,6 @@ tasks:
       # knip second, same reason as gate:web (~1-3s wall here too).
       - task: deadcode:agent
       - task: typecheck:agent
-      - task: test:agent
 
   fmt-check:
     # COMPOSES THE TWO PER-MODULE TARGETS; IT DOES NOT RE-SCOPE THEM. There must

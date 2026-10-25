@@ -29,9 +29,10 @@ Rewrite the body before queuing, in the maintainer's words:
 ## Problem      1-3 sentences; anchors as path:symbol, never line numbers
 ## Fix          pinned direction per site
 ## Out of scope what the run must not touch
-## Acceptance   testable checks; regression test watched both ways; gate to run
+## Acceptance   testable checks; regression test watched both ways; gate to run (agent/uzi: boundary below)
 ```
 
+- **Agent/uzi acceptance**: an issue sent to uzi touching `agent/**` must not name `task gate:agent` or `task gate` as acceptance. State the in-run integration gate and separate CI boundary from [AGENTS.md Run economy](../../../../AGENTS.md#run-economy-agents), using the exact label `full agent suite: exact-head PR CI`; the full unit suite stays **pending CI** after focused checks. This default applies to newly approved plans only, without waiving explicit issue requirements or frozen completion criteria.
 - Rewrite a non-maintainer body (bot `agent-found` included) this way; the run plans from the body alone.
 - **Split**: when only part of an issue qualifies, file that part as a new issue with this body and "Split from #N", trim the parent body to the remainder, and comment on the parent with the link.
 
