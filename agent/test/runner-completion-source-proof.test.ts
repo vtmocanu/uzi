@@ -33,6 +33,7 @@ interface PrivateRunner {
   classifyCompletionSource(source: CompletionSource): { kind: string };
   forgetCompletionSourceBinding(source: CompletionSource): void;
   bindCompletionSource(flight: Flight): Promise<void>;
+  owedOptions(...args: unknown[]): Promise<{ context?: CompletionSource["context"] }>;
   withCompletionSourceBoundary(source: CompletionSource, action: (open: () => boolean) => Promise<void>): Promise<"passed" | "retained">;
 }
 
@@ -421,7 +422,8 @@ for (const outcome of ["success", "partial-retry", "pending-bind", "concurrent-b
       await forgetting;
       controlWitness?.release(); controlWitness?.release();
     }
-    // Behavioral cases deliberately use only pre-existing APIs, so they can be copied to the base.
+    // Only pending-bind, concurrent-binds and late-bind avoid the new witness API.
+    // Exclude those copyable behavioral cases from this new-API assertion block.
     if (outcome !== "pending-bind" && outcome !== "concurrent-binds" && outcome !== "late-bind") {
       const internals = f.p.recovery as unknown as { completionCleanupWitnesses: Map<string, unknown> };
       assert.equal(internals.completionCleanupWitnesses.size, 0, "last release removes shared evidence");
@@ -430,6 +432,116 @@ for (const outcome of ["success", "partial-retry", "pending-bind", "concurrent-b
       fresh.release();
     }
   });
+}
+
+// No initial runner bind: cleanup can finish before provenance has ever been installed.
+async function preparationFallback() {
+  const f = await setup();
+  assert.ok(await f.p.recovery.pin({ runId: f.claim.run_id, generation: 29, kind: "issue",
+    branch: f.source.context.branch, sourceSha: f.source.expectedHead, inventoryGuarded: true }));
+  const frozen = await f.p.recovery.freezeInventory({ context: f.source.context,
+    currentSha: f.source.expectedHead, originalSourceSha: f.source.expectedHead,
+    defaultBranch: "main", locallyQuiescent: true });
+  assert.ok(frozen?.coverageDigest);
+  await (f.p.recovery as unknown as JournalWriter).writeRecordUnlocked({ ...frozen,
+    serverCaptureId: "preparation-archive", finalAcknowledged: true,
+    finalRequest: { disposition: { kind: "archive", capture_id: "preparation-archive",
+      source_sha: frozen.sourceSha, coverage_digest: frozen.coverageDigest } } });
+  return f;
+}
+
+for (const stage of ["owedOptions", "worktreeHead", "enumerateOwedCandidates"] as const) {
+  for (const outcome of ["no-prior-binding", "existing-versions", "throw",
+    ...(stage === "enumerateOwedCandidates" ? [] : ["early-return"]),
+    ...(stage === "owedOptions" ? ["mismatched-context"] : [])]) {
+    it(`completion preparation fallback: ${stage} ${outcome}`, async t => {
+      const f = await preparationFallback();
+      const group = f.claim.run_id + ":29";
+      const prior: unknown[] = [];
+      if (outcome !== "no-prior-binding") {
+        prior.push(f.remember(), f.remember({ ...f.source, expectedHead: "b".repeat(40) }),
+          f.remember(f.source, new FakeCodexExecutor(f.rig.safety, async ctx => ({ branch: ctx.branch }))));
+      }
+      const siblingIdentity = { ...f.source, attemptId: mintAttemptId(29), clonePath: f.source.clonePath + "-other" };
+      const other = outcome === "no-prior-binding" ? undefined : f.remember(siblingIdentity);
+      f.remember({ ...f.source, context: { ...f.source.context, generation: 30 } });
+      f.remember({ ...f.source, context: { ...f.source.context, runId: "33333333-3333-4333-8333-333333333333" } });
+      const siblings = [...f.p.completionSourceBindings].filter(([key]) => key !== group);
+      const entered = barrier(), resume = barrier();
+      let first = true;
+      const pause = async () => {
+        if (!first) return false;
+        first = false;
+        entered.open();
+        await resume.wait;
+        if (outcome === "throw") throw new Error("deliberate preparation failure");
+        return true;
+      };
+      if (stage === "owedOptions") {
+        const original = f.p.owedOptions.bind(f.p);
+        t.mock.method(f.p, "owedOptions", async (...args: unknown[]) => {
+          const paused = await pause();
+          if (paused && outcome === "early-return") return {};
+          const options = await original(...args);
+          if (paused && outcome === "mismatched-context") return {
+            ...options, context: { ...f.source.context, generation: 30 },
+          };
+          return options;
+        });
+      } else if (stage === "worktreeHead") {
+        const original = git.worktreeHead.bind(git);
+        t.mock.method(git, "worktreeHead", async (...args: Parameters<typeof git.worktreeHead>) => {
+          if (await pause() && outcome === "early-return") return null;
+          return original(...args);
+        });
+      } else {
+        const original = git.enumerateOwedCandidates.bind(git);
+        t.mock.method(git, "enumerateOwedCandidates", async (...args: Parameters<typeof git.enumerateOwedCandidates>) => {
+          await pause();
+          return original(...args);
+        });
+      }
+      const cleanup = t.mock.method(git, "cleanupRecoveryGeneration", async () => "removed" as const);
+      const bind = f.p.recovery.bindCompletionSource.bind(f.p.recovery);
+      const results: boolean[] = [];
+      t.mock.method(f.p.recovery, "bindCompletionSource", async (source: CompletionSource) => {
+        const result = await bind(source);
+        results.push(result);
+        return result;
+      });
+      const pending = f.p.bindCompletionSource(f.flight);
+      try {
+        await entered.wait;
+        await f.p.recovery.forgetGeneration(f.claim.run_id, 29);
+        assert.equal(cleanup.mock.callCount(), 1, "real fallback cleanup completed during preparation");
+        assert.deepEqual(await f.p.recovery.inspect(f.claim.run_id), []);
+        const kept = f.p.completionSourceBindings.get(group) ?? [];
+        for (const binding of prior) {
+          assert.ok(kept.includes(binding), "preparation protects every old identity version");
+          assert.ok(f.p.conflictedCompletionSources.has(binding), "pending conflicts stay protected");
+        }
+        assert.equal(kept.includes(other), false, "same-generation sibling identity is released");
+        resume.open();
+        await pending;
+        if (outcome === "mismatched-context") {
+          assert.deepEqual(f.p.completionSourceBindings.get(group), prior, "wrong context cannot consume cleanup evidence");
+        } else {
+          assert.equal(f.p.completionSourceBindings.has(group), false,
+            "preparation settlement releases positively forgotten provenance");
+          for (const binding of prior) assert.equal(f.p.conflictedCompletionSources.has(binding), false);
+        }
+        assert.deepEqual(results, ["no-prior-binding", "existing-versions"].includes(outcome) ? [false] : [],
+          "real durable binder returns false for the empty generation");
+        for (const [key, bindings] of siblings) assert.equal(f.p.completionSourceBindings.get(key), bindings);
+        assert.equal(f.p.completionSourceBinds.size, 0, "all preparation/durable markers released");
+        const internals = f.p.recovery as unknown as { completionCleanupWitnesses: Map<string, unknown> };
+        assert.equal(internals.completionCleanupWitnesses.size, 0, "preparation lease released on every exit");
+      } finally {
+        resume.open();
+        await pending;
+      }
+    });
+  }
 }
 
 function barrier() {

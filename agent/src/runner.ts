@@ -2890,7 +2890,7 @@ export class RunRunner {
   // A boundary pass alone is not full cleanup. Only the coordinator completion notification retires bindings.
   private readonly completionSourceBindings = new Map<string, readonly CompletionSourceBinding[]>();
   private readonly conflictedCompletionSources = new Set<CompletionSourceBinding>();
-  private readonly completionSourceBinds = new Set<CompletionSourceBinding>();
+  private readonly completionSourceBinds = new Set<Pick<CompletionSourceBinding, "key">>();
   /** PRD #218 M1: set by `shutdown()`. Read when a run registers so a run that starts
    *  DURING the shutdown drain (a late claim) is aborted immediately rather than running
    *  to completion past the grace window. */
@@ -3341,7 +3341,7 @@ export class RunRunner {
     // A binder may already own provenance while waiting on the coordinator's journal lock.
     // Its partial write must never become an unclassified current-process source; preserve
     // every version of its identity, including conflicting bindings.
-    const pendingKeys = new Set(bindings.filter(b => this.completionSourceBinds.has(b)).map(b => b.key));
+    const pendingKeys = new Set([...this.completionSourceBinds].map(b => b.key));
     const remaining = bindings.filter(binding => {
       if ((key !== undefined && binding.key !== key) || pendingKeys.has(binding.key)) return true;
       this.conflictedCompletionSources.delete(binding);
@@ -3727,26 +3727,41 @@ export class RunRunner {
         !flight.runnerClone || flight.runnerClone.path !== flight.worktreePath || flight.runnerClone.branch !== flight.branch) return;
     const executor = flight.executor;
     const terminalSource = executor.safety ? this.terminalSource(flight, executor, executor.safety) : undefined;
+    const { runId, claimGeneration: generation, barePath, branch, worktreePath } = flight;
+    const attemptId = flight.runnerClone.attemptId;
+    // Preparation protects every existing version before owedOptions can yield.
+    const preparation = { key: JSON.stringify([runId, generation, barePath, branch, worktreePath, attemptId]) };
+    this.completionSourceBinds.add(preparation);
+    const witness = this.recovery.registerCompletionCleanupWitness(runId, generation);
+    let binding: CompletionSourceBinding | undefined;
+    let matchingIdentity = true;
     try {
-      const context = (await this.owedOptions(flight, flight.barePath, flight.branch)).context;
-      if (!context || context.generation === null || "legacy" in context) return;
-      const expectedHead = await this.git.worktreeHead(flight.worktreePath);
-      if (!expectedHead) return;
-      const candidates = await this.git.enumerateOwedCandidates(flight.barePath, flight.runId);
-      const roots = candidates.map(r => ({ sha: r.sha,
-        contexts: r.contexts.filter(c => c.generation === flight.claimGeneration && !("origin" in c)) }))
-        .filter(r => r.contexts.length > 0);
-      const source: CompletionSource = { context: context as CompletionSource["context"],
-        clonePath: flight.worktreePath, attemptId: flight.runnerClone?.attemptId, expectedHead, roots };
-      // Install before the durable write: false/throw may already have persisted part of the cohort.
-      const binding = this.rememberCompletionSource(source, flight, executor, terminalSource);
-      this.completionSourceBinds.add(binding);
-      const witness = this.recovery.registerCompletionCleanupWitness(context.runId, context.generation);
-      try { await this.recovery.bindCompletionSource(source); }
-      finally {
-        this.completionSourceBinds.delete(binding);
+      try {
+        const context = (await this.owedOptions(flight, barePath, branch)).context;
+        if (!context || context.generation === null || "legacy" in context) return;
+        matchingIdentity = context.runId === runId && context.generation === generation &&
+          context.barePath === barePath && context.branch === branch;
+        if (!matchingIdentity) throw new Error("completion source preparation identity changed");
+        const expectedHead = await this.git.worktreeHead(worktreePath);
+        if (!expectedHead) return;
+        const candidates = await this.git.enumerateOwedCandidates(barePath, runId);
+        const roots = candidates.map(r => ({ sha: r.sha,
+          contexts: r.contexts.filter(c => c.generation === generation && !("origin" in c)) }))
+          .filter(r => r.contexts.length > 0);
+        const source: CompletionSource = { context: context as CompletionSource["context"],
+          clonePath: worktreePath, attemptId, expectedHead, roots };
+        matchingIdentity = this.completionSourceIdentity(source) === preparation.key;
+        if (!matchingIdentity) throw new Error("completion source preparation identity changed");
+        // Install before the durable write: false/throw may already have persisted part of the cohort.
+        binding = this.rememberCompletionSource(source, flight, executor, terminalSource);
+        this.completionSourceBinds.add(binding);
+        this.completionSourceBinds.delete(preparation);
+        await this.recovery.bindCompletionSource(source);
+      } finally {
+        this.completionSourceBinds.delete(preparation);
+        if (binding) this.completionSourceBinds.delete(binding);
         try {
-          if (witness.fullyForgotten()) this.forgetCompletionSourceBindings(context.runId, context.generation);
+          if (matchingIdentity && witness.fullyForgotten()) this.forgetCompletionSourceBindings(runId, generation);
         } finally { witness.release(); }
       }
     } catch (err) {
