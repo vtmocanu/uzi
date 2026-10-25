@@ -21498,6 +21498,10 @@ export class RunRunner {
       (claim.worker_recovery_episode ?? -1) >= 0 ? claim.worker_recovery_episode : undefined;
     if (source.recovery?.stage === "blocked" &&
         (source.recovery.blocker !== "budget_exhausted" || (recoveryEpisode ?? 0) <= (source.recovery.episode ?? 0))) await fail();
+    // Refusing an unfenced renewal must leave the predecessor journal untouched.
+    if (episode && (recoveryEpisode ?? 0) > (episode.episode ?? 0) &&
+        (!Number.isSafeInteger(flight.claimGeneration) || flight.claimGeneration < 1 ||
+          flight.claimGeneration <= (episode.claimGeneration ?? 0))) throw new RetainedRecoveryStop();
     for (;;) {
       this.retainedLifecycleGuard(flight);
       let reservation: Awaited<ReturnType<GitCache["reserveRecoveryIteration"]>>;

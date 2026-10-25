@@ -125,26 +125,27 @@ for (const blocker of Object.keys(permanentBlockers) as Exclude<RecoveryBlocker,
   });
 }
 
-for (const state of ["partly-used", "budget-blocked"] as const) {
-  for (const generation of [undefined, 3, 4]) {
-    test(`newer episode with ${String(generation)} fence preserves ${state} whole journal`, async t => {
-      const f = fixture(t);
-      await f.reserve(4, f.recreate(), 7);
-      if (state === "budget-blocked") {
+for (const state of ["partly-used", "exhausted-unblocked", "budget-blocked"] as const) {
+  for (const generation of [undefined, 0, 3, 4]) {
+    for (const expired of [false, true]) {
+      test(`newer episode with ${String(generation)} fence preserves ${state} whole journal (expired=${expired})`, async t => {
+        const f = fixture(t);
         await f.reserve(4, f.recreate(), 7);
-        await f.reserve(4, f.recreate(), 7);
-        await assert.rejects(f.reserve(4, f.recreate(), 7), /budget/);
-      }
-      const before = f.read();
-      await assert.rejects(f.reserve(generation, f.recreate(), 8), /fence/);
-      assert.deepEqual(f.read(), before);
-      if (state === "budget-blocked") {
+        if (state !== "partly-used") {
+          await f.reserve(4, f.recreate(), 7);
+          await f.reserve(4, f.recreate(), 7);
+        }
+        if (state === "budget-blocked") await assert.rejects(f.reserve(4, f.recreate(), 7), /budget/);
+        if (expired) f.advance(400_000);
+        const before = f.read();
+        await assert.rejects(f.reserve(generation, f.recreate(), 8), /fence/);
+        assert.deepEqual(f.read(), before);
         const h = runnerFixture(f, async () => ({ status: "running", claim_generation: generation }));
         await assert.rejects(h.run(generation, 8));
         assert.equal(h.quiescenceCalls(), 0);
-        assert.deepEqual(f.read(), before, "runner failure finalization cannot rewrite blocked predecessor");
-      }
-    });
+        assert.deepEqual(f.read(), before, "runner failure finalization cannot rewrite predecessor");
+      });
+    }
   }
 }
 
