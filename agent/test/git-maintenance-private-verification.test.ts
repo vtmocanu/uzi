@@ -28,8 +28,14 @@ const latch = () => {
   const promise = new Promise<void>(resolve => { release = resolve; });
   return { promise, release };
 };
+async function fixtureDirectory(parent = path.resolve("../.uzi/scratch")) {
+  const dir = await fs.mkdtemp(path.join(parent, "private-verification-"));
+  // Clear inherited setgid before creating worker-owned fixture directories.
+  await fs.chmod(dir, 0o700);
+  return dir;
+}
 async function fixture(t: test.TestContext, decoded?: number | ((total: number) => number)) {
-  const dir = await fs.mkdtemp(path.resolve("../.uzi/scratch/private-verification-"));
+  const dir = await fixtureDirectory();
   const native = async (cwd: string, args: string[]) => {
     const result = exec("/usr/bin/git", ["-C", cwd, ...args], {
     env: { PATH: "/usr/bin:/bin", HOME: dir, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null",
@@ -173,6 +179,20 @@ async function fixture(t: test.TestContext, decoded?: number | ((total: number) 
     run, runCapture, seam, charge, fingerprint, original, physical, callbacks: () => callbacks,
     effects: () => effects, joined: () => joined, cancelled: () => cancelled };
 }
+
+test("private verification fixture clears inherited setgid before creating descendants", {
+  skip: process.platform !== "linux" ? "needs Linux setgid directory inheritance" : false,
+}, async t => {
+  const parent = await fs.mkdtemp(path.resolve("../.uzi/scratch/private-verification-setgid-"));
+  t.after(() => fs.rm(parent, { recursive: true, force: true }));
+  await fs.chmod(parent, 0o2775);
+  assert.equal((await fs.stat(parent)).mode & 0o2000, 0o2000);
+  const dir = await fixtureDirectory(parent);
+  assert.equal((await fs.stat(dir)).mode & 0o2000, 0, "fixture root must clear inherited setgid");
+  const child = path.join(dir, "child");
+  await fs.mkdir(child);
+  assert.equal((await fs.stat(child)).mode & 0o2000, 0, "fixture descendants must not inherit setgid");
+});
 
 test("private maintenance refuses genuine capture with valid resources before snapshot effects", async t => {
   const f = await fixture(t);
