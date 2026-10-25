@@ -126,6 +126,11 @@ const (
 	// runs.health_reason is free text). The sweeper (SweepTaskNeverDispatched) expires
 	// the run to 'failed' with a terminal failure_reason after DispatchGrace.
 	reasonHandoffSetup = "handoff setup has not finished"
+	// reasonMaintenance (PRD #3454) is the honest queued reason for a run the instance intake pause
+	// holds (fn_instance_intake_paused() and the run not admitted by
+	// fn_run_admitted_during_intake_pause): ClaimRun matches no row for it, so no worker gap is the
+	// cause. Same fixed-string contract and healthWaitingWorker enum as its siblings.
+	reasonMaintenance = "waiting: uzi is in maintenance mode"
 	// reasonStaleRequeuePinPrefix opens both expected owner-hold reasons: stale requeue
 	// (#2705) and draining or maintenance (#3000). Unlike its fixed
 	// siblings they embed values (the deadline and the worker name). isStaleRequeuePinReason
@@ -455,6 +460,11 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		// nudge (its flag was already waiting_worker) and would carry the hold in its "stuck for".
 		leftPin := target != healthOK && r.Health == healthWaitingWorker && r.HealthReason.Valid &&
 			isStaleRequeuePinReason(r.HealthReason.String) && !isStaleRequeuePinReason(reason)
+		// PRD #3454: a run leaving the maintenance hold starts a new episode too, so its "stuck for"
+		// excludes the pause and a run still stuck after the lift can nudge.
+		leftMaintenance := target != healthOK && r.Health == healthWaitingWorker && r.HealthReason.Valid &&
+			r.HealthReason.String == reasonMaintenance && reason != reasonMaintenance
+		leftPin = leftPin || leftMaintenance
 		nudge := target != healthOK && (r.Health == healthOK || leftPin) &&
 			(cooldown == 0 || !r.HealthNotifiedAt.Valid || now.Sub(r.HealthNotifiedAt.Time) >= cooldown)
 		// PRD #1349 M6 (D10): SUPPRESS the per-run Slack nudge for the custody-limit reason. The
@@ -487,6 +497,10 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		// failure after DispatchGrace, not a "waiting" nudge during a setup that may still be in
 		// flight. Keyed off the reason, exactly like reasonCustodyLimit above.
 		if reason == reasonHandoffSetup {
+			nudge = false
+		}
+		// PRD #3454: maintenance is an expected, operator-announced wait; a worker-pickup nudge is noise.
+		if reason == reasonMaintenance {
 			nudge = false
 		}
 		// Issues #2705/#3000: both owner-hold reasons are expected waiting; a worker-pickup
@@ -1154,6 +1168,11 @@ func (s *Service) queuedReasonWithEligibility(ctx context.Context, now time.Time
 	// real cause. Report the honest saga-setup reason; the sweeper (SweepTaskNeverDispatched)
 	// expires it to 'failed' with a terminal failure_reason after DispatchGrace. A dispatched
 	// queued task (DispatchedAt.Valid) falls through to the normal rungs.
+	// PRD #3454: the instance intake pause outranks every rung, the handoff one included, since the
+	// pause is the reason ClaimRun matches nothing.
+	if r.IntakePauseHeld {
+		return reasonMaintenance
+	}
 	if r.Kind == "task" && !r.DispatchedAt.Valid {
 		return reasonHandoffSetup
 	}

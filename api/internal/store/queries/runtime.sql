@@ -9859,7 +9859,11 @@ SELECT id, user_id, status, auto_approve,
                                              ELSE false END)))
                    )
              )
-       ))::boolean AS codex_account_gated
+       ))::boolean AS codex_account_gated,
+       -- PRD #3454: a queued run the instance intake pause holds (paused AND not admitted); queuedReason
+       -- reports it as reasonMaintenance, ahead of every worker-side rung.
+       (fn_instance_intake_paused() AND status = 'queued'
+        AND NOT fn_run_admitted_during_intake_pause(runs))::boolean AS intake_pause_held
 FROM runs
 WHERE status IN ('queued', 'running', 'awaiting_approval')
   AND kind <> 'chat';
@@ -10621,6 +10625,9 @@ WHERE r.status = 'queued'
                   AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds lh
                                   WHERE lh.live_worker_id = wc.id AND lh.state = 'open'))
       ) < @max_per_user::int
+  -- PRD #3454: while intake is paused only admitted runs (replacements) may drive provisioning, so
+  -- blocked roots cannot fill the bounded batch; provisionOne re-checks under the advisory lock.
+  AND (NOT fn_instance_intake_paused() OR fn_run_admitted_during_intake_pause(r))
 ORDER BY fn_run_priority(r.kind, r.priority, r.created_at < @background_grace_cutoff) DESC, r.created_at ASC
 LIMIT @max_rows;
 
@@ -10896,6 +10903,9 @@ WHERE r.status = 'queued'
                   AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds lh
                                   WHERE lh.live_worker_id = wc.id AND lh.state = 'open'))
       ) < @max_per_user::int
+  -- PRD #3454: while intake is paused only admitted runs (replacements) may drive provisioning, so
+  -- blocked roots cannot fill the bounded batch; provisionOne re-checks under the advisory lock.
+  AND (NOT fn_instance_intake_paused() OR fn_run_admitted_during_intake_pause(r))
 ORDER BY fn_run_priority(r.kind, r.priority, r.created_at < @background_grace_cutoff) DESC, r.status_since ASC
 LIMIT @max_rows;
 
@@ -10948,6 +10958,9 @@ WHERE r.status = 'queued'
                   AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds lh
                                   WHERE lh.live_worker_id = wc.id AND lh.state = 'open'))
       ) < @max_per_user::int
+  -- PRD #3454: while intake is paused only admitted runs (replacements) may drive provisioning, so
+  -- blocked roots cannot fill the bounded batch; provisionOne re-checks under the advisory lock.
+  AND (NOT fn_instance_intake_paused() OR fn_run_admitted_during_intake_pause(r))
 ORDER BY fn_run_priority(r.kind, r.priority, r.created_at < @background_grace_cutoff) DESC, r.created_at ASC
 LIMIT @max_rows;
 
