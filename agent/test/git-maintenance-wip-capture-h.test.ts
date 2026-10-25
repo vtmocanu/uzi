@@ -265,7 +265,8 @@ describe("hash-attested maintenance WIP capture (W0-H)", { skip: process.platfor
     delete env.NODE_TEST_CONTEXT;
     const child = spawnSync(process.execPath, [
       "--import", import.meta.resolve("tsx"),
-      "--test", "--test-timeout=120000", "--test-reporter=tap",
+      // Run the selected leaf in this process: a default isolated child would survive the launcher's SIGKILL.
+      "--test", "--test-isolation=none", "--test-timeout=120000", "--test-reporter=tap",
       "--test-name-pattern=^hash-attested maintenance WIP capture \\(W0-H\\) " + leaf + "$",
       fileURLToPath(import.meta.url),
     ], { cwd, env, encoding: "utf8", timeout: 110_000, killSignal: "SIGKILL", maxBuffer: 1024 * 1024 });
