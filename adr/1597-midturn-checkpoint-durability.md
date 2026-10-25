@@ -71,6 +71,40 @@ secret scan runs via `agent/src/git.ts`'s `secretScanRange`, with `agent/src/sec
 holding its pure, I/O-free helpers; `CHECKPOINT_TICK_INTERVAL` parsing is in
 `agent/src/config.ts`.
 
+## Generic checkpoint error diagnostics (issue #296)
+
+Generic exceptions retain the feed anchor “checkpoint publish failed: error” and append
+fixed phase and cause labels. Phase is `packing` until a packed tip exists, then
+`publish_request`. At most four nodes, including the root, in a linear cause chain
+are inspected with cycle detection and defensive code/message/cause reads. The first
+recognized exact code wins: ENOTFOUND/EAI_AGAIN → `dns`, ECONNREFUSED →
+`connection_refused`, ECONNRESET → `connection_reset`, and ETIMEDOUT or
+UND_ERR_CONNECT_TIMEOUT/UND_ERR_HEADERS_TIMEOUT/UND_ERR_BODY_TIMEOUT → `timeout`.
+Everything else is `unknown`; messages and aggregate collections do not classify errors.
+Boundary failures, typed refusals and aborts retain their earlier precedence, including
+fail-closed propagation from hostile boundary/name getters.
+
+The feed and its `error:<phase>:<cause>` dedupe key contain only this fixed vocabulary.
+Dedupe counts diagnostic events, not publish attempts: every generic failure is logged,
+distinct phase/cause pairs surface separately, and confirmed publication clears the
+ledger and reports recovery. These labels add no retries. HTTP status diagnostics and
+the bounded HTTP retry policy below remain distinct.
+
+Operators correlate the fixed feed label with the run ID and phase in the operator log.
+Only that log receives untrusted free text: a root `error` message and a `cause` field
+for the remaining at most three nodes. Each message is known-secret-redacted before
+sanitization and limited to 200 UTF-16 units; joined causes, including separators and
+ellipsis, are limited to 600. Raw messages over the existing 4096-character redaction
+input bound are omitted whole, and U+2028/U+2029 normalize before redaction. Missing,
+malformed or throwing redactors omit free text; stacks and arbitrary objects are never
+serialized. This is known-secret redaction, not universal removal of remote text:
+parser/ACK errors may retain a bounded, redacted remote excerpt in operator logs.
+
+An ambiguous ACK error does not prove refusal. Attempted tips still support later
+reconciliation; only a confirmed ACK and successful producer settle the confirmed tip.
+A checkpoint failure says nothing definitive about final delivery: the later work
+branch push and merge request publication remain separate and can succeed.
+
 ## Bounded HTTP retries (issue #296)
 
 [Issue #296](https://github.com/vtmocanu/uzi/issues/296) adds retries for explicit numeric

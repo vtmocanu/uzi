@@ -681,13 +681,14 @@ describe("RunRunner — typed shutdown checkpoint outcome (issue #1597 M1)", () 
     try {
       const { feed, lines } = await shutdownOnce(1597_06);
       assert.ok(feed.includes(notPublished("publish_error")), JSON.stringify(feed));
-      assert.ok(feed.includes("checkpoint publish failed: error"), JSON.stringify(feed));
+      assert.ok(feed.includes("checkpoint publish failed: error (phase=publish_request, cause=unknown)"), JSON.stringify(feed));
       for (const needle of ["boom", "secret", "remote-text"]) {
         assert.ok(!feed.some((t) => t.includes(needle)), `feed leaked "${needle}": ${JSON.stringify(feed)}`);
       }
       // The operator log keeps the message.
       assert.ok(
-        lines.some((l) => l.msg === "checkpoint publish failed: error" && l.error === "boom-secret-remote-text"),
+        lines.some((l) => l.msg === "checkpoint publish failed: error (phase=publish_request, cause=unknown)" &&
+          l.error === "boom-secret-remote-text" && String(l.error).length <= 200),
         "runLog.warn keeps the thrown message",
       );
     } finally {
