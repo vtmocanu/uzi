@@ -1266,6 +1266,59 @@ tester and auditor dispatches were cancelled; partial mutation artifacts are not
 complete sign-offs. Surviving or invalid mutants still require adjudication, and
 completion is not claimed by this record.
 
+An additional healthy comparison ran the unchanged ordinary pack-index and
+pack-staging matrix on baseline `76cd0a66` and candidate `754f1329`. Both passed
+all 156 tests with Node 24.20.0, concurrency 2, timeout 120000, the same fixture
+filesystem, hermetic process preload and explicit Git environment, unsetting only
+inherited `UZI_SQLC_DIR`. Wall times were 38.994692179 s (baseline, `K0FDnD`) and
+37.308433792 s (candidate, `5CXyvP`). The exact commands and revisions are retained
+in `m2-shared-helper-timings.json`. This measures the affected ordinary helper step,
+not the new complete producer path, C2's composed measurement or hosted CI.
+Queue/cache/rerun effects and hosted critical-path timing remain unmeasured.
+The failed full gate's 120-minute bound is not a successful duration comparison.
+
 The PR diff map's test area additionally includes these two coordinator fixture
 ports and the W0 verification-cwd correction. Their changes have no new production
 charge sites. All parent issue and C2–C8 boundaries remain unchanged.
+
+### M2 security repair and mutation adjudication
+
+The full-range auditor at `754f1329` reproduced a Medium CWE-117 defect: an
+importer default-branch name containing U+202E reached the raw debug log. The
+producer-only literal validator now rejects C0/C1/DEL, bidi marks, embeddings,
+overrides and isolates, and line/paragraph separators before filesystem work,
+callbacks or Git dispatch. Both branch fields are revalidated, including values
+loaded from storage. The fixed refusal does not echo the value. Unicode names,
+NBSP and names over 1 KiB retain literal anchor behavior. No ordinary writer,
+storage schema or global logger changes. The new six-case branch-safety suite
+captures the real logger, checks zero effects for unsafe inputs and exercises
+valid inputs through import. Independent repair review is still required.
+
+The tester also reproduced a false-positive shallow-output test: its default
+object-mode `Readable.from` failed even for an injected `false` response with
+`subprocess output closed before end`; both children settled. Byte mode fixes the
+injection. The export-only positive then imported successfully, with two queries,
+one import/pair and 27/27 children settled. The primary harness now uses byte mode
+with a permanent positive and a second-query false-to-true negative, without a
+shallow file, so the post-proof Git-state check has an independent assertion.
+
+| Named mutation | Corrected evidence at `754f1329`, before primary harness repair |
+|---|---|
+| M08 config pin | Removing only the canonical-config leaf pin typechecks and turns its post-proof mutation test red (`Missing expected rejection`). The earlier controls-map mutation did not disable this pin and is not counted. |
+| M14 shallow state | Bypassing the importer query predicate typechecks; with byte-mode injection, true/unknown/empty responses turn three refusal assertions red. Pipe-error refusal remains green. The earlier object-mode survivor was invalid evidence. |
+| M16 second query | Removing only the dirty-path post-proof query typechecks and turns the existing two-query accounting assertion red (`1 !== 2`). File insertion alone remains caught by the independent absence pin. |
+| M04 all-ref anchors | Broadening the query/anchor set typechecks and turns both bundle-head/non-listed-tag refusal cases red. Earlier compile failure is not red evidence. |
+| M15 canonical environment | An importer-only private-directory override typechecks and turns the omitted-`GIT_DIR` assertion red. The earlier three-hit instrumentation failure is not counted. |
+
+The repaired focused export baseline passed all ten selected tests, without skips.
+Exact edits, commands, exits, assertions and logs are in
+`tester-1-adjudication-evidence/results.json`; the original results are retained.
+These five proofs do not establish a complete per-test mutation map. Export lint
+enumerated zero ignored files and failed; it is not a source-lint verdict. The
+primary repair run passed all 50 admission/branch-safety cases with zero skips
+(`7GiJFH`, 148,883.086877 ms); lint, typecheck and knip passed (`ya5lfk`). Docs
+validation and mirror equality passed (`gfZ6Hu`); the preceding `ZuB8uV` invocation
+used a nonexistent docs task name and is not a successful docs check. Independent
+review must still validate the applied repairs. The R3 administration-budget block,
+incomplete full gate and unperformed proofs remain open; no formal partial or
+acceptance decision has waived them.

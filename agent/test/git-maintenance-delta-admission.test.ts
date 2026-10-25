@@ -26,8 +26,18 @@ test("delta shallow source: local bare clone of actual shallow origin refuses pr
   await f.retained();
 });
 
-for (const answer of ["true\n", "unknown\n", "", "error"]) {
-  test("delta shallow query: absent file with observed Git state " + JSON.stringify(answer) + " refuses", linux, async t => {
+function shallowQueryOutput(stream: Readable, answer: string): Readable {
+  return Readable.from((async function* () {
+    for await (const _ of stream) { /* Settle the real query before replacing its bytes. */ }
+    if (answer === "error") throw new Error("fixture shallow query pipe failed");
+    yield Buffer.from(answer);
+  })(), { objectMode: false });
+}
+
+for (const answer of ["false\n", "true\n", "unknown\n", "", "error"]) {
+  const succeeds = answer === "false\n";
+  test(succeeds ? "delta shallow query: wrapped false succeeds and settles both queries" :
+    "delta shallow query: absent file with observed Git state " + JSON.stringify(answer) + " refuses", linux, async t => {
     const f = await maintenanceDeltaFixture(t);
     let queries = 0;
     f.hooks.stdout = (request, stream) => {
@@ -35,21 +45,38 @@ for (const answer of ["true\n", "unknown\n", "", "error"]) {
       queries++;
       for (const key of ["GIT_SHALLOW_FILE", "GIT_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"])
         assert.equal(request.env[key], undefined, key + " absent in canonical query");
-      return Readable.from((async function* () {
-        for await (const _ of stream) { /* Settle the actual false query before injecting an unestablished state. */ }
-        if (answer === "error") throw new Error("fixture shallow query pipe failed");
-        yield Buffer.from(answer);
-      })());
+      return shallowQueryOutput(stream, answer);
     };
-    await assert.rejects(f.run(), layout);
-    assert.equal(queries, 1);
+    if (succeeds) assert.deepEqual(await f.run(), { kind: "imported", sourceSha: f.tip });
+    else await assert.rejects(f.run(), layout);
+    assert.equal(queries, succeeds ? 2 : 1);
     await assert.rejects(fs.lstat(path.join(f.bare, "shallow")), { code: "ENOENT" });
-    assert.equal(f.requests.filter(canonicalImport).length, 0);
+    assert.equal(f.requests.filter(canonicalImport).length, succeeds ? 1 : 0);
     assert.equal(f.joined(), f.requests.length);
-    assert.equal(f.pairs(), 0);
+    assert.equal(f.pairs(), succeeds ? 1 : 0);
     await f.retained();
   });
 }
+
+test("delta shallow query: state becomes true after proof refuses without a shallow file", linux, async t => {
+  const f = await maintenanceDeltaFixture(t);
+  let queries = 0, proved = false;
+  f.cache.afterPhase = async phase => { if (phase === "proof") proved = true; };
+  f.hooks.stdout = (request, stream) => {
+    if (!request.argv.includes("--is-shallow-repository")) return stream;
+    queries++;
+    if (queries === 2) assert.equal(proved, true, "second query follows successful proof");
+    return shallowQueryOutput(stream, queries === 1 ? "false\n" : "true\n");
+  };
+  await assert.rejects(f.run(), layout);
+  assert.equal(queries, 2);
+  assert.equal(proved, true);
+  await assert.rejects(fs.lstat(path.join(f.bare, "shallow")), { code: "ENOENT" });
+  assert.equal(f.requests.filter(canonicalImport).length, 0);
+  assert.equal(f.joined(), f.requests.length);
+  assert.equal(f.pairs(), 0);
+  await f.retained();
+});
 
 test("delta shallow lstat: non-ENOENT failure refuses even though bare is non-shallow", linux, async t => {
   const f = await maintenanceDeltaFixture(t), lstat = fs.lstat.bind(fs);

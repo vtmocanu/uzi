@@ -13687,7 +13687,11 @@ try {
       MaintenanceResources.consume("metadataBytes", Buffer.byteLength(value) * 10 + 1024);
       for (const character of value) {
         const point = character.codePointAt(0)!;
-        if (point <= 0x20 || point === 0x7f || (point >= 0xd800 && point <= 0xdfff) ||
+        // Ref arguments reach spawnGit debug logs: refuse display controls before any effects.
+        if (point <= 0x20 || (point >= 0x7f && point <= 0x9f) ||
+            point === 0x061c || point === 0x200e || point === 0x200f ||
+            (point >= 0x2028 && point <= 0x202e) || (point >= 0x2066 && point <= 0x2069) ||
+            (point >= 0xd800 && point <= 0xdfff) ||
             "~^:?*[\\".includes(character)) return false;
       }
       return !value.includes("..") && !value.includes("@{") && !value.startsWith("/") && !value.endsWith("/") &&
