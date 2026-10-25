@@ -1,17 +1,136 @@
 import { needsAttention } from "../../components/WorkerUpgradeBadge";
-import type { BindMode } from "../../lib/api";
+import type { BindMode, Worker } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import { healthyFleetWorkers, incidentFleetWorkers, mockAdminWorkers, mockWorkers } from "../data";
 import { minsAgo } from "../data/time";
-import { delay, mockScenario } from "./shared";
+import { delay, mockScenario, requireSession } from "./shared";
 // secrets ↔ workers is the one accepted import cycle (PRD #991 D4): setWorkerBindMode
 // resolves a token label against the secrets roster, and secrets' deleteAnthropicTokenById
 // unbinds workers pinned to a deleted token. Both reads are inside function bodies and no
 // module-level initializer crosses the modules, so the cycle cannot throw at import.
 import { secrets } from "./secrets";
 
-export let workers = mockWorkers.map((w) => ({ ...w }));
+export let workers: Worker[] = mockWorkers.map((w) => ({ ...w }));
 let workerCounter = 0;
+
+// Store manual transitions separately so regenerated health-scenario rows retain them.
+// The prior effective flag is internal evidence, never a new Worker wire field.
+type ManualState = Pick<Worker, "manual_cordoned_at" | "manual_cordoned_by" | "manual_cordoned_by_label" | "manual_cordon_reason"> & {
+  priorEffective: boolean;
+};
+const manualStates = new Map<string, ManualState>();
+
+function ownerWorkers(): Worker[] {
+  return mockScenario() === "health-incident" ? incidentFleetWorkers() : workers;
+}
+
+function projectedWorker<T extends Worker>(w: T): T {
+  const manual = manualStates.get(w.id);
+  if (!manual) return { ...w };
+  const { priorEffective, ...tuple } = manual;
+  return {
+    ...w, ...tuple,
+    effective_cordoned: !!tuple.manual_cordoned_at || !!w.draining_since || priorEffective,
+  };
+}
+
+// Snapshot-only equivalent of x/ansi.Strip's print/execute actions. Its UTF-8 byte
+// handling matters: Unicode C1 runes aren't 8-bit introducers, while OSC/DCS payload
+// bytes are ignored. ESC/CSI execute LF/tab; control strings do not.
+// One forward pass over the input bytes, without retries or nested scans.
+function manualANSIText(value: string): string {
+  type State = "ground" | "esc" | "esc-intermediate" | "csi" | "csi-intermediate"
+    | "dcs" | "dcs-param" | "dcs-intermediate" | "dcs-string" | "osc" | "sos";
+  let state: State = "ground";
+  let utf8Remaining = 0;
+  const output: number[] = [];
+  for (const byte of new TextEncoder().encode(value)) {
+    if (utf8Remaining > 0) {
+      output.push(byte);
+      utf8Remaining--;
+      continue;
+    }
+    if (byte === 0x18 || byte === 0x1a || byte === 0x9c) {
+      // ST dispatches strings, but executes as a raw byte in other states.
+      if (byte === 0x9c && state !== "osc" && state !== "dcs-string" && state !== "sos") output.push(byte);
+      state = "ground";
+    } else if (byte === 0x1b) {
+      // x/ansi's DCS entry accepts ESC as passthrough data.
+      state = state === "dcs" ? "dcs-string" : "esc";
+    } else if (state === "osc" || state === "dcs-string") {
+      if (state === "osc" && byte === 0x07) state = "ground";
+    } else if (byte >= 0xc2 && byte <= 0xf4) {
+      output.push(byte);
+      utf8Remaining = byte < 0xe0 ? 1 : byte < 0xf0 ? 2 : 3;
+      state = "ground";
+    } else if (byte >= 0x80) {
+      // Raw C1 bytes can occur after a string terminates inside UTF-8 data.
+      // Preserve ExecuteAction bytes; introducers and unassigned bytes emit nothing.
+      if (byte <= 0x9a && byte !== 0x90 && byte !== 0x98) output.push(byte);
+      state = byte === 0x9b ? "csi" : byte === 0x90 ? "dcs"
+        : byte === 0x9d ? "osc" : [0x98, 0x9e, 0x9f].includes(byte) ? "sos" : "ground";
+    } else if (state === "ground") {
+      output.push(byte);
+    } else if (state === "sos") {
+      // ASCII payload is ignored; Unicode above follows x/ansi's UTF-8 transition.
+    } else if (state === "esc" || state === "esc-intermediate") {
+      if (byte < 0x20) output.push(byte);
+      else if (byte === 0x7f) continue;
+      else if (byte < 0x30) state = "esc-intermediate";
+      else if (state === "esc-intermediate") state = "ground";
+      else {
+        state = byte === 0x5b ? "csi" : byte === 0x50 ? "dcs"
+          : byte === 0x5d ? "osc" : [0x58, 0x5e, 0x5f].includes(byte) ? "sos" : "ground";
+      }
+    } else if (state === "csi" || state === "csi-intermediate") {
+      if (byte < 0x20) output.push(byte);
+      else if (byte === 0x7f) continue;
+      else if (byte < 0x30) state = "csi-intermediate";
+      else if (byte >= 0x40 || state === "csi-intermediate") state = "ground";
+    } else {
+      // DCS entry/parameters/intermediates ignore controls, then enter payload.
+      if (state === "dcs" && byte >= 0x08 && byte <= 0x0d) state = "dcs-string";
+      else if (byte < 0x20 || byte === 0x7f) continue;
+      else if (byte < 0x30) state = "dcs-intermediate";
+      else if (byte >= 0x40 || state === "dcs-intermediate") state = "dcs-string";
+      else state = "dcs-param";
+    }
+  }
+  return new TextDecoder().decode(new Uint8Array(output));
+}
+
+// Mirrors store.ManualCordonText: ANSI first, then CellText's Cc/Cf removal and
+// LF/tab folding. Internal Zl/Zp survive storage; stripDisplayCell is display-only.
+function manualText(value: string, limit: number): string {
+  // Go strings.TrimSpace uses Unicode White_Space (unlike JS trim's BOM exception).
+  const trim = (text: string) => text.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, "");
+  const clean = trim(manualANSIText(value).replace(/[\n\t]/g, " ").replace(/[\p{Cc}\p{Cf}]/gu, ""));
+  return trim(Array.from(clean).slice(0, limit).join(""));
+}
+
+function changeManualCordon(id: string, cordon: boolean, reason?: string): { worker: Worker } {
+  const actor = requireSession();
+  if (reason !== undefined && Array.from(reason).length > 500) {
+    throw new ApiError(400, "reason must be at most 500 codepoints");
+  }
+  const source = ownerWorkers().find((w) => w.id === id);
+  if (!source) throw new ApiError(404, "no such worker");
+  if (source.ephemeral) {
+    throw new ApiError(409, "manual cordon is only supported for persistent workers");
+  }
+  const current = projectedWorker(source);
+  if (!!current.manual_cordoned_at === cordon) return { worker: current };
+  const priorEffective = manualStates.get(id)?.priorEffective
+    ?? (!current.manual_cordoned_at && !!current.effective_cordoned);
+  manualStates.set(id, {
+    priorEffective,
+    manual_cordoned_at: cordon ? new Date().toISOString() : null,
+    manual_cordoned_by: cordon ? actor.id : null,
+    manual_cordoned_by_label: cordon ? manualText(actor.display_name ?? "", 200) || actor.id : null,
+    manual_cordon_reason: cordon ? manualText(reason ?? "", 500) || null : null,
+  });
+  return { worker: projectedWorker(source) };
+}
 
 export const workersApi = {
   // PRD #113 M6. Computed LIVE from the demo worker list rather than hardcoded, so the
@@ -30,11 +149,12 @@ export const workersApi = {
   // M5). AdminWorker extends Worker, so the shape is compatible. Every other scenario returns
   // the ordinary seeded fleet.
   listWorkers: async () => {
-    if (mockScenario() === "health-incident") {
-      return delay({ workers: incidentFleetWorkers().map((w) => ({ ...w })) });
-    }
-    return delay({ workers: workers.map((w) => ({ ...w })) });
+    return delay({ workers: ownerWorkers().map(projectedWorker) });
   },
+  cordonWorker: async (id: string, reason?: string): Promise<{ worker: Worker }> =>
+    delay(changeManualCordon(id, true, reason)),
+  uncordonWorker: async (id: string): Promise<{ worker: Worker }> =>
+    delay(changeManualCordon(id, false)),
   createWorker: async (name: string, template?: string) => {
     const w = {
       id: `w-new-${++workerCounter}`,
@@ -89,6 +209,7 @@ export const workersApi = {
   },
   deleteWorker: async (id: string) => {
     workers = workers.filter((w) => w.id !== id);
+    manualStates.delete(id);
     return delay(null);
   },
   // PRD #104 M3: rebind a worker to a named token, or clear it with null. Mirrors
@@ -106,7 +227,7 @@ export const workersApi = {
       w.anthropic_bind_mode = mode;
       w.anthropic_secret_id = null;
       w.anthropic_secret_label = null;
-      return delay({ worker: { ...w } });
+      return delay({ worker: projectedWorker(w) });
     }
     if (label === null || label.trim() === "") {
       throw new ApiError(400, "anthropic_bind_mode=pinned requires a token label in anthropic_token");
@@ -118,7 +239,7 @@ export const workersApi = {
     w.anthropic_bind_mode = "pinned";
     w.anthropic_secret_id = secret.id;
     w.anthropic_secret_label = secret.label;
-    return delay({ worker: { ...w } });
+    return delay({ worker: projectedWorker(w) });
   },
 
   // Hosted workers (PRD #58). The demo is the only place M5 can be seen working: on a
@@ -223,6 +344,6 @@ export const workersApi = {
           : scn === "health-silent" || scn === "health-degraded" || scn === "health-owner-only"
             ? healthyFleetWorkers()
             : mockAdminWorkers;
-    return delay({ workers: rows.map((w) => ({ ...w })) });
+    return delay({ workers: rows.map(projectedWorker) });
   },
 };

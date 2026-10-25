@@ -2501,6 +2501,16 @@ describe("M3 captured issue evidence", () => {
 });
 
 describe("lead guidance routing", () => {
+  it("#3436 renders bounded pressure-recovery and lifecycle guidance for both lead harnesses", () => {
+    for (const harness of ["claude", "codex"] as const) {
+      const { append } = buildLeadSystemPrompt("CUSTOM LEAD BODY", { kind: "issue", harness });
+      assert.ok(append.includes("pressure-held means memory recovery is pending"), harness);
+      assert.ok(append.includes("waits one bounded recovery window"), harness);
+      assert.ok(append.includes("report the criterion blocked"), harness);
+      assert.ok(append.includes("phase-held refusal"), harness);
+      assert.ok(append.includes("owner Resume after the memory-pressure park"), harness);
+    }
+  });
   const dispatch = "do not dispatch an agent to ask its role or availability";
   const fastChecks = "Before committing a unit for review, run its available cheap, check-only static checks";
   const noChurn = "Do not re-read unchanged output or repeat unchanged status updates";

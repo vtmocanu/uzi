@@ -2375,27 +2375,40 @@ describe("SdkExecutor guardrail options", () => {
     assert.strictEqual(out.hookSpecificOutput?.permissionDecision, "deny");
   });
 
-  it("hands the SDK a sparse env with no worker secrets (every turn)", async () => {
-    const { queryFn, turns } = fakeTurns([
-      [submitPlan("plan"), resultSuccess()],
-      [signalDone(), resultSuccess()],
-    ]);
-    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx().ctx);
+  for (const sqlcDir of [undefined, "/synthetic/uzi-sqlc-cache"]) {
+    it(`hands the SDK a sparse env with no worker secrets (every turn) (UZI_SQLC_DIR ${sqlcDir === undefined ? "absent" : "present"})`, async () => {
+      const savedSqlcDir = process.env.UZI_SQLC_DIR;
+      try {
+        if (sqlcDir === undefined) delete process.env.UZI_SQLC_DIR;
+        else process.env.UZI_SQLC_DIR = sqlcDir;
+        const { queryFn, turns } = fakeTurns([
+          [submitPlan("plan"), resultSuccess()],
+          [signalDone(), resultSuccess()],
+        ]);
+        await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx().ctx);
 
-    for (const t of turns) {
-      const env = t.options.env!;
-      // Core keys + TMPDIR (5-bis per-uid scratch, when the ambient env has one) — never a
-      // worker secret. TMPDIR is not a secret. AGENT_BROWSER_ARGS is a non-secret browser launch
-      // FLAG (buildSdkEnv, issue #709): it guarantees --no-sandbox survives a shim bypass, not a
-      // credential — the no-PAT / no-join-token assertions below still hold.
-      const expected = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AGENT_BROWSER_ARGS"]);
-      if (process.env.UZI_RUNNER_TMPDIR || process.env.TMPDIR) expected.add("TMPDIR");
-      assert.deepStrictEqual(new Set(Object.keys(env)), expected);
-      const serialized = JSON.stringify(env);
-      assert.ok(!serialized.includes(FAKE_PAT), "PAT must not reach the SDK env");
-      assert.ok(!serialized.includes(FAKE_JOIN_TOKEN), "join token must not reach the SDK env");
-    }
-  });
+        for (const t of turns) {
+          const env = t.options.env!;
+          // Core keys + TMPDIR (5-bis per-uid scratch, when the ambient env has one) — never a
+          // worker secret. TMPDIR is not a secret. AGENT_BROWSER_ARGS is a non-secret browser launch
+          // FLAG (buildSdkEnv, issue #709): it guarantees --no-sandbox survives a shim bypass, not a
+          // credential — the no-PAT / no-join-token assertions below still hold.
+          const expected = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AGENT_BROWSER_ARGS"]);
+          if (process.env.UZI_RUNNER_TMPDIR || process.env.TMPDIR) expected.add("TMPDIR");
+          if (sqlcDir !== undefined) expected.add("UZI_SQLC_DIR");
+          assert.deepStrictEqual(new Set(Object.keys(env)), expected);
+          assert.strictEqual(Object.hasOwn(env, "UZI_SQLC_DIR"), sqlcDir !== undefined);
+          assert.strictEqual(env.UZI_SQLC_DIR, sqlcDir);
+          const serialized = JSON.stringify(env);
+          assert.ok(!serialized.includes(FAKE_PAT), "PAT must not reach the SDK env");
+          assert.ok(!serialized.includes(FAKE_JOIN_TOKEN), "join token must not reach the SDK env");
+        }
+      } finally {
+        if (savedSqlcDir === undefined) delete process.env.UZI_SQLC_DIR;
+        else process.env.UZI_SQLC_DIR = savedSqlcDir;
+      }
+    });
+  }
 
   it("resumes the session across turns, seeding from the claim's session id", async () => {
     const { queryFn, turns } = fakeTurns([

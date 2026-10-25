@@ -101,3 +101,16 @@ func paginateCIJobs(ctx context.Context, pageSize int, wrap func(error) error, f
 		return items, next, nil
 	}, 1000, 10, b)
 }
+
+// paginateResponses opts into a per-list byte budget while retaining ordinary
+// pagination backstops and all-or-nothing results. Terminal equality succeeds;
+// continuing equality refuses before the next SDK call.
+func paginateResponses[T any](wrap func(error) error, perResponse, total int64, fetch func(int, *responseLimitState) ([]T, int, error)) ([]T, error) {
+	ledger := &responseLedger{remaining: total}
+	return paginate(wrap, func(page int) ([]T, int, error) {
+		if ledger.remaining <= 0 {
+			return nil, 0, newResponseLimitState(perResponse).recordOverflow(ledger.status)
+		}
+		return fetch(page, ledger.state(perResponse))
+	})
+}

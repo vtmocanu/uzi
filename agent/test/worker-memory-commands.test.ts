@@ -18,6 +18,36 @@ function setup() {
   const context = registry.begin(contextInput());
   return { registry, context };
 }
+
+test("memory admission explanations preserve the existing predicate for every hold combination", () => {
+  for (const retired of [false, true]) for (const exhausted of [false, true])
+    for (const phase of [false, true]) for (const pressure of [false, true]) {
+      const { registry, context } = setup();
+      if (exhausted) registry.updateAllowance(context, 0);
+      if (phase) registry.holdPhase(context);
+      if (pressure) registry.acquireLatch(context);
+      if (retired) registry.retire(context);
+      const expected = retired ? "retired" : exhausted ? "exhausted" : phase ? "phase-held" : pressure ? "pressure-held" : undefined;
+      assert.equal(registry.admissionReason(context), expected);
+      assert.equal(registry.admitsCommands(context), expected === undefined);
+    }
+});
+
+test("memory pressure notifications do not restart the bounded wait or release its latch", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const registry = new WorkerMemoryCommands([], { rearmMs: 100, sampleMs: 10, responseBudgetMs: 10 });
+  const context = registry.begin(contextInput());
+  const latch = registry.acquireLatch(context)!;
+  const work = registry.waitForPressure(context, { deadlineAt: 2000, phaseRevision: registry.phaseRevision(context) });
+  t.mock.timers.tick(60);
+  registry.updateAllowance(context, 2);
+  t.mock.timers.tick(60);
+  assert.equal(await work, "pressure-held");
+  assert.equal(registry.pressureHeld(context), true);
+  assert.equal(registry.remaining(context), 2);
+  registry.releaseLatch(latch);
+  assert.equal(registry.admitsCommands(context), true);
+});
 function enroll(registry: WorkerMemoryCommands, context: ReturnType<WorkerMemoryCommands["begin"]>, pid = 10, startTime = "10"): Entry {
   return registry.register(context, {
     source: "codex-model-command", toolId: "tool", attemptId: "attempt",

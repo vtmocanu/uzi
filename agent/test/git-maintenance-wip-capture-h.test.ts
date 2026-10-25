@@ -18,7 +18,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { AGENT_GIT_IDENTITY, GitCache, WIP_PARK_COMMIT_PREFIX } from "../src/git.js";
 import { MaintenanceResources, RecoveryMaintenance, type MaintenanceResource } from "../src/recovery-maintenance.js";
 import type { BoundaryProcessRequest } from "../src/harness.js";
@@ -249,6 +249,38 @@ async function forgeStatCache(f: Fixture, name: string) {
 }
 
 describe("hash-attested maintenance WIP capture (W0-H)", { skip: process.platform !== "linux" && "Linux /proc capture required" }, () => {
+  test("plain clone/bundle transfer works from a nonrepository cwd", async t => {
+    const cwd = await tmpDir(t);
+    assert.deepEqual(await fs.readdir(cwd), []);
+    const probe = spawnSync("/usr/bin/git", ["rev-parse", "--show-toplevel"], {
+      cwd, env: gitEnv, encoding: "utf8", timeout: 5_000,
+    });
+    assert.equal(probe.error, undefined);
+    assert.equal(probe.signal, null);
+    assert.equal(probe.status, 128, probe.stdout + probe.stderr);
+    assert.match(probe.stderr, /not a git repository/);
+
+    const leaf = "clone HEAD = W, single parent, status clean, connectivity intact, and a plain clone/bundle of it works";
+    const env: NodeJS.ProcessEnv = { ...gitEnv };
+    delete env.NODE_TEST_CONTEXT;
+    const child = spawnSync(process.execPath, [
+      "--import", import.meta.resolve("tsx"),
+      // Run the selected leaf in this process: a default isolated child would survive the launcher's SIGKILL.
+      "--test", "--test-isolation=none", "--test-timeout=120000", "--test-reporter=tap",
+      "--test-name-pattern=^hash-attested maintenance WIP capture \\(W0-H\\) " + leaf + "$",
+      fileURLToPath(import.meta.url),
+    ], { cwd, env, encoding: "utf8", timeout: 110_000, killSignal: "SIGKILL", maxBuffer: 1024 * 1024 });
+    const diagnostics = child.stdout + child.stderr;
+    assert.equal(child.error, undefined, diagnostics);
+    assert.equal(child.signal, null, diagnostics);
+    assert.equal(child.status, 0, diagnostics);
+    const passedLeaves = child.stdout.split("\n")
+      .filter(line => line.trim().replace(/^ok \d+ - /, "") === leaf);
+    assert.equal(passedLeaves.length, 1, diagnostics);
+    for (const summary of ["tests 1", "pass 1", "fail 0", "cancelled 0", "skipped 0"])
+      assert.ok(child.stdout.split("\n").includes("# " + summary), diagnostics);
+  });
+
   // ---------------------------------------------------------------- acceptance 1: refusals
 
   // Refused in P0/P1, before the status launch: nothing but read-only probes ran.
@@ -895,13 +927,21 @@ observed.readSync = function (fd, ...rest) {
     // exercised by runner-maintenance-terminal-source.test.ts.
     const bundle = path.join(f.dir, "w.bundle");
     f.gitIn("bundle", "create", bundle, "main");
-    execFileSync("/usr/bin/git", ["bundle", "verify", bundle], { env: gitEnv, stdio: "pipe" });
+    execFileSync("/usr/bin/git", ["bundle", "verify", bundle], { cwd: f.root, env: gitEnv, stdio: "pipe" });
     const clone = path.join(f.dir, "transferred");
     execFileSync("/usr/bin/git", ["clone", "--no-local", "-q", f.root, clone], { env: gitEnv, stdio: "pipe" });
     assert.equal(execFileSync("/usr/bin/git", ["-C", clone, "rev-parse", "HEAD"], { env: gitEnv, encoding: "utf8" }).trim(), result.head);
     assert.equal(await fs.readFile(path.join(clone, "tracked"), "utf8"), "changed");
     assert.equal(await fs.readFile(path.join(clone, "fresh"), "utf8"), "new");
     await assert.rejects(fs.stat(path.join(clone, ".gitignore")), { code: "ENOENT" });
+    const bundleClone = path.join(f.dir, "from-bundle");
+    execFileSync("/usr/bin/git", ["clone", "-q", "-b", "main", bundle, bundleClone], { env: gitEnv, stdio: "pipe" });
+    assert.equal(execFileSync("/usr/bin/git", ["-C", bundleClone, "rev-parse", "HEAD"], { env: gitEnv, encoding: "utf8" }).trim(), result.head);
+    assert.equal(execFileSync("/usr/bin/git", ["-C", bundleClone, "status", "--porcelain=v1", "--untracked-files=all"],
+      { env: gitEnv, encoding: "utf8" }), "");
+    assert.equal(await fs.readFile(path.join(bundleClone, "tracked"), "utf8"), "changed");
+    assert.equal(await fs.readFile(path.join(bundleClone, "fresh"), "utf8"), "new");
+    await assert.rejects(fs.stat(path.join(bundleClone, ".gitignore")), { code: "ENOENT" });
   });
 
   // ------------------------------------------------------------ acceptance 7: both uid modes

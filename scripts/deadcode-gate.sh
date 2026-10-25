@@ -74,8 +74,17 @@ if [ ! -d "$MODULE_DIR" ]; then
 fi
 
 TMP="$(mktemp -d)"
-# shellcheck disable=SC2064  # expand TMP now: the trap must survive its unset.
-trap "rm -rf '$TMP'" EXIT INT TERM
+START="$(date +%s 2>/dev/null)" || START=
+cleanup() {
+  end="$(date +%s 2>/dev/null)" || end=
+  elapsed="$(awk -v start="$START" -v end="$end" 'BEGIN {
+    if (start ~ /^[0-9]+$/ && end ~ /^[0-9]+$/ && end >= start) print end - start
+  }' 2>/dev/null)" || elapsed=
+  printf 'deadcode-gate: diagnostics: wrapper_elapsed_seconds=%s\n' \
+    "${elapsed:-unavailable (clock missing or malformed)}" >&2 || :
+  rm -rf "$TMP"
+}
+trap cleanup EXIT INT TERM
 
 # One field per line: import path, function name, file:line:col. Fields 1-2 are
 # the baseline key; field 3 is for the human only.
@@ -85,8 +94,9 @@ TEMPLATE='{{range .Funcs}}{{printf "%s\t%s\t%s:%d:%d\n" $.Path .Name .Position.F
 # pipe, do not `$( )` into a test. `|| rc=$?` puts the command in a condition
 # context so errexit does not pre-empt the capture.
 rc=0
-(cd "$MODULE_DIR" && go run "$TOOL" -test -f="$TEMPLATE" ./...) \
-  >"$TMP/full" 2>"$TMP/err" || rc=$?
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
+sh "$SCRIPT_DIR/deadcode-measure.sh" "$TMP" "$MODULE_DIR" \
+  go run "$TOOL" -test -f="$TEMPLATE" ./... || rc=$?
 if [ "$rc" -ne 0 ]; then
   cat "$TMP/err" >&2
   echo "deadcode-gate: $TOOL exited $rc over $MODULE_DIR (0 findings were captured)." >&2

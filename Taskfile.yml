@@ -169,7 +169,7 @@ vars:
   # renovate: datasource=github-releases depName=gitleaks/gitleaks
   GITLEAKS_VERSION: "v8.30.1"
   # renovate: datasource=github-releases depName=golangci-lint-taskfile packageName=golangci/golangci-lint
-  GOLANGCI_LINT_VERSION: v2.14.0
+  GOLANGCI_LINT_VERSION: v2.15.0
   # The pinned OpenAPI diff tool behind check:api-v1-compat (PRD #1908 Decision 11). Passed to
   # scripts/oasdiff.sh as an ARGUMENT, like the golangci-lint pin above, so `task`'s echo shows the
   # resolved version. The wrapper carries the per-arch sha256 pins and refuses any other version.
@@ -290,6 +290,7 @@ tasks:
       - task: check:uxlab-freeze
       - task: test:uxlab-freeze
       - task: test:uxlab-build
+      - task: test:uxlab-pty
       - task: check:skill-triage-render
       # A web test importing an uncopied fixture passes gate:web but breaks the web image build (#2602).
       - task: test:web-docker-fixtures
@@ -309,6 +310,8 @@ tasks:
       # build-Go guard: no network and no real release binary. It protects the
       # archive-cache trust boundary and the go/toolchain compatibility seam.
       - task: test:golangci-wrapper
+      # Best-effort deadcode diagnostics and gate verdicts, with fake Go only.
+      - task: test:deadcode-gate
       # Hermetic tests of the oasdiff wrapper's verified-archive cache (PRD #1908 M5): fake
       # curl/uname, a real fixture tarball, no network. Same protection as the line above.
       - task: test:oasdiff-wrapper
@@ -990,6 +993,11 @@ tasks:
       - ./scripts/lint-formula.sh Formula/uzi-cli.rb
       - ./scripts/lint-formula.sh Formula/uzi-cli-rc.rb
 
+  test:deadcode-gate:
+    desc: hermetic deadcode verdict and optional diagnostic contracts (fake Go)
+    cmds:
+      - ./scripts/deadcode-gate.test.sh
+
   test:golangci-wrapper:
     desc: hermetic tests of the verified golangci-lint archive cache and build-Go guard
     cmds:
@@ -1088,6 +1096,11 @@ tasks:
     desc: hermetic uxlab build preflight and PNG freshness contract
     cmds:
       - bash ./scripts/uxlab-build.test.sh
+
+  test:uxlab-pty:
+    desc: hermetic terminal interpreter regression controls
+    cmds:
+      - python3 -B -m unittest discover -s api/cmd/uzi/uxlab -p demo_pty_test.py -v
 
   test:renovate-go-toolchain:
     desc: hermetic Go-toolchain grouping and worker Go flake extraction contract
@@ -2175,7 +2188,7 @@ tasks:
       # carry per-arch aliases. The generic version-only customManager in
       # renovate.json matches the annotation; go datasource, semver.
       # renovate: datasource=go depName=govulncheck-api packageName=golang.org/x/vuln
-      - ./scripts/govulncheck-gate.sh api golang.org/x/vuln/cmd/govulncheck@v1.8.0
+      - ./scripts/govulncheck-gate.sh api golang.org/x/vuln/cmd/govulncheck@v1.9.0
 
   test:api:
     desc: api unit tests (-race -count=1; live-DB tests self-skip)
@@ -2378,7 +2391,7 @@ tasks:
       # `gate:controller` - read vulncheck:api's comment before editing either.
       # Renovate-tracked too (alias -controller, shared packageName); see vulncheck:api.
       # renovate: datasource=go depName=govulncheck-controller packageName=golang.org/x/vuln
-      - ./scripts/govulncheck-gate.sh controller golang.org/x/vuln/cmd/govulncheck@v1.8.0
+      - ./scripts/govulncheck-gate.sh controller golang.org/x/vuln/cmd/govulncheck@v1.9.0
 
   test:controller:
     desc: controller unit tests (-race -count=1)

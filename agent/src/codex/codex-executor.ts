@@ -164,6 +164,8 @@ import {
 import {
   CodexCallbackBroker,
   CommandDeadlineError,
+  DEFAULT_COMMAND_WALL_MS,
+  LONG_COMMAND_WALL_MS,
   type FileopClient,
   type ScreenPolicy,
   type CapturedMemoryContext,
@@ -316,8 +318,6 @@ function isCommandCacheEnvKey(key: string): boolean {
 
 const DEFAULT_IDLE_MS = 5 * 60 * 1000;
 const DEFAULT_WALL_MS = 60 * 60 * 1000;
-const DEFAULT_COMMAND_WALL_MS = 3_600_000;
-const LONG_COMMAND_WALL_MS = 7_200_000;
 // Issue #1600: the precision/race allowance a refused-park re-drive is armed with when the server's
 // remaining budget has (nearly) run out. The budget fields are whole seconds and the refusal raced
 // the deadline, so a zero-or-negative remainder would otherwise re-trip and re-capture at once. Kept
@@ -6658,13 +6658,32 @@ export function makeDefaultSpawnCommand(
   capturedMemory?: CapturedMemoryContext,
 ): SpawnCommandSeam {
   return async (argv, opts): Promise<SpawnCommandResult> => {
+      const effectiveWallMs = opts.long_running === true ? longWallMs : wallMs;
+      const originalDeadline = opts.deadlineAt;
+      if (originalDeadline !== undefined && (!Number.isFinite(originalDeadline) || Date.now() >= originalDeadline)) {
+        throw new CommandDeadlineError(effectiveWallMs, false);
+      }
+      const deadlineAbort = new AbortController();
+      let deadlineExpired = false;
+      const timer = originalDeadline === undefined ? undefined : setTimeout(() => {
+        deadlineExpired = true;
+        deadlineAbort.abort();
+      }, Math.min(originalDeadline - Date.now(), 2_147_483_647));
+      const commandSignal = originalDeadline === undefined ? opts.signal
+        : AbortSignal.any([deadlineAbort.signal, ...(opts.signal ? [opts.signal] : [])]);
+      try {
       if (capturedMemory && isBrokerModelCommand(opts.modelCommand)
         && !isBrokerModelCommand(opts.modelCommand, capturedMemory)) throw new Error("memory command context binding mismatch");
       if (capturedMemory && isBrokerModelCommand(opts.modelCommand, capturedMemory)
         && (!capturedMemory.commands.isCurrent(capturedMemory.context, capturedMemory.flight, capturedMemory.lifecycleRevision)
           || !capturedMemory.commands.admitsCommands(capturedMemory.context))) throw new Error("captured memory admission closed");
       const [cmd, ...rest] = argv;
-      const withCache = cacheForLaunch(cache, launch);
+      const boundedLaunch: typeof launch = originalDeadline === undefined ? launch : (spec, startupMs) => {
+        if (opts.signal?.aborted) throw new Error("command aborted before launch");
+        if (Date.now() >= originalDeadline) throw new CommandDeadlineError(effectiveWallMs, false);
+        return launch(spec, Math.max(1, Math.min(startupMs ?? reapDeadlineMs, originalDeadline - Date.now())));
+      };
+      const withCache = cacheForLaunch(cache, boundedLaunch);
       const launched = await launchRegisteredEffectRoot(
         registry,
         withCache.launch,
@@ -6675,9 +6694,11 @@ export function makeDefaultSpawnCommand(
       );
       let memory: Awaited<ReturnType<typeof enrollMemoryCommand>>;
       try {
-        memory = await enrollMemoryCommand(capturedMemory, opts.modelCommand, registry, launched.root, launched.handle, reapDeadlineMs, opts.signal);
+        memory = await enrollMemoryCommand(capturedMemory, opts.modelCommand, registry, launched.root, launched.handle, reapDeadlineMs, commandSignal);
       } catch (error) {
-        await boundedCommandWait(registry.reapRoot(launched.root, reapDeadlineMs), reapDeadlineMs);
+        const reaped = await boundedCommandWait(registry.reapRoot(launched.root, reapDeadlineMs), reapDeadlineMs);
+        if (!reaped.ok) throw new Error(COMMAND_ROOT_UNREAPED);
+        if (deadlineExpired && !opts.signal?.aborted) throw new CommandDeadlineError(effectiveWallMs);
         throw error;
       }
       let stdout = "";
@@ -6728,14 +6749,15 @@ export function makeDefaultSpawnCommand(
 
       let onAbort: (() => void) | undefined;
       const aborted = new Promise<"aborted">((resolve) => {
-        if (opts.signal?.aborted) resolve("aborted");
-        else if (opts.signal) {
+        if (commandSignal?.aborted) resolve("aborted");
+        else if (commandSignal) {
           onAbort = () => resolve("aborted");
-          opts.signal.addEventListener("abort", onAbort, { once: true });
+          commandSignal.addEventListener("abort", onAbort, { once: true });
         }
       });
-      const effectiveWallMs = opts.long_running === true ? longWallMs : wallMs;
-      const terminal = launched.handle.waitChild(effectiveWallMs).then((result) => ({ kind: "exit" as const, code: result.code }))
+      const remainingWallMs = originalDeadline === undefined ? effectiveWallMs : Math.max(0, Math.min(effectiveWallMs, originalDeadline - Date.now()));
+      const terminal = (remainingWallMs <= 0 ? Promise.resolve({ kind: "deadline" as const })
+        : launched.handle.waitChild(remainingWallMs).then((result) => ({ kind: "exit" as const, code: result.code })))
         .catch((error: unknown) => (error instanceof SupervisedChildExitTimeoutError ? { kind: "deadline" as const } : { kind: "failed" as const, error }));
       const ordinary = Promise.race([
         terminal,
@@ -6749,7 +6771,7 @@ export function makeDefaultSpawnCommand(
       // A pressure outcome conveys tool feedback, never ordinary disposal authority.
       // Keep this root owned in the foreground until exit, abort, cap or wall deadline.
       const cleanupReason = first.kind === "memory" ? await ordinary : first;
-      if (onAbort && opts.signal) opts.signal.removeEventListener("abort", onAbort);
+      if (onAbort && commandSignal) commandSignal.removeEventListener("abort", onAbort);
       let cleanupError: unknown;
       let reaped = false;
       try {
@@ -6771,6 +6793,7 @@ export function makeDefaultSpawnCommand(
       }
       if (memoryPressure) return { code: COMMAND_CAPTURE_KILLED_CODE, stdout, stderr, memoryPressure };
       if (cleanupError) throw cleanupError;
+      if (cleanupReason.kind === "aborted" && deadlineExpired && !opts.signal?.aborted) throw new CommandDeadlineError(effectiveWallMs);
       if (cleanupReason.kind === "aborted" || (cleanupReason.kind === "deadline" && opts.signal?.aborted)) throw new Error("command aborted");
       if (cleanupReason.kind === "deadline") throw new CommandDeadlineError(effectiveWallMs);
       if (cleanupReason.kind === "failed") throw cleanupReason.error;
@@ -6779,6 +6802,7 @@ export function makeDefaultSpawnCommand(
         stdout,
         stderr,
       };
+      } finally { if (timer !== undefined) clearTimeout(timer); }
   };
 }
 

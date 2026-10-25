@@ -42,11 +42,12 @@ async function until(predicate: () => boolean, what = "readiness") {
   assert.fail(`fixture ${what} deadline`);
 }
 function captured(): CapturedMemoryContext {
-  const commands = new WorkerMemoryCommands(["private-fixture"]);
+  const commands = new WorkerMemoryCommands(["private-fixture"], { rearmMs: 100, sampleMs: 10, responseBudgetMs: 10 });
   const flight = {};
   const context = commands.begin({
     run_id: "11111111-1111-4111-8111-111111111111", worker_id: "22222222-2222-4222-8222-222222222222",
     register_nonce: "nonce", claim_generation: 1, memory_episode: 0, flight, lifecycleRevision: 1,
+    memory_policy: { version: 1, max_interventions: 3 }, memory_intervention_count: 1,
   });
   return { commands, context, flight, lifecycleRevision: 1 };
 }
@@ -278,13 +279,17 @@ test("a call before any turn began is refused and launches nothing", { timeout: 
   assert.equal(h.specs.length, 0);
 });
 
-test("admission: a retired context or a held latch refuses with worker_memory_pressure and launches nothing", { timeout: 10000 }, async () => {
+test("admission: a retired context or a held latch refuses with worker_memory_pressure and launches nothing", { timeout: 10000 }, async t => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
   const held = harness();
   const latch = held.c.commands.acquireLatch(held.c.context)!;
-  const r1 = await held.call({ command: "echo hi" });
+  const work = held.call({ command: "echo hi", timeout: 100 });
+  await new Promise(resolve => setImmediate(resolve));
+  t.mock.timers.tick(100);
+  const r1 = await work;
   assert.equal(r1.isError, true);
   assert.match(text(r1), /worker_memory_pressure/);
-  assert.match(text(r1), /Shell admission is held or its captured flight has retired\./);
+  assert.match(text(r1), /pressure-held/);
   assert.equal(held.specs.length, 0);
   held.c.commands.releaseLatch(latch);
   assert.match(text(await held.call({ command: "echo hi" })), /^Exit code: 0/, "released admission launches again");
@@ -295,6 +300,105 @@ test("admission: a retired context or a held latch refuses with worker_memory_pr
   assert.match(text(r2), /worker_memory_pressure/);
   assert.equal(retired.specs.length, 0);
   assert.equal(held.specs.length, 1);
+});
+
+test("#3436 Claude pressure wait wakes without blocking release and consumes the original deadline", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const h = harness();
+  const latch = h.c.commands.acquireLatch(h.c.context)!;
+  let settled = false;
+  const work = h.call({ command: "echo fixture", timeout: 1000 }).finally(() => { settled = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settled, false);
+  assert.equal(h.specs.length, 0);
+  t.mock.timers.tick(50);
+  h.c.commands.releaseLatch(latch);
+  assert.match(text(await work), /^Exit code: 0/);
+  assert.equal(h.specs.length, 1);
+  assert.equal(h.roots[0]!.waitMs(), 950 + 300 + 30, "remaining command time plus separate cleanup/output headroom");
+});
+
+test("#3436 Claude distinguishes all four admission reasons and only pressure waits", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  for (const reason of ["retired", "exhausted", "phase-held", "pressure-held"] as const) {
+    const h = harness();
+    if (reason === "retired") h.c.commands.retire(h.c.context);
+    if (reason === "exhausted") h.c.commands.updateAllowance(h.c.context, 0);
+    if (reason === "phase-held") h.c.commands.holdPhase(h.c.context);
+    if (reason === "pressure-held") h.c.commands.acquireLatch(h.c.context);
+    let settled = false;
+    const work = h.call({ command: "echo fixture", timeout: 1000 }).finally(() => { settled = true; });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(settled, reason !== "pressure-held", reason);
+    if (reason === "pressure-held") t.mock.timers.tick(120);
+    const result = await work;
+    assert.match(text(result), new RegExp(reason));
+    assert.equal(h.specs.length, 0);
+    if (reason === "pressure-held") {
+      assert.match(text(result), /0\.1 s/);
+      assert.match(text(result), /remaining: 2/);
+    }
+  }
+});
+
+test("#3436 Claude pending pressure waits count toward the live-command cap", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const h = harness({ maxConcurrent: 1 });
+  const latch = h.c.commands.acquireLatch(h.c.context)!;
+  const first = h.call({ command: "echo fixture", timeout: 1000 });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.lane.liveCount, 1);
+  assert.match(text(await h.call({ command: "echo fixture" })), /At most 1 commands/);
+  await h.lane.quiesce(300);
+  assert.equal((await first).isError, true);
+  h.c.commands.releaseLatch(latch);
+  assert.equal(h.specs.length, 0);
+});
+
+for (const interruption of ["retire", "successor", "phase", "exhaust", "cancel", "deadline", "path", "quiesce",
+  "phase-after-release", "cancel-after-release", "deadline-after-release", "successor-after-release", "pressure-again"] as const) {
+  test("#3436 Claude launches nothing after waiting and " + interruption, async t => {
+    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+    const secretPaths: string[] = [];
+    const h = harness({ secretPaths });
+    const latch = h.c.commands.acquireLatch(h.c.context)!;
+    const abort = new AbortController();
+    const work = h.call({ command: interruption === "path" ? "cat /tmp/memory-admission-private" : "echo fixture", timeout: 100 }, undefined, abort.signal);
+    await new Promise(resolve => setImmediate(resolve));
+    if (interruption === "retire") h.c.commands.retire(h.c.context);
+    if (interruption === "successor") h.c.commands.begin({ ...h.c.context, claim_generation: 2, flight: {} });
+    if (interruption === "phase") { const phase = h.c.commands.holdPhase(h.c.context)!; h.c.commands.releasePhase(phase); }
+    if (interruption === "exhaust") h.c.commands.updateAllowance(h.c.context, 0);
+    if (interruption === "cancel") abort.abort();
+    if (interruption === "deadline") t.mock.timers.tick(100);
+    if (interruption === "path") secretPaths.push("/tmp/memory-admission-private");
+    const quiesced = interruption === "quiesce" ? h.lane.quiesce(300) : Promise.resolve();
+    if (interruption.endsWith("after-release") || interruption === "pressure-again") {
+      h.c.commands.releaseLatch(latch);
+      if (interruption === "phase-after-release") { const phase = h.c.commands.holdPhase(h.c.context)!; h.c.commands.releasePhase(phase); }
+      if (interruption === "cancel-after-release") abort.abort();
+      if (interruption === "deadline-after-release") t.mock.timers.tick(100);
+      if (interruption === "successor-after-release") h.c.commands.begin({ ...h.c.context, claim_generation: 2, flight: {} });
+      if (interruption === "pressure-again") h.c.commands.acquireLatch(h.c.context);
+    }
+    h.c.commands.releaseLatch(latch);
+    assert.equal((await work).isError, true);
+    await quiesced;
+    assert.equal(h.specs.length, 0, interruption);
+  });
+}
+
+test("#3436 Claude run-budget cancellation interrupts a pressure wait", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const h = harness({}, false);
+  const budget = new AbortController();
+  h.lane.beginTurn(budget.signal);
+  h.c.commands.acquireLatch(h.c.context);
+  const work = h.call({ command: "echo fixture", timeout: 1000 });
+  await new Promise(resolve => setImmediate(resolve));
+  budget.abort();
+  assert.equal((await work).isError, true);
+  assert.equal(h.specs.length, 0);
 });
 
 test("the ninth concurrent command is refused visibly; a finished slot is reusable", { timeout: 20000 }, async () => {

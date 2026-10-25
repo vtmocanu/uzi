@@ -298,6 +298,12 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **The worker memory guard measures the cgroup working set and no longer needs PSI ([#3384](https://github.com/vtmocanu/uzi/pull/3384), [#3405](https://github.com/vtmocanu/uzi/pull/3405)).**
   Hosts without memory.pressure, where an enabled guard never intervened before, now intervene at the hard threshold on valid core accounting (early intervention needs PSI), and PSI-capable hosts compare the working set (memory.current minus inactive_file), so file-cache-heavy hosts intervene later and return to quiet sooner; the working set is an estimate and can underestimate pressure from dirty or slow-to-reclaim file pages.
 
+- **A refused worker delete names the runs that block it ([#3415](https://github.com/vtmocanu/uzi/pull/3415)).**
+  `uzi worker rm`, the Workers page and the 409 body list up to 10 active runs (Chats included) plus the total, so the owner knows what to cancel.
+
+- **Completion-interlock verification and documentation match the structural contract ([#3424](https://github.com/vtmocanu/uzi/pull/3424)).**
+  Lifecycle, wire-parity and mutation regressions cover the structural completion interlock; semantic completion auditing remains unshipped.
+
 ### Added
 
 - **Healthy busy workers no longer show custody attention.**
@@ -419,6 +425,12 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Operators can set Go build and test concurrency defaults for worker commands ([#3382](https://github.com/vtmocanu/uzi/pull/3382), [#3400](https://github.com/vtmocanu/uzi/pull/3400)).**
   Optional `workers.goBuildParallelism` / `workers.goMaxProcs` (Compose: `WORKER_GO_BUILD_PARALLELISM` / `WORKER_GO_MAXPROCS`) set `GOFLAGS=-p=N` and `GOMAXPROCS=N` for agent commands and worker checks.
+
+- **Owners can pause new intake on persistent workers ([#3423](https://github.com/vtmocanu/uzi/pull/3423)).**
+  Manual cordon and uncordon are available in Workers and the CLI; holds survive rolls and restarts independently of automatic drains, while assigned work remains subject to existing fences.
+
+- **The plan gate offers to require an inferred capability on the repo, and names the Docker allowlist gap ([#3414](https://github.com/vtmocanu/uzi/pull/3414)).**
+  When the plan needs a capability the repo's hint lacks, the steering user can add it to the repo with one click, so later runs route to a capable worker. When the plan needs Docker and the repo is not on the Docker worker allowlist, the gate now says so.
 
 ### Fixed
 
@@ -1110,6 +1122,9 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **The controller's PVC-ceiling refusal names the same preset every time ([#3383](https://github.com/vtmocanu/uzi/pull/3383), [#3401](https://github.com/vtmocanu/uzi/pull/3401)).**
   With l and l-highmem both at 50Gi of data, the message picked whichever came first in map order; presets are now checked in sorted order.
+
+- **The dind-meter sidecar exits promptly on SIGTERM ([#3426](https://github.com/vtmocanu/uzi/pull/3426)).**
+  A Docker worker pod no longer waits out its termination grace period on the meter before dind is stopped; Docker worker pods pick up the new sidecar command when this controller release ships, rolling through normal roll pacing rather than an immediate forced roll.
 
 ### Security
 

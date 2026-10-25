@@ -63,6 +63,8 @@ import type { ExecutionRegistry } from "./registry.js";
 // so the test asserts the exact caps rather than hard-coding a copy of them.
 export const MAX_ID_BYTES = 512;
 export const MAX_TOOL_NAME_BYTES = 256;
+export const DEFAULT_COMMAND_WALL_MS = 3_600_000;
+export const LONG_COMMAND_WALL_MS = 7_200_000;
 
 // Output cap. A shell effect's stdout/stderr is bounded (as plain TEXT) before it
 // reaches the model so a large effect cannot balloon a callback result. HYGIENE bound,
@@ -324,6 +326,8 @@ export interface SpawnCommandResult {
  *  seam records the exact env command spawns use; the default seam falls back to its
  *  closed-over env when `env` is absent. */
 export interface SpawnCommandOptions {
+  /** Worker-owned original deadline after admission waited; never supplied by model args. */
+  readonly deadlineAt?: number;
   readonly modelCommand?: ModelCommandMetadata;
   readonly long_running?: boolean;
   readonly cwd?: string;
@@ -331,11 +335,11 @@ export interface SpawnCommandOptions {
   readonly signal?: AbortSignal;
 }
 
-/** Thrown by a {@link SpawnCommandSeam} when the command ran to its wall deadline. The
- *  seam throws it ONLY after the command's whole process tree was reaped cleanly, so the
+/** Thrown when a command reaches its original deadline. `launched:false` means no
+ *  command was started. Otherwise its whole process tree was reaped cleanly, so the
  *  broker can tell the agent the command was stopped rather than report a generic failure. */
 export class CommandDeadlineError extends Error {
-  constructor(readonly deadlineMs: number) {
+  constructor(readonly deadlineMs: number, readonly launched = true) {
     super(`command stopped at its deadline (${deadlineMs}ms)`);
     this.name = "CommandDeadlineError";
   }
@@ -411,6 +415,8 @@ export interface RunGrants {
 /** Everything the broker is constructed with: the registry, the injected seams, the
  *  immutable grants, and optional routing/screening config. */
 export interface CodexCallbackBrokerOptions {
+  readonly commandWallMs?: number;
+  readonly longCommandWallMs?: number;
   readonly capturedMemory?: CapturedMemoryContext;
   readonly scrubToolResult?: (result: WorkerMemoryPressureResult) => WorkerMemoryPressureResult;
   readonly codeCrossCheck?: CodeCrossCheckToolAccess;
@@ -757,34 +763,67 @@ export class CodexCallbackBroker {
     }
     const cwd = strField(args, "cwd");
     let spawnCwd = this.worktreePath;
-    if (cwd !== undefined) {
-      if (referencesDotGit(cwd)) return deny("path_denied", "cwd references the .git directory");
-      const jail = screenToolPath(cwd, this.worktreePath, this.worktreePath, this.extraSecretPaths);
-      if (jail.denied) return deny("path_denied", jail.reason ?? "cwd is outside the worktree");
-      spawnCwd = path.resolve(this.worktreePath, cwd);
-    }
-    // Screen the command through the shared guardrail — NEVER a second copy of it.
-    let screen: ReturnType<typeof screenBashCommand>;
-    try {
-      screen = screenBashCommand(command, this.extraSecretPaths, this.dockerWired);
-    } catch {
-      return deny("screen_error", "shell screening raised; denied fail-closed");
-    }
-    if (screen.denied) return deny("shell_denied", screen.reason ?? "denied by guardrail");
-
     const hasLongRunning = typeof args === "object" && args !== null && Object.hasOwn(args, "long_running");
     const longRunning = hasLongRunning ? (args as Record<string, unknown>)["long_running"] : undefined;
-    if (hasLongRunning && typeof longRunning !== "boolean") {
-      return deny("bad_args", "Bash 'long_running' must be a boolean");
-    }
-    if (longRunning === true && (origin !== "root" || !this.grants.isRoot)) {
-      return deny("denied_tool", "Bash long_running:true is available only to the root lead");
-    }
+    // Keep the original command arguments, but repeat all authority/path checks after a wait.
+    const validate = (): CallbackResult | undefined => {
+      if (!this.grants.allowedTools.has(toolName)) return deny("denied_tool", "shell tool grant is no longer available");
+      if (cwd !== undefined) {
+        if (referencesDotGit(cwd)) return deny("path_denied", "cwd references the .git directory");
+        const jail = screenToolPath(cwd, this.worktreePath, this.worktreePath, this.extraSecretPaths);
+        if (jail.denied) return deny("path_denied", jail.reason ?? "cwd is outside the worktree");
+        spawnCwd = path.resolve(this.worktreePath, cwd);
+      }
+      // Screen through the shared guardrail, including after admission waited.
+      let screen: ReturnType<typeof screenBashCommand>;
+      try {
+        screen = screenBashCommand(command, this.extraSecretPaths, this.dockerWired);
+      } catch {
+        return deny("screen_error", "shell screening raised; denied fail-closed");
+      }
+      if (screen.denied) return deny("shell_denied", screen.reason ?? "denied by guardrail");
+      if (hasLongRunning && typeof longRunning !== "boolean") {
+        return deny("bad_args", "Bash 'long_running' must be a boolean");
+      }
+      if (longRunning === true && (origin !== "root" || !this.grants.isRoot)) {
+        return deny("denied_tool", "Bash long_running:true is available only to the root lead");
+      }
+      return undefined;
+    };
+    const invalid = validate();
+    if (invalid) return invalid;
 
     const captured = this.opts.capturedMemory;
-    if (captured && (!captured.commands.isCurrent(captured.context, captured.flight, captured.lifecycleRevision)
-      || !captured.commands.admitsCommands(captured.context))) {
-      return deny("worker_memory_pressure", "Shell admission is held or its captured flight has retired.");
+    let deadlineAt: number | undefined;
+    if (captured) {
+      const { commands, context } = captured;
+      if (!commands.isCurrent(context, captured.flight, captured.lifecycleRevision)) {
+        return deny("worker_memory_pressure", commands.admissionMessage(context, "retired"));
+      }
+      const phaseRevision = commands.phaseRevision(context);
+      let reason = commands.admissionReason(context, phaseRevision);
+      if (reason === "pressure-held") {
+        const wallMs = longRunning === true
+          ? this.opts.longCommandWallMs ?? LONG_COMMAND_WALL_MS : this.opts.commandWallMs ?? DEFAULT_COMMAND_WALL_MS;
+        deadlineAt = Date.now() + wallMs;
+        const outcome = await commands.waitForPressure(context, { deadlineAt, phaseRevision, signal: this.signal });
+        if (outcome === "cancelled") return deny("command_cancelled", "Command cancelled while waiting for memory recovery; nothing was launched.");
+        if (outcome === "deadline" || Date.now() >= deadlineAt) {
+          return deny("command_deadline", `Command deadline expired before launch: ${commands.admissionMessage(context, "pressure-held")} Nothing was launched.`);
+        }
+        if (outcome !== "admitted") return deny("worker_memory_pressure", commands.admissionMessage(context, outcome));
+        if (this.signal?.aborted) return deny("command_cancelled", "Command cancelled before launch; nothing was launched.");
+        if (this.registry.state() !== "open" || this.registry.isPoisoned()) {
+          return deny("admission_closed", "The captured execution epoch closed while waiting; nothing was launched.");
+        }
+        const invalidAfterWait = validate();
+        if (invalidAfterWait) return invalidAfterWait;
+        if (!commands.isCurrent(context, captured.flight, captured.lifecycleRevision)) {
+          return deny("worker_memory_pressure", commands.admissionMessage(context, "retired"));
+        }
+        reason = commands.admissionReason(context, phaseRevision);
+      }
+      if (reason !== undefined) return deny("worker_memory_pressure", commands.admissionMessage(context, reason));
     }
     const metadata: ModelCommandMetadata = Object.freeze({
       threadId: rt.threadId, turnId: rt.turnId, callId: rt.callId, toolName,
@@ -793,9 +832,11 @@ export class CodexCallbackBroker {
     modelCommands.set(metadata, captured ? Object.freeze({ ...captured }) : undefined);
     let spawned: SpawnCommandResult;
     try {
-      spawned = await this.spawnCommand(["/bin/sh", "-c", command], { cwd: spawnCwd, signal: this.signal, modelCommand: metadata, ...(hasLongRunning ? { long_running: longRunning as boolean } : {}) });
+      spawned = await this.spawnCommand(["/bin/sh", "-c", command], { cwd: spawnCwd, signal: this.signal, modelCommand: metadata,
+        ...(deadlineAt === undefined ? {} : { deadlineAt }), ...(hasLongRunning ? { long_running: longRunning as boolean } : {}) });
     } catch (err) {
-      if (err instanceof CommandDeadlineError) return deny("command_deadline", commandDeadlineMessage(err.deadlineMs));
+      if (err instanceof CommandDeadlineError) return deny("command_deadline", err.launched
+        ? commandDeadlineMessage(err.deadlineMs) : "Command deadline expired before launch; nothing was launched.");
       throw err;
     }
     if (spawned.memoryPressure) {

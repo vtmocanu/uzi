@@ -160,6 +160,7 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 				return err
 			}
 			for _, w := range ws {
+				printWorkerManualDetail(p, w.WorkerDTO)
 				printWorkerDrainDetail(p, w.WorkerDTO)
 			}
 			return nil

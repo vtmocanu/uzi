@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"strings"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -166,7 +168,7 @@ func (s *Service) ClaimChat(ctx context.Context, wkr store.Worker) (*ChatClaimPa
 	if wkr.IsolatedLane {
 		return nil, nil
 	}
-	run, err := s.q.ClaimChatRun(ctx, store.ClaimChatRunParams{
+	run, err := s.claimChatRun(ctx, wkr, store.ClaimChatRunParams{
 		WorkerID: pgconv.UUID(wkr.ID),
 		UserID:   wkr.UserID,
 		// PRD #529 Decision 4: an ephemeral (run-bound) worker never claims a chat.
@@ -376,6 +378,10 @@ func (s *Service) assembleChatClaim(ctx context.Context, run store.Run) (*ChatCl
 		return nil, fmt.Errorf("harness model defaults lookup: %w", err)
 	}
 	defaultModel := lanes.DefaultClaudeModel
+	if defaultModel.Valid && agenttmpl.CodexRoleModels[strings.TrimSpace(defaultModel.String)] {
+		slog.Warn("chat claim: dropped Codex role model from Claude lane", "run_id", run.ID.String(), "model", strings.TrimSpace(defaultModel.String))
+		defaultModel = pgtype.Text{}
+	}
 
 	defaultEffort, err := s.q.GetUserDefaultEffort(ctx, run.UserID)
 	if err != nil {
@@ -836,4 +842,40 @@ func uuidPtr(u pgtype.UUID) *string {
 	}
 	s := uuid.UUID(u.Bytes).String()
 	return &s
+}
+
+// claimChatRun takes a fresh statement snapshot after locking the worker, matching
+// ordinary and checker intake. Assembly runs after commit, outside the worker lock.
+func (s *Service) claimChatRun(ctx context.Context, wkr store.Worker, params store.ClaimChatRunParams) (store.Run, error) {
+	if s.txBeginner == nil {
+		return s.q.ClaimChatRun(ctx, params)
+	}
+	tx, err := s.txBeginner.Begin(ctx)
+	if err != nil {
+		return store.Run{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); err != nil {
+		return store.Run{}, err
+	}
+	q := store.New(tx)
+	if _, err := q.GetWorkerForUpdate(ctx, wkr.ID); err != nil {
+		return store.Run{}, err
+	}
+	current, err := q.GetWorkerByID(ctx, wkr.ID)
+	if err != nil {
+		return store.Run{}, err
+	}
+	params.IsEphemeral = current.Ephemeral
+	if current.IsolatedLane {
+		return store.Run{}, pgx.ErrNoRows
+	}
+	run, err := q.ClaimChatRun(ctx, params)
+	if err != nil {
+		return store.Run{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return store.Run{}, err
+	}
+	return run, nil
 }

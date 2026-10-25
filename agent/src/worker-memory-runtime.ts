@@ -20,7 +20,7 @@ type Sinks = Readonly<{
 
 /** One worker-owned reader, registry and sampler. Adapters must bind real sinks
  * before enrolling commands; sinks belong to the captured context, never a run-ID lookup.
- * Claude has no enrollment adapter. No command is enrolled by constructing this runtime.
+ * No command is enrolled by constructing this runtime.
  */
 export class WorkerMemoryRuntime {
   readonly commands: WorkerMemoryCommands;
@@ -63,7 +63,9 @@ export class WorkerMemoryRuntime {
       || settings.maxInterventions > 9999) throw new Error("invalid memory guard settings");
     this.configuredMemoryPolicy = Object.freeze({ version: 1, max_interventions: settings.maxInterventions });
     const reader = options.reader ?? new WorkerMemoryReader();
-    this.commands = new WorkerMemoryCommands(options.secrets);
+    this.commands = new WorkerMemoryCommands(options.secrets, {
+      rearmMs: settings.rearmMs, sampleMs: settings.sampleMs, responseBudgetMs: settings.responseBudgetMs,
+    });
     const sink = (context: Context): Sinks => {
       const bound = this.sinks.get(context);
       if (!bound) {

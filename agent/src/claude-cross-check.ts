@@ -487,7 +487,7 @@ export class ClaudeCrossCheck {
       if (isErrorResult(resultFrame)) throw new Error("cross-check model error");
       const text = resultFrame["result"];
       if (typeof text !== "string" || Buffer.byteLength(text) > MAX_VERDICT_BYTES) {
-        throw new CrossCheckMalformedError("cross-check requires one bounded complete verdict");
+        throw new CrossCheckMalformedError("cross-check requires one bounded complete verdict", "result_cap");
       }
       if (code) validateCodeFindings(text);
       else validateVerdict(text);

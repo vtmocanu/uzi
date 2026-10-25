@@ -478,7 +478,8 @@ describe("RunRunner — milestone checkpoint (PRD #122 M6)", () => {
   });
 
   it("a thrown publish error is swallowed — the run still completes and reports state (best-effort)", async () => {
-    const { gitlab } = fakeGitlab();
+    const forge = fakeGitlab();
+    followSuccessfulPush(git, forge.pr);
     const claim = gitlabClaim(66);
     const events: string[] = [];
     const restoreFetch = spyFetch(events);
@@ -493,7 +494,7 @@ describe("RunRunner — milestone checkpoint (PRD #122 M6)", () => {
     };
     try {
       // Must NOT reject even though publishCheckpoint throws.
-      await runner(exec, gitlab).execute(claim);
+      await runner(exec, forge.gitlab).execute(claim);
     } finally {
       restorePublish();
       restoreFetch();
@@ -503,6 +504,13 @@ describe("RunRunner — milestone checkpoint (PRD #122 M6)", () => {
       (s) => s.runId === claim.run_id && s.body.status === "completed",
     );
     assert.ok(completed, "the run completed despite the publish failure");
+    assert.equal(events.filter(e => e === "publish").length, 1, "a transport throw adds no checkpoint retry");
+    assert.equal(execFileSync("git", ["-C", fx.originPath, "rev-parse", "--verify", "refs/heads/agent/issue-66"],
+      { encoding: "utf8" }).trim().length, 40, "final publication pushes the work branch after checkpoint failure");
+    assert.equal(forge.calls.filter(c => c.method === "POST").length, 1, "final publication opens one MR");
+    const texts = api.messages(claim.run_id).map(m => String(m.payload.text ?? ""));
+    assert.ok(texts.some(t => t === "checkpoint publish failed: error (phase=publish_request, cause=unknown)"),
+      "checkpoint failure remains a distinct diagnostic after successful final delivery");
   });
 });
 

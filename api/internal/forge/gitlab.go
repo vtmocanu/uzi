@@ -497,9 +497,8 @@ func (g *gitLab) ListIssueComments(ctx context.Context, projectID, issueIID int6
 		Sort:        new("asc"),
 	}
 	wrap := func(e error) error { return g.wrapErr("list issue comments", e) }
-	return paginate(wrap, func(page int) ([]IssueComment, int, error) {
+	return paginateResponses(wrap, commentPageResponseBytes, commentListResponseBytes, func(page int, state *responseLimitState) ([]IssueComment, int, error) {
 		opt.Page = int64(page)
-		state := newResponseLimitState(commentPageResponseBytes)
 		notes, resp, err := g.client.Notes.ListIssueNotes(projectID, issueIID, opt, gitlab.WithContext(withResponseLimit(ctx, state)))
 		if state.overflow.Load() {
 			return nil, 0, state.err()
