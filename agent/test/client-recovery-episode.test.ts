@@ -47,7 +47,7 @@ for (const [label, episode] of [
   ["string", "8"], ["null", null], ["true", true], ["false", false],
   ["array", [8]], ["object", { episode: 8 }],
 ] as const) {
-  it(`claimRun silently drops ${label} episode and cannot renew exhausted progress`, async () => {
+  it(`claimRun silently drops ${label} episode and cannot renew exhausted or partly used progress`, async () => {
     claim.worker_recovery_episode = episode;
     await client.register("episode-worker");
     const decoded = await client.claimRun();
@@ -105,6 +105,10 @@ for (const [label, episode] of [
     assert.equal(charged.attempts, 2);
     assert.equal(charged.episode, 7);
     assert.equal(charged.backoffMs, 2000);
+    assert.equal(charged.claimGeneration, 5);
+    assert.equal(charged.startedAt, 1_400_000);
+    assert.equal(charged.deadline, 1_700_000);
+    assert.equal(charged.stage, "capturing");
     assert.deepEqual(journal.recovery, charged);
   });
 }

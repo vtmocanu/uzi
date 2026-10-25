@@ -235,6 +235,19 @@ for (const state of ["partly-used", "exhausted-unblocked"] as const) {
     await assert.rejects(f.reserve(6, f.recreate(), 9), /blocked/);
     assert.deepEqual(f.read(), blocked);
   });
+
+  test(`rollback during newer episode on the same fence leaves unblocked ${state} unchanged`, async t => {
+    const f = fixture(t);
+    await f.reserve(4, f.recreate(), 7);
+    if (state === "exhausted-unblocked") {
+      await f.reserve(4, f.recreate(), 7);
+      await f.reserve(4, f.recreate(), 7);
+    }
+    const before = f.read();
+    f.advance(-1);
+    await assert.rejects(f.reserve(4, f.recreate(), 8), /clock/);
+    assert.deepEqual(f.read(), before);
+  });
 }
 
 test("fresh fenced claim after an interrupted long turn rebases deadline without refunding attempts", async t => {
