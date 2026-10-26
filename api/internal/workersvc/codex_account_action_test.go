@@ -33,7 +33,9 @@ func TestDeriveCodexAccountAction(t *testing.T) {
 		mutate func(in *codexAccountActionInputs)
 		want   string
 	}{
-		{"quarantined, receipt retry pending", func(in *codexAccountActionInputs) {
+		// SQL projects receipt/consumption timing into retryPending. The distinct
+		// eligibility, expiry and failure cases live in TestCodexAccountActionRetryPendingLiveDB.
+		{"quarantined, retry pending", func(in *codexAccountActionInputs) {
 			quarantine(in)
 			in.retryPending = true
 		}, CodexAccountActionReconciling},
@@ -41,12 +43,6 @@ func TestDeriveCodexAccountAction(t *testing.T) {
 			quarantine(in)
 			in.retryPending, in.reauthRequired = true, true
 		}, CodexAccountActionReloginRequired},
-		{"quarantined, consumed retry still pending", func(in *codexAccountActionInputs) {
-			quarantine(in)
-			in.retryPending = true
-		}, CodexAccountActionReconciling},
-		{"quarantined, consumed retry expired", quarantine, CodexAccountActionReloginRequired},
-		{"quarantined, retry failed", quarantine, CodexAccountActionReloginRequired},
 		{"identity change outranks retry pending", func(in *codexAccountActionInputs) {
 			quarantine(in)
 			in.retryPending = true
