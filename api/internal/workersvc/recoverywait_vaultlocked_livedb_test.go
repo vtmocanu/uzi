@@ -130,6 +130,10 @@ func TestRecoveryWaitVaultUnlockEarlyPromoteReclaimLiveDB(t *testing.T) {
 	enableClaimAssembly(t, env, userID)
 	wk := seedSnapshotWorker(t, env, userID, "nonce-early-vault")
 	svc := snapshotSvc(env, testParams())
+	vlt := vault.NewPostgres(env.box, env.pool)
+	enrollCodexProtectedVault(t, env, vlt, userID, codexVaultLockedTestPassword)
+	vlt.Lock(userID)
+	svc.SetVault(vlt)
 	runID := seedOutageRun(t, env, userID, repoID, wk, "running", "issue", 3, 0)
 	cause := "vault_locked"
 	if _, applied, err := svc.SetState(env.ctx, wkrRow(t, env, wk), runID,
@@ -137,12 +141,13 @@ func TestRecoveryWaitVaultUnlockEarlyPromoteReclaimLiveDB(t *testing.T) {
 		t.Fatalf("park: applied=%v err=%v", applied, err)
 	}
 	parked, err := env.q.GetRunByID(env.ctx, runID)
-	if err != nil || !parked.RecoveryRetryNotBefore.Valid || !parked.RecoveryRetryNotBefore.Time.After(time.Now()) {
-		t.Fatalf("park must have a future timer: row=%+v err=%v", parked, err)
+	if err != nil || !parked.RecoveryRetryNotBefore.Valid || !parked.RecoveryRetryNotBefore.Time.After(time.Now()) ||
+		!parked.RecoveryWaitCause.Valid || parked.RecoveryWaitCause.String != cause {
+		t.Fatalf("protected park must have a typed cause and future timer: row=%+v err=%v", parked, err)
 	}
-	vlt := vault.NewPostgres(env.box, env.pool)
-	svc.SetVault(vlt)
-	enrollCodexProtectedVault(t, env, vlt, userID, codexVaultLockedTestPassword)
+	if err := vlt.UnlockExisting(env.ctx, userID, codexVaultLockedTestPassword); err != nil {
+		t.Fatal(err)
+	}
 	bc, lc := &parkBroadcaster{}, &fakeLifecycle{}
 	svc.SetBroadcaster(bc)
 	svc.SetLifecycle(lc)
@@ -199,15 +204,22 @@ func TestRecoveryWaitVaultUnlockPromoteRefusesStaleRunningReportLiveDB(t *testin
 	enableClaimAssembly(t, env, userID)
 	wk := seedSnapshotWorker(t, env, userID, "nonce-stale-running")
 	svc := snapshotSvc(env, testParams())
+	vlt := vault.NewPostgres(env.box, env.pool)
+	enrollCodexProtectedVault(t, env, vlt, userID, codexVaultLockedTestPassword)
+	vlt.Lock(userID)
+	svc.SetVault(vlt)
 	runID := seedOutageRun(t, env, userID, repoID, wk, "running", "issue", 3, 0)
 	cause := "vault_locked"
 	if _, applied, err := svc.SetState(env.ctx, wkrRow(t, env, wk), runID,
 		StateRequest{State: "recovery_wait", RecoveryCause: &cause, ClaimGeneration: i64Ptr(3)}); err != nil || !applied {
 		t.Fatalf("park: applied=%v err=%v", applied, err)
 	}
-	vlt := vault.NewPostgres(env.box, env.pool)
-	svc.SetVault(vlt)
-	enrollCodexProtectedVault(t, env, vlt, userID, codexVaultLockedTestPassword)
+	if status, stored := vaultLockedCause(t, env, runID); status != "recovery_wait" || !stored.Valid || stored.String != cause {
+		t.Fatalf("protected park: status=%q cause=%v, want recovery_wait/vault_locked", status, stored)
+	}
+	if err := vlt.UnlockExisting(env.ctx, userID, codexVaultLockedTestPassword); err != nil {
+		t.Fatal(err)
+	}
 	if err := svc.PromoteVaultLockedRecoveryWaitRuns(env.ctx, userID); err != nil {
 		t.Fatal(err)
 	}
