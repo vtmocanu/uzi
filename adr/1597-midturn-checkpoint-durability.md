@@ -452,8 +452,9 @@ independent 600 s timer (`GIT_TIMEOUT_MS`) ended it, with a plain error.
   already did: ended with nothing read is a genuine empty EOF only on a clean exit;
   data already read, destroyed without end, or errored is refused.
 - **Settlement rule.** Both supervised output consumers (the gated stream and the
-  `execScoped` collector) settle on the scope's hard signal and, where the scope is
-  not masked, its soft signal. A soft stop's cancellation is requested by the child
+  `execScoped` collector) settle on the scope's hard signal in every boundary scope
+  (including the mid-turn tick and other TickSpawner scopes) and, where the scope
+  carries one and is not masked (Codex checkpoints), its soft signal. A soft stop's cancellation is requested by the child
   handle's own listener; a hard stop relies on the scope's spawner stopping the
   child on its own signal. The verdict is joined with the child's completion at the
   `spawnGit` or `execScoped` level, and a completion rejection wins; otherwise hard
@@ -467,8 +468,9 @@ independent 600 s timer (`GIT_TIMEOUT_MS`) ended it, with a plain error.
   Before any stop they behave as before; ordinary failures are not reclassified.
 - **Step split.** The code-head reads report as
   `checkpoint-code-head-runner-tip`, `-tracking`, `-default-tip`, `-pin` and
-  `-changed-files` in both the gate snapshot and the done body; `checkpoint-code-head`
-  remains as the entry marker before them. The gate's ownership
+  `-changed-files` in both the gate snapshot and the done body. In the done body,
+  `checkpoint-code-head` remains as the entry marker before the post-import reads;
+  the gate snapshot no longer reports it. The gate's ownership
   readback, previously under the last import step, now reports as
   `checkpoint-code-head-tracking`, and its fresh pin as `checkpoint-code-head-pin`.
 
