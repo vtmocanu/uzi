@@ -16,6 +16,7 @@ const environment = {
 type Options = NonNullable<Parameters<typeof createRuntime>[0]>;
 
 function fixture(t: { after(fn: () => void): void }) {
+  fs.mkdirSync(new URL("../../.uzi/scratch/", import.meta.url), { recursive: true });
   const root = fs.mkdtempSync(fileURLToPath(new URL("../../.uzi/scratch/bootstrap.", import.meta.url)));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const calls: string[][] = [];

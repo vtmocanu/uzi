@@ -6,6 +6,8 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { resolve, join } from "node:path";
 import { runPodEpochShadow, readPodEpochProjection, PodEpochSettlementError } from "../src/pod-epoch-reclaim.js";
+import { WorkerClient } from "../src/client.js";
+import { nullLogger } from "./helpers.js";
 import type { PodEpochOwnership } from "../src/pod-epoch-lock.js";
 import type { RetainedSourceEvidence } from "../src/git.js";
 
@@ -38,8 +40,8 @@ function setup() {
   };
   return { options, calls, parent };
 }
-function clock(options: Options) {
-  let time = 0;
+function clock(options: Options, initial = 0) {
+  let time = initial;
   const timers = new Set<{ at: number; callback: () => void }>();
   options.now = () => time;
   options.schedule = (callback, ms) => {
@@ -503,6 +505,7 @@ test("shutdown during intentional daemon cleanup joins without handover", async 
   } finally { await d.close(); }
 });
 test("default projection reader joins real regular and Kubernetes projection symlink reads", async () => {
+  await mkdir(resolve("../.uzi/scratch"), { recursive: true });
   const dir = await mkdtemp(resolve("../.uzi/scratch/projection-"));
   try {
     await mkdir(join(dir, "..version"));
@@ -515,6 +518,7 @@ test("default projection reader joins real regular and Kubernetes projection sym
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 test("default projection reader handles missing, empty, oversize and nonregular files", async () => {
+  await mkdir(resolve("../.uzi/scratch"), { recursive: true });
   const dir = await mkdtemp(resolve("../.uzi/scratch/projection-"));
   try {
     const signal = new AbortController().signal;
@@ -533,6 +537,7 @@ test("default projection reader handles missing, empty, oversize and nonregular 
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 test("default projection reader joins actual read and close even when shutdown arrives", async t => {
+  await mkdir(resolve("../.uzi/scratch"), { recursive: true });
   const dir = await mkdtemp(resolve("../.uzi/scratch/projection-"));
   try {
     const path = join(dir, "evidence");
@@ -585,3 +590,68 @@ test("empty healthy census is eligible and intentional guard close is harmless",
     assert.equal(result.reason, "shadow_complete");
   } finally { await d.close(); }
 });
+
+for (const endpoint of ["holds", "ownership"] as const) {
+  for (const mode of ["overflow", "abort", "deadline"] as const) {
+    test("real WorkerClient " + endpoint + " joins delayed body cancellation (" + mode + ")", async () => {
+      const d = await daemon();
+      let release!: () => void;
+      const held = new Promise<void>(r => { release = r; });
+      let entered!: () => void, cancelling!: () => void;
+      const reading = new Promise<void>(r => { entered = r; });
+      const cancelled = new Promise<void>(r => { cancelling = r; });
+      let cancelSettled = false, settled = false;
+      const { options, calls, parent } = setup();
+      options.dockerHost = d.host;
+      inventory(options, 1);
+      const time = clock(options, Date.now());
+      const requests: string[] = [];
+      options.client = new WorkerClient("http://example.invalid", "inert", "test", nullLogger(), {
+        fetch: async (url, init) => {
+          assert.equal(init?.method, "GET");
+          const path = new URL(String(url)).pathname;
+          requests.push(path);
+          const isHolds = path.endsWith("/recovery-holds");
+          if (endpoint === "ownership" && isHolds)
+            return new Response(JSON.stringify({ run_id: "run0", holds: [] }));
+          assert.equal(path.endsWith(endpoint === "holds" ? "/recovery-holds" : "/ownership"), true);
+          return new Response(new ReadableStream<Uint8Array>({
+            pull(controller) {
+              entered();
+              if (mode !== "abort") controller.enqueue(new Uint8Array(1024 * 1024 + 1));
+            },
+            async cancel() { cancelling(); await held; cancelSettled = true; },
+          }));
+        },
+      });
+      const running = runPodEpochShadow(options).finally(() => { settled = true; });
+      try {
+        await reading;
+        if (mode === "abort") parent.abort();
+        await cancelled;
+        // Give daemon socket cleanup time to finish if an RPC detached cancellation.
+        for (let i = 0; i < 1000 && !settled; i++) await tick();
+        assert.equal(settled, false);
+        assert.equal(calls.handovers, 0);
+        if (mode === "deadline") {
+          time.advance(595000); await tick(); time.advance(5000);
+          await assert.rejects(running, PodEpochSettlementError);
+          assert.equal(calls.handovers, 0);
+          assert.equal(cancelSettled, false);
+        } else {
+          release();
+          const result = await running;
+          assert.equal(cancelSettled, true);
+          assert.equal(result!.would_delete, 0);
+          assert.equal(calls.handovers, mode === "abort" ? 0 : 1);
+        }
+        assert.equal(requests.length, endpoint === "holds" ? 1 : 2);
+      } finally {
+        release();
+        await running.catch(() => undefined);
+        await tick();
+        await d.close();
+      }
+    });
+  }
+}

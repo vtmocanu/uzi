@@ -1,6 +1,7 @@
 import { constants } from "node:fs";
 import { open } from "node:fs/promises";
 import { basename } from "node:path";
+import { MaintenanceBudget } from "./maintenance-budget.js";
 import type { inspectPodEpochBootstrap } from "./pod-epoch-bootstrap.js";
 import type { PodEpochOwnership } from "./pod-epoch-lock.js";
 import { parsePodEpochEvidence, assertPodEpochEvidenceBinding } from "./pod-epoch-evidence.js";
@@ -81,8 +82,8 @@ function holdsSnapshot(response: RecoveryHoldsResponse, runId: string): Retained
   }
   return { state: "read", holds };
 }
-// retained-source-server.ts RUN_ID_RE alphabet/limit, with a strict end assertion:
-// JavaScript $ also accepts a trailing newline, which is unsafe in an HTTP path.
+// Use the operator channel's run-ID alphabet and length bound, with an explicit
+// end-of-input assertion before metadata can become an HTTP path component.
 const RUN_ID_RE = /^[A-Za-z0-9_-]{1,160}(?![\s\S])/;
 const safe = (value: string) => value.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 160);
 
@@ -238,10 +239,12 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
       let holds: RetainedHoldsSnapshot = { state: "unknown" };
       let lifecycle: RetainedLifecycleSnapshot = { state: "unknown" };
       try {
-        holds = holdsSnapshot(await owned(() => options.client.listRecoveryHolds(group.selector.runId, controller.signal), hardPass), group.selector.runId);
-        const row = await owned(() => options.client.getRunOwnership(group.selector.runId, {
-          signal: controller.signal, deadline: hardPass - 5000,
-        }), hardPass);
+        holds = holdsSnapshot(await owned(() => MaintenanceBudget.runOwned(controller.signal,
+          () => options.client.listRecoveryHolds(group.selector.runId, controller.signal)), hardPass), group.selector.runId);
+        const row = await owned(() => MaintenanceBudget.runOwned(controller.signal,
+          () => options.client.getRunOwnership(group.selector.runId, {
+            signal: controller.signal, deadline: hardPass - 5000,
+          })), hardPass);
         if (row && (row.status === "completed" || row.status === "failed" || row.status === "cancelled"))
           lifecycle = { state: "terminal", status: row.status };
       } catch (error) { if (fatal || controller.signal.aborted) throw error; partial = true; }

@@ -347,3 +347,52 @@ it("a selected multipart group that grows after the census fails before any meas
   assert.equal(result.sources.length, 0);
   assert.equal(measurementOpens, 0);
 });
+
+for (const failingFirst of [true, false]) for (const abort of [false, true]) {
+  it("epoch discovery joins failed realpath and delayed sibling (failureFirst=" + failingFirst + ", abort=" + abort + ")", async () => {
+    let entered!: () => void, release!: () => void;
+    const ready = new Promise<void>(r => { entered = r; });
+    const held = new Promise<void>(r => { release = r; });
+    let calls = 0;
+    mock.method(fsp, "realpath", async () => {
+      const first = ++calls === 1;
+      if (first === failingFirst) throw new Error("lookup failure");
+      entered(); await held; return path.dirname(bare);
+    });
+    const stop = new AbortController();
+    let settled = false;
+    const pending = cache.discoverEpochRetainedSources({ signal: stop.signal }).finally(() => { settled = true; });
+    try {
+      await ready;
+      if (abort) stop.abort();
+      // Allow unrelated directory cleanup to finish without releasing either lookup.
+      for (let i = 0; i < 1000 && !settled; i++) await new Promise<void>(r => setImmediate(r));
+      assert.equal(calls, 2);
+      assert.equal(settled, false, "discovery cannot hand ownership back before both lookups settle");
+    } finally { release(); }
+    const result = await pending;
+    assert.equal(result.inventoryComplete, false);
+    assert.equal(result.groups.length, 0);
+  });
+}
+
+for (const failingFirst of [true, false]) {
+  it("public bare resolution joins failed realpath and delayed sibling (failureFirst=" + failingFirst + ")", async () => {
+    let entered!: () => void, release!: () => void;
+    const ready = new Promise<void>(r => { entered = r; });
+    const held = new Promise<void>(r => { release = r; });
+    let calls = 0, settled = false;
+    mock.method(fsp, "realpath", async () => {
+      if ((++calls === 1) === failingFirst) throw new Error("lookup failure");
+      entered(); await held; return path.dirname(bare);
+    });
+    const pending = cache.resolveRecoveryBareDir(path.basename(bare)).finally(() => { settled = true; });
+    try {
+      await ready;
+      await new Promise<void>(r => setImmediate(r));
+      assert.equal(calls, 2);
+      assert.equal(settled, false, "public resolution must join both filesystem outcomes");
+    } finally { release(); }
+    assert.equal(await pending, undefined);
+  });
+}

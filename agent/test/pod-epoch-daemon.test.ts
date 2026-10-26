@@ -3,6 +3,7 @@ import http from "node:http";
 import type { ServerResponse } from "node:http";
 import type { Socket } from "node:net";
 import { once } from "node:events";
+import { mkdir } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { relative } from "node:path";
 import { setImmediate } from "node:timers/promises";
@@ -39,6 +40,7 @@ async function daemon(t: TestContext, route: Route = () => false, count = 0, uni
   });
   server.on("connection", socket => { sockets.add(socket); socket.on("close", () => sockets.delete(socket)); });
   const socketPath = relative(process.cwd(), new URL("../../.uzi/scratch/epoch-" + randomUUID() + ".sock", import.meta.url).pathname);
+  if (unix) await mkdir(new URL("../../.uzi/scratch/", import.meta.url), { recursive: true });
   if (unix) server.listen(socketPath);
   else server.listen(0, "127.0.0.1");
   await once(server, "listening");
@@ -287,5 +289,21 @@ test("injected deadline covers held stream without real waits", async t => {
   clock = 601000; [...timers][0]!.fire();
   assert.throws(() => guard.assertHealthy(), { reason: "daemon_deadline" });
   await guard.close(); assert.equal(timers.size, 0);
+  await turns(() => d.sockets.size === 0);
+});
+
+test("event byte bound counts cumulative small whitespace frames and joins stream close", async t => {
+  const d = await daemon(t);
+  const guard = await openPodEpochDaemonBarrier(d.options);
+  t.after(() => guard.close());
+  // Every individual frame is two bytes; newline bytes count toward the same bound.
+  for (let i = 0; i < 7; i++) d.events!.write(" \n".repeat(4096));
+  await setImmediate();
+  guard.assertHealthy();
+  d.events!.write(" \n".repeat(4096));
+  d.events!.write("\n");
+  await turns(() => guard.signal.aborted);
+  assert.throws(() => guard.assertHealthy(), { reason: "daemon_event_invalid" });
+  await guard.close();
   await turns(() => d.sockets.size === 0);
 });

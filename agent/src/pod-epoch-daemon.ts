@@ -191,12 +191,13 @@ export async function openPodEpochDaemonBarrier(
     const events = await request(`/events?since=${since}`, true);
     monitoring = (async () => {
       const decoder = new TextDecoder("utf-8", { fatal: true });
-      let frame = "", frameBytes = 0;
-      // Each newline-delimited frame is bounded before decode/append. Whitespace
-      // heartbeats reset on newline; an unbounded whitespace frame still refuses.
+      let frame = "", frameBytes = 0, streamBytes = 0;
+      // Count actual stream bytes, including whitespace and delimiters, before parsing.
       try {
         for await (const raw of events) {
           const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as Uint8Array);
+          if (chunk.length > FRAME_LIMIT - streamBytes) fail("daemon_event_invalid");
+          streamBytes += chunk.length;
           let start = 0;
           for (let i = 0; i <= chunk.length; i++) {
             if (i !== chunk.length && chunk[i] !== 10) continue;

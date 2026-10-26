@@ -2791,7 +2791,13 @@ export class GitCache {
     try {
       const st = await this.retainedIO(() => fs.lstat(barePath));
       if (st.isSymbolicLink() || !st.isDirectory()) return undefined;
-      const [realBare, realRoot] = await this.retainedIO(() => Promise.all([fs.realpath(barePath), fs.realpath(this.reposRoot)]));
+      const [realBare, realRoot] = await this.retainedIO(async () => {
+        const results = await Promise.allSettled([fs.realpath(barePath), fs.realpath(this.reposRoot)]);
+        return results.map(result => {
+          if (result.status === "rejected") throw result.reason;
+          return result.value;
+        }) as [string, string];
+      });
       if (path.dirname(realBare) !== realRoot) return undefined;
     } catch {
       return undefined;
