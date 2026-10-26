@@ -16578,7 +16578,8 @@ try {
     // cancellation and completion have settled through its handle, and only if the stream still has not ended.
     let softJoin: Promise<void> | undefined;
     const joinSoftStop = (): Promise<void> => softJoin ??= (async () => {
-      // The handle's own soft listener (spawnCheckpointProcess) has already requested the cancellation.
+      // The handle's own soft listener (spawnCheckpointProcess) requests the cancellation while the handle
+      // still admits it; once completion has settled nothing is needed.
       await Promise.allSettled([process.completed]);
       // An EOF already queued on the stream (delivered on a later tick) must land before the verdict.
       await new Promise<void>(resolve => setImmediate(resolve));
@@ -16917,11 +16918,11 @@ try {
       const stopOutput = (): void => {
         if (stopSettling || gated.done()) return;
         stopSettling = (async () => {
-          // The handle's own soft listener (spawnCheckpointProcess) has already requested the cancellation
-          // when the soft signal fired, so only a hard stop asks for it here.
-          const cleanup = await Promise.allSettled([
-            boundary.softSignal?.aborted ? Promise.resolve() : Promise.resolve().then(() => process.cancel()),
-            process.completed]);
+          // No cancellation is requested here. On a soft stop the handle's own soft listener
+          // (spawnCheckpointProcess) requests it while the handle still admits cancellation (once completion
+          // has settled nothing is needed). On a hard stop the safety handle stops on the permit abort itself,
+          // and a cancel() request would mirror its typed completion rejection into an unsafe-cleanup error.
+          const cleanup = await Promise.allSettled([process.completed]);
           for (const result of cleanup) {
             if (result.status !== "rejected") continue;
             const reason = result.reason;

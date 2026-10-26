@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { GitCache, type BoundaryProcessSpawner } from "../src/git.js";
+import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { CheckpointSoftDeadlineError, CheckpointUnsafeCleanupError, GitBoundaryAbortError } from "../src/checkpoint-stop.js";
 import type { BoundaryProcessHandle } from "../src/harness.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
@@ -91,7 +92,10 @@ describe("readBare 600 s timer inside a boundary scope", () => {
       assert.equal(read.settled(), false);
       (stop === "hard" ? scope.hard : scope.soft).abort();
       await turns();
-      assert.equal(child.cancels() >= 1, true, "the stop requested the child's cancellation");
+      // Soft: the handle's own soft listener requests the cancellation. Hard: the safety handle stops on the
+      // permit abort itself, so nothing here requests an extra cancel (it would mirror a typed rejection).
+      if (stop === "soft") assert.equal(child.cancels() >= 1, true, "the soft stop requested the child's cancellation");
+      else assert.equal(child.cancels(), 0, "a hard stop requests no extra cancellation");
       assert.equal(read.settled(), false, "the read waits for the child's cleanup");
       timers.pastReadDeadline();
       await turns();
@@ -102,8 +106,37 @@ describe("readBare 600 s timer inside a boundary scope", () => {
       assert.ok("error" in outcome, "the stopped read fails");
       assert.ok(outcome.error instanceof (stop === "hard" ? GitBoundaryAbortError : CheckpointSoftDeadlineError),
         `typed ${stop} error, got ${String(outcome.error)}`);
+      if (stop === "hard") assert.match((outcome.error as Error).message, /boundary deadline exceeded/);
     });
   }
+
+  it("hard stop with a typed completion rejection that cancel() mirrors: the typed refusal, not an unsafe-cleanup error", async t => {
+    const timers = mockTimers(t);
+    const stdout = new PassThrough(), stderr = new PassThrough();
+    for (const stream of [stdout, stderr]) stream.on("error", () => undefined);
+    let cancels = 0;
+    const scope = scopeFor(async () => {
+      // Safety-like handle: the permit abort stops it, completion rejects a few turns later, and cancel()
+      // returns the same completion (so it rejects with the same refusal).
+      let reject!: (reason: unknown) => void;
+      const completed = new Promise<Terminal>((_resolve, rej) => { reject = rej; });
+      completed.catch(() => undefined);
+      scope.hard.signal.addEventListener("abort", () => {
+        void turns(5).then(() => reject(new TrustedExecutionRefusal("boundary process deadline exceeded")));
+      }, { once: true });
+      return { stdin: new Writable({ write: (_c, _e, cb) => cb() }), stdout, stderr, completed,
+        cancel: () => { cancels++; return completed.then(() => undefined); } };
+    });
+    const read = track(scope.run(readHead));
+    await turns();
+    scope.hard.abort();
+    timers.pastReadDeadline();
+    const outcome = await read.result();
+    assert.ok("error" in outcome);
+    assert.ok(!(outcome.error instanceof CheckpointUnsafeCleanupError), `reclassified: ${String(outcome.error)}`);
+    assert.ok(outcome.error instanceof TrustedExecutionRefusal, `got ${String(outcome.error)}`);
+    assert.equal(cancels, 0, "a hard stop requested no cancellation");
+  });
 
   it("surfaces an unclean cleanup as CheckpointUnsafeCleanupError, still without the plain deadline error", async t => {
     const timers = mockTimers(t);
@@ -128,7 +161,7 @@ describe("readBare 600 s timer inside a boundary scope", () => {
     const scope = scopeFor(async () => { scope.hard.abort(); return child.handle; });
     const read = track(scope.run(readHead));
     await turns();
-    assert.equal(child.cancels() >= 1, true);
+    assert.equal(child.cancels(), 0, "a hard stop requests no extra cancellation");
     timers.pastReadDeadline();
     await turns();
     assert.equal(read.settled(), false, "no timer was armed to fire the plain deadline error");
@@ -190,7 +223,7 @@ describe("streamBundleWithCap 600 s timer inside a boundary scope (via produceRe
       (stop === "hard" ? scope.hard : scope.soft).abort();
       await turns();
       const cancelsAtStop = child.cancels();
-      assert.equal(cancelsAtStop >= 1, true, "the stop requested the child's cancellation");
+      if (stop === "soft") assert.equal(cancelsAtStop >= 1, true, "the soft stop requested the child's cancellation");
       timers.pastReadDeadline();
       await turns();
       assert.equal(child.cancels(), cancelsAtStop, "the retired timer killed nothing");
