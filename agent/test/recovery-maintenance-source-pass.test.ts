@@ -4,6 +4,8 @@ import fs from "node:fs/promises";
 import { writeFileSync } from "node:fs";
 import path from "node:path";
 import { createHash, createHmac } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { residueQuarantine } from "../src/residue-quarantine.js";
 import { RecoveryCoordinator, canonicalJson, type ClosedSourceObservation, type RecoveryRecord, type RecoveryArchiveClient } from "../src/recovery.js";
 import { setImmediate as turn } from "node:timers/promises";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
@@ -796,6 +798,150 @@ test("busy boot pass cannot drop a source pass; shutdown aborts and joins delaye
   const first = await f.seal(await f.bundled(f.partial(ordinary)));
   const secondId = "00000000-0000-4000-8000-000000000003";
   await f.seal(await f.bundled(f.partial(secondId)));
+  // Instance-only observations: the production saved-evidence context excludes boot.
+  type SavedPass = { signal: AbortSignal; entries: number; bytes: number; exhausted: boolean };
+  const seams = f.coordinator as unknown as {
+    savedEvidenceOnly: AsyncLocalStorage<SavedPass>;
+    log: ReturnType<typeof nullLogger>;
+    replayTerminalEvidence(run: string, signal: AbortSignal): Promise<void>;
+    savedSourceCandidates(run: string, signal: AbortSignal): Promise<RecoveryRecord[]>;
+    checkSavedMetadata(resource?: "entries" | "bytes", amount?: number): void;
+    finalRetryReady(record: RecoveryRecord): boolean;
+    savedSourceCandidate(record: RecoveryRecord): boolean;
+    withCancellationAttempt(record: RecoveryRecord, action: () => Promise<unknown>,
+      attempts?: Map<string, MaintenanceBudget>, onCancellationObserved?: () => MaintenanceBudget): Promise<unknown>;
+    readRecord(filename: string): Promise<RecoveryRecord | null>;
+    writeRecordUnlocked(record: RecoveryRecord): Promise<void>;
+    pendingStep(record: RecoveryRecord, signal?: AbortSignal, redrive?: string): Promise<void>;
+    isExecuting(run: string): boolean;
+  };
+  const stages = new AsyncLocalStorage<{ stage: string; id?: string }>();
+  const trace: Array<Record<string, unknown>> = [];
+  let dropped = 0;
+  let savedPass: SavedPass | undefined;
+  const state = (record: RecoveryRecord) => ({
+    id: record.captureId, state: record.state, reason: record.reason,
+    finalAcknowledged: record.finalAcknowledged, completionReceipt: !!record.completionReceipt,
+  });
+  // Only the two fixture identities are retained; no diagnostic journal rereads.
+  const lastObserved = new Map<string, ReturnType<typeof state> | null>();
+  const remember = (id: string, record: RecoveryRecord | null) => {
+    if (id === ordinary || id === secondId) lastObserved.set(id, record ? state(record) : null);
+  };
+  const emit = (event: string, fields: Record<string, unknown> = {}) => {
+    if (trace.length === 128) { dropped++; return; }
+    const pass = seams.savedEvidenceOnly.getStore();
+    trace.push({ event, run: f.context.runId, stage: stages.getStore()?.stage ?? "source",
+      id: stages.getStore()?.id, ...(pass ? {
+        entries: pass.entries, bytes: pass.bytes, exhausted: pass.exhausted, aborted: pass.signal.aborted,
+      } : {}), ...fields });
+  };
+  // Each async wrapper adds only its settlement observer; sync checks stay sync.
+  // Context follows nested reads without a shared stage variable racing boot.
+  const observe = <T,>(stage: string, id: string | undefined, action: () => Promise<T>,
+    settled: (value: T) => Record<string, unknown> = () => ({})): Promise<T> =>
+    stages.run({ stage, id }, () => {
+      emit("entry");
+      return action().then(value => { emit("settled", settled(value)); return value; }, error => {
+        emit("throw", { error: String(error),
+          ...(stage === "cancellation_attempt" ? { reason: "cancellation_attempt_retained" } : {}) });
+        throw error;
+      });
+    });
+  const replay = seams.replayTerminalEvidence.bind(seams);
+  t.mock.method(seams, "replayTerminalEvidence", (run: string, signal: AbortSignal) =>
+    observe("replay", undefined, () => replay(run, signal), () => ({
+      aborted: signal.aborted, quarantine: residueQuarantine(),
+      ...(savedPass ? { entries: savedPass.entries, bytes: savedPass.bytes,
+        exhausted: savedPass.exhausted } : {}),
+      ...(signal.aborted ? { reason: "aborted" } :
+        savedPass?.exhausted ? { reason: "saved_metadata_exhausted" } :
+          residueQuarantine() !== undefined ? { reason: "quarantined" } : {}),
+    })));
+  const discover = seams.savedSourceCandidates.bind(seams);
+  t.mock.method(seams, "savedSourceCandidates", (run: string, signal: AbortSignal) => {
+    savedPass = seams.savedEvidenceOnly.getStore();
+    return observe("discovery", undefined, () => discover(run, signal),
+      records => ({ ids: records.map(record => record.captureId) }));
+  });
+  const metadata = seams.checkSavedMetadata.bind(seams);
+  t.mock.method(seams, "checkSavedMetadata", (...args: Parameters<typeof metadata>) => {
+    try { return metadata(...args); }
+    catch (error) {
+      const pass = seams.savedEvidenceOnly.getStore();
+      if (pass) emit("metadata_throw", { resource: args[0], amount: args[1], error: String(error),
+        reason: pass.signal.aborted ? "aborted" : pass.exhausted ? "saved_metadata_exhausted" : "metadata_check_threw" });
+      throw error;
+    }
+  });
+  for (const name of ["finalRetryReady", "savedSourceCandidate"] as const) {
+    const check = seams[name].bind(seams);
+    t.mock.method(seams, name, (record: RecoveryRecord) => {
+      const result = check(record);
+      if (seams.savedEvidenceOnly.getStore()) emit(name, { ...state(record), result,
+        ...(!result ? { reason: name === "finalRetryReady" ? "final_retry_backoff" : "current_record_ineligible" } : {}) });
+      return result;
+    });
+  }
+  const attempt = seams.withCancellationAttempt.bind(seams);
+  t.mock.method(seams, "withCancellationAttempt", (...args: Parameters<typeof attempt>) =>
+    seams.savedEvidenceOnly.getStore()
+      ? observe("cancellation_attempt", args[0].captureId, () => attempt(...args))
+      : attempt(...args));
+  const read = seams.readRecord.bind(seams);
+  t.mock.method(seams, "readRecord", (...args: Parameters<typeof read>) =>
+    seams.savedEvidenceOnly.getStore()
+      ? observe("readRecord", path.basename(args[0], ".json"), () => read(...args),
+        record => {
+          remember(path.basename(args[0], ".json"), record);
+          return record ? state(record) : { reason: "current_record_absent_or_unreadable" };
+        })
+      : read(...args));
+  const write = seams.writeRecordUnlocked.bind(seams);
+  t.mock.method(seams, "writeRecordUnlocked", (record: RecoveryRecord) => {
+    return seams.savedEvidenceOnly.getStore()
+      ? observe("writeRecord", record.captureId, () => write(record), () => {
+        remember(record.captureId, record);
+        return state(record);
+      }) : write(record);
+  });
+  const pending = seams.pendingStep.bind(seams);
+  t.mock.method(seams, "pendingStep", (...args: Parameters<typeof pending>) => {
+    if (!seams.savedEvidenceOnly.getStore()) return pending(...args);
+    emit("pendingStep_entry", { ...state(args[0]), redrive: args[2] });
+    return observe("pendingStep", args[0].captureId, () => pending(...args), () => ({
+      lastObservedRecord: lastObserved.get(args[0].captureId),
+      note: "last successful read/write observation; no extra settlement reread",
+    }));
+  });
+  const executing = seams.isExecuting.bind(seams);
+  t.mock.method(seams, "isExecuting", (run: string) => {
+    const result = executing(run);
+    if (seams.savedEvidenceOnly.getStore()) emit("executing_check", {
+      result, quarantine: residueQuarantine(), ...(result ? { reason: "executing" } : {}),
+    });
+    return result;
+  });
+  for (const level of ["warn", "info"] as const) {
+    const log = seams.log[level].bind(seams.log);
+    t.mock.method(seams.log, level, (...args: Parameters<typeof log>) => {
+      if (seams.savedEvidenceOnly.getStore()) emit(level, { message: args[0], fields: args[1],
+        ...(args[0] === "recovery: terminal saved evidence discovery incomplete"
+          ? { reason: "discovery_incomplete" } :
+          typeof args[1]?.reason === "string" ? { reason: args[1].reason } : {}),
+      });
+      return log(args[0], args[1]);
+    });
+  }
+  const diagnostic = () => {
+    const reasons = trace.flatMap(event => typeof event.reason === "string" ? [event.reason] : []);
+    return "busy admission must not drop the registered source pass; " + JSON.stringify({
+      run: f.context.runId, records: [ordinary, secondId],
+      observedReasons: reasons, exit: "unresolved unless an explicit event identifies the exit",
+      unresolved: "events describe observations; an unobserved exit cannot be identified from absence alone",
+      trace, dropped,
+    });
+  };
   const bootEntered = deferred<void>(), bootRelease = deferred<void>();
   const sourceEntered = deferred<void>(), sourceRelease = deferred<void>();
   let sourceSignal: AbortSignal | undefined;
@@ -803,28 +949,40 @@ test("busy boot pass cannot drop a source pass; shutdown aborts and joins delaye
   const upload = f.client.uploadRecoveryBundle;
   f.client.uploadRecoveryBundle = async (run, id, manifest, stream, signal) => {
     reservations++;
+    if (seams.savedEvidenceOnly.getStore()) emit("upload_entry", { id, aborted: signal?.aborted });
     const result = await upload(run, id, manifest, stream, signal);
     if (reservations === 1) { bootEntered.resolve(); await bootRelease.promise; }
     else { sourceSignal = signal; sourceEntered.resolve(); await sourceRelease.promise; }
     return result;
   };
   const boot = f.coordinator.resumePending(undefined, [first]);
-  await bootEntered.promise;
-  const pass = request(f);
-  // Source pass may wait on the boot record's existing cycle lock.
-  bootRelease.resolve();
-  const enteredBeforeFinished = await Promise.race([
-    sourceEntered.promise.then(() => true), pass.then(() => false),
-  ]);
-  assert.equal(enteredBeforeFinished, true, "busy admission must not drop the registered source pass");
-  let joined = false;
-  const drain = f.coordinator.shutdown().then(() => { joined = true; });
-  await turn();
-  assert.equal(sourceSignal?.aborted, true);
-  assert.equal(joined, false);
-  sourceRelease.resolve();
-  await Promise.all([boot, pass, drain]);
-  assert.equal(reservations, 2);
+  let pass: Promise<void> | undefined;
+  let drain: Promise<void> | undefined;
+  try {
+    await bootEntered.promise;
+    pass = request(f);
+    // Source pass may wait on the boot record's existing cycle lock.
+    bootRelease.resolve();
+    const enteredBeforeFinished = await Promise.race([
+      sourceEntered.promise.then(() => true), pass.then(() => false),
+    ]);
+    assert.equal(enteredBeforeFinished, true, diagnostic());
+    let joined = false;
+    drain = f.coordinator.shutdown().then(() => { joined = true; });
+    await turn();
+    assert.equal(sourceSignal?.aborted, true);
+    assert.equal(joined, false);
+    sourceRelease.resolve();
+    await Promise.all([boot, pass, drain]);
+    assert.equal(reservations, 2);
+  } finally {
+    // Release both owned children even if admission or abort/join assertions fail.
+    bootRelease.resolve();
+    sourceRelease.resolve();
+    const shutdown = f.coordinator.shutdown();
+    await Promise.allSettled([boot, pass, drain, shutdown]);
+    // TestContext restores the instance mocks only after this callback settles.
+  }
 });
 
 for (const mode of ["park", "undefined", "wrong-run", "wrong-generation", "no-family", "no-tag"] as const) {
