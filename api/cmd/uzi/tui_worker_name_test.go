@@ -117,23 +117,39 @@ func TestWorkerNameDistinctHeads(t *testing.T) {
 }
 
 func TestWorkerNameNarrowDetailHeader(t *testing.T) {
-	for _, width := range []int{26, 30} {
+	for _, width := range []int{20, 21, 22, 26, 30} {
 		m := workerRenderModel(true)
 		m.width = width
 		m.workers.rows[0].w.Name = "base.l-highmem-a32f"
+		m.workers.rows[0].w.OnlineSince = tp(time.Now().Add(-time.Minute))
 		out := stripANSI(m.View().Content)
 		found := false
 		for _, line := range strings.Split(out, "\n") {
 			if strings.HasPrefix(line, "worker › ") {
 				found = true
-				if !strings.HasPrefix(line, "worker › base.l…m-a32f") {
+				want := "worker › " + m.renderer.WorkerName("base.l-highmem-a32f", min(13, width-9))
+				if !strings.HasPrefix(line, want) {
 					t.Errorf("width %d lost minimum name: %q", width, line)
+				}
+				if strings.HasSuffix(line, "-a32f…") || strings.HasSuffix(line, "-a32f …") {
+					t.Errorf("width %d has ambiguous tail ellipsis: %q", width, line)
 				}
 			}
 		}
 		if !found {
 			t.Fatalf("width %d missing worker header: %q", width, out)
 		}
+		if !strings.Contains(out, "\n  up 1m\n") {
+			t.Errorf("width %d lost separate heartbeat: %q", width, out)
+		}
+	}
+	m := workerRenderModel(true)
+	m.width = 80
+	m.workers.rows[0].w.Name = "short"
+	m.workers.rows[0].w.OnlineSince = tp(time.Now().Add(-time.Minute))
+	lines, _ := m.workerDetailLines(time.Now())
+	if !strings.Contains(stripANSI(lines[1]), "short") || !strings.Contains(stripANSI(lines[1]), "up 1m") {
+		t.Errorf("short name lost inline heartbeat: %q", stripANSI(lines[1]))
 	}
 }
 
@@ -166,18 +182,37 @@ func TestWorkerNameHostileAllSites(t *testing.T) {
 
 func TestWorkerNameAdminReadoutKeepsFittedName(t *testing.T) {
 	for _, width := range []int{30, 120} {
-		m := workerRenderModel(true)
-		m.board.admin = true
-		row := m.workers.rows[0]
-		row.w.Name = strings.Repeat("manual", 30) + "-a32f"
-		row.workerOwner = "owner@example.test"
-		want := m.renderer.WorkerName(row.w.Name, width-9)
-		out := stripANSI(m.workerReadout(row, width)[0])
-		if !strings.Contains(out, want) || !strings.HasSuffix(out, "-a32f") {
-			t.Errorf("width %d lost fitted name %q: %q", width, want, out)
+		for _, spare := range []int{0, 1, 2} {
+			m := workerRenderModel(true)
+			m.board.admin = true
+			row := m.workers.rows[0]
+			row.w.Name = strings.Repeat("manual", 30) + "-a32f"
+			if spare > 0 {
+				row.w.Name = strings.Repeat("m", width-9-spare-5) + "-a32f"
+			}
+			row.workerOwner = "owner@example.test"
+			want := m.renderer.WorkerName(row.w.Name, width-9)
+			out := stripANSI(m.workerReadout(row, width)[0])
+			if !strings.Contains(out, want) || !strings.HasSuffix(out, "-a32f") {
+				t.Errorf("width %d lost fitted name %q: %q", width, want, out)
+			}
+			if visualWidth(out) > width || strings.Contains(out, "owner") {
+				t.Errorf("width %d should have no metadata space: %q", width, out)
+			}
 		}
-		if visualWidth(out) > width || strings.Contains(out, "owner") {
-			t.Errorf("width %d should have no metadata space: %q", width, out)
+	}
+}
+
+func TestWorkerNameReadoutDropsTinyAttentionMetadata(t *testing.T) {
+	m := workerRenderModel(true)
+	m.board.admin = false
+	row := m.workers.rows[0]
+	row.w.Status = "offline"
+	for _, spare := range []int{1, 2, 3} {
+		row.w.Name = strings.Repeat("m", 120-9-spare-5) + "-a32f"
+		out := stripANSI(m.workerReadout(row, 120)[0])
+		if out != "selected "+row.w.Name {
+			t.Errorf("spare %d should drop attention metadata: %q", spare, out)
 		}
 	}
 }

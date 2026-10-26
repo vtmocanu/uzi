@@ -949,7 +949,13 @@ func (m tuiModel) workerReadout(r workerRow, width int) []string {
 		}
 	}
 	// Clamp metadata independently so its ellipsis cannot replace the name's tail.
-	selected += clampVisual(metadata, width-visualWidth(selected))
+	minimumMetadata := visualWidth(" · ") + 1
+	if m.board.admin {
+		minimumMetadata = visualWidth(" · owner ") + 1
+	}
+	if remaining := width - visualWidth(selected); remaining >= minimumMetadata {
+		selected += clampVisual(metadata, remaining)
+	}
 	if inline {
 		return []string{selected}
 	}
