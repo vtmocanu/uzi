@@ -1044,7 +1044,29 @@ SELECT
     COALESCE(length(cpa.recovery_sealed) > 0
              AND cpa.recovery_generation = cpa.generation, false)::boolean AS recovery_at_generation,
     cpa.lease_deadline,
-    cpa.reauth_required
+    cpa.reauth_required,
+    EXISTS (
+        SELECT 1 FROM codex_refresh_intent cri
+        WHERE cri.user_id = cpa.user_id AND cri.provider_account_id = cpa.id
+          AND cri.state = 'rotating' AND cri.provider_error_at IS NOT NULL
+          AND cri.operation_id = cpa.coord_operation_id
+          AND cri.from_generation = cpa.generation
+          AND cpa.coord_state = 'quarantined' AND cpa.recovery_sealed IS NULL
+          AND NOT cpa.reauth_required
+          AND (
+              (cri.reuse_attempted_at IS NULL
+               AND cri.created_at > now() - interval '30 minutes'
+               AND EXISTS (
+                   SELECT 1 FROM codex_credential_state s
+                   JOIN user_secrets enabled_alias
+                     ON enabled_alias.id = s.user_secret_id AND enabled_alias.user_id = s.user_id
+                   WHERE s.user_id = cpa.user_id AND s.provider_account_id = cpa.id
+                     AND s.status = 'linked' AND enabled_alias.disabled_at IS NULL
+               ))
+              OR (cri.reuse_attempted_at IS NOT NULL
+                  AND cri.reuse_attempted_at > now() - (sqlc.arg('reuse_in_flight_microseconds')::bigint * interval '1 microsecond'))
+          )
+    )::boolean AS retry_pending
 FROM runs r
 LEFT JOIN user_secrets us
     ON us.id = r.codex_secret_id AND us.user_id = r.user_id

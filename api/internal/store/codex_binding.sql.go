@@ -759,7 +759,29 @@ SELECT
     COALESCE(length(cpa.recovery_sealed) > 0
              AND cpa.recovery_generation = cpa.generation, false)::boolean AS recovery_at_generation,
     cpa.lease_deadline,
-    cpa.reauth_required
+    cpa.reauth_required,
+    EXISTS (
+        SELECT 1 FROM codex_refresh_intent cri
+        WHERE cri.user_id = cpa.user_id AND cri.provider_account_id = cpa.id
+          AND cri.state = 'rotating' AND cri.provider_error_at IS NOT NULL
+          AND cri.operation_id = cpa.coord_operation_id
+          AND cri.from_generation = cpa.generation
+          AND cpa.coord_state = 'quarantined' AND cpa.recovery_sealed IS NULL
+          AND NOT cpa.reauth_required
+          AND (
+              (cri.reuse_attempted_at IS NULL
+               AND cri.created_at > now() - interval '30 minutes'
+               AND EXISTS (
+                   SELECT 1 FROM codex_credential_state s
+                   JOIN user_secrets enabled_alias
+                     ON enabled_alias.id = s.user_secret_id AND enabled_alias.user_id = s.user_id
+                   WHERE s.user_id = cpa.user_id AND s.provider_account_id = cpa.id
+                     AND s.status = 'linked' AND enabled_alias.disabled_at IS NULL
+               ))
+              OR (cri.reuse_attempted_at IS NOT NULL
+                  AND cri.reuse_attempted_at > now() - ($1::bigint * interval '1 microsecond'))
+          )
+    )::boolean AS retry_pending
 FROM runs r
 LEFT JOIN user_secrets us
     ON us.id = r.codex_secret_id AND us.user_id = r.user_id
@@ -767,10 +789,15 @@ LEFT JOIN codex_credential_state ccs
     ON ccs.user_secret_id = r.codex_secret_id AND ccs.user_id = r.user_id
 LEFT JOIN codex_provider_account cpa
     ON cpa.id = ccs.provider_account_id AND cpa.user_id = r.user_id
-WHERE r.id = ANY($1::uuid[])
+WHERE r.id = ANY($2::uuid[])
   AND r.status = 'recovery_wait'
   AND r.recovery_wait_cause = 'codex_account_unavailable'
 `
+
+type ListCodexAccountActionInputsParams struct {
+	ReuseInFlightMicroseconds int64       `json:"reuse_in_flight_microseconds"`
+	RunIds                    []uuid.UUID `json:"run_ids"`
+}
 
 type ListCodexAccountActionInputsRow struct {
 	ID                        uuid.UUID          `json:"id"`
@@ -793,6 +820,7 @@ type ListCodexAccountActionInputsRow struct {
 	RecoveryAtGeneration      bool               `json:"recovery_at_generation"`
 	LeaseDeadline             pgtype.Timestamptz `json:"lease_deadline"`
 	ReauthRequired            pgtype.Bool        `json:"reauth_required"`
+	RetryPending              bool               `json:"retry_pending"`
 }
 
 // PRD #1590 D6: the read-time inputs of the derived codex_account_action, batched over one
@@ -807,8 +835,8 @@ type ListCodexAccountActionInputsRow struct {
 // the account's current generation, the survivor pass's promotion test), so no sealed
 // material leaves the database on this path. The label is the run's OWN snapshot
 // (runs.codex_secret_label), never the alias row's current label.
-func (q *Queries) ListCodexAccountActionInputs(ctx context.Context, runIds []uuid.UUID) ([]ListCodexAccountActionInputsRow, error) {
-	rows, err := q.db.Query(ctx, listCodexAccountActionInputs, runIds)
+func (q *Queries) ListCodexAccountActionInputs(ctx context.Context, arg ListCodexAccountActionInputsParams) ([]ListCodexAccountActionInputsRow, error) {
+	rows, err := q.db.Query(ctx, listCodexAccountActionInputs, arg.ReuseInFlightMicroseconds, arg.RunIds)
 	if err != nil {
 		return nil, err
 	}
@@ -837,6 +865,7 @@ func (q *Queries) ListCodexAccountActionInputs(ctx context.Context, runIds []uui
 			&i.RecoveryAtGeneration,
 			&i.LeaseDeadline,
 			&i.ReauthRequired,
+			&i.RetryPending,
 		); err != nil {
 			return nil, err
 		}
