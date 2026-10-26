@@ -632,7 +632,7 @@ UZI_MEASURE_3031=1 UZI_MEASURE_DOCKER_HOST=tcp://<dind>:2375 \
   covered, and each MEASURE line records the mode.
 - The measurement must be the only process in its container: the exclusive-idle scan and the harness
   idleness check refuse any other writer, so redirect output to a file (a `| tee` or `| grep` is a
-  foreign process) and run it as PID 1, not through a long-lived `docker exec` shell.
+  foreign process) and run it as PID 1 (or a child of PID 1 through the test runner; a deeper ancestry is `UNRUN`), not through a long-lived `docker exec` shell.
 - `UZI_MEASURE_DEVIATION` states any difference from the worker image's environment. It
   becomes `elapsed_fidelity: "unverified: <text>"`, and a would-be PASS is then reported as
   `counters_within_limits_elapsed_unverified`. It never relaxes a limit or the slot deadline.

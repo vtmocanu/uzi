@@ -383,15 +383,30 @@ function runnerTailProblem(runner: unknown, runId: string): string | undefined {
   const tails = (runner as { executionTails: Map<string, unknown> }).executionTails;
   return [...tails.keys()].some(id => id !== runId) ? "the runner holds an execution tail for another run" : undefined;
 }
+/** The measurement is PID 1 or a descendant of PID 1 through at most the test runner (PID 1 -> runner -> this file). */
+function ancestryProblem(parents: ReadonlyMap<number, number>, self: number): string | undefined {
+  const parent = parents.get(self) ?? 0;
+  if (self === 1 || parent === 1 || (parents.get(parent) ?? 0) === 1) return undefined;
+  return "the measurement is not PID 1, nor a child of PID 1, nor a child of PID 1's test runner";
+}
 function soleExecutionProblem(runner?: unknown, runId?: string): string | undefined {
-  const foreign = foreignPids(readParents(), process.pid);
+  const tree = readParents();
+  const ancestry = ancestryProblem(tree, process.pid);
+  if (ancestry) return ancestry;
+  const foreign = foreignPids(tree, process.pid);
   if (foreign.length > 0) return `${foreign.length} process(es) other than the measurement, its ancestors and its descendants run in this container`;
   return runner ? runnerTailProblem(runner, runId ?? "") : undefined;
 }
 
+/** The real writer exclusion; its idleness is the harness's sole-execution check, evaluated at entry. */
+function realExclusion(runner: () => unknown, runId: string, dockerHost: string): MaintenanceWriterExclusion {
+  return new MaintenanceWriterExclusion({ gate: new DindPruneGate(), isIdle: () => soleExecutionProblem(runner(), runId) === undefined,
+    proof: scans => terminalMaintenanceProof(scans, dockerHost), log: nullLogger() });
+}
+
 const SUPPRESSED_REASON = "pre-slot production bundle path suppressed by the harness";
 /** Gate eligibility. Every run installs the produceRecoveryBundle suppression, so none qualifies for a C2 PASS. */
-function eligibility(spec: { real: boolean; origin: "repo" | "tiny"; controlLimits?: unknown }, _suppressedBundleCalls: number): { eligible: boolean; reasons: string[] } {
+function eligibility(spec: { real: boolean; origin: "repo" | "tiny"; controlLimits?: unknown }): { eligible: boolean; reasons: string[] } {
   const reasons: string[] = [];
   if (!spec.real) reasons.push("control run (stubbed exclusion and quiescence)");
   if (spec.origin !== "repo") reasons.push("not a clone of the source repository");
@@ -434,11 +449,11 @@ async function runPipeline(t: TestContext, spec: Spec): Promise<RunResult> {
   }
   let dockerHost = "http://unused.invalid";
   if (spec.real) {
+    const crowded = soleExecutionProblem();
+    if (crowded) return unrun("sole execution is unverified, so the idleness precondition fails: " + crowded);
     const prerequisites = realPrerequisites();
     if ("unrun" in prerequisites) return unrun(prerequisites.unrun);
     dockerHost = prerequisites.dockerHost;
-    const crowded = soleExecutionProblem();
-    if (crowded) return unrun("sole execution is unverified, so the idleness precondition fails: " + crowded);
   }
   if (spec.real) {
     const ancestors = ancestorProblem(path.dirname(git.recoveryRoot));
@@ -455,7 +470,7 @@ async function runPipeline(t: TestContext, spec: Spec): Promise<RunResult> {
   // ---- origin: a clone of this repository's checkout (item 2); the runner makes the bare (item 4)
   if (source) {
     const origin = path.join(path.dirname(fx.dataDir), "origin-src");
-    execFileSync("git", ["clone", "-q", "--no-local", "--no-hardlinks", REPO_ROOT, origin], { env: gitEnv, stdio: "pipe" });
+    execFileSync("git", ["clone", "-q", "--no-local", "--no-hardlinks", spec.sourceRoot ?? REPO_ROOT, origin], { env: gitEnv, stdio: "pipe" });
     sh(origin, "checkout", "-q", "-B", "main", source.head);
     disableAutoMaintenance(origin, gitEnv);
     fx.originPath = origin;
@@ -562,10 +577,7 @@ async function runPipeline(t: TestContext, spec: Spec): Promise<RunResult> {
     process: { state: "quiescent" as const, processes: [], killed: [], detail: "" },
     docker: { state: (request.site === "retained_ops" ? "docker_unconfirmed" : "not_wired") as "docker_unconfirmed" | "not_wired", removed: [], detail: "" },
   });
-  const exclusion = spec.real
-    ? new MaintenanceWriterExclusion({ gate: new DindPruneGate(), isIdle: () => soleExecutionProblem(runner, claim.run_id) === undefined,
-        proof: scans => terminalMaintenanceProof(scans, dockerHost), log: nullLogger() })
-    : passingExclusion();
+  const exclusion = spec.real ? realExclusion(() => runner, claim.run_id, dockerHost) : passingExclusion();
 
   // ---- the runner: a failed run leaves the WIP shape in its attempt clone
   let genesis = "", baseCommit = "";
@@ -733,7 +745,7 @@ async function runPipeline(t: TestContext, spec: Spec): Promise<RunResult> {
   const evaluation = archiveNotApplicable
     ? evaluate({ unrun: `the fixture cannot satisfy the archive precondition: ${(archiveError as Error).message}`, limits, elapsedLimitMs: slotMs, elapsedMs: slotElapsed, phases, deviation: env.deviation })
     : evaluate({ limits, elapsedLimitMs: slotMs, elapsedMs: slotElapsed, phases, refusedCharge, capRefusals, envelopeOverruns, refusal, incomplete, deviation: env.deviation });
-  const eligible = eligibility(spec, stray.length);
+  const eligible = eligibility(spec);
   const record = emit({
     ...head, ...body,
     candidate_sha: source?.head, source_commits: source?.commits, run_id: claim.run_id,
@@ -872,15 +884,35 @@ describe("#3031 composed measurement verdict controls", () => {
   });
 
   it("control: a run that suppresses production bundle calls is never eligible, and with no eligible run the C2 gate is UNRUN", () => {
-    for (const suppressed of [0, 2]) {
-      const e = eligibility({ real: true, origin: "repo" }, suppressed);
-      assert.equal(e.eligible, false);
-      assert.ok(e.reasons.includes("pre-slot production bundle path suppressed by the harness"), e.reasons.join());
-    }
+    const e = eligibility({ real: true, origin: "repo" });
+    assert.equal(e.eligible, false);
+    assert.ok(e.reasons.includes("pre-slot production bundle path suppressed by the harness"), e.reasons.join());
     const lines = [{ kind: "composed", label: "a", verdict: "PASS", eligible_for_gate: false }, { kind: "composed", label: "b", verdict: "FAIL", eligible_for_gate: false }];
     assert.equal(gateSummary(lines).verdict, "UNRUN");
     assert.equal(gateSummary([...lines, { kind: "composed", label: "c", verdict: "FAIL", eligible_for_gate: true }]).verdict, "FAIL");
     assert.equal(gateSummary([{ kind: "composed", label: "c", verdict: "PASS", eligible_for_gate: true }]).verdict, "PASS");
+  });
+
+  it("control: a real orphaned process makes the sole-execution check refuse, in the precondition and in the exclusion", { skip: LINUX_ONLY }, async t => {
+    const orphan = Number(execFileSync("sh", ["-c", "sleep 60 >/dev/null 2>&1 & echo $!"], { encoding: "utf8" }).trim());
+    t.after(() => { try { process.kill(orphan); } catch { /* gone */ } });
+    // The shell exited, so the sleep is no descendant of this process: a foreign writer in the container.
+    assert.ok(foreignPids(readParents(), process.pid).includes(orphan), "the orphan is reported foreign");
+    assert.match(soleExecutionProblem() ?? "", /other than the measurement|not PID 1/);
+    // The precondition is wired into runPipeline before any prerequisite or fixture work.
+    const { evaluation, record } = await runPipeline(t, { label: "control-sole", layout: "shared", shape: "A", origin: "repo", real: true });
+    assert.equal(evaluation.verdict, "UNRUN");
+    assert.match(String(record.reason), /sole execution is unverified/);
+    // The real exclusion refuses at entry on a foreign runner tail: isIdle is the harness check, not a constant.
+    const exclusion = realExclusion(() => ({ executionTails: new Map([["other-run", 1]]) }), "this-run", "http://unused.invalid");
+    assert.deepEqual(await exclusion.run(async () => "ran", () => true), { entered: false, reason: "worker_not_idle" });
+  });
+
+  it("control: the measurement must be PID 1 or a child of PID 1 through at most the test runner", () => {
+    assert.equal(ancestryProblem(new Map([[1, 0], [20, 1]]), 20), undefined);
+    assert.equal(ancestryProblem(new Map([[1, 0], [10, 1], [20, 10]]), 20), undefined);
+    assert.equal(ancestryProblem(new Map([[1, 0]]), 1), undefined);
+    assert.match(ancestryProblem(new Map([[1, 0], [5, 1], [10, 5], [20, 10]]), 20) ?? "", /not PID 1/);
   });
 
   it("control: the sole-execution precondition refuses a foreign process and a foreign runner tail", () => {
