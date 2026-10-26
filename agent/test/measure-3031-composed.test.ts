@@ -900,7 +900,7 @@ describe("#3031 composed measurement verdict controls", () => {
     assert.ok(foreignPids(readParents(), process.pid).includes(orphan), "the orphan is reported foreign");
     assert.match(soleExecutionProblem() ?? "", /other than the measurement|not PID 1/);
     // The precondition is wired into runPipeline before any prerequisite or fixture work.
-    const { evaluation, record } = await runPipeline(t, { label: "control-sole", layout: "shared", shape: "A", origin: "repo", real: true });
+    const { evaluation, record } = await runPipeline(t, { label: "control-sole", layout: "shared", shape: "A", origin: "tiny", real: true });
     assert.equal(evaluation.verdict, "UNRUN");
     assert.match(String(record.reason), /sole execution is unverified/);
     // The real exclusion refuses at entry on a foreign runner tail: isIdle is the harness check, not a constant.
