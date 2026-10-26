@@ -128,7 +128,13 @@ func TestEvaluateCodex(t *testing.T) {
 			apitypes.CodexRateLimitBucketDTO{ID: "codex", Secondary: win(20, week, future)},
 			apitypes.CodexRateLimitBucketDTO{ID: "codex_other", Primary: win(80, week, future)}), Held, 80},
 		{"equal to threshold held", codexAt(apitypes.CodexRateLimitBucketDTO{ID: "codex", Secondary: win(70, week, future)}), Held, 70},
-		{"69.9 not held", codexAt(apitypes.CodexRateLimitBucketDTO{ID: "codex", Secondary: win(69.9, week, future)}), OK, 70},
+		{"69.9 not held, shown floored", codexAt(apitypes.CodexRateLimitBucketDTO{ID: "codex", Secondary: win(69.9, week, future)}), OK, 69},
+		{"over 100 clamped and held beside a low sibling", codexAt(
+			apitypes.CodexRateLimitBucketDTO{ID: "codex", Secondary: win(100.5, week, future)},
+			apitypes.CodexRateLimitBucketDTO{ID: "codex_other", Primary: win(20, week, future)}), Held, 100},
+		{"weekly window without percent beside a low sibling unknown", codexAt(
+			apitypes.CodexRateLimitBucketDTO{ID: "codex", Secondary: &apitypes.CodexRateLimitWindowDTO{LimitWindowSeconds: i64(week), ResetAt: i64(future)}},
+			apitypes.CodexRateLimitBucketDTO{ID: "codex_other", Primary: win(20, week, future)}), Unknown, 0},
 		{"no weekly window unknown", codexAt(apitypes.CodexRateLimitBucketDTO{ID: "codex", Primary: win(99, fiveH, future)}), Unknown, 0},
 		{"no buckets unknown", codexAt(), Unknown, 0},
 		{"weekly window without percent unknown", codexAt(apitypes.CodexRateLimitBucketDTO{ID: "codex",

@@ -6,6 +6,8 @@
 -- proceed), unlike an inline validated ADD CONSTRAINT, per the two-step pattern of
 -- 00242/00243. The backlog satisfies both by construction: weekly_reserve_pct is new and
 -- NULL on every existing row, and no existing row holds pause_mode = 'reserve'.
+SET LOCAL lock_timeout = '5s';
+
 ALTER TABLE users VALIDATE CONSTRAINT users_weekly_reserve_pct_check;
 ALTER TABLE runs VALIDATE CONSTRAINT runs_pause_mode_check;
 
@@ -14,6 +16,8 @@ ALTER TABLE runs VALIDATE CONSTRAINT runs_pause_mode_check;
 -- There is no VALIDATE inverse, so restore the pre-00362 state (each constraint present but
 -- NOT VALID) by dropping and re-adding it NOT VALID. The CHECK bodies match 00360/00361
 -- verbatim. Mirrors 00243's Down.
+SET LOCAL lock_timeout = '5s';
+
 ALTER TABLE users DROP CONSTRAINT users_weekly_reserve_pct_check;
 ALTER TABLE users ADD CONSTRAINT users_weekly_reserve_pct_check
     CHECK (weekly_reserve_pct IS NULL OR weekly_reserve_pct BETWEEN 1 AND 100) NOT VALID;

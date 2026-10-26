@@ -210,9 +210,10 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 	// Current-user weekly usage reserve (PRD #3522): the 7-day utilization percent at which
 	// uzi stops spending the caller's subscription. RequireUser, so a uzc_ CLI Bearer works
 	// (`uzi settings reserve`), unlike the consent switches above: those grant uzi
-	// permission to spend unattended, which a stolen CLI token must not be able to do. This
-	// grants nothing: it is an owner-only limit on spend, and the same token can already
-	// create runs through Bearer-reachable routes. Identity is the session user, never the body.
+	// permission to spend unattended, which a stolen CLI token must not be able to do. The
+	// reserve is a self-limit on spend, not a theft control: a token that can already create
+	// runs through Bearer-reachable routes can also turn the reserve off. Identity is the
+	// session user, never the body.
 	r.With(mw.RequireUser(h.q, h.cfg)).Put("/me/usage-reserve", h.SetUsageReserve)
 
 	// Current-user Claude rate-limit meters (PRD #53): the caller's own 5h/7d

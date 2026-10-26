@@ -441,8 +441,8 @@ func (e *Engine) observe(ctx context.Context, userID, secretID uuid.UUID, rev in
 // a prior pending 7-day reset exists (T set AND in the future relative to
 // prev.SyncedAt), now is strictly more than earlyResetThreshold before T, and the
 // reset is observed by EITHER Arm A (the fresh reset epoch moved strictly more than
-// resetEpochMoveMargin past T — the rolling-boundary model) OR Arm B (the 7-day
-// used% dropped from >= pctResetFloor to <= pctResetCeil with an unmoved boundary —
+// usagereserve.ResetEpochMoveMargin past T — the rolling-boundary model) OR Arm B (the 7-day
+// used% dropped from >= usagereserve.PctResetFloor to <= usagereserve.PctResetCeil with an unmoved boundary —
 // the fixed-grid model). The prior "was limiting" gate is gone (PRD #1114): the two
 // arms' jitter margins replace the false-positive protection it provided. It returns
 // T as the expected reset.

@@ -120,7 +120,9 @@ func preReset(resetsAt *time.Time, syncedAt, now time.Time) bool {
 func unknown() Verdict { return Verdict{State: Unknown, Reason: UnknownReason} }
 
 func decide(threshold int16, used float64, resetsAt *time.Time) Verdict {
-	pct := int(math.Round(used))
+	// Floor, not round: the displayed percent never reaches the threshold on an OK verdict
+	// (69.6 vs 70 shows 69), while Held compares the unrounded value.
+	pct := int(math.Floor(used))
 	if used >= float64(threshold) {
 		return Verdict{State: Held, Pct: pct, Threshold: int(threshold), ResetsAt: resetsAt, Fresh: true,
 			Reason: HeldReason(pct, int(threshold))}
@@ -168,11 +170,16 @@ func EvaluateCodex(threshold *int16, r CodexReading, interval time.Duration, now
 	var best *apitypes.CodexRateLimitWindowDTO
 	for i := range r.Buckets {
 		for _, w := range []*apitypes.CodexRateLimitWindowDTO{r.Buckets[i].Primary, r.Buckets[i].Secondary} {
-			if w == nil || w.LimitWindowSeconds == nil || *w.LimitWindowSeconds != WeeklyWindowSeconds ||
-				!validPercent(w.UsedPercent) {
+			if w == nil || w.LimitWindowSeconds == nil || *w.LimitWindowSeconds != WeeklyWindowSeconds {
 				continue
 			}
-			if best == nil || *w.UsedPercent > *best.UsedPercent {
+			// Fail closed (PRD D6): a weekly window whose utilization is missing or not finite
+			// makes the whole reading Unknown rather than letting a sibling window decide. Over
+			// 100% is the most-held state there is, so it is clamped to 100, never skipped.
+			if w.UsedPercent == nil || math.IsNaN(*w.UsedPercent) || math.IsInf(*w.UsedPercent, 0) || *w.UsedPercent < 0 {
+				return unknown()
+			}
+			if best == nil || clampPercent(*w.UsedPercent) > clampPercent(*best.UsedPercent) {
 				best = w
 			}
 		}
@@ -192,8 +199,10 @@ func EvaluateCodex(threshold *int16, r CodexReading, interval time.Duration, now
 	if preReset(resetsAt, *r.LastSuccessAt, now) {
 		return unknown()
 	}
-	return decide(*threshold, *best.UsedPercent, resetsAt)
+	return decide(*threshold, clampPercent(*best.UsedPercent), resetsAt)
 }
+
+func clampPercent(p float64) float64 { return math.Min(p, 100) }
 
 // ClaudeResetObserved reports whether a fresh Claude 7-day reading shows the week reset past
 // the anchor T (the previously reported reset). Arm A: the fresh reset epoch moved strictly
