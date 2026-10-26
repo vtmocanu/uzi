@@ -125,7 +125,7 @@ func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 		item.LandingState = workersvc.DeriveLandingState(textPtrValue(row.Run.FailOrigin.Valid, row.Run.FailOrigin.String), row.Run.PreservedPatch.Valid, row.HasAvailableCapture)
 		out = append(out, item)
 	}
-	h.overlayListCodexAccountActions(r, out)
+	h.overlayListDecorations(r, out)
 	writeRunList(w, r, out)
 }
 
@@ -190,7 +190,7 @@ func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 		setProgressPhase(&item.RunDTO)
 		out = append(out, item)
 	}
-	h.overlayListCodexAccountActions(r, out)
+	h.overlayListDecorations(r, out)
 	writeRunList(w, r, out)
 }
 
@@ -211,13 +211,15 @@ func writeRunList(w http.ResponseWriter, r *http.Request, out []apitypes.RunList
 	httpx.JSON(w, http.StatusOK, map[string]any{"runs": out})
 }
 
-// overlayListCodexAccountActions sets codex_account_action (PRD #1590 D6) on a run list page:
-// one batched read covering only the page's codex_account_unavailable holds, none when the page
-// has no such run. Best-effort like the other list decorations.
-func (h *Handler) overlayListCodexAccountActions(r *http.Request, items []apitypes.RunListItemDTO) {
+// overlayListDecorations applies the batched list decorations to a run list page: codex_account_action
+// (PRD #1590 D6; one read covering only the page's codex_account_unavailable holds, none when the
+// page has no such run) and queue_reason (PRD #3454; one read covering the page's queued runs).
+// Best-effort like the other list decorations.
+func (h *Handler) overlayListDecorations(r *http.Request, items []apitypes.RunListItemDTO) {
 	dtos := make([]*apitypes.RunDTO, 0, len(items))
 	for i := range items {
 		dtos = append(dtos, &items[i].RunDTO)
 	}
 	h.overlayCodexAccountActions(r.Context(), dtos...)
+	h.overlayQueueReasons(r.Context(), dtos...)
 }

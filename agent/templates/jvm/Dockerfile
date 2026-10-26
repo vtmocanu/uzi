@@ -446,6 +446,23 @@ USER root
 # PRD #51 A1 root-entry setpriv drop — the SAME explicit stanza as templates/base (jvm
 # is NOT `FROM base`). Image baseline stays ROOT and the entrypoint drops to `worker`
 # keeping only CAP_SETUID/SETGID ambient (M4 spawns `runner` children). Final USER is root.
+# Epoch startup dependencies belong to the release layer; no toolchain rebuild
+# is required when adding the lifetime lock to an existing runtime.
+RUN n=0; until apk add --no-cache flock; do n=$((n+1)); [ "$n" -ge 5 ] && exit 1; sleep "$((n*3))"; done \
+    && /usr/bin/flock --version | grep -F -q util-linux
+# PRD #3430: container-local npm/tsx bootstrap before Node owns the epoch.
+RUN mkdir /tmp/uzi-epoch-bootstrap \
+    && chown worker:worker /tmp/uzi-epoch-bootstrap \
+    && chmod 0700 /tmp/uzi-epoch-bootstrap \
+    && mkdir -p /usr/local/lib/uzi \
+    && touch /usr/local/lib/uzi/epoch-global.npmrc \
+    && chmod 0644 /usr/local/lib/uzi/epoch-global.npmrc
+# Plain shell validator and the TypeScript wrapper's relative require both use
+# image-baked, root-owned copies, after the /app ownership migration layer.
+COPY --chown=0:0 --chmod=0644 agent/templates/pod-epoch-init.cjs /usr/local/lib/uzi/pod-epoch-init.cjs
+COPY --chown=0:0 --chmod=0644 agent/templates/pod-epoch-init.cjs /app/templates/pod-epoch-init.cjs
+# COPY --chmod can synthesize the parent as 0644; restore traversal after COPY.
+RUN chown root:root /app/templates && chmod 0755 /app/templates
 COPY --chmod=0755 agent/templates/entrypoint.sh /usr/local/sbin/uzi-entrypoint
 VOLUME ["/data", "/nix"]
 

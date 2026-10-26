@@ -242,7 +242,7 @@ for (const resource of Object.keys(caps) as Array<keyof typeof caps>) {
       family: { originals: [{ ...genesis, identity: "1:2" }], observedExecution: { runId, generation: 1 }, metadata: "family" },
     };
     const token = Object.freeze({});
-    let observations = 0, captures = 0;
+    let observations = 0, captures = 0, imports = 0;
     const client: RecoveryArchiveClient = {
       observeTerminalMaintenanceHold: async () => {
         observations++;
@@ -261,7 +261,8 @@ for (const resource of Object.keys(caps) as Array<keyof typeof caps>) {
     };
     const coordinator = new RecoveryCoordinator({
       recoveryRoot: path.join(root, "recovery"), workerToken: "fixture", client, log: nullLogger(),
-      git: { matchMaintenanceSourceFamily: async () => ({ sources: observation.family!.originals, metadata: "family" }),
+      git: { importMaintenanceTip: async () => { imports++; throw new Error("unexpected import"); },
+        matchMaintenanceSourceFamily: async () => ({ sources: observation.family!.originals, metadata: "family" }),
         maintenanceOriginDigest: async () => "b".repeat(64), worktreeHead: async () => "a".repeat(40) } as never,
       writerExclusion: passingExclusion(),
       terminalSettlementConfirmed: () => true,
@@ -274,6 +275,7 @@ for (const resource of Object.keys(caps) as Array<keyof typeof caps>) {
     await coordinator.resumeTerminalSource(runId, Promise.resolve(observation), 1, new AbortController().signal);
     assert.equal(observations, 2);
     assert.equal(captures, 0);
+    assert.equal(imports, 0);
     await assert.rejects(fs.stat(path.join(root, "recovery-maintenance", "complete.json")), { code: "ENOENT" });
   });
 }

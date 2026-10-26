@@ -416,6 +416,8 @@ var inventoryQueryFiles = []string{
 	"ci_autofix.sql",
 	// PRD #333 M1 — the incidental-findings store (full query set)
 	"findings.sql",
+	// PRD #3454 instance maintenance mode
+	"intake_pause.sql",
 }
 
 // inventoryPackages are the directories, relative to this one, whose *_test.go files are
@@ -986,6 +988,55 @@ var queryInventory = []queryPin{
 			"NULL, and it reappears in the to_file bucket / open_count) while a `filing` coordinate " +
 			"with a FRESH filing_since (within the cutoff) is NOT reset — the clamp that protects a " +
 			"slow-but-alive CreateIssue mid-flight (M5 review reaper)"},
+
+	// ── intake_pause.sql — instance maintenance mode (PRD #3454) ───────────────────────
+	// Execution counts observed with log_statement=all over TestIntakePause*, TestMaintenance*,
+	// TestQueueReason*, TestEphemeralProvision*IntakePause* across store, handler and workersvc
+	// (excluding STATEMENT: echoes): Get 26, Lock 45, Ensure 45, Update 31, InsertEvent 31,
+	// ListEvents 7, RunAdmittable 169, Snapshot/Active/Held/Custody/Queued/IdleBound 11 each,
+	// ListRunQueueReasons 19. None is zero. A receipt of that sweep, not a live count.
+	{"GetInstanceIntakePause", "intake_pause.sql", "TestIntakePauseMissingRowLiveDB",
+		"direct call at intake_pause_livedb_test.go (reads back by_user_id and by_label after a " +
+			"re-seeded row is lifted); also reached through store.ReadInstanceIntakePause in " +
+			"several tests of the same file"},
+	{"LockInstanceIntakePause", "intake_pause.sql", "TestIntakePauseTransitionsLiveDB",
+		"reached through store.SetInstanceIntakePause (row lock before the transition); the test " +
+			"asserts changed/no-op for every pause and lift transition"},
+	{"EnsureInstanceIntakePauseRow", "intake_pause.sql", "TestIntakePauseMissingRowLiveDB",
+		"reached through store.SetInstanceIntakePause, which re-seeds a deleted singleton row; the " +
+			"test deletes the row, lifts the pause and asserts the row is back unpaused with one off event"},
+	{"UpdateInstanceIntakePause", "intake_pause.sql", "TestIntakePauseTransitionsLiveDB",
+		"reached through store.SetInstanceIntakePause; asserts the resulting state and the " +
+			"changed flag per transition (TestIntakePauseReasonEditKeepsAttributionLiveDB covers the " +
+			"reason-edit path)"},
+	{"InsertInstanceIntakePauseEvent", "intake_pause.sql", "TestIntakePauseTransitionsLiveDB",
+		"reached through store.SetInstanceIntakePause in the same transaction as the update; " +
+			"asserted by reading the events back, and TestIntakePauseRollbackIsAtomicLiveDB asserts " +
+			"a rolled-back transition leaves no event"},
+	{"ListInstanceIntakePauseEvents", "intake_pause.sql", "TestIntakePauseTransitionsLiveDB",
+		"direct call at intake_pause_livedb_test.go, asserting the event sequence and order"},
+	{"RunAdmittableForEphemeralProvision", "intake_pause.sql", "TestEphemeralProvisionOneRechecksIntakePauseLiveDB",
+		"../handler: prov.ProvisionPass -> provisionOne recheck under the advisory lock; the test " +
+			"enables the pause mid-pass and asserts no worker is created (replacing the query with " +
+			"SELECT true reddens it). The batch test also executes it but never depends on its answer"},
+	{"MaintenanceSnapshotNow", "intake_pause.sql", "TestMaintenanceReadoutPartitionLiveDB",
+		"reached through store.ReadMaintenanceReadout (one statement-time clock shared by every " +
+			"section); executed; the test asserts only that as_of is set"},
+	{"ListMaintenanceActiveRuns", "intake_pause.sql", "TestMaintenanceReadoutPartitionLiveDB",
+		"reached through store.ReadMaintenanceReadout; the partition test asserts which seeded runs " +
+			"land in the active section"},
+	{"ListMaintenanceHeldRuns", "intake_pause.sql", "TestMaintenanceReadoutPartitionLiveDB",
+		"reached through store.ReadMaintenanceReadout; asserts the held section membership"},
+	{"ListMaintenanceCustodyRuns", "intake_pause.sql", "TestMaintenanceReadoutPartitionLiveDB",
+		"reached through store.ReadMaintenanceReadout; asserts the custody section membership"},
+	{"ListMaintenanceQueuedRuns", "intake_pause.sql", "TestMaintenanceReadoutPartitionLiveDB",
+		"reached through store.ReadMaintenanceReadout; asserts the queued section membership " +
+			"(TestMaintenanceReadoutCapLiveDB asserts the row cap)"},
+	{"ListMaintenanceIdleBoundWorkers", "intake_pause.sql", "TestMaintenanceReadoutPartitionLiveDB",
+		"reached through store.ReadMaintenanceReadout; asserts the idle-bound worker section"},
+	{"ListRunQueueReasons", "intake_pause.sql", "TestQueueReasonLiveDB",
+		"../handler: runs_dto.go batch lookup behind the run reads; asserts queue_reason for queued " +
+			"runs while paused and its absence once lifted. Also called from workersvc/jobs.go"},
 }
 
 var sqlQueryNameRe = regexp.MustCompile(`(?m)^-- name: (\w+) `)

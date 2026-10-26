@@ -93,9 +93,13 @@ describe("credential-free capture foundation (#2852)", () => {
       r.git.withCredentialFreeCapture(context, async () => {
         t.mock.method(fs.promises, "lstat", async () => { reads++; throw new Error("unexpected filesystem read"); });
         t.mock.method(fs.promises, "mkdir", async () => { effects++; throw new Error("unexpected filesystem effect"); });
-        await assert.rejects(internal.withVerifiedMaintenancePack(
-          { clonePath: "/capture/source", identity: "1:2" }, "a".repeat(40), "/capture/output",
-          async () => { effects++; }, async () => { effects++; }), { message: "capture private verification refused" });
+        await assert.rejects(internal.importMaintenanceTip({
+          source: { clonePath: "/capture/source", identity: "1:2", runId: "capture", attemptId: "capture" },
+          original: { barePath: "/capture/base.git", cloneUrl: "https://example.test/repo.git" },
+          tip: "a".repeat(40), outDir: "/capture/output", defaultBranch: "main", branch: "capture",
+          key: "capture", family: [], prepare: async () => { effects++; },
+          beforeSemantic: async () => { effects++; }, validateFamily: async () => { effects++; },
+        }), { message: "capture private verification refused" });
         await assert.rejects(internal.spawnGit("/capture/source", ["status"], undefined, {
           trustedExecutable: true,
           // This decoration passes the overlay guard, so refusal must precede

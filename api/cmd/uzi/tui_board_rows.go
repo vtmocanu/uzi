@@ -363,7 +363,7 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 	}
 	if workerWidth > 0 {
 		row = padSeg(clampVisual(row, contentWidth), contentWidth, bg) + gap +
-			paintSeg(m.pal.faintC, bg, false, padCell(m.renderer.Plain(text.runWorkerName, 16), 16))
+			paintSeg(m.pal.faintC, bg, false, padVisual(m.renderer.WorkerName(text.runWorkerName, 16), 16))
 	}
 	return clampVisual(row, m.width)
 }

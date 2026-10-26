@@ -30,7 +30,8 @@
 # --ghcr-only [baseline-verifier] runs #1464 M1 publication fixtures only.
 # --frozen-rc-only runs the #1389 block-guard regressions without the full fixture suite.
 # --fold-order-only runs canonical pending/open-RC ordering fixtures.
-# --fragments-only runs pending fragment consumption and preflight regressions.
+# --plan-only [cutter-path] runs read-only decision and publication fixtures.
+# --fragments-only [cutter-path] runs fragment regressions, optionally against a frozen cutter.
 #
 # Wired as `task test:release-scripts` (its own gate member, not gate:repo's
 # sub-second band: it builds a multi-commit repo). Watch it fail on the
@@ -39,6 +40,8 @@ set -uo pipefail
 # Fixture repos must not read host git config: a global core.fsmonitor=true
 # leaves a detached fsmonitor daemon per repo on macOS.
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+# Fixtures exercise local warning compatibility unless a case explicitly opts into CI.
+export CI=false
 
 SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)"
 TMPDIR="$(cd "$SCRIPTS_DIR/.." && pwd)/.uzi/scratch"
@@ -124,6 +127,61 @@ fi
 printf '%s\n' "$GH_STUB_OUT"
 STUB
 chmod +x "$GH_STUB/gh"
+cat > "$GH_STUB/curl" <<'STUB'
+#!/usr/bin/env bash
+[ "${1:-}" = -q ] || exit 90  # the caller must ignore personal curl configuration
+url=""; head=0; auth=0
+for arg in "$@"; do
+  case "$arg" in
+    https://ghcr.io/*) url=$arg ;;
+    --head|-I) head=1 ;;
+    'Authorization: Bearer anon-fixture') auth=1 ;;
+  esac
+done
+[ -z "${GHCR_QUERY_LOG:-}" ] || printf 'curl %s\n' "$*" >> "$GHCR_QUERY_LOG"
+case "$url" in
+  https://ghcr.io/token)
+    case "${GHCR_CURL_CASE:-}" in
+      token-network) printf '{"token":"anon-fixture"}\n200'; exit 7 ;;
+      token-http) printf '{"token":"anon-fixture"}\n403'; exit 0 ;;
+      token-404) printf '{"errors":[]}\n404'; exit 0 ;;
+      token-missing) printf '{}\n200'; exit 0 ;;
+      token-empty) printf '{"token":""}\n200'; exit 0 ;;
+      token-malformed) printf 'not-json\n200'; exit 0 ;;
+      token-conflict) printf '{"token":"anon-fixture","access_token":"other"}\n200'; exit 0 ;;
+      token-header) printf '{"token":"bad\\r\\nheader"}\n200'; exit 0 ;;
+      token-space) printf '{"token":"anon fixture"}\n200'; exit 0 ;;
+      token-raw-cr) printf '{"token":"anon\rfixture"}\n200'; exit 0 ;;
+      token-escaped-key) printf '{"\\"x\\"token":"EVIL"}\n200'; exit 0 ;;
+      access-token) printf '{"access_token":"anon-fixture"}\n200'; exit 0 ;;
+      multiline-token) printf '{\n "token": "anon-fixture"\n}\n200'; exit 0 ;;
+    esac
+    printf '{"token":"anon-fixture"}\n200'
+    ;;
+  https://ghcr.io/v2/*/manifests/*)
+    [ "$head" = 1 ] && [ "$auth" = 1 ] || exit 91
+    case "${GHCR_CURL_CASE:-}" in
+      absent) printf 404; exit 0 ;;
+      unauthorized) printf 401; exit 0 ;;
+      forbidden) printf 403; exit 0 ;;
+      redirect) printf 307; exit 0 ;;
+      server) printf 503; exit 0 ;;
+      network) printf 200; exit 7 ;;
+      network-404) printf 404; exit 7 ;;
+    esac
+    tag=${url##*/}
+    case "$url" in
+      */agent-base/manifests/*) tags=${GHCR_BASE_OUT-}; rc=${GHCR_BASE_RC:-7} ;;
+      */agent-jvm/manifests/*) tags=${GHCR_JVM_OUT-}; rc=${GHCR_JVM_RC:-7} ;;
+      *) tags=${GHCR_OTHER_OUT-}; rc=${GHCR_OTHER_RC:-7} ;;
+    esac
+    [ "$rc" = 0 ] || exit "$rc"
+    case $'\n'"$tags"$'\n' in (*$'\n'"$tag"$'\n'*) printf 200 ;; (*) printf 404 ;; esac
+    ;;
+  *) exit 92 ;; # unconfigured requests never reach the network
+esac
+STUB
+chmod +x "$GH_STUB/curl"
 export PATH="$GH_STUB:$PATH"
 unset GH_STUB_OUT GH_STUB_LOG GHCR_STUB GHCR_QUERY_LOG
 export GH_REPO=test/uzi
@@ -466,7 +524,7 @@ if [ "${1:-}" = "--identity-only" ]; then
   exit $?
 fi
 
-if [ "${1:-}" != "--shipping-paths-only" ] && [ "${1:-}" != "--ghcr-only" ] && [ "${1:-}" != "--fold-order-only" ] && [ "${1:-}" != "--fragments-only" ]; then
+if [ "${1:-}" != "--shipping-paths-only" ] && [ "${1:-}" != "--ghcr-only" ] && [ "${1:-}" != "--fold-order-only" ] && [ "${1:-}" != "--fragments-only" ] && [ "${1:-}" != "--plan-only" ]; then
 identity_regressions
 echo "=== building fixture in $REPO ==="
 build_fixture
@@ -574,6 +632,7 @@ fi
 # =============================================================================
 REPO_ROOT="$(cd "$SCRIPTS_DIR/.." && pwd)"
 RC="$REPO_ROOT/.agents/skills/uzi-release/scripts/release-cut.sh"
+[ "${1:-}" != --fragments-only ] && [ "${1:-}" != --plan-only ] || RC="${2:-$RC}"
 [ -f "$RC" ] || { echo "release-scripts-test: $RC not found" >&2; exit 2; }
 
 D2N=0
@@ -598,6 +657,7 @@ seed_repo() {
   cp "$SCRIPTS_DIR/lib/dependency-bump.sh" "$d/scripts/lib/dependency-bump.sh"
   cp "$SCRIPTS_DIR/lib/changelog-fragments.sh" "$d/scripts/lib/changelog-fragments.sh"
   cp "$SCRIPTS_DIR/lib/changelog-fragments.awk" "$d/scripts/lib/changelog-fragments.awk"
+  cp "$SCRIPTS_DIR/changelog-fragment-citations.py" "$d/scripts/changelog-fragment-citations.py"
   cp "$SCRIPTS_DIR/lib/release-mode.sh" "$d/scripts/lib/release-mode.sh"
   cp "$SCRIPTS_DIR/lib/changelog-bullets.awk" "$d/scripts/lib/changelog-bullets.awk"
   [ ! -f "$SCRIPTS_DIR/lib/ghcr.sh" ] || cp "$SCRIPTS_DIR/lib/ghcr.sh" "$d/scripts/lib/ghcr.sh"
@@ -673,6 +733,198 @@ published_rc() {
   git -C "$1" tag v0.2.0-rc.1
   push_tag_to_origin "$1" v0.2.0-rc.1
 }
+# The planner shares the cutter's discovery and note rules, but owns no Git writes.
+plan_regressions() (
+  local d before_head before_refs before_status output rc
+  d="$(mktemp -d)"
+  trap 'rm -rf "$d"' EXIT
+  seed_repo "$d"
+  cp "$SCRIPTS_DIR/release-ci-coverage.py" "$d/scripts/release-ci-coverage.py"
+  git -C "$d" add scripts/release-ci-coverage.py
+  gcommit "$d" 'test: include release evidence reader'
+  mkdir -p "$d/plan-bin"
+  cat > "$d/plan-bin/gh" <<'GH'
+#!/usr/bin/env bash
+if [ "$1 $2" = 'repo view' ]; then echo example/uzi; exit 0; fi
+[ "$1 $2" = 'api --paginate' ] || exit 91
+case "${PLAN_PUBLICATION:-success}" in
+  error) exit 1 ;;
+  transient) echo 'HTTP 502: Bad Gateway' >&2; exit 1 ;;
+esac
+for arg in "$@"; do
+  case "$arg" in *head_sha=*) sha="${arg#*head_sha=}"; sha="${sha%%&*}" ;; esac
+done
+branch=$PLAN_PREVIOUS
+if [ "$sha" = "${PLAN_FAILED_SHA:-}" ]; then
+  PLAN_PUBLICATION=failed
+  branch=$PLAN_FAILED_TAG
+fi
+case "${PLAN_PUBLICATION:-success}" in
+  missing) printf '[{"total_count":0,"workflow_runs":[]}]'; exit 0 ;;
+  pending) status=in_progress; conclusion=null ;;
+  failed) status=completed; conclusion='"failure"' ;;
+  *) status=completed; conclusion='"success"' ;;
+esac
+printf '[{"total_count":1,"workflow_runs":[{"id":1,"run_attempt":1,"status":"%s","conclusion":%s,"head_sha":"%s","head_branch":"%s","event":"push","path":".github/workflows/release.yml","repository":{"full_name":"example/uzi"},"head_repository":{"full_name":"example/uzi"}}]}]' "$status" "$conclusion" "$sha" "$branch"
+GH
+  chmod +x "$d/plan-bin/gh"
+  # Resolve before changing PATH, so the shim cannot recursively invoke itself.
+  PLAN_REAL_GIT="$(command -v git)" || return 2
+  PLAN_GIT_AUDIT="$d/forbidden-fetch"
+  export PLAN_REAL_GIT PLAN_GIT_AUDIT
+  cat > "$d/plan-bin/git" <<'GIT'
+#!/usr/bin/env bash
+if [ "${PLAN_READONLY:-0}" = 1 ]; then
+  for arg in "$@"; do
+    if [ "$arg" = fetch ]; then printf 'fetch\n' >> "$PLAN_GIT_AUDIT"; exit 73; fi
+  done
+fi
+if [ "${PLAN_HISTORY_FAILURE:-0}" = 1 ]; then
+  case " $* " in *' log --first-parent '*) exit 74 ;; esac
+fi
+exec "$PLAN_REAL_GIT" "$@"
+GIT
+  chmod +x "$d/plan-bin/git"
+  export PATH="$d/plan-bin:$PATH" PLAN_PREVIOUS=v0.1.0 PLAN_PUBLICATION=success GITHUB_REPOSITORY=example/uzi
+  output="$(
+    cd "$d" || exit 2
+    set -o pipefail
+    # Only extract the real cutter's pure function, rather than running its ceremony.
+    # shellcheck source=/dev/null
+    . <(awk '/^inflight_rc\(\)/ { active=1 } active { print } active && /^}/ { exit }' "$RC")
+    inflight_rc
+  )"; rc=$?
+  assert_eq 'no open train emits no tag' '' "$output"
+  assert_eq 'no open train is a successful discovery' 0 "$rc"
+  plan_expect() {
+    local label=$1 expected=$2 field actual; shift 2
+    before_head="$(git -C "$d" rev-parse HEAD)"
+    before_refs="$(git -C "$d" show-ref)"
+    before_status="$(git -C "$d" status --porcelain --untracked-files=all)"
+    output="$(cd "$d" && PLAN_READONLY=1 bash "$RC" --plan "$@" 2>&1)"; rc=$?
+    assert_eq "$label plan exit" 0 "$rc"
+    while IFS= read -r field; do
+      actual="$(printf '%s\n' "$output" | awk -v prefix="${field%%=*}=" 'index($0, prefix) == 1 { print }')"
+      assert_eq "$label decision ${field%%=*}" "$field" "$actual"
+    done <<< "$expected"
+    assert_eq "$label HEAD unchanged" "$before_head" "$(git -C "$d" rev-parse HEAD)"
+    assert_eq "$label refs unchanged" "$before_refs" "$(git -C "$d" show-ref)"
+    assert_eq "$label worktree unchanged" "$before_status" "$(git -C "$d" status --porcelain --untracked-files=all)"
+    assert_eq "$label no scratch files" '' "$(find "$d/.uzi/scratch" -type f 2>/dev/null)"
+    assert_eq "$label no fetch" '' "$(cat "$PLAN_GIT_AUDIT" 2>/dev/null)"
+  }
+  plan_expect 'empty range' 'OP=noop'
+  plan_expect 'version must exceed stable' $'OP=blocked\nREASON=version-not-above-stable' --version 0.1.0
+  plan_expect 'no train to abandon' $'OP=blocked\nREASON=no-train-to-abandon' --abandon-train
+  plan_expect 'CI strict planning does not query worker pins' 'OP=noop' --ci
+  add_feature "$d" 201
+  output="$(cd "$d" && PLAN_HISTORY_FAILURE=1 bash "$RC" --plan 2>&1)"; rc=$?
+  assert_eq 'broken history reader is an instrument error' 2 "$rc"
+  plan_expect 'shipping without notes' 'OP=noop'
+  feature_201_changelog "$d"
+  plan_expect 'new minor' $'OP=new-base\nTAG=v0.2.0-rc.1'
+  plan_expect 'manual patch base' $'OP=new-base\nTAG=v0.1.1-rc.1' --version 0.1.1
+  plan_expect 'invalid explicit base' $'OP=blocked\nREASON=invalid-version' --version 0.01.1
+  plan_expect 'plan never switches to promote' 'OP=blocked' --promote
+  git -C "$d" tag v0.2.0-rc.9
+  export PLAN_PREVIOUS=v0.2.0-rc.9
+  plan_expect 'open train no new shipping' 'OP=noop'
+  add_feature "$d" 202
+  plan_expect 'open train advances' $'OP=nextrc\nTAG=v0.2.0-rc.10'
+  plan_expect 'other base needs abandon' $'OP=blocked\nREASON=open-train-needs-abandon' --version 0.3.0
+  plan_expect 'abandon needs a higher base' $'OP=blocked\nREASON=abandon-needs-higher-base' --version 0.2.0 --abandon-train
+  PLAN_PREVIOUS=v0.1.0 plan_expect 'explicit abandon' $'OP=new-base\nTAG=v0.3.0-rc.1\nPREVIOUS_TAG=v0.1.0\nSHIPPING_COUNT=2' --version 0.3.0 --abandon-train
+  PLAN_PREVIOUS=v0.1.0 PLAN_FAILED_TAG=v0.2.0-rc.9 PLAN_FAILED_SHA="$(git -C "$d" rev-parse v0.2.0-rc.9)" \
+    plan_expect 'failed abandoned candidate does not block' $'OP=new-base\nTAG=v0.3.0-rc.1\nPREVIOUS_TAG=v0.1.0\nPUBLICATION_STATE=success' --version 0.3.0 --abandon-train
+  plan_expect 'abandon cannot downgrade' $'OP=blocked\nREASON=abandon-needs-higher-base' --version 0.1.1 --abandon-train
+  for PLAN_PUBLICATION in failed pending missing error transient; do
+    export PLAN_PUBLICATION
+    plan_expect "publication $PLAN_PUBLICATION" 'OP=blocked'
+  done
+  export PLAN_PUBLICATION=success
+  printf '\n// dirty\n' >> "$d/api/base.go"
+  plan_expect 'dirty tracked files' 'OP=blocked'
+  git -C "$d" checkout -- api/base.go
+  git -C "$d" tag -d v0.2.0-rc.9 >/dev/null
+  git -C "$d" tag v1.0.0
+  export PLAN_PREVIOUS=v1.0.0
+  plan_expect 'automatic 1.x held' 'OP=blocked'
+  plan_expect 'explicit 1.x patch no shipping' 'OP=noop' --version 1.0.1
+  git -C "$d" tag -d v1.0.0 >/dev/null
+  export PLAN_PREVIOUS=v0.1.0
+  # A strict metadata change is excluded regardless of its subject, even with notes.
+  git -C "$d" tag v0.2.0-rc.9
+  export PLAN_PREVIOUS=v0.2.0-rc.9
+  printf 'apiVersion: v2\nname: uzi\nversion: 0.2.0\nappVersion: "0.1.0"\n' > "$d/deploy/chart/Chart.yaml"
+  git -C "$d" add deploy/chart/Chart.yaml
+  gcommit "$d" 'repair: chart version'
+  plan_expect 'metadata excluded independent of subject' $'OP=noop\nSHIPPING_COUNT=0'
+  export PLAN_PUBLICATION=failed
+  plan_expect 'failed previous tag blocks a no-op' 'OP=blocked'
+  export PLAN_PUBLICATION=success
+  git -C "$d" tag v0.2.0-rc.10
+  export PLAN_PREVIOUS=v0.2.0-rc.10
+  printf '# Changelog\n\n## [Unreleased]\n\n## [0.1.0] - 2026-09-01\n### Added\n- **Initial** (#100)\n' | put_changelog "$d"
+  mkdir -p "$d/docs"
+  echo 'Editorial correction.' > "$d/docs/example.md"
+  git -C "$d" add docs/example.md
+  git -C "$d" commit -q -m 'docs: correct example' -m 'Changelog: none, editorial correction'
+  plan_expect 'explicitly exempt range has no releasable notes' $'OP=noop\nREASON=no-releasable-notes'
+  printf 'module example/test\n' > "$d/api/go.mod"
+  git -C "$d" add api/go.mod
+  gcommit "$d" 'chore(deps): update module (#204)'
+  printf '# Changelog\n\n## [Unreleased]\n\n## [0.1.0] - 2026-09-01\n### Added\n- **Initial** (#100)\n' | put_changelog "$d"
+  plan_expect 'dependency citations make notes releasable' $'OP=nextrc\nTAG=v0.2.0-rc.11'
+  add_feature "$d" 205
+  mkdir -p "$d/changelog.d"
+  printf '### Fixed\n\n- **Fix feature (#205).**\n  Correct the observed behavior.\n' > "$d/changelog.d/01234567-89ab-4cde-8fab-0123456789ab.md"
+  plan_expect 'untracked fragment blocked' 'OP=blocked'
+  git -C "$d" add changelog.d
+  gcommit "$d" 'docs: add fragment'
+  plan_expect 'committed fragment accepted' $'OP=nextrc\nTAG=v0.2.0-rc.11'
+  git -C "$d" rm -q -- changelog.d/01234567-89ab-4cde-8fab-0123456789ab.md
+  gcommit "$d" 'chore: consume previous notes'
+  git -C "$d" tag v0.2.0-rc.11
+  export PLAN_PREVIOUS=v0.2.0-rc.11
+  add_feature "$d" 206
+  mkdir -p "$d/changelog.d"
+  printf '### Fixed\n\n- **Fix isolated feature (#206).**\n  The only pending note is this fragment.\n' > "$d/changelog.d/01234567-89ab-4cde-8fab-0123456789ab.md"
+  git -C "$d" add changelog.d
+  gcommit "$d" 'docs: isolated fragment'
+  plan_expect 'only committed fragment makes range releasable' $'OP=nextrc\nTAG=v0.2.0-rc.12\nSHIPPING_COUNT=1'
+  mkdir -p "$d/agent/codex"
+  echo 'runtime pin fixture' > "$d/agent/codex/codex-package.lock"
+  git -C "$d" add agent/codex/codex-package.lock
+  gcommit "$d" 'chore: change Codex runtime'
+  plan_expect 'Codex adoption requires a local cut' $'OP=blocked\nREASON=codex-runtime-needs-local-cut'
+  PLAN_PUBLICATION=failed plan_expect 'Codex block precedes liftable publication block' $'OP=blocked\nREASON=codex-runtime-needs-local-cut'
+  # A human's local cut establishes a new boundary after the adoption read.
+  git -C "$d" tag v0.2.0-rc.12
+  export PLAN_PREVIOUS=v0.2.0-rc.12
+  add_feature "$d" 207
+  plan_expect 'published local boundary clears adoption block' $'OP=nextrc\nTAG=v0.2.0-rc.13'
+  git -C "$d" checkout -q -b other
+  plan_expect 'non-main branch blocked' $'OP=blocked\nREASON=main-required'
+  git -C "$d" checkout -q main
+  git -C "$d" tag -d v0.1.0 v0.2.0-rc.9 v0.2.0-rc.10 v0.2.0-rc.11 v0.2.0-rc.12 >/dev/null
+  plan_expect 'first release remains local' $'OP=blocked\nREASON=initial-release-needs-local-cut'
+  plan_expect 'explicit first release remains local' $'OP=blocked\nREASON=initial-release-needs-local-cut' --version 0.1.0
+  git -C "$d" tag v0.2.0-rc.1
+  plan_expect 'abandon without stable boundary remains local' $'OP=blocked\nREASON=initial-release-needs-local-cut' --version 0.3.0 --abandon-train
+  output="$(cd "$d" && bash "$RC" --plan 0.1.0 2>&1)"; rc=$?
+  assert_eq 'plan positional base is usage error' 3 "$rc"
+  assert_contains 'plan positional base prints usage' usage: "$output"
+  output="$(cd "$d" && bash "$RC" --plan --version 2>&1)"; rc=$?
+  assert_eq 'missing version is usage error' 3 "$rc"
+  assert_contains 'missing version prints usage' usage: "$output"
+  echo "release plan: $PASSES passed, $FAILS failed"
+  [ "$FAILS" -eq 0 ]
+)
+if [ "${1:-}" = --plan-only ]; then
+  plan_regressions; exit $?
+fi
+if [ "$#" -eq 0 ]; then plan_regressions || fail "release planning regressions"; fi
+
 # Real cuts preserve published blocks while grouping newly pending categories.
 fold_order_regressions() {
   local d mode inventory version base before oldblock oldaddition section expected
@@ -731,7 +983,7 @@ fold_order_regressions() {
     done
   done
 }
-if [ "${1:-}" != "--fragments-only" ]; then
+if [ "${1:-}" != "--fragments-only" ] && [ "${1:-}" != "--plan-only" ]; then
 if [ "$#" -eq 0 ] || [ "${1:-}" = "--fold-order-only" ]; then fold_order_regressions; fi
 if [ "${1:-}" = "--fold-order-only" ]; then
   printf '=== fold ordering: %s passed, %s failed ===\n' "$PASSES" "$FAILS"
@@ -959,21 +1211,21 @@ ghcr_queries() {
   local label="$1" log="$2" owner="$3" text
   text="$(cat "$log")"
   assert_contains "$label identity lookup" 'repo view --json owner,name' "$text"
-  assert_contains "$label owner type lookup" 'api users/test --jq .type' "$text"
+  ghcr_absent "$label no owner-type lookup needed" 'api users/' "$text"
   local image line endpoint matched count
   # Each worker endpoint must be queried exactly once; argument order is unrestricted.
   for image in agent-base agent-jvm; do
-    endpoint="/${owner}/packages/container/uzi%2F${image}/versions"
+    endpoint="https://ghcr.io/v2/test/uzi/${image}/manifests/0.1.1"
     matched=""; count=0
     while IFS= read -r line; do
       case "$line" in *"$endpoint"*) matched="$line"; count=$((count + 1)) ;; esac
     done < "$log"
     assert_eq "$label $image queried once" 1 "$count"
-    assert_contains "$label $image endpoint" "$endpoint" "$matched"
-    assert_contains "$label $image pagination" --paginate "$matched"
-    assert_contains "$label $image tag projection" '.[].metadata.container.tags[]' "$matched"
+    assert_contains "$label $image endpoint ($owner)" "$endpoint" "$matched"
+    assert_contains "$label $image HEAD" --head "$matched"
+    assert_contains "$label $image pull scope" "scope=repository:test/uzi/${image}:pull" "$text"
   done
-  ghcr_absent "$label no unrelated package" 'uzi%2Fapi/' "$text"
+  ghcr_absent "$label no Packages REST" '/packages/container/' "$text"
 }
 ghcr_outcome() {
   local label="$1" image="$2" outcome="$3" output="$4" line found=""
@@ -985,7 +1237,7 @@ ghcr_outcome() {
   if [ -n "$found" ]; then pass "$label $image $outcome"; else fail "$label $image $outcome"; fi
 }
 ghcr_cut_case() {
-  local name="$1" mode="$2" base="$3" jvm="$4" d log before head_before version verb owner out_lower
+  local name="$1" mode="$2" base="$3" jvm="$4" d log before head_before version verb owner out_lower ci_mode=false strict_failure=0
   local failures_before="$FAILS"
   # M2 mutation runners may select one named priority/pin case without changing fixtures.
   [ -z "${GHCR_CASE_FILTER:-}" ] || [ "$name" = "$GHCR_CASE_FILTER" ] || return 0
@@ -995,11 +1247,15 @@ ghcr_cut_case() {
   case "$jvm" in absent) GHCR_JVM_OUT=0.2.0 ;; error) GHCR_JVM_RC=7 ;; esac
   owner=users/test
   case "$name" in
-    org-present) GHCR_KIND=Organization; owner=orgs/test ;;
+    org-present) GHCR_IDENTITY='Test uzi'; GHCR_KIND=Organization; owner=orgs/test ;;
     kind-fallback-present) GHCR_KIND=''; GHCR_KIND_RC=7 ;;
     identity-rc-present) GHCR_IDENTITY_RC=7 ;;
     identity-rc-missing) GHCR_IDENTITY_RC=7; GHCR_BASE_OUT=0.2.0 ;;
     unresolved-owner) GHCR_IDENTITY=''; GHCR_IDENTITY_RC=7 ;;
+    ci-owner-error) GHCR_IDENTITY=''; GHCR_IDENTITY_RC=7; ci_mode=true; strict_failure=1 ;;
+    ci-both-error|ci-present-error) ci_mode=true; strict_failure=1 ;;
+    ci-present|ci-promote-only) ci_mode=true ;;
+    cli-both-error) strict_failure=1 ;;
     empty-head-pin)
       sed 's/tag: "0.1.1"/tag: ""/' "$d/deploy/chart/values.yaml" > "$d/values.tmp"
       mv "$d/values.tmp" "$d/deploy/chart/values.yaml"
@@ -1016,10 +1272,16 @@ ghcr_cut_case() {
     promote-only) verb=--promote-only ;;
     auto-promote-only) version=0.3.0; verb=--promote ;;
   esac
-  if [ -n "$verb" ]; then run_rc "$d" "$version" "$verb"; else run_rc "$d" "$version"; fi
+  if [ "$name" = cli-both-error ]; then
+    run_rc "$d" "$version" --ci
+  elif [ -n "$verb" ]; then
+    CI="$ci_mode" run_rc "$d" "$version" "$verb"
+  else
+    CI="$ci_mode" run_rc "$d" "$version"
+  fi
   out_lower="$(printf '%s' "$RC_OUT" | tr '[:upper:]' '[:lower:]')"
   if [ "$base" != absent ] && [ "$jvm" != absent ] &&
-     [ "$name" != empty-head-pin ] && [ "$name" != unreadable-head-pin ]; then
+     [ "$name" != empty-head-pin ] && [ "$name" != unreadable-head-pin ] && [ "$strict_failure" = 0 ]; then
     assert_eq "$name succeeds" 0 "$RC_RC"
     case "$name" in
       both-error|present-error|unresolved-owner|identity-rc-present|identity-rc-missing)
@@ -1036,7 +1298,7 @@ ghcr_cut_case() {
     else
       if [ "$name" = unresolved-owner ] || [ "$name" = identity-rc-present ] || [ "$name" = identity-rc-missing ]; then
         assert_contains "$name identity attempted" 'repo view --json owner,name' "$(cat "$log")"
-        ghcr_absent "$name no package queries" '/packages/container/' "$(cat "$log")"
+        ghcr_absent "$name no registry queries" 'https://ghcr.io/' "$(cat "$log")"
       else
         ghcr_queries "$name" "$log" "$owner"
       fi
@@ -1058,6 +1320,12 @@ ghcr_cut_case() {
     assert_eq "$name HEAD tags refs reachable commits and tree unchanged" "$before" "$(ghcr_snapshot "$d")"
     assert_eq "$name clean tree after refusal" "" "$(git -C "$d" status --porcelain)"
     case "$name" in
+      ci-owner-error)
+        assert_contains "$name unresolved identity" 'resolve owner/repo' "$RC_OUT"
+        ghcr_absent "$name no registry queries" 'https://ghcr.io/' "$(cat "$log")" ;;
+      ci-both-error|ci-present-error|cli-both-error)
+        ghcr_queries "$name" "$log" "$owner"
+        assert_contains "$name query error refuses" 'query error' "$RC_OUT" ;;
       empty-head-pin|unreadable-head-pin)
         ghcr_absent "$name no package queries" '/packages/container/' "$(cat "$log")"
         assert_contains "$name instrument failure diagnostic" 'instrument' "$out_lower"
@@ -1157,12 +1425,12 @@ YAML
     # Verifier also checks the release artifacts; only inspect the worker endpoints here.
     local image endpoint matched line
     for image in agent-base agent-jvm; do
-      endpoint="/${owner}/packages/container/uzi%2F${image}/versions"; matched=""
+      endpoint="https://ghcr.io/v2/test/uzi/${image}/manifests/"; matched=""
       while IFS= read -r line; do
         case "$line" in *"$endpoint"*) matched="$line"; break ;; esac
       done < "$querylog"
-      assert_contains "verify $name $image owner endpoint" "$endpoint" "$matched"
-      assert_contains "verify $name $image pagination" --paginate "$matched"
+      assert_contains "verify $name $image registry endpoint ($owner)" "$endpoint" "$matched"
+      assert_contains "verify $name $image HEAD" --head "$matched"
     done
   fi
   case "$name" in
@@ -1218,6 +1486,44 @@ ghcr_reader_case() {
   printf 'GHCR_CASE=reader-%s READER_EXIT=%s ASSERTION_FAILURES=%s\n' "$name" "$rc" "$((FAILS - failures_before))"
   rm -rf "$d"
 }
+ghcr_registry_cases() {
+  local scenario wanted log out rc text
+  for scenario in present absent unauthorized forbidden redirect server network network-404 token-network token-http token-404 token-missing token-empty token-malformed token-conflict token-header token-space token-raw-cr token-escaped-key access-token multiline-token invalid-tag; do
+    [ -z "${GHCR_CASE_FILTER:-}" ] || [ "registry-$scenario" = "$GHCR_CASE_FILTER" ] || continue
+    ghcr_defaults
+    wanted=2
+    case "$scenario" in present|access-token|multiline-token) wanted=0 ;; absent) wanted=1 ;; esac
+    log="$(mktemp)"
+    out="$(
+      export GHCR_CURL_CASE="$scenario" GHCR_QUERY_LOG="$log"
+      export GH_TOKEN=credential-sentinel GITHUB_TOKEN=credential-sentinel
+      # shellcheck source=scripts/lib/ghcr.sh
+      . "$SCRIPTS_DIR/lib/ghcr.sh"
+      OWNER="test"; REPO=uzi; VERSION=0.1.1
+      [ "$scenario" != invalid-tag ] || VERSION='bad/tag'
+      img_has_tag agent-base
+    )"; rc=$?
+    text="$(cat "$log")"
+    assert_eq "anonymous registry $scenario status" "$wanted" "$rc"
+    assert_eq "anonymous registry $scenario no token output" '' "$out"
+    ghcr_absent "$scenario no personal credential" credential-sentinel "$text"
+    ghcr_absent "$scenario no Packages REST" /packages/container/ "$text"
+    if [ "$scenario" = invalid-tag ]; then
+      assert_eq 'invalid tag makes no registry request' '' "$text"
+    else
+      assert_contains "$scenario fixed anonymous token endpoint" 'https://ghcr.io/token' "$text"
+      assert_contains "$scenario read-only pull scope" 'scope=repository:test/uzi/agent-base:pull' "$text"
+      case "$scenario" in
+        token-*) ghcr_absent "$scenario stops before HEAD" /manifests/ "$text" ;;
+        *)
+          assert_contains "$scenario exact manifest" 'https://ghcr.io/v2/test/uzi/agent-base/manifests/0.1.1' "$text"
+          assert_contains "$scenario HEAD only" --head "$text"
+          ;;
+      esac
+    fi
+    rm -f "$log"
+  done
+}
 ghcr_regressions() {
   local baseline="$GHCR_BASELINE" record name
   if [ -n "$baseline" ]; then
@@ -1231,6 +1537,7 @@ ghcr_regressions() {
     echo "GHCR_CURRENT_LOG=$record"
     echo "  No frozen baseline supplied; asserting current verifier behavior only."
   fi
+  ghcr_registry_cases
   # Finite scenario matrices: assertion failures never prevent sibling scenarios.
   ghcr_cut_case missing-base default absent present
   ghcr_cut_case missing-jvm default present absent
@@ -1242,6 +1549,12 @@ ghcr_regressions() {
   ghcr_cut_case empty-head-pin default present present
   ghcr_cut_case unreadable-head-pin default present present
   ghcr_cut_case present default present present
+  ghcr_cut_case ci-present default present present
+  ghcr_cut_case ci-promote-only promote-only error error
+  ghcr_cut_case ci-both-error default error error
+  ghcr_cut_case ci-present-error default present error
+  ghcr_cut_case ci-owner-error default present present
+  ghcr_cut_case cli-both-error default error error
   ghcr_cut_case org-present default present present
   ghcr_cut_case kind-fallback-present default present present
   ghcr_cut_case identity-rc-present default present present
@@ -2819,7 +3132,7 @@ STUB
   rm -rf "$MF"
 done
 
-# A fragment-touch shipping commit needs the right identity in the assembled section.
+# A single new fragment receives its shipping introducer's identity at assembly.
 for identity in missing wrong correct; do
   MF="$(mktemp -d "$REPO_ROOT/.uzi/scratch/m2.XXXXXX")"; seed_repo "$MF"; write_fragment "$MF" 999
   case "$identity" in
@@ -2829,15 +3142,202 @@ for identity in missing wrong correct; do
   echo 'package main // ships' > "$MF/api/feature.go"
   git -C "$MF" add -- api/feature.go "$fragment_path"; gcommit "$MF" 'Feature (#201)'
   run_rc "$MF" 0.2.0
-  expected=1; [ "$identity" != correct ] || expected=0
-  assert_eq "shipping fragment $identity identity" "$expected" "$RC_RC"
-  if [ "$identity" != correct ]; then
-    assert_contains "$identity identity oracle refusal" 'VERIFY FAILED' "$RC_OUT"
-    assert_fragment_staged "$MF" "$identity identity"
-  else
+  assert_eq "shipping fragment $identity identity" 0 "$RC_RC"
+  assert_contains "$identity introducer citation" '[#201](https://github.com/vtmocanu/uzi/pull/201)' "$(cat "$MF/CHANGELOG.md")"
+  if [ "$identity" = correct ]; then
     assert_eq "correct identity rendered once" 1 "$(fragment_count "$MF" 201)"
     assert_contains "correct identity citation retained" '- **Fragment 201 ([#201](https://github.com/vtmocanu/uzi/pull/201)).**' "$(cat "$MF/CHANGELOG.md")"
   fi
+  rm -rf "$MF"
+done
+
+echo '=== fragment-introducer-citation (#3510) ==='
+for mode in squash merge merge-default rebase direct suffix code-paren prose-paren modified readded cited cited-description multiple multiple-covered unrelated equal-prose frozen history-error shipping-history-error unsafe-introduction citation-limit citation-total-limit; do
+  MF="$(mktemp -d "$REPO_ROOT/.uzi/scratch/citation.XXXXXX")"; seed_repo "$MF"
+  if [ "$mode" = frozen ]; then
+    add_feature "$MF" 201; commit_fragment "$MF" 201
+    run_rc "$MF" 0.2.0
+    assert_eq 'frozen citation fixture initial RC' 0 "$RC_RC"
+    git -C "$MF" tag v0.2.0-rc.1
+    awk '/^- \*\*Fragment 201 / { print; getline; print }' "$MF/CHANGELOG.md" > "$MF/.git/frozen-block"
+  fi
+  case "$mode" in merge|merge-default|rebase) git -C "$MF" checkout -qb delivery ;; esac
+  if [ "$mode" = readded ]; then
+    commit_fragment "$MF" 296
+    git -C "$MF" rm -q -- "$fragment_path"; gcommit "$MF" 'docs: retire old fragment (#1111)'
+  fi
+  write_fragment "$MF" 296
+  case "$mode" in
+    code-paren) printf '### Added\n\n- **Use f().**\n  Preserved description.\n' > "$MF/$fragment_path" ;;
+    prose-paren) printf '### Added\n\n- **Upgrade compiler (to 1.27).**\n  Preserved description.\n' > "$MF/$fragment_path" ;;
+  esac
+  if [ "$mode" = cited ] || [ "$mode" = multiple-covered ]; then
+    sed 's/(#296)/(#296, #3434)/' "$MF/$fragment_path" > "$MF/.git/note"
+    mv "$MF/.git/note" "$MF/$fragment_path"
+  fi
+  if [ "$mode" = multiple ] || [ "$mode" = multiple-covered ]; then
+    cp "$MF/$fragment_path" "$MF/$fragment_second"
+    if [ "$mode" = multiple-covered ]; then
+      sed 's/(#296, #3434)/(#296)/' "$MF/$fragment_second" > "$MF/.git/note"
+      mv "$MF/.git/note" "$MF/$fragment_second"
+    fi
+  fi
+  if [ "$mode" = cited-description ]; then
+    sed 's/Preserved description./Preserved description (#3434)./' "$MF/$fragment_path" > "$MF/.git/note"
+    mv "$MF/.git/note" "$MF/$fragment_path"
+  fi
+  if [ "$mode" = citation-limit ] || [ "$mode" = citation-total-limit ]; then
+    python3 - "$mode" "$MF/$fragment_path" "$MF/CHANGELOG.md" <<'PY'
+from pathlib import Path
+import sys
+mode, fragment, changelog = sys.argv[1:]
+if mode == "citation-limit":
+    prefix = b"### Added\n\n- **Fragment 296 (#296).**\n  "
+    Path(fragment).write_bytes(prefix + b"x" * (65536 - len(prefix) - 1) + b"\n")
+else:
+    prefix = b"\n### Added\n\n- **Legacy (#100).**\n  "
+    tail = b"\n\n"
+    padding = 4194304 - len(Path(fragment).read_bytes()) - len(prefix) - len(tail)
+    Path(changelog).write_bytes(b"# Changelog\n\n## [Unreleased]\n" + prefix + b"x" * padding + tail + b"## [0.1.0] - 2026-09-01\n- Initial (#100)\n")
+PY
+  fi
+  if [ "$mode" = unsafe-introduction ]; then
+    cp "$MF/$fragment_path" "$MF/.git/note"
+    rm "$MF/$fragment_path"
+    ln -s ../README.md "$MF/$fragment_path"
+  fi
+  echo 'package main // fragment introduction' > "$MF/api/delivery.go"
+  git -C "$MF" add -- api/delivery.go changelog.d CHANGELOG.md
+  subject='Delivery (#3434)'
+  case "$mode" in
+    direct) subject='Delivery without a PR suffix' ;;
+    suffix) subject='Delivery (#3434) followed by unrelated text' ;;
+    merge|merge-default) subject='Side implementation (#9999)' ;;
+  esac
+  gcommit "$MF" "$subject"
+  if [ "$mode" = merge ] || [ "$mode" = merge-default ]; then
+    git -C "$MF" checkout -q main
+    merge_subject='Delivery (#3434)'
+    [ "$mode" != merge-default ] || merge_subject='Merge pull request #3434 from owner/delivery'
+    git -C "$MF" merge -q --no-ff -m "$merge_subject" delivery
+  elif [ "$mode" = rebase ]; then
+    git -C "$MF" checkout -q main
+    echo 'Unrelated documentation.' > "$MF/README.md"; git -C "$MF" add README.md; gcommit "$MF" 'docs: unrelated main change'
+    git -C "$MF" checkout -q delivery
+    git -C "$MF" rebase -q main
+    git -C "$MF" checkout -q main
+    git -C "$MF" merge -q --ff-only delivery
+  fi
+  introduction="$(git -C "$MF" rev-parse --short HEAD)"
+  case "$mode" in
+    modified)
+      sed 's/Preserved description./Updated description./' "$MF/$fragment_path" > "$MF/.git/note"
+      mv "$MF/.git/note" "$MF/$fragment_path"
+      git -C "$MF" add -- "$fragment_path"; gcommit "$MF" 'docs: clarify pending description' ;;
+    unrelated)
+      echo 'package main // uncited delivery' > "$MF/api/unrelated.go"
+      git -C "$MF" add api/unrelated.go
+      gcommit "$MF" $'Other delivery (#3435)\n\nRefs #296' ;;
+    equal-prose)
+      cp "$MF/$fragment_path" "$MF/$fragment_second"
+      echo 'package main // independent introduction' > "$MF/api/second.go"
+      git -C "$MF" add -- api/second.go "$fragment_second"; gcommit "$MF" 'Independent delivery (#3435)'
+      printf '# Changelog\n\n## [Unreleased]\n### Added\n- **Fragment 296 (#296).**\n  Preserved description.\n\n## [0.1.0] - 2026-09-01\n- Initial (#100)\n' | put_changelog "$MF" ;;
+    unsafe-introduction)
+      rm "$MF/$fragment_path"; cp "$MF/.git/note" "$MF/$fragment_path"
+      git -C "$MF" add -- "$fragment_path"; gcommit "$MF" 'docs: regular pending fragment' ;;
+  esac
+  if [ "$mode" = history-error ] || [ "$mode" = shipping-history-error ]; then
+    mkdir "$MF/.git/bin"
+    cat > "$MF/.git/bin/git" <<'STUB'
+#!/usr/bin/env bash
+if [ "$CITATION_FAILURE" = shipping-history-error ] && [ "${1:-}" = log ] && [ "${2:-}" = --first-parent ]; then
+  for arg in "$@"; do
+    if [ "$arg" = "$CITATION_EXPECTED_RANGE" ]; then
+      printf 'shipping\n' > .git/history-error-reached
+      printf 'fixture shipping history unavailable\n' >&2
+      exit 23
+    fi
+  done
+fi
+for arg in "$@"; do
+  if [ "$CITATION_FAILURE" = history-error ] && [ "$arg" = --raw ]; then
+    printf 'reached\n' > .git/history-error-reached
+    printf 'fixture raw history unavailable\n' >&2
+    exit 23
+  fi
+done
+exec "$CITATION_REAL_GIT" "$@"
+STUB
+    chmod +x "$MF/.git/bin/git"
+  fi
+  start="$(git -C "$MF" rev-parse HEAD)"
+  cp "$MF/$fragment_path" "$MF/.git/input-before"
+  if [ "$mode" = squash ]; then
+    (cd "$MF" && bash scripts/changelog-fragments.sh render-unreleased CHANGELOG.md) > "$MF/.git/plain-before"
+    printf '%s\n' "$start" > "$MF/.git/shipping"
+    (cd "$MF" && bash scripts/changelog-fragments.sh render-unreleased CHANGELOG.md --cite-introducers "$(git rev-parse v0.1.0)" "$start" .git/shipping) > "$MF/.git/cited-view"
+    (cd "$MF" && bash scripts/changelog-fragments.sh render-unreleased CHANGELOG.md) > "$MF/.git/plain-after"
+    if cmp -s "$MF/.git/plain-before" "$MF/.git/plain-after"; then pass 'standalone rendering remains byte-identical'; else fail 'standalone rendering changed'; fi
+    assert_contains 'opt-in renderer cites captured introduction' '#3434' "$(cat "$MF/.git/cited-view")"
+    if cmp -s "$MF/.git/input-before" "$MF/$fragment_path"; then pass 'opt-in rendering preserves tracked fragment bytes'; else fail 'opt-in rendering edited tracked fragment'; fi
+  fi
+  if [ "$mode" = history-error ] || [ "$mode" = shipping-history-error ]; then
+    citation_real_git="$(command -v git)"
+    citation_range="$(git -C "$MF" rev-parse v0.1.0)..$start"
+    PATH="$MF/.git/bin:$PATH" CITATION_REAL_GIT="$citation_real_git" CITATION_FAILURE="$mode" CITATION_EXPECTED_RANGE="$citation_range" run_rc "$MF" 0.2.0
+  else
+    run_rc "$MF" 0.2.0
+  fi
+  case "$mode" in
+    history-error|shipping-history-error|unsafe-introduction|citation-limit|citation-total-limit)
+      assert_eq "$mode refuses before preparation" 3 "$RC_RC"
+      assert_eq "$mode HEAD unchanged" "$start" "$(git -C "$MF" rev-parse HEAD)"
+      assert_eq "$mode index/worktree unchanged" '' "$(git -C "$MF" status --porcelain --untracked-files=no)"
+      if [ "$mode" = history-error ]; then
+        assert_eq 'history producer failed at intended seam' reached "$(cat "$MF/.git/history-error-reached" 2>/dev/null)"
+        assert_contains 'raw history diagnostic preserved' 'fixture raw history unavailable' "$RC_OUT"
+      elif [ "$mode" = shipping-history-error ]; then
+        assert_eq 'shipping history producer failed at intended seam' shipping "$(cat "$MF/.git/history-error-reached" 2>/dev/null)"
+        assert_contains 'shipping history failure is explicit' 'could not read shipping history' "$RC_OUT"
+      fi
+      ;;
+    multiple|unrelated)
+      assert_eq "$mode unchanged oracle refuses uncovered merge" 1 "$RC_RC"
+      assert_contains "$mode oracle still authoritative" 'VERIFY FAILED' "$RC_OUT"
+      if [ "$mode" = unrelated ]; then assert_contains 'unrelated body reference does not cover delivery' '#3435' "$RC_OUT"; fi
+      ;;
+    *)
+      assert_eq "fragment-introducer-citation $mode succeeds" 0 "$RC_RC"
+      wanted='#3434'
+      case "$mode" in direct|suffix|merge-default) wanted="$introduction" ;; esac
+      assert_contains "$mode current introduction retained" "$wanted" "$(cat "$MF/CHANGELOG.md")"
+      description='Preserved description.'
+      case "$mode" in modified) description='Updated description.' ;; cited-description) description='Preserved description ([#3434](https://github.com/vtmocanu/uzi/pull/3434)).' ;; esac
+      assert_contains "$mode description preserved" "$description" "$(cat "$MF/CHANGELOG.md")"
+      assert_eq "$mode only captured fragments consumed" '' "$(git -C "$MF" ls-files -- "$fragment_path" "$fragment_second")"
+      assert_eq "$mode clean tracked inputs" '' "$(git -C "$MF" status --porcelain --untracked-files=no)"
+      if [ "$mode" = cited ] || [ "$mode" = cited-description ] || [ "$mode" = multiple-covered ]; then
+        assert_eq "$mode does not duplicate an existing identity" 1 "$(awk 'index($0, "#3434") { n++ } END { print n+0 }' "$MF/CHANGELOG.md")"
+      fi
+      if [ "$mode" = merge ] || [ "$mode" = merge-default ]; then
+        assert_eq 'side-branch identity is not borrowed' 0 "$(awk 'index($0, "#9999") { n++ } END { print n+0 }' "$MF/CHANGELOG.md")"
+      fi
+      if [ "$mode" = code-paren ]; then
+        assert_contains 'function-call headline remains intact' '- **Use f() ([#3434](https://github.com/vtmocanu/uzi/pull/3434)).**' "$(cat "$MF/CHANGELOG.md")"
+      elif [ "$mode" = prose-paren ]; then
+        assert_contains 'prose parenthetical remains intact' '- **Upgrade compiler (to 1.27) ([#3434](https://github.com/vtmocanu/uzi/pull/3434)).**' "$(cat "$MF/CHANGELOG.md")"
+      fi
+      if [ "$mode" = frozen ]; then
+        awk '/^- \*\*Fragment 201 / { print; getline; print }' "$MF/CHANGELOG.md" > "$MF/.git/frozen-after"
+        if cmp -s "$MF/.git/frozen-block" "$MF/.git/frozen-after"; then pass 'shipped RC block preserved byte-for-byte'; else fail 'shipped RC block changed'; fi
+      fi
+      if [ "$mode" = equal-prose ]; then
+        assert_eq 'equal prose remains three distinct notes' 3 "$(fragment_count "$MF" 296)"
+        assert_contains 'second equal-prose note keeps its own identity' '#3435' "$(cat "$MF/CHANGELOG.md")"
+      fi
+      ;;
+  esac
   rm -rf "$MF"
 done
 

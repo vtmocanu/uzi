@@ -102,6 +102,8 @@ WHERE id = (
              OR r.worker_id = c.id))
       AND r.kind = 'chat'
       AND r.status = 'queued'
+      -- PRD #3454 D2/D4: match ClaimRun's intake-pause admission conjunct.
+      AND (NOT (SELECT fn_instance_intake_paused()) OR fn_run_admitted_during_intake_pause(r))
       -- Match ClaimRun's released-incarnation exclusion BEFORE the UPDATE clears it.
       -- The materialized claimant holds the worker lock while comparing its current nonce.
       AND (r.released_worker_id IS NULL

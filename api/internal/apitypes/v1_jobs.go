@@ -38,8 +38,10 @@ type V1JobCreateRequest struct {
 // V1JobDTO is one job as the API shows it. Status is the small public vocabulary
 // (queued, running, waiting, completed, failed, cancelled), never the internal run status.
 // FailureReason is a bounded, secret-scrubbed human message, set only for a failed job.
-// WallSeconds is the job's wall-clock limit in seconds, null while the instance default
-// applies.
+// WallSeconds is the job's wall-clock limit in seconds, frozen at creation (the requested value,
+// else the instance default, capped at the ceiling); it counts from claim, not from queueing, so
+// a job held in the queue by maintenance mode loses none of it. It is null only for a job created
+// before defaults were frozen at create.
 type V1JobDTO struct {
 	ID               string     `json:"id"`
 	Type             string     `json:"type"`
@@ -51,6 +53,13 @@ type V1JobDTO struct {
 	CreatedAt        time.Time  `json:"created_at"`
 	StartedAt        *time.Time `json:"started_at"`
 	FinishedAt       *time.Time `json:"finished_at"`
+	// QueueReason is "maintenance" while instance maintenance mode holds this queued job back
+	// (PRD #3454); absent otherwise. Status stays "queued".
+	QueueReason *string `json:"queue_reason,omitempty"`
+	// Notice is create-only (POST /api/v1/jobs): a human-readable line, present while instance
+	// maintenance mode is active, saying the job is queued and starts when maintenance ends.
+	// Absent on GET and list responses and when maintenance is off.
+	Notice *string `json:"notice,omitempty"`
 }
 
 // V1JobListDTO is one page of GET /api/v1/jobs, newest first. NextCursor is null on the

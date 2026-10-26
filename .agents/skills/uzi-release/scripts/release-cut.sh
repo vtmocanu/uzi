@@ -10,7 +10,7 @@
 # the RC tag on main can follow its push immediately: publish gates enforce CI coverage.
 # A tag push publishes unattended, so it needs the user's go-ahead (without one the harness classifier blocks it).
 #
-#   release-cut.sh <X.Y.Z> [VERB] [--changelog-file FILE] [--no-commit] [--prev-tag TAG]
+#   release-cut.sh <X.Y.Z> [VERB] [--changelog-file FILE] [--no-commit] [--prev-tag TAG] [--ci]
 #
 #   <X.Y.Z>   the STABLE version a candidate is being cut FOR (leading v optional).
 #             The script derives the tag: vX.Y.Z-rc.N by default, vX.Y.Z with --stable.
@@ -39,50 +39,74 @@
 #   --no-commit       stage every edit but do not commit (and so do not run the oracle).
 #                     Applies to the main half only; rejected with --promote.
 #   --prev-tag TAG    override the derived coverage-window base tag (a repair).
+#   --ci              refuse unknown worker-pin publication state (also CI=true).
 #
 # The prerelease form is exactly vX.Y.Z-rc.N (N from 1); nothing else (D2). Tag discovery
 # never sorts a mixed stable/prerelease list: stable tags are filtered first and the
 # in-flight RC is found by grouping per base and comparing N numerically (D1).
 #
-# Exit codes: 0 ready;  1 a step/verify failed (tree left recoverable);  3 usage /
+#   --plan [--version X.Y.Z] [--abandon-train] prints a scheduled-RC decision,
+#             without fetching or changing Git state, CHANGELOG or fragments. The
+#             caller refreshes refs. Validators remove snapshots but may leave an
+#             empty .uzi/scratch directory.
+#             Eight KEY=VALUE lines: OP, BASE, TAG, REASON, SHIPPING_COUNT,
+#             PREVIOUS_TAG, PUBLICATION_STATE, HEAD_SHA. OP is nextrc/new-base/noop/blocked.
+#             Exit 0 includes noop/blocked, including failed API/fragment reads;
+#             exit 2 is reserved for Git/history instruments, exit 3 for usage.
+#             No-op is a scheduled policy; manual cuts keep their
+#             existing empty-delta behavior. Tip CI waiting is a separate operation.
+#
+# Exit codes (cut mode): 0 ready;  1 a step/verify failed (tree left recoverable);  3 usage /
 #             precondition failure, or a refusal that needs a verb.
 #
 # NEVER skip-ci a release commit: skip markers suppress tag publish workflows too.
 set -uo pipefail
 
-VERSION=""; VERB=""; CL_FILE=""; DO_COMMIT=1; PREV_OVERRIDE=""
+VERSION=""; VERB=""; CL_FILE=""; DO_COMMIT=1; PREV_OVERRIDE=""; PLAN=0; ABANDON_TRAIN=0; VERSION_OPTION=0; POSITIONAL_VERSION=0
+CI_STRICT=0
+case "${CI:-}" in true|1) CI_STRICT=1 ;; esac
+cut_usage() {
+  printf '%s\n' 'usage: release-cut.sh <X.Y.Z> [--promote|--promote-only|--skip-promote|--stable] [--changelog-file FILE] [--no-commit] [--prev-tag TAG] [--ci]' \
+    '       release-cut.sh --plan [--version X.Y.Z] [--abandon-train] [--ci]' >&2
+  exit 3
+}
 set_verb() {
   if [ -n "$VERB" ]; then echo "release-cut: only one of --promote/--promote-only/--skip-promote/--stable" >&2; exit 3; fi
   VERB="$1"
 }
 while [ $# -gt 0 ]; do
   case "$1" in
+    --plan) PLAN=1; shift;;
+    --version)
+      [ "$#" -ge 2 ] && [ -n "$2" ] && [[ "$2" != -* ]] || cut_usage
+      VERSION="$2"; VERSION_OPTION=1; shift 2;;
+    --abandon-train) ABANDON_TRAIN=1; shift;;
     --promote|--promote-only|--skip-promote|--stable) set_verb "$1"; shift;;
     --changelog-file) CL_FILE="${2:?}"; shift 2;;
     --no-commit) DO_COMMIT=0; shift;;
     --prev-tag) PREV_OVERRIDE="${2:?}"; shift 2;;
+    --ci) CI_STRICT=1; shift;;
     -h|--help) awk 'NR > 1 { if (/^#/) print; else exit }' "$0"; exit 3;;
     -*) echo "release-cut: unknown flag $1" >&2; exit 3;;
-    *) if [ -z "$VERSION" ]; then VERSION="$1"; shift
-       else echo "release-cut: unexpected arg: $1" >&2; exit 3; fi ;;
+    *) if [ -z "$VERSION" ]; then VERSION="$1"; POSITIONAL_VERSION=1; shift
+       else echo "release-cut: unexpected arg: $1" >&2; cut_usage; fi ;;
   esac
 done
-if [ -z "$VERSION" ]; then
-  echo "usage: release-cut.sh <X.Y.Z> [--promote|--promote-only|--skip-promote|--stable] [--changelog-file FILE] [--no-commit] [--prev-tag TAG]" >&2
-  exit 3
+if { [ -z "$VERSION" ] && [ "$PLAN" -eq 0 ]; } || { [ "$PLAN" -eq 1 ] && [ "$POSITIONAL_VERSION" -eq 1 ]; }; then
+  cut_usage
 fi
 VERSION="${VERSION#v}"
 # The INPUT is always a stable base X.Y.Z (the version a candidate is cut FOR); the tag
 # shape is derived. Reject a prerelease/other suffix on the input (D2).
-if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+if [ "$PLAN" -eq 0 ] && ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   echo "release-cut: '$VERSION' is not a stable X.Y.Z version (pass the base; the RC suffix is derived)" >&2; exit 3
 fi
-if [ "$DO_COMMIT" -eq 0 ] && [ "$VERB" = "--promote" ]; then
+if [ "$PLAN" -eq 0 ] && [ "$DO_COMMIT" -eq 0 ] && [ "$VERB" = "--promote" ]; then
   echo "release-cut: --no-commit is rejected with --promote (the promote half tags unconditionally)" >&2; exit 3
 fi
 # --promote-only has no main half, so every main-half option is meaningless with it. Refuse
 # rather than ignore: a lead passing a changelog draft expects a next candidate to be cut.
-if [ "$VERB" = "--promote-only" ] && { [ -n "$CL_FILE" ] || [ "$DO_COMMIT" -eq 0 ] || [ -n "$PREV_OVERRIDE" ]; }; then
+if [ "$PLAN" -eq 0 ] && [ "$VERB" = "--promote-only" ] && { [ -n "$CL_FILE" ] || [ "$DO_COMMIT" -eq 0 ] || [ -n "$PREV_OVERRIDE" ]; }; then
   echo "release-cut: --promote-only takes no --changelog-file/--no-commit/--prev-tag (it cuts no next candidate and never touches main; use --promote to cut one in lockstep)" >&2; exit 3
 fi
 TODAY="$(date +%F)"
@@ -131,8 +155,8 @@ highest_stable() {
 # enters (D1).
 inflight_rc() {
   local stables
-  stables="$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//' | tr '\n' ' ')"
-  git tag -l 'v*-rc.*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$' | awk -v stables="$stables" '
+  stables="$(git tag -l 'v*' | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/ { sub(/^v/, ""); printf "%s ", $0 }')" || return 1
+  git tag -l 'v*-rc.*' | awk -v stables="$stables" '
     function gt(x, y,   ax, ay) {
       split(x, ax, "\\."); split(y, ay, "\\.")
       if (ax[1]+0 != ay[1]+0) return ax[1]+0 > ay[1]+0
@@ -140,7 +164,7 @@ inflight_rc() {
       return ax[3]+0 > ay[3]+0
     }
     BEGIN { n = split(stables, arr, " "); for (i = 1; i <= n; i++) { hasstable[arr[i]] = 1; if (hs == "" || gt(arr[i], hs)) hs = arr[i] } }
-    {
+    /^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$/ {
       tag = $0; b = tag; sub(/^v/, "", b); sub(/-rc\..*$/, "", b)
       rc = tag; sub(/^.*-rc\./, "", rc)
       if (b in hasstable) next
@@ -166,13 +190,17 @@ prev_stable_below() {
 changelog_unreleased_body() {
   printf '%s\n' "$PENDING_BODY"
 }
-# shipping_commits_since <ref> -> one SHA per first-parent commit in <ref>..HEAD that touched
-# a SHIPPING path (is_shipping, shared with the oracle). This is what promote-only keys on:
+# shipping_commits_since <ref> [tip] -> one SHA per first-parent shipping commit.
+# Uses is_shipping, shared with the oracle. This is what promote-only keys on:
 # a docs/skill/prd/build-only commit after the RC must NOT force a next candidate that ships
 # nothing (with an empty [Unreleased] and no draft, preflight would refuse the promotion).
 # Counting raw `git log` commits conflated the two.
 shipping_commits_since() {
-  local sha f shipping files_fd files_pid
+  local sha f shipping files_fd files_pid commits
+  if ! commits="$(git log --first-parent --format=%H "$1..${2:-HEAD}")"; then
+    echo 'release-cut: could not read shipping history' >&2
+    return 1
+  fi
   while IFS= read -r sha; do
     [ -n "$sha" ] || continue
     shipping=0
@@ -201,7 +229,7 @@ shipping_commits_since() {
     fi
     if [ "$shipping" = 1 ]; then printf '%s\n' "$sha"; fi
   done <<EOF
-$(git log --first-parent --format=%H "$1..HEAD" 2>/dev/null)
+$commits
 EOF
 }
 # rc_tag_on_remote <tag> -> 0 present on origin, 2 absent from origin, 3 origin
@@ -221,6 +249,161 @@ rc_tag_on_remote() {
     *) return 3 ;;
   esac
 }
+
+# dependency_merge_refs <prev> -> one citation per first-parent merge in <prev>..HEAD that
+# the per-PR check spared as a dependency bump (scripts/lib/dependency-bump.sh): a
+# dependency-typed subject, at least one shipping path, every shipping path a dependency
+# manifest, CHANGELOG.md untouched and no `Changelog: none` (the oracle skips those two
+# anyway). Each line is `<citation><TAB><short SHA>`: the citation is the subject's trailing
+# PR number `#N`, else the short SHA; the oracle accepts either, so both identities are
+# carried to the already-cited check. Empty <prev> (first release ever) yields nothing.
+dependency_merge_refs() {
+  local prev="$1" sha subject f shipping manifest_only touched_cl pr short files_fd files_pid
+  [ -n "$prev" ] || return 0
+  while IFS= read -r sha; do
+    [ -n "$sha" ] || continue
+    subject="$(git log -1 --format=%s "$sha")"
+    is_dependency_subject "$subject" || continue
+    if git log -1 --format=%B "$sha" | grep -iE '^Changelog:[[:space:]]*none' >/dev/null; then continue; fi
+    # A failed listing aborts this scan before any dependency citations are used.
+    exec {files_fd}< <(
+      listing_tmp="$(mktemp)" || exit 1
+      listing_rc=0
+      if git diff --name-only -z "$sha^1" "$sha" > "$listing_tmp" 2>/dev/null ||
+         git show --name-only --format= -z "$sha" > "$listing_tmp"; then
+        cat "$listing_tmp" || listing_rc=$?
+      else
+        listing_rc=$?
+      fi
+      rm -f "$listing_tmp"
+      exit "$listing_rc"
+    )
+    files_pid=$!
+    shipping=0; manifest_only=1; touched_cl=0
+    while IFS= read -r -d '' f; do
+      [ -n "$f" ] || continue
+      [ "$f" != CHANGELOG.md ] || touched_cl=1
+      is_shipping "$f" || continue
+      shipping=1
+      is_dependency_manifest "$f" || manifest_only=0
+    done <&"$files_fd"
+    exec {files_fd}<&-
+    if ! wait "$files_pid"; then
+      echo "release-cut: could not list changed paths for $sha" >&2
+      return 1
+    fi
+    [ "$shipping" = 1 ] && [ "$manifest_only" = 1 ] && [ "$touched_cl" = 0 ] || continue
+    pr="$(printf '%s\n' "$subject" | sed -nE 's/.*\(#([0-9]+)\)[[:space:]]*$/\1/p')"
+    short="$(git rev-parse --short "$sha")"
+    if [ -n "$pr" ]; then printf '#%s\t%s\n' "$pr" "$short"; else printf '%s\t%s\n' "$short" "$short"; fi
+  done <<EOF
+$(git log --first-parent --reverse --format=%H "$prev..HEAD")
+EOF
+}
+
+# --plan is deliberately before every fetch, index edit and release mutation.
+# Scratch snapshots use the cutter's existing bounded validators and clean traps.
+release_plan() (
+  export GIT_OPTIONAL_LOCKS=0
+  git() { command git -c core.fsmonitor=false "$@"; }
+  export -f git
+  local op=blocked base='' tag='' reason=unspecified count=0 previous='' publication=not-applicable head stable candidate cb cn sha parent metadata_rc publication_rc runtime_rc shipping paths fragment pending deps
+  head="$(git rev-parse --verify HEAD)" || return 2
+  emit_plan() {
+    printf 'OP=%s\nBASE=%s\nTAG=%s\nREASON=%s\nSHIPPING_COUNT=%s\nPREVIOUS_TAG=%s\nPUBLICATION_STATE=%s\nHEAD_SHA=%s\n' \
+      "$op" "$base" "$tag" "$reason" "$count" "$previous" "$publication" "$head"
+  }
+  block_plan() { op=blocked; reason=$1; emit_plan; exit 0; }
+  [ -z "$VERB" ] && [ -z "$CL_FILE" ] && [ "$DO_COMMIT" -eq 1 ] && [ -z "$PREV_OVERRIDE" ] || block_plan unsupported-plan-option
+  if [ -n "$VERSION" ] && ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+    block_plan invalid-version
+  fi
+  paths="$(git status --porcelain --untracked-files=no)" || return 2
+  [ -z "$paths" ] || block_plan dirty-tracked-tree
+  [ "$(git symbolic-ref -q --short HEAD)" = main ] || block_plan main-required
+  stable="$(highest_stable)" || return 2
+  candidate="$(inflight_rc)" || return 2
+  [ -n "$stable$candidate" ] || block_plan initial-release-needs-local-cut
+  if [ -n "$candidate" ]; then
+    cb="${candidate#v}"; cb="${cb%-rc.*}"; cn="${candidate##*-rc.}"
+    previous=$candidate
+    base=${VERSION:-$cb}
+    if [ "$base" != "$cb" ]; then
+      [ "$ABANDON_TRAIN" -eq 1 ] || block_plan open-train-needs-abandon
+      [ "$(ver_cmp "$base" "$cb")" = 1 ] || block_plan abandon-needs-higher-base
+      previous="$(prev_stable_below "$base")" || return 2
+      [ -n "$previous" ] || block_plan initial-release-needs-local-cut
+      tag="v$base-rc.1"; op='new-base'
+    else
+      [ "$ABANDON_TRAIN" -eq 0 ] || block_plan abandon-needs-higher-base
+      tag="v$base-rc.$((10#$cn + 1))"; op=nextrc
+    fi
+  else
+    previous=$stable
+    [ "$ABANDON_TRAIN" -eq 0 ] || block_plan no-train-to-abandon
+    if [ -n "$VERSION" ]; then
+      base=$VERSION
+    elif [ -n "$stable" ] && [[ "$stable" =~ ^v0\.([0-9]+)\.[0-9]+$ ]]; then
+      base="0.$((10#${BASH_REMATCH[1]} + 1)).0"
+    else
+      block_plan explicit-base-policy-required
+    fi
+    if [ -n "$stable" ] && [ "$(ver_cmp "$base" "${stable#v}")" != 1 ]; then
+      block_plan version-not-above-stable
+    fi
+    tag="v$base-rc.1"; op='new-base'
+  fi
+  # Adoption still needs a local review/cut. Check before the publication refusal,
+  # which an explicitly authorized supersede may lift in the CI orchestrator.
+  git diff --quiet --no-ext-diff --no-textconv "$previous" "$head" -- agent/codex/codex-package.lock
+  runtime_rc=$?
+  case "$runtime_rc" in
+    0) : ;;
+    1) block_plan codex-runtime-needs-local-cut ;;
+    *) return 2 ;;
+  esac
+  # Check the previous publication even for a zero-delta scheduled attempt.
+  if [ -n "$previous" ]; then
+    publication="$(python3 -I "$ROOT/scripts/release-ci-coverage.py" publication "$previous" --tag "$previous")"
+    publication_rc=$?
+    case "$publication_rc" in
+      0) : ;;
+      1) publication=unknown; block_plan previous-publication-unreadable ;;
+      *) return 2 ;;
+    esac
+    if [ "$publication" != success ]; then
+      block_plan previous-publication-not-successful
+    fi
+  fi
+  shipping="$(shipping_commits_since "$previous" "$head")" || return 2
+  while IFS= read -r sha; do
+    [ -n "$sha" ] || continue
+    parent="$(git rev-parse --verify "$sha^1")" || return 2
+    python3 -I "$ROOT/scripts/release-ci-coverage.py" metadata "$parent" "$sha" >/dev/null 2>&1
+    metadata_rc=$?
+    case "$metadata_rc" in 0) continue ;; 1) : ;; *) return 2 ;; esac
+    count=$((count + 1))
+  done <<< "$shipping"
+  paths="$(bash "$ROOT/scripts/changelog-fragments.sh" list)" || { block_plan invalid-pending-fragments; }
+  while IFS= read -r fragment; do
+    [ -n "$fragment" ] || continue
+    [ "$(git ls-tree "$head" -- "$fragment" | awk '{print $1}')" = 100644 ] || { block_plan uncommitted-fragment; }
+  done <<< "$paths"
+  pending="$(bash "$ROOT/scripts/changelog-fragments.sh" render-unreleased CHANGELOG.md)" || { block_plan invalid-pending-notes; }
+  deps="$(dependency_merge_refs "$previous")" || return 2
+  if [ "$count" -eq 0 ]; then
+    op=noop; reason=no-new-shipping-change
+  elif [ -z "$deps" ] && ! printf '%s\n' "$pending" | awk '/^- / { found=1 } END { exit !found }'; then
+    op=noop; reason=no-releasable-notes
+  else
+    reason=ready
+  fi
+  emit_plan
+)
+if [ "$PLAN" -eq 1 ]; then release_plan; exit $?; fi
+if [ "$ABANDON_TRAIN" -ne 0 ] || [ "$VERSION_OPTION" -ne 0 ]; then
+  echo 'release-cut: --version/--abandon-train are only available with --plan; local cuts use the positional base/--skip-promote' >&2; exit 3
+fi
 
 # --- preconditions ------------------------------------------------------------
 if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
@@ -286,6 +469,14 @@ raw_pending_body() (
     }
   ' "$work/source"
 )
+render_cited_pending() (
+  local work
+  mkdir -p .uzi/scratch || return 1
+  work="$(mktemp -d .uzi/scratch/release-citations.XXXXXX)" || return 1
+  trap 'rm -rf "$work"' EXIT
+  shipping_commits_since "$1" "$2" > "$work/shipping" || return 1
+  bash "$FRAGMENT_CLI" render-unreleased CHANGELOG.md --cite-introducers "$1" "$2" "$work/shipping"
+)
 if [ "$VERB" = --promote-only ] || [ -n "$CL_FILE" ]; then
   if ! PENDING_BODY="$(raw_pending_body)"; then exit 3; fi
 else
@@ -329,6 +520,10 @@ if [ "$VERB" != "--promote-only" ]; then
   fi
   ghcr_resolve_owner; owner_rc=$?
   if [ "$owner_rc" -ne 0 ]; then
+    if [ "$CI_STRICT" = 1 ]; then
+      echo "release-cut: worker pin pre-flight refused: could not resolve owner/repo in CI" >&2
+      exit 3
+    fi
     echo "release-cut: warning: worker pin pre-flight for $PIN could not resolve owner/repo; continuing with the publish gate as authority" >&2
   else
     pin_absent=0; pin_error=0; pin_outcomes=""
@@ -348,6 +543,11 @@ if [ "$VERB" != "--promote-only" ]; then
       echo "the pinned tag's publication did not complete; re-run or complete the release.yml publish for that tag, confirm both worker images exist (e.g. release-verify.sh on that tag), then re-run the cut." >&2
       exit 3
     elif [ "$pin_error" -eq 1 ]; then
+      if [ "$CI_STRICT" = 1 ]; then
+        echo "release-cut: worker pin pre-flight refused: query error for $PIN in CI" >&2
+        printf '%s' "$pin_outcomes" >&2
+        exit 3
+      fi
       echo "release-cut: warning: worker pin pre-flight for $PIN encountered a query error; continuing with the publish gate as authority" >&2
     fi
   fi
@@ -606,57 +806,6 @@ run_links() {
   bash scripts/changelog-links.sh || { echo "release-cut: changelog-links.sh failed" >&2; exit 1; }
 }
 
-# dependency_merge_refs <prev> -> one citation per first-parent merge in <prev>..HEAD that
-# the per-PR check spared as a dependency bump (scripts/lib/dependency-bump.sh): a
-# dependency-typed subject, at least one shipping path, every shipping path a dependency
-# manifest, CHANGELOG.md untouched and no `Changelog: none` (the oracle skips those two
-# anyway). Each line is `<citation><TAB><short SHA>`: the citation is the subject's trailing
-# PR number `#N`, else the short SHA; the oracle accepts either, so both identities are
-# carried to the already-cited check. Empty <prev> (first release ever) yields nothing.
-dependency_merge_refs() {
-  local prev="$1" sha subject f shipping manifest_only touched_cl pr short files_fd files_pid
-  [ -n "$prev" ] || return 0
-  while IFS= read -r sha; do
-    [ -n "$sha" ] || continue
-    subject="$(git log -1 --format=%s "$sha")"
-    is_dependency_subject "$subject" || continue
-    if git log -1 --format=%B "$sha" | grep -iE '^Changelog:[[:space:]]*none' >/dev/null; then continue; fi
-    # A failed listing aborts this scan before any dependency citations are used.
-    exec {files_fd}< <(
-      listing_tmp="$(mktemp)" || exit 1
-      listing_rc=0
-      if git diff --name-only -z "$sha^1" "$sha" > "$listing_tmp" 2>/dev/null ||
-         git show --name-only --format= -z "$sha" > "$listing_tmp"; then
-        cat "$listing_tmp" || listing_rc=$?
-      else
-        listing_rc=$?
-      fi
-      rm -f "$listing_tmp"
-      exit "$listing_rc"
-    )
-    files_pid=$!
-    shipping=0; manifest_only=1; touched_cl=0
-    while IFS= read -r -d '' f; do
-      [ -n "$f" ] || continue
-      [ "$f" != CHANGELOG.md ] || touched_cl=1
-      is_shipping "$f" || continue
-      shipping=1
-      is_dependency_manifest "$f" || manifest_only=0
-    done <&"$files_fd"
-    exec {files_fd}<&-
-    if ! wait "$files_pid"; then
-      echo "release-cut: could not list changed paths for $sha" >&2
-      return 1
-    fi
-    [ "$shipping" = 1 ] && [ "$manifest_only" = 1 ] && [ "$touched_cl" = 0 ] || continue
-    pr="$(printf '%s\n' "$subject" | sed -nE 's/.*\(#([0-9]+)\)[[:space:]]*$/\1/p')"
-    short="$(git rev-parse --short "$sha")"
-    if [ -n "$pr" ]; then printf '#%s\t%s\n' "$pr" "$short"; else printf '%s\t%s\n' "$short" "$short"; fi
-  done <<EOF
-$(git log --first-parent --reverse --format=%H "$prev..HEAD")
-EOF
-}
-
 # autocite_dependency_merges <base>: cite every DEP_REFS merge the [base] section does not
 # already cite by either identity (the oracle's own matching: `#N` not followed by a digit,
 # or the literal short SHA) in a fresh `### Changed` bullet. Never extend an earlier
@@ -887,6 +1036,10 @@ else
 fi
 if ! DEP_REFS="$(dependency_merge_refs "$PREV")"; then
   exit 3
+fi
+if [ -z "$CL_FILE" ] && [ -n "$PREV" ] && [ "${#INCORPORATED[@]}" -gt 0 ]; then
+  PREV_SHA="$(git rev-parse --verify "$PREV^{commit}")" || exit 3
+  if ! PENDING_BODY="$(render_cited_pending "$PREV_SHA" "$STARTING_SHA")"; then exit 3; fi
 fi
 
 # Refuse empty new-base cuts before publishing the assembled view. Dependency-only

@@ -2116,8 +2116,8 @@ rationale.
   broken relative link (doc→doc or doc→img), reference-style links, or an
   oversized `docs/img/*` file; it warns (without failing) on a `user` page over
   the 60-line house-style budget.
-  It runs both locally (ahead of `npm run build`) and in CI (`validate:web`
-  runs `npm run check-docs` too, PRD #52), so a broken doc fails the pipeline as
+  It runs both locally (ahead of `npm run build`) and in CI (`validate-web`
+  runs `task check-docs:web` too, PRD #52), so a broken doc fails the pipeline as
   well as the local build.
 
 ## Deployment: compose (laptop) and k8s
@@ -2540,6 +2540,16 @@ so ordinary coverage guarantees require compatible controllers. No worker-image
 protocol requirement or activation flag is added. Contract and rationale:
 [ADR-422 D5a](adr/0422-decouple-worker-version.md#d5a--owner-manual-cordon-is-persistent-intent-scope-amendment-2026-10-22);
 user lifecycle: [manual cordon](docs/hosted-workers.md#pause-new-work-with-a-manual-cordon).
+
+Instance maintenance mode ([PRD #3454](prds/done/3454-instance-maintenance-mode.md))
+is a separate instance-wide intake pause: a singleton `instance_intake_pause` row
+read by SQL function `fn_instance_intake_paused()`. Its conjunct sits in exactly
+the two claim statements, `ClaimRun` and `ClaimChatRun`, and admits only runs with
+`claim_generation > 0` or `cross_check` children; it is deliberately not folded
+into `fn_worker_accepts_new_intake`, so capacity, capability and roll projections
+stay truthful. The ephemeral provisioner rechecks it in SQL per candidate and
+inside all three demand queries. The controller is unchanged. Web-only writer;
+operator guide: [instance maintenance](docs/instance-maintenance.md).
 
 Under #3103, actual spec-hash/generation drift (image pin, template or size) and
 associated recycle wait indefinitely for genuine idle, including run-bound

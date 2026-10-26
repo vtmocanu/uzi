@@ -87,6 +87,9 @@ type Store interface {
 	OldestUndispatchedTaskRun(ctx context.Context) (pgtype.Timestamptz, error)
 	// schedules.paused: count of users with a pause-all and >= 1 enabled schedule.
 	CountUsersPausedWithEnabledSchedules(ctx context.Context, now pgtype.Timestamptz) (int64, error)
+	// maintenance.active: the instance intake-pause singleton (pgx.ErrNoRows when the row was
+	// deleted, which fn_instance_intake_paused reads as paused).
+	GetInstanceIntakePause(ctx context.Context) (store.InstanceIntakePause, error)
 	// board.drift: given-up column moves in a cutoff window (issue_iid filtered in Go, D12).
 	ListGaveUpColumnMoves(ctx context.Context, arg store.ListGaveUpColumnMovesParams) ([]store.ListGaveUpColumnMovesRow, error)
 	// custody.holds: owners at/over the custody admission limit.
@@ -146,8 +149,12 @@ type Config struct {
 	// nil reads as "nobody gated", so fleet.memory_authority is ok.
 	MemoryAuthorityLost func(workerID uuid.UUID) (time.Time, bool)
 	Store               Store
-	Pool                *pgxpool.Pool
-	Settings            Settings
+	// MaintenanceReadout reads the maintenance drain readout (PRD #3454), called only while
+	// maintenance is active; wired to store.ReadMaintenanceReadout over the pool. nil leaves
+	// the counts out of maintenance.active's evidence.
+	MaintenanceReadout func(context.Context) (store.MaintenanceReadout, error)
+	Pool               *pgxpool.Pool
+	Settings           Settings
 	// DiskFull is the shared disk-full (SQLSTATE 53100) sighting signal fed by the api
 	// pool's query tracer. nil means the db check never reports disk-full.
 	DiskFull *dbdiskfull.Signal
@@ -309,6 +316,7 @@ func (s *Service) Evaluate(ctx context.Context) (Doc, error) {
 		s.checkForgeSync(ctx, now),
 		s.checkSlackSocket(now),
 		s.checkSchedulesPaused(ctx, now),
+		s.checkMaintenanceActive(ctx),
 		s.checkBoardDrift(ctx, now),
 		s.checkCustodyHolds(ctx, now),
 		s.checkRecoveryStorage(ctx, now),

@@ -32,6 +32,8 @@ vi.mock("../lib/api", async (importActual) => {
       updateCheckAgentSource: vi.fn(),
       getReleaseCheck: vi.fn(),
       checkReleaseNow: vi.fn(),
+      getAdminMaintenance: vi.fn(),
+      setMaintenance: vi.fn(),
     },
   };
 });
@@ -208,6 +210,12 @@ beforeEach(() => {
   mockApi.getReleaseCheck.mockResolvedValue({ release_check: releaseCheck() });
   mockApi.checkReleaseNow.mockResolvedValue({ release_check: releaseCheck() });
   mockApi.vaultMigration.mockResolvedValue({ master_sealed: 0 });
+  // PRD #3454: the Maintenance card self-loads; off with a clear readout.
+  const none = { count: 0, items: [] };
+  mockApi.getAdminMaintenance.mockResolvedValue({
+    state: { active: false, since: null, reason: null, by_label: null },
+    readout: { as_of: "2026-10-25T12:00:00Z", clear: true, active: none, held: none, custody: none, queued: none, idle_bound_workers: none },
+  });
   // Old caller-scoped fetch control: no cross-user repositories are returned here.
   mockApi.listRepos.mockResolvedValue({ repos: [] });
   mockApi.adminListDockerAllowlistRepos.mockResolvedValue({
@@ -256,7 +264,7 @@ describe("agent-source Health navigation", () => {
     const check = doc.checks.find((c) => c.id === "agentsource.update")!;
     check.severity = "warn";
     check.action = "Untrusted action https://example.com/#arbitrary";
-    doc.counts = { ok: 21, warn: 1, danger: 0, unknown: 0, na: 0 };
+    doc.counts = { ok: 22, warn: 1, danger: 0, unknown: 0, na: 0 };
     mockApi.getAdminHealth.mockResolvedValue(doc);
     let resolveSettings!: (value: ReturnType<typeof response>) => void;
     mockApi.getSettings.mockReturnValue(new Promise((resolve) => { resolveSettings = resolve; }));

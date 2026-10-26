@@ -278,6 +278,7 @@ uzi admin products connections <product>
 uzi admin guardrail-impact
 uzi admin blocked-repos
 uzi admin review-bots
+uzi admin maintenance status   # read-only: maintenance state + drain readout (CLEAR / NOT CLEAR); exit 0 either way
 uzi admin agent-source get
 uzi admin agent-source status
 uzi admin review backlog [--bucket todo|filed|done|dismissed|all] [--category <label,label>]

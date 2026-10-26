@@ -3639,38 +3639,42 @@ export class RunRunner {
             checkLocal();
           } catch { throw refused(); }
         };
-        try {
-          checkLocal();
-          owner = new TickSpawner({ signal: ownerSignal, log: this.log,
-            ...(this.checkpointTestHooks?.tickSpawn ? { hooks: this.checkpointTestHooks.tickSpawn } : {}),
-            ...(this.checkpointTestHooks?.tickKillGraceMs !== undefined
-              ? { killGraceMs: this.checkpointTestHooks.tickKillGraceMs } : {}),
-          });
-          const supervisor = owner;
-          const familyQuiet = familyProof(source, checkLocal, ownerSignal);
-          return await this.git.withBoundaryProcessSpawner(request => {
-            check();
-            return supervisor.spawn(request);
-          }, ownerSignal, async () => {
-            if (!await familyQuiet()) throw refused();
-            checkLocal();
-            started = true;
-            callbackActive = true;
-            // Await the callback itself, including pending filesystem work, before settlement.
-            try { return await action(check); }
-            finally { callbackActive = false; }
-          });
-        } catch {
-          throw refused();
-        } finally {
-          callbackActive = false;
-          phaseScope.abort();
-          try {
-            await settleOwned(owner);
-            // A single post-transfer family pass follows the actual child join, also on failure.
-            await proveAfterTransfer();
-          } finally { phaseActive = false; }
-        }
+        return this.git.withRecoveryOperation(continuationSignal,
+          Date.now() + Math.min(capturedBudget?.remainingMs() ?? Infinity, phaseBudget.remainingMs(),
+            MaintenanceResources.remainingMsIfActive()), async () => {
+            try {
+              checkLocal();
+              owner = new TickSpawner({ signal: ownerSignal, log: this.log,
+                ...(this.checkpointTestHooks?.tickSpawn ? { hooks: this.checkpointTestHooks.tickSpawn } : {}),
+                ...(this.checkpointTestHooks?.tickKillGraceMs !== undefined
+                  ? { killGraceMs: this.checkpointTestHooks.tickKillGraceMs } : {}),
+              });
+              const supervisor = owner;
+              const familyQuiet = familyProof(source, checkLocal, ownerSignal);
+              return await this.git.withBoundaryProcessSpawner(request => {
+                check();
+                return supervisor.spawn(request);
+              }, ownerSignal, async () => {
+                if (!await familyQuiet()) throw refused();
+                checkLocal();
+                started = true;
+                callbackActive = true;
+                // Await the callback itself, including pending filesystem work, before settlement.
+                try { return await action(check); }
+                finally { callbackActive = false; }
+              });
+            } catch {
+              throw refused();
+            } finally {
+              callbackActive = false;
+              phaseScope.abort();
+              try {
+                await settleOwned(owner);
+                // A single post-transfer family pass follows the actual child join, also on failure.
+                await proveAfterTransfer();
+              } finally { phaseActive = false; }
+            }
+        }, phaseBudget);
       }, { durationMs: Math.min(capturedBudget?.remainingMs() ?? 120_000, MaintenanceResources.remainingMsIfActive()),
         signal: capturedBudget?.signal })).catch(error => {
         phaseScope.abort();

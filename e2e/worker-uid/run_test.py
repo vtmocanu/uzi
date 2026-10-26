@@ -27,9 +27,11 @@ LANE_TIMES = []
 EXPECTED = [{"file": "agent/test/example.test.ts", "names": ["suite", "leaf"]}]
 COMMAND_EXPECTED = [{"file": "e2e/worker-uid/memory-command-real.test.mts", "names": ["command leaf"]}]
 SINGLE_EXPECTED = [{"file": "e2e/worker-uid/single-uid-preflight.test.mts", "names": ["single leaf"]}]
-SHARED_EXPECTED = [{"file": "e2e/worker-uid/runner-shared-real.test.mts", "names": ["shared leaf"]}]
+SHARED_EXPECTED = [{"file": "e2e/worker-uid/runner-shared-real.test.mts", "names": ["shared leaf"]},
+                   {"file": "e2e/worker-uid/pod-epoch-real.test.mts", "names": ["epoch leaf"]}]
 SHARED_PASS = ('<testsuites><testcase name="shared leaf" '
-               'file="/app/uzi-worker-uid-proof/e2e/worker-uid/runner-shared-real.test.mts"/></testsuites>')
+               'file="/app/uzi-worker-uid-proof/e2e/worker-uid/runner-shared-real.test.mts"/>'
+               '<testcase name="epoch leaf" file="/app/uzi-worker-uid-proof/e2e/worker-uid/pod-epoch-real.test.mts"/></testsuites>')
 SINGLE_PASS = ('<testsuites><testcase name="single leaf" '
                'file="/app/uzi-worker-uid-proof/e2e/worker-uid/single-uid-preflight.test.mts"/></testsuites>')
 COMMAND_PASS = ('<testsuites><testcase name="command leaf" '
@@ -561,7 +563,8 @@ sys.exit(rc)
         self.assertIn("--test-timeout=120000", call)
         self.assertIn("--test-reporter=junit", call)
         self.assertEqual(call[call.index("--test-name-pattern") + 1], "^shared leaf$")
-        self.assertEqual(call[-1], "/app/uzi-worker-uid-proof/e2e/worker-uid/runner-shared-real.test.mts")
+        self.assertEqual(call[-2:], ["/app/uzi-worker-uid-proof/e2e/worker-uid/runner-shared-real.test.mts",
+                                    "/app/uzi-worker-uid-proof/e2e/worker-uid/pod-epoch-real.test.mts"])
         mounts = [call[i + 1] for i, a in enumerate(call) if a == "--mount"]
         for source in ("e2e/worker-uid", "agent/src", "agent/test", "agent/templates",
                        "controller/internal/kube/testdata/runner-shared-init.sh"):
@@ -738,11 +741,13 @@ sys.exit(rc)
     def test_single_uid_passing_runs_succeed_and_failure_keeps_going(self):
         result, _ = self.run_lane()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.count("1 required leaves passed"), 6)
+        self.assertEqual(result.stdout.count("1 required leaves passed"), 5)
+        self.assertEqual(result.stdout.count("2 required leaves passed"), 1)
         self.calls.unlink(missing_ok=True)
         result, _ = self.run_lane(single={"1": {"rc": 9}, "3": {"rc": 8}})
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(result.stdout.count("1 required leaves passed"), 6)
+        self.assertEqual(result.stdout.count("1 required leaves passed"), 5)
+        self.assertEqual(result.stdout.count("2 required leaves passed"), 1)
         for number, code in (("1", 9), ("3", 8)):
             self.assertIn(f"worker UID single-{number} node/container exit: {code}", result.stderr)
         self.assertNotIn("single-2 node/container exit", result.stderr)

@@ -146,6 +146,13 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 		r.Get("/upgrade-summary", h.WorkerUpgradeSummary)
 	})
 
+	// Instance maintenance notice (PRD #3454): the public pause state for any authenticated
+	// user (session or CLI token); no attribution, no readout.
+	r.Route("/maintenance", func(r chi.Router) {
+		r.Use(mw.RequireUser(h.q, h.cfg))
+		r.Get("/", h.GetMaintenance)
+	})
+
 	// Runs-in-progress count for the Runs nav badge (PRD #239). Its own endpoint +
 	// AppShell poll, mirroring /me/workers/upgrade-summary and /me/judge/stats.
 	r.Route("/me/runs", func(r chi.Router) {

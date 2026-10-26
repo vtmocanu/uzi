@@ -11,6 +11,8 @@ import {
   isAwaitingFollowup,
   isAwaitingInput,
   isHealthFlaggableStatus,
+  isMaintenanceQueued,
+  maintenanceQueueText,
   isPlanningRun,
   isRevisingRun,
   isStoppedRun,
@@ -1422,5 +1424,49 @@ describe("base divergence rejection", () => {
     expect(runStatusTone("failed", null, "agent_failure")).toBe("danger");
     expect(runBadge(run({ status: "failed", fail_origin: "base_diverged" }), 0)).toMatchObject({ label: "rejected", tone: "neutral" });
     expect(runBadge(run({ status: "failed", fail_origin: "base_diverged", stop_kind: "plan_rejected" }), 0)).toMatchObject({ label: "stopped", tone: "neutral" });
+  });
+});
+
+// PRD #3454: a queued run held back by instance maintenance mode reads as a deliberate wait,
+// taking precedence over the generic waiting-for-worker flag the detector may still raise.
+describe("maintenance queue reason", () => {
+  const held = run({
+    status: "queued",
+    queue_reason: "maintenance",
+    health: "waiting_worker",
+    health_since: "2026-07-04T12:00:00Z",
+    health_reason: "waiting for a worker to pick up this run",
+  });
+
+  it("takes precedence over waiting for worker on the board badge and the list pill", () => {
+    const expected = {
+      kind: "badge",
+      label: "waiting: uzi is in maintenance mode",
+      tone: "info",
+      pulse: false,
+      title: "waiting: uzi is in maintenance mode",
+      wrap: true,
+    };
+    expect(runBadge(held, NOW)).toEqual(expected);
+    expect(healthBadge(held, NOW)).toEqual(expected);
+  });
+
+  it("appends the admin's reason as one sanitized cell", () => {
+    const b = runBadge(held, NOW, "Node pool upgrade\n\u202e<b>x</b>");
+    expect(b.kind === "badge" && b.title).toBe("waiting: uzi is in maintenance mode (Node pool upgrade<b>x</b>)");
+    // PRD acceptance example 1: the card's VISIBLE text is the full sentence, reason included.
+    expect(b.kind === "badge" && b.label).toBe("waiting: uzi is in maintenance mode (Node pool upgrade<b>x</b>)");
+    expect(maintenanceQueueText("  ")).toBe("waiting: uzi is in maintenance mode");
+    expect(maintenanceQueueText(null)).toBe("waiting: uzi is in maintenance mode");
+  });
+
+  it("applies only to a queued run carrying the maintenance reason", () => {
+    expect(isMaintenanceQueued(held)).toBe(true);
+    expect(isMaintenanceQueued(run({ status: "queued" }))).toBe(false);
+    expect(isMaintenanceQueued(run({ status: "queued", queue_reason: null }))).toBe(false);
+    // A stale frame: the run was claimed, so the queue reason no longer applies.
+    expect(isMaintenanceQueued(run({ status: "running", queue_reason: "maintenance" }))).toBe(false);
+    const plain = runBadge(run({ status: "queued", health: "waiting_worker", health_since: "2026-07-04T12:00:00Z" }), NOW);
+    expect(plain.kind === "badge" && plain.label).toBe("⚠ waiting for worker · 4m");
   });
 });

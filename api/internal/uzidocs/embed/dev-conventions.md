@@ -60,7 +60,8 @@ Four things about it that are decisions rather than accidents:
 
 - **The load-bearing flags live in the targets, with their reason beside them.**
   `-race` and `-count=1` on `test:api` and (since PRD #103 M6) on `test:controller`,
-  `--test-timeout=120000` inside `agent/package.json`'s `test` script. None is
+  `--test-timeout=120000` inside `agent/test/run-unit-tests.ts` (the launcher
+  for `agent/package.json`'s `test` script). None is
   optional and each one's absence is invisible in a passing run, which is why
   the Taskfile is not `silent:` — Task echoes every command, so you can read the
   flags in the output instead of trusting a file.
@@ -81,7 +82,7 @@ written out as commands in `CLAUDE.md` and the `.claude/rules/` files it indexes
 
 The Taskfile installs no *project* dependencies — no `npm ci`, no
 `go mod download`. Your `node_modules` and module cache are expected to exist; CI
-does that in its `before_script`.
+does that in its dependency-installation steps in `.github/workflows/ci.yml`.
 
 **One exception since PRD #103 M3, and it is why that sentence is now qualified:**
 `task lint:api` and `task lint:controller` acquire golangci-lint through
@@ -360,10 +361,9 @@ reason down would invite someone to "fix" gitleaks out of `gate:repo` on the sam
 logic.
 
 They do run on every MR, as extra script lines of the existing per-toolchain jobs
-(`lint:api`, `lint:controller`, `validate:web`, `validate:agent`) rather than as new
-jobs. All four of those jobs are in `*publish_needs`, so **the release-blocking
-property is inherited**: a CVE published on a Tuesday can redden a `v*` tag publish
-with nobody's diff in it. That is accepted rather than overlooked.
+(`lint-api`, `lint-controller`, `validate-web`, `validate-agent`) rather than as new
+jobs. Release publication checks CI through `assert-ci-coverage` in
+`.github/workflows/release.yml`.
 
 **npm audit gates at `--audit-level=high`, not at zero.** The threshold was set
 because two moderate `react-router` advisories had no fix on React Router 6: no
@@ -689,6 +689,16 @@ scenarios are mutually exclusive by construction. Known values:
   tag pin clears the warning without an apply; with a branch ref, applying a
   snapshot matching the recorded tip clears it. Requires a signed-in admin.
   (#2902.)
+- `maintenance` — instance maintenance mode is on with a reason, so every
+  page shows the maintenance banner. `/admin/settings?mock=maintenance#maintenance`
+  shows the admin card with a not-yet-clear readout: running, held
+  (`needs owner` and `progressing` tags), one custody hold, queued runs and an
+  idle bound worker. The queued fixtures carry `queue_reason: "maintenance"`,
+  so `/runs/run-queued?mock=maintenance` and the board show the maintenance
+  queue label, and `/admin/health?mock=maintenance` warns on
+  `maintenance.active`. The switch and reason stay live for the session; the
+  readout does not model the drain. Without the scenario, maintenance is off
+  and the readout is clear. (PRD #3454.)
 
 ### What keeps the mock build current
 

@@ -26,6 +26,33 @@ func clampVisual(s string, n int) string {
 	return ansi.Truncate(s, n, "…")
 }
 
+// middleCell shortens sanitized text by terminal columns. Prefer preserving the
+// last hyphen-delimited segment while reserving a distinguishing head; otherwise
+// divide the space around the ellipsis.
+func middleCell(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	w := visualWidth(s)
+	if w <= width {
+		return s
+	}
+	tail := (width - 1) / 2
+	if i := strings.LastIndex(s, "-"); i >= 0 && i < len(s)-1 {
+		if suffix := visualWidth(s[i:]); suffix <= width-1 {
+			tail = max(tail, suffix)
+		}
+	}
+	tail = min(tail, width-1-min(4, (width-1)/2))
+	right := ansi.TruncateLeft(s, w-tail, "")
+	// TruncateLeft retains a grapheme crossing the cut boundary. Drop that
+	// grapheme if it would exceed the tail budget and trigger a later clamp.
+	for cut := w - tail + 1; visualWidth(right) > tail; cut++ {
+		right = ansi.TruncateLeft(s, cut, "")
+	}
+	return ansi.Truncate(s, width-1-tail, "") + "…" + right
+}
+
 // padVisual pads to n columns ignoring ANSI escapes, which lipgloss has already added
 // by this point — counting them as width would shove every row right.
 func padVisual(s string, n int) string {

@@ -13,7 +13,7 @@ import type { ClaimResponse } from "../src/protocol.js";
 import { makeFixture } from "./fixture-repo.js";
 import { makeClaim, nullLogger, testGitCacheOptions } from "./helpers.js";
 
-// Snapshot retirement and the stopped-source quiescence proofs (src/git.ts snapshotMaintenanceObjects,
+// Snapshot retirement and the stopped-source quiescence proofs (src/git.ts deleteCodeSnapshot,
 // src/runner.ts quiescence proofs) fail closed off Linux, so these scenarios cannot reach their
 // post-proof assertions on macOS (#1912). Linux runs every assertion.
 const LINUX_ONLY = process.platform !== "linux"

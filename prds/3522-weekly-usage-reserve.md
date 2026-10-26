@@ -1,0 +1,108 @@
+# PRD #3522: Weekly usage reserve: hold new runs and pause running ones above a per-user 7-day threshold
+
+**Issue**: [#3522](https://github.com/vtmocanu/uzi/issues/3522)
+**Status**: Draft
+**Priority**: Medium
+
+Resolved facts below were read at `main` `a059e81dd`.
+
+## Problem
+
+A user who shares one model subscription between uzi and their own day-to-day work (interactive troubleshooting, ad-hoc sessions) wants uzi to leave part of the weekly allowance untouched. Each user picks their own line: one stops uzi at 70% of the 7-day window, another at 95%. Today uzi keeps spending until the provider itself refuses at 100%, so the user can find their week gone before they need it.
+
+Nothing in uzi enforces such a reserve:
+
+- Auto credential selection has a headroom floor, `UZI_AUTOSELECT_MIN_HEADROOM` (default 15, `api/internal/config/config.go`), but it is server-wide, ranks on `min(100 - 5h, 100 - 7d)` (`api/internal/autoselect/autoselect.go`), and by design never refuses: below the floor it picks the best of the pool, a stale or unmeasured pool spends a pooled floor credential, and only an empty pool holds (`pool_wait`, PRD #754's pooled-only invariant) (PRD #111 D6, D10 in `prds/done/111-auto-select-anthropic-token.md`; `api/internal/autoselect/select.go`, `api/internal/workersvc/secretchoice.go`). Making it per-user would not give a reserve.
+- The usage-limit park (PRDs #35, #759, #2360) reacts only when the provider refuses. PRD #35 explicitly deferred proactive throttling and pre-parking queued runs (`prds/done/35-run-limit-retry.md`).
+- A closed-issue and PR search found no earlier reserve-threshold proposal or rejection.
+
+## Outcome
+
+Each user can set, in web settings and the CLI:
+
+1. **Weekly reserve threshold**: off (default) or an integer 1..100, the 7-day utilization percent at which uzi stops spending that user's subscription.
+2. **Also pause running runs**: on by default once a threshold is set.
+
+While the credential or account a run would spend reads at or above the threshold **on its 7-day window** (the 5-hour window is ignored for this feature):
+
+- **New work does not start.** Every worker run kind that does autonomous work, manual and scheduled alike (`issue`, `task`, `prompt`, `self_improve`, `ci_fix`, `mr_rework`, `job`, `judge`, `cross_check`; read `fixtures/run-kinds/registry.json` for the current set), stays queued with a visible reserve reason in the run DTO, web and CLI, instead of being claimed. Only `chat` is exempt: it is the interactive use the reserve exists to protect (user decision). A `cross_check` checker runs on the opposite harness from its parent (`oppositeHarness`, `api/internal/workersvc/cross_check.go`), so it is gated against its own credential/account, not the parent's. Its absolute deadline (configurable, default 30 minutes; `cross_check.go`, `code_cross_check.go`) keeps running while it is held; if it expires, it settles exactly as an expired check does today, and the parent's existing gating applies (a non-pass forces a human gate). No new checker logic.
+- **Running runs pause after their current milestone** (toggle on), through the existing milestone pause, and **auto-resume** once a fresh reading is below the threshold. The owner can also resume a reserve-paused run by hand at any time.
+
+Acceptance examples:
+
+1. User A sets 70%. Their only Anthropic token reads 7d = 72%, 5h = 10%. They start an issue run: it stays `queued` with reason "weekly usage reserve: 72% >= 70%"; a scheduled sweep fire behaves the same. At the 7-day reset the poller reads 3%; the next claim pass starts the run.
+2. User B sets 95% with the pause toggle on. A running issue run is on milestone M2 of 4 when the reading crosses 95%. The run finishes M2, checkpoints, and pauses with the reserve cause. After the reset a fresh reading of 5% resumes it automatically at M3. Had the owner run `uzi run resume` earlier, it would have resumed at once and not re-paused for the reserve until the next observed 7-day reset.
+3. User C has no threshold set. Nothing changes for any of their runs, whatever their usage, including on a deployment with the usage poller disabled (`UZI_USAGE_POLL_INTERVAL=0`).
+
+## Out of scope
+
+- The 5-hour window; forecasting; token preallocation; cross-user aggregation of a shared account; new checkpoint timers.
+- A per-run "start anyway" override for a reserve-held queued run (the owner can lower or clear the threshold).
+- Changing PRD #111 auto-selection ranking, `MinHeadroom` or its best-of-pool fallback beyond skipping credentials that are above the user's reserve.
+- Any `.github/workflows/**` change.
+
+## Modules and seams
+
+- **Reserve evaluation (new, small, pure)**: input = the user's threshold (nullable), the run's resolved credential/account, and its latest usage reading with freshness; output = `ok` / `held(pct, threshold)` / `unknown(reason)`. Threshold null always yields `ok`. Hides harness differences:
+  - Claude: per-token `seven_day_pct` in `anthropic_rate_limits` (`api/internal/store/queries/anthropic_rate_limits.sql`), fed by `api/internal/usagepoller/engine.go` (usage endpoint first, then a header probe; last-good preserved on failure).
+  - Codex: per canonical account in `codex_account_rate_limits` (`api/internal/codexauth/usage.go`, `api/internal/codexusagepoller/engine.go`, `api/internal/store/queries/codex_rate_limits.sql`). Identify the 7-day window by its reported duration (`LimitWindowSeconds == 604800`), never by primary/secondary position. Where several buckets carry a 7-day window, use the one applying to the run's model; if that cannot be determined, use the highest.
+  - Freshness: reuse the existing staleness rule each surface already applies (3 x poll interval for Claude, `api/internal/handler/ratelimits.go`; last-success-derived for Codex, `api/internal/handler/codex_ratelimits.go`). With a threshold set, a missing or stale reading yields `unknown`, which holds new work ("weekly usage unknown") rather than silently dropping the protection. A reset time passing triggers reconsideration only; it never proves capacity on its own. Once the observed 7-day reset has passed, a reading synced before that reset is treated as stale, so release waits for the next post-reset poll (one poll interval, default 5 min) rather than acting on pre-reset usage.
+  - Applicability is decided by structure, never by a missing reading (which would fail open). Not gated, because the credential structurally has no subscription meter: a Codex API-key alias (no canonical subscription account, `api/internal/store/queries/codex_binding.sql`) and an OpenAI API key. Every Anthropic credential is treated as metered: OAuth tokens and console API keys share `anthropic_token` and ingestion deliberately assumes no format (`api/internal/handler/secrets.go`), so they cannot be told apart reliably. An Anthropic console key with no usage reading therefore reads `unknown` and holds new work while a threshold is set; the docs say so (a console-key-only user leaves the threshold off).
+  - Tested as a table-driven unit (thresholds, boundaries `pct == threshold`, stale, missing, Codex swapped primary/secondary).
+- **Claim admission**: enforce in claim / credential resolution (`ClaimRun` in `api/internal/workersvc/service.go`, `assembleClaim` in `claim_assembly.go`, `claimSecretID` in `secretchoice.go`), not per creation path, so manual starts, schedules, resumes and successors are all covered. Check the credential the claim would actually spend (pinned, default or auto pick). An auto pool may choose another pooled credential that is below the threshold; it must not cross pool or pinning rules (PRD #754) to do so. A held run stays `queued` (no new run status) with a persisted reason surfaced in the run DTO, web and CLI. The judge lane assembles its credential separately (`api/internal/workersvc/judge.go`) and needs the same check; chat's separate claim (`api/internal/store/queries/chat.sql`) is deliberately not gated.
+- **Reserve pause applies to the kinds the milestone pause already supports** (`CreatePauseInput`'s allowlist: non-interactive `issue`, `task`, `prompt`, `self_improve`). Interactive tasks and the other gated kinds (`ci_fix`, `mr_rework`, `job`, `judge`, `cross_check`) have no milestone pause contract (several run on specialized runners that bypass the ordinary executor, `agent/src/worker.ts`); they are held at admission only, and one already running finishes. No new pause boundary is invented for them. Only a fresh reading at or above the threshold requests a pause on a running run; an `unknown` reading (missing, stale, or a successful poll with no weekly utilization) holds admission but never pauses running work. Milestone completion is already reported and persisted (`milestones_completed`, unioned by `SetRunRunning`; boundary rule `frozenLen == 0 || completedLen > afterCount` in `api/internal/handler/runs_dto.go`).
+- **Reserve pause**: the system files the existing milestone pause (PRD #1190 `CreatePauseInput`, `pause_mode = milestone`, `api/internal/store/queries/runtime.sql`; honoured by both harnesses, `agent/src/sdk-executor.ts`, `agent/src/codex/codex-executor.ts`), the way the sweeper files the wall pause (PRD #1497, `RequestWallParks`, `api/internal/workersvc/sweep.go`), with a distinct persisted reserve cause so it can be told apart from an owner pause. A run with no frozen milestones pauses at the next executor boundary, as an ordinary milestone pause does. The durable checkpoint before parking is kept (`agent/src/runner.ts`). A reserve pause request does not overwrite a pending owner or wall pause. If the pause's checkpoint fails, the existing rule stands (ADR-1190 I6: the request clears and the run continues, so no work is lost); the reserve re-requests at the next boundary. This is why the reserve is best effort, not a strict cap (D10).
+- **Auto-release**: a periodic pass (the sweeper) releases only reserve-caused pauses and holds whose credential now reads `ok` from a fresh reading. Owner pauses, wall parks, `limit_wait` and every other hold are never released by it. Release keeps wall budget accounting, credential fencing and custody/checkpoint durability exactly as an owner resume does.
+- **Manual resume**: `uzi run resume` and the web resume work on a reserve-paused run as an explicit, recorded override: the run is marked reserve-exempt until the next observed 7-day reset (persisted, shown on the run), so the requeue is not held again at admission and the run does not re-pause at once. The resume confirmation states that it overrides the reserve.
+- **Settings**: per-user threshold (nullable smallint 1..100, CHECK-constrained) and the pause toggle (boolean, default true) in an additive migration; exposed through the existing user-settings API, web settings page and a CLI command in `api/cmd/uzi/` (Bearer `uzc_` works: mount in the `RequireUser` group, not cookie-only). Changing the threshold takes effect on the next claim and sweeper pass. Clearing it (or turning the pause toggle off, for pauses) releases every reserve-owned hold and pause and withdraws any pending reserve pause request on the next pass regardless of usage freshness, including during a poller outage; owner and wall requests are untouched. The pause toggle also scopes admission: never-started work is always gated while a threshold is set, but a previously started run's resume claim is gated only while the toggle is on. So turning the toggle off lets released (and any other previously started) runs continue above the threshold while new work stays held. Tested end to end: reserve-paused, toggle off, released, claimed successfully with an above-threshold reading.
+- **Untrusted input**: the threshold is user-controlled, bounded 1..100 by API validation and the DB CHECK; it gates only that user's own runs.
+
+## Testing decisions
+
+- Reserve evaluation: Go table tests (unit).
+- Claim admission: LiveDB store/service tests beside the existing claim and autoselect tests (`api/internal/workersvc`, `api/internal/autoselect`): held at/above, claimed below, 5h ignored, auto pool skips to a below-threshold pooled token, stale/missing/partial (no weekly utilization) holds when enabled, threshold off unchanged, chat not gated, judge gated, cross_check gated on its own (opposite-harness) credential with a held check expiring through the existing path, Codex API-key aliases not gated, an Anthropic token with no reading held as unknown, threshold cleared during a poller outage releases reserve holds and pauses, Claude and Codex credentials both covered (Codex 7d chosen by window duration with swapped primary/secondary), two owners with different thresholds on independent credentials, exact equality `pct == threshold` holds.
+- Pause/resume coexistence: a reserve pause never overwrites a pending owner or wall pause; checkpoint failure continues the run and re-requests at the next boundary; remaining wall budget is preserved across a reserve pause and release (not reset as `PromoteLimitWaitRuns` does); unknown readings never pause running work.
+- Reserve pause and release: service tests beside the PRD #1190 pause tests and PRD #1497 wall-park tests: system milestone pause filed with the reserve cause, not overwriting an owner/wall pause; auto-release on a fresh below-threshold reading only; owner pause never auto-released; manual resume exempts the run.
+- Agent: no executor change expected (the milestone pause is already honoured); if one is needed, a focused test in the matching `agent/test` file.
+- Web: vitest for the settings control and the reserve reason rendering; CLI: render tests in `api/cmd/uzi`.
+- Every new behaviour has a test that fails without the change (mutation discipline, `.claude/rules/go.md`).
+- Product contract change: `git grep -F` new and changed literals across `e2e/` per the root `CLAUDE.md`, update stale expectations, run `task test:e2e-lib` and `task test:forge-fake`.
+
+## Milestones
+
+### M1: A run does not start while its credential is at or above the user's weekly reserve
+
+Blocked by: none.
+
+Settings (migration, API, web, CLI), reserve evaluation for both harnesses, claim admission across every gated kind (judge included, chat excluded), the visible reserve reason on queued runs, docs (`docs/` page for the setting, `task docs:sync`).
+
+Acceptance: examples 1 and 3; the claim-admission tests above; web and CLI show the setting and the reason; `task check-docs:web` green.
+
+### M2: A running run pauses after its current milestone and resumes at the reset or by hand
+
+Blocked by: M1.
+
+System reserve pause with a distinct cause, the pause toggle honoured, sweeper auto-release on a fresh below-threshold reading, manual resume as a recorded override until the next observed 7-day reset (expiry tested), release on disabling regardless of freshness, the reserve cause shown on paused runs in web and CLI, docs updated.
+
+Acceptance: example 2; the pause/release tests above; owner and wall pauses provably untouched.
+
+## Decision Log
+
+- **D1: 7-day window only.** The reserve protects the weekly allowance for interactive work; the 5-hour window recovers on its own within hours and is already handled by `limit_wait`. (User decision, 2026-10-26.) Rejected: both windows.
+- **D2: Enforce at claim, not at creation.** One seam covers manual, scheduled, resumed and successor runs; per-creation-path gates would miss some. Rejected: scheduler-only gate.
+- **D3: Held work stays `queued`.** No new run status, so no state-machine change; the reason is a persisted field. Rejected: parking into `limit_wait`: it fails the run when `wait_on_limit` is off or the wait count is exhausted (`workersvc/limitwait.go`), increments `limit_wait_count`, writes the Claude 7d gauge as exhausted, grants a fresh wall budget on promotion (`PromoteLimitWaitRuns`), promotes on the clock without a fresh reading, and excludes `judge`, `job`, `cross_check`. The reserve must touch none of those counters, gauges or budgets.
+- **D4: Reuse the milestone pause with a distinct cause.** Both harnesses already honour it at the server's boundary decision, and PRD #1497 already files system pauses. Rejected: an ordinary owner pause (cannot be auto-released safely) and a new pause protocol.
+- **D5: Auto-release needs a fresh below-threshold reading.** A reset timestamp only triggers reconsideration. Rejected: release on the clock alone.
+- **D6: Missing or stale reading holds when a threshold is set.** Opting in means the user wants the protection; silently ignoring it would defeat the feature. Default off keeps everyone else, and the e2e overlay with its disabled poller, unchanged. Rejected: PRD #111 D7's never-refuse rule, which fits an optimizer, not a reserve.
+- **D7: Only chat exempt (user decision, 2026-10-26); judge and cross-check gated.** Chat is the interactive use the reserve protects. Cross-check spends the opposite harness's account, which the parent's pause does not protect, so it is gated on its own credential; a held check may expire and settle through the existing expiry path. Lead's proposal, confirmable at the plan gate: only kinds with the existing milestone-pause contract are paused mid-run; the rest are held at admission and finish if already running. Only kinds with the existing milestone pause contract are paused mid-run; the rest are gated at admission only. Rejected: inventing a pause boundary for kinds without one.
+- **D8: Pause toggle defaults on.** The requester preferred pausing over only not starting; it is what keeps the reserve intact. (User decision, 2026-10-26.)
+- **D9: Manual resume is an explicit override until the next 7-day reset.** Otherwise the requeue would be held again at admission and the run would re-pause at the next boundary. Scoped to the current weekly window, so a run spanning a reset is protected again in the next week. Rejected: lifetime exemption (outlives the decision) and resume without override (immediately re-held). Auto-resume plus manual resume both stay available. (User decision, 2026-10-26.)
+- **D10: Best effort.** Poll lag (default 5 min), finishing the current milestone, admission-only kinds finishing, exempt kinds and checkpoint-failure continuation all mean usage may exceed the threshold; overshoot is not bounded. Documented, not engineered away.
+- **D12: Unknown usage holds admission only.** Pausing running work on a missing or stale reading would let a poller outage stop every run; holding new work keeps the reserve's promise cheaply. With the poller disabled (`UZI_USAGE_POLL_INTERVAL=0`) and a threshold set, every subscription credential reads `unknown`, so new work holds; documented.
+- **D11: Only structurally unmetered credentials are exempt.** Codex API-key aliases and OpenAI API keys have no subscription account, so no weekly window. Anthropic tokens cannot be classified reliably, so all are treated as metered and fail closed. Rejected: inferring "API key" from a missing reading (fails open on a poller outage); a new per-credential classification mechanism (more moving parts than the problem needs; revisit if console-key users ask).
+
+## Gates
+
+- Go: `task gate:api` (run with `UZI_TEST_DATABASE_URL` unset; LiveDB via `./e2e/run-store-it.sh` when needed). Web: `task gate:web`.
+- `agent/**`, if touched: focused tests plus `UZI_DEADCODE_AGENT_REQUIRED=1 task check:agent` in-run; full agent suite: exact-head PR CI.
+- No `.github/workflows/**` change in implementation or validation.

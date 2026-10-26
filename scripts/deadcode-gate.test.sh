@@ -11,7 +11,13 @@ mkdir -p "$TMP/bin" "$TMP/api" "$TMP/controller" "$TMP/timer programs" "$TMP/tem
 export TMPDIR="$TMP/temp"
 GO_LOG="$TMP/go.log"
 export GO_LOG
-unset ImageOS ImageVersion
+unset ImageOS ImageVersion GOMEMLIMIT GOGC
+# Resolve before the fakes shadow PATH: the Taskfile probes need the real task.
+TASK="$(command -v task || true)"
+[ -n "$TASK" ] && [ -x "$TASK" ] || {
+  printf 'deadcode-gate.test.sh: FAIL: task must be on PATH\n' >&2
+  exit 1
+}
 
 fail() {
   printf 'deadcode-gate.test.sh: FAIL: %s\n' "$*" >&2
@@ -23,7 +29,7 @@ contains() {
 
 cat > "$TMP/bin/go" <<'EOF'
 #!/bin/sh
-printf 'called\n' >> "$GO_LOG"
+printf 'called gomemlimit=%s gogc=%s\n' "${GOMEMLIMIT-unset}" "${GOGC-unset}" >> "$GO_LOG"
 [ "$#" -eq 5 ] && [ "$1" = run ] &&
   [ "$2" = golang.org/x/tools/cmd/deadcode@v0.48.0 ] &&
   [ "$3" = -test ] && [ "$5" = ./... ] &&
@@ -130,6 +136,8 @@ contains "$err" 'command_elapsed_seconds=62.500'
 contains "$err" 'peak_rss_bytes=2097152'
 contains "$err" 'not simultaneous aggregate tree or whole-job memory'
 contains "$err" 'runner_image_version=unavailable (ImageVersion unset)'
+contains "$err" 'go_memory_limit=unset'
+contains "$GO_LOG" 'gomemlimit=unset'
 
 run_case gnu-finding api finding gnu 1
 contains "$out" 'unreachable func: DeadProbe'
@@ -170,4 +178,55 @@ contains "$err" 'unavailable (timer exited 77; child verdict retained)'
 TIME_BEHAVIOR=no-launch
 run_case timer-no-launch controller clean gnu 0
 contains "$err" 'timer did not launch command'
+
+grep -Fq -- '- env GOMEMLIMIT=12GiB ./scripts/deadcode-gate.sh api golang.org/x/tools/cmd/deadcode@v0.48.0' "$ROOT/Taskfile.yml" ||
+  fail 'Taskfile.yml deadcode:api lacks the fixed GOMEMLIMIT=12GiB command'
+
+# Real Taskfile probes: run the actual targets against the fake Go. These do not
+# use run_case, so the real module baselines stay read-only.
+(
+  cp "$ROOT/api/.deadcode-baseline" "$TMP/api-baseline.before"
+  cp "$ROOT/controller/.deadcode-baseline" "$TMP/controller-baseline.before"
+  GOMEMLIMIT=1GiB
+  export GOMEMLIMIT
+  FAKE_RESULT=clean TIME_KIND=gnu TIME_BEHAVIOR=normal TEST_OS=Linux FAKE_MEMORY=valid
+  export FAKE_RESULT TIME_KIND TIME_BEHAVIOR TEST_OS FAKE_MEMORY
+  DEADCODE_TIME_BIN="$TMP/timer programs/time fake"
+  export DEADCODE_TIME_BIN
+  for spec in "api 12GiB" "controller 1GiB"; do
+    name=${spec% *}
+    want=${spec#* }
+    target="deadcode:$name"
+    EXPECTED_MODULE="$ROOT/$name"
+    export EXPECTED_MODULE
+    : > "$GO_LOG"
+    rc=0
+    # --output interleaved: the root Taskfile's prefixed output would merge
+    # child stderr into stdout.
+    "$TASK" --output interleaved --taskfile "$ROOT/Taskfile.yml" "$target" \
+      >"$TMP/$name.task.stdout" 2>"$TMP/$name.task.stderr" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      cat "$TMP/$name.task.stdout" "$TMP/$name.task.stderr" >&2
+      fail "$target: expected exit 0, got $rc"
+    fi
+    calls=$(wc -l < "$GO_LOG")
+    [ "$calls" -eq 1 ] || fail "$target: expected one Go invocation, got $calls"
+    contains "$GO_LOG" "gomemlimit=$want"
+    contains "$GO_LOG" 'gogc=unset'
+    contains "$TMP/$name.task.stderr" "go_memory_limit=$want"
+    contains "$TMP/$name.task.stderr" 'fake Go warning'
+    contains "$TMP/$name.task.stdout" 'clean (0 findings'
+    if grep -Fq 'diagnostics:' "$TMP/$name.task.stdout"; then
+      fail "$target: diagnostics on stdout"
+    fi
+  done
+  # A child cannot change its parent's environment, so this proves the probes
+  # ran under the inherited value that the controller target must keep.
+  [ "$GOMEMLIMIT" = 1GiB ] || fail 'GOMEMLIMIT changed in the probe shell'
+  cmp -s "$ROOT/api/.deadcode-baseline" "$TMP/api-baseline.before" ||
+    fail 'api/.deadcode-baseline changed during Taskfile probes'
+  cmp -s "$ROOT/controller/.deadcode-baseline" "$TMP/controller-baseline.before" ||
+    fail 'controller/.deadcode-baseline changed during Taskfile probes'
+  printf 'ok taskfile-probes\n'
+) || exit 1
 printf 'deadcode-gate.test.sh: all contracts passed\n'

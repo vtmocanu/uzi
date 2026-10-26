@@ -1142,7 +1142,7 @@ describe("the shared root-entry drop wrapper", () => {
       /"\$CHOWN"\s+0:0\s+"\$root"\s*[^\n]*\n\s*"\$CHMOD"\s+2775\s+"\$root"\s*[^\n]*\n\s*"\$CHOWN"\s+"\$owner:\$FSGROUP"\s+"\$root"/,
       "alignment must reclaim -> chmod 2775 -> restore owner:fsGroup on the root dir",
     );
-    assert.match(entrypoint, /if\s+\[\s+-n\s+"\$NIX_HAD_FSGROUP"\s+\];\s*then\s*\n\s*align_pvc_root\s+"\$NIX_DIR"\s+runner\s*\n\s*align_pvc_root\s+"\$DATA_DIR"\s+"\$WORKER_USER"/, "alignment must run for /nix and /data only when the fingerprint says k8s");
+    assert.ok(/if\s+\[\s+-n\s+"\$NIX_HAD_FSGROUP"\s+\];\s*then\s*\n\s*align_pvc_root\s+"\$NIX_DIR"\s+runner\s*\n\s*if\s+\[\s+"\$\{UZI_EPOCH_LOCK-\}"\s+!=\s+1\s+\];\s*then\s*\n\s*align_pvc_root\s+"\$DATA_DIR"\s+"\$WORKER_USER"\s*\n\s*fi\s*\n\s*fi/.test(entrypoint), "the fsGroup fingerprint must gate /nix and legacy /data alignment (Compose no-op); participating Docker startup must skip /data alignment to preserve gid 10001 and setgid");
     assert.match(entrypoint, /^FSGROUP=10001$/m, "the fsGroup restored on the roots is 10001 (the worker gid)");
   });
 

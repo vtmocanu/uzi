@@ -229,6 +229,32 @@ per-pod `emptyDir`.
   [ADR-3153](../adr/3153-runner-shared-pvc-subpath.md)). It does not restore
   rootless-container writability.
 
+### Pod-epoch shadow reclaim
+
+Hosted Docker workers participate in a lifetime shared epoch lock on supported
+ext4/xfs data volumes, including when shadow evaluation is off. On replacement,
+a fresh pod can evaluate retained attempt trees before accepting runs and log
+`pod_epoch_reclaim`: `eligible`, `deferred` or `partial`, with a stable reason,
+examined/would-delete/kept counts and up to 32 would-delete entries with sizes.
+Partial or unknown bytes and incomplete inventories are marked explicitly.
+
+**This is shadow reporting:** the pass deletes no attempt trees, releases no
+recovery holds and removes no stopped containers. Existing startup reapers and
+DinD maintenance retain their separate behavior. Compose and non-Docker workers
+are unchanged.
+
+The administrator's `workers.docker.podEpochReclaim.runtime` defaults to unset.
+A fresh default-off pod logs `deferred` / `runtime_not_declared` immediately
+after startup reaping, without waiting for predecessor evidence. The lifetime
+lock still applies. A consumed pod does not evaluate again on process restart.
+
+Rolls can take longer while startup waits for epoch ownership or evidence.
+A lock timeout refuses startup and retries through a nonzero exit; deleting
+lock or ledger files is not a contention remedy. See the
+[operator prerequisites, bounds and recovery cautions](../deploy/README.md#pod-epoch-shadow-reclaim-prd-3430)
+before declaring a runtime. Final-head base/JVM image proofs and live shadow
+acceptance remain pending; this is not production-verification evidence.
+
 ### Upgrading and rolling back
 
 - **Upgrade order.** A worker image that carries the runner-shared layout
@@ -237,8 +263,16 @@ per-pod `emptyDir`.
   bumps that pin when the agent changed. A new controller with an old image
   fails closed: the `runner-init` init container refuses the pod (it stays
   in `Init:CrashLoopBackOff` and the roll health names the init container)
-  before it, dind or the worker touch the run directory. The `seed-nix`
-  init container runs earlier and behaves as before. An old controller with a new image works.
+  before it, dind or the worker touch the run directory. On a Docker worker
+  the `seed-nix` init container runs earlier and now calls the image's
+  pod-epoch helper (`/usr/local/lib/uzi/pod-epoch-init.cjs`) to record the
+  pod before seeding, so it needs the new image too: on an old image it
+  fails closed the same way (`Init:CrashLoopBackOff`, named by the roll
+  health) before `runner-init`. An old controller with a new image boots
+  (image skew). Rolling the controller back after the layout migration is a
+  different case: drain recovery custody first, and recovery records for
+  migrated clones read as missing until you roll forward again (see
+  **Rolling back the controller** below and ADR-3153 D10).
 - **Custody-held workers migrate later.** A Docker worker that holds
   recovery custody for a run stays on its old pod layout (the `emptyDir`)
   until custody releases, so its unpublished clone is not lost by the

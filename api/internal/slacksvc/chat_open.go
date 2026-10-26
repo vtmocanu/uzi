@@ -33,6 +33,9 @@ const (
 	chatStatusFallback = "uzi chat"
 	// chatBusyText refuses a second top-level DM while a chat is live (Decision 3).
 	chatBusyText = "You already have a live chat in this DM — reply in its thread to continue it (or say you're done there first). One conversation at a time keeps them from queueing behind each other."
+	// chatBusyMaintenanceText is the same refusal when the live chat has not started because
+	// instance maintenance mode is holding new runs back (PRD #3454).
+	chatBusyMaintenanceText = "Your last chat is still queued because uzi is in maintenance mode; it starts when maintenance ends. Reply in its thread to add to it."
 	// chatRateLimitedText is the shared-budget refusal (Decision 9): the chat spend
 	// guard is one per-user pool across web and Slack, so it names the web page too.
 	chatRateLimitedText = "You're starting chats faster than the limit allows — give it a moment. This budget is shared with the web Chat page, so heavy use on either side counts."
@@ -61,11 +64,11 @@ const (
 func (r *Replier) openChat(ctx context.Context, m MessageReply, user store.User) {
 	// Decision 3: one live chat at a time. A pointer, not a clock — the user continues
 	// by replying in the existing thread.
-	if _, ok, err := r.svc.LiveChatForUser(ctx, user.ID); err != nil {
+	if live, ok, err := r.svc.LiveChatForUser(ctx, user.ID); err != nil {
 		r.logf("check live chat", err)
 		return
 	} else if ok {
-		r.postThreadReply(ctx, m, chatBusyText)
+		r.postThreadReply(ctx, m, r.busyText(ctx, live))
 		return
 	}
 
@@ -107,8 +110,29 @@ func (r *Replier) openChat(ctx context.Context, m MessageReply, user store.User)
 		return
 	}
 
+	// PRD #3454: while maintenance holds new runs back, say so in the thread. Best-effort,
+	// like every other post here; the chat itself is created and anchored.
+	if notice := r.svc.MaintenanceNotice(ctx); notice != "" {
+		// postThreadReply posts plain mrkdwn text, so the admin-written reason inside the
+		// notice must be escaped (<!channel>, <url|label>) before it reaches Slack.
+		r.postThreadReply(ctx, m, "ℹ️ "+EscapeMrkdwn(notice))
+	}
+
 	// ✅ the opening message so the user sees it landed even before the worker replies.
 	r.ack(ctx, m)
+}
+
+// busyText is the refusal for a second top-level DM. When the live chat is still queued and was
+// never admitted (claim_generation 0) while maintenance is active, maintenance is why it has not
+// started, so say that instead of the generic pointer.
+func (r *Replier) busyText(ctx context.Context, live store.Run) string {
+	// This Go check mirrors the SQL admission rule (PRD #3454 D4, fn_run_admitted_during_intake_pause):
+	// a run never claimed (claim_generation 0) is held by the pause. Chats are never cross_check
+	// children, so the cross_check carve-out in that function cannot apply here.
+	if live.Status == "queued" && live.ClaimGeneration == 0 && r.svc.MaintenanceNotice(ctx) != "" {
+		return chatBusyMaintenanceText
+	}
+	return chatBusyText
 }
 
 // openingStatusText picks the opener's status line: the normal "on it" copy, or —

@@ -651,7 +651,12 @@ describe("PRD #1493 M2: root-branch migration ownership map (portable, record-on
   it("token (AC5): MUTATION CONTROL — reverting `stat -L` to lstat sees the symlink's own 0777 and fails closed", () => {
     // Prove `-L` is load-bearing: with lstat (no -L) the posture read returns the atomic-writer
     // symlink's OWN 0777 rather than the target's 0440, so the fail-closed check rejects it.
-    const h = makeHarness({ mutate: (t) => t.replace("stat -L -c", "stat -c") });
+    const tokenPostureLine = `    token_posture="$("$BUSYBOX" stat -L -c '%u %g %a' "$TOKEN" 2>/dev/null || true)"`;
+    const h = makeHarness({ mutate: (t) => {
+      assert.equal(t.split("\n").filter(line => line === tokenPostureLine).length, 1,
+        "exactly one token-posture stat line must be mutated");
+      return t.replace(tokenPostureLine, tokenPostureLine.replace("stat -L -c", "stat -c"));
+    } });
     try {
       fs.mkdirSync(h.data);
       fs.mkdirSync(h.nix);

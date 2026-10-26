@@ -183,7 +183,7 @@ This pass uses the existing FINAL and ACK proofs, admits no producer, charges
 no maintenance slot and adds no timer. Saved evidence remains available to the
 ordinary boot/live replay paths when notification is suppressed.
 
-### Terminal-producer delivery hold (issue #3031, 2026-10-20)
+### Historical terminal-producer delivery hold (issue #3031, 2026-10-20)
 
 The W0-H capture redesign and its dependent producer pipeline are not
 implemented in this delivery. The frozen design requires the clone's index
@@ -243,9 +243,9 @@ adds no ledger backup/restore artifact or historical-reader format change,
 and does not expand ADR-1786 authority. Production-image/PVC and three-forge
 compose/k8s acceptance remain maintainer-owned and unperformed.
 
-### Terminal-producer hold validation (issue #3031, 2026-10-22)
+### Historical terminal-producer hold validation (issue #3031, 2026-10-22)
 
-The current approved W0 P1 still pins the post-`add -A` index's device,
+At this historical capture, the approved W0 P1 pinned the post-`add -A` index's device,
 inode, size, mtime, ctime and trailing checksum before and after commit and
 through P5. A fresh isolated reproduction on Git 2.54.0 with
 `--no-optional-locks` and `GIT_OPTIONAL_LOCKS=0`: ordinary add then commit
@@ -684,8 +684,9 @@ The user chose option A with the broader risk wording below. This supersedes
 deferral. Nested operations share both the counter and cache by
 reference; standalone calls have a private cache, and new operations start empty.
 
-Every call still performs the complete `rev-list --objects --missing=error` walk
-and batch metadata checks. Cache hits must retain their verified type and size.
+Ordinary closure verification still performs the complete
+`rev-list --objects --missing=error` walk and batch metadata checks. The #3441
+amendment below separately defines the weaker maintenance delta-range proof. Cache hits must retain their verified type and size.
 Only misses contribute to the declared-size precheck, content hashing and decoded
 charges. Entries publish only after all requested frames and hashes verify, the
 producer exits cleanly, and the bare identity is unchanged. A failed or partial
@@ -884,3 +885,351 @@ and runner fixtures in [the Codex executor tests](../agent/test/codex-executor.t
 The resume fixture covers a resolvable non-Docker session path, with
 retained-source successor selection bypassed; it does not establish general
 successor-path or Docker resume coverage. There is no live-provider proof.
+
+## Amendment 2026-10-25: #3441 U4b verified delta transfer
+
+C1/U4b implements the objects-only delta transfer with focused acceptance and
+coordinator controls recorded in the delivery report. The terminal producer remains
+disabled. Independent candidate reviews, mutation proofs and full integration gates
+remain required and are reported in the PR; these focused results do not waive them.
+C2–C8 and the complete #3031 producer pipeline are separate deliveries.
+The guarded terminal producer transfers selected objects absent from an eligible
+canonical boundary. TERMINAL_ORIGIN_ADMISSION_ENABLED remains false. The importer writes
+objects, never refs. A successful imported or already_present result proves W is
+connected relative to the trusted-boundary invariant; neither result grants FINAL,
+release, cleanup, tracking/owed or accepted-ledger authority. The coordinator must join
+the actual owner and prove final family continuity before a fresh observation and output
+indexing. Real coordinator-to-runner-to-importer tests establish a fresh
+complete-list/exact pair immediately before canonical import and after the actual owner
+join before accepted output indexing, with no intervening metadata Git. A custody
+refusal at either dispatch prevents its effect; a post-import range failure retains
+imported and unknown bytes and prevents accepted output indexing. A crash after canonical import but
+before maintenance-wip-v1 indexing leaves the tip imported in bare, not indexed; C6 owns
+reconciliation.
+
+The canonical bare, objects, pack and ancestors are no-follow dev/ino-pinned. Canonical
+alternates/http-alternates are refused. Producer admission and post-proof recheck
+require absent bare/shallow by lstat (any present entry/non-ENOENT error refuses), and
+canonical rev-parse --is-shallow-repository=false. The query uses plain replacement
+gitEnv, no GIT_SHALLOW_FILE or private object-directory overrides. Both checks are
+charged even on already_present. Existing shallow-source writer behavior remains
+unchanged and maintainer-owned.
+
+All canonical ref namespaces depend on complete connected inputs, not only the three
+eligible anchors. Fetch negotiation/connectivity excludes existing ref history in any
+namespace. The eligible minimization anchors are exactly
+`refs/remotes/origin/<defaultBranch>`, `refs/heads/<defaultBranch>` and
+`refs/uzi-runner/<branch>`. recovered-source as default refuses. RECOVERY_BUNDLE_REF and
+every other namespace are excluded. Candidates from original.baseCommit,
+record.sourceSha and eligible tips become boundary only on positive bare-only ancestry.
+Empty boundary refuses. A nonempty selection must uniquely include W. Empty selection
+requires positive W-to-eligible-anchor ancestry and returns already_present after the
+same shallow/identity/settlement checks, without pack/index/import/ref writes.
+Non-anchor-reachable empty selection refuses. This resolves the
+includes-tip/boundary-candidate conflict.
+
+The clone object store is read in place under private controls, restricted environment
+and sole pinned canonical alternate. No clone config, fetch-back, graph/MIDX
+acceleration or hardlink trust is used. Every nlink>1 file refuses protected with
+custody/source retained. Legitimate hardlinked clones therefore refuse; Git interrupted
+between loose-object link() and unlink() can leave a permanent nlink2 refusal. The
+bounded walk counts encoded entries without copying or rehashing excluded objects.
+
+Selected object sizes are prechecked against inherited C; pack-objects cannot reuse
+encoded objects/deltas. Strict staged indexing admits canonical prerequisites only as an
+alternate, and pack membership must equal the selected OID set exactly. Every newly
+staged selected body is decoded and hashed, even after canonical cache hits.
+Same-operation positive reuse binds unchanged staged pack/index provenance plus
+canonical identity; partial/failed/cancelled batches publish nothing. Ordinary
+full-closure verification remains a full walk. The selected range is checked in
+staged-only proof plus pinned canonical alternate, and again in canonical objects after
+strict import. Post-import failure retains all imported and unknown objects,
+source/custody, and returns no accepted result; no rollback/deletion or output/FINAL
+authority follows.
+
+The rev6 acceptance 4 full-prerequisite claim is conditionally replaced by the weaker
+4/4a/4b contract: missing selected-range objects refuse before import; post-import range
+failure may leave inert objects; missing/corrupt excluded closure is not proved by the
+range walk. A defect may predate and persist across operations with directory identities
+unchanged. No unbounded full walk is added to the maintenance slot.
+
+For self-contained archives only, missing/unreadable excluded objects block bundle
+creation before pack emission. The archive-backed FINAL proof requires
+`selfContained === true` and an empty `prerequisiteShas` array
+(`agent/src/recovery.ts`, the archive FINAL predicate); it does not verify pack bodies. Only RecoveryBundleTooLargeError permits guarded thin
+fallback; thin never authorizes archive FINAL. Existing independently proved
+held-publication/settled FINAL paths remain unchanged. This backstop does not detect
+well-formed object bytes inconsistent with their names: pack-objects does not rehash and
+FINAL reads bundle header. Same-uid trust remains. No agent core.fsync setting exists;
+Git default committed,-loose-object permits host-crash loose-object loss and ref
+rollback, with the same backstop limits. If #2506 option A authorizes release on
+thin archives, re-review this invariant as authority-bearing.
+
+Owner R8 clarification: read-only Git queries/config acquisition and supervised private
+pack/index/decoded proof commands do not independently need remote pairs. They retain
+original operation/slot/deadline/cancellation/accounting/pin checks; fixed private
+per-file preparation remains deny-only, with no Git/network. Fresh complete-list/exact
+pairs remain immediately before canonical strict import, accepted output indexing after
+joined owner, producer-origin indexing/publication, journal temp creation/rename and
+every other existing listed shared/durable/server-mutating effect. No Git metadata
+acquisition occurs after the pair before its effect. All W0 pairs stay unchanged. Final
+measured complete-path resource totals and both import/output custody-refusal traces are
+required; no cap increase or omission is authorized.
+
+Disposable private scratch is never reused after crash. O_NOFOLLOW/O_EXCL, nlink1,
+dev/ino matching, pinned-parent rechecks before rename, full read-completion checks and
+finite nonrecursive owned-only disposal remain mandatory. File/directory fsync is not
+required by U2. Unknown entries and uncertain close/disposal identities are retained.
+Scratch paths are borrowed, never journaled.
+
+**Enabling blocker: decompression amplification.** The decoded counter (8 GiB
+aggregate, no per-object cap) meters bodies delivered to the verifier; it does not
+bound the memory a Git child uses while inflating an object before that first
+delivery. Demonstrated: a roughly 1 MB loose tree object declaring a 1 GiB inflated
+size drove the source-environment `rev-list --objects` selection to about 1.08 GB
+RSS, and `pack-objects` and both `index-pack --strict` invocations (private staging
+and canonical import) also inflate such objects (inferred, not measured; Git may
+stream blobs above `core.bigFileThreshold`). The transfer is
+unreachable in production today: `terminalOriginAdmissionEnabled()` returns the false
+`TERMINAL_ORIGIN_ADMISSION_ENABLED` constant (tests override it). Enabling it is
+blocked until the enabling design proves a memory bound before the first inflation
+(this amendment prescribes no specific mechanism as sufficient). Until then the
+transfer's resource claims cover metered deliveries, not Git-process memory.
+
+**Enabling blocker: split-UID runner tree.** `importMaintenanceTip` pins every
+source-path component from the filesystem root through `safeDir`, which rejects the
+production split-UID runner root (`worker:runner` 3775, sticky) and the repository
+directory under it (worker-owned, group `runner`, 2775), so with the guard enabled
+every split-UID transfer would refuse `maintenance_source_layout_unsupported` at the
+source pin, before any Git launch. The split-UID test models do not cover those two
+directories. Supporting the production layout requires a separately reviewed
+layout/admission design that preserves component-replacement protection, plus tests
+using the exact entrypoint ownership and modes. No permission broadening is presumed
+safe or authorized here.
+
+Current enforcing symbols are `GitCache.importMaintenanceTip` (admission,
+`literalBranch`, no-follow pins/walk, canonical shallow checks, eligible anchors,
+selection, staging, decoded proof, import/no-op and final rechecks),
+`stageMaintenancePack` and `indexMaintenancePack` (private transport), and
+`verifyRecoveryClosureBound` (the unchanged ordinary full-closure walk), all in
+`agent/src/git.ts`. `RunRunner.withRetainedSourceBoundary` owns the transfer
+operation/children in `agent/src/runner.ts`; `RecoveryCoordinator.admitTerminalOrigin`
+in `agent/src/recovery.ts` joins that owner before its fresh output pair/index.
+
+The original slot/signal/deadline is retained. Read/private-proof operations add no
+remote pair. Immediately before canonical import, a fresh pair follows all Git
+metadata acquisition; only local deny/pin checks follow the pair before dispatch.
+The real-owner tests cover import custody refusal, output custody refusal,
+post-import range failure, clean `already_present`, and fixed shallow diagnostics.
+Successful no-op returns after both canonical shallow checks and identity rechecks,
+then follows the same owner-join/fresh-output path; it imports no pack and writes no ref.
+
+The producer-only stage parent-mode equality reuses its already charged stat and
+leaves the ordinary helper default unchanged. The final pre-rename parent recheck
+performs additional charged admin stats. The ordinary public family reader strips
+any extra private config-read option, so only the importer supplies that binding.
+Literal branch/ref handling preserves valid punctuation, Unicode whitespace and
+long names rather than imposing a new ASCII/1024-character cap; input validation
+and closed-anchor string capacity are reserved as metadata before allocation.
+Late observed regular-file hardlinks retain the fixed alias refusal at both fd and
+named rechecks without adding filesystem operations. See the delivery record's
+per-site accounting, acceptance, port and measured resource tables.
+
+### Complete-boundary writer induction and per-pinner acquisition chains
+
+Owner decision 9ab05c2f (owner baseline 735d3734) resolves the previously reported R3
+prerequisite by audit, not by a writer change. Owners report a composed test through
+real worker code at origin/main 735d3734, substituting direct RecoveryCoordinator.pin
+for the private runner journaling wrapper: failed fetchAgentBranch leaves an
+unreferenced tip commit with missing ancestors; the journal records it; boot coverage
+refuses with "recovery coverage proof failed" at its ancestry check, no coverage ref is
+pinned and custody is retained. Owners traced the remaining writer chains to successful
+fetch connectivity, connected synthesis or existing explicit full walks. No reachable
+producer of a root missing its tree/blob was found. This is owner-reported evidence on
+735d3734, not a test run by this worker or on its baseline 76cd0a66. Proceed under the
+existing non-shallow precondition, record the three named residuals and leave live
+writers unchanged; any OTHER unresolved writer gap still triggers R3.
+
+The trusted-boundary invariant is conditional on initially healthy non-shallow
+worker-owned storage, normal Git fetch connectivity and the stated same-uid/crash
+residuals. It covers **all canonical ref namespaces**, including staging/transient refs;
+eligible anchors are selection minimization only. Fetch negotiation/connectivity can
+exclude history under every existing ref. Mere presence, journal authenticity, commit
+type or ancestry alone is never the acquisition proof. The following acquisition table
+is part of this ADR and the delivery/PR record.
+
+Exhaustive tracked production-writer/caller sweeps covered
+clone/fetch/update-ref/commit-tree/write-tree/index-pack, other import verbs, canonical
+paths and constructed ref namespaces. The SHA/acquisition/quote column preserves
+baseline line citations; the added current-pointer column maps unchanged source lines
+into this working tree. Paths below are `agent/src/` unless stated; source baseline
+76cd0a66 differs from owner test 735d3734.
+
+| Writer / presence-only pinner | Baseline SHA source, acquisition chain and implementing quote | Current working-tree source sites |
+|---|---|---|
+| Initial cloneBare, heads/tags | `git.ts:15054` uses `["clone", "--bare", "-c",` (not mirror/no depth/filter). Successful ordinary full clone establishes initial population. Owner-required producer non-shallow checks exclude shallow-derived stores without changing this writer. | Source/caller symbols and quoted acquisition chain in the baseline-evidence column; production writers unchanged. |
+| Warm fetch/origin/checkpoint refs | `git.ts:15085` `["fetch", "--prune", "origin"]`; `:15098` `["fetch", "origin", "+refs/uzi-checkpoints/*:refs/uzi-checkpoints/*"]`; exact task checkpoint `:2770` awaits fetch then verifies advertised SHA. Connectivity is relative to all existing refs, not unreferenced objects. | Source/caller symbols and quoted acquisition chain in the baseline-evidence column; production writers unchanged. |
+| Publication/workflow/secret-scan/default temporary refs | Fetch writers `git.ts:2991/:11576–11577/:13032/:13258–13259` use `"fetch", "--refmap="` or `"fetch", "--", "origin"`, with explicitly constructed publication-floor/workflow-target/secret-scan-floor/origin-default destinations. Successful transport supplies closure before later semantic validation; abandoned refs remain induction roots. | Source/caller symbols and quoted acquisition chain in the baseline-evidence column; production writers unchanged. |
+| fetchAgentBranch → staged incoming → promotion | `git.ts:4853–4854` supplies `"fetch", "--refmap=", "--no-tags",` and `"--no-write-fetch-head"` with file transport and branch-to-stage refspec; stage is `refs/uzi-incoming/` (:4849). Await transport before resolveCommitStrict (:4858); then `promoteTrackingUnderLock` writes runner tracking (:17282, `"update-ref", runnerTrackingRef(branch)`). Thrown transport bypasses incoming pinning; connected staged refs differ from unreferenced residue. | Source/caller symbols and quoted acquisition chain in the baseline-evidence column; production writers unchanged. |
+| updateTrackingRef / bridge synthesis | Sole live adoption caller `runner.ts:14987`; before it, :14981–14982 execute `await this.git.scratchPublicationPreflight(barePath, branch, H);` and the same call for bridge. `git.ts:15461` constructs `["-c", "commit.gpgsign=false", "commit-tree", tipTree, "-p", tip]`; floors supply further parents (:15462), from acquired canonical published/checkpoint history. Existing full walk is `"rev-list", "--objects", "--missing=error", "--quiet", candidate` (:2919). Not merely requireOwedCommit. | Source/caller symbols and quoted acquisition chain in the baseline-evidence column; production writers unchanged. |
+| Workflow wrappers / checkpoint-chain synthesis | `git.ts:10547` `["read-tree", realTip]`, :10565 `["read-tree", "--prefix=.github/workflows",`, :10569 `["write-tree"]`, :10577 `["-c", "commit.gpgsign=false", "commit-tree", newRoot]`, :10578 adds existing connected parents. realTip is imported canonical candidate; workflowSource is freshly fetched default (:10449), previous checkpoint is prior connected published/synthesized state. checkpointPack :9602–9603 explicitly preflights source and transformed candidate before publication, including any claim-provided prior checkpoint input. | Source/caller symbols and quoted acquisition chain in the baseline-evidence column; production writers unchanged. |
+| anchorRecoveryHead | Sole caller `runner.ts:17137`. transferRestorePointToTrustedBare awaits fetchTracking (:17102; calls fetchAgentBranch at :14724 and rejects not_updated at :14727), verifies tracking coverage, then :17127 rejects `if (head === null \|\| head !== fetched.candidateSha) {` before anchoring its private clone HEAD. Writer `git.ts:5463` uses `["update-ref", pinRef, sha]`. No arbitrary present-object discovery. | `runner.ts:17141`, `runner.ts:17106`, `runner.ts:14728`, `runner.ts:14731`, `runner.ts:17131`, `git.ts:5463` |
+| createQuarantineArchiveRef / uzi-archive run-generation pin | Sole caller `quarantine-archive.ts:124–127`: `const head = await git.trackingTip(barePath, branch);` then archive that exact head. trackingTip resolves runnerTrackingRef's commit (`git.ts:5017`), from successful fetch/promotion or preflighted bridge. Writer :5498 uses `["update-ref", ref, sha, ""]`. | Source/caller symbols and quoted acquisition chain in the baseline-evidence column; production writers unchanged. |
+| pinCodeSnapshot | Capture `runner.ts:11833–11839` checks branch HEAD equality and `await this.requireTrackingOwned(flight, barePath, runnerClone.branch, head);`; defaultCommit comes from originBranchTip. Capture pin=false follows successful fetch (:11979–11982 or :13426–13432); writing call :13442 uses that captured head. Writer `git.ts:5193` `["update-ref", ref, head, ""]`. A previously acquired head may legitimately no longer be current tracking tip. | Source/caller symbols and quoted acquisition chain in the baseline-evidence column; production writers unchanged. |
+| pinOwedUnderLock | All five call sites in `git.ts`: :4870 successfully staged incoming; :17239 displaced observed tracking SHA; :17244 incoming promoted SHA; :4973 conflicting ancestor's observed SHA; :17603 retained current observed SHA. Incoming follows fetch or preflighted bridge; others are exact ref/receipt-derived SHAs. Writer :17049 `["update-ref", ref, sha]`. :16885 `"cat-file", "-t", sha` is type evidence only. | Source/caller symbols and quoted acquisition chain in the baseline-evidence column; production writers unchanged. |
+| retainCurrentOwedCandidate | Live callers `runner.ts:5168/:14441` supply trusted owed context. `git.ts:17596–17603` observes tracking under lock, requires matching owner run, and pins that observed SHA. Receipt :17103 checks `receipt.trackingSha === sha` and committed phase; :17107–17108 bind branch/run/generation/context. Attribution binds the ref; it does not certify arbitrary dangling objects. | Source/caller symbols and quoted acquisition chain in the baseline-evidence column; production writers unchanged. |
+| clearConflictingAncestorTrackingRefs / uzi-archive branch-SHA pin | Only promotion calls it (`git.ts:17264`). :4968 observes each conflicting tracking ancestor, :4969 refuses unknown observation, :4975 records `sha: observed.sha`; :4973 optionally owed-pins same SHA. :4984 `["update-ref", archive, sha]` precedes :4986 deletion of the old tracking ref. Existing ref closure is copied, not manufactured by commit-type check. | Source/caller symbols and quoted acquisition chain in the baseline-evidence column; production writers unchanged. |
+| pinSettlementRefs — source | `runner.ts:16814` requires successor seededFrom tracking/checkpoint; :16824 excludes guarded predecessor; :16831 `if (!(await this.git.isAncestorRef(barePath, pred.sourceSha, clone.baseCommit))) continue;`; :16832–16835 pins source/adopted. Source closure follows membership in independently complete adopted history, not journal authentication/ancestry alone. | Source/caller symbols and quoted acquisition chain in the baseline-evidence column; production writers unchanged. |
+| pinSettlementRefs — adopted | Same call supplies clone.baseCommit. `git.ts:3991–3997/:4022–4054` chooses tracking/owner checkpoint refs; effectiveBase returned at :4502 may peel wrapper/marker to acquired ancestors (:4176/:4215–4233). Recovery override :7328–7329 binds episode pin (:7310–7311), explicitly closure-proved before creation (:7094–7097). | Source/caller symbols and quoted acquisition chain in the baseline-evidence column; production writers unchanged. |
+| pinSettlementRefs — pushed | Sole writing caller `runner.ts:16979–16992` uses successfulPushedSha or valid completion body.head. Field set only after awaited pushBranch (:8519–8527) over tracking-owned publication.candidate (:8485). CompletionHead (:9944) derives from same success field (:9400–9402). Scope-capped zero-slice body (:7853–7857) is `report_only`, skipped by journalTerminalReport (:7113), and never reaches this pin. | Source/caller symbols and quoted acquisition chain in the baseline-evidence column; production writers unchanged. |
+| pinSettlementRefs — published | `runner.ts:2988` maps pinPublished to `{ published: sha }`; `recovery-settlement.ts:820–822` checks source/adopted ancestry then pins. Sole producer `runner.ts:16895` supplies branch successfulPushedSha (:9321/:16913–16915) or checkpoint packed.tipOid only after publication ack AND successful pack-child exit (:16436–16457). checkpointPack full preflights (git.ts:9602–9603) establish transformed tree/parent closure before publication. Shared pin writer `git.ts:6146` uses `"update-ref"`; local commit presence is supplemental. | Source/caller symbols and quoted acquisition chain in the baseline-evidence column; production writers unchanged. |
+| Recovery episode pin | `git.ts:7094`: `if (!await this.verifyRecoveryClosure(barePath, tip)) throw new Error("captured object closure is invalid");`, before episode update-ref :7097. Explicit full-closure verification supplies proof for later recovery-successor references. | Source/caller symbols and quoted acquisition chain in the baseline-evidence column; production writers unchanged. |
+| buildRecoveryCoverage / coverage ref | `recovery.ts:1254–1261` adds originalSourceSha to roots; `git.ts:17781–17782` builds `"commit-tree", tree` over those parents; :17797 requires root ancestry or throws `"recovery coverage proof failed"`, before `"update-ref", coverageRef, sha` (:17804). **Owner audit/test resolves earlier concern:** reachable source chains are connected, or tested missing-ancestor failed-fetch root refuses before pin. This ancestry protection is incidental and NOT a tree/blob closure proof; no reachable producer of a root missing tree/blob was found. Keep the residual, not a claim that the builder independently proves closure. | Source/caller symbols and quoted acquisition chain in the baseline-evidence column; production writers unchanged. |
+| RECOVERY_BUNDLE_REF / transient recovery bundle pin | `git.ts:13369` `["update-ref", RECOVERY_BUNDLE_REF, h]` precedes bundle production. Quarantine caller (:150) uses tracking-derived archive head; coordinator `recovery.ts:2771/:3970` supplies record.sourceSha from acquired/proved sources or connected coverage above. Owner failed-transfer composed test refuses before the coverage ref, so that partial root never reaches this transient pin. Never an eligible boundary anchor. | Source/caller symbols and quoted acquisition chain in the baseline-evidence column; production writers unchanged. |
+| Explicit index-pack writers | `git.ts:5565` `["index-pack", "--stdin", "--strict", "--check-self-contained-and-connected"]` targets temporary bundle-verification bare; :14477 `"index-pack", "--strict"` indexes private staging; :14788 `spawnGitAsRunnerWithStdin(clonePath, ["index-pack", "--stdin"])` targets runner clone. Canonical transport imports are clone/fetch above. | Source/caller symbols and quoted acquisition chain in the baseline-evidence column; production writers unchanged. |
+| Delete-only transaction | `git.ts:5998–5999` prepares `update-ref --stdin` with `delete`; deletes cannot enlarge closure. Include in exhaustive classification, not as acquisition. | Source/caller symbols and quoted acquisition chain in the baseline-evidence column; production writers unchanged. |
+| importMaintenanceTip — objects only, never refs | Nonempty: selected exact-OID/decoded proof + trusted-boundary invariant → canonical import → bare-only range check and identity/control revalidation (`validate()`; the shallow query is checked before boundary formation and at the post-proof recheck preceding import, and is not re-run after import) → scoped imported result. Empty: eligible-anchor ancestry proof and same admission/rechecks → already_present. Owner joins/fresh observation precede accepted output index. Failed post-import residue has no accepted result; successful connected but not-yet-indexed imports are legitimate unnamed objects, not forbidden merely for lacking a ref. | Source/caller symbols and quoted acquisition chain in the baseline-evidence column; production writers unchanged. |
+
+**Three named residuals required in ADR-1197 and PR:** (1) the trusted-boundary
+invariant relies on fetch connectivity checks and existing explicit walks;
+buildRecoveryCoverage's protection against partial roots is incidental (ancestry), not a
+tree/blob closure proof; (2) failed agent-branch fetch may leave unreferenced partial
+objects in the bare—fetch does not trust unreferenced objects; (3) maintainers track
+writer hardening separately and this child changes none of those writers. The owners'
+tested failure retained custody; do not generalize it into an independently verified
+full-closure guarantee for the builder.
+
+**Residue versus provenance:** failed-fetch unreferenced objects and U4b
+post-import-failure residue are not trusted by presence/type or a journal alone and
+authorize no pin/output/FINAL/release/cleanup. Successful
+fetch-connected/synthesized/full-walk-verified objects can be connected but unnamed
+(verified import before its index write, preflighted bridge, prior verified snapshot
+head). Current pinners use the acquisition chains above; do not add a rule banning
+legitimate unnamed verified objects. A new caller/acquisition path not covered here
+needs its own proof; any other unresolved writer gap is still R3. The ordinary-journal →
+coverage concern is resolved by owner audit/test evidence, not waived by plan approval
+or repaired in this child.
+
+Automatic maintenance: `git.ts:4745–4746` sets `maintenance.auto=false` and `gc.auto=0`;
+per-invocation gitEnv pins at :19714–19715 reinforce them. `:4674` `await git(["repack",
+"-a", "-d", "-q"]);` is runner-clone materialization only. Tracked searches found no
+explicit canonical repack/prune or agent core.fsync setting; no other issue is cited as
+establishing the invariant.
+
+### Canonical history-decoration writer audit
+
+Record in audit/ADR: at baseline 76cd0a66 no tracked production writer creates canonical
+`info/grafts` or `refs/replace/*`. Tests do create replacements in temporary bare
+fixtures (`recovery-guarded-producer.test.ts:277`,
+`repo-instructions-at-commit.test.ts:142`), so do not say “no writer” without the
+production qualification.
+
+Exhaustive tracked grep: `git grep -n -i -e graft -e 'refs/replace' -e 'refs\\/replace'
+-e GIT_NO_REPLACE_OBJECTS -e GIT_REPLACE_REF_BASE -e '"replace"' -e "'replace'"`;
+complete hits at `.uzi/scratch/point7-exhaustive-grep.txt`. Destination/plumbing
+enumeration: `git grep -n -E
+'update-ref|symbolic-ref|pack-refs|fetch.*refspec|refs/\\*|refs/heads/\\*|--mirror|fast-import|unpack-objects'
+-- agent/src`; evidence at `.uzi/scratch/point7-writer-hits.txt` and expanded variants
+`.uzi/scratch/point7-expanded-hits.txt`.
+
+Matches are defensive env pins (`git.ts:2441` `GIT_GRAFT_FILE: "/dev/null"`, :13556
+`GIT_REPLACE_REF_BASE: "refs/disabled/"`), clone-side refusal (:11931), tests/docs or
+unrelated replacement. Clone is bare, not mirror (:15054); refspecs are heads→origin
+(:15059), checkpoints (:15098), and branch→incoming (:4853–4854). External/same-uid
+actors and config remain trust residuals.
+
+
+
+Current production-only repeat: `git grep -n -i -e graft -e 'refs/replace' -e
+'refs\/replace' -e GIT_NO_REPLACE_OBJECTS -e GIT_REPLACE_REF_BASE -e '"replace"' -e
+"'replace'" -- agent/src` returned defensive pins, refusals and comments, with no
+production history-decoration writer found. The current hits are
+`agent/src/git.ts:1101`, `:2439`, `:2441`, `:2511`, `:2512`, `:5528`, `:5529`, `:5567`,
+`:7020`, `:7021`, `:7022`, `:11500`, `:11502`, `:11677`, `:11872`, `:11945`, `:12344`,
+`:12658`, `:12664`, `:13683`, `:13684`, `:14516`, `:14517` and `:16547`. Verdict for
+each listed site: already accurate defensive configuration, refusal or explanatory
+comment; none creates canonical grafts/replacements. The broad historical
+plumbing/ref-path/filesystem sweeps are recorded in
+`.uzi/scratch/point7-exhaustive-grep.txt`, `point7-writer-hits.txt`,
+`point7-expanded-hits.txt`, `point7-ref-path-hits.txt`, `point7-filesystem-writers.txt`
+and `point7-other-writers.txt`. Current repeat evidence:
+`.uzi/scratch/u4b-history-decoration-production-grep.txt` and
+`.uzi/scratch/docs-u4b-current-history-grep.txt`. These scratch files are supporting run
+evidence; the findings, acquisition chains and limits are recorded here and in the
+delivery record.
+
+The unchanged-writers comparison records `captureMaintenanceWip`, `cloneBare`,
+`disableAutoMaintenance`, `fetchAgentBranch`, `updateTrackingRef`, `anchorRecoveryHead`
+and `pinSettlementRefs` unchanged against 76cd0a66. No production writer or W0-H change
+is part of U4b. Same-uid actors, storage loss, shallow-source writers and separate
+maintainer hardening remain outside this change.
+
+### U4b validation limit observed during M2
+
+The required full-gate fixture, including W0 and coordinator effects under its
+existing temporary-directory wrapper, exhausted the unchanged adminEntries limit.
+A narrowed reproduction refused the next 1-entry scratch-parent stat at 4,096
+entries, after proof and during the canonical-import phase's post-import-range
+dispatch guard; it used 16 charged RPCs plus 4 discovery attempts. The earlier direct
+fixture success at 3,983 admin entries does not establish this wrapped path's
+capacity. This over-cap result is R3 material-change evidence, not permission to
+raise the cap, shorten the failing path, remove proofs/checks or grant output/cleanup
+authority. This is historical failed-gate evidence. The owner has now resolved
+the resource-category decision by the C1-only correction and actual wrapped pass
+below. The implementation remains guarded off; full-gate and complete mutation-map
+obligations still block completion. Detailed counters and fixture repairs appear
+in [the delivery record](../docs/issue-3031-delivery.md#m2-owner-diagnosis-and-category-correction).
+
+
+### U4b owner-directed C1 category correction
+
+Diagnosis precedes redesign: at baseline `6f8f0b7c`, admin charges reconcile to
+4096 successful units plus one refused existing-ancestor lstat at `git.ts:13650`
+`scratchCheck`, before post-import range dispatch. Strict import had completed;
+no accepted output followed. No actual duplicate operation was established.
+The owner authorized a category correction preserving operations, units, separate
+consume calls, reservation timing, checks, scheduling, caps and timeouts.
+This resolves the resource R3 decision, not the historical failed gate.
+
+C1 existing-file stat/fstat/open/pin checks and parent/identity/cleanup reserves
+use `sourceEntries`: controls after exclusive creation, retries, initial/repeated
+scratch ancestry and staged/renamed entries. `own` retains
+depth+(administrative?3:0) and its separate nonadministrative three-unit consume,
+with `(depth+3)*6144` metadata. Private mkdir and exclusive HEAD/config creation
+remain `adminEntries`. Cleanup stays finite/prepaid after joins, retains uncertain
+identities and grants no canonical rollback.
+
+Disposable stage and proof-bound index select source for target and parent stats
+and cleanup reservations. Omitted options retain ordinary admin defaults, fsync,
+parent policy and environment. New private canonical config acquisition passes
+an explicit sixth `runGit` argument selecting source for raw nonempty NUL rows
+before filtering. `runGit` and
+`MaintenanceResources.consumeMetadataEntriesIfActive` default their optional
+category to admin; ordinary callbacks and W0 rows retain their original charges.
+Selected/range/index/CRC object rows stay `closureEntries`; metadata, encoded reads,
+artifact emission and decoded bodies retain independent charges.
+
+W0-H bytes are preserved (lead-verified hash prefix `77c072d`; exact W0 accounting
+test passed). Historical W0 totals remain P0=430, P1=0, P2+P3=380, P4a=426,
+P4b=1042, P5=262, aggregate2540. This is preservation, not a newly measured
+post-fix W0 subphase ledger.
+
+The measurements used the four-file category correction before its commit,
+not the unchanged source at `6f8f0b7c`. Main's actual wrapped eight-case run passed
+(`gate-log.Wjznwz`, EXIT=0, zero skips, 154614.593962 ms), with real procfs and
+tmpdir-leakguard wrappers, primary agent cwd, unchanged Linux os.tmpdir depth,
+only UZI_SQLC_DIR unset. Dirty import measured launches200/512,
+metadataBytes32870476/268435456, admin2664/4096, sources126/128,
+RPC18/32 +4 discovery=22 physical, sourceEntries13017/65536,
+sourceBytes201091/268435456, artifact2046/268435456, closure18/65536,
+decoded478/8GiB or tighter inherited C. Eight variants remain under their caps;
+index acceptance follows owner join and refusals block their respective effects.
+No ref, FINAL or cleanup authority follows.
+
+The delivery record carries the full baseline phase/operation table, each
+old-to-new site verdict, 15 new accounting cases and one preserved partial-write
+assertion adjustment, plus every slot dimension and physical/discovery RPC total
+for each wrapped variant. M2/M3, complete mutation mapping, integration/full gate
+and new candidate reviewer/tester/auditor sign-offs remain incomplete and mandatory.
+The timed-out full gate is not green. Guard remains false; C2–C8, compose70/72/73
+and hosted timing retain their separate unproven boundaries.
