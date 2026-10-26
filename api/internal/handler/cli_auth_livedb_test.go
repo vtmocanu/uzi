@@ -26,7 +26,6 @@ import (
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
-	"github.com/vtmocanu/uzi/api/internal/vault"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -49,8 +48,9 @@ var cliTestSecret = []byte("0123456789abcdef0123456789abcdef")
 // cliLiveDB builds a live-DB-backed Handler wired with the collaborators the ceiling
 // tests actually reach (wsvc for run reads, settings for /auth/me + the admin
 // settings read), plus its full Routes() router mounting the real RequireUser /
-// RequireAdminRO chain, with a database-backed vault. The optional auth limiter
-// lets vault tests exercise the real per-user budget; other limiters are generous.
+// RequireAdminRO chain. The vault stays unwired, as most suites expect; the vault
+// suite wires one via cliVaultLiveDB. The optional auth limiter lets vault tests
+// exercise the real per-user budget; other limiters are generous.
 func cliLiveDB(t *testing.T, authLimiters ...*mw.Limiter) (*Handler, http.Handler, *pgxpool.Pool) {
 	t.Helper()
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
@@ -78,7 +78,6 @@ func cliLiveDB(t *testing.T, authLimiters ...*mw.Limiter) (*Handler, http.Handle
 			AuthTokenTTL: time.Hour,
 		},
 		wsvc:     workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()}),
-		vault:    vault.New(box, q),
 		settings: settings.New(&settingsStore{}, time.Minute),
 		hub:      hub.New(),
 	}

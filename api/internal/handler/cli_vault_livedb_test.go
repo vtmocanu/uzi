@@ -13,13 +13,15 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/auth"
 	"github.com/vtmocanu/uzi/api/internal/clitoken"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
-// These tests deliberately use cliLiveDB's full Routes router and persisted
+// These tests deliberately use cliVaultLiveDB's full Routes router and persisted
 // vault rows. A non-401 alone would also pass with an unwired vault returning 500.
 const cliVaultPassword = "a-dedicated-vault-passphrase"
 
@@ -45,6 +47,15 @@ func cliVaultStatus(t *testing.T, router http.Handler, token string, want bool) 
 	}
 }
 
+// cliVaultLiveDB is cliLiveDB with a database-backed vault. Only this suite wires
+// one: other cliLiveDB suites save secrets without unlocking a vault.
+func cliVaultLiveDB(t *testing.T, authLimiters ...*mw.Limiter) (*Handler, http.Handler, *pgxpool.Pool) {
+	t.Helper()
+	h, router, pool := cliLiveDB(t, authLimiters...)
+	h.vault = vault.New(h.box, h.q)
+	return h, router, pool
+}
+
 func cliVaultSeed(t *testing.T, h *Handler, id uuid.UUID) {
 	t.Helper()
 	if err := h.vault.Unlock(context.Background(), id, cliVaultPassword); err != nil {
@@ -54,7 +65,7 @@ func cliVaultSeed(t *testing.T, h *Handler, id uuid.UUID) {
 }
 
 func TestCLIVaultUnlockStatusLiveDB(t *testing.T) {
-	h, router, pool := cliLiveDB(t)
+	h, router, pool := cliVaultLiveDB(t)
 	owner := cliSeedUser(t, pool, false)
 	token := cliMintToken(t, pool, owner, clitoken.ScopeUser)
 	cliVaultSeed(t, h, owner)
@@ -69,7 +80,7 @@ func TestCLIVaultUnlockStatusLiveDB(t *testing.T) {
 }
 
 func TestCLIVaultOIDCPassphraseLiveDB(t *testing.T) {
-	h, router, pool := cliLiveDB(t)
+	h, router, pool := cliVaultLiveDB(t)
 	owner := cliSeedUser(t, pool, false)
 	cliMustExec(t, pool, "UPDATE users SET password_hash = NULL WHERE id = $1", owner)
 	jwt := cliMintJWT(t, pool, owner)
@@ -88,7 +99,7 @@ func TestCLIVaultOIDCPassphraseLiveDB(t *testing.T) {
 }
 
 func TestCLIVaultWrongPasswordNoVaultLiveDB(t *testing.T) {
-	h, router, pool := cliLiveDB(t)
+	h, router, pool := cliVaultLiveDB(t)
 	owner, absent := cliSeedUser(t, pool, false), cliSeedUser(t, pool, false)
 	cliVaultSeed(t, h, owner)
 	ownerToken := cliMintToken(t, pool, owner, clitoken.ScopeUser)
@@ -111,7 +122,7 @@ func TestCLIVaultWrongPasswordNoVaultLiveDB(t *testing.T) {
 }
 
 func TestCLIVaultOwnerIsolationLiveDB(t *testing.T) {
-	h, router, pool := cliLiveDB(t)
+	h, router, pool := cliVaultLiveDB(t)
 	owner, admin := cliSeedUser(t, pool, false), cliSeedUser(t, pool, true)
 	cliVaultSeed(t, h, owner)
 	ownerToken := cliMintToken(t, pool, owner, clitoken.ScopeUser)
@@ -139,7 +150,7 @@ func TestCLIVaultOwnerIsolationLiveDB(t *testing.T) {
 }
 
 func TestCLIVaultSharedUserLimitLiveDB(t *testing.T) {
-	h, router, pool := cliLiveDB(t, mw.NewLimiter(2, time.Hour, nil))
+	h, router, pool := cliVaultLiveDB(t, mw.NewLimiter(2, time.Hour, nil))
 	owner, other := cliSeedUser(t, pool, false), cliSeedUser(t, pool, false)
 	cliVaultSeed(t, h, owner)
 	cliVaultSeed(t, h, other)
@@ -167,7 +178,7 @@ func TestCLIVaultSharedUserLimitLiveDB(t *testing.T) {
 func TestCLIVaultAuthenticationCSRFLiveDB(t *testing.T) {
 	// A one-request budget also proves rejected authentication/CSRF attempts
 	// never consume the authenticated owner's unlock allowance.
-	h, router, pool := cliLiveDB(t, mw.NewLimiter(1, time.Hour, nil))
+	h, router, pool := cliVaultLiveDB(t, mw.NewLimiter(1, time.Hour, nil))
 	owner := cliSeedUser(t, pool, false)
 	cliVaultSeed(t, h, owner)
 	jwt := cliMintJWT(t, pool, owner)
@@ -207,7 +218,7 @@ func TestCLIVaultAuthenticationCSRFLiveDB(t *testing.T) {
 }
 
 func TestCLIVaultCookieOnlyWritesLiveDB(t *testing.T) {
-	h, router, pool := cliLiveDB(t)
+	h, router, pool := cliVaultLiveDB(t)
 	owner := cliSeedUser(t, pool, true)
 	cliMustExec(t, pool, "UPDATE users SET password_hash = NULL WHERE id = $1", owner)
 	jwt := cliMintJWT(t, pool, owner)
