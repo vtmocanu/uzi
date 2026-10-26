@@ -204,6 +204,8 @@ interface Spec {
   real: boolean;
   /** CONTROL ONLY: the source checkout the precondition reads (default: the checkout this test runs from). */
   sourceRoot?: string;
+  /** CONTROL ONLY: replaces the archive step with a fault ("skip": no archive outcome at all). */
+  controlArchive?: Error | "skip";
   /** CONTROL ONLY: lowers limits at evaluation time, from the phases the run actually charged. */
   controlLimits?: (limits: Limits, phases: ReadonlyArray<{ name: string; used: Counters }>) => Limits;
 }
@@ -637,9 +639,10 @@ async function runPipeline(t: TestContext, spec: Spec): Promise<RunResult> {
       try {
         // Self-contained first; the guarded thin fallback is taken inside produceRecoveryBundle only
         // on RecoveryBundleTooLargeError.
-        const result = await git.produceRecoveryBundle(bare, { sourceSha: importerResult.sourceSha, outPath,
+        if (spec.controlArchive instanceof Error) throw spec.controlArchive;
+        const result = spec.controlArchive === "skip" ? undefined : await git.produceRecoveryBundle(bare, { sourceSha: importerResult.sourceSha, outPath,
           guardedDefaultBranch: args[0].defaultBranch });
-        archive = { kind: result.selfContained ? "self-contained" : "thin", bytes: result.byteSize, cap_bytes: RECOVERY_MAX_BUNDLE_BYTES,
+        if (result) archive = { kind: result.selfContained ? "self-contained" : "thin", bytes: result.byteSize, cap_bytes: RECOVERY_MAX_BUNDLE_BYTES,
           prerequisite_shas: result.prerequisiteShas.length, source_sha: result.sourceSha };
       } catch (error) {
         archiveError = error;
@@ -754,6 +757,7 @@ async function runPipeline(t: TestContext, spec: Spec): Promise<RunResult> {
       "isIdle: harness check of sole execution in the container and a settled runner, passed to the real MaintenanceWriterExclusion (no Worker object exists; this does not prove production Worker-idleness integration)",
       "produceRecoveryBundle: every call outside the archive window throws RecoveryBundleTooLargeError (models the ordinary pre-slot capture refused as oversize, not a journaled bundle); calls are counted; every run depending on it is gate-ineligible",
       ...(spec.controlLimits ? ["CONTROL ONLY: limits lowered at evaluation time"] : []),
+      ...(spec.controlArchive ? ["CONTROL ONLY: archive step replaced by a fault"] : []),
       ...(spec.real ? [] : ["CONTROL ONLY: passingExclusion", "CONTROL ONLY: stubbed quiescence verdict", "CONTROL ONLY: trusted-ancestor DAC projection"])],
     layout_construction: spec.layout === "dissociated" ? "real GitCache.materializeRunnerClone" : "clone --shared, alternates retained",
     uid_mode: process.env.UZI_UID_SPLIT === "1" ? "split-UID requested (not covered by this harness)" : "single-UID (UZI_UID_SPLIT unset); split-UID is not covered",
@@ -772,7 +776,7 @@ async function runPipeline(t: TestContext, spec: Spec): Promise<RunResult> {
     archive: archive ?? { kind: "none", bytes: 0, cap_bytes: RECOVERY_MAX_BUNDLE_BYTES, error: archiveError instanceof Error ? archiveError.message : undefined },
     transfer: importerResult ?? null,
     loose_objects: spec.shape === "C" ? { target: spec.loose, source: spec.loose === LOOSE_SAMPLE_LARGEST ? LOOSE_SAMPLE_NOTE : "ladder rung above the sample" } : undefined,
-    refusal: evaluation.refusal ?? null, refusals,
+    refusal: evaluation.refusal ?? null, refusals, reason: evaluation.reason,
     verdict: evaluation.verdict, verdict_detail: evaluation,
   });
   return { record, evaluation };
@@ -980,6 +984,24 @@ describe("#3031 composed measurement verdict controls", () => {
     assert.ok((record.phases as Record<string, Counters>).archive?.artifactBytes, "the archive phase charged artifactBytes");
     assert.equal(evaluation.verdict, "FAIL", JSON.stringify(record));
     assert.deepEqual(evaluation.violations.map(v => [v.dimension, v.phase]), [["artifactBytes", "archive"]]);
+  });
+
+  it("control (pipeline): an arbitrary archive failure is FAIL, never relabelled UNRUN", { skip: LINUX_ONLY, timeout: 120_000 }, async t => {
+    const { evaluation, record } = await runPipeline(t, { ...small("control-archive-fault"), controlArchive: new Error("archive exploded") });
+    assert.equal(evaluation.verdict, "FAIL", JSON.stringify(record));
+    assert.equal(evaluation.refusal?.phase, "archive");
+  });
+
+  it("control (pipeline): an owed-bare refusal of the archive step is UNRUN with the precondition reason", { skip: LINUX_ONLY, timeout: 120_000 }, async t => {
+    const { evaluation, record } = await runPipeline(t, { ...small("control-archive-owed-bare"), controlArchive: new Error("unsafe worker bare directory") });
+    assert.equal(evaluation.verdict, "UNRUN", JSON.stringify(record));
+    assert.match(String(record.reason), /archive precondition/);
+  });
+
+  it("control (pipeline): a pipeline that ends without an archive outcome is FAIL, never PASS", { skip: LINUX_ONLY, timeout: 120_000 }, async t => {
+    const { evaluation, record } = await runPipeline(t, { ...small("control-archive-none"), controlArchive: "skip" });
+    assert.equal(evaluation.verdict, "FAIL", JSON.stringify(record));
+    assert.equal(evaluation.reason, "the pipeline ended without an archive outcome");
   });
 
   it("control 10 (pipeline): with a lowered configured C the decoded limit follows the admission", { skip: LINUX_ONLY, timeout: 120_000 }, async t => {
