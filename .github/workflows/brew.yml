@@ -105,6 +105,10 @@ jobs:
   publish-formula:
     # Serialize only the tap read/guard/write interval. Publication proofs can wait
     # in parallel without holding this lock. Retain up to 100 pending publishers.
+    # A promote can push stable and next-RC tags within minutes; both fresh clones
+    # push tap main without rebase. A per-ref lock would permit non-fast-forward
+    # collisions (PRD #1378 R5). This shared lock also protects the version guard's
+    # read-then-push interval, so delayed candidates cannot downgrade the formula.
     concurrency:
       group: brew-tap-publish
       cancel-in-progress: false
