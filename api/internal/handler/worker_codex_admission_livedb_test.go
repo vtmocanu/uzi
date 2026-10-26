@@ -11,12 +11,27 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
+
+func assertAdmissionSpreadBound(t *testing.T, eligible pgtype.Timestamptz, expiry time.Time, widthMs int32) {
+	t.Helper()
+	if !eligible.Valid || eligible.Time.Before(expiry) {
+		t.Fatalf("spread eligibility=%v before expiry=%v", eligible, expiry)
+	}
+	if widthMs == 0 {
+		if !eligible.Time.Equal(expiry) {
+			t.Fatalf("zero-width eligibility=%v, want %v", eligible, expiry)
+		}
+	} else if !eligible.Time.Before(expiry.Add(time.Duration(widthMs) * time.Millisecond)) {
+		t.Fatalf("spread eligibility=%v outside persisted width=%dms from %v", eligible, widthMs, expiry)
+	}
+}
 
 // Real Bearer -> route -> handler -> service -> SQL, before any M2 dependents.
 // This uses the worker_codex_livedb_test.go fixture pattern without minting a
@@ -109,10 +124,76 @@ func TestWorkerCodexAdmissionPersistedLiveDB(t *testing.T) {
 		t.Fatalf("duplicate altered receipts: %v", err)
 	}
 	eligible, err := q.GetCodexAdmissionRunEligibility(ctx, run)
-	if err != nil || !eligible.Valid || eligible.Time.Before(state.EffectiveExpiry.Time) ||
-		!eligible.Time.Before(state.EffectiveExpiry.Time.Add(30*time.Second)) {
-		t.Fatalf("spread eligibility=%v: %v", eligible, err)
+	if err != nil {
+		t.Fatal(err)
 	}
+	assertAdmissionSpreadBound(t, eligible, state.EffectiveExpiry.Time, state.SpreadWidthMs)
+	t.Run("deterministic spread vectors", func(t *testing.T) {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(context.Background()) }()
+		// Fixed UUIDs exist only until this transaction rolls back. Copy the
+		// fixture's owner-scoped binding; distinct issues avoid the active-run index.
+		run9 := uuid.MustParse("00000000-0000-0000-0000-000000000009")
+		run10 := uuid.MustParse("00000000-0000-0000-0000-00000000000a")
+		for i, id := range []uuid.UUID{run9, run10} {
+			tag, err := tx.Exec(ctx, `INSERT INTO runs
+				(id,user_id,repo_id,kind,issue_iid,issue_title,issue_description,status,
+				 worker_id,claim_generation,harness,codex_secret_id,codex_auth_mode,
+				 codex_secret_label,codex_material_revision,codex_account_key,codex_account_revision)
+				SELECT $1,user_id,repo_id,kind,$2,issue_title,issue_description,status,
+				 worker_id,claim_generation,harness,codex_secret_id,codex_auth_mode,
+				 codex_secret_label,codex_material_revision,codex_account_key,codex_account_revision
+				FROM runs WHERE id=$3`, id, 3530009+i, run)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tag.RowsAffected() != 1 {
+				t.Fatal("missing baseline run")
+			}
+		}
+		txq := store.New(tx)
+		for _, tc := range []struct {
+			name    string
+			run     uuid.UUID
+			episode string
+			width   int32
+			offset  time.Duration
+		}{
+			{"above 30 seconds", run9, "00000000-0000-0000-0000-000000000001", 35000, 32607 * time.Millisecond},
+			{"different run", run10, "00000000-0000-0000-0000-000000000001", 35000, 3491 * time.Millisecond},
+			{"different episode", run9, "00000000-0000-0000-0000-000000000002", 35000, 21139 * time.Millisecond},
+			{"zero width", run9, "00000000-0000-0000-0000-000000000001", 0, 0},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				if _, err := tx.Exec(ctx, `UPDATE codex_account_admission_throttle
+					SET episode_id=$3,spread_width_ms=$4 WHERE user_id=$1 AND provider_account_id=$2`,
+					owner, account.ID, uuid.MustParse(tc.episode), tc.width); err != nil {
+					t.Fatal(err)
+				}
+				persisted, err := txq.GetCodexAdmissionState(ctx, store.GetCodexAdmissionStateParams{UserID: owner, ProviderAccountID: account.ID})
+				if err != nil {
+					t.Fatal(err)
+				}
+				// Query the actual codex_admission_run_eligible_at twice for repeatability.
+				for repeat := 0; repeat < 2; repeat++ {
+					got, err := txq.GetCodexAdmissionRunEligibility(ctx, tc.run)
+					if err != nil {
+						t.Fatal(err)
+					}
+					assertAdmissionSpreadBound(t, got, persisted.EffectiveExpiry.Time, persisted.SpreadWidthMs)
+					if want := persisted.EffectiveExpiry.Time.Add(tc.offset); !got.Time.Equal(want) {
+						t.Fatalf("eligibility=%v, want %v (offset %s)", got, want, tc.offset)
+					}
+				}
+			})
+		}
+		if err := tx.Rollback(ctx); err != nil {
+			t.Fatal(err)
+		}
+	})
 	mustExecT(ctx, t, pool, "UPDATE runs SET status='recovery_wait',claim_released_at=now() WHERE id=$1", run)
 	if rec = post(); rec.Code != http.StatusNotFound {
 		t.Fatalf("post-park = %d %s", rec.Code, rec.Body.String())

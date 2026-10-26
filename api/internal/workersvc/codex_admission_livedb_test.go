@@ -41,6 +41,15 @@ func TestCodexAdmissionAuthorityLiveDB(t *testing.T) {
 		{"released", func(f codexRunFixture) { env.exec("UPDATE runs SET claim_released_at=now() WHERE id=$1", f.runID) }},
 		{"generation", func(f codexRunFixture) { env.exec("UPDATE runs SET claim_generation=2 WHERE id=$1", f.runID) }},
 		{"zero generation", func(f codexRunFixture) { env.exec("UPDATE runs SET claim_generation=0 WHERE id=$1", f.runID) }},
+		{"Claude harness", func(f codexRunFixture) {
+			// Keep the binding coherent under runs_codex_harness_coherence_check.
+			env.exec(`UPDATE runs SET harness='claude', codex_secret_id=NULL, codex_auth_mode=NULL,
+				codex_secret_label=NULL, codex_account_key=NULL, codex_material_revision=NULL,
+				codex_account_revision=NULL WHERE id=$1`, f.runID)
+		}},
+		{"wrong credential kind", func(f codexRunFixture) {
+			env.exec("UPDATE user_secrets SET kind='openai_api_key' WHERE id=$1", f.aliasID)
+		}},
 		{"disabled", func(f codexRunFixture) { env.exec("UPDATE user_secrets SET disabled_at=now() WHERE id=$1", f.aliasID) }},
 		{"material revision", func(f codexRunFixture) {
 			env.exec("UPDATE codex_credential_state SET material_revision=material_revision+1 WHERE user_secret_id=$1", f.aliasID)
@@ -72,6 +81,18 @@ func TestCodexAdmissionAuthorityLiveDB(t *testing.T) {
 			}
 		})
 	}
+	t.Run("API-key mode", func(t *testing.T) {
+		f := newAPIKeyFixture(t, env)
+		env.exec("UPDATE runs SET claim_generation=1 WHERE id=$1", f.runID)
+		f.svc.SetTxBeginner(env.pool)
+		err := f.svc.RecordCodexAdmissionSignal(env.ctx, f.wkr, f.runID, admissionSignal("rate_limit"))
+		if !errors.Is(err, ErrCodexAdmissionRefused) {
+			t.Fatalf("refusal = %v", err)
+		}
+		if admissionRowCount(t, env, f.userID) != 0 {
+			t.Fatal("refused API-key evidence persisted")
+		}
+	})
 	for _, status := range []string{"queued", "claimed", "running", "awaiting_approval", "awaiting_input", "awaiting_followup", "completed", "failed", "cancelled", "paused", "limit_wait", "recovery_wait", "pool_wait"} {
 		t.Run(status, func(t *testing.T) {
 			f := admissionServiceFixture(t, env)

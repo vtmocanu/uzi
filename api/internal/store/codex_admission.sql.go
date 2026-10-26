@@ -133,7 +133,7 @@ WITH inputs AS MATERIALIZED (
     FROM source CROSS JOIN inputs
 )
 INSERT INTO codex_account_admission_throttle AS current_state
-SELECT (state).user_id, (state).provider_account_id, (state).rate_step, (state).rate_expiry, (state).rate_last_qualifying, (state).overload_step, (state).overload_expiry, (state).overload_last_qualifying, (state).observation_clock, (state).receipts, (state).overload_votes, (state).episode_id, (state).spread_width_ms, (state).effective_expiry, (state).recovery_floor FROM initial
+SELECT (state).user_id, (state).provider_account_id, (state).rate_step, (state).rate_expiry, (state).rate_last_qualifying, (state).overload_step, (state).overload_expiry, (state).overload_last_qualifying, (state).observation_clock, (state).receipts, (state).overload_votes, (state).episode_id, (state).spread_width_ms, (state).effective_expiry, (state).recovery_floor FROM initial WHERE true
 ON CONFLICT (user_id, provider_account_id) DO UPDATE
 SET (rate_step, rate_expiry, rate_last_qualifying, overload_step, overload_expiry, overload_last_qualifying, observation_clock, receipts, overload_votes, episode_id, spread_width_ms, effective_expiry, recovery_floor) = (
     SELECT next_state.rate_step, next_state.rate_expiry, next_state.rate_last_qualifying, next_state.overload_step, next_state.overload_expiry, next_state.overload_last_qualifying, next_state.observation_clock, next_state.receipts, next_state.overload_votes, next_state.episode_id, next_state.spread_width_ms, next_state.effective_expiry, next_state.recovery_floor
