@@ -656,7 +656,7 @@ quiescence; their lines are marked as not eligible for the gate.
 
 #### Official diagnostic run (harness `91a8ad16`)
 
-Environment: the rc.26 worker image (pinned by digest in the run record), Git 2.54.0, Node v24.20.0,
+Environment: the rc.26 worker image `agent-base@sha256:74154d5bf9f738278b65db058c3116d74b8cc7dfababd33e1f2bdff46bccbf07`, Git 2.54.0, Node v24.20.0,
 emulated linux/amd64 on an arm64 host, single-UID 10001 (split-UID not covered), candidate SHA
 `91a8ad16b50c31618b6070cfdf7a30ad8f1078ed`. The harness ran the candidate's `agent/src` with
 lockfile-installed `node_modules`, not the image's `/app` (rc.26 predates C1). Elapsed time is
