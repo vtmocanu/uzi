@@ -70,7 +70,7 @@ func TestWorkerNameMiddleCell(t *testing.T) {
 		{"short", 13, "short"},
 		{"base.l-highmem-a32f", 16, "base.l-h…em-a32f"},
 		{"base.l-highmem-a32f", 13, "base.l…m-a32f"},
-		{"longname-suffix", 8, "…-suffix"},
+		{"longname-suffix", 8, "lon…ffix"},
 		{"abcdefghij", 5, "ab…ij"},
 		{"abc-longsegment", 5, "ab…nt"},
 		{"界界界界-a32f", 13, "界界界界-a32f"},
@@ -88,5 +88,96 @@ func TestWorkerNameMiddleCell(t *testing.T) {
 				t.Fatalf("width overflow: %q", got)
 			}
 		})
+	}
+}
+
+func TestWorkerNameDistinctHeads(t *testing.T) {
+	var renderer *tuiRenderer
+	for _, width := range []int{13, 16} {
+		a := renderer.WorkerName("laptop-buildserver123", width)
+		b := renderer.WorkerName("desktop-buildserver123", width)
+		if a == b || !strings.HasPrefix(a, "lapt") || !strings.HasPrefix(b, "desk") {
+			t.Errorf("width %d lost distinguishing heads: %q and %q", width, a, b)
+		}
+	}
+	m := workerRenderModel(true)
+	m.width = 160
+	for _, name := range []string{"laptop-buildserver123", "desktop-buildserver123"} {
+		r := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{ID: "run", Status: "running", IssueTitle: "title"}, WorkerName: sp(name)}
+		row := workerRow{w: apitypes.WorkerDTO{ID: "render", Name: name, Status: "online", Kind: "hosted"}}
+		for site, out := range map[string]string{
+			"board16": m.boardRow(r, false, boardMarkerCols{}, m.boardAccountCols([]apitypes.RunListItemDTO{r})),
+			"table13": m.workerRowLine(row, false, 160, m.workerTableWidths([]workerRow{row}, 160), time.Now()),
+		} {
+			if !strings.Contains(stripANSI(out), name[:4]) {
+				t.Errorf("%s lost distinguishing head of %q: %q", site, name, stripANSI(out))
+			}
+		}
+	}
+}
+
+func TestWorkerNameNarrowDetailHeader(t *testing.T) {
+	for _, width := range []int{26, 30} {
+		m := workerRenderModel(true)
+		m.width = width
+		m.workers.rows[0].w.Name = "base.l-highmem-a32f"
+		out := stripANSI(m.View().Content)
+		found := false
+		for _, line := range strings.Split(out, "\n") {
+			if strings.HasPrefix(line, "worker › ") {
+				found = true
+				if !strings.HasPrefix(line, "worker › base.l…m-a32f") {
+					t.Errorf("width %d lost minimum name: %q", width, line)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("width %d missing worker header: %q", width, out)
+		}
+	}
+}
+
+func TestWorkerNameHostileAllSites(t *testing.T) {
+	const payload = "\x1b[2J\x1b]8;;evil\x07x\x1b]8;;\x07"
+	for _, dark := range []bool{true, false} {
+		m := workerRenderModel(dark)
+		m.width = 160
+		name := payload + "base.l-highmem-a32f"
+		m.workers.rows[0].w.Name = name
+		m.detail.run.WorkerName = sp(name)
+		row := m.workers.rows[0]
+		r := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{ID: "run", Status: "running", IssueTitle: "title"}, WorkerName: sp(name)}
+		for site, out := range map[string]string{
+			"board":   m.boardRow(r, false, boardMarkerCols{}, m.boardAccountCols([]apitypes.RunListItemDTO{r})),
+			"table":   m.workerRowLine(row, false, 160, m.workerTableWidths([]workerRow{row}, 160), time.Now()),
+			"rail":    m.railWorkerLine(),
+			"readout": strings.Join(m.workerReadout(row, 30), "\n"),
+			"detail":  m.View().Content,
+		} {
+			t.Run(site, func(t *testing.T) {
+				assertNoRawControls(t, site, out)
+				if strings.Contains(out, "\x1b[2J") || strings.Contains(out, "\x1b]8;;evil") {
+					t.Fatalf("hostile escape survived: %q", out)
+				}
+			})
+		}
+	}
+}
+
+func TestWorkerNameAdminReadoutKeepsFittedName(t *testing.T) {
+	for _, width := range []int{30, 120} {
+		m := workerRenderModel(true)
+		m.board.admin = true
+		row := m.workers.rows[0]
+		row.w.Name = strings.Repeat("manual", 30) + "-a32f"
+		row.workerOwner = "owner@example.test"
+		want := m.renderer.WorkerName(row.w.Name, width-9)
+		out := stripANSI(m.workerReadout(row, width)[0])
+		if !strings.Contains(out, want) || !strings.HasSuffix(out, "-a32f") {
+			t.Errorf("width %d lost fitted name %q: %q", width, want, out)
+		}
+		if visualWidth(out) > width || strings.Contains(out, "owner") {
+			t.Errorf("width %d should have no metadata space: %q", width, out)
+		}
 	}
 }

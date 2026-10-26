@@ -233,7 +233,10 @@ func (m tuiModel) workerDetailLines(now time.Time) ([]string, int) {
 	width := max(1, m.width)
 	state := workerState(r)
 	headerTail := "  " + paintSeg(m.workerStateColor(state), nil, false, workerStateGlyph(state)+" "+state) + "  " + m.pal.faint.Render(m.workerKind(r))
-	header := m.pal.faint.Render("worker › ") + m.pal.title.Render(m.renderer.WorkerName(t.workerName, max(0, width-9-visualWidth(headerTail)))) + headerTail
+	// Preserve a useful name at narrow widths; the final line clamp may cut
+	// state/kind once the name has its minimum allocation.
+	nameWidth := max(min(visualWidth(cellText(t.workerName)), 13), width-9-visualWidth(headerTail))
+	header := m.pal.faint.Render("worker › ") + m.pal.title.Render(m.renderer.WorkerName(t.workerName, nameWidth)) + headerTail
 	lines := []string{m.tabStrip(m.board.admin, viewWorkers, false)}
 	var timing []string
 	if w.Status == "online" {

@@ -27,7 +27,8 @@ func clampVisual(s string, n int) string {
 }
 
 // middleCell shortens sanitized text by terminal columns. Prefer preserving the
-// last hyphen-delimited segment; otherwise divide the space around the ellipsis.
+// last hyphen-delimited segment while reserving a distinguishing head; otherwise
+// divide the space around the ellipsis.
 func middleCell(s string, width int) string {
 	if width <= 0 {
 		return ""
@@ -42,6 +43,7 @@ func middleCell(s string, width int) string {
 			tail = max(tail, suffix)
 		}
 	}
+	tail = min(tail, width-1-min(4, (width-1)/2))
 	right := ansi.TruncateLeft(s, w-tail, "")
 	// TruncateLeft retains a grapheme crossing the cut boundary. Drop that
 	// grapheme if it would exceed the tail budget and trigger a later clamp.
