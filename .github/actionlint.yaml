@@ -1,5 +1,10 @@
 # actionlint configuration (read automatically from .github/).
 paths:
+  .github/workflows/release-auto.yml:
+    ignore:
+      # Native concurrency.queue is pinned by ci-safe-paths.test.rb; the pinned
+      # actionlint parser does not yet recognize the documented key.
+      - 'unexpected key "queue" for "concurrency" section'
   .github/workflows/brew.yml:
     ignore:
       # Native job concurrency.queue is pinned by ci-safe-paths.test.rb;

@@ -2793,3 +2793,7 @@ deliberately deferred — see [plan.md](prds/done/initial-plan.md), the PRDs' Ri
 `prds/done/4-agent-runtime-workers.md`'s "Out of scope". This document will grow
 new sections (additional services, data flows, trust boundaries) as those
 land.
+
+## Release authorization
+
+The dispatch-only release workflow isolates App credentials from repository code: preparation uses the shared cutter and coverage policy, then a separate job validates a bundle and atomically pushes permitted refs. RC and stable use separate principals; stable requires an Environment reviewer. The local fallback remains. [ADR-3512](adr/3512-release-automation.md) records the accepted main-write trust boundary, staged rollout and deferred recovery work.
