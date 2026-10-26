@@ -1685,7 +1685,44 @@ export type RetainedLifecycleSnapshot =
   | { state: "not_terminal"; status: string }
   | { state: "unknown" };
 
+export interface EpochRetainedLimits {
+  /** Test seams may lower, but never raise, the production limits. */
+  maxDirectoryEntries?: number;
+  maxBares?: number;
+  maxMetadataBytes?: number;
+  maxMetadataRecords?: number;
+  maxSeenPaths?: number;
+}
+
+export interface EpochRetainedDiscoveryOptions {
+  signal?: AbortSignal;
+  /** Absolute wall-clock deadline. */
+  deadline?: number;
+  maxPhysicalPaths?: number;
+  limits?: EpochRetainedLimits;
+}
+
+export interface EpochRetainedDiscoveryResult {
+  groups: Array<{ barePath: string; selector: RetainedSourceSelector; paths: string[] }>;
+  inventoryComplete: boolean;
+  /** Unique physical paths observed, including omitted groups; a lower bound if incomplete. */
+  physicalPaths: number;
+  overflow: number;
+  overflowExact: boolean;
+  unreadable: number;
+}
+
 export interface RetainedInspectOptions {
+  signal?: AbortSignal;
+  /** Absolute wall-clock deadline, also covering measurement and queued locks. */
+  deadline?: number;
+  /** Opt in to bounded epoch reads; ordinary operator defaults are unchanged. */
+  epoch?: boolean;
+  maxDescriptors?: number;
+  maxPhysicalPaths?: number;
+  epochLimits?: EpochRetainedLimits;
+  /** Caller-owned read-only binding check immediately before each physical tree walk. */
+  beforeTree?: (clonePath: string) => void;
   /** Restrict to one source. Absent ⇒ an aggregate view (no disposition: holds are per run). */
   selector?: RetainedSourceSelector;
   /** Restrict to one bare (tests; the operator channel scans every bare). */
@@ -2287,6 +2324,124 @@ export class GitCache {
     closureCache: { identities: Map<string, Map<string, ClosureObject>>; entries: number };
   }>();
 
+  private readonly epochRetained = new AsyncLocalStorage<Required<EpochRetainedLimits>>();
+
+  private epochLimits(limits: EpochRetainedLimits = {}): Required<EpochRetainedLimits> {
+    const cap = (value: number | undefined, maximum: number): number => {
+      if (value !== undefined && (!Number.isSafeInteger(value) || value < 1 || value > maximum))
+        throw new Error("invalid epoch retained limit");
+      return value ?? maximum;
+    };
+    return {
+      maxDirectoryEntries: cap(limits.maxDirectoryEntries, 4096),
+      maxBares: cap(limits.maxBares, 1024),
+      maxMetadataBytes: cap(limits.maxMetadataBytes, 8 * 1024 * 1024),
+      maxMetadataRecords: cap(limits.maxMetadataRecords, 4096),
+      maxSeenPaths: cap(limits.maxSeenPaths, 4096),
+    };
+  }
+
+  private retainedCap(value: number | undefined, fallback: number): number {
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < 1 || value > 200))
+      throw new Error("invalid retained source cap");
+    return value ?? fallback;
+  }
+
+  /** Await uncancellable filesystem work to settlement, then observe interruption. */
+  private async retainedIO<T>(action: () => Promise<T>): Promise<T> {
+    this.checkRecoveryInterruption();
+    try { return await action(); }
+    finally { this.checkRecoveryInterruption(); }
+  }
+
+  /** Epoch reads stream and refuse the whole listing on overflow before any sort. */
+  private async retainedNames(dir: string): Promise<string[]> {
+    const limits = this.epochRetained.getStore();
+    if (!limits) return this.retainedIO(() => fs.readdir(dir));
+    this.checkRecoveryInterruption();
+    const handle = await fs.opendir(dir, { bufferSize: 1 });
+    try {
+      this.checkRecoveryInterruption();
+      const names: string[] = [];
+      for (;;) {
+        const entry = await this.retainedIO(() => handle.read());
+        if (!entry) return names;
+        if (names.length >= limits.maxDirectoryEntries) throw new Error("epoch directory entry limit");
+        names.push(entry.name);
+      }
+    } finally { await handle.close(); }
+  }
+
+  /** Discovery is only a census. Selected groups must be inspected again with fresh authority.
+   * One streaming pass, no retries: a failed bare or exhausted cap stops sibling discovery and
+   * makes every reported count a lower bound. All started filesystem work is awaited. */
+  async discoverEpochRetainedSources(opts: EpochRetainedDiscoveryOptions = {}): Promise<EpochRetainedDiscoveryResult> {
+    const limits = this.epochLimits(opts.limits);
+    const maximum = this.retainedCap(opts.maxPhysicalPaths, 200);
+    const result: EpochRetainedDiscoveryResult = {
+      groups: [], inventoryComplete: true, physicalPaths: 0, overflow: 0, overflowExact: false, unreadable: 0,
+    };
+    const seen = new Set<string>();
+    const selectedPaths = new Set<string>();
+    try {
+      await this.epochRetained.run(limits, () => this.withRecoveryOperation(
+        opts.signal ?? new AbortController().signal, opts.deadline ?? Date.now() + RETAINED_INSPECT_BUDGET_MS,
+        async () => {
+          this.checkRecoveryInterruption();
+          const handle = await fs.opendir(this.reposRoot, { bufferSize: 1 });
+          try {
+            this.checkRecoveryInterruption();
+            let entries = 0;
+            let bares = 0;
+            for (;;) {
+              const ent = await this.retainedIO(() => handle.read());
+              if (!ent) break;
+              if (++entries > limits.maxDirectoryEntries) { result.inventoryComplete = false; break; }
+              if (!ent.name.endsWith(".git") || !ent.isDirectory() || ent.isSymbolicLink()) continue;
+              if (++bares > limits.maxBares) { result.inventoryComplete = false; break; }
+              const bare = path.join(this.reposRoot, ent.name);
+              try {
+                await this.withLock(bare, async () => {
+                  const g = await this.gatherRetainedUnderLock(bare);
+                  for (const rec of g.records) {
+                    this.checkRecoveryInterruption();
+                    const paths = [...new Set(rec.parts.map(p => p.clonePath))];
+                    const fresh = paths.filter(p => !seen.has(p));
+                    if (seen.size + fresh.length > limits.maxSeenPaths) {
+                      result.inventoryComplete = false;
+                      return;
+                    }
+                    for (const p of fresh) seen.add(p);
+                    result.physicalPaths = seen.size;
+                    const unselected = paths.filter(p => !selectedPaths.has(p));
+                    if (!unselected.length) continue;
+                    // Keep whole groups; shared paths are charged once globally.
+                    if (selectedPaths.size + unselected.length > maximum) continue;
+                    const head = rec.parts[0]!;
+                    result.groups.push({ barePath: bare,
+                      selector: { runId: rec.runId, generation: head.generation ?? "none", attempt: head.attemptId ?? "canonical" },
+                      paths });
+                    for (const p of unselected) selectedPaths.add(p);
+                  }
+                });
+              } catch {
+                this.checkRecoveryInterruption();
+                result.unreadable++;
+                result.inventoryComplete = false;
+              }
+              if (!result.inventoryComplete) break;
+            }
+          } finally { await handle.close(); }
+        }));
+    } catch (error) {
+      result.inventoryComplete = false;
+      if (!opts.signal?.aborted && (error as NodeJS.ErrnoException).code !== "ENOENT") result.unreadable++;
+    }
+    result.overflow = result.physicalPaths - selectedPaths.size;
+    result.overflowExact = result.inventoryComplete;
+    return result;
+  }
+
   /** Local recovery clocks, including queued locks and actual child settlement. */
   async withRecoveryOperation<T>(signal: AbortSignal, deadline: number, action: (signal: AbortSignal) => Promise<T>, budget?: MaintenanceBudget): Promise<T> {
     const parent = this.recoveryOperations.getStore();
@@ -2634,14 +2789,14 @@ export class GitCache {
     const barePath = path.join(this.reposRoot, bareDir);
     if (path.dirname(barePath) !== this.reposRoot) return undefined;
     try {
-      const st = await fs.lstat(barePath);
+      const st = await this.retainedIO(() => fs.lstat(barePath));
       if (st.isSymbolicLink() || !st.isDirectory()) return undefined;
-      const [realBare, realRoot] = await Promise.all([fs.realpath(barePath), fs.realpath(this.reposRoot)]);
+      const [realBare, realRoot] = await this.retainedIO(() => Promise.all([fs.realpath(barePath), fs.realpath(this.reposRoot)]));
       if (path.dirname(realBare) !== realRoot) return undefined;
     } catch {
       return undefined;
     }
-    if (this.reportProofs.getStore()) {
+    if (this.epochRetained.getStore() || this.reportProofs.getStore()) {
       try { if ((await this.runGit(barePath, ["rev-parse", "--is-bare-repository"])).trim() !== "true") return undefined; }
       catch { return undefined; }
     } else if (!(await isBareRepo(barePath))) return undefined;
@@ -6489,7 +6644,7 @@ export class GitCache {
   }
 
   private async assertRecoveryBare(barePath: string): Promise<void> {
-    const st = await fs.lstat(path.join(barePath, "config"));
+    const st = await this.retainedIO(() => fs.lstat(path.join(barePath, "config")));
     if (!st.isFile() || st.isSymbolicLink() || st.uid !== process.getuid?.() || (st.mode & 0o002) !== 0 ||
         ((st.mode & 0o020) !== 0 && (st.gid !== process.getgid?.() || (uidSplitActive() && st.gid === RUNNER_UID)))) {
       throw new Error("unsafe recovery bare config");
@@ -7493,10 +7648,11 @@ export class GitCache {
    *  `present` with its dev:ino identity, ENOENT is `missing`, anything else is `unsafe`. */
   private async clonePresence(p: string): Promise<{ presence: "present" | "missing" | "unsafe"; devIno: string }> {
     try {
-      const st = await fs.lstat(p);
+      const st = await this.retainedIO(() => fs.lstat(p));
       if (st.isSymbolicLink() || !st.isDirectory()) return { presence: "unsafe", devIno: "unsafe" };
       return { presence: "present", devIno: `${st.dev}:${st.ino}` };
     } catch (err) {
+      this.checkRecoveryInterruption();
       if ((err as NodeJS.ErrnoException).code === "ENOENT") return { presence: "missing", devIno: "missing" };
       return { presence: "unsafe", devIno: "unsafe" };
     }
@@ -7550,6 +7706,7 @@ export class GitCache {
         try {
           out.valid.push({ marker: await this.parseStoppedMarker(barePath, runId, raw), raw });
         } catch {
+          this.checkRecoveryInterruption();
           out.malformed.push({ runId, raw });
         }
       }
@@ -8013,7 +8170,7 @@ export class GitCache {
     if (only !== undefined) return [only];
     let names: string[];
     try {
-      names = await fs.readdir(this.reposRoot);
+      names = await this.retainedNames(this.reposRoot);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
       throw err;
@@ -8022,8 +8179,14 @@ export class GitCache {
     for (const name of names.sort()) {
       if (!name.endsWith(".git")) continue;
       const p = path.join(this.reposRoot, name);
-      const st = await fs.lstat(p).catch(() => undefined);
-      if (st?.isDirectory() && !st.isSymbolicLink()) out.push(p);
+      const st = await this.retainedIO(() => fs.lstat(p)).catch(() => {
+        this.checkRecoveryInterruption();
+        return undefined;
+      });
+      if (st?.isDirectory() && !st.isSymbolicLink()) {
+        if (out.length >= (this.epochRetained.getStore()?.maxBares ?? Infinity)) throw new Error("epoch bare limit");
+        out.push(p);
+      }
     }
     return out;
   }
@@ -8055,6 +8218,7 @@ export class GitCache {
       let m = /^uzi-attempts\.(.+)\.entry$/.exec(k);
       if (m) {
         const e = parseAttemptLedgerEntry(v);
+        if (!e && this.epochRetained.getStore()) throw new Error("unreadable epoch attempt ledger");
         if (e) {
           ledger.set(e.attemptId, { ...e, branch: m[1]! });
           ledgerRaw.set(e.attemptId, v);
@@ -8075,6 +8239,7 @@ export class GitCache {
           journal = parseRecoveryJournal(v);
         } catch {
           this.checkRecoveryInterruption();
+          if (this.epochRetained.getStore()) throw new Error("unreadable epoch journal");
           bareProblems.push(`unreadable_journal:${sanitizeForLog(m[1]!, 64)}`);
         }
         active.set(m[1]!, { raw: v, journal });
@@ -8088,9 +8253,12 @@ export class GitCache {
       descriptors = await this.protectedRecoveries(barePath);
     } catch {
       this.checkRecoveryInterruption();
+      if (this.epochRetained.getStore()) throw new Error("unreadable epoch protected descriptors");
       bareProblems.push("protected_descriptors_unreadable");
     }
     const markers = await this.readStoppedMarkers(barePath, list);
+    if (this.epochRetained.getStore() && (markers.malformed.length || markers.overflow.size))
+      throw new Error("unreadable epoch stopped markers");
 
     // path → the journals, descriptors and markers that name it.
     const namers = new Map<string, string[]>();
@@ -8267,7 +8435,7 @@ export class GitCache {
     for (const { root, kind, field, resolution } of roots) {
       let names: string[];
       try {
-        names = (await fs.readdir(path.join(root, runId))).sort();
+        names = (await this.retainedNames(path.join(root, runId))).sort();
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
         throw err;
@@ -8285,17 +8453,19 @@ export class GitCache {
   /** Best-effort, informational generation of a local record (a bounded no-follow read). */
   private async readRecordGeneration(file: string, field: string): Promise<number | null> {
     if (!file.endsWith(".json")) return null;
+    this.checkRecoveryInterruption();
     try {
       const fh = await fs.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
       try {
         const buf = Buffer.alloc(65536);
-        const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+        const { bytesRead } = await this.retainedIO(() => fh.read(buf, 0, buf.length, 0));
         const g = (JSON.parse(buf.subarray(0, bytesRead).toString("utf8")) as Record<string, unknown>)[field];
         return Number.isSafeInteger(g) ? (g as number) : null;
       } finally {
         await fh.close();
       }
     } catch {
+      this.checkRecoveryInterruption();
       return null;
     }
   }
@@ -8455,8 +8625,9 @@ export class GitCache {
     let bytes = 0;
     let visited = 0;
     try {
-      bytes += (await fs.lstat(root)).blocks * 512;
+      bytes += (await this.retainedIO(() => fs.lstat(root))).blocks * 512;
     } catch {
+      this.checkRecoveryInterruption();
       return { bytes: 0, complete: false };
     }
     const stack: Array<{ dir: string; depth: number }> = [{ dir: root, depth: 0 }];
@@ -8464,21 +8635,25 @@ export class GitCache {
       const { dir, depth } = stack.pop()!;
       let handle;
       try {
+        this.checkRecoveryInterruption();
         handle = await fs.opendir(dir);
       } catch {
+        this.checkRecoveryInterruption();
         return { bytes, complete: false };
       }
       try {
+        this.checkRecoveryInterruption();
         for (;;) {
           if (now() >= deadline) return { bytes, complete: false };
-          const ent = await handle.read();
+          const ent = await this.retainedIO(() => handle.read());
           if (!ent) break;
           if (++visited > maxEntries) return { bytes, complete: false };
           const p = path.join(dir, ent.name);
           let st: Stats;
           try {
-            st = await fs.lstat(p);
+            st = await this.retainedIO(() => fs.lstat(p));
           } catch (err) {
+            this.checkRecoveryInterruption();
             if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
             return { bytes, complete: false };
           }
@@ -8489,7 +8664,7 @@ export class GitCache {
           }
         }
       } finally {
-        await handle.close().catch(() => undefined);
+        await handle.close();
       }
     }
     return { bytes, complete: true };
@@ -8503,15 +8678,25 @@ export class GitCache {
    * to get a disposition.
    */
   async inspectRetainedSources(opts: RetainedInspectOptions): Promise<RetainedInspectResult> {
+    const run = () => this.inspectRetainedSourcesScoped(opts);
+    return opts.epoch ? this.epochRetained.run(this.epochLimits(opts.epochLimits), run) : run();
+  }
+
+  private async inspectRetainedSourcesScoped(opts: RetainedInspectOptions): Promise<RetainedInspectResult> {
+    const maxDescriptors = opts.epoch ? this.retainedCap(opts.maxDescriptors, 200) : RETAINED_MAX_DESCRIPTORS;
+    const maxPhysicalPaths = opts.epoch ? this.retainedCap(opts.maxPhysicalPaths, 200) : Infinity;
+    const physicalPaths = new Set<string>();
     const now = opts.now ?? Date.now;
     const budgetMs = opts.budgetMs ?? RETAINED_INSPECT_BUDGET_MS;
     const deadline = now() + budgetMs;
+    const operationDeadline = Math.min(opts.deadline ?? Infinity, Date.now() +
+      (opts.now === undefined ? budgetMs : Math.max(budgetMs, RETAINED_INSPECT_BUDGET_MS)));
     let partial = false;
     let unreadable = 0;
     type Evaluated = Awaited<ReturnType<GitCache["evaluateRetained"]>>;
     const found: Array<{ g: GatheredBare; rec: GatheredRecord; ev: Evaluated }> = [];
     const exhausted = (err: unknown): boolean =>
-      now() >= deadline || (err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError" || /deadline exhausted/.test(err.message)));
+      opts.signal?.aborted === true || now() >= deadline || Date.now() >= (opts.deadline ?? Infinity) || (err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError" || /deadline exhausted/.test(err.message)));
     const byIdentity = (x: { rec: GatheredRecord }, y: { rec: GatheredRecord }): number =>
       (x.rec.runId < y.rec.runId ? -1 : x.rec.runId > y.rec.runId ? 1 : 0) ||
       (x.rec.parts[0]!.clonePath < y.rec.parts[0]!.clonePath ? -1 : x.rec.parts[0]!.clonePath > y.rec.parts[0]!.clonePath ? 1 : 0);
@@ -8519,8 +8704,7 @@ export class GitCache {
       // One recovery clock covers the bare locks (queued waits included), the gather and the
       // evaluation; exhausting it is `partial`, never a silently shorter list.
       // (An injected clock governs the budget in tests; the real-time guard then stays at the default.)
-      const realBudgetMs = opts.now === undefined ? budgetMs : Math.max(budgetMs, RETAINED_INSPECT_BUDGET_MS);
-      await this.withRecoveryOperation(new AbortController().signal, Date.now() + realBudgetMs, async () => {
+      await this.withRecoveryOperation(opts.signal ?? new AbortController().signal, operationDeadline, async () => {
         for (const bare of await this.retainedBares(opts.barePath)) {
           if (now() >= deadline) {
             partial = true;
@@ -8538,8 +8722,17 @@ export class GitCache {
                   : this.matchesRetainedSelector(rec, opts.selector))
                 .map((rec) => ({ g, rec }))
                 .sort(byIdentity)
-                .slice(0, RETAINED_MAX_DESCRIPTORS + 1);
+                .slice(0, maxDescriptors + 1);
               for (const { rec } of matching) {
+                this.checkRecoveryInterruption();
+                if (opts.epoch) {
+                  const fresh = [...new Set(rec.parts.map(p => p.clonePath))].filter(p => !physicalPaths.has(p));
+                  if (found.length >= maxDescriptors || physicalPaths.size + fresh.length > maxPhysicalPaths) {
+                    partial = true;
+                    continue;
+                  }
+                  for (const p of fresh) physicalPaths.add(p);
+                }
                 const ev = await this.evaluateRetained(g, rec, {
                   holds: opts.selector === undefined ? undefined : opts.holds,
                   ...(opts.selector === undefined || opts.lifecycle === undefined ? {} : { lifecycle: opts.lifecycle }),
@@ -8566,11 +8759,13 @@ export class GitCache {
       }
     }
     found.sort(byIdentity);
-    if (found.length > RETAINED_MAX_DESCRIPTORS) {
+    if (found.length > maxDescriptors) {
       partial = true;
-      found.length = RETAINED_MAX_DESCRIPTORS;
+      found.length = maxDescriptors;
     }
     const sources: RetainedSourceEvidence[] = [];
+    const measurements = new Map<string, { bytes: number; complete: boolean }>();
+    let bindingFailed = false;
     for (const { g, rec, ev } of found) {
       const parts: RetainedSourcePart[] = [];
       let measured = 0;
@@ -8580,7 +8775,22 @@ export class GitCache {
         let bytes: number | null = null;
         if (p.presence === "missing") bytes = 0;
         else if (p.presence === "present") {
-          const m = await this.measureAllocated(p.clonePath, now, deadline, opts.measureCaps);
+          let m = { bytes: 0, complete: false };
+          try {
+            if (bindingFailed) throw new Error("retained tree binding check failed");
+            m = (opts.epoch ? measurements.get(p.clonePath) : undefined) ??
+              await this.withRecoveryOperation(opts.signal ?? new AbortController().signal, operationDeadline,
+                async () => {
+                  this.checkRecoveryInterruption();
+                  try { opts.beforeTree?.(p.clonePath); }
+                  catch (error) { bindingFailed = true; throw error; }
+                  this.checkRecoveryInterruption();
+                  return this.measureAllocated(p.clonePath, now, deadline, opts.measureCaps);
+                });
+            if (opts.epoch) measurements.set(p.clonePath, m);
+          } catch (error) {
+            if (!exhausted(error)) unreadable++;
+          }
           bytes = m.complete ? m.bytes : null;
           if (!m.complete) partial = true;
         }
@@ -8606,6 +8816,10 @@ export class GitCache {
         sources: parts, consumers: [...ev.consumers, ...ev.blockers.map((b) => `blocker:${b}`)], localRecords: ev.localRecords,
         holds: ev.holdsView, disposition: ev.disposition,
       });
+    }
+    if (bindingFailed) {
+      partial = true;
+      for (const source of sources) source.disposition = undefined;
     }
     return { sources, partial, unreadable, sampledAt: new Date(now()).toISOString() };
   }
@@ -9355,8 +9569,9 @@ export class GitCache {
   /** Callback errors retain custody; no identity is inferred from terminal body fields. */
   async hasPhysicalTerminalProtection(runId: string): Promise<boolean> {
     try {
-      return await this.terminalRecordProtection?.(runId) ?? false;
+      return await this.retainedIO(async () => await this.terminalRecordProtection?.(runId) ?? false);
     } catch {
+      this.checkRecoveryInterruption();
       return true;
     }
   }
@@ -9370,7 +9585,7 @@ export class GitCache {
     if (await this.hasPhysicalTerminalProtection(runId)) return true;
     for (const root of [this.recoveryRoot, this.recoverySettlementRoot]) {
       try {
-        if ((await fs.readdir(path.join(root, runId))).length > 0) return true;
+        if ((await this.retainedNames(path.join(root, runId))).length > 0) return true;
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== "ENOENT") return true;
       }
@@ -15885,6 +16100,43 @@ try {
     return output;
   }
 
+  private checkEpochMetadata(args: string[], stdout: string): void {
+    const limits = this.epochRetained.getStore();
+    if (!limits) return;
+    this.checkRecoveryInterruption();
+    if (Buffer.byteLength(stdout) > limits.maxMetadataBytes) throw new Error("epoch metadata byte limit");
+    const config = args.includes("config") && (args.includes("--list") || args.includes("--get-regexp"));
+    const refs = args.includes("for-each-ref") || args.includes("show-ref");
+    if (!config && !refs) return;
+    const separator = config && (args.includes("--null") || args.includes("-z")) ? "\0" : "\n";
+    let count = 0;
+    for (let i = 0; i < stdout.length; i++) {
+      if (stdout[i] === separator && ++count > limits.maxMetadataRecords) throw new Error("epoch metadata record limit");
+    }
+    if (stdout.length && !stdout.endsWith(separator) && ++count > limits.maxMetadataRecords)
+      throw new Error("epoch metadata record limit");
+    if (config && separator === "\0" && args.includes("--list")) {
+      let start = 0;
+      let sources = 0;
+      for (let i = 0; i <= stdout.length; i++) {
+        if (i < stdout.length && stdout[i] !== "\0") continue;
+        const item = stdout.slice(start, i);
+        start = i + 1;
+        const nl = item.indexOf("\n");
+        const key = item.slice(0, nl);
+        if (!/^(uzi-recovery\.|uzi-retained\.|uzi-attempts\.|uzi-stopped\.)/.test(key)) continue;
+        sources++;
+        try {
+          const parsed = JSON.parse(item.slice(nl + 1));
+          const journal = key.startsWith("uzi-retained.") ? parsed?.journal : parsed;
+          if (Array.isArray(journal?.retainedSources)) sources += journal.retainedSources.length;
+          if (journal?.recovery) sources += 2;
+        } catch { /* The authority parser reports malformed values; never accept them here. */ }
+        if (sources > limits.maxMetadataRecords) throw new Error("epoch source record limit");
+      }
+    }
+  }
+
   private async execScoped(
     command: string,
     args: string[],
@@ -15892,6 +16144,8 @@ try {
     identity: BoundaryProcessRequest["identity"] = "worker_pat",
   ): Promise<{ stdout: string; stderr: string }> {
     const boundary = this.boundaryProcesses.getStore();
+    const epoch = this.epochRetained.getStore();
+    if (epoch) options = { ...options, maxBuffer: Math.min(options.maxBuffer ?? Infinity, epoch.maxMetadataBytes) };
     this.checkReportProof();
     const report = this.reportProofs.getStore();
     if (report) options = { ...options, timeout: Math.max(1, Math.min(options.timeout ?? Infinity, report.deadline - Date.now())) };
@@ -15905,7 +16159,11 @@ try {
       // issue #2213: the second quarantine check, keyed on the credential itself, synchronously
       // before the child is created (nothing awaits between this and execFileAsync).
       assertNoCredentialedGitWhileQuarantined(options.env);
-      if (MaintenanceResources.active()) return this.execMeteredNative(command, args, options, operationSignal);
+      if (MaintenanceResources.active()) {
+        const result = await this.execMeteredNative(command, args, options, operationSignal);
+        this.checkEpochMetadata(args, result.stdout);
+        return result;
+      }
       // issue #1597 M2: optional stdin (the checkpoint scan's cat-file / gitleaks stdin). An EPIPE on
       // an early-exiting child is swallowed here; the exit status carries the failure.
       const pending = execFileAsync(command, args, { ...execOptions,
@@ -15923,7 +16181,9 @@ try {
       try {
         const result = await pending;
         this.checkRecoveryInterruption();
-        return { stdout: String(result.stdout), stderr: String(result.stderr) };
+        const stdout = String(result.stdout);
+        this.checkEpochMetadata(args, stdout);
+        return { stdout, stderr: String(result.stderr) };
       } finally {
         await closed;
         if (killTimer) clearTimeout(killTimer);
@@ -16072,6 +16332,7 @@ try {
       failure.stderr = err;
       throw failure;
     }
+    this.checkEpochMetadata(args, out);
     return { stdout: out, stderr: err };
   }
 
@@ -16806,7 +17067,7 @@ try {
       throw new Error("owed candidates require a known worker bare path");
     }
     for (const dir of [root, barePath]) {
-      const st = await fs.lstat(dir);
+      const st = await this.retainedIO(() => fs.lstat(dir));
       if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== process.getuid?.() ||
           (st.mode & 0o002) !== 0 ||
           ((st.mode & 0o020) !== 0 && (st.gid !== process.getgid?.() ||
@@ -17327,13 +17588,14 @@ try {
         throw new Error("unsafe owed discovery directory");
       }
       const names: string[] = [];
-      if (this.reportProofs.getStore() || MaintenanceResources.active()) {
+      if (this.epochRetained.getStore() || this.reportProofs.getStore() || MaintenanceResources.active()) {
         const directory = await fs.opendir(dir);
         try {
           for (;;) {
             this.checkReportProof();
+            this.checkRecoveryInterruption();
             MaintenanceResources.checkIfActive();
-            const entry = await directory.read();
+            const entry = await this.retainedIO(() => directory.read());
             if (!entry) break;
             MaintenanceResources.consumeIfActive("adminEntries", 1);
             MaintenanceResources.consumeIfActive("metadataBytes", Buffer.byteLength(entry.name));
