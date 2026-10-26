@@ -76,7 +76,7 @@ func TestRetainedParkRollbackLiveDB(t *testing.T) {
 		exec(`INSERT INTO runs(id,user_id,repo_id,worker_id,kind,issue_iid,issue_title,issue_description,status,
    retained_park_count,claim_generation,claim_released_at,recovery_wait_cause,recovery_retry_not_before)
    VALUES($1,$2,$3,$4,'issue',$5,'rollback','fixture',$6,3,7,now(),'retained_recovery_exhausted',
-   CASE WHEN $5=1 THEN now()+interval '1 hour' END)`, id, user, repo, worker, i+1, []string{"recovery_wait", "recovery_wait", "queued"}[i])
+   CASE WHEN $5::bigint=1 THEN now()+interval '1 hour' END)`, id, user, repo, worker, i+1, []string{"recovery_wait", "recovery_wait", "queued"}[i])
 	}
 	const preserved = `SELECT (to_jsonb(r)-ARRAY['retained_park_count','status','fail_origin','failure_reason','finished_at','status_since','updated_at','recovery_wait_cause','recovery_retry_not_before'])::text FROM runs r WHERE id=$1`
 	before := map[uuid.UUID]string{}
