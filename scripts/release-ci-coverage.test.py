@@ -725,5 +725,98 @@ class Decision(unittest.TestCase):
                 api.smoke_job(run('kind-smoke.yml'))
 
 
+class Published(unittest.TestCase):
+    def setUp(self):
+        self.output = io.StringIO()
+        redirect = contextlib.redirect_stdout(self.output)
+        redirect.__enter__()
+        self.addCleanup(redirect.__exit__, None, None, None)
+        self.api = unittest.mock.Mock()
+
+    def test_existing_tag_success_is_immediate(self):
+        self.api.run.return_value = run('release.yml', 'head', 'v0.2.0')
+        with patch.object(policy.time, 'sleep', side_effect=AssertionError('already published')):
+            policy.published(self.api, 'head', 'v0.2.0', 0, 1)
+        self.api.run.assert_called_once_with('release.yml', 'head', 'v0.2.0')
+        self.assertIn('run 2, attempt 2', self.output.getvalue())
+
+    def test_waits_through_publication_retry(self):
+        self.api.run.side_effect = [None, run('release.yml', status='queued', conclusion=None),
+                                   run('release.yml', conclusion='failure'), run('release.yml')]
+        clock = [0.0]
+        with patch.object(policy.time, 'monotonic', side_effect=lambda: clock[0]), \
+             patch.object(policy.time, 'sleep', side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay)) as sleep:
+            policy.published(self.api, 'head', 'v0.2.0', 3, 1)
+        self.assertEqual(sleep.call_count, 3)
+        self.assertEqual(self.api.run.call_count, 4)
+
+    def test_non_success_states_never_publish(self):
+        for result in (None, run('release.yml', status='in_progress', conclusion=None),
+                       run('release.yml', conclusion='failure'), run('release.yml', conclusion='cancelled'),
+                       run('release.yml', conclusion='skipped')):
+            self.api.run.return_value = result
+            with self.subTest(result=result), self.assertRaises(policy.Refusal):
+                policy.published(self.api, 'head', 'v0.2.0', 0, 1)
+
+    def test_failed_run_wait_is_bounded(self):
+        self.api.run.return_value = run('release.yml', conclusion='failure')
+        clock = [0.0]
+        with patch.object(policy.time, 'monotonic', side_effect=lambda: clock[0]), \
+             patch.object(policy.time, 'sleep', side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay)):
+            with self.assertRaisesRegex(policy.Refusal, 'not successful'):
+                policy.published(self.api, 'head', 'v0.2.0', 2, 1)
+        self.assertEqual(clock[0], 2)
+
+    def test_api_error_and_unknown_state_fail_closed(self):
+        self.api.run.side_effect = policy.Refusal('API unavailable')
+        with self.assertRaisesRegex(policy.Refusal, 'API unavailable'):
+            policy.published(self.api, 'head', 'v0.2.0', 100, 1)
+        self.api.run.side_effect = None
+        self.api.run.return_value = run('release.yml', status='unexpected')
+        with self.assertRaises(policy.Refusal):
+            policy.published(self.api, 'head', 'v0.2.0', 100, 1)
+
+    def test_invalid_poll_bounds_make_no_query(self):
+        for wait, interval in ((-1, 1), (1, 0), (float('inf'), 1), (1, float('nan'))):
+            with self.subTest(wait=wait, interval=interval), self.assertRaises(policy.Refusal):
+                policy.published(self.api, 'head', 'v0.2.0', wait, interval)
+        self.api.run.assert_not_called()
+
+    def test_release_evidence_filters_and_newest_attempt(self):
+        api = policy.GitHub('example/uzi')
+        good = run('release.yml', 'head', 'v0.2.0', number=1)
+        newer = run('release.yml', 'head', 'v0.2.0', number=2, status='in_progress', conclusion=None)
+        with patch.object(api, 'pages', return_value=[good, newer]):
+            with self.assertRaises(policy.Refusal):
+                policy.published(api, 'head', 'v0.2.0', 0, 1)
+        for key, value in (('head_sha', 'other'), ('head_branch', 'main'), ('event', 'workflow_dispatch'),
+                           ('path', '.github/workflows/ci.yml'),
+                           ('repository', {'full_name': 'other/uzi'}),
+                           ('head_repository', {'full_name': 'other/uzi'})):
+            wrong = {**good, key: value}
+            with self.subTest(key=key), patch.object(api, 'pages', return_value=[wrong]):
+                with self.assertRaises(policy.Refusal):
+                    policy.published(api, 'head', 'v0.2.0', 0, 1)
+
+
+class PublishedCLI(RepoFixture, unittest.TestCase):
+    def test_dispatch_existing_tag_uses_same_sha(self):
+        sha = self.git('rev-parse', 'HEAD')
+        api = unittest.mock.Mock()
+        api.run.return_value = run('release.yml', sha, 'v0.2.0')
+        with patch.object(policy.sys, 'argv', ['policy', 'published', 'HEAD', '--tag', 'v0.2.0', '--repo', 'example/uzi', '--wait', '0']), \
+             patch.object(policy, 'GitHub', return_value=api), contextlib.redirect_stdout(io.StringIO()):
+            policy.main()
+        api.run.assert_called_once_with('release.yml', sha, 'v0.2.0')
+
+    def test_missing_or_invalid_tag_is_refused(self):
+        for tag in (None, 'main', 'v0.2.0-rc.01'):
+            args = ['policy', 'published', 'HEAD', '--repo', 'example/uzi', '--wait', '0']
+            if tag is not None:
+                args.extend(['--tag', tag])
+            with self.subTest(tag=tag), patch.object(policy.sys, 'argv', args), self.assertRaises(policy.Refusal):
+                policy.main()
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

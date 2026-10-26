@@ -170,4 +170,28 @@ fixtures.each_with_index do |files, index|
   assert.call(classify.call(files.length.to_s, safe.to_s, files.length.to_s), index < 2 ? 'skip_components=1' : 'skip_components=0', "path/status fixture #{index}")
 end
 assert.call(jobs.fetch('test-api-store-it').fetch('steps').any? { |step| step.fetch('run', '').include?('../scripts/livedb-skip-guard.sh livedb.log') }, true, 'LiveDB proof retained')
+brew_workflow = YAML.safe_load(File.read(File.join(root, '.github/workflows/brew.yml')))
+assert.call(brew_workflow.fetch('concurrency').fetch('group'), 'brew-tap-publish', 'tap writes remain serialized')
+assert.call(brew_workflow.fetch('concurrency')['queue'], 'max', 'long release proof retains pending publishes')
+assert.call(brew_workflow.fetch('concurrency').fetch('cancel-in-progress'), false, 'active tap publication is never superseded')
+brew = brew_workflow.fetch('jobs')
+publisher = brew.fetch('publish-formula')
+assert.call(Array(publisher['needs']).include?('assert-release-published'), true, 'tap credential job requires successful release proof')
+assert.call(publisher['if'], nil, 'publisher cannot override failed needs')
+guard = brew.fetch('assert-release-published')
+assert.call(guard['environment'], nil, 'release proof has no credential environment')
+assert.call(guard.fetch('permissions'), {'contents' => 'read', 'actions' => 'read'}, 'release proof is read-only')
+assert.call(guard.to_s.include?('HOMEBREW_TAP_TOKEN'), false, 'tap credential absent from proof job')
+assert.call(publisher.fetch('environment'), 'release', 'tap environment stays tag-restricted')
+assert.call(guard.fetch('steps').any? { |step| step['run'] == 'task wait:release-published' }, true, 'proof uses project automation')
+validation = guard.fetch('steps').find { |step| step['id'] == 'tag' }.fetch('run')
+[['v0.2.0', 'v0.2.0', 'tag', true], ['v0.2.0-rc.1', 'v0.2.0-rc.1', 'tag', true],
+ ['v0.2.0', 'v0.1.0', 'tag', false], ['v0.2.0', 'v0.2.0', 'branch', false],
+ ['bad;tag', 'bad;tag', 'tag', false]].each do |tag, ref, kind, expected|
+  Tempfile.create('brew-tag-output') do |file|
+    _, _, status = Open3.capture3({'INPUT_TAG' => tag, 'WORKFLOW_TAG' => ref, 'WORKFLOW_REF_TYPE' => kind, 'GITHUB_OUTPUT' => file.path}, 'bash', '-e', '-c', validation)
+    assert.call(status.success?, expected, "Brew tag context #{[tag, ref, kind]}")
+    assert.call(File.read(file.path).strip, expected ? "tag=#{tag}" : '', 'only valid matching tag produces output')
+  end
+end
 puts "ci-safe-paths: #{checks} assertions passed"

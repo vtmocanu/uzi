@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Fail-closed release coverage and tagged smoke, using only git and gh reads."""
+"""Fail-closed release coverage, smoke and publication, using git and gh reads."""
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
@@ -278,13 +279,30 @@ def smoke(api, sha, tag, wait, interval):
         time.sleep(min(interval, max(0, deadline - time.monotonic())))
 
 
+def published(api, sha, tag, wait, interval):
+    if not math.isfinite(wait) or not math.isfinite(interval) or wait < 0 or interval <= 0:
+        raise Refusal('invalid publication poll bounds')
+    deadline = time.monotonic() + wait
+    while True:
+        release = api.run('release.yml', sha, tag)
+        current = state(release)
+        if current == 'success':
+            print(f'PASS release published: {tag}, SHA {sha}, run {release["id"]}, attempt {release["run_attempt"]}')
+            return
+        if time.monotonic() >= deadline:
+            raise Refusal(f'release {tag} at {sha} not successful (latest state: {current})')
+        # A failed publication attempt may be recovered by the existing bounded watcher.
+        print(f'Waiting for release publication {tag} at {sha}: {current}', flush=True)
+        time.sleep(min(interval, max(0, deadline - time.monotonic())))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=('metadata', 'coverage', 'tip', 'smoke', 'annotation'))
+    parser.add_argument('mode', choices=('metadata', 'coverage', 'tip', 'smoke', 'annotation', 'published'))
     parser.add_argument('ref')
     parser.add_argument('other', nargs='?')
     parser.add_argument('--repo')
-    parser.add_argument('--tag', help='actual annotated release tag; enables the explicit hotfix exception')
+    parser.add_argument('--tag', help='actual release tag; coverage uses it for the annotated hotfix exception')
     parser.add_argument('--wait', type=float, default=2700)
     parser.add_argument('--interval', type=float, default=15)
     parser.add_argument('--hops', type=int, default=2,
@@ -308,9 +326,13 @@ def main():
             raise Refusal('no explicit annotated hotfix intent')
         print(f'UNVERIFIED hotfix annotation: no full CI evidence; tag {args.tag}, SHA {sha}')
         return
+    if args.mode == 'published' and (not args.tag or not re.fullmatch('v' + VERSION, args.tag)):
+        raise Refusal('published needs a valid release tag')
     repo = args.repo or os.environ.get('GITHUB_REPOSITORY') or command('gh', 'repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner').strip()
     api = GitHub(repo)
-    if args.mode == 'smoke':
+    if args.mode == 'published':
+        published(api, sha, args.tag, args.wait, args.interval)
+    elif args.mode == 'smoke':
         if not args.other or not re.fullmatch('v' + VERSION, args.other):
             raise Refusal('smoke needs a valid release tag')
         smoke(api, sha, args.other, args.wait, args.interval)

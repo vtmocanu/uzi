@@ -1359,7 +1359,19 @@ tasks:
       # script header.
       - ./scripts/release-scripts-test.sh
       - ./scripts/worker-roll-target.test.sh
+      - task: test:release-ci-coverage
+
+  test:release-ci-coverage:
+    desc: offline release evidence, metadata and publication polling regressions
+    cmds:
       - python3 -I -B scripts/release-ci-coverage.test.py
+
+  wait:release-published:
+    desc: require successful publication of INPUT_TAG at this checkout's HEAD
+    cmds:
+      # Allow the existing publication watcher's bounded reruns. Brew's proof job
+      # has a 65-minute outer bound; no tap credential is loaded while waiting.
+      - python3 -I scripts/release-ci-coverage.py published HEAD --tag "$INPUT_TAG" --wait 3600 --interval 15
 
   test:worker-roll-target-package:
     desc: "offline packaged-chart stamp/override regressions; needs Helm, ci.yml helm-chart job (not task gate; #2906)"
