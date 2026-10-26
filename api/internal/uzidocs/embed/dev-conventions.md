@@ -361,10 +361,9 @@ reason down would invite someone to "fix" gitleaks out of `gate:repo` on the sam
 logic.
 
 They do run on every MR, as extra script lines of the existing per-toolchain jobs
-(`lint:api`, `lint:controller`, `validate:web`, `validate:agent`) rather than as new
-jobs. All four of those jobs are in `*publish_needs`, so **the release-blocking
-property is inherited**: a CVE published on a Tuesday can redden a `v*` tag publish
-with nobody's diff in it. That is accepted rather than overlooked.
+(`lint-api`, `lint-controller`, `validate-web`, `validate-agent`) rather than as new
+jobs. Release publication checks CI through `assert-ci-coverage` in
+`.github/workflows/release.yml`.
 
 **npm audit gates at `--audit-level=high`, not at zero.** The threshold was set
 because two moderate `react-router` advisories had no fix on React Router 6: no
