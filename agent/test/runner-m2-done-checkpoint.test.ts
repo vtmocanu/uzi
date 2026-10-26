@@ -1015,7 +1015,11 @@ for (const exit of ["clean_exit", "until_cancelled"] as const) {
     assert.deepEqual(attemptOutcomes(r as unknown as DiffRun), ["soft_stop"]);
     assert.equal(r.failedStates, 0, "the run does not fail");
     assert.equal(r.poisoned, false);
-    assert.equal(r.spawnedNameOnly, 0, "the soft stop precedes the prompt-only changed-files diff");
+    // An issue claim never runs the prompt-only changed-files diff; this pins that the done body did not either.
+    assert.equal(r.spawnedNameOnly, 0, "an issue claim's done body never runs the prompt-only changed-files diff");
+    // The done-body caller passes its step callback: the stall is reported under the pin sub-step.
+    const steps = r.lines.filter(l => l.msg === "checkpoint step").map(l => l.step);
+    assert.equal(steps.at(-1), "checkpoint_code_head_pin", `the stalled read is labelled by the done-body pin step, saw ${JSON.stringify(steps)}`);
   });
 }
 

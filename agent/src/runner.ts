@@ -13682,6 +13682,7 @@ export class RunRunner {
                     barePath!, defaultBranch, claim.secrets.forge_pat,
                     claim.repo.clone_url, claim.secrets.forge_username,
                   );
+                  attempt?.steps.enter("checkpoint_code_head_pin");
                   const pinned = await this.git.pinCodeSnapshot(barePath!, runId, codeSnapshot.head_commit, codeDefaultCommit, true, flight.claimGeneration);
                   codeFreshReceipt = pinned.freshReceipt;
                   snapshot = { head_commit: pinned.head_commit, base_commit: pinned.base_commit,
