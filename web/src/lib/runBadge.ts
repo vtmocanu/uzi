@@ -3,17 +3,17 @@
 // link gate. Kept out of Board.tsx so the mapping is unit-tested in isolation
 // (see runBadge.test.ts), the same split the run stream uses (runStream.ts).
 
-import {
-  isTerminalRun,
-  type LatestRun,
-  type Run,
-  type Milestone,
-  type MilestoneAgent,
-  type QueueReason,
-  type RunHealth,
-  type RunPriority,
-  type StopKind,
-} from "./api";
+import type {
+  LatestRun,
+  Run,
+  Milestone,
+  MilestoneAgent,
+  QueueReason,
+  RunHealth,
+  RunPriority,
+  StopKind,
+} from "./apiTypes";
+import { isTerminalRun } from "./runStatus";
 import { credentialSwitchHold } from "./credentialSwitchHold";
 import { forgeNounSentence, forgeNounLower, forgePlatform } from "./forgeNoun";
 import { formatCountdown } from "./limitWait";
