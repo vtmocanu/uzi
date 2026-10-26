@@ -237,6 +237,7 @@ for (const attack of ["parent symlink", "hardlinked write target"]) {
     await fs.mkdir(foreign); await fs.writeFile(marker, "foreign bytes");
     const mkdir = fs.mkdir.bind(fs), open = fs.open.bind(fs);
     let inserted = false, attempted = 0;
+    const observedFlags: Parameters<typeof fs.open>[1][] = [];
     t.mock.method(fs, "mkdir", async (...args: Parameters<typeof fs.mkdir>) => {
       const result = await mkdir(...args);
       if (args[0] === parent) {
@@ -249,14 +250,18 @@ for (const attack of ["parent symlink", "hardlinked write target"]) {
     t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
       if (args[0] === path.join(parent, "HEAD")) {
         attempted++;
-        assert.equal(typeof args[1], "number");
-        assert.equal((Number(args[1]) & constants.O_NOFOLLOW) !== 0 && (Number(args[1]) & constants.O_EXCL) !== 0, true);
+        observedFlags.push(args[1]);
       }
       return open(...args);
     });
     await assert.rejects(f.run());
     assert.equal(inserted, true);
     assert.equal(attempted, attack === "parent symlink" ? 0 : 1);
+    assert.equal(observedFlags.length, attack === "parent symlink" ? 0 : 1);
+    if (attack === "hardlinked write target") {
+      assert.equal(typeof observedFlags[0], "number");
+      assert.equal((Number(observedFlags[0]) & constants.O_NOFOLLOW) !== 0 && (Number(observedFlags[0]) & constants.O_EXCL) !== 0, true);
+    }
     assert.equal(await fs.readFile(marker, "utf8"), "foreign bytes");
     if (attack === "hardlinked write target") assert.equal((await fs.lstat(marker)).nlink, 2);
     assert.equal(f.requests.length, 0);
