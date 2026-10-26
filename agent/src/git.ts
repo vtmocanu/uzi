@@ -1429,6 +1429,18 @@ export class BareCacheIdentityError extends Error {
   }
 }
 
+/**
+ * issue #3450: a bare cache that is shallow (a `shallow` file, refs with missing ancestry) is
+ * refused, both when freshly cloned and when reused. Refusal only: an existing bare is left as
+ * found. Non-retryable by the default classification; the message carries no path on purpose.
+ */
+export class BareCacheShallowError extends Error {
+  constructor() {
+    super("repo cache refused: shallow repository");
+    this.name = "BareCacheShallowError";
+  }
+}
+
 /** A supervised retained-readiness effect has no positive cleanup proof. */
 export class RetainedReadinessCleanupUnconfirmedError extends Error {
   constructor() { super("retained_readiness_cleanup"); }
@@ -2619,6 +2631,13 @@ export class GitCache {
     if (stored.kind !== "ok" || stored.value !== repoUrl) throw new BareCacheIdentityError(name);
   }
 
+  /** issue #3450: refuse a shallow bare. Read-only probe; a probe failure propagates unchanged. */
+  private async assertBareNotShallow(barePath: string): Promise<void> {
+    const { stdout } = await this.execScoped("git", withDir(barePath, ["rev-parse", "--is-shallow-repository"]),
+      { env: gitEnv(), timeout: GIT_TIMEOUT_MS });
+    if (stdout.trim() !== "false") throw new BareCacheShallowError();
+  }
+
   /** Resolve a recovery journal basename to a real bare directly under the private repos root. */
   async resolveRecoveryBareDir(bareDir: string): Promise<string | undefined> {
     if (
@@ -2724,6 +2743,8 @@ export class GitCache {
       await fs.mkdir(this.reposRoot, { recursive: true });
       if (await isBareRepo(barePath)) {
         await this.assertBareOriginIdentity(barePath, repoUrl);
+        // issue #3450: before any write (maintenance config, fetch) so a refusal leaves it as found.
+        await this.assertBareNotShallow(barePath);
         this.log.info("repo cache: fetching", { bare: barePath });
         // Issue #134: reassert IDEMPOTENTLY on the warm path, BEFORE the fetch (the first
         // object-writing command, hence the first spawner). cloneBare only runs on the very
@@ -15063,6 +15084,8 @@ try {
     // transient into a permanent one. This guarantees each retry starts from a clean bare.
     try {
       await this.runGit(undefined, ["clone", "--bare", "-c", `${BARE_CACHE_ORIGIN_KEY_CONFIG}=${repoUrl}`, "--", repoUrl, dest], pat, scope, username);
+      // issue #3450: a shallow source yields a shallow bare; refuse it (the catch removes dest).
+      await this.assertBareNotShallow(dest);
       // Convert the mirror refspec to remote-tracking so future fetches write to
       // refs/remotes/origin/*. Under (b) the bare's refs/heads/* stay the
       // stale mirror; the agent branch is resolved via refs/remotes/origin/* (resume)

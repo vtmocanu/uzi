@@ -13,6 +13,7 @@ type GitInternals = {
   runGitAsRunner(cwd: string | undefined, args: string[], opts?: { timeoutMs?: number }): Promise<string>;
   disableAutoMaintenance(dest: string): Promise<void>;
   fetch(dest: string): Promise<void>;
+  assertBareNotShallow(dest: string): Promise<void>;
 };
 
 async function captureBareClone(cache: GitCache, repoUrl: string, dest: string): Promise<string[]> {
@@ -24,6 +25,7 @@ async function captureBareClone(cache: GitCache, repoUrl: string, dest: string):
   };
   internals.disableAutoMaintenance = async () => {};
   internals.fetch = async () => {};
+  internals.assertBareNotShallow = async () => {};
   await internals.cloneBare(repoUrl, dest);
   assert.equal(clones.length, 1);
   return clones[0]!;
