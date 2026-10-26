@@ -8,7 +8,7 @@ interface RuntimePort {
 interface Bootstrap {
   readonly podUid: string;
   readonly runtime?: Runtime;
-  readonly evidenceFile?: "/run/uzi/pod-epoch/evidence";
+  readonly evidenceFile?: "/etc/uzi/pod-epoch/evidence";
   readonly firstMode: "shared" | "exclusive";
   readonly reason?: "runtime_not_declared" | "runtime_not_supported" | "no_projection" |
     "unsupported_projection" | "already_consumed" | "consumption_full" | "consumption_uncertain";
@@ -29,7 +29,7 @@ export function inspectPodEpochBootstrap(
   const declared = environment.UZI_POD_EPOCH_RUNTIME;
   const projection = environment.UZI_POD_EPOCH_EVIDENCE_FILE;
   const runtime: Runtime | undefined = declared === "containerd-runc" || declared === "crio-crun" ? declared : undefined;
-  const evidenceFile: Bootstrap["evidenceFile"] = projection === "/run/uzi/pod-epoch/evidence" ? projection : undefined;
+  const evidenceFile: Bootstrap["evidenceFile"] = projection === "/etc/uzi/pod-epoch/evidence" ? projection : undefined;
   const base = { podUid, runtime, evidenceFile };
   const shared = (reason: NonNullable<Bootstrap["reason"]>): Readonly<Bootstrap> =>
     Object.freeze({ ...base, firstMode: "shared", reason });

@@ -106,6 +106,9 @@ const (
 	// worker would find no token and crash-loop (see ValidateSecretMountPath).
 	defaultSecretMountPath = "/run/secrets"
 
+	// podEpochMountPath stays outside the configurable /run/<singlecomponent> secret namespace.
+	podEpochMountPath = "/etc/uzi/pod-epoch"
+
 	dataMountPath = "/data"
 	nixMountPath  = "/nix"
 	// nixSeedMountPath is where the INIT container mounts the nix PVC — deliberately
@@ -1299,11 +1302,11 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 	}
 	if withDinD(w) {
 		env = append(env, corev1.EnvVar{Name: "UZI_EPOCH_LOCK", Value: "1"},
-			corev1.EnvVar{Name: "UZI_POD_EPOCH_EVIDENCE_FILE", Value: "/run/uzi/pod-epoch/evidence"})
+			corev1.EnvVar{Name: "UZI_POD_EPOCH_EVIDENCE_FILE", Value: podEpochMountPath + "/evidence"})
 		if cfg.PodEpochRuntime != "" {
 			env = append(env, corev1.EnvVar{Name: PodEpochRuntimeEnv, Value: cfg.PodEpochRuntime})
 		}
-		workerMounts = append(workerMounts, corev1.VolumeMount{Name: "pod-epoch", MountPath: "/run/uzi/pod-epoch", ReadOnly: true})
+		workerMounts = append(workerMounts, corev1.VolumeMount{Name: "pod-epoch", MountPath: podEpochMountPath, ReadOnly: true})
 		volumes = append(volumes, corev1.Volume{Name: "pod-epoch", VolumeSource: corev1.VolumeSource{DownwardAPI: &corev1.DownwardAPIVolumeSource{Items: []corev1.DownwardAPIVolumeFile{{Path: "evidence", FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.annotations['uzi.dev/pod-epoch-evidence']"}}}}}})
 		initContainers[0].Command[2] = dockerNixSeedScript()
 		initContainers[0].Env = []corev1.EnvVar{

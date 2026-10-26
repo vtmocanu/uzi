@@ -81,7 +81,7 @@ test("main uses one runtime, consumes the bootstrap UID and restores TMP before 
   const podUid = "12345678-1234-1234-1234-123456789abc";
   const environment = {
     UZI_EPOCH_LOCK: "1", UZI_DATA_DIR: "/data", UZI_POD_UID: podUid,
-    UZI_POD_EPOCH_RUNTIME: "containerd-runc", UZI_POD_EPOCH_EVIDENCE_FILE: "/run/uzi/pod-epoch/evidence",
+    UZI_POD_EPOCH_RUNTIME: "containerd-runc", UZI_POD_EPOCH_EVIDENCE_FILE: "/etc/uzi/pod-epoch/evidence",
   };
   const controller = new AbortController();
   const ownership: PodEpochOwnership = {

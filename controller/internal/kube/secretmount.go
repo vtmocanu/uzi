@@ -31,7 +31,7 @@ var knownWorkerMountPaths = []string{
 	dindDataDirRoot,
 	dindMeterDir,
 	dindMeterDataDir,
-	"/run/uzi/pod-epoch",
+	podEpochMountPath,
 }
 
 // ValidateSecretMountPath refuses a SecretMountPath override that is malformed or

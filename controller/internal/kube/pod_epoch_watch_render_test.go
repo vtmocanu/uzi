@@ -53,10 +53,10 @@ func TestPodEpochRenderProjectionAndRuntime(t *testing.T) {
 			}
 		}
 	}
-	if mount == nil || mount.SubPath != "" || mount.MountPath != "/run/uzi/pod-epoch" || !mount.ReadOnly {
+	if mount == nil || mount.SubPath != "" || mount.MountPath != "/etc/uzi/pod-epoch" || !mount.ReadOnly {
 		t.Fatalf("mount=%+v", mount)
 	}
-	if envs[PodEpochRuntimeEnv] != "containerd-runc" || envs["UZI_POD_EPOCH_EVIDENCE_FILE"] != "/run/uzi/pod-epoch/evidence" {
+	if envs[PodEpochRuntimeEnv] != "containerd-runc" || envs["UZI_POD_EPOCH_EVIDENCE_FILE"] != "/etc/uzi/pod-epoch/evidence" {
 		t.Fatalf("env=%v", envs)
 	}
 	found := false

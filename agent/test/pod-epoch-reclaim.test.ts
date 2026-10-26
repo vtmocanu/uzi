@@ -25,7 +25,7 @@ function setup() {
   };
   const options: Options = {
     bootstrap: { podUid: evidence.successor, runtime: evidence.runtime,
-      evidenceFile: "/run/uzi/pod-epoch/evidence", firstMode: "exclusive" },
+      evidenceFile: "/etc/uzi/pod-epoch/evidence", firstMode: "exclusive" },
     ownership, consumption: { result: "fresh", mayEvaluate: true }, signal: parent.signal,
     readEvidence: async () => { calls.reads++; return bytes; },
     client: { listRecoveryHolds: async run_id => ({ run_id, holds: [] }),

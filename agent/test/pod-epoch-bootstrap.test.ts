@@ -11,7 +11,7 @@ const T = "00000000-0000-0000-0000-000000000002";
 const environment = {
   UZI_POD_UID: S,
   UZI_POD_EPOCH_RUNTIME: "containerd-runc",
-  UZI_POD_EPOCH_EVIDENCE_FILE: "/run/uzi/pod-epoch/evidence",
+  UZI_POD_EPOCH_EVIDENCE_FILE: "/etc/uzi/pod-epoch/evidence",
 };
 type Options = NonNullable<Parameters<typeof createRuntime>[0]>;
 
@@ -41,6 +41,7 @@ test("bootstrap reads only its three fields and defaults to SH without a peek", 
     [{ UZI_POD_EPOCH_RUNTIME: "unknown" }, "runtime_not_supported"],
     [{ UZI_POD_EPOCH_EVIDENCE_FILE: undefined }, "no_projection"],
     [{ UZI_POD_EPOCH_EVIDENCE_FILE: "/tmp/arbitrary" }, "unsupported_projection"],
+    [{ UZI_POD_EPOCH_EVIDENCE_FILE: "/run/uzi/pod-epoch/evidence" }, "unsupported_projection"],
   ] as const) {
     const env = new Proxy({ ...environment, ...values }, {
       get(target, key, receiver) {
@@ -51,6 +52,7 @@ test("bootstrap reads only its three fields and defaults to SH without a peek", 
     const snapshot = inspectPodEpochBootstrap(env, port);
     assert.equal(snapshot.firstMode, "shared");
     assert.equal(snapshot.reason, reason);
+    if (reason === "unsupported_projection") assert.equal(snapshot.evidenceFile, undefined);
     assert.ok(Object.isFrozen(snapshot));
   }
   assert.equal(peeks, 0);
@@ -93,6 +95,8 @@ test("fresh bootstrap chooses EX before acquire; durable consume alone enables e
   assert.equal(fs.statSync(f.file).size, before.size);
   assert.equal(fs.readFileSync(f.file, "utf8"), "UZIEC01\n");
   const snapshot = inspectPodEpochBootstrap(environment, f.runtime);
+  assert.equal(snapshot.evidenceFile, "/etc/uzi/pod-epoch/evidence");
+  assert.equal(snapshot.firstMode, "exclusive");
   const held = await f.runtime.acquire(snapshot);
   try {
     assert.equal(held.mode, "exclusive");
