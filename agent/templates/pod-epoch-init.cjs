@@ -195,6 +195,24 @@ function createRuntime(options = {}) {
     if (seen.size !== records.length) throw new Error('duplicate consumption UUID');
     return { seen, size: contents.length };
   }
+  // Advisory only: never acquire the ledger mutex before epoch ownership.
+  // A complete read uses at most MAX_BYTES + 1 bytes; consumption still validates
+  // and fsyncs under the ledger mutex after acquire, even for an existing UID.
+  function inspectConsumption(podUid) {
+    uuid(podUid);
+    try {
+      const fd = io.openSync(names.ledger,
+        fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+      try {
+        const before = verify(fd, names.ledger);
+        const { seen } = ledger(fd);
+        const after = verify(fd, names.ledger, 0o600, identity(before));
+        if (after.size !== before.size || after.mtimeNs !== before.mtimeNs ||
+            after.ctimeNs !== before.ctimeNs) return 'uncertain';
+        return seen.has(podUid) ? 'existing' : seen.size === MAX_RECORDS ? 'full' : 'fresh';
+      } finally { io.closeSync(fd); }
+    } catch { return 'uncertain'; }
+  }
   async function consume(podUid, signal) {
     uuid(podUid);
     const fd = open(names.ledger);
@@ -390,7 +408,7 @@ function createRuntime(options = {}) {
     verify(fd, names.epoch, 0o600, expected);
     await validateLedger(signal);
   }
-  return { acquire, seed, prepare, hold };
+  return { acquire, seed, prepare, hold, inspectConsumption };
 }
 
 module.exports = { createRuntime };

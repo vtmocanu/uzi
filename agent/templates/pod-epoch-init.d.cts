@@ -30,7 +30,9 @@ interface RuntimeOptions {
 }
 
 interface PodEpochRuntime {
-  /** M1 callers leave firstMode unset. Exclusive is reserved for the future verdict pass. */
+  /** Read-only advisory snapshot; never grants evaluation or admission authority. */
+  inspectConsumption(podUid: string): "fresh" | "existing" | "full" | "uncertain";
+  /** Choose the first mode before acquisition; durable consume remains mandatory. */
   acquire(options?: { firstMode?: "shared" | "exclusive"; signal?: AbortSignal }): Promise<PodEpochOwnership>;
   seed(podUid: string, signal?: AbortSignal): Promise<"updated" | "busy" | "unsupported" | "invalid">;
   prepare(): string;
