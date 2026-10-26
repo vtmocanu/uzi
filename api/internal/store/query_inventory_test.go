@@ -776,8 +776,21 @@ var queryInventory = []queryPin{
 	// PRD #890 M1 adds the three vault-lock-notice queries and, unlike the original three,
 	// EXECUTES each against real Postgres in TestVaultLockNoticeQueriesLiveDB (the sqlc-
 	// inference gate: a green generate does not prove the multi-subquery SELECT / the atomic
-	// RETURNING claim / the guarded re-arm actually run). So this file is now 3 executed +
-	// 3 still-unpinned — the original coverage gap is unchanged, not closed by M1.
+	// RETURNING claim / the guarded re-arm actually run). That left 3 executed +
+	// 3 still-unpinned at that point — the original coverage gap was not closed by M1.
+	// Issue #3507 adds the mode/epoch queries below, exercised directly by its LiveDB tests.
+	{"GetUserVaultState", "user_vaults.sql", "TestVaultModeMigrationBackfillLiveDB",
+		"direct calls in vault_mode_livedb_test.go — existing vaultless, OIDC and inactive users " +
+			"must all reload as protected with epoch zero after migration"},
+	{"LockUserVaultState", "user_vaults.sql", "TestVaultModeQueriesLiveDB",
+		"direct transaction-bound calls in vault_mode_livedb_test.go — one transaction holds " +
+			"the user row and a competing lock attempt reaches its deadline before rollback"},
+	{"AdvanceUserVaultMode", "user_vaults.sql", "TestVaultModeQueriesLiveDB",
+		"direct calls in vault_mode_livedb_test.go — returned state and the subsequent locked reload " +
+			"must both report the requested mode and an epoch increment of one"},
+	{"CountUnprotectedUsers", "user_vaults.sql", "TestVaultModeQueriesLiveDB",
+		"direct call in vault_mode_livedb_test.go — the off-user count is one beside a protected " +
+			"user, independently of the protected-only legacy-secret count"},
 	{"ListUsersNeedingVaultLockNotice", "user_vaults.sql", "TestVaultLockNoticeQueriesLiveDB",
 		"direct call in vault_lock_notice_livedb_test.go — the PRD #890 M1 reconciler-eligibility " +
 			"query, executed against real Postgres with a seeded eligible user (vault row + confirmed " +
@@ -815,6 +828,10 @@ var queryInventory = []queryPin{
 			"coverage report, and only one of them is fine"},
 
 	// ── settings.sql — the write path and the plain read are pinned; the LOCK is not ──
+	{"GetVaultPolicy", "settings.sql", "TestVaultModeQueriesLiveDB",
+		"direct calls in vault_mode_livedb_test.go — only exact optional permits optional mode; " +
+			"missing and invalid policy rows fail closed to required. The admission-lock test also " +
+			"reads the policy in a separate statement after the settings writer commits"},
 	{"DeleteAppSettings", "settings.sql", unpinnedPin,
 		"PRD #590 M2 — retires the legacy selfimprove_* keys after the boot-migration materializes " +
 			"the self_improve schedule row. Its only caller is schedsvc.MigrateLegacySelfImprove, which " +
