@@ -854,9 +854,8 @@ test("busy boot pass cannot drop a source pass; shutdown aborts and joins delaye
       aborted: signal.aborted, quarantine: residueQuarantine(),
       ...(savedPass ? { entries: savedPass.entries, bytes: savedPass.bytes,
         exhausted: savedPass.exhausted } : {}),
-      ...(signal.aborted ? { reason: "aborted" } :
-        savedPass?.exhausted ? { reason: "saved_metadata_exhausted" } :
-          residueQuarantine() !== undefined ? { reason: "quarantined" } : {}),
+      // Settlement flags are observations only: a late abort or exhaustion
+      // here does not prove a guard stopped this pass, so no reason is set.
     })));
   const discover = seams.savedSourceCandidates.bind(seams);
   t.mock.method(seams, "savedSourceCandidates", (run: string, signal: AbortSignal) => {
@@ -947,9 +946,10 @@ test("busy boot pass cannot drop a source pass; shutdown aborts and joins delaye
       (event.event === "executing_check" && event.reason === "executing")
     ));
     const passExits = trace.filter(event => (
-      ((event.event === "settled" && event.stage === "replay") || event.event === "metadata_throw") &&
-      ["aborted", "saved_metadata_exhausted", "quarantined"].includes(String(event.reason))
+      event.event === "metadata_throw" &&
+      ["aborted", "saved_metadata_exhausted"].includes(String(event.reason))
     ) || (event.event === "executing_check" && event.id === undefined && event.reason === "executing"));
+    const replaySettled = trace.find(event => event.stage === "replay" && event.event === "settled");
     const discoveryExit = secondOmitted
       ? trace.find(event => event.stage === "discovery" && event.event === "warn" &&
         event.reason === "discovery_incomplete") : undefined;
@@ -966,6 +966,7 @@ test("busy boot pass cannot drop a source pass; shutdown aborts and joins delaye
           ? "second record omitted from discovery snapshot without a discovery warning; filtering does not identify a cycle exit"
           : "no explicit second-record exit or pass-wide stop observed; absence alone cannot identify an exit",
       }),
+      ...(replaySettled ? { replaySettlement: replaySettled } : {}),
       ...(secondOmitted ? { observation: "candidate_not_discovered",
         discoveryEvidence: evidence(discovery!) } : {}),
       trace, dropped,
