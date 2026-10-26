@@ -176,20 +176,26 @@ export function MaintenanceCard() {
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  // A GET that started before or during a PUT must not overwrite the PUT's newer state when
-  // it resolves late. writeGen moves when a write starts and again when it settles; a read
-  // keeps its response only if the generation is unchanged and no write is in flight.
+  // A Refresh GET that a PUT overtakes must not overwrite the PUT's newer state when it
+  // resolves late. writeGen moves when a write starts; a read keeps its outcome (data or
+  // error) only if no write started since it began. A read cannot start during a write:
+  // Refresh is disabled while one is busy, and the switch only renders once data loaded.
   const writeGen = useRef(0);
-  const writing = useRef(0);
-  const readIsFresh = (gen: number) => writeGen.current === gen && writing.current === 0;
+  // The last server reason the card adopted. Refresh compares the field against it at
+  // resolve time, so text typed while its GET was in flight is never replaced.
+  const savedReasonRef = useRef("");
+
+  const adopt = (resp: AdminMaintenance) => {
+    savedReasonRef.current = resp.state.reason ?? "";
+    setData(resp);
+    setReason(savedReasonRef.current);
+  };
 
   const { loading, error: loadError, reload } = useAsyncData(
     async ({ isCurrent }) => {
-      const gen = writeGen.current;
       const resp = await api.getAdminMaintenance();
-      if (!isCurrent() || !readIsFresh(gen)) return;
-      setData(resp);
-      setReason(resp.state.reason ?? "");
+      if (!isCurrent()) return;
+      adopt(resp);
     },
     [],
     { fallback: "Failed to load maintenance mode", skeleton: "always" },
@@ -203,11 +209,9 @@ export function MaintenanceCard() {
     setNotice("");
     setBusy(kind);
     writeGen.current++;
-    writing.current++;
     try {
       const resp = await api.setMaintenance(active, reason.trim());
-      setData(resp);
-      setReason(resp.state.reason ?? "");
+      adopt(resp);
       reloadBanner();
       setNotice(
         kind === "reason"
@@ -219,8 +223,6 @@ export function MaintenanceCard() {
     } catch (err) {
       setError(errorMessage(err, "Failed to update maintenance mode"));
     } finally {
-      writing.current--;
-      writeGen.current++;
       setBusy(null);
     }
   };
@@ -231,12 +233,18 @@ export function MaintenanceCard() {
     const gen = writeGen.current;
     try {
       const resp = await api.getAdminMaintenance();
-      // A write started or settled meanwhile: its response is newer than this read.
-      if (!readIsFresh(gen)) return;
+      // A write started meanwhile: its response is newer than this read.
+      if (writeGen.current !== gen) return;
+      const prevSaved = savedReasonRef.current;
+      const next = resp.state.reason ?? "";
+      savedReasonRef.current = next;
       setData(resp);
-      // Keep an in-progress reason edit; adopt the server's only when the field is untouched.
-      if (!reasonDirty) setReason(resp.state.reason ?? "");
+      // Keep an in-progress reason edit, including one typed while this GET was in flight:
+      // adopt the server's reason only when the field still holds the last saved one.
+      setReason((cur) => (cur === prevSaved ? next : cur));
     } catch (err) {
+      // A superseded read's failure is moot: the write's response is the current state.
+      if (writeGen.current !== gen) return;
       setError(errorMessage(err, "Failed to refresh the readout"));
     } finally {
       setRefreshing(false);

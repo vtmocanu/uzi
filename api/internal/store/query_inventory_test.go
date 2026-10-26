@@ -997,14 +997,14 @@ var queryInventory = []queryPin{
 	// ListRunQueueReasons 19. None is zero. A receipt of that sweep, not a live count.
 	{"GetInstanceIntakePause", "intake_pause.sql", "TestIntakePauseMissingRowLiveDB",
 		"direct call at intake_pause_livedb_test.go (reads back by_user_id and by_label after a " +
-			"re-seeded row is paused); also reached through store.ReadInstanceIntakePause in " +
+			"re-seeded row is lifted); also reached through store.ReadInstanceIntakePause in " +
 			"several tests of the same file"},
 	{"LockInstanceIntakePause", "intake_pause.sql", "TestIntakePauseTransitionsLiveDB",
 		"reached through store.SetInstanceIntakePause (row lock before the transition); the test " +
 			"asserts changed/no-op for every pause and lift transition"},
 	{"EnsureInstanceIntakePauseRow", "intake_pause.sql", "TestIntakePauseMissingRowLiveDB",
 		"reached through store.SetInstanceIntakePause, which re-seeds a deleted singleton row; the " +
-			"test deletes the row and asserts the pause still takes effect"},
+			"test deletes the row, lifts the pause and asserts the row is back unpaused with one off event"},
 	{"UpdateInstanceIntakePause", "intake_pause.sql", "TestIntakePauseTransitionsLiveDB",
 		"reached through store.SetInstanceIntakePause; asserts the resulting state and the " +
 			"changed flag per transition (TestIntakePauseReasonEditKeepsAttributionLiveDB covers the " +
@@ -1015,13 +1015,13 @@ var queryInventory = []queryPin{
 			"a rolled-back transition leaves no event"},
 	{"ListInstanceIntakePauseEvents", "intake_pause.sql", "TestIntakePauseTransitionsLiveDB",
 		"direct call at intake_pause_livedb_test.go, asserting the event sequence and order"},
-	{"RunAdmittableForEphemeralProvision", "intake_pause.sql", "TestEphemeralProvisionPassIntakePauseBatchLiveDB",
-		"../handler: prov.ProvisionPass -> hostedsvc ephemeral provisioning admission check; asserts " +
-			"which runs are provisioned while paused and after the pause lifts. The per-kind " +
-			"admission table is TestIntakePauseAdmissionTableLiveDB in this package"},
+	{"RunAdmittableForEphemeralProvision", "intake_pause.sql", "TestEphemeralProvisionOneRechecksIntakePauseLiveDB",
+		"../handler: prov.ProvisionPass -> provisionOne recheck under the advisory lock; the test " +
+			"enables the pause mid-pass and asserts no worker is created (replacing the query with " +
+			"SELECT true reddens it). The batch test also executes it but never depends on its answer"},
 	{"MaintenanceSnapshotNow", "intake_pause.sql", "TestMaintenanceReadoutPartitionLiveDB",
 		"reached through store.ReadMaintenanceReadout (one statement-time clock shared by every " +
-			"section); executed but only its consequence, the section ages, is asserted"},
+			"section); executed; the test asserts only that as_of is set"},
 	{"ListMaintenanceActiveRuns", "intake_pause.sql", "TestMaintenanceReadoutPartitionLiveDB",
 		"reached through store.ReadMaintenanceReadout; the partition test asserts which seeded runs " +
 			"land in the active section"},

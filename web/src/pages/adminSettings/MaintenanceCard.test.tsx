@@ -195,8 +195,6 @@ describe("MaintenanceCard", () => {
     mockApi.setMaintenance.mockReturnValueOnce(put.promise);
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
     fireEvent.click(screen.getByRole("switch", { name: "Maintenance mode" }));
-    // Refresh is disabled while a write is in flight.
-    expect((screen.getByRole("button", { name: /Refresh/ }) as HTMLButtonElement).disabled).toBe(true);
 
     await act(async () => get.resolve(doc({ active: false, clear: false })));
     expect(document.querySelector('[data-maintenance-clear="false"]')).toBeNull();
@@ -206,6 +204,70 @@ describe("MaintenanceCard", () => {
     expect(screen.getByRole("switch", { name: "Maintenance mode" }).getAttribute("aria-checked")).toBe("true");
     expect(document.querySelector('[data-maintenance-clear="true"]')).toBeTruthy();
     expect(reasonInput().value).toBe("Drain");
+  });
+
+  it("drops the error of a Refresh GET that fails after a PUT overtook it", async () => {
+    await renderCard(doc({ active: true, clear: false }));
+    let reject!: (e: unknown) => void;
+    mockApi.getAdminMaintenance.mockReturnValueOnce(new Promise<AdminMaintenance>((_, r) => (reject = r)));
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+    mockApi.setMaintenance.mockResolvedValueOnce(doc({ active: false }));
+    fireEvent.click(screen.getByRole("switch", { name: "Maintenance mode" }));
+    expect(await screen.findByText("Maintenance mode is off. Queued runs start as workers free up.")).toBeTruthy();
+
+    await act(async () => reject(new Error("bad gateway")));
+    await waitFor(() => expect((screen.getByRole("button", { name: "Refresh" }) as HTMLButtonElement).disabled).toBe(false));
+    expect(screen.queryByText(/Failed to refresh the readout|bad gateway/)).toBeNull();
+    expect(screen.getByText("Maintenance mode is off. Queued runs start as workers free up.")).toBeTruthy();
+    expect(screen.getByRole("switch", { name: "Maintenance mode" }).getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("shows the error of a Refresh GET that fails with no write in between", async () => {
+    await renderCard(doc({ active: true, clear: false }));
+    mockApi.getAdminMaintenance.mockRejectedValueOnce(new Error("bad gateway"));
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(await screen.findByText(/bad gateway|Failed to refresh the readout/)).toBeTruthy();
+  });
+
+  it("keeps reason text typed while a Refresh GET is in flight", async () => {
+    await renderCard(doc({ active: true, reason: "Old" }));
+    const get = deferred<AdminMaintenance>();
+    mockApi.getAdminMaintenance.mockReturnValueOnce(get.promise);
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    fireEvent.change(reasonInput(), { target: { value: "Typed during refresh" } });
+
+    await act(async () => get.resolve(doc({ active: true, reason: "Server reason" })));
+    await waitFor(() => expect((screen.getByRole("button", { name: "Refresh" }) as HTMLButtonElement).disabled).toBe(false));
+    expect(reasonInput().value).toBe("Typed during refresh");
+    // The edit stays dirty against the newly read reason, so it can still be saved.
+    expect((screen.getByRole("button", { name: "Save reason" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("an untouched reason field adopts the reason a Refresh reads", async () => {
+    await renderCard(doc({ active: true, reason: "Old" }));
+    mockApi.getAdminMaintenance.mockResolvedValueOnce(doc({ active: true, reason: "Changed elsewhere" }));
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    await waitFor(() => expect(reasonInput().value).toBe("Changed elsewhere"));
+  });
+
+  it("disables Refresh while a write is busy, after the last Refresh settled", async () => {
+    // No read can start during a write: the stale-read guard relies on this.
+    await renderCard(doc({ active: true }));
+    mockApi.getAdminMaintenance.mockResolvedValueOnce(doc({ active: true }));
+    const refresh = () => screen.getByRole("button", { name: /Refresh/ }) as HTMLButtonElement;
+    fireEvent.click(refresh());
+    await waitFor(() => expect(refresh().textContent).toBe("Refresh"));
+    expect(refresh().disabled).toBe(false);
+
+    const put = deferred<AdminMaintenance>();
+    mockApi.setMaintenance.mockReturnValueOnce(put.promise);
+    fireEvent.click(screen.getByRole("switch", { name: "Maintenance mode" }));
+    expect(refresh().textContent).toBe("Refresh");
+    expect(refresh().disabled).toBe(true);
+
+    await act(async () => put.resolve(doc()));
+    await waitFor(() => expect(refresh().disabled).toBe(false));
   });
 
   it("a Refresh with no write in between updates the readout", async () => {
