@@ -13,29 +13,41 @@ import {
 //
 // Files (all 0600 under the 0700 `<dataDir>/.uzi-authority/`, never persisting st_dev/st_ino):
 //   enrollment.json        authenticated storage UUID + layout version + canonical data root
-//   head.json              MAC'd store head: latest slot seq per slot key (freshness)
-//   slots/<digest>.json    one MAC'd record per source path
+//   heads/<xx>.json       256 MAC'd head shards (xx = first two hex digits of the slot key):
+//                         latest slot seq per slot key in that shard (freshness)
+//   slots/<digest>.json   one MAC'd record per source path
 // Writes are tmp(O_EXCL|O_NOFOLLOW) -> file fsync -> rename -> directory fsync -> read back.
 // Each write holds an O_DIRECTORY|O_NOFOLLOW handle on the target directory and refuses when
 // the directory name no longer resolves to that inode, checked before the tmp file is
-// created, before the rename and after it (memory only).
+// created, before the rename and after it (memory only). A pre-rename refusal unlinks the
+// synced tmp file through the held directory handle (/proc/self/fd), so it is not leaked in a
+// directory that was moved away.
 //
 // Freshness: a MAC binds the key, not recency, so an authentic OLD slot file could be put back
-// to restore a cleared state. Every slot write is therefore followed by a head.json write
-// (the same five-step durable write), so each slot write costs two extra barriers (a file
-// fsync and a directory fsync) on top of the slot's own two. A loaded slot must satisfy
-// slot.seq == head seq; slot.seq == head seq + 1 is the crash window between the slot rename
-// and the head update, and is completed under the transaction. Anything older refuses and
-// blocks. The store also keeps an in-process high-water mark per slot key. Rolling the WHOLE
-// authority store back (head and slots together, e.g. a volume snapshot restore) is outside
-// this guarantee by design; only an older head with a newer slot (more than one ahead) or an
-// older slot under a newer head is detected.
+// to restore a cleared state. Every slot write is therefore followed by a write of that key's
+// head shard (the same five-step durable write), so each slot write costs two extra barriers (a
+// file fsync and a directory fsync) on top of the slot's own two. The shard name is bound into
+// the shard's MAC and every key in it must carry that prefix, so shards cannot be swapped. A
+// loaded slot must satisfy slot.seq == shard seq; slot.seq == shard seq + 1 is the crash window
+// between the slot rename and the shard update, and is completed under the transaction.
+// Anything older refuses and blocks. Retired tombstones are kept (no GC), so the head is sharded
+// to keep each file far below MAX_SLOT_BYTES and to rewrite only one shard per operation. A
+// shard file that is deleted reads as seq 0, so it is indistinguishable from the crash window
+// only for a slot at seq 1; a deleted shard under any later slot refuses.
+//
+// Rollback: the in-process high-water mark (module level, keyed by storage id, so reopening the
+// store per transaction keeps it) catches any restore within this process. Across a restart,
+// the one undetected rollback is restoring a head shard together with every slot written since
+// it (for example a volume snapshot restore, up to and including the whole store); detection
+// of that case is in-process only. An older shard with a newer slot (more than one ahead) or
+// an older slot under a newer shard is detected.
 
 const AUTHORITY_LAYOUT = "uzi-authority-layout/1";
 const ENROLLMENT_VERSION = "uzi-authority-enrollment/1";
 const SLOT_VERSION = "uzi-authority-slot/1";
-const HEAD_VERSION = "uzi-authority-head/1";
-const HEAD_FILE = "head.json";
+const HEAD_VERSION = "uzi-authority-head/2";
+const HEADS_DIR = "heads";
+const SHARD = /^[0-9a-f]{2}$/;
 const SLOT_FILE = /^[0-9a-f]{64}\.json$/;
 const KEY_LABEL = "uzi completion authority v1";
 const ENROLLMENT_FILE = "enrollment.json";
@@ -163,15 +175,18 @@ function normalizeEnrollment(raw: unknown): Enrollment {
   return { version: ENROLLMENT_VERSION, layout: text(o.layout, 128), storageId: uuid(o.storageId), dataDir: text(o.dataDir, 4096) };
 }
 
-interface Head { version: string; storageId: string; slots: Record<string, number> }
+interface Head { version: string; storageId: string; shard: string; slots: Record<string, number> }
 function normalizeHead(raw: unknown): Head {
-  const o = exact(raw, ["version", "storageId", "slots"]);
+  const o = exact(raw, ["version", "storageId", "shard", "slots"]);
   if (o.version !== HEAD_VERSION) throw new AuthorityRefusal("unsupported authority head version");
+  if (typeof o.shard !== "string" || !SHARD.test(o.shard)) throw new AuthorityRefusal("malformed authority record");
+  const shard = o.shard;
   if (!isPlain(o.slots)) throw new AuthorityRefusal("malformed authority record");
   const entries = Object.entries(o.slots)
     .map(([key, seq]) => [hex64(key), uint(seq, 1, Number.MAX_SAFE_INTEGER)] as const)
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-  return { version: HEAD_VERSION, storageId: uuid(o.storageId), slots: Object.fromEntries(entries) };
+  if (entries.some(([key]) => !key.startsWith(shard))) throw new AuthorityRefusal("malformed authority record");
+  return { version: HEAD_VERSION, storageId: uuid(o.storageId), shard, slots: Object.fromEntries(entries) };
 }
 
 // ---- authenticated records ------------------------------------------------------------
@@ -274,7 +289,9 @@ async function writeDurable(ops: AuthorityFsOps, dir: string, uid: number, name:
       await check(); // before anything is renamed into the store
       await ops.rename(tmp, path.join(dir, name));
     } catch (error) {
-      await fsp.unlink(tmp).catch(() => undefined);
+      // Unlink through the held handle: after a directory swap the name resolves elsewhere.
+      await fsp.unlink(path.join(`/proc/self/fd/${dirHandle.fd}`, path.basename(tmp)))
+        .catch(() => fsp.unlink(tmp)).catch(() => undefined);
       throw error;
     }
     await check();
@@ -283,31 +300,47 @@ async function writeDurable(ops: AuthorityFsOps, dir: string, uid: number, name:
   });
 }
 
-function sealHead(key: Buffer, storageId: string, heads: ReadonlyMap<string, number>): string {
+const shardOf = (slotKey: string): string => slotKey.slice(0, 2);
+
+function sealHead(init: StoreIdentity, shard: string, heads: ReadonlyMap<string, number>): string {
   const slots = Object.fromEntries([...heads].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
-  const content = seal(key, "head", { version: HEAD_VERSION, storageId, slots });
-  if (Buffer.byteLength(content, "utf8") > MAX_SLOT_BYTES) throw new AuthorityRefusal("authority head exceeds bound");
+  const content = seal(init.key, "head", { version: HEAD_VERSION, storageId: init.storageId, shard, slots });
+  if (Buffer.byteLength(content, "utf8") > init.maxHeadBytes) throw new AuthorityRefusal("authority head exceeds bound");
   return content;
 }
 
-/** The authenticated head, or null when no head file exists. */
-async function readHead(init: StoreIdentity): Promise<Map<string, number> | null> {
-  const source = await readRegular(path.join(init.dir, HEAD_FILE), init.uid, MAX_SLOT_BYTES);
-  if (source === null) return null;
+/** The authenticated head shard (empty when its file does not exist yet). */
+async function readHead(init: StoreIdentity, shard: string): Promise<Map<string, number>> {
+  try { await fsp.lstat(path.join(init.dir, HEADS_DIR)); }
+  catch { throw new AuthorityRefusal("authority head missing"); }
+  const source = await readRegular(path.join(init.dir, HEADS_DIR, `${shard}.json`), init.uid, init.maxHeadBytes);
+  if (source === null) return new Map();
   const head = unseal(init.key, "head", source, normalizeHead);
   if (head.storageId !== init.storageId) throw new AuthorityRefusal("authority head belongs to another storage");
+  if (head.shard !== shard) throw new AuthorityRefusal("authority head shard does not match its name");
   return new Map(Object.entries(head.slots));
 }
 
-async function writeHead(ops: AuthorityFsOps, init: StoreIdentity, heads: ReadonlyMap<string, number>): Promise<void> {
-  const content = sealHead(init.key, init.storageId, heads);
-  await writeDurable(ops, init.dir, init.uid, HEAD_FILE, content);
-  if (await readRegular(path.join(init.dir, HEAD_FILE), init.uid, MAX_SLOT_BYTES) !== content) {
+async function writeHead(
+  ops: AuthorityFsOps, init: StoreIdentity, shard: string, heads: ReadonlyMap<string, number>,
+): Promise<void> {
+  const content = sealHead(init, shard, heads);
+  const dir = path.join(init.dir, HEADS_DIR);
+  await writeDurable(ops, dir, init.uid, `${shard}.json`, content);
+  if (await readRegular(path.join(dir, `${shard}.json`), init.uid, init.maxHeadBytes) !== content) {
     throw new AuthorityRefusal("authority head did not read back");
   }
 }
 
-interface StoreIdentity { dir: string; uid: number; key: Buffer; storageId: string }
+interface StoreIdentity { dir: string; uid: number; key: Buffer; storageId: string; maxHeadBytes: number }
+
+/** Highest seq loaded or written per slot key, per storage id, for the life of the process. */
+const highWaters = new Map<string, Map<string, number>>();
+function highWaterOf(storageId: string): Map<string, number> {
+  let marks = highWaters.get(storageId);
+  if (!marks) { marks = new Map(); highWaters.set(storageId, marks); }
+  return marks;
+}
 
 async function ensurePrivateDir(dir: string, parent: string, uid: number, ops: AuthorityFsOps): Promise<void> {
   let created = false;
@@ -343,6 +376,8 @@ export interface AuthorityStoreOptions {
   workerIncarnation?: string;
   /** Tests only: inject fsync/rename failures. */
   ops?: AuthorityFsOps;
+  /** Tests only: a smaller per-shard head bound than MAX_SLOT_BYTES. */
+  maxHeadBytes?: number;
 }
 
 /**
@@ -379,24 +414,29 @@ export async function openAuthorityStore(tx: AuthorityTransaction, options: Auth
   }
   if (enrollment.layout !== AUTHORITY_LAYOUT) throw new AuthorityRefusal("unsupported authority layout");
   if (enrollment.dataDir !== ctx.dataDir) throw new AuthorityRefusal("authority enrolled under a different data root spelling");
-  // The head makes slot freshness checkable. Create it only for an empty store: slots with no
-  // head cannot be told from a deleted head, so they refuse.
-  const identity: StoreIdentity = { dir: ctx.authorityDir, uid: ctx.uid, key, storageId: enrollment.storageId };
-  if (await readHead(identity) === null) {
+  // The head shards make slot freshness checkable. Create their directory only for an empty
+  // store: slots with no head directory cannot be told from a deleted one, so they refuse.
+  const headsDir = path.join(ctx.authorityDir, HEADS_DIR);
+  let headsExist = true;
+  try { await fsp.lstat(headsDir); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; headsExist = false; }
+  if (!headsExist) {
     let entries: string[] = [];
     try { entries = await fsp.readdir(slotsDir); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     if (entries.some((name) => SLOT_FILE.test(name))) throw new AuthorityRefusal("authority slots exist without a head");
-    await writeHead(ops, identity, new Map());
   }
+  await ensurePrivateDir(headsDir, ctx.authorityDir, ctx.uid, ops);
   return new AuthorityStore(storeBrand, {
     key, storageId: enrollment.storageId, ctxDir: ctx.authorityDir, dataDir: ctx.dataDir, uid: ctx.uid,
     incarnation: options.workerIncarnation ?? PROCESS_INCARNATION, ops,
+    maxHeadBytes: options.maxHeadBytes ?? MAX_SLOT_BYTES,
   });
 }
 
 interface StoreInit {
   key: Buffer; storageId: string; ctxDir: string; dataDir: string; uid: number; incarnation: string; ops: AuthorityFsOps;
+  maxHeadBytes: number;
 }
 
 const NEXT_STATES: Record<"claude_ready" | "sealed" | "ineligible", SlotState[]> = {
@@ -416,11 +456,12 @@ function requireResidueCovered(pending: PendingFootprint | null, manifest: reado
 
 export class AuthorityStore {
   readonly #init: StoreInit;
-  /** Highest seq this store has loaded or written per slot key (in-process freshness floor). */
-  readonly #highWater = new Map<string, number>();
+  /** Highest seq loaded or written per slot key; shared by every store of this storage id. */
+  readonly #highWater: Map<string, number>;
   constructor(token: symbol, init: StoreInit) {
     if (token !== storeBrand) throw new TypeError("AuthorityStore cannot be constructed");
     this.#init = init;
+    this.#highWater = highWaterOf(init.storageId);
   }
 
   get storageId(): string { return this.#init.storageId; }
@@ -473,17 +514,14 @@ export class AuthorityStore {
   }
 
   #identityOf(): StoreIdentity {
-    return { dir: this.#init.ctxDir, uid: this.#init.uid, key: this.#init.key, storageId: this.#init.storageId };
-  }
-
-  async #head(): Promise<Map<string, number>> {
-    const head = await readHead(this.#identityOf());
-    if (head === null) throw new AuthorityRefusal("authority head missing");
-    return head;
+    return {
+      dir: this.#init.ctxDir, uid: this.#init.uid, key: this.#init.key, storageId: this.#init.storageId,
+      maxHeadBytes: this.#init.maxHeadBytes,
+    };
   }
 
   async #load(dir: string, key: string): Promise<SlotSnapshot | null> {
-    const head = await this.#head();
+    const head = await readHead(this.#identityOf(), shardOf(key));
     const source = await readRegular(path.join(dir, `${key}.json`), this.#init.uid, MAX_SLOT_BYTES);
     const headSeq = head.get(key) ?? 0;
     const floor = Math.max(headSeq, this.#highWater.get(key) ?? 0);
@@ -498,7 +536,7 @@ export class AuthorityStore {
       // Exactly one ahead is a crash between the slot rename and the head update: finish it.
       if (body.seq !== headSeq + 1) throw new AuthorityRefusal("authority slot is ahead of the recorded head");
       head.set(key, body.seq);
-      await writeHead(this.#init.ops, this.#identityOf(), head);
+      await writeHead(this.#init.ops, this.#identityOf(), shardOf(key), head);
     }
     this.#highWater.set(key, body.seq);
     return body;
@@ -507,21 +545,22 @@ export class AuthorityStore {
   /**
    * Validate through the decoder and the size bound BEFORE anything is written, so the public
    * API can never persist a slot the next load would refuse. The slot is written first, then
-   * the head (which must stay within its own bound, checked up front).
+   * the key's head shard (which must stay within its own bound, checked up front).
    */
   async #save(dir: string, input: SlotSnapshot): Promise<void> {
     const body = normalizeSlot(JSON.parse(JSON.stringify(input)));
     const content = seal(this.#init.key, "slot", body);
     if (Buffer.byteLength(content, "utf8") > MAX_SLOT_BYTES) throw new AuthorityRefusal("authority slot exceeds bound");
-    const head = await this.#head();
+    const shard = shardOf(body.key);
+    const head = await readHead(this.#identityOf(), shard);
     if (body.seq !== (head.get(body.key) ?? 0) + 1) throw new AuthorityRefusal("authority slot is not the next head sequence");
     head.set(body.key, body.seq);
-    sealHead(this.#init.key, this.#init.storageId, head);
+    sealHead(this.#identityOf(), shard, head);
     await writeDurable(this.#init.ops, dir, this.#init.uid, `${body.key}.json`, content);
     const back = await readRegular(path.join(dir, `${body.key}.json`), this.#init.uid, MAX_SLOT_BYTES);
     if (back !== content) throw new AuthorityRefusal("authority slot did not read back");
     this.#highWater.set(body.key, body.seq);
-    await writeHead(this.#init.ops, this.#identityOf(), head);
+    await writeHead(this.#init.ops, this.#identityOf(), shard, head);
   }
 
   /** Current verified slot, or null when never admitted. A malformed slot refuses. */

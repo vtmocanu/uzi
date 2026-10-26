@@ -376,6 +376,8 @@ export async function withAuthorityTransaction<T>(
       await requireSupportedStorage(ctx.supportedFs, ctx.authorityDir);
       await flockExclusive(ctx, handle, Math.max(0, deadline - performance.now()), signal, false);
       await verifyLockFile(ctx, handle, file);
+      // The first check ran before A was taken; W may have been replaced while waiting for A.
+      await verifyWorkerLock(ctx);
       const tx = new AuthorityTransaction(transactionBrand);
       const state: TransactionState = { ctx, active: true };
       transactionStates.set(tx, state);

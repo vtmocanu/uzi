@@ -250,6 +250,28 @@ test("A: replacing authority.lock between open and flock refuses before the call
   assert.equal(await withAuthorityTransaction(lifetime, {}, async () => "recovered"), "recovered");
 });
 
+test("W: replacing worker.lock while A is being acquired refuses before the callback runs", async (t) => {
+  const root = makeTmp(t);
+  const base = testLockOptions();
+  let swap = false;
+  const lifetime = await acquireWorkerLifetime(root, {
+    ...base,
+    run: async (args, fd, signal, timeout) => {
+      if (swap && args[0] !== "--version") {
+        swap = false;
+        fs.renameSync(lockFile(root), lockFile(root) + ".old");
+        fs.writeFileSync(lockFile(root), "", { mode: 0o600 });
+      }
+      return base.run ? base.run(args, fd, signal, timeout) : realRun(args, fd);
+    },
+  });
+  await withAuthorityTransaction(lifetime, {}, async () => undefined);
+  swap = true;
+  let ran = false;
+  await assert.rejects(withAuthorityTransaction(lifetime, {}, async () => { ran = true; }), /inode changed/);
+  assert.equal(ran, false);
+});
+
 /** A flock stand-in that passes the util-linux trust check and then blocks forever. */
 function fakeFlock(t: Parameters<typeof makeTmp>[0]): { script: string; pidFile: string } {
   const dir = makeTmp(t, "fake-flock-");

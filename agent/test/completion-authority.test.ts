@@ -25,7 +25,9 @@ const enrollmentFile = (f: Fixture): string => path.join(authorityDir(f), "enrol
 function tx<T>(f: Fixture, fn: (tx: AuthorityTransaction) => Promise<T>): Promise<T> {
   return withAuthorityTransaction(f.lifetime, { timeoutMs: 5000 }, fn);
 }
-function store(f: Fixture, extra: { workerIncarnation?: string; ops?: AuthorityFsOps; token?: string } = {}): Promise<AuthorityStore> {
+function store(
+  f: Fixture, extra: { workerIncarnation?: string; ops?: AuthorityFsOps; token?: string; maxHeadBytes?: number } = {},
+): Promise<AuthorityStore> {
   return tx(f, (t) => openAuthorityStore(t, { workerToken: extra.token ?? f.token, ...extra }));
 }
 function source(f: Fixture, name = "runner/repo-a"): string {
@@ -33,6 +35,7 @@ function source(f: Fixture, name = "runner/repo-a"): string {
   fs.mkdirSync(full, { recursive: true });
   return full;
 }
+const shardFile = (f: Fixture, key: string): string => path.join(authorityDir(f), "heads", `${key.slice(0, 2)}.json`);
 function slotFiles(f: Fixture): string[] {
   return fs.existsSync(slotsDir(f)) ? fs.readdirSync(slotsDir(f)) : [];
 }
@@ -361,34 +364,40 @@ test("the in-process high-water mark refuses a replay of the slot and head toget
   const key = await tx(f, (t2) => s.slotKey(t2, src));
   const lease = await tx(f, (t2) => s.admitSourceUse(t2, src));
   const file = path.join(slotsDir(f), `${key}.json`);
-  const headFile = path.join(authorityDir(f), "head.json");
+  const headFile = shardFile(f, key);
   const oldSlot = fs.readFileSync(file);
   const oldHead = fs.readFileSync(headFile);
   await tx(f, (t2) => s.transition(t2, lease, "ineligible"));
   fs.writeFileSync(file, oldSlot, { mode: 0o600 });
   fs.writeFileSync(headFile, oldHead, { mode: 0o600 });
-  // A whole-store rollback is outside the guarantee across a restart; within the process it is caught.
+  // A whole-store rollback is outside the guarantee across a restart; within the process it is caught,
+  // even by a store reopened after the write (the mark is per storage id, not per store instance).
   await assert.rejects(tx(f, (t2) => s.readSlot(t2, key)), /replay/);
+  const reopened = await store(f);
+  await assert.rejects(tx(f, (t2) => reopened.readSlot(t2, key)), /replay/);
 });
 
 test("the head tracks every slot write and survives its own crash window", async (t) => {
   const f = await fixture(t);
-  const headFile = path.join(authorityDir(f), "head.json");
-  const head = (): Record<string, number> => (JSON.parse(fs.readFileSync(headFile, "utf8")) as { slots: Record<string, number> }).slots;
+  const src = source(f);
   const flags = { head: false };
   const s = await store(f, {
     ops: {
       syncFile: (h) => h.sync(), syncDir: (h) => h.sync(),
-      rename: async (a, b) => { if (flags.head && b.endsWith("head.json")) throw new Error("injected head failure"); fs.renameSync(a, b); },
+      rename: async (a, b) => {
+        if (flags.head && path.basename(path.dirname(b)) === "heads") throw new Error("injected head failure");
+        fs.renameSync(a, b);
+      },
     },
   });
-  assert.deepEqual(head(), {});
-  const src = source(f);
   const key = await tx(f, (t2) => s.slotKey(t2, src));
+  const headFile = shardFile(f, key);
+  const head = (): Record<string, number> => (JSON.parse(fs.readFileSync(headFile, "utf8")) as { slots: Record<string, number> }).slots;
+  assert.equal(fs.existsSync(headFile), false, "a shard exists only once a slot in it was written");
 
   flags.head = true;
   await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src)), /injected head failure/);
-  assert.deepEqual(head(), {}, "slot renamed, head not yet updated");
+  assert.equal(fs.existsSync(headFile), false, "slot renamed, head not yet updated");
   assert.equal(slotFiles(f).length, 1);
   flags.head = false;
 
@@ -405,21 +414,23 @@ test("a rolled-back or deleted head, or a deleted slot, refuses", async (t) => {
   const s = await store(f);
   const src = source(f);
   const key = await tx(f, (t2) => s.slotKey(t2, src));
-  const headFile = path.join(authorityDir(f), "head.json");
+  const headFile = shardFile(f, key);
   const lease = await tx(f, (t2) => s.admitSourceUse(t2, src));
   const oldHead = fs.readFileSync(headFile);
   await tx(f, (t2) => s.transition(t2, lease, "claude_ready"));
   await tx(f, (t2) => s.transition(t2, lease, "ineligible"));
+  const newHead = fs.readFileSync(headFile);
 
   fs.writeFileSync(headFile, oldHead, { mode: 0o600 });
-  const fresh = await store(f);
-  await assert.rejects(tx(f, (t2) => fresh.readSlot(t2, key)), /ahead of the recorded head/);
+  await assert.rejects(tx(f, (t2) => s.readSlot(t2, key)), /ahead of the recorded head/);
 
-  const newHead = fs.readFileSync(headFile);
   fs.writeFileSync(headFile, JSON.stringify({ ...JSON.parse(newHead.toString()) as object, slots: {} }) + "\n", { mode: 0o600 });
-  await assert.rejects(store(f), /authentication/);
+  await assert.rejects(tx(f, (t2) => s.readSlot(t2, key)), /authentication/);
 
   fs.rmSync(headFile);
+  await assert.rejects(tx(f, (t2) => s.readSlot(t2, key)), /ahead of the recorded head/);
+
+  fs.rmSync(path.join(authorityDir(f), "heads"), { recursive: true });
   await assert.rejects(store(f), /without a head/);
   await assert.rejects(tx(f, (t2) => s.readSlot(t2, key)), /head missing/);
 
@@ -454,7 +465,77 @@ test("a directory swapped under a write is refused before anything is renamed in
   swap = true;
   await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src)), /identity changed/);
   assert.deepEqual(slotFiles(f), [], "nothing renamed into the replacement directory");
-  assert.deepEqual(fs.readdirSync(slotsDir(f) + ".old").filter((name) => name.endsWith(".json")), [], "nor into the original");
+  assert.deepEqual(fs.readdirSync(slotsDir(f) + ".old"), [], "nor into the original, and the synced tmp file is not leaked there");
+});
+
+/** Slot paths whose keys share one head shard, found by brute force over the 256 shards. */
+async function sameShardSources(f: Fixture, s: AuthorityStore, count: number): Promise<{ src: string; key: string }[]> {
+  const byShard = new Map<string, { src: string; key: string }[]>();
+  for (let i = 0; i < 4000; i++) {
+    const src = source(f, `runner/probe-${i}`);
+    const key = await tx(f, (t2) => s.slotKey(t2, src));
+    const list = byShard.get(key.slice(0, 2)) ?? [];
+    list.push({ src, key });
+    byShard.set(key.slice(0, 2), list);
+    if (list.length === count) return list;
+  }
+  throw new Error("no shard collision found");
+}
+
+test("the per-shard head bound is checked before the slot is written, and other shards keep working", async (t) => {
+  const f = await fixture(t);
+  const probe = await store(f);
+  const [a, b] = await sameShardSources(f, probe, 2) as [{ src: string; key: string }, { src: string; key: string }];
+  await tx(f, (t2) => probe.admitSourceUse(t2, a.src));
+  const oneEntry = fs.statSync(shardFile(f, a.key)).size;
+
+  // Room for the shard with one key, not two.
+  const small = await store(f, { maxHeadBytes: oneEntry + 20 });
+  await assert.rejects(tx(f, (t2) => small.admitSourceUse(t2, b.src)), /head exceeds bound/);
+  assert.equal(fs.existsSync(path.join(slotsDir(f), `${b.key}.json`)), false, "no slot is written that its head cannot record");
+  assert.equal(await tx(f, (t2) => small.readSlot(t2, b.key)), null);
+
+  // The full-shard condition is local to that shard: a key in another shard is still admitted.
+  let other: { src: string; key: string } | undefined;
+  for (let i = 0; !other; i++) {
+    const src = source(f, `runner/other-${i}`);
+    const key = await tx(f, (t2) => small.slotKey(t2, src));
+    if (key.slice(0, 2) !== a.key.slice(0, 2)) other = { src, key };
+  }
+  await tx(f, (t2) => small.admitSourceUse(t2, other.src));
+  assert.equal((await tx(f, (t2) => small.readSlot(t2, other.key)))?.seq, 1);
+});
+
+test("head shards are bound to their name and cannot be swapped", async (t) => {
+  const f = await fixture(t);
+  const s = await store(f);
+  const [a, b] = await (async () => {
+    const found: { src: string; key: string }[] = [];
+    for (let i = 0; found.length < 2; i++) {
+      const src = source(f, `runner/swap-${i}`);
+      const key = await tx(f, (t2) => s.slotKey(t2, src));
+      if (found.every((x) => x.key.slice(0, 2) !== key.slice(0, 2))) found.push({ src, key });
+    }
+    return found as [{ src: string; key: string }, { src: string; key: string }];
+  })();
+  await tx(f, (t2) => s.admitSourceUse(t2, a.src));
+  await tx(f, (t2) => s.admitSourceUse(t2, b.src));
+  fs.copyFileSync(shardFile(f, a.key), shardFile(f, b.key));
+  await assert.rejects(tx(f, (t2) => s.readSlot(t2, b.key)), /does not match its name/);
+});
+
+test("a head shard stays far below the file bound with many retired tombstones kept", async (t) => {
+  const f = await fixture(t);
+  const s = await store(f);
+  for (let i = 0; i < 40; i++) {
+    const src = source(f, `runner/many-${i}`);
+    const lease = await tx(f, (t2) => s.admitSourceUse(t2, src));
+    await tx(f, (t2) => s.markRetiring(t2, lease, { prior: "e".repeat(64), manifest: [] }));
+    await tx(f, (t2) => s.markRetired(t2, lease));
+  }
+  const heads = fs.readdirSync(path.join(authorityDir(f), "heads"));
+  assert.ok(heads.length > 1, "writes spread over several shards");
+  for (const name of heads) assert.ok(fs.statSync(path.join(authorityDir(f), "heads", name)).size < 4096);
 });
 
 test("a stale or foreign lease passed to admit refuses instead of minting a new epoch", async (t) => {
