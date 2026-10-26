@@ -34,6 +34,7 @@ import {
   derivePlanRevision,
 } from "./RunView";
 import { useRunStream } from "../lib/useRunStream";
+import { useMaintenance } from "../lib/useMaintenance";
 import { useAuth } from "../auth/AuthContext";
 // ?raw rather than node:fs — the web tsconfig has no node types, and this repo
 // already makes the same choice for the same reason in WorkerUpgradeBadge.test.tsx
@@ -128,6 +129,11 @@ const mockApi = vi.mocked(api);
 // directly (the real hook opens a websocket). useRunStream is used ONLY by RunView, so
 // this mock does not touch the sub-component tests above.
 vi.mock("../lib/useRunStream", () => ({ useRunStream: vi.fn() }));
+// PRD #3454: the shared maintenance state, defaulting to "no provider" (status null) so every
+// existing case renders as before; the maintenance HealthFlag cases set a reason.
+vi.mock("../lib/useMaintenance", () => ({
+  useMaintenance: vi.fn(() => ({ status: null, reload: () => {} })),
+}));
 const mockUseRunStream = vi.mocked(useRunStream);
 
 // Issue #1766: the vault_locked park body reads the VIEWER's vault state off useAuth (the
@@ -1405,6 +1411,41 @@ it("HealthFlag renders manual attribution as escaped single-cell text", () => {
   expect(container.querySelector("b")).toBeNull();
   rerender(<HealthFlag run={run({ status: "queued", health: "waiting_worker", health_reason: {} as string })} />);
   expect(container.textContent).not.toContain("[object Object]");
+});
+
+describe("HealthFlag — maintenance queue reason (PRD #3454)", () => {
+  const held = { status: "queued" as const, queue_reason: "maintenance" as const, health: "waiting_worker" as const,
+    health_since: "2026-10-25T12:00:00Z", health_reason: "waiting for a worker to pick up this run" };
+
+  it("replaces the waiting-for-worker flag with the maintenance line", () => {
+    const { container } = render(<HealthFlag run={run(held)} />);
+    const pill = container.querySelector('[data-queue-reason="maintenance"]')!;
+    expect(pill.textContent).toBe("waiting: uzi is in maintenance mode");
+    expect(container.textContent).not.toContain("waiting for worker");
+    expect(container.textContent).not.toContain("stuck for");
+    expect(container.querySelector('[role="status"]')!.textContent).toBe("waiting: uzi is in maintenance mode");
+  });
+
+  it("appends the maintenance reason from the shared state", () => {
+    vi.mocked(useMaintenance).mockReturnValue({
+      status: { active: true, since: null, reason: "Node pool upgrade\u202e" },
+      reload: () => {},
+    });
+    try {
+      const { container } = render(<HealthFlag run={run(held)} />);
+      expect(container.querySelector('[data-queue-reason="maintenance"]')!.textContent).toBe(
+        "waiting: uzi is in maintenance mode (Node pool upgrade)",
+      );
+    } finally {
+      vi.mocked(useMaintenance).mockReturnValue({ status: null, reload: () => {} });
+    }
+  });
+
+  it("leaves a plain queued run's waiting-for-worker flag alone", () => {
+    const { container } = render(<HealthFlag run={run({ ...held, queue_reason: null })} />);
+    expect(container.querySelector('[data-queue-reason="maintenance"]')).toBeNull();
+    expect(container.textContent).toContain("waiting for worker");
+  });
 });
 
 describe("HealthFlag — the health reason (#124, text channel)", () => {

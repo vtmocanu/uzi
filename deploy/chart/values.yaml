@@ -936,6 +936,11 @@ workers:
   # sysbox (runtimeClassName: sysbox-runc) remains the documented path to a
   # non-privileged tier once a cluster can run it; it is NOT installed and NOT required.
   docker:
+    podEpochReclaim:
+      # Shadow reporting only; unset still participates in lifetime epoch locking.
+      # Set containerd-runc or crio-crun only after operator attestation of the
+      # audited runtime/storage prerequisites; see deploy/README.md, Pod-epoch shadow reclaim.
+      runtime: ""
     # Turning this on creates the privileged namespace, its quota/limits, the worker
     # SA + pull secret in it, and the controller's Role there. It also makes the
     # controller render docker workers (UZI_WORKER_DOCKER_NAMESPACE + the sidecar

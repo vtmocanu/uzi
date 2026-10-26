@@ -21,8 +21,9 @@
 # version of this script: it passed the case it was written for and failed #149,
 # whose entry existed and was simply written elsewhere. Ordinary PRs now add UUID
 # fragments under changelog.d/; legacy `[Unreleased]` additions remain accepted.
-# scripts/check-changelog-entry.sh (gate:repo) checks PR entries with the same
-# exemptions plus a dependency-manifest one.
+# scripts/check-changelog-entry.sh (gate:repo) checks PR entries with an explicit
+# `Changelog: none` or dependency-manifest exemption. Docs-typed branch subjects
+# alone do not exempt a PR; this oracle still honors docs-typed final subjects.
 # This oracle stays the final check: it also accepts citations written at cut time
 # and covers merges that reached main without a PR.
 #

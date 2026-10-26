@@ -608,4 +608,7 @@ type RunNowResponse struct {
 	IneligibleMatched *int64            `json:"ineligible_matched,omitempty"`
 	Started           []LastFireStarted `json:"started"`
 	Skips             []LastFireSkip    `json:"skips"`
+	// Notice is present only while instance maintenance mode is active and the fire started at
+	// least one run: those runs are queued and start when maintenance ends (PRD #3454).
+	Notice *string `json:"notice,omitempty"`
 }

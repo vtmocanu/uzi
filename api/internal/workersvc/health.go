@@ -126,6 +126,11 @@ const (
 	// runs.health_reason is free text). The sweeper (SweepTaskNeverDispatched) expires
 	// the run to 'failed' with a terminal failure_reason after DispatchGrace.
 	reasonHandoffSetup = "handoff setup has not finished"
+	// reasonMaintenance (PRD #3454) is the honest queued reason for a run the instance intake pause
+	// holds (fn_instance_intake_paused() and the run not admitted by
+	// fn_run_admitted_during_intake_pause): ClaimRun matches no row for it, so no worker gap is the
+	// cause. Same fixed-string contract and healthWaitingWorker enum as its siblings.
+	reasonMaintenance = "waiting: uzi is in maintenance mode"
 	// reasonStaleRequeuePinPrefix opens both expected owner-hold reasons: stale requeue
 	// (#2705) and draining or maintenance (#3000). Unlike its fixed
 	// siblings they embed values (the deadline and the worker name). isStaleRequeuePinReason
@@ -455,6 +460,13 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		// nudge (its flag was already waiting_worker) and would carry the hold in its "stuck for".
 		leftPin := target != healthOK && r.Health == healthWaitingWorker && r.HealthReason.Valid &&
 			isStaleRequeuePinReason(r.HealthReason.String) && !isStaleRequeuePinReason(reason)
+		// PRD #3454: a run leaving the maintenance hold has health_since restamped so its "stuck for"
+		// excludes the pause, but it is NOT nudge-eligible on that tick: the whole backlog leaves the
+		// hold at once, and nudging here would burst a Slack DM per run right after the lift. Accepted
+		// trade-off (PRD #3454 D12): a run still stuck after the lift is not nudged until it
+		// clears to ok and flags again; only that later ok->flagged episode nudges.
+		leftMaintenance := target != healthOK && r.Health == healthWaitingWorker && r.HealthReason.Valid &&
+			r.HealthReason.String == reasonMaintenance && reason != reasonMaintenance
 		nudge := target != healthOK && (r.Health == healthOK || leftPin) &&
 			(cooldown == 0 || !r.HealthNotifiedAt.Valid || now.Sub(r.HealthNotifiedAt.Time) >= cooldown)
 		// PRD #1349 M6 (D10): SUPPRESS the per-run Slack nudge for the custody-limit reason. The
@@ -489,6 +501,10 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		if reason == reasonHandoffSetup {
 			nudge = false
 		}
+		// PRD #3454: maintenance is an expected, operator-announced wait; a worker-pickup nudge is noise.
+		if reason == reasonMaintenance {
+			nudge = false
+		}
 		// Issues #2705/#3000: both owner-hold reasons are expected waiting; a worker-pickup
 		// nudge would be noise. Match the prefix shared by their deadline and worker name.
 		if isStaleRequeuePinReason(reason) {
@@ -502,7 +518,7 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 			nudge = false
 		}
 		since := healthSince(now, target, r)
-		if leftPin {
+		if leftPin || leftMaintenance {
 			since = pgconv.Time(now)
 		}
 		notifiedAt := pgtype.Timestamptz{}
@@ -1148,6 +1164,11 @@ type healthEligibilityResult struct {
 }
 
 func (s *Service) queuedReasonWithEligibility(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds, early bool, projection *healthEligibilityResult) string {
+	// PRD #3454: the instance intake pause outranks every rung, the handoff one included, since the
+	// pause is the reason ClaimRun matches nothing.
+	if r.IntakePauseHeld {
+		return reasonMaintenance
+	}
 	// PRD #400 Decision 6 / issue #1367: an undispatched task run (its uzi/task/<id> branch
 	// push or dispatch never landed) is NOT waiting for a worker — ClaimRun never offers it
 	// (kind<>'task' OR dispatched_at IS NOT NULL), so none of the fleet reasons below is the

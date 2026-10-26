@@ -114,8 +114,8 @@ rules:
     # decision rather than a field.
     #
     # Unlike the Secrets rule, this one HAS a mechanical gate on both sides:
-    # controller/internal/kube asserts over the whole fake-client action log that pod
-    # actions are `list` only (negative) AND that pods are actually listed (positive).
+    # controller/internal/kube asserts that Observe issues only pod lists and
+    # actually lists pods. Docker watch/patch is tested separately at the HTTP seam.
     # The negative alone would pass on a build that never calls pods at all.
     verbs: ["list"]
 ---
@@ -211,8 +211,8 @@ rules:
     verbs: ["create", "list", "patch", "delete"]
   - apiGroups: [""]
     resources: ["pods"]
-    # Same grant, same reasons as the restricted Role above (PRD #113 M3): `list` only,
-    # no `get`/`watch`, and `pods/log` refused. Both namespaces need it because roll
+    # Docker adds watch for pod-epoch ordering and patch for successor evidence.
+    # No get or pods/log. Both namespaces need list because roll
     # health is per-worker and the docker tier's workers live only here — a scan of one
     # namespace can never see the other's.
     #
@@ -221,7 +221,7 @@ rules:
     # `enforce: restricted`, so the namespace with the WEAKEST admission is the one
     # where a parked non-worker pod matters most. That is an argument for the unmanaged
     # pod warning M3 adds, not against this grant — pod metadata is what detects it.
-    verbs: ["list"]
+    verbs: ["list", "watch", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -280,7 +280,8 @@ rules:
     verbs: ["create", "list", "patch", "delete"]
   - apiGroups: [""]
     resources: ["pods"]
-    # `list` only, no `get`/`watch`, and `pods/log` refused, as in the other two Roles.
+    # Isolated stays list only, with no get/watch/patch or pods/log.
+    # Docker alone grants watch and patch for pod-epoch evidence.
     verbs: ["list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

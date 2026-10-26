@@ -97,6 +97,13 @@ func (f *FakeClient) AdminBlockedRepos(context.Context) (apitypes.AdminBlockedRe
 	return f.BlockedReposV, nil
 }
 
+func (f *FakeClient) AdminMaintenance(context.Context) (apitypes.MaintenanceAdminDTO, error) {
+	if f.Err != nil {
+		return apitypes.MaintenanceAdminDTO{}, f.Err
+	}
+	return f.MaintenanceV, nil
+}
+
 func (f *FakeClient) AdminSettings(context.Context) (AdminSettingsView, error) {
 	if f.Err != nil {
 		return AdminSettingsView{}, f.Err

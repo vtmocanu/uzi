@@ -258,15 +258,16 @@ func (c *HTTPClient) GetCIRun(ctx context.Context, repoID string, runID int64) (
 	return out, nil
 }
 
-func (c *HTTPClient) CreateCIFixRun(ctx context.Context, repoID, ref string) (apitypes.RunDTO, error) {
+func (c *HTTPClient) CreateCIFixRun(ctx context.Context, repoID, ref string) (CreatedRunResult, error) {
 	body := struct {
 		Ref string `json:"ref"`
 	}{Ref: ref}
 	var env struct {
-		Run apitypes.RunDTO `json:"run"`
+		Run    apitypes.RunDTO `json:"run"`
+		Notice string          `json:"notice"`
 	}
 	if err := c.postJSON(ctx, "/api/repos/"+url.PathEscape(repoID)+"/ci-fix-runs", body, &env); err != nil {
-		return apitypes.RunDTO{}, err
+		return CreatedRunResult{}, err
 	}
-	return env.Run, nil
+	return CreatedRunResult{RunDTO: env.Run, Notice: env.Notice}, nil
 }

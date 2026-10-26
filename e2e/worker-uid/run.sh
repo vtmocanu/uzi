@@ -185,10 +185,13 @@ phase shared-proof capture "$REPORT_DIR/shared-results.xml" 420 \
   --mount "type=bind,src=$REPO/agent/test,dst=/app/uzi-worker-uid-proof/agent/test,readonly" \
   --mount "type=bind,src=$REPO/agent/templates,dst=/app/uzi-worker-uid-proof/agent/templates,readonly" \
   --mount "type=bind,src=$REPO/controller/internal/kube/testdata/runner-shared-init.sh,dst=/app/uzi-worker-uid-proof/controller/internal/kube/testdata/runner-shared-init.sh,readonly" \
+  --mount "type=bind,src=$REPO/controller/internal/kube/testdata/pod-epoch-seed.golden,dst=/app/uzi-worker-uid-proof/controller/internal/kube/testdata/pod-epoch-seed.golden,readonly" \
   --entrypoint /usr/local/bin/node "$IMAGE" \
   --import /app/node_modules/tsx/dist/loader.mjs --import /app/uzi-worker-uid-proof/e2e/worker-uid/image-layout.mjs \
   --test --test-concurrency=1 --test-timeout=120000 --test-reporter=junit \
-  --test-name-pattern "$SHARED_PATTERN" /app/uzi-worker-uid-proof/e2e/worker-uid/runner-shared-real.test.mts || shared_rc=$?
+  --test-name-pattern "$SHARED_PATTERN" \
+  /app/uzi-worker-uid-proof/e2e/worker-uid/runner-shared-real.test.mts \
+  /app/uzi-worker-uid-proof/e2e/worker-uid/pod-epoch-real.test.mts || shared_rc=$?
 python3 e2e/worker-uid/check.py "$REPORT_DIR/shared-expected.json" "$REPORT_DIR/shared-results.xml" || shared_checker_rc=$?
 if [ "$shared_rc" -ne 0 ]; then
   printf 'worker UID shared node/container exit: %s\n' "$shared_rc" >&2

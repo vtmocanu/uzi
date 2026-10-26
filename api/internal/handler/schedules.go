@@ -476,7 +476,13 @@ func (h *Handler) RunScheduleNow(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	httpx.JSON(w, http.StatusAccepted, runNowResponse(out))
+	resp := runNowResponse(out)
+	if len(out.Started) > 0 {
+		if n := h.maintenanceNotice(r.Context()); n != "" {
+			resp.Notice = &n
+		}
+	}
+	httpx.JSON(w, http.StatusAccepted, resp)
 }
 
 // runNowResponse maps a FireOutcome onto the run-now wire shape (PRD #308 M3). It is pure

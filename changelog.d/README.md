@@ -25,7 +25,11 @@ Changed, Deprecated, Removed, Fixed and Security. For example:
 ```
 
 Initially cite the relevant issue; a PR number need not exist yet. The parser
-checks structure, not citation identity. The release oracle still requires the
+checks structure, not citation identity. At release cut, a shipping mainline commit
+that introduced exactly one pending fragment contributes its trailing PR identity
+to that fragment's rendered headline, or its short SHA when no PR suffix exists.
+Existing citations and tracked fragment bytes are preserved. Zero or multiple
+pending introductions receive no automatic repair. The release oracle still requires the
 shipping commit's identity in the assembled release section (subject issue/PR,
 same-repo closing reference, or short SHA; forge lookup can resolve closed
 issues). A fragment touch is not an oracle exemption.
@@ -68,10 +72,18 @@ at the merge base supplies a new entry. Editing or deleting inherited fragments
 alone does not satisfy coverage. Existing legacy `[Unreleased]` bullets stay
 until the next release; direct additions remain supported during migration.
 
-The existing exemptions remain: `Changelog: none` in a branch commit with a
-reason; docs-typed shipping commits (with a docs-typed squash subject for the
-oracle); and dependency-manifest-only changes under dependency-typed commits,
-which the cutter cites in bulk. See
+### Exemptions
+
+The PR check accepts `Changelog: none` with a reason in a non-merge branch commit,
+or dependency-manifest-only changes under dependency-typed commits, which the
+cutter cites in bulk. Docs-typed subjects alone do not exempt a shipping PR:
+add a new fragment, or add a `Changelog: none` line with a reason to a non-merge
+branch commit when there is nothing to announce. This also applies to automated
+documentation PRs. Keep the declaration in the squash commit body; the repository's
+squash-with-commit-messages convention preserves it for the release oracle.
+
+The release oracle still exempts docs-typed final subjects, including direct
+docs commits. That does not replace the explicit PR-time contract. See
 [the PR check](../scripts/check-changelog-entry.sh) for the predicates and
 [the release oracle](../scripts/assert-changelog-covers-release.sh) for final
 shipping identity coverage. A malformed changed fragment still fails on an

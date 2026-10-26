@@ -725,6 +725,52 @@ func (h *Handler) overlayCodexAccountActions(ctx context.Context, dtos ...*apity
 	}
 }
 
+// queueReasonPtr maps a SQL-derived queue_reason column (” = none) to the wire pointer.
+func queueReasonPtr(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+// overlayQueueReasons sets queue_reason (PRD #3454) on the queued runs among dtos: "maintenance"
+// while intake is paused and the run is not admitted. runToDTO stays pure; the reason is derived
+// in SQL at read time (ListRunQueueReasons) so it never lags the pause. Only queued runs are
+// looked up, in one batched read per call. Best-effort: an error is logged and leaves it absent.
+func (h *Handler) overlayQueueReasons(ctx context.Context, dtos ...*apitypes.RunDTO) {
+	if h.q == nil {
+		return
+	}
+	var ids []uuid.UUID
+	byID := make(map[uuid.UUID][]*apitypes.RunDTO)
+	for _, d := range dtos {
+		if d == nil || d.Status != "queued" {
+			continue
+		}
+		id, err := uuid.Parse(d.ID)
+		if err != nil {
+			continue
+		}
+		if _, seen := byID[id]; !seen {
+			ids = append(ids, id)
+		}
+		byID[id] = append(byID[id], d)
+	}
+	if len(ids) == 0 {
+		return
+	}
+	rows, err := h.q.ListRunQueueReasons(ctx, ids)
+	if err != nil {
+		slog.Error("run queue reasons", "runs", len(ids), "error", err)
+		return
+	}
+	for _, row := range rows {
+		for _, d := range byID[row.RunID] {
+			d.QueueReason = queueReasonPtr(row.QueueReason)
+		}
+	}
+}
+
 // runJobDTO maps the service's job block to the wire shape; nil in, nil out (a non-job run).
 // Slices are never nil on the wire.
 func runJobDTO(d *workersvc.JobRunDetail) *apitypes.RunJobDTO {

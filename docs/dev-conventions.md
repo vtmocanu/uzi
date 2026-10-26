@@ -689,6 +689,16 @@ scenarios are mutually exclusive by construction. Known values:
   tag pin clears the warning without an apply; with a branch ref, applying a
   snapshot matching the recorded tip clears it. Requires a signed-in admin.
   (#2902.)
+- `maintenance` — instance maintenance mode is on with a reason, so every
+  page shows the maintenance banner. `/admin/settings?mock=maintenance#maintenance`
+  shows the admin card with a not-yet-clear readout: running, held
+  (`needs owner` and `progressing` tags), one custody hold, queued runs and an
+  idle bound worker. The queued fixtures carry `queue_reason: "maintenance"`,
+  so `/runs/run-queued?mock=maintenance` and the board show the maintenance
+  queue label, and `/admin/health?mock=maintenance` warns on
+  `maintenance.active`. The switch and reason stay live for the session; the
+  readout does not model the drain. Without the scenario, maintenance is off
+  and the readout is clear. (PRD #3454.)
 
 ### What keeps the mock build current
 

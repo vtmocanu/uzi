@@ -96,6 +96,7 @@ type FakeClient struct {
 	CodexRateLimits []apitypes.CodexAdminRateLimitRowDTO
 	GuardrailV      apitypes.GuardrailImpactDTO
 	BlockedReposV   apitypes.AdminBlockedReposDTO
+	MaintenanceV    apitypes.MaintenanceAdminDTO
 	AdminSettingsV  AdminSettingsView
 	AgentSourceV    apitypes.AgentSourceDTO
 	// EgressProfiles drives AdminListEgressProfiles and AdminGetEgressProfile (PRD #1906
@@ -145,7 +146,10 @@ type FakeClient struct {
 	// Write-verb capture + canned replies. CreateRun returns CreatedRun and records
 	// its args; SubmitRunInput returns InputResp and records kind/body/selection, so
 	// a test can assert the exact wire mapping of each write verb.
-	CreatedRun         apitypes.RunDTO
+	CreatedRun apitypes.RunDTO
+	// CreatedNotice is the canned maintenance notice (PRD #3454) CreateRun and CreateTaskRun
+	// return beside the run; empty = maintenance off.
+	CreatedNotice      string
 	LastCreateRepoID   string
 	LastCreateIssueIID int64
 	// LastCreateWaitOnLimit keeps the POINTER rather than a bool, so a test can tell

@@ -294,6 +294,7 @@ export interface RecoveryArchiveClient {
 
 /** The bundle-producer subset {@link RecoveryCoordinator} needs — GitCache satisfies it. */
 export interface RecoveryBundleProducer {
+  importMaintenanceTip?: GitCache["importMaintenanceTip"];
   matchMaintenanceSourceFamily?: GitCache["matchMaintenanceSourceFamily"];
   maintenanceOriginDigest?: GitCache["maintenanceOriginDigest"];
   worktreeHead?: GitCache["worktreeHead"];
@@ -3424,21 +3425,25 @@ export class RecoveryCoordinator {
     return TERMINAL_ORIGIN_ADMISSION_ENABLED;
   }
 
-  /** Charged local WIP capture after durable origin publication; no bare transfer,
-   * tracking/owed publication, bundle production or remote preservation permit. */
+  /** Charged WIP capture and verified objects-only tip transfer/no-op after durable
+   * origin publication; no tracking/owed publication, bundle production or remote
+   * preservation permit. An imported tip can remain unindexed after a crash. */
   private async admitTerminalOrigin(observation: ClosedSourceObservation, signal: AbortSignal): Promise<void> {
     const original = observation.originalContext, family = observation.family;
     const ledger = this.maintenance, boundary = this.withTerminalSourceBoundary, exclusion = this.writerExclusion,
       settledBoundary = this.terminalSettlementConfirmed;
     const observe = this.client.observeTerminalMaintenanceHold?.bind(this.client);
     const current = this.client.isCurrentTerminalMaintenanceHold?.bind(this.client);
+    const transfer = this.git.importMaintenanceTip?.bind(this.git);
     const scan = this.git.matchMaintenanceSourceFamily?.bind(this.git);
     const originDigest = this.git.maintenanceOriginDigest?.bind(this.git);
     const head = this.git.worktreeHead?.bind(this.git);
     const genesis = observation.genesis;
     type Reason = "invalid_context" | "source_protected_or_ambiguous" | "origin_mismatch" |
       "local_binding_mismatch" | "exact_hold_refused" | "boundary_closed" | "metadata_incomplete" |
-      "source_unverified" | "history_refused" | "publication_unverified" | ExclusionRefusal;
+      "source_unverified" | "history_refused" | "publication_unverified" | ExclusionRefusal |
+      "maintenance_source_layout_unsupported" | "maintenance_source_alias_refused" |
+      "maintenance_transfer_boundary_missing";
     let stage: Reason = "invalid_context", reported = false;
     let knownHold: string | undefined;
     let chargedSignal: AbortSignal | undefined;
@@ -3459,7 +3464,7 @@ export class RecoveryCoordinator {
       report(reason);
       throw new Error("terminal origin refused");
     };
-    if (!original || !family || !ledger || !boundary || !exclusion || !settledBoundary || !observe || !current || !scan || !originDigest || !head ||
+    if (!original || !family || !ledger || !boundary || !exclusion || !settledBoundary || !observe || !current || !transfer || !scan || !originDigest || !head ||
         !validInventoryContext(original.context, genesis.runId, original.barePath) ||
         "legacy" in original.context || "origin" in original.context ||
         original.context.generation !== genesis.generation || original.context.branch !== original.branch ||
@@ -3666,10 +3671,53 @@ export class RecoveryCoordinator {
               // captureWip has joined and disposed its owner. Continue only under a fresh
               // child owner of this same reservation; a WIP result alone is not settlement.
               await withMaintenanceTransfer(async transferCheck => {
-                transferCheck();
-                await fresh(result.head);
-                await revalidate();
-                transferCheck();
+                // Preparation is deny-only: no metadata Git, RPC or ledger work.
+                const prepare = async () => { transferCheck(); check(); };
+                const beforeSemantic = async () => {
+                  await prepare();
+                  const exact = await observe(genesis.runId, genesis.generation, binding, signal);
+                  await prepare();
+                  if (!exact.ok || !["failed", "cancelled", "completed"].includes(exact.hold.run_status ?? "") ||
+                      !current(exact.token) || exact.hold.original_worker_id !== admission.identity.custodian)
+                    refused("exact_hold_refused");
+                };
+                try {
+                  const member = family.originals.find(s => s.clonePath === genesis.clonePath &&
+                    s.runId === genesis.runId && s.attemptId === genesis.attemptId);
+                  if (!member) return refused("source_unverified");
+                  const transferred = await transfer({
+                    source: { clonePath: genesis.clonePath, identity: member.identity,
+                      runId: genesis.runId, attemptId: genesis.attemptId },
+                    original, record: { bareDir: path.basename(original.barePath), sourceSha },
+                    tip: result.head, defaultBranch: original.defaultBranch, branch: original.branch,
+                    key: original.key, family: family.originals,
+                    outDir: path.join(this.recoveryRoot, genesis.runId, ".maintenance-transfer-" + randomUUID()),
+                    prepare, beforeSemantic,
+                    validateFamily: async snapshot => {
+                      await prepare();
+                      if (snapshot.metadata !== family.metadata || snapshot.origin !== origin)
+                        refused("source_unverified");
+                      await revalidate();
+                      await prepare();
+                    },
+                  });
+                  if (transferred.sourceSha !== result.head ||
+                      (transferred.kind !== "imported" && transferred.kind !== "already_present"))
+                    refused("source_unverified");
+                  await prepare();
+                } catch (error) {
+                  // Project only producer-owned fixed diagnostics before the runner's
+                  // generic error collapse. Source prose and stderr grant no reason.
+                  if (error instanceof Error) {
+                    switch (error.message) {
+                      case "maintenance_source_layout_unsupported":
+                      case "maintenance_source_alias_refused":
+                      case "maintenance_transfer_boundary_missing":
+                        report(error.message);
+                    }
+                  }
+                  throw error;
+                }
               });
               // The transfer callback's return precedes its child join and final family proof.
               // Accept lineage only after the owner returns, with a fresh semantic observation.

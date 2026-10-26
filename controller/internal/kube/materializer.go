@@ -101,6 +101,8 @@ type RecyclePolicy struct {
 const pvcBindTimeout = 10 * time.Minute
 
 type Materializer struct {
+	epoch        *PodEpochSession
+	epochDeletes map[string]podEpochMaintenanceDelete
 	// Unconfirmed migration cordons remain unavailable until a fresh poll
 	// resolves their state. This process-local record is not a write fence.
 	migrationPending map[string]rollCoverage
@@ -389,9 +391,9 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		}
 	}
 
-	// Pods (PRD #113 M3): roll health, and the only place it is readable. LIST only —
-	// the grant is `list` and nothing here may become a get-by-name, which is
-	// impossible anyway (pod names are Deployment-generated).
+	// This observation uses pod LIST only for roll health. Docker additionally
+	// grants watch/patch to the independent pod-epoch subscription. No tier grants
+	// get-by-name (pod names are Deployment-generated).
 	//
 	// Unselected, for the same reason as the two lists above: a label selector would
 	// make the unmanaged-pod check below structurally blind to exactly what it looks
@@ -997,9 +999,12 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 				continue
 			}
 		}
-		_, err := m.client.CoreV1().PersistentVolumeClaims(ns).Create(ctx, pvc, metav1.CreateOptions{})
+		created, err := m.client.CoreV1().PersistentVolumeClaims(ns).Create(ctx, pvc, metav1.CreateOptions{})
 		if err != nil && !apierrors.IsAlreadyExists(err) {
 			return fmt.Errorf("create pvc %s: %w", pvc.Name, err)
+		}
+		if err == nil && pvc.Name == dindDataPVCName(w.ID) {
+			m.recordEpochMint(ctx, w.ID, created)
 		}
 	}
 

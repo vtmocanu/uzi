@@ -156,6 +156,9 @@ type JobView struct {
 	StartedAt         *time.Time
 	FinishedAt        *time.Time
 	UpdatedAt         time.Time
+	// QueueReason is "maintenance" while instance maintenance mode holds this queued job back
+	// (PRD #3454); nil otherwise.
+	QueueReason *string
 }
 
 // JobFindingView is one structured finding of a job result.
@@ -520,6 +523,16 @@ func (s *Service) CreateJobRun(ctx context.Context, p CreateJobParams) (JobView,
 	if view.CreatedAt.IsZero() {
 		view.CreatedAt = originCreatedAt.Time
 	}
+	// PRD #3454: a job created during the intake pause is queued and not admitted. Best-effort
+	// decoration read after the create commits; a store without the query leaves it absent.
+	if qr, ok := s.q.(queueReasonStore); ok {
+		if rows, qerr := qr.ListRunQueueReasons(ctx, []uuid.UUID{run.ID}); qerr != nil {
+			slog.Error("job queue reason", "run_id", run.ID, "error", qerr)
+		} else if len(rows) == 1 && rows[0].QueueReason != "" {
+			r := rows[0].QueueReason
+			view.QueueReason = &r
+		}
+	}
 	return view, nil
 }
 
@@ -555,12 +568,21 @@ func jobViewFromRow(f store.ListJobsForCallerRow) JobView {
 		FinishedAt:        timePtrTz(f.FinishedAt),
 		UpdatedAt:         f.UpdatedAt.Time,
 	}
+	if f.QueueReason != "" {
+		r := f.QueueReason
+		v.QueueReason = &r
+	}
 	if f.FailureReason.Valid {
 		// failure_reason is server-authored but can quote worker text: scrub, then bound.
 		r := scrubThenBound(f.FailureReason.String, maxJobFailureReasonBytes)
 		v.FailureReason = &r
 	}
 	return v
+}
+
+// queueReasonStore is the PRD #3454 queue_reason read. *store.Queries satisfies it.
+type queueReasonStore interface {
+	ListRunQueueReasons(ctx context.Context, runIds []uuid.UUID) ([]store.ListRunQueueReasonsRow, error)
 }
 
 // jobStore is the caller-scoped read surface; *store.Queries satisfies it.

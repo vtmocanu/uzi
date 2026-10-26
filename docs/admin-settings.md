@@ -268,6 +268,16 @@ is editable) on every instance, including compose ones — it's simply inert
 there, since hosting itself is off unless an admin turns it on for the
 deployment (see [Configuration](./configuration.md#hosted-k8s-workers-prd-58)).
 
+## Maintenance mode
+
+An admin can switch on **Maintenance mode** from the **Maintenance mode** card
+on **Admin → Instance**, with an optional reason, before infrastructure work
+such as draining nodes. While it is on, every user sees a banner. New runs are
+still created but wait in the queue ("waiting: uzi is in maintenance mode"),
+and nothing starts them until an admin turns it off. Work that had already
+started keeps running and finishes. Only an admin can change it, and only from
+the web. Admins: see [Instance maintenance mode](./instance-maintenance.md).
+
 ## Custody hold limit
 
 The recovery custody admission limit, how many [admission-counted

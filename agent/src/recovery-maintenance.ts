@@ -757,12 +757,13 @@ export class MaintenanceResources {
     scope.used[resource] = used + amount;
   }
   /** Count raw nonempty rows before callers allocate arrays or interpret metadata. */
-  static consumeMetadataEntriesIfActive(value: string, separator: "\0" | "\n"): void {
+  static consumeMetadataEntriesIfActive(value: string, separator: "\0" | "\n",
+    category: "adminEntries" | "sourceEntries" = "adminEntries"): void {
     if (!this.active()) return;
     this.checkIfActive();
     for (let start = 0; start < value.length;) {
       const end = value.indexOf(separator, start);
-      if (end !== start) this.consumeIfActive("adminEntries", 1);
+      if (end !== start) this.consumeIfActive(category, 1);
       if (end < 0) break;
       start = end + 1;
     }

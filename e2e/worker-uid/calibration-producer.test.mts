@@ -382,8 +382,11 @@ test("real supervisor proof refuses absent, skipped or incomplete Go subtests", 
 
 
 test("parallel proof children accept only the exact existing scratch symlink", async () => {
-  const script = (await readFile(new URL("./image-layout.mjs", import.meta.url), "utf8"))
-    .replace(/^import .* from "node:fs";$/m, "");
+  const source = await readFile(new URL("./image-layout.mjs", import.meta.url), "utf8");
+  // This VM test owns the scratch-link branch; baked imports are image-only.
+  const marker = 'const link = "/app/uzi-worker-uid-proof/.uzi";';
+  assert.equal(source.split(marker).length, 2, "scratch-link branch appears once");
+  const script = marker + source.split(marker)[1]!;
   let existing: string | undefined;
   const context = {
     symlinkSync: (target: string, _link: string) => {

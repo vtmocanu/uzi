@@ -302,17 +302,18 @@ func (c *HTTPClient) SetRunMrRework(ctx context.Context, id string, enabled *boo
 // always sent); the server unwraps to the created `mr_rework` run. The exit-code mapping
 // (404→ExitNotFound, 409→ExitConflict, 400→ExitUsage) comes for free through
 // statusError/postJSON, so it is not hand-rolled here.
-func (c *HTTPClient) RunRework(ctx context.Context, runID, guidance string) (apitypes.RunDTO, error) {
+func (c *HTTPClient) RunRework(ctx context.Context, runID, guidance string) (CreatedRunResult, error) {
 	body := struct {
 		Guidance string `json:"guidance"`
 	}{Guidance: guidance}
 	var env struct {
-		Run apitypes.RunDTO `json:"run"`
+		Run    apitypes.RunDTO `json:"run"`
+		Notice string          `json:"notice"`
 	}
 	if err := c.postJSON(ctx, "/api/runs/"+url.PathEscape(runID)+"/rework", body, &env); err != nil {
-		return apitypes.RunDTO{}, err
+		return CreatedRunResult{}, err
 	}
-	return env.Run, nil
+	return CreatedRunResult{RunDTO: env.Run, Notice: env.Notice}, nil
 }
 
 // completionDecisionRequest is the POST /api/runs/{id}/completion/decision body (PRD #1226 M5, D7 +
@@ -434,9 +435,18 @@ type CreateRunCredentialOverride struct {
 	SecretID string
 }
 
-func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, credOverride *CreateRunCredentialOverride, harness string) (apitypes.RunDTO, error) {
+// CreatedRunResult is a run-create reply: the run plus the server's optional notice (PRD
+// #3454), set while instance maintenance mode holds the new run in the queue. Notice is
+// server-authored text and must be sanitized before it reaches a terminal.
+type CreatedRunResult struct {
+	apitypes.RunDTO
+	Notice string
+}
+
+func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, credOverride *CreateRunCredentialOverride, harness string) (CreatedRunResult, error) {
 	var env struct {
-		Run apitypes.RunDTO `json:"run"`
+		Run    apitypes.RunDTO `json:"run"`
+		Notice string          `json:"notice"`
 	}
 	// A struct rather than the map this used to build, because the map could not
 	// express the tri-state: `omitempty` on a POINTER omits only nil, so a non-nil
@@ -504,14 +514,15 @@ func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int6
 		reqBody.CredentialOverride = ov
 	}
 	if err := c.postJSON(ctx, "/api/repos/"+url.PathEscape(repoID)+"/runs", reqBody, &env); err != nil {
-		return apitypes.RunDTO{}, err
+		return CreatedRunResult{}, err
 	}
-	return env.Run, nil
+	return CreatedRunResult{RunDTO: env.Run, Notice: env.Notice}, nil
 }
 
-func (c *HTTPClient) CreateTaskRun(ctx context.Context, repoID, taskContext, baseBranch string, openMR, reviewRequested, thenFixRequested, interactive bool, continuedIssueIID *int64) (apitypes.RunDTO, error) {
+func (c *HTTPClient) CreateTaskRun(ctx context.Context, repoID, taskContext, baseBranch string, openMR, reviewRequested, thenFixRequested, interactive bool, continuedIssueIID *int64) (CreatedRunResult, error) {
 	var env struct {
-		Run apitypes.RunDTO `json:"run"`
+		Run    apitypes.RunDTO `json:"run"`
+		Notice string          `json:"notice"`
 	}
 	// base_branch is `omitempty` so an unset --base sends no key and the worker
 	// branches from the caller's seeded HEAD — the CreateRun tri-state convention: an
@@ -528,9 +539,9 @@ func (c *HTTPClient) CreateTaskRun(ctx context.Context, repoID, taskContext, bas
 		ThenFixRequested  bool   `json:"then_fix_requested"`
 	}{ContinuedIssueIID: continuedIssueIID, Context: taskContext, BaseBranch: baseBranch, OpenMr: openMR, Interactive: interactive, ReviewRequested: reviewRequested, ThenFixRequested: thenFixRequested}
 	if err := c.postJSON(ctx, "/api/repos/"+url.PathEscape(repoID)+"/task-runs", reqBody, &env); err != nil {
-		return apitypes.RunDTO{}, err
+		return CreatedRunResult{}, err
 	}
-	return env.Run, nil
+	return CreatedRunResult{RunDTO: env.Run, Notice: env.Notice}, nil
 }
 
 func (c *HTTPClient) GetTaskReview(ctx context.Context, id string) (*apitypes.TaskReviewDTO, error) {

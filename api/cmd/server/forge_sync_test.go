@@ -95,6 +95,9 @@ func (s *wiringStore) OldestUndispatchedTaskRun(context.Context) (pgtype.Timesta
 func (s *wiringStore) CountUsersPausedWithEnabledSchedules(context.Context, pgtype.Timestamptz) (int64, error) {
 	return 0, nil
 }
+func (s *wiringStore) GetInstanceIntakePause(context.Context) (store.InstanceIntakePause, error) {
+	return store.InstanceIntakePause{ID: true}, nil
+}
 func (s *wiringStore) ListGaveUpColumnMoves(context.Context, store.ListGaveUpColumnMovesParams) ([]store.ListGaveUpColumnMovesRow, error) {
 	return nil, nil
 }

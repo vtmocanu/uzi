@@ -7,6 +7,7 @@
 import type { Board, BoardPrefs, IssueProposal, LatestRun, Run, RunMessage, RunStatus, User, WsEvent } from "../lib/api";
 import { seedUnifiedProgress } from "./data/unifiedProgress";
 import { deriveMockProgress } from "./runProgress";
+import { mockScenario } from "./mockScenario";
 import {
   mockAdmin,
   mockAwaitingMessages,
@@ -161,6 +162,12 @@ function seed(): MockState {
   for (const r of mockJobRuns) messages.set(r.id, []);
   for (const [id, log] of Object.entries(mockChatMessages)) messages.set(id, log.map((m) => ({ ...m })));
   seedUnifiedProgress(runs, messages);
+  // ?mock=maintenance (PRD #3454): every queued fixture is held back by maintenance mode, as
+  // the server derives queue_reason for a queued, never-claimed run while the pause is on.
+  const maintenance = mockScenario() === "maintenance";
+  if (maintenance) {
+    for (const r of runs.values()) if (r.status === "queued") r.queue_reason = "maintenance";
+  }
   const proposals = new Map<string, IssueProposal>();
   for (const p of mockProposals) proposals.set(p.id, { ...p });
   const boards = new Map<string, Board>();
@@ -173,6 +180,7 @@ function seed(): MockState {
         latest_run: c.latest_run ? {
           ...c.latest_run,
           auto_approve_blocked_reasons: c.latest_run.auto_approve_blocked_reasons ?? [],
+          ...(maintenance && c.latest_run.status === "queued" ? { queue_reason: "maintenance" as const } : {}),
         } : null,
       })),
     });
@@ -268,6 +276,8 @@ const CARD_MIRRORED_FIELDS = [
   "health_reason",
   "health_since",
   "deadline_at",
+  // PRD #3454: the maintenance queue reason rides the card so the board badge agrees.
+  "queue_reason",
   // PRD #1732 D14: the board projection sends hold_reason on every card, so a run parked
   // on (or released from) credential_disabled flips the card's badge along with its status.
   "hold_reason",

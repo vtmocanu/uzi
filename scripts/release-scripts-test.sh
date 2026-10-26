@@ -30,7 +30,7 @@
 # --ghcr-only [baseline-verifier] runs #1464 M1 publication fixtures only.
 # --frozen-rc-only runs the #1389 block-guard regressions without the full fixture suite.
 # --fold-order-only runs canonical pending/open-RC ordering fixtures.
-# --fragments-only runs pending fragment consumption and preflight regressions.
+# --fragments-only [cutter-path] runs fragment regressions, optionally against a frozen cutter.
 #
 # Wired as `task test:release-scripts` (its own gate member, not gate:repo's
 # sub-second band: it builds a multi-commit repo). Watch it fail on the
@@ -574,6 +574,7 @@ fi
 # =============================================================================
 REPO_ROOT="$(cd "$SCRIPTS_DIR/.." && pwd)"
 RC="$REPO_ROOT/.agents/skills/uzi-release/scripts/release-cut.sh"
+[ "${1:-}" != --fragments-only ] || RC="${2:-$RC}"
 [ -f "$RC" ] || { echo "release-scripts-test: $RC not found" >&2; exit 2; }
 
 D2N=0
@@ -598,6 +599,7 @@ seed_repo() {
   cp "$SCRIPTS_DIR/lib/dependency-bump.sh" "$d/scripts/lib/dependency-bump.sh"
   cp "$SCRIPTS_DIR/lib/changelog-fragments.sh" "$d/scripts/lib/changelog-fragments.sh"
   cp "$SCRIPTS_DIR/lib/changelog-fragments.awk" "$d/scripts/lib/changelog-fragments.awk"
+  cp "$SCRIPTS_DIR/changelog-fragment-citations.py" "$d/scripts/changelog-fragment-citations.py"
   cp "$SCRIPTS_DIR/lib/release-mode.sh" "$d/scripts/lib/release-mode.sh"
   cp "$SCRIPTS_DIR/lib/changelog-bullets.awk" "$d/scripts/lib/changelog-bullets.awk"
   [ ! -f "$SCRIPTS_DIR/lib/ghcr.sh" ] || cp "$SCRIPTS_DIR/lib/ghcr.sh" "$d/scripts/lib/ghcr.sh"
@@ -2819,7 +2821,7 @@ STUB
   rm -rf "$MF"
 done
 
-# A fragment-touch shipping commit needs the right identity in the assembled section.
+# A single new fragment receives its shipping introducer's identity at assembly.
 for identity in missing wrong correct; do
   MF="$(mktemp -d "$REPO_ROOT/.uzi/scratch/m2.XXXXXX")"; seed_repo "$MF"; write_fragment "$MF" 999
   case "$identity" in
@@ -2829,15 +2831,202 @@ for identity in missing wrong correct; do
   echo 'package main // ships' > "$MF/api/feature.go"
   git -C "$MF" add -- api/feature.go "$fragment_path"; gcommit "$MF" 'Feature (#201)'
   run_rc "$MF" 0.2.0
-  expected=1; [ "$identity" != correct ] || expected=0
-  assert_eq "shipping fragment $identity identity" "$expected" "$RC_RC"
-  if [ "$identity" != correct ]; then
-    assert_contains "$identity identity oracle refusal" 'VERIFY FAILED' "$RC_OUT"
-    assert_fragment_staged "$MF" "$identity identity"
-  else
+  assert_eq "shipping fragment $identity identity" 0 "$RC_RC"
+  assert_contains "$identity introducer citation" '[#201](https://github.com/vtmocanu/uzi/pull/201)' "$(cat "$MF/CHANGELOG.md")"
+  if [ "$identity" = correct ]; then
     assert_eq "correct identity rendered once" 1 "$(fragment_count "$MF" 201)"
     assert_contains "correct identity citation retained" '- **Fragment 201 ([#201](https://github.com/vtmocanu/uzi/pull/201)).**' "$(cat "$MF/CHANGELOG.md")"
   fi
+  rm -rf "$MF"
+done
+
+echo '=== fragment-introducer-citation (#3510) ==='
+for mode in squash merge merge-default rebase direct suffix code-paren prose-paren modified readded cited cited-description multiple multiple-covered unrelated equal-prose frozen history-error shipping-history-error unsafe-introduction citation-limit citation-total-limit; do
+  MF="$(mktemp -d "$REPO_ROOT/.uzi/scratch/citation.XXXXXX")"; seed_repo "$MF"
+  if [ "$mode" = frozen ]; then
+    add_feature "$MF" 201; commit_fragment "$MF" 201
+    run_rc "$MF" 0.2.0
+    assert_eq 'frozen citation fixture initial RC' 0 "$RC_RC"
+    git -C "$MF" tag v0.2.0-rc.1
+    awk '/^- \*\*Fragment 201 / { print; getline; print }' "$MF/CHANGELOG.md" > "$MF/.git/frozen-block"
+  fi
+  case "$mode" in merge|merge-default|rebase) git -C "$MF" checkout -qb delivery ;; esac
+  if [ "$mode" = readded ]; then
+    commit_fragment "$MF" 296
+    git -C "$MF" rm -q -- "$fragment_path"; gcommit "$MF" 'docs: retire old fragment (#1111)'
+  fi
+  write_fragment "$MF" 296
+  case "$mode" in
+    code-paren) printf '### Added\n\n- **Use f().**\n  Preserved description.\n' > "$MF/$fragment_path" ;;
+    prose-paren) printf '### Added\n\n- **Upgrade compiler (to 1.27).**\n  Preserved description.\n' > "$MF/$fragment_path" ;;
+  esac
+  if [ "$mode" = cited ] || [ "$mode" = multiple-covered ]; then
+    sed 's/(#296)/(#296, #3434)/' "$MF/$fragment_path" > "$MF/.git/note"
+    mv "$MF/.git/note" "$MF/$fragment_path"
+  fi
+  if [ "$mode" = multiple ] || [ "$mode" = multiple-covered ]; then
+    cp "$MF/$fragment_path" "$MF/$fragment_second"
+    if [ "$mode" = multiple-covered ]; then
+      sed 's/(#296, #3434)/(#296)/' "$MF/$fragment_second" > "$MF/.git/note"
+      mv "$MF/.git/note" "$MF/$fragment_second"
+    fi
+  fi
+  if [ "$mode" = cited-description ]; then
+    sed 's/Preserved description./Preserved description (#3434)./' "$MF/$fragment_path" > "$MF/.git/note"
+    mv "$MF/.git/note" "$MF/$fragment_path"
+  fi
+  if [ "$mode" = citation-limit ] || [ "$mode" = citation-total-limit ]; then
+    python3 - "$mode" "$MF/$fragment_path" "$MF/CHANGELOG.md" <<'PY'
+from pathlib import Path
+import sys
+mode, fragment, changelog = sys.argv[1:]
+if mode == "citation-limit":
+    prefix = b"### Added\n\n- **Fragment 296 (#296).**\n  "
+    Path(fragment).write_bytes(prefix + b"x" * (65536 - len(prefix) - 1) + b"\n")
+else:
+    prefix = b"\n### Added\n\n- **Legacy (#100).**\n  "
+    tail = b"\n\n"
+    padding = 4194304 - len(Path(fragment).read_bytes()) - len(prefix) - len(tail)
+    Path(changelog).write_bytes(b"# Changelog\n\n## [Unreleased]\n" + prefix + b"x" * padding + tail + b"## [0.1.0] - 2026-09-01\n- Initial (#100)\n")
+PY
+  fi
+  if [ "$mode" = unsafe-introduction ]; then
+    cp "$MF/$fragment_path" "$MF/.git/note"
+    rm "$MF/$fragment_path"
+    ln -s ../README.md "$MF/$fragment_path"
+  fi
+  echo 'package main // fragment introduction' > "$MF/api/delivery.go"
+  git -C "$MF" add -- api/delivery.go changelog.d CHANGELOG.md
+  subject='Delivery (#3434)'
+  case "$mode" in
+    direct) subject='Delivery without a PR suffix' ;;
+    suffix) subject='Delivery (#3434) followed by unrelated text' ;;
+    merge|merge-default) subject='Side implementation (#9999)' ;;
+  esac
+  gcommit "$MF" "$subject"
+  if [ "$mode" = merge ] || [ "$mode" = merge-default ]; then
+    git -C "$MF" checkout -q main
+    merge_subject='Delivery (#3434)'
+    [ "$mode" != merge-default ] || merge_subject='Merge pull request #3434 from owner/delivery'
+    git -C "$MF" merge -q --no-ff -m "$merge_subject" delivery
+  elif [ "$mode" = rebase ]; then
+    git -C "$MF" checkout -q main
+    echo 'Unrelated documentation.' > "$MF/README.md"; git -C "$MF" add README.md; gcommit "$MF" 'docs: unrelated main change'
+    git -C "$MF" checkout -q delivery
+    git -C "$MF" rebase -q main
+    git -C "$MF" checkout -q main
+    git -C "$MF" merge -q --ff-only delivery
+  fi
+  introduction="$(git -C "$MF" rev-parse --short HEAD)"
+  case "$mode" in
+    modified)
+      sed 's/Preserved description./Updated description./' "$MF/$fragment_path" > "$MF/.git/note"
+      mv "$MF/.git/note" "$MF/$fragment_path"
+      git -C "$MF" add -- "$fragment_path"; gcommit "$MF" 'docs: clarify pending description' ;;
+    unrelated)
+      echo 'package main // uncited delivery' > "$MF/api/unrelated.go"
+      git -C "$MF" add api/unrelated.go
+      gcommit "$MF" $'Other delivery (#3435)\n\nRefs #296' ;;
+    equal-prose)
+      cp "$MF/$fragment_path" "$MF/$fragment_second"
+      echo 'package main // independent introduction' > "$MF/api/second.go"
+      git -C "$MF" add -- api/second.go "$fragment_second"; gcommit "$MF" 'Independent delivery (#3435)'
+      printf '# Changelog\n\n## [Unreleased]\n### Added\n- **Fragment 296 (#296).**\n  Preserved description.\n\n## [0.1.0] - 2026-09-01\n- Initial (#100)\n' | put_changelog "$MF" ;;
+    unsafe-introduction)
+      rm "$MF/$fragment_path"; cp "$MF/.git/note" "$MF/$fragment_path"
+      git -C "$MF" add -- "$fragment_path"; gcommit "$MF" 'docs: regular pending fragment' ;;
+  esac
+  if [ "$mode" = history-error ] || [ "$mode" = shipping-history-error ]; then
+    mkdir "$MF/.git/bin"
+    cat > "$MF/.git/bin/git" <<'STUB'
+#!/usr/bin/env bash
+if [ "$CITATION_FAILURE" = shipping-history-error ] && [ "${1:-}" = log ] && [ "${2:-}" = --first-parent ]; then
+  for arg in "$@"; do
+    if [ "$arg" = "$CITATION_EXPECTED_RANGE" ]; then
+      printf 'shipping\n' > .git/history-error-reached
+      printf 'fixture shipping history unavailable\n' >&2
+      exit 23
+    fi
+  done
+fi
+for arg in "$@"; do
+  if [ "$CITATION_FAILURE" = history-error ] && [ "$arg" = --raw ]; then
+    printf 'reached\n' > .git/history-error-reached
+    printf 'fixture raw history unavailable\n' >&2
+    exit 23
+  fi
+done
+exec "$CITATION_REAL_GIT" "$@"
+STUB
+    chmod +x "$MF/.git/bin/git"
+  fi
+  start="$(git -C "$MF" rev-parse HEAD)"
+  cp "$MF/$fragment_path" "$MF/.git/input-before"
+  if [ "$mode" = squash ]; then
+    (cd "$MF" && bash scripts/changelog-fragments.sh render-unreleased CHANGELOG.md) > "$MF/.git/plain-before"
+    printf '%s\n' "$start" > "$MF/.git/shipping"
+    (cd "$MF" && bash scripts/changelog-fragments.sh render-unreleased CHANGELOG.md --cite-introducers "$(git rev-parse v0.1.0)" "$start" .git/shipping) > "$MF/.git/cited-view"
+    (cd "$MF" && bash scripts/changelog-fragments.sh render-unreleased CHANGELOG.md) > "$MF/.git/plain-after"
+    if cmp -s "$MF/.git/plain-before" "$MF/.git/plain-after"; then pass 'standalone rendering remains byte-identical'; else fail 'standalone rendering changed'; fi
+    assert_contains 'opt-in renderer cites captured introduction' '#3434' "$(cat "$MF/.git/cited-view")"
+    if cmp -s "$MF/.git/input-before" "$MF/$fragment_path"; then pass 'opt-in rendering preserves tracked fragment bytes'; else fail 'opt-in rendering edited tracked fragment'; fi
+  fi
+  if [ "$mode" = history-error ] || [ "$mode" = shipping-history-error ]; then
+    citation_real_git="$(command -v git)"
+    citation_range="$(git -C "$MF" rev-parse v0.1.0)..$start"
+    PATH="$MF/.git/bin:$PATH" CITATION_REAL_GIT="$citation_real_git" CITATION_FAILURE="$mode" CITATION_EXPECTED_RANGE="$citation_range" run_rc "$MF" 0.2.0
+  else
+    run_rc "$MF" 0.2.0
+  fi
+  case "$mode" in
+    history-error|shipping-history-error|unsafe-introduction|citation-limit|citation-total-limit)
+      assert_eq "$mode refuses before preparation" 3 "$RC_RC"
+      assert_eq "$mode HEAD unchanged" "$start" "$(git -C "$MF" rev-parse HEAD)"
+      assert_eq "$mode index/worktree unchanged" '' "$(git -C "$MF" status --porcelain --untracked-files=no)"
+      if [ "$mode" = history-error ]; then
+        assert_eq 'history producer failed at intended seam' reached "$(cat "$MF/.git/history-error-reached" 2>/dev/null)"
+        assert_contains 'raw history diagnostic preserved' 'fixture raw history unavailable' "$RC_OUT"
+      elif [ "$mode" = shipping-history-error ]; then
+        assert_eq 'shipping history producer failed at intended seam' shipping "$(cat "$MF/.git/history-error-reached" 2>/dev/null)"
+        assert_contains 'shipping history failure is explicit' 'could not read shipping history' "$RC_OUT"
+      fi
+      ;;
+    multiple|unrelated)
+      assert_eq "$mode unchanged oracle refuses uncovered merge" 1 "$RC_RC"
+      assert_contains "$mode oracle still authoritative" 'VERIFY FAILED' "$RC_OUT"
+      if [ "$mode" = unrelated ]; then assert_contains 'unrelated body reference does not cover delivery' '#3435' "$RC_OUT"; fi
+      ;;
+    *)
+      assert_eq "fragment-introducer-citation $mode succeeds" 0 "$RC_RC"
+      wanted='#3434'
+      case "$mode" in direct|suffix|merge-default) wanted="$introduction" ;; esac
+      assert_contains "$mode current introduction retained" "$wanted" "$(cat "$MF/CHANGELOG.md")"
+      description='Preserved description.'
+      case "$mode" in modified) description='Updated description.' ;; cited-description) description='Preserved description ([#3434](https://github.com/vtmocanu/uzi/pull/3434)).' ;; esac
+      assert_contains "$mode description preserved" "$description" "$(cat "$MF/CHANGELOG.md")"
+      assert_eq "$mode only captured fragments consumed" '' "$(git -C "$MF" ls-files -- "$fragment_path" "$fragment_second")"
+      assert_eq "$mode clean tracked inputs" '' "$(git -C "$MF" status --porcelain --untracked-files=no)"
+      if [ "$mode" = cited ] || [ "$mode" = cited-description ] || [ "$mode" = multiple-covered ]; then
+        assert_eq "$mode does not duplicate an existing identity" 1 "$(awk 'index($0, "#3434") { n++ } END { print n+0 }' "$MF/CHANGELOG.md")"
+      fi
+      if [ "$mode" = merge ] || [ "$mode" = merge-default ]; then
+        assert_eq 'side-branch identity is not borrowed' 0 "$(awk 'index($0, "#9999") { n++ } END { print n+0 }' "$MF/CHANGELOG.md")"
+      fi
+      if [ "$mode" = code-paren ]; then
+        assert_contains 'function-call headline remains intact' '- **Use f() ([#3434](https://github.com/vtmocanu/uzi/pull/3434)).**' "$(cat "$MF/CHANGELOG.md")"
+      elif [ "$mode" = prose-paren ]; then
+        assert_contains 'prose parenthetical remains intact' '- **Upgrade compiler (to 1.27) ([#3434](https://github.com/vtmocanu/uzi/pull/3434)).**' "$(cat "$MF/CHANGELOG.md")"
+      fi
+      if [ "$mode" = frozen ]; then
+        awk '/^- \*\*Fragment 201 / { print; getline; print }' "$MF/CHANGELOG.md" > "$MF/.git/frozen-after"
+        if cmp -s "$MF/.git/frozen-block" "$MF/.git/frozen-after"; then pass 'shipped RC block preserved byte-for-byte'; else fail 'shipped RC block changed'; fi
+      fi
+      if [ "$mode" = equal-prose ]; then
+        assert_eq 'equal prose remains three distinct notes' 3 "$(fragment_count "$MF" 296)"
+        assert_contains 'second equal-prose note keeps its own identity' '#3435' "$(cat "$MF/CHANGELOG.md")"
+      fi
+      ;;
+  esac
   rm -rf "$MF"
 done
 
