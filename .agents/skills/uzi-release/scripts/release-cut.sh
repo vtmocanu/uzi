@@ -10,7 +10,7 @@
 # the RC tag on main can follow its push immediately: publish gates enforce CI coverage.
 # A tag push publishes unattended, so it needs the user's go-ahead (without one the harness classifier blocks it).
 #
-#   release-cut.sh <X.Y.Z> [VERB] [--changelog-file FILE] [--no-commit] [--prev-tag TAG]
+#   release-cut.sh <X.Y.Z> [VERB] [--changelog-file FILE] [--no-commit] [--prev-tag TAG] [--ci]
 #
 #   <X.Y.Z>   the STABLE version a candidate is being cut FOR (leading v optional).
 #             The script derives the tag: vX.Y.Z-rc.N by default, vX.Y.Z with --stable.
@@ -39,6 +39,7 @@
 #   --no-commit       stage every edit but do not commit (and so do not run the oracle).
 #                     Applies to the main half only; rejected with --promote.
 #   --prev-tag TAG    override the derived coverage-window base tag (a repair).
+#   --ci              refuse unknown worker-pin publication state (also CI=true).
 #
 # The prerelease form is exactly vX.Y.Z-rc.N (N from 1); nothing else (D2). Tag discovery
 # never sorts a mixed stable/prerelease list: stable tags are filtered first and the
@@ -51,6 +52,8 @@
 set -uo pipefail
 
 VERSION=""; VERB=""; CL_FILE=""; DO_COMMIT=1; PREV_OVERRIDE=""
+CI_STRICT=0
+case "${CI:-}" in true|1) CI_STRICT=1 ;; esac
 set_verb() {
   if [ -n "$VERB" ]; then echo "release-cut: only one of --promote/--promote-only/--skip-promote/--stable" >&2; exit 3; fi
   VERB="$1"
@@ -61,6 +64,7 @@ while [ $# -gt 0 ]; do
     --changelog-file) CL_FILE="${2:?}"; shift 2;;
     --no-commit) DO_COMMIT=0; shift;;
     --prev-tag) PREV_OVERRIDE="${2:?}"; shift 2;;
+    --ci) CI_STRICT=1; shift;;
     -h|--help) awk 'NR > 1 { if (/^#/) print; else exit }' "$0"; exit 3;;
     -*) echo "release-cut: unknown flag $1" >&2; exit 3;;
     *) if [ -z "$VERSION" ]; then VERSION="$1"; shift
@@ -68,7 +72,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 if [ -z "$VERSION" ]; then
-  echo "usage: release-cut.sh <X.Y.Z> [--promote|--promote-only|--skip-promote|--stable] [--changelog-file FILE] [--no-commit] [--prev-tag TAG]" >&2
+  echo "usage: release-cut.sh <X.Y.Z> [--promote|--promote-only|--skip-promote|--stable] [--changelog-file FILE] [--no-commit] [--prev-tag TAG] [--ci]" >&2
   exit 3
 fi
 VERSION="${VERSION#v}"
@@ -329,6 +333,10 @@ if [ "$VERB" != "--promote-only" ]; then
   fi
   ghcr_resolve_owner; owner_rc=$?
   if [ "$owner_rc" -ne 0 ]; then
+    if [ "$CI_STRICT" = 1 ]; then
+      echo "release-cut: worker pin pre-flight refused: could not resolve owner/repo in CI" >&2
+      exit 3
+    fi
     echo "release-cut: warning: worker pin pre-flight for $PIN could not resolve owner/repo; continuing with the publish gate as authority" >&2
   else
     pin_absent=0; pin_error=0; pin_outcomes=""
@@ -348,6 +356,11 @@ if [ "$VERB" != "--promote-only" ]; then
       echo "the pinned tag's publication did not complete; re-run or complete the release.yml publish for that tag, confirm both worker images exist (e.g. release-verify.sh on that tag), then re-run the cut." >&2
       exit 3
     elif [ "$pin_error" -eq 1 ]; then
+      if [ "$CI_STRICT" = 1 ]; then
+        echo "release-cut: worker pin pre-flight refused: query error for $PIN in CI" >&2
+        printf '%s' "$pin_outcomes" >&2
+        exit 3
+      fi
       echo "release-cut: warning: worker pin pre-flight for $PIN encountered a query error; continuing with the publish gate as authority" >&2
     fi
   fi

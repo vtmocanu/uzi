@@ -39,6 +39,8 @@ set -uo pipefail
 # Fixture repos must not read host git config: a global core.fsmonitor=true
 # leaves a detached fsmonitor daemon per repo on macOS.
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+# Fixtures exercise local warning compatibility unless a case explicitly opts into CI.
+export CI=false
 
 SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)"
 TMPDIR="$(cd "$SCRIPTS_DIR/.." && pwd)/.uzi/scratch"
@@ -124,6 +126,57 @@ fi
 printf '%s\n' "$GH_STUB_OUT"
 STUB
 chmod +x "$GH_STUB/gh"
+cat > "$GH_STUB/curl" <<'STUB'
+#!/usr/bin/env bash
+[ "${1:-}" = -q ] || exit 90  # the caller must ignore personal curl configuration
+url=""; head=0; auth=0
+for arg in "$@"; do
+  case "$arg" in
+    https://ghcr.io/*) url=$arg ;;
+    --head|-I) head=1 ;;
+    'Authorization: Bearer anon-fixture') auth=1 ;;
+  esac
+done
+[ -z "${GHCR_QUERY_LOG:-}" ] || printf 'curl %s\n' "$*" >> "$GHCR_QUERY_LOG"
+case "$url" in
+  https://ghcr.io/token)
+    case "${GHCR_CURL_CASE:-}" in
+      token-network) printf '{"token":"anon-fixture"}\n200'; exit 7 ;;
+      token-http) printf '{"token":"anon-fixture"}\n403'; exit 0 ;;
+      token-missing) printf '{}\n200'; exit 0 ;;
+      token-empty) printf '{"token":""}\n200'; exit 0 ;;
+      token-malformed) printf 'not-json\n200'; exit 0 ;;
+      token-conflict) printf '{"token":"anon-fixture","access_token":"other"}\n200'; exit 0 ;;
+      token-header) printf '{"token":"bad\\r\\nheader"}\n200'; exit 0 ;;
+      access-token) printf '{"access_token":"anon-fixture"}\n200'; exit 0 ;;
+      multiline-token) printf '{\n "token": "anon-fixture"\n}\n200'; exit 0 ;;
+    esac
+    printf '{"token":"anon-fixture"}\n200'
+    ;;
+  https://ghcr.io/v2/*/manifests/*)
+    [ "$head" = 1 ] && [ "$auth" = 1 ] || exit 91
+    case "${GHCR_CURL_CASE:-}" in
+      absent) printf 404; exit 0 ;;
+      unauthorized) printf 401; exit 0 ;;
+      forbidden) printf 403; exit 0 ;;
+      redirect) printf 307; exit 0 ;;
+      server) printf 503; exit 0 ;;
+      network) printf 200; exit 7 ;;
+      network-404) printf 404; exit 7 ;;
+    esac
+    tag=${url##*/}
+    case "$url" in
+      */agent-base/manifests/*) tags=${GHCR_BASE_OUT-}; rc=${GHCR_BASE_RC:-7} ;;
+      */agent-jvm/manifests/*) tags=${GHCR_JVM_OUT-}; rc=${GHCR_JVM_RC:-7} ;;
+      *) tags=${GHCR_OTHER_OUT-}; rc=${GHCR_OTHER_RC:-7} ;;
+    esac
+    [ "$rc" = 0 ] || exit "$rc"
+    case $'\n'"$tags"$'\n' in (*$'\n'"$tag"$'\n'*) printf 200 ;; (*) printf 404 ;; esac
+    ;;
+  *) exit 92 ;; # unconfigured requests never reach the network
+esac
+STUB
+chmod +x "$GH_STUB/curl"
 export PATH="$GH_STUB:$PATH"
 unset GH_STUB_OUT GH_STUB_LOG GHCR_STUB GHCR_QUERY_LOG
 export GH_REPO=test/uzi
@@ -959,21 +1012,21 @@ ghcr_queries() {
   local label="$1" log="$2" owner="$3" text
   text="$(cat "$log")"
   assert_contains "$label identity lookup" 'repo view --json owner,name' "$text"
-  assert_contains "$label owner type lookup" 'api users/test --jq .type' "$text"
+  ghcr_absent "$label no owner-type lookup needed" 'api users/' "$text"
   local image line endpoint matched count
   # Each worker endpoint must be queried exactly once; argument order is unrestricted.
   for image in agent-base agent-jvm; do
-    endpoint="/${owner}/packages/container/uzi%2F${image}/versions"
+    endpoint="https://ghcr.io/v2/test/uzi/${image}/manifests/0.1.1"
     matched=""; count=0
     while IFS= read -r line; do
       case "$line" in *"$endpoint"*) matched="$line"; count=$((count + 1)) ;; esac
     done < "$log"
     assert_eq "$label $image queried once" 1 "$count"
-    assert_contains "$label $image endpoint" "$endpoint" "$matched"
-    assert_contains "$label $image pagination" --paginate "$matched"
-    assert_contains "$label $image tag projection" '.[].metadata.container.tags[]' "$matched"
+    assert_contains "$label $image endpoint ($owner)" "$endpoint" "$matched"
+    assert_contains "$label $image HEAD" --head "$matched"
+    assert_contains "$label $image pull scope" "scope=repository:test/uzi/${image}:pull" "$text"
   done
-  ghcr_absent "$label no unrelated package" 'uzi%2Fapi/' "$text"
+  ghcr_absent "$label no Packages REST" '/packages/container/' "$text"
 }
 ghcr_outcome() {
   local label="$1" image="$2" outcome="$3" output="$4" line found=""
@@ -985,7 +1038,7 @@ ghcr_outcome() {
   if [ -n "$found" ]; then pass "$label $image $outcome"; else fail "$label $image $outcome"; fi
 }
 ghcr_cut_case() {
-  local name="$1" mode="$2" base="$3" jvm="$4" d log before head_before version verb owner out_lower
+  local name="$1" mode="$2" base="$3" jvm="$4" d log before head_before version verb owner out_lower ci_mode=false strict_failure=0
   local failures_before="$FAILS"
   # M2 mutation runners may select one named priority/pin case without changing fixtures.
   [ -z "${GHCR_CASE_FILTER:-}" ] || [ "$name" = "$GHCR_CASE_FILTER" ] || return 0
@@ -995,11 +1048,15 @@ ghcr_cut_case() {
   case "$jvm" in absent) GHCR_JVM_OUT=0.2.0 ;; error) GHCR_JVM_RC=7 ;; esac
   owner=users/test
   case "$name" in
-    org-present) GHCR_KIND=Organization; owner=orgs/test ;;
+    org-present) GHCR_IDENTITY='Test uzi'; GHCR_KIND=Organization; owner=orgs/test ;;
     kind-fallback-present) GHCR_KIND=''; GHCR_KIND_RC=7 ;;
     identity-rc-present) GHCR_IDENTITY_RC=7 ;;
     identity-rc-missing) GHCR_IDENTITY_RC=7; GHCR_BASE_OUT=0.2.0 ;;
     unresolved-owner) GHCR_IDENTITY=''; GHCR_IDENTITY_RC=7 ;;
+    ci-owner-error) GHCR_IDENTITY=''; GHCR_IDENTITY_RC=7; ci_mode=true; strict_failure=1 ;;
+    ci-both-error|ci-present-error) ci_mode=true; strict_failure=1 ;;
+    ci-present|ci-promote-only) ci_mode=true ;;
+    cli-both-error) strict_failure=1 ;;
     empty-head-pin)
       sed 's/tag: "0.1.1"/tag: ""/' "$d/deploy/chart/values.yaml" > "$d/values.tmp"
       mv "$d/values.tmp" "$d/deploy/chart/values.yaml"
@@ -1016,10 +1073,16 @@ ghcr_cut_case() {
     promote-only) verb=--promote-only ;;
     auto-promote-only) version=0.3.0; verb=--promote ;;
   esac
-  if [ -n "$verb" ]; then run_rc "$d" "$version" "$verb"; else run_rc "$d" "$version"; fi
+  if [ "$name" = cli-both-error ]; then
+    run_rc "$d" "$version" --ci
+  elif [ -n "$verb" ]; then
+    CI="$ci_mode" run_rc "$d" "$version" "$verb"
+  else
+    CI="$ci_mode" run_rc "$d" "$version"
+  fi
   out_lower="$(printf '%s' "$RC_OUT" | tr '[:upper:]' '[:lower:]')"
   if [ "$base" != absent ] && [ "$jvm" != absent ] &&
-     [ "$name" != empty-head-pin ] && [ "$name" != unreadable-head-pin ]; then
+     [ "$name" != empty-head-pin ] && [ "$name" != unreadable-head-pin ] && [ "$strict_failure" = 0 ]; then
     assert_eq "$name succeeds" 0 "$RC_RC"
     case "$name" in
       both-error|present-error|unresolved-owner|identity-rc-present|identity-rc-missing)
@@ -1036,7 +1099,7 @@ ghcr_cut_case() {
     else
       if [ "$name" = unresolved-owner ] || [ "$name" = identity-rc-present ] || [ "$name" = identity-rc-missing ]; then
         assert_contains "$name identity attempted" 'repo view --json owner,name' "$(cat "$log")"
-        ghcr_absent "$name no package queries" '/packages/container/' "$(cat "$log")"
+        ghcr_absent "$name no registry queries" 'https://ghcr.io/' "$(cat "$log")"
       else
         ghcr_queries "$name" "$log" "$owner"
       fi
@@ -1058,6 +1121,12 @@ ghcr_cut_case() {
     assert_eq "$name HEAD tags refs reachable commits and tree unchanged" "$before" "$(ghcr_snapshot "$d")"
     assert_eq "$name clean tree after refusal" "" "$(git -C "$d" status --porcelain)"
     case "$name" in
+      ci-owner-error)
+        assert_contains "$name unresolved identity" 'resolve owner/repo' "$RC_OUT"
+        ghcr_absent "$name no registry queries" 'https://ghcr.io/' "$(cat "$log")" ;;
+      ci-both-error|ci-present-error|cli-both-error)
+        ghcr_queries "$name" "$log" "$owner"
+        assert_contains "$name query error refuses" 'query error' "$RC_OUT" ;;
       empty-head-pin|unreadable-head-pin)
         ghcr_absent "$name no package queries" '/packages/container/' "$(cat "$log")"
         assert_contains "$name instrument failure diagnostic" 'instrument' "$out_lower"
@@ -1157,12 +1226,12 @@ YAML
     # Verifier also checks the release artifacts; only inspect the worker endpoints here.
     local image endpoint matched line
     for image in agent-base agent-jvm; do
-      endpoint="/${owner}/packages/container/uzi%2F${image}/versions"; matched=""
+      endpoint="https://ghcr.io/v2/test/uzi/${image}/manifests/"; matched=""
       while IFS= read -r line; do
         case "$line" in *"$endpoint"*) matched="$line"; break ;; esac
       done < "$querylog"
-      assert_contains "verify $name $image owner endpoint" "$endpoint" "$matched"
-      assert_contains "verify $name $image pagination" --paginate "$matched"
+      assert_contains "verify $name $image registry endpoint ($owner)" "$endpoint" "$matched"
+      assert_contains "verify $name $image HEAD" --head "$matched"
     done
   fi
   case "$name" in
@@ -1218,6 +1287,44 @@ ghcr_reader_case() {
   printf 'GHCR_CASE=reader-%s READER_EXIT=%s ASSERTION_FAILURES=%s\n' "$name" "$rc" "$((FAILS - failures_before))"
   rm -rf "$d"
 }
+ghcr_registry_cases() {
+  local scenario wanted log out rc text
+  for scenario in present absent unauthorized forbidden redirect server network network-404 token-network token-http token-missing token-empty token-malformed token-conflict token-header access-token multiline-token invalid-tag; do
+    [ -z "${GHCR_CASE_FILTER:-}" ] || [ "registry-$scenario" = "$GHCR_CASE_FILTER" ] || continue
+    ghcr_defaults
+    wanted=2
+    case "$scenario" in present|access-token|multiline-token) wanted=0 ;; absent) wanted=1 ;; esac
+    log="$(mktemp)"
+    out="$(
+      export GHCR_CURL_CASE="$scenario" GHCR_QUERY_LOG="$log"
+      export GH_TOKEN=credential-sentinel GITHUB_TOKEN=credential-sentinel
+      # shellcheck source=scripts/lib/ghcr.sh
+      . "$SCRIPTS_DIR/lib/ghcr.sh"
+      OWNER="test"; REPO=uzi; VERSION=0.1.1
+      [ "$scenario" != invalid-tag ] || VERSION='bad/tag'
+      img_has_tag agent-base
+    )"; rc=$?
+    text="$(cat "$log")"
+    assert_eq "anonymous registry $scenario status" "$wanted" "$rc"
+    assert_eq "anonymous registry $scenario no token output" '' "$out"
+    ghcr_absent "$scenario no personal credential" credential-sentinel "$text"
+    ghcr_absent "$scenario no Packages REST" /packages/container/ "$text"
+    if [ "$scenario" = invalid-tag ]; then
+      assert_eq 'invalid tag makes no registry request' '' "$text"
+    else
+      assert_contains "$scenario fixed anonymous token endpoint" 'https://ghcr.io/token' "$text"
+      assert_contains "$scenario read-only pull scope" 'scope=repository:test/uzi/agent-base:pull' "$text"
+      case "$scenario" in
+        token-*) ghcr_absent "$scenario stops before HEAD" /manifests/ "$text" ;;
+        *)
+          assert_contains "$scenario exact manifest" 'https://ghcr.io/v2/test/uzi/agent-base/manifests/0.1.1' "$text"
+          assert_contains "$scenario HEAD only" --head "$text"
+          ;;
+      esac
+    fi
+    rm -f "$log"
+  done
+}
 ghcr_regressions() {
   local baseline="$GHCR_BASELINE" record name
   if [ -n "$baseline" ]; then
@@ -1231,6 +1338,7 @@ ghcr_regressions() {
     echo "GHCR_CURRENT_LOG=$record"
     echo "  No frozen baseline supplied; asserting current verifier behavior only."
   fi
+  ghcr_registry_cases
   # Finite scenario matrices: assertion failures never prevent sibling scenarios.
   ghcr_cut_case missing-base default absent present
   ghcr_cut_case missing-jvm default present absent
@@ -1242,6 +1350,12 @@ ghcr_regressions() {
   ghcr_cut_case empty-head-pin default present present
   ghcr_cut_case unreadable-head-pin default present present
   ghcr_cut_case present default present present
+  ghcr_cut_case ci-present default present present
+  ghcr_cut_case ci-promote-only promote-only error error
+  ghcr_cut_case ci-both-error default error error
+  ghcr_cut_case ci-present-error default present error
+  ghcr_cut_case ci-owner-error default present present
+  ghcr_cut_case cli-both-error default error error
   ghcr_cut_case org-present default present present
   ghcr_cut_case kind-fallback-present default present present
   ghcr_cut_case identity-rc-present default present present
