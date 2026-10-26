@@ -4,6 +4,13 @@ SELECT vault_mode, vault_epoch FROM users WHERE id = $1;
 -- name: LockUserVaultState :one
 SELECT vault_mode, vault_epoch FROM users WHERE id = $1 FOR UPDATE;
 
+-- name: LockVaultAuthState :one
+-- Lifecycle operations lock the durable mode/epoch and current login hash together.
+SELECT vault_mode, vault_epoch, password_hash FROM users WHERE id = $1 FOR UPDATE;
+
+-- name: LockUserVault :one
+SELECT * FROM user_vaults WHERE user_id = $1 FOR UPDATE;
+
 -- name: AdvanceUserVaultMode :one
 UPDATE users SET vault_mode = @vault_mode, vault_epoch = vault_epoch + 1
 WHERE id = @id RETURNING vault_mode, vault_epoch;
@@ -33,13 +40,9 @@ ON CONFLICT (user_id) DO NOTHING
 RETURNING *;
 
 -- name: DeleteUserVault :execrows
--- Drops ONLY the vault row (there is no FK cascade user_vaults → user_secrets).
--- Intended for the future password-reset flow, where the DEK is unrecoverable by
--- design: that flow MUST also delete this user's sealed_with='dek' user_secrets
--- rows and force re-entry — keeping unreadable ciphertext would be a worse bug
--- than the data loss. Reset itself is out of scope (PRD #32); this is the
--- primitive it will build on. Account deletion is already handled by the
--- ON DELETE CASCADE from users.
+-- Drops ONLY the wrapper. The vault-disable transaction must first reseal all
+-- owned secret and account slots under master_aad while holding the owner fence.
+-- Deleting a wrapper with remaining DEK material would strand those credentials.
 DELETE FROM user_vaults WHERE user_id = $1;
 
 -- name: ListUsersNeedingVaultLockNotice :many

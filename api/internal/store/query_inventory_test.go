@@ -763,29 +763,21 @@ var queryInventory = []queryPin{
 			"affects 0 rows, then the owner's delete of that SAME id affects 1, which proves the 0 " +
 			"was the predicate and not a missing row"},
 
-	// ── user_vaults.sql — the ORIGINAL THREE unpinned, the PRD #890 M1 THREE executed ──
-	// The per-user vault (Argon2 KEK + wrapped DEK) is the mechanism protecting every
-	// sealed_with='dek' secret, and until PRD #890 NOT ONE of its queries had executed
-	// against a database (measured 0/0/0 for GetUserVault / CreateUserVaultIfAbsent /
-	// DeleteUserVault, all still unpinned below). It is not that nobody wrote a live test
-	// near it — four live-DB files mention "vault", which is exactly the false positive a
-	// name-based scan would report. They do not reach those queries:
-	// secrets_crud_livedb_test.go:24 states it passes a NIL vault on purpose ("real box
-	// (nil vault → the master-box seal path, which is all these tests need)"), a deliberate
-	// and locally reasonable choice that leaves that path with no live exercise.
-	//
-	// PRD #890 M1 adds the three vault-lock-notice queries and, unlike the original three,
-	// EXECUTES each against real Postgres in TestVaultLockNoticeQueriesLiveDB (the sqlc-
-	// inference gate: a green generate does not prove the multi-subquery SELECT / the atomic
-	// RETURNING claim / the guarded re-arm actually run). That left 3 executed +
-	// 3 still-unpinned at that point — the original coverage gap was not closed by M1.
-	// Issue #3507 adds the mode/epoch queries below, exercised directly by its LiveDB tests.
+	// ── user_vaults.sql — wrapper lifecycle, mode/epoch and lock notices ──
+	// PRD #890 introduced real-database pins for the notice queries. Issue #3507
+	// exercises wrapper creation, existing-wrapper reads and atomic deletion through
+	// the lifecycle, alongside direct mode/epoch and migration tests. These pins
+	// name executed paths, not a claim that a nearby vault-named test proves SQL.
 	{"GetUserVaultState", "user_vaults.sql", "TestVaultModeMigrationBackfillLiveDB",
 		"direct calls in vault_mode_livedb_test.go — existing vaultless, OIDC and inactive users " +
 			"must all reload as protected with epoch zero after migration"},
 	{"LockUserVaultState", "user_vaults.sql", "TestVaultModeQueriesLiveDB",
 		"direct transaction-bound calls in vault_mode_livedb_test.go — one transaction holds " +
 			"the user row and a competing lock attempt reaches its deadline before rollback"},
+	{"LockVaultAuthState", "user_vaults.sql", "TestVaultLifecycleRoundTripLiveDB",
+		"transaction-bound lifecycle calls lock current mode, epoch and password hash; wrong-password enable preserves the complete durable snapshot"},
+	{"LockUserVault", "user_vaults.sql", "TestVaultLifecycleRoundTripLiveDB",
+		"lifecycle transactions lock existing wrappers and observe missing wrappers before create-only enable"},
 	{"AdvanceUserVaultMode", "user_vaults.sql", "TestVaultModeQueriesLiveDB",
 		"direct calls in vault_mode_livedb_test.go — returned state and the subsequent locked reload " +
 			"must both report the requested mode and an epoch increment of one"},
@@ -807,28 +799,16 @@ var queryInventory = []queryPin{
 		"direct call in vault_lock_notice_livedb_test.go — the unlock re-arm, executed against real " +
 			"Postgres: after a claim, ClearVaultLockNotice nulls lock_notified_at back so a re-claim " +
 			"once again returns the row (proves the IS NOT NULL guard and the episode cycle)"},
-	{"GetUserVault", "user_vaults.sql", unpinnedPin,
-		"0 executions. Production callers are vault.go:117, :200 and :265; every test in its path " +
-			"is a fake (vault/vault_test.go:76, workersvc/vault_gate_test.go:27, " +
-			"handler/vault_test.go:31), each returning a canned store.UserVault. So the SELECT that " +
-			"fetches the KEK salt and wrapped DEK has never run against the real table"},
-	{"CreateUserVaultIfAbsent", "user_vaults.sql", unpinnedPin,
-		"0 executions — and it is the query in this file whose whole point a fake CANNOT stand in " +
-			"for. Its `ON CONFLICT (user_id) DO NOTHING` exists to make two concurrent first-unlocks " +
-			"safe: one insert wins, the loser gets pgx.ErrNoRows and re-reads the winner's row, so " +
-			"the cached DEK always equals the persisted one. That is a race fixed by database " +
-			"semantics, and a fake has no unique index to conflict on. The comment states the " +
-			"consequence of getting it wrong (each request caching a different DEK than the DB " +
-			"holds); nothing has ever made Postgres produce the conflict"},
-	{"DeleteUserVault", "user_vaults.sql", unpinnedPin,
-		"0 executions, and it has NO CALLER AT ALL — not a test, not production. `rg` over " +
-			"internal/ and cmd/ finds only the generated method. It is a deliberate primitive for " +
-			"PRD #32's password reset (its own comment says reset is out of scope and this is what " +
-			"that flow will build on), so it is dead-but-intended rather than dead-by-accident. " +
-			"Worth a row precisely because 'unused' and 'untested' are indistinguishable from a " +
-			"coverage report, and only one of them is fine"},
+	{"GetUserVault", "user_vaults.sql", "TestVaultLifecycleRoundTripLiveDB",
+		"status checks reload actual wrapper presence after create, disable and re-enable on a real database"},
+	{"CreateUserVaultIfAbsent", "user_vaults.sql", "TestVaultLifecycleRoundTripLiveDB",
+		"create-only lifecycle transactions persist wrapped keys used by later existing-wrapper unlock; concurrent lifecycle coverage is separate"},
+	{"DeleteUserVault", "user_vaults.sql", "TestVaultLifecycleRollbackLiveDB",
+		"disable removes the wrapper only after conversion; an injected error after DELETE rolls back mode, ciphertext and wrapper together"},
 
 	// ── vault_material.sql — bounded, owner-scoped crypto conversion primitives ──
+	{"HasMasterVaultMaterial", "vault_material.sql", "TestVaultLifecycleRoundTripLiveDB",
+		"existing-wrapper unlock executes the all-DEK fast path and then rewraps a legacy personal row plus both canonical account slots"},
 	{"GetVaultMaterialTotals", "vault_material.sql", "TestVaultMaterialQueriesLiveDB",
 		"direct call in vault_material_livedb_test.go — exact owned row/slot and ciphertext-byte " +
 			"totals include disabled secrets and orphan canonical accounts, excluding foreign material"},

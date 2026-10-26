@@ -115,13 +115,9 @@ const deleteUserVault = `-- name: DeleteUserVault :execrows
 DELETE FROM user_vaults WHERE user_id = $1
 `
 
-// Drops ONLY the vault row (there is no FK cascade user_vaults → user_secrets).
-// Intended for the future password-reset flow, where the DEK is unrecoverable by
-// design: that flow MUST also delete this user's sealed_with='dek' user_secrets
-// rows and force re-entry — keeping unreadable ciphertext would be a worse bug
-// than the data loss. Reset itself is out of scope (PRD #32); this is the
-// primitive it will build on. Account deletion is already handled by the
-// ON DELETE CASCADE from users.
+// Drops ONLY the wrapper. The vault-disable transaction must first reseal all
+// owned secret and account slots under master_aad while holding the owner fence.
+// Deleting a wrapper with remaining DEK material would strand those credentials.
 func (q *Queries) DeleteUserVault(ctx context.Context, userID uuid.UUID) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteUserVault, userID)
 	if err != nil {
@@ -246,6 +242,24 @@ func (q *Queries) ListUsersNeedingVaultLockNotice(ctx context.Context) ([]ListUs
 	return items, nil
 }
 
+const lockUserVault = `-- name: LockUserVault :one
+SELECT user_id, kek_salt, wrapped_dek, created_at, updated_at, lock_notified_at FROM user_vaults WHERE user_id = $1 FOR UPDATE
+`
+
+func (q *Queries) LockUserVault(ctx context.Context, userID uuid.UUID) (UserVault, error) {
+	row := q.db.QueryRow(ctx, lockUserVault, userID)
+	var i UserVault
+	err := row.Scan(
+		&i.UserID,
+		&i.KekSalt,
+		&i.WrappedDek,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.LockNotifiedAt,
+	)
+	return i, err
+}
+
 const lockUserVaultState = `-- name: LockUserVaultState :one
 SELECT vault_mode, vault_epoch FROM users WHERE id = $1 FOR UPDATE
 `
@@ -259,5 +273,23 @@ func (q *Queries) LockUserVaultState(ctx context.Context, id uuid.UUID) (LockUse
 	row := q.db.QueryRow(ctx, lockUserVaultState, id)
 	var i LockUserVaultStateRow
 	err := row.Scan(&i.VaultMode, &i.VaultEpoch)
+	return i, err
+}
+
+const lockVaultAuthState = `-- name: LockVaultAuthState :one
+SELECT vault_mode, vault_epoch, password_hash FROM users WHERE id = $1 FOR UPDATE
+`
+
+type LockVaultAuthStateRow struct {
+	VaultMode    string      `json:"vault_mode"`
+	VaultEpoch   int64       `json:"vault_epoch"`
+	PasswordHash pgtype.Text `json:"password_hash"`
+}
+
+// Lifecycle operations lock the durable mode/epoch and current login hash together.
+func (q *Queries) LockVaultAuthState(ctx context.Context, id uuid.UUID) (LockVaultAuthStateRow, error) {
+	row := q.db.QueryRow(ctx, lockVaultAuthState, id)
+	var i LockVaultAuthStateRow
+	err := row.Scan(&i.VaultMode, &i.VaultEpoch, &i.PasswordHash)
 	return i, err
 }

@@ -15,14 +15,8 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// fakeVaultStore is an in-memory Store so the vault's DB-touching paths (unlock,
-// race-safe create, lazy rewrap) are exercised without a live database. It models
-// the real semantics that matter: CreateUserVaultIfAbsent's DO NOTHING (returns
-// pgx.ErrNoRows on conflict) and RewrapUserSecret's guard on sealed_with='master'.
-//
-// Secrets are a flat ROW LIST, not a kind-keyed map: since PRD #104 a user may
-// hold several secrets of one kind, and a map keyed by kind would silently make
-// that impossible to stage — hiding exactly the rewrap-clobber bug D10 fixes.
+// This crypto-only fixture implements the explicit Store and transaction seams.
+// It does not model PostgreSQL rollback, locking, or commit atomicity.
 type fakeSecret struct {
 	id         uuid.UUID
 	userID     uuid.UUID
@@ -33,6 +27,9 @@ type fakeSecret struct {
 
 type fakeVaultStore struct {
 	mu      sync.Mutex
+	txMu    sync.Mutex
+	states  map[uuid.UUID]store.LockVaultAuthStateRow
+	policy  string
 	vaults  map[uuid.UUID]store.UserVault
 	secrets []*fakeSecret
 
@@ -44,7 +41,7 @@ type fakeVaultStore struct {
 }
 
 func newFakeVaultStore() *fakeVaultStore {
-	return &fakeVaultStore{vaults: make(map[uuid.UUID]store.UserVault)}
+	return &fakeVaultStore{vaults: make(map[uuid.UUID]store.UserVault), states: make(map[uuid.UUID]store.LockVaultAuthStateRow), policy: "optional"}
 }
 
 // putSecret seeds a stored secret (used to stage a legacy master-sealed row) and
@@ -102,37 +99,6 @@ func (f *fakeVaultStore) CreateUserVaultIfAbsent(_ context.Context, arg store.Cr
 	return uv, nil
 }
 
-func (f *fakeVaultStore) ListMasterSealedSecrets(_ context.Context, userID uuid.UUID) ([]store.ListMasterSealedSecretsRow, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	out := []store.ListMasterSealedSecretsRow{}
-	for _, s := range f.secrets {
-		if s.userID == userID && s.sealedWith == store.SealedWithMaster {
-			out = append(out, store.ListMasterSealedSecretsRow{ID: s.id, Kind: s.kind, Ciphertext: s.ciphertext})
-		}
-	}
-	return out, nil
-}
-
-// RewrapUserSecret models the real statement's predicate exactly —
-// WHERE id = @id AND user_id = @user_id AND sealed_with = 'master' — including
-// that it is a set-based UPDATE, so a predicate matching several rows would write
-// all of them (which is how the pre-D10 by-kind form destroyed siblings).
-func (f *fakeVaultStore) RewrapUserSecret(_ context.Context, arg store.RewrapUserSecretParams) (int64, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	var n int64
-	for _, s := range f.secrets {
-		if s.id != arg.ID || s.userID != arg.UserID || s.sealedWith != store.SealedWithMaster {
-			continue
-		}
-		s.ciphertext = arg.Ciphertext
-		s.sealedWith = store.SealedWithDEK
-		n++
-	}
-	return n, nil
-}
-
 func (f *fakeVaultStore) ClearVaultLockNotice(_ context.Context, userID uuid.UUID) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -157,7 +123,7 @@ func newTestVaultWithStore(t *testing.T) (*Vault, *secretbox.Box, *fakeVaultStor
 		t.Fatalf("secretbox.New master: %v", err)
 	}
 	st := newFakeVaultStore()
-	return New(master, st), master, st
+	return New(master, st, st.transaction(st)), master, st
 }
 
 const testKind = store.KindAnthropicToken
@@ -178,11 +144,11 @@ func TestUnlockSealOpenRoundTrip(t *testing.T) {
 	}
 
 	secret := []byte("sk-ant-oat-deadbeef")
-	sealed, err := v.Seal(uid, testKind, secret)
+	sealed, err := v.Seal(ctx, uid, testKind, secret, SealForUse)
 	if err != nil {
 		t.Fatalf("Seal: %v", err)
 	}
-	if bytes.Contains(sealed, secret) {
+	if bytes.Contains(sealed.Ciphertext, secret) {
 		t.Fatal("sealed output contains the plaintext")
 	}
 
@@ -190,17 +156,17 @@ func TestUnlockSealOpenRoundTrip(t *testing.T) {
 	if v.Unlocked(uid) {
 		t.Fatal("vault should be locked after Lock")
 	}
-	if _, err := v.Seal(uid, testKind, secret); err != ErrLocked {
+	if _, err := v.Seal(ctx, uid, testKind, secret, SealForUse); err != ErrLocked {
 		t.Fatalf("Seal while locked: got %v, want ErrLocked", err)
 	}
-	if _, err := v.Open(uid, testKind, store.SealedWithDEK, sealed); err != ErrLocked {
+	if _, err := v.Open(uid, testKind, store.SealedWithDEK, sealed.Ciphertext); err != ErrLocked {
 		t.Fatalf("Open dek while locked: got %v, want ErrLocked", err)
 	}
 
 	if err := v.Unlock(ctx, uid, pw); err != nil {
 		t.Fatalf("re-Unlock: %v", err)
 	}
-	opened, err := v.Open(uid, testKind, store.SealedWithDEK, sealed)
+	opened, err := v.Open(uid, testKind, store.SealedWithDEK, sealed.Ciphertext)
 	if err != nil {
 		t.Fatalf("Open after re-unlock: %v", err)
 	}
@@ -240,11 +206,11 @@ func TestMasterKeyCannotOpenDEKSealed(t *testing.T) {
 	if err := v.Unlock(ctx, uid, "password-for-dek"); err != nil {
 		t.Fatalf("Unlock: %v", err)
 	}
-	sealed, err := v.Seal(uid, testKind, []byte("dek-only secret"))
+	sealed, err := v.Seal(ctx, uid, testKind, []byte("dek-only secret"), SealForUse)
 	if err != nil {
 		t.Fatalf("Seal: %v", err)
 	}
-	if _, err := master.Open(sealed); err == nil {
+	if _, err := master.Open(sealed.Ciphertext); err == nil {
 		t.Fatal("master key opened a DEK-sealed ciphertext — vault provides no isolation")
 	}
 }
@@ -259,12 +225,12 @@ func TestAADMismatchFails(t *testing.T) {
 	if err := v.Unlock(ctx, uid, "aad-binding-pw"); err != nil {
 		t.Fatalf("Unlock: %v", err)
 	}
-	sealed, err := v.Seal(uid, testKind, []byte("bound secret"))
+	sealed, err := v.Seal(ctx, uid, testKind, []byte("bound secret"), SealForUse)
 	if err != nil {
 		t.Fatalf("Seal: %v", err)
 	}
 
-	if _, err := v.Open(uid, "other_kind", store.SealedWithDEK, sealed); err == nil {
+	if _, err := v.Open(uid, "other_kind", store.SealedWithDEK, sealed.Ciphertext); err == nil {
 		t.Fatal("Open succeeded with a mismatched kind AAD")
 	}
 
@@ -274,7 +240,7 @@ func TestAADMismatchFails(t *testing.T) {
 	if err := v.Unlock(ctx, other, "second-user-pw"); err != nil {
 		t.Fatalf("Unlock other: %v", err)
 	}
-	if _, err := v.Open(other, testKind, store.SealedWithDEK, sealed); err == nil {
+	if _, err := v.Open(other, testKind, store.SealedWithDEK, sealed.Ciphertext); err == nil {
 		t.Fatal("Open succeeded under a different owner's DEK/AAD")
 	}
 }
@@ -397,6 +363,11 @@ func TestLazyRewrapOnUnlock(t *testing.T) {
 	v, master, st := newTestVaultWithStore(t)
 	ctx := context.Background()
 	uid := uuid.New()
+	const password = "unlock-password"
+	if err := v.Unlock(ctx, uid, password); err != nil {
+		t.Fatal(err)
+	}
+	v.Lock(uid)
 
 	// Stage a legacy row: master-box-sealed (nil AAD), sealed_with='master'.
 	token := []byte("legacy-token-to-migrate")
@@ -406,7 +377,7 @@ func TestLazyRewrapOnUnlock(t *testing.T) {
 	}
 	st.putSecret(uid, testKind, legacy, store.SealedWithMaster)
 
-	if err := v.Unlock(ctx, uid, "unlock-pw"); err != nil {
+	if err := v.UnlockExisting(ctx, uid, password); err != nil {
 		t.Fatalf("Unlock: %v", err)
 	}
 
@@ -430,41 +401,15 @@ func TestLazyRewrapOnUnlock(t *testing.T) {
 		t.Fatal("rewrapped ciphertext still opens under the master key")
 	}
 	// A second unlock finds nothing left to rewrap (idempotent).
-	if rows, _ := st.ListMasterSealedSecrets(ctx, uid); len(rows) != 0 {
-		t.Fatalf("still %d master-sealed rows after rewrap", len(rows))
+	if err := v.UnlockExisting(ctx, uid, password); err != nil {
+		t.Fatal(err)
+	}
+	if hasMaster, _ := st.HasMasterVaultMaterial(ctx, uid); hasMaster {
+		t.Fatal("master-sealed rows remain after rewrap")
 	}
 }
 
-// TestRewrapPreservesSiblingSecretsOfSameKind is the PRD #104 D10 regression gate.
-//
-// Before the fix, RewrapUserSecret was keyed on (user_id, kind, sealed_with='master')
-// and ListMasterSealedSecrets returned no id, so the rewrap loop's FIRST iteration
-// resealed token 1 and wrote it over EVERY master-sealed row of that kind. The
-// remaining iterations then matched nothing (the siblings were already 'dek') and
-// the loop finished without a single error: tokens 2..N were silently replaced by a
-// copy of token 1. It is reachable in a supported configuration — a vault-nil
-// deployment seals everything 'master', and PRD #32's documented upgrade is to
-// enable the vault later, at which point the owner's first unlock runs this loop.
-//
-// The gate: two master-sealed rows of ONE kind with DIFFERENT plaintexts must both
-// survive an unlock with their own original plaintext. Asserting on the plaintexts
-// (not just on distinct ciphertexts) is what makes the clobber unmissable — the
-// buggy path leaves two rows that both open, but to the SAME secret.
-//
-// If you are bisecting and landed on the commit that introduced this test: yes, it
-// stages a shape the live schema still forbids here. `UNIQUE (user_id, kind)` does
-// not drop until migration 00077 in the NEXT commit, so at this commit no database
-// would accept these two rows. That is deliberate and harmless — a fake store is a
-// model, and this one models the post-00077 world so the correctness fix can land
-// and be proven before the schema change that makes it reachable. The test that
-// runs against real SQL is TestUserSecretsRewrapLiveDB, which arrives with the
-// migration.
-//
-// This test is also NOT independently falsifiable: reverting the production fix
-// changes the generated types, so a pre-fix tree fails to COMPILE here rather than
-// going red. Its job is to prove vault.go threads the id through the real
-// rewrapMasterSecrets loop; the evidentiary weight for the bug itself belongs to
-// the live-DB test.
+// TestRewrapPreservesSiblingSecretsOfSameKind preserves each row’s own plaintext.
 func TestRewrapPreservesSiblingSecretsOfSameKind(t *testing.T) {
 	v, master, st := newTestVaultWithStore(t)
 	ctx := context.Background()
@@ -548,7 +493,7 @@ func TestConcurrentFirstUnlockConsistent(t *testing.T) {
 	// Seal with the cached DEK, then Lock + UnlockExisting (which unwraps the
 	// PERSISTED row) and open: proves cache DEK == persisted DEK.
 	secret := []byte("post-race-secret")
-	sealed, err := v.Seal(uid, testKind, secret)
+	sealed, err := v.Seal(ctx, uid, testKind, secret, SealForUse)
 	if err != nil {
 		t.Fatalf("Seal: %v", err)
 	}
@@ -556,7 +501,7 @@ func TestConcurrentFirstUnlockConsistent(t *testing.T) {
 	if err := v.UnlockExisting(ctx, uid, pw); err != nil {
 		t.Fatalf("UnlockExisting from persisted row: %v", err)
 	}
-	opened, err := v.Open(uid, testKind, store.SealedWithDEK, sealed)
+	opened, err := v.Open(uid, testKind, store.SealedWithDEK, sealed.Ciphertext)
 	if err != nil {
 		t.Fatalf("Open after re-unlock (cache/DB DEK diverged?): %v", err)
 	}
@@ -565,8 +510,8 @@ func TestConcurrentFirstUnlockConsistent(t *testing.T) {
 	}
 }
 
-// blockedNoticeVaultStore pauses the refresh unlock after its DEK is cached.
-// Only that one list call is blocked; the context deadline bounds a failed barrier.
+// blockedNoticeVaultStore pauses the lazy phase after the key is published.
+// The context deadline bounds a failed barrier.
 type blockedNoticeVaultStore struct {
 	*fakeVaultStore
 	entered, release chan struct{}
@@ -574,14 +519,20 @@ type blockedNoticeVaultStore struct {
 	marked           bool
 }
 
-func (s *blockedNoticeVaultStore) ListMasterSealedSecrets(ctx context.Context, uid uuid.UUID) ([]store.ListMasterSealedSecretsRow, error) {
+func (s *blockedNoticeVaultStore) HasMasterVaultMaterial(ctx context.Context, uid uuid.UUID) (bool, error) {
 	close(s.entered)
 	select {
 	case <-s.release:
-		return s.fakeVaultStore.ListMasterSealedSecrets(ctx, uid)
+		return s.fakeVaultStore.HasMasterVaultMaterial(ctx, uid)
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return false, ctx.Err()
 	}
+}
+func (s *blockedNoticeVaultStore) ClaimVaultLockNotice(_ context.Context, uid uuid.UUID) (uuid.UUID, error) {
+	s.noticeMu.Lock()
+	defer s.noticeMu.Unlock()
+	s.marked = true
+	return uid, nil
 }
 
 func (s *blockedNoticeVaultStore) ClearVaultLockNotice(ctx context.Context, uid uuid.UUID) error {
@@ -606,6 +557,7 @@ func TestUnlockExistingAfterLockPreservesNotice(t *testing.T) {
 		fakeVaultStore: st, entered: make(chan struct{}), release: make(chan struct{}),
 	}
 	v.q = blocked
+	v.transact = st.transaction(blocked)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	done := make(chan error, 1)
 	var releaseOnce sync.Once
@@ -624,33 +576,32 @@ func TestUnlockExistingAfterLockPreservesNotice(t *testing.T) {
 	select {
 	case <-blocked.entered:
 	case <-ctx.Done():
-		t.Fatal("refresh unlock did not reach list barrier")
+		t.Fatal("refresh unlock did not reach lazy barrier")
 	}
 	if !v.Unlocked(uid) {
-		t.Fatal("refresh must cache the DEK before the list barrier")
+		t.Fatal("refresh must cache the DEK before the lazy barrier")
 	}
-	v.Lock(uid)
-	// Model the manual handler's pre-acknowledgement after it evicts the key.
-	blocked.noticeMu.Lock()
-	blocked.marked = true
-	blocked.noticeMu.Unlock()
-	st.mu.Lock()
-	clearsBefore := len(st.clearNoticeCalls)
-	st.mu.Unlock()
+	lockDone := make(chan error, 1)
+	go func() { lockDone <- v.LockAndAcknowledge(ctx, uid) }()
+	select {
+	case err := <-lockDone:
+		t.Fatalf("Lock returned before lazy phase finished: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if !v.Unlocked(uid) {
+		t.Fatal("key evicted before lazy phase finished")
+	}
 	release()
 	err := <-done
 	joined = true
 	if err != nil {
 		t.Fatalf("refresh unlock: %v", err)
 	}
-	if v.Unlocked(uid) {
-		t.Error("older unlock must leave the manually locked vault locked")
+	if err := <-lockDone; err != nil {
+		t.Fatal(err)
 	}
-	st.mu.Lock()
-	clearsAfter := len(st.clearNoticeCalls)
-	st.mu.Unlock()
-	if clearsAfter != clearsBefore {
-		t.Errorf("older unlock cleared lock notice after manual lock: calls before=%d after=%d", clearsBefore, clearsAfter)
+	if v.Unlocked(uid) {
+		t.Error("manual lock must evict after unlock finishes")
 	}
 	blocked.noticeMu.Lock()
 	marked := blocked.marked
@@ -677,13 +628,13 @@ func TestUnlockFiresClearNotice(t *testing.T) {
 
 // TestUnlockClearNoticeErrorNonFatal: a ClearVaultLockNotice failure must NOT fail an
 // otherwise-valid unlock (PRD #890 M1) — the re-arm is best-effort and logged, mirroring
-// rewrapMasterSecrets. The vault ends unlocked despite the clear error.
+// lazy conversion. The vault ends unlocked despite the clear error.
 func TestUnlockClearNoticeErrorNonFatal(t *testing.T) {
 	v, _, st := newTestVaultWithStore(t)
 	st.clearNoticeErr = errors.New("db hiccup on clear")
 	uid := uuid.New()
 
-	if err := v.Unlock(context.Background(), uid, "clear-err-pw"); err != nil {
+	if err := v.Unlock(context.Background(), uid, "clear-error-password"); err != nil {
 		t.Fatalf("Unlock must succeed despite a clear-notice error, got %v", err)
 	}
 	if !v.Unlocked(uid) {
@@ -727,6 +678,7 @@ func startBlockedNoticeClear(t *testing.T, password string) (v *Vault, a, b uuid
 	}
 	slow = &slowNoticeVaultStore{fakeVaultStore: st, entered: make(chan struct{}), release: make(chan struct{})}
 	v.q = slow
+	v.transact = st.transaction(slow)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	t.Cleanup(cancel)
 	unlockDone = make(chan error, 1)
@@ -768,7 +720,7 @@ func TestSlowNoticeClearDoesNotDelayOtherUsersLock(t *testing.T) {
 func TestLockWaitsForSameUserNoticeClearThenEvicts(t *testing.T) {
 	v, a, _, slow, unlockDone := startBlockedNoticeClear(t, "same-user-notice-pw")
 	v.mu.RLock()
-	dek := v.cache[a]
+	dek := v.cache[a].dek
 	v.mu.RUnlock()
 	if len(dek) == 0 {
 		t.Fatal("fixture: user A's DEK is not cached")

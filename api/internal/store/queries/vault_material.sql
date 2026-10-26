@@ -5,6 +5,18 @@
 -- conversion commits or rolls back.
 -- Counts include disabled secrets and canonical accounts without aliases.
 
+-- name: HasMasterVaultMaterial :one
+-- Unlock's steady state need not load ciphertext when all slots already use DEK.
+SELECT EXISTS (
+    SELECT 1 FROM user_secrets s
+    WHERE s.user_id = @user_id AND s.sealed_with IN ('master', 'master_aad')
+    UNION ALL
+    SELECT 1 FROM codex_provider_account a
+    WHERE a.user_id = @user_id
+      AND (a.sealed_with IN ('master', 'master_aad')
+           OR a.recovery_sealed_with IN ('master', 'master_aad'))
+);
+
 -- name: GetVaultMaterialTotals :one
 WITH secrets AS (
     SELECT count(*)::bigint AS material_rows,

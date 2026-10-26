@@ -13,7 +13,6 @@ import (
 )
 
 const getVaultMaterialTotals = `-- name: GetVaultMaterialTotals :one
-
 WITH secrets AS (
     SELECT count(*)::bigint AS material_rows,
            coalesce(sum(octet_length(s.ciphertext)), 0)::bigint AS ciphertext_bytes,
@@ -39,17 +38,38 @@ type GetVaultMaterialTotalsRow struct {
 	MaxRowBytes     int64 `json:"max_row_bytes"`
 }
 
+func (q *Queries) GetVaultMaterialTotals(ctx context.Context, userID uuid.UUID) (GetVaultMaterialTotalsRow, error) {
+	row := q.db.QueryRow(ctx, getVaultMaterialTotals, userID)
+	var i GetVaultMaterialTotalsRow
+	err := row.Scan(&i.MaterialRows, &i.CiphertextBytes, &i.MaxRowBytes)
+	return i, err
+}
+
+const hasMasterVaultMaterial = `-- name: HasMasterVaultMaterial :one
+
+SELECT EXISTS (
+    SELECT 1 FROM user_secrets s
+    WHERE s.user_id = $1 AND s.sealed_with IN ('master', 'master_aad')
+    UNION ALL
+    SELECT 1 FROM codex_provider_account a
+    WHERE a.user_id = $1
+      AND (a.sealed_with IN ('master', 'master_aad')
+           OR a.recovery_sealed_with IN ('master', 'master_aad'))
+)
+`
+
 // These queries run after the owner users row is locked, behind the shared
 // secret-mutation advisory lock. The conversion protocol requires every credential
 // writer to take the same users-row fence before persistence. That exclusion
 // keeps preflight totals and bounded pages stable until the crypto-only
 // conversion commits or rolls back.
 // Counts include disabled secrets and canonical accounts without aliases.
-func (q *Queries) GetVaultMaterialTotals(ctx context.Context, userID uuid.UUID) (GetVaultMaterialTotalsRow, error) {
-	row := q.db.QueryRow(ctx, getVaultMaterialTotals, userID)
-	var i GetVaultMaterialTotalsRow
-	err := row.Scan(&i.MaterialRows, &i.CiphertextBytes, &i.MaxRowBytes)
-	return i, err
+// Unlock's steady state need not load ciphertext when all slots already use DEK.
+func (q *Queries) HasMasterVaultMaterial(ctx context.Context, userID uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, hasMasterVaultMaterial, userID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
 }
 
 const lockVaultAccountMaterialBatch = `-- name: LockVaultAccountMaterialBatch :many
