@@ -37,6 +37,13 @@ type FakeClient struct {
 	// the TUI's tier-1 vault-locked hint on/off. Whoami ignores it (it stays {user}-only).
 	VaultLocked bool
 
+	VaultUnlocked        bool
+	VaultStatusErr       error
+	VaultUnlockErr       error
+	VaultStatusCalls     int
+	VaultUnlockCalls     int
+	VaultUnlockPasswords []string
+
 	Runs                 []apitypes.RunListItemDTO
 	RunByID              map[string]apitypes.RunDTO
 	LogsByID             map[string][]apitypes.MessageDTO
