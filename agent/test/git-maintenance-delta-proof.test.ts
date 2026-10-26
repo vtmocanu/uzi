@@ -225,8 +225,9 @@ test("delta decoded C: compressible body exceeds remaining original C after nest
 
 test("delta cancellation: complete frames before clean child settlement seed no cache", linux, async t => {
   const f = await maintenanceDeltaFixture(t);
-  let enter!: () => void, release!: () => void;
+  let enter!: () => void, release!: () => void, decodedEnd!: () => void;
   const entered = new Promise<void>(resolve => { enter = resolve; }), held = new Promise<void>(resolve => { release = resolve; });
+  const decodedEOF = new Promise<void>(resolve => { decodedEnd = resolve; });
   t.after(release);
   let hold = false, settled = false, cache: { entries: number } | undefined;
   f.cache.beforePhase = async phase => {
@@ -235,17 +236,29 @@ test("delta cancellation: complete frames before clean child settlement seed no 
   f.hooks.beforeSpawn = async request => {
     if (f.cache.phase === "proof" && request.argv.includes("cat-file") && request.argv.includes("--batch")) hold = true;
   };
+  f.hooks.stdout = (request, stream) => {
+    if (f.cache.phase === "proof" && request.argv.includes("cat-file") && request.argv.includes("--batch")) {
+      stream.once("end", decodedEnd);
+    }
+    return stream;
+  };
   f.hooks.completed = async () => { if (hold) { enter(); await held; } };
   const outcome = f.run().then(value => ({ value }), error => ({ error })).finally(() => { settled = true; });
   try {
-    await Promise.race([entered, outcome.then(() => { throw new Error("missed decoded child settlement latch"); })]);
+    await Promise.race([Promise.all([decodedEOF, entered]), outcome.then(() => { throw new Error("missed decoded child settlement latch"); })]);
+    // Decoded EOF plus a consumer continuation turn lets verifyClosureFrames finish while child settlement stays held.
+    await new Promise<void>(resolve => setImmediate(resolve));
     assert.ok(cache);
     assert.equal(cache.entries, 0);
     f.controller.abort();
     await new Promise<void>(resolve => setImmediate(resolve));
     assert.equal(settled, false, "refusal joins the held actual child");
     assert.equal(cache.entries, 0, "no publication before clean settlement");
-  } finally { release(); }
+  } finally {
+    f.controller.abort();
+    release();
+    await outcome;
+  }
   const result = await outcome;
   assert.ok("error" in result && result.error instanceof Error);
   assert.equal(cache!.entries, 0);
