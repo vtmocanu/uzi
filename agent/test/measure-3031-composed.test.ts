@@ -85,7 +85,7 @@ type Dimension = MaintenanceResource;
 type Counters = Partial<Record<Dimension, number>>;
 type Limits = Record<string, number>;
 
-interface Violation { dimension: string; phase: string; used?: number; limit: number; refused?: boolean }
+interface Violation { dimension: string; phase: string; used?: number; limit?: number; refused?: boolean; unlimited?: boolean }
 interface EvaluationInput {
   limits: Limits;
   elapsedLimitMs: number;
@@ -126,7 +126,11 @@ function evaluate(input: EvaluationInput): Evaluation {
       const total = (cumulative.get(dimension) ?? 0) + used;
       cumulative.set(dimension, total);
       const limit = input.limits[dimension];
-      if (limit !== undefined && total > limit && !named.has(dimension)) {
+      // A charged dimension with no admitted limit is never skipped: it fails, naming itself.
+      if (limit === undefined && used > 0 && !named.has(dimension)) {
+        named.add(dimension);
+        violations.push({ dimension, phase: phase.name, used: total, unlimited: true });
+      } else if (limit !== undefined && total > limit && !named.has(dimension)) {
         named.add(dimension);
         violations.push({ dimension, phase: phase.name, used: total, limit });
       }
@@ -197,6 +201,8 @@ interface Spec {
   origin: "repo" | "tiny";
   /** Real exclusion and quiescence. Only controls run with real=false. */
   real: boolean;
+  /** CONTROL ONLY: lowers limits at evaluation time, from the phases the run actually charged. */
+  controlLimits?: (limits: Limits, phases: ReadonlyArray<{ name: string; used: Counters }>) => Limits;
 }
 
 function looseCount(clone: string): number {
@@ -332,12 +338,17 @@ function realPrerequisites(): { dockerHost: string } | { unrun: string } {
 
 // Owner ruling (recov2 co-sign): a two-member family may be reached only through the real blocked/inherited
 // path, with no injected member. At bed7dd94 it cannot be reached at all, so the variant is UNRUN.
-const FAMILY_UNREACHABLE = "a two-member source family is unreachable through production code: the family input list is " +
+const FAMILY_UNREACHABLE = "admission not reached for a two-member family: it is unreachable through production code: the family input list is " +
   "[genesis] on the normal-failed path and the inherited originals on the blocked path (runner.ts closedSourceObservation, " +
   "`const originals = blocked ? flight.sourceInherited?.family?.originals : [genesis]`), and the inherited originals come " +
   "from an earlier observation built the same way, so every real family has one member; a sibling ledger entry for the run " +
   "makes the real scan refuse (git.ts matchMaintenanceSourceFamily `incomplete known family`). Reaching two members needs an " +
   "injected member or a production change; the measurement does neither (#3440 owns multi-source families)";
+
+// The exact refusals of GitCache.assertOwedBare (git.ts), the precondition of the guarded archive call: a
+// fixture bare that cannot satisfy it is UNRUN with the reason, not a counter FAIL.
+const OWED_BARE_REFUSALS: ReadonlySet<string> = new Set(["owed candidates require a known worker bare path",
+  "unsafe worker bare directory", "owed candidates require a bare repository"]);
 
 interface RunResult { record: Record<string, unknown>; evaluation: Evaluation }
 
@@ -466,10 +477,10 @@ async function runPipeline(t: TestContext, spec: Spec): Promise<RunResult> {
   // ---- the archive phase is the only production bundle call allowed; any other is refused
   let archive: Record<string, unknown> | undefined, archiveWindow = false, archiveError: unknown, archiveEnded: number | undefined;
   const produce = git.produceRecoveryBundle.bind(git);
-  const stray: Array<{ phase: string; inSlot: boolean }> = [];
+  const stray: Array<{ phase: string; inSlot: boolean; afterAdmission: boolean }> = [];
   t.mock.method(git, "produceRecoveryBundle", async (...args: Parameters<typeof produce>) => {
     if (archiveWindow) return produce(...args);
-    stray.push({ phase, inSlot: MaintenanceResources.active() && !MaintenanceResources.discoveryActive() });
+    stray.push({ phase, inSlot: MaintenanceResources.active() && !MaintenanceResources.discoveryActive(), afterAdmission: slotStarted !== undefined });
     throw new Error("fixture bundle production unavailable outside the measured archive phase");
   });
 
@@ -622,13 +633,15 @@ async function runPipeline(t: TestContext, spec: Spec): Promise<RunResult> {
 
   // ---- assemble the verdict from what was actually observed
   const body: Record<string, unknown> = { fixtures, w0_invocations: w0Invocations, transfer_entered: transferEntered,
-    bundle_attempts_outside_the_slot_refused: stray.filter(s => !s.inSlot).length };
+    bundle_attempts_refused_before_admission: stray.filter(s => !s.afterAdmission).length,
+    bundle_attempts_refused_after_admission: stray.filter(s => s.afterAdmission).length };
   if (limitsError !== undefined || admittedCap === undefined) {
     body.admission = { error: limitsError ?? "no slot was admitted", refusals };
     const reason = refusals.length > 0 ? `admission refused before the charged slot: ${refusals.join(",")}` : `no charged slot: ${limitsError ?? "admission not reached"}`;
     return unrun(reason, body);
   }
   const phases = PHASES.map(name => ({ name, used: used[name]! }));
+  if (spec.controlLimits) limits = spec.controlLimits(limits, phases);
   const slotElapsed = Math.round((slotEnded - (slotStarted ?? started)));
   const failure = (importerError ?? archiveError) as unknown;
   let incomplete: string | undefined, refusal: { phase: string; reason: string } | undefined;
@@ -640,9 +653,9 @@ async function runPipeline(t: TestContext, spec: Spec): Promise<RunResult> {
   }
   if (w0Invocations === 0 && !refusal) incomplete = "the admission never reached the W0 capture";
   else if (!archive && !refusal) incomplete = "the pipeline ended without an archive outcome";
-  const strayInSlot = stray.filter(s => s.inSlot);
-  if (strayInSlot.length > 0) incomplete = `a production bundle call inside the charged slot but outside the archive phase was refused (phase ${strayInSlot.map(s => s.phase).join(",")})`;
-  const archiveNotApplicable = archiveError instanceof Error && /assertOwedBare|owed bare|not a recovery bare/i.test(archiveError.message);
+  const strayInSlot = stray.filter(s => s.afterAdmission);
+  if (strayInSlot.length > 0) incomplete = `a production bundle call after slot admission but outside the archive window was refused (phase ${strayInSlot.map(s => s.phase).join(",")})`;
+  const archiveNotApplicable = archiveError instanceof Error && OWED_BARE_REFUSALS.has(archiveError.message);
   const envelopeOverruns: Violation[] = [];
   for (const proof of proofs.filter(p => p.in_slot)) for (const dimension of ["metadataBytes", "adminEntries"] as const) {
     const limit = proof.envelope?.[dimension];
@@ -658,12 +671,17 @@ async function runPipeline(t: TestContext, spec: Spec): Promise<RunResult> {
     : evaluate({ limits, elapsedLimitMs: slotMs, elapsedMs: slotElapsed, phases, refusedCharge, capRefusals, envelopeOverruns, refusal, incomplete, deviation: env.deviation });
   const record = emit({
     ...head, ...body,
-    candidate_sha: source?.head, source_commits: source?.commits,
-    substitutions: ["guard-method: RecoveryCoordinator.terminalOriginAdmissionEnabled", "faked-server: strict WorkerClient over a faked worker API",
+    candidate_sha: source?.head, source_commits: source?.commits, run_id: claim.run_id,
+    substitutions: ["guard-method: RecoveryCoordinator.terminalOriginAdmissionEnabled",
+      "faked-server: strict WorkerClient over a faked worker API, with client.hasFeature and client.listRecoveryHolds answered directly by the harness",
+      "isIdle: () => true passed to the real MaintenanceWriterExclusion (no Worker object exists in the harness)",
+      "produceRecoveryBundle: calls outside the archive window are refused and counted (the runner's ordinary pre-slot flows); a refused call after slot admission makes the run non-eligible",
+      ...(spec.controlLimits ? ["CONTROL ONLY: limits lowered at evaluation time"] : []),
       ...(spec.real ? [] : ["CONTROL ONLY: passingExclusion", "CONTROL ONLY: stubbed quiescence verdict", "CONTROL ONLY: trusted-ancestor DAC projection"])],
-    harness_facts: ["isIdle is true by construction (no Worker object in the harness)",
-      `layout via production selfContained path: ${spec.layout === "dissociated" ? "real GitCache.materializeRunnerClone" : "clone --shared, alternates retained"}`],
-    eligible_for_gate: spec.real && spec.origin === "repo",
+    layout_construction: spec.layout === "dissociated" ? "real GitCache.materializeRunnerClone" : "clone --shared, alternates retained",
+    uid_mode: process.env.UZI_UID_SPLIT === "1" ? "split-UID requested (not covered by this harness)" : "single-UID (UZI_UID_SPLIT unset); split-UID is not covered",
+    archive_phase_note: "harness-placed archive phase (no production caller yet)",
+    eligible_for_gate: spec.real && spec.origin === "repo" && !stray.some(s => s.afterAdmission),
     deviation: env.deviation ?? null, elapsed_fidelity: evaluation.elapsed_fidelity,
     elapsed_ms: slotElapsed, elapsed_to_archive_end_ms: archiveEnded !== undefined && slotStarted !== undefined ? Math.round(archiveEnded - slotStarted) : null,
     pipeline_elapsed_ms: Math.round(performance.now() - started),
@@ -741,6 +759,9 @@ describe("#3031 composed measurement verdict controls", () => {
     const refused = evaluate({ ...base, phases: [phase("walk", { sources: 10 })], refusedCharge: { resource: "sources", amount: 1, used: 10, phase: "proof" } });
     assert.equal(refused.verdict, "FAIL");
     assert.deepEqual(refused.violations.map(v => [v.dimension, v.phase, v.refused]), [["sources", "proof", true]]);
+    const unlimited = evaluate({ ...base, limits: { sourceEntries: 100 }, phases: [phase("walk", { sourceEntries: 1, mystery: 5 } as Counters)] });
+    assert.equal(unlimited.verdict, "FAIL");
+    assert.deepEqual(unlimited.violations.map(v => [v.dimension, v.phase, v.unlimited]), [["mystery", "walk", true]]);
     const slow = evaluate({ ...base, elapsedMs: SLOT_ELAPSED_LIMIT_MS + 1, phases: [] });
     assert.deepEqual(slow.violations.map(v => v.dimension), ["elapsedMs"]);
   });
@@ -779,7 +800,6 @@ describe("#3031 composed measurement verdict controls", () => {
       assert.equal(evaluation.verdict, "UNRUN");
       assert.equal(evaluation.reason, precondition.reason);
     }
-    assert.equal(sourcePrecondition(REPO_ROOT).ok === true || true, true, "the repository checkout is not required by a control");
   });
 
   it("control: the two-source family variant is UNRUN with the reachability reason and is never eligible for the gate", async t => {
@@ -802,6 +822,15 @@ describe("#3031 composed measurement verdict controls", () => {
     assert.equal(decoded.limit, 1);
   });
 
+  it("control 9 (pipeline): a limit that only the archive phase crosses fails naming that dimension and the archive phase", { skip: LINUX_ONLY, timeout: 120_000 }, async t => {
+    const before = (l: Limits, phases: ReadonlyArray<{ name: string; used: Counters }>) => ({ ...l,
+      artifactBytes: phases.filter(p => PHASES.indexOf(p.name as Phase) < PHASES.indexOf("archive")).reduce((n, p) => n + (p.used.artifactBytes ?? 0), 0) });
+    const { evaluation, record } = await runPipeline(t, { ...small("control-archive-cap"), controlLimits: (l, ph) => ({ ...before(l, ph), artifactBytes: before(l, ph).artifactBytes + 1 }) });
+    assert.ok((record.phases as Record<string, Counters>).archive?.artifactBytes, "the archive phase charged artifactBytes");
+    assert.equal(evaluation.verdict, "FAIL", JSON.stringify(record));
+    assert.deepEqual(evaluation.violations.map(v => [v.dimension, v.phase]), [["artifactBytes", "archive"]]);
+  });
+
   it("control 10 (pipeline): with a lowered configured C the decoded limit follows the admission", { skip: LINUX_ONLY, timeout: 120_000 }, async t => {
     const cap = 123 * 1024 ** 2;
     const { record, evaluation } = await runPipeline(t, small("control-admission-limit", cap));
@@ -810,6 +839,11 @@ describe("#3031 composed measurement verdict controls", () => {
     // Within every limit and complete; PASS, or the deviation label when UZI_MEASURE_DEVIATION is set.
     assert.ok(within(evaluation.verdict) && evaluation.violations.length === 0 && !evaluation.refusal, JSON.stringify(record));
     assert.notEqual((record.archive as { kind: string }).kind, "none", "the control pipeline reached the archive phase");
+    // B3: the whole MEASURE limits object equals the slot reservation persisted by the ledger, read here
+    // independently of the harness; no dimension may carry a handwritten limit.
+    const table = JSON.parse(await fs.readFile(path.join(path.dirname(git.recoveryRoot), "recovery-maintenance", "complete.json"), "utf8")).value;
+    const cycle = table.cycles.find((c: { identity: { run: string } }) => c.identity.run === record.run_id);
+    assert.deepEqual(record.limits, cycle.slots[cycle.slots.length - 1].reserved);
     assert.ok(Object.keys(record.limits as Limits).includes("rpcAttempts"), "every key of the slot quota is a checked dimension");
   });
 });

@@ -587,9 +587,16 @@ W0-H capture, `importMaintenanceTip` (walk, selection, pack, proof, import), the
 archive phase (`produceRecoveryBundle`, self-contained first, guarded thin fallback only
 on `RecoveryBundleTooLargeError`). The writer-exclusion proof and the quiescence scans are
 the real ones (three exclusion passes and the family proofs are charged inside the slot).
-Only two substitutions are allowed, and every MEASURE line prints them: the guard method
-and a faked server behind the real strict client. Every limit is read from the admitted
-slot reservation in the ledger, never from a table, and `decoded` follows the configured C.
+The harness interventions are these, and every MEASURE line prints all of them: the guard
+method; a faked server behind the real strict client (the harness answers `hasFeature` and
+`listRecoveryHolds` directly); `isIdle: () => true` passed to the real writer exclusion (no
+Worker object exists here); and a refusal of every `produceRecoveryBundle` call outside the
+archive window, which stops the runner's ordinary pre-slot flows from writing a producer
+record (without it admission is refused as `source_protected_or_ambiguous`, measured). A
+refused bundle call after slot admission makes the run non-eligible. The archive phase is
+harness-placed: it has no production caller yet. Every limit is read from the admitted slot
+reservation in the ledger, never from a table, and `decoded` follows the configured C. A
+charged dimension with no admitted limit fails.
 
 Run it as the container's main process on Linux, on the worker image's Git and Node,
 from a full (non-shallow, at least 1,000 commits) checkout of this repository:
@@ -608,7 +615,10 @@ UZI_MEASURE_3031=1 UZI_MEASURE_DOCKER_HOST=tcp://<dind>:2375 \
   that bind the fixture clone paths, and the `/proc` scan may SIGKILL in-scope processes.
   Unset, the run reports UNRUN.
 - `TMPDIR` must be a case-sensitive, container-internal directory whose ancestors are not
-  group-writable, world-writable or sticky (as `/data` is). Otherwise UNRUN with the reason.
+  group-writable, world-writable or sticky. Otherwise UNRUN with the reason. This rule rejects
+  the real Kubernetes `/data` layout (mode 2775), so the measurement runs on a scratch
+  directory, not on `/data`. It is single-UID (`UZI_UID_SPLIT` unset); split-UID is not
+  covered, and each MEASURE line records the mode.
 - The measurement must be the only test process: the exclusive-idle scan refuses any other
   writer. Run it as PID 1 of the container, not through a long-lived `docker exec` shell.
 - `UZI_MEASURE_DEVIATION` states any difference from the worker image's environment. It
