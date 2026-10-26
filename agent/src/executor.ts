@@ -6,6 +6,7 @@ import { watch } from "node:fs";
 import path from "node:path";
 import type { Logger } from "./log.js";
 import type { CapturedMemoryContext } from "./codex/broker.js";
+import type { ExecutorSealResult, ExecutorTerminalSeal } from "./codex/executor-lifetime.js";
 import type { UsageSink } from "./usage-recorder.js";
 import type { RunCacheDropResult } from "./run-caches.js";
 import type { BoundarySink, CodexExecutionSafety, CredentialFreeCaptureContext, HarnessError } from "./harness.js";
@@ -938,6 +939,18 @@ export interface Executor {
   run(ctx: RunContext): Promise<ExecutorResult>;
   /** Close summary admission synchronously, then abort/join within the remaining sink deadline. */
   closeAndSettlePlanSummary?(deadlineMs?: number): Promise<void>;
+  /**
+   * #3404 M1b: irreversibly close this executor's lifetime and, only when every owned producer,
+   * observer and cleanup tail has settled with unchanged successful disposal facts, return an opaque
+   * seal bound to `sourceUse` (an opaque caller-owned identity, e.g. the source-use lease). Failure
+   * is `{ kind: "unproven" }`, permanently closed, and never changes a completed run. Only the Codex
+   * executor implements it; absent means the executor has no closed lifetime to prove. Dormant until
+   * the runner consumes it: call it only after every executor-dependent terminal sink, never under a
+   * safety, journal or bare lock.
+   */
+  sealLifetime?(sourceUse: object): Promise<ExecutorSealResult>;
+  /** True only for the exact, still-current seal this executor issued for `sourceUse`. */
+  acceptsLifetimeSeal?(seal: unknown, sourceUse: object): seal is ExecutorTerminalSeal;
   /**
    * Group-kill every subprocess the agent spawned for the last run. The runner
    * calls this BEFORE any PAT-bearing git op (push) so an agent-backgrounded

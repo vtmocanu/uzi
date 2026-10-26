@@ -17,6 +17,7 @@
 
 import { assertClosedReaperRequest } from "../closed-reaper.js";
 import { MaintenanceBudget } from "../maintenance-budget.js";
+import type { ExecutorLifetime } from "./executor-lifetime.js";
 import type { BoundaryProcessRequest, ChildQuiescence, HarnessError, ProcessReap, ToolDisposal } from "../harness.js";
 
 /** Issue #1864: a caught error's class name, as it may appear in a harness error message. That
@@ -259,9 +260,25 @@ export class ExecutionRegistry {
   // safety facade, so at most ONE quiesce is ever in flight, hence a single waiter.
   private quiesceWaiter?: () => void;
 
-  constructor(epoch: LocalExecutionEpoch) {
+  constructor(epoch: LocalExecutionEpoch, private readonly lifetime?: ExecutorLifetime) {
     this.epochValue = epoch;
+    lifetime?.inventory(this, () => this.terminalDisposal !== undefined &&
+      this.acceptsTerminalDisposal(this.terminalDisposal.outcome));
   }
+
+  assertWorkAdmission(): void { this.lifetime?.assertOpen(); }
+
+  workAdmissionOpen(): boolean { return this.lifetime?.isOpen() ?? true; }
+
+  admitWork<T>(action: () => Promise<T>): Promise<T> {
+    return this.lifetime ? this.lifetime.admit(action) : action();
+  }
+
+  retainCleanup<T>(work: Promise<T>): Promise<T> {
+    return this.lifetime?.retain(work) ?? work;
+  }
+
+  bindFacade(facade: object, check: () => boolean): void { this.lifetime?.bindFacade(this, facade, check); }
 
   // --- getters (for the safety facade and tests) ------------------------------
 
@@ -442,6 +459,7 @@ export class ExecutionRegistry {
   // --- launch reservations ----------------------------------------------------
 
   reserveLaunch(kind: RootKind, reaperRequest?: BoundaryProcessRequest): LaunchReservationResult {
+    if (!this.workAdmissionOpen()) return { kind: "denied", reason: "admission_closed" };
     if (this.tablesCleared) {
       this.poison({ category: "protocol", message: "reserveLaunch: registry disposal entered" });
       return { kind: "denied", reason: "admission_closed" };
@@ -516,6 +534,7 @@ export class ExecutionRegistry {
   // --- callback reservations (idempotency bookkeeping only) -------------------
 
   reserveCallback(request: CallbackReservationRequest): CallbackReservationResult {
+    if (!this.workAdmissionOpen()) return { kind: "denied", reason: "admission_closed" };
     if (this.tablesCleared) {
       this.poison({ category: "protocol", message: "reserveCallback: registry disposal entered" });
       return { kind: "denied", reason: "admission_closed" };
@@ -955,6 +974,7 @@ export class ExecutionRegistry {
       this.terminalDisposal = { outcome, revision, roots, launches, callbacks };
       return outcome;
     });
+    this.retainCleanup(this.disposalPromise);
     return this.disposalPromise;
   }
 
