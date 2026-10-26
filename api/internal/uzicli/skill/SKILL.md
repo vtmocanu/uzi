@@ -400,8 +400,11 @@ uzi version
   because the forge was unreachable at clone — cause `forge_unreachable`, capped by
   `RUN_FORGE_UNREACHABLE_MAX_PARKS`; the sweep retries it on a capped backoff; cause
   `codex_account_unavailable` is held on its Codex account until that account is usable
-  again; cause `vault_locked` means a Codex credential refresh or release found the run
-  owner's vault locked: an explicit vault unlock queues existing parks promptly;
+  again: **reconciling** means automatic recovery is pending; unlock the vault or
+  enable the credential if needed, and follow a re-login request on the same
+  credential if recovery cannot finish. A verified replacement can restore the
+  account while recovery is still pending. Cause `vault_locked` means a Codex
+  credential refresh or release found the run owner's vault locked: an explicit vault unlock queues existing parks promptly;
   `recovery_retry_not_before` remains the fallback and a worker still claims the run), and `paused`
   (an ordinary owner-requested pause via `uzi run pause` or `/park`, or a
   lead-requested pause via `park_run`, resumed on demand with `uzi run resume <id>`;

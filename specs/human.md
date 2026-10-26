@@ -1220,7 +1220,7 @@ Tracked as GitHub issue vtmocanu/uzi#1484; PRD at `prds/done/1484-admin-health-t
 
 Tracked as GitHub issue vtmocanu/uzi#1594.
 
-- A Codex login the provider rejects (an allowlisted refresh-token rejection code, on a 400/401) surfaces to its owner as re-login required with the reason that the provider rejected it; any other refresh failure stays ambiguous and never releases or re-spends a token. (AI-synced 2026-09-24)
+- A Codex login the provider rejects (an allowlisted refresh-token rejection code, on a 400/401) surfaces to its owner as re-login required with the reason that the provider rejected it; other refresh failures stay ambiguous and release no token. One exception permits a single survivor retry of the original token after a durable receipt of an original non-rejection provider error, with an enabled linked alias, unlocked vault and openable login, admitted within 30 minutes of intent creation. Recovered material requires identity-verified promotion before release; explicit rejection (even if quarantine persistence fails) and a crash without a receipt never authorize reuse. See [ADR-3523](../adr/3523-codex-refresh-provider-error-reuse.md). (AI-synced 2026-10-26)
 - The documented way to add a Codex login is a login dedicated to uzi, isolated from the owner's everyday Codex CLI; a re-paste after a failure comes from a new isolated login. (AI-synced 2026-09-24)
 
 ## Issue #1593 — A prose-only plan turn parks for the owner instead of failing

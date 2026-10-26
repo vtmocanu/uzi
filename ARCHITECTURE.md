@@ -464,6 +464,17 @@ durable design decisions and
 [docs/rate-limits.md](docs/rate-limits.md#codex-account-limits) for
 user-facing behavior.
 
+A separate survivor path can retry an original non-rejection refresh error once
+when its durable receipt authorizes reuse. Admission consumes the retry under
+user secret mutation/account/intent locks with a fresh database clock and an
+enabled linked alias; local vault/login failures defer without consumption.
+Recovered material stays quarantined until identity-verified promotion. The
+survivor and account-action display share a 52.14-second in-flight policy bound;
+owner restore advances the generation and fences stale installs. Mixed API
+versions are unsupported for receipt-aware resolution/display. See
+[ADR-3523](adr/3523-codex-refresh-provider-error-reuse.md) for the fixed 30-minute
+eligibility window, terminal fences, provider-overlap risk and evidence limits.
+
 ## Agent runtime: workers, runs, live view
 
 uzi's third surface is the one that acts: a per-user worker container claims
