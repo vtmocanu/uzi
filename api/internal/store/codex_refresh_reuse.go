@@ -38,8 +38,23 @@ func AdmitCodexRefreshReuse(ctx context.Context, b CodexRejectionTxBeginner, arg
 		}
 		return false, err
 	}
+	// Match the rejection/resolution account-before-intent order. The clock must
+	// follow every potentially blocking lock, including this final row lock.
+	if _, err := q.LockRotatingCodexRefreshIntent(ctx, LockRotatingCodexRefreshIntentParams{
+		Op: arg.OperationID, UserID: arg.UserID, ProviderAccountID: arg.AccountID, FromGeneration: arg.FromGeneration,
+	}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	admittedAt, err := q.LeaseClockNow(ctx)
+	if err != nil || !admittedAt.Valid {
+		return false, err
+	}
 	n, err := q.ConsumeCodexRefreshReuse(ctx, ConsumeCodexRefreshReuseParams{
 		UserID: arg.UserID, AccountID: arg.AccountID, OperationID: arg.OperationID, FromGeneration: arg.FromGeneration,
+		AdmittedAt: admittedAt,
 	})
 	if err != nil || n != 1 {
 		return false, err

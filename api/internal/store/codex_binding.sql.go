@@ -249,11 +249,12 @@ func (q *Queries) CommitCodexRefresh(ctx context.Context, arg CommitCodexRefresh
 
 const consumeCodexRefreshReuse = `-- name: ConsumeCodexRefreshReuse :execrows
 UPDATE codex_refresh_intent i
-SET reuse_attempted_at = now(), updated_at = now()
-WHERE i.operation_id = $1 AND i.user_id = $2
-  AND i.provider_account_id = $3 AND i.from_generation = $4::bigint
+SET reuse_attempted_at = $1::timestamptz,
+    updated_at = $1::timestamptz
+WHERE i.operation_id = $2 AND i.user_id = $3
+  AND i.provider_account_id = $4 AND i.from_generation = $5::bigint
   AND i.state = 'rotating' AND i.provider_error_at IS NOT NULL
-  AND i.reuse_attempted_at IS NULL AND i.created_at > now() - interval '30 minutes'
+  AND i.reuse_attempted_at IS NULL AND i.created_at > $1::timestamptz - interval '30 minutes'
   AND EXISTS (
       SELECT 1 FROM codex_provider_account a
       WHERE a.id = i.provider_account_id AND a.user_id = i.user_id
@@ -270,16 +271,19 @@ WHERE i.operation_id = $1 AND i.user_id = $2
 `
 
 type ConsumeCodexRefreshReuseParams struct {
-	OperationID    uuid.UUID `json:"operation_id"`
-	UserID         uuid.UUID `json:"user_id"`
-	AccountID      uuid.UUID `json:"account_id"`
-	FromGeneration int64     `json:"from_generation"`
+	AdmittedAt     pgtype.Timestamptz `json:"admitted_at"`
+	OperationID    uuid.UUID          `json:"operation_id"`
+	UserID         uuid.UUID          `json:"user_id"`
+	AccountID      uuid.UUID          `json:"account_id"`
+	FromGeneration int64              `json:"from_generation"`
 }
 
-// Account and user mutation locks are held by AdmitCodexRefreshReuse. Recheck every
-// durable prerequisite in the single consumption statement using the database clock.
+// User mutation, account and intent locks are held by AdmitCodexRefreshReuse.
+// admitted_at is LeaseClockNow's fresh DB instant sampled AFTER all those locks,
+// not transaction-start now(): lock waits must not extend eligibility or backdate reuse.
 func (q *Queries) ConsumeCodexRefreshReuse(ctx context.Context, arg ConsumeCodexRefreshReuseParams) (int64, error) {
 	result, err := q.db.Exec(ctx, consumeCodexRefreshReuse,
+		arg.AdmittedAt,
 		arg.OperationID,
 		arg.UserID,
 		arg.AccountID,
@@ -1112,9 +1116,9 @@ type LockRotatingCodexRefreshIntentParams struct {
 	FromGeneration    int64     `json:"from_generation"`
 }
 
-// Step 2 of the provider-rejection primitive (issue #1594): row-lock the rejecting operation's
-// intent, ONLY IF it is still 'rotating' from the same generation on the same account. Taken
-// AFTER LockCodexAccountForRejection (account row first, then the intent). pgx.ErrNoRows means the
+// Step 2 of provider rejection and the final row lock for refresh-reuse admission:
+// lock the operation's intent ONLY IF it is still 'rotating' from the same generation
+// on the same account. Taken AFTER the account lock in both paths. pgx.ErrNoRows means the
 // intent already moved (committed/reconciled/unrecoverable) and the caller applies nothing.
 // Owner-scoped.
 func (q *Queries) LockRotatingCodexRefreshIntent(ctx context.Context, arg LockRotatingCodexRefreshIntentParams) (uuid.UUID, error) {

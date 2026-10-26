@@ -166,6 +166,95 @@ func TestCodexRefreshReuseResolutionFenceLiveDB(t *testing.T) {
 	}
 }
 
+type clockStartReuseBeginner struct {
+	store.CodexRejectionTxBeginner
+	started chan time.Time
+}
+
+func (b clockStartReuseBeginner) Begin(ctx context.Context) (pgx.Tx, error) {
+	tx, err := b.CodexRejectionTxBeginner.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var started time.Time
+	if err := tx.QueryRow(ctx, "SELECT now()").Scan(&started); err != nil {
+		_ = tx.Rollback(ctx)
+		return nil, err
+	}
+	b.started <- started
+	return tx, nil
+}
+
+// No sleeps: hold the user lock, observe admission's transaction-start instant,
+// then release at a later DB instant. The expiry fixture straddles those instants.
+func TestCodexRefreshReuseFreshAdmissionClockLiveDB(t *testing.T) {
+	for _, kind := range []string{"deadline_crossed", "stamp_after_wait"} {
+		t.Run(kind, func(t *testing.T) {
+			ctx, q, f, _, b := reuseFixture(t)
+			ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			owner, err := b.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = owner.Rollback(ctx) }()
+			if err := store.LockSecretMutation(ctx, owner, f.user); err != nil {
+				t.Fatal(err)
+			}
+			started := make(chan time.Time, 1)
+			results := make(chan struct {
+				ok  bool
+				err error
+			}, 1)
+			go func() {
+				ok, err := store.AdmitCodexRefreshReuse(ctx, clockStartReuseBeginner{b, started}, reuseArg(f))
+				results <- struct {
+					ok  bool
+					err error
+				}{ok, err}
+			}()
+			var transactionStart time.Time
+			select {
+			case transactionStart = <-started:
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			if kind == "deadline_crossed" {
+				created := transactionStart.Add(-30 * time.Minute).Add(time.Microsecond)
+				if _, err := owner.Exec(ctx, "UPDATE codex_refresh_intent SET created_at=$2 WHERE operation_id=$1", f.op, created); err != nil {
+					t.Fatal(err)
+				}
+			}
+			releasedAt, err := store.New(owner).LeaseClockNow(ctx)
+			if err != nil || !releasedAt.Valid || !releasedAt.Time.After(transactionStart.Add(time.Microsecond)) {
+				t.Fatalf("database clock did not advance across barrier: %v,%v", releasedAt, err)
+			}
+			if err := owner.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case result := <-results:
+				if result.err != nil || result.ok != (kind == "stamp_after_wait") {
+					t.Fatalf("admission after wait=%v,%v", result.ok, result.err)
+				}
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			it, err := q.GetCodexRefreshIntent(ctx, store.GetCodexRefreshIntentParams{UserID: f.user, OperationID: f.op})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if kind == "deadline_crossed" {
+				if it.ReuseAttemptedAt.Valid {
+					t.Fatal("expired retry consumed after lock wait")
+				}
+			} else if !it.ReuseAttemptedAt.Valid || it.ReuseAttemptedAt.Time.Before(releasedAt.Time) {
+				t.Fatal("lock wait backdated reuse and spent its in-flight budget")
+			}
+		})
+	}
+}
+
 // A verdict computed before the recovery write must not declare known surviving
 // material lost, even after the retry's pending-write policy bound has expired.
 func TestCodexRefreshReuseLateRecoveryFenceLiveDB(t *testing.T) {

@@ -690,9 +690,9 @@ WHERE id = @id AND user_id = @user_id
 FOR UPDATE;
 
 -- name: LockRotatingCodexRefreshIntent :one
--- Step 2 of the provider-rejection primitive (issue #1594): row-lock the rejecting operation's
--- intent, ONLY IF it is still 'rotating' from the same generation on the same account. Taken
--- AFTER LockCodexAccountForRejection (account row first, then the intent). pgx.ErrNoRows means the
+-- Step 2 of provider rejection and the final row lock for refresh-reuse admission:
+-- lock the operation's intent ONLY IF it is still 'rotating' from the same generation
+-- on the same account. Taken AFTER the account lock in both paths. pgx.ErrNoRows means the
 -- intent already moved (committed/reconciled/unrecoverable) and the caller applies nothing.
 -- Owner-scoped.
 SELECT operation_id FROM codex_refresh_intent
@@ -856,14 +856,16 @@ WHERE id = @account_id AND user_id = @user_id
 FOR UPDATE;
 
 -- name: ConsumeCodexRefreshReuse :execrows
--- Account and user mutation locks are held by AdmitCodexRefreshReuse. Recheck every
--- durable prerequisite in the single consumption statement using the database clock.
+-- User mutation, account and intent locks are held by AdmitCodexRefreshReuse.
+-- admitted_at is LeaseClockNow's fresh DB instant sampled AFTER all those locks,
+-- not transaction-start now(): lock waits must not extend eligibility or backdate reuse.
 UPDATE codex_refresh_intent i
-SET reuse_attempted_at = now(), updated_at = now()
+SET reuse_attempted_at = sqlc.arg('admitted_at')::timestamptz,
+    updated_at = sqlc.arg('admitted_at')::timestamptz
 WHERE i.operation_id = @operation_id AND i.user_id = @user_id
   AND i.provider_account_id = @account_id AND i.from_generation = @from_generation::bigint
   AND i.state = 'rotating' AND i.provider_error_at IS NOT NULL
-  AND i.reuse_attempted_at IS NULL AND i.created_at > now() - interval '30 minutes'
+  AND i.reuse_attempted_at IS NULL AND i.created_at > sqlc.arg('admitted_at')::timestamptz - interval '30 minutes'
   AND EXISTS (
       SELECT 1 FROM codex_provider_account a
       WHERE a.id = i.provider_account_id AND a.user_id = i.user_id
