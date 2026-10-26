@@ -224,7 +224,7 @@ test("delta decoded C: compressible body exceeds remaining original C after nest
 });
 
 test("delta cancellation: complete frames before clean child settlement seed no cache", linux, async t => {
-  const f = await maintenanceDeltaFixture(t);
+  const f = await maintenanceDeltaFixture(t), refs = await f.refs();
   let enter!: () => void, release!: () => void, decodedEnd!: () => void;
   const entered = new Promise<void>(resolve => { enter = resolve; }), held = new Promise<void>(resolve => { release = resolve; });
   const decodedEOF = new Promise<void>(resolve => { decodedEnd = resolve; });
@@ -234,25 +234,35 @@ test("delta cancellation: complete frames before clean child settlement seed no 
     if (phase === "proof") cache = (f.cache as any).recoveryOperations.getStore().closureCache;
   };
   f.hooks.beforeSpawn = async request => {
-    if (f.cache.phase === "proof" && request.argv.includes("cat-file") && request.argv.includes("--batch")) hold = true;
-  };
-  f.hooks.stdout = (request, stream) => {
     if (f.cache.phase === "proof" && request.argv.includes("cat-file") && request.argv.includes("--batch")) {
-      stream.once("end", decodedEnd);
+      hold = true;
+      f.hooks.holdStderr = true;
     }
-    return stream;
   };
-  f.hooks.completed = async () => { if (hold) { enter(); await held; } };
+  f.hooks.stderrDestroy = (error, callback) => { void held.then(() => callback(error)); };
+  f.hooks.completed = async () => { if (hold) enter(); };
+  const spawn = f.cache["spawnGit"].bind(f.cache);
+  t.mock.method(f.cache as any, "spawnGit", async (...args: Parameters<typeof spawn>) => {
+    const child = await spawn(...args);
+    if (f.cache.phase === "proof" && args[1].includes("cat-file") && args[1].includes("--batch")) {
+      child.stdout.once("end", decodedEnd);
+    }
+    return child;
+  });
   const outcome = f.run().then(value => ({ value }), error => ({ error })).finally(() => { settled = true; });
   try {
     await Promise.race([Promise.all([decodedEOF, entered]), outcome.then(() => { throw new Error("missed decoded child settlement latch"); })]);
-    // Decoded EOF plus a consumer continuation turn lets verifyClosureFrames finish while child settlement stays held.
+    // spawnGit gated stdout EOF permits verifyClosureFrames to finish; raw stderr still holds child.exited.
     await new Promise<void>(resolve => setImmediate(resolve));
     assert.ok(cache);
     assert.equal(cache.entries, 0);
+    assert.equal(f.hooks.stderr!.destroyed, false, "raw stderr remains open before cancellation");
+    assert.equal(f.hooks.stderr!.closed, false);
     f.controller.abort();
     await new Promise<void>(resolve => setImmediate(resolve));
     assert.equal(settled, false, "refusal joins the held actual child");
+    assert.equal(f.hooks.stderr!.destroyed, true, "cancellation requests raw stderr disposal");
+    assert.equal(f.hooks.stderr!.closed, false, "raw asynchronous stderr disposal remains held");
     assert.equal(cache.entries, 0, "no publication before clean settlement");
   } finally {
     f.controller.abort();
@@ -261,6 +271,8 @@ test("delta cancellation: complete frames before clean child settlement seed no 
   }
   const result = await outcome;
   assert.ok("error" in result && result.error instanceof Error);
+  assert.equal(f.hooks.stderr!.closed, true);
+  assert.equal(await f.refs(), refs);
   assert.equal(cache!.entries, 0);
   assert.equal(f.requests.filter(canonicalImport).length, 0);
   assert.equal(f.joined(), f.requests.length);

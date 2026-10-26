@@ -404,6 +404,38 @@ test("delta boundary: non-anchor-reachable candidate is dropped without dropping
   f.request.original.baseCommit = unrelated;
   assert.deepEqual(await f.run(), { kind: "imported", sourceSha: f.tip });
   assert.equal(await f.native(f.bare, ["show", f.tip + ":new"]), "new selected blob");
+
+  const g = await maintenanceDeltaFixture(t), candidate = g.tip, refs = await g.refs();
+  await g.native(g.bare, ["fetch", "--no-write-fetch-head", "--no-tags", g.clone, candidate]);
+  assert.equal(await g.native(g.bare, ["cat-file", "-t", candidate]), "commit", "candidate is present");
+  await assert.rejects(g.native(g.bare, ["merge-base", "--is-ancestor", candidate, g.base]), { code: 1 });
+  assert.equal(await g.refs(), refs, "connected candidate has no anchoring ref");
+  const candidateObjects = (await g.native(g.clone,
+    ["rev-list", "--objects", "--no-object-names", candidate, "--not", g.base])).split("\n");
+  assert.ok(candidateObjects.includes(candidate));
+  assert.equal(candidateObjects.length, 3, "candidate has its own commit, tree and unique blob");
+  await fs.writeFile(path.join(g.clone, "child-only"), "unique child delta blob\n");
+  await g.native(g.clone, ["add", "."]); await g.native(g.clone, ["commit", "-qm", "child of unanchored candidate"]);
+  const childW = await g.native(g.clone, ["rev-parse", "HEAD"]);
+  g.request.tip = childW;
+  g.request.original.baseCommit = candidate;
+  const expectedSelectedOIDs = (await g.native(g.clone,
+    ["rev-list", "--objects", "--no-object-names", childW, "--not", g.base])).split("\n");
+  for (const oid of candidateObjects) assert.ok(expectedSelectedOIDs.includes(oid), "full range includes candidate objects");
+  const index = g.cache["indexMaintenancePack"].bind(g.cache);
+  let actualSelectedOIDs: string[] | undefined;
+  t.mock.method(g.cache as any, "indexMaintenancePack", async (...args: Parameters<typeof index>) => {
+    actualSelectedOIDs = [...args[2]];
+    return index(...args);
+  });
+  assert.deepEqual(await g.run(), { kind: "imported", sourceSha: childW });
+  assert.ok(actualSelectedOIDs);
+  assert.deepEqual(new Set(actualSelectedOIDs), new Set(expectedSelectedOIDs), "ineligible candidate excludes no selected objects");
+  assert.ok(actualSelectedOIDs.includes(candidate));
+  assert.equal(await g.native(g.bare, ["show", childW + ":child-only"]), "unique child delta blob");
+  assert.equal(await g.refs(), refs);
+  assert.equal(g.joined(), g.requests.length);
+  await g.retained();
 });
 
 for (const entry of ["unknown", "info/http-alternates", "pack/pack-" + "a".repeat(40) + ".promisor"]) {
