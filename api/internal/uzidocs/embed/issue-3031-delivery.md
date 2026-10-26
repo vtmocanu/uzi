@@ -617,7 +617,9 @@ kind, bytes and the per-bundle cap, and `count-objects -v` per fixture clone. Sh
 196 loose objects, the largest observed in a read-only sample of hosted worker attempt
 clones (not a fleet maximum). A refusal (layout, quiescence, admission, resource exhaustion)
 is recorded with its phase and the phases left unrun and is never a counter PASS. The
-two-source family is preservation-only (U4) and never counts as whole-family preservation.
+two-source family variant is reported UNRUN: at this commit no production path produces a two-member
+family (the family list is `[genesis]` or the inherited list, which is built the same way), and the
+measurement injects no member. Multi-source families belong to #3440.
 
 The verdict controls (`measure-3031-composed.test.ts`, "verdict controls") run without the
 environment variable, on a small fixture, and are the only runs that stub exclusion and

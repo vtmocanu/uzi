@@ -330,6 +330,15 @@ function realPrerequisites(): { dockerHost: string } | { unrun: string } {
 
 // --------------------------------------------------------------------------- the pipeline run
 
+// Owner ruling (recov2 co-sign): a two-member family may be reached only through the real blocked/inherited
+// path, with no injected member. At bed7dd94 it cannot be reached at all, so the variant is UNRUN.
+const FAMILY_UNREACHABLE = "a two-member source family is unreachable through production code: the family input list is " +
+  "[genesis] on the normal-failed path and the inherited originals on the blocked path (runner.ts closedSourceObservation, " +
+  "`const originals = blocked ? flight.sourceInherited?.family?.originals : [genesis]`), and the inherited originals come " +
+  "from an earlier observation built the same way, so every real family has one member; a sibling ledger entry for the run " +
+  "makes the real scan refuse (git.ts matchMaintenanceSourceFamily `incomplete known family`). Reaching two members needs an " +
+  "injected member or a production change; the measurement does neither (#3440 owns multi-source families)";
+
 interface RunResult { record: Record<string, unknown>; evaluation: Evaluation }
 
 async function runPipeline(t: TestContext, spec: Spec): Promise<RunResult> {
@@ -340,6 +349,9 @@ async function runPipeline(t: TestContext, spec: Spec): Promise<RunResult> {
     ({ record: emit({ ...head, ...body, verdict: evaluation.verdict, verdict_detail: evaluation }), evaluation });
   const unrun = (reason: string, body: Record<string, unknown> = {}) =>
     finish(evaluate({ unrun: reason, limits: {}, elapsedLimitMs: SLOT_ELAPSED_LIMIT_MS, elapsedMs: 0, phases: [], deviation: env.deviation }), { ...body, reason });
+
+  // ---- the two-source family cannot be reached through production code: UNRUN, nothing else asserted
+  if (spec.family) return unrun(FAMILY_UNREACHABLE, { family_reachability: FAMILY_UNREACHABLE });
 
   // ---- preconditions: UNRUN with the reason, nothing else asserted
   let source: { head: string; commits: number } | undefined;
@@ -481,7 +493,7 @@ async function runPipeline(t: TestContext, spec: Spec): Promise<RunResult> {
     : passingExclusion();
 
   // ---- the runner: a failed run leaves the WIP shape in its attempt clone
-  let genesis = "", baseCommit = "", sibling: { path: string; attemptId: string } | undefined;
+  let genesis = "", baseCommit = "";
   const fixtures: Record<string, unknown> = {};
   const log = recordingLogger();
   const target = path.join(homeDir, claim.run_id);
@@ -503,43 +515,16 @@ async function runPipeline(t: TestContext, spec: Spec): Promise<RunResult> {
     quiesceRun: spec.real ? quiesce : controlQuiesce,
   });
 
-  // The coordinator is handed the observation the runner produced; a two-source family extends the
-  // INPUT list of that observation with a real sibling clone and lets the real family scan compute
-  // identities and metadata (the normal-failed path itself only ever lists the genesis).
-  let siblingBefore: string | undefined;
   const resume = RecoveryCoordinator.prototype.resumeTerminalSource;
   let notified: Promise<void> | undefined;
   t.mock.method(RecoveryCoordinator.prototype, "resumeTerminalSource", function (this: RecoveryCoordinator, ...args: Parameters<typeof resume>) {
-    if (spec.family) args[1] = Promise.resolve(args[1]).then(async observation => {
-      const view = observation as unknown as { genesis: { clonePath: string; attemptId: string; generation: number; runId: string }; family?: { originals: Array<Record<string, unknown>>; metadata: string; observedExecution: unknown } } | undefined;
-      if (!view?.family) return observation;
-      const coordinates = (runner as unknown as { cloneCoordinates(c: typeof claim): { key: string; branch: string } }).cloneCoordinates(claim);
-      const attemptId = view.genesis.attemptId.replace(/^\d{8}T\d{6}Z/, "20000101T000000Z").replace(/-[0-9a-f]{16}$/, "-" + "5".repeat(16));
-      const dir = path.join(path.dirname(view.genesis.clonePath), path.basename(view.genesis.clonePath).replace(view.genesis.attemptId, attemptId));
-      execFileSync("git", ["clone", "-q", "--shared", "--no-checkout", "--", bare, dir], { env: gitEnv, stdio: "pipe" });
-      disableAutoMaintenance(dir, gitEnv);
-      sh(dir, "checkout", "-q", "--detach", baseCommit);
-      if (spec.layout === "dissociated") await (git as unknown as { materializeRunnerClone(c: string, r: string[]): Promise<void> }).materializeRunnerClone(dir, [sh(dir, "rev-parse", "HEAD").trim()]);
-      await applyShape(dir, "B", undefined); // unique uncommitted work held only by the sibling
-      await fs.writeFile(path.join(dir, "sibling-unique-untracked.txt"), "work only the sibling holds\n");
-      sh(bare, "config", "--add", `uzi-attempts.${coordinates.branch}.entry`,
-        JSON.stringify({ attemptId, runId: claim.run_id, clonePath: dir, state: "abandoned" }));
-      sibling = { path: dir, attemptId };
-      siblingBefore = siblingState(dir);
-      fixtures.sibling = { path: dir, count_objects: countObjects(dir) };
-      const originals = [...view.family.originals, { ...view.family.originals[0]!, clonePath: dir, attemptId, identity: undefined }];
-      const scan = await git.matchMaintenanceSourceFamily(bare, coordinates.branch, coordinates.key, claim.run_id, originals as never);
-      if (!scan) return undefined; // the real scan refused the two-source family: no admission, reported below
-      return { ...view, family: { ...view.family, metadata: scan.metadata, originals: scan.sources.map(s => ({
-        ...originals.find(o => o.clonePath === s.clonePath)!, identity: s.identity })) } } as never;
-    });
     notified = resume.apply(this, args);
     return notified;
   });
 
   // ---- phase markers and the archive, all through wrappers on named GitCache / runner scopes
   let w0Invocations = 0, transferEntered = 0, importerResult: { kind: string; sourceSha: string } | undefined;
-  let importerError: unknown, w0Head: string | undefined;
+  let importerError: unknown;
   const observer = (git as unknown as { observeMaintenanceTransferPhase<T>(p: string, a: () => Promise<T>): Promise<T> }).observeMaintenanceTransferPhase.bind(git);
   t.mock.method(git as unknown as { observeMaintenanceTransferPhase: (p: Phase, a: () => Promise<unknown>) => Promise<unknown> }, "observeMaintenanceTransferPhase", async (name: Phase, action: () => Promise<unknown>) => {
     setPhase(name);
@@ -606,7 +591,6 @@ async function runPipeline(t: TestContext, spec: Spec): Promise<RunResult> {
             },
             afterRunnerGit: async step => { await callbacks.afterRunnerGit(step); if (step === "commit") setPhase("w0_p5"); },
           });
-          w0Head = result.head;
           setPhase("transfer_entry");
           return result;
         },
@@ -672,15 +656,6 @@ async function runPipeline(t: TestContext, spec: Spec): Promise<RunResult> {
   const evaluation = archiveNotApplicable
     ? evaluate({ unrun: `the fixture cannot satisfy the archive precondition: ${(archiveError as Error).message}`, limits, elapsedLimitMs: slotMs, elapsedMs: slotElapsed, phases, deviation: env.deviation })
     : evaluate({ limits, elapsedLimitMs: slotMs, elapsedMs: slotElapsed, phases, refusedCharge, capRefusals, envelopeOverruns, refusal, incomplete, deviation: env.deviation });
-  const family = spec.family ? {
-    members: 2, w0_invocations: w0Invocations,
-    per_source: {
-      genesis: { role: "A", outcome: w0Head ? "captured by one W0 invocation" : "not captured", w0_head: w0Head },
-      sibling: { role: "B", outcome: sibling && siblingBefore === siblingState(sibling.path) ? "protected: retained, uncaptured, bytes and refs unchanged" : "NOT protected", path_retained: !!sibling && fsSync.existsSync(sibling.path) },
-    },
-    preservation_only: true, whole_family_preservation: false,
-    note: "genesis preservation never counts as whole-family preservation (U4); sibling coverage proof is #3440",
-  } : undefined;
   const record = emit({
     ...head, ...body,
     candidate_sha: source?.head, source_commits: source?.commits,
@@ -702,18 +677,10 @@ async function runPipeline(t: TestContext, spec: Spec): Promise<RunResult> {
     archive: archive ?? { kind: "none", bytes: 0, cap_bytes: RECOVERY_MAX_BUNDLE_BYTES, error: archiveError instanceof Error ? archiveError.message : undefined },
     transfer: importerResult ?? null,
     loose_objects: spec.shape === "C" ? { target: spec.loose, source: spec.loose === LOOSE_SAMPLE_LARGEST ? LOOSE_SAMPLE_NOTE : "ladder rung above the sample" } : undefined,
-    family: family ?? null,
     refusal: evaluation.refusal ?? null, refusals,
     verdict: evaluation.verdict, verdict_detail: evaluation,
   });
   return { record, evaluation };
-}
-
-function siblingState(dir: string): string {
-  const entries = fsSync.readdirSync(dir).filter(n => n !== ".git").sort();
-  return JSON.stringify([sh(dir, "rev-parse", "HEAD").trim(), sh(dir, "status", "--porcelain=v1", "-z"),
-    sh(dir, "for-each-ref", "--format=%(refname) %(objectname)"),
-    entries.map(n => { try { return fsSync.statSync(path.join(dir, n)).isFile() ? fsSync.readFileSync(path.join(dir, n)).toString("base64") : n; } catch { return n; } })]);
 }
 
 // ------------------------------------------------------------------------------ measurements
@@ -732,8 +699,9 @@ describe("#3031 composed measurement (C2)", () => {
         if (shape === "C") ladder.push({ loose: LOOSE_SAMPLE_LARGEST, verdict: evaluation.verdict });
       });
     }
-    it(`layout ${layout}, two-source family (genesis shape A, sibling shape B)`, { skip: MEASURE_SKIP, timeout: 120_000 }, async t => {
-      await runPipeline(t, { label: `${layout}-family`, layout, shape: "A", family: true, origin: "repo", real: true });
+    it(`layout ${layout}, two-source family (UNRUN: unreachable through production code)`, { skip: MEASURE_SKIP, timeout: 120_000 }, async t => {
+      const { evaluation } = await runPipeline(t, { label: `${layout}-family`, layout, shape: "A", family: true, origin: "repo", real: true });
+      assert.equal(evaluation.verdict, "UNRUN");
     });
   }
 
@@ -812,6 +780,14 @@ describe("#3031 composed measurement verdict controls", () => {
       assert.equal(evaluation.reason, precondition.reason);
     }
     assert.equal(sourcePrecondition(REPO_ROOT).ok === true || true, true, "the repository checkout is not required by a control");
+  });
+
+  it("control: the two-source family variant is UNRUN with the reachability reason and is never eligible for the gate", async t => {
+    const { record, evaluation } = await runPipeline(t, { label: "control-family", layout: "shared", shape: "A", family: true, origin: "repo", real: true });
+    assert.equal(evaluation.verdict, "UNRUN");
+    assert.match(String(record.reason), /unreachable through production code/);
+    assert.equal(record.eligible_for_gate, undefined, "an UNRUN family line carries no eligibility");
+    assert.equal(record.w0_invocations, undefined, "nothing else was run or asserted");
   });
 
   const small = (label: string, decodedCap?: number): Spec => ({ label, layout: "dissociated", shape: "control", origin: "tiny", real: false, decodedCap });
