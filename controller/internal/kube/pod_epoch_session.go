@@ -627,7 +627,7 @@ func (s *PodEpochSession) Deliver(ctx context.Context, d *PodEpochDecision) erro
 	if err != nil {
 		return err
 	}
-	requestCtx, cancel := context.WithTimeout(ctx, podEpochRequestTimeout)
+	requestCtx, cancel := context.WithTimeout(markMaintenanceRead(ctx), podEpochRequestTimeout)
 	defer cancel()
 	_, err = s.client.CoreV1().Pods(d.namespace).Patch(requestCtx, d.name, types.MergePatchType, body, metav1.PatchOptions{})
 	return err

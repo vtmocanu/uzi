@@ -80,8 +80,12 @@ All new Go code lives in `controller/internal/kube/pod_epoch*.go`.
 `PodEpochIdentityResolver.ResolvePodEpoch(ctx, worker, pod, successor)` resolves
 live claims for predecessors and verifies current Deployment/ReplicaSet template
 equivalence and controller UID ancestry for successors. The provided
-`PodEpochKubeResolver` uses actual GetDeployment/GetReplicaSet/GetPVC calls, checks
-the exact runtime literal and mounted claim names, and ignores copied annotations.
+`PodEpochKubeResolver` requires LIST permission on Deployments, ReplicaSets and
+PVCs in the Docker namespace. It uses `metadata.name` field selectors and
+pagination with a page size of 100, an 8 MiB decompressed response cap per page,
+a 16 MiB aggregate response budget and a 4096-item budget per resolution. It
+checks the exact successor runtime literal and mounted claim names, and ignores copied
+annotations.
 Predecessors may belong to an older template, as required for Recreate.
 
 The session retains all pod identities, including foreign claim users. Pod
