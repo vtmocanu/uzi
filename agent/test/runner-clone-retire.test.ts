@@ -7,7 +7,7 @@ import path from "node:path";
 import net from "node:net";
 import { execFileSync } from "node:child_process";
 import { GitCache, ForeignCaptureBlockedError, CapturePathMismatchError } from "../src/git.js";
-import { latchResidueQuarantine } from "../src/residue-quarantine.js";
+import { latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
 import type { Logger } from "../src/log.js";
 import { RequestError } from "../src/client.js";
 import { type ExecutorFactory } from "../src/runner.js";
@@ -2960,4 +2960,31 @@ it("completion: a post-move throwing process proof restores the canonical clone 
   assert.equal(fs.existsSync(clonePath), true, "canonical clone must be restored after the exception");
   assert.equal(fs.existsSync(movedTo), false);
   assert.deepEqual(readJournal(bare, branch), journal);
+});
+
+it("normal: revocation during the quarantine rollback leaves the restored clone and journal intact", async t => {
+  const owner = randomUUID();
+  const { bare, branch, clonePath } = await seedResidue(2852, owner, "proof.txt");
+  const journal = readJournal(bare, branch);
+  t.after(() => resetResidueQuarantineForTests());
+  let live = true, movedTo: string | undefined, revokedDuringRestore = false;
+  const rename = fsp.rename.bind(fsp);
+  t.mock.method(fsp, "rename", async (...args: Parameters<typeof fsp.rename>) => {
+    const from = String(args[0]), to = String(args[1]);
+    if (movedTo && from === movedTo && to === clonePath) {
+      live = false;
+      revokedDuringRestore = true;
+    }
+    await rename(...args);
+    if (from === clonePath && !movedTo) {
+      movedTo = to;
+      latchResidueQuarantine({ cause: "rollback race test", runId: owner, site: "test" }, nullLogger());
+    }
+  });
+  await assert.rejects(git.retireRunnerClone(bare, clonePath, branch, owner, { discard: true, processProof: () => live }));
+  assert.ok(movedTo);
+  assert.equal(revokedDuringRestore, true, "the proof was revoked while the quarantine rollback restored the clone");
+  assert.equal(fs.readFileSync(path.join(clonePath, "proof.txt"), "utf8"), "owner-only bytes\n");
+  assert.equal(fs.existsSync(movedTo), false);
+  assert.deepEqual(readJournal(bare, branch), journal, "journal still names the restored canonical clone");
 });

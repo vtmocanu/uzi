@@ -11157,16 +11157,19 @@ export class GitCache {
         if (processRevoked || residueQuarantine() !== undefined || (opts.completionSource && !opts.completionSource.canDelete())) {
           // issue #2213: a latch landed after the move. Undo it (best-effort), keep the journal and
           // dispose of nothing; the latched worker keeps the clone at its journaled path.
-          const movedTo = renamed ? (exdev ? (scratch ? path.join(scratch, "clone") : undefined) : holdingDest) : undefined;
-          if (movedTo !== undefined) {
-            await fs.rename(movedTo, clonePath).then(
+          const rollbackSource = renamed ? (exdev ? (scratch ? path.join(scratch, "clone") : undefined) : holdingDest) : undefined;
+          if (rollbackSource !== undefined) {
+            await fs.rename(rollbackSource, clonePath).then(
               async () => {
+                // Restored: the outer revocation rollback must not treat the vacated
+                // holding path as residue and re-point the journal at it.
+                movedTo = undefined;
                 if (scratch) await this.removeBestEffort(scratch, "retire-rollback-scratch", "emptyDir");
               },
               (renameErr: unknown) =>
                 this.log.warn("retireRunnerClone: worker residue quarantine latched mid-retire and the clone could not be moved back; it is retained at the holding path", {
                   clone: clonePath,
-                  retained_at: movedTo,
+                  retained_at: rollbackSource,
                   error: gitErrorMessage(renameErr),
                 }),
             );
