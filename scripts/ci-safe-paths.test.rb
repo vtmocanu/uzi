@@ -374,6 +374,9 @@ Dir.mktmpdir('release-auto-contract') do |dir|
   end
   exercise.call({'RELEASE_ACTOR' => 'outside'}, false)
   exercise.call({'RELEASE_REF' => 'refs/heads/feature'}, false)
+  exercise.call({'GITHUB_REPOSITORY' => 'other/uzi'}, false)
+  exercise.call({'GITHUB_EVENT_NAME' => 'push'}, false)
+  exercise.call({'RELEASE_VERSION' => '0.3.0'}, false)
   exercise.call({'BUNDLE_DIGEST' => '0' * 64}, false)
   exercise.call({'RELEASE_SHA' => '0' * 40}, false)
   exercise.call({'RELEASE_KIND' => 'stable', 'RELEASE_RC_TAG' => 'v0.2.0-rc.10', 'RELEASE_RC_SHA' => parent,
@@ -395,6 +398,14 @@ Dir.mktmpdir('release-auto-contract') do |dir|
                 'RELEASE_RC_SHA' => parent, 'RELEASE_TAG' => 'v0.2.0', 'RELEASE_SHA' => promoted,
                 'TAG_OID' => promoted_tag, 'BUNDLE_DIGEST' => Digest::SHA256.file(stable_bundle).hexdigest,
                 'RUN_CREATED_AT' => '2026-10-25T10:00:00Z'}
+  prefix = bundle_step.fetch('run').split("reason='bundle-digest-mismatch'", 2)
+  assert.call(prefix.length, 2, 'schema boundary remains identifiable before artifact access')
+  _, _, parent_status = Open3.capture3(env.merge(stable_env).merge('PARENT' => stable_sha, 'GITHUB_OUTPUT' => File.join(dir, 'prefix-output')),
+                                      'bash', '-e', '-c', prefix.first)
+  assert.call(parent_status.success?, false, 'actual pre-key schema independently binds approved parent')
+  exercise.call(stable_env.merge('RELEASE_VERSION' => '0.2.0'), false, nil, stable_bundle)
+  exercise.call(stable_env.merge('RELEASE_SUPERSEDE' => 'v0.2.0-rc.9'), false, nil, stable_bundle)
+  exercise.call(stable_env.merge('RUN_CREATED_AT' => '2026-10-27T10:00:00Z'), false, nil, stable_bundle)
   exercise.call(stable_env, true, false, stable_bundle, {'TEST_NOW' => (Time.utc(2026, 10, 26, 10).to_i + 1).to_s})
   exercise.call(stable_env, true, true, stable_bundle)
   # A self-contained bundle can hide a wrong parent from prerequisite checking;
@@ -414,6 +425,18 @@ Dir.mktmpdir('release-auto-contract') do |dir|
   git.call('-C', repo, 'bundle', 'create', extra_bundle, 'refs/heads/release-auto-prepared', 'refs/tags/v0.2.0-rc.12', 'refs/heads/extra')
   exercise.call({'RELEASE_SHA' => wrong_child, 'RELEASE_TAG' => 'v0.2.0-rc.12', 'TAG_OID' => wrong_tag,
                  'BUNDLE_DIGEST' => Digest::SHA256.file(extra_bundle).hexdigest}, false, nil, extra_bundle)
+  # Self-consistency does not establish the human-approved stable version.
+  mismatched_remote = File.join(dir, 'mismatched-stable.git')
+  git.call('clone', '--bare', remote, mismatched_remote)
+  git.call('-C', repo, 'tag', '-a', 'v9.9.9', '-m', 'wrong stable target', release_sha)
+  mismatched_oid = git.call('-C', repo, 'rev-parse', 'v9.9.9')
+  git.call('-C', repo, 'update-ref', 'refs/heads/release-auto-prepared', release_sha)
+  mismatched_bundle = File.join(dir, 'mismatched-stable.bundle')
+  git.call('-C', repo, 'bundle', 'create', mismatched_bundle, 'refs/heads/release-auto-prepared', 'refs/tags/v9.9.9', '^' + parent)
+  exercise.call({'TEST_REMOTE' => mismatched_remote, 'RELEASE_KIND' => 'stable',
+                 'RELEASE_RC_TAG' => 'v0.2.0-rc.10', 'RELEASE_RC_SHA' => parent,
+                 'RELEASE_TAG' => 'v9.9.9', 'TAG_OID' => mismatched_oid,
+                 'BUNDLE_DIGEST' => Digest::SHA256.file(mismatched_bundle).hexdigest}, false, nil, mismatched_bundle)
   # A main advance after preparation must stop the RC route before any push.
   raced_remote = File.join(dir, 'raced-remote.git')
   git.call('clone', '--bare', remote, raced_remote)

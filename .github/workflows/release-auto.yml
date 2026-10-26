@@ -166,9 +166,10 @@ jobs:
         run: |
           set -euo pipefail
           reason='authorization-failed'
-          trap 'printf "reason=%s\n" "$reason" >> "$GITHUB_OUTPUT"' ERR
+          fail() { printf 'reason=%s\n' "$reason" >> "$GITHUB_OUTPUT"; exit 1; }
+          trap fail ERR
           export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_TERMINAL_PROMPT=0
-          [ "$GITHUB_REPOSITORY" = vtmocanu/uzi ] && [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]
+          if ! { [ "$GITHUB_REPOSITORY" = vtmocanu/uzi ] && [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; }; then fail; fi
           [ "$RELEASE_REF" = refs/heads/main ]
           read -r -a dispatchers <<< "$(printf '%s' "$RELEASE_DISPATCHERS" | tr ',\t\r\n' '    ')"
           allowed=false
@@ -186,17 +187,17 @@ jobs:
             rc)
               [ -z "$RELEASE_RC_TAG$RELEASE_RC_SHA" ]
               [[ "$RELEASE_TAG" =~ $rc ]]
-              [ "$RELEASE_ABANDON" = false ] || [ -n "$RELEASE_VERSION" ]
+              if ! { [ "$RELEASE_ABANDON" = false ] || [ -n "$RELEASE_VERSION" ]; }; then fail; fi
               if [ -n "$RELEASE_VERSION" ]; then [ "${RELEASE_TAG#v}" = "${RELEASE_VERSION}-rc.${RELEASE_TAG##*-rc.}" ]; fi
               ;;
             stable)
-              [ -z "$RELEASE_VERSION$RELEASE_SUPERSEDE" ] && [ "$RELEASE_ABANDON" = false ]
+              if ! { [ -z "$RELEASE_VERSION$RELEASE_SUPERSEDE" ] && [ "$RELEASE_ABANDON" = false ]; }; then fail; fi
               [[ ${#RELEASE_RC_TAG} -le 128 && "$RELEASE_RC_TAG" =~ $rc && "$RELEASE_RC_SHA" =~ ^[0-9a-f]{40}$ ]]
-              [ "$RELEASE_TAG" = "${RELEASE_RC_TAG%-rc.*}" ] && [ "$PARENT" = "$RELEASE_RC_SHA" ]
+              if ! { [ "$RELEASE_TAG" = "${RELEASE_RC_TAG%-rc.*}" ] && [ "$PARENT" = "$RELEASE_RC_SHA" ]; }; then fail; fi
               reason='stale-request'
               [[ "$RUN_CREATED_AT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
               requested="$(date -u -d "$RUN_CREATED_AT" +%s)"; now="$(date -u +%s)"
-              [ "$requested" -le "$now" ] && [ "$((now-requested))" -le 86400 ]
+              if ! { [ "$requested" -le "$now" ] && [ "$((now-requested))" -le 86400 ]; }; then fail; fi
               ;;
             *) exit 1 ;;
           esac
@@ -242,7 +243,8 @@ jobs:
         run: |
           set -euo pipefail
           reason='remote-state-unreadable'
-          trap 'printf "reason=%s\n" "$reason" >> "$GITHUB_OUTPUT"' ERR
+          fail() { printf 'reason=%s\n' "$reason" >> "$GITHUB_OUTPUT"; exit 1; }
+          trap fail ERR
           export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_TERMINAL_PROMPT=0
           unset GIT_TRACE GIT_TRACE_CURL GIT_CURL_VERBOSE
           bare="$RUNNER_TEMP/release-auto-push.git"
@@ -269,16 +271,16 @@ jobs:
               s=oid["refs/tags/"st"^{}"];if(s=="")s=oid["refs/tags/"st]
               printf "%s|%s|%s|%s|%s",oid["refs/heads/main"],rc,r,st,s }')"
           IFS='|' read -r main rc rc_sha stable stable_sha <<< "$inventory"
-          [ "$rc" = "$PREVIOUS_RC" ] && [ "$rc_sha" = "$PREVIOUS_RC_SHA" ]
-          [ "$stable" = "$PREVIOUS_STABLE" ] && [ "$stable_sha" = "$PREVIOUS_STABLE_SHA" ]
+          if ! { [ "$rc" = "$PREVIOUS_RC" ] && [ "$rc_sha" = "$PREVIOUS_RC_SHA" ]; }; then fail; fi
+          if ! { [ "$stable" = "$PREVIOUS_STABLE" ] && [ "$stable_sha" = "$PREVIOUS_STABLE_SHA" ]; }; then fail; fi
           if printf '%s\n' "$refs" | awk -v tag="refs/tags/$RELEASE_TAG" '$2==tag {found=1} END {exit !found}'; then exit 1; fi
           case "$RELEASE_KIND" in
             rc) reason='main-race'; [ "$main" = "$PARENT" ]; refspecs=("$RELEASE_SHA:refs/heads/main" "refs/tags/$RELEASE_TAG") ;;
             stable)
-              [ "$rc" = "$RELEASE_RC_TAG" ] && [ "$rc_sha" = "$RELEASE_RC_SHA" ]
+              if ! { [ "$rc" = "$RELEASE_RC_TAG" ] && [ "$rc_sha" = "$RELEASE_RC_SHA" ]; }; then fail; fi
               reason='stale-request'
               requested="$(date -u -d "$RUN_CREATED_AT" +%s)"; now="$(date -u +%s)"
-              [ "$requested" -le "$now" ] && [ "$((now-requested))" -le 86400 ]
+              if ! { [ "$requested" -le "$now" ] && [ "$((now-requested))" -le 86400 ]; }; then fail; fi
               refspecs=("refs/tags/$RELEASE_TAG") ;;
             *) exit 1 ;;
           esac
