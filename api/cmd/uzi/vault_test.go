@@ -68,7 +68,7 @@ type vaultInputReader func([]byte) (int, error)
 func (r vaultInputReader) Read(p []byte) (int, error) { return r(p) }
 
 func TestVaultUnlockRejectedInput(t *testing.T) {
-	for _, name := range []string{"TTY flag", "nonTTY missing flag", "empty", "empty LF", "empty CRLF", "oversize", "read error", "prompt error", "cancel before", "cancel after", "cancel stdin"} {
+	for _, name := range []string{"TTY flag", "nonTTY missing flag", "empty", "empty LF", "empty CRLF", "oversize", "TTY oversize", "read error", "prompt error", "cancel before", "cancel after", "cancel stdin"} {
 		t.Run(name, func(t *testing.T) {
 			f := &uzicli.FakeClient{}
 			env := fakeEnv(f)
@@ -92,6 +92,13 @@ func TestVaultUnlockRejectedInput(t *testing.T) {
 				env.Stdin = strings.NewReader("\r\n")
 			case "oversize":
 				env.Stdin = strings.NewReader(strings.Repeat("x", (1<<20)+1))
+			case "TTY oversize":
+				env.StdinTTY = true
+				args = args[:len(args)-1]
+				env.ReadVaultPassword = func(context.Context, io.Reader) ([]byte, error) {
+					reads++
+					return make([]byte, maxVaultPasswordBytes+1), nil
+				}
 			case "read error":
 				wantCode = uzicli.ExitGeneric
 				env.Stdin = vaultInputReader(func(p []byte) (int, error) { return copy(p, vaultTestSecret), errors.New(vaultTestSecret) })
@@ -166,7 +173,7 @@ func TestVaultStatusAndOutput(t *testing.T) {
 		{"JSON unlock", false, []string{"--json", "vault", "unlock", "--password-stdin"}, "{\"unlocked\":true}\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			f := &uzicli.FakeClient{VaultUnlocked: tc.unlocked}
+			f := &uzicli.FakeClient{VaultLocked: !tc.unlocked}
 			env := fakeEnv(f)
 			env.Stdin = strings.NewReader(vaultTestSecret)
 			out, stderr, code := runCLI(t, env, append([]string{"--url", "https://example.com"}, tc.args...)...)

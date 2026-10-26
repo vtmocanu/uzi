@@ -189,6 +189,14 @@ func TestSafeVaultUnlockError(t *testing.T) {
 
 func TestFakeVault(t *testing.T) {
 	ctx := context.Background()
+	for _, locked := range []bool{false, true} {
+		fixture := &FakeClient{VaultLocked: locked}
+		status, err := fixture.VaultStatus(ctx)
+		_, whoamiLocked, whoamiErr := fixture.WhoamiVault(ctx)
+		if err != nil || whoamiErr != nil || status.Unlocked == whoamiLocked {
+			t.Fatal("fake vault surfaces disagree")
+		}
+	}
 	f := &FakeClient{VaultLocked: true}
 	got, err := f.VaultStatus(ctx)
 	if err != nil || got.Unlocked || f.VaultStatusCalls != 1 {
@@ -202,8 +210,8 @@ func TestFakeVault(t *testing.T) {
 		t.Fatalf("unlocked status=%+v error=%v", got, err)
 	}
 	f.VaultUnlockErr = ErrVaultIncorrectPassword
-	f.VaultUnlocked = false
-	if err := f.VaultUnlock(ctx, "second"); !errors.Is(err, ErrVaultIncorrectPassword) || f.VaultUnlocked {
+	f.VaultLocked = true
+	if err := f.VaultUnlock(ctx, "second"); !errors.Is(err, ErrVaultIncorrectPassword) || !f.VaultLocked {
 		t.Fatalf("failed unlock changed state: %v", err)
 	}
 	if f.VaultUnlockCalls != 2 || strings.Join(f.VaultUnlockPasswords, ",") != "first,second" {
@@ -217,7 +225,7 @@ func TestFakeVault(t *testing.T) {
 	if _, err := f.VaultStatus(ctx); err != io.ErrUnexpectedEOF {
 		t.Fatalf("global status error=%v", err)
 	}
-	if err := f.VaultUnlock(ctx, "third"); err != io.ErrUnexpectedEOF || f.VaultUnlocked {
+	if err := f.VaultUnlock(ctx, "third"); err != io.ErrUnexpectedEOF || !f.VaultLocked {
 		t.Fatalf("global unlock error=%v", err)
 	}
 	if f.VaultUnlockCalls != 3 || f.VaultUnlockPasswords[2] != "third" {
