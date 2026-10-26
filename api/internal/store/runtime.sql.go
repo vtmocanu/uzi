@@ -938,6 +938,9 @@ WITH claimant AS MATERIALIZED (
       -- unaffected (dispatched_at is only ever set on a task run).
       AND (r.kind <> 'task' OR r.dispatched_at IS NOT NULL)
       AND r.status = 'queued'
+      -- PRD #3454 D2/D4: during an instance intake pause only admitted runs (claimed at
+      -- least once, or cross_check children) may claim; a new root stays queued.
+      AND (NOT (SELECT fn_instance_intake_paused()) OR fn_run_admitted_during_intake_pause(r))
       -- Lock only this checker's parent, then its pending attempt, before the target
       -- row and custody side effects. A changed verdict is rechecked on the locked cc.
       AND (r.kind <> 'cross_check' OR EXISTS (
@@ -9123,7 +9126,11 @@ SELECT id, user_id, status, auto_approve,
                                              ELSE false END)))
                    )
              )
-       ))::boolean AS codex_account_gated
+       ))::boolean AS codex_account_gated,
+       -- PRD #3454: a queued run the instance intake pause holds (paused AND not admitted); queuedReason
+       -- reports it as reasonMaintenance, ahead of every worker-side rung.
+       ((SELECT fn_instance_intake_paused()) AND status = 'queued'
+        AND NOT fn_run_admitted_during_intake_pause(runs))::boolean AS intake_pause_held
 FROM runs
 WHERE status IN ('queued', 'running', 'awaiting_approval')
   AND kind <> 'chat'
@@ -9168,6 +9175,7 @@ type ListActiveRunsForHealthRow struct {
 	TerminalPendingSince      pgtype.Timestamptz `json:"terminal_pending_since"`
 	CodexCustomRoot           bool               `json:"codex_custom_root"`
 	CodexAccountGated         bool               `json:"codex_account_gated"`
+	IntakePauseHeld           bool               `json:"intake_pause_held"`
 }
 
 // Run health detector (PRD #47) ----------------------------------------------
@@ -9284,6 +9292,7 @@ func (q *Queries) ListActiveRunsForHealth(ctx context.Context, codexCuratedModel
 			&i.TerminalPendingSince,
 			&i.CodexCustomRoot,
 			&i.CodexAccountGated,
+			&i.IntakePauseHeld,
 		); err != nil {
 			return nil, err
 		}
@@ -9885,6 +9894,9 @@ WHERE r.status = 'queued'
                   AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds lh
                                   WHERE lh.live_worker_id = wc.id AND lh.state = 'open'))
       ) < $1::int
+  -- PRD #3454: while intake is paused only admitted runs (replacements) may drive provisioning, so
+  -- blocked roots cannot fill the bounded batch; provisionOne re-checks under the advisory lock.
+  AND (NOT (SELECT fn_instance_intake_paused()) OR fn_run_admitted_during_intake_pause(r))
 ORDER BY fn_run_priority(r.kind, r.priority, r.created_at < $2) DESC, r.created_at ASC
 LIMIT $3
 `
@@ -11578,6 +11590,9 @@ WHERE r.status = 'queued'
                   AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds lh
                                   WHERE lh.live_worker_id = wc.id AND lh.state = 'open'))
       ) < $10::int
+  -- PRD #3454: while intake is paused only admitted runs (replacements) may drive provisioning, so
+  -- blocked roots cannot fill the bounded batch; provisionOne re-checks under the advisory lock.
+  AND (NOT (SELECT fn_instance_intake_paused()) OR fn_run_admitted_during_intake_pause(r))
 ORDER BY fn_run_priority(r.kind, r.priority, r.created_at < $11) DESC, r.status_since ASC
 LIMIT $12
 `
@@ -11870,6 +11885,9 @@ WHERE r.status = 'queued'
                   AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds lh
                                   WHERE lh.live_worker_id = wc.id AND lh.state = 'open'))
       ) < $9::int
+  -- PRD #3454: while intake is paused only admitted runs (replacements) may drive provisioning, so
+  -- blocked roots cannot fill the bounded batch; provisionOne re-checks under the advisory lock.
+  AND (NOT (SELECT fn_instance_intake_paused()) OR fn_run_admitted_during_intake_pause(r))
 ORDER BY fn_run_priority(r.kind, r.priority, r.created_at < $10) DESC, r.created_at ASC
 LIMIT $11
 `

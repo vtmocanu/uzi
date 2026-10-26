@@ -111,6 +111,9 @@ type ChatActionSubmitter interface {
 	// refuses when one exists (Decision 3, and it makes a double-press idempotent since
 	// the first press's resumed run is live by the time the second is processed).
 	LiveChatForUser(ctx context.Context, userID uuid.UUID) (store.Run, bool, error)
+	// MaintenanceNotice returns the "queued by maintenance mode" notice (PRD #3454) while the
+	// instance intake pause is active, else "". Read after a run is created.
+	MaintenanceNotice(ctx context.Context) string
 }
 
 // ChatActions handles the chat cards' Block Kit buttons (PRD #191 M4): Create files
@@ -298,11 +301,22 @@ func (c *ChatActions) continueChat(ctx context.Context, a BlockAction, userID, r
 	case err == nil:
 		// Post the new conversation's status message (top-level → a new thread) and
 		// anchor the resumed run on it (root_ts == status_ts, both this bot message).
+		// PRD #3454: the resumed chat is a new run, so maintenance mode holds it queued.
+		notice := c.svc.MaintenanceNotice(ctx)
+		statusText := "💬 Continuing the conversation — reply in THIS thread to keep going."
+		if notice != "" {
+			statusText += "\nℹ️ " + notice
+		}
 		statusTS, perr := c.poster.PostBlocks(ctx, a.ChannelID, "", "uzi chat",
-			chatLiveStatusBlocks(newRunID, "💬 Continuing the conversation — reply in THIS thread to keep going."))
+			chatLiveStatusBlocks(newRunID, statusText))
 		if perr != nil {
 			c.logf("post continued status", perr)
-			c.ephemeral(ctx, a, "Continued — find the new conversation in uzi.")
+			msg := "Continued — find the new conversation in uzi."
+			if notice != "" {
+				// Ephemerals are plain mrkdwn text (the status blocks escape on their own).
+				msg += " " + EscapeMrkdwn(notice)
+			}
+			c.ephemeral(ctx, a, msg)
 			return
 		}
 		if _, aerr := c.store.InsertSlackChatAnchor(ctx, store.InsertSlackChatAnchorParams{
@@ -333,7 +347,11 @@ func (c *ChatActions) startRun(ctx context.Context, a BlockAction, userID uuid.U
 		return
 	}
 	base, _ := c.baseURL(ctx)
-	c.editCardLinked(ctx, a, "▶️ Run started.", runURL(base, runID), "View the run")
+	started := "▶️ Run started."
+	if notice := c.svc.MaintenanceNotice(ctx); notice != "" { // PRD #3454
+		started += "\nℹ️ " + notice
+	}
+	c.editCardLinked(ctx, a, started, runURL(base, runID), "View the run")
 }
 
 // cancelRun cancels the card's target run via the owner-only SubmitInput(cancel) and

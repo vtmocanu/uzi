@@ -861,6 +861,10 @@ export interface LatestRun {
   // null for a non-running/chat/judge/interactive run. Optional for the same api/web
   // rollout skew as is_planning: a pre-feature api pod omits the key.
   deadline_at?: string | null;
+  // queue_reason (PRD #3454): "maintenance" while instance maintenance mode holds this queued,
+  // not-yet-admitted run back; null/absent otherwise. Computed in SQL at read time, so it never
+  // lags the pause. Optional for api/web rollout skew.
+  queue_reason?: QueueReason | null;
   // hold_reason (PRD #1226/#1497/#1732): why a `paused` run is server-held, null for an owner
   // pause or a non-paused run. Non-sensitive, so the board projection sends it on every card
   // (api/internal/handler/board.go latestRunDTO.HoldReason). effectiveRunStatus overlays
@@ -1532,6 +1536,66 @@ export interface ReleaseCheckStatus {
   partial?: boolean;
 }
 
+// ── Instance maintenance mode (PRD #3454) ───────────────────────────────────
+
+// QueueReason is why a queued run is held back by the instance, beyond waiting for a
+// worker. Only "maintenance" exists today.
+export type QueueReason = "maintenance";
+
+// MaintenanceState is `GET /api/maintenance` (any signed-in user): whether intake is paused,
+// since when, and the admin's plain-text reason. Render the reason via stripDisplayCell.
+export interface MaintenanceState {
+  active: boolean;
+  since: string | null;
+  reason: string | null;
+}
+
+// MaintenanceRunItem is one run in an admin readout category. tag says whether the run will
+// finish on its own ("progressing") or needs its owner to act ("needs_owner"); null when the
+// category does not tag (active, queued).
+export interface MaintenanceRunItem {
+  run_id: string;
+  kind: string;
+  status: string;
+  owner_label: string;
+  repo: string | null;
+  since: string | null;
+  tag: "progressing" | "needs_owner" | null;
+  hold_id: string | null;
+}
+
+export interface MaintenanceIdleWorker {
+  worker_id: string;
+  owner_label: string;
+  run_id: string;
+  since: string | null;
+}
+
+// MaintenanceCategory: an exact count plus up to 50 items.
+export interface MaintenanceCategory<T> {
+  count: number;
+  items: T[];
+}
+
+// MaintenanceReadout is the drain snapshot. clear = no active, held or custody blockers
+// visible as of as_of; queued and idle_bound_workers are informational.
+export interface MaintenanceReadout {
+  as_of: string;
+  clear: boolean;
+  active: MaintenanceCategory<MaintenanceRunItem>;
+  held: MaintenanceCategory<MaintenanceRunItem>;
+  custody: MaintenanceCategory<MaintenanceRunItem>;
+  queued: MaintenanceCategory<MaintenanceRunItem>;
+  idle_bound_workers: MaintenanceCategory<MaintenanceIdleWorker>;
+}
+
+// AdminMaintenance is `GET`/`PUT /api/admin/maintenance` (admin): the state with who last
+// changed it, plus the readout.
+export interface AdminMaintenance {
+  state: MaintenanceState & { by_label: string | null };
+  readout: MaintenanceReadout;
+}
+
 // HealthDoc is the admin-health document (PRD #1484 M1): the response of
 // `GET /api/admin/health` (RequireAdminRO). It mirrors `apitypes.HealthDocDTO`
 // byte-for-byte (snake_case JSON keys). Admin-only by route — it carries owner and
@@ -2033,6 +2097,8 @@ export type RunNowResponse = {
   ineligible_matched?: number | null;
   started: LastFireStarted[];
   skips: LastFireSkip[];
+  // PRD #3454: set when the fire started runs while uzi is in maintenance mode.
+  notice?: string | null;
 };
 
 export interface CIEpisodeDTO {
@@ -3116,6 +3182,9 @@ export interface Run {
   // null for a non-running/chat/judge/interactive run. Optional for the same api/web
   // rollout skew as is_planning: a pre-feature api pod omits the key.
   deadline_at?: string | null;
+  /** PRD #3454: "maintenance" while instance maintenance mode holds this queued run back
+   *  (see LatestRun.queue_reason). Optional for api/web rollout skew. */
+  queue_reason?: QueueReason | null;
   /** PRD #320 D8: the run's queue-priority CLASS, computed server-side (see RunPriority).
    *  Only a QUEUED run is ever non-"normal"; a running/terminal run renders no pill. It
    *  rides the shared run embed (RunListItemDTO embeds RunDTO), so it is present on BOTH

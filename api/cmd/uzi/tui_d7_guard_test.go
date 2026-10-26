@@ -262,6 +262,7 @@ var d7Sanitizers = map[string]bool{
 	"capCell":       true,
 	"Markdown":      true,
 	"Plain":         true,
+	"WorkerName":    true,
 }
 
 func TestD7UntrustedFieldsNeverReachAWriterUnsanitized(t *testing.T) {

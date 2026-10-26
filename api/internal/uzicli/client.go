@@ -138,7 +138,7 @@ type Client interface {
 	// `mr_rework` run. A foreign/unknown run is 404 → ExitNotFound (4); a refusal (disabled
 	// / not reworkable / already running / nothing new) is 409 → ExitConflict (5); guidance
 	// too long is 400 → ExitUsage (2) — all via the shared status→exit mapping.
-	RunRework(ctx context.Context, runID, guidance string) (apitypes.RunDTO, error)
+	RunRework(ctx context.Context, runID, guidance string) (CreatedRunResult, error)
 	// ContinueCompletionDecision records the owner's CONTINUE decision on a completion-blocked
 	// run and resumes it (PRD #1226 M5, D7): POST /api/runs/{id}/completion/decision
 	// {decision:"continue", guidance}, RequireUser so a `uzc_` token reaches it. This client
@@ -268,6 +268,9 @@ type Client interface {
 	// AdminBlockedRepos reads the admin cross-user blocked-repos list from the
 	// stored privilege report (PRD #66 M9): GET /api/admin/blocked-repos.
 	AdminBlockedRepos(ctx context.Context) (apitypes.AdminBlockedReposDTO, error)
+	// AdminMaintenance reads the instance maintenance state and drain readout (PRD #3454):
+	// GET /api/admin/maintenance. READ-ONLY - the PUT is cookie + CSRF only and stays in the web UI.
+	AdminMaintenance(ctx context.Context) (apitypes.MaintenanceAdminDTO, error)
 	// AdminSettings reads the instance settings map and per-key sources (issue #2347):
 	// GET /api/admin/settings. READ-ONLY — writes are cookie-only and stay in the web UI.
 	AdminSettings(ctx context.Context) (AdminSettingsView, error)
@@ -338,7 +341,7 @@ type Client interface {
 	// sends no meaningful selection (byte-identical to a pre-#1429 create; the server
 	// resolves the effective harness itself, D11), "claude"/"codex" (validated CLIENT-SIDE
 	// before this call) rides as an explicit pin.
-	CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, credOverride *CreateRunCredentialOverride, harness string) (apitypes.RunDTO, error)
+	CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, credOverride *CreateRunCredentialOverride, harness string) (CreatedRunResult, error)
 	// CreateTaskRun queues a handoff/task run on a repo (PRD #400 M3). A nil
 	// continuedIssueIID omits the optional existing-issue link:
 	// POST /api/repos/{id}/task-runs {context, base_branch?, open_mr}. The server
@@ -354,7 +357,7 @@ type Client interface {
 	// findings to the same branch (--then-fix implies --review); interactive
 	// (--interactive) asks the worker to keep the run alive after signal_done (parking in
 	// awaiting_followup to iterate) rather than terminating.
-	CreateTaskRun(ctx context.Context, repoID, context, baseBranch string, openMR, reviewRequested, thenFixRequested, interactive bool, continuedIssueIID *int64) (apitypes.RunDTO, error)
+	CreateTaskRun(ctx context.Context, repoID, context, baseBranch string, openMR, reviewRequested, thenFixRequested, interactive bool, continuedIssueIID *int64) (CreatedRunResult, error)
 	// GetTaskReview fetches a handoff task's diff-review (PRD #400 M4a): GET
 	// /api/runs/{id}/task-review, whose envelope is {"task_review": <dto>|null}. A visible
 	// task with no review yet returns a nil DTO (the CLI prints "no review available yet");
@@ -702,7 +705,7 @@ type Client interface {
 	// created run (201). The server re-validates the Fix-CI preconditions, so a ref
 	// whose latest cached pipeline is not failed (or has no cached pipeline) is a 409 →
 	// ExitConflict (5); a foreign/unknown repo is a 404 (exit 4).
-	CreateCIFixRun(ctx context.Context, repoID, ref string) (apitypes.RunDTO, error)
+	CreateCIFixRun(ctx context.Context, repoID, ref string) (CreatedRunResult, error)
 	// RecoveryArchives returns a run's owner-scoped durable-recovery summary — metadata
 	// ONLY, never raw bytes (PRD #1296 D6/D7): GET /api/runs/{id}/archives. RequireUser
 	// and strict owner-or-404 server-side (an admin viewing a foreign run is refused,

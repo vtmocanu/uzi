@@ -107,6 +107,13 @@ func (r *tuiRenderer) Plain(s string, maxRunes int) string {
 	return capCell(cellText(s), maxRunes)
 }
 
+// WorkerName preserves identifying tails within terminal columns, after D7
+// sanitization. cellText caps at 200 runes, so longer inputs have already lost
+// their original tail before this shortening step.
+func (r *tuiRenderer) WorkerName(s string, width int) string {
+	return middleCell(cellText(s), width)
+}
+
 // provenanceBox draws untrusted free text inside a bordered box titled with WHERE the
 // text came from.
 //

@@ -439,8 +439,8 @@ tasks:
       # make fails the gate closed. Before `scan:secrets`, which is deliberately last.
       - task: check:api-v1-compat
       # PR-time entry gate: a branch changing shipping paths adds a valid new fragment or
-      # legacy Unreleased line, carries `Changelog: none`, is docs-typed, or touches dependency
-      # manifests (the release oracle's rules, moved to the PR). Needs a merge-base with
+      # legacy Unreleased line, carries `Changelog: none`, or touches dependency
+      # manifests (see the script's exact predicates). Needs a merge-base with
       # origin/main, so CI's lint-repo job checks out full history; fails closed (exit 2)
       # without one. Its hermetic suite runs first so a gutted check cannot read green.
       - task: test:changelog-fragments
@@ -1509,7 +1509,7 @@ tasks:
       - ./scripts/check-mktemp-portability.sh scripts/mktemp-portability-canary.txt
 
   check:changelog-entry:
-    desc: a shipping branch adds a valid new fragment or legacy Unreleased line, or is exempt (Changelog none, docs-typed, manifests only)
+    desc: a shipping branch adds a valid new fragment or legacy Unreleased line, or is exempt (Changelog none, manifests only)
     cmds:
       # See the script header for the exemptions and why each matches the release oracle
       # (scripts/assert-changelog-covers-release.sh), which stays the final check at cut time.

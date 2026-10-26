@@ -342,7 +342,7 @@ func newRunReworkCmd(env Env, gf *globalFlags) *cobra.Command {
 			}
 			// renderCreatedRun is `run create`'s renderer: renderRunDetail for humans and the
 			// SAME {"run": <dto>} envelope for --json, since this creates a new mr_rework run.
-			return renderCreatedRun(env, gf, run)
+			return renderCreatedRun(env, gf, run.RunDTO, run.Notice)
 		},
 	}
 	rework.Flags().StringP("message", "m", "", "optional guidance to steer the rework (or pipe it on stdin)")

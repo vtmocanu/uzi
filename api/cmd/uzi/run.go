@@ -573,18 +573,32 @@ func openQuestion(ctx context.Context, c uzicli.Client, runID string) (questionP
 // already carries a health reason (e.g. a locked vault parks it queued). The reliable
 // surface remains `uzi run get`/`run list`, which poll the same reason; this warns at
 // create time so an agent that queues then polls is not left blind on the first read.
-func renderCreatedRun(env Env, gf *globalFlags, run apitypes.RunDTO) error {
+func renderCreatedRun(env Env, gf *globalFlags, run apitypes.RunDTO, notice string) error {
 	if run.HealthReason != nil && strings.TrimSpace(*run.HealthReason) != "" {
 		_, _ = fmt.Fprintf(env.Stderr, "warning: %s\n", sanitizeTTY(strings.TrimSpace(*run.HealthReason)))
 	}
+	printNotice(env, notice)
 	p := env.printer(gf)
 	if p.Format == uzicli.FormatJSON {
-		return p.JSON(map[string]any{"run": run})
+		out := map[string]any{"run": run}
+		if strings.TrimSpace(notice) != "" {
+			out["notice"] = notice
+		}
+		return p.JSON(out)
 	}
 	if !gf.quiet {
 		return renderRunDetail(p, run)
 	}
 	return nil
+}
+
+// printNotice writes the server's create-time notice (PRD #3454: instance maintenance holds the
+// new run in the queue) to stderr as a warning, so stdout stays machine-readable. The text is
+// server-authored, so it passes through sanitizeTTY.
+func printNotice(env Env, notice string) {
+	if n := strings.TrimSpace(notice); n != "" {
+		_, _ = fmt.Fprintf(env.Stderr, "warning: %s\n", sanitizeTTY(n))
+	}
 }
 
 // nonEmpty drops blank entries from a StringSlice flag (e.g. --exclude-agents "" or

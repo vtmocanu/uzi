@@ -34,12 +34,15 @@ import { repoAgentFolder } from "../lib/repoAgentFolder";
 import { stripDisplayCell, stripUnsafeChars } from "../lib/safeText";
 import { sanitizeLabel } from "../lib/sanitizeLabel";
 import { useNow } from "../lib/useNow";
+import { useMaintenance } from "../lib/useMaintenance";
 import { credentialSwitchHold } from "../lib/credentialSwitchHold";
 import {
   effectiveRunStatus,
   parkLabel,
   formatElapsed,
   healthFlagLabel,
+  isMaintenanceQueued,
+  maintenanceQueueText,
   isStoppedRun,
   isRejectedRun,
   milestoneBadge,
@@ -320,7 +323,12 @@ function checkpointSentence(run: Run, nowMs: number): string | null {
  */
 export function HealthFlag({ run }: { run: Run }) {
   const now = useNow(30_000);
-  const show = shouldShowHealthFlag(run.health, run.status);
+  const maintenanceReason = useMaintenance().status?.reason;
+  // PRD #3454: maintenance mode holding this queued run back takes precedence over every
+  // health flag (the detector may still say waiting_worker). A calm info line, no "stuck
+  // for" clock: the wait is the admin's drain, not a fault.
+  const maintenance = isMaintenanceQueued(run);
+  const show = !maintenance && shouldShowHealthFlag(run.health, run.status);
   const since = run.health_since ? Date.parse(run.health_since) : NaN;
   // Near timeout ("slow", PRD #1170) counts DOWN to run.deadline_at instead of the
   // since-flagged "stuck for Xm" every other flag keeps: `· 1h 5m left`, or `· stopping`
@@ -341,9 +349,21 @@ export function HealthFlag({ run }: { run: Run }) {
   // the region re-announce on every tick, the same countdown-in-a-live-region hostility
   // the park panel's role="status" note warns about. The stuck time and reason stay in
   // the visible pill, which no screen reader is listening to.
-  const announce = show ? (healthFlagLabel(run.health) ?? "") : "";
+  const announce = maintenance
+    ? maintenanceQueueText(maintenanceReason)
+    : show
+      ? (healthFlagLabel(run.health) ?? "")
+      : "";
   return (
     <>
+      {maintenance && (
+        <span
+          data-queue-reason="maintenance"
+          className="inline-flex items-center gap-1 rounded-full border border-info/40 bg-info/10 px-2 py-0.5 text-[11px] font-medium text-info"
+        >
+          {maintenanceQueueText(maintenanceReason)}
+        </span>
+      )}
       {show && (
         // A PLAIN (non-live) span: the sr-only region below owns the announcement.
         // role="status" used to sit HERE, and that was the bug the comment denied — a

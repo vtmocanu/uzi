@@ -49,7 +49,7 @@ func newRunCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return renderCreatedRun(env, gf, run)
+			return renderCreatedRun(env, gf, run.RunDTO, run.Notice)
 		},
 	}
 	create.Flags().String("repo", "", "repo id to run against (see 'uzi repo list')")

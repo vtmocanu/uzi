@@ -27,7 +27,7 @@ func TestM2RunBlockedReasonRowAndJSON(t *testing.T) {
 			}
 		}
 		var machine bytes.Buffer
-		if err := renderCreatedRun(Env{Stdout: &machine, Stderr: &machine}, &globalFlags{json: true}, r); err != nil {
+		if err := renderCreatedRun(Env{Stdout: &machine, Stderr: &machine}, &globalFlags{json: true}, r, ""); err != nil {
 			t.Fatal(err)
 		}
 		var envelope struct {

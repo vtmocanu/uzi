@@ -12,6 +12,7 @@ import (
 	"unicode"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -57,6 +58,8 @@ type fakeStore struct {
 	undispatchErr          error
 	pausedCount            int64
 	pausedErr              error
+	pause                  store.InstanceIntakePause
+	pauseErr               error
 	gaveUp                 []store.ListGaveUpColumnMovesRow
 	gaveUpErr              error
 	custodyOwners          []uuid.UUID
@@ -108,6 +111,9 @@ func (f *fakeStore) OldestUndispatchedTaskRun(context.Context) (pgtype.Timestamp
 }
 func (f *fakeStore) CountUsersPausedWithEnabledSchedules(context.Context, pgtype.Timestamptz) (int64, error) {
 	return f.pausedCount, f.pausedErr
+}
+func (f *fakeStore) GetInstanceIntakePause(context.Context) (store.InstanceIntakePause, error) {
+	return f.pause, f.pauseErr
 }
 func (f *fakeStore) ListGaveUpColumnMoves(context.Context, store.ListGaveUpColumnMovesParams) ([]store.ListGaveUpColumnMovesRow, error) {
 	return f.gaveUp, f.gaveUpErr
@@ -721,6 +727,97 @@ func TestSchedulesPaused(t *testing.T) {
 	}
 }
 
+// ---- maintenance.active ----------------------------------------------------
+
+func TestMaintenanceActive(t *testing.T) {
+	since := time.Date(2026, 10, 26, 9, 0, 0, 0, time.UTC)
+	active := store.InstanceIntakePause{ID: true, Active: true,
+		Since:  pgtype.Timestamptz{Time: since, Valid: true},
+		Reason: pgtype.Text{String: "node drain", Valid: true}}
+	readout := store.MaintenanceReadout{
+		Active:  store.MaintenanceSection{Count: 2},
+		Held:    store.MaintenanceSection{Count: 3},
+		Custody: store.MaintenanceSection{Count: 1},
+		Queued:  store.MaintenanceSection{Count: 7},
+	}
+	evidence := func(c apitypes.HealthCheckDTO) map[string]string {
+		m := map[string]string{}
+		for _, e := range c.Evidence {
+			m[e.Label] = e.Value
+		}
+		return m
+	}
+
+	t.Run("ok when off", func(t *testing.T) {
+		svc := newSvc(&fakeStore{pause: store.InstanceIntakePause{ID: true}}, &fakeSettings{})
+		c := svc.checkMaintenanceActive(context.Background())
+		if c.Severity != sevOK || c.Summary != "uzi is not in maintenance mode." || c.Since != nil {
+			t.Fatalf("got %q / %q / since %v", c.Severity, c.Summary, c.Since)
+		}
+		if c.Scope != "instance" || c.Group != groupHousekeeping || c.Title != "Maintenance mode" {
+			t.Errorf("meta = %q %q %q", c.Scope, c.Group, c.Title)
+		}
+	})
+	t.Run("warn with reason, since and counts", func(t *testing.T) {
+		svc := newSvc(&fakeStore{pause: active}, &fakeSettings{})
+		svc.cfg.MaintenanceReadout = func(context.Context) (store.MaintenanceReadout, error) { return readout, nil }
+		c := svc.checkMaintenanceActive(context.Background())
+		if c.Severity != sevWarn || c.Summary != "Maintenance mode is on: new runs wait in the queue. Reason: node drain" {
+			t.Fatalf("got %q / %q", c.Severity, c.Summary)
+		}
+		if c.Since == nil || *c.Since != "2026-10-26T09:00:00Z" {
+			t.Errorf("since = %v", c.Since)
+		}
+		want := map[string]string{"Running": "2", "Held": "3", "Custody holds": "1", "Queued": "7", "Clear": "no"}
+		got := evidence(c)
+		for k, v := range want {
+			if got[k] != v {
+				t.Errorf("evidence[%q] = %q, want %q", k, got[k], v)
+			}
+		}
+	})
+	t.Run("clear readout", func(t *testing.T) {
+		svc := newSvc(&fakeStore{pause: active}, &fakeSettings{})
+		svc.cfg.MaintenanceReadout = func(context.Context) (store.MaintenanceReadout, error) { return store.MaintenanceReadout{}, nil }
+		if got := evidence(svc.checkMaintenanceActive(context.Background()))["Clear"]; got != "yes" {
+			t.Errorf("Clear = %q", got)
+		}
+	})
+	t.Run("no reason", func(t *testing.T) {
+		p := active
+		p.Reason = pgtype.Text{}
+		svc := newSvc(&fakeStore{pause: p}, &fakeSettings{})
+		if c := svc.checkMaintenanceActive(context.Background()); c.Summary != "Maintenance mode is on: new runs wait in the queue." {
+			t.Errorf("summary = %q", c.Summary)
+		}
+	})
+	t.Run("hostile reason is sanitized", func(t *testing.T) {
+		p := active
+		p.Reason = pgtype.Text{String: "x\x1b[2Jy\u202ez", Valid: true}
+		svc := newSvc(&fakeStore{pause: p}, &fakeSettings{})
+		if c := svc.checkMaintenanceActive(context.Background()); strings.ContainsAny(c.Summary, "\x1b\u202e") {
+			t.Errorf("summary carries control or bidi characters: %q", c.Summary)
+		}
+	})
+	t.Run("missing row warns and says so", func(t *testing.T) {
+		svc := newSvc(&fakeStore{pauseErr: pgx.ErrNoRows}, &fakeSettings{})
+		c := svc.checkMaintenanceActive(context.Background())
+		if c.Severity != sevWarn || !strings.Contains(c.Summary, "state row is missing") || !strings.Contains(c.Summary, "held") {
+			t.Fatalf("got %q / %q", c.Severity, c.Summary)
+		}
+	})
+	t.Run("readout error keeps the warning", func(t *testing.T) {
+		svc := newSvc(&fakeStore{pause: active}, &fakeSettings{})
+		svc.cfg.MaintenanceReadout = func(context.Context) (store.MaintenanceReadout, error) {
+			return store.MaintenanceReadout{}, errors.New("readout failed")
+		}
+		c := svc.checkMaintenanceActive(context.Background())
+		if c.Severity != sevWarn || evidence(c)["Readout"] != "unavailable" {
+			t.Fatalf("got %q / %+v", c.Severity, c.Evidence)
+		}
+	})
+}
+
 // ---- board.drift -----------------------------------------------------------
 
 func TestBoardDrift(t *testing.T) {
@@ -1081,11 +1178,11 @@ func TestEvaluateRollupAndRegistry(t *testing.T) {
 	// (integrations), so it is 14, not 11; PRD #1809 M6 added fleet.rundisk
 	// (workers), issue #2203 adds forge.sync (integrations), and issue #2213 adds
 	// fleet.quarantine and issue #3142 adds fleet.memory_authority (workers); pricing.codex follows release.check, db.size follows db and
-	// recovery.storage follows custody.holds, making 22 with agentsource.update after release.check.
+	// recovery.storage follows custody.holds, making 23 with agentsource.update after release.check and maintenance.active after schedules.paused (PRD #3454).
 	wantIDs := []string{
 		"fleet.roll", "fleet.capacity", "fleet.disk", "fleet.rundisk", "fleet.quarantine", "fleet.memory_authority", "queue.waiting", "queue.undispatched",
 		"controller.report", "db", "db.size", "loops", "forge.ciwatch", "forge.sync", "slack.socket",
-		"schedules.paused", "board.drift", "custody.holds", "recovery.storage", "release.check", "agentsource.update", "pricing.codex",
+		"schedules.paused", "maintenance.active", "board.drift", "custody.holds", "recovery.storage", "release.check", "agentsource.update", "pricing.codex",
 	}
 	if len(doc.Checks) != len(wantIDs) {
 		t.Fatalf("doc has %d checks, want %d", len(doc.Checks), len(wantIDs))
@@ -1209,6 +1306,10 @@ func TestDegradeUnknownOnQueryError(t *testing.T) {
 	t.Run("schedules.paused", func(t *testing.T) {
 		svc := newSvc(&fakeStore{pausedErr: boom}, &fakeSettings{})
 		assertUnknown(t, svc.checkSchedulesPaused(context.Background(), fixedNow), degradeSummary)
+	})
+	t.Run("maintenance.active", func(t *testing.T) {
+		svc := newSvc(&fakeStore{pauseErr: boom}, &fakeSettings{})
+		assertUnknown(t, svc.checkMaintenanceActive(context.Background()), degradeSummary)
 	})
 	t.Run("board.drift", func(t *testing.T) {
 		svc := newSvc(&fakeStore{gaveUpErr: boom}, &fakeSettings{})

@@ -610,6 +610,8 @@ SELECT DISTINCT ON (r.issue_iid)
        r.budget_finalize_seconds, r.hold_reason,
        r.auto_approve_blocked_reasons,
        r.created_at, r.updated_at,
+       -- PRD #3454: "maintenance" while intake is paused and this queued run is not admitted, else '' (sqlc types a CASE column non-null; the handler maps '' to absent).
+       (CASE WHEN r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r) THEN 'maintenance' ELSE '' END)::text AS queue_reason,
        ru.display_name AS owner_name, rw.name AS worker_name,
        COUNT(*) OVER (PARTITION BY r.issue_iid) AS run_count
 FROM runs r
@@ -643,6 +645,8 @@ SELECT r.id, r.user_id, r.status, r.mr_iid, r.mr_web_url, r.mr_state, r.failure_
        r.budget_finalize_seconds, r.hold_reason,
        r.auto_approve_blocked_reasons,
        r.created_at, r.updated_at,
+       -- PRD #3454: "maintenance" while intake is paused and this queued run is not admitted, else '' (sqlc types a CASE column non-null; the handler maps '' to absent).
+       (CASE WHEN r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r) THEN 'maintenance' ELSE '' END)::text AS queue_reason,
        ru.display_name AS owner_name, rw.name AS worker_name,
        COUNT(*) OVER () AS run_count
 FROM runs r

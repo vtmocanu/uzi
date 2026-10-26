@@ -19,11 +19,18 @@ holds one canonical category and one outcome/description block; the exact gramma
 and contributor commands live in [changelog.d/README.md](../changelog.d/README.md).
 
 Existing legacy `[Unreleased]` bullets remain until the next release, and direct
-additions remain accepted during migration. The PR check retains `Changelog: none`,
-docs-typed and dependency-manifest exemptions. Its
+additions remain accepted during migration. The PR check retains explicit
+`Changelog: none` and dependency-manifest exemptions. Its
 [implementation](../scripts/check-changelog-entry.sh) validates changed fragments
 before accepting an entry or exemption; a valid new path absent at the merge base
 can supply an entry, while editing or deleting inherited paths cannot.
+
+**Amended 2026-10-26 (#3511):** docs-typed shipping branch subjects no longer
+exempt a PR. A non-docs squash title loses that implicit declaration, so such a
+branch supplies a new fragment, a permitted legacy entry, or an explicit
+`Changelog: none` line with a reason in a non-merge branch commit. The existing
+squash-with-commit-messages convention preserves the declaration in the final
+body. The release oracle's docs-subject exemption remains unchanged.
 
 The [release oracle](../scripts/assert-changelog-covers-release.sh) separately
 checks shipping commit identity in the assembled release section. Fragment

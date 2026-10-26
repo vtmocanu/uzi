@@ -80,6 +80,11 @@ type PlanGateSubmitter interface {
 	// HasOnlineWorker reports whether the user has a worker online (PRD #191 M6): the
 	// opener names "no worker connected" as the reason a fresh chat sits queued.
 	HasOnlineWorker(ctx context.Context, userID uuid.UUID) (bool, error)
+	// MaintenanceNotice returns the "queued by maintenance mode" notice (PRD #3454) when the
+	// instance intake pause is active, else "". It is read uncached AFTER a run is created, so
+	// the opener can tell the user why the new chat sits queued; the busy refusal also uses it
+	// to say maintenance is why an earlier chat has not started. Read errors yield "".
+	MaintenanceNotice(ctx context.Context) string
 	// CreateChatRun queues a new chat run seeded with the opening message, returning
 	// the run (its id anchors the DM). It rides the same ownership-scoped service the
 	// web Chat page uses; the Slack path draws from the shared per-user chat spend

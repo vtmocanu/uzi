@@ -511,7 +511,8 @@ func (q *Queries) FailUnservedJobRun(ctx context.Context, arg FailUnservedJobRun
 const getJobForCaller = `-- name: GetJobForCaller :one
 SELECT r.id, r.job_type, r.status, r.issue_title AS title, r.failure_reason, r.fail_origin,
        r.budget_wall_seconds, r.created_at, r.started_at, r.finished_at, r.updated_at,
-       o.product_id, o.product_token_id, o.requested_by_label
+       o.product_id, o.product_token_id, o.requested_by_label,
+       (CASE WHEN r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r) THEN 'maintenance' ELSE '' END)::text AS queue_reason
   FROM runs r
   JOIN job_origins o ON o.run_id = r.id
  WHERE r.id = $1
@@ -541,6 +542,7 @@ type GetJobForCallerRow struct {
 	ProductID         pgtype.UUID        `json:"product_id"`
 	ProductTokenID    pgtype.UUID        `json:"product_token_id"`
 	RequestedByLabel  pgtype.Text        `json:"requested_by_label"`
+	QueueReason       string             `json:"queue_reason"`
 }
 
 func (q *Queries) GetJobForCaller(ctx context.Context, arg GetJobForCallerParams) (GetJobForCallerRow, error) {
@@ -561,6 +563,7 @@ func (q *Queries) GetJobForCaller(ctx context.Context, arg GetJobForCallerParams
 		&i.ProductID,
 		&i.ProductTokenID,
 		&i.RequestedByLabel,
+		&i.QueueReason,
 	)
 	return i, err
 }
@@ -927,7 +930,8 @@ func (q *Queries) ListJobMessagesForCaller(ctx context.Context, arg ListJobMessa
 const listJobsForCaller = `-- name: ListJobsForCaller :many
 SELECT r.id, r.job_type, r.status, r.issue_title AS title, r.failure_reason, r.fail_origin,
        r.budget_wall_seconds, r.created_at, r.started_at, r.finished_at, r.updated_at,
-       o.product_id, o.product_token_id, o.requested_by_label
+       o.product_id, o.product_token_id, o.requested_by_label,
+       (CASE WHEN r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r) THEN 'maintenance' ELSE '' END)::text AS queue_reason
   FROM runs r
   JOIN job_origins o ON o.run_id = r.id
  WHERE r.kind = 'job'
@@ -962,6 +966,7 @@ type ListJobsForCallerRow struct {
 	ProductID         pgtype.UUID        `json:"product_id"`
 	ProductTokenID    pgtype.UUID        `json:"product_token_id"`
 	RequestedByLabel  pgtype.Text        `json:"requested_by_label"`
+	QueueReason       string             `json:"queue_reason"`
 }
 
 // Newest first, keyset on (created_at, id) descending. A NULL cursor starts at the newest job.
@@ -995,6 +1000,7 @@ func (q *Queries) ListJobsForCaller(ctx context.Context, arg ListJobsForCallerPa
 			&i.ProductID,
 			&i.ProductTokenID,
 			&i.RequestedByLabel,
+			&i.QueueReason,
 		); err != nil {
 			return nil, err
 		}

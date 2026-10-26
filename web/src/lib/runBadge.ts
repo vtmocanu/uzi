@@ -9,6 +9,7 @@ import {
   type Run,
   type Milestone,
   type MilestoneAgent,
+  type QueueReason,
   type RunHealth,
   type RunPriority,
   type StopKind,
@@ -37,6 +38,9 @@ export type RunBadge =
       tone: BadgeTone;
       pulse: boolean;
       title?: string;
+      // wrap lets a sentence-length label (the maintenance wait) wrap instead of
+      // overflowing a narrow card; absent keeps the usual one-line pill.
+      wrap?: boolean;
     };
 
 // MrChipState is the MR chip's display variant (PRD #33 Decision 2, a
@@ -448,7 +452,27 @@ export type HealthFlaggable = {
   // near-timeout flag ("slow") counts DOWN to it; optional for api/web rollout skew —
   // an older api pod omits it and the badge falls back to the since-flagged suffix.
   deadline_at?: string | null;
+  // PRD #3454: "maintenance" while instance maintenance mode holds this queued run back.
+  // Optional for api/web rollout skew; absent reads as no instance hold.
+  queue_reason?: QueueReason | null;
 };
+
+// isMaintenanceQueued reports whether instance maintenance mode, not a missing worker, is
+// why this run waits. The server derives queue_reason from the same SQL function the claim
+// uses, so it never lags; the status check is belt-and-braces for a stale frame.
+export function isMaintenanceQueued(run: { status: string; queue_reason?: QueueReason | null }): boolean {
+  return run.status === "queued" && run.queue_reason === "maintenance";
+}
+
+// maintenanceQueueText is the one sentence every surface uses for a maintenance-held run,
+// with the admin's reason appended when the shared maintenance state carries one. The reason
+// is admin-authored free text: reduced to one display cell here.
+export function maintenanceQueueText(reason?: string | null): string {
+  const clean = stripDisplayCell(reason).trim();
+  return clean === ""
+    ? "waiting: uzi is in maintenance mode"
+    : `waiting: uzi is in maintenance mode (${clean})`;
+}
 
 // healthSuffix is the trailing clause on a flagged run's pill. For the NEAR-TIMEOUT flag
 // ("slow", PRD #1170) it counts DOWN to the run's server-computed deadline — `· 1h 5m
@@ -477,7 +501,24 @@ function healthSuffix(run: HealthFlaggable, nowMs: number): string {
 export function healthBadge(
   run: HealthFlaggable,
   nowMs: number,
+  maintenanceReason?: string | null,
 ): RunBadge | null {
+  // PRD #3454: a maintenance-held run is waiting ON PURPOSE. This takes precedence over
+  // every health flag (the server's detector may still say waiting_worker): a calm INFO
+  // pill, no pulse, no elapsed "stuck for" clock, since the wait is the admin's drain.
+  // The visible label is the full PRD sentence (reason included), wrapping on a narrow
+  // card; the title repeats it for a truncating surface.
+  if (isMaintenanceQueued(run)) {
+    const text = maintenanceQueueText(maintenanceReason);
+    return {
+      kind: "badge",
+      label: text,
+      tone: "info",
+      pulse: false,
+      title: text,
+      wrap: true,
+    };
+  }
   if (!shouldShowHealthFlag(run.health, run.status)) return null;
   const label = healthFlagLabel(run.health);
   return {
@@ -499,7 +540,7 @@ function badgeTitle(reason: string | null | undefined): string | undefined {
 
 // runBadge maps a card's latest_run to its primary status pill. nowMs is passed in
 // (not read from Date.now) so the running elapsed is deterministic under test.
-export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause" | "worker_recovery" | "requeue_count" | "memory_hold">>, nowMs: number): RunBadge {
+export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause" | "worker_recovery" | "requeue_count" | "memory_hold">>, nowMs: number, maintenanceReason?: string | null): RunBadge {
   // The stopped signal wins over the raw status so a cancel-shaped `failed`
   // never renders as breakage.
   if (isStoppedRun(run.status, run.stop_kind)) {
@@ -522,7 +563,7 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
   // calm "revising" info badge is the more informative live-state, matching the strip/
   // ring/favicon dropping the run entirely. Non-revising runs are byte-identical (the
   // `eff !== "revising"` guard is a no-op unless the run is revising).
-  const flagged = healthBadge(run, nowMs);
+  const flagged = healthBadge(run, nowMs, maintenanceReason);
   if (flagged && eff !== "revising") return flagged;
   switch (eff) {
     case "queued":
