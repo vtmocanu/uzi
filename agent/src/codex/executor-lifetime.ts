@@ -47,10 +47,17 @@ export class ExecutorLifetime {
   private phase: "open" | "sealing" | "sealed" = "open";
   private readonly tails = new Set<Promise<unknown>>();
   private readonly incarnations = new Map<object, Incarnation>();
-  private readonly executorIncarnation = randomUUID();
+  private readonly incarnationId = randomUUID();
   private failure = false;
   private completion?: Promise<ExecutorSealResult>;
   private sealedFor?: object;
+
+  /**
+   * This lifetime's executor incarnation: the value `terminalSealMaterial(...).executorIncarnation`
+   * reports, so a source-use lease admitted with `{ executor: lifetime.executorIncarnation }`
+   * matches the seal this lifetime later produces.
+   */
+  get executorIncarnation(): string { return this.incarnationId; }
 
   assertOpen(): void {
     if (this.phase !== "open") throw new TrustedExecutionRefusal("codex executor lifetime closed");
@@ -137,7 +144,7 @@ export class ExecutorLifetime {
       const seal = Object.freeze({}) as ExecutorTerminalSeal;
       const material: ExecutorSealMaterial = Object.freeze({
         sourceUse,
-        executorIncarnation: this.executorIncarnation,
+        executorIncarnation: this.incarnationId,
         incarnations: Object.freeze([...this.incarnations.values()].map(entry =>
           Object.freeze({ registry: entry.id, facade: entry.facade!.id }))),
       });

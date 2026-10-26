@@ -401,7 +401,8 @@ async function main(): Promise<void> {
 
   // Issue #3404 M1a: take the process-lifetime worker lock W before ensureRunnerTmpdir, any
   // registration, sweep or admission. A second compatible worker, a missing util-linux flock,
-  // an unsupported filesystem or untrusted lock metadata refuses startup (fatal handler). The
+  // an unsupported filesystem, untrusted lock metadata, or an unavailable descriptor path
+  // (/proc/self/fd, needed to create the lock through a held directory) refuses startup (fatal handler). The
   // descriptor is retained for the whole process; nothing here can release it.
   installWorkerLifetime(await acquireWorkerLifetime(config.dataDir, { signal: controller.signal }));
   log.info("worker lifetime lock acquired");

@@ -147,14 +147,42 @@ async function syncDirectory(dir: string): Promise<void> {
   try { await handle.sync(); } finally { await handle.close(); }
 }
 
+/**
+ * True for an owner-only directory mode. S_ISGID is tolerated: a directory made inside a setgid
+ * parent (a Kubernetes fsGroup volume) inherits it, and the bit on a 0700 directory owned by
+ * this worker grants nothing. Every other bit (group/other access, setuid, sticky) is refused.
+ */
+export function isPrivateDirMode(mode: number | bigint): boolean {
+  return (BigInt(mode) & 0o7777n & ~0o2000n) === 0o700n;
+}
+
+/**
+ * mkdir an owner-only directory. Returns false when it already existed (the caller validates it).
+ * A directory this call created is verified through a held descriptor (a directory, owned by
+ * `uid`, not a swapped-in symlink) and then fchmod'd to exactly 0700, which clears an inherited
+ * S_ISGID.
+ */
+export async function mkdirPrivate(dir: string, uid: number): Promise<boolean> {
+  try { await fsp.mkdir(dir, { mode: 0o700 }); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
+  }
+  const handle = await fsp.open(dir, fsc.O_RDONLY | fsc.O_DIRECTORY | fsc.O_NOFOLLOW);
+  try {
+    const stat = await handle.stat({ bigint: true });
+    if (!stat.isDirectory() || stat.uid !== BigInt(uid)) throw new AuthorityRefusal("unsafe authority directory");
+    await handle.chmod(0o700);
+  } finally { await handle.close(); }
+  return true;
+}
+
 async function ensureAuthorityDir(ctx: Context): Promise<void> {
   const root = await fsp.lstat(ctx.dataDir);
   if (!root.isDirectory() || root.isSymbolicLink()) throw new AuthorityRefusal("authority data root is not a real directory");
-  let created = false;
-  try { await fsp.mkdir(ctx.authorityDir, { mode: 0o700 }); created = true; }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+  const created = await mkdirPrivate(ctx.authorityDir, ctx.uid);
   const stat = await fsp.lstat(ctx.authorityDir);
-  if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== ctx.uid || (stat.mode & 0o7777) !== 0o700) {
+  if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== ctx.uid || !isPrivateDirMode(stat.mode)) {
     throw new AuthorityRefusal("unsafe authority directory");
   }
   if (created) await syncDirectory(ctx.dataDir);
@@ -179,7 +207,7 @@ async function openLockFile(ctx: Context, name: string): Promise<{ handle: fsp.F
   const dirHandle = await fsp.open(ctx.authorityDir, fsc.O_RDONLY | fsc.O_DIRECTORY | fsc.O_NOFOLLOW);
   try {
     const held = await dirHandle.stat({ bigint: true });
-    if (!held.isDirectory() || held.uid !== BigInt(ctx.uid) || (held.mode & 0o7777n) !== 0o700n) {
+    if (!held.isDirectory() || held.uid !== BigInt(ctx.uid) || !isPrivateDirMode(held.mode)) {
       throw new AuthorityRefusal("unsafe authority directory");
     }
     const file = path.join(ctx.authorityDir, name);
@@ -188,11 +216,21 @@ async function openLockFile(ctx: Context, name: string): Promise<{ handle: fsp.F
     let handle: fsp.FileHandle;
     let created = false;
     try {
-      handle = await fsp.open(viaDir, base | fsc.O_CREAT | fsc.O_EXCL, 0o600);
-      created = true;
+      try {
+        handle = await fsp.open(viaDir, base | fsc.O_CREAT | fsc.O_EXCL, 0o600);
+        created = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        handle = await fsp.open(viaDir, base);
+      }
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      handle = await fsp.open(viaDir, base);
+      // Every failure of the via-directory open is a refusal with context, not a raw errno. ENOENT
+      // here means the descriptor path itself is unavailable (no procfs), since the directory is held.
+      if (error instanceof AuthorityRefusal) throw error;
+      const code = (error as NodeJS.ErrnoException).code;
+      throw new AuthorityRefusal(code === "ENOENT"
+        ? "authority lock requires /proc/self/fd"
+        : `authority lock open failed: ${code ?? errorText(error)}`);
     }
     try {
       if (created) {

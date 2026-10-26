@@ -207,6 +207,8 @@ describe("ExecutorLifetime (#3404 M1b)", () => {
     assert.equal(material.sourceUse, source);
     assert.equal(material.incarnations.length, 1);
     assert.match(material.executorIncarnation, /^[0-9a-f-]{36}$/);
+    assert.equal(lifetime.executorIncarnation, material.executorIncarnation);
+    assert.notEqual(other.executorIncarnation, lifetime.executorIncarnation);
     assert.match(material.incarnations[0]!.registry, /^[0-9a-f-]{36}$/);
     assert.match(material.incarnations[0]!.facade, /^[0-9a-f-]{36}$/);
     assert.notEqual(material.incarnations[0]!.registry, material.incarnations[0]!.facade);

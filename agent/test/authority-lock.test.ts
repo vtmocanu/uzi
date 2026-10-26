@@ -7,7 +7,7 @@ import path from "node:path";
 import { mock, test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import {
-  acquireWorkerLifetime, AuthorityTransaction, WorkerLifetime, withAuthorityTransaction,
+  acquireWorkerLifetime, AuthorityRefusal, AuthorityTransaction, WorkerLifetime, withAuthorityTransaction,
 } from "../src/authority-lock.js";
 import { makeTmp, spawnWorkerLockHolder, testLockOptions, utilLinux } from "./authority-test-support.js";
 
@@ -359,4 +359,57 @@ test("A: a lock file is created inside the verified directory handle, and a swap
   await assert.rejects(withAuthorityTransaction(lifetime, { timeoutMs: 2000 }, async () => "no"), /identity changed/);
   assert.equal(swapped, true);
   assert.deepEqual(fs.readdirSync(dir), [], "the lock file was not created in the swapped-in directory");
+});
+
+/** A data root that is setgid, like a Kubernetes fsGroup volume (drwxrwsr-x). Skips when the host refuses the bit. */
+function setgidRoot(t: Parameters<typeof makeTmp>[0]): string | undefined {
+  const root = makeTmp(t);
+  fs.chmodSync(root, 0o2770);
+  return (fs.statSync(root).mode & 0o2000) === 0 ? undefined : root;
+}
+
+test("W: a setgid data root still starts: the created authority directory is exactly 0700", async (t) => {
+  const root = setgidRoot(t);
+  if (root === undefined) { t.skip("host does not let this user set S_ISGID on its own directory"); return; }
+  const lifetime = await acquireWorkerLifetime(root, testLockOptions());
+  assert.equal(fs.statSync(authorityDir(root)).mode & 0o7777, 0o700, "mkdir inherited S_ISGID and it was not cleared");
+  assert.equal(await withAuthorityTransaction(lifetime, { timeoutMs: 2000 }, async () => "ok"), "ok");
+});
+
+test("W: an existing authority directory at 02700 is accepted; setuid or sticky is not", async (t) => {
+  const setgid = makeTmp(t);
+  fs.mkdirSync(authorityDir(setgid), { mode: 0o700 });
+  fs.chmodSync(authorityDir(setgid), 0o2700);
+  if ((fs.statSync(authorityDir(setgid)).mode & 0o2000) === 0) { t.skip("host does not let this user set S_ISGID"); return; }
+  await acquireWorkerLifetime(setgid, testLockOptions());
+
+  const sticky = makeTmp(t);
+  fs.mkdirSync(authorityDir(sticky), { mode: 0o700 });
+  fs.chmodSync(authorityDir(sticky), 0o1700);
+  await assert.rejects(acquireWorkerLifetime(sticky, testLockOptions()), /unsafe authority directory/);
+});
+
+test("W: lock-open failures are authority refusals with context, not raw errnos", async (t) => {
+  const symlink = makeTmp(t);
+  fs.mkdirSync(authorityDir(symlink), { mode: 0o700 });
+  fs.writeFileSync(path.join(symlink, "target"), "", { mode: 0o600 });
+  fs.symlinkSync(path.join(symlink, "target"), lockFile(symlink));
+  const refusal = await acquireWorkerLifetime(symlink, testLockOptions()).then(() => undefined, (error: unknown) => error);
+  assert.ok(refusal instanceof AuthorityRefusal, String(refusal));
+  assert.match((refusal as Error).message, /authority lock open failed: ELOOP/);
+
+  // No usable descriptor path (no procfs): the creating open of the via-directory name fails with ENOENT.
+  const root = makeTmp(t);
+  const realOpen = fsp.open;
+  const patched = mock.method(fsp, "open", async (...args: Parameters<typeof fsp.open>) => {
+    if (typeof args[0] === "string" && args[0].startsWith("/proc/self/fd/")) {
+      throw Object.assign(new Error("ENOENT: no such file or directory"), { code: "ENOENT" });
+    }
+    return realOpen(...args);
+  });
+  syncBuiltinESMExports();
+  t.after(() => { patched.mock.restore(); syncBuiltinESMExports(); });
+  const noProc = await acquireWorkerLifetime(root, testLockOptions()).then(() => undefined, (error: unknown) => error);
+  assert.ok(noProc instanceof AuthorityRefusal, String(noProc));
+  assert.match((noProc as Error).message, /authority lock requires \/proc\/self\/fd/);
 });

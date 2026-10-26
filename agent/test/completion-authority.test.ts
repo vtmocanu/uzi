@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { createHmac, randomBytes, randomUUID } from "node:crypto";
-import fs from "node:fs";
+import { randomBytes, randomUUID } from "node:crypto";
+import fs, { constants as fsConstants } from "node:fs";
+import fsp from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
-import { test, type TestContext } from "node:test";
+import { mock, test, type TestContext } from "node:test";
 import {
   acquireWorkerLifetime, AuthorityRefusal, type AuthorityTransaction, withAuthorityTransaction, type WorkerLifetime,
 } from "../src/authority-lock.js";
@@ -58,7 +60,7 @@ const leaseSources = new WeakMap<SourceUseLease, CompletionSourceV2>();
 /** Admit a codex slot: the executor id is the lifetime's, and the lease is sealed for it. */
 async function admitCodex(s: AuthorityStore, t2: AuthorityTransaction, src: string): Promise<SourceUseLease> {
   const lifetime = new ExecutorLifetime();
-  const lease = await s.admitSourceUse(t2, src, { executor: (lifetime as unknown as { executorIncarnation: string }).executorIncarnation });
+  const lease = await s.admitSourceUse(t2, src, { executor: lifetime.executorIncarnation });
   const identity = {};
   lifetime.inventory(identity, () => true);
   lifetime.bindFacade(identity, {}, () => true);
@@ -498,7 +500,7 @@ test("a rolled-back or deleted head, or a deleted slot, refuses", async (t) => {
   await assert.rejects(tx(f, (t2) => s.readSlot(t2, key)), /authority head missing/);
 
   fs.rmSync(path.join(authorityDir(f), "heads"), { recursive: true });
-  await assert.rejects(store(f), /without a head/);
+  await assert.rejects(store(f), /enrolled authority store has no heads/);
   await assert.rejects(tx(f, (t2) => s.readSlot(t2, key)), /head missing/);
 
   const g = await fixture(t);
@@ -1046,18 +1048,97 @@ test("heads swapped for a symlink refuses with an authority refusal, not a raw e
   assert.ok(reopened instanceof AuthorityRefusal, String(reopened));
 });
 
-test("a MAC-valid head shard holding a key of another shard is refused", async (t) => {
+test("a head shard holding a key of another shard is refused before its MAC is compared", async (t) => {
   const f = await fixture(t);
   await store(f);
   const enrolled = JSON.parse(fs.readFileSync(enrollmentFile(f), "utf8")) as { storageId: string };
-  // Forge with the join token's derived key: the only way to reach the prefix check past the MAC.
-  const macKey = createHmac("sha256", TOKEN).update("uzi completion authority v1").digest();
+  // Normalization (including the key-prefix check) runs before the MAC compare, so a well-formed
+  // dummy MAC is enough: the refusal is "malformed", not "failed authentication".
   const shard = "ab";
   const body = {
     version: "uzi-authority-head/2", storageId: enrolled.storageId, shard, slots: { ["cd" + "1".repeat(62)]: 1 },
   };
-  const mac = createHmac("sha256", macKey).update(`uzi-authority-record\0head\0${JSON.stringify(body)}`).digest("hex");
-  fs.writeFileSync(path.join(authorityDir(f), "heads", `${shard}.json`), JSON.stringify({ ...body, mac }) + "\n", { mode: 0o600 });
+  fs.writeFileSync(path.join(authorityDir(f), "heads", `${shard}.json`), JSON.stringify({ ...body, mac: "0".repeat(64) }) + "\n", { mode: 0o600 });
   const s = await store(f);
   await assert.rejects(tx(f, (t2) => s.readSlot(t2, shard + "2".repeat(62))), /malformed authority record/);
+});
+
+test("a setgid data volume (fsGroup) still enrolls: every directory made here is exactly 0700", async (t) => {
+  const root = makeTmp(t);
+  fs.chmodSync(root, 0o2770);
+  if ((fs.statSync(root).mode & 0o2000) === 0) { t.skip("host does not let this user set S_ISGID on its own directory"); return; }
+  const f: Fixture = { root, lifetime: await acquireWorkerLifetime(root, testLockOptions()), token: TOKEN };
+  const s = await store(f);
+  const src = source(f);
+  const lease = await tx(f, (t2) => s.admitSourceUse(t2, src));
+  await tx(f, (t2) => publish(f, s, t2, lease, "claude_ready"));
+  for (const dir of [authorityDir(f), slotsDir(f), path.join(authorityDir(f), "heads")]) {
+    assert.equal(fs.statSync(dir).mode & 0o7777, 0o700, dir);
+  }
+});
+
+test("an enrolled store whose heads and slots were both deleted refuses instead of resetting", async (t) => {
+  const f = await fixture(t);
+  const s = await store(f);
+  const src = source(f);
+  await tx(f, (t2) => s.admitSourceUse(t2, src));
+  fs.rmSync(path.join(authorityDir(f), "heads"), { recursive: true });
+  fs.rmSync(slotsDir(f), { recursive: true });
+  await assert.rejects(store(f), /enrolled authority store has no heads/);
+  const bare = await fixture(t);
+  await store(bare);
+  fs.rmSync(path.join(authorityDir(bare), "heads"), { recursive: true });
+  await assert.rejects(store(bare), /enrolled authority store has no heads/);
+});
+
+test("heads written but enrollment missing (crash window) is adopted when empty and refused otherwise", async (t) => {
+  const f = await fixture(t);
+  await store(f);
+  const headOf = (): { storageId: string } =>
+    JSON.parse(fs.readFileSync(path.join(authorityDir(f), "heads", "00.json"), "utf8")) as { storageId: string };
+  const before = headOf().storageId;
+  fs.rmSync(enrollmentFile(f));
+  const reopened = await store(f);
+  assert.equal((JSON.parse(fs.readFileSync(enrollmentFile(f), "utf8")) as { storageId: string }).storageId, before);
+  const src = source(f);
+  const key = await tx(f, (t2) => reopened.slotKey(t2, src));
+  await tx(f, (t2) => reopened.admitSourceUse(t2, src));
+  assert.equal((await tx(f, (t2) => reopened.readSlot(t2, key)))?.seq, 1);
+
+  // A non-empty head set without an enrollment is a reset attempt, not a crash window.
+  fs.rmSync(enrollmentFile(f));
+  fs.rmSync(slotsDir(f), { recursive: true });
+  await assert.rejects(store(f), /authority heads exist without an enrollment/);
+});
+
+test("a leftover heads staging directory is removed when the heads are created", async (t) => {
+  const f = await fixture(t);
+  const stale = path.join(authorityDir(f), `.heads.${randomUUID()}.tmp`);
+  fs.mkdirSync(stale, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(stale, "00.json"), "partial", { mode: 0o600 });
+  await store(f);
+  assert.equal(fs.existsSync(stale), false);
+  assert.equal(fs.readdirSync(path.join(authorityDir(f), "heads")).length, 256);
+});
+
+test("a transient open failure on the heads directory is named, not reported as an unsafe directory", async (t) => {
+  const f = await fixture(t);
+  const s = await store(f);
+  const src = source(f);
+  const key = await tx(f, (t2) => s.slotKey(t2, src));
+  await tx(f, (t2) => s.admitSourceUse(t2, src));
+  const headsPath = path.join(authorityDir(f), "heads");
+  const realOpen = fsp.open;
+  const patched = mock.method(fsp, "open", async (...args: Parameters<typeof fsp.open>) => {
+    const flags = typeof args[1] === "number" ? args[1] : 0;
+    if (args[0] === headsPath && (flags & fsConstants.O_DIRECTORY) !== 0) {
+      throw Object.assign(new Error("EMFILE: too many open files"), { code: "EMFILE" });
+    }
+    return realOpen(...args);
+  });
+  syncBuiltinESMExports();
+  t.after(() => { patched.mock.restore(); syncBuiltinESMExports(); });
+  const refusal = await tx(f, (t2) => s.readSlot(t2, key)).then(() => undefined, (error: unknown) => error);
+  assert.ok(refusal instanceof AuthorityRefusal, String(refusal));
+  assert.match((refusal as Error).message, /authority directory unavailable: EMFILE/);
 });
