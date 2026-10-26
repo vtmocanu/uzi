@@ -2943,7 +2943,8 @@ export class RunRunner {
   private readonly inventoryReservations = new Set<string>();
   private readonly commandSettlements = new WeakMap<Executor, { confirmed: boolean; failed: boolean }>();
   private readonly executionTails = new Map<string, Promise<ClosedSourceObservation | void>>();
-  // A boundary pass alone is not full cleanup. Only the coordinator completion notification retires bindings.
+  // A boundary pass alone is not full cleanup. Bindings retire only on positive cleanup evidence: the
+  // coordinator's completion notifications, or a binder's cleanup witness reporting full fallback cleanup.
   private readonly completionSourceBindings = new Map<string, readonly CompletionSourceBinding[]>();
   private readonly conflictedCompletionSources = new Set<CompletionSourceBinding>();
   private readonly completionSourceBinds = new Set<Pick<CompletionSourceBinding, "key">>();
