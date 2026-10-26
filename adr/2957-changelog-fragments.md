@@ -30,6 +30,16 @@ checks shipping commit identity in the assembled release section. Fragment
 touches are not an exemption. The structural parser does not establish whether
 a citation covers a shipping commit.
 
+**Amended 2026-10-26 (#3510):** release assembly adds the shipping mainline
+introducer's trailing PR identity, or short SHA, to a pending fragment when that
+commit added exactly one captured pending fragment. Both coverage endpoints are
+pinned to commit IDs. First-parent diffs establish the current addition after
+delete/re-add; side-branch authorship is not substituted. A temporary map applies
+only to validated, committed fragment snapshots, with the existing byte limits.
+Source fragments, equal-prose neighbors and shipped RC blocks are not rewritten.
+Zero or multiple introductions receive no automatic repair; existing valid
+coverage still passes, and missing coverage still fails the independent oracle.
+
 ## Deterministic assembly and consumption
 
 [The renderer](../scripts/lib/changelog-fragments.awk) emits categories in this

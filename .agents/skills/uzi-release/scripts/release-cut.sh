@@ -166,13 +166,17 @@ prev_stable_below() {
 changelog_unreleased_body() {
   printf '%s\n' "$PENDING_BODY"
 }
-# shipping_commits_since <ref> -> one SHA per first-parent commit in <ref>..HEAD that touched
-# a SHIPPING path (is_shipping, shared with the oracle). This is what promote-only keys on:
+# shipping_commits_since <ref> [tip] -> one SHA per first-parent shipping commit.
+# Uses is_shipping, shared with the oracle. This is what promote-only keys on:
 # a docs/skill/prd/build-only commit after the RC must NOT force a next candidate that ships
 # nothing (with an empty [Unreleased] and no draft, preflight would refuse the promotion).
 # Counting raw `git log` commits conflated the two.
 shipping_commits_since() {
-  local sha f shipping files_fd files_pid
+  local sha f shipping files_fd files_pid commits
+  if ! commits="$(git log --first-parent --format=%H "$1..${2:-HEAD}")"; then
+    echo 'release-cut: could not read shipping history' >&2
+    return 1
+  fi
   while IFS= read -r sha; do
     [ -n "$sha" ] || continue
     shipping=0
@@ -201,7 +205,7 @@ shipping_commits_since() {
     fi
     if [ "$shipping" = 1 ]; then printf '%s\n' "$sha"; fi
   done <<EOF
-$(git log --first-parent --format=%H "$1..HEAD" 2>/dev/null)
+$commits
 EOF
 }
 # rc_tag_on_remote <tag> -> 0 present on origin, 2 absent from origin, 3 origin
@@ -285,6 +289,14 @@ raw_pending_body() (
       }
     }
   ' "$work/source"
+)
+render_cited_pending() (
+  local work
+  mkdir -p .uzi/scratch || return 1
+  work="$(mktemp -d .uzi/scratch/release-citations.XXXXXX)" || return 1
+  trap 'rm -rf "$work"' EXIT
+  shipping_commits_since "$1" "$2" > "$work/shipping" || return 1
+  bash "$FRAGMENT_CLI" render-unreleased CHANGELOG.md --cite-introducers "$1" "$2" "$work/shipping"
 )
 if [ "$VERB" = --promote-only ] || [ -n "$CL_FILE" ]; then
   if ! PENDING_BODY="$(raw_pending_body)"; then exit 3; fi
@@ -887,6 +899,10 @@ else
 fi
 if ! DEP_REFS="$(dependency_merge_refs "$PREV")"; then
   exit 3
+fi
+if [ -z "$CL_FILE" ] && [ -n "$PREV" ] && [ "${#INCORPORATED[@]}" -gt 0 ]; then
+  PREV_SHA="$(git rev-parse --verify "$PREV^{commit}")" || exit 3
+  if ! PENDING_BODY="$(render_cited_pending "$PREV_SHA" "$STARTING_SHA")"; then exit 3; fi
 fi
 
 # Refuse empty new-base cuts before publishing the assembled view. Dependency-only
