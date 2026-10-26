@@ -654,6 +654,43 @@ The verdict controls (`measure-3031-composed.test.ts`, "verdict controls") run w
 environment variable, on a small fixture, and are the only runs that stub exclusion and
 quiescence; their lines are marked as not eligible for the gate.
 
+#### Official diagnostic run (harness `91a8ad16`)
+
+Environment: the rc.26 worker image (pinned by digest in the run record), Git 2.54.0, Node v24.20.0,
+emulated linux/amd64 on an arm64 host, single-UID 10001 (split-UID not covered), candidate SHA
+`91a8ad16b50c31618b6070cfdf7a30ad8f1078ed`. The harness ran the candidate's `agent/src` with
+lockfile-installed `node_modules`, not the image's `/app` (rc.26 predates C1). Elapsed time is
+unverified (emulation). Evidence: ten JSON lines extracted from the run output, sha256
+`a03cd83f28afb82a85c1dac61aeb9898383ebda495c79db64ca54520bcbb582a`.
+
+| Run | Verdict | Refused phase | sourceEntries (W0 share) | sources | adminEntries | rpcAttempts | launches | Transfer entered | Archive |
+|---|---|---|---|---|---|---|---|---|---|
+| shared-A | FAIL | after_walk | 65,536 (62,980) | 58 | 3,371 | 25 | 162 | yes | none |
+| shared-B | FAIL | selection | 65,536 (62,745) | 70 | 3,341 | 25 | 167 | yes | none |
+| shared-C | FAIL | walk | 65,536 (63,300) | 58 | 3,366 | 25 | 162 | yes | none |
+| dissociated-A | FAIL (incomplete) | none attributed | 62,845 (partial) | 44 | 2,429 | 17 | 113 | no | none |
+| dissociated-B | FAIL | selection | 65,536 (62,745) | 66 | 3,341 | 25 | 168 | yes | none |
+| dissociated-C | FAIL | walk | 65,536 (63,300) | 58 | 3,366 | 25 | 162 | yes | none |
+| shared-family, dissociated-family | UNRUN | not reached | n/a | n/a | n/a | n/a | n/a | no | none |
+
+Results, stated exactly:
+
+- C2 remains UNRUN. The gate summary is UNRUN with 0 of 8 runs eligible: every run depends on the
+  suppressed pre-slot production bundle path.
+- The two-source family variants are UNRUN: a two-member family is unreachable through production code.
+- Five representative runs (shared A, B, C and dissociated B, C) show diagnostic `sourceEntries`
+  refusals at 65,536; W0 alone uses 62,745 to 63,300.
+- dissociated-A is incomplete and unattributed: the 120 s test timeout fired under emulation, the transfer
+  never entered, no quota was violated, and its W0 counters are partial. Its `post_archive` label is a
+  bookkeeping label, not evidence that archive execution occurred.
+- No representative run reached an archive outcome. The small controls did produce self-contained archives.
+- The loose-object ceiling is not established: 196 loose objects failed locally, which is not a proven
+  universal ceiling.
+
+These results are diagnostic only and are not C2 evidence. R3 conflicts for maintainer disposition: family
+reachability, the pre-slot bundle suppression, and `sourceEntries` capacity. No redesign, waiver or
+C3 to C8 unblock follows from them.
+
 
 ## U4b delivery (#3441), producer disabled
 

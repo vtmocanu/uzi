@@ -370,8 +370,10 @@ equal to the index size. The caller's fresh observation pairs cost about 8
 `rpcAttempts` per capture (4 mutating dispatches), against the cap of 32.
 Representative measurement: see the delivery report.
 
-**Boundary.** The composed W0, U4b and archive capacity remains an unverified
-projection. The terminal producer guard stays off. U4b, U4c, U4d, U5, F, M3
+**Boundary.** The composed gate (C2) is UNRUN: no qualifying measurement exists, and
+the diagnostic run shows `sourceEntries` refusals at 65,536 on representative
+fixtures, with no archive outcome reached (see the MEASURE section of the delivery
+report). No contract change follows. The terminal producer guard stays off. U4b, U4c, U4d, U5, F, M3
 and M4 remain undelivered, and MO is unperformed.
 
 ### Server-owned backoff
