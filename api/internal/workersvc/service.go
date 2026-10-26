@@ -1630,7 +1630,8 @@ type Params struct {
 	// DATA-VOLUME-FULL park's lifetime cap: parkDataVolumeFull fails the run with the
 	// server-derived fail_origin='data_volume_full' instead of parking when a COUNTED park would
 	// take disk_park_count past it. A preventive park is neither counted nor capped. 0 = unlimited.
-	RunDiskParkMax int
+	RunDiskParkMax              int
+	RunRetainedRecoveryMaxParks int
 	// RunProviderParkMaxDuration (PRD #1733), mirrored from config RUN_PROVIDER_PARK_MAX_DURATION.
 	// The elapsed-time bound on an unbroken streak of typed provider_outage parks: the first
 	// such park at or past it becomes a paused 'provider_unavailable' owner hold instead of a
@@ -5306,6 +5307,17 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		// 'data_volume_full'. It settles no custody hold (the park keeps custody) and, like the
 		// forge park, falls through to the shared post-switch fan-out. A stale claim returns
 		// early carrying the locked run for the handler's generic stale_claim 409.
+		if req.RecoveryCause != nil && *req.RecoveryCause == recoveryCauseRetainedRecoveryExhausted {
+			var retained store.Run
+			retained, rows, err = s.parkRetainedRecovery(ctx, wkr, owned, req, sessionID)
+			if err != nil {
+				return retained, false, err
+			}
+			if rows == 0 {
+				return retained, false, nil
+			}
+			break
+		}
 		if req.RecoveryCause != nil && *req.RecoveryCause == recoveryCauseDataVolumeFull {
 			var drun store.Run
 			drun, rows, err = s.parkDataVolumeFull(ctx, wkr, owned, req, sessionID)

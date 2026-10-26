@@ -376,7 +376,8 @@ func run() error {
 		RunGateRefusalMax:           cfg.RunGateRefusalMax,
 		// Data-volume-full park cap (PRD #1809 M5, D6): past this many COUNTED disk parks the run
 		// fails with fail_origin='data_volume_full'. 0 = unlimited. Preventive parks never count.
-		RunDiskParkMax: cfg.RunDiskParkMax,
+		RunDiskParkMax:              cfg.RunDiskParkMax,
+		RunRetainedRecoveryMaxParks: cfg.RunRetainedRecoveryMaxParks,
 		// PRD #1733: elapsed-time bound on an unbroken provider-outage park streak; past it the next
 		// provider park becomes a paused 'provider_unavailable' hold. 0 disables the hold.
 		RunProviderParkMaxDuration: cfg.RunProviderParkMaxDuration,

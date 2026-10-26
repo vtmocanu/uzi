@@ -1108,6 +1108,7 @@ type Run struct {
 	SourcePublicationIntent     []byte             `json:"source_publication_intent"`
 	ContinuedIssueIid           pgtype.Int8        `json:"continued_issue_iid"`
 	CheckpointCoordinates       []byte             `json:"checkpoint_coordinates"`
+	RetainedParkCount           int32              `json:"retained_park_count"`
 }
 
 type RunCompletionAttempt struct {
