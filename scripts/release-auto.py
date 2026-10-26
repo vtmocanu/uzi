@@ -165,7 +165,9 @@ def created_at(env, fetch=None):
     url = f'https://api.github.com/repos/vtmocanu/uzi/actions/runs/{run_id}'
     if fetch is None:
         def fetch(location):
-            request = urllib.request.Request(location, headers={'Accept': 'application/vnd.github+json'})
+            require(bool(env.get('GH_TOKEN')), 'run-metadata-token-missing')
+            request = urllib.request.Request(location, headers={'Accept': 'application/vnd.github+json',
+                                                               'Authorization': 'Bearer ' + env['GH_TOKEN']})
             with urllib.request.urlopen(request, timeout=20) as response:
                 return json.load(response)
     run = fetch(url)

@@ -109,6 +109,14 @@ class Evidence(unittest.TestCase):
                            ('path', '.github/workflows/ci.yml'), ('created_at', 'not a timestamp')):
             with self.subTest(key=key), self.assertRaises(auto.Stop):
                 auto.created_at(context(), lambda url: {**data, key: value})
+        with self.assertRaises(auto.Stop):
+            auto.created_at(context(), lambda url: {**data, 'repository': {'full_name': 'other/uzi'}})
+        response = Mock()
+        response.__enter__ = Mock(return_value=io.BytesIO(json.dumps(data).encode()))
+        response.__exit__ = Mock(return_value=False)
+        with patch.object(auto.urllib.request, 'urlopen', return_value=response) as fetch:
+            auto.created_at(context(GH_TOKEN='credential-sentinel'))
+            self.assertEqual(fetch.call_args.args[0].get_header('Authorization'), 'Bearer credential-sentinel')
 
 
 class TipFixture:

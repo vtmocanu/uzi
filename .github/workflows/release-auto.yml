@@ -62,6 +62,8 @@ jobs:
           persist-credentials: false
       - name: Validate dispatch and original run metadata
         id: authorize
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: python3 -I scripts/release-auto.py authorize
 
   prepare:
@@ -229,12 +231,31 @@ jobs:
           [ "$(g rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$RELEASE_SHA" ]
           [ "$(g cat-file -t "refs/tags/$RELEASE_TAG")" = tag ]
           [ "$(g rev-list --parents -n 1 "$RELEASE_SHA")" = "$RELEASE_SHA $PARENT" ]
+          reason='non-metadata-bundle'
+          changes="$RUNNER_TEMP/release-changes"
+          g diff-tree --no-commit-id --no-renames --no-ext-diff --no-textconv --name-status -r -z "$PARENT" "$RELEASE_SHA" > "$changes"
+          uuid='[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}'
+          status=''; path=''
+          while IFS= read -r -d '' status; do
+            IFS= read -r -d '' path || fail
+            old_mode="$(g ls-tree "$PARENT" -- "$path" | awk '{print $1}')"
+            case "$status:$path" in
+              M:CHANGELOG.md|M:deploy/chart/Chart.yaml|M:deploy/chart/values.yaml|M:scripts/assert-worker-tag-decoupled.sh)
+                new_mode="$(g ls-tree "$RELEASE_SHA" -- "$path" | awk '{print $1}')"
+                if ! { [ "$old_mode" = "$new_mode" ] && [[ "$old_mode" = 100644 || "$old_mode" = 100755 ]]; }; then fail; fi ;;
+              D:*)
+                if ! { [[ "$path" =~ ^changelog\.d/${uuid}\.md$ ]] && [ "$old_mode" = 100644 ]; }; then fail; fi ;;
+              *) fail ;;
+            esac
+            status=''; path=''
+          done < "$changes"
+          [ -z "$status$path" ]
 
       - name: Mint repository-scoped installation token
         id: app
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510  # v3.3.0
         with:
-          app-id: ${{ vars.RELEASE_APP_ID }}
+          client-id: ${{ vars.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_KEY }}
           owner: vtmocanu
           repositories: uzi
@@ -251,7 +272,7 @@ jobs:
           fail() { printf 'reason=%s\n' "$reason" >> "$GITHUB_OUTPUT"; exit 1; }
           trap fail ERR
           export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_TERMINAL_PROMPT=0
-          unset GIT_TRACE GIT_TRACE_CURL GIT_CURL_VERBOSE
+          unset GIT_TRACE GIT_TRACE_CURL GIT_CURL_VERBOSE GIT_TRACE_PACKET GIT_TRACE_SETUP GIT_TRACE_PERFORMANCE GIT_TRACE2 GIT_TRACE2_EVENT GIT_TRACE2_PERF
           bare="$RUNNER_TEMP/release-auto-push.git"
           g() { git --git-dir="$bare" -c core.hooksPath=/dev/null "$@"; }
           auth="$(printf 'x-access-token:%s' "$GH_APP_TOKEN" | base64 | tr -d '\n')"
@@ -263,14 +284,15 @@ jobs:
           actual_digest="$(printf '%s\n' "$refs" | awk '$2 ~ /^refs\/tags\/v/ {print}' | LC_ALL=C sort | sha256sum | cut -d' ' -f1)"
           [ "$actual_digest" = "$REFS_DIGEST" ]
           inventory="$(printf '%s\n' "$refs" | awk -F '\t' '
+            BEGIN { base="(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)" }
             function gt(a,b, x,y,i) {
               sub(/^v/,"",a); sub(/^v/,"",b); gsub(/-rc\./,".",a); gsub(/-rc\./,".",b)
               split(a,x,"."); split(b,y,".")
               for(i=1;i<=4;i++) {if(x[i]+0>y[i]+0)return 1;if(x[i]+0<y[i]+0)return 0} return 0
             }
             { oid[$2]=$1; t=$2; sub(/^refs\/tags\//,"",t)
-              if(t ~ /^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[1-9][0-9]*$/ && (rc=="" || gt(t,rc))) rc=t
-              if(t ~ /^v[0-9]+\.[0-9]+\.[0-9]+$/ && (st=="" || gt(t,st))) st=t
+              if(t ~ ("^v"base"-rc[.][1-9][0-9]*$") && (rc=="" || gt(t,rc))) rc=t
+              if(t ~ ("^v"base"$") && (st=="" || gt(t,st))) st=t
             }
             END { r=oid["refs/tags/"rc"^{}"];if(r=="")r=oid["refs/tags/"rc]
               s=oid["refs/tags/"st"^{}"];if(s=="")s=oid["refs/tags/"st]
@@ -278,7 +300,7 @@ jobs:
           IFS='|' read -r main rc rc_sha stable stable_sha <<< "$inventory"
           if ! { [ "$rc" = "$PREVIOUS_RC" ] && [ "$rc_sha" = "$PREVIOUS_RC_SHA" ]; }; then fail; fi
           if ! { [ "$stable" = "$PREVIOUS_STABLE" ] && [ "$stable_sha" = "$PREVIOUS_STABLE_SHA" ]; }; then fail; fi
-          if printf '%s\n' "$refs" | awk -v tag="refs/tags/$RELEASE_TAG" '$2==tag {found=1} END {exit !found}'; then exit 1; fi
+          if printf '%s\n' "$refs" | awk -v tag="refs/tags/$RELEASE_TAG" '$2==tag {found=1} END {exit !found}'; then reason='target-tag-exists'; fail; fi
           case "$RELEASE_KIND" in
             rc) reason='main-race'; [ "$main" = "$PARENT" ]; refspecs=("$RELEASE_SHA:refs/heads/main" "refs/tags/$RELEASE_TAG") ;;
             stable)

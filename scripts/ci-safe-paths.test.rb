@@ -269,7 +269,7 @@ assert.call(auto_jobs.fetch('watch').fetch('steps').find { |step| step['id'] == 
 mint = auto_push.fetch('steps').find { |step| step['id'] == 'app' }
 assert.call(mint.fetch('uses'), 'actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510', 'reviewed token action')
 assert.call(mint['if'], nil, 'mint keeps default success gating after validation')
-assert.call(mint.fetch('with'), {'app-id' => '${{ vars.RELEASE_APP_ID }}', 'private-key' => '${{ secrets.RELEASE_APP_KEY }}',
+assert.call(mint.fetch('with'), {'client-id' => '${{ vars.RELEASE_APP_ID }}', 'private-key' => '${{ secrets.RELEASE_APP_KEY }}',
                                'owner' => 'vtmocanu', 'repositories' => 'uzi', 'permission-contents' => 'write'}, 'installation token scope')
 bundle_step = auto_push.fetch('steps').find { |step| step['id'] == 'bundle' }
 publish_step = auto_push.fetch('steps').find { |step| step['id'] == 'push' }
@@ -280,8 +280,8 @@ assert.call(auto_push.fetch('steps').map { |step| step['uses'] }.compact, [
   'actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510'
 ], 'credential job runs only reviewed infrastructure actions')
 push_runs = auto_push.fetch('steps').map { |step| step.fetch('run', '') }.join("\n")
-assert.call(push_runs.match?(/\b(?:python3?|node|npm|npx|pip|curl|wget|eval|source|bash|sh)\b/), false, 'credential job does not execute repository runtimes or installers')
-assert.call(push_runs.match?(%r{(?:\.agents/|scripts/|\b(?:git|g)\s+(?:checkout|switch|worktree))}), false, 'credential job never checks out or runs repository code')
+assert.call(push_runs.match?(/\b(?:python3?|node|npm|npx|pip|curl|wget|eval|source|bash)\b|(?:^|[;|&]|\$\()\s*sh(?:\s|$)/), false, 'credential job does not execute repository runtimes or installers')
+assert.call(push_runs.match?(%r{(?:^|[;|&])\s*(?:\./)?(?:\.agents/|scripts/)\S*|\b(?:git|g)\s+(?:checkout|switch|worktree)}), false, 'credential job never checks out or runs repository code')
 assert.call(push_runs.include?('--force'), false, 'release push cannot force refs')
 assert.call(publish_step.fetch('run').include?('g push --atomic origin'), true, 'main and candidate tag use an atomic push')
 
@@ -303,12 +303,12 @@ Dir.mktmpdir('release-auto-contract') do |dir|
   git.call('init', '-b', 'main', repo)
   git.call('-C', repo, 'config', 'user.name', 'fixture')
   git.call('-C', repo, 'config', 'user.email', 't@example.com')
-  File.write(File.join(repo, 'version'), "stable\n")
-  git.call('-C', repo, 'add', 'version')
+  File.write(File.join(repo, 'CHANGELOG.md'), "stable\n")
+  git.call('-C', repo, 'add', 'CHANGELOG.md')
   git.call('-C', repo, 'commit', '-m', 'stable')
   stable_sha = git.call('-C', repo, 'rev-parse', 'HEAD')
   git.call('-C', repo, 'tag', '-a', 'v0.1.0', '-m', 'v0.1.0')
-  File.write(File.join(repo, 'version'), "candidate\n")
+  File.write(File.join(repo, 'CHANGELOG.md'), "candidate\n")
   git.call('-C', repo, 'commit', '-am', 'candidate')
   parent = git.call('-C', repo, 'rev-parse', 'HEAD')
   git.call('-C', repo, 'tag', '-a', 'v0.2.0-rc.10', '-m', 'candidate')
@@ -316,7 +316,7 @@ Dir.mktmpdir('release-auto-contract') do |dir|
   git.call('-C', repo, 'push', 'origin', 'main', '--tags')
   advertised = git.call('-C', repo, 'ls-remote', 'origin', 'refs/heads/main', 'refs/tags/v*')
   refs_digest = Digest::SHA256.hexdigest(advertised.lines.map(&:chomp).select { |line| line.split("\t")[1].start_with?('refs/tags/v') }.sort.join("\n") + "\n")
-  File.write(File.join(repo, 'version'), "new candidate\n")
+  File.write(File.join(repo, 'CHANGELOG.md'), "new candidate\n")
   git.call('-C', repo, 'commit', '-am', 'prepared')
   release_sha = git.call('-C', repo, 'rev-parse', 'HEAD')
   git.call('-C', repo, 'tag', '-a', 'v0.2.0-rc.11', '-m', 'new candidate')
@@ -387,12 +387,26 @@ Dir.mktmpdir('release-auto-contract') do |dir|
   exercise.call({'RELEASE_SHA' => '0' * 40}, false)
   exercise.call({'RELEASE_KIND' => 'stable', 'RELEASE_RC_TAG' => 'v0.2.0-rc.10', 'RELEASE_RC_SHA' => parent,
                  'RELEASE_TAG' => 'v0.2.0', 'RUN_CREATED_AT' => '2026-10-24T09:00:00Z'}, false)
+  # A self-consistent child with source changes must fail the fixed metadata fence.
+  git.call('-C', repo, 'checkout', '--detach', parent)
+  FileUtils.mkdir_p(File.join(repo, 'api'))
+  File.write(File.join(repo, 'api/injected.go'), "package main\n")
+  git.call('-C', repo, 'add', 'api/injected.go')
+  git.call('-C', repo, 'commit', '-m', 'extra source')
+  injected = git.call('-C', repo, 'rev-parse', 'HEAD')
+  git.call('-C', repo, 'tag', '-a', 'v0.2.0-rc.99', '-m', 'extra source')
+  injected_tag = git.call('-C', repo, 'rev-parse', 'v0.2.0-rc.99')
+  git.call('-C', repo, 'update-ref', 'refs/heads/release-auto-prepared', injected)
+  injected_bundle = File.join(dir, 'injected.bundle')
+  git.call('-C', repo, 'bundle', 'create', injected_bundle, 'refs/heads/release-auto-prepared', 'refs/tags/v0.2.0-rc.99', '^' + parent)
+  exercise.call({'RELEASE_SHA' => injected, 'RELEASE_TAG' => 'v0.2.0-rc.99', 'TAG_OID' => injected_tag,
+                 'BUNDLE_DIGEST' => Digest::SHA256.file(injected_bundle).hexdigest}, false, nil, injected_bundle)
   # Stable pushes ignore current main, and age is checked again after bundle fetch.
   stable_remote = File.join(dir, 'stable-remote.git')
   git.call('clone', '--bare', remote, stable_remote)
   git.call('-C', repo, 'push', stable_remote, release_sha + ':refs/heads/main')
   git.call('-C', repo, 'checkout', '--detach', parent)
-  File.write(File.join(repo, 'version'), "promoted\n")
+  File.write(File.join(repo, 'CHANGELOG.md'), "promoted\n")
   git.call('-C', repo, 'commit', '-am', 'promote')
   promoted = git.call('-C', repo, 'rev-parse', 'HEAD')
   git.call('-C', repo, 'tag', '-a', 'v0.2.0', '-m', 'stable')
@@ -416,7 +430,7 @@ Dir.mktmpdir('release-auto-contract') do |dir|
   exercise.call(stable_env, true, true, stable_bundle)
   # A self-contained bundle can hide a wrong parent from prerequisite checking;
   # the independent single-parent binding must still reject it before minting.
-  File.write(File.join(repo, 'version'), "wrong parent\n")
+  File.write(File.join(repo, 'CHANGELOG.md'), "wrong parent\n")
   git.call('-C', repo, 'commit', '-am', 'another child')
   wrong_child = git.call('-C', repo, 'rev-parse', 'HEAD')
   git.call('-C', repo, 'tag', '-a', 'v0.2.0-rc.12', '-m', 'wrong parent fixture')
