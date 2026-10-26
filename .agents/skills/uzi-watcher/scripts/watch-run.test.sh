@@ -227,6 +227,9 @@ qstop "empty logs" ""
 qstop "text-only logs" '{"seq":9,"kind":"text"}'
 qstop "question without seq" '{"kind":"question"}'
 qstop "regressed question seq" '{"seq":3,"kind":"question"}'
+qstop "answered plus seq-less question" "$(printf '%s\n' '{"seq":5,"kind":"question"}' '{"kind":"question"}')"
+qstop "answered plus string seq" "$(printf '%s\n' '{"seq":5,"kind":"question"}' '{"seq":"12","kind":"question"}')"
+qstop "answered plus fractional seq" "$(printf '%s\n' '{"seq":5,"kind":"question"}' '{"seq":4.5,"kind":"question"}')"
 reset awaiting_input stalled "" '[]'
 printf '%s\n' '{"seq":5,"kind":"question"}' > "$WORK/logs"
 rc=0; out=$(QPOLLS=3 qrun 5) || rc=$?

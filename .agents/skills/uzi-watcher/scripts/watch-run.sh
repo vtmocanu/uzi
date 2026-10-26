@@ -99,7 +99,9 @@ max_plan_seq() {
 max_question_seq() {
   local logs
   logs="$(uzi run logs "$RID" --json 2>/dev/null)" || return 0
-  printf '%s' "$logs" | jq -rs '[.[] | select(.kind=="question") | .seq | numbers] | max // empty' 2>/dev/null || true
+  # Any question without a positive integer seq makes the evidence uncertain: print nothing.
+  printf '%s' "$logs" | jq -rs '[.[] | select(.kind=="question") | .seq]
+    | if length > 0 and all(type=="number" and . > 0 and . == floor) then max else empty end' 2>/dev/null || true
 }
 
 # attention_check returns 0 (and sets ATTN_EVIDENCE) when this poll shows attention, 1 when
