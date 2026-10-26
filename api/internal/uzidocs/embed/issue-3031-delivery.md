@@ -1796,7 +1796,25 @@ layers were not tested one by one. rf and x1 stay unproven: no test makes only t
 post-join `revalidate()` refuse, and cancellation is pinned through the resource
 checks rather than the importer's own `check()`.
 
-### Remaining verification boundary
+### Current exact-revision validation status (`f7442c49`)
+
+This supersedes the historical boundary below for the current candidate. Guard off;
+non-closing partial delivery of #3441 (see "Delivery status of #3441" near the top).
+
+- Full gate: exact-head CI on `f7442c49` is green on every required check, including
+  both full agent suite shards and the worker-uid suite (the maintainer-approved
+  substitute for the local `gate:agent`).
+- Reviews over the review-fold range: reviewer approval at `f7442c49`, tester re-test
+  and auditor re-audit at `58137dd4` (agent sources unchanged since `04d8f363`).
+- Mutation: the review-fold survivors are pinned; the walk-level `nlink` checks are
+  redundant within the collectively pinned hardlink property; `rf` and `x1` remain
+  unproven layer-specific gaps.
+- E2E literal audit: no hits; `task test:e2e-lib` and `task test:forge-fake` pass;
+  compose phases unrun.
+- Still open: the two-source `sources` conflict (C2 input), the decompression
+  enabling blocker, live acceptance and C2 to C8. #3441 stays open.
+
+### Remaining verification boundary (historical, before the review fold)
 
 Historical full `task gate:agent` log `gate-log.vNpy2y` timed out at 120 minutes,
 631/690 files, with 104 fixture/environment/category failures. Focused repairs
