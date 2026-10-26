@@ -1286,8 +1286,35 @@ function renderCodeCrossCheck(summary: import("./code-cross-check-gate.js").Code
   const guidance = summary.custom_guidance_applied
     ? [`custom guidance applied${summary.guidance_digest ? ` (sha256 ${codeSpan(summary.guidance_digest.slice(0, 12))})` : ""}`]
     : [];
+  const account = summary.coverage;
+  const coverageLines: string[] = [];
+  let unassessedPaths: string[] = [];
+  let unassessedTotal = 0;
+  if (!account) coverageLines.push("coverage not reported");
+  else {
+    const examined = account.entries.filter(e => e.status === "examined").length;
+    const excluded = account.entries.filter(e => e.status === "excluded").length;
+    const unassessed = account.entries.filter(e => e.status === "unassessed");
+    unassessedTotal = unassessed.length;
+    coverageLines.push(`Coverage: ${examined} examined, ${excluded} excluded, ${unassessed.length} unassessed`);
+    unassessedPaths = unassessed.slice(0, 10).map(e => `- Unassessed: ${value(e.path)}`);
+    if (account.omitted_paths > 0 || !account.omitted_count_exact || account.reasons.includes("inventory_failed") || account.reasons.includes("inventory_truncated")) {
+      coverageLines.push(account.omitted_count_exact
+        ? `inventory incomplete (${account.omitted_paths} paths omitted)`
+        : account.omitted_paths > 0 ? `inventory incomplete (at least ${account.omitted_paths} paths omitted; total unknown)`
+        : "inventory incomplete (omitted path count unknown)");
+    }
+    if (account.unknown_judgments || account.invalid_judgments || account.omitted_judgments)
+      coverageLines.push(`Coverage judgments: ${account.unknown_judgments} unknown, ${account.invalid_judgments} invalid, ${account.omitted_judgments} omitted`);
+    if (!account.activity_complete) coverageLines.push("Recorded-read activity incomplete.");
+    coverageLines.push("Coverage is an advisory review account.");
+  }
   const footer = "**Changes after the check were not cross-checked.**";
-  const render = () => [counts, ...guidance, ...findings, footer].join("\n");
+  const render = () => [counts, ...guidance, ...coverageLines, ...unassessedPaths,
+    ...(unassessedTotal > unassessedPaths.length ? [`${unassessedTotal - unassessedPaths.length} more unassessed paths; see the run for the full stored account.`] : []),
+    ...findings, footer].join("\n");
+  // Drop displayed paths before existing findings; the full stored account remains on the run.
+  while (unassessedPaths.length && Buffer.byteLength(render()) > 4096) unassessedPaths.pop();
   while (findings.length && Buffer.byteLength(render()) > 4096) findings.pop();
   return render();
 }

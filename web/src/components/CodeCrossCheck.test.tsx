@@ -129,7 +129,7 @@ it.each([undefined, null])("does not turn legacy dispositions %s into not report
   view({ findings: persistedFindings, dispositions, finalized_at: "2026-10-11T00:00:00Z" });
   expect(screen.getByText("Dispositions unavailable")).toBeTruthy();
   expect(screen.queryByText(/Disposition:/)).toBeNull();
-  expect(screen.queryByText(/not reported/)).toBeNull();
+  expect(screen.queryByText(/^[0-9]+ addressed,.*not reported/)).toBeNull();
 });
 it.each([
   ["unknown", [persistedFindings[0]], [{ finding_id: "unknown", disposition: "addressed", reason: "hidden reason" }]],
@@ -310,4 +310,120 @@ it.each(["path", "title", "detail", "items"])("discloses isolated code %s trunca
   expect(notice.closest("details")).toBeNull();
   expect(container.querySelector(".animate-pulse, .overflow-auto, .overflow-y-auto, .overflow-scroll, .overflow-y-scroll")).toBeNull();
   expect(screen.queryByText(/Checking/)).toBeNull();
+});
+
+
+const coverageAccount = {
+  version: 1 as const,
+  entries: [
+    { path: "src/a.ts", status: "examined" as const, reason: "read implementation", recorded_read: true },
+    { path: "src/b.ts", status: "examined" as const, reason: "checked branch", recorded_read: true },
+    { path: "src/c.ts", status: "examined" as const, reason: "checked types", recorded_read: false },
+    { path: "src/d.ts", status: "examined" as const, reason: "checked errors", recorded_read: true },
+    { path: "src/e.ts", status: "examined" as const, reason: "checked inputs", recorded_read: true },
+    { path: "src/f.ts", status: "examined" as const, reason: "checked outputs", recorded_read: true },
+    { path: "src/g.ts", status: "examined" as const, reason: "checked callers", recorded_read: false },
+    { path: "src/h.ts", status: "examined" as const, reason: "checked cleanup", recorded_read: true },
+    { path: "src/i.ts", status: "examined" as const, reason: "checked tests", recorded_read: true },
+    { path: "src/deleted.ts", status: "unassessed" as const, reason: "deleted path", recorded_read: false },
+    { path: "src/k.ts", status: "unassessed" as const, reason: "", recorded_read: false },
+    { path: "src/l.ts", status: "unassessed" as const, reason: "not reached", recorded_read: false },
+  ],
+  inventory_incomplete: false, omitted_paths: 0, omitted_count_exact: true,
+  unknown_judgments: 0, invalid_judgments: 0, omitted_judgments: 0, activity_complete: true, reasons: [],
+};
+
+it("coverage displays the complete stored twelve-path account with derived counts", () => {
+  const { container } = view({ coverage: coverageAccount });
+  expect(screen.getByText("12 stored paths: 9 examined, 0 excluded, 3 unassessed")).toBeTruthy();
+  expect(screen.getByText("Activity: complete")).toBeTruthy();
+  expect(screen.getByText("Advisory review account; not a correctness certification.")).toBeTruthy();
+  const rows = container.querySelectorAll('[aria-label="Review coverage account"] li');
+  const expected = [
+    ["src/a.ts", "examined", "read implementation", "yes"],
+    ["src/b.ts", "examined", "checked branch", "yes"],
+    ["src/c.ts", "examined", "checked types", "no"],
+    ["src/d.ts", "examined", "checked errors", "yes"],
+    ["src/e.ts", "examined", "checked inputs", "yes"],
+    ["src/f.ts", "examined", "checked outputs", "yes"],
+    ["src/g.ts", "examined", "checked callers", "no"],
+    ["src/h.ts", "examined", "checked cleanup", "yes"],
+    ["src/i.ts", "examined", "checked tests", "yes"],
+    ["src/deleted.ts", "unassessed", "deleted path", "no"],
+    ["src/k.ts", "unassessed", "not reported", "no"],
+    ["src/l.ts", "unassessed", "not reached", "no"],
+  ];
+  expect(rows).toHaveLength(12);
+  expected.forEach(([path, status, reason, read], i) => {
+    expect(rows[i].textContent).toBe(path + " · " + status + " · Recorded read: " + read + "Reason: " + reason);
+  });
+});
+
+it("coverage renders exclusions, judgment counts and partial activity without inventing omitted inventory", () => {
+  view({ coverage: { ...coverageAccount, entries: [{ path: "generated.ts", status: "excluded", reason: "generated source", recorded_read: false }],
+    inventory_incomplete: true, unknown_judgments: 2, invalid_judgments: 3, omitted_judgments: 4,
+    activity_complete: false, reasons: ["activity_incomplete"] } });
+  expect(screen.getByText("1 stored paths: 0 examined, 1 excluded, 0 unassessed")).toBeTruthy();
+  expect(screen.getByText("Reason: generated source")).toBeTruthy();
+  expect(screen.getByText("Judgments: 2 unknown, 3 invalid, 4 omitted")).toBeTruthy();
+  expect(screen.getByText("Activity: partial")).toBeTruthy();
+  expect(screen.queryByText(/Inventory incomplete/)).toBeNull();
+  expect(screen.queryByText(/0 paths omitted/)).toBeNull();
+});
+
+it.each([
+  [true, 7, "Inventory incomplete: 7 paths omitted"],
+  [false, 7, "Inventory incomplete: at least 7 paths omitted; total unknown"],
+  [false, 0, "Inventory incomplete: omitted path count unknown"],
+] as const)("coverage explains inventory omission exact=%s count=%s", (exact, count, expected) => {
+  view({ coverage: { ...coverageAccount, inventory_incomplete: true, omitted_count_exact: exact, omitted_paths: count, reasons: ["inventory_truncated"] } });
+  expect(screen.getByText(expected)).toBeTruthy();
+});
+
+it.each([undefined, null])("coverage preserves legacy absence %s", coverage => {
+  view({ coverage });
+  expect(screen.getByText("coverage not reported")).toBeTruthy();
+  expect(screen.queryByText(/stored paths:/)).toBeNull();
+});
+
+it.each([
+  false, [], {}, { ...coverageAccount, version: 2 }, { ...coverageAccount, entries: [null] },
+  { ...coverageAccount, entries: [{ ...coverageAccount.entries[0], status: "approved" }] },
+  { ...coverageAccount, entries: [{ ...coverageAccount.entries[0], recorded_read: null }] },
+  { ...coverageAccount, entries: [coverageAccount.entries[0], coverageAccount.entries[0]] },
+  { ...coverageAccount, entries: [{ ...coverageAccount.entries[0], path: "界".repeat(171) }] },
+  { ...coverageAccount, entries: [{ ...coverageAccount.entries[0], reason: "界".repeat(86) }] },
+  { ...coverageAccount, entries: [{ ...coverageAccount.entries[0], path: "\ud800" }] },
+  { ...coverageAccount, entries: Array.from({ length: 129 }, (_, i) => ({ ...coverageAccount.entries[0], path: String(i) })) },
+  { ...coverageAccount, omitted_paths: -1 }, { ...coverageAccount, omitted_paths: 1 },
+  { ...coverageAccount, omitted_count_exact: false }, { ...coverageAccount, activity_complete: null },
+  { ...coverageAccount, unknown_judgments: 1.5 }, { ...coverageAccount, reasons: [null] },
+  { ...coverageAccount, extra: "x".repeat(128 * 1024) },
+])("coverage rejects malformed evidence %#", coverage => {
+  view({ coverage: coverage as unknown as CodeCrossCheckSummary["coverage"] });
+  expect(screen.getByText("Coverage unavailable")).toBeTruthy();
+  expect(screen.queryByText(/stored paths:/)).toBeNull();
+});
+
+it("coverage shows all 128 stored entries and full bounded fields", () => {
+  view({ coverage: { ...coverageAccount, entries: Array.from({ length: 128 }, (_, i) => ({
+    path: i === 127 ? "z".repeat(512) : "path-" + i, status: "unassessed", reason: "r".repeat(256), recorded_read: false,
+  })) } });
+  expect(screen.getByText("128 stored paths: 0 examined, 0 excluded, 128 unassessed")).toBeTruthy();
+  expect(screen.getByText("z".repeat(512))).toBeTruthy();
+  expect(screen.getAllByText("Reason: " + "r".repeat(256))).toHaveLength(128);
+});
+
+it("coverage keeps hostile Markdown HTML ANSI and bidi plain in historical evidence", () => {
+  const { container } = view({ interrupted_at: "2026-10-09T00:00:00Z", coverage: {
+    ...coverageAccount, entries: [{ path: "<img src=x>**path**\u001b[31m\u202e", status: "excluded",
+      reason: "[bad](javascript:alert(1))\u001b]0;hidden\u0007\u202e", recorded_read: false }],
+  } });
+  expect(screen.getByText("Earlier attempt evidence")).toBeTruthy();
+  expect(screen.getByText("<img src=x>**path**")).toBeTruthy();
+  expect(screen.getByText("Reason: [bad](javascript:alert(1))")).toBeTruthy();
+  const account = container.querySelector('[aria-label="Review coverage account"]')!;
+  expect(account.querySelector("img, a, strong, script")).toBeNull();
+  for (const code of [27, 7, 0x202e]) expect(account.textContent).not.toContain(String.fromCodePoint(code));
+  expect(account.textContent).not.toContain("hidden");
 });

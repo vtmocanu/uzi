@@ -64,6 +64,117 @@ func codeDispositionEvidence(s *apitypes.CodeCrossCheck, ids []string) (map[stri
 	return result, "Finalized"
 }
 
+// Coverage fields are bounded before rendering. Strip terminal controls before
+// splitting into cells; each cell still passes through the hardened plain renderer.
+func codeCoveragePlain(value string) string {
+	value = strings.NewReplacer("\n", " ", "\t", " ").Replace(sanitizeTTY(value))
+	runes := []rune(value)
+	var out strings.Builder
+	for len(runes) > 0 {
+		n := min(len(runes), 190)
+		cell := crossCheckPlain("x" + string(runes[:n]) + "x")
+		out.WriteString(strings.TrimSuffix(strings.TrimPrefix(cell, "x"), "x"))
+		runes = runes[n:]
+	}
+	return out.String()
+}
+
+func codeCoverageRows(label string, raw json.RawMessage) [][]string {
+	key := label + "_COVERAGE"
+	if len(raw) == 0 || strings.TrimSpace(string(raw)) == "null" {
+		return [][]string{{key, "coverage not reported"}}
+	}
+	unavailable := [][]string{{key, "Coverage unavailable"}}
+	if len(raw) > 128*1024 || !utf8.Valid(raw) {
+		return unavailable
+	}
+	// Pointer fields distinguish omitted/null metadata from real zero counts.
+	var account struct {
+		Version *int `json:"version"`
+		Entries *[]struct {
+			Path         *string `json:"path"`
+			Status       *string `json:"status"`
+			Reason       *string `json:"reason"`
+			RecordedRead *bool   `json:"recorded_read"`
+		} `json:"entries"`
+		InventoryIncomplete *bool     `json:"inventory_incomplete"`
+		OmittedPaths        *int64    `json:"omitted_paths"`
+		OmittedCountExact   *bool     `json:"omitted_count_exact"`
+		UnknownJudgments    *int64    `json:"unknown_judgments"`
+		InvalidJudgments    *int64    `json:"invalid_judgments"`
+		OmittedJudgments    *int64    `json:"omitted_judgments"`
+		ActivityComplete    *bool     `json:"activity_complete"`
+		Reasons             *[]string `json:"reasons"`
+	}
+	if json.Unmarshal(raw, &account) != nil || account.Version == nil || *account.Version != 1 ||
+		account.Entries == nil || len(*account.Entries) > 128 || account.InventoryIncomplete == nil ||
+		account.OmittedCountExact == nil || account.ActivityComplete == nil || account.Reasons == nil || len(*account.Reasons) > 8 {
+		return unavailable
+	}
+	for _, count := range []*int64{account.OmittedPaths, account.UnknownJudgments, account.InvalidJudgments, account.OmittedJudgments} {
+		if count == nil || *count < 0 || *count > 9007199254740991 {
+			return unavailable
+		}
+	}
+	if (!*account.OmittedCountExact || *account.OmittedPaths > 0) && !*account.InventoryIncomplete {
+		return unavailable
+	}
+	counts := map[string]int{"examined": 0, "excluded": 0, "unassessed": 0}
+	seen := make(map[string]bool)
+	for _, entry := range *account.Entries {
+		if entry.Path == nil || *entry.Path == "" || len(*entry.Path) > 512 || strings.ContainsRune(*entry.Path, 0) ||
+			seen[*entry.Path] || entry.Status == nil || entry.Reason == nil || len(*entry.Reason) > 256 ||
+			strings.ContainsRune(*entry.Reason, 0) || entry.RecordedRead == nil {
+			return unavailable
+		}
+		if _, ok := counts[*entry.Status]; !ok || (*entry.Status == "excluded" && *entry.Reason == "") {
+			return unavailable
+		}
+		seen[*entry.Path] = true
+		counts[*entry.Status]++
+	}
+	inventoryMissing := *account.OmittedPaths > 0 || !*account.OmittedCountExact
+	for _, reason := range *account.Reasons {
+		if len(reason) > 256 || strings.ContainsRune(reason, 0) {
+			return unavailable
+		}
+		inventoryMissing = inventoryMissing || reason == "inventory_failed" || reason == "inventory_truncated"
+	}
+	rows := [][]string{
+		{key, fmt.Sprintf("%d stored paths: %d examined, %d excluded, %d unassessed", len(*account.Entries), counts["examined"], counts["excluded"], counts["unassessed"])},
+		{key + "_ADVISORY", "Advisory review account; not a correctness certification."},
+		{key + "_JUDGMENTS", fmt.Sprintf("%d unknown, %d invalid, %d omitted", *account.UnknownJudgments, *account.InvalidJudgments, *account.OmittedJudgments)},
+	}
+	if inventoryMissing {
+		omitted := "omitted path count unknown"
+		if *account.OmittedCountExact {
+			omitted = fmt.Sprintf("%d paths omitted", *account.OmittedPaths)
+		} else if *account.OmittedPaths > 0 {
+			omitted = fmt.Sprintf("at least %d paths omitted; total unknown", *account.OmittedPaths)
+		}
+		rows = append(rows, []string{key + "_INVENTORY", "Inventory incomplete: " + omitted})
+	} else if *account.InventoryIncomplete {
+		rows = append(rows, []string{key + "_INCOMPLETE", "Review account incomplete; see judgment and activity metadata."})
+	}
+	activity := "partial"
+	if *account.ActivityComplete {
+		activity = "complete"
+	}
+	rows = append(rows, []string{key + "_ACTIVITY", activity})
+	for i, reason := range *account.Reasons {
+		rows = append(rows, []string{fmt.Sprintf("%s_REASON_%d", key, i+1), crossCheckPlain(reason)})
+	}
+	for i, entry := range *account.Entries {
+		prefix := fmt.Sprintf("%s_%d", key, i+1)
+		rows = append(rows,
+			[]string{prefix + "_PATH", codeCoveragePlain(*entry.Path)},
+			[]string{prefix + "_STATUS", crossCheckPlain(*entry.Status)},
+			[]string{prefix + "_REASON", codeCoveragePlain(*entry.Reason)},
+			[]string{prefix + "_RECORDED_READ", fmt.Sprint(*entry.RecordedRead)})
+	}
+	return rows
+}
+
 var codeCheckedSHA = regexp.MustCompile(`^[a-fA-F0-9]{40}$`)
 
 func codeCrossCheckRows(r apitypes.RunDTO) [][]string {
@@ -91,6 +202,7 @@ func codeCrossCheckRows(r apitypes.RunDTO) [][]string {
 		}
 	}
 	rows := [][]string{{label, status}}
+	rows = append(rows, codeCoverageRows(label, s.Coverage)...)
 	if s.ReasonClass != nil {
 		reason := strings.ReplaceAll(crossCheckPlain(*s.ReasonClass), "_", " ")
 		rows = append(rows, []string{label + "_REASON", reason})

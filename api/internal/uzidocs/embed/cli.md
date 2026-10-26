@@ -2888,6 +2888,8 @@ the displayed gate revision, not historical findings. See
 
 ### Code cross-check evidence
 
+The coverage rows show every stored path, its assessment, reason and recorded-read flag, plus omitted-path, judgment and activity metadata. Legacy checks say "coverage not reported". This is an advisory account; see [Review coverage](./cross-check.md#review-coverage).
+
 The [Code cross-check](./cross-check.md#code-cross-check) consent is set in
 **Settings → Run defaults → Cross-check**; there is no CLI write verb for it.
 

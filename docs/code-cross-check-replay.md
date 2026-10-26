@@ -5,7 +5,7 @@ audience: contributor
 
 # Code cross-check replay
 
-A maintainer-run, offline replay of today's unchanged Code cross-check checkers (Codex and Claude) on a frozen, pinned, disclosed-synthetic corpus. It baselines detection, unadjudicated findings, cost, latency and the timeout/incomplete rate per family before any brief change (PRD #3167 M1, see [the PRD](../prds/3167-code-cross-check-coverage.md)). A uzi run never executes it, and it is not a gate or a CI target. The corpus provenance, case list and pins are in [the corpus README](../fixtures/code-cross-check-replay/README.md).
+A maintainer-run, offline replay of Code cross-check checkers (Codex and Claude) on a frozen, pinned, disclosed-synthetic corpus, with explicit executing-brief profiles. It baselines detection, unadjudicated findings, cost, latency and the timeout/incomplete rate per family before any brief change (PRD #3167 M1, see [the PRD](../prds/3167-code-cross-check-coverage.md)). A uzi run never executes it, and it is not a gate or a CI target. The corpus provenance, case list and pins are in [the corpus README](../fixtures/code-cross-check-replay/README.md).
 
 ## Prerequisites
 
@@ -17,6 +17,35 @@ Run everything from the `agent/` directory with the repository's installed depen
 ## Authorization
 
 Real-model calls cost money. They need the maintainer's own authorization for paid calls and the explicit `--authorize-real-model-calls` flag. Without the flag, `replay` refuses with `authorization_required` before it loads the corpus or builds a checker. `verify` and `score` make no model calls.
+
+## Select the executing brief
+
+The default profile is `baseline`. It retains `brief_drift` rejection when
+the executing brief differs from the original pinned brief. Run the M1 baseline
+from commit `4d018dbd69175cc7d60f5acefd7ae122311a1ba1`, using that
+checkout's lockfile dependencies and matching pinned worker binary, as described
+in the maintainer follow-up below.
+
+On the M2 checkout, select `--profile revised` explicitly for `verify`,
+`replay` and `score`. For example:
+
+```sh
+npm run --silent eval:code-cross-check -- verify --profile revised
+npm run --silent eval:code-cross-check -- score <records.jsonl> --profile revised
+```
+
+For authorized model calls, add the same `--profile revised` to the replay
+command below; it does not replace the separate spend-authorization flag.
+The executing brief must match the selected source-pinned profile. Records and
+aggregates identify that profile and the actual brief hash; mixed or stale
+records are rejected. The original corpus manifest, brief pins and reconstructed
+artifacts remain unchanged. Profiles do not let this checkout execute the old
+brief under the new hash, or override prompts arbitrarily.
+
+M2 tests profile integrity and findings-plus-coverage decoding offline with fake
+checkers. Baseline and comparative detection, coverage, false-positive, cost and
+latency measurements still require the separately authorized maintainer runs.
+No measurement improvement is claimed by profile compatibility alone.
 
 ## Run a baseline
 

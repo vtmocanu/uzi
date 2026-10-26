@@ -3757,7 +3757,22 @@ export interface PlanCrossCheckFinding {
   rationale: string;
 }
 
+export interface CodeCrossCheckCoverage {
+  version: 1;
+  entries: { path: string; status: "examined" | "excluded" | "unassessed"; reason: string; recorded_read: boolean }[];
+  inventory_incomplete: boolean;
+  omitted_paths: number;
+  omitted_count_exact: boolean;
+  unknown_judgments: number;
+  invalid_judgments: number;
+  omitted_judgments: number;
+  activity_complete: boolean;
+  reasons: string[];
+}
+
 export interface CodeCrossCheckSummary {
+  /** Raw JSON from the API; the card validates it before rendering. */
+  coverage?: unknown;
   custom_guidance_applied?: boolean;
   guidance_digest?: string;
   repo_instructions_enabled?: boolean;

@@ -10,6 +10,14 @@ import type { GitCache } from "../src/git.js";
 import { CODE_COVERAGE_LIMITS, collectCodeInventory, decodeCodeCoverage, normalizeCodeCoverage, type CodeInventory } from "../src/code-cross-check-coverage.js";
 
 const exec = promisify(execFile);
+test("coverage wire fixture is shared with the API normalizer", async () => {
+  const fixture = JSON.parse(await fs.readFile(new URL("../../fixtures/code-cross-check/coverage-v1.json", import.meta.url), "utf8"));
+  const decoded = decodeCodeCoverage(fixture)!;
+  const got = normalizeCodeCoverage(inventory(decoded.entries.map(e => e.path)), decoded.entries,
+    new Set(decoded.entries.filter(e => e.recorded_read).map(e => e.path)), decoded.activity_complete);
+  assert.deepEqual(got, fixture);
+});
+
 const base = "a".repeat(40), head = "b".repeat(40);
 const inventory = (paths: string[]): CodeInventory => ({ paths, inventory_incomplete: false, omitted_paths: 0, omitted_count_exact: true, reasons: [] });
 const reader = (raw: Buffer, truncated = false): Pick<GitCache, "readBare"> => ({

@@ -1,9 +1,9 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
-import type { Run } from "../lib/apiTypes";
+import type { CodeCrossCheckCoverage, Run } from "../lib/apiTypes";
 import { costDisplay, costHeadline } from "../lib/costStatus";
 import { isTerminalRun } from "../lib/runStatus";
-import { stripUnsafeChars } from "../lib/safeText";
+import { stripDisplayCell, stripUnsafeChars } from "../lib/safeText";
 import { Markdown } from "./Markdown";
 import { Badge, Card, CardHeader, type BadgeTone } from "./ui";
 
@@ -106,6 +106,60 @@ function Findings({ value, dispositions }: { value: unknown; dispositions: Map<s
   </div>;
 }
 
+function coverageEvidence(value: unknown): CodeCrossCheckCoverage | null {
+  const object = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
+  const text = (v: unknown, cap: number): v is string => typeof v === "string" && v.length <= cap
+    && new TextDecoder("utf-8", { ignoreBOM: true }).decode(new TextEncoder().encode(v)) === v
+    && !v.includes("\u0000") && new TextEncoder().encode(v).length <= cap;
+  if (!object(value) || value.version !== 1 || !Array.isArray(value.entries) || value.entries.length > 128
+    || typeof value.inventory_incomplete !== "boolean" || typeof value.omitted_count_exact !== "boolean"
+    || typeof value.activity_complete !== "boolean"
+    || ![value.omitted_paths, value.unknown_judgments, value.invalid_judgments, value.omitted_judgments]
+      .every(n => Number.isSafeInteger(n) && (n as number) >= 0)
+    || !Array.isArray(value.reasons) || value.reasons.length > 8 || !value.reasons.every(r => text(r, 256))) return null;
+  const seen = new Set<string>();
+  for (const entry of value.entries) {
+    if (!object(entry) || !text(entry.path, 512) || !entry.path || seen.has(entry.path)
+      || !["examined", "excluded", "unassessed"].includes(entry.status as string)
+      || !text(entry.reason, 256) || (entry.status === "excluded" && !entry.reason)
+      || typeof entry.recorded_read !== "boolean") return null;
+    seen.add(entry.path);
+  }
+  if ((!value.omitted_count_exact || (value.omitted_paths as number) > 0) && !value.inventory_incomplete) return null;
+  try {
+    if (new TextEncoder().encode(JSON.stringify(value)).length > 128 * 1024) return null;
+  } catch { return null; }
+  return value as unknown as CodeCrossCheckCoverage;
+}
+
+function Coverage({ value }: { value: unknown }) {
+  if (value == null) return <p>coverage not reported</p>;
+  const account = coverageEvidence(value);
+  if (!account) return <p>Coverage unavailable</p>;
+  const counts = { examined: 0, excluded: 0, unassessed: 0 };
+  for (const entry of account.entries) counts[entry.status]++;
+  const inventoryMissing = account.omitted_paths > 0 || !account.omitted_count_exact
+    || account.reasons.some(r => r === "inventory_failed" || r === "inventory_truncated");
+  const omitted = account.omitted_count_exact ? `${account.omitted_paths} paths omitted`
+    : account.omitted_paths > 0 ? `at least ${account.omitted_paths} paths omitted; total unknown` : "omitted path count unknown";
+  return <div className="space-y-2" aria-label="Review coverage account">
+    <p>{account.entries.length} stored paths: {counts.examined} examined, {counts.excluded} excluded, {counts.unassessed} unassessed</p>
+    <p>Advisory review account; not a correctness certification.</p>
+    {inventoryMissing && <p>Inventory incomplete: {omitted}</p>}
+    {account.inventory_incomplete && !inventoryMissing && <p>Review account incomplete; see judgment and activity metadata.</p>}
+    <p>Judgments: {account.unknown_judgments} unknown, {account.invalid_judgments} invalid, {account.omitted_judgments} omitted</p>
+    <p>Activity: {account.activity_complete ? "complete" : "partial"}</p>
+    {account.reasons.length > 0 && <p>Account reasons: {account.reasons.map(r => stripDisplayCell(r)).join(", ")}</p>}
+    <ul className="space-y-2">
+      {account.entries.map((entry, index) => <li key={index} className="break-words">
+        <code className="font-mono break-all">{stripDisplayCell(entry.path)}</code>
+        <span> · {entry.status} · Recorded read: {entry.recorded_read ? "yes" : "no"}</span>
+        <p>Reason: {stripDisplayCell(entry.reason) || "not reported"}</p>
+      </li>)}
+    </ul>
+  </div>;
+}
+
 export function CodeCrossCheck({ run }: { run: Run }) {
   const s = run.code_cross_check_summary;
   if (!s && !run.code_cross_check_required) return null;
@@ -133,7 +187,7 @@ export function CodeCrossCheck({ run }: { run: Run }) {
       {s.reason_class && <p>Reason: {reasonLabel(s.reason_class)}</p>}
       <p>{evidence.state === "Pending report" ? "Dispositions pending" : evidence.state}</p>
       {!historical && s.outcome === "completed" && evidence.state === "Finalized" && <p>{counts.addressed} addressed, {counts.declined} declined, {counts.not_reported} not reported</p>}
-      <Findings value={s.findings} dispositions={evidence.entries} />
+      <Coverage value={s.coverage} />\n      <Findings value={s.findings} dispositions={evidence.entries} />
       <p className="flex flex-wrap gap-x-1 break-all text-xs text-muted">
         <span>Family: {s.checker_harness === "codex" ? "Codex" : s.checker_harness === "claude" ? "Claude" : "Unreported"}</span>
         <span className="inline-flex max-w-full gap-x-1"><span className="shrink-0"> · </span><span className="min-w-0">Model: {plain(s.checker_model) || "Unreported"}</span></span>

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
@@ -80,6 +81,21 @@ func TestCodeCrossCheckCoverageNormalization(t *testing.T) {
 		}
 	}
 }
+func TestCodeCrossCheckCoverageSharedWire(t *testing.T) {
+	raw, err := os.ReadFile("../../../fixtures/code-cross-check/coverage-v1.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var expected apitypes.CodeCrossCheckCoverage
+	if json.Unmarshal(raw, &expected) != nil || len(expected.Entries) != 12 {
+		t.Fatal("invalid shared fixture")
+	}
+	got := NormalizeCodeCrossCheckCoverage("completed", raw)
+	if !bytes.Equal(got, coverageJSON(t, expected)) {
+		t.Fatal("API normalized wire differs from shared fixture")
+	}
+}
+
 func TestCodeCrossCheckCoverageMixedEntries(t *testing.T) {
 	expected := coverageFixture().Entries[0]
 	raw := bytes.Replace(coverageJSON(t, coverageFixture()), []byte(`"entries":[`), []byte(`"entries":[{"path":"b.go","status":"examined","reason":"checked","recorded_read":"yes"},`), 1)

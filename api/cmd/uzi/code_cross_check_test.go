@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +12,100 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
+
+func cliCoverageFixture(t *testing.T) apitypes.CodeCrossCheckCoverage {
+	t.Helper()
+	raw, err := os.ReadFile("../../../fixtures/code-cross-check/coverage-v1.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var account apitypes.CodeCrossCheckCoverage
+	if json.Unmarshal(raw, &account) != nil {
+		t.Fatal("invalid coverage fixture")
+	}
+	return account
+}
+
+func TestCodeCrossCheckCoverageFullDisplayAndJSON(t *testing.T) {
+	account := cliCoverageFixture(t)
+	raw, err := json.Marshal(account)
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary := &apitypes.CodeCrossCheck{Stage: "code", Outcome: "completed", Findings: json.RawMessage("[]"), Coverage: raw}
+	out := codeCheckCommand(t, summary)
+	for _, expected := range []string{"12 stored paths: 9 examined, 0 excluded, 3 unassessed", "deleted.ts", "Reviewed patch", "0 unknown, 0 invalid, 0 omitted"} {
+		if !strings.Contains(out, expected) {
+			t.Fatalf("missing %q", expected)
+		}
+	}
+	var decoded apitypes.RunDTO
+	if json.Unmarshal([]byte(codeCheckCommand(t, summary, "--json")), &decoded) != nil || decoded.CodeCrossCheckSummary == nil {
+		t.Fatal("invalid run JSON")
+	}
+	var got apitypes.CodeCrossCheckCoverage
+	if json.Unmarshal(decoded.CodeCrossCheckSummary.Coverage, &got) != nil || !reflect.DeepEqual(got, account) {
+		t.Fatal("JSON lost full coverage account")
+	}
+}
+
+func TestCodeCrossCheckCoverageIncompleteAndMalformed(t *testing.T) {
+	for _, raw := range []json.RawMessage{nil, json.RawMessage("null")} {
+		if got := codeCoverageRows("CODE_CHECK", raw); got[0][1] != "coverage not reported" {
+			t.Fatal("legacy coverage invented")
+		}
+	}
+	for _, raw := range []json.RawMessage{json.RawMessage("{}"), json.RawMessage("false"), json.RawMessage(`{"version":1,"entries":[null]}`)} {
+		if got := codeCoverageRows("CODE_CHECK", raw); got[0][1] != "Coverage unavailable" {
+			t.Fatal("invalid account rendered as complete")
+		}
+	}
+	for _, tc := range []struct {
+		exact   bool
+		count   int64
+		message string
+	}{
+		{true, 7, "7 paths omitted"}, {false, 7, "at least 7 paths omitted; total unknown"}, {false, 0, "omitted path count unknown"},
+	} {
+		account := cliCoverageFixture(t)
+		account.InventoryIncomplete = true
+		account.OmittedCountExact = tc.exact
+		account.OmittedPaths = tc.count
+		raw, _ := json.Marshal(account)
+		found := false
+		for _, row := range codeCoverageRows("EARLIER_CODE_CHECK", raw) {
+			if strings.Contains(row[1], tc.message) {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("missing omission notice %q", tc.message)
+		}
+	}
+}
+
+func TestCodeCrossCheckCoverageFullFieldsAreTerminalSafe(t *testing.T) {
+	account := cliCoverageFixture(t)
+	account.Entries = []apitypes.CodeCrossCheckCoverageEntry{{Path: strings.Repeat("z", 512), Status: "excluded", Reason: strings.Repeat("r", 256)}}
+	raw, _ := json.Marshal(account)
+	rows := codeCoverageRows("CODE_CHECK", raw)
+	fullPath, fullReason := false, false
+	for _, row := range rows {
+		fullPath = fullPath || row[1] == strings.Repeat("z", 512)
+		fullReason = fullReason || row[1] == strings.Repeat("r", 256)
+	}
+	if !fullPath || !fullReason {
+		t.Fatal("bounded stored fields were truncated")
+	}
+	account.Entries[0].Path = "<img>" + string(rune(27)) + "[31m" + string(rune(0x202e))
+	account.Entries[0].Reason = "[bad](javascript:alert(1))" + string(rune(27)) + "]0;hidden" + string(rune(7)) + string(rune(0x202e))
+	raw, _ = json.Marshal(account)
+	for _, row := range codeCoverageRows("EARLIER_CODE_CHECK", raw) {
+		if strings.ContainsAny(row[1], string([]rune{27, 7, 0x202e})) {
+			t.Fatal("terminal control escaped renderer")
+		}
+	}
+}
 
 func codeCheckCommand(t *testing.T, s *apitypes.CodeCrossCheck, args ...string) string {
 	t.Helper()

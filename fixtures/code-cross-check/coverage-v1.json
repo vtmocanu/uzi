@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "path": "src/0.ts",
+      "status": "examined",
+      "reason": "Reviewed patch",
+      "recorded_read": true
+    },
+    {
+      "path": "src/1.ts",
+      "status": "examined",
+      "reason": "Reviewed patch",
+      "recorded_read": false
+    },
+    {
+      "path": "src/2.ts",
+      "status": "examined",
+      "reason": "Reviewed patch",
+      "recorded_read": false
+    },
+    {
+      "path": "src/3.ts",
+      "status": "examined",
+      "reason": "Reviewed patch",
+      "recorded_read": false
+    },
+    {
+      "path": "src/4.ts",
+      "status": "examined",
+      "reason": "Reviewed patch",
+      "recorded_read": false
+    },
+    {
+      "path": "src/5.ts",
+      "status": "examined",
+      "reason": "Reviewed patch",
+      "recorded_read": false
+    },
+    {
+      "path": "src/6.ts",
+      "status": "examined",
+      "reason": "Reviewed patch",
+      "recorded_read": false
+    },
+    {
+      "path": "src/7.ts",
+      "status": "examined",
+      "reason": "Reviewed patch",
+      "recorded_read": false
+    },
+    {
+      "path": "src/8.ts",
+      "status": "examined",
+      "reason": "Reviewed patch",
+      "recorded_read": false
+    },
+    {
+      "path": "deleted.ts",
+      "status": "unassessed",
+      "reason": "",
+      "recorded_read": false
+    },
+    {
+      "path": "old-name.ts",
+      "status": "unassessed",
+      "reason": "",
+      "recorded_read": false
+    },
+    {
+      "path": "remaining.ts",
+      "status": "unassessed",
+      "reason": "",
+      "recorded_read": false
+    }
+  ],
+  "inventory_incomplete": false,
+  "omitted_paths": 0,
+  "omitted_count_exact": true,
+  "unknown_judgments": 0,
+  "invalid_judgments": 0,
+  "omitted_judgments": 0,
+  "activity_complete": true,
+  "reasons": []
+}
