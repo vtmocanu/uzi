@@ -5,11 +5,19 @@ import path from "node:path";
 import {
   AuthorityRefusal, requireSupportedStorage, transactionContext, type AuthorityTransaction, type WorkerLifetime,
 } from "./authority-lock.js";
+import { type CompletionSourceV2, parseCompletionSourceV2, sourceCoreDigest } from "./completion-source.js";
 
 // Completion-authority enrollment and durable source-use slots (issue #3404 M1a).
 // DORMANT: nothing in production calls the slot API yet; it changes no release
 // eligibility. Every operation needs an active authority transaction (A) from
 // authority-lock.ts, so a stale or foreign caller cannot write.
+//
+// Harness and the sticky codex marker: the harness is bound when a lease is minted (an executor
+// present means codex, absent means claude) and recorded on the lease. A slot admitted with an
+// executor, at any time, carries `codexMarked` in its MAC'd body; it survives re-admission,
+// ineligible, retiring and the retired tombstone, so a reused path can never publish claude_ready.
+// Publication takes the CERTIFIED source itself (see transition) and derives the digest and the
+// run/generation of the cohort from it.
 //
 // Files (all 0600 under the 0700 `<dataDir>/.uzi-authority/`, never persisting st_dev/st_ino):
 //   enrollment.json        authenticated storage UUID + layout version + canonical data root
@@ -46,7 +54,7 @@ import {
 /** Authority layout identity; exposed as `AuthorityStore.layout` for completion-source.ts. */
 const AUTHORITY_LAYOUT = "uzi-authority-layout/1";
 const ENROLLMENT_VERSION = "uzi-authority-enrollment/1";
-const SLOT_VERSION = "uzi-authority-slot/2";
+const SLOT_VERSION = "uzi-authority-slot/3";
 const CERTIFICATE_LABEL = "uzi completion source certificate v2\0";
 const MAX_CAPTURE_IDS = 256;
 const HEAD_VERSION = "uzi-authority-head/2";
@@ -64,6 +72,8 @@ const MAX_ITEM = 512;
 const MAX_ITEMS = 1024;
 const HEX64 = /^[0-9a-f]{64}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** recovery.ts capture ids: randomUUID(), or "maintenance-v1-" + randomUUID() for a maintenance capture. */
+const CAPTURE_ID = /^(?:maintenance-v1-)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /** Random per process; a successor worker never shares it. */
 const PROCESS_INCARNATION = randomUUID();
@@ -119,6 +129,8 @@ export interface SlotSnapshot {
   retiring: RetiringRecord | null;
   /** Present exactly for sealed and claude_ready; kept through ineligible and retiring. */
   publication: SlotPublication | null;
+  /** Sticky: set once the slot was admitted with an executor (codex); never cleared, even by retire. */
+  codexMarked: boolean;
 }
 /** What `readPublication` returns for retirement verification. */
 export interface SlotPublicationRead extends SlotPublication {
@@ -166,7 +178,10 @@ function normalizePublication(raw: unknown): SlotPublication {
   if (p.harness !== "codex" && p.harness !== "claude") throw new AuthorityRefusal("malformed authority record");
   const c = exact(p.cohort, ["runId", "generation", "captureIds"]);
   if (!Array.isArray(c.captureIds) || c.captureIds.length > MAX_CAPTURE_IDS) throw new AuthorityRefusal("malformed authority record");
-  const captureIds = c.captureIds.map((id) => text(id, 128));
+  const captureIds = c.captureIds.map((id) => {
+    if (typeof id !== "string" || !CAPTURE_ID.test(id)) throw new AuthorityRefusal("malformed authority record");
+    return id;
+  });
   for (let i = 1; i < captureIds.length; i++) {
     if (!((captureIds[i - 1] as string) < (captureIds[i] as string))) throw new AuthorityRefusal("malformed authority record");
   }
@@ -177,7 +192,7 @@ function normalizePublication(raw: unknown): SlotPublication {
 }
 
 function normalizeSlot(raw: unknown): SlotSnapshot {
-  const o = exact(raw, ["version", "key", "state", "epoch", "seq", "owner", "pending", "retiring", "publication"]);
+  const o = exact(raw, ["version", "key", "state", "epoch", "seq", "owner", "pending", "retiring", "publication", "codexMarked"]);
   if (o.version !== SLOT_VERSION) throw new AuthorityRefusal("unsupported authority slot version");
   const state = o.state;
   if (typeof state !== "string" || !STATES.includes(state as SlotState)) throw new AuthorityRefusal("malformed authority record");
@@ -203,11 +218,17 @@ function normalizeSlot(raw: unknown): SlotSnapshot {
   if (state === "active" && publication !== null) throw new AuthorityRefusal("malformed authority record");
   if (state === "sealed" && publication?.harness !== "codex") throw new AuthorityRefusal("malformed authority record");
   if (state === "claude_ready" && publication?.harness !== "claude") throw new AuthorityRefusal("malformed authority record");
+  if (state === "retired" && publication !== null) throw new AuthorityRefusal("malformed authority record");
+  if (typeof o.codexMarked !== "boolean") throw new AuthorityRefusal("malformed authority record");
+  const codexMarked = o.codexMarked;
+  // A codex executor or a codex publication can never sit in an unmarked slot, nor a claude_ready one in a marked slot.
+  if ((owner.executor !== null || publication?.harness === "codex") && !codexMarked) throw new AuthorityRefusal("malformed authority record");
+  if (state === "claude_ready" && codexMarked) throw new AuthorityRefusal("malformed authority record");
   return {
     version: SLOT_VERSION, key: hex64(o.key), state: state as SlotState, epoch: uuid(o.epoch),
     seq: uint(o.seq, 1, Number.MAX_SAFE_INTEGER),
     owner: { worker: uuid(owner.worker), executor: owner.executor === null ? null : text(owner.executor, 128) },
-    pending, retiring, publication,
+    pending, retiring, publication, codexMarked,
   };
 }
 
@@ -461,17 +482,18 @@ async function requireCompleteHeads(init: StoreIdentity): Promise<void> {
 
 const storeBrand = Symbol("authority-store-token");
 const leaseBrand = Symbol("source-use-lease-token");
-const leaseState = new WeakMap<SourceUseLease, { store: AuthorityStore; key: string; epoch: string }>();
+type LeaseHarness = "codex" | "claude";
+const leaseState = new WeakMap<SourceUseLease, { store: AuthorityStore; key: string; epoch: string; harness: LeaseHarness }>();
 
 /** Opaque exact-owner lease for one source-use epoch. Only admitSourceUse can mint one. */
 export class SourceUseLease {
-  constructor(token: symbol, store: AuthorityStore, key: string, epoch: string) {
+  constructor(token: symbol, store: AuthorityStore, key: string, epoch: string, harness: LeaseHarness) {
     if (token !== leaseBrand) throw new TypeError("SourceUseLease cannot be constructed");
-    leaseState.set(this, { store, key, epoch });
+    leaseState.set(this, { store, key, epoch, harness });
   }
 }
 
-function heldLease(lease: SourceUseLease): { store: AuthorityStore; key: string; epoch: string } {
+function heldLease(lease: SourceUseLease): { store: AuthorityStore; key: string; epoch: string; harness: LeaseHarness } {
   const held = leaseState.get(lease);
   if (!held) throw new AuthorityRefusal("not a source-use lease");
   return held;
@@ -480,6 +502,8 @@ function heldLease(lease: SourceUseLease): { store: AuthorityStore; key: string;
 export function leaseEpoch(lease: SourceUseLease): string { return heldLease(lease).epoch; }
 /** The slot key a lease is bound to. */
 export function leaseSlotKey(lease: SourceUseLease): string { return heldLease(lease).key; }
+/** The harness bound at admission: codex when an executor was presented, claude otherwise. */
+export function leaseHarness(lease: SourceUseLease): LeaseHarness { return heldLease(lease).harness; }
 
 export interface AuthorityStoreOptions {
   workerToken: string;
@@ -587,17 +611,43 @@ export class AuthorityStore {
   get workerIncarnation(): string { return this.#init.incarnation; }
 
   /**
-   * Mint the certificate for a source core digest. The key never leaves this module. Needs a
-   * live authority transaction; only the publication path may call it.
+   * Certify a source core. The key never leaves this module, and only the exact live lease of
+   * the slot can obtain a certificate: the slot must be active and owned by this worker under
+   * the lease's epoch, and the source must carry that epoch, name this slot, this worker, the
+   * lease's harness and (codex) the slot's executor. A claude source is refused for a slot that
+   * was ever admitted as codex.
    */
-  certifySource(tx: AuthorityTransaction, coreDigest: string): string {
-    this.#check(tx);
-    return this.#certificate(hex64(coreDigest));
+  async certifySource(tx: AuthorityTransaction, lease: SourceUseLease, value: unknown): Promise<CompletionSourceV2> {
+    const { body, held } = await this.#owned(tx, lease);
+    const source = await this.#bindSource(tx, held, body, value);
+    const { certificate: _old, ...bare } = source;
+    return { ...bare, certificate: this.#certificate(sourceCoreDigest(bare)) };
+  }
+
+  async #bindSource(
+    tx: AuthorityTransaction, held: { key: string; epoch: string; harness: LeaseHarness }, body: SlotSnapshot, value: unknown,
+  ): Promise<CompletionSourceV2> {
+    if (body.state !== "active") throw new AuthorityRefusal("source slot is not active");
+    const source = parseCompletionSourceV2(value, { dataDir: this.#init.dataDir, storageId: this.#init.storageId, layout: AUTHORITY_LAYOUT });
+    if (source.sourceUseEpoch !== body.epoch || body.epoch !== held.epoch) throw new AuthorityRefusal("source belongs to another source-use epoch");
+    if (await this.slotKey(tx, source.clonePath) !== held.key) throw new AuthorityRefusal("source belongs to another slot");
+    if (source.workerIncarnation !== this.#init.incarnation) throw new AuthorityRefusal("source belongs to another worker incarnation");
+    if (source.harness !== held.harness) throw new AuthorityRefusal("source harness does not match the lease");
+    if (source.harness === "claude") {
+      if (body.codexMarked) throw new AuthorityRefusal("slot was admitted as codex");
+    } else if (body.owner.executor === null || source.executorIncarnation !== body.owner.executor) {
+      throw new AuthorityRefusal("source executor does not match the slot owner");
+    }
+    return source;
   }
 
   /** Constant-time check of a certificate against a digest, under a live transaction. */
   verifySourceCertificate(tx: AuthorityTransaction, coreDigest: string, certificate: unknown): boolean {
     this.#check(tx);
+    return this.#verifies(coreDigest, certificate);
+  }
+
+  #verifies(coreDigest: string, certificate: unknown): boolean {
     if (typeof certificate !== "string" || !HEX64.test(certificate) || !HEX64.test(coreDigest)) return false;
     return timingSafeEqual(Buffer.from(this.#certificate(coreDigest), "hex"), Buffer.from(certificate, "hex"));
   }
@@ -727,6 +777,7 @@ export class AuthorityStore {
     const key = await this.slotKey(tx, sourcePath);
     const dir = await this.#slotsDir();
     const old = await this.#load(dir, key);
+    const harness: LeaseHarness = options.executor !== undefined ? "codex" : "claude";
     if (old) {
       if (old.pending !== null) throw new AuthorityRefusal("source has an unresolved pending footprint");
       if (old.state === "retiring") throw new AuthorityRefusal("source is being retired");
@@ -738,18 +789,23 @@ export class AuthorityStore {
       const held = leaseState.get(options.lease);
       if (!held || held.store !== this || held.key !== key) throw new AuthorityRefusal("lease does not belong to this source");
       if (old?.state !== "active" || held.epoch !== old.epoch) throw new AuthorityRefusal("stale source-use lease");
+      if (options.executor !== undefined && options.executor !== old.owner.executor) {
+        throw new AuthorityRefusal("lease was admitted under another executor");
+      }
       return options.lease;
     }
     const body: SlotSnapshot = {
       version: SLOT_VERSION, key, state: "active", epoch: randomUUID(), seq: (old?.seq ?? 0) + 1,
       owner: { worker: this.#init.incarnation, executor: options.executor ?? null }, pending: null, retiring: null,
-      publication: null,
+      publication: null, codexMarked: harness === "codex" || (old?.codexMarked ?? false),
     };
     await this.#save(dir, body);
-    return new SourceUseLease(leaseBrand, this, key, body.epoch);
+    return new SourceUseLease(leaseBrand, this, key, body.epoch, harness);
   }
 
-  async #owned(tx: AuthorityTransaction, lease: SourceUseLease): Promise<{ dir: string; body: SlotSnapshot }> {
+  async #owned(tx: AuthorityTransaction, lease: SourceUseLease): Promise<{
+    dir: string; body: SlotSnapshot; held: { key: string; epoch: string; harness: LeaseHarness };
+  }> {
     this.#check(tx);
     const held = leaseState.get(lease);
     if (!held || held.store !== this) throw new AuthorityRefusal("lease does not belong to this store");
@@ -759,34 +815,45 @@ export class AuthorityStore {
     if (body.epoch !== held.epoch || body.owner.worker !== this.#init.incarnation) {
       throw new AuthorityRefusal("stale source-use lease");
     }
-    return { dir, body };
+    return { dir, body, held: { key: held.key, epoch: held.epoch, harness: held.harness } };
   }
 
   /**
-   * Move the slot on under the exact live lease. claude_ready (harness claude) and sealed
-   * (harness codex) publish the source core digest and the cohort manifest in the same write;
-   * both are required, validated before anything is written, and kept until retirement.
+   * Move the slot on under the exact live lease. claude_ready needs a claude-admitted lease and a
+   * slot never admitted as codex; sealed needs a codex-admitted lease. Both take the CERTIFIED
+   * source itself plus the cohort's capture ids: the source is parsed, its certificate verified,
+   * and it must carry this lease's epoch, this slot, this worker, the lease's harness and (codex)
+   * the slot owner's executor. The store computes the core digest and takes the cohort's run and
+   * generation from the source, so a caller cannot supply a digest or a foreign cohort. The
+   * publication is written in the same step and kept until retirement.
    */
   async transition(tx: AuthorityTransaction, lease: SourceUseLease, to: "ineligible"): Promise<void>;
   async transition(
-    tx: AuthorityTransaction, lease: SourceUseLease, to: "claude_ready" | "sealed", publication: SlotPublication,
+    tx: AuthorityTransaction, lease: SourceUseLease, to: "claude_ready" | "sealed", input: { source: unknown; captureIds: readonly string[] },
   ): Promise<void>;
   async transition(
-    tx: AuthorityTransaction, lease: SourceUseLease, to: "claude_ready" | "sealed" | "ineligible", publication?: SlotPublication,
+    tx: AuthorityTransaction, lease: SourceUseLease, to: "claude_ready" | "sealed" | "ineligible",
+    input?: { source: unknown; captureIds: readonly string[] },
   ): Promise<void> {
-    const { dir, body } = await this.#owned(tx, lease);
+    const { dir, body, held } = await this.#owned(tx, lease);
     if (!NEXT_STATES[to].includes(body.state)) throw new AuthorityRefusal(`illegal transition ${body.state} -> ${to}`);
     if (to === "ineligible") {
-      if (publication !== undefined) throw new AuthorityRefusal("ineligible carries no publication");
+      if (input !== undefined) throw new AuthorityRefusal("ineligible carries no publication");
       await this.#save(dir, { ...body, state: to, seq: body.seq + 1 });
       return;
     }
     if (body.pending !== null) throw new AuthorityRefusal("unresolved pending footprint");
-    if (publication === undefined) throw new AuthorityRefusal("publication data required");
+    if (input === undefined) throw new AuthorityRefusal("publication data required");
     const wanted = to === "sealed" ? "codex" : "claude";
-    const normalized = normalizePublication(JSON.parse(JSON.stringify(publication)));
-    if (normalized.harness !== wanted) throw new AuthorityRefusal(`${to} requires harness ${wanted}`);
-    await this.#save(dir, { ...body, state: to, publication: normalized, seq: body.seq + 1 });
+    if (held.harness !== wanted) throw new AuthorityRefusal(`${to} requires harness ${wanted}`);
+    const source = await this.#bindSource(tx, held, body, input.source);
+    const digest = sourceCoreDigest(source);
+    if (!this.#verifies(digest, source.certificate)) throw new AuthorityRefusal("completion source certificate does not verify");
+    const publication = normalizePublication(JSON.parse(JSON.stringify({
+      harness: wanted, sourceCoreDigest: digest,
+      cohort: { runId: source.context.runId, generation: source.context.generation, captureIds: input.captureIds },
+    })));
+    await this.#save(dir, { ...body, state: to, publication, seq: body.seq + 1 });
   }
 
   /**
@@ -809,6 +876,8 @@ export class AuthorityStore {
   ): Promise<string> {
     const { dir, body } = await this.#owned(tx, lease);
     if (body.state === "retiring" || body.state === "retired") throw new AuthorityRefusal("source is retiring");
+    // Post-publication, any source operation needs a fresh admitSourceUse epoch first.
+    if (body.state === "sealed" || body.state === "claude_ready") throw new AuthorityRefusal("source is published; admit a new epoch first");
     if (body.pending !== null) throw new AuthorityRefusal("a pending footprint is already recorded");
     const operation = randomUUID();
     const pending: PendingFootprint = {

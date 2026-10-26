@@ -8,9 +8,11 @@ import {
   acquireWorkerLifetime, AuthorityRefusal, type AuthorityTransaction, withAuthorityTransaction, type WorkerLifetime,
 } from "../src/authority-lock.js";
 import {
-  type AuthorityFsOps, type AuthorityStore, installWorkerLifetime, leaseEpoch, leaseSlotKey, openAuthorityStore,
-  requireWorkerLifetime, type SlotPublication, SourceUseLease,
+  type AuthorityFsOps, AuthorityStore, installWorkerLifetime, leaseEpoch, leaseHarness, leaseSlotKey, openAuthorityStore,
+  requireWorkerLifetime, SourceUseLease,
 } from "../src/completion-authority.js";
+import { buildClaudeSourceCore, buildCodexSourceCore, type CompletionSourceV2, sourceCoreDigest } from "../src/completion-source.js";
+import { ExecutorLifetime } from "../src/codex/executor-lifetime.js";
 import { agentRoot, makeTmp, testLockOptions } from "./authority-test-support.js";
 
 const TOKEN = "unit-join-" + randomBytes(12).toString("hex");
@@ -38,11 +40,60 @@ function source(f: Fixture, name = "runner/repo-a"): string {
   return full;
 }
 const shardFile = (f: Fixture, key: string): string => path.join(authorityDir(f), "heads", `${key.slice(0, 2)}.json`);
-const claudePub = {
-  harness: "claude" as const, sourceCoreDigest: "d".repeat(64),
-  cohort: { runId: "run-1", generation: 1, captureIds: ["cap-a", "cap-b"] },
-};
-const codexPub = { ...claudePub, harness: "codex" as const };
+const CAPS = ["11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"];
+
+// Publication needs a certified source for the lease, so the tests remember each lease's path (by
+// wrapping admission once) and, for codex leases, the lifetime that sealed it.
+const leasePaths = new WeakMap<SourceUseLease, string>();
+const leaseSeals = new WeakMap<SourceUseLease, { lifetime: ExecutorLifetime; seal: unknown }>();
+const leaseSources = new WeakMap<SourceUseLease, CompletionSourceV2>();
+{
+  const realAdmit = AuthorityStore.prototype.admitSourceUse;
+  AuthorityStore.prototype.admitSourceUse = async function (this: AuthorityStore, ...args: Parameters<typeof realAdmit>) {
+    const lease = await realAdmit.apply(this, args);
+    leasePaths.set(lease, args[1]);
+    return lease;
+  };
+}
+/** Admit a codex slot: the executor id is the lifetime's, and the lease is sealed for it. */
+async function admitCodex(s: AuthorityStore, t2: AuthorityTransaction, src: string): Promise<SourceUseLease> {
+  const lifetime = new ExecutorLifetime();
+  const lease = await s.admitSourceUse(t2, src, { executor: (lifetime as unknown as { executorIncarnation: string }).executorIncarnation });
+  const identity = {};
+  lifetime.inventory(identity, () => true);
+  lifetime.bindFacade(identity, {}, () => true);
+  const sealed = await lifetime.seal(lease, async () => undefined, () => true);
+  assert.equal(sealed.kind, "sealed");
+  leaseSeals.set(lease, { lifetime, seal: sealed.kind === "sealed" ? sealed.seal : undefined });
+  return lease;
+}
+/** Build and certify a source for the lease's own harness (cached per lease), without transitioning. */
+async function certifiedFor(f: Fixture, s: AuthorityStore, t2: AuthorityTransaction, lease: SourceUseLease): Promise<CompletionSourceV2> {
+  const cached = leaseSources.get(lease);
+  if (cached) return cached;
+  const clonePath = leasePaths.get(lease) as string;
+  const sha = "a".repeat(40);
+  const context = {
+    runId: "run-1", branch: "agent/issue-1", kind: "issue" as const, barePath: path.join(f.root, "bare"), generation: 2,
+    defaultIdentity: { ref: "refs/heads/main", sha },
+  };
+  const base = { context, clonePath, expectedHead: sha, roots: [{ sha: "b".repeat(40), contexts: [context] }] };
+  const seals = leaseSeals.get(lease);
+  const core = leaseHarness(lease) === "codex" && seals
+    ? buildCodexSourceCore({ store: s, base, lease, seal: seals.seal, accepts: (seal, use) => seals.lifetime.accepts(seal, use) })
+    : buildClaudeSourceCore({ store: s, base, lease });
+  const certified = await s.certifySource(t2, lease, core);
+  leaseSources.set(lease, certified);
+  return certified;
+}
+/** Certify (once) and publish; returns the certified source that was published. */
+async function publish(
+  f: Fixture, s: AuthorityStore, t2: AuthorityTransaction, lease: SourceUseLease, to: "claude_ready" | "sealed", captureIds: string[] = CAPS,
+): Promise<CompletionSourceV2> {
+  const source = await certifiedFor(f, s, t2, lease);
+  await s.transition(t2, lease, to, { source, captureIds });
+  return source;
+}
 function slotFiles(f: Fixture): string[] {
   return fs.existsSync(slotsDir(f)) ? fs.readdirSync(slotsDir(f)) : [];
 }
@@ -149,13 +200,17 @@ test("admit mints an epoch, re-admit with the open lease retains it, a plain re-
   assert.equal(fs.statSync(path.join(slotsDir(f), `${key}.json`)).mode & 0o7777, 0o600);
   assert.doesNotMatch(fs.readFileSync(path.join(slotsDir(f), `${key}.json`), "utf8"), /"(?:st_)?(?:dev|ino)"/i);
   assert.equal(await tx(f, (t2) => s.admitSourceUse(t2, src, { lease })), lease);
+  assert.equal(await tx(f, (t2) => s.admitSourceUse(t2, src, { lease, executor: "exec-1" })), lease);
+  await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src, { lease, executor: "exec-other" })), /another executor/);
   assert.equal((await tx(f, (t2) => s.readSlot(t2, key)))?.epoch, slot?.epoch);
 
   const next = await tx(f, (t2) => s.admitSourceUse(t2, src));
   assert.notEqual((await tx(f, (t2) => s.readSlot(t2, key)))?.epoch, slot?.epoch);
-  await assert.rejects(tx(f, (t2) => s.transition(t2, lease, "claude_ready", claudePub)), /stale/);
-  await tx(f, (t2) => s.transition(t2, next, "claude_ready", claudePub));
-  assert.throws(() => new SourceUseLease(Symbol("x"), s, key, randomUUID()), /cannot be constructed/);
+  await assert.rejects(tx(f, (t2) => publish(f, s, t2, lease, "claude_ready")), /stale/);
+  await assert.rejects(tx(f, (t2) => publish(f, s, t2, next, "claude_ready")), /admitted as codex/, "the slot was admitted with an executor once");
+  const plain = await tx(f, (t2) => s.admitSourceUse(t2, source(f, "runner/plain")));
+  await tx(f, (t2) => publish(f, s, t2, plain, "claude_ready"));
+  assert.throws(() => new SourceUseLease(Symbol("x"), s, key, randomUUID(), "claude"), /cannot be constructed/);
 });
 
 test("a successor worker cannot advance a foreign active epoch; it may supersede a settled one", async (t) => {
@@ -169,22 +224,22 @@ test("a successor worker cannot advance a foreign active epoch; it may supersede
   await tx(f, (t2) => one.transition(t2, lease, "ineligible"));
   const taken = await tx(f, (t2) => two.admitSourceUse(t2, src));
   await assert.rejects(tx(f, (t2) => one.transition(t2, lease, "ineligible")), /stale/);
-  await tx(f, (t2) => two.transition(t2, taken, "claude_ready", claudePub));
+  await tx(f, (t2) => publish(f, two, t2, taken, "claude_ready"));
 });
 
 test("transition table is enforced", async (t) => {
   const f = await fixture(t);
   const s = await store(f);
   const lease = await tx(f, (t2) => s.admitSourceUse(t2, source(f)));
-  await tx(f, (t2) => s.transition(t2, lease, "claude_ready", claudePub));
-  await assert.rejects(tx(f, (t2) => s.transition(t2, lease, "sealed", codexPub)), /illegal transition/);
-  await assert.rejects(tx(f, (t2) => s.transition(t2, lease, "claude_ready", claudePub)), /illegal transition/);
+  await tx(f, (t2) => publish(f, s, t2, lease, "claude_ready"));
+  await assert.rejects(tx(f, (t2) => publish(f, s, t2, lease, "sealed")), /illegal transition/);
+  await assert.rejects(tx(f, (t2) => publish(f, s, t2, lease, "claude_ready")), /illegal transition/);
   await tx(f, (t2) => s.transition(t2, lease, "ineligible"));
-  await assert.rejects(tx(f, (t2) => s.transition(t2, lease, "sealed", codexPub)), /illegal transition/);
+  await assert.rejects(tx(f, (t2) => publish(f, s, t2, lease, "sealed")), /illegal transition/);
 
-  const codexLease = await tx(f, (t2) => s.admitSourceUse(t2, source(f, "runner/repo-codex")));
-  await tx(f, (t2) => s.transition(t2, codexLease, "sealed", codexPub));
-  await assert.rejects(tx(f, (t2) => s.transition(t2, codexLease, "claude_ready", claudePub)), /illegal transition/);
+  const codexLease = await tx(f, (t2) => admitCodex(s, t2, source(f, "runner/repo-codex")));
+  await tx(f, (t2) => publish(f, s, t2, codexLease, "sealed"));
+  await assert.rejects(tx(f, (t2) => publish(f, s, t2, codexLease, "claude_ready")), /illegal transition/);
   await tx(f, (t2) => s.transition(t2, codexLease, "ineligible"));
 });
 
@@ -202,7 +257,7 @@ test("tampered or malformed slots refuse and block admission", async (t) => {
   fs.writeFileSync(file, JSON.stringify(forged) + "\n", { mode: 0o600 });
   // A sealed state without publication data is refused by the decoder before the MAC is even checked.
   await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src)), /authentication|malformed/);
-  await assert.rejects(tx(f, (t2) => s.transition(t2, lease, "claude_ready", claudePub)), /authentication|malformed/);
+  await assert.rejects(tx(f, (t2) => publish(f, s, t2, lease, "claude_ready")), /authentication|malformed/);
 
   fs.writeFileSync(file, '{"version":', { mode: 0o600 });
   await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src)), /malformed/);
@@ -245,7 +300,7 @@ test("pending footprints: running blocks admission, settle clears, a failed sett
   assert.equal((await tx(f, (t2) => s.readSlot(t2, key)))?.pending?.status, "running");
   await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src)), /pending/);
   await assert.rejects(tx(f, (t2) => s.beginPending(t2, lease, { kind: "bare_mutation", footprint: "x" })), /already recorded/);
-  await assert.rejects(tx(f, (t2) => s.transition(t2, lease, "claude_ready", claudePub)), /pending/);
+  await assert.rejects(tx(f, (t2) => publish(f, s, t2, lease, "claude_ready")), /pending/);
   await assert.rejects(tx(f, (t2) => s.markRetiring(t2, lease, { prior: "a".repeat(64), manifest: [] })), /pending/);
   await tx(f, (t2) => s.settlePending(t2, lease, op, { ok: true }));
   assert.equal((await tx(f, (t2) => s.readSlot(t2, key)))?.pending, null);
@@ -278,8 +333,8 @@ test("retiring blocks admission until retired; a retired tombstone mints a new e
   assert.equal(retired?.state, "retired");
   const fresh = await tx(f, (t2) => s.admitSourceUse(t2, src));
   assert.notEqual((await tx(f, (t2) => s.readSlot(t2, key)))?.epoch, retired?.epoch);
-  await assert.rejects(tx(f, (t2) => s.transition(t2, lease, "claude_ready", claudePub)), /stale/);
-  await tx(f, (t2) => s.transition(t2, fresh, "claude_ready", claudePub));
+  await assert.rejects(tx(f, (t2) => publish(f, s, t2, lease, "claude_ready")), /stale/);
+  await tx(f, (t2) => publish(f, s, t2, fresh, "claude_ready"));
 });
 
 function failingOps(flags: { file: boolean; dir: boolean; rename: boolean }): AuthorityFsOps {
@@ -303,8 +358,8 @@ test("a failed durable write never returns a lease or leaves an eligible state",
   assert.deepEqual(slotFiles(f), [], "no slot and no temporary file remains");
   flags.file = false;
 
-  const lease = await tx(f, (t2) => s.admitSourceUse(t2, src));
-  await tx(f, (t2) => s.transition(t2, lease, "sealed", codexPub));
+  const lease = await tx(f, (t2) => admitCodex(s, t2, src));
+  await tx(f, (t2) => publish(f, s, t2, lease, "sealed"));
 
   flags.rename = true;
   await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src)), /injected rename/);
@@ -345,7 +400,7 @@ test("input the decoder would refuse is rejected before anything is written, so 
   const big = Array.from({ length: 1024 }, (_, i) => String(i).padStart(4, "0") + "€".repeat(508));
   await assert.rejects(tx(f, (t2) => s.markRetiring(t2, other, { prior: "c".repeat(64), manifest: big })), /exceeds bound/);
   assert.equal((await tx(f, (t2) => s.readSlot(t2, otherKey)))?.state, "active", "slot still readable and unchanged");
-  await tx(f, (t2) => s.transition(t2, other, "claude_ready", claudePub));
+  await tx(f, (t2) => publish(f, s, t2, other, "claude_ready"));
 });
 
 test("replaying an older authentic slot file refuses and keeps refusing", async (t) => {
@@ -366,7 +421,7 @@ test("replaying an older authentic slot file refuses and keeps refusing", async 
     await assert.rejects(tx(f, (t2) => who.readSlot(t2, key)), /replay/);
     await assert.rejects(tx(f, (t2) => who.admitSourceUse(t2, src)), /replay/);
   }
-  await assert.rejects(tx(f, (t2) => s.transition(t2, lease, "claude_ready", claudePub)), /replay/);
+  await assert.rejects(tx(f, (t2) => publish(f, s, t2, lease, "claude_ready")), /replay/);
 });
 
 test("the in-process high-water mark refuses a replay of the slot and head together", async (t) => {
@@ -417,7 +472,7 @@ test("the head tracks every slot write and survives its own crash window", async
   assert.equal((await tx(f, (t2) => restarted.readSlot(t2, key)))?.seq, 1);
   assert.deepEqual(head(), { [key]: 1 }, "completed under the transaction");
   const lease = await tx(f, (t2) => restarted.admitSourceUse(t2, src));
-  await tx(f, (t2) => restarted.transition(t2, lease, "claude_ready", claudePub));
+  await tx(f, (t2) => publish(f, restarted, t2, lease, "claude_ready"));
   assert.deepEqual(head(), { [key]: 3 });
 });
 
@@ -429,7 +484,7 @@ test("a rolled-back or deleted head, or a deleted slot, refuses", async (t) => {
   const headFile = shardFile(f, key);
   const lease = await tx(f, (t2) => s.admitSourceUse(t2, src));
   const oldHead = fs.readFileSync(headFile);
-  await tx(f, (t2) => s.transition(t2, lease, "claude_ready", claudePub));
+  await tx(f, (t2) => publish(f, s, t2, lease, "claude_ready"));
   await tx(f, (t2) => s.transition(t2, lease, "ineligible"));
   const newHead = fs.readFileSync(headFile);
 
@@ -611,26 +666,150 @@ test("sealed and claude_ready publish the digest and cohort, and require the mat
   const xSrc = source(f, "runner/codex");
   const cKey = await tx(f, (t2) => s.slotKey(t2, cSrc));
   const cLease = await tx(f, (t2) => s.admitSourceUse(t2, cSrc));
-  const xLease = await tx(f, (t2) => s.admitSourceUse(t2, xSrc));
+  const xLease = await tx(f, (t2) => admitCodex(s, t2, xSrc));
   assert.equal(leaseSlotKey(cLease), cKey);
   assert.equal(leaseEpoch(cLease), (await tx(f, (t2) => s.readSlot(t2, cKey)))?.epoch);
+  assert.equal(leaseHarness(cLease), "claude");
+  assert.equal(leaseHarness(xLease), "codex");
   assert.equal(await tx(f, (t2) => s.readPublication(t2, cSrc)), null, "an active slot publishes nothing");
 
-  await assert.rejects(tx(f, (t2) => s.transition(t2, cLease, "sealed", claudePub)), /requires harness codex/);
-  await assert.rejects(tx(f, (t2) => s.transition(t2, cLease, "claude_ready", codexPub)), /requires harness claude/);
+  await assert.rejects(tx(f, (t2) => publish(f, s, t2, cLease, "sealed")), /requires harness codex/, "a claude lease cannot seal");
+  await assert.rejects(tx(f, (t2) => publish(f, s, t2, xLease, "claude_ready")), /requires harness claude/, "a codex lease cannot become claude_ready");
   const loose = s.transition.bind(s) as (...a: unknown[]) => Promise<void>;
   await assert.rejects(tx(f, (t2) => loose(t2, cLease, "claude_ready")), /publication data required/);
-  await assert.rejects(tx(f, (t2) => loose(t2, cLease, "sealed")), /publication data required/);
-  await assert.rejects(tx(f, (t2) => loose(t2, cLease, "ineligible", claudePub)), /no publication/);
+  await assert.rejects(tx(f, (t2) => loose(t2, xLease, "sealed")), /publication data required/);
+  await assert.rejects(tx(f, (t2) => loose(t2, cLease, "ineligible", { source: {}, captureIds: [] })), /no publication/);
   assert.equal((await tx(f, (t2) => s.readSlot(t2, cKey)))?.state, "active", "no refused call wrote anything");
 
-  await tx(f, (t2) => s.transition(t2, cLease, "claude_ready", claudePub));
-  await tx(f, (t2) => s.transition(t2, xLease, "sealed", codexPub));
-  const claude = await tx(f, (t2) => s.readPublication(t2, cSrc));
-  assert.deepEqual(claude, { ...claudePub, state: "claude_ready", epoch: leaseEpoch(cLease) });
-  const codex = await tx(f, (t2) => s.readPublication(t2, xSrc));
-  assert.deepEqual(codex, { ...codexPub, state: "sealed", epoch: leaseEpoch(xLease) });
+  const claudeSource = await tx(f, (t2) => publish(f, s, t2, cLease, "claude_ready"));
+  const codexSource = await tx(f, (t2) => publish(f, s, t2, xLease, "sealed"));
+  const cohort = { runId: "run-1", generation: 2, captureIds: CAPS };
+  assert.deepEqual(await tx(f, (t2) => s.readPublication(t2, cSrc)), {
+    harness: "claude", sourceCoreDigest: sourceCoreDigest(claudeSource), cohort, state: "claude_ready", epoch: leaseEpoch(cLease),
+  });
+  assert.deepEqual(await tx(f, (t2) => s.readPublication(t2, xSrc)), {
+    harness: "codex", sourceCoreDigest: sourceCoreDigest(codexSource), cohort, state: "sealed", epoch: leaseEpoch(xLease),
+  });
   assert.equal(await tx(f, (t2) => s.readPublication(t2, source(f, "runner/never"))), null);
+});
+
+test("a codex slot can never become claude_ready: the harness is bound at admission and the marker is sticky", async (t) => {
+  const f = await fixture(t);
+  const s = await store(f);
+  // (a) admitted with an executor, then a claude_ready attempt.
+  const aSrc = source(f, "runner/a");
+  const aLease = await tx(f, (t2) => s.admitSourceUse(t2, aSrc, { executor: "exec-1" }));
+  const aKey = await tx(f, (t2) => s.slotKey(t2, aSrc));
+  assert.equal((await tx(f, (t2) => s.readSlot(t2, aKey)))?.codexMarked, true);
+  await assert.rejects(tx(f, (t2) => s.transition(t2, aLease, "claude_ready", { source: {}, captureIds: [] })), /requires harness claude/);
+
+  // (b) a sealed codex slot re-admitted by a successor (publication wiped) is still not claude_ready-able.
+  const bSrc = source(f, "runner/b");
+  const bKey = await tx(f, (t2) => s.slotKey(t2, bSrc));
+  const bLease = await tx(f, (t2) => admitCodex(s, t2, bSrc));
+  await tx(f, (t2) => publish(f, s, t2, bLease, "sealed"));
+  const successor = await tx(f, (t2) => s.admitSourceUse(t2, bSrc));
+  const reslot = await tx(f, (t2) => s.readSlot(t2, bKey));
+  assert.equal(reslot?.publication, null, "re-admission wipes the publication");
+  assert.equal(reslot?.owner.executor, null);
+  assert.equal(reslot?.codexMarked, true, "the marker outlives the wipe");
+  assert.equal(leaseHarness(successor), "claude");
+  await assert.rejects(tx(f, (t2) => publish(f, s, t2, successor, "claude_ready")), /admitted as codex/);
+  await assert.rejects(tx(f, (t2) => s.transition(t2, successor, "sealed", { source: {}, captureIds: [] })), /requires harness codex/, "a claude lease cannot seal either");
+
+  // The marker survives ineligible, retiring and the tombstone, so a reused path is still codex.
+  await tx(f, (t2) => s.transition(t2, successor, "ineligible"));
+  assert.equal((await tx(f, (t2) => s.readSlot(t2, bKey)))?.codexMarked, true);
+  await tx(f, (t2) => s.markRetiring(t2, successor, { prior: "a".repeat(64), manifest: [] }));
+  assert.equal((await tx(f, (t2) => s.readSlot(t2, bKey)))?.codexMarked, true);
+  await tx(f, (t2) => s.markRetired(t2, successor));
+  const tomb = await tx(f, (t2) => s.readSlot(t2, bKey));
+  assert.equal(tomb?.state, "retired");
+  assert.equal(tomb?.codexMarked, true, "even the tombstone keeps it");
+  const reused = await tx(f, (t2) => s.admitSourceUse(t2, bSrc));
+  await assert.rejects(tx(f, (t2) => publish(f, s, t2, reused, "claude_ready")), /admitted as codex/);
+  assert.equal((await tx(f, (t2) => s.readSlot(t2, bKey)))?.state, "active");
+
+  // A claude-only slot is never marked, and a codex re-admission marks it for good.
+  const cSrc = source(f, "runner/c");
+  const cKey = await tx(f, (t2) => s.slotKey(t2, cSrc));
+  await tx(f, (t2) => s.admitSourceUse(t2, cSrc));
+  assert.equal((await tx(f, (t2) => s.readSlot(t2, cKey)))?.codexMarked, false);
+  await tx(f, (t2) => s.admitSourceUse(t2, cSrc, { executor: "exec-2" }));
+  assert.equal((await tx(f, (t2) => s.readSlot(t2, cKey)))?.codexMarked, true);
+  const next = await tx(f, (t2) => s.admitSourceUse(t2, cSrc));
+  assert.equal((await tx(f, (t2) => s.readSlot(t2, cKey)))?.codexMarked, true);
+  await assert.rejects(tx(f, (t2) => publish(f, s, t2, next, "claude_ready")), /admitted as codex/);
+});
+
+test("the decoder refuses an executor or codex publication without the marker, claude_ready with it, and a retired slot with a publication", async (t) => {
+  const f = await fixture(t);
+  const s = await store(f);
+  const src = source(f);
+  const key = await tx(f, (t2) => s.slotKey(t2, src));
+  const lease = await tx(f, (t2) => admitCodex(s, t2, src));
+  const file = path.join(slotsDir(f), `${key}.json`);
+  const active = fs.readFileSync(file, "utf8");
+  const forge = (mutate: (o: Record<string, any>) => void, base: string): void => {
+    const o = JSON.parse(base) as Record<string, any>;
+    mutate(o);
+    fs.writeFileSync(file, JSON.stringify(o) + "\n", { mode: 0o600 });
+  };
+  forge((o) => { o.codexMarked = false; }, active);
+  await assert.rejects(tx(f, (t2) => s.readSlot(t2, key)), /malformed/, "an executor without the marker");
+  forge((o) => { delete o.codexMarked; }, active);
+  await assert.rejects(tx(f, (t2) => s.readSlot(t2, key)), /malformed/);
+  fs.writeFileSync(file, active, { mode: 0o600 });
+
+  await tx(f, (t2) => publish(f, s, t2, lease, "sealed"));
+  const sealed = fs.readFileSync(file, "utf8");
+  forge((o) => { o.state = "retired"; }, sealed);
+  await assert.rejects(tx(f, (t2) => s.readSlot(t2, key)), /malformed/, "a retired slot cannot carry a publication");
+  forge((o) => { o.codexMarked = false; o.owner.executor = null; }, sealed);
+  await assert.rejects(tx(f, (t2) => s.readSlot(t2, key)), /malformed/, "a codex publication without the marker");
+  forge((o) => { o.state = "claude_ready"; o.publication.harness = "claude"; }, sealed);
+  await assert.rejects(tx(f, (t2) => s.readSlot(t2, key)), /malformed/, "claude_ready in a marked slot");
+  fs.writeFileSync(file, sealed, { mode: 0o600 });
+  assert.equal((await tx(f, (t2) => s.readSlot(t2, key)))?.state, "sealed");
+});
+
+test("publication takes the certified source: any foreign epoch, slot, worker, executor, certificate or cohort is refused", async (t) => {
+  const f = await fixture(t);
+  const s = await store(f);
+  const aSrc = source(f, "runner/pa");
+  const bSrc = source(f, "runner/pb");
+  const aLease = await tx(f, (t2) => s.admitSourceUse(t2, aSrc));
+  const bLease = await tx(f, (t2) => s.admitSourceUse(t2, bSrc));
+  const aSource = await tx(f, (t2) => certifiedFor(f, s, t2, aLease));
+  const bSource = await tx(f, (t2) => certifiedFor(f, s, t2, bLease));
+  const put = (lease: SourceUseLease, source: unknown, captureIds: unknown = CAPS): Promise<void> =>
+    tx(f, (t2) => s.transition(t2, lease, "claude_ready", { source, captureIds: captureIds as string[] }));
+
+  await assert.rejects(put(aLease, bSource), /another source-use epoch/, "another slot's source");
+  await assert.rejects(put(aLease, { ...aSource, certificate: undefined }), /malformed/);
+  const { certificate: _c, ...uncertified } = aSource;
+  await assert.rejects(put(aLease, uncertified), /certificate does not verify/);
+  await assert.rejects(put(aLease, { ...aSource, certificate: bSource.certificate }), /certificate does not verify/);
+  await assert.rejects(put(aLease, { ...aSource, expectedHead: "c".repeat(40) }), /certificate does not verify/, "a digest the certificate does not cover");
+  await assert.rejects(put(aLease, { ...aSource, extra: 1 }), /malformed/);
+  await assert.rejects(put(aLease, { ...aSource, workerIncarnation: randomUUID() }), /another worker incarnation/);
+  // A certificate-bearing source for another slot, rebound to this lease's epoch, still names the wrong slot.
+  const wrongSlot = { ...bSource, sourceUseEpoch: leaseEpoch(aLease) };
+  await assert.rejects(put(aLease, wrongSlot), /another slot|certificate does not verify/);
+  await assert.rejects(put(aLease, aSource, "not-an-array"), /malformed/);
+  assert.equal((await tx(f, (t2) => s.readPublication(t2, aSrc))), null, "nothing was written");
+  await put(aLease, aSource);
+  const read = await tx(f, (t2) => s.readPublication(t2, aSrc));
+  assert.equal(read?.cohort.runId, aSource.context.runId, "the cohort run and generation come from the source");
+  assert.equal(read?.cohort.generation, aSource.context.generation);
+
+  // Codex: the source's executor must be the slot owner's.
+  const xSrc = source(f, "runner/px");
+  const xLease = await tx(f, (t2) => admitCodex(s, t2, xSrc));
+  const xSource = await tx(f, (t2) => certifiedFor(f, s, t2, xLease));
+  const wrongExecutor = await tx(f, (t2) => s.certifySource(t2, xLease, { ...xSource, executorIncarnation: "exec-forged" }).catch((e: unknown) => e));
+  assert.match(String((wrongExecutor as Error).message), /executor does not match/);
+  await tx(f, (t2) => s.transition(t2, xLease, "sealed", { source: xSource, captureIds: CAPS }));
 });
 
 test("publication data is validated before anything is written", async (t) => {
@@ -639,23 +818,46 @@ test("publication data is validated before anything is written", async (t) => {
   const src = source(f);
   const key = await tx(f, (t2) => s.slotKey(t2, src));
   const lease = await tx(f, (t2) => s.admitSourceUse(t2, src));
-  const bad = (p: unknown): Promise<void> => assert.rejects(
-    tx(f, (t2) => s.transition(t2, lease, "claude_ready", p as SlotPublication)), /malformed/);
-  const ids = (captureIds: string[]): unknown => ({ ...claudePub, cohort: { ...claudePub.cohort, captureIds } });
-  await bad(ids(["b", "a"]));
-  await bad(ids(["a", "a"]));
-  await bad(ids([""]));
-  await bad(ids(Array.from({ length: 257 }, (_, i) => String(i).padStart(4, "0"))));
-  await bad({ ...claudePub, sourceCoreDigest: "D".repeat(64) });
-  await bad({ ...claudePub, sourceCoreDigest: "d".repeat(63) });
-  await bad({ ...claudePub, extra: 1 });
-  await bad({ ...claudePub, cohort: { ...claudePub.cohort, generation: 0 } });
-  await bad({ ...claudePub, cohort: { ...claudePub.cohort, extra: 1 } });
-  await bad({ harness: "claude", sourceCoreDigest: "d".repeat(64) });
+  const bad = (captureIds: unknown): Promise<void> => assert.rejects(tx(f, async (t2) => {
+    const source = await certifiedFor(f, s, t2, lease);
+    await s.transition(t2, lease, "claude_ready", { source, captureIds: captureIds as string[] });
+  }), /malformed/);
+  const [a, b] = CAPS as [string, string];
+  await bad([b, a]);
+  await bad([a, a]);
+  await bad([""]);
+  await bad(["cap-a"]);
+  await bad(["AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"]);
+  await bad([`maintenance-v2-${a}`]);
+  await bad([`${a}\n`]);
+  await bad([5]);
+  await bad(Array.from({ length: 257 }, (_, i) => `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`));
   const slot = await tx(f, (t2) => s.readSlot(t2, key));
   assert.equal(slot?.state, "active");
   assert.equal(slot?.publication, null);
-  await tx(f, (t2) => s.transition(t2, lease, "claude_ready", claudePub));
+  await tx(f, (t2) => publish(f, s, t2, lease, "claude_ready", [a, `maintenance-v1-${b}`].sort()));
+  assert.equal((await tx(f, (t2) => s.readSlot(t2, key)))?.state, "claude_ready");
+});
+
+test("a published slot refuses bare mutation until a fresh epoch is admitted", async (t) => {
+  const f = await fixture(t);
+  const s = await store(f);
+  const cSrc = source(f, "runner/pc");
+  const xSrc = source(f, "runner/pd");
+  const cLease = await tx(f, (t2) => s.admitSourceUse(t2, cSrc));
+  const xLease = await tx(f, (t2) => admitCodex(s, t2, xSrc));
+  for (const [lease, to, src] of [[cLease, "claude_ready", cSrc], [xLease, "sealed", xSrc]] as const) {
+    await tx(f, (t2) => publish(f, s, t2, lease, to));
+    const key = await tx(f, (t2) => s.slotKey(t2, src));
+    for (const kind of ["bare_mutation", "destructive"] as const) {
+      await assert.rejects(tx(f, (t2) => s.beginPending(t2, lease, { kind, footprint: "x" })), /published/);
+    }
+    const slot = await tx(f, (t2) => s.readSlot(t2, key));
+    assert.equal(slot?.pending, null, "nothing was recorded");
+    assert.equal(slot?.state, to);
+  }
+  const fresh = await tx(f, (t2) => s.admitSourceUse(t2, cSrc));
+  await tx(f, (t2) => s.beginPending(t2, fresh, { kind: "bare_mutation", footprint: "x" }));
 });
 
 test("a stale lease cannot publish, and a pending footprint blocks publication and reads", async (t) => {
@@ -665,11 +867,11 @@ test("a stale lease cannot publish, and a pending footprint blocks publication a
   const key = await tx(f, (t2) => s.slotKey(t2, src));
   const stale = await tx(f, (t2) => s.admitSourceUse(t2, src));
   const lease = await tx(f, (t2) => s.admitSourceUse(t2, src));
-  await assert.rejects(tx(f, (t2) => s.transition(t2, stale, "claude_ready", claudePub)), /stale/);
+  await assert.rejects(tx(f, (t2) => publish(f, s, t2, stale, "claude_ready")), /stale/);
   assert.equal(await tx(f, (t2) => s.readPublication(t2, src)), null);
 
   await tx(f, (t2) => s.beginPending(t2, lease, { kind: "bare_mutation", footprint: "x" }));
-  await assert.rejects(tx(f, (t2) => s.transition(t2, lease, "claude_ready", claudePub)), /pending/);
+  await assert.rejects(tx(f, (t2) => publish(f, s, t2, lease, "claude_ready")), /pending/);
   await assert.rejects(tx(f, (t2) => s.readPublication(t2, src)), /pending/);
   assert.equal((await tx(f, (t2) => s.readSlot(t2, key)))?.publication, null);
 });
@@ -679,8 +881,8 @@ test("publication survives ineligible and retiring, is cleared by retire, and is
   const s = await store(f);
   const src = source(f);
   const key = await tx(f, (t2) => s.slotKey(t2, src));
-  const lease = await tx(f, (t2) => s.admitSourceUse(t2, src));
-  await tx(f, (t2) => s.transition(t2, lease, "sealed", codexPub));
+  const lease = await tx(f, (t2) => admitCodex(s, t2, src));
+  await tx(f, (t2) => publish(f, s, t2, lease, "sealed"));
   const file = path.join(slotsDir(f), `${key}.json`);
   const original = fs.readFileSync(file, "utf8");
 
@@ -702,20 +904,29 @@ test("publication survives ineligible and retiring, is cleared by retire, and is
   assert.equal(await tx(f, (t2) => s.readPublication(t2, src)), null);
 });
 
-test("source certificates are minted and checked under a live transaction with the store key", async (t) => {
+test("source certificates are minted for a live lease and checked under a live transaction with the store key", async (t) => {
   const f = await fixture(t);
   const s = await store(f);
-  const digest = "a".repeat(64);
-  const cert = await tx(f, async (t2) => s.certifySource(t2, digest));
+  const src = source(f);
+  const lease = await tx(f, (t2) => s.admitSourceUse(t2, src));
+  const certified = await tx(f, (t2) => certifiedFor(f, s, t2, lease));
+  const digest = sourceCoreDigest(certified);
+  const cert = certified.certificate as string;
   assert.match(cert, /^[0-9a-f]{64}$/);
   assert.equal(await tx(f, async (t2) => s.verifySourceCertificate(t2, digest, cert)), true);
   assert.equal(await tx(f, async (t2) => s.verifySourceCertificate(t2, "b".repeat(64), cert)), false);
-  assert.equal(await tx(f, async (t2) => s.verifySourceCertificate(t2, digest, cert.replace(/^./, "0"))), false);
+  assert.equal(await tx(f, async (t2) => s.verifySourceCertificate(t2, digest, cert.replace(/^./, "0"))), cert[0] === "0");
   assert.equal(await tx(f, async (t2) => s.verifySourceCertificate(t2, digest, 5)), false);
   let captured: AuthorityTransaction | undefined;
   await tx(f, async (t2) => { captured = t2; });
-  assert.throws(() => s.certifySource(captured!, digest), /active authority transaction/);
-  assert.throws(() => s.certifySource({} as AuthorityTransaction, digest), /active authority transaction/);
+  assert.throws(() => s.verifySourceCertificate(captured!, digest, cert), /active authority transaction/);
+  await assert.rejects(s.certifySource(captured!, lease, certified), /active authority transaction/);
+  await assert.rejects(s.certifySource({} as AuthorityTransaction, lease, certified), /active authority transaction/);
+  // A lease from another store, or one the slot has moved past, cannot certify.
+  const other = await store(f, { workerIncarnation: randomUUID() });
+  await assert.rejects(tx(f, (t2) => other.certifySource(t2, lease, certified)), /does not belong/);
+  await tx(f, (t2) => s.admitSourceUse(t2, src));
+  await assert.rejects(tx(f, (t2) => s.certifySource(t2, lease, certified)), /stale/);
 });
 
 // ---- head shards: creation, deletion, restart rollback --------------------------------------

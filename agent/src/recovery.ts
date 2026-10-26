@@ -5411,7 +5411,7 @@ function validInventoryContext(value: unknown, runId: string, barePath?: string)
 }
 
 /** Completion source shape is checked before authenticating the containing record. */
-function validCompletionSource(value: unknown): value is CompletionSource {
+export function validCompletionSource(value: unknown): value is CompletionSource {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const s = value as CompletionSource;
   const keys = Object.keys(s).sort().join(",");

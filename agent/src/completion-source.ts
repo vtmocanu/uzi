@@ -1,17 +1,20 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { AuthorityRefusal, type AuthorityTransaction } from "./authority-lock.js";
-import { leaseEpoch, type AuthorityStore, type SourceUseLease } from "./completion-authority.js";
-import type { ExecutorSealMaterial } from "./codex/executor-lifetime.js";
-import type { CompletionSource } from "./recovery.js";
+import { leaseEpoch, type AuthorityStore, type SlotPublicationRead, type SourceUseLease } from "./completion-authority.js";
+import { terminalSealMaterial } from "./codex/executor-lifetime.js";
+import { type CompletionSource, validCompletionSource } from "./recovery.js";
 
 // Version 2 completion sources and the source fence (issue #3404 M2 U1). Pure primitives:
 // DORMANT, no production caller. A V2 source extends the V1 attempt provenance with the
 // storage identity, the harness and the worker/executor incarnations that produced it, bound
 // to one source-use epoch. `sourceCoreDigest` covers everything except the certificate, and the
 // certificate is an HMAC over that digest minted only by the authority store (the key never
-// leaves completion-authority.ts), so a source that was not published under the authority
-// cannot present one.
+// leaves completion-authority.ts) and only for the exact live lease of the source's slot
+// (AuthorityStore.certifySource), so a source that was not produced under a live lease cannot
+// present one. `verifyCertifiedSource` is a pure MAC check and says nothing about freshness: a
+// consumer that needs the source to still be the published one uses `verifyPublishedSource`,
+// which also compares the slot's publication (readPublication).
 
 const CORE_DOMAIN = "uzi completion source core v2\0";
 const MAX_PATH = 4096;
@@ -42,10 +45,8 @@ export interface CompletionSourceV2 {
   workerIncarnation: string;
   /** Codex only. */
   executorIncarnation?: string;
-  /** Codex only; strictly ascending. */
-  registryIncarnations?: string[];
-  /** Codex only; strictly ascending. */
-  facadeIncarnations?: string[];
+  /** Codex only: one [registry, facade] pair per inventoried registry, strictly ascending by registry id. */
+  registryFacadePairs?: [string, string][];
   sourceUseEpoch: string;
   /** HMAC over `sourceCoreDigest` minted by the authority store; absent on an uncertified core. */
   certificate?: string;
@@ -111,11 +112,17 @@ function checkRoots(value: unknown, ctx: CompletionSource["context"]): Completio
   });
 }
 
-function sortedIds(value: unknown): string[] {
+function checkPairs(value: unknown): [string, string][] {
   if (!Array.isArray(value) || value.length > MAX_INCARNATIONS) return refuse();
-  const ids = value.map((id) => match(id, INCARNATION));
-  for (let i = 1; i < ids.length; i++) if (!((ids[i - 1] as string) < (ids[i] as string))) return refuse();
-  return ids;
+  const pairs = value.map((pair): [string, string] => {
+    if (!Array.isArray(pair) || pair.length !== 2) return refuse();
+    return [match(pair[0], INCARNATION), match(pair[1], INCARNATION)];
+  });
+  for (let i = 1; i < pairs.length; i++) {
+    if (!(((pairs[i - 1] as [string, string])[0]) < (pairs[i] as [string, string])[0])) return refuse();
+  }
+  if (new Set(pairs.map((pair) => pair[1])).size !== pairs.length) return refuse();
+  return pairs;
 }
 
 function relativeOf(value: unknown): string {
@@ -127,27 +134,39 @@ function relativeOf(value: unknown): string {
 }
 
 /**
- * Strictly decode a V2 source: exact key set (codex carries the three incarnation lists,
- * claude none), bounded strings, hex and UUID formats, and a clone path that is the absolute
- * normalized join of `expected.dataDir` and `relativeSource`. Returns a fresh object.
+ * Decode a V2 source: the V1 core first (recovery.ts `validCompletionSource`, so both versions
+ * agree on context, roots and attempt shape), then the exact key set (codex carries the
+ * registry/facade pairs, claude none), bounded strings, hex and UUID formats. With an
+ * expectation the clone path must be the absolute normalized join of `expected.dataDir` and
+ * `relativeSource` under that storage identity; without one only the shape is checked (digest
+ * and fence computation). Returns a fresh object.
  */
-export function parseCompletionSourceV2(value: unknown, expected: SourceExpectation): CompletionSourceV2 {
+function decodeSource(value: unknown, expected?: SourceExpectation): CompletionSourceV2 {
   if (!isPlain(value)) return refuse();
+  const v1: Record<string, unknown> = {};
+  for (const key of ["context", "clonePath", "expectedHead", "roots", "attemptId"]) if (value[key] !== undefined) v1[key] = value[key];
+  let v1Valid = false;
+  try { v1Valid = validCompletionSource(v1); } catch { v1Valid = false; }
+  if (!v1Valid) return refuse();
   const codex = value.harness === "codex";
   if (!codex && value.harness !== "claude") return refuse();
   const base = ["version", "context", "clonePath", "expectedHead", "roots", "storageId", "layout", "relativeSource",
     "harness", "workerIncarnation", "sourceUseEpoch"];
-  const o = exactKeys(value, codex ? [...base, "executorIncarnation", "registryIncarnations", "facadeIncarnations"] : base,
+  const o = exactKeys(value, codex ? [...base, "executorIncarnation", "registryFacadePairs"] : base,
     ["attemptId", "certificate"]);
   if (o.version !== 2) return refuse();
   const context = checkContext(o.context);
   const clonePath = absolute(o.clonePath);
   const relativeSource = relativeOf(o.relativeSource);
-  if (expected.dataDir !== path.resolve(expected.dataDir) || clonePath !== path.join(expected.dataDir, relativeSource)) return refuse();
-  if (match(o.storageId, UUID) !== expected.storageId || o.layout !== expected.layout) return refuse();
+  const storageId = match(o.storageId, UUID);
+  const layout = str(o.layout, 128);
+  if (expected) {
+    if (expected.dataDir !== path.resolve(expected.dataDir) || clonePath !== path.join(expected.dataDir, relativeSource)) return refuse();
+    if (storageId !== expected.storageId || layout !== expected.layout) return refuse();
+  } else if (!clonePath.endsWith(`/${relativeSource}`)) return refuse();
   const out: CompletionSourceV2 = {
     version: 2, context, clonePath, expectedHead: match(o.expectedHead, HEX40), roots: checkRoots(o.roots, context),
-    storageId: expected.storageId, layout: expected.layout, relativeSource, harness: codex ? "codex" : "claude",
+    storageId, layout, relativeSource, harness: codex ? "codex" : "claude",
     workerIncarnation: match(o.workerIncarnation, UUID), sourceUseEpoch: match(o.sourceUseEpoch, UUID),
   };
   if (o.attemptId !== undefined) {
@@ -155,25 +174,49 @@ export function parseCompletionSourceV2(value: unknown, expected: SourceExpectat
   }
   if (codex) {
     out.executorIncarnation = match(o.executorIncarnation, INCARNATION);
-    out.registryIncarnations = sortedIds(o.registryIncarnations);
-    out.facadeIncarnations = sortedIds(o.facadeIncarnations);
+    out.registryFacadePairs = checkPairs(o.registryFacadePairs);
   }
   if (o.certificate !== undefined) out.certificate = match(o.certificate, HEX64);
   return out;
 }
 
-function canonicalJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  if (typeof value === "object" && value !== null) {
-    const record = value as Record<string, unknown>;
-    return `{${Object.keys(record).sort().map((k) => `${JSON.stringify(k)}:${canonicalJson(record[k])}`).join(",")}}`;
-  }
-  return JSON.stringify(value);
+/** Strictly decode a V2 source against the storage identity it must belong to. */
+export function parseCompletionSourceV2(value: unknown, expected: SourceExpectation): CompletionSourceV2 {
+  return decodeSource(value, expected);
 }
 
-/** sha256 hex over the domain-separated canonical JSON of the source minus its certificate. */
+/**
+ * Canonical JSON for digests. Throws on anything JSON would drop or conflate (undefined,
+ * functions, symbols, bigint, non-finite numbers, negative zero, sparse arrays, non-plain
+ * objects), so two values with one spelling can never differ.
+ */
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value === "boolean" || typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || Object.is(value, -0)) return refuse();
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    const items: string[] = [];
+    for (let i = 0; i < value.length; i++) {
+      if (!(i in value)) return refuse();
+      items.push(canonicalJson(value[i]));
+    }
+    return `[${items.join(",")}]`;
+  }
+  if (isPlain(value)) {
+    return `{${Object.keys(value).sort().map((k) => `${JSON.stringify(k)}:${canonicalJson(value[k])}`).join(",")}}`;
+  }
+  return refuse();
+}
+
+/**
+ * sha256 hex over the domain-separated canonical JSON of the source minus its certificate. The
+ * input is decoded first (shape only), so an unknown key or an undefined value refuses rather
+ * than digesting differently from its absent spelling.
+ */
 export function sourceCoreDigest(source: CompletionSourceV2): string {
-  const { certificate: _certificate, ...core } = source;
+  const { certificate: _certificate, ...core } = decodeSource(source);
   return createHash("sha256").update(CORE_DOMAIN).update(canonicalJson(core)).digest("hex");
 }
 
@@ -204,25 +247,51 @@ export function parseSourceFenceJson(text: string): CompletionSourceFence {
 }
 
 export function sourceFenceOf(source: CompletionSourceV2): CompletionSourceFence {
+  // The digest decodes (and so validates) the whole source, epoch included, before the fence is returned.
   return { version: 1, sourceUseEpoch: source.sourceUseEpoch, sourceCoreDigest: sourceCoreDigest(source) };
 }
 
 // ---- certificates -----------------------------------------------------------------------
 
-/** Mint the certificate for a core. Needs a live transaction; the publication path only. */
-export function certifySourceCore(tx: AuthorityTransaction, store: AuthorityStore, source: CompletionSourceV2): CompletionSourceV2 {
-  const checked = parseCompletionSourceV2(source, { dataDir: store.dataDir, storageId: store.storageId, layout: store.layout });
-  const { certificate: _old, ...bare } = checked;
-  return { ...bare, certificate: store.certifySource(tx, sourceCoreDigest(bare)) };
+/**
+ * Mint the certificate for a core. Only the exact live lease of the source's slot can obtain
+ * one (same epoch and slot, slot active and owned by this worker); see AuthorityStore.certifySource.
+ */
+export function certifySourceCore(
+  tx: AuthorityTransaction, store: AuthorityStore, lease: SourceUseLease, source: CompletionSourceV2,
+): Promise<CompletionSourceV2> {
+  return store.certifySource(tx, lease, source);
 }
 
-/** Decode a stored source and require a certificate valid under this store's key. */
+/**
+ * Decode a stored source and require a certificate valid under this store's key. This is a pure
+ * MAC check: it proves the core was certified, not that it is still the published source. Use
+ * `verifyPublishedSource` for freshness.
+ */
 export function verifyCertifiedSource(tx: AuthorityTransaction, store: AuthorityStore, value: unknown): CompletionSourceV2 {
   const source = parseCompletionSourceV2(value, { dataDir: store.dataDir, storageId: store.storageId, layout: store.layout });
   if (!store.verifySourceCertificate(tx, sourceCoreDigest(source), source.certificate)) {
     throw new AuthorityRefusal("completion source certificate does not verify");
   }
   return source;
+}
+
+/**
+ * Certificate AND freshness: the slot for the source's path must currently publish this very
+ * source (state sealed for codex or claude_ready for claude, the same epoch, harness and digest).
+ * A pending footprint, a replayed or malformed slot, or a missing publication refuses.
+ */
+export async function verifyPublishedSource(
+  tx: AuthorityTransaction, store: AuthorityStore, value: unknown,
+): Promise<{ source: CompletionSourceV2; publication: SlotPublicationRead }> {
+  const source = verifyCertifiedSource(tx, store, value);
+  const publication = await store.readPublication(tx, source.clonePath);
+  const state = source.harness === "codex" ? "sealed" : "claude_ready";
+  if (publication === null || publication.state !== state || publication.harness !== source.harness ||
+      publication.epoch !== source.sourceUseEpoch || publication.sourceCoreDigest !== sourceCoreDigest(source)) {
+    throw new AuthorityRefusal("completion source is not the published source");
+  }
+  return { source, publication };
 }
 
 // ---- builders (uncertified cores) ---------------------------------------------------------
@@ -249,14 +318,23 @@ function core(input: CoreInput, extra: Partial<CompletionSourceV2> & Pick<Comple
   });
 }
 
-/** Uncertified codex core from a terminal seal's material; incarnation lists are sorted. */
-export function buildCodexSourceCore(input: CoreInput & { material: ExecutorSealMaterial }): CompletionSourceV2 {
-  const sort = (ids: string[]): string[] => ids.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-  return core(input, {
-    harness: "codex", executorIncarnation: input.material.executorIncarnation,
-    registryIncarnations: sort(input.material.incarnations.map((i) => i.registry)),
-    facadeIncarnations: sort(input.material.incarnations.map((i) => i.facade)),
-  });
+/**
+ * Uncertified codex core from an opaque terminal seal. The material comes only from
+ * `terminalSealMaterial(seal)`; it must have been sealed for exactly this lease and the caller's
+ * `accepts` (for example `(seal, use) => executor.acceptsLifetimeSeal(seal, use)`) must still
+ * accept it. There is no plain-material input.
+ */
+export function buildCodexSourceCore(input: CoreInput & {
+  seal: unknown;
+  accepts: (seal: unknown, sourceUse: object) => boolean;
+}): CompletionSourceV2 {
+  const material = terminalSealMaterial(input.seal);
+  if (!material) throw new AuthorityRefusal("not a terminal seal");
+  if (material.sourceUse !== input.lease) throw new AuthorityRefusal("terminal seal belongs to another source use");
+  if (input.accepts(input.seal, input.lease) !== true) throw new AuthorityRefusal("terminal seal is not accepted");
+  const pairs = material.incarnations.map((i): [string, string] => [i.registry, i.facade])
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  return core(input, { harness: "codex", executorIncarnation: material.executorIncarnation, registryFacadePairs: pairs });
 }
 
 /** Uncertified claude core: no executor, registry or facade incarnations. */
