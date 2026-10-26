@@ -599,8 +599,14 @@ UZI_MEASURE_3031=1 UZI_MEASURE_DOCKER_HOST=tcp://<dind>:2375 \
   node --import tsx --test --test-timeout=120000 test/measure-3031-composed.test.ts
 ```
 
-- `UZI_MEASURE_DOCKER_HOST` is the Docker daemon the worker is wired to; the exclusion
-  proof and quiescence scans probe it for real. Unset, the run reports UNRUN.
+- `UZI_MEASURE_DOCKER_HOST` is the Docker daemon the measurement is wired to. It must be a
+  throwaway dind sidecar reachable only from the measurement container: an unauthenticated,
+  TLS-off `tcp://...:2375` must never be exposed or shared, and it is never a real worker's
+  daemon. It must have zero running containers. Only the exclusion proof is read-only
+  (`GET /containers/json`, which requires zero running containers). The real quiescence
+  scans are not: they may force-remove (`DELETE /containers/<id>?force=1&v=1`) containers
+  that bind the fixture clone paths, and the `/proc` scan may SIGKILL in-scope processes.
+  Unset, the run reports UNRUN.
 - `TMPDIR` must be a case-sensitive, container-internal directory whose ancestors are not
   group-writable, world-writable or sticky (as `/data` is). Otherwise UNRUN with the reason.
 - The measurement must be the only test process: the exclusive-idle scan refuses any other
