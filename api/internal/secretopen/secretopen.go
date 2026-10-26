@@ -115,19 +115,21 @@ func OpenByIDOfKind(ctx context.Context, q Store, vlt *vault.Vault, box *secretb
 // path the rate-limit poller takes when it lists every token in one query (D1).
 // It is the crypto half of OpenByID and shares the exact vault dispatch: a 'dek' row
 // needs the owner unlocked (ErrVaultLocked otherwise), a legacy 'master' row opens
-// under the master box regardless of lock state, and a nil vault opens under box
-// directly. There is no ErrNoSecret here — the caller already has the row. Open
-// errors never carry plaintext, so a decrypt failure collapses to ErrUndecryptable.
+// under the master box regardless of lock state, and master_aad authenticates
+// the owner and kind with that box. Without a vault, DEK rows remain locked and
+// master discriminators keep the same dispatch. The caller already has the row,
+// so ErrNoSecret cannot occur here. Errors never carry plaintext; a decryption
+// failure collapses to ErrUndecryptable.
 func OpenSealed(vlt *vault.Vault, box *secretbox.Box, userID uuid.UUID, kind, sealedWith string, ciphertext []byte) ([]byte, error) {
 	var plain []byte
 	var err error
 	if vlt != nil {
 		plain, err = vlt.Open(userID, kind, sealedWith, ciphertext)
-		if errors.Is(err, vault.ErrLocked) {
-			return nil, ErrVaultLocked
-		}
 	} else {
-		plain, err = box.Open(ciphertext)
+		plain, err = vault.OpenMasterMaterial(box, userID, kind, sealedWith, ciphertext)
+	}
+	if errors.Is(err, vault.ErrLocked) {
+		return nil, ErrVaultLocked
 	}
 	if err != nil {
 		return nil, ErrUndecryptable

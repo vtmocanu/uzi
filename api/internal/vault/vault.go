@@ -350,27 +350,42 @@ func (v *Vault) Seal(userID uuid.UUID, kind string, plaintext []byte) ([]byte, e
 	return box.SealWithAAD(plaintext, secretAAD(userID, kind))
 }
 
-// Open decrypts a user secret according to how it was sealed. A legacy
-// sealed_with='master' row opens under the process master key and needs no unlock
-// (while locked, the claim gate — not crypto — is what withholds it; PRD #32
-// lazy-migration note). A sealed_with='dek' row requires the vault unlocked
-// (ErrLocked otherwise) and is bound to user_id||kind.
+// Open decrypts user material according to its discriminator. Legacy master rows
+// use nil AAD; master_aad and dek bind the owner and kind. Only dek needs a cached
+// DEK. An authentication failure never retries with another key or AAD scheme.
 func (v *Vault) Open(userID uuid.UUID, kind, sealedWith string, ciphertext []byte) ([]byte, error) {
+	if sealedWith != store.SealedWithDEK {
+		return OpenMasterMaterial(v.master, userID, kind, sealedWith, ciphertext)
+	}
+	box, ok, err := v.dekBox(userID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, ErrLocked
+	}
+	return box.OpenWithAAD(ciphertext, secretAAD(userID, kind))
+}
+
+// OpenMasterMaterial is the shared master-key reader, also used when a caller has
+// no Vault. It preserves legacy nil-AAD rows, authenticates master_aad against the
+// owner and kind, and refuses DEK or unknown discriminators before decryption.
+func OpenMasterMaterial(master *secretbox.Box, userID uuid.UUID, kind, sealedWith string, ciphertext []byte) ([]byte, error) {
+	var aad []byte
 	switch sealedWith {
 	case store.SealedWithMaster:
-		return v.master.Open(ciphertext)
+		// Legacy rows deliberately retain their original nil-AAD format.
+	case store.SealedWithMasterAAD:
+		aad = secretAAD(userID, kind)
 	case store.SealedWithDEK:
-		box, ok, err := v.dekBox(userID)
-		if err != nil {
-			return nil, err
-		}
-		if !ok {
-			return nil, ErrLocked
-		}
-		return box.OpenWithAAD(ciphertext, secretAAD(userID, kind))
+		return nil, ErrLocked
 	default:
 		return nil, fmt.Errorf("vault: unknown sealed_with %q", sealedWith)
 	}
+	if master == nil {
+		return nil, errors.New("vault: master box unavailable")
+	}
+	return master.OpenWithAAD(ciphertext, aad)
 }
 
 // dekBox builds a secretbox over the user's cached DEK. secretbox.New copies the

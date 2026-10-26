@@ -58,6 +58,69 @@ func TestOpenSealed(t *testing.T) {
 	}
 }
 
+func TestOpenSealedMasterAAD(t *testing.T) {
+	box, err := secretbox.New(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, other := uuid.New(), uuid.New()
+	kinds := []string{store.KindAnthropicToken, store.KindOpenAIAPIKey, store.KindCodexAuth}
+	for _, useVault := range []bool{false, true} {
+		name := "no_vault"
+		var vlt *vault.Vault
+		if useVault {
+			name, vlt = "locked_vault", vault.New(box, nil)
+		}
+		t.Run(name, func(t *testing.T) {
+			for i, kind := range kinds {
+				t.Run(kind, func(t *testing.T) {
+					aad := append(append([]byte(nil), owner[:]...), 0)
+					aad = append(aad, []byte(kind)...)
+					sealed, err := box.SealWithAAD([]byte("credential material"), aad)
+					if err != nil {
+						t.Fatal(err)
+					}
+					got, err := OpenSealed(vlt, box, owner, kind, store.SealedWithMasterAAD, sealed)
+					if err != nil || string(got) != "credential material" {
+						t.Fatalf("master_aad round trip: material matches=%v error=%v", string(got) == "credential material", err)
+					}
+					for _, tc := range []struct {
+						name, kind, marker string
+						user               uuid.UUID
+					}{
+						{"owner_swap", kind, store.SealedWithMasterAAD, other},
+						{"kind_swap", kinds[(i+1)%len(kinds)], store.SealedWithMasterAAD, owner},
+						{"legacy_marker", kind, store.SealedWithMaster, owner},
+						{"unknown_marker", kind, "unknown", owner},
+					} {
+						t.Run(tc.name, func(t *testing.T) {
+							if _, err := OpenSealed(vlt, box, tc.user, tc.kind, tc.marker, sealed); !errors.Is(err, ErrUndecryptable) {
+								t.Fatalf("mismatched binding/discriminator: %v", err)
+							}
+						})
+					}
+					legacy, err := box.Seal([]byte("legacy material"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					if got, err := OpenSealed(vlt, box, owner, kind, store.SealedWithMaster, legacy); err != nil || string(got) != "legacy material" {
+						t.Fatalf("legacy material no longer opens: %v", err)
+					}
+					if _, err := OpenSealed(vlt, box, owner, kind, store.SealedWithMasterAAD, legacy); !errors.Is(err, ErrUndecryptable) {
+						t.Fatalf("master_aad accepted legacy material: %v", err)
+					}
+					if _, err := OpenSealed(vlt, box, owner, kind, "unknown", legacy); !errors.Is(err, ErrUndecryptable) {
+						t.Fatalf("unknown discriminator accepted valid legacy material: %v", err)
+					}
+					if _, err := OpenSealed(vlt, box, owner, kind, store.SealedWithDEK, legacy); !errors.Is(err, ErrVaultLocked) {
+						t.Fatalf("DEK marker opened with master key: %v", err)
+					}
+				})
+			}
+		})
+	}
+}
+
 // TestOpenSealedRealVaultLocked exercises the D3 dispatch through a REAL
 // *vault.Vault whose cache is empty (i.e. the user is locked), not the nil-vault
 // shortcut: a master-sealed secret opens regardless of the lock, while a

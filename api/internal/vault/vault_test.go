@@ -302,6 +302,68 @@ func TestOpenMasterRow(t *testing.T) {
 	}
 }
 
+func TestOpenMasterAAD(t *testing.T) {
+	v, master := newTestVault(t)
+	owner := uuid.New()
+	other := uuid.New()
+	kinds := []string{store.KindAnthropicToken, store.KindOpenAIAPIKey, store.KindCodexAuth}
+	for i, kind := range kinds {
+		t.Run(kind, func(t *testing.T) {
+			plain := []byte("credential material")
+			// Independent wire-format fixture: UUID bytes, a NUL, then the kind.
+			aad := append(append([]byte(nil), owner[:]...), 0)
+			aad = append(aad, []byte(kind)...)
+			sealed, err := master.SealWithAAD(plain, aad)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := v.Open(owner, kind, store.SealedWithMasterAAD, sealed)
+			if err != nil || !bytes.Equal(got, plain) {
+				t.Fatalf("master_aad round trip: material matches=%v error=%v", bytes.Equal(got, plain), err)
+			}
+			if v.Unlocked(owner) {
+				t.Fatal("opening master material cached a DEK")
+			}
+			for _, tc := range []struct {
+				name, kind, marker string
+				user               uuid.UUID
+			}{
+				{"owner_swap", kind, store.SealedWithMasterAAD, other},
+				{"kind_swap", kinds[(i+1)%len(kinds)], store.SealedWithMasterAAD, owner},
+				{"legacy_marker", kind, store.SealedWithMaster, owner},
+				{"unknown_marker", kind, "unknown", owner},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					if _, err := v.Open(tc.user, tc.kind, tc.marker, sealed); err == nil {
+						t.Fatal("mismatched binding or discriminator authenticated")
+					}
+				})
+			}
+			legacy, err := master.Seal(plain)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, err := v.Open(owner, kind, store.SealedWithMaster, legacy); err != nil || !bytes.Equal(got, plain) {
+				t.Fatalf("legacy row no longer opens: %v", err)
+			}
+			if _, err := v.Open(owner, kind, store.SealedWithMasterAAD, legacy); err == nil {
+				t.Fatal("master_aad silently opened a legacy nil-AAD row")
+			}
+		})
+	}
+}
+
+func TestOpenMasterMaterialWithoutBox(t *testing.T) {
+	for _, marker := range []string{store.SealedWithMaster, store.SealedWithMasterAAD, "unknown"} {
+		if _, err := OpenMasterMaterial(nil, uuid.New(), testKind, marker, nil); err == nil {
+			t.Fatalf("marker %q succeeded without a master box", marker)
+		}
+	}
+	if _, err := OpenMasterMaterial(nil, uuid.New(), testKind, store.SealedWithDEK, nil); !errors.Is(err, ErrLocked) {
+		t.Fatalf("DEK without a vault: %v", err)
+	}
+}
+
 // TestUnknownSealedWith guards the enum: an unrecognized sealed_with is an error,
 // never a silent master-open.
 func TestUnknownSealedWith(t *testing.T) {
@@ -553,7 +615,9 @@ func TestUnlockExistingAfterLockPreservesNotice(t *testing.T) {
 		cancel()
 		release()
 		if !joined {
-			<-done
+			if err := <-done; err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				t.Errorf("cleanup unlock: %v", err)
+			}
 		}
 	})
 	go func() { done <- v.UnlockExisting(ctx, uid, password) }()
