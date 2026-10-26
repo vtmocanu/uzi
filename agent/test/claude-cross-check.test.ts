@@ -17,7 +17,7 @@ import type { SdkQueryFn } from "../src/sdk-executor.js";
 import type { GitCache } from "../src/git.js";
 import type { Logger } from "../src/log.js";
 import type { WorkerClient } from "../src/client.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, recordingLogger } from "./helpers.js";
 
 const TEST_SCRATCH = path.resolve(import.meta.dirname, "../../.uzi/scratch");
 fs.mkdirSync(TEST_SCRATCH, { recursive: true });
@@ -70,6 +70,22 @@ function rig(frames: unknown[], opts: { claim?: ClaimResponse; kill?: (pid: numb
   const controller = new AbortController();
   return { checker, secrets, added, usage, seen, controller,
     run: () => checker.run(opts.claim ?? claudeClaim(), "/checkout", "/home", controller.signal, async (p) => { usage.push(p); }) };
+}
+
+for (const [name, result] of [
+  ["oversized result", resultFrame("é".repeat(32 * 1024 + 1))],
+  ["missing result", (() => { const frame: Record<string, unknown> = resultFrame(APPROVE); delete frame.result; return frame; })()],
+  ["non-string result", resultFrame(APPROVE, { result: 42 })],
+] as const) {
+  it("malformed diagnostic Claude result_cap " + name, async () => {
+    const r = rig([initFrame(), result]);
+    await assert.rejects(r.run(), (err: unknown) => {
+      assert.ok(err instanceof CrossCheckMalformedError);
+      assert.equal(err.subreason, "result_cap");
+      return true;
+    });
+    assert.equal(r.secrets.size, 0);
+  });
 }
 
 function scratch(): { root: string; checkout: string; home: string } {
@@ -431,6 +447,7 @@ describe("CrossCheckRunner dispatch on the claim's credential family (PRD #2460)
     const decisions: any[] = [];
     const states: any[] = [];
     const calls = { codex: 0, claude: 0 };
+    const recorded = recordingLogger();
     const client = {
       reportState: async (_id: string, body: unknown) => { states.push(body); return { applied: true }; },
       getInputs: async () => ({ inputs: [] }),
@@ -439,7 +456,7 @@ describe("CrossCheckRunner dispatch on the claim's credential family (PRD #2460)
     } as unknown as WorkerClient;
     const git = { ensureClone: async () => "/bare", runnerCloneAtCommit: async () => "/checkout", removeRunnerClone: async () => {} } as unknown as GitCache;
     try {
-      await new CrossCheckRunner(client, git, nullLogger(), { homeRoot: root, pollMs: 1, modelTimeoutMs: 1000,
+      await new CrossCheckRunner(client, git, recorded.logger, { homeRoot: root, pollMs: 1, modelTimeoutMs: 1000,
         model: { run: async () => { calls.codex++; return APPROVE; } },
         claudeModel: { run: async () => {
           calls.claude++;
@@ -447,7 +464,7 @@ describe("CrossCheckRunner dispatch on the claim's credential family (PRD #2460)
           return deps.claudeText ?? APPROVE;
         } } }).execute(claim);
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
-    return { decisions, states, calls };
+    return { decisions, states, calls, logs: recorded.lines };
   }
   const codexSecrets = { auth_mode: "api_key", access_token: "claim-token", capability: "cap" };
 
@@ -475,6 +492,7 @@ describe("CrossCheckRunner dispatch on the claim's credential family (PRD #2460)
     const confinement = await exercise(claudeClaim(), { claudeText: new Error("cross-check confinement refused: effective tool set differs") });
     assert.equal(confinement.decisions.at(-1).reason_class, "confinement_failed");
     assert.equal(confinement.states.at(-1).status, "failed");
+    assert.ok(!JSON.stringify(confinement.logs).includes("cross-check verdict malformed"));
   });
 
   it("with the real Claude checker, a missing token settles checker unavailable and a confinement refusal settles confinement_failed", async () => {

@@ -507,6 +507,89 @@ test("backward and invalid clocks fail closed at reservation, capture, adoption 
   } finally { Date.now = realNow; }
 });
 
+test("server episode renewal persists through real Git recreation and cannot renew twice", async t => {
+  let now = 1_000_000;
+  t.mock.method(Date, "now", () => now);
+  for (let i = 0; i < 3; i++) await recreate().reserveRecoveryIteration(bare, branch, key, source, 1000, 4, 7);
+  await assert.rejects(recreate().reserveRecoveryIteration(bare, branch, key, source, 1000, 4, 7), /budget/);
+  const blocked = journal();
+  now += 400_000;
+  const renewed = await recreate().reserveRecoveryIteration(bare, branch, key, source, 1000, 5, 8);
+  assert.equal(renewed.episode, 8);
+  assert.equal(renewed.claimGeneration, 5);
+  assert.equal(renewed.attempts, 1);
+  assert.equal(renewed.backoffMs, 1000);
+  assert.equal(renewed.startedAt, 1_400_000);
+  assert.equal(renewed.deadline, 1_700_000);
+  assert.equal(Object.hasOwn(renewed, "blocker"), false);
+  assert.deepEqual(journal(), { ...blocked, recovery: renewed });
+  const discovered = await recreate().discoverRetainedRecovery(fx.originPath, branch, key, runId);
+  assert.ok(discovered);
+  assert.deepEqual(discovered.journal.recovery, renewed);
+  const olderApi = await recreate().reserveRecoveryIteration(bare, branch, key, source, 1000, 6);
+  assert.equal(olderApi.episode, 8);
+  assert.equal(olderApi.attempts, 2);
+  const olderEpisode = await recreate().reserveRecoveryIteration(bare, branch, key, source, 1000, 7, 7);
+  assert.equal(olderEpisode.episode, 8);
+  assert.equal(olderEpisode.attempts, 3);
+  await assert.rejects(recreate().reserveRecoveryIteration(bare, branch, key, source, 1000, 8, 8), /budget/);
+  assert.equal(journal().recovery.episode, 8);
+  assert.equal(journal().recovery.attempts, 3);
+});
+
+test("real Git journal strictly decodes server episodes and leaves legacy absence unmaterialized", async () => {
+  await cache.reserveRecoveryIteration(bare, branch, key, source, 1000, 4);
+  const legacy = journal();
+  const read = async () => (await recreate().discoverRetainedRecovery(fx.originPath, branch, key, runId))!.journal;
+  const decoded = await read();
+  assert.equal(Object.hasOwn(decoded.recovery!, "episode"), false);
+  assert.deepEqual(JSON.parse(JSON.stringify(decoded)), legacy);
+  for (const episode of [0, 7, Number.MAX_SAFE_INTEGER]) {
+    const value = { ...legacy, recovery: { ...legacy.recovery, episode } };
+    writeJournal(value);
+    assert.deepEqual(JSON.parse(JSON.stringify(await read())), value);
+  }
+  for (const episode of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1, "7", null, true, false, [], {}]) {
+    const value = { ...legacy, recovery: { ...legacy.recovery, episode } };
+    writeJournal(value);
+    await assert.rejects(read(), /invalid.*recovery/i);
+    assert.deepEqual(journal(), value, "malformed journal remains intact");
+  }
+});
+
+for (const identity of ["episode", "claimGeneration"] as const) {
+  test(`frozen clock delayed blocker rejects changed ${identity} independently`, async t => {
+    t.mock.method(Date, "now", () => 1_000_000);
+    const old = await cache.reserveRecoveryIteration(bare, branch, key, source, 1000, 4, 7);
+    const renewed = await recreate().reserveRecoveryIteration(bare, branch, key, source, 1000, 5, 8);
+    assert.equal(renewed.startedAt, old.startedAt);
+    assert.equal(renewed.deadline, old.deadline);
+    assert.equal(renewed.attempts, old.attempts);
+    const before = journal();
+    // Match every coordinate except the term under test. Removing that one comparison
+    // would allow the delayed finalizer to poison the renewed allowance.
+    const delayed = { ...renewed, [identity]: old[identity] };
+    await assert.rejects(recreate().blockRecoveryEpisode(
+      bare, branch, key, source, "capture_failed", delayed,
+    ), /episode changed/);
+    assert.deepEqual(journal(), before);
+    await recreate().blockRecoveryEpisode(bare, branch, key, source, "capture_failed", renewed);
+    assert.equal(journal().recovery.blocker, "capture_failed", "matching identity still finalizes");
+  });
+}
+
+test("strict progress decoder rejects a present undefined episode and preserves legacy logical zero", () => {
+  const legacy = {
+    version: 1, source, attempts: 1, startedAt: 1_000_000, deadline: 1_300_000,
+    backoffMs: 1000, stage: "capturing",
+  };
+  const decoded = recoveryProgress(legacy);
+  assert.equal(decoded.episode ?? 0, 0);
+  assert.equal(Object.hasOwn(decoded, "episode"), false);
+  assert.equal(Object.hasOwn(JSON.parse(JSON.stringify(decoded)), "episode"), false);
+  assert.throws(() => recoveryProgress({ ...legacy, episode: undefined }), /invalid retained recovery progress/);
+});
+
 test("backoff uses persisted attempt exponent and permits a 30-second base", async () => {
   assert.equal((await cache.reserveRecoveryIteration(bare, branch, key, source, 30_000)).backoffMs, 30_000);
   assert.equal((await recreate().reserveRecoveryIteration(bare, branch, key, source, 30_000)).backoffMs, 60_000);

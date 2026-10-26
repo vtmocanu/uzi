@@ -78,6 +78,21 @@ export class WorkerMemoryCommands {
   private readonly protectedRoots = new Set<ProtectedRoot>();
   private closed = false;
   private readonly drainListeners = new Set<(entry: Entry) => void>();
+  private readonly admissionListeners = new Map<Context, Set<() => void>>();
+
+  private notifyAdmission(context: Context): void {
+    for (const listener of this.admissionListeners.get(context) ?? []) listener();
+  }
+
+  private subscribeAdmission(context: Context, listener: () => void): () => void {
+    const listeners = this.admissionListeners.get(context) ?? new Set<() => void>();
+    listeners.add(listener);
+    this.admissionListeners.set(context, listeners);
+    return () => {
+      listeners.delete(listener);
+      if (!listeners.size) this.admissionListeners.delete(context);
+    };
+  }
 
   subscribeConfirmedDrain(callback: (entry: Entry) => void): () => void {
     this.drainListeners.add(callback);
@@ -91,6 +106,7 @@ export class WorkerMemoryCommands {
   updateAllowance(context: Context, remaining: number): boolean {
     if (!this.isCurrent(context)) return false;
     this.allowances.set(context, remaining);
+    this.notifyAdmission(context);
     return true;
   }
 
@@ -131,7 +147,13 @@ export class WorkerMemoryCommands {
     return true;
   }
 
-  constructor(private readonly secrets: readonly string[] = []) {}
+  constructor(private readonly secrets: readonly string[] = [], private readonly timing?: Readonly<{
+    rearmMs: number; sampleMs: number; responseBudgetMs: number;
+  }>) {
+    if (timing && ![timing.rearmMs, timing.sampleMs, timing.responseBudgetMs].every(positive)) {
+      throw new Error("invalid memory admission timing");
+    }
+  }
 
   begin(input: ContextInput): Context {
     if (this.closed || !uuid(input.run_id) || !uuid(input.worker_id) || typeof input.register_nonce !== "string" || !input.register_nonce || Buffer.byteLength(input.register_nonce) > 128
@@ -162,15 +184,18 @@ export class WorkerMemoryCommands {
     this.contexts.delete(context.run_id);
     this.latches.delete(context);
     this.phaseHolds.delete(context);
+    this.notifyAdmission(context);
     return true;
   }
 
   memoryPark(context: Context): boolean { return this.retire(context); }
 
   registrationRotated(): void {
+    const contexts = [...this.contexts.values()];
     this.contexts.clear();
     this.latches.clear();
     this.phaseHolds.clear();
+    for (const context of contexts) this.notifyAdmission(context);
   }
 
   shutdown(): void {
@@ -182,12 +207,14 @@ export class WorkerMemoryCommands {
     if (!this.isCurrent(context) || this.latches.has(context)) return undefined;
     const latch = Object.freeze({ context, identity: randomUUID() });
     this.latches.set(context, latch);
+    this.notifyAdmission(context);
     return latch;
   }
 
   releaseLatch(latch: Latch): boolean {
     if (!this.isCurrent(latch.context) || this.latches.get(latch.context) !== latch) return false;
     this.latches.delete(latch.context);
+    this.notifyAdmission(latch.context);
     return true;
   }
 
@@ -200,12 +227,14 @@ export class WorkerMemoryCommands {
     const token = Object.freeze({ context, identity: randomUUID() });
     this.phaseRevisions.set(context, this.phaseRevision(context) + 1);
     this.phaseHolds.set(context, token);
+    this.notifyAdmission(context);
     return token;
   }
 
   releasePhase(token: Latch): boolean {
     if (!this.isCurrent(token.context) || this.phaseHolds.get(token.context) !== token) return false;
     this.phaseHolds.delete(token.context);
+    this.notifyAdmission(token.context);
     return true;
   }
 
@@ -216,6 +245,72 @@ export class WorkerMemoryCommands {
 
   admitsCommands(context: Context): boolean {
     return this.phaseAdmits(context) && !this.latches.has(context) && this.remaining(context) !== 0;
+  }
+
+  /** Observational only: preserve the admission predicate and its authority owners. */
+  admissionReason(context: Context, phaseRevision = this.phaseRevision(context)):
+    "retired" | "exhausted" | "phase-held" | "pressure-held" | undefined {
+    if (!this.isCurrent(context)) return "retired";
+    if (this.remaining(context) === 0) return "exhausted";
+    if (!this.phaseAdmits(context, phaseRevision)) return "phase-held";
+    if (this.pressureHeld(context)) return "pressure-held";
+    return undefined;
+  }
+
+  admissionMessage(context: Context, reason = this.admissionReason(context)): string {
+    const remaining = this.remaining(context);
+    const allowance = remaining === undefined ? "" : ` Interventions remaining: ${String(remaining)}.`;
+    switch (reason) {
+      case "retired": return "Shell admission is retired for this captured flight; no further commands can run in it." + allowance;
+      case "exhausted": return "Shell admission is exhausted for this memory episode; no further commands can run. Owner Resume after the memory-pressure park starts a new episode." + allowance;
+      case "phase-held": return "Shell admission is phase-held or its captured phase changed; finish any pending answer, approval or follow-up lifecycle step, then issue a fresh command call." + allowance;
+      case "pressure-held": {
+        const dwell = this.timing ? ` of ${String(this.timing.rearmMs / 1000)} s` : "";
+        return "Shell admission is pressure-held; memory recovery is pending. Release requires confirmed drain, resolved outcome reporting and continuously fresh low-pressure samples for the configured quiet dwell" +
+          dwell + " (a minimum condition, not an ETA)." + allowance;
+      }
+      default: return "Shell admission is open." + allowance;
+    }
+  }
+
+  /** Subscribe without holding a guard lock. Wakeups never renew the timer or release admission. */
+  async waitForPressure(context: Context, options: {
+    deadlineAt: number; phaseRevision: number; signal?: AbortSignal; now?: () => number;
+  }): Promise<"admitted" | "cancelled" | "deadline" | NonNullable<ReturnType<WorkerMemoryCommands["admissionReason"]>>> {
+    const now = options.now ?? (() => Date.now());
+    if (options.signal?.aborted) return "cancelled";
+    if (!Number.isFinite(options.deadlineAt) || now() >= options.deadlineAt) return "deadline";
+    const reason = this.admissionReason(context, options.phaseRevision);
+    if (reason !== "pressure-held") return reason ?? "admitted";
+    const limit = this.timing ? this.timing.rearmMs + this.timing.sampleMs + this.timing.responseBudgetMs : 0;
+    if (limit <= 0) return reason;
+    return new Promise(resolve => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let unsubscribe = () => {};
+      const finish = (result: Awaited<ReturnType<WorkerMemoryCommands["waitForPressure"]>>) => {
+        if (settled) return;
+        settled = true;
+        if (timer !== undefined) clearTimeout(timer);
+        unsubscribe();
+        options.signal?.removeEventListener("abort", cancelled);
+        resolve(result);
+      };
+      const cancelled = () => finish("cancelled");
+      const check = () => {
+        if (options.signal?.aborted) return finish("cancelled");
+        if (now() >= options.deadlineAt) return finish("deadline");
+        const current = this.admissionReason(context, options.phaseRevision);
+        if (current !== "pressure-held") finish(current ?? "admitted");
+      };
+      unsubscribe = this.subscribeAdmission(context, check);
+      options.signal?.addEventListener("abort", cancelled, { once: true });
+      check(); // Subscribe first: a release cannot be lost between the test and listener.
+      if (!settled) timer = setTimeout(() => {
+        check();
+        if (!settled) finish("pressure-held");
+      }, Math.min(limit, options.deadlineAt - now(), 2_147_483_647));
+    });
   }
 
   register(context: Context, input: Omit<Entry, "identity" | "context" | "command" | "root" | "commandId"> & {

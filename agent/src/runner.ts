@@ -112,7 +112,7 @@ import type {
 import { resolveAgentSelection, RUN_KINDS } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { deriveCloneKey, resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
-import { RecoveryCoordinator, canonicalJson, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, type ClosedSourceObservation, type InventorySourceBoundaryContext, type CompletionSource, type RecoveryRecord, type RecoveryCoordinatorOptions } from "./recovery.js";
+import { RecoveryCoordinator, canonicalJson, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, inventoryProcessDiagnostic, type ClosedSourceObservation, type InventorySourceBoundaryContext, type CompletionSource, type RecoveryRecord, type RecoveryCoordinatorOptions } from "./recovery.js";
 import { classifyRecoveryOrigin } from "./recovery-origin.js";
 import {
   PUSHED_HEAD_UNRECORDED,
@@ -1926,6 +1926,62 @@ function redactThenSanitize(redactText: (text: string) => string, text: string):
   return sanitizeForLog(redactText(redactorInput(text)), SCRATCH_CAUSE_PART_MAX);
 }
 
+/** Generic checkpoint diagnostics inspect only four linear nodes. Getter failures omit that
+ * field; a broken cause read stops traversal, without hiding readable sibling fields. */
+function checkpointErrorField(value: unknown, field: "code" | "message" | "cause"): unknown {
+  try {
+    if (value !== null && (typeof value === "object" || typeof value === "function")) {
+      return (value as Record<string, unknown>)[field];
+    }
+  } catch { /* Diagnostic metadata has no authority over publication. */ }
+  return undefined;
+}
+
+function checkpointErrorDiagnostic(
+  error: unknown,
+  phase: "packing" | "publish_request",
+  redactText: ((text: string) => string) | undefined,
+): { key: string; text: string; error?: string; cause?: string } {
+  let causeClass = "unknown";
+  let root: string | undefined;
+  const parts: string[] = [];
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  for (let depth = 0; current !== undefined && current !== null && depth < 4; depth++) {
+    if (seen.has(current)) break;
+    seen.add(current);
+    const code = checkpointErrorField(current, "code");
+    if (causeClass === "unknown") {
+      switch (code) {
+        case "ENOTFOUND": case "EAI_AGAIN": causeClass = "dns"; break;
+        case "ECONNREFUSED": causeClass = "connection_refused"; break;
+        case "ECONNRESET": causeClass = "connection_reset"; break;
+        case "ETIMEDOUT": case "UND_ERR_CONNECT_TIMEOUT":
+        case "UND_ERR_HEADERS_TIMEOUT": case "UND_ERR_BODY_TIMEOUT": causeClass = "timeout"; break;
+      }
+    }
+    const message = typeof current === "string" ? current : checkpointErrorField(current, "message");
+    if (typeof redactText === "function" && typeof message === "string") {
+      try {
+        const redacted = redactText(redactorInput(message));
+        if (typeof redacted === "string") {
+          // sanitizeForLog may append three units; reserve them before formatting.
+          const safe = sanitizeForLog(redacted, 197);
+          if (depth === 0) root = safe;
+          else parts.push(safe);
+        }
+      } catch { /* Omit free text when redaction is unavailable or fails. */ }
+    }
+    current = checkpointErrorField(current, "cause");
+  }
+  return {
+    key: `error:${phase}:${causeClass}`,
+    text: `checkpoint publish failed: error (phase=${phase}, cause=${causeClass})`,
+    error: root,
+    cause: parts.length ? sanitizeForLog(parts.join(" <- "), 597) : undefined,
+  };
+}
+
 /** The DETAIL path: bound the unsplit raw text (omitting it when oversized), redact it whole (the redactor matches across CR and
  *  LF, so a token split by a newline is caught only before any line split), THEN pick the first
  *  non-empty line and sanitize and cap it. U+2028/U+2029 become LF before redaction (redactorInput). */
@@ -3274,12 +3330,12 @@ export class RunRunner {
           if (process.platform !== "linux") return refuse({ check: "non_linux_host" });
           if (this.liveAttempts.isLivePath(clone.clonePath)) return refuse({ check: "live_attempt_path" });
           const before = await this.quiesceImpl(request);
-          if (before.process?.state !== "quiescent") return refuse({ check: "process_not_quiescent_before_git" });
+          if (before.process?.state !== "quiescent") return refuse(inventoryProcessDiagnostic("process_not_quiescent_before_git", before.process, request.otherClaimInFlight));
           const status = await this.git.worktreeStatus(clone.clonePath);
           const after = await this.quiesceImpl({ ...request, dockerHost: undefined, site: "inventory_source:after_runner_git" });
           if (status === null) return refuse({ check: "worktree_status_unreadable" });
           if (status.length !== 0) return refuse({ check: "worktree_status_dirty" });
-          if (after.process?.state !== "quiescent") return refuse({ check: "process_not_quiescent_after_git" });
+          if (after.process?.state !== "quiescent") return refuse(inventoryProcessDiagnostic("process_not_quiescent_after_git", after.process, request.otherClaimInFlight));
         }
         const afterGit = await this.git.readInventoryCloneHeads(barePath, runId);
         if (afterGit.kind !== "verified")
@@ -16689,10 +16745,13 @@ export class RunRunner {
       });
       // issue #1597 M1: the feed line carries the CLASS only — a thrown message can embed remote
       // text or a credentialed URL; the runLog keeps it for operators.
-      this.reportPublishOutcome(flight, "error", "checkpoint publish failed: error", {
-        phase: packedTip === undefined ? "packing" : "publish_request",
+      const phase = packedTip === undefined ? "packing" : "publish_request";
+      const diagnostic = checkpointErrorDiagnostic(e, phase, flight.redactText);
+      this.reportPublishOutcome(flight, diagnostic.key, diagnostic.text, {
+        phase,
         tip_produced: packedTip !== undefined,
-        error: errMessage(e),
+        error: diagnostic.error,
+        cause: diagnostic.cause,
       });
       return { published: false, reason: "error" };
     } finally {
@@ -21702,7 +21761,8 @@ export class RunRunner {
     if (deadline !== undefined && Date.now() >= deadline) throw new Error("recovery deadline exhausted");
   }
 
-  /** At most three durably precharged iterations in this claim and all its successors.
+  /** At most three durably precharged iterations per server recovery episode.
+   * A newer episode with a fresh owned claim can renew budget exhaustion; other blockers persist.
    * Each failed capture blocks only this run; waits are bounded by the persisted episode clock. */
   private async recoverRetainedClaim(
     claim: ClaimResponse, flight: RunFlight, key: string, source: RecoveryJournalEntry,
@@ -21772,7 +21832,14 @@ export class RunRunner {
       flight.sourceNormalBlocked = flight.sourceBlockingNormal && flight.sourceBlockedReport === true;
       throw new RetainedRecoveryStop();
     };
-    if (source.recovery?.stage === "blocked") await fail();
+    const recoveryEpisode = Number.isSafeInteger(claim.worker_recovery_episode) &&
+      (claim.worker_recovery_episode ?? -1) >= 0 ? claim.worker_recovery_episode : undefined;
+    if (source.recovery?.stage === "blocked" &&
+        (source.recovery.blocker !== "budget_exhausted" || (recoveryEpisode ?? 0) <= (source.recovery.episode ?? 0))) await fail();
+    // Refusing an unfenced renewal must leave the predecessor journal untouched.
+    if (episode && (recoveryEpisode ?? 0) > (episode.episode ?? 0) &&
+        (!Number.isSafeInteger(flight.claimGeneration) || flight.claimGeneration < 1 ||
+          flight.claimGeneration <= (episode.claimGeneration ?? 0))) throw new RetainedRecoveryStop();
     for (;;) {
       this.retainedLifecycleGuard(flight);
       let reservation: Awaited<ReturnType<GitCache["reserveRecoveryIteration"]>>;
@@ -21799,7 +21866,7 @@ export class RunRunner {
               throw new RetainedRecoveryStop();
             }
           }
-          return this.git.reserveRecoveryIteration(bare, branch, key, source, this.recoveryRetryMs, flight.claimGeneration);
+          return this.git.reserveRecoveryIteration(bare, branch, key, source, this.recoveryRetryMs, flight.claimGeneration, recoveryEpisode);
         });
       } catch (error) {
         this.retainedLifecycleGuard(flight);

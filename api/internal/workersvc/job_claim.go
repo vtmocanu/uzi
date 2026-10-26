@@ -203,6 +203,7 @@ func (s *Service) assembleJobClaim(ctx context.Context, wkr store.Worker, run st
 		RunID:                   run.ID.String(),
 		Kind:                    run.Kind,
 		ClaimGeneration:         run.ClaimGeneration,
+		WorkerRecoveryEpisode:   run.WorkerRecoveryEpisode,
 		IssueTitle:              run.IssueTitle,
 		IssueDescription:        run.IssueDescription,
 		Status:                  run.Status,

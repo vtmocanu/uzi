@@ -1038,7 +1038,7 @@ describe("M3 actual runner memory Codex delivery", () => {
             "m3-thread", "m3-turn", "m3-retry-call"));
           await waitFor(() => !!response(23962), "held retry callback");
           assert.equal(rec(rec(response(23962)).result).success, false);
-          assert.match(JSON.stringify(response(23962)), /Shell admission is held/);
+          assert.match(JSON.stringify(response(23962)), /Shell admission is pressure-held/);
           assert.equal(modelLaunches, 1, "held retry never launches a fake root");
           const beforeLow = f.samples();
           f.pressure(100);

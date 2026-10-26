@@ -2,7 +2,7 @@ import { it } from "node:test";
 import assert from "node:assert/strict";
 import { PassThrough, Writable } from "node:stream";
 import { createHash } from "node:crypto";
-import { CodexCrossCheck, OWNER_GUIDANCE_LABEL, REPO_INSTRUCTIONS_DIFF_NOTE, codeCrossCheckBrief, crossCheckBrief, crossCheckPrompt, type CrossCheckModelDeps } from "../src/codex/cross-check.js";
+import { CodexCrossCheck, CrossCheckMalformedError, validateVerdict, validateCodeFindings, OWNER_GUIDANCE_LABEL, REPO_INSTRUCTIONS_DIFF_NOTE, codeCrossCheckBrief, crossCheckBrief, crossCheckPrompt, type CrossCheckModelDeps } from "../src/codex/cross-check.js";
 import type { CodexRootHandle, CodexLaunchSpec, CodexEffectLaunchSpec } from "../src/codex/launcher.js";
 import type { ClaimResponse } from "../src/protocol.js";
 import type { WorkerClient } from "../src/client.js";
@@ -12,6 +12,31 @@ import { CheckActivityRecorder } from "../src/cross-check-activity.js";
 import { CrossCheckCheckerUnavailableError } from "../src/codex/model-rejection.js";
 
 const verdict = JSON.stringify({ verdict: "approve", summary: "Anchors checked", items: [] });
+
+const diagnosticFinding = { file: "anchor.ts", severity: "warning", summary: "Finding", rationale: "Read anchor" };
+for (const [name, text, subreason] of [
+ ["invalid_json", "{broken", "invalid_json"],
+ ["verdict_schema", JSON.stringify({ verdict: "maybe", summary: "x", items: [] }), "verdict_schema"],
+ ["finding_schema", JSON.stringify({ verdict: "revise", summary: "x", items: [{ ...diagnosticFinding, severity: "bad" }] }), "finding_schema"],
+ ["findings_cap per-item", JSON.stringify({ verdict: "revise", summary: "x", items: [{ ...diagnosticFinding, rationale: "é".repeat(1025) }] }), "findings_cap"],
+ ["findings_cap aggregate", JSON.stringify({ verdict: "revise", summary: "x", items: Array.from({ length: 20 }, () => ({ ...diagnosticFinding, rationale: "é".repeat(850) })) }), "findings_cap"],
+] as const) {
+ it("malformed diagnostic validateVerdict " + name, () => {
+  assert.throws(() => validateVerdict(text), (err: unknown) => {
+   assert.ok(err instanceof CrossCheckMalformedError);
+   assert.equal(err.subreason, subreason);
+   return true;
+  });
+ });
+}
+
+it("malformed diagnostic validateCodeFindings code_findings", () => {
+ assert.throws(() => validateCodeFindings("{broken"), (err: unknown) => {
+  assert.ok(err instanceof CrossCheckMalformedError);
+  assert.equal(err.subreason, "code_findings");
+  return true;
+ });
+});
 const claim = (subscription = false): ClaimResponse => ({
  kind: "cross_check", run_id: "check", issue_iid: null, issue_title: "Issue",
  repo: { id: "repo", full_name: "owner/repo", url: "https://example.test/owner/repo", clone_url: "https://example.test/owner/repo.git", default_branch: "main" },

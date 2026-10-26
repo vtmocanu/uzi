@@ -3,6 +3,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { Readable } from "node:stream";
 import { makeScratchRoot } from "./fixture-repo.js";
 import { it } from "node:test";
+import type { ProcessQuiescence, QuiesceRunRequest, QuiesceRunOutcome } from "../src/run-quiescence.js";
 import { RunRunner } from "../src/runner.js";
 import { prepareFrozenHeld, type HeldGit } from "../src/frozen-held.js";
 import { RequestError } from "../src/client.js";
@@ -2484,7 +2485,148 @@ for (const kind of ["issue", "mr_rework"] as const) for (const cause of sourceDi
     });
   }
 
-async function fixture(sourceBoundary: boolean | "runner" = false, rootParent = os.tmpdir(), receiptModel = false, runId = "run-1") {
+// Independent literal oracle for the complete producer vocabulary (#3467).
+const processCodes3467 = [
+  "status_unreadable", "status_unparsable", "unreadable_unattributed", "unreadable_no_other_claim",
+  "own_attempt", "live_attempt_conflict", "terminal_attempt", "unmarked_in_scope",
+  "unattributed_in_scope", "exclusive_idle_identity_unreadable", "exclusive_idle_status_unreadable",
+  "exclusive_idle_status_unparsable", "exclusive_idle_writer_present",
+];
+const private3467 = "private-detail-comm-cwd-argv-environment";
+function process3467(reasons: unknown[], state: "unverified" | "survivors" = "unverified"): ProcessQuiescence {
+  return { state, detail: private3467, killed: [987654321, 987654322],
+    processes: reasons.map(reason => ({ pid: 987654323, uid: 987654324, comm: private3467,
+      cwd: private3467, argv: private3467, environment: private3467, reason })) } as ProcessQuiescence;
+}
+const missing3467 = { quiescence_state: "missing", quiescence_process_counts: {}, killed: 0 };
+const cases3467 = [
+  { name: "unattributed", process: () => process3467(["unreadable_unattributed", "unreadable_unattributed"]),
+    sibling: true, counts: { unreadable_unattributed: 2 }, state: "unverified", killed: 2 },
+  { name: "survivors", process: () => process3467(["own_attempt", "terminal_attempt"], "survivors"),
+    sibling: false, counts: { own_attempt: 1, terminal_attempt: 1 }, state: "survivors", killed: 2 },
+  { name: "unknown composed non-string", process: () => process3467(["raw-malicious-reason", "own_attempt:kill_unconfirmed",
+      { toString() { assert.fail("reason must never be coerced"); } }]),
+    sibling: false, counts: { other: 3 }, state: "unverified", killed: 2 },
+  { name: "missing", process: () => undefined, sibling: false, counts: {}, state: "missing", killed: 0 },
+  { name: "throwing builder", process: () => {
+      const result = process3467(["own_attempt"]);
+      Object.defineProperty(result.processes[0], "reason", { get() { throw new Error(private3467); } });
+      return result;
+    }, sibling: true, counts: {}, state: "missing", killed: 0 },
+  { name: "overflow repeats", process: () => process3467([...processCodes3467, "status_unreadable",
+      "exclusive_idle_writer_present", "raw-malicious-reason"]), sibling: true,
+    counts: { status_unreadable: 2, status_unparsable: 1, unreadable_unattributed: 1, unreadable_no_other_claim: 1,
+      own_attempt: 1, live_attempt_conflict: 1, terminal_attempt: 1, unmarked_in_scope: 1, other: 7 },
+    state: "unverified", killed: 2 },
+  ...processCodes3467.map(code => ({ name: code, process: () => process3467([code]), sibling: false,
+    counts: { [code]: 1 }, state: "unverified", killed: 2 })),
+];
+for (const after of [false, true]) for (const sample of cases3467) {
+  it(`#3467 real runner coordinator bounded process fields ${sample.name} after=${after}`, async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { ...platform, value: "linux" });
+    const trace: string[] = [], requests: QuiesceRunRequest[] = [];
+    const f = await fixture("runner", path.resolve(import.meta.dirname, "../../.uzi/scratch"), false, "run-1", { quiesceRun: async request => {
+      requests.push(request); trace.push(request.site!);
+      const process = !after || request.site === "inventory_source:after_runner_git" ? sample.process() :
+        { state: "quiescent", processes: [], killed: [], detail: "" };
+      return { process, docker: { state: "not_wired", removed: [], detail: "" } } as QuiesceRunOutcome;
+    } });
+    try {
+      const record = await f.freeze(); assert.ok(record);
+      f.git.readInventoryCloneHeads = async () => {
+        trace.push("inventory");
+        return { kind: "verified", heads: [], clones: [{ clonePath: "/fixture/owned", branch: "task", runId: "run-1" }], foreignOwners: [] } as never;
+      };
+      f.git.worktreeStatus = async () => { trace.push("status"); return []; };
+      const sibling = Promise.resolve();
+      if (sample.sibling) f.runnerState().executionTails.set("sibling", sibling);
+      const capturedLogs: Array<{ message: string; fields: unknown }> = [];
+      f.log.warn = (message, fields) => { capturedLogs.push({ message, fields }); throw new Error(private3467); };
+      const outcome = await f.capture(record);
+      const check = after ? "process_not_quiescent_after_git" : "process_not_quiescent_before_git";
+      const expected = { quiescence_state: sample.state, quiescence_process_counts: sample.counts,
+        killed: sample.killed, other_claim_in_flight: sample.sibling };
+      const serialized = JSON.stringify([f.producerDiagnostics, capturedLogs]);
+      for (const forbidden of [private3467, "987654321", "987654322", "987654323", "987654324",
+          "raw-malicious-reason", "own_attempt:kill_unconfirmed", '"detail"', '"comm"', '"cwd"', '"argv"', '"environment"'])
+        assert.equal(serialized.includes(forbidden), false, "privacy: " + forbidden);
+      // Assert producer data BEFORE coordinator normalization can hide a privacy/folding regression.
+      assert.deepEqual(f.producerDiagnostics, [{ check, summary: expected }], "producer bounded schema and exact folding");
+      assert.deepEqual(capturedLogs, [{ message: "recovery: inventory source boundary retained", fields: {
+        run_id: "run-1", generation: 7, capture_id: record.captureId, source_boundary_reason: check, ...expected,
+      } }], "coordinator logs all bounded process fields even when logger throws");
+      assert.deepEqual(trace, after ? ["inventory", "inventory_source", "status", "inventory_source:after_runner_git"] :
+        ["inventory", "inventory_source"], "sole quiesce seam and exact source proof trace");
+      assert.deepEqual(requests.map(request => request.otherClaimInFlight), after ? [sample.sibling, sample.sibling] : [sample.sibling]);
+      assert.deepEqual(f.boundaryResults, ["retained"]);
+      assert.equal(f.boundaryActions(), 0);
+      assert.equal(f.runnerState().inventoryReservations.size, 0);
+      assert.equal(f.runnerState().executionTails.has("run-1"), false);
+      assert.equal(f.runnerState().executionTails.get("sibling"), sample.sibling ? sibling : undefined);
+      const reason = "inventory_source_not_quiescent:" + check;
+      assert.equal(outcome.reason, reason);
+      assert.equal((await f.make("runner").inspect("run-1"))[0]!.reason, reason, "MAC-authenticated restart reason");
+      assert.deepEqual(f.finals, []); assert.equal(f.state.open, true);
+    } finally { await f.close(); Object.defineProperty(process, "platform", platform); }
+  });
+}
+
+for (const check of ["process_not_quiescent_before_git", "process_not_quiescent_after_git"] as const) {
+  const valid = { quiescence_state: "survivors", quiescence_process_counts: { own_attempt: 2, other: 1, terminal_attempt: 0 },
+    killed: 3, other_claim_in_flight: true };
+  const malformed: Array<{ name: string; summary?: unknown; expected?: Record<string, unknown> }> = [
+    { name: "legacy" },
+    { name: "extra fields discarded", summary: { ...valid, detail: private3467, pid: 987654321, argv: private3467 },
+      expected: { ...valid, quiescence_process_counts: { own_attempt: 2, other: 1 } } },
+    ...["arbitrary", "__proto__", "constructor", "own_attempt:kill_unconfirmed"].map(key => ({ name: key,
+      summary: { ...valid, quiescence_process_counts: { [key]: 1 } } })),
+    ...["raw-state", undefined, {}, 1].map(state => ({ name: "state " + String(state), summary: { ...valid, quiescence_state: state } })),
+    ...[NaN, Infinity, -1, 0.5, Number.MAX_SAFE_INTEGER + 1, "2"].flatMap(count => [
+      { name: "count " + String(count), summary: { ...valid, quiescence_process_counts: { own_attempt: count } } },
+      { name: "killed " + String(count), summary: { ...valid, killed: count } },
+    ]),
+    ...["true", 1, null, {}].map(value => ({ name: "boolean " + String(value), summary: { ...valid, other_claim_in_flight: value } })),
+    { name: "excess buckets", summary: { ...valid, quiescence_process_counts: Object.fromEntries(processCodes3467.slice(0, 9).map(code => [code, 1])) } },
+    { name: "throw after boolean", summary: Object.defineProperty({ other_claim_in_flight: true }, "quiescence_state",
+      { get() { throw new Error(private3467); } }) },
+  ];
+  for (const sample of malformed) it(`#3467 coordinator independent summary validation ${check} ${sample.name}`, async () => {
+    const f = await fixture(true, path.resolve(import.meta.dirname, "../../.uzi/scratch"));
+    try {
+      const record = await f.freeze(); assert.ok(record);
+      f.state.sourceRefused = true;
+      f.state.secondDiagnostic = { check: "boundary_exception" };
+      f.state.diagnostic = { check, ...(sample.name === "legacy" ? {} : { summary: sample.summary }) } as InventorySourceDiagnostic;
+      const bool = (sample.summary as { other_claim_in_flight?: unknown } | undefined)?.other_claim_in_flight;
+      const expected = sample.expected ?? { ...missing3467, ...(typeof bool === "boolean" ? { other_claim_in_flight: bool } : {}) };
+      const outcome = await f.capture(record);
+      assert.deepEqual(f.logs, [{ run_id: "run-1", generation: 7, capture_id: record.captureId,
+        source_boundary_reason: check, ...expected }], "independent coordinator safe schema");
+      assert.equal(outcome.reason, "inventory_source_not_quiescent:" + check);
+      assert.equal((await f.make().inspect("run-1"))[0]!.reason, outcome.reason);
+      assert.deepEqual(f.finals, []); assert.equal(f.state.open, true);
+    } finally { await f.close(); }
+  });
+  it(`#3467 throwing summary accessor preserves first check ${check}`, async () => {
+    const f = await fixture(true, path.resolve(import.meta.dirname, "../../.uzi/scratch"));
+    try {
+      const record = await f.freeze(); assert.ok(record);
+      f.state.sourceRefused = true;
+      f.state.secondDiagnostic = { check: "boundary_exception" };
+      f.state.diagnostic = Object.defineProperty({ check }, "summary", { get() { throw new Error(private3467); } });
+      const outcome = await f.capture(record);
+      assert.deepEqual(f.logs, [{ run_id: "run-1", generation: 7, capture_id: record.captureId,
+        source_boundary_reason: check, ...missing3467 }]);
+      assert.equal(outcome.reason, "inventory_source_not_quiescent:" + check);
+      assert.equal((await f.make().inspect("run-1"))[0]!.reason, outcome.reason);
+    } finally { await f.close(); }
+  });
+}
+
+async function fixture(sourceBoundary: boolean | "runner" = false, rootParent = os.tmpdir(), receiptModel = false, runId = "run-1",
+  runnerOptions: ConstructorParameters<typeof RunRunner>[6] = {}) {
+  await fs.mkdir(rootParent, { recursive: true });
   const root = makeScratchRoot("inventory-", rootParent);
   const context: PositiveOwedCandidateContext = {
     runId, generation: 7, kind: "issue", branch: "task",
@@ -2499,12 +2641,16 @@ async function fixture(sourceBoundary: boolean | "runner" = false, rootParent = 
     reserveError: undefined as Error | undefined,
     finalError: undefined as Error | undefined,
     oversized: false, cloneHeads: [] as string[], cloneReadable: true,
-    sourceRefused: false, sourceProofRefused: false, diagnostic: undefined as InventorySourceDiagnostic | undefined, cloneCause: undefined as string | undefined, uploads: 0, pinDeletes: 0, statusReads: 0, thin: false,
+    sourceRefused: false, sourceProofRefused: false, diagnostic: undefined as InventorySourceDiagnostic | undefined, secondDiagnostic: undefined as InventorySourceDiagnostic | undefined, cloneCause: undefined as string | undefined, uploads: 0, pinDeletes: 0, statusReads: 0, thin: false,
     produceWait: undefined as Promise<void> | undefined, produced: 0,
     onProduce: undefined as (() => void) | undefined,
     beforeFinalAck: undefined as (() => Promise<void>) | undefined,
   };
   const logs: Array<Record<string, unknown>> = [];
+  const producerDiagnostics: InventorySourceDiagnostic[] = [];
+  const boundaryResults: string[] = [];
+  let boundaryActions = 0;
+  let runnerState: { executionTails: Map<string, Promise<void>>; inventoryReservations: Set<string> } | undefined;
   const aggregates: string[][] = [];
   const finals: unknown[][] = [];
   let reserves = 0;
@@ -2618,6 +2764,7 @@ async function fixture(sourceBoundary: boolean | "runner" = false, rootParent = 
     },
   };
   const git = {
+    worktreeStatus: async () => [] as string[],
     recoverySettlementRoot: path.join(root, "settlement"),
     deleteRecoveryPin: async () => { state.pinDeletes++; state.candidates = []; },
     readInventoryCloneHeads: async () => state.cloneReadable
@@ -2664,10 +2811,17 @@ async function fixture(sourceBoundary: boolean | "runner" = false, rootParent = 
     const coordinator = new RecoveryCoordinator({
     recoveryRoot: path.join(root, "journal"), workerToken: "local-worker-fixture",
     log, client: client as never, git: git as never, now: () => state.now, pendingGenerationReport, onAuthoritativeGenerationReleased, testHooks,
-    withInventorySourceBoundary: sourceBoundary === "runner" ? (context, action) =>
-      physical.withInventorySourceBoundary(context, action) : sourceBoundary ? async (context, action) => {
+    withInventorySourceBoundary: sourceBoundary === "runner" ? async (context, action) => {
+      const result = await physical.withInventorySourceBoundary({ ...context, reportDiagnostic: diagnostic => {
+        producerDiagnostics.push(diagnostic);
+        return context.reportDiagnostic?.(diagnostic);
+      } }, async prove => { boundaryActions++; await action(prove); });
+      boundaryResults.push(result);
+      return result;
+    } : sourceBoundary ? async (context, action) => {
       if (state.sourceRefused) {
         if (state.diagnostic) context.reportDiagnostic?.(state.diagnostic);
+        if (state.secondDiagnostic) context.reportDiagnostic?.(state.secondDiagnostic);
         return "retained";
       }
       await action(async () => {
@@ -2680,9 +2834,13 @@ async function fixture(sourceBoundary: boolean | "runner" = false, rootParent = 
       return "passed";
     } : undefined,
     });
-    if (sourceBoundary === "runner") physical = new RunRunner(client as never, git as never,
-      () => { throw new Error("unreached executor"); }, nullLogger(), 20, undefined,
-      { recovery: coordinator }) as unknown as typeof physical;
+    if (sourceBoundary === "runner") {
+      const runner = new RunRunner(client as never, git as never,
+        () => { throw new Error("unreached executor"); }, log, 20, undefined,
+        { ...runnerOptions, recovery: coordinator });
+      physical = runner as unknown as typeof physical;
+      runnerState = runner as unknown as typeof runnerState;
+    }
     return coordinator;
   };
   const coordinator = make(sourceBoundary);
@@ -2693,7 +2851,8 @@ async function fixture(sourceBoundary: boolean | "runner" = false, rootParent = 
     record, barePath: context.barePath, defaultBranch: "main",
   });
   return { root, context, state, logs, aggregates, finals, coordinator, make, freeze, capture, git,
-    captures, reserveKeys, committedReceipts, client, log,
+    captures, reserveKeys, committedReceipts, client, log, producerDiagnostics, boundaryResults,
+    runnerState: () => runnerState!, boundaryActions: () => boundaryActions,
     reserves: () => reserves, close: () => fs.rm(root, { recursive: true, force: true }) };
 }
 

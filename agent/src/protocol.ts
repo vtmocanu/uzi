@@ -1477,6 +1477,8 @@ export interface ClaimResponse extends ClaimMemoryState {
    *  reserve/release name it so a capture/release binds to the exact hold this claim opened.
    *  Optional so a pre-#1296 payload without it still decodes. */
   claim_generation?: number;
+  /** Server recovery allowance; malformed values are ignored at the claim boundary. */
+  worker_recovery_episode?: number;
   /** Structured PRD #3 templates — the lead plus any subagents — consumed
    *  programmatically by M3 (mapped to SDK AgentDefinitions). M2 ignores them. */
   agents: AgentTemplate[];
@@ -1893,6 +1895,7 @@ export interface TaskReviewRequest {
 export interface ChatClaimResponse extends ClaimMemoryState {
   run_id: string;
   claim_generation?: number;
+  worker_recovery_episode?: number;
   kind: "chat";
   /** Conversation display title (server-derived; may be empty). */
   title: string;

@@ -1268,6 +1268,7 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, wkr store.Worker, run 
 		// (a non-pointer int64, so 0) makes the server fence every capability worker's judge as
 		// stale (ErrMissingClaimGeneration / staleClaim), silently breaking the whole judge lane.
 		ClaimGeneration:        run.ClaimGeneration,
+		WorkerRecoveryEpisode:  run.WorkerRecoveryEpisode,
 		IssueTitle:             run.IssueTitle,
 		IssueDescription:       run.IssueDescription,
 		Status:                 run.Status,

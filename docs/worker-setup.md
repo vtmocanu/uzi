@@ -711,9 +711,18 @@ disables native `Bash` and `Monitor`. What changes for those runs
   advertising `worker_memory_pressure_v1`, or the worker shuts down), the turn
   is aborted and follows the existing recovery/requeue policy. Restart the
   worker to regain authority, as for Codex: registration runs once at startup,
-  and until then each new run claim on that worker, including a requeued run that
-  lands back on it, fails with "Worker memory enrollment requires the full
-  worker claim and registration" and is reported as a run failure.
+  and until then the API withholds new guard-bound run claims from that worker.
+  An already in-flight claim can still fail enrollment under the existing
+  authority fences.
+- Both harnesses distinguish retired authority, exhausted allowance,
+  lifecycle phase holds and memory-pressure holds. A pressure-held command
+  waits within its original command deadline and remaining run budget for
+  at most one configured quiet dwell plus sample/response margin. It then
+  rechecks the original authority and command restrictions before starting,
+  or returns the current refusal reason. This wait neither releases the
+  guard's latch nor promises a recovery time. Phase holds require finishing
+  the pending answer, approval or follow-up step. Exhausted episodes require
+  owner Resume after the memory-pressure park.
 
 **Startup preflight.** With the guard enabled the worker launches the command
 supervisor with an inert child before registering, and requires it to start,
