@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -72,6 +73,7 @@ func (req *planCrossCheckRequest) UnmarshalJSON(raw []byte) error {
 }
 
 type crossCheckVerdictRequest struct {
+	Coverage        json.RawMessage `json:"coverage"`
 	codeFields      bool
 	planFields      bool
 	ClaimGeneration *int64                            `json:"claim_generation"`
@@ -104,7 +106,7 @@ func (req *crossCheckVerdictRequest) UnmarshalJSON(raw []byte) error {
 	if err := json.Unmarshal(raw, &fields); err != nil {
 		return err
 	}
-	for _, key := range []string{"outcome", "findings"} {
+	for _, key := range []string{"outcome", "findings", "coverage"} {
 		if _, ok := fields[key]; ok {
 			req.codeFields = true
 		}
@@ -270,8 +272,10 @@ func (h *Handler) WorkerCrossCheckVerdict(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
+	rawBody, readErr := io.ReadAll(http.MaxBytesReader(w, r.Body, 256<<10))
+	r.Body = io.NopCloser(bytes.NewReader(rawBody))
 	var req crossCheckVerdictRequest
-	if httpx.DecodeJSONStrictBounded(r, &req, 64<<10) != nil || req.ClaimGeneration == nil {
+	if readErr != nil || httpx.DecodeJSONStrictBounded(r, &req, 256<<10) != nil || req.ClaimGeneration == nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid cross-check verdict")
 		return
 	}
@@ -289,7 +293,7 @@ func (h *Handler) WorkerCrossCheckVerdict(w http.ResponseWriter, r *http.Request
 			httpx.Error(w, http.StatusBadRequest, "invalid code cross-check verdict")
 			return
 		}
-		_, err := h.wsvc.DecideCodeCrossCheck(r.Context(), worker, id, *req.ClaimGeneration, req.Outcome, req.ReasonClass, req.Findings)
+		_, err := h.wsvc.DecideCodeCrossCheck(r.Context(), worker, id, *req.ClaimGeneration, req.Outcome, req.ReasonClass, req.Findings, req.Coverage)
 		if err != nil {
 			crossCheckError(w, err)
 			return
@@ -297,7 +301,7 @@ func (h *Handler) WorkerCrossCheckVerdict(w http.ResponseWriter, r *http.Request
 		httpx.JSON(w, http.StatusOK, map[string]any{"status": "ok"})
 		return
 	}
-	if req.codeFields || len(req.Items) > 20 || len(req.Summary) > 4*1024 ||
+	if len(rawBody) > 64<<10 || req.codeFields || len(req.Items) > 20 || len(req.Summary) > 4*1024 ||
 		(req.Verdict != "approve" && req.Verdict != "revise" && req.Verdict != "block" && req.Verdict != "failed") {
 		httpx.Error(w, http.StatusBadRequest, "invalid cross-check verdict")
 		return

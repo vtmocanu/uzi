@@ -312,6 +312,7 @@ type CrossCheck struct {
 	Dispositions            []byte             `json:"dispositions"`
 	FinalizedAt             pgtype.Timestamptz `json:"finalized_at"`
 	RepoInstructionsCommit  pgtype.Text        `json:"repo_instructions_commit"`
+	Coverage                []byte             `json:"coverage"`
 }
 
 type CustodyEpisodeNotice struct {

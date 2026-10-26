@@ -7,6 +7,7 @@ import (
 
 // CodeCrossCheck is owner-only detail. It is never a plan approval.
 type CodeCrossCheck struct {
+	Coverage                json.RawMessage `json:"coverage"`
 	CustomGuidanceApplied   bool            `json:"custom_guidance_applied"`
 	GuidanceDigest          string          `json:"guidance_digest"`
 	RepoInstructionsCommit  *string         `json:"repo_instructions_commit"`

@@ -67,7 +67,7 @@ func ValidateCrossCheckClaim(payload *ClaimPayload) error {
 		if input.CustomGuidanceApplied != nil && *input.CustomGuidanceApplied != (input.GuidanceSnapshot != "") {
 			return ErrCrossCheckRefused
 		}
-	} else if input.RepoInstructionsCommit != nil || input.RepoInstructionsEnabled != nil || input.CustomGuidanceApplied != nil ||
+	} else if input.CoverageSupported || input.RepoInstructionsCommit != nil || input.RepoInstructionsEnabled != nil || input.CustomGuidanceApplied != nil ||
 		input.GuidanceDigest != "" || input.RepoInstructionsDigest != "" || input.RepoInstructionsText != "" {
 		return ErrCrossCheckRefused
 	}
