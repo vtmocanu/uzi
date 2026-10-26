@@ -10,28 +10,32 @@
 # (the two sanctioned includes, local vendored copies; see that file's rule 3).
 #
 # TRIGGERS: a `v*` tag push (auto-publish the formula on release, matching release.yml)
-# AND workflow_dispatch (re-publish for any existing tag by hand). Both feed the same job
+# AND workflow_dispatch (re-publish for any existing tag by hand). Both feed the proof job
 # through INPUT_TAG below. Dispatch on the tag itself (`gh workflow run brew.yml --ref
-# vX.Y.Z -f tag=vX.Y.Z`): the `release` environment admits only `v*` tag refs, so a
-# dispatch from `main` is rejected before any step runs, and a tag dispatch runs the
-# workflow as it was at that tag. To publish with a newer workflow than the tag carries,
+# vX.Y.Z -f tag=vX.Y.Z`): a dispatch from `main` is refused by the proof job's tag
+# validation (the `release` environment also admits only `v*` tag refs). A tag dispatch
+# runs the workflow as it was at that tag. To publish with a newer workflow than the tag carries,
 # render and publish locally from `main` (`task brew-rc:formula` + `task brew-rc:publish`):
+# first prove that tag with `python3 -I scripts/release-ci-coverage.py published
+# refs/tags/vX.Y.Z --tag vX.Y.Z --wait 0`, then
 # run scripts/brew-tap-guard.py against the tap's current formula first and publish only
 # when it exits 0; exit 3 skips, any other failure refuses (the publish task has no guard).
 # brew:formula fetches the ANONYMOUS auto-archive
 # (https://github.com/vtmocanu/uzi/archive/refs/tags/<tag>.tar.gz); the reusable task
 # guards the empty-input digest and refuses to render on a 404. A release tags vX.Y.Z (or
 # vX.Y.Z-rc.N), release.yml publishes the images + chart, and this publishes the matching
-# formula. brew stays a SEPARATE workflow from release.yml because it needs that public
-# archive, and a failed tap push must not redden the image+chart release.
+# formula only after that tag's release.yml succeeds. brew stays a SEPARATE workflow
+# because a failed tap push must not redden the image+chart release.
+# If the proof times out, first wait for the same tag's release.yml to succeed, then
+# recover the failed Brew run with `gh run rerun <brew-run> --failed`.
 #
 # The default GITHUB_TOKEN cannot write to a second repo, so the cross-repo push uses
 # HOMEBREW_TAP_TOKEN (a fine-grained PAT scoped to vtmocanu/homebrew-tap, contents:write),
 # from the `release` environment. The `environment: release` below is REQUIRED for that
 # reason -- it scopes the token as an environment secret -- NOT as an approval gate: that
-# environment carries no required reviewer (removed 2026-08-20), so this publishes
-# immediately on the tag with no approval click. Access control is the `v*` tag ruleset
-# (only a repo admin can create the tag), same as release.yml. No GitHub Release is
+# environment carries no required reviewer (removed 2026-08-20). Publication waits for
+# the read-only release proof, with no approval click. Access control is the `v*` tag ruleset,
+# as in release.yml. No GitHub Release is
 # created (the auto-archive needs none), so permissions stay read-only -- matching
 # cc-statusline.
 
@@ -53,34 +57,27 @@ name: Brew
 permissions:
   contents: read
 
-concurrency:
-  # Ref-INDEPENDENT (not per-tag): a promote ceremony pushes the stable tag and the next
-  # RC tag within minutes, firing two runs that BOTH `git push origin main` into the tap
-  # from a fresh clone with no rebase/retry. A per-ref group would let them run
-  # concurrently and collide on a non-fast-forward push, reddening one (PRD #1378 R5). One
-  # shared group + cancel-in-progress:false serializes the promote's two publishes: one
-  # runs, the other pends, then runs. This serialization also protects the version
-  # guard's read-then-push interval; delayed runs skip instead of downgrading the tap.
-  # A 3rd tag pushed inside that ~3-min window would displace the
-  # single pending slot; `queue: max` (a real GH Actions key since 2026-05-07) would hold
-  # all pending runs, but the pinned actionlint rejects the `queue` key, so it is deferred
-  # until that pin catches up -- and three simultaneous release tags is not a cadence the
-  # RC-first flow produces, while a displaced publish simply re-runs on the tag.
-  group: brew-tap-publish
-  cancel-in-progress: false
-
 jobs:
-  publish-formula:
+  assert-release-published:
     runs-on: ubuntu-latest
-    environment: release
+    timeout-minutes: 65
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     env:
       # Passed via env, never string-interpolated into a run script: a workflow_dispatch
       # input is untrusted, and git ref names allow shell metacharacters. On a v* tag push
       # inputs.tag is empty, so fall back to the tag ref name; the Validate step below
       # rejects anything that is not strict SemVer either way.
       INPUT_TAG: ${{ inputs.tag || github.ref_name }}
+      WORKFLOW_TAG: ${{ github.ref_name }}
+      WORKFLOW_REF_TYPE: ${{ github.ref_type }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
 
       # Only strict SemVer tags may proceed -- a stable vMAJOR.MINOR.PATCH or an RC
       # vMAJOR.MINOR.PATCH-rc.N (integer N, no leading zero). $INPUT_TAG flows into a URL +
@@ -94,7 +91,33 @@ jobs:
             echo "refusing to publish: tag '$INPUT_TAG' is not vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-rc.N" >&2
             exit 1
           fi
+          if [ "$WORKFLOW_REF_TYPE" != tag ] || [ "$INPUT_TAG" != "$WORKFLOW_TAG" ]; then
+            echo 'refusing to publish: dispatch on the same tag as the input' >&2
+            exit 1
+          fi
           echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for the same tag's release publication
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 -I scripts/release-ci-coverage.py published HEAD --tag "$INPUT_TAG" --wait 3600 --interval 15
+
+  publish-formula:
+    # Serialize only the tap read/guard/write interval. Publication proofs can wait
+    # in parallel without holding this lock. Retain up to 100 pending publishers.
+    # A promote can push stable and next-RC tags within minutes; both fresh clones
+    # push tap main without rebase. A per-ref lock would permit non-fast-forward
+    # collisions (PRD #1378 R5). This shared lock also protects the version guard's
+    # read-then-push interval, so delayed candidates cannot downgrade the formula.
+    concurrency:
+      group: brew-tap-publish
+      cancel-in-progress: false
+      queue: max
+    needs: assert-release-published
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
       - uses: arduino/setup-task@c0bc642852239c2689f73f4ea6459c29405f3c52  # v3.0.0
         with:
@@ -106,7 +129,7 @@ jobs:
       # Git/read/parse failures refuse the write; only guard exit 3 means skip.
       - name: Guard, render and publish channels
         env:
-          VERSION: ${{ steps.tag.outputs.tag }}
+          VERSION: ${{ needs.assert-release-published.outputs.tag }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
