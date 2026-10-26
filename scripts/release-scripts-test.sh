@@ -800,7 +800,7 @@ GIT
     local label=$1 expected=$2 field actual; shift 2
     before_head="$(git -C "$d" rev-parse HEAD)"
     before_refs="$(git -C "$d" show-ref)"
-    before_status="$(git -C "$d" status --porcelain --untracked-files=no)"
+    before_status="$(git -C "$d" status --porcelain --untracked-files=all)"
     output="$(cd "$d" && PLAN_READONLY=1 bash "$RC" --plan "$@" 2>&1)"; rc=$?
     assert_eq "$label plan exit" 0 "$rc"
     while IFS= read -r field; do
@@ -809,7 +809,7 @@ GIT
     done <<< "$expected"
     assert_eq "$label HEAD unchanged" "$before_head" "$(git -C "$d" rev-parse HEAD)"
     assert_eq "$label refs unchanged" "$before_refs" "$(git -C "$d" show-ref)"
-    assert_eq "$label tracked tree unchanged" "$before_status" "$(git -C "$d" status --porcelain --untracked-files=no)"
+    assert_eq "$label worktree unchanged" "$before_status" "$(git -C "$d" status --porcelain --untracked-files=all)"
     assert_eq "$label no scratch files" '' "$(find "$d/.uzi/scratch" -type f 2>/dev/null)"
     assert_eq "$label no fetch" '' "$(cat "$PLAN_GIT_AUDIT" 2>/dev/null)"
   }
