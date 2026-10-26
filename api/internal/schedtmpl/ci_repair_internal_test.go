@@ -11,7 +11,7 @@ func TestCIRepairCatalogApproval(t *testing.T) {
 			if job.AutoApprove || job.Target != "ci_watch" || job.Cron != "0 * * * *" || job.Timezone != "UTC" || job.Prompt == "" {
 				t.Fatalf("CI catalog entry = %+v", job)
 			}
-			for _, instruction := range []string{"untrusted", "Reproduce", "Classify", "smallest", "regression test", "CI-config", "publishing guard", "re-run", "report only"} {
+			for _, instruction := range []string{"untrusted", "Reproduce", "Classify", "smallest", "regression test", "CI-config", "publishing guard", "re-run", "report only", "list_issues", "reproduction blocker", "discriminating", "summary"} {
 				if !strings.Contains(job.Prompt, instruction) {
 					t.Errorf("prompt missing %q", instruction)
 				}
