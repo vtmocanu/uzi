@@ -17887,12 +17887,12 @@ describe("CodexExecutor planning settlement (#1733)", () => {
 });
 
 describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
-  // Readiness uses bounded real event-loop turns, independently of the frozen Date.
+  // Readiness polls real event-loop turns against a real-time deadline (performance.now is not
+  // mocked), independently of the frozen Date. A turn count alone runs out before real I/O on a
+  // loaded runner: 500 turns elapsed in under 5 ms on CI.
   async function until(predicate: () => boolean): Promise<void> {
-    for (let n = 0; n < 500; n++) {
-      if (predicate()) return;
-      await tick();
-    }
+    const deadline = performance.now() + 5000;
+    while (!predicate() && performance.now() < deadline) await tick();
     assert.ok(predicate(), "event barrier was not reached");
   }
 
