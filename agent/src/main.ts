@@ -2,6 +2,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig, MAX_CONCURRENT_RUNS_SOFT_CEILING, type ExecutorKind, type Config } from "./config.js";
 import { configureGoConcurrency } from "./go-concurrency.js";
+import { acquireWorkerLifetime } from "./authority-lock.js";
+import { installWorkerLifetime } from "./completion-authority.js";
 import { createLogger, type Logger } from "./log.js";
 import { maintenanceBootstrapRoots, readMaintenancePosture, recordMaintenanceBootstrap, snapshotMaintenanceBootstrap, terminalMaintenanceProof } from "./run-quiescence.js";
 import { MaintenanceWriterExclusion } from "./maintenance-exclusion.js";
@@ -396,6 +398,13 @@ async function main(): Promise<void> {
   const bootstrap = maintenanceBootstrapRoots();
   log.info("terminal maintenance bootstrap posture", { ...readMaintenancePosture(),
     bootstrap: bootstrap === undefined ? "refused" : bootstrap.length });
+
+  // Issue #3404 M1a: take the process-lifetime worker lock W before ensureRunnerTmpdir, any
+  // registration, sweep or admission. A second compatible worker, a missing util-linux flock,
+  // an unsupported filesystem or untrusted lock metadata refuses startup (fatal handler). The
+  // descriptor is retained for the whole process; nothing here can release it.
+  installWorkerLifetime(await acquireWorkerLifetime(config.dataDir, { signal: controller.signal }));
+  log.info("worker lifetime lock acquired");
 
   // Issue #3153: when TMPDIR lives under the (now persistent) `<dataDir>/runner`, confirm it is a
   // real, worker-owned, writable directory BEFORE anything uses a temp path. A symlink or
