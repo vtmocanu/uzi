@@ -60,7 +60,8 @@ Four things about it that are decisions rather than accidents:
 
 - **The load-bearing flags live in the targets, with their reason beside them.**
   `-race` and `-count=1` on `test:api` and (since PRD #103 M6) on `test:controller`,
-  `--test-timeout=120000` inside `agent/package.json`'s `test` script. None is
+  `--test-timeout=120000` inside `agent/test/run-unit-tests.ts` (the launcher
+  for `agent/package.json`'s `test` script). None is
   optional and each one's absence is invisible in a passing run, which is why
   the Taskfile is not `silent:` — Task echoes every command, so you can read the
   flags in the output instead of trusting a file.
@@ -81,7 +82,7 @@ written out as commands in `CLAUDE.md` and the `.claude/rules/` files it indexes
 
 The Taskfile installs no *project* dependencies — no `npm ci`, no
 `go mod download`. Your `node_modules` and module cache are expected to exist; CI
-does that in its `before_script`.
+does that in its dependency-installation steps in `.github/workflows/ci.yml`.
 
 **One exception since PRD #103 M3, and it is why that sentence is now qualified:**
 `task lint:api` and `task lint:controller` acquire golangci-lint through

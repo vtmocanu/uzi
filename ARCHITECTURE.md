@@ -2114,8 +2114,8 @@ rationale.
   broken relative link (doc→doc or doc→img), reference-style links, or an
   oversized `docs/img/*` file; it warns (without failing) on a `user` page over
   the 60-line house-style budget.
-  It runs both locally (ahead of `npm run build`) and in CI (`validate:web`
-  runs `npm run check-docs` too, PRD #52), so a broken doc fails the pipeline as
+  It runs both locally (ahead of `npm run build`) and in CI (`validate-web`
+  runs `task check-docs:web` too, PRD #52), so a broken doc fails the pipeline as
   well as the local build.
 
 ## Deployment: compose (laptop) and k8s
