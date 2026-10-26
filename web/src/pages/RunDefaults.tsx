@@ -9,6 +9,7 @@ import { useState } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { api, type UserSettingsPatch } from "../lib/api";
 import { CrossCheckDefaults } from "../components/CrossCheckDefaults";
+import { UsageReserveSetting } from "../components/UsageReserveSetting";
 import type { UserSettings, BindMode, ModelSettingCell } from "../lib/apiTypes";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
@@ -749,6 +750,11 @@ export function RunDefaults() {
           Sends a Slack DM when your weekly Anthropic or Codex limit reopens more than 8 hours
           before its expected reset. On by default; needs a linked Slack account to reach you.
         </p>
+
+        {/* PRD #3522: the weekly usage reserve. The third thing on this card that is
+            about your 7-day window; its own component and endpoint, so its busy/error
+            state never touches the two toggles above. */}
+        <UsageReserveSetting />
       </Card>
 
       <Card className="space-y-4">

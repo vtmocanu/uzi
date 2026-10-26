@@ -635,6 +635,15 @@ const realApi = {
    */
   setWaitOnLimit: (enabled: boolean) =>
     request<{ user: User }>("PUT", "/me/wait-on-limit", { enabled }),
+  // Set the current user's weekly usage reserve (PRD #3522). Both fields are always sent
+  // (the server 400s an absent one): thresholdPct is an integer 1..100, or null to turn
+  // the reserve off; pauseRunning also pauses running runs after their current milestone.
+  // Session identity only. Returns the updated user.
+  setUsageReserve: (thresholdPct: number | null, pauseRunning: boolean) =>
+    request<{ user: User }>("PUT", "/me/usage-reserve", {
+      threshold_pct: thresholdPct,
+      pause_running: pauseRunning,
+    }),
   // Flip the current user's early-limit-reset Slack alert opt-in (PRD #1020 M4/M5).
   // Session identity only — the body carries no user id. Returns the updated user.
   setNotifyEarlyReset: (enabled: boolean) =>

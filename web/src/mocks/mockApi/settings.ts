@@ -527,7 +527,13 @@ function mySettingsResponse(): { settings: UserSettings } {
     { claude: userSettings.judge_model, codex: userSettings.codex_judge_model },
     { claude: appSettings.judge_model, codex: appSettings.codex_judge_model },
   );
-  return { settings: { ...userSettings, cross_check_pins, judge_models, default_model: projected ?? null } };
+  // PRD #3522: the reserve lives on the user row (written by setUsageReserve), and the
+  // server's GET /me/settings reads it from there, so project it from the session user.
+  const me = state.session;
+  const reserve = me
+    ? { weekly_reserve_pct: me.weekly_reserve_pct ?? null, weekly_reserve_pause_running: me.weekly_reserve_pause_running ?? true }
+    : {};
+  return { settings: { ...userSettings, ...reserve, cross_check_pins, judge_models, default_model: projected ?? null } };
 }
 
 export let appSettings: AppSettings = loadedSettings.appSettings;
@@ -1125,6 +1131,29 @@ export const settingsApi = {
   setWaitOnLimit: async (enabled: boolean) => {
     const u = requireSession();
     u.wait_on_limit = enabled;
+    return delay({ user: { ...u } }, 200);
+  },
+
+  // ── Weekly usage reserve (PRD #3522 M2) ──────────────────────────────────────
+  // Mirrors PUT /api/me/usage-reserve (handler/usage_reserve.go): both fields are
+  // required, the threshold is an integer 1..100 or null (off), pause_running a boolean,
+  // and the write lands on the session user, never a body id. 400 messages match the server.
+  setUsageReserve: async (thresholdPct: number | null, pauseRunning: boolean) => {
+    const u = requireSession();
+    if (thresholdPct === undefined) {
+      throw new ApiError(400, "threshold_pct is required (an integer 1..100, or null to turn the reserve off)");
+    }
+    if (pauseRunning === undefined) {
+      throw new ApiError(400, "pause_running is required (true or false)");
+    }
+    if (thresholdPct !== null && (!Number.isInteger(thresholdPct) || thresholdPct < 1 || thresholdPct > 100)) {
+      throw new ApiError(400, "threshold_pct must be an integer from 1 to 100, or null");
+    }
+    if (typeof pauseRunning !== "boolean") {
+      throw new ApiError(400, "pause_running must be true or false");
+    }
+    u.weekly_reserve_pct = thresholdPct;
+    u.weekly_reserve_pause_running = pauseRunning;
     return delay({ user: { ...u } }, 200);
   },
 
