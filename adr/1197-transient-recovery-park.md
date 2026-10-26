@@ -988,7 +988,8 @@ bound the memory a Git child uses while inflating an object before that first
 delivery. Demonstrated: a roughly 1 MB loose tree object declaring a 1 GiB inflated
 size drove the source-environment `rev-list --objects` selection to about 1.08 GB
 RSS, and `pack-objects` and both `index-pack --strict` invocations (private staging
-and canonical import) inflate attacker-supplied objects the same way. The transfer is
+and canonical import) also inflate such objects (inferred, not measured; Git may
+stream blobs above `core.bigFileThreshold`). The transfer is
 unreachable in production today: `terminalOriginAdmissionEnabled()` returns the false
 `TERMINAL_ORIGIN_ADMISSION_ENABLED` constant (tests override it). Enabling it is
 blocked until the enabling design proves a memory bound before the first inflation

@@ -15,8 +15,9 @@ resource refusal is resolved (see the owner diagnosis and category correction
 below; all ten slot dimensions are under their unchanged caps for a single-member
 family, while a two-source family exceeds `sources`, recorded below as a C2 input). The remaining U4b
 boundary is verification: the full frozen gate is substituted by exact-head CI per
-the maintainer decision, and the review and mutation evidence is refreshed at the
-final head. Full
+the maintainer decision of 2026-10-26 (recorded in the PR for #3441: GitHub CI's
+full agent suite on the exact PR head counts as the frozen-candidate `gate:agent`),
+and the review and mutation evidence is refreshed at the final head. Full
 frozen-gate results belong to the PR verification record; live acceptance
 remains separate. The U4b contract revision is recorded below; no producer enablement is included.
 
@@ -128,10 +129,13 @@ Projection, not measured: if the single-member path's 31 paid reads also applied
 a two-member family, the complete path would need about 31 x 6 + 2 = 188 `sources`
 against 128. The single-member path measures 126/128.
 
-The overrun binds only when the producer is enabled: the only `sources` charge is
-`consumeIfActive` inside `withMaintenanceFamilyLock`, and slots are minted only by
+The overrun binds only when the producer is enabled. `sources` is charged at two
+sites: `consumeIfActive` inside `withMaintenanceFamilyLock` (the per-read charge),
+and `MaintenanceResources.consume("sources", 2)` inside `importMaintenanceTip` (the
+two further units above). Both apply only inside a slot, and slots are minted only by
 terminal-origin admission, which returns early while
-`TERMINAL_ORIGIN_ADMISSION_ENABLED` is false.
+`TERMINAL_ORIGIN_ADMISSION_ENABLED` is false; `importMaintenanceTip` is reached only
+from that admission path.
 
 This conflicts with the C2 hard gate (#3442 item 5): the two-source family must
 complete with genesis preserved and the sibling protected, and a cap refusal is not
@@ -1748,7 +1752,8 @@ this is not the C2 representative W0/U4b/archive measurement.
 The decoded counter (8 GiB aggregate, no per-object cap) does not bound Git-process
 memory before the first inflation. Demonstrated: a roughly 1 MB loose tree object
 declaring 1 GiB drove source-environment `rev-list --objects` to about 1.08 GB RSS;
-`pack-objects` and both `index-pack --strict` invocations also inflate. The transfer
+`pack-objects` and both `index-pack --strict` invocations also inflate (inferred,
+not measured; Git may stream blobs above `core.bigFileThreshold`). The transfer
 is production-unreachable today (`terminalOriginAdmissionEnabled()` returns the false
 `TERMINAL_ORIGIN_ADMISSION_ENABLED` constant; tests override it). This is an explicit
 blocker to enabling it: the enabling design must prove a memory bound before the first
@@ -1787,7 +1792,9 @@ Historical full `task gate:agent` log `gate-log.vNpy2y` timed out at 120 minutes
 631/690 files, with 104 fixture/environment/category failures. Focused repairs
 and eight wrapped passes do not establish a full-suite green. Full per-test
 mutation/applicability mapping and integration/full gate remain mandatory and
-unwaived. Reviewer, tester and auditor must review the new combined category
+unwaived; the full gate is satisfied only by a green exact-head CI full agent suite
+at the final candidate, the maintainer-approved substitute recorded in the status
+above. Reviewer, tester and auditor must review the new combined category
 candidate; their clean `6f8f0b7c` reports cover the earlier committed fixture repair.
 M2 is incomplete, M3 is not done, guard remains false. No partial acceptance
 has been supplied.
