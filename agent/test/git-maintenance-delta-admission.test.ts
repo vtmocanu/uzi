@@ -230,6 +230,39 @@ test("delta walk10: loose entries exhaust reduced remaining sourceEntries withou
   await f.retained();
 });
 
+test("delta walk10b: every walked loose entry stat and open is charged as sourceEntries with its own path", linux, async t => {
+  const f = await maintenanceDeltaFixture(t), loose = path.join(f.clone, ".git", "objects", "aa");
+  await fs.mkdir(loose, { recursive: true });
+  for (let i = 0; i < 5; i++) await fs.writeFile(path.join(loose, i.toString(16).padStart(38, "0")), "encoded walk fixture");
+  const lstat = fs.lstat.bind(fs), observed: string[] = [];
+  t.mock.method(fs, "lstat", async (...args: Parameters<typeof fs.lstat>) => {
+    if (f.physical(args[0]).startsWith(loose + "/")) {
+      const [entry, metadata] = f.charges.slice(-2);
+      assert.equal(entry?.resource, "sourceEntries"); assert.equal(entry?.amount, 1);
+      assert.equal(metadata?.resource, "metadataBytes");
+      assert.equal(metadata?.amount, 2048 + Buffer.byteLength(String(args[0])), "the charge immediately preceding names this entry");
+      observed.push(String(args[0]));
+    }
+    return lstat(...args);
+  });
+  const open = fs.open.bind(fs), opened: string[] = [];
+  t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
+    if (f.physical(args[0]).startsWith(loose + "/")) {
+      // importMaintenanceTip's own charge() helper, default category, immediately before the open.
+      const [entry, metadata] = f.charges.slice(-2);
+      assert.equal(entry?.resource, "sourceEntries"); assert.equal(entry?.amount, 1);
+      assert.equal(metadata?.resource, "metadataBytes");
+      assert.equal(metadata?.amount, 2048 + Buffer.byteLength(String(args[0])));
+      opened.push(String(args[0]));
+    }
+    return open(...args);
+  });
+  assert.deepEqual(await f.run(), { kind: "imported", sourceSha: f.tip });
+  assert.ok(opened.length >= 5, "each loose entry open was observed: " + opened.length);
+  assert.ok(observed.length >= 5, "each loose entry stat was observed: " + observed.length);
+  await f.retained();
+});
+
 for (const attack of ["parent symlink", "hardlinked write target"]) {
   test("delta scratch F: " + attack + " before control create refuses without touching foreign bytes", linux, async t => {
     const f = await maintenanceDeltaFixture(t), parent = path.join(f.request.outDir, "read");
