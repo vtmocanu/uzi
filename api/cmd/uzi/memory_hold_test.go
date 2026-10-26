@@ -167,6 +167,7 @@ func TestOwnerHoldCLIFollowFinalDrain(t *testing.T) {
 	}{
 		{"memory", "worker memory pressure", memoryHeldRun()},
 		{"worker exhaustion", "worker recovery exhausted", workerExhaustionRun(3)},
+		{"retained recovery", "retained recovery exhausted", retainedRecoveryRun("held")},
 	} {
 		for _, format := range []string{"text", "NDJSON"} {
 			for _, failDrain := range []bool{false, true} {

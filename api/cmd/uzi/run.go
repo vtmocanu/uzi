@@ -79,10 +79,10 @@ const statusPoolWait = "pool_wait"
 // statusLimitWait/statusPoolWait: the follow loop, the steer-queue delivery label and
 // `uzi run get`'s detail block compare against one literal.
 //
-// NON-TERMINAL, like limit_wait/pool_wait, and with NO lifetime cap: a park always
-// becomes promotable again after its capped backoff, so the run auto-resumes repeatedly
-// until it recovers or the owner cancels. Treating it as terminal would make `--follow`
-// exit on a run that is about to produce more messages.
+// NON-TERMINAL, like limit_wait/pool_wait. The cause and retry stamp distinguish
+// timed recovery from an owner-required hold. Retained recovery with a finite stamp
+// stays timed even after it is due; NULL requires owner Resume or Cancel. Default
+// wait and follow stop on owner-required worker holds; timed recovery keeps polling.
 const statusRecoveryWait = "recovery_wait"
 
 // statusPaused is the status a run carries while parked by an OWNER pause (PRD #1190):
@@ -196,8 +196,8 @@ var allRunStatuses = func() map[string]bool {
 // follow-up park, or a terminal — the common "wait for the gate OR the end" case. It also
 // OMITS recovery_wait (issue #1197: a transient-recovery park auto-resumes on a capped
 // backoff, so it is legitimate to wait through, exactly like limit_wait/pool_wait).
-// runWait separately stops a default wait on worker_requeue_exhausted for owner
-// intervention; an explicit --until retains the exact status-set semantics.
+// runWait separately stops a default wait on owner-required worker holds, including
+// retained recovery exhausted only when its retry stamp is NULL; an explicit --until retains the exact status-set semantics.
 var defaultWaitStates = []string{"awaiting_approval", "awaiting_input", "awaiting_followup", "completed", "failed", "cancelled"}
 
 // run wait poll cadence and transient-blip resilience knobs (PRD #264 D1/D9). Vars,

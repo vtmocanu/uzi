@@ -13,7 +13,7 @@ func isMemoryHold(r apitypes.RunDTO) bool {
 }
 
 func isOwnerRequiredWorkerHold(r apitypes.RunDTO) bool {
-	return isMemoryHold(r) || isWorkerRecoveryExhausted(r)
+	return isMemoryHold(r) || isWorkerRecoveryExhausted(r) || isRetainedRecoveryHold(r)
 }
 
 func memoryHoldAllowance(r apitypes.RunDTO) string {
