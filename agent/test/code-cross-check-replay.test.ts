@@ -24,13 +24,6 @@ const scratch = path.join(tc.root, "scratch");
 const sha256 = (s: string | Uint8Array): string => createHash("sha256").update(s).digest("hex");
 const load = (): Promise<ReplayCorpus> => loadReplayCorpus(tc.checkout, { profile: "revised", manifestSha256: tc.manifestSha256 });
 
-test("baseline remains drift-checked while revised profile preserves frozen pins", async () => {
-  await assert.rejects(loadReplayCorpus(tc.checkout, { manifestSha256: tc.manifestSha256 }), { message: "brief_drift" });
-  const revised = await load();
-  assert.equal(revised.profile, "revised");
-  assert.notDeepEqual(revised.brief_sha256, revised.pins.brief_sha256);
-  assert.equal(revised.pins.brief_sha256.codex, "29e410c44476fb6e2560fd03c2d990de24cee2193e6df6c250085cb1b39252a5");
-});
 const corpus = await load();
 const defect = corpus.cases.find((c) => c.id === tc.defectId)!;
 const findingsText = JSON.stringify({ findings: [{ id: "F1", severity: "major", path: "src/client.ts", line: 4, title: "UNIQUE-TITLE-XYZ", detail: "UNIQUE-DETAIL-XYZ" }] });
@@ -55,6 +48,16 @@ const groups = process.getgroups?.() ?? [];
 const splitGid = groups.find((g) => g !== process.getgid?.()) ?? process.getgid!();
 const split = { split: true, gid: splitGid };
 const single = { split: false, gid: splitGid };
+
+// Register tests only after asynchronous fixture setup, so a filtered first test
+// cannot let the file's cleanup hook run while the corpus is still loading.
+test("baseline remains drift-checked while revised profile preserves frozen pins", async () => {
+  await assert.rejects(loadReplayCorpus(tc.checkout, { manifestSha256: tc.manifestSha256 }), { message: "brief_drift" });
+  const revised = await load();
+  assert.equal(revised.profile, "revised");
+  assert.notDeepEqual(revised.brief_sha256, revised.pins.brief_sha256);
+  assert.equal(revised.pins.brief_sha256.codex, "29e410c44476fb6e2560fd03c2d990de24cee2193e6df6c250085cb1b39252a5");
+});
 
 async function replay(over: Partial<RunReplaysDeps> & { checkers?: RunReplaysDeps["checkers"] } = {}): Promise<ReplayRecord[]> {
   const out: ReplayRecord[] = [];
