@@ -831,7 +831,9 @@ describe("#3031 composed measurement verdict controls", () => {
     const { record, evaluation } = await runPipeline(t, small("control-admission-limit", cap));
     assert.equal((record.limits as Limits).decoded, cap, "the MEASURE limit is the admitted decodedCap");
     assert.equal(record.configured_decoded_cap, cap);
-    assert.equal(evaluation.verdict, "PASS", JSON.stringify(record));
+    // Within every limit and complete; PASS, or the deviation label when UZI_MEASURE_DEVIATION is set.
+    assert.ok(within(evaluation.verdict) && evaluation.violations.length === 0 && !evaluation.refusal, JSON.stringify(record));
+    assert.notEqual((record.archive as { kind: string }).kind, "none", "the control pipeline reached the archive phase");
     assert.ok(Object.keys(record.limits as Limits).includes("rpcAttempts"), "every key of the slot quota is a checked dimension");
   });
 });
