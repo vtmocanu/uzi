@@ -32,15 +32,16 @@ import {
 // between the slot rename and the shard update, and is completed under the transaction.
 // Anything older refuses and blocks. Retired tombstones are kept (no GC), so the head is sharded
 // to keep each file far below MAX_SLOT_BYTES and to rewrite only one shard per operation. A
-// shard file that is deleted reads as seq 0, so it is indistinguishable from the crash window
-// only for a slot at seq 1; a deleted shard under any later slot refuses.
+// shard file is never read as empty: all 256 empty shards are created in one atomic step when
+// the store is enrolled, so the seq-1 crash window still has a shard to complete, and a missing
+// shard (or a heads/ directory that is not a private directory with every shard) refuses.
 //
 // Rollback: the in-process high-water mark (module level, keyed by storage id, so reopening the
 // store per transaction keeps it) catches any restore within this process. Across a restart,
-// the one undetected rollback is restoring a head shard together with every slot written since
-// it (for example a volume snapshot restore, up to and including the whole store); detection
-// of that case is in-process only. An older shard with a newer slot (more than one ahead) or
-// an older slot under a newer shard is detected.
+// the undetected rollback is restoring a head shard together with the slot(s) of the keys being
+// read, up to and including the whole store (for example a volume snapshot restore); detection
+// of that case is in-process only. A deleted shard now refuses, as does an older shard with a
+// newer slot (more than one ahead) or an older slot under a newer shard.
 
 /** Authority layout identity; exposed as `AuthorityStore.layout` for completion-source.ts. */
 const AUTHORITY_LAYOUT = "uzi-authority-layout/1";
@@ -296,7 +297,12 @@ async function readRegular(file: string, uid: number, limit: number): Promise<st
 async function withDirGuard<T>(
   dir: string, uid: number, fn: (handle: fsp.FileHandle, check: () => Promise<void>) => Promise<T>,
 ): Promise<T> {
-  const handle = await fsp.open(dir, fsc.O_RDONLY | fsc.O_DIRECTORY | fsc.O_NOFOLLOW);
+  let handle: fsp.FileHandle;
+  try { handle = await fsp.open(dir, fsc.O_RDONLY | fsc.O_DIRECTORY | fsc.O_NOFOLLOW); }
+  catch (error) {
+    // A missing directory, a symlink (ELOOP) and a non-directory (ENOTDIR) are all refusals, not raw errors.
+    throw new AuthorityRefusal((error as NodeJS.ErrnoException).code === "ENOENT" ? "authority directory missing" : "unsafe authority directory");
+  }
   try {
     const held = await handle.stat({ bigint: true });
     if (!held.isDirectory() || held.uid !== BigInt(uid) || (held.mode & 0o7777n) !== 0o700n) {
@@ -351,12 +357,20 @@ function sealHead(init: StoreIdentity, shard: string, heads: ReadonlyMap<string,
   return content;
 }
 
-/** The authenticated head shard (empty when its file does not exist yet). */
+/**
+ * The authenticated head shard. Every shard exists from store creation on, so a missing one
+ * refuses: reading it as empty would let a deleted shard roll back every key in it.
+ */
 async function readHead(init: StoreIdentity, shard: string): Promise<Map<string, number>> {
-  try { await fsp.lstat(path.join(init.dir, HEADS_DIR)); }
-  catch { throw new AuthorityRefusal("authority head missing"); }
-  const source = await readRegular(path.join(init.dir, HEADS_DIR, `${shard}.json`), init.uid, init.maxHeadBytes);
-  if (source === null) return new Map();
+  const source = await withDirGuard(path.join(init.dir, HEADS_DIR), init.uid, async (_handle, check) => {
+    const read = await readRegular(path.join(init.dir, HEADS_DIR, `${shard}.json`), init.uid, init.maxHeadBytes);
+    await check();
+    return read;
+  }).catch((error: unknown) => {
+    if (error instanceof AuthorityRefusal && error.message === "authority directory missing") throw new AuthorityRefusal("authority head missing");
+    throw error;
+  });
+  if (source === null) throw new AuthorityRefusal("authority head missing");
   const head = unseal(init.key, "head", source, normalizeHead);
   if (head.storageId !== init.storageId) throw new AuthorityRefusal("authority head belongs to another storage");
   if (head.shard !== shard) throw new AuthorityRefusal("authority head shard does not match its name");
@@ -396,6 +410,51 @@ async function ensurePrivateDir(dir: string, parent: string, uid: number, ops: A
     const handle = await fsp.open(parent, fsc.O_RDONLY | fsc.O_DIRECTORY | fsc.O_NOFOLLOW);
     try { await ops.syncDir(handle); } finally { await handle.close(); }
   }
+}
+
+const SHARD_NAMES: readonly string[] = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2, "0"));
+const STALE_HEADS_TMP = /^\.heads\.[0-9a-f-]{36}\.tmp$/;
+
+/**
+ * Create all 256 empty MAC'd shards in one atomic step: stage them in a tmp directory, fsync
+ * each file and the directory, rename it to heads/, fsync the parent. A crash leaves either
+ * no heads/ or a complete one (plus an unreferenced tmp directory, removed on the next create).
+ */
+async function createHeads(ops: AuthorityFsOps, init: StoreIdentity): Promise<void> {
+  for (const name of await fsp.readdir(init.dir)) {
+    if (STALE_HEADS_TMP.test(name)) await fsp.rm(path.join(init.dir, name), { recursive: true, force: true });
+  }
+  const staging = path.join(init.dir, `.${HEADS_DIR}.${randomUUID()}.tmp`);
+  await fsp.mkdir(staging, { mode: 0o700 });
+  try {
+    await fsp.chmod(staging, 0o700);
+    for (const shard of SHARD_NAMES) {
+      const handle = await fsp.open(path.join(staging, `${shard}.json`), fsc.O_WRONLY | fsc.O_CREAT | fsc.O_EXCL | fsc.O_NOFOLLOW, 0o600);
+      try {
+        await handle.chmod(0o600);
+        await handle.writeFile(sealHead(init, shard, new Map()), "utf8");
+        await ops.syncFile(handle);
+      } finally { await handle.close(); }
+    }
+    const dirHandle = await fsp.open(staging, fsc.O_RDONLY | fsc.O_DIRECTORY | fsc.O_NOFOLLOW);
+    try { await ops.syncDir(dirHandle); } finally { await dirHandle.close(); }
+    await ops.rename(staging, path.join(init.dir, HEADS_DIR));
+  } catch (error) {
+    await fsp.rm(staging, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
+  }
+  const parent = await fsp.open(init.dir, fsc.O_RDONLY | fsc.O_DIRECTORY | fsc.O_NOFOLLOW);
+  try { await ops.syncDir(parent); } finally { await parent.close(); }
+}
+
+/** An existing heads/ must be a private directory holding every shard; none may be missing. */
+async function requireCompleteHeads(init: StoreIdentity): Promise<void> {
+  const names = await withDirGuard(path.join(init.dir, HEADS_DIR), init.uid, async (_handle, check) => {
+    const listed = await fsp.readdir(path.join(init.dir, HEADS_DIR));
+    await check();
+    return new Set(listed);
+  });
+  if (SHARD_NAMES.some((shard) => !names.has(`${shard}.json`))) throw new AuthorityRefusal("authority head missing");
 }
 
 // ---- store ----------------------------------------------------------------------------
@@ -466,19 +525,24 @@ export async function openAuthorityStore(tx: AuthorityTransaction, options: Auth
   }
   if (enrollment.layout !== AUTHORITY_LAYOUT) throw new AuthorityRefusal("unsupported authority layout");
   if (enrollment.dataDir !== ctx.dataDir) throw new AuthorityRefusal("authority enrolled under a different data root spelling");
-  // The head shards make slot freshness checkable. Create their directory only for an empty
-  // store: slots with no head directory cannot be told from a deleted one, so they refuse.
+  // The head shards make slot freshness checkable. Create them (all 256, atomically) only for
+  // an empty store: slots with no head directory cannot be told from a deleted one, so they
+  // refuse, and an existing heads/ with any shard missing refuses too.
   const headsDir = path.join(ctx.authorityDir, HEADS_DIR);
+  const identity: StoreIdentity = {
+    dir: ctx.authorityDir, uid: ctx.uid, key, storageId: enrollment.storageId, maxHeadBytes: options.maxHeadBytes ?? MAX_SLOT_BYTES,
+  };
   let headsExist = true;
   try { await fsp.lstat(headsDir); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; headsExist = false; }
-  if (!headsExist) {
+  if (headsExist) await requireCompleteHeads(identity);
+  else {
     let entries: string[] = [];
     try { entries = await fsp.readdir(slotsDir); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     if (entries.some((name) => SLOT_FILE.test(name))) throw new AuthorityRefusal("authority slots exist without a head");
+    await createHeads(ops, identity);
   }
-  await ensurePrivateDir(headsDir, ctx.authorityDir, ctx.uid, ops);
   return new AuthorityStore(storeBrand, {
     key, storageId: enrollment.storageId, ctxDir: ctx.authorityDir, dataDir: ctx.dataDir, uid: ctx.uid,
     incarnation: options.workerIncarnation ?? PROCESS_INCARNATION, ops,

@@ -1,16 +1,17 @@
 import assert from "node:assert/strict";
-import { randomBytes, randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { test, type TestContext } from "node:test";
 import {
-  acquireWorkerLifetime, type AuthorityTransaction, withAuthorityTransaction, type WorkerLifetime,
+  acquireWorkerLifetime, AuthorityRefusal, type AuthorityTransaction, withAuthorityTransaction, type WorkerLifetime,
 } from "../src/authority-lock.js";
 import {
   type AuthorityFsOps, type AuthorityStore, installWorkerLifetime, leaseEpoch, leaseSlotKey, openAuthorityStore,
   requireWorkerLifetime, type SlotPublication, SourceUseLease,
 } from "../src/completion-authority.js";
-import { makeTmp, testLockOptions } from "./authority-test-support.js";
+import { agentRoot, makeTmp, testLockOptions } from "./authority-test-support.js";
 
 const TOKEN = "unit-join-" + randomBytes(12).toString("hex");
 
@@ -404,11 +405,11 @@ test("the head tracks every slot write and survives its own crash window", async
   const key = await tx(f, (t2) => s.slotKey(t2, src));
   const headFile = shardFile(f, key);
   const head = (): Record<string, number> => (JSON.parse(fs.readFileSync(headFile, "utf8")) as { slots: Record<string, number> }).slots;
-  assert.equal(fs.existsSync(headFile), false, "a shard exists only once a slot in it was written");
+  assert.deepEqual(head(), {}, "every shard exists, empty, from enrollment on");
 
   flags.head = true;
   await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src)), /injected head failure/);
-  assert.equal(fs.existsSync(headFile), false, "slot renamed, head not yet updated");
+  assert.deepEqual(head(), {}, "slot renamed, head not yet updated");
   assert.equal(slotFiles(f).length, 1);
   flags.head = false;
 
@@ -439,7 +440,7 @@ test("a rolled-back or deleted head, or a deleted slot, refuses", async (t) => {
   await assert.rejects(tx(f, (t2) => s.readSlot(t2, key)), /authentication/);
 
   fs.rmSync(headFile);
-  await assert.rejects(tx(f, (t2) => s.readSlot(t2, key)), /ahead of the recorded head/);
+  await assert.rejects(tx(f, (t2) => s.readSlot(t2, key)), /authority head missing/);
 
   fs.rmSync(path.join(authorityDir(f), "heads"), { recursive: true });
   await assert.rejects(store(f), /without a head/);
@@ -715,4 +716,137 @@ test("source certificates are minted and checked under a live transaction with t
   await tx(f, async (t2) => { captured = t2; });
   assert.throws(() => s.certifySource(captured!, digest), /active authority transaction/);
   assert.throws(() => s.certifySource({} as AuthorityTransaction, digest), /active authority transaction/);
+});
+
+// ---- head shards: creation, deletion, restart rollback --------------------------------------
+
+/**
+ * Run authority setup in a separate node process, so the module-level high-water marks of this
+ * process never see it: the parent then behaves like a restarted worker. The child holds W only
+ * while it runs. Prints the slot key.
+ */
+function setupInChild(root: string, src: string, backupDir: string, mode: "admit" | "settle_failed"): string {
+  const code = `(async () => {
+    const [lockUrl, authUrl, supportUrl, root, token, src, backupDir, mode] = process.argv.slice(1);
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const lock = await import(lockUrl);
+    const auth = await import(authUrl);
+    const support = await import(supportUrl);
+    const w = await lock.acquireWorkerLifetime(root, support.testLockOptions());
+    const run = (fn) => lock.withAuthorityTransaction(w, { timeoutMs: 5000 }, fn);
+    const store = await run((t) => auth.openAuthorityStore(t, { workerToken: token }));
+    const key = await run((t) => store.slotKey(t, src));
+    const lease = await run((t) => store.admitSourceUse(t, src));
+    fs.copyFileSync(path.join(root, ".uzi-authority", "slots", key + ".json"), path.join(backupDir, "slot.json"));
+    if (mode === "settle_failed") {
+      const op = await run((t) => store.beginPending(t, lease, { kind: "destructive", footprint: "rm -r build" }));
+      await run((t) => store.settlePending(t, lease, op, { ok: false, residue: ["a"] }));
+    }
+    process.stdout.write(key + "\\n");
+  })().catch((error) => { process.stderr.write(String(error && error.stack || error) + "\\n"); process.exit(1); });`;
+  const result = spawnSync(process.execPath, [
+    "--import", "tsx", "-e", code,
+    new URL("../src/authority-lock.ts", import.meta.url).href, new URL("../src/completion-authority.ts", import.meta.url).href,
+    new URL("./authority-test-support.ts", import.meta.url).href, root, TOKEN, src, backupDir, mode,
+  ], { cwd: agentRoot, encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  return result.stdout.trim();
+}
+
+async function restarted(root: string): Promise<Fixture> {
+  return { root, lifetime: await acquireWorkerLifetime(root, testLockOptions()), token: TOKEN };
+}
+
+test("a deleted head shard cannot roll a key back across a restart (restore of the crash-window slot)", async (t) => {
+  const root = makeTmp(t);
+  const backup = makeTmp(t, "authority-backup-");
+  const src = path.join(root, "runner", "repo-a");
+  fs.mkdirSync(src, { recursive: true });
+  const key = setupInChild(root, src, backup, "settle_failed");
+  const f = await restarted(root);
+  fs.rmSync(shardFile(f, key));
+  fs.copyFileSync(path.join(backup, "slot.json"), path.join(slotsDir(f), `${key}.json`));
+  fs.chmodSync(path.join(slotsDir(f), `${key}.json`), 0o600);
+  await assert.rejects(async () => {
+    const s = await store(f);
+    return tx(f, (t2) => s.readSlot(t2, key));
+  }, /authority head missing/);
+});
+
+test("a deleted head shard and slot cannot make an admitted key read as never admitted across a restart", async (t) => {
+  const root = makeTmp(t);
+  const backup = makeTmp(t, "authority-backup-");
+  const src = path.join(root, "runner", "repo-a");
+  fs.mkdirSync(src, { recursive: true });
+  const key = setupInChild(root, src, backup, "admit");
+  const f = await restarted(root);
+  fs.rmSync(shardFile(f, key));
+  fs.rmSync(path.join(slotsDir(f), `${key}.json`));
+  await assert.rejects(async () => {
+    const s = await store(f);
+    return tx(f, (t2) => s.admitSourceUse(t2, src));
+  }, /authority head missing/);
+});
+
+test("a fresh store gets all 256 empty shards at once, and a failed creation leaves no heads or staging directory", async (t) => {
+  const f = await fixture(t);
+  const headsPath = path.join(authorityDir(f), "heads");
+  let fail = true;
+  const ops: AuthorityFsOps = {
+    syncFile: (h) => h.sync(), syncDir: (h) => h.sync(),
+    rename: async (a, b) => {
+      if (fail && path.basename(b) === "heads") throw new Error("injected heads rename failure");
+      fs.renameSync(a, b);
+    },
+  };
+  await assert.rejects(store(f, { ops }), /injected heads rename failure/);
+  assert.equal(fs.existsSync(headsPath), false);
+  assert.deepEqual(fs.readdirSync(authorityDir(f)).filter((name) => name.includes("heads")), []);
+  fail = false;
+  await store(f, { ops });
+  const names = fs.readdirSync(headsPath).sort();
+  assert.equal(names.length, 256);
+  assert.deepEqual(names, Array.from({ length: 256 }, (_, i) => `${i.toString(16).padStart(2, "0")}.json`));
+  assert.equal(fs.statSync(headsPath).mode & 0o7777, 0o700);
+  assert.ok(names.every((name) => (fs.statSync(path.join(headsPath, name)).mode & 0o7777) === 0o600));
+});
+
+test("an existing heads directory with any shard missing refuses at open", async (t) => {
+  const f = await fixture(t);
+  await store(f);
+  fs.rmSync(path.join(authorityDir(f), "heads", "7f.json"));
+  await assert.rejects(store(f), /authority head missing/);
+});
+
+test("heads swapped for a symlink refuses with an authority refusal, not a raw error", async (t) => {
+  const f = await fixture(t);
+  const s = await store(f);
+  const src = source(f);
+  const key = await tx(f, (t2) => s.slotKey(t2, src));
+  await tx(f, (t2) => s.admitSourceUse(t2, src));
+  const headsPath = path.join(authorityDir(f), "heads");
+  fs.renameSync(headsPath, `${headsPath}.real`);
+  fs.symlinkSync(`${headsPath}.real`, headsPath);
+  const refusal = await tx(f, (t2) => s.readSlot(t2, key)).then(() => undefined, (error: unknown) => error);
+  assert.ok(refusal instanceof AuthorityRefusal, String(refusal));
+  assert.match((refusal as Error).message, /unsafe authority directory/);
+  const reopened = await store(f).then(() => undefined, (error: unknown) => error);
+  assert.ok(reopened instanceof AuthorityRefusal, String(reopened));
+});
+
+test("a MAC-valid head shard holding a key of another shard is refused", async (t) => {
+  const f = await fixture(t);
+  await store(f);
+  const enrolled = JSON.parse(fs.readFileSync(enrollmentFile(f), "utf8")) as { storageId: string };
+  // Forge with the join token's derived key: the only way to reach the prefix check past the MAC.
+  const macKey = createHmac("sha256", TOKEN).update("uzi completion authority v1").digest();
+  const shard = "ab";
+  const body = {
+    version: "uzi-authority-head/2", storageId: enrolled.storageId, shard, slots: { ["cd" + "1".repeat(62)]: 1 },
+  };
+  const mac = createHmac("sha256", macKey).update(`uzi-authority-record\0head\0${JSON.stringify(body)}`).digest("hex");
+  fs.writeFileSync(path.join(authorityDir(f), "heads", `${shard}.json`), JSON.stringify({ ...body, mac }) + "\n", { mode: 0o600 });
+  const s = await store(f);
+  await assert.rejects(tx(f, (t2) => s.readSlot(t2, shard + "2".repeat(62))), /malformed authority record/);
 });

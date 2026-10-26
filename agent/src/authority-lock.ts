@@ -174,28 +174,45 @@ async function verifyLockFile(ctx: Context, handle: fsp.FileHandle, file: string
 
 async function openLockFile(ctx: Context, name: string): Promise<{ handle: fsp.FileHandle; file: string }> {
   await ensureAuthorityDir(ctx);
-  const file = path.join(ctx.authorityDir, name);
-  const base = fsc.O_RDWR | fsc.O_NOFOLLOW | fsc.O_NONBLOCK;
-  let handle: fsp.FileHandle;
-  let created = false;
+  // Create and open the lock through a held, verified directory descriptor, not by path: a
+  // directory swapped in after the lstat above must not receive the lock file.
+  const dirHandle = await fsp.open(ctx.authorityDir, fsc.O_RDONLY | fsc.O_DIRECTORY | fsc.O_NOFOLLOW);
   try {
-    handle = await fsp.open(file, base | fsc.O_CREAT | fsc.O_EXCL, 0o600);
-    created = true;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    handle = await fsp.open(file, base);
-  }
-  try {
-    if (created) {
-      await handle.chmod(0o600);
-      await handle.sync();
-      await syncDirectory(ctx.authorityDir);
+    const held = await dirHandle.stat({ bigint: true });
+    if (!held.isDirectory() || held.uid !== BigInt(ctx.uid) || (held.mode & 0o7777n) !== 0o700n) {
+      throw new AuthorityRefusal("unsafe authority directory");
     }
-    await verifyLockFile(ctx, handle, file);
-    return { handle, file };
-  } catch (error) {
-    await handle.close().catch(() => undefined);
-    throw error;
+    const file = path.join(ctx.authorityDir, name);
+    const viaDir = path.join(`/proc/self/fd/${dirHandle.fd}`, name);
+    const base = fsc.O_RDWR | fsc.O_NOFOLLOW | fsc.O_NONBLOCK;
+    let handle: fsp.FileHandle;
+    let created = false;
+    try {
+      handle = await fsp.open(viaDir, base | fsc.O_CREAT | fsc.O_EXCL, 0o600);
+      created = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      handle = await fsp.open(viaDir, base);
+    }
+    try {
+      if (created) {
+        await handle.chmod(0o600);
+        await handle.sync();
+        await dirHandle.sync();
+      }
+      // Re-verify that the name still resolves to the directory the lock was created in.
+      const named = await fsp.lstat(ctx.authorityDir, { bigint: true });
+      if (!named.isDirectory() || named.dev !== held.dev || named.ino !== held.ino) {
+        throw new AuthorityRefusal("authority directory identity changed");
+      }
+      await verifyLockFile(ctx, handle, file);
+      return { handle, file };
+    } catch (error) {
+      await handle.close().catch(() => undefined);
+      throw error;
+    }
+  } finally {
+    await dirHandle.close();
   }
 }
 

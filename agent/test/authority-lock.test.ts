@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import fs from "node:fs";
+import fs, { constants as fsConstants } from "node:fs";
 import fsp from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
-import { test } from "node:test";
+import { mock, test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import {
   acquireWorkerLifetime, AuthorityTransaction, WorkerLifetime, withAuthorityTransaction,
@@ -335,4 +336,27 @@ test("A: another process holding the authority lock blocks until a finite deadli
   const blocked = withAuthorityTransaction(lifetime, { timeoutMs: 10_000 }, async () => "got it");
   external.stdin.end("go\n");
   assert.equal(await blocked, "got it");
+});
+
+test("A: a lock file is created inside the verified directory handle, and a swapped directory is refused", async (t) => {
+  const { root, lifetime } = await lifetimeFor(t);
+  const dir = authorityDir(root);
+  let swapped = false;
+  const realOpen = fsp.open;
+  // Swap the directory name right after the lock code opens its handle on the directory.
+  const patched = mock.method(fsp, "open", async (...args: Parameters<typeof fsp.open>) => {
+    const handle = await realOpen(...args);
+    const flags = typeof args[1] === "number" ? args[1] : 0;
+    if (args[0] === dir && (flags & fsConstants.O_DIRECTORY) !== 0 && !swapped) {
+      swapped = true;
+      fs.renameSync(dir, `${dir}.old`);
+      fs.mkdirSync(dir, { mode: 0o700 });
+    }
+    return handle;
+  });
+  syncBuiltinESMExports();
+  t.after(() => { patched.mock.restore(); syncBuiltinESMExports(); });
+  await assert.rejects(withAuthorityTransaction(lifetime, { timeoutMs: 2000 }, async () => "no"), /identity changed/);
+  assert.equal(swapped, true);
+  assert.deepEqual(fs.readdirSync(dir), [], "the lock file was not created in the swapped-in directory");
 });
