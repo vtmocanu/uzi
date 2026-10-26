@@ -41,6 +41,20 @@ func ReadInstanceIntakePause(ctx context.Context, q *Queries) (IntakePauseState,
 	return IntakePauseState{InstanceIntakePause: row}, nil
 }
 
+// MaintenanceNoticeText is the one wording of the "queued by maintenance" notice shown to
+// whoever just created a run (web, CLI, chat, Slack; PRD #3454). It is empty while the pause
+// is inactive. The reason is already sanitized at write time (IntakePauseReasonText).
+func MaintenanceNoticeText(st IntakePauseState) string {
+	if !st.Active {
+		return ""
+	}
+	t := "uzi is in maintenance mode: this run is queued and will start when maintenance ends."
+	if st.Reason.Valid && st.Reason.String != "" {
+		t += " Reason: " + st.Reason.String
+	}
+	return t
+}
+
 // SetInstanceIntakePause applies a transition under the singleton's row lock. q MUST be
 // bound to the caller's open transaction (store.New(tx)), never the pool: the row change
 // and its audit event are two statements that only commit or roll back together inside

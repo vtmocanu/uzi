@@ -2097,6 +2097,8 @@ export type RunNowResponse = {
   ineligible_matched?: number | null;
   started: LastFireStarted[];
   skips: LastFireSkip[];
+  // PRD #3454: set when the fire started runs while uzi is in maintenance mode.
+  notice?: string | null;
 };
 
 export interface CIEpisodeDTO {

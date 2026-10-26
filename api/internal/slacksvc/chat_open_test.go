@@ -214,3 +214,64 @@ func TestChatThreadReplyTurnCapReached(t *testing.T) {
 		t.Fatalf("want one cap notice in the conversation thread, got %+v", fp.posts)
 	}
 }
+
+const testMaintenanceNotice = "uzi is in maintenance mode: this run is queued and will start when maintenance ends. Reason: node drain"
+
+// PRD #3454: a chat opened while maintenance is active gets the notice as a thread reply, and
+// is still created and anchored; with maintenance off there is no extra post.
+func TestOpenChatPostsMaintenanceNotice(t *testing.T) {
+	for _, tc := range []struct {
+		name, notice string
+		wantPosts    int
+	}{{"paused", testMaintenanceNotice, 1}, {"not paused", "", 0}} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := &fakeReplierStore{user: store.User{ID: uuid.New()}}
+			sub := &fakeSubmitter{createdChat: store.Run{ID: uuid.New(), Kind: runkind.Chat}, maintenance: tc.notice}
+			fp := &fakePoster{}
+			NewReplier(fs, sub, fp, nil).HandleMessage(context.Background(), topLevelDM("hello"))
+
+			if len(sub.createdChats) != 1 || len(fs.chatAnchors) != 1 {
+				t.Fatalf("chat must still be created and anchored: created=%d anchors=%d", len(sub.createdChats), len(fs.chatAnchors))
+			}
+			if len(fp.posts) != tc.wantPosts {
+				t.Fatalf("thread replies = %+v, want %d", fp.posts, tc.wantPosts)
+			}
+			if tc.wantPosts == 1 {
+				if fp.posts[0].thread != "open1" || !strings.Contains(fp.posts[0].text, testMaintenanceNotice) {
+					t.Errorf("notice reply = %+v, want it threaded on the opening message", fp.posts[0])
+				}
+			}
+		})
+	}
+}
+
+// PRD #3454: the busy refusal says maintenance is why only for a queued, never-admitted chat
+// while the pause is active; every other combination keeps the generic pointer.
+func TestOpenChatBusyNamesMaintenance(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		live    store.Run
+		notice  string
+		wantTxt string
+	}{
+		{"queued never admitted, paused", store.Run{Kind: runkind.Chat, Status: "queued"}, testMaintenanceNotice, chatBusyMaintenanceText},
+		{"queued never admitted, not paused", store.Run{Kind: runkind.Chat, Status: "queued"}, "", chatBusyText},
+		{"queued but admitted before, paused", store.Run{Kind: runkind.Chat, Status: "queued", ClaimGeneration: 1}, testMaintenanceNotice, chatBusyText},
+		{"running, paused", store.Run{Kind: runkind.Chat, Status: "running", ClaimGeneration: 1}, testMaintenanceNotice, chatBusyText},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.live.ID = uuid.New()
+			fs := &fakeReplierStore{user: store.User{ID: uuid.New()}}
+			sub := &fakeSubmitter{liveChat: tc.live, liveChatOK: true, maintenance: tc.notice}
+			fp := &fakePoster{}
+			NewReplier(fs, sub, fp, nil).HandleMessage(context.Background(), topLevelDM("another"))
+
+			if len(sub.createdChats) != 0 {
+				t.Errorf("must not mint a second chat, got %d", len(sub.createdChats))
+			}
+			if len(fp.posts) != 1 || fp.posts[0].text != tc.wantTxt {
+				t.Fatalf("refusal = %+v, want %q", fp.posts, tc.wantTxt)
+			}
+		})
+	}
+}

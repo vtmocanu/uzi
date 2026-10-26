@@ -310,7 +310,7 @@ func (f *FakeClient) AcceptCompletionDecision(_ context.Context, id string, crit
 	return f.DecideRun, nil
 }
 
-func (f *FakeClient) CreateRun(_ context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, credOverride *CreateRunCredentialOverride, harness string) (apitypes.RunDTO, error) {
+func (f *FakeClient) CreateRun(_ context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, credOverride *CreateRunCredentialOverride, harness string) (CreatedRunResult, error) {
 	f.LastCreateRepoID = repoID
 	f.LastCreateIssueIID = issueIID
 	f.LastCreateWaitOnLimit = waitOnLimit
@@ -320,9 +320,9 @@ func (f *FakeClient) CreateRun(_ context.Context, repoID string, issueIID int64,
 	f.LastCreateCredOverride = credOverride
 	f.LastCreateHarness = harness
 	if f.Err != nil {
-		return apitypes.RunDTO{}, f.Err
+		return CreatedRunResult{}, f.Err
 	}
-	return f.CreatedRun, nil
+	return CreatedRunResult{RunDTO: f.CreatedRun, Notice: f.CreatedNotice}, nil
 }
 
 // CreateTaskRun records the handoff-create args and returns CreatedTaskRun. It
@@ -330,7 +330,7 @@ func (f *FakeClient) CreateRun(_ context.Context, repoID string, issueIID int64,
 // refusal still proves the write was reached; CreateTaskRunErr wins over Err so a
 // 422 can be modelled on this verb alone. It appends "create" to TaskCalls so the
 // create → push → dispatch ordering is observable.
-func (f *FakeClient) CreateTaskRun(_ context.Context, repoID, taskContext, baseBranch string, openMR, reviewRequested, thenFixRequested, interactive bool, continuedIssueIID *int64) (apitypes.RunDTO, error) {
+func (f *FakeClient) CreateTaskRun(_ context.Context, repoID, taskContext, baseBranch string, openMR, reviewRequested, thenFixRequested, interactive bool, continuedIssueIID *int64) (CreatedRunResult, error) {
 	f.LastCreateTaskContinuedIssueIID = continuedIssueIID
 	f.LastCreateTaskRepoID = repoID
 	f.LastCreateTaskContext = taskContext
@@ -341,12 +341,12 @@ func (f *FakeClient) CreateTaskRun(_ context.Context, repoID, taskContext, baseB
 	f.LastCreateTaskThenFix = thenFixRequested
 	f.TaskCalls = append(f.TaskCalls, "create")
 	if f.CreateTaskRunErr != nil {
-		return apitypes.RunDTO{}, f.CreateTaskRunErr
+		return CreatedRunResult{}, f.CreateTaskRunErr
 	}
 	if f.Err != nil {
-		return apitypes.RunDTO{}, f.Err
+		return CreatedRunResult{}, f.Err
 	}
-	return f.CreatedTaskRun, nil
+	return CreatedRunResult{RunDTO: f.CreatedTaskRun, Notice: f.CreatedNotice}, nil
 }
 
 // GetTaskReview returns the canned TaskReview (nil ⇒ "no review yet"). GetTaskReviewErr

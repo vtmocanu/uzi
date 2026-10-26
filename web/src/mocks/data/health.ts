@@ -28,7 +28,7 @@ const CHECK_META: { id: string; scope: string; group: string; title: string; doc
   { id: "forge.sync", scope: "owner", group: "integrations", title: "Forge issue sync", doc: null },
   { id: "slack.socket", scope: "owner", group: "integrations", title: "Slack socket", doc: null },
   { id: "schedules.paused", scope: "owner", group: "housekeeping", title: "Paused schedules", doc: null },
-  { id: "maintenance.active", scope: "instance", group: "housekeeping", title: "Maintenance mode", doc: null },
+  { id: "maintenance.active", scope: "instance", group: "housekeeping", title: "Maintenance mode", doc: "instance-maintenance" },
   { id: "board.drift", scope: "owner", group: "housekeeping", title: "Board drift", doc: null },
   { id: "custody.holds", scope: "owner", group: "housekeeping", title: "Recovery custody holds", doc: null },
   { id: "recovery.storage", scope: "owner", group: "housekeeping", title: "Recovery storage", doc: null },

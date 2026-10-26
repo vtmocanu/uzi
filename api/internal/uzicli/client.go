@@ -268,6 +268,9 @@ type Client interface {
 	// AdminBlockedRepos reads the admin cross-user blocked-repos list from the
 	// stored privilege report (PRD #66 M9): GET /api/admin/blocked-repos.
 	AdminBlockedRepos(ctx context.Context) (apitypes.AdminBlockedReposDTO, error)
+	// AdminMaintenance reads the instance maintenance state and drain readout (PRD #3454):
+	// GET /api/admin/maintenance. READ-ONLY - the PUT is cookie + CSRF only and stays in the web UI.
+	AdminMaintenance(ctx context.Context) (apitypes.MaintenanceAdminDTO, error)
 	// AdminSettings reads the instance settings map and per-key sources (issue #2347):
 	// GET /api/admin/settings. READ-ONLY — writes are cookie-only and stay in the web UI.
 	AdminSettings(ctx context.Context) (AdminSettingsView, error)
@@ -338,7 +341,7 @@ type Client interface {
 	// sends no meaningful selection (byte-identical to a pre-#1429 create; the server
 	// resolves the effective harness itself, D11), "claude"/"codex" (validated CLIENT-SIDE
 	// before this call) rides as an explicit pin.
-	CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, credOverride *CreateRunCredentialOverride, harness string) (apitypes.RunDTO, error)
+	CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, credOverride *CreateRunCredentialOverride, harness string) (CreatedRunResult, error)
 	// CreateTaskRun queues a handoff/task run on a repo (PRD #400 M3). A nil
 	// continuedIssueIID omits the optional existing-issue link:
 	// POST /api/repos/{id}/task-runs {context, base_branch?, open_mr}. The server
@@ -354,7 +357,7 @@ type Client interface {
 	// findings to the same branch (--then-fix implies --review); interactive
 	// (--interactive) asks the worker to keep the run alive after signal_done (parking in
 	// awaiting_followup to iterate) rather than terminating.
-	CreateTaskRun(ctx context.Context, repoID, context, baseBranch string, openMR, reviewRequested, thenFixRequested, interactive bool, continuedIssueIID *int64) (apitypes.RunDTO, error)
+	CreateTaskRun(ctx context.Context, repoID, context, baseBranch string, openMR, reviewRequested, thenFixRequested, interactive bool, continuedIssueIID *int64) (CreatedRunResult, error)
 	// GetTaskReview fetches a handoff task's diff-review (PRD #400 M4a): GET
 	// /api/runs/{id}/task-review, whose envelope is {"task_review": <dto>|null}. A visible
 	// task with no review yet returns a nil DTO (the CLI prints "no review available yet");

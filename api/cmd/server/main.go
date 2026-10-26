@@ -420,13 +420,13 @@ func run() error {
 	// Reject-without-reason buttons. It rides workersvc's ownership-checked
 	// SubmitInput (via the gateSubmitter adapter, which keeps slacksvc free of a
 	// workersvc import) and reads run status itself for stale-click handling.
-	slackGate := slacksvc.NewGatekeeper(q, gateSubmitter{wsvc}, slackPoster, slog.Default())
+	slackGate := slacksvc.NewGatekeeper(q, gateSubmitter{wsvc, q}, slackPoster, slog.Default())
 
 	// Reply-from-Slack handler (PRD #25 M5): inbound message.im thread replies →
 	// reasoned reject during a reject-pending gate, follow_up on a live run, a nudge
 	// during an open gate, or a coalesced ephemeral otherwise. Same ownership-checked
 	// submitter as the gatekeeper.
-	slackReplier := slacksvc.NewReplier(q, gateSubmitter{wsvc}, slackPoster, slog.Default())
+	slackReplier := slacksvc.NewReplier(q, gateSubmitter{wsvc, q}, slackPoster, slog.Default())
 
 	// Per-user chat budget (PRD #39): a spend guard on chat create + message posts.
 	// Created here (ahead of the other route limiters) because the Slack chat opener
@@ -443,7 +443,7 @@ func run() error {
 	// Dismiss on an issue-proposal card — routed as a THIRD InboundMux member beside the
 	// linker and the gatekeeper. The forge write rides the same claim-first
 	// ConfirmProposalForUser the web confirm uses (lifted in M1).
-	slackChatActions := slacksvc.NewChatActions(q, gateSubmitter{wsvc}, slackPoster, settingsCache.PublicBaseURL, slog.Default())
+	slackChatActions := slacksvc.NewChatActions(q, gateSubmitter{wsvc, q}, slackPoster, settingsCache.PublicBaseURL, slog.Default())
 	// The Continue button mints a run and spends the owner's token, so it draws from the
 	// SAME shared per-user chat budget the opener uses (PRD #191 M6) — same key, one pool.
 	slackChatActions.SetChatSpendGuard(func(userID uuid.UUID) bool {
@@ -1125,10 +1125,13 @@ func run() error {
 	// debounced claimed fan-out is M6). Wired beside the custody-episode reconciler above: a
 	// standalone reconciler with a boot pass then a one-minute ticker.
 	healthSvc := healthsvc.New(healthsvc.Config{
-		WorkerEligibilityForHealth:   wsvc.WorkerEligibilityForHealth,
-		ResidueQuarantine:            wsvc.ResidueQuarantineFor,
-		MemoryAuthorityLost:          wsvc.MemoryAuthorityLostFor,
-		Store:                        q,
+		WorkerEligibilityForHealth: wsvc.WorkerEligibilityForHealth,
+		ResidueQuarantine:          wsvc.ResidueQuarantineFor,
+		MemoryAuthorityLost:        wsvc.MemoryAuthorityLostFor,
+		Store:                      q,
+		MaintenanceReadout: func(ctx context.Context) (store.MaintenanceReadout, error) {
+			return store.ReadMaintenanceReadout(ctx, pool)
+		},
 		Pool:                         pool,
 		DiskFull:                     diskFull,
 		DBStorageCapacityBytes:       cfg.DBStorageCapacityBytes,
@@ -1646,7 +1649,10 @@ func run() error {
 // slice the Slack approval gatekeeper needs (read a run, submit an approve/reject
 // input). It drops SubmitInput's result (the gatekeeper only cares whether it
 // succeeded) and keeps slacksvc free of a workersvc import.
-type gateSubmitter struct{ svc *workersvc.Service }
+type gateSubmitter struct {
+	svc *workersvc.Service
+	q   *store.Queries
+}
 
 func (g gateSubmitter) GetRun(ctx context.Context, userID, runID uuid.UUID) (store.Run, error) {
 	return g.svc.GetRun(ctx, userID, runID)
@@ -1765,6 +1771,16 @@ func (g gateSubmitter) CreateChatRun(ctx context.Context, userID uuid.UUID, mess
 // HasOnlineWorker adapts the opener's no-worker check (PRD #191 M6).
 func (g gateSubmitter) HasOnlineWorker(ctx context.Context, userID uuid.UUID) (bool, error) {
 	return g.svc.HasOnlineWorker(ctx, userID)
+}
+
+// MaintenanceNotice adapts the create-time maintenance notice (PRD #3454).
+func (g gateSubmitter) MaintenanceNotice(ctx context.Context) string {
+	st, err := store.ReadInstanceIntakePause(ctx, g.q)
+	if err != nil {
+		slog.Warn("read intake pause for create notice", "error", err)
+		return ""
+	}
+	return store.MaintenanceNoticeText(st)
 }
 
 // EndChat adapts the Slack End-chat button (PRD #191 M6): cancel the live chat, with

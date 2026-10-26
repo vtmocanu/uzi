@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"time"
@@ -103,6 +104,30 @@ func (h *Handler) GetMaintenance(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, apitypes.MaintenanceStateDTO{
 		Active: st.Active, Since: pgTimeStr(st.Since), Reason: pgTextStr(st.Reason),
 	})
+}
+
+// maintenanceNotice returns the notice for a run just created, or "" when maintenance is off.
+// It reads the pause row uncached after the create committed. A read error is logged and
+// yields no notice: the run was created and the notice is advisory.
+func (h *Handler) maintenanceNotice(ctx context.Context) string {
+	if h.q == nil { // handlers wired without a store (unit tests) have no pause to report
+		return ""
+	}
+	st, err := store.ReadInstanceIntakePause(ctx, h.q)
+	if err != nil {
+		slog.Warn("read intake pause for create notice", "error", err)
+		return ""
+	}
+	return store.MaintenanceNoticeText(st)
+}
+
+// createdRunBody is the {"run": dto} create response, plus "notice" while maintenance is on.
+func (h *Handler) createdRunBody(ctx context.Context, run any) map[string]any {
+	body := map[string]any{"run": run}
+	if n := h.maintenanceNotice(ctx); n != "" {
+		body["notice"] = n
+	}
+	return body
 }
 
 // AdminGetMaintenance serves GET /api/admin/maintenance (RequireUser + RequireAdminRO).

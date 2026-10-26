@@ -159,6 +159,11 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO, origin ...string) err
 	if r.HealthReason != nil && *r.HealthReason != "" {
 		rows = append(rows, []string{"HEALTH_REASON", sanitizeTTY(*r.HealthReason)})
 	}
+	// QUEUE_REASON (PRD #3454): why a queued run has not started, derived server-side at read
+	// time. Emit-only-when-set; "maintenance" is spelled out, anything else is shown sanitized.
+	if r.QueueReason != nil && *r.QueueReason != "" {
+		rows = append(rows, []string{"QUEUE_REASON", queueReasonCell(*r.QueueReason)})
+	}
 	if r.FailureReason != nil && *r.FailureReason != "" {
 		rows = append(rows, []string{"FAILURE_REASON", sanitizeTTY(*r.FailureReason)})
 	}
@@ -2589,4 +2594,13 @@ func pauseOriginLabel(r apitypes.RunDTO, personal bool, origin ...string) string
 		value = origin[0]
 	}
 	return runpresentation.PauseLabel(value, personal)
+}
+
+// queueReasonCell renders a run's queue_reason. The only reason today is "maintenance", which
+// is spelled out; an unknown future value still renders, sanitized.
+func queueReasonCell(reason string) string {
+	if reason == "maintenance" {
+		return "maintenance (uzi is in maintenance mode)"
+	}
+	return sanitizeTTY(reason)
 }

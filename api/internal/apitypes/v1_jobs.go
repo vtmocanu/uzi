@@ -56,6 +56,10 @@ type V1JobDTO struct {
 	// QueueReason is "maintenance" while instance maintenance mode holds this queued job back
 	// (PRD #3454); absent otherwise. Status stays "queued".
 	QueueReason *string `json:"queue_reason,omitempty"`
+	// Notice is create-only (POST /api/v1/jobs): a human-readable line, present while instance
+	// maintenance mode is active, saying the job is queued and starts when maintenance ends.
+	// Absent on GET and list responses and when maintenance is off.
+	Notice *string `json:"notice,omitempty"`
 }
 
 // V1JobListDTO is one page of GET /api/v1/jobs, newest first. NextCursor is null on the

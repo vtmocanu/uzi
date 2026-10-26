@@ -813,6 +813,14 @@ components:
             its wall-clock limit counts from that claim, not from queueing (and not necessarily
             from the moment maintenance ends). Absent or null otherwise.
             status stays queued.
+        notice:
+          type:
+            - string
+            - "null"
+          description: >-
+            Optional, create-only (POST /api/v1/jobs). A human-readable line present while the
+            instance is in maintenance mode, saying the job is queued and starts when
+            maintenance ends. Absent on GET and list responses and when maintenance is off.
     JobList:
       type: object
       required:

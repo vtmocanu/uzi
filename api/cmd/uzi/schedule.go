@@ -691,6 +691,9 @@ func newScheduleRunNowCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if res.Notice != nil {
+				printNotice(env, *res.Notice)
+			}
 			p := env.printer(gf)
 			if p.Format == uzicli.FormatJSON {
 				return p.JSON(res)
