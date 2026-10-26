@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Docker-free orchestration tests; fake commands never execute probe payloads."""
+import errno
 import json
 import os
 from pathlib import Path
@@ -237,7 +238,13 @@ class ProofTest(unittest.TestCase):
         for suffix in ("\nEXIT=0\n\x1b[31m", "\x85", "\u202e", "\u2066", "\u2028", "\u2029",
                        os.fsdecode(b"\xff")):
             unsafe = self.root / ("unsafe" + suffix)
-            unsafe.mkdir()
+            try:
+                unsafe.mkdir()
+            except OSError as error:
+                # APFS rejects invalid UTF-8 names, so no such checkout can exist on that host.
+                if error.errno != errno.EILSEQ:
+                    raise
+                continue
             lexical = unsafe / "proof.sh"
             lexical.symlink_to(self.script)
             physical = unsafe / "e2e/worker-uid"
