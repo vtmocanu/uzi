@@ -122,14 +122,24 @@ func TestVaultMaterialQueriesLiveDB(t *testing.T) {
 		t.Fatal("account reseal changed non-crypto metadata")
 	}
 	var secretMarker, liveMarker, recoveryMarker string
-	if err := pool.QueryRow(ctx, "SELECT sealed_with FROM user_secrets WHERE id=$1", secrets[0].ID).Scan(&secretMarker); err != nil {
+	var savedPersonal, savedLive, savedRecovery []byte
+	if err := pool.QueryRow(ctx, "SELECT sealed_with,ciphertext FROM user_secrets WHERE id=$1", secrets[0].ID).Scan(&secretMarker, &savedPersonal); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.QueryRow(ctx, "SELECT sealed_with,recovery_sealed_with FROM codex_provider_account WHERE id=$1", accounts[0].ID).Scan(&liveMarker, &recoveryMarker); err != nil {
+	if err := pool.QueryRow(ctx, "SELECT sealed_with,recovery_sealed_with,sealed_login,recovery_sealed FROM codex_provider_account WHERE id=$1", accounts[0].ID).Scan(&liveMarker, &recoveryMarker, &savedLive, &savedRecovery); err != nil {
 		t.Fatal(err)
 	}
 	if secretMarker != SealedWithMasterAAD || liveMarker != SealedWithMasterAAD || recoveryMarker != SealedWithMasterAAD {
 		t.Fatal("crypto discriminators were not updated together")
+	}
+	if !bytes.Equal(savedPersonal, secretWrite.Ciphertext) {
+		t.Fatal("secret ciphertext was not replaced")
+	}
+	if !bytes.Equal(savedLive, accountWrite.SealedLogin) {
+		t.Fatal("live account ciphertext was not replaced")
+	}
+	if !bytes.Equal(savedRecovery, accountWrite.RecoverySealed) {
+		t.Fatal("recovery account ciphertext was not replaced")
 	}
 	// The foreign positive control also covers an account with no recovery slot.
 	ftx, err := pool.Begin(ctx)
@@ -158,8 +168,11 @@ func TestVaultMaterialQueriesLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	var recoveryStillEmpty bool
-	if err := pool.QueryRow(ctx, "SELECT recovery_sealed IS NULL AND recovery_sealed_with IS NULL FROM codex_provider_account WHERE id=$1", frows[0].ID).Scan(&recoveryStillEmpty); err != nil || !recoveryStillEmpty {
+	if err := pool.QueryRow(ctx, "SELECT recovery_sealed IS NULL AND recovery_sealed_with IS NULL,sealed_login FROM codex_provider_account WHERE id=$1", frows[0].ID).Scan(&recoveryStillEmpty, &savedLive); err != nil || !recoveryStillEmpty {
 		t.Fatalf("empty recovery pair changed: empty=%v error=%v", recoveryStillEmpty, err)
+	}
+	if string(savedLive) != "new-live" {
+		t.Fatal("empty-slot account ciphertext was not replaced")
 	}
 }
 
