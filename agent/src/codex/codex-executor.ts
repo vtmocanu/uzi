@@ -4003,6 +4003,8 @@ export class CodexExecutor implements Executor {
       // turn's milestones_completed reaches the ExecutorResult after the loop breaks.
       let declaredMilestonesCompleted: string[] | undefined;
       let declaredReportOnly = false;
+      let declaredSummary: string | undefined;
+      let declaredProposal: ReducedTurnResult["proposal"];
       // PRD #1798 M2 (D4, D13 parity with sdk-executor): the latched signal_done pr_summary,
       // stamped with the worktree HEAD on the done turn that declared it.
       let declaredPrSummary: PrSummaryClaim | undefined;
@@ -4040,6 +4042,8 @@ export class CodexExecutor implements Executor {
         ...(pausedAt ? { pausedAt } : {}),
         ...(isIssueRun && scopeCapped ? { scopeCapped } : {}),
         ...(isIssueRun && declaredReportOnly ? { reportOnly: true } : {}),
+        ...((isIssueRun || resolveRunKind(ctx.kind) === "prompt") && declaredSummary !== undefined ? { summary: declaredSummary } : {}),
+        ...(declaredProposal !== undefined ? { proposal: declaredProposal } : {}),
         // Issue #1674 (PRD #265 M1 parity): forward the declared finished-milestone ids on issue
         // runs only, OMITTED when nothing was declared, as sdk-executor does; runner.ts reads it.
         ...(isIssueRun && declaredMilestonesCompleted !== undefined ? { milestonesCompleted: declaredMilestonesCompleted } : {}),
@@ -4278,6 +4282,13 @@ export class CodexExecutor implements Executor {
           if (!hasQuestions && result.milestonesCompleted !== undefined) {
             declaredMilestonesCompleted = result.milestonesCompleted;
             for (const id of result.milestonesCompleted) seenCompletedIds.add(id);
+          }
+          // Keep the latest declaration across later turns that omit it.
+          if (!hasQuestions && result.summary !== undefined) {
+            declaredSummary = result.summary;
+          }
+          if (!hasQuestions && result.proposal !== undefined) {
+            declaredProposal = result.proposal;
           }
           // PRD #1798 M2: last-wins, and stamped with the worktree HEAD only on the turn that
           // carried the claims, so a later bare signal_done keeps the earlier claims with the sha

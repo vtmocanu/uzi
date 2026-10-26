@@ -831,7 +831,7 @@ export interface ExecutorResult {
    *  runner completes it with NO push/MR. Issue runs only. Absent ⇒ normal push+MR path. */
   reportOnly?: boolean;
   /** issue #279: the one-line/short findings summary from signal_done, persisted as
-   *  report_md on a report-only completion. Issue runs only. */
+   *  report_md on a report-only issue completion or a prompt completion. Issue and prompt runs only. */
   summary?: string;
   /** PRD #929 M2: a scheduled `prompt` run's structured proposal (title + body) from
    *  signal_done, forwarded verbatim on the prompt-run completion report so the server can

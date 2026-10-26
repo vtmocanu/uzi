@@ -13504,6 +13504,106 @@ describe("CodexExecutor milestone progress (issue #1674)", () => {
     });
   }
 
+  it("#3469 regression Codex prompt terminating signal_done forwards exact summary and proposal", async () => {
+    const summary = "Prompt findings\n\nNo repair needed.";
+    const proposal = { title: "Follow-up", body: "Investigate the scheduler." };
+    const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(3469, th, tn, { summary, proposal })]])]);
+    const { ctx } = makeCtx({ kind: "prompt" });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3469 prompt");
+    assert.equal(result.summary, summary);
+    assert.deepEqual(result.proposal, proposal);
+    assert.ok(!("reportOnly" in result));
+  });
+
+  it("#3469 control Codex undeclared summary proposal and reportOnly keys are absent", async () => {
+    for (const kind of ["issue", "prompt"] as const) {
+      const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(3469, th, tn)]])]);
+      const { ctx } = makeCtx({ kind });
+      const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3469 absent");
+      for (const key of ["summary", "proposal", "reportOnly"]) assert.ok(!(key in result), key);
+    }
+  });
+
+  it("#3469 control Codex plain-text completion does not synthesize declarations", async () => {
+    const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [
+      agentMessage("Finished. Summary: prose only. Proposal: prose only.", th),
+      done(3469, th, tn),
+    ]])]);
+    const { ctx } = makeCtx({ kind: "prompt" });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3469 prose");
+    for (const key of ["summary", "proposal", "reportOnly"]) assert.ok(!(key in result), key);
+  });
+
+  it("#3469 control Codex report-only remains issue-only and other kinds omit summary", async () => {
+    for (const kind of ["issue", "ci_fix", "chat", "judge", "self_improve", "prompt", "task", "mr_rework", "job", "cross_check"] as const) {
+      const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [
+        done(3469, th, tn, { report_only: true, summary: "findings" }),
+      ]])]);
+      const { ctx } = makeCtx({ kind });
+      const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3469 kind gate");
+      if (kind === "issue") assert.equal(result.reportOnly, true);
+      else assert.ok(!("reportOnly" in result), kind);
+      if (kind !== "issue" && kind !== "prompt") assert.ok(!("summary" in result), kind);
+    }
+  });
+
+  it("#3469 post-fix positive Codex issue and absent-kind default forward exact summary", async () => {
+    for (const kind of ["issue", undefined] as const) {
+      const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [
+        done(3469, th, tn, { report_only: true, summary: "issue findings" }),
+      ]])]);
+      const { ctx } = makeCtx({ kind });
+      const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3469 issue summary");
+      assert.equal(result.summary, "issue findings");
+      assert.equal(result.reportOnly, true);
+    }
+  });
+
+  it("#3469 post-fix positive Codex every kind forwards exact proposal", async () => {
+    const proposal = { title: "Follow-up", body: "Investigate the scheduler." };
+    for (const kind of ["issue", "ci_fix", "chat", "judge", "self_improve", "prompt", "task", "mr_rework", "job", "cross_check"] as const) {
+      const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(3469, th, tn, { proposal })]])]);
+      const { ctx } = makeCtx({ kind });
+      const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3469 proposal");
+      assert.deepEqual(result.proposal, proposal, kind);
+    }
+  });
+
+  for (const mode of ["last declared wins", "bare later done retains declarations", "questions cannot overwrite accepted declarations"] as const) {
+    it(`#3469 post-fix positive Codex multi-turn ${mode}`, async () => {
+      const first = { summary: "first findings", proposal: { title: "First", body: "First proposal." } };
+      const later = { summary: "later findings", proposal: { title: "Later", body: "Later proposal." } };
+      const rig = makeMultiEpochRig([
+        script("th-1", [(th, tn) => [done(34691, th, tn, { ...first, milestones_completed: ["m1"] })]]),
+        script("th-1", [
+          (th, tn) => [
+            done(34692, th, tn, { ...(mode === "bare later done retains declarations" ? {} : later), milestones_completed: ["m1", "m2"] }),
+            ...(mode === "questions cannot overwrite accepted declarations"
+              ? [toolCall(34693, "ask_user", { questions: [{ question: "Which target?", header: "Target" }] }, th, tn, "ask-34693")]
+              : []),
+          ],
+          (th, tn) => [done(34694, th, tn, { milestones_completed: ["m1", "m2"] })],
+        ]),
+      ]);
+      let attempts = 0;
+      let asked = 0;
+      const { ctx } = makeCtx({
+        kind: "issue", completionInterlock: true, config: { max_iterations: 5 },
+        frozenMilestones: [{ id: "m1", title: "Alpha" }, { id: "m2", title: "Beta" }],
+        checkpoint: async () => {},
+        recordCompletionAttempt: async () => ({ unmet: attempts++ === 0 ? ["m2"] : [], attemptCount: attempts }),
+        askUser: async () => { asked++; return { kind: "answer", answers: ["server"] }; },
+      });
+      const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3469 rework");
+      assert.equal(attempts, 2, "both accepted done turns reach the interlock");
+      assert.equal(asked, mode === "questions cannot overwrite accepted declarations" ? 1 : 0);
+      assert.equal(rig.epochs[1]!.transport.turnStartCount, asked + 1);
+      const expected = mode === "last declared wins" ? later : first;
+      assert.equal(result.summary, expected.summary);
+      assert.deepEqual(result.proposal, expected.proposal);
+    });
+  }
+
   it("carries signal_done milestones_completed into the terminal result on issue runs only", async () => {
     for (const [kind, args, expected] of [
       ["issue", { milestones_completed: ["m1"] }, ["m1"]],

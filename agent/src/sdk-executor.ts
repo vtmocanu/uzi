@@ -4442,12 +4442,10 @@ export class SdkExecutor implements Executor {
       if (isIssueRun && depsTruncated) {
         result.gatesDiscoveryTruncated = true;
       }
-      // issue #279: forward the report-only declaration + captured summary on `issue` runs
-      // only, with the SAME OMITTED-not-undefined discipline as prdDonePath above — the keys
-      // are absent unless the lead actually declared them, so an ordinary push+MR completion
-      // is byte-identical to before and every existing deepStrictEqual on this result holds.
+      // Forward report-only on issue runs and captured summaries on issue and prompt runs.
+      // Omit each key unless the lead declared it, as with prdDonePath above.
       if (isIssueRun && declaredReportOnly) result.reportOnly = true;
-      if (isIssueRun && declaredSummary !== undefined) {
+      if ((isIssueRun || resolveRunKind(ctx.kind) === "prompt") && declaredSummary !== undefined) {
         result.summary = declaredSummary;
       }
       // PRD #929 M2: forward the declared proposal. NOT gated on isIssueRun — it is the
