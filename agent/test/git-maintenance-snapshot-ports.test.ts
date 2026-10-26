@@ -745,6 +745,7 @@ test("ported snapshot: source request accounting includes raw names, EOF and sho
 test("ported snapshot: partial writes retry only unwritten tail and charge the chunk once", snapshotLinux, async t => {
   const f = await snapshotPortFixture(t), out = path.join(f.cache.recoveryRoot, "ported.pack");
   const attempts: Array<[number, number, number]> = [];
+  const categories: Array<{ admin: number; source: number; previousAdmin: number; previousSource: number }> = [];
   let lastAdmin = 0, lastSource = 0, syncs = 0;
   f.hooks.open = (file, p) => {
     if (p !== out) return;
@@ -754,14 +755,18 @@ test("ported snapshot: partial writes retry only unwritten tail and charge the c
       if (b.toString() !== "abc") return write(b, o, n, at);
       const admin = f.charges.filter(c => c.resource === "adminEntries").reduce((sum, c) => sum + c.amount, 0);
       const source = f.charges.filter(c => c.resource === "sourceEntries").reduce((sum, c) => sum + c.amount, 0);
-      assert.equal(admin, lastAdmin, "disposable parent/file validation consumes no creation allowance");
-      assert.ok(source > lastSource, "each retry charges active parent/file validation");
+      categories.push({ admin, source, previousAdmin: lastAdmin, previousSource: lastSource });
       lastAdmin = admin; lastSource = source;
       attempts.push([o, n, at - 12]);
       return write(b, o, 1, at);
     });
   };
   await portStage(f, out);
+  assert.equal(categories.length, 3);
+  for (const { admin, source, previousAdmin, previousSource } of categories) {
+    assert.equal(admin, previousAdmin, "disposable parent/file validation consumes no creation allowance");
+    assert.ok(source > previousSource, "each retry charges active parent/file validation");
+  }
   assert.deepEqual(attempts, [[0, 3, 0], [1, 2, 1], [2, 1, 2]]);
   assert.deepEqual(await fs.readFile(out), Buffer.concat(portOpaquePack()));
   assert.equal(f.charges.filter(c => c.resource === "artifactBytes").reduce((sum, c) => sum + c.amount, 0), 35);
