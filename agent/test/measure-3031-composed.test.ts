@@ -433,6 +433,10 @@ function gateSummary(records: ReadonlyArray<Record<string, unknown>>) {
     per_run: runs.map(r => ({ label: r.label, verdict: r.verdict, eligible_for_gate: r.eligible_for_gate ?? false })) };
 }
 
+// Module-level hooks for controls only. They are not Spec fields, so a real spec stays free of control fields
+// and the control-only guard does not count them; each control sets and restores them itself.
+const testHooks: { sourceRoot?: string; ancestorProbe?: string } = {};
+
 interface RunResult { record: Record<string, unknown>; evaluation: Evaluation }
 
 async function runPipeline(t: TestContext, spec: Spec): Promise<RunResult> {
@@ -454,22 +458,21 @@ async function runPipeline(t: TestContext, spec: Spec): Promise<RunResult> {
   // ---- preconditions: UNRUN with the reason, nothing else asserted
   let source: { head: string; commits: number } | undefined;
   if (spec.origin === "repo") {
-    const precondition = sourcePrecondition(spec.sourceRoot ?? REPO_ROOT);
+    const precondition = sourcePrecondition(testHooks.sourceRoot ?? spec.sourceRoot ?? REPO_ROOT);
     if (!precondition.ok) return unrun(precondition.reason);
     source = precondition;
   }
   let dockerHost = "http://unused.invalid";
   if (spec.real) {
+    const ancestors = ancestorProblem(testHooks.ancestorProbe ?? path.dirname(git.recoveryRoot));
+    if (ancestors) return unrun(ancestors);
     const crowded = soleExecutionProblem();
     if (crowded) return unrun("sole execution is unverified, so the idleness precondition fails: " + crowded);
     const prerequisites = realPrerequisites();
     if ("unrun" in prerequisites) return unrun(prerequisites.unrun);
     dockerHost = prerequisites.dockerHost;
   }
-  if (spec.real) {
-    const ancestors = ancestorProblem(path.dirname(git.recoveryRoot));
-    if (ancestors) return unrun(ancestors);
-  } else projectTrustedAncestors(t);
+  if (!spec.real) projectTrustedAncestors(t);
   head.candidate_sha = source?.head;
   head.source_commits = source?.commits;
 
@@ -481,7 +484,7 @@ async function runPipeline(t: TestContext, spec: Spec): Promise<RunResult> {
   // ---- origin: a clone of this repository's checkout (item 2); the runner makes the bare (item 4)
   if (source) {
     const origin = path.join(path.dirname(fx.dataDir), "origin-src");
-    execFileSync("git", ["clone", "-q", "--no-local", "--no-hardlinks", spec.sourceRoot ?? REPO_ROOT, origin], { env: gitEnv, stdio: "pipe" });
+    execFileSync("git", ["clone", "-q", "--no-local", "--no-hardlinks", testHooks.sourceRoot ?? spec.sourceRoot ?? REPO_ROOT, origin], { env: gitEnv, stdio: "pipe" });
     sh(origin, "checkout", "-q", "-B", "main", source.head);
     disableAutoMaintenance(origin, gitEnv);
     fx.originPath = origin;
@@ -912,7 +915,10 @@ describe("#3031 composed measurement verdict controls", () => {
     // The shell exited, so the sleep is no descendant of this process: a foreign writer in the container.
     assert.ok(foreignPids(readParents(), process.pid).includes(orphan), "the orphan is reported foreign");
     assert.match(soleExecutionProblem() ?? "", /other than the measurement|not PID 1/);
-    // The precondition is wired into runPipeline before any prerequisite or fixture work.
+    // The precondition is wired into runPipeline before any prerequisite or fixture work. The ancestor
+    // probe is pointed at "/" so the (earlier) ancestor check passes wherever TMPDIR lives.
+    testHooks.ancestorProbe = "/";
+    t.after(() => { testHooks.ancestorProbe = undefined; });
     const { evaluation, record } = await runPipeline(t, { label: "control-sole", layout: "shared", shape: "A", origin: "tiny", real: true });
     assert.equal(evaluation.verdict, "UNRUN");
     assert.match(String(record.reason), /sole execution is unverified/);
@@ -956,6 +962,28 @@ describe("#3031 composed measurement verdict controls", () => {
     t.after(() => fs.rm(dir, { recursive: true, force: true }));
     await fs.chmod(dir, 0o777);
     assert.match(ancestorProblem(path.join(dir)) ?? "", /not a trusted ancestor/);
+  });
+
+  it("control: a real spec without control fields runs the source precondition (acceptance 2 on the real path)", async t => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "measure-3031-notrepo-"));
+    t.after(() => fs.rm(dir, { recursive: true, force: true }));
+    testHooks.sourceRoot = dir;
+    t.after(() => { testHooks.sourceRoot = undefined; });
+    const { evaluation, record } = await runPipeline(t, { label: "control-real-source", layout: "shared", shape: "A", origin: "repo", real: true });
+    assert.equal(evaluation.verdict, "UNRUN");
+    assert.match(String(record.reason), /source repository checkout is inaccessible/);
+    assert.equal(record.w0_invocations, undefined);
+  });
+
+  it("control: a real spec with an untrusted ancestor of the data directory is UNRUN before anything else", async t => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "measure-3031-ancestor-wired-"));
+    t.after(() => fs.rm(dir, { recursive: true, force: true }));
+    await fs.chmod(dir, 0o777);
+    testHooks.ancestorProbe = dir;
+    t.after(() => { testHooks.ancestorProbe = undefined; });
+    const { evaluation, record } = await runPipeline(t, { label: "control-real-ancestor", layout: "shared", shape: "A", origin: "tiny", real: true });
+    assert.equal(evaluation.verdict, "UNRUN");
+    assert.match(String(record.reason), /not a trusted ancestor/);
   });
 
   it("control: runPipeline returns UNRUN for a failing source precondition and runs nothing else", async t => {
