@@ -44,5 +44,7 @@
       "resolved_model": "x",
       "source": "x"
     }
-  ]
+  ],
+  "weekly_reserve_pct": 1,
+  "weekly_reserve_pause_running": true
 }

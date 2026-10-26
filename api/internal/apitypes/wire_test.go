@@ -63,6 +63,8 @@ func TestUserDTOTags(t *testing.T) {
 		"judge_anthropic_secret_id", "judge_anthropic_secret_label",
 		// PRD #1140 M2: the EFFECTIVE three-valued judge bind mode (default/pinned/auto).
 		"judge_anthropic_bind_mode",
+		// PRD #3522: the weekly usage reserve (null threshold ⇒ off).
+		"weekly_reserve_pct", "weekly_reserve_pause_running",
 		"created_at", "last_login")
 }
 
@@ -1173,7 +1175,9 @@ func TestUserSettingsDTOTags(t *testing.T) {
 		// PRD #2603: the per-user model-written "Now" summary switch (null ⇒ default ON).
 		"now_summary_enabled",
 		// PRD #3245: the Codex judge lane and the read-only resolved judge cells.
-		"codex_judge_model", "judge_models")
+		"codex_judge_model", "judge_models",
+		// PRD #3522: the weekly usage reserve (null threshold ⇒ off).
+		"weekly_reserve_pct", "weekly_reserve_pause_running")
 }
 
 func TestModelSettingCellDTOTags(t *testing.T) {

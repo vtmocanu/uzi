@@ -35,6 +35,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/secretopen"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/usagereserve"
 )
 
 // defaultMaxConcurrency bounds how many users are polled in parallel per tick.
@@ -363,23 +364,9 @@ func (e *Engine) pollToken(ctx context.Context, userID, secretID uuid.UUID, rev,
 // ahead of its advertised reset, so poll jitter never trips it (PRD #1020 D2).
 const earlyResetThreshold = 8 * time.Hour
 
-// resetEpochMoveMargin: Arm A requires the fresh 7-day reset epoch to move at
-// least this far past the advertised T. A genuine reset moves it by ~days,
-// while a usage_endpoint->header_probe source flip re-derives the same instant
-// from a different wire field (ISO body string vs Unix-epoch header) and can
-// differ by seconds; +1h absorbs that jitter so a bare .After never fires on it
-// (PRD #1114 D8).
-const resetEpochMoveMargin = 1 * time.Hour
-
-// pctResetFloor / pctResetCeil: Arm B treats a 7-day utilization drop from
-// >= pctResetFloor to <= pctResetCeil as a reset (the fixed-grid manifestation,
-// where used% zeroes but the boundary does not move). The 7-day used% is
-// monotonic non-decreasing between resets, so a genuine drop only happens at a
-// reset; the small buffer stops a cross-source rounding delta from reading as a
-// reset. Set low deliberately (owner accepts a noisy floor; real weekly resets
-// are rare and a missed early clear costs more than a spurious alert) (PRD #1114 D5/D8).
-const pctResetFloor = 5
-const pctResetCeil = 1
+// The Arm A margin (ResetEpochMoveMargin, +1h, PRD #1114 D8) and the Arm B floor/ceil
+// (PctResetFloor 5 / PctResetCeil 1, PRD #1114 D5/D8) are single-sourced in usagereserve,
+// next to the arm predicate the weekly usage reserve shares.
 
 // observe writes the fresh reading and, when the owner opted in, fires the early
 // 7-day reset alert (PRD #1020 M2). It wraps EVERY upsert path — tick and poke —
@@ -472,20 +459,13 @@ func earlyResetFires(prev store.AnthropicRateLimit, hasPrev bool, next anthropic
 	if !t.After(prev.SyncedAt.Time) {
 		return false, time.Time{}
 	}
-	// Arm A — boundary moved forward (rolling model): the fresh reset epoch is set
-	// AND strictly more than resetEpochMoveMargin past T.
-	armA := next.SevenDay.ResetsAt != nil && next.SevenDay.ResetsAt.After(t.Add(resetEpochMoveMargin))
-	// Arm B — utilization zeroed ahead of schedule (fixed-grid model): the fresh 7-day
-	// reset epoch is PRESENT and unmoved (== T, i.e. the fixed grid did not shift — a
-	// forward move past the margin is Arm A's domain, and a nil, sub-margin, or backward
-	// boundary is jitter-ambiguous and must not fire here), AND prior 7-day used% >=
-	// pctResetFloor while the fresh used% <= pctResetCeil.
-	armB := next.SevenDay.ResetsAt != nil &&
-		next.SevenDay.ResetsAt.Equal(t) &&
-		prev.SevenDayPct.Valid &&
-		int(prev.SevenDayPct.Int16) >= pctResetFloor &&
-		next.SevenDay.Pct <= pctResetCeil
-	if !armA && !armB {
+	// Arms A and B (boundary moved forward / utilization zeroed on an unmoved boundary)
+	// live in usagereserve.ClaudeResetObserved, shared with the weekly usage reserve.
+	var priorPct *int16
+	if prev.SevenDayPct.Valid {
+		priorPct = &prev.SevenDayPct.Int16
+	}
+	if !usagereserve.ClaudeResetObserved(t, priorPct, next.SevenDay.ResetsAt, next.SevenDay.Pct) {
 		return false, time.Time{}
 	}
 	// early: now strictly before T - threshold (exactly -threshold is NOT early).

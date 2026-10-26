@@ -1105,6 +1105,11 @@ type Run struct {
 	SourcePublicationIntent     []byte             `json:"source_publication_intent"`
 	ContinuedIssueIid           pgtype.Int8        `json:"continued_issue_iid"`
 	CheckpointCoordinates       []byte             `json:"checkpoint_coordinates"`
+	ReserveHoldReason           pgtype.Text        `json:"reserve_hold_reason"`
+	ReserveExemptUntil          pgtype.Timestamptz `json:"reserve_exempt_until"`
+	ReserveExemptGrantedAt      pgtype.Timestamptz `json:"reserve_exempt_granted_at"`
+	ReserveExemptCredentialID   pgtype.UUID        `json:"reserve_exempt_credential_id"`
+	ReserveExemptWindowReset    pgtype.Timestamptz `json:"reserve_exempt_window_reset"`
 }
 
 type RunCompletionAttempt struct {
@@ -1513,53 +1518,55 @@ type ToolAllowlist struct {
 }
 
 type User struct {
-	ID                      uuid.UUID          `json:"id"`
-	Email                   string             `json:"email"`
-	PasswordHash            pgtype.Text        `json:"password_hash"`
-	DisplayName             pgtype.Text        `json:"display_name"`
-	IsAdmin                 bool               `json:"is_admin"`
-	IsActive                bool               `json:"is_active"`
-	TokenVersion            int32              `json:"token_version"`
-	CreatedAt               pgtype.Timestamptz `json:"created_at"`
-	LastLogin               pgtype.Timestamptz `json:"last_login"`
-	DefaultModel            pgtype.Text        `json:"default_model"`
-	AutopilotEnabled        bool               `json:"autopilot_enabled"`
-	Theme                   pgtype.Text        `json:"theme"`
-	SlackMemberID           pgtype.Text        `json:"slack_member_id"`
-	SlackNotify             bool               `json:"slack_notify"`
-	SlackResolvedID         pgtype.Text        `json:"slack_resolved_id"`
-	SlackLinkConfirmedAt    pgtype.Timestamptz `json:"slack_link_confirmed_at"`
-	OidcIssuer              pgtype.Text        `json:"oidc_issuer"`
-	OidcSubject             pgtype.Text        `json:"oidc_subject"`
-	JudgeEnabled            bool               `json:"judge_enabled"`
-	JudgeAnthropicSecretID  pgtype.UUID        `json:"judge_anthropic_secret_id"`
-	WaitOnLimit             bool               `json:"wait_on_limit"`
-	CiAutofixEnabled        pgtype.Bool        `json:"ci_autofix_enabled"`
-	SidebarTokenIds         []uuid.UUID        `json:"sidebar_token_ids"`
-	JudgeModel              pgtype.Text        `json:"judge_model"`
-	SummaryModel            pgtype.Text        `json:"summary_model"`
-	EphemeralWorkersEnabled bool               `json:"ephemeral_workers_enabled"`
-	DefaultEffort           pgtype.Text        `json:"default_effort"`
-	MrReworkEnabled         pgtype.Bool        `json:"mr_rework_enabled"`
-	AttributionEnabled      bool               `json:"attribution_enabled"`
-	NotifyEarlyLimitReset   bool               `json:"notify_early_limit_reset"`
-	SchedulesPaused         bool               `json:"schedules_paused"`
-	SchedulesPausedUntil    pgtype.Timestamptz `json:"schedules_paused_until"`
-	JudgeAnthropicBindMode  string             `json:"judge_anthropic_bind_mode"`
-	AppearanceMode          pgtype.Text        `json:"appearance_mode"`
-	LightTheme              pgtype.Text        `json:"light_theme"`
-	DarkTheme               pgtype.Text        `json:"dark_theme"`
-	Typeface                pgtype.Text        `json:"typeface"`
-	DefaultHarness          pgtype.Text        `json:"default_harness"`
-	SidebarCodexAccountIds  []uuid.UUID        `json:"sidebar_codex_account_ids"`
-	DefaultClaudeModel      pgtype.Text        `json:"default_claude_model"`
-	DefaultCodexModel       pgtype.Text        `json:"default_codex_model"`
-	DefaultCodexEffort      pgtype.Text        `json:"default_codex_effort"`
-	EphemeralDockerEnabled  bool               `json:"ephemeral_docker_enabled"`
-	PlanCrossCheckEnabled   bool               `json:"plan_cross_check_enabled"`
-	NowSummaryEnabled       pgtype.Bool        `json:"now_summary_enabled"`
-	CodeCrossCheckEnabled   bool               `json:"code_cross_check_enabled"`
-	CodexJudgeModel         pgtype.Text        `json:"codex_judge_model"`
+	ID                        uuid.UUID          `json:"id"`
+	Email                     string             `json:"email"`
+	PasswordHash              pgtype.Text        `json:"password_hash"`
+	DisplayName               pgtype.Text        `json:"display_name"`
+	IsAdmin                   bool               `json:"is_admin"`
+	IsActive                  bool               `json:"is_active"`
+	TokenVersion              int32              `json:"token_version"`
+	CreatedAt                 pgtype.Timestamptz `json:"created_at"`
+	LastLogin                 pgtype.Timestamptz `json:"last_login"`
+	DefaultModel              pgtype.Text        `json:"default_model"`
+	AutopilotEnabled          bool               `json:"autopilot_enabled"`
+	Theme                     pgtype.Text        `json:"theme"`
+	SlackMemberID             pgtype.Text        `json:"slack_member_id"`
+	SlackNotify               bool               `json:"slack_notify"`
+	SlackResolvedID           pgtype.Text        `json:"slack_resolved_id"`
+	SlackLinkConfirmedAt      pgtype.Timestamptz `json:"slack_link_confirmed_at"`
+	OidcIssuer                pgtype.Text        `json:"oidc_issuer"`
+	OidcSubject               pgtype.Text        `json:"oidc_subject"`
+	JudgeEnabled              bool               `json:"judge_enabled"`
+	JudgeAnthropicSecretID    pgtype.UUID        `json:"judge_anthropic_secret_id"`
+	WaitOnLimit               bool               `json:"wait_on_limit"`
+	CiAutofixEnabled          pgtype.Bool        `json:"ci_autofix_enabled"`
+	SidebarTokenIds           []uuid.UUID        `json:"sidebar_token_ids"`
+	JudgeModel                pgtype.Text        `json:"judge_model"`
+	SummaryModel              pgtype.Text        `json:"summary_model"`
+	EphemeralWorkersEnabled   bool               `json:"ephemeral_workers_enabled"`
+	DefaultEffort             pgtype.Text        `json:"default_effort"`
+	MrReworkEnabled           pgtype.Bool        `json:"mr_rework_enabled"`
+	AttributionEnabled        bool               `json:"attribution_enabled"`
+	NotifyEarlyLimitReset     bool               `json:"notify_early_limit_reset"`
+	SchedulesPaused           bool               `json:"schedules_paused"`
+	SchedulesPausedUntil      pgtype.Timestamptz `json:"schedules_paused_until"`
+	JudgeAnthropicBindMode    string             `json:"judge_anthropic_bind_mode"`
+	AppearanceMode            pgtype.Text        `json:"appearance_mode"`
+	LightTheme                pgtype.Text        `json:"light_theme"`
+	DarkTheme                 pgtype.Text        `json:"dark_theme"`
+	Typeface                  pgtype.Text        `json:"typeface"`
+	DefaultHarness            pgtype.Text        `json:"default_harness"`
+	SidebarCodexAccountIds    []uuid.UUID        `json:"sidebar_codex_account_ids"`
+	DefaultClaudeModel        pgtype.Text        `json:"default_claude_model"`
+	DefaultCodexModel         pgtype.Text        `json:"default_codex_model"`
+	DefaultCodexEffort        pgtype.Text        `json:"default_codex_effort"`
+	EphemeralDockerEnabled    bool               `json:"ephemeral_docker_enabled"`
+	PlanCrossCheckEnabled     bool               `json:"plan_cross_check_enabled"`
+	NowSummaryEnabled         pgtype.Bool        `json:"now_summary_enabled"`
+	CodeCrossCheckEnabled     bool               `json:"code_cross_check_enabled"`
+	CodexJudgeModel           pgtype.Text        `json:"codex_judge_model"`
+	WeeklyReservePct          pgtype.Int2        `json:"weekly_reserve_pct"`
+	WeeklyReservePauseRunning bool               `json:"weekly_reserve_pause_running"`
 }
 
 type UserCrossCheckPin struct {

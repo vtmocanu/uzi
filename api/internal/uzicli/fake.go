@@ -334,6 +334,12 @@ type FakeClient struct {
 	// Settings drives GetMySettings: the caller's own non-secret settings.
 	Settings apitypes.UserSettingsDTO
 
+	// SetUsageReserve capture (PRD #3522): how many times it was called and the threshold
+	// (nil = off) and pause flag the command sent.
+	ReserveCalls     int
+	LastReservePct   *int
+	LastReservePause bool
+
 	// Secrets drives ListSecrets (PRD #104 M2).
 	Secrets                  []apitypes.SecretDTO
 	SecretTestResult         apitypes.SecretTestResult

@@ -17,6 +17,8 @@
   "judge_anthropic_secret_id": null,
   "judge_anthropic_secret_label": null,
   "judge_anthropic_bind_mode": "",
+  "weekly_reserve_pct": null,
+  "weekly_reserve_pause_running": false,
   "created_at": "0001-01-01T00:00:00Z",
   "last_login": null
 }

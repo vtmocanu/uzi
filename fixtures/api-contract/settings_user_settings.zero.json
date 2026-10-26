@@ -18,5 +18,7 @@
   "dark_theme": null,
   "typeface": null,
   "default_harness": null,
-  "judge_models": null
+  "judge_models": null,
+  "weekly_reserve_pct": null,
+  "weekly_reserve_pause_running": false
 }

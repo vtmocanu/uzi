@@ -160,6 +160,7 @@ uzi auth status [--all]
 uzi whoami
 uzi settings
 uzi settings get
+uzi settings reserve
 uzi context list
 uzi context current
 uzi context use <name>
@@ -317,7 +318,7 @@ uzi version
 ### Account settings
 
 - `uzi settings` — show settings command help.
-- `uzi settings get` — read your own non-secret account settings; no setters.
+- `uzi settings get` — read your own non-secret account settings.
   The default table shows the Claude and Codex plan cross-check cells, including
   active/inactive status, stored model/effort pins, worker default model,
   resolved model/effort, and their sources (`pin` or `worker default`, with
@@ -326,6 +327,18 @@ uzi version
   server reports inactive is still shown; its stored pin remains visible. Table rendering inspects at most twenty response cells and
   displays each harness once. `uzi settings get --json` returns the settings
   object at the top level, including `cross_check_pins` and source fields.
+  The table output ends with a `Weekly usage reserve:` line (`off`, or the threshold
+  and whether running runs are paused); `--json` carries `weekly_reserve_pct` (null =
+  off) and `weekly_reserve_pause_running`.
+- `uzi settings reserve --threshold <1..100|off> [--pause-running[=true|false]]` — set
+  your weekly usage reserve, the 7-day utilization percent at which uzi stops starting
+  runs on your subscription (and, with pausing on, pauses running runs at their next
+  milestone). `--threshold` is required: an integer from 1 to 100, or `off`.
+  `--pause-running` / `--pause-running=false` sets whether running runs are also paused;
+  when omitted the current value is kept (the command reads your settings first).
+  Prints the resulting reserve; `--json` returns `weekly_reserve_pct` and
+  `weekly_reserve_pause_running`. Usage exit 2 on an out-of-range threshold. A uzc_ token
+  can run it.
 
 ### Named contexts
 

@@ -13,6 +13,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/autoselectrow"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/usagereserve"
 )
 
 // rateLimitWindow (apitypes.RateLimitWindow), rateLimitDTO (apitypes.RateLimitDTO)
@@ -181,14 +182,7 @@ func (h *Handler) okRateLimitDTO(fivePct pgtype.Int2, fiveReset pgtype.Timestamp
 // existing rows are still served but always marked stale, since nothing refreshes
 // them.
 func (h *Handler) rateLimitStale(syncedAt pgtype.Timestamptz) bool {
-	interval := h.cfg.UsagePollInterval
-	if interval <= 0 {
-		return true
-	}
-	if !syncedAt.Valid {
-		return true
-	}
-	return time.Since(syncedAt.Time) > 3*interval
+	return usagereserve.Stale(syncedAt.Time, syncedAt.Valid, h.cfg.UsagePollInterval, time.Now())
 }
 
 // epochPtr renders a stored reset timestamp as epoch seconds, or nil (→ JSON null)

@@ -47,6 +47,10 @@ export interface User {
    *  creation and overridable on the run view — so the two disagreeing is the normal
    *  state of a user who overrode one run, not a sync bug to fix. */
   wait_on_limit: boolean;
+  /** PRD #3522: weekly usage reserve threshold (1..100), null when off. */
+  weekly_reserve_pct?: number | null;
+  /** PRD #3522: also pause running runs at the reserve (default true). */
+  weekly_reserve_pause_running?: boolean;
   /** PRD #1020: this user's opt-in to an alert when the poller observes their
    *  Anthropic usage window has reset earlier than its previously reported reset
    *  time. Default true; toggled from their own Settings. */
@@ -223,6 +227,10 @@ export interface UserSettings {
    *  default ON. null/absent reads as enabled; an explicit false opts this account out. The
    *  instance kill-switch (AppSettings.now_summary_enabled) is separate. */
   now_summary_enabled?: boolean | null;
+  /** PRD #3522: weekly usage reserve threshold (1..100), null when off. */
+  weekly_reserve_pct?: number | null;
+  /** PRD #3522: also pause running runs at the reserve (default true). */
+  weekly_reserve_pause_running?: boolean;
   /** Per-user default harness (PRD #1429 M1 / D3); null = "no preference", so implicit run
    *  creation falls through the D11 resolver. One of claude|codex when set; the web Run
    *  Defaults page writes it. */

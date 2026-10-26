@@ -120,6 +120,21 @@ func (c *HTTPClient) GetMySettings(ctx context.Context) (apitypes.UserSettingsDT
 	return env.Settings, nil
 }
 
+func (c *HTTPClient) SetUsageReserve(ctx context.Context, thresholdPct *int, pauseRunning bool) (apitypes.UserDTO, error) {
+	// threshold_pct is always present (null = off): the server rejects an absent field.
+	body := struct {
+		ThresholdPct *int `json:"threshold_pct"`
+		PauseRunning bool `json:"pause_running"`
+	}{ThresholdPct: thresholdPct, PauseRunning: pauseRunning}
+	var env struct {
+		User apitypes.UserDTO `json:"user"`
+	}
+	if err := c.put(ctx, "/api/me/usage-reserve", body, &env); err != nil {
+		return apitypes.UserDTO{}, err
+	}
+	return env.User, nil
+}
+
 func (c *HTTPClient) ListMemory(ctx context.Context) ([]apitypes.AgentMemoryDTO, error) {
 	var env struct {
 		Memories []apitypes.AgentMemoryDTO `json:"memories"`

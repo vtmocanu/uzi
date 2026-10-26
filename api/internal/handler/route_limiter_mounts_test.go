@@ -996,6 +996,9 @@ var wantRouteMounts = []routeMount{
 	// makes no forge call, sends no DM at toggle time, and mints nothing — none of
 	// the three things the per-user limiters exist to bound. Cookie+CSRF gates it.
 	{"PUT", "/api/me/notify-early-reset", noLimiter},
+	// PRD #3522: the weekly usage reserve (SetUsageReserve). One owner-scoped UPDATE of two
+	// columns, no spend, no forge write, no fan-out: the same shape as /me/notify-early-reset.
+	{"PUT", "/api/me/usage-reserve", noLimiter},
 	// PRD #46: the run-judge consent toggle (SetJudgeEnabled). A single boolean
 	// UPDATE on the caller's own users row, spends no Anthropic token at toggle time
 	// — noLimiter, matching /me/autopilot and /me/ci-autofix beside it. Its route

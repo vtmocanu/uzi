@@ -60,7 +60,13 @@ type UserDTO struct {
 	// "default", "pinned", or "auto". Effective means a "pinned" row whose pointer was
 	// nulled (a deleted token) reports "default", so the mode always agrees with what
 	// the claim will actually resolve — the client never re-derives the rule.
-	JudgeAnthropicBindMode string     `json:"judge_anthropic_bind_mode"`
-	CreatedAt              time.Time  `json:"created_at"`
-	LastLogin              *time.Time `json:"last_login"`
+	JudgeAnthropicBindMode string `json:"judge_anthropic_bind_mode"`
+	// WeeklyReservePct is the user's weekly usage reserve threshold (PRD #3522): the 7-day
+	// utilization percent (1..100) at which uzi stops spending their subscription. null =
+	// off (the default). WeeklyReservePauseRunning says whether a running run is also paused
+	// at its next milestone boundary; it defaults to true and only matters once a threshold is set.
+	WeeklyReservePct          *int       `json:"weekly_reserve_pct"`
+	WeeklyReservePauseRunning bool       `json:"weekly_reserve_pause_running"`
+	CreatedAt                 time.Time  `json:"created_at"`
+	LastLogin                 *time.Time `json:"last_login"`
 }

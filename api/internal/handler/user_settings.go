@@ -86,6 +86,10 @@ type userSettingsDTO struct {
 	// JudgeModels is the read-only resolved view of both judge lanes (PRD #3245), ordered
 	// claude then codex. It is never accepted on a PUT.
 	JudgeModels []apitypes.ModelSettingCellDTO `json:"judge_models"`
+	// WeeklyReservePct and WeeklyReservePauseRunning are the weekly usage reserve (PRD
+	// #3522), read-only here: PUT /api/me/usage-reserve owns the write. null = off.
+	WeeklyReservePct          *int `json:"weekly_reserve_pct"`
+	WeeklyReservePauseRunning bool `json:"weekly_reserve_pause_running"`
 }
 
 // userSettingsResponse reads the user's settings row (one GetUserSettings query,
@@ -149,26 +153,28 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 	// needed (PRD #362 M2).
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"settings": userSettingsDTO{
-			CrossCheckPins:         pins,
-			DefaultModel:           textPtrValue(legacyModel.Valid, legacyModel.String),
-			DefaultClaudeModel:     textPtrValue(s.DefaultClaudeModel.Valid, s.DefaultClaudeModel.String),
-			DefaultCodexModel:      textPtrValue(s.DefaultCodexModel.Valid, s.DefaultCodexModel.String),
-			DefaultEffort:          textPtrValue(s.DefaultEffort.Valid, s.DefaultEffort.String),
-			DefaultCodexEffort:     textPtrValue(s.DefaultCodexEffort.Valid, s.DefaultCodexEffort.String),
-			JudgeModel:             judgeLane,
-			CodexJudgeModel:        codexJudgeLane,
-			SummaryModel:           textPtrValue(s.SummaryModel.Valid, s.SummaryModel.String),
-			Theme:                  textPtrValue(s.Theme.Valid, s.Theme.String),
-			MrReworkEnabled:        boolPtrValue(s.MrReworkEnabled),
-			NowSummaryEnabled:      boolPtrValue(s.NowSummaryEnabled),
-			SidebarTokenIds:        uuidStrings(s.SidebarTokenIds),
-			SidebarCodexAccountIds: uuidStrings(sidebarCodexIDs),
-			AppearanceMode:         textPtrValue(s.AppearanceMode.Valid, s.AppearanceMode.String),
-			LightTheme:             textPtrValue(s.LightTheme.Valid, s.LightTheme.String),
-			DarkTheme:              textPtrValue(s.DarkTheme.Valid, s.DarkTheme.String),
-			Typeface:               textPtrValue(s.Typeface.Valid, s.Typeface.String),
-			DefaultHarness:         textPtrValue(s.DefaultHarness.Valid, s.DefaultHarness.String),
-			JudgeModels:            judgeModelCells(judgeLane, codexJudgeLane, instance),
+			CrossCheckPins:            pins,
+			DefaultModel:              textPtrValue(legacyModel.Valid, legacyModel.String),
+			DefaultClaudeModel:        textPtrValue(s.DefaultClaudeModel.Valid, s.DefaultClaudeModel.String),
+			DefaultCodexModel:         textPtrValue(s.DefaultCodexModel.Valid, s.DefaultCodexModel.String),
+			DefaultEffort:             textPtrValue(s.DefaultEffort.Valid, s.DefaultEffort.String),
+			DefaultCodexEffort:        textPtrValue(s.DefaultCodexEffort.Valid, s.DefaultCodexEffort.String),
+			JudgeModel:                judgeLane,
+			CodexJudgeModel:           codexJudgeLane,
+			SummaryModel:              textPtrValue(s.SummaryModel.Valid, s.SummaryModel.String),
+			Theme:                     textPtrValue(s.Theme.Valid, s.Theme.String),
+			MrReworkEnabled:           boolPtrValue(s.MrReworkEnabled),
+			NowSummaryEnabled:         boolPtrValue(s.NowSummaryEnabled),
+			SidebarTokenIds:           uuidStrings(s.SidebarTokenIds),
+			SidebarCodexAccountIds:    uuidStrings(sidebarCodexIDs),
+			AppearanceMode:            textPtrValue(s.AppearanceMode.Valid, s.AppearanceMode.String),
+			LightTheme:                textPtrValue(s.LightTheme.Valid, s.LightTheme.String),
+			DarkTheme:                 textPtrValue(s.DarkTheme.Valid, s.DarkTheme.String),
+			Typeface:                  textPtrValue(s.Typeface.Valid, s.Typeface.String),
+			DefaultHarness:            textPtrValue(s.DefaultHarness.Valid, s.DefaultHarness.String),
+			JudgeModels:               judgeModelCells(judgeLane, codexJudgeLane, instance),
+			WeeklyReservePct:          intPtrFromInt2(s.WeeklyReservePct),
+			WeeklyReservePauseRunning: s.WeeklyReservePauseRunning,
 		},
 	})
 }

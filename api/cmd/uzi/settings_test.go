@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -26,8 +27,8 @@ func TestSettingsGetTableAndJSON(t *testing.T) {
 		t.Fatalf("exit %d: %s", code, stderr)
 	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) != 4 || lines[3] != "Now summary: on (default)" {
-		t.Fatalf("expected header, two cells and the Now summary line: %s", out)
+	if len(lines) != 5 || lines[3] != "Now summary: on (default)" || lines[4] != "Weekly usage reserve: off" {
+		t.Fatalf("expected header, two cells, the Now summary line and the reserve line: %s", out)
 	}
 	want := []string{
 		"plan claude active Default SDK/account default SDK/account default worker default Pin · high high pin",
@@ -73,7 +74,7 @@ func TestSettingsGetFourIndependentCells(t *testing.T) {
 		"code claude inactive Default SDK/account default SDK/account default worker default Pin · low low pin",
 		"code codex active Pin · code-only code-worker code-only pin Default medium worker default",
 	}
-	if len(lines) != 6 || lines[5] != "Now summary: on (default)" {
+	if len(lines) != 7 || lines[5] != "Now summary: on (default)" {
 		t.Fatalf("four cells: %s", out)
 	}
 	for i, row := range want {
@@ -98,7 +99,7 @@ func TestSettingsGetFourIndependentCells(t *testing.T) {
 	}
 	fc.Settings.CrossCheckPins = append(fc.Settings.CrossCheckPins, settings.CrossCheckPins[2:]...)
 	out, _, code = runCLI(t, fakeEnv(fc), "settings", "get")
-	if code != 0 || strings.Count(out, "\n") != 4 {
+	if code != 0 || strings.Count(out, "\n") != 5 {
 		t.Fatalf("input bound: %s", out)
 	}
 }
@@ -116,7 +117,7 @@ func TestSettingsGetClaudePinAndDefaultModel(t *testing.T) {
 		t.Fatalf("exit %d: %s", code, stderr)
 	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) != 4 {
+	if len(lines) != 5 {
 		t.Fatalf("expected two cells: %s", out)
 	}
 	for i, want := range []string{
@@ -144,7 +145,7 @@ func TestSettingsGetHostileTextAndBounds(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit %d: %s", code, stderr)
 	}
-	if strings.ContainsAny(out, "\x1b\x07\u202e") || strings.Count(out, "\n") != 3 ||
+	if strings.ContainsAny(out, "\x1b\x07\u202e") || strings.Count(out, "\n") != 4 ||
 		len(out) > 3000 || !strings.Contains(out, "unknown") || strings.Contains(out, strings.Repeat("x", 201)) {
 		t.Fatalf("unsafe or unbounded output: %q", out)
 	}
@@ -189,8 +190,8 @@ func TestSettingsGetTokenGET(t *testing.T) {
 func TestSettingsReadOnlyAndErrors(t *testing.T) {
 	root := newRootCmd(fakeEnv(&uzicli.FakeClient{}))
 	cmd := findCmd(root, "settings")
-	if cmd == nil || len(cmd.Commands()) != 1 || findCmd(cmd, "get") == nil {
-		t.Fatal("settings must expose only get")
+	if cmd == nil || len(cmd.Commands()) != 2 || findCmd(cmd, "get") == nil || findCmd(cmd, "reserve") == nil {
+		t.Fatal("settings must expose only get and reserve")
 	}
 	for _, args := range [][]string{{"settings", "set"}, {"settings", "reset"}, {"settings", "get", "extra"}} {
 		if _, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{}), args...); code == 0 {
@@ -222,5 +223,128 @@ func TestSettingsGetNowSummaryLine(t *testing.T) {
 		if strings.Contains(jout, "Now summary:") {
 			t.Errorf("%s: JSON carries the human line: %s", c.name, jout)
 		}
+	}
+}
+
+func TestSettingsGetReserveLine(t *testing.T) {
+	seventy := 70
+	for _, c := range []struct {
+		name  string
+		pct   *int
+		pause bool
+		want  string
+	}{
+		{"off", nil, true, "Weekly usage reserve: off"},
+		{"on, pausing", &seventy, true, "Weekly usage reserve: 70% (pause running runs: on)"},
+		{"on, not pausing", &seventy, false, "Weekly usage reserve: 70% (pause running runs: off)"},
+	} {
+		fc := &uzicli.FakeClient{Settings: apitypes.UserSettingsDTO{WeeklyReservePct: c.pct, WeeklyReservePauseRunning: c.pause}}
+		out, stderr, code := runCLI(t, fakeEnv(fc), "settings", "get")
+		if code != 0 {
+			t.Fatalf("%s: exit %d: %s", c.name, code, stderr)
+		}
+		if !strings.Contains(out, "\n"+c.want+"\n") {
+			t.Errorf("%s: missing %q in %q", c.name, c.want, out)
+		}
+	}
+}
+
+func TestSettingsReserve(t *testing.T) {
+	cases := []struct {
+		name      string
+		args      []string
+		stored    bool // the stored pause_running the GET returns
+		wantCode  int
+		wantCalls int
+		wantPct   int // -1 = off (nil)
+		wantPause bool
+		wantOut   string
+	}{
+		{"threshold, pause kept (stored on)", []string{"--threshold", "70"}, true, 0, 1, 70, true, "Weekly usage reserve: 70% (pause running runs: on)"},
+		{"threshold, pause kept (stored off)", []string{"--threshold", "70"}, false, 0, 1, 70, false, "Weekly usage reserve: 70% (pause running runs: off)"},
+		{"explicit pause=false overrides stored", []string{"--threshold", "95", "--pause-running=false"}, true, 0, 1, 95, false, "(pause running runs: off)"},
+		{"bare --pause-running means true", []string{"--threshold", "95", "--pause-running"}, false, 0, 1, 95, true, "(pause running runs: on)"},
+		{"off", []string{"--threshold", "off"}, true, 0, 1, -1, true, "Weekly usage reserve: off"},
+		{"OFF is case-insensitive", []string{"--threshold", "OFF"}, true, 0, 1, -1, true, "Weekly usage reserve: off"},
+		{"bounds 1", []string{"--threshold", "1"}, true, 0, 1, 1, true, "1%"},
+		{"bounds 100", []string{"--threshold", "100"}, true, 0, 1, 100, true, "100%"},
+		{"0 rejected", []string{"--threshold", "0"}, true, 2, 0, 0, false, ""},
+		{"101 rejected", []string{"--threshold", "101"}, true, 2, 0, 0, false, ""},
+		{"fraction rejected", []string{"--threshold", "1.5"}, true, 2, 0, 0, false, ""},
+		{"word rejected", []string{"--threshold", "high"}, true, 2, 0, 0, false, ""},
+		{"threshold required", []string{}, true, 2, 0, 0, false, ""},
+	}
+	for _, c := range cases {
+		fc := &uzicli.FakeClient{Settings: apitypes.UserSettingsDTO{WeeklyReservePauseRunning: c.stored}}
+		out, stderr, code := runCLI(t, fakeEnv(fc), append([]string{"settings", "reserve"}, c.args...)...)
+		if code != c.wantCode {
+			t.Errorf("%s: exit %d, want %d (stderr %s)", c.name, code, c.wantCode, stderr)
+			continue
+		}
+		if fc.ReserveCalls != c.wantCalls {
+			t.Errorf("%s: SetUsageReserve calls = %d, want %d", c.name, fc.ReserveCalls, c.wantCalls)
+		}
+		if c.wantCalls == 0 {
+			continue
+		}
+		if (c.wantPct < 0) != (fc.LastReservePct == nil) || (fc.LastReservePct != nil && *fc.LastReservePct != c.wantPct) {
+			t.Errorf("%s: sent threshold %v, want %d", c.name, fc.LastReservePct, c.wantPct)
+		}
+		if fc.LastReservePause != c.wantPause {
+			t.Errorf("%s: sent pause_running %v, want %v", c.name, fc.LastReservePause, c.wantPause)
+		}
+		if !strings.Contains(out, c.wantOut) {
+			t.Errorf("%s: output %q lacks %q", c.name, out, c.wantOut)
+		}
+	}
+}
+
+func TestSettingsReserveJSON(t *testing.T) {
+	fc := &uzicli.FakeClient{}
+	out, stderr, code := runCLI(t, fakeEnv(fc), "settings", "reserve", "--threshold", "80", "--pause-running=false", "--json")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	var got struct {
+		Pct   *int `json:"weekly_reserve_pct"`
+		Pause bool `json:"weekly_reserve_pause_running"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil || got.Pct == nil || *got.Pct != 80 || got.Pause {
+		t.Fatalf("JSON output = %s (%v)", out, err)
+	}
+}
+
+func TestSettingsReserveSendsBearerPUT(t *testing.T) {
+	token := "uzc_" + "test-reserve"
+	var gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/version" {
+			_, _ = w.Write([]byte("{}"))
+			return
+		}
+		if r.Method != http.MethodPut || r.URL.Path != "/api/me/usage-reserve" ||
+			r.Header.Get("Authorization") != "Bearer "+token {
+			t.Errorf("unexpected request: %s %s auth=%q", r.Method, r.URL.Path, r.Header.Get("Authorization"))
+		}
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		_, _ = w.Write([]byte(`{"user":{"weekly_reserve_pct":null,"weekly_reserve_pause_running":false}}`))
+	}))
+	defer srv.Close()
+	t.Setenv("UZI_URL", srv.URL)
+	t.Setenv("UZI_TOKEN", token)
+	var out, stderr bytes.Buffer
+	env := Env{Stdout: &out, Stderr: &stderr, Stdin: strings.NewReader(""),
+		NewClient: func(s uzicli.Settings) uzicli.Client { return uzicli.NewHTTPClient(s) }}
+	// An explicit --pause-running keeps the command to the single PUT (no GET first).
+	if code := Main(env, []string{"settings", "reserve", "--threshold", "off", "--pause-running=false"}); code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr.String())
+	}
+	// threshold_pct stays PRESENT as null: the server rejects an absent field.
+	if gotBody != `{"threshold_pct":null,"pause_running":false}` {
+		t.Fatalf("request body = %s", gotBody)
+	}
+	if !strings.Contains(out.String(), "Weekly usage reserve: off") {
+		t.Fatalf("output = %q", out.String())
 	}
 }
