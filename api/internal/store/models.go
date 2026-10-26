@@ -1542,6 +1542,8 @@ type User struct {
 	NowSummaryEnabled       pgtype.Bool        `json:"now_summary_enabled"`
 	CodeCrossCheckEnabled   bool               `json:"code_cross_check_enabled"`
 	CodexJudgeModel         pgtype.Text        `json:"codex_judge_model"`
+	VaultMode               string             `json:"vault_mode"`
+	VaultEpoch              int64              `json:"vault_epoch"`
 }
 
 type UserCrossCheckPin struct {

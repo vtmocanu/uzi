@@ -25,6 +25,21 @@ func (q *Queries) DeleteAppSettings(ctx context.Context, keys []string) (int64, 
 	return result.RowsAffected(), nil
 }
 
+const getVaultPolicy = `-- name: GetVaultPolicy :one
+SELECT CASE WHEN (SELECT value FROM app_settings WHERE key = 'vault_policy') = 'optional'
+    THEN 'optional' ELSE 'required' END::text AS vault_policy
+`
+
+// Authoritative admission read: execute as a separate READ COMMITTED statement
+// after LockSettingsAdmission, never in the statement that acquires the lock.
+// Missing or malformed persisted policy always requires a vault.
+func (q *Queries) GetVaultPolicy(ctx context.Context) (string, error) {
+	row := q.db.QueryRow(ctx, getVaultPolicy)
+	var vault_policy string
+	err := row.Scan(&vault_policy)
+	return vault_policy, err
+}
+
 const listAppSettings = `-- name: ListAppSettings :many
 SELECT key, value, updated_by, updated_at FROM app_settings ORDER BY key
 `

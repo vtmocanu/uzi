@@ -1,3 +1,16 @@
+-- name: GetUserVaultState :one
+SELECT vault_mode, vault_epoch FROM users WHERE id = $1;
+
+-- name: LockUserVaultState :one
+SELECT vault_mode, vault_epoch FROM users WHERE id = $1 FOR UPDATE;
+
+-- name: AdvanceUserVaultMode :one
+UPDATE users SET vault_mode = @vault_mode, vault_epoch = vault_epoch + 1
+WHERE id = @id RETURNING vault_mode, vault_epoch;
+
+-- name: CountUnprotectedUsers :one
+SELECT count(*) FROM users WHERE vault_mode = 'unprotected';
+
 -- name: GetUserVault :one
 -- The user's KEK salt + wrapped DEK. The plaintext DEK is never selected (it is
 -- never stored); the caller derives the KEK from the login password and unwraps

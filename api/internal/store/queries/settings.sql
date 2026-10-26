@@ -1,3 +1,10 @@
+-- name: GetVaultPolicy :one
+-- Authoritative admission read: execute as a separate READ COMMITTED statement
+-- after LockSettingsAdmission, never in the statement that acquires the lock.
+-- Missing or malformed persisted policy always requires a vault.
+SELECT CASE WHEN (SELECT value FROM app_settings WHERE key = 'vault_policy') = 'optional'
+    THEN 'optional' ELSE 'required' END::text AS vault_policy;
+
 -- name: ListAppSettings :many
 SELECT * FROM app_settings ORDER BY key;
 

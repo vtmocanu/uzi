@@ -70,11 +70,12 @@ func (q *Queries) CountEnabledSecretSlot(ctx context.Context, arg CountEnabledSe
 }
 
 const countMasterSealedSecrets = `-- name: CountMasterSealedSecrets :one
-SELECT count(*) FROM user_secrets WHERE sealed_with = 'master'
+SELECT count(*) FROM user_secrets s JOIN users u ON u.id = s.user_id
+WHERE s.sealed_with = 'master' AND u.vault_mode = 'protected'
 `
 
-// Admin migration-progress signal (PRD #32): how many stored user secrets still
-// use the legacy master-key sealing — i.e. owners who have not unlocked since the
+// Admin migration-progress signal (PRD #32): how many protected users' secrets
+// still use legacy master-key sealing — i.e. owners who have not unlocked since the
 // vault rolled out. New saves are born 'dek' and lazy rewrap flips old rows on the
 // owner's next unlock, so this trends to zero; a persistently non-zero count flags
 // dormant accounts an operator may want to nudge.

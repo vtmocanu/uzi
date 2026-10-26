@@ -12,6 +12,28 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const advanceUserVaultMode = `-- name: AdvanceUserVaultMode :one
+UPDATE users SET vault_mode = $1, vault_epoch = vault_epoch + 1
+WHERE id = $2 RETURNING vault_mode, vault_epoch
+`
+
+type AdvanceUserVaultModeParams struct {
+	VaultMode string    `json:"vault_mode"`
+	ID        uuid.UUID `json:"id"`
+}
+
+type AdvanceUserVaultModeRow struct {
+	VaultMode  string `json:"vault_mode"`
+	VaultEpoch int64  `json:"vault_epoch"`
+}
+
+func (q *Queries) AdvanceUserVaultMode(ctx context.Context, arg AdvanceUserVaultModeParams) (AdvanceUserVaultModeRow, error) {
+	row := q.db.QueryRow(ctx, advanceUserVaultMode, arg.VaultMode, arg.ID)
+	var i AdvanceUserVaultModeRow
+	err := row.Scan(&i.VaultMode, &i.VaultEpoch)
+	return i, err
+}
+
 const claimVaultLockNotice = `-- name: ClaimVaultLockNotice :one
 UPDATE user_vaults SET lock_notified_at = now()
 WHERE user_id = $1 AND lock_notified_at IS NULL
@@ -40,6 +62,17 @@ WHERE user_id = $1 AND lock_notified_at IS NOT NULL
 func (q *Queries) ClearVaultLockNotice(ctx context.Context, userID uuid.UUID) error {
 	_, err := q.db.Exec(ctx, clearVaultLockNotice, userID)
 	return err
+}
+
+const countUnprotectedUsers = `-- name: CountUnprotectedUsers :one
+SELECT count(*) FROM users WHERE vault_mode = 'unprotected'
+`
+
+func (q *Queries) CountUnprotectedUsers(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, countUnprotectedUsers)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
 }
 
 const createUserVaultIfAbsent = `-- name: CreateUserVaultIfAbsent :one
@@ -115,6 +148,22 @@ func (q *Queries) GetUserVault(ctx context.Context, userID uuid.UUID) (UserVault
 		&i.UpdatedAt,
 		&i.LockNotifiedAt,
 	)
+	return i, err
+}
+
+const getUserVaultState = `-- name: GetUserVaultState :one
+SELECT vault_mode, vault_epoch FROM users WHERE id = $1
+`
+
+type GetUserVaultStateRow struct {
+	VaultMode  string `json:"vault_mode"`
+	VaultEpoch int64  `json:"vault_epoch"`
+}
+
+func (q *Queries) GetUserVaultState(ctx context.Context, id uuid.UUID) (GetUserVaultStateRow, error) {
+	row := q.db.QueryRow(ctx, getUserVaultState, id)
+	var i GetUserVaultStateRow
+	err := row.Scan(&i.VaultMode, &i.VaultEpoch)
 	return i, err
 }
 
@@ -195,4 +244,20 @@ func (q *Queries) ListUsersNeedingVaultLockNotice(ctx context.Context) ([]ListUs
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockUserVaultState = `-- name: LockUserVaultState :one
+SELECT vault_mode, vault_epoch FROM users WHERE id = $1 FOR UPDATE
+`
+
+type LockUserVaultStateRow struct {
+	VaultMode  string `json:"vault_mode"`
+	VaultEpoch int64  `json:"vault_epoch"`
+}
+
+func (q *Queries) LockUserVaultState(ctx context.Context, id uuid.UUID) (LockUserVaultStateRow, error) {
+	row := q.db.QueryRow(ctx, lockUserVaultState, id)
+	var i LockUserVaultStateRow
+	err := row.Scan(&i.VaultMode, &i.VaultEpoch)
+	return i, err
 }
