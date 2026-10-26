@@ -485,13 +485,14 @@ func TestCoordinatedCodexRefreshCancelledMidExchangeRecoverableLiveDB(t *testing
 	capw := env.mintCap(t, f.runID, f.workerID)
 
 	ctx, cancel := context.WithCancel(env.ctx)
+	operationID := uuid.New()
 	var (
 		res  CodexRefreshResult
 		rerr error
 		done = make(chan struct{})
 	)
 	go func() {
-		res, rerr = f.svc.CoordinatedCodexRefresh(ctx, f.wkr, f.runID, capw, uuid.New(), 0)
+		res, rerr = f.svc.CoordinatedCodexRefresh(ctx, f.wkr, f.runID, capw, operationID, 0)
 		close(done)
 	}()
 
@@ -529,19 +530,34 @@ func TestCoordinatedCodexRefreshCancelledMidExchangeRecoverableLiveDB(t *testing
 		t.Fatal("lease_deadline must be set on a held lease")
 	}
 
-	// Recovery: a survivor whose clock is past the lease deadline reaps the expired lease to
-	// quarantine and resolves the stranded 'rotating' intent — the account is NOT permanently
-	// stuck holding a live lease.
+	// ADR-3523: cancellation is a non-rejection provider error. Its detached receipt
+	// keeps the intent eligible for one retry even though this survivor has no
+	// provider/vault configured. It reaps the lease without discarding eligibility.
 	recSvc := &Service{q: env.q, box: env.box, now: func() time.Time { return time.Now().Add(codexRefreshLeaseTTL + time.Minute) }}
 	n, err := recSvc.ReconcileUnresolvedCodexRefresh(env.ctx, f.userID, f.accountID)
 	if err != nil {
 		t.Fatalf("reconcile after cancel: %v", err)
 	}
-	if n != 1 {
-		t.Fatalf("reconcile resolved %d intents, want 1", n)
+	if n != 0 {
+		t.Fatalf("reconcile resolved %d intents, want 0 while reuse remains eligible", n)
 	}
 	if acct := env.mustAccount(t, f.userID, f.accountID); acct.CoordState != codexCoordQuarantined {
 		t.Fatalf("coord_state = %q, want quarantined (the stranded lease was reaped)", acct.CoordState)
+	}
+	intent, err := env.q.GetCodexRefreshIntent(env.ctx, store.GetCodexRefreshIntentParams{UserID: f.userID, OperationID: operationID})
+	if err != nil || intent.State != codexIntentRotating || !intent.ProviderErrorAt.Valid || intent.ReuseAttemptedAt.Valid {
+		t.Fatalf("cancelled intent state=%s receipt=%v consumed=%v err=%v", intent.State, intent.ProviderErrorAt.Valid, intent.ReuseAttemptedAt.Valid, err)
+	}
+	// Eligibility is bounded by the database clock, not the survivor's injected
+	// clock. Once it expires, ordinary resolution makes the intent unrecoverable.
+	env.exec("UPDATE codex_refresh_intent SET created_at=now()-interval '31 minutes' WHERE operation_id=$1", operationID)
+	n, err = recSvc.ReconcileUnresolvedCodexRefresh(env.ctx, f.userID, f.accountID)
+	if err != nil || n != 1 {
+		t.Fatalf("reconcile after eligibility expired=%d,%v, want 1,nil", n, err)
+	}
+	intent, err = env.q.GetCodexRefreshIntent(env.ctx, store.GetCodexRefreshIntentParams{UserID: f.userID, OperationID: operationID})
+	if err != nil || intent.State != codexIntentUnrecoverable || intent.ReuseAttemptedAt.Valid || fake.callCount() != 1 {
+		t.Fatalf("expired intent state=%s consumed=%v provider calls=%d err=%v", intent.State, intent.ReuseAttemptedAt.Valid, fake.callCount(), err)
 	}
 }
 

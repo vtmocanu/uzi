@@ -224,8 +224,11 @@ func (f *joinedReuseFix) strand(t *testing.T, lane string) {
 	parkHeldCodexFix(t, e, fx)
 	f.held = mustRun(t, e, fx.runID)
 	// A separate claimed, frozen run has a current capability. The parked run's
-	// revoked capability would prove only revocation, not account quarantine.
-	f.shadow = e.seedCodexRun(t, fx.userID, fx.workerA, fx.repoID)
+	// revoked capability would prove only revocation, not account quarantine. Give
+	// it a separate repo because seedCodexRun always uses issue 1, and the held
+	// run still counts against the active-run uniqueness constraint.
+	shadowRepo := e.seedCodexRepo(t, fx.userID)
+	f.shadow = e.seedCodexRun(t, fx.userID, fx.workerA, shadowRepo)
 	if err := fx.svc.FreezeCodexBinding(e.ctx, fx.userID, f.shadow, fx.aliasID, codexAuthModeSubscription); err != nil {
 		t.Fatal(err)
 	}
