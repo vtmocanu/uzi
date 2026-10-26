@@ -674,6 +674,7 @@ export class CodexHarness implements RunHarness {
 
   /** Route frames carrying `threadId` into `sink` instead of the root loop. */
   registerChildSink(threadId: string, sink: CodexChildSink): void {
+    this.registry.assertWorkAdmission();
     this.childSinks.set(threadId, sink);
   }
 
@@ -942,7 +943,7 @@ export class CodexHarness implements RunHarness {
         return Promise.reject(err);
       }
     }
-    return transport.request<T>(method, params, opts);
+    return this.registry.admitWork(() => transport.request<T>(method, params, opts));
   }
 
   /** Answer a child server→client tool-call on the shared transport. Best-effort: an
@@ -965,6 +966,7 @@ export class CodexHarness implements RunHarness {
   }
 
   startTurn(request: RunTurnRequest): HarnessTurn {
+    this.registry.assertWorkAdmission();
     if (this.closed) {
       throw new CodexHarnessError({ category: "transport", message: "codex harness is closed" });
     }
@@ -1055,6 +1057,7 @@ export class CodexHarness implements RunHarness {
     let reject!: (error: unknown) => void;
     const completion = new Promise<void>((done, fail) => { resolve = done; reject = fail; });
     this.closeCompletion = completion;
+    this.registry.retainCleanup(completion);
     void this.closeOwned().then(resolve, reject);
     return completion;
   }
@@ -1071,6 +1074,7 @@ export class CodexHarness implements RunHarness {
     let failed = false;
     try { await this.transport?.close(); }
     catch (error) { primary = error; failed = true; }
+    await Promise.allSettled([...this.pendingToolCalls]);
     try { await this.appServerAuth?.drainInterceptedRequests(); }
     catch (error) {
       if (failed) throw new AggregateError([primary, error], "codex harness close failed");
@@ -1127,6 +1131,7 @@ export class CodexHarness implements RunHarness {
   }
 
   private async *runTurn(request: RunTurnRequest, rendered: RenderedCodexRun): AsyncGenerator<HarnessEvent> {
+    this.registry.assertWorkAdmission();
     this.currentModel = rendered.lead.model ?? this.provider.model;
     const ordinal = this.turnOrdinal;
     this.liveProjectionTurn = ordinal;
@@ -1474,6 +1479,7 @@ export class CodexHarness implements RunHarness {
   }
 
   private async ensureRoot(signal?: AbortSignal): Promise<void> {
+    this.registry.assertWorkAdmission();
     if (this.transport) {
       // A prior startup may have failed after the root was registered. Re-enter the
       // pinned auth owner so its poison state remains the explicit failure, and never
@@ -1523,12 +1529,30 @@ export class CodexHarness implements RunHarness {
       }));
       throw new CodexHarnessError({ category: "protocol", message: "codex provider root failed registry admission" });
     }
-    this.transport = launched.transport;
+    const raw = launched.transport;
+    const registry = this.registry;
+    this.transport = {
+      get protocolFailure() { return raw.protocolFailure; },
+      request: (method, params, opts) => registry.admitWork(() => raw.request(method, params, opts)),
+      notify: (method, params) => { registry.assertWorkAdmission(); raw.notify(method, params); },
+      respond: (id, response) => { registry.assertWorkAdmission(); raw.respond(id, response); },
+      notifications: () => {
+        registry.assertWorkAdmission();
+        const notes = raw.notifications();
+        return {
+          [Symbol.asyncIterator]() { return this; },
+          next: () => registry.admitWork(() => notes.next()),
+          return: notes.return ? value => registry.retainCleanup(notes.return!(value)) : undefined,
+        };
+      },
+      installServerRequestInterceptor: raw.installServerRequestInterceptor?.bind(raw),
+      close: () => registry.retainCleanup(raw.close()),
+    };
     // The pinned initialize/initialized/login sequence completes before any thread/model
     // work. The auth owner has no reference to the model callback broker.
-    await this.appServerAuth?.authenticate(launched.transport, signal);
+    await this.registry.admitWork(() => this.appServerAuth?.authenticate(this.transport!, signal) ?? Promise.resolve());
     // Single-consumer: obtain the notifications iterator exactly once for the root.
-    this.notes = launched.transport.notifications();
+    this.notes = this.transport.notifications();
     this.log.debug("codex provider root launched", { supervisorPid: launched.supervisorPid });
   }
 

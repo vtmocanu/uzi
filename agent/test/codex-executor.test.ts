@@ -24810,3 +24810,128 @@ describe("issue3472 M1 Codex repository instruction snapshot", () => {
     });
   });
 });
+
+
+describe("3404 terminal executor lifetime", () => {
+  const done = epochResponder("th-1", "tn-1", t => { t.push(signalDone()).push(turnCompleted()); });
+  function barrier() {
+    let resolve!: () => void;
+    const promise = new Promise<void>(r => { resolve = r; });
+    return { promise, resolve };
+  }
+
+  it("3404 seals a real completed provider/provision incarnation and rejects runtime fakes and foreign seals", async () => {
+    const rig = makeRig({ responder: done });
+    const executor = makeExecutor(rig, bindingOf(API_KEY));
+    const { ctx } = makeCtx();
+    await executor.run(ctx);
+    assert.ok(rig.providerLaunches() > 0);
+    assert.ok(rig.disposed() > 0);
+    const source = Object.freeze({ runId: ctx.runId });
+    const result = await executor.sealTerminalLifetime(source);
+    assert.equal(result.kind, "sealed");
+    if (result.kind !== "sealed") return;
+    assert.equal(executor.acceptsTerminalLifetimeSeal(result.seal, source), true);
+    assert.equal(executor.acceptsTerminalLifetimeSeal({}, source), false);
+    assert.equal(executor.acceptsTerminalLifetimeSeal(JSON.parse(JSON.stringify(result.seal)), source), false);
+    assert.equal(executor.acceptsTerminalLifetimeSeal(result.seal, { runId: ctx.runId }), false);
+    const foreign = makeExecutor(makeRig(), bindingOf(API_KEY));
+    assert.equal(foreign.acceptsTerminalLifetimeSeal(result.seal, source), false);
+    const launches = rig.providerLaunches(), credentials = rig.client.releaseCalls.length;
+    await assert.rejects(executor.run(ctx), /lifetime closed/);
+    await assert.rejects(executor.withCredentialFreeCapture(100, async () => {}), /lifetime closed/);
+    await assert.rejects(executor.settleForCredentialFreeCapture(100), /lifetime closed/);
+    assert.equal(rig.providerLaunches(), launches);
+    assert.equal(rig.client.releaseCalls.length, credentials);
+    assert.equal((await executor.sealTerminalLifetime(source)), result);
+  });
+
+  it("3404 closes synchronously and joins a retained progress observer without failing the completed run", async () => {
+    const entered = barrier(), release = barrier();
+    const responder = epochResponder("th-1", "tn-1", t => {
+      t.push(toolCall(7, "report_progress", { completed: ["m1"], in_progress: [], milestones_agents: {} }))
+        .push(signalDone()).push(turnCompleted());
+    });
+    const rig = makeRig({ responder });
+    const executor = makeExecutor(rig, bindingOf(API_KEY));
+    const { ctx } = makeCtx({ approvedMilestones: [{ id: "m1", title: "one" }],
+      reportProgress: async () => { entered.resolve(); await release.promise; } });
+    const result = await executor.run(ctx);
+    await entered.promise;
+    let sealed = false;
+    const sealing = executor.sealTerminalLifetime({}).then(value => { sealed = true; return value; });
+    try {
+      await assert.rejects(executor.run(ctx), /lifetime closed/);
+      await tick();
+      assert.equal(sealed, false);
+      release.resolve();
+      assert.equal((await sealing).kind, "sealed");
+      assert.equal(result.branch, ctx.branch);
+    } finally { release.resolve(); await sealing; }
+  });
+
+  for (const failure of ["reap", "dispose", "fileop"] as const) {
+    it(`3404 ${failure} cleanup uncertainty never seals or retries model work`, async () => {
+      const rig = makeRig({ responder: done });
+      if (failure === "reap") rig.root.reap = async () => ({ ok: false, error: { category: "tool", message: "no ECHILD" } });
+      if (failure === "dispose") rig.root.dispose = async () => { throw new Error("cleanup unconfirmed"); };
+      if (failure === "fileop") rig.deps = { ...rig.deps, wireFileop: () => ({ client: { op: async () => ({ ok: true }) },
+        dispose: async () => { throw new Error("fileop closure failed"); } }) };
+      const executor = makeExecutor(rig, bindingOf(API_KEY));
+      const { ctx } = makeCtx();
+      const completed = await executor.run(ctx);
+      const launches = rig.providerLaunches();
+      assert.equal((await executor.sealTerminalLifetime({})).kind, "unproven");
+      assert.equal(completed.branch, ctx.branch);
+      assert.equal(rig.providerLaunches(), launches);
+    });
+  }
+
+  it("3404 delayed provider factory blocks seal and active-run sealing remains permanently unproven", async () => {
+    const entered = barrier(), release = barrier();
+    const rig = makeRig({ responder: done });
+    const launch = rig.deps.launchProviderRoot!;
+    rig.deps = { ...rig.deps, launchProviderRoot: async (...args) => {
+      entered.resolve(); await release.promise; return launch(...args);
+    } };
+    const executor = makeExecutor(rig, bindingOf(API_KEY));
+    const running = executor.run(makeCtx().ctx).catch(() => undefined);
+    await entered.promise;
+    let settled = false;
+    const sealing = executor.sealTerminalLifetime({}).then(value => { settled = true; return value; });
+    try {
+      await tick();
+      assert.equal(settled, false);
+      release.resolve();
+      await running;
+      assert.equal((await sealing).kind, "unproven");
+      assert.equal((await executor.sealTerminalLifetime({})).kind, "unproven");
+    } finally { release.resolve(); await running; await sealing; }
+  });
+
+  it("3404 delayed cache removal keeps original settlement in the lifetime after pending delivery", async () => {
+    const raw = barrier();
+    const rig = makeRig({ responder: done });
+    rig.deps = { ...rig.deps,
+      startCacheHolder: async token => ({ token, path: "/cache", alive: () => false,
+        release: async () => ({ state: "error", reason: "unused" }) }),
+      removeCommandCache: async () => ({ state: "pending", reason: "",
+        settlement: raw.promise.then(() => ({ state: "removed", reason: "" })) }),
+    };
+    const executor = makeExecutor(rig, bindingOf(API_KEY));
+    await executor.run(makeCtx().ctx);
+    let settled = false;
+    const sealing = executor.sealTerminalLifetime({}).then(value => { settled = true; return value; });
+    try {
+      await tick(); assert.equal(settled, false);
+      raw.resolve(); assert.equal((await sealing).kind, "sealed");
+    } finally { raw.resolve(); await sealing; }
+  });
+
+  it("3404 structural source strings confer no authority", async () => {
+    const rig = makeRig({ responder: done });
+    const executor = makeExecutor(rig, bindingOf(API_KEY));
+    await executor.run(makeCtx().ctx);
+    assert.equal((await executor.sealTerminalLifetime("run-1" as never)).kind, "unproven");
+  });
+});

@@ -387,6 +387,8 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     private readonly reaperAttempt?: () => SdkAttemptEnv | undefined,
   ) {
     this.registry = registry;
+    registry.bindFacade(this, () => this.disposalPromise === undefined ||
+      (this.disposalOutcome !== undefined && this.acceptsTerminalDisposal(this.disposalOutcome)));
     this.seams = seams;
     this.reconcileBeforeBoundary = reconcileBeforeBoundary;
     cleanupReaders.set(this, {
@@ -518,6 +520,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     request: BoundaryRequest,
     action: (permit: BoundaryPermit) => Promise<T>,
   ): Promise<T> {
+    this.registry.assertWorkAdmission();
     // Refusal must precede queue admission and preserve completed capture evidence.
     const state = this.registry.state();
     if (state === "poisoned" || state === "disposed") {
@@ -532,6 +535,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     let release!: () => void;
     const held = new Promise<void>((res) => { release = res; });
     this.queueTail = prior.then(() => held);
+    this.registry.retainCleanup(this.queueTail);
     let admissionExpired = false;
     try {
       try {
@@ -573,6 +577,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
         }
         throw error;
       }
+      this.registry.assertWorkAdmission();
       return await this.runBoundary(request, action, deadlineAt);
     } finally {
       release();
@@ -607,6 +612,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
   private async captureOperation<T>(
     deadlineMs: number, action?: (context: CredentialFreeCaptureContext) => Promise<T>, externalSignal?: AbortSignal,
   ): Promise<CredentialFreeCaptureSettlement | CredentialFreeCaptureResult<T>> {
+    this.registry.assertWorkAdmission();
     const deadlineAt = this.now() + Math.max(0, deadlineMs);
     const budget = MaintenanceBudget.current();
     const budgetSignal = MaintenanceBudget.signal();
@@ -618,6 +624,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     this.queueTail = new Promise<void>((res) => {
       release = res;
     });
+    this.registry.retainCleanup(this.queueTail);
     let timer: ReturnType<typeof setTimeout> | undefined;
     let queued = true;
     let onAbort: (() => void) | undefined;
@@ -981,6 +988,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     permit: BoundaryPermit | CredentialFreeCaptureContext,
     request: BoundaryProcessRequest,
   ): Promise<BoundaryProcessHandle> {
+    this.registry.assertWorkAdmission();
     // Own startup, admission and failed-admission cleanup before invoking the seam.
     let resolve!: (handle: BoundaryProcessHandle) => void;
     let reject!: (error: unknown) => void;
@@ -1280,6 +1288,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     argv: readonly string[],
     identity: BoundaryActionIdentity,
   ): Promise<BoundaryActionOutcome> {
+    this.registry.assertWorkAdmission();
     // Refuse before creating/tracking a promise. Besides making the permit check
     // synchronous with admission, this prevents repeated out-of-boundary calls from
     // accumulating already-settled refusal promises in pendingActions.
@@ -1287,6 +1296,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       return Promise.resolve({ kind: "refused", reason: "stale_permit" });
     }
     const p = this.runBoundaryAction(permit, argv, identity);
+    this.registry.retainCleanup(p);
     this.pendingActions.push(p);
     return p;
   }
@@ -1391,6 +1401,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     let resolve!: (outcome: ToolDisposal) => void;
     let reject!: (error: unknown) => void;
     this.disposalPromise = new Promise((yes, no) => { resolve = yes; reject = no; });
+    this.registry.retainCleanup(this.disposalPromise);
     void this.disposeQueued(request).then(outcome => {
       this.disposalOutcome = outcome;
       resolve(outcome);
@@ -1403,6 +1414,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     const prior = this.queueTail;
     let release!: () => void;
     this.queueTail = new Promise<void>(resolve => { release = resolve; });
+    this.registry.retainCleanup(this.queueTail);
     let queued = true;
     let cancelDeadline: (() => void) | undefined;
     try {
