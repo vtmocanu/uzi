@@ -2493,7 +2493,7 @@ describe("M2 Git retirement process proof", () => {
     });
   }
 
-  for (const exdev of [false, true]) for (const failedRestore of [false, true]) for (const seam of ["actual journal-clear runGit await", "retired append settlement", "physical check", "beforeDestroy guard"] as const) {
+  for (const exdev of [false, true]) for (const failedRestore of [false, true]) for (const seam of ["one-shot postmove proof exception", "actual journal-clear runGit await", "retired append settlement", "physical check", "beforeDestroy guard"] as const) {
     if (failedRestore && seam !== "actual journal-clear runGit await") continue;
     it(`normal attempt revocation at ${seam} restores raw metadata EXDEV=${exdev} failedRestore=${failedRestore}`, async (t) => {
       const owner = randomUUID(), branch = "agent/issue-2852";
@@ -2560,6 +2560,11 @@ describe("M2 Git retirement process proof", () => {
       let finalProofChecks = 0;
       await assert.rejects(git.retireRunnerClone(bare, clonePath, branch, owner, {
         discard: true, attemptId, processProof: () => {
+          if (seam === "one-shot postmove proof exception" && movedTo && !injected) {
+            revoke();
+            live = true; // Later observations cannot erase the thrown denial.
+            throw new Error("process proof revoked: one-shot callback exception");
+          }
           if (physicalSettled && !injected && ++finalProofChecks === 2) revoke();
           return live;
         },

@@ -11143,11 +11143,10 @@ export class GitCache {
         //    concurrent successor must never have its journal cleared by us.
         stage = "journal_clear";
         const still = await this.readRecoveryCapture(barePath, branch);
-        const processRevoked = opts.processProof !== undefined && opts.processProof() !== true;
-        if (processRevoked && !opts.completionSource) {
-          processRevokedHere = true;
-          throw new Error("runner clone process proof revoked");
-        }
+        // Normal observations must latch exceptions as well as false returns, so
+        // a one-shot callback failure cannot disappear on the rollback recheck.
+        if (!opts.completionSource) checkProcessProof();
+        const processRevoked = opts.completionSource !== undefined && opts.processProof !== undefined && opts.processProof() !== true;
         if (processRevoked || residueQuarantine() !== undefined || (opts.completionSource && !opts.completionSource.canDelete())) {
           // issue #2213: a latch landed after the move. Undo it (best-effort), keep the journal and
           // dispose of nothing; the latched worker keeps the clone at its journaled path.
