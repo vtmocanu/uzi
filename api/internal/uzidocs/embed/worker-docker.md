@@ -268,7 +268,11 @@ acceptance remain pending; this is not production-verification evidence.
   pod-epoch helper (`/usr/local/lib/uzi/pod-epoch-init.cjs`) to record the
   pod before seeding, so it needs the new image too: on an old image it
   fails closed the same way (`Init:CrashLoopBackOff`, named by the roll
-  health) before `runner-init`. An old controller with a new image works.
+  health) before `runner-init`. An old controller with a new image boots
+  (image skew). Rolling the controller back after the layout migration is a
+  different case: drain recovery custody first, and recovery records for
+  migrated clones read as missing until you roll forward again (see
+  **Rolling back the controller** below and ADR-3153 D10).
 - **Custody-held workers migrate later.** A Docker worker that holds
   recovery custody for a run stays on its old pod layout (the `emptyDir`)
   until custody releases, so its unpublished clone is not lost by the

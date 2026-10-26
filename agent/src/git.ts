@@ -2388,7 +2388,13 @@ export class GitCache {
         opts.signal ?? new AbortController().signal, opts.deadline ?? Date.now() + RETAINED_INSPECT_BUDGET_MS,
         async () => {
           this.checkRecoveryInterruption();
-          const handle = await fs.opendir(this.reposRoot, { bufferSize: 1 });
+          let handle: Awaited<ReturnType<typeof fs.opendir>>;
+          try { handle = await fs.opendir(this.reposRoot, { bufferSize: 1 }); }
+          catch (error) {
+            // A fresh volume has no repos root yet: an empty, complete census.
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+            throw error;
+          }
           try {
             this.checkRecoveryInterruption();
             let entries = 0;

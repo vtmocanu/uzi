@@ -126,6 +126,21 @@ for (const limits of [{ maxMetadataBytes: 32 }, { maxMetadataRecords: 1 }] satis
     assert.equal((await inspect()).sources.length, 2, "epoch limits do not leak into operator reads");
   });
 }
+it("a missing repos root is an empty, complete census; any other open failure is not", async () => {
+  const fresh = fs.mkdtempSync(path.join(fixture.dataDir, "..", "epoch-fresh-"));
+  try {
+    const empty = new GitCache(fresh, nullLogger(), undefined, testGitCacheOptions());
+    const result = await empty.discoverEpochRetainedSources({ deadline: Date.now() + 90_000 });
+    assert.equal(result.inventoryComplete, true);
+    assert.equal(result.overflowExact, true);
+    assert.equal(result.unreadable, 0);
+    assert.equal(result.groups.length, 0);
+    fs.writeFileSync(path.join(fresh, "repos"), "not a directory");
+    const blocked = await empty.discoverEpochRetainedSources({ deadline: Date.now() + 90_000 });
+    assert.equal(blocked.inventoryComplete, false);
+    assert.equal(blocked.unreadable, 1);
+  } finally { fs.rmSync(fresh, { recursive: true, force: true }); }
+});
 it("invalid config is unreadable and cannot produce a complete census", async () => {
   fs.appendFileSync(path.join(bare, "config"), "\n[unterminated\n");
   const result = await cache.discoverEpochRetainedSources();
