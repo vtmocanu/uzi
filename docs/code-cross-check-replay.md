@@ -76,4 +76,4 @@ CI's agent test job checks out shallow, so only the corpus test's hermetic layer
 
 ## Maintainer follow-up
 
-Outside issue #3357 and unnumbered: running the authorized baseline, adjudicating every unmatched and control finding, and posting the `score --adjudications` aggregate (with `unadjudicated_findings` at 0) on #3167 completes PRD #3167 M1, whose baseline includes false positives. That unblocks its M2 and M3a and PRD #3168 M2.
+Outside issue #3357 and unnumbered: running the authorized baseline, adjudicating every unmatched and control finding, and posting the `score --adjudications` aggregate (with `unadjudicated_findings` at 0) on #3167 completes PRD #3167 M1, whose baseline includes false positives. Run it from a checkout at the baseline commit `4d018dbd69175cc7d60f5acefd7ae122311a1ba1`, with `agent/` dependencies installed from that commit's lockfile, so it measures the code brief from before PRD #3167 M2 and M3a change it. Record the full baseline SHA and the worker-image digest with the aggregate. The aggregate unblocks PRD #3167 M3b and PRD #3168 M2.
