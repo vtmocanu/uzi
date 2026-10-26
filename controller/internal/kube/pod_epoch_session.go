@@ -241,11 +241,17 @@ func (s *PodEpochSession) chargeKey(key string) bool {
 	s.bytes += len(key)
 	return true
 }
+
+// podEpochPrivatePID reports the audited topology: init exit tears down a private PID
+// namespace. Host PID or a shared pod PID namespace breaks that premise.
+func podEpochPrivatePID(p *corev1.Pod) bool {
+	return !p.Spec.HostPID && (p.Spec.ShareProcessNamespace == nil || !*p.Spec.ShareProcessNamespace)
+}
 func podEpochSignal(p *corev1.Pod) ([]PodEpochContainer, []PodEpochContainer, bool) {
 	if p.Status.Phase != corev1.PodSucceeded && p.Status.Phase != corev1.PodFailed {
 		return nil, nil, false
 	}
-	if p.Spec.RuntimeClassName != nil || len(p.Spec.EphemeralContainers) > 0 || len(p.Status.EphemeralContainerStatuses) > 0 {
+	if p.Spec.RuntimeClassName != nil || len(p.Spec.EphemeralContainers) > 0 || len(p.Status.EphemeralContainerStatuses) > 0 || !podEpochPrivatePID(p) {
 		return nil, nil, false
 	}
 	// Synthetic failures are not runtime termination observations.
@@ -518,6 +524,9 @@ func (s *PodEpochSession) produce(w PodEpochWorker, p *corev1.Pod, r *podEpochRe
 	}
 	if !podEpochRuntime(w.Runtime) {
 		return negative("runtime_not_declared")
+	}
+	if !podEpochPrivatePID(p) {
+		return negative("successor_pid_unaudited")
 	}
 	if x == nil || x.terminal == 0 || x.terminal >= r.start || x.tainted || x.identity == nil {
 		return negative("predecessor_unproven")

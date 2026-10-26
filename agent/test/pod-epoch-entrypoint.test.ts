@@ -43,6 +43,28 @@ printf 'runtime=%s\\nbootstrap=%s\\ncache=%s\\ntsx=%s\\nca=%s\\n' "$UZI_EPOCH_RU
 printf 'arg=%s\\n' "$@"
 `);
   const chown = stub("chown", 'printf "chown %s\\n" "$*" >> "$OPLOG"\n');
+  // Portable BusyBox seam, as in entrypoint-migration.test.ts: the real /bin/busybox where it
+  // exists (Linux CI), else host tools for the applets these paths call. The actual-image
+  // proof (e2e/worker-uid/pod-epoch-proof.sh) still runs the image's own BusyBox.
+  const busybox = stub("busybox", `
+[ -x /bin/busybox ] && exec /bin/busybox "$@"
+sub=$1; shift
+case "$sub" in
+  env|tr|cat) exec "$sub" "$@" ;;
+  readlink) [ "$1" = -f ] || exit 2; exec realpath "$2" ;;
+  stat)
+    stat -c %u / >/dev/null 2>&1 && exec stat "$@"
+    follow=; [ "$1" = -L ] && { follow=-L; shift; }
+    [ "$1" = -c ] || exit 2
+    case "$2" in
+      "%u %g %a") out=$(stat $follow -f '%u %g %Mp%Lp' "$3") || exit 1
+        set -- $out; m=$3; case "$m" in 0?*) m=\${m#0} ;; esac; printf '%s %s %s\\n' "$1" "$2" "$m" ;;
+      %h) exec stat $follow -f %l "$3" ;;
+      *) exit 2 ;;
+    esac ;;
+  *) exit 2 ;;
+esac
+`);
   const helper = path.join(root, "helper.cjs");
   fs.writeFileSync(helper, `
 const fs = require('node:fs');
@@ -63,6 +85,7 @@ if (process.argv[2] === 'hold') {
     .replace("ID=/usr/bin/id", `ID=${id}`)
     .replace("TINI=/sbin/tini", `TINI=${tini}`)
     .replace("CHOWN=/bin/chown", `CHOWN=${chown}`)
+    .replace("BUSYBOX=/bin/busybox", `BUSYBOX=${busybox}`)
     .replace("NODE=/usr/local/bin/node", `NODE=${process.execPath}`)
     .replace("EPOCH_HELPER=/usr/local/lib/uzi/pod-epoch-init.cjs", `EPOCH_HELPER=${helper}`)
     .replace("EPOCH_BOOTSTRAP=/tmp/uzi-epoch-bootstrap", `EPOCH_BOOTSTRAP=${bootstrap}`)

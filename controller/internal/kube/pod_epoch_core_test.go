@@ -208,6 +208,8 @@ func TestPodEpochRefusals(t *testing.T) {
 		{"ephemeral-spec", func(p *corev1.Pod) { p.Spec.EphemeralContainers = []corev1.EphemeralContainer{{}} }},
 		{"ephemeral-status", func(p *corev1.Pod) { p.Status.EphemeralContainerStatuses = []corev1.ContainerStatus{{Name: "debug"}} }},
 		{"runtimeclass", func(p *corev1.Pod) { v := ""; p.Spec.RuntimeClassName = &v }},
+		{"host-pid", func(p *corev1.Pod) { p.Spec.HostPID = true }},
+		{"shared-pid", func(p *corev1.Pod) { v := true; p.Spec.ShareProcessNamespace = &v }},
 		{"no-id", func(p *corev1.Pod) { p.Status.ContainerStatuses[0].ContainerID = "" }},
 		{"negative-restarts", func(p *corev1.Pod) { p.Status.ContainerStatuses[0].RestartCount = -1 }},
 		{"minus-one", func(p *corev1.Pod) { p.Status.ContainerStatuses[0].State.Terminated.ExitCode = -1 }},
@@ -232,6 +234,42 @@ func TestPodEpochRefusals(t *testing.T) {
 		h := newEpochHarness(t, epochPod(epochA))
 		h.event(watch.Deleted, epochPod(epochA))
 		h.assertDecision(h.event(watch.Added, epochPod(epochB)), false)
+	})
+	for _, mode := range []string{"host-pid", "shared-pid"} {
+		t.Run("successor-"+mode, func(t *testing.T) {
+			h := newEpochHarness(t, epochPod(epochA))
+			h.event(watch.Modified, epochTerminal(epochPod(epochA)))
+			b := epochPod(epochB)
+			if mode == "host-pid" {
+				b.Spec.HostPID = true
+			} else {
+				v := true
+				b.Spec.ShareProcessNamespace = &v
+			}
+			h.assertDecision(h.event(watch.Added, b), false)
+		})
+		t.Run("foreign-before-"+mode, func(t *testing.T) {
+			w := epochPod(epochC)
+			w.Labels = map[string]string{}
+			if mode == "host-pid" {
+				w.Spec.HostPID = true
+			} else {
+				v := true
+				w.Spec.ShareProcessNamespace = &v
+			}
+			h := newEpochHarness(t, epochPod(epochA), w)
+			h.event(watch.Modified, epochTerminal(w))
+			h.event(watch.Modified, epochTerminal(epochPod(epochA)))
+			h.assertDecision(h.event(watch.Added, epochPod(epochB)), false)
+		})
+	}
+	t.Run("private-pid-explicit-false", func(t *testing.T) {
+		h := newEpochHarness(t, epochPod(epochA))
+		x := epochTerminal(epochPod(epochA))
+		v := false
+		x.Spec.ShareProcessNamespace = &v
+		h.event(watch.Modified, x)
+		h.assertDecision(h.event(watch.Added, epochPod(epochB)), true)
 	})
 	t.Run("signal-after-add", func(t *testing.T) {
 		h := newEpochHarness(t, epochPod(epochA))

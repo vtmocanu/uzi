@@ -263,8 +263,12 @@ acceptance remain pending; this is not production-verification evidence.
   bumps that pin when the agent changed. A new controller with an old image
   fails closed: the `runner-init` init container refuses the pod (it stays
   in `Init:CrashLoopBackOff` and the roll health names the init container)
-  before it, dind or the worker touch the run directory. The `seed-nix`
-  init container runs earlier and behaves as before. An old controller with a new image works.
+  before it, dind or the worker touch the run directory. On a Docker worker
+  the `seed-nix` init container runs earlier and now calls the image's
+  pod-epoch helper (`/usr/local/lib/uzi/pod-epoch-init.cjs`) to record the
+  pod before seeding, so it needs the new image too: on an old image it
+  fails closed the same way (`Init:CrashLoopBackOff`, named by the roll
+  health) before `runner-init`. An old controller with a new image works.
 - **Custody-held workers migrate later.** A Docker worker that holds
   recovery custody for a run stays on its old pod layout (the `emptyDir`)
   until custody releases, so its unpublished clone is not lost by the
