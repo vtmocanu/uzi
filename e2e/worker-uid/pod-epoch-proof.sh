@@ -200,7 +200,7 @@ for template in base jvm; do
       owner=$(apk info --who-owns /usr/bin/flock)
       printf "%s\n" "$owner"
       case "$owner" in "/usr/bin/flock is owned by flock-"[0-9]*) ;; *) exit 1 ;; esac
-      package=$(apk info -v flock)
+      package=$(apk info -e -v flock)
       printf "%s\n" "$package"
       case "$package" in flock-[0-9]*) ;; *) exit 1 ;; esac
       printf "%s  %s\n" "$1" /usr/local/lib/uzi/pod-epoch-init.cjs \

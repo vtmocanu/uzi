@@ -164,7 +164,7 @@ class ProofTest(unittest.TestCase):
                 "no-new-privileges", "--tmpfs", "/data", "--tmpfs", "/nix", "--entrypoint"])
             self.assertEqual(probe[17:22], ["/bin/sh", IDS[template], "-eu", "-c", probe[21]])
             for literal in ("/usr/bin/flock --version", "apk info --who-owns /usr/bin/flock",
-                            "apk info -v flock", "/usr/local/lib/uzi/pod-epoch-init.cjs",
+                            "apk info -e -v flock", "/usr/local/lib/uzi/pod-epoch-init.cjs",
                             "/app/templates/pod-epoch-init.cjs", "/usr/local/sbin/uzi-entrypoint",
                             "sha256sum -c -"):
                 self.assertIn(literal, probe[21])

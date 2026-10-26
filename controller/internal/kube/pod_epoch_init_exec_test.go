@@ -301,7 +301,7 @@ func TestPodEpochInitExecBusyRecordSkipsButProtectedInitWaits(t *testing.T) {
 			defer func() {
 				stop()
 				if done != nil {
-					<-done
+					_ = <-done // drain only: after stop() cancels the child its exit error is expected
 				}
 			}()
 			h.awaitEvent("SH-wait")

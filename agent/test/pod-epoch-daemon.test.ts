@@ -31,6 +31,7 @@ async function daemon(t: TestContext, route: Route = () => false, count = 0, uni
     if (path === "/_ping") { res.end("OK"); return; }
     const match = /^\/containers\/([a-f0-9]{64})\/json$/.exec(path);
     if (match) {
+      res.setHeader("Content-Type", "application/json");
       res.end(JSON.stringify({ Id: match[1],
         State: { Running: false, Restarting: false, Paused: false, Status: "exited" },
         HostConfig: { RestartPolicy: { Name: "no" } } })); return;
