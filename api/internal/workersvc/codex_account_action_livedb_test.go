@@ -2,8 +2,11 @@ package workersvc
 
 import (
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // seedActionRecovery puts a properly sealed recovery login at the account's current generation
@@ -162,4 +165,101 @@ func TestCodexAccountActionsForRunsLiveDB(t *testing.T) {
 			t.Fatalf("after promotion: actions = %v, err = %v, want none", got, err)
 		}
 	})
+}
+
+// TestCodexAccountActionRetryPendingLiveDB exercises the display query and service
+// over receipt states. Intent age is fixed in SQL; consumed retry age is independent.
+func TestCodexAccountActionRetryPendingLiveDB(t *testing.T) {
+	for _, tc := range []struct {
+		name                  string
+		intentSet, accountSet string
+		disabled, recovery    bool
+		pending               bool
+		want                  string
+	}{
+		{name: "eligible", pending: true, want: CodexAccountActionReconciling},
+		{name: "consumed disabled alias old intent", intentSet: "created_at=now()-interval '1 hour', reuse_attempted_at=now()", disabled: true, pending: true, want: CodexAccountActionReconciling},
+		{name: "expired unconsumed window", intentSet: "created_at=now()-interval '31 minutes'", want: CodexAccountActionReloginRequired},
+		{name: "consumed crash bound expired", intentSet: "reuse_attempted_at=now()-interval '53 seconds'", want: CodexAccountActionReloginRequired},
+		{name: "consumed inside bound", intentSet: "reuse_attempted_at=now()-interval '30 seconds'", pending: true, want: CodexAccountActionReconciling},
+		{name: "wrong operation", accountSet: "coord_operation_id=gen_random_uuid()", want: CodexAccountActionReloginRequired},
+		{name: "moved generation", accountSet: "generation=generation+1", want: CodexAccountActionReloginRequired},
+		{name: "no receipt", intentSet: "provider_error_at=NULL", want: CodexAccountActionReloginRequired},
+		{name: "unconsumed disabled alias", disabled: true, want: CodexAccountActionReloginRequired},
+		{name: "failed retry", intentSet: "reuse_attempted_at=now(), state='unrecoverable'", want: CodexAccountActionReloginRequired},
+		{name: "reauth precedence", accountSet: "reauth_required=true, reauth_generation=generation, reauth_credential_revision=credential_revision", want: CodexAccountActionReloginRequired},
+		{name: "recovery control", recovery: true, want: CodexAccountActionReconciling},
+		{name: "consumed recovery control", intentSet: "reuse_attempted_at=now()", recovery: true, want: CodexAccountActionReconciling},
+		{name: "committed control", accountSet: "coord_state='committed'", want: CodexAccountActionResuming},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := setupCodexLiveDB(t)
+			fx, svc := heldCodexFix(t, env)
+			op := uuid.New()
+			env.exec("UPDATE codex_provider_account SET coord_operation_id=$2, lease_deadline=NULL WHERE id=$1", fx.accountID, op)
+			env.exec(`INSERT INTO codex_refresh_intent
+                (operation_id,user_id,provider_account_id,from_generation,state,created_at,provider_error_at)
+                SELECT $1,user_id,id,generation,'rotating',now()-interval '1 minute',now()
+                FROM codex_provider_account WHERE id=$2`, op, fx.accountID)
+			// Never leave an unresolved intent for another test's survivor sweep.
+			t.Cleanup(func() { env.exec("DELETE FROM codex_refresh_intent WHERE operation_id=$1", op) })
+			if tc.intentSet != "" {
+				env.exec("UPDATE codex_refresh_intent SET "+tc.intentSet+" WHERE operation_id=$1", op)
+			}
+			if tc.accountSet != "" {
+				fx.setAccount(t, tc.accountSet)
+			}
+			if tc.disabled {
+				env.exec("UPDATE user_secrets SET disabled_at=now() WHERE id=$1", fx.aliasID)
+			}
+			if tc.recovery {
+				seedActionRecovery(t, fx)
+			}
+			ids := []uuid.UUID{fx.runID}
+			rows, err := env.q.ListCodexAccountActionInputs(env.ctx, store.ListCodexAccountActionInputsParams{
+				RunIds: ids, ReuseInFlightMicroseconds: codexRefreshReuseInFlightBound.Microseconds(),
+			})
+			if err != nil || len(rows) != 1 {
+				t.Fatalf("query rows=%d err=%v", len(rows), err)
+			}
+			if rows[0].RetryPending != tc.pending {
+				t.Fatalf("retry_pending=%v want %v", rows[0].RetryPending, tc.pending)
+			}
+			// Retry eligibility is DB-clocked even when the service clock is far ahead.
+			svc.SetClock(func() time.Time { return time.Now().Add(time.Hour) })
+			got, err := svc.CodexAccountActionsForRuns(env.ctx, ids)
+			if err != nil || len(got) != 1 || got[fx.runID].Action != tc.want {
+				t.Fatalf("actions=%v err=%v want %s", got, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestCodexAccountActionRetryBoundParamLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	fx, _ := heldCodexFix(t, env)
+	op := uuid.New()
+	env.exec("UPDATE codex_provider_account SET coord_operation_id=$2, lease_deadline=NULL WHERE id=$1", fx.accountID, op)
+	env.exec(`INSERT INTO codex_refresh_intent
+        (operation_id,user_id,provider_account_id,from_generation,state,created_at,provider_error_at,reuse_attempted_at)
+        SELECT $1,user_id,id,generation,'rotating',now()-interval '1 hour',now()-interval '1 minute',now()-interval '1 minute'
+        FROM codex_provider_account WHERE id=$2`, op, fx.accountID)
+	t.Cleanup(func() { env.exec("DELETE FROM codex_refresh_intent WHERE operation_id=$1", op) })
+	for _, tc := range []struct {
+		bound   time.Duration
+		pending bool
+	}{
+		{codexRefreshReuseInFlightBound, false},
+		{2 * time.Minute, true},
+	} {
+		rows, err := env.q.ListCodexAccountActionInputs(env.ctx, store.ListCodexAccountActionInputsParams{
+			RunIds: []uuid.UUID{fx.runID}, ReuseInFlightMicroseconds: tc.bound.Microseconds(),
+		})
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("bound=%v rows=%d err=%v", tc.bound, len(rows), err)
+		}
+		if rows[0].RetryPending != tc.pending {
+			t.Fatalf("bound=%v retry_pending=%v want %v", tc.bound, rows[0].RetryPending, tc.pending)
+		}
+	}
 }

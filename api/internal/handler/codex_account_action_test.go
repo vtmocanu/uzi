@@ -28,8 +28,8 @@ type codexActionStore struct {
 	calls [][]uuid.UUID
 }
 
-func (s *codexActionStore) ListCodexAccountActionInputs(_ context.Context, ids []uuid.UUID) ([]store.ListCodexAccountActionInputsRow, error) {
-	s.calls = append(s.calls, ids)
+func (s *codexActionStore) ListCodexAccountActionInputs(_ context.Context, arg store.ListCodexAccountActionInputsParams) ([]store.ListCodexAccountActionInputsRow, error) {
+	s.calls = append(s.calls, arg.RunIds)
 	return s.rows, s.err
 }
 
@@ -139,10 +139,10 @@ type heldRunsStore struct {
 	actionRows []store.ListCodexAccountActionInputsRow
 }
 
-func (s *heldRunsStore) ListCodexAccountActionInputs(_ context.Context, ids []uuid.UUID) ([]store.ListCodexAccountActionInputsRow, error) {
+func (s *heldRunsStore) ListCodexAccountActionInputs(_ context.Context, arg store.ListCodexAccountActionInputsParams) ([]store.ListCodexAccountActionInputsRow, error) {
 	var out []store.ListCodexAccountActionInputsRow
 	for _, row := range s.actionRows {
-		if slices.Contains(ids, row.ID) {
+		if slices.Contains(arg.RunIds, row.ID) {
 			out = append(out, row)
 		}
 	}

@@ -475,7 +475,7 @@ for (const stage of ["plan", "code"] as const) {
      } },
     }).execute(c);
     assert.equal(modelCalls, 1);
-    assert.equal(diffReads, stage === "code" ? 1 : 0);
+    assert.equal(diffReads, stage === "code" ? 2 : 0);
     assert.equal(removals, 1);
     assert.deepEqual(states, [
      { status: "running", claim_generation: 7 },

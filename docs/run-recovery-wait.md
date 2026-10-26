@@ -294,8 +294,10 @@ board each name one of four states (a state this client does not recognise
 reads **Codex account unavailable**):
 
 - **Codex account is reconciling** — the account is repairing its login on
-  its own. No action is needed; the run resumes automatically once it
-  clears.
+  its own after an uncertain renewal or while verifying protected login
+  material. Let recovery finish; unlock your vault or enable the login if
+  needed. The run resumes automatically if recovery succeeds, or asks you
+  to log in again if it cannot recover.
 - **Re-log in Codex credential \<label\> to continue** — the account has no way back on
   its own. Log in again in Settings, on the **same** credential — the same
   alias, the same ChatGPT account. Logging in with a different account does
@@ -308,8 +310,10 @@ reads **Codex account unavailable**):
   worker that holds its source, including when the hold began at a running
   checkpoint; normal worker-affinity limits still apply.
 
-A successful same-credential re-login re-admits the run: the activity feed
-records the re-admission, naming the credential and what changed.
+Automatic account recovery or a successful same-credential re-login re-admits
+the run: the activity feed records the re-admission, naming the credential
+and what changed. You can replace the login on that same credential while
+recovery is still in progress; uzi verifies it before using it.
 
 ### No expiry, no timer
 
@@ -394,8 +398,10 @@ the source and retry visibly with bounded backoff instead of failing after
 the ordinary blocked-capture limit. Verified capture is still required to
 park. Cancellation, shutdown and loss of the claim retain precedence; other
 recovery causes keep their existing limit. After unlock, the recovery sweep
-promotes the protected login before the run can resume. The original refresh
-token is never exchanged again.
+promotes the protected login before the run can resume. Recovering this
+protected login does not exchange the original refresh token again. After a
+separate uncertain renewal failure, uzi may make one automatic recovery attempt;
+if that cannot recover the account, follow the request to log in again.
 
 Deploy the API before upgrading the affected workers. Older workers keep
 their existing first-request vault-lock reply, including pending retention,

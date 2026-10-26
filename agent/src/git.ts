@@ -258,12 +258,25 @@ export interface CodeSnapshotRetirementProof {
  *  a late reader sees only EOF. A caller may await something before it reads (the finalize
  *  import starts its `index-pack` consumer first, which under the real supervisor can take
  *  longer than a small `pack-objects` takes to exit and reap); the bytes wait in `out`, with
- *  backpressure pausing the source, instead of being lost. */
+ *  backpressure pausing the source, instead of being lost.
+ *
+ *  `classifyAtAttach` (issue #3304, supervised boundary children only): the handle can reach this
+ *  function after its source already ended, closed or failed (the Codex supervisor closes its stdio
+ *  copies at launch, so a fast, silent child's pipe can be over before the handle is returned), and
+ *  a terminal event emitted before the listeners attach is never delivered again. With the flag the
+ *  source's terminal STATE is recorded as flags only and the exit verdict decides, through
+ *  {@link settle}'s precedence: data already read is lost output (refused at exit), an errored source
+ *  is refused with its error, an ended source with nothing ever read is a genuine empty EOF (valid
+ *  only on a clean exit), a source destroyed without ending is a premature close deferred to exit.
+ *  Nothing is destroyed eagerly. `fail(err)` settles the output with a typed error from the owner
+ *  when the supervised child's scope stops while the source can no longer finish by itself.
+ *  Callers that deliberately hand over a consumed source (`attachStdout`) keep the flag off. */
 function exitGatedStream(
   source: Readable,
   onAbandon?: () => void,
   deferPrematureCloseUntilExit = false,
-): { out: Readable; exited: (err?: Error) => void } {
+  classifyAtAttach = false,
+): { out: Readable; exited: (err?: Error) => void; fail: (err: Error) => void; done: () => boolean } {
   const out = new PassThrough();
   // A caller may drop the stream unread (tests do; a skipped publish could): an exit error
   // with no listener would be an uncaught exception that kills the worker. Consumers that
@@ -271,6 +284,7 @@ function exitGatedStream(
   out.on("error", () => undefined);
   let sourceEnded = false;
   let sourceClosedPrematurely = false;
+  let attachFailure: Error | undefined;
   let finished = false;
   let exit: { err?: Error } | undefined;
   const settle = (): void => {
@@ -278,6 +292,9 @@ function exitGatedStream(
     if (exit.err) {
       finished = true;
       out.destroy(exit.err);
+    } else if (attachFailure) {
+      finished = true;
+      out.destroy(attachFailure);
     } else if (sourceEnded) {
       finished = true;
       out.end();
@@ -312,6 +329,12 @@ function exitGatedStream(
     sourceEnded = true;
     settle();
   });
+  if (classifyAtAttach) {
+    if (source.errored) attachFailure = source.errored;
+    else if (source.readableDidRead) attachFailure = new Error("git stdout was read before it was attached (output lost)");
+    else if (source.readableEnded) sourceEnded = true;
+    else if (source.destroyed) sourceClosedPrematurely = true;
+  }
   source.pipe(out, { end: false });
   return {
     out,
@@ -319,6 +342,13 @@ function exitGatedStream(
       exit ??= { err };
       settle();
     },
+    fail: (err) => {
+      if (finished || out.destroyed) return;
+      finished = true;
+      source.unpipe(out);
+      out.destroy(err);
+    },
+    done: () => finished || out.destroyed,
   };
 }
 
@@ -756,7 +786,8 @@ interface BoundaryProcessScope {
   spawn: BoundaryProcessSpawner;
   signal: AbortSignal;
   /** Checkpoint-only budget. The soft signal may forfeit a queued lock or abort
-   * broker I/O; it must never abort an active child output collector. */
+   * broker I/O; it never settles a child output collector before that child's
+   * cancellation and completion have settled through its handle (issue #3304). */
   softSignal?: AbortSignal;
   softDeadlineAt?: number;
   now?: () => number;
@@ -13212,6 +13243,8 @@ try {
     if (!Number.isFinite(timeoutMs)) throw new Error(`${what}: timeoutMs must be finite`);
     const deadlineError = new Error(`${what} exceeded ${timeoutMs}ms`);
     const budgeted = !!this.recoveryOperation()?.budget || MaintenanceResources.active();
+    // issue #3304: the scope's stop signals, read at spawn time. A masked scope carries no soft signal.
+    const stopSignals = this.boundaryStopSignals();
     const { stdout, exited, cancel } = await this.spawnGit(barePath, [...args], undefined, {
       timeoutMs,
       cancelOnAbandon: budgeted,
@@ -13223,10 +13256,20 @@ try {
       let bytes = 0;
       let settled = false;
       let timer: NodeJS.Timeout | undefined;
+      // Once the boundary scope stops, this plain deadline must not race the owner's typed verdict: the
+      // stopped scope settles the gated stdout itself (spawnGit), so the timer only retires. It never
+      // settles, abandons or kills anything, and it is never armed again.
+      let retired = false;
+      const retire = (): void => {
+        retired = true;
+        if (timer !== undefined) clearTimeout(timer);
+        timer = undefined;
+      };
       const finish = (result: BoundedRead | undefined, error?: Error): void => {
         if (settled) return;
         settled = true;
         if (timer !== undefined) clearTimeout(timer);
+        for (const signal of stopSignals) signal.removeEventListener("abort", retire);
         opts.signal?.removeEventListener("abort", onAbort);
         stdout.removeListener("data", onData);
         stdout.removeListener("end", onEnd);
@@ -13262,7 +13305,11 @@ try {
       stdout.on("data", onData);
       stdout.once("end", onEnd);
       stdout.once("error", onError);
-      timer = setTimeout(() => finish(undefined, deadlineError), timeoutMs);
+      if (stopSignals.some(signal => signal.aborted)) retired = true;
+      else {
+        for (const signal of stopSignals) signal.addEventListener("abort", retire, { once: true });
+        timer = setTimeout(() => { if (!retired) finish(undefined, deadlineError); }, timeoutMs);
+      }
       if (opts.signal?.aborted) onAbort();
       else opts.signal?.addEventListener("abort", onAbort, { once: true });
     });
@@ -15116,6 +15163,7 @@ try {
    * as {@link runGit} (via {@link spawnGit}), no shell, and the same GIT_TIMEOUT_MS bound.
    */
   private async streamBundleWithCap(barePath: string, args: string[], outPath: string, maxBytes: number): Promise<void> {
+    const stopSignals = this.boundaryStopSignals();
     const { child, stdout, exited, cancel } = await this.spawnGit(barePath, args, undefined, { timeoutMs: GIT_TIMEOUT_MS, stdoutCategory: "artifactBytes" });
     let seen = 0;
     const counter = new Transform({
@@ -15129,10 +15177,24 @@ try {
       cancel();
       if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     };
-    const timer = setTimeout(() => {
-      killChild();
-      counter.destroy(new Error(`git ${args.join(" ")} exceeded ${GIT_TIMEOUT_MS}ms`));
-    }, GIT_TIMEOUT_MS);
+    // issue #3304: after the boundary scope stops, this plain deadline only retires (see readBare); the
+    // gated stdout settles with the owner's typed error and the catch below still kills and removes.
+    let retired = false;
+    let timer: NodeJS.Timeout | undefined;
+    const retire = (): void => {
+      retired = true;
+      if (timer !== undefined) clearTimeout(timer);
+      timer = undefined;
+    };
+    if (stopSignals.some(signal => signal.aborted)) retired = true;
+    else {
+      for (const signal of stopSignals) signal.addEventListener("abort", retire, { once: true });
+      timer = setTimeout(() => {
+        if (retired) return;
+        killChild();
+        counter.destroy(new Error(`git ${args.join(" ")} exceeded ${GIT_TIMEOUT_MS}ms`));
+      }, GIT_TIMEOUT_MS);
+    }
     try {
       await pipeline(stdout, counter, createWriteStream(outPath, { mode: 0o600 }));
       await exited;
@@ -15144,7 +15206,8 @@ try {
       await fs.rm(outPath, { force: true });
       throw err;
     } finally {
-      clearTimeout(timer);
+      if (timer !== undefined) clearTimeout(timer);
+      for (const signal of stopSignals) signal.removeEventListener("abort", retire);
     }
   }
 
@@ -16139,6 +16202,13 @@ try {
     }
   }
 
+  /** issue #3304: the active boundary scope's stop signals (hard permit signal, and the soft signal unless
+   *  the scope is masked), read once when a read starts. Empty outside a boundary scope. */
+  private boundaryStopSignals(): AbortSignal[] {
+    const scope = this.boundaryProcesses.getStore();
+    return scope ? [scope.signal, scope.softSignal].filter((signal): signal is AbortSignal => signal !== undefined) : [];
+  }
+
   /** Called under the existing lock, after observation. Only cooperative checkpoint
    * cancellation is masked; the spawner, hard signal and release hook are identical. */
   private maskCheckpointCooperation<T>(action: () => Promise<T>): Promise<T> {
@@ -16504,6 +16574,16 @@ try {
     process.stdin?.on("error", () => undefined);
     if (!recovery?.signal.aborted) process.stdin?.end(input);
     const cap = options.maxBuffer ?? GIT_MAX_BUFFER;
+    // issue #3304: the soft signal of an UNMASKED scope settles a collector only after the child's own
+    // cancellation and completion have settled through its handle, and only if the stream still has not ended.
+    let softJoin: Promise<void> | undefined;
+    const joinSoftStop = (): Promise<void> => softJoin ??= (async () => {
+      // The handle's own soft listener (spawnCheckpointProcess) requests the cancellation while the handle
+      // still admits it; once completion has settled nothing is needed.
+      await Promise.allSettled([process.completed]);
+      // An EOF already queued on the stream (delivered on a later tick) must land before the verdict.
+      await new Promise<void>(resolve => setImmediate(resolve));
+    })();
     const collect = (source: Readable | null): Promise<{ chunks: Buffer[]; oversized: boolean }> =>
       new Promise((resolve, reject) => {
         if (!source) { resolve({ chunks: [], oversized: false }); return; }
@@ -16514,6 +16594,7 @@ try {
         let settled = false;
         const cleanup = (): void => {
           boundary.signal.removeEventListener("abort", onAbort);
+          boundary.softSignal?.removeEventListener("abort", onSoft);
           stream.removeListener("data", onData);
           stream.removeListener("end", onEnd);
           stream.removeListener("close", onClose);
@@ -16549,6 +16630,10 @@ try {
           stream.destroy();
           settle(undefined, new Error(GIT_OUTPUT_ABORT_MESSAGE));
         };
+        const onSoft = (): void => {
+          if (settled) return;
+          void joinSoftStop().then(() => settle(undefined, new CheckpointSoftDeadlineError()));
+        };
         stream.on("data", onData);
         stream.once("end", onEnd);
         stream.once("close", onClose);
@@ -16561,7 +16646,11 @@ try {
         else if (stream.readableEnded) onEnd();
         else if (stream.destroyed) onClose();
         if (boundary.signal.aborted) onAbort();
-        else boundary.signal.addEventListener("abort", onAbort, { once: true });
+        else {
+          boundary.signal.addEventListener("abort", onAbort, { once: true });
+          if (boundary.softSignal?.aborted) onSoft();
+          else boundary.softSignal?.addEventListener("abort", onSoft, { once: true });
+        }
       });
     let stdout: { chunks: Buffer[]; oversized: boolean };
     let stderr: { chunks: Buffer[]; oversized: boolean };
@@ -16813,7 +16902,48 @@ try {
         stderrBytes += kept.length;
       });
       const gated = exitGatedStream(this.meteredGitOutput(process.stdout, opts.stdoutCategory, abortRecovery),
-        opts.cancelOnAbandon || MaintenanceResources.active() ? abortRecovery : undefined, true);
+        opts.cancelOnAbandon || MaintenanceResources.active() ? abortRecovery : undefined, true, true);
+      // issue #3304: the child's clean exit does not end the gated output by itself (its source may never
+      // deliver an EOF), and the handle stops cancelling once its completion has settled. When the scope's
+      // hard signal, or its soft signal where the scope carries one (a masked scope has none), fires while
+      // the output is still unfinished, the child is joined (its spawner's handle stops it on the hard
+      // signal; on soft, the handle's soft listener requests cancellation while it still admits it), then
+      // the output settles with the typed verdict. The `exited` calls below are first-wins, so a rejection or soft timeout of
+      // the completion itself still reaches the output through them (tests: v2 control in
+      // runner-m2-done-checkpoint, git-startup-timeout).
+      const stopSignals = [boundary.signal, boundary.softSignal].filter((signal): signal is AbortSignal => signal !== undefined);
+      const unwatchStops = (): void => {
+        for (const signal of stopSignals) signal.removeEventListener("abort", stopOutput);
+      };
+      let stopSettling: Promise<void> | undefined;
+      const stopOutput = (): void => {
+        if (stopSettling || gated.done()) return;
+        stopSettling = (async () => {
+          // No cancellation is requested here. On a soft stop the handle's own soft listener
+          // (spawnCheckpointProcess) requests it while the handle still admits cancellation (once completion
+          // has settled nothing is needed). On a hard stop the scope's spawner (the Codex safety handle or TickSpawner) stops the child on its own signal,
+          // and a cancel() request would mirror its typed completion rejection into an unsafe-cleanup error.
+          const cleanup = await Promise.allSettled([process.completed]);
+          for (const result of cleanup) {
+            if (result.status !== "rejected") continue;
+            const reason = result.reason;
+            gated.fail(reason instanceof CheckpointUnsafeCleanupError || reason instanceof TrustedExecutionRefusal ||
+              reason instanceof GitBoundaryAbortError || reason instanceof CheckpointSoftDeadlineError
+              ? reason : new CheckpointUnsafeCleanupError("checkpoint metadata child settlement unverified", reason));
+            return;
+          }
+          // An EOF already queued on the source (delivered on a later tick) must land before this verdict.
+          await new Promise<void>(resolve => setImmediate(resolve));
+          gated.fail(boundary.signal.aborted
+            ? new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE, undefined, boundary.capture?.signal)
+            : new CheckpointSoftDeadlineError());
+        })();
+        void stopSettling.finally(unwatchStops);
+      };
+      for (const signal of stopSignals) signal.addEventListener("abort", stopOutput, { once: true });
+      gated.out.once("finish", unwatchStops);
+      gated.out.once("close", unwatchStops);
+      if (stopSignals.some(signal => signal.aborted)) stopOutput();
       stderr?.on("error", error => { abortRecovery(); gated.exited(error); });
       process.completed.then(({ code, softTimedOut }) => {
         const expired = completionError();
@@ -16823,6 +16953,10 @@ try {
           return;
         }
         if (code !== 0) {
+          // A stopped scope owns cancellation. Its verified nonzero completion (TickSpawner
+          // resolves with 128 on a signal) must not beat stopOutput's typed verdict while
+          // that handler gives an already-queued EOF one turn to arrive.
+          if (stopSignals.some(signal => signal.aborted)) return;
           const detail = Buffer.concat(stderrChunks).subarray(0, stderrCap).toString().trim();
           gated.exited(new Error(`git ${args.join(" ")} exited ${code}${detail ? `: ${detail}` : ""}`));
         } else gated.exited();
