@@ -76,6 +76,19 @@ func (f *reuseWorkerStore) SetCodexRefreshIntentState(ctx context.Context, arg s
 	return 1, nil
 }
 
+func (f *reuseWorkerStore) SetCodexRefreshReuseUnrecoverable(ctx context.Context, arg store.SetCodexRefreshReuseUnrecoverableParams) (int64, error) {
+	if f.intent.State != codexIntentRotating || !f.intent.ProviderErrorAt.Valid || !f.intent.ReuseAttemptedAt.Valid ||
+		arg.UserID != f.acct.UserID || arg.AccountID != f.acct.ID || arg.OperationID != f.intent.OperationID ||
+		arg.FromGeneration != f.acct.Generation || f.intent.FromGeneration != arg.FromGeneration ||
+		f.acct.CoordState != codexCoordQuarantined || !f.acct.CoordOperationID.Valid ||
+		uuid.UUID(f.acct.CoordOperationID.Bytes) != arg.OperationID || len(f.acct.RecoverySealed) != 0 || f.acct.ReauthRequired {
+		return 0, nil
+	}
+	return f.SetCodexRefreshIntentState(ctx, store.SetCodexRefreshIntentStateParams{
+		UserID: arg.UserID, OperationID: arg.OperationID, State: codexIntentUnrecoverable,
+	})
+}
+
 func (f *reuseWorkerStore) SetCodexRefreshIntentStateFenced(_ context.Context, arg store.SetCodexRefreshIntentStateFencedParams) (int64, error) {
 	f.intent.State = arg.State
 	return 1, nil
@@ -345,6 +358,61 @@ func TestCodexReuseWorkerOwnerFence(t *testing.T) {
 	}
 	if p.calls != 1 || st.writes != 1 || len(st.acct.RecoverySealed) != 0 || st.promotes != 0 {
 		t.Fatal("owner fence miss persisted or retried material")
+	}
+}
+
+// The original review reproduction used the actual sibling reconciler in the
+// provider callback. Cover both synchronous termination and background exhaustion.
+func TestCodexReuseWorkerLateTerminalPreservesRestore(t *testing.T) {
+	for _, kind := range []string{"provider_error", "seal_error", "sync_loss", "background_loss"} {
+		t.Run(kind, func(t *testing.T) {
+			s, st, p, admit := newReuseWorker(t)
+			restore := func() {
+				st.acct.Generation++
+				st.acct.CoordState = codexCoordIdle
+				st.acct.CoordOperationID.Valid = false
+				if _, _, err := s.reconcileUnresolvedCodexRefresh(context.Background(), st.acct.UserID, st.acct.ID); err != nil {
+					t.Fatal(err)
+				}
+				if st.intent.State != codexIntentReconciled {
+					t.Fatal("restored generation did not reconcile")
+				}
+			}
+			var bg func()
+			switch kind {
+			case "provider_error":
+				p.onRefresh = restore
+				p.err = errors.New("late provider error")
+			case "seal_error":
+				p.onRefresh = func() {
+					restore()
+					s.vlt.Lock(st.acct.UserID)
+					s.box = nil
+				}
+			case "sync_loss":
+				p.onRefresh = restore
+				st.writeErr = errors.New("db unavailable")
+			case "background_loss":
+				st.writeErr = errors.New("db unavailable")
+				s.background = func(fn func()) { bg = fn }
+			}
+			if applied, err := s.retryCodexRefreshReuse(context.Background(), st, st.acct, st.intent, admit); !applied || err != nil {
+				t.Fatalf("retry applied=%v err=%v", applied, err)
+			}
+			if kind == "background_loss" {
+				if bg == nil {
+					t.Fatal("missing retained writer")
+				}
+				restore()
+				bg()
+			}
+			if st.intent.State != codexIntentReconciled || st.acct.CoordState != codexCoordIdle || st.acct.Generation != 1 {
+				t.Fatal("late retry reversed owner restore reconciliation")
+			}
+			if p.calls != 1 || st.terminals != 0 || len(st.acct.RecoverySealed) != 0 {
+				t.Fatal("late retry overwrote restored state or material")
+			}
+		})
 	}
 }
 

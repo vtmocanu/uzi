@@ -1029,17 +1029,15 @@ func (s *Service) retryCodexRefreshReuse(ctx context.Context, q codexRefreshStor
 	result, rerr := s.codexRefresh.Refresh(providerCtx, prev.RefreshToken)
 	cancel()
 	logCodexRefreshPhase(it.OperationID, codexRefreshPhaseOAuthPostReuse, start, rerr)
-	terminal := func() {
-		wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), codexRecoverySlotWriteTimeout)
-		defer cancel()
-		s.markCodexIntentUnrecoverable(wctx, q, acct.UserID, it.OperationID)
+	terminal := func(writeCtx context.Context) {
+		s.markCodexReuseUnrecoverable(writeCtx, q, acct, it)
 	}
 	if rerr != nil {
 		var authErr *codexauth.AuthError
 		if errors.As(rerr, &authErr) && authErr.RefreshMaterialRejected() {
 			s.recordCodexRefreshRejection(ctx, acct.UserID, acct.ID, it.OperationID, acct.Generation)
 		} else {
-			terminal()
+			terminal(ctx)
 		}
 		return true, nil
 	}
@@ -1047,7 +1045,7 @@ func (s *Service) retryCodexRefreshReuse(ctx context.Context, q codexRefreshStor
 	merged := mergeCodexLogin(prev, result)
 	raw, err := json.Marshal(merged) //nolint:gosec // G117: the merged codex login is sealed before recovery persistence
 	if err != nil {
-		terminal()
+		terminal(ctx)
 		return true, nil
 	}
 	sealed, sealedWith, err := s.sealCodexLogin(acct.UserID, raw)
@@ -1058,16 +1056,37 @@ func (s *Service) retryCodexRefreshReuse(ctx context.Context, q codexRefreshStor
 		cause = pgconv.Text("vault_locked")
 	}
 	if err != nil {
-		terminal()
+		terminal(ctx)
 		return true, nil
 	}
 	// A background handoff is retained-pending: do not mark it terminal merely
 	// because the synchronous writes did not complete.
-	_, err = s.persistCodexRecoverySlotWithCause(ctx, q, acct.UserID, acct.ID, it.OperationID, acct.Generation, sealed, sealedWith, cause)
+	_, err = s.persistCodexRecoverySlotWithTerminal(ctx, q, acct.UserID, acct.ID, it.OperationID, acct.Generation, sealed, sealedWith, cause, terminal)
 	if err != nil {
-		terminal()
+		terminal(ctx)
 	}
 	return true, nil
+}
+
+// codexRefreshReuseTerminalStore keeps the admitted retry's terminal write separate
+// from original-attempt writes. Missing support fails closed until survivor resolution.
+type codexRefreshReuseTerminalStore interface {
+	SetCodexRefreshReuseUnrecoverable(context.Context, store.SetCodexRefreshReuseUnrecoverableParams) (int64, error)
+}
+
+func (s *Service) markCodexReuseUnrecoverable(ctx context.Context, q codexRefreshStore, acct store.CodexProviderAccount, it store.CodexRefreshIntent) {
+	terminal, ok := q.(codexRefreshReuseTerminalStore)
+	if !ok {
+		return
+	}
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), codexRecoverySlotWriteTimeout)
+	defer cancel()
+	_, err := terminal.SetCodexRefreshReuseUnrecoverable(wctx, store.SetCodexRefreshReuseUnrecoverableParams{
+		UserID: acct.UserID, AccountID: acct.ID, OperationID: it.OperationID, FromGeneration: it.FromGeneration,
+	})
+	if err != nil {
+		slog.Warn("codex refresh: reuse terminal write deferred", "operation", it.OperationID, "result", CodexTimingResult(err))
+	}
 }
 
 // codexRefreshRejector records a provider rejection of an operation's refresh material
@@ -1141,6 +1160,12 @@ func (s *Service) persistCodexRecoverySlot(ctx context.Context, q codexRefreshSt
 // persistCodexRecoverySlotWithCause returns true only for a completed synchronous write.
 // Background retries keep the same fenced parameters and nullable cause.
 func (s *Service) persistCodexRecoverySlotWithCause(ctx context.Context, q codexRefreshStore, userID, accountID, operationID uuid.UUID, fromGeneration int64, sealedMerged []byte, sealedWith string, cause pgtype.Text) (bool, error) {
+	return s.persistCodexRecoverySlotWithTerminal(ctx, q, userID, accountID, operationID, fromGeneration, sealedMerged, sealedWith, cause, nil)
+}
+
+// persistCodexRecoverySlotWithTerminal uses the same resilient persistence path;
+// admitted reuse supplies its fenced terminal writer for background exhaustion.
+func (s *Service) persistCodexRecoverySlotWithTerminal(ctx context.Context, q codexRefreshStore, userID, accountID, operationID uuid.UUID, fromGeneration int64, sealedMerged []byte, sealedWith string, cause pgtype.Text, terminal func(context.Context)) (bool, error) {
 	params := store.SetCodexRecoverySlotParams{
 		Sealed:             append([]byte(nil), sealedMerged...),
 		RecoveryCause:      cause,
@@ -1184,7 +1209,11 @@ func (s *Service) persistCodexRecoverySlotWithCause(ctx context.Context, q codex
 		// re-login by marking THIS op's intent unrecoverable, on its own fresh detached ctx.
 		uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), codexRecoverySlotWriteTimeout)
 		defer cancel()
-		s.markCodexIntentUnrecoverable(uctx, q, userID, operationID)
+		if terminal != nil {
+			terminal(uctx)
+		} else {
+			s.markCodexIntentUnrecoverable(uctx, q, userID, operationID)
+		}
 		slog.Warn("codex refresh: recovery slot persistence gave up", "account", accountID, "operation", operationID)
 	})
 	return false, nil
@@ -1544,10 +1573,11 @@ type codexRefreshSweepStore interface {
 // lists every account with an expired in_progress lease, an unresolved rotating intent, or
 // un-promoted recovery material at the current generation (issue #1532, race 1), and runs the
 // per-account reap→quarantine→resolve state machine on each, so an interrupted refresh can no
-// longer wedge an account forever. It NEVER re-spends a refresh token or auto-recovers a live
-// op. One account's failure is captured and surfaced but does not abort the rest.
+// longer wedge an account forever. Only a receipt-bearing, durably admitted retry may
+// reuse the original token; a live operation is never recovered. One account's failure is
+// captured and surfaced but does not abort the rest.
 //
-// Returns the number of ACCOUNTS this pass CHANGED (reaped, had intents resolved, or promoted /
+// Returns the number of ACCOUNTS this pass CHANGED (reaped, admitted retry, resolved intents, or promoted /
 // cleared recovery material), not the intent count. Counting CHANGED accounts is deliberate on
 // two fronts. Counting accounts rather than intents (a rare crash between advanceCodexRefresh's
 // intent→'unrecoverable' write and its QuarantineCodexAccount write can leave an in_progress

@@ -92,6 +92,66 @@ func TestCodexRefreshReuseAdmissionLiveDB(t *testing.T) {
 	}
 }
 
+// CI-owned execution: the admitted retry may terminate before its in-flight
+// bound, but cannot reverse reconciliation, a restore, or protected recovery.
+func TestCodexRefreshReuseTerminalFenceLiveDB(t *testing.T) {
+	for _, kind := range []string{"current", "reconciled", "restored", "operation", "recovery", "unconsumed", "no_receipt", "foreign_owner"} {
+		t.Run(kind, func(t *testing.T) {
+			ctx, q, f, _, b := reuseFixture(t)
+			if ok, err := store.AdmitCodexRefreshReuse(ctx, b, reuseArg(f)); err != nil || !ok {
+				t.Fatalf("admit=%v,%v", ok, err)
+			}
+			var change string
+			switch kind {
+			case "reconciled":
+				change = "UPDATE codex_refresh_intent SET state='reconciled' WHERE operation_id=$1"
+			case "restored":
+				change = "UPDATE codex_provider_account SET generation=generation+1,coord_state='idle',coord_operation_id=NULL WHERE coord_operation_id=$1"
+			case "operation":
+				change = "UPDATE codex_provider_account SET coord_operation_id=NULL WHERE coord_operation_id=$1"
+			case "recovery":
+				change = "UPDATE codex_provider_account SET recovery_sealed='protected',recovery_generation=generation,recovery_sealed_with='master' WHERE coord_operation_id=$1"
+			case "unconsumed":
+				change = "UPDATE codex_refresh_intent SET reuse_attempted_at=NULL WHERE operation_id=$1"
+			case "no_receipt":
+				change = "UPDATE codex_refresh_intent SET provider_error_at=NULL WHERE operation_id=$1"
+			}
+			if change != "" {
+				if _, err := b.(store.DBTX).Exec(ctx, change, f.op); err != nil {
+					t.Fatal(err)
+				}
+			}
+			arg := store.SetCodexRefreshReuseUnrecoverableParams{
+				UserID: f.user, AccountID: f.account, OperationID: f.op, FromGeneration: rejectGen,
+			}
+			if kind == "foreign_owner" {
+				arg.UserID = uuid.New()
+			}
+			n, err := q.SetCodexRefreshReuseUnrecoverable(ctx, arg)
+			want := int64(0)
+			if kind == "current" {
+				want = 1
+			}
+			if err != nil || n != want {
+				t.Fatalf("terminate=%d,%v want %d", n, err, want)
+			}
+			it, err := q.GetCodexRefreshIntent(ctx, store.GetCodexRefreshIntentParams{UserID: f.user, OperationID: f.op})
+			if err != nil {
+				t.Fatal(err)
+			}
+			state := "rotating"
+			if kind == "current" {
+				state = "unrecoverable"
+			} else if kind == "reconciled" {
+				state = "reconciled"
+			}
+			if it.State != state {
+				t.Fatalf("state=%s want %s", it.State, state)
+			}
+		})
+	}
+}
+
 func TestCodexRefreshReuseConcurrentAdmissionLiveDB(t *testing.T) {
 	ctx, _, f, _, b := reuseFixture(t)
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)

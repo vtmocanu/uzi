@@ -1727,8 +1727,9 @@ type SetCodexRefreshIntentStateFencedParams struct {
 // still 'rotating' AND the account is still at the generation the verdict was computed from AND
 // the account is NOT a live in-progress lease-holder of THIS intent's op — so a concurrently
 // committed intent, a generation that advanced under us, or a genuinely live in-flight op is
-// never overwritten. Owner-scoped; the owning-op writes stay on the unconditional
-// SetCodexRefreshIntentState. 0 rows means the guard rejected the stale write.
+// never overwritten. Owner-scoped; original owning-op writes use
+// SetCodexRefreshIntentState, while admitted reuse has its own terminal fence.
+// 0 rows means the guard rejected the stale write.
 // Lock the account before the intent, serializing restore/lease changes with resolution.
 func (q *Queries) SetCodexRefreshIntentStateFenced(ctx context.Context, arg SetCodexRefreshIntentStateFencedParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setCodexRefreshIntentStateFenced,
@@ -1737,6 +1738,51 @@ func (q *Queries) SetCodexRefreshIntentStateFenced(ctx context.Context, arg SetC
 		arg.UserID,
 		arg.ExpectedGeneration,
 		arg.ReuseInFlightMicroseconds,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const setCodexRefreshReuseUnrecoverable = `-- name: SetCodexRefreshReuseUnrecoverable :execrows
+WITH locked_account AS MATERIALIZED (
+    SELECT a.id, a.user_id, a.provider_user_id, a.workspace_account_id, a.sealed_login, a.sealed_with, a.generation, a.credential_revision, a.recovery_sealed, a.recovery_generation, a.recovery_sealed_with, a.coord_state, a.coord_operation_id, a.lease_deadline, a.committed_generation, a.created_at, a.updated_at, a.reauth_required, a.reauth_generation, a.reauth_credential_revision, a.reauth_reason, a.recovery_cause FROM codex_provider_account a
+    WHERE a.id = $3 AND a.user_id = $2
+    FOR UPDATE
+)
+UPDATE codex_refresh_intent i
+SET state = 'unrecoverable', updated_at = now()
+WHERE i.operation_id = $1 AND i.user_id = $2
+  AND i.provider_account_id = $3
+  AND i.from_generation = $4::bigint
+  AND i.state = 'rotating' AND i.provider_error_at IS NOT NULL
+  AND i.reuse_attempted_at IS NOT NULL
+  AND EXISTS (
+      SELECT 1 FROM locked_account a
+      WHERE a.id = i.provider_account_id AND a.user_id = i.user_id
+        AND a.coord_state = 'quarantined' AND a.coord_operation_id = i.operation_id
+        AND a.generation = i.from_generation AND a.recovery_sealed IS NULL
+        AND NOT a.reauth_required
+  )
+`
+
+type SetCodexRefreshReuseUnrecoverableParams struct {
+	OperationID    uuid.UUID `json:"operation_id"`
+	UserID         uuid.UUID `json:"user_id"`
+	AccountID      uuid.UUID `json:"account_id"`
+	FromGeneration int64     `json:"from_generation"`
+}
+
+// Only the admitted survivor may terminate its still-current rotating retry.
+// Lock account before intent, as admission, rejection and resolution do. An owner
+// restore, a reconciled intent or surviving recovery material wins over a late error.
+func (q *Queries) SetCodexRefreshReuseUnrecoverable(ctx context.Context, arg SetCodexRefreshReuseUnrecoverableParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setCodexRefreshReuseUnrecoverable,
+		arg.OperationID,
+		arg.UserID,
+		arg.AccountID,
+		arg.FromGeneration,
 	)
 	if err != nil {
 		return 0, err

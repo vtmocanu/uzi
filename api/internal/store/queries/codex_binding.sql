@@ -789,8 +789,9 @@ WHERE operation_id = @operation_id AND user_id = @user_id;
 -- still 'rotating' AND the account is still at the generation the verdict was computed from AND
 -- the account is NOT a live in-progress lease-holder of THIS intent's op — so a concurrently
 -- committed intent, a generation that advanced under us, or a genuinely live in-flight op is
--- never overwritten. Owner-scoped; the owning-op writes stay on the unconditional
--- SetCodexRefreshIntentState. 0 rows means the guard rejected the stale write.
+-- never overwritten. Owner-scoped; original owning-op writes use
+-- SetCodexRefreshIntentState, while admitted reuse has its own terminal fence.
+-- 0 rows means the guard rejected the stale write.
 -- Lock the account before the intent, serializing restore/lease changes with resolution.
 WITH locked_account AS MATERIALIZED (
     SELECT a.* FROM codex_provider_account a
@@ -834,6 +835,30 @@ WHERE cri.operation_id = sqlc.arg('operation_id') AND cri.user_id = sqlc.arg('us
                  AND cpa.coord_operation_id = cri.operation_id
                  AND cpa.lease_deadline IS NOT NULL
                  AND cpa.lease_deadline > now())
+  );
+
+-- name: SetCodexRefreshReuseUnrecoverable :execrows
+-- Only the admitted survivor may terminate its still-current rotating retry.
+-- Lock account before intent, as admission, rejection and resolution do. An owner
+-- restore, a reconciled intent or surviving recovery material wins over a late error.
+WITH locked_account AS MATERIALIZED (
+    SELECT a.* FROM codex_provider_account a
+    WHERE a.id = sqlc.arg('account_id') AND a.user_id = sqlc.arg('user_id')
+    FOR UPDATE
+)
+UPDATE codex_refresh_intent i
+SET state = 'unrecoverable', updated_at = now()
+WHERE i.operation_id = sqlc.arg('operation_id') AND i.user_id = sqlc.arg('user_id')
+  AND i.provider_account_id = sqlc.arg('account_id')
+  AND i.from_generation = sqlc.arg('from_generation')::bigint
+  AND i.state = 'rotating' AND i.provider_error_at IS NOT NULL
+  AND i.reuse_attempted_at IS NOT NULL
+  AND EXISTS (
+      SELECT 1 FROM locked_account a
+      WHERE a.id = i.provider_account_id AND a.user_id = i.user_id
+        AND a.coord_state = 'quarantined' AND a.coord_operation_id = i.operation_id
+        AND a.generation = i.from_generation AND a.recovery_sealed IS NULL
+        AND NOT a.reauth_required
   );
 
 -- name: RecordCodexRefreshProviderError :execrows
