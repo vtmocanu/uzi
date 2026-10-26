@@ -386,6 +386,10 @@ func (v *Vault) LockAndAcknowledge(ctx context.Context, id uuid.UUID) error {
 	if err := v.lifecycleContext(ctx); err != nil {
 		return err
 	}
+	// A notice is best effort: a stalled claim must not retain a usable DEK
+	// indefinitely. Preserve a shorter request deadline and evict even on failure.
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 	m := v.lifecycleMutex(id)
 	m.Lock()
 	defer m.Unlock()
