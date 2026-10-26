@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { useRef, useState, type FormEvent } from "react";
 import { Link } from "react-router-dom";
 
 import {
@@ -176,11 +176,18 @@ export function MaintenanceCard() {
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  // A GET that started before or during a PUT must not overwrite the PUT's newer state when
+  // it resolves late. writeGen moves when a write starts and again when it settles; a read
+  // keeps its response only if the generation is unchanged and no write is in flight.
+  const writeGen = useRef(0);
+  const writing = useRef(0);
+  const readIsFresh = (gen: number) => writeGen.current === gen && writing.current === 0;
 
   const { loading, error: loadError, reload } = useAsyncData(
     async ({ isCurrent }) => {
+      const gen = writeGen.current;
       const resp = await api.getAdminMaintenance();
-      if (!isCurrent()) return;
+      if (!isCurrent() || !readIsFresh(gen)) return;
       setData(resp);
       setReason(resp.state.reason ?? "");
     },
@@ -195,6 +202,8 @@ export function MaintenanceCard() {
     setError("");
     setNotice("");
     setBusy(kind);
+    writeGen.current++;
+    writing.current++;
     try {
       const resp = await api.setMaintenance(active, reason.trim());
       setData(resp);
@@ -210,6 +219,8 @@ export function MaintenanceCard() {
     } catch (err) {
       setError(errorMessage(err, "Failed to update maintenance mode"));
     } finally {
+      writing.current--;
+      writeGen.current++;
       setBusy(null);
     }
   };
@@ -217,8 +228,11 @@ export function MaintenanceCard() {
   const refresh = async () => {
     setError("");
     setRefreshing(true);
+    const gen = writeGen.current;
     try {
       const resp = await api.getAdminMaintenance();
+      // A write started or settled meanwhile: its response is newer than this read.
+      if (!readIsFresh(gen)) return;
       setData(resp);
       // Keep an in-progress reason edit; adopt the server's only when the field is untouched.
       if (!reasonDirty) setReason(resp.state.reason ?? "");
@@ -343,7 +357,7 @@ export function MaintenanceCard() {
                   Refresh once more right before evicting nodes: a claim in flight at enable can still appear.
                 </p>
               </div>
-              <Button variant="secondary" size="sm" onClick={() => void refresh()} disabled={refreshing}>
+              <Button variant="secondary" size="sm" onClick={() => void refresh()} disabled={refreshing || busy !== null}>
                 {refreshing ? "Refreshing…" : "Refresh"}
               </Button>
             </div>

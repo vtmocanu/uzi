@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, it, expect, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 
 import { MaintenanceCard } from "./MaintenanceCard";
@@ -63,6 +63,14 @@ async function renderCard(initial: AdminMaintenance) {
     </MemoryRouter>,
   );
   await screen.findByRole("switch", { name: "Maintenance mode" });
+}
+
+function deferred<T>() {
+  let resolve!: (v: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
 }
 
 const reasonInput = () => screen.getByLabelText("Reason shown to every user") as HTMLInputElement;
@@ -159,6 +167,55 @@ describe("MaintenanceCard", () => {
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
     await waitFor(() => expect(document.querySelector('[data-maintenance-clear="true"]')).toBeTruthy());
     expect(mockApi.getAdminMaintenance).toHaveBeenCalledTimes(2);
+  });
+
+  it("drops a Refresh GET that resolves after a toggle-off PUT settled", async () => {
+    await renderCard(doc({ active: true, clear: false }));
+    const get = deferred<AdminMaintenance>();
+    mockApi.getAdminMaintenance.mockReturnValueOnce(get.promise);
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+    mockApi.setMaintenance.mockResolvedValueOnce(doc({ active: false }));
+    fireEvent.click(screen.getByRole("switch", { name: "Maintenance mode" }));
+    expect(await screen.findByText("Maintenance mode is off. Queued runs start as workers free up.")).toBeTruthy();
+
+    // The stale read (taken before the PUT) now lands: it must not resurrect "on".
+    await act(async () => get.resolve(doc({ active: true, clear: false })));
+    await waitFor(() => expect((screen.getByRole("button", { name: "Refresh" }) as HTMLButtonElement).disabled).toBe(false));
+    expect(screen.getByRole("switch", { name: "Maintenance mode" }).getAttribute("aria-checked")).toBe("false");
+    expect(document.getElementById("maintenance-state")!.textContent).toMatch(/^Off/);
+    expect(document.querySelector('[data-maintenance-clear="true"]')).toBeTruthy();
+  });
+
+  it("drops a GET that resolves while a PUT is still in flight, and keeps the PUT's result", async () => {
+    await renderCard(doc({ active: false }));
+    const get = deferred<AdminMaintenance>();
+    const put = deferred<AdminMaintenance>();
+    mockApi.getAdminMaintenance.mockReturnValueOnce(get.promise);
+    mockApi.setMaintenance.mockReturnValueOnce(put.promise);
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    fireEvent.click(screen.getByRole("switch", { name: "Maintenance mode" }));
+    // Refresh is disabled while a write is in flight.
+    expect((screen.getByRole("button", { name: /Refresh/ }) as HTMLButtonElement).disabled).toBe(true);
+
+    await act(async () => get.resolve(doc({ active: false, clear: false })));
+    expect(document.querySelector('[data-maintenance-clear="false"]')).toBeNull();
+
+    await act(async () => put.resolve(doc({ active: true, reason: "Drain" })));
+    expect(await screen.findByText("Maintenance mode is on. New runs wait in the queue.")).toBeTruthy();
+    expect(screen.getByRole("switch", { name: "Maintenance mode" }).getAttribute("aria-checked")).toBe("true");
+    expect(document.querySelector('[data-maintenance-clear="true"]')).toBeTruthy();
+    expect(reasonInput().value).toBe("Drain");
+  });
+
+  it("a Refresh with no write in between updates the readout", async () => {
+    await renderCard(doc({ active: true, clear: false }));
+    const get = deferred<AdminMaintenance>();
+    mockApi.getAdminMaintenance.mockReturnValueOnce(get.promise);
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    await act(async () => get.resolve(doc({ active: false })));
+    await waitFor(() => expect(document.querySelector('[data-maintenance-clear="true"]')).toBeTruthy());
+    expect(screen.getByRole("switch", { name: "Maintenance mode" }).getAttribute("aria-checked")).toBe("false");
   });
 
   it("shows the server error when a PUT fails and keeps the switch state", async () => {

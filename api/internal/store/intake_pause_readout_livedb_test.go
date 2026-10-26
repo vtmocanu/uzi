@@ -317,7 +317,13 @@ func TestMaintenanceReadoutCapLiveDB(t *testing.T) {
 }
 
 // The readout's active query must be able to use idx_runs_nonterminal_since: its status IN
-// list implies the index's NOT IN predicate. enable_seqscan=off proves the path exists.
+// list implies the index's NOT IN predicate. With seqscan, bitmap scans and explicit sorts
+// all disabled, the only cheap plan for the status_since ordering is the ordered scan of that
+// index (idx_runs_claimable cannot supply the order), so this proves the index can serve the
+// ordered read. It does not prove the default planner picks it: on a populated database with
+// few claimed/running rows the planner may legitimately prefer idx_runs_claimable plus a sort.
+// The query text is a copy of the ListMaintenanceActiveRuns filter and order (the sqlc
+// constant is unexported from this external test package).
 func TestMaintenanceActiveQueryUsesNonterminalIndexLiveDB(t *testing.T) {
 	f := newReadoutFixture(t)
 	f.run(seedRun{status: "running"})
@@ -327,8 +333,14 @@ func TestMaintenanceActiveQueryUsesNonterminalIndexLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback(f.ctx) }()
-	if _, err := tx.Exec(f.ctx, `SET LOCAL enable_seqscan = off`); err != nil {
-		t.Fatal(err)
+	for _, s := range []string{
+		`SET LOCAL enable_seqscan = off`,
+		`SET LOCAL enable_bitmapscan = off`,
+		`SET LOCAL enable_sort = off`,
+	} {
+		if _, err := tx.Exec(f.ctx, s); err != nil {
+			t.Fatal(err)
+		}
 	}
 	rows, err := tx.Query(f.ctx, `EXPLAIN SELECT r.id FROM runs r WHERE r.status IN ('claimed', 'running') ORDER BY r.status_since, r.id LIMIT 50`)
 	if err != nil {
