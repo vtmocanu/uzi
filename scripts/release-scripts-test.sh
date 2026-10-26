@@ -754,13 +754,18 @@ esac
 for arg in "$@"; do
   case "$arg" in *head_sha=*) sha="${arg#*head_sha=}"; sha="${sha%%&*}" ;; esac
 done
+branch=$PLAN_PREVIOUS
+if [ "$sha" = "${PLAN_FAILED_SHA:-}" ]; then
+  PLAN_PUBLICATION=failed
+  branch=$PLAN_FAILED_TAG
+fi
 case "${PLAN_PUBLICATION:-success}" in
   missing) printf '[{"total_count":0,"workflow_runs":[]}]'; exit 0 ;;
   pending) status=in_progress; conclusion=null ;;
   failed) status=completed; conclusion='"failure"' ;;
   *) status=completed; conclusion='"success"' ;;
 esac
-printf '[{"total_count":1,"workflow_runs":[{"id":1,"run_attempt":1,"status":"%s","conclusion":%s,"head_sha":"%s","head_branch":"%s","event":"push","path":".github/workflows/release.yml","repository":{"full_name":"example/uzi"},"head_repository":{"full_name":"example/uzi"}}]}]' "$status" "$conclusion" "$sha" "$PLAN_PREVIOUS"
+printf '[{"total_count":1,"workflow_runs":[{"id":1,"run_attempt":1,"status":"%s","conclusion":%s,"head_sha":"%s","head_branch":"%s","event":"push","path":".github/workflows/release.yml","repository":{"full_name":"example/uzi"},"head_repository":{"full_name":"example/uzi"}}]}]' "$status" "$conclusion" "$sha" "$branch"
 GH
   chmod +x "$d/plan-bin/gh"
   # Resolve before changing PATH, so the shim cannot recursively invoke itself.
@@ -809,6 +814,8 @@ GIT
     assert_eq "$label no fetch" '' "$(cat "$PLAN_GIT_AUDIT" 2>/dev/null)"
   }
   plan_expect 'empty range' 'OP=noop'
+  plan_expect 'version must exceed stable' $'OP=blocked\nREASON=version-not-above-stable' --version 0.1.0
+  plan_expect 'no train to abandon' $'OP=blocked\nREASON=no-train-to-abandon' --abandon-train
   plan_expect 'CI strict planning does not query worker pins' 'OP=noop' --ci
   add_feature "$d" 201
   output="$(cd "$d" && PLAN_HISTORY_FAILURE=1 bash "$RC" --plan 2>&1)"; rc=$?
@@ -824,9 +831,12 @@ GIT
   plan_expect 'open train no new shipping' 'OP=noop'
   add_feature "$d" 202
   plan_expect 'open train advances' $'OP=nextrc\nTAG=v0.2.0-rc.10'
-  plan_expect 'other base needs abandon' 'OP=blocked' --version 0.3.0
-  plan_expect 'explicit abandon' $'OP=new-base\nTAG=v0.3.0-rc.1' --version 0.3.0 --abandon-train
-  plan_expect 'abandon cannot downgrade' 'OP=blocked' --version 0.1.1 --abandon-train
+  plan_expect 'other base needs abandon' $'OP=blocked\nREASON=open-train-needs-abandon' --version 0.3.0
+  plan_expect 'abandon needs a higher base' $'OP=blocked\nREASON=abandon-needs-higher-base' --version 0.2.0 --abandon-train
+  PLAN_PREVIOUS=v0.1.0 plan_expect 'explicit abandon' $'OP=new-base\nTAG=v0.3.0-rc.1\nPREVIOUS_TAG=v0.1.0\nSHIPPING_COUNT=2' --version 0.3.0 --abandon-train
+  PLAN_PREVIOUS=v0.1.0 PLAN_FAILED_TAG=v0.2.0-rc.9 PLAN_FAILED_SHA="$(git -C "$d" rev-parse v0.2.0-rc.9)" \
+    plan_expect 'failed abandoned candidate does not block' $'OP=new-base\nTAG=v0.3.0-rc.1\nPREVIOUS_TAG=v0.1.0\nPUBLICATION_STATE=success' --version 0.3.0 --abandon-train
+  plan_expect 'abandon cannot downgrade' $'OP=blocked\nREASON=abandon-needs-higher-base' --version 0.1.1 --abandon-train
   for PLAN_PUBLICATION in failed pending missing error transient; do
     export PLAN_PUBLICATION
     plan_expect "publication $PLAN_PUBLICATION" 'OP=blocked'
@@ -872,12 +882,28 @@ GIT
   git -C "$d" add changelog.d
   gcommit "$d" 'docs: add fragment'
   plan_expect 'committed fragment accepted' $'OP=nextrc\nTAG=v0.2.0-rc.11'
+  git -C "$d" rm -q -- changelog.d/01234567-89ab-4cde-8fab-0123456789ab.md
+  gcommit "$d" 'chore: consume previous notes'
+  git -C "$d" tag v0.2.0-rc.11
+  export PLAN_PREVIOUS=v0.2.0-rc.11
+  add_feature "$d" 206
+  mkdir -p "$d/changelog.d"
+  printf '### Fixed\n\n- **Fix isolated feature (#206).**\n  The only pending note is this fragment.\n' > "$d/changelog.d/01234567-89ab-4cde-8fab-0123456789ab.md"
+  git -C "$d" add changelog.d
+  gcommit "$d" 'docs: isolated fragment'
+  plan_expect 'only committed fragment makes range releasable' $'OP=nextrc\nTAG=v0.2.0-rc.12\nSHIPPING_COUNT=1'
   git -C "$d" checkout -q -b other
   plan_expect 'non-main branch blocked' $'OP=blocked\nREASON=main-required'
   git -C "$d" checkout -q main
-  git -C "$d" tag -d v0.1.0 v0.2.0-rc.9 v0.2.0-rc.10 >/dev/null
+  git -C "$d" tag -d v0.1.0 v0.2.0-rc.9 v0.2.0-rc.10 v0.2.0-rc.11 >/dev/null
   plan_expect 'first release remains local' $'OP=blocked\nREASON=initial-release-needs-local-cut'
   plan_expect 'explicit first release remains local' $'OP=blocked\nREASON=initial-release-needs-local-cut' --version 0.1.0
+  output="$(cd "$d" && bash "$RC" --plan 0.1.0 2>&1)"; rc=$?
+  assert_eq 'plan positional base is usage error' 3 "$rc"
+  assert_contains 'plan positional base prints usage' usage: "$output"
+  output="$(cd "$d" && bash "$RC" --plan --version 2>&1)"; rc=$?
+  assert_eq 'missing version is usage error' 3 "$rc"
+  assert_contains 'missing version prints usage' usage: "$output"
   echo "release plan: $PASSES passed, $FAILS failed"
   [ "$FAILS" -eq 0 ]
 )

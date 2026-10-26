@@ -46,12 +46,14 @@
 # in-flight RC is found by grouping per base and comparing N numerically (D1).
 #
 #   --plan [--version X.Y.Z] [--abandon-train] prints a scheduled-RC decision,
-#             without fetching or changing Git state, notes or fragments. The caller
-#             refreshes refs. Existing ephemeral validators clean up their snapshots.
+#             without fetching or changing Git state, CHANGELOG or fragments. The
+#             caller refreshes refs. Validators remove snapshots but may leave an
+#             empty .uzi/scratch directory.
 #             Eight KEY=VALUE lines: OP, BASE, TAG, REASON, SHIPPING_COUNT,
 #             PREVIOUS_TAG, PUBLICATION_STATE, HEAD_SHA. OP is nextrc/new-base/noop/blocked.
-#             Exit 0 means a plan was printed, including noop/blocked; exit 2 means an
-#             instrument failed. No-op is a scheduled policy; manual cuts keep their
+#             Exit 0 includes noop/blocked, including failed API/fragment reads;
+#             exit 2 is reserved for Git/history instruments, exit 3 for usage.
+#             No-op is a scheduled policy; manual cuts keep their
 #             existing empty-delta behavior. Tip CI waiting is a separate operation.
 #
 # Exit codes (cut mode): 0 ready;  1 a step/verify failed (tree left recoverable);  3 usage /
@@ -60,9 +62,14 @@
 # NEVER skip-ci a release commit: skip markers suppress tag publish workflows too.
 set -uo pipefail
 
-VERSION=""; VERB=""; CL_FILE=""; DO_COMMIT=1; PREV_OVERRIDE=""; PLAN=0; ABANDON_TRAIN=0; VERSION_OPTION=0
+VERSION=""; VERB=""; CL_FILE=""; DO_COMMIT=1; PREV_OVERRIDE=""; PLAN=0; ABANDON_TRAIN=0; VERSION_OPTION=0; POSITIONAL_VERSION=0
 CI_STRICT=0
 case "${CI:-}" in true|1) CI_STRICT=1 ;; esac
+cut_usage() {
+  printf '%s\n' 'usage: release-cut.sh <X.Y.Z> [--promote|--promote-only|--skip-promote|--stable] [--changelog-file FILE] [--no-commit] [--prev-tag TAG] [--ci]' \
+    '       release-cut.sh --plan [--version X.Y.Z] [--abandon-train] [--ci]' >&2
+  exit 3
+}
 set_verb() {
   if [ -n "$VERB" ]; then echo "release-cut: only one of --promote/--promote-only/--skip-promote/--stable" >&2; exit 3; fi
   VERB="$1"
@@ -70,7 +77,9 @@ set_verb() {
 while [ $# -gt 0 ]; do
   case "$1" in
     --plan) PLAN=1; shift;;
-    --version) VERSION="${2:?}"; VERSION_OPTION=1; shift 2;;
+    --version)
+      [ "$#" -ge 2 ] && [ -n "$2" ] && [[ "$2" != -* ]] || cut_usage
+      VERSION="$2"; VERSION_OPTION=1; shift 2;;
     --abandon-train) ABANDON_TRAIN=1; shift;;
     --promote|--promote-only|--skip-promote|--stable) set_verb "$1"; shift;;
     --changelog-file) CL_FILE="${2:?}"; shift 2;;
@@ -79,13 +88,12 @@ while [ $# -gt 0 ]; do
     --ci) CI_STRICT=1; shift;;
     -h|--help) awk 'NR > 1 { if (/^#/) print; else exit }' "$0"; exit 3;;
     -*) echo "release-cut: unknown flag $1" >&2; exit 3;;
-    *) if [ -z "$VERSION" ]; then VERSION="$1"; shift
-       else echo "release-cut: unexpected arg: $1" >&2; exit 3; fi ;;
+    *) if [ -z "$VERSION" ]; then VERSION="$1"; POSITIONAL_VERSION=1; shift
+       else echo "release-cut: unexpected arg: $1" >&2; cut_usage; fi ;;
   esac
 done
-if [ -z "$VERSION" ] && [ "$PLAN" -eq 0 ]; then
-  echo "usage: release-cut.sh <X.Y.Z> [--promote|--promote-only|--skip-promote|--stable] [--changelog-file FILE] [--no-commit] [--prev-tag TAG] [--ci]" >&2
-  exit 3
+if { [ -z "$VERSION" ] && [ "$PLAN" -eq 0 ]; } || { [ "$PLAN" -eq 1 ] && [ "$POSITIONAL_VERSION" -eq 1 ]; }; then
+  cut_usage
 fi
 VERSION="${VERSION#v}"
 # The INPUT is always a stable base X.Y.Z (the version a candidate is cut FOR); the tag
@@ -323,6 +331,7 @@ release_plan() (
     if [ "$base" != "$cb" ]; then
       [ "$ABANDON_TRAIN" -eq 1 ] || block_plan open-train-needs-abandon
       [ "$(ver_cmp "$base" "$cb")" = 1 ] || block_plan abandon-needs-higher-base
+      previous="$(prev_stable_below "$base")" || return 2
       tag="v$base-rc.1"; op='new-base'
     else
       [ "$ABANDON_TRAIN" -eq 0 ] || block_plan abandon-needs-higher-base
@@ -353,15 +362,10 @@ release_plan() (
       *) return 2 ;;
     esac
     if [ "$publication" != success ]; then
-      op=blocked; block_plan previous-publication-not-successful
+      block_plan previous-publication-not-successful
     fi
   fi
-  if [ -n "$previous" ]; then
-    shipping="$(shipping_commits_since "$previous" "$head")" || return 2
-  else
-    # Without a published boundary an explicit first base still needs a human cut.
-    op=blocked; block_plan initial-release-needs-local-cut
-  fi
+  shipping="$(shipping_commits_since "$previous" "$head")" || return 2
   while IFS= read -r sha; do
     [ -n "$sha" ] || continue
     parent="$(git rev-parse --verify "$sha^1")" || return 2
@@ -370,12 +374,12 @@ release_plan() (
     case "$metadata_rc" in 0) continue ;; 1) : ;; *) return 2 ;; esac
     count=$((count + 1))
   done <<< "$shipping"
-  paths="$(bash "$ROOT/scripts/changelog-fragments.sh" list)" || { op=blocked; block_plan invalid-pending-fragments; }
+  paths="$(bash "$ROOT/scripts/changelog-fragments.sh" list)" || { block_plan invalid-pending-fragments; }
   while IFS= read -r fragment; do
     [ -n "$fragment" ] || continue
-    [ "$(git ls-tree "$head" -- "$fragment" | awk '{print $1}')" = 100644 ] || { op=blocked; block_plan uncommitted-fragment; }
+    [ "$(git ls-tree "$head" -- "$fragment" | awk '{print $1}')" = 100644 ] || { block_plan uncommitted-fragment; }
   done <<< "$paths"
-  pending="$(bash "$ROOT/scripts/changelog-fragments.sh" render-unreleased CHANGELOG.md)" || { op=blocked; block_plan invalid-pending-notes; }
+  pending="$(bash "$ROOT/scripts/changelog-fragments.sh" render-unreleased CHANGELOG.md)" || { block_plan invalid-pending-notes; }
   deps="$(dependency_merge_refs "$previous")" || return 2
   if [ "$count" -eq 0 ]; then
     op=noop; reason=no-new-shipping-change
@@ -390,7 +394,6 @@ if [ "$PLAN" -eq 1 ]; then release_plan; exit $?; fi
 if [ "$ABANDON_TRAIN" -ne 0 ] || [ "$VERSION_OPTION" -ne 0 ]; then
   echo 'release-cut: --version/--abandon-train are only available with --plan; local cuts use the positional base/--skip-promote' >&2; exit 3
 fi
-
 
 # --- preconditions ------------------------------------------------------------
 if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
