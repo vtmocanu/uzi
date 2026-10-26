@@ -2841,7 +2841,7 @@ for identity in missing wrong correct; do
 done
 
 echo '=== fragment-introducer-citation (#3510) ==='
-for mode in squash merge rebase direct suffix modified readded cited cited-description multiple multiple-covered unrelated equal-prose frozen history-error unsafe-introduction citation-limit citation-total-limit; do
+for mode in squash merge merge-default rebase direct suffix code-paren prose-paren modified readded cited cited-description multiple multiple-covered unrelated equal-prose frozen history-error shipping-history-error unsafe-introduction citation-limit citation-total-limit; do
   MF="$(mktemp -d "$REPO_ROOT/.uzi/scratch/citation.XXXXXX")"; seed_repo "$MF"
   if [ "$mode" = frozen ]; then
     add_feature "$MF" 201; commit_fragment "$MF" 201
@@ -2850,12 +2850,16 @@ for mode in squash merge rebase direct suffix modified readded cited cited-descr
     git -C "$MF" tag v0.2.0-rc.1
     awk '/^- \*\*Fragment 201 / { print; getline; print }' "$MF/CHANGELOG.md" > "$MF/.git/frozen-block"
   fi
-  case "$mode" in merge|rebase) git -C "$MF" checkout -qb delivery ;; esac
+  case "$mode" in merge|merge-default|rebase) git -C "$MF" checkout -qb delivery ;; esac
   if [ "$mode" = readded ]; then
     commit_fragment "$MF" 296
     git -C "$MF" rm -q -- "$fragment_path"; gcommit "$MF" 'docs: retire old fragment (#1111)'
   fi
   write_fragment "$MF" 296
+  case "$mode" in
+    code-paren) printf '### Added\n\n- **Use f().**\n  Preserved description.\n' > "$MF/$fragment_path" ;;
+    prose-paren) printf '### Added\n\n- **Upgrade compiler (to 1.27).**\n  Preserved description.\n' > "$MF/$fragment_path" ;;
+  esac
   if [ "$mode" = cited ] || [ "$mode" = multiple-covered ]; then
     sed 's/(#296)/(#296, #3434)/' "$MF/$fragment_path" > "$MF/.git/note"
     mv "$MF/.git/note" "$MF/$fragment_path"
@@ -2897,12 +2901,14 @@ PY
   case "$mode" in
     direct) subject='Delivery without a PR suffix' ;;
     suffix) subject='Delivery (#3434) followed by unrelated text' ;;
-    merge) subject='Side implementation (#9999)' ;;
+    merge|merge-default) subject='Side implementation (#9999)' ;;
   esac
   gcommit "$MF" "$subject"
-  if [ "$mode" = merge ]; then
+  if [ "$mode" = merge ] || [ "$mode" = merge-default ]; then
     git -C "$MF" checkout -q main
-    git -C "$MF" merge -q --no-ff -m 'Delivery (#3434)' delivery
+    merge_subject='Delivery (#3434)'
+    [ "$mode" != merge-default ] || merge_subject='Merge pull request #3434 from owner/delivery'
+    git -C "$MF" merge -q --no-ff -m "$merge_subject" delivery
   elif [ "$mode" = rebase ]; then
     git -C "$MF" checkout -q main
     echo 'Unrelated documentation.' > "$MF/README.md"; git -C "$MF" add README.md; gcommit "$MF" 'docs: unrelated main change'
@@ -2930,13 +2936,23 @@ PY
       rm "$MF/$fragment_path"; cp "$MF/.git/note" "$MF/$fragment_path"
       git -C "$MF" add -- "$fragment_path"; gcommit "$MF" 'docs: regular pending fragment' ;;
   esac
-  if [ "$mode" = history-error ]; then
+  if [ "$mode" = history-error ] || [ "$mode" = shipping-history-error ]; then
     mkdir "$MF/.git/bin"
     cat > "$MF/.git/bin/git" <<'STUB'
 #!/usr/bin/env bash
+if [ "$CITATION_FAILURE" = shipping-history-error ] && [ "${1:-}" = log ] && [ "${2:-}" = --first-parent ]; then
+  for arg in "$@"; do
+    if [ "$arg" = "$CITATION_EXPECTED_RANGE" ]; then
+      printf 'shipping\n' > .git/history-error-reached
+      printf 'fixture shipping history unavailable\n' >&2
+      exit 23
+    fi
+  done
+fi
 for arg in "$@"; do
-  if [ "$arg" = --raw ]; then
+  if [ "$CITATION_FAILURE" = history-error ] && [ "$arg" = --raw ]; then
     printf 'reached\n' > .git/history-error-reached
+    printf 'fixture raw history unavailable\n' >&2
     exit 23
   fi
 done
@@ -2955,18 +2971,25 @@ STUB
     assert_contains 'opt-in renderer cites captured introduction' '#3434' "$(cat "$MF/.git/cited-view")"
     if cmp -s "$MF/.git/input-before" "$MF/$fragment_path"; then pass 'opt-in rendering preserves tracked fragment bytes'; else fail 'opt-in rendering edited tracked fragment'; fi
   fi
-  if [ "$mode" = history-error ]; then
+  if [ "$mode" = history-error ] || [ "$mode" = shipping-history-error ]; then
     citation_real_git="$(command -v git)"
-    PATH="$MF/.git/bin:$PATH" CITATION_REAL_GIT="$citation_real_git" run_rc "$MF" 0.2.0
+    citation_range="$(git -C "$MF" rev-parse v0.1.0)..$start"
+    PATH="$MF/.git/bin:$PATH" CITATION_REAL_GIT="$citation_real_git" CITATION_FAILURE="$mode" CITATION_EXPECTED_RANGE="$citation_range" run_rc "$MF" 0.2.0
   else
     run_rc "$MF" 0.2.0
   fi
   case "$mode" in
-    history-error|unsafe-introduction|citation-limit|citation-total-limit)
+    history-error|shipping-history-error|unsafe-introduction|citation-limit|citation-total-limit)
       assert_eq "$mode refuses before preparation" 3 "$RC_RC"
       assert_eq "$mode HEAD unchanged" "$start" "$(git -C "$MF" rev-parse HEAD)"
       assert_eq "$mode index/worktree unchanged" '' "$(git -C "$MF" status --porcelain --untracked-files=no)"
-      if [ "$mode" = history-error ]; then assert_eq 'history producer failed at intended seam' reached "$(cat "$MF/.git/history-error-reached" 2>/dev/null)"; fi
+      if [ "$mode" = history-error ]; then
+        assert_eq 'history producer failed at intended seam' reached "$(cat "$MF/.git/history-error-reached" 2>/dev/null)"
+        assert_contains 'raw history diagnostic preserved' 'fixture raw history unavailable' "$RC_OUT"
+      elif [ "$mode" = shipping-history-error ]; then
+        assert_eq 'shipping history producer failed at intended seam' shipping "$(cat "$MF/.git/history-error-reached" 2>/dev/null)"
+        assert_contains 'shipping history failure is explicit' 'could not read shipping history' "$RC_OUT"
+      fi
       ;;
     multiple|unrelated)
       assert_eq "$mode unchanged oracle refuses uncovered merge" 1 "$RC_RC"
@@ -2976,7 +2999,7 @@ STUB
     *)
       assert_eq "fragment-introducer-citation $mode succeeds" 0 "$RC_RC"
       wanted='#3434'
-      case "$mode" in direct|suffix) wanted="$introduction" ;; esac
+      case "$mode" in direct|suffix|merge-default) wanted="$introduction" ;; esac
       assert_contains "$mode current introduction retained" "$wanted" "$(cat "$MF/CHANGELOG.md")"
       description='Preserved description.'
       case "$mode" in modified) description='Updated description.' ;; cited-description) description='Preserved description ([#3434](https://github.com/vtmocanu/uzi/pull/3434)).' ;; esac
@@ -2986,8 +3009,13 @@ STUB
       if [ "$mode" = cited ] || [ "$mode" = cited-description ] || [ "$mode" = multiple-covered ]; then
         assert_eq "$mode does not duplicate an existing identity" 1 "$(awk 'index($0, "#3434") { n++ } END { print n+0 }' "$MF/CHANGELOG.md")"
       fi
-      if [ "$mode" = merge ]; then
+      if [ "$mode" = merge ] || [ "$mode" = merge-default ]; then
         assert_eq 'side-branch identity is not borrowed' 0 "$(awk 'index($0, "#9999") { n++ } END { print n+0 }' "$MF/CHANGELOG.md")"
+      fi
+      if [ "$mode" = code-paren ]; then
+        assert_contains 'function-call headline remains intact' '- **Use f() ([#3434](https://github.com/vtmocanu/uzi/pull/3434)).**' "$(cat "$MF/CHANGELOG.md")"
+      elif [ "$mode" = prose-paren ]; then
+        assert_contains 'prose parenthetical remains intact' '- **Upgrade compiler (to 1.27) ([#3434](https://github.com/vtmocanu/uzi/pull/3434)).**' "$(cat "$MF/CHANGELOG.md")"
       fi
       if [ "$mode" = frozen ]; then
         awk '/^- \*\*Fragment 201 / { print; getline; print }' "$MF/CHANGELOG.md" > "$MF/.git/frozen-after"

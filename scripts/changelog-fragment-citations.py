@@ -16,7 +16,7 @@ def git(*args):
         ["git", "-c", "core.fsmonitor=false", *args], capture_output=True, check=False
     )
     if result.returncode:
-        raise Refusal("cannot read committed introduction history")
+        raise Refusal(f"git failed: {result.stderr.decode(errors='replace').strip()}")
     return result.stdout
 
 
@@ -84,12 +84,8 @@ def citations(base, head, work, shipping_file):
             if status == b"D":
                 current[path] = None
             elif status == b"A":
-                if current[path] is not None:
-                    raise Refusal("ambiguous fragment addition")
                 current[path] = (sha, newmode == b"100644")
                 added.append(path)
-            elif current[path] is None:
-                raise Refusal("fragment modification has no introduction")
         additions[sha] = added
 
     rows = []

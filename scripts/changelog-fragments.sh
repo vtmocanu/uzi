@@ -16,7 +16,11 @@ CHANGELOG_FRAGMENT_PARSER="$SCRIPT_ROOT/scripts/lib/changelog-fragments.awk"
 # shellcheck source=scripts/lib/changelog-fragments.sh
 . "$SCRIPT_ROOT/scripts/lib/changelog-fragments.sh"
 
-usage() { echo 'usage: changelog-fragments.sh validate [paths...] | list | render-body file | render-unreleased file' >&2; exit 2; }
+usage() {
+  echo 'usage: changelog-fragments.sh validate [paths...] | list | render-body file | render-unreleased file' >&2
+  echo 'render suffix: --cite-introducers base-oid head-oid shipping-file' >&2
+  exit 2
+}
 [ "$#" -gt 0 ] || usage
 mode=$1
 shift
@@ -64,7 +68,7 @@ case "$mode" in
         input="$work/fragment-$((number - 1))"
         awk -v identity="$identity" '
           FNR == 3 {
-            if ($0 ~ /\)\.\*\*$/) sub(/\)\.\*\*$/, ", " identity ").**")
+            if ($0 ~ /\(#[0-9]+(, #[0-9]+)*\)\.\*\*$/) sub(/\)\.\*\*$/, ", " identity ").**")
             else sub(/\.\*\*$/, " (" identity ").**")
           }
           { print }
