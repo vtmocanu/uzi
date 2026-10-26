@@ -589,11 +589,15 @@ on `RecoveryBundleTooLargeError`). The writer-exclusion proof and the quiescence
 the real ones (three exclusion passes and the family proofs are charged inside the slot).
 The harness interventions are these, and every MEASURE line prints all of them: the guard
 method; a faked server behind the real strict client (the harness answers `hasFeature` and
-`listRecoveryHolds` directly); `isIdle: () => true` passed to the real writer exclusion (no
-Worker object exists here); and a refusal of every `produceRecoveryBundle` call outside the
-archive window, which stops the runner's ordinary pre-slot flows from writing a producer
-record (without it admission is refused as `source_protected_or_ambiguous`, measured). A
-refused bundle call after slot admission makes the run non-eligible. The archive phase is
+`listRecoveryHolds` directly); `isIdle`, a harness check (sole execution in the container and
+a settled runner, verified before admission, else UNRUN) passed to the real writer exclusion,
+which does not prove the production Worker-idleness integration; and a refusal of every
+`produceRecoveryBundle` call outside the archive window, which stops the runner's ordinary
+pre-slot flows from writing a producer record (without it admission is refused as
+`source_protected_or_ambiguous`, measured). That suppression is not a Design-7 substitution, so
+every run is `eligible_for_gate: false` ("pre-slot production bundle path suppressed by the
+harness"), its counters are diagnostics, and the gate-level `c2_gate_summary` line is `UNRUN`
+(no qualifying measurement is possible) regardless of the counters. The archive phase is
 harness-placed: it has no production caller yet. Every limit is read from the admitted slot
 reservation in the ledger, never from a table, and `decoded` follows the configured C. A
 charged dimension with no admitted limit fails.
@@ -603,7 +607,7 @@ from a full (non-shallow, at least 1,000 commits) checkout of this repository:
 
 ```sh
 UZI_MEASURE_3031=1 UZI_MEASURE_DOCKER_HOST=tcp://<dind>:2375 \
-  node --import tsx --test --test-timeout=120000 test/measure-3031-composed.test.ts
+  node --import tsx --test --test-timeout=120000 test/measure-3031-composed.test.ts > measure.out
 ```
 
 - `UZI_MEASURE_DOCKER_HOST` is the Docker daemon the measurement is wired to. It must be a
@@ -619,8 +623,9 @@ UZI_MEASURE_3031=1 UZI_MEASURE_DOCKER_HOST=tcp://<dind>:2375 \
   the real Kubernetes `/data` layout (mode 2775), so the measurement runs on a scratch
   directory, not on `/data`. It is single-UID (`UZI_UID_SPLIT` unset); split-UID is not
   covered, and each MEASURE line records the mode.
-- The measurement must be the only test process: the exclusive-idle scan refuses any other
-  writer. Run it as PID 1 of the container, not through a long-lived `docker exec` shell.
+- The measurement must be the only process in its container: the exclusive-idle scan and the harness
+  idleness check refuse any other writer, so redirect output to a file (a `| tee` or `| grep` is a
+  foreign process) and run it as PID 1, not through a long-lived `docker exec` shell.
 - `UZI_MEASURE_DEVIATION` states any difference from the worker image's environment. It
   becomes `elapsed_fidelity: "unverified: <text>"`, and a would-be PASS is then reported as
   `counters_within_limits_elapsed_unverified`. It never relaxes a limit or the slot deadline.
@@ -635,7 +640,8 @@ clones (not a fleet maximum). A refusal (layout, quiescence, admission, resource
 is recorded with its phase and the phases left unrun and is never a counter PASS. The
 two-source family variant is reported UNRUN: at this commit no production path produces a two-member
 family (the family list is `[genesis]` or the inherited list, which is built the same way), and the
-measurement injects no member. Multi-source families belong to #3440.
+measurement injects no member. This is a reachability conflict between #3442 Design 5 and current
+production, left for maintainer disposition.
 
 The verdict controls (`measure-3031-composed.test.ts`, "verdict controls") run without the
 environment variable, on a small fixture, and are the only runs that stub exclusion and

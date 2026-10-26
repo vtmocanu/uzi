@@ -17,7 +17,8 @@
 //   - guard-method: RecoveryCoordinator.terminalOriginAdmissionEnabled returns true;
 //   - faked-server: the worker API is a faked server behind the real strict WorkerClient.
 // Harness facts that are not substitutions of a production check, also printed: the Worker object
-// does not exist here, so `isIdle` is true by construction (the measurement is the only runner).
+// exists here, so `isIdle` is the harness check of sole execution in the container and a settled runner (a
+// disclosed fixture precondition; it does not prove production Worker-idleness integration).
 //
 // Environment inputs: UZI_MEASURE_DOCKER_HOST (the Docker daemon the worker is wired to; the
 // exclusion proof and the quiescence scans probe it for real), UZI_MEASURE_DEVIATION (free text,
@@ -343,12 +344,70 @@ const FAMILY_UNREACHABLE = "admission not reached for a two-member family: it is
   "`const originals = blocked ? flight.sourceInherited?.family?.originals : [genesis]`), and the inherited originals come " +
   "from an earlier observation built the same way, so every real family has one member; a sibling ledger entry for the run " +
   "makes the real scan refuse (git.ts matchMaintenanceSourceFamily `incomplete known family`). Reaching two members needs an " +
-  "injected member or a production change; the measurement does neither (#3440 owns multi-source families)";
+  "injected member or a production change; the measurement does neither; this is a reachability conflict between #3442 Design 5 and current production, for maintainer disposition";
 
 // The exact refusals of GitCache.assertOwedBare (git.ts), the precondition of the guarded archive call: a
 // fixture bare that cannot satisfy it is UNRUN with the reason, not a counter FAIL.
 const OWED_BARE_REFUSALS: ReadonlySet<string> = new Set(["owed candidates require a known worker bare path",
   "unsafe worker bare directory", "owed candidates require a bare repository"]);
+
+/**
+ * Fixture precondition standing in for Worker idleness: no process in this container other than this one,
+ * its ancestors and its own descendants (read from /proc), and a runner with no execution tail but the
+ * observed run's own. It is NOT evidence about the production Worker.isIdle integration.
+ */
+function readParents(): Map<number, number> {
+  const parents = new Map<number, number>();
+  for (const name of fsSync.readdirSync("/proc")) {
+    if (!/^\d+$/.test(name)) continue;
+    try {
+      const stat = fsSync.readFileSync(`/proc/${name}/stat`, "utf8");
+      parents.set(Number(name), Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]));
+    } catch { /* exited while scanning */ }
+  }
+  return parents;
+}
+/** Pids that are neither `self`, an ancestor of it, nor one of its descendants. */
+function foreignPids(parents: ReadonlyMap<number, number>, self: number): number[] {
+  const related = new Set<number>([self]);
+  for (let p = parents.get(self); p !== undefined && p > 0 && !related.has(p); p = parents.get(p)) related.add(p);
+  const descends = (pid: number): boolean => {
+    for (let p: number | undefined = pid, i = 0; p !== undefined && p > 0 && i < 128; p = parents.get(p), i++) if (p === self) return true;
+    return false;
+  };
+  return [...parents.keys()].filter(pid => !related.has(pid) && !descends(pid));
+}
+function runnerTailProblem(runner: unknown, runId: string): string | undefined {
+  const tails = (runner as { executionTails: Map<string, unknown> }).executionTails;
+  return [...tails.keys()].some(id => id !== runId) ? "the runner holds an execution tail for another run" : undefined;
+}
+function soleExecutionProblem(runner?: unknown, runId?: string): string | undefined {
+  const foreign = foreignPids(readParents(), process.pid);
+  if (foreign.length > 0) return `${foreign.length} process(es) other than the measurement, its ancestors and its descendants run in this container`;
+  return runner ? runnerTailProblem(runner, runId ?? "") : undefined;
+}
+
+const SUPPRESSED_REASON = "pre-slot production bundle path suppressed by the harness";
+/** Gate eligibility. Every run installs the produceRecoveryBundle suppression, so none qualifies for a C2 PASS. */
+function eligibility(spec: { real: boolean; origin: "repo" | "tiny"; controlLimits?: unknown }, _suppressedBundleCalls: number): { eligible: boolean; reasons: string[] } {
+  const reasons: string[] = [];
+  if (!spec.real) reasons.push("control run (stubbed exclusion and quiescence)");
+  if (spec.origin !== "repo") reasons.push("not a clone of the source repository");
+  if (spec.controlLimits) reasons.push("limits lowered at evaluation time");
+  reasons.push(SUPPRESSED_REASON);
+  return { eligible: reasons.length === 0, reasons };
+}
+
+/** The gate-level verdict of C2: only eligible runs can qualify; with none, no qualifying measurement exists. */
+function gateSummary(records: ReadonlyArray<Record<string, unknown>>) {
+  const runs = records.filter(r => r.kind === "composed" && r.label !== undefined);
+  const eligible = runs.filter(r => r.eligible_for_gate === true);
+  const verdict = eligible.length === 0 ? "UNRUN" : eligible.some(r => r.verdict === "FAIL" || r.verdict === "UNRUN") ? "FAIL"
+    : eligible.every(r => r.verdict === "PASS") ? "PASS" : "counters_within_limits_elapsed_unverified";
+  return { kind: "c2_gate_summary", verdict, eligible_runs: eligible.length, runs: runs.length,
+    reason: eligible.length === 0 ? "no qualifying measurement is possible: every run depends on a harness intervention that is not a Design-7 substitution (" + SUPPRESSED_REASON + "); per-run counters are diagnostics" : undefined,
+    per_run: runs.map(r => ({ label: r.label, verdict: r.verdict, eligible_for_gate: r.eligible_for_gate ?? false })) };
+}
 
 interface RunResult { record: Record<string, unknown>; evaluation: Evaluation }
 
@@ -376,6 +435,8 @@ async function runPipeline(t: TestContext, spec: Spec): Promise<RunResult> {
     const prerequisites = realPrerequisites();
     if ("unrun" in prerequisites) return unrun(prerequisites.unrun);
     dockerHost = prerequisites.dockerHost;
+    const crowded = soleExecutionProblem();
+    if (crowded) return unrun("sole execution is unverified, so the idleness precondition fails: " + crowded);
   }
   if (spec.real) {
     const ancestors = ancestorProblem(path.dirname(git.recoveryRoot));
@@ -499,7 +560,7 @@ async function runPipeline(t: TestContext, spec: Spec): Promise<RunResult> {
     docker: { state: (request.site === "retained_ops" ? "docker_unconfirmed" : "not_wired") as "docker_unconfirmed" | "not_wired", removed: [], detail: "" },
   });
   const exclusion = spec.real
-    ? new MaintenanceWriterExclusion({ gate: new DindPruneGate(), isIdle: () => true,
+    ? new MaintenanceWriterExclusion({ gate: new DindPruneGate(), isIdle: () => soleExecutionProblem(runner, claim.run_id) === undefined,
         proof: scans => terminalMaintenanceProof(scans, dockerHost), log: nullLogger() })
     : passingExclusion();
 
@@ -669,19 +730,20 @@ async function runPipeline(t: TestContext, spec: Spec): Promise<RunResult> {
   const evaluation = archiveNotApplicable
     ? evaluate({ unrun: `the fixture cannot satisfy the archive precondition: ${(archiveError as Error).message}`, limits, elapsedLimitMs: slotMs, elapsedMs: slotElapsed, phases, deviation: env.deviation })
     : evaluate({ limits, elapsedLimitMs: slotMs, elapsedMs: slotElapsed, phases, refusedCharge, capRefusals, envelopeOverruns, refusal, incomplete, deviation: env.deviation });
+  const eligible = eligibility(spec, stray.length);
   const record = emit({
     ...head, ...body,
     candidate_sha: source?.head, source_commits: source?.commits, run_id: claim.run_id,
     substitutions: ["guard-method: RecoveryCoordinator.terminalOriginAdmissionEnabled",
       "faked-server: strict WorkerClient over a faked worker API, with client.hasFeature and client.listRecoveryHolds answered directly by the harness",
-      "isIdle: () => true passed to the real MaintenanceWriterExclusion (no Worker object exists in the harness)",
+      "isIdle: harness check of sole execution in the container and a settled runner, passed to the real MaintenanceWriterExclusion (no Worker object exists; this does not prove production Worker-idleness integration)",
       "produceRecoveryBundle: calls outside the archive window are refused and counted (the runner's ordinary pre-slot flows); a refused call after slot admission makes the run non-eligible",
       ...(spec.controlLimits ? ["CONTROL ONLY: limits lowered at evaluation time"] : []),
       ...(spec.real ? [] : ["CONTROL ONLY: passingExclusion", "CONTROL ONLY: stubbed quiescence verdict", "CONTROL ONLY: trusted-ancestor DAC projection"])],
     layout_construction: spec.layout === "dissociated" ? "real GitCache.materializeRunnerClone" : "clone --shared, alternates retained",
     uid_mode: process.env.UZI_UID_SPLIT === "1" ? "split-UID requested (not covered by this harness)" : "single-UID (UZI_UID_SPLIT unset); split-UID is not covered",
     archive_phase_note: "harness-placed archive phase (no production caller yet)",
-    eligible_for_gate: spec.real && spec.origin === "repo" && !stray.some(s => s.afterAdmission),
+    eligible_for_gate: eligible.eligible, ineligible_reasons: eligible.reasons,
     deviation: env.deviation ?? null, elapsed_fidelity: evaluation.elapsed_fidelity,
     elapsed_ms: slotElapsed, elapsed_to_archive_end_ms: archiveEnded !== undefined && slotStarted !== undefined ? Math.round(archiveEnded - slotStarted) : null,
     pipeline_elapsed_ms: Math.round(performance.now() - started),
@@ -730,6 +792,10 @@ describe("#3031 composed measurement (C2)", () => {
       ladder.push({ loose, verdict: evaluation.verdict });
     });
   }
+
+  it("C2 gate summary", { skip: MEASURE_SKIP }, () => {
+    emit(gateSummary(emitted));
+  });
 
   it("loose-object ceiling summary", { skip: MEASURE_SKIP }, () => {
     const passing = ladder.filter(r => within(r.verdict)).map(r => r.loose);
@@ -802,6 +868,27 @@ describe("#3031 composed measurement verdict controls", () => {
     }
   });
 
+  it("control: a run that suppresses production bundle calls is never eligible, and with no eligible run the C2 gate is UNRUN", () => {
+    for (const suppressed of [0, 2]) {
+      const e = eligibility({ real: true, origin: "repo" }, suppressed);
+      assert.equal(e.eligible, false);
+      assert.ok(e.reasons.includes("pre-slot production bundle path suppressed by the harness"), e.reasons.join());
+    }
+    const lines = [{ kind: "composed", label: "a", verdict: "PASS", eligible_for_gate: false }, { kind: "composed", label: "b", verdict: "FAIL", eligible_for_gate: false }];
+    assert.equal(gateSummary(lines).verdict, "UNRUN");
+    assert.equal(gateSummary([...lines, { kind: "composed", label: "c", verdict: "FAIL", eligible_for_gate: true }]).verdict, "FAIL");
+    assert.equal(gateSummary([{ kind: "composed", label: "c", verdict: "PASS", eligible_for_gate: true }]).verdict, "PASS");
+  });
+
+  it("control: the sole-execution precondition refuses a foreign process and a foreign runner tail", () => {
+    const tree = new Map([[1, 0], [10, 1], [20, 10], [30, 20]]); // init, parent, self, own child
+    assert.deepEqual(foreignPids(tree, 20), []);
+    assert.deepEqual(foreignPids(new Map([...tree, [40, 1]]), 20), [40]);
+    assert.deepEqual(foreignPids(new Map([...tree, [40, 30], [50, 40]]), 20), [], "descendants of descendants are the measurement's own");
+    assert.match(runnerTailProblem({ executionTails: new Map([["other-run", 1]]) }, "this-run") ?? "", /another run/);
+    assert.equal(runnerTailProblem({ executionTails: new Map([["this-run", 1]]) }, "this-run"), undefined);
+  });
+
   it("control: the two-source family variant is UNRUN with the reachability reason and is never eligible for the gate", async t => {
     const { record, evaluation } = await runPipeline(t, { label: "control-family", layout: "shared", shape: "A", family: true, origin: "repo", real: true });
     assert.equal(evaluation.verdict, "UNRUN");
@@ -815,6 +902,7 @@ describe("#3031 composed measurement verdict controls", () => {
   it("control 9 (pipeline): one cap lowered through the decoded-limit seam fails naming that dimension and a phase", { skip: LINUX_ONLY, timeout: 120_000 }, async t => {
     const { record, evaluation } = await runPipeline(t, small("control-lowered-cap", 1));
     assert.equal(record.eligible_for_gate, false, "a control run never qualifies for the gate");
+    assert.ok((record.ineligible_reasons as string[]).includes("pre-slot production bundle path suppressed by the harness"));
     assert.equal(evaluation.verdict, "FAIL", JSON.stringify(record));
     const decoded = evaluation.violations.find(v => v.dimension === "decoded");
     assert.ok(decoded, JSON.stringify(evaluation));
