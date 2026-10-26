@@ -1,4 +1,5 @@
 import { setTimeout as delay } from "node:timers/promises";
+import { TransientRecoveryError } from "./sdk-executor.js";
 import { RequestError, RevisionSourceFenceUnavailableError } from "./client.js";
 import { PlanRejectedError, PlanRevisionReplacedError } from "./executor.js";
 import type { RunOwnershipResponse, StateAck, StateRequest } from "./protocol.js";
@@ -22,7 +23,7 @@ export class PlanRevisionRecoveryStoppedError extends Error {
 
 type Report = (request: StateRequest) => Promise<StateAck>;
 interface Source { revision: number; request: StateRequest; report: Report }
-interface Active { id: number; source: Source; used: number; redriveReady: boolean }
+interface Active { id: number; source: Source; used: number; redriveReady: boolean; cause?: unknown }
 
 interface Dependencies {
   generation: number;
@@ -95,7 +96,8 @@ export class PlanRevisionRecovery {
     } : {};
   }
 
-  /** Called immediately before an individual human revision turn, not each inner retry.
+  /** Called before human revision turns and at fresh epoch admission fences.
+   * Repeated source probes spend an allowance only once, when redriveReady is set.
    * A successful clarification does not create a new allowance.
    */
   async beforeTurn(): Promise<void> {
@@ -103,14 +105,16 @@ export class PlanRevisionRecovery {
     if (!a) return;
     await this.confirmSource(a);
     if (a.redriveReady) {
-      await this.deps.notice(`Provider transient exhaustion during plan revision ${a.id}; re-driving the failed turn (${a.used + 1}/${this.limit}).`);
+      const reason = a.cause instanceof TransientRecoveryError && a.cause.zeroEvidenceIdle
+        ? "No model output within the idle timeout" : "Provider transient exhaustion";
+      await this.deps.notice(`${reason} during plan revision ${a.id}; re-driving the failed turn (${a.used + 1}/${this.limit}).`);
       await this.confirmSource(a);
       a.used++;
       a.redriveReady = false;
     }
   }
 
-  /** Only the runner's typed provider-origin exhaustion hook calls this method. */
+  /** The runner admits typed provider exhaustion and measured Codex revision silence only. */
   async retry(cause: unknown): Promise<void> {
     const a = this.active;
     if (!a) throw cause; // missing source/older API keeps existing compatibility behavior
@@ -118,6 +122,7 @@ export class PlanRevisionRecovery {
     // An id-less legacy presentation still has a source ownership fence, but
     // cannot use the exact-presentation expiry restore. Keep its existing recovery path.
     if (!a.source.request.presentation_id) throw cause;
+    a.cause = cause;
     if (a.used < this.limit) {
       const random = this.deps.policy?.random?.() ?? Math.random();
       const jitter = Number.isFinite(random) ? Math.max(0, Math.min(1, random)) : 0;
@@ -142,7 +147,7 @@ export class PlanRevisionRecovery {
     await restoreSourceGate(await this.confirmSource(a));
     this.deps.steering.setGateRevision(a.source.revision);
     await this.deps.notice(
-      `Plan revision retry allowance exhausted (generation ${this.deps.generation}, source gate ${a.source.revision}, pending revision ${a.id}, ${this.limit} automatic re-drives in this flight). Feedback remains pending; no revised plan answering it has persisted. ` +
+      `${a.cause instanceof TransientRecoveryError && a.cause.zeroEvidenceIdle ? "No model output within the idle timeout. " : ""}Plan revision retry allowance exhausted (generation ${this.deps.generation}, source gate ${a.source.revision}, pending revision ${a.id}, ${this.limit} automatic re-drives in this flight). Feedback remains pending; no revised plan answering it has persisted. ` +
       "Use an ordinary revise bound to this source gate for a new, normally charged revision, if the server's PLAN_MAX_REVISIONS permits. If that cap is exhausted, no further revise/retry is available on this run. " +
       "Cancel and source-bound reject remain available. Approval and follow-up cannot resume this wait. For further changes after the cap, cancel/reject and dispatch a new run. This live gate remains busy and can defer a worker image roll until it ends or existing drain/shutdown policy acts.",
     );

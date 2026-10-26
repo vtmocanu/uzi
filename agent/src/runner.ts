@@ -13043,7 +13043,7 @@ export class RunRunner {
         : {}),
       beforePlanRevisionTurn: () => revisionRecovery?.beforeTurn() ?? Promise.resolve(),
       retryPlanRevisionTurn: async (cause) => {
-        if (!(cause instanceof TransientRecoveryError) || !cause.providerOrigin || !revisionRecovery) throw cause;
+        if (!(cause instanceof TransientRecoveryError) || (!cause.providerOrigin && !cause.zeroEvidenceIdle) || !revisionRecovery) throw cause;
         await revisionRecovery.retry(cause);
       },
       gatePlan: async (planMd, milestones, onPlanPersisted, settles, semanticSubmission) => {

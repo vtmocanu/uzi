@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import { RevisionSourceFenceUnavailableError } from "../src/client.js";
+import { TransientRecoveryError } from "../src/sdk-executor.js";
 import assert from "node:assert/strict";
 import { PlanRevisionRecovery, PlanRevisionRecoveryStoppedError, type PlanRevisionRetryPolicy } from "../src/plan-revision-retry.js";
 import { PlanRejectedError, PlanRevisionReplacedError } from "../src/executor.js";
@@ -156,6 +157,30 @@ describe("live-flight plan revision recovery", () => {
     assert.match(f.notices.at(-1)!, /generation 7, source gate 11, pending revision 101/);
     assert.match(f.notices.at(-1)!, /Feedback remains pending/);
     assert.match(f.notices.at(-1)!, /live gate remains busy/);
+    assert.deepEqual(f.retired, []);
+  });
+
+  it("3466 measured silence shares exactly three re-drives and names the idle cause", async () => {
+    const f = fixture(3);
+    const cause = new TransientRecoveryError("silent revision", {
+      zeroEvidenceIdle: true, originalIdle: new Error("codex run idle timeout"),
+    });
+    await f.recovery.beforeTurn();
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const slept = f.sleeps.reduce((sum, ms) => sum + ms, 0);
+      await f.recovery.retry(cause);
+      assert.equal(f.sleeps.reduce((sum, ms) => sum + ms, 0) - slept, [5000, 10000, 20000][attempt - 1]);
+      await f.recovery.beforeTurn();
+      await f.recovery.beforeTurn();
+      assert.equal(f.notices.at(-1),
+        `No model output within the idle timeout during plan revision 101; re-driving the failed turn (${attempt}/3).`);
+    }
+    assert.equal(f.sleeps.reduce((sum, ms) => sum + ms, 0), 35000);
+    await assert.rejects(f.recovery.retry(cause), PlanRejectedError);
+    assert.match(f.notices.at(-1)!, /^No model output within the idle timeout\. Plan revision retry allowance exhausted/);
+    assert.match(f.notices.at(-1)!, /Feedback remains pending/);
+    assert.ok(f.notices.every(text => !text.includes("Provider transient")));
+    assert.deepEqual(f.writes, []);
     assert.deepEqual(f.retired, []);
   });
 

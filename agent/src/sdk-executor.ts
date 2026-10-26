@@ -247,7 +247,8 @@ const EMPTY_TURN_BACKOFF_SLICE_MS = 250;
  *    events and no terminal at all;
  *  - the Codex lane, `CodexExecutor.driveTurnWithWallPark` (issue #2099): a turn that kept
  *    failing with a transient provider classification after its bounded same-thread retries,
- *    or an eligible non-human-revision turn that idled with zero model-processing evidence (#3462).
+ *    or an eligible turn that idled with zero model-processing evidence (#3462, #3466).
+ *    Human revision silence is consumed by its in-flight driver, never the ordinary recovery park.
  *
  * Except for that Codex zero-evidence idle, wall/idle/cancel/pause interruptions keep their
  * existing terminal/cancelled/paused outcome. It is never thrown on the Claude lane for a turn that RAN but
@@ -259,15 +260,21 @@ export class TransientRecoveryError extends Error {
    *  error. The runner types the recovery_wait park `provider_outage` from this alone; the
    *  empty-turn and gate-recovery throws stay unmarked. */
   public readonly providerOrigin: boolean;
+  /** Measured Codex human-revision silence, never provider-outage evidence. */
+  public readonly zeroEvidenceIdle: boolean;
+  /** Original idle trip retained by identity for unsupported revision recovery. */
+  public readonly originalIdle?: Error;
   /** Session resolved by the final failed attempt; undefined means resume no session. */
   public readonly sessionId?: string;
   constructor(
     message = "the model returned a positively-empty result (0 turns, no activity) after bounded in-process retries",
-    opts: { providerOrigin?: boolean; sessionId?: string } = {},
+    opts: { providerOrigin?: boolean; sessionId?: string; zeroEvidenceIdle?: boolean; originalIdle?: Error } = {},
   ) {
     super(message);
     this.name = "TransientRecoveryError";
     this.providerOrigin = opts.providerOrigin === true;
+    this.zeroEvidenceIdle = opts.zeroEvidenceIdle === true;
+    this.originalIdle = opts.originalIdle;
     this.sessionId = opts.sessionId;
   }
 }

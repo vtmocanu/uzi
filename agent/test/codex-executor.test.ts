@@ -18116,9 +18116,9 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
     } finally { release(); rig.transport.end(); t.mock.timers.reset(); }
   });
 
-  for (const followup of ["none", "clarification", "prose"] as const) it(`3462 human revision ${followup} silence retains terminal idle`, async t => {
+  for (const followup of ["none", "clarification", "prose"] as const) it(`3466 human revision ${followup} silence retries the exact prompt in a fresh epoch`, async t => {
     const silentTurn = followup === "none" ? 2 : 3;
-    const rig = makeRig({ responder: c => {
+    const rig = makeMultiEpochRig([c => {
       if (c.method === "thread/start") return { thread: { id: "th-1" } };
       if (c.method === "turn/start") {
         if (c.turnStartCount === 1) c.transport.push(threadStarted())
@@ -18132,27 +18132,53 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
         return { turn: { id: "tn-1" } };
       }
       return {};
-    } });
+    }, epochResponder("th-1", "tn-1", transport => transport
+      .push(toolCall(3, "submit_plan", { plan_md: "revised" }, "th-1", "tn-1", "revised"))
+      .push(turnCompleted("completed")))]);
     rig.deps = { ...rig.deps, idleMs: 100, wallMs: 5000 };
-    let retries = 0, gates = 0;
-    const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined,
-      gatePlan: async () => { gates++; return { kind: "revise", feedback: "change", inputId: 11 }; },
-      askUser: async () => ({ kind: "answer", answers: ["server"] }),
-      retryPlanRevisionTurn: async () => { retries++; },
+    const releaseCodex = rig.client.releaseCodex.bind(rig.client);
+    rig.client.releaseCodex = async (...args) => {
+      if (rig.client.releaseCalls.length) assert.ok(rig.epochs[0]!.disposed() > 0, "dispose precedes fresh release");
+      return releaseCodex(...args);
+    };
+    let retries = 0, gates = 0, questions = 0;
+    const settled: (number | undefined)[] = [];
+    const { ctx, emitted } = makeCtx({ planApproved: false, approvedPlan: undefined,
+      config: { plan_max_revisions: 1, question_max: 1 },
+      gatePlan: async (plan, _milestones, _summary, input) => {
+        gates++; settled.push(input);
+        if (gates === 1) return { kind: "revise", feedback: "change", inputId: 11 };
+        assert.equal(plan, "revised");
+        return { kind: "reject", reason: "test complete" };
+      },
+      askUser: async () => { questions++; return { kind: "answer", answers: ["server"] }; },
+      retryPlanRevisionTurn: async cause => {
+        assert.ok(cause instanceof TransientRecoveryError && cause.zeroEvidenceIdle);
+        assert.equal(cause.providerOrigin, false);
+        assert.equal(cause.originalIdle?.message, "codex run idle timeout");
+        assert.ok(rig.epochs[0]!.disposed() > 0);
+        retries++;
+      },
     });
     t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
     const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
     void running.catch(() => undefined);
     try {
-      await until(() => rig.transport.turnStartCount === silentTurn);
+      await until(() => rig.epochs[0]!.transport.turnStartCount === silentTurn);
       await tick(); t.mock.timers.tick(100);
-      await assert.rejects(running, (error: unknown) => {
-        assert.ok(error instanceof Error && !(error instanceof TransientRecoveryError));
-        assert.equal(error.message, "codex run idle timeout"); return true;
-      });
-      assert.equal(retries, 0); assert.equal(gates, 1);
-      assert.equal(rig.transport.turnStartCount, silentTurn);
-    } finally { rig.transport.end(); t.mock.timers.reset(); }
+      await assert.rejects(running, PlanRejectedError);
+      assert.equal(retries, 1); assert.equal(gates, 2);
+      assert.deepEqual(settled, [undefined, 11]);
+      assert.equal(questions, followup === "clarification" ? 1 : 0);
+      assert.equal(emitted.filter(m => m.kind === "plan_feedback").length, 1);
+      assert.equal(rig.providerLaunches(), 2);
+      assert.equal(rig.client.releaseCalls.length, 2);
+      assert.equal(rig.epochs[0]!.transport.turnStartCount, silentTurn);
+      assert.equal(rig.epochs[1]!.transport.turnStartCount, 1);
+      const failed = rig.epochs[0]!.transport.requests.filter(r => r.method === "turn/start").at(-1)!;
+      const retried = rig.epochs[1]!.transport.requests.find(r => r.method === "turn/start")!;
+      assert.deepEqual(retried.params, failed.params, "the answered or nudged prompt and all turn budgets survive");
+    } finally { for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
   });
 
   it("3462 a typed idle trip with undefined evidence cannot recover", async t => {
@@ -18190,12 +18216,18 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
     } finally { rig.transport.end(); t.mock.timers.reset(); }
   });
 
-  it("3462 real runner human revision zero-output idle fails and closes the gate", async () => {
+  for (const mode of ["redrive", "replacement", "cancel", "reject"] as const)
+    it(`3466 real runner revision silence ${mode} preserves the negotiated source and receipts`, async () => {
     const api = new FakeApi("revision-idle-worker");
+    api.planRevisionRetries = true;
+    api.gateRevisions = true;
+    api.strictReceiptGenerations = true;
+    api.stampInputCreatedAt = true;
+    api.stampGateBindings = true;
     const url = await api.listen();
     const fx = makeFixture();
     const diagnostics = recordingLog();
-    const rig = makeRig({ responder: c => {
+    const rig = makeMultiEpochRig([c => {
       if (c.method === "thread/start") return { thread: { id: "th-1" } };
       if (c.method === "turn/start") {
         if (c.turnStartCount === 1) c.transport.push(threadStarted())
@@ -18204,59 +18236,107 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
         return { turn: { id: "tn-1" } };
       }
       return {};
-    } });
+    }, epochResponder("th-1", "tn-1", transport => transport
+      .push(toolCall(2, "submit_plan", { plan_md: "# Revised plan" }, "th-1", "tn-1", "revised"))
+      .push(turnCompleted("completed")))]);
     rig.deps = { ...rig.deps, idleMs: 100, wallMs: 5000, deferRegistryTeardown: true };
     const client = new WorkerClient(url, "revision-idle-worker", "test", diagnostics.log, {
       sleep: async () => {}, terminalRetrySchedule: [1, 1],
     });
+    client.protocolFeatures = ["claim_generation_fence", "gate_revision_v1", "plan_revision_retry_v1"];
     const claim = makeClaim({
       repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
-      auto_approve: false, plan_approved: false,
+      claim_generation: 1, auto_approve: false, plan_approved: false, config: { plan_max_revisions: 1 },
       secrets: { forge_pat: "fixture-forge-pat-000000", codex: SUBSCRIPTION as never },
     });
+    api.setInputClaimGeneration(claim.run_id, 1);
     api.onState(claim.run_id, body => {
-      if (body.status === "awaiting_approval") api.setInputs(claim.run_id,
+      if (body.status !== "awaiting_approval") return;
+      if (body.plan_md === "# Initial plan") api.setInputs(claim.run_id,
         [{ id: 1, kind: "revise_plan", body: "tighten the scope" }]);
+      if (body.plan_md === "# Revised plan") api.setInputs(claim.run_id,
+        [{ id: 3, kind: "reject_plan", body: "test complete" }]);
     });
-    let produced: unknown;
-    let revisions = 0;
-    let retries = 0;
+    let revisions = 0, retries = 0, expired = 0;
+    const waits: number[] = [];
     const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
     const run = executor.run.bind(executor);
     executor.run = async ctx => {
       const gate = ctx.gatePlan!;
-      const retry = ctx.retryPlanRevisionTurn;
+      const retry = ctx.retryPlanRevisionTurn!;
+      const emit = ctx.emit;
+      ctx.emit = message => {
+        emit(message);
+        if (message.kind !== "status" || !String(rec(message.payload).text).includes("retry allowance exhausted")) return;
+        expired++;
+        assert.equal(api.isApplied(claim.run_id, 1), false);
+        assert.ok(rig.epochs[0]!.disposed() > 0, "exhausted gate is offered only after disposal");
+        assert.equal(rig.providerLaunches(), 1);
+        api.setInputs(claim.run_id, [{ id: 2,
+          kind: mode === "replacement" ? "revise_plan" : mode === "reject" ? "reject_plan" : "cancel",
+          body: mode === "replacement" ? "replacement J" : "stop" }]);
+      };
       ctx.gatePlan = async (...args) => {
         const verdict = await gate(...args);
-        assert.equal(verdict.kind, "revise");
-        if (verdict.kind === "revise") assert.equal(verdict.feedback, "tighten the scope");
-        revisions++;
+        if (verdict.kind === "revise") {
+          assert.equal(verdict.feedback, "tighten the scope");
+          revisions++;
+        }
         return verdict;
       };
-      ctx.retryPlanRevisionTurn = async (...args) => { retries++; await retry?.(...args); };
-      try { return await run(ctx); } catch (error) { produced = error; throw error; }
+      ctx.retryPlanRevisionTurn = async cause => {
+        assert.ok(cause instanceof TransientRecoveryError && cause.zeroEvidenceIdle && !cause.providerOrigin);
+        retries++; await retry(cause);
+      };
+      return run(ctx);
     };
     try {
       const git = new GitCache(fx.dataDir, diagnostics.log, undefined, testGitCacheOptions());
       await new RunRunner(client, git, () => ({ executor }), diagnostics.log, 20, undefined, {
         pollMs: 5,
+        planRevisionRetryPolicy: { redrives: mode === "redrive" ? 3 : 0, random: () => 0,
+          sleep: async (ms, signal) => {
+            signal.throwIfAborted(); waits.push(ms);
+            if (ms === 30000) await new Promise<void>((resolve, reject) => {
+              const timer = setTimeout(resolve, ms);
+              signal.addEventListener("abort", () => { clearTimeout(timer); reject(signal.reason); }, { once: true });
+            });
+          } },
         quiesceRun: async () => ({
           process: { state: "quiescent", processes: [], killed: [], detail: "fixture roots reaped" },
           docker: { state: "not_wired", removed: [], detail: "not wired" },
         }),
       }).execute(claim);
-      assert.ok(produced instanceof Error && !(produced instanceof TransientRecoveryError), diagnostics.lines.join("\n"));
-      assert.equal(produced.message, "codex run idle timeout");
-      assert.equal(revisions, 1);
-      assert.equal(retries, 0);
-      assert.equal(rig.transport.turnStartCount, 2);
       const states = api.states.filter(s => s.runId === claim.run_id).map(s => s.body);
-      assert.equal(states.filter(s => s.status === "awaiting_approval").length, 1);
-      assert.equal(states.filter(s => s.status === "failed").length, 1);
-      assert.equal(states.at(-1)?.status, "failed", "the revision gate ends in a terminal state");
-      assert.equal(states.at(-1)?.failure_reason, "codex run idle timeout");
+      const revised = states.find(s => s.plan_md === "# Revised plan");
+      const publishes = mode === "redrive" || mode === "replacement";
+      assert.equal(revisions, 1);
+      assert.equal(retries, 1, diagnostics.lines.join("\n"));
+      assert.equal(expired, mode === "redrive" ? 0 : 1, diagnostics.lines.join("\n"));
+      assert.equal(rig.providerLaunches(), publishes ? 2 : 1, diagnostics.lines.join("\n"));
+      assert.equal(rig.epochs[0]!.transport.turnStartCount, 2);
+      assert.equal(states.filter(s => s.status === "awaiting_approval").length, publishes ? 2 : 1);
+      assert.equal(Boolean(revised), publishes, diagnostics.lines.join("\n"));
+      assert.equal(api.isApplied(claim.run_id, 1), publishes);
+      if (revised) {
+        assert.equal(revised.revision_input_id, mode === "replacement" ? 2 : 1);
+        assert.equal(revised.expected_gate_revision, 1);
+        assert.deepEqual(revised.superseded_revision_input_ids, mode === "replacement" ? [1] : []);
+        assert.equal(api.isInputSuperseded(claim.run_id, 1), mode === "replacement");
+        const failed = rig.epochs[0]!.transport.requests.filter(r => r.method === "turn/start").at(-1)!;
+        const retried = rig.epochs[1]!.transport.requests.find(r => r.method === "turn/start")!;
+        if (mode === "redrive") {
+          assert.deepEqual(retried.params, failed.params);
+          assert.equal(waits.reduce((sum, ms) => sum + ms, 0), 5000);
+        } else {
+          assert.match(JSON.stringify(retried.params), /replacement J/);
+          assert.doesNotMatch(JSON.stringify(retried.params), /tighten the scope/);
+          assert.equal(api.isApplied(claim.run_id, 2), true);
+        }
+      }
       assert.ok(!states.some(s => s.status === "recovery_wait"));
-    } finally { rig.transport.end(); await api.close(); fx.cleanup(); }
+      assert.ok(!states.some(s => s.failure_reason === "codex run idle timeout"));
+    } finally { for (const epoch of rig.epochs) epoch.transport.end(); await api.close(); fx.cleanup(); }
   });
 
   it("3462 a plain idle-message Error has unknown evidence and cannot recover", async () => {

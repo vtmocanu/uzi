@@ -2274,6 +2274,7 @@ export class CodexExecutor implements Executor {
   private beforeCaptureDrain?: () => Promise<void>;
   private captureMayHaveDrained?: () => boolean;
   private epochAdmission?: () => void;
+  private epochSourceAdmission?: () => Promise<void>;
   private captureLifecycleSignal?: AbortSignal;
   private reaperAttempt?: RunContext["runAttempt"];
   private captureReaperAttempt?: Readonly<SdkAttemptEnv>;
@@ -3584,20 +3585,36 @@ export class CodexExecutor implements Executor {
       let lastSessionId = ctx.sessionId ?? undefined;
       const wallMs = this.deps.wallMs ?? (ctx.config?.run_timeout_seconds ? ctx.config.run_timeout_seconds * 1000 : DEFAULT_WALL_MS);
       const wall: RunWall = { remainingMs: wallMs, maxServedMs: wallMs, claimMs: wallMs };
+      let silentRevision: { cause: TransientRecoveryError; needsRebuild: boolean; retryReady: boolean; checkedAt: number } | undefined;
+      const chargeSilentRecovery = (): void => {
+        if (!silentRevision?.needsRebuild) return;
+        const now = Date.now();
+        wall.remainingMs -= Math.max(0, now - silentRevision.checkedAt);
+        silentRevision.checkedAt = now;
+      };
       let completionAttempted = false;
       const completion = { history: new CompletionHistory(), attempted: () => completionAttempted };
       this.epochAdmission = () => {
         this.assertCaptureAdmission();
         // Capture continuation adds this fence. Ordinary epoch startup retains its
         // established approval/installer interruption routing.
-        if (this.captureRevision === 0) return;
+        if (this.captureRevision === 0 && !silentRevision) return;
+        chargeSilentRecovery();
         if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
         if (ctx.claimFenced?.() || lifecycleSignal.aborted) throw new CodexRequestFailure("parent_abort");
-        if (pauseNow.vaultLock.latched) throw new CodexCredentialDeferredError();
         const pending = this.pendingInterruption(ctx, pauseNow, wall);
         if (pending === REASON_CANCEL) throw new Error(REASON_CANCEL);
-        if (pauseNow.pending || ((epochIndex > 0 || this.captureRevision > 0)
+        if (silentRevision && pending === REASON_WALL) throw this.tripError(REASON_WALL, pauseNow.capture(), 0);
+        if (silentRevision && pending === REASON_PAUSE) throw new PauseNowSignal();
+        if (pauseNow.vaultLock.latched) throw new CodexCredentialDeferredError();
+        if (pauseNow.pending || ((epochIndex > 0 || this.captureRevision > 0 || silentRevision !== undefined)
           && (pending === REASON_PAUSE || pending === REASON_WALL))) throw new PauseNowSignal();
+      };
+      this.epochSourceAdmission = async () => {
+        if (!silentRevision) return;
+        await ctx.beforePlanRevisionTurn?.();
+        // Ownership probes await network I/O; check controls afterwards.
+        this.epochAdmission?.();
       };
       this.assertCaptureAdmission(setupRevision);
       epoch = await this.withCaptureOwnership(async () => {
@@ -3630,6 +3647,9 @@ export class CodexExecutor implements Executor {
         if (this.unverifiedEpochRegistries.has(old.registry)) {
           throw new EpochCleanupUnprovenError(old.safety);
         }
+        // Last disposal must precede the exact-source/claim/control proof.
+        await this.epochSourceAdmission?.();
+        this.epochAdmission?.();
         epoch = await this.startProviderEpoch(ctx, shared, lastSessionId, epochNamespace, ++epochIndex, { persistAfterLaunchOnly: true });
         this.safety = epoch.safety;
         reapedSinceLastPersist = false;
@@ -3736,17 +3756,87 @@ export class CodexExecutor implements Executor {
         // turn and every revision turn each get one nudge and one owner park.
         let nudged = false;
         let fallbackUsed = false;
+        const routeSilentInterruption = async (): Promise<{ kind: "walled" } | { kind: "held"; reason: string } | undefined> => {
+          if (!silentRevision?.needsRebuild) return;
+          chargeSilentRecovery();
+          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+          const pending = this.pendingInterruption(ctx, pauseNow, wall);
+          if (pending === REASON_CANCEL) throw new Error(REASON_CANCEL);
+          if (pending === REASON_PAUSE) throw new PauseNowSignal();
+          if (pending !== REASON_WALL) return;
+          if (ctx.completionInterlock && (completion.attempted() || completion.history.priorAttempt)) {
+            if (await routeHold(REASON_WALL, true, { allowDegradedCapture: true })) return { kind: "held", reason: REASON_WALL };
+            return { kind: "walled" };
+          }
+          const outcome = await this.parkAtWall(ctx, { completedCount: 0 }, beforeReapingSink, pauseNow, pauseNow.capture(), wall, completion);
+          silentRevision.checkedAt = Date.now();
+          if (outcome === "held") return { kind: "held", reason: REASON_WALL };
+          if (outcome === "parked") return { kind: "walled" };
+          if (outcome === "unwired") throw this.tripError(REASON_WALL, pauseNow.capture(), 0);
+          return;
+        };
         // `round` counts clarification rounds only; the prose-only recovery below has its own budget.
         for (let round = 0; ; ) {
           let turn: Awaited<ReturnType<CodexExecutor["driveTurnWithWallPark"]>>;
           try {
+            const stopped = await routeSilentInterruption();
+            if (stopped) return stopped;
+            // An owner replacement inherits the rebuild requirement, not the old allowance.
+            if (humanRevision && silentRevision?.needsRebuild && !silentRevision.retryReady) {
+              const cause = silentRevision.cause;
+              try { await ctx.retryPlanRevisionTurn!(cause); }
+              catch (rejected) {
+                if (rejected === cause) throw cause.originalIdle ?? cause;
+                throw rejected;
+              } finally { chargeSilentRecovery(); }
+              silentRevision.retryReady = true;
+            }
+            // Debit the allowance before reconstruction, including credential failures.
             if (humanRevision) await ctx.beforePlanRevisionTurn?.();
-            turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, shared.selection.current, shared.repoInstructions, { completedCount: 0 }, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completion, undefined, undefined, undefined, undefined, false, !humanRevision);
+            if (humanRevision && silentRevision?.needsRebuild) {
+              silentRevision.retryReady = false;
+              await recreateEpochAfterReap();
+              chargeSilentRecovery();
+              silentRevision.needsRebuild = false;
+            }
+            turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, shared.selection.current, shared.repoInstructions, { completedCount: 0 }, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completion, undefined, undefined, undefined, undefined, false, !humanRevision, humanRevision);
           } catch (error) {
-            if (!humanRevision || !(error instanceof TransientRecoveryError) || !error.providerOrigin || !ctx.retryPlanRevisionTurn) throw error;
-            // The runner hook owns backoff and control checks. Redrive without a new cap,
-            // wall-budget reset, or epoch; clarification/prose recovery state stays local.
-            await ctx.retryPlanRevisionTurn(error);
+            if (silentRevision?.needsRebuild && error instanceof CodexTurnTripError && error.message === REASON_WALL) {
+              const stopped = await routeSilentInterruption();
+              if (stopped) return stopped;
+              continue;
+            }
+            let cause = error;
+            if (humanRevision && error instanceof TransientRecoveryError && error.zeroEvidenceIdle) {
+              silentRevision = { cause: error, needsRebuild: true, retryReady: false, checkedAt: Date.now() };
+              // Persist already happened in the measured-idle branch. Dispose before
+              // the hook, even when it will restore the exhausted owner gate.
+              await this.withCaptureOwnership(async () => {
+                await epoch!.dispose();
+                if (this.unverifiedEpochRegistries.size)
+                  throw new EpochCleanupUnprovenError(epoch!.safety);
+              });
+              chargeSilentRecovery();
+              const stopped = await routeSilentInterruption();
+              if (stopped) return stopped;
+            } else if (humanRevision && silentRevision?.needsRebuild &&
+                (error instanceof CodexCredentialDeferredError || error instanceof CodexInitialCredentialUnavailableError)) {
+              // Includes half-built replacement registries, not just the predecessor.
+              if (this.unverifiedEpochRegistries.size) throw new EpochCleanupUnprovenError(epoch!.safety);
+              cause = silentRevision.cause;
+            }
+            if (!humanRevision || !(cause instanceof TransientRecoveryError) ||
+                (!cause.providerOrigin && !cause.zeroEvidenceIdle)) throw error;
+            if (!ctx.retryPlanRevisionTurn) throw cause.zeroEvidenceIdle ? cause.originalIdle ?? cause : cause;
+            try {
+              await ctx.retryPlanRevisionTurn(cause);
+              if (silentRevision?.needsRebuild) silentRevision.retryReady = true;
+            } catch (rejected) {
+              // Only identity rejection denotes unsupported recovery. Controls and
+              // replacement-revise exceptions must retain their own routing.
+              if (rejected === cause && cause.zeroEvidenceIdle) throw cause.originalIdle ?? cause;
+              throw rejected;
+            } finally { chargeSilentRecovery(); }
             continue;
           }
           // Issue #1764: an owner `now` pause dropped the plan turn. The runner's plan-phase catch
@@ -3853,7 +3943,7 @@ export class CodexExecutor implements Executor {
           // The revise turn resumes the plan thread, which holds the plan being revised.
           let reviseTurn: Awaited<ReturnType<typeof drivePlan>>;
           try {
-            if (reapedSinceLastPersist) await recreateEpochAfterReap();
+            if (reapedSinceLastPersist && !silentRevision?.needsRebuild) await recreateEpochAfterReap();
             reviseTurn = await drivePlan(verdict.automatic === true
               ? buildAutomaticRevisionPrompt("plan", { summary: feedback, items: verdict.items ?? [] }, undefined)
               : buildRevisePlanPrompt(feedback), !automatic);
@@ -3871,6 +3961,7 @@ export class CodexExecutor implements Executor {
             throw new TrustedExecutionRefusal("codex plan turn produced no plan on revision");
           }
           verdict = await ctx.gatePlan(planMd, planResult.rejectedMilestones ?? planResult.milestones, beginPlanSummary(), settles, planResult.semanticSubmission);
+          silentRevision = undefined;
         }
         if (verdict.kind === "reject") throw new PlanRejectedError(verdict.reason, verdict.sourceGateRevision);
         if (verdict.kind === "cancel") throw new Error(REASON_CANCEL);
@@ -4633,6 +4724,7 @@ export class CodexExecutor implements Executor {
         this.beforeCaptureDrain = undefined;
         this.captureMayHaveDrained = undefined;
         this.epochAdmission = undefined;
+        this.epochSourceAdmission = undefined;
         summaryState.closed = true;
         await this.closeAndSettlePlanSummary();
         if (summaryResult && (ctx.claimFenced?.() || ctx.cancelRequested?.() || lifecycleSignal.aborted)) {
@@ -4727,6 +4819,7 @@ export class CodexExecutor implements Executor {
     const registries = new Set<ExecutionRegistry>();
     return this.trackEpochSetup(async () => {
       await this.settleOwnedSummariesBeforeCredentials();
+      await this.epochSourceAdmission?.();
       this.assertCaptureAdmission(revision);
       this.epochAdmission?.();
       const epoch = await this.buildProviderEpoch(ctx, shared, resumeSessionId, epochNamespace, epochIndex, opts, revision, registries);
@@ -4983,6 +5076,7 @@ export class CodexExecutor implements Executor {
           // their established control-flow timing and session-operation evidence stay
           // independent of the production launcher staging protocol.
           await this.sessionStore.adopt(storeDir, codexHome).catch(() => undefined);
+          await this.epochSourceAdmission?.();
           this.assertCaptureAdmission(revision);
           this.epochAdmission?.();
           return providerLaunchRoot(spec, binding.authMode);
@@ -5009,6 +5103,7 @@ export class CodexExecutor implements Executor {
           { destination: "runner-seed" },
         ).catch(() => undefined);
         try {
+          await this.epochSourceAdmission?.();
           this.assertCaptureAdmission(revision);
           this.epochAdmission?.();
           return await providerLaunchRoot(
@@ -5534,6 +5629,7 @@ export class CodexExecutor implements Executor {
     beforeDispatch?: (prompt: string) => string,
     ownerCompletionRecheck = false,
     zeroEvidenceRecoveryEligible = false,
+    humanRevision = false,
   ): Promise<
     | { kind: "turn"; result: ReducedTurnResult }
     | { kind: "walled" }
@@ -5628,9 +5724,9 @@ export class CodexExecutor implements Executor {
             );
           }
         }
-        // Only a real turn's measured zero-evidence idle can park. Synthetic trips and
-        // owner revision turns retain their existing failure contract.
-        const zeroEvidenceIdle = zeroEvidenceRecoveryEligible && !idleOperation &&
+        // Human revision silence stays inside its negotiated driver. Synthetic
+        // trips and unknown evidence retain the terminal idle contract.
+        const zeroEvidenceIdle = (zeroEvidenceRecoveryEligible || humanRevision) && !idleOperation &&
           err instanceof CodexTurnTripError && err.message === REASON_IDLE && err.processedEvents === 0;
         let recoveryCheckedAt = Date.now();
         const recoveryInterruption = (): CodexTurnTripError | undefined => {
@@ -5699,7 +5795,8 @@ export class CodexExecutor implements Executor {
               const afterCapture = recoveryInterruption();
               if (afterCapture) { err = afterCapture; continue routeTrip; }
               if (!pauseNow.vaultLock.latched) {
-                throw new TransientRecoveryError("provider sent no model output within the idle timeout");
+                throw new TransientRecoveryError("provider sent no model output within the idle timeout",
+                  humanRevision ? { zeroEvidenceIdle: true, originalIdle: caught instanceof Error ? caught : undefined } : {});
               }
             }
           }
@@ -5850,6 +5947,7 @@ export class CodexExecutor implements Executor {
     };
     // One epoch owns this bounded sequence; a refusal stops it immediately.
     for (let attempt = 1; attempt <= attempts; attempt++) {
+      await this.epochSourceAdmission?.();
       checkAbort();
       assertResidueQuarantineOpen("provider_turn");
       try {

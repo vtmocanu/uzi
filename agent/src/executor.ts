@@ -424,12 +424,12 @@ export interface RunContext {
    * a fenced claim ends quietly. Absent on the stub/test executors ⇒ today's behaviour.
    */
   takeResumedGateEvent?(signal?: AbortSignal): Promise<PlanVerdict | undefined>;
-  /** Only human revision drivers call this after typed provider retry exhaustion.
+  /** Only human revision drivers call this after typed provider exhaustion or measured Codex silence.
    * Resolves to redrive, or throws controls / PlanRevisionReplacedError to exit this driver.
    * The runner must prove ownership before resolving; unknown ownership permits no provider start.
    */
   retryPlanRevisionTurn?(cause: unknown): Promise<void>;
-  /** Check the captured source before each human revision provider turn, including continuations. */
+  /** Check the captured source before human revision turns and fresh epoch credential/root admission. */
   beforePlanRevisionTurn?(): Promise<void>;
   /** An associated cross-check human gate continues its established wait after switch give-up. */
   continueExistingPlanGate?(otherwise: () => Promise<PlanVerdict>): Promise<PlanVerdict>;

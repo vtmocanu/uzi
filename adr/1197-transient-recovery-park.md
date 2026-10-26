@@ -846,10 +846,11 @@ provider error nor that the model processed the prompt.
 
 Eligibility covers initial planning, automatic plan revisions and implementation
 model turns.
-`drivePlan` excludes human plan-revision turns throughout the invocation,
-including their clarification and prose-only followups. Those idle outcomes
-retain the existing failure contract. Productive idle, callback-based idle
-suppression, `idleOperation`, child turns and the Claude lane are unchanged.
+Human plan-revision turns use the separate, negotiated in-flight recovery
+path described in the #3466 amendment below, including clarification and
+prose-only followups. Without that recovery, they retain the idle failure
+contract. Productive idle, callback-based idle suppression, `idleOperation`,
+child turns and the Claude lane are unchanged.
 The [SDK recovery-error comment](../agent/src/sdk-executor.ts) records the
 same Codex exception.
 
@@ -862,8 +863,9 @@ pause or spent wall therefore takes its existing route instead of becoming
 ordinary recovery. A latched vault lock prevents this conversion; a lock
 latched after the idle trip preserves the earlier idle outcome.
 
-There is no in-process retry or transient-retry debit for this idle outcome,
-including silence after a #2099 retry. The existing #2099 classified-provider
+Outside negotiated human revision recovery (#3466 below), there is no
+in-process retry or transient-retry debit for this idle outcome, including
+silence after a #2099 retry. The existing #2099 classified-provider
 retry count and same-thread retries remain unchanged; that in-process
 backoff stays clamped to the remaining wall budget. A fresh
 harness is required after the recovery park: `turn/interrupt` is a
@@ -1233,3 +1235,41 @@ for each wrapped variant. M2/M3, complete mutation mapping, integration/full gat
 and new candidate reviewer/tester/auditor sign-offs remain incomplete and mandatory.
 The timed-out full gate is not green. Guard remains false; C2–C8, compose70/72/73
 and hosted timing retain their separate unproven boundaries.
+## Issue #3466 amendment — silent human revisions
+
+A real Codex idle trip with exactly zero measured model-processing events can
+use `plan_revision_retry_v1` during an accepted human revision, including its
+clarification and prose followups. A typed `zeroEvidenceIdle` discriminator
+retains the original idle trip; `providerOrigin` stays false. Silence does not
+establish a provider error. This path uses `PlanRevisionRecovery`, without an
+ordinary recovery park or provider-outage accounting. Missing negotiation,
+hook, active revision or presentation identity retains the original terminal
+idle outcome. Control and ownership exceptions retain their own routes.
+
+The pre-reaping sink persists the session before verified epoch disposal,
+including when the retry allowance is exhausted. A silent retry reconstructs
+inside the revision driver, after allowance consumption and the last awaited
+disposal. Exact source, claim and owner controls are checked again before
+construction and at credential/root admission, including before any capture.
+Unproven cleanup, including cleanup of a partially built replacement, and
+residue quarantine refuse continuation. Token redaction survives replacement
+until existing terminal cleanup.
+
+Each admitted reconstruction spends the existing three-redrive allowance.
+Locked-vault and unavailable-credential construction failures remain inside
+that bounded driver, including an owner replacement revision after exhaustion;
+they do not escape into the runner credential hold. Teardown, backoff and
+admission consume the unchanged wall budget. Cancel, pause, spent wall and
+completion holds retain their existing precedence. Provider-origin revision
+retries continue on their existing epoch.
+
+The same failed prompt and clarification/prose budgets survive a silent retry.
+Feedback remains pending until source-fenced revised publication succeeds.
+Exhaustion restores the original presentation and an operable busy owner wait;
+source-bound reject and cancel remain available. An ordinary replacement revise
+spends the normal revision cap and receives a fresh allowance, while predecessor
+feedback settles only with the successor publication receipt. Retry notices
+describe silence as no model output, without attributing it to a provider outage.
+
+Validation uses scripted executor and runner fixtures. No live-provider or
+compose-stack proof is claimed for this amendment.
