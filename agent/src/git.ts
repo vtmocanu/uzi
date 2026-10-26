@@ -13798,7 +13798,7 @@ try {
         if (!unchanged(leaf.stat, now)) throw refused();
       }
       if (includeOwned) for (const [name, entry] of owned) {
-        const now = await stat(name, entry.directory ? "adminEntries" : "sourceEntries");
+        const now = await stat(name, "sourceEntries");
         if (!same(entry.stat, now) || (!entry.directory && (!unchanged(entry.stat, now) || now.nlink !== 1n))) throw refused();
       }
       for (const [name, initial] of controls) {
@@ -13823,7 +13823,7 @@ try {
       valid(p);
       const depth = p.split("/").length;
       // Reserve parent checks separately from operations on a regular artifact.
-      MaintenanceResources.consume("adminEntries", depth + (administrative ? 3 : 0));
+      MaintenanceResources.consume("sourceEntries", depth + (administrative ? 3 : 0));
       if (!administrative) MaintenanceResources.consume("sourceEntries", 3);
       MaintenanceResources.consume("metadataBytes", (depth + 3) * 6144);
       return (s: Stat) => { owned.set(p, { stat: s, directory }); };
@@ -13833,7 +13833,7 @@ try {
       for (let p = path.dirname(target);; p = path.dirname(p)) {
         const expected = owned.get(p)?.stat ?? scratchParents.get(p);
         if (!expected) throw refused();
-        const now = await stat(p, "adminEntries");
+        const now = await stat(p, "sourceEntries");
         if (!same(expected, now) || !safeDir(p, now, false)) throw refused();
         if (path.dirname(p) === p) break;
       }
@@ -13857,18 +13857,18 @@ try {
       const file = await fs.open(p, fsConstants.O_CREAT | fsConstants.O_EXCL |
         fsConstants.O_NOFOLLOW | fsConstants.O_WRONLY, 0o600);
       try {
-        charge(p, "adminEntries"); const created = await file.stat({ bigint: true }); recordOwn(created);
+        charge(p, "sourceEntries"); const created = await file.stat({ bigint: true }); recordOwn(created);
         if (!created.isFile() || created.nlink !== 1n || created.uid !== BigInt(process.getuid!()) ||
             (created.mode & 0o7777n) !== 0o600n) throw refused();
         for (let offset = 0; offset < bytes.length;) {
           await local(); await scratchCheck(p);
-          const named = await stat(p, "adminEntries");
-          charge(p, "adminEntries"); const fd = await file.stat({ bigint: true });
+          const named = await stat(p, "sourceEntries");
+          charge(p, "sourceEntries"); const fd = await file.stat({ bigint: true });
           if (!same(created, named) || !same(named, fd) || named.nlink !== 1n || fd.nlink !== 1n) throw refused();
           const result = await file.write(bytes, offset, bytes.length - offset, offset);
           if (result.bytesWritten <= 0 || result.bytesWritten > bytes.length - offset) throw refused();
           offset += result.bytesWritten;
-          charge(p, "adminEntries"); recordOwn(await file.stat({ bigint: true }));
+          charge(p, "sourceEntries"); recordOwn(await file.stat({ bigint: true }));
         }
       } finally { await closeIO(file); }
     };
@@ -13993,7 +13993,7 @@ try {
           await infoControl(base, "alternates", true); await infoControl(base, "http-alternates", true);
           await infoControl(bare, "alternates", true);
           for (let p = path.dirname(outDir);; p = path.dirname(p)) {
-            const s = await stat(p, "adminEntries");
+            const s = await stat(p, "sourceEntries");
             if (!safeDir(p, s, false)) throw refused();
             scratchParents.set(p, s); if (path.dirname(p) === p) break;
           }
@@ -14082,7 +14082,8 @@ try {
             // or a recursive family read. The caller holds the canonical lock.
             await local(); await validate(); check();
             // Canonical metadata only, never clone config; no recursive family reader.
-            const config = await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"]);
+            const config = await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"],
+              undefined, undefined, undefined, "sourceEntries");
             check(); await validate();
             const rows = config.split("\0");
             if (rows.some(row => /^(include\.|includeif\.|core\.(worktree|hookspath|sshcommand)\n|extensions\.(partialclone|worktreeconfig|refstorage)\n)/i.test(row)) ||
@@ -14371,7 +14372,7 @@ try {
       check();
     };
     const chargeStat = (p: string) => {
-      MaintenanceResources.consume(options?.disposable && p === outPath ? "sourceEntries" : "adminEntries", 1);
+      MaintenanceResources.consume(options?.disposable ? "sourceEntries" : "adminEntries", 1);
       MaintenanceResources.consume("metadataBytes", 1024 + Buffer.byteLength(p));
     };
     const same = (a: Stats, b: Stats) => a.dev === b.dev && a.ino === b.ino;
@@ -14579,7 +14580,7 @@ try {
         (strictAncestor(p) && uidSplitActive() && process.getuid!() === WORKER_UID &&
           process.getgid!() === WORKER_UID && s.gid === WORKER_UID));
     const chargeStat = (p: string) => {
-      MaintenanceResources.consume(proof && (p === outPath || p === staged.path) ? "sourceEntries" : "adminEntries", 1);
+      MaintenanceResources.consume(proof ? "sourceEntries" : "adminEntries", 1);
       MaintenanceResources.consume("metadataBytes", 1024 + Buffer.byteLength(p));
     };
     const parents: Array<{ path: string; stat: Stats }> = [];
@@ -16341,7 +16342,8 @@ try {
     return { stdout: out, stderr: err };
   }
 
-  private async runGit(cwd: string | undefined, args: string[], pat?: string, scope?: string, username?: string): Promise<string> {
+  private async runGit(cwd: string | undefined, args: string[], pat?: string, scope?: string, username?: string,
+    metadataCategory: "adminEntries" | "sourceEntries" = "adminEntries"): Promise<string> {
     if (this.boundaryProcesses.getStore()?.capture && (pat !== undefined || scope !== undefined || username !== undefined)) {
       throw new Error("capture credentials refused");
     }
@@ -16358,7 +16360,7 @@ try {
       // journals, ledgers, origins or stopped markers. Raw output bytes are metered
       // by execScoped; unscoped boot/live calls retain their existing behavior.
       if (MaintenanceResources.active() && args[0] === "config" && args.includes("--null") && args.includes("--list")) {
-        MaintenanceResources.consumeMetadataEntriesIfActive(stdout, "\0");
+        MaintenanceResources.consumeMetadataEntriesIfActive(stdout, "\0", metadataCategory);
       }
       return stdout;
     } catch (err) {

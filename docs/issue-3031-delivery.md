@@ -632,8 +632,10 @@ still joins owner settlement before an accepted index; it writes no import/ref.
 Disposable stage parent-mode equality is conditional on `options.disposable` and reuses
 its already charged stat; the ordinary stage policy is unchanged. Importer `rename`
 repeats `scratchCheck(to)` after target absence and before rename, charging each actual
-parent stat as `adminEntries`. The complete-path table below includes these charges;
-its tight margins are not a C2 representative-repository capacity result.
+parent stat as `sourceEntries`. The historical complete-path table below predates
+the category correction; current measurements appear in
+[the M2 correction](#m2-owner-diagnosis-and-category-correction). Neither fixture
+is a C2 representative-repository capacity result.
 
 ### Complete-boundary writer induction and per-pinner acquisition chains
 
@@ -781,23 +783,27 @@ distinct.
 | walk opendir/read/stat/open/fstat/recheck | Copy source and full canonical stores | In-place clone-only sourceEntries per actual lookup/validation;255 sourceBytes per raw name request including EOF; each regular st_size precharged separately; alternates reads reserve remaining requested sourceBytes including short-read retries/EOF; no object-store copy | `git.ts`: importer `walk`, `sourceUnchanged`, alternate read loop |
 | bare shallow lstat initial/postproof | Absent | sourceEntries1 plus bounded path/stat metadataBytes per attempt, including ENOENT/failure; present entries never opened | `git.ts`: importer `shallow`, `absent`, `stat` |
 | canonical shallow rev-parse initial/postproof | Absent | launches1 via existing canonical execution path, stdout/stderr metadataBytes; no manual duplicate launch, no private/GIT_SHALLOW_FILE overrides | `git.ts`: importer `shallow` / existing `runGit` metering |
-| canonical config/family and anchor/ancestry commands | Full source/base snapshot plus private full closure | Existing launches/metadata metering preserved; supervised local currency/pins before/after; no read-only RPC pair | `git.ts`: importer `supervised`, `readCanonicalConfig`, `launch` |
+| canonical config/family and anchor/ancestry commands | Full source/base snapshot plus private full closure | Existing launches/metadata metering preserved; new private canonical raw NUL rows sourceEntries before filtering via explicit sixth runGit argument; ordinary/W0 rows retain adminEntries; supervised local currency/pins before/after; no read-only RPC pair | `git.ts`: importer `supervised`, `readCanonicalConfig`, `launch` |
 | selection parseOids and range rows | Full-closure rev-list | closureEntries per selected/range row and bounded metadata capacity; no excluded-closure walk | `git.ts`: importer `parseOids`, `range` |
 | declared selected metadata | Full-closure batch metadata | closureEntries per row, metadata stdout/input reservations; decoded C precheck excludes only same-operation positively verified artifact provenance | `git.ts`: importer `metadata` |
-| disposable private mkdir/control write | Copied object-store administrative hierarchy | adminEntries for directory/config/ref/pin creation and every validation/retry; known control artifactBytes reserved before open, once across short writes | `git.ts`: importer `mkdir`, `write`, `scratchCheck` |
-| private own/cleanup registry | Owned snapshot entries | Finite parent stat/unlink/rmdir cleanup reservation at creation; regular staged artifacts sourceEntries, directory/control adminEntries; never canonical object rollback | `git.ts`: importer `own`, `closePins`, `cleanup` |
-| stageMaintenancePack | Isolated self-contained staging regular operations adminEntries | Ordinary default unchanged; importer disposable branch regular staged-file checks/open/cleanup sourceEntries, parent checks adminEntries; emitted chunks artifactBytes once, retry only unwritten tail; closureEntries pack header count | `git.ts`: `stageMaintenancePack` disposable branch, write loop, header readback |
-| indexMaintenancePack | Isolated environment; input/output file checks adminEntries | Ordinary default unchanged; importer binding regular input/output/cleanup sourceEntries, parent adminEntries; same Imax envelope artifactBytes, encoded sourceBytes, fanout/OID closureEntries; canonical prerequisites are not extra pack members | `git.ts`: `indexMaintenancePack` producer binding, metered read, exact OID comparison, cleanup |
-| staged checksum/read/rename | Snapshot proof artifacts | Actual regular file operations sourceEntries;20-byte checksum sourceBytes; pinned-parent adminEntries, no disposable fsync | `git.ts`: importer checksum read, `rename`, `scratchCheck` |
+| disposable private mkdir/control write | Copied object-store administrative hierarchy | adminEntries for private mkdir and exclusive HEAD/config creation; existing-name/fd/parent validation and each retry sourceEntries; known control artifactBytes reserved before open, once across short writes | `git.ts`: importer `mkdir`, `write`, `scratchCheck` |
+| private own/cleanup registry | Owned snapshot entries | Finite sourceEntries parent/identity/unlink/rmdir cleanup reserves at registration, including directory/control and staged/renamed entries; original separate own calls and amounts retained; never canonical object rollback | `git.ts`: importer `own`, `closePins`, `cleanup` |
+| stageMaintenancePack | Isolated self-contained staging regular operations adminEntries | Ordinary default unchanged; importer disposable branch regular staged-file checks/open/cleanup and parent checks/reservations sourceEntries; emitted chunks artifactBytes once, retry only unwritten tail; closureEntries pack header count | `git.ts`: `stageMaintenancePack` disposable branch, write loop, header readback |
+| indexMaintenancePack | Isolated environment; input/output file checks adminEntries | Ordinary default unchanged; importer binding regular input/output/cleanup and parent checks/reservations sourceEntries; same Imax envelope artifactBytes, encoded sourceBytes, fanout/OID closureEntries; canonical prerequisites are not extra pack members | `git.ts`: `indexMaintenancePack` producer binding, metered read, exact OID comparison, cleanup |
+| staged checksum/read/rename | Snapshot proof artifacts | Actual regular file operations sourceEntries;20-byte checksum sourceBytes; pinned-parent sourceEntries, no disposable fsync | `git.ts`: importer checksum read, `rename`, `scratchCheck` |
 | decoded selected proof | Full closure decoded hash verification | Same operation-wide unique decoded budget; no clone/prior-operation trust; every new artifact body verified despite canonical cache hits; publish only complete settled identity-checked batches | `git.ts`: importer proof phase, `verifyClosureFrames`, cache publication |
 | canonical strict import | No wired importer | launches once, artifact file stat/open/fstat/read sourceEntries; sourceBytes requested streaming capacity, metadata output; fresh complete-list/exact pair rpcAttempts2 immediately before dispatch | `git.ts`: importer import phase, stream loop; `recovery.ts`: guarded `beforeSemantic` |
 | final owner settlement/output index | Dormant transfer seam | Joined owner/final family proof and current fresh/revalidate/index wiring; fresh output pair prevents indexing on custody refusal; W0 pairs unchanged, no read/proof pairs | `runner.ts`: transfer owner settlement; `recovery.ts`: joined continuation and `maintenance-wip-v1` index |
 
 The stage parent-mode equality is disposable-only and reuses its existing stat
 (`stageMaintenancePack` disposable parent check); no extra filesystem charge is invented. The repeated final pre-rename
-scratchCheck in importer `rename` does perform additional actual parent stats, charged
-adminEntries in importer `scratchCheck`. These charges were not in the earlier dirty fixture
-measurement.
+scratchCheck in importer `rename` does perform additional actual parent stats, now charged
+sourceEntries in importer `scratchCheck`. Both repeated checks remain. These operations
+were absent from the earlier dirty fixture measurement.
+
+The following table is **HISTORICAL**, before the category correction and the
+failing wrapped diagnosis. Its measurements are retained; current wrapped results
+appear in the M2 correction below.
 
 | Slot dimension | Cap | Dirty import | Already present | Import custody refusal | Output custody refusal | Post-import range failure |
 |---|---|---:|---:|---:|---:|---:|
@@ -813,7 +819,7 @@ measurement.
 | `decoded` | 8 GiB (tighter inherited C still applies) | 478 | 0 | 478 | 478 | 478 |
 
 
-These are actual worker-run complete preservation-path fixtures: the four main
+These historical observations are actual worker-run complete preservation-path fixtures: the four main
 columns are from `gate-log.AY6aQz` (762 affected tests passed, no skips), and the
 post-import fault column is from `gate-log.7DrNmN` (nine focused follow-up cases
 passed). They include W0 and the coordinator's origin index, journal temp create,
@@ -833,14 +839,14 @@ rename and accepted-output effects. Each path additionally uses 4 discovery RPCs
 Reads and private proof commands add zero remote pairs, as asserted by actual
 supervised-dispatch traces. Import and accepted indexing each follow their own
 new complete-list/exact pair without intervening metadata Git. Import/output
-custody refusals prevent their respective effects. The dirty fixture has only
-113 admin entries and 2 source descriptors left: these are tight margins, not a
+custody refusals prevent their respective effects. The historical dirty fixture had only
+113 admin entries and 2 source descriptors left: those were tight margins, not a
 representative repository capacity proof. Quiescence is injected and trusted
 ancestor DAC is explicitly modeled; this is not live DAC, the C2 measurement
 gate, or the W0/U4b/archive pipeline. C2 owns representative measurement using
 the phase seam. No cap, timeout, original reservation or W0-H charge changed.
 The earlier F8Q09H figure remains historical pre-final-rename evidence, not the
-current table. Timing, cache warmth and path lengths can affect observed byte
+historical table. Timing, cache warmth and path lengths can affect observed byte
 reservations; the recorded figures are observations, not universal costs.
 
 ### U4b complete test-port inventory
@@ -1178,7 +1184,7 @@ All seven named unchanged-writer/capture methods were byte-compared against base
 76cd0a66 after implementation. The flag remains false. Final old-helper sweeps contain
 no owned present-tense source/test callers; historical inventory titles remain in docs.
 
-## U4b M2: material change needed — disposable-scratch administration budget
+## U4b M2: historical disposable-scratch administration-budget failure
 
 The implementation is committed at `81993269`. The mandatory full
 `task gate:agent` run on that revision did **not** pass: the command reached its
@@ -1212,12 +1218,13 @@ no path was shortened to make the failing example fit.
 | closureEntries | 16 | 65,536 |
 | decoded | 478 | 8 GiB, or tighter inherited C |
 
-R3 applies to the over-cap result. No cap, timeout, test timeout, selected object
-set, required proof, writer, guard or disposal rule has been changed to work around
-it. In particular, the tests' input path has not been shortened and scratch-parent
-checks have not been removed. A material capacity/contract decision is required
-before dependent completion work and a successful full-gate claim. Candidate
-review, mutation evidence and hosted/downstream records are not waived.
+This was R3 evidence requiring owner direction. The resource-category decision is
+now **RESOLVED** by the authorized correction and actual complete wrapped pass
+[below](#m2-owner-diagnosis-and-category-correction). No cap, timeout, test timeout,
+selected object set, proof, writer, guard or disposal rule changed. Paths were not
+shortened and scratch-parent checks were not removed. The historical failed gate
+remains failed/incomplete. Candidate review, full per-test mutation mapping,
+integration/full-gate and hosted/downstream obligations remain mandatory.
 
 ### Independent M2 fixture repairs
 
@@ -1292,7 +1299,8 @@ loaded from storage. The fixed refusal does not echo the value. Unicode names,
 NBSP and names over 1 KiB retain literal anchor behavior. No ordinary writer,
 storage schema or global logger changes. The new six-case branch-safety suite
 captures the real logger, checks zero effects for unsafe inputs and exercises
-valid inputs through import. Independent repair review is still required.
+valid inputs through import. Independent repair review was subsequently completed
+at `f4dcfd8f`, as recorded below; the new category candidate needs its own review.
 
 The tester also reproduced a false-positive shallow-output test: its default
 object-mode `Readable.from` failed even for an injected `false` response with
@@ -1319,9 +1327,10 @@ primary repair run passed all 50 admission/branch-safety cases with zero skips
 (`7GiJFH`, 148,883.086877 ms); lint, typecheck and knip passed (`ya5lfk`). Docs
 validation and mirror equality passed (`gfZ6Hu`); the preceding `ZuB8uV` invocation
 used a nonexistent docs task name and is not a successful docs check. Independent
-review must still validate the applied repairs. The R3 administration-budget block,
-incomplete full gate and unperformed proofs remain open; no formal partial or
-acceptance decision has waived them.
+review subsequently confirmed the committed repairs as recorded below.
+The then-open R3 category block is now resolved by the owner-directed correction
+below; the incomplete full gate and unperformed proofs remain open.
+No formal partial or acceptance decision has waived them.
 
 At `f4dcfd8f`, the scoped reviewer, tester and auditor found no introduced repair
 defect; the auditor closed the original importer CWE-117 finding. The tester's
@@ -1341,8 +1350,14 @@ the real completion promise with a consumption observer and retains all prior
 terminal, cleanup, handle and child assertions. A third early-walk-failure case
 exercises the outer join before any helper/private view exists. Failure cleanup
 also releases the latch and awaits the operation. All three focused cases, lint,
-typecheck and knip passed (`gmvVqf`); independent mutation/review confirmation of
-this last fixture repair remains required.
+typecheck and knip passed (`gmvVqf`). Independent reviewer, tester and auditor
+confirmation at `6f8f0b7c` subsequently found no introduced blocking repair defect.
+Both formerly surviving mutants typechecked (exit 0) and turned the intended
+assertions red (test exit 1): the outer-await omission fails the early-walk
+held-terminal assertion, and discarding per-pin close completions fails the
+completion-consumption assertion in all three cases. These scoped proofs close
+those two survivors; they do not complete the per-test mutation map or review the
+new uncommitted category candidate.
 
 Standalone `env -u UZI_SQLC_DIR task test:codex-m4` passed on `f4dcfd8f`
 (`WNwUTs`, exit 0): 189 tests, zero skips/failures/cancellations, 180 seconds for
@@ -1351,3 +1366,319 @@ Codex/P matrix (37 clauses, 64 executed evidence results). The full gate did not
 reach this stage; this standalone success does not turn that incomplete run green.
 No production-source change follows this M4 result. Hosted CI, affected compose
 phases and C2–C8 remain separately owned and unrun as stated above.
+
+## M2 owner diagnosis and category correction
+
+**The resource R3 category decision is resolved; M2 and M3 remain incomplete.**
+The owner required diagnosis before redesign and authorized C1 existing-file
+stat/fstat/open/pin validation and its cleanup reservations as `sourceEntries`,
+logical object rows as `closureEntries`, and administrative creation as
+`adminEntries`. No actual duplicate operation was established (NONE removed).
+Operations, consume calls, amounts, reservation timing, checks, scheduling, caps
+and timeouts remain. W0-H and ordinary defaults remain frozen. No ref, FINAL,
+release or cleanup authority is granted.
+
+The failing measured baseline is
+`6f8f0b7c718f2036d02ea0202f69b64c2baf0b85`. The corrected candidate is currently
+uncommitted in `agent/src/git.ts`, `agent/src/recovery-maintenance.ts`,
+`agent/test/git-maintenance-delta-accounting.test.ts` and the one adjusted
+assertion in `agent/test/git-maintenance-snapshot-ports.test.ts`.
+Its successful results must not be attributed to committed `6f8f0b7c`.
+
+### Historical wrapped baseline: every admin charge by phase and operation
+
+The diagnosis and full grouped JSON (`m2-admin-diagnosis.md` and
+`m2-admin-summary.json`, run-local scratch evidence) reconcile 119 JSON admin
+rows to the phase/operation table below. **Every code line in this table belongs
+to SHA `6f8f0b7c`, not current line numbering.** Units are measured ledger charges;
+calls are consume invocations. Observed JS APIs are fs/promises/FileHandle calls,
+not kernel syscalls or Git/internal child physical I/O. Reserved helper/cleanup
+work and logical rows must not be added to API observations as executed calls.
+
+| Phase | Charge site | Operation served | Consume calls | Successful units | Refused units | Direct API correlation (first call after charge) |
+|---|---|---|---:|---:|---:|---|
+| coordinator/admission | git.ts:6515 via maintenance.ts:765 | canonical config name rows | 26 | 26 | 0 | reservation / logical row |
+| coordinator/admission | git.ts:16175 via maintenance.ts:765 | canonical config NUL rows | 26 | 26 | 0 | reservation / logical row |
+| coordinator/admission | git.ts:6359 | family sibling directory read including EOF | 2 | 2 | 0 | Dir.read=2 |
+| W0 P0 | recovery.ts:3732 | journal directory read including EOF | 3 | 3 | 0 | Dir.read=3 |
+| W0 P0 | git.ts:6515 via maintenance.ts:765 | canonical config name rows | 78 | 78 | 0 | reservation / logical row |
+| W0 P0 | git.ts:16175 via maintenance.ts:765 | canonical config NUL rows | 78 | 78 | 0 | reservation / logical row |
+| W0 P0 | git.ts:6359 | family sibling directory read including EOF | 6 | 6 | 0 | Dir.read=6 |
+| W0 P0 | client.ts:3056 | remote hold-list rows | 3 | 3 | 0 | reservation / logical row |
+| W0 P0 | client.ts:3073 | remote exact-hold row | 3 | 3 | 0 | reservation / logical row |
+| W0 P0 | recovery.ts:4877 | producer-origin ancestor check | 7 | 7 | 0 | fs.lstat=7 |
+| W0 P0 | git.ts:11921 | W0 config helper reservation | 1 | 220 | 0 | reservation / logical row |
+| W0 P0 | git.ts:11890 via11954 | W0 config output rows | 32 | 32 | 0 | reservation / logical row |
+| W0 P2 + P3 | git.ts:6515 via maintenance.ts:765 | canonical config name rows | 52 | 52 | 0 | reservation / logical row |
+| W0 P2 + P3 | git.ts:16175 via maintenance.ts:765 | canonical config NUL rows | 52 | 52 | 0 | reservation / logical row |
+| W0 P2 + P3 | git.ts:6359 | family sibling directory read including EOF | 4 | 4 | 0 | Dir.read=4 |
+| W0 P2 + P3 | git.ts:11921 | W0 config helper reservation | 1 | 220 | 0 | reservation / logical row |
+| W0 P2 + P3 | git.ts:11890 via11954 | W0 config output rows | 32 | 32 | 0 | reservation / logical row |
+| W0 P2 + P3 | git.ts:11995 | W0 census/race recheck directory reservation | 1 | 10 | 0 | reservation / logical row |
+| W0 P2 + P3 | git.ts:11995 | W0 payload hash directory reservation | 1 | 10 | 0 | reservation / logical row |
+| W0 P4a | git.ts:6515 via maintenance.ts:765 | canonical config name rows | 78 | 78 | 0 | reservation / logical row |
+| W0 P4a | git.ts:16175 via maintenance.ts:765 | canonical config NUL rows | 78 | 78 | 0 | reservation / logical row |
+| W0 P4a | git.ts:6359 | family sibling directory read including EOF | 6 | 6 | 0 | Dir.read=6 |
+| W0 P4a | client.ts:3056 | remote hold-list rows | 1 | 1 | 0 | reservation / logical row |
+| W0 P4a | client.ts:3073 | remote exact-hold row | 1 | 1 | 0 | reservation / logical row |
+| W0 P4a | git.ts:11921 | W0 config helper reservation | 1 | 220 | 0 | reservation / logical row |
+| W0 P4a | git.ts:11890 via11954 | W0 config output rows | 32 | 32 | 0 | reservation / logical row |
+| W0 P4a | git.ts:11995 | W0 census/race recheck directory reservation | 1 | 10 | 0 | reservation / logical row |
+| W0 P4b | git.ts:6515 via maintenance.ts:765 | canonical config name rows | 130 | 130 | 0 | reservation / logical row |
+| W0 P4b | git.ts:16175 via maintenance.ts:765 | canonical config NUL rows | 130 | 130 | 0 | reservation / logical row |
+| W0 P4b | git.ts:6359 | family sibling directory read including EOF | 10 | 10 | 0 | Dir.read=10 |
+| W0 P4b | client.ts:3056 | remote hold-list rows | 3 | 3 | 0 | reservation / logical row |
+| W0 P4b | client.ts:3073 | remote exact-hold row | 3 | 3 | 0 | reservation / logical row |
+| W0 P4b | git.ts:11921 | W0 config helper reservation | 3 | 660 | 0 | reservation / logical row |
+| W0 P4b | git.ts:11890 via11954 | W0 config output rows | 96 | 96 | 0 | reservation / logical row |
+| W0 P4b | git.ts:11995 | W0 census/race recheck directory reservation | 1 | 10 | 0 | reservation / logical row |
+| W0 P5 | git.ts:11921 | W0 config helper reservation | 1 | 220 | 0 | reservation / logical row |
+| W0 P5 | git.ts:11890 via11954 | W0 config output rows | 32 | 32 | 0 | reservation / logical row |
+| W0 P5 | git.ts:11995 | W0 census/race recheck directory reservation | 1 | 10 | 0 | reservation / logical row |
+| admission/boundary | git.ts:13555 via13810 | initial scratch-parent lstat | 8 | 8 | 0 | fs.lstat=8 |
+| admission/boundary | git.ts:13640 | owned-entry identity/cleanup reserve | 16 | 217 | 0 | reservation / logical row |
+| admission/boundary | git.ts:13555 via13650 | scratch-parent chain lstat | 215 | 215 | 0 | fs.lstat=215 |
+| admission/boundary | git.ts:13555 via13658 | private directory mkdir | 8 | 8 | 0 | fs.mkdir=8 |
+| admission/boundary | git.ts:13555 via13670 | private control open/create | 4 | 4 | 0 | fs.open=4 |
+| admission/boundary | git.ts:13555 via13674 | private control initial fstat | 4 | 4 | 0 | FileHandle.stat=4 |
+| admission/boundary | git.ts:13555 via13679 | private control pre-write lstat | 4 | 4 | 0 | fs.lstat=4 |
+| admission/boundary | git.ts:13555 via13680 | private control pre-write fstat | 4 | 4 | 0 | FileHandle.stat=4 |
+| admission/boundary | git.ts:13555 via13685 | private control post-write fstat | 4 | 4 | 0 | FileHandle.stat=4 |
+| admission/boundary | git.ts:13555 via13615 | owned-directory revalidation lstat | 89 | 89 | 0 | fs.lstat=89 |
+| admission/boundary | git.ts:16175 via maintenance.ts:765 | canonical config NUL rows | 39 | 39 | 0 | reservation / logical row |
+| selection | git.ts:13555 via13615 | owned-directory revalidation lstat | 105 | 105 | 0 | fs.lstat=105 |
+| selection | git.ts:16175 via maintenance.ts:765 | canonical config NUL rows | 65 | 65 | 0 | reservation / logical row |
+| selection | git.ts:13555 via13650 | scratch-parent chain lstat | 50 | 50 | 0 | fs.lstat=50 |
+| pack | git.ts:13555 via13615 | owned-directory revalidation lstat | 48 | 48 | 0 | fs.lstat=48 |
+| pack | git.ts:16175 via maintenance.ts:765 | canonical config NUL rows | 26 | 26 | 0 | reservation / logical row |
+| pack | git.ts:13555 via13650 | scratch-parent chain lstat | 10 | 10 | 0 | fs.lstat=10 |
+| pack | git.ts:14188 via14229 | stage/index cleanup-parent reservation | 12 | 12 | 0 | reservation / logical row |
+| pack | git.ts:14188 via14233 | stage/index initial-parent lstat | 12 | 12 | 0 | fs.lstat=12 |
+| pack | git.ts:14188 via14202 | stage/index parent recheck lstat | 120 | 120 | 0 | fs.lstat=120 |
+| pack | git.ts:14396 via14464 | stage/index cleanup-parent reservation | 12 | 12 | 0 | reservation / logical row |
+| pack | git.ts:14396 via14467 | stage/index initial-parent lstat | 12 | 12 | 0 | fs.lstat=12 |
+| pack | git.ts:14396 via14402 | stage/index parent recheck lstat | 168 | 168 | 0 | fs.lstat=168 |
+| proof | git.ts:13555 via13615 | owned-directory revalidation lstat | 80 | 80 | 0 | fs.lstat=80 |
+| proof | git.ts:16175 via maintenance.ts:765 | canonical config NUL rows | 39 | 39 | 0 | reservation / logical row |
+| proof | git.ts:13555 via13650 | scratch-parent chain lstat | 30 | 30 | 0 | fs.lstat=30 |
+| import | git.ts:13555 via13650 | scratch-parent chain lstat | 42 | 41 | 1 | fs.lstat=41 |
+| import | git.ts:13555 via13615 | owned-directory revalidation lstat | 48 | 48 | 0 | fs.lstat=48 |
+| import | git.ts:16175 via maintenance.ts:765 | canonical config NUL rows | 26 | 26 | 0 | reservation / logical row |
+| import | client.ts:3056 | remote hold-list rows | 1 | 1 | 0 | reservation / logical row |
+| import | client.ts:3073 | remote exact-hold row | 1 | 1 | 0 | reservation / logical row |
+
+W0 P1 and walk measured zero admin charges. Including ordinary callbacks within
+subphases, historical W0 totals are P0=430, P1=0, P2+P3=380, P4a=426, P4b=1042,
+P5=262: **2540 unchanged**. Other successful totals are coordinator/admission=54,
+admission/boundary=596, selection=220, pack=420, proof=149, import=117:
+4096 successful units plus 1 refused. This 2540 is the pre-correction measurement,
+not a post-fix W0 subphase remeasurement. W0-H byte preservation (lead-verified
+hash prefix `77c072d`) and the exact-accounting test prove preservation.
+
+The refused existing-ancestor lstat was in old `git.ts:13650` `scratchCheck`,
+via `launch.beforeSpawn` :13712, before post-import range :14048/:14122.
+The command TMPDIR base (parent of the wrapper root) was next; consume refused
+before filesystem dispatch. Strict canonical index-pack had already completed;
+the range child did not launch and no output was accepted. Recovery-root depth
+was 6; the wrapper appended one guard component to actual Linux `os.tmpdir()`.
+No path shortening was used.
+
+Historical reconciliation: 1831 reserved units (1540 W0 config helpers + 50 W0
+directory helpers + 217 own registry + 24 stage/index cleanup parents), 1163
+logical rows (224 W0 config + 364 canonical names + 559 canonical NUL + 16 hold),
+and 1102 immediate API units (31 Dir.read + 1047 lstat + 8 mkdir + 4 open +
+12 fstat) total 4096. The refused unit dispatched no API. No immediate
+admin-linked API failed; the complete filesystem ledger separately recorded
+1276 lstat ENOENT results. Failed probes retain their serving-category charge.
+
+W0 config helpers reserved 7 x 220 = 1540 units plus 7 x 32 = 224 config rows.
+Literal helper source estimates five explicit realpathSync and sixteen explicit
+lstatSync attempts per helper, 147 direct child calls across seven helpers,
+excluding realpath internals. This is an estimate, not measured kernel work.
+The older comment's 15-lstat/20-visit bound is not grounds to reduce units.
+Five census/hash/race helpers reserved 5 x 10 = 50 units; child open/stat internals
+were not instrumented. Cleanup observed 155 lstats (141 parents,14 owned names),
+six unlinks and eight rmdirs; pin closure separately observed 28 FileHandle.close
+calls. Prepaid cleanup generates no fresh consume or refund.
+
+### Site-by-site old-to-new accounting verdicts
+
+Site numbers below identify **baseline SHA `6f8f0b7c`**; current symbols identify
+the enforcing code. Each validation attempt retains its original precharge,
+including ENOENT/failure, identity rejection, repeated checks and short-write
+iterations. The original audit proposed these mappings; the candidate now
+implements the authorized changes.
+
+| Baseline site / current symbol | Old → current category | Verdict | Operation / preserved boundary |
+|---|---|---|---|
+| 13554-13560 `charge/stat` | parameter/default sourceEntries -> same default | already accurate | Common per-attempt dispatcher; default source and metadata reservation unchanged. Its individual callers select the category. |
+| 13615 `validate` owned-directory arm | adminEntries -> sourceEntries | updated | One lstat per owned directory per validation pass. The regular owned-file arm already uses sourceEntries. Both authenticate existing names; retain every invocation. |
+| 13640 `own`: depth term, all entry kinds | adminEntries -> sourceEntries | updated | Reserve the same depth units for future existing-parent lstats. Reservation at creation time is not creation work. Includes directory, HEAD/config, staged and renamed artifact registrations. |
+| 13640 `own`: administrative +3 | adminEntries -> sourceEntries | updated | Retain all three units for identity acquisition and bounded owned-name cleanup/removal allowance. For mkdir the immediate post-mkdir identity lstat at13660 is pre-reserved here, not an uncharged extra. Cleanup target lstat and unlink/rmdir are not creation. Controls also reserve this conservative amount; do not delete spare capacity on suspicion of overlap with an immediate fstat charge. |
+| 13641 `own`: nonadministrative +3 | sourceEntries -> sourceEntries | already accurate | Existing regular-artifact reservation stays three. Combined parent+target reserve remains depth+3 for every entry; only category changes. |
+| 13650 `scratchCheck` | adminEntries -> sourceEntries | updated | One actual existing-parent lstat per ancestor, per invocation. Applies before mkdir, control creation/write, Git spawn, both rename checks, and each import-stream iteration. All repeats retained, including root. |
+| 13658 `mkdir` | adminEntries -> adminEntries | already accurate | Actual private directory creation attempt; all eight directory creations on tester's path are correctly admin. The separate identity lstat is covered by own's source reserve. |
+| 13670 `write` open | adminEntries -> adminEntries | already accurate | O_CREAT with O_EXCL creates worker HEAD/config controls; actual creation is admin. Do not generalize this exception to read-only opens or pack/index artifacts. Artifact byte reservation stays once before open. |
+| 13674 `write` initial fstat | adminEntries -> sourceEntries | updated | File already exists after exclusive open. Validates created identity/mode/nlink; fstat is validation even while the creation helper is still active. |
+| 13679 `write` pre-write named lstat | adminEntries -> sourceEntries | updated | Existing HEAD/config name validation on every short-write iteration. |
+| 13680 `write` pre-write fstat | adminEntries -> sourceEntries | updated | Independent fd validation on every iteration; not the same actual operation as preceding lstat. |
+| 13685 `write` post-write fstat | adminEntries -> sourceEntries | updated | Independent post-write validation on every iteration. Keep every retry's charge, even for the same control. |
+| 13810 initial scratch ancestry | adminEntries -> sourceEntries | updated | Existing outDir-parent chain acquisition/validation before any private creation; actual lstat, not pin creation. Store identities exactly as now. |
+| 14188 stage `chargeStat`, disposable=true, target | sourceEntries -> sourceEntries | already accurate | Existing correct producer target fstat/lstat and target cleanup-stat reservations. |
+| 14188 stage `chargeStat`, disposable=true, parents | adminEntries -> sourceEntries | updated | All hierarchy reads/reservations serve the staged pack. Covers parentCheck14202, cleanup reservation14229, and initial parent lstat14233; unchanged count for every parent every time. |
+| 14230 stage cleanup unlink | sourceEntries when disposable -> same | already accurate | One potential regular staged-pack unlink, pre-reserved independently of later revocation. Ordinary=false remains adminEntries. |
+| 14240 stage open | sourceEntries when disposable -> same | already accurate | Pack artifact create/open is already charged to sourceEntries. Ordinary=false remains adminEntries. |
+| 14396 index `chargeStat`, proof bound, staged/output targets | sourceEntries -> sourceEntries | already accurate | Existing correct input/output stats, absence checks, fd/name authentication and cleanup-target reserves. |
+| 14396 index `chargeStat`, proof bound, parents | adminEntries -> sourceEntries | updated | Hierarchy reads/reservations serve the pack/index files. Covers parentCheck14402, cleanup reservation14464, initial parent lstat14467, and all repeated inputCheck/effect/return validations. |
+| 14465 index cleanup unlink | sourceEntries when proof -> same | already accurate | Regular index cleanup reservation; ordinary unbound remains adminEntries. |
+| 14475 index input open | sourceEntries when proof -> same | already accurate | Read-only pack open. Ordinary unbound remains adminEntries. |
+| 14561 index Git unlink+create | sourceEntries x2 when proof -> same | already accurate | Two logical artifact operations, including absent-name unlink attempt; preserve both, even if unlink sees ENOENT. Ordinary unbound remains adminEntries x2. |
+| 14582 index output open | sourceEntries when proof -> same | already accurate | Existing read-only index open. Ordinary unbound remains adminEntries. |
+| 13895/13899 readCanonicalConfig → runGit16175 / recovery-maintenance765 | adminEntries → sourceEntries on new private acquisition | updated | Explicit sixth private runGit argument selects source; each nonempty raw NUL row charged once before filtering. Same argv/cwd/env/executor/launch/byte/error path. |
+| runGit / consumeMetadataEntriesIfActive defaults | adminEntries → adminEntries | already accurate | New optional category defaults admin in both helpers; ordinary/W0 callers do not opt in. |
+| 6344–6356,6377 producer chargeSource | sourceEntries → sourceEntries | already accurate | Source ancestor lstat, parent opendir and clone lstat stay distinct attempts; no new ordinary charges. |
+| 6359 producer directory rows/EOF | sourceEntries → sourceEntries | already accurate | Private configRead branch remains source; ordinary family scanner remains admin. |
+| 6393–6410 origin interpretation | ordinary admin → unchanged | already accurate | Already-metered snapshot interpretation adds no acquisition/charge; ordinary owner callbacks retain defaults. |
+| runner3468–3506 transfer binding | no direct admin caller | already accurate | Same original reservation/deadline, owner/action/join/final family proof and scheduling. |
+| recovery3338–3625 admission/transfer | no direct admin caller | already accurate | Existing hold-list/exact pair and both RPC charges; prepare remains local deny-only. |
+| recovery3732 /4877 | inherited admin → admin | already accurate | Journal enumeration and origin ancestor reads outside C1 correction remain frozen. |
+| git6515 /16175 ordinary name/NUL rows | inherited admin → admin | already accurate | Includes W0 and transfer-owner ordinary rechecks; enclosing C1 operation does not opt them in. |
+| recovery-maintenance caps / maintenance-budget / dind-maintenance | unchanged | already accurate | Only optional row-category selector added in resource helper; no cap or reservation renewal. |
+| git9151 /17418 /17545 /17625 | inherited admin → admin | already accurate | Unrelated baseline literal sites outside C1 correction. |
+
+`own` keeps sixteen registrations: eight directories, four HEAD/config controls,
+two staged and two renamed artifacts. Combined depth+3 remains per entry.
+The first consume stays depth+(administrative?3:0), now source; the separate
+nonadministrative three-unit source consume stays separate. Metadata remains
+`(depth+3)*6144`. Rename registers the destination without refunding the old reserve.
+Stage keeps hierarchy plus two target-stat reserves and separate unlink; index
+keeps independent reserves. Unused capacity is not proof of duplicate work.
+Post-mkdir identity lstat and finite cleanup retain prepaid allowances after
+revocation; uncertain/unregistered identities remain retained.
+
+The stage selector covers paths served by `options.disposable` and the index
+selector paths served by `proof`, including parents and reserved cleanup stats.
+Omitted options retain ordinary admin accounting, fsync, parent policy and
+isolated environment. Private canonical rows opt in through `readCanonicalConfig`;
+no global replacement or disabled shared charge plus refund is used.
+
+Existing pin/absolutePin stat/open/fstat, leaf/control/absence validation, clone
+walk/read/rechecks, checksum, rename I/O and strict-import streaming stay source.
+Object rows stay `closureEntries`: selected/range OIDs (:13961–13970/:14047),
+selected metadata (:13988), pack header count (:14288), expected OIDs (:14453),
+index OIDs (:14601) and CRC rows (:14633), using baseline line numbers.
+Repeated traversals of the same OID remain distinct charges. Metadata, encoded
+reads, artifact emission, decoded bodies, launches, sources and RPCs remain
+independent dimensions.
+
+### Accounting regression evidence
+
+`agent/test/git-maintenance-delta-accounting.test.ts` adds 15 cases: four
+positive/ordinary/raw-row controls and eleven original-slot precharge refusals
+at mkdir, create, initial/named/pre/post-write stats, scratch ancestry, initial
+ancestry, owned validation, stage and index. The positive forces seven-byte
+HEAD/config writes and checks per-attempt categories, sixteen own reserves,
+four separate artifact reserves, eight mkdirs and four creates. Raw-row controls
+include an ignored extra key and exhaustion before filtering. Ordinary controls
+check admin stats, fsync and isolated environment. Refusals retain refs,
+source/custody and child joins; refused initial fstat retains the already-created
+unregistered HEAD rather than claiming disposal.
+
+The existing ported partial-write assertion now requires admin constant and
+source increasing per retry. Attempts `[[0,3,0],[1,2,1],[2,1,2]]`, exact bytes,
+artifactBytes=35, syncs=0, requests=0 and custody assertions remain.
+No case, quota allowance or cap changed.
+
+Coder's final typecheck/lint/knip passed (`.uzi/scratch/gate-log.fUu2jb`, exit 0).
+
+Final focused tests passed 17, skipped zero (`gate-log.yBqg8p`, exit 0):
+15 new cases, adjusted partial write and exact W0 accounting. W0-H bytes match
+HEAD (lead-verified hash prefix `77c072d`). The own-category mutant typechecked
+then failed the intended category assertion (`gate-log.CdH6K7`, test exit 1),
+in a disposable export. Earlier focused failures (12/13 and 73/74) remain in
+the implementation report: a new cleanup expectation and stale partial-write
+assertion were corrected. These focused proofs do not supply the full per-test
+mutation map or independent review of the new candidate.
+
+### Actual corrected wrapped command: eight cases passed
+
+Main's `gate-log.Wjznwz` recorded **EXIT=0, 8 passed, 0 skipped,
+duration 154614.593962 ms**. It used actual real-procfs and tmpdir-leakguard
+wrappers, primary agent cwd and actual Linux `os.tmpdir()` wrapper depth,
+unsetting only `UZI_SQLC_DIR`. No path shortening, cap or timeout change.
+The source was the uncommitted four-file category candidate above.
+
+The full `m2-category-wrapped-results.json` contains sixteen rows, two per case.
+Final rows include transferCalls=1, transferEntered=1 and effect traces.
+Each pair's totals agree. Missing no-op decoded usage is filled as 0.
+These are measured slot charges; launches/sources are not measured physical
+processes/distinct clones. HTTP fixture transports are not hosted API evidence.
+
+| Slot dimension | Limit | `origin-admission` | `origin-already-present` | `origin-transfer-final-family` | `origin-transfer-head` |
+|---|---:|---:|---:|---:|---:|
+| `launches` | 512 | 200 | 93 | 193 | 200 |
+| `metadataBytes` | 268,435,456 | 32,870,476 | 17,872,179 | 32,596,328 | 32,599,934 |
+| `adminEntries` | 4,096 | 2,664 | 931 | 2,608 | 2,662 |
+| `sources` | 128 | 126 | 70 | 122 | 126 |
+| `rpcAttempts` | 32 | 18 | 8 | 16 | 16 |
+| `sourceEntries` | 65,536 | 13,017 | 7,167 | 13,017 | 13,017 |
+| `sourceBytes` | 268,435,456 | 201,091 | 164,528 | 201,021 | 201,118 |
+| `artifactBytes` | 268,435,456 | 2,046 | 142 | 2,040 | 2,042 |
+| `closureEntries` | 65,536 | 18 | 0 | 18 | 18 |
+| `decoded` | 8 GiB (or tighter inherited C) | 478 | 0 | 478 | 478 |
+
+| Slot dimension | Limit | `origin-transfer-revoked` | `origin-transfer-import-refused` | `origin-transfer-layout-refused` | `origin-transfer-post-import-range` |
+|---|---:|---:|---:|---:|---:|
+| `launches` | 512 | 200 | 189 | 186 | 192 |
+| `metadataBytes` | 268,435,456 | 32,862,078 | 29,340,160 | 25,978,326 | 30,524,023 |
+| `adminEntries` | 4,096 | 2,664 | 2,608 | 2,606 | 2,608 |
+| `sources` | 128 | 126 | 114 | 106 | 118 |
+| `rpcAttempts` | 32 | 18 | 16 | 14 | 16 |
+| `sourceEntries` | 65,536 | 13,017 | 11,440 | 9,942 | 12,021 |
+| `sourceBytes` | 268,435,456 | 201,032 | 200,629 | 200,182 | 200,487 |
+| `artifactBytes` | 268,435,456 | 2,042 | 2,044 | 2,042 | 2,044 |
+| `closureEntries` | 65,536 | 18 | 16 | 16 | 16 |
+| `decoded` | 8 GiB (or tighter inherited C) | 478 | 478 | 478 | 478 |
+
+Each of the eight variants is under every listed cap. The 32 RPC limit applies
+to charged slot attempts; discovery remains separate.
+
+| Variant | Slot RPCs / pairs | Discovery RPCs / pairs | Physical RPCs / pairs | Observed effect boundary |
+|---|---:|---:|---:|---|
+| origin-admission | 18 / 9 | 4 / 2 | 22 / 11 | Import and accepted WIP index after owner join; no ref/FINAL/cleanup authority. |
+| origin-already-present | 8 / 4 | 4 / 2 | 12 / 6 | Accepted after owner join; no pack/import/ref write. |
+| origin-transfer-final-family | 16 / 8 | 4 / 2 | 20 / 10 | Import occurred; final-family refusal prevents accepted WIP index. |
+| origin-transfer-head | 16 / 8 | 4 / 2 | 20 / 10 | Import occurred; changed HEAD prevents output pair/index. |
+| origin-transfer-revoked | 18 / 9 | 4 / 2 | 22 / 11 | Output pair observed but custody revoked: no accepted WIP index. |
+| origin-transfer-import-refused | 16 / 8 | 4 / 2 | 20 / 10 | Import custody refusal prevents canonical import and output index. |
+| origin-transfer-layout-refused | 14 / 7 | 4 / 2 | 18 / 9 | Post-proof layout refusal prevents import and output index. |
+| origin-transfer-post-import-range | 16 / 8 | 4 / 2 | 20 / 10 | Strict import occurred; range failure prevents accepted WIP index; inert residue retained. |
+
+The full dirty path now measures launches=200/512,
+metadataBytes=32870476/268435456, adminEntries=2664/4096, sources=126/128,
+RPC=18/32 +4 discovery=22 physical, sourceEntries=13017/65536,
+sourceBytes=201091/268435456, artifactBytes=2046/268435456,
+closureEntries=18/65536 and decoded=478/8 GiB (or tighter inherited C).
+Accepted indexing follows actual owner join. Refusals block their respective
+effects. Quiescence remains injected and trusted ancestor DAC modeled;
+this is not the C2 representative W0/U4b/archive measurement.
+
+### Remaining verification boundary
+
+Historical full `task gate:agent` log `gate-log.vNpy2y` timed out at 120 minutes,
+631/690 files, with 104 fixture/environment/category failures. Focused repairs
+and eight wrapped passes do not establish a full-suite green. Full per-test
+mutation/applicability mapping and integration/full gate remain mandatory and
+unwaived. Reviewer, tester and auditor must review the new combined category
+candidate; their clean `6f8f0b7c` reports cover the earlier committed fixture repair.
+M2 is incomplete, M3 is not done, guard remains false. No partial acceptance
+has been supplied.
+
+Standalone Codex M4 at `f4dcfd8f` remains 189 tests, 37 clauses and 64 executed
+evidence results (`WNwUTs`); the timed-out gate did not reach it.
+Later `6f8f0b7c` offline E2E library/fake checks (`paqj2` / `D40CnK`) and the
+25-literal no-hit audit are separate proofs, not compose execution.
+C2–C8 retain their existing boundaries. Compose70/72/73 remain unrun and hosted
+critical-path timing unmeasured. Maintainers own the separately recorded live
+image/PVC acceptance and can run those named compose phases against an isolated
+stack. Workers still owe gates, security, reviews and mutation evidence.

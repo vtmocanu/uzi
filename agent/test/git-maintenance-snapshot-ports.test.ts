@@ -754,7 +754,8 @@ test("ported snapshot: partial writes retry only unwritten tail and charge the c
       if (b.toString() !== "abc") return write(b, o, n, at);
       const admin = f.charges.filter(c => c.resource === "adminEntries").reduce((sum, c) => sum + c.amount, 0);
       const source = f.charges.filter(c => c.resource === "sourceEntries").reduce((sum, c) => sum + c.amount, 0);
-      assert.ok(admin > lastAdmin && source > lastSource, "each retry charges active parent/file validation");
+      assert.equal(admin, lastAdmin, "disposable parent/file validation consumes no creation allowance");
+      assert.ok(source > lastSource, "each retry charges active parent/file validation");
       lastAdmin = admin; lastSource = source;
       attempts.push([o, n, at - 12]);
       return write(b, o, 1, at);

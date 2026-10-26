@@ -1149,6 +1149,62 @@ dispatch guard; it used 16 charged RPCs plus 4 discovery attempts. The earlier d
 fixture success at 3,983 admin entries does not establish this wrapped path's
 capacity. This over-cap result is R3 material-change evidence, not permission to
 raise the cap, shorten the failing path, remove proofs/checks or grant output/cleanup
-authority. The implementation remains guarded off and completion is blocked pending
-a capacity/contract decision. Detailed all-dimension counters and independent test
-fixture repairs are recorded in `docs/issue-3031-delivery.md` and the PR evidence.
+authority. This is historical failed-gate evidence. The owner has now resolved
+the resource-category decision by the C1-only correction and actual wrapped pass
+below. The implementation remains guarded off; full-gate and complete mutation-map
+obligations still block completion. Detailed counters and fixture repairs appear
+in [the delivery record](../docs/issue-3031-delivery.md#m2-owner-diagnosis-and-category-correction).
+
+
+### U4b owner-directed C1 category correction
+
+Diagnosis precedes redesign: at baseline `6f8f0b7c`, admin charges reconcile to
+4096 successful units plus one refused existing-ancestor lstat at `git.ts:13650`
+`scratchCheck`, before post-import range dispatch. Strict import had completed;
+no accepted output followed. No actual duplicate operation was established.
+The owner authorized a category correction preserving operations, units, separate
+consume calls, reservation timing, checks, scheduling, caps and timeouts.
+This resolves the resource R3 decision, not the historical failed gate.
+
+C1 existing-file stat/fstat/open/pin checks and parent/identity/cleanup reserves
+use `sourceEntries`: controls after exclusive creation, retries, initial/repeated
+scratch ancestry and staged/renamed entries. `own` retains
+depth+(administrative?3:0) and its separate nonadministrative three-unit consume,
+with `(depth+3)*6144` metadata. Private mkdir and exclusive HEAD/config creation
+remain `adminEntries`. Cleanup stays finite/prepaid after joins, retains uncertain
+identities and grants no canonical rollback.
+
+Disposable stage and proof-bound index select source for target and parent stats
+and cleanup reservations. Omitted options retain ordinary admin defaults, fsync,
+parent policy and environment. New private canonical config acquisition passes
+an explicit sixth `runGit` argument selecting source for raw nonempty NUL rows
+before filtering. `runGit` and
+`MaintenanceResources.consumeMetadataEntriesIfActive` default their optional
+category to admin; ordinary callbacks and W0 rows retain their original charges.
+Selected/range/index/CRC object rows stay `closureEntries`; metadata, encoded reads,
+artifact emission and decoded bodies retain independent charges.
+
+W0-H bytes are preserved (lead-verified hash prefix `77c072d`; exact W0 accounting
+test passed). Historical W0 totals remain P0=430, P1=0, P2+P3=380, P4a=426,
+P4b=1042, P5=262, aggregate2540. This is preservation, not a newly measured
+post-fix W0 subphase ledger.
+
+The measurements used the four-file category correction before its commit,
+not the unchanged source at `6f8f0b7c`. Main's actual wrapped eight-case run passed
+(`gate-log.Wjznwz`, EXIT=0, zero skips, 154614.593962 ms), with real procfs and
+tmpdir-leakguard wrappers, primary agent cwd, unchanged Linux os.tmpdir depth,
+only UZI_SQLC_DIR unset. Dirty import measured launches200/512,
+metadataBytes32870476/268435456, admin2664/4096, sources126/128,
+RPC18/32 +4 discovery=22 physical, sourceEntries13017/65536,
+sourceBytes201091/268435456, artifact2046/268435456, closure18/65536,
+decoded478/8GiB or tighter inherited C. Eight variants remain under their caps;
+index acceptance follows owner join and refusals block their respective effects.
+No ref, FINAL or cleanup authority follows.
+
+The delivery record carries the full baseline phase/operation table, each
+old-to-new site verdict, 15 new accounting cases and one preserved partial-write
+assertion adjustment, plus every slot dimension and physical/discovery RPC total
+for each wrapped variant. M2/M3, complete mutation mapping, integration/full gate
+and new candidate reviewer/tester/auditor sign-offs remain incomplete and mandatory.
+The timed-out full gate is not green. Guard remains false; C2–C8, compose70/72/73
+and hosted timing retain their separate unproven boundaries.
