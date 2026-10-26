@@ -24952,6 +24952,49 @@ describe("3404 terminal executor lifetime", () => {
     }
   });
 
+  for (const sealed of [false, true]) {
+    it(`3404 owner abort mid-turn still cancels and interrupts after a lifetime seal (${sealed ? "sealed" : "control"})`, async () => {
+      const controller = new AbortController();
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") return { turn: { id: "tn-1" } };
+        return {};
+      } });
+      rig.transport.push(threadStarted());
+      const executor = makeExecutor(rig, bindingOf(API_KEY));
+      const running = executor.run(makeCtx({ signal: controller.signal }).ctx);
+      await waitFor(() => rig.transport.requests.some(r => r.method === "turn/start"), "turn started");
+      let sealing: Promise<{ kind: string }> | undefined;
+      if (sealed) sealing = executor.sealLifetime({});
+      controller.abort();
+      await assert.rejects(withTimeout(running, 3000, "cancel after seal"), /run cancelled/);
+      assert.ok(rig.transport.requests.some(r => r.method === "turn/interrupt"), "the stop request was delivered");
+      if (sealing) assert.equal((await sealing).kind, "unproven", "a run that was active at seal time stays unproven");
+    });
+  }
+
+  it("3404 a seal is refused while any epoch registry is still unverified", async () => {
+    const rig = makeRig({ responder: done });
+    const executor = makeExecutor(rig, bindingOf(API_KEY));
+    await executor.run(makeCtx().ctx);
+    (executor as unknown as { unverifiedEpochRegistries: Set<object> }).unverifiedEpochRegistries.add({});
+    assert.equal((await executor.sealLifetime({})).kind, "unproven");
+  });
+
+  it("3404 after a seal a retained refresh bridge is refused before the real refresh", async () => {
+    const rig = makeRig({ responder: done });
+    const executor = makeExecutor(rig, bindingOf(API_KEY));
+    await executor.run(makeCtx().ctx);
+    assert.equal((await executor.sealLifetime({})).kind, "sealed");
+    const internals = executor as unknown as {
+      lifetimeBoundRefreshBridge(bridge: { refresh(request: unknown): Promise<unknown> }): { refresh(request: unknown): Promise<unknown> };
+    };
+    let refreshed = 0;
+    const bridge = internals.lifetimeBoundRefreshBridge({ refresh: async () => { refreshed++; return {}; } });
+    await assert.rejects(bridge.refresh({}), /lifetime closed/);
+    assert.equal(refreshed, 0, "refused before the underlying bridge.refresh");
+  });
+
   it("3404 structural source strings confer no authority", async () => {
     const rig = makeRig({ responder: done });
     const executor = makeExecutor(rig, bindingOf(API_KEY));

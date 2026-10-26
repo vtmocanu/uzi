@@ -41,7 +41,10 @@ describe("ExecutorLifetime (#3404 M1b)", () => {
     let invoked = 0;
     const sealing = lifetime.seal({}, settled, () => true);
     // No await between seal() and the call: the fence is already shut.
-    assert.throws(() => lifetime.admit(async () => { invoked++; }), /lifetime closed/);
+    const refused = lifetime.admit(async () => { invoked++; });
+    await assert.rejects(refused, /lifetime closed/);
+    // A fire-and-forget caller's `.catch` must see the refusal, never a synchronous throw.
+    assert.doesNotThrow(() => { void lifetime.admit(async () => { invoked++; }).catch(() => undefined); });
     assert.equal(lifetime.isOpen(), false);
     assert.equal(o.registry.reserveLaunch("command").kind, "denied");
     assert.throws(() => new ExecutionRegistry(newLocalExecutionEpoch(0), lifetime), /lifetime closed/);
@@ -128,7 +131,7 @@ describe("ExecutorLifetime (#3404 M1b)", () => {
     const first = lifetime.seal({}, settled, () => true);
     assert.equal((await first).kind, "unproven");
     // The same promise, a different source use, and a settle callback that now succeeds.
-    assert.equal(await lifetime.seal({}, settled, () => true), await first);
+    assert.deepEqual(await lifetime.seal({}, settled, () => true), await first);
     assert.equal(lifetime.isOpen(), false);
     assert.throws(() => lifetime.assertOpen(), /lifetime closed/);
   });
@@ -147,6 +150,20 @@ describe("ExecutorLifetime (#3404 M1b)", () => {
       assert.equal(done, false, `${mode}: tail still pending`);
       gate.resolve();
       assert.equal((await sealing).kind, "unproven");
+    }
+  });
+
+  it("a second seal call for a different source use is unproven, the same one repeats the result", async () => {
+    const lifetime = new ExecutorLifetime();
+    await disposeOrigin(origin(lifetime));
+    const first = {}, second = {};
+    const sealed = await lifetime.seal(first, settled, () => true);
+    assert.equal(sealed.kind, "sealed");
+    assert.equal(await lifetime.seal(first, settled, () => true), sealed);
+    assert.equal((await lifetime.seal(second, settled, () => true)).kind, "unproven");
+    if (sealed.kind === "sealed") {
+      assert.equal(lifetime.accepts(sealed.seal, first), true);
+      assert.equal(lifetime.accepts(sealed.seal, second), false);
     }
   });
 

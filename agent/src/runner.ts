@@ -13569,7 +13569,10 @@ export class RunRunner {
       // A failure is logged and swallowed; an informational field never fails a run.
       reportProgress: (progress, frozen) => {
         nowSummary?.observeProgress(progress, frozen);
-        void enqueueRunningReport(() =>
+        // The returned promise is the actual chained report with its rejection already
+        // handled; callers that ignore it stay safe and an owner (the Codex executor's
+        // lifetime) can join its settlement.
+        return enqueueRunningReport(() =>
           reportState({
             status: "running",
             milestones_completed: progress.completed,
@@ -13582,8 +13585,7 @@ export class RunRunner {
           }),
         ).catch((e) =>
           runLog.warn("could not report progress", { error: errMessage(e) }),
-        );
-        return Promise.resolve();
+        ).then(() => undefined);
       },
       // PRD #122 M6: durably checkpoint the run's committed milestone work MID-RUN
       // (Decisions 6, 7, 10, 10b). It is the SAME credential-free fetch-back the done and

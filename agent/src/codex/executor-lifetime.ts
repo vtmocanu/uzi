@@ -50,6 +50,7 @@ export class ExecutorLifetime {
   private readonly executorIncarnation = randomUUID();
   private failure = false;
   private completion?: Promise<ExecutorSealResult>;
+  private sealedFor?: object;
 
   assertOpen(): void {
     if (this.phase !== "open") throw new TrustedExecutionRefusal("codex executor lifetime closed");
@@ -58,12 +59,13 @@ export class ExecutorLifetime {
   isOpen(): boolean { return this.phase === "open"; }
 
   /**
-   * Refuse after closure BEFORE invoking `action`, then own the promise it returns. The call is
-   * synchronous (no timing change for open callers); a seal that closes admission while the
-   * operation is in flight joins its actual settlement.
+   * Refuse after closure BEFORE invoking `action`, then own the promise it returns. The phase
+   * check is synchronous (no timing change for open callers) but the refusal is a rejected
+   * promise, so fire-and-forget callers (`void x().catch(...)`) cannot be thrown past; a seal
+   * that closes admission while the operation is in flight joins its actual settlement.
    */
   admit<T>(action: () => Promise<T>): Promise<T> {
-    this.assertOpen();
+    if (this.phase !== "open") return Promise.reject(new TrustedExecutionRefusal("codex executor lifetime closed"));
     let pending: Promise<T>;
     try { pending = action(); } catch (error) { pending = Promise.reject(error); }
     this.track(pending);
@@ -115,7 +117,11 @@ export class ExecutorLifetime {
    * `eligible` is the owner's own terminal predicate, read before and after the joins.
    */
   seal(sourceUse: object, settle: () => Promise<void>, eligible: () => boolean): Promise<ExecutorSealResult> {
-    if (this.completion) return this.completion;
+    if (this.completion) {
+      // A repeat call is proof only for the identical source use.
+      return sourceUse === this.sealedFor ? this.completion : this.completion.then(() => ({ kind: "unproven" } as const));
+    }
+    this.sealedFor = sourceUse;
     this.phase = "sealing"; // irrevocable, before any callback or await
     if (typeof sourceUse !== "object" || sourceUse === null) this.distrust();
     let initiallyEligible = false;

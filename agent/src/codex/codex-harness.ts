@@ -534,6 +534,8 @@ export class CodexHarness implements RunHarness {
   // Run-level provider root state (launched once, reused across turns; a reused
   // notifications() iterator is single-consumer so it is obtained exactly once).
   private transport?: CodexTransport;
+  /** The unwrapped transport, used only by the stop path that must outlive lifetime closure. */
+  private rawTransport?: CodexTransport;
   private notes?: AsyncIterableIterator<CodexNotification>;
   // At most one notifications().next() may be outstanding. If a turn aborts while
   // it is pending, the promise is retained and consumed by the next turn rather than
@@ -946,6 +948,22 @@ export class CodexHarness implements RunHarness {
     return this.registry.admitWork(() => transport.request<T>(method, params, opts));
   }
 
+  /** `turn/interrupt` is a stop/cleanup request, not new work: it stays deliverable after the
+   *  executor lifetime closes (so an owner abort still cancels), is retained so a seal joins its
+   *  actual settlement, and a rejection is uncertainty that forbids a seal. */
+  interruptOnTransport(
+    params: { threadId: string; turnId: string },
+    opts?: { deadlineMs?: number },
+  ): Promise<unknown> {
+    const raw = this.rawTransport;
+    if (!raw) {
+      return Promise.reject(new CodexHarnessError({ category: "protocol", message: "codex provider root is not launched" }));
+    }
+    let pending: Promise<unknown>;
+    try { pending = raw.request("turn/interrupt", params, opts); } catch (error) { pending = Promise.reject(error); }
+    return this.registry.retainCleanup(pending);
+  }
+
   /** Answer a child server→client tool-call on the shared transport. Best-effort: an
    *  undeliverable reply into a closed transport is dropped, never thrown (mirrors the
    *  root {@link routeToolCall} reply guard). */
@@ -1027,11 +1045,9 @@ export class CodexHarness implements RunHarness {
     const threadId = this.threadId;
     const turnId = this.activeTurnId;
     if (transport && threadId !== undefined && turnId !== undefined) {
-      void transport
-        .request("turn/interrupt", { threadId, turnId })
-        .catch(() => {
-          /* interrupt is best-effort; the terminal/EOF path settles the turn */
-        });
+      this.interruptOnTransport({ threadId, turnId }).catch(() => {
+        /* interrupt is best-effort; the terminal/EOF path settles the turn */
+      });
     }
     // End the stream even when it is wedged in a pending broker callback. The sticky
     // stopRequested bit also covers the lazy-generator window before stopTurn exists.
@@ -1530,6 +1546,7 @@ export class CodexHarness implements RunHarness {
     }
     const raw = launched.transport;
     const registry = this.registry;
+    this.rawTransport = raw;
     this.transport = {
       get protocolFailure() { return raw.protocolFailure; },
       request: (method, params, opts) => registry.admitWork(() => raw.request(method, params, opts)),

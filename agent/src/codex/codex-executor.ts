@@ -2147,7 +2147,7 @@ export class CodexExecutor implements Executor {
         ...this.planFlights, ...this.retiredIntentFlights,
         ...(this.intentFlight ? [this.intentFlight] : []),
       ].map(flight => flight.done));
-    }, () => !this.runActive && this.captureOwners === 0);
+    }, () => !this.runActive && this.captureOwners === 0 && this.unverifiedEpochRegistries.size === 0);
   }
 
   /**
@@ -6042,8 +6042,7 @@ export class CodexExecutor implements Executor {
         // is bounded by the transport's own short deadline instead (childInterruptDeadlineMs).
         interrupt: async (): Promise<void> => {
           await harness
-            .requestOnTransport(
-              "turn/interrupt",
+            .interruptOnTransport(
               { threadId: childThreadId, turnId: childTurnId },
               { deadlineMs: interruptDeadlineMs },
             )
