@@ -83,15 +83,26 @@ it.
 
 - `uzi vault` — show vault command help.
 - `uzi vault status` — report `locked` or `unlocked` for the active user;
-  `--json` returns an `unlocked` boolean.
+  `--json` returns only `{"unlocked":false}` or `{"unlocked":true}`.
+  Status output remains visible with `--quiet`.
 - `uzi vault unlock` — ask the owner to run this when their vault is locked.
-  It prompts without echo for their login password or OIDC vault passphrase.
-  Never solicit, read, or handle the owner's password or passphrase yourself.
+  It prompts on stderr without echo for their login password or OIDC vault
+  passphrase. Never solicit, read, or handle the owner's password or passphrase
+  yourself. Unlock opens an existing vault; OIDC passphrase creation stays in
+  the web app.
   Owners scripting unlock can explicitly use `--password-stdin` with non-terminal
-  stdin; the flag is rejected on a terminal. There is no password-valued flag,
-  argument, environment setting, or persistent CLI vault secret.
+  stdin; the flag is rejected on a terminal, and non-terminal input requires it.
+  It reads one line, strips LF/CRLF, preserves spaces, and accepts a final line
+  without a newline. Empty input or input over 1 MiB is rejected. There is no
+  password-valued flag, argument, environment setting, or persisted re-unlock key.
+  Success prints `Vault unlocked.` unless `--quiet`; `--json` returns
+  `{"unlocked":true}` even with `--quiet`. The terminal prompt remains on stderr.
   Wrong password and no vault both report `incorrect password` (exit 3);
-  rate limiting returns exit 6 with a safe retry hint. Unlock submits once.
+  rate limiting returns exit 6 with a safe hint from a valid positive
+  `Retry-After`. Unlock submits once without automatic retries. Generic input
+  failures or cancellation exit 1, usage errors exit 2, authentication failures
+  exit 3, and unreachable/server failures exit 6. Terminal cleanup failure
+  prevents submission.
 
 ### Exit codes
 
@@ -416,7 +427,8 @@ uzi version
   `codex_account_unavailable` is held on its Codex account until that account is usable
   again; cause `vault_locked` means a Codex credential refresh or release found the run
   owner's vault locked: ask the owner to check `uzi vault status` and run
-  `uzi vault unlock`; never ask for their password. An explicit unlock queues existing parks promptly;
+  `uzi vault unlock` or use the web app; never solicit or read their password or passphrase.
+  An explicit unlock best-effort queues existing parks promptly;
   `recovery_retry_not_before` remains the fallback and a worker still claims the run), and `paused`
   (an ordinary owner-requested pause via `uzi run pause` or `/park`, or a
   lead-requested pause via `park_run`, resumed on demand with `uzi run resume <id>`;

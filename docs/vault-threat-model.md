@@ -62,6 +62,38 @@ vault would lose already-sealed secrets) — a documented limitation, not an
 oversight. See [auth-design.md](auth-design.md#oidc-single-sign-on) for how
 this fits into the OIDC login flow.
 
+## CLI unlock: authenticated guessing and key custody
+
+`GET /api/vault/status` and `POST /api/vault/unlock` accept either a session
+cookie or a Bearer CLI token. A stolen `uzc_` token therefore exposes an
+authenticated online guessing surface for its owner's login password or
+OIDC vault passphrase. Authentication runs before the unlock limiter;
+cookie sessions and every CLI token for the same user share the per-user
+unlock budget. Changing tokens or client IPs does not grant that user a
+fresh budget. Rate-limited requests return HTTP 429 with `Retry-After`;
+the CLI submits once, reports a sanitized retry hint, and does not retry
+automatically.
+
+Cookie CSRF protections are unchanged: cookie-authenticated unlock POSTs
+still require CSRF validation. Bearer authentication takes its own path
+without CSRF, ignores cookies, and never falls back to a cookie session
+after a token failure. `POST /api/vault/lock` and
+`POST /api/vault/passphrase` remain cookie-only.
+
+Unlock never creates a vault. Wrong-password and no-vault attempts both
+return HTTP 403 with `incorrect password` (CLI exit 3), so the unlock
+response does not disclose whether a vault exists. The no-vault path
+performs the same-cost derivation burn used for timing equalization.
+
+This adds no new key custody: the existing KEK/DEK hierarchy and API memory
+cache remain unchanged. The CLI accepts the owner's secret through hidden
+terminal input or explicit non-terminal `--password-stdin`, with a 1 MiB
+input bound; it has no password-valued flags, arguments, environment
+setting, or persisted re-unlock key. Terminal input fails closed on cleanup
+failure and no password is submitted. Agents must direct the owner to
+unlock without soliciting or reading the secret. See
+[CLI vault usage](cli.md#vault-check-status-and-unlock).
+
 ## Residual risks (accepted)
 
 1. **`users.password_hash` is an offline brute-force oracle — the dominant

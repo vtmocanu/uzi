@@ -2051,7 +2051,12 @@ token's server-enforced scope. See
   else (`POST /api/workers`, `/api/me/cli-tokens`, `/api/vault/*`, `/api/forge/*`,
   `/api/me/secrets/*`, every admin write) stayed cookie-only, since swapping whole
   groups would have widened what a stolen CLI token could do. See the PRD's
-  route-disposition table.
+  route-disposition table. Issue #3504 later adds `GET /api/vault/status` and
+  `POST /api/vault/unlock` to `RequireUser` for `uzi vault status` and
+  `uzi vault unlock`; lock and passphrase creation remain cookie-only. Unlock
+  retains the authenticated per-user limiter shared by cookies and CLI tokens.
+  See [the vault threat model](docs/vault-threat-model.md#cli-unlock-authenticated-guessing-and-key-custody)
+  for the accepted guessing surface.
 - **`scope` is a ceiling, enforced in the middleware, not just at `/api/admin/*`.**
   `RequireAdminRO` is a plain `user.IsAdmin` check; the real control is upstream in
   `RequireUser`, which gives a CLI token whose `scope != 'admin_ro'` a **copy** of

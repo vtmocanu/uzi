@@ -78,11 +78,57 @@ secret), never a plain variable.**
 can target a *named context* instead of overwriting the one you already have —
 see [Named contexts](#named-contexts) below.
 
+## Vault: check status and unlock
+
+After authenticating, run `uzi vault status` to print `locked` or `unlocked`
+for the active user. `--json` returns only `{"unlocked":false}` or
+`{"unlocked":true}`. Status output remains visible with `--quiet`.
+
+Run `uzi vault unlock` in a terminal to enter your login password or, for
+an OIDC-only account, your dedicated vault passphrase. The prompt goes to
+stderr and input is hidden. Unlock opens an existing vault; it does not
+create one. Set an OIDC vault passphrase in the web app first.
+
+For an owner-controlled script, explicitly pass `--password-stdin` with
+non-terminal stdin, for example using a password manager's stdout:
+
+```sh
+pass show uzi/vault | uzi vault unlock --password-stdin
+```
+
+The command reads one line, strips its trailing LF or CRLF, and preserves
+leading and trailing spaces. A final line without a newline is accepted.
+Empty input or input over 1 MiB is rejected. Non-terminal stdin without
+`--password-stdin`, or a terminal with that flag, is a usage error.
+There is no password-valued flag, positional argument, environment setting,
+or persisted re-unlock key. Agents must ask the owner to unlock, never
+solicit or read the owner's password or passphrase.
+
+On success, unlock prints `Vault unlocked.` unless `--quiet` is set.
+`--json` returns `{"unlocked":true}`, including with `--quiet`; the terminal
+prompt still goes to stderr. Unlock submits once and never retries
+automatically. Terminal input fails closed if cleanup fails: no password
+is submitted.
+
+| Exit | Vault result |
+|------|--------------|
+| 0 | Success |
+| 1 | Generic input/read/cleanup failure or cancellation |
+| 2 | Usage error, including invalid flags/arguments, empty or oversized input, or stdin/flag mismatch |
+| 3 | Authentication failure; wrong password and no existing vault both report `incorrect password` |
+| 6 | Unreachable server, server error, or HTTP 429 rate limit |
+
+A 429 reports a safe retry hint when the server supplies a valid positive
+`Retry-After`; wait before making another attempt. Arbitrary unlock error
+response bodies are not printed.
+
 ## Commands
 
 ```
 uzi login | logout | auth token [--with-token] | auth status [--all] | whoami
 uzi context list | current | use <name> | set <name> --url <url> | rm <name>
+uzi vault status
+uzi vault unlock [--password-stdin]
 uzi run list | get <id> [--field <name> ...] [--reconciliation-before-gate-revision <n>]
 uzi run logs <id> [--follow] [--after <seq>]
 uzi run plan <run-id> [--version N] [--diff] [--json]
@@ -1830,12 +1876,12 @@ A newer release is available.
   `🔒 vault locked` hint (`[locked] vault locked` under NO_COLOR or a
   non-color terminal). When one or more of **your own** runs are actually
   parked on the lock, the hint escalates to a steady amber needs-you band
-  instead: `▌ VAULT LOCKED · N runs parked — unlock in the web app to
-  resume`. On the admin/factory board the count is scoped to your own
+  instead: `▌ VAULT LOCKED · N runs parked — uzi vault unlock or the web app to resume`.
+  On the admin/factory board the count is scoped to your own
   runs only — it never counts or names another user's locked vault. Either
   form is steady, never blinking, and clears on its own within about a
   minute of the vault unlocking; there's no dismiss. Unlocking itself is done
-  off-TUI, in the web app.
+  outside the TUI, with `uzi vault unlock` or in the web app.
 - **Run detail** (`[enter]` from the board, or `uzi tui <run-id>` directly).
   A left rail of agent lanes — the lead plus each live subagent, one lane per
   invocation, each with a status dot — beside the selected lane's transcript,
