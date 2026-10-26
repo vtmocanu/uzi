@@ -91,6 +91,14 @@ const (
 	codexRecoverySlotRetryBackoff = 20 * time.Millisecond
 )
 
+// codexRefreshReuseInFlightBound is the policy fence from admission through the OAuth
+// budget, all recovery writes/backoffs (including the final background sleep), and
+// the terminal write tail. Scheduling pauses are not bounded by this policy.
+const codexRefreshReuseInFlightBound = codexRefreshLeaseTTL +
+	(codexRecoverySlotSyncAttempts+codexRecoverySlotBgAttempts)*codexRecoverySlotWriteTimeout +
+	(codexRecoverySlotSyncAttempts-1+codexRecoverySlotBgAttempts)*codexRecoverySlotRetryBackoff +
+	codexRecoverySlotWriteTimeout
+
 // errCodexRecoveryLost is the internal signal from persistCodexRecoverySlot that the
 // recovery write's loss is ESTABLISHED synchronously (e.g. no background seam is wired to
 // hand off to), so the caller must mark the intent unrecoverable. A transient/cancelled
@@ -741,6 +749,12 @@ func (s *Service) advanceCodexRefresh(ctx context.Context, q codexRefreshStore, 
 			if s.recordCodexRefreshRejection(ctx, userID, accountID, operationID, acct.Generation) {
 				return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: %w", ErrCodexRefreshRejected, ErrCodexRefreshUnrecoverable)
 			}
+		} else {
+			// This is the operation's last write on the ambiguous branch. A failed
+			// receipt leaves the original ambiguity and consumes no retry.
+			s.recordCodexRefreshProviderError(ctx, q, store.RecordCodexRefreshProviderErrorParams{
+				UserID: userID, AccountID: accountID, OperationID: operationID, FromGeneration: acct.Generation,
+			})
 		}
 		return CodexRefreshResult{Outcome: CodexRefreshContended}, fmt.Errorf("codex refresh: provider exchange: %w", rerr)
 	}
@@ -910,6 +924,62 @@ func (s *Service) codexRetainUnverifiedMaterial(ctx context.Context, q codexRefr
 		return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: %v", ErrCodexRefreshUnrecoverable, perr)
 	}
 	return CodexRefreshResult{Outcome: CodexRefreshQuarantined}, fmt.Errorf("%w: fresh access-token identity claims are unverified", ErrCodexRefreshQuarantined)
+}
+
+// codexProviderErrorStore is separate from codexRefreshStore so older narrow fakes
+// can safely leave receipt support unwired. Production *store.Queries implements it.
+type codexProviderErrorStore interface {
+	RecordCodexRefreshProviderError(context.Context, store.RecordCodexRefreshProviderErrorParams) (int64, error)
+}
+
+func (s *Service) recordCodexRefreshProviderError(ctx context.Context, q codexRefreshStore, arg store.RecordCodexRefreshProviderErrorParams) {
+	receipts, ok := q.(codexProviderErrorStore)
+	if !ok {
+		return
+	}
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), codexRecoverySlotWriteTimeout)
+	defer cancel()
+	n, err := receipts.RecordCodexRefreshProviderError(wctx, arg)
+	if err != nil || n != 1 {
+		slog.Warn("codex refresh: ambiguous provider receipt not persisted", "operation", arg.OperationID, "result", CodexTimingResult(err))
+	}
+}
+
+type codexRefreshReuseAdmitter func(context.Context, store.CodexRefreshReuseParams) (bool, error)
+
+// admitCodexRefreshReuse checks local prerequisites before durable consumption. M3
+// may use the returned login only after successful admission; this helper never
+// calls the provider. The store rechecks alias, operation and generation under locks.
+func (s *Service) admitCodexRefreshReuse(ctx context.Context, acct store.CodexProviderAccount, it store.CodexRefreshIntent, admit codexRefreshReuseAdmitter) (codexLoginBlob, bool, error) {
+	if s.vlt == nil || !s.vlt.Unlocked(acct.UserID) {
+		return codexLoginBlob{}, false, errVaultLocked
+	}
+	login, err := s.openCodexAccountLogin(acct.UserID, acct)
+	if err != nil {
+		return codexLoginBlob{}, false, err
+	}
+	if login.RefreshToken == "" {
+		return codexLoginBlob{}, false, ErrCodexRefreshNoToken
+	}
+	arg := store.CodexRefreshReuseParams{
+		UserID: acct.UserID, AccountID: acct.ID, OperationID: it.OperationID, FromGeneration: acct.Generation,
+	}
+	if it.UserID != acct.UserID || it.ProviderAccountID != acct.ID || it.FromGeneration != acct.Generation {
+		return codexLoginBlob{}, false, nil
+	}
+	if admit == nil {
+		if s.txBeginner == nil {
+			return codexLoginBlob{}, false, nil
+		}
+		admit = func(ctx context.Context, arg store.CodexRefreshReuseParams) (bool, error) {
+			return store.AdmitCodexRefreshReuse(ctx, s.txBeginner, arg)
+		}
+	}
+	applied, err := admit(ctx, arg)
+	if err != nil || !applied {
+		return codexLoginBlob{}, false, err
+	}
+	return login, true, nil
 }
 
 // codexRefreshRejector records a provider rejection of an operation's refresh material
@@ -1276,11 +1346,11 @@ func (s *Service) reconcileUnresolvedCodexRefresh(ctx context.Context, userID, a
 		// lease-holder of THIS op — so a concurrently committed intent is never clobbered.
 		// 0 rows means the guard rejected the stale write: don't count it resolved or changed.
 		n, serr := q.SetCodexRefreshIntentStateFenced(ctx, store.SetCodexRefreshIntentStateFencedParams{
-			State:              state,
-			OperationID:        it.OperationID,
-			UserID:             userID,
-			ExpectedGeneration: acct.Generation,
-			Now:                pgconv.Time(now),
+			State:                     state,
+			OperationID:               it.OperationID,
+			UserID:                    userID,
+			ExpectedGeneration:        acct.Generation,
+			ReuseInFlightMicroseconds: codexRefreshReuseInFlightBound.Microseconds(),
 		})
 		if serr != nil {
 			return resolved, changed, fmt.Errorf("codex reconcile: set intent %s state: %w", it.OperationID, serr)
@@ -1516,15 +1586,24 @@ func (s *Service) promoteCodexRecovery(ctx context.Context, q codexRefreshStore,
 // (QuarantineExpiredCodexLease) already quarantined an EXPIRED lease before this runs, so an
 // account still 'in_progress' under this op with a valid, non-expired lease it owns and an
 // unchanged generation is a genuinely live op — declaring it unrecoverable would brick a
-// refresh that is about to commit. Every other stranded shape still resolves terminally.
+// refresh that is about to commit. Receipt-bearing intents also remain pending during
+// their fixed eligibility window or consumed in-flight bound; SQL rechecks those windows
+// using the database clock before accepting a destructive verdict.
 func codexRefreshResolution(now time.Time, acct store.CodexProviderAccount, it store.CodexRefreshIntent) string {
 	switch {
 	case acct.Generation > it.FromGeneration:
 		// A commit landed past this intent's starting generation → the rotation completed.
 		return codexIntentReconciled
-	case len(acct.RecoverySealed) > 0 && acct.RecoveryGeneration.Valid && acct.RecoveryGeneration.Int64 == it.FromGeneration:
+	case len(acct.RecoverySealed) > 0 && acct.RecoveryGeneration.Valid && acct.RecoveryGeneration.Int64 == it.FromGeneration &&
+		(!it.ProviderErrorAt.Valid || acct.Generation == it.FromGeneration):
 		// A recovery copy survives for this generation — recoverable, not total loss.
 		return codexIntentReconciled
+	case it.ProviderErrorAt.Valid &&
+		((!it.ReuseAttemptedAt.Valid && it.CreatedAt.Time.After(now.Add(-30*time.Minute))) ||
+			(it.ReuseAttemptedAt.Valid && it.ReuseAttemptedAt.Time.After(now.Add(-codexRefreshReuseInFlightBound)))):
+		// Receipt eligibility/in-flight work survives disabled aliases and locked
+		// vaults. The authoritative resolution fence uses the database clock.
+		return codexIntentPending
 	case acct.CoordState == codexCoordInProgress &&
 		acct.CoordOperationID.Valid && uuid.UUID(acct.CoordOperationID.Bytes) == it.OperationID &&
 		acct.LeaseDeadline.Valid && acct.LeaseDeadline.Time.After(now) &&

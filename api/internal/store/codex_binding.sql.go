@@ -247,6 +247,50 @@ func (q *Queries) CommitCodexRefresh(ctx context.Context, arg CommitCodexRefresh
 	return i, err
 }
 
+const consumeCodexRefreshReuse = `-- name: ConsumeCodexRefreshReuse :execrows
+UPDATE codex_refresh_intent i
+SET reuse_attempted_at = now(), updated_at = now()
+WHERE i.operation_id = $1 AND i.user_id = $2
+  AND i.provider_account_id = $3 AND i.from_generation = $4::bigint
+  AND i.state = 'rotating' AND i.provider_error_at IS NOT NULL
+  AND i.reuse_attempted_at IS NULL AND i.created_at > now() - interval '30 minutes'
+  AND EXISTS (
+      SELECT 1 FROM codex_provider_account a
+      WHERE a.id = i.provider_account_id AND a.user_id = i.user_id
+        AND a.coord_state = 'quarantined' AND a.coord_operation_id = i.operation_id
+        AND a.generation = i.from_generation AND a.recovery_sealed IS NULL
+        AND NOT a.reauth_required
+        AND EXISTS (
+            SELECT 1 FROM codex_credential_state s
+            JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
+            WHERE s.user_id = a.user_id AND s.provider_account_id = a.id
+              AND s.status = 'linked' AND us.disabled_at IS NULL
+        )
+  )
+`
+
+type ConsumeCodexRefreshReuseParams struct {
+	OperationID    uuid.UUID `json:"operation_id"`
+	UserID         uuid.UUID `json:"user_id"`
+	AccountID      uuid.UUID `json:"account_id"`
+	FromGeneration int64     `json:"from_generation"`
+}
+
+// Account and user mutation locks are held by AdmitCodexRefreshReuse. Recheck every
+// durable prerequisite in the single consumption statement using the database clock.
+func (q *Queries) ConsumeCodexRefreshReuse(ctx context.Context, arg ConsumeCodexRefreshReuseParams) (int64, error) {
+	result, err := q.db.Exec(ctx, consumeCodexRefreshReuse,
+		arg.OperationID,
+		arg.UserID,
+		arg.AccountID,
+		arg.FromGeneration,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const failCodexAccountWaitRun = `-- name: FailCodexAccountWaitRun :execrows
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
@@ -419,7 +463,7 @@ func (q *Queries) FreezeRunCodexBinding(ctx context.Context, arg FreezeRunCodexB
 }
 
 const getCodexRefreshIntent = `-- name: GetCodexRefreshIntent :one
-SELECT operation_id, user_id, provider_account_id, from_generation, state, created_at, updated_at FROM codex_refresh_intent
+SELECT operation_id, user_id, provider_account_id, from_generation, state, created_at, updated_at, provider_error_at, reuse_attempted_at FROM codex_refresh_intent
 WHERE operation_id = $1 AND user_id = $2
 `
 
@@ -441,6 +485,8 @@ func (q *Queries) GetCodexRefreshIntent(ctx context.Context, arg GetCodexRefresh
 		&i.State,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ProviderErrorAt,
+		&i.ReuseAttemptedAt,
 	)
 	return i, err
 }
@@ -651,7 +697,7 @@ func (q *Queries) InsertCodexReadmitRunMessage(ctx context.Context, arg InsertCo
 const insertCodexRefreshIntent = `-- name: InsertCodexRefreshIntent :one
 INSERT INTO codex_refresh_intent (operation_id, user_id, provider_account_id, from_generation, state)
 VALUES ($1, $2, $3, $4::bigint, 'rotating')
-RETURNING operation_id, user_id, provider_account_id, from_generation, state, created_at, updated_at
+RETURNING operation_id, user_id, provider_account_id, from_generation, state, created_at, updated_at, provider_error_at, reuse_attempted_at
 `
 
 type InsertCodexRefreshIntentParams struct {
@@ -681,6 +727,8 @@ func (q *Queries) InsertCodexRefreshIntent(ctx context.Context, arg InsertCodexR
 		&i.State,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ProviderErrorAt,
+		&i.ReuseAttemptedAt,
 	)
 	return i, err
 }
@@ -871,7 +919,7 @@ func (q *Queries) ListUnresolvedCodexRefreshAccounts(ctx context.Context, now pg
 }
 
 const listUnresolvedCodexRefreshIntents = `-- name: ListUnresolvedCodexRefreshIntents :many
-SELECT operation_id, user_id, provider_account_id, from_generation, state, created_at, updated_at FROM codex_refresh_intent
+SELECT operation_id, user_id, provider_account_id, from_generation, state, created_at, updated_at, provider_error_at, reuse_attempted_at FROM codex_refresh_intent
 WHERE user_id = $1 AND provider_account_id = $2 AND state = 'rotating'
 `
 
@@ -900,6 +948,8 @@ func (q *Queries) ListUnresolvedCodexRefreshIntents(ctx context.Context, arg Lis
 			&i.State,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.ProviderErrorAt,
+			&i.ReuseAttemptedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -1001,6 +1051,48 @@ func (q *Queries) LockCodexAliasForShareNowait(ctx context.Context, arg LockCode
 	row := q.db.QueryRow(ctx, lockCodexAliasForShareNowait, arg.UserSecretID, arg.UserID)
 	var i LockCodexAliasForShareNowaitRow
 	err := row.Scan(&i.Status, &i.MaterialRevision, &i.ProviderAccountID)
+	return i, err
+}
+
+const lockCodexRefreshReuseAccount = `-- name: LockCodexRefreshReuseAccount :one
+SELECT id, user_id, provider_user_id, workspace_account_id, sealed_login, sealed_with, generation, credential_revision, recovery_sealed, recovery_generation, recovery_sealed_with, coord_state, coord_operation_id, lease_deadline, committed_generation, created_at, updated_at, reauth_required, reauth_generation, reauth_credential_revision, reauth_reason, recovery_cause FROM codex_provider_account
+WHERE id = $1 AND user_id = $2
+FOR UPDATE
+`
+
+type LockCodexRefreshReuseAccountParams struct {
+	AccountID uuid.UUID `json:"account_id"`
+	UserID    uuid.UUID `json:"user_id"`
+}
+
+// Called only after LockSecretMutation, before locking/updating an intent.
+func (q *Queries) LockCodexRefreshReuseAccount(ctx context.Context, arg LockCodexRefreshReuseAccountParams) (CodexProviderAccount, error) {
+	row := q.db.QueryRow(ctx, lockCodexRefreshReuseAccount, arg.AccountID, arg.UserID)
+	var i CodexProviderAccount
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.ProviderUserID,
+		&i.WorkspaceAccountID,
+		&i.SealedLogin,
+		&i.SealedWith,
+		&i.Generation,
+		&i.CredentialRevision,
+		&i.RecoverySealed,
+		&i.RecoveryGeneration,
+		&i.RecoverySealedWith,
+		&i.CoordState,
+		&i.CoordOperationID,
+		&i.LeaseDeadline,
+		&i.CommittedGeneration,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.ReauthRequired,
+		&i.ReauthGeneration,
+		&i.ReauthCredentialRevision,
+		&i.ReauthReason,
+		&i.RecoveryCause,
+	)
 	return i, err
 }
 
@@ -1338,6 +1430,40 @@ func (q *Queries) ReadmitRunCodexBinding(ctx context.Context, arg ReadmitRunCode
 	return result.RowsAffected(), nil
 }
 
+const recordCodexRefreshProviderError = `-- name: RecordCodexRefreshProviderError :execrows
+UPDATE codex_refresh_intent i
+SET provider_error_at = now(), updated_at = now()
+WHERE i.operation_id = $1 AND i.user_id = $2
+  AND i.provider_account_id = $3 AND i.from_generation = $4::bigint
+  AND i.state = 'rotating' AND i.provider_error_at IS NULL AND i.reuse_attempted_at IS NULL
+  AND EXISTS (
+      SELECT 1 FROM codex_provider_account a
+      WHERE a.id = i.provider_account_id AND a.user_id = i.user_id
+        AND a.generation = i.from_generation AND a.coord_operation_id = i.operation_id
+  )
+`
+
+type RecordCodexRefreshProviderErrorParams struct {
+	OperationID    uuid.UUID `json:"operation_id"`
+	UserID         uuid.UUID `json:"user_id"`
+	AccountID      uuid.UUID `json:"account_id"`
+	FromGeneration int64     `json:"from_generation"`
+}
+
+// Last write of an ambiguous provider exchange. No retry is consumed here.
+func (q *Queries) RecordCodexRefreshProviderError(ctx context.Context, arg RecordCodexRefreshProviderErrorParams) (int64, error) {
+	result, err := q.db.Exec(ctx, recordCodexRefreshProviderError,
+		arg.OperationID,
+		arg.UserID,
+		arg.AccountID,
+		arg.FromGeneration,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const refreshCodexAccountLogin = `-- name: RefreshCodexAccountLogin :execrows
 UPDATE codex_provider_account
 SET sealed_login         = $1,
@@ -1538,27 +1664,57 @@ func (q *Queries) SetCodexRefreshIntentState(ctx context.Context, arg SetCodexRe
 }
 
 const setCodexRefreshIntentStateFenced = `-- name: SetCodexRefreshIntentStateFenced :execrows
+WITH locked_account AS MATERIALIZED (
+    SELECT a.id, a.user_id, a.provider_user_id, a.workspace_account_id, a.sealed_login, a.sealed_with, a.generation, a.credential_revision, a.recovery_sealed, a.recovery_generation, a.recovery_sealed_with, a.coord_state, a.coord_operation_id, a.lease_deadline, a.committed_generation, a.created_at, a.updated_at, a.reauth_required, a.reauth_generation, a.reauth_credential_revision, a.reauth_reason, a.recovery_cause FROM codex_provider_account a
+    WHERE a.user_id = $3 AND a.id = (
+        SELECT i.provider_account_id FROM codex_refresh_intent i
+        WHERE i.operation_id = $2 AND i.user_id = $3
+    )
+    FOR UPDATE
+)
 UPDATE codex_refresh_intent cri
-SET state = $1, updated_at = now()
+SET state = $1::text, updated_at = now()
 WHERE cri.operation_id = $2 AND cri.user_id = $3
   AND cri.state = 'rotating'
   AND EXISTS (
-      SELECT 1 FROM codex_provider_account cpa
+      SELECT 1 FROM locked_account cpa
       WHERE cpa.id = cri.provider_account_id AND cpa.user_id = cri.user_id
         AND cpa.generation = $4::bigint
+        AND (
+            cri.provider_error_at IS NULL
+            OR (
+                $1::text = 'reconciled'
+                AND (cpa.generation > cri.from_generation
+                     OR (cpa.recovery_sealed IS NOT NULL
+                         AND cpa.recovery_generation = cpa.generation
+                         AND cpa.generation = cri.from_generation))
+            )
+            OR (
+                $1::text = 'unrecoverable'
+                AND cpa.generation = cri.from_generation
+                AND NOT (cpa.recovery_sealed IS NOT NULL
+                         AND cpa.recovery_generation = cpa.generation)
+                AND NOT (
+                    (cri.reuse_attempted_at IS NULL
+                     AND cri.created_at > now() - interval '30 minutes')
+                    OR (cri.reuse_attempted_at IS NOT NULL
+                        AND cri.reuse_attempted_at > now() - ($5::bigint * interval '1 microsecond'))
+                )
+            )
+        )
         AND NOT (cpa.coord_state = 'in_progress'
                  AND cpa.coord_operation_id = cri.operation_id
                  AND cpa.lease_deadline IS NOT NULL
-                 AND cpa.lease_deadline > $5::timestamptz)
+                 AND cpa.lease_deadline > now())
   )
 `
 
 type SetCodexRefreshIntentStateFencedParams struct {
-	State              string             `json:"state"`
-	OperationID        uuid.UUID          `json:"operation_id"`
-	UserID             uuid.UUID          `json:"user_id"`
-	ExpectedGeneration int64              `json:"expected_generation"`
-	Now                pgtype.Timestamptz `json:"now"`
+	State                     string    `json:"state"`
+	OperationID               uuid.UUID `json:"operation_id"`
+	UserID                    uuid.UUID `json:"user_id"`
+	ExpectedGeneration        int64     `json:"expected_generation"`
+	ReuseInFlightMicroseconds int64     `json:"reuse_in_flight_microseconds"`
 }
 
 // Fenced survivor intent-state write (issue #1532, race 2): the reconcile pass decides a
@@ -1569,13 +1725,14 @@ type SetCodexRefreshIntentStateFencedParams struct {
 // committed intent, a generation that advanced under us, or a genuinely live in-flight op is
 // never overwritten. Owner-scoped; the owning-op writes stay on the unconditional
 // SetCodexRefreshIntentState. 0 rows means the guard rejected the stale write.
+// Lock the account before the intent, serializing restore/lease changes with resolution.
 func (q *Queries) SetCodexRefreshIntentStateFenced(ctx context.Context, arg SetCodexRefreshIntentStateFencedParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setCodexRefreshIntentStateFenced,
 		arg.State,
 		arg.OperationID,
 		arg.UserID,
 		arg.ExpectedGeneration,
-		arg.Now,
+		arg.ReuseInFlightMicroseconds,
 	)
 	if err != nil {
 		return 0, err

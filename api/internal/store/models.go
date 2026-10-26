@@ -263,6 +263,8 @@ type CodexRefreshIntent struct {
 	State             string             `json:"state"`
 	CreatedAt         pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	ProviderErrorAt   pgtype.Timestamptz `json:"provider_error_at"`
+	ReuseAttemptedAt  pgtype.Timestamptz `json:"reuse_attempted_at"`
 }
 
 type ControllerReportStatus struct {
