@@ -11146,7 +11146,14 @@ export class GitCache {
         // Normal observations must latch exceptions as well as false returns, so
         // a one-shot callback failure cannot disappear on the rollback recheck.
         if (!opts.completionSource) checkProcessProof();
-        const processRevoked = opts.completionSource !== undefined && opts.processProof !== undefined && opts.processProof() !== true;
+        // Completion: a throwing proof callback is a revocation too, routed through the same
+        // rollback (canonical restored, journal kept, nothing disposed) before it is rethrown.
+        let processRevoked = false;
+        let completionProofError: unknown;
+        if (opts.completionSource !== undefined && opts.processProof !== undefined) {
+          try { processRevoked = opts.processProof() !== true; }
+          catch (err) { processRevoked = true; completionProofError = err; }
+        }
         if (processRevoked || residueQuarantine() !== undefined || (opts.completionSource && !opts.completionSource.canDelete())) {
           // issue #2213: a latch landed after the move. Undo it (best-effort), keep the journal and
           // dispose of nothing; the latched worker keeps the clone at its journaled path.
@@ -11164,6 +11171,7 @@ export class GitCache {
                 }),
             );
           }
+          if (completionProofError !== undefined) throw completionProofError;
           if (processRevoked) throw new Error("runner clone process proof revoked");
           throw new CloneRetainedByQuarantineError();
         }

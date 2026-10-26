@@ -2930,3 +2930,34 @@ describe("M2 Git retirement process proof", () => {
     await assert.rejects(git.retireRunnerClone(bare, clonePath, branch, "wrong-owner", { discard: true, processProof: () => true }), CapturePathMismatchError);
   });
 });
+
+it("completion: a post-move throwing process proof restores the canonical clone and keeps the journal", async t => {
+  const owner = randomUUID();
+  const { bare, branch, clonePath } = await seedResidue(2852, owner, "proof.txt");
+  const head = await git.worktreeHead(clonePath);
+  assert.ok(head);
+  const journal = readJournal(bare, branch);
+  let movedTo: string | undefined;
+  let thrown = false;
+  const rename = fsp.rename.bind(fsp);
+  t.mock.method(fsp, "rename", async (...args: Parameters<typeof fsp.rename>) => {
+    await rename(...args);
+    if (String(args[0]) === clonePath) movedTo = String(args[1]);
+  });
+  await assert.rejects(git.retireRunnerClone(bare, clonePath, branch, owner, {
+    discard: true,
+    completionSource: { expectedHead: head, canDelete: () => true },
+    processProof: () => {
+      if (movedTo && !thrown) {
+        thrown = true;
+        throw new Error("one-shot proof exception");
+      }
+      return true;
+    },
+  }), /one-shot proof exception/);
+  assert.equal(thrown, true);
+  assert.ok(movedTo);
+  assert.equal(fs.existsSync(clonePath), true, "canonical clone must be restored after the exception");
+  assert.equal(fs.existsSync(movedTo), false);
+  assert.deepEqual(readJournal(bare, branch), journal);
+});
