@@ -1786,6 +1786,16 @@ plus mutation establishes the property, so none is claimed covered elsewhere):
 | rf explicit `revalidate()` before output index removed | targeted run (3 tests) stayed green; the fresh observation and the indexing guard may subsume it, not proven |
 | x1 importer `check()` made a no-op | targeted run (2 tests) stayed green; resource accounting still calls `check()`, not proven to cover the importer sites |
 
+Re-test at `58137dd4` (Linux, Git 2.53.0): the fold tests redden under w1, s1, s2,
+s2b, ojdup, p1 and the custodian-deletion mutant and pass on restore. For n1, the walk
+layer alone stays green on 98 hardlink tests, while removing every importer `nlink`
+layer (both walk checks, the `validate()` leaf check, the `unchanged()` comparison and
+the in-walk alias refusal) reddens 12 of them: the hardlink property is pinned
+collectively and the walk-level checks are redundant defence in depth; the other
+layers were not tested one by one. rf and x1 stay unproven: no test makes only the
+post-join `revalidate()` refuse, and cancellation is pinned through the resource
+checks rather than the importer's own `check()`.
+
 ### Remaining verification boundary
 
 Historical full `task gate:agent` log `gate-log.vNpy2y` timed out at 120 minutes,
