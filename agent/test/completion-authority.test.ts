@@ -7,7 +7,8 @@ import {
   acquireWorkerLifetime, type AuthorityTransaction, withAuthorityTransaction, type WorkerLifetime,
 } from "../src/authority-lock.js";
 import {
-  type AuthorityFsOps, type AuthorityStore, installWorkerLifetime, openAuthorityStore, requireWorkerLifetime, SourceUseLease,
+  type AuthorityFsOps, type AuthorityStore, installWorkerLifetime, leaseEpoch, leaseSlotKey, openAuthorityStore,
+  requireWorkerLifetime, type SlotPublication, SourceUseLease,
 } from "../src/completion-authority.js";
 import { makeTmp, testLockOptions } from "./authority-test-support.js";
 
@@ -36,6 +37,11 @@ function source(f: Fixture, name = "runner/repo-a"): string {
   return full;
 }
 const shardFile = (f: Fixture, key: string): string => path.join(authorityDir(f), "heads", `${key.slice(0, 2)}.json`);
+const claudePub = {
+  harness: "claude" as const, sourceCoreDigest: "d".repeat(64),
+  cohort: { runId: "run-1", generation: 1, captureIds: ["cap-a", "cap-b"] },
+};
+const codexPub = { ...claudePub, harness: "codex" as const };
 function slotFiles(f: Fixture): string[] {
   return fs.existsSync(slotsDir(f)) ? fs.readdirSync(slotsDir(f)) : [];
 }
@@ -146,8 +152,8 @@ test("admit mints an epoch, re-admit with the open lease retains it, a plain re-
 
   const next = await tx(f, (t2) => s.admitSourceUse(t2, src));
   assert.notEqual((await tx(f, (t2) => s.readSlot(t2, key)))?.epoch, slot?.epoch);
-  await assert.rejects(tx(f, (t2) => s.transition(t2, lease, "claude_ready")), /stale/);
-  await tx(f, (t2) => s.transition(t2, next, "claude_ready"));
+  await assert.rejects(tx(f, (t2) => s.transition(t2, lease, "claude_ready", claudePub)), /stale/);
+  await tx(f, (t2) => s.transition(t2, next, "claude_ready", claudePub));
   assert.throws(() => new SourceUseLease(Symbol("x"), s, key, randomUUID()), /cannot be constructed/);
 });
 
@@ -162,18 +168,23 @@ test("a successor worker cannot advance a foreign active epoch; it may supersede
   await tx(f, (t2) => one.transition(t2, lease, "ineligible"));
   const taken = await tx(f, (t2) => two.admitSourceUse(t2, src));
   await assert.rejects(tx(f, (t2) => one.transition(t2, lease, "ineligible")), /stale/);
-  await tx(f, (t2) => two.transition(t2, taken, "claude_ready"));
+  await tx(f, (t2) => two.transition(t2, taken, "claude_ready", claudePub));
 });
 
 test("transition table is enforced", async (t) => {
   const f = await fixture(t);
   const s = await store(f);
   const lease = await tx(f, (t2) => s.admitSourceUse(t2, source(f)));
-  await assert.rejects(tx(f, (t2) => s.transition(t2, lease, "sealed")), /illegal transition/);
-  await tx(f, (t2) => s.transition(t2, lease, "claude_ready"));
-  await tx(f, (t2) => s.transition(t2, lease, "sealed"));
-  await assert.rejects(tx(f, (t2) => s.transition(t2, lease, "claude_ready")), /illegal transition/);
+  await tx(f, (t2) => s.transition(t2, lease, "claude_ready", claudePub));
+  await assert.rejects(tx(f, (t2) => s.transition(t2, lease, "sealed", codexPub)), /illegal transition/);
+  await assert.rejects(tx(f, (t2) => s.transition(t2, lease, "claude_ready", claudePub)), /illegal transition/);
   await tx(f, (t2) => s.transition(t2, lease, "ineligible"));
+  await assert.rejects(tx(f, (t2) => s.transition(t2, lease, "sealed", codexPub)), /illegal transition/);
+
+  const codexLease = await tx(f, (t2) => s.admitSourceUse(t2, source(f, "runner/repo-codex")));
+  await tx(f, (t2) => s.transition(t2, codexLease, "sealed", codexPub));
+  await assert.rejects(tx(f, (t2) => s.transition(t2, codexLease, "claude_ready", claudePub)), /illegal transition/);
+  await tx(f, (t2) => s.transition(t2, codexLease, "ineligible"));
 });
 
 test("tampered or malformed slots refuse and block admission", async (t) => {
@@ -188,8 +199,9 @@ test("tampered or malformed slots refuse and block admission", async (t) => {
   const forged = (JSON.parse(original) as Record<string, unknown>);
   forged.state = "sealed";
   fs.writeFileSync(file, JSON.stringify(forged) + "\n", { mode: 0o600 });
-  await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src)), /authentication/);
-  await assert.rejects(tx(f, (t2) => s.transition(t2, lease, "claude_ready")), /authentication/);
+  // A sealed state without publication data is refused by the decoder before the MAC is even checked.
+  await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src)), /authentication|malformed/);
+  await assert.rejects(tx(f, (t2) => s.transition(t2, lease, "claude_ready", claudePub)), /authentication|malformed/);
 
   fs.writeFileSync(file, '{"version":', { mode: 0o600 });
   await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src)), /malformed/);
@@ -232,7 +244,7 @@ test("pending footprints: running blocks admission, settle clears, a failed sett
   assert.equal((await tx(f, (t2) => s.readSlot(t2, key)))?.pending?.status, "running");
   await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src)), /pending/);
   await assert.rejects(tx(f, (t2) => s.beginPending(t2, lease, { kind: "bare_mutation", footprint: "x" })), /already recorded/);
-  await assert.rejects(tx(f, (t2) => s.transition(t2, lease, "claude_ready")), /pending/);
+  await assert.rejects(tx(f, (t2) => s.transition(t2, lease, "claude_ready", claudePub)), /pending/);
   await assert.rejects(tx(f, (t2) => s.markRetiring(t2, lease, { prior: "a".repeat(64), manifest: [] })), /pending/);
   await tx(f, (t2) => s.settlePending(t2, lease, op, { ok: true }));
   assert.equal((await tx(f, (t2) => s.readSlot(t2, key)))?.pending, null);
@@ -265,8 +277,8 @@ test("retiring blocks admission until retired; a retired tombstone mints a new e
   assert.equal(retired?.state, "retired");
   const fresh = await tx(f, (t2) => s.admitSourceUse(t2, src));
   assert.notEqual((await tx(f, (t2) => s.readSlot(t2, key)))?.epoch, retired?.epoch);
-  await assert.rejects(tx(f, (t2) => s.transition(t2, lease, "claude_ready")), /stale/);
-  await tx(f, (t2) => s.transition(t2, fresh, "claude_ready"));
+  await assert.rejects(tx(f, (t2) => s.transition(t2, lease, "claude_ready", claudePub)), /stale/);
+  await tx(f, (t2) => s.transition(t2, fresh, "claude_ready", claudePub));
 });
 
 function failingOps(flags: { file: boolean; dir: boolean; rename: boolean }): AuthorityFsOps {
@@ -291,8 +303,7 @@ test("a failed durable write never returns a lease or leaves an eligible state",
   flags.file = false;
 
   const lease = await tx(f, (t2) => s.admitSourceUse(t2, src));
-  await tx(f, (t2) => s.transition(t2, lease, "claude_ready"));
-  await tx(f, (t2) => s.transition(t2, lease, "sealed"));
+  await tx(f, (t2) => s.transition(t2, lease, "sealed", codexPub));
 
   flags.rename = true;
   await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src)), /injected rename/);
@@ -333,7 +344,7 @@ test("input the decoder would refuse is rejected before anything is written, so 
   const big = Array.from({ length: 1024 }, (_, i) => String(i).padStart(4, "0") + "€".repeat(508));
   await assert.rejects(tx(f, (t2) => s.markRetiring(t2, other, { prior: "c".repeat(64), manifest: big })), /exceeds bound/);
   assert.equal((await tx(f, (t2) => s.readSlot(t2, otherKey)))?.state, "active", "slot still readable and unchanged");
-  await tx(f, (t2) => s.transition(t2, other, "claude_ready"));
+  await tx(f, (t2) => s.transition(t2, other, "claude_ready", claudePub));
 });
 
 test("replaying an older authentic slot file refuses and keeps refusing", async (t) => {
@@ -354,7 +365,7 @@ test("replaying an older authentic slot file refuses and keeps refusing", async 
     await assert.rejects(tx(f, (t2) => who.readSlot(t2, key)), /replay/);
     await assert.rejects(tx(f, (t2) => who.admitSourceUse(t2, src)), /replay/);
   }
-  await assert.rejects(tx(f, (t2) => s.transition(t2, lease, "claude_ready")), /replay/);
+  await assert.rejects(tx(f, (t2) => s.transition(t2, lease, "claude_ready", claudePub)), /replay/);
 });
 
 test("the in-process high-water mark refuses a replay of the slot and head together", async (t) => {
@@ -405,7 +416,7 @@ test("the head tracks every slot write and survives its own crash window", async
   assert.equal((await tx(f, (t2) => restarted.readSlot(t2, key)))?.seq, 1);
   assert.deepEqual(head(), { [key]: 1 }, "completed under the transaction");
   const lease = await tx(f, (t2) => restarted.admitSourceUse(t2, src));
-  await tx(f, (t2) => restarted.transition(t2, lease, "claude_ready"));
+  await tx(f, (t2) => restarted.transition(t2, lease, "claude_ready", claudePub));
   assert.deepEqual(head(), { [key]: 3 });
 });
 
@@ -417,7 +428,7 @@ test("a rolled-back or deleted head, or a deleted slot, refuses", async (t) => {
   const headFile = shardFile(f, key);
   const lease = await tx(f, (t2) => s.admitSourceUse(t2, src));
   const oldHead = fs.readFileSync(headFile);
-  await tx(f, (t2) => s.transition(t2, lease, "claude_ready"));
+  await tx(f, (t2) => s.transition(t2, lease, "claude_ready", claudePub));
   await tx(f, (t2) => s.transition(t2, lease, "ineligible"));
   const newHead = fs.readFileSync(headFile);
 
@@ -590,4 +601,118 @@ test("the worker lifetime accessor refuses before install and exposes only the i
   installWorkerLifetime(f.lifetime);
   assert.equal(requireWorkerLifetime(), f.lifetime);
   assert.throws(() => installWorkerLifetime(f.lifetime), /already installed/);
+});
+
+test("sealed and claude_ready publish the digest and cohort, and require the matching harness", async (t) => {
+  const f = await fixture(t);
+  const s = await store(f);
+  const cSrc = source(f, "runner/claude");
+  const xSrc = source(f, "runner/codex");
+  const cKey = await tx(f, (t2) => s.slotKey(t2, cSrc));
+  const cLease = await tx(f, (t2) => s.admitSourceUse(t2, cSrc));
+  const xLease = await tx(f, (t2) => s.admitSourceUse(t2, xSrc));
+  assert.equal(leaseSlotKey(cLease), cKey);
+  assert.equal(leaseEpoch(cLease), (await tx(f, (t2) => s.readSlot(t2, cKey)))?.epoch);
+  assert.equal(await tx(f, (t2) => s.readPublication(t2, cSrc)), null, "an active slot publishes nothing");
+
+  await assert.rejects(tx(f, (t2) => s.transition(t2, cLease, "sealed", claudePub)), /requires harness codex/);
+  await assert.rejects(tx(f, (t2) => s.transition(t2, cLease, "claude_ready", codexPub)), /requires harness claude/);
+  const loose = s.transition.bind(s) as (...a: unknown[]) => Promise<void>;
+  await assert.rejects(tx(f, (t2) => loose(t2, cLease, "claude_ready")), /publication data required/);
+  await assert.rejects(tx(f, (t2) => loose(t2, cLease, "sealed")), /publication data required/);
+  await assert.rejects(tx(f, (t2) => loose(t2, cLease, "ineligible", claudePub)), /no publication/);
+  assert.equal((await tx(f, (t2) => s.readSlot(t2, cKey)))?.state, "active", "no refused call wrote anything");
+
+  await tx(f, (t2) => s.transition(t2, cLease, "claude_ready", claudePub));
+  await tx(f, (t2) => s.transition(t2, xLease, "sealed", codexPub));
+  const claude = await tx(f, (t2) => s.readPublication(t2, cSrc));
+  assert.deepEqual(claude, { ...claudePub, state: "claude_ready", epoch: leaseEpoch(cLease) });
+  const codex = await tx(f, (t2) => s.readPublication(t2, xSrc));
+  assert.deepEqual(codex, { ...codexPub, state: "sealed", epoch: leaseEpoch(xLease) });
+  assert.equal(await tx(f, (t2) => s.readPublication(t2, source(f, "runner/never"))), null);
+});
+
+test("publication data is validated before anything is written", async (t) => {
+  const f = await fixture(t);
+  const s = await store(f);
+  const src = source(f);
+  const key = await tx(f, (t2) => s.slotKey(t2, src));
+  const lease = await tx(f, (t2) => s.admitSourceUse(t2, src));
+  const bad = (p: unknown): Promise<void> => assert.rejects(
+    tx(f, (t2) => s.transition(t2, lease, "claude_ready", p as SlotPublication)), /malformed/);
+  const ids = (captureIds: string[]): unknown => ({ ...claudePub, cohort: { ...claudePub.cohort, captureIds } });
+  await bad(ids(["b", "a"]));
+  await bad(ids(["a", "a"]));
+  await bad(ids([""]));
+  await bad(ids(Array.from({ length: 257 }, (_, i) => String(i).padStart(4, "0"))));
+  await bad({ ...claudePub, sourceCoreDigest: "D".repeat(64) });
+  await bad({ ...claudePub, sourceCoreDigest: "d".repeat(63) });
+  await bad({ ...claudePub, extra: 1 });
+  await bad({ ...claudePub, cohort: { ...claudePub.cohort, generation: 0 } });
+  await bad({ ...claudePub, cohort: { ...claudePub.cohort, extra: 1 } });
+  await bad({ harness: "claude", sourceCoreDigest: "d".repeat(64) });
+  const slot = await tx(f, (t2) => s.readSlot(t2, key));
+  assert.equal(slot?.state, "active");
+  assert.equal(slot?.publication, null);
+  await tx(f, (t2) => s.transition(t2, lease, "claude_ready", claudePub));
+});
+
+test("a stale lease cannot publish, and a pending footprint blocks publication and reads", async (t) => {
+  const f = await fixture(t);
+  const s = await store(f);
+  const src = source(f);
+  const key = await tx(f, (t2) => s.slotKey(t2, src));
+  const stale = await tx(f, (t2) => s.admitSourceUse(t2, src));
+  const lease = await tx(f, (t2) => s.admitSourceUse(t2, src));
+  await assert.rejects(tx(f, (t2) => s.transition(t2, stale, "claude_ready", claudePub)), /stale/);
+  assert.equal(await tx(f, (t2) => s.readPublication(t2, src)), null);
+
+  await tx(f, (t2) => s.beginPending(t2, lease, { kind: "bare_mutation", footprint: "x" }));
+  await assert.rejects(tx(f, (t2) => s.transition(t2, lease, "claude_ready", claudePub)), /pending/);
+  await assert.rejects(tx(f, (t2) => s.readPublication(t2, src)), /pending/);
+  assert.equal((await tx(f, (t2) => s.readSlot(t2, key)))?.publication, null);
+});
+
+test("publication survives ineligible and retiring, is cleared by retire, and is authenticated", async (t) => {
+  const f = await fixture(t);
+  const s = await store(f);
+  const src = source(f);
+  const key = await tx(f, (t2) => s.slotKey(t2, src));
+  const lease = await tx(f, (t2) => s.admitSourceUse(t2, src));
+  await tx(f, (t2) => s.transition(t2, lease, "sealed", codexPub));
+  const file = path.join(slotsDir(f), `${key}.json`);
+  const original = fs.readFileSync(file, "utf8");
+
+  const forged = JSON.parse(original) as { publication: { harness: string; sourceCoreDigest: string } };
+  forged.publication.harness = "claude";
+  fs.writeFileSync(file, JSON.stringify(forged) + "\n", { mode: 0o600 });
+  await assert.rejects(tx(f, (t2) => s.readPublication(t2, src)), /malformed/, "harness must match the state");
+  forged.publication.harness = "codex";
+  forged.publication.sourceCoreDigest = "e".repeat(64);
+  fs.writeFileSync(file, JSON.stringify(forged) + "\n", { mode: 0o600 });
+  await assert.rejects(tx(f, (t2) => s.readPublication(t2, src)), /authentication/);
+  fs.writeFileSync(file, original, { mode: 0o600 });
+
+  await tx(f, (t2) => s.transition(t2, lease, "ineligible"));
+  assert.equal((await tx(f, (t2) => s.readPublication(t2, src)))?.state, "ineligible");
+  await tx(f, (t2) => s.markRetiring(t2, lease, { prior: "a".repeat(64), manifest: [] }));
+  assert.equal((await tx(f, (t2) => s.readPublication(t2, src)))?.state, "retiring");
+  await tx(f, (t2) => s.markRetired(t2, lease));
+  assert.equal(await tx(f, (t2) => s.readPublication(t2, src)), null);
+});
+
+test("source certificates are minted and checked under a live transaction with the store key", async (t) => {
+  const f = await fixture(t);
+  const s = await store(f);
+  const digest = "a".repeat(64);
+  const cert = await tx(f, async (t2) => s.certifySource(t2, digest));
+  assert.match(cert, /^[0-9a-f]{64}$/);
+  assert.equal(await tx(f, async (t2) => s.verifySourceCertificate(t2, digest, cert)), true);
+  assert.equal(await tx(f, async (t2) => s.verifySourceCertificate(t2, "b".repeat(64), cert)), false);
+  assert.equal(await tx(f, async (t2) => s.verifySourceCertificate(t2, digest, cert.replace(/^./, "0"))), false);
+  assert.equal(await tx(f, async (t2) => s.verifySourceCertificate(t2, digest, 5)), false);
+  let captured: AuthorityTransaction | undefined;
+  await tx(f, async (t2) => { captured = t2; });
+  assert.throws(() => s.certifySource(captured!, digest), /active authority transaction/);
+  assert.throws(() => s.certifySource({} as AuthorityTransaction, digest), /active authority transaction/);
 });

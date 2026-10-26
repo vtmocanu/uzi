@@ -42,9 +42,12 @@ import {
 // of that case is in-process only. An older shard with a newer slot (more than one ahead) or
 // an older slot under a newer shard is detected.
 
+/** Authority layout identity; exposed as `AuthorityStore.layout` for completion-source.ts. */
 const AUTHORITY_LAYOUT = "uzi-authority-layout/1";
 const ENROLLMENT_VERSION = "uzi-authority-enrollment/1";
-const SLOT_VERSION = "uzi-authority-slot/1";
+const SLOT_VERSION = "uzi-authority-slot/2";
+const CERTIFICATE_LABEL = "uzi completion source certificate v2\0";
+const MAX_CAPTURE_IDS = 256;
 const HEAD_VERSION = "uzi-authority-head/2";
 const HEADS_DIR = "heads";
 const SHARD = /^[0-9a-f]{2}$/;
@@ -91,6 +94,19 @@ export interface RetiringRecord {
   manifest: string[];
   deleted: number;
 }
+/** The authenticated cohort manifest a final slot binds: one run generation's capture ids. */
+export interface SlotCohort {
+  runId: string;
+  generation: number;
+  /** Strictly ascending, so a cohort has exactly one spelling. */
+  captureIds: string[];
+}
+/** What a sealed (codex) or claude_ready (claude) slot publishes about its source. */
+export interface SlotPublication {
+  harness: "codex" | "claude";
+  sourceCoreDigest: string;
+  cohort: SlotCohort;
+}
 export interface SlotSnapshot {
   version: string;
   key: string;
@@ -100,6 +116,13 @@ export interface SlotSnapshot {
   owner: { worker: string; executor: string | null };
   pending: PendingFootprint | null;
   retiring: RetiringRecord | null;
+  /** Present exactly for sealed and claude_ready; kept through ineligible and retiring. */
+  publication: SlotPublication | null;
+}
+/** What `readPublication` returns for retirement verification. */
+export interface SlotPublicationRead extends SlotPublication {
+  state: SlotState;
+  epoch: string;
 }
 
 // ---- strict decoding ------------------------------------------------------------------
@@ -137,8 +160,23 @@ function strings(value: unknown, maxItems: number): string[] {
   return value.map((item) => text(item, MAX_ITEM));
 }
 
+function normalizePublication(raw: unknown): SlotPublication {
+  const p = exact(raw, ["harness", "sourceCoreDigest", "cohort"]);
+  if (p.harness !== "codex" && p.harness !== "claude") throw new AuthorityRefusal("malformed authority record");
+  const c = exact(p.cohort, ["runId", "generation", "captureIds"]);
+  if (!Array.isArray(c.captureIds) || c.captureIds.length > MAX_CAPTURE_IDS) throw new AuthorityRefusal("malformed authority record");
+  const captureIds = c.captureIds.map((id) => text(id, 128));
+  for (let i = 1; i < captureIds.length; i++) {
+    if (!((captureIds[i - 1] as string) < (captureIds[i] as string))) throw new AuthorityRefusal("malformed authority record");
+  }
+  return {
+    harness: p.harness, sourceCoreDigest: hex64(p.sourceCoreDigest),
+    cohort: { runId: text(c.runId, 128), generation: uint(c.generation, 1, Number.MAX_SAFE_INTEGER), captureIds },
+  };
+}
+
 function normalizeSlot(raw: unknown): SlotSnapshot {
-  const o = exact(raw, ["version", "key", "state", "epoch", "seq", "owner", "pending", "retiring"]);
+  const o = exact(raw, ["version", "key", "state", "epoch", "seq", "owner", "pending", "retiring", "publication"]);
   if (o.version !== SLOT_VERSION) throw new AuthorityRefusal("unsupported authority slot version");
   const state = o.state;
   if (typeof state !== "string" || !STATES.includes(state as SlotState)) throw new AuthorityRefusal("malformed authority record");
@@ -160,11 +198,15 @@ function normalizeSlot(raw: unknown): SlotSnapshot {
     retiring = { prior: hex64(r.prior), operation: uuid(r.operation), manifest, deleted: uint(r.deleted, 0, manifest.length) };
   }
   if ((state === "retiring") !== (retiring !== null)) throw new AuthorityRefusal("malformed authority record");
+  const publication = o.publication === null ? null : normalizePublication(o.publication);
+  if (state === "active" && publication !== null) throw new AuthorityRefusal("malformed authority record");
+  if (state === "sealed" && publication?.harness !== "codex") throw new AuthorityRefusal("malformed authority record");
+  if (state === "claude_ready" && publication?.harness !== "claude") throw new AuthorityRefusal("malformed authority record");
   return {
     version: SLOT_VERSION, key: hex64(o.key), state: state as SlotState, epoch: uuid(o.epoch),
     seq: uint(o.seq, 1, Number.MAX_SAFE_INTEGER),
     owner: { worker: uuid(owner.worker), executor: owner.executor === null ? null : text(owner.executor, 128) },
-    pending, retiring,
+    pending, retiring, publication,
   };
 }
 
@@ -370,6 +412,16 @@ export class SourceUseLease {
   }
 }
 
+function heldLease(lease: SourceUseLease): { store: AuthorityStore; key: string; epoch: string } {
+  const held = leaseState.get(lease);
+  if (!held) throw new AuthorityRefusal("not a source-use lease");
+  return held;
+}
+/** The epoch a lease was minted for; fences bind it. Opaque leases expose no structural fields. */
+export function leaseEpoch(lease: SourceUseLease): string { return heldLease(lease).epoch; }
+/** The slot key a lease is bound to. */
+export function leaseSlotKey(lease: SourceUseLease): string { return heldLease(lease).key; }
+
 export interface AuthorityStoreOptions {
   workerToken: string;
   /** Tests only: simulate another worker process. */
@@ -441,7 +493,7 @@ interface StoreInit {
 
 const NEXT_STATES: Record<"claude_ready" | "sealed" | "ineligible", SlotState[]> = {
   claude_ready: ["active"],
-  sealed: ["claude_ready"],
+  sealed: ["active"],
   ineligible: ["active", "claude_ready", "sealed"],
 };
 
@@ -465,6 +517,30 @@ export class AuthorityStore {
   }
 
   get storageId(): string { return this.#init.storageId; }
+  get layout(): string { return AUTHORITY_LAYOUT; }
+  get dataDir(): string { return this.#init.dataDir; }
+  /** The worker incarnation this store writes slots under. */
+  get workerIncarnation(): string { return this.#init.incarnation; }
+
+  /**
+   * Mint the certificate for a source core digest. The key never leaves this module. Needs a
+   * live authority transaction; only the publication path may call it.
+   */
+  certifySource(tx: AuthorityTransaction, coreDigest: string): string {
+    this.#check(tx);
+    return this.#certificate(hex64(coreDigest));
+  }
+
+  /** Constant-time check of a certificate against a digest, under a live transaction. */
+  verifySourceCertificate(tx: AuthorityTransaction, coreDigest: string, certificate: unknown): boolean {
+    this.#check(tx);
+    if (typeof certificate !== "string" || !HEX64.test(certificate) || !HEX64.test(coreDigest)) return false;
+    return timingSafeEqual(Buffer.from(this.#certificate(coreDigest), "hex"), Buffer.from(certificate, "hex"));
+  }
+
+  #certificate(coreDigest: string): string {
+    return createHmac("sha256", this.#init.key).update(`${CERTIFICATE_LABEL}${this.#init.storageId}\0${coreDigest}`).digest("hex");
+  }
 
   #check(tx: AuthorityTransaction): void {
     if (transactionContext(tx).authorityDir !== this.#init.ctxDir) {
@@ -603,6 +679,7 @@ export class AuthorityStore {
     const body: SlotSnapshot = {
       version: SLOT_VERSION, key, state: "active", epoch: randomUUID(), seq: (old?.seq ?? 0) + 1,
       owner: { worker: this.#init.incarnation, executor: options.executor ?? null }, pending: null, retiring: null,
+      publication: null,
     };
     await this.#save(dir, body);
     return new SourceUseLease(leaseBrand, this, key, body.epoch);
@@ -621,11 +698,45 @@ export class AuthorityStore {
     return { dir, body };
   }
 
-  async transition(tx: AuthorityTransaction, lease: SourceUseLease, to: "claude_ready" | "sealed" | "ineligible"): Promise<void> {
+  /**
+   * Move the slot on under the exact live lease. claude_ready (harness claude) and sealed
+   * (harness codex) publish the source core digest and the cohort manifest in the same write;
+   * both are required, validated before anything is written, and kept until retirement.
+   */
+  async transition(tx: AuthorityTransaction, lease: SourceUseLease, to: "ineligible"): Promise<void>;
+  async transition(
+    tx: AuthorityTransaction, lease: SourceUseLease, to: "claude_ready" | "sealed", publication: SlotPublication,
+  ): Promise<void>;
+  async transition(
+    tx: AuthorityTransaction, lease: SourceUseLease, to: "claude_ready" | "sealed" | "ineligible", publication?: SlotPublication,
+  ): Promise<void> {
     const { dir, body } = await this.#owned(tx, lease);
     if (!NEXT_STATES[to].includes(body.state)) throw new AuthorityRefusal(`illegal transition ${body.state} -> ${to}`);
-    if (to !== "ineligible" && body.pending !== null) throw new AuthorityRefusal("unresolved pending footprint");
-    await this.#save(dir, { ...body, state: to, seq: body.seq + 1 });
+    if (to === "ineligible") {
+      if (publication !== undefined) throw new AuthorityRefusal("ineligible carries no publication");
+      await this.#save(dir, { ...body, state: to, seq: body.seq + 1 });
+      return;
+    }
+    if (body.pending !== null) throw new AuthorityRefusal("unresolved pending footprint");
+    if (publication === undefined) throw new AuthorityRefusal("publication data required");
+    const wanted = to === "sealed" ? "codex" : "claude";
+    const normalized = normalizePublication(JSON.parse(JSON.stringify(publication)));
+    if (normalized.harness !== wanted) throw new AuthorityRefusal(`${to} requires harness ${wanted}`);
+    await this.#save(dir, { ...body, state: to, publication: normalized, seq: body.seq + 1 });
+  }
+
+  /**
+   * The published digest and cohort of a sealed or claude_ready source, for retirement
+   * verification. Null when the slot is absent or never published; a pending footprint or a
+   * malformed or replayed slot refuses.
+   */
+  async readPublication(tx: AuthorityTransaction, sourcePath: string): Promise<SlotPublicationRead | null> {
+    const key = await this.slotKey(tx, sourcePath);
+    const slot = await this.#load(await this.#slotsDir(), key);
+    if (!slot) return null;
+    if (slot.pending !== null) throw new AuthorityRefusal("source has an unresolved pending footprint");
+    if (slot.publication === null) return null;
+    return { ...structuredClone(slot.publication), state: slot.state, epoch: slot.epoch };
   }
 
   /** Durably record intent BEFORE a bare mutation or destructive operation begins. */
@@ -688,7 +799,7 @@ export class AuthorityStore {
       throw new AuthorityRefusal("retire is incomplete");
     }
     requireResidueCovered(body.pending, body.retiring.manifest);
-    await this.#save(dir, { ...body, state: "retired", retiring: null, pending: null, seq: body.seq + 1 });
+    await this.#save(dir, { ...body, state: "retired", retiring: null, pending: null, publication: null, seq: body.seq + 1 });
   }
 }
 
