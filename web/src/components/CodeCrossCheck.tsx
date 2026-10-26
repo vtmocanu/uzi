@@ -188,7 +188,8 @@ export function CodeCrossCheck({ run }: { run: Run }) {
       {s.reason_class && <p>Reason: {reasonLabel(s.reason_class)}</p>}
       <p>{evidence.state === "Pending report" ? "Dispositions pending" : evidence.state}</p>
       {!historical && s.outcome === "completed" && evidence.state === "Finalized" && <p>{counts.addressed} addressed, {counts.declined} declined, {counts.not_reported} not reported</p>}
-      <Coverage value={s.coverage} />\n      <Findings value={s.findings} dispositions={evidence.entries} />
+      <Coverage value={s.coverage} />
+      <Findings value={s.findings} dispositions={evidence.entries} />
       <p className="flex flex-wrap gap-x-1 break-all text-xs text-muted">
         <span>Family: {s.checker_harness === "codex" ? "Codex" : s.checker_harness === "claude" ? "Claude" : "Unreported"}</span>
         <span className="inline-flex max-w-full gap-x-1"><span className="shrink-0"> · </span><span className="min-w-0">Model: {plain(s.checker_model) || "Unreported"}</span></span>

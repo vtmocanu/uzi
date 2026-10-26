@@ -354,6 +354,7 @@ it("coverage displays the complete stored twelve-path account with derived count
     ["src/l.ts", "unassessed", "not reached", "no"],
   ];
   expect(rows).toHaveLength(12);
+  expect(container.textContent).not.toContain("\\n");
   expected.forEach(([path, status, reason, read], i) => {
     expect(rows[i].textContent).toBe(path + " · " + status + " · Recorded read: " + read + "Reason: " + reason);
   });
