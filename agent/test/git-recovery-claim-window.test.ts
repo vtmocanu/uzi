@@ -705,3 +705,24 @@ for (const jump of [1, 2]) test(`derived episode jump ${jump} passes runner owne
   assert.equal(f.read().recovery?.episode, 7 + jump);
   assert.equal(f.read().recovery?.blocker, "quiescence_failed");
 });
+
+for (const first of ["unconfirmed ACK", "transport"] as const) test(`retained park ${first} then 400 remains nonterminal`, async t => {
+  const f = fixture(t);
+  await f.reserve(4, f.recreate(), 7); f.advance(300_001);
+  let sends = 0;
+  const h = exhaustionRunner(f, {
+    ack: async () => {
+      if (++sends === 1) {
+        if (first === "transport") throw new TypeError("fetch failed after send");
+        return {};
+      }
+      throw new RequestError("POST", "/state", 400, "invalid request body");
+    },
+    ownership: async () => ({ status: "running", claim_generation: 4 }),
+  });
+  await assert.rejects(h.run(), (error: Error) => error.constructor.name === "RetainedRecoveryStop");
+  assert.equal(h.counts().terminal, 0, "a later refusal cannot disprove an earlier possibly applied report");
+  assert.equal(h.counts().reports, 2);
+  assert.equal(h.flight.parked, false);
+  assert.equal(Reflect.get(h.flight, "retainedEpisodeCustody"), true);
+});

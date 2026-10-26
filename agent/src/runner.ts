@@ -21809,7 +21809,10 @@ export class RunRunner {
           this.retainedLifecycleGuard(flight);
           if (error instanceof RetainedRecoveryStop || error instanceof CredentialSwitchSignal ||
               error instanceof StaleClaimError || isRunOwnershipLost(error, flight.runId)) throw error;
-          if (error instanceof RequestError && error.status === 400) return false;
+          if (error instanceof RequestError && error.status === 400) {
+            if (attempt === 0) return false;
+            throw new RetainedRecoveryStop();
+          }
           flight.runLog.warn("retained exhaustion park report unconfirmed", {
             attempt, ...formatRetainedRecoveryDiagnostic(error, flight.redactText),
           });

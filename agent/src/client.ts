@@ -407,7 +407,7 @@ function hasRevisionSourceFields(body: StateRequest): boolean {
 
 // Internal per-attempt evidence, minted only after reading the authenticated response through EOF.
 class StateDecodeRefusalError extends RequestError {}
-interface StateAttemptEvidence { ambiguous: boolean; refusals: number }
+interface StateAttemptEvidence { ambiguous: boolean; refusals: number; refusedAfterAmbiguity?: boolean }
 
 /** Match a small, complete 404 JSON object against exactly the expected keys and values. */
 export function isStrict404Body(err: unknown, expected: Readonly<Record<string, string>>): boolean {
@@ -2201,7 +2201,14 @@ export class WorkerClient {
           body.status !== "recovery_wait" || !Number.isSafeInteger(body.claim_generation) ||
           (body.claim_generation ?? 0) < 1) throw new Error("retained recovery park requires support and a positive generation");
       // This contract cannot degrade to an unfenced or untyped recovery park on rollback.
-      return this.reportStateOnce(runId, path, Object.freeze({ ...body }), signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
+      const evidence: StateAttemptEvidence = { ambiguous: false, refusals: 0 };
+      try {
+        return await this.reportStateOnce(runId, path, Object.freeze({ ...body }), signal, CROSS_CHECK_RESPONSE_MAX_BYTES, evidence);
+      } catch (error) {
+        // A later validation refusal says nothing about an earlier possibly applied send.
+        if (evidence.refusedAfterAmbiguity) throw new Error("retained recovery park outcome uncertain", { cause: error });
+        throw error;
+      }
     }
     if (body.recovery_cause === "worker_memory_pressure") {
       // Snapshot once: caller mutation and transport retries cannot rebind this request.
@@ -2554,6 +2561,8 @@ export class WorkerClient {
       } catch (err) {
         MaintenanceBudget.current()?.check();
         if (evidence) {
+          if (evidence.ambiguous && err instanceof RequestError && err.status === 400)
+            evidence.refusedAfterAmbiguity = true;
           if (err instanceof StateDecodeRefusalError) evidence.refusals++;
           else evidence.ambiguous = true;
         }

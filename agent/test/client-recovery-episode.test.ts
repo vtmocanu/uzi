@@ -145,3 +145,17 @@ it("retained exhaustion requires negotiated support and positive generation befo
     await assert.rejects(client.reportState("episode-run", { ...body, claim_generation: generation }));
   assert.equal(paths.length, 1);
 });
+
+for (const refusal of ["invalid request body", "invalid recovery cause"]) it(`retained exhaustion HTTP uncertainty survives later 400 ${refusal}`, async () => {
+  const sent: unknown[] = [];
+  client.protocolFeatures = ["recovery_cause_retained_recovery_exhausted"];
+  mock.method(globalThis, "fetch", async (_input: unknown, init?: RequestInit) => {
+    sent.push(JSON.parse(String(init?.body)));
+    return sent.length === 1 ? Response.json({ error: "response lost after write" }, { status: 500 })
+      : Response.json({ error: refusal }, { status: 400 });
+  });
+  const body = { status: "recovery_wait", recovery_cause: "retained_recovery_exhausted", claim_generation: 5 } as const;
+  await assert.rejects(client.reportState("episode-run", body), (error: unknown) =>
+    error instanceof Error && !(error instanceof RequestError && error.status === 400));
+  assert.deepEqual(sent, [body, body]);
+});
