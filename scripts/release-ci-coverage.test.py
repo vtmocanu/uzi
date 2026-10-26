@@ -776,6 +776,39 @@ class Published(unittest.TestCase):
         with self.assertRaises(policy.Refusal):
             policy.published(self.api, 'head', 'v0.2.0', 100, 1)
 
+    def test_transient_api_failure_recovers_within_deadline(self):
+        self.api.run.side_effect = [policy.TransientAPIError('HTTP 502'), run('release.yml')]
+        clock = [0.0]
+        with patch.object(policy.time, 'monotonic', side_effect=lambda: clock[0]), \
+             patch.object(policy.time, 'sleep', side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay)):
+            policy.published(self.api, 'head', 'v0.2.0', 2, 1)
+        self.assertEqual(clock[0], 1)
+        self.assertEqual(self.api.run.call_count, 2)
+
+    def test_transient_api_failure_expires(self):
+        self.api.run.side_effect = policy.TransientAPIError('HTTP 503')
+        clock = [0.0]
+        with patch.object(policy.time, 'monotonic', side_effect=lambda: clock[0]), \
+             patch.object(policy.time, 'sleep', side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay)):
+            with self.assertRaisesRegex(policy.Refusal, 'not successful'):
+                policy.published(self.api, 'head', 'v0.2.0', 2, 1)
+        self.assertEqual(clock[0], 2)
+        self.assertEqual(self.api.run.call_count, 3)
+
+    def test_command_classifies_only_recognized_transient_gh_api_errors(self):
+        for message, expected in ((b'HTTP 502: Bad Gateway', True), (b'HTTP 429: rate limited', True),
+                                  (b'dial tcp: i/o timeout', True), (b'connection reset by peer', True),
+                                  (b'HTTP 401: Bad credentials', False), (b'HTTP 403: Forbidden', False),
+                                  (b'HTTP 404: Not Found', False), (b'unknown error', False)):
+            result = subprocess.CompletedProcess([], 1, b'', message)
+            with self.subTest(message=message), patch.object(policy.subprocess, 'run', return_value=result):
+                with self.assertRaises(policy.Refusal) as caught:
+                    policy.command('gh', 'api', '/repos/example/uzi/actions/runs')
+                self.assertEqual(isinstance(caught.exception, policy.TransientAPIError), expected)
+                with self.assertRaises(policy.Refusal) as git_error:
+                    policy.command('git', 'status')
+                self.assertNotIsInstance(git_error.exception, policy.TransientAPIError)
+
     def test_invalid_poll_bounds_make_no_query(self):
         for wait, interval in ((-1, 1), (1, 0), (float('inf'), 1), (1, float('nan'))):
             with self.subTest(wait=wait, interval=interval), self.assertRaises(policy.Refusal):

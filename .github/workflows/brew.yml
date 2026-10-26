@@ -12,9 +12,9 @@
 # TRIGGERS: a `v*` tag push (auto-publish the formula on release, matching release.yml)
 # AND workflow_dispatch (re-publish for any existing tag by hand). Both feed the proof job
 # through INPUT_TAG below. Dispatch on the tag itself (`gh workflow run brew.yml --ref
-# vX.Y.Z -f tag=vX.Y.Z`): the `release` environment admits only `v*` tag refs, so a
-# dispatch from `main` is rejected by tag validation, and a tag dispatch runs the
-# workflow as it was at that tag. To publish with a newer workflow than the tag carries,
+# vX.Y.Z -f tag=vX.Y.Z`): a dispatch from `main` is refused by the proof job's tag
+# validation (the `release` environment also admits only `v*` tag refs). A tag dispatch
+# runs the workflow as it was at that tag. To publish with a newer workflow than the tag carries,
 # render and publish locally from `main` (`task brew-rc:formula` + `task brew-rc:publish`):
 # first prove that tag with `python3 -I scripts/release-ci-coverage.py published
 # refs/tags/vX.Y.Z --tag vX.Y.Z --wait 0`, then
@@ -26,6 +26,8 @@
 # vX.Y.Z-rc.N), release.yml publishes the images + chart, and this publishes the matching
 # formula only after that tag's release.yml succeeds. brew stays a SEPARATE workflow
 # because a failed tap push must not redden the image+chart release.
+# If the proof times out, first wait for the same tag's release.yml to succeed, then
+# recover the failed Brew run with `gh run rerun <brew-run> --failed`.
 #
 # The default GITHUB_TOKEN cannot write to a second repo, so the cross-repo push uses
 # HOMEBREW_TAP_TOKEN (a fine-grained PAT scoped to vtmocanu/homebrew-tap, contents:write),
@@ -54,21 +56,6 @@ name: Brew
 
 permissions:
   contents: read
-
-concurrency:
-  # Ref-INDEPENDENT (not per-tag): a promote ceremony pushes the stable tag and the next
-  # RC tag within minutes, firing two runs that BOTH `git push origin main` into the tap
-  # from a fresh clone with no rebase/retry. A per-ref group would let them run
-  # concurrently and collide on a non-fast-forward push, reddening one (PRD #1378 R5). One
-  # shared group + cancel-in-progress:false serializes the promote's two publishes: one
-  # runs, the other pends, then runs. This serialization also protects the version
-  # guard's read-then-push interval; delayed runs skip instead of downgrading the tap.
-  # The old single-pending policy assumed a short publish. Release proof can now
-  # wait 60 minutes, so retain up to 100 pending runs with queue: max. The narrow
-  # actionlint compatibility exception matches release.yml until its parser catches up.
-  group: brew-tap-publish
-  cancel-in-progress: false
-  queue: max
 
 jobs:
   assert-release-published:
@@ -110,13 +97,18 @@ jobs:
           fi
           echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
 
-      - uses: ./.github/actions/setup-task
       - name: Wait for the same tag's release publication
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: task wait:release-published
+        run: python3 -I scripts/release-ci-coverage.py published HEAD --tag "$INPUT_TAG" --wait 3600 --interval 15
 
   publish-formula:
+    # Serialize only the tap read/guard/write interval. Publication proofs can wait
+    # in parallel without holding this lock. Retain up to 100 pending publishers.
+    concurrency:
+      group: brew-tap-publish
+      cancel-in-progress: false
+      queue: max
     needs: assert-release-published
     runs-on: ubuntu-latest
     environment: release

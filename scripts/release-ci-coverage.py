@@ -14,10 +14,18 @@ class Refusal(Exception):
     """Coverage is absent, failed, or cannot be established."""
 
 
+class TransientAPIError(Refusal):
+    """A recognized temporary gh API failure; evidence remains unproven."""
+
+
 def command(*args):
     result = subprocess.run(args, capture_output=True, check=False)
     if result.returncode:
-        raise Refusal(f"{args[0]} failed: {result.stderr.decode(errors='replace').strip()}")
+        error = result.stderr.decode(errors='replace').strip()
+        temporary = (re.search(r'\bHTTP (?:429|5[0-9]{2})\b', error)
+                     or re.search(r'i/o timeout|TLS handshake timeout|connection reset by peer|temporary failure in name resolution', error, re.I))
+        refusal = TransientAPIError if args[:2] == ('gh', 'api') and temporary else Refusal
+        raise refusal(f"{args[0]} failed: {error}")
     return result.stdout.decode()
 
 
@@ -284,8 +292,12 @@ def published(api, sha, tag, wait, interval):
         raise Refusal('invalid publication poll bounds')
     deadline = time.monotonic() + wait
     while True:
-        release = api.run('release.yml', sha, tag)
-        current = state(release)
+        try:
+            release = api.run('release.yml', sha, tag)
+            current = state(release)
+        except TransientAPIError:
+            release = None
+            current = 'temporary API failure'
         if current == 'success':
             print(f'PASS release published: {tag}, SHA {sha}, run {release["id"]}, attempt {release["run_attempt"]}')
             return

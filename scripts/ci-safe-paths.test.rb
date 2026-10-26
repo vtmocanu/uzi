@@ -5,6 +5,7 @@
 require 'yaml'
 require 'open3'
 require 'tempfile'
+require 'tmpdir'
 
 class Expression
   def initialize(source, context)
@@ -171,11 +172,12 @@ fixtures.each_with_index do |files, index|
 end
 assert.call(jobs.fetch('test-api-store-it').fetch('steps').any? { |step| step.fetch('run', '').include?('../scripts/livedb-skip-guard.sh livedb.log') }, true, 'LiveDB proof retained')
 brew_workflow = YAML.safe_load(File.read(File.join(root, '.github/workflows/brew.yml')))
-assert.call(brew_workflow.fetch('concurrency').fetch('group'), 'brew-tap-publish', 'tap writes remain serialized')
-assert.call(brew_workflow.fetch('concurrency')['queue'], 'max', 'long release proof retains pending publishes')
-assert.call(brew_workflow.fetch('concurrency').fetch('cancel-in-progress'), false, 'active tap publication is never superseded')
+assert.call(brew_workflow['concurrency'], nil, 'publication proof runs without the tap lock')
 brew = brew_workflow.fetch('jobs')
 publisher = brew.fetch('publish-formula')
+assert.call(publisher.fetch('concurrency').fetch('group'), 'brew-tap-publish', 'tap writes remain serialized')
+assert.call(publisher.fetch('concurrency')['queue'], 'max', 'pending publishes are retained')
+assert.call(publisher.fetch('concurrency').fetch('cancel-in-progress'), false, 'active publication is never superseded')
 assert.call(Array(publisher['needs']).include?('assert-release-published'), true, 'tap credential job requires successful release proof')
 assert.call(publisher['if'], nil, 'publisher cannot override failed needs')
 guard = brew.fetch('assert-release-published')
@@ -183,7 +185,11 @@ assert.call(guard['environment'], nil, 'release proof has no credential environm
 assert.call(guard.fetch('permissions'), {'contents' => 'read', 'actions' => 'read'}, 'release proof is read-only')
 assert.call(guard.to_s.include?('HOMEBREW_TAP_TOKEN'), false, 'tap credential absent from proof job')
 assert.call(publisher.fetch('environment'), 'release', 'tap environment stays tag-restricted')
-assert.call(guard.fetch('steps').any? { |step| step['run'] == 'task wait:release-published' }, true, 'proof uses project automation')
+proof_command = 'python3 -I scripts/release-ci-coverage.py published HEAD --tag "$INPUT_TAG" --wait 3600 --interval 15'
+assert.call(guard.fetch('steps').any? { |step| step['run'] == proof_command }, true, 'exact publication proof command must run')
+assert.call(guard['continue-on-error'], nil, 'proof job cannot suppress failure')
+guard.fetch('steps').each { |step| assert.call(step['continue-on-error'], nil, 'proof steps cannot suppress failure') }
+assert.call(3600 < guard.fetch('timeout-minutes') * 60, true, 'proof finishes within job timeout')
 validation = guard.fetch('steps').find { |step| step['id'] == 'tag' }.fetch('run')
 [['v0.2.0', 'v0.2.0', 'tag', true], ['v0.2.0-rc.1', 'v0.2.0-rc.1', 'tag', true],
  ['v0.2.0', 'v0.1.0', 'tag', false], ['v0.2.0', 'v0.2.0', 'branch', false],
@@ -193,5 +199,26 @@ validation = guard.fetch('steps').find { |step| step['id'] == 'tag' }.fetch('run
     assert.call(status.success?, expected, "Brew tag context #{[tag, ref, kind]}")
     assert.call(File.read(file.path).strip, expected ? "tag=#{tag}" : '', 'only valid matching tag produces output')
   end
+end
+Dir.mktmpdir('brew-watch-proof') do |dir|
+  gh = File.join(dir, 'gh')
+  File.write(gh, <<~'SH')
+    #!/bin/sh
+    case "$*" in
+      'run list --workflow release.yml '*) echo 101 ;;
+      'run list --workflow brew.yml '*) echo 202 ;;
+      'run view 101 '*) printf 'completed\tsuccess\tpublish-api\thttps://example.invalid/101\n' ;;
+      'run view 202 '*) printf 'completed\tfailure\tassert-release-published\thttps://example.invalid/202\n' ;;
+      *) echo 'unexpected gh call' >&2; exit 99 ;;
+    esac
+  SH
+  File.chmod(0o700, gh)
+  stdout, stderr, status = Open3.capture3({'PATH' => "#{dir}:#{ENV.fetch('PATH')}", 'GIT_CONFIG_COUNT' => '1',
+                                        'GIT_CONFIG_KEY_0' => 'core.fsmonitor', 'GIT_CONFIG_VALUE_0' => 'false'},
+                                       'bash', File.join(root, '.agents/skills/uzi-release/scripts/release-watch.sh'),
+                                       '0.2.0', '--max-ticks', '1', chdir: root)
+  assert.call(status.exitstatus, 1, 'failed Brew proof remains a gate failure')
+  assert.call(stdout.include?('manual recovery required'), true, 'watcher refuses automatic gate rerun')
+  assert.call(stderr.include?("After the same tag's release.yml succeeds: gh run rerun 202 --failed"), true, 'watcher names guarded recovery command')
 end
 puts "ci-safe-paths: #{checks} assertions passed"

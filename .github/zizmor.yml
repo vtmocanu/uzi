@@ -9,7 +9,6 @@
 rules:
   self-repository:
     ignore:
-      - brew.yml
       - ci.yml
       - main-guard.yml
       - pricing-freshness.yml
