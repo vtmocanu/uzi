@@ -52,6 +52,8 @@ import type { ClaimCodexSecrets } from "./protocol.js";
 import type { CommandSandboxMode } from "./config.js";
 import { ensureRunnerTmpdir } from "./runner-tmpdir.js";
 import { createPodEpoch, restoreEpochRuntimeTmpdir } from "./pod-epoch-lock.js";
+import { inspectPodEpochBootstrap } from "./pod-epoch-bootstrap.js";
+import { PodEpochSettlementError, runPodEpochShadow } from "./pod-epoch-reclaim.js";
 
 export function buildWorkerGitCache(
   config: Pick<Config, "dataDir" | "recoveryDecodedLimitBytes">,
@@ -351,13 +353,17 @@ async function main(): Promise<void> {
   if (epochEnabled && process.env.UZI_DATA_DIR !== "/data") {
     throw new Error("epoch workers require UZI_DATA_DIR=/data");
   }
-  // M1 always chooses SH. The future shadow candidate must select its first
-  // mode here, before acquiring ownership; flock conversion is never used.
-  const epochOwnership = epochEnabled
-    ? await createPodEpoch().acquire({ signal: controller.signal })
+  const epochRuntime = epochEnabled ? createPodEpoch() : undefined;
+  const epochBootstrap = epochRuntime ? inspectPodEpochBootstrap({
+    UZI_POD_UID: process.env.UZI_POD_UID,
+    UZI_POD_EPOCH_RUNTIME: process.env.UZI_POD_EPOCH_RUNTIME,
+    UZI_POD_EPOCH_EVIDENCE_FILE: process.env.UZI_POD_EPOCH_EVIDENCE_FILE,
+  }, epochRuntime) : undefined;
+  const epochOwnership = epochRuntime && epochBootstrap
+    ? await epochRuntime.acquire({ firstMode: epochBootstrap.firstMode, signal: controller.signal })
     : undefined;
-  const epochConsumption = epochOwnership
-    ? await epochOwnership.consume(process.env.UZI_POD_UID ?? "")
+  const epochConsumption = epochOwnership && epochBootstrap
+    ? await epochOwnership.consume(epochBootstrap.podUid)
     : undefined;
   if (epochOwnership) restoreEpochRuntimeTmpdir(epochOwnership);
   // The raw Node descriptor stays open until process exit, including every
@@ -1017,6 +1023,15 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (epochBootstrap && epochOwnership && epochConsumption) {
+    const result = await runPodEpochShadow({
+      bootstrap: epochBootstrap, ownership: epochOwnership, consumption: epochConsumption,
+      dockerHost: config.dockerWiring.dockerHost, git, client, signal: controller.signal,
+    });
+    if (result !== undefined) log.info("pod_epoch_reclaim", { ...result });
+  }
+  if (controller.signal.aborted) return;
+
   lifecyclePhase = "worker";
   await worker.run(controller.signal);
   lifecyclePhase = "stopped";
@@ -1056,6 +1071,9 @@ if (isEntrypoint) {
       process.stderr.write(JSON.stringify({ level: "error", msg: "fatal", error: message,
         cause: "exception", phase: lifecyclePhase, exit_code: 1 }) + "\n");
     }
+    // Unsettled owned filesystem work can keep the event loop alive. Terminate
+    // with EX still held; only process exit releases epoch ownership in this case.
+    if (err instanceof PodEpochSettlementError) process.exit(1);
     process.exitCode = 1;
   });
 }
