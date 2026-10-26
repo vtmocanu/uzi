@@ -873,7 +873,7 @@ func (m tuiModel) workerRowLine(r workerRow, selected bool, width int, columns w
 	if selected {
 		pre = "▌"
 	}
-	fields := []string{paintSeg(m.pal.tungsten, bg, true, pre), cell(m.renderer.Plain(t.workerName, 13), 13, nil)}
+	fields := []string{paintSeg(m.pal.tungsten, bg, true, pre), cell(m.renderer.WorkerName(t.workerName, 13), 13, nil)}
 	if width >= 120 && m.board.admin {
 		fields = append(fields, cell(m.workerOwnerCell(r), 7, m.pal.faintC))
 	}
@@ -936,7 +936,7 @@ func (m tuiModel) workerRowLine(r workerRow, selected bool, width int, columns w
 }
 func (m tuiModel) workerReadout(r workerRow, width int) []string {
 	t := workerTextOf(r)
-	selected := m.pal.faint.Render("selected ") + m.pal.title.Render(m.renderer.Plain(t.workerName, max(0, width-9)))
+	selected := m.pal.faint.Render("selected ") + m.pal.title.Render(m.renderer.WorkerName(t.workerName, max(0, width-9)))
 	if m.board.admin {
 		selected += m.pal.faint.Render(" · owner ") + m.renderer.Plain(t.workerOwner, width)
 	}

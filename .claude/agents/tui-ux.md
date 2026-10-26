@@ -112,11 +112,12 @@ Interactive drive-testing: `cd api && go run ./cmd/uzi tui --demo` (a hidden fla
 the real model over seeded fixtures + a fake stream, no server).
 
 **The control-byte (terminal-injection) lens is live here and load-bearing.** Untrusted
-cells are drawn through `m.renderer.Plain` (= `capCell(cellText(s))`; `cellText` is the
+cells are drawn through `m.renderer.Plain` (= `capCell(cellText(s))`) or the
+worker-name-specific `m.renderer.WorkerName` (also sanitizes first); `cellText` is the
 control-byte stripper, a bare `capCell` is NOT enough). The guard is the `d7UntrustedFields`
 set (`tui_d7_guard_test.go`) plus a hostile-value render test (`tui_model_test.go`, e.g.
 `TestTUIViewsStripControlBytesFromUntrustedText`). A new untrusted board/detail field drawn
-without going through `Plain` and without being added to that guard is a Blocking finding —
+without going through either sanitizer and without being added to that guard is a Blocking finding —
 a clean-fixture screenshot cannot catch it.
 
 **NO_COLOR:** the status spine carries a per-status glyph (● running, ! awaiting, ~
