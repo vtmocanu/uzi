@@ -164,6 +164,12 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO, origin ...string) err
 	if r.QueueReason != nil && *r.QueueReason != "" {
 		rows = append(rows, []string{"QUEUE_REASON", queueReasonCell(*r.QueueReason)})
 	}
+	// RESERVE (PRD #3522): the weekly usage reserve's visible reason on a queued run it holds
+	// ("weekly usage reserve: 72% >= 70%", or "... weekly usage unknown"), emit-only-when-set. The
+	// text is server-built from numbers, but it rides a persisted column, so it is sanitized.
+	if r.ReserveHoldReason != nil && *r.ReserveHoldReason != "" {
+		rows = append(rows, []string{"RESERVE", sanitizeTTY(*r.ReserveHoldReason)})
+	}
 	if r.FailureReason != nil && *r.FailureReason != "" {
 		rows = append(rows, []string{"FAILURE_REASON", sanitizeTTY(*r.FailureReason)})
 	}
@@ -2596,11 +2602,15 @@ func pauseOriginLabel(r apitypes.RunDTO, personal bool, origin ...string) string
 	return runpresentation.PauseLabel(value, personal)
 }
 
-// queueReasonCell renders a run's queue_reason. The only reason today is "maintenance", which
-// is spelled out; an unknown future value still renders, sanitized.
+// queueReasonCell renders a run's queue_reason. The two reasons today are spelled out:
+// "maintenance" (PRD #3454) and "weekly_reserve" (PRD #3522, the exact figures are on the
+// RESERVE row beside it); an unknown future value still renders, sanitized.
 func queueReasonCell(reason string) string {
-	if reason == "maintenance" {
+	switch reason {
+	case "maintenance":
 		return "maintenance (uzi is in maintenance mode)"
+	case "weekly_reserve":
+		return "weekly_reserve (held by your weekly usage reserve)"
 	}
 	return sanitizeTTY(reason)
 }

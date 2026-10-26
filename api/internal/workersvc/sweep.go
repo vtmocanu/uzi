@@ -322,6 +322,18 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		s.publishSwept(r.ID, r.Status)
 	}
 
+	// PRD #3522 M3: keep every queued run's weekly-reserve hold marker (the visible reason, the
+	// queue_reason, the health pill, the ephemeral provisioner's demand filter) in step with the
+	// reserve. Best effort and never blocking: the marker is display and demand state, ClaimRun's
+	// own reserve clause is what actually withholds a run, so a marker failure must not stop the
+	// liveness passes below. Placed beside the promote passes because a run just promoted to queued
+	// is marked in the same tick.
+	marked, markErr := s.markReserveHolds(ctx, now)
+	if markErr != nil {
+		slog.Warn("sweeper: weekly reserve marker pass failed", "error", markErr)
+	}
+	res.ReserveMarked = marked
+
 	// Transient-recovery promotion (issue #1197): recovery_wait → queued once
 	// recovery_retry_not_before has elapsed. Placed beside the limit-wait promote for the
 	// same "transitions first, enforcement second" reason, and it is a distinct clock-based

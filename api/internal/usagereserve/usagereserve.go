@@ -41,12 +41,17 @@ const (
 // staleFactor is the multiple of the poll interval after which a reading is stale.
 const staleFactor = 3
 
+// ReasonPrefix opens every visible reserve reason (HeldReason, UnknownReason). Surfaces that must
+// recognise a reserve reason among free-text hold reasons (the health pill's nudge suppression)
+// match on it, so the prefix has one definition.
+const ReasonPrefix = "weekly usage reserve: "
+
 // UnknownReason is the visible reason a run is held while the weekly usage cannot be read.
-const UnknownReason = "weekly usage reserve: weekly usage unknown"
+const UnknownReason = ReasonPrefix + "weekly usage unknown"
 
 // HeldReason is the visible reason a run is held at or above the threshold.
 func HeldReason(pct, threshold int) string {
-	return fmt.Sprintf("weekly usage reserve: %d%% >= %d%%", pct, threshold)
+	return fmt.Sprintf("%s%d%% >= %d%%", ReasonPrefix, pct, threshold)
 }
 
 // State is the outcome of one evaluation.

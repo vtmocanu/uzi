@@ -358,6 +358,10 @@ func run() error {
 		// internally consistent while the meter and the selector disagreed about the
 		// same token, with nothing going red.
 		Autoselect: cfg.AutoselectPolicy(),
+		// PRD #3522: the weekly usage reserve's freshness window is three of these, the rule the
+		// rate-limit surfaces already apply.
+		UsagePollInterval:      cfg.UsagePollInterval,
+		CodexUsagePollInterval: cfg.CodexUsagePollInterval,
 		// PRD #35 usage-limit park. Both are server-side bounds on a WORKER-REPORTED
 		// event: the worker asks to park, the server decides for how long and how often.
 		RunLimitMaxWaits: cfg.RunLimitMaxWaits,
@@ -783,6 +787,9 @@ func run() error {
 		WorkerAffinityGrace:     cfg.WorkerAffinityGrace,
 		WorkerStaleRequeueGrace: cfg.WorkerStaleRequeueGrace,
 		WorkerAffinityCeiling:   cfg.WorkerAffinityCeiling,
+		// PRD #3522: the weekly usage reserve's freshness window for provisionOne's recheck.
+		UsagePollInterval:      cfg.UsagePollInterval,
+		CodexUsagePollInterval: cfg.CodexUsagePollInterval,
 		// Issue #1965: lane workers are provisioned only where the chart enabled the lane.
 		IsolatedLaneEnabled: cfg.IsolatedLaneEnabled(),
 		DockerEnabled:       cfg.WorkerDockerEnabled,

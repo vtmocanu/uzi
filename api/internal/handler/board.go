@@ -163,7 +163,8 @@ type latestRunDTO struct {
 	// shared card unconditionally; the near-timeout badge counts down to it.
 	DeadlineAt *time.Time `json:"deadline_at"`
 	// QueueReason is "maintenance" while instance maintenance mode holds this queued run back
-	// (PRD #3454), derived in SQL at read time; absent otherwise. Non-sensitive, shown to every
+	// (PRD #3454) or "weekly_reserve" while the owner's weekly usage reserve does (PRD #3522),
+	// derived in SQL at read time; absent otherwise. Non-sensitive, shown to every
 	// viewer like status.
 	QueueReason *string `json:"queue_reason,omitempty"`
 	// IsPlanning is issue #321's planning-phase display flag on the board card;

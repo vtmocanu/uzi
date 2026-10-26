@@ -157,7 +157,8 @@ type JobView struct {
 	FinishedAt        *time.Time
 	UpdatedAt         time.Time
 	// QueueReason is "maintenance" while instance maintenance mode holds this queued job back
-	// (PRD #3454); nil otherwise.
+	// (PRD #3454), or "weekly_reserve" while the owner's weekly usage reserve does (PRD #3522); nil
+	// otherwise.
 	QueueReason *string
 }
 

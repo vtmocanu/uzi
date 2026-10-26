@@ -564,10 +564,17 @@ type RunDTO struct {
 	// to it; the reason string stays static, so nothing stored ever ages (D4).
 	DeadlineAt *time.Time `json:"deadline_at"`
 	// QueueReason (PRD #3454) is "maintenance" while instance maintenance mode holds this
-	// queued run back (queued, intake paused, run not admitted); absent otherwise. Derived in
-	// SQL at read time (store ListRunQueueReasons) so it never lags the pause; runToDTO leaves it nil.
+	// queued run back (queued, intake paused, run not admitted), or "weekly_reserve" (PRD #3522)
+	// while the owner's weekly usage reserve holds it (maintenance wins when both apply); absent
+	// otherwise. Derived in SQL at read time (store ListRunQueueReasons) so it never lags the
+	// pause; runToDTO leaves it nil.
 	QueueReason *string `json:"queue_reason,omitempty"`
-	PlanMd      *string `json:"plan_md"`
+	// ReserveHoldReason (PRD #3522) is the visible weekly-usage-reserve reason ("weekly usage
+	// reserve: 72% >= 70%" or "weekly usage reserve: weekly usage unknown") while this QUEUED run is
+	// held because the credential it would spend reads at or above the owner's threshold, or
+	// cannot be read. Absent otherwise; runToDTO fills it only while status is "queued".
+	ReserveHoldReason *string `json:"reserve_hold_reason,omitempty"`
+	PlanMd            *string `json:"plan_md"`
 	// PlanSource is where plan_md came from (PRD #209): "agent" for a normal run whose
 	// worker wrote the plan at the gate, "seeded" for a run created WITH a user-authored
 	// plan that skips planning + the approval gate. NOT NULL DEFAULT 'agent' in the DB
@@ -1412,9 +1419,16 @@ type RunSummaryItemDTO struct {
 	// to it; the reason string stays static, so nothing stored ever ages (D4).
 	DeadlineAt *time.Time `json:"deadline_at"`
 	// QueueReason (PRD #3454) is "maintenance" while instance maintenance mode holds this
-	// queued run back (queued, intake paused, run not admitted); absent otherwise. Derived in
-	// SQL at read time (store ListRunQueueReasons) so it never lags the pause; runToDTO leaves it nil.
+	// queued run back (queued, intake paused, run not admitted), or "weekly_reserve" (PRD #3522)
+	// while the owner's weekly usage reserve holds it (maintenance wins when both apply); absent
+	// otherwise. Derived in SQL at read time (store ListRunQueueReasons) so it never lags the
+	// pause; runToDTO leaves it nil.
 	QueueReason *string `json:"queue_reason,omitempty"`
+	// ReserveHoldReason (PRD #3522) is the visible weekly-usage-reserve reason ("weekly usage
+	// reserve: 72% >= 70%" or "weekly usage reserve: weekly usage unknown") while this QUEUED run is
+	// held because the credential it would spend reads at or above the owner's threshold, or
+	// cannot be read. Absent otherwise; runToDTO fills it only while status is "queued".
+	ReserveHoldReason *string `json:"reserve_hold_reason,omitempty"`
 	// PlanSource is where plan_md came from (PRD #209): "agent" for a normal run whose
 	// worker wrote the plan at the gate, "seeded" for a run created WITH a user-authored
 	// plan that skips planning + the approval gate. NOT NULL DEFAULT 'agent' in the DB
@@ -1935,6 +1949,7 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		HealthSince:                 item.HealthSince,
 		DeadlineAt:                  item.DeadlineAt,
 		QueueReason:                 item.QueueReason,
+		ReserveHoldReason:           item.ReserveHoldReason,
 		PlanSource:                  item.PlanSource,
 		GateRevision:                item.GateRevision,
 		SummaryIntent:               item.SummaryIntent,
@@ -2102,6 +2117,7 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			HealthSince:                 s.HealthSince,
 			DeadlineAt:                  s.DeadlineAt,
 			QueueReason:                 s.QueueReason,
+			ReserveHoldReason:           s.ReserveHoldReason,
 			PlanSource:                  s.PlanSource,
 			GateRevision:                s.GateRevision,
 			SummaryIntent:               s.SummaryIntent,

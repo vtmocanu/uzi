@@ -1138,6 +1138,12 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, wkr store.Worker, run 
 		if err != nil {
 			return nil, err
 		}
+		// PRD #3522 M3: the weekly usage reserve gates the judge lane on the credential judgeChoice
+		// resolved (a pinned judge token, the default, or the empty-pool default fallback); the
+		// auto ranker inside judgeChoice already filtered its pool. A nil gate is today's behaviour.
+		if herr := reserveGateFrom(ctx).checkChoice(choice); herr != nil {
+			return nil, herr
+		}
 		// Open with the SAME open-failed retry the run lane uses (PRD #1140 M2): before the
 		// extraction the judge lane opened directly, so an `auto` judge pick that would not
 		// decrypt failed terminally while the run lane floored onto another pooled token.

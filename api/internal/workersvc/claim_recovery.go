@@ -161,8 +161,12 @@ func (s *Service) finishRunClaim(ctx context.Context, run store.Run, payload *Cl
 		return nil, nil
 	}
 	assemblyErr = claudeCheckerClaimError(run, assemblyErr)
+	// errReserveHeld (PRD #3522 M3) is transient like errVaultLocked: the run returns to queued with
+	// the visible reserve reason. It is deliberately NOT mapped by claudeCheckerClaimError, so a held
+	// Claude checker stays queued and expires through its own cc.deadline_at path.
 	transient := errors.Is(assemblyErr, errVaultLocked) || errors.Is(assemblyErr, errAutoPoolEmpty) ||
-		errors.Is(assemblyErr, errCustomModelCapabilityMissing) || errors.Is(assemblyErr, errCrossCheckPinsCapabilityMissing)
+		errors.Is(assemblyErr, errCustomModelCapabilityMissing) || errors.Is(assemblyErr, errCrossCheckPinsCapabilityMissing) ||
+		errors.Is(assemblyErr, errReserveHeld)
 	// errCredentialDisabled is its own non-terminal classification (PRD #1732 D14): neither
 	// transient nor terminal, so it must pass this early return to reach the fenced park.
 	if assemblyErr != nil && !transient && !claimAssemblyTerminal(assemblyErr) &&
@@ -513,7 +517,9 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	case transient:
 		n, err = q.RequeueClaimAssemblyExact(ctx, store.RequeueClaimAssemblyExactParams{
 			PoolWait: errors.Is(decision, errAutoPoolEmpty),
-			ID:       run.ID, WorkerID: pgconv.UUID(identity.workerID), ClaimGeneration: run.ClaimGeneration,
+			// PRD #3522 M3: persisted only for a reserve hold; NULL leaves the column as it is.
+			ReserveHoldReason: pgconv.TextOrNull(reserveHeldReasonOf(decision)),
+			ID:                run.ID, WorkerID: pgconv.UUID(identity.workerID), ClaimGeneration: run.ClaimGeneration,
 		})
 	default:
 		failureReason := decision.Error()

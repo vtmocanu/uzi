@@ -216,6 +216,22 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	if isolated != wkr.IsolatedLane {
 		return nil, errIsolatedLaneMismatch
 	}
+	// PRD #3522 M3: the weekly usage reserve. The gate is nil unless the reserve applies to this
+	// run (a threshold is set, the run is not chat, no manual-resume override is active, and a
+	// started run's pause toggle is on), and then rides the context into every credential
+	// resolution below (claimSecretID, judgeChoice, autoChoice, autoFloorRetry), so the credential
+	// a claim finally spends is checked, not only the one ClaimRun admitted. A Codex run is checked
+	// HERE, before anything is minted or opened: a held Codex claim leaves no capability behind.
+	gate, gerr := s.reserveGateFor(ctx, run)
+	if gerr != nil {
+		return nil, gerr
+	}
+	ctx = gate.attach(ctx)
+	if run.Harness == harnessCodex {
+		if herr := gate.checkCodex(run); herr != nil {
+			return nil, herr
+		}
+	}
 	if run.Kind == runkind.Judge {
 		// PRD #1429 M3: the judge lane now threads the CLAIMING worker through too —
 		// assembleJudgeClaim's Codex branch needs it (codexClaimSecrets is worker-scoped),

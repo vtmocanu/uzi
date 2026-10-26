@@ -528,6 +528,69 @@ func (q *Queries) ListRateLimitsForUser(ctx context.Context, userID uuid.UUID) (
 	return items, nil
 }
 
+const listReserveClaudeTokens = `-- name: ListReserveClaudeTokens :many
+SELECT s.id            AS user_secret_id,
+       s.is_default    AS is_default,
+       s.auto_eligible AS auto_eligible,
+       (rl.user_secret_id IS NOT NULL)::boolean AS has_reading,
+       rl.seven_day_pct,
+       rl.seven_day_resets_at,
+       rl.synced_at
+FROM user_secrets s
+LEFT JOIN anthropic_rate_limits rl
+       ON rl.user_secret_id = s.id AND rl.enablement_rev = s.enablement_rev
+WHERE s.user_id = $1
+  AND s.kind = 'anthropic_token'
+  AND s.disabled_at IS NULL
+ORDER BY s.id
+`
+
+type ListReserveClaudeTokensRow struct {
+	UserSecretID     uuid.UUID          `json:"user_secret_id"`
+	IsDefault        bool               `json:"is_default"`
+	AutoEligible     bool               `json:"auto_eligible"`
+	HasReading       bool               `json:"has_reading"`
+	SevenDayPct      pgtype.Int2        `json:"seven_day_pct"`
+	SevenDayResetsAt pgtype.Timestamptz `json:"seven_day_resets_at"`
+	SyncedAt         pgtype.Timestamptz `json:"synced_at"`
+}
+
+// PRD #3522 M3: every ENABLED anthropic_token one user holds with the 7-day reading the weekly
+// usage reserve evaluates (usagereserve.EvaluateClaude), plus the two facts the reserve's lane
+// resolution needs: is_default (the credential an unbound lane opens) and auto_eligible (the
+// pooled set an auto lane draws from). Driven from user_secrets so a token with no reading
+// still appears (has_reading false, which the evaluator turns into "unknown", never "ok"). A
+// reading counts only at the token's current enablement revision, exactly like
+// ListAutoSelectCandidates, so a pre-disable reading cannot vouch for a re-enabled token. A
+// DISABLED token is not listed: it can never be opened, so the claim refuses it on its own.
+func (q *Queries) ListReserveClaudeTokens(ctx context.Context, userID uuid.UUID) ([]ListReserveClaudeTokensRow, error) {
+	rows, err := q.db.Query(ctx, listReserveClaudeTokens, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListReserveClaudeTokensRow{}
+	for rows.Next() {
+		var i ListReserveClaudeTokensRow
+		if err := rows.Scan(
+			&i.UserSecretID,
+			&i.IsDefault,
+			&i.AutoEligible,
+			&i.HasReading,
+			&i.SevenDayPct,
+			&i.SevenDayResetsAt,
+			&i.SyncedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const markAnthropicTokenRejected = `-- name: MarkAnthropicTokenRejected :execrows
 UPDATE user_secrets SET anthropic_rejected_at = clock_timestamp()
 WHERE id = $1 AND user_id = $2

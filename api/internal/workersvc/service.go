@@ -1597,6 +1597,15 @@ type Params struct {
 	// nobody chose.
 	Autoselect autoselect.Policy
 
+	// UsagePollInterval and CodexUsagePollInterval are the Claude and Codex usage poll cadences
+	// (config.UsagePollInterval / CodexUsagePollInterval): the weekly usage reserve (PRD #3522)
+	// treats a reading older than three of them as stale (usagereserve.Stale), the same rule the
+	// rate-limit surfaces apply. Zero (a poller disabled, or a forgotten field) makes every reading
+	// stale, so a user WITH a threshold reads "unknown" and is held, never silently unprotected;
+	// a user without one is unaffected.
+	UsagePollInterval      time.Duration
+	CodexUsagePollInterval time.Duration
+
 	// Anthropic usage-limit park (PRD #35), mirrored from config. RunLimitMaxWaits
 	// caps parks PER RUN; RunLimitMaxPark caps how far out ONE park may reach.
 	//
@@ -3364,6 +3373,21 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		custodyLimit = n
 	}
 	claimNow := s.now()
+	// PRD #3522 M3: the weekly usage reserve, read ONCE per claim. An owner with no threshold costs
+	// exactly one settings read (the OFF snapshot); an owner with one also reads their token and
+	// Codex readings and their workers' lanes. The snapshot feeds ClaimRun's reserve clause below
+	// and rides the context into assembly, so the credential the claim finally spends is checked
+	// against the SAME reading that admitted it. A read failure fails the claim closed (the handler
+	// answers 500 and the run stays queued), like the custody limit.
+	reserve, rerr := s.reserveSnapshot(ctx, wkr.UserID, claimNow)
+	if rerr != nil {
+		return nil, rerr
+	}
+	reservePeers, rerr := s.reserveBlockedWorkers(ctx, reserve)
+	if rerr != nil {
+		return nil, rerr
+	}
+	ctx = withReserveSnapshot(ctx, reserve)
 	// Issue #3142: the memory-authority gate applies to the run/ordinary lanes only (the
 	// cross_check lane never reaches a memory runtime). claimRunInTx recomputes it from the
 	// locked re-read capabilities. A held report clears the visibility entry; an absent
@@ -3445,6 +3469,7 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		// custom (non-curated) effective root then requires codex_custom_model_v1. Sorted server-side.
 		CodexCuratedModels: codexCuratedModelsSlice(),
 	}
+	reserveClaimParams(&params, reserve, wkr, reservePeers, claimNow)
 
 	// Bodyless claims also lock and re-read the worker in a separate statement.
 	// This serializes both lane and legacy child occupancy before ClaimRun's snapshot.
@@ -8281,6 +8306,9 @@ type SweepResult struct {
 	// partial index this reads covers only parked runs, a set that is empty on a
 	// healthy instance.
 	LimitPromoted int64
+	// ReserveMarked is the number of queued runs whose weekly-reserve hold marker this pass wrote or
+	// cleared (PRD #3522 M3). Only changes count: an owner whose markers are already right adds 0.
+	ReserveMarked int64
 	// PoolResumed is the number of runs this pass reactively resumed from pool_wait to
 	// queued because their owner's token pool became non-empty (PRD #754 M5). At most
 	// ONE per distinct held-run owner per tick (the anti-stampede stagger), so on a

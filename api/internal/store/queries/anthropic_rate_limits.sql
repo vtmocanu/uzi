@@ -389,3 +389,27 @@ SELECT EXISTS (
 -- future schema change ever loosened that cascade). Idempotent: 0 rows when there
 -- is nothing to drop.
 DELETE FROM anthropic_rate_limits WHERE user_id = $1;
+
+-- name: ListReserveClaudeTokens :many
+-- PRD #3522 M3: every ENABLED anthropic_token one user holds with the 7-day reading the weekly
+-- usage reserve evaluates (usagereserve.EvaluateClaude), plus the two facts the reserve's lane
+-- resolution needs: is_default (the credential an unbound lane opens) and auto_eligible (the
+-- pooled set an auto lane draws from). Driven from user_secrets so a token with no reading
+-- still appears (has_reading false, which the evaluator turns into "unknown", never "ok"). A
+-- reading counts only at the token's current enablement revision, exactly like
+-- ListAutoSelectCandidates, so a pre-disable reading cannot vouch for a re-enabled token. A
+-- DISABLED token is not listed: it can never be opened, so the claim refuses it on its own.
+SELECT s.id            AS user_secret_id,
+       s.is_default    AS is_default,
+       s.auto_eligible AS auto_eligible,
+       (rl.user_secret_id IS NOT NULL)::boolean AS has_reading,
+       rl.seven_day_pct,
+       rl.seven_day_resets_at,
+       rl.synced_at
+FROM user_secrets s
+LEFT JOIN anthropic_rate_limits rl
+       ON rl.user_secret_id = s.id AND rl.enablement_rev = s.enablement_rev
+WHERE s.user_id = @user_id
+  AND s.kind = 'anthropic_token'
+  AND s.disabled_at IS NULL
+ORDER BY s.id;

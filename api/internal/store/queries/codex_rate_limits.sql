@@ -442,3 +442,38 @@ WHERE a.user_id = @user_id AND a.id = @provider_account_id
         JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
         WHERE s.user_id = a.user_id AND s.provider_account_id = a.id AND s.status = 'linked'
     )::text = @enablement_sig::text;
+
+-- name: ListReserveCodexAliases :many
+-- PRD #3522 M3: every ENABLED Codex alias one user holds with the account reading the weekly
+-- usage reserve evaluates (usagereserve.EvaluateCodex). unmetered is true exactly for a
+-- 'static' alias (an OpenAI API key: structurally no subscription meter, so the reserve never
+-- gates it; decided by structure, never by a missing reading). Every other alias is metered:
+-- a linked alias reads its account's snapshot, and a staging/failed alias (no account yet)
+-- has no reading and therefore evaluates to "unknown". The reading is joined with the SAME
+-- current-reading rule GetCodexAccountRateLimitsForUser applies (every enabled linked alias of
+-- the account must appear in the stored enablement_sig at its current revision), so a reading
+-- from before a disable and re-enable reads as no reading until the next poll.
+SELECT s.user_secret_id AS alias_id,
+       (s.status = 'static')::boolean AS unmetered,
+       (rl.provider_account_id IS NOT NULL)::boolean AS has_reading,
+       rl.buckets,
+       rl.last_success_at
+FROM codex_credential_state s
+JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
+LEFT JOIN codex_account_rate_limits rl
+    ON rl.user_id = s.user_id AND rl.provider_account_id = s.provider_account_id
+    AND s.status = 'linked'
+    AND NOT EXISTS (
+        SELECT 1 FROM codex_credential_state cs
+        JOIN user_secrets cus ON cus.id = cs.user_secret_id AND cus.user_id = cs.user_id
+        WHERE cs.user_id = s.user_id AND cs.provider_account_id = s.provider_account_id AND cs.status = 'linked'
+            AND cus.disabled_at IS NULL
+            AND NOT CASE
+                WHEN rl.enablement_sig IS NULL THEN cus.enablement_rev = 0
+                ELSE (cus.id::text || ':' || cus.enablement_rev::text)
+                     = ANY (string_to_array(rl.enablement_sig, ','))
+            END
+    )
+WHERE s.user_id = @user_id
+  AND us.disabled_at IS NULL
+ORDER BY s.user_secret_id;

@@ -54,7 +54,8 @@ type V1JobDTO struct {
 	StartedAt        *time.Time `json:"started_at"`
 	FinishedAt       *time.Time `json:"finished_at"`
 	// QueueReason is "maintenance" while instance maintenance mode holds this queued job back
-	// (PRD #3454); absent otherwise. Status stays "queued".
+	// (PRD #3454), or "weekly_reserve" while the owner's weekly usage reserve holds it
+	// (PRD #3522); absent otherwise. Status stays "queued".
 	QueueReason *string `json:"queue_reason,omitempty"`
 	// Notice is create-only (POST /api/v1/jobs): a human-readable line, present while instance
 	// maintenance mode is active, saying the job is queued and starts when maintenance ends.

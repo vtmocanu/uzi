@@ -1143,6 +1143,58 @@ WITH claimant AS MATERIALIZED (
                AND (SELECT count(*) FROM recovery_custody_holds oh2
                       WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < @custody_hold_limit::int)
            OR (SELECT fn_custody_admission_count(@user_id::uuid, @heartbeat_cutoff::timestamptz)) < @custody_hold_limit::int)
+      -- PRD #3522 M3: the weekly usage reserve admission gate. @reserve_on is true only when the run
+      -- owner has a threshold set (users.weekly_reserve_pct); every other @reserve_* param is then
+      -- precomputed in Go (workersvc/usage_reserve.go, reserveSnapshot) from the owner's fresh
+      -- readings. A held run matches no row and stays queued. The exemption arms mirror Go's
+      -- reserveEnforced (chat is already excluded above): an active manual-resume override
+      -- (@reserve_override_ended lists run ids whose override ended early; empty until the reset
+      -- observation lands) and a previously started run while the pause toggle is off
+      -- (@reserve_pause_on). The credential arm mirrors Go's reserveHeld, in claimSecretID order:
+      --   Codex run        -> its frozen alias is blocked (api_key aliases are never in the list);
+      --   judge/self_improve -> the owner's judge-lane binding;
+      --   per-run override -> pinned id / default / auto pool (a pinned override with a NULL id
+      --                       falls through to the worker lane);
+      --   otherwise        -> the CLAIMING worker's lane (@reserve_worker_mode, static verdict
+      --                       @reserve_worker_static_blocked for pinned/default).
+      -- The auto arms hold only when something pooled WAS spendable but every such token is
+      -- blocked: an empty pool (or only the run's active dead-credential exclusion) keeps its
+      -- existing pool_wait behaviour. A pooled id is skippable-by-exclusion when the run's
+      -- limit_dead_secret_id names it while retry_not_before is still in the future (claimExcludeFor).
+      -- A reserve-marked queued run sorts after the owner's unmarked ones in the ORDER BY below.
+      AND (NOT @reserve_on::boolean
+           OR (COALESCE(r.reserve_exempt_until > @reserve_now::timestamptz, false) AND NOT (r.id = ANY(@reserve_override_ended::uuid[])))
+           OR (r.first_started_at IS NOT NULL AND NOT @reserve_pause_on::boolean)
+           OR NOT (
+               CASE
+                   WHEN r.harness = 'codex'
+                       THEN COALESCE(r.codex_secret_id = ANY(@reserve_blocked_codex::uuid[]), false)
+                   WHEN r.kind IN ('judge', 'self_improve')
+                       THEN CASE @reserve_judge_mode::text
+                           WHEN 'auto' THEN
+                               CASE
+                                   WHEN EXISTS (SELECT 1 FROM unnest(@reserve_permitted::uuid[]) pp
+                                                WHERE NOT COALESCE(r.retry_not_before > @reserve_now::timestamptz AND pp = r.limit_dead_secret_id, false))
+                                       THEN false
+                                   WHEN EXISTS (SELECT 1 FROM unnest(@reserve_pooled::uuid[]) pp
+                                                WHERE NOT COALESCE(r.retry_not_before > @reserve_now::timestamptz AND pp = r.limit_dead_secret_id, false))
+                                       THEN true
+                                   ELSE @reserve_owner_default_blocked::boolean
+                               END
+                           ELSE @reserve_judge_static_blocked::boolean
+                       END
+                   WHEN r.credential_override_mode = 'pinned' AND r.credential_override_secret_id IS NOT NULL
+                       THEN COALESCE(r.credential_override_secret_id = ANY(@reserve_blocked_claude::uuid[]), false)
+                   WHEN r.credential_override_mode = 'default'
+                       THEN @reserve_owner_default_blocked::boolean
+                   WHEN r.credential_override_mode = 'auto' OR @reserve_worker_mode::text = 'auto'
+                       THEN (EXISTS (SELECT 1 FROM unnest(@reserve_pooled::uuid[]) pp
+                                     WHERE NOT COALESCE(r.retry_not_before > @reserve_now::timestamptz AND pp = r.limit_dead_secret_id, false))
+                             AND NOT EXISTS (SELECT 1 FROM unnest(@reserve_permitted::uuid[]) pp
+                                             WHERE NOT COALESCE(r.retry_not_before > @reserve_now::timestamptz AND pp = r.limit_dead_secret_id, false)))
+                   ELSE @reserve_worker_static_blocked::boolean
+               END
+           ))
       -- PRD #1226 M1 (D2): the NON-BYPASSABLE completion-protocol claim clause. An
       -- INTERLOCKED run (completion_contract_version IS NOT NULL) may be claimed ONLY by a
       -- worker whose SELF-REPORTED protocol_capabilities contain 'completion_interlock_v1';
@@ -1531,6 +1583,26 @@ WITH claimant AS MATERIALIZED (
                 AND ((r.egress_profile_id IS NOT NULL) = p.isolated_lane)
                 AND (r.egress_profile_id IS NULL OR 'isolated_fetch_v1' = ANY(p.protocol_capabilities))
                 AND (r.egress_profile_id IS NULL OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL))
+                -- PRD #3522 M3: never DEFER a worker-lane run to a peer whose own Anthropic lane the
+                -- weekly reserve blocks (@reserve_blocked_worker_ids, the owner's workers whose bind
+                -- mode resolves to a blocked token or an all-blocked auto pool): that peer's
+                -- ClaimRun would hold the run, and deferring to it would leave the run unclaimed
+                -- until @spread_cutoff. Only a run whose credential is chosen by the claiming
+                -- WORKER is affected: Codex, judge/self_improve and per-run override runs resolve
+                -- their credential independently of the peer, and an exempt run is not gated. The
+                -- list is computed without the run's dead-credential exclusion; the spread is advisory
+                -- and fails open at @spread_cutoff, so that approximation can delay a deferral but
+                -- never strand a run.
+                AND NOT (
+                    @reserve_on::boolean
+                    AND NOT (COALESCE(r.reserve_exempt_until > @reserve_now::timestamptz, false) AND NOT (r.id = ANY(@reserve_override_ended::uuid[])))
+                    AND NOT (r.first_started_at IS NOT NULL AND NOT @reserve_pause_on::boolean)
+                    AND r.harness IS DISTINCT FROM 'codex'
+                    AND r.kind NOT IN ('judge', 'self_improve')
+                    AND NOT (r.credential_override_mode = 'pinned' AND r.credential_override_secret_id IS NOT NULL)
+                    AND COALESCE(r.credential_override_mode, '') NOT IN ('default', 'auto')
+                    AND p.id = ANY(@reserve_blocked_worker_ids::uuid[])
+                )
                 AND pa.active < p.max_concurrent_runs
                 AND pa.active * (SELECT w.max_concurrent_runs FROM workers w WHERE w.id = @worker_id)
                     < (SELECT count(*) FROM runs mr
@@ -1614,7 +1686,14 @@ WITH claimant AS MATERIALIZED (
     -- level. @background_grace_cutoff (now − RUN_BACKGROUND_GRACE) is the D4
     -- fail-open: a demoted run created before it reads as stale, so
     -- fn_run_priority returns normal and background work never starves.
+    --
+    -- PRD #3522 M3: a queued run carrying a weekly-reserve hold marker (reserve_hold_reason, written by
+    -- the sweeper's markReserveHolds pass) sorts AFTER the owner's unmarked runs, right after the
+    -- affinity key. Held runs are filtered out of `target` above, so the marker only matters where a
+    -- stale marker outlives the reading that set it: the run is still claimable, it just does not
+    -- starve unmarked siblings while the sweeper catches up.
     ORDER BY COALESCE(r.worker_id = @worker_id, false) DESC,
+             (r.reserve_hold_reason IS NOT NULL) ASC,
              fn_run_priority(r.kind, r.priority, r.created_at < @background_grace_cutoff) DESC,
              r.created_at ASC
     FOR UPDATE SKIP LOCKED
@@ -1684,6 +1763,9 @@ UPDATE runs SET
     -- credential_disabled park of this claimed run, a sweeper wall park, a completion hold) shows
     -- "not reported" instead of an older park's value. Display-only.
     checkpoint_contains_latest = NULL,
+    -- PRD #3522 M3: leaving 'queued' drops the weekly-reserve hold marker; the visible reason only
+    -- describes a queued run.
+    reserve_hold_reason = NULL,
     -- Exit contract (PRD #47 Decision 3): leaving 'queued' clears any health flag
     -- the detector raised (e.g. "no worker online"). health_notified_at is NOT reset.
     health = 'ok', health_reason = NULL, health_since = NULL
@@ -5759,6 +5841,10 @@ UPDATE runs SET
     budget_paused_seconds = CASE WHEN @pool_wait::boolean THEN 0 ELSE runs.budget_paused_seconds END,
     health = 'ok', health_reason = NULL, health_since = NULL,
     codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
+    -- PRD #3522 M3: a claim that resolved onto a credential the weekly reserve blocks (the reading
+    -- changed after admission) persists the visible reason here; only set when supplied, and the
+    -- sweeper's markReserveHolds pass keeps it current afterwards. No other counter or stamp moves.
+    reserve_hold_reason = COALESCE(sqlc.narg('reserve_hold_reason')::text, runs.reserve_hold_reason),
     updated_at = now()
 WHERE runs.id = @id AND runs.worker_id = @worker_id AND runs.claim_generation = @claim_generation
   AND runs.status = 'claimed'
@@ -9863,7 +9949,10 @@ SELECT id, user_id, status, auto_approve,
        -- PRD #3454: a queued run the instance intake pause holds (paused AND not admitted); queuedReason
        -- reports it as reasonMaintenance, ahead of every worker-side rung.
        ((SELECT fn_instance_intake_paused()) AND status = 'queued'
-        AND NOT fn_run_admitted_during_intake_pause(runs))::boolean AS intake_pause_held
+        AND NOT fn_run_admitted_during_intake_pause(runs))::boolean AS intake_pause_held,
+       -- PRD #3522 M3: the weekly-reserve hold marker of a queued run ('' otherwise; sqlc types a
+       -- COALESCE column non-null); healthTargetFor reports it right after maintenance.
+       COALESCE(CASE WHEN status = 'queued' THEN reserve_hold_reason END, '')::text AS reserve_hold_reason
 FROM runs
 WHERE status IN ('queued', 'running', 'awaiting_approval')
   AND kind <> 'chat';
@@ -9993,6 +10082,12 @@ WHERE w.user_id = @user_id
 -- claim would allow. That only softens a "restart worker" hint and never grants a claim.
 -- Issue #2184: preserve the advisory availability projection separately from strict health
 -- eligibility. Static requirements compose on ONE candidate; strict counts ignore slots.
+--
+-- PRD #3522 M3: deliberately LANE-AGNOSTIC for the weekly usage reserve. This counts which workers
+-- could claim the run structurally; a reserve hold is a property of the run's credential, not of
+-- any worker's availability, and the health resolver reports it through its own queued-run reason
+-- (ListActiveRunsForHealth.reserve_hold_reason, read by healthTargetFor), so folding it in here
+-- would turn "weekly reserve" into a bogus "no worker can claim" reading.
 WITH candidates AS (
 SELECT w.id,
        (run.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, run, false, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = run.id), @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))::boolean AS strict_candidate,
@@ -10628,6 +10723,10 @@ WHERE r.status = 'queued'
   -- PRD #3454: while intake is paused only admitted runs (replacements) may drive provisioning, so
   -- blocked roots cannot fill the bounded batch; provisionOne re-checks under the advisory lock.
   AND (NOT (SELECT fn_instance_intake_paused()) OR fn_run_admitted_during_intake_pause(r))
+  -- PRD #3522 M3: a run the weekly usage reserve holds (reserve_hold_reason, set by the sweeper's
+  -- markReserveHolds only when every claimant lane, the ephemeral lane included, is blocked) would
+  -- be claimed by no worker, so it must not drive provisioning; provisionOne re-checks live.
+  AND r.reserve_hold_reason IS NULL
 ORDER BY fn_run_priority(r.kind, r.priority, r.created_at < @background_grace_cutoff) DESC, r.created_at ASC
 LIMIT @max_rows;
 
@@ -10906,6 +11005,10 @@ WHERE r.status = 'queued'
   -- PRD #3454: while intake is paused only admitted runs (replacements) may drive provisioning, so
   -- blocked roots cannot fill the bounded batch; provisionOne re-checks under the advisory lock.
   AND (NOT (SELECT fn_instance_intake_paused()) OR fn_run_admitted_during_intake_pause(r))
+  -- PRD #3522 M3: a run the weekly usage reserve holds (reserve_hold_reason, set by the sweeper's
+  -- markReserveHolds only when every claimant lane, the ephemeral lane included, is blocked) would
+  -- be claimed by no worker, so it must not drive provisioning; provisionOne re-checks live.
+  AND r.reserve_hold_reason IS NULL
 ORDER BY fn_run_priority(r.kind, r.priority, r.created_at < @background_grace_cutoff) DESC, r.status_since ASC
 LIMIT @max_rows;
 
@@ -10961,6 +11064,10 @@ WHERE r.status = 'queued'
   -- PRD #3454: while intake is paused only admitted runs (replacements) may drive provisioning, so
   -- blocked roots cannot fill the bounded batch; provisionOne re-checks under the advisory lock.
   AND (NOT (SELECT fn_instance_intake_paused()) OR fn_run_admitted_during_intake_pause(r))
+  -- PRD #3522 M3: a run the weekly usage reserve holds (reserve_hold_reason, set by the sweeper's
+  -- markReserveHolds only when every claimant lane, the ephemeral lane included, is blocked) would
+  -- be claimed by no worker, so it must not drive provisioning; provisionOne re-checks live.
+  AND r.reserve_hold_reason IS NULL
 ORDER BY fn_run_priority(r.kind, r.priority, r.created_at < @background_grace_cutoff) DESC, r.created_at ASC
 LIMIT @max_rows;
 

@@ -221,6 +221,7 @@
   "health_since": "2020-01-02T03:04:05Z",
   "deadline_at": "2020-01-02T03:04:05Z",
   "queue_reason": "x",
+  "reserve_hold_reason": "x",
   "plan_source": "x",
   "gate_revision": 1,
   "summary_intent": "x",

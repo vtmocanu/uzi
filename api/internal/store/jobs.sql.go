@@ -517,7 +517,7 @@ const getJobForCaller = `-- name: GetJobForCaller :one
 SELECT r.id, r.job_type, r.status, r.issue_title AS title, r.failure_reason, r.fail_origin,
        r.budget_wall_seconds, r.created_at, r.started_at, r.finished_at, r.updated_at,
        o.product_id, o.product_token_id, o.requested_by_label,
-       (CASE WHEN r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r) THEN 'maintenance' ELSE '' END)::text AS queue_reason
+       (CASE WHEN r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r) THEN 'maintenance' WHEN r.status = 'queued' AND r.reserve_hold_reason IS NOT NULL THEN 'weekly_reserve' ELSE '' END)::text AS queue_reason
   FROM runs r
   JOIN job_origins o ON o.run_id = r.id
  WHERE r.id = $1
@@ -936,7 +936,7 @@ const listJobsForCaller = `-- name: ListJobsForCaller :many
 SELECT r.id, r.job_type, r.status, r.issue_title AS title, r.failure_reason, r.fail_origin,
        r.budget_wall_seconds, r.created_at, r.started_at, r.finished_at, r.updated_at,
        o.product_id, o.product_token_id, o.requested_by_label,
-       (CASE WHEN r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r) THEN 'maintenance' ELSE '' END)::text AS queue_reason
+       (CASE WHEN r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r) THEN 'maintenance' WHEN r.status = 'queued' AND r.reserve_hold_reason IS NOT NULL THEN 'weekly_reserve' ELSE '' END)::text AS queue_reason
   FROM runs r
   JOIN job_origins o ON o.run_id = r.id
  WHERE r.kind = 'job'

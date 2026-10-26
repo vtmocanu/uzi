@@ -388,10 +388,13 @@ func (q *Queries) ListMaintenanceQueuedRuns(ctx context.Context) ([]ListMaintena
 
 const listRunQueueReasons = `-- name: ListRunQueueReasons :many
 SELECT r.id AS run_id,
-       'maintenance'::text AS queue_reason
+       (CASE WHEN (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r)
+             THEN 'maintenance' ELSE 'weekly_reserve' END)::text AS queue_reason
 FROM runs r
 WHERE r.id = ANY($1::uuid[])
-  AND r.status = 'queued' AND (SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r)
+  AND r.status = 'queued'
+  AND (((SELECT fn_instance_intake_paused()) AND NOT fn_run_admitted_during_intake_pause(r))
+       OR r.reserve_hold_reason IS NOT NULL)
 `
 
 type ListRunQueueReasonsRow struct {
@@ -400,8 +403,9 @@ type ListRunQueueReasonsRow struct {
 }
 
 // PRD #3454: the derived queue_reason for a set of runs, evaluated at read time so it never lags
-// the pause. Only runs that are queued, not admitted, while intake is paused are returned (reason
-// "maintenance"); every other id is absent.
+// the pause. A queued run that is not admitted while intake is paused reads "maintenance"; PRD
+// #3522: a queued run carrying a weekly-reserve hold marker otherwise reads "weekly_reserve"
+// (maintenance wins when both apply). Every other id is absent.
 func (q *Queries) ListRunQueueReasons(ctx context.Context, runIds []uuid.UUID) ([]ListRunQueueReasonsRow, error) {
 	rows, err := q.db.Query(ctx, listRunQueueReasons, runIds)
 	if err != nil {

@@ -253,6 +253,9 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		Health:        r.Health,
 		HealthReason:  textPtrValue(r.HealthReason.Valid, r.HealthReason.String),
 		HealthSince:   timePtr(r.HealthSince.Valid, r.HealthSince.Time),
+		// PRD #3522: the weekly-usage-reserve reason, only while the run is queued (the marker
+		// describes a queued run; ClaimRun clears it on claim).
+		ReserveHoldReason: reserveHoldReasonPtr(r),
 		// PRD #1170: the server-computed wall-clock deadline the near-timeout badge
 		// counts down to. RunDeadline returns nil for a run with no wall deadline
 		// (not running, chat/judge/interactive, or no started_at).
@@ -723,6 +726,15 @@ func (h *Handler) overlayCodexAccountActions(ctx context.Context, dtos ...*apity
 			}
 		}
 	}
+}
+
+// reserveHoldReasonPtr is the DTO's reserve_hold_reason: the persisted marker, only while the run
+// is queued, nil otherwise.
+func reserveHoldReasonPtr(r store.Run) *string {
+	if r.Status != "queued" || !r.ReserveHoldReason.Valid {
+		return nil
+	}
+	return textPtrValue(true, r.ReserveHoldReason.String)
 }
 
 // queueReasonPtr maps a SQL-derived queue_reason column (” = none) to the wire pointer.

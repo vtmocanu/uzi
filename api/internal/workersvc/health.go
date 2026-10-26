@@ -29,6 +29,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/usagereserve"
 )
 
 // ReasonWorkersUpgrading is shared with fleet.capacity's stored-reason confirmation.
@@ -505,6 +506,11 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		if reason == reasonMaintenance {
 			nudge = false
 		}
+		// PRD #3522 M3: the weekly usage reserve is the owner's own deliberate limit, not a stuck
+		// run; a worker-pickup nudge would say the opposite of the truth. State still written below.
+		if isReserveHoldReason(reason) {
+			nudge = false
+		}
 		// Issues #2705/#3000: both owner-hold reasons are expected waiting; a worker-pickup
 		// nudge would be noise. Match the prefix shared by their deadline and worker name.
 		if isStaleRequeuePinReason(reason) {
@@ -517,8 +523,13 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 			(r.Status == "running" && isManualCordonWaitReason(reason)) {
 			nudge = false
 		}
+		// PRD #3522 M3: a run leaving the reserve hold (the line was raised, the week reset) but
+		// still waiting restarts its "stuck for" clock like leaving maintenance, so the hold is not
+		// counted as time stuck; it is not nudge-eligible on that tick either (r.Health is not ok).
+		leftReserve := target != healthOK && r.Health == healthWaitingWorker && r.HealthReason.Valid &&
+			isReserveHoldReason(r.HealthReason.String) && !isReserveHoldReason(reason)
 		since := healthSince(now, target, r)
-		if leftPin || leftMaintenance {
+		if leftPin || leftMaintenance || leftReserve {
 			since = pgconv.Time(now)
 		}
 		notifiedAt := pgtype.Timestamptz{}
@@ -551,6 +562,12 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 	return changed
 }
 
+// isReserveHoldReason reports a health reason that is a weekly-usage-reserve hold text
+// (usagereserve.HeldReason or UnknownReason).
+func isReserveHoldReason(reason string) bool {
+	return strings.HasPrefix(reason, usagereserve.ReasonPrefix)
+}
+
 // healthTargetFor computes the (flag, reason) a run should carry now. It returns
 // (healthOK, "") when the run looks healthy, which the caller writes as a
 // self-clear. Exactly one flag per run; the running-run priority is inside
@@ -571,6 +588,14 @@ func (s *Service) healthTargetFor(ctx context.Context, now time.Time, r store.Li
 		// real status change with an incidental row write and reset this clock).
 		if th.queued == 0 {
 			return healthOK, ""
+		}
+		// PRD #3522 M3: a run the owner's weekly usage reserve holds is explained from the first
+		// tick, not after the queued threshold: the owner set the line on purpose and the reason is
+		// the answer to "why is it not starting". The reason IS the persisted reserve text. The
+		// intake pause (reasonMaintenance) still outranks it, so a paused instance keeps its own
+		// pill; a run past the age gate resolves it in queuedReason, in the same order.
+		if !r.IntakePauseHeld && r.ReserveHoldReason != "" {
+			return healthWaitingWorker, r.ReserveHoldReason
 		}
 		// Issue #2705: a run held for its returning worker is explained from the first tick of the
 		// hold, not after the queued threshold. Issue #2501: the unambiguous, persistent
@@ -1168,6 +1193,12 @@ func (s *Service) queuedReasonWithEligibility(ctx context.Context, now time.Time
 	// pause is the reason ClaimRun matches nothing.
 	if r.IntakePauseHeld {
 		return reasonMaintenance
+	}
+	// PRD #3522 M3: the weekly usage reserve is the next most fundamental cause: ClaimRun matches no
+	// row for the run whatever the fleet looks like, so none of the worker-side rungs below is
+	// the reason. The reason is the persisted reserve text.
+	if r.ReserveHoldReason != "" {
+		return r.ReserveHoldReason
 	}
 	// PRD #400 Decision 6 / issue #1367: an undispatched task run (its uzi/task/<id> branch
 	// push or dispatch never landed) is NOT waiting for a worker — ClaimRun never offers it

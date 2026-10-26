@@ -1548,7 +1548,8 @@ export interface ReleaseCheckStatus {
 
 // QueueReason is why a queued run is held back by the instance, beyond waiting for a
 // worker. Only "maintenance" exists today.
-export type QueueReason = "maintenance";
+/** "weekly_reserve" (PRD #3522): the owner's weekly usage reserve holds this queued run. */
+export type QueueReason = "maintenance" | "weekly_reserve";
 
 // MaintenanceState is `GET /api/maintenance` (any signed-in user): whether intake is paused,
 // since when, and the admin's plain-text reason. Render the reason via stripDisplayCell.
@@ -3193,6 +3194,9 @@ export interface Run {
   /** PRD #3454: "maintenance" while instance maintenance mode holds this queued run back
    *  (see LatestRun.queue_reason). Optional for api/web rollout skew. */
   queue_reason?: QueueReason | null;
+  /** PRD #3522: why the weekly usage reserve holds this queued run (e.g. "weekly usage reserve:
+   *  72% >= 70%"); absent when not held or not queued. */
+  reserve_hold_reason?: string | null;
   /** PRD #320 D8: the run's queue-priority CLASS, computed server-side (see RunPriority).
    *  Only a QUEUED run is ever non-"normal"; a running/terminal run renders no pill. It
    *  rides the shared run embed (RunListItemDTO embeds RunDTO), so it is present on BOTH
