@@ -408,11 +408,16 @@ function realExclusion(runner: () => unknown, runId: string, dockerHost: string)
 
 const SUPPRESSED_REASON = "pre-slot production bundle path suppressed by the harness";
 /** Gate eligibility. Every run installs the produceRecoveryBundle suppression, so none qualifies for a C2 PASS. */
-function eligibility(spec: { real: boolean; origin: "repo" | "tiny"; controlLimits?: unknown }): { eligible: boolean; reasons: string[] } {
+/** The Spec fields that exist only for controls: a real measurement must set none of them. */
+function controlFields(spec: Partial<Spec>): string[] {
+  return (["sourceRoot", "controlArchive", "controlLimits", "decodedCap"] as const).filter(key => spec[key] !== undefined);
+}
+
+function eligibility(spec: Partial<Spec> & { real: boolean; origin: "repo" | "tiny" }): { eligible: boolean; reasons: string[] } {
   const reasons: string[] = [];
   if (!spec.real) reasons.push("control run (stubbed exclusion and quiescence)");
   if (spec.origin !== "repo") reasons.push("not a clone of the source repository");
-  if (spec.controlLimits) reasons.push("limits lowered at evaluation time");
+  if (controlFields(spec).length > 0) reasons.push("control-only field(s) set: " + controlFields(spec).join(", "));
   reasons.push(SUPPRESSED_REASON);
   return { eligible: reasons.length === 0, reasons };
 }
@@ -438,6 +443,10 @@ async function runPipeline(t: TestContext, spec: Spec): Promise<RunResult> {
     ({ record: emit({ ...head, ...body, verdict: evaluation.verdict, verdict_detail: evaluation }), evaluation });
   const unrun = (reason: string, body: Record<string, unknown> = {}) =>
     finish(evaluate({ unrun: reason, limits: {}, elapsedLimitMs: SLOT_ELAPSED_LIMIT_MS, elapsedMs: 0, phases: [], deviation: env.deviation }), { ...body, reason });
+
+  // ---- control-only seams never reach a real measurement
+  if (spec.real && controlFields(spec).length > 0)
+    return unrun("a real measurement carries control-only field(s): " + controlFields(spec).join(", "));
 
   // ---- the two-source family cannot be reached through production code: UNRUN, nothing else asserted
   if (spec.family) return unrun(FAMILY_UNREACHABLE, { family_reachability: FAMILY_UNREACHABLE });
@@ -950,10 +959,20 @@ describe("#3031 composed measurement verdict controls", () => {
   });
 
   it("control: runPipeline returns UNRUN for a failing source precondition and runs nothing else", async t => {
-    const { record, evaluation } = await runPipeline(t, { label: "control-source", layout: "shared", shape: "A", origin: "repo", real: true, sourceRoot: path.join(os.tmpdir(), "measure-3031-no-such-source") });
+    const { record, evaluation } = await runPipeline(t, { label: "control-source", layout: "shared", shape: "A", origin: "repo", real: false, sourceRoot: path.join(os.tmpdir(), "measure-3031-no-such-source") });
     assert.equal(evaluation.verdict, "UNRUN");
     assert.match(String(record.reason), /inaccessible/);
     assert.equal(record.w0_invocations, undefined);
+  });
+
+  it("control: a real measurement spec with a control-only field is refused and is never eligible", async t => {
+    const { evaluation, record } = await runPipeline(t, { label: "control-guard", layout: "shared", shape: "A", origin: "tiny", real: true, controlArchive: "skip" });
+    assert.equal(evaluation.verdict, "UNRUN");
+    assert.match(String(record.reason), /control-only field\(s\): controlArchive/);
+    for (const spec of [{ sourceRoot: "/x" }, { controlArchive: "skip" as const }, { controlLimits: (l: Limits) => l }, { decodedCap: 1 }]) {
+      const e = eligibility({ real: true, origin: "repo", ...spec });
+      assert.ok(e.reasons.some(r => r.startsWith("control-only field(s) set")), JSON.stringify(Object.keys(spec)));
+    }
   });
 
   it("control: the two-source family variant is UNRUN with the reachability reason and is never eligible for the gate", async t => {
