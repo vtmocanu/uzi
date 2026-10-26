@@ -574,6 +574,55 @@ MEASURE elapsed=1354
   `EMFILE` under a low `RLIMIT_NOFILE` refuses safely; the ceiling is
   unmeasured.
 
+### Composed measurement harness (C2, #3442)
+
+`agent/test/measure-3031-composed.test.ts` is the harness for the composed capacity
+gate. It records no verdict here: the measurement has not been run on a candidate,
+and only a recorded PASS releases C3. The producer guard stays `false`; the harness
+changes no production code.
+
+It drives one complete pipeline per measurement through the real `RunRunner` and the
+real `RecoveryCoordinator` admission, in one charged slot with the production caps:
+W0-H capture, `importMaintenanceTip` (walk, selection, pack, proof, import), then the
+archive phase (`produceRecoveryBundle`, self-contained first, guarded thin fallback only
+on `RecoveryBundleTooLargeError`). The writer-exclusion proof and the quiescence scans are
+the real ones (three exclusion passes and the family proofs are charged inside the slot).
+Only two substitutions are allowed, and every MEASURE line prints them: the guard method
+and a faked server behind the real strict client. Every limit is read from the admitted
+slot reservation in the ledger, never from a table, and `decoded` follows the configured C.
+
+Run it as the container's main process on Linux, on the worker image's Git and Node,
+from a full (non-shallow, at least 1,000 commits) checkout of this repository:
+
+```sh
+UZI_MEASURE_3031=1 UZI_MEASURE_DOCKER_HOST=tcp://<dind>:2375 \
+  node --import tsx --test --test-timeout=120000 test/measure-3031-composed.test.ts
+```
+
+- `UZI_MEASURE_DOCKER_HOST` is the Docker daemon the worker is wired to; the exclusion
+  proof and quiescence scans probe it for real. Unset, the run reports UNRUN.
+- `TMPDIR` must be a case-sensitive, container-internal directory whose ancestors are not
+  group-writable, world-writable or sticky (as `/data` is). Otherwise UNRUN with the reason.
+- The measurement must be the only test process: the exclusive-idle scan refuses any other
+  writer. Run it as PID 1 of the container, not through a long-lived `docker exec` shell.
+- `UZI_MEASURE_DEVIATION` states any difference from the worker image's environment. It
+  becomes `elapsed_fidelity: "unverified: <text>"`, and a would-be PASS is then reported as
+  `counters_within_limits_elapsed_unverified`. It never relaxes a limit or the slot deadline.
+
+Output is one `MEASURE {json}` line per layout (shared, dissociated) by shape (A, B, C) and
+per two-source family variant, a loose-object ladder above the shape-C count, and a ceiling
+summary. Each line carries per-phase counters for every slot dimension, the limit compared
+with, real `rpcAttempts`, elapsed time, RSS, Git and Node versions, substitutions, archive
+kind, bytes and the per-bundle cap, and `count-objects -v` per fixture clone. Shape C uses
+196 loose objects, the largest observed in a read-only sample of hosted worker attempt
+clones (not a fleet maximum). A refusal (layout, quiescence, admission, resource exhaustion)
+is recorded with its phase and the phases left unrun and is never a counter PASS. The
+two-source family is preservation-only (U4) and never counts as whole-family preservation.
+
+The verdict controls (`measure-3031-composed.test.ts`, "verdict controls") run without the
+environment variable, on a small fixture, and are the only runs that stub exclusion and
+quiescence; their lines are marked as not eligible for the gate.
+
 
 ## U4b delivery (#3441), producer disabled
 
