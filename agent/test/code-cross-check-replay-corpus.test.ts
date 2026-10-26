@@ -26,7 +26,7 @@ const patchLines = (patch: Buffer): string[] => patch.toString("utf8").split("\n
 const added = (patch: Buffer): string[] => patchLines(patch).filter((l) => l.startsWith("+") && !l.startsWith("+++"));
 const removedLines = (patch: Buffer): string[] => patchLines(patch).filter((l) => l.startsWith("-") && !l.startsWith("---"));
 
-before(async () => { corpus = await loadReplayCorpus(CHECKOUT); });
+before(async () => { corpus = await loadReplayCorpus(CHECKOUT, { profile: "revised" }); });
 
 describe("committed replay corpus (hermetic)", () => {
   it("loads with the source-pinned manifest hash and verifies every pin and artifact", async () => {

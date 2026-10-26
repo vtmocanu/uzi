@@ -1330,6 +1330,9 @@ export interface ClaimPlanCrossCheck {
 }
 
 export interface ClaimCodeCrossCheck extends Omit<ClaimPlanCrossCheck, "stage" | "planning_diff"> {
+  coverage_supported?: boolean;
+  /** Computed locally from Git, never trusted from a server claim. */
+  code_inventory?: import("./code-cross-check-coverage.js").CodeInventory;
   stage: "code";
   head_commit: string;
   /** Fresh default tip bound independently of repository-instructions consent; absent on legacy claims. */

@@ -212,12 +212,12 @@ it("code checker uses the confined provider and file broker and returns only fin
  assert.match(input, /<code_context_[a-f0-9]{32}>/);
 });
 
-// PRD #2170. The goldens are the sha256 of the pre-change brief and nonce-stripped DATA prompt for
-// codeClaim() (computed from the tree before owner guidance and repository instructions existed).
+// PRD #3167 M2: coverage brief and nonce-stripped DATA prompt goldens.
+// These are separate from the byte-frozen pre-M2 replay corpus pins.
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 const stripNonces = (text: string) => text.replace(/_[a-f0-9]{32}>/g, "_NONCE>");
-const GOLDEN_CODE_PROMPT = "40aa10669f27861a6f35882e8c95b82b67979a37b738cb53c01506ff1eda0f03";
-const GOLDEN_CODEX_CODE_BRIEF = "29e410c44476fb6e2560fd03c2d990de24cee2193e6df6c250085cb1b39252a5";
+const GOLDEN_CODE_PROMPT = "f95c12b182d1a8b0b4426cfb0d52558d982a7da3965c860456e935d3ba201581";
+const GOLDEN_CODEX_CODE_BRIEF = "d8dd1257d920c6aa5f467d54f7a7b169ef445facf05932d45790d7f500fc5841";
 
 async function codeRequests(c: ClaimResponse) {
  const r = rig({ claim: c, notes: (emit) => r.terminal(emit, '{"findings":[]}') });

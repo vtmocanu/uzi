@@ -18,6 +18,7 @@ import {
 } from "./code-cross-check-replay.js";
 
 export interface ReplayCliDeps {
+  profile?: import("./code-cross-check-replay-profiles.js").ReplayProfile;
   checkout: string;
   env: NodeJS.ProcessEnv;
   write: (line: string) => void;
@@ -104,7 +105,7 @@ async function agentVersion(checkout: string): Promise<string> {
 }
 
 async function runVerify(deps: ReplayCliDeps, signal: AbortSignal, scratch: string): Promise<number> {
-  const corpus = await loadReplayCorpus(deps.checkout, { manifestSha256: deps.manifestSha256 });
+  const corpus = await loadReplayCorpus(deps.checkout, { manifestSha256: deps.manifestSha256, profile: deps.profile });
   const materialize = deps.materialize ?? materializeCase;
   for (const c of corpus.cases) {
     signal.throwIfAborted();
@@ -126,7 +127,7 @@ async function runReplayCommand(
 ): Promise<number> {
   // Before any case, checker or credential: a helper uid that cannot reach the snapshot fails fast.
   if (deps.layout?.split ?? uidSplitActive()) await assertSnapshotTraversable(scratch);
-  const corpus = await loadReplayCorpus(deps.checkout, { manifestSha256: deps.manifestSha256 });
+  const corpus = await loadReplayCorpus(deps.checkout, { manifestSha256: deps.manifestSha256, profile: deps.profile });
   const now = deps.now ?? Date.now;
   const uzi_head = deps.uziHead ? await deps.uziHead() : await hermeticGit(["rev-parse", "HEAD"], deps.checkout);
   const checkerVersion = { uzi_head, agent_version: await agentVersion(deps.checkout) };
@@ -156,7 +157,7 @@ async function runScore(deps: ReplayCliDeps, args: string[]): Promise<number> {
   let adjudicationsFile: string | undefined;
   if (args.length === 3 && args[1] === "--adjudications") adjudicationsFile = args[2];
   else if (args.length !== 1) { deps.write(JSON.stringify({ error: "invalid_cli" })); return 1; }
-  const corpus = await loadReplayCorpus(deps.checkout, { manifestSha256: deps.manifestSha256 });
+  const corpus = await loadReplayCorpus(deps.checkout, { manifestSha256: deps.manifestSha256, profile: deps.profile });
   const readInput = async (file: string, max: number, code: "records_invalid" | "adjudication_invalid"): Promise<Buffer> => {
     let bytes: Buffer | null = null;
     try { bytes = await readReplayFile(path.resolve(deps.checkout, file), max); } catch { /* mapped below */ }
@@ -174,6 +175,15 @@ async function runScore(deps: ReplayCliDeps, args: string[]): Promise<number> {
 
 /** Signal handlers precede startup and stay installed until cleanup has settled. */
 export async function runReplayCli(args: string[], deps: ReplayCliDeps): Promise<number> {
+  const profileIndex = args.indexOf("--profile");
+  if (profileIndex !== -1) {
+    const profile = args[profileIndex + 1];
+    if ((profile !== "baseline" && profile !== "revised") || args.lastIndexOf("--profile") !== profileIndex) {
+      deps.write(JSON.stringify({ error: "invalid_cli" })); return 1;
+    }
+    deps = { ...deps, profile };
+    args = [...args.slice(0, profileIndex), ...args.slice(profileIndex + 2)];
+  }
   const [command, ...rest] = args;
   const fail = (error: string): number => { deps.write(JSON.stringify({ error })); return 1; };
   let parsed: ReplayArgs | null = null;

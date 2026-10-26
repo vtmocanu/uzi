@@ -22,7 +22,15 @@ const tc: TempCorpus = await buildTempCorpus();
 after(() => tc.cleanup());
 const scratch = path.join(tc.root, "scratch");
 const sha256 = (s: string | Uint8Array): string => createHash("sha256").update(s).digest("hex");
-const load = (): Promise<ReplayCorpus> => loadReplayCorpus(tc.checkout, { manifestSha256: tc.manifestSha256 });
+const load = (): Promise<ReplayCorpus> => loadReplayCorpus(tc.checkout, { profile: "revised", manifestSha256: tc.manifestSha256 });
+
+test("baseline remains drift-checked while revised profile preserves frozen pins", async () => {
+  await assert.rejects(loadReplayCorpus(tc.checkout, { manifestSha256: tc.manifestSha256 }), { message: "brief_drift" });
+  const revised = await load();
+  assert.equal(revised.profile, "revised");
+  assert.notDeepEqual(revised.brief_sha256, revised.pins.brief_sha256);
+  assert.equal(revised.pins.brief_sha256.codex, "29e410c44476fb6e2560fd03c2d990de24cee2193e6df6c250085cb1b39252a5");
+});
 const corpus = await load();
 const defect = corpus.cases.find((c) => c.id === tc.defectId)!;
 const findingsText = JSON.stringify({ findings: [{ id: "F1", severity: "major", path: "src/client.ts", line: 4, title: "UNIQUE-TITLE-XYZ", detail: "UNIQUE-DETAIL-XYZ" }] });
@@ -77,6 +85,19 @@ test("the claim passes the real decoder and prompt builder with a single-family 
   assert.deepEqual(Object.keys(codex.secrets.codex!).sort(), ["access_token", "auth_mode", "capability"]);
   assert.equal(codex.secrets.codex!.access_token, "key-openai");
   assert.equal(codex.secrets.anthropic_oauth_token, undefined);
+});
+
+test("both replay families retain findings when the revised checker also returns coverage", async () => {
+  const value = JSON.parse(findingsText) as {findings: unknown[]};
+  const output = JSON.stringify({ ...value, coverage: [{path: "src/client.ts", status: "examined", reason: "read patch"}] });
+  const records = await replay({ families: ["claude", "codex"],
+    checkers: { claude: checker(completes(output)), codex: checker(completes(output)) } });
+  for (const record of records) {
+    assert.equal(record.outcome, "completed");
+    assert.equal(record.findings[0]?.id, "F1");
+    assert.equal(record.profile, "revised");
+    assert.equal(record.brief_sha256, corpus.brief_sha256[record.family]);
+  }
 });
 
 test("records carry every pinned field", async () => {
@@ -257,7 +278,7 @@ async function cli(args: string[], over: Partial<Parameters<typeof runReplayCli>
   const errLines: string[] = [];
   const code = await runReplayCli(args, {
     checkout: tc.checkout, env, write: (l) => { lines.push(l); }, writeErr: (l) => { errLines.push(l); },
-    signals: quietSignals, manifestSha256: tc.manifestSha256, layout: single,
+    signals: quietSignals, profile: "revised", manifestSha256: tc.manifestSha256, layout: single,
     uziHead: async () => "b".repeat(40), ...over,
   });
   return { code, lines, errLines };
@@ -265,9 +286,19 @@ async function cli(args: string[], over: Partial<Parameters<typeof runReplayCli>
 const replayArgs = (extra: string[] = []) =>
   ["replay", "--family", "claude", "--model", "haiku", "--effort", "low", "--repeats", "1", ...extra];
 
+test("CLI requires explicit revised profile selection and retains baseline drift rejection", async () => {
+  const baseline = await cli(["verify"], { profile: undefined });
+  assert.equal(baseline.code, 1);
+  assert.deepEqual(baseline.lines, ['{"error":"brief_drift"}']);
+  const revised = await cli(["verify", "--profile", "revised"], { profile: undefined });
+  assert.equal(revised.code, 0);
+  const wrong = await cli(["verify", "--profile", "unknown-profile"], { profile: undefined });
+  assert.deepEqual(wrong.lines, ['{"error":"invalid_cli"}']);
+});
+
 test("replay refuses without explicit authorization before loading or constructing anything", async () => {
   const guard = checker(completes());
-  const r = await cli(replayArgs(), { checkers: { claude: guard }, manifestSha256: "f".repeat(64) });
+  const r = await cli(replayArgs(), { checkers: { claude: guard }, profile: "revised", manifestSha256: "f".repeat(64) });
   assert.equal(r.code, 1);
   assert.deepEqual(r.lines, ['{"error":"authorization_required"}']);
   assert.equal(guard.calls.length, 0);
@@ -401,7 +432,7 @@ test("default wiring sends stdout lines to stdout and the locator channel to std
 
 test("verify materializes every case; a wrong manifest pin fails with a fixed code", async () => {
   assert.deepEqual((await cli(["verify"])).lines, ['{"verify":"ok","cases":2}']);
-  const wrong = await cli(["verify"], { manifestSha256: "f".repeat(64) });
+  const wrong = await cli(["verify"], { profile: "revised", manifestSha256: "f".repeat(64) });
   assert.equal(wrong.code, 1);
   assert.deepEqual(wrong.lines, ['{"error":"corpus_integrity"}']);
 });
@@ -470,20 +501,20 @@ async function reseal(mutate: (files: { pins: Record<string, any>; caseJson: Rec
 
 test("a consistently re-pinned corpus still fails on brief drift, oversize diff, symlinks and provenance lies", async () => {
   const drift = await reseal(({ pins }) => { pins.brief_sha256.claude = "0".repeat(64); });
-  try { await assert.rejects(loadReplayCorpus(tc.checkout, { manifestSha256: drift.sha }), { message: "brief_drift" }); } finally { await drift.restore(); }
+  try { await assert.rejects(loadReplayCorpus(tc.checkout, { profile: "revised", manifestSha256: drift.sha }), { message: "brief_drift" }); } finally { await drift.restore(); }
 
   const patch = path.join(tc.corpusDir, `cases/${tc.defectId}/prefix.patch`);
   const oldPatch = await fs.readFile(patch);
   const big = Buffer.alloc(1024 * 1024, 0x20);
   await fs.writeFile(patch, big);
   const oversize = await reseal(({ caseJson }) => { caseJson.artifacts["prefix.patch"] = sha256(big); });
-  try { await assert.rejects(loadReplayCorpus(tc.checkout, { manifestSha256: oversize.sha }), { message: "diff_oversize" }); }
+  try { await assert.rejects(loadReplayCorpus(tc.checkout, { profile: "revised", manifestSha256: oversize.sha }), { message: "diff_oversize" }); }
   finally { await oversize.restore(); await fs.writeFile(patch, oldPatch); }
 
   const lie = await reseal(({ caseJson }) => { caseJson.input_provenance = "recorded"; });
-  try { await assert.rejects(loadReplayCorpus(tc.checkout, { manifestSha256: lie.sha }), { message: "corpus_integrity" }); } finally { await lie.restore(); }
+  try { await assert.rejects(loadReplayCorpus(tc.checkout, { profile: "revised", manifestSha256: lie.sha }), { message: "corpus_integrity" }); } finally { await lie.restore(); }
   const milestones = await reseal(({ caseJson }) => { caseJson.milestones = []; });
-  try { await assert.rejects(loadReplayCorpus(tc.checkout, { manifestSha256: milestones.sha }), { message: "corpus_integrity" }); } finally { await milestones.restore(); }
+  try { await assert.rejects(loadReplayCorpus(tc.checkout, { profile: "revised", manifestSha256: milestones.sha }), { message: "corpus_integrity" }); } finally { await milestones.restore(); }
 
   const plan = path.join(tc.corpusDir, `cases/${tc.defectId}/plan.md`);
   const savedPlan = await fs.readFile(plan);
@@ -683,7 +714,7 @@ test("the snapshot walk never follows a tracked symlink to a file outside the sn
   const before = await fs.stat(secret);
   const linked = await buildTempCorpus({ symlinks: { "link-out": secret } });
   try {
-    const lc = await loadReplayCorpus(linked.checkout, { manifestSha256: linked.manifestSha256 });
+    const lc = await loadReplayCorpus(linked.checkout, { profile: "revised", manifestSha256: linked.manifestSha256 });
     const c = lc.cases.find((x) => x.id === linked.defectId)!;
     const run = await createReplayRunDir(await fs.mkdtemp(path.join(tc.root, "link-")), split);
     const m = await materializeCase(linked.checkout, c, run, undefined, split);

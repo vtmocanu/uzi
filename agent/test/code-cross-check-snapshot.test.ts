@@ -59,6 +59,38 @@ async function fixture() {
   return { fx, git, bare, head, base, claim, client, verdicts };
 }
 
+it("coverage is inventory-normalized and sent only for a capable API", async () => {
+  for (const supported of [false, true]) {
+    const f = await fixture();
+    try {
+      assert.equal(f.claim.cross_check?.stage, "code");
+      if (f.claim.cross_check?.stage !== "code") assert.fail("code claim required");
+      f.claim.cross_check.coverage_supported = supported;
+      await new CrossCheckRunner(f.client, f.git, nullLogger(), {
+        homeRoot: f.fx.dataDir, pollMs: 1,
+        model: { run: async (claim, checkout, _home, _signal, _usage, cleanup, activity) => {
+          assert.equal(claim.cross_check?.stage, "code");
+          if (claim.cross_check?.stage !== "code") assert.fail("code claim required");
+          assert.deepEqual(claim.cross_check.code_inventory?.paths, ["source.txt"]);
+          activity?.modelStarted();
+          activity?.begin("recorded", "read", path.join(checkout, "source.txt"));
+          activity?.settle("recorded", { outcome: "ok", lines: [1, 1] });
+          cleanup?.();
+          return JSON.stringify({ findings: [], coverage: [{ path: "source.txt", status: "examined", reason: "read committed source" },
+            { path: "invented", status: "examined", reason: "not in Git" }] });
+        } },
+      }).execute(f.claim);
+      assert.equal(f.verdicts.length, 1);
+      const result = f.verdicts[0] as { outcome: string; coverage?: { entries: Array<{path: string; recorded_read: boolean}>; unknown_judgments: number } };
+      assert.equal(result.outcome, "completed");
+      if (supported) {
+        assert.deepEqual(result.coverage?.entries.map(e => [e.path, e.recorded_read]), [["source.txt", true]]);
+        assert.equal(result.coverage?.unknown_judgments, 1);
+      } else assert.equal("coverage" in result, false);
+    } finally { f.fx.cleanup(); }
+  }
+});
+
 it("timeout with unconfirmed native cleanup retains the snapshot reader", async (t) => {
   const f = await fixture();
   try {

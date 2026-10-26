@@ -92,7 +92,7 @@ test("Codex fileop can stat and read the replay snapshot while the records file,
     fs.mkdirSync(path.join(hidden, "run"));
     await assert.rejects(assertSnapshotTraversable(path.join(hidden, "run")), { message: "snapshot_untraversable" });
 
-    const corpus = await loadReplayCorpus(tc.checkout, { manifestSha256: tc.manifestSha256 });
+    const corpus = await loadReplayCorpus(tc.checkout, { profile: "revised", manifestSha256: tc.manifestSha256 });
     const defect = corpus.cases.find((c) => c.id === tc.defectId)!;
     const seen: {
       stat?: FileopResponse; read?: FileopResponse; dac?: unknown; runner?: unknown; names?: string[]; failure?: string;
