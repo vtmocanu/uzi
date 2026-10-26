@@ -143,11 +143,15 @@ case "$url" in
     case "${GHCR_CURL_CASE:-}" in
       token-network) printf '{"token":"anon-fixture"}\n200'; exit 7 ;;
       token-http) printf '{"token":"anon-fixture"}\n403'; exit 0 ;;
+      token-404) printf '{"errors":[]}\n404'; exit 0 ;;
       token-missing) printf '{}\n200'; exit 0 ;;
       token-empty) printf '{"token":""}\n200'; exit 0 ;;
       token-malformed) printf 'not-json\n200'; exit 0 ;;
       token-conflict) printf '{"token":"anon-fixture","access_token":"other"}\n200'; exit 0 ;;
       token-header) printf '{"token":"bad\\r\\nheader"}\n200'; exit 0 ;;
+      token-space) printf '{"token":"anon fixture"}\n200'; exit 0 ;;
+      token-raw-cr) printf '{"token":"anon\rfixture"}\n200'; exit 0 ;;
+      token-escaped-key) printf '{"\\"x\\"token":"EVIL"}\n200'; exit 0 ;;
       access-token) printf '{"access_token":"anon-fixture"}\n200'; exit 0 ;;
       multiline-token) printf '{\n "token": "anon-fixture"\n}\n200'; exit 0 ;;
     esac
@@ -1289,7 +1293,7 @@ ghcr_reader_case() {
 }
 ghcr_registry_cases() {
   local scenario wanted log out rc text
-  for scenario in present absent unauthorized forbidden redirect server network network-404 token-network token-http token-missing token-empty token-malformed token-conflict token-header access-token multiline-token invalid-tag; do
+  for scenario in present absent unauthorized forbidden redirect server network network-404 token-network token-http token-404 token-missing token-empty token-malformed token-conflict token-header token-space token-raw-cr token-escaped-key access-token multiline-token invalid-tag; do
     [ -z "${GHCR_CASE_FILTER:-}" ] || [ "registry-$scenario" = "$GHCR_CASE_FILTER" ] || continue
     ghcr_defaults
     wanted=2

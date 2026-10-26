@@ -24,6 +24,8 @@ img_has_tag() {
     --data-urlencode service=ghcr.io --data-urlencode "scope=repository:${name}:pull" \
     --write-out $'\n%{http_code}' https://ghcr.io/token)" || return 2
   [ "${response##*$'\n'}" = 200 ] && [ "${#response}" -le 65536 ] || return 2
+  # Reject escapes before extracting quote-delimited token fields.
+  case "$response" in *\\*) return 2 ;; esac
   token="$(printf '%s' "${response%$'\n'*}" | LC_ALL=C awk '
     { json = json $0 }
     END {
