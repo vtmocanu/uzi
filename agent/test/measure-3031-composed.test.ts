@@ -16,9 +16,10 @@
 // Closed list of substitutions in a measurement run (printed in every MEASURE line):
 //   - guard-method: RecoveryCoordinator.terminalOriginAdmissionEnabled returns true;
 //   - faked-server: the worker API is a faked server behind the real strict WorkerClient.
-// Harness facts that are not substitutions of a production check, also printed: the Worker object
-// exists here, so `isIdle` is the harness check of sole execution in the container and a settled runner (a
-// disclosed fixture precondition; it does not prove production Worker-idleness integration).
+// Harness interventions that are not Design-7 substitutions are printed too (see `substitutions` in every
+// MEASURE line). No Worker object exists in the harness, so `isIdle` is the harness check of sole execution
+// in the container and a settled runner (a disclosed fixture precondition; it does not prove production
+// Worker-idleness integration).
 //
 // Environment inputs: UZI_MEASURE_DOCKER_HOST (the Docker daemon the worker is wired to; the
 // exclusion proof and the quiescence scans probe it for real), UZI_MEASURE_DEVIATION (free text,
@@ -93,6 +94,8 @@ interface EvaluationInput {
   elapsedMs: number;
   phases: ReadonlyArray<{ name: string; used: Counters }>;
   refusedCharge?: { resource: string; amount: number; used: number; phase: string };
+  /** A charge that failed for any reason other than quota exhaustion (revoked or expired token, cancellation, clock). */
+  interruption?: { reason: string; resource: string; phase: string };
   /** Cap refusals that arrive as a typed refusal, not as a refused charge (the decoded verification budget). */
   capRefusals?: Violation[];
   envelopeOverruns?: Violation[];
@@ -106,6 +109,7 @@ interface Evaluation {
   elapsed_fidelity: string;
   violations: Violation[];
   refusal?: { phase: string; reason: string; phases_left_unrun: string[] };
+  interruption?: { reason: string; resource: string; phase: string; phases_left_unrun: string[] };
   reason?: string;
 }
 
@@ -151,11 +155,24 @@ function evaluate(input: EvaluationInput): Evaluation {
     const at = PHASES.indexOf(input.refusal.phase as Phase);
     out.refusal = { ...input.refusal, phases_left_unrun: at < 0 ? [] : PHASES.slice(at + 1) as string[] };
   }
-  if (violations.length > 0 || input.refusal || input.incomplete !== undefined) {
+  if (input.interruption) {
+    const at = PHASES.indexOf(input.interruption.phase as Phase);
+    out.interruption = { ...input.interruption, phases_left_unrun: at < 0 ? [] : PHASES.slice(at + 1) as string[] };
+    out.reason = `interrupted: ${input.interruption.reason} (not a quota overrun)`;
+  }
+  if (violations.length > 0 || input.refusal || input.interruption || input.incomplete !== undefined) {
     out.verdict = "FAIL";
     if (input.incomplete !== undefined) out.reason = input.incomplete;
   } else if (input.deviation) out.verdict = "counters_within_limits_elapsed_unverified";
   return out;
+}
+
+/**
+ * Only a genuine quota exhaustion is a resource overrun that names a dimension. A revoked or expired
+ * token, a cancellation, a clock failure or any other interruption is recorded with its own reason.
+ */
+function chargeFailureKind(error: unknown): "quota" | "interruption" {
+  return error instanceof Error && error.message === "maintenance_resource_exhausted" ? "quota" : "interruption";
 }
 
 // ---------------------------------------------------------------- source precondition (item 2)
@@ -505,6 +522,7 @@ async function runPipeline(t: TestContext, spec: Spec): Promise<RunResult> {
   const totals: Counters = {};
   let phase: Phase = "preamble", slotStarted: number | undefined, slotEnded: number | undefined;
   let refusedCharge: { resource: string; amount: number; used: number; phase: string } | undefined;
+  let interruption: { reason: string; resource: string; phase: string } | undefined;
   const phaseMs: Record<string, number> = {};
   let phaseSince = performance.now();
   const setPhase = (next: Phase) => {
@@ -516,7 +534,8 @@ async function runPipeline(t: TestContext, spec: Spec): Promise<RunResult> {
   t.mock.method(MaintenanceResources, "consume", (resource: Dimension, amount: number) => {
     try { consume(resource, amount); }
     catch (error) {
-      refusedCharge ??= { resource, amount, used: totals[resource] ?? 0, phase };
+      if (chargeFailureKind(error) === "quota") refusedCharge ??= { resource, amount, used: totals[resource] ?? 0, phase };
+      else interruption ??= { reason: error instanceof Error ? error.message : String(error), resource, phase };
       throw error;
     }
     totals[resource] = (totals[resource] ?? 0) + amount;
@@ -736,7 +755,7 @@ async function runPipeline(t: TestContext, spec: Spec): Promise<RunResult> {
   const slotElapsed = Math.round((slotEnded - (slotStarted ?? started)));
   const failure = (importerError ?? archiveError) as unknown;
   let incomplete: string | undefined, refusal: { phase: string; reason: string } | undefined;
-  const failurePhase = refusedCharge?.phase ?? (archiveError ? "archive" : importerError ? "transfer_entry" : refusals.length > 0 ? phase : undefined);
+  const failurePhase = refusedCharge?.phase ?? interruption?.phase ?? (archiveError ? "archive" : importerError ? "transfer_entry" : refusals.length > 0 ? phase : undefined);
   if (failure !== undefined || refusals.length > 0) {
     const message = failure instanceof RecoveryBundleTooLargeError ? "RecoveryBundleTooLargeError: neither self-contained nor guarded thin bundle fits the per-bundle cap"
       : failure instanceof Error ? failure.message : refusals.join(",");
@@ -759,7 +778,7 @@ async function runPipeline(t: TestContext, spec: Spec): Promise<RunResult> {
     ? [{ dimension: "decoded", phase: refusal.phase, limit: limits.decoded ?? admittedCap, refused: true }] : [];
   const evaluation = archiveNotApplicable
     ? evaluate({ unrun: `the fixture cannot satisfy the archive precondition: ${(archiveError as Error).message}`, limits, elapsedLimitMs: slotMs, elapsedMs: slotElapsed, phases, deviation: env.deviation })
-    : evaluate({ limits, elapsedLimitMs: slotMs, elapsedMs: slotElapsed, phases, refusedCharge, capRefusals, envelopeOverruns, refusal, incomplete, deviation: env.deviation });
+    : evaluate({ limits, elapsedLimitMs: slotMs, elapsedMs: slotElapsed, phases, refusedCharge, interruption, capRefusals, envelopeOverruns, refusal, incomplete, deviation: env.deviation });
   const eligible = eligibility(spec);
   const record = emit({
     ...head, ...body,
@@ -861,6 +880,23 @@ describe("#3031 composed measurement verdict controls", () => {
     assert.deepEqual(unlimited.violations.map(v => [v.dimension, v.phase, v.unlimited]), [["mystery", "walk", true]]);
     const slow = evaluate({ ...base, elapsedMs: SLOT_ELAPSED_LIMIT_MS + 1, phases: [] });
     assert.deepEqual(slow.violations.map(v => v.dimension), ["elapsedMs"]);
+  });
+
+  it("control 9: quota exhaustion names a dimension; a deadline, cancellation or revoked token is an interruption, never an overrun", () => {
+    assert.equal(chargeFailureKind(new Error("maintenance_resource_exhausted")), "quota");
+    for (const reason of ["maintenance_token_invalid", "maintenance_clock_invalid", "maintenance deadline exhausted", "This operation was aborted"])
+      assert.equal(chargeFailureKind(new Error(reason)), "interruption", reason);
+    assert.equal(chargeFailureKind("maintenance_resource_exhausted"), "interruption", "only an Error carrying the quota reason counts");
+    const phases = [phase("walk", { sourceEntries: 1 })];
+    const quota = evaluate({ ...base, phases, refusedCharge: { resource: "sourceEntries", amount: 1, used: 100, phase: "walk" } });
+    assert.deepEqual(quota.violations.map(v => [v.dimension, v.phase, v.refused]), [["sourceEntries", "walk", true]]);
+    assert.equal(quota.interruption, undefined);
+    const cut = evaluate({ ...base, phases, interruption: { reason: "maintenance_token_invalid", resource: "launches", phase: "selection" } });
+    assert.equal(cut.verdict, "FAIL");
+    assert.deepEqual(cut.violations, [], "an interruption names no dimension");
+    assert.equal(cut.interruption?.phase, "selection");
+    assert.match(String(cut.reason), /interrupted: maintenance_token_invalid/);
+    assert.ok(cut.interruption?.phases_left_unrun.includes("archive"));
   });
 
   it("control 9: a refusal is recorded with the phases left unrun and is never a counter PASS", () => {
