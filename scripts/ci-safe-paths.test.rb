@@ -273,6 +273,21 @@ assert.call(mint.fetch('with'), {'client-id' => '${{ vars.RELEASE_APP_ID }}', 'p
                                'owner' => 'vtmocanu', 'repositories' => 'uzi', 'permission-contents' => 'write'}, 'installation token scope')
 bundle_step = auto_push.fetch('steps').find { |step| step['id'] == 'bundle' }
 publish_step = auto_push.fetch('steps').find { |step| step['id'] == 'push' }
+# Execute the classifier from the actual step, including its defensive mixed
+# receipt branch. A reported ref update must never be called "nothing changed".
+receipt_parts = publish_step.fetch('run').split("if awk -F '\\t' ", 2)
+assert.call(receipt_parts.length, 2, 'actual porcelain classifier is present')
+receipt_classifier = "awk -F '\\t' " + receipt_parts.last.split(' "$receipt"; then', 2).first
+{"!\trefs/tags/v0.2.0:refs/tags/v0.2.0\t[rejected]\n" => true,
+ "*\trefs/heads/main:refs/heads/main\t[new branch]\n!\trefs/tags/v0.2.0:refs/tags/v0.2.0\t[rejected]\n" => false,
+ "fatal: transport interrupted\n" => false}.each do |receipt, rejected|
+  Tempfile.create('push-porcelain') do |file|
+    file.write(receipt)
+    file.flush
+    _, _, status = Open3.capture3('bash', '-e', '-c', receipt_classifier + ' "$1"', 'porcelain', file.path)
+    assert.call(status.success?, rejected, 'only rejection without a changed ref is definitive')
+  end
+end
 assert.call(auto_push.fetch('steps').index(bundle_step) < auto_push.fetch('steps').index(mint), true, 'bundle validated before minting')
 assert.call(auto_push.fetch('steps').index(mint) < auto_push.fetch('steps').index(publish_step), true, 'only final publisher receives installation token')
 assert.call(auto_push.fetch('steps').map { |step| step['uses'] }.compact, [
@@ -439,6 +454,27 @@ Dir.mktmpdir('release-auto-contract') do |dir|
   git.call('-C', repo, 'bundle', 'create', valid_extra_bundle, 'refs/heads/release-auto-prepared',
            'refs/tags/v0.2.0-rc.11', 'refs/heads/unexpected', '^' + parent)
   exercise.call({'BUNDLE_DIGEST' => Digest::SHA256.file(valid_extra_bundle).hexdigest}, false, nil, valid_extra_bundle)
+  # Each malformed commit otherwise has matching parent, tag and digest. Pin
+  # both the fragment-only deletion rule and unchanged regular-file modes.
+  %w[deletion mode].each_with_index do |shape, index|
+    git.call('-C', repo, 'checkout', '--detach', parent)
+    if shape == 'deletion'
+      FileUtils.rm(File.join(repo, 'CHANGELOG.md'))
+    else
+      File.chmod(0o755, File.join(repo, 'CHANGELOG.md'))
+    end
+    git.call('-C', repo, 'add', '--', 'CHANGELOG.md')
+    git.call('-C', repo, 'commit', '-m', shape + ' fence fixture')
+    malformed = git.call('-C', repo, 'rev-parse', 'HEAD')
+    malformed_tag = "v0.2.0-rc.#{96 + index}"
+    git.call('-C', repo, 'tag', '-a', malformed_tag, '-m', shape)
+    malformed_oid = git.call('-C', repo, 'rev-parse', malformed_tag)
+    git.call('-C', repo, 'update-ref', 'refs/heads/release-auto-prepared', malformed)
+    malformed_bundle = File.join(dir, shape + '.bundle')
+    git.call('-C', repo, 'bundle', 'create', malformed_bundle, 'refs/heads/release-auto-prepared', 'refs/tags/' + malformed_tag, '^' + parent)
+    exercise.call({'RELEASE_SHA' => malformed, 'RELEASE_TAG' => malformed_tag, 'TAG_OID' => malformed_oid,
+                   'BUNDLE_DIGEST' => Digest::SHA256.file(malformed_bundle).hexdigest}, false, nil, malformed_bundle)
+  end
   # A self-consistent child with source changes must fail the fixed metadata fence.
   git.call('-C', repo, 'checkout', '--detach', parent)
   FileUtils.mkdir_p(File.join(repo, 'api'))

@@ -433,6 +433,7 @@ class FailedEvidence(unittest.TestCase):
     def test_failed_retry_keeps_evidence_in_real_main_outputs_and_summary(self):
         status, data, summary = self.failure()
         self.assertEqual(status, 1)
+        self.assertEqual(data['parent'], H)
         retry = json.loads(data['retry_log'])[0]
         self.assertEqual((retry['sha'], retry['run'], retry['attempt']), (H, 10, 1))
         self.assertEqual(retry['jobs'][0]['id'], 20)
@@ -444,6 +445,7 @@ class FailedEvidence(unittest.TestCase):
     def test_uncertain_rerun_request_keeps_attempted_evidence(self):
         status, data, summary = self.failure(request_error=True)
         self.assertEqual(status, 1)
+        self.assertEqual(data['parent'], H)
         retry = json.loads(data['retry_log'])[0]
         self.assertEqual(retry['result'], 'request unconfirmed')
         self.assertEqual(retry['run'], 10)
