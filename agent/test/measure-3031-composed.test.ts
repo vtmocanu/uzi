@@ -202,6 +202,8 @@ interface Spec {
   origin: "repo" | "tiny";
   /** Real exclusion and quiescence. Only controls run with real=false. */
   real: boolean;
+  /** CONTROL ONLY: the source checkout the precondition reads (default: the checkout this test runs from). */
+  sourceRoot?: string;
   /** CONTROL ONLY: lowers limits at evaluation time, from the phases the run actually charged. */
   controlLimits?: (limits: Limits, phases: ReadonlyArray<{ name: string; used: Counters }>) => Limits;
 }
@@ -426,7 +428,7 @@ async function runPipeline(t: TestContext, spec: Spec): Promise<RunResult> {
   // ---- preconditions: UNRUN with the reason, nothing else asserted
   let source: { head: string; commits: number } | undefined;
   if (spec.origin === "repo") {
-    const precondition = sourcePrecondition(REPO_ROOT);
+    const precondition = sourcePrecondition(spec.sourceRoot ?? REPO_ROOT);
     if (!precondition.ok) return unrun(precondition.reason);
     source = precondition;
   }
@@ -542,7 +544,8 @@ async function runPipeline(t: TestContext, spec: Spec): Promise<RunResult> {
   t.mock.method(git, "produceRecoveryBundle", async (...args: Parameters<typeof produce>) => {
     if (archiveWindow) return produce(...args);
     stray.push({ phase, inSlot: MaintenanceResources.active() && !MaintenanceResources.discoveryActive(), afterAdmission: slotStarted !== undefined });
-    throw new Error("fixture bundle production unavailable outside the measured archive phase");
+    // Models the ordinary capture refused as oversize (produceBundle records archiveRefusal "oversize").
+    throw new RecoveryBundleTooLargeError(RECOVERY_MAX_BUNDLE_BYTES + 1, RECOVERY_MAX_BUNDLE_BYTES);
   });
 
   // ---- real quiescence (a wrapper that only reads the envelope and the charge around the real call)
@@ -737,7 +740,7 @@ async function runPipeline(t: TestContext, spec: Spec): Promise<RunResult> {
     substitutions: ["guard-method: RecoveryCoordinator.terminalOriginAdmissionEnabled",
       "faked-server: strict WorkerClient over a faked worker API, with client.hasFeature and client.listRecoveryHolds answered directly by the harness",
       "isIdle: harness check of sole execution in the container and a settled runner, passed to the real MaintenanceWriterExclusion (no Worker object exists; this does not prove production Worker-idleness integration)",
-      "produceRecoveryBundle: calls outside the archive window are refused and counted (the runner's ordinary pre-slot flows); a refused call after slot admission makes the run non-eligible",
+      "produceRecoveryBundle: every call outside the archive window throws RecoveryBundleTooLargeError (models the ordinary pre-slot capture refused as oversize, not a journaled bundle); calls are counted; every run depending on it is gate-ineligible",
       ...(spec.controlLimits ? ["CONTROL ONLY: limits lowered at evaluation time"] : []),
       ...(spec.real ? [] : ["CONTROL ONLY: passingExclusion", "CONTROL ONLY: stubbed quiescence verdict", "CONTROL ONLY: trusted-ancestor DAC projection"])],
     layout_construction: spec.layout === "dissociated" ? "real GitCache.materializeRunnerClone" : "clone --shared, alternates retained",
@@ -889,6 +892,34 @@ describe("#3031 composed measurement verdict controls", () => {
     assert.equal(runnerTailProblem({ executionTails: new Map([["this-run", 1]]) }, "this-run"), undefined);
   });
 
+  it("control: a deviation never turns an incomplete pipeline or a refusal into a counters-within-limits verdict", () => {
+    const clean = [phase("walk", { sourceEntries: 1 })];
+    assert.equal(evaluate({ ...base, phases: clean, incomplete: "the pipeline ended without an archive outcome", deviation: "emulated" }).verdict, "FAIL");
+    assert.equal(evaluate({ ...base, phases: clean, incomplete: "the pipeline ended without an archive outcome" }).verdict, "FAIL");
+    assert.equal(evaluate({ ...base, phases: clean, refusal: { phase: "walk", reason: "maintenance_source_layout_unsupported" }, deviation: "emulated" }).verdict, "FAIL");
+    assert.equal(evaluate({ ...base, phases: clean, envelopeOverruns: [{ dimension: "familyProof.metadataBytes", phase: "w0_p0", used: 2, limit: 1 }] }).verdict, "FAIL");
+    assert.equal(evaluate({ ...base, phases: clean, envelopeOverruns: [{ dimension: "familyProof.adminEntries", phase: "walk", used: 2, limit: 1 }], deviation: "emulated" }).verdict, "FAIL");
+  });
+
+  it("control: the real-path preconditions report UNRUN without a daemon and for an untrusted ancestor", async t => {
+    const saved = process.env.UZI_MEASURE_DOCKER_HOST;
+    delete process.env.UZI_MEASURE_DOCKER_HOST;
+    t.after(() => { if (saved !== undefined) process.env.UZI_MEASURE_DOCKER_HOST = saved; });
+    const noDaemon = realPrerequisites();
+    assert.ok("unrun" in noDaemon && /UZI_MEASURE_DOCKER_HOST is unset/.test(noDaemon.unrun));
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "measure-3031-ancestor-"));
+    t.after(() => fs.rm(dir, { recursive: true, force: true }));
+    await fs.chmod(dir, 0o777);
+    assert.match(ancestorProblem(path.join(dir)) ?? "", /not a trusted ancestor/);
+  });
+
+  it("control: runPipeline returns UNRUN for a failing source precondition and runs nothing else", async t => {
+    const { record, evaluation } = await runPipeline(t, { label: "control-source", layout: "shared", shape: "A", origin: "repo", real: true, sourceRoot: path.join(os.tmpdir(), "measure-3031-no-such-source") });
+    assert.equal(evaluation.verdict, "UNRUN");
+    assert.match(String(record.reason), /inaccessible/);
+    assert.equal(record.w0_invocations, undefined);
+  });
+
   it("control: the two-source family variant is UNRUN with the reachability reason and is never eligible for the gate", async t => {
     const { record, evaluation } = await runPipeline(t, { label: "control-family", layout: "shared", shape: "A", family: true, origin: "repo", real: true });
     assert.equal(evaluation.verdict, "UNRUN");
@@ -933,5 +964,6 @@ describe("#3031 composed measurement verdict controls", () => {
     const cycle = table.cycles.find((c: { identity: { run: string } }) => c.identity.run === record.run_id);
     assert.deepEqual(record.limits, cycle.slots[cycle.slots.length - 1].reserved);
     assert.ok(Object.keys(record.limits as Limits).includes("rpcAttempts"), "every key of the slot quota is a checked dimension");
+    assert.match(String((record.substitutions as string[]).find(x => x.startsWith("produceRecoveryBundle"))), /RecoveryBundleTooLargeError/);
   });
 });

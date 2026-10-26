@@ -592,12 +592,19 @@ method; a faked server behind the real strict client (the harness answers `hasFe
 `listRecoveryHolds` directly); `isIdle`, a harness check (sole execution in the container and
 a settled runner, verified before admission, else UNRUN) passed to the real writer exclusion,
 which does not prove the production Worker-idleness integration; and a refusal of every
-`produceRecoveryBundle` call outside the archive window, which stops the runner's ordinary
-pre-slot flows from writing a producer record (without it admission is refused as
-`source_protected_or_ambiguous`, measured). That suppression is not a Design-7 substitution, so
+`produceRecoveryBundle` call outside the archive window with a `RecoveryBundleTooLargeError`,
+which models the runner's ordinary pre-slot capture refused as oversize (without it the ordinary
+pass journals a real bundle, a saved-source candidate, and admission is refused as
+`source_protected_or_ambiguous`; measured on the shared-layout shape-B fixture, not diagnosed
+further). That suppression is not a Design-7 substitution, so
 every run is `eligible_for_gate: false` ("pre-slot production bundle path suppressed by the
 harness"), its counters are diagnostics, and the gate-level `c2_gate_summary` line is `UNRUN`
-(no qualifying measurement is possible) regardless of the counters. The archive phase is
+(no qualifying measurement is possible) regardless of the counters.
+With the two-source family variant `UNRUN` at current production and the pre-slot suppression
+non-qualifying, C2 cannot record a PASS at this code: this is an R3 stop-and-report for the
+maintainers. Open reachability question, not a confirmed blocker and not something the harness
+proves: production may refuse `worker_not_idle` if the failed run's lane is still active at
+admission, which the harness's own sole-execution check does not exercise. The archive phase is
 harness-placed: it has no production caller yet. Every limit is read from the admitted slot
 reservation in the ledger, never from a table, and `decoded` follows the configured C. A
 charged dimension with no admitted limit fails.
