@@ -40,6 +40,20 @@ async function until(predicate: () => boolean, timeoutMs = 3000) {
   }
 }
 
+async function withTimeout<T>(operation: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 async function setup(count = 0, configured = settings) {
   api.memoryRegisterNonce = "original-memory-registration";
   api.setRegisterProtocolFeatures(["worker_memory_pressure_v1", "claim_generation_fence"]);
@@ -1644,6 +1658,12 @@ for (const scenario of ["wall", "disk", "withdrawn", "cancel", "shutdown", "clai
           await until(() => entered);
           if (scenario === "unsettled") {
             assert.notEqual(captured.workerMemory?.settled, true);
+          } else if (scenario === "already-parked") {
+            // The owned capture has a five-second budget; a three-second poll can expire first.
+            const operation = captured.workerMemory?.operation;
+            assert.ok(operation, "already-parked capture keeps its owned operation");
+            await withTimeout(operation, 6000, "already-parked memory capture settlement");
+            assert.equal(captured.workerMemory?.settled, true);
           } else {
             await until(() => captured?.workerMemory?.settled === true);
           }

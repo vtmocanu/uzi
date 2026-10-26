@@ -998,6 +998,12 @@ describe("M3 actual runner memory Codex delivery", () => {
             return dispose(...args);
           });
           await withTimeout(running, lateCapture ? 1500 : 3000, "memory deadline must not await Codex captureTail");
+          if (!lateCapture) {
+            // Public deadline expiry does not order capture settlement before executor cleanup.
+            assert.ok(memory.operation, "late cleanup retains the original capture operation");
+            await withTimeout(memory.operation, 6000, "late-cleanup capture settlement");
+            await waitFor(() => cleanupEntered, "late-cleanup executor finally remains gated", 6000);
+          }
           assert.equal(memory.settled === true, !lateCapture,
             "cover both pending capture and capture already settled beneath pending executor cleanup");
           assert.equal(runner.isExecuting(f.claim.run_id), true);
