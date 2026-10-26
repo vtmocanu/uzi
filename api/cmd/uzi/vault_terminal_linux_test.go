@@ -23,7 +23,11 @@ func TestVaultTerminalPassword(t *testing.T) {
 				t.Fatal(err)
 			}
 			master := os.NewFile(uintptr(fd), "vault-test-master")
-			defer master.Close()
+			defer func() {
+				if err := master.Close(); err != nil {
+					t.Errorf("close PTY master: %v", err)
+				}
+			}()
 			if err := unix.IoctlSetPointerInt(fd, unix.TIOCSPTLCK, 0); err != nil {
 				t.Fatal(err)
 			}
@@ -35,7 +39,11 @@ func TestVaultTerminalPassword(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer slave.Close()
+			defer func() {
+				if err := slave.Close(); err != nil {
+					t.Errorf("close PTY slave: %v", err)
+				}
+			}()
 			before, err := unix.IoctlGetTermios(int(slave.Fd()), unix.TCGETS)
 			if err != nil {
 				t.Fatal(err)
