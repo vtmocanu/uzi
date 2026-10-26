@@ -2141,11 +2141,13 @@ tasks:
       #   GOMEMLIMIT=8GiB    15.04 GB   363 s
       #   GOMEMLIMIT=2GiB    14.53 GB   452 s
       #
-      # On that worker 12GiB gave most of the observed reduction for the
-      # smallest observed time increase. Runner results are unmeasured until CI.
+      # On that worker, among the GOMEMLIMIT rows, 12GiB gave most of the observed
+      # reduction for the smallest observed time increase. Runner results are
+      # unmeasured until CI.
       #
       # The value is fixed on purpose: `env GOMEMLIMIT=...` overrides an inherited
-      # GOMEMLIMIT, so local and CI runs are identical. A malformed value (e.g.
+      # GOMEMLIMIT, so the limit is identical locally and in CI (GOGC and hardware
+      # still vary). A malformed value (e.g.
       # `12GB`) makes `go` itself die with `malformed GOMEMLIMIT`, exit 2, which
       # the gate reports as a load error. The hand-run `--write` command in
       # api/.deadcode-baseline's header does not carry the limit.

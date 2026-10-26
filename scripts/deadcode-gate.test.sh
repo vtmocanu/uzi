@@ -212,6 +212,7 @@ grep -Fq -- '- env GOMEMLIMIT=12GiB ./scripts/deadcode-gate.sh api golang.org/x/
     calls=$(wc -l < "$GO_LOG")
     [ "$calls" -eq 1 ] || fail "$target: expected one Go invocation, got $calls"
     contains "$GO_LOG" "gomemlimit=$want"
+    contains "$GO_LOG" 'gogc=unset'
     contains "$TMP/$name.task.stderr" "go_memory_limit=$want"
     contains "$TMP/$name.task.stderr" 'fake Go warning'
     contains "$TMP/$name.task.stdout" 'clean (0 findings'
