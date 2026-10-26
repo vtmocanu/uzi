@@ -2597,6 +2597,162 @@ describe("M2 Git retirement process proof", () => {
     });
   }
 
+  for (const exdev of [false, true]) for (const fault of ["write", "read", "conflict"] as const) for (const failedRestore of [false, true]) {
+    if (failedRestore && fault !== "write") continue;
+    it(`ledger repair failure ${fault} retains discoverable bytes EXDEV=${exdev} failedRestore=${failedRestore}`, async (t) => {
+      const owner = randomUUID(), branch = "agent/issue-2852";
+      const bare = await git.ensureClone(fx.originPath);
+      const attemptId = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "0123456789abcdef");
+      const clone = await git.createOrAttachRunnerClone(bare, 2852, noProofReseed, owner, false, undefined,
+        { attemptId, isLive: () => false, beforeSeed: async () => {} });
+      const clonePath = clone.path;
+      fs.writeFileSync(path.join(clonePath, "proof.txt"), "owner-only bytes\n");
+      await git.markRecoveryCapture(bare, clonePath, branch, owner, attemptId);
+      const command = (...args: string[]) => execFileSync("git", ["-C", bare, ...args],
+        { env: GIT_ENV, encoding: "utf8", stdio: "pipe" });
+      const journalKey = `uzi-recovery.${branch}.clone`, ledgerKey = `uzi-attempts.${branch}.entry`;
+      const before = JSON.parse(command("config", "--get", journalKey));
+      const head = await git.worktreeHead(clonePath);
+      let live = true, movedTo: string | undefined, settledLedger = "", unproven = 0, faults = 0;
+      const moves: string[][] = [], disposals: string[] = [];
+      const rename = fsp.rename.bind(fsp), rm = fsp.rm.bind(fsp);
+      t.mock.method(fsp, "rename", async (...args: Parameters<typeof fsp.rename>) => {
+        const from = String(args[0]), to = String(args[1]);
+        if (from === clonePath && exdev && path.dirname(to) === holdingRoot())
+          throw Object.assign(new Error("cross device"), { code: "EXDEV" });
+        if (failedRestore && from === movedTo && to === clonePath)
+          throw Object.assign(new Error("restore denied"), { code: "EACCES" });
+        await rename(...args);
+        if (from === clonePath) movedTo = to;
+        if (from === clonePath || to === clonePath) moves.push([from, to]);
+      });
+      t.mock.method(fsp, "rm", async (...args: Parameters<typeof fsp.rm>) => {
+        if (args[1]?.recursive) disposals.push(String(args[0]));
+        return rm(...args);
+      });
+      const seam = git as unknown as {
+        runGit: (cwd: string | undefined, args: string[]) => Promise<string>;
+        rewriteLedgerAtomically: (bare: string, key: string, values: string[]) => Promise<void>;
+        readAllAttemptLedgerRaw: (bare: string) => Promise<Array<[string, string]>>;
+        log: Logger;
+      };
+      const warn = t.mock.method(seam.log, "warn", () => {});
+      const runGit = seam.runGit.bind(git), readLedger = seam.readAllAttemptLedgerRaw.bind(git);
+      t.mock.method(seam, "runGit", async (cwd: string | undefined, args: string[]) => {
+        const result = await runGit(cwd, args);
+        if (live && movedTo && args.includes("--add") && args.includes(ledgerKey) && args.at(-1)?.includes('"state":"retired"')) {
+          assert.equal(command("config", "--get", journalKey), "\n", "raw journal really cleared");
+          assert.equal(fs.existsSync(clonePath), false);
+          assert.equal(await git.worktreeHead(movedTo), head);
+          if (fault === "conflict") {
+            command("config", "--add", ledgerKey, args.at(-1)!);
+            faults++;
+          }
+          settledLedger = command("config", "--get-all", ledgerKey);
+          live = false;
+        }
+        return result;
+      });
+      t.mock.method(seam, "rewriteLedgerAtomically", async () => { faults++; throw new Error("injected ledger write failure"); });
+      t.mock.method(seam, "readAllAttemptLedgerRaw", async (barePath: string) => {
+        if (!live && fault === "read") { faults++; throw new Error("injected ledger read failure"); }
+        return readLedger(barePath);
+      });
+      await assert.rejects(git.retireRunnerClone(bare, clonePath, branch, owner, {
+        discard: true, attemptId, processProof: () => live, onRetirementUnproven: () => { unproven++; },
+      }), /process proof revoked/);
+      assert.equal(live, false, "actual retired append settled before revocation");
+      assert.equal(faults, 1);
+      assert.ok(movedTo);
+      const actualPath = failedRestore ? movedTo : clonePath;
+      assert.deepEqual(moves, failedRestore ? [[clonePath, movedTo]] : [[clonePath, movedTo], [movedTo, clonePath]]);
+      assert.equal(fs.existsSync(clonePath), !failedRestore);
+      assert.equal(fs.readFileSync(path.join(actualPath, "proof.txt"), "utf8"), "owner-only bytes\n");
+      assert.equal(await git.worktreeHead(actualPath), head);
+      const restored = JSON.parse(command("config", "--get", journalKey));
+      assert.equal(restored.runId, before.runId);
+      assert.equal(restored.clonePath, actualPath);
+      assert.equal(restored.attemptId, failedRestore ? undefined : attemptId);
+      assert.ok(restored.retainedSources.some((src: { clonePath: string }) => src.clonePath === actualPath));
+      assert.equal(command("config", "--get-all", ledgerKey), settledLedger, "fault leaves the actual retired append intact");
+      const fresh = new GitCache(fx.dataDir, nullLogger());
+      if (!failedRestore) assert.equal(await fresh.classifyOwnerClonePath(bare, branch, "issue-2852", owner, clonePath), "attempt");
+      const inventory = await fresh.inspectRetainedSources({ barePath: bare, isLivePath: () => false });
+      assert.equal(inventory.unreadable, 0);
+      const record = inventory.sources.find(r => r.sources.some(src => src.clonePath === actualPath));
+      assert.ok(record, "fresh inspection discovers live bytes despite the retired ledger");
+      assert.equal(record.presence, "present");
+      if (failedRestore) assert.ok(record.consumers.includes("blocker:attribution_unknown"), "holding residue grants no disposal authority");
+      else {
+        assert.equal(record.kind, "protected", "restored bytes require the existing protected-source protocol");
+        assert.equal(record.sources.find(src => src.clonePath === clonePath)?.ledgerState, "retired");
+      }
+      assert.equal(record.disposition, undefined, "inspection without hold authority grants no disposal");
+      assert.ok(unproven > 0);
+      assert.ok(warn.mock.calls.some(c => c.arguments[0] === "retireRunnerClone: process revocation rollback ledger repair failed"));
+      assert.deepEqual(disposals, []);
+    });
+  }
+
+  for (const exdev of [false, true]) {
+    it(`late quarantine retention warning preserves exact context EXDEV=${exdev}`, async (t) => {
+      const owner = randomUUID();
+      const { bare, branch, clonePath } = await seedResidue(2852, owner, "proof.txt");
+      const seam = git as unknown as { log: Logger };
+      const warn = t.mock.method(seam.log, "warn", () => {});
+      const disposals: string[] = [];
+      let movedTo: string | undefined;
+      const rename = fsp.rename.bind(fsp), rm = fsp.rm.bind(fsp);
+      t.mock.method(fsp, "rename", async (...args: Parameters<typeof fsp.rename>) => {
+        if (String(args[0]) === clonePath && exdev && path.dirname(String(args[1])) === holdingRoot())
+          throw Object.assign(new Error("cross device"), { code: "EXDEV" });
+        await rename(...args);
+        if (String(args[0]) === clonePath) movedTo = String(args[1]);
+      });
+      t.mock.method(fsp, "rm", async (...args: Parameters<typeof fsp.rm>) => {
+        if (args[1]?.recursive) disposals.push(String(args[0]));
+        return rm(...args);
+      });
+      const protection = git.hasPhysicalTerminalProtection.bind(git);
+      t.mock.method(git, "hasPhysicalTerminalProtection", async (runId: string) => {
+        if (!movedTo) return protection(runId);
+        assert.equal(readJournal(bare, branch), undefined);
+        latchResidueQuarantine({ cause: "late test latch", runId: owner, site: "test" }, nullLogger());
+        return false;
+      });
+      assert.equal(await git.retireRunnerClone(bare, clonePath, branch, owner, { discard: true }), exdev ? "source-already-absent" : "quarantined");
+      assert.ok(movedTo);
+      assert.equal(fs.readFileSync(path.join(movedTo, "proof.txt"), "utf8"), "owner-only bytes\n");
+      const call = warn.mock.calls.find(c => c.arguments[0] === "retireRunnerClone: worker residue quarantine latched after the journal clear; the holding/scratch dirs are retained, not disposed");
+      assert.ok(call);
+      assert.deepEqual(call.arguments[1], { run_id: owner, clone: clonePath,
+        holding: exdev ? undefined : movedTo, scratch: exdev ? path.dirname(movedTo) : undefined });
+      assert.deepEqual(disposals, []);
+    });
+  }
+
+  it("failed direct holding removal warning preserves path", async (t) => {
+    const owner = randomUUID();
+    const { bare, branch, clonePath } = await seedResidue(2852, owner, "proof.txt");
+    const seam = git as unknown as { log: Logger };
+    const warn = t.mock.method(seam.log, "warn", () => {});
+    const rm = fsp.rm.bind(fsp);
+    let held: string | undefined;
+    t.mock.method(fsp, "rm", async (...args: Parameters<typeof fsp.rm>) => {
+      if (args[1]?.recursive && path.dirname(String(args[0])) === holdingRoot()) {
+        held = String(args[0]);
+        throw Object.assign(new Error("holding busy"), { code: "EACCES" });
+      }
+      return rm(...args);
+    });
+    assert.equal(await git.retireRunnerClone(bare, clonePath, branch, owner, { discard: true }), "quarantined");
+    assert.ok(held);
+    assert.equal(fs.readFileSync(path.join(held, "proof.txt"), "utf8"), "owner-only bytes\n");
+    const call = warn.mock.calls.find(c => c.arguments[0] === "retireRunnerClone: holding dispose failed");
+    assert.ok(call);
+    assert.deepEqual(call.arguments[1], { path: held });
+  });
+
   it("normal dispatched disposal settles despite postcallback lock failure", async (t) => {
     const owner = randomUUID(), branch = "agent/issue-2852";
     const bare = await git.ensureClone(fx.originPath);

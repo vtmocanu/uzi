@@ -11200,7 +11200,13 @@ export class GitCache {
           const protectedNow = await this.hasPhysicalTerminalProtection(ownerRunId);
           checkProcessProof();
           // Preserve quarantine-only late-latch policy: retain moved residue as-is.
-          if (residueQuarantine() !== undefined) { unproven(); return result; }
+          if (residueQuarantine() !== undefined) {
+            unproven();
+            if (holding || scratch) this.log.warn("retireRunnerClone: worker residue quarantine latched after the journal clear; the holding/scratch dirs are retained, not disposed", {
+              run_id: ownerRunId, clone: clonePath, holding, scratch,
+            });
+            return result;
+          }
           if (!renamed || (holding && !opts.discard) || ((holding || scratch) && protectedNow)) unproven();
           const target = scratch ?? (opts.discard ? holding : undefined);
           if (target && !protectedNow) {
@@ -11217,7 +11223,12 @@ export class GitCache {
             // Own the promise outside withLock, whose post-callback interruption may reject.
             beforeDestroy();
             dispatched = this.removeBestEffort(target, scratch ? "retire-scratch" : "retire-holding-dispose",
-              "tree").then(ok => { if (!ok) unproven(); });
+              "tree").then(ok => {
+                if (!ok) {
+                  unproven();
+                  if (holding && !scratch) this.log.warn("retireRunnerClone: holding dispose failed", { path: holding });
+                }
+              });
           }
         }
         return result;
@@ -11233,16 +11244,41 @@ export class GitCache {
             const currentJournal = await this.readRecoveryCaptureRaw(barePath, branch);
             if (currentJournal !== journalBeforeMove?.raw && !(cleared && currentJournal === undefined))
               throw new Error("retirement rollback journal changed");
-            const currentLedger = (await this.readAllAttemptLedgerRaw(barePath))
-              .filter(([b]) => b === branch).map(([, raw]) => raw);
-            const baseline = JSON.stringify(ledgerBeforeMove);
-            if (JSON.stringify(currentLedger) !== baseline) {
-              if (!appended || JSON.stringify(currentLedger) !== JSON.stringify([...ledgerBeforeMove, retiredValue]))
-                throw new Error("retirement rollback ledger changed");
-              await this.rewriteLedgerAtomically(barePath, attemptLedgerKey(branch), ledgerBeforeMove);
+            let ledgerRepairFailed = false;
+            try {
+              const currentLedger = (await this.readAllAttemptLedgerRaw(barePath))
+                .filter(([b]) => b === branch).map(([, raw]) => raw);
+              const baseline = JSON.stringify(ledgerBeforeMove);
+              if (JSON.stringify(currentLedger) !== baseline) {
+                if (!appended || JSON.stringify(currentLedger) !== JSON.stringify([...ledgerBeforeMove, retiredValue]))
+                  throw new Error("retirement rollback ledger changed");
+                await this.rewriteLedgerAtomically(barePath, attemptLedgerKey(branch), ledgerBeforeMove);
+              }
+            } catch (ledgerError) {
+              ledgerRepairFailed = true;
+              unproven();
+              this.log.warn("retireRunnerClone: process revocation rollback ledger repair failed", {
+                clone: clonePath, error: gitErrorMessage(ledgerError),
+              });
             }
-            if (cleared && currentJournal === undefined && journalBeforeMove)
-              await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), journalBeforeMove.raw]);
+            // One journal repair and one return rename, independently of ledger repair.
+            // A possibly retired attempt needs the existing protected-source form so
+            // gatherRetainedUnderLock still enumerates its live bytes conservatively.
+            if (journalBeforeMove && (ledgerRepairFailed || (cleared && currentJournal === undefined))) {
+              const before = journalBeforeMove.journal;
+              const raw = ledgerRepairFailed
+                ? JSON.stringify({ ...before, retainedSources: [...(before.retainedSources ?? []),
+                  { runId: ownerRunId, clonePath, ...(opts.attemptId ? { attemptId: opts.attemptId } : {}) }] })
+                : journalBeforeMove.raw;
+              try {
+                await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), raw]);
+              } catch (journalError) {
+                unproven();
+                this.log.warn("retireRunnerClone: process revocation rollback journal repair failed", {
+                  clone: clonePath, error: gitErrorMessage(journalError),
+                });
+              }
+            }
             if (movedTo) {
               const occupied = await fs.lstat(clonePath).then(() => true, (err: NodeJS.ErrnoException) => {
                 if (err.code === "ENOENT") return false;
