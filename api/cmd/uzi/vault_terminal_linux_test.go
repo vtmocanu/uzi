@@ -375,7 +375,7 @@ func TestVaultUnlockSignalSubprocess(t *testing.T) {
 			}
 
 			home := t.TempDir()
-			cmd := exec.Command(os.Args[0], "-test.run=^TestVaultUnlockSignalHelper$")
+			cmd := exec.Command(os.Args[0], "-test.run=^TestVaultUnlockSignalHelper$") //nolint:gosec // G204: re-executes this test binary with a fixed argument.
 			cmd.Env = append(os.Environ(),
 				"UZI_VAULT_SIGNAL_HELPER=1",
 				"UZI_URL="+srv.URL,
@@ -392,10 +392,13 @@ func TestVaultUnlockSignalSubprocess(t *testing.T) {
 			}
 			waited := make(chan error, 1)
 			go func() { waited <- cmd.Wait() }()
+			exited := false
 			defer func() {
-				if cmd.ProcessState == nil {
+				if !exited {
 					_ = cmd.Process.Kill()
-					<-waited
+					if err := <-waited; err != nil {
+						t.Logf("helper stopped during cleanup: %v", err)
+					}
 				}
 			}()
 
@@ -414,6 +417,7 @@ func TestVaultUnlockSignalSubprocess(t *testing.T) {
 				select {
 				case <-poll.C:
 				case err := <-waited:
+					exited = true
 					t.Fatalf("helper exited before prompting: %v\n%s", err, stderr.String())
 				case <-deadline.C:
 					t.Fatalf("helper did not disable ECHO\n%s", stderr.String())
@@ -433,7 +437,12 @@ func TestVaultUnlockSignalSubprocess(t *testing.T) {
 				t.Fatal(err)
 			}
 			select {
-			case <-waited:
+			case err := <-waited:
+				exited = true
+				var exitErr *exec.ExitError
+				if err != nil && !errors.As(err, &exitErr) {
+					t.Fatalf("wait for helper: %v", err)
+				}
 			case <-deadline.C:
 				t.Fatalf("helper did not exit on %v", sig)
 			}
