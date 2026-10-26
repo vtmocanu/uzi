@@ -101,6 +101,84 @@ describe("verified successor retirement", () => {
     assert.deepEqual(JSON.parse(command(s.bare, "config", "--get", `uzi-recovery.${s.branch}.clone`)), s.expected);
   });
 
+  for (const exdev of [false, true]) for (const failedRestore of [false, true]) for (const seam of ["postmove checkSuccessor acknowledgement", "final acknowledgement", "final physical check"] as const) {
+    if (failedRestore && seam !== "postmove checkSuccessor acknowledgement") continue;
+    it(`normal verified successor revocation at ${seam} restores move-time anchor EXDEV=${exdev} failedRestore=${failedRestore}`, async (t) => {
+      const s = await seedCompleted();
+      let live = true, injected = false, movedTo: string | undefined, moveJournal = "", moveLedger = "";
+      const moves: string[][] = [], disposals: string[] = [];
+      const raw = (key: string) => command(s.bare, "config", "--get-all", key);
+      const journalKey = `uzi-recovery.${s.branch}.clone`, ledgerKey = `uzi-attempts.${s.branch}.entry`;
+      const rename = fsp.rename.bind(fsp), rm = fsp.rm.bind(fsp);
+      t.mock.method(fsp, "rename", async (...args: Parameters<typeof fsp.rename>) => {
+        const from = String(args[0]), to = String(args[1]);
+        if (from === s.expected.clonePath && exdev && path.dirname(to) === holdingRoot())
+          throw Object.assign(new Error("cross device"), { code: "EXDEV" });
+        if (from === s.expected.clonePath) { moveJournal = raw(journalKey); moveLedger = raw(ledgerKey); }
+        if (failedRestore && from === movedTo && to === s.expected.clonePath)
+          throw Object.assign(new Error("restore denied"), { code: "EACCES" });
+        await rename(...args);
+        if (from === s.expected.clonePath) movedTo = to;
+        if (from === s.expected.clonePath || to === s.expected.clonePath) moves.push([from, to]);
+      });
+      t.mock.method(fsp, "rm", async (...args: Parameters<typeof fsp.rm>) => {
+        if (args[1]?.recursive) disposals.push(String(args[0]));
+        return rm(...args);
+      });
+      const revoke = () => {
+        assert.ok(movedTo);
+        assert.equal(fs.existsSync(s.expected.clonePath), false, "canonical is actually absent at revocation");
+        injected = true; live = false;
+      };
+      let postmoveAcknowledgements = 0;
+      s.opts.verifiedSuccessor.acknowledged = async () => {
+        if (movedTo && !injected && ++postmoveAcknowledgements === (seam === "postmove checkSuccessor acknowledgement" ? 1 : 2)) {
+          if (seam !== "final physical check") { await Promise.resolve(); revoke(); }
+        }
+        return true;
+      };
+      const physical = git.hasPhysicalTerminalProtection.bind(git);
+      t.mock.method(git, "hasPhysicalTerminalProtection", async (owner: string) => {
+        const result = await physical(owner);
+        if (seam === "final physical check" && postmoveAcknowledgements === 2 && !injected) revoke();
+        return result;
+      });
+      await assert.rejects(git.retireRunnerClone(s.bare, s.expected.clonePath, s.branch, s.owner, {
+        ...s.opts, processProof: () => live,
+      }), /process proof revoked/);
+      assert.equal(injected, true);
+      assert.ok(movedTo);
+      if (failedRestore) {
+        assert.deepEqual(moves, [[s.expected.clonePath, movedTo]]);
+        assert.equal(fs.existsSync(s.expected.clonePath), false);
+        assert.equal(fs.readFileSync(path.join(movedTo, "predecessor.txt"), "utf8"), "successor bytes\n");
+        assert.equal(command(movedTo, "rev-parse", "HEAD"), s.tip);
+        const held = JSON.parse(raw(journalKey)) as import("../src/git.js").RecoveryJournalEntry;
+        const before = JSON.parse(moveJournal) as import("../src/git.js").RecoveryJournalEntry;
+        assert.equal(held.clonePath, before.clonePath, "predecessor anchor stays in place");
+        assert.deepEqual(held.retainedSources?.slice(0, -1), before.retainedSources);
+        assert.equal(held.retainedSources?.at(-1)?.clonePath, movedTo);
+        const fresh = new GitCache(fx.dataDir, nullLogger());
+        const inventory = await fresh.inspectRetainedSources({ barePath: s.bare, isLivePath: () => false });
+        assert.ok(inventory.sources.some(r => r.sources.some(p => p.clonePath === movedTo)),
+          "fresh inspection discovers holding source alongside its retained predecessors");
+        for (const predecessor of s.expected.retainedSources!)
+          assert.equal(fs.readFileSync(path.join(predecessor.clonePath, "predecessor.txt"), "utf8"), s.bytes.get(predecessor.clonePath));
+        assert.equal(command(s.bare, "rev-parse", s.pin), s.tip);
+        assert.equal(raw(ledgerKey), moveLedger);
+        assert.deepEqual(disposals, []);
+        return;
+      }
+      assert.deepEqual(moves, [[s.expected.clonePath, movedTo], [movedTo, s.expected.clonePath]]);
+      assert.equal(raw(journalKey), moveJournal, "restore the exact predecessor anchor at move time");
+      assert.equal(raw(ledgerKey), moveLedger, "restore every raw ledger value in order");
+      assert.equal(fs.readFileSync(path.join(s.expected.clonePath, "predecessor.txt"), "utf8"), "successor bytes\n");
+      assert.equal(command(s.expected.clonePath, "rev-parse", "HEAD"), s.tip);
+      assert.deepEqual(disposals, []);
+      await assertPredecessors(s, true);
+    });
+  }
+
   type Seed = Awaited<ReturnType<typeof seedCompleted>>;
   async function assertPredecessors(s: Seed, anchored: boolean) {
     const fresh = new GitCache(fx.dataDir, nullLogger());
@@ -2414,6 +2492,137 @@ describe("M2 Git retirement process proof", () => {
       assert.equal(disposals.length, 0, "rollback never attempts recursive disposal");
     });
   }
+
+  for (const exdev of [false, true]) for (const failedRestore of [false, true]) for (const seam of ["actual journal-clear runGit await", "retired append settlement", "physical check", "beforeDestroy guard"] as const) {
+    if (failedRestore && seam !== "actual journal-clear runGit await") continue;
+    it(`normal attempt revocation at ${seam} restores raw metadata EXDEV=${exdev} failedRestore=${failedRestore}`, async (t) => {
+      const owner = randomUUID(), branch = "agent/issue-2852";
+      const bare = await git.ensureClone(fx.originPath);
+      const attemptId = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "0123456789abcdef");
+      const clone = await git.createOrAttachRunnerClone(bare, 2852, noProofReseed, owner, false, undefined,
+        { attemptId, isLive: () => false, beforeSeed: async () => {} });
+      const clonePath = clone.path;
+      fs.writeFileSync(path.join(clonePath, "proof.txt"), "owner-only bytes\n");
+      await git.markRecoveryCapture(bare, clonePath, branch, owner, attemptId);
+      const command = (...args: string[]) => execFileSync("git", ["-C", bare, ...args],
+        { env: GIT_ENV, encoding: "utf8", stdio: "pipe" });
+      const journalKey = `uzi-recovery.${branch}.clone`, ledgerKey = `uzi-attempts.${branch}.entry`;
+      // Noncanonical JSON whitespace and duplicate live values pin raw, ordered restoration.
+      command("config", journalKey, JSON.stringify({ runId: owner, clonePath, attemptId }, null, 2));
+      command("config", "--add", ledgerKey, JSON.stringify({ attemptId, runId: owner, clonePath, state: "live" }, null, 1));
+      const journal = command("config", "--get", journalKey), ledger = command("config", "--get-all", ledgerKey);
+      const head = await git.worktreeHead(clonePath);
+      let live = true, injected = false, movedTo: string | undefined, physicalSettled = false;
+      const moves: string[][] = [], disposals: string[] = [];
+      const rename = fsp.rename.bind(fsp), rm = fsp.rm.bind(fsp);
+      t.mock.method(fsp, "rename", async (...args: Parameters<typeof fsp.rename>) => {
+        const from = String(args[0]), to = String(args[1]);
+        if (from === clonePath && exdev && path.dirname(to) === holdingRoot())
+          throw Object.assign(new Error("cross device"), { code: "EXDEV" });
+        if (failedRestore && from === movedTo && to === clonePath)
+          throw Object.assign(new Error("restore denied"), { code: "EACCES" });
+        await rename(...args);
+        if (from === clonePath) movedTo = to;
+        if (from === clonePath || to === clonePath) moves.push([from, to]);
+      });
+      t.mock.method(fsp, "rm", async (...args: Parameters<typeof fsp.rm>) => {
+        if (args[1]?.recursive) disposals.push(String(args[0]));
+        return rm(...args);
+      });
+      const revoke = () => {
+        assert.ok(movedTo);
+        assert.equal(fs.existsSync(clonePath), false, "canonical is actually absent at revocation");
+        assert.equal(fs.readFileSync(path.join(movedTo, "proof.txt"), "utf8"), "owner-only bytes\n");
+        live = false; injected = true;
+      };
+      type RunGit = (cwd: string | undefined, args: string[]) => Promise<string>;
+      const seamGit = git as unknown as { runGit: RunGit };
+      const runGit = seamGit.runGit.bind(git);
+      t.mock.method(seamGit, "runGit", async (cwd: string | undefined, args: string[]) => {
+        const result = await runGit(cwd, args);
+        if (!injected && movedTo && (
+          (seam === "actual journal-clear runGit await" && args.at(-2) === journalKey && args.at(-1) === "") ||
+          (seam === "retired append settlement" && args.includes("--add") && args.includes(ledgerKey) && args.at(-1)?.includes('"state":"retired"')))) {
+          if (seam === "actual journal-clear runGit await") assert.equal(command("config", "--get", journalKey), "\n", "real clear executed before wrapper settles");
+          revoke();
+        }
+        return result;
+      });
+      const physical = git.hasPhysicalTerminalProtection.bind(git);
+      t.mock.method(git, "hasPhysicalTerminalProtection", async (run: string) => {
+        const value = await physical(run);
+        if (movedTo && !injected) {
+          if (seam === "physical check") revoke();
+          if (seam === "beforeDestroy guard") physicalSettled = true;
+        }
+        return value;
+      });
+      let finalProofChecks = 0;
+      await assert.rejects(git.retireRunnerClone(bare, clonePath, branch, owner, {
+        discard: true, attemptId, processProof: () => {
+          if (physicalSettled && !injected && ++finalProofChecks === 2) revoke();
+          return live;
+        },
+      }), /process proof revoked/);
+      assert.equal(injected, true);
+      assert.ok(movedTo);
+      if (failedRestore) {
+        assert.deepEqual(moves, [[clonePath, movedTo]]);
+        assert.equal(fs.existsSync(clonePath), false);
+        assert.equal(fs.readFileSync(path.join(movedTo, "proof.txt"), "utf8"), "owner-only bytes\n");
+        assert.equal(await git.worktreeHead(movedTo), head);
+        const held = JSON.parse(command("config", "--get", journalKey)) as { clonePath: string };
+        assert.equal(held.clonePath, movedTo, "journal names the actual retained source");
+        const fresh = new GitCache(fx.dataDir, nullLogger());
+        const inventory = await fresh.inspectRetainedSources({ barePath: bare, isLivePath: () => false });
+        const record = inventory.sources.find(r => r.sources.some(s => s.clonePath === movedTo));
+        assert.ok(record, "fresh retained-source inspection discovers the holding copy");
+        assert.ok(record.consumers.includes("blocker:attribution_unknown"), "noncanonical residue grants no disposal authority");
+      } else {
+        assert.deepEqual(moves, [[clonePath, movedTo], [movedTo, clonePath]]);
+        assert.equal(fs.readFileSync(path.join(clonePath, "proof.txt"), "utf8"), "owner-only bytes\n");
+        assert.equal(await git.worktreeHead(clonePath), head);
+        assert.equal(command("config", "--get", journalKey), journal);
+        const inventory = await git.readInventoryCloneHeads(bare, owner);
+        assert.equal(inventory.kind, "verified", "canonical recovery attribution stays valid");
+        if (inventory.kind === "verified") assert.ok(inventory.clones.some(c => c.clonePath === clonePath));
+      }
+      assert.equal(command("config", "--get-all", ledgerKey), ledger, "no retired entry; exact ordered raw baseline");
+      assert.deepEqual(disposals, []);
+    });
+  }
+
+  it("normal dispatched disposal settles despite postcallback lock failure", async (t) => {
+    const owner = randomUUID(), branch = "agent/issue-2852";
+    const bare = await git.ensureClone(fx.originPath);
+    const clone = await git.createOrAttachRunnerClone(bare, 2852, noProofReseed, owner);
+    await git.markRecoveryCapture(bare, clone.path, branch, owner);
+    const entered = proofEvent(), release = proofEvent();
+    let settled = false, returned = false;
+    const rm = fsp.rm.bind(fsp);
+    t.mock.method(fsp, "rm", async (...args: Parameters<typeof fsp.rm>) => {
+      if (args[1]?.recursive && String(args[0]).startsWith(holdingRoot())) {
+        entered.resolve(); await release.promise;
+        await rm(...args); settled = true; return;
+      }
+      return rm(...args);
+    });
+    type WithLock = <T>(key: string, fn: () => Promise<T>) => Promise<T>;
+    const seam = git as unknown as { withLock: WithLock };
+    const withLock = seam.withLock.bind(git);
+    t.mock.method(seam, "withLock", async <T,>(key: string, fn: () => Promise<T>): Promise<T> => {
+      await withLock(key, fn);
+      throw new Error("postcallback interruption");
+    });
+    const retirement = git.retireRunnerClone(bare, clone.path, branch, owner, { discard: true });
+    const rejection = assert.rejects(retirement, /postcallback interruption/).then(() => { returned = true; });
+    try {
+      await entered.promise;
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(returned, false, "rejection waits for dispatched rm");
+    } finally { release.resolve(); await rejection; }
+    assert.equal(settled, true);
+  });
 
   for (const revocation of ["sync", "microtask"] as const) {
     for (const exdev of [false, true]) {

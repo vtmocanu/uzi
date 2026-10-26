@@ -10893,11 +10893,20 @@ export class GitCache {
     const unproven = (): void => {
       try { opts.onRetirementUnproven?.(); } catch { /* preserve retirement behavior */ }
     };
+    let processRevokedHere = false;
     const checkProcessProof = (): void => {
-      if (opts.processProof && opts.processProof() !== true) throw new Error("runner clone process proof revoked");
+      if (opts.processProof) {
+        let valid: boolean;
+        try { valid = opts.processProof(); }
+        catch (error) { processRevokedHere = true; throw error; }
+        if (valid === true) return;
+        processRevokedHere = true;
+        throw new Error("runner clone process proof revoked");
+      }
     };
     checkProcessProof();
     let stage: OrphanRetireStage = "journal_read";
+    let dispatched: Promise<void> | undefined;
     const retire = async (): Promise<{ holding?: string; scratch?: string; renamed: boolean; disposition: RunnerCloneRetireResult }> => {
       // 1. Pre-rename pair validation. Require the EXACT (ownerRunId, clonePath) pair
       //    to STILL be journaled before moving anything. A missing/malformed journal, or
@@ -11022,180 +11031,268 @@ export class GitCache {
         }
         await checkSuccessor(anchored);
       }
-      this.checkRecoveryInterruption();
+      // Snapshot the predecessor anchor, not the initial successor journal. Rollback
+      // touches only this invocation's metadata, while adoption still shares this lock.
+      const journalBeforeMove = opts.completionSource ? undefined : await this.readRecoveryCaptureWithRaw(barePath, branch);
+      const ledgerBeforeMove = (opts.completionSource ? [] : await this.readAllAttemptLedgerRaw(barePath))
+        .filter(([b]) => b === branch).map(([, raw]) => raw);
+      let cleared = false, appended = false;
+      let movedTo: string | undefined;
+      const retiredValue = opts.attemptId === undefined ? undefined : attemptLedgerValue({
+        attemptId: opts.attemptId, runId: ownerRunId, clonePath, state: "retired",
+      });
       try {
-        checkProcessProof();
-        await fs.rename(clonePath, holdingDest);
-      } catch (err) {
-        const e = err as NodeJS.ErrnoException;
-        if (e.code === "EXDEV") {
-          // issue #1354 — runnerRoot and the quarantine share a dataDir PATH but are on
-          // DIFFERENT mounts on a docker-lane worker (the runner-shared subPath bind mount vs the
-          // PVC root; formerly an emptyDir), so the rename to holdingDest is a cross-mount move that
-          // cannot happen even when both sit on one filesystem. Free the canonical with
-          // an intra-device atomic rename into a scratch parent under runnerRoot (SAME
-          // device — never EXDEV, and it survives a daemon file-hold where a recursive rm
-          // races). The #1315 invariant is preserved: the journaled canonical is freed ONLY
-          // by an atomic rename, never a direct recursive rm of partial residue.
-          exdev = true;
-          if (opts.discard) {
-            // Hot path (G1 rename-first): the owner's own terminal trash. Free the
-            // canonical and copy NOTHING — an fs.cp here would throw on a git fsmonitor
-            // socket / FIFO the clone may carry. No holdingDest is used on this path.
-            stage = "intra_device_rename";
-            checkProcessProof();
-            const scratchParent = await this.createRetireScratchParent();
-            if (opts.completionSource && !opts.completionSource.canDelete()) throw new Error("completion cleanup exclusion changed");
-            renamed = await this.renameIntoScratchUnlessLatched(clonePath, scratchParent, undefined,
-              anchored ? () => checkSuccessor(anchored!) : undefined, checkProcessProof);
-            scratch = scratchParent;
-          } else {
-            // Rare foreign-orphan reclaim: the quarantine is RETAINED FOREVER, so
-            // cross-crash retention is a hard requirement → copy-before-free. COMPLETE the
-            // symlink-safe copy into holdingDest FIRST, while the canonical AND the journal
-            // still protect a retry.
-            stage = "retained_copy";
-            try {
-              checkProcessProof();
-              await fs.cp(clonePath, holdingDest, {
-                recursive: true,
-                dereference: false,
-                verbatimSymlinks: true,
-                // dereference:false + verbatimSymlinks:true copy symlinks AS links. The
-                // filter skips sockets/FIFOs: fs.cp throws ERR_FS_CP_SOCKET /
-                // ERR_FS_CP_FIFO_PIPE on them, and the git fsmonitor daemon plants a UNIX
-                // socket in .git/.
-                filter: async (src) => {
-                  checkProcessProof();
-                  const s = await fs.lstat(src);
-                  checkProcessProof();
-                  return !s.isSocket() && !s.isFIFO();
-                },
-              });
-            } catch (copyErr) {
-              // Remove ONLY the incomplete copy; the canonical + journal stay intact so a
-              // retry can re-copy. No scratch parent exists yet (created below), so this
-              // cleanup is scoped strictly to the copy.
-              await this.removeBestEffort(holdingDest, "retire-incomplete-copy", "tree", checkProcessProof);
-              throw copyErr;
-            }
-            // The completed off-tree copy is recorded. NOW free the canonical with the
-            // intra-device atomic rename. A REAL rename failure here must RETAIN the
-            // completed holdingDest AND leave the canonical + journal intact — so this
-            // rename is deliberately OUTSIDE the copy's cleanup catch above.
-            stage = "intra_device_rename";
-            checkProcessProof();
-            const scratchParent = await this.createRetireScratchParent();
-            renamed = await this.renameIntoScratchUnlessLatched(clonePath, scratchParent, holdingDest, undefined, checkProcessProof);
-            holding = holdingDest; // retained; step 6 no-ops since discard === false
-            scratch = scratchParent;
-          }
-        } else if (e.code === "ENOENT") {
-          // The destination parent was asserted in step 3, so a rename ENOENT is about the
-          // SOURCE. Confirm: if the source is gone, the canonical is already free — proceed
-          // to clear the journal. If the source STILL exists, the ENOENT is a real,
-          // unexpected failure (e.g. a destination parent that vanished under us) and must
-          // surface with the journal left intact.
+        this.checkRecoveryInterruption();
+        try {
           checkProcessProof();
-          const sourceGone = await fs.lstat(clonePath).then(
-            () => false,
-            (le: NodeJS.ErrnoException) => {
-              if (le.code === "ENOENT") return true;
-              throw le;
-            },
-          );
-          if (!sourceGone) throw err;
-          renamed = false;
-        } else {
-          throw err;
+          await fs.rename(clonePath, holdingDest);
+          movedTo = holdingDest;
+        } catch (err) {
+          const e = err as NodeJS.ErrnoException;
+          if (e.code === "EXDEV") {
+            // issue #1354 — runnerRoot and the quarantine share a dataDir PATH but are on
+            // DIFFERENT mounts on a docker-lane worker (the runner-shared subPath bind mount vs the
+            // PVC root; formerly an emptyDir), so the rename to holdingDest is a cross-mount move that
+            // cannot happen even when both sit on one filesystem. Free the canonical with
+            // an intra-device atomic rename into a scratch parent under runnerRoot (SAME
+            // device — never EXDEV, and it survives a daemon file-hold where a recursive rm
+            // races). The #1315 invariant is preserved: the journaled canonical is freed ONLY
+            // by an atomic rename, never a direct recursive rm of partial residue.
+            exdev = true;
+            if (opts.discard) {
+              // Hot path (G1 rename-first): the owner's own terminal trash. Free the
+              // canonical and copy NOTHING — an fs.cp here would throw on a git fsmonitor
+              // socket / FIFO the clone may carry. No holdingDest is used on this path.
+              stage = "intra_device_rename";
+              checkProcessProof();
+              const scratchParent = await this.createRetireScratchParent();
+              if (opts.completionSource && !opts.completionSource.canDelete()) throw new Error("completion cleanup exclusion changed");
+              renamed = await this.renameIntoScratchUnlessLatched(clonePath, scratchParent, undefined,
+                anchored ? () => checkSuccessor(anchored!) : undefined, checkProcessProof);
+              scratch = scratchParent;
+              if (renamed) movedTo = path.join(scratchParent, "clone");
+            } else {
+              // Rare foreign-orphan reclaim: the quarantine is RETAINED FOREVER, so
+              // cross-crash retention is a hard requirement → copy-before-free. COMPLETE the
+              // symlink-safe copy into holdingDest FIRST, while the canonical AND the journal
+              // still protect a retry.
+              stage = "retained_copy";
+              try {
+                checkProcessProof();
+                await fs.cp(clonePath, holdingDest, {
+                  recursive: true,
+                  dereference: false,
+                  verbatimSymlinks: true,
+                  // dereference:false + verbatimSymlinks:true copy symlinks AS links. The
+                  // filter skips sockets/FIFOs: fs.cp throws ERR_FS_CP_SOCKET /
+                  // ERR_FS_CP_FIFO_PIPE on them, and the git fsmonitor daemon plants a UNIX
+                  // socket in .git/.
+                  filter: async (src) => {
+                    checkProcessProof();
+                    const s = await fs.lstat(src);
+                    checkProcessProof();
+                    return !s.isSocket() && !s.isFIFO();
+                  },
+                });
+              } catch (copyErr) {
+                // Remove ONLY the incomplete copy; the canonical + journal stay intact so a
+                // retry can re-copy. No scratch parent exists yet (created below), so this
+                // cleanup is scoped strictly to the copy.
+                await this.removeBestEffort(holdingDest, "retire-incomplete-copy", "tree", checkProcessProof);
+                throw copyErr;
+              }
+              // The completed off-tree copy is recorded. NOW free the canonical with the
+              // intra-device atomic rename. A REAL rename failure here must RETAIN the
+              // completed holdingDest AND leave the canonical + journal intact — so this
+              // rename is deliberately OUTSIDE the copy's cleanup catch above.
+              stage = "intra_device_rename";
+              checkProcessProof();
+              const scratchParent = await this.createRetireScratchParent();
+              renamed = await this.renameIntoScratchUnlessLatched(clonePath, scratchParent, holdingDest, undefined, checkProcessProof);
+              holding = holdingDest; // retained; step 6 no-ops since discard === false
+              scratch = scratchParent;
+              if (renamed) movedTo = path.join(scratchParent, "clone");
+            }
+          } else if (e.code === "ENOENT") {
+            // The destination parent was asserted in step 3, so a rename ENOENT is about the
+            // SOURCE. Confirm: if the source is gone, the canonical is already free — proceed
+            // to clear the journal. If the source STILL exists, the ENOENT is a real,
+            // unexpected failure (e.g. a destination parent that vanished under us) and must
+            // surface with the journal left intact.
+            checkProcessProof();
+            const sourceGone = await fs.lstat(clonePath).then(
+              () => false,
+              (le: NodeJS.ErrnoException) => {
+                if (le.code === "ENOENT") return true;
+                throw le;
+              },
+            );
+            if (!sourceGone) throw err;
+            renamed = false;
+          } else {
+            throw err;
+          }
         }
-      }
-      if (!exdev) {
-        // Non-EXDEV path (rename success OR a confirmed source-already-free): unchanged
-        // behavior — holdingDest is the retired residue iff we renamed it, no scratch.
-        holding = renamed ? holdingDest : undefined;
-      }
-      // 5. Journal clear — ONLY after a confirmed rename or a confirmed source-already-
-      //    free. Re-read and clear only if it STILL matches (ownerRunId, clonePath); a
-      //    concurrent successor must never have its journal cleared by us.
-      stage = "journal_clear";
-      const still = await this.readRecoveryCapture(barePath, branch);
-      const processRevoked = opts.processProof !== undefined && opts.processProof() !== true;
-      if (processRevoked || residueQuarantine() !== undefined || (opts.completionSource && !opts.completionSource.canDelete())) {
-        // issue #2213: a latch landed after the move. Undo it (best-effort), keep the journal and
-        // dispose of nothing; the latched worker keeps the clone at its journaled path.
-        const movedTo = renamed ? (exdev ? (scratch ? path.join(scratch, "clone") : undefined) : holdingDest) : undefined;
-        if (movedTo !== undefined) {
-          await fs.rename(movedTo, clonePath).then(
-            async () => {
-              if (scratch) await this.removeBestEffort(scratch, "retire-rollback-scratch", "emptyDir");
-            },
-            (renameErr: unknown) =>
-              this.log.warn("retireRunnerClone: worker residue quarantine latched mid-retire and the clone could not be moved back; it is retained at the holding path", {
+        if (!exdev) {
+          // Non-EXDEV path (rename success OR a confirmed source-already-free): unchanged
+          // behavior — holdingDest is the retired residue iff we renamed it, no scratch.
+          holding = renamed ? holdingDest : undefined;
+        }
+        // 5. Journal clear — ONLY after a confirmed rename or a confirmed source-already-
+        //    free. Re-read and clear only if it STILL matches (ownerRunId, clonePath); a
+        //    concurrent successor must never have its journal cleared by us.
+        stage = "journal_clear";
+        const still = await this.readRecoveryCapture(barePath, branch);
+        const processRevoked = opts.processProof !== undefined && opts.processProof() !== true;
+        if (processRevoked && !opts.completionSource) {
+          processRevokedHere = true;
+          throw new Error("runner clone process proof revoked");
+        }
+        if (processRevoked || residueQuarantine() !== undefined || (opts.completionSource && !opts.completionSource.canDelete())) {
+          // issue #2213: a latch landed after the move. Undo it (best-effort), keep the journal and
+          // dispose of nothing; the latched worker keeps the clone at its journaled path.
+          const movedTo = renamed ? (exdev ? (scratch ? path.join(scratch, "clone") : undefined) : holdingDest) : undefined;
+          if (movedTo !== undefined) {
+            await fs.rename(movedTo, clonePath).then(
+              async () => {
+                if (scratch) await this.removeBestEffort(scratch, "retire-rollback-scratch", "emptyDir");
+              },
+              (renameErr: unknown) =>
+                this.log.warn("retireRunnerClone: worker residue quarantine latched mid-retire and the clone could not be moved back; it is retained at the holding path", {
+                  clone: clonePath,
+                  retained_at: movedTo,
+                  error: gitErrorMessage(renameErr),
+                }),
+            );
+          }
+          if (processRevoked) throw new Error("runner clone process proof revoked");
+          throw new CloneRetainedByQuarantineError();
+        }
+        if (anchored) await checkSuccessor(anchored);
+        if (!opts.completionSource) checkProcessProof();
+        if (!verified && !opts.completionSource && still?.runId === ownerRunId && still.clonePath === clonePath) {
+          cleared = true;
+          await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
+        }
+        // Completion keeps its existing journal until physical disposal succeeds, so a caught
+        // disposal failure can restore the exact canonical source under the held bare lock.
+        // issue #1783 M2: an attempt clone the owner's terminal retire disposed of is `retired` in
+        // the ledger (its id is never reused). Contained: by here the clone is moved and the journal
+        // cleared, so a failed append must neither fail the completed retire nor skip step 6's
+        // disposal of the holding copy.
+        if (opts.attemptId !== undefined && !opts.completionSource) {
+          checkProcessProof();
+          appended = true;
+          await this.appendAttemptLedger(barePath, branch, { attemptId: opts.attemptId, runId: ownerRunId, clonePath, state: "retired" }).catch(
+            (err: unknown) => {
+              unproven();
+              this.log.warn("retireRunnerClone: could not record the attempt as retired; the gone path is compacted later", {
                 clone: clonePath,
-                retained_at: movedTo,
-                error: gitErrorMessage(renameErr),
-              }),
+                attempt_id: opts.attemptId,
+                error: gitErrorMessage(err),
+              });
+            },
           );
         }
-        if (processRevoked) throw new Error("runner clone process proof revoked");
-        throw new CloneRetainedByQuarantineError();
-      }
-      if (anchored) await checkSuccessor(anchored);
-      if (!opts.completionSource) checkProcessProof();
-      if (!verified && !opts.completionSource && still?.runId === ownerRunId && still.clonePath === clonePath) {
-        await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
-      }
-      // Completion keeps its existing journal until physical disposal succeeds, so a caught
-      // disposal failure can restore the exact canonical source under the held bare lock.
-      // issue #1783 M2: an attempt clone the owner's terminal retire disposed of is `retired` in
-      // the ledger (its id is never reused). Contained: by here the clone is moved and the journal
-      // cleared, so a failed append must neither fail the completed retire nor skip step 6's
-      // disposal of the holding copy.
-      if (opts.attemptId !== undefined && !opts.completionSource) {
-        checkProcessProof();
-        await this.appendAttemptLedger(barePath, branch, { attemptId: opts.attemptId, runId: ownerRunId, clonePath, state: "retired" }).catch(
-          (err: unknown) => {
-            unproven();
-            this.log.warn("retireRunnerClone: could not record the attempt as retired; the gone path is compacted later", {
-              clone: clonePath,
-              attempt_id: opts.attemptId,
-              error: gitErrorMessage(err),
+        const result = { holding, scratch, renamed,
+          disposition: holding ? "quarantined" as const : "source-already-absent" as const };
+        if (!opts.completionSource) {
+          checkProcessProof();
+          const protectedNow = await this.hasPhysicalTerminalProtection(ownerRunId);
+          checkProcessProof();
+          // Preserve quarantine-only late-latch policy: retain moved residue as-is.
+          if (residueQuarantine() !== undefined) { unproven(); return result; }
+          if (!renamed || (holding && !opts.discard) || ((holding || scratch) && protectedNow)) unproven();
+          const target = scratch ?? (opts.discard ? holding : undefined);
+          if (target && !protectedNow) {
+            if (verified && await verified.acknowledged() !== true)
+              throw new Error("verified successor FINAL authority unavailable");
+            if (verified && await this.hasPhysicalTerminalProtection(ownerRunId))
+              throw new Error("verified successor FINAL authority unavailable");
+            const beforeDestroy = () => {
+              checkProcessProof();
+              if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
+              this.checkRecoveryInterruption();
+            };
+            // The guard and fs.rm dispatch run synchronously before this callback returns.
+            // Own the promise outside withLock, whose post-callback interruption may reject.
+            beforeDestroy();
+            dispatched = this.removeBestEffort(target, scratch ? "retire-scratch" : "retire-holding-dispose",
+              "tree").then(ok => { if (!ok) unproven(); });
+          }
+        }
+        return result;
+      } catch (error) {
+        if (!opts.completionSource && !dispatched && opts.processProof) {
+          // Preserve an already observed denial even if a later callback returns true.
+          try { checkProcessProof(); } catch { /* rollback below */ }
+        }
+        if (!opts.completionSource && !dispatched && processRevokedHere) {
+          // One restoration attempt, without asking the revoked proof for permission.
+          // Conflicting metadata or an occupied canonical fails closed; no recursive rm.
+          try {
+            const currentJournal = await this.readRecoveryCaptureRaw(barePath, branch);
+            if (currentJournal !== journalBeforeMove?.raw && !(cleared && currentJournal === undefined))
+              throw new Error("retirement rollback journal changed");
+            const currentLedger = (await this.readAllAttemptLedgerRaw(barePath))
+              .filter(([b]) => b === branch).map(([, raw]) => raw);
+            const baseline = JSON.stringify(ledgerBeforeMove);
+            if (JSON.stringify(currentLedger) !== baseline) {
+              if (!appended || JSON.stringify(currentLedger) !== JSON.stringify([...ledgerBeforeMove, retiredValue]))
+                throw new Error("retirement rollback ledger changed");
+              await this.rewriteLedgerAtomically(barePath, attemptLedgerKey(branch), ledgerBeforeMove);
+            }
+            if (cleared && currentJournal === undefined && journalBeforeMove)
+              await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), journalBeforeMove.raw]);
+            if (movedTo) {
+              const occupied = await fs.lstat(clonePath).then(() => true, (err: NodeJS.ErrnoException) => {
+                if (err.code === "ENOENT") return false;
+                throw err;
+              });
+              try {
+                if (occupied) throw new Error("retirement rollback canonical occupied");
+                await fs.rename(movedTo, clonePath);
+              } catch (renameError) {
+                if (journalBeforeMove) {
+                  // Keep the actual residue discoverable through retained-source inspect.
+                  // Its noncanonical path deliberately grants no adoption/discard authority.
+                  // Holding paths are not attempt-shaped; keep the old attempt identity
+                  // in the unchanged ledger, without claiming it for this residue path.
+                  const source = { runId: ownerRunId, clonePath: movedTo };
+                  const before = journalBeforeMove.journal;
+                  const retained = before.clonePath === clonePath
+                    ? { ...before, clonePath: movedTo, attemptId: undefined, retainedSources: [source] }
+                    : { ...before, retainedSources: [...(before.retainedSources ?? []), source] };
+                  await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), JSON.stringify(retained)]);
+                }
+                throw renameError;
+              }
+              if (scratch) await this.removeBestEffort(scratch, "retire-rollback-scratch", "emptyDir");
+            }
+          } catch (rollbackError) {
+            this.log.warn("retireRunnerClone: process revocation rollback retained residue", {
+              clone: clonePath, retained_at: movedTo, error: gitErrorMessage(rollbackError),
             });
-          },
-        );
+          }
+        }
+        throw error;
       }
-      return { holding, scratch, renamed, disposition: holding ? "quarantined" : "source-already-absent" };
     };
-    const result = await (bareLockHeld ? retire() : this.withLock(barePath, retire)).catch((error: unknown) => {
+    let result: Awaited<ReturnType<typeof retire>>;
+    try {
+      result = await (bareLockHeld ? retire() : this.withLock(barePath, retire));
+    } catch (error) {
+      if (dispatched) await dispatched;
       if (opts.orphanDiagnostics) emitOrphanDiagnostic(opts.orphanDiagnostics, clonePath, "orphan_retirement_failed", stage, "canonical_retirement_failure", error);
       throw error;
-    });
-    // 6. Normal retirement disposes outside its lock; completion keeps the outer bare lock.
-    //    Terminal trash (discard) — best-effort delete the
-    //    holding dir. Foreign quarantine (!discard) — RETAIN it forever (never delete).
-    //    Always best-effort delete the intra-device scratch parent (issue #1354): by here
-    //    the canonical is already free and the journal already cleared, so a partial
-    //    scratch rm is harmless residue.
-    const { holding, scratch } = result;
-    let protectedNow = false;
-    if (!opts.completionSource) {
-      checkProcessProof();
-      protectedNow = await this.hasPhysicalTerminalProtection(ownerRunId);
     }
-    // issue #2213: a latch that landed during the protection read keeps the holding and scratch dirs.
-    if (!opts.completionSource && residueQuarantine() !== undefined) {
-      unproven();
-      if (holding || scratch) {
-        this.log.warn("retireRunnerClone: worker residue quarantine latched after the journal clear; the holding/scratch dirs are retained, not disposed", {
-          run_id: ownerRunId,
-          clone: clonePath,
-          holding,
-          scratch,
-        });
-      }
+    if (!opts.completionSource) {
+      if (dispatched) await dispatched;
       return result.disposition;
     }
+    // Completion keeps the existing outer bare lock through disposal.
+    const { holding, scratch } = result;
+    let protectedNow = false;
     if (opts.completionSource) {
       const open = (): void => {
         checkProcessProof();
@@ -11279,32 +11376,6 @@ export class GitCache {
         throw error;
       }
       return result.disposition;
-    }
-    // Recheck trusted FINAL proof separately for each disposal; no retries. A refusal
-    // retains the moved successor and does not affect predecessor paths or episode pins.
-    const checkDisposal = async () => {
-      if (opts.verifiedSuccessor && await opts.verifiedSuccessor.acknowledged() !== true) {
-        throw new Error("verified successor FINAL authority unavailable");
-      }
-      if (await this.hasPhysicalTerminalProtection(ownerRunId)) {
-        throw new Error("verified successor FINAL authority unavailable");
-      }
-      checkProcessProof();
-      if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
-    };
-    if (!result.renamed || (holding && !opts.discard) || ((holding || scratch) && protectedNow)) unproven();
-    if (holding && opts.discard && !protectedNow) {
-      if (opts.verifiedSuccessor) await checkDisposal();
-      this.checkRecoveryInterruption();
-      if (!(await this.removeBestEffort(holding, "retire-holding-dispose", "tree", checkProcessProof))) {
-        unproven();
-        this.log.warn("retireRunnerClone: holding dispose failed", { path: holding });
-      }
-    }
-    if (scratch && !protectedNow) {
-      if (opts.verifiedSuccessor) await checkDisposal();
-      this.checkRecoveryInterruption();
-      if (!(await this.removeBestEffort(scratch, "retire-scratch", "tree", checkProcessProof))) unproven();
     }
     return result.disposition;
   }
