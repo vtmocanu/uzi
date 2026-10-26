@@ -255,7 +255,7 @@ func (s *Service) TestCodexLinkedAccount(ctx context.Context, userID, accountID 
 	if err != nil || codexRotatableState(acct) != nil {
 		return "inconclusive", "generic"
 	}
-	if !s.codexVaultUnlocked(userID) {
+	if !s.codexVaultUnlocked(ctx, userID) {
 		return "inconclusive", "vault_locked"
 	}
 	blob, err := s.openCodexAccountLogin(userID, acct)
@@ -276,7 +276,7 @@ func (s *Service) TestCodexLinkedAccount(ctx context.Context, userID, accountID 
 		}
 	}
 	fresh, err := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{UserID: userID, ID: accountID})
-	if err != nil || fresh.Generation != acct.Generation || fresh.CredentialRevision != acct.CredentialRevision || fresh.CoordState != acct.CoordState || codexRotatableState(fresh) != nil || !s.codexVaultUnlocked(userID) {
+	if err != nil || fresh.Generation != acct.Generation || fresh.CredentialRevision != acct.CredentialRevision || fresh.CoordState != acct.CoordState || codexRotatableState(fresh) != nil || !s.codexVaultUnlocked(ctx, userID) {
 		return "inconclusive", "superseded"
 	}
 	if status == "inconclusive" {
@@ -436,7 +436,7 @@ func (s *Service) finalizeCodexUsage(ctx context.Context, q codexUsageStore, cap
 	if f := s.codexRequireLinkedAlias(ctx, q, captured.UserID, captured.ID); f != nil {
 		return f
 	}
-	if !s.codexVaultUnlocked(captured.UserID) {
+	if !s.codexVaultUnlocked(ctx, captured.UserID) {
 		return codexUsageFail(CodexUsageFailVaultLocked)
 	}
 	return nil
@@ -459,10 +459,10 @@ func (s *Service) codexRequireLinkedAlias(ctx context.Context, q codexUsageStore
 	return nil
 }
 
-// codexVaultUnlocked reports whether the owner's vault is open. A nil vault (the master-box
-// test path / a deployment without the vault) is treated as unlocked, matching the run lane.
-func (s *Service) codexVaultUnlocked(userID uuid.UUID) bool {
-	return s.vlt == nil || s.vlt.Unlocked(userID)
+// codexVaultUnlocked is the mode-aware admission gate, matching the run lane.
+// Explicit nil-vault fixtures retain their original admission behavior.
+func (s *Service) codexVaultUnlocked(ctx context.Context, userID uuid.UUID) bool {
+	return s.vlt == nil || !s.vlt.RequiresUnlock(ctx, userID)
 }
 
 // codexUsageIdentityMatches enforces the response-vs-account identity check. The response

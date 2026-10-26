@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -205,7 +204,7 @@ func (v *Vault) Status(ctx context.Context, userID uuid.UUID) (Status, error) {
 	}
 	// Status holds the lifecycle boundary too; bound its database reads so it
 	// cannot indefinitely prevent an explicit lock or conversion from entering.
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, LifecycleTimeout)
 	defer cancel()
 	m := v.lifecycleMutex(userID)
 	m.Lock()

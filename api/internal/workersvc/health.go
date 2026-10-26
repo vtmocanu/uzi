@@ -1157,7 +1157,7 @@ func (s *Service) queuedReasonWithEligibility(ctx context.Context, now time.Time
 	if r.Kind == "task" && !r.DispatchedAt.Valid {
 		return reasonHandoffSetup
 	}
-	if s.vlt != nil && !s.vlt.Unlocked(r.UserID) {
+	if s.vlt != nil && s.vlt.RequiresUnlock(ctx, r.UserID) {
 		return reasonVaultLocked
 	}
 	// PRD #1296 M4 (D4): the owner-scoped custody-admission block. When the owner holds

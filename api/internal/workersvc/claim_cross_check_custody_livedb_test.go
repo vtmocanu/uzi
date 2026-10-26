@@ -188,7 +188,7 @@ func TestClaimCrossCheckCustodyRefusalsLiveDB(t *testing.T) {
 						other := cloneLaneChild(t, sibling)
 						f.env.exec("UPDATE runs SET status='running',worker_id=$2,cross_check_lane=true WHERE id=$1", other, f.worker)
 					case "vault locked":
-						f.svc.SetVault(vault.New(f.env.box, f.env.q))
+						f.svc.SetVault(vault.NewPostgres(f.env.box, f.env.pool))
 						if harness == "claude" {
 							f.env.exec("UPDATE user_secrets SET sealed_with='dek' WHERE user_id=$1 AND kind='anthropic_token'", f.owner)
 						} else {

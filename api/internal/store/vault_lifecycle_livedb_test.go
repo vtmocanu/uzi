@@ -448,6 +448,9 @@ func TestVaultLifecycleFenceLiveDB(t *testing.T) {
 		t.Fatalf("current persisted seal unreadable: %v", err)
 	}
 	q := store.New(pool)
+	if _, err := q.LockUserVaultStateForMutation(ctx, f.owner); !errors.Is(err, store.ErrVaultTransactionRequired) {
+		t.Fatalf("autocommit state transition fence: %v", err)
+	}
 	if _, err := q.FenceVaultWrite(ctx, f.owner, current.Mode, current.Epoch); !errors.Is(err, store.ErrVaultTransactionRequired) {
 		t.Fatalf("autocommit fence: %v", err)
 	}

@@ -12,7 +12,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/store"
-	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 func TestManualCordonHealthEntryMetadataAndPrerequisites(t *testing.T) {
@@ -55,7 +54,7 @@ func TestManualCordonHealthEntryMetadataAndPrerequisites(t *testing.T) {
 					th.queued = 0
 					want = ""
 				case "vault":
-					svc.SetVault(vault.New(newBox(t), newMemVaultStore()))
+					svc.SetVault(newMemoryVault(newBox(t), newMemVaultStore()))
 					want = reasonVaultLocked
 				case "custody":
 					fs.custodyHolds = int64(testCustodyLimit)
@@ -272,7 +271,7 @@ func TestManualCordonReadFailurePrerequisitePriority(t *testing.T) {
 			want := ""
 			switch mode {
 			case "vault":
-				svc.SetVault(vault.New(newBox(t), newMemVaultStore()))
+				svc.SetVault(newMemoryVault(newBox(t), newMemVaultStore()))
 				want = reasonVaultLocked
 			case "custody":
 				fs.custodyHolds = int64(testCustodyLimit)

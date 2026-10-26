@@ -15,6 +15,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 // codex_account_promote_livedb_test.go pins PRD #1590 M3 (D3) against a real Postgres: the
@@ -654,6 +655,8 @@ func TestCodexAccountPromoteSurvivorRecoveryLiveDB(t *testing.T) {
 		t.Fatalf("SetCodexRecoverySlot = (%d, %v), want (1, nil)", n, err)
 	}
 	svc := parkHeldCodexFix(t, env, fx)
+	svc.SetVault(vault.NewPostgres(env.box, env.pool))
+	svc.SetTxBeginner(env.pool)
 	held := mustRun(t, env, fx.runID)
 
 	// The recovery blob verifies as this account. Every other account's leftover recovery

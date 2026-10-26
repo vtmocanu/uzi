@@ -1271,6 +1271,10 @@ func (f *fakeStore) PromoteLimitWaitRuns(_ context.Context, now pgtype.Timestamp
 // Issue #1197. setRecoveryWaitRows defaults to 0 — the SQL guard refusing — so a fixture
 // that wants a park to land must say so, matching the safe default for a fake whose real
 // query carries a positive source guard (same convention as SetRunLimitWait above).
+func (f *fakeStore) LockUserVaultStateForMutation(ctx context.Context, _ uuid.UUID) (store.LockUserVaultStateRow, error) {
+	return store.LockUserVaultStateRow{VaultMode: store.VaultModeProtected}, ctx.Err()
+}
+
 func (f *fakeStore) SetRunRecoveryWait(_ context.Context, arg store.SetRunRecoveryWaitParams) (int64, error) {
 	f.setRecoveryWait = &arg
 	return f.setRecoveryWaitRows, f.setRecoveryWaitErr

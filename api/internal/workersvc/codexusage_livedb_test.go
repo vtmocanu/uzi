@@ -105,7 +105,7 @@ func newUsageFixture(t *testing.T, env codexTestEnv, fake *fakeUsageClient, with
 	workspace := "acct-" + uuid.NewString()
 	fid := newFakeCodexIdentity()
 	fid.idByToken[access] = codexauth.Identity{ProviderUserID: providerUser, WorkspaceAccountID: workspace}
-	r := NewCodexReconciler(env.q, nil, env.box, fid, env.pool)
+	r := NewCodexReconciler(env.q, env.vlt, env.box, fid, env.pool)
 	if err := r.ReconcileCodexAuthIdentity(env.ctx, userID, aliasID); err != nil {
 		t.Fatalf("reconcile usage alias: %v", err)
 	}
@@ -118,7 +118,8 @@ func newUsageFixture(t *testing.T, env codexTestEnv, fake *fakeUsageClient, with
 	}
 	accountID := uuid.UUID(st.ProviderAccountID.Bytes)
 
-	svc := &Service{q: env.q, box: env.box, codexRefresh: fake}
+	svc := &Service{q: env.q, box: env.box, vlt: env.vlt, codexRefresh: fake}
+	svc.SetTxBeginner(env.pool)
 	return usageFixture{
 		userID:         userID,
 		aliasID:        aliasID,
@@ -350,7 +351,7 @@ func TestReconcileClearsReauthFlagLiveDB(t *testing.T) {
 	newAlias := env.seedStagingAlias(t, fx.userID, "codex-reimport-"+uuid.NewString(), codexLoginBlob{AccessToken: newAccess, RefreshToken: codexToken("refresh-reimport")})
 	fid := newFakeCodexIdentity()
 	fid.idByToken[newAccess] = codexauth.Identity{ProviderUserID: fx.providerUserID, WorkspaceAccountID: fx.workspaceID}
-	r := NewCodexReconciler(env.q, nil, env.box, fid, env.pool)
+	r := NewCodexReconciler(env.q, env.vlt, env.box, fid, env.pool)
 	if err := r.ReconcileCodexAuthIdentity(env.ctx, fx.userID, newAlias); err != nil {
 		t.Fatalf("reconcile re-import: %v", err)
 	}
@@ -516,11 +517,9 @@ func TestCollectCodexAccountUsageFinalizeVaultLockedLiveDB(t *testing.T) {
 	fx := newUsageFixture(t, env, fake, true)
 	fake.usageResults = fx.matchingReadingResult()
 
-	vlt := vault.New(env.box, env.q)
+	vlt := vault.NewPostgres(env.box, env.pool)
 	fx.svc.SetVault(vlt)
-	if err := vlt.Unlock(env.ctx, fx.userID, "codex-usage-finalize-vault-pw"); err != nil {
-		t.Fatalf("unlock vault: %v", err)
-	}
+	enrollCodexProtectedVault(t, env, vlt, fx.userID, "codex-usage-finalize-vault-pw")
 	fake.beforeReturn = func(call int) {
 		if call == 0 {
 			vlt.Lock(fx.userID)
@@ -606,25 +605,26 @@ func TestCollectCodexAccountUsageVaultLockedAtOpenLiveDB(t *testing.T) {
 	fake := &fakeUsageClient{}
 	fx := newUsageFixture(t, env, fake, true)
 
-	vlt := vault.New(env.box, env.q)
+	vlt := vault.NewPostgres(env.box, env.pool)
 	fx.svc.SetVault(vlt)
-	if err := vlt.Unlock(env.ctx, fx.userID, "codex-usage-open-vault-pw"); err != nil {
-		t.Fatalf("unlock vault: %v", err)
-	}
+	enrollCodexProtectedVault(t, env, vlt, fx.userID, "codex-usage-open-vault-pw")
 	// Re-seal the committed login under the DEK, then lock: openCodexAccountLogin now fails.
-	blob := env.accountBlob(t, fx.userID, fx.accountID)
+	blob, err := fx.svc.openCodexAccountLogin(fx.userID, env.mustAccount(t, fx.userID, fx.accountID))
+	if err != nil {
+		t.Fatal(err)
+	}
 	raw, merr := json.Marshal(blob) //nolint:gosec // G117: test marshals a synthetic login-blob fixture, not a real credential
 	if merr != nil {
 		t.Fatalf("marshal login: %v", merr)
 	}
-	dekSealed, serr := vlt.Seal(fx.userID, store.KindCodexAuth, raw)
+	dekSealed, serr := vlt.Seal(env.ctx, fx.userID, store.KindCodexAuth, raw, vault.SealForUse)
 	if serr != nil {
 		t.Fatalf("dek-seal login: %v", serr)
 	}
-	env.exec(`UPDATE codex_provider_account SET sealed_login = $1, sealed_with = $2 WHERE id = $3`, dekSealed, store.SealedWithDEK, fx.accountID)
+	env.exec(`UPDATE codex_provider_account SET sealed_login = $1, sealed_with = $2 WHERE id = $3`, dekSealed.Ciphertext, dekSealed.SealedWith, fx.accountID)
 	vlt.Lock(fx.userID)
 
-	_, err := fx.svc.CollectCodexAccountUsage(env.ctx, fx.userID, fx.accountID)
+	_, err = fx.svc.CollectCodexAccountUsage(env.ctx, fx.userID, fx.accountID)
 	if got := mustUsageFailure(t, err).Kind; got != CodexUsageFailVaultLocked {
 		t.Fatalf("kind = %v, want vault_locked (committed login could not be opened)", got)
 	}

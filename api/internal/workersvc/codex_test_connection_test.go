@@ -85,3 +85,55 @@ func TestCodexLinkedProbeUnit(t *testing.T) {
 		})
 	}
 }
+
+func TestCodexLinkedProbeVaultMode(t *testing.T) {
+	for _, tc := range []struct {
+		name, mode, coord, wantStatus, wantReason string
+		unlocked                                  bool
+		wantCalls                                 int
+	}{
+		{name: "off uncached", mode: store.VaultModeUnprotected, coord: codexCoordIdle, wantStatus: "ok", wantCalls: 1},
+		{name: "protected locked", mode: store.VaultModeProtected, coord: codexCoordIdle, wantStatus: "inconclusive", wantReason: "vault_locked"},
+		{name: "protected unlocked", mode: store.VaultModeProtected, coord: codexCoordIdle, unlocked: true, wantStatus: "ok", wantCalls: 1},
+		{name: "off quarantine", mode: store.VaultModeUnprotected, coord: codexCoordQuarantined, wantStatus: "inconclusive", wantReason: "generic"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			uid, aid := uuid.New(), uuid.New()
+			box := newBox(t)
+			m := newMemVaultStore()
+			m.states[uid] = store.LockVaultAuthStateRow{VaultMode: tc.mode}
+			v := newMemoryVault(box, m)
+			if tc.unlocked {
+				if err := v.Unlock(ctx, uid, "probe-fixture-password"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Legacy input remains readable under either mode. This test writes no
+			// replacement credential and makes no provider refresh call.
+			raw, err := json.Marshal(codexLoginBlob{AccessToken: "access", RefreshToken: "renewal"}) //nolint:gosec // G117: synthetic credential fixture
+			if err != nil {
+				t.Fatal(err)
+			}
+			sealed, err := box.Seal(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			q := &linkedProbeStore{account: store.CodexProviderAccount{
+				UserID: uid, ID: aid, CoordState: tc.coord,
+				SealedLogin: sealed, SealedWith: store.SealedWithMaster,
+				ProviderUserID: "user", WorkspaceAccountID: "workspace",
+			}}
+			svc := &Service{q: q, box: box, vlt: v}
+			calls := 0
+			reader := linkedProbeReader(func(context.Context, string, string) (codexauth.UsageReading, error) {
+				calls++
+				return codexauth.UsageReading{UserID: "user"}, nil
+			})
+			status, reason := svc.TestCodexLinkedAccount(ctx, uid, aid, reader)
+			if status != tc.wantStatus || reason != tc.wantReason || calls != tc.wantCalls {
+				t.Fatalf("status=%s reason=%s calls=%d", status, reason, calls)
+			}
+		})
+	}
+}

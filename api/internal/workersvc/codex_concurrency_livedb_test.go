@@ -294,7 +294,7 @@ func TestCodexTwoRunsDuplicateImportsClaimConcurrentlyLiveDB(t *testing.T) {
 	sameID := codexauth.Identity{ProviderUserID: "user-" + uuid.NewString(), WorkspaceAccountID: "acct-" + uuid.NewString()}
 	fake.idByToken[tok1] = sameID
 	fake.idByToken[tok2] = sameID
-	r := NewCodexReconciler(env.q, nil, env.box, fake, env.pool)
+	r := NewCodexReconciler(env.q, env.vlt, env.box, fake, env.pool)
 	if err := r.ReconcileCodexAuthIdentity(env.ctx, userID, alias1); err != nil {
 		t.Fatalf("reconcile alias1: %v", err)
 	}

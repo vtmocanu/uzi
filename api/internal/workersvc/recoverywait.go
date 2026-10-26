@@ -2,9 +2,11 @@ package workersvc
 
 import (
 	"context"
+	"errors"
 	"math/rand"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -129,6 +131,29 @@ func (s *Service) setRecoveryWait(ctx context.Context, writer recoveryWaitWriter
 // setRecoveryWaitLocked stays on an existing fenced run transaction. Its caller
 // must already have checked claim generation and release under the run lock.
 func (s *Service) setRecoveryWaitLocked(ctx context.Context, writer recoveryWaitWriter, cause pgtype.Text, run store.Run, wkr store.Worker, req StateRequest, sessionID pgtype.Text) (int64, error) {
+	if cause.Valid && cause.String == recoveryCauseVaultLocked {
+		// The caller holds worker/run locks. Lock users next, without taking a
+		// waiting secret advisory or entering the vault lifecycle. Disable must
+		// serialize with this park so an off user cannot acquire an unlock wait.
+		reader, ok := writer.(interface {
+			LockUserVaultStateForMutation(context.Context, uuid.UUID) (store.LockUserVaultStateRow, error)
+		})
+		if !ok {
+			return 0, errors.New("recovery park: vault mode fence unavailable")
+		}
+		state, err := reader.LockUserVaultStateForMutation(ctx, run.UserID)
+		if err != nil {
+			return 0, err
+		}
+		switch state.VaultMode {
+		case store.VaultModeUnprotected:
+			cause = pgtype.Text{}
+		case store.VaultModeProtected:
+			// Historical vault-lock evidence remains valid after unlock.
+		default:
+			return 0, errors.New("recovery park: invalid vault mode")
+		}
+	}
 	retryNotBefore := s.now().Add(s.recoveryParkFallbackFor(run.RecoveryWaitCount) + recoveryParkJitter())
 	return writer.SetRunRecoveryWait(ctx, store.SetRunRecoveryWaitParams{
 		ResetProviderStreak: req.ProviderProgressTurns != nil && *req.ProviderProgressTurns > 0 &&

@@ -15,7 +15,6 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
-	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 // t0 is a fixed "now" so every age is deterministic.
@@ -1126,7 +1125,7 @@ func TestHealthQueuedRepoNotDockerAllowedEarly(t *testing.T) {
 				svc.capabilitySettings = fakeCapabilitySettings{on: true}
 			}
 			if tc.lockedVault {
-				svc.SetVault(vault.New(newBox(t), newMemVaultStore())) // r.UserID never unlocked
+				svc.SetVault(newMemoryVault(newBox(t), newMemVaultStore())) // r.UserID never unlocked
 			}
 
 			svc.detectRunHealth(context.Background(), t0)

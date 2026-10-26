@@ -21,9 +21,8 @@ import (
 // These tests prove the issue #1238 secret-free phase-timing instrumentation: each per-phase
 // and the service-total record carries ONLY non-secret fields (operation_id, a fixed phase
 // name, elapsed integers, a finite result token), and NO token / refresh token / account id /
-// raw error text ever reaches an slog attribute. They are DB-free (no UZI_TEST_DATABASE_URL,
-// no build tag): the advanced happy path is driven through advanceCodexRefresh directly with
-// an in-memory store fake, so a plain `go test ./internal/workersvc/` exercises them.
+// raw error text ever reaches an slog attribute. The refresh paths use a real vault and
+// transaction in LiveDB tests; classification and service-total logging remain DB-free.
 
 // captureRecord is one slog record the capturing handler recorded: its message and a
 // snapshot of its attributes as a key->Value map.
@@ -135,76 +134,19 @@ func (f *instrFakeRefresh) DiscoverIdentity(_ context.Context, _ string) (codexa
 	return f.identity, nil
 }
 
-// instrFakeStore implements all codexRefreshStore methods. Only the 5 reached on the advanced
-// happy path return success; the recovery/reconcile-only writes (issue #1532's fenced intent
-// write + the atomic mismatch clear-and-mark) are unreached here and return their zero values;
-// the 7 read/quarantine methods are unreachable here and panic if hit.
-type instrFakeStore struct{}
-
-func (instrFakeStore) InsertCodexRefreshIntent(context.Context, store.InsertCodexRefreshIntentParams) (store.CodexRefreshIntent, error) {
-	return store.CodexRefreshIntent{}, nil
-}
-
-func (instrFakeStore) AcquireCodexRefreshLease(context.Context, store.AcquireCodexRefreshLeaseParams) (int64, error) {
-	return int64(1), nil
-}
-
-func (instrFakeStore) CommitCodexRefresh(context.Context, store.CommitCodexRefreshParams) (store.CommitCodexRefreshRow, error) {
-	return store.CommitCodexRefreshRow{Generation: 1}, nil
-}
-
-func (instrFakeStore) SetCodexRefreshIntentState(context.Context, store.SetCodexRefreshIntentStateParams) (int64, error) {
-	return int64(1), nil
-}
-
-func (instrFakeStore) SetCodexRefreshIntentStateFenced(context.Context, store.SetCodexRefreshIntentStateFencedParams) (int64, error) {
-	return int64(0), nil
-}
-
-func (instrFakeStore) ClearMismatchedCodexRecoveryAndMarkIntents(context.Context, store.ClearMismatchedCodexRecoveryAndMarkIntentsParams) (store.ClearMismatchedCodexRecoveryAndMarkIntentsRow, error) {
-	return store.ClearMismatchedCodexRecoveryAndMarkIntentsRow{}, nil
-}
-
-func (instrFakeStore) ResetCodexCoordIdle(context.Context, store.ResetCodexCoordIdleParams) (int64, error) {
-	return int64(1), nil
-}
-
-func (instrFakeStore) GetCodexProviderAccountByID(context.Context, store.GetCodexProviderAccountByIDParams) (store.CodexProviderAccount, error) {
-	panic("unused")
-}
-
-func (instrFakeStore) GetCodexRefreshIntent(context.Context, store.GetCodexRefreshIntentParams) (store.CodexRefreshIntent, error) {
-	panic("unused")
-}
-
-func (instrFakeStore) ListUnresolvedCodexRefreshIntents(context.Context, store.ListUnresolvedCodexRefreshIntentsParams) ([]store.CodexRefreshIntent, error) {
-	panic("unused")
-}
-
-func (instrFakeStore) SetCodexRecoverySlot(context.Context, store.SetCodexRecoverySlotParams) (int64, error) {
-	panic("unused")
-}
-
-func (instrFakeStore) QuarantineExpiredCodexLease(context.Context, store.QuarantineExpiredCodexLeaseParams) (int64, error) {
-	panic("unused")
-}
-
-func (instrFakeStore) QuarantineCodexAccount(context.Context, store.QuarantineCodexAccountParams) (int64, error) {
-	panic("unused")
-}
-
-func (instrFakeStore) PromoteCodexRecovery(context.Context, store.PromoteCodexRecoveryParams) (int64, error) {
-	panic("unused")
-}
-
-// newInstrFixture builds the DB-free fixture that drives advanceCodexRefresh: a master box,
+// newInstrFixture builds canary material for advanceCodexRefresh: a master box,
 // a sealed pre-rotation login carrying canary tokens, and the matching account row.
 func newInstrFixture(t *testing.T) (*secretbox.Box, store.CodexProviderAccount) {
 	t.Helper()
 	box, err := secretbox.New(make([]byte, secretbox.KeySize))
 	if err != nil {
-		t.Fatalf("secretbox.New: %v", err)
+		t.Fatal(err)
 	}
+	return box, newInstrAccount(t, box)
+}
+
+func newInstrAccount(t *testing.T, box *secretbox.Box) store.CodexProviderAccount {
+	t.Helper()
 	blob := codexLoginBlob{AccessToken: "CANARY_OLD_ACCESS", RefreshToken: "CANARY_REFRESH"} //nolint:gosec // G101: test canary strings, not real credentials — the test asserts they are scrubbed from the timing logs
 	raw, err := json.Marshal(blob)                                                           //nolint:gosec // G117: sealing a test-fixture login blob, never a real credential
 	if err != nil {
@@ -221,7 +163,7 @@ func newInstrFixture(t *testing.T) (*secretbox.Box, store.CodexProviderAccount) 
 		WorkspaceAccountID: "CANARY_ACCOUNT_ID",
 		Generation:         0,
 	}
-	return box, acct
+	return acct
 }
 
 func TestCodexTimingClassification(t *testing.T) {
@@ -248,9 +190,10 @@ func TestCodexTimingClassification(t *testing.T) {
 	}
 }
 
-func TestCodexRefreshInstrumentationNoSecretLeak(t *testing.T) {
+func TestCodexRefreshInstrumentationNoSecretLeakLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
 	cap := installCapture(t)
-	box, acct := newInstrFixture(t)
+	acct := newInstrAccount(t, env.box)
 	fake := &instrFakeRefresh{
 		result: codexauth.RefreshResult{ //nolint:gosec // G101: test canary string, not a real credential
 			AccessToken: "CANARY_NEW_ACCESS",
@@ -261,11 +204,16 @@ func TestCodexRefreshInstrumentationNoSecretLeak(t *testing.T) {
 			},
 		},
 	}
-	svc := &Service{box: box, codexRefresh: fake}
+	f := newRefreshFixture(t, env, fake)
+	// Preserve the canary login and identity while using the actual canonical row and vault.
+	env.exec(`UPDATE codex_provider_account SET sealed_login=$1, sealed_with=$2,
+ provider_user_id=$3, workspace_account_id=$4 WHERE id=$5`,
+		acct.SealedLogin, acct.SealedWith, acct.ProviderUserID, acct.WorkspaceAccountID, f.accountID)
+	acct = env.mustAccount(t, f.userID, f.accountID)
+	svc := f.svc
 
 	res, aerr := svc.advanceCodexRefresh(
-		context.Background(), instrFakeStore{},
-		uuid.New(), uuid.New(), uuid.New(),
+		env.ctx, env.q, f.userID, f.accountID, uuid.New(),
 		acct, time.Now().Add(time.Hour), time.Now().Add(time.Hour),
 	)
 	if aerr != nil {
@@ -312,17 +260,18 @@ func TestCodexRefreshInstrumentationNoSecretLeak(t *testing.T) {
 	assertNoCanary(t, recs, "CANARY_OLD_ACCESS", "CANARY_NEW_ACCESS", "CANARY_REFRESH", "CANARY_ACCOUNT_ID")
 }
 
-func TestCodexRefreshInstrumentationProviderError(t *testing.T) {
+func TestCodexRefreshInstrumentationProviderErrorLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
 	cap := installCapture(t)
-	box, acct := newInstrFixture(t)
+	acct := newInstrAccount(t, env.box)
 	fake := &instrFakeRefresh{
 		refreshErr: errors.New("provider host=chatgpt.com token=CANARY_PROVIDER_ERR 401"),
 	}
-	svc := &Service{box: box, codexRefresh: fake}
-
-	_, aerr := svc.advanceCodexRefresh(
-		context.Background(), instrFakeStore{},
-		uuid.New(), uuid.New(), uuid.New(),
+	f := newRefreshFixture(t, env, fake)
+	env.exec(`UPDATE codex_provider_account SET sealed_login=$1, sealed_with=$2 WHERE id=$3`, acct.SealedLogin, acct.SealedWith, f.accountID)
+	acct = env.mustAccount(t, f.userID, f.accountID)
+	_, aerr := f.svc.advanceCodexRefresh(
+		env.ctx, env.q, f.userID, f.accountID, uuid.New(),
 		acct, time.Now().Add(time.Hour), time.Now().Add(time.Hour),
 	)
 	if aerr == nil {

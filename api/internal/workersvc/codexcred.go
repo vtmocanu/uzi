@@ -118,10 +118,10 @@ type codexLoginBlob struct {
 // there. The coordinated refresher (lease/intent/generation) is a later unit.
 //
 // The deps are injected so tests supply a fake identity client and (for the seal
-// path) a real secretbox with a nil vault:
+// path) a real policy-aware vault:
 //   - q     the Codex + ciphertext queries (pre-transaction reads run through this);
-//   - vlt   the per-user vault (nil ⇒ seal under the master box, the pre-vault path);
-//   - box   the master box (nil-vault sealing and discriminator-aware master reads);
+//   - vlt   the per-user policy vault, required for canonical material writes;
+//   - box   the master box for discriminator-aware legacy and master-AAD reads;
 //   - ident the identity client (fake in tests);
 //   - beginner the transaction seam (a *pgxpool.Pool), REQUIRED: it makes the canonical
 //     install + link CAS atomic (PRD #1147 M3) so a lost link CAS rolls the canonical
@@ -135,7 +135,7 @@ type CodexReconciler struct {
 	ident    CodexIdentityClient
 }
 
-// NewCodexReconciler builds a reconciler over the store, the vault (may be nil), the
+// NewCodexReconciler builds a reconciler over the store, the policy vault, the
 // master box, the identity client and the transaction beginner (a *pgxpool.Pool). The
 // beginner is REQUIRED: the reconciler always runs its canonical install + link CAS in
 // one transaction (PRD #1147 M3), so there is no non-atomic path to select.
@@ -157,7 +157,7 @@ func NewCodexReconciler(q codexCredStore, vlt *vault.Vault, box *secretbox.Box, 
 //     oauth/refresh calls. Refresh is NEVER called here: if the access token is expired
 //     the import stays failed and the user re-logs in.
 //  3. Reconcile by the full tuple: an existing account for the tuple is linked to
-//     (its sealed_login untouched); otherwise the login blob is sealed under the DEK
+//     (its sealed_login untouched); otherwise the login blob is sealed under current policy
 //     and a new account (generation 0) is inserted, then linked. Linking flips the
 //     state to 'linked'.
 func (r *CodexReconciler) ReconcileCodexAuthIdentity(ctx context.Context, userID, userSecretID uuid.UUID) error {
@@ -245,12 +245,15 @@ func (r *CodexReconciler) ReconcileCodexAuthIdentity(ctx context.Context, userID
 // leave an orphan account (new-account path) or a mutated account (quarantine restore)
 // for a later import to adopt.
 //
-// The beginner is required (NewCodexReconciler enforces it); a nil beginner fails closed
+// The beginner is required; a nil beginner fails closed
 // rather than falling back to a non-atomic write.
 func (r *CodexReconciler) installAndLink(ctx context.Context, userID, userSecretID uuid.UUID, plain []byte, id codexauth.Identity, observedMaterialRevision int64) error {
 	if r.beginner == nil {
 		return fmt.Errorf("codex reconcile: no transaction beginner configured")
 	}
+	// Preparation may fail while protected and locked. Defer that error until
+	// tuple lookup: a healthy account needs only a metadata link, not a new DEK.
+	prepared, prepareErr := r.sealLogin(ctx, userID, plain)
 	tx, err := r.beginner.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("codex reconcile: begin tx: %w", err)
@@ -263,7 +266,18 @@ func (r *CodexReconciler) installAndLink(ctx context.Context, userID, userSecret
 			_ = tx.Rollback(ctx)
 		}
 	}()
-	if err := r.reconcileTuple(ctx, store.New(tx), tx, userID, userSecretID, plain, id, observedMaterialRevision); err != nil {
+	q := store.New(tx)
+	if err := q.LockSecretMutation(ctx, userID); err != nil {
+		return fmt.Errorf("codex reconcile: lock secret mutation: %w", err)
+	}
+	state, err := q.LockUserVaultState(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("codex reconcile: lock vault state: %w", err)
+	}
+	if (state.VaultMode != store.VaultModeUnprotected && state.VaultMode != store.VaultModeProtected) || state.VaultEpoch < 0 {
+		return vault.ErrInvalidState
+	}
+	if err := r.reconcileTuple(ctx, q, tx, userID, userSecretID, plain, id, observedMaterialRevision, state, prepared, prepareErr); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -277,7 +291,7 @@ func (r *CodexReconciler) installAndLink(ctx context.Context, userID, userSecret
 // *store.Queries). tx is the enclosing transaction (always non-nil); it is used to open a
 // SAVEPOINT around the account insert so a same-tuple unique violation can be recovered
 // WITHOUT aborting the outer transaction.
-func (r *CodexReconciler) reconcileTuple(ctx context.Context, q codexCredStore, tx pgx.Tx, userID, userSecretID uuid.UUID, plain []byte, id codexauth.Identity, observedMaterialRevision int64) error {
+func (r *CodexReconciler) reconcileTuple(ctx context.Context, q *store.Queries, tx pgx.Tx, userID, userSecretID uuid.UUID, plain []byte, id codexauth.Identity, observedMaterialRevision int64, state store.LockUserVaultStateRow, prepared vault.SealedMaterial, prepareErr error) error {
 	acct, err := q.GetCodexProviderAccountByTuple(ctx, store.GetCodexProviderAccountByTupleParams{
 		UserID:             userID,
 		ProviderUserID:     id.ProviderUserID,
@@ -305,13 +319,13 @@ func (r *CodexReconciler) reconcileTuple(ctx context.Context, q codexCredStore, 
 		// reauth_generation/revision = the live values) and (ii) the alias material-revision link
 		// CAS below.
 		if acct.CoordState == codexCoordQuarantined || acct.ReauthRequired {
-			sealed, sealedWith, serr := r.sealLogin(userID, plain)
+			sealed, serr := r.currentLoginSeal(ctx, q, userID, plain, state, prepared, prepareErr)
 			if serr != nil {
 				return fmt.Errorf("codex reconcile: seal re-login: %w", serr)
 			}
 			n, rerr := q.RefreshCodexAccountLogin(ctx, store.RefreshCodexAccountLoginParams{
-				Sealed:         sealed,
-				SealedWith:     sealedWith,
+				Sealed:         sealed.Ciphertext,
+				SealedWith:     sealed.SealedWith,
 				ID:             acct.ID,
 				UserID:         userID,
 				FromGeneration: acct.Generation,
@@ -329,10 +343,9 @@ func (r *CodexReconciler) reconcileTuple(ctx context.Context, q codexCredStore, 
 		}
 		return r.link(ctx, q, userID, userSecretID, acct.ID, observedMaterialRevision)
 	case errors.Is(err, pgx.ErrNoRows):
-		// No account for this tuple yet: seal the login blob under the DEK (AAD
-		// user_id||codex_auth, the same vault Seal path the handler uses) and insert
+		// No account for this tuple yet: validate current policy sealing and insert
 		// the authoritative account at generation 0, then link.
-		sealed, sealedWith, serr := r.sealLogin(userID, plain)
+		sealed, serr := r.currentLoginSeal(ctx, q, userID, plain, state, prepared, prepareErr)
 		if serr != nil {
 			return fmt.Errorf("codex reconcile: seal login: %w", serr)
 		}
@@ -340,8 +353,8 @@ func (r *CodexReconciler) reconcileTuple(ctx context.Context, q codexCredStore, 
 			UserID:             userID,
 			ProviderUserID:     id.ProviderUserID,
 			WorkspaceAccountID: id.WorkspaceAccountID,
-			SealedLogin:        sealed,
-			SealedWith:         sealedWith,
+			SealedLogin:        sealed.Ciphertext,
+			SealedWith:         sealed.SealedWith,
 		})
 		if ierr != nil {
 			// Concurrent enrollment of the same tuple: another alias won the
@@ -448,17 +461,29 @@ func (r *CodexReconciler) markFailed(ctx context.Context, userID, userSecretID u
 	})
 }
 
-// sealLogin encrypts the login blob for storage on the provider account, mirroring
-// the handler's sealUserSecret: with a vault it seals under the user's DEK
-// (sealed_with='dek', AAD user_id||codex_auth); without one (tests) it falls back to
-// the master box (sealed_with='master').
-func (r *CodexReconciler) sealLogin(userID uuid.UUID, plaintext []byte) (sealed []byte, sealedWith string, err error) {
-	if r.vlt != nil {
-		sealed, err = r.vlt.Seal(userID, store.KindCodexAuth, plaintext)
-		return sealed, store.SealedWithDEK, err
+// sealLogin prepares policy material without taking lifecycle locks. A nil vault
+// refuses material writes; the master box is only an input-reading dependency.
+func (r *CodexReconciler) sealLogin(ctx context.Context, userID uuid.UUID, plaintext []byte) (vault.SealedMaterial, error) {
+	return r.vlt.Seal(ctx, userID, store.KindCodexAuth, plaintext, vault.SealForUse)
+}
+
+// currentLoginSeal is used only by material-writing branches. The owner row is
+// already locked before tuple lookup. Retry crypto once on a failed preparation
+// or changed mode/epoch, using the same discovered bytes and transaction reader.
+// The final fence verifies both fields before any ciphertext is persisted.
+func (r *CodexReconciler) currentLoginSeal(ctx context.Context, q *store.Queries, userID uuid.UUID, plain []byte, state store.LockUserVaultStateRow, sealed vault.SealedMaterial, prepareErr error) (vault.SealedMaterial, error) {
+	if prepareErr != nil || sealed.Mode != state.VaultMode || sealed.Epoch != state.VaultEpoch {
+		var err error
+		sealed, err = r.sealLogin(vault.WithStateReader(ctx, q), userID, plain)
+		if err != nil {
+			return vault.SealedMaterial{}, err
+		}
 	}
-	sealed, err = r.box.Seal(plaintext)
-	return sealed, store.SealedWithMaster, err
+	// This repeats the users lock to validate the actual seal, including a reseal.
+	if _, err := q.FenceVaultWrite(ctx, userID, sealed.Mode, sealed.Epoch); err != nil {
+		return vault.SealedMaterial{}, err
+	}
+	return sealed, nil
 }
 
 // classifyDiscoveryFailure maps a DiscoverIdentity error to (reason, terminal). terminal is

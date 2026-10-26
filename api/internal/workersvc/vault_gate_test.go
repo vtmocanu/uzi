@@ -2,6 +2,7 @@ package workersvc
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 
@@ -18,11 +19,13 @@ import (
 // can run against a real *vault.Vault without a database.
 type memVaultStore struct {
 	mu     sync.Mutex
+	txMu   sync.Mutex
 	vaults map[uuid.UUID]store.UserVault
+	states map[uuid.UUID]store.LockVaultAuthStateRow
 }
 
 func newMemVaultStore() *memVaultStore {
-	return &memVaultStore{vaults: map[uuid.UUID]store.UserVault{}}
+	return &memVaultStore{vaults: map[uuid.UUID]store.UserVault{}, states: map[uuid.UUID]store.LockVaultAuthStateRow{}}
 }
 
 func (m *memVaultStore) GetUserVault(_ context.Context, id uuid.UUID) (store.UserVault, error) {
@@ -46,19 +49,96 @@ func (m *memVaultStore) CreateUserVaultIfAbsent(_ context.Context, arg store.Cre
 	return v, nil
 }
 
-func (m *memVaultStore) ListMasterSealedSecrets(context.Context, uuid.UUID) ([]store.ListMasterSealedSecretsRow, error) {
+// transaction serializes crypto-only fixture callbacks; it does not model
+// rollback. Atomicity and database lock ordering require LiveDB tests.
+func (m *memVaultStore) transaction(ctx context.Context, fn func(context.Context, vault.Store) error) error {
+	m.txMu.Lock()
+	defer m.txMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return fn(vault.WithStateReader(ctx, m), m)
+}
+
+func newMemoryVault(box *secretbox.Box, m *memVaultStore) *vault.Vault {
+	return vault.New(box, m, m.transaction)
+}
+
+func (m *memVaultStore) state(id uuid.UUID) store.LockVaultAuthStateRow {
+	s, ok := m.states[id]
+	if !ok {
+		s.VaultMode = store.VaultModeProtected
+	}
+	return s
+}
+func (m *memVaultStore) GetUserVaultState(_ context.Context, id uuid.UUID) (store.GetUserVaultStateRow, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.state(id)
+	return store.GetUserVaultStateRow{VaultMode: s.VaultMode, VaultEpoch: s.VaultEpoch}, nil
+}
+func (m *memVaultStore) LockVaultAuthState(_ context.Context, id uuid.UUID) (store.LockVaultAuthStateRow, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.state(id), nil
+}
+func (m *memVaultStore) LockSettingsAdmission(ctx context.Context) error           { return ctx.Err() }
+func (m *memVaultStore) LockSecretMutation(ctx context.Context, _ uuid.UUID) error { return ctx.Err() }
+func (m *memVaultStore) GetVaultPolicy(ctx context.Context) (string, error) {
+	return "optional", ctx.Err()
+}
+func (m *memVaultStore) LockUserVault(ctx context.Context, id uuid.UUID) (store.UserVault, error) {
+	return m.GetUserVault(ctx, id)
+}
+func (m *memVaultStore) DeleteUserVault(_ context.Context, id uuid.UUID) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.vaults[id]; !ok {
+		return 0, nil
+	}
+	delete(m.vaults, id)
+	return 1, nil
+}
+func (m *memVaultStore) AdvanceUserVaultMode(_ context.Context, arg store.AdvanceUserVaultModeParams) (store.AdvanceUserVaultModeRow, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.state(arg.ID)
+	s.VaultMode = arg.VaultMode
+	s.VaultEpoch++
+	m.states[arg.ID] = s
+	return store.AdvanceUserVaultModeRow{VaultMode: s.VaultMode, VaultEpoch: s.VaultEpoch}, nil
+}
+func (m *memVaultStore) HasMasterVaultMaterial(context.Context, uuid.UUID) (bool, error) {
+	return false, nil
+}
+func (m *memVaultStore) GetVaultMaterialTotals(context.Context, uuid.UUID) (store.GetVaultMaterialTotalsRow, error) {
+	return store.GetVaultMaterialTotalsRow{}, nil
+}
+func (m *memVaultStore) LockVaultAccountMaterialBatch(context.Context, store.LockVaultAccountMaterialBatchParams) ([]store.LockVaultAccountMaterialBatchRow, error) {
 	return nil, nil
 }
-func (m *memVaultStore) RewrapUserSecret(context.Context, store.RewrapUserSecretParams) (int64, error) {
-	return 0, nil
+func (m *memVaultStore) LockVaultSecretMaterialBatch(context.Context, store.LockVaultSecretMaterialBatchParams) ([]store.LockVaultSecretMaterialBatchRow, error) {
+	return nil, nil
 }
+func (m *memVaultStore) ResealVaultAccountMaterial(context.Context, store.ResealVaultAccountMaterialParams) (int64, error) {
+	return 0, errors.New("memory vault: no account material")
+}
+func (m *memVaultStore) ResealVaultSecretMaterial(context.Context, store.ResealVaultSecretMaterialParams) (int64, error) {
+	return 0, errors.New("memory vault: no secret material")
+}
+func (m *memVaultStore) ClaimVaultLockNotice(_ context.Context, id uuid.UUID) (uuid.UUID, error) {
+	return id, nil
+}
+
+var _ vault.Store = (*memVaultStore)(nil)
+
 func (m *memVaultStore) ClearVaultLockNotice(context.Context, uuid.UUID) error { return nil }
 
 // unlockedVault returns a vault with uid unlocked (its DEK cached).
 func unlockedVault(t *testing.T, uid uuid.UUID, box *secretbox.Box) *vault.Vault {
 	t.Helper()
-	v := vault.New(box, newMemVaultStore())
-	if err := v.Unlock(context.Background(), uid, "vault-pw"); err != nil {
+	v := newMemoryVault(box, newMemVaultStore())
+	if err := v.Unlock(context.Background(), uid, "vault-password-fixture"); err != nil {
 		t.Fatalf("Unlock: %v", err)
 	}
 	return v
@@ -66,11 +146,11 @@ func unlockedVault(t *testing.T, uid uuid.UUID, box *secretbox.Box) *vault.Vault
 
 // TestClaimGateSkipsLockedOwner: while the run owner's vault is locked, Claim
 // reports idle and never calls ClaimRun — the run stays queued, not failed
-// (PRD #32 M3, directive 9: a pure in-memory gate, no SQL filter).
+// (PRD #32 M3, directive 9; mode-aware admission runs before the claim transaction).
 func TestClaimGateSkipsLockedOwner(t *testing.T) {
 	box := newBox(t)
 	uid := uuid.New()
-	v := vault.New(box, newMemVaultStore()) // uid never unlocked → locked
+	v := newMemoryVault(box, newMemVaultStore()) // uid never unlocked → locked
 
 	fs := &fakeStore{}
 	svc := New(fs, box, testParams())
@@ -99,7 +179,7 @@ func TestClaimUnlockedOwnerOpensDEKToken(t *testing.T) {
 	v := unlockedVault(t, uid, box)
 
 	sealedPAT, _ := box.Seal([]byte(pat))
-	dekTok, err := v.Seal(uid, store.KindAnthropicToken, []byte(token))
+	dekTok, err := v.Seal(context.Background(), uid, store.KindAnthropicToken, []byte(token), vault.SealForUse)
 	if err != nil {
 		t.Fatalf("vault Seal: %v", err)
 	}
@@ -111,8 +191,8 @@ func TestClaimUnlockedOwnerOpensDEKToken(t *testing.T) {
 			DefaultBranch: pgconv.TextOrNull("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
 			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
 		},
-		anthropic:           dekTok,
-		anthropicSealedWith: store.SealedWithDEK,
+		anthropic:           dekTok.Ciphertext,
+		anthropicSealedWith: dekTok.SealedWith,
 		templates:           []store.AgentTemplate{{Name: "coder", PromptBody: "code"}},
 	}
 	svc := New(fs, box, testParams())

@@ -10,6 +10,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
@@ -38,10 +39,8 @@ func TestCodexRefreshRecoveryLostReplyLiveDB(t *testing.T) {
 	f := newRefreshFixture(t, e, fake)
 	cleanupCodexRecoveryUser(t, e.pool, f.userID)
 	cap := e.mintCap(t, f.runID, f.workerID)
-	v := vault.New(e.box, e.q)
-	if err := v.Unlock(e.ctx, f.userID, "recovery-fixture-password"); err != nil {
-		t.Fatal(err)
-	}
+	v := vault.NewPostgres(e.box, e.pool)
+	enrollCodexProtectedVault(t, e, v, f.userID, "recovery-fixture-password")
 	f.svc.SetVault(v)
 	fake.onRefresh = func() { v.Lock(f.userID) }
 	op := uuid.New()
@@ -50,7 +49,7 @@ func TestCodexRefreshRecoveryLostReplyLiveDB(t *testing.T) {
 		t.Fatalf("first response: %v", err)
 	}
 	acct := e.mustAccount(t, f.userID, f.accountID)
-	if acct.CoordState != codexCoordQuarantined || acct.RecoveryCause.String != "vault_locked" || !acct.RecoveryCause.Valid || len(acct.RecoverySealed) == 0 || acct.RecoverySealedWith.String != store.SealedWithMaster {
+	if acct.CoordState != codexCoordQuarantined || acct.RecoveryCause.String != "vault_locked" || !acct.RecoveryCause.Valid || len(acct.RecoverySealed) == 0 || acct.RecoverySealedWith.String != store.SealedWithMasterAAD {
 		t.Fatalf("durable vault recovery absent: state=%s cause=%v", acct.CoordState, acct.RecoveryCause)
 	}
 	for _, unlocked := range []bool{false, true} {
@@ -63,6 +62,7 @@ func TestCodexRefreshRecoveryLostReplyLiveDB(t *testing.T) {
 			e.exec("UPDATE codex_refresh_intent SET state=$1 WHERE operation_id=$2", state, op)
 			fresh := &Service{q: e.q, box: e.box, codexRefresh: fake}
 			fresh.SetVault(v)
+			fresh.SetTxBeginner(e.pool)
 			res, err := fresh.CoordinatedCodexRefresh(e.ctx, f.wkr, f.runID, cap, op, 0)
 			if !errors.Is(err, ErrCodexVaultLocked) || res != (CodexRefreshResult{}) {
 				t.Fatalf("unlocked=%v state=%s retry=(%+v,%v)", unlocked, state, res, err)
@@ -125,7 +125,8 @@ func TestCodexRefreshRecoveryRefusalsLiveDB(t *testing.T) {
 			f := newRefreshFixture(t, e, fake)
 			cleanupCodexRecoveryUser(t, e.pool, f.userID)
 			cap := e.mintCap(t, f.runID, f.workerID)
-			f.svc.SetVault(vault.New(e.box, e.q))
+			enrollCodexProtectedVault(t, e, f.svc.vlt, f.userID, codexVaultLockedTestPassword)
+			fake.onRefresh = func() { f.svc.vlt.Lock(f.userID) }
 			op := uuid.New()
 			if _, err := f.svc.CoordinatedCodexRefresh(e.ctx, f.wkr, f.runID, cap, op, 0); !errors.Is(err, ErrCodexVaultLocked) {
 				t.Fatal(err)
@@ -150,7 +151,8 @@ func TestCodexRefreshRecoveryPendingCompatibilityLiveDB(t *testing.T) {
 			f := newRefreshFixture(t, e, fake)
 			cleanupCodexRecoveryUser(t, e.pool, f.userID)
 			cap := e.mintCap(t, f.runID, f.workerID)
-			f.svc.SetVault(vault.New(e.box, e.q))
+			enrollCodexProtectedVault(t, e, f.svc.vlt, f.userID, codexVaultLockedTestPassword)
+			fake.onRefresh = func() { f.svc.vlt.Lock(f.userID) }
 			if capable {
 				f.wkr.ProtocolCapabilities = []string{capability.CodexRefreshRecoveryV1}
 			}
@@ -204,8 +206,11 @@ func TestCodexRefreshRecoveryReleasedDuringExchangeLiveDB(t *testing.T) {
 	f := newRefreshFixture(t, e, fake)
 	cleanupCodexRecoveryUser(t, e.pool, f.userID)
 	cap := e.mintCap(t, f.runID, f.workerID)
-	f.svc.SetVault(vault.New(e.box, e.q))
-	fake.onRefresh = func() { e.exec("UPDATE runs SET claim_released_at=now() WHERE id=$1", f.runID) }
+	enrollCodexProtectedVault(t, e, f.svc.vlt, f.userID, codexVaultLockedTestPassword)
+	fake.onRefresh = func() {
+		f.svc.vlt.Lock(f.userID)
+		e.exec("UPDATE runs SET claim_released_at=now() WHERE id=$1", f.runID)
+	}
 	op := uuid.New()
 	for i := 0; i < 2; i++ {
 		res, err := f.svc.CoordinatedCodexRefresh(e.ctx, f.wkr, f.runID, cap, op, 0)
@@ -241,9 +246,12 @@ func TestCodexRefreshRecoveryNonVaultBranchesLiveDB(t *testing.T) {
 				f.svc.q = refreshHookStore{Queries: e.q, commitErr: errors.New("injected commit failure")}
 				wantSlot = true
 			case "missing recovery sealer":
-				f.svc.SetVault(vault.New(e.box, e.q))
-				// Open the legacy login first, then remove the recovery sealer.
-				fake.onRefresh = func() { f.svc.box = nil }
+				enrollCodexProtectedVault(t, e, f.svc.vlt, f.userID, codexVaultLockedTestPassword)
+				// Open while unlocked, then remove the recovery sealer and lock.
+				fake.onRefresh = func() {
+					f.svc.vlt.Lock(f.userID)
+					f.svc.SetVault(vault.NewPostgres(nil, e.pool))
+				}
 			}
 			op := uuid.New()
 			res, err := f.svc.CoordinatedCodexRefresh(e.ctx, f.wkr, f.runID, cap, op, 0)
@@ -268,19 +276,40 @@ func TestCodexRefreshRecoveryNonVaultBranchesLiveDB(t *testing.T) {
 	}
 }
 
-// The store hook promotes only after the fenced recovery write, before the first
-// response recheck. This is a response-selection interleaving, not an E2E proof.
-type recoverySlotAfterWriteStore struct {
-	*store.Queries
-	afterWrite func()
+// Promote after the fenced recovery transaction commits, before response selection.
+// The callback fires once for this fixture; a failed commit never runs it.
+type recoveryAfterCommitBeginner struct {
+	*pgxpool.Pool
+	afterCommit func()
+	fired       bool
 }
 
-func (h *recoverySlotAfterWriteStore) SetCodexRecoverySlot(ctx context.Context, arg store.SetCodexRecoverySlotParams) (int64, error) {
-	n, err := h.Queries.SetCodexRecoverySlot(ctx, arg)
-	if err == nil && n == 1 {
-		h.afterWrite()
+func (b *recoveryAfterCommitBeginner) Begin(ctx context.Context) (pgx.Tx, error) {
+	return b.BeginTx(ctx, pgx.TxOptions{})
+}
+
+func (b *recoveryAfterCommitBeginner) BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error) {
+	tx, err := b.Pool.BeginTx(ctx, opts)
+	if err != nil {
+		return nil, err
 	}
-	return n, err
+	return &recoveryAfterCommitTx{Tx: tx, parent: b}, nil
+}
+
+type recoveryAfterCommitTx struct {
+	pgx.Tx
+	parent *recoveryAfterCommitBeginner
+}
+
+func (tx *recoveryAfterCommitTx) Commit(ctx context.Context) error {
+	if err := tx.Tx.Commit(ctx); err != nil {
+		return err
+	}
+	if !tx.parent.fired {
+		tx.parent.fired = true
+		tx.parent.afterCommit()
+	}
+	return nil
 }
 
 func TestCodexRefreshRecoveryPromotedBeforeFirstResponseLiveDB(t *testing.T) {
@@ -311,10 +340,12 @@ func TestCodexRefreshRecoveryPromotedBeforeFirstResponseLiveDB(t *testing.T) {
 					if capable {
 						f.wkr.ProtocolCapabilities = []string{capability.CodexRefreshRecoveryV1}
 					}
-					v := vault.New(e.box, e.q)
+					v := vault.NewPostgres(e.box, e.pool)
 					f.svc.SetVault(v)
+					enrollCodexProtectedVault(t, e, v, f.userID, "first-response-password")
+					fake.onRefresh = func() { v.Lock(f.userID) }
 					before := e.mustAccount(t, f.userID, f.accountID)
-					f.svc.q = &recoverySlotAfterWriteStore{Queries: e.q, afterWrite: func() {
+					f.svc.SetTxBeginner(&recoveryAfterCommitBeginner{Pool: e.pool, afterCommit: func() {
 						acct := e.mustAccount(t, f.userID, f.accountID)
 						if !acct.RecoveryCause.Valid || acct.RecoveryCause.String != "vault_locked" {
 							t.Fatal("missing fenced vault-lock recovery")
@@ -333,7 +364,7 @@ func TestCodexRefreshRecoveryPromotedBeforeFirstResponseLiveDB(t *testing.T) {
 							target := map[string]uuid.UUID{"run": f.runID, "alias": f.aliasID, "account": f.accountID}[tc.target]
 							e.exec(tc.sql, target)
 						}
-					}}
+					}})
 					res, err := f.svc.CoordinatedCodexRefresh(e.ctx, f.wkr, f.runID, cap, uuid.New(), 0)
 					if !errors.Is(err, tc.want) || errors.Is(err, ErrCodexVaultLocked) != (tc.want == ErrCodexVaultLocked) {
 						t.Fatalf("first response=(%+v,%v), want %v", res, err, tc.want)

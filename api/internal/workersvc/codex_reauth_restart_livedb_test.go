@@ -11,6 +11,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 // PRD #1209 M4, DELIVERABLE C: the zero-worker reauth-restart REGRESSION, end to end. Begin
@@ -96,7 +97,7 @@ func TestCodexReauthSurvivesRestartThenReplacementClearsLiveDB(t *testing.T) {
 		codexLoginBlob{AccessToken: newAccess, RefreshToken: codexToken("refresh-reimport")})
 	fid := newFakeCodexIdentity()
 	fid.idByToken[newAccess] = codexauth.Identity{ProviderUserID: fx.providerUserID, WorkspaceAccountID: fx.workspaceID}
-	r := NewCodexReconciler(freshQ, nil, freshBox, fid, freshPool)
+	r := NewCodexReconciler(freshQ, vault.NewPostgres(freshBox, freshPool), freshBox, fid, freshPool)
 	if rerr := r.ReconcileCodexAuthIdentity(env.ctx, fx.userID, newAlias); rerr != nil {
 		t.Fatalf("reconcile verified replacement: %v", rerr)
 	}

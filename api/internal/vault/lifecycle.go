@@ -17,6 +17,10 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
+// LifecycleTimeout bounds a conversion transaction. Result-preserving writers
+// must allow their background lock wait to outlast this conversion boundary.
+const LifecycleTimeout = 2 * time.Minute
+
 // ErrUncertainOutcome requires callers to refresh durable status before retrying.
 // No key is retained, even if fresh reconciliation observes a committed change.
 var ErrUncertainOutcome = errors.New("vault: lifecycle outcome uncertain")
@@ -112,7 +116,7 @@ func (v *Vault) unlock(ctx context.Context, id uuid.UUID, password string, creat
 	if err := v.lifecycleContext(ctx); err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, LifecycleTimeout)
 	defer cancel()
 	m := v.lifecycleMutex(id)
 	m.Lock()
@@ -317,7 +321,7 @@ func (v *Vault) Disable(ctx context.Context, id uuid.UUID) error {
 	if err := v.lifecycleContext(ctx); err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, LifecycleTimeout)
 	defer cancel()
 	m := v.lifecycleMutex(id)
 	m.Lock()

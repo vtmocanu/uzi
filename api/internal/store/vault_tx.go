@@ -40,6 +40,16 @@ func (q *Queries) LockSecretMutation(ctx context.Context, userID uuid.UUID) erro
 	return LockSecretMutation(ctx, q.db, userID)
 }
 
+// LockUserVaultStateForMutation keeps mode-based state transitions inside the
+// caller's existing transaction. An autocommit SELECT FOR UPDATE would release
+// its lock before the subsequent transition and falsely claim serialization.
+func (q *Queries) LockUserVaultStateForMutation(ctx context.Context, userID uuid.UUID) (LockUserVaultStateRow, error) {
+	if err := q.requireVaultTransaction(); err != nil {
+		return LockUserVaultStateRow{}, err
+	}
+	return q.LockUserVaultState(ctx, userID)
+}
+
 // FenceVaultWrite locks the owner row and checks BOTH the sealing mode and epoch.
 // Call after the applicable advisory/worker/run prefix and before material rows.
 // The returned current state permits a provider-result writer to reseal that same

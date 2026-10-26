@@ -151,6 +151,8 @@ func newRejHarness(t *testing.T, providerErr error, rejector *recordingRejector)
 	st := &rejFakeStore{acct: acct}
 	client := &rejFakeRefresh{err: providerErr}
 	svc := &Service{q: st, box: box, codexRefresh: client}
+	svc.SetVault(newMemoryVault(box, newMemVaultStore()))
+	svc.SetTxBeginner(rejectionNoMaterialWriteBeginner{})
 	if rejector != nil {
 		svc.codexRejector = rejector
 	}
@@ -439,4 +441,11 @@ func TestCodexRefreshPhaseLogOAuthErrorOnlyWhenPresent(t *testing.T) {
 			assertKeySet(t, recs[0], "operation_id", "phase", "elapsed_ms", "result", "oauth_error")
 		})
 	}
+}
+
+// Rejection must finish without opening a material-write transaction.
+type rejectionNoMaterialWriteBeginner struct{}
+
+func (rejectionNoMaterialWriteBeginner) Begin(context.Context) (pgx.Tx, error) {
+	return nil, errors.New("rejection fixture: unexpected material-write transaction")
 }

@@ -158,7 +158,7 @@ type ChatClaimConfig struct {
 // Claim's vault gate and assembly-error recovery, so a locked owner's chats wait
 // and a chat with no Anthropic token fails cleanly instead of wedging the loop.
 func (s *Service) ClaimChat(ctx context.Context, wkr store.Worker) (*ChatClaimPayload, error) {
-	if s.vlt != nil && !s.vlt.Unlocked(wkr.UserID) {
+	if s.vlt != nil && s.vlt.RequiresUnlock(ctx, wkr.UserID) {
 		return nil, nil // idle: owner locked
 	}
 	// PRD #1906 M5 (Decision D-D): a chat run is never profile-bound (runs_egress_profile_not_chat),
