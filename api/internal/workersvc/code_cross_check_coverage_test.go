@@ -105,6 +105,35 @@ func TestCodeCrossCheckCoverageMixedEntries(t *testing.T) {
 	}
 }
 
+func TestCodeCrossCheckCoverageUnrepresentablePaths(t *testing.T) {
+	for _, path := range []string{"auth\u202e.go", "auth\n.go", "auth\t.go", "auth\u001b.go", "auth\u0085.go", "auth\u2028.go", "auth\u2029.go"} {
+		t.Run(fmt.Sprintf("%q", path), func(t *testing.T) {
+			account := coverageFixture()
+			account.Entries[0].Path = "auth.go"
+			expected := account.Entries[0]
+			unsafe := expected
+			unsafe.Path = path
+			account.Entries = append(account.Entries, unsafe)
+			account.OmittedPaths = 2
+			got := decodeCoverage(t, NormalizeCodeCrossCheckCoverage("completed", coverageJSON(t, account)))
+			if len(got.Entries) != 1 || got.Entries[0] != expected || got.OmittedPaths != 3 || !got.InventoryIncomplete || got.OmittedCountExact {
+				t.Fatalf("unsafe path aliased or lost valid sibling/omission evidence: %+v", got)
+			}
+			if len(got.Reasons) != 1 || got.Reasons[0] != "coverage_invalid" {
+				t.Fatalf("invalid entry reason changed: %+v", got.Reasons)
+			}
+		})
+	}
+	for _, path := range []string{"é.go", "\U0001f680.go", "\ue000.go"} {
+		account := coverageFixture()
+		account.Entries[0].Path = path
+		raw := coverageJSON(t, account)
+		if got := NormalizeCodeCrossCheckCoverage("completed", raw); !bytes.Equal(got, raw) {
+			t.Fatalf("safe Unicode identity changed: %q: %s", path, got)
+		}
+	}
+}
+
 func TestCodeCrossCheckCoverageBoundaries(t *testing.T) {
 	account := coverageFixture()
 	account.Entries[0].Path = strings.Repeat("é", 256)

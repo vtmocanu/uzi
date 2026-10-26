@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -105,7 +106,9 @@ func NormalizeCodeCrossCheckCoverage(outcome string, input ...json.RawMessage) [
 		if !valid || decodeErr != nil || entry.Path == "" ||
 			len(entry.Path) > codeCoveragePathBytes || len(entry.Reason) > codeCoverageReasonBytes ||
 			!utf8.ValidString(entry.Path) || !utf8.ValidString(entry.Reason) ||
-			strings.ContainsRune(entry.Path, 0) || strings.ContainsRune(entry.Reason, 0) ||
+			strings.ContainsFunc(entry.Path, func(r rune) bool {
+				return unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r)
+			}) || strings.ContainsRune(entry.Reason, 0) ||
 			(entry.Status != "examined" && entry.Status != "excluded" && entry.Status != "unassessed") ||
 			(entry.Status != "unassessed" && entry.Reason == "") ||
 			(entry.RecordedRead && entry.Status != "examined") {

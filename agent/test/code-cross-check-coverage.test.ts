@@ -68,6 +68,33 @@ test("real git inventory retains deleted, renamed, binary and type-changed paths
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
 
+test("inventory omits unrepresentable identities once without aliasing safe Unicode paths", async () => {
+  const safe = ["auth.go", "é.go", "\u{1f680}.go", "\ue000.go"];
+  const unsafe = ["auth\u202e.go", "auth\n.go", "auth\t.go", "auth\u001b.go", "auth\u0085.go", "auth\u2028.go", "auth\u2029.go"];
+  const rows = [...safe, ...unsafe, ...unsafe].map(p => "A\0" + p + "\0").join("");
+  const got = await collectCodeInventory(reader(Buffer.from(rows)), "", base, head, { timeoutMs: 1000 });
+  assert.deepEqual(got.paths, safe);
+  assert.equal(got.omitted_paths, 7);
+  assert.equal(got.omitted_count_exact, true);
+  assert.equal(got.inventory_incomplete, true);
+  assert.deepEqual(got.reasons, ["inventory_truncated"]);
+});
+
+test("normalizer omits injected unrepresentable identities and decoder refuses them", () => {
+  const safe = ["auth.go", "é.go", "\u{1f680}.go", "\ue000.go"];
+  const unsafe = ["auth\u202e.go", "auth\n.go", "auth\t.go", "auth\u001b.go", "auth\u0085.go", "auth\u2028.go", "auth\u2029.go", "auth\0.go"];
+  const got = normalizeCodeCoverage(inventory([...safe, ...unsafe, ...unsafe]), [], new Set(), true);
+  assert.deepEqual(got.entries.map(e => e.path), safe);
+  assert.equal(got.omitted_paths, 8);
+  assert.equal(got.omitted_count_exact, true);
+  assert.equal(got.inventory_incomplete, true);
+  assert.deepEqual(got.reasons, ["inventory_truncated"]);
+  assert.deepEqual(decodeCodeCoverage(got), got);
+  for (const path of unsafe) {
+    assert.throws(() => decodeCodeCoverage({ ...got, entries: [{ ...got.entries[0], path }] }), /invalid code coverage account/);
+  }
+});
+
 test("inventory caps preserve exact counts only for fully consumed records", async () => {
   const rows = Array.from({ length: 129 }, (_, i) => "A\0file-" + i + "\0").join("");
   const got = await collectCodeInventory(reader(Buffer.from(rows)), "", base, head, { timeoutMs: 1000 });
@@ -112,8 +139,10 @@ test("invalid, unknown and duplicate judgments cannot claim examination", () => 
 });
 
 test("verdict parser preserves valid findings independently of optional malformed coverage", () => {
+  const findings = [{ id: "retain", severity: "major", path: "auth.go", line: 17,
+    title: "Preserve authorization", detail: "The changed handler bypasses the owner check." }];
   for (const coverage of [null, {}, false, [], "x".repeat(40000)]) {
-    assert.deepEqual(validateCodeVerdict(JSON.stringify({ findings: [], coverage })).findings, []);
+    assert.deepEqual(validateCodeVerdict(JSON.stringify({ findings, coverage })).findings, findings);
   }
   assert.deepEqual(validateCodeVerdict('{"findings":[]}').findings, []);
   assert.throws(() => validateCodeVerdict('{"findings":{},"coverage":[]}'));
@@ -129,10 +158,13 @@ test("partial and over-budget coverage stays unassessed and obeys encoded accoun
   }
   const large = normalizeCodeCoverage(inventory(["a"]), [{ path: "a", status: "examined", reason: "x".repeat(32768) }], new Set(), true);
   assert.equal(large.omitted_judgments, 1); assert.ok(large.reasons.includes("judgments_truncated"));
-  const inv = inventory(Array.from({ length: 128 }, (_, i) => "p" + i + "\u0001".repeat(500)));
+  const inv = inventory(Array.from({ length: 128 }, (_, i) => "p" + i + "\\".repeat(500)));
   const bounded = normalizeCodeCoverage(inv, [], new Set(), true);
   assert.ok(Buffer.byteLength(JSON.stringify(bounded)) <= CODE_COVERAGE_LIMITS.accountBytes);
+  assert.ok(bounded.entries.length > 0);
   assert.ok(bounded.omitted_paths > 0);
+  assert.equal(bounded.omitted_paths, 128 - bounded.entries.length);
+  assert.equal(bounded.omitted_count_exact, true);
   assert.deepEqual(decodeCodeCoverage(bounded), bounded);
 });
 

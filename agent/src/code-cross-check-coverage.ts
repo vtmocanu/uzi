@@ -31,6 +31,8 @@ const bytes = (s: string): number => Buffer.byteLength(s, "utf8");
 const object = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 const text = (v: unknown, cap: number): v is string => typeof v === "string" && bytes(v) <= cap
   && Buffer.from(v).toString("utf8") === v && !v.includes("\0");
+const representablePath = (v: unknown): v is string => text(v, CODE_COVERAGE_LIMITS.pathBytes)
+  && v.length > 0 && !/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(v);
 const count = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 0;
 const failedInventory = (): CodeInventory => ({
   paths: [], inventory_incomplete: true, omitted_paths: 0, omitted_count_exact: false, reasons: ["inventory_failed"],
@@ -76,7 +78,7 @@ export async function collectCodeInventory(
         if (seen.has(identity)) continue;
         seen.add(identity);
         const path = value.toString("utf8");
-        if (value.length > CODE_COVERAGE_LIMITS.pathBytes || !Buffer.from(path).equals(value)
+        if (!representablePath(path) || !Buffer.from(path).equals(value)
           || inventory.paths.length >= CODE_COVERAGE_LIMITS.entries) {
           inventory.omitted_paths++;
         } else inventory.paths.push(path);
@@ -98,15 +100,17 @@ export async function collectCodeInventory(
 export function normalizeCodeCoverage(
   inventory: CodeInventory, judgments: unknown, recordedReads: ReadonlySet<string>, activityComplete: boolean,
 ): CodeCoverage {
+  const invalidPaths = new Set(inventory.paths.filter(path => !representablePath(path)));
   const account: CodeCoverage = { version: 1,
-    entries: inventory.paths.map(path => ({ path, status: "unassessed", reason: "", recorded_read: false })),
-    inventory_incomplete: inventory.inventory_incomplete, omitted_paths: inventory.omitted_paths,
+    entries: inventory.paths.filter(representablePath).map(path => ({ path, status: "unassessed", reason: "", recorded_read: false })),
+    inventory_incomplete: inventory.inventory_incomplete, omitted_paths: inventory.omitted_paths + invalidPaths.size,
     omitted_count_exact: inventory.omitted_count_exact, unknown_judgments: 0, invalid_judgments: 0,
     omitted_judgments: 0, activity_complete: activityComplete, reasons: [...inventory.reasons] };
   const reason = (code: CoverageReason): void => {
     account.inventory_incomplete = true;
     if (!account.reasons.includes(code)) account.reasons.push(code);
   };
+  if (invalidPaths.size > 0) reason("inventory_truncated");
   if (!activityComplete) reason("activity_incomplete");
   const entries = new Map(account.entries.map(entry => [entry.path, entry]));
   const seen = new Set<string>(), duplicates = new Set<string>();
@@ -175,7 +179,7 @@ export function decodeCodeCoverage(value: unknown): CodeCoverage | null {
   const seen = new Set<string>();
   for (const entry of value.entries) {
     if (!object(entry) || Object.keys(entry).sort().join(",") !== "path,reason,recorded_read,status"
-      || !text(entry.path, CODE_COVERAGE_LIMITS.pathBytes) || !entry.path || seen.has(entry.path)
+      || !representablePath(entry.path) || seen.has(entry.path)
       || !text(entry.reason, CODE_COVERAGE_LIMITS.reasonBytes)
       || !["examined", "excluded", "unassessed"].includes(entry.status as string)
       || (entry.status !== "unassessed" && entry.reason.length === 0)

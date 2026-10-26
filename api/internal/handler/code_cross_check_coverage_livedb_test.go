@@ -56,6 +56,7 @@ func TestCodeCrossCheckCoverageRouteLiveDB(t *testing.T) {
 		{"absent", "", false}, {"null", "null", false}, {"partial", `{"version":1}`, true},
 		{"scalar", `"malformed account"`, true}, {"invalid entries", strings.Replace(valid, `"examined"`, `"invented"`, 1), true},
 		{"over coverage cap", `"` + strings.Repeat("x", 128<<10) + `"`, true},
+		{"unsafe path with valid sibling", strings.Replace(valid, `"entries":[`, `"entries":[{"path":"auth\u202e.go","status":"examined","reason":"checked","recorded_read":true},`, 1), true},
 		{"nul path", strings.Replace(valid, `"a.go"`, `"a\u0000.go"`, 1), true},
 		{"empty examined reason", strings.Replace(valid, `"checked"`, `""`, 1), true},
 		{"unassessed recorded read", strings.Replace(valid, `"examined"`, `"unassessed"`, 1), true},
@@ -89,6 +90,11 @@ func TestCodeCrossCheckCoverageRouteLiveDB(t *testing.T) {
 				var got apitypes.CodeCrossCheckCoverage
 				if json.Unmarshal(stored.Coverage, &got) != nil || got.InventoryIncomplete != tc.incomplete {
 					t.Fatalf("account: %s", stored.Coverage)
+				}
+				if tc.name == "unsafe path with valid sibling" {
+					if len(got.Entries) != 1 || got.Entries[0].Path != "a.go" || got.OmittedPaths != 1 || got.OmittedCountExact || !reflect.DeepEqual(got.Reasons, []string{"coverage_invalid"}) {
+						t.Fatalf("unsafe path retained or valid sibling/omission evidence lost: %+v", got)
+					}
 				}
 				if tc.name == "valid" {
 					var expected apitypes.CodeCrossCheckCoverage
