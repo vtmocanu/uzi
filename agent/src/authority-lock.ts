@@ -54,6 +54,9 @@ interface Context {
   readonly run: NonNullable<AuthorityLockOptions["run"]>;
   readonly supportedFs: (dir: string) => Promise<boolean>;
   verified: boolean;
+  /** The held W descriptor and its name, set once W is acquired (memory only). */
+  wHandle?: fsp.FileHandle;
+  wFile?: string;
 }
 
 async function defaultSupportedFs(dir: string): Promise<boolean> {
@@ -271,9 +274,25 @@ export async function acquireWorkerLifetime(
     throw error;
   }
   retainedHandles.add(handle);
+  ctx.wHandle = handle;
+  ctx.wFile = file;
   const capability = new WorkerLifetime(livenessBrand, dataDir);
   lifetimeContexts.set(capability, ctx);
   return capability;
+}
+
+/**
+ * W exclusivity holds only while the named worker.lock is still the inode this process
+ * locked (a successor opening the name would otherwise lock a different inode). Compare the
+ * held descriptor with the name at each outer A acquisition; memory only, never persisted.
+ */
+async function verifyWorkerLock(ctx: Context): Promise<void> {
+  if (!ctx.wHandle || !ctx.wFile) throw new AuthorityRefusal("live worker lifetime capability required");
+  try { await verifyLockFile(ctx, ctx.wHandle, ctx.wFile); }
+  catch (error) {
+    if (error instanceof AuthorityRefusal) throw error;
+    throw new AuthorityRefusal(`worker lifetime lock unreadable: ${errorText(error)}`);
+  }
 }
 
 function lifetimeContext(lifetime: unknown): Context {
@@ -333,6 +352,9 @@ export async function withAuthorityTransaction<T>(
     throw new AuthorityRefusal("nested authority transaction must borrow the active transaction");
   }
   const { signal } = options;
+  // One deadline covers the in-process queue wait and the cross-process flock wait.
+  const timeoutMs = options.timeoutMs ?? DEFAULT_A_TIMEOUT_MS;
+  const deadline = performance.now() + timeoutMs;
   const key = ctx.authorityDir;
   const previous = tails.get(key) ?? Promise.resolve();
   let release!: () => void;
@@ -341,17 +363,18 @@ export async function withAuthorityTransaction<T>(
   tails.set(key, tail);
   const done = (): void => { release(); if (tails.get(key) === tail) tails.delete(key); };
   try {
-    await waitFor(previous, signal);
+    await waitFor(previous, signal, timeoutMs);
   } catch (error) {
     // Free our queue slot only after the predecessor settles so ordering holds.
     void previous.then(done);
     throw error;
   }
   try {
+    await verifyWorkerLock(ctx);
     const { handle, file } = await openLockFile(ctx, A_NAME);
     try {
       await requireSupportedStorage(ctx.supportedFs, ctx.authorityDir);
-      await flockExclusive(ctx, handle, options.timeoutMs ?? DEFAULT_A_TIMEOUT_MS, signal, false);
+      await flockExclusive(ctx, handle, Math.max(0, deadline - performance.now()), signal, false);
       await verifyLockFile(ctx, handle, file);
       const tx = new AuthorityTransaction(transactionBrand);
       const state: TransactionState = { ctx, active: true };
@@ -366,12 +389,14 @@ export async function withAuthorityTransaction<T>(
   }
 }
 
-function waitFor(promise: Promise<void>, signal: AbortSignal | undefined): Promise<void> {
-  if (!signal) return promise;
+/** Wait for the in-process predecessor, bounded by the caller's deadline and signal. */
+function waitFor(promise: Promise<void>, signal: AbortSignal | undefined, timeoutMs: number): Promise<void> {
   return new Promise((resolve, reject) => {
-    if (signal.aborted) { reject(signal.reason ?? new Error("aborted")); return; }
-    const onAbort = (): void => reject(signal.reason ?? new Error("aborted"));
-    signal.addEventListener("abort", onAbort, { once: true });
-    promise.then(() => { signal.removeEventListener("abort", onAbort); resolve(); });
+    if (signal?.aborted) { reject(signal.reason ?? new Error("aborted")); return; }
+    const cleanup = (): void => { clearTimeout(timer); signal?.removeEventListener("abort", onAbort); };
+    const onAbort = (): void => { cleanup(); reject(signal?.reason ?? new Error("aborted")); };
+    const timer = setTimeout(() => { cleanup(); reject(new AuthorityRefusal("authority lock timeout")); }, Math.max(1, timeoutMs));
+    signal?.addEventListener("abort", onAbort, { once: true });
+    void promise.then(() => { cleanup(); resolve(); });
   });
 }

@@ -219,7 +219,7 @@ test("source paths with symlinks, escapes or odd spelling refuse", async (t) => 
   await tx(f, (t2) => s.admitSourceUse(t2, path.join(f.root, "real", "future")));
 });
 
-test("pending footprints: running blocks admission, settle clears, failure forces retirement", async (t) => {
+test("pending footprints: running blocks admission, settle clears, a failed settle leaves an ineligible slot that blocks admission", async (t) => {
   const f = await fixture(t);
   const s = await store(f);
   const src = source(f);
@@ -299,11 +299,197 @@ test("a failed durable write never returns a lease or leaves an eligible state",
 
   flags.dir = true;
   await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src)), /injected dir sync/);
+  flags.dir = false;
   // The rename may or may not be durable; either way the state is never one that releases.
+  // (Reading finishes the head update for a slot renamed just before the failure.)
   const after = await tx(f, (t2) => s.readSlot(t2, key));
   assert.ok(after?.state === "sealed" || after?.state === "active");
-  flags.dir = false;
   await assert.rejects(tx(f, (t2) => s.transition(t2, lease, "ineligible")), /stale/);
+});
+
+test("input the decoder would refuse is rejected before anything is written, so no slot is wedged", async (t) => {
+  const f = await fixture(t);
+  const s = await store(f);
+  const src = source(f);
+  const key = await tx(f, (t2) => s.slotKey(t2, src));
+
+  await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src, { executor: "" })), /invalid executor/);
+  assert.deepEqual(slotFiles(f), []);
+  const lease = await tx(f, (t2) => s.admitSourceUse(t2, src));
+
+  await tx(f, (t2) => s.markRetiring(t2, lease, { prior: "a".repeat(64), manifest: ["x", "y"] }));
+  await assert.rejects(tx(f, (t2) => s.advanceRetiring(t2, lease, 0.5)), /invalid retire progress/);
+  await assert.rejects(tx(f, (t2) => s.advanceRetiring(t2, lease, Number.NaN)), /invalid retire progress/);
+  const retiring = await tx(f, (t2) => s.readSlot(t2, key));
+  assert.equal(retiring?.retiring?.deleted, 0);
+  await tx(f, (t2) => s.advanceRetiring(t2, lease, 1));
+
+  // 1024 manifest items of 512 three-byte characters pass the per-item limits yet exceed the file bound.
+  const other = await tx(f, (t2) => s.admitSourceUse(t2, source(f, "runner/repo-b")));
+  const otherKey = await tx(f, (t2) => s.slotKey(t2, source(f, "runner/repo-b")));
+  const big = Array.from({ length: 1024 }, (_, i) => String(i).padStart(4, "0") + "€".repeat(508));
+  await assert.rejects(tx(f, (t2) => s.markRetiring(t2, other, { prior: "c".repeat(64), manifest: big })), /exceeds bound/);
+  assert.equal((await tx(f, (t2) => s.readSlot(t2, otherKey)))?.state, "active", "slot still readable and unchanged");
+  await tx(f, (t2) => s.transition(t2, other, "claude_ready"));
+});
+
+test("replaying an older authentic slot file refuses and keeps refusing", async (t) => {
+  const f = await fixture(t);
+  const s = await store(f);
+  const src = source(f);
+  const key = await tx(f, (t2) => s.slotKey(t2, src));
+  const lease = await tx(f, (t2) => s.admitSourceUse(t2, src));
+  const file = path.join(slotsDir(f), `${key}.json`);
+  const old = fs.readFileSync(file);
+  const op = await tx(f, (t2) => s.beginPending(t2, lease, { kind: "destructive", footprint: "rm -r build" }));
+  await tx(f, (t2) => s.settlePending(t2, lease, op, { ok: false, residue: ["build"] }));
+  assert.equal((await tx(f, (t2) => s.readSlot(t2, key)))?.state, "ineligible");
+
+  fs.writeFileSync(file, old, { mode: 0o600 });
+  const restarted = await store(f); // a fresh store has no in-process memory: the head alone must catch it
+  for (const who of [s, restarted]) {
+    await assert.rejects(tx(f, (t2) => who.readSlot(t2, key)), /replay/);
+    await assert.rejects(tx(f, (t2) => who.admitSourceUse(t2, src)), /replay/);
+  }
+  await assert.rejects(tx(f, (t2) => s.transition(t2, lease, "claude_ready")), /replay/);
+});
+
+test("the in-process high-water mark refuses a replay of the slot and head together", async (t) => {
+  const f = await fixture(t);
+  const s = await store(f);
+  const src = source(f);
+  const key = await tx(f, (t2) => s.slotKey(t2, src));
+  const lease = await tx(f, (t2) => s.admitSourceUse(t2, src));
+  const file = path.join(slotsDir(f), `${key}.json`);
+  const headFile = path.join(authorityDir(f), "head.json");
+  const oldSlot = fs.readFileSync(file);
+  const oldHead = fs.readFileSync(headFile);
+  await tx(f, (t2) => s.transition(t2, lease, "ineligible"));
+  fs.writeFileSync(file, oldSlot, { mode: 0o600 });
+  fs.writeFileSync(headFile, oldHead, { mode: 0o600 });
+  // A whole-store rollback is outside the guarantee across a restart; within the process it is caught.
+  await assert.rejects(tx(f, (t2) => s.readSlot(t2, key)), /replay/);
+});
+
+test("the head tracks every slot write and survives its own crash window", async (t) => {
+  const f = await fixture(t);
+  const headFile = path.join(authorityDir(f), "head.json");
+  const head = (): Record<string, number> => (JSON.parse(fs.readFileSync(headFile, "utf8")) as { slots: Record<string, number> }).slots;
+  const flags = { head: false };
+  const s = await store(f, {
+    ops: {
+      syncFile: (h) => h.sync(), syncDir: (h) => h.sync(),
+      rename: async (a, b) => { if (flags.head && b.endsWith("head.json")) throw new Error("injected head failure"); fs.renameSync(a, b); },
+    },
+  });
+  assert.deepEqual(head(), {});
+  const src = source(f);
+  const key = await tx(f, (t2) => s.slotKey(t2, src));
+
+  flags.head = true;
+  await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src)), /injected head failure/);
+  assert.deepEqual(head(), {}, "slot renamed, head not yet updated");
+  assert.equal(slotFiles(f).length, 1);
+  flags.head = false;
+
+  const restarted = await store(f);
+  assert.equal((await tx(f, (t2) => restarted.readSlot(t2, key)))?.seq, 1);
+  assert.deepEqual(head(), { [key]: 1 }, "completed under the transaction");
+  const lease = await tx(f, (t2) => restarted.admitSourceUse(t2, src));
+  await tx(f, (t2) => restarted.transition(t2, lease, "claude_ready"));
+  assert.deepEqual(head(), { [key]: 3 });
+});
+
+test("a rolled-back or deleted head, or a deleted slot, refuses", async (t) => {
+  const f = await fixture(t);
+  const s = await store(f);
+  const src = source(f);
+  const key = await tx(f, (t2) => s.slotKey(t2, src));
+  const headFile = path.join(authorityDir(f), "head.json");
+  const lease = await tx(f, (t2) => s.admitSourceUse(t2, src));
+  const oldHead = fs.readFileSync(headFile);
+  await tx(f, (t2) => s.transition(t2, lease, "claude_ready"));
+  await tx(f, (t2) => s.transition(t2, lease, "ineligible"));
+
+  fs.writeFileSync(headFile, oldHead, { mode: 0o600 });
+  const fresh = await store(f);
+  await assert.rejects(tx(f, (t2) => fresh.readSlot(t2, key)), /ahead of the recorded head/);
+
+  const newHead = fs.readFileSync(headFile);
+  fs.writeFileSync(headFile, JSON.stringify({ ...JSON.parse(newHead.toString()) as object, slots: {} }) + "\n", { mode: 0o600 });
+  await assert.rejects(store(f), /authentication/);
+
+  fs.rmSync(headFile);
+  await assert.rejects(store(f), /without a head/);
+  await assert.rejects(tx(f, (t2) => s.readSlot(t2, key)), /head missing/);
+
+  const g = await fixture(t);
+  const gs = await store(g);
+  const gsrc = source(g);
+  const gkey = await tx(g, (t2) => gs.slotKey(t2, gsrc));
+  await tx(g, (t2) => gs.admitSourceUse(t2, gsrc));
+  fs.rmSync(path.join(slotsDir(g), `${gkey}.json`));
+  await assert.rejects(tx(g, (t2) => gs.admitSourceUse(t2, gsrc)), /slot missing/);
+});
+
+test("a directory swapped under a write is refused before anything is renamed into the store", async (t) => {
+  const f = await fixture(t);
+  let swap = false;
+  const s = await store(f, {
+    ops: {
+      syncFile: async (h) => {
+        await h.sync();
+        if (!swap) return;
+        swap = false;
+        fs.renameSync(slotsDir(f), slotsDir(f) + ".old");
+        fs.mkdirSync(slotsDir(f), { mode: 0o700 });
+      },
+      syncDir: (h) => h.sync(),
+      rename: async (a, b) => { fs.renameSync(a, b); },
+    },
+  });
+  const src = source(f);
+  await tx(f, (t2) => s.slotKey(t2, src));
+  fs.mkdirSync(slotsDir(f), { recursive: true, mode: 0o700 });
+  swap = true;
+  await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src)), /identity changed/);
+  assert.deepEqual(slotFiles(f), [], "nothing renamed into the replacement directory");
+  assert.deepEqual(fs.readdirSync(slotsDir(f) + ".old").filter((name) => name.endsWith(".json")), [], "nor into the original");
+});
+
+test("a stale or foreign lease passed to admit refuses instead of minting a new epoch", async (t) => {
+  const f = await fixture(t);
+  const s = await store(f);
+  const src = source(f);
+  const key = await tx(f, (t2) => s.slotKey(t2, src));
+  const stale = await tx(f, (t2) => s.admitSourceUse(t2, src));
+  const current = await tx(f, (t2) => s.admitSourceUse(t2, src));
+  const before = await tx(f, (t2) => s.readSlot(t2, key));
+  await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src, { lease: stale })), /stale/);
+  assert.deepEqual(await tx(f, (t2) => s.readSlot(t2, key)), before, "nothing was written");
+  assert.equal(await tx(f, (t2) => s.admitSourceUse(t2, src, { lease: current })), current);
+
+  const foreign = await tx(f, (t2) => s.admitSourceUse(t2, source(f, "runner/repo-b")));
+  await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src, { lease: foreign })), /does not belong/);
+
+  await tx(f, (t2) => s.transition(t2, current, "ineligible"));
+  await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src, { lease: current })), /stale/);
+});
+
+test("a failed footprint's residue cannot be discarded by a retire that does not cover it", async (t) => {
+  const f = await fixture(t);
+  const s = await store(f);
+  const src = source(f);
+  const key = await tx(f, (t2) => s.slotKey(t2, src));
+  const lease = await tx(f, (t2) => s.admitSourceUse(t2, src));
+  const op = await tx(f, (t2) => s.beginPending(t2, lease, { kind: "destructive", footprint: "rm -r build" }));
+  await tx(f, (t2) => s.settlePending(t2, lease, op, { ok: false, residue: ["a/b", "c"] }));
+  await assert.rejects(tx(f, (t2) => s.markRetiring(t2, lease, { prior: "d".repeat(64), manifest: ["a/b"] })), /residue/);
+  assert.equal((await tx(f, (t2) => s.readSlot(t2, key)))?.state, "ineligible");
+  await tx(f, (t2) => s.markRetiring(t2, lease, { prior: "d".repeat(64), manifest: ["c", "a/b"] }));
+  await tx(f, (t2) => s.advanceRetiring(t2, lease, 2));
+  await tx(f, (t2) => s.markRetired(t2, lease));
+  assert.equal((await tx(f, (t2) => s.readSlot(t2, key)))?.state, "retired");
 });
 
 test("authority operations require an active transaction of the same root", async (t) => {

@@ -13,12 +13,30 @@ import {
 //
 // Files (all 0600 under the 0700 `<dataDir>/.uzi-authority/`, never persisting st_dev/st_ino):
 //   enrollment.json        authenticated storage UUID + layout version + canonical data root
+//   head.json              MAC'd store head: latest slot seq per slot key (freshness)
 //   slots/<digest>.json    one MAC'd record per source path
 // Writes are tmp(O_EXCL|O_NOFOLLOW) -> file fsync -> rename -> directory fsync -> read back.
+// Each write holds an O_DIRECTORY|O_NOFOLLOW handle on the target directory and refuses when
+// the directory name no longer resolves to that inode, checked before the tmp file is
+// created, before the rename and after it (memory only).
+//
+// Freshness: a MAC binds the key, not recency, so an authentic OLD slot file could be put back
+// to restore a cleared state. Every slot write is therefore followed by a head.json write
+// (the same five-step durable write), so each slot write costs two extra barriers (a file
+// fsync and a directory fsync) on top of the slot's own two. A loaded slot must satisfy
+// slot.seq == head seq; slot.seq == head seq + 1 is the crash window between the slot rename
+// and the head update, and is completed under the transaction. Anything older refuses and
+// blocks. The store also keeps an in-process high-water mark per slot key. Rolling the WHOLE
+// authority store back (head and slots together, e.g. a volume snapshot restore) is outside
+// this guarantee by design; only an older head with a newer slot (more than one ahead) or an
+// older slot under a newer head is detected.
 
 const AUTHORITY_LAYOUT = "uzi-authority-layout/1";
 const ENROLLMENT_VERSION = "uzi-authority-enrollment/1";
 const SLOT_VERSION = "uzi-authority-slot/1";
+const HEAD_VERSION = "uzi-authority-head/1";
+const HEAD_FILE = "head.json";
+const SLOT_FILE = /^[0-9a-f]{64}\.json$/;
 const KEY_LABEL = "uzi completion authority v1";
 const ENROLLMENT_FILE = "enrollment.json";
 const SLOTS_DIR = "slots";
@@ -145,6 +163,17 @@ function normalizeEnrollment(raw: unknown): Enrollment {
   return { version: ENROLLMENT_VERSION, layout: text(o.layout, 128), storageId: uuid(o.storageId), dataDir: text(o.dataDir, 4096) };
 }
 
+interface Head { version: string; storageId: string; slots: Record<string, number> }
+function normalizeHead(raw: unknown): Head {
+  const o = exact(raw, ["version", "storageId", "slots"]);
+  if (o.version !== HEAD_VERSION) throw new AuthorityRefusal("unsupported authority head version");
+  if (!isPlain(o.slots)) throw new AuthorityRefusal("malformed authority record");
+  const entries = Object.entries(o.slots)
+    .map(([key, seq]) => [hex64(key), uint(seq, 1, Number.MAX_SAFE_INTEGER)] as const)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return { version: HEAD_VERSION, storageId: uuid(o.storageId), slots: Object.fromEntries(entries) };
+}
+
 // ---- authenticated records ------------------------------------------------------------
 
 function macOf(key: Buffer, kind: string, bodyJson: string): string {
@@ -203,23 +232,82 @@ async function readRegular(file: string, uid: number, limit: number): Promise<st
   }
 }
 
-async function writeDurable(ops: AuthorityFsOps, dir: string, name: string, content: string): Promise<void> {
-  const tmp = path.join(dir, `.${name}.${randomUUID()}.tmp`);
+/**
+ * Hold a handle on `dir` and expose `check`, which refuses unless the name still resolves to
+ * the directory this handle was opened on. Memory only: st_dev/st_ino are never persisted.
+ */
+async function withDirGuard<T>(
+  dir: string, uid: number, fn: (handle: fsp.FileHandle, check: () => Promise<void>) => Promise<T>,
+): Promise<T> {
+  const handle = await fsp.open(dir, fsc.O_RDONLY | fsc.O_DIRECTORY | fsc.O_NOFOLLOW);
   try {
-    const handle = await fsp.open(tmp, fsc.O_WRONLY | fsc.O_CREAT | fsc.O_EXCL | fsc.O_NOFOLLOW, 0o600);
-    try {
-      await handle.chmod(0o600);
-      await handle.writeFile(content, "utf8");
-      await ops.syncFile(handle);
-    } finally { await handle.close(); }
-    await ops.rename(tmp, path.join(dir, name));
-  } catch (error) {
-    await fsp.unlink(tmp).catch(() => undefined);
-    throw error;
+    const held = await handle.stat({ bigint: true });
+    if (!held.isDirectory() || held.uid !== BigInt(uid) || (held.mode & 0o7777n) !== 0o700n) {
+      throw new AuthorityRefusal("unsafe authority directory");
+    }
+    const check = async (): Promise<void> => {
+      let named;
+      try { named = await fsp.lstat(dir, { bigint: true }); }
+      catch { throw new AuthorityRefusal("authority directory identity changed"); }
+      if (!named.isDirectory() || named.dev !== held.dev || named.ino !== held.ino) {
+        throw new AuthorityRefusal("authority directory identity changed");
+      }
+    };
+    await check();
+    return await fn(handle, check);
+  } finally {
+    await handle.close();
   }
-  const dirHandle = await fsp.open(dir, fsc.O_RDONLY | fsc.O_DIRECTORY | fsc.O_NOFOLLOW);
-  try { await ops.syncDir(dirHandle); } finally { await dirHandle.close(); }
 }
+
+async function writeDurable(ops: AuthorityFsOps, dir: string, uid: number, name: string, content: string): Promise<void> {
+  await withDirGuard(dir, uid, async (dirHandle, check) => {
+    const tmp = path.join(dir, `.${name}.${randomUUID()}.tmp`);
+    try {
+      // withDirGuard verified the directory identity just before this point, so before the tmp file exists.
+      const handle = await fsp.open(tmp, fsc.O_WRONLY | fsc.O_CREAT | fsc.O_EXCL | fsc.O_NOFOLLOW, 0o600);
+      try {
+        await handle.chmod(0o600);
+        await handle.writeFile(content, "utf8");
+        await ops.syncFile(handle);
+      } finally { await handle.close(); }
+      await check(); // before anything is renamed into the store
+      await ops.rename(tmp, path.join(dir, name));
+    } catch (error) {
+      await fsp.unlink(tmp).catch(() => undefined);
+      throw error;
+    }
+    await check();
+    await ops.syncDir(dirHandle);
+    await check();
+  });
+}
+
+function sealHead(key: Buffer, storageId: string, heads: ReadonlyMap<string, number>): string {
+  const slots = Object.fromEntries([...heads].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
+  const content = seal(key, "head", { version: HEAD_VERSION, storageId, slots });
+  if (Buffer.byteLength(content, "utf8") > MAX_SLOT_BYTES) throw new AuthorityRefusal("authority head exceeds bound");
+  return content;
+}
+
+/** The authenticated head, or null when no head file exists. */
+async function readHead(init: StoreIdentity): Promise<Map<string, number> | null> {
+  const source = await readRegular(path.join(init.dir, HEAD_FILE), init.uid, MAX_SLOT_BYTES);
+  if (source === null) return null;
+  const head = unseal(init.key, "head", source, normalizeHead);
+  if (head.storageId !== init.storageId) throw new AuthorityRefusal("authority head belongs to another storage");
+  return new Map(Object.entries(head.slots));
+}
+
+async function writeHead(ops: AuthorityFsOps, init: StoreIdentity, heads: ReadonlyMap<string, number>): Promise<void> {
+  const content = sealHead(init.key, init.storageId, heads);
+  await writeDurable(ops, init.dir, init.uid, HEAD_FILE, content);
+  if (await readRegular(path.join(init.dir, HEAD_FILE), init.uid, MAX_SLOT_BYTES) !== content) {
+    throw new AuthorityRefusal("authority head did not read back");
+  }
+}
+
+interface StoreIdentity { dir: string; uid: number; key: Buffer; storageId: string }
 
 async function ensurePrivateDir(dir: string, parent: string, uid: number, ops: AuthorityFsOps): Promise<void> {
   let created = false;
@@ -282,7 +370,7 @@ export async function openAuthorityStore(tx: AuthorityTransaction, options: Auth
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     if (entries.length > 0) throw new AuthorityRefusal("authority slots exist without an enrollment");
     enrollment = { version: ENROLLMENT_VERSION, layout: AUTHORITY_LAYOUT, storageId: randomUUID(), dataDir: ctx.dataDir };
-    await writeDurable(ops, ctx.authorityDir, ENROLLMENT_FILE, seal(key, "enrollment", enrollment));
+    await writeDurable(ops, ctx.authorityDir, ctx.uid, ENROLLMENT_FILE, seal(key, "enrollment", enrollment));
     const written = await readRegular(enrollmentFile, ctx.uid, MAX_ENROLLMENT_BYTES);
     if (written === null) throw new AuthorityRefusal("authority enrollment vanished");
     enrollment = unseal(key, "enrollment", written, normalizeEnrollment);
@@ -291,6 +379,16 @@ export async function openAuthorityStore(tx: AuthorityTransaction, options: Auth
   }
   if (enrollment.layout !== AUTHORITY_LAYOUT) throw new AuthorityRefusal("unsupported authority layout");
   if (enrollment.dataDir !== ctx.dataDir) throw new AuthorityRefusal("authority enrolled under a different data root spelling");
+  // The head makes slot freshness checkable. Create it only for an empty store: slots with no
+  // head cannot be told from a deleted head, so they refuse.
+  const identity: StoreIdentity = { dir: ctx.authorityDir, uid: ctx.uid, key, storageId: enrollment.storageId };
+  if (await readHead(identity) === null) {
+    let entries: string[] = [];
+    try { entries = await fsp.readdir(slotsDir); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    if (entries.some((name) => SLOT_FILE.test(name))) throw new AuthorityRefusal("authority slots exist without a head");
+    await writeHead(ops, identity, new Map());
+  }
   return new AuthorityStore(storeBrand, {
     key, storageId: enrollment.storageId, ctxDir: ctx.authorityDir, dataDir: ctx.dataDir, uid: ctx.uid,
     incarnation: options.workerIncarnation ?? PROCESS_INCARNATION, ops,
@@ -307,8 +405,19 @@ const NEXT_STATES: Record<"claude_ready" | "sealed" | "ineligible", SlotState[]>
   ineligible: ["active", "claude_ready", "sealed"],
 };
 
+/** A failed footprint's residue may only be discarded by a retire that deletes all of it. */
+function requireResidueCovered(pending: PendingFootprint | null, manifest: readonly string[]): void {
+  if (pending?.status !== "settled_failed") return;
+  const covered = new Set(manifest);
+  if (!pending.residue.every((item) => covered.has(item))) {
+    throw new AuthorityRefusal("pending residue is not covered by the retire manifest");
+  }
+}
+
 export class AuthorityStore {
   readonly #init: StoreInit;
+  /** Highest seq this store has loaded or written per slot key (in-process freshness floor). */
+  readonly #highWater = new Map<string, number>();
   constructor(token: symbol, init: StoreInit) {
     if (token !== storeBrand) throw new TypeError("AuthorityStore cannot be constructed");
     this.#init = init;
@@ -363,19 +472,56 @@ export class AuthorityStore {
     return createHmac("sha256", this.#init.key).update(`slot\0${this.#init.storageId}\0${rel}`).digest("hex");
   }
 
+  #identityOf(): StoreIdentity {
+    return { dir: this.#init.ctxDir, uid: this.#init.uid, key: this.#init.key, storageId: this.#init.storageId };
+  }
+
+  async #head(): Promise<Map<string, number>> {
+    const head = await readHead(this.#identityOf());
+    if (head === null) throw new AuthorityRefusal("authority head missing");
+    return head;
+  }
+
   async #load(dir: string, key: string): Promise<SlotSnapshot | null> {
+    const head = await this.#head();
     const source = await readRegular(path.join(dir, `${key}.json`), this.#init.uid, MAX_SLOT_BYTES);
-    if (source === null) return null;
+    const headSeq = head.get(key) ?? 0;
+    const floor = Math.max(headSeq, this.#highWater.get(key) ?? 0);
+    if (source === null) {
+      if (floor > 0) throw new AuthorityRefusal("authority slot missing");
+      return null;
+    }
     const body = unseal(this.#init.key, "slot", source, normalizeSlot);
     if (body.key !== key) throw new AuthorityRefusal("authority slot does not match its name");
+    if (body.seq < floor) throw new AuthorityRefusal("authority slot is older than the recorded head (replay)");
+    if (body.seq > headSeq) {
+      // Exactly one ahead is a crash between the slot rename and the head update: finish it.
+      if (body.seq !== headSeq + 1) throw new AuthorityRefusal("authority slot is ahead of the recorded head");
+      head.set(key, body.seq);
+      await writeHead(this.#init.ops, this.#identityOf(), head);
+    }
+    this.#highWater.set(key, body.seq);
     return body;
   }
 
-  async #save(dir: string, body: SlotSnapshot): Promise<void> {
+  /**
+   * Validate through the decoder and the size bound BEFORE anything is written, so the public
+   * API can never persist a slot the next load would refuse. The slot is written first, then
+   * the head (which must stay within its own bound, checked up front).
+   */
+  async #save(dir: string, input: SlotSnapshot): Promise<void> {
+    const body = normalizeSlot(JSON.parse(JSON.stringify(input)));
     const content = seal(this.#init.key, "slot", body);
-    await writeDurable(this.#init.ops, dir, `${body.key}.json`, content);
+    if (Buffer.byteLength(content, "utf8") > MAX_SLOT_BYTES) throw new AuthorityRefusal("authority slot exceeds bound");
+    const head = await this.#head();
+    if (body.seq !== (head.get(body.key) ?? 0) + 1) throw new AuthorityRefusal("authority slot is not the next head sequence");
+    head.set(body.key, body.seq);
+    sealHead(this.#init.key, this.#init.storageId, head);
+    await writeDurable(this.#init.ops, dir, this.#init.uid, `${body.key}.json`, content);
     const back = await readRegular(path.join(dir, `${body.key}.json`), this.#init.uid, MAX_SLOT_BYTES);
     if (back !== content) throw new AuthorityRefusal("authority slot did not read back");
+    this.#highWater.set(body.key, body.seq);
+    await writeHead(this.#init.ops, this.#identityOf(), head);
   }
 
   /** Current verified slot, or null when never admitted. A malformed slot refuses. */
@@ -387,25 +533,33 @@ export class AuthorityStore {
 
   /**
    * Durably invalidate older authority for this source and return a lease for a fresh
-   * epoch. Presenting this store's still-current lease re-admits without a write.
+   * epoch. Presenting this store's still-current lease re-admits without a write; a lease
+   * that is not current (stale epoch, other source, other store, slot no longer active) is
+   * REFUSED, never silently replaced by a new epoch: call without a lease to mint one.
    */
   async admitSourceUse(
     tx: AuthorityTransaction, sourcePath: string, options: { executor?: string; lease?: SourceUseLease } = {},
   ): Promise<SourceUseLease> {
     this.#check(tx);
+    if (options.executor !== undefined &&
+        (typeof options.executor !== "string" || options.executor.length < 1 || options.executor.length > 128)) {
+      throw new AuthorityRefusal("invalid executor");
+    }
     const key = await this.slotKey(tx, sourcePath);
     const dir = await this.#slotsDir();
     const old = await this.#load(dir, key);
     if (old) {
       if (old.pending !== null) throw new AuthorityRefusal("source has an unresolved pending footprint");
       if (old.state === "retiring") throw new AuthorityRefusal("source is being retired");
-      if (old.state === "active") {
-        if (old.owner.worker !== this.#init.incarnation) {
-          throw new AuthorityRefusal("source is active under another worker incarnation");
-        }
-        const held = options.lease ? leaseState.get(options.lease) : undefined;
-        if (held && held.store === this && held.key === key && held.epoch === old.epoch) return options.lease!;
+      if (old.state === "active" && old.owner.worker !== this.#init.incarnation) {
+        throw new AuthorityRefusal("source is active under another worker incarnation");
       }
+    }
+    if (options.lease) {
+      const held = leaseState.get(options.lease);
+      if (!held || held.store !== this || held.key !== key) throw new AuthorityRefusal("lease does not belong to this source");
+      if (old?.state !== "active" || held.epoch !== old.epoch) throw new AuthorityRefusal("stale source-use lease");
+      return options.lease;
     }
     const body: SlotSnapshot = {
       version: SLOT_VERSION, key, state: "active", epoch: randomUUID(), seq: (old?.seq ?? 0) + 1,
@@ -474,6 +628,7 @@ export class AuthorityStore {
     const retiring: RetiringRecord = {
       prior: hex64(input.prior), operation: randomUUID(), manifest: strings(input.manifest, MAX_ITEMS), deleted: 0,
     };
+    requireResidueCovered(body.pending, retiring.manifest);
     await this.#save(dir, { ...body, state: "retiring", retiring, seq: body.seq + 1 });
   }
 
@@ -481,7 +636,7 @@ export class AuthorityStore {
   async advanceRetiring(tx: AuthorityTransaction, lease: SourceUseLease, deleted: number): Promise<void> {
     const { dir, body } = await this.#owned(tx, lease);
     if (body.state !== "retiring" || !body.retiring) throw new AuthorityRefusal("source is not retiring");
-    if (deleted < body.retiring.deleted || deleted > body.retiring.manifest.length) {
+    if (!Number.isSafeInteger(deleted) || deleted < body.retiring.deleted || deleted > body.retiring.manifest.length) {
       throw new AuthorityRefusal("invalid retire progress");
     }
     await this.#save(dir, { ...body, retiring: { ...body.retiring, deleted }, seq: body.seq + 1 });
@@ -493,6 +648,7 @@ export class AuthorityStore {
     if (body.state !== "retiring" || !body.retiring || body.retiring.deleted !== body.retiring.manifest.length) {
       throw new AuthorityRefusal("retire is incomplete");
     }
+    requireResidueCovered(body.pending, body.retiring.manifest);
     await this.#save(dir, { ...body, state: "retired", retiring: null, pending: null, seq: body.seq + 1 });
   }
 }

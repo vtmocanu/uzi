@@ -4,6 +4,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { test } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   acquireWorkerLifetime, AuthorityTransaction, WorkerLifetime, withAuthorityTransaction,
 } from "../src/authority-lock.js";
@@ -197,6 +198,104 @@ test("A: aborting a queued caller frees its slot without disturbing the holder",
   release();
   assert.equal(await holder, "held");
   assert.equal(await after, "after");
+});
+
+test("A: a second caller behind a stuck in-process holder fails at its own deadline and the queue stays usable", { timeout: 30_000 }, async (t) => {
+  const { lifetime } = await lifetimeFor(t);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let started!: () => void;
+  const running = new Promise<void>((resolve) => { started = resolve; });
+  const holder = withAuthorityTransaction(lifetime, {}, async () => { started(); await gate; return "held"; });
+  await running;
+  const began = performance.now();
+  await assert.rejects(withAuthorityTransaction(lifetime, { timeoutMs: 150 }, async () => "never"), /timeout/);
+  assert.ok(performance.now() - began < 10_000, "failed at the deadline, not after the holder");
+  release();
+  assert.equal(await holder, "held");
+  assert.equal(await withAuthorityTransaction(lifetime, { timeoutMs: 2000 }, async () => "after"), "after");
+});
+
+test("W: a worker.lock name that no longer matches the held inode refuses new transactions", async (t) => {
+  const { root, lifetime } = await lifetimeFor(t);
+  assert.equal(await withAuthorityTransaction(lifetime, {}, async () => "ok"), "ok");
+  fs.renameSync(lockFile(root), lockFile(root) + ".old");
+  fs.writeFileSync(lockFile(root), "", { mode: 0o600 });
+  let ran = false;
+  await assert.rejects(withAuthorityTransaction(lifetime, {}, async () => { ran = true; }), /inode changed/);
+  assert.equal(ran, false);
+});
+
+test("A: replacing authority.lock between open and flock refuses before the callback runs", async (t) => {
+  const root = makeTmp(t);
+  const base = testLockOptions();
+  let swap = false;
+  const lifetime = await acquireWorkerLifetime(root, {
+    ...base,
+    run: async (args, fd, signal, timeout) => {
+      if (swap && args[0] !== "--version") {
+        swap = false;
+        const named = path.join(authorityDir(root), "authority.lock");
+        fs.renameSync(named, named + ".old");
+        fs.writeFileSync(named, "", { mode: 0o600 });
+      }
+      return base.run ? base.run(args, fd, signal, timeout) : realRun(args, fd);
+    },
+  });
+  await withAuthorityTransaction(lifetime, {}, async () => undefined); // creates authority.lock
+  swap = true;
+  let ran = false;
+  await assert.rejects(withAuthorityTransaction(lifetime, {}, async () => { ran = true; }), /inode changed/);
+  assert.equal(ran, false);
+  assert.equal(await withAuthorityTransaction(lifetime, {}, async () => "recovered"), "recovered");
+});
+
+/** A flock stand-in that passes the util-linux trust check and then blocks forever. */
+function fakeFlock(t: Parameters<typeof makeTmp>[0]): { script: string; pidFile: string } {
+  const dir = makeTmp(t, "fake-flock-");
+  const pidFile = path.join(dir, "helper.pid");
+  const script = path.join(dir, "flock");
+  fs.writeFileSync(script, `#!/bin/sh
+if [ "$1" = "--version" ]; then echo "flock from util-linux 2.41"; exit 0; fi
+echo $$ > '${pidFile}'
+exec sleep 300
+`, { mode: 0o755 });
+  return { script, pidFile };
+}
+
+async function readPid(file: string): Promise<number> {
+  for (let i = 0; i < 400; i++) {
+    try {
+      const text = fs.readFileSync(file, "utf8");
+      if (/^\d+\n$/.test(text)) return Number(text);
+    } catch { /* not written yet */ }
+    await delay(25);
+  }
+  throw new Error("helper never reported its pid");
+}
+
+function alive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
+}
+
+test("the real flock helper is SIGKILLed and joined on abort, before acquisition returns", { timeout: 30_000 }, async (t) => {
+  const { script, pidFile } = fakeFlock(t);
+  const controller = new AbortController();
+  const attempt = acquireWorkerLifetime(makeTmp(t), { supportedFs: async () => true, flockPath: script, signal: controller.signal });
+  attempt.catch(() => undefined);
+  const pid = await readPid(pidFile);
+  assert.equal(alive(pid), true);
+  controller.abort(new Error("stop now"));
+  await assert.rejects(attempt, /stop now/);
+  assert.equal(alive(pid), false, "the helper had exited by the time the lock descriptor was released");
+});
+
+test("the real flock helper is SIGKILLed and joined at its deadline", { timeout: 30_000 }, async (t) => {
+  const { script, pidFile } = fakeFlock(t);
+  const attempt = acquireWorkerLifetime(makeTmp(t), { supportedFs: async () => true, flockPath: script, timeoutMs: 300 });
+  attempt.catch(() => undefined);
+  await assert.rejects(attempt, /flock helper timeout/);
+  assert.equal(alive(await readPid(pidFile)), false);
 });
 
 test("A: another process holding the authority lock blocks until a finite deadline, then releases", async (t) => {
