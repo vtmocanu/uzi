@@ -150,7 +150,14 @@ func TestRetainedParkRefusalsWriteNothingLiveDB(t *testing.T) {
 			case "newer outcome":
 				e.exec(t, "UPDATE runs SET status='awaiting_input' WHERE id=$1", id)
 			default:
-				e.exec(t, "UPDATE runs SET kind=$2 WHERE id=$1", id, scenario)
+				// Each forbidden kind must satisfy runs_kind_shape so refusal
+				// reaches the park writer instead of failing fixture setup.
+				target := e.fpSeedRunning(t, w, 1)
+				e.exec(t, `UPDATE runs SET kind=$2, issue_iid=NULL, branch=NULL,
+					repo_id=CASE WHEN $2='cross_check' THEN repo_id ELSE NULL END,
+					target_run_id=CASE WHEN $2 IN ('judge','cross_check') THEN $3::uuid ELSE NULL END,
+					job_type=CASE WHEN $2='job' THEN 'research' ELSE NULL END,
+					report_only=($2='cross_check'), budget_wall_seconds=3600 WHERE id=$1`, id, scenario, target)
 			}
 			before, err := e.q.GetRunByID(e.ctx, id)
 			if err != nil {
@@ -226,6 +233,49 @@ func TestRetainedParkRequiresPositiveGeneration(t *testing.T) {
 		_, _, err := svc.parkRetainedRecovery(t.Context(), store.Worker{}, store.Run{}, StateRequest{ClaimGeneration: gen}, pgtype.Text{})
 		if !errors.Is(err, ErrInvalidState) {
 			t.Fatalf("generation=%v err=%v", gen, err)
+		}
+	}
+}
+
+func TestRetainedParkCheckpointDurabilityLiveDB(t *testing.T) {
+	for _, reconciled := range []bool{false, true} {
+		for _, value := range []struct {
+			name     string
+			reported *bool
+		}{{"absent", nil}, {"false", boolPtr(false)}, {"true", boolPtr(true)}} {
+			t.Run(fmt.Sprintf("reconciled=%v/%s", reconciled, value.name), func(t *testing.T) {
+				e := setupInterlockLiveDB(t)
+				svc := e.diskParkService(t, 3)
+				w := e.seedWorker(t, nil)
+				id := e.fpSeedRunning(t, w, 1)
+				// An absent report must clear an older park's display value.
+				e.exec(t, "UPDATE runs SET checkpoint_contains_latest=true WHERE id=$1", id)
+				if reconciled {
+					var input int64
+					if err := e.pool.QueryRow(e.ctx, "INSERT INTO run_user_inputs(run_id,kind,body) VALUES($1,'approve_plan','') RETURNING id", id).Scan(&input); err != nil {
+						t.Fatal(err)
+					}
+					e.exec(t, `INSERT INTO run_milestone_reconciliations(id,run_id,owner_id,gate_revision,presentation_id,
+						gate_digest,reset_state_digest,worker_id,claim_generation,reason,consent,before_state,after_state,
+						applied_input_id,stop_cutoff)
+						VALUES($1,$2,$3,1,$4,$5,'fixture',$6,1,'fixture','{}','{}','{}',$7,0)`,
+						uuid.New(), id, e.userID, uuid.New(), []byte{1}, w, input)
+				}
+				req := retainedReport(1)
+				req.CheckpointContainsLatest = value.reported
+				run, applied, err := svc.SetState(e.ctx, store.Worker{ID: w}, id, req)
+				if err != nil || !applied || !run.ClaimReleasedAt.Valid {
+					t.Fatalf("park applied=%v err=%v", applied, err)
+				}
+				got := run.CheckpointContainsLatest
+				if value.reported == nil {
+					if got.Valid {
+						t.Fatal("flagless retained park kept stale checkpoint evidence")
+					}
+				} else if !got.Valid || got.Bool != *value.reported {
+					t.Fatalf("checkpoint durability=%+v want %v", got, *value.reported)
+				}
+			})
 		}
 	}
 }

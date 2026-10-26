@@ -58,9 +58,16 @@ func (s *Service) parkRetainedRecovery(ctx context.Context, wkr store.Worker, ow
 	if counted {
 		retry = pgconv.Time(s.now().Add(s.recoveryParkFallbackFor(run.RetainedParkCount) + recoveryParkJitter()))
 	}
+	// Preserve the existing tri-state park display field in this transaction:
+	// post-park claim mutations cannot pass a reconciled run's release fence.
+	var checkpoint pgtype.Bool
+	if req.CheckpointContainsLatest != nil {
+		checkpoint = pgtype.Bool{Bool: *req.CheckpointContainsLatest, Valid: true}
+	}
 	parked, err := q.ParkRunRetainedRecovery(ctx, store.ParkRunRetainedRecoveryParams{
 		ID: run.ID, WorkerID: workerID, ClaimGeneration: *req.ClaimGeneration,
 		Counted: counted, RetryNotBefore: retry, SessionID: sessionID,
+		CheckpointContainsLatest: checkpoint,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return run, 0, nil

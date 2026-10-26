@@ -11827,6 +11827,7 @@ UPDATE runs SET status='recovery_wait', status_since=now(), updated_at=now(),
  retained_park_count=retained_park_count+CASE WHEN @counted::boolean THEN 1 ELSE 0 END,
  recovery_retry_not_before=sqlc.narg('retry_not_before')::timestamptz,
  session_id=COALESCE(sqlc.narg('session_id')::text, session_id),
+ checkpoint_contains_latest=sqlc.narg('checkpoint_contains_latest')::boolean,
  claim_released_at=now(),
  health='ok', health_reason=NULL, health_since=NULL
 WHERE id = @id AND worker_id = @worker_id AND status='running'

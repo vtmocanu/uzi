@@ -5540,7 +5540,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 			// The bounded provider park left the run 'paused', not 'recovery_wait': store the
 			// durability report against the status the run actually holds.
 			s.setCheckpointDurability(ctx, wkr, owned, "paused", req.CheckpointContainsLatest)
-		} else {
+		} else if req.State != "recovery_wait" || req.RecoveryCause == nil || *req.RecoveryCause != recoveryCauseRetainedRecoveryExhausted {
+			// Retained recovery records this value atomically before releasing
+			// execution; a post-park mutation is stale on reconciled runs.
 			s.recordCheckpointDurability(ctx, wkr, owned, req)
 		}
 	}
