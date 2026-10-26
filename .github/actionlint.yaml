@@ -1,5 +1,10 @@
 # actionlint configuration (read automatically from .github/).
 paths:
+  .github/workflows/brew.yml:
+    ignore:
+      # Native job concurrency.queue is pinned by ci-safe-paths.test.rb;
+      # actionlint 1.7.12 does not recognize the documented key yet.
+      - 'unexpected key "queue" for "concurrency" section'
   .github/workflows/release.yml:
     ignore:
       # `concurrency.queue` is a documented GitHub Actions key (job-level queue: max keeps

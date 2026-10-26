@@ -1359,6 +1359,11 @@ tasks:
       # script header.
       - ./scripts/release-scripts-test.sh
       - ./scripts/worker-roll-target.test.sh
+      - task: test:release-ci-coverage
+
+  test:release-ci-coverage:
+    desc: offline release evidence, metadata and publication polling regressions
+    cmds:
       - python3 -I -B scripts/release-ci-coverage.test.py
 
   test:worker-roll-target-package:
