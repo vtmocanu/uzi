@@ -633,14 +633,18 @@ interface DiffChild {
  *  actions replace the clock: an owner cancel, or a `now` pause, lands while the child is stalled. */
 type Stop = "none" | "soft" | "hard" | "soft_then_hard" | "cancel" | "pause_now";
 
-/** Spin real macrotask turns until `done()` or `ms` of real time pass: bounded, never the 600 s timer. */
-async function spin(done: () => boolean, ms: number): Promise<boolean> {
-  const until = Date.now() + ms;
-  for (let turn = 0; !done() && Date.now() < until; turn++) {
+/** Observe the controlled child's consequences without advancing any wall-clock timer. */
+async function observeTurns(done: () => boolean = () => false): Promise<boolean> {
+  for (let turn = 0; !done() && turn < 200; turn++) {
     await new Promise<void>(resolve => setImmediate(resolve));
-    if (turn % 20 === 19) await new Promise<void>(resolve => setTimeout(resolve, 1));
   }
   return done();
+}
+
+function eventSignal(): { ready: Promise<void>; mark: () => void } {
+  let mark!: () => void;
+  const ready = new Promise<void>(resolve => { mark = resolve; });
+  return { ready, mark };
 }
 
 /** Track (and unref) every pending 600 s timer, so a red run can neither hang the process nor hide one. */
@@ -696,14 +700,15 @@ async function runDiffScenario(t: TestContext, issue: number, spec: {
     submitted.push(snapshot);
     throw new Error("fixture response unavailable");
   });
-  let spawned = false, nameOnly = 0, cancels = 0;
+  let nameOnly = 0, cancels = 0;
+  const launched = eventSignal(), reaped = eventSignal();
   let stdout!: PassThrough;
   const spawnDiff = async (): Promise<SpawnedBoundaryProcess> => {
     stdout = new PassThrough();
     const stderr = new PassThrough(), stdin = new PassThrough();
     for (const stream of [stdout, stderr, stdin]) stream.on("error", () => undefined);
     const closed = new Promise<void>(resolve => stdout.once("close", () => resolve()));
-    nameOnly++; spawned = true;
+    nameOnly++; launched.mark();
     events.push("spawned");
     if (spec.child.stdout === "ended_unread") { stdout.resume(); stdout.end(); await once(stdout, "end"); }
     else if (spec.child.stdout === "read_then_ended") { stdout.write("lost\n"); stdout.resume(); stdout.end(); await once(stdout, "end"); }
@@ -715,6 +720,7 @@ async function runDiffScenario(t: TestContext, issue: number, spec: {
         reap: async () => {
           await new Promise<void>(resolve => setImmediate(resolve));
           events.push("reap");
+          reaped.mark();
           return spec.child.cleanup === "unclean_reap"
             ? { ok: false as const, error: { category: "tool" as const, message: "fixture root did not reap" } }
             : { ok: true as const };
@@ -761,25 +767,30 @@ async function runDiffScenario(t: TestContext, issue: number, spec: {
       void gate.then(() => { settled = true; });
       try {
         if (spec.stop !== "none") {
-          assert.equal(await spin(() => spawned, 20_000), true, "the --name-only diff was spawned");
+          await launched.ready;
           // A clean exit must have fully settled (exit, reap, completion) BEFORE the stop arrives.
           if (spec.child.exit === "clean_exit") {
-            assert.equal(await spin(() => events.includes("reap"), 5_000), true, "the child was reaped");
-            await spin(() => false, 40);
+            await reaped.ready;
+            await observeTurns();
           }
         }
-        else await spin(() => settled, 8_000);
+        else {
+          // The step-label control uses only real children. For fake early-EOF cases, first
+          // reach the controlled completion, then observe whether the bounded read settled.
+          if (spec.match) await gate;
+          else { await launched.ready; await reaped.ready; await observeTurns(() => settled); }
+        }
         let settledAfterSoft: boolean | undefined;
-        if (spec.stop === "cancel") { route("cancel"); await spin(() => settled, 5_000); }
-        else if (spec.stop === "pause_now") { route("pause", "now"); await spin(() => settled, 5_000); }
+        if (spec.stop === "cancel") { route("cancel"); await observeTurns(() => settled); }
+        else if (spec.stop === "pause_now") { route("pause", "now"); await observeTurns(() => settled); }
         else if (spec.stop === "soft_then_hard") {
           clock.advance(60_000);
-          settledAfterSoft = await spin(() => settled, 1_500);
+          settledAfterSoft = await observeTurns(() => settled);
           clock.advance(30_000);
-          await spin(() => settled, 5_000);
+          await observeTurns(() => settled);
         } else if (spec.stop !== "none") {
           clock.advance(spec.stop === "soft" ? 60_000 : 90_000);
-          await spin(() => settled, 5_000);
+          await observeTurns(() => settled);
         }
         record = { settledAtStop: settled, settledAfterSoft, outcome: undefined, events, timersAtStop: timers.pending(),
           poisoned: rig.registry.isPoisoned() };
@@ -787,7 +798,7 @@ async function runDiffScenario(t: TestContext, issue: number, spec: {
         // A red run must end by assertion, never by the 600 s timer: unblock whatever is still pending.
         stdout?.destroy();
         if (!settled) timers.flush();
-        if (!settled && !(await spin(() => settled, 3_000))) clock.advance(120_000);
+        if (!settled && !(await observeTurns(() => settled))) clock.advance(120_000);
         const outcome = await gate;
         if (record) record.outcome = outcome;
       }
@@ -943,7 +954,8 @@ async function runDoneBodyScenario(t: TestContext, issue: number, spec: {
   const clock = virtualBoundaryClock();
   const { logger, lines } = recordingLogger();
   const timers = trackReadTimers(t);
-  let stalled = 0, nameOnly = 0, reaped = false;
+  let stalled = 0, nameOnly = 0;
+  const launched = eventSignal(), reaped = eventSignal();
   let stdout: PassThrough | undefined;
   const match = spec.match ?? (request => request.argv.includes("merge-base") && !request.argv.includes("--is-ancestor"));
   let matched = false;
@@ -951,13 +963,14 @@ async function runDoneBodyScenario(t: TestContext, issue: number, spec: {
   let result: { settled: boolean; error: unknown; poisoned: boolean } | undefined;
   const spawnStalled = async (): Promise<SpawnedBoundaryProcess> => {
     stalled++;
+    launched.mark();
     const out = stdout = new PassThrough();
     const stderr = new PassThrough(), stdin = new PassThrough();
     for (const stream of [out, stderr, stdin]) stream.on("error", () => undefined);
     return {
       root: {
         kind: "boundary_action",
-        reap: async () => { await new Promise<void>(resolve => setImmediate(resolve)); reaped = true; return { ok: true as const }; },
+        reap: async () => { await new Promise<void>(resolve => setImmediate(resolve)); reaped.mark(); return { ok: true as const }; },
         dispose: async () => undefined,
       },
       stdin, stdout: out, stderr,
@@ -978,19 +991,19 @@ async function runDoneBodyScenario(t: TestContext, issue: number, spec: {
       const done = ctx.checkpoint!({ reap: true, sink: "done_checkpoint" }).catch(err => { error = err; }).then(() => { settled = true; });
       try {
         if (spec.stop !== "none") {
-          assert.equal(await spin(() => stalled > 0, 20_000), true, "the unmasked shared read was spawned");
+          await launched.ready;
           if (spec.exit === "clean_exit") {
-            assert.equal(await spin(() => reaped, 5_000), true, "the child was reaped");
-            await spin(() => false, 40);
+            await reaped.ready;
+            await observeTurns();
           }
           clock.advance(60_000);
         }
-        await spin(() => settled, 5_000);
+        await observeTurns(() => settled);
         result = { settled, error, poisoned: rig.registry.isPoisoned() };
       } finally {
         stdout?.destroy();
         if (!settled) timers.flush();
-        if (!settled && !(await spin(() => settled, 3_000))) clock.advance(120_000);
+        if (!settled && !(await observeTurns(() => settled))) clock.advance(120_000);
         await done;
         if (result) result.error = error;
       }

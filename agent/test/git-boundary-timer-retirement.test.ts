@@ -37,6 +37,7 @@ const BOUNDARY_MS = 1_800_000;
 type CleanupMode = "clean" | "reap-fails" | "dispose-throws";
 
 interface HeldChild {
+  ready: Promise<void>;
   spawned: () => SpawnedBoundaryProcess;
   spawns: () => number;
   disposes: () => number;
@@ -46,14 +47,18 @@ interface HeldChild {
 }
 
 function heldChild(): HeldChild {
+  let markReady!: () => void;
+  const ready = new Promise<void>(resolve => { markReady = resolve; });
   let spawns = 0, disposes = 0, reaps = 0;
   let open!: (mode: CleanupMode) => void;
   const gate = new Promise<CleanupMode>(resolve => { open = resolve; });
   return {
+    ready,
     spawns: () => spawns, disposes: () => disposes, reaps: () => reaps,
     release: mode => open(mode ?? "clean"),
     spawned: () => {
       spawns++;
+      markReady();
       const stdout = new PassThrough(), stderr = new PassThrough();
       for (const stream of [stdout, stderr]) stream.on("error", () => undefined);
       return {
@@ -243,20 +248,26 @@ describe("readBare 600 s timer inside a real boundary scope", () => {
 });
 
 describe("streamBundleWithCap 600 s timer inside a real boundary scope (via produceRecoveryBundle)", () => {
-  async function bundleScope() {
+  function bundleOutput(t: TestContext): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-3304-bundle-"));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    return path.join(dir, "recovery.bundle");
+  }
+
+  async function bundleScope(t: TestContext) {
     const bare = await cache.ensureClone(fx.originPath);
     const sourceSha = execFileSync("git", ["-C", bare, "rev-parse", "refs/remotes/origin/main"], { encoding: "utf8", env: GIT_ENV }).trim();
-    const out = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "uzi-3304-bundle-")), "recovery.bundle");
+    const out = bundleOutput(t);
     const s = scope(isBundle);
     return { s, produce: () => s.run(() => cache.produceRecoveryBundle(bare, { sourceSha, outPath: out })) };
   }
 
   for (const stop of ["hard", "soft"] as const) {
     it(`streamBundleWithCap under the real Codex facade: the pipeline settles with the typed ${stop} error`, async t => {
-      const { s, produce } = await bundleScope();
+      const { s, produce } = await bundleScope(t);
       const timers = mockTimers(t);
       const { inner } = produce();
-      for (let i = 0; i < 200 && s.child.spawns() === 0; i++) await turns(5);
+      await s.child.ready;
       assert.equal(s.child.spawns(), 1, "the bundle child launched through the real safety");
       await turns();
       if (stop === "hard") s.expireHard(); else s.soft.abort();
@@ -287,6 +298,28 @@ describe("streamBundleWithCap 600 s timer inside a real boundary scope (via prod
     return { handle, cancels: () => cancels, release };
   }
 
+  for (const stop of ["hard", "soft", "none"] as const) {
+    it(`readBare nonzero TickSpawner-shaped completion after ${stop} stop preserves its classification`, async () => {
+      const child = pendingCompletionChild();
+      const hard = new AbortController(), soft = new AbortController();
+      // TickSpawner owns hard cancellation and resolves completed after verified group cleanup.
+      hard.signal.addEventListener("abort", () => { void child.handle.cancel(); }, { once: true });
+      const run = track(cache.withBoundaryProcessSpawner(async () => child.handle, hard.signal, readHead,
+        { softSignal: soft.signal }));
+      await turns();
+      if (stop !== "none") (stop === "hard" ? hard : soft).abort();
+      await turns();
+      assert.equal(run.settled(), false, "owned completion is still pending");
+      if (stop !== "none") assert.equal(child.cancels(), 1, "the owner requested cancellation");
+      child.release({ code: 128 });
+      const error = errorOf(await run.result());
+      if (stop === "none") {
+        assert.equal((error as Error).constructor, Error);
+        assert.match((error as Error).message, /exited 128/);
+      } else assertTyped(error, stop === "hard" ? GitBoundaryAbortError : CheckpointSoftDeadlineError);
+    });
+  }
+
   const realPipes: BoundaryProcessSpawner = async request => {
     const [command, ...args] = request.argv;
     const child = spawn(command!, args, { cwd: request.cwd, env: request.env, stdio: ["pipe", "pipe", "pipe"] });
@@ -302,7 +335,7 @@ describe("streamBundleWithCap 600 s timer inside a real boundary scope (via prod
     it(`TickSpawner-shaped completion-pending spawner, ${stop} stop: the timer retires, the owner settles after release`, async t => {
       const bare = await cache.ensureClone(fx.originPath);
       const sourceSha = execFileSync("git", ["-C", bare, "rev-parse", "refs/remotes/origin/main"], { encoding: "utf8", env: GIT_ENV }).trim();
-      const out = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "uzi-3304-bundle-")), "recovery.bundle");
+      const out = bundleOutput(t);
       const child = pendingCompletionChild();
       let markSpawned!: () => void;
       const spawned = new Promise<void>(resolve => { markSpawned = resolve; });
@@ -331,10 +364,10 @@ describe("streamBundleWithCap 600 s timer inside a real boundary scope (via prod
   }
 
   it("control: without a scope stop the timer still kills the child and fails with the plain deadline error", async t => {
-    const { s, produce } = await bundleScope();
+    const { s, produce } = await bundleScope(t);
     const timers = mockTimers(t);
     const { inner } = produce();
-    for (let i = 0; i < 200 && s.child.spawns() === 0; i++) await turns(5);
+    await s.child.ready;
     await turns();
     assert.equal(s.child.disposes(), 0);
     timers.pastReadDeadline();

@@ -16953,6 +16953,10 @@ try {
           return;
         }
         if (code !== 0) {
+          // A stopped scope owns cancellation. Its verified nonzero completion (TickSpawner
+          // resolves with 128 on a signal) must not beat stopOutput's typed verdict while
+          // that handler gives an already-queued EOF one turn to arrive.
+          if (stopSignals.some(signal => signal.aborted)) return;
           const detail = Buffer.concat(stderrChunks).subarray(0, stderrCap).toString().trim();
           gated.exited(new Error(`git ${args.join(" ")} exited ${code}${detail ? `: ${detail}` : ""}`));
         } else gated.exited();
