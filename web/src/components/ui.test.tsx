@@ -392,3 +392,20 @@ describe("CountPill", () => {
     expect(screen.getByLabelText("5 unread").textContent).toBe("5");
   });
 });
+
+
+it.each([
+  ["2099-01-01T00:00:00Z", "retained recovery retrying"],
+  ["2020-01-01T00:00:00Z", "retained recovery retrying"],
+  [null, "retained recovery needs decision"],
+  [undefined, "retained recovery timing unknown"],
+  ["invalid", "retained recovery timing unknown"],
+] as const)("StatusPill preserves retained recovery timing %s", (stamp, label) => {
+  const { container } = render(<StatusPill status="recovery_wait" recovery_wait_cause="retained_recovery_exhausted" recovery_retry_not_before={stamp} />);
+  expect(container.textContent).toBe(label);
+  expect(container.querySelector(".text-warn")).toBeTruthy();
+});
+it("StatusPill keeps a narrow projection's recovery cause unknown", () => {
+  const { container } = render(<StatusPill status="recovery_wait" />);
+  expect(container.textContent).toBe("recovery wait");
+});
