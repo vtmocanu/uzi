@@ -24,6 +24,10 @@ import { fakeGitHub, fakeGitlab } from "./runner-harness.js";
 import { realProcfsSkip } from "./real-procfs.js";
 import { newRunAttempt } from "../src/run-quiescence.js";
 
+// Capture before any test enables mocked timers. Readiness caps must use real time.
+const readinessSetTimeout = globalThis.setTimeout;
+const readinessClearTimeout = globalThis.clearTimeout;
+
 const HAS_PROCFS = process.platform === "linux";
 // The real runner path opens the Codex session store and quiescence proofs through /proc/self/fd
 // (src/codex/session-state.ts, src/runner.ts), which macOS lacks (#1912). Linux runs every assertion.
@@ -17887,16 +17891,106 @@ describe("CodexExecutor planning settlement (#1733)", () => {
 });
 
 describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
-  // Readiness uses bounded real event-loop turns, independently of the frozen Date.
-  async function until(predicate: () => boolean): Promise<void> {
-    for (let n = 0; n < 500; n++) {
-      if (predicate()) return;
-      await tick();
-    }
-    assert.ok(predicate(), "event barrier was not reached");
+  function latch(event: string) {
+    let resolve!: () => void;
+    const delivered = new Promise<void>(r => { resolve = r; });
+    return {
+      resolve,
+      async wait(ms = 5000): Promise<void> {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([delivered, new Promise<never>((_, reject) => {
+            timer = readinessSetTimeout(() => reject(new assert.AssertionError({
+              message: `readiness event was not reached: ${event}`,
+            })), ms);
+          })]);
+        } finally { readinessClearTimeout(timer); }
+      },
+    };
   }
 
-  for (const retry of [false, true]) it(`3462 ${retry ? "serverOverloaded then silent retry" : "first-turn silence"} parks without another start`, async t => {
+  function observeTransport(transport: FakeTransport, targets: readonly number[]) {
+    const turns = new Map(targets.map(count => [count, latch(`turn/start #${count}`)]));
+    const response91 = latch("response #91 recorded");
+    const request = transport.request;
+    const respond = transport.respond;
+    transport.request = function<T = unknown>(...args: Parameters<FakeTransport["request"]>): Promise<T> {
+      const result = request.apply(this, args) as Promise<T>;
+      // FakeTransport.request increments synchronously; do not wait for its responder.
+      if (args[0] === "turn/start") turns.get((this.countsFrom ?? this).turnStartCount)?.resolve();
+      return result;
+    };
+    transport.respond = function(...args) {
+      const result = respond.apply(this, args);
+      if (args[0] === 91) response91.resolve();
+      return result;
+    };
+    return {
+      turn(count: number) {
+        const target = turns.get(count);
+        assert.ok(target, `turn/start #${count} must be armed before execution`);
+        return target;
+      },
+      response91,
+      restore() { transport.request = request; transport.respond = respond; },
+    };
+  }
+
+  function delayTurnStart(transport: FakeTransport) {
+    const request = transport.request;
+    transport.request = async function<T = unknown>(...args: Parameters<FakeTransport["request"]>): Promise<T> {
+      // Exactly 1000 adversarial hops BEFORE the observed wrapper and synchronous increment.
+      // Readiness still depends on the event; any delay failure rejects this request.
+      if (args[0] === "turn/start") for (let n = 0; n < 1000; n++) await tick();
+      return request.apply(this, args) as Promise<T>;
+    };
+  }
+
+  function observeEmit(ctx: RunContext) {
+    const transientError = latch("transient error emitted");
+    const text = latch("text emitted");
+    const emit = ctx.emit;
+    ctx.emit = function(...args) {
+      const result = emit.apply(this, args);
+      const [message] = args;
+      if (/transient error/.test(String(rec(message.payload).text))) transientError.resolve();
+      if (message.kind === "text") text.resolve();
+      return result;
+    };
+    return { transientError, text, restore() { ctx.emit = emit; } };
+  }
+
+  it("3462 missing turn/start fails by real time under frozen timers", async t => {
+    const missing = latch("turn/start #1");
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    try {
+      await assert.rejects(missing.wait(20), (error: unknown) => {
+        assert.ok(error instanceof assert.AssertionError);
+        assert.equal(error.message, "readiness event was not reached: turn/start #1");
+        return true;
+      });
+      assert.equal(Date.now(), 0, "no mocked time was advanced");
+    } finally { t.mock.timers.reset(); }
+  });
+
+  it("3462 pre-armed turn targets retain early delivery without responder settlement", async () => {
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const transport = new FakeTransport(() => pending);
+    const observed = observeTransport(transport, [1, 2, 3]);
+    try {
+      const requests = [transport.request("turn/start"), transport.request("turn/start"), transport.request("turn/start")];
+      await observed.turn(1).wait();
+      await observed.turn(2).wait();
+      await observed.turn(3).wait();
+      assert.equal(transport.turnStartCount, 3);
+      release();
+      await Promise.all(requests);
+    } finally { release(); observed.restore(); transport.end(); }
+  });
+
+  for (const scenario of ["first", "retry", "delayed"] as const) it(`3462 ${scenario === "retry" ? "serverOverloaded then silent retry" : scenario === "delayed" ? "1000 hops before turn/start" : "first-turn silence"} parks without another start`, async t => {
+    const retry = scenario === "retry";
     const rig = makeRig({ responder: c => {
       if (c.method === "thread/start") return { thread: { id: "th-1" } };
       if (c.method === "turn/start") {
@@ -17911,16 +18005,20 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
     } });
     rig.deps = { ...rig.deps, idleMs: 100, wallMs: 5000, transientBackoffBaseMs: 1 };
     const { ctx, emitted } = makeCtx();
+    const observed = observeTransport(rig.transport, [1, 2]);
+    const events = observeEmit(ctx);
+    t.after(() => { observed.restore(); events.restore(); });
+    if (scenario === "delayed") delayTurnStart(rig.transport);
     t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
     const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
     void running.catch(() => undefined);
     try {
-      await until(() => rig.transport.turnStartCount === 1);
+      await observed.turn(1).wait();
       if (retry) {
-        await until(() => emitted.some(m => /transient error/.test(String(rec(m.payload).text))));
+        await events.transientError.wait();
         await tick();
         t.mock.timers.tick(1);
-        await until(() => rig.transport.turnStartCount === 2);
+        await observed.turn(2).wait();
       }
       await tick();
       t.mock.timers.tick(100);
@@ -17947,13 +18045,16 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
       return {};
     } });
     rig.deps = { ...rig.deps, idleMs: 100, wallMs: 5000 };
-    const { ctx, emitted } = makeCtx();
+    const { ctx } = makeCtx();
+    const observed = observeTransport(rig.transport, [1]);
+    const events = observeEmit(ctx);
+    t.after(() => { observed.restore(); events.restore(); });
     t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
     const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
     void running.catch(() => undefined);
     try {
-      await until(() => evidence === "tool" ? rig.transport.responses.some(r => r.requestId === 91)
-        : evidence === "text" ? emitted.some(m => m.kind === "text") : rig.transport.turnStartCount === 1);
+      await (evidence === "tool" ? observed.response91
+        : evidence === "text" ? events.text : observed.turn(1)).wait();
       for (let i = 0; i < 5; i++) await tick();
       t.mock.timers.tick(100);
       await assert.rejects(running, evidence === "lifecycle" ? isRecovery : (error: unknown) => {
@@ -17967,12 +18068,12 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
 
   for (const interruption of ["none", "pause", "wall", "cancel"] as const) it(`3462 ${interruption} during pre-recovery persistence`, async t => {
     const rig = makeRig();
-    let entered = false;
+    const entered = latch("pre-recovery persistence entered");
     let release!: () => void;
     const barrier = new Promise<void>(resolve => { release = resolve; });
     rig.deps = { ...rig.deps, idleMs: 100, wallMs: 1000,
       sessionStore: { ...rig.deps.sessionStore!, persist: async () => {
-        entered = true; await barrier; return { files: 0, bytes: 0 };
+        entered.resolve(); await barrier; return { files: 0, bytes: 0 };
       } },
     };
     let mode: "now" | null = null;
@@ -17984,13 +18085,16 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
       parkForPause: async () => { pauses++; return true; },
       parkForWall: async () => { walls++; return "parked"; },
     });
+    const observed = observeTransport(rig.transport, [1]);
+    t.after(() => observed.restore());
+    if (interruption === "cancel") delayTurnStart(rig.transport);
     t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
     const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
     void running.catch(() => undefined);
     try {
-      await until(() => rig.transport.turnStartCount === 1);
+      await observed.turn(1).wait();
       await tick(); t.mock.timers.tick(100);
-      await until(() => entered);
+      await entered.wait();
       if (interruption === "pause") { mode = "now"; interrupt?.(); }
       if (interruption === "wall") t.mock.timers.tick(1000);
       if (interruption === "cancel") cancelled = true;
@@ -18013,7 +18117,8 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
       epochResponder("th-2", "tn-2", () => {}),
     ]);
     rig.deps = { ...rig.deps, idleMs: 100, wallMs: 1000 };
-    let entered = false, release!: () => void;
+    const entered = latch("declined completion hold entered");
+    let release!: () => void;
     const barrier = new Promise<void>(resolve => { release = resolve; });
     let mode: "now" | null = null, interrupt: (() => void) | undefined;
     let cancelled = false, holds = 0, pauses = 0, walls = 0;
@@ -18022,7 +18127,7 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
       enterCompletionHold: async reason => {
         holds++;
         if (reason === "codex run wall-clock timeout") return false;
-        entered = true; await barrier; return false;
+        entered.resolve(); await barrier; return false;
       },
       onPauseNow: cb => { interrupt = cb; }, pauseModeRequested: () => mode,
       cancelRequested: () => cancelled,
@@ -18035,13 +18140,15 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
       },
       parkForWall: async () => { walls++; return "parked"; },
     });
+    const observed = observeTransport(rig.epochs[1]!.transport, [1]);
+    t.after(() => observed.restore());
     t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
     const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
     void running.catch(() => undefined);
     try {
-      await until(() => rig.epochs[1]!.transport.turnStartCount === 1);
+      await observed.turn(1).wait();
       await tick(); t.mock.timers.tick(100);
-      await until(() => entered);
+      await entered.wait();
       if (interruption === "pause") { mode = "now"; interrupt?.(); }
       if (interruption === "wall") t.mock.timers.tick(1000);
       if (interruption === "cancel") cancelled = true;
@@ -18070,10 +18177,11 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
       }
       return {};
     } });
-    let refreshing = false, release!: () => void;
+    const refreshing = latch("vault refresh entered");
+    let release!: () => void;
     const barrier = new Promise<void>(resolve => { release = resolve; });
     rig.client.refreshCodex = async () => {
-      refreshing = true; await barrier;
+      refreshing.resolve(); await barrier;
       throw new RequestError("POST", "/refresh", 409, JSON.stringify({ reason: "vault_locked" }));
     };
     rig.deps = { ...rig.deps, idleMs: 100, wallMs: 5000 };
@@ -18081,7 +18189,7 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
     const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx);
     void running.catch(() => undefined);
     try {
-      await until(() => refreshing);
+      await refreshing.wait();
       t.mock.timers.tick(100); release();
       await assert.rejects(running, (error: unknown) => {
         assert.ok(error instanceof Error && !(error instanceof TransientRecoveryError));
@@ -18116,11 +18224,13 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
       askUser: async () => ({ kind: "answer", answers: ["server"] }),
       retryPlanRevisionTurn: async () => { retries++; },
     });
+    const observed = observeTransport(rig.transport, [2, 3]);
+    t.after(() => observed.restore());
     t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
     const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
     void running.catch(() => undefined);
     try {
-      await until(() => rig.transport.turnStartCount === silentTurn);
+      await observed.turn(silentTurn).wait();
       await tick(); t.mock.timers.tick(100);
       await assert.rejects(running, (error: unknown) => {
         assert.ok(error instanceof Error && !(error instanceof TransientRecoveryError));
@@ -18150,11 +18260,13 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
       assert.equal((typed as Error & { processedEvents?: number }).processedEvents, undefined);
       return typed;
     };
+    const observed = observeTransport(rig.transport, [1]);
+    t.after(() => observed.restore());
     t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
     const running = executor.run(makeCtx().ctx);
     void running.catch(() => undefined);
     try {
-      await until(() => rig.transport.turnStartCount === 1);
+      await observed.turn(1).wait();
       await tick(); t.mock.timers.tick(100);
       await assert.rejects(running, (error: unknown) => {
         assert.equal(error, typed);
