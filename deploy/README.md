@@ -921,8 +921,12 @@ Live acceptance remains operator-owned: attest the node/storage prerequisites,
 then observe several graceful rolls and record handoff capture, projection
 latency, pass times and verdict/list agreement with actual trees and holds, as
 specified in the [acceptance boundary](../prds/3430-pod-epoch-lock-shadow.md#delivery-acceptance-and-closure).
-These pending proofs are not production verification; deletion remains later
-work under #3431.
+The local full-agent gate also remains red, with inconclusive bounded
+base/candidate controls; exact-head PR CI is still pending. Before delivery,
+a formal owner partial decision must name the actual milestone IDs and the
+outstanding M1/M2c image/full-gate criteria and M3 live acceptance. Continuation
+guidance does not waive these checks. These pending proofs are not production
+verification; deletion remains later work under #3431.
 
 ### M4/M5 runbook: known items before go-live
 
