@@ -313,114 +313,6 @@ func TestVaultTerminalPasswordBoundPTY(t *testing.T) {
 	}
 }
 
-// An interrupt during the hidden prompt restores the terminal before exiting
-// and submits no password; the default signal action would skip the restore.
-func TestVaultTerminalPasswordInterruptPTY(t *testing.T) {
-	fd, err := unix.Open("/dev/ptmx", unix.O_RDWR|unix.O_NOCTTY|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	master := os.NewFile(uintptr(fd), "vault-interrupt-master")
-	defer func() {
-		if err := master.Close(); err != nil {
-			t.Errorf("close PTY master: %v", err)
-		}
-	}()
-	if err := unix.IoctlSetPointerInt(fd, unix.TIOCSPTLCK, 0); err != nil {
-		t.Fatal(err)
-	}
-	n, err := unix.IoctlGetInt(fd, unix.TIOCGPTN)
-	if err != nil {
-		t.Fatal(err)
-	}
-	slave, err := os.OpenFile(fmt.Sprintf("/dev/pts/%d", n), os.O_RDWR|unix.O_NOCTTY, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		if err := slave.Close(); err != nil {
-			t.Errorf("close PTY slave: %v", err)
-		}
-	}()
-	before, err := unix.IoctlGetTermios(int(slave.Fd()), unix.TCGETS)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	notified := make(chan chan<- os.Signal, 1)
-	exited := make(chan *unix.Termios, 1)
-	oldNotify, oldStop, oldExit := vaultNotifyInterrupt, vaultStopInterrupt, vaultInterruptExit
-	vaultNotifyInterrupt = func(c chan<- os.Signal) { notified <- c }
-	vaultStopInterrupt = func(chan<- os.Signal) {}
-	vaultInterruptExit = func(os.Signal) {
-		state, err := unix.IoctlGetTermios(int(slave.Fd()), unix.TCGETS)
-		if err != nil {
-			t.Errorf("termios at exit: %v", err)
-		}
-		exited <- state
-	}
-	t.Cleanup(func() { vaultNotifyInterrupt, vaultStopInterrupt, vaultInterruptExit = oldNotify, oldStop, oldExit })
-
-	type result struct {
-		password []byte
-		err      error
-	}
-	done := make(chan result, 1)
-	go func() {
-		password, err := readVaultTerminalPassword(context.Background(), slave)
-		done <- result{password, err}
-	}()
-	deadline := time.NewTimer(3 * time.Second)
-	defer deadline.Stop()
-	var interrupts chan<- os.Signal
-	select {
-	case interrupts = <-notified:
-	case <-deadline.C:
-		t.Fatal("reader did not register for interrupts")
-	}
-	poll := time.NewTicker(time.Millisecond)
-	defer poll.Stop()
-	for {
-		state, err := unix.IoctlGetTermios(int(slave.Fd()), unix.TCGETS)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if state.Lflag&unix.ECHO == 0 {
-			break
-		}
-		select {
-		case <-poll.C:
-		case <-deadline.C:
-			t.Fatal("reader did not disable ECHO")
-		}
-	}
-	interrupts <- os.Interrupt
-	select {
-	case state := <-exited:
-		if state == nil || *state != *before {
-			t.Fatal("terminal state was not restored before the interrupt exit")
-		}
-	case <-deadline.C:
-		t.Fatal("interrupt did not exit the prompt")
-	}
-	// Release the reader the stubbed exit left blocked; the prompt must still
-	// not have produced a password before this test input.
-	select {
-	case got := <-done:
-		t.Fatalf("reader returned before input: err=%v", got.err)
-	default:
-	}
-	if _, err := unix.Write(fd, []byte("\n")); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case got := <-done:
-		clear(got.password)
-	case <-deadline.C:
-		t.Fatal("reader did not return after release")
-	}
-}
-
 // TestVaultUnlockSignalHelper is the child process for
 // TestVaultUnlockSignalSubprocess; it runs the real CLI on its terminal stdin.
 func TestVaultUnlockSignalHelper(t *testing.T) {
@@ -434,8 +326,10 @@ func TestVaultUnlockSignalHelper(t *testing.T) {
 }
 
 // A real SIGINT or SIGTERM delivered to `uzi vault unlock` while its hidden
-// prompt waits must restore the full terminal state, exit with 128+signal and
-// send no unlock request. Default signal termination would skip the restore.
+// prompt holds a partly typed password must discard that input, restore the
+// full terminal state, exit with 128+signal and send no unlock request.
+// Default signal termination would skip the restore, and a signal sent with
+// kill (unlike a typed INTR) leaves the partial secret queued for the shell.
 func TestVaultUnlockSignalSubprocess(t *testing.T) {
 	for _, sig := range []syscall.Signal{syscall.SIGINT, syscall.SIGTERM} {
 		t.Run(sig.String(), func(t *testing.T) {
@@ -525,6 +419,16 @@ func TestVaultUnlockSignalSubprocess(t *testing.T) {
 					t.Fatalf("helper did not disable ECHO\n%s", stderr.String())
 				}
 			}
+			const partial = "partial-secret-sentinel"
+			if _, err := unix.Write(fd, []byte(partial)); err != nil {
+				t.Fatal(err)
+			}
+			// A canonical-mode queue reports no bytes until a full line arrives
+			// (TIOCINQ counts completed lines), so no readiness event exists for
+			// a partial line. Give the PTY flip buffer time to reach the line
+			// discipline; a late arrival could only make the test pass vacuously,
+			// which the mutation run against the unfixed reader rules out.
+			time.Sleep(100 * time.Millisecond)
 			if err := cmd.Process.Signal(sig); err != nil {
 				t.Fatal(err)
 			}
@@ -545,6 +449,34 @@ func TestVaultUnlockSignalSubprocess(t *testing.T) {
 			}
 			if got := requests.Load(); got != 0 {
 				t.Errorf("unlock requests = %d, want 0", got)
+			}
+			// The next terminal reader must not receive the partial secret:
+			// terminate the pending line and read what the slave delivers.
+			if _, err := unix.Write(fd, []byte("\n")); err != nil {
+				t.Fatal(err)
+			}
+			if err := unix.SetNonblock(int(slave.Fd()), true); err != nil {
+				t.Fatal(err)
+			}
+			var line []byte
+			for !bytes.Contains(line, []byte("\n")) {
+				var buf [256]byte
+				n, err := unix.Read(int(slave.Fd()), buf[:])
+				if n > 0 {
+					line = append(line, buf[:n]...)
+					continue
+				}
+				if err != nil && !errors.Is(err, unix.EAGAIN) {
+					t.Fatal(err)
+				}
+				select {
+				case <-poll.C:
+				case <-deadline.C:
+					t.Fatalf("next reader got no line; read %q", line)
+				}
+			}
+			if bytes.Contains(line, []byte(partial)) {
+				t.Errorf("queued secret input survived the signal: next reader got %q", line)
 			}
 		})
 	}

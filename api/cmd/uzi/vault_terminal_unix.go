@@ -6,25 +6,21 @@ import (
 	"errors"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
 	"github.com/charmbracelet/x/term"
 	"golang.org/x/sys/unix"
 )
 
-// Interrupt hooks for the hidden prompt; tests replace them to observe an
-// interruption without delivering a real signal or exiting.
-var (
-	vaultNotifyInterrupt = func(c chan<- os.Signal) { signal.Notify(c, os.Interrupt, syscall.SIGTERM) }
-	vaultStopInterrupt   = func(c chan<- os.Signal) { signal.Stop(c) }
-	vaultInterruptExit   = func(sig os.Signal) {
-		code := 130 // 128 + SIGINT, as the default action would report
-		if sig == syscall.SIGTERM {
-			code = 143
-		}
-		os.Exit(code)
+// vaultInterruptExitCode reports an interrupted prompt as the default signal
+// action would: 128 plus the signal number.
+func vaultInterruptExitCode(sig os.Signal) int {
+	if sig == syscall.SIGTERM {
+		return 128 + int(syscall.SIGTERM)
 	}
-)
+	return 128 + int(syscall.SIGINT)
+}
 
 type vaultPasswordFD uintptr
 
@@ -42,26 +38,45 @@ func readVaultHiddenPassword(fd uintptr) (password []byte, err error) {
 	hidden.Lflag &^= unix.ECHO
 	hidden.Lflag |= unix.ICANON | unix.ISIG
 	hidden.Iflag |= unix.ICRNL
-	// Catch SIGINT/SIGTERM for the prompt's lifetime: the default action would
-	// exit before the deferred restore below, leaving the terminal without echo.
-	// ISIG makes the driver flush queued input on INTR, so nothing is echoed back.
+	// Catch SIGINT/SIGTERM from before the terminal is hidden until it is
+	// restored: the default action would exit with echo still off. mu
+	// serializes every terminal change with the interrupt path, so an interrupt
+	// can neither precede a later hide nor fall between restore and unregister.
+	// A signal sent with kill does not flush the input queue the way a typed
+	// INTR does, so the interrupt path discards queued secret input itself and,
+	// like the overflow path, keeps echo off when that fails.
+	var mu sync.Mutex
+	hiddenApplied := false
 	interrupts := make(chan os.Signal, 1)
-	vaultNotifyInterrupt(interrupts)
+	signal.Notify(interrupts, os.Interrupt, syscall.SIGTERM)
 	stopped := make(chan struct{})
 	go func() {
 		select {
 		case sig := <-interrupts:
-			_ = term.Restore(fd, state)
-			vaultInterruptExit(sig)
+			mu.Lock() // held through exit: no later terminal change can run
+			if hiddenApplied && flushVaultTerminalInput(fd) == nil {
+				_ = term.Restore(fd, state)
+			}
+			os.Exit(vaultInterruptExitCode(sig))
 		case <-stopped:
 		}
 	}()
-	if err := term.SetState(fd, &hidden); err != nil {
-		vaultStopInterrupt(interrupts)
+	unregister := func() {
+		signal.Stop(interrupts)
 		close(stopped)
+	}
+	mu.Lock()
+	err = term.SetState(fd, &hidden)
+	hiddenApplied = err == nil
+	mu.Unlock()
+	if err != nil {
+		unregister()
 		return nil, err
 	}
+	defer unregister() // runs after the restore below: protection outlives it
 	defer func() {
+		mu.Lock()
+		defer mu.Unlock()
 		if errors.Is(err, errVaultPasswordTooLong) {
 			clear(password)
 			password = nil
@@ -71,6 +86,7 @@ func readVaultHiddenPassword(fd uintptr) (password []byte, err error) {
 				return
 			}
 		}
+		hiddenApplied = false
 		if restoreErr := term.Restore(fd, state); restoreErr != nil {
 			clear(password)
 			password = nil
@@ -78,10 +94,6 @@ func readVaultHiddenPassword(fd uintptr) (password []byte, err error) {
 				err = restoreErr
 			}
 		}
-	}()
-	defer func() {
-		vaultStopInterrupt(interrupts)
-		close(stopped)
 	}()
 	return readVaultPasswordLine(vaultPasswordFD(fd))
 }
