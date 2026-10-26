@@ -348,6 +348,26 @@ class FailedEvidence(unittest.TestCase):
         self.assertIn(H, summary)
 
 
+class RunAttempts(unittest.TestCase):
+    def test_prepare_rerun_refuses_before_any_orchestration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env = context(GITHUB_RUN_ATTEMPT='2', RUNNER_TEMP=directory,
+                          GITHUB_OUTPUT=directory + '/output', GITHUB_STEP_SUMMARY=directory + '/summary')
+            with patch.dict(os.environ, env, clear=True), patch.object(auto.sys, 'argv', ['release-auto.py', 'prepare']), \
+                 patch.object(auto, 'Release') as constructor, contextlib.redirect_stderr(io.StringIO()) as error:
+                constructor.return_value.prepare.side_effect = AssertionError('preparer ran during a rerun')
+                status = auto.main()
+            self.assertEqual(status, 1)
+            constructor.assert_not_called()
+            self.assertIn('re-dispatch-required', Path(directory, 'output').read_text())
+            self.assertIn('re-dispatch instead', error.getvalue().lower())
+
+    def test_watch_rerun_can_observe_the_same_tag(self):
+        with patch.dict(os.environ, context(GITHUB_RUN_ATTEMPT='2', RELEASE_TAG='v0.2.0-rc.11', RELEASE_SHA=RELEASE), clear=True), \
+             patch.object(auto.sys, 'argv', ['release-auto.py', 'watch-check']), patch.object(auto, 'Release') as constructor:
+            constructor.return_value.watch_admission.return_value = {'outcome': 'watch-admitted'}
+            self.assertEqual(auto.main(), 0)
+            constructor.return_value.watch_admission.assert_called_once_with('v0.2.0-rc.11', RELEASE)
 class Recovery(unittest.TestCase):
     def test_stable_recovery_cannot_republish_older_latest(self):
         cfg = auto.inputs(context(RELEASE_KIND='stable', RELEASE_RC_TAG=TAG, RELEASE_RC_SHA=CANDIDATE))

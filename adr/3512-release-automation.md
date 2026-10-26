@@ -60,6 +60,9 @@ flowchart LR
   Validate digest, exact refs, release SHA, tag object and single parent before
   minting. No configuration or hooks are imported. A lost push receipt is
   recovered against the same prepared tag/SHA; never prepare a replacement.
+  Prepare and push fail closed for run attempts greater than one, before minting:
+  re-dispatch instead after inspecting uncertain remote state. Watch and report
+  may rerun against the same existing tag/SHA; they cannot create a new tag.
   Recovery refuses an older stable when a newer stable tag exists, preventing
   a stale publication rerun from changing the latest channel.
 

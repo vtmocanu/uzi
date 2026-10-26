@@ -394,6 +394,7 @@ def main():
         if args.mode == 'authorize':
             result = dict(outcome='authorized', kind=cfg['kind'], created_at=created_at(os.environ))
         elif args.mode == 'prepare':
+            require(os.environ.get('GITHUB_RUN_ATTEMPT') == '1', 're-dispatch-required')
             directory = Path(os.environ['RUNNER_TEMP']) / 'release-auto'
             release = Release(cfg)
             result = release.prepare(directory)
@@ -410,6 +411,8 @@ def main():
         outputs(result)
         summary(result)
         print(f'release-auto: {result["reason"]}', file=sys.stderr)
+        if result['reason'] == 're-dispatch-required':
+            print('Re-dispatch instead of rerunning prepare or push.', file=sys.stderr)
         print(str(error)[-8192:], file=sys.stderr)
         return 1
 

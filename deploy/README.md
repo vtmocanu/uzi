@@ -133,8 +133,11 @@ inspect remote main/tags and resolve interrupted publication on the same tag.
 The prepared bundle is validated in a separate job without repository checkout
 before the App token is minted. RC metadata and tag push atomically, without force.
 A lost push receipt is investigated against the prepared tag/SHA, never by cutting
-a replacement. Rerun failed jobs for same-tag recovery; rerunning all RC preparation
-is another cut request. Only a confirmed publication and `release-verify.sh` success mean
+a replacement. Prepare and push refuse when the run attempt is greater than one: re-dispatch
+instead, after inspecting remote refs when a push receipt is uncertain. Never
+rerun prepare or push in the same run. Watch and report may rerun against the
+exact existing tag/SHA; the local watch/verify scripts remain available for
+manual same-tag recovery. Only a confirmed publication and `release-verify.sh` success mean
 done; deployment health is a separate check. Problems use one `Release automation
 failures` tracking issue; expected no-ops remain in the summary.
 

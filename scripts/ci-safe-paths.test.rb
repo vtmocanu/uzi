@@ -268,6 +268,7 @@ assert.call(auto_jobs.fetch('watch').fetch('steps').find { |step| step['id'] == 
             'python3 -I scripts/release-auto.py watch-check', 'recovery checks actor and tag before actions writes')
 mint = auto_push.fetch('steps').find { |step| step['id'] == 'app' }
 assert.call(mint.fetch('uses'), 'actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510', 'reviewed token action')
+assert.call(mint['if'], nil, 'mint keeps default success gating after validation')
 assert.call(mint.fetch('with'), {'app-id' => '${{ vars.RELEASE_APP_ID }}', 'private-key' => '${{ secrets.RELEASE_APP_KEY }}',
                                'owner' => 'vtmocanu', 'repositories' => 'uzi', 'permission-contents' => 'write'}, 'installation token scope')
 bundle_step = auto_push.fetch('steps').find { |step| step['id'] == 'bundle' }
@@ -341,7 +342,7 @@ Dir.mktmpdir('release-auto-contract') do |dir|
   %w[git sha256sum date].each { |name| File.chmod(0o700, File.join(bin, name)) }
   env = hermetic.merge('PATH' => "#{bin}:#{ENV.fetch('PATH')}", 'TEST_REAL_GIT' => real_git, 'TEST_REMOTE' => remote,
                       'TEST_NOW' => Time.utc(2026, 10, 26, 10).to_i.to_s,
-                      'GITHUB_REPOSITORY' => 'vtmocanu/uzi', 'GITHUB_EVENT_NAME' => 'workflow_dispatch',
+                      'GITHUB_REPOSITORY' => 'vtmocanu/uzi', 'GITHUB_EVENT_NAME' => 'workflow_dispatch', 'GITHUB_RUN_ATTEMPT' => '1',
                       'RELEASE_KIND' => 'rc', 'RELEASE_VERSION' => '', 'RELEASE_ABANDON' => 'false',
                       'RELEASE_SUPERSEDE' => '', 'RELEASE_RC_TAG' => '', 'RELEASE_RC_SHA' => '',
                       'RELEASE_REF' => 'refs/heads/main', 'RELEASE_ACTOR' => 'maintainer', 'RELEASE_DISPATCHERS' => 'maintainer',
@@ -354,8 +355,12 @@ Dir.mktmpdir('release-auto-contract') do |dir|
       FileUtils.mkdir_p(File.join(work, 'release-bundle'))
       FileUtils.cp(source_bundle, File.join(work, 'release-bundle/release.bundle'))
       invocation = env.merge('RUNNER_TEMP' => work, 'GITHUB_OUTPUT' => File.join(work, 'output')).merge(changes)
-      _, err, status = Open3.capture3(invocation, 'bash', '-e', '-c', bundle_step.fetch('run'), chdir: work)
+      guard_out, err, status = Open3.capture3(invocation, 'bash', '-e', '-c', bundle_step.fetch('run'), chdir: work)
       assert.call(status.success?, expected, "actual pre-key guard #{changes.keys}: #{err[-300..]}")
+      if changes['GITHUB_RUN_ATTEMPT'] == '2'
+        assert.call(status.success?, false, 'rerun never reaches the default-success token step')
+        assert.call((guard_out + err).include?('Re-dispatch instead'), true, 'push rerun gives a clear recovery instruction')
+      end
       if expected && !publish_expected.nil?
         active_remote = invocation.fetch('TEST_REMOTE')
         main_before = git.call('--git-dir=' + active_remote, 'rev-parse', 'refs/heads/main')
@@ -373,6 +378,7 @@ Dir.mktmpdir('release-auto-contract') do |dir|
     end
   end
   exercise.call({'RELEASE_ACTOR' => 'outside'}, false)
+  exercise.call({'GITHUB_RUN_ATTEMPT' => '2'}, false)
   exercise.call({'RELEASE_REF' => 'refs/heads/feature'}, false)
   exercise.call({'GITHUB_REPOSITORY' => 'other/uzi'}, false)
   exercise.call({'GITHUB_EVENT_NAME' => 'push'}, false)

@@ -16,6 +16,7 @@ Do NOT bake step details that live in the repo into your head. Read the source o
 
 ## 0. Guardrails first
 - Standard CI releases use `release-auto.yml` on main after the maintainer verifies its App/ruleset setup. Dispatch an RC only under the user's release authorization. Agents NEVER dispatch `kind=stable` and NEVER approve a `release-stable` deployment; the human performs both acts.
+- CI prepare/push never rerun in the same run ID: re-dispatch instead after inspecting uncertain remote refs. Only watch/report may rerun against the existing tag/SHA; use local watch/verify for manual same-tag recovery.
 - Before local fallback, finish or stop any CI release run, inspect remote main/tags and resolve interrupted publication on the same tag. No local/CI race. A Codex lock change blocks CI planning; perform the adoption read and cut locally. On abandon the range starts at the highest stable, so an already adopted change can still require local fallback.
 - Dispatch-only stage: no nightly schedule yet. D10 post-cut CI/tagged-smoke recovery is deferred to 3e-3; assertions remain fail-closed, with existing non-gate retries only.
 - NEVER `docker compose -p uzi down -v` and never glob `uzi-` containers (see `CLAUDE.md` "Destructive operations"). This skill touches git, `gh`, and (if you have deploy access) `kubectl` only.

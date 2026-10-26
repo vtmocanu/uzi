@@ -168,6 +168,11 @@ jobs:
           reason='authorization-failed'
           fail() { printf 'reason=%s\n' "$reason" >> "$GITHUB_OUTPUT"; exit 1; }
           trap fail ERR
+          if [ "${GITHUB_RUN_ATTEMPT:-}" != 1 ]; then
+            reason='re-dispatch-required'
+            echo '::error::Re-dispatch instead of rerunning prepare or push.'
+            fail
+          fi
           export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_TERMINAL_PROMPT=0
           if ! { [ "$GITHUB_REPOSITORY" = vtmocanu/uzi ] && [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; }; then fail; fi
           [ "$RELEASE_REF" = refs/heads/main ]
