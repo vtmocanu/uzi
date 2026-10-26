@@ -138,7 +138,8 @@ func readVaultPassword(ctx context.Context, env Env) ([]byte, error) {
 	return password, nil
 }
 
-// The bounded terminal reader restores the terminal before returning.
+// The bounded reader attempts to restore terminal state before returning.
+// If overflow cleanup cannot discard pending input, echo stays disabled.
 // Context cancellation is checked before and after the blocking terminal read;
 // no password is submitted after cancellation.
 func readVaultTerminalPassword(ctx context.Context, input io.Reader) ([]byte, error) {
