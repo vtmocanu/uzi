@@ -80,6 +80,15 @@ func TestCodeCrossCheckCoverageNormalization(t *testing.T) {
 		}
 	}
 }
+func TestCodeCrossCheckCoverageMixedEntries(t *testing.T) {
+	expected := coverageFixture().Entries[0]
+	raw := bytes.Replace(coverageJSON(t, coverageFixture()), []byte(`"entries":[`), []byte(`"entries":[{"path":"b.go","status":"examined","reason":"checked","recorded_read":"yes"},`), 1)
+	got := decodeCoverage(t, NormalizeCodeCrossCheckCoverage("completed", raw))
+	if len(got.Entries) != 1 || got.Entries[0] != expected || got.OmittedPaths != 1 || !got.InventoryIncomplete || got.OmittedCountExact {
+		t.Fatalf("mixed account lost the valid sibling or omission evidence: %+v", got)
+	}
+}
+
 func TestCodeCrossCheckCoverageBoundaries(t *testing.T) {
 	account := coverageFixture()
 	account.Entries[0].Path = strings.Repeat("é", 256)

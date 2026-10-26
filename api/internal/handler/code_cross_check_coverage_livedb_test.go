@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -85,6 +86,12 @@ func TestCodeCrossCheckCoverageRouteLiveDB(t *testing.T) {
 				var got apitypes.CodeCrossCheckCoverage
 				if json.Unmarshal(stored.Coverage, &got) != nil || got.InventoryIncomplete != tc.incomplete {
 					t.Fatalf("account: %s", stored.Coverage)
+				}
+				if tc.name == "valid" {
+					var expected apitypes.CodeCrossCheckCoverage
+					if json.Unmarshal([]byte(valid), &expected) != nil || !reflect.DeepEqual(got, expected) {
+						t.Fatal("persisted account differs from independently specified input")
+					}
 				}
 			}
 			rec = call(http.MethodGet, "/api/worker/runs/"+lead.String()+"/cross-checks/code/latest?claim_generation=1", "")

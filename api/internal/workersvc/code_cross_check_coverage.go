@@ -48,7 +48,13 @@ func NormalizeCodeCrossCheckCoverage(outcome string, input ...json.RawMessage) [
 	}
 	var account apitypes.CodeCrossCheckCoverage
 	fields, ok := coverageObject(raw, []string{"version", "entries", "inventory_incomplete", "omitted_paths", "omitted_count_exact", "unknown_judgments", "invalid_judgments", "omitted_judgments", "activity_complete", "reasons"})
-	if !ok || json.Unmarshal(raw, &account) != nil || account.Version != 1 || account.Entries == nil || account.Reasons == nil {
+	if !ok {
+		return fallback("coverage_invalid")
+	}
+	entryJSON := fields["entries"]
+	fields["entries"] = json.RawMessage("[]")
+	metadata, err := json.Marshal(fields)
+	if err != nil || json.Unmarshal(metadata, &account) != nil || account.Version != 1 || account.Reasons == nil {
 		return fallback("coverage_invalid")
 	}
 	for _, n := range []int64{account.OmittedPaths, account.UnknownJudgments, account.InvalidJudgments, account.OmittedJudgments} {
@@ -77,7 +83,7 @@ func NormalizeCodeCrossCheckCoverage(outcome string, input ...json.RawMessage) [
 	}
 	account.Reasons = reasons
 	var entries []json.RawMessage
-	if json.Unmarshal(fields["entries"], &entries) != nil {
+	if json.Unmarshal(entryJSON, &entries) != nil {
 		return fallback("coverage_invalid")
 	}
 	kept := []apitypes.CodeCrossCheckCoverageEntry{}
