@@ -1537,13 +1537,19 @@ chain in the diagram above, with no intervening `running`.
   and blocks the worker's teardown. Admission counts open holds except at most
   one per run backing a healthy current claim without an owner decision;
   total custody remains protected. After discarded/released precedence, an OPEN
-  hold at `recovery_wait` for `worker_requeue_exhausted` or
-  `worker_memory_pressure` reports `needs_action` after failed latest capture,
+  hold at `recovery_wait` for `worker_requeue_exhausted`,
+  `worker_memory_pressure`, or `retained_recovery_exhausted` reports
+  `needs_action` after failed latest capture,
   otherwise `source_only`, before available unguarded archives or capture
-  progress. Archive availability remains independent of attention and does not
-  release owner-held custody; other classifier decisions remain unchanged.
-  See [ADR-2445](adr/2445-custody-admission-accounting.md) and
-  [ADR-2396](adr/2396-worker-memory-guard.md).
+  progress. Retained-recovery exhaustion keeps this conservative protection
+  for both timed retries and NULL-stamp owner holds throughout `recovery_wait`.
+  After timer promotion or owner Resume, existing proof-based release rules
+  apply again; execution-claim release alone never permits source deletion.
+  Archive availability remains independent of attention and does not release
+  these causes' custody; other classifier decisions remain unchanged.
+  See [ADR-2445](adr/2445-custody-admission-accounting.md),
+  [ADR-2396](adr/2396-worker-memory-guard.md), and the #3495 amendment in
+  [ADR-1197](adr/1197-transient-recovery-park.md).
   The **archive capture** (`recovery_captures`) is the later,
   immutable, encrypted artifact bound to that hold. PRD #1349 hardens the
   lifecycle: reserve/release now key on the **exact `runs.claim_generation`**

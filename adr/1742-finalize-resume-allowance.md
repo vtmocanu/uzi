@@ -673,7 +673,14 @@ releases custody. This narrowly qualifies the earlier archive-ready/no-archive
 expectations for exhaustion, including D4 and the procedure above, and applies
 the same bounded attention rule to memory-pressure holds. Other classifier
 decisions, inventory-guarded warnings and release safeguards are unchanged.
-See [ADR-2396](2396-worker-memory-guard.md).
+See [ADR-2396](2396-worker-memory-guard.md). The #3495 amendment in
+[ADR-1197](1197-transient-recovery-park.md) adds the same conservative custody
+attention and release protection for `retained_recovery_exhausted`, including
+its timed parks. Its finite retry stamp permits automatic retry; only its
+NULL-stamp form requires owner Resume/Cancel. Protection lasts throughout
+`recovery_wait`; after promotion or Resume, existing proof-based custody
+rules apply again. Neither execution-claim release nor promotion proves source
+redundancy or permits deletion by itself.
 
 ## Amendment 2026-10-07 — #2394 owner-resumed recovery episodes
 
