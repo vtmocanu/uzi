@@ -168,9 +168,10 @@ For a Codex login in `staging` or `failed`, Test runs identity reconciliation;
 that check can move the link state to `linked` or `failed`. If the verified
 account is quarantined or needs re-login, reconciliation can install a newly
 verified replacement on it, as the background check does for a new login.
-You can replace the value while automatic recovery is still in progress;
-uzi verifies the replacement belongs to the same account. For a `linked`
-login, Test reads the account's usage once and does not refresh or rotate the
+You can replace the value while automatic recovery is still in progress.
+To resume held runs, supply the same ChatGPT account and workspace: uzi verifies
+the replacement's identity, but a replacement for a different account cannot
+resume those runs. For a `linked` login, Test reads the account's usage once and does not refresh or rotate the
 login. It is a current check, not a promise that a later run can start.
 
 For an OpenAI API key, Test requests `GET /v1/models`. An `ok` result means
