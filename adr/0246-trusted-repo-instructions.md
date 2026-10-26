@@ -8,13 +8,15 @@
 ## Decision (summary)
 
 A second per-repo opt-in, `repos.repo_claudemd_enabled` (default off), lets the
-**lead only** read a trusted repo's **root `CLAUDE.md`** and treat it as a
-nonce-fenced, **UNTRUSTED/ADVISORY** block appended to its system prompt. The
-channel is uzi's own read-and-inject code, never the SDK's project loader:
-`settingSources` stays `[]`, so hooks, `.claude/commands`, `.claude/agents`, and
-everything else under `.claude/` remain unreachable exactly as before this
-feature. This deliberately softens the *content* the lead is allowed to see for
-one specific file class, while leaving every enforcement layer — the
+**Claude or Codex lead** receive a worker-read snapshot of a trusted repo's
+**root `CLAUDE.md`** and treat it as a nonce-fenced, **UNTRUSTED/ADVISORY**
+block appended to its system prompt. The
+channel is uzi's own read-and-inject code, never either harness's native
+project loader. Claude keeps `settingSources: []`; Codex keeps
+`project_doc_max_bytes = 0`, an explicitly `untrusted` project, and native
+extensions/hooks disabled. The repo-instructions opt-in does not enable native
+repo configuration. This deliberately softens the *content* the lead is allowed
+to see for one specific file class, while leaving every enforcement layer — the
 `PreToolUse` deny-hook, forge protected-branch + Developer role, the
 worker-held PAT, and human MR review — completely unchanged. The feature adds
 **context, not permissions**.
@@ -46,10 +48,11 @@ isolation posture that protects every repo, trusted or not.
 class the SDK-loader isolation blocks; this feature does not touch that
 isolation at all. Instead the worker reads the file itself
 (`agent/src/repo-instructions.ts`) and injects the result through its own
-prompt-construction code. `settingSources` stays `[]` on both the plan and
-the implement turn — a regression test in `sdk-executor.test.ts` asserts this
-explicitly for the flag both on and off, the same assertion the repo-skills
-flag already carries.
+prompt-construction code for both Claude and Codex leads. Claude keeps
+`settingSources: []` on the plan and implement turns
+(`agent/src/claude-harness.ts`); Codex keeps native project documents disabled
+and the project explicitly untrusted (`agent/src/codex/config.ts`). Neither
+harness enables native extensions or hooks from the repo through this opt-in.
 
 ### Two separable flags under one "Trusted repo" affordance
 
@@ -109,11 +112,23 @@ The framed block is appended **last** in `buildLeadSystemPrompt`
 (`agent/src/prompt.ts`) — after the guardrail reminder, the PRD-lifecycle
 clause, and the repo-sourced-subagent untrusted-review passage — so no part
 of the untrusted block precedes uzi's own guardrail text. The file is read
-and framed **once** per run, in `run()`, and the same framed string is
-threaded to both `buildLeadSystemPrompt` call sites (the plan turn and the
-implement turn), so a run never mints two nonces or re-reads the file.
-Subagents receive nothing: they build their own definitions and never see
-`repoInstructions`.
+and framed **once per executor execution**, before the same-run dependency
+installer and agent turns can write. Codex captures it in `runLeg`, before
+repo-tool provisioning as well as dependency installation
+(`agent/src/codex/codex-executor.ts`). Its readonly
+`EpochSharedContext.repoInstructions` carries the immutable framed string to
+`buildRunRequest` and then `buildLeadSystemPrompt` across root planning,
+implementation, continuation, completion rechecks, retries and replacement
+provider epochs. Claude threads its captured block through its root prompt
+construction in `agent/src/sdk-executor.ts`.
+
+Reuse preserves both the captured text and its nonce within that execution;
+later file changes do not replace the advisory block. A fresh execution,
+including a newly claimed resume, snapshots and frames afresh. This is not a
+once-per-persisted-run or once-per-provider-epoch cache. Subagent definitions
+receive no `repoInstructions`; their existing static advice remains unchanged.
+The separately consented code checker retains its frozen-commit contract
+(see the amendment below).
 
 ### Structural sanitization only; no content/prose filtering
 
@@ -123,7 +138,8 @@ also normalized to LF, as `repo-skills.ts` does, so a Windows-authored file
 parses):
 
 - **Root file only.** `path.join(clonePath, "CLAUDE.md")` — no nested
-  `**/CLAUDE.md`, no `CLAUDE.local.md`.
+  `**/CLAUDE.md`, no `CLAUDE.local.md`, no fallback to `AGENTS.md` when the
+  root file is absent.
 - **Symlinks followed, but only when contained.** `realpath` resolves
   both the clone path and the link, following the whole chain (a broken
   link or an `ELOOP` cycle throws, dropped `symlinked`); containment is
@@ -150,7 +166,7 @@ parses):
   the concurrent writer is the package manager itself, not repo postinstall
   code) and before any agent turn runs repo-authored code. That ordering
   removes the same-run package-manager writer from the resolve→open
-  window; the file descriptor pins the bytes after `open`, and
+  window; the file descriptor pins the inode after `open`, and
   `O_NOFOLLOW` rejects a final-component symlink swap. It is not total: a
   parent-component swap before `open`, and documented cross-run races
   (with `WORKER_MAX_CONCURRENT_RUNS` > 1 a sibling run's Bash can write
@@ -163,12 +179,13 @@ parses):
   model reading an `@`-referenced path on its own initiative. Scoped to the
   leading token only — an inline `@ref` mid-line may survive, which is
   accepted as inert for the same reason.
-- **A 64 KiB cap (`REPO_INSTRUCTIONS_MAX_BYTES`) enforced on both the raw
-  file and the post-sanitization text.** The `@`-import marker is longer
-  than the import line it replaces, so a file just under the raw cap could
-  amplify past it after substitution; re-checking the sanitized byte length
-  closes that so the *injected* text can never exceed the cap regardless of
-  marker amplification.
+- **A 64 KiB cap (`REPO_INSTRUCTIONS_MAX_BYTES`) checked against the opened
+  file's `fstat` size and the post-sanitization UTF-8 text.** Oversized results
+  are dropped rather than truncated. The `@`-import marker can expand the
+  text, so the second check also bounds marker amplification. This bounds the
+  accepted body, not bytes consumed by `readFile`: concurrent growth of the
+  opened inode after `fstat` can make the read exceed 64 KiB before the
+  sanitized-size check. The descriptor does not freeze file contents.
 
 Every outcome — injected (with byte count) or dropped, with reason
 (`absent` / `too_large` / `symlinked` / `read_error`) — is trace-logged, so a
@@ -238,8 +255,8 @@ admin. No new policy was introduced for this flag.
 
 A `readFile` error after the `lstat` guard passed (permission change, a
 transient FS error, a TOCTOU delete) is caught and returned as a
-`read_error` drop rather than thrown. Both the production SDK-executor path
-and the `StubExecutor` treat it identically, so a filesystem anomaly on a
+`read_error` drop rather than thrown. The Claude SDK executor, Codex executor
+and `StubExecutor` use this shared reader, so a filesystem anomaly on a
 repo's `CLAUDE.md` degrades a run to "instructions not injected, logged" —
 never a hard failure of run setup.
 
@@ -291,9 +308,10 @@ of that existing exposure.
   suggestion that shapes *what* the agent builds, not what it is *permitted*
   to do. This was already the review discipline every uzi-authored MR relies
   on; this feature does not reduce it.
-- **Lead-only, single read.** Subagents never see this content, and the file
-  is read/framed once per run, bounding the number of times the untrusted
-  text is presented to the model at all.
+- **Lead-only snapshot per execution.** The worker appends this block to root
+  lead prompts, not subagent definitions. It reuses one read/framing result
+  across root phases, retries and replacement epochs within an execution;
+  this does not bound how many model requests include the block.
 
 **Explicit non-claim.** The content of a trusted repo's `CLAUDE.md` is **not
 claimed to be "sanitized safe."** Natural-language instruction injection is
@@ -309,9 +327,9 @@ content has been made safe to blindly follow.
 
 ## Consequences
 
-- The `settingSources: []` isolation itself is untouched by this feature —
-  it protects a different (and larger) surface, `.claude/` config, than the
-  one root file this feature reads through its own channel.
+- Native loader isolation is untouched: Claude's `settingSources: []` and
+  Codex's disabled project documents, explicitly untrusted project and disabled
+  native extensions/hooks remain separate from this worker-owned channel.
 - A future third repo-borne capability (should one arise) has a clear
   precedent to follow: its own opt-in column, folded into `SetRepoTrustFlags`
   if it belongs under "Trusted repo," read-and-injected through uzi's own

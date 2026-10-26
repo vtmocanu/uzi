@@ -353,10 +353,12 @@ model); this section is the map. User-facing usage is
   `.agents`), since `lstat` follows a symlinked parent (issue #1205 follow-up). Repo
   skills carry no allocation, so a surviving one attaches to **every** template;
   they rank lowest (a name collision with any delivered skill drops the repo skill)
-  and are first evicted if the set exceeds `skills_max_per_run`. These two roots are
-  the **only** clone-borne configuration the worker reads (no hooks, settings,
-  commands, or `CLAUDE.md`), and it reads them through its OWN enumeration, not the
-  SDK: `settingSources: []` keeps the SDK from auto-loading the clone's `.claude/`
+  and are first evicted if the set exceeds `skills_max_per_run`. The repo-skills
+  channel reads only these two roots (no hooks, settings, commands, or `CLAUDE.md`)
+  through its OWN enumeration. A separate owner opt-in supplies root `CLAUDE.md`
+  as advisory context to Claude and Codex leads ([ADR-246](adr/0246-trusted-repo-instructions.md)).
+  Neither channel uses native project loading; for Claude, `settingSources: []`
+  keeps the SDK from auto-loading the clone's `.claude/`
   config class (settings, hooks, commands, subagents, `CLAUDE.md`), and `.agents/`
   is not an SDK setting source at all. The opt-in deliberately re-opens one narrow,
   skills-only slice of that otherwise-closed clone-config class, which is why the
