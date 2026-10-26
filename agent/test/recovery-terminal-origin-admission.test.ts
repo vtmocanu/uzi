@@ -209,6 +209,34 @@ test("terminal origin: registration changes during the semantic pair refuse befo
   }
 });
 
+test("terminal origin: a semantic pair naming a different original worker than the custodian refuses before import", async t => {
+  const f = await fixture(t);
+  const observe = f.client.observeTerminalMaintenanceHold!;
+  let semanticPair = false, imported = 0, pairCalls = 0;
+  f.client.observeTerminalMaintenanceHold = async (...args: Parameters<typeof observe>) => {
+    const result = await observe(...args);
+    if (!semanticPair || !result.ok) return result;
+    pairCalls++;
+    // Only the owner's semantic pair is altered; the charged and fresh observations name the custodian.
+    return { ...result, hold: { ...result.hold, original_worker_id: "another-" + workerId } };
+  };
+  f.git.importMaintenanceTip = async request => {
+    await request.prepare();
+    await request.validateFamily({ sources: [...f.observation.family!.originals],
+      metadata: f.observation.family!.metadata, origin });
+    semanticPair = true;
+    try { await request.beforeSemantic(); }
+    finally { semanticPair = false; }
+    imported++;
+    return { kind: "already_present" as const, sourceSha: request.tip };
+  };
+  await f.run();
+  assert.equal(pairCalls, 1, "the semantic pair was reached with a foreign original worker");
+  assert.equal(imported, 0, "a hold whose original worker is not the custodian refuses before shared import");
+  assert.equal(await f.chargeCount(), 1, "the same paid slot is retained");
+  await f.unchanged();
+});
+
 test("terminal origin: real ledger indexes a MAC standard prefix before publication; source and UUID unchanged", async t => {
   const f = await fixture(t);
   const ordinaryId = "00000000-0000-4000-8000-000000000035";
