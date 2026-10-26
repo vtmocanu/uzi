@@ -441,8 +441,10 @@ production incident resolution or hosted acceptance. See the
 
 A done-checkpoint code snapshot failed the run after 600 s in `checkpoint-code-head`
 (allowance 60 s soft / 90 s hard). A supervised git read inside the boundary scope
-never settled: the child's output had finished before the exit-gated stream
-attached, or a cleanly exited child's stdout never ended. Only `readBare`'s
+never settled. Local reproduction showed two seams consistent with the incident
+(which one fired in production is not distinguished): the child's output had
+finished before the exit-gated stream attached, or a cleanly exited child's stdout
+never ended. Only `readBare`'s
 independent 600 s timer (`GIT_TIMEOUT_MS`) ended it, with a plain error.
 
 - **Attach classification.** In a boundary scope, `spawnGit`'s exit-gated stdout
@@ -451,20 +453,22 @@ independent 600 s timer (`GIT_TIMEOUT_MS`) ended it, with a plain error.
   data already read, destroyed without end, or errored is refused.
 - **Settlement rule.** Both supervised output consumers (the gated stream and the
   `execScoped` collector) settle on the scope's hard signal and, where the scope is
-  not masked, its soft signal. They join the child's completion first (a soft stop's
-  cancellation is requested by the child handle's own listener; a hard stop relies
-  on the scope's spawner stopping the child on its own signal), then forward a
-  typed rejection if there is one, else hard gives `GitBoundaryAbortError` and soft
-  gives `CheckpointSoftDeadlineError`. `maskCheckpointCooperation` keeps in-import
+  not masked, its soft signal. A soft stop's cancellation is requested by the child
+  handle's own listener; a hard stop relies on the scope's spawner stopping the
+  child on its own signal. The verdict is joined with the child's completion at the
+  `spawnGit` or `execScoped` level, and a completion rejection wins; otherwise hard
+  gives `GitBoundaryAbortError` and soft gives `CheckpointSoftDeadlineError`. The
+  collector's hard path itself is unchanged. `maskCheckpointCooperation` keeps in-import
   mutation hard-only; that invariant is unchanged.
 - **Timer retirement.** Inside a boundary scope, `readBare`'s and
   `streamBundleWithCap`'s independent 600 s timers are cleared when the scope stops,
   never re-armed, and never armed if the scope already stopped, so a generic timer
   cannot pre-empt owned cleanup with a plain error. Settlement is left to the owner.
   Before any stop they behave as before; ordinary failures are not reclassified.
-- **Step split.** `checkpoint-code-head` is reported as
+- **Step split.** The code-head reads report as
   `checkpoint-code-head-runner-tip`, `-tracking`, `-default-tip`, `-pin` and
-  `-changed-files` by both the gate snapshot and the done body. The gate's ownership
+  `-changed-files` in both the gate snapshot and the done body; `checkpoint-code-head`
+  remains as the entry marker before them. The gate's ownership
   readback, previously under the last import step, now reports as
   `checkpoint-code-head-tracking`, and its fresh pin as `checkpoint-code-head-pin`.
 
