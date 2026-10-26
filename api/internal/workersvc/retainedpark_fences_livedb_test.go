@@ -58,7 +58,10 @@ func TestRetainedParkLateExecutionFencesLiveDB(t *testing.T) {
 					for _, state := range []string{"running", "awaiting_approval", "awaiting_input", "awaiting_followup", "paused", "failed", "completed", "limit_wait", "recovery_wait", "credential_switch", "credential_switch_failed"} {
 						req := StateRequest{State: state, ClaimGeneration: gen, PlanMd: strPtr("fixture plan"), OpenQuestionID: strPtr("question"), OpenFollowupID: i64Ptr(1)}
 						_, ok, err := svc.SetState(e.ctx, store.Worker{ID: w}, id, req)
-						if ok {
+						// Credential release acknowledges an already released generation
+						// idempotently. Its ACK is not a write; the full-row comparison
+						// below still requires every field to remain unchanged.
+						if ok && (state != "credential_switch" || gen == nil) {
 							t.Fatalf("late %s applied", state)
 						}
 						if err != nil && !errors.Is(err, ErrStaleClaim) && !errors.Is(err, ErrMissingClaimGeneration) && !errors.Is(err, ErrInvalidState) {

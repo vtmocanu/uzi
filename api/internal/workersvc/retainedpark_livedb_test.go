@@ -115,7 +115,7 @@ func TestRetainedParkCountsAndResumeLiveDB(t *testing.T) {
 				claimed, err := e.q.ClaimRun(e.ctx, store.ClaimRunParams{WorkerID: pgconv.UUID(w), UserID: r.UserID,
 					IsDockerWorker: true, DockerRepoAllowlist: []uuid.UUID{r.RepoID.Bytes},
 					AffinityCutoff: pgconv.Time(time.Now().Add(-time.Hour)), HeartbeatCutoff: pgconv.Time(time.Now().Add(-time.Hour)),
-					RecoveryCapable: true, WorkerIdentity: "retained-worker"})
+					RecoveryCapable: true, WorkerIdentity: "retained-worker", WorkerProtocolCaps: []string{"recovery_inventory_v1"}})
 				if err != nil || claimed.ID != id || claimed.ClaimGeneration != gen+1 || claimed.ClaimReleasedAt.Valid || claimed.RetainedParkCount != want {
 					t.Fatalf("fresh claim: gen=%d err=%v", claimed.ClaimGeneration, err)
 				}
