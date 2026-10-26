@@ -1,16 +1,16 @@
 import { afterEach, beforeEach, describe, it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough, Writable } from "node:stream";
-import { GitCache } from "../src/git.js";
+import { GitCache, type BoundaryProcessSpawner } from "../src/git.js";
 import { CheckpointSoftDeadlineError, CheckpointUnsafeCleanupError, GitBoundaryAbortError } from "../src/checkpoint-stop.js";
 import { CodexBoundaryError, type SpawnedBoundaryProcess } from "../src/codex/safety.js";
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import type { ReapOutcome } from "../src/codex/registry.js";
-import type { BoundaryProcessRequest } from "../src/harness.js";
+import type { BoundaryProcessHandle, BoundaryProcessRequest } from "../src/harness.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger } from "./helpers.js";
 import { codexRig, virtualBoundaryClock } from "./runner-codex-sinks-fixture.js";
@@ -24,6 +24,10 @@ import { codexRig, virtualBoundaryClock } from "./runner-codex-sinks-fixture.js"
 // `GitCache.withBoundaryProcessSpawner` bound to `safety.spawnBoundaryProcess(permit, request)`. Only the child
 // is faked: its stdout never ends and its root's dispose/reap stay pending until the test releases them. The
 // hard expiry is the rig's virtual boundary clock; Node MockTimers stand in for the 600 s read wait.
+//
+// Under that facade the Codex handle's completion settles the bundle stream on its own, so the real-facade
+// bundle cases show the typed outcome, not the timer retirement. The bundle retirement is pinned by the
+// TickSpawner-shaped cases at the end (a spawner whose completion stays pending until the test releases it).
 
 const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
 const UNUSED_BARE = "/nonexistent-3304/bare.git";
@@ -165,7 +169,9 @@ describe("readBare 600 s timer inside a real boundary scope", () => {
     assert.equal(inner.settled(), false, "the retired timer did not settle the read with its plain deadline error");
     assert.equal(outer.settled(), false);
     s.child.release("clean");
-    assertTyped(errorOf(await inner.result()), TrustedExecutionRefusal);
+    const refusal = errorOf(await inner.result());
+    assertTyped(refusal, TrustedExecutionRefusal);
+    assert.match((refusal as Error).message, /boundary process deadline exceeded/);
     assert.ok(errorOf(await outer.result()) instanceof CodexBoundaryError, "the boundary owner reports its typed failure");
     assert.equal(s.rig.registry.isPoisoned(), true);
   });
@@ -184,6 +190,7 @@ describe("readBare 600 s timer inside a real boundary scope", () => {
     assert.equal(inner.settled(), false, "the retired timer did not settle the read");
     s.child.release("clean");
     assertTyped(errorOf(await inner.result()), CheckpointSoftDeadlineError);
+    assert.equal(s.rig.registry.isPoisoned(), false, "a clean soft cleanup leaves the registry unpoisoned");
   });
 
   for (const mode of ["reap-fails", "dispose-throws"] as const) {
@@ -213,7 +220,9 @@ describe("readBare 600 s timer inside a real boundary scope", () => {
     await turns();
     assert.equal(inner.settled(), false, "no timer was armed to fire the plain deadline error");
     s.child.release("clean");
-    assertTyped(errorOf(await inner.result()), TrustedExecutionRefusal);
+    const refusal = errorOf(await inner.result());
+    assertTyped(refusal, TrustedExecutionRefusal);
+    assert.match((refusal as Error).message, /boundary process deadline exceeded/);
     assert.equal(s.child.disposes(), 1);
     assert.equal(s.child.reaps(), 1);
   });
@@ -243,7 +252,7 @@ describe("streamBundleWithCap 600 s timer inside a real boundary scope (via prod
   }
 
   for (const stop of ["hard", "soft"] as const) {
-    it(`retires on the ${stop} stop: the pipeline is settled by the owner, not the plain deadline error`, async t => {
+    it(`streamBundleWithCap under the real Codex facade: the pipeline settles with the typed ${stop} error`, async t => {
       const { s, produce } = await bundleScope();
       const timers = mockTimers(t);
       const { inner } = produce();
@@ -255,9 +264,68 @@ describe("streamBundleWithCap 600 s timer inside a real boundary scope (via prod
       assert.equal(s.child.disposes() >= 1, true, "the real safety disposed the root");
       timers.pastReadDeadline();
       await turns();
-      assert.equal(inner.settled(), false, "the retired timer did not fail the pipeline with its plain deadline error");
       s.child.release("clean");
       const error = errorOf(await inner.result());
+      assertTyped(error, stop === "hard" ? GitBoundaryAbortError : CheckpointSoftDeadlineError);
+    });
+  }
+
+  // TickSpawner-shaped, completion-pending spawner: a non-Codex boundary spawner (hard-only in the runner)
+  // whose handle `completed` stays pending until the test releases it. Nothing else settles the stream, so
+  // only a retired (not re-armed) timer keeps the plain deadline error and the kill away.
+  type Terminal = { code: number; softTimedOut?: true };
+  function pendingCompletionChild() {
+    const stdout = new PassThrough(), stderr = new PassThrough();
+    for (const stream of [stdout, stderr]) stream.on("error", () => undefined);
+    let cancels = 0;
+    let release!: (outcome?: Terminal) => void;
+    const completed = new Promise<Terminal>(resolve => { release = outcome => resolve(outcome ?? { code: -1 }); });
+    const handle: BoundaryProcessHandle = {
+      stdin: new Writable({ write: (_chunk, _enc, cb) => cb() }), stdout, stderr, completed,
+      cancel: async () => { cancels++; await completed; },
+    };
+    return { handle, cancels: () => cancels, release };
+  }
+
+  const realPipes: BoundaryProcessSpawner = async request => {
+    const [command, ...args] = request.argv;
+    const child = spawn(command!, args, { cwd: request.cwd, env: request.env, stdio: ["pipe", "pipe", "pipe"] });
+    const completed = new Promise<{ code: number }>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", code => resolve({ code: code ?? 128 }));
+    });
+    return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed,
+      cancel: async () => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); await completed; } };
+  };
+
+  for (const stop of ["hard", "soft"] as const) {
+    it(`TickSpawner-shaped completion-pending spawner, ${stop} stop: the timer retires, the owner settles after release`, async t => {
+      const bare = await cache.ensureClone(fx.originPath);
+      const sourceSha = execFileSync("git", ["-C", bare, "rev-parse", "refs/remotes/origin/main"], { encoding: "utf8", env: GIT_ENV }).trim();
+      const out = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "uzi-3304-bundle-")), "recovery.bundle");
+      const child = pendingCompletionChild();
+      let markSpawned!: () => void;
+      const spawned = new Promise<void>(resolve => { markSpawned = resolve; });
+      const hard = new AbortController(), soft = new AbortController();
+      const spawner: BoundaryProcessSpawner = request => {
+        if (!request.argv.includes("bundle")) return realPipes(request);
+        markSpawned();
+        return Promise.resolve(child.handle);
+      };
+      const timers = mockTimers(t);
+      const run = track(cache.withBoundaryProcessSpawner(spawner, hard.signal,
+        () => cache.produceRecoveryBundle(bare, { sourceSha, outPath: out }), { softSignal: soft.signal }));
+      await spawned;
+      await turns();
+      (stop === "hard" ? hard : soft).abort();
+      await turns();
+      const cancelsAtStop = child.cancels();
+      timers.pastReadDeadline();
+      await turns();
+      assert.equal(child.cancels(), cancelsAtStop, "the retired timer killed nothing");
+      assert.equal(run.settled(), false, "the retired timer did not fail the pipeline with its plain deadline error");
+      child.release(stop === "hard" ? { code: 0 } : undefined);
+      const error = errorOf(await run.result());
       assertTyped(error, stop === "hard" ? GitBoundaryAbortError : CheckpointSoftDeadlineError);
     });
   }
