@@ -242,7 +242,7 @@ source "$ROOT/e2e/lib.sh"
 
 say "building images"
 storage_diagnostic_snapshot before-build
-"${COMPOSE[@]}" build >/dev/null
+compose_build_logged
 storage_diagnostic_snapshot after-build
 
 say "starting db + api + web + forge-fake"
