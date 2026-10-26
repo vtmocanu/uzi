@@ -127,7 +127,8 @@ func codeCoverageRows(label string, raw json.RawMessage) [][]string {
 			strings.ContainsRune(*entry.Reason, 0) || entry.RecordedRead == nil {
 			return unavailable
 		}
-		if _, ok := counts[*entry.Status]; !ok || (*entry.Status == "excluded" && *entry.Reason == "") {
+		if _, ok := counts[*entry.Status]; !ok || (*entry.Status != "unassessed" && *entry.Reason == "") ||
+			(*entry.RecordedRead && *entry.Status != "examined") {
 			return unavailable
 		}
 		seen[*entry.Path] = true

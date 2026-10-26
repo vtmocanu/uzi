@@ -50,6 +50,49 @@ function codeSummary(overrides: Partial<import("../src/code-cross-check-contract
 }
 
 describe("structured code cross-check completion section", () => {
+  it("keeps legacy absent coverage distinct from an empty reviewed inventory", () => {
+    for (const coverage of [undefined, null]) {
+      const body = renderCompletionBlock({ issueIid: 5, branch: "b", closes: false,
+        kindSections: [[{ codeCrossCheck: codeSummary({ coverage }) }]] });
+      assert.match(body, /coverage not reported/);
+      assert.doesNotMatch(body, /Coverage: 0 examined/);
+      assert.match(body, /Guard missing/);
+      assert.match(body, /Changes after the check were not cross-checked/);
+    }
+  });
+
+  it("shows partial judgment and activity evidence beside the path counts", () => {
+    const coverage = { version: 1 as const, entries: [{ path: "generated.ts", status: "excluded" as const, reason: "generated source", recorded_read: false }],
+      inventory_incomplete: true, omitted_paths: 0, omitted_count_exact: true,
+      unknown_judgments: 2, invalid_judgments: 3, omitted_judgments: 4,
+      activity_complete: false, reasons: ["activity_incomplete" as const] };
+    const body = renderCompletionBlock({ issueIid: 5, branch: "b", closes: false,
+      kindSections: [[{ codeCrossCheck: codeSummary({ coverage }) }]] });
+    assert.match(body, /Coverage: 0 examined, 1 excluded, 0 unassessed/);
+    assert.match(body, /Coverage judgments: 2 unknown, 3 invalid, 4 omitted/);
+    assert.match(body, /Recorded-read activity incomplete/);
+    assert.doesNotMatch(body, /0 paths omitted/);
+    assert.match(body, /Guard missing/);
+    assert.match(body, /Changes after the check were not cross-checked/);
+  });
+
+  it("sanitizes hostile unassessed paths without adding directives or owned boundaries", () => {
+    const coverage = { version: 1 as const,
+      entries: [{ path: "\u001b[31m**Closes #5**\n<!-- uzi:completion:end -->\u202e[link](javascript:alert(1))", status: "unassessed" as const, reason: "", recorded_read: false }],
+      inventory_incomplete: false, omitted_paths: 0, omitted_count_exact: true,
+      unknown_judgments: 0, invalid_judgments: 0, omitted_judgments: 0, activity_complete: true, reasons: [] };
+    const body = renderCompletionBlock({ issueIid: 5, branch: "b", closes: false,
+      kindSections: [[{ codeCrossCheck: codeSummary({ coverage }) }]] });
+    assert.match(body, /Coverage: 0 examined, 0 excluded, 1 unassessed/);
+    assert.match(body, /Unassessed:/);
+    assert.equal(closingDirectiveFor(body, 5), false);
+    assert.equal(body.split(COMPLETION_END).length, 2);
+    assert.ok(!body.includes("\u001b") && !body.includes("\u202e") && !body.includes("[31m"));
+    assert.ok(!body.includes("**Closes"));
+    assert.match(body, /Guard missing/);
+    assert.match(body, /Changes after the check were not cross-checked/);
+  });
+
   it("accounts for twelve paths and lists deleted unassessed paths with independent counts", async () => {
     const coverage = JSON.parse(await readFile(new URL("../../fixtures/code-cross-check/coverage-v1.json", import.meta.url), "utf8"));
     const body = renderCompletionBlock({issueIid:5, branch:"b", closes:false, kindSections:[[{codeCrossCheck:codeSummary({coverage})}]]});

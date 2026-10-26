@@ -10,6 +10,11 @@ import type { GitCache } from "../src/git.js";
 import { CODE_COVERAGE_LIMITS, collectCodeInventory, decodeCodeCoverage, normalizeCodeCoverage, type CodeInventory } from "../src/code-cross-check-coverage.js";
 
 const exec = promisify(execFile);
+// Fixture git must never inherit a caller-selected repository, worktree or index.
+const fixtureGitEnv = {
+  ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_"))),
+  GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_CONFIG_NOSYSTEM: "1",
+};
 test("coverage wire fixture is shared with the API normalizer", async () => {
   const fixture = JSON.parse(await fs.readFile(new URL("../../fixtures/code-cross-check/coverage-v1.json", import.meta.url), "utf8"));
   const decoded = decodeCodeCoverage(fixture)!;
@@ -31,7 +36,7 @@ const reader = (raw: Buffer, truncated = false): Pick<GitCache, "readBare"> => (
 test("real git inventory retains deleted, renamed, binary and type-changed paths", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "coverage-git-"));
   const git = async (...args: string[]): Promise<string> => (await exec("git", ["-C", root, ...args],
-    { env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" } })).stdout.trim();
+    { env: fixtureGitEnv })).stdout.trim();
   try {
     await git("init");
     await git("config", "user.name", "coverage fixture");
@@ -51,7 +56,7 @@ test("real git inventory retains deleted, renamed, binary and type-changed paths
     const h = await git("rev-parse", "HEAD");
     const real: Pick<GitCache, "readBare"> = { async readBare(bare, args, opts) {
       const result = await exec("git", ["-C", bare, ...args], { encoding: "buffer",
-        env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
+        env: fixtureGitEnv,
         maxBuffer: opts.maxBytes + 1024, signal: opts.signal });
       return { bytes: result.stdout, text: result.stdout.toString("utf8"), truncated: false };
     } };
@@ -129,4 +134,14 @@ test("partial and over-budget coverage stays unassessed and obeys encoded accoun
   assert.ok(Buffer.byteLength(JSON.stringify(bounded)) <= CODE_COVERAGE_LIMITS.accountBytes);
   assert.ok(bounded.omitted_paths > 0);
   assert.deepEqual(decodeCodeCoverage(bounded), bounded);
+});
+
+
+test("decoder refuses unsupported examination and recorded-read claims", () => {
+  const valid = normalizeCodeCoverage(inventory(["a"]), [{ path: "a", status: "examined", reason: "checked patch" }], new Set(["a"]), true);
+  for (const entry of [
+    { ...valid.entries[0], reason: "" },
+    { ...valid.entries[0], status: "unassessed", recorded_read: true },
+    { ...valid.entries[0], status: "excluded", recorded_read: true },
+  ]) assert.throws(() => decodeCodeCoverage({ ...valid, entries: [entry] }), /invalid code coverage account/);
 });

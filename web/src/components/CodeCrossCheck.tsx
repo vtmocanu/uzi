@@ -121,7 +121,8 @@ function coverageEvidence(value: unknown): CodeCrossCheckCoverage | null {
   for (const entry of value.entries) {
     if (!object(entry) || !text(entry.path, 512) || !entry.path || seen.has(entry.path)
       || !["examined", "excluded", "unassessed"].includes(entry.status as string)
-      || !text(entry.reason, 256) || (entry.status === "excluded" && !entry.reason)
+      || !text(entry.reason, 256) || (entry.status !== "unassessed" && !entry.reason)
+      || (entry.recorded_read === true && entry.status !== "examined")
       || typeof entry.recorded_read !== "boolean") return null;
     seen.add(entry.path);
   }

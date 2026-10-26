@@ -112,7 +112,7 @@ func TestCodeCrossCheckCoverageBoundaries(t *testing.T) {
 	if got := decodeCoverage(t, NormalizeCodeCrossCheckCoverage("completed", coverageJSON(t, account))); got.InventoryIncomplete || len(got.Entries) != 1 {
 		t.Fatal("exact UTF-8 bounds refused")
 	}
-	for _, field := range []string{"path", "reason", "status", "nul path", "nul reason"} {
+	for _, field := range []string{"path", "reason", "status", "nul path", "nul reason", "empty examined reason", "unassessed read", "excluded read"} {
 		c := coverageFixture()
 		switch field {
 		case "path":
@@ -125,6 +125,12 @@ func TestCodeCrossCheckCoverageBoundaries(t *testing.T) {
 			c.Entries[0].Path = "a\u0000.go"
 		case "nul reason":
 			c.Entries[0].Reason = "reason\u0000"
+		case "empty examined reason":
+			c.Entries[0].Reason = ""
+		case "unassessed read":
+			c.Entries[0].Status = "unassessed"
+		case "excluded read":
+			c.Entries[0].Status = "excluded"
 		}
 		got := decodeCoverage(t, NormalizeCodeCrossCheckCoverage("completed", coverageJSON(t, c)))
 		if !got.InventoryIncomplete || len(got.Entries) != 0 || got.OmittedPaths != 1 {

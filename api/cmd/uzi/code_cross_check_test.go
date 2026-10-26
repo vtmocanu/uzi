@@ -28,15 +28,44 @@ func cliCoverageFixture(t *testing.T) apitypes.CodeCrossCheckCoverage {
 
 func TestCodeCrossCheckCoverageFullDisplayAndJSON(t *testing.T) {
 	account := cliCoverageFixture(t)
+	for i := range account.Entries {
+		account.Entries[i].Reason = fmt.Sprintf("unique reason %d", i+1)
+		account.Entries[i].RecordedRead = account.Entries[i].Status == "examined" && i%2 == 0
+	}
+	account.Entries[1].Status = "excluded"
+	account.Entries[1].RecordedRead = false
 	raw, err := json.Marshal(account)
 	if err != nil {
 		t.Fatal(err)
 	}
 	summary := &apitypes.CodeCrossCheck{Stage: "code", Outcome: "completed", Findings: json.RawMessage("[]"), Coverage: raw}
 	out := codeCheckCommand(t, summary)
-	for _, expected := range []string{"12 stored paths: 9 examined, 0 excluded, 3 unassessed", "deleted.ts", "Reviewed patch", "0 unknown, 0 invalid, 0 omitted"} {
+	for _, expected := range []string{"12 stored paths: 8 examined, 1 excluded, 3 unassessed", "deleted.ts", "unique reason 1", "0 unknown, 0 invalid, 0 omitted"} {
 		if !strings.Contains(out, expected) {
 			t.Fatalf("missing %q", expected)
+		}
+	}
+	// Bind every plain-output field to its entry, rather than aggregate substrings.
+	plain := make(map[string]string)
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		fields := strings.Fields(line)
+		if len(fields) > 0 && strings.HasPrefix(fields[0], "CODE_CHECK_COVERAGE_") {
+			if _, exists := plain[fields[0]]; exists {
+				t.Fatalf("duplicate plain row %s", fields[0])
+			}
+			plain[fields[0]] = strings.TrimSpace(strings.TrimPrefix(line, fields[0]))
+		}
+	}
+	for i, entry := range account.Entries {
+		prefix := fmt.Sprintf("CODE_CHECK_COVERAGE_%d", i+1)
+		for suffix, want := range map[string]string{
+			"_PATH": entry.Path, "_STATUS": entry.Status, "_REASON": entry.Reason, "_RECORDED_READ": fmt.Sprint(entry.RecordedRead),
+		} {
+			got, exists := plain[prefix+suffix]
+			if !exists || got != want {
+				t.Fatalf("%s: got %q (present=%t), want %q", prefix+suffix, got, exists, want)
+			}
 		}
 	}
 	var decoded apitypes.RunDTO
@@ -58,6 +87,21 @@ func TestCodeCrossCheckCoverageIncompleteAndMalformed(t *testing.T) {
 	for _, raw := range []json.RawMessage{json.RawMessage("{}"), json.RawMessage("false"), json.RawMessage(`{"version":1,"entries":[null]}`)} {
 		if got := codeCoverageRows("CODE_CHECK", raw); got[0][1] != "Coverage unavailable" {
 			t.Fatal("invalid account rendered as complete")
+		}
+	}
+	for _, entry := range []apitypes.CodeCrossCheckCoverageEntry{
+		{Path: "a", Status: "examined", Reason: "", RecordedRead: false},
+		{Path: "a", Status: "unassessed", Reason: "", RecordedRead: true},
+		{Path: "a", Status: "excluded", Reason: "generated", RecordedRead: true},
+	} {
+		account := cliCoverageFixture(t)
+		account.Entries = []apitypes.CodeCrossCheckCoverageEntry{entry}
+		raw, err := json.Marshal(account)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := codeCoverageRows("CODE_CHECK", raw); got[0][1] != "Coverage unavailable" {
+			t.Fatalf("unsupported evidence rendered: %+v", entry)
 		}
 	}
 	for _, tc := range []struct {
@@ -281,8 +325,13 @@ func TestRunGetCodeCrossCheckDispositions(t *testing.T) {
 	for _, raw := range []json.RawMessage{nil, json.RawMessage("null")} {
 		s.Dispositions = raw
 		out = codeCheckCommand(t, s)
-		if !strings.Contains(out, "Dispositions unavailable") || strings.Contains(out, "_COUNTS") || strings.Contains(out, "not reported") {
+		if !strings.Contains(out, "Dispositions unavailable") || strings.Contains(out, "_COUNTS") {
 			t.Fatalf("legacy: %s", out)
+		}
+		for _, row := range codeCrossCheckRows(apitypes.RunDTO{CodeCrossCheckSummary: s}) {
+			if strings.HasSuffix(row[0], "_DISPOSITION") || strings.HasSuffix(row[0], "_DISPOSITION_REASON") {
+				t.Fatalf("legacy invented per-finding disposition: %s", row[0])
+			}
 		}
 	}
 	s.FinalizedAt = &now

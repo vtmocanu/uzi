@@ -107,7 +107,8 @@ func NormalizeCodeCrossCheckCoverage(outcome string, input ...json.RawMessage) [
 			!utf8.ValidString(entry.Path) || !utf8.ValidString(entry.Reason) ||
 			strings.ContainsRune(entry.Path, 0) || strings.ContainsRune(entry.Reason, 0) ||
 			(entry.Status != "examined" && entry.Status != "excluded" && entry.Status != "unassessed") ||
-			(entry.Status == "excluded" && entry.Reason == "") {
+			(entry.Status != "unassessed" && entry.Reason == "") ||
+			(entry.RecordedRead && entry.Status != "examined") {
 			dropped++
 			invalid = true
 			continue

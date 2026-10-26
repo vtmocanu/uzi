@@ -57,6 +57,9 @@ func TestCodeCrossCheckCoverageRouteLiveDB(t *testing.T) {
 		{"scalar", `"malformed account"`, true}, {"invalid entries", strings.Replace(valid, `"examined"`, `"invented"`, 1), true},
 		{"over coverage cap", `"` + strings.Repeat("x", 128<<10) + `"`, true},
 		{"nul path", strings.Replace(valid, `"a.go"`, `"a\u0000.go"`, 1), true},
+		{"empty examined reason", strings.Replace(valid, `"checked"`, `""`, 1), true},
+		{"unassessed recorded read", strings.Replace(valid, `"examined"`, `"unassessed"`, 1), true},
+		{"excluded recorded read", strings.Replace(valid, `"examined"`, `"excluded"`, 1), true},
 		{"valid", valid, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

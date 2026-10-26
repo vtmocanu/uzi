@@ -178,7 +178,8 @@ export function decodeCodeCoverage(value: unknown): CodeCoverage | null {
       || !text(entry.path, CODE_COVERAGE_LIMITS.pathBytes) || !entry.path || seen.has(entry.path)
       || !text(entry.reason, CODE_COVERAGE_LIMITS.reasonBytes)
       || !["examined", "excluded", "unassessed"].includes(entry.status as string)
-      || (entry.status === "excluded" && entry.reason.length === 0)
+      || (entry.status !== "unassessed" && entry.reason.length === 0)
+      || (entry.recorded_read === true && entry.status !== "examined")
       || typeof entry.recorded_read !== "boolean") return invalid();
     seen.add(entry.path);
   }
