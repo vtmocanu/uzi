@@ -16906,8 +16906,9 @@ try {
       // issue #3304: the child's clean exit does not end the gated output by itself (its source may never
       // deliver an EOF), and the handle stops cancelling once its completion has settled. When the scope's
       // hard signal, or its soft signal where the scope carries one (a masked scope has none), fires while
-      // the output is still unfinished, the child is cancelled and joined first, then the output settles
-      // with the typed verdict. The `exited` calls below are first-wins, so a rejection or soft timeout of
+      // the output is still unfinished, the child is joined (its spawner's handle stops it on the hard
+      // signal; on soft, the handle's soft listener requests cancellation while it still admits it), then
+      // the output settles with the typed verdict. The `exited` calls below are first-wins, so a rejection or soft timeout of
       // the completion itself still reaches the output through them (tests: v2 control in
       // runner-m2-done-checkpoint, git-startup-timeout).
       const stopSignals = [boundary.signal, boundary.softSignal].filter((signal): signal is AbortSignal => signal !== undefined);
@@ -16920,7 +16921,7 @@ try {
         stopSettling = (async () => {
           // No cancellation is requested here. On a soft stop the handle's own soft listener
           // (spawnCheckpointProcess) requests it while the handle still admits cancellation (once completion
-          // has settled nothing is needed). On a hard stop the safety handle stops on the permit abort itself,
+          // has settled nothing is needed). On a hard stop the scope's spawner (the Codex safety handle or TickSpawner) stops the child on its own signal,
           // and a cancel() request would mirror its typed completion rejection into an unsafe-cleanup error.
           const cleanup = await Promise.allSettled([process.completed]);
           for (const result of cleanup) {

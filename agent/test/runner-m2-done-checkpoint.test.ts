@@ -931,3 +931,99 @@ it("m3304 negative: a claim without code_cross_check_required has no gate and ne
   assert.equal(gate, undefined);
   assert.ok(!rig!.processArgv.some(argv => argv.includes("--name-only") && argv.includes("--no-textconv")));
 });
+
+// ---------------------------------------------------------------------------------------------
+// Issue #3304 (done-body half): the reaped done checkpoint's own code-head capture takes the same
+// snapshot, so an unmasked shared read that stalls there must settle at the soft deadline too.
+// ---------------------------------------------------------------------------------------------
+
+async function runDoneBodyScenario(t: TestContext, issue: number, spec: {
+  exit: "clean_exit" | "until_cancelled"; stop: "soft" | "none"; match?: (request: BoundaryProcessRequest) => boolean;
+}): Promise<{ settled: boolean; error: unknown; poisoned: boolean; lines: DiffRun["lines"]; failedStates: number; spawnedNameOnly: number; spawnedStalled: number }> {
+  const clock = virtualBoundaryClock();
+  const { logger, lines } = recordingLogger();
+  const timers = trackReadTimers(t);
+  let stalled = 0, nameOnly = 0, reaped = false;
+  let stdout: PassThrough | undefined;
+  const match = spec.match ?? (request => request.argv.includes("merge-base") && !request.argv.includes("--is-ancestor"));
+  let matched = false;
+  let rig: ReturnType<typeof codexRig> | undefined;
+  let result: { settled: boolean; error: unknown; poisoned: boolean } | undefined;
+  const spawnStalled = async (): Promise<SpawnedBoundaryProcess> => {
+    stalled++;
+    const out = stdout = new PassThrough();
+    const stderr = new PassThrough(), stdin = new PassThrough();
+    for (const stream of [out, stderr, stdin]) stream.on("error", () => undefined);
+    return {
+      root: {
+        kind: "boundary_action",
+        reap: async () => { await new Promise<void>(resolve => setImmediate(resolve)); reaped = true; return { ok: true as const }; },
+        dispose: async () => undefined,
+      },
+      stdin, stdout: out, stderr,
+      waitChild: () => spec.exit === "clean_exit" ? Promise.resolve({ code: 0 }) : new Promise(() => undefined),
+    };
+  };
+  const executor: Executor = {
+    get safety() { return rig?.safety; },
+    run: async ctx => {
+      rig = codexRig({ lifecycleSignal: AbortSignal.any([ctx.signal!, ctx.terminalLifecycleSignal!]),
+        armDeadline: clock.armDeadline, now: clock.now,
+        boundaryProcess: request => {
+          if (isNameOnlyDiff(request)) nameOnly++;
+          return spec.stop !== "none" && !matched && match(request) ? (matched = true, spawnStalled()) : undefined;
+        } });
+      commitInTree(ctx.worktreePath, "done-body.txt", "done body candidate\n");
+      let settled = false, error: unknown;
+      const done = ctx.checkpoint!({ reap: true, sink: "done_checkpoint" }).catch(err => { error = err; }).then(() => { settled = true; });
+      try {
+        if (spec.stop !== "none") {
+          assert.equal(await spin(() => stalled > 0, 20_000), true, "the unmasked shared read was spawned");
+          if (spec.exit === "clean_exit") {
+            assert.equal(await spin(() => reaped, 5_000), true, "the child was reaped");
+            await spin(() => false, 40);
+          }
+          clock.advance(60_000);
+        }
+        await spin(() => settled, 5_000);
+        result = { settled, error, poisoned: rig.registry.isPoisoned() };
+      } finally {
+        stdout?.destroy();
+        if (!settled) timers.flush();
+        if (!settled && !(await spin(() => settled, 3_000))) clock.advance(120_000);
+        await done;
+        if (result) result.error = error;
+      }
+      return { branch: ctx.branch };
+    },
+  };
+  const worker = runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, logger, {
+    checkpointIntervalMs: 0,
+    checkpointTestHooks: { absoluteNow: clock.now, armSoftDeadline: clock.arm },
+  });
+  await worker.execute(gitlabClaim(issue, { code_cross_check_required: true, claim_generation: 1 }));
+  assert.ok(result, "the executor reached the scenario record");
+  return { ...result, lines: lines as DiffRun["lines"], spawnedNameOnly: nameOnly, spawnedStalled: stalled,
+    failedStates: api.states.filter(s => s.body.status === "failed").length };
+}
+
+for (const exit of ["clean_exit", "until_cancelled"] as const) {
+  it(`m3304 done body ${exit === "clean_exit" ? "v1" : "v2 control"}: an unmasked shared read stalling in the code-head capture settles at the soft deadline`, async t => {
+    const r = await runDoneBodyScenario(t, exit === "clean_exit" ? 330421 : 330422, { exit, stop: "soft" });
+    assert.equal(r.spawnedStalled, 1, "the unmasked merge-base child was the stalled one");
+    assert.equal(r.settled, true, "the done checkpoint settles at the soft deadline, not after the 600 s read timer");
+    assert.deepEqual(attemptOutcomes(r as unknown as DiffRun), ["soft_stop"]);
+    assert.equal(r.failedStates, 0, "the run does not fail");
+    assert.equal(r.poisoned, false);
+    assert.equal(r.spawnedNameOnly, 0, "the soft stop precedes the prompt-only changed-files diff");
+  });
+}
+
+it("m3304 steps: the code-head capture reports each split step in checkpoint step records", async t => {
+  const r = await runDiffScenario(t, 330423, { child: { stdout: "ended_unread", exit: "clean_exit" }, stop: "none", match: () => false });
+  const steps = r.lines.filter(l => l.msg === "checkpoint step").map(l => l.step);
+  const split = ["runner_tip", "tracking", "default_tip", "pin", "changed_files"].map(s => `checkpoint_code_head_${s}`);
+  let at = 0;
+  for (const step of steps) if (step === split[at]) at++;
+  assert.equal(at, split.length, `the split steps appear in capture order, saw ${JSON.stringify(steps)}`);
+});
