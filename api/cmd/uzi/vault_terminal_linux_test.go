@@ -7,7 +7,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"os/exec"
+	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -302,6 +308,243 @@ func TestVaultTerminalPasswordBoundPTY(t *testing.T) {
 				case <-deadline.C:
 					t.Fatal("next terminal consumer did not receive newline")
 				}
+			}
+		})
+	}
+}
+
+// An interrupt during the hidden prompt restores the terminal before exiting
+// and submits no password; the default signal action would skip the restore.
+func TestVaultTerminalPasswordInterruptPTY(t *testing.T) {
+	fd, err := unix.Open("/dev/ptmx", unix.O_RDWR|unix.O_NOCTTY|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	master := os.NewFile(uintptr(fd), "vault-interrupt-master")
+	defer func() {
+		if err := master.Close(); err != nil {
+			t.Errorf("close PTY master: %v", err)
+		}
+	}()
+	if err := unix.IoctlSetPointerInt(fd, unix.TIOCSPTLCK, 0); err != nil {
+		t.Fatal(err)
+	}
+	n, err := unix.IoctlGetInt(fd, unix.TIOCGPTN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slave, err := os.OpenFile(fmt.Sprintf("/dev/pts/%d", n), os.O_RDWR|unix.O_NOCTTY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := slave.Close(); err != nil {
+			t.Errorf("close PTY slave: %v", err)
+		}
+	}()
+	before, err := unix.IoctlGetTermios(int(slave.Fd()), unix.TCGETS)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	notified := make(chan chan<- os.Signal, 1)
+	exited := make(chan *unix.Termios, 1)
+	oldNotify, oldStop, oldExit := vaultNotifyInterrupt, vaultStopInterrupt, vaultInterruptExit
+	vaultNotifyInterrupt = func(c chan<- os.Signal) { notified <- c }
+	vaultStopInterrupt = func(chan<- os.Signal) {}
+	vaultInterruptExit = func(os.Signal) {
+		state, err := unix.IoctlGetTermios(int(slave.Fd()), unix.TCGETS)
+		if err != nil {
+			t.Errorf("termios at exit: %v", err)
+		}
+		exited <- state
+	}
+	t.Cleanup(func() { vaultNotifyInterrupt, vaultStopInterrupt, vaultInterruptExit = oldNotify, oldStop, oldExit })
+
+	type result struct {
+		password []byte
+		err      error
+	}
+	done := make(chan result, 1)
+	go func() {
+		password, err := readVaultTerminalPassword(context.Background(), slave)
+		done <- result{password, err}
+	}()
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	var interrupts chan<- os.Signal
+	select {
+	case interrupts = <-notified:
+	case <-deadline.C:
+		t.Fatal("reader did not register for interrupts")
+	}
+	poll := time.NewTicker(time.Millisecond)
+	defer poll.Stop()
+	for {
+		state, err := unix.IoctlGetTermios(int(slave.Fd()), unix.TCGETS)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.Lflag&unix.ECHO == 0 {
+			break
+		}
+		select {
+		case <-poll.C:
+		case <-deadline.C:
+			t.Fatal("reader did not disable ECHO")
+		}
+	}
+	interrupts <- os.Interrupt
+	select {
+	case state := <-exited:
+		if state == nil || *state != *before {
+			t.Fatal("terminal state was not restored before the interrupt exit")
+		}
+	case <-deadline.C:
+		t.Fatal("interrupt did not exit the prompt")
+	}
+	// Release the reader the stubbed exit left blocked; the prompt must still
+	// not have produced a password before this test input.
+	select {
+	case got := <-done:
+		t.Fatalf("reader returned before input: err=%v", got.err)
+	default:
+	}
+	if _, err := unix.Write(fd, []byte("\n")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-done:
+		clear(got.password)
+	case <-deadline.C:
+		t.Fatal("reader did not return after release")
+	}
+}
+
+// TestVaultUnlockSignalHelper is the child process for
+// TestVaultUnlockSignalSubprocess; it runs the real CLI on its terminal stdin.
+func TestVaultUnlockSignalHelper(t *testing.T) {
+	if os.Getenv("UZI_VAULT_SIGNAL_HELPER") != "1" {
+		t.Skip("subprocess helper")
+	}
+	root := newRootCmd(DefaultEnv())
+	root.SetArgs([]string{"vault", "unlock"})
+	_ = root.Execute()
+	os.Exit(0)
+}
+
+// A real SIGINT or SIGTERM delivered to `uzi vault unlock` while its hidden
+// prompt waits must restore the full terminal state, exit with 128+signal and
+// send no unlock request. Default signal termination would skip the restore.
+func TestVaultUnlockSignalSubprocess(t *testing.T) {
+	for _, sig := range []syscall.Signal{syscall.SIGINT, syscall.SIGTERM} {
+		t.Run(sig.String(), func(t *testing.T) {
+			var requests atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasPrefix(r.URL.Path, "/api/vault/unlock") {
+					requests.Add(1)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte("{}"))
+			}))
+			defer srv.Close()
+
+			fd, err := unix.Open("/dev/ptmx", unix.O_RDWR|unix.O_NOCTTY|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			master := os.NewFile(uintptr(fd), "vault-signal-master")
+			defer func() {
+				if err := master.Close(); err != nil {
+					t.Errorf("close PTY master: %v", err)
+				}
+			}()
+			if err := unix.IoctlSetPointerInt(fd, unix.TIOCSPTLCK, 0); err != nil {
+				t.Fatal(err)
+			}
+			n, err := unix.IoctlGetInt(fd, unix.TIOCGPTN)
+			if err != nil {
+				t.Fatal(err)
+			}
+			slave, err := os.OpenFile(fmt.Sprintf("/dev/pts/%d", n), os.O_RDWR|unix.O_NOCTTY, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := slave.Close(); err != nil {
+					t.Errorf("close PTY slave: %v", err)
+				}
+			}()
+			before, err := unix.IoctlGetTermios(int(slave.Fd()), unix.TCGETS)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			home := t.TempDir()
+			cmd := exec.Command(os.Args[0], "-test.run=^TestVaultUnlockSignalHelper$")
+			cmd.Env = append(os.Environ(),
+				"UZI_VAULT_SIGNAL_HELPER=1",
+				"UZI_URL="+srv.URL,
+				"UZI_TOKEN=uzc_signaltest",
+				"UZI_VERSION_CHECK=0",
+				"HOME="+home,
+				"XDG_CONFIG_HOME="+home,
+			)
+			cmd.Stdin = slave
+			var stderr bytes.Buffer
+			cmd.Stdout, cmd.Stderr = &stderr, &stderr
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			waited := make(chan error, 1)
+			go func() { waited <- cmd.Wait() }()
+			defer func() {
+				if cmd.ProcessState == nil {
+					_ = cmd.Process.Kill()
+					<-waited
+				}
+			}()
+
+			deadline := time.NewTimer(15 * time.Second)
+			defer deadline.Stop()
+			poll := time.NewTicker(time.Millisecond)
+			defer poll.Stop()
+			for {
+				state, err := unix.IoctlGetTermios(int(slave.Fd()), unix.TCGETS)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if state.Lflag&unix.ECHO == 0 {
+					break
+				}
+				select {
+				case <-poll.C:
+				case err := <-waited:
+					t.Fatalf("helper exited before prompting: %v\n%s", err, stderr.String())
+				case <-deadline.C:
+					t.Fatalf("helper did not disable ECHO\n%s", stderr.String())
+				}
+			}
+			if err := cmd.Process.Signal(sig); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-waited:
+			case <-deadline.C:
+				t.Fatalf("helper did not exit on %v", sig)
+			}
+			if got, want := cmd.ProcessState.ExitCode(), 128+int(sig); got != want {
+				t.Errorf("exit code = %d (%v), want %d", got, cmd.ProcessState, want)
+			}
+			after, err := unix.IoctlGetTermios(int(slave.Fd()), unix.TCGETS)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if *after != *before {
+				t.Error("terminal state was not restored after the signal")
+			}
+			if got := requests.Load(); got != 0 {
+				t.Errorf("unlock requests = %d, want 0", got)
 			}
 		})
 	}
