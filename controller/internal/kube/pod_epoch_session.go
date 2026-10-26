@@ -15,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 const PodEpochMaxIdentities = 4096
@@ -629,6 +630,15 @@ func (s *PodEpochSession) Deliver(ctx context.Context, d *PodEpochDecision) erro
 	}
 	requestCtx, cancel := context.WithTimeout(markMaintenanceRead(ctx), podEpochRequestTimeout)
 	defer cancel()
+	client := s.client.CoreV1().RESTClient()
+	if concrete, ok := client.(*rest.RESTClient); ok && concrete == nil {
+		client = nil
+	}
+	if client != nil {
+		return client.Patch(types.MergePatchType).MaxRetries(0).
+			Namespace(d.namespace).Resource("pods").Name(d.name).Body(body).
+			Do(requestCtx).Error()
+	}
 	_, err = s.client.CoreV1().Pods(d.namespace).Patch(requestCtx, d.name, types.MergePatchType, body, metav1.PatchOptions{})
 	return err
 }
