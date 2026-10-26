@@ -683,6 +683,10 @@ with owner intent and owner commands. (AI-synced 2026-10-24)
 - Roll completion/incarnation proof and reservation completion are separate from serving eligibility. Manual workers supply no replacement coverage; idle workers can roll and return cordoned, while busy drift waits under #3103. An all-manual multi-worker pool may remain held; no zero-coverage bypass is added. #3153/#3307 migration coverage/custody, #3103 global ForceRoll semantics and independent DinD/pressure/maintenance guards above remain authoritative. (AI-synced 2026-10-24)
 - Web persistent external/hosted controls and owner CLI show manual metadata alongside combined fences. Health/admin surfaces remain diagnosis only, without cordon actions. A manual wait requires a nonempty entirely manually cordoned suitable population and no claimable assigned continuation; a suitable uncordoned busy or automatically drained peer prevents that diagnosis. Manual waits receive no upgrade-only exemption. No TTL, retention policy, provisioning repair or new force action is added. (AI-synced 2026-10-24)
 
+### Instance maintenance mode (#3454)
+
+- An admin can switch on an instance-wide maintenance mode (optional reason, 280 characters) before infrastructure work: new work queues and is never rejected; a run claimed at least once, and cross-check children of an admitted lead, finish. "Clear" means zero active, held and open-custody work in one snapshot, "no blockers visible" and not a race-free authorization. The web admin card is the only writer (cookie session + CSRF); the CLI is read-only (`uzi admin maintenance status`). PRD #3454; live acceptance on hosted k8s is tracked in #3465. (AI-synced 2026-10-26)
+
 ## Feature #121 — Pre-provision a cloned repo's JS dependencies
 
 Tracked as GitLab issue vtmocanu/uzi#121; PRD at `prds/done/121-clone-js-deps-provision.md`.
