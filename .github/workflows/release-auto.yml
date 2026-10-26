@@ -314,17 +314,31 @@ jobs:
           # A lost transport receipt may follow a successful atomic server update.
           # Recover/verify this exact tag only; never prepare or push a replacement.
           echo 'attempted=true' >> "$GITHUB_OUTPUT"
-          if g push --atomic origin "${refspecs[@]}"; then
+          receipt="$RUNNER_TEMP/push-receipt"
+          errors="$RUNNER_TEMP/push-errors"
+          if g push --porcelain --atomic origin "${refspecs[@]}" > "$receipt" 2> "$errors"; then
+            cat "$receipt" "$errors"
             echo 'outcome=pushed' >> "$GITHUB_OUTPUT"
           else
-            echo 'outcome=receipt-unknown' >> "$GITHUB_OUTPUT"
-            echo 'reason=push-receipt-unknown' >> "$GITHUB_OUTPUT"
-            echo '::warning::Push receipt unconfirmed; verify only the prepared tag.'
+            cat "$receipt" "$errors"
+            if awk -F '\t' '
+              NF>=3 && $1=="!" { rejected++ }
+              NF>=3 && $1 ~ /^[ *+\-]$/ { changed++ }
+              END { exit !(rejected>0 && changed==0) }' "$receipt"; then
+              echo 'attempted=false' >> "$GITHUB_OUTPUT"
+              echo 'outcome=push-rejected' >> "$GITHUB_OUTPUT"
+              reason='push-rejected'
+              fail
+            else
+              echo 'outcome=receipt-unknown' >> "$GITHUB_OUTPUT"
+              echo 'reason=push-receipt-unknown' >> "$GITHUB_OUTPUT"
+              echo '::warning::Push receipt unconfirmed; inspect and verify only the prepared tag.'
+            fi
           fi
 
   watch:
     needs: [authorize, prepare, push]
-    if: needs.push.outputs.attempted == 'true'
+    if: ${{ !cancelled() && needs.push.outputs.attempted == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 125
     permissions:
@@ -401,11 +415,12 @@ jobs:
           needs = json.loads(os.environ['NEEDS_JSON'])
           prepared = needs['prepare'].get('outputs', {})
           pushed = needs['push'].get('outputs', {})
+          push_outcome = pushed.get('outcome') or ('receipt-unknown' if pushed.get('attempted') == 'true' else '')
           watched = needs['watch'].get('outputs', {})
           result = {'run': os.environ['RUN_URL'], 'tag': prepared.get('tag', ''),
                     'parent': prepared.get('parent', ''), 'release': prepared.get('release', ''),
                     'audit_head': prepared.get('audit_head', ''),
-                    'push_outcome': pushed.get('outcome', ''),
+                    'push_outcome': push_outcome,
                     'published_at': watched.get('published_at', ''), 'verified_at': watched.get('verified_at', ''),
                     'changes': json.loads(prepared.get('changes') or '[]'),
                     'retries': json.loads(prepared.get('retry_log') or '[]')}
@@ -414,7 +429,7 @@ jobs:
           result['outcome'] = 'blocked' if problem else (watched.get('outcome') or prepared.get('outcome') or 'no-op')
           result['reason'] = next((needs[name].get('outputs', {}).get('reason') or name + '-failed' for name in failed),
                                   'partial-publication' if problem else prepared.get('reason', 'complete'))
-          if problem and pushed.get('outcome') == 'receipt-unknown':
+          if problem and push_outcome == 'receipt-unknown':
               result['outcome'], result['reason'] = 'partial-publication', 'push-receipt-unknown'
           body = '```json\n' + json.dumps(result, indent=2, sort_keys=True) + '\n```\n'
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as stream:

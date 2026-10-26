@@ -263,7 +263,7 @@ assert.call(auto_prepare.fetch('steps').find { |step| step['id'] == 'prepare' }.
 auto_push = auto_jobs.fetch('push')
 assert.call(auto_push.fetch('if'), "needs.authorize.outputs.outcome == 'authorized' && needs.prepare.outputs.outcome == 'prepared'", 'App key requires authorized successful preparation')
 assert.call(auto_push.fetch('environment').fetch('name'), "${{ inputs.kind == 'stable' && 'release-stable' || 'release-rc' }}", 'separate principal per operation')
-assert.call(auto_jobs.fetch('watch').fetch('if'), "needs.push.outputs.attempted == 'true'", 'recovery follows only an authorized push attempt')
+assert.call(auto_jobs.fetch('watch').fetch('if'), "${{ !cancelled() && needs.push.outputs.attempted == 'true' }}", 'known push attempt remains watched after job failure or timeout')
 assert.call(auto_jobs.fetch('watch').fetch('steps').find { |step| step['id'] == 'admit' }.fetch('run'),
             'python3 -I scripts/release-auto.py watch-check', 'recovery checks actor and tag before actions writes')
 mint = auto_push.fetch('steps').find { |step| step['id'] == 'app' }
@@ -283,7 +283,6 @@ push_runs = auto_push.fetch('steps').map { |step| step.fetch('run', '') }.join("
 assert.call(push_runs.match?(/\b(?:python3?|node|npm|npx|pip|curl|wget|eval|source|bash)\b|(?:^|[;|&]|\$\()\s*sh(?:\s|$)/), false, 'credential job does not execute repository runtimes or installers')
 assert.call(push_runs.match?(%r{(?:^|[;|&])\s*(?:\./)?(?:\.agents/|scripts/)\S*|\b(?:git|g)\s+(?:checkout|switch|worktree)}), false, 'credential job never checks out or runs repository code')
 assert.call(push_runs.include?('--force'), false, 'release push cannot force refs')
-assert.call(publish_step.fetch('run').include?('g push --atomic origin'), true, 'main and candidate tag use an atomic push')
 
 # Execute the real guarded steps against an owned local bare remote. All network
 # protocols are denied; an insteadOf mapping redirects the hard-coded public URL.
@@ -326,7 +325,26 @@ Dir.mktmpdir('release-auto-contract') do |dir|
   git.call('-C', repo, 'bundle', 'create', bundle, 'refs/heads/release-auto-prepared', 'refs/tags/v0.2.0-rc.11', '^' + parent)
   File.write(File.join(bin, 'git'), <<~'SH')
     #!/usr/bin/env bash
-    exec "$TEST_REAL_GIT" -c core.fsmonitor=false -c "url.${TEST_REMOTE}.insteadOf=https://github.com/vtmocanu/uzi.git" "$@"
+    set -e
+    args=(); pushing=false
+    for arg in "$@"; do
+      args+=("$arg")
+      if [ "$arg" = push ]; then
+        pushing=true
+        if [ -n "${TEST_RECEIVE_PACK:-}" ]; then args+=("--receive-pack=$TEST_RECEIVE_PACK"); fi
+      fi
+    done
+    if [ "$pushing" = true ] && [ "${TEST_FAIL_AFTER_PUSH:-0}" = 1 ]; then
+      "$TEST_REAL_GIT" -c core.fsmonitor=false -c "url.${TEST_REMOTE}.insteadOf=https://github.com/vtmocanu/uzi.git" "${args[@]}"
+      exit 77
+    fi
+    exec "$TEST_REAL_GIT" -c core.fsmonitor=false -c "url.${TEST_REMOTE}.insteadOf=https://github.com/vtmocanu/uzi.git" "${args[@]}"
+  SH
+  File.write(File.join(bin, 'receive-pack'), <<~'SH')
+    #!/usr/bin/env bash
+    export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+    unset GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+    exec "$TEST_REAL_GIT" -c core.fsmonitor=false -c "core.hooksPath=$TEST_REMOTE/hooks" receive-pack "$@"
   SH
   File.write(File.join(bin, 'sha256sum'), <<~'RUBY')
     #!/usr/bin/env ruby
@@ -339,7 +357,7 @@ Dir.mktmpdir('release-auto-contract') do |dir|
     require 'time'
     puts(ARGV.include?('-d') ? Time.iso8601(ARGV[ARGV.index('-d') + 1]).to_i : ENV.fetch('TEST_NOW'))
   RUBY
-  %w[git sha256sum date].each { |name| File.chmod(0o700, File.join(bin, name)) }
+  %w[git receive-pack sha256sum date].each { |name| File.chmod(0o700, File.join(bin, name)) }
   env = hermetic.merge('PATH' => "#{bin}:#{ENV.fetch('PATH')}", 'TEST_REAL_GIT' => real_git, 'TEST_REMOTE' => remote,
                       'TEST_NOW' => Time.utc(2026, 10, 26, 10).to_i.to_s,
                       'GITHUB_REPOSITORY' => 'vtmocanu/uzi', 'GITHUB_EVENT_NAME' => 'workflow_dispatch', 'GITHUB_RUN_ATTEMPT' => '1',
@@ -350,7 +368,7 @@ Dir.mktmpdir('release-auto-contract') do |dir|
                       'RELEASE_TAG' => 'v0.2.0-rc.11', 'TAG_OID' => tag_oid, 'BUNDLE_DIGEST' => Digest::SHA256.file(bundle).hexdigest,
                       'REFS_DIGEST' => refs_digest, 'PREVIOUS_RC' => 'v0.2.0-rc.10', 'PREVIOUS_RC_SHA' => parent,
                       'PREVIOUS_STABLE' => 'v0.1.0', 'PREVIOUS_STABLE_SHA' => stable_sha, 'GH_APP_TOKEN' => 'credential-sentinel')
-  exercise = lambda do |changes, expected, publish_expected = nil, source_bundle = bundle, after_validation = {}|
+  exercise = lambda do |changes, expected, publish_expected = nil, source_bundle = bundle, after_validation = {}, expected_outcome = nil|
     Dir.mktmpdir('push-step', dir) do |work|
       FileUtils.mkdir_p(File.join(work, 'release-bundle'))
       FileUtils.cp(source_bundle, File.join(work, 'release-bundle/release.bundle'))
@@ -364,15 +382,21 @@ Dir.mktmpdir('release-auto-contract') do |dir|
       if expected && !publish_expected.nil?
         active_remote = invocation.fetch('TEST_REMOTE')
         main_before = git.call('--git-dir=' + active_remote, 'rev-parse', 'refs/heads/main')
+        tags_before = git.call('--git-dir=' + active_remote, 'show-ref', '--tags')
         _, push_err, pushed = Open3.capture3(invocation.merge(after_validation), 'bash', '-e', '-c', publish_step.fetch('run'), chdir: work)
-        assert.call(pushed.success?, publish_expected, "actual atomic publish: #{push_err}")
         expected_main = publish_expected && invocation['RELEASE_KIND'] == 'rc' ? invocation['RELEASE_SHA'] : main_before
-        assert.call(git.call('--git-dir=' + active_remote, 'rev-parse', 'refs/heads/main'), expected_main, 'publisher preserves the correct main boundary')
+        assert.call(git.call('--git-dir=' + active_remote, 'rev-parse', 'refs/heads/main'), expected_main,
+                    expected_outcome == 'push-rejected' ? 'atomic rejection leaves main unchanged' : 'publisher preserves the correct main boundary')
+        assert.call(pushed.success?, publish_expected, "actual atomic publish: #{push_err}")
+        if expected_outcome
+          receipt = File.read(invocation.fetch('GITHUB_OUTPUT')).lines.map { |line| line.strip.split('=', 2) }.to_h
+          assert.call(receipt['outcome'], expected_outcome, 'push result classification')
+          assert.call(receipt['attempted'], expected_outcome == 'push-rejected' ? 'false' : 'true', 'rejected push never enters watch')
+        end
         if publish_expected
           assert.call(git.call('--git-dir=' + active_remote, 'rev-parse', 'refs/tags/' + invocation['RELEASE_TAG'] + '^{}'), invocation['RELEASE_SHA'], 'atomic publish creates exact tag')
         else
-          tags = git.call('--git-dir=' + active_remote, 'show-ref', '--tags')
-          assert.call(tags.lines.any? { |line| line.split[1] == 'refs/tags/' + invocation['RELEASE_TAG'] }, false, 'failed final guard creates no tag')
+          assert.call(git.call('--git-dir=' + active_remote, 'show-ref', '--tags'), tags_before, 'failed final guard preserves all tags')
         end
       end
     end
@@ -383,10 +407,38 @@ Dir.mktmpdir('release-auto-contract') do |dir|
   exercise.call({'GITHUB_REPOSITORY' => 'other/uzi'}, false)
   exercise.call({'GITHUB_EVENT_NAME' => 'push'}, false)
   exercise.call({'RELEASE_VERSION' => '0.3.0'}, false)
+  exercise.call({'RELEASE_RC_TAG' => 'v0.2.0-rc.10'}, false)
+  exercise.call({'RELEASE_TAG' => 'v00.2.0-rc.11'}, false)
   exercise.call({'BUNDLE_DIGEST' => '0' * 64}, false)
   exercise.call({'RELEASE_SHA' => '0' * 40}, false)
+  exercise.call({'REFS_DIGEST' => '0' * 64}, true, false)
+  exercise.call({'PREVIOUS_RC' => 'v0.2.0-rc.9'}, true, false)
+  exercise.call({'PREVIOUS_STABLE' => 'v0.0.9'}, true, false)
   exercise.call({'RELEASE_KIND' => 'stable', 'RELEASE_RC_TAG' => 'v0.2.0-rc.10', 'RELEASE_RC_SHA' => parent,
                  'RELEASE_TAG' => 'v0.2.0', 'RUN_CREATED_AT' => '2026-10-24T09:00:00Z'}, false)
+  # Matching digests and advertised heads cannot replace annotation and target
+  # checks. Both malformed bundles otherwise have the expected two heads.
+  git.call('-C', repo, 'update-ref', 'refs/tags/v0.2.0-rc.11', release_sha)
+  lightweight_bundle = File.join(dir, 'lightweight.bundle')
+  git.call('-C', repo, 'bundle', 'create', lightweight_bundle, 'refs/heads/release-auto-prepared', 'refs/tags/v0.2.0-rc.11', '^' + parent)
+  exercise.call({'TAG_OID' => release_sha, 'BUNDLE_DIGEST' => Digest::SHA256.file(lightweight_bundle).hexdigest}, false, nil, lightweight_bundle)
+  git.call('-C', repo, 'tag', '-f', '-a', 'v0.2.0-rc.11', '-m', 'wrong target', parent)
+  wrong_target_oid = git.call('-C', repo, 'rev-parse', 'v0.2.0-rc.11')
+  wrong_target_bundle = File.join(dir, 'wrong-target.bundle')
+  git.call('-C', repo, 'bundle', 'create', wrong_target_bundle, 'refs/heads/release-auto-prepared', 'refs/tags/v0.2.0-rc.11', '^' + parent)
+  exercise.call({'TAG_OID' => wrong_target_oid, 'BUNDLE_DIGEST' => Digest::SHA256.file(wrong_target_bundle).hexdigest}, false, nil, wrong_target_bundle)
+  git.call('-C', repo, 'update-ref', 'refs/tags/v0.2.0-rc.11', tag_oid)
+  invalid_rc_bundle = File.join(dir, 'invalid-rc.bundle')
+  git.call('-C', repo, 'tag', '-a', 'v0.2.0-rc.0', '-m', 'invalid zero candidate', release_sha)
+  invalid_rc_oid = git.call('-C', repo, 'rev-parse', 'v0.2.0-rc.0')
+  git.call('-C', repo, 'bundle', 'create', invalid_rc_bundle, 'refs/heads/release-auto-prepared', 'refs/tags/v0.2.0-rc.0', '^' + parent)
+  exercise.call({'RELEASE_TAG' => 'v0.2.0-rc.0', 'TAG_OID' => invalid_rc_oid,
+                 'BUNDLE_DIGEST' => Digest::SHA256.file(invalid_rc_bundle).hexdigest}, false, nil, invalid_rc_bundle)
+  valid_extra_bundle = File.join(dir, 'valid-extra-head.bundle')
+  git.call('-C', repo, 'update-ref', 'refs/heads/unexpected', release_sha)
+  git.call('-C', repo, 'bundle', 'create', valid_extra_bundle, 'refs/heads/release-auto-prepared',
+           'refs/tags/v0.2.0-rc.11', 'refs/heads/unexpected', '^' + parent)
+  exercise.call({'BUNDLE_DIGEST' => Digest::SHA256.file(valid_extra_bundle).hexdigest}, false, nil, valid_extra_bundle)
   # A self-consistent child with source changes must fail the fixed metadata fence.
   git.call('-C', repo, 'checkout', '--detach', parent)
   FileUtils.mkdir_p(File.join(repo, 'api'))
@@ -426,8 +478,28 @@ Dir.mktmpdir('release-auto-contract') do |dir|
   exercise.call(stable_env.merge('RELEASE_VERSION' => '0.2.0'), false, nil, stable_bundle)
   exercise.call(stable_env.merge('RELEASE_SUPERSEDE' => 'v0.2.0-rc.9'), false, nil, stable_bundle)
   exercise.call(stable_env.merge('RUN_CREATED_AT' => '2026-10-27T10:00:00Z'), false, nil, stable_bundle)
+  # Recompute discovery outputs so only the approved-candidate identity guard
+  # rejects a newer remote RC. The raw inventory digest alone is insufficient.
+  newer_remote = File.join(dir, 'newer-candidate.git')
+  git.call('clone', '--bare', remote, newer_remote)
+  git.call('-C', repo, 'tag', '-a', 'v0.2.0-rc.12', '-m', 'new candidate', parent)
+  git.call('-C', repo, 'push', newer_remote, 'refs/tags/v0.2.0-rc.12')
+  newer_refs = git.call('ls-remote', newer_remote, 'refs/tags/v*')
+  newer_digest = Digest::SHA256.hexdigest(newer_refs.lines.map(&:chomp).sort.join("\n") + "\n")
+  exercise.call(stable_env.merge('TEST_REMOTE' => newer_remote, 'REFS_DIGEST' => newer_digest,
+                               'PREVIOUS_RC' => 'v0.2.0-rc.12'), true, false, stable_bundle)
+  git.call('-C', repo, 'tag', '-d', 'v0.2.0-rc.12')
   exercise.call(stable_env, true, false, stable_bundle, {'TEST_NOW' => (Time.utc(2026, 10, 26, 10).to_i + 1).to_s})
   exercise.call(stable_env, true, true, stable_bundle)
+  # An existing target is independently refused even with a matching fresh
+  # inventory and matching discovery names. No existing ref may be rewritten.
+  existing_remote = File.join(dir, 'existing-target.git')
+  git.call('clone', '--bare', remote, existing_remote)
+  git.call('-C', repo, 'push', existing_remote, 'refs/tags/v0.2.0-rc.11')
+  existing_refs = git.call('ls-remote', existing_remote, 'refs/tags/v*')
+  existing_digest = Digest::SHA256.hexdigest(existing_refs.lines.map(&:chomp).sort.join("\n") + "\n")
+  exercise.call({'TEST_REMOTE' => existing_remote, 'REFS_DIGEST' => existing_digest,
+                 'PREVIOUS_RC' => 'v0.2.0-rc.11', 'PREVIOUS_RC_SHA' => release_sha}, true, false)
   # A self-contained bundle can hide a wrong parent from prerequisite checking;
   # the independent single-parent binding must still reject it before minting.
   File.write(File.join(repo, 'CHANGELOG.md'), "wrong parent\n")
@@ -462,10 +534,18 @@ Dir.mktmpdir('release-auto-contract') do |dir|
   git.call('clone', '--bare', remote, raced_remote)
   git.call('-C', repo, 'push', raced_remote, release_sha + ':refs/heads/main')
   exercise.call({'TEST_REMOTE' => raced_remote}, true, false)
+  rejected_remote = File.join(dir, 'rejected-remote.git')
+  git.call('clone', '--bare', remote, rejected_remote)
+  File.write(File.join(rejected_remote, 'hooks/update'), "#!/bin/sh\n[ \"$1\" != refs/tags/v0.2.0-rc.11 ]\n")
+  File.chmod(0o700, File.join(rejected_remote, 'hooks/update'))
+  exercise.call({'TEST_REMOTE' => rejected_remote, 'TEST_RECEIVE_PACK' => File.join(bin, 'receive-pack')}, true, false, bundle, {}, 'push-rejected')
+  lost_remote = File.join(dir, 'lost-receipt.git')
+  git.call('clone', '--bare', remote, lost_remote)
+  exercise.call({'TEST_REMOTE' => lost_remote, 'TEST_FAIL_AFTER_PUSH' => '1'}, true, true, bundle, {}, 'receipt-unknown')
   exercise.call({}, true, true)
 end
 # Reporting has no checkout/contents grant. Execute its exact inline program with
-# a fake API; no-op is summary-only, and failures reuse one existing issue.
+# a fake API; healthy publication is summary-only, and failures reuse one issue.
 report_script = auto_jobs.fetch('report').fetch('steps').first.fetch('run')
 Dir.mktmpdir('release-report') do |dir|
   bin = File.join(dir, 'bin')
@@ -489,14 +569,15 @@ Dir.mktmpdir('release-report') do |dir|
   RUBY
   File.chmod(0o700, File.join(bin, 'gh'))
   normal = {'authorize' => {'result' => 'success', 'outputs' => {'outcome' => 'authorized'}},
-            'prepare' => {'result' => 'success', 'outputs' => {'outcome' => 'noop', 'reason' => 'no-new-shipping-change'}},
-            'push' => {'result' => 'skipped', 'outputs' => {}}, 'watch' => {'result' => 'skipped', 'outputs' => {}}}
+            'prepare' => {'result' => 'success', 'outputs' => {'outcome' => 'prepared', 'reason' => 'ready'}},
+            'push' => {'result' => 'success', 'outputs' => {'outcome' => 'pushed', 'attempted' => 'true'}},
+            'watch' => {'result' => 'success', 'outputs' => {'outcome' => 'published-and-verified', 'receipt' => 'confirmed'}}}
   environment = {'PATH' => "#{bin}:#{ENV.fetch('PATH')}", 'REPORT_CALLS' => File.join(dir, 'calls'),
                  'GH_TOKEN' => 'credential-sentinel', 'REPOSITORY' => 'vtmocanu/uzi', 'RUN_ID' => '123',
                  'RUN_URL' => 'https://github.com/vtmocanu/uzi/actions/runs/123', 'GITHUB_STEP_SUMMARY' => File.join(dir, 'summary')}
   _, err, status = Open3.capture3(environment.merge('NEEDS_JSON' => normal.to_json), 'bash', '-e', '-c', report_script)
-  assert.call(status.success?, true, "no-op reporting: #{err}")
-  assert.call(File.exist?(File.join(dir, 'calls')), false, 'no-op never opens or comments on an issue')
+  assert.call(status.success?, true, "healthy publication reporting: #{err}")
+  assert.call(File.exist?(File.join(dir, 'calls')), false, 'healthy publication never opens or comments on an issue')
   failed = Marshal.load(Marshal.dump(normal))
   failed['prepare'] = {'result' => 'failure', 'outputs' => {'outcome' => 'blocked', 'reason' => 'codex-runtime-needs-local-cut'}}
   _, err, status = Open3.capture3(environment.merge('NEEDS_JSON' => failed.to_json), 'bash', '-e', '-c', report_script)
@@ -504,5 +585,15 @@ Dir.mktmpdir('release-report') do |dir|
   calls = File.read(File.join(dir, 'calls'))
   assert.call(calls.include?('PATCH repos/vtmocanu/uzi/issues/42'), true, 'closed tracking issue is reopened')
   assert.call(calls.include?('POST repos/vtmocanu/uzi/issues/42/comments'), true, 'existing tracking issue receives incident')
+  %w[failure cancelled].each do |result|
+    interrupted = Marshal.load(Marshal.dump(normal))
+    interrupted['push'] = {'result' => result, 'outputs' => {'attempted' => 'true'}}
+    interrupted['watch'] = {'result' => 'failure', 'outputs' => {}}
+    _, _, status = Open3.capture3(environment.merge('NEEDS_JSON' => interrupted.to_json), 'bash', '-e', '-c', report_script)
+    assert.call(status.exitstatus, 1, "#{result} after send remains an incident")
+    text = File.read(environment.fetch('GITHUB_STEP_SUMMARY'))
+    assert.call(text.include?('"push_outcome": "receipt-unknown"'), true, "#{result} with missing receipt is unknown")
+    assert.call(text.include?('"outcome": "partial-publication"'), true, "#{result} reports same-tag manual inspection")
+  end
 end
 puts "ci-safe-paths: #{checks} assertions passed"

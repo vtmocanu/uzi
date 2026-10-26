@@ -121,7 +121,7 @@ releasability. Review the run summary and its exact parent/release/tag identifie
 Only the human dispatches `kind=stable`, supplying the newest `rc_tag` and its full
 peeled `rc_sha`, then approves `release-stable`. Agents never perform either act.
 The request expires 24 hours after the original run creation, including approval
-wait and reruns. Promotion uses the candidate and ignores current-main CI and
+wait. Promotion uses the candidate and ignores current-main CI and
 advancement. The summary links first-parent main changes observed during preparation.
 
 Codex lock changes in the planned range require the adoption read and a local cut.
@@ -136,7 +136,9 @@ A lost push receipt is investigated against the prepared tag/SHA, never by cutti
 a replacement. Prepare and push refuse when the run attempt is greater than one: re-dispatch
 instead, after inspecting remote refs when a push receipt is uncertain. Never
 rerun prepare or push in the same run. Watch and report may rerun against the
-exact existing tag/SHA; the local watch/verify scripts remain available for
+exact existing tag/SHA. The inspection bundle is retained for one day; watch
+and report recovery use the existing tag and stored outputs, not a new bundle
+or a second push. The local watch/verify scripts remain available for
 manual same-tag recovery. Only a confirmed publication and `release-verify.sh` success mean
 done; deployment health is a separate check. Problems use one `Release automation
 failures` tracking issue; expected no-ops remain in the summary.

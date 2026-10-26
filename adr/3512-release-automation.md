@@ -13,9 +13,12 @@ installation or shared build cache. Installation tokens request only
 The RC App may bypass main review and create RC tags. The stable App may create
 stable tags only, after the `release-stable` Environment reviewer approves.
 Both Environments admit only main. A dispatcher allowlist and input checks run
-before preparation and again before minting, including on reruns. Stable age is
+before preparation and again before minting. Prepare and push reject run attempts
+above one; watch recovery rechecks the dispatcher and exact tag. Stable age is
 measured from the original run's `created_at`, with a 24-hour bound checked after
-approval and immediately before push. Agents never dispatch stable or approve
+approval and immediately before the only push attempt. The bundle is retained
+for one day for inspection; watch/report recovery reads the existing tag and
+stored outputs without preparing or pushing again. Agents never dispatch stable or approve
 the stable Environment. GitHub cannot distinguish a human from an agent using
 the same credential; this behavioral boundary remains explicit.
 
@@ -25,6 +28,14 @@ classifier protects the prepared path, not a stolen credential. The App has no
 workflow-write permission. This accepts the replacement authorization boundary
 requested in #3512, superseding the exclusively in-session driver of PRD-1265
 and the human-only tag push of PR #947. The local scripts remain the fallback.
+
+Before minting, the isolated Git job also enforces the cutter's fixed paths:
+only modifications of `CHANGELOG.md`, `deploy/chart/Chart.yaml`,
+`deploy/chart/values.yaml` and `scripts/assert-worker-tag-decoupled.sh`, plus
+deletions of canonical lowercase UUID-v4 fragments in `changelog.d/`. Modified
+files must keep their regular-file mode; fragment deletions require mode 100644.
+No additions, renames, symlinks or directory-prefix exemptions are admitted.
+The full content classifier still runs during preparation.
 
 ```mermaid
 flowchart LR

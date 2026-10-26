@@ -315,6 +315,100 @@ class Changes(unittest.TestCase):
             self.assertFalse(release.changes('v0.1.0', RELEASE)[0]['shipping'])
 
 
+class PrepareFixture:
+    def __init__(self, kind='rc', scenario='', abandon=False):
+        self.kind, self.scenario, self.calls, self.remote_reads = kind, scenario, [], 0
+        env = context() if kind == 'rc' else context(RELEASE_KIND='stable', RELEASE_RC_TAG=TAG, RELEASE_RC_SHA=CANDIDATE)
+        if abandon:
+            env.update(RELEASE_VERSION='0.3.0', RELEASE_ABANDON='true')
+        if scenario == 'candidate-sha-mismatch':
+            env['RELEASE_RC_SHA'] = NEW
+        self.config = auto.inputs(env)
+        self.parent = H if kind == 'rc' else CANDIDATE
+        self.tag = ('v0.3.0-rc.1' if abandon else 'v0.2.0-rc.11') if kind == 'rc' else 'v0.2.0'
+        self.api = Mock()
+        self.api.run.return_value = run(conclusion='failure' if scenario == 'candidate-not-published' else 'success')
+        self.release = auto.Release(self.config, self.command, self.api)
+        rc_plan = plan(BASE='0.3.0', TAG=self.tag, PREVIOUS_TAG='v0.1.0') if abandon else plan()
+        self.release.tip = lambda: (H, rc_plan)
+
+    def command(self, *args, **kwargs):
+        self.calls.append(args)
+        if args[0] == 'python3':
+            if args[3] == 'metadata' and self.scenario == 'metadata-rejected':
+                raise auto.Stop('metadata-rejected')
+            return ''
+        if args[:2] == ('bash', auto.CUTTER):
+            if '--plan' not in args and self.scenario == 'cutter-main-race':
+                raise auto.Stop('cutter-refused')
+            return rendered(plan(PREVIOUS_TAG='v0.2.0-rc.11' if self.scenario == 'discovery-not-latest' else TAG)) if '--plan' in args else ''
+        if args[0] != 'git':
+            raise AssertionError(args)
+        git = args[3:]
+        if git[0] == 'ls-remote':
+            self.remote_reads += 1
+            main = NEW if self.scenario == 'main-race' or (self.scenario == 'cutter-main-race' and self.remote_reads > 1) else H
+            rows = f'{main}\trefs/heads/main\n{CANDIDATE}\trefs/tags/{TAG}\n{H}\trefs/tags/v0.1.0'
+            if self.scenario == 'candidate-not-latest' or (self.scenario == 'release-ref-race' and self.remote_reads > 1):
+                rows += f'\n{NEW}\trefs/tags/v0.3.0-rc.1'
+            if self.scenario == 'target-tag-exists':
+                rows += f'\n{RELEASE}\trefs/tags/{self.tag}'
+            if self.scenario == 'stable-superseded':
+                rows += f'\n{NEW}\trefs/tags/v0.2.0'
+            return rows
+        if git[0] == 'rev-parse':
+            if git[-1] == 'HEAD':
+                return RELEASE
+            if git[-1] == 'FETCH_HEAD':
+                return NEW
+            if TAG in git[-1]:
+                return CANDIDATE
+            return RELEASE if git[-1].endswith('^{commit}') else TAG_OID
+        if git[0] == 'rev-list':
+            parent = NEW if self.scenario == 'bad-parent' else self.parent
+            return f'{RELEASE} {parent}'
+        if git[0] == 'show':
+            return f'version: {self.tag[1:]}\nappVersion: "{self.tag[1:]}"\n'
+        if git[:2] == ('bundle', 'create'):
+            Path(git[2]).write_bytes(b'fixture bundle')
+        if git[0] == 'log':
+            return ''
+        return ''
+
+    def prepare(self):
+        with tempfile.TemporaryDirectory() as directory:
+            return self.release.prepare(Path(directory))
+
+
+class PrepareGuards(unittest.TestCase):
+    def test_rc_preparation_and_explicit_abandon_mapping(self):
+        fixture = PrepareFixture()
+        self.assertEqual(fixture.prepare()['parent'], H)
+        self.assertIn(('python3', '-I', 'scripts/release-ci-coverage.py', 'metadata', H, RELEASE), fixture.calls)
+        abandoned = PrepareFixture(abandon=True)
+        abandoned.prepare()
+        self.assertIn(('bash', auto.CUTTER, '0.3.0', '--ci', '--skip-promote'), abandoned.calls)
+
+    def test_rc_refusals_are_independent(self):
+        for scenario, reason in (('main-race', 'main-race'), ('cutter-main-race', 'main-race'), ('target-tag-exists', 'target-tag-exists'),
+                                 ('bad-parent', 'prepared-parent-mismatch'), ('release-ref-race', 'release-ref-race'),
+                                 ('metadata-rejected', 'metadata-rejected')):
+            with self.subTest(scenario=scenario), self.assertRaisesRegex(auto.Stop, reason):
+                PrepareFixture(scenario=scenario).prepare()
+
+    def test_stable_refusals_are_independent(self):
+        for scenario, reason in (('discovery-not-latest', 'candidate-not-latest'),
+                                 ('candidate-not-latest', 'candidate-not-latest'),
+                                 ('candidate-sha-mismatch', 'candidate-sha-mismatch'),
+                                 ('candidate-not-published', 'candidate-not-published'),
+                                 ('stable-superseded', 'stable-superseded'),
+                                 ('bad-parent', 'promotion-parent-mismatch'),
+                                 ('release-ref-race', 'release-ref-race'),
+                                 ('metadata-rejected', 'metadata-rejected')):
+            with self.subTest(scenario=scenario), self.assertRaisesRegex(auto.Stop, reason):
+                PrepareFixture(kind='stable', scenario=scenario).prepare()
+
+
 class FailedEvidence(unittest.TestCase):
     def failure(self, request_error=False):
         fixture = TipFixture([H])
