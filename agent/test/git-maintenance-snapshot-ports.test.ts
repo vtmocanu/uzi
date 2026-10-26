@@ -710,16 +710,34 @@ test("ported snapshot: source DAC refusal never repairs permissions or launches 
 });
 
 test("ported snapshot: source request accounting includes raw names, EOF and short read capacity", snapshotLinux, async t => {
-  const f = await snapshotPortFixture(t), info = path.join(f.clone, ".git", "objects", "info");
+  const f = await snapshotPortFixture(t), objects = path.join(f.clone, ".git", "objects");
+  const info = path.join(objects, "info");
   const control = path.join(info, "alternates"), size = (await fs.stat(control)).size;
+  let encodedSizeSum = 0;
+  const directories = [objects];
+  for (const directory of directories) {
+    for (const name of await fs.readdir(directory)) {
+      const entry = path.join(directory, name), stat = await fs.lstat(entry);
+      if (stat.isDirectory()) directories.push(entry);
+      else {
+        assert.equal(stat.isFile(), true, "fixture object store contains only directories and regular files");
+        encodedSizeSum += stat.size;
+      }
+    }
+  }
   const capacities: number[] = [];
-  let rawReads = 0;
+  let rawReads = 0, allRawReads = 0;
   const opendir = fs.opendir.bind(fs);
   t.mock.method(fs, "opendir", async (...args: Parameters<typeof fs.opendir>) => {
     const dir = await opendir(...args);
-    if (f.physical(args[0]) === info) {
+    const physical = f.physical(args[0]);
+    if (physical === objects || physical.startsWith(objects + path.sep)) {
       const read = dir.read.bind(dir);
-      t.mock.method(dir, "read", async () => { rawReads++; return read(); });
+      t.mock.method(dir, "read", async () => {
+        allRawReads++;
+        if (physical === info) rawReads++;
+        return read();
+      });
     }
     return dir;
   });
@@ -737,6 +755,8 @@ test("ported snapshot: source request accounting includes raw names, EOF and sho
   const used = f.charges.filter(c => c.resource === "sourceBytes").reduce((n, c) => n + c.amount, 0);
   assert.ok(used >= capacities.reduce((n, v) => n + v, 0) + rawReads * 255 + size,
     "read capacity, raw-name requests and conservative st_size are distinct charges");
+  assert.equal(used, encodedSizeSum + allRawReads * 255 + capacities.reduce((n, v) => n + v, 0),
+    "every encoded file size, raw-name request including EOF and actual read capacity is charged exactly");
   f.charge("sourceBytes", 256 * 1024 ** 2 - used);
   assert.throws(() => f.charge("sourceBytes", 1), { message: "maintenance_resource_exhausted" });
   await f.assertRetained();
