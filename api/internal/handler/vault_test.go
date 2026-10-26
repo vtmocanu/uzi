@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -19,14 +20,21 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
-// memVaultQ is an in-memory vault.Store for the handler tests: enough to exercise
-// create-on-first-unlock and the endpoints without a database.
+// memVaultQ is a crypto-only fixture. Unknown users explicitly default to protected
+// epoch zero with no password hash (OIDC passphrase); tests may select off mode.
 type memVaultQ struct {
-	mu     sync.Mutex
-	vaults map[uuid.UUID]store.UserVault
+	mu          sync.Mutex
+	txMu        sync.Mutex
+	vaults      map[uuid.UUID]store.UserVault
+	states      map[uuid.UUID]store.LockVaultAuthStateRow
+	defaultMode string
+	notice      func(context.Context, uuid.UUID) (uuid.UUID, error)
+	clear       func(context.Context, uuid.UUID) error
 }
 
-func newMemVaultQ() *memVaultQ { return &memVaultQ{vaults: map[uuid.UUID]store.UserVault{}} }
+func newMemVaultQ() *memVaultQ {
+	return &memVaultQ{vaults: map[uuid.UUID]store.UserVault{}, states: map[uuid.UUID]store.LockVaultAuthStateRow{}}
+}
 
 func (m *memVaultQ) GetUserVault(_ context.Context, id uuid.UUID) (store.UserVault, error) {
 	m.mu.Lock()
@@ -49,13 +57,101 @@ func (m *memVaultQ) CreateUserVaultIfAbsent(_ context.Context, arg store.CreateU
 	return v, nil
 }
 
-func (m *memVaultQ) ListMasterSealedSecrets(context.Context, uuid.UUID) ([]store.ListMasterSealedSecretsRow, error) {
+// transaction serializes crypto-only fixture callbacks; it does not model
+// rollback. Atomicity and database lock ordering require LiveDB tests.
+func (m *memVaultQ) transaction(ctx context.Context, fn func(context.Context, vault.Store) error) error {
+	m.txMu.Lock()
+	defer m.txMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return fn(vault.WithStateReader(ctx, m), m)
+}
+
+func newHandlerMemoryVault(box *secretbox.Box, m *memVaultQ) *vault.Vault {
+	return vault.New(box, m, m.transaction)
+}
+
+func (m *memVaultQ) state(id uuid.UUID) store.LockVaultAuthStateRow {
+	s, ok := m.states[id]
+	if !ok {
+		s.VaultMode = m.defaultMode
+		if s.VaultMode == "" {
+			s.VaultMode = store.VaultModeProtected
+		}
+	}
+	return s
+}
+func (m *memVaultQ) GetUserVaultState(_ context.Context, id uuid.UUID) (store.GetUserVaultStateRow, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.state(id)
+	return store.GetUserVaultStateRow{VaultMode: s.VaultMode, VaultEpoch: s.VaultEpoch}, nil
+}
+func (m *memVaultQ) LockVaultAuthState(_ context.Context, id uuid.UUID) (store.LockVaultAuthStateRow, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.state(id), nil
+}
+func (m *memVaultQ) LockSettingsAdmission(ctx context.Context) error           { return ctx.Err() }
+func (m *memVaultQ) LockSecretMutation(ctx context.Context, _ uuid.UUID) error { return ctx.Err() }
+func (m *memVaultQ) GetVaultPolicy(ctx context.Context) (string, error) {
+	return "optional", ctx.Err()
+}
+func (m *memVaultQ) LockUserVault(ctx context.Context, id uuid.UUID) (store.UserVault, error) {
+	return m.GetUserVault(ctx, id)
+}
+func (m *memVaultQ) DeleteUserVault(_ context.Context, id uuid.UUID) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.vaults[id]; !ok {
+		return 0, nil
+	}
+	delete(m.vaults, id)
+	return 1, nil
+}
+func (m *memVaultQ) AdvanceUserVaultMode(_ context.Context, arg store.AdvanceUserVaultModeParams) (store.AdvanceUserVaultModeRow, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.state(arg.ID)
+	s.VaultMode = arg.VaultMode
+	s.VaultEpoch++
+	m.states[arg.ID] = s
+	return store.AdvanceUserVaultModeRow{VaultMode: s.VaultMode, VaultEpoch: s.VaultEpoch}, nil
+}
+func (m *memVaultQ) HasMasterVaultMaterial(context.Context, uuid.UUID) (bool, error) {
+	return false, nil
+}
+func (m *memVaultQ) GetVaultMaterialTotals(context.Context, uuid.UUID) (store.GetVaultMaterialTotalsRow, error) {
+	return store.GetVaultMaterialTotalsRow{}, nil
+}
+func (m *memVaultQ) LockVaultAccountMaterialBatch(context.Context, store.LockVaultAccountMaterialBatchParams) ([]store.LockVaultAccountMaterialBatchRow, error) {
 	return nil, nil
 }
-func (m *memVaultQ) RewrapUserSecret(context.Context, store.RewrapUserSecretParams) (int64, error) {
-	return 0, nil
+func (m *memVaultQ) LockVaultSecretMaterialBatch(context.Context, store.LockVaultSecretMaterialBatchParams) ([]store.LockVaultSecretMaterialBatchRow, error) {
+	return nil, nil
 }
-func (m *memVaultQ) ClearVaultLockNotice(context.Context, uuid.UUID) error { return nil }
+func (m *memVaultQ) ResealVaultAccountMaterial(context.Context, store.ResealVaultAccountMaterialParams) (int64, error) {
+	return 0, errors.New("memory vault: no account material")
+}
+func (m *memVaultQ) ResealVaultSecretMaterial(context.Context, store.ResealVaultSecretMaterialParams) (int64, error) {
+	return 0, errors.New("memory vault: no secret material")
+}
+func (m *memVaultQ) ClaimVaultLockNotice(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	if m.notice != nil {
+		return m.notice(ctx, id)
+	}
+	return id, nil
+}
+
+var _ vault.Store = (*memVaultQ)(nil)
+
+func (m *memVaultQ) ClearVaultLockNotice(ctx context.Context, id uuid.UUID) error {
+	if m.clear != nil {
+		return m.clear(ctx, id)
+	}
+	return nil
+}
 
 func testVault(t *testing.T) *vault.Vault {
 	t.Helper()
@@ -67,7 +163,7 @@ func testVault(t *testing.T) *vault.Vault {
 	if err != nil {
 		t.Fatalf("secretbox.New: %v", err)
 	}
-	return vault.New(box, newMemVaultQ())
+	return newHandlerMemoryVault(box, newMemVaultQ())
 }
 
 func authedAs(method, target string, body []byte, userID uuid.UUID) *http.Request {
@@ -258,7 +354,7 @@ func TestVaultUnlockWrongPassword(t *testing.T) {
 	v := testVault(t)
 	h := &Handler{vault: v}
 	uid := uuid.New()
-	if err := v.Unlock(context.Background(), uid, "the-real-one"); err != nil {
+	if err := v.Unlock(context.Background(), uid, "the-real-password"); err != nil {
 		t.Fatalf("seed unlock: %v", err)
 	}
 	v.Lock(uid)
@@ -283,7 +379,7 @@ func TestVaultUnlockNoVaultDoesNotCreate(t *testing.T) {
 		key[i] = byte(i) + 3
 	}
 	box, _ := secretbox.New(key)
-	h := &Handler{vault: vault.New(box, mq)}
+	h := &Handler{vault: newHandlerMemoryVault(box, mq)}
 	uid := uuid.New()
 
 	body, _ := json.Marshal(map[string]string{"password": "anything"})
@@ -302,10 +398,10 @@ func TestVaultUnlockNoVaultDoesNotCreate(t *testing.T) {
 func TestPutAnthropicTokenLockedReturns409(t *testing.T) {
 	v := testVault(t)
 	db := &fakeUpsertDB{}
-	h := &Handler{q: store.New(db), vault: v}
+	h := &Handler{q: store.New(db), vault: v, secretBeginTx: func(context.Context) (pgx.Tx, error) { return &handlerSecretTx{db: db}, nil }}
 	uid := uuid.New()
 	// Vault exists (created once) but is currently locked.
-	if err := v.Unlock(context.Background(), uid, "pw"); err != nil {
+	if err := v.Unlock(context.Background(), uid, "long-password"); err != nil {
 		t.Fatalf("seed unlock: %v", err)
 	}
 	v.Lock(uid)
@@ -337,10 +433,10 @@ func TestPutAnthropicTokenLockedReturns409(t *testing.T) {
 func TestPutAnthropicTokenDEKSealedWhenUnlocked(t *testing.T) {
 	const fixture = "sk-ant-oat01-DEKSAVETEST-abcdef1234567890"
 	v := testVault(t)
-	db := &fakeUpsertDB{}
-	h := &Handler{q: store.New(db), vault: v}
+	db := &fakeUpsertDB{mode: store.VaultModeProtected, epoch: 1}
+	h := &Handler{q: store.New(db), vault: v, secretBeginTx: func(context.Context) (pgx.Tx, error) { return &handlerSecretTx{db: db}, nil }}
 	uid := uuid.New()
-	if err := v.Unlock(context.Background(), uid, "pw"); err != nil {
+	if err := v.Unlock(context.Background(), uid, "long-password"); err != nil {
 		t.Fatalf("seed unlock: %v", err)
 	}
 
@@ -384,7 +480,9 @@ func (f *fakeVaultNoticeClaimer) ClaimVaultLockNotice(_ context.Context, userID 
 // reconciler does not later DM them to unlock.
 func TestVaultLockPreAcksNotice(t *testing.T) {
 	claimer := &fakeVaultNoticeClaimer{}
-	h := &Handler{vault: testVault(t), vaultNoticeStore: claimer}
+	m := newMemVaultQ()
+	m.notice = claimer.ClaimVaultLockNotice
+	h := &Handler{vault: newHandlerMemoryVault(newHandlerTestBox(t), m)}
 	uid := uuid.New()
 
 	rec := httptest.NewRecorder()
@@ -402,7 +500,9 @@ func TestVaultLockPreAcksNotice(t *testing.T) {
 // returns 204 (a DB hiccup on the mark must not fail the lock).
 func TestVaultLockPreAckErrorStill204(t *testing.T) {
 	claimer := &fakeVaultNoticeClaimer{err: context.DeadlineExceeded}
-	h := &Handler{vault: testVault(t), vaultNoticeStore: claimer}
+	m := newMemVaultQ()
+	m.notice = claimer.ClaimVaultLockNotice
+	h := &Handler{vault: newHandlerMemoryVault(newHandlerTestBox(t), m)}
 	uid := uuid.New()
 
 	rec := httptest.NewRecorder()

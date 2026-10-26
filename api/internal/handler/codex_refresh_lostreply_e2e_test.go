@@ -250,7 +250,7 @@ func TestCodexRefreshLostReplyE2E(t *testing.T) {
 			q := store.New(pool)
 			delayed := &lostReplyStore{Queries: q, delay: variant == "pending-retention"}
 			box := newHandlerTestBox(t)
-			vlt := vault.New(box, q)
+			vlt := vault.NewPostgres(box, pool)
 			svc := workersvc.New(delayed, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), RunRecoveryParkBase: time.Second, RunRecoveryMaxPark: time.Second})
 			svc.SetTxBeginner(pool)
 			svc.SetVault(vlt)
@@ -360,20 +360,21 @@ func TestCodexRefreshLostReplyE2E(t *testing.T) {
 				VALUES($1,$2,$3,$4,'online',now(),$5)`, worker, owner, worker.String(), hash,
 				[]string{"codex_harness_v1", "codex_runtime_v2", "codex_completion_interlock_v1", "completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "codex_refresh_recovery_v1"})
 			password := "fixture-password"
+			setVaultFixturePassword(t, pool, owner, password)
 			if err := vlt.Unlock(ctx, owner, password); err != nil {
 				t.Fatal(err)
 			}
 			login, _ := json.Marshal(map[string]string{"access_token": lostReplyAccess(0), "refresh_token": lostReplyRefresh(0)})
-			sealed, err := vlt.Seal(owner, store.KindCodexAuth, login)
+			sealed, err := vlt.Seal(ctx, owner, store.KindCodexAuth, login, vault.SealForUse)
 			if err != nil {
 				t.Fatal(err)
 			}
-			secret, err := q.InsertCodexSecret(ctx, store.InsertCodexSecretParams{UserID: owner, Kind: store.KindCodexAuth, Label: "subscription", WantDefault: true, Ciphertext: sealed, SealedWith: store.SealedWithDEK})
+			secret, err := q.InsertCodexSecret(ctx, store.InsertCodexSecretParams{UserID: owner, Kind: store.KindCodexAuth, Label: "subscription", WantDefault: true, Ciphertext: sealed.Ciphertext, SealedWith: store.SealedWithDEK})
 			if err != nil {
 				t.Fatal(err)
 			}
 			identity := codexauth.Identity{ProviderUserID: "provider-" + owner.String(), WorkspaceAccountID: "account-" + owner.String()}
-			account, err := q.InsertCodexProviderAccount(ctx, store.InsertCodexProviderAccountParams{UserID: owner, ProviderUserID: identity.ProviderUserID, WorkspaceAccountID: identity.WorkspaceAccountID, SealedLogin: sealed, SealedWith: store.SealedWithDEK})
+			account, err := q.InsertCodexProviderAccount(ctx, store.InsertCodexProviderAccountParams{UserID: owner, ProviderUserID: identity.ProviderUserID, WorkspaceAccountID: identity.WorkspaceAccountID, SealedLogin: sealed.Ciphertext, SealedWith: store.SealedWithDEK})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -470,7 +471,7 @@ func TestCodexRefreshLostReplyE2E(t *testing.T) {
 				if err != nil {
 					return nil, err
 				}
-				sealed, err := vlt.Seal(owner, store.KindCodexAuth, login)
+				sealed, err := vlt.Seal(ctx, owner, store.KindCodexAuth, login, vault.SealForUse)
 				if err != nil {
 					return nil, err
 				}
@@ -481,7 +482,7 @@ func TestCodexRefreshLostReplyE2E(t *testing.T) {
 				if err := pool.QueryRow(ctx, `SELECT material_revision FROM codex_credential_state WHERE user_secret_id=$1`, secret.ID).Scan(&material); err != nil {
 					return nil, err
 				}
-				if n, err := q.RefreshCodexAccountLogin(ctx, store.RefreshCodexAccountLoginParams{Sealed: sealed, SealedWith: store.SealedWithDEK, ID: account.ID, UserID: owner, FromGeneration: 0}); err != nil || n != 1 {
+				if n, err := q.RefreshCodexAccountLogin(ctx, store.RefreshCodexAccountLoginParams{Sealed: sealed.Ciphertext, SealedWith: store.SealedWithDEK, ID: account.ID, UserID: owner, FromGeneration: 0}); err != nil || n != 1 {
 					return nil, fmt.Errorf("same identity relogin: %d %w", n, err)
 				}
 				if n, err := q.LinkCodexCredentialState(ctx, store.LinkCodexCredentialStateParams{ProviderAccountID: pgconv.UUID(account.ID), UserSecretID: secret.ID, UserID: owner, MaterialRevision: material}); err != nil || n != 1 {

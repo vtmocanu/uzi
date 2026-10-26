@@ -59,6 +59,9 @@ type Handler struct {
 	// statement fails and prove a storage error answers 503 temporarily_unavailable at every step
 	// (PRD #1910 D7). nil in production: New leaves it unset.
 	oauthBeginTx func(ctx context.Context) (pgx.Tx, error)
+	// secretBeginTx supplies a real transaction for secret mutations in tests.
+	// Production uses pool.BeginTx; withSecretLock enforces READ COMMITTED.
+	secretBeginTx func(ctx context.Context) (pgx.Tx, error)
 	// tmplWriteStore, when non-nil, replaces h.q for the two builtin-definition/reset
 	// agent-template handlers so their DB touch can be faked in a unit test without a
 	// live database (issue #223). nil in production — New leaves it unset and the
@@ -72,16 +75,11 @@ type Handler struct {
 	// leaves them unset); read only through productTokenListBound.
 	myProductTokenRowsOverride    int32
 	adminProductTokenRowsOverride int32
-	// vaultNoticeStore, when non-nil, replaces h.q for VaultLock's pre-ack of the
-	// vault-lock notice (PRD #890 D6), so that one DB touch can be faked in a unit test
-	// without a live database. nil in production — the accessor falls back to h.q.
-	// Deliberately narrow (see vaultNoticeClaimer), mirroring tmplWriteStore.
-	vaultNoticeStore vaultNoticeClaimer
 	// forgeFactory, when non-nil, replaces h.svc.ForgeForConnection for the forge-view
 	// read routes (PRD #1255 M2a), so their handlers can be exercised against a
 	// forgetest.BaseFake without a live forge or a wired forgesvc.Service (the auth
 	// live-DB suite injects one). nil in production — New leaves it unset and
-	// forgeForConnection falls back to h.svc. Mirrors tmplWriteStore/vaultNoticeStore.
+	// forgeForConnection falls back to h.svc. Mirrors tmplWriteStore.
 	forgeFactory func(forgeType, baseURL string, tokenCiphertext []byte) (forge.Forge, error)
 	// forgeMemo folds duplicate forge reads under the forge-view routes (PRD #1255
 	// M2b, D4): a short-TTL + singleflight memo so N terminals polling one PR cost
@@ -567,27 +565,6 @@ func (h *Handler) recoveryLimits() recovery.Limits {
 		CustodyHoldLimit:     h.settings.CustodyHoldLimit,
 		WorkerHeartbeatStale: h.cfg.WorkerHeartbeatStale,
 	}
-}
-
-// vaultNoticeClaimer is the narrow slice of *store.Queries VaultLock touches to pre-ack a
-// deliberate lock (PRD #890 D6). Kept narrow, and injectable via vaultNoticeStore, so the
-// pre-ack can be unit-tested without a live database. *store.Queries satisfies it.
-type vaultNoticeClaimer interface {
-	ClaimVaultLockNotice(ctx context.Context, userID uuid.UUID) (uuid.UUID, error)
-}
-
-// vaultLockNoticeStore returns the injected vault-notice claimer, or the real
-// *store.Queries. nil-safe both ways: it returns a nil INTERFACE (not a typed-nil
-// wrapper) when neither is set, so struct-literal test handlers with no store get a
-// clean nil the caller can compare against.
-func (h *Handler) vaultLockNoticeStore() vaultNoticeClaimer {
-	if h.vaultNoticeStore != nil {
-		return h.vaultNoticeStore
-	}
-	if h.q != nil {
-		return h.q
-	}
-	return nil
 }
 
 // Reconciler receives the "labels changed, resync everything" signal from the

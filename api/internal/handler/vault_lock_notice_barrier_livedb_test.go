@@ -2,8 +2,10 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -41,7 +43,10 @@ func TestVaultManualLockWaitingOnNoticeClearSendsNoNoticeLiveDB(t *testing.T) {
 	e := newRecoveryEnv(t)
 	h := e.handler()
 	barrier := &vaultNoticeClearBarrier{Queries: h.q}
-	h.vault = vault.New(e.box, barrier)
+	h.vault = newWrappedPostgresVault(e.box, e.pool, barrier, func(q *store.Queries) vault.Store {
+		return &vaultNoticeClearBarrier{Queries: q, entered: barrier.entered, release: barrier.release}
+	})
+	setVaultFixturePassword(t, e.pool, e.user, recoveryUnlockPassword)
 	if err := h.vault.Unlock(e.ctx, e.user, recoveryUnlockPassword); err != nil {
 		t.Fatal(err)
 	}
@@ -65,14 +70,30 @@ func TestVaultManualLockWaitingOnNoticeClearSendsNoNoticeLiveDB(t *testing.T) {
 	barrier.entered, barrier.release = make(chan struct{}), make(chan struct{})
 	ctx, cancel := context.WithTimeout(e.ctx, 15*time.Second)
 	defer cancel()
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(barrier.release) }) }
+	unlockJoined, lockStarted, lockJoined := false, false, false
 	unlockDone := make(chan error, 1)
+	lockDone := make(chan int, 1)
+	defer func() {
+		release()
+		cancel()
+		if !unlockJoined {
+			if err := <-unlockDone; err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				t.Errorf("join unlock after releasing notice barrier: %v", err)
+			}
+		}
+		if lockStarted && !lockJoined {
+			<-lockDone
+		}
+	}()
 	go func() { unlockDone <- h.vault.UnlockExisting(ctx, e.user, recoveryUnlockPassword) }()
 	select {
 	case <-barrier.entered:
 	case <-ctx.Done():
 		t.Fatal("notice clear did not start")
 	}
-	lockDone := make(chan int, 1)
+	lockStarted = true
 	go func() {
 		req := httptest.NewRequest(http.MethodPost, "/api/vault/lock", nil)
 		req = req.WithContext(mw.ContextWithUser(ctx, store.User{ID: e.user, IsActive: true}))
@@ -80,18 +101,21 @@ func TestVaultManualLockWaitingOnNoticeClearSendsNoNoticeLiveDB(t *testing.T) {
 		h.VaultLock(rec, req)
 		lockDone <- rec.Code
 	}()
-	// Let the lock reach its wait, then reconcile while the clear is still blocked.
-	time.Sleep(200 * time.Millisecond)
+	// Reconcile while unlock holds its notice-clear barrier.
 	reconciler.Reconcile(e.ctx)
 	if n := inbox(); n != 0 {
 		t.Errorf("reconciler sent %d vault_locked notices while the manual lock waited", n)
 	}
 
-	close(barrier.release)
-	if err := <-unlockDone; err != nil {
+	release()
+	unlockErr := <-unlockDone
+	unlockJoined = true
+	if err := unlockErr; err != nil {
 		t.Fatal(err)
 	}
-	if code := <-lockDone; code != http.StatusNoContent {
+	code := <-lockDone
+	lockJoined = true
+	if code != http.StatusNoContent {
 		t.Fatalf("manual lock=%d", code)
 	}
 	if h.vault.Unlocked(e.user) {

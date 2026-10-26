@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/google/uuid"
@@ -23,18 +24,9 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
-// sealUserSecret encrypts a user secret for storage, returning the ciphertext and
-// the sealed_with value to record. With a vault wired (production) it seals under
-// the user's DEK (sealed_with='dek') and returns vault.ErrLocked when the vault is
-// locked; without one (tests) it falls back to the legacy master box
-// (sealed_with='master'), preserving pre-vault behavior.
-func (h *Handler) sealUserSecret(userID uuid.UUID, kind string, plaintext []byte) (sealed []byte, sealedWith string, err error) {
-	if h.vault != nil {
-		sealed, err = h.vault.Seal(userID, kind, plaintext)
-		return sealed, store.SealedWithDEK, err
-	}
-	sealed, err = h.box.Seal(plaintext)
-	return sealed, store.SealedWithMaster, err
+// sealUserSecret captures the durable mode and epoch before the write transaction.
+func (h *Handler) sealUserSecret(ctx context.Context, userID uuid.UUID, kind string, plaintext []byte) (vault.SealedMaterial, error) {
+	return h.vault.Seal(ctx, userID, kind, plaintext, vault.SealForUse)
 }
 
 // maxTokenBytes bounds a pasted credential. Generous enough for both
@@ -119,38 +111,44 @@ func (h *Handler) ListMySecrets(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{"secrets": out})
 }
 
-// withSecretLock runs fn inside a transaction that first takes the per-(user,kind)
-// advisory lock serializing this user's token mutations (PRD #104 M2/D12). It is
-// what makes create, set-default and delete atomic against each other, so the
-// "exactly one default while any token exists" invariant — which no index can
-// enforce — holds across concurrent requests.
-//
-// With no pool wired (unit tests only; main always wires one) it runs fn directly
-// on h.q with no transaction. That is sound in a test precisely because the lock's
-// only job is serializing CONCURRENT callers, and a single-threaded unit test has
-// none; the concurrency itself is proven by the live-DB tests. This mirrors
-// sealUserSecret's vault-nil fallback.
-func (h *Handler) withSecretLock(ctx context.Context, userID uuid.UUID, fn func(q *store.Queries) error) error {
-	if h.pool == nil {
-		if err := fn(h.q); err != nil {
-			return err
-		}
-		h.requestCredentialPromotion(userID)
-		return nil
+// withSecretLock serializes all secret mutations. A material snapshot is fenced
+// after the advisory lock and before fn can touch credentials, defaults or aliases.
+// Metadata-only callers pass nil and retain the same transaction boundary.
+func (h *Handler) withSecretLock(ctx context.Context, userID uuid.UUID, snapshot *vault.SealedMaterial, fn func(q *store.Queries) error) error {
+	var tx pgx.Tx
+	var err error
+	if h.secretBeginTx != nil {
+		tx, err = h.secretBeginTx(ctx)
+	} else if h.pool != nil {
+		tx, err = h.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	} else {
+		return store.ErrVaultTransactionRequired
 	}
-	tx, err := h.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx) //nolint:errcheck // no-op after a successful Commit
-	// FIRST statement, before any read the lock protects (the identical placement
-	// rule as the hosted-provision quota lock). Serializes this user's token
-	// mutations until the transaction ends; XACT-scoped, so there is no unlock to
-	// forget.
-	if err := store.LockSecretMutation(ctx, tx, userID); err != nil {
+	if tx == nil {
+		return store.ErrVaultTransactionRequired
+	}
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = tx.Rollback(cleanup)
+	}()
+	// Also enforce isolation for an injected transaction source.
+	if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); err != nil {
 		return err
 	}
-	if err := fn(h.q.WithTx(tx)); err != nil {
+	q := store.New(tx)
+	if err := q.LockSecretMutation(ctx, userID); err != nil {
+		return err
+	}
+	if snapshot != nil {
+		if _, err := q.FenceVaultWrite(ctx, userID, snapshot.Mode, snapshot.Epoch); err != nil {
+			return err
+		}
+	}
+	if err := fn(q); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -201,13 +199,8 @@ func (h *Handler) PutAnthropicToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Seal under the user's per-user vault DEK (PRD #32) so a DB dump + every env
-	// var + Infisical cannot recover the token. The vault must be unlocked (it is
-	// right after login; a mid-session pod restart is the only way to hit locked
-	// here) → 409 vault_locked, which the SPA turns into an unlock prompt. When no
-	// vault is wired (tests only; main always wires one) fall back to the legacy
-	// master box so existing behavior and tests are unchanged.
-	sealed, sealedWith, err := h.sealUserSecret(user.ID, store.KindAnthropicToken, []byte(token))
+	// Seal before starting the mutation transaction.
+	material, err := h.sealUserSecret(r.Context(), user.ID, store.KindAnthropicToken, []byte(token))
 	if err != nil {
 		if h.writeVaultLocked(w, err) {
 			return
@@ -221,7 +214,7 @@ func (h *Handler) PutAnthropicToken(w http.ResponseWriter, r *http.Request) {
 	// 'default' (PRD #104 D14 — this kind-path route is a compatibility alias over
 	// the default; M2 adds the id-keyed routes and deprecates this one).
 	var row store.UpsertDefaultUserSecretRow
-	err = h.withSecretLock(r.Context(), user.ID, func(q *store.Queries) error {
+	err = h.withSecretLock(r.Context(), user.ID, &material, func(q *store.Queries) error {
 		_, getErr := q.GetDefaultUserSecretID(r.Context(), store.GetDefaultUserSecretIDParams{
 			UserID: user.ID, Kind: store.KindAnthropicToken,
 		})
@@ -237,7 +230,7 @@ func (h *Handler) PutAnthropicToken(w http.ResponseWriter, r *http.Request) {
 			}
 			if candidateErr == nil {
 				rotated, rotateErr := q.RotateUserSecret(r.Context(), store.RotateUserSecretParams{
-					ID: candidate, UserID: user.ID, Ciphertext: sealed, SealedWith: sealedWith,
+					ID: candidate, UserID: user.ID, Ciphertext: material.Ciphertext, SealedWith: material.SealedWith,
 				})
 				if rotateErr != nil {
 					return rotateErr
@@ -252,11 +245,14 @@ func (h *Handler) PutAnthropicToken(w http.ResponseWriter, r *http.Request) {
 		var writeErr error
 		row, writeErr = q.UpsertDefaultUserSecret(r.Context(), store.UpsertDefaultUserSecretParams{
 			UserID: user.ID, Kind: store.KindAnthropicToken,
-			Ciphertext: sealed, SealedWith: sealedWith,
+			Ciphertext: material.Ciphertext, SealedWith: material.SealedWith,
 		})
 		return writeErr
 	})
 	if err != nil {
+		if h.writeVaultStale(w, err) {
+			return
+		}
 		if errors.Is(err, pgx.ErrNoRows) {
 			httpx.Error(w, http.StatusConflict, errSecretDisabled.Error())
 			return
@@ -291,7 +287,7 @@ func (h *Handler) DeleteAnthropicToken(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Deprecation", "true")
 
 	var multiToken, deleted bool
-	err := h.withSecretLock(r.Context(), user.ID, func(q *store.Queries) error {
+	err := h.withSecretLock(r.Context(), user.ID, nil, func(q *store.Queries) error {
 		secretID, gerr := q.GetDefaultUserSecretID(r.Context(), store.GetDefaultUserSecretIDParams{
 			UserID: user.ID, Kind: store.KindAnthropicToken,
 		})
@@ -374,7 +370,7 @@ func (h *Handler) CreateAnthropicToken(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	sealed, sealedWith, err := h.sealUserSecret(user.ID, store.KindAnthropicToken, []byte(token))
+	material, err := h.sealUserSecret(r.Context(), user.ID, store.KindAnthropicToken, []byte(token))
 	if err != nil {
 		if h.writeVaultLocked(w, err) {
 			return
@@ -385,7 +381,7 @@ func (h *Handler) CreateAnthropicToken(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var row store.InsertUserSecretRow
-	err = h.withSecretLock(r.Context(), user.ID, func(q *store.Queries) error {
+	err = h.withSecretLock(r.Context(), user.ID, &material, func(q *store.Queries) error {
 		// If the caller wants this the default, clear the current one first — the
 		// insert then sets is_default=true and there is exactly one default at commit.
 		// Under the advisory lock this clear-then-insert cannot interleave with a
@@ -403,12 +399,15 @@ func (h *Handler) CreateAnthropicToken(w http.ResponseWriter, r *http.Request) {
 			Kind:        store.KindAnthropicToken,
 			Label:       label,
 			WantDefault: req.Default, // first token is forced default by the query regardless
-			Ciphertext:  sealed,
-			SealedWith:  sealedWith,
+			Ciphertext:  material.Ciphertext,
+			SealedWith:  material.SealedWith,
 		})
 		return ierr
 	})
 	if err != nil {
+		if h.writeVaultStale(w, err) {
+			return
+		}
 		if isLabelCollision(err) {
 			httpx.Error(w, http.StatusConflict, "a token with that label already exists")
 			return
@@ -451,8 +450,8 @@ func (h *Handler) PatchAnthropicToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate + seal the new value (if any) BEFORE the transaction: sealing needs
-	// no DB, and a locked vault must surface as a 409 without ever opening a tx.
+	// Seal the optional new value before the transaction. A protected locked vault
+	// surfaces as a 409 before starting a mutation.
 	var err error
 	var newLabel string
 	if req.Label != nil {
@@ -462,15 +461,15 @@ func (h *Handler) PatchAnthropicToken(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	var sealed []byte
-	var sealedWith string
+	var material vault.SealedMaterial
+	var snapshot *vault.SealedMaterial
 	if req.Token != nil {
 		tok, verr := validateAnthropicToken(*req.Token)
 		if verr != nil {
 			httpx.Error(w, http.StatusBadRequest, verr.Error())
 			return
 		}
-		sealed, sealedWith, err = h.sealUserSecret(user.ID, store.KindAnthropicToken, []byte(tok))
+		material, err = h.sealUserSecret(r.Context(), user.ID, store.KindAnthropicToken, []byte(tok))
 		if err != nil {
 			if h.writeVaultLocked(w, err) {
 				return
@@ -487,10 +486,14 @@ func (h *Handler) PatchAnthropicToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.Token != nil {
+		snapshot = &material
+	}
+
 	var out store.RenameUserSecretRow // id/kind/label/is_default/timestamps, shared shape
 	var disabledAt pgtype.Timestamptz
 	var found bool
-	err = h.withSecretLock(r.Context(), user.ID, func(q *store.Queries) error {
+	err = h.withSecretLock(r.Context(), user.ID, snapshot, func(q *store.Queries) error {
 		cur, gerr := q.GetUserSecretForUpdate(r.Context(), store.GetUserSecretForUpdateParams{
 			ID: secretID, UserID: user.ID,
 		})
@@ -517,7 +520,7 @@ func (h *Handler) PatchAnthropicToken(w http.ResponseWriter, r *http.Request) {
 
 		if req.Token != nil {
 			if _, rerr := q.RotateUserSecret(r.Context(), store.RotateUserSecretParams{
-				ID: secretID, UserID: user.ID, Ciphertext: sealed, SealedWith: sealedWith,
+				ID: secretID, UserID: user.ID, Ciphertext: material.Ciphertext, SealedWith: material.SealedWith,
 			}); rerr != nil {
 				return rerr
 			}
@@ -548,6 +551,9 @@ func (h *Handler) PatchAnthropicToken(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	if err != nil {
+		if h.writeVaultStale(w, err) {
+			return
+		}
 		if isLabelCollision(err) {
 			httpx.Error(w, http.StatusConflict, "a token with that label already exists")
 			return
@@ -631,7 +637,7 @@ func (h *Handler) PatchAnthropicTokenAutoEligible(w http.ResponseWriter, r *http
 	var out store.SetUserSecretAutoEligibleRow
 	var disabledAt pgtype.Timestamptz
 	var found bool
-	err := h.withSecretLock(r.Context(), user.ID, func(q *store.Queries) error {
+	err := h.withSecretLock(r.Context(), user.ID, nil, func(q *store.Queries) error {
 		cur, gerr := q.GetUserSecretForUpdate(r.Context(), store.GetUserSecretForUpdateParams{
 			ID: secretID, UserID: user.ID,
 		})
@@ -699,7 +705,7 @@ func (h *Handler) DeleteAnthropicTokenByID(w http.ResponseWriter, r *http.Reques
 	}
 
 	var found, refusedDefault bool
-	err := h.withSecretLock(r.Context(), user.ID, func(q *store.Queries) error {
+	err := h.withSecretLock(r.Context(), user.ID, nil, func(q *store.Queries) error {
 		cur, gerr := q.GetUserSecretForUpdate(r.Context(), store.GetUserSecretForUpdateParams{
 			ID: secretID, UserID: user.ID,
 		})
@@ -804,8 +810,8 @@ func (h *Handler) CreateOpenAIAPIKey(w http.ResponseWriter, r *http.Request) {
 // createCodexSecret is the shared create path for both codex kinds (PRD #1147 M1). It
 // mirrors CreateAnthropicToken but with the codex-specific rules:
 //
-//   - The value is validated per-kind (validateCodexValue) and sealed under the user's
-//     vault DEK, exactly as an anthropic token is; a locked vault surfaces as 409.
+//   - The value is validated per-kind (validateCodexValue) and sealed for the user's
+//     durable protection mode; a protected locked vault surfaces as 409.
 //   - Default is decided across BOTH codex kinds: the user's FIRST codex credential is
 //     forced default (CountCodexSecrets == 0), otherwise the caller's `default` stands.
 //     InsertCodexSecret sets is_default EXACTLY as asked — deliberately NOT the
@@ -846,7 +852,7 @@ func (h *Handler) createCodexSecret(w http.ResponseWriter, r *http.Request, kind
 		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	sealed, sealedWith, err := h.sealUserSecret(user.ID, kind, []byte(value))
+	material, err := h.sealUserSecret(r.Context(), user.ID, kind, []byte(value))
 	if err != nil {
 		if h.writeVaultLocked(w, err) {
 			return
@@ -858,7 +864,7 @@ func (h *Handler) createCodexSecret(w http.ResponseWriter, r *http.Request, kind
 	status := codexInitialStatus(kind)
 
 	var row store.InsertCodexSecretRow
-	err = h.withSecretLock(r.Context(), user.ID, func(q *store.Queries) error {
+	err = h.withSecretLock(r.Context(), user.ID, &material, func(q *store.Queries) error {
 		// The user's FIRST codex credential (across both kinds) is forced default so it
 		// is never invisible; a later one is default only if the caller asks. Under the
 		// advisory lock this count is stable against a concurrent create.
@@ -884,8 +890,8 @@ func (h *Handler) createCodexSecret(w http.ResponseWriter, r *http.Request, kind
 			Kind:        kind,
 			Label:       label,
 			WantDefault: wantDefault,
-			Ciphertext:  sealed,
-			SealedWith:  sealedWith,
+			Ciphertext:  material.Ciphertext,
+			SealedWith:  material.SealedWith,
 		})
 		if ierr != nil {
 			return ierr
@@ -898,6 +904,9 @@ func (h *Handler) createCodexSecret(w http.ResponseWriter, r *http.Request, kind
 		return serr
 	})
 	if err != nil {
+		if h.writeVaultStale(w, err) {
+			return
+		}
 		if isLabelCollision(err) {
 			httpx.Error(w, http.StatusConflict, "a credential with that label already exists")
 			return
@@ -978,15 +987,15 @@ func (h *Handler) patchCodexSecret(w http.ResponseWriter, r *http.Request, kind 
 			return
 		}
 	}
-	var sealed []byte
-	var sealedWith string
+	var material vault.SealedMaterial
+	var snapshot *vault.SealedMaterial
 	if req.Token != nil {
 		val, verr := validateCodexValue(kind, *req.Token)
 		if verr != nil {
 			httpx.Error(w, http.StatusBadRequest, verr.Error())
 			return
 		}
-		sealed, sealedWith, err = h.sealUserSecret(user.ID, kind, []byte(val))
+		material, err = h.sealUserSecret(r.Context(), user.ID, kind, []byte(val))
 		if err != nil {
 			if h.writeVaultLocked(w, err) {
 				return
@@ -1001,11 +1010,15 @@ func (h *Handler) patchCodexSecret(w http.ResponseWriter, r *http.Request, kind 
 		return
 	}
 
+	if req.Token != nil {
+		snapshot = &material
+	}
+
 	var out store.RenameUserSecretRow
 	var disabledAt pgtype.Timestamptz
 	var status string
 	var found bool
-	err = h.withSecretLock(r.Context(), user.ID, func(q *store.Queries) error {
+	err = h.withSecretLock(r.Context(), user.ID, snapshot, func(q *store.Queries) error {
 		cur, gerr := q.GetUserSecretForUpdate(r.Context(), store.GetUserSecretForUpdateParams{
 			ID: secretID, UserID: user.ID,
 		})
@@ -1032,7 +1045,7 @@ func (h *Handler) patchCodexSecret(w http.ResponseWriter, r *http.Request, kind 
 
 		if req.Token != nil {
 			rotated, rerr := q.RotateUserSecret(r.Context(), store.RotateUserSecretParams{
-				ID: secretID, UserID: user.ID, Ciphertext: sealed, SealedWith: sealedWith,
+				ID: secretID, UserID: user.ID, Ciphertext: material.Ciphertext, SealedWith: material.SealedWith,
 			})
 			if rerr != nil {
 				return rerr
@@ -1086,6 +1099,9 @@ func (h *Handler) patchCodexSecret(w http.ResponseWriter, r *http.Request, kind 
 		return nil
 	})
 	if err != nil {
+		if h.writeVaultStale(w, err) {
+			return
+		}
 		if isLabelCollision(err) {
 			httpx.Error(w, http.StatusConflict, "a credential with that label already exists")
 			return
@@ -1149,7 +1165,7 @@ func (h *Handler) deleteCodexSecretByID(w http.ResponseWriter, r *http.Request, 
 	}
 
 	var found bool
-	err := h.withSecretLock(r.Context(), user.ID, func(q *store.Queries) error {
+	err := h.withSecretLock(r.Context(), user.ID, nil, func(q *store.Queries) error {
 		cur, gerr := q.GetUserSecretForUpdate(r.Context(), store.GetUserSecretForUpdateParams{
 			ID: secretID, UserID: user.ID,
 		})
@@ -1366,4 +1382,13 @@ func validateAnthropicToken(raw string) (string, error) {
 		}
 	}
 	return token, nil
+}
+
+// writeVaultStale tells the client to retry with material sealed for current state.
+func (h *Handler) writeVaultStale(w http.ResponseWriter, err error) bool {
+	if !errors.Is(err, store.ErrVaultSealStale) {
+		return false
+	}
+	httpx.Error(w, http.StatusConflict, "vault protection changed; retry saving the credential")
+	return true
 }

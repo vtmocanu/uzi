@@ -17,23 +17,23 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
-// All queries except the single refresh list run against Postgres, including
+// All queries, including the intercepted lazy material check, run against Postgres:
 // unlock's clear, the manual handler's pre-ack, and reconciler eligibility/claim.
 type vaultNoticeListBarrier struct {
 	*store.Queries
 	entered, release chan struct{}
 }
 
-func (s *vaultNoticeListBarrier) ListMasterSealedSecrets(ctx context.Context, uid uuid.UUID) ([]store.ListMasterSealedSecretsRow, error) {
+func (s *vaultNoticeListBarrier) HasMasterVaultMaterial(ctx context.Context, uid uuid.UUID) (bool, error) {
 	if s.entered == nil {
-		return s.Queries.ListMasterSealedSecrets(ctx, uid)
+		return s.Queries.HasMasterVaultMaterial(ctx, uid)
 	}
 	close(s.entered)
 	select {
 	case <-s.release:
-		return s.Queries.ListMasterSealedSecrets(ctx, uid)
+		return s.Queries.HasMasterVaultMaterial(ctx, uid)
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return false, ctx.Err()
 	}
 }
 
@@ -54,7 +54,10 @@ func TestVaultLockOlderUnlockPreservesNoticeLiveDB(t *testing.T) {
 	e := newRecoveryEnv(t)
 	h := e.handler()
 	barrier := &vaultNoticeListBarrier{Queries: h.q}
-	h.vault = vault.New(e.box, barrier)
+	h.vault = newWrappedPostgresVault(e.box, e.pool, barrier, func(q *store.Queries) vault.Store {
+		return &vaultNoticeListBarrier{Queries: q, entered: barrier.entered, release: barrier.release}
+	})
+	setVaultFixturePassword(t, e.pool, e.user, recoveryUnlockPassword)
 	if err := h.vault.Unlock(e.ctx, e.user, recoveryUnlockPassword); err != nil {
 		t.Fatal(err)
 	}
@@ -112,39 +115,49 @@ func TestVaultLockOlderUnlockPreservesNoticeLiveDB(t *testing.T) {
 	var releaseOnce sync.Once
 	release := func() { releaseOnce.Do(func() { close(barrier.release) }) }
 	joined := false
+	lockDone := make(chan *httptest.ResponseRecorder, 1)
+	lockStarted, lockJoined := false, false
 	t.Cleanup(func() {
 		cancel()
 		release()
 		if !joined {
 			<-done
 		}
+		if lockStarted && !lockJoined {
+			<-lockDone
+		}
 	})
 	go func() { done <- vaultRecoveryUnlock(h, ctx, e.user, recoveryUnlockPassword) }()
 	select {
 	case <-barrier.entered:
 	case <-ctx.Done():
-		t.Fatal("older unlock did not reach list barrier")
+		t.Fatal("older unlock did not reach material check barrier")
 	}
 	if !h.vault.Unlocked(e.user) {
 		t.Fatal("older unlock must cache the DEK before reaching the barrier")
 	}
-	req := httptest.NewRequest(http.MethodPost, "/api/vault/lock", nil)
-	req = req.WithContext(mw.ContextWithUser(ctx, store.User{ID: e.user, IsActive: true}))
-	lockResponse := httptest.NewRecorder()
-	h.VaultLock(lockResponse, req)
-	if lockResponse.Code != http.StatusNoContent {
-		t.Fatalf("manual lock=%d body=%s", lockResponse.Code, lockResponse.Body.String())
-	}
-	preack := marker().LockNotifiedAt
-	if h.vault.Unlocked(e.user) || !preack.Valid {
-		t.Fatal("manual lock must evict the key and persist its pre-ack before releasing older unlock")
-	}
-
+	lockStarted = true
+	go func() {
+		req := httptest.NewRequest(http.MethodPost, "/api/vault/lock", nil)
+		req = req.WithContext(mw.ContextWithUser(ctx, store.User{ID: e.user, IsActive: true}))
+		rec := httptest.NewRecorder()
+		h.VaultLock(rec, req)
+		lockDone <- rec
+	}()
 	release()
 	unlockResponse := <-done
 	joined = true
 	if unlockResponse.Code != http.StatusNoContent {
 		t.Fatalf("older unlock=%d body=%s", unlockResponse.Code, unlockResponse.Body.String())
+	}
+	lockResponse := <-lockDone
+	lockJoined = true
+	if lockResponse.Code != http.StatusNoContent {
+		t.Fatalf("manual lock=%d body=%s", lockResponse.Code, lockResponse.Body.String())
+	}
+	preack := marker().LockNotifiedAt
+	if !preack.Valid {
+		t.Fatal("manual lock must persist pre-ack")
 	}
 	if h.vault.Unlocked(e.user) {
 		t.Error("older unlock must leave the manually locked vault locked")

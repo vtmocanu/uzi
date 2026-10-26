@@ -347,7 +347,7 @@ func TestCodexRateLimitsReadSurfaceLiveDB(t *testing.T) {
 
 	t.Run("vault locked overrides all", func(t *testing.T) {
 		hLocked := &Handler{pool: pool, q: q, box: box, cfg: config.Config{CodexUsagePollInterval: 5 * time.Minute}}
-		hLocked.vault = vault.New(box, nil) // empty cache ⇒ every user reads locked
+		hLocked.vault = vault.NewPostgres(box, pool) // protected durable state, empty cache
 		rec := httptest.NewRecorder()
 		hLocked.SelfCodexRateLimits(rec, codexRLReq(userA, false))
 		accounts := decodeAccounts(t, rec)
@@ -452,7 +452,7 @@ func TestCodexVaultUnlockPokesPollerLiveDB(t *testing.T) {
 	mustExecT(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
 		userID, "codex-unlock-"+uuid.NewString()+"@example.test")
 
-	vlt := vault.New(box, q)
+	vlt := vault.NewPostgres(box, pool)
 	h := &Handler{pool: pool, q: q, box: box, vault: vlt, cfg: config.Config{CodexUsagePollInterval: 5 * time.Minute}}
 	poker := &fakeCodexPoker{}
 	h.SetCodexUsagePoker(poker)
@@ -460,6 +460,7 @@ func TestCodexVaultUnlockPokesPollerLiveDB(t *testing.T) {
 	const password = "unlock-password-123"
 	// First-ever unlock creates + unlocks the vault; then lock it so the handler exercises
 	// the real UnlockExisting success path.
+	setVaultFixturePassword(t, pool, userID, password)
 	if err := vlt.Unlock(ctx, userID, password); err != nil {
 		t.Fatalf("seed vault: %v", err)
 	}

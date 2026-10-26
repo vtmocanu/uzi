@@ -18,7 +18,6 @@ import (
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
-	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 // fakeRLDB is a store.DBTX answering the rate-limit read queries from fixed
@@ -380,7 +379,7 @@ func TestAdminRateLimitsVaultLocked(t *testing.T) {
 	}}
 	h := rlHandler(&fakeRLDB{listRows: rows}, 5*time.Minute)
 	box, _ := secretbox.New([]byte("0123456789abcdef0123456789abcdef"))
-	h.vault = vault.New(box, nil) // empty cache ⇒ every user is locked
+	h.vault = newHandlerMemoryVault(box, newMemVaultQ()) // empty cache ⇒ every user is locked
 
 	rec := httptest.NewRecorder()
 	h.AdminRateLimits(rec, rlReq(uuid.New(), true))

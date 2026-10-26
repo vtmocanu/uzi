@@ -21,7 +21,6 @@ import (
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
-	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 // codexSecretRow is one user_secrets row the fake store models in memory.
@@ -48,6 +47,9 @@ type fakeCodexDB struct {
 	order   []uuid.UUID
 	states  map[uuid.UUID]string // user_secret_id → codex_credential_state.status
 
+	mode            string
+	epoch           int64
+	sealedWith      []string
 	sealedArgs      [][]byte // every ciphertext handed to the store, for leak checks
 	bumpCalls       int      // BumpCodexMaterialRevision invocations
 	lastBumpStatus  string
@@ -148,6 +150,7 @@ func scanCodexState(secretID uuid.UUID, status string) func(dest ...any) error {
 
 func (f *fakeCodexDB) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	switch {
+	case strings.Contains(sql, "pg_advisory_xact_lock"), sql == "SET TRANSACTION ISOLATION LEVEL READ COMMITTED":
 	case strings.Contains(sql, "name: ClearCodexDefaults"):
 		f.clearCalls++
 		for _, s := range f.secrets {
@@ -221,6 +224,16 @@ func scanStatePair(id uuid.UUID, status string) func(dest ...any) error {
 
 func (f *fakeCodexDB) QueryRow(_ context.Context, sql string, args ...any) pgx.Row {
 	switch {
+	case strings.Contains(sql, "name: GetUserVaultState"), strings.Contains(sql, "name: LockUserVaultState"):
+		return fakeScanRow{func(dest ...any) error {
+			mode := f.mode
+			if mode == "" {
+				mode = store.VaultModeUnprotected
+			}
+			*dest[0].(*string) = mode
+			*dest[1].(*int64) = f.epoch
+			return nil
+		}}
 	case strings.Contains(sql, "name: GetDefaultUserSecretID"):
 		for _, s := range f.secrets {
 			if s.kind == args[1].(string) && s.isDefault {
@@ -277,6 +290,7 @@ func (f *fakeCodexDB) QueryRow(_ context.Context, sql string, args ...any) pgx.R
 		f.secrets[id] = row
 		f.order = append(f.order, id)
 		f.sealedArgs = append(f.sealedArgs, ct)
+		f.sealedWith = append(f.sealedWith, args[5].(string))
 		return fakeScanRow{scanSecretMeta(row)}
 	case strings.Contains(sql, "name: InsertCodexCredentialState"):
 		secretID := args[0].(uuid.UUID)
@@ -349,15 +363,14 @@ func (r *fakeCodexRows) RawValues() [][]byte                          { return n
 func (r *fakeCodexRows) Conn() *pgx.Conn                              { return nil }
 func (r *fakeCodexRows) TypeMap() *pgtype.Map                         { return pgtype.NewMap() }
 
-// newCodexHandler wires a Handler over a fake store and a real (nil-vault) box, so the
-// non-vault seal path is exercised exactly as the anthropic leak test does.
+// newCodexHandler wires an explicit unprotected policy sealer and transaction fixture.
 func newCodexHandler(t *testing.T, db store.DBTX) *Handler {
 	t.Helper()
 	box, err := secretbox.New(make([]byte, secretbox.KeySize))
 	if err != nil {
 		t.Fatalf("new box: %v", err)
 	}
-	return &Handler{q: store.New(db), box: box}
+	return newMaterialTestHandler(box, db)
 }
 
 func codexReq(t *testing.T, method, path, body string, userID uuid.UUID, secretID string) *http.Request {
@@ -799,7 +812,7 @@ func TestCreateCodexVaultLocked(t *testing.T) {
 		t.Fatalf("new box: %v", err)
 	}
 	// A vault with nothing unlocked → Seal returns vault.ErrLocked for any user.
-	h := &Handler{q: store.New(db), box: box, vault: vault.New(nil, nil)}
+	h := &Handler{q: store.New(db), box: box, vault: newHandlerMemoryVault(box, newMemVaultQ())}
 	user := uuid.New()
 
 	body, _ := json.Marshal(map[string]any{"token": codexAuthBlob("acc"), "label": "sub"})

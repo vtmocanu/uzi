@@ -6,8 +6,6 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/jackc/pgx/v5"
-
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/vault"
@@ -124,12 +122,9 @@ func (h *Handler) VaultPassphrase(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create + unlock with the chosen passphrase (same code path as a first
-	// login-unlock). A concurrent create that won the race with a different
-	// passphrase surfaces as ErrWrongPassword — that is "already exists" too, so map
-	// it to 409 rather than a 500.
-	if err := h.vault.Unlock(r.Context(), user.ID, req.Passphrase); err != nil {
-		if errors.Is(err, vault.ErrWrongPassword) {
+	// Enable is create-only and verifies the current durable authentication state.
+	if err := h.vault.Enable(r.Context(), user.ID, req.Passphrase); err != nil {
+		if errors.Is(err, vault.ErrAlreadyProtected) {
 			httpx.Error(w, http.StatusConflict, "a vault already exists")
 			return
 		}
@@ -155,15 +150,10 @@ func (h *Handler) VaultLock(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if h.vault != nil {
-		h.vault.Lock(user.ID)
-		// Pre-acknowledge a deliberate lock (PRD #890 D6): a user who locks on purpose is
-		// already aware, so mark lock_notified_at = now() to keep the vault-lock reconciler
-		// from later DMing them to unlock. Best-effort — the returned row and any error are
-		// ignored/logged; a DB hiccup here must not fail the lock.
-		if claimer := h.vaultLockNoticeStore(); claimer != nil {
-			if _, err := claimer.ClaimVaultLockNotice(r.Context(), user.ID); err != nil && !errors.Is(err, pgx.ErrNoRows) {
-				slog.Error("vault lock: pre-ack lock-notice", "user", user.ID, "error", err)
-			}
+		if err := h.vault.LockAndAcknowledge(r.Context(), user.ID); err != nil {
+			slog.Error("vault lock", "user", user.ID, "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
 		}
 	}
 	w.WriteHeader(http.StatusNoContent)

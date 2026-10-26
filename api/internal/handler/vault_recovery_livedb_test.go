@@ -45,7 +45,7 @@ func (b *vaultRecoveryEvents) Notify(id uuid.UUID, status string) {
 func vaultRecoveryHandler(t *testing.T, e *recoveryEnv, createVault bool) (*Handler, *fakeCodexPoker, *vaultRecoveryEvents) {
 	t.Helper()
 	h := e.handler()
-	h.vault = vault.New(e.box, h.q)
+	h.vault = vault.NewPostgres(e.box, e.pool)
 	h.wsvc.SetVault(h.vault)
 	poker := &fakeCodexPoker{}
 	h.SetCodexUsagePoker(poker)
@@ -53,6 +53,7 @@ func vaultRecoveryHandler(t *testing.T, e *recoveryEnv, createVault bool) (*Hand
 	h.wsvc.SetBroadcaster(events)
 	h.wsvc.SetLifecycle(events)
 	if createVault {
+		setVaultFixturePassword(t, e.pool, e.user, recoveryUnlockPassword)
 		if err := h.vault.Unlock(e.ctx, e.user, recoveryUnlockPassword); err != nil {
 			t.Fatal(err)
 		}

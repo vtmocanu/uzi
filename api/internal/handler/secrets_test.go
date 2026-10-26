@@ -110,6 +110,8 @@ func TestAnthropicTokenNeverLeaks(t *testing.T) {
 // the plaintext token anywhere in the handler's request path.
 type fakeUpsertDB struct {
 	lastArgs []any
+	mode     string
+	epoch    int64
 }
 
 func (f *fakeUpsertDB) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
@@ -120,8 +122,21 @@ func (f *fakeUpsertDB) Query(context.Context, string, ...any) (pgx.Rows, error) 
 	return nil, errors.New("fakeUpsertDB: Query not used")
 }
 
-func (f *fakeUpsertDB) QueryRow(_ context.Context, _ string, args ...any) pgx.Row {
-	f.lastArgs = args
+func (f *fakeUpsertDB) QueryRow(_ context.Context, sql string, args ...any) pgx.Row {
+	if strings.Contains(sql, "name: GetUserVaultState") || strings.Contains(sql, "name: LockUserVaultState") {
+		return fakeScanRow{func(dest ...any) error {
+			mode := f.mode
+			if mode == "" {
+				mode = store.VaultModeUnprotected
+			}
+			*dest[0].(*string) = mode
+			*dest[1].(*int64) = f.epoch
+			return nil
+		}}
+	}
+	if strings.Contains(sql, "name: RotateUserSecret") || strings.Contains(sql, "name: UpsertDefaultUserSecret") {
+		f.lastArgs = args
+	}
 	return fakeUpsertRow{}
 }
 
@@ -142,6 +157,8 @@ func (fakeUpsertRow) Scan(dest ...any) error {
 			*p = now
 		case *uuid.UUID:
 			*p = uuid.New()
+		case *int64:
+			*p = 0
 		case *bool:
 			*p = true
 		}
@@ -168,7 +185,7 @@ func TestPutAnthropicTokenNeverLeaksEndToEnd(t *testing.T) {
 		t.Fatalf("new box: %v", err)
 	}
 	db := &fakeUpsertDB{}
-	h := &Handler{q: store.New(db), box: box}
+	h := newMaterialTestHandler(box, db)
 
 	body, _ := json.Marshal(map[string]string{"token": fixture})
 	req := httptest.NewRequest(http.MethodPut, "/api/me/secrets/anthropic_token", bytes.NewReader(body))

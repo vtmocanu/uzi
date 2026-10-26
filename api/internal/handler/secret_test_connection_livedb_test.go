@@ -144,7 +144,7 @@ func TestSecretConnectionDisabledAndVaultLockedLiveDB(t *testing.T) {
 	locked := seedTestConnection(t, h, pool, owner, "openai_api_key", "fixture-locked")
 	// A DEK-sealed row requires an unlocked user vault before any provider request.
 	cliMustExec(t, pool, `UPDATE user_secrets SET sealed_with = 'dek' WHERE id = $1`, locked)
-	h.vault = vault.New(h.box, nil)
+	h.vault = vault.NewPostgres(h.box, h.pool)
 	requireTestResult(t, cookieReq(t, router, http.MethodPost, testConnectionPath("openai_api_key", locked), session, ""),
 		http.StatusOK, "inconclusive", "vault_locked")
 	if got := calls.Load(); got != 0 {

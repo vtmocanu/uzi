@@ -26,6 +26,7 @@ import (
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -68,9 +69,10 @@ func cliLiveDB(t *testing.T) (*Handler, http.Handler, *pgxpool.Pool) {
 	q := store.New(pool)
 	box := newHandlerTestBox(t)
 	h := &Handler{
-		pool: pool,
-		q:    q,
-		box:  box,
+		pool:  pool,
+		q:     q,
+		box:   box,
+		vault: vault.NewPostgres(box, pool),
 		cfg: config.Config{
 			JWTSecret:    cliTestSecret,
 			AuthTokenTTL: time.Hour,
@@ -96,7 +98,7 @@ func cliMustExec(t *testing.T, pool *pgxpool.Pool, sql string, args ...any) {
 func cliSeedUser(t *testing.T, pool *pgxpool.Pool, isAdmin bool) uuid.UUID {
 	t.Helper()
 	id := uuid.New()
-	cliMustExec(t, pool, `INSERT INTO users (id, email, password_hash, is_admin) VALUES ($1, $2, 'x', $3)`,
+	cliMustExec(t, pool, `INSERT INTO users (id, email, password_hash, is_admin, vault_mode) VALUES ($1, $2, 'x', $3, 'unprotected')`,
 		id, fmt.Sprintf("cli-%s@e2e", id), isAdmin)
 	return id
 }
