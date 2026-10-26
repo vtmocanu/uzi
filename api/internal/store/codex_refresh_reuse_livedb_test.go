@@ -16,6 +16,16 @@ import (
 func reuseFixture(t *testing.T) (context.Context, *store.Queries, rejectionFixture, uuid.UUID, store.CodexRejectionTxBeginner) {
 	t.Helper()
 	ctx, pool, q, user := codexLiveDB(t)
+	// These fixtures include deliberately unopenable recovery envelopes. Remove
+	// their enabled accounts before a later package's global survivor scans the
+	// shared LiveDB database. Registered after pool.Close, so cleanup runs first.
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := pool.Exec(cleanupCtx, "DELETE FROM users WHERE id=$1", user); err != nil {
+			t.Errorf("delete reuse fixture user %s: %v", user, err)
+		}
+	})
 	f := newRejectionFixture(ctx, t, pool, q, user)
 	secret, err := insertSecret(ctx, pool, user, store.KindCodexAuth, "reuse-"+uuid.NewString(), false)
 	if err != nil {
