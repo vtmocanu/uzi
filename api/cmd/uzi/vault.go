@@ -3,11 +3,11 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 
-	"github.com/charmbracelet/x/term"
 	"github.com/spf13/cobra"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
@@ -120,6 +120,10 @@ func readVaultPassword(ctx context.Context, env Env) ([]byte, error) {
 		clear(password)
 		return nil, uzicli.Exitf(uzicli.ExitGeneric, "vault password input cancelled")
 	}
+	if errors.Is(err, errVaultPasswordTooLong) {
+		clear(password)
+		return nil, uzicli.Exitf(uzicli.ExitUsage, "vault password input is too long")
+	}
 	if err != nil {
 		clear(password)
 		return nil, uzicli.Exitf(uzicli.ExitGeneric, "cannot read vault password")
@@ -134,7 +138,7 @@ func readVaultPassword(ctx context.Context, env Env) ([]byte, error) {
 	return password, nil
 }
 
-// The established terminal reader restores the terminal before returning.
+// The bounded terminal reader restores the terminal before returning.
 // Context cancellation is checked before and after the blocking terminal read;
 // no password is submitted after cancellation.
 func readVaultTerminalPassword(ctx context.Context, input io.Reader) ([]byte, error) {
@@ -145,7 +149,7 @@ func readVaultTerminalPassword(ctx context.Context, input io.Reader) ([]byte, er
 	if !ok {
 		return nil, uzicli.Exitf(uzicli.ExitGeneric, "password input is not a terminal file")
 	}
-	password, err := term.ReadPassword(f.Fd())
+	password, err := readVaultHiddenPassword(f.Fd())
 	if ctx.Err() != nil {
 		clear(password)
 		return nil, ctx.Err()
