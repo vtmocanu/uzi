@@ -241,3 +241,29 @@ func TestCodeCrossCheckCoverageClaimRollout(t *testing.T) {
 		t.Fatal("plan admitted code capability")
 	}
 }
+
+func TestCodeCrossCheckCoverageSurrogateEscapes(t *testing.T) {
+	sibling := func(escapedPath string) json.RawMessage {
+		return bytes.Replace(coverageJSON(t, coverageFixture()), []byte(`"entries":[`),
+			[]byte(`"entries":[{"path":"`+escapedPath+`","status":"examined","reason":"checked","recorded_read":true},`), 1)
+	}
+	for _, escaped := range []string{`auth\ud800.go`, `auth\udc00.go`, `auth\udc00\ud800.go`, `auth\ud800A.go`, `auth\ud800`, `\\\ud800.go`} {
+		t.Run(escaped, func(t *testing.T) {
+			got := decodeCoverage(t, NormalizeCodeCrossCheckCoverage("completed", sibling(escaped)))
+			if len(got.Entries) != 1 || got.Entries[0] != coverageFixture().Entries[0] || got.OmittedPaths != 1 || !got.InventoryIncomplete || got.OmittedCountExact {
+				t.Fatalf("lone surrogate escape kept a rewritten path or lost the valid sibling: %+v", got)
+			}
+			if len(got.Reasons) != 1 || got.Reasons[0] != "coverage_invalid" {
+				t.Fatalf("invalid entry reason changed: %+v", got.Reasons)
+			}
+		})
+	}
+	for escaped, want := range map[string]string{`🚀.go`: "\U0001f680.go", `�.go`: "�.go", "�2.go": "�2.go", `\\ud800.go`: `\ud800.go`} {
+		t.Run(escaped, func(t *testing.T) {
+			got := decodeCoverage(t, NormalizeCodeCrossCheckCoverage("completed", sibling(escaped)))
+			if len(got.Entries) != 2 || got.Entries[0].Path != want || got.OmittedPaths != 0 || len(got.Reasons) != 0 {
+				t.Fatalf("valid escape lost its identity: %+v", got)
+			}
+		})
+	}
+}

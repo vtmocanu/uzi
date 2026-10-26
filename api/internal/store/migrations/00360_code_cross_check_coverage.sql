@@ -1,4 +1,5 @@
 -- +goose Up
+SET LOCAL lock_timeout = '5s';
 -- No backfill: historical and plan accounts remain NULL.
 ALTER TABLE cross_checks ADD COLUMN coverage jsonb;
 ALTER TABLE cross_checks ADD CONSTRAINT cross_checks_coverage_shape CHECK (
@@ -34,6 +35,7 @@ CREATE TRIGGER cross_checks_coverage_write_once BEFORE INSERT OR UPDATE ON cross
 -- +goose StatementEnd
 
 -- +goose Down
+SET LOCAL lock_timeout = '5s';
 DROP TRIGGER cross_checks_coverage_write_once ON cross_checks;
 DROP FUNCTION enforce_code_cross_check_coverage();
 ALTER TABLE cross_checks DROP CONSTRAINT cross_checks_coverage_shape, DROP COLUMN coverage;

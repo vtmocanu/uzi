@@ -103,7 +103,7 @@ func NormalizeCodeCrossCheckCoverage(outcome string, input ...json.RawMessage) [
 			}
 			seen[entry.Path] = true
 		}
-		if !valid || decodeErr != nil || entry.Path == "" ||
+		if !valid || decodeErr != nil || entry.Path == "" || hasLoneSurrogateEscape(rawEntry) ||
 			len(entry.Path) > codeCoveragePathBytes || len(entry.Reason) > codeCoverageReasonBytes ||
 			!utf8.ValidString(entry.Path) || !utf8.ValidString(entry.Reason) ||
 			strings.ContainsFunc(entry.Path, func(r rune) bool {
@@ -186,4 +186,52 @@ func coverageObject(raw []byte, keys []string) (map[string]json.RawMessage, bool
 		return nil, false
 	}
 	return fields, len(fields) == len(keys)
+}
+
+// hasLoneSurrogateEscape reports a \uXXXX surrogate escape that is not a
+// high/low pair. encoding/json silently decodes one to U+FFFD, which would
+// record a path the worker never named.
+func hasLoneSurrogateEscape(raw []byte) bool {
+	hex := func(i int) (rune, bool) {
+		if i+6 > len(raw) || raw[i] != '\\' || raw[i+1] != 'u' {
+			return 0, false
+		}
+		var r rune
+		for _, c := range raw[i+2 : i+6] {
+			switch {
+			case '0' <= c && c <= '9':
+				r = r<<4 | rune(c-'0')
+			case 'a' <= c && c <= 'f':
+				r = r<<4 | rune(c-'a'+10)
+			case 'A' <= c && c <= 'F':
+				r = r<<4 | rune(c-'A'+10)
+			default:
+				return 0, false
+			}
+		}
+		return r, true
+	}
+	for i := 0; i < len(raw); i++ {
+		if raw[i] != '\\' {
+			continue
+		}
+		r, ok := hex(i)
+		if !ok {
+			i++ // skip the escaped byte, so \\ never starts a new escape
+			continue
+		}
+		switch {
+		case 0xDC00 <= r && r <= 0xDFFF:
+			return true
+		case 0xD800 <= r && r <= 0xDBFF:
+			low, ok := hex(i + 6)
+			if !ok || low < 0xDC00 || low > 0xDFFF {
+				return true
+			}
+			i += 11
+		default:
+			i += 5
+		}
+	}
+	return false
 }
