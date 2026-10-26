@@ -26,6 +26,9 @@ Do NOT bake step details that live in the repo into your head. Read the source o
 
 **Artifact membership.** Query the public OCI registry anonymously; no Packages PAT is needed. GitHub release and Actions evidence still uses `gh` read access. Pass `--ci` to the cutter in automation (also enabled by `CI=true`): an unknown worker-pin query or checkout identity refuses the cut. Local cuts retain a warning on query errors; a confirmed missing worker image always refuses.
 
+
+`release-cut.sh --plan [--version X.Y.Z] [--abandon-train]` reports the scheduled RC decision without fetching or changing Git state or notes. Refresh refs first. Read `OP` (`nextrc`, `new-base`, `noop`, `blocked`), `BASE`, `TAG`, `REASON`, `SHIPPING_COUNT`, `PREVIOUS_TAG`, `PUBLICATION_STATE`, and `HEAD_SHA`; exit 0 includes no-op/blocked plans, while exit 2 signals a broken instrument. An open train continues, otherwise 0.x defaults to the next minor; automatic 1.x needs a policy. Failed, pending, missing or unreadable previous publication blocks even a no-op. Only non-metadata shipping changes count, and notes or dependency citations must make them releasable. This recommendation does not remove manual empty-delta cuts or replace exact-tip CI checks.
+
 ## 2. Cut the release inline with the deterministic scripts — do NOT dispatch a subagent
 Once step 1 holds (nothing wanted left unmerged, `main` green on the tip), cut the release **inline as the lead**, driving three bundled scripts. Do NOT dispatch the `release` subagent for this: a background subagent spawns a watch and then idles, so every wait becomes a manual re-ping (the "agent keeps dying" ping-pong), while the steps that actually need judgment — flake-vs-defect, whether to rerun, authoring the CHANGELOG — are the lead's regardless. `.claude/agents/release.md` stays the MECHANICS reference (what each step proves, the signing traps, deploy verify), but the driver is the lead + scripts, not that agent.
 

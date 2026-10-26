@@ -851,5 +851,32 @@ class PublishedCLI(RepoFixture, unittest.TestCase):
                 policy.main()
 
 
+class PublicationCLI(RepoFixture, unittest.TestCase):
+    def test_current_publication_state_uses_exact_tag_and_commit(self):
+        sha = self.git('rev-parse', 'HEAD')
+        for result, expected in ((None, 'absent'), (run('release.yml'), 'success'),
+                                 (run('release.yml', status='queued', conclusion=None), 'pending'),
+                                 (run('release.yml', conclusion='failure'), 'failed')):
+            api = unittest.mock.Mock()
+            api.run.return_value = result
+            output = io.StringIO()
+            with self.subTest(expected=expected), \
+                 patch.object(policy.sys, 'argv', ['policy', 'publication', 'HEAD', '--tag', 'v0.2.0', '--repo', 'example/uzi']), \
+                 patch.object(policy, 'GitHub', return_value=api), contextlib.redirect_stdout(output):
+                policy.main()
+            api.run.assert_called_once_with('release.yml', sha, 'v0.2.0')
+            self.assertEqual(output.getvalue(), expected + '\n')
+
+    def test_missing_tag_and_unreadable_state_refuse(self):
+        with patch.object(policy.sys, 'argv', ['policy', 'publication', 'HEAD', '--repo', 'example/uzi']), \
+             self.assertRaises(policy.Refusal):
+            policy.main()
+        api = unittest.mock.Mock()
+        api.run.side_effect = policy.Refusal('unreadable API')
+        with patch.object(policy.sys, 'argv', ['policy', 'publication', 'HEAD', '--tag', 'v0.2.0', '--repo', 'example/uzi']), \
+             patch.object(policy, 'GitHub', return_value=api), self.assertRaisesRegex(policy.Refusal, 'unreadable API'):
+            policy.main()
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -30,6 +30,7 @@
 # --ghcr-only [baseline-verifier] runs #1464 M1 publication fixtures only.
 # --frozen-rc-only runs the #1389 block-guard regressions without the full fixture suite.
 # --fold-order-only runs canonical pending/open-RC ordering fixtures.
+# --plan-only [cutter-path] runs read-only decision and publication fixtures.
 # --fragments-only [cutter-path] runs fragment regressions, optionally against a frozen cutter.
 #
 # Wired as `task test:release-scripts` (its own gate member, not gate:repo's
@@ -523,7 +524,7 @@ if [ "${1:-}" = "--identity-only" ]; then
   exit $?
 fi
 
-if [ "${1:-}" != "--shipping-paths-only" ] && [ "${1:-}" != "--ghcr-only" ] && [ "${1:-}" != "--fold-order-only" ] && [ "${1:-}" != "--fragments-only" ]; then
+if [ "${1:-}" != "--shipping-paths-only" ] && [ "${1:-}" != "--ghcr-only" ] && [ "${1:-}" != "--fold-order-only" ] && [ "${1:-}" != "--fragments-only" ] && [ "${1:-}" != "--plan-only" ]; then
 identity_regressions
 echo "=== building fixture in $REPO ==="
 build_fixture
@@ -631,7 +632,7 @@ fi
 # =============================================================================
 REPO_ROOT="$(cd "$SCRIPTS_DIR/.." && pwd)"
 RC="$REPO_ROOT/.agents/skills/uzi-release/scripts/release-cut.sh"
-[ "${1:-}" != --fragments-only ] || RC="${2:-$RC}"
+[ "${1:-}" != --fragments-only ] && [ "${1:-}" != --plan-only ] || RC="${2:-$RC}"
 [ -f "$RC" ] || { echo "release-scripts-test: $RC not found" >&2; exit 2; }
 
 D2N=0
@@ -732,6 +733,159 @@ published_rc() {
   git -C "$1" tag v0.2.0-rc.1
   push_tag_to_origin "$1" v0.2.0-rc.1
 }
+# The planner shares the cutter's discovery and note rules, but owns no Git writes.
+plan_regressions() (
+  local d before_head before_refs before_status output rc
+  d="$(mktemp -d)"
+  trap 'rm -rf "$d"' EXIT
+  seed_repo "$d"
+  cp "$SCRIPTS_DIR/release-ci-coverage.py" "$d/scripts/release-ci-coverage.py"
+  git -C "$d" add scripts/release-ci-coverage.py
+  gcommit "$d" 'test: include release evidence reader'
+  mkdir -p "$d/plan-bin"
+  cat > "$d/plan-bin/gh" <<'GH'
+#!/usr/bin/env bash
+if [ "$1 $2" = 'repo view' ]; then echo example/uzi; exit 0; fi
+[ "$1 $2" = 'api --paginate' ] || exit 91
+case "${PLAN_PUBLICATION:-success}" in
+  error) exit 1 ;;
+  transient) echo 'HTTP 502: Bad Gateway' >&2; exit 1 ;;
+esac
+for arg in "$@"; do
+  case "$arg" in *head_sha=*) sha="${arg#*head_sha=}"; sha="${sha%%&*}" ;; esac
+done
+case "${PLAN_PUBLICATION:-success}" in
+  missing) printf '[{"total_count":0,"workflow_runs":[]}]'; exit 0 ;;
+  pending) status=in_progress; conclusion=null ;;
+  failed) status=completed; conclusion='"failure"' ;;
+  *) status=completed; conclusion='"success"' ;;
+esac
+printf '[{"total_count":1,"workflow_runs":[{"id":1,"run_attempt":1,"status":"%s","conclusion":%s,"head_sha":"%s","head_branch":"%s","event":"push","path":".github/workflows/release.yml","repository":{"full_name":"example/uzi"},"head_repository":{"full_name":"example/uzi"}}]}]' "$status" "$conclusion" "$sha" "$PLAN_PREVIOUS"
+GH
+  chmod +x "$d/plan-bin/gh"
+  # Resolve before changing PATH, so the shim cannot recursively invoke itself.
+  PLAN_REAL_GIT="$(command -v git)" || return 2
+  PLAN_GIT_AUDIT="$d/forbidden-fetch"
+  export PLAN_REAL_GIT PLAN_GIT_AUDIT
+  cat > "$d/plan-bin/git" <<'GIT'
+#!/usr/bin/env bash
+if [ "${PLAN_READONLY:-0}" = 1 ]; then
+  for arg in "$@"; do
+    if [ "$arg" = fetch ]; then printf 'fetch\n' >> "$PLAN_GIT_AUDIT"; exit 73; fi
+  done
+fi
+if [ "${PLAN_HISTORY_FAILURE:-0}" = 1 ]; then
+  case " $* " in *' log --first-parent '*) exit 74 ;; esac
+fi
+exec "$PLAN_REAL_GIT" "$@"
+GIT
+  chmod +x "$d/plan-bin/git"
+  export PATH="$d/plan-bin:$PATH" PLAN_PREVIOUS=v0.1.0 PLAN_PUBLICATION=success GITHUB_REPOSITORY=example/uzi
+  output="$(
+    cd "$d" || exit 2
+    set -o pipefail
+    # Only extract the real cutter's pure function, rather than running its ceremony.
+    # shellcheck source=/dev/null
+    . <(awk '/^inflight_rc\(\)/ { active=1 } active { print } active && /^}/ { exit }' "$RC")
+    inflight_rc
+  )"; rc=$?
+  assert_eq 'no open train emits no tag' '' "$output"
+  assert_eq 'no open train is a successful discovery' 0 "$rc"
+  plan_expect() {
+    local label=$1 expected=$2 field actual; shift 2
+    before_head="$(git -C "$d" rev-parse HEAD)"
+    before_refs="$(git -C "$d" show-ref)"
+    before_status="$(git -C "$d" status --porcelain --untracked-files=no)"
+    output="$(cd "$d" && PLAN_READONLY=1 bash "$RC" --plan "$@" 2>&1)"; rc=$?
+    assert_eq "$label plan exit" 0 "$rc"
+    while IFS= read -r field; do
+      actual="$(printf '%s\n' "$output" | awk -v prefix="${field%%=*}=" 'index($0, prefix) == 1 { print }')"
+      assert_eq "$label decision ${field%%=*}" "$field" "$actual"
+    done <<< "$expected"
+    assert_eq "$label HEAD unchanged" "$before_head" "$(git -C "$d" rev-parse HEAD)"
+    assert_eq "$label refs unchanged" "$before_refs" "$(git -C "$d" show-ref)"
+    assert_eq "$label tracked tree unchanged" "$before_status" "$(git -C "$d" status --porcelain --untracked-files=no)"
+    assert_eq "$label no scratch files" '' "$(find "$d/.uzi/scratch" -type f 2>/dev/null)"
+    assert_eq "$label no fetch" '' "$(cat "$PLAN_GIT_AUDIT" 2>/dev/null)"
+  }
+  plan_expect 'empty range' 'OP=noop'
+  plan_expect 'CI strict planning does not query worker pins' 'OP=noop' --ci
+  add_feature "$d" 201
+  output="$(cd "$d" && PLAN_HISTORY_FAILURE=1 bash "$RC" --plan 2>&1)"; rc=$?
+  assert_eq 'broken history reader is an instrument error' 2 "$rc"
+  plan_expect 'shipping without notes' 'OP=noop'
+  feature_201_changelog "$d"
+  plan_expect 'new minor' $'OP=new-base\nTAG=v0.2.0-rc.1'
+  plan_expect 'manual patch base' $'OP=new-base\nTAG=v0.1.1-rc.1' --version 0.1.1
+  plan_expect 'invalid explicit base' $'OP=blocked\nREASON=invalid-version' --version 0.01.1
+  plan_expect 'plan never switches to promote' 'OP=blocked' --promote
+  git -C "$d" tag v0.2.0-rc.9
+  export PLAN_PREVIOUS=v0.2.0-rc.9
+  plan_expect 'open train no new shipping' 'OP=noop'
+  add_feature "$d" 202
+  plan_expect 'open train advances' $'OP=nextrc\nTAG=v0.2.0-rc.10'
+  plan_expect 'other base needs abandon' 'OP=blocked' --version 0.3.0
+  plan_expect 'explicit abandon' $'OP=new-base\nTAG=v0.3.0-rc.1' --version 0.3.0 --abandon-train
+  plan_expect 'abandon cannot downgrade' 'OP=blocked' --version 0.1.1 --abandon-train
+  for PLAN_PUBLICATION in failed pending missing error transient; do
+    export PLAN_PUBLICATION
+    plan_expect "publication $PLAN_PUBLICATION" 'OP=blocked'
+  done
+  export PLAN_PUBLICATION=success
+  printf '\n// dirty\n' >> "$d/api/base.go"
+  plan_expect 'dirty tracked files' 'OP=blocked'
+  git -C "$d" checkout -- api/base.go
+  git -C "$d" tag -d v0.2.0-rc.9 >/dev/null
+  git -C "$d" tag v1.0.0
+  export PLAN_PREVIOUS=v1.0.0
+  plan_expect 'automatic 1.x held' 'OP=blocked'
+  plan_expect 'explicit 1.x patch no shipping' 'OP=noop' --version 1.0.1
+  git -C "$d" tag -d v1.0.0 >/dev/null
+  export PLAN_PREVIOUS=v0.1.0
+  # A strict metadata change is excluded regardless of its subject, even with notes.
+  git -C "$d" tag v0.2.0-rc.9
+  export PLAN_PREVIOUS=v0.2.0-rc.9
+  printf 'apiVersion: v2\nname: uzi\nversion: 0.2.0\nappVersion: "0.1.0"\n' > "$d/deploy/chart/Chart.yaml"
+  git -C "$d" add deploy/chart/Chart.yaml
+  gcommit "$d" 'repair: chart version'
+  plan_expect 'metadata excluded independent of subject' $'OP=noop\nSHIPPING_COUNT=0'
+  export PLAN_PUBLICATION=failed
+  plan_expect 'failed previous tag blocks a no-op' 'OP=blocked'
+  export PLAN_PUBLICATION=success
+  git -C "$d" tag v0.2.0-rc.10
+  export PLAN_PREVIOUS=v0.2.0-rc.10
+  printf '# Changelog\n\n## [Unreleased]\n\n## [0.1.0] - 2026-09-01\n### Added\n- **Initial** (#100)\n' | put_changelog "$d"
+  mkdir -p "$d/docs"
+  echo 'Editorial correction.' > "$d/docs/example.md"
+  git -C "$d" add docs/example.md
+  git -C "$d" commit -q -m 'docs: correct example' -m 'Changelog: none, editorial correction'
+  plan_expect 'explicitly exempt range has no releasable notes' $'OP=noop\nREASON=no-releasable-notes'
+  printf 'module example/test\n' > "$d/api/go.mod"
+  git -C "$d" add api/go.mod
+  gcommit "$d" 'chore(deps): update module (#204)'
+  printf '# Changelog\n\n## [Unreleased]\n\n## [0.1.0] - 2026-09-01\n### Added\n- **Initial** (#100)\n' | put_changelog "$d"
+  plan_expect 'dependency citations make notes releasable' $'OP=nextrc\nTAG=v0.2.0-rc.11'
+  add_feature "$d" 205
+  mkdir -p "$d/changelog.d"
+  printf '### Fixed\n\n- **Fix feature (#205).**\n  Correct the observed behavior.\n' > "$d/changelog.d/01234567-89ab-4cde-8fab-0123456789ab.md"
+  plan_expect 'untracked fragment blocked' 'OP=blocked'
+  git -C "$d" add changelog.d
+  gcommit "$d" 'docs: add fragment'
+  plan_expect 'committed fragment accepted' $'OP=nextrc\nTAG=v0.2.0-rc.11'
+  git -C "$d" checkout -q -b other
+  plan_expect 'non-main branch blocked' $'OP=blocked\nREASON=main-required'
+  git -C "$d" checkout -q main
+  git -C "$d" tag -d v0.1.0 v0.2.0-rc.9 v0.2.0-rc.10 >/dev/null
+  plan_expect 'first release remains local' $'OP=blocked\nREASON=initial-release-needs-local-cut'
+  plan_expect 'explicit first release remains local' $'OP=blocked\nREASON=initial-release-needs-local-cut' --version 0.1.0
+  echo "release plan: $PASSES passed, $FAILS failed"
+  [ "$FAILS" -eq 0 ]
+)
+if [ "${1:-}" = --plan-only ]; then
+  plan_regressions; exit $?
+fi
+if [ "$#" -eq 0 ]; then plan_regressions || fail "release planning regressions"; fi
+
 # Real cuts preserve published blocks while grouping newly pending categories.
 fold_order_regressions() {
   local d mode inventory version base before oldblock oldaddition section expected
@@ -790,7 +944,7 @@ fold_order_regressions() {
     done
   done
 }
-if [ "${1:-}" != "--fragments-only" ]; then
+if [ "${1:-}" != "--fragments-only" ] && [ "${1:-}" != "--plan-only" ]; then
 if [ "$#" -eq 0 ] || [ "${1:-}" = "--fold-order-only" ]; then fold_order_regressions; fi
 if [ "${1:-}" = "--fold-order-only" ]; then
   printf '=== fold ordering: %s passed, %s failed ===\n' "$PASSES" "$FAILS"
