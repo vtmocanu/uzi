@@ -10,7 +10,12 @@ Refs #3031. This is an incomplete delivery under the supplied plan's R3.
 The terminal producer remains disabled. S and N are implemented, with the
 scoped acceptance, regression and mutation evidence recorded below. C1/U4b is
 implemented with the guard off; its focused acceptance, test ports, accounting and
-conditional ADR amendment are recorded below. C2–C8 are not delivered. U4b completion is currently blocked by the M2 resource refusal recorded under material change needed below. Full
+conditional ADR amendment are recorded below. C2–C8 are not delivered. The M2
+resource refusal is resolved (see the owner diagnosis and category correction
+below; all ten slot dimensions are under their unchanged caps). The remaining U4b
+boundary is verification: the full frozen gate is substituted by exact-head CI per
+the maintainer decision, and the review and mutation evidence is refreshed at the
+final head. Full
 frozen-gate results belong to the PR verification record; live acceptance
 remains separate. The U4b contract revision is recorded below; no producer enablement is included.
 
@@ -690,7 +695,7 @@ into this working tree. Paths below are `agent/src/` unless stated; source basel
 | RECOVERY_BUNDLE_REF / transient recovery bundle pin | `git.ts:13369` `["update-ref", RECOVERY_BUNDLE_REF, h]` precedes bundle production. Quarantine caller (:150) uses tracking-derived archive head; coordinator `recovery.ts:2771/:3970` supplies record.sourceSha from acquired/proved sources or connected coverage above. Owner failed-transfer composed test refuses before the coverage ref, so that partial root never reaches this transient pin. Never an eligible boundary anchor. | Source/caller symbols and quoted acquisition chain in the baseline-evidence column; production writers unchanged. |
 | Explicit index-pack writers | `git.ts:5565` `["index-pack", "--stdin", "--strict", "--check-self-contained-and-connected"]` targets temporary bundle-verification bare; :14477 `"index-pack", "--strict"` indexes private staging; :14788 `spawnGitAsRunnerWithStdin(clonePath, ["index-pack", "--stdin"])` targets runner clone. Canonical transport imports are clone/fetch above. | Source/caller symbols and quoted acquisition chain in the baseline-evidence column; production writers unchanged. |
 | Delete-only transaction | `git.ts:5998–5999` prepares `update-ref --stdin` with `delete`; deletes cannot enlarge closure. Include in exhaustive classification, not as acquisition. | Source/caller symbols and quoted acquisition chain in the baseline-evidence column; production writers unchanged. |
-| importMaintenanceTip — objects only, never refs | Nonempty: selected exact-OID/decoded proof + trusted-boundary invariant → canonical import → successful range/shallow/identity checks → scoped imported result. Empty: eligible-anchor ancestry proof and same admission/rechecks → already_present. Owner joins/fresh observation precede accepted output index. Failed post-import residue has no accepted result; successful connected but not-yet-indexed imports are legitimate unnamed objects, not forbidden merely for lacking a ref. | Source/caller symbols and quoted acquisition chain in the baseline-evidence column; production writers unchanged. |
+| importMaintenanceTip — objects only, never refs | Nonempty: selected exact-OID/decoded proof + trusted-boundary invariant → canonical import → bare-only range check and identity/control revalidation (`validate()`; the shallow query is checked before boundary formation and at the post-proof recheck preceding import, and is not re-run after import) → scoped imported result. Empty: eligible-anchor ancestry proof and same admission/rechecks → already_present. Owner joins/fresh observation precede accepted output index. Failed post-import residue has no accepted result; successful connected but not-yet-indexed imports are legitimate unnamed objects, not forbidden merely for lacking a ref. | Source/caller symbols and quoted acquisition chain in the baseline-evidence column; production writers unchanged. |
 
 **Three named residuals required in ADR-1197 and PR:** (1) the trusted-boundary
 invariant relies on fetch connectivity checks and existing explicit walks;
@@ -1205,6 +1210,8 @@ fixture's 3,983-entry successful observation is retained as history, not substit
 for this required gate's refusal. The deeper wrapper path adds real parent checks;
 no path was shortened to make the failing example fit.
 
+(Path-depth dependent: see the note under the corrected wrapped table; only `launches`, `sources`, `rpcAttempts`, `closureEntries` and `decoded` are reproducible.)
+
 | Dimension | Refused wrapped path, including W0 and coordinator effects | Limit |
 |---|---:|---:|
 | launches | 191 | 512 |
@@ -1379,11 +1386,11 @@ and timeouts remain. W0-H and ordinary defaults remain frozen. No ref, FINAL,
 release or cleanup authority is granted.
 
 The failing measured baseline is
-`6f8f0b7c718f2036d02ea0202f69b64c2baf0b85`. The corrected candidate is currently
-uncommitted in `agent/src/git.ts`, `agent/src/recovery-maintenance.ts`,
+`6f8f0b7c718f2036d02ea0202f69b64c2baf0b85`. The corrected candidate was committed
+afterwards (`3bef25138`) in `agent/src/git.ts`, `agent/src/recovery-maintenance.ts`,
 `agent/test/git-maintenance-delta-accounting.test.ts` and the one adjusted
 assertion in `agent/test/git-maintenance-snapshot-ports.test.ts`.
-Its successful results must not be attributed to committed `6f8f0b7c`.
+Its successful results must not be attributed to `6f8f0b7c`.
 
 ### Historical wrapped baseline: every admin charge by phase and operation
 
@@ -1640,6 +1647,13 @@ processes/distinct clones. HTTP fixture transports are not hosted API evidence.
 | `closureEntries` | 65,536 | 18 | 16 | 16 | 16 |
 | `decoded` | 8 GiB (or tighter inherited C) | 478 | 478 | 478 | 478 |
 
+Path-depth dependence: `adminEntries`, `sourceEntries`, `metadataBytes` and
+`sourceBytes` include per-path-component reservations, so they vary with the depth
+of the temporary directory the run executes under; the values in these tables were
+measured at the wrapped Linux `os.tmpdir()` depth and are not portable. `launches`,
+`sources`, `rpcAttempts`, `closureEntries` and `decoded` do not depend on depth and
+are reproducible.
+
 Each of the eight variants is under every listed cap. The 32 RPC limit applies
 to charged slot attempts; discovery remains separate.
 
@@ -1662,6 +1676,44 @@ closureEntries=18/65536 and decoded=478/8 GiB (or tighter inherited C).
 Accepted indexing follows actual owner join. Refusals block their respective
 effects. Quiescence remains injected and trusted ancestor DAC modeled;
 this is not the C2 representative W0/U4b/archive measurement.
+
+### Enabling blocker: decompression amplification (auditor High)
+
+The decoded counter (8 GiB aggregate, no per-object cap) does not bound Git-process
+memory before the first inflation. Demonstrated: a roughly 1 MB loose tree object
+declaring 1 GiB drove source-environment `rev-list --objects` to about 1.08 GB RSS;
+`pack-objects` and both `index-pack --strict` invocations also inflate. The transfer
+is production-unreachable today (`terminalOriginAdmissionEnabled()` returns the false
+`TERMINAL_ORIGIN_ADMISSION_ENABLED` constant; tests override it). This is an explicit
+blocker to enabling it: the enabling design must prove a memory bound before the first
+inflation. No specific fix is prescribed here, and none is implemented.
+
+### Candidate mutation adjudication at `04d8f363` (review fold)
+
+Red/green for the tester's survivors, each closed by a behavioural test (mutant
+applied, test red on the intended assertion, restored, green):
+
+| Mutant | Test | Red message | Green |
+|---|---|---|---|
+| w1 walk per-entry stat uncharged | `delta walk10b` (admission) | preceding charge is `sourceBytes`, not `sourceEntries` | restored |
+| s1 importer `charge()` default category | `delta walk10b` (admission) | `adminEntries` observed before the loose-entry open | restored |
+| s2/s2b stage and index category | `delta accounting` central and ordinary stage/index tests | `adminEntries` where `sourceEntries` is required (observed by call window, not source text) | restored |
+| ojdup index before owner join | runner `origin-*` modes | `indexesBeforeJoin` 1, expected 0 | restored |
+| p1 proof/import order swap | `delta proof range` (proof file) | a canonical import was dispatched | restored |
+| N3 custodian comparison in `beforeSemantic` | `a semantic pair naming a different original worker` | imported 1, expected 0 | restored |
+
+The proof-phase refusals decoded-hash mismatch, remaining-C exhaustion and
+cancellation after proof already fail under the p1 swap in the proof test file; the
+tester's partial run covered only the four tests that legitimately fail before the proof phase.
+
+Survivors left as **unproven layer, for exact-head adjudication** (no observed test
+plus mutation establishes the property, so none is claimed covered elsewhere):
+
+| Survivor | Tester evidence |
+|---|---|
+| n1 both walk `nlink` checks removed | targeted run (13 tests, including the hardlink alias cases) stayed green; the descriptor-level alias check in the walk's `sourceUnchanged` still refuses, so the walk-level checks are likely redundant, not proven |
+| rf explicit `revalidate()` before output index removed | targeted run (3 tests) stayed green; the fresh observation and the indexing guard may subsume it, not proven |
+| x1 importer `check()` made a no-op | targeted run (2 tests) stayed green; resource accounting still calls `check()`, not proven to cover the importer sites |
 
 ### Remaining verification boundary
 

@@ -982,6 +982,19 @@ finite nonrecursive owned-only disposal remain mandatory. File/directory fsync i
 required by U2. Unknown entries and uncertain close/disposal identities are retained.
 Scratch paths are borrowed, never journaled.
 
+**Enabling blocker: decompression amplification.** The decoded counter (8 GiB
+aggregate, no per-object cap) meters bodies delivered to the verifier; it does not
+bound the memory a Git child uses while inflating an object before that first
+delivery. Demonstrated: a roughly 1 MB loose tree object declaring a 1 GiB inflated
+size drove the source-environment `rev-list --objects` selection to about 1.08 GB
+RSS, and `pack-objects` and both `index-pack --strict` invocations (private staging
+and canonical import) inflate attacker-supplied objects the same way. The transfer is
+unreachable in production today: `terminalOriginAdmissionEnabled()` returns the false
+`TERMINAL_ORIGIN_ADMISSION_ENABLED` constant (tests override it). Enabling it is
+blocked until the enabling design proves a memory bound before the first inflation
+(this amendment prescribes no specific mechanism as sufficient). Until then the
+transfer's resource claims cover metered deliveries, not Git-process memory.
+
 Current enforcing symbols are `GitCache.importMaintenanceTip` (admission,
 `literalBranch`, no-follow pins/walk, canonical shallow checks, eligible anchors,
 selection, staging, decoded proof, import/no-op and final rechecks),
@@ -1063,7 +1076,7 @@ into this working tree. Paths below are `agent/src/` unless stated; source basel
 | RECOVERY_BUNDLE_REF / transient recovery bundle pin | `git.ts:13369` `["update-ref", RECOVERY_BUNDLE_REF, h]` precedes bundle production. Quarantine caller (:150) uses tracking-derived archive head; coordinator `recovery.ts:2771/:3970` supplies record.sourceSha from acquired/proved sources or connected coverage above. Owner failed-transfer composed test refuses before the coverage ref, so that partial root never reaches this transient pin. Never an eligible boundary anchor. | Source/caller symbols and quoted acquisition chain in the baseline-evidence column; production writers unchanged. |
 | Explicit index-pack writers | `git.ts:5565` `["index-pack", "--stdin", "--strict", "--check-self-contained-and-connected"]` targets temporary bundle-verification bare; :14477 `"index-pack", "--strict"` indexes private staging; :14788 `spawnGitAsRunnerWithStdin(clonePath, ["index-pack", "--stdin"])` targets runner clone. Canonical transport imports are clone/fetch above. | Source/caller symbols and quoted acquisition chain in the baseline-evidence column; production writers unchanged. |
 | Delete-only transaction | `git.ts:5998–5999` prepares `update-ref --stdin` with `delete`; deletes cannot enlarge closure. Include in exhaustive classification, not as acquisition. | Source/caller symbols and quoted acquisition chain in the baseline-evidence column; production writers unchanged. |
-| importMaintenanceTip — objects only, never refs | Nonempty: selected exact-OID/decoded proof + trusted-boundary invariant → canonical import → successful range/shallow/identity checks → scoped imported result. Empty: eligible-anchor ancestry proof and same admission/rechecks → already_present. Owner joins/fresh observation precede accepted output index. Failed post-import residue has no accepted result; successful connected but not-yet-indexed imports are legitimate unnamed objects, not forbidden merely for lacking a ref. | Source/caller symbols and quoted acquisition chain in the baseline-evidence column; production writers unchanged. |
+| importMaintenanceTip — objects only, never refs | Nonempty: selected exact-OID/decoded proof + trusted-boundary invariant → canonical import → bare-only range check and identity/control revalidation (`validate()`; the shallow query is checked before boundary formation and at the post-proof recheck preceding import, and is not re-run after import) → scoped imported result. Empty: eligible-anchor ancestry proof and same admission/rechecks → already_present. Owner joins/fresh observation precede accepted output index. Failed post-import residue has no accepted result; successful connected but not-yet-indexed imports are legitimate unnamed objects, not forbidden merely for lacking a ref. | Source/caller symbols and quoted acquisition chain in the baseline-evidence column; production writers unchanged. |
 
 **Three named residuals required in ADR-1197 and PR:** (1) the trusted-boundary
 invariant relies on fetch connectivity checks and existing explicit walks;
