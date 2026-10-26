@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 
 	"github.com/charmbracelet/x/term"
@@ -19,6 +20,15 @@ func readVaultHiddenPassword(fd uintptr) (password []byte, err error) {
 		return nil, err
 	}
 	defer func() {
+		if errors.Is(err, errVaultPasswordTooLong) {
+			clear(password)
+			password = nil
+			if flushErr := windows.FlushConsoleInputBuffer(windows.Handle(fd)); flushErr != nil {
+				// Keep echo disabled when queued secret input could not be discarded.
+				err = flushErr
+				return
+			}
+		}
 		if restoreErr := term.Restore(fd, state); restoreErr != nil {
 			clear(password)
 			password = nil

@@ -146,6 +146,10 @@ func TestVaultTerminalPasswordBoundPTY(t *testing.T) {
 					t.Errorf("close PTY master: %v", err)
 				}
 			}()
+			// Bound all writer attempts, including cleanup if the reader regresses.
+			if err := master.SetWriteDeadline(time.Now().Add(15 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
 			if err := unix.IoctlSetPointerInt(fd, unix.TIOCSPTLCK, 0); err != nil {
 				t.Fatal(err)
 			}
@@ -180,9 +184,13 @@ func TestVaultTerminalPasswordBoundPTY(t *testing.T) {
 			writerJoined := false
 			defer func() {
 				// Closing our master also releases a writer blocked by a failed reader.
-				_ = master.Close()
+				if err := master.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+					t.Errorf("close PTY master during cleanup: %v", err)
+				}
 				if writerDone != nil && !writerJoined {
-					_ = <-writerDone // Closing the master may release the writer with an error.
+					if writerErr := <-writerDone; writerErr != nil {
+						t.Logf("PTY writer released during cleanup: %v", writerErr)
+					}
 				}
 				if !joined {
 					got := <-done
@@ -204,19 +212,12 @@ func TestVaultTerminalPasswordBoundPTY(t *testing.T) {
 				select {
 				case <-poll.C:
 				case <-deadline.C:
-					_, _ = master.Write([]byte("\n"))
-					got := <-done
-					joined = true
-					clear(got.password)
 					t.Fatal("reader did not disable ECHO")
 				}
 			}
 			writerDone = make(chan error, 1)
 			go func() {
 				remaining := maxVaultPasswordBytes
-				if overflow {
-					remaining++
-				}
 				for remaining > 0 {
 					size := min(1024, remaining)
 					chunk := bytes.Repeat([]byte{'x'}, size)
@@ -232,20 +233,26 @@ func TestVaultTerminalPasswordBoundPTY(t *testing.T) {
 					writerDone <- err
 					return
 				}
-				writerDone <- nil
+				// Queue the overflow byte and its same-line tail in one write while
+				// echo is off. The next consumer must never receive this tail.
+				_, err := master.Write(append([]byte("xqueued_secret_tail"), before.Cc[unix.VEOF]))
+				writerDone <- err
 			}()
 			var got result
 			select {
 			case got = <-done:
 				joined = true
 			case <-deadline.C:
-				// Release the old unbounded reader, then join both owned goroutines
-				// before failing so the regression's red path cannot leak readers.
-				_, _ = master.Write([]byte("\n"))
+				// Hang up our PTY before joining either goroutine. Cleanup cannot
+				// block trying to submit more input to a stalled reader.
+				if err := master.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+					t.Errorf("close PTY master after timeout: %v", err)
+				}
 				got = <-done
 				joined = true
-				_ = master.Close()
-				_ = <-writerDone // Timeout already fails; closing the master releases the writer.
+				if writerErr := <-writerDone; writerErr != nil {
+					t.Logf("PTY writer released after timeout: %v", writerErr)
+				}
 				writerJoined = true
 				clear(got.password)
 				t.Fatal("reader waited for newline instead of rejecting overflow")
@@ -269,6 +276,32 @@ func TestVaultTerminalPasswordBoundPTY(t *testing.T) {
 			}
 			if *before != *after {
 				t.Fatal("full terminal state was not restored")
+			}
+			// Submit only a newline after return, exposing any queued tail as data.
+			// A nonblocking literal read has no shell and needs no cleanup goroutine.
+			if _, err := master.Write([]byte("\n")); err != nil {
+				t.Fatal(err)
+			}
+			if err := unix.SetNonblock(int(slave.Fd()), true); err != nil {
+				t.Fatal(err)
+			}
+			var next [128]byte
+			for {
+				n, err := unix.Read(int(slave.Fd()), next[:])
+				if err == nil {
+					if n != 1 || next[0] != '\n' {
+						t.Fatalf("next terminal consumer received queued input (%d bytes)", n)
+					}
+					break
+				}
+				if !errors.Is(err, unix.EAGAIN) {
+					t.Fatal(err)
+				}
+				select {
+				case <-poll.C:
+				case <-deadline.C:
+					t.Fatal("next terminal consumer did not receive newline")
+				}
 			}
 		})
 	}
