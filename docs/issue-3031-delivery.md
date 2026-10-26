@@ -153,7 +153,7 @@ any ledger index; proof-phase range refusal before import; custodian mismatch
 refusal).
 
 Recorded, not delivered: the two-source `sources` conflict above (C2 input); the
-decompression-amplification enabling blocker; mutation layers n1, rf and x1 left as
+decompression-amplification and split-UID runner-tree enabling blockers; mutation layers n1, rf and x1 left as
 unproven for exact-head adjudication.
 
 Open before #3441 can close: exact-head CI on the final candidate (the
@@ -1796,6 +1796,29 @@ layers were not tested one by one. rf and x1 stay unproven: no test makes only t
 post-join `revalidate()` refuse, and cancellation is pinned through the resource
 checks rather than the importer's own `check()`.
 
+### Enabling blocker: split-UID runner tree refuses at the source pin
+
+`importMaintenanceTip` pins every component of the source clone path from the
+filesystem root (`absolutePin(source.clonePath, true)`), and each directory must pass
+`safeDir`. The production split-UID layout does not: the entrypoint creates the runner
+root as `worker:runner` mode 3775 (setgid, group-write, sticky), and
+`seedRunnerClone` creates the repository directory under it as worker-owned, group
+`runner`, mode 2775 (umask 002). `safeDir` rejects the runner root on its sticky bit,
+and both directories on group write (the group-write exception covers only
+runner-owned paths and strict ancestors of the runner root). With the guard enabled,
+every split-UID transfer would therefore refuse `maintenance_source_layout_unsupported`
+at the source pin, before any Git launch: fail-closed, nothing lost, but no transfer
+succeeds. Unreachable today: the transfer runs only behind the false
+`TERMINAL_ORIGIN_ADMISSION_ENABLED` guard.
+
+Acceptance 11 gap: the split-UID models used by the ported snapshot tests model only
+the strict ancestor (2775) and runner-owned clone paths; the runner root (3775) and
+repository directory (2775, group `runner`) keep the fixture's default modes, so no test
+exercises the production layout. Supporting the production layout requires a separately
+reviewed layout/admission design that preserves component-replacement protection, plus
+tests using the exact entrypoint ownership and modes. No permission broadening is
+presumed safe or authorized here.
+
 ### Current exact-revision validation status (`f7442c49`)
 
 This supersedes the historical boundary below for the current candidate. Guard off;
@@ -1811,8 +1834,10 @@ non-closing partial delivery of #3441 (see "Delivery status of #3441" near the t
   unproven layer-specific gaps.
 - E2E literal audit: no hits; `task test:e2e-lib` and `task test:forge-fake` pass;
   compose phases unrun.
-- Still open: the two-source `sources` conflict (C2 input), the decompression
-  enabling blocker, live acceptance and C2 to C8. #3441 stays open.
+- Still open: the two-source `sources` conflict (C2 input, including the per-chunk
+  revalidation scaling to measure), the decompression
+  and split-UID runner-tree enabling blockers, live acceptance and C2 to C8. #3441
+  stays open.
 
 ### Remaining verification boundary (historical, before the review fold)
 

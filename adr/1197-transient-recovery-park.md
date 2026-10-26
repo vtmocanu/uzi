@@ -996,6 +996,17 @@ blocked until the enabling design proves a memory bound before the first inflati
 (this amendment prescribes no specific mechanism as sufficient). Until then the
 transfer's resource claims cover metered deliveries, not Git-process memory.
 
+**Enabling blocker: split-UID runner tree.** `importMaintenanceTip` pins every
+source-path component from the filesystem root through `safeDir`, which rejects the
+production split-UID runner root (`worker:runner` 3775, sticky) and the repository
+directory under it (worker-owned, group `runner`, 2775), so with the guard enabled
+every split-UID transfer would refuse `maintenance_source_layout_unsupported` at the
+source pin, before any Git launch. The split-UID test models do not cover those two
+directories. Supporting the production layout requires a separately reviewed
+layout/admission design that preserves component-replacement protection, plus tests
+using the exact entrypoint ownership and modes. No permission broadening is presumed
+safe or authorized here.
+
 Current enforcing symbols are `GitCache.importMaintenanceTip` (admission,
 `literalBranch`, no-follow pins/walk, canonical shallow checks, eligible anchors,
 selection, staging, decoded proof, import/no-op and final rechecks),
