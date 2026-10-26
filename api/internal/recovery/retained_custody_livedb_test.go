@@ -122,7 +122,8 @@ func TestRetainedCustodyQueuedProofBoundaryLiveDB(t *testing.T) {
 		t.Run(promotion, func(t *testing.T) {
 			e := newInventoryEnv(t)
 			capture := e.reserve("queued-proof")
-			e.upload(capture)
+			body := e.upload(capture)
+			preparing := e.reserve("queued-preparing")
 			e.exec("UPDATE runs SET status='recovery_wait', recovery_wait_cause='retained_recovery_exhausted', retained_park_count=1, claim_released_at=now(), recovery_retry_not_before=now()-interval '1 second' WHERE id=$1", e.run)
 			if promotion == "timer" {
 				if _, err := e.q.PromoteRecoveryWaitRuns(e.ctx, pgconv.Time(time.Now())); err != nil {
@@ -139,9 +140,34 @@ func TestRetainedCustodyQueuedProofBoundaryLiveDB(t *testing.T) {
 			if err != nil || run.Status != "queued" || !run.ClaimReleasedAt.Valid {
 				t.Fatalf("queued fence status=%s err=%v", run.Status, err)
 			}
-			// Ending execution does not provide archive proof: a capture belonging
-			// to no hold cannot release this guarded source.
-			e.reject(e.w, e.request(uuid.New()), ErrNotAuthorized)
+			custodyAndBytes := func() string {
+				t.Helper()
+				var snapshot string
+				if err := e.pool.QueryRow(e.ctx, `SELECT json_build_array(row_to_json(h),
+                    (SELECT json_agg(row_to_json(c) ORDER BY c.capture_id,c.chunk_index)
+                     FROM recovery_capture_chunks c JOIN recovery_captures a ON a.id=c.capture_id WHERE a.hold_id=h.id))::text
+                    FROM recovery_custody_holds h WHERE h.id=$1`, e.hold).Scan(&snapshot); err != nil {
+					t.Fatal(err)
+				}
+				return snapshot
+			}
+			before := custodyAndBytes()
+			assertPreserved := func() {
+				t.Helper()
+				if custodyAndBytes() != before {
+					t.Fatal("unproven queued release changed custody or encrypted bytes")
+				}
+			}
+			// Both requests bind the existing worker, generation and hold. The
+			// queued execution fence does not make unfinished or expired proof final.
+			e.reject(e.w, e.request(preparing), ErrManifestConflict)
+			assertPreserved()
+			e.bytes(capture, body)
+			e.exec("UPDATE recovery_captures SET expires_at=now()-interval '1 second' WHERE id=$1", capture)
+			e.reject(e.w, e.request(capture), ErrManifestConflict)
+			assertPreserved()
+			e.exec("UPDATE recovery_captures SET expires_at=now()+interval '1 hour' WHERE id=$1", capture)
+			e.bytes(capture, body)
 			var open bool
 			if err := e.pool.QueryRow(e.ctx, "SELECT state='open' FROM recovery_custody_holds WHERE id=$1", e.hold).Scan(&open); err != nil || !open {
 				t.Fatalf("unproven queued release open=%v err=%v", open, err)

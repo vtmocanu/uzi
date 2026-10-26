@@ -165,9 +165,13 @@ func TestRetainedParkRefusalsWriteNothingLiveDB(t *testing.T) {
 			}
 			req := retainedReport(gen)
 			req.MrIID = i64Ptr(42)
-			_, applied, _ := svc.SetState(e.ctx, store.Worker{ID: w}, id, req)
-			if applied {
-				t.Fatal("refused park applied")
+			_, applied, err := svc.SetState(e.ctx, store.Worker{ID: w}, id, req)
+			var wantErr error
+			if scenario == "stale" || scenario == "released" {
+				wantErr = ErrStaleClaim
+			}
+			if applied || !errors.Is(err, wantErr) {
+				t.Fatalf("refused park applied=%v err=%v, want applied=false err=%v", applied, err, wantErr)
 			}
 			after, err := e.q.GetRunByID(e.ctx, id)
 			if err != nil {
