@@ -126,7 +126,7 @@ func (q *joinedReuseStore) SetCodexRecoverySlot(ctx context.Context, arg store.S
 		return 0, errors.New("transient slot write failure")
 	}
 	n, err := q.Queries.SetCodexRecoverySlot(ctx, arg)
-	row, rerr := q.Queries.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{UserID: arg.UserID, ID: arg.ID})
+	row, rerr := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{UserID: arg.UserID, ID: arg.ID})
 	if err == nil {
 		err = rerr
 	}
@@ -729,7 +729,8 @@ func TestCodexReuseJoinedPausedBackgroundWriterLiveDB(t *testing.T) {
 			f.assertFenced(t)
 			f.p.assertTokens(t, f.old, 2)
 			access := ""
-			if kind == "past_bound" {
+			switch kind {
+			case "past_bound":
 				f.env.exec("UPDATE codex_refresh_intent SET reuse_attempted_at=now()-($2::bigint * interval '1 microsecond') WHERE operation_id=$1",
 					f.op, (codexRefreshReuseInFlightBound + time.Second).Microseconds())
 				f.reconcile(t)
@@ -737,7 +738,7 @@ func TestCodexReuseJoinedPausedBackgroundWriterLiveDB(t *testing.T) {
 					t.Fatal("past-bound resolver did not follow approved crash policy")
 				}
 				f.action(t, CodexAccountActionReloginRequired)
-			} else if kind == "owner_restore" {
+			case "owner_restore":
 				access = codexToken("owner-restored")
 				relogin(t, f.env, f.env.q, f.fx, access)
 				f.reconcile(t)

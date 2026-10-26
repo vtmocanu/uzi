@@ -200,7 +200,7 @@ func TestCodexReuseAdmissionPrechecks(t *testing.T) {
 				acct.SealedLogin = []byte("corrupt")
 			}
 			if kind == "empty_refresh" {
-				raw, err := json.Marshal(codexLoginBlob{AccessToken: "access"})
+				raw, err := json.Marshal(codexLoginBlob{AccessToken: "access"}) //nolint:gosec // G117: synthetic fixture
 				if err != nil {
 					t.Fatal(err)
 				}

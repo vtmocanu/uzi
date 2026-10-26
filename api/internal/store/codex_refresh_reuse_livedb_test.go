@@ -150,9 +150,10 @@ func TestCodexRefreshReuseTerminalFenceLiveDB(t *testing.T) {
 				t.Fatal(err)
 			}
 			state := "rotating"
-			if kind == "current" {
+			switch kind {
+			case "current":
 				state = "unrecoverable"
-			} else if kind == "reconciled" {
+			case "reconciled":
 				state = "reconciled"
 			}
 			if it.State != state {

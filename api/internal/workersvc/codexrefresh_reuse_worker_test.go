@@ -211,7 +211,7 @@ func TestCodexReuseWorkerDeferrals(t *testing.T) {
 			case "corrupt":
 				st.acct.SealedLogin = []byte("corrupt")
 			case "missing_refresh":
-				raw, _ := json.Marshal(codexLoginBlob{AccessToken: "old"})
+				raw, _ := json.Marshal(codexLoginBlob{AccessToken: "old"}) //nolint:gosec // G117: synthetic fixture
 				var err error
 				st.acct.SealedLogin, err = s.box.Seal(raw)
 				if err != nil {
