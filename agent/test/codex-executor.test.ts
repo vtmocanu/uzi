@@ -130,6 +130,15 @@ import { MAX_LEAD_FINAL_MESSAGE_LEN, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING } f
 /** Issue #1718: every implement prompt now ends with the roster line; makeCtx has no agents. */
 const NO_SUBAGENTS_BLOCK = "\n\nNo subagents are available; do the work yourself.";
 
+/** Issue #3462: a zero-evidence idle trip is an ordinary, non-provider-origin recovery. */
+const recoveryMessage = "provider sent no model output within the idle timeout";
+const isRecovery = (error: unknown): boolean => {
+  assert.ok(error instanceof TransientRecoveryError, String(error));
+  assert.equal(error.message, recoveryMessage);
+  assert.equal(error.providerOrigin, false);
+  return true;
+};
+
 // PRD #1171 (M3, milestone 3, Phase 2A) — the production CodexExecutor + the claim-aware
 // DARK selection seam, driven with an in-memory transport and scripted app-server frames
 // (NO real Codex process, NO real launcher). Every external effect is an INJECTED SEAM.
@@ -5123,7 +5132,7 @@ describe("CodexExecutor: child-thread delegation demux (part C)", () => {
           await new Promise<void>(resolve => setTimeout(resolve, IDLE_MS + 50));
           assert.equal(parks, route === "refused wall" ? 1 : 0, "current callback suppresses idle without a stale wall park");
           fresh.settleCallback(current.token, "ok");
-          await assert.rejects(withTimeout(running, 2000, "idle after current callback settles"), TransientRecoveryError);
+          await assert.rejects(withTimeout(running, 2000, "idle after current callback settles"), isRecovery);
           assert.equal(parks, route === "refused wall" ? 1 : 0, "idle does not consume the newer wall budget");
         } finally {
           ExecutionRegistry.prototype.subscribeCallbacks = subscribe;
@@ -12694,7 +12703,7 @@ describe("Codex completion interlock", () => {
         parkForWall: async () => { parks++; return "parked"; },
       });
       const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
-      if (trip === "idle") await assert.rejects(withTimeout(running, 3000, "pre-attempt idle"), TransientRecoveryError);
+      if (trip === "idle") await assert.rejects(withTimeout(running, 3000, "pre-attempt idle"), isRecovery);
       else assert.deepEqual((await withTimeout(running, 3000, "pre-attempt wall")).walled, { reason: "codex run wall-clock timeout" });
       assert.equal(attempts, 0);
       assert.equal(holds, 0);
@@ -12731,7 +12740,7 @@ describe("Codex completion interlock", () => {
       enterCompletionHold: async (reason) => { holds.push(reason); return false; },
       parkForWall: async () => { parks++; return "parked"; },
     });
-    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "refused idle hold"), TransientRecoveryError);
+    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "refused idle hold"), isRecovery);
     assert.deepEqual(holds, ["codex run idle timeout"]);
     assert.equal(parks, 0);
   });
@@ -17878,13 +17887,6 @@ describe("CodexExecutor planning settlement (#1733)", () => {
 });
 
 describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
-  const recoveryMessage = "provider sent no model output within the idle timeout";
-  const isRecovery = (error: unknown): boolean => {
-    assert.ok(error instanceof TransientRecoveryError, String(error));
-    assert.equal(error.message, recoveryMessage);
-    assert.equal(error.providerOrigin, false);
-    return true;
-  };
   // Readiness uses bounded real event-loop turns, independently of the frozen Date.
   async function until(predicate: () => boolean): Promise<void> {
     for (let n = 0; n < 500; n++) {
@@ -24085,7 +24087,7 @@ describe("3282 historical boundary regressions", () => {
       enterCompletionHold: async () => { holds++; return true; },
       parkForWall: async () => { parks++; return "parked"; },
     });
-    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "historical idle"), TransientRecoveryError);
+    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "historical idle"), isRecovery);
     assert.equal(holds, 0); assert.equal(parks, 0);
     assert.equal(rig.providerLaunches(), 1);
     assert.equal(rig.epochs[0]!.transport.turnStartCount, 1);
