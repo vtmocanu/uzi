@@ -577,8 +577,8 @@ MEASURE elapsed=1354
 ### Composed measurement harness (C2, #3442)
 
 `agent/test/measure-3031-composed.test.ts` is the harness for the composed capacity
-gate. It records no verdict here: the measurement has not been run on a candidate,
-and only a recorded PASS releases C3. The producer guard stays `false`; the harness
+gate. A diagnostic run has been recorded (see "Official diagnostic run" below), but no
+qualifying C2 measurement and no PASS exist, and only a recorded PASS releases C3. The producer guard stays `false`; the harness
 changes no production code.
 
 It drives one complete pipeline per measurement through the real `RunRunner` and the
