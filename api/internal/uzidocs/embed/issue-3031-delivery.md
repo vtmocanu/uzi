@@ -12,7 +12,8 @@ scoped acceptance, regression and mutation evidence recorded below. C1/U4b is
 implemented with the guard off; its focused acceptance, test ports, accounting and
 conditional ADR amendment are recorded below. C2–C8 are not delivered. The M2
 resource refusal is resolved (see the owner diagnosis and category correction
-below; all ten slot dimensions are under their unchanged caps). The remaining U4b
+below; all ten slot dimensions are under their unchanged caps for a single-member
+family, while a two-source family exceeds `sources`, recorded below as a C2 input). The remaining U4b
 boundary is verification: the full frozen gate is substituted by exact-head CI per
 the maintainer decision, and the review and mutation evidence is refreshed at the
 final head. Full
@@ -92,6 +93,71 @@ Historical status (before #3349): no workaround was implemented, and W0, U4b,
 U4c, U4d, U5, F, M3 and M4 were incomplete. W0 is now delivered (see the note
 at the top); U4b, U4c, U4d, U5, F, M3 and M4 remain incomplete. The representative composed measurement remains C2 work; no capacity projection is verified.
 The guard-off U4b implementation and its conditional ADR contract follow below.
+
+## Material change needed: two-source family exceeds `sources` (fixture-injected diagnostic)
+
+Diagnostic, not C2's measurement. A scratch copy of the runner `origin-admission`
+mode at candidate `db8e010b` injected a sibling into the scanned family: it pushed a
+second entry into `known` (the `originals` argument of the family scan), created
+the sibling directory with `mkdir`, and inserted an abandoned-attempt ledger entry.
+It created no second Git clone. Substitutions, as in the existing `origin-transfer-*`
+modes: the terminal-origin guard method, a faked server, `passingExclusion()` for
+the writer exclusion, and an injected quiescent verdict. The slot was minted
+normally. It ran only to the first refusal and was not committed. It demonstrates
+the observed descriptor-budget refusal; it does not measure the complete real
+two-clone topology that C2 (#3442 item 5) requires.
+
+Observed:
+
+- 25 attempted `readLockedFamily` calls = 3 discovery reads (uncharged) +
+  21 successful paid reads at 6 `sources` each (4 for a single-member family) +
+  1 refused paid read. Two further `sources` units were charged elsewhere.
+- The refused read fails with `maintenance_resource_exhausted` at `sources`
+  128/128 (+1), in `count()` called from `readLockedFamily`, reached from the
+  importer's `supervised` read in `beforeSpawn` inside `importMaintenanceTip`, after
+  the transfer was entered and before any canonical import.
+- Counters at the refusal point (not complete-path totals): launches 177/512,
+  adminEntries 2,384/4,096, rpcAttempts 14/32 (plus 4 discovery), sourceEntries
+  5,976/65,536, sourceBytes 198,747, metadataBytes 17,159,953, artifactBytes 142,
+  closureEntries 4, decoded 0. Everything after the refusal is unmeasured.
+- Fail-closed at the refusal: no canonical import (tip absent from the bare, refs
+  unchanged), no output index, source clone and both attempt directories retained,
+  no custody release and no bundle upload.
+
+Projection, not measured: if the single-member path's 31 paid reads also applied to
+a two-member family, the complete path would need about 31 x 6 + 2 = 188 `sources`
+against 128. The single-member path measures 126/128.
+
+The overrun binds only when the producer is enabled: the only `sources` charge is
+`consumeIfActive` inside `withMaintenanceFamilyLock`, and slots are minted only by
+terminal-origin admission, which returns early while
+`TERMINAL_ORIGIN_ADMISSION_ENABLED` is false.
+
+This conflicts with the C2 hard gate (#3442 item 5): the two-source family must
+complete with genesis preserved and the sibling protected, and a cap refusal is not
+a PASS. No cap, accounting or scheduling change is made or approved here. C2 inherits
+this as a recorded R3 input; C3 to C8 stay blocked until C2 records a PASS. #3440
+(multi-source settlement) does not absorb or waive it.
+
+## Delivery status of #3441 (non-closing)
+
+Implemented, pending acceptance validation, guard off: design items 1 to 10, the
+acceptance 1 to 22 and F-row tests as mapped in the port and acceptance tables, the
+ADR-1197 amendment, the accounting old-to-new mapping, and the review-fold tests
+(walk, importer and stage/index charge categories; unconditional owner join before
+any ledger index; proof-phase range refusal before import; custodian mismatch
+refusal).
+
+Recorded, not delivered: the two-source `sources` conflict above (C2 input); the
+decompression-amplification enabling blocker; mutation layers n1, rf and x1 left as
+unproven for exact-head adjudication.
+
+Open before #3441 can close: exact-head CI on the final candidate (the
+maintainer-approved substitute for the local `gate:agent`); fresh reviewer, tester
+and auditor passes over the fold range, including the remaining mutation
+adjudication; and the mandatory E2E literal audit with `task test:e2e-lib` and
+`task test:forge-fake` run at the final head. The PR refers to #3441 without a
+closing keyword.
 
 ## Requirement map
 
