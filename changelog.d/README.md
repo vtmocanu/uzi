@@ -68,10 +68,18 @@ at the merge base supplies a new entry. Editing or deleting inherited fragments
 alone does not satisfy coverage. Existing legacy `[Unreleased]` bullets stay
 until the next release; direct additions remain supported during migration.
 
-The existing exemptions remain: `Changelog: none` in a branch commit with a
-reason; docs-typed shipping commits (with a docs-typed squash subject for the
-oracle); and dependency-manifest-only changes under dependency-typed commits,
-which the cutter cites in bulk. See
+### Exemptions
+
+The PR check accepts `Changelog: none` with a reason in a non-merge branch commit,
+or dependency-manifest-only changes under dependency-typed commits, which the
+cutter cites in bulk. Docs-typed subjects alone do not exempt a shipping PR:
+add a new fragment, or add a `Changelog: none` line with a reason to a non-merge
+branch commit when there is nothing to announce. This also applies to automated
+documentation PRs. Keep the declaration in the squash commit body; the repository's
+squash-with-commit-messages convention preserves it for the release oracle.
+
+The release oracle still exempts docs-typed final subjects, including direct
+docs commits. That does not replace the explicit PR-time contract. See
 [the PR check](../scripts/check-changelog-entry.sh) for the predicates and
 [the release oracle](../scripts/assert-changelog-covers-release.sh) for final
 shipping identity coverage. A malformed changed fragment still fails on an
