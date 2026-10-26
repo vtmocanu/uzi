@@ -307,7 +307,7 @@ release_plan() (
   export GIT_OPTIONAL_LOCKS=0
   git() { command git -c core.fsmonitor=false "$@"; }
   export -f git
-  local op=blocked base='' tag='' reason=unspecified count=0 previous='' publication=not-applicable head stable candidate cb cn sha parent metadata_rc publication_rc shipping paths fragment pending deps
+  local op=blocked base='' tag='' reason=unspecified count=0 previous='' publication=not-applicable head stable candidate cb cn sha parent metadata_rc publication_rc runtime_rc shipping paths fragment pending deps
   head="$(git rev-parse --verify HEAD)" || return 2
   emit_plan() {
     printf 'OP=%s\nBASE=%s\nTAG=%s\nREASON=%s\nSHIPPING_COUNT=%s\nPREVIOUS_TAG=%s\nPUBLICATION_STATE=%s\nHEAD_SHA=%s\n' \
@@ -332,6 +332,7 @@ release_plan() (
       [ "$ABANDON_TRAIN" -eq 1 ] || block_plan open-train-needs-abandon
       [ "$(ver_cmp "$base" "$cb")" = 1 ] || block_plan abandon-needs-higher-base
       previous="$(prev_stable_below "$base")" || return 2
+      [ -n "$previous" ] || block_plan initial-release-needs-local-cut
       tag="v$base-rc.1"; op='new-base'
     else
       [ "$ABANDON_TRAIN" -eq 0 ] || block_plan abandon-needs-higher-base
@@ -352,6 +353,15 @@ release_plan() (
     fi
     tag="v$base-rc.1"; op='new-base'
   fi
+  # Adoption still needs a local review/cut. Check before the publication refusal,
+  # which an explicitly authorized supersede may lift in the CI orchestrator.
+  git diff --quiet --no-ext-diff --no-textconv "$previous" "$head" -- agent/codex/codex-package.lock
+  runtime_rc=$?
+  case "$runtime_rc" in
+    0) : ;;
+    1) block_plan codex-runtime-needs-local-cut ;;
+    *) return 2 ;;
+  esac
   # Check the previous publication even for a zero-delta scheduled attempt.
   if [ -n "$previous" ]; then
     publication="$(python3 -I "$ROOT/scripts/release-ci-coverage.py" publication "$previous" --tag "$previous")"

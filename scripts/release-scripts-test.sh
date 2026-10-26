@@ -892,12 +892,25 @@ GIT
   git -C "$d" add changelog.d
   gcommit "$d" 'docs: isolated fragment'
   plan_expect 'only committed fragment makes range releasable' $'OP=nextrc\nTAG=v0.2.0-rc.12\nSHIPPING_COUNT=1'
+  mkdir -p "$d/agent/codex"
+  echo 'runtime pin fixture' > "$d/agent/codex/codex-package.lock"
+  git -C "$d" add agent/codex/codex-package.lock
+  gcommit "$d" 'chore: change Codex runtime'
+  plan_expect 'Codex adoption requires a local cut' $'OP=blocked\nREASON=codex-runtime-needs-local-cut'
+  PLAN_PUBLICATION=failed plan_expect 'Codex block precedes liftable publication block' $'OP=blocked\nREASON=codex-runtime-needs-local-cut'
+  # A human's local cut establishes a new boundary after the adoption read.
+  git -C "$d" tag v0.2.0-rc.12
+  export PLAN_PREVIOUS=v0.2.0-rc.12
+  add_feature "$d" 207
+  plan_expect 'published local boundary clears adoption block' $'OP=nextrc\nTAG=v0.2.0-rc.13'
   git -C "$d" checkout -q -b other
   plan_expect 'non-main branch blocked' $'OP=blocked\nREASON=main-required'
   git -C "$d" checkout -q main
-  git -C "$d" tag -d v0.1.0 v0.2.0-rc.9 v0.2.0-rc.10 v0.2.0-rc.11 >/dev/null
+  git -C "$d" tag -d v0.1.0 v0.2.0-rc.9 v0.2.0-rc.10 v0.2.0-rc.11 v0.2.0-rc.12 >/dev/null
   plan_expect 'first release remains local' $'OP=blocked\nREASON=initial-release-needs-local-cut'
   plan_expect 'explicit first release remains local' $'OP=blocked\nREASON=initial-release-needs-local-cut' --version 0.1.0
+  git -C "$d" tag v0.2.0-rc.1
+  plan_expect 'abandon without stable boundary remains local' $'OP=blocked\nREASON=initial-release-needs-local-cut' --version 0.3.0 --abandon-train
   output="$(cd "$d" && bash "$RC" --plan 0.1.0 2>&1)"; rc=$?
   assert_eq 'plan positional base is usage error' 3 "$rc"
   assert_contains 'plan positional base prints usage' usage: "$output"
