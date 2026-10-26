@@ -34,7 +34,8 @@ reason and keeps the start time.
 The web UI is the only way to change it. `PUT /api/admin/maintenance` accepts a
 cookie session with a CSRF token only; a Bearer token (including an admin
 token) is refused, and the CLI has no on/off command. Every change is recorded
-with who, when and the reason.
+with who and when. Switching it on records the reason; the reason is cleared
+when maintenance is lifted, so the "off" event has none.
 
 **Enable it only after an api rollout has completed.** During a rolling update
 the old replicas do not have the check and keep starting new runs until they are
@@ -50,7 +51,7 @@ no burst of Slack nudges is sent for the backlog.
 |---|---|
 | A run never claimed before (`claim_generation` 0), of any kind: issue, prompt, sweep, schedule, chat, chat Continue, judge, CI-fix, MR rework, task review and then-fix phases, `/api/v1` job, recovery successor, Slack-created runs and chats | Created as usual and stays `queued`. No worker claims it and no ephemeral pod is started for it. |
 | A run claimed at least once | Keeps going: finishes, resumes after approval, input, follow-up, limit, pool, recovery or wall-clock waits, and may be requeued and re-claimed by any worker that accepts it, an ephemeral replacement included. |
-| A cross-check child | Counts as admitted; it is only claimed while its lead is. |
+| A cross-check child | Counts as admitted: it can only be claimed while its lead is claimed or running (or, for a code check, an interactive task lead at `awaiting_followup`). |
 | Persistent workers | Unchanged. They simply find nothing new to claim. |
 
 A `--review --then-fix` task handoff stops between its phases until
@@ -71,9 +72,11 @@ to admitted work as before.
   stays `queued`, and the job's wall-clock limit counts from claim, so waiting
   does not use it up.
 - Creating a run (web, CLI, chat, `/api/v1`) succeeds as usual with an added
-  `notice`; the CLI prints it as a warning on stderr. Slack replies that open or
-  continue a chat, or refuse a second message because a queued chat is waiting,
-  mention maintenance.
+  `notice`. It reads neutrally: new work is queued and starts when maintenance
+  ends. The CLI prints it as a warning on stderr, including `uzi run rework`
+  and `uzi ci fix`. Slack replies that open or continue a chat, the "Start run"
+  card reply, and the refusal of a second message while a queued chat is
+  waiting also mention maintenance.
 
 ## Reading the readout
 
@@ -119,6 +122,10 @@ Two cautions:
   idle bound worker, and claims its run after the lift.
 - A pre-enable ephemeral pod that never registered is still reaped at its
   deadline and is not re-provisioned while maintenance is on.
+- Edge case for `/api/v1` jobs: a job whose ephemeral worker was requested
+  before maintenance and never registered can still be failed with
+  `ephemeral_worker_never_registered`. This is the existing never-registered
+  check for jobs, which maintenance does not suspend.
 
 ## Health check
 

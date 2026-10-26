@@ -139,8 +139,9 @@ export function maintenanceDoc(): HealthDoc {
           { label: "Held", value: "3" },
           { label: "Custody holds", value: "1" },
           { label: "Queued", value: "3" },
+          { label: "Clear", value: "no" },
         ],
-        action: "Turn maintenance mode off in Admin settings once the infrastructure work is done.",
+        action: "Switch maintenance mode off in Admin Settings when the work is done; queued runs then start.",
       },
     }),
   );

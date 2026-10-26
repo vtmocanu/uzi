@@ -171,6 +171,36 @@ func runCLIBuffers(t *testing.T, env Env, args ...string) (string, string, int) 
 	return out.String(), errb.String(), code
 }
 
+// `uzi run rework` and `uzi ci fix` create runs too, so the server's maintenance notice must
+// reach stderr (sanitized) for them as well, with stdout left clean.
+func TestReworkAndCIFixNoticeGoesToStderr(t *testing.T) {
+	notice := "uzi is in maintenance mode: new work is queued. Reason: " + hostileANSI
+	t.Run("run rework", func(t *testing.T) {
+		fc := &uzicli.FakeClient{
+			RunByID:       map[string]apitypes.RunDTO{"r1": {ID: "r1"}},
+			ReworkRun:     apitypes.RunDTO{ID: "r2", Kind: "mr_rework", Status: "queued"},
+			CreatedNotice: notice,
+		}
+		out, errs, code := runCLIBuffers(t, fakeEnv(fc), "run", "rework", "r1")
+		if code != uzicli.ExitOK || !strings.Contains(errs, "warning: uzi is in maintenance mode") || strings.ContainsRune(errs, 0x1b) {
+			t.Fatalf("exit %d, stderr = %q", code, errs)
+		}
+		if strings.Contains(out, "maintenance mode") {
+			t.Errorf("notice leaked to stdout:\n%s", out)
+		}
+	})
+	t.Run("ci fix", func(t *testing.T) {
+		fc := &uzicli.FakeClient{CIFixRunResult: apitypes.RunDTO{ID: "run-123", Status: "queued"}, CreatedNotice: notice}
+		out, errs, code := runCLIBuffers(t, fakeEnv(fc), "ci", "fix", "main", "--repo", "r1")
+		if code != uzicli.ExitOK || !strings.Contains(errs, "warning: uzi is in maintenance mode") || strings.ContainsRune(errs, 0x1b) {
+			t.Fatalf("exit %d, stderr = %q", code, errs)
+		}
+		if strings.Contains(out, "maintenance mode") || !strings.Contains(out, "run-123") {
+			t.Errorf("stdout = %q", out)
+		}
+	})
+}
+
 func TestCreateNoticeGoesToStderrSanitized(t *testing.T) {
 	notice := "uzi is in maintenance mode: this run is queued. Reason: " + hostileANSI
 	t.Run("run create", func(t *testing.T) {

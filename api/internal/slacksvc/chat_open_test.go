@@ -215,7 +215,7 @@ func TestChatThreadReplyTurnCapReached(t *testing.T) {
 	}
 }
 
-const testMaintenanceNotice = "uzi is in maintenance mode: this run is queued and will start when maintenance ends. Reason: node drain"
+const testMaintenanceNotice = "uzi is in maintenance mode: new work is queued and starts when maintenance ends. Reason: node drain"
 
 // PRD #3454: a chat opened while maintenance is active gets the notice as a thread reply, and
 // is still created and anchored; with maintenance off there is no extra post.
@@ -242,6 +242,22 @@ func TestOpenChatPostsMaintenanceNotice(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The thread-reply notice is plain mrkdwn text, so the admin reason must be escaped.
+func TestOpenChatMaintenanceNoticeEscapesReason(t *testing.T) {
+	fs := &fakeReplierStore{user: store.User{ID: uuid.New()}}
+	sub := &fakeSubmitter{createdChat: store.Run{ID: uuid.New(), Kind: runkind.Chat},
+		maintenance: "uzi is in maintenance mode. Reason: drain <!channel> <https://x.example|y>"}
+	fp := &fakePoster{}
+	NewReplier(fs, sub, fp, nil).HandleMessage(context.Background(), topLevelDM("hello"))
+	if len(fp.posts) != 1 {
+		t.Fatalf("posts = %+v", fp.posts)
+	}
+	got := fp.posts[0].text
+	if !strings.Contains(got, "&lt;") || strings.Contains(got, "<!channel>") || strings.Contains(got, "<https://x.example|y>") {
+		t.Errorf("notice reply not escaped: %q", got)
 	}
 }
 

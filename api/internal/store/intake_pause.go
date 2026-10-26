@@ -48,7 +48,7 @@ func MaintenanceNoticeText(st IntakePauseState) string {
 	if !st.Active {
 		return ""
 	}
-	t := "uzi is in maintenance mode: this run is queued and will start when maintenance ends."
+	t := "uzi is in maintenance mode: new work is queued and starts when maintenance ends."
 	if st.Reason.Valid && st.Reason.String != "" {
 		t += " Reason: " + st.Reason.String
 	}

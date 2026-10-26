@@ -113,7 +113,9 @@ func (r *Replier) openChat(ctx context.Context, m MessageReply, user store.User)
 	// PRD #3454: while maintenance holds new runs back, say so in the thread. Best-effort,
 	// like every other post here; the chat itself is created and anchored.
 	if notice := r.svc.MaintenanceNotice(ctx); notice != "" {
-		r.postThreadReply(ctx, m, "ℹ️ "+notice)
+		// postThreadReply posts plain mrkdwn text, so the admin-written reason inside the
+		// notice must be escaped (<!channel>, <url|label>) before it reaches Slack.
+		r.postThreadReply(ctx, m, "ℹ️ "+EscapeMrkdwn(notice))
 	}
 
 	// ✅ the opening message so the user sees it landed even before the worker replies.
@@ -124,6 +126,9 @@ func (r *Replier) openChat(ctx context.Context, m MessageReply, user store.User)
 // never admitted (claim_generation 0) while maintenance is active, maintenance is why it has not
 // started, so say that instead of the generic pointer.
 func (r *Replier) busyText(ctx context.Context, live store.Run) string {
+	// This Go check mirrors the SQL admission rule (PRD #3454 D4, fn_run_admitted_during_intake_pause):
+	// a run never claimed (claim_generation 0) is held by the pause. Chats are never cross_check
+	// children, so the cross_check carve-out in that function cannot apply here.
 	if live.Status == "queued" && live.ClaimGeneration == 0 && r.svc.MaintenanceNotice(ctx) != "" {
 		return chatBusyMaintenanceText
 	}

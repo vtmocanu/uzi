@@ -302,17 +302,18 @@ func (c *HTTPClient) SetRunMrRework(ctx context.Context, id string, enabled *boo
 // always sent); the server unwraps to the created `mr_rework` run. The exit-code mapping
 // (404→ExitNotFound, 409→ExitConflict, 400→ExitUsage) comes for free through
 // statusError/postJSON, so it is not hand-rolled here.
-func (c *HTTPClient) RunRework(ctx context.Context, runID, guidance string) (apitypes.RunDTO, error) {
+func (c *HTTPClient) RunRework(ctx context.Context, runID, guidance string) (CreatedRunResult, error) {
 	body := struct {
 		Guidance string `json:"guidance"`
 	}{Guidance: guidance}
 	var env struct {
-		Run apitypes.RunDTO `json:"run"`
+		Run    apitypes.RunDTO `json:"run"`
+		Notice string          `json:"notice"`
 	}
 	if err := c.postJSON(ctx, "/api/runs/"+url.PathEscape(runID)+"/rework", body, &env); err != nil {
-		return apitypes.RunDTO{}, err
+		return CreatedRunResult{}, err
 	}
-	return env.Run, nil
+	return CreatedRunResult{RunDTO: env.Run, Notice: env.Notice}, nil
 }
 
 // completionDecisionRequest is the POST /api/runs/{id}/completion/decision body (PRD #1226 M5, D7 +

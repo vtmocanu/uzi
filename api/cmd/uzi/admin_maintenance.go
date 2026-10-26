@@ -11,7 +11,7 @@ import (
 )
 
 // newAdminMaintenanceCmd is `uzi admin maintenance`. Maintenance mode is switched on and off
-// from the web Admin Settings page only (PRD #3454 D6: the settings write is cookie + CSRF
+// from the web Admin Instance page only (PRD #3454 D6: the settings write is cookie + CSRF
 // only), so this group carries read-only verbs.
 func newAdminMaintenanceCmd(env Env, gf *globalFlags) *cobra.Command {
 	cmd := &cobra.Command{
@@ -19,7 +19,7 @@ func newAdminMaintenanceCmd(env Env, gf *globalFlags) *cobra.Command {
 		Short: "Inspect instance maintenance mode (read-only)",
 		Long: "Instance maintenance mode holds new runs in the queue so an operator can drain the " +
 			"instance before node maintenance. It is switched on and off in the web UI at " +
-			"Admin → Settings; the CLI only reads it.",
+			"Admin → Instance; the CLI only reads it.",
 	}
 	cmd.AddCommand(newAdminMaintenanceStatusCmd(env, gf))
 	return cmd

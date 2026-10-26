@@ -1134,17 +1134,19 @@ A few worth knowing:
   verb: creating, editing and deleting a profile are cookie-only admin writes.
 - **`admin maintenance status` reads [instance maintenance
   mode](instance-maintenance.md)** (PRD #3454): whether it is on, since when and
-  why, then the readout of `active`, `held` and `custody` work (each item tagged
-  `progressing` or `needs_owner`, with owner and age), the informational `queued`
-  runs and idle bound ephemeral workers, and a `clear` / `not yet clear` line with
-  its `as_of` time. "Clear" means no blockers visible in that snapshot; refresh it
+  why, then the counts and a `CLEAR: …` or `NOT CLEAR: …` line with its `as_of`
+  time. It lists `active`, `held` and `custody` items (owner and age; only held
+  and custody items carry a `progressing` or `needs_owner` tag, active items
+  carry none). The informational queued runs and idle bound ephemeral workers
+  are counts only here; the web card lists them. "Clear" means no blockers visible in that snapshot; refresh it
   right before evicting nodes. The reason and owner labels go through the same
   sanitizing path as every other untrusted field. Read-only, `uza_`-token (or
   session), same ceiling as every other `admin` verb: turning maintenance on or
   off is a cookie-only web action (**Admin → Instance → Maintenance mode**), so
   the CLI has no on/off.
 - **While maintenance is on, creating a run still succeeds and prints a warning
-  on stderr** (the server's `notice`), and `uzi run get` shows a `QUEUE_REASON`
+  on stderr** (the server's `notice`; `uzi run create`, `uzi run rework`,
+  `uzi ci fix` and the other create paths), and `uzi run get` shows a `QUEUE_REASON`
   row for a queued run that maintenance is holding back. `--json` stdout is
   unchanged apart from the additive `queue_reason` and `notice` fields.
 - **`uzi repo remove <id>` deletes a single stale repo** — the surgical

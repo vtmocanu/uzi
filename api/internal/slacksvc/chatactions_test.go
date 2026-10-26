@@ -803,11 +803,59 @@ func TestChatActionIgnoresForeignNamespace(t *testing.T) {
 	}
 }
 
+// The admin-written reason inside the notice must never reach Slack as live mrkdwn: every
+// sink (status block, card, and the plain-text ephemeral fallback) escapes it exactly once.
+func TestChatActionMaintenanceNoticeEscapesReason(t *testing.T) {
+	user := store.User{ID: uuid.New()}
+	const hostile = "drain <!channel> <https://x.example|y>"
+	notice := "uzi is in maintenance mode: new work is queued and starts when maintenance ends. Reason: " + hostile
+	check := func(t *testing.T, label, got string) {
+		t.Helper()
+		if !strings.Contains(got, "&lt;") || strings.Contains(got, "<!channel>") || strings.Contains(got, "<https://x.example|y>") {
+			t.Errorf("%s not escaped: %q", label, got)
+		}
+		if strings.Contains(got, "&amp;lt;") {
+			t.Errorf("%s double escaped: %q", label, got)
+		}
+	}
+
+	t.Run("continue blocks", func(t *testing.T) {
+		sub := &fakeChatActionSubmitter{continuedRun: uuid.New(), maintenance: notice}
+		fp := &fakePoster{}
+		NewChatActions(&fakeChatActionStore{user: user}, sub, fp, fixedBase, nil).
+			HandleBlockAction(context.Background(), lifecyclePress(ActionChatContinue, uuid.New()))
+		if len(fp.blocks) != 1 {
+			t.Fatalf("blocks = %+v", fp.blocks)
+		}
+		check(t, "status block", fp.blocks[0].sectionText)
+	})
+	t.Run("continue ephemeral fallback", func(t *testing.T) {
+		sub := &fakeChatActionSubmitter{continuedRun: uuid.New(), maintenance: notice}
+		fp := &fakePoster{postErr: errors.New("slack down")}
+		NewChatActions(&fakeChatActionStore{user: user}, sub, fp, fixedBase, nil).
+			HandleBlockAction(context.Background(), lifecyclePress(ActionChatContinue, uuid.New()))
+		if len(fp.ephemerals) != 1 {
+			t.Fatalf("ephemerals = %+v", fp.ephemerals)
+		}
+		check(t, "ephemeral", fp.ephemerals[0].text)
+	})
+	t.Run("start run card", func(t *testing.T) {
+		sub := &fakeChatActionSubmitter{startedRun: uuid.New(), maintenance: notice}
+		fp := &fakePoster{}
+		NewChatActions(&fakeChatActionStore{user: user}, sub, fp, fixedBase, nil).
+			HandleBlockAction(context.Background(), runCardPress(ActionChatRunStart, "grp/repo", 42))
+		if len(fp.updateBlocks) != 1 {
+			t.Fatalf("updateBlocks = %+v", fp.updateBlocks)
+		}
+		check(t, "card", fp.updateBlocks[0].sectionText)
+	})
+}
+
 // PRD #3454: the resumed chat's status message and a Start-run card both carry the maintenance
 // notice while the pause is active.
 func TestChatActionMaintenanceNotice(t *testing.T) {
 	user := store.User{ID: uuid.New()}
-	const notice = "uzi is in maintenance mode: this run is queued and will start when maintenance ends."
+	const notice = "uzi is in maintenance mode: new work is queued and starts when maintenance ends."
 
 	t.Run("continue", func(t *testing.T) {
 		sub := &fakeChatActionSubmitter{continuedRun: uuid.New(), maintenance: notice}

@@ -313,7 +313,8 @@ func (c *ChatActions) continueChat(ctx context.Context, a BlockAction, userID, r
 			c.logf("post continued status", perr)
 			msg := "Continued — find the new conversation in uzi."
 			if notice != "" {
-				msg += " " + notice
+				// Ephemerals are plain mrkdwn text (the status blocks escape on their own).
+				msg += " " + EscapeMrkdwn(notice)
 			}
 			c.ephemeral(ctx, a, msg)
 			return

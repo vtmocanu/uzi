@@ -241,19 +241,19 @@ func (f *FakeClient) SetRunMrRework(_ context.Context, id string, enabled *bool)
 // a 409/404/400 still proves the write was reached with the right args; RunReworkErr wins
 // over the blanket Err. With no explicit error set, an id absent from the run map is a
 // 404 (ExitNotFound), matching GetRun/RunInputs' 404 shape.
-func (f *FakeClient) RunRework(_ context.Context, runID, guidance string) (apitypes.RunDTO, error) {
+func (f *FakeClient) RunRework(_ context.Context, runID, guidance string) (CreatedRunResult, error) {
 	f.LastReworkRunID = runID
 	f.LastReworkGuidance = guidance
 	if f.RunReworkErr != nil {
-		return apitypes.RunDTO{}, f.RunReworkErr
+		return CreatedRunResult{}, f.RunReworkErr
 	}
 	if f.Err != nil {
-		return apitypes.RunDTO{}, f.Err
+		return CreatedRunResult{}, f.Err
 	}
 	if _, ok := f.RunByID[runID]; !ok {
-		return apitypes.RunDTO{}, Exitf(ExitNotFound, "run %s not found", runID)
+		return CreatedRunResult{}, Exitf(ExitNotFound, "run %s not found", runID)
 	}
-	return f.ReworkRun, nil
+	return CreatedRunResult{RunDTO: f.ReworkRun, Notice: f.CreatedNotice}, nil
 }
 
 // ContinueCompletionDecision records the run id and guidance it was called with and returns the

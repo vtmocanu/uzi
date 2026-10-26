@@ -1327,7 +1327,7 @@ func TestRunReworkWire(t *testing.T) {
 				_, _ = io.ReadFull(r.Body, b)
 				body = string(b)
 				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"run":{"id":"r2","kind":"mr_rework","status":"queued"}}`))
+				_, _ = w.Write([]byte(`{"run":{"id":"r2","kind":"mr_rework","status":"queued"},"notice":"held by maintenance"}`))
 			}))
 			defer srv.Close()
 
@@ -1340,6 +1340,9 @@ func TestRunReworkWire(t *testing.T) {
 			}
 			if !strings.Contains(body, tc.wantJSON) {
 				t.Errorf("body = %s, want it to contain %s", body, tc.wantJSON)
+			}
+			if run.Notice != "held by maintenance" {
+				t.Errorf("notice = %q, want it decoded from the envelope", run.Notice)
 			}
 			if run.ID != "r2" || run.Kind != "mr_rework" {
 				t.Errorf("decoded run = %+v, want the r2 mr_rework run from the envelope", run)
