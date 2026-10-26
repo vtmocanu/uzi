@@ -820,7 +820,7 @@ test("busy boot pass cannot drop a source pass; shutdown aborts and joins delaye
   let dropped = 0;
   let savedPass: SavedPass | undefined;
   const state = (record: RecoveryRecord) => ({
-    id: record.captureId, state: record.state, reason: record.reason,
+    id: record.captureId, state: record.state, recordReason: record.reason,
     finalAcknowledged: record.finalAcknowledged, completionReceipt: !!record.completionReceipt,
   });
   // Only the two fixture identities are retained; no diagnostic journal rereads.
@@ -879,7 +879,8 @@ test("busy boot pass cannot drop a source pass; shutdown aborts and joins delaye
     t.mock.method(seams, name, (record: RecoveryRecord) => {
       const result = check(record);
       if (seams.savedEvidenceOnly.getStore()) emit(name, { ...state(record), result,
-        ...(!result ? { reason: name === "finalRetryReady" ? "final_retry_backoff" : "current_record_ineligible" } : {}) });
+        ...(!result && stages.getStore()?.stage !== "discovery"
+          ? { reason: name === "finalRetryReady" ? "final_retry_backoff" : "current_record_ineligible" } : {}) });
       return result;
     });
   }
@@ -926,19 +927,47 @@ test("busy boot pass cannot drop a source pass; shutdown aborts and joins delaye
     const log = seams.log[level].bind(seams.log);
     t.mock.method(seams.log, level, (...args: Parameters<typeof log>) => {
       if (seams.savedEvidenceOnly.getStore()) emit(level, { message: args[0], fields: args[1],
-        ...(args[0] === "recovery: terminal saved evidence discovery incomplete"
-          ? { reason: "discovery_incomplete" } :
-          typeof args[1]?.reason === "string" ? { reason: args[1].reason } : {}),
+        ...(level === "warn" && args[0] === "recovery: terminal saved evidence discovery incomplete"
+          ? { reason: "discovery_incomplete" } : {}),
       });
       return log(args[0], args[1]);
     });
   }
   const diagnostic = () => {
-    const reasons = trace.flatMap(event => typeof event.reason === "string" ? [event.reason] : []);
+    const discovery = trace.find(event => event.stage === "discovery" && event.event === "settled");
+    const secondOmitted = Array.isArray(discovery?.ids) && !discovery.ids.includes(secondId);
+    const recordExits = trace.filter(event => event.id === secondId && (
+      (event.event === "finalRetryReady" && event.reason === "final_retry_backoff") ||
+      (event.event === "savedSourceCandidate" && event.stage !== "discovery" &&
+        event.reason === "current_record_ineligible") ||
+      (event.event === "settled" && event.stage === "readRecord" &&
+        event.reason === "current_record_absent_or_unreadable") ||
+      (event.event === "throw" && event.stage === "cancellation_attempt" &&
+        event.reason === "cancellation_attempt_retained") ||
+      (event.event === "executing_check" && event.reason === "executing")
+    ));
+    const passExits = trace.filter(event => (
+      ((event.event === "settled" && event.stage === "replay") || event.event === "metadata_throw") &&
+      ["aborted", "saved_metadata_exhausted", "quarantined"].includes(String(event.reason))
+    ) || (event.event === "executing_check" && event.id === undefined && event.reason === "executing"));
+    const discoveryExit = secondOmitted
+      ? trace.find(event => event.stage === "discovery" && event.event === "warn" &&
+        event.reason === "discovery_incomplete") : undefined;
+    const exits = [...recordExits, ...passExits, ...(discoveryExit ? [discoveryExit] : [])];
+    const selected = exits[0];
+    const evidence = (event: Record<string, unknown>) => ({
+      recordId: event.id ?? null, stage: event.stage, event: event.event,
+    });
     return "busy admission must not drop the registered source pass; " + JSON.stringify({
-      run: f.context.runId, records: [ordinary, secondId],
-      observedReasons: reasons, exit: "unresolved unless an explicit event identifies the exit",
-      unresolved: "events describe observations; an unobserved exit cannot be identified from absence alone",
+      run: f.context.runId, records: [ordinary, secondId], targetRecord: secondId,
+      observedReasons: exits.map(event => event.reason), exit: selected?.reason ?? "unresolved",
+      ...(selected ? { evidence: evidence(selected) } : {
+        unresolved: secondOmitted
+          ? "second record omitted from discovery snapshot without a discovery warning; filtering does not identify a cycle exit"
+          : "no explicit second-record exit or pass-wide stop observed; absence alone cannot identify an exit",
+      }),
+      ...(secondOmitted ? { observation: "candidate_not_discovered",
+        discoveryEvidence: evidence(discovery!) } : {}),
       trace, dropped,
     });
   };
