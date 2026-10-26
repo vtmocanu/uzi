@@ -77,17 +77,21 @@ async function fixture(t: test.TestContext, decodedLimit?: number) {
 }
 
 test("ported private: private verification fixture clears inherited setgid before creating descendants", { skip: LINUX_ONLY }, async t => {
-  const f = await maintenanceDeltaFixture(t);
-  assert.equal((await fs.stat(f.dir)).mode & 0o2000, 0);
-  const parent = path.join(f.dir, "setgid");
-  await fs.mkdir(parent); await fs.chmod(parent, 0o2775);
+  // Redirect the fixture's tmp root (os.tmpdir() reads TMPDIR per call) to a real setgid parent.
+  const parent = await fs.mkdtemp(path.join(os.tmpdir(), "private-verification-setgid-"));
+  const oldTmp = process.env.TMPDIR;
+  t.after(async () => {
+    if (oldTmp === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = oldTmp;
+    await fs.rm(parent, { recursive: true, force: true });
+  });
+  await fs.chmod(parent, 0o2775);
   assert.equal((await fs.stat(parent)).mode & 0o2000, 0o2000);
-  const child = await fs.mkdtemp(path.join(parent, "private-"));
-  await fs.chmod(child, 0o700);
-  await fs.mkdir(path.join(child, "descendant"));
-  assert.equal((await fs.stat(child)).mode & 0o2000, 0);
-  assert.equal((await fs.stat(path.join(child, "descendant"))).mode & 0o2000, 0);
-  assert.equal(path.dirname(f.dir), os.tmpdir());
+  process.env.TMPDIR = parent;
+  const f = await maintenanceDeltaFixture(t);
+  assert.equal(path.dirname(f.dir), parent, "the fixture directory is created under the setgid parent");
+  assert.equal((await fs.stat(f.dir)).mode & 0o2000, 0, "fixture root must clear inherited setgid");
+  assert.equal((await fs.stat(f.bare)).mode & 0o2000, 0, "fixture descendants must not inherit setgid");
+  assert.equal((await fs.stat(f.clone)).mode & 0o2000, 0, "fixture descendants must not inherit setgid");
 });
 
 test("ported private: private maintenance refuses genuine capture with valid resources before snapshot effects", { skip: LINUX_ONLY }, async t => {
