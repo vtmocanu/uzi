@@ -198,6 +198,13 @@ func resetUsers(t *testing.T, pool *pgxpool.Pool) {
 	if _, err := pool.Exec(context.Background(), "TRUNCATE users CASCADE"); err != nil {
 		t.Fatalf("reset users: %v", err)
 	}
+	// The CASCADE also empties instance_intake_pause (its by_user_id references users),
+	// and a missing row reads as PAUSED (PRD #3454), which would hold every later claim
+	// in this database. Re-seed the singleton in its migration default (not paused).
+	if _, err := pool.Exec(context.Background(),
+		"INSERT INTO instance_intake_pause (id) VALUES (true) ON CONFLICT (id) DO NOTHING"); err != nil {
+		t.Fatalf("re-seed intake pause: %v", err)
+	}
 }
 
 func oidcTxt(s string) pgtype.Text { return pgtype.Text{String: s, Valid: true} }
