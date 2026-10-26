@@ -247,7 +247,8 @@ func TestCodeCrossCheckCoverageSurrogateEscapes(t *testing.T) {
 		return bytes.Replace(coverageJSON(t, coverageFixture()), []byte(`"entries":[`),
 			[]byte(`"entries":[{"path":"`+escapedPath+`","status":"examined","reason":"checked","recorded_read":true},`), 1)
 	}
-	for _, escaped := range []string{`auth\ud800.go`, `auth\udc00.go`, `auth\udc00\ud800.go`, `auth\ud800A.go`, `auth\ud800`, `\\\ud800.go`} {
+	esc := func(s string) string { return string(rune(92)) + s }
+	for _, escaped := range []string{`auth\ud800.go`, `auth\udc00.go`, `auth\udc00\ud800.go`, "auth" + esc("ud800") + esc("u0041") + ".go", `auth\ud800A.go`, `auth\ud800`, `\\\ud800.go`} {
 		t.Run(escaped, func(t *testing.T) {
 			got := decodeCoverage(t, NormalizeCodeCrossCheckCoverage("completed", sibling(escaped)))
 			if len(got.Entries) != 1 || got.Entries[0] != coverageFixture().Entries[0] || got.OmittedPaths != 1 || !got.InventoryIncomplete || got.OmittedCountExact {
@@ -258,7 +259,10 @@ func TestCodeCrossCheckCoverageSurrogateEscapes(t *testing.T) {
 			}
 		})
 	}
-	for escaped, want := range map[string]string{`🚀.go`: "\U0001f680.go", `�.go`: "�.go", "�2.go": "�2.go", `\\ud800.go`: `\ud800.go`} {
+	for escaped, want := range map[string]string{
+		esc("ud83d") + esc("ude80") + ".go": "\U0001f680.go", esc("uD83D") + esc("uDE80") + ".go": "\U0001f680.go", "\U0001f680x.go": "\U0001f680x.go",
+		esc("ufffd") + ".go": "\ufffd.go", "\ufffd2.go": "\ufffd2.go", esc("") + esc("ud800") + ".go": "\\ud800.go",
+	} {
 		t.Run(escaped, func(t *testing.T) {
 			got := decodeCoverage(t, NormalizeCodeCrossCheckCoverage("completed", sibling(escaped)))
 			if len(got.Entries) != 2 || got.Entries[0].Path != want || got.OmittedPaths != 0 || len(got.Reasons) != 0 {
