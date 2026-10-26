@@ -153,13 +153,14 @@ type CodexReading struct {
 }
 
 // EvaluateCodex evaluates a Codex account against the user's threshold. The 7-day windows are
-// the primary or secondary windows whose reported duration is exactly WeeklyWindowSeconds and
-// that report a finite used percent, never chosen by position. Buckets carry no model field, so
+// the primary or secondary windows whose reported duration is exactly WeeklyWindowSeconds,
+// never chosen by position. A weekly window whose used percent is missing, non-finite or
+// negative makes the whole reading Unknown (fail closed); over 100 is clamped to 100. Buckets carry no model field, so
 // the PRD's fallback applies: the highest used percent across every bucket's weekly windows
 // decides, and its reset is that window's. No weekly window is Unknown.
 //
 // Rounding: the verdict is Held iff used >= threshold on the unrounded percent (so 69.9 does
-// not hold a 70 threshold); the reported Pct is the used percent rounded to the nearest int.
+// not hold a 70 threshold); the reported Pct is the used percent rounded down.
 func EvaluateCodex(threshold *int16, r CodexReading, interval time.Duration, now time.Time) Verdict {
 	if threshold == nil {
 		return Verdict{State: OK}

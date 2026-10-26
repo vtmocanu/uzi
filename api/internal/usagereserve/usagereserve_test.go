@@ -132,6 +132,10 @@ func TestEvaluateCodex(t *testing.T) {
 		{"over 100 clamped and held beside a low sibling", codexAt(
 			apitypes.CodexRateLimitBucketDTO{ID: "codex", Secondary: win(100.5, week, future)},
 			apitypes.CodexRateLimitBucketDTO{ID: "codex_other", Primary: win(20, week, future)}), Held, 100},
+		{"negative weekly percent beside a low sibling unknown", codexAt(
+			apitypes.CodexRateLimitBucketDTO{ID: "codex", Secondary: win(-1, week, future)},
+			apitypes.CodexRateLimitBucketDTO{ID: "codex_other", Primary: win(20, week, future)}), Unknown, 0},
+		{"150.5 clamped to 100", codexAt(apitypes.CodexRateLimitBucketDTO{ID: "codex", Secondary: win(150.5, week, future)}), Held, 100},
 		{"weekly window without percent beside a low sibling unknown", codexAt(
 			apitypes.CodexRateLimitBucketDTO{ID: "codex", Secondary: &apitypes.CodexRateLimitWindowDTO{LimitWindowSeconds: i64(week), ResetAt: i64(future)}},
 			apitypes.CodexRateLimitBucketDTO{ID: "codex_other", Primary: win(20, week, future)}), Unknown, 0},
