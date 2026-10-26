@@ -32,13 +32,14 @@ case "$*" in
       '{status:"running",hold_reason:(if $hr=="" then null else $hr end),recovery_wait_cause:(if $c=="" then null else $c end),disk_park_count:(if $dp=="" then null else ($dp|tonumber) end),health:$h,health_reason:(if $h=="stalled" then "no progress 20m" else null end),health_since:(if $h=="ok" then null else ($since|if .=="" then null else . end) end),worker_id:(if $w=="" then null else $w end)}'
     mv "$WORK/poll.next" "$WORK/poll" ;;
   "worker list --json") cat "$WORK/workers" ;;
+  "run logs "*" --json") [ -f "$WORK/logs" ] || exit 1; cat "$WORK/logs" ;;
   *) echo "unexpected uzi call: $*" >&2; exit 1 ;;
 esac
 STUB
 chmod +x "$WORK/bin/uzi"
 
 # scenario NAME STATUSES HEALTHS WORKER_ID WORKERS_JSON
-reset() { rm -f "$WORK/since" "$WORK/cause" "$WORK/hold"; : > "$WORK/parks"; printf '%s\n' "$1" > "$WORK/status"; printf '%s\n' "$2" > "$WORK/health"; printf '%s' "$3" > "$WORK/worker_id"; printf '%s\n' "$4" > "$WORK/workers"; rm -f "$WORK/poll" "$WORK/poll.next"; echo 0 > "$WORK/poll"; }
+reset() { rm -f "$WORK/since" "$WORK/cause" "$WORK/hold" "$WORK/logs"; : > "$WORK/parks"; printf '%s\n' "$1" > "$WORK/status"; printf '%s\n' "$2" > "$WORK/health"; printf '%s' "$3" > "$WORK/worker_id"; printf '%s\n' "$4" > "$WORK/workers"; rm -f "$WORK/poll" "$WORK/poll.next"; echo 0 > "$WORK/poll"; }
 run() { PATH="$WORK/bin:$PATH" bash "$SCRIPT" rid completed,failed,cancelled 0 "${1:-6}" 2>/dev/null; }
 fresh=$(date -u +%Y-%m-%dT%H:%M:%S.123456Z)
 old=$(date -u -d '-1 hour' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-1H +%Y-%m-%dT%H:%M:%SZ)
@@ -203,5 +204,23 @@ echo data_volume_full > "$WORK/cause"; printf '2\n3\n' > "$WORK/parks"
 rc=0; out=$(PATH="$WORK/bin:$PATH" WATCH_ATTENTION_ACK=data_volume_full@park2 bash "$SCRIPT" rid completed,failed,cancelled 0 6 2>/dev/null) || rc=$?
 [ "$rc" -eq 4 ] || fail "new disk park: want exit 4, got $rc: $out"
 case "$out" in *"disk_park_count=3"*) ;; *) fail "new park evidence missing: $out";; esac
+
+# 16. min-question-seq: the answered question's lingering awaiting_input keeps polling,
+#     a newer question stops, and unreadable logs stop rather than mask a park.
+qrun() { PATH="$WORK/bin:$PATH" WATCH_ATTENTION_POLLS=0 bash "$SCRIPT" rid "" 0 4 "" "$1" 2>/dev/null; }
+reset "$(printf 'awaiting_input\nrunning')" ok "" '[]'
+printf '%s\n' '{"seq":5,"kind":"question"}' '{"seq":9,"kind":"text"}' > "$WORK/logs"
+rc=0; out=$(qrun 5) || rc=$?
+[ "$rc" -eq 3 ] || fail "answered question: want exit 3, got $rc: $out"
+case "$out" in *STOP=*) fail "answered question stopped the watch: $out";; esac
+reset awaiting_input ok "" '[]'
+printf '%s\n' '{"seq":5,"kind":"question"}' '{"seq":12,"kind":"question"}' > "$WORK/logs"
+rc=0; out=$(qrun 5) || rc=$?
+[ "$rc" -eq 0 ] || fail "new question: want exit 0, got $rc: $out"
+case "$out" in *"STOP=awaiting_input (question seq=12 > 5)"*"RESULT=stop:awaiting_input") ;; *) fail "new question stop missing: $out";; esac
+reset awaiting_input ok "" '[]'
+rc=0; out=$(qrun 5) || rc=$?
+[ "$rc" -eq 0 ] || fail "unreadable logs: want exit 0, got $rc: $out"
+case "$out" in *"STOP=awaiting_input"*) ;; *) fail "unreadable logs must stop: $out";; esac
 
 echo "PASS: watch-run attention stop"
