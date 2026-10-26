@@ -411,6 +411,7 @@ var inventoryQueryFiles = []string{
 	"notifications.sql",
 	"agent_memory.sql",
 	"user_vaults.sql",
+	"vault_material.sql",
 	"settings.sql",
 	// PRD #71 M4 — the ci-autofix loop guard
 	"ci_autofix.sql",
@@ -826,6 +827,23 @@ var queryInventory = []queryPin{
 			"that flow will build on), so it is dead-but-intended rather than dead-by-accident. " +
 			"Worth a row precisely because 'unused' and 'untested' are indistinguishable from a " +
 			"coverage report, and only one of them is fine"},
+
+	// ── vault_material.sql — bounded, owner-scoped crypto conversion primitives ──
+	{"GetVaultMaterialTotals", "vault_material.sql", "TestVaultMaterialQueriesLiveDB",
+		"direct call in vault_material_livedb_test.go — exact owned row/slot and ciphertext-byte " +
+			"totals include disabled secrets and orphan canonical accounts, excluding foreign material"},
+	{"LockVaultSecretMaterialBatch", "vault_material.sql", "TestVaultMaterialBatchBytesLiveDB",
+		"direct call proves an exact 1 MiB prefix; the Queries test independently asserts the " +
+			"64-row cap, NULL initial cursor including zero UUID, keyset tail, owner scope and row locks"},
+	{"LockVaultAccountMaterialBatch", "vault_material.sql", "TestVaultMaterialBatchBytesLiveDB",
+		"direct call proves the combined live/recovery 1 MiB bound and exclusion of oversized " +
+			"pairs; the Queries test covers 64 slots, owner scope, keyset tail, locking and empty recovery"},
+	{"ResealVaultSecretMaterial", "vault_material.sql", "TestVaultMaterialQueriesLiveDB",
+		"direct calls reject foreign ownership, then change ciphertext/discriminator while a " +
+			"JSON snapshot asserts every non-crypto column is preserved"},
+	{"ResealVaultAccountMaterial", "vault_material.sql", "TestVaultMaterialQueriesLiveDB",
+		"direct calls reject foreign ownership, update both slot discriminators together, retain " +
+			"empty recovery pairing and preserve every non-crypto column including revisions/generation"},
 
 	// ── settings.sql — the write path and the plain read are pinned; the LOCK is not ──
 	{"GetVaultPolicy", "settings.sql", "TestVaultModeQueriesLiveDB",
