@@ -33,8 +33,10 @@
 #   `uzi run answer` or `uzi run decide`: the status can still read the answered
 #   `awaiting_input` for a poll or two, and a plain re-arm stops on it at once,
 #   leaving the run unwatched. When set, `awaiting_input` only stops the watch once
-#   the run has a question message with seq > min-question-seq (unreadable logs
-#   stop, never mask a park). Capture it before answering:
+#   the newest question message is no longer the answered one: only a newest
+#   question seq exactly equal to min-question-seq keeps polling (attention checks
+#   still run); a newer, missing, unreadable or lower seq stops, never masking a
+#   park. Capture it before answering:
 #     QSEQ=$(uzi run logs <id> --json | jq -rs '[.[]|select(.kind=="question")|.seq]|max // 0')
 #
 # Attention stop (read-only; never changes run state). A dead run can read `running`
@@ -93,11 +95,11 @@ max_plan_seq() {
     | jq -rs '[.[] | select(.kind=="plan") | .seq] | max // 0'
 }
 
-# Prints the newest question seq, or nothing when the logs are unreadable.
+# Prints the newest question seq, or nothing when the logs are unreadable or hold none.
 max_question_seq() {
   local logs
   logs="$(uzi run logs "$RID" --json 2>/dev/null)" || return 0
-  printf '%s' "$logs" | jq -rs '[.[] | select(.kind=="question") | .seq] | max // 0' 2>/dev/null || true
+  printf '%s' "$logs" | jq -rs '[.[] | select(.kind=="question") | .seq | numbers] | max // empty' 2>/dev/null || true
 }
 
 # attention_check returns 0 (and sets ATTN_EVIDENCE) when this poll shows attention, 1 when
@@ -190,26 +192,24 @@ while [ "$i" -lt "$MAX" ]; do
         printf 'RESULT=stop:%s\n' "$s"
         exit 0
       fi
-      # An answered question can still read awaiting_input briefly: only a newer one stops.
+      # An answered question can still read awaiting_input briefly: keep polling (with the
+      # attention checks below) only while the newest question is positively the answered one.
+      answered=0
       if [ "$s" = "awaiting_input" ] && [ -n "$MIN_QUESTION_SEQ" ]; then
         cur="$(max_question_seq)"
-        case "$cur" in
-          ''|*[!0-9]*) ;;
-          *)
-            if [ "$cur" -le "$MIN_QUESTION_SEQ" ]; then
-              i=$((i + 1))
-              sleep "$INT"
-              continue
-            fi
-            printf 'STOP=%s (question seq=%s > %s)\n' "$s" "$cur" "$MIN_QUESTION_SEQ"
-            printf 'RESULT=stop:%s\n' "$s"
-            exit 0
-            ;;
-        esac
+        if [ "$cur" = "$MIN_QUESTION_SEQ" ]; then
+          answered=1
+        else
+          printf 'STOP=%s (newest question seq=%s, answered=%s)\n' "$s" "${cur:-none}" "$MIN_QUESTION_SEQ"
+          printf 'RESULT=stop:%s\n' "$s"
+          exit 0
+        fi
       fi
-      printf 'STOP=%s\n' "$s"
-      printf 'RESULT=stop:%s\n' "$s"
-      exit 0
+      if [ "$answered" -eq 0 ]; then
+        printf 'STOP=%s\n' "$s"
+        printf 'RESULT=stop:%s\n' "$s"
+        exit 0
+      fi
       ;;
   esac
   case "$s" in

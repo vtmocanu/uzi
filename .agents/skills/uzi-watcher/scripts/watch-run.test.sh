@@ -205,22 +205,33 @@ rc=0; out=$(PATH="$WORK/bin:$PATH" WATCH_ATTENTION_ACK=data_volume_full@park2 ba
 [ "$rc" -eq 4 ] || fail "new disk park: want exit 4, got $rc: $out"
 case "$out" in *"disk_park_count=3"*) ;; *) fail "new park evidence missing: $out";; esac
 
-# 16. min-question-seq: the answered question's lingering awaiting_input keeps polling,
-#     a newer question stops, and unreadable logs stop rather than mask a park.
-qrun() { PATH="$WORK/bin:$PATH" WATCH_ATTENTION_POLLS=0 bash "$SCRIPT" rid "" 0 4 "" "$1" 2>/dev/null; }
+# 16. min-question-seq: only a newest question positively equal to the answered seq keeps
+#     polling; a newer, missing, unreadable or lower seq stops; attention checks still run.
+qrun() { PATH="$WORK/bin:$PATH" WATCH_ATTENTION_POLLS="${QPOLLS:-0}" bash "$SCRIPT" rid "" 0 4 "" "$1" 2>/dev/null; }
+qstop() { # qstop DESC LOGS-or-"-" -> must stop at awaiting_input with exit 0
+  reset awaiting_input ok "" '[]'
+  [ "$2" = - ] || printf '%s' "$2" > "$WORK/logs"
+  rc=0; out=$(qrun 5) || rc=$?
+  [ "$rc" -eq 0 ] || fail "$1: want exit 0, got $rc: $out"
+  case "$out" in *"STOP=awaiting_input"*"RESULT=stop:awaiting_input") ;; *) fail "$1: stop missing: $out";; esac
+}
 reset "$(printf 'awaiting_input\nrunning')" ok "" '[]'
 printf '%s\n' '{"seq":5,"kind":"question"}' '{"seq":9,"kind":"text"}' > "$WORK/logs"
 rc=0; out=$(qrun 5) || rc=$?
 [ "$rc" -eq 3 ] || fail "answered question: want exit 3, got $rc: $out"
 case "$out" in *STOP=*) fail "answered question stopped the watch: $out";; esac
-reset awaiting_input ok "" '[]'
-printf '%s\n' '{"seq":5,"kind":"question"}' '{"seq":12,"kind":"question"}' > "$WORK/logs"
-rc=0; out=$(qrun 5) || rc=$?
-[ "$rc" -eq 0 ] || fail "new question: want exit 0, got $rc: $out"
-case "$out" in *"STOP=awaiting_input (question seq=12 > 5)"*"RESULT=stop:awaiting_input") ;; *) fail "new question stop missing: $out";; esac
-reset awaiting_input ok "" '[]'
-rc=0; out=$(qrun 5) || rc=$?
-[ "$rc" -eq 0 ] || fail "unreadable logs: want exit 0, got $rc: $out"
-case "$out" in *"STOP=awaiting_input"*) ;; *) fail "unreadable logs must stop: $out";; esac
+qstop "newer question" "$(printf '%s\n' '{"seq":5,"kind":"question"}' '{"seq":12,"kind":"question"}')"
+case "$out" in *"newest question seq=12, answered=5"*) ;; *) fail "newer question evidence missing: $out";; esac
+qstop "unreadable logs" -
+qstop "empty logs" ""
+qstop "text-only logs" '{"seq":9,"kind":"text"}'
+qstop "question without seq" '{"kind":"question"}'
+qstop "regressed question seq" '{"seq":3,"kind":"question"}'
+reset awaiting_input stalled "" '[]'
+printf '%s\n' '{"seq":5,"kind":"question"}' > "$WORK/logs"
+rc=0; out=$(QPOLLS=3 qrun 5) || rc=$?
+[ "$rc" -eq 4 ] || fail "answered question + stalled health: want exit 4, got $rc: $out"
+case "$out" in *STOP=needs_attention*) ;; *) fail "attention skipped on answered question: $out";; esac
+case "$out" in *"REARM="*" '' 5"*) ;; *) fail "REARM lost min-question-seq: $out";; esac
 
 echo "PASS: watch-run attention stop"
