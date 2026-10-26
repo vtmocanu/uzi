@@ -117,6 +117,7 @@ func TestValidateSecretMountPath(t *testing.T) {
 	invalid := []string{
 		"/", "run/uzi", "/run", "/run/", "/run/uzi-secrets/", "/run/a/b", "/run/../etc",
 		"/run/Uzi", "/data/secrets", "/tmp/secrets", "/etc/uzi", "/run/secrets/uzi",
+		"/run/uzi",    // ancestor of the pod-epoch projection
 		dindSocketDir, // /run/dind: shape-valid, but the dind socket volume lives there
 	}
 	for _, p := range invalid {

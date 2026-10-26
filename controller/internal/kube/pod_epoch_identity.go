@@ -40,7 +40,7 @@ func (r PodEpochKubeResolver) ResolvePodEpoch(ctx context.Context, w PodEpochWor
 	var budget podEpochReadBudget
 	var result PodEpochIdentity
 	fail := errors.New("pod epoch live identity mismatch")
-	if !podEpochRuntime(w.Runtime) || p.Spec.RuntimeClassName != nil || p.Labels[LabelWorkerID] != w.ID || !podEpochDeclaredRuntime(p.Spec, w.Runtime) {
+	if !podEpochRuntime(w.Runtime) || p.Spec.RuntimeClassName != nil || p.Labels[LabelWorkerID] != w.ID {
 		return result, fail
 	}
 	if successor {
