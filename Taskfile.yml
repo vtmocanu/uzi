@@ -2116,14 +2116,40 @@ tasks:
       # measured independently on this tree and gave IDENTICAL counts (1 for api,
       # 0 for controller), which is worth more than a figure from one version.
       #
-      # COST, measured 2026-08-02 on go1.26.5 darwin/arm64: 2.7-3.2s warm, ~25s
-      # on a cold GOCACHE (x/tools' own dependency tree). deadcode has NO result
+      # COST, a HISTORICAL figure measured 2026-08-02 on go1.26.5 darwin/arm64:
+      # 2.7-3.2s warm, ~25s on a cold GOCACHE (x/tools' own dependency tree). A
+      # 2026-10-26 worker sample (table below) took ~278 s, so do not read this
+      # figure as current. deadcode has NO result
       # cache of its own - checked for one, and cold and warm runs were
       # byte-identical - so carry-forward item 4's poisoned-cache hazard, where
       # golangci-lint replays a sibling worktree's absolute paths, has no analogue
       # here. Neither does its host-global LOCK: three concurrent runs, no
       # contention.
-      - ./scripts/deadcode-gate.sh api golang.org/x/tools/cmd/deadcode@v0.48.0
+      #
+      # GOMEMLIMIT=12GiB (issue #3433). GitHub-hosted lint-api runners were
+      # killed during this step. Comment [3] on the issue measured the runner at
+      # 16.76 GB total and 14.78 GB available at step start, with a 15.64 GB peak
+      # RSS: 0.86 GB above the available memory and 1.1 GB below the total.
+      #
+      # SINGLE worker samples, measured 2026-10-26 (Linux amd64, 4 CPUs,
+      # go1.27.3; peak = max individual-process RSS across descendants):
+      #
+      #   setting            peak RSS   elapsed
+      #   none               17.20 GB   278 s
+      #   GOGC=50            16.61 GB   251 s
+      #   GOMEMLIMIT=12GiB   14.94 GB   314 s
+      #   GOMEMLIMIT=8GiB    15.04 GB   363 s
+      #   GOMEMLIMIT=2GiB    14.53 GB   452 s
+      #
+      # On that worker 12GiB gave most of the observed reduction for the
+      # smallest observed time increase. Runner results are unmeasured until CI.
+      #
+      # The value is fixed on purpose: `env GOMEMLIMIT=...` overrides an inherited
+      # GOMEMLIMIT, so local and CI runs are identical. A malformed value (e.g.
+      # `12GB`) makes `go` itself die with `malformed GOMEMLIMIT`, exit 2, which
+      # the gate reports as a load error. The hand-run `--write` command in
+      # api/.deadcode-baseline's header does not carry the limit.
+      - env GOMEMLIMIT=12GiB ./scripts/deadcode-gate.sh api golang.org/x/tools/cmd/deadcode@v0.48.0
 
   deadcode:api:all:
     desc: api - unreachable funcs WITHOUT -test; reported, never gating, ALWAYS EXITS 0
@@ -2372,6 +2398,9 @@ tasks:
       # invocation when M4 landed, so nothing was deleted to reach zero here; the
       # target exists to keep it there. An empty backlog is not the same thing as
       # a no-op (fmt-check:controller shipped under the same argument).
+      #
+      # The GOMEMLIMIT in deadcode:api is api-only, per #3433's scope ("for that
+      # one command"), so this target keeps its inherited environment.
       - ./scripts/deadcode-gate.sh controller golang.org/x/tools/cmd/deadcode@v0.48.0
 
   deadcode:controller:all:
