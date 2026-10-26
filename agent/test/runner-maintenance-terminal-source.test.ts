@@ -49,7 +49,7 @@ it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, { skip: mode.startsWit
   const acceptedOutput = mode === "origin-admission" || mode === "origin-already-present";
   const expectedRPC = mode === "origin-already-present" ? 8 : layoutRefused ? 14 :
     ["origin-transfer-final-family", "origin-transfer-head", "origin-transfer-import-refused", "origin-transfer-post-import-range"].includes(mode) ? 16 : 18;
-  let importPhase = false, importDispatched = false, ownerJoined = false, outputPairObserved = false, outputIndexCalls = 0;
+  let importPhase = false, importDispatched = false, ownerJoined = false, outputPairObserved = false, outputIndexCalls = 0, indexesBeforeJoin = 0;
   let captureRPC = -1;
   const semanticTrace: string[] = [];
   const transferResults: string[] = [];
@@ -343,6 +343,8 @@ it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, { skip: mode.startsWit
     const indexOutput = RecoveryMaintenance.prototype.beforeMutation;
     t.mock.method(RecoveryMaintenance.prototype, "beforeMutation", async function (this: RecoveryMaintenance,
       ...args: Parameters<typeof indexOutput>) {
+      // Unconditional: any ledger index once the transfer owner has been entered must follow its join.
+      if (transferEntered && !ownerJoined) indexesBeforeJoin++;
       if (transferSettled) {
         outputIndexCalls++;
         assert.equal(ownerJoined, true);
@@ -525,6 +527,7 @@ it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, { skip: mode.startsWit
       assert.equal(ownerJoined, true, "even refused import joins its real owner before return");
       assert.equal(importDispatched, mode !== "origin-already-present" && !importRefused && !layoutRefused);
       assert.equal(outputIndexCalls, acceptedOutput ? 1 : 0);
+      assert.equal(indexesBeforeJoin, 0, "no ledger index is written before the transfer owner joins");
       if (layoutRefused) assert.deepEqual(log.lines.filter(line => (line as { msg?: string }).msg === "recovery: terminal origin refused")
         .map(line => (line as { reason?: string }).reason), ["maintenance_source_layout_unsupported"],
         "fixed shallow/layout diagnostic survives the real transfer-owner collapse");

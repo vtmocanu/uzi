@@ -142,6 +142,26 @@ test("delta cache: canonical verified hit cannot authenticate newly staged same-
   assert.equal(cache!.entries, entriesBefore, "failed staged batch publishes no entries");
 });
 
+test("delta proof range: the proof-phase selected range failing refuses before any canonical import", linux, async t => {
+  const f = await maintenanceDeltaFixture(t);
+  const spawn = f.cache["spawnGit"].bind(f.cache);
+  let forced = false;
+  t.mock.method(f.cache as any, "spawnGit", async (...args: Parameters<typeof spawn>) => {
+    const child = await spawn(...args);
+    if (f.cache.phase === "proof" && args[1].includes("rev-list") && args[1].includes("--missing=error")) {
+      for await (const _ of child.stdout) { /* Drain and join the real proof range before fault injection. */ }
+      assert.equal(await child.exited, 0);
+      forced = true;
+      return { ...child, stdout: Readable.from([]) };
+    }
+    return child;
+  });
+  await rejected(f);
+  assert.equal(forced, true, "the staged-plus-alternate proof range ran and was failed");
+  assert.equal(f.requests.some(r => gitVerb(r) === "index-pack" && canonicalImport(r)), false);
+  await assert.rejects(f.native(f.bare, ["cat-file", "-e", f.tip]), "no selected object reached the canonical store");
+});
+
 test("delta cache: repeated proof of unchanged staged bytes shares only settled operation entries", linux, async t => {
   const probe = await maintenanceDeltaFixture(t), size = (await selected(probe)).size;
   const f = await maintenanceDeltaFixture(t, { decodedLimit: size });
