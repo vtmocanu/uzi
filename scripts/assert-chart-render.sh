@@ -1044,6 +1044,52 @@ awk '
 ' "$CHART_DIR/Chart.yaml" > "$STRIPPED/Chart.yaml"
 
 
+# Pod-epoch runtime: exact enum even with Docker disabled. Each render is one
+# attempt; failure stops the matrix. Docker alone gains pod watch/patch.
+for epoch_runtime in '' containerd-runc crio-crun; do
+  helm template uzi "$STRIPPED" --set workers.enabled=true --set api.tls.enabled=true \
+    --set-string "workers.docker.podEpochReclaim.runtime=$epoch_runtime" > "$WORK/epoch.yaml"
+  awk -v expected="\"$epoch_runtime\"" '
+    /- name: UZI_WORKER_POD_EPOCH_RUNTIME/ { pending=1; count++; next }
+    pending && /^[[:space:]]*value:/ { if ($2 != expected) exit 1; pending=0 }
+    END { if (count != 1 || pending) exit 1 }
+  ' "$WORK/epoch.yaml"
+done
+for epoch_runtime in invalid CONTAINERD-RUNC true 7; do
+  if helm template uzi "$STRIPPED" \
+    --set "workers.docker.podEpochReclaim.runtime=$epoch_runtime" > "$WORK/epoch-invalid.log" 2>&1; then
+    echo "FAIL: invalid pod-epoch runtime accepted: $epoch_runtime" >&2
+    exit 1
+  fi
+  grep -F 'workers.docker.podEpochReclaim.runtime must be' "$WORK/epoch-invalid.log" >/dev/null
+done
+helm template uzi "$STRIPPED" --set workers.enabled=true --set api.tls.enabled=true \
+  --set workers.docker.enabled=true --set workers.docker.networkPolicy.acknowledgeUnfenced=true \
+  --set workers.isolatedLane.enabled=true --set workers.fqdnEgress.enabled=true \
+  --set 'forge.allowedBaseURLs[0]=https://gitlab.example.com' \
+  --set 'workers.isolatedLane.clusterCIDRs.pod[0]=10.244.0.0/16' \
+  --set 'workers.isolatedLane.clusterCIDRs.service[0]=10.96.0.0/12' \
+  --set 'workers.isolatedLane.clusterCIDRs.node[0]=192.0.2.0/24' > "$WORK/epoch-rbac.yaml"
+awk '
+  /^---$/ { role=0; name=""; resource=""; next }
+  /^kind: Role$/ { role=1 }
+  role && /^  name:/ { name=$2 }
+  role && /^    resources:/ { resource=$0; next }
+  role && /^    verbs:/ {
+    if (index(resource, "\"pods\"")) {
+      want="    verbs: [\"list\"]"
+      if (name ~ /-controller-docker$/) want="    verbs: [\"list\", \"watch\", \"patch\"]"
+      if ($0 != want) { print "FAIL: pod verbs in " name ": " $0; bad=1 }
+      seen[name]=1
+    }
+    if (index(resource, "\"secrets\"") && $0 != "    verbs: [\"create\", \"delete\"]") bad=1
+    if (index(resource, "\"replicasets\"") && $0 != "    verbs: [\"list\"]") bad=1
+    if (index(resource, "\"pods/log\"") || index($0, "\"get\"")) bad=1
+  }
+  END { for (name in seen) count++; if (count != 3 || bad) exit 1 }
+' "$WORK/epoch-rbac.yaml"
+echo "OK: pod-epoch runtime enum and Docker-only pod watch/patch"
+
 # Memory guard configuration: a finite case matrix, no retries. Any failure stops
 # sibling cases. These renders use explicit synthetic values, not sizing advice.
 memory_guard_render() {

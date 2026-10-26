@@ -188,6 +188,8 @@ spec:
             - name: UZI_WORKER_GO_MAXPROCS
               value: {{ $goMaxProcs | quote }}
             {{- end }}
+            - name: UZI_WORKER_POD_EPOCH_RUNTIME
+              value: {{ .Values.workers.docker.podEpochReclaim.runtime | quote }}
             - name: UZI_WORKER_MAX_CONCURRENT_RUNS
               value: {{ .Values.workers.maxConcurrentRuns | quote }}
             # Unconditional: Helm treats 0 as empty, but it disables this lane.

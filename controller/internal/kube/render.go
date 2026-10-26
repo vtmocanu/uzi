@@ -428,6 +428,7 @@ var seedResources = corev1.ResourceRequirements{
 // Every field here is operator config — the api sends names, this side owns every
 // mapping to a concrete pod-spec value.
 type RenderConfig struct {
+	PodEpochRuntime   string
 	RollConcurrency   int
 	RollTargetVersion string
 	// Namespace is the dedicated worker namespace: it contains nothing but hosted
@@ -1297,7 +1298,13 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		},
 	}
 	if withDinD(w) {
-		env = append(env, corev1.EnvVar{Name: "UZI_EPOCH_LOCK", Value: "1"})
+		env = append(env, corev1.EnvVar{Name: "UZI_EPOCH_LOCK", Value: "1"},
+			corev1.EnvVar{Name: "UZI_POD_EPOCH_EVIDENCE_FILE", Value: "/run/uzi/pod-epoch/evidence"})
+		if cfg.PodEpochRuntime != "" {
+			env = append(env, corev1.EnvVar{Name: PodEpochRuntimeEnv, Value: cfg.PodEpochRuntime})
+		}
+		workerMounts = append(workerMounts, corev1.VolumeMount{Name: "pod-epoch", MountPath: "/run/uzi/pod-epoch", ReadOnly: true})
+		volumes = append(volumes, corev1.Volume{Name: "pod-epoch", VolumeSource: corev1.VolumeSource{DownwardAPI: &corev1.DownwardAPIVolumeSource{Items: []corev1.DownwardAPIVolumeFile{{Path: "evidence", FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.annotations['uzi.dev/pod-epoch-evidence']"}}}}}})
 		initContainers[0].Command[2] = dockerNixSeedScript()
 		initContainers[0].Env = []corev1.EnvVar{
 			{Name: "UZI_EPOCH_LOCK", Value: "1"},
