@@ -185,6 +185,7 @@ class Release:
         self.api = api or policy.GitHub('vtmocanu/uzi')
         self.clock, self.sleep = clock, sleep
         self.retries = []
+        self.evidence = {}
 
     def git(self, *args):
         return self.run('git', '-c', 'core.fsmonitor=false', *args)
@@ -237,6 +238,7 @@ class Release:
                 raise Stop('tip-not-green-by-deadline', 'defer')
             self.git('fetch', '--prune', '--tags', 'origin')
             sha = self.git('rev-parse', 'refs/remotes/origin/main')
+            self.evidence['parent'] = sha
             tags = self.git('show-ref', '--tags', '-d')
             if selected != (sha, tags):
                 self.git('checkout', '-B', 'main', sha)
@@ -257,15 +259,25 @@ class Release:
                 if not retried:
                     jobs = self.api.pages(f'repos/vtmocanu/uzi/actions/runs/{ci["id"]}/attempts/{ci["run_attempt"]}/jobs?per_page=100', 'jobs')
                     require(eligible_jobs(jobs), 'tip-ci-not-retryable')
-                    self.run('gh', 'run', 'rerun', str(ci['id']), '--failed', '--repo', 'vtmocanu/uzi')
-                    retried = True
-                    pending_retry = (*marker, self.clock() + 60)
-                    self.retries.append(dict(sha=sha, run=ci['id'], attempt=ci['run_attempt'],
-                                             result='requested', jobs=[{'id': j.get('id'), 'name': j.get('name'),
+                    entry = dict(sha=sha, run=ci['id'], attempt=ci['run_attempt'],
+                                             result='requesting', jobs=[{'id': j.get('id'), 'name': j.get('name'),
                                                 'steps': [{'name': s.get('name'), 'conclusion': s.get('conclusion')}
                                                           for s in j.get('steps', []) if s.get('conclusion') in ('failure', 'timed_out', 'cancelled')]}
-                                                for j in jobs if j.get('conclusion') != 'success']))
+                                                for j in jobs if j.get('conclusion') != 'success'])
+                    self.retries.append(entry)
+                    try:
+                        self.run('gh', 'run', 'rerun', str(ci['id']), '--failed', '--repo', 'vtmocanu/uzi')
+                    except (Stop, policy.Refusal, OSError, subprocess.TimeoutExpired):
+                        entry['result'] = 'request unconfirmed'
+                        raise
+                    entry['result'] = 'requested'
+                    retried = True
+                    pending_retry = (*marker, self.clock() + 60)
                 else:
+                    for retry in self.retries:
+                        if retry['sha'] == sha and retry['run'] == ci['id'] and ci['run_attempt'] > retry['attempt']:
+                            retry['result'] = 'failed after retry'
+                            retry['final_attempt'] = ci['run_attempt']
                     raise Stop('tip-ci-retry-failed')
             elif ci_state == 'success' and smoke_state == 'success':
                 if self.clock() > deadline:
@@ -331,6 +343,7 @@ class Release:
             require(self.plan(requested=False)['PREVIOUS_TAG'] == cfg['rc_tag'], 'candidate-not-latest')
             parent = self.git('rev-parse', '--verify', f'refs/tags/{cfg["rc_tag"]}^{{commit}}')
             require(parent == cfg['rc_sha'], 'candidate-sha-mismatch')
+            self.evidence['parent'] = parent
             require(self.publication(cfg['rc_tag']) == 'success', 'candidate-not-published')
             self.run('python3', '-I', 'scripts/release-ci-coverage.py', 'coverage', parent, '--hops', '1', '--wait', '0')
             before = self.remote()
@@ -371,6 +384,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('mode', choices=('authorize', 'prepare', 'watch-check', 'watch-log'))
     args = parser.parse_args()
+    release = None
     try:
         require(os.environ.get('GITHUB_ACTIONS') == 'true', 'ci-context-required')
         cfg = inputs(os.environ)
@@ -381,7 +395,8 @@ def main():
             result = dict(outcome='authorized', kind=cfg['kind'], created_at=created_at(os.environ))
         elif args.mode == 'prepare':
             directory = Path(os.environ['RUNNER_TEMP']) / 'release-auto'
-            result = Release(cfg).prepare(directory)
+            release = Release(cfg)
+            result = release.prepare(directory)
         else:
             result = Release(cfg).watch_admission(os.environ.get('RELEASE_TAG', ''), os.environ.get('RELEASE_SHA', ''))
         outputs(result)
@@ -389,6 +404,9 @@ def main():
         return 0
     except (Stop, policy.Refusal, ValueError, OSError, subprocess.TimeoutExpired) as error:
         result = dict(outcome=getattr(error, 'outcome', 'blocked'), reason=getattr(error, 'reason', 'instrument-error'))
+        if release is not None:
+            result.update(release.evidence)
+            result['retry_log'] = json.dumps(release.retries)
         outputs(result)
         summary(result)
         print(f'release-auto: {result["reason"]}', file=sys.stderr)

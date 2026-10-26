@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Offline release dispatch/orchestration fixtures; no live API or publication."""
 import importlib.util
+import contextlib
+import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -18,7 +21,7 @@ def context(**changes):
     env = dict(GITHUB_ACTIONS='true', GITHUB_REPOSITORY='vtmocanu/uzi', RELEASE_REF='refs/heads/main',
                RELEASE_ACTOR='maintainer', RELEASE_DISPATCHERS='other,maintainer third', RELEASE_KIND='rc',
                RELEASE_VERSION='', RELEASE_ABANDON='false', RELEASE_SUPERSEDE='', RELEASE_RC_TAG='',
-               RELEASE_RC_SHA='', GITHUB_RUN_ID='123', GITHUB_SHA=H)
+               RELEASE_RC_SHA='', GITHUB_RUN_ID='123', GITHUB_SHA=H, GITHUB_RUN_ATTEMPT='1')
     env.update(changes)
     return env
 
@@ -39,7 +42,7 @@ def run(status='completed', conclusion='success', number=10, attempt=1):
 
 
 def job(step='Set up job', conclusion='failure'):
-    return dict(name='validate-api', conclusion=conclusion, steps=[dict(name=step, conclusion=conclusion)])
+    return dict(id=20, name='validate-api', conclusion=conclusion, steps=[dict(name=step, conclusion=conclusion)])
 
 
 class Inputs(unittest.TestCase):
@@ -302,6 +305,47 @@ class Changes(unittest.TestCase):
         self.assertTrue(any(kwargs.get('raw') for _, kwargs in calls))
         with patch.object(auto.policy, 'metadata', return_value=True):
             self.assertFalse(release.changes('v0.1.0', RELEASE)[0]['shipping'])
+
+
+class FailedEvidence(unittest.TestCase):
+    def failure(self, request_error=False):
+        fixture = TipFixture([H])
+        api = Mock()
+        api.pages.return_value = [job()]
+        api.run.side_effect = lambda workflow, sha, branch: run(conclusion='failure', attempt=1 if fixture.index == 0 else 2) if workflow == 'ci.yml' else run()
+        def command(*args, **kwargs):
+            if request_error and args[:3] == ('gh', 'run', 'rerun'):
+                raise auto.Stop('command-failed')
+            return fixture.command(*args, **kwargs)
+        release = auto.Release(auto.inputs(context()), command, api, lambda: fixture.now, fixture.sleep)
+        release.prepare = lambda directory: release.tip(seconds=30, interval=1)
+        with tempfile.TemporaryDirectory() as directory:
+            output, summary = Path(directory) / 'output', Path(directory) / 'summary'
+            env = context(RUNNER_TEMP=directory, GITHUB_OUTPUT=str(output), GITHUB_STEP_SUMMARY=str(summary))
+            with patch.dict(os.environ, env, clear=True), patch.object(auto.sys, 'argv', ['release-auto.py', 'prepare']), \
+                 patch.object(auto, 'Release', return_value=release), contextlib.redirect_stderr(io.StringIO()):
+                status = auto.main()
+            data = dict(line.split('=', 1) for line in output.read_text().splitlines())
+            return status, data, summary.read_text()
+
+    def test_failed_retry_keeps_evidence_in_real_main_outputs_and_summary(self):
+        status, data, summary = self.failure()
+        self.assertEqual(status, 1)
+        retry = json.loads(data['retry_log'])[0]
+        self.assertEqual((retry['sha'], retry['run'], retry['attempt']), (H, 10, 1))
+        self.assertEqual(retry['jobs'][0]['id'], 20)
+        self.assertEqual(retry['jobs'][0]['steps'][0]['name'], 'Set up job')
+        self.assertEqual(retry['result'], 'failed after retry')
+        self.assertIn(H, summary)
+        self.assertIn('failed after retry', summary)
+
+    def test_uncertain_rerun_request_keeps_attempted_evidence(self):
+        status, data, summary = self.failure(request_error=True)
+        self.assertEqual(status, 1)
+        retry = json.loads(data['retry_log'])[0]
+        self.assertEqual(retry['result'], 'request unconfirmed')
+        self.assertEqual(retry['run'], 10)
+        self.assertIn(H, summary)
 
 
 class Recovery(unittest.TestCase):
