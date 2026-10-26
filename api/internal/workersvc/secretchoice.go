@@ -139,8 +139,9 @@ func staticChoice(secretID *uuid.UUID, bound string) secretChoice {
 
 // openAnthropic resolves AND opens the Anthropic credential for one run — the one
 // secret the run lane, the judge lane and the chat lane all deliver, and the ONE
-// place credential resolution happens. The vault-dispatch logic (dek needs unlock,
-// legacy master opens regardless, nil vault → master box) lives in secretopen,
+// place credential resolution happens. The vault-dispatch logic (dek needs unlock;
+// master formats open without a cached DEK, with master_aad binding owner and kind;
+// unknown discriminators are refused) lives in secretopen,
 // shared with the rate-limit poller (PRD #53); this method maps its sentinels back
 // to workersvc's domain errors, preserving the exact prior behavior: a lock
 // surfaces as errVaultLocked (requeue, never fail), and a missing/undecryptable

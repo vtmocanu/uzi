@@ -3,9 +3,11 @@
 // run lane and the rate-limit poller open tokens the same way). It reproduces the
 // vault dispatch exactly: a 'dek'-sealed row needs the owner's vault unlocked (a
 // lock surfaces as ErrVaultLocked — transient, retry), a legacy 'master'-sealed
-// row opens under the process master box regardless of lock state, and a nil vault
-// (tests) opens under the master box directly. Callers map these sentinels to
-// their own domain errors (workersvc) or skip semantics (the poller).
+// row opens under the process master box regardless of lock state, and a
+// 'master_aad' row authenticates its owner and kind under that box. Without a
+// vault, only the master formats can open; DEK rows remain locked and unknown
+// discriminators are refused. Callers map these sentinels to their own domain
+// errors (workersvc) or skip semantics (the poller).
 package secretopen
 
 import (

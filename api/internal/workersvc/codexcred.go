@@ -121,7 +121,7 @@ type codexLoginBlob struct {
 // path) a real secretbox with a nil vault:
 //   - q     the Codex + ciphertext queries (pre-transaction reads run through this);
 //   - vlt   the per-user vault (nil ⇒ seal under the master box, the pre-vault path);
-//   - box   the master box (the nil-vault seal/open fallback);
+//   - box   the master box (nil-vault sealing and discriminator-aware master reads);
 //   - ident the identity client (fake in tests);
 //   - beginner the transaction seam (a *pgxpool.Pool), REQUIRED: it makes the canonical
 //     install + link CAS atomic (PRD #1147 M3) so a lost link CAS rolls the canonical
