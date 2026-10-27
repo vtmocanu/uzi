@@ -314,7 +314,7 @@ func newRunRejectCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return submitInput(env, gf, c, cmd, args[0], kindRejectPlan, msg, nil, false, expected)
+			return submitInput(env, gf, c, cmd, args[0], kindRejectPlan, msg, false, expected)
 		},
 	}
 	reject.Flags().StringP("message", "m", "", "reason to send back to the agent (or pipe it on stdin)")
@@ -341,7 +341,7 @@ func newRunCancelCmd(env Env, gf *globalFlags) *cobra.Command {
 			// discarding that outcome. This non-TTY flag is the explicit, no-prompt confirmation
 			// the owner passes to discard it and cancel.
 			discard, _ := cmd.Flags().GetBool("discard-pending-outcome")
-			return submitInput(env, gf, c, cmd, args[0], kindCancel, msg, nil, discard, nil)
+			return submitInput(env, gf, c, cmd, args[0], kindCancel, msg, discard, nil)
 		},
 	}
 	cancel.Flags().StringP("message", "m", "", "reason for cancelling (optional; or pipe it on stdin)")
@@ -380,7 +380,7 @@ func newRunStopCmd(env Env, gf *globalFlags) *cobra.Command {
 			// The stop message is OPTIONAL, like a cancel reason — no empty check.
 			msg, _ := cmd.Flags().GetString("message")
 			msg = resolveMessage(env, msg)
-			return submitInput(env, gf, c, cmd, args[0], kindStop, msg, nil, false, nil)
+			return submitInput(env, gf, c, cmd, args[0], kindStop, msg, false, nil)
 		},
 	}
 	stop.Flags().StringP("message", "m", "", "an optional message to accompany the stop (or pipe it on stdin)")
