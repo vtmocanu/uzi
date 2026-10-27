@@ -155,8 +155,9 @@ func TestPolicyRevisionProjectionClaimLiveDB(t *testing.T) {
 	}
 }
 
-// A parent owns its commit; the inner call must never expose precommit evidence.
-func TestPolicyRevisionProjectionParentTransactionLiveDB(t *testing.T) {
+// The parent-owned pause_failed path returns before state projection capture.
+// This checks that early return, not the parentTx exclusion at capture.
+func TestPolicyRevisionProjectionParentEarlyReturnLiveDB(t *testing.T) {
 	e, f, run := revisionGateFixture(t)
 	enableRevisionProjection(f.svc, &f.wkr)
 	locked, _, tx, err := f.svc.beginClaimMutation(e.ctx, f.wkr, run, i64(1))
