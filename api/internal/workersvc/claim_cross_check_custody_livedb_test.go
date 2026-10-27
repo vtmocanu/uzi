@@ -188,11 +188,21 @@ func TestClaimCrossCheckCustodyRefusalsLiveDB(t *testing.T) {
 						other := cloneLaneChild(t, sibling)
 						f.env.exec("UPDATE runs SET status='running',worker_id=$2,cross_check_lane=true WHERE id=$1", other, f.worker)
 					case "vault locked":
-						f.svc.SetVault(vault.NewPostgres(f.env.box, f.env.pool))
-						if harness == "claude" {
-							f.env.exec("UPDATE user_secrets SET sealed_with='dek' WHERE user_id=$1 AND kind='anthropic_token'", f.owner)
-						} else {
-							f.env.exec("UPDATE codex_provider_account SET sealed_with='dek' WHERE user_id=$1", f.owner)
+						vlt := vault.NewPostgres(f.env.box, f.env.pool)
+						f.svc.SetVault(vlt)
+						// Enrollment rewraps the existing credentials without changing bindings.
+						enrollCodexProtectedVault(t, f.env, vlt, f.owner, codexVaultLockedTestPassword)
+						state, err := vlt.State(f.env.ctx, f.owner)
+						if err != nil || state.VaultMode != store.VaultModeProtected || !vlt.Unlocked(f.owner) {
+							t.Fatalf("protected enrollment state = %+v, %v; unlocked = %v", state, err, vlt.Unlocked(f.owner))
+						}
+						wrapper, err := f.env.q.GetUserVault(f.env.ctx, f.owner)
+						if err != nil || len(wrapper.KekSalt) == 0 || len(wrapper.WrappedDek) == 0 {
+							t.Fatalf("protected enrollment missing durable wrapper: %v", err)
+						}
+						vlt.Lock(f.owner)
+						if vlt.Unlocked(f.owner) {
+							t.Fatal("vault still unlocked after Lock")
 						}
 					case "credential unavailable":
 						if harness == "claude" {

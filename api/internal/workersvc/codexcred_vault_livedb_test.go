@@ -40,13 +40,39 @@ func credVaultEnrollment(t *testing.T, env codexTestEnv, owner uuid.UUID) {
 		t.Fatal(err)
 	}
 	env.exec("UPDATE users SET password_hash=$2 WHERE id=$1", owner, hash)
-	// Disable needs optional policy. Restore the exact setting for sibling tests.
-	var policy string
-	if err := env.pool.QueryRow(env.ctx, "SELECT value FROM app_settings WHERE key='vault_policy'").Scan(&policy); err != nil {
+	optionalWorkerVaultPolicy(t, env)
+}
+
+// optionalWorkerVaultPolicy permits Disable while preserving the exact policy row
+// or its absence for serial tests sharing the database.
+func optionalWorkerVaultPolicy(t *testing.T, env codexTestEnv) {
+	t.Helper()
+	var previous store.AppSetting
+	err := env.pool.QueryRow(env.ctx, "SELECT key,value,updated_at,updated_by FROM app_settings WHERE key='vault_policy'").
+		Scan(&previous.Key, &previous.Value, &previous.UpdatedAt, &previous.UpdatedBy)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatal(err)
 	}
-	env.exec("UPDATE app_settings SET value='optional' WHERE key='vault_policy'")
-	t.Cleanup(func() { env.exec("UPDATE app_settings SET value=$1 WHERE key='vault_policy'", policy) })
+	existed := err == nil
+	t.Cleanup(func() {
+		// A per-test operation context may already have expired or been canceled.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		var err error
+		if existed {
+			_, err = env.pool.Exec(ctx, `INSERT INTO app_settings(key,value,updated_at,updated_by) VALUES($1,$2,$3,$4)
+				ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=EXCLUDED.updated_at,updated_by=EXCLUDED.updated_by`,
+				previous.Key, previous.Value, previous.UpdatedAt, previous.UpdatedBy)
+		} else {
+			_, err = env.pool.Exec(ctx, "DELETE FROM app_settings WHERE key='vault_policy'")
+		}
+		if err != nil {
+			t.Errorf("restore vault policy: %v", err)
+		}
+	})
+	if _, err := env.pool.Exec(env.ctx, "INSERT INTO app_settings(key,value) VALUES('vault_policy','optional') ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value"); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestReconcileCodexInstallPolicyBarrierLiveDB(t *testing.T) {

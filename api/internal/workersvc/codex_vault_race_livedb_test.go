@@ -48,12 +48,7 @@ func codexRaceFixture(t *testing.T, e codexTestEnv) (refreshFixture, *codexRaceP
 		t.Fatal(err)
 	}
 	e.exec("UPDATE users SET password_hash=$2 WHERE id=$1", f.userID, hash)
-	var policy string
-	if err := e.pool.QueryRow(e.ctx, "SELECT value FROM app_settings WHERE key='vault_policy'").Scan(&policy); err != nil {
-		t.Fatal(err)
-	}
-	e.exec("UPDATE app_settings SET value='optional' WHERE key='vault_policy'")
-	t.Cleanup(func() { e.exec("UPDATE app_settings SET value=$1 WHERE key='vault_policy'", policy) })
+	optionalWorkerVaultPolicy(t, e)
 	return f, p
 }
 
