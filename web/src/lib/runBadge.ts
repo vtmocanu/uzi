@@ -499,7 +499,7 @@ export function displayHealthReason(run: Pick<HealthFlaggable, "health_reason">)
     ? null : reason || null;
 }
 
-export function queuedBlockerPrecedesCodexAdmission(run: Pick<HealthFlaggable, "status" | "health_reason">): boolean {
+export function queuedBlockerPrecedesCodexAdmission(run: { status: string; health_reason?: string | null }): boolean {
   // Mirror the blockers before admission in queuedReasonWithEligibility (health.go).
   return run.status === "queued" && [
     "handoff setup has not finished",
