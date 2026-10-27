@@ -814,9 +814,12 @@ describe("a published source is never re-admitted without an explicit consuming 
     await untouched(r, before);
   });
 
-  it("normalize, replace and discard admissions refuse", async (t) => {
+  // U5: "discard" is no longer in this list. The guarded operator discard (git.ts discardRetainedSource) has
+  // already authorized its footprint, so its admission is the one explicit operator-discard takeover
+  // (AuthorityStore.admitOperatorDiscard; see completion-retirement.test.ts) instead of a refusal.
+  it("normalize and replace admissions refuse", async (t) => {
     const { r, before } = await published(t);
-    for (const op of ["normalize", "replace", "discard"]) {
+    for (const op of ["normalize", "replace"]) {
       await assert.rejects(r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, op)), /published/, op);
     }
     await untouched(r, before);
@@ -841,7 +844,7 @@ describe("a published source is never re-admitted without an explicit consuming 
 
   it("an unpublished slot is admitted by every caller as before", async (t) => {
     const r = await rig(t);
-    for (const op of ["seed-canonical", "replace", "discard"]) {
+    for (const op of ["seed-canonical", "replace"]) {
       await r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, op));
       assert.equal((await slotOf(r.rt, r.clone))?.state, "active", op);
     }

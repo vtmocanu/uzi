@@ -11377,6 +11377,39 @@ export class GitCache {
     });
   }
 
+  /**
+   * issue #3404 M2 U5 - the retry-authority sibling of {@link completionSourceAlreadyRetired}, used only when an
+   * authenticated retiring record (not the attempt ledger or the journal fence) is what authorizes a residue
+   * retry. True when the clone path is absent, no journal names it (a journal naming a different run or path is
+   * a successor's and is never touched), no retained source or recovery episode names it, and no terminal
+   * record protects the run. Read-only.
+   */
+  async completionSourceJournalAbsent(barePath: string, branch: string, runId: string, clonePath: string,
+    attemptId: string | undefined): Promise<boolean> {
+    return this.withLock(barePath, async () => {
+      await this.assertRecoveryBare(barePath);
+      try { await fs.lstat(clonePath); return false; }
+      catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
+      const pending = await this.readRecoveryCapture(barePath, branch);
+      if (pending?.runId === runId && pending.clonePath === clonePath && pending.attemptId === attemptId) return false;
+      if (pending?.recovery || pending?.retainedSources?.some(source => source.clonePath === clonePath)) return false;
+      return !await this.hasPhysicalTerminalProtection(runId);
+    });
+  }
+
+  /**
+   * issue #3404 M2 U5 - remove the paired skills dir (`.uzi-skills-<clone name>`) of a retired completion source.
+   * Goes through deleteRetainedArtifact, so it is the hooked runner-uid delete (beginDestructive) that the
+   * retiring lease carries; strict validation throws instead of reporting a quiet refusal. True when it is gone
+   * (absent counts), false when a guard refused it.
+   */
+  async removeCompletionSkillsDir(barePath: string, clonePath: string, canDelete: () => boolean): Promise<boolean> {
+    const parent = path.dirname(clonePath);
+    const skills = `.uzi-skills-${path.basename(clonePath)}`;
+    return this.withLock(barePath, () =>
+      this.deleteRetainedArtifact(parent, path.join(parent, skills), name => name === skills, { canDelete, strictValidation: true }));
+  }
+
   async retireRunnerClone(
     barePath: string,
     clonePath: string,
@@ -11390,9 +11423,13 @@ export class GitCache {
         acknowledged: () => Promise<boolean> };
       completionSource?: { expectedHead: string; canDelete: () => boolean;
         /** issue #3404 M2: the journal fence the caller certified. Required whenever `authorityRequired`
-         *  is set, which nothing in production does yet (a later unit wires it); optional so every
-         *  caller without authority keeps the legacy behaviour. */
-        expectedFence?: CompletionSourceFence } },
+         *  is set; restart retirement (recovery.ts forgetCompletedGeneration, through the runner's completion
+         *  source boundary) passes the fence of the verified published source. Optional so every caller
+         *  without authority keeps the legacy behaviour. */
+        expectedFence?: CompletionSourceFence;
+        /** issue #3404 M2 U5: awaited under the bare lock, after every guard and immediately before the clone is
+         *  first moved. The restart-retirement caller enters `retiring` here, so a refusal moves nothing. */
+        beforeDestroy?: () => Promise<void> } },
   ): Promise<RunnerCloneRetireResult> {
     if (opts.processProof && opts.processProof() !== true) throw new Error("runner clone process proof revoked");
     if (opts.completionSource && opts.verifiedSuccessor) throw new Error("retirement authorities are mutually exclusive");
@@ -11415,9 +11452,11 @@ export class GitCache {
         acknowledged: () => Promise<boolean> };
       completionSource?: { expectedHead: string; canDelete: () => boolean;
         /** issue #3404 M2: the journal fence the caller certified. Required whenever `authorityRequired`
-         *  is set, which nothing in production does yet (a later unit wires it); optional so every
-         *  caller without authority keeps the legacy behaviour. */
-        expectedFence?: CompletionSourceFence } },
+         *  is set; restart retirement (recovery.ts forgetCompletedGeneration, through the runner's completion
+         *  source boundary) passes the fence of the verified published source. Optional so every caller
+         *  without authority keeps the legacy behaviour. */
+        expectedFence?: CompletionSourceFence;
+        beforeDestroy?: () => Promise<void> } },
     bareLockHeld = false,
   ): Promise<RunnerCloneRetireResult> {
     // Deny-only observation: no cleanup authority, and observer errors cannot change retirement.
@@ -11562,6 +11601,13 @@ export class GitCache {
       checkProcessProof();
       if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
       if (opts.completionSource && !opts.completionSource.canDelete()) throw new Error("completion cleanup exclusion changed");
+      if (opts.completionSource?.beforeDestroy) {
+        // issue #3404 M2 U5: the durable retiring entry precedes the first destructive effect (the move below).
+        await opts.completionSource.beforeDestroy();
+        checkProcessProof();
+        if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
+        if (!opts.completionSource.canDelete()) throw new Error("completion cleanup exclusion changed");
+      }
       if (anchored) {
         await checkSuccessor(pending);
         await this.writeRecovery(barePath, branch, anchored, () => checkSuccessor(pending));

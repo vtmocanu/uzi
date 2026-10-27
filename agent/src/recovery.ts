@@ -1,8 +1,10 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { ProcessQuiescence } from "./run-quiescence.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
-import type { AuthorityScope } from "./authority-runtime.js";
-import { decodeCompletionSourceShape, type CompletionSourceV2 } from "./completion-source.js";
+import type { AuthorityScope, RetirementHandle, RetirementView } from "./authority-runtime.js";
+import {
+  decodeCompletionSourceShape, serializeSourceFence, sourceFenceOf, type CompletionSourceFence, type CompletionSourceV2,
+} from "./completion-source.js";
 import type { ExclusionRefusal, MaintenanceExclusion, MaintenanceWriterExclusion } from "./maintenance-exclusion.js";
 import { MaintenanceResources as M1MaintenanceResources, RecoveryMaintenance, type MaintenanceAdmission } from "./recovery-maintenance.js";
 import { classifyRecoveryOrigin } from "./recovery-origin.js";
@@ -83,6 +85,27 @@ const ORDINARY_TEMP_RE = new RegExp(`^${UUID_V4}(?:\\.json\\.${UUID_V4}\\.tmp|\\
  *  removed (removeGenerationRecordsUnlocked deletes the record first and tolerates a failed bundle rm). */
 function ordinaryTempEntry(name: string): boolean {
   return ORDINARY_TEMP_RE.test(name);
+}
+
+/** Retiring-manifest item prefixes. A bare absolute path is the clone or its paired skills dir (the destructive footprint). */
+const FENCE_ITEM = "fence:";
+const BUNDLE_ITEM = "bundle:";
+const RECORD_ITEM = "record:";
+
+/**
+ * The exact artifacts a completed generation's retirement destroys, in DELETION order, so what remains at any
+ * moment is a suffix: the clone, its paired skills dir (only when present), the journal fence (cleared with the
+ * clone's retirement), the bundle files that exist, the cohort's records and the receipt-bearing record last.
+ */
+function retiringManifest(input: { clonePath: string; skillsPath: string | undefined; fence: CompletionSourceFence;
+  bundles: string[]; records: string[]; authorityRecord: string }): string[] {
+  return [
+    input.clonePath, ...(input.skillsPath === undefined ? [] : [input.skillsPath]),
+    FENCE_ITEM + serializeSourceFence(input.fence),
+    ...[...input.bundles].sort().map(file => BUNDLE_ITEM + file),
+    ...input.records.filter(file => file !== input.authorityRecord).sort().map(file => RECORD_ITEM + file),
+    RECORD_ITEM + input.authorityRecord,
+  ];
 }
 
 /** Issue #3031 staged groundwork: new-origin admission (charged WIP capture after a terminal
@@ -327,6 +350,9 @@ export interface RecoveryBundleProducer {
   readInventoryCloneHeadsUnderLock?: GitCache["readInventoryCloneHeadsUnderLock"];
   enumerateOwedUnderLock?: GitCache["enumerateOwedUnderLock"];
   cleanupRecoveryGeneration?: GitCache["cleanupRecoveryGeneration"];
+  /** issue #3404 M2 U5: restart retirement reads the completing journal's fence and removes the paired skills dir. */
+  readCompletionSourceFence?: GitCache["readCompletionSourceFence"];
+  removeCompletionSkillsDir?: GitCache["removeCompletionSkillsDir"];
   readInventoryCloneHeads?: GitCache["readInventoryCloneHeads"];
   committedTrackingOwnership?: GitCache["committedTrackingOwnership"];
   ancestry?: GitCache["ancestry"];
@@ -526,6 +552,20 @@ function inventorySourceReason(diagnostic?: InventorySourceDiagnostic): string {
     (diagnostic.check === "inventory_read_not_verified" ? ":" + diagnostic.cause : "");
 }
 
+/**
+ * issue #3404 M2 U5: what the completion-source boundary needs when the release rests on durable authority
+ * rather than on this process's memory. Built only after the coordinator verified the published (or retiring)
+ * slot, the whole physical cohort and the journal fence, under the outer authority transaction A.
+ */
+export interface DurableCompletionRetirement {
+  /** The fence the completing bare journal must still carry; retireRunnerClone refuses anything else. */
+  expectedFence: CompletionSourceFence;
+  /** A retiring record already authorizes the cleanup: the clone may already be gone and the fence cleared. */
+  resumed: boolean;
+  /** Enter `retiring` (idempotent): awaited immediately before the first destructive effect. */
+  enter(): Promise<void>;
+}
+
 export interface RecoveryCoordinatorOptions {
   /** issue #3404 M2: opens (or borrows) the authority transaction A. Every capture cycle that can
    *  reach a hooked Git effect is entered inside it, so A is taken BEFORE the cycle lock C, the
@@ -544,11 +584,15 @@ export interface RecoveryCoordinatorOptions {
   }) => Promise<T>, signal?: AbortSignal) => Promise<{ entered: false } | { entered: true; value: T }>;
   /** Notification only, after exact-source and generation cleanup actually completed. */
   onCompletionSourceForgotten?: (source: CompletionSource) => void;
+  /** issue #3404 M2 U5: whether a binder for this source's identity is still pending in the process. The retired
+   *  tombstone is written only while none is. Absent: nothing is pending. */
+  completionBinderPending?: (source: CompletionSource) => boolean;
   /** Notification only, after guarded archive/FINAL cleanup removed the full generation. */
   onCompletionGenerationForgotten?: (runId: string, generation: number) => void;
   withCompletionSourceBoundary?: (
     source: CompletionSource,
     action: (canDelete: () => boolean) => Promise<void>,
+    durable?: DurableCompletionRetirement,
   ) => Promise<"passed" | "retained">;
   /** Tests only: the file/directory barriers of {@link RecoveryCoordinator.publishCompletionSource}. */
   publicationOps?: PublicationFsOps;
@@ -1010,6 +1054,7 @@ export class RecoveryCoordinator {
   private readonly withInventorySourceBoundary: RecoveryCoordinatorOptions["withInventorySourceBoundary"];
   private readonly withCompletionSourceBoundary: RecoveryCoordinatorOptions["withCompletionSourceBoundary"];
   private readonly onCompletionSourceForgotten: RecoveryCoordinatorOptions["onCompletionSourceForgotten"];
+  private readonly completionBinderPending: RecoveryCoordinatorOptions["completionBinderPending"];
   private readonly publicationOps: PublicationFsOps;
   private readonly onCompletionGenerationForgotten: RecoveryCoordinatorOptions["onCompletionGenerationForgotten"];
   private readonly isExecuting: (runId: string) => boolean;
@@ -1211,6 +1256,7 @@ export class RecoveryCoordinator {
     this.withInventorySourceBoundary = opts.withInventorySourceBoundary;
     this.withCompletionSourceBoundary = opts.withCompletionSourceBoundary;
     this.onCompletionSourceForgotten = opts.onCompletionSourceForgotten;
+    this.completionBinderPending = opts.completionBinderPending;
     this.publicationOps = opts.publicationOps ?? {
       syncFile: handle => handle.sync(), syncDir: handle => handle.sync(), rename: (from, to) => fs.rename(from, to),
     };
@@ -4414,7 +4460,16 @@ export class RecoveryCoordinator {
    * gates it: the issue #2625 redundancy claims are built under the journal lock from the records
    * read there, but submitted only after the lock is released, bounded by one deadline, and their
    * answers are logged and otherwise ignored, so no refusal, error or timeout changes the cleanup.
-   * One attempt per existing sweep; any failed proof stops this generation and retains authority. */
+   * One attempt per existing sweep; any failed proof stops this generation and retains authority.
+   *
+   * issue #3404 M2 U5: with an authority scope (every production worker) the release rests on DURABLE
+   * authority, checked first and before any source inspection or source-dependent preflight, under the
+   * outer authority transaction A the cycle already holds: the published (or retiring) slot, a physical
+   * run directory whose generation members are exactly the slot's cohort and all carry the identical
+   * certified V2 source, and the completing bare journal's fence. Legacy V1, mixed, partial, corrupt or
+   * unknown records retain. The in-memory binding of the runner stays a veto (never the authority): a
+   * restarted process has none and proceeds only on the durable proof. Destruction is a retiring
+   * transaction (see {@link retiringManifest}). */
   private async forgetCompletedGeneration(runId: string, generation: number, isExecuting: (runId: string) => boolean,
     signal?: AbortSignal): Promise<void> {
     if (!this.withCompletionSourceBoundary || isExecuting(runId) || this.isExecuting(runId)) return;
@@ -4425,16 +4480,22 @@ export class RecoveryCoordinator {
       const selected = records.filter(r => r.generation === generation);
       const authority = selected.find(r => r.completionReceipt && r.completionSource);
       if (!authority || !this.git.cleanupRecoveryGeneration || residueQuarantine() !== undefined) return;
-      // A published V2 source is read as its legacy core here: restart retirement that consumes the
-      // certificate is a separate step, and this release decision stays exactly the legacy one.
       const source = legacyCompletionCore(authority.completionSource!);
       const ctx = source.context;
       if (selected.some(r => !r.inventoryGuarded || r.branch !== ctx.branch || r.kind !== ctx.kind ||
           (r.completionReceipt && canonicalJson(r.completionReceipt) !== canonicalJson(authority.completionReceipt)))) return;
+      // The durable authority comes BEFORE the bare resolution, the redundancy claims, the bundle checks and the
+      // completion-check preflight: an unknown or unproven source never reaches any of them.
+      const plan = this.authority ? await this.verifyDurableRetirement(runId, generation, authority, records, selected, source) : undefined;
+      if (this.authority && !plan) return;
+      // Without an authority scope nothing can verify a V2 source, and reading it as its legacy core would turn
+      // an unverified certificate into release authority: a coordinator that cannot check it retains.
+      if (!this.authority && selected.some(r => r.completionSource !== undefined && "version" in r.completionSource)) return;
       const bare = await ownedRecoveryIO(() => this.git.resolveRecoveryBareDir?.(path.basename(ctx.barePath)));
       if (bare !== ctx.barePath) return;
       claims = await this.buildRedundancyClaims(selected, generation, bare, budget, authority.completionReceipt!.final_head);
       const bundles = new Set<string>();
+      const presentBundles = new Set<string>();
       for (const record of selected) {
         if ((record.bareDir && record.bareDir !== path.basename(bare)) ||
             (record.recoveryPinBareDir && record.recoveryPinBareDir !== path.basename(bare)) ||
@@ -4446,6 +4507,7 @@ export class RecoveryCoordinator {
         try {
           const stat = await fs.lstat(canonical);
           if (!stat.isFile() || stat.isSymbolicLink()) return;
+          presentBundles.add(canonical);
         } catch (err) { MaintenanceBudget.current()?.check();
           if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
         }
@@ -4459,8 +4521,58 @@ export class RecoveryCoordinator {
         recoverySources, authority.completionReceipt!.final_head,
         () => residueQuarantine() === undefined && !isExecuting(runId) && !this.isExecuting(runId), "completion-check"));
       if (preflight !== "verified") return;
+      // The retiring manifest: every artifact this retirement destroys, in deletion order. Only a fresh
+      // retirement uses it; a resume is bound to the retiring record's own.
+      const authorityRecord = this.recordPath(authority);
+      let items: string[] = [];
+      if (plan && plan.view.phase === "published") {
+        const skills = path.join(path.dirname(plan.v2.clonePath), `.uzi-skills-${path.basename(plan.v2.clonePath)}`);
+        const skillsPresent = await ownedRecoveryIO(() => fs.lstat(skills)).then(() => true, (err: NodeJS.ErrnoException) => {
+          if (err.code === "ENOENT") return false;
+          throw err;
+        });
+        items = retiringManifest({
+          clonePath: plan.v2.clonePath, skillsPath: skillsPresent ? skills : undefined, fence: plan.fence,
+          bundles: [...presentBundles], records: selected.map(r => this.recordPath(r)), authorityRecord,
+        });
+      }
+      let handle: RetirementHandle | undefined;
+      const expected = plan?.expected;
+      const durable: DurableCompletionRetirement | undefined = plan ? {
+        expectedFence: plan.fence, resumed: plan.view.phase === "retiring",
+        enter: async () => { handle ??= await this.authority!.retirement!.enter(plan.view, items); },
+      } : undefined;
       let forgotten = false;
       const boundary = await this.withCompletionSourceBoundary!(source, async canDelete => {
+        // Idempotent: normally the clone move already entered it; a source that is already gone enters here,
+        // before the first ref, bundle or record is destroyed.
+        await durable?.enter();
+        let recorded = handle?.deleted ?? 0;
+        const present = async (item: string): Promise<boolean> => {
+          if (item.startsWith(FENCE_ITEM)) return await ownedRecoveryIO(() => this.git.readCompletionSourceFence!(ctx.barePath, ctx.branch, expected!)) !== undefined;
+          const file = item.startsWith(BUNDLE_ITEM) ? item.slice(BUNDLE_ITEM.length) : item.startsWith(RECORD_ITEM) ? item.slice(RECORD_ITEM.length) : item;
+          return ownedRecoveryIO(() => fs.lstat(file)).then(() => true, (err: NodeJS.ErrnoException) => {
+            if (err.code === "ENOENT") return false;
+            throw err;
+          });
+        };
+        // Progress is recorded from what is CONFIRMED gone: the leading absent prefix of the manifest.
+        const progress = async (): Promise<void> => {
+          if (!handle) return;
+          let leading = 0;
+          for (const item of handle.manifest) { if (await present(item)) break; leading++; }
+          if (leading > recorded) { await handle.advance(leading); recorded = leading; }
+        };
+        if (handle) {
+          const skills = handle.manifest.find(item => path.basename(item).startsWith(".uzi-skills-") && !item.startsWith(RECORD_ITEM) && !item.startsWith(BUNDLE_ITEM));
+          if (skills !== undefined) {
+            const removeSkills = this.git.removeCompletionSkillsDir;
+            if (!removeSkills || !canDelete()) throw new Error("completion skills directory cannot be removed");
+            const gone = await ownedRecoveryIO(() => removeSkills.call(this.git, bare, plan!.v2.clonePath, canDelete));
+            if (!gone) throw new Error("completion skills directory retained");
+            await progress();
+          }
+        }
         const result = await ownedRecoveryIO(() => this.git.cleanupRecoveryGeneration!(bare, ctx, source.roots, pins,
           recoverySources, authority.completionReceipt!.final_head, canDelete, "completion"));
         if (result !== "removed") return;
@@ -4470,15 +4582,120 @@ export class RecoveryCoordinator {
           catch (err) { MaintenanceBudget.current()?.check(); if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
         };
         for (const bundle of bundles) await unlink(bundle);
+        await progress();
         for (const record of selected) if (record.captureId !== authority.captureId) await unlink(this.recordPath(record));
-        await unlink(this.recordPath(authority));
+        await progress();
+        await unlink(authorityRecord);
+        if (handle) await this.syncRunDirectory(runId);
         await ownedRecoveryIO(() => fs.rmdir(this.runDir(runId))).catch(() => undefined);
+        if (handle) {
+          await progress();
+          if (this.completionBinderPending?.(source)) throw new Error("a completion source binder is pending; the retired tombstone waits");
+          await handle.finish();
+        }
         forgotten = true;
-      });
+      }, durable);
       // A pass whose action returned early, or any partial failure, keeps provenance.
       if (boundary === "passed" && forgotten) this.onCompletionSourceForgotten?.(source);
     });
     await this.submitRedundancyClaims(claims, budget);
+  }
+
+  /**
+   * issue #3404 M2 U5 - the durable authority for retiring a completed generation, read under A and J.
+   * Returns the verified source, the slot view and the journal fence it must see; undefined (retain) for
+   * anything else. Nothing here inspects the source clone. FIRST retirement (slot published): the physical
+   * run directory's generation members are exactly the slot's cohort, every member carries the identical
+   * certified V2 source, and the completing bare journal carries exactly the source's fence. RESUME (slot
+   * retiring): the retiring record alone authorizes the residue cleanup, see {@link residueExplained}.
+   */
+  private async verifyDurableRetirement(runId: string, generation: number, authority: RecoveryRecord, records: RecoveryRecord[],
+    selected: RecoveryRecord[], legacy: CompletionSource): Promise<{
+    view: RetirementView; v2: CompletionSourceV2; fence: CompletionSourceFence;
+    expected: { runId: string; clonePath: string; attemptId?: string };
+  } | undefined> {
+    const scope = this.authority?.retirement;
+    if (!scope || !this.git.readCompletionSourceFence) return undefined;
+    try {
+      const stored = authority.completionSource;
+      if (!stored || !("version" in stored) || stored.version !== 2) return undefined;
+      const view = await scope.inspect(stored);
+      const v2 = view.source;
+      const ctx = v2.context;
+      if (canonicalJson(legacyCompletionCore(v2)) !== canonicalJson(legacy) || ctx.runId !== runId || ctx.generation !== generation ||
+          view.cohort.runId !== runId || view.cohort.generation !== generation) return undefined;
+      const wanted = canonicalJson(v2);
+      const expected = { runId, clonePath: v2.clonePath, ...(v2.attemptId === undefined ? {} : { attemptId: v2.attemptId }) };
+      const fence = sourceFenceOf(v2);
+      const journalFence = await ownedRecoveryIO(() => this.git.readCompletionSourceFence!(ctx.barePath, ctx.branch, expected));
+      if (view.phase === "published") {
+        const physical = await this.physicalGeneration(runId, generation);
+        if (physical.captureIds.join("\n") !== view.cohort.captureIds.join("\n") ||
+            physical.selected.some(r => canonicalJson(r.completionSource) !== wanted)) return undefined;
+        if (journalFence === undefined || serializeSourceFence(journalFence) !== serializeSourceFence(fence)) return undefined;
+      } else if (!await this.residueExplained(runId, view, v2, wanted, journalFence, records, selected)) return undefined;
+      return { view, v2, fence, expected };
+    } catch { MaintenanceBudget.current()?.check(); return undefined; }
+  }
+
+  /**
+   * The residue retry's validation: the authenticated retiring record is the ONLY authority, because the original
+   * fence or a manifest member was intentionally removed by the retirement itself. It refuses additions (a record
+   * or bundle of the run that the manifest does not name, a member whose source is not the retiring one, a stray
+   * directory entry), changes (a journal fence other than the manifest's) and unexplained absence. Deletion
+   * order is the manifest order, so what remains must be a SUFFIX of it: the leading absent items are explained
+   * by the deletions the retirement made (confirmed or not yet recorded), but an item absent behind a present one
+   * is not, and an item the record counts as deleted must not be present. Caller holds J.
+   */
+  private async residueExplained(runId: string, view: RetirementView, v2: CompletionSourceV2, wanted: string,
+    journalFence: CompletionSourceFence | undefined, records: RecoveryRecord[], selected: RecoveryRecord[]): Promise<boolean> {
+    const retiring = view.retiring;
+    if (!retiring || retiring.manifest[0] !== v2.clonePath) return false;
+    const skills = path.join(path.dirname(v2.clonePath), `.uzi-skills-${path.basename(v2.clonePath)}`);
+    const manifest = new Set(retiring.manifest);
+    for (const item of retiring.manifest.slice(1)) {
+      if (item === skills || item.startsWith(FENCE_ITEM) || item.startsWith(BUNDLE_ITEM) || item.startsWith(RECORD_ITEM)) continue;
+      return false;
+    }
+    // Additions: every record of this generation still present is a named member carrying the retiring source.
+    for (const record of selected) {
+      if (!manifest.has(RECORD_ITEM + this.recordPath(record)) || canonicalJson(record.completionSource) !== wanted) return false;
+    }
+    const runDir = path.resolve(this.runDir(runId));
+    const known = new Set(records.map(r => r.captureId));
+    const names = await ownedRecoveryIO(() => fs.readdir(runDir)).catch((err: NodeJS.ErrnoException) => {
+      if (err.code === "ENOENT") return [] as string[];
+      throw err;
+    });
+    for (const name of names) {
+      // A bundle of a member of THIS generation that the manifest never named is an addition. (A bundle whose
+      // record is gone, and the coordinator's own crash-era temps, are tolerated exactly as publication does:
+      // they carry no authority and the retirement does not own them.)
+      if (name.endsWith(".bundle") && selected.some(r => r.captureId === name.slice(0, -".bundle".length)) &&
+          !manifest.has(BUNDLE_ITEM + path.join(runDir, name))) return false;
+      if (ordinaryTempEntry(name)) continue;
+      const stem = name.endsWith(".json") ? name.slice(0, -".json".length) : undefined;
+      if (stem === undefined || !known.has(stem)) return false;
+    }
+    // Absence: the present items must form a suffix, and none the record counts as deleted may be present.
+    let firstPresent = -1;
+    for (const [index, item] of retiring.manifest.entries()) {
+      let present: boolean;
+      if (item.startsWith(FENCE_ITEM)) {
+        present = journalFence !== undefined;
+        if (present && FENCE_ITEM + serializeSourceFence(journalFence!) !== item) return false;
+      } else {
+        const file = item.startsWith(BUNDLE_ITEM) || item.startsWith(RECORD_ITEM) ? item.slice(item.indexOf(":") + 1) : item;
+        present = await ownedRecoveryIO(() => fs.lstat(file)).then(() => true, (err: NodeJS.ErrnoException) => {
+          if (err.code === "ENOENT") return false;
+          throw err;
+        });
+      }
+      if (present && firstPresent < 0) firstPresent = index;
+      if (!present && firstPresent >= 0) return false;
+    }
+    const remaining = firstPresent < 0 ? retiring.manifest.length : firstPresent;
+    return remaining >= retiring.deleted;
   }
 
   /** Caller owns the generation cycle. The journal lock spans selection and every destructive

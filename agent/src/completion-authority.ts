@@ -1,4 +1,4 @@
-import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { constants as fsc } from "node:fs";
 import * as fsp from "node:fs/promises";
 import path from "node:path";
@@ -740,6 +740,14 @@ function isResidueRetry(body: SlotSnapshot, input: { kind: string; footprint: st
 function retiringRecord(prior: string, manifest: readonly string[]): RetiringRecord {
   return { prior, operation: randomUUID(), manifest: strings(manifest, MAX_ITEMS), deleted: 0 };
 }
+/**
+ * The `prior` of an operator-discard retiring record. A discarded source has no published proof to cite, so
+ * the record names a digest derived from its own slot and epoch: only a record written by admitOperatorDiscard
+ * can carry it, and endOperatorDiscard refuses any other retiring record.
+ */
+function operatorDiscardPrior(key: string, epoch: string): string {
+  return createHash("sha256").update(`uzi operator discard\0${key}\0${epoch}`).digest("hex");
+}
 
 export class AuthorityStore {
   readonly #init: StoreInit;
@@ -1214,6 +1222,67 @@ export class AuthorityStore {
     if (body.pending?.status === "running") throw new AuthorityRefusal("unresolved pending footprint");
     requireResidueCovered(body.pending, body.retiring.manifest);
     await this.#save(dir, { ...body, state: "retired", retiring: null, pending: null, publication: null, seq: body.seq + 1 });
+  }
+
+  /**
+   * issue #3404 M2 U5 - the ONE operator-discard takeover. The existing guarded operator discard (git.ts
+   * discardRetainedSource, reached through retained-source-server) has already authorized exactly the paths in
+   * `footprint` (the source and its paired skills dir); this stops authority state from blocking it for those
+   * footprints. It admits a fresh epoch owned by this incarnation in state `retiring`, whatever the slot held:
+   * an `active` slot a crashed worker left behind, an `ineligible` slot, a published slot, or a `retiring` one
+   * (a stuck restart retirement). The retiring record is the discard's own transaction (manifest = footprint,
+   * `prior` = operatorDiscardPrior), so destructive records for the footprint are residue retries inside the
+   * manifest and {@link endOperatorDiscard} tombstones the slot once the deletion is confirmed.
+   *
+   * Refuses a `running` pending record (an unresolved helper may still be walking the footprint) and a
+   * `settled_failed` record whose residue lies outside `footprint`: the discard never clears evidence about
+   * anything it does not delete. A settled_failed record is KEPT in the new slot, so its residue stays on
+   * record until a confirmed deletion retires it.
+   */
+  async admitOperatorDiscard(tx: AuthorityTransaction, sourcePath: string, footprint: readonly string[]): Promise<SourceUseLease> {
+    this.#check(tx);
+    const key = await this.slotKey(tx, sourcePath);
+    const dir = await this.#slotsDir();
+    const old = await this.#load(dir, key);
+    const items = strings([...footprint], MAX_ITEMS);
+    if (items.length === 0) throw new AuthorityRefusal("operator discard needs a footprint");
+    if (old?.pending?.status === "running") throw new AuthorityRefusal("source has an unresolved pending footprint");
+    if (old?.pending && !old.pending.residue.every((item) => items.includes(item))) {
+      throw new AuthorityRefusal("pending residue is not covered by the discard footprint");
+    }
+    const epoch = randomUUID();
+    const body: SlotSnapshot = {
+      version: SLOT_VERSION, key, state: "retiring", epoch, seq: (old?.seq ?? 0) + 1,
+      owner: { worker: this.#init.incarnation, executor: null }, pending: old?.pending ?? null,
+      retiring: { prior: operatorDiscardPrior(key, epoch), operation: randomUUID(), manifest: items, deleted: 0 },
+      publication: old?.publication ?? null, codexMarked: old?.codexMarked ?? false,
+    };
+    await this.#save(dir, body);
+    return new SourceUseLease(leaseBrand, this, key, epoch, "claude");
+  }
+
+  /**
+   * End the discard {@link admitOperatorDiscard} opened. `allGone` is the caller's confirmed finding that every
+   * footprint item is absent: the slot is then tombstoned (`retired`, pending and publication dropped; the
+   * residue it recorded was inside the footprint, so it is gone with it). Otherwise a slot with nothing
+   * pending leaves `retiring` for `ineligible` (the source stays as it was, usable by a retained recovery) and
+   * a slot with a settled_failed record stays `retiring`, keeping its residue as evidence. A running pending
+   * record refuses. Only a record this method's admission wrote qualifies.
+   */
+  async endOperatorDiscard(tx: AuthorityTransaction, lease: SourceUseLease, outcome: { allGone: boolean }): Promise<"retired" | "ineligible" | "retained"> {
+    const { dir, body } = await this.#owned(tx, lease);
+    if (body.state !== "retiring" || !body.retiring || body.retiring.prior !== operatorDiscardPrior(body.key, body.epoch)) {
+      throw new AuthorityRefusal("source is not an operator discard");
+    }
+    if (body.pending?.status === "running") throw new AuthorityRefusal("unresolved pending footprint");
+    if (outcome.allGone) {
+      requireResidueCovered(body.pending, body.retiring.manifest);
+      await this.#save(dir, { ...body, state: "retired", retiring: null, pending: null, publication: null, seq: body.seq + 1 });
+      return "retired";
+    }
+    if (body.pending !== null) return "retained";
+    await this.#save(dir, { ...body, state: "ineligible", retiring: null, seq: body.seq + 1 });
+    return "ineligible";
   }
 }
 

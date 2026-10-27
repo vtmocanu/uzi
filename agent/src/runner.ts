@@ -116,7 +116,7 @@ import type {
 import { resolveAgentSelection, RUN_KINDS } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { deriveCloneKey, resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
-import { RecoveryCoordinator, canonicalJson, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, inventoryProcessDiagnostic, type ClosedSourceObservation, type InventorySourceBoundaryContext, type CompletionSource, type RecoveryRecord, type RecoveryCoordinatorOptions } from "./recovery.js";
+import { RecoveryCoordinator, canonicalJson, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, inventoryProcessDiagnostic, type ClosedSourceObservation, type InventorySourceBoundaryContext, type CompletionSource, type DurableCompletionRetirement, type RecoveryRecord, type RecoveryCoordinatorOptions } from "./recovery.js";
 import { classifyRecoveryOrigin } from "./recovery-origin.js";
 import {
   PUSHED_HEAD_UNRECORDED,
@@ -3048,7 +3048,11 @@ export class RunRunner {
         // The terminal boundary retains its execution tail only when settlement stayed unconfirmed.
         terminalSettlementConfirmed: runId => !this.executionTails.has(runId),
         withInventorySourceBoundary: (context, action) => this.withInventorySourceBoundary(context, action),
-        withCompletionSourceBoundary: (source, action) => this.withCompletionSourceBoundary(source, action),
+        withCompletionSourceBoundary: (source, action, durable) => this.withCompletionSourceBoundary(source, action, durable),
+        completionBinderPending: source => {
+          const key = this.completionSourceIdentity(source);
+          return [...this.completionSourceBinds].some(binder => binder.key === key);
+        },
         onCompletionSourceForgotten: source => this.forgetCompletionSourceBinding(source),
         onCompletionGenerationForgotten: (runId, generation) => this.forgetCompletionSourceBindings(runId, generation),
         withTerminalSourceBoundary: (runId, paths, action, signal) => {
@@ -3665,8 +3669,12 @@ export class RunRunner {
   /** Reserve execution through completion retirement's disposal under the bare lock. Successor admission
    * replaces this tail and stops any further destruction while waiting for our release. */
   private async withCompletionSourceBoundary(source: CompletionSource,
-    action: (canDelete: () => boolean) => Promise<void>): Promise<"passed" | "retained"> {
+    action: (canDelete: () => boolean) => Promise<void>, durable?: DurableCompletionRetirement): Promise<"passed" | "retained"> {
     const ctx = source.context;
+    // issue #3404 M2 U5: with an authority runtime a release rests on durable authority the coordinator verified
+    // and passes here. This process's memory (classification below) stays a VETO either way, but it is never the
+    // authority: a restarted process has no binding ("noReliableBinding") and proceeds only on `durable`.
+    if (this.authority && durable === undefined) return "retained";
     const classification = this.classifyCompletionSource(source);
     const proof = (): boolean => {
       const current = this.classifyCompletionSource(source);
@@ -3686,8 +3694,13 @@ export class RunRunner {
       if (inventory.kind !== "verified" || !open()) return "retained";
       const clone = inventory.clones.find(c => c.clonePath === source.clonePath);
       if (!clone) {
-        if (!await this.git.completionSourceAlreadyRetired(ctx.barePath, ctx.branch, ctx.runId, source.clonePath, source.attemptId,
-          classification.kind === "knownCodex" ? { processProof: open } : undefined) || !open()) return "retained";
+        // A resumed retirement's authenticated retiring record replaces the attempt-ledger/fence proof: the
+        // clone is gone and no journal still names it.
+        const retired = await this.git.completionSourceAlreadyRetired(ctx.barePath, ctx.branch, ctx.runId, source.clonePath, source.attemptId,
+          classification.kind === "knownCodex" ? { processProof: open } : undefined) ||
+          (durable?.resumed === true && open() &&
+            await this.git.completionSourceJournalAbsent(ctx.barePath, ctx.branch, ctx.runId, source.clonePath, source.attemptId));
+        if (!retired || !open()) return "retained";
         await action(open);
         return "passed";
       }
@@ -3703,7 +3716,8 @@ export class RunRunner {
       const after = await this.quiesceImpl({ ...request, dockerHost: undefined, site: "completion_source:after_git" });
       if (after.process?.state !== "quiescent" || !open()) return "retained";
       await this.git.retireRunnerClone(ctx.barePath, source.clonePath, ctx.branch, ctx.runId, {
-        discard: true, attemptId: source.attemptId, completionSource: { expectedHead: source.expectedHead, canDelete: open },
+        discard: true, attemptId: source.attemptId, completionSource: { expectedHead: source.expectedHead, canDelete: open,
+          ...(durable ? { expectedFence: durable.expectedFence, beforeDestroy: durable.enter } : {}) },
         ...(classification.kind === "knownCodex" ? { processProof: open } : {}),
       });
       if (!open()) return "retained";

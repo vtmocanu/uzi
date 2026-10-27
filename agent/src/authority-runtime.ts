@@ -8,8 +8,12 @@ import {
 } from "./authority-lock.js";
 import {
   leaseEpoch, leaseHarness, openAuthorityStore, peekAuthoritySlot,
-  type AuthorityFsOps, type AuthorityStore, type SlotSnapshot, type SourceUseLease,
+  type AuthorityFsOps, type AuthorityStore, type SlotCohort, type SlotSnapshot, type SourceUseLease,
 } from "./completion-authority.js";
+import {
+  sourceCoreDigest, sourceFenceOf, verifyCertifiedSource, verifyPublishedSource,
+  type CompletionSourceFence, type CompletionSourceV2,
+} from "./completion-source.js";
 import type { AuthoritySettlement, GitAuthorityHooks } from "./git-authority-hooks.js";
 
 // issue #3404 M2 U3 — the process runtime that turns the completion-authority store into the
@@ -49,6 +53,48 @@ export interface AuthorityScope {
     fn: (tx: AuthorityTransaction) => Promise<T>,
     options?: AuthorityWait,
   ): Promise<T>;
+  /**
+   * issue #3404 M2 U5: the restart-retirement store access. Present on the production {@link AuthorityRuntime};
+   * a scope without it (a unit-test double) cannot retire a completed source durably, so a coordinator that has
+   * an authority scope and finds none here retains.
+   */
+  readonly retirement?: RetirementScope;
+}
+
+/** What a retirement caller learns about a stored V2 source, read under the active transaction A. */
+export interface RetirementView {
+  /** The certified source (the certificate verified under this store's key). */
+  source: CompletionSourceV2;
+  /** `published`: the slot is still sealed/claude_ready for exactly this source. `retiring`: a retirement of it began. */
+  phase: "published" | "retiring";
+  /** The authenticated cohort manifest the slot binds. */
+  cohort: SlotCohort;
+  /** Present exactly for `retiring`: the authenticated manifest and the confirmed-deleted prefix length. */
+  retiring: { manifest: readonly string[]; deleted: number } | null;
+}
+
+/** A retirement entered under A: durable progress, the tombstone, and the fence the destruction must see. */
+export interface RetirementHandle {
+  readonly fence: CompletionSourceFence;
+  /** The authenticated manifest in deletion order; on a resume it is the retiring record's, never a fresh one. */
+  readonly manifest: readonly string[];
+  /** Confirmed-deleted prefix recorded when the handle was entered. */
+  readonly deleted: number;
+  advance(deleted: number): Promise<void>;
+  /** The durable retired tombstone; requires the whole manifest to be recorded as deleted. */
+  finish(): Promise<void>;
+}
+
+export interface RetirementScope {
+  /** Never writes. Throws AuthorityRefusal for a source that is not published or retiring under this store. */
+  inspect(value: unknown): Promise<RetirementView>;
+  /**
+   * Enter retiring for `view` (published: begin; retiring: resume) and register the retiring lease with the
+   * runtime, so a destructive record opened for the source's footprint (beginDestructive) is carried by it.
+   * `manifest` is used only for a fresh retirement. A running pending record, or a retiring slot this process
+   * holds no lease for, refuses.
+   */
+  enter(view: RetirementView, manifest: readonly string[]): Promise<RetirementHandle>;
 }
 
 export interface AuthorityRuntimeOptions {
@@ -126,7 +172,10 @@ export class AuthorityRuntime implements AuthorityScope {
   #retryTimer: NodeJS.Timeout | undefined;
   /** Collects the normalized slot paths this runtime admits inside {@link recordAdmissions}. */
   readonly #collector = new AsyncLocalStorage<Set<string>>();
+  /** The operator-discard lease per normalized slot path: an end of that source use tombstones or releases it. */
+  readonly #discards = new Map<string, SourceUseLease>();
   readonly hooks: GitAuthorityHooks;
+  readonly retirement: RetirementScope;
 
   constructor(options: AuthorityRuntimeOptions) {
     this.#options = options;
@@ -135,6 +184,10 @@ export class AuthorityRuntime implements AuthorityScope {
       beginBareMutation: (bare, op, footprint) => this.#beginBare(bare, op, footprint),
       assertBareClear: (bare, op) => this.#assertBareClear(bare, op),
       beginDestructive: (paths, op) => this.#beginDestructive(paths, op),
+    };
+    this.retirement = {
+      inspect: (value) => this.#inspectRetirement(value),
+      enter: (view, manifest) => this.#enterRetirement(view, manifest),
     };
   }
 
@@ -311,6 +364,7 @@ export class AuthorityRuntime implements AuthorityScope {
       this.#leases.delete(key);
       return "dropped";
     }
+    if (slot.state === "retiring" && this.#discards.get(key) === lease) return this.#endDiscard(tx, store, key, lease, slot);
     if (slot.state !== "active") { this.#leases.delete(key); return "dropped"; }
     if (slot.pending?.status === "running") {
       this.#options.log?.warn("source use left active: an operation on it is unresolved", { source: key, operation: slot.pending.operation });
@@ -319,6 +373,114 @@ export class AuthorityRuntime implements AuthorityScope {
     await store.transition(tx, lease, "ineligible");
     this.#leases.delete(key);
     return "ended";
+  }
+
+  /**
+   * End an operator discard (U5): the slot is tombstoned only when every footprint item is confirmed absent
+   * (lstat ENOENT; any other answer counts as present), otherwise it leaves `retiring` for `ineligible` or keeps
+   * its settled_failed residue. A running pending record keeps it for a later retry.
+   */
+  async #endDiscard(tx: AuthorityTransaction, store: AuthorityStore, key: string, lease: SourceUseLease, slot: SlotSnapshot): Promise<"ended" | "kept"> {
+    if (slot.pending?.status === "running") {
+      this.#options.log?.warn("operator discard left retiring: an operation on it is unresolved", { source: key, operation: slot.pending.operation });
+      return "kept";
+    }
+    let allGone = true;
+    for (const item of slot.retiring?.manifest ?? []) {
+      const present = await fsp.lstat(item).then(() => true, (error: NodeJS.ErrnoException) => error.code !== "ENOENT");
+      if (present) { allGone = false; break; }
+    }
+    await store.endOperatorDiscard(tx, lease, { allGone });
+    this.#leases.delete(key);
+    this.#discards.delete(key);
+    return "ended";
+  }
+
+  // ---- restart retirement (U5) -------------------------------------------------------------
+
+  /**
+   * A `retiring` slot whose progress record says every manifest item is confirmed deleted needs only its
+   * tombstone: write it (taking over a dead owner's retirement first) unless an operation on it is unresolved.
+   * Progress is recorded only after a deletion is confirmed, so nothing here deletes or reopens anything. Any
+   * refusal leaves the slot as it is and the admission that follows refuses as before.
+   */
+  async #finishRecordedRetirement(tx: AuthorityTransaction, store: AuthorityStore, key: string): Promise<void> {
+    const slot = await this.#slotOf(tx, store, key);
+    const retiring = slot?.retiring;
+    if (!slot || slot.state !== "retiring" || !retiring || retiring.deleted !== retiring.manifest.length ||
+        slot.pending?.status === "running") return;
+    try {
+      let lease = this.#leases.get(key);
+      if (slot.owner.worker !== store.workerIncarnation || !lease || leaseEpoch(lease) !== slot.epoch) {
+        lease = await store.beginRetirement(tx, key, { expectedEpoch: slot.epoch, expectedDigest: retiring.prior, manifest: [] });
+      }
+      await store.markRetired(tx, lease);
+      this.#leases.delete(key);
+      this.#discards.delete(key);
+    } catch (error) {
+      this.#options.log?.warn("a fully recorded retirement could not be tombstoned", { source: key, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  async #inspectRetirement(value: unknown): Promise<RetirementView> {
+    const tx = this.#requireActive("retirement");
+    const store = await this.#storeFor(tx);
+    const source = verifyCertifiedSource(tx, store, value);
+    const slot = await this.#slotOf(tx, store, path.resolve(source.clonePath));
+    if (!slot) throw new AuthorityRefusal("no authority slot covers the source");
+    const digest = sourceCoreDigest(source);
+    if (slot.state === "retiring") {
+      const { retiring, publication } = slot;
+      if (!retiring || !publication || retiring.prior !== digest || publication.sourceCoreDigest !== digest ||
+          publication.harness !== source.harness || slot.epoch !== source.sourceUseEpoch) {
+        throw new AuthorityRefusal("the retiring slot is not this source's retirement");
+      }
+      if (slot.pending?.status === "running") throw new AuthorityRefusal("an operation on the retiring source is unresolved");
+      return { source, phase: "retiring", cohort: structuredClone(publication.cohort),
+        retiring: { manifest: [...retiring.manifest], deleted: retiring.deleted } };
+    }
+    const { publication } = await verifyPublishedSource(tx, store, value);
+    return { source, phase: "published", cohort: structuredClone(publication.cohort), retiring: null };
+  }
+
+  async #enterRetirement(view: RetirementView, manifest: readonly string[]): Promise<RetirementHandle> {
+    const tx = this.#requireActive("retirement");
+    const store = await this.#storeFor(tx);
+    const key = path.resolve(view.source.clonePath);
+    const digest = sourceCoreDigest(view.source);
+    let lease: SourceUseLease;
+    if (view.phase === "published") {
+      // Restart (published by a dead incarnation) or this worker's own published slot: either way the store
+      // verifies the exact epoch and digest and writes retiring + the manifest BEFORE any destruction.
+      lease = await store.beginRetirement(tx, key, { expectedEpoch: view.source.sourceUseEpoch, expectedDigest: digest, manifest: [...manifest] });
+    } else {
+      const slot = await this.#slotOf(tx, store, key);
+      if (!slot || slot.state !== "retiring" || slot.epoch !== view.source.sourceUseEpoch || slot.retiring?.prior !== digest) {
+        throw new AuthorityRefusal("the retiring slot is not this source's retirement");
+      }
+      if (slot.owner.worker === store.workerIncarnation) {
+        // Our own partial retirement: only the lease this process registered for it may continue it.
+        const held = this.#leases.get(key);
+        if (!held || leaseEpoch(held) !== slot.epoch) throw new AuthorityRefusal("this worker holds the retiring slot without its lease");
+        if (slot.pending?.status === "running") throw new AuthorityRefusal("an operation on the retiring source is unresolved");
+        lease = held;
+      } else {
+        // A dead owner's retirement: taken over unless its helper may still be running (the store refuses that).
+        lease = await store.beginRetirement(tx, key, { expectedEpoch: slot.epoch, expectedDigest: digest, manifest: [] });
+      }
+    }
+    // Registered so beginDestructive (the runner-uid delete) carries its record on THIS retiring epoch.
+    this.#leases.set(key, lease);
+    const recorded = (await this.#slotOf(tx, store, key))?.retiring;
+    if (!recorded) throw new AuthorityRefusal("retiring record missing after entry");
+    return {
+      fence: sourceFenceOf(view.source), manifest: [...recorded.manifest], deleted: recorded.deleted,
+      advance: (deleted) => store.advanceRetiring(this.#requireActive("retirement"), lease, deleted),
+      finish: async () => {
+        await store.markRetired(this.#requireActive("retirement"), lease);
+        this.#leases.delete(key);
+      },
+    };
   }
 
   /**
@@ -454,6 +616,7 @@ export class AuthorityRuntime implements AuthorityScope {
     if (this.#store && this.#store.storageId === opened.storageId) return this.#store;
     this.#store = opened;
     this.#leases.clear();
+    this.#discards.clear();
     return opened;
   }
 
@@ -484,6 +647,19 @@ export class AuthorityRuntime implements AuthorityScope {
     // A seed's parent (`<runnerRoot>/<repoDir>`) does not exist before a repo's first clone, and the store
     // keys a path only when every ancestor exists. Create it exactly as the seed itself would right after.
     if (SEED_OPS.has(op)) await fsp.mkdir(path.dirname(key), { recursive: true });
+    // The guarded operator discard already authorized exactly this clone and its paired skills dir: the one
+    // operator-discard takeover opens its own retiring transaction over that footprint, whatever authority
+    // state the slot is in (a crashed worker's active epoch, settled_failed residue); a running pending refuses.
+    if (op === "discard") {
+      this.#note(key);
+      const lease = await store.admitOperatorDiscard(tx, key, [key, path.join(path.dirname(key), `${SKILLS_PREFIX}${path.basename(key)}`)]);
+      this.#leases.set(key, lease);
+      this.#discards.set(key, lease);
+      return;
+    }
+    // A retirement whose whole manifest is RECORDED deleted but whose tombstone was never written (a crash, a
+    // failed write, a pending binder) is finished here, so it cannot wedge the path's next use.
+    await this.#finishRecordedRetirement(tx, store, key);
     // A normalize works on the source its own epoch already covers: the same open lease keeps its
     // epoch. Every other op starts a new use of the path and mints a fresh epoch first.
     if (op === "normalize") {

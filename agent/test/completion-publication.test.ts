@@ -760,7 +760,7 @@ describe("rollback: a pre-#3404 worker refuses what publication writes", () => {
   });
 });
 
-describe("restart retirement reads a published source as its legacy core", () => {
+describe("restart retirement consumes the durable publication (U5)", () => {
   /** What the receipt-driven cleanup decides for a cohort in the given shape (run-id independent). */
   async function decide(t: TestContext, shape: "v1" | "v2" | "mixed"): Promise<unknown> {
     const r = await rig(t, { codex: false, cohort: 3 });
@@ -783,13 +783,19 @@ describe("restart retirement reads a published source as its legacy core", () =>
       finalHead: calls.map(c => c[5] === r.bound.expectedHead),
     };
   }
-  const V1_DECISION = { preflights: 1, modes: ["completion-check"], barePath: [true], rootsAreTheBoundRoots: [true], finalHead: [true] };
+  const RETAINED = { preflights: 0, modes: [], barePath: [], rootsAreTheBoundRoots: [], finalHead: [] };
+  const RELEASE_DECISION = { preflights: 1, modes: ["completion-check"], barePath: [true], rootsAreTheBoundRoots: [true], finalHead: [true] };
 
-  for (const shape of ["v1", "v2", "mixed"] as const) {
-    it(`${shape === "v1" ? "a V1 cohort (control)" : shape === "v2" ? "an all-V2 cohort" : "a mixed V1/V2 cohort (partial publication)"} reaches the V1 release decision`, async t => {
-      assert.deepEqual(await decide(t, shape), V1_DECISION);
+  // A legacy V1 cohort and a partially published one used to reach the release decision after a restart. Under
+  // the plan's unknown-retain they never reach the preflight: nothing proves them durably.
+  for (const shape of ["v1", "mixed"] as const) {
+    it(`${shape === "v1" ? "a V1 cohort" : "a mixed V1/V2 cohort (partial publication)"} is retained before any preflight`, async t => {
+      assert.deepEqual(await decide(t, shape), RETAINED);
     });
   }
+  it("an all-V2 published cohort reaches the release decision", async t => {
+    assert.deepEqual(await decide(t, "v2"), RELEASE_DECISION);
+  });
 });
 
 describe("an interrupted publication (process death) confers nothing on a restart", () => {

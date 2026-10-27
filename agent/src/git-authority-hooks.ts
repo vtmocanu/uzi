@@ -47,11 +47,18 @@
  *  - "replace": GitCache.prepareRecoverySuccessor, before the successor ledger/journal writes and
  *    clone. Footprint: the successor path and the journal that names the retained predecessors.
  *  - "discard": GitCache.discardRetainedSource, after the disposition check and before the first
- *    delete. Footprint: every path of the retained record.
+ *    delete. Footprint: every path of the retained record. The guarded operator discard has already
+ *    authorized exactly the clone and its paired skills dir, so this is the ONE operator-discard takeover
+ *    (AuthorityStore.admitOperatorDiscard): a fresh epoch in state `retiring` whose manifest is that footprint,
+ *    whatever state the slot held (a crashed worker's `active` epoch, `ineligible` with settled_failed residue
+ *    inside the footprint); only a `running` pending record refuses. The destructive records of the deletes are
+ *    residue retries inside that manifest, and ending the source use (AuthorityRuntime.endSourceUse) tombstones
+ *    the slot once the footprint is confirmed gone, or returns it to `ineligible` when it is not.
  *  A published source (sealed/claude_ready) is never re-admitted by accident: the runtime passes the
  *  store's explicit consume-the-publication purpose only for "seed-canonical" and "seed-attempt" (they run
- *  after git.ts's journal guards found no journal naming the path). "replace", "normalize", "discard" and
- *  every destructive operation never consume a publication; retirement does.
+ *  after git.ts's journal guards found no journal naming the path). "replace", "normalize" and every
+ *  destructive operation never consume a publication; restart retirement (beginRetirement) and the operator
+ *  discard (admitOperatorDiscard) are the only other ways a published slot changes.
  *  Not hooked: retainStoppedAttempt and markStoppedCanonical change bare ledger/marker/journal
  *  metadata only and never touch clone bytes; retireRunnerClone is fenced by the journal's
  *  completion-source fence (expectedFence), not by this hook.
