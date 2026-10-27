@@ -2554,6 +2554,13 @@ export type PublishResult =
   | { ok: true; body: PublishResponse }
   | { ok: false; httpStatus: number };
 
+export const CAPABILITY_INFERENCE_EVIDENCE_FEATURE = "capability_inference_evidence_v1";
+
+export type CapabilityInferenceEvidence = Partial<Record<"docker" | "jvm", {
+  triggers: { path: string; reason: "docker_marker" | "jvm_manifest" | "testcontainers_reference" | "docker_command" }[];
+  truncated: boolean;
+}>>;
+
 export interface StateRequest {
   /** Memory-pressure park fence, bound to the current registration. */
   register_nonce?: string;
@@ -2710,6 +2717,8 @@ export interface StateRequest {
    *  reports as `milestones` (candidate on awaiting_approval, frozen on the autopilot
    *  running report). */
   required_capabilities?: string[];
+  /** Display-only raw detector samples. Absent preserves old observations; {} is a known empty scan. */
+  capability_inference_evidence?: CapabilityInferenceEvidence;
   /** Provisionable toolchain names the run needs (e.g. go, node, python, rust, jvm).
    *  Additive + optional, OMITTED ENTIRELY when empty, same discipline as above. */
   required_tools?: string[];

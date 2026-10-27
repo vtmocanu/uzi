@@ -22496,7 +22496,7 @@ export class RunRunner {
       // PRD #122 M1 (Decision 2): an autopilot run never reports awaiting_approval, so
       // the FROZEN milestone list rides this self-contained running report instead —
       // mirroring the repo_agents conditional above. Only when non-empty (additive-
-      // optional, never []). Reporting stays fire-and-forget via the .catch below.
+      // optional, never []). The storage report is awaited before implementation.
       if (milestones?.length) autopilotState.milestones = milestones;
       // PRD #84 M4: the FROZEN requirement set rides this same self-contained running
       // report (an autopilot run never reports awaiting_approval), each field only when
@@ -23296,16 +23296,15 @@ function presentedReportFields(presented: GatePresentedRequirements | undefined)
   return fields;
 }
 
-/** PRD #84 M4: the additive `StateRequest` fields for a plan-time toolchain detection.
- *  Each array field is included ONLY when non-empty — mirroring the `milestones?.length ?
- *  {milestones} : {}` conditional-spread discipline, so a run that detected nothing (or
- *  whose scan failed and passed `undefined`) reports byte-for-byte as before. `size_class`
- *  is included whenever a detection was computed (it is soft/display-only). */
+/** Plan-time requirements omit empty arrays; a completed scan always includes its
+ *  observation map ({} means known empty). Failed scans emit nothing. WorkerClient
+ *  independently negotiates advisory metadata; size_class may floor server budgets. */
 function toolchainReportFields(
   detection: ToolchainDetection | undefined,
 ): Partial<StateRequest> {
   if (!detection) return {};
   const fields: Partial<StateRequest> = { size_class: detection.size_class };
+  fields.capability_inference_evidence = detection.evidence;
   if (detection.required_capabilities.length)
     fields.required_capabilities = detection.required_capabilities;
   if (detection.required_tools.length)

@@ -205,6 +205,8 @@ type MemoryHoldDTO struct {
 
 // RunDTO is the web view of a run; worker-internal session_id and last_seq are omitted.
 type RunDTO struct {
+	// Detail-only detector provenance; never approval authority or summary polling data.
+	CapabilityProvenance                           *CapabilityProvenance `json:"capability_provenance,omitempty"`
 	CompletionPending                              *CompletionPendingDTO `json:"completion_pending,omitempty"`
 	SemanticGate                                   *SemanticGateDTO      `json:"semantic_gate,omitempty"`
 	SemanticDrift                                  *SemanticDriftDTO     `json:"semantic_drift,omitempty"`

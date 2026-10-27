@@ -18,6 +18,7 @@ import type { ResidueQuarantineState } from "./residue-quarantine.js";
 import type { UsageWireRequest } from "./usage-recorder.js";
 import {
   WORKER_API_PREFIX,
+  CAPABILITY_INFERENCE_EVIDENCE_FEATURE,
   type MemoryBinding,
   type MemoryPolicy,
   type MemoryOutcome,
@@ -2228,7 +2229,7 @@ export class WorkerClient {
     return this.reportStateOnce(runId, `${WORKER_API_PREFIX}/runs/${runId}/state`, body, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
   }
 
-  /** Semantic writes require existing fences and never use compatibility stripping. */
+  /** Semantic authority fields never downgrade; advisory observations negotiate separately. */
   async reportSemanticPlanGateState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal): Promise<StateAck> {
     const frozen: PlanCrossCheckStateRequest = JSON.parse(JSON.stringify(body));
     if (!Number.isSafeInteger(frozen.claim_generation) || (frozen.claim_generation ?? 0) <= 0 ||
@@ -2514,8 +2515,10 @@ export class WorkerClient {
           throw new Error("source publication requires negotiated support, positive claim_generation and matching terminal proof");
       }
       try {
-        this.sealCodexAdmission(path, { ...body, claim_generation: admissionGeneration ?? body.claim_generation });
-        const res = await this.fetchRaw("POST", path, body, this.httpTimeoutMs, signal);
+        const outbound = { ...body };
+        if (!this.hasFeature(CAPABILITY_INFERENCE_EVIDENCE_FEATURE)) delete outbound.capability_inference_evidence;
+        this.sealCodexAdmission(path, { ...outbound, claim_generation: admissionGeneration ?? outbound.claim_generation });
+        const res = await this.fetchRaw("POST", path, outbound, this.httpTimeoutMs, signal);
         // 409 = the server declined the transition and is telling us the run's real
         // status. Not an error, and not a retry: the server has moved on.
         if (res.status === 200 || res.status === 409) {

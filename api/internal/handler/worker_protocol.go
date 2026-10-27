@@ -402,6 +402,7 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 // worker never sends the snapshot — the same shape an old worker sees.
 func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool) []string {
 	groups := [][]string{
+		{workersvc.CapabilityEvidenceFeature},
 		{"heartbeat_protocol_refresh_v1"},
 		{"codex_account_admission_signal_v1"},
 		{"completion_non_closing_v1"},

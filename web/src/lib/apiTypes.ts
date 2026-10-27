@@ -3039,6 +3039,18 @@ export interface SemanticDriftDTO {
 }
 
 export interface Run {
+  capability_provenance?: {
+    hints_known: boolean;
+    inference_known: boolean;
+    capabilities: {
+      capability: string;
+      sources: string[];
+      required: boolean;
+      inference_ignored: boolean;
+      triggers: { path: string; reason: string }[];
+      truncated: boolean;
+    }[];
+  };
   /** Repo display path on detail reads; absent on older servers, empty when unavailable. */
   repo_path?: string;
   /** Frozen repo inference policy; explicit requirements take precedence. */
@@ -3990,6 +4002,7 @@ export type RunSummaryItem = Omit<
   "plan_md" | "repo_agents" | "issue_description" | "preserved_patch"
   | "reset_state_digest" | "milestone_reconciliations" | "milestone_reconciliations_next_before_gate_revision"
   | "semantic_gate" | "completion_pending" | "semantic_drift"
+  | "capability_provenance"
 >;
 
 // RunOutcomes is the failed-run rate aggregate for one scope+window (PRD #1293).

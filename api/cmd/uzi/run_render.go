@@ -202,6 +202,32 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 	if len(r.IgnoredInferredCapabilities) > 0 {
 		rows = append(rows, []string{"IGNORED_INFERRED_CAPABILITIES", sanitizeTTY(strings.Join(r.IgnoredInferredCapabilities, ","))})
 	}
+	if r.CapabilityProvenance != nil {
+		if len(r.CapabilityProvenance.Capabilities) > 0 {
+			if !r.CapabilityProvenance.HintsKnown {
+				rows = append(rows, []string{"CAPABILITY_PROVENANCE", "repo-hint history unknown"})
+			}
+			if !r.CapabilityProvenance.InferenceKnown {
+				rows = append(rows, []string{"CAPABILITY_PROVENANCE", "inference evidence unknown"})
+			}
+		}
+		for _, item := range r.CapabilityProvenance.Capabilities {
+			status := "required"
+			if !item.Required {
+				status = "not currently required"
+			}
+			if item.InferenceIgnored {
+				status += "; inference ignored"
+			}
+			rows = append(rows, []string{"CAPABILITY_SOURCE", sanitizeTTY(item.Capability + ": " + strings.Join(item.Sources, "+") + "; " + status)})
+			for _, trigger := range item.Triggers {
+				rows = append(rows, []string{"CAPABILITY_TRIGGER", sanitizeTTY(item.Capability + ": " + trigger.Reason + ": " + trigger.Path)})
+			}
+			if item.Truncated {
+				rows = append(rows, []string{"CAPABILITY_TRIGGER", sanitizeTTY(item.Capability + ": additional or invalid trigger paths omitted")})
+			}
+		}
+	}
 	if len(r.RequiredTools) > 0 {
 		rows = append(rows, []string{"REQUIRED_TOOLS", sanitizeTTY(strings.Join(r.RequiredTools, ","))})
 	}

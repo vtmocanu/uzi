@@ -4224,16 +4224,18 @@ type StateRequest struct {
 	// worker sends each array only when non-empty. UNTRUSTED on arrival — every name is
 	// Filter-ed / FilterTools-ed against the server-owned vocabulary before storage
 	// (capability package), and SizeClass is clamped to {"s","m","l"}, so a garbled
-	// report cannot smuggle arbitrary strings into the requirement panel. Ignored on
-	// every non-`awaiting_approval` report.
+	// report cannot smuggle arbitrary strings into the requirement panel. Consumed by
+	// awaiting_approval and plan-bearing autopilot running reports.
 	//
 	// required_capabilities is UNION-MERGED onto the M2 repo hint (escalation-only:
 	// inference can add, never drop); required_tools is SET. size_class is SET the same
 	// way (PRD #84 M4 4b): the clamped value REPLACES the run's size_class column, and a
 	// nil / off-vocabulary value COALESCEs to a no-op. A later unit surfaces it on the DTO.
 	RequiredCapabilities *[]string `json:"required_capabilities"`
-	RequiredTools        *[]string `json:"required_tools"`
-	SizeClass            *string   `json:"size_class"`
+	// Optional, display-only raw detector observations; never part of gate identity.
+	CapabilityInferenceEvidence json.RawMessage `json:"capability_inference_evidence,omitempty"`
+	RequiredTools               *[]string       `json:"required_tools"`
+	SizeClass                   *string         `json:"size_class"`
 	// RecoveryCause is the worker's TYPED cause for a 'recovery_wait' park (PRD #1392 M1).
 	// UNTRUSTED free text on arrival: SetState validates it against the server enum
 	// {forge_unreachable, empty_turn, provider_outage, vault_locked, data_volume_full} BEFORE any
@@ -4929,6 +4931,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		// it for them). Absent on every ordinary session-id/iteration heartbeat, so those
 		// stay no-ops.
 		runningParams.InferredCapabilities, runningParams.InferredTools, runningParams.SizeClass = inferredRequirementParams(req)
+		runningParams.CapabilityInferenceEvidence = capabilityEvidenceParam(req)
 		// PRD #628 M4: a cross-worker re-claim that reseeded from the DEFAULT branch recovered
 		// no committed work, so pass-1's milestones_completed is stale — it must be cleared,
 		// NOT unioned onto. milestones_completed is a monotone union (SetRunRunning below,
@@ -4990,11 +4993,12 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 			// non-empty candidate to `[]` (no superseded criteria freeze), and after a REJECTED list
 			// (stored candidate NULL beside a stored plan_md) it stays NULL: nothing freezes and the
 			// run holds at finalize.
-			MilestonesCandidate:  reportPlanMilestonesParam(owned, req),
-			InferredCapabilities: inferredCaps,
-			InferredTools:        inferredTools,
-			SizeClass:            sizeClass,
-			PlanChangedFiles:     planChangedFilesParam(req.PlanChangedFiles),
+			MilestonesCandidate:         reportPlanMilestonesParam(owned, req),
+			InferredCapabilities:        inferredCaps,
+			CapabilityInferenceEvidence: capabilityEvidenceParam(req),
+			InferredTools:               inferredTools,
+			SizeClass:                   sizeClass,
+			PlanChangedFiles:            planChangedFilesParam(req.PlanChangedFiles),
 		}
 		// PRD #1795 M1: classify the report under the run-row lock BEFORE any write (see
 		// gate_revision.go). The effective presented payload is computed in Go, so a conflict

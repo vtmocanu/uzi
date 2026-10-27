@@ -1136,6 +1136,8 @@ type Run struct {
 	CheckpointCoordinates       []byte             `json:"checkpoint_coordinates"`
 	RetainedParkCount           int32              `json:"retained_park_count"`
 	IgnoredInferredCapabilities []string           `json:"ignored_inferred_capabilities"`
+	HintedCapabilities          []string           `json:"hinted_capabilities"`
+	CapabilityInferenceEvidence []byte             `json:"capability_inference_evidence"`
 	ReserveHoldReason           pgtype.Text        `json:"reserve_hold_reason"`
 	ReserveExemptUntil          pgtype.Timestamptz `json:"reserve_exempt_until"`
 	ReserveExemptGrantedAt      pgtype.Timestamptz `json:"reserve_exempt_granted_at"`

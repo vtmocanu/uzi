@@ -3178,7 +3178,7 @@ row (the hard, closed-vocabulary set — today `docker`/`jvm` — a subset of
 which the run's worker must have to claim and to clear the plan-approval
 gate), a `REQUIRED_TOOLS` row (provisionable toolchains that will simply be
 installed at run time, never a blocker), and a `SIZE_CLASS` row (`s`/`m`/`l`,
-advisory only). All three are comma-joined where the value is a list, and
+coarse repo size, which can floor large-repo budgets). All three are comma-joined where the value is a list, and
 readable the same way under `--json`.
 
 `IGNORED_INFERRED_CAPABILITIES` shows the run's captured repo inference policy
@@ -3186,6 +3186,15 @@ when non-empty. The JSON field is `ignored_inferred_capabilities`. This affects
 inferred scheduling requirements only; explicit repo hints still win, and
 `required_tools` is unchanged. Configure the policy in the repo's Tools panel
 or through its settings API; the CLI has no repo-settings command.
+
+`CAPABILITY_SOURCE` lists known repo-hint and inferred sources, current required
+status, and ignored inference. `CAPABILITY_TRIGGER` lists bounded detector path
+samples and reasons, with a note for omitted paths. `CAPABILITY_PROVENANCE` marks
+unavailable history. The detail JSON field
+`capability_provenance` includes `hints_known`, `inference_known` and per-capability
+source flags, triggers and truncation. Unknown legacy provenance remains unknown;
+an empty observed scan is distinct from missing evidence. Evidence stays outside
+approval identity and summary polling.
 
 ### Run status, and what `--follow` waits for
 
