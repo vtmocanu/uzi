@@ -35,7 +35,9 @@
 # reason -- it scopes the token as an environment secret -- NOT as an approval gate: that
 # environment carries no required reviewer (removed 2026-08-20). Publication waits for
 # the read-only release proof, with no approval click. Access control is the `v*` tag ruleset,
-# as in release.yml. No GitHub Release is
+# as in release.yml. Standard stable authorization is the release-stable review in
+# release-auto.yml before its App creates a tag; this publisher has no second review.
+# No GitHub Release is
 # created (the auto-archive needs none), so permissions stay read-only -- matching
 # cc-statusline.
 
