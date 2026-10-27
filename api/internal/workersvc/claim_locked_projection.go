@@ -3,6 +3,7 @@ package workersvc
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"strings"
 	"time"
@@ -56,7 +57,7 @@ func (s *Service) claimPlanProjection(ctx context.Context, q claimPlanReader, ru
 	}
 	// The submitted plan's seq rides ONLY the awaiting_approval resume (D13: "awaiting_approval
 	// with the submitted plan's seq"), so the query stays off the hot path for every other
-	// claim. A query error degrades to seq 0 and NEVER fails the claim — the same degrade-and-log
+	// claim. A recovered query error degrades to seq 0 — the same degrade-and-log
 	// posture as the milestone/issue-comments decodes above; the run still resumes its gate, the
 	// worker just cannot correlate a buffered approve_plan to a specific plan revision.
 	var resumePlanSeq int64
@@ -75,6 +76,9 @@ func (s *Service) claimPlanProjection(ctx context.Context, q claimPlanReader, ru
 			}
 		}
 		if seq, err := q.LatestPlanSeqForRun(ctx, run.ID); err != nil {
+			if errors.Is(err, errClaimPlanFrameTx) {
+				return nil, err
+			}
 			slog.Warn("workersvc: latest plan seq for resume", "run_id", run.ID, "error", err)
 		} else {
 			resumePlanSeq = seq
@@ -104,13 +108,16 @@ func (s *Service) claimPlanProjection(ctx context.Context, q claimPlanReader, ru
 	// latest `plan` frame whose plan_md equals the persisted run.PlanMd, so a newer frame for a
 	// plan whose awaiting_approval report never persisted cannot move it. The worker discards a
 	// replayed gate verdict written against an earlier plan. Same hasPlan test resumePhaseFor
-	// applies, same planApproved value. A query error or no matching plan frame omits the field
-	// (no fallback to the latest frame) and never fails the claim.
+	// applies, same planApproved value. A recovered query error or no matching plan frame
+	// omits the field (no fallback to the latest frame). Savepoint failures are fatal.
 	var resumePlanAt *time.Time
 	if run.PlanMd.Valid && strings.TrimSpace(run.PlanMd.String) != "" && !planApproved {
 		if at, err := q.LatestPersistedPlanFrameAtForRun(ctx, store.LatestPersistedPlanFrameAtForRunParams{
 			RunID: run.ID, PlanMd: run.PlanMd.String,
 		}); err != nil {
+			if errors.Is(err, errClaimPlanFrameTx) {
+				return nil, err
+			}
 			slog.Warn("workersvc: latest plan frame time for resume", "run_id", run.ID, "error", err)
 		} else if at.Valid {
 			t := at.Time

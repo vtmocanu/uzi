@@ -86,6 +86,56 @@ type pgxClaimFinishTx struct {
 	tx pgx.Tx
 }
 
+// Only these legacy-degradable reads use savepoints. The owned run lock was
+// acquired by finishRunClaimTx before either read and belongs to the outer tx.
+func (t pgxClaimFinishTx) LatestPlanSeqForRun(ctx context.Context, id uuid.UUID) (int64, error) {
+	return claimPlanFrameRead(ctx, t.tx, func(q *store.Queries) (int64, error) {
+		return q.LatestPlanSeqForRun(ctx, id)
+	})
+}
+
+func (t pgxClaimFinishTx) LatestPersistedPlanFrameAtForRun(ctx context.Context, arg store.LatestPersistedPlanFrameAtForRunParams) (pgtype.Timestamptz, error) {
+	return claimPlanFrameRead(ctx, t.tx, func(q *store.Queries) (pgtype.Timestamptz, error) {
+		return q.LatestPersistedPlanFrameAtForRun(ctx, arg)
+	})
+}
+
+var errClaimPlanFrameTx = errors.New("claim plan frame transaction recovery failed")
+
+// claimPlanFrameRead makes one read in one savepoint, without retries. A query
+// error may degrade only after rollback succeeds; an uncertain outer transaction
+// or a cancelled caller must prevent delivery.
+func claimPlanFrameRead[T any](ctx context.Context, tx pgx.Tx, read func(*store.Queries) (T, error)) (T, error) {
+	var zero T
+	if tx == nil {
+		return zero, fmt.Errorf("%w: no transaction", errClaimPlanFrameTx)
+	}
+	sp, err := tx.Begin(ctx)
+	if err != nil {
+		return zero, fmt.Errorf("%w: begin savepoint: %w", errClaimPlanFrameTx, err)
+	}
+	if sp == nil {
+		return zero, fmt.Errorf("%w: nil savepoint", errClaimPlanFrameTx)
+	}
+	value, queryErr := read(store.New(sp))
+	if queryErr != nil {
+		if err := sp.Rollback(ctx); err != nil {
+			return zero, fmt.Errorf("%w: rollback savepoint: %w", errClaimPlanFrameTx, errors.Join(queryErr, err))
+		}
+		if ctx.Err() != nil || isTransientClaimDBError(queryErr) || errors.Is(queryErr, pgx.ErrTxClosed) {
+			return zero, fmt.Errorf("%w: interrupted read: %w", errClaimPlanFrameTx, errors.Join(queryErr, ctx.Err()))
+		}
+		return zero, queryErr
+	}
+	if err := sp.Commit(ctx); err != nil {
+		return zero, fmt.Errorf("%w: release savepoint: %w", errClaimPlanFrameTx, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return zero, fmt.Errorf("%w: cancelled read: %w", errClaimPlanFrameTx, err)
+	}
+	return value, nil
+}
+
 func (t pgxClaimFinishTx) Commit(ctx context.Context) error   { return t.tx.Commit(ctx) }
 func (t pgxClaimFinishTx) Rollback(ctx context.Context) error { return t.tx.Rollback(ctx) }
 

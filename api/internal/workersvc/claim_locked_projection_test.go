@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -234,6 +235,135 @@ func TestClaimLockedProjectionFinalSize(t *testing.T) {
 	if err != nil || p != nil || fs.claimFailed == nil || fs.claimFailed.FailOrigin.String != "provisioning_failed" {
 		t.Fatalf("final size not enforced: %v / %v", p, err)
 	}
+}
+
+// Exercise both production overrides through the shared projection boundary.
+// Embedding pgx.Tx keeps unexpected calls loud without a broad handwritten mock.
+func TestClaimLockedProjectionSavepointFailures(t *testing.T) {
+	for _, target := range []string{"seq", "time"} {
+		for _, mode := range []string{"nil_tx", "begin", "nil_savepoint", "rollback", "release", "cancelled", "connection", "query", "success"} {
+			t.Run(target+"/"+mode, func(t *testing.T) {
+				_, svc, run, _ := finishFixture(t)
+				run.PlanMd = pgtype.Text{String: "plan", Valid: true}
+				run.SessionID = pgtype.Text{String: "session", Valid: true}
+				run.PlanSource, run.AutoApprove, run.GateRevision = "agent", false, 0
+				injected := errors.New("savepoint failure")
+				tx := &lockedPlanFrameUnitTx{target: target, mode: mode, injected: injected}
+				var underlying pgx.Tx = tx
+				if mode == "nil_tx" {
+					underlying = nil
+				}
+				ctx := context.Background()
+				if mode == "cancelled" {
+					var cancel context.CancelFunc
+					ctx, cancel = context.WithCancel(ctx)
+					defer cancel()
+					tx.cancel = cancel
+				}
+				q := pgxClaimFinishTx{tx: underlying}
+				p, err := svc.claimPlanProjection(ctx, q, run, store.GetRunClaimContextRow{})
+				if mode != "query" && mode != "success" {
+					if p != nil || !errors.Is(err, errClaimPlanFrameTx) {
+						t.Fatalf("savepoint failure degraded: payload=%v err=%v", p, err)
+					}
+					if (mode == "begin" || mode == "rollback" || mode == "release") && !errors.Is(err, injected) {
+						t.Fatalf("lost lifecycle failure: %v", err)
+					}
+					return
+				}
+				if err != nil || p == nil {
+					t.Fatalf("recoverable projection: %v", err)
+				}
+				wantSeq := int64(17)
+				if mode == "query" && target == "seq" {
+					wantSeq = 0
+				}
+				wantTime := mode != "query" || target != "time"
+				if p.ResumePlanSeq != wantSeq || (p.ResumePlanAt != nil) != wantTime {
+					t.Fatalf("degradation: seq=%d at=%v", p.ResumePlanSeq, p.ResumePlanAt)
+				}
+				if mode == "query" && tx.rollbacks != 1 {
+					t.Fatalf("query error returned without recovery: rollbacks=%d", tx.rollbacks)
+				}
+			})
+		}
+	}
+}
+
+type lockedPlanFrameUnitTx struct {
+	pgx.Tx
+	target    string
+	mode      string
+	injected  error
+	begins    int
+	rollbacks int
+	cancel    context.CancelFunc
+}
+
+func (tx *lockedPlanFrameUnitTx) Begin(context.Context) (pgx.Tx, error) {
+	tx.begins++
+	target := tx.begins == 1 && tx.target == "seq" || tx.begins == 2 && tx.target == "time"
+	if target && tx.mode == "begin" {
+		return nil, tx.injected
+	}
+	if target && tx.mode == "nil_savepoint" {
+		return nil, nil
+	}
+	return &lockedPlanFrameUnitSavepoint{owner: tx, target: target}, nil
+}
+
+type lockedPlanFrameUnitSavepoint struct {
+	pgx.Tx
+	owner  *lockedPlanFrameUnitTx
+	target bool
+}
+
+func (sp *lockedPlanFrameUnitSavepoint) QueryRow(_ context.Context, sql string, _ ...any) pgx.Row {
+	var err error
+	if sp.target {
+		switch sp.owner.mode {
+		case "rollback", "query":
+			err = sp.owner.injected
+		case "cancelled":
+			sp.owner.cancel()
+			err = context.Canceled
+		case "connection":
+			err = &pgconn.PgError{Code: "08006", Message: "connection failure"}
+		}
+	}
+	return lockedPlanFrameUnitRow{err: err, seq: strings.HasPrefix(sql, "-- name: LatestPlanSeqForRun :one")}
+}
+
+func (sp *lockedPlanFrameUnitSavepoint) Rollback(context.Context) error {
+	sp.owner.rollbacks++
+	if sp.target && sp.owner.mode == "rollback" {
+		return sp.owner.injected
+	}
+	return nil
+}
+
+func (sp *lockedPlanFrameUnitSavepoint) Commit(context.Context) error {
+	if sp.target && sp.owner.mode == "release" {
+		return sp.owner.injected
+	}
+	return nil
+}
+
+type lockedPlanFrameUnitRow struct {
+	err error
+	seq bool
+}
+
+func (r lockedPlanFrameUnitRow) Scan(dest ...any) error {
+	if r.err != nil {
+		return r.err
+	}
+	if r.seq {
+		*dest[0].(*int64) = 17
+	} else {
+		*dest[0].(*pgtype.Timestamptz) = pgtype.Timestamptz{Time: time.Date(2026, 10, 27, 1, 2, 3, 0, time.UTC), Valid: true}
+	}
+	return nil
 }
 
 // This is deliberately separate from the public-Claim preunit overlay tests: it
