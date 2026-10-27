@@ -34,6 +34,10 @@ func TestPolicyClaimAckHumanApprovalLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.exec("UPDATE runs SET plan_cross_check_required=false,auto_approve=false,policy_refusal_count=1 WHERE id=$1", created.ID)
+	// Dispatch is a fixture precondition; no forge branch seeding is exercised.
+	if _, err := f.svc.DispatchTaskRun(e.ctx, f.userID, created.ID); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() { dropCustodyHolds(t, e, f.userID) })
 	claim, err := f.svc.Claim(e.ctx, w, nil)
 	if err != nil || claim == nil {
@@ -50,7 +54,7 @@ func TestPolicyClaimAckHumanApprovalLiveDB(t *testing.T) {
 	req := gateReq(&gen, uid())
 	req.RequiredCapabilities = &[]string{}
 	candidate, err := f.svc.SetStateReportWithReconciliation(e.ctx, w, created.ID, req)
-	if err != nil || !candidate.Applied || candidate.PlanApproved == nil || *candidate.PlanApproved {
+	if err != nil || !candidate.Applied || candidate.PlanApproved == nil || *candidate.PlanApproved || mustRun(t, e, created.ID).PolicyRefusalCount != 1 {
 		t.Fatalf("candidate: %+v %v", candidate, err)
 	}
 	approval, err := f.svc.SubmitInputWithOptions(e.ctx, f.userID, created.ID, "approve_plan", "", nil, SubmitInputOptions{ExpectedGateRevision: &candidate.GateRevision})
@@ -64,7 +68,7 @@ func TestPolicyClaimAckHumanApprovalLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	approved, err := f.svc.SetStateReportWithReconciliation(e.ctx, w, created.ID, StateRequest{State: "running", ClaimGeneration: &gen})
-	if err != nil || !approved.Applied || approved.PlanApproved == nil || !*approved.PlanApproved {
+	if err != nil || !approved.Applied || approved.PlanApproved == nil || !*approved.PlanApproved || mustRun(t, e, created.ID).PolicyRefusalCount != 1 {
 		t.Fatalf("current human approval: %+v %v", approved, err)
 	}
 }
@@ -113,7 +117,9 @@ func TestPolicyAckApprovalNegotiationControlsLiveDB(t *testing.T) {
 			case "old_worker":
 				f.wkr.ProtocolCapabilities = []string{capability.GateRevisionV1}
 			case "claude":
-				e.exec("UPDATE runs SET harness='claude' WHERE id=$1", run)
+				e.exec(`UPDATE runs SET harness='claude', codex_secret_id=NULL, codex_auth_mode=NULL,
+					codex_secret_label=NULL, codex_account_key=NULL, codex_material_revision=NULL,
+					codex_account_revision=NULL WHERE id=$1`, run)
 			case "interactive":
 				e.exec("UPDATE runs SET interactive=true WHERE id=$1", run)
 			}
