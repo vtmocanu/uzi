@@ -186,6 +186,7 @@ func (s *Service) reservePauseForOwner(ctx context.Context, q reservePauseQuerie
 		runs[i].ReserveExemptGrantedAt = pgtype.Timestamptz{}
 		runs[i].ReserveExemptCredentialID = pgtype.UUID{}
 		runs[i].ReserveExemptWindowReset = pgtype.Timestamptz{}
+		runs[i].ReserveExemptPriorPct = pgtype.Int2{}
 	}
 
 	// 2. Classify.
@@ -366,7 +367,10 @@ type ReserveOverrideGrant struct {
 	GrantedAt    time.Time
 	CredentialID *uuid.UUID
 	WindowReset  *time.Time
-	Until        time.Time
+	// PriorPct is the 7-day utilization the grant read, recorded with WindowReset: the reset
+	// detector's prior, so a later threshold change cannot hide an observed reset.
+	PriorPct *int16
+	Until    time.Time
 }
 
 // ComputeReserveOverride computes the override an owner's manual resume of the given weekly_reserve
@@ -394,6 +398,8 @@ func ComputeReserveOverride(ctx context.Context, q *store.Queries, run store.Run
 	if v, ok := snap.spentVerdict(run); ok && v.Fresh && v.State == usagereserve.Held && v.ResetsAt != nil && v.ResetsAt.After(now) {
 		anchor := v.ResetsAt.UTC()
 		g.WindowReset = &anchor
+		prior := int16(v.Pct)
+		g.PriorPct = &prior
 		if anchor.Before(g.Until) {
 			g.Until = anchor
 		}

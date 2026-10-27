@@ -141,6 +141,9 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 				if grant.WindowReset != nil {
 					resumeParams.ReserveExemptWindowReset = pgtype.Timestamptz{Time: *grant.WindowReset, Valid: true}
 				}
+				if grant.PriorPct != nil {
+					resumeParams.ReserveExemptPriorPct = pgtype.Int2{Int16: *grant.PriorPct, Valid: true}
+				}
 				auditBody = pgtype.Text{String: "overrode the weekly usage reserve until " + grant.Until.UTC().Format(time.RFC3339), Valid: true}
 			}
 		}

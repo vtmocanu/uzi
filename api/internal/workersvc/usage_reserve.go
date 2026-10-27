@@ -453,14 +453,20 @@ func overrideEndedByReading(run store.Run, snap *reserveSnap) bool {
 		return false
 	}
 	anchor := run.ReserveExemptWindowReset.Time
-	// The utilization at the grant is not persisted. The anchor is recorded only when the run read at
-	// or above the threshold at the grant (ComputeReserveOverride), so the threshold is the one
-	// established lower bound on the prior. Utilization is monotonic within a week, so a fresh reading
-	// at or below usagereserve.PctResetCeil under an unmoved boundary is a reset whatever the exact
-	// prior was, provided the prior reached the detectors' own floor; for a threshold below
-	// usagereserve.PctResetFloor the drop arm cannot fire (the moved-boundary arm and the clock arm
-	// still end the exemption).
-	prior := float64(*snap.threshold)
+	// The prior is the utilization the grant read (reserve_exempt_prior_pct, recorded with the anchor
+	// from a fresh held verdict), never the CURRENT threshold: the owner can change the threshold
+	// mid-override, and a lowered one would hide an observed reset. Utilization is monotonic within a
+	// week, so a fresh reading at or below usagereserve.PctResetCeil under an unmoved boundary is a
+	// reset when the prior reached the detectors' own floor; below usagereserve.PctResetFloor the drop
+	// arm cannot fire (the moved-boundary arm and the clock arm still end the exemption). A row with an
+	// anchor but no recorded prior cannot prove a drop, so only those two arms apply to it.
+	if !run.ReserveExemptPriorPct.Valid {
+		if codex {
+			return usagereserve.CodexResetObserved(anchor.Unix(), v.ResetsAt.Unix(), nil, nil)
+		}
+		return usagereserve.ClaudeResetObserved(anchor, nil, v.ResetsAt, v.Pct)
+	}
+	prior := float64(run.ReserveExemptPriorPct.Int16)
 	if codex {
 		fresh := float64(v.Pct)
 		return usagereserve.CodexResetObserved(anchor.Unix(), v.ResetsAt.Unix(), &prior, &fresh)

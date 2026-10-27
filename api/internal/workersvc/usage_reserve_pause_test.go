@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
@@ -48,6 +49,9 @@ func ovRun(harness string, until time.Time, anchor *time.Time) store.Run {
 	}
 	if anchor != nil {
 		r.ReserveExemptWindowReset = pgconv.Time(*anchor)
+		// A real grant records its anchor only from a fresh held reading, together with that
+		// reading's utilization as the reset detector's prior (72% here, above every test threshold).
+		r.ReserveExemptPriorPct = pgtype.Int2{Int16: 72, Valid: true}
 	}
 	return r
 }
@@ -61,6 +65,10 @@ func TestOverrideActiveReadingAware(t *testing.T) {
 	afterGrant := ovGrant.Add(time.Hour)
 	beforeGrant := ovGrant.Add(-time.Hour)
 	moved := anchor.Add(7 * 24 * time.Hour) // a week later: the boundary moved
+	withPrior := func(run store.Run, pct int16) store.Run {
+		run.ReserveExemptPriorPct = pgtype.Int2{Int16: pct, Valid: true}
+		return run
+	}
 	withThr := func(snap *reserveSnap, thr int16) *reserveSnap {
 		snap.threshold = &thr
 		return snap
@@ -88,9 +96,9 @@ func TestOverrideActiveReadingAware(t *testing.T) {
 		{"codex early reset", "codex", ovRun("codex", anchor, &anchor), ovSnap(freshV(usagereserve.Held, 55, moved), afterGrant), now, false},
 		{"codex unmoved boundary", "codex", ovRun("codex", anchor, &anchor), ovSnap(freshV(usagereserve.Held, 55, anchor), afterGrant), now, true},
 		{"codex no anchor, fresh below the line", "codex", ovRun("codex", ovGrant.Add(ReserveOverrideWindow), nil), ovSnap(freshV(usagereserve.OK, 5, anchor), afterGrant), now, false},
-		{"threshold 1, claude: the same fresh 1% under the unchanged boundary is not a reset", "claude", ovRun("claude", anchor, &anchor), withThr(ovSnap(freshV(usagereserve.Held, 1, anchor), afterGrant), 1), now, true},
-		{"threshold 1, codex: the same fresh 1.0 under the unchanged boundary is not a reset", "codex", ovRun("codex", anchor, &anchor), withThr(ovSnap(freshV(usagereserve.Held, 1, anchor), afterGrant), 1), now, true},
-		{"threshold 1: a moved boundary still ends it", "claude", ovRun("claude", anchor, &anchor), withThr(ovSnap(freshV(usagereserve.Held, 1, moved), afterGrant), 1), now, false},
+		{"threshold 1, claude: the same fresh 1% under the unchanged boundary is not a reset", "claude", withPrior(ovRun("claude", anchor, &anchor), 1), withThr(ovSnap(freshV(usagereserve.Held, 1, anchor), afterGrant), 1), now, true},
+		{"threshold 1, codex: the same fresh 1.0 under the unchanged boundary is not a reset", "codex", withPrior(ovRun("codex", anchor, &anchor), 1), withThr(ovSnap(freshV(usagereserve.Held, 1, anchor), afterGrant), 1), now, true},
+		{"threshold 1: a moved boundary still ends it", "claude", withPrior(ovRun("claude", anchor, &anchor), 1), withThr(ovSnap(freshV(usagereserve.Held, 1, moved), afterGrant), 1), now, false},
 		{"threshold 70, fresh 1% under the unchanged boundary is a reset", "claude", ovRun("claude", anchor, &anchor), withThr(ovSnap(freshV(usagereserve.OK, 1, anchor), afterGrant), 70), now, false},
 		{"threshold 70, codex fresh 1.0 under the unchanged boundary is a reset", "codex", ovRun("codex", anchor, &anchor), withThr(ovSnap(freshV(usagereserve.OK, 1, anchor), afterGrant), 70), now, false},
 		{"no exemption", "claude", store.Run{Kind: runkind.Issue}, ovSnap(freshV(usagereserve.OK, 5, anchor), afterGrant), now, false},
@@ -250,5 +258,49 @@ func TestReserveReleaseHasCapacity(t *testing.T) {
 	// With a lane (ephemeral on) the helper defers to the lanes.
 	if got := svc.reserveReleaseHasCapacity(run, ovSnap(freshV(usagereserve.Held, 60, anchor), now), nil, false, true, now); !got {
 		t.Error("with a lane the helper defers to the lane decision")
+	}
+}
+
+// TestOverrideResetSurvivesThresholdChange: the reset detector's prior is the utilization the grant
+// read (reserve_exempt_prior_pct), not the CURRENT threshold. Granted above 70%, the owner then
+// lowers the threshold to 1%; a fresh reading at 0% under the unchanged boundary is still an observed
+// reset and must end the override, for both harnesses.
+func TestOverrideResetSurvivesThresholdChange(t *testing.T) {
+	for _, harness := range []string{"claude", harnessCodex} {
+		t.Run(harness, func(t *testing.T) {
+			run := ovRun(harness, ovAnchor, &ovAnchor)
+			run.ReserveExemptPriorPct = pgtype.Int2{Int16: 72, Valid: true}
+			snap := ovSnap(freshV(usagereserve.OK, 0, ovAnchor), ovGrant.Add(time.Hour))
+			snap.threshold = i16p(1)
+			if overrideActive(run, snap, reserveT0) {
+				t.Fatal("an observed reset must end the override after the threshold is lowered from 70 to 1")
+			}
+			// The same reading with the threshold raised still ends it, and an unchanged 72% reading does not.
+			snap.threshold = i16p(90)
+			if overrideActive(run, snap, reserveT0) {
+				t.Fatal("an observed reset must end the override after the threshold is raised")
+			}
+			still := ovSnap(freshV(usagereserve.OK, 72, ovAnchor), ovGrant.Add(time.Hour))
+			still.threshold = i16p(1)
+			if !overrideActive(run, still, reserveT0) {
+				t.Fatal("an unchanged reading under the same boundary is not a reset")
+			}
+		})
+	}
+}
+
+// TestOverrideAnchorWithoutPriorUsesBoundaryOnly: a row carrying an anchor but no recorded prior
+// cannot prove a drop, so an unmoved boundary keeps the exemption while a moved one still ends it.
+func TestOverrideAnchorWithoutPriorUsesBoundaryOnly(t *testing.T) {
+	moved := ovAnchor.Add(7 * 24 * time.Hour)
+	for _, harness := range []string{"claude", harnessCodex} {
+		run := ovRun(harness, ovAnchor, &ovAnchor)
+		run.ReserveExemptPriorPct = pgtype.Int2{}
+		if !overrideActive(run, ovSnap(freshV(usagereserve.OK, 0, ovAnchor), ovGrant.Add(time.Hour)), reserveT0) {
+			t.Errorf("%s: no recorded prior, unmoved boundary: want the exemption kept", harness)
+		}
+		if overrideActive(run, ovSnap(freshV(usagereserve.OK, 0, moved), ovGrant.Add(time.Hour)), reserveT0) {
+			t.Errorf("%s: no recorded prior, moved boundary: want the exemption ended", harness)
+		}
 	}
 }

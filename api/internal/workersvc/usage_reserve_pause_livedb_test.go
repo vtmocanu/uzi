@@ -592,12 +592,12 @@ func TestReserveOverrideEndsAtObservedResetLiveDB(t *testing.T) {
 	granted := time.Now().Add(-2 * time.Hour)
 	mk := func(withAnchor bool, until time.Time) uuid.UUID {
 		id := fx.queueRun(reserveRun{firstStarted: true})
-		var wr any
+		var wr, prior any
 		if withAnchor {
-			wr = anchor
+			wr, prior = anchor, 60 // a real grant records the utilization it read with the anchor
 		}
 		fx.env.exec(`UPDATE runs SET reserve_exempt_until = $2, reserve_exempt_granted_at = $3, reserve_exempt_credential_id = $4,
-		             reserve_exempt_window_reset = $5, anthropic_secret_id = $4 WHERE id = $1`, id, until, granted, tok, wr)
+		             reserve_exempt_window_reset = $5, reserve_exempt_prior_pct = $6, anthropic_secret_id = $4 WHERE id = $1`, id, until, granted, tok, wr, prior)
 		return id
 	}
 	run := mk(true, anchor)
@@ -625,7 +625,7 @@ func TestReserveOverrideEndsAtObservedResetLiveDB(t *testing.T) {
 	if n := fx.pass(); n < 1 {
 		t.Fatal("the pass did not drop the ended exemption")
 	}
-	if r := mustRun(t, fx.env, run); r.ReserveExemptUntil.Valid || r.ReserveExemptGrantedAt.Valid || r.ReserveExemptCredentialID.Valid || r.ReserveExemptWindowReset.Valid {
+	if r := mustRun(t, fx.env, run); r.ReserveExemptUntil.Valid || r.ReserveExemptGrantedAt.Valid || r.ReserveExemptCredentialID.Valid || r.ReserveExemptWindowReset.Valid || r.ReserveExemptPriorPct.Valid {
 		t.Fatalf("an ended exemption kept columns: %+v", r)
 	}
 

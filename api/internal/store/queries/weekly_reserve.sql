@@ -159,14 +159,15 @@ cancel_input AS (
 SELECT id, user_id, status FROM withdrawn;
 
 -- name: ClearReserveOverride :execrows
--- Drop an ended manual-resume exemption (all four columns) so the display and the claim gate agree.
+-- Drop an ended manual-resume exemption (all five columns) so the display and the claim gate agree.
 -- Guarded on the grant time the caller READ, so a fresh grant that landed between the list and this
 -- write is never cleared. updated_at is untouched (display state).
 UPDATE runs SET
     reserve_exempt_until         = NULL,
     reserve_exempt_granted_at    = NULL,
     reserve_exempt_credential_id = NULL,
-    reserve_exempt_window_reset  = NULL
+    reserve_exempt_window_reset  = NULL,
+    reserve_exempt_prior_pct     = NULL
 WHERE id = @id
   AND status NOT IN ('completed', 'failed', 'cancelled')
   AND reserve_exempt_until IS NOT NULL

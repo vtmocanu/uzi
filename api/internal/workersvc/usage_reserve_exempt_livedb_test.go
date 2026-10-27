@@ -106,6 +106,9 @@ func (fx *reserveFix) ownerResume(run uuid.UUID, withOverride bool) {
 		if grant.WindowReset != nil {
 			params.ReserveExemptWindowReset = pgtype.Timestamptz{Time: *grant.WindowReset, Valid: true}
 		}
+		if grant.PriorPct != nil {
+			params.ReserveExemptPriorPct = pgtype.Int2{Int16: *grant.PriorPct, Valid: true}
+		}
 	}
 	if _, err := fx.env.q.ResumePausedRun(fx.env.ctx, params); err != nil {
 		fx.t.Fatalf("ResumePausedRun: %v", err)

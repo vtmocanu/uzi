@@ -1141,6 +1141,7 @@ type Run struct {
 	ReserveExemptGrantedAt      pgtype.Timestamptz `json:"reserve_exempt_granted_at"`
 	ReserveExemptCredentialID   pgtype.UUID        `json:"reserve_exempt_credential_id"`
 	ReserveExemptWindowReset    pgtype.Timestamptz `json:"reserve_exempt_window_reset"`
+	ReserveExemptPriorPct       pgtype.Int2        `json:"reserve_exempt_prior_pct"`
 }
 
 type RunCompletionAttempt struct {

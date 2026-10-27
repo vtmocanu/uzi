@@ -3980,7 +3980,7 @@ UPDATE runs SET
     hold_reason = CASE WHEN runs.hold_reason IN ('budget_exhausted', 'credential_switch_settling', 'credential_switch_unsettled', 'weekly_reserve') THEN NULL ELSE runs.hold_reason END,
     hold_captured_head = CASE WHEN runs.hold_reason = 'budget_exhausted' THEN NULL ELSE runs.hold_captured_head END,
     -- PRD #3522 M4a: the owner's manual resume of a weekly_reserve pause is a recorded OVERRIDE until the
-    -- next observed 7-day reset. The four exemption columns are written ONLY on a weekly_reserve hold and
+    -- next observed 7-day reset. The five exemption columns are written ONLY on a weekly_reserve hold and
     -- only when the caller supplies a grant time (the owner resume does; set-token, the completion
     -- decision and the sweeper release pass NULL, leaving the columns as they were).
     reserve_exempt_granted_at    = CASE WHEN runs.hold_reason = 'weekly_reserve' AND sqlc.narg('reserve_exempt_granted_at')::timestamptz IS NOT NULL
@@ -3989,6 +3989,8 @@ UPDATE runs SET
                                         THEN sqlc.narg('reserve_exempt_credential_id')::uuid ELSE runs.reserve_exempt_credential_id END,
     reserve_exempt_window_reset  = CASE WHEN runs.hold_reason = 'weekly_reserve' AND sqlc.narg('reserve_exempt_granted_at')::timestamptz IS NOT NULL
                                         THEN sqlc.narg('reserve_exempt_window_reset')::timestamptz ELSE runs.reserve_exempt_window_reset END,
+    reserve_exempt_prior_pct     = CASE WHEN runs.hold_reason = 'weekly_reserve' AND sqlc.narg('reserve_exempt_granted_at')::timestamptz IS NOT NULL
+                                        THEN sqlc.narg('reserve_exempt_prior_pct')::smallint ELSE runs.reserve_exempt_prior_pct END,
     reserve_exempt_until         = CASE WHEN runs.hold_reason = 'weekly_reserve' AND sqlc.narg('reserve_exempt_granted_at')::timestamptz IS NOT NULL
                                         THEN sqlc.narg('reserve_exempt_until')::timestamptz ELSE runs.reserve_exempt_until END,
     -- PRD #1733: the owner's resume of a provider hold is the decision to try again, so the open

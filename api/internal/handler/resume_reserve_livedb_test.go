@@ -85,6 +85,7 @@ func TestResumeRunNowRecordsReserveOverrideLiveDB(t *testing.T) {
 		status                 string
 		until, granted, anchor *time.Time
 		credential             *uuid.UUID
+		prior                  *int16
 		hold                   *string
 		auditBody              string
 		auditRows              int
@@ -92,8 +93,8 @@ func TestResumeRunNowRecordsReserveOverrideLiveDB(t *testing.T) {
 	read := func(id uuid.UUID) exemption {
 		var e exemption
 		if err := pool.QueryRow(ctx, `SELECT status, reserve_exempt_until, reserve_exempt_granted_at, reserve_exempt_window_reset,
-		                                     reserve_exempt_credential_id, hold_reason FROM runs WHERE id = $1`, id).
-			Scan(&e.status, &e.until, &e.granted, &e.anchor, &e.credential, &e.hold); err != nil {
+		                                     reserve_exempt_credential_id, hold_reason, reserve_exempt_prior_pct FROM runs WHERE id = $1`, id).
+			Scan(&e.status, &e.until, &e.granted, &e.anchor, &e.credential, &e.hold, &e.prior); err != nil {
 			t.Fatalf("read run: %v", err)
 		}
 		if err := pool.QueryRow(ctx, `SELECT count(*), COALESCE(max(body), '') FROM run_user_inputs WHERE run_id = $1 AND kind = 'resume'`, id).
@@ -117,6 +118,9 @@ func TestResumeRunNowRecordsReserveOverrideLiveDB(t *testing.T) {
 		if e.until == nil || !e.until.Equal(resets) || e.anchor == nil || !e.anchor.Equal(resets) || e.granted == nil || e.credential == nil || *e.credential != tok {
 			t.Fatalf("exemption = until %v anchor %v granted %v credential %v, want anchored on %v for %s", e.until, e.anchor, e.granted, e.credential, resets, tok)
 		}
+		if e.prior == nil || *e.prior != 80 {
+			t.Fatalf("exemption prior = %v, want the 80%% the grant read (the reset detector's baseline)", e.prior)
+		}
 		if e.auditRows != 1 || e.auditBody == "" {
 			t.Fatalf("resume audit = %d rows, body %q, want one row recording the override", e.auditRows, e.auditBody)
 		}
@@ -129,7 +133,7 @@ func TestResumeRunNowRecordsReserveOverrideLiveDB(t *testing.T) {
 			t.Fatalf("resume = %d: %s", rec.Code, rec.Body.String())
 		}
 		e := read(id)
-		if e.anchor != nil || e.until == nil || e.granted == nil {
+		if e.anchor != nil || e.prior != nil || e.until == nil || e.granted == nil {
 			t.Fatalf("exemption = until %v anchor %v granted %v, want a capped, anchor-less exemption", e.until, e.anchor, e.granted)
 		}
 		if d := e.until.Sub(*e.granted); d < 7*24*time.Hour-time.Minute || d > 7*24*time.Hour+time.Minute {
