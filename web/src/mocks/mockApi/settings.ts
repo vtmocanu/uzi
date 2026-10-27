@@ -594,7 +594,7 @@ function settingsResponse(): SettingsResponse {
 }
 
 // Shared session/status projection; wrapper absence does not determine mode.
-export function mockVaultStatus(): VaultStatus {
+function mockVaultStatus(): VaultStatus {
   return {
     ...mockVaultMaterial(oidcDemo().passwordless),
     policy: appSettings.vault_policy === "optional" ? "optional" : "required",
