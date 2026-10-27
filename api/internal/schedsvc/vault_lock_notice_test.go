@@ -12,7 +12,7 @@ import (
 
 // newVaultLockReconciler wires a reconciler over the shared M1 test fakes. A nil vault
 // means "no local gate" (every user treated as locked); pass a *fakeVault to exercise
-// the vlt.Unlocked skip.
+// the RequiresUnlock skip.
 func newVaultLockReconciler(st *fakeStore, notif *fakeNotifier, set *fakeSettings, vlt VaultGate) *VaultLockReconciler {
 	return NewVaultLockReconciler(st, vlt, notif, set, nil)
 }
@@ -117,7 +117,7 @@ func TestVaultLockReconcileUnlockedSkip(t *testing.T) {
 	// The skipped seed admin must not have been claimed at all.
 	for _, id := range st.vaultClaimedOrder {
 		if id == seedAdmin {
-			t.Error("unlocked seed admin was claimed — the vlt.Unlocked skip must precede the claim")
+			t.Error("unlocked seed admin was claimed — the RequiresUnlock skip must precede the claim")
 		}
 	}
 }

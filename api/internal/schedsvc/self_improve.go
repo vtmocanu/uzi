@@ -102,11 +102,10 @@ func (e *Scheduler) fireSelfImprove(ctx context.Context, sched store.RunSchedule
 		return FireOutcome{Matched: 1, Skips: []Skip{{Reason: SkipAlreadyRunning}}}, nil
 	}
 
-	// 3. Vault-lock skip (benign): the owner's DEK is not cached, so the autonomous run can't
-	// spend their token this cycle. Notify + advance normally; the cadence re-fires on schedule
-	// once the vault is unlocked. A nil vault is treated as always unlocked (a deployment
-	// without the vault), mirroring the bespoke engine.
-	if e.vault != nil && !e.vault.Unlocked(sched.UserID) {
+	// 3. Vault-lock skip (benign): protected owners need their current DEK cached.
+	// Notify + advance normally; the cadence retries at the next scheduled time.
+	// Off owners and a nil scheduler gate permit firing without a cached DEK.
+	if e.vault != nil && e.vault.RequiresUnlock(ctx, sched.UserID) {
 		e.notifySelfImproveSkipped(ctx, sched.UserID,
 			"Your vault is locked, so this self-improvement cycle was skipped — it can't spend your token while locked. It will try again at the next scheduled time; unlock your vault before then so it isn't skipped again.")
 		return FireOutcome{Matched: 1, Skips: []Skip{{Reason: SkipVaultLocked}}}, nil

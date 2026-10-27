@@ -16,6 +16,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 // Behavioral, end-to-end live-DB coverage for PRD #890 M4. Distinct from M1's
@@ -29,7 +30,7 @@ import (
 //     running/claimed runs and fired/disabled schedules do not; no-Slack and no-vault
 //     users never qualify.
 //   - The unlock → clear → re-notify episode cycle (SC5) end-to-end through Reconcile.
-//   - The vlt.Unlocked fail-safe skip (SC3), proven to suppress a send WITHOUT burning
+//   - The RequiresUnlock fail-safe skip (SC3), proven to suppress a send WITHOUT burning
 //     the mark (a later Reconcile, once relocked, still notifies).
 //   - The atomic claim under CONCURRENCY (SC6) — the multi-replica dedup — in a separate
 //     test below (M1 was serial).
@@ -87,7 +88,7 @@ func TestVaultLockReconcilerLiveDB(t *testing.T) {
 	s.run(userH, s.repo(userH), "queued")
 
 	// U — eligible work, but UNLOCKED on this pod: vault + Slack + queued run, with the
-	// local vlt.Unlocked skip active. Must be suppressed WITHOUT burning the mark.
+	// local RequiresUnlock skip active. Must be suppressed WITHOUT burning the mark.
 	userU := s.user(true)
 	s.vault(userU)
 	s.run(userU, s.repo(userU), "queued")
@@ -146,7 +147,7 @@ func TestVaultLockReconcilerLiveDB(t *testing.T) {
 		t.Fatalf("after clear + Reconcile #3: user B has %d rows, want 1 (not re-armed)", got)
 	}
 
-	// ── Unlocked-skip proof (SC3): U was suppressed by the local vlt.Unlocked skip on
+	// ── Unlocked-skip proof (SC3): U was suppressed by the local RequiresUnlock skip on
 	// every prior tick WITHOUT burning its mark, so relocking it and reconciling now
 	// sends. ───────────────────────────────────────────────────────────────────
 	if got := countVaultLocked(ctx, t, pool, userU); got != 0 {
@@ -172,6 +173,63 @@ func TestVaultLockReconcilerLiveDB(t *testing.T) {
 		if got := countVaultLocked(ctx, t, pool, u.id); got != 0 {
 			t.Fatalf("final: ineligible user %s has %d vault_locked rows, want 0", u.name, got)
 		}
+	}
+}
+
+// TestVaultLockReconcilerActualVaultModesLiveDB pairs real PostgreSQL eligibility
+// with the actual Vault gate. Off has no wrapper and no cached DEK; protected has
+// a wrapper but remains locked. No password unlock or synthetic cached key is used.
+func TestVaultLockReconcilerActualVaultModesLiveDB(t *testing.T) {
+	ctx, pool, q := openVaultLockLiveDB(t)
+	s := &vaultLockSeeder{ctx: ctx, t: t, pool: pool}
+	off, protected := s.user(true), s.user(true)
+	s.exec("UPDATE users SET vault_mode = $2 WHERE id = $1", off, store.VaultModeUnprotected)
+	s.exec("UPDATE users SET vault_mode = $2 WHERE id = $1", protected, store.VaultModeProtected)
+	s.vault(protected)
+	s.run(off, s.repo(off), "queued")
+	s.run(protected, s.repo(protected), "queued")
+
+	var wrappers int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM user_vaults WHERE user_id = $1", off).Scan(&wrappers); err != nil {
+		t.Fatal(err)
+	}
+	if wrappers != 0 {
+		t.Fatal("Off fixture unexpectedly has a vault wrapper")
+	}
+
+	v := vault.NewPostgres(nil, pool) // Admission reads need neither a master key nor a transaction.
+	if v.Unlocked(off) || v.Unlocked(protected) {
+		t.Fatal("both fixtures must have empty raw DEK caches")
+	}
+	if v.RequiresUnlock(ctx, off) || !v.RequiresUnlock(ctx, protected) {
+		t.Fatal("actual vault must distinguish Off from protected locked")
+	}
+	rows, err := q.ListUsersNeedingVaultLockNotice(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundProtected := false
+	for _, row := range rows {
+		if row.ID == off {
+			t.Fatal("Off owner without a wrapper must never be eligible")
+		}
+		if row.ID == protected {
+			foundProtected = true
+		}
+	}
+	if !foundProtected {
+		t.Fatal("protected locked positive control must be eligible")
+	}
+
+	notifier := notifysvc.New(q, nil, 0, nil)
+	rec := NewVaultLockReconciler(q, v, notifier, &fakeSettings{}, nil)
+	rec.Reconcile(ctx)
+	rec.Reconcile(ctx) // Durable claim must prevent a duplicate protected notice.
+	if got := countVaultLocked(ctx, t, pool, off); got != 0 {
+		t.Fatalf("Off owner received %d notices, want 0", got)
+	}
+	if got := countVaultLocked(ctx, t, pool, protected); got != 1 {
+		t.Fatalf("protected locked owner received %d notices, want 1", got)
 	}
 }
 

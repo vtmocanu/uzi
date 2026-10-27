@@ -200,12 +200,12 @@ type Notifier interface {
 	Notify(ctx context.Context, n notifysvc.Notification) (store.Notification, error)
 }
 
-// VaultGate reports whether an owner's vault DEK is cached (unlocked) — the same gate the
-// bespoke self-improve engine uses (PRD #590 M1). *vault.Vault satisfies it. Optional: a
-// nil gate is treated as "always unlocked" (a deployment without the vault), so a
-// self_improve fire never wedges on a missing vault.
+// VaultGate reports whether an owner requires a vault unlock. *vault.Vault implements
+// this using durable mode and the current epoch's cached DEK, failing closed on errors.
+// Off owners do not require an unlock even when no DEK is cached. A nil scheduler gate
+// permits firing; a nil VaultLockReconciler gate treats notice candidates as locked.
 type VaultGate interface {
-	Unlocked(userID uuid.UUID) bool
+	RequiresUnlock(ctx context.Context, userID uuid.UUID) bool
 }
 
 // Scheduler is the single-instance scheduled-runs actor.
